@@ -61,14 +61,19 @@ describe("edtfFromText", () => {
   });
 
   it.each([
-    ["19th century", "18XX"],
-    ["20th century", "19XX"],
-    ["early 20th century", "19XX"],
-    ["1st century", "00XX"],
-  ])("century %j", (text, edtf) => {
+    ["19th century", "1801/1900", false],
+    ["20th century", "1901/2000", false],
+    ["early 20th century", "1901/2000", true],
+    ["1st century", "0001/0100", false],
+    ["ca. 19th century", "1801~/1900~", false],
+  ])("century %j uses its strict years", (text, edtf, keep) => {
     const result = read(text);
     expect(result.edtf).toBe(edtf);
-    expect(result.note).toContain(text);
+    expect(result.note !== undefined).toBe(keep);
+  });
+
+  it("keeps the original wording, not a lowercased copy, in the note", () => {
+    expect(read("Late 1920s").note).toBe("Originally “Late 1920s”.");
   });
 
   it.each([
@@ -108,6 +113,11 @@ describe("edtfFromText", () => {
     ["1920-45", "1920/1945"],
     ["1920 - 25", "1920/1925"],
     ["1920s-1930s", "192X/193X"],
+    ["1920-06 to 1921-05", "1920-06/1921-05"],
+    ["1985-04-12 - 1985-05-01", "1985-04-12/1985-05-01"],
+    ["1920-12-25 to 1921", "1920-12-25/1921"],
+    ["mid-1950s to late 1960s", "195X/196X"],
+    ["1920-06", "1920-06"],
     ["ca. 1920-1925", "1920~/1925~"],
   ])("range %j", (text, edtf) => {
     expect(read(text).edtf).toBe(edtf);
@@ -122,6 +132,18 @@ describe("edtfFromText", () => {
     ["1925-20", "ambiguous"],
     ["1920-25", "ambiguous"],
     ["1920-21", "ambiguous"],
+    ["ca. 1920-25", "ambiguous"],
+    ["c. 1920-21", "ambiguous"],
+    ["probably 1920-22", "ambiguous"],
+    ["ca. 1920-25?", "ambiguous"],
+    ["1920-25.", "ambiguous"],
+    ["1920-25?", "ambiguous"],
+    ["1920-21~", "ambiguous"],
+    ["1901-12", "ambiguous"],
+    ["1905-08", "ambiguous"],
+    ["–1920", "ambiguous"],
+    ["-1920", "ambiguous"],
+    ["- 1920", "ambiguous"],
     ["undated", "undated"],
     ["n.d.", "undated"],
     ["Unknown", "undated"],

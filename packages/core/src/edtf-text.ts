@@ -87,7 +87,8 @@ function fail(code: string, message: string): never {
 
 interface Piece {
   edtf: string;
-  note: string | undefined;
+  /** EDTF loses something the text said ("late 1920s"), so keep the original. */
+  keep: boolean;
 }
 
 /**
@@ -116,22 +117,8 @@ export function edtfFromText(
   const trimmed = input.trim();
   if (trimmed === "") return { ok: false, issues: [issue([], "empty", "The date is empty.")] };
 
-  // "1920-25" is valid EDTF (spring 1920), but in free text it almost always
-  // means 1920 to 1925. Don't pick one.
-  const seasonOrRange = /^(\d{4})-(\d{2})$/.exec(trimmed);
-  const code = Number(seasonOrRange?.[2] ?? 0);
-  if (seasonOrRange !== null && code >= 21 && code <= 41) {
-    return {
-      ok: false,
-      issues: [
-        issue(
-          [],
-          "ambiguous",
-          `${shown(trimmed)} could be the years ${seasonOrRange[1] ?? ""} to ${(seasonOrRange[1] ?? "").slice(0, 2)}${seasonOrRange[2] ?? ""} or an EDTF season code. Enter it as an interval (a/b) or an EDTF season.`,
-        ),
-      ],
-    };
-  }
+  const guard = ambiguousForm(trimmed);
+  if (guard !== undefined) return { ok: false, issues: [issue([], "ambiguous", guard)] };
 
   const exact = parseEdtf(trimmed);
   if (exact.ok) {
@@ -157,7 +144,12 @@ export function edtfFromText(
     }
     return {
       ok: true,
-      value: Object.freeze({ edtf: piece.edtf, note: piece.note, date: parsed.value }),
+      value: Object.freeze({
+        edtf: piece.edtf,
+        // The text exactly as entered (trimmed), not the lowercased working copy.
+        note: piece.keep ? `Originally “${trimmed}”.` : undefined,
+        date: parsed.value,
+      }),
     };
   } catch (error) {
     if (error instanceof TextError) {
@@ -171,21 +163,59 @@ function readRange(text: string, options: EdtfFromTextOptions): Piece {
   // "ca. 1920-1925": a qualifier in front applies to both ends.
   const { rest, qualifier } = readQualifier(text);
   const between = /^(?:between|from) (.+?) (?:and|to|until|-) (.+)$/.exec(rest);
-  if (between === null) {
-    // A single date first: "06-05-1920" has dashes but is not a range.
-    try {
-      return readSingle(rest, qualifier, options);
-    } catch (error) {
-      if (!(error instanceof TextError) || error.code !== "unreadable") throw error;
+  if (between !== null) {
+    return joinRange(between[1] ?? "", between[2] ?? "", qualifier, options, text);
+  }
+  // A single date first: "06-05-1920" has dashes but is not a range.
+  let lastError: TextError;
+  try {
+    return readSingle(rest, qualifier, options);
+  } catch (error) {
+    if (!(error instanceof TextError) || error.code !== "unreadable") throw error;
+    lastError = error;
+  }
+  // Then every place the text could split into two dates. "1920-06 to
+  // 1921-05" has a dash before the real split, so try them all; if two
+  // splits give different answers, it's ambiguous.
+  const found = new Map<string, Piece>();
+  let ambiguous: TextError | undefined;
+  for (let i = 1; i < rest.length - 1; i++) {
+    for (const separator of [" to ", " until ", " - ", "-"]) {
+      if (!rest.startsWith(separator, i)) continue;
+      try {
+        const piece = joinRange(
+          rest.slice(0, i),
+          rest.slice(i + separator.length),
+          qualifier,
+          options,
+          text,
+        );
+        found.set(piece.edtf, piece);
+      } catch (error) {
+        if (!(error instanceof TextError)) throw error;
+        if (error.code === "ambiguous") ambiguous ??= error;
+      }
     }
   }
-  const match = between ?? /^(.+?)(?: to | ?- ?)(.+)$/.exec(rest);
-  if (match === null) return readSingle(rest, qualifier, options);
+  if (found.size > 1) {
+    fail("ambiguous", `${shown(text)} can be split into a range in more than one way.`);
+  }
+  const [only] = found.values();
+  if (only !== undefined) return only;
+  throw ambiguous ?? lastError;
+}
 
-  const startText = match[1] ?? "";
-  let endText = match[2] ?? "";
-  // "1920-25": a two-digit end takes its century from the start.
-  const short = /^(\d{4})$/.exec(startText) !== null ? /^(\d{2})$/.exec(endText) : null;
+function joinRange(
+  startRaw: string,
+  endRaw: string,
+  qualifier: string,
+  options: EdtfFromTextOptions,
+  text: string,
+): Piece {
+  const startText = startRaw.trim();
+  let endText = endRaw.trim();
+  // "1920 - 25": a two-digit end takes its century from the start.
+  const short = /^\d{4}$/.test(startText) ? /^(\d{2})$/.exec(endText) : null;
   if (short !== null) {
     const end = `${startText.slice(0, 2)}${short[1] ?? ""}`;
     if (Number(end) <= Number(startText)) {
@@ -198,11 +228,31 @@ function readRange(text: string, options: EdtfFromTextOptions): Piece {
   if (start.edtf.includes("/") || end.edtf.includes("/")) {
     fail("unreadable", "A range inside a range can't be read.");
   }
-  const notes = [start.note, end.note].filter((n) => n !== undefined);
-  return {
-    edtf: `${start.edtf}/${end.edtf}`,
-    note: notes.length > 0 ? notes.join(" ") : undefined,
-  };
+  return { edtf: `${start.edtf}/${end.edtf}`, keep: start.keep || end.keep };
+}
+
+/**
+ * Forms that read two ways in free text, checked before anything else. Returns
+ * the message, or undefined if the text is fine.
+ */
+function ambiguousForm(text: string): string | undefined {
+  // A dash before the first year: "until 1920", or a BCE year?
+  if (/^[-\u2013\u2014]\s*\d/.test(text)) {
+    return `${shown(text)} starts with a dash: it could mean “until” or a year BCE. Enter ../1920 for “until 1920”.`;
+  }
+  // "1920-25" is EDTF's spring 1920, and "1901-05" is May 1901, but in free
+  // text both are as likely the years 1920–1925 and 1901–1905.
+  for (const m of text.matchAll(/(?<![\dX-])(\d{4})-(\d{2})(?![\dX-])/g)) {
+    const year = m[1] ?? "";
+    const two = Number(m[2]);
+    const season = two >= 21 && two <= 41;
+    const month = two >= 1 && two <= 12 && two > Number(year.slice(2));
+    if (season || month) {
+      const what = season ? "an EDTF season code" : "a month";
+      return `${shown(m[0])} could be the years ${year} to ${year.slice(0, 2)}${m[2] ?? ""} or ${what}. Enter a range as 1920/1925.`;
+    }
+  }
+  return undefined;
 }
 
 function readQualifier(text: string): { rest: string; qualifier: string } {
@@ -247,7 +297,7 @@ function readSingle(raw: string, qualifier: string, options: EdtfFromTextOptions
 
   // Already EDTF on its own ("1920", "1920-06").
   if (/^-?\d{4}(?:-\d{2}){0,2}$/.test(text) && parseEdtf(text).ok) {
-    return { edtf: `${text}${q}`, note: undefined };
+    return { edtf: `${text}${q}`, keep: false };
   }
 
   // Decades: "1950s", "early 1920s", "mid-1950s", "the 1950s".
@@ -261,8 +311,7 @@ function readSingle(raw: string, qualifier: string, options: EdtfFromTextOptions
         `${shown(raw)} could mean a decade (${stem}0–${stem}9) or a century; enter it as ${stem}X or ${stem.slice(0, 2)}XX.`,
       );
     }
-    const note = part === undefined ? undefined : `Originally ${shown(raw)}.`;
-    return { edtf: `${stem}X${q}`, note };
+    return { edtf: `${stem}X${q}`, keep: part !== undefined };
   }
   if (
     /^(?:the )?(?:(?:early|mid|late)[- ]?)?(?:'\d0s|\d0s|twenties|thirties|forties|fifties|sixties|seventies|eighties|nineties)$/.test(
@@ -280,11 +329,10 @@ function readSingle(raw: string, qualifier: string, options: EdtfFromTextOptions
   if (century !== null) {
     const n = Number(century[2]);
     if (n < 1 || n > 99) fail("unreadable", `${shown(raw)} is not a century.`);
-    const stem = String(n - 1).padStart(2, "0");
-    return {
-      edtf: `${stem}XX${q}`,
-      note: `Originally ${shown(raw)}, read as ${stem}00–${stem}99.`,
-    };
+    // The strict meaning: the 20th century is 1901 to 2000.
+    const first = String((n - 1) * 100 + 1).padStart(4, "0");
+    const last = String(n * 100).padStart(4, "0");
+    return { edtf: `${first}${q}/${last}${q}`, keep: century[1] !== undefined };
   }
 
   // Seasons: "spring 1920", "summer of 1920".
@@ -292,7 +340,7 @@ function readSingle(raw: string, qualifier: string, options: EdtfFromTextOptions
   if (season !== null) {
     return {
       edtf: `${season[2] ?? ""}-${SEASONS.get(season[1] ?? "") ?? ""}${q}`,
-      note: undefined,
+      keep: false,
     };
   }
 
@@ -300,7 +348,7 @@ function readSingle(raw: string, qualifier: string, options: EdtfFromTextOptions
   const monthYear = /^([a-z]+)\.?,? (\d{4})$/.exec(text);
   if (monthYear !== null) {
     const month = monthNumber(monthYear[1]);
-    return { edtf: `${monthYear[2] ?? ""}-${pad(month)}${q}`, note: undefined };
+    return { edtf: `${monthYear[2] ?? ""}-${pad(month)}${q}`, keep: false };
   }
   const monthDayYear = /^([a-z]+)\.? (\d{1,2})(?:st|nd|rd|th)?,? (\d{4})$/.exec(text);
   const dayMonthYear = /^(\d{1,2})(?:st|nd|rd|th)? (?:of )?([a-z]+)\.?,? (\d{4})$/.exec(text);
@@ -311,7 +359,7 @@ function readSingle(raw: string, qualifier: string, options: EdtfFromTextOptions
         : [dayMonthYear?.[2], dayMonthYear?.[1], dayMonthYear?.[3]];
     return {
       edtf: `${yearText ?? ""}-${pad(monthNumber(monthName))}-${pad(Number(dayText))}${q}`,
-      note: undefined,
+      keep: false,
     };
   }
 
@@ -333,7 +381,7 @@ function readSingle(raw: string, qualifier: string, options: EdtfFromTextOptions
         `${shown(raw)} could be month/day or day/month. Say which order the source uses.`,
       );
     }
-    return { edtf: `${year}-${pad(month)}-${pad(day)}${q}`, note: undefined };
+    return { edtf: `${year}-${pad(month)}-${pad(day)}${q}`, keep: false };
   }
 
   if (/^(?:before|after|by|pre|post|not before|not after)\b/.test(text)) {

@@ -167,6 +167,7 @@ describe("level 2", () => {
     ["156X-12-25", "1560|12|25", "1569|12|25"],
     ["15XX-12-25", "1500|12|25", "1599|12|25"],
     ["XXXX-12-XX", "0|12|1", "9999|12|31"],
+    ["-XXXX", "-9999|1|1", "-1|12|31"],
     ["1XXX-XX", "1000|1|1", "1999|12|31"],
     ["1XXX-12", "1000|12|1", "1999|12|31"],
     ["1984-1X", "1984|10|1", "1984|12|31"],
@@ -257,6 +258,10 @@ describe("rejects", () => {
     ["Y170000002-01", "invalid_syntax"],
     ["Y-17E7", "unsupported"],
     ["1950S2", "unsupported"],
+    ["?1985?", "invalid_syntax"],
+    ["%1985~", "invalid_syntax"],
+    ["1985~-04~-12~", "invalid_syntax"],
+    ["1985~-04-12?", "invalid_syntax"],
     ["1985-04-12T24:00:00", "invalid_time"],
     ["1985-04-12T23:60:00", "invalid_time"],
     ["1985-04-12T23:20:30+15:00", "invalid_time"],
@@ -373,6 +378,18 @@ describe("helpers", () => {
     expect(compareEdtf(ok("1985-01-01"), ok("1985"))).toBeLessThan(0);
     expect(compareEdtf(ok("1985"), ok("1985/.."))).toBeLessThan(0);
     expect(compareEdtf(ok("1985"), ok("1985~"))).toBe(0);
+  });
+
+  it("gives no sort year when no year is known, and sorts those last", () => {
+    for (const text of ["XXXX", "XXXX-12-25", "-XXXX", "[XXXX-12,XXXX-11]"]) {
+      expect(ok(text)).toMatchObject({ sortKey: null, sortYear: null });
+    }
+    expect(Object.is(ok("-XXXX").latest?.year, -0)).toBe(false);
+    const sorted = ["XXXX-12-25", "1985", "0000"].map(ok).sort(compareEdtf);
+    expect(sorted.map((d) => d.edtf)).toEqual(["0000", "1985", "XXXX-12-25"]);
+    expect(ok("XXXX/1950")).toMatchObject({ sortYear: 1950 });
+    expect(ok("[XXXX,1950]")).toMatchObject({ sortYear: 1950 });
+    expect(ok("[..1950,XXXX]")).toMatchObject({ sortYear: 9999 });
   });
 
   it("returns frozen results", () => {

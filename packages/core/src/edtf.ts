@@ -52,11 +52,12 @@ export interface EdtfDate {
   /**
    * A number to sort dates by: the earliest day as `year*10000 + month*100 +
    * day` (so `1920-03-05` is 19200305), or the latest day when the start is
-   * open. It orders correctly for negative years too.
+   * open. It orders correctly for negative years too. Null when no year is
+   * known at all (`XXXX-12-25`): such dates sort last, not as year 0.
    */
-  readonly sortKey: number;
-  /** The year of the day `sortKey` uses: a clean year for lists and facets. */
-  readonly sortYear: number;
+  readonly sortKey: number | null;
+  /** The year of the day `sortKey` uses: a clean year for lists and facets. Null with `sortKey`. */
+  readonly sortYear: number | null;
   /** Some part is marked `?` or `%`. */
   readonly uncertain: boolean;
   /** Some part is marked `~` or `%`. */
@@ -77,9 +78,13 @@ export function dayKey(day: CalendarDay): number {
   return day.year * 10000 + day.month * 100 + day.day;
 }
 
-/** Compare two dates for sorting: by `sortKey`, then by latest day (open last). */
+/** Compare two dates for sorting: by `sortKey` (no year last), then by latest day (open last). */
 export function compareEdtf(a: EdtfDate, b: EdtfDate): number {
-  if (a.sortKey !== b.sortKey) return a.sortKey - b.sortKey;
+  if (a.sortKey !== b.sortKey) {
+    if (a.sortKey === null) return 1;
+    if (b.sortKey === null) return -1;
+    return a.sortKey - b.sortKey;
+  }
   const al = a.latest === null ? Infinity : dayKey(a.latest);
   const bl = b.latest === null ? Infinity : dayKey(b.latest);
   if (al === bl) return 0;
@@ -108,6 +113,8 @@ class EdtfError extends Error {
 }
 
 interface Span {
+  /** The day to sort by, or null if no year is known. */
+  anchor: CalendarDay | null;
   earliest: CalendarDay | null;
   latest: CalendarDay | null;
   level: EdtfLevel;
@@ -143,9 +150,7 @@ export function parseEdtf(input: unknown): Validated<EdtfDate> {
   }
   try {
     const { kind, span } = parseExpression(input);
-    const edge = span.earliest ?? span.latest;
-    if (edge === null) fail("invalid_interval", "A date needs at least one known end.");
-    const anchor = edge;
+    const anchor = span.anchor;
     return {
       ok: true,
       value: Object.freeze({
@@ -154,8 +159,8 @@ export function parseEdtf(input: unknown): Validated<EdtfDate> {
         kind,
         earliest: span.earliest,
         latest: span.latest,
-        sortKey: dayKey(anchor),
-        sortYear: anchor.year,
+        sortKey: anchor === null ? null : dayKey(anchor),
+        sortYear: anchor === null ? null : anchor.year,
         uncertain: span.uncertain,
         approximate: span.approximate,
         unspecified: span.unspecified,
@@ -223,6 +228,7 @@ function parseDateTime(text: string): Span {
   }
   const at = { year, month, day };
   return {
+    anchor: at,
     earliest: at,
     latest: at,
     level: 0,
@@ -279,6 +285,13 @@ const GROUPINGS: Readonly<Record<number, readonly [number, number, number, numbe
 };
 
 function parseDate(text: string): Span {
+  const span = parseDateBounds(text);
+  // A year of only X digits says nothing about when: don't sort it as year 0.
+  const noYear = /^[?~%]?-?XXXX(?![\dX])/.test(text);
+  return { ...span, anchor: noYear ? null : span.earliest };
+}
+
+function parseDateBounds(text: string): Omit<Span, "anchor"> {
   const m = DATE.exec(text);
   if (m === null) {
     fail(
@@ -299,9 +312,15 @@ function parseDate(text: string): Span {
   let level: EdtfLevel = 0;
   let uncertain = false;
   let approximate = false;
+  if (suffixes.filter((q) => q !== undefined).length > 1) {
+    fail("invalid_syntax", "A date can have only one qualifier (?, ~ or %) after its parts.");
+  }
   for (let i = 0; i <= last; i++) {
     const pre = prefixes[i];
     const post = suffixes[i];
+    if (pre !== undefined && post !== undefined) {
+      fail("invalid_syntax", "Each part of a date can have only one qualifier (?, ~ or %).");
+    }
     if (pre !== undefined || (post !== undefined && i !== last)) level = 2;
     if (post !== undefined && i === last) level = maxLevel(level, 1);
     for (const q of [pre, post]) {
@@ -344,7 +363,8 @@ function parseDate(text: string): Span {
     const low = Number(digits.replaceAll("X", "0"));
     const high = Number(digits.replaceAll("X", "9"));
     if (digits.includes("X")) unspecified = true;
-    [yearMin, yearMax] = negative ? [-high, -low] : [low, high];
+    // -0000 is not a year, so a negative year with X digits ends at -1.
+    [yearMin, yearMax] = negative ? [-high, -Math.max(low, 1)] : [low, high];
   }
 
   if (monthText === undefined) {
@@ -486,6 +506,7 @@ function parseInterval(text: string): Span {
   // Open or unknown ends are level 1.
   const level = maxLevel(start?.level ?? 1, end?.level ?? 1);
   return {
+    anchor: start?.anchor ?? (end !== null && end.anchor !== null ? end.latest : null),
     earliest: start?.earliest ?? null,
     latest: end?.latest ?? null,
     level,
@@ -518,7 +539,13 @@ function parseSet(text: string): Span {
   let uncertain = false;
   let approximate = false;
   let unspecified = false;
+  // The earliest day among members that have a known year.
+  const known: { day: CalendarDay | undefined } = { day: undefined };
   const take = (span: Span): void => {
+    const anchor = span.anchor;
+    if (anchor !== null && (known.day === undefined || dayKey(anchor) < dayKey(known.day))) {
+      known.day = anchor;
+    }
     uncertain ||= span.uncertain;
     approximate ||= span.approximate;
     unspecified ||= span.unspecified;
@@ -565,9 +592,12 @@ function parseSet(text: string): Span {
     lower(a === null ? null : a.earliest);
     upper(b === null ? null : b.latest);
   });
+  const low = earliest ?? null;
+  const high = latest ?? null;
   return {
-    earliest: earliest ?? null,
-    latest: latest ?? null,
+    anchor: known.day === undefined ? null : low === null ? high : known.day,
+    earliest: low,
+    latest: high,
     level: 2,
     uncertain,
     approximate,
