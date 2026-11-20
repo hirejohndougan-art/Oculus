@@ -207,6 +207,29 @@ describe("validateArrangement: hostile shapes stay fast", () => {
 });
 
 describe("unfiledUnits", () => {
+  it("includes units in a loop, so they aren't lost", () => {
+    const aId = newRecordId();
+    const bId = newRecordId();
+    const a: ArchivalUnitRecord = { ...unit("A", "series", undefined, aId), parentId: bId };
+    const b: ArchivalUnitRecord = { ...unit("B", "series", undefined, bId), parentId: aId };
+    const hanger = unit("Hanger", "item", a);
+    expect(unfiledUnits([a, b, hanger]).map((u) => u.title)).toEqual(["A", "B"]);
+  });
+
+  it("includes duplicated units and units filed under a duplicated ID", () => {
+    const x = unit("X", "fonds");
+    const c = unit("C", "series", x);
+    expect(unfiledUnits([x, { ...x }, c]).map((u) => u.title)).toEqual(["X", "X", "C"]);
+  });
+
+  it("doesn't throw when reporting a unit whose title isn't text", () => {
+    const bad = {
+      ...unit("x", "series", unit("gone", "fonds")),
+      title: null,
+    } as unknown as ArchivalUnitRecord;
+    expect(() => validateArrangement([bad])).not.toThrow();
+  });
+
   it("includes units whose parent isn't in the set, so they aren't lost", () => {
     const lost = unit("Lost", "item", unit("Gone", "fonds"));
     expect(unfiledUnits([lost]).map((u) => u.title)).toEqual(["Lost"]);

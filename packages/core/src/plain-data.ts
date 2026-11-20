@@ -55,6 +55,10 @@ export class IssueList {
   get count(): number {
     return this.items.length;
   }
+  /** True once the limit was reached; callers can stop looking for more. */
+  get full(): boolean {
+    return this.stopped;
+  }
 }
 
 export const FORBIDDEN_KEYS: ReadonlySet<string> = new Set([
@@ -64,10 +68,14 @@ export const FORBIDDEN_KEYS: ReadonlySet<string> = new Set([
 ]);
 
 // Characters never allowed in stored text: C0 controls other than tab, line
-// feed and carriage return; DEL; C1 controls; and the bidirectional overrides
-// and isolates that can make text display differently from what it says.
-// eslint-disable-next-line no-control-regex -- matching control characters is the point
-const BAD_TEXT = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f‪-‮⁦-⁩]/;
+// feed and carriage return; DEL; C1 controls; direction marks, overrides and
+// isolates, which can make text display differently from what it says;
+// invisible zero-width space, word joiner and byte-order mark; and the
+// non-characters U+FFFE and U+FFFF. Zero-width joiner and non-joiner (U+200C,
+// U+200D) are allowed: several scripts and emoji need them.
+const BAD_TEXT =
+  // eslint-disable-next-line no-control-regex -- matching control characters is the point
+  /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u061c\u200b\u200e\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff\ufffe\uffff]/;
 /** A high surrogate not followed by a low one, or a low one not after a high one. */
 const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
 
@@ -78,10 +86,22 @@ export function textProblem(text: string): string | undefined {
   return undefined;
 }
 
-/** Show a key or value in a message: quoted, shortened, control characters escaped. */
-export function shown(text: string, max = 60): string {
+/** Characters JSON.stringify leaves as-is that could still hide or reorder text in a message. */
+const UNSAFE_IN_MESSAGE =
+  /[\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufffe\uffff]/g;
+
+/**
+ * Show a key or value in a message: quoted, shortened, and with every control,
+ * invisible or direction-changing character written as an escape like \u202e.
+ * Accepts anything, so a bad stored value can't make reporting throw.
+ */
+export function shown(value: unknown, max = 60): string {
+  const text = typeof value === "string" ? value : String(value);
   const short = text.length > max ? `${text.slice(0, max)}…` : text;
-  return JSON.stringify(short);
+  return JSON.stringify(short).replace(
+    UNSAFE_IN_MESSAGE,
+    (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
 }
 
 interface Context {
@@ -152,7 +172,7 @@ function read(
   }
   if (Array.isArray(value)) return readArray(value, path, depth, ctx);
   const proto: unknown = Object.getPrototypeOf(value);
-  if (proto !== Object.prototype && proto !== null) {
+  if ((proto !== Object.prototype && proto !== null) || isBuiltIn(value)) {
     ctx.issues.add(path, "not_json", "Values must be text, numbers, true/false, lists or groups.");
     return NOT_READ;
   }
@@ -198,17 +218,15 @@ function readArray(
     );
     return NOT_READ;
   }
-  const ownKeys = Reflect.ownKeys(list);
-  // An ordinary, hole-free array has exactly the keys "0" … "length-1" and "length".
-  if (ownKeys.length !== length + 1) {
-    const extras = ownKeys.filter(
-      (key) => key !== "length" && !(typeof key === "string" && isIndex(key, length)),
-    );
-    if (extras.length > 0) {
-      ctx.issues.add(path, "not_plain_data", "Lists can't carry extra properties or methods.");
-    } else {
-      ctx.issues.add(path, "holes", "Lists can't have empty slots.");
-    }
+  // An ordinary, hole-free array has exactly the keys "0" … "length-1" and
+  // "length". Anything more is an extra property; anything less is a hole.
+  const keyCount = Reflect.ownKeys(list).length;
+  if (keyCount > length + 1) {
+    ctx.issues.add(path, "not_plain_data", "Lists can't carry extra properties or methods.");
+    return NOT_READ;
+  }
+  if (keyCount < length + 1) {
+    ctx.issues.add(path, "holes", "Lists can't have empty slots.");
     return NOT_READ;
   }
   const out: JsonValue[] = [];
@@ -219,8 +237,12 @@ function readArray(
       ctx.issues.add([...path, i], "holes", "Lists can't have empty slots.");
       return NOT_READ;
     }
-    if (!("value" in descriptor)) {
-      ctx.issues.add([...path, i], "not_plain_data", "List items can't be getters or setters.");
+    if (!("value" in descriptor) || descriptor.enumerable !== true) {
+      ctx.issues.add(
+        [...path, i],
+        "not_plain_data",
+        "List items can't be getters, setters or hidden.",
+      );
       ok = false;
       continue;
     }
@@ -241,6 +263,18 @@ function readObject(
   const out: Record<string, JsonValue> = {};
   let ok = true;
   for (const key of Reflect.ownKeys(source)) {
+    // Stop as soon as the input is known to be too big or too broken, so the
+    // work done stays bounded by the limits, not by the number of keys.
+    if (ctx.overBudget || ctx.issues.full) return NOT_READ;
+    ctx.values += 1;
+    if (ctx.values > ctx.limits.maxValues) {
+      overBudget(
+        ctx,
+        "too_many_values",
+        `At most ${String(ctx.limits.maxValues)} values are allowed.`,
+      );
+      return NOT_READ;
+    }
     if (typeof key === "symbol") {
       ctx.issues.add(path, "not_plain_data", "Symbol keys are not accepted.");
       ok = false;
@@ -274,7 +308,6 @@ function readObject(
     const item = read(descriptor.value, [...path, key], depth + 1, ctx);
     if (item === NOT_READ) ok = false;
     else out[key] = item; // safe: prototype keys were refused by readKey
-    if (ctx.overBudget) return NOT_READ;
   }
   return ok ? Object.freeze(out) : NOT_READ;
 }
@@ -318,7 +351,20 @@ function overBudget(ctx: Context, code: string, message: string): void {
   ctx.overBudget = true;
 }
 
-function isIndex(key: string, length: number): boolean {
-  if (!/^(?:0|[1-9]\d*)$/.test(key)) return false;
-  return Number(key) < length;
+/** Maps, sets, dates and other built-ins, even with their prototype swapped out. */
+function isBuiltIn(value: object): boolean {
+  return (
+    types.isMap(value) ||
+    types.isSet(value) ||
+    types.isWeakMap(value) ||
+    types.isWeakSet(value) ||
+    types.isDate(value) ||
+    types.isRegExp(value) ||
+    types.isPromise(value) ||
+    types.isBoxedPrimitive(value) ||
+    types.isAnyArrayBuffer(value) ||
+    types.isArrayBufferView(value) ||
+    types.isGeneratorObject(value) ||
+    Object.prototype.toString.call(value) === "[object Error]"
+  );
 }

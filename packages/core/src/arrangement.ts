@@ -90,7 +90,7 @@ export function validateArrangement(units: readonly ArchivalUnitRecord[]): Issue
       issues.add(
         [unit.id, "parentId"],
         "wrong_level",
-        `A ${unit.level} can't be filed under a ${parent.level} (${shown(unit.title)} under ${shown(parent.title)}).`,
+        `${article(unit.level)} can't be filed under ${article(parent.level)} (${shown(unit.title)} under ${shown(parent.title)}).`,
       );
     }
   }
@@ -155,14 +155,50 @@ export function validateArrangement(units: readonly ArchivalUnitRecord[]): Issue
 }
 
 /**
- * Units that need filing: no parent (other than a top-level fonds or
- * collection), or a parent that isn't in the set, so nothing is lost from view.
+ * Units that need filing, so nothing is lost from view. Lists the top of every
+ * branch that isn't attached to a top-level fonds or collection:
+ * - units with no parent, other than a top-level fonds or collection
+ * - units whose parent isn't in the set
+ * - units that share an ID with another unit, or are filed under such an ID
+ * - units in a loop (the units hanging under a loop are reached through it)
  */
 export function unfiledUnits(units: readonly ArchivalUnitRecord[]): ArchivalUnitRecord[] {
-  const ids = new Set(units.map((unit) => unit.id));
-  return units.filter((unit) =>
-    unit.parentId === undefined
-      ? unit.level !== "fonds" && unit.level !== "collection"
-      : !ids.has(unit.parentId),
-  );
+  const count = new Map<RecordId, number>();
+  for (const unit of units) count.set(unit.id, (count.get(unit.id) ?? 0) + 1);
+  const byId = new Map<RecordId, ArchivalUnitRecord>();
+  for (const unit of units) if (count.get(unit.id) === 1) byId.set(unit.id, unit);
+  const inLoop = loopMembers(byId);
+  return units.filter((unit) => {
+    if (count.get(unit.id) !== 1) return true;
+    if (inLoop.has(unit.id)) return true;
+    if (unit.parentId === undefined) return unit.level !== "fonds" && unit.level !== "collection";
+    return !byId.has(unit.parentId);
+  });
+}
+
+/** The units that are part of a loop of parents (not the ones hanging under it). */
+function loopMembers(byId: ReadonlyMap<RecordId, ArchivalUnitRecord>): Set<RecordId> {
+  const members = new Set<RecordId>();
+  const done = new Set<RecordId>();
+  for (const start of byId.values()) {
+    const path: RecordId[] = [];
+    const index = new Map<RecordId, number>();
+    let current: ArchivalUnitRecord | undefined = start;
+    while (current !== undefined && !done.has(current.id)) {
+      const seenAt = index.get(current.id);
+      if (seenAt !== undefined) {
+        for (const id of path.slice(seenAt)) members.add(id);
+        break;
+      }
+      index.set(current.id, path.length);
+      path.push(current.id);
+      current = current.parentId === undefined ? undefined : byId.get(current.parentId);
+    }
+    for (const id of path) done.add(id);
+  }
+  return members;
+}
+
+function article(level: ArchivalLevel): string {
+  return `${level === "item" ? "An" : "A"} ${level}`;
 }

@@ -115,7 +115,8 @@ const READ_LIMITS = {
 const FIELD_KEY = /^[a-z][a-z0-9_]{0,63}$/;
 /** Characters allowed in stored text but not in a one-line title. */
 const TITLE_BREAKS = /[\t\n\r\u2028\u2029]/;
-const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
+/** Exactly the form Date.prototype.toISOString() writes, so stored timestamps sort as text. */
+const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 /** RFC 6838 type/subtype, restricted-name characters only, no parameters. */
 const MEDIA_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/;
 
@@ -159,7 +160,8 @@ function check(input: unknown): Validated<CatalogRecord> {
   const issues = new IssueList();
   const copy = readPlainData(input, [], READ_LIMITS, issues);
   if (copy === undefined || !isPlainObject(copy)) return { ok: false, issues: issues.items };
-  const record: Readonly<Record<string, JsonValue>> = copy;
+  // Read only the copy's own properties, never anything inherited.
+  const record: Readonly<Record<string, JsonValue | undefined>> = ownOnly(copy);
 
   const kind = record.kind;
   if (!isRecordKind(kind)) {
@@ -212,7 +214,7 @@ function check(input: unknown): Validated<CatalogRecord> {
       }
       break;
     case "place":
-      if ("coordinates" in record) checkCoordinates(record.coordinates, issues);
+      if (record.coordinates !== undefined) checkCoordinates(record.coordinates, issues);
       break;
     case "object":
     case "event":
@@ -221,7 +223,19 @@ function check(input: unknown): Validated<CatalogRecord> {
 
   if (issues.count > 0) return { ok: false, issues: issues.items };
   // The copy is plain, frozen data, and every property was checked above.
-  return { ok: true, value: record as unknown as CatalogRecord };
+  return { ok: true, value: copy as unknown as CatalogRecord };
+}
+
+/** A view of `obj` where anything not an own property reads as undefined. */
+function ownOnly(
+  obj: Readonly<Record<string, JsonValue>>,
+): Readonly<Record<string, JsonValue | undefined>> {
+  const view: Record<string, JsonValue | undefined> = Object.create(null) as Record<
+    string,
+    JsonValue | undefined
+  >;
+  for (const key of Object.keys(obj)) view[key] = obj[key];
+  return view;
 }
 
 /** The fields a caller supplies when making a new record. */
@@ -255,20 +269,34 @@ export function createRecord(
   input: NewRecordInput & { readonly fields?: Readonly<Record<string, FieldValue>> },
   now: Date = new Date(),
 ): Validated<CatalogRecord> {
-  if (!(now instanceof Date) || Number.isNaN(now.getTime())) {
+  try {
+    const time = Date.prototype.getTime.call(now);
+    if (Number.isNaN(time)) throw new RangeError("invalid time");
+    const stamp = new Date(time).toISOString();
+    // Copy the caller's input as plain data first, so getters can't run twice
+    // and nothing the caller keeps can change the new record.
+    if (types.isProxy(input) || !isPlainObject(input)) {
+      return {
+        ok: false,
+        issues: [issue([], "not_an_object", "A record must be a plain object.")],
+      };
+    }
+    const issues = new IssueList();
+    const copy = readPlainData(input, [], READ_LIMITS, issues);
+    if (copy === undefined || !isPlainObject(copy)) return { ok: false, issues: issues.items };
+    return validateRecord({
+      fields: {},
+      ...copy,
+      id: newRecordId(),
+      createdAt: stamp,
+      updatedAt: stamp,
+    });
+  } catch {
     return {
       ok: false,
       issues: [issue([], "invalid_time", "The creation time is not a valid date.")],
     };
   }
-  const stamp = now.toISOString();
-  return validateRecord({
-    fields: {},
-    ...input,
-    id: newRecordId(),
-    createdAt: stamp,
-    updatedAt: stamp,
-  });
 }
 
 export function isRecordKind(value: unknown): value is RecordKind {
@@ -311,10 +339,18 @@ function checkTimestamps(createdAt: unknown, updatedAt: unknown, issues: IssueLi
   const created = parseUtc(createdAt);
   const updated = parseUtc(updatedAt);
   if (created === undefined) {
-    issues.add(["createdAt"], "invalid_timestamp", "createdAt must be an ISO 8601 UTC timestamp.");
+    issues.add(
+      ["createdAt"],
+      "invalid_timestamp",
+      "createdAt must be an ISO 8601 UTC timestamp like 2026-11-20T16:05:00.000Z.",
+    );
   }
   if (updated === undefined) {
-    issues.add(["updatedAt"], "invalid_timestamp", "updatedAt must be an ISO 8601 UTC timestamp.");
+    issues.add(
+      ["updatedAt"],
+      "invalid_timestamp",
+      "updatedAt must be an ISO 8601 UTC timestamp like 2026-11-20T16:05:00.000Z.",
+    );
   }
   if (created !== undefined && updated !== undefined && updated < created) {
     issues.add(["updatedAt"], "before_created", "updatedAt can't be earlier than createdAt.");
@@ -327,8 +363,7 @@ function parseUtc(value: unknown): number | undefined {
   const ms = Date.parse(value);
   if (Number.isNaN(ms)) return undefined;
   // Reject dates that roll over, like February 30.
-  const normalized = new Date(ms).toISOString();
-  return normalized.slice(0, 19) === value.slice(0, 19) ? ms : undefined;
+  return new Date(ms).toISOString() === value ? ms : undefined;
 }
 
 /** Field values were already read safely; here only the top-level keys are checked. */
@@ -349,13 +384,13 @@ function checkFields(fields: unknown, issues: IssueList): void {
 }
 
 function checkOptionalLink(
-  record: Readonly<Record<string, JsonValue>>,
+  record: Readonly<Record<string, JsonValue | undefined>>,
   key: "parentId" | "represents",
   selfMessage: string,
   issues: IssueList,
 ): void {
-  if (!(key in record)) return;
   const value = record[key];
+  if (value === undefined) return;
   if (!isRecordId(value)) {
     issues.add([key], "invalid_id", `${key} must be a record ID.`);
   } else if (value === record.id) {

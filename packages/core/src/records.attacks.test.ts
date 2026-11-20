@@ -169,7 +169,7 @@ describe("text and size", () => {
     ["a lone high surrogate", "x\ud800"],
     ["a lone low surrogate", "\udc00x"],
     ["a C1 control", "a\u0085b"],
-    ["a direction override", "a‮b"],
+    ["a direction override", "a\u202eb"],
   ])("refuses field text with %s", (_label, note) => {
     expect(codes(validateRecord({ ...valid(), fields: { note } }))).toEqual(["bad_characters"]);
   });
@@ -203,7 +203,7 @@ describe("text and size", () => {
 
   it("stops at a few hundred issues, however many problems there are", () => {
     const fields: Record<string, number> = {};
-    for (let i = 0; i < 1500; i += 1) fields[`Bad${String(i)}`] = 1;
+    for (let i = 0; i < 900; i += 1) fields[`Bad${String(i)}`] = 1;
     const r = validateRecord({ ...valid(), fields });
     expect(r.ok).toBe(false);
     if (r.ok) return;
@@ -219,5 +219,97 @@ describe("text and size", () => {
       expect(i.message).not.toContain("\u0000");
       expect(i.message.length).toBeLessThan(200);
     }
+  });
+});
+
+describe("second review", () => {
+  it("escapes every hidden or direction-changing character in messages and paths", () => {
+    const r = validateRecord({ ...valid(), fields: { a: { "x\u0085\u202ey\u007f\u200b": 1 } } });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    const text = JSON.stringify(r.issues.map((i) => [i.path.map(String), i.message]));
+    const raw = r.issues.flatMap((i) => [...i.path.map(String), i.message]).join("");
+    // eslint-disable-next-line no-control-regex -- checking control characters are absent
+    expect(raw).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e]/);
+    expect(text).toContain("\\\\u202e");
+  });
+
+  it("refuses a very wide object quickly", () => {
+    const wide = JSON.parse(
+      `{${Array.from({ length: 200_000 }, (_, i) => `"\\u0001${String(i)}":1`).join(",")}}`,
+    ) as unknown;
+    const started = performance.now();
+    expect(validateRecord({ ...valid(), fields: { a: wide } }).ok).toBe(false);
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
+  it("refuses a valid-looking but very wide object quickly, by value count", () => {
+    const wide: Record<string, number> = {};
+    for (let i = 0; i < 200_000; i += 1) wide[`k${String(i)}`] = 1;
+    const started = performance.now();
+    expect(codes(validateRecord({ ...valid(), fields: { a: wide } }))).toEqual(["too_many_values"]);
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
+  it("createRecord never throws on hostile input or a fake date", () => {
+    const thrower = {
+      kind: "object",
+      get title(): string {
+        throw new Error("x");
+      },
+    };
+    expect(() => createRecord(thrower as never)).not.toThrow();
+    expect(createRecord(thrower as never).ok).toBe(false);
+    const fakeDate = Object.create(Date.prototype) as Date;
+    expect(() => createRecord({ kind: "object", title: "x" }, fakeDate)).not.toThrow();
+    expect(codes(createRecord({ kind: "object", title: "x" }, fakeDate))).toEqual(["invalid_time"]);
+  });
+
+  it("createRecord refuses getters instead of running them", () => {
+    const sneaky = {
+      kind: "object",
+      get title(): string {
+        return "X";
+      },
+    };
+    expect(codes(createRecord(sneaky as never))).toEqual(["not_plain_data"]);
+  });
+
+  it("ignores values inherited from a polluted Object.prototype", () => {
+    const proto = Object.prototype as Record<string, unknown>;
+    proto.title = "P";
+    try {
+      const input = valid();
+      delete input.title;
+      expect(codes(validateRecord(input))).toEqual(["required"]);
+    } finally {
+      delete proto.title;
+    }
+  });
+
+  it.each(["\u200b", "a\u200fb", "a\u061cb", "\ufeffTitle", "a\uffffb"])(
+    "refuses invisible or direction-changing characters in a title: %j",
+    (title) => {
+      expect(codes(validateRecord({ ...valid(), title }))).toContain("bad_characters");
+    },
+  );
+
+  it("keeps zero-width joiners, which emoji and some scripts need", () => {
+    expect(validateRecord({ ...valid(), title: "Family 👨\u200d👩\u200d👧" }).ok).toBe(true);
+  });
+
+  it("refuses a Map or Date disguised with a plain prototype", () => {
+    const m = new Map([[1, 2]]);
+    Object.setPrototypeOf(m, Object.prototype);
+    expect(codes(validateRecord({ ...valid(), fields: { a: m } }))).toEqual(["not_json"]);
+    const d = new Date();
+    Object.setPrototypeOf(d, Object.prototype);
+    expect(codes(validateRecord({ ...valid(), fields: { a: d } }))).toEqual(["not_json"]);
+  });
+
+  it("refuses hidden list entries", () => {
+    const list: unknown[] = [1];
+    Object.defineProperty(list, 0, { value: 9, enumerable: false });
+    expect(codes(validateRecord({ ...valid(), fields: { list } }))).toEqual(["not_plain_data"]);
   });
 });

@@ -183,6 +183,7 @@ describe("validateRecord: common properties", () => {
     "2026-11-20",
     "2026-11-20T16:05:00",
     "2026-11-20T16:05:00+00:00",
+    "2026-11-20T24:00:00.000Z",
     "2026-02-30T00:00:00Z",
     "2026-13-01T00:00:00Z",
     "Nov 20 2026",
@@ -193,16 +194,14 @@ describe("validateRecord: common properties", () => {
     ).toEqual(["invalid_timestamp", "invalid_timestamp"]);
   });
 
-  it("accepts timestamps with and without milliseconds", () => {
-    const r = validateRecord(
-      base({
-        kind: "object",
-        createdAt: "2026-11-20T16:05:00Z",
-        updatedAt: "2026-11-20T16:05:00.5Z",
-      }),
-    );
-    expect(r.ok).toBe(true);
-  });
+  it.each(["2026-11-20T16:05:00Z", "2026-11-20T16:05:00.5Z", "2026-11-20T16:05:00.50Z"])(
+    "accepts only the one canonical spelling, not %j",
+    (stamp) => {
+      expect(
+        codes(validateRecord(base({ kind: "object", createdAt: stamp, updatedAt: stamp }))),
+      ).toEqual(["invalid_timestamp", "invalid_timestamp"]);
+    },
+  );
 
   it("rejects updatedAt before createdAt", () => {
     const r = validateRecord(base({ kind: "object", updatedAt: "2026-11-20T16:04:59.999Z" }));
