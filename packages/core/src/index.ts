@@ -44,3 +44,19 @@ export {
   validateArrangement,
   unfiledUnits,
 } from "./arrangement.js";
+
+export {
+  MAX_EDTF_LENGTH,
+  MAX_SET_MEMBERS,
+  MAX_EDTF_YEAR,
+  parseEdtf,
+  isEdtf,
+  compareEdtf,
+  dayKey,
+  daysInMonth,
+  isLeapYear,
+} from "./edtf.js";
+export type { CalendarDay, EdtfDate, EdtfKind, EdtfLevel } from "./edtf.js";
+
+export { MAX_DATE_TEXT_LENGTH, edtfFromText } from "./edtf-text.js";
+export type { EdtfFromText, EdtfFromTextOptions } from "./edtf-text.js";
