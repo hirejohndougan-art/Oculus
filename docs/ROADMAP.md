@@ -14,11 +14,13 @@ These are never picked by a run. The weekly report repeats each question until J
 
 The data model in TypeScript, written for any archive or museum rather than one organization. There is no server or database yet: these are pure, tested modules in `packages/core`.
 
-- [ ] T-001 **Project scaffold and gate.**
+- [x] T-001 **Project scaffold and gate.**
   - An npm workspaces repo with `packages/core`: TypeScript in strict mode, ESLint, Prettier and Vitest.
   - `npm run gate` runs format, lint, typecheck, tests, build, `npm audit --audit-level=high` and a license check (MIT, BSD, ISC, Apache-2.0 or similarly permissive only).
   - `gate-baseline.json`, `.nvmrc` with the current Node LTS, and a GitHub Actions workflow that runs the gate on every push.
   - At least one real test, so the gate shows it is working.
+- [ ] T-001a **Turn on GitHub security alerts.** (needs John)
+  - Dependabot alerts are disabled on the repository and code scanning isn't reachable from the autopilot. John: enable Dependabot alerts and CodeQL default setup in the repo's Settings → Code security, so the security run can read them.
 - [ ] T-002 **Record types.** deps: T-001
   - Types and validators for object, archival unit (collection > series > file > item, nested to any depth), digital asset, agent (person, organization, family), place and event.
   - Every record has a permanent internal UUID.
