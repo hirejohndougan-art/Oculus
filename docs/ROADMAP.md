@@ -21,7 +21,7 @@ The data model in TypeScript, written for any archive or museum rather than one 
   - At least one real test, so the gate shows it is working.
 - [ ] T-001a **Turn on GitHub security alerts.** (needs John)
   - Dependabot alerts are disabled on the repository and code scanning isn't reachable from the autopilot. John: enable Dependabot alerts and CodeQL default setup in the repo's Settings → Code security, so the security run can read them.
-- [ ] T-002 **Record types.** deps: T-001
+- [x] T-002 **Record types.** deps: T-001
   - Types and validators for object, archival unit (collection > series > file > item, nested to any depth), digital asset, agent (person, organization, family), place and event.
   - Every record has a permanent internal UUID.
   - Collections and series stay independent of each other (PLATFORM_PLAN.md §1).
