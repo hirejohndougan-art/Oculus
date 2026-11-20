@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Back end: Hermes site editor</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@500;600;700&amp;family=Open+Sans:wght@400;600&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#1d4f73}a:hover{color:#0f2f47}
+</style>
+</helmet>
+<div style="font-family: 'Open Sans', system-ui, sans-serif; color: #2f3337; background: #e9ecf0; min-height: 100vh; display: flex; flex-direction: column">
+
+<header style="background: #26292c; color: #ffffff; padding: 10px 20px; display: flex; flex-wrap: wrap; align-items: center; gap: 14px">
+<a href="AdminDashboard.dc.html" style="display: inline-flex; align-items: center; min-height: 44px; padding: 0 12px; color: #ffffff; text-decoration: none; font-size: 14px; border: 1px solid #5a5f64; border-radius: 4px">← Back to Polybius</a>
+<div style="display: flex; flex-direction: column">
+<span style="font-family: Roboto, sans-serif; font-weight: 600; font-size: 16px">Hermes · Digital Archive</span>
+<label for="pg" style="position: absolute; left: -9999px">Page</label>
+<select id="pg" style="margin-top: 2px; height: 32px; padding: 0 8px; border: 1px solid #5a5f64; border-radius: 4px; background: #3c4044; color: #ffffff; font-family: inherit; font-size: 13px"><option>Home</option><option>Browse (template)</option><option>Item page (template)</option><option>Finding aid (template)</option></select>
+</div>
+<div role="group" aria-label="Preview size" style="margin-left: auto; display: flex">
+<sc-for list="{{devices}}" as="d" hint-placeholder-count="3">
+<button type="button" aria-pressed="{{d.on}}" onClick="{{d.pick}}" style="min-height: 44px; padding: 0 14px; border: 1px solid #5a5f64; background: {{d.bg}}; color: #ffffff; font-family: inherit; font-size: 13px">{{d.label}}</button>
+</sc-for>
+</div>
+<span style="font-size: 13px; color: #c9cdd1">Draft saved [time]</span>
+<a href="Main.dc.html" style="display: inline-flex; align-items: center; min-height: 44px; padding: 0 16px; color: #ffffff; text-decoration: none; font-weight: 600; font-size: 14px; border: 1px solid #8b939c; border-radius: 4px">Preview</a>
+<button type="button" style="min-height: 44px; padding: 0 18px; background: {{accent}}; color: #1a1a1a; border: 0; font-family: Roboto, sans-serif; font-weight: 600; font-size: 15px; border-radius: 4px">Publish changes</button>
+</header>
+
+<div style="flex: 1; display: flex; flex-wrap: wrap; min-height: 0">
+
+<aside aria-label="Widgets" style="flex: 0 0 260px; background: #ffffff; border-right: 1px solid #d7dce2; padding: 18px; display: flex; flex-direction: column; gap: 14px; box-sizing: border-box">
+<div style="display: flex; flex-direction: column; gap: 6px"><label for="wsearch" style="font-size: 13px; font-weight: 600">Find a widget</label><input id="wsearch" type="search" placeholder="e.g. timeline" style="height: 40px; padding: 0 10px; border: 1px solid #8b939c; border-radius: 4px; font-size: 14px; font-family: inherit"></div>
+<sc-for list="{{groups}}" as="g" hint-placeholder-count="3">
+<div style="display: flex; flex-direction: column; gap: 8px">
+<span style="font-size: 12px; font-weight: 600; letter-spacing: 1px; text-transform: uppercase; color: #4a5056">{{g.name}}</span>
+<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px">
+<sc-for list="{{g.items}}" as="w" hint-placeholder-count="4">
+<button type="button" style="min-height: 56px; padding: 6px; background: #f3f5f8; border: 1px solid #d7dce2; border-radius: 4px; font-family: inherit; font-size: 13px; color: #2f3337; cursor: grab">{{w}}</button>
+</sc-for>
+</div>
+</div>
+</sc-for>
+</aside>
+
+<main style="flex: 1 1 560px; min-width: 0; padding: 24px; display: flex; justify-content: center; box-sizing: border-box">
+<div style="width: 100%; max-width: {{frameW}}; background: #ffffff; box-shadow: 0 2px 10px rgba(0,0,0,0.12); border-radius: 4px; overflow: hidden; align-self: flex-start">
+<div style="background: #3c3c3c; color: #ffffff; padding: 14px 20px; display: flex; justify-content: space-between; font-family: Roboto, sans-serif; font-size: 14px"><span style="font-weight: 700">Dickinson Historical Society</span><span>Home · Browse · Collections · …</span></div>
+<div style="position: relative; margin: 14px; padding: 28px 24px; border: 2px solid {{accent}}; border-radius: 4px; display: flex; flex-wrap: wrap; gap: 20px; align-items: center">
+<span style="position: absolute; top: -13px; left: 10px; background: {{accent}}; color: #1a1a1a; font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 3px">Search · Hero (selected)</span>
+<div style="flex: 1 1 260px; display: flex; flex-direction: column; gap: 10px">
+<span style="font-family: Roboto, sans-serif; font-weight: 700; font-size: 26px; color: #111111; line-height: 1.15">{{heading}}</span>
+<span style="height: 40px; border: 1px solid #8b939c; border-radius: 4px; display: flex; align-items: center; padding: 0 12px; font-size: 13px; color: #555555">Names, places, subjects, ID numbers</span>
+</div>
+<img src="/_blob/2e9e77821dec3d46d57a32fdc4e99dbc" alt="" style="flex: 1 1 200px; min-width: 0; height: 170px; object-fit: cover; border-radius: 4px">
+</div>
+<sc-for list="{{blocks}}" as="b" hint-placeholder-count="4">
+<div style="margin: 14px; padding: 18px; border: 1px dashed #b7bec7; border-radius: 4px; display: flex; justify-content: space-between; align-items: center; gap: 12px">
+<span style="display: flex; flex-direction: column; gap: 2px"><span style="font-weight: 600; font-size: 14px; color: #111111">{{b.name}}</span><span style="font-size: 12px; color: #4a5056">{{b.src}}</span></span>
+<span style="font-size: 12px; color: #4a5056">Drag to reorder</span>
+</div>
+</sc-for>
+</div>
+</main>
+
+<aside aria-label="Widget settings" style="flex: 0 0 300px; background: #ffffff; border-left: 1px solid #d7dce2; padding: 18px; display: flex; flex-direction: column; gap: 16px; box-sizing: border-box">
+<h2 style="margin: 0; font-family: Roboto, sans-serif; font-weight: 600; font-size: 17px; color: #111111">Search · Hero</h2>
+<div style="display: flex; flex-direction: column; gap: 6px"><label for="s-head" style="font-size: 13px; font-weight: 600">Heading</label><input id="s-head" type="text" value="{{heading}}" onInput="{{setHeading}}" style="height: 40px; padding: 0 10px; border: 1px solid #8b939c; border-radius: 4px; font-size: 14px; font-family: inherit"></div>
+<div style="display: flex; flex-direction: column; gap: 6px"><label for="s-img" style="font-size: 13px; font-weight: 600">Image</label><select id="s-img" style="height: 40px; padding: 0 8px; border: 1px solid #8b939c; border-radius: 4px; font-size: 14px; font-family: inherit; background: #ffffff"><option>From a record: Aerial View of Dickinson</option><option>Rotate featured items</option><option>Upload an image</option></select></div>
+<div style="display: flex; flex-direction: column; gap: 6px"><label for="s-scope" style="font-size: 13px; font-weight: 600">Search covers</label><select id="s-scope" style="height: 40px; padding: 0 8px; border: 1px solid #8b939c; border-radius: 4px; font-size: 14px; font-family: inherit; background: #ffffff"><option>Everything published to this site</option><option>One collection</option></select></div>
+<fieldset style="margin: 0; padding: 12px; border: 1px solid #d7dce2; border-radius: 4px; display: flex; flex-direction: column; gap: 8px">
+<legend style="padding: 0 4px; font-size: 13px; font-weight: 600">Suggested searches</legend>
+<label style="display: flex; align-items: center; gap: 8px; font-size: 14px"><input type="checkbox" checked style="width: 18px; height: 18px">Show "Try:" links</label>
+<span style="font-size: 13px; color: #4a5056">Dickinson Bayou, Railroad, 1900 Storm, Cemetery records</span>
+</fieldset>
+<p style="margin: 0; font-size: 12px; line-height: 1.5; color: #4a5056">Widgets pull live from Polybius. Publishing a record shows it here; no export or import step.</p>
+</aside>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","default":"#f0792d","options":["#f0792d","#e0b341","#4f9fd6","#7fb069"]},"$preview":{"width":1440,"height":1000}}'>
+class Component extends DCLogic {
+  constructor(props) { super(props); this.state = { device: 'desktop', heading: 'Explore the history of Dickinson and Galveston County' }; }
+  renderVals() {
+    const accent = this.props.accent ?? '#f0792d';
+    const dev = [{ id: 'desktop', label: 'Desktop', w: '1000px' }, { id: 'tablet', label: 'Tablet', w: '720px' }, { id: 'phone', label: 'Phone', w: '390px' }];
+    const cur = dev.find((d) => d.id === this.state.device);
+    return {
+      accent,
+      heading: this.state.heading,
+      setHeading: (e) => this.setState({ heading: e.target.value }),
+      frameW: cur.w,
+      devices: dev.map((d) => ({ label: d.label, on: d.id === this.state.device, bg: d.id === this.state.device ? '#5a5f64' : 'transparent', pick: () => this.setState({ device: d.id }) })),
+      groups: [
+        { name: 'Collections', items: ['Search', 'Browse', 'Item grid', 'Featured item', 'Finding aid', 'Collection cards'] },
+        { name: 'Storytelling', items: ['Exhibit', 'Timeline', 'Map', 'Gallery'] },
+        { name: 'Layout', items: ['Box', 'Heading', 'Text', 'Button'] }
+      ],
+      blocks: [
+        { name: 'Collection cards', src: 'Shows: 4 collections, newest first' },
+        { name: 'Featured item', src: 'Record: Dickinson Station and Park' },
+        { name: 'Item grid · Recent additions', src: 'Last 6 records published to this site' },
+        { name: 'Timeline', src: 'Records tagged “Dickinson milestones”' },
+        { name: 'Map + Exhibits', src: 'Records with a map pin · 3 exhibits' }
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>

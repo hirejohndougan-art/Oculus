@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Finding aid</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@500;600;700&amp;family=Open+Sans:wght@400;600&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#1d4f73}a:hover{color:#0f2f47}
+summary{cursor:pointer}
+</style>
+</helmet>
+<div style="font-family: 'Open Sans', system-ui, sans-serif; color: #3a3a3a; background: #e5e9ef; min-height: 100vh">
+
+<header style="background: #3c3c3c; color: #ffffff">
+<div style="max-width: 1240px; margin: 0 auto; padding: 0 32px; min-height: 76px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px">
+<a href="Main.dc.html" style="display: flex; flex-direction: column; text-decoration: none; color: #ffffff; padding: 12px 0">
+<span style="font-family: Roboto, sans-serif; font-weight: 700; font-size: 20px">Dickinson Historical Society</span>
+<span style="font-size: 13px; color: #d6d6d6; letter-spacing: 1.5px; text-transform: uppercase">Digital Archive</span>
+</a>
+<nav aria-label="Main" style="display: flex; flex-wrap: wrap; align-items: center; gap: 4px">
+<a href="Main.dc.html" style="color: #ffffff; text-decoration: none; font-family: Roboto, sans-serif; font-weight: 500; font-size: 15px; padding: 12px 14px">Home</a>
+<a href="Browse.dc.html" style="color: #ffffff; text-decoration: none; font-family: Roboto, sans-serif; font-weight: 500; font-size: 15px; padding: 12px 14px">Browse</a>
+<a href="Browse.dc.html" style="color: #ffffff; text-decoration: none; font-family: Roboto, sans-serif; font-weight: 500; font-size: 15px; padding: 12px 14px">Collections</a>
+<a href="FindingAid.dc.html" aria-current="page" style="color: #ffffff; text-decoration: none; font-family: Roboto, sans-serif; font-weight: 500; font-size: 15px; padding: 12px 14px; border-bottom: 3px solid {{accent}}">Finding aids</a>
+<a href="Main.dc.html" style="color: #ffffff; text-decoration: none; font-family: Roboto, sans-serif; font-weight: 500; font-size: 15px; padding: 12px 14px">Exhibits</a>
+<a href="Main.dc.html" style="color: #ffffff; text-decoration: none; font-family: Roboto, sans-serif; font-weight: 500; font-size: 15px; padding: 12px 14px">Map</a>
+<a href="#" style="margin-left: 8px; background: {{accent}}; color: #1a1a1a; text-decoration: none; font-family: Roboto, sans-serif; font-weight: 600; font-size: 15px; padding: 12px 18px; border-radius: 4px">Donate</a>
+</nav>
+</div>
+</header>
+
+<main style="max-width: 1240px; margin: 0 auto; padding: 28px 32px 56px; display: flex; flex-direction: column; gap: 24px">
+<nav aria-label="Breadcrumb" style="font-size: 14px"><a href="Main.dc.html">Home</a> <span aria-hidden="true">›</span> <a href="Browse.dc.html">Collections</a> <span aria-hidden="true">›</span> Historic Railroad Center</nav>
+
+<div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end; gap: 16px">
+<div style="display: flex; flex-direction: column; gap: 8px">
+<span style="font-family: Roboto, sans-serif; font-weight: 600; font-size: 13px; letter-spacing: 1.5px; text-transform: uppercase; color: #8a4310">Finding-aid tree widget</span>
+<h1 style="margin: 0; font-family: Roboto, sans-serif; font-weight: 700; font-size: 38px; color: #111111">Historic Railroad Center Collection</h1>
+<span style="font-size: 15px">1909–2006 · [Extent, e.g. 2 linear feet and 0.4 GB]</span>
+</div>
+<div style="display: flex; flex-wrap: wrap; gap: 10px">
+<a href="#" style="display: inline-flex; align-items: center; min-height: 48px; padding: 0 18px; background: #111111; color: #ffffff; text-decoration: none; font-family: Roboto, sans-serif; font-weight: 600; border-radius: 4px">Download EAD</a>
+<a href="#" style="display: inline-flex; align-items: center; min-height: 48px; padding: 0 18px; background: #ffffff; color: #111111; border: 1px solid #8b939c; text-decoration: none; font-family: Roboto, sans-serif; font-weight: 600; border-radius: 4px">Print / PDF</a>
+</div>
+</div>
+
+<div style="display: flex; flex-wrap: wrap; gap: 32px; align-items: flex-start">
+
+<section aria-labelledby="sum-h" style="flex: 1 1 360px; min-width: 0; background: #ffffff; border-radius: 6px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.12); display: flex; flex-direction: column; gap: 16px">
+<h2 id="sum-h" style="margin: 0; font-family: Roboto, sans-serif; font-weight: 700; font-size: 20px; color: #111111">Collection summary (DACS)</h2>
+<dl style="margin: 0; display: flex; flex-direction: column; gap: 14px; font-size: 14px; line-height: 1.55">
+<sc-for list="{{summary}}" as="s" hint-placeholder-count="7">
+<div style="display: flex; flex-direction: column; gap: 2px">
+<dt style="font-weight: 600; color: #222222">{{s.k}}</dt>
+<dd style="margin: 0">{{s.v}}</dd>
+</div>
+</sc-for>
+</dl>
+</section>
+
+<section aria-labelledby="tree-h" style="flex: 2 1 560px; min-width: 0; display: flex; flex-direction: column; gap: 14px">
+<div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px">
+<h2 id="tree-h" style="margin: 0; font-family: Roboto, sans-serif; font-weight: 700; font-size: 24px; color: #111111">Contents</h2>
+<div style="display: flex; flex-direction: column; gap: 4px">
+<label for="within" style="font-size: 13px; font-weight: 600">Search within this collection</label>
+<input id="within" type="search" placeholder="e.g. depot" style="height: 44px; width: 260px; max-width: 100%; padding: 0 12px; border: 1px solid #8b939c; border-radius: 4px; font-size: 15px; font-family: inherit">
+</div>
+</div>
+
+<sc-for list="{{series}}" as="se" hint-placeholder-count="3">
+<details open style="background: #ffffff; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.12)">
+<summary style="min-height: 56px; display: flex; align-items: center; gap: 12px; padding: 0 20px; font-family: Roboto, sans-serif; font-weight: 600; font-size: 17px; color: #111111; border-bottom: 1px solid #e1e5ea">
+<span style="font-size: 12px; font-weight: 600; letter-spacing: 1px; text-transform: uppercase; color: #555555">Series {{se.n}}</span>
+<span style="flex: 1">{{se.title}}</span>
+<span style="font-family: 'Open Sans', sans-serif; font-weight: 400; font-size: 13px; color: #555555">{{se.dates}}</span>
+</summary>
+<div style="padding: 8px 20px 16px 36px; display: flex; flex-direction: column; gap: 6px">
+<sc-for list="{{se.files}}" as="fi" hint-placeholder-count="2">
+<details open>
+<summary style="min-height: 44px; display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 15px; color: #222222">
+<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h7l2 2h9v11H3z"></path></svg>
+<span style="flex: 1">File: {{fi.title}}</span>
+<span style="font-weight: 400; font-size: 13px; color: #555555">{{fi.loc}}</span>
+</summary>
+<ul style="list-style: none; margin: 0 0 6px; padding: 0 0 0 26px; display: flex; flex-direction: column; gap: 2px">
+<sc-for list="{{fi.items}}" as="it" hint-placeholder-count="3">
+<li>
+<a href="Item.dc.html" style="min-height: 40px; display: flex; align-items: center; gap: 12px; text-decoration: none; color: #1d4f73; font-size: 14px; border-bottom: 1px solid #eef1f4">
+<span style="width: 48px; height: 32px; flex: 0 0 48px; background: #c9d0d8; border-radius: 3px"></span>
+<span style="flex: 1; text-decoration: underline">{{it.title}}</span>
+<span style="color: #555555; font-size: 13px">{{it.kind}} · {{it.date}}</span>
+</a>
+</li>
+</sc-for>
+</ul>
+</details>
+</sc-for>
+</div>
+</details>
+</sc-for>
+</section>
+</div>
+</main>
+
+<footer style="background: #3c3c3c; color: #e6e6e6">
+<div style="max-width: 1240px; margin: 0 auto; padding: 32px; display: flex; flex-wrap: wrap; gap: 24px; justify-content: space-between; font-size: 14px">
+<span>Dickinson Historical Society · Dickinson, Texas</span>
+<span style="color: #cfcfcf">Powered by Hermes + Polybius · <a href="Login.dc.html" style="color: #ffffff">Staff sign in</a></span>
+</div>
+</footer>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","default":"#f0792d","options":["#f0792d","#e0b341","#4f9fd6","#7fb069"]},"$preview":{"width":1440,"height":1600}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return {
+      accent: this.props.accent ?? '#f0792d',
+      summary: [
+        { k: 'Creator', v: 'Dickinson Historical Society' },
+        { k: 'Dates', v: '1909–2006' },
+        { k: 'Extent', v: '[Extent]' },
+        { k: 'Scope and content', v: 'Photographs, documents and video about the GH&H railroad in Dickinson: the depot and park, strawberry shipping, the interurban, and the depot’s move and restoration.' },
+        { k: 'Arrangement', v: 'Three series by format: photographs, documents, audiovisual.' },
+        { k: 'Access', v: '[Conditions governing access]' },
+        { k: 'Reuse', v: '[rightsstatements.org statement]' },
+        { k: 'Provenance', v: '[Unknown for most items; to be confirmed]' }
+      ],
+      series: [
+        { n: 1, title: 'Photographs', dates: '1909–1972', files: [
+          { title: 'GH&H Depot, 1902–1967', loc: 'Box [00], Folder [00]', items: [
+            { title: 'Dickinson Station and Park', kind: 'Photograph', date: '1909' },
+            { title: 'Dickinson Depot Move', kind: 'Photograph', date: '1967' },
+            { title: 'Placing the Depot Cupola', kind: 'Photograph', date: '1972' }
+          ] },
+          { title: 'Freight and bridges', loc: 'Box [00], Folder [00]', items: [
+            { title: 'Loading Strawberries', kind: 'Photograph', date: 'April 25, 1909' },
+            { title: 'Interurban Bridge over Dickinson Bayou', kind: 'Photograph', date: '[Date]' },
+            { title: 'Galveston Causeway Bridge', kind: 'Photograph', date: '1911' }
+          ] }
+        ] },
+        { n: 2, title: 'Documents', dates: '2006', files: [
+          { title: 'Depot museum planning', loc: 'Box [00], Folder [00]', items: [
+            { title: 'Depot Museum Exhibit Plan', kind: 'Document', date: '2006' }
+          ] }
+        ] },
+        { n: 3, title: 'Audiovisual', dates: '2000', files: [
+          { title: 'Restoration campaign', loc: 'Digital', items: [
+            { title: 'Railroad Restoration Video', kind: 'Video', date: '2000' }
+          ] }
+        ] }
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>

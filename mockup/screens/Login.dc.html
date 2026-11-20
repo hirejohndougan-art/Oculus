@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sign in</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@500;600;700&amp;family=Open+Sans:wght@400;600&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#1d4f73}a:hover{color:#0f2f47}
+</style>
+</helmet>
+<div style="font-family: 'Open Sans', system-ui, sans-serif; color: #2f3337; background: #3c3c3c; min-height: 100vh; display: flex; flex-wrap: wrap"><div style="flex: 1 1 520px; min-height: 420px; background: #2a2d30 url(/_blob/2e9e77821dec3d46d57a32fdc4e99dbc) center / cover no-repeat; position: relative"><div style="position: absolute; left: 0; right: 0; bottom: 0; padding: 32px; background: linear-gradient(transparent, rgba(0,0,0,0.75)); color: #ffffff"><span style="font-size: 13px">Aerial view of Dickinson, Texas, late 1920s · Dickinson Historical Society</span></div></div><main style="flex: 1 1 480px; background: #f3f5f8; display: flex; align-items: center; justify-content: center; padding: 48px 32px; box-sizing: border-box"><div style="width: 100%; max-width: 420px; display: flex; flex-direction: column; gap: 22px"><div style="display: flex; flex-direction: column; gap: 4px"><span style="font-family: Roboto, sans-serif; font-weight: 700; font-size: 34px; color: #111111">Polybius</span><span style="font-size: 15px; color: #4a5056">Dickinson Historical Society · collections and archive</span></div><h1 style="margin: 0; font-family: Roboto, sans-serif; font-weight: 700; color: #111111; font-size: 24px">Sign in</h1><div style="display: flex; flex-direction: column; gap: 6px; min-width: 0"><label for="em" style="font-size: 14px; font-weight: 600; color: #222222">Email</label><input id="em" type="email" placeholder="you@example.org" style="height: 44px; padding: 0 12px; border: 1px solid #8b939c; border-radius: 4px; font-size: 15px; font-family: inherit; background: #ffffff; box-sizing: border-box; width: 100%"></div><div style="display: flex; flex-direction: column; gap: 6px; min-width: 0"><label for="pw" style="font-size: 14px; font-weight: 600; color: #222222">Password</label><input id="pw" type="password" style="height: 44px; padding: 0 12px; border: 1px solid #8b939c; border-radius: 4px; font-size: 15px; font-family: inherit; background: #ffffff; box-sizing: border-box; width: 100%"></div><label style="display: flex; align-items: center; gap: 10px; font-size: 14px"><input type="checkbox" style="width: 18px; height: 18px">Keep me signed in on this computer</label><a href="AdminDashboard.dc.html" style="display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 44px; padding: 0 18px; text-decoration: none; font-family: Roboto, sans-serif; font-weight: 600; font-size: 15px; border-radius: 4px; box-sizing: border-box; background: #111111; color: #ffffff; border: 0">Sign in</a><div style="display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; font-size: 14px"><a href="#">Forgot your password?</a><a href="WizSetup.dc.html">Setting up a new archive?</a></div><div style="padding: 12px 14px; background: #eaf2fa; border: 1px solid #a9c6e2; border-radius: 4px; font-size: 14px; line-height: 1.5; color: #1d3b55">Volunteers sign in with the account an administrator made for them. Roles decide what each person can see and change.</div><a href="Main.dc.html" style="font-size: 14px">← Back to the public Digital Archive</a></div></main></div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","default":"#f0792d","options":["#f0792d","#e0b341","#4f9fd6","#7fb069"]},"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  spec() { return {"tabs": {}, "choices": {}, "toggles": {}, "wiz": null}; }
+  constructor(props) {
+    super(props);
+    const s = this.spec();
+    const tabs = {}; Object.keys(s.tabs).forEach((n) => { tabs[n] = s.tabs[n][0]; });
+    const ch = {}; Object.keys(s.choices).forEach((n) => { const c = s.choices[n]; ch[n] = c.multi ? (c.init === -1 ? [] : [].concat(c.init)) : c.init; });
+    this.state = { tabs, ch, tg: Object.assign({}, s.toggles), step: 0 };
+  }
+  renderVals() {
+    const accent = this.props.accent ?? '#f0792d';
+    const s = this.spec();
+    const v = { accent };
+    Object.keys(s.tabs).forEach((n) => {
+      s.tabs[n].forEach((id) => {
+        const on = this.state.tabs[n] === id;
+        v['tabsel_' + n + '_' + id] = on;
+        v['tabon_' + n + '_' + id] = on;
+        v['tabline_' + n + '_' + id] = on ? accent : 'transparent';
+        v['tabpick_' + n + '_' + id] = () => this.setState({ tabs: Object.assign({}, this.state.tabs, { [n]: id }) });
+      });
+    });
+    Object.keys(s.choices).forEach((n) => {
+      const c = s.choices[n];
+      const cur = this.state.ch[n];
+      const isOn = (i) => (c.multi ? cur.indexOf(i) >= 0 : cur === i);
+      v['ch_' + n] = c.opts.map((o, i) => ({
+        label: o.label, sub: o.sub || '', hasSub: !!o.sub, on: isOn(i),
+        ring: isOn(i) ? accent : '#d7dce2', bg: isOn(i) ? '#fff7f0' : '#ffffff',
+        dot: isOn(i) ? '#3c3c3c' : '#ffffff', shape: c.multi ? '3px' : '50%',
+        pick: () => {
+          let next;
+          if (c.multi) { next = isOn(i) ? cur.filter((x) => x !== i) : cur.concat([i]); } else { next = i; }
+          this.setState({ ch: Object.assign({}, this.state.ch, { [n]: next }) });
+        },
+      }));
+      const sel = c.multi ? null : c.opts[cur];
+      v['ch_' + n + '_hasnote'] = !!(sel && sel.note);
+      v['ch_' + n + '_note'] = sel && sel.note ? sel.note : '';
+      v['ch_' + n + '_chosen'] = sel ? sel.label : '';
+      c.opts.forEach((o, i) => { v['chis_' + n + '_' + i] = isOn(i); });
+    });
+    Object.keys(s.toggles).forEach((n) => {
+      const on = !!this.state.tg[n];
+      v['tg_' + n] = on; v['tgnot_' + n] = !on;
+      v['tgflip_' + n] = () => this.setState({ tg: Object.assign({}, this.state.tg, { [n]: !on }) });
+    });
+    if (s.wiz) {
+      const st = this.state.step; const n = s.wiz.length;
+      const go = (i) => () => this.setState({ step: i });
+      s.wiz.forEach((t, i) => { v['st_' + i] = st === i; v['go_' + i] = go(i); });
+      v.rail = s.wiz.map((t, i) => ({
+        n: i < st ? '✓' : String(i + 1), title: t, pick: go(i),
+        bg: i === st ? '#3c4044' : 'transparent', numBg: i === st ? accent : (i < st ? '#5a6168' : 'transparent'),
+        numFg: i === st ? '#1a1a1a' : '#ffffff', fg: i === st ? '#ffffff' : (i < st ? '#dfe3e7' : '#aeb4ba'),
+        cur: i === st ? 'step' : 'false',
+      }));
+      v.stepNum = st + 1; v.stepCount = n; v.pct = Math.round(((st + 1) / n) * 100) + '%';
+      v.isFirst = st === 0; v.notFirst = st > 0; v.isLast = st === n - 1; v.notLast = st < n - 1;
+      v.goBack = go(Math.max(st - 1, 0)); v.goNext = go(Math.min(st + 1, n - 1));
+    }
+    return v;
+  }
+}
+</script>
+</body>
+</html>

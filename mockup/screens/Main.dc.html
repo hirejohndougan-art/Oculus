@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Archive home</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@500;600;700&amp;family=Open+Sans:wght@400;600&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#1d4f73}a:hover{color:#0f2f47}
+</style>
+</helmet>
+<div style="font-family: 'Open Sans', system-ui, sans-serif; color: #3a3a3a; background: #e5e9ef; min-height: 100vh">
+
+<header style="background: #3c3c3c; color: #ffffff">
+<div style="max-width: 1240px; margin: 0 auto; padding: 0 32px; min-height: 76px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px">
+<a href="Main.dc.html" style="display: flex; flex-direction: column; text-decoration: none; color: #ffffff; padding: 12px 0">
+<span style="font-family: Roboto, sans-serif; font-weight: 700; font-size: 20px; letter-spacing: 0.2px">Dickinson Historical Society</span>
+<span style="font-size: 13px; color: #d6d6d6; letter-spacing: 1.5px; text-transform: uppercase">Digital Archive</span>
+</a>
+<nav aria-label="Main" style="display: flex; flex-wrap: wrap; align-items: center; gap: 4px">
+<a href="Main.dc.html" style="color: #ffffff; text-decoration: none; font-family: Roboto, sans-serif; font-weight: 500; font-size: 15px; padding: 12px 14px; border-bottom: 3px solid {{accent}}">Home</a>
+<a href="Browse.dc.html" style="color: #ffffff; text-decoration: none; font-family: Roboto, sans-serif; font-weight: 500; font-size: 15px; padding: 12px 14px">Browse</a>
+<a href="Browse.dc.html" style="color: #ffffff; text-decoration: none; font-family: Roboto, sans-serif; font-weight: 500; font-size: 15px; padding: 12px 14px">Collections</a>
+<a href="FindingAid.dc.html" style="color: #ffffff; text-decoration: none; font-family: Roboto, sans-serif; font-weight: 500; font-size: 15px; padding: 12px 14px">Finding aids</a>
+<a href="#exhibits" style="color: #ffffff; text-decoration: none; font-family: Roboto, sans-serif; font-weight: 500; font-size: 15px; padding: 12px 14px">Exhibits</a>
+<a href="#map" style="color: #ffffff; text-decoration: none; font-family: Roboto, sans-serif; font-weight: 500; font-size: 15px; padding: 12px 14px">Map</a>
+<a href="#" style="margin-left: 8px; background: {{accent}}; color: #1a1a1a; text-decoration: none; font-family: Roboto, sans-serif; font-weight: 600; font-size: 15px; padding: 12px 18px; border-radius: 4px">Donate</a>
+</nav>
+</div>
+</header>
+
+<section aria-labelledby="hero-h" style="background: #ffffff; border-bottom: 1px solid #cfd5dd">
+<div style="max-width: 1240px; margin: 0 auto; padding: 72px 32px 64px; display: flex; flex-wrap: wrap; gap: 48px; align-items: center">
+<div style="flex: 1 1 520px; min-width: 0; display: flex; flex-direction: column; gap: 20px">
+<p style="margin: 0; font-family: Roboto, sans-serif; font-weight: 600; font-size: 14px; letter-spacing: 1.5px; text-transform: uppercase; color: #8a4310">Search widget · Hero</p>
+<h1 id="hero-h" style="margin: 0; font-family: Roboto, sans-serif; font-weight: 700; font-size: 52px; line-height: 1.1; color: #111111">Explore the history of Dickinson and Galveston County</h1>
+<p style="margin: 0; font-size: 18px; line-height: 1.6; max-width: 620px">Photographs, documents, maps, oral histories and objects from the Society's collections, cataloged in Polybius and published here live.</p>
+<form action="Browse.dc.html" style="display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin-top: 8px">
+<div style="flex: 1 1 320px; display: flex; flex-direction: column; gap: 6px">
+<label for="q" style="font-size: 14px; font-weight: 600; color: #222222">Search the archive</label>
+<input id="q" type="search" placeholder="Names, places, subjects, ID numbers" style="height: 52px; padding: 0 16px; font-size: 16px; border: 1px solid #8b939c; border-radius: 4px; font-family: inherit">
+</div>
+<div style="flex: 0 1 200px; display: flex; flex-direction: column; gap: 6px">
+<label for="kind" style="font-size: 14px; font-weight: 600; color: #222222">Type</label>
+<select id="kind" style="height: 52px; padding: 0 12px; font-size: 16px; border: 1px solid #8b939c; border-radius: 4px; font-family: inherit; background: #ffffff">
+<option>All types</option>
+<option>Photographs</option>
+<option>Documents</option>
+<option>Maps</option>
+<option>Oral histories</option>
+<option>Objects</option>
+</select>
+</div>
+<a href="Browse.dc.html" style="height: 52px; display: inline-flex; align-items: center; gap: 8px; padding: 0 24px; background: #111111; color: #ffffff; text-decoration: none; font-family: Roboto, sans-serif; font-weight: 600; font-size: 16px; border-radius: 4px">
+<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="M20 20l-3.5-3.5"></path></svg>
+Search</a>
+</form>
+<div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center">
+<span style="font-size: 14px; color: #555555">Try:</span>
+<a href="Browse.dc.html" style="font-size: 14px; padding: 8px 14px; border: 1px solid #b7bec7; border-radius: 999px; text-decoration: none">Dickinson Bayou</a>
+<a href="Browse.dc.html" style="font-size: 14px; padding: 8px 14px; border: 1px solid #b7bec7; border-radius: 999px; text-decoration: none">Railroad</a>
+<a href="Browse.dc.html" style="font-size: 14px; padding: 8px 14px; border: 1px solid #b7bec7; border-radius: 999px; text-decoration: none">1900 Storm</a>
+<a href="Browse.dc.html" style="font-size: 14px; padding: 8px 14px; border: 1px solid #b7bec7; border-radius: 999px; text-decoration: none">Cemetery records</a>
+</div>
+</div>
+<img src="/_blob/2e9e77821dec3d46d57a32fdc4e99dbc" alt="Labeled aerial view of downtown Dickinson from the school building, with homes, stores, the depot and the Methodist church marked" style="flex: 1 1 420px; min-width: 0; height: 400px; object-fit: cover; border-radius: 6px; display: block">
+</div>
+</section>
+
+<section aria-labelledby="coll-h" style="max-width: 1240px; margin: 0 auto; padding: 64px 32px 24px">
+<div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 24px">
+<h2 id="coll-h" style="margin: 0; font-family: Roboto, sans-serif; font-weight: 700; font-size: 32px; color: #111111">Collections</h2>
+<a href="Browse.dc.html" style="font-weight: 600; font-size: 15px">All collections →</a>
+</div>
+<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 24px">
+<sc-for list="{{collections}}" as="c" hint-placeholder-count="4">
+<a href="FindingAid.dc.html" style="display: flex; flex-direction: column; background: #ffffff; border-radius: 6px; overflow: hidden; text-decoration: none; color: #3a3a3a; box-shadow: 0 1px 3px rgba(0,0,0,0.12)">
+<div style="height: 170px; background: #c9d0d8; display: flex; align-items: center; justify-content: center; color: #3c434b; font-size: 13px; font-weight: 600">[Cover image]</div>
+<div style="padding: 18px 20px 22px; display: flex; flex-direction: column; gap: 8px">
+<span style="font-family: Roboto, sans-serif; font-weight: 600; font-size: 19px; color: #111111">{{c.title}}</span>
+<span style="font-size: 14px; line-height: 1.5">{{c.blurb}}</span>
+<span style="font-size: 13px; color: #555555">[N] items · {{c.kind}}</span>
+</div>
+</a>
+</sc-for>
+</div>
+</section>
+
+<section aria-labelledby="feat-h" style="max-width: 1240px; margin: 0 auto; padding: 48px 32px">
+<div style="background: #ffffff; border-radius: 6px; display: flex; flex-wrap: wrap; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.12)">
+<div style="flex: 1 1 520px; min-height: 380px; background: #b9c1ca; display: flex; align-items: center; justify-content: center; color: #2f353b; font-size: 14px; font-weight: 600; text-align: center; padding: 0 24px">GH&amp;H depot and park, passengers waiting, 1909</div>
+<div style="flex: 1 1 380px; padding: 40px; display: flex; flex-direction: column; gap: 16px; justify-content: center">
+<p style="margin: 0; font-family: Roboto, sans-serif; font-weight: 600; font-size: 13px; letter-spacing: 1.5px; text-transform: uppercase; color: #8a4310">Featured item</p>
+<h2 id="feat-h" style="margin: 0; font-family: Roboto, sans-serif; font-weight: 700; font-size: 30px; color: #111111">Dickinson Station and Park</h2>
+<p style="margin: 0; font-size: 16px; line-height: 1.6">The GH&amp;H railroad depot and park in Dickinson, with passengers waiting for the train.</p>
+<dl style="margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; font-size: 14px">
+<dt style="font-weight: 600; color: #222222">Date</dt><dd style="margin: 0">1909</dd>
+<dt style="font-weight: 600; color: #222222">Type</dt><dd style="margin: 0">Photograph</dd>
+<dt style="font-weight: 600; color: #222222">Collection</dt><dd style="margin: 0">Historic Railroad Center</dd>
+</dl>
+<a href="Item.dc.html" style="align-self: flex-start; margin-top: 8px; display: inline-flex; align-items: center; min-height: 48px; padding: 0 22px; background: #111111; color: #ffffff; text-decoration: none; font-family: Roboto, sans-serif; font-weight: 600; border-radius: 4px">View item</a>
+</div>
+</div>
+</section>
+
+<section aria-labelledby="recent-h" style="max-width: 1240px; margin: 0 auto; padding: 24px 32px 48px">
+<div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 24px">
+<h2 id="recent-h" style="margin: 0; font-family: Roboto, sans-serif; font-weight: 700; font-size: 32px; color: #111111">Recent additions</h2>
+<a href="Browse.dc.html" style="font-weight: 600; font-size: 15px">Browse everything →</a>
+</div>
+<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 20px">
+<sc-for list="{{recent}}" as="r" hint-placeholder-count="6">
+<a href="Item.dc.html" style="display: flex; flex-direction: column; gap: 10px; text-decoration: none; color: #3a3a3a">
+<div style="aspect-ratio: 1 / 1; background: #c9d0d8; border-radius: 4px; display: flex; align-items: center; justify-content: center; color: #3c434b; font-size: 12px; font-weight: 600">[Image]</div>
+<span style="font-size: 12px; font-weight: 600; letter-spacing: 1px; text-transform: uppercase; color: #555555">{{r.kind}}</span>
+<span style="font-family: Roboto, sans-serif; font-weight: 600; font-size: 16px; color: #111111">{{r.title}}</span>
+<span style="font-size: 13px; color: #555555">{{r.date}}</span>
+</a>
+</sc-for>
+</div>
+</section>
+
+<section aria-labelledby="tl-h" style="background: #ffffff; border-top: 1px solid #cfd5dd; border-bottom: 1px solid #cfd5dd">
+<div style="max-width: 1240px; margin: 0 auto; padding: 56px 32px">
+<p style="margin: 0 0 8px; font-family: Roboto, sans-serif; font-weight: 600; font-size: 13px; letter-spacing: 1.5px; text-transform: uppercase; color: #8a4310">Timeline widget</p>
+<h2 id="tl-h" style="margin: 0 0 32px; font-family: Roboto, sans-serif; font-weight: 700; font-size: 32px; color: #111111">Dickinson through time</h2>
+<div style="position: relative; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 24px; border-top: 3px solid #3c3c3c; padding-top: 28px">
+<sc-for list="{{events}}" as="e" hint-placeholder-count="5">
+<a href="Browse.dc.html" style="display: flex; flex-direction: column; gap: 8px; text-decoration: none; color: #3a3a3a">
+<span style="width: 16px; height: 16px; border-radius: 50%; background: {{accent}}; border: 3px solid #3c3c3c; margin-top: -39px; margin-bottom: 8px"></span>
+<span style="font-family: Roboto, sans-serif; font-weight: 700; font-size: 28px; color: #111111">{{e.year}}</span>
+<span style="font-size: 15px; font-weight: 600; color: #222222">{{e.label}}</span>
+<span style="font-size: 13px; color: #555555">{{e.item}}</span>
+</a>
+</sc-for>
+</div>
+</div>
+</section>
+
+<section style="max-width: 1240px; margin: 0 auto; padding: 56px 32px; display: flex; flex-wrap: wrap; gap: 32px">
+<div id="map" style="flex: 2 1 560px; min-width: 0; display: flex; flex-direction: column; gap: 16px">
+<p style="margin: 0; font-family: Roboto, sans-serif; font-weight: 600; font-size: 13px; letter-spacing: 1.5px; text-transform: uppercase; color: #8a4310">Map widget</p>
+<h2 style="margin: 0; font-family: Roboto, sans-serif; font-weight: 700; font-size: 32px; color: #111111">Explore by place</h2>
+<div style="position: relative; height: 380px; background: #d7dde3; border-radius: 6px; overflow: hidden">
+<svg width="100%" height="100%" viewBox="0 0 700 380" preserveAspectRatio="none" aria-hidden="true"><path d="M0 230 C 120 200, 200 260, 320 220 S 520 170, 700 210" fill="none" stroke="#9fb3c4" stroke-width="18"></path><path d="M0 90 L700 120 M180 0 L220 380 M470 0 L440 380" stroke="#c3cad1" stroke-width="4"></path></svg>
+<sc-for list="{{pins}}" as="p" hint-placeholder-count="4">
+<a href="Item.dc.html" aria-label="{{p.label}}" style="position: absolute; left: {{p.x}}; top: {{p.y}}; width: 32px; height: 32px; border-radius: 50% 50% 50% 0; transform: rotate(-45deg); background: #3c3c3c; border: 3px solid #ffffff; box-shadow: 0 1px 3px rgba(0,0,0,0.3)"></a>
+</sc-for>
+<div style="position: absolute; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 4px">
+<button type="button" aria-label="Zoom in" style="width: 44px; height: 44px; background: #ffffff; border: 1px solid #8b939c; border-radius: 4px; font-size: 20px">+</button>
+<button type="button" aria-label="Zoom out" style="width: 44px; height: 44px; background: #ffffff; border: 1px solid #8b939c; border-radius: 4px; font-size: 20px">−</button>
+</div>
+</div>
+<div style="display: flex; flex-wrap: wrap; gap: 8px">
+<sc-for list="{{pins}}" as="p" hint-placeholder-count="4">
+<a href="Browse.dc.html" style="display: inline-flex; align-items: center; gap: 6px; font-size: 14px; padding: 8px 14px; background: #ffffff; border: 1px solid #b7bec7; border-radius: 999px; text-decoration: none">
+<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 21s-7-6.2-7-11a7 7 0 0 1 14 0c0 4.8-7 11-7 11z"></path><circle cx="12" cy="10" r="2.5"></circle></svg>
+{{p.label}}</a>
+</sc-for>
+</div>
+</div>
+<div id="exhibits" style="flex: 1 1 340px; min-width: 0; display: flex; flex-direction: column; gap: 16px">
+<p style="margin: 0; font-family: Roboto, sans-serif; font-weight: 600; font-size: 13px; letter-spacing: 1.5px; text-transform: uppercase; color: #8a4310">Exhibit widget</p>
+<h2 style="margin: 0; font-family: Roboto, sans-serif; font-weight: 700; font-size: 32px; color: #111111">Online exhibits</h2>
+<a href="#" style="display: flex; flex-direction: column; background: #3c3c3c; color: #ffffff; border-radius: 6px; overflow: hidden; text-decoration: none">
+<div style="height: 180px; background: #5a5f64; display: flex; align-items: center; justify-content: center; color: #e8e8e8; font-size: 13px; font-weight: 600; text-align: center; padding: 0 20px">The 1902 depot on a house mover's truck, 1967</div>
+<div style="padding: 20px 22px 24px; display: flex; flex-direction: column; gap: 8px">
+<span style="font-family: Roboto, sans-serif; font-weight: 600; font-size: 20px">Saving the Dickinson Depot</span>
+<span style="font-size: 14px; color: #e0e0e0; line-height: 1.5">From the 1909 station to the 1967 move, the 1972 cupola and the depot museum plans.</span>
+<span style="font-size: 14px; font-weight: 600; color: #ffb27d">Start the exhibit →</span>
+</div>
+</a>
+<a href="#" style="display: flex; justify-content: space-between; align-items: center; min-height: 56px; padding: 0 20px; background: #ffffff; border-radius: 6px; text-decoration: none; font-weight: 600; box-shadow: 0 1px 3px rgba(0,0,0,0.12)">Becoming a City, 1958–1980 <span aria-hidden="true">→</span></a>
+<a href="#" style="display: flex; justify-content: space-between; align-items: center; min-height: 56px; padding: 0 20px; background: #ffffff; border-radius: 6px; text-decoration: none; font-weight: 600; box-shadow: 0 1px 3px rgba(0,0,0,0.12)">Here They Rest: Magnolia Cemetery <span aria-hidden="true">→</span></a>
+</div>
+</section>
+
+<footer style="background: #3c3c3c; color: #e6e6e6">
+<div style="max-width: 1240px; margin: 0 auto; padding: 48px 32px; display: flex; flex-wrap: wrap; gap: 40px; justify-content: space-between">
+<div style="display: flex; flex-direction: column; gap: 8px; max-width: 360px">
+<span style="font-family: Roboto, sans-serif; font-weight: 700; font-size: 18px; color: #ffffff">Dickinson Historical Society</span>
+<span style="font-size: 14px; line-height: 1.6">[Street address] · Dickinson, Texas<br>[Hours] · [Phone]</span>
+</div>
+<nav aria-label="Footer" style="display: flex; flex-wrap: wrap; gap: 8px 28px; font-size: 14px">
+<a href="Browse.dc.html" style="color: #ffffff">Browse</a>
+<a href="FindingAid.dc.html" style="color: #ffffff">Finding aids</a>
+<a href="#" style="color: #ffffff">Rights &amp; reuse</a>
+<a href="#" style="color: #ffffff">Accessibility</a>
+<a href="#" style="color: #ffffff">Contact</a>
+</nav>
+<span style="font-size: 13px; color: #cfcfcf; align-self: flex-end">Powered by Hermes + Polybius · <a href="Login.dc.html" style="color: #ffffff">Staff sign in</a></span>
+</div>
+</footer>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","default":"#f0792d","options":["#f0792d","#e0b341","#4f9fd6","#7fb069"]},"$preview":{"width":1440,"height":3200}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return {
+      accent: this.props.accent ?? '#f0792d',
+      collections: [
+        { title: 'Historic Railroad Center', blurb: 'The GH&H depot, the interurban and the strawberry trains.', kind: 'Photographs & documents' },
+        { title: 'Dickinson City Cemetery Records', blurb: 'Burial records being digitized now.', kind: 'Archival records' },
+        { title: 'Spoken History', blurb: 'Recorded interviews with longtime residents.', kind: 'Oral histories' },
+        { title: 'Becoming a City', blurb: 'Incorporation papers, first officials and poll tax drives.', kind: 'Documents & photographs' }
+      ],
+      recent: [
+        { kind: 'Photograph', title: 'Loading Strawberries', date: 'April 25, 1909' },
+        { kind: 'Booklet', title: 'Souvenir of the Galveston Storm', date: '1900' },
+        { kind: 'Photograph', title: 'Aerial View of Dickinson', date: 'About 1920' },
+        { kind: 'Program', title: 'Dickinson High School Baccalaureate', date: 'May 14, 1922' },
+        { kind: 'Manuscript', title: 'Dickinson: Taller Than the Pines', date: '1979' },
+        { kind: 'Oral history', title: 'Spoken History: Fred Menotti', date: '2020' }
+      ],
+      events: [
+        { year: '1900', label: 'The Galveston Storm', item: 'Storm souvenir booklet' },
+        { year: '1909', label: 'Strawberries ship by rail', item: 'Three railcars loaded' },
+        { year: '1941', label: 'Hollywood Theatre opens', item: 'Photograph, 1941' },
+        { year: '1967', label: 'The depot is moved', item: 'House mover photograph' },
+        { year: '1977', label: 'Village elects its first officials', item: 'Group photograph' }
+      ],
+      pins: [
+        { label: 'Interurban bridge, Dickinson Bayou', x: '30%', y: '52%' },
+        { label: 'GH&H depot and park', x: '44%', y: '68%' },
+        { label: 'Village Green gazebo', x: '58%', y: '30%' },
+        { label: 'Hollywood Theatre', x: '52%', y: '46%' },
+        { label: 'Oil well, Hughes Road', x: '78%', y: '40%' }
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>
