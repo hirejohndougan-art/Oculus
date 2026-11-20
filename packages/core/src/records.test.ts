@@ -111,7 +111,13 @@ describe("validateRecord: each kind", () => {
     expect(codes(r)).toEqual(["self_reference"]);
   });
 
-  it.each([undefined, "corporation", "Person"])("rejects agent type %j", (agentType) => {
+  it("reports a property set to undefined", () => {
+    expect(codes(validateRecord(base({ kind: "agent", agentType: undefined })))).toEqual([
+      "undefined_value",
+    ]);
+  });
+
+  it.each(["corporation", "Person", 3])("rejects agent type %j", (agentType) => {
     expect(codes(validateRecord(base({ kind: "agent", agentType })))).toEqual([
       "invalid_agent_type",
     ]);
@@ -150,12 +156,18 @@ describe("validateRecord: common properties", () => {
   });
 
   it.each([
-    ["missing", undefined, "required"],
+    ["undefined", undefined, "undefined_value"],
+    ["a number", 42, "required"],
     ["empty", "", "required"],
     ["only spaces", "   ", "required"],
     ["leading space", " Depot", "untrimmed"],
     ["a line break", "Depot\nMove", "control_characters"],
-    ["a null byte", "Depot\u0000", "control_characters"],
+    ["a null byte", "Depot\u0000", "bad_characters"],
+    ["a tab", "Depot\tMove", "control_characters"],
+    ["a line separator", "Depot\u2028Move", "control_characters"],
+    ["a C1 control", "Depot\u0085", "bad_characters"],
+    ["a direction override", "Depot\u202eevoM", "bad_characters"],
+    ["a lone surrogate", "Depot\ud800", "bad_characters"],
     ["too long", "x".repeat(MAX_TITLE_LENGTH + 1), "too_long"],
   ])("rejects a title that is %s", (_label, title, code) => {
     expect(codes(validateRecord(base({ kind: "object", title })))).toContain(code);
@@ -223,7 +235,13 @@ describe("validateRecord: template-defined fields", () => {
     expect(validateRecord(base({ kind: "object", fields })).ok).toBe(true);
   });
 
-  it.each(["Date", "1date", "date-made", "", "_private", "x".repeat(65)])(
+  it("rejects an empty field key", () => {
+    expect(codes(validateRecord(base({ kind: "object", fields: { "": "x" } })))).toEqual([
+      "invalid_key",
+    ]);
+  });
+
+  it.each(["Date", "1date", "date-made", "_private", "x".repeat(65)])(
     "rejects field key %j",
     (key) => {
       expect(codes(validateRecord(base({ kind: "object", fields: { [key]: "x" } })))).toEqual([
@@ -233,8 +251,8 @@ describe("validateRecord: template-defined fields", () => {
   );
 
   it.each([
-    ["undefined", undefined],
     ["a function", () => 1],
+    ["a nested undefined", [undefined]],
     ["a date object", new Date(0)],
     ["a class instance", new Map()],
     ["a symbol", Symbol("x")],
@@ -242,6 +260,12 @@ describe("validateRecord: template-defined fields", () => {
   ])("rejects a field value that is %s", (_label, value) => {
     expect(codes(validateRecord(base({ kind: "object", fields: { note: value } })))).toEqual([
       "not_json",
+    ]);
+  });
+
+  it("reports a field set to undefined", () => {
+    expect(codes(validateRecord(base({ kind: "object", fields: { note: undefined } })))).toEqual([
+      "undefined_value",
     ]);
   });
 
@@ -301,7 +325,7 @@ describe("validateRecord: template-defined fields", () => {
     const input = JSON.parse(
       `{"kind":"object","id":"${ID}","title":"x","createdAt":"${T}","updatedAt":"${T}","fields":{},"__proto__":{"admin":true}}`,
     ) as unknown;
-    expect(codes(validateRecord(input))).toEqual(["unknown_property"]);
+    expect(codes(validateRecord(input))).toEqual(["forbidden_key"]);
   });
 
   it("accepts an object with no prototype", () => {

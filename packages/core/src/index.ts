@@ -4,6 +4,9 @@ export type { RecordId } from "./record-id.js";
 export { issue, isPlainObject } from "./issues.js";
 export type { Issue, Validated } from "./issues.js";
 
+export { readPlainData, textProblem, IssueList, FORBIDDEN_KEYS } from "./plain-data.js";
+export type { JsonValue, ReadLimits } from "./plain-data.js";
+
 export {
   RECORD_KINDS,
   ARCHIVAL_LEVELS,
@@ -12,6 +15,8 @@ export {
   MAX_STRING_LENGTH,
   MAX_FIELD_DEPTH,
   MAX_FIELD_ENTRIES,
+  MAX_RECORD_CHARS,
+  MAX_KEY_LENGTH,
   validateRecord,
   createRecord,
   isRecordKind,

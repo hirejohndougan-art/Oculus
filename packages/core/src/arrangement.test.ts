@@ -130,7 +130,12 @@ describe("validateArrangement", () => {
 
   it("reports duplicate IDs", () => {
     const a = unit("A", "fonds");
-    expect(codes([a, { ...a, title: "A again" }])).toEqual(["duplicate_id"]);
+    const child = unit("Child", "item", a);
+    expect(codes([a, { ...a, title: "A again" }, child])).toEqual([
+      "duplicate_id",
+      "duplicate_id",
+      "ambiguous_parent",
+    ]);
   });
 
   it.each([
@@ -168,7 +173,45 @@ describe("validateArrangement", () => {
   });
 });
 
+describe("validateArrangement: hostile shapes stay fast", () => {
+  function loopOf(n: number): ArchivalUnitRecord[] {
+    const ids = Array.from({ length: n }, () => newRecordId());
+    return ids.map((id, i) => ({
+      ...unit(`S${String(i)}`, "series", undefined, id),
+      parentId: ids[(i + 1) % n] ?? id,
+    }));
+  }
+
+  it("handles a loop of 20,000 units in linear time, with capped issues", () => {
+    const started = performance.now();
+    const issues = validateArrangement(loopOf(20_000));
+    expect(performance.now() - started).toBeLessThan(2000);
+    expect(issues.length).toBeLessThanOrEqual(201);
+    expect(issues[0]?.code).toBe("loop");
+    expect(issues[issues.length - 1]?.code).toBe("too_many_issues");
+  });
+
+  it("handles a long chain hanging under a self-loop quickly", () => {
+    const loopId = newRecordId();
+    const top: ArchivalUnitRecord = {
+      ...unit("Self", "file", undefined, loopId),
+      parentId: loopId,
+    };
+    const chain: ArchivalUnitRecord[] = [top];
+    for (let i = 0; i < 20_000; i += 1)
+      chain.push(unit(`F${String(i)}`, "file", chain[chain.length - 1]));
+    const started = performance.now();
+    validateArrangement([...chain].reverse());
+    expect(performance.now() - started).toBeLessThan(2000);
+  });
+});
+
 describe("unfiledUnits", () => {
+  it("includes units whose parent isn't in the set, so they aren't lost", () => {
+    const lost = unit("Lost", "item", unit("Gone", "fonds"));
+    expect(unfiledUnits([lost]).map((u) => u.title)).toEqual(["Lost"]);
+  });
+
   it("lists units with no parent except fonds and collections", () => {
     const f = unit("F", "fonds");
     const c = unit("Standalone collection", "collection");

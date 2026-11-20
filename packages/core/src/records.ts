@@ -15,7 +15,9 @@
  * The template-defined fields are checked here only for being safe, plain
  * JSON. Which fields a record must have is the job of field templates (T-005).
  */
-import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
+import { issue, isPlainObject, type Validated } from "./issues.js";
+import { IssueList, readPlainData, shown, type JsonValue } from "./plain-data.js";
+import { types } from "node:util";
 import { isRecordId, newRecordId, type RecordId } from "./record-id.js";
 
 export const RECORD_KINDS = [
@@ -36,8 +38,7 @@ export const AGENT_TYPES = ["person", "organization", "family"] as const;
 export type AgentType = (typeof AGENT_TYPES)[number];
 
 /** A JSON value, as stored in a record's template-defined fields. */
-export type FieldValue =
-  string | number | boolean | null | readonly FieldValue[] | { readonly [key: string]: FieldValue };
+export type FieldValue = JsonValue;
 
 interface RecordBase {
   readonly id: RecordId;
@@ -91,15 +92,29 @@ export type CatalogRecord =
 // Limits. Generous for real catalog work, small enough to refuse abuse.
 
 export const MAX_TITLE_LENGTH = 1000;
+/** The longest a single text value in a record may be. */
 export const MAX_STRING_LENGTH = 100_000;
+/** How deep a field value may nest (a plain value is 1). */
 export const MAX_FIELD_DEPTH = 8;
+/** How many values (including every list and group) a whole record may hold. */
 export const MAX_FIELD_ENTRIES = 2000;
+/** All the text in a record (keys and values) added together. */
+export const MAX_RECORD_CHARS = 1_000_000;
+/** The longest a key inside a field value may be. */
+export const MAX_KEY_LENGTH = 200;
+
+const READ_LIMITS = {
+  // The record is depth 1, `fields` depth 2, so a field value starts at depth 3.
+  maxDepth: MAX_FIELD_DEPTH + 1,
+  maxValues: MAX_FIELD_ENTRIES,
+  maxStringLength: MAX_STRING_LENGTH,
+  maxKeyLength: MAX_KEY_LENGTH,
+  maxTotalChars: MAX_RECORD_CHARS,
+} as const;
 
 const FIELD_KEY = /^[a-z][a-z0-9_]{0,63}$/;
-/** Keys that could reach an object's prototype if copied naively. */
-const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"]);
-// eslint-disable-next-line no-control-regex -- control characters are what this rejects
-const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+/** Characters allowed in stored text but not in a one-line title. */
+const TITLE_BREAKS = /[\t\n\r\u2028\u2029]/;
 const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
 /** RFC 6838 type/subtype, restricted-name characters only, no parameters. */
 const MEDIA_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/;
@@ -118,79 +133,95 @@ const EXTRA_KEYS: Readonly<Record<RecordKind, readonly string[]>> = {
 
 /**
  * Check untrusted input (from an API request, an import, a stored row) and
- * return it as a typed record, or every problem found. Nothing is trimmed,
- * guessed or dropped: a value that isn't exactly right is reported.
+ * return it as a typed record, or every problem found.
+ *
+ * The record returned is a fresh, frozen copy built from plain data only (see
+ * `plain-data.ts`), never the caller's object, so nothing can change after it
+ * was checked. Nothing is trimmed, guessed or dropped: a value that isn't
+ * exactly right is reported. This function never throws.
  */
 export function validateRecord(input: unknown): Validated<CatalogRecord> {
-  if (!isPlainObject(input)) {
-    return { ok: false, issues: [issue([], "not_an_object", "A record must be an object.")] };
+  try {
+    return check(input);
+  } catch {
+    // Only a hostile input (a getter or Proxy that throws) gets here.
+    return {
+      ok: false,
+      issues: [issue([], "unreadable", "This record could not be read as plain data.")],
+    };
   }
-  const issues: Issue[] = [];
-  const kind = input.kind;
+}
+
+function check(input: unknown): Validated<CatalogRecord> {
+  if (types.isProxy(input) || !isPlainObject(input)) {
+    return { ok: false, issues: [issue([], "not_an_object", "A record must be a plain object.")] };
+  }
+  const issues = new IssueList();
+  const copy = readPlainData(input, [], READ_LIMITS, issues);
+  if (copy === undefined || !isPlainObject(copy)) return { ok: false, issues: issues.items };
+  const record: Readonly<Record<string, JsonValue>> = copy;
+
+  const kind = record.kind;
   if (!isRecordKind(kind)) {
-    issues.push(
-      issue(["kind"], "invalid_kind", `Kind must be one of: ${RECORD_KINDS.join(", ")}.`),
-    );
-    return { ok: false, issues };
+    issues.add(["kind"], "invalid_kind", `Kind must be one of: ${RECORD_KINDS.join(", ")}.`);
+    return { ok: false, issues: issues.items };
   }
 
   const allowed = new Set<string>([...COMMON_KEYS, ...EXTRA_KEYS[kind]]);
-  for (const key of Object.keys(input)) {
+  for (const key of Object.keys(record)) {
     if (!allowed.has(key)) {
-      issues.push(issue([key], "unknown_property", `"${key}" is not a property of a ${kind}.`));
+      issues.add([key], "unknown_property", `${shown(key)} is not a property of a ${kind}.`);
     }
   }
 
-  if (!isRecordId(input.id)) {
-    issues.push(issue(["id"], "invalid_id", "The ID must be a lowercase version 4 UUID."));
+  if (!isRecordId(record.id)) {
+    issues.add(["id"], "invalid_id", "The ID must be a lowercase version 4 UUID.");
   }
-  checkTitle(input.title, issues);
-  checkTimestamps(input.createdAt, input.updatedAt, issues);
-  checkFields(input.fields, issues);
+  checkTitle(record.title, issues);
+  checkTimestamps(record.createdAt, record.updatedAt, issues);
+  checkFields(record.fields, issues);
 
   switch (kind) {
     case "archival_unit":
-      if (!isArchivalLevel(input.level)) {
-        issues.push(
-          issue(["level"], "invalid_level", `Level must be one of: ${ARCHIVAL_LEVELS.join(", ")}.`),
+      if (!isArchivalLevel(record.level)) {
+        issues.add(
+          ["level"],
+          "invalid_level",
+          `Level must be one of: ${ARCHIVAL_LEVELS.join(", ")}.`,
         );
       }
-      checkOptionalLink(input, "parentId", "A unit can't be filed under itself.", issues);
+      checkOptionalLink(record, "parentId", "A unit can't be filed under itself.", issues);
       break;
     case "digital_asset":
-      if (typeof input.mediaType !== "string" || !MEDIA_TYPE.test(input.mediaType)) {
-        issues.push(
-          issue(
-            ["mediaType"],
-            "invalid_media_type",
-            "The media type must look like image/tiff or audio/wav, in lower case.",
-          ),
+      if (typeof record.mediaType !== "string" || !MEDIA_TYPE.test(record.mediaType)) {
+        issues.add(
+          ["mediaType"],
+          "invalid_media_type",
+          "The media type must look like image/tiff or audio/wav, in lower case.",
         );
       }
-      checkOptionalLink(input, "represents", "A file can't represent itself.", issues);
+      checkOptionalLink(record, "represents", "A file can't represent itself.", issues);
       break;
     case "agent":
-      if (!(AGENT_TYPES as readonly unknown[]).includes(input.agentType)) {
-        issues.push(
-          issue(
-            ["agentType"],
-            "invalid_agent_type",
-            `Agent type must be one of: ${AGENT_TYPES.join(", ")}.`,
-          ),
+      if (!(AGENT_TYPES as readonly unknown[]).includes(record.agentType)) {
+        issues.add(
+          ["agentType"],
+          "invalid_agent_type",
+          `Agent type must be one of: ${AGENT_TYPES.join(", ")}.`,
         );
       }
       break;
     case "place":
-      if ("coordinates" in input) checkCoordinates(input.coordinates, issues);
+      if ("coordinates" in record) checkCoordinates(record.coordinates, issues);
       break;
     case "object":
     case "event":
       break;
   }
 
-  if (issues.length > 0) return { ok: false, issues };
-  // Every property was checked above, and nothing else is allowed through.
-  return { ok: true, value: input as unknown as CatalogRecord };
+  if (issues.count > 0) return { ok: false, issues: issues.items };
+  // The copy is plain, frozen data, and every property was checked above.
+  return { ok: true, value: record as unknown as CatalogRecord };
 }
 
 /** The fields a caller supplies when making a new record. */
@@ -224,6 +255,12 @@ export function createRecord(
   input: NewRecordInput & { readonly fields?: Readonly<Record<string, FieldValue>> },
   now: Date = new Date(),
 ): Validated<CatalogRecord> {
+  if (!(now instanceof Date) || Number.isNaN(now.getTime())) {
+    return {
+      ok: false,
+      issues: [issue([], "invalid_time", "The creation time is not a valid date.")],
+    };
+  }
   const stamp = now.toISOString();
   return validateRecord({
     fields: {},
@@ -244,49 +281,43 @@ export function isArchivalLevel(value: unknown): value is ArchivalLevel {
 
 // ---------------------------------------------------------------------------
 
-function checkTitle(title: unknown, issues: Issue[]): void {
+function checkTitle(title: unknown, issues: IssueList): void {
   if (typeof title !== "string" || title.length === 0) {
-    issues.push(issue(["title"], "required", "Every record needs a title."));
+    issues.add(["title"], "required", "Every record needs a title.");
     return;
   }
   if (title.trim().length === 0) {
-    issues.push(issue(["title"], "required", "The title is only spaces."));
+    issues.add(["title"], "required", "The title is only spaces.");
   } else if (title !== title.trim()) {
-    issues.push(issue(["title"], "untrimmed", "The title starts or ends with spaces."));
+    issues.add(["title"], "untrimmed", "The title starts or ends with spaces.");
   }
   if (title.length > MAX_TITLE_LENGTH) {
-    issues.push(
-      issue(["title"], "too_long", `Titles can be at most ${String(MAX_TITLE_LENGTH)} characters.`),
+    issues.add(
+      ["title"],
+      "too_long",
+      `Titles can be at most ${String(MAX_TITLE_LENGTH)} characters.`,
     );
   }
-  if (CONTROL_CHARS.test(title)) {
-    issues.push(
-      issue(
-        ["title"],
-        "control_characters",
-        "The title contains line breaks or other invisible control characters.",
-      ),
+  if (TITLE_BREAKS.test(title)) {
+    issues.add(
+      ["title"],
+      "control_characters",
+      "A title must be one line, with no tabs or line breaks.",
     );
   }
 }
 
-function checkTimestamps(createdAt: unknown, updatedAt: unknown, issues: Issue[]): void {
+function checkTimestamps(createdAt: unknown, updatedAt: unknown, issues: IssueList): void {
   const created = parseUtc(createdAt);
   const updated = parseUtc(updatedAt);
   if (created === undefined) {
-    issues.push(
-      issue(["createdAt"], "invalid_timestamp", "createdAt must be an ISO 8601 UTC timestamp."),
-    );
+    issues.add(["createdAt"], "invalid_timestamp", "createdAt must be an ISO 8601 UTC timestamp.");
   }
   if (updated === undefined) {
-    issues.push(
-      issue(["updatedAt"], "invalid_timestamp", "updatedAt must be an ISO 8601 UTC timestamp."),
-    );
+    issues.add(["updatedAt"], "invalid_timestamp", "updatedAt must be an ISO 8601 UTC timestamp.");
   }
   if (created !== undefined && updated !== undefined && updated < created) {
-    issues.push(
-      issue(["updatedAt"], "before_created", "updatedAt can't be earlier than createdAt."),
-    );
+    issues.add(["updatedAt"], "before_created", "updatedAt can't be earlier than createdAt.");
   }
 }
 
@@ -300,129 +331,57 @@ function parseUtc(value: unknown): number | undefined {
   return normalized.slice(0, 19) === value.slice(0, 19) ? ms : undefined;
 }
 
-function checkFields(fields: unknown, issues: Issue[]): void {
+/** Field values were already read safely; here only the top-level keys are checked. */
+function checkFields(fields: unknown, issues: IssueList): void {
   if (!isPlainObject(fields)) {
-    issues.push(issue(["fields"], "not_an_object", "fields must be an object."));
+    issues.add(["fields"], "not_an_object", "fields must be an object.");
     return;
   }
-  const budget = { entries: 0 };
-  for (const [key, value] of Object.entries(fields)) {
-    if (FORBIDDEN_KEYS.has(key)) {
-      issues.push(issue(["fields", key], "forbidden_key", `"${key}" can't be used as a key.`));
-      continue;
-    }
+  for (const key of Object.keys(fields)) {
     if (!FIELD_KEY.test(key)) {
-      issues.push(
-        issue(
-          ["fields", key],
-          "invalid_field_key",
-          "Field keys are lower case letters, digits and underscores, starting with a letter.",
-        ),
-      );
-      continue;
-    }
-    checkJson(value, ["fields", key], 1, budget, issues);
-  }
-}
-
-function checkJson(
-  value: unknown,
-  path: (string | number)[],
-  depth: number,
-  budget: { entries: number },
-  issues: Issue[],
-): void {
-  budget.entries += 1;
-  if (budget.entries > MAX_FIELD_ENTRIES) {
-    if (budget.entries === MAX_FIELD_ENTRIES + 1) {
-      issues.push(
-        issue(
-          ["fields"],
-          "too_many_values",
-          `A record can hold at most ${String(MAX_FIELD_ENTRIES)} field values.`,
-        ),
+      issues.add(
+        ["fields", key],
+        "invalid_field_key",
+        "Field keys are lower case letters, digits and underscores, starting with a letter.",
       );
     }
-    return;
   }
-  if (depth > MAX_FIELD_DEPTH) {
-    issues.push(
-      issue(path, "too_deep", `Field values can nest at most ${String(MAX_FIELD_DEPTH)} levels.`),
-    );
-    return;
-  }
-  if (value === null || typeof value === "boolean") return;
-  if (typeof value === "string") {
-    if (value.length > MAX_STRING_LENGTH) {
-      issues.push(
-        issue(
-          path,
-          "too_long",
-          `Text values can be at most ${String(MAX_STRING_LENGTH)} characters.`,
-        ),
-      );
-    }
-    return;
-  }
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) {
-      issues.push(issue(path, "not_finite", "Numbers must be finite."));
-    }
-    return;
-  }
-  if (Array.isArray(value)) {
-    value.forEach((item: unknown, index) => {
-      checkJson(item, [...path, index], depth + 1, budget, issues);
-    });
-    return;
-  }
-  if (isPlainObject(value)) {
-    for (const [key, item] of Object.entries(value)) {
-      if (FORBIDDEN_KEYS.has(key)) {
-        issues.push(issue([...path, key], "forbidden_key", `"${key}" can't be used as a key.`));
-        continue;
-      }
-      checkJson(item, [...path, key], depth + 1, budget, issues);
-    }
-    return;
-  }
-  issues.push(
-    issue(path, "not_json", "Field values must be text, numbers, true/false, lists or groups."),
-  );
 }
 
 function checkOptionalLink(
-  input: Record<string, unknown>,
+  record: Readonly<Record<string, JsonValue>>,
   key: "parentId" | "represents",
   selfMessage: string,
-  issues: Issue[],
+  issues: IssueList,
 ): void {
-  if (!(key in input)) return;
-  const value = input[key];
+  if (!(key in record)) return;
+  const value = record[key];
   if (!isRecordId(value)) {
-    issues.push(issue([key], "invalid_id", `${key} must be a record ID.`));
-  } else if (value === input.id) {
-    issues.push(issue([key], "self_reference", selfMessage));
+    issues.add([key], "invalid_id", `${key} must be a record ID.`);
+  } else if (value === record.id) {
+    issues.add([key], "self_reference", selfMessage);
   }
 }
 
-function checkCoordinates(value: unknown, issues: Issue[]): void {
+function checkCoordinates(value: unknown, issues: IssueList): void {
   if (!isPlainObject(value)) {
-    issues.push(issue(["coordinates"], "not_an_object", "coordinates must be { lat, lng }."));
+    issues.add(["coordinates"], "not_an_object", "coordinates must be { lat, lng }.");
     return;
   }
   for (const key of Object.keys(value)) {
     if (key !== "lat" && key !== "lng") {
-      issues.push(
-        issue(["coordinates", key], "unknown_property", `"${key}" is not part of coordinates.`),
+      issues.add(
+        ["coordinates", key],
+        "unknown_property",
+        `${shown(key)} is not part of coordinates.`,
       );
     }
   }
   const { lat, lng } = value;
-  if (typeof lat !== "number" || !Number.isFinite(lat) || lat < -90 || lat > 90) {
-    issues.push(issue(["coordinates", "lat"], "out_of_range", "Latitude must be -90 to 90."));
+  if (typeof lat !== "number" || lat < -90 || lat > 90) {
+    issues.add(["coordinates", "lat"], "out_of_range", "Latitude must be -90 to 90.");
   }
-  if (typeof lng !== "number" || !Number.isFinite(lng) || lng < -180 || lng > 180) {
-    issues.push(issue(["coordinates", "lng"], "out_of_range", "Longitude must be -180 to 180."));
+  if (typeof lng !== "number" || lng < -180 || lng > 180) {
+    issues.add(["coordinates", "lng"], "out_of_range", "Longitude must be -180 to 180.");
   }
 }
