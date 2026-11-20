@@ -2,3 +2,9 @@ __pycache__/
 tools/mockup-generator/out/
 node_modules/
 .DS_Store
+dist/
+.gate/
+coverage/
+*.tsbuildinfo
+.env
+.env.*

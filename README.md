@@ -33,3 +33,7 @@ TypeScript throughout, a Node.js API, PostgreSQL, React for the admin and the pa
 ## License
 
 [MIT](LICENSE).
+
+## Development
+
+Node 26 (see `.nvmrc`; 22 or later works). `npm install`, then `npm run gate` runs every check a change must pass: format, lint, type check, tests, build, `npm audit`, the license check and the test-count floor in `gate-baseline.json`. Code lives in `packages/`; `packages/core` is the record model.

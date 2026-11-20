@@ -1,0 +1,8 @@
+# Hand-written docs and the generated mockup are not code; Prettier checks code and config only.
+*.md
+mockup/
+design/
+tools/mockup-generator/
+dist/
+.gate/
+package-lock.json
