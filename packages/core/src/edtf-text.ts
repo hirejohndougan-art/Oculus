@@ -13,11 +13,18 @@
  * - "6/5/1920" when it could be June 5 or 6 May, unless the caller says which
  *   order its data uses.
  * - "'50s" and "the fifties": which century?
+ * - "c1920": copyright 1920 in library catalogs, circa elsewhere.
+ * - "1901-05": May 1901, or 1901 to 1905? And a leading dash: BCE or "until"?
  * - "before 1920", "undated", and anything else it doesn't recognize.
+ *
+ * Some forms are read so that the result holds every reading: "19th
+ * century" becomes 1800/1900 (strictly 1801–1900, commonly 1800–1899), and
+ * "between 1920 and 1925" becomes [1920..1925], one date in that span
+ * (DACS 2.4), where "from 1920 to 1925" is the whole span 1920/1925.
  */
 import { issue, type Validated } from "./issues.js";
 import { parseEdtf, type EdtfDate } from "./edtf.js";
-import { shown } from "./plain-data.js";
+import { shown, textProblem } from "./plain-data.js";
 
 export interface EdtfFromTextOptions {
   /**
@@ -117,6 +124,15 @@ export function edtfFromText(
   const trimmed = input.trim();
   if (trimmed === "") return { ok: false, issues: [issue([], "empty", "The date is empty.")] };
 
+  // The original wording can end up in a note, so it must be storable text.
+  const problem =
+    textProblem(trimmed) ??
+    (/[\u2028\u2029\ufeff]/.test(trimmed)
+      ? "contains a line or paragraph separator or a byte-order mark"
+      : undefined);
+  if (problem !== undefined) {
+    return { ok: false, issues: [issue([], "invalid_text", `The date text ${problem}.`)] };
+  }
   const guard = ambiguousForm(trimmed);
   if (guard !== undefined) return { ok: false, issues: [issue([], "ambiguous", guard)] };
 
@@ -162,9 +178,20 @@ export function edtfFromText(
 function readRange(text: string, options: EdtfFromTextOptions): Piece {
   // "ca. 1920-1925": a qualifier in front applies to both ends.
   const { rest, qualifier } = readQualifier(text);
-  const between = /^(?:between|from) (.+?) (?:and|to|until|-) (.+)$/.exec(rest);
+  // "between 1920 and 1925" is one unknown date in that span (DACS 2.4),
+  // which EDTF writes as a one-of set; "from 1920 to 1925" is the whole span.
+  const between = /^between (.+?) (?:and|-) (.+)$/.exec(rest);
   if (between !== null) {
-    return joinRange(between[1] ?? "", between[2] ?? "", qualifier, options, text);
+    const piece = joinRange(between[1] ?? "", between[2] ?? "", qualifier, options, text);
+    return { edtf: `[${piece.edtf.replace("/", "..")}]`, keep: piece.keep };
+  }
+  const from = /^from (.+?) (?:to|until|-) (.+)$/.exec(rest);
+  if (from !== null) return joinRange(from[1] ?? "", from[2] ?? "", qualifier, options, text);
+  if (/^(?:before|after|by|pre|post|not before|not after|until|till)\b/.test(rest)) {
+    fail(
+      "unreadable",
+      `${shown(text)} gives only one side of a range; enter it as an interval such as ../1920 or 1920/..`,
+    );
   }
   // A single date first: "06-05-1920" has dashes but is not a range.
   let lastError: TextError;
@@ -249,7 +276,8 @@ function ambiguousForm(text: string): string | undefined {
     const month = two >= 1 && two <= 12 && two > Number(year.slice(2));
     if (season || month) {
       const what = season ? "an EDTF season code" : "a month";
-      return `${shown(m[0])} could be the years ${year} to ${year.slice(0, 2)}${m[2] ?? ""} or ${what}. Enter a range as 1920/1925.`;
+      const end = `${year.slice(0, 2)}${m[2] ?? ""}`;
+      return `${shown(m[0])} could be the years ${year} to ${end} or ${what}. Enter the range as ${year}/${end}.`;
     }
   }
   return undefined;
@@ -261,8 +289,16 @@ function readQualifier(text: string): { rest: string; qualifier: string } {
   let uncertain = false;
   for (let round = 0; round < 2; round++) {
     const a = APPROXIMATE.exec(rest);
-    // "c1920" and "c. 1920" are circa, but "c" must not eat the start of a word.
+    // "c. 1920" is circa, but "c" must not eat the start of a word.
     const after = a === null ? "" : rest.slice(a[0].length);
+    if (a !== null && /^c\d/.test(rest)) {
+      // Library catalogs (AACR2, MARC) write "c1920" for copyright 1920, an
+      // exact date, and circa as "ca."; don't guess which this is.
+      fail(
+        "ambiguous",
+        `${shown(text)} could mean copyright ${after.slice(0, 4)} or circa. Write “ca. ${after.slice(0, 4)}” for circa.`,
+      );
+    }
     if (
       a !== null &&
       /^(?:\d|early|mid|late|the |spring|summer|autumn|fall|winter|[a-z]{3})/.test(after)
@@ -323,16 +359,22 @@ function readSingle(raw: string, qualifier: string, options: EdtfFromTextOptions
 
   // Centuries: "19th century", "early 20th century", "20th c.".
   const century =
-    /^(?:the )?(?:(early|mid|late)[- ]?)?(\d{1,2})(?:st|nd|rd|th) (?:century|cent\.?|c\.?)$/.exec(
+    /^(?:the )?(?:(early|mid|late)[- ]?)?(\d{1,2})(st|nd|rd|th) (?:century|cent\.?|c\.?)$/.exec(
       text,
     );
   if (century !== null) {
     const n = Number(century[2]);
-    if (n < 1 || n > 99) fail("unreadable", `${shown(raw)} is not a century.`);
-    // The strict meaning: the 20th century is 1901 to 2000.
-    const first = String((n - 1) * 100 + 1).padStart(4, "0");
+    const ordinal =
+      n % 100 >= 11 && n % 100 <= 13 ? "th" : (["th", "st", "nd", "rd"][n % 10] ?? "th");
+    if (n < 1 || n > 99 || century[3] !== ordinal) {
+      fail("unreadable", `${shown(raw)} is not a century.`);
+    }
+    // "19th century" means 1801–1900 strictly, but most catalogers mean
+    // 1800–1899. The interval 1800/1900 holds both readings; the note keeps
+    // the original words.
+    const first = String((n - 1) * 100).padStart(4, "0");
     const last = String(n * 100).padStart(4, "0");
-    return { edtf: `${first}${q}/${last}${q}`, keep: century[1] !== undefined };
+    return { edtf: `${first}${q}/${last}${q}`, keep: true };
   }
 
   // Seasons: "spring 1920", "summer of 1920".

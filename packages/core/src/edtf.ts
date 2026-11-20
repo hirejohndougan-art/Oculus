@@ -18,12 +18,20 @@
  * Not supported, and reported as `unsupported`: exponential years
  * (`Y-17E7`) and significant digits (`1950S2`). They are for geological and
  * astronomical time, not collections.
+ * Deliberately strict: each part takes one qualifier, and a date takes only
+ * one qualifier after its parts (`2004?-06~-11` is rejected; write
+ * `?2004-~06-11`).
  *
  * Every valid date gets `earliest` and `latest` calendar days. They are
  * guaranteed to contain every day the expression could mean, and can be a
  * little wider (for example, a 29 February in a year with unspecified digits).
  * `~` and `?` don't widen them: "about 1920" sorts as 1920, flagged as
  * approximate, rather than as an invented range.
+ *
+ * Seasons whose hemisphere isn't stated (21–24) and winters (which straddle
+ * two years, and "winter 1920" is used for both) get wide bounds for the
+ * same reason. A date whose year starts with X (`XXXX`, `XXX1`) has no sort
+ * year: it sorts after every dated record.
  */
 import { issue, type Validated } from "./issues.js";
 import { shown } from "./plain-data.js";
@@ -157,8 +165,8 @@ export function parseEdtf(input: unknown): Validated<EdtfDate> {
         edtf: input,
         level: span.level,
         kind,
-        earliest: span.earliest,
-        latest: span.latest,
+        earliest: span.earliest === null ? null : Object.freeze({ ...span.earliest }),
+        latest: span.latest === null ? null : Object.freeze({ ...span.latest }),
         sortKey: anchor === null ? null : dayKey(anchor),
         sortYear: anchor === null ? null : anchor.year,
         uncertain: span.uncertain,
@@ -255,39 +263,57 @@ const qualOf = (q: string | undefined): Qual => ({
   approximate: q === "~" || q === "%",
 });
 
-/** Sub-year groupings: code → [start month, start day, end month, end day, end in next year]. */
-const GROUPINGS: Readonly<Record<number, readonly [number, number, number, number, boolean]>> = {
-  // Level 1 seasons (hemisphere not stated) and level 2 northern seasons.
-  21: [3, 1, 5, 31, false],
-  22: [6, 1, 8, 31, false],
-  23: [9, 1, 11, 30, false],
-  // Winter can mean January–February or December onward, so cover both.
-  24: [1, 1, 2, 0, true],
-  25: [3, 1, 5, 31, false],
-  26: [6, 1, 8, 31, false],
-  27: [9, 1, 11, 30, false],
-  28: [1, 1, 2, 0, true],
-  // Southern hemisphere seasons.
-  29: [9, 1, 11, 30, false],
-  30: [1, 1, 2, 0, true],
-  31: [3, 1, 5, 31, false],
-  32: [6, 1, 8, 31, false],
+/**
+ * Sub-year groupings: code → [start year offset, start month, start day,
+ * end year offset, end month, end day (0 = last day of the month)].
+ *
+ * Bounds must hold every day a code could mean:
+ * - Winter (and southern summer) runs December to February, and "winter
+ *   1920" is used both for December 1919–February 1920 and for December
+ *   1920–February 1921, so it covers December of the year before through
+ *   February of the year after.
+ * - Level 1 seasons 21–24 don't say which hemisphere, so each covers both:
+ *   spring and autumn run March to November, summer and winter cover the
+ *   two winter-like spans above and June to August.
+ */
+type Grouping = readonly [number, number, number, number, number, number];
+const NORTH_SPRING: Grouping = [0, 3, 1, 0, 5, 31];
+const NORTH_SUMMER: Grouping = [0, 6, 1, 0, 8, 31];
+const NORTH_AUTUMN: Grouping = [0, 9, 1, 0, 11, 30];
+const NORTH_WINTER: Grouping = [-1, 12, 1, 1, 2, 0];
+const EITHER_SPRING_OR_AUTUMN: Grouping = [0, 3, 1, 0, 11, 30];
+const EITHER_SUMMER_OR_WINTER: Grouping = [-1, 12, 1, 1, 2, 0];
+const GROUPINGS: Readonly<Record<number, Grouping>> = {
+  21: EITHER_SPRING_OR_AUTUMN,
+  22: EITHER_SUMMER_OR_WINTER,
+  23: EITHER_SPRING_OR_AUTUMN,
+  24: EITHER_SUMMER_OR_WINTER,
+  25: NORTH_SPRING,
+  26: NORTH_SUMMER,
+  27: NORTH_AUTUMN,
+  28: NORTH_WINTER,
+  // Southern hemisphere: spring is September–November, and so on.
+  29: NORTH_AUTUMN,
+  30: NORTH_WINTER,
+  31: NORTH_SPRING,
+  32: NORTH_SUMMER,
   // Quarters, quadrimesters, semesters.
-  33: [1, 1, 3, 31, false],
-  34: [4, 1, 6, 30, false],
-  35: [7, 1, 9, 30, false],
-  36: [10, 1, 12, 31, false],
-  37: [1, 1, 4, 30, false],
-  38: [5, 1, 8, 31, false],
-  39: [9, 1, 12, 31, false],
-  40: [1, 1, 6, 30, false],
-  41: [7, 1, 12, 31, false],
+  33: [0, 1, 1, 0, 3, 31],
+  34: [0, 4, 1, 0, 6, 30],
+  35: [0, 7, 1, 0, 9, 30],
+  36: [0, 10, 1, 0, 12, 31],
+  37: [0, 1, 1, 0, 4, 30],
+  38: [0, 5, 1, 0, 8, 31],
+  39: [0, 9, 1, 0, 12, 31],
+  40: [0, 1, 1, 0, 6, 30],
+  41: [0, 7, 1, 0, 12, 31],
 };
 
 function parseDate(text: string): Span {
   const span = parseDateBounds(text);
-  // A year of only X digits says nothing about when: don't sort it as year 0.
-  const noYear = /^[?~%]?-?XXXX(?![\dX])/.test(text);
+  // A year whose first digit is X (XXXX, XXX1) says nothing useful about
+  // when, so don't sort it as year 0 or year 1.
+  const noYear = /^[?~%]?-?X/.test(text);
   return { ...span, anchor: noYear ? null : span.earliest };
 }
 
@@ -386,10 +412,10 @@ function parseDateBounds(text: string): Omit<Span, "anchor"> {
       fail("invalid_month", `${monthText} is not a month (01–12) or an EDTF season (21–41).`);
     }
     if (dayText !== undefined) fail("invalid_day", "A season or quarter can't have a day.");
-    const [sm, sd, em, ed, nextYear] = grouping;
-    const endYear = yearMax + (nextYear ? 1 : 0);
+    const [sy, sm, sd, ey, em, ed] = grouping;
+    const endYear = yearMax + ey;
     return {
-      earliest: { year: yearMin, month: sm, day: sd },
+      earliest: { year: yearMin + sy, month: sm, day: sd },
       latest: { year: endYear, month: em, day: ed === 0 ? daysInMonth(endYear, em) : ed },
       level: maxLevel(level, code <= 24 ? 1 : 2),
       uncertain,
@@ -425,7 +451,11 @@ function parseDateBounds(text: string): Omit<Span, "anchor"> {
   const days = matching(dayText, 31);
   if (dayText.includes("X")) unspecified = true;
   // Keep only months that have at least one possible day.
-  const usable = months.filter((month) => days.some((d) => d <= longest(month)));
+  let usable = months.filter((month) => days.some((d) => d <= longest(month)));
+  // 29 February with X digits in the year: only if some matching year is a leap year.
+  if (!yearKnown && usable.length === 1 && usable[0] === 2 && days[0] === 29) {
+    if (!someLeapYear(yearMin, yearMax, yearText)) usable = [];
+  }
   if (days.length === 0 || usable.length === 0) {
     if (!dayText.includes("X") && !monthText.includes("X") && yearKnown) {
       checkDay(yearMin, Number(monthText), Number(dayText));
@@ -454,6 +484,16 @@ function unspecifiedLevel(year: string, month?: string, day?: string): EdtfLevel
   if (month === "XX") return day === undefined || day === "XX" ? 1 : 2;
   if (month?.includes("X")) return 2;
   return day === "XX" ? 1 : 2;
+}
+
+/** True if a year matching `pattern` (digits and X) between low and high is a leap year. */
+function someLeapYear(low: number, high: number, pattern: string): boolean {
+  const digits = pattern.replace(/^-/, "");
+  const shape = new RegExp(`^${digits.replaceAll("X", "\\d")}$`);
+  for (let year = low; year <= high; year++) {
+    if (isLeapYear(year) && shape.test(String(Math.abs(year)).padStart(4, "0"))) return true;
+  }
+  return false;
 }
 
 /** A value the parser has already shown exists. */
@@ -503,8 +543,9 @@ function parseInterval(text: string): Span {
       fail("interval_backwards", "The interval ends before it starts.");
     }
   }
-  // Open or unknown ends are level 1.
-  const level = maxLevel(start?.level ?? 1, end?.level ?? 1);
+  // Open or unknown ends are level 1; X digits in an interval are level 2.
+  let level = maxLevel(start?.level ?? 1, end?.level ?? 1);
+  if (start?.unspecified === true || end?.unspecified === true) level = 2;
   return {
     anchor: start?.anchor ?? (end !== null && end.anchor !== null ? end.latest : null),
     earliest: start?.earliest ?? null,
@@ -595,7 +636,7 @@ function parseSet(text: string): Span {
   const low = earliest ?? null;
   const high = latest ?? null;
   return {
-    anchor: known.day === undefined ? null : low === null ? high : known.day,
+    anchor: known.day ?? null,
     earliest: low,
     latest: high,
     level: 2,

@@ -30,7 +30,6 @@ describe("edtfFromText", () => {
     ["ca. 1920", "1920~"],
     ["ca 1920", "1920~"],
     ["c. 1920", "1920~"],
-    ["c1920", "1920~"],
     ["approx. 1920", "1920~"],
     ["1920?", "1920?"],
     ["probably 1920", "1920?"],
@@ -61,15 +60,16 @@ describe("edtfFromText", () => {
   });
 
   it.each([
-    ["19th century", "1801/1900", false],
-    ["20th century", "1901/2000", false],
-    ["early 20th century", "1901/2000", true],
-    ["1st century", "0001/0100", false],
-    ["ca. 19th century", "1801~/1900~", false],
-  ])("century %j uses its strict years", (text, edtf, keep) => {
+    ["19th century", "1800/1900"],
+    ["20th century", "1900/2000"],
+    ["early 20th century", "1900/2000"],
+    ["1st century", "0000/0100"],
+    ["21st century", "2000/2100"],
+    ["ca. 19th century", "1800~/1900~"],
+  ])("century %j covers both the strict and the common reading", (text, edtf) => {
     const result = read(text);
     expect(result.edtf).toBe(edtf);
-    expect(result.note !== undefined).toBe(keep);
+    expect(result.note).toBe(`Originally “${text}”.`);
   });
 
   it("keeps the original wording, not a lowercased copy, in the note", () => {
@@ -108,7 +108,8 @@ describe("edtfFromText", () => {
     ["1920 - 1925", "1920/1925"],
     ["1920–1925", "1920/1925"],
     ["1920 to 1925", "1920/1925"],
-    ["between 1920 and 1925", "1920/1925"],
+    ["between 1920 and 1925", "[1920..1925]"],
+    ["from 1920 to 1925", "1920/1925"],
     ["from June 1920 to May 1921", "1920-06/1921-05"],
     ["1920-45", "1920/1945"],
     ["1920 - 25", "1920/1925"],
@@ -148,6 +149,12 @@ describe("edtfFromText", () => {
     ["n.d.", "undated"],
     ["Unknown", "undated"],
     ["before 1920", "unreadable"],
+    ["c1920", "ambiguous"],
+    ["19st century", "unreadable"],
+    ["12nd century", "unreadable"],
+    ["late\u20281920s", "invalid_text"],
+    ["late\ufeff1920s", "invalid_text"],
+    ["1920\u0000", "invalid_text"],
     ["after 1920", "unreadable"],
     ["Christmas 1920", "unreadable"],
     ["constructor 1920", "unreadable"],
@@ -162,6 +169,18 @@ describe("edtfFromText", () => {
     ["1".repeat(MAX_DATE_TEXT_LENGTH + 1), "too_long"],
   ])("flags %j as %s", (text, expected) => {
     expect(code(text)).toBe(expected);
+  });
+
+  it("explains one-sided ranges", () => {
+    for (const text of ["before 1920", "after 1920", "by 1920", "pre 1920"]) {
+      const result = edtfFromText(text);
+      expect(!result.ok && result.issues[0]?.message).toContain("one side of a range");
+    }
+  });
+
+  it("suggests the actual range for year-dash-two-digit text", () => {
+    const result = edtfFromText("1901-05");
+    expect(!result.ok && result.issues[0]?.message).toContain("1901/1905");
   });
 
   it("returns the parsed date with sort fields", () => {

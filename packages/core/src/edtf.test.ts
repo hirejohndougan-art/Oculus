@@ -85,11 +85,12 @@ describe("level 1", () => {
   });
 
   it.each([
-    ["2001-21", "2001|3|1", "2001|5|31"],
-    ["2001-22", "2001|6|1", "2001|8|31"],
-    ["2001-23", "2001|9|1", "2001|11|30"],
-    ["2001-24", "2001|1|1", "2002|2|28"],
-    ["2003-24", "2003|1|1", "2004|2|29"],
+    // Hemisphere not stated, so each covers both readings.
+    ["2001-21", "2001|3|1", "2001|11|30"],
+    ["2001-22", "2000|12|1", "2002|2|28"],
+    ["2001-23", "2001|3|1", "2001|11|30"],
+    ["2001-24", "2000|12|1", "2002|2|28"],
+    ["2003-24", "2002|12|1", "2004|2|29"],
   ])("season %s", (text, earliest, latest) => {
     const d = ok(text);
     expect(d.level).toBe(1);
@@ -189,6 +190,8 @@ describe("level 2", () => {
 
   it.each([
     ["2001-25", "2001|3|1", "2001|5|31"],
+    ["2001-28", "2000|12|1", "2002|2|28"],
+    ["2001-30", "2000|12|1", "2002|2|28"],
     ["2001-29", "2001|9|1", "2001|11|30"],
     ["2001-32", "2001|6|1", "2001|8|31"],
     ["2001-33", "2001|1|1", "2001|3|31"],
@@ -223,7 +226,9 @@ describe("level 2", () => {
 
   it.each([
     ["2004-06-~01/2004-06-~20", 2],
-    ["2004-06-XX/2004-07-03", 1],
+    ["2004-06-XX/2004-07-03", 2],
+    ["201X/2020", 2],
+    ["1984~/2004-06", 1],
   ])("interval of level 2 parts %s", (text, level) => {
     expect(ok(text).level).toBe(level);
   });
@@ -250,6 +255,8 @@ describe("rejects", () => {
     ["1985-04-00", "invalid_day"],
     ["1985-04-32", "invalid_day"],
     ["1985-02-3X", "invalid_day"],
+    ["XXX1-02-29", "invalid_day"],
+    ["190X-02-29", "__ok__"],
     ["2001-21-05", "invalid_day"],
     ["-0000", "invalid_year"],
     ["Y1985", "invalid_year"],
@@ -285,7 +292,7 @@ describe("rejects", () => {
     ["[1972..1970]", "range_backwards"],
     [`[${Array.from({ length: MAX_SET_MEMBERS + 1 }, () => "1985").join(",")}]`, "set_too_large"],
   ])("%j → %s", (text, expected) => {
-    expect(code(text)).toBe(expected);
+    expect(code(text)).toBe(expected === "__ok__" ? undefined : expected);
   });
 
   it("never throws, whatever the input", () => {
@@ -381,7 +388,7 @@ describe("helpers", () => {
   });
 
   it("gives no sort year when no year is known, and sorts those last", () => {
-    for (const text of ["XXXX", "XXXX-12-25", "-XXXX", "[XXXX-12,XXXX-11]"]) {
+    for (const text of ["XXXX", "XXXX-12-25", "-XXXX", "[XXXX-12,XXXX-11]", "XXX1", "X985"]) {
       expect(ok(text)).toMatchObject({ sortKey: null, sortYear: null });
     }
     expect(Object.is(ok("-XXXX").latest?.year, -0)).toBe(false);
@@ -389,10 +396,15 @@ describe("helpers", () => {
     expect(sorted.map((d) => d.edtf)).toEqual(["0000", "1985", "XXXX-12-25"]);
     expect(ok("XXXX/1950")).toMatchObject({ sortYear: 1950 });
     expect(ok("[XXXX,1950]")).toMatchObject({ sortYear: 1950 });
-    expect(ok("[..1950,XXXX]")).toMatchObject({ sortYear: 9999 });
+    expect(ok("[..1950,XXXX]")).toMatchObject({ sortYear: 1950 });
+    expect(ok("[..1760,1900..]")).toMatchObject({ sortYear: 1760 });
+    expect(ok("[..1760-12-03,1900]")).toMatchObject({ sortKey: 17601203 });
   });
 
-  it("returns frozen results", () => {
+  it("returns frozen results, including the day objects", () => {
     expect(Object.isFrozen(ok("1985"))).toBe(true);
+    const d = ok("1985-04-12T10:00:00");
+    expect(Object.isFrozen(d.earliest)).toBe(true);
+    expect(d.earliest).not.toBe(d.latest);
   });
 });
