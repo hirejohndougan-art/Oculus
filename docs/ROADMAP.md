@@ -25,10 +25,14 @@ The data model in TypeScript, written for any archive or museum rather than one 
   - Types and validators for object, archival unit (collection > series > file > item, nested to any depth), digital asset, agent (person, organization, family), place and event.
   - Every record has a permanent internal UUID.
   - Collections and series stay independent of each other (PLATFORM_PLAN.md §1).
-- [ ] T-003 **EDTF dates.** deps: T-001
+- [x] T-003 **EDTF dates.** deps: T-001
   - Parse and validate Extended Date/Time Format (Library of Congress spec): levels 0 and 1, and the level 2 parts archives use.
   - Give every date a sort key and a clean sortable year.
   - Turn common free-text dates into EDTF ("about 1920" → `1920~`, "1950s" → `195X`, "late 1920s" → `192X` plus a note), and flag anything it can't read instead of guessing.
+- [ ] T-003a **EDTF review follow-ups.** deps: T-003
+  - Decide whether to accept a qualifier after more than one part (`2004?-06~-11`); the 2019 level 2 grammar may allow it. Check against the spec text.
+  - Decide whether "1920-1925?" should put `?` on both ends (it does now) or be flagged.
+  - Compare `parseEdtf` against the spec's full example list in a test, once the spec page can be read from the sandbox (this run's fetch was blocked).
 - [ ] T-004 **Typed identifiers.** deps: T-002
   - Identifier types defined by the organization, each with a format pattern, a uniqueness rule and optional auto-numbering (year-based `2026.015`, or prefix plus digits `DHS-0001`).
   - Any number of identifiers per record, one of them marked primary.
