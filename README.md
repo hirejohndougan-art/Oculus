@@ -20,6 +20,7 @@ Records are published live: when you publish a record in Polybius, it shows on t
 | Path | What it is |
 |---|---|
 | [`docs/PLATFORM_PLAN.md`](docs/PLATFORM_PLAN.md) | The plan: goals, decisions, record model, ID numbers, users, media, public sites, replacing Omeka S, technology, phases, risks and open questions. |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md), [`docs/PROGRESS.md`](docs/PROGRESS.md), [`docs/DECISIONS.md`](docs/DECISIONS.md) | What's next, what's been done, and why. Oculus is built nightly by scheduled sessions that follow [`docs/AUTOPILOT.md`](docs/AUTOPILOT.md). |
 | [`design/DESIGN.md`](design/DESIGN.md) | The design guide: colors, type, spacing, layouts, components, behavior patterns, and a list of every screen and wizard. |
 | [`design/tokens/`](design/tokens/) | The colors, fonts and sizes as CSS variables (`tokens.css`) and JSON (`tokens.json`). |
 | [`mockup/`](mockup/) | The 41-screen click-through mockup: public site, back end and six step-by-step wizards. |
