@@ -63,7 +63,7 @@
  */
 import { issue, type Issue, type Validated } from "./issues.js";
 import { RIGHTS_FIELD_KEY, rightsPublishIssues } from "./rights.js";
-import { markEffective } from "./effective-brand.js";
+import { markEffective, markPublicView } from "./effective-brand.js";
 import { shown } from "./plain-data.js";
 import { types } from "node:util";
 import { MAX_ARRANGEMENT_DEPTH, canFileUnder } from "./arrangement.js";
@@ -559,16 +559,20 @@ function compose(
     .filter((e) => e.visibility === "public" && e.inTemplate)
     .map((e) => Object.freeze({ key: e.key, label: e.label, value: e.value, own: e.own }));
   markEffective(effective);
-  PUBLIC_VIEWS.set(
+  const view: PublicRecord = Object.freeze({
+    id: target.id,
+    kind: target.kind,
+    title: target.title,
+    fields: Object.freeze(Object.fromEntries(shownEntries.map((e) => [e.key, e.value]))),
+    entries: Object.freeze(shownEntries),
+  });
+  PUBLIC_VIEWS.set(effective, view);
+  // So public output (T-010) can recognise this view and find its checks.
+  markPublicView(view, {
     effective,
-    Object.freeze({
-      id: target.id,
-      kind: target.kind,
-      title: target.title,
-      fields: Object.freeze(Object.fromEntries(shownEntries.map((e) => [e.key, e.value]))),
-      entries: Object.freeze(shownEntries),
-    }),
-  );
+    template: own.template,
+    ...(target.kind === "archival_unit" ? { level: target.level } : {}),
+  });
   return effective;
 }
 
