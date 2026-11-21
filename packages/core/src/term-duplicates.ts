@@ -52,11 +52,13 @@
  * word in common is missed only when one edit is an insertion or deletion
  * among the first three letters and the other among the last three. A block
  * with more than 20 terms is sorted and each term compared with its 8
- * nearest neighbours on each side. Every pair visited is charged against
- * `MAX_SPELLING_CELLS` (at least 500 cells, or the product of the two keys'
- * lengths when their distance is worked out), and visited once however many
- * blocks it shares. When any limit cuts the search short, `truncated` is
- * true and `limitsReached` says which.
+ * nearest neighbours on each side. A pair whose keys differ in more letters
+ * than the edits allowed could change is passed over without working out
+ * its distance. Every pair visited is charged against `MAX_SPELLING_CELLS`
+ * (500 cells, 2,000 when its distance is worked out, or the product of the
+ * two keys' lengths when that is more and a distance is needed), and visited
+ * once however many blocks it shares. When any limit cuts the search short,
+ * `truncated` is true and `limitsReached` says which.
  */
 import { type Issue, type Validated } from "./issues.js";
 import { IssueList, shown } from "./plain-data.js";
@@ -153,12 +155,20 @@ export const DEFAULT_DUPLICATE_CANDIDATES = 500;
 export const MAX_DUPLICATE_CANDIDATES = 10_000;
 /**
  * The spelling check's work budget, in character cells. Each pair visited
- * costs at least `VISIT_CELLS`; a pair whose distance is worked out costs the
- * product of the two keys' lengths if that is more. It also bounds the
- * pairs remembered as visited (at most 4,000,000).
+ * costs at least `VISIT_CELLS`, and a pair whose distance is worked out at
+ * least `DISTANCE_CELLS`; a pair that needs a distance costs the product of
+ * the two keys' lengths if that is more. It also bounds the pairs remembered
+ * as visited (at most 4,000,000) and the distances worked out (at most
+ * 1,000,000), so 50,000 hostile terms stay near 2 seconds.
  */
 export const MAX_SPELLING_CELLS = 2_000_000_000;
+/** A visit: remembering the pair and checking it is worth a distance. */
 const VISIT_CELLS = 500;
+/**
+ * A distance worked out, however short the keys: measured at about twice a
+ * visit, charged at four times so that the distances stay within the time.
+ */
+const DISTANCE_CELLS = 2000;
 /**
  * The abbreviation check's work budget: one unit per run of words looked at,
  * plus the characters of each shortened form built to look up.
@@ -847,19 +857,35 @@ function spelling(terms: readonly Prepared[], out: Collector): void {
     return cached;
   };
 
-  const visited = new Set<number>();
+  // Which letters (folded into 32 buckets) each key has. One edit changes
+  // the set by at most two buckets, so keys whose sets differ in more than
+  // 2 × limit buckets can't be within the limit, and their distance needn't
+  // be worked out.
+  const letterSets = new Int32Array(terms.length);
+  terms.forEach((t, i) => {
+    let set = 0;
+    // By code point, as `chars` holds them.
+    for (const c of t.key) set |= 1 << ((c.codePointAt(0) ?? 0) & 31);
+    letterSets[i] = set;
+  });
+
+  const visited = new PairSet();
   let cells = 0;
   /** Visit one pair; false when the budget has run out. */
   const visit = (i: number, j: number): boolean => {
-    const id = pairId(i, j, terms.length);
-    if (visited.has(id)) return true;
+    if (visited.has(i, j)) return true;
     const a = terms[i];
     const b = terms[j];
     if (a === undefined || b === undefined) return true;
     const product = a.chars.length * b.chars.length;
     const needsDistance =
       a.key !== b.key && !out.has(i, j) && out.eligible(i, j, "similar_spelling");
-    const cost = needsDistance ? Math.max(VISIT_CELLS, product) : VISIT_CELLS;
+    const limit = Math.min(a.chars.length, b.chars.length) >= 10 ? 2 : 1;
+    const worked =
+      needsDistance && bitCount((letterSets[i] ?? 0) ^ (letterSets[j] ?? 0)) <= 2 * limit;
+    const cost = needsDistance
+      ? Math.max(worked ? DISTANCE_CELLS : VISIT_CELLS, product)
+      : VISIT_CELLS;
     if (cells + cost > MAX_SPELLING_CELLS) {
       out.limits.add("spelling_budget");
       return false;
@@ -869,9 +895,8 @@ function spelling(terms: readonly Prepared[], out: Collector): void {
       return false;
     }
     cells += cost;
-    visited.add(id);
-    if (!needsDistance) return true;
-    const limit = Math.min(a.chars.length, b.chars.length) >= 10 ? 2 : 1;
+    visited.add(i, j);
+    if (!worked) return true;
     const d = boundedDistance(a.chars, b.chars, limit);
     if (d <= limit) out.add(i, j, "similar_spelling", d);
     return true;
@@ -912,6 +937,66 @@ function spelling(terms: readonly Prepared[], out: Collector): void {
         if (y === x || (y < x && terms[j]?.hasUri !== true)) continue;
         if (!visit(i, j)) return;
       }
+    }
+  }
+}
+
+/** How many bits of a 32-bit number are set. */
+function bitCount(x: number): number {
+  let v = x - ((x >>> 1) & 0x55555555);
+  v = (v & 0x33333333) + ((v >>> 2) & 0x33333333);
+  return (Math.imul((v + (v >>> 4)) & 0x0f0f0f0f, 0x01010101) >>> 24) & 0xff;
+}
+
+/**
+ * A set of pairs of term positions (each below 2^31), in typed arrays with
+ * open addressing: far less memory and time than a `Set` of numbers that
+ * outgrow small integers. Pairs are unordered.
+ */
+class PairSet {
+  private low = new Int32Array(1 << 12).fill(-1);
+  private high = new Int32Array(1 << 12);
+  private size = 0;
+
+  has(i: number, j: number): boolean {
+    return this.low[this.slot(Math.min(i, j), Math.max(i, j))] !== -1;
+  }
+
+  add(i: number, j: number): void {
+    const x = Math.min(i, j);
+    const y = Math.max(i, j);
+    const at = this.slot(x, y);
+    if (this.low[at] !== -1) return;
+    this.low[at] = x;
+    this.high[at] = y;
+    this.size += 1;
+    if (this.size * 2 > this.low.length) this.grow();
+  }
+
+  /** Where the pair is, or the empty slot where it would go. */
+  private slot(x: number, y: number): number {
+    const mask = this.low.length - 1;
+    let at = (Math.imul(x, 0x9e3779b1) ^ Math.imul(y, 0x85ebca6b)) >>> 0;
+    at = (at ^ (at >>> 15)) & mask;
+    for (;;) {
+      const l = this.low[at] ?? -1;
+      if (l === -1 || (l === x && this.high[at] === y)) return at;
+      at = (at + 1) & mask;
+    }
+  }
+
+  private grow(): void {
+    const low = this.low;
+    const high = this.high;
+    this.low = new Int32Array(low.length * 2).fill(-1);
+    this.high = new Int32Array(low.length * 2);
+    for (let k = 0; k < low.length; k += 1) {
+      const x = low[k] ?? -1;
+      if (x === -1) continue;
+      const y = high[k] ?? 0;
+      const at = this.slot(x, y);
+      this.low[at] = x;
+      this.high[at] = y;
     }
   }
 }

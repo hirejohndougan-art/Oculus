@@ -284,6 +284,48 @@ describe("near-duplicate detection can't be overloaded", () => {
     expect(r.ms).toBeLessThan(5000);
   });
 
+  // Labels of 6 or 7 short random words: keys too short to be charged much
+  // each, in hundreds of big blocks of different keys.
+  const randomWords = (seed: number, vocabulary: readonly string[], words: number): unknown[] => {
+    let s = seed;
+    const next = (): number => {
+      s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+      return s / 2 ** 32;
+    };
+    return Array.from({ length: N }, () => ({
+      label: Array.from(
+        { length: words },
+        () => vocabulary[Math.floor(next() * vocabulary.length)] ?? "",
+      ).join(" "),
+    }));
+  };
+  const consonants = "bcdfghjklmnpqrstvwxz";
+  const threeLetters = (count: number, letters: string): string[] =>
+    Array.from({ length: count }, (_, i) =>
+      [0, 1, 2]
+        .map((k) => letters[Math.floor((i * 7919) / letters.length ** k) % letters.length])
+        .join(""),
+    );
+
+  it("is fast on many labels of six short random words", () => {
+    const r = timed(randomWords(42, threeLetters(120, consonants), 6));
+    expect(r.ms).toBeLessThan(5000);
+  });
+
+  it("is fast on many labels of seven short random words", () => {
+    const r = timed(randomWords(42, threeLetters(40, consonants), 7));
+    expect(r.ms).toBeLessThan(5000);
+  });
+
+  it("charges every distance worked out, even when the keys use the same few letters", () => {
+    // 64 words from 4 letters: every key has the same letters, so no pair is
+    // passed over cheaply and each needs its distance.
+    const r = timed(randomWords(7, threeLetters(64, "bcdf"), 6));
+    expect(r.limits).toContain("spelling_budget");
+    expect(r.found).toBeGreaterThan(0);
+    expect(r.ms).toBeLessThan(5000);
+  });
+
   it("doesn't run out of memory on labels that unfold to many characters", () => {
     // U+FDFA unfolds to 18 characters: 450 of them would be an 8,100-letter key.
     const r = findNearDuplicateTerms(

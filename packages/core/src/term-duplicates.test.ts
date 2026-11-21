@@ -407,6 +407,51 @@ describe("findNearDuplicateTerms: results and limits", () => {
     ]);
   });
 
+  it("finds every pair within the edit limit among many keys with the same letters", () => {
+    // Keys from six letters, each a few edits from one of eight stems: every
+    // pair a full comparison finds must be found, none passed over unworked.
+    let seed = 11;
+    const rand = (n: number): number => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return Math.floor((seed / 2 ** 32) * n);
+    };
+    const letters = "abcdef";
+    const stems = Array.from({ length: 8 }, (_, k) =>
+      Array.from({ length: 5 + k }, () => letters[rand(6)]).join(""),
+    );
+    const labels = Array.from({ length: 48 }, () => {
+      const key = Array.from(stems[rand(8)] ?? "");
+      for (let e = rand(3); e > 0; e -= 1) {
+        const at = rand(key.length);
+        const kind = rand(3);
+        if (kind === 0) key.splice(at, 1);
+        else if (kind === 1) key.splice(at, 0, letters[rand(6)] ?? "");
+        else key[at] = letters[rand(6)] ?? "";
+      }
+      return key.join("");
+    });
+    const r = findNearDuplicateTerms(
+      labels.map((label) => ({ label })),
+      { maxCandidates: 10_000 },
+    );
+    if (!r.ok) throw new Error("expected ok");
+    expect(r.value.limitsReached).toEqual([]);
+    const found = new Set(r.value.candidates.map((c) => `${String(c.first)} ${String(c.second)}`));
+    let near = 0;
+    for (let i = 0; i < labels.length; i += 1) {
+      for (let j = i + 1; j < labels.length; j += 1) {
+        const a = labels[i] ?? "";
+        const b = labels[j] ?? "";
+        if (a === b || Math.min(a.length, b.length) < 5) continue;
+        const limit = Math.min(a.length, b.length) >= 10 ? 2 : 1;
+        if (boundedDistance(a, b, limit) > limit) continue;
+        near += 1;
+        expect(found.has(`${String(i)} ${String(j)}`), `${a} ${b}`).toBe(true);
+      }
+    }
+    expect(near).toBeGreaterThan(20);
+  });
+
   it("doesn't mark an ordinary long heading as truncated", () => {
     const r = findNearDuplicateTerms([
       {
