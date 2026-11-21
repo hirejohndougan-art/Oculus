@@ -7,7 +7,9 @@ import {
   effectivePublishIssues,
   effectiveRecord,
   indexRecords,
+  isEffectiveRecord,
   publicView,
+  rightsPublishIssues,
   type EffectiveRecord,
   newRecordId,
   type ArchivalLevel,
@@ -193,17 +195,35 @@ describe("inherited values can't be faked", () => {
     expect(reads).toBe(0);
   });
 
-  it("by a getter id or a Proxy record, which are skipped as unreadable", () => {
+  it("by a getter id or a Proxy record, which fail the whole set (they could hide a duplicate)", () => {
     const fonds = unit("Fonds", "fonds");
     const item = unit("Item", "item", fonds);
     const withGetter = { ...fonds };
     Object.defineProperty(withGetter, "id", { enumerable: true, get: () => fonds.id });
     expect(codeOf(effectiveRecord(item.id, [item, withGetter], () => PUBLIC_NOTE))).toBe(
-      "missing_parent",
+      "unreadable_entry",
     );
     expect(codeOf(effectiveRecord(item.id, [item, new Proxy(fonds, {})], () => PUBLIC_NOTE))).toBe(
-      "missing_parent",
+      "unreadable_entry",
     );
+    // A twin hidden behind a getter id can't make the real parent look unique.
+    const twin = { ...fonds, title: "Twin" };
+    Object.defineProperty(twin, "id", { enumerable: true, get: () => fonds.id });
+    expect(codeOf(effectiveRecord(item.id, [item, fonds, twin], () => PUBLIC_NOTE))).toBe(
+      "unreadable_entry",
+    );
+    const holes = [item, fonds] as CatalogRecord[];
+    holes.length = 3;
+    expect(codeOf(effectiveRecord(item.id, holes, () => PUBLIC_NOTE))).toBe("unreadable_entry");
+    expect(
+      codeOf(
+        effectiveRecord(
+          item.id,
+          [item, fonds, "x"] as unknown as CatalogRecord[],
+          () => PUBLIC_NOTE,
+        ),
+      ),
+    ).toBe("unreadable_entry");
   });
 
   it("by a getter in a list slot or a Proxy list", () => {
@@ -218,7 +238,7 @@ describe("inherited values can't be faked", () => {
         return fonds;
       },
     });
-    expect(codeOf(effectiveRecord(item.id, list, () => PUBLIC_NOTE))).toBe("missing_parent");
+    expect(codeOf(effectiveRecord(item.id, list, () => PUBLIC_NOTE))).toBe("unreadable_entry");
     expect(reads).toBe(0);
     expect(codeOf(effectiveRecord(item.id, new Proxy([item, fonds], {}), () => PUBLIC_NOTE))).toBe(
       "not_a_list",
@@ -474,5 +494,77 @@ describe("plug-in checkers run on inherited values", () => {
     expect(codeOf(effectiveRecord(item.id, [item], () => PUBLIC_NOTE, getter))).toBe(
       "invalid_options",
     );
+  });
+});
+
+describe("checkers can't change what was checked", () => {
+  it("a checker rewriting a later inherited value can't get an unchecked value kept", () => {
+    const both = template([def("note", "public"), def("other", "public")], "both");
+    const fonds = unit("Fonds", "fonds", undefined, { note: "Fine", other: "Bad" });
+    const item = unit("Item", "item", fonds);
+    const checkers = {
+      text: (value: unknown, _field: unknown, rec: CatalogRecord) => {
+        if (value === "Fine") {
+          try {
+            (rec.fields as Record<string, FieldValue>).other = "Good";
+          } catch {
+            // Frozen: the rewrite is refused.
+          }
+        }
+        return value === "Bad" ? [{ code: "refused", message: "Refused." }] : [];
+      },
+    };
+    const r = effectiveRecord(item.id, [item, fonds], () => both, { checkers });
+    if (!r.ok) throw new Error("failed");
+    expect(r.value.fields).toEqual({ note: "Fine" });
+    expect(publicView(r.value)?.fields).toEqual({ note: "Fine" });
+    expect(r.value.notes.map((n) => [n.code, n.path])).toEqual([
+      ["not_valid_here", ["fields", "other"]],
+    ]);
+  });
+
+  it("checkers are given a frozen record", () => {
+    const fonds = unit("Fonds", "fonds", undefined, { note: "Fine" });
+    const item = unit("Item", "item", fonds);
+    let frozen = false;
+    effectiveRecord(item.id, [item, fonds], () => PUBLIC_NOTE, {
+      checkers: {
+        text: (_v: unknown, _f: unknown, rec: CatalogRecord) => {
+          frozen = Object.isFrozen(rec) && Object.isFrozen(rec.fields);
+          return [];
+        },
+      },
+    });
+    expect(frozen).toBe(true);
+  });
+
+  it("a Proxy checkers object is refused", () => {
+    const item = unit("Item", "item");
+    const r = effectiveRecord(item.id, [item], () => PUBLIC_NOTE, {
+      checkers: new Proxy({}, {}),
+    });
+    expect(codeOf(r)).toBe("invalid_options");
+  });
+});
+
+describe("rightsPublishIssues refuses an effective record", () => {
+  it("so staff-only rights can't pass by the wrong check", () => {
+    const RIGHTS = "http://rightsstatements.org/vocab/CNE/1.0/";
+    const fonds = unit("Fonds", "fonds", undefined, { rights: RIGHTS });
+    const item = unit("Item", "item", fonds);
+    const r = effectiveRecord(item.id, [item, fonds], (rec) =>
+      rec.id === fonds.id
+        ? template([def("rights", "staff")], "fonds")
+        : template([def("rights", "public")], "item"),
+    );
+    if (!r.ok) throw new Error("failed");
+    expect(isEffectiveRecord(r.value)).toBe(true);
+    expect(rightsPublishIssues(r.value).map((i) => i.code)).toEqual([
+      "use_effective_publish_issues",
+    ]);
+    expect(canPublishRights(r.value)).toBe(false);
+    expect(effectivePublishIssues(r.value).map((i) => i.code)).toEqual(["rights_not_public"]);
+    expect(isEffectiveRecord({ ...r.value })).toBe(false);
+    expect(isEffectiveRecord(publicView(r.value))).toBe(false);
   });
 });

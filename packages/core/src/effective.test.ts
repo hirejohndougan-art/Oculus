@@ -3,7 +3,9 @@ import {
   MAX_ARRANGEMENT_DEPTH,
   MAX_RECORD_SET,
   canPublishRights,
+  effectivePublishIssues,
   effectiveRecord,
+  publicView,
   indexRecords,
   newRecordId,
   rightsPublishIssues,
@@ -178,10 +180,13 @@ describe("effectiveRecord: the mockup's Effective Record screen", () => {
     expect(effective.notes).toEqual([]);
   });
 
-  it("is what the rights publish check runs on", () => {
+  it("is what the rights publish check runs on, through effectivePublishIssues", () => {
     expect(rightsPublishIssues(item)[0]?.code).toBe("rights_missing");
-    expect(rightsPublishIssues(effective)).toEqual([]);
-    expect(canPublishRights(effective)).toBe(true);
+    expect(effectivePublishIssues(effective)).toEqual([]);
+    expect(canPublishRights(publicView(effective))).toBe(true);
+    // rightsPublishIssues can't see the visibility rule, so it refuses the effective record.
+    expect(rightsPublishIssues(effective)[0]?.code).toBe("use_effective_publish_issues");
+    expect(canPublishRights(effective)).toBe(false);
   });
 
   it("works out the same for a unit higher up", () => {
@@ -247,7 +252,7 @@ describe("the record's own value wins", () => {
       ["empty_value", ["fields", "subjects"]],
     ]);
     // So the record can't be published until someone chooses its rights.
-    expect(rightsPublishIssues(e)[0]?.code).toBe("rights_missing");
+    expect(effectivePublishIssues(e)[0]?.code).toBe("rights_missing");
   });
 
   it("an empty value on a unit in between stops values from further up", () => {
@@ -332,8 +337,33 @@ describe("which fields inherit", () => {
     expect(e.fields).toEqual({});
     expect(e.notes[0]?.code).toBe("incompatible_field");
     expect(e.notes[0]?.message).toBe(
-      '"Creator" isn\'t inherited from "F": the field there is a single long text, here it is a single text.',
+      '"Creator" isn\'t inherited through "F": the field there is a single long text, here it is a single text.',
     );
+  });
+
+  it("not through a unit in between whose field has a different kind, even with no value there", () => {
+    const middleT = template([field({ key: "creator", kind: "long_text" })], "middle");
+    const fonds = unit("F", "fonds", undefined, { creator: "A" });
+    const series = unit("S", "series", fonds);
+    const item = unit("I", "item", series);
+    const lookup: TemplateLookup = (r) => (r.id === series.id ? middleT : ARCHIVE);
+    const e = ok(effectiveRecord(item.id, [item, series, fonds], lookup));
+    expect(e.fields).toEqual({});
+    expect(e.notes.map((n) => [n.code, n.path])).toEqual([
+      ["incompatible_field", ["fields", "creator"]],
+    ]);
+    expect(e.notes[0]?.message).toMatch(/through "S"/);
+  });
+
+  it("not through a unit in between whose field is repeatable where the others aren't", () => {
+    const middleT = template([field({ key: "creator", repeatable: true })], "middle");
+    const fonds = unit("F", "fonds", undefined, { creator: "A" });
+    const series = unit("S", "series", fonds);
+    const item = unit("I", "item", series);
+    const lookup: TemplateLookup = (r) => (r.id === series.id ? middleT : ARCHIVE);
+    const e = ok(effectiveRecord(item.id, [item, series, fonds], lookup));
+    expect(e.fields).toEqual({});
+    expect(e.notes[0]?.code).toBe("incompatible_field");
   });
 
   it("not between a repeatable and a single field, with a note", () => {
@@ -659,14 +689,19 @@ describe("indexRecords: one set, many records", () => {
     for (let i = 0; i < 80_000; i += 1) others.push(unit(`O${String(i)}`, "fonds"));
     const index = indexRecords([...others, fonds, collection, ...items]);
     if (!index.ok) throw new Error("not indexed");
-    const started = performance.now();
+    // Count the work instead of timing it: each item asks for exactly one
+    // template per record on its chain (3), whatever the size of the set.
+    let asked = 0;
+    const counting: TemplateLookup = () => {
+      asked += 1;
+      return ARCHIVE;
+    };
     let rights = 0;
     for (const item of items) {
-      const e = ok(effectiveRecord(item.id, index.value, all(ARCHIVE)));
+      const e = ok(effectiveRecord(item.id, index.value, counting));
       if (e.fields.rights === CNE) rights += 1;
     }
     expect(rights).toBe(20_000);
-    // Generous: about 1 second on the build machine; quadratic would be hours.
-    expect(performance.now() - started).toBeLessThan(15_000);
+    expect(asked).toBe(60_000);
   }, 30_000);
 });

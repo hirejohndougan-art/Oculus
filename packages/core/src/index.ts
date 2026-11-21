@@ -202,6 +202,7 @@ export {
   publicView,
   effectivePublishIssues,
 } from "./effective.js";
+export { isEffectiveRecord } from "./effective-brand.js";
 export type {
   ChainStep,
   EffectiveField,

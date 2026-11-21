@@ -32,6 +32,7 @@
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import { shown, textProblem } from "./plain-data.js";
 import { types } from "node:util";
+import { isEffectiveRecord } from "./effective-brand.js";
 
 export type RightsSource = "rightsstatements.org" | "creativecommons.org";
 
@@ -257,6 +258,16 @@ const RIGHTS_EXEMPT_KINDS: ReadonlySet<string> = new Set(["agent", "place", "eve
  * data properties count; getters, hidden properties and Proxies are reported
  * as unreadable. Never throws.
  */
+const USE_EFFECTIVE: readonly Issue[] = Object.freeze([
+  Object.freeze(
+    issue(
+      ["fields", RIGHTS_FIELD_KEY],
+      "use_effective_publish_issues",
+      "This is an effective record: check it with effectivePublishIssues, which also checks the rights are public.",
+    ),
+  ),
+]);
+
 export function rightsPublishIssues(record: unknown): readonly Issue[] {
   const path = ["fields", RIGHTS_FIELD_KEY] as const;
   const unreadable = Object.freeze([
@@ -265,6 +276,9 @@ export function rightsPublishIssues(record: unknown): readonly Issue[] {
   try {
     // A Proxy could answer differently each time it is asked, so it isn't read at all.
     if (types.isProxy(record)) return unreadable;
+    // The effective record holds staff-only values; its rights must go
+    // through effectivePublishIssues, which applies the visibility rule.
+    if (isEffectiveRecord(record)) return USE_EFFECTIVE;
     const kind = ownValue(record, "kind");
     if (typeof kind === "string" && RIGHTS_EXEMPT_KINDS.has(kind)) return Object.freeze([]);
     const fields = ownValue(record, "fields");

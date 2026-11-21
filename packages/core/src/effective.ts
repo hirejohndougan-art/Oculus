@@ -7,8 +7,10 @@
  * item below it. `effectiveRecord` works out what a record looks like after
  * inheriting: each field's value, the record it came from (or the record's
  * own value), and the visibility that applies to it. This is what the
- * Effective Record screen shows and what publishing (T-010) starts from, so
- * the rights publish check (`rightsPublishIssues`) runs on this result.
+ * Effective Record screen shows and what publishing (T-010) starts from.
+ * Publishing checks rights with `effectivePublishIssues` and publishes only
+ * `publicView`; `rightsPublishIssues` refuses an effective record outright
+ * (`use_effective_publish_issues`), because it can't see the visibility rule.
  *
  * The rules, for one field key, looking up from the record:
  * - The record's own value wins. A repeatable field's own list replaces the
@@ -22,10 +24,12 @@
  *   (`null`, blank text or `[]`, which templates refuse anyway) means "none":
  *   nothing is inherited from it or from above it, so an empty value can
  *   never let an ancestor's value through by accident.
- * - The value is only inherited when the two definitions have the same kind
- *   and the same `repeatable`, and it passes the record's own template check
- *   (list options, lengths, allowed codes). Otherwise the field is left out
- *   and a note says why. There is no second try further up.
+ * - The value is only inherited when every definition of the key on the way
+ *   (the source's, the receiver's and any unit's in between) has the same
+ *   kind and the same `repeatable`, and it passes the record's own template
+ *   check (list options, lengths, allowed codes) and the caller's checkers.
+ *   Otherwise the field is left out and a note says why. There is no second
+ *   try further up.
  * - **Visibility is the strictest along the way.** Records in one tree can
  *   use different templates, and each template sets visibility for its own
  *   fields. An inherited value is `staff` if the field is `staff` in the
@@ -59,6 +63,7 @@
  */
 import { issue, type Issue, type Validated } from "./issues.js";
 import { RIGHTS_FIELD_KEY, rightsPublishIssues } from "./rights.js";
+import { markEffective } from "./effective-brand.js";
 import { shown } from "./plain-data.js";
 import { types } from "node:util";
 import { MAX_ARRANGEMENT_DEPTH, canFileUnder } from "./arrangement.js";
@@ -151,7 +156,8 @@ export interface EffectiveOptions {
    * The same plug-in checks `checkRecordAgainstTemplate` takes. Inherited
    * values go through them against the receiving record's template, and a
    * value they refuse is left out. The record a checker is given is the
-   * receiving record holding only its inherited values.
+   * receiving record (frozen) holding only its inherited values, which may
+   * be staff only: checkers see staff data and must not publish or log it.
    */
   readonly checkers?: TemplateCheckOptions["checkers"];
 }
@@ -204,9 +210,10 @@ const LOOKUPS = new WeakMap<object, LookupState>();
  * Every record is validated now, so the index is one consistent snapshot:
  * later changes to the caller's objects are not seen, and an index must be
  * built again after any edit. A record that fails validation is remembered
- * as invalid under the ID it carries; entries with no readable ID are
- * skipped (a parent that is skipped is then reported missing). IDs used more
- * than once are remembered, and using one fails. Never throws.
+ * as invalid under the ID it carries. An entry with no ID that can be read
+ * as plain data (a hole, a getter, a Proxy, not a record) fails the whole
+ * index, since it could hide a duplicate. IDs used more than once are
+ * remembered, and using one fails. Never throws.
  */
 export function indexRecords(records: unknown): Validated<RecordLookup> {
   try {
@@ -232,11 +239,18 @@ function buildLookup(records: unknown): RecordLookup {
   for (let i = 0; i < length; i += 1) {
     // Read each slot as a plain data property, so a getter can't run.
     const slot = Object.getOwnPropertyDescriptor(records, i);
-    if (slot === undefined || !("value" in slot)) continue;
-    const record: unknown = slot.value;
+    const record: unknown = slot !== undefined && "value" in slot ? slot.value : undefined;
     const checked = validateRecord(record);
     const id = checked.ok ? checked.value.id : idOf(record);
-    if (id === undefined) continue;
+    // An entry whose ID can't be read plainly could be hiding a duplicate,
+    // so the whole set is refused rather than the entry skipped.
+    if (id === undefined) {
+      fail(
+        [i],
+        "unreadable_entry",
+        `Entry ${String(i)} in the set has no ID that can be read as plain data.`,
+      );
+    }
     byId.set(
       id,
       byId.has(id)
@@ -544,6 +558,7 @@ function compose(
   const shownEntries = entries
     .filter((e) => e.visibility === "public" && e.inTemplate)
     .map((e) => Object.freeze({ key: e.key, label: e.label, value: e.value, own: e.own }));
+  markEffective(effective);
   PUBLIC_VIEWS.set(
     effective,
     Object.freeze({
@@ -630,18 +645,20 @@ function inherit(
     if (!definition.inherited) return undefined;
     visibility = strictest(visibility, definition.visibility);
     const stored = ownField(record.fields, field.key);
-    if (stored === undefined) continue;
-    if (isEmpty(stored)) return undefined;
+    if (stored !== undefined && isEmpty(stored)) return undefined;
+    // Every unit on the way that has the key must agree on its shape, even
+    // one in between with no value of its own.
     if (definition.kind !== field.kind || definition.repeatable !== field.repeatable) {
       notes.push(
         issue(
           ["fields", field.key],
           "incompatible_field",
-          `${shown(field.label)} isn't inherited from ${shown(record.title)}: the field there is ${describe(definition)}, here it is ${describe(field)}.`,
+          `${shown(field.label)} isn't inherited through ${shown(record.title)}: the field there is ${describe(definition)}, here it is ${describe(field)}.`,
         ),
       );
       return undefined;
     }
+    if (stored === undefined) continue;
     return {
       key: field.key,
       label: field.label,
@@ -675,10 +692,13 @@ function dropUnfit(
     ...template,
     fields: template.fields.map((f) => ({ ...f, required: false })),
   };
-  const probe = {
-    ...target,
-    fields: Object.fromEntries(inherited.map((c) => [c.key, c.value])),
-  } as CatalogRecord;
+  // Frozen, so a checker can't change a value after it was checked (or
+  // before another checker sees it). The values themselves are already
+  // frozen copies from validateRecord.
+  const probeFields: Readonly<Record<string, FieldValue>> = Object.freeze(
+    Object.fromEntries(inherited.map((c) => [c.key, c.value])),
+  );
+  const probe = Object.freeze({ ...target, fields: probeFields }) as CatalogRecord;
   const problems = checkRecordAgainstTemplate(
     probe,
     loose,
@@ -696,21 +716,30 @@ function dropUnfit(
       unsure = true;
     }
   }
-  return candidates.filter((c) => {
-    if (c.from === 0) return true;
+  const kept: Candidate[] = [];
+  for (const c of candidates) {
+    if (c.from === 0) {
+      kept.push(c);
+      continue;
+    }
     const why = unsure
       ? "it could not be checked against this record's template."
       : unfit.get(c.key);
-    if (why === undefined) return true;
+    const checked = ownField(probeFields, c.key);
+    if (why === undefined && checked === c.value) {
+      // Keep exactly the value that was checked.
+      kept.push({ ...c, value: checked });
+      continue;
+    }
     notes.push(
       issue(
         ["fields", c.key],
         "not_valid_here",
-        `${shown(c.label)} isn't inherited from ${shown(up[c.from]?.title)}: ${why}`,
+        `${shown(c.label)} isn't inherited from ${shown(up[c.from]?.title)}: ${why ?? "it changed while being checked."}`,
       ),
     );
-    return false;
-  });
+  }
+  return kept;
 }
 
 function step(record: CatalogRecord): ChainStep {
@@ -763,5 +792,9 @@ function ownSetting(options: unknown, key: string): unknown {
   if (!("value" in descriptor)) {
     fail([], "invalid_options", `The ${key} option can't be a getter.`);
   }
-  return descriptor.value;
+  const value: unknown = descriptor.value;
+  if (typeof value === "object" && value !== null && types.isProxy(value)) {
+    fail([], "invalid_options", `The ${key} option can't be a Proxy.`);
+  }
+  return value;
 }
