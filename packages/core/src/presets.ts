@@ -16,7 +16,7 @@
  * uses the DACS and Spectrum presets side by side, with the digital asset
  * preset for its scans.
  *
- * Every field cites the standard element it comes from, in `standards`:
+ * Fields cite the standard element they come from, in `standards`:
  * - DACS: SAA's "Describing Archives: A Content Standard", second edition,
  *   element numbers and names as published by SAA at
  *   https://saa-ts-dacs.github.io/dacs/ (version 2022.0.4, read 2026-11-20).
@@ -24,18 +24,26 @@
  * - Spectrum: Collections Trust's Spectrum 5.1 unit of information names, as
  *   written in its Cataloguing and Acquisition and accessioning procedures
  *   (2022). Where only the information group could be confirmed (rights,
- *   valuation), the group is cited instead of a unit.
+ *   valuation), the group is cited and its element text ends
+ *   "(information group)".
  * - Dublin Core: DCMI Metadata Terms (2020-01-20), with their
- *   `http://purl.org/dc/terms/` URIs.
+ *   `http://purl.org/dc/terms/` URIs, on public fields only. The digital
+ *   asset preset's staff fields cite nothing: a Dublin Core cite there would
+ *   read as if the field were published.
  * The title is not a template field: every record has a `title` of its own,
  * which is DACS 2.3 Title, Spectrum "Title" and Dublin Core `title`.
  *
- * Visibility is chosen field by field, and fails closed: anything about
- * donors or acquisition, appraisal, storage location, valuation or insurance,
- * and internal notes is `staff`. Spectrum's "Credit line" is published by many
- * museums but names a donor, so it starts as `staff`; switching it is the
- * organization's decision. Every preset has the `rights` field
- * (`RIGHTS_FIELD_KEY`, D-011) as a public field.
+ * Visibility is chosen field by field, and fails closed: anything that can
+ * name a private person or reveal what staff keep to themselves starts as
+ * `staff`, and an organization that wants it published switches it. That
+ * covers donors and acquisition, custodial and object history, provenance,
+ * owners and rights holders, sources, where originals or copies are, storage
+ * location, appraisal, valuation and insurance, credit lines, and notes. Two
+ * fields that could match those words stay public on purpose: the conditions
+ * governing access (researchers need them; the help text says not to give
+ * personal or donor-confidential reasons) and the repository's own name and
+ * location. Every preset has the `rights` field (`RIGHTS_FIELD_KEY`, D-011)
+ * as a public field.
  *
  * What gets published, and as which Dublin Core term, is in
  * `dublin-core.ts`, not in `standards` here.
@@ -162,7 +170,7 @@ const DACS_FIELDS: readonly FieldDefinition[] = [
   {
     key: "access_conditions",
     label: "Conditions governing access",
-    help: "Published. Who may see the material and when, such as open to researchers.",
+    help: "Published. Who may see the material and when, such as open to researchers. Don't give personal or donor-confidential reasons here.",
     kind: "long_text",
     required: true,
     repeatable: false,
@@ -234,11 +242,11 @@ const DACS_FIELDS: readonly FieldDefinition[] = [
   {
     key: "custodial_history",
     label: "Custodial history",
-    help: "Published. The chain of ownership and custody. Donor details and terms go in Immediate source of acquisition, which is staff only.",
+    help: "Staff only until the organization chooses to publish it: the chain of ownership and custody can name private owners and donors.",
     kind: "long_text",
     required: false,
     repeatable: false,
-    visibility: "public",
+    visibility: "staff",
     inherited: true,
     standards: [dacs("5.1 Custodial History")],
   },
@@ -277,20 +285,22 @@ const DACS_FIELDS: readonly FieldDefinition[] = [
   {
     key: "originals_location",
     label: "Existence and location of originals",
+    help: "Staff only until the organization chooses to publish it: it can name a private owner or where they live.",
     kind: "long_text",
     required: false,
     repeatable: false,
-    visibility: "public",
+    visibility: "staff",
     inherited: false,
     standards: [dacs("6.1 Existence and Location of Originals")],
   },
   {
     key: "copies_location",
     label: "Existence and location of copies",
+    help: "Staff only until the organization chooses to publish it: it can name a private owner or where they live.",
     kind: "long_text",
     required: false,
     repeatable: false,
-    visibility: "public",
+    visibility: "staff",
     inherited: false,
     standards: [dacs("6.2 Existence and Location of Copies")],
   },
@@ -317,11 +327,11 @@ const DACS_FIELDS: readonly FieldDefinition[] = [
   {
     key: "notes",
     label: "Notes",
-    help: "Published. Anything that fits no other element.",
+    help: "Staff only until the organization chooses to publish it: general notes often hold private details.",
     kind: "long_text",
     required: false,
     repeatable: false,
-    visibility: "public",
+    visibility: "staff",
     inherited: false,
     standards: [dacs("7.1 Notes")],
   },
@@ -538,11 +548,11 @@ const SPECTRUM_FIELDS: readonly FieldDefinition[] = [
   {
     key: "object_history",
     label: "History",
-    help: "Published. The object's story and earlier owners. Donor details and terms go in the acquisition fields, which are staff only.",
+    help: "Staff only until the organization chooses to publish it: earlier owners and donors can be private people.",
     kind: "long_text",
     required: false,
     repeatable: false,
-    visibility: "public",
+    visibility: "staff",
     inherited: false,
     standards: [spectrum("Object history note")],
   },
@@ -555,7 +565,7 @@ const SPECTRUM_FIELDS: readonly FieldDefinition[] = [
     repeatable: false,
     visibility: "public",
     inherited: false,
-    standards: [spectrum("Rights information")],
+    standards: [spectrum("Rights information (information group)")],
   },
   {
     key: "acquisition_method",
@@ -645,7 +655,7 @@ const SPECTRUM_FIELDS: readonly FieldDefinition[] = [
     repeatable: false,
     visibility: "staff",
     inherited: false,
-    standards: [spectrum("Object valuation information")],
+    standards: [spectrum("Object valuation information (information group)")],
   },
   {
     key: "comments",
@@ -744,13 +754,12 @@ const DIGITAL_ASSET_FIELDS: readonly FieldDefinition[] = [
   {
     key: "source",
     label: "Source",
-    help: "The original this file was made from, if it has no record of its own.",
+    help: "Staff only until the organization chooses to publish it: the original may be privately owned.",
     kind: "text",
     required: false,
     repeatable: false,
-    visibility: "public",
+    visibility: "staff",
     inherited: false,
-    standards: [dcterms("source")],
   },
   {
     key: "languages",
@@ -796,13 +805,12 @@ const DIGITAL_ASSET_FIELDS: readonly FieldDefinition[] = [
   {
     key: "rights_holder",
     label: "Rights holder",
-    help: "Published. The person or organization that owns the rights.",
+    help: "Staff only until the organization chooses to publish it: the holder can be a private person.",
     kind: "text",
     required: false,
     repeatable: false,
-    visibility: "public",
+    visibility: "staff",
     inherited: false,
-    standards: [dcterms("rightsHolder")],
   },
   {
     key: "digitization_notes",
@@ -813,7 +821,6 @@ const DIGITAL_ASSET_FIELDS: readonly FieldDefinition[] = [
     repeatable: false,
     visibility: "staff",
     inherited: false,
-    standards: [dcterms("description")],
   },
 ];
 

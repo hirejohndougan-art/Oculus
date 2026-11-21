@@ -117,33 +117,41 @@ export function validateDublinCoreMapping(
   try {
     return checkMapping(mapping, template);
   } catch {
-    return {
-      ok: false,
-      issues: [issue([], "unreadable", "This mapping could not be read as plain data.")],
-    };
+    return unreadable();
   }
+}
+
+function unreadable(): Validated<never> {
+  return {
+    ok: false,
+    issues: [issue([], "unreadable", "This mapping could not be read as plain data.")],
+  };
+}
+
+function invalidTemplate(): Validated<never> {
+  return {
+    ok: false,
+    issues: [
+      issue(
+        [],
+        "invalid_template",
+        "The template is not valid, so the mapping can't be checked against it. Check it with validateTemplate.",
+      ),
+    ],
+  };
+}
+
+function notAnObject(): Validated<never> {
+  return {
+    ok: false,
+    issues: [issue([], "not_an_object", "A mapping must be { template, entries }.")],
+  };
 }
 
 function checkMapping(mapping: unknown, template: unknown): Validated<DublinCoreMapping> {
   const checked = validateTemplate(template);
-  if (!checked.ok) {
-    return {
-      ok: false,
-      issues: [
-        issue(
-          [],
-          "invalid_template",
-          "The template is not valid, so the mapping can't be checked against it. Check it with validateTemplate.",
-        ),
-      ],
-    };
-  }
-  if (types.isProxy(mapping) || !isPlainObject(mapping)) {
-    return {
-      ok: false,
-      issues: [issue([], "not_an_object", "A mapping must be { template, entries }.")],
-    };
-  }
+  if (!checked.ok) return invalidTemplate();
+  if (types.isProxy(mapping) || !isPlainObject(mapping)) return notAnObject();
   const issues = new IssueList();
   const copy = readPlainData(mapping, [], READ_LIMITS, issues);
   if (copy === undefined || !isPlainObject(copy)) return { ok: false, issues: issues.items };
@@ -266,7 +274,6 @@ export const DACS_DUBLIN_CORE: DublinCoreMapping = mapping("dacs-archival-unit",
   ["access_conditions", "accessRights"],
   [RIGHTS_FIELD_KEY, "rights"],
   ["languages", "language"],
-  ["custodial_history", "provenance"],
   ["related_materials", "relation"],
   ["subjects", "subject"],
   ["places", "spatial"],
@@ -283,7 +290,6 @@ export const SPECTRUM_DUBLIN_CORE: DublinCoreMapping = mapping("spectrum-object"
   ["makers", "creator"],
   ["subjects", "subject"],
   ["associated_places", "spatial"],
-  ["object_history", "provenance"],
   [RIGHTS_FIELD_KEY, "rights"],
 ]);
 
@@ -294,12 +300,10 @@ export const DIGITAL_ASSET_DUBLIN_CORE: DublinCoreMapping = mapping("dublin-core
   ["creators", "creator"],
   ["description", "description"],
   ["extent", "extent"],
-  ["source", "source"],
   ["languages", "language"],
   ["subjects", "subject"],
   ["places", "spatial"],
   [RIGHTS_FIELD_KEY, "rights"],
-  ["rights_holder", "rightsHolder"],
 ]);
 
 const BY_TEMPLATE: ReadonlyMap<string, DublinCoreMapping> = new Map(
@@ -307,10 +311,41 @@ const BY_TEMPLATE: ReadonlyMap<string, DublinCoreMapping> = new Map(
 );
 
 /**
- * The built-in mapping for a preset's template key, or undefined. A template
- * copied from a preset and then edited must still be checked with
- * `validateDublinCoreMapping` before this mapping is used for it.
+ * The built-in mapping for a preset's template key, or undefined. For a
+ * template copied from a preset under a new key, use `mappingForTemplate`.
  */
 export function presetDublinCoreMapping(templateKey: unknown): DublinCoreMapping | undefined {
   return typeof templateKey === "string" ? BY_TEMPLATE.get(templateKey) : undefined;
+}
+
+/**
+ * Re-target a mapping to another template, such as a preset's mapping for a
+ * template copied from that preset under a new key, and check it against
+ * that template. Only the `template` property is replaced; every entry is
+ * checked as `validateDublinCoreMapping` does, so a field the copy removed or
+ * made staff-only is reported, never dropped quietly. Never throws.
+ */
+export function mappingForTemplate(
+  mapping: unknown,
+  template: unknown,
+): Validated<DublinCoreMapping> {
+  try {
+    const checked = validateTemplate(template);
+    if (!checked.ok) return invalidTemplate();
+    if (types.isProxy(mapping) || !isPlainObject(mapping)) return notAnObject();
+    // Copy own, enumerable data properties only; a getter or a hidden
+    // property throws and is reported as unreadable.
+    const retargeted: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+    for (const key of Reflect.ownKeys(mapping)) {
+      const d = Object.getOwnPropertyDescriptor(mapping, key);
+      if (typeof key !== "string" || d === undefined || !("value" in d) || d.enumerable !== true) {
+        throw new TypeError("not plain data");
+      }
+      if (key !== "template") retargeted[key] = d.value;
+    }
+    retargeted.template = checked.value.key;
+    return validateDublinCoreMapping({ ...retargeted }, checked.value);
+  } catch {
+    return unreadable();
+  }
 }

@@ -181,5 +181,6 @@ export {
   dublinCoreTermUri,
   validateDublinCoreMapping,
   presetDublinCoreMapping,
+  mappingForTemplate,
 } from "./dublin-core.js";
 export type { DublinCoreTerm, DublinCoreEntry, DublinCoreMapping } from "./dublin-core.js";

@@ -12,6 +12,7 @@ import {
   STANDARD_PRESETS,
   dublinCoreTermUri,
   isDublinCoreTerm,
+  mappingForTemplate,
   presetDublinCoreMapping,
   validateDublinCoreMapping,
   type DublinCoreMapping,
@@ -97,15 +98,38 @@ describe("preset mappings", () => {
     const edited = JSON.parse(JSON.stringify(DACS_ARCHIVAL_UNIT_PRESET)) as {
       fields: { key: string; visibility: string }[];
     };
-    for (const f of edited.fields) if (f.key === "custodial_history") f.visibility = "staff";
+    for (const f of edited.fields) if (f.key === "scope_and_content") f.visibility = "staff";
     const result = validateDublinCoreMapping(DACS_DUBLIN_CORE, edited);
     expect(codes(result)).toEqual(["staff_field"]);
   });
 });
 
 describe("validateDublinCoreMapping", () => {
+  it("the preset mappings leave out the fields that start as staff-only", () => {
+    const mapped = [DACS_DUBLIN_CORE, SPECTRUM_DUBLIN_CORE, DIGITAL_ASSET_DUBLIN_CORE].flatMap(
+      (m) => m.entries.map((e) => e.field),
+    );
+    for (const field of [
+      "custodial_history",
+      "originals_location",
+      "copies_location",
+      "notes",
+      "object_history",
+      "source",
+      "rights_holder",
+    ]) {
+      expect(mapped).not.toContain(field);
+    }
+  });
+
   it("refuses staff-only fields", () => {
-    for (const field of ["acquisition_source", "appraisal", "storage_location"]) {
+    for (const field of [
+      "acquisition_source",
+      "appraisal",
+      "storage_location",
+      "custodial_history",
+      "notes",
+    ]) {
       const result = validateDublinCoreMapping(
         withEntries([{ field, term: "description" }]),
         DACS_ARCHIVAL_UNIT_PRESET,
@@ -248,5 +272,77 @@ describe("validateDublinCoreMapping", () => {
     expect(result.value).not.toBe(input);
     expect(Object.isFrozen(result.value)).toBe(true);
     expect(Object.isFrozen(result.value.entries[0])).toBe(true);
+  });
+});
+
+describe("mappingForTemplate", () => {
+  function copyOf(preset: FieldTemplate, key: string) {
+    const copy = JSON.parse(JSON.stringify(preset)) as {
+      key: string;
+      fields: { key: string; visibility: string }[];
+    };
+    copy.key = key;
+    return copy;
+  }
+
+  it("a preset mapping fails for a copy with a new key, and works once re-targeted", () => {
+    const copy = copyOf(SPECTRUM_OBJECT_PRESET, "my-objects");
+    expect(codes(validateDublinCoreMapping(SPECTRUM_DUBLIN_CORE, copy))).toEqual([
+      "wrong_template",
+    ]);
+    const result = mappingForTemplate(SPECTRUM_DUBLIN_CORE, copy);
+    expect(codes(result)).toEqual([]);
+    if (!result.ok) return;
+    expect(result.value.template).toBe("my-objects");
+    expect(result.value.entries).toEqual(SPECTRUM_DUBLIN_CORE.entries);
+    expect(Object.isFrozen(result.value)).toBe(true);
+  });
+
+  it("still refuses fields the copy made staff-only or removed", () => {
+    const copy = copyOf(SPECTRUM_OBJECT_PRESET, "my-objects");
+    for (const f of copy.fields) if (f.key === "materials") f.visibility = "staff";
+    copy.fields = copy.fields.filter((f) => f.key !== "makers");
+    expect(codes(mappingForTemplate(SPECTRUM_DUBLIN_CORE, copy)).sort()).toEqual([
+      "staff_field",
+      "unknown_field",
+    ]);
+  });
+
+  it("still reports unknown properties, and fails closed on bad input", () => {
+    const copy = copyOf(DACS_ARCHIVAL_UNIT_PRESET, "my-units");
+    expect(codes(mappingForTemplate({ ...DACS_DUBLIN_CORE, extra: 1 }, copy))).toEqual([
+      "unknown_property",
+    ]);
+    expect(codes(mappingForTemplate(DACS_DUBLIN_CORE, { ...copy, fields: [] }))).toEqual([
+      "invalid_template",
+    ]);
+    for (const bad of [null, [], "x", new Proxy({ entries: [] }, {})]) {
+      expect(codes(mappingForTemplate(bad, copy))).toEqual(["not_an_object"]);
+    }
+    const getter = {
+      template: "x",
+      get entries(): unknown {
+        throw new Error("boom");
+      },
+    };
+    expect(codes(mappingForTemplate(getter, copy))).toEqual(["unreadable"]);
+    const hidden = { template: "x" };
+    Object.defineProperty(hidden, "entries", { value: [], enumerable: false });
+    expect(codes(mappingForTemplate(hidden, copy))).toEqual(["unreadable"]);
+    expect(codes(mappingForTemplate({ entries: [], [Symbol("s")]: 1 }, copy))).toEqual([
+      "unreadable",
+    ]);
+  });
+
+  it("ignores entries on a polluted Object.prototype", () => {
+    const copy = copyOf(DACS_ARCHIVAL_UNIT_PRESET, "my-units");
+    (Object.prototype as Record<string, unknown>).entries = [
+      { field: "acquisition_source", term: "description" },
+    ];
+    try {
+      expect(codes(mappingForTemplate({ template: "x" }, copy))).toEqual(["required"]);
+    } finally {
+      delete (Object.prototype as Record<string, unknown>).entries;
+    }
   });
 });

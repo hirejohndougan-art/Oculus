@@ -121,13 +121,25 @@ describe("standard presets", () => {
 
 describe("standards citations", () => {
   it.each(STANDARD_PRESETS.map((p) => [p.key, p] as const))(
-    "every field in %s cites at least one standard element",
+    "every field in %s cites a standard element, except staff fields of the Dublin Core preset",
     (_key, preset) => {
       for (const f of preset.fields) {
-        expect(f.standards?.length ?? 0, f.key).toBeGreaterThan(0);
+        if (preset === DIGITAL_ASSET_PRESET && f.visibility === "staff") {
+          expect(f.standards, f.key).toBeUndefined();
+        } else {
+          expect(f.standards?.length ?? 0, f.key).toBeGreaterThan(0);
+        }
       }
     },
   );
+
+  it("no staff field carries a Dublin Core cite", () => {
+    for (const preset of STANDARD_PRESETS) {
+      for (const f of preset.fields.filter((x) => x.visibility === "staff")) {
+        for (const s of f.standards ?? []) expect(s.standard, f.key).not.toBe("dcterms");
+      }
+    }
+  });
 
   it("DACS fields cite DACS element numbers and names", () => {
     const elements = DACS_ARCHIVAL_UNIT_PRESET.fields
@@ -169,7 +181,7 @@ describe("standards citations", () => {
     }
   });
 
-  it("Spectrum fields cite Spectrum units of information", () => {
+  it("Spectrum fields cite Spectrum units of information, or a group marked as one", () => {
     expect(fieldOf(SPECTRUM_OBJECT_PRESET, "object_number").standards).toEqual([
       { standard: "spectrum", element: "Object number" },
     ]);
@@ -178,6 +190,19 @@ describe("standards citations", () => {
     ]);
     for (const f of SPECTRUM_OBJECT_PRESET.fields) {
       for (const s of f.standards ?? []) expect(s.standard).toBe("spectrum");
+    }
+    // Only the group names for rights and valuation could be confirmed.
+    expect(fieldOf(SPECTRUM_OBJECT_PRESET, RIGHTS_FIELD_KEY).standards).toEqual([
+      { standard: "spectrum", element: "Rights information (information group)" },
+    ]);
+    expect(fieldOf(SPECTRUM_OBJECT_PRESET, "valuation").standards).toEqual([
+      { standard: "spectrum", element: "Object valuation information (information group)" },
+    ]);
+    const elements = SPECTRUM_OBJECT_PRESET.fields.flatMap((f) =>
+      (f.standards ?? []).map((s) => s.element),
+    );
+    for (const e of elements.filter((x) => / information\b/i.test(x))) {
+      expect(e).toMatch(/ \(information group\)$/);
     }
   });
 
@@ -208,13 +233,18 @@ describe("visibility", () => {
     const staff = (p: FieldTemplate) =>
       p.fields.filter((f) => f.visibility === "staff").map((f) => f.key);
     expect(staff(DACS_ARCHIVAL_UNIT_PRESET)).toEqual([
+      "custodial_history",
       "acquisition_source",
       "appraisal",
+      "originals_location",
+      "copies_location",
+      "notes",
       "description_control",
       "storage_location",
     ]);
     expect(staff(SPECTRUM_OBJECT_PRESET)).toEqual([
       "other_numbers",
+      "object_history",
       "acquisition_method",
       "acquisition_source",
       "acquisition_date",
@@ -224,18 +254,33 @@ describe("visibility", () => {
       "valuation",
       "comments",
     ]);
-    expect(staff(DIGITAL_ASSET_PRESET)).toEqual(["digitization_notes"]);
+    expect(staff(DIGITAL_ASSET_PRESET)).toEqual(["source", "rights_holder", "digitization_notes"]);
   });
 
-  it("anything about donors, acquisition, appraisal, storage, valuation or internal notes is staff", () => {
+  it("anything about provenance, custody, owners, sources, donors, location, valuation or notes is staff", () => {
     const sensitive =
-      /donor|acqui|apprais|storage|current.location|valuation|insurance|internal|comment|credit|processing|digitization/i;
+      /provenance|custod|owner|holder|(?:^|[\s_])source|donor|acqui|apprais|storage|location|valuation|insurance|internal|comment|credit|processing|digitization|object.history|notes/i;
+    // Public on purpose: researchers need the access conditions (the help
+    // text forbids personal reasons), the repository is the organization's
+    // own name and address, and rights must be published (D-011).
+    const allowed = new Set(["access_conditions", "repository", RIGHTS_FIELD_KEY]);
+    let checked = 0;
     for (const preset of STANDARD_PRESETS) {
       for (const f of preset.fields) {
         const text = `${f.key} ${f.label} ${f.standards?.map((s) => s.element).join(" ") ?? ""}`;
-        if (sensitive.test(text)) expect(f.visibility, f.key).toBe("staff");
+        if (!sensitive.test(text) || allowed.has(f.key)) continue;
+        checked++;
+        expect(f.visibility, f.key).toBe("staff");
       }
     }
+    expect(checked).toBeGreaterThanOrEqual(20);
+  });
+
+  it("the access conditions help says it is published and forbids confidential reasons", () => {
+    const f = fieldOf(DACS_ARCHIVAL_UNIT_PRESET, "access_conditions");
+    expect(f.visibility).toBe("public");
+    expect(f.help).toMatch(/^Published\./);
+    expect(f.help).toMatch(/personal or donor-confidential reasons/);
   });
 
   it("every visibility is stated, never left to a default", () => {
