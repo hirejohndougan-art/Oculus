@@ -1,5 +1,5 @@
 /**
- * Safe template changes (roadmap T-005a, security S-002, decision D-0XX).
+ * Safe template changes (roadmap T-005a, security S-002, decision D-023).
  *
  * A template edit can publish data or strand it. A value entered while its
  * field was `staff` is published as soon as the field is made `public`, and

@@ -120,7 +120,7 @@ describe("validateIdentifierType", () => {
   });
 });
 
-describe("identifier type visibility (D-0XX)", () => {
+describe("identifier type visibility (D-022)", () => {
   it("accepts public true or false, and leaving it out", () => {
     for (const value of [true, false]) {
       const r = validateIdentifierType({ ...BOX, public: value });

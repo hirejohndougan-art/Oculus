@@ -297,7 +297,7 @@ describe("records checked against the presets", () => {
   // Invented sample types for the identifier fields the presets use.
   const made = makeIdentifierChecker([
     // Call and accession numbers are usually published with the record, so
-    // these are marked public; types are staff only by default (D-0XX).
+    // these are marked public; types are staff only by default (D-022).
     {
       key: "call_number",
       label: "Call number",

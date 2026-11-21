@@ -167,7 +167,7 @@ describe("staff values never reach any output form", () => {
   });
 });
 
-describe("staff identifier types never reach any output form (D-0XX)", () => {
+describe("staff identifier types never reach any output form (D-022)", () => {
   // `donor_file_number` is staff only (the default) in the fixtures' types.
   const SECRET = "DF-SECRET-0042";
   const staffItem = () =>
@@ -215,7 +215,7 @@ describe("staff identifier types never reach any output form (D-0XX)", () => {
         checkers: { identifier },
       });
       expect(result.ok).toBe(false);
-      // The effective record already holds it back (D-0XX).
+      // The effective record already holds it back (D-022).
       expect(codes(result)).toEqual(["private_identifier_type"]);
       expect(JSON.stringify(result)).not.toContain(SECRET);
     }

@@ -14,7 +14,7 @@
  *   must be one of the organization's identifier types, and the `value` must
  *   follow the rules every identifier follows and fit that type's format
  *   (identifiers.ts, D-009). In a public field the type must also be
- *   public (D-0XX). It needs the organization's types, so it can't
+ *   public (D-022). It needs the organization's types, so it can't
  *   be a default. Instead `checkRecordAgainstTemplate` refuses identifier
  *   values when no checker is given, rather than letting them through
  *   unchecked.

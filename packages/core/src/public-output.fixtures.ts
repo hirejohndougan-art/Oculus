@@ -107,7 +107,7 @@ export function record(
 
 // Both types are public, so their values may be published; the type key
 // itself must still never appear in output. `donor_file_number` is staff
-// only (the default), so its values must never be published (D-0XX).
+// only (the default), so its values must never be published (D-022).
 const identifierChecker = makeIdentifierChecker([
   { key: "accession_number", label: "Accession number", uniqueness: "none", public: true },
   { key: "secret_type_code", label: "Secret type", uniqueness: "none", public: true },
@@ -122,7 +122,7 @@ export function effectiveOf(
   id: RecordId,
   tpl: FieldTemplate = TPL,
 ): EffectiveRecord {
-  // With the identifier checker, so public-type numbers reach the view (D-0XX).
+  // With the identifier checker, so public-type numbers reach the view (D-022).
   const result = effectiveRecord(id, records, () => tpl, { checkers: CHECKERS });
   if (!result.ok) throw new Error(JSON.stringify(result.issues));
   return result.value;

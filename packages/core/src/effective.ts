@@ -61,7 +61,7 @@
  * check (`rightsPublishIssues`) run on that public view, and also refuses
  * rights that are staff-only here. Nothing here throws.
  *
- * **Identifier values** (D-0XX). Identifier types are staff only unless
+ * **Identifier values** (D-022). Identifier types are staff only unless
  * marked public, and only the identifier checker in `options.checkers` (from
  * `makeIdentifierChecker`) knows which are public. Checkers judge an
  * inherited value by its effective visibility, so a staff-type number
@@ -653,7 +653,7 @@ const WITHHELD_IDENTIFIER: ReadonlySet<string> = new Set([
  * Mark `staff`, with a note, every public identifier value the public may not
  * see: one whose type (or any of whose types, for a list) isn't public, or
  * any at all when the identifier checker can't say which types are public
- * (D-0XX). The value stays in the effective record for staff.
+ * (D-022). The value stays in the effective record for staff.
  */
 function withholdIdentifiers(
   candidates: readonly Candidate[],
@@ -840,7 +840,7 @@ function dropUnfit(
   // Checkers judge each inherited value by its effective visibility, not the
   // receiving field's: a value staff along the way is checked as staff, so a
   // staff-type identifier inherited into a public field isn't refused for
-  // going public when it never will (D-0XX). Rights fields must be public in
+  // going public when it never will (D-022). Rights fields must be public in
   // every template, so they are never made staff here.
   const staffHere = new Set(inherited.filter((c) => c.visibility === "staff").map((c) => c.key));
   const loose: FieldTemplate = {

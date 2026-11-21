@@ -34,7 +34,7 @@
  *   (`record_changed`); with `templateFor`, every template on the way must
  *   be unchanged (`template_changed`). Only both together catch every
  *   change; building the view at publish time is still the rule.
- * - **Only public identifier types go out** (D-0XX). The checker from
+ * - **Only public identifier types go out** (D-022). The checker from
  *   `makeIdentifierChecker` refuses a staff type's value in a public field
  *   (`private_identifier_type`), and the identifier value is checked again
  *   here against the public types that checker was made with, reading the
@@ -179,7 +179,7 @@ export interface PublishOptions {
    * values): an ancestor's value changed or emptied since, or a record moved
    * to another parent or level, would otherwise still publish the old
    * inherited values. Only `records` and `templateFor` together catch every
-   * change to a kept view (D-0XX).
+   * change to a kept view (D-021).
    */
   readonly records?: RecordLookup | readonly CatalogRecord[];
 }
@@ -444,7 +444,7 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
       `The mapping must map the ${RIGHTS_FIELD_KEY} field to rights or license, because this kind of record can't be published without its rights.`,
     );
   }
-  // The view holds identifiers as `{ value }` only (D-0XX); the template
+  // The view holds identifiers as `{ value }` only (D-022); the template
   // check and the type check below read the full values the view's entries
   // came from, in the effective record.
   const full = fullValues(view, effective, template);
@@ -657,7 +657,7 @@ function fullValues(
 /**
  * Refuse unless every identifier in `value` is of a type the identifier
  * checker knows to be public. A checker not made by `makeIdentifierChecker`
- * can't say, so any identifier value is refused with it (D-0XX).
+ * can't say, so any identifier value is refused with it (D-022).
  */
 function publicTypesOnly(
   value: FieldValue | undefined,
@@ -921,7 +921,7 @@ function valueOf(
     }
     case "identifier": {
       // Only the value: the view holds no type, and the type was checked
-      // public by publicTypesOnly (D-0XX).
+      // public by publicTypesOnly (D-022).
       const id = props(value, IDENTIFIER_KEYS, invalid);
       return outValue(nonBlank(id.get("value"), invalid));
     }

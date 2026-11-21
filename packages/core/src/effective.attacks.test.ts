@@ -602,7 +602,7 @@ describe("rightsPublishIssues refuses an effective record", () => {
   });
 });
 
-describe("staff identifier types never reach the public view (D-0XX)", () => {
+describe("staff identifier types never reach the public view (D-022)", () => {
   const SECRET = "DF-SECRET-0042";
   const made = makeIdentifierChecker([
     { key: "object_number", label: "Object number", uniqueness: "none", public: true },

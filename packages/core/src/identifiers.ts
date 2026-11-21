@@ -23,7 +23,7 @@
  * yet, so nothing here can stop two people taking the same next number at the
  * same moment; the save path must re-check uniqueness when it writes.
  *
- * - **Which types are public** (D-0XX). A type is staff only unless it says
+ * - **Which types are public** (D-022). A type is staff only unless it says
  *   `public: true`. Only values of public types may sit in a public template
  *   field (`makeIdentifierChecker` reports `private_identifier_type`), and
  *   `publicOutput` publishes only those. Every function in this module still
@@ -86,7 +86,7 @@ export interface IdentifierType {
   /**
    * True if values of this type may be published (an object or accession
    * number, say). Left out or false, the type is staff only: its values are
-   * refused in public template fields and never reach public output (D-0XX).
+   * refused in public template fields and never reach public output (D-022).
    */
   readonly public?: boolean;
 }

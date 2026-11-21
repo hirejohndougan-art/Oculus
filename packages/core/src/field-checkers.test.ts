@@ -24,7 +24,7 @@ const CC_BY = "https://creativecommons.org/licenses/by/4.0/";
 /**
  * The sample organization's identifier types. Invented. Both are public, so
  * their values may sit in the public fields used below; types are staff only
- * by default (D-0XX), tested under "identifier type visibility".
+ * by default (D-022), tested under "identifier type visibility".
  */
 const TYPES = [
   {
@@ -344,7 +344,7 @@ describe("a record that passes its template can be published (rights)", () => {
   });
 });
 
-describe("identifier type visibility (D-0XX)", () => {
+describe("identifier type visibility (D-022)", () => {
   const MIXED = [
     { key: "object_number", label: "Object number", uniqueness: "current", public: true },
     { key: "donor_file", label: "Donor file number", uniqueness: "none" },

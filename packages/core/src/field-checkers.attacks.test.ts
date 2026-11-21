@@ -17,7 +17,7 @@ import {
 const ID = "3f1c2a9e-8b7d-4c6e-9a1b-2d3e4f5a6b7c";
 const T = "2026-11-20T16:05:00.000Z";
 const INC = "http://rightsstatements.org/vocab/InC/1.0/";
-// Public, so values may sit in the public fields used here (D-0XX).
+// Public, so values may sit in the public fields used here (D-022).
 const TYPES = [{ key: "legacy", label: "Legacy number", uniqueness: "none", public: true }];
 
 function field(extra: Record<string, unknown>): Record<string, unknown> {
@@ -173,7 +173,7 @@ describe("hostile values given straight to a checker", () => {
   });
 });
 
-describe("staff identifier types can't be made public by accident (D-0XX)", () => {
+describe("staff identifier types can't be made public by accident (D-022)", () => {
   const STAFF = [{ key: "donor_file", label: "Donor file number", uniqueness: "none" }];
 
   it("a public flag on Object.prototype doesn't make a type public", () => {
