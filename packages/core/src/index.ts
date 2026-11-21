@@ -247,3 +247,14 @@ export type {
   DuplicateLimit,
   SkippedTerm,
 } from "./term-duplicates.js";
+export {
+  DCMITYPE_NAMESPACE,
+  RDFS_NAMESPACE,
+  DC_ELEMENTS_NAMESPACE,
+  OAI_DC_NAMESPACE,
+  OAI_DC_SCHEMA,
+  MAX_BASE_URL_LENGTH,
+  MAX_OUTPUT_CHARS,
+  publicOutput,
+} from "./public-output.js";
+export type { PublishOptions, PublicOutput, DublinCoreValues } from "./public-output.js";
