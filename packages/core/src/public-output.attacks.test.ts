@@ -636,11 +636,11 @@ describe("a parent's template changed after the view was made (security run 2026
     if (view === undefined) throw new Error("no view");
     expect(view.fields.creator).toBe("SECRET-now-staff");
     fondsTemplate = staffCreator("fonds");
-    return { view, item, lookup };
+    return { view, item, lookup, fondsId: fonds.id };
   }
 
   it("refuses with templateFor, naming the parent", () => {
-    const { view, item, lookup } = staleView();
+    const { view, item, lookup, fondsId } = staleView();
     const result = publicOutput(view, CREATOR_MAP, {
       baseUrl: BASE,
       published: [item.id],
@@ -648,6 +648,7 @@ describe("a parent's template changed after the view was made (security run 2026
       templateFor: lookup,
     });
     expect(codes(result)).toEqual(["template_changed"]);
+    expect(result.ok ? [] : result.issues[0]?.path).toEqual(["templateFor", fondsId]);
     expect(JSON.stringify(result)).not.toContain("SECRET");
   });
 
