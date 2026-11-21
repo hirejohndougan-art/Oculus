@@ -228,10 +228,29 @@ export function normalizeRightsUri(input: unknown): Validated<NormalizedRights> 
 }
 
 /**
+ * The record kinds that hold copyrightable content, and so need a rights value
+ * before they can be published (D-011). Agents, places and events don't.
+ */
+export const RIGHTS_REQUIRED_KINDS = Object.freeze([
+  "object",
+  "archival_unit",
+  "digital_asset",
+] as const);
+/** Kinds the rule doesn't apply to. Any other kind, or none, is checked (fail closed). */
+const RIGHTS_EXEMPT_KINDS: ReadonlySet<string> = new Set(["agent", "place", "event"]);
+
+/**
  * The publishing rule: the problems that keep a record's rights from being
- * published, or an empty list if there are none. A record needs an accepted,
- * canonical URI in `fields.rights`. Give it the record as it will be published
- * (once inheritance exists, the effective record from T-008). Never throws.
+ * published, or an empty list if there are none. An object, archival unit or
+ * digital asset needs an accepted, canonical URI in `fields.rights`; agent,
+ * place and event records need none. A record with any other kind, or none,
+ * is checked as if it needed one.
+ *
+ * Call it on the exact frozen copy that will be published (the validated
+ * record, or once inheritance exists the effective record from T-008), not on
+ * an object that will be copied or changed afterwards. Only own, enumerable
+ * data properties count; getters, hidden properties and Proxies are reported
+ * as unreadable. Never throws.
  */
 export function rightsPublishIssues(record: unknown): readonly Issue[] {
   const path = ["fields", RIGHTS_FIELD_KEY] as const;
@@ -241,6 +260,8 @@ export function rightsPublishIssues(record: unknown): readonly Issue[] {
   try {
     // A Proxy could answer differently each time it is asked, so it isn't read at all.
     if (types.isProxy(record)) return unreadable;
+    const kind = ownValue(record, "kind");
+    if (typeof kind === "string" && RIGHTS_EXEMPT_KINDS.has(kind)) return Object.freeze([]);
     const fields = ownValue(record, "fields");
     if (types.isProxy(fields)) return unreadable;
     if (!isPlainObject(fields)) {
@@ -262,13 +283,19 @@ export function canPublishRights(record: unknown): boolean {
 
 // ---------------------------------------------------------------------------
 
-/** An own data property of `obj`, or undefined. Never runs a getter or reads inherited values. */
+/**
+ * An own, enumerable data property of `obj`, or undefined when there is none.
+ * Never runs a getter or reads inherited values. A getter or a hidden
+ * (non-enumerable) property isn't plain data: JSON output would drop a hidden
+ * one, so it throws and the caller reports the value as unreadable.
+ */
 function ownValue(obj: unknown, key: string): unknown {
   if (typeof obj !== "object" || obj === null) return undefined;
   const descriptor = Object.getOwnPropertyDescriptor(obj, key);
   if (descriptor === undefined) return undefined;
-  // A getter isn't plain data; the caller reports it as unreadable.
-  if (!("value" in descriptor)) throw new TypeError("not plain data");
+  if (!("value" in descriptor) || descriptor.enumerable !== true) {
+    throw new TypeError("not plain data");
+  }
   return descriptor.value;
 }
 
@@ -304,8 +331,10 @@ const NOT_RIGHTS =
  * match takes linear time; the length was checked first anyway.
  */
 const URI_SHAPE = /^(https?):\/\/(www\.)?([a-z.]+)(\/[^?#\s]*)?(\?[^#\s]*)?(#\S*)?$/i;
-const CC_SUFFIX = /^(?:deed|legalcode)(?:\.[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{2,8})*)?$/;
-const OLD_CC_VERSION = /^[1-3]\.[05]$|^2\.1$/;
+/** `deed`, `legalcode`, an optional language (`.en`, `.zh-hans`) and an optional `.txt`. */
+const CC_SUFFIX = /^(?:deed|legalcode)(?:\.[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{2,8})*)?(?:\.txt)?$/;
+/** The license versions Creative Commons published before 4.0. */
+const OLD_CC_VERSION = /^(?:1\.0|2\.0|2\.1|2\.5|3\.0)$/;
 
 function parse(input: unknown): Parsed {
   const fail = (code: string, message: string): Parsed => ({
@@ -369,7 +398,7 @@ function parse(input: unknown): Parsed {
   if (found.suffix) {
     changes.push({
       code: "removed_page_suffix",
-      message: `Removed ${shown(segments[segments.length - 1])} (a page about the license) from the end.`,
+      message: `Removed ${shown(segments[segments.length - 1])} (the license's deed or legal text) from the end.`,
     });
   }
   if (query !== undefined) {
@@ -420,8 +449,9 @@ function creativeCommonsFrom(
     if (term !== undefined && version === "4.0" && extra === 0) {
       return { term, pageToVocab: false, suffix };
     }
-    const ported = version === "4.0" && extra === 1 && /^[a-z]{2,3}$/.test(rest[0] ?? "");
-    if (OLDER_CC_CODES.has(code) && (OLD_CC_VERSION.test(version) || ported)) {
+    const ported =
+      term !== undefined && version === "4.0" && extra === 1 && /^[a-z]{2,3}$/.test(rest[0] ?? "");
+    if (ported || (OLDER_CC_CODES.has(code) && OLD_CC_VERSION.test(version))) {
       return {
         ok: false,
         issue: issue(

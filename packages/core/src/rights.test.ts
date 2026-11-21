@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   CREATIVE_COMMONS,
   RIGHTS_FIELD_KEY,
+  RIGHTS_REQUIRED_KINDS,
   RIGHTS_STATEMENTS,
   RIGHTS_TERMS,
   canPublishRights,
@@ -222,6 +223,8 @@ describe("normalizeRightsUri", () => {
       ["removed_page_suffix"],
     ],
     ["https://creativecommons.org/licenses/by-nc-nd/4.0/deed.pt_BR", ["removed_page_suffix"]],
+    ["https://creativecommons.org/licenses/by/4.0/legalcode.txt", ["removed_page_suffix"]],
+    ["https://creativecommons.org/licenses/by-sa/4.0/legalcode.en.txt", ["removed_page_suffix"]],
     ["https://www.creativecommons.org/publicdomain/zero/1.0/", ["removed_www"]],
     [
       "https://creativecommons.org/publicdomain/mark/1.0/deed.en#ref",
@@ -246,6 +249,13 @@ describe("normalizeRightsUri", () => {
     ]);
   });
 
+  it("describes a removed deed or legal-text ending in plain words", () => {
+    const n = normal("https://creativecommons.org/licenses/by/4.0/legalcode.en.txt");
+    expect(n.changes.map((c) => c.message)).toEqual([
+      'Removed "legalcode.en.txt" (the license\'s deed or legal text) from the end.',
+    ]);
+  });
+
   it("returns frozen results", () => {
     const n = normal("https://rightsstatements.org/vocab/InC/1.0/");
     expect(Object.isFrozen(n)).toBe(true);
@@ -263,6 +273,17 @@ describe("normalizeRightsUri", () => {
   ])("reports the older or national license %s as an unsupported version", (text) => {
     const r = normalizeRightsUri(text);
     expect(code(r)).toBe("unsupported_version");
+  });
+
+  it("says why a national 4.0 license or an older version is refused", () => {
+    const national = normalizeRightsUri("https://creativecommons.org/licenses/by/4.0/us/");
+    expect(national.ok ? "" : national.issues[0]?.message).toBe(
+      "Creative Commons 4.0 licenses have no national versions: use the International one.",
+    );
+    const older = normalizeRightsUri("https://creativecommons.org/licenses/by-sa/2.5/");
+    expect(older.ok ? "" : older.issues[0]?.message).toContain(
+      "Creative Commons 2.5 licenses aren't accepted yet",
+    );
   });
 
   it("explains rightsstatements.org versions other than 1.0", () => {
@@ -285,6 +306,10 @@ describe("normalizeRightsUri", () => {
     "https://creativecommons.org/publicdomain/zero/2.0/",
     "https://creativecommons.org/publicdomain/certification/1.0/us/",
     "https://creativecommons.org/licenses/",
+    "https://creativecommons.org/licenses/by/3.5/",
+    "https://creativecommons.org/licenses/by/4.1/",
+    "https://creativecommons.org/licenses/sa/4.0/us/",
+    "https://creativecommons.org/licenses/nc/4.0/",
     "https://creativecommons.org",
     "ftp://creativecommons.org/licenses/by/4.0/",
     "https://creativecommons.org.example.com/licenses/by/4.0/",
@@ -347,6 +372,40 @@ describe("the publishing rule", () => {
     const issues = rightsPublishIssues(record({ rights: value }));
     expect(issues.map((i) => i.code)).toEqual([expected]);
     expect(issues[0]?.path).toEqual(["fields", "rights"]);
+  });
+
+  it("applies to objects, archival units and digital assets only", () => {
+    expect(RIGHTS_REQUIRED_KINDS).toEqual(["object", "archival_unit", "digital_asset"]);
+    expect(Object.isFrozen(RIGHTS_REQUIRED_KINDS)).toBe(true);
+    for (const kind of RIGHTS_REQUIRED_KINDS) {
+      expect(canPublishRights({ kind, fields: {} })).toBe(false);
+      expect(canPublishRights({ kind, fields: { rights: "All rights reserved" } })).toBe(false);
+    }
+    for (const kind of ["agent", "place", "event"]) {
+      expect(rightsPublishIssues({ kind, fields: {} })).toEqual([]);
+      expect(canPublishRights({ kind, fields: {} })).toBe(true);
+    }
+  });
+
+  it("works on real validated agent, place and event records with no rights", () => {
+    for (const input of [
+      { kind: "agent", title: "Invented Family", agentType: "family" },
+      { kind: "place", title: "Invented Bayou" },
+      { kind: "event", title: "Invented Festival" },
+    ] as const) {
+      const made = createRecord(input);
+      expect(made.ok).toBe(true);
+      if (made.ok) expect(canPublishRights(made.value)).toBe(true);
+    }
+    const unit = createRecord({ kind: "archival_unit", title: "Invented Series", level: "series" });
+    expect(unit.ok && canPublishRights(unit.value)).toBe(false);
+  });
+
+  it("checks a record whose kind is missing or unknown (fails closed)", () => {
+    for (const kind of [undefined, "", "Agent", "person", 3]) {
+      expect(canPublishRights({ kind, fields: {} })).toBe(false);
+    }
+    expect(canPublishRights({ fields: {} })).toBe(false);
   });
 
   it("reports a record with no fields object", () => {

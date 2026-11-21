@@ -54,6 +54,36 @@ describe("the publishing rule can't be fooled", () => {
     expect(calls).toBe(0);
   });
 
+  it("refuses a hidden (non-enumerable) rights value that JSON output would drop", () => {
+    const fields = {};
+    Object.defineProperty(fields, "rights", { value: INC, enumerable: false });
+    const record = { kind: "object", fields };
+    expect(JSON.stringify(record)).not.toContain("rightsstatements");
+    expect(rightsPublishIssues(record)[0]?.code).toBe("unreadable");
+    expect(canPublishRights(record)).toBe(false);
+  });
+
+  it("refuses hidden fields, and a hidden or getter kind claiming an exempt kind", () => {
+    const hiddenFields = { kind: "object" };
+    Object.defineProperty(hiddenFields, "fields", { value: { rights: INC }, enumerable: false });
+    expect(canPublishRights(hiddenFields)).toBe(false);
+
+    const hiddenKind = { fields: {} };
+    Object.defineProperty(hiddenKind, "kind", { value: "agent", enumerable: false });
+    expect(canPublishRights(hiddenKind)).toBe(false);
+
+    const getterKind = { fields: {} };
+    Object.defineProperty(getterKind, "kind", { enumerable: true, get: () => "agent" });
+    expect(canPublishRights(getterKind)).toBe(false);
+  });
+
+  it("ignores an exempt kind inherited from a prototype", () => {
+    const record: unknown = Object.assign(Object.create({ kind: "agent" }) as object, {
+      fields: {},
+    });
+    expect(canPublishRights(record)).toBe(false);
+  });
+
   it("refuses a Proxy whose trap throws, without throwing", () => {
     const hostile = new Proxy(
       {},
