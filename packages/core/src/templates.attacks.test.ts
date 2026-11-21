@@ -365,7 +365,7 @@ describe("review fixes", () => {
   });
 });
 
-// A record names its template (D-0XX). The S-002 review's leak: a record
+// A record names its template (D-029). The S-002 review's leak: a record
 // moved to another template, with nothing in the record saying so, has its
 // staff values checked (and published) under a key the other template makes
 // public.

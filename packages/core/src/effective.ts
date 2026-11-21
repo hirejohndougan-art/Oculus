@@ -183,7 +183,7 @@ export interface EffectiveOptions {
  * it returns is validated (copied) each time, so returning one object that
  * changes between calls can't make one record use another's definitions.
  * For a record with a `templateKey`, the template returned must have that
- * key (`template_mismatch`, D-0XX). Prefer a registry from `indexTemplates`,
+ * key (`template_mismatch`, D-029). Prefer a registry from `indexTemplates`,
  * which finds each record's template by its `templateKey`; a function is
  * the only way to work out records stored without one.
  */

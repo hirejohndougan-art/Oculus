@@ -53,7 +53,7 @@
  * template can't make a field public by leaving something out. Staff-only
  * fields must never reach public output (T-010).
  *
- * **A record names its template** (`templateKey`, D-0XX). The checks take
+ * **A record names its template** (`templateKey`, D-029). The checks take
  * either one template or a registry from `indexTemplates`, the organization's
  * templates validated once and found by key. Either way, a record whose
  * `templateKey` names a different template than the one given is refused

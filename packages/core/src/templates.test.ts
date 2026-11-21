@@ -788,7 +788,7 @@ describe("webUrlProblem", () => {
   });
 });
 
-describe("template registries and record template keys (D-0XX)", () => {
+describe("template registries and record template keys (D-029)", () => {
   const objects = {
     key: "objects",
     label: "Objects",

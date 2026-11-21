@@ -915,7 +915,7 @@ describe("the records changed after the view was made (S-001a)", () => {
   });
 });
 
-// Records name their template (D-0XX). A record must never be published under
+// Records name their template (D-029). A record must never be published under
 // a template other than the one it names, however the caller's lookup or a
 // kept view would have it.
 describe("records are published only under the template they name", () => {

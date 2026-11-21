@@ -401,7 +401,7 @@ describe("createRecord", () => {
   });
 });
 
-describe("templateKey (D-0XX)", () => {
+describe("templateKey (D-029)", () => {
   it("keeps the key of the template a record follows", () => {
     const r = validateRecord(base({ kind: "object", templateKey: "spectrum-object" }));
     expect(r.ok && r.value.templateKey).toBe("spectrum-object");

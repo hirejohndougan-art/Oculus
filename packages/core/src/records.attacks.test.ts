@@ -315,7 +315,7 @@ describe("second review", () => {
   });
 });
 
-describe("hostile template keys (D-0XX)", () => {
+describe("hostile template keys (D-029)", () => {
   it("refuses prototype keys as a template key", () => {
     for (const bad of ["constructor", "prototype", "__proto__"]) {
       expect(codes(validateRecord({ ...valid(), templateKey: bad }))).toEqual([

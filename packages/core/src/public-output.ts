@@ -425,7 +425,7 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
   if (blocked.length > 0) throw new OutputError(blocked);
   const template = origin.template;
   // Checked again at the boundary: every template the view was built with is
-  // the one its record names (D-0XX).
+  // the one its record names (D-029).
   for (const step of origin.chain) {
     const named = storedTemplateKey(step.record);
     if (!named.ok || (named.value !== undefined && named.value !== step.template.key)) {

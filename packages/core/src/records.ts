@@ -48,7 +48,7 @@ interface RecordBase {
   /** ISO 8601 UTC timestamp; never earlier than `createdAt`. */
   readonly updatedAt: string;
   /**
-   * The key of the field template this record follows (D-0XX). The checks,
+   * The key of the field template this record follows (D-029). The checks,
    * `effectiveRecord` and `publicOutput` find the template from it, and
    * refuse a template with any other key. Left out only by records stored
    * before records named their template; those can be checked only through a
@@ -276,7 +276,7 @@ export function isTemplateKey(key: unknown): key is string {
 /**
  * The fields a caller supplies when making a new record. `templateKey` is
  * optional in the type only so older callers keep working; give it for
- * every new record (D-0XX).
+ * every new record (D-029).
  */
 export type NewRecordInput =
   | { readonly kind: "object"; readonly title: string }

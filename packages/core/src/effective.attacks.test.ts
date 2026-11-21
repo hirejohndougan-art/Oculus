@@ -697,7 +697,7 @@ describe("staff identifier types never reach the public view (D-022)", () => {
   });
 });
 
-// A record names its template (D-0XX). The S-002 review's leak: a lookup
+// A record names its template (D-029). The S-002 review's leak: a lookup
 // that puts a record under another template (a bug, a stale cache, a record
 // "moved" with nothing in it saying so) checked its staff values against a
 // template that makes the same key public.
