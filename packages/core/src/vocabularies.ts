@@ -196,13 +196,17 @@ export function isLocalTerm(term: { readonly vocabulary?: string | undefined }):
 const TERM_KEYS: ReadonlySet<string> = new Set(["label", "uri", "vocabulary"]);
 const LINE_BREAKS = /[\t\n\r\u2028\u2029]/;
 
-const TERM_READ_LIMITS: ReadLimits = {
-  maxDepth: 2,
-  maxValues: 10,
-  maxStringLength: MAX_URL_LENGTH,
-  maxKeyLength: 64,
-  maxTotalChars: 5000,
-};
+// A function, not a constant: templates.ts and this module import each
+// other, so nothing from templates.ts may be read while modules load.
+function termReadLimits(): ReadLimits {
+  return {
+    maxDepth: 2,
+    maxValues: 10,
+    maxStringLength: MAX_URL_LENGTH,
+    maxKeyLength: 64,
+    maxTotalChars: 5000,
+  };
+}
 
 /**
  * Check one controlled term: its shape (as the template check does), then
@@ -212,7 +216,7 @@ export function validateControlledTerm(input: unknown): Validated<ControlledTerm
   const issues = new IssueList();
   let term: ControlledTerm | undefined;
   try {
-    const data = readPlainData(input, [], TERM_READ_LIMITS, issues);
+    const data = readPlainData(input, [], termReadLimits(), issues);
     if (data !== undefined) term = checkTermValue(data, [], issues);
   } catch {
     issues.add([], "unreadable", "This term could not be read as plain data.");
