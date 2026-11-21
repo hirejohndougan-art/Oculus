@@ -27,17 +27,36 @@ describe("the publishing rule can't be fooled", () => {
     }
   });
 
+  it("ignores a uri inherited from a prototype", () => {
+    const rights: unknown = Object.create({ uri: INC });
+    expect(rightsPublishIssues({ fields: { rights } })[0]?.code).toBe("not_an_object");
+    const proto = Object.prototype as Record<string, unknown>;
+    proto.uri = INC;
+    try {
+      expect(rightsPublishIssues({ fields: { rights: {} } })[0]?.code).toBe("rights_missing");
+    } finally {
+      delete proto.uri;
+    }
+  });
+
+  it("refuses the old plain-text shape, even with a canonical URI", () => {
+    expect(rightsPublishIssues({ fields: { rights: INC } })[0]?.code).toBe("not_an_object");
+    expect(canPublishRights({ fields: { rights: INC } })).toBe(false);
+  });
+
   it("ignores fields inherited from a prototype", () => {
-    const record: unknown = Object.create({ fields: { rights: INC } });
+    const record: unknown = Object.create({ fields: { rights: { uri: INC } } });
     expect(canPublishRights(record)).toBe(false);
   });
 
   it("refuses a Proxy record or Proxy fields that would claim a valid value", () => {
-    const fields = new Proxy({ rights: INC }, {});
+    const fields = new Proxy({ rights: { uri: INC } }, {});
     expect(rightsPublishIssues({ fields })[0]?.code).toBe("unreadable");
-    expect(rightsPublishIssues(new Proxy({ fields: { rights: INC } }, {}))[0]?.code).toBe(
+    expect(rightsPublishIssues(new Proxy({ fields: { rights: { uri: INC } } }, {}))[0]?.code).toBe(
       "unreadable",
     );
+    const rights = new Proxy({ uri: INC }, {});
+    expect(rightsPublishIssues({ fields: { rights } })[0]?.code).toBe("unreadable");
   });
 
   it("does not run a getter, and reports it as unreadable", () => {
@@ -47,25 +66,40 @@ describe("the publishing rule can't be fooled", () => {
       enumerable: true,
       get() {
         calls += 1;
-        return INC;
+        return { uri: INC };
       },
     });
     expect(rightsPublishIssues({ fields })[0]?.code).toBe("unreadable");
+    const rights = {};
+    Object.defineProperty(rights, "uri", {
+      enumerable: true,
+      get() {
+        calls += 1;
+        return INC;
+      },
+    });
+    expect(rightsPublishIssues({ fields: { rights } })[0]?.code).toBe("unreadable");
     expect(calls).toBe(0);
   });
 
   it("refuses a hidden (non-enumerable) rights value that JSON output would drop", () => {
     const fields = {};
-    Object.defineProperty(fields, "rights", { value: INC, enumerable: false });
+    Object.defineProperty(fields, "rights", { value: { uri: INC }, enumerable: false });
     const record = { kind: "object", fields };
     expect(JSON.stringify(record)).not.toContain("rightsstatements");
     expect(rightsPublishIssues(record)[0]?.code).toBe("unreadable");
     expect(canPublishRights(record)).toBe(false);
+    const rights = {};
+    Object.defineProperty(rights, "uri", { value: INC, enumerable: false });
+    expect(rightsPublishIssues({ fields: { rights } })[0]?.code).toBe("unreadable");
   });
 
   it("refuses hidden fields, and a hidden or getter kind claiming an exempt kind", () => {
     const hiddenFields = { kind: "object" };
-    Object.defineProperty(hiddenFields, "fields", { value: { rights: INC }, enumerable: false });
+    Object.defineProperty(hiddenFields, "fields", {
+      value: { rights: { uri: INC } },
+      enumerable: false,
+    });
     expect(canPublishRights(hiddenFields)).toBe(false);
 
     const hiddenKind = { fields: {} };
@@ -101,6 +135,7 @@ describe("the publishing rule can't be fooled", () => {
     const boxed = new String(INC);
     expect(rightsTerm(boxed)).toBeUndefined();
     expect(canPublishRights({ fields: { rights: boxed } })).toBe(false);
+    expect(canPublishRights({ fields: { rights: { uri: boxed } } })).toBe(false);
   });
 
   it("does not treat prototype names as statement codes", () => {

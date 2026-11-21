@@ -2,8 +2,9 @@
  * Rights: rightsstatements.org statements and Creative Commons tools
  * (PLATFORM_PLAN.md §1, decision D-011).
  *
- * A record's rights are stored as one canonical URI, in the template field
- * `rights` (`RIGHTS_FIELD_KEY`). The design's rule is that a record with no
+ * A record's rights are stored as one canonical URI, in the `uri` of the
+ * template field `rights` (`RIGHTS_FIELD_KEY`), which holds the template's
+ * `rights` value shape `{ uri, note? }` (D-010, D-015). The design's rule is that a record with no
  * rights value can't be published; `rightsPublishIssues` is that check, for
  * the publishing step (T-010) to call on the record it is about to publish.
  *
@@ -55,7 +56,7 @@ export interface RightsTerm {
   readonly category: RightsCategory;
 }
 
-/** The template field that holds a record's rights URI. */
+/** The template field that holds a record's rights value, `{ uri, note? }`. */
 export const RIGHTS_FIELD_KEY = "rights";
 
 /** The longest text `normalizeRightsUri` reads. Real URIs are under 80. */
@@ -242,7 +243,9 @@ const RIGHTS_EXEMPT_KINDS: ReadonlySet<string> = new Set(["agent", "place", "eve
 /**
  * The publishing rule: the problems that keep a record's rights from being
  * published, or an empty list if there are none. An object, archival unit or
- * digital asset needs an accepted, canonical URI in `fields.rights`; agent,
+ * digital asset needs `fields.rights` to be `{ uri, note? }` with an
+ * accepted, canonical `uri`; a plain string there is refused (`not_an_object`),
+ * so the old shape can't slip through; agent,
  * place and event records need none. A record with any other kind, or none,
  * is checked as if it needed one.
  *
@@ -268,8 +271,22 @@ export function rightsPublishIssues(record: unknown): readonly Issue[] {
       return Object.freeze([issue(["fields"], "not_an_object", "fields must be an object.")]);
     }
     const value = ownValue(fields, RIGHTS_FIELD_KEY);
-    if (rightsTerm(value) !== undefined) return Object.freeze([]);
-    return Object.freeze([explain(value, path)]);
+    if (value === undefined || value === null) return Object.freeze([explain(undefined, path)]);
+    if (types.isProxy(value)) return unreadable;
+    if (!isPlainObject(value)) {
+      return Object.freeze([
+        issue(
+          [...path],
+          "not_an_object",
+          typeof value === "string"
+            ? `The rights value must be { uri, note? }, not text on its own: store ${shown(value)} as its uri.`
+            : "The rights value must be { uri, note? }.",
+        ),
+      ]);
+    }
+    const uri = ownValue(value, "uri");
+    if (rightsTerm(uri) !== undefined) return Object.freeze([]);
+    return Object.freeze([explain(uri, [...path, "uri"])]);
   } catch {
     // Only a hostile input gets here.
     return unreadable;

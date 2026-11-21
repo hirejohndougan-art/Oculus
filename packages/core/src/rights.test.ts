@@ -323,6 +323,8 @@ describe("normalizeRightsUri", () => {
   });
 });
 
+const INC_URI = "http://rightsstatements.org/vocab/InC/1.0/";
+
 describe("the publishing rule", () => {
   const record = (fields: Record<string, unknown>): unknown => ({
     kind: "object",
@@ -332,8 +334,10 @@ describe("the publishing rule", () => {
 
   it("allows a record whose rights field holds a canonical URI", () => {
     for (const t of RIGHTS_TERMS) {
-      expect(rightsPublishIssues(record({ [RIGHTS_FIELD_KEY]: t.uri }))).toEqual([]);
-      expect(canPublishRights(record({ rights: t.uri }))).toBe(true);
+      expect(rightsPublishIssues(record({ [RIGHTS_FIELD_KEY]: { uri: t.uri } }))).toEqual([]);
+      expect(
+        canPublishRights(record({ rights: { uri: t.uri, note: "Credit the Society." } })),
+      ).toBe(true);
     }
   });
 
@@ -341,7 +345,7 @@ describe("the publishing rule", () => {
     const made = createRecord({
       kind: "object",
       title: "Invented plow",
-      fields: { rights: "http://rightsstatements.org/vocab/NoC-US/1.0/" },
+      fields: { rights: { uri: "http://rightsstatements.org/vocab/NoC-US/1.0/" } },
     });
     expect(made.ok).toBe(true);
     if (!made.ok) return;
@@ -361,17 +365,36 @@ describe("the publishing rule", () => {
     expect(canPublishRights(record({}))).toBe(false);
     expect(canPublishRights(record({ rights: null }))).toBe(false);
     expect(canPublishRights(record({ rights: "" }))).toBe(false);
+    expect(rightsPublishIssues(record({ rights: { note: "Ask first" } }))).toEqual([
+      {
+        path: ["fields", "rights", "uri"],
+        code: "rights_missing",
+        message: "Choose a rights statement or license before this record can be published.",
+      },
+    ]);
+  });
+
+  it("refuses a rights value that isn't { uri, note? }, saying so", () => {
+    const text = rightsPublishIssues(record({ rights: INC_URI }));
+    expect(text.map((i) => i.code)).toEqual(["not_an_object"]);
+    expect(text[0]?.path).toEqual(["fields", "rights"]);
+    expect(text[0]?.message).toContain("not text on its own");
+    for (const value of [[{ uri: INC_URI }], 3, true, new String(INC_URI)]) {
+      const issues = rightsPublishIssues(record({ rights: value }));
+      expect(issues.map((i) => i.code)).toEqual(["not_an_object"]);
+      expect(issues[0]?.message).toBe("The rights value must be { uri, note? }.");
+    }
   });
 
   it.each([
     ["All rights reserved", "unknown_rights"],
     ["https://rightsstatements.org/vocab/InC/1.0/", "not_canonical"],
     ["https://creativecommons.org/licenses/by/3.0/", "unsupported_version"],
-    [{ uri: "http://rightsstatements.org/vocab/InC/1.0/" }, "not_text"],
-  ])("blocks %j with %s", (value, expected) => {
-    const issues = rightsPublishIssues(record({ rights: value }));
+    [["http://rightsstatements.org/vocab/InC/1.0/"], "not_text"],
+  ])("blocks the uri %j with %s", (uri, expected) => {
+    const issues = rightsPublishIssues(record({ rights: { uri } }));
     expect(issues.map((i) => i.code)).toEqual([expected]);
-    expect(issues[0]?.path).toEqual(["fields", "rights"]);
+    expect(issues[0]?.path).toEqual(["fields", "rights", "uri"]);
   });
 
   it("applies to objects, archival units and digital assets only", () => {
@@ -379,7 +402,9 @@ describe("the publishing rule", () => {
     expect(Object.isFrozen(RIGHTS_REQUIRED_KINDS)).toBe(true);
     for (const kind of RIGHTS_REQUIRED_KINDS) {
       expect(canPublishRights({ kind, fields: {} })).toBe(false);
-      expect(canPublishRights({ kind, fields: { rights: "All rights reserved" } })).toBe(false);
+      expect(canPublishRights({ kind, fields: { rights: { uri: "All rights reserved" } } })).toBe(
+        false,
+      );
     }
     for (const kind of ["agent", "place", "event"]) {
       expect(rightsPublishIssues({ kind, fields: {} })).toEqual([]);

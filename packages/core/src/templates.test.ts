@@ -127,7 +127,7 @@ function goodFields(): Record<string, unknown> {
     subjects: [
       {
         label: "Railroad stations",
-        uri: "http://id.loc.gov/authorities/subjects/sh85110700",
+        uri: "http://id.loc.gov/authorities/subjects/sh85111042",
         vocabulary: "lcsh",
       },
       { label: "Depot Park", vocabulary: "local" },

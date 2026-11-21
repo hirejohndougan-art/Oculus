@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 import {
   checkRecordAgainstTemplate,
   checkRightsValue,
+  createRecord,
   makeIdentifierChecker,
+  rightsPublishIssues,
   validateRecord,
   validateTemplate,
   type CatalogRecord,
@@ -322,5 +324,29 @@ describe("checkRecordAgainstTemplate: identifier values need a checker", () => {
       },
     );
     expect(codes(r)).toEqual(["not_allowed"]);
+  });
+});
+
+describe("a record that passes its template can be published (rights)", () => {
+  it("checkRecordAgainstTemplate and rightsPublishIssues agree on { uri, note? }", () => {
+    const t = template([field({ key: "rights", label: "Rights", kind: "rights", required: true })]);
+    const made = createRecord({
+      kind: "object",
+      title: "Invented lantern",
+      fields: { rights: { uri: INC, note: "Rights holder unknown." } },
+    });
+    expect(made.ok).toBe(true);
+    if (!made.ok) return;
+    expect(checkRecordAgainstTemplate(made.value, t)).toEqual([]);
+    expect(rightsPublishIssues(made.value)).toEqual([]);
+  });
+
+  it("and both refuse the same non-canonical uri, at the same path", () => {
+    const r = record({ rights: { uri: "https://rightsstatements.org/page/InC/1.0/" } });
+    const fromTemplate = checkRecordAgainstTemplate(r, RIGHTS);
+    const fromPublish = rightsPublishIssues(r);
+    expect(codes(fromTemplate)).toEqual(["not_canonical"]);
+    expect(codes(fromPublish)).toEqual(["not_canonical"]);
+    expect(paths(fromTemplate)).toEqual(paths(fromPublish));
   });
 });
