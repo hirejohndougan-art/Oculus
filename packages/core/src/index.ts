@@ -139,3 +139,24 @@ export type {
   FieldValueChecker,
   TemplateCheckOptions,
 } from "./templates.js";
+
+export {
+  RIGHTS_FIELD_KEY,
+  MAX_RIGHTS_TEXT_LENGTH,
+  RIGHTS_STATEMENTS,
+  CREATIVE_COMMONS,
+  RIGHTS_TERMS,
+  rightsTerm,
+  isRightsUri,
+  validateRightsUri,
+  normalizeRightsUri,
+  rightsPublishIssues,
+  canPublishRights,
+} from "./rights.js";
+export type {
+  RightsSource,
+  RightsCategory,
+  RightsTerm,
+  RightsChange,
+  NormalizedRights,
+} from "./rights.js";
