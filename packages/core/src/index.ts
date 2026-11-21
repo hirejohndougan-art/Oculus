@@ -187,3 +187,12 @@ export {
 export type { DublinCoreTerm, DublinCoreEntry, DublinCoreMapping } from "./dublin-core.js";
 
 export { checkRightsValue, makeIdentifierChecker } from "./field-checkers.js";
+
+export { MAX_RECORD_SET, indexRecords, effectiveRecord } from "./effective.js";
+export type {
+  ChainStep,
+  EffectiveField,
+  EffectiveRecord,
+  TemplateLookup,
+  RecordLookup,
+} from "./effective.js";
