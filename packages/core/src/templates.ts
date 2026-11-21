@@ -22,7 +22,12 @@
  *   vocabulary such as LCSH, or a local term with no URI.
  * - `identifier`: `{ type, value }`, such as an accession number.
  * - `link`: `{ url, label? }`, a web link (http or https).
- * - `rights`: `{ uri, note? }`, a rights statement or license URI.
+ * - `rights`: `{ uri, note? }`, a rights statement or license URI. One per
+ *   record: the kind is only allowed in a single, public, non-repeating field
+ *   with the key `rights`, the field the publish rule reads (rights.ts,
+ *   D-011, D-015). The note is published with the URI, so it must never hold
+ *   donor names or contact details; private rights notes go in a separate
+ *   staff field.
  * - `place`: `{ label, uri?, recordId? }`, a place by name, with a gazetteer
  *   URI (GNIS) or the ID of a place record if known.
  *
@@ -55,6 +60,7 @@ import {
 } from "./plain-data.js";
 import { parseEdtf } from "./edtf.js";
 import { checkRightsValue } from "./field-checkers.js";
+import { RIGHTS_FIELD_KEY } from "./rights.js";
 import { isRecordId } from "./record-id.js";
 import { RECORD_KINDS, isRecordKind, type CatalogRecord, type RecordKind } from "./records.js";
 import { types } from "node:util";
@@ -400,6 +406,7 @@ function checkField(
       );
     }
   }
+  if (kind === "rights" || f.key === RIGHTS_FIELD_KEY) checkRightsField(f, kind, path, issues);
   if (kind === "list") checkOptions(f.options, [...path, "options"], issues);
   if (kind === "controlled_term" && f.vocabularies !== undefined) {
     checkCodes(f.vocabularies, [...path, "vocabularies"], "vocabulary", issues);
@@ -420,6 +427,49 @@ function checkField(
     }
   }
   return key;
+}
+
+/**
+ * The publish rule reads one rights value from `fields.rights` and publishes
+ * it, note included (D-011, D-015). So the `rights` kind and the key `rights`
+ * go together, the field holds one value, and it is public. Duplicate keys
+ * are refused elsewhere, so a template has at most one rights field.
+ */
+function checkRightsField(
+  f: Readonly<Record<string, JsonValue | undefined>>,
+  kind: FieldKind,
+  path: readonly (string | number)[],
+  issues: IssueList,
+): void {
+  if (kind !== "rights") {
+    issues.add(
+      [...path, "kind"],
+      "rights_key_kind",
+      `The field ${shown(RIGHTS_FIELD_KEY)} must have the kind rights, because publishing reads it as the record's rights.`,
+    );
+    return;
+  }
+  if (f.key !== RIGHTS_FIELD_KEY) {
+    issues.add(
+      [...path, "key"],
+      "rights_kind_key",
+      `A rights field must use the key ${shown(RIGHTS_FIELD_KEY)}, so a template has one and publishing finds it.`,
+    );
+  }
+  if (f.repeatable === true) {
+    issues.add(
+      [...path, "repeatable"],
+      "rights_repeatable",
+      "A record has one rights value, so the rights field can't repeat.",
+    );
+  }
+  if (f.visibility === "staff") {
+    issues.add(
+      [...path, "visibility"],
+      "rights_not_public",
+      'The rights field is published with the record, note included, so its visibility must be "public". Keep private rights notes in a separate staff field.',
+    );
+  }
 }
 
 function checkOptions(

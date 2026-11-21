@@ -603,6 +603,58 @@ describe("checkRecordAgainstTemplate: each kind", () => {
   });
 });
 
+describe("validateTemplate: the rights field", () => {
+  const fieldCodes = (...fields: Record<string, unknown>[]): string[] =>
+    codes(validateTemplate({ ...fullTemplate(), fields }));
+  const rights = (extra: Record<string, unknown> = {}): Record<string, unknown> =>
+    field({ key: "rights", label: "Rights", kind: "rights", ...extra });
+
+  it("accepts one public, single rights field under the key rights", () => {
+    expect(fieldCodes(rights())).toEqual([]);
+    expect(fieldCodes(rights({ required: true, inherited: true }))).toEqual([]);
+  });
+
+  it("refuses the rights kind under any other key", () => {
+    const r = validateTemplate({ ...fullTemplate(), fields: [rights({ key: "license" })] });
+    expect(codes(r)).toEqual(["rights_kind_key"]);
+    expect(paths(r)).toEqual(["fields.0.key"]);
+  });
+
+  it("refuses the key rights with any other kind", () => {
+    for (const kind of ["text", "controlled_term", "place", "long_text", "link"]) {
+      const r = validateTemplate({ ...fullTemplate(), fields: [rights({ kind })] });
+      expect(codes(r)).toEqual(["rights_key_kind"]);
+      expect(paths(r)).toEqual(["fields.0.kind"]);
+    }
+  });
+
+  it("refuses two rights fields", () => {
+    expect(fieldCodes(rights(), rights({ key: "rights_2" }))).toEqual(["rights_kind_key"]);
+    expect(fieldCodes(rights(), rights())).toEqual(["duplicate_key"]);
+  });
+
+  it("refuses a repeatable rights field (one value per record)", () => {
+    const r = validateTemplate({ ...fullTemplate(), fields: [rights({ repeatable: true })] });
+    expect(codes(r)).toEqual(["rights_repeatable"]);
+    expect(paths(r)).toEqual(["fields.0.repeatable"]);
+  });
+
+  it("refuses a staff-only rights field, because the note is published", () => {
+    const r = validateTemplate({ ...fullTemplate(), fields: [rights({ visibility: "staff" })] });
+    expect(codes(r)).toEqual(["rights_not_public"]);
+    expect(paths(r)).toEqual(["fields.0.visibility"]);
+  });
+
+  it("makes a template with a hand-built rights field fail closed in checkRecordAgainstTemplate", () => {
+    const bad = { ...fullTemplate(), fields: [rights({ visibility: "staff" })] } as unknown;
+    const issues = checkRecordAgainstTemplate(
+      record({ rights: { uri: "http://rightsstatements.org/vocab/InC/1.0/" } }),
+      bad as FieldTemplate,
+    );
+    expect(codes(issues)).toEqual(["invalid_template"]);
+  });
+});
+
 describe("checkRecordAgainstTemplate: plugged-in checkers", () => {
   it("runs a checker after the structure check and adds its problems with paths", () => {
     const rights = vi.fn(() => [

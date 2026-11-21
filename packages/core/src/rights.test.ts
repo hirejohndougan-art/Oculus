@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   CREATIVE_COMMONS,
+  MAX_RIGHTS_NOTE_LENGTH,
   RIGHTS_FIELD_KEY,
   RIGHTS_REQUIRED_KINDS,
   RIGHTS_STATEMENTS,
@@ -14,6 +15,7 @@ import {
   type NormalizedRights,
 } from "./rights.js";
 import { createRecord } from "./records.js";
+import { MAX_HELP_LENGTH } from "./templates.js";
 import type { Validated } from "./issues.js";
 
 function normal(text: string): NormalizedRights {
@@ -395,6 +397,34 @@ describe("the publishing rule", () => {
     const issues = rightsPublishIssues(record({ rights: { uri } }));
     expect(issues.map((i) => i.code)).toEqual([expected]);
     expect(issues[0]?.path).toEqual(["fields", "rights", "uri"]);
+  });
+
+  it("refuses unknown properties and a note that isn't text, as the template does", () => {
+    const issues = (rights: unknown): string[] =>
+      rightsPublishIssues(record({ rights })).map((i) => `${i.path.join(".")}:${i.code}`);
+    expect(issues({ uri: INC_URI, note: "Credit the Society." })).toEqual([]);
+    expect(issues({ uri: INC_URI, holder: "x" })).toEqual([
+      "fields.rights.holder:unknown_property",
+    ]);
+    expect(issues({ uri: INC_URI, note: 3 })).toEqual(["fields.rights.note:invalid_text"]);
+    expect(issues({ uri: INC_URI, note: " " })).toEqual(["fields.rights.note:invalid_text"]);
+    expect(issues({ uri: INC_URI, note: "x".repeat(MAX_RIGHTS_NOTE_LENGTH + 1) })).toEqual([
+      "fields.rights.note:too_long",
+    ]);
+    expect(issues({ uri: INC_URI, note: "a\u202eb" })).toEqual([
+      "fields.rights.note:bad_characters",
+    ]);
+    expect(issues({ uri: "All rights reserved", extra: 1, note: null })).toEqual([
+      "fields.rights.extra:unknown_property",
+      "fields.rights.note:invalid_text",
+      "fields.rights.uri:unknown_rights",
+    ]);
+  });
+
+  it("allows notes as long as the template does", () => {
+    expect(MAX_RIGHTS_NOTE_LENGTH).toBe(MAX_HELP_LENGTH);
+    const note = "x".repeat(MAX_HELP_LENGTH);
+    expect(rightsPublishIssues(record({ rights: { uri: INC_URI, note } }))).toEqual([]);
   });
 
   it("applies to objects, archival units and digital assets only", () => {

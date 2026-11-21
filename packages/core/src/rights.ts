@@ -245,7 +245,9 @@ const RIGHTS_EXEMPT_KINDS: ReadonlySet<string> = new Set(["agent", "place", "eve
  * published, or an empty list if there are none. An object, archival unit or
  * digital asset needs `fields.rights` to be `{ uri, note? }` with an
  * accepted, canonical `uri`; a plain string there is refused (`not_an_object`),
- * so the old shape can't slip through; agent,
+ * so the old shape can't slip through. Unknown properties and a `note` that
+ * isn't text are refused too, as the template does, so this rule stands on
+ * its own. The note is published with the URI; agent,
  * place and event records need none. A record with any other kind, or none,
  * is checked as if it needed one.
  *
@@ -284,13 +286,56 @@ export function rightsPublishIssues(record: unknown): readonly Issue[] {
         ),
       ]);
     }
+    // The same shape the template's rights kind requires, checked again here
+    // so publishing doesn't depend on the template check having run.
+    const found: Issue[] = [];
+    for (const key of Object.keys(value)) {
+      if (key !== "uri" && key !== "note") {
+        found.push(
+          issue(
+            [...path, key],
+            "unknown_property",
+            `${shown(key)} is not a property of a rights value, which is { uri, note? }.`,
+          ),
+        );
+      }
+    }
+    const note = ownValue(value, "note");
+    if (note !== undefined) {
+      const problem = noteProblem(note);
+      if (problem !== undefined)
+        found.push(issue([...path, "note"], problem.code, problem.message));
+    }
     const uri = ownValue(value, "uri");
-    if (rightsTerm(uri) !== undefined) return Object.freeze([]);
-    return Object.freeze([explain(uri, [...path, "uri"])]);
+    if (rightsTerm(uri) === undefined) found.push(explain(uri, [...path, "uri"]));
+    return Object.freeze(found);
   } catch {
     // Only a hostile input gets here.
     return unreadable;
   }
+}
+
+/**
+ * The longest a rights note may be: the same as the template's limit for
+ * help text and notes (`MAX_HELP_LENGTH`).
+ */
+export const MAX_RIGHTS_NOTE_LENGTH = 2000;
+
+/** Why a rights note can't be published, or undefined. The template's rules, plus `textProblem`. */
+function noteProblem(note: unknown): { code: string; message: string } | undefined {
+  if (typeof note !== "string" || note.trim().length === 0) {
+    return { code: "invalid_text", message: "The rights note must be text, or be left out." };
+  }
+  if (note.length > MAX_RIGHTS_NOTE_LENGTH) {
+    return {
+      code: "too_long",
+      message: `The rights note can be at most ${String(MAX_RIGHTS_NOTE_LENGTH)} characters.`,
+    };
+  }
+  const problem = textProblem(note);
+  if (problem !== undefined)
+    return { code: "bad_characters", message: `The rights note ${problem}.` };
+  return undefined;
 }
 
 /** True when `rightsPublishIssues` finds nothing. */

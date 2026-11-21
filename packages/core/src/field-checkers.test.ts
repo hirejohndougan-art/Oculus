@@ -210,18 +210,6 @@ describe("checkRecordAgainstTemplate: the rights checker runs by default", () =>
     expect(codes(checkRights({ uri: "https://example.org/rights" }))).toEqual(["unknown_rights"]);
   });
 
-  it("checks each value of a repeatable rights field", () => {
-    const t = template([
-      field({ key: "rights", label: "Rights", kind: "rights", repeatable: true }),
-    ]);
-    const r = checkRecordAgainstTemplate(
-      record({ rights: [{ uri: INC }, { uri: "https://example.org/x" }] }),
-      t,
-    );
-    expect(codes(r)).toEqual(["unknown_rights"]);
-    expect(paths(r)).toEqual(["fields.rights.1.uri"]);
-  });
-
   it("still runs with an empty checkers object, or rights: undefined", () => {
     const bad = { uri: "https://example.org/rights" };
     expect(codes(checkRights(bad, { checkers: {} }))).toEqual(["unknown_rights"]);
