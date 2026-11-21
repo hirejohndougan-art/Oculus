@@ -108,6 +108,7 @@ export type {
   DroppedIdentifier,
 } from "./identifiers.js";
 
+export {
   FIELD_KINDS,
   FIELD_VISIBILITIES,
   MAX_TEMPLATE_FIELDS,
