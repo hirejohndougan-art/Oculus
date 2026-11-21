@@ -57,6 +57,33 @@ describe("identifierKey", () => {
     expect(same("Ö-1", "Ó-1")).toBe(false);
   });
 
+  it("maps lookalikes that have no Latin decomposition (S-003 review)", () => {
+    expect(same("YÆƏƟV-1", "\u04ae\u04d4\u04d8\u04e8\u0474-1")).toBe(true);
+    expect(same("yæəɵv-1", "\u04af\u04d5\u04d9\u04e9\u0475-1")).toBe(true);
+    expect(same("ÇJ-1", "\u04aa\u037f-1")).toBe(true);
+    expect(same("çj-1", "\u04ab\u03f3-1")).toBe(true);
+    expect(same("ã-1", "\u1fb6-1")).toBe(true); // Greek ᾶ
+    expect(same("DHS-1", "DHS\u16801")).toBe(true); // Ogham space mark draws a dash
+    expect(same("DHS-1", "DHS 1")).toBe(false);
+  });
+
+  it("removes invisibles before composing accents (S-003 review)", () => {
+    expect(same("Á-1", "A\u2800\u0301-1")).toBe(true);
+    expect(same("Á-1", "A\u200d\u0301-1")).toBe(true);
+    expect(same("Ä-1", "A\u00a8-1")).toBe(true); // NFKC gives space + diaeresis
+    expect(same("\uac00", "\u1100\u1160\u1161")).toBe(true);
+  });
+
+  it("compares over-long text and long runs of marks exactly", () => {
+    const long = "A".repeat(1001);
+    expect(same(long, long)).toBe(true);
+    expect(same(long, long.toLowerCase())).toBe(false);
+    const marks = "a" + "\u0301".repeat(31);
+    expect(same(marks, marks)).toBe(true);
+    expect(same(marks, "A" + "\u0301".repeat(31))).toBe(false);
+    expect(same("a" + "\u0301".repeat(30), "A" + "\u0301".repeat(30))).toBe(true);
+  });
+
   it("treats blank-looking characters as spaces (S-003)", () => {
     for (const blank of [
       "\u2800",

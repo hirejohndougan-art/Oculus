@@ -5,6 +5,7 @@ import {
   MAX_FORMER_IDENTIFIERS,
   checkNewIdentifier,
   findByIdentifier,
+  findIdentifierConflicts,
   identifierKey,
   newRecordId,
   nextIdentifier,
@@ -164,6 +165,16 @@ describe("lookalike identifiers can't both be held (S-003)", () => {
     ["é-1", "\u03ad-1"], // Greek έ
     ["ó-1", "\u03cc-1"], // Greek ό
     ["Á-1", "\u0391\u0341-1"], // Greek Α + combining tone mark
+    // Review fixes: lookalikes with no Latin decomposition
+    ["Y-1", "\u04ae-1"], // Cyrillic Ү
+    ["Æ-1", "\u04d4-1"], // Cyrillic Ӕ
+    ["ə-1", "\u04d9-1"], // Cyrillic ә
+    ["Ɵ-1", "\u04e8-1"], // Cyrillic Ө
+    ["V-1", "\u0474-1"], // Cyrillic Ѵ
+    ["Ç-1", "\u04aa-1"], // Cyrillic Ҫ
+    ["J-1", "\u037f-1"], // Greek Ϳ
+    ["ã-1", "\u1fb6-1"], // Greek ᾶ (perispomeni drawn as a tilde)
+    ["DHS-0001", "DHS\u16800001"], // Ogham space mark, drawn as a dash
   ];
   const holding = (value: string): RecordIdentifiers => ({
     recordId: newRecordId(),
@@ -229,19 +240,38 @@ describe("lookalike identifiers can't both be held (S-003)", () => {
     ).toEqual(["not_unique"]);
   });
 
-  it("the key stays linear on long runs of accented lookalikes and marks", () => {
-    const time = (text: string): number => {
-      const started = performance.now();
-      identifierKey(text);
-      return performance.now() - started;
-    };
-    // Mixed combining classes make NFD reorder each run of marks.
-    const unit = "\u04e6\u0301\u0323\u0386\u03ad";
-    time(unit.repeat(1000)); // warm up
-    const small = time(unit.repeat(20_000));
-    const large = time(unit.repeat(200_000));
-    expect(large).toBeLessThan(Math.max(small, 1) * 30);
-    expect(large).toBeLessThan(2000);
+  it.each(["\u2800", "\u200d", "\u3164", " "])(
+    "%j between a letter and its accent doesn't keep them apart (review fix)",
+    (blank) => {
+      // Stored before the value check, or from an import.
+      const odd = holding(`A${blank}\u0301-1`);
+      expect(uniquenessIssues([odd, holding("Á-1")], TYPES)).toHaveLength(2);
+      expect(
+        findIdentifierConflicts({ type: "box_label", value: "Á-1" }, newRecordId(), [odd], TYPES),
+      ).toHaveLength(1);
+    },
+  );
+
+  it("a Hangul filler between jamo doesn't keep them from the syllable (review fix)", () => {
+    expect(identifierKey("\u1100\u1160\u1161-1")).toBe(identifierKey("\uac00-1"));
+  });
+
+  it("long runs of combining marks cost linear time, even with no length cap (review fix)", () => {
+    // Normalization sorts each run of marks in time growing with its square.
+    const longRun = "a" + "\u0323\u0301".repeat(100_000);
+    const shortRuns = ("a" + "\u0323\u0301".repeat(15)).repeat(30); // under the length cap
+    const started = performance.now();
+    expect(
+      findIdentifierConflicts({ type: "box_label", value: longRun }, newRecordId(), [], TYPES),
+    ).toEqual([]);
+    const stored = Array.from({ length: 2000 }, () => holding(shortRuns));
+    expect(uniquenessIssues([...stored, holding(longRun), holding(longRun)], TYPES).length).toBe(
+      201,
+    );
+    // An unnormalized key still finds exactly the same text.
+    expect(identifierKey(longRun)).toBe(identifierKey(longRun));
+    expect(identifierKey(longRun)).not.toBe(identifierKey(`A${longRun.slice(1)}`));
+    expect(performance.now() - started).toBeLessThan(1500);
   });
 });
 
