@@ -41,11 +41,13 @@
  *   reason. An entry that doesn't say which organization it belongs to
  *   counts as another organization's.
  *
- * Not decided here, and left to later tasks:
- * - Changing an identifier type. Tightening a format, removing a type,
- *   making it unique or making it staff only can make existing records fail `validateRecordIdentifiers`;
- *   the admin screen must check the records (or move the old values to the
- *   former list) before saving the change.
+ * Changing an identifier type: tightening a format, removing or renaming a
+ * type, making it unique or changing its numbering can make existing records
+ * fail `validateRecordIdentifiers` or give a used number out again, and
+ * making it public publishes staff values. `identifierTypeChanges` and
+ * `identifierTypeDeletion` (identifier-type-changes.ts, D-0XX) report the
+ * records affected; the admin screen must show them and get confirmation
+ * before saving.
  */
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import {

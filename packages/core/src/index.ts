@@ -165,6 +165,18 @@ export { TEMPLATE_CHANGE_CODES, MAX_LISTED_RECORDS, templateChanges } from "./te
 export type { TemplateChangeCode, TemplateChange, TemplateChanges } from "./template-changes.js";
 
 export {
+  IDENTIFIER_TYPE_CHANGE_CODES,
+  identifierTypeChanges,
+  identifierTypeDeletion,
+} from "./identifier-type-changes.js";
+export type {
+  IdentifierTypeChangeCode,
+  IdentifierTypeChange,
+  IdentifierTypeChanges,
+  IdentifierTypeUse,
+} from "./identifier-type-changes.js";
+
+export {
   RIGHTS_FIELD_KEY,
   RIGHTS_REQUIRED_KINDS,
   MAX_RIGHTS_TEXT_LENGTH,
