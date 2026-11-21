@@ -165,3 +165,10 @@ Two levels of management, refining D-019's system admins and site roles:
 - Site roles below a site manager (the plan's cataloger, reviewer and read-only, and Q-4's open question about Scanner and Donor relations) are granted per site, as T-041 defines them.
 - **Plugins** are new to the plan. What a plugin may do and how it is checked before install (it runs code on the server) is undecided and gets its own decision task before any plugin system is built (P-001).
 
+## D-026 — Show or hide each field on a site's record pages (2026-11-21, John)
+System managers and site managers decide which record fields a site's record pages show, with a show/hide toggle for each field of each template.
+- **The toggle only narrows.** It applies to fields that are already public (template visibility, D-013, D-022 and D-023). A staff field can't be shown by switching it on: making a field public stays a template change, with the confirmation D-023 requires. So the toggle is a display setting, not part of the publish boundary.
+- **Hidden means not sent.** A hidden field is left out of that site's pages entirely, including the page's embedded JSON-LD, not just hidden by CSS, so it isn't in the page source either.
+- **Per site.** One organization's sites can show different fields of the same records. Feeds for the whole organization (OAI-PMH) follow the Dublin Core mapping, not a site's toggles.
+- **Rejected:** using the toggle as the public/staff switch (it would let a display setting publish staff data without D-023's confirmation); hiding fields only in the browser.
+
