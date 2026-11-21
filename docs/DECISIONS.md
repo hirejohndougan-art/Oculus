@@ -161,6 +161,7 @@ An identifier type takes `public?: boolean`; left out or `false`, it is staff on
 Two levels of management, refining D-019's system admins and site roles:
 - **System managers** can do everything, across the whole install. They sign in, create and set up the sites, install plugins and themes, manage every user and which sites each person can use, and run System settings.
 - **Site managers** manage only the sites assigned to them, one or more. On those sites they have full control (content, catalog, Design, Site settings and the site's people and roles), and they choose among the plugins and themes a system manager has installed. They can't install anything, create sites, or see or change sites they aren't assigned to.
+- **Site managers can change anything on their sites (John, same day):** every part of the site's design, including the installed theme they picked (colours, fonts, layouts, headers, footers, templates). Theme updates must not overwrite a site's own changes, so a site's changes are stored separately from the theme.
 - Site roles below a site manager (the plan's cataloger, reviewer and read-only, and Q-4's open question about Scanner and Donor relations) are granted per site, as T-041 defines them.
 - **Plugins** are new to the plan. What a plugin may do and how it is checked before install (it runs code on the server) is undecided and gets its own decision task before any plugin system is built (P-001).
 
