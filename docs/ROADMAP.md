@@ -65,12 +65,15 @@ The data model in TypeScript, written for any archive or museum rather than one 
 - [ ] T-009a **Vocabulary follow-ups.** deps: T-009
   - Confirm the Nomenclature 4.0 and GNIS URI patterns from nomenclature.info and USGS once they can be reached, and tighten those checks.
   - A Data Cleaning report of LC-vocabulary terms with no URI.
-- [ ] T-010 **Dublin Core and JSON-LD output.** deps: T-006, T-007, T-008
+- [x] T-010 **Dublin Core and JSON-LD output.** deps: T-006, T-007, T-008
   - Turn a published record into Dublin Core and JSON-LD.
   - Unpublished and staff-only fields never appear in the output. (risky)
   - Fields not in the record's template (left over after a template edit) count as staff-only. Identifier types are staff-only unless marked public, and former-identifier notes are never published (from the T-004 review).
   - Build public output only from `publicView(effective)` and check it with `effectivePublishIssues` (D-013); never from `fields` or `record`.
   - Identifier fields publish only `value`, never `type`. The Dublin Core mapping doesn't check that a field's kind fits its term: handle each kind explicitly.
+- [ ] T-010a **Check public output against the specs.** deps: T-010
+  - DCMI term ranges, the DCMI Type URIs, the oai_dc namespace and schema location and the XML 1.0 Char rule were written from knowledge, because dublincore.org, openarchives.org and w3.org couldn't be reached. Check them against the specs when they can be read, and add a JSON-LD processor check in a test if a permissive dev dependency is acceptable (decision entry).
+  - Records need a real publish state (Phase 2); `published` is the caller's word until then.
 - [ ] T-011 **Phase 1 review.** deps: T-001 to T-010
   - Check the model against PLATFORM_PLAN.md §1–2 and the mockup screens.
   - Write the Phase 2 tasks, server and database, using whatever John has answered for Q-1 and Q-2 so far.

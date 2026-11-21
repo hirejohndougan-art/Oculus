@@ -2,6 +2,15 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-20 23:00 CT — manual (John asked to finish Phase 1) — T-010 Dublin Core and JSON-LD output
+- Result: done
+- What changed: `publicOutput()` (`public-output.ts`) turns a `publicView` into a Dublin Core values object, OAI-PMH oai_dc XML and JSON-LD, refusing output unless the publish, mapping, rights-mapping and template checks all pass. Small changes to `effective.ts` (a view mark; the rights note left out of `publicView`) and doc comments in `rights.ts` and `templates.ts`. A separate fix to `dublin-core.ts`: the duplicate check no longer uses `JSON.stringify`, so a polluted `toJSON` can't block publishing (found by the builder, test added).
+- Decisions: D-016 (supersedes D-015's rights-note bullet)
+- Review: three independent reviews. None found a leak: staff values, notes, identifier types, ancestor IDs and unpublished records stayed out of every form; forging, mutation and injection held. Round 1 found own values published without the template check, JSON-LD ignoring DCMI term ranges, non-canonical URIs, a size cap that didn't count escaping (45M under a "5M" cap), rights not required in the mapping, an unclear rights-note policy and prototype pollution via `iri`. Round 2 found IRI characters RFC 3987 forbids, the rights note in `publicView`, stale views, the JSON text built before it was capped, `toJSON` pollution and missing DCMI types for digital assets. All fixed with tests that fail without the fix. The third reviewer ran realistic DACS, Spectrum and digital-asset records through jsonld.toRDF (in the scratchpad, not the repo) and the triples were correct.
+- Sources: written from knowledge of DCMI Terms, DCMI Type, OAI-PMH 2.0 oai_dc, JSON-LD 1.1 and XML 1.0, because those sites couldn't be reached (T-010a).
+- Gate: PASS · tests_passing 1194 (was 1110) · npm audit clean
+- Next: T-011 Phase 1 review
+
 ## 2026-11-20 20:30 CT — manual (John asked to finish Phase 1) — T-006, T-007a, T-008, T-009
 - Result: done (four tasks in parallel worktrees, merged one at a time with the gate after each rebase)
 - What changed: **T-006** DACS, Spectrum and digital-asset presets with every public field citing its standard element, privacy-first defaults, and Dublin Core mappings that can only map public fields (`presets.ts`, `dublin-core.ts`). **T-007a** default checkers for rights and identifiers (`field-checkers.ts`); the stored rights value is `{ uri, note? }` and the `rights` field must be single, public and keyed `rights`. **T-008** the effective record with inheritance, sources and strictest visibility, `publicView` as the only source of public output, and `effectivePublishIssues` (`effective.ts`). **T-009** vocabularies and URI rules, a default controlled-term checker, and near-duplicate detection for Data Cleaning (`vocabularies.ts`, `term-duplicates.ts`).
