@@ -310,7 +310,7 @@ function ancestry(recordId: RecordId, state: LookupState): readonly CatalogRecor
         fail(
           [child.id, "parentId"],
           "wrong_level",
-          `A ${child.level} can't be filed under a ${record.level} (${shown(child.title)} under ${shown(record.title)}).`,
+          `${article(child.level)} can't be filed under ${article(record.level).toLowerCase()} (${shown(child.title)} under ${shown(record.title)}).`,
         );
       }
     }
@@ -629,4 +629,8 @@ function strictest(a: FieldVisibility, b: FieldVisibility): FieldVisibility {
 
 function describe(field: FieldDefinition): string {
   return `${field.repeatable ? "a repeatable" : "a single"} ${field.kind.replace("_", " ")}`;
+}
+
+function article(level: ArchivalLevel): string {
+  return `${level === "item" ? "An" : "A"} ${level}`;
 }
