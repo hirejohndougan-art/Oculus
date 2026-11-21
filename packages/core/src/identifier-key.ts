@@ -66,14 +66,14 @@ const LOOKALIKES: ReadonlyMap<string, string> = new Map([
   // Latin dotless i
   ["ı", "i"],
   // Dashes and minus signs (full-width and small forms are handled by NFKC)
-  ["‐", "-"],
-  ["‑", "-"],
-  ["‒", "-"],
-  ["–", "-"],
-  ["—", "-"],
-  ["―", "-"],
-  ["⁃", "-"],
-  ["−", "-"],
+  ["\u2010", "-"],
+  ["\u2011", "-"],
+  ["\u2012", "-"],
+  ["\u2013", "-"],
+  ["\u2014", "-"],
+  ["\u2015", "-"],
+  ["\u2043", "-"],
+  ["\u2212", "-"],
 ]);
 
 const ANY_CHAR = /./gsu;
