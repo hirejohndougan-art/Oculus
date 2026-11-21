@@ -217,7 +217,9 @@ function checkMapping(mapping: unknown, template: unknown): Validated<DublinCore
         );
       }
       if (typeof field === "string" && typeof e.term === "string") {
-        const pair = JSON.stringify([field, e.term]);
+        // A plain key, not JSON.stringify, so a polluted toJSON can't make
+        // every entry look like a duplicate. Field keys and terms never hold NUL.
+        const pair = `${field}\u0000${e.term}`;
         if (seen.has(pair)) issues.add(path, "duplicate", "This entry is listed twice.");
         seen.add(pair);
       }

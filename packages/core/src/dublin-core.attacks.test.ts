@@ -72,6 +72,16 @@ describe("Dublin Core mapping attacks", () => {
     expect(codes(validateDublinCoreMapping(DACS_DUBLIN_CORE, proxy))).toEqual(["invalid_template"]);
   });
 
+  it("a polluted toJSON doesn't make distinct entries look like duplicates", () => {
+    const proto = Object.prototype as Record<string, unknown>;
+    proto.toJSON = () => "same";
+    try {
+      expect(validateDublinCoreMapping(DACS_DUBLIN_CORE, DACS_ARCHIVAL_UNIT_PRESET).ok).toBe(true);
+    } finally {
+      delete proto.toJSON;
+    }
+  });
+
   it("entries inherited from a polluted Object.prototype are not read", () => {
     (Object.prototype as Record<string, unknown>).entries = [STAFF_ENTRY];
     const result = validateDublinCoreMapping(
