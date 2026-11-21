@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-21 14:55 CT — manual (John) — D-025 System managers and site managers
+- Result: done (decision recorded; no code)
+- What changed: John's roles: system managers can do everything (create and set up sites, install plugins and themes, all users, System settings); site managers have full control of only their assigned sites (one or more) and choose among installed plugins and themes. PLATFORM_PLAN.md §3 and T-041 updated; plugins are new, so P-001 (plugin security model) is added before any plugin system. The Oculus Sitemap whiteboard shows the same structure.
+- Decisions: D-025 (John)
+- Review: n/a
+- Gate: PASS · tests_passing 1956 (unchanged)
+- Next: T-005a remaining part (identifier types)
+
 ## 2026-11-21 07:30 CT — manual (John: "Fix the rest") — S-001a to S-006 Remaining security findings
 - Result: done (six fixes built in parallel worktrees, merged one at a time onto origin/main; gate on the result)
 - What changed: **S-001a** `publicOutput` takes `records` and refuses a kept view whose record or ancestors changed since (`record_changed`). **S-002** `templateChanges(old, new, records?)` reports every template change that would publish stored staff data or strand data, with the affected record IDs; making a field public always needs confirmation (main part of T-005a). **S-003** identifier keys decompose before mapping lookalikes (Greek/Cyrillic precomposed letters, more lookalikes), remove blanks and invisibles first, stay linear at any length; values with blank characters or more than 8 combining marks in a row are refused. **S-004** every dash-like character is read as `-` before the ambiguity checks, and a dash after "probably"/"maybe" is flagged. **S-005** near-duplicate terms: two lossless prefilters, a typed-array pair set and a faster distance; same recall, hostile 50,000-term shapes from ~3.6 s to ~2 s. **S-006** identifier types are staff only unless marked `public`; staff-type values never reach `publicView` or public output, and the view holds identifiers as `{ value }`.

@@ -42,7 +42,8 @@ Build a general collections platform that runs on the web, one that any archive,
 ## 3. Users and permissions
 
 - Logins with a password and optional two-factor, sessions and password reset.
-- Roles: admin, cataloger, reviewer and read-only, with permissions down to the collection level.
+- **System managers** can do everything: create and set up sites, install plugins and themes, manage all users and System settings. **Site managers** have full control of only the sites assigned to them (one or more) and choose among the installed plugins and themes (D-025).
+- Roles within a site: cataloger, reviewer and read-only, with permissions down to the collection level.
 - A log of every change: who, what and when.
 - Protection so two people can't silently overwrite each other's edits.
 - An optional approval step before changes are saved or published.
