@@ -2,6 +2,16 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-21 00:39 CT — build — T-003a EDTF review follow-ups
+- Result: done
+- What changed: read the LoC EDTF spec (2019-02-04) and tested every example string in it (`edtf.spec-examples.test.ts`): all parse at their level except exponential years and significant digits, left out by D-008. `2004?-06~-11` stays refused, and the error now gives the prefix form `%2004-~06-11` (the old doc comment's `?2004-~06-11` dropped the year's `~`). Free text with a trailing `?` after a range ("1920-1925?") is flagged as ambiguous instead of getting `?` on both ends. Commits b468c26, 48abbc9.
+- Decisions: D-017
+- Review: one independent review (input handling). No security, data-loss or leak problems; the prefix suggestion is correct and includes only regex-matched parts. It found that "19th century?" was wrongly flagged (a single date that reads as an interval), a hint with fixed example years, and a wrong hint for "probably 1920-1925?". All fixed, with tests.
+- Sources: https://www.loc.gov/standards/datetime/edtf.html
+- Note: local `main` was stale (origin/main had been force-updated before this run, not by this run), so the merge was pushed as a fast-forward of origin/main (`git push origin HEAD:main`).
+- Gate: PASS · tests_passing 1278 (was 1194) · npm audit clean
+- Next: T-005a Safe template changes (risky)
+
 ## 2026-11-20 23:40 CT — manual (John asked to finish Phase 1) — T-011 Phase 1 review
 - Result: done
 - What changed: `docs/reports/2026-11-phase1-review.md` checks Phase 1 against PLATFORM_PLAN.md §1–2 and the mockup. The original Phase 1 tasks (T-001 to T-010) are done and strong, but §1 isn't fully met: admins can't add record types, records don't store which template they use, identifiers can live in two places, and accessions/deeds, storage and moves, loans and condition, and links between records aren't modelled. Those became Phase 1 tasks T-012 to T-018. Phase 2 is written as run-sized tasks T-020 to T-053, starting with decision tasks (PostgreSQL version, database access and migrations, HTTP framework, passwords and sessions, admin build); only T-040, T-050 and T-051 wait on Q-1 or Q-2. Added Q-4 (roles in the mockup) and Q-5 (OCR and D-004) for John.
