@@ -362,6 +362,8 @@ describe("validateTemplate: field definitions", () => {
     expect(vocab("lcsh")).toEqual(["invalid_list"]);
     expect(vocab(["LCSH"])).toEqual(["invalid_code"]);
     expect(vocab(["lcsh", "lcsh"])).toEqual(["duplicate"]);
+    expect(vocab(["lcsh", "aat"])).toEqual(["unknown_vocabulary"]);
+    expect(vocab(["lcsh", "lcnaf", "lcgft", "nomenclature", "gnis", "local"])).toEqual([]);
     expect(fieldCodes(field({ kind: "identifier", identifierTypes: ["call number"] }))).toEqual([
       "invalid_code",
     ]);
@@ -534,13 +536,53 @@ describe("checkRecordAgainstTemplate: each kind", () => {
     expect(term("Depots")).toEqual(["not_an_object"]);
     expect(term({ vocabulary: "local" })).toEqual(["invalid_text"]);
     expect(term({ label: "Depots", vocabulary: "aat" })).toEqual(["not_allowed"]);
-    expect(term({ label: "Depots" })).toEqual(["required"]);
+    // No vocabulary is a local term, which this field allows (D-014).
+    expect(term({ label: "Depots" })).toEqual([]);
     expect(term({ label: "Depots", vocabulary: "local", uri: "id.loc.gov/x" })).toEqual([
       "invalid_url",
     ]);
     expect(term({ label: "Depots", vocabulary: "local", broader: "x" })).toEqual([
       "unknown_property",
     ]);
+  });
+
+  it("controlled_term: a term with no vocabulary needs a field that allows local terms", () => {
+    const t = template({
+      ...fullTemplate(),
+      fields: [field({ key: "genre", kind: "controlled_term", vocabularies: ["lcgft"] })],
+    });
+    const r = checkRecordAgainstTemplate(record({ genre: { label: "Postcards" } }), t);
+    expect(r.map((i) => [i.path.join("."), i.code])).toEqual([
+      ["fields.genre.vocabulary", "required"],
+    ]);
+    expect(
+      checkRecordAgainstTemplate(
+        record({ genre: { label: "Postcards", vocabulary: "local" } }),
+        t,
+      ).map((i) => i.code),
+    ).toEqual(["not_allowed"]);
+  });
+
+  it("controlled_term: the vocabulary rules run by default (D-014)", () => {
+    const term = (t: unknown, options?: TemplateCheckOptions): string[] =>
+      codes(check({ ...goodFields(), subjects: [t] }, options));
+    expect(term({ label: "Depots", vocabulary: "local", uri: "https://example.org/x" })).toEqual([
+      "local_uri",
+    ]);
+    expect(
+      term({
+        label: "Railroad stations",
+        uri: "https://id.loc.gov/authorities/subjects/sh85111042",
+        vocabulary: "lcsh",
+      }),
+    ).toEqual(["not_canonical"]);
+    // A checker given for the kind replaces the default.
+    expect(
+      term(
+        { label: "Depots", vocabulary: "local", uri: "https://example.org/x" },
+        { checkers: { controlled_term: () => [] } },
+      ),
+    ).toEqual([]);
   });
 
   it("controlled_term: any vocabulary code when the field doesn't restrict them", () => {

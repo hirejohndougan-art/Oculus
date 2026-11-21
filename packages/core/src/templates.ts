@@ -19,7 +19,10 @@
  * - `list`: one choice from the options the template lists (a pick list).
  *   Several choices is a repeatable `list` field.
  * - `controlled_term`: `{ label, uri?, vocabulary? }`, a term from a
- *   vocabulary such as LCSH, or a local term with no URI.
+ *   vocabulary such as LCSH, or a local term with no URI. A term with no
+ *   vocabulary is a local term (D-014), so it is allowed wherever `local`
+ *   is. A field's `vocabularies` may list only the codes in
+ *   `VOCABULARY_CODES` (vocabularies.ts).
  * - `identifier`: `{ type, value }`, such as an accession number.
  * - `link`: `{ url, label? }`, a web link (http or https).
  * - `rights`: `{ uri, note? }`, a rights statement or license URI. One per
@@ -35,8 +38,9 @@
  * its vocabulary (T-009), an identifier type exists and is unique (T-004), a
  * rights URI is a known statement (T-007) or a place record exists is for
  * those modules: they plug in through `TemplateCheckOptions.checkers`.
- * The ready-made ones are in `field-checkers.ts` (D-015). The rights checker
- * runs by default. The identifier checker needs the organization's
+ * The ready-made ones are in `field-checkers.ts` (D-015) and
+ * `vocabularies.ts` (D-014). The rights and controlled term checkers run by
+ * default. The identifier checker needs the organization's
  * identifier types, so the caller must pass one (`makeIdentifierChecker`):
  * without it, identifier values are refused with `unchecked`, never accepted
  * unchecked.
@@ -61,6 +65,10 @@ import {
 import { parseEdtf } from "./edtf.js";
 import { checkRightsValue } from "./field-checkers.js";
 import { RIGHTS_FIELD_KEY } from "./rights.js";
+// vocabularies.ts imports this module too. Neither reads the other's exports
+// while the modules load, only when their functions run, so the order in
+// which they load doesn't matter.
+import { VOCABULARY_CODES, controlledTermChecker } from "./vocabularies.js";
 import { isRecordId } from "./record-id.js";
 import { RECORD_KINDS, isRecordKind, type CatalogRecord, type RecordKind } from "./records.js";
 import { types } from "node:util";
@@ -410,6 +418,7 @@ function checkField(
   if (kind === "list") checkOptions(f.options, [...path, "options"], issues);
   if (kind === "controlled_term" && f.vocabularies !== undefined) {
     checkCodes(f.vocabularies, [...path, "vocabularies"], "vocabulary", issues);
+    checkVocabularyCodes(f.vocabularies, [...path, "vocabularies"], issues);
   }
   if (kind === "identifier" && f.identifierTypes !== undefined) {
     checkCodes(f.identifierTypes, [...path, "identifierTypes"], "identifier type", issues);
@@ -503,6 +512,25 @@ function checkOptions(
       seen.add(o.value);
     }
     checkLabel(o.label, [...path, i, "label"], "Each option", issues);
+  });
+}
+
+/** Codes that are well formed but not a vocabulary Oculus knows (D-014). */
+function checkVocabularyCodes(
+  value: JsonValue,
+  path: readonly (string | number)[],
+  issues: IssueList,
+): void {
+  if (!Array.isArray(value)) return;
+  const known: readonly string[] = VOCABULARY_CODES;
+  (value as readonly JsonValue[]).forEach((code, i) => {
+    if (isCode(code) && !known.includes(code)) {
+      issues.add(
+        [...path, i],
+        "unknown_vocabulary",
+        `${shown(code)} is not a vocabulary Oculus knows (${known.join(", ")}).`,
+      );
+    }
   });
 }
 
@@ -788,7 +816,7 @@ function checkOne(
   checkShape(value, field, path, issues);
   if (issues.count > before) return;
   const given = ownValue(settings.checkers, field.kind);
-  const checker = given === undefined ? DEFAULT_CHECKERS.get(field.kind) : given;
+  const checker = given === undefined ? defaultChecker(field.kind) : given;
   if (checker === undefined) {
     if (CHECKER_REQUIRED.has(field.kind)) {
       issues.add(
@@ -884,13 +912,20 @@ function checkShape(
       if (v === undefined) return;
       requiredLine(v.label, [...path, "label"], "The term", issues);
       if (v.uri !== undefined) checkUrl(v.uri, [...path, "uri"], issues);
-      if (v.vocabulary !== undefined || field.vocabularies !== undefined) {
+      if (v.vocabulary !== undefined) {
         checkAllowedCode(
           v.vocabulary,
           field.vocabularies,
           [...path, "vocabulary"],
           "vocabulary",
           issues,
+        );
+      } else if (field.vocabularies !== undefined && !field.vocabularies.includes("local")) {
+        // No vocabulary means a local term (D-014).
+        issues.add(
+          [...path, "vocabulary"],
+          "required",
+          `This field takes terms from ${field.vocabularies.join(", ")}, not local terms, so the term needs its vocabulary.`,
         );
       }
       return;
@@ -946,11 +981,16 @@ function checkShape(
   }
 }
 
-/** Checkers that run when the caller gives none for the kind (D-015). */
-const DEFAULT_CHECKERS: ReadonlyMap<FieldKind, FieldValueChecker> = new Map<
-  FieldKind,
-  FieldValueChecker
->([["rights", checkRightsValue]]);
+/**
+ * The checker that runs when the caller gives none for the kind (D-014,
+ * D-015). A function, not a table built at load time, because
+ * vocabularies.ts and this module import each other.
+ */
+function defaultChecker(kind: FieldKind): FieldValueChecker | undefined {
+  if (kind === "rights") return checkRightsValue;
+  if (kind === "controlled_term") return controlledTermChecker;
+  return undefined;
+}
 /** Kinds whose values are refused when no checker is given, because no default can exist. */
 const CHECKER_REQUIRED: ReadonlySet<FieldKind> = new Set<FieldKind>(["identifier"]);
 
