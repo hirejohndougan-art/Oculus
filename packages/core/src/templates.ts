@@ -352,18 +352,36 @@ export function legacyTemplateIssues(
       const item: unknown = slot !== undefined && "value" in slot ? slot.value : undefined;
       if (validateTemplate(item).ok) continue;
       const legacy = validateLegacyTemplate(item);
+      // Read from a safe copy, so a template invalid for other reasons still
+      // shows which of its codes the key rule refuses.
+      const copy =
+        legacy.ok || types.isProxy(item) || !isPlainObject(item)
+          ? undefined
+          : readPlainData(item, [], TEMPLATE_READ_LIMITS, new IssueList());
+      const view = legacy.ok
+        ? legacy.value
+        : copy !== undefined && isPlainObject(copy)
+          ? ownOnly(copy)
+          : undefined;
       const codes: string[] = [];
-      if (legacy.ok) {
-        for (const f of legacy.value.fields) {
-          for (const c of f.identifierTypes ?? []) {
-            if (!isIdentifierTypeKey(c) && !codes.includes(c)) codes.push(c);
+      const fieldList: unknown = view?.fields;
+      if (Array.isArray(fieldList)) {
+        for (const f of fieldList as unknown[]) {
+          if (!isPlainObject(f)) continue;
+          const listed: unknown = Object.hasOwn(f, "identifierTypes")
+            ? f.identifierTypes
+            : undefined;
+          if (!Array.isArray(listed)) continue;
+          for (const c of listed as unknown[]) {
+            if (isCode(c) && !isIdentifierTypeKey(c) && !codes.includes(c)) codes.push(c);
           }
         }
       }
+      const key: unknown = view?.key;
       out.push(
         Object.freeze({
           index: i,
-          ...(legacy.ok ? { key: legacy.value.key } : {}),
+          ...(isCode(key) ? { key } : {}),
           fixable: legacy.ok,
           identifierTypes: Object.freeze(codes),
         }),

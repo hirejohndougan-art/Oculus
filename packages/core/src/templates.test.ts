@@ -393,7 +393,13 @@ describe("validateTemplate: field definitions", () => {
     const r = legacyTemplateIssues([fullTemplate(), { ...legacy, fields }, { key: "x" }]);
     expect(r.ok && r.value).toEqual([
       { index: 1, key: "sample-photo", fixable: true, identifierTypes: ["call-number"] },
-      { index: 2, fixable: false, identifierTypes: [] },
+      { index: 2, key: "x", fixable: false, identifierTypes: [] },
+    ]);
+    // Invalid for other reasons too: still lists the codes to fix.
+    const broken = { ...legacy, label: "", fields };
+    const b = legacyTemplateIssues([broken]);
+    expect(b.ok && b.value).toEqual([
+      { index: 0, key: "sample-photo", fixable: false, identifierTypes: ["call-number"] },
     ]);
     expect(legacyTemplateIssues("x").ok).toBe(false);
     expect(legacyTemplateIssues(new Proxy([], {})).ok).toBe(false);

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   MAX_LISTED_RECORDS,
   identifierTypeChanges,
+  identifierTypeCreation,
   identifierTypeDeletion,
   newRecordId,
   type IdentifierType,
@@ -383,6 +384,57 @@ describe("identifierTypeChanges", () => {
       ),
     );
     expect(summary(p)).toEqual([["auto_number_changed", false, []]]);
+  });
+
+  it("without stored data, a public new type always reports made_public", () => {
+    const pub = { ...BOX, public: true };
+    const r = ok(identifierTypeChanges(pub, { ...pub, label: "Boxes" }));
+    expect(summary(r)).toEqual([["made_public", true, []]]);
+    expect(r.changes[0]?.message).toContain("wasn't checked against the stored type");
+  });
+
+  it("after a rename, checks reissues against the numbers the new key holds", () => {
+    const acc = without(ACCESSION, "pattern");
+    const renamed = {
+      ...acc,
+      key: "acc",
+      autoNumber: { style: "prefix", prefix: "DHS-", digits: 5 },
+    };
+    const r = ok(
+      identifierTypeChanges(
+        acc,
+        renamed,
+        use(
+          [
+            set(A, [{ type: "accession", value: "DHS-0007" }]),
+            set(B, [{ type: "acc", value: "DHS-0002" }]),
+          ],
+          [],
+          [acc],
+        ),
+      ),
+    );
+    // nextIdentifier will count only acc's DHS-0002, then reach 7 again.
+    expect(r.changes.find((c) => c.code === "auto_number_changed")?.recordIds).toEqual([A]);
+  });
+
+  it("creating a type with numbering checks adopted values for reissue", () => {
+    const created: IdentifierType = {
+      key: "acc",
+      label: "Acc",
+      uniqueness: "none",
+      autoNumber: { style: "prefix", prefix: "DHS", digits: 4 },
+    };
+    const r = ok(
+      identifierTypeCreation(
+        created,
+        use([set(A, [{ type: "acc", value: "DHS-0009" }])], [], [BOX]),
+      ),
+    );
+    expect(summary(r)).toEqual([
+      ["key_adopts_values", true, [A]],
+      ["auto_number_changed", true, [A]],
+    ]);
   });
 
   it("making a type staff lists records holding it in public template fields", () => {

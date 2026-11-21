@@ -233,7 +233,13 @@ export function identifierTypeCreation(
       if (!u.ok) return u;
       use = u.value;
     }
-    return done(adoption(t, [], use), use);
+    const changes = adoption(t, [], use);
+    if (use !== undefined && t.autoNumber !== undefined) {
+      // Adopted left-overs are counted by nextIdentifier only in exactly its form.
+      const held = reissued(use, t.key, t.autoNumber, t.pattern);
+      if (held.count > 0) changes.push(change("auto_number_changed", t.key, held, true));
+    }
+    return done(changes, use);
   });
 }
 
@@ -326,6 +332,10 @@ function compare(
   const changes: IdentifierTypeChange[] = [];
   const unchecked = use === undefined;
 
+  // Without stored data the old type isn't checked either: it may claim to be
+  // public already when the stored one is staff.
+  const madePublic = now.public === true && (was.public !== true || unchecked);
+
   // `constructor` and `prototype` were allowed before D-0XX: a stored type
   // keeps working, but can't be created, and an edit must rename it.
   if (!isIdentifierTypeKey(now.key)) {
@@ -344,17 +354,25 @@ function compare(
     );
     // Values left under the new key by a deleted type become this type's.
     // A type made public here reports the adopted values in its own made_public.
-    changes.push(...adoption(now, [key], use, was.public === true));
+    changes.push(...adoption(now, [key], use, !madePublic));
     const refs = use === undefined ? undefined : referencing(use, key);
     if (refs !== undefined) changes.push(refs);
   }
-  if (was.public !== true && now.public === true) {
+  if (madePublic) {
     let held: Held | undefined;
     if (use !== undefined) {
       held = holders(use, key);
       if (now.key !== key) for (const id of holders(use, now.key).all()) held.add(id);
     }
-    changes.push(change("made_public", key, held, true));
+    changes.push(
+      change(
+        "made_public",
+        key,
+        held,
+        true,
+        unchecked && was.public === true ? { text: "unverified" } : {},
+      ),
+    );
   }
   if (now.pattern !== undefined && now.pattern !== was.pattern) {
     const held = use === undefined ? undefined : misfits(use, key, now.pattern);
@@ -373,7 +391,12 @@ function compare(
         }),
       );
     } else {
-      const held = use === undefined ? undefined : reissued(use, key, now.autoNumber, now.pattern);
+      // After a rename nextIdentifier counts the new key's values (adopted
+      // left-overs), not the old key's.
+      const held =
+        use === undefined
+          ? undefined
+          : reissued(use, now.key, now.autoNumber, now.pattern, now.key === key ? [] : [key]);
       changes.push(change("auto_number_changed", key, held, unchecked || (held?.count ?? 0) > 0));
     }
   }
@@ -758,7 +781,20 @@ const NOT_LETTER_OR_DIGIT = /[^\p{L}\p{N}]/gu;
  * will be given out again in the new form; its key differs, so the
  * uniqueness check won't catch it.
  */
-function reissued(use: Use, key: string, auto: AutoNumbering, source: string | undefined): Held {
+/**
+ * `key` is the key the type has after the change, whose values
+ * `nextIdentifier` will count; `alsoKeys` are keys whose values it keeps
+ * but `nextIdentifier` won't count (the old key of a renamed type), so
+ * every one of them is a candidate, even of exactly the new form.
+ */
+function reissued(
+  use: Use,
+  key: string,
+  auto: AutoNumbering,
+  source: string | undefined,
+  alsoKeys: readonly string[] = [],
+): Held {
+  const uncounted = new Set(alsoKeys);
   let pattern: IdentifierPattern | undefined;
   if (source !== undefined) {
     const parsed = parseIdentifierPattern(source);
@@ -826,6 +862,12 @@ function reissued(use: Use, key: string, auto: AutoNumbering, source: string | u
   const others: { id: RecordId; head: string; n: number }[] = [];
   for (const set of use.identifiers) {
     for (const item of [...set.current, ...set.former]) {
+      if (uncounted.has(item.type)) {
+        const l = exact(item.value) ?? loose(item.value);
+        if (l !== undefined && l.n >= 1 && l.n <= MAX_AUTO_NUMBER)
+          others.push({ id: set.recordId, ...l });
+        continue;
+      }
       if (item.type !== key) continue;
       const e = exact(item.value);
       if (e !== undefined) {
@@ -841,7 +883,7 @@ function reissued(use: Use, key: string, auto: AutoNumbering, source: string | u
   // of them, even of exactly the new form, can be given out again.
   for (const record of use.records) {
     for (const item of fieldIdentifiers(record)) {
-      if (item.type !== key) continue;
+      if (item.type !== key && !uncounted.has(item.type)) continue;
       const l = exact(item.value) ?? loose(item.value);
       if (l !== undefined && l.n >= 1 && l.n <= MAX_AUTO_NUMBER)
         others.push({ id: record.id, ...l });
@@ -947,6 +989,9 @@ function message(
         return count === undefined
           ? `The new public type ${key} may take over staff-only values left under its key. Records weren't checked, so saving could publish them. Confirm first.`
           : `The public type ${key} takes over values left under its key by a deleted type, which were staff only; ${agree(count, "hold them")}. Saving publishes them. Confirm first.`;
+      }
+      if (detail.text === "unverified") {
+        return `The identifier type ${key} is public. It wasn't checked against the stored type or records, so it may have been staff, and saving could publish every value stored while it was. Confirm first.`;
       }
       return `The identifier type ${key} changes from staff to public, which publishes every value of it in public fields. ${
         count === undefined
