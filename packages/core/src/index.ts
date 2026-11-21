@@ -60,3 +60,49 @@ export type { CalendarDay, EdtfDate, EdtfKind, EdtfLevel } from "./edtf.js";
 
 export { MAX_DATE_TEXT_LENGTH, edtfFromText } from "./edtf-text.js";
 export type { EdtfFromText, EdtfFromTextOptions } from "./edtf-text.js";
+
+export {
+  MAX_PATTERN_LENGTH,
+  MAX_PATTERN_SLOTS,
+  MAX_PATTERN_REPEAT,
+  PATTERN_HELP,
+  parseIdentifierPattern,
+  matchesIdentifierPattern,
+} from "./identifier-pattern.js";
+export type { IdentifierPattern } from "./identifier-pattern.js";
+export { identifierKey } from "./identifier-key.js";
+export {
+  UNIQUENESS_RULES,
+  YEAR_SEPARATORS,
+  MAX_IDENTIFIER_LENGTH,
+  MAX_IDENTIFIER_TYPES,
+  MAX_TYPE_LABEL_LENGTH,
+  MAX_PREFIX_LENGTH,
+  MAX_AUTO_DIGITS,
+  MAX_AUTO_NUMBER,
+  MAX_CURRENT_IDENTIFIERS,
+  MAX_FORMER_IDENTIFIERS,
+  MAX_FORMER_NOTE_LENGTH,
+  MAX_QUERY_LENGTH,
+  validateIdentifierType,
+  validateIdentifierTypes,
+  validateRecordIdentifiers,
+  primaryIdentifier,
+  uniquenessIssues,
+  findIdentifierConflicts,
+  checkNewIdentifier,
+  findByIdentifier,
+  nextIdentifier,
+  retireIdentifier,
+  droppedIdentifiers,
+} from "./identifiers.js";
+export type {
+  UniquenessRule,
+  YearSeparator,
+  AutoNumbering,
+  IdentifierType,
+  Identifier,
+  FormerIdentifier,
+  RecordIdentifiers,
+  IdentifierMatch,
+} from "./identifiers.js";
