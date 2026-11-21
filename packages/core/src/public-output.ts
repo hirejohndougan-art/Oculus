@@ -100,6 +100,7 @@ import {
   MAX_REPEATS,
   MAX_URL_LENGTH,
   checkRecordAgainstTemplate,
+  validateTemplate,
   type FieldDefinition,
   type FieldTemplate,
   type TemplateCheckOptions,
@@ -134,6 +135,11 @@ export interface PublishOptions {
    * (`makeIdentifierChecker`).
    */
   readonly checkers?: TemplateCheckOptions["checkers"];
+  /**
+   * The record's template as it is now. When given, output is refused if it
+   * differs from the template the view was built with (`template_changed`).
+   */
+  readonly currentTemplate?: unknown;
 }
 
 /** Dublin Core as term → values, in order (see the module header). */
@@ -273,15 +279,39 @@ interface OutValue {
   readonly text: string;
   readonly iri: string | undefined;
   readonly labelled: boolean;
+  /** A DCMI Type Vocabulary name (`StillImage`), for a list choice whose code is one. */
+  readonly dcmiType: string | undefined;
 }
 
-function outValue(text: string, iri?: string, labelled = false): OutValue {
-  const value = Object.create(null) as { text: string; iri: string | undefined; labelled: boolean };
+function outValue(text: string, iri?: string, labelled = false, dcmiType?: string): OutValue {
+  const value = Object.create(null) as {
+    text: string;
+    iri: string | undefined;
+    labelled: boolean;
+    dcmiType: string | undefined;
+  };
   value.text = text;
   value.iri = iri;
   value.labelled = labelled;
+  value.dcmiType = dcmiType;
   return Object.freeze(value);
 }
+
+/** The DCMI Type Vocabulary's classes, as the digital asset preset's type codes use them. */
+const DCMI_TYPE_NAMES: ReadonlySet<string> = new Set([
+  "Collection",
+  "Dataset",
+  "Event",
+  "Image",
+  "InteractiveResource",
+  "MovingImage",
+  "PhysicalObject",
+  "Service",
+  "Software",
+  "Sound",
+  "StillImage",
+  "Text",
+]);
 
 interface Budget {
   chars: number;
@@ -293,6 +323,17 @@ interface Budget {
  * Dublin Core mapping for the template that record uses, and `options` the
  * base URL, the published record IDs and any checkers. Fails, with the
  * issues found, when anything is off. Never throws.
+ *
+ * **Build the view fresh at publish time.** A view records the template it
+ * was made with; a view kept from earlier publishes under that template's
+ * visibility and fields, even if the template has changed since. Pass the
+ * record's template as it is now in `currentTemplate` to have a changed one
+ * refused (`template_changed`).
+ *
+ * **"Passes the template check" means the configured check.** Checkers given
+ * in `checkers` replace the defaults for their kinds (as
+ * `checkRecordAgainstTemplate` does), so a caller that passes a lax checker
+ * for, say, `controlled_term` publishes what that checker accepts.
  */
 export function publicOutput(
   view: PublicRecord,
@@ -322,7 +363,7 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
       "This is not a public view from publicView, so it can't be published.",
     );
   }
-  const { baseUrl, published, checkers } = readOptions(options);
+  const { baseUrl, published, checkers, currentTemplate } = readOptions(options);
   if (!published.has(view.id)) {
     fail([], "not_published", "This record is not in the published list, so it can't be output.");
   }
@@ -331,6 +372,7 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
   const blocked = effectivePublishIssues(effective);
   if (blocked.length > 0) throw new OutputError(blocked);
   const template = origin.template;
+  if (currentTemplate !== undefined) sameTemplate(currentTemplate, template);
   const checked = validateDublinCoreMapping(mapping, template);
   if (!checked.ok) throw new OutputError(checked.issues);
   if (
@@ -369,11 +411,10 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
     else list.push(...values);
   }
 
-  const type = typeFor(view.kind, origin);
-  const dublinCore = dublinCoreValues(terms, recordUrl, type);
-  const jsonLd = jsonLdDocument(recordUrl, type, terms);
-  const jsonLdText = scriptSafeJson(jsonLd);
-  capped(jsonLdText.length, "jsonLdText");
+  const types = typesFor(view.kind, origin, terms.get("type") ?? []);
+  const dublinCore = dublinCoreValues(terms, recordUrl, types);
+  const jsonLd = jsonLdDocument(recordUrl, types, terms);
+  const jsonLdText = writeJson(jsonLd);
   return Object.freeze({
     id: recordUrl,
     dublinCore,
@@ -381,6 +422,43 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
     jsonLdText,
     oaiDcXml: oaiDc(dublinCore),
   });
+}
+
+/**
+ * Refuse when the record's template today is not the one the view was built
+ * with: a view kept from earlier would publish under the old visibility and
+ * fields. Compared as validated data, with object keys in sorted order.
+ */
+function sameTemplate(current: unknown, captured: FieldTemplate): void {
+  const checked = validateTemplate(current);
+  if (!checked.ok) {
+    fail(
+      ["currentTemplate"],
+      "invalid_template",
+      "currentTemplate is not a valid template. Check it with validateTemplate.",
+    );
+  }
+  if (canonicalJson(checked.value) !== canonicalJson(captured)) {
+    fail(
+      ["currentTemplate"],
+      "template_changed",
+      "The record's template has changed since this public view was made. Make the view again with effectiveRecord and publicView, and publish that.",
+    );
+  }
+}
+
+/** Plain data as JSON text with object keys sorted, for comparing. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${(value as readonly unknown[]).map(canonicalJson).join(",")}]`;
+  }
+  if (typeof value === "object" && value !== null) {
+    const obj = value as Readonly<Record<string, unknown>>;
+    const keys = Object.keys(obj).sort();
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`).join(",")}}`;
+  }
+  // Validated templates hold only text, numbers, true/false and null here.
+  return JSON.stringify(value);
 }
 
 /**
@@ -407,6 +485,23 @@ function templateCheck(
   if (problems.length > 0) throw new OutputError(problems);
 }
 
+/**
+ * The record's classes, as compact IRIs: the kind's class, or, for a kind
+ * that has none (digital assets, archival items), the DCMI types named by
+ * list choices mapped to `type` (the digital asset preset's `resource_type`).
+ */
+function typesFor(
+  kind: RecordKind,
+  origin: object,
+  typeValues: readonly OutValue[],
+): readonly string[] {
+  const own = typeFor(kind, origin);
+  if (own !== undefined) return [own];
+  const found = new Set<string>();
+  for (const v of typeValues) if (v.dcmiType !== undefined) found.add(`dcmitype:${v.dcmiType}`);
+  return [...found];
+}
+
 /** The kind's class, as a compact IRI (`dcmitype:Collection`), or undefined. */
 function typeFor(kind: RecordKind, origin: object): string | undefined {
   if (kind === "archival_unit") {
@@ -431,12 +526,18 @@ function capped(length: number, form: string): void {
 // ---------------------------------------------------------------------------
 // Options.
 
-const OPTION_KEYS: ReadonlySet<string> = new Set(["baseUrl", "published", "checkers"]);
+const OPTION_KEYS: ReadonlySet<string> = new Set([
+  "baseUrl",
+  "published",
+  "checkers",
+  "currentTemplate",
+]);
 
 interface ReadOptions {
   readonly baseUrl: string;
   readonly published: ReadonlySet<RecordId>;
   readonly checkers: unknown;
+  readonly currentTemplate: unknown;
 }
 
 function readOptions(options: unknown): ReadOptions {
@@ -451,7 +552,8 @@ function readOptions(options: unknown): ReadOptions {
   const baseUrl = checkBaseUrl(dataProp(options, "baseUrl"));
   const published = readPublished(dataProp(options, "published"));
   const checkers = dataProp(options, "checkers");
-  return { baseUrl, published, checkers };
+  const currentTemplate = dataProp(options, "currentTemplate");
+  return { baseUrl, published, checkers, currentTemplate };
 }
 
 /** An own data property, or undefined. A getter, hidden property or Proxy value fails. */
@@ -475,8 +577,8 @@ function checkBaseUrl(value: unknown): string {
   if (value.length > MAX_BASE_URL_LENGTH) {
     return bad(`can be at most ${String(MAX_BASE_URL_LENGTH)} characters`);
   }
-  if (!PRINTABLE_ASCII.test(value) || value.includes("\\")) {
-    return bad("can't hold spaces, backslashes, control or non-ASCII characters");
+  if (!PRINTABLE_ASCII.test(value) || NOT_IN_IRI.test(value) || BAD_PERCENT.test(value)) {
+    return bad("can't hold spaces, <>\"{}|\\^`, a bad % escape, control or non-ASCII characters");
   }
   if (value.includes("?") || value.includes("#")) return bad("can't have a query or fragment");
   let url: URL;
@@ -488,6 +590,7 @@ function checkBaseUrl(value: unknown): string {
   if (url.protocol !== "https:" && url.protocol !== "http:") return bad("must be http or https");
   if (url.username !== "" || url.password !== "") return bad("can't hold a user name or password");
   if (url.href !== value) return bad(`must be written as ${shown(url.href)}`);
+  if (!bracketsOnlyInHost(value, url)) return bad("can only use [ and ] around an IPv6 host");
   if (!url.pathname.endsWith("/")) return bad("must end with /");
   return value;
 }
@@ -572,7 +675,7 @@ function valueOf(
       const code = nonBlank(value, invalid);
       const option = (def.options ?? []).find((o) => o.value === code);
       if (option === undefined) return invalid();
-      return outValue(option.label);
+      return outValue(option.label, undefined, false, DCMI_TYPE_NAMES.has(code) ? code : undefined);
     }
     case "controlled_term": {
       const term = props(value, TERM_KEYS, invalid);
@@ -661,7 +764,8 @@ function optionalIri(value: unknown, invalid: () => never): string | undefined {
     typeof value !== "string" ||
     value.length > MAX_URL_LENGTH ||
     !PRINTABLE_ASCII.test(value) ||
-    value.includes("\\")
+    NOT_IN_IRI.test(value) ||
+    BAD_PERCENT.test(value)
   ) {
     return invalid();
   }
@@ -673,8 +777,25 @@ function optionalIri(value: unknown, invalid: () => never): string | undefined {
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") return invalid();
   if (url.username !== "" || url.password !== "") return invalid();
-  if (url.href !== value) return invalid();
+  if (url.href !== value || !bracketsOnlyInHost(value, url)) return invalid();
   return value;
+}
+
+/**
+ * Characters RFC 3987 IRIs (and N-Triples) don't allow that a URL parser
+ * leaves as they are. `[` and `]` are checked by `bracketsOnlyInHost`.
+ */
+const NOT_IN_IRI = /[<>"{}|\\^`\s]/;
+/** A `%` not followed by two hex digits. */
+const BAD_PERCENT = /%(?![0-9A-Fa-f]{2})/;
+
+/** True when `[` and `]` appear only around an IPv6 host, right after `scheme://`. */
+function bracketsOnlyInHost(value: string, url: URL): boolean {
+  if (!/[[\]]/.test(value)) return true;
+  const start = url.protocol.length + 2;
+  if (!url.hostname.startsWith("[") || value[start] !== "[") return false;
+  const end = value.indexOf("]", start);
+  return end > start && !/[[\]]/.test(value.slice(start + 1, end) + value.slice(end + 1));
 }
 
 /**
@@ -703,7 +824,7 @@ function safeText(text: string, path: readonly (string | number)[], budget: Budg
 function dublinCoreValues(
   terms: ReadonlyMap<DublinCoreTerm, readonly OutValue[]>,
   recordUrl: string,
-  type: string | undefined,
+  types: readonly string[],
 ): DublinCoreValues {
   const lists = new Map<DublinCoreTerm, string[]>();
   const add = (term: DublinCoreTerm, text: string): void => {
@@ -714,8 +835,10 @@ function dublinCoreValues(
   for (const v of terms.get("title") ?? []) add("title", v.text);
   add("identifier", recordUrl);
   // The DCMI Type Vocabulary types only; Agent and Location are classes, not types.
-  if (type?.startsWith("dcmitype:") === true) {
-    add("type", DCMITYPE_NAMESPACE + type.slice("dcmitype:".length));
+  for (const type of types) {
+    if (type.startsWith("dcmitype:")) {
+      add("type", DCMITYPE_NAMESPACE + type.slice("dcmitype:".length));
+    }
   }
   let chars = 0;
   for (const [term, values] of terms) {
@@ -724,28 +847,38 @@ function dublinCoreValues(
   }
   for (const list of lists.values()) for (const text of list) chars += text.length;
   capped(chars, "dublinCore");
-  const values: DublinCoreValues = Object.freeze(
-    Object.fromEntries([...lists].map(([term, list]) => [term, Object.freeze(list)])),
-  );
-  return values;
+  return nullObject([...lists].map(([term, list]) => [term, Object.freeze(list)]));
 }
 
-const CONTEXT: Readonly<Record<string, JsonValue>> = Object.freeze({
-  dcterms: DCTERMS_NAMESPACE,
-  dcmitype: DCMITYPE_NAMESPACE,
-  rdfs: RDFS_NAMESPACE,
-});
+/**
+ * A frozen object with a null prototype holding exactly these own
+ * properties, so nothing on Object.prototype (a `toJSON`, an extra key) can
+ * change what it says or how it is written.
+ */
+function nullObject<T>(pairs: readonly (readonly [string, T])[]): Readonly<Record<string, T>> {
+  const obj = Object.create(null) as Record<string, T>;
+  for (const [key, value] of pairs) obj[key] = value;
+  return Object.freeze(obj);
+}
+
+const CONTEXT: Readonly<Record<string, JsonValue>> = nullObject<JsonValue>([
+  ["dcterms", DCTERMS_NAMESPACE],
+  ["dcmitype", DCMITYPE_NAMESPACE],
+  ["rdfs", RDFS_NAMESPACE],
+]);
 
 function jsonLdDocument(
   id: string,
-  type: string | undefined,
+  types: readonly string[],
   terms: ReadonlyMap<DublinCoreTerm, readonly OutValue[]>,
 ): Readonly<Record<string, JsonValue>> {
   const pairs: [string, JsonValue][] = [
     ["@context", CONTEXT],
     ["@id", id],
   ];
-  if (type !== undefined) pairs.push(["@type", type]);
+  const [onlyType] = types;
+  if (types.length === 1 && onlyType !== undefined) pairs.push(["@type", onlyType]);
+  else if (types.length > 1) pairs.push(["@type", Object.freeze([...types])]);
   for (const [term, values] of terms) {
     const range = RANGE.get(term) ?? "literal";
     const items = values.map((v) => jsonLdValue(term, range, v));
@@ -755,8 +888,8 @@ function jsonLdDocument(
       items.length === 1 && only !== undefined ? only : Object.freeze(items),
     ]);
   }
-  // Object.fromEntries defines own properties; every key is fixed above.
-  return Object.freeze(Object.fromEntries(pairs));
+  // Every key is fixed above.
+  return nullObject(pairs);
 }
 
 function jsonLdValue(term: DublinCoreTerm, range: Range, value: OutValue): JsonValue {
@@ -764,14 +897,65 @@ function jsonLdValue(term: DublinCoreTerm, range: Range, value: OutValue): JsonV
   // A vocabulary concept or a web page is not a class, so `type` never takes an IRI here.
   const iri = term === "type" ? undefined : value.iri;
   if (iri === undefined) {
-    return range === "class" ? Object.freeze({ "rdfs:label": value.text }) : value.text;
+    return range === "class" ? nullObject([["rdfs:label", value.text]]) : value.text;
   }
-  return Object.freeze(value.labelled ? { "@id": iri, "rdfs:label": value.text } : { "@id": iri });
+  return nullObject(
+    value.labelled
+      ? [
+          ["@id", iri],
+          ["rdfs:label", value.text],
+        ]
+      : [["@id", iri]],
+  );
 }
 
-/** JSON text with `<`, `>`, `&`, U+2028 and U+2029 escaped: the same value, safe in a script element. */
-function scriptSafeJson(value: JsonValue): string {
-  return JSON.stringify(value).replace(
+/**
+ * `jsonLd` as JSON text, written here rather than by JSON.stringify so that
+ * nothing on Object.prototype (a `toJSON`) can change it, and counted as it
+ * is written so text over MAX_OUTPUT_CHARS is never built. `<`, `>`, `&`,
+ * U+2028 and U+2029 are escaped: the same value, safe in a script element.
+ */
+function writeJson(value: JsonValue): string {
+  const parts: string[] = [];
+  let length = 0;
+  const push = (text: string): void => {
+    length += text.length;
+    capped(length, "jsonLdText");
+    parts.push(text);
+  };
+  const walk = (v: JsonValue): void => {
+    if (typeof v === "string") {
+      push(scriptSafe(JSON.stringify(v)));
+    } else if (Array.isArray(v)) {
+      push("[");
+      (v as readonly JsonValue[]).forEach((item, i) => {
+        if (i > 0) push(",");
+        walk(item);
+      });
+      push("]");
+    } else if (typeof v === "object" && v !== null) {
+      const obj = v as Readonly<Record<string, JsonValue>>;
+      push("{");
+      Object.keys(obj).forEach((key, i) => {
+        const inner = obj[key];
+        if (inner === undefined) return;
+        if (i > 0) push(",");
+        push(scriptSafe(JSON.stringify(key)));
+        push(":");
+        walk(inner);
+      });
+      push("}");
+    } else {
+      // Only text, lists and objects are ever built here.
+      fail([], "unreadable", "The JSON-LD could not be written.");
+    }
+  };
+  walk(value);
+  return parts.join("");
+}
+
+function scriptSafe(json: string): string {
+  return json.replace(
     /[<>&\u2028\u2029]/g,
     (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`,
   );

@@ -440,6 +440,31 @@ describe("prototype pollution", () => {
     delete proto.level;
   });
 
+  it("can't change the JSON text through Object.prototype.toJSON", () => {
+    const item = record("object", "I", { rights: { uri: CNE }, creator: "someone" });
+    const view = viewOf([item], item.id);
+    // One entry: dublin-core.ts compares entries with JSON.stringify, so a
+    // polluted toJSON makes it refuse longer mappings (it fails closed).
+    const mapping = { template: "out", entries: [RIGHTS_ENTRY] };
+    const clean = ok(out(view, mapping));
+    const proto = Object.prototype as Record<string, unknown>;
+    proto.toJSON = () => "evil";
+    let result: ReturnType<typeof out>;
+    try {
+      result = out(view, mapping);
+    } finally {
+      // Removed before anything else serializes (the test runner does too).
+      delete proto.toJSON;
+    }
+    const polluted = ok(result);
+    expect(polluted.jsonLdText).toBe(clean.jsonLdText);
+    expect(polluted.jsonLdText).not.toContain("evil");
+    expect(Object.getPrototypeOf(polluted.jsonLd)).toBeNull();
+    expect(Object.getPrototypeOf(polluted.jsonLd["@context"])).toBeNull();
+    expect(Object.getPrototypeOf(polluted.jsonLd["dcterms:rights"])).toBeNull();
+    expect(Object.getPrototypeOf(polluted.dublinCore)).toBeNull();
+  });
+
   it("can't add an IRI, label or type to output values through Object.prototype", () => {
     const item = record("object", "I", {
       rights: { uri: CNE },

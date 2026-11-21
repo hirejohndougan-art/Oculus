@@ -61,7 +61,7 @@
  * check (`rightsPublishIssues`) run on that public view, and also refuses
  * rights that are staff-only here. Nothing here throws.
  */
-import { issue, type Issue, type Validated } from "./issues.js";
+import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import { RIGHTS_FIELD_KEY, rightsPublishIssues } from "./rights.js";
 import { markEffective, markPublicView } from "./effective-brand.js";
 import { shown } from "./plain-data.js";
@@ -557,7 +557,14 @@ function compose(
   });
   const shownEntries = entries
     .filter((e) => e.visibility === "public" && e.inTemplate)
-    .map((e) => Object.freeze({ key: e.key, label: e.label, value: e.value, own: e.own }));
+    .map((e) =>
+      Object.freeze({
+        key: e.key,
+        label: e.label,
+        value: e.key === RIGHTS_FIELD_KEY ? withoutRightsNote(e.value) : e.value,
+        own: e.own,
+      }),
+    );
   markEffective(effective);
   const view: PublicRecord = Object.freeze({
     id: target.id,
@@ -574,6 +581,18 @@ function compose(
     ...(target.kind === "archival_unit" ? { level: target.level } : {}),
   });
   return effective;
+}
+
+/**
+ * A rights value without its `note`: rights notes are kept staff-side and
+ * never published (D-016), so the public view doesn't hold them. Anything
+ * that isn't a plain rights object is left as it is, for the publish check
+ * to refuse.
+ */
+function withoutRightsNote(value: FieldValue): FieldValue {
+  if (!isPlainObject(value) || !Object.hasOwn(value, "note")) return value;
+  // Object.fromEntries defines own properties, so no key can reach a prototype.
+  return Object.freeze(Object.fromEntries(Object.entries(value).filter(([key]) => key !== "note")));
 }
 
 /** The public view of each effective record made here, made at the same time. */

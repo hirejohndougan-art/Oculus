@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  DIGITAL_ASSET_DUBLIN_CORE,
+  DIGITAL_ASSET_PRESET,
   DCTERMS_NAMESPACE,
   DCMITYPE_NAMESPACE,
   OAI_DC_NAMESPACE,
@@ -706,5 +708,159 @@ describe("publicOutput: URIs must be canonical", () => {
       const result = out(viewOf([item], item.id));
       expect(result.ok, JSON.stringify(fields)).toBe(false);
     }
+  });
+});
+
+describe("publicOutput: IRIs RFC 3987 allows", () => {
+  it("refuses characters a URL parser leaves but IRIs forbid, and bad % escapes", () => {
+    for (const url of [
+      "https://example.org/a|b",
+      "https://example.org/a^b",
+      "https://example.org/[x]",
+      "https://example.org/a]",
+      "https://example.org/?q={x}",
+      "https://example.org/#a`b",
+      "https://example.org/%zz",
+      "https://example.org/%4",
+      "https://example.org/a%",
+    ]) {
+      const item = record("object", "I", { rights: { uri: CNE }, website: { url } });
+      expect(out(viewOf([item], item.id)).ok, url).toBe(false);
+      const place = record("object", "I", {
+        rights: { uri: CNE },
+        places: [{ label: "x", uri: url }],
+      });
+      expect(out(viewOf([place], place.id)).ok, url).toBe(false);
+    }
+  });
+
+  it("accepts an IPv6 host and good % escapes", () => {
+    for (const url of [
+      "http://[::1]/x",
+      "https://example.org/a%20b",
+      "https://example.org/%E2%82%AC",
+    ]) {
+      const item = record("object", "I", { rights: { uri: CNE }, website: { url } });
+      expect(ok(out(viewOf([item], item.id))).dublinCore.relation).toEqual([url]);
+    }
+  });
+
+  it("applies the same rules to the base URL", () => {
+    const item = record("object", "I", { rights: { uri: CNE } });
+    const view = viewOf([item], item.id);
+    for (const baseUrl of [
+      "https://example.org/a|b/",
+      "https://example.org/a^b/",
+      "https://example.org/[x]/",
+      "https://example.org/%zz/",
+    ]) {
+      expect(
+        codes(publicOutput(view, MAPPING, { baseUrl, published: [view.id] })),
+        baseUrl,
+      ).toEqual(["invalid_base_url"]);
+    }
+    expect(
+      ok(publicOutput(view, MAPPING, { baseUrl: "http://[::1]/items/", published: [view.id] })).id,
+    ).toBe(`http://[::1]/items/${view.id}`);
+  });
+});
+
+describe("publicView: rights notes", () => {
+  it("leaves the rights note out of the public view, and so out of every public page", () => {
+    const item = record("object", "I", { rights: { uri: CNE, note: "Call the donor at home" } });
+    const effective = effectiveOf([item], item.id);
+    expect(effective.fields.rights).toEqual({ uri: CNE, note: "Call the donor at home" });
+    const view = viewOf([item], item.id);
+    expect(view.fields.rights).toEqual({ uri: CNE });
+    expect(view.entries.find((e) => e.key === "rights")?.value).toEqual({ uri: CNE });
+    expect(Object.isFrozen(view.fields.rights)).toBe(true);
+    expect(JSON.stringify(view)).not.toContain("donor");
+  });
+});
+
+describe("publicOutput: currentTemplate", () => {
+  const item = record("object", "I", { rights: { uri: CNE }, donor_note: "SECRET" });
+  const view = viewOf([item], item.id);
+  const run = (currentTemplate: unknown) =>
+    publicOutput(view, MAPPING, { baseUrl: BASE, published: [view.id], currentTemplate });
+
+  it("publishes when the template is unchanged, even as a fresh copy in another key order", () => {
+    const copy = JSON.parse(JSON.stringify(TPL)) as Record<string, unknown>;
+    const reordered = Object.fromEntries(Object.entries(copy).reverse());
+    expect(run(copy).ok).toBe(true);
+    expect(run(reordered).ok).toBe(true);
+  });
+
+  it("refuses when the template changed since the view was made", () => {
+    const changed = template(
+      TPL.fields.map((f) => (f.key === "donor_note" ? { ...f, visibility: "public" as const } : f)),
+    );
+    expect(codes(run(changed))).toEqual(["template_changed"]);
+    expect(codes(run(template(TPL.fields.slice(1))))).toEqual(["template_changed"]);
+  });
+
+  it("refuses an invalid current template", () => {
+    expect(codes(run({ key: "out" }))).toEqual(["invalid_template"]);
+    expect(codes(run(new Proxy(TPL, {})))).toEqual(["invalid_options"]);
+  });
+});
+
+describe("publicOutput: digital assets and DCMI types", () => {
+  it("types a digital asset from the preset's resource type, as @type and dc:type", () => {
+    const asset = record("digital_asset", "Station postcard scan", {
+      rights: { uri: CNE },
+      resource_type: "StillImage",
+    });
+    const view = viewOf([asset], asset.id, DIGITAL_ASSET_PRESET);
+    const o = ok(
+      publicOutput(view, DIGITAL_ASSET_DUBLIN_CORE, {
+        baseUrl: BASE,
+        published: [view.id],
+        checkers: CHECKERS,
+      }),
+    );
+    expect(o.jsonLd["@type"]).toBe("dcmitype:StillImage");
+    expect(o.jsonLd["dcterms:type"]).toEqual({ "rdfs:label": "Still image" });
+    expect(o.dublinCore.type).toEqual(["http://purl.org/dc/dcmitype/StillImage", "Still image"]);
+    expect(o.oaiDcXml).toContain("<dc:type>http://purl.org/dc/dcmitype/StillImage</dc:type>");
+    expect(o.oaiDcXml).toContain("<dc:type>Still image</dc:type>");
+  });
+
+  it("doesn't add a type from a field to a kind that has its own", () => {
+    const tpl = template([
+      ...TPL.fields,
+      field({ key: "kind_code", kind: "list", options: [{ value: "Sound", label: "Sound" }] }),
+    ]);
+    const item = record("object", "I", { rights: { uri: CNE }, kind_code: "Sound" });
+    const mapping = {
+      template: "out",
+      entries: [RIGHTS_ENTRY, { field: "kind_code", term: "type" }],
+    };
+    const o = ok(out(viewOf([item], item.id, tpl), [item.id], mapping));
+    expect(o.jsonLd["@type"]).toBe("dcmitype:PhysicalObject");
+    expect(o.dublinCore.type).toEqual(["http://purl.org/dc/dcmitype/PhysicalObject", "Sound"]);
+  });
+
+  it("gives an archival item several DCMI types as a list", () => {
+    const tpl = template([
+      ...TPL.fields,
+      field({
+        key: "kinds",
+        kind: "list",
+        repeatable: true,
+        options: [
+          { value: "Text", label: "Text" },
+          { value: "StillImage", label: "Still image" },
+          { value: "other", label: "Other" },
+        ],
+      }),
+    ]);
+    const item = record("archival_unit", "Scrapbook", {
+      rights: { uri: CNE },
+      kinds: ["Text", "StillImage", "other"],
+    });
+    const mapping = { template: "out", entries: [RIGHTS_ENTRY, { field: "kinds", term: "type" }] };
+    const o = ok(out(viewOf([item], item.id, tpl), [item.id], mapping));
+    expect(o.jsonLd["@type"]).toEqual(["dcmitype:Text", "dcmitype:StillImage"]);
   });
 });
