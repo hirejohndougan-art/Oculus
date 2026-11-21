@@ -9,6 +9,8 @@ These are never picked by a run. The weekly report repeats each question until J
 - [ ] Q-1 One server app for Polybius and Hermes, or two apps sharing the database through the API? (needs John) Needed before Phase 2.
 - [ ] Q-2 Hosting for the Historical Society, and the budget for hosting and storage. (needs John) Needed before Phase 2 deploys anywhere.
 - [ ] Q-3 Should the Society's other websites move to Hermes eventually? (needs John) Not needed until Phase 5.
+- [ ] Q-4 Roles: the mockup shows "Scanner" and "Donor relations" roles that the plan doesn't have. Should Phase 2 add them? (needs John) Needed before T-041.
+- [ ] Q-5 OCR: common OCR engines ship trained models. Does D-004 (no AI in the product) rule them out, or is classical OCR allowed? (needs John) Needed before OCR work.
 
 ## Phase 1 — Record model and ID numbers
 

@@ -2,6 +2,15 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-20 23:40 CT — manual (John asked to finish Phase 1) — T-011 Phase 1 review
+- Result: done
+- What changed: `docs/reports/2026-11-phase1-review.md` checks Phase 1 against PLATFORM_PLAN.md §1–2 and the mockup. The original Phase 1 tasks (T-001 to T-010) are done and strong, but §1 isn't fully met: admins can't add record types, records don't store which template they use, identifiers can live in two places, and accessions/deeds, storage and moves, loans and condition, and links between records aren't modelled. Those became Phase 1 tasks T-012 to T-018. Phase 2 is written as run-sized tasks T-020 to T-053, starting with decision tasks (PostgreSQL version, database access and migrations, HTTP framework, passwords and sessions, admin build); only T-040, T-050 and T-051 wait on Q-1 or Q-2. Added Q-4 (roles in the mockup) and Q-5 (OCR and D-004) for John.
+- Decisions: none
+- Review: n/a (planning only)
+- Gate: PASS · tests_passing 1194 (unchanged) · npm audit clean
+- Risk to note: Phase 2's logins and roles will be merged by the autopilot with only AI review; a person should review them before anything is deployed.
+- Next: T-012 Records name their template
+
 ## 2026-11-20 23:00 CT — manual (John asked to finish Phase 1) — T-010 Dublin Core and JSON-LD output
 - Result: done
 - What changed: `publicOutput()` (`public-output.ts`) turns a `publicView` into a Dublin Core values object, OAI-PMH oai_dc XML and JSON-LD, refusing output unless the publish, mapping, rights-mapping and template checks all pass. Small changes to `effective.ts` (a view mark; the rights note left out of `publicView`) and doc comments in `rights.ts` and `templates.ts`. A separate fix to `dublin-core.ts`: the duplicate check no longer uses `JSON.stringify`, so a polluted `toJSON` can't block publishing (found by the builder, test added).
