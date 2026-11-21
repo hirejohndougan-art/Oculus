@@ -24,7 +24,7 @@
  * same moment; the save path must re-check uniqueness when it writes.
  */
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
-import { IssueList, readPlainData, shown, type JsonValue } from "./plain-data.js";
+import { IssueList, readPlainData, shown, textProblem, type JsonValue } from "./plain-data.js";
 import { types } from "node:util";
 import { isRecordId, type RecordId } from "./record-id.js";
 import { identifierKey } from "./identifier-key.js";
@@ -253,11 +253,13 @@ function checkType(
   }
   if (view.autoNumber !== undefined) {
     const auto = checkAutoNumber(view.autoNumber, [...at, "autoNumber"], issues);
-    // A number the type would give out must fit its own format. Every year from
-    // 1000 to 9999 has four digits, so one sample year stands for all of them.
+    // A number the type would give out must fit its own format, in every year
+    // it is likely to be used: a format with a literal year (`2026.###`) would
+    // stop working on 1 January. Years 2000 to 2099 are checked, so `20##.###`
+    // is allowed.
     if (auto !== undefined && pattern !== undefined) {
-      const sample = formatAutoNumber(auto, 1, 2026);
-      if (!matchesIdentifierPattern(pattern, sample)) {
+      const sample = sampleMismatch(auto, pattern);
+      if (sample !== undefined) {
         issues.add(
           [...at, "autoNumber"],
           "auto_number_mismatch",
@@ -267,6 +269,17 @@ function checkType(
     }
   }
 }
+
+function sampleMismatch(auto: AutoNumbering, pattern: IdentifierPattern): string | undefined {
+  const years = auto.style === "year" ? SAMPLE_YEARS : [SAMPLE_YEARS[0] ?? 2000];
+  for (const year of years) {
+    const sample = formatAutoNumber(auto, 1, year);
+    if (!matchesIdentifierPattern(pattern, sample)) return sample;
+  }
+  return undefined;
+}
+
+const SAMPLE_YEARS: readonly number[] = Array.from({ length: 100 }, (_, i) => 2000 + i);
 
 function checkAutoNumber(
   value: JsonValue,
@@ -485,7 +498,9 @@ function checkFormer(list: JsonValue | undefined, issues: IssueList): void {
       typeof item.value === "string" &&
       typeof item.type === "string"
     ) {
-      const dupKey = `${item.type}\u0000${identifierKey(item.value)}`;
+      // Exact match: former identifiers are history, and two spellings of one
+      // old number (`dhs-1`, `DHS-1`) are both worth keeping.
+      const dupKey = `${item.type}\u0000${item.value}`;
       if (seen.has(dupKey)) {
         issues.add(
           [...at, "value"],
@@ -559,7 +574,13 @@ function checkLine(
 function checkNote(value: JsonValue, at: (string | number)[], issues: IssueList): void {
   if (typeof value !== "string" || value.trim().length === 0) {
     issues.add(at, "required", "A note must be text; leave it out if there is none.");
-  } else if (value.length > MAX_FORMER_NOTE_LENGTH) {
+    return;
+  }
+  // Already checked when read with readPlainData; repeated for notes passed
+  // straight to retireIdentifier.
+  const problem = textProblem(value);
+  if (problem !== undefined) issues.add(at, "bad_characters", `This note ${problem}.`);
+  if (value.length > MAX_FORMER_NOTE_LENGTH) {
     issues.add(
       at,
       "too_long",
@@ -834,7 +855,13 @@ export function nextIdentifier(
   } else {
     start = identifierKey(auto.prefix);
   }
+  let pattern: IdentifierPattern | undefined;
+  if (type.pattern !== undefined) {
+    const parsed = parseIdentifierPattern(type.pattern);
+    if (parsed.ok) pattern = parsed.value;
+  }
   let highest = 0;
+  let highestValue = "";
   const consider = (itemType: string, value: string): void => {
     if (itemType !== type.key) return;
     const key = identifierKey(value);
@@ -842,7 +869,18 @@ export function nextIdentifier(
     const rest = key.slice(start.length);
     if (!/^[0-9]{1,15}$/.test(rest)) return;
     const n = Number(rest);
-    if (n > highest) highest = n;
+    if (n <= highest) return;
+    // A number this type's format could never give out (an old or mistyped
+    // `DHS-0001000000` under `DHS-####`) can't clash with a new one, so it
+    // must not push the count past what the format allows.
+    if (
+      pattern !== undefined &&
+      !matchesIdentifierPattern(pattern, formatAutoNumber(auto, n, year ?? 0))
+    ) {
+      return;
+    }
+    highest = n;
+    highestValue = value;
   };
   for (const set of all) {
     for (const item of set.current) consider(item.type, item.value);
@@ -853,14 +891,11 @@ export function nextIdentifier(
     return fail("numbers_exhausted", `${type.label} numbers have run out.`);
   }
   const value = formatAutoNumber(auto, next, year ?? 0);
-  if (type.pattern !== undefined) {
-    const parsed = parseIdentifierPattern(type.pattern);
-    if (parsed.ok && !matchesIdentifierPattern(parsed.value, value)) {
-      return fail(
-        "pattern_full",
-        `The next ${type.label} would be ${shown(value)}, which doesn't fit the format ${shown(type.pattern)}. Widen the format.`,
-      );
-    }
+  if (pattern !== undefined && !matchesIdentifierPattern(pattern, value)) {
+    return fail(
+      "pattern_full",
+      `The next ${type.label} after ${shown(highestValue)} would be ${shown(value)}, which doesn't fit the format ${shown(pattern.source)}.`,
+    );
   }
   return { ok: true, value };
 }
@@ -873,8 +908,9 @@ export function nextIdentifier(
  * list, so it stays findable. If it was the primary one and others remain,
  * `newPrimary` must say which becomes primary; nothing is picked silently.
  * `newPrimary` can also be given to move the primary mark when retiring a
- * non-primary identifier. If the value is already listed as former, that entry
- * is kept as it is. Returns a new frozen object. Never throws.
+ * non-primary identifier. If exactly this value is already listed as former
+ * (it was retired before and reinstated), that one entry is kept, with the new
+ * date and both notes. Returns a new frozen object. Never throws.
  */
 export function retireIdentifier(
   identifiers: RecordIdentifiers,
@@ -925,20 +961,31 @@ export function retireIdentifier(
   const current = remaining.map((i, n) =>
     Object.freeze({ type: i.type, value: i.value, primary: n === newPrimaryIndex }),
   );
-  const alreadyFormer = identifiers.former.some(
-    (f) => f.type === retired.type && identifierKey(f.value) === identifierKey(retired.value),
+  // Matched exactly, so a differently spelled former entry never hides this one.
+  const existingIndex = identifiers.former.findIndex(
+    (f) => f.type === retired.type && f.value === retired.value,
   );
-  const former = alreadyFormer
-    ? [...identifiers.former]
-    : [
-        ...identifiers.former,
-        Object.freeze({
-          type: retired.type,
-          value: retired.value,
-          ...(options.retiredAt === undefined ? {} : { retiredAt: options.retiredAt }),
-          ...(options.note === undefined ? {} : { note: options.note }),
-        }),
-      ];
+  const existing = identifiers.former[existingIndex];
+  // Retired before and reinstated: keep the one entry, with the latest date and
+  // every note.
+  const note =
+    existing?.note !== undefined && options.note !== undefined && existing.note !== options.note
+      ? `${existing.note}\n${options.note}`
+      : (options.note ?? existing?.note);
+  if (note !== undefined && note.length > MAX_FORMER_NOTE_LENGTH) {
+    return fail("too_long", `A note can be at most ${String(MAX_FORMER_NOTE_LENGTH)} characters.`);
+  }
+  const retiredAt = options.retiredAt ?? existing?.retiredAt;
+  const entry: FormerIdentifier = Object.freeze({
+    type: retired.type,
+    value: retired.value,
+    ...(retiredAt === undefined ? {} : { retiredAt }),
+    ...(note === undefined ? {} : { note }),
+  });
+  const former =
+    existing === undefined
+      ? [...identifiers.former, entry]
+      : identifiers.former.map((f, i) => (i === existingIndex ? entry : f));
   if (former.length > MAX_FORMER_IDENTIFIERS) {
     return fail(
       "too_many",

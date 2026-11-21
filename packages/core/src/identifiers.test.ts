@@ -101,8 +101,14 @@ describe("validateIdentifierType", () => {
     ],
     [{ ...OBJECT_NO, pattern: "DHS####" }, "auto_number_mismatch"],
     [{ ...ACCESSION, pattern: "####-###" }, "auto_number_mismatch"],
+    // A literal year would stop working next year (review fix).
+    [{ ...ACCESSION, pattern: "2026.###" }, "auto_number_mismatch"],
   ])("reports %j as %s", (input, expected) => {
     expect(codes(validateIdentifierType(input))).toContain(expected);
+  });
+
+  it("allows a format that fixes only the century", () => {
+    expect(validateIdentifierType({ ...ACCESSION, pattern: "20##.###" }).ok).toBe(true);
   });
 
   it("refuses something that isn't an object", () => {
@@ -205,7 +211,7 @@ describe("validateRecordIdentifiers", () => {
     expect(r.ok).toBe(true);
   });
 
-  it("reports the same identifier twice, comparing loosely", () => {
+  it("reports a current identifier twice (compared loosely) or a former one twice (exactly)", () => {
     const r = validateRecordIdentifiers(
       set(
         id,
@@ -216,13 +222,14 @@ describe("validateRecordIdentifiers", () => {
         [
           ["omeka_id", "12"],
           ["omeka_id", "１２"],
+          ["omeka_id", "12"],
         ],
       ),
       TYPES,
     );
     expect(r.ok ? [] : r.issues.map((i) => [i.path, i.code])).toEqual([
       [["current", 1, "value"], "duplicate"],
-      [["former", 1, "value"], "duplicate"],
+      [["former", 2, "value"], "duplicate"],
     ]);
   });
 
@@ -550,6 +557,22 @@ describe("nextIdentifier", () => {
     expect(nextIdentifier(open, all)).toEqual({ ok: true, value: "DHS-10000" });
   });
 
+  it("ignores numbers the format could never give out (review fix)", () => {
+    const all = [
+      set(a, [["object_number", "DHS-0041"]], [["object_number", "DHS-0001000000"]]),
+      set(b, [["object_number", "DHS-0005"]], [["object_number", "DHS-00050"]]),
+    ];
+    // 1000000 can't be written as DHS-####, so it can never clash; 50 can.
+    expect(nextIdentifier(OBJECT_NO, all)).toEqual({ ok: true, value: "DHS-0051" });
+  });
+
+  it("says which number filled the format", () => {
+    const r = nextIdentifier(OBJECT_NO, [set(a, [["object_number", "DHS-9999"]])]);
+    expect(r.ok ? "" : r.issues[0]?.message).toBe(
+      'The next Object number after "DHS-9999" would be "DHS-10000", which doesn\'t fit the format "DHS-####".',
+    );
+  });
+
   it("refuses when the numbers run out, and for types without auto-numbering", () => {
     const open: IdentifierType = { ...OBJECT_NO, pattern: "DHS-#{1,15}" };
     const all = [set(a, [["object_number", "DHS-999999999999"]])];
@@ -612,10 +635,66 @@ describe("retireIdentifier", () => {
     expect(r.ok && r.value.former).toEqual([{ type: "object_number", value: "DHS-0001" }]);
   });
 
-  it("keeps an existing former entry instead of listing it twice", () => {
-    const again = set(id, [["object_number", "DHS-0001"]], [["object_number", "dhs-0001"]]);
-    const r = retireIdentifier(again, { type: "object_number", value: "DHS-0001" });
-    expect(r.ok && r.value.former).toEqual([{ type: "object_number", value: "dhs-0001" }]);
+  it("keeps a differently spelled former entry and adds this exact one (review fix)", () => {
+    // Found by the independent review: a loose match used to swallow the
+    // retired value and its note.
+    const again = set(
+      id,
+      [
+        ["object_number", "dhs-0001", true],
+        ["object_number", "DHS-0002", false],
+      ],
+      [["object_number", "DHS-0001"]],
+    );
+    const r = retireIdentifier(
+      again,
+      { type: "object_number", value: "dhs-0001" },
+      { note: "Typed in lower case", newPrimary: { type: "object_number", value: "DHS-0002" } },
+    );
+    expect(r.ok && r.value.former).toEqual([
+      { type: "object_number", value: "DHS-0001" },
+      { type: "object_number", value: "dhs-0001", note: "Typed in lower case" },
+    ]);
+    expect(r.ok && droppedIdentifiers(again, r.value)).toEqual([]);
+    expect(r.ok && validateRecordIdentifiers(r.value, TYPES).ok).toBe(true);
+  });
+
+  it("merges into an exact former entry: newest date, both notes", () => {
+    const again: RecordIdentifiers = {
+      recordId: id,
+      current: [{ type: "object_number", value: "DHS-0001", primary: true }],
+      former: [{ type: "object_number", value: "DHS-0001", retiredAt: T, note: "First time" }],
+    };
+    const later = "2027-01-05T10:00:00.000Z";
+    const r = retireIdentifier(
+      again,
+      { type: "object_number", value: "DHS-0001" },
+      { retiredAt: later, note: "Second time" },
+    );
+    expect(r.ok && r.value.former).toEqual([
+      {
+        type: "object_number",
+        value: "DHS-0001",
+        retiredAt: later,
+        note: "First time\nSecond time",
+      },
+    ]);
+    const plain = retireIdentifier(again, { type: "object_number", value: "DHS-0001" });
+    expect(plain.ok && plain.value.former).toEqual(again.former);
+    const long = retireIdentifier(
+      again,
+      { type: "object_number", value: "DHS-0001" },
+      { note: "x".repeat(995) },
+    );
+    expect(codes(long)).toEqual(["too_long"]);
+  });
+
+  it("refuses a note with hidden or broken characters (review fix)", () => {
+    for (const note of ["x\u202e", "x\u0000", "x\ud800"]) {
+      expect(
+        codes(retireIdentifier(start, { type: "box_label", value: "Box 4" }, { note })),
+      ).toEqual(["bad_characters"]);
+    }
   });
 
   it("reports what it can't do", () => {
