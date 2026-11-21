@@ -33,24 +33,30 @@ The data model in TypeScript, written for any archive or museum rather than one 
   - Decide whether to accept a qualifier after more than one part (`2004?-06~-11`); the 2019 level 2 grammar may allow it. Check against the spec text.
   - Decide whether "1920-1925?" should put `?` on both ends (it does now) or be flagged.
   - Compare `parseEdtf` against the spec's full example list in a test, once the spec page can be read from the sandbox (this run's fetch was blocked).
-- [ ] T-004 **Typed identifiers.** deps: T-002
+- [x] T-004 **Typed identifiers.** deps: T-002
   - Identifier types defined by the organization, each with a format pattern, a uniqueness rule and optional auto-numbering (year-based `2026.015`, or prefix plus digits `DHS-0001`).
   - Any number of identifiers per record, one of them marked primary.
   - Former IDs kept and searchable.
-- [ ] T-005 **Field templates.** deps: T-002
+- [x] T-005 **Field templates.** deps: T-002
   - Field templates as data: field kinds (text, long text, date, list, controlled term, identifier, link, rights, place).
   - Rules for required fields and repeatable fields.
   - Validation of a record against its template.
+- [ ] T-007a **Wire the field kinds to their modules.** deps: T-004, T-005, T-007
+  - Ready-made checkers for the template `identifier` kind (T-004 identifier types) and `rights` kind (T-007 `validateRightsUri`), so `checkRecordAgainstTemplate` uses them by default.
+- [ ] T-005a **Safe template changes.** deps: T-005 (risky)
+  - Compare a new version of a template with the old one before it's saved. Switching a field from `staff` to `public` would publish existing staff data, so it must be reported for confirmation. Renaming or removing a key, changing its kind or `repeatable`, or dropping a list option must report the records affected rather than strand their data.
+  - The same check for identifier types (T-004): editing or deleting a type checks existing records first.
 - [ ] T-006 **Standards presets.** deps: T-005
   - Starting templates for DACS (archival units), Spectrum-style museum objects and digital assets.
   - A Dublin Core mapping for publishing.
   - Each field cites the standard element it maps to.
-- [ ] T-007 **Rights.** deps: T-002
+- [x] T-007 **Rights.** deps: T-002
   - rightsstatements.org statements (the 12 URIs, with labels) and Creative Commons licenses.
   - The rule from the design: a record without a rights statement can't be published.
 - [ ] T-008 **Effective record.** deps: T-002, T-007 (risky)
   - Fields inherited down the hierarchy (fonds → series → collection → item), with the item's own value winning.
   - It reports where each value came from, matching the mockup's Effective Record screen.
+  - From the T-005 review: visibility belongs to each template's field, and records in one hierarchy can use different templates. A value from a `staff` field must never become `public` by being inherited into a child whose template marks the same key `public`: keep the strictest visibility along the chain.
 - [ ] T-009 **Controlled vocabularies.** deps: T-005
   - A vocabulary and term model (LCSH, LCNAF, LCGFT, Nomenclature 4.0, GNIS and local terms), stored as URIs plus labels.
   - Near-duplicate detection for local terms, to feed Data Cleaning.
@@ -58,6 +64,8 @@ The data model in TypeScript, written for any archive or museum rather than one 
 - [ ] T-010 **Dublin Core and JSON-LD output.** deps: T-006, T-007, T-008
   - Turn a published record into Dublin Core and JSON-LD.
   - Unpublished and staff-only fields never appear in the output. (risky)
+  - Fields not in the record's template (left over after a template edit) count as staff-only. Identifier types are staff-only unless marked public, and former-identifier notes are never published (from the T-004 review).
+  - Check rights with `rightsPublishIssues` on the same frozen effective record that is published.
 - [ ] T-011 **Phase 1 review.** deps: T-001 to T-010
   - Check the model against PLATFORM_PLAN.md §1–2 and the mockup screens.
   - Write the Phase 2 tasks, server and database, using whatever John has answered for Q-1 and Q-2 so far.
