@@ -178,14 +178,15 @@ export function edtfFromText(
 function readRange(text: string, options: EdtfFromTextOptions): Piece {
   // "ca. 1920-1925": a qualifier in front applies to both ends.
   const read = readQualifier(text);
-  const piece = readRangeParts(text, read.rest, read.qualifier, options);
+  const { piece, range } = readRangeParts(text, read.rest, read.qualifier, options);
   // "1920-1925?": EDTF puts a qualifier on one end of an interval (LoC EDTF
   // 2019, level 1 extended interval), but in free text a trailing "?" can
-  // doubt the end year or the whole range. Don't guess which (T-003a).
-  if (read.trailing && (piece.edtf.includes("/") || piece.edtf.includes(".."))) {
+  // doubt the end date or the whole range. Don't guess which (T-003a). A
+  // single date that reads as an interval ("19th century?") is not a range.
+  if (read.trailing && range) {
     fail(
       "ambiguous",
-      `In ${shown(text)} the “?” could doubt the end year or the whole range. Write “probably …” in front to doubt the whole range, or enter EDTF such as 1920/1925?.`,
+      `In ${shown(text)} the “?” at the end could doubt the last date or the whole range. Remove it and write “probably” in front to doubt the whole range, or enter the EDTF yourself with ? on the date it applies to.`,
     );
   }
   return piece;
@@ -196,16 +197,21 @@ function readRangeParts(
   rest: string,
   qualifier: string,
   options: EdtfFromTextOptions,
-): Piece {
+): { piece: Piece; range: boolean } {
   // "between 1920 and 1925" is one unknown date in that span (DACS 2.4),
   // which EDTF writes as a one-of set; "from 1920 to 1925" is the whole span.
   const between = /^between (.+?) (?:and|-) (.+)$/.exec(rest);
   if (between !== null) {
     const piece = joinRange(between[1] ?? "", between[2] ?? "", qualifier, options, text);
-    return { edtf: `[${piece.edtf.replace("/", "..")}]`, keep: piece.keep };
+    return { piece: { edtf: `[${piece.edtf.replace("/", "..")}]`, keep: piece.keep }, range: true };
   }
   const from = /^from (.+?) (?:to|until|-) (.+)$/.exec(rest);
-  if (from !== null) return joinRange(from[1] ?? "", from[2] ?? "", qualifier, options, text);
+  if (from !== null) {
+    return {
+      piece: joinRange(from[1] ?? "", from[2] ?? "", qualifier, options, text),
+      range: true,
+    };
+  }
   if (/^(?:before|after|by|pre|post|not before|not after|until|till)\b/.test(rest)) {
     fail(
       "unreadable",
@@ -215,7 +221,7 @@ function readRangeParts(
   // A single date first: "06-05-1920" has dashes but is not a range.
   let lastError: TextError;
   try {
-    return readSingle(rest, qualifier, options);
+    return { piece: readSingle(rest, qualifier, options), range: false };
   } catch (error) {
     if (!(error instanceof TextError) || error.code !== "unreadable") throw error;
     lastError = error;
@@ -247,7 +253,7 @@ function readRangeParts(
     fail("ambiguous", `${shown(text)} can be split into a range in more than one way.`);
   }
   const [only] = found.values();
-  if (only !== undefined) return only;
+  if (only !== undefined) return { piece: only, range: true };
   throw ambiguous ?? lastError;
 }
 

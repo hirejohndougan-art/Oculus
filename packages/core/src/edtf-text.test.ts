@@ -33,6 +33,9 @@ describe("edtfFromText", () => {
     ["approx. 1920", "1920~"],
     ["1920?", "1920?"],
     ["1920s?", "192X?"],
+    // One date that reads as an interval is not a range (T-003a review).
+    ["19th century?", "1800?/1900?"],
+    ["19th century ?", "1800?/1900?"],
     ["probably 1920", "1920?"],
     ["ca. 1920?", "1920%"],
     ["about June 1920", "1920-06~"],
