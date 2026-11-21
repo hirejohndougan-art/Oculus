@@ -161,3 +161,25 @@ export type {
   RightsChange,
   NormalizedRights,
 } from "./rights.js";
+
+export {
+  DACS_ARCHIVAL_UNIT_PRESET,
+  SPECTRUM_OBJECT_PRESET,
+  DIGITAL_ASSET_PRESET,
+  STANDARD_PRESETS,
+  standardPreset,
+} from "./presets.js";
+
+export {
+  DCTERMS_NAMESPACE,
+  DUBLIN_CORE_TERMS,
+  MAX_DUBLIN_CORE_ENTRIES,
+  DACS_DUBLIN_CORE,
+  SPECTRUM_DUBLIN_CORE,
+  DIGITAL_ASSET_DUBLIN_CORE,
+  isDublinCoreTerm,
+  dublinCoreTermUri,
+  validateDublinCoreMapping,
+  presetDublinCoreMapping,
+} from "./dublin-core.js";
+export type { DublinCoreTerm, DublinCoreEntry, DublinCoreMapping } from "./dublin-core.js";
