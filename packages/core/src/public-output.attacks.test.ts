@@ -5,6 +5,7 @@ import {
   MAX_OUTPUT_CHARS,
   MAX_RECORD_SET,
   effectiveRecord,
+  indexRecords,
   newRecordId,
   publicOutput,
   publicView,
@@ -710,5 +711,124 @@ describe("a parent's template changed after the view was made (security run 2026
       }),
     );
     expect(everything(result)).toContain("Public creator");
+  });
+});
+
+describe("the records changed after the view was made (S-001a)", () => {
+  const CREATOR_MAP = {
+    template: "out",
+    entries: [RIGHTS_ENTRY, { field: "creator", term: "creator" }],
+  };
+
+  // A fonds, a series and an item inheriting `creator` from the fonds. The
+  // view is built, then the catalog is edited; the view is kept and published.
+  function keptView() {
+    const fonds = record(
+      "archival_unit",
+      "Fonds",
+      { rights: { uri: CNE }, creator: "SECRET-old-creator" },
+      { level: "fonds" },
+    );
+    const other = record(
+      "archival_unit",
+      "Other fonds",
+      { rights: { uri: CNE }, creator: "Other creator" },
+      { level: "fonds" },
+    );
+    const item = record("archival_unit", "Item", {}, { level: "item", parentId: fonds.id });
+    const lookup = () => TPL;
+    const built = effectiveRecord(item.id, [item, fonds, other], lookup);
+    if (!built.ok) throw new Error(JSON.stringify(built.issues));
+    const view = publicView(built.value);
+    if (view === undefined) throw new Error("no view");
+    expect(view.fields.creator).toBe("SECRET-old-creator");
+    return { view, item, fonds, other, lookup };
+  }
+
+  function run(view: PublicRecord, id: string, records: unknown, extra: object = {}) {
+    return publicOutput(view, CREATOR_MAP, {
+      baseUrl: BASE,
+      published: [id as PublicRecord["id"]],
+      checkers: CHECKERS,
+      templateFor: () => TPL,
+      records: records as readonly never[],
+      ...extra,
+    });
+  }
+
+  function refusedAt(result: Validated<PublicOutput>, id: string): void {
+    expect(codes(result)).toEqual(["record_changed"]);
+    expect(result.ok ? [] : result.issues[0]?.path).toEqual(["records", id]);
+    expect(JSON.stringify(result)).not.toContain("SECRET");
+  }
+
+  it("refuses when an ancestor's value has changed since, naming the ancestor", () => {
+    const { view, item, fonds, other } = keptView();
+    const edited = { ...fonds, fields: { ...fonds.fields, creator: "New creator" } };
+    // templateFor alone can't see it: the templates are unchanged.
+    expect(run(view, item.id, undefined).ok).toBe(true);
+    refusedAt(run(view, item.id, [item, edited, other]), fonds.id);
+    const indexed = indexRecords([item, edited, other]);
+    if (!indexed.ok) throw new Error("bad fixture");
+    refusedAt(run(view, item.id, indexed.value), fonds.id);
+  });
+
+  it("refuses when an ancestor's value has been made empty since", () => {
+    const { view, item, fonds, other } = keptView();
+    const emptied = { ...fonds, fields: { ...fonds.fields, creator: "" } };
+    refusedAt(run(view, item.id, [item, emptied, other]), fonds.id);
+  });
+
+  it("refuses when the item has moved to a different parent since", () => {
+    const { view, item, fonds, other } = keptView();
+    const moved = { ...item, parentId: other.id };
+    refusedAt(run(view, item.id, [moved, fonds, other]), item.id);
+  });
+
+  it("refuses when the item's level has changed since", () => {
+    const { view, item, fonds, other } = keptView();
+    const relevelled = { ...item, level: "file" };
+    refusedAt(run(view, item.id, [relevelled, fonds, other]), item.id);
+  });
+
+  it("refuses when a parent has been removed from the set, or the record itself", () => {
+    const { view, item, fonds, other } = keptView();
+    refusedAt(run(view, item.id, [item, other]), item.id);
+    refusedAt(run(view, item.id, [fonds, other]), item.id);
+  });
+
+  it("refuses a records option that isn't a list or an index", () => {
+    const { view, item, fonds, other } = keptView();
+    expect(codes(run(view, item.id, { item, fonds, other }))).toEqual(["invalid_options"]);
+    expect(codes(run(view, item.id, new Proxy([item, fonds, other], {})))).toEqual([
+      "invalid_options",
+    ]);
+    expect(codes(run(view, item.id, Object.freeze({ size: 3 })))).toEqual(["invalid_options"]);
+  });
+
+  it("asks templateFor with the records as they are now", () => {
+    const { view, item, fonds, other } = keptView();
+    const seen: unknown[] = [];
+    const copies = structuredClone([item, fonds, other]);
+    const result = run(view, item.id, copies, {
+      templateFor: (r: unknown) => {
+        seen.push(r);
+        return TPL;
+      },
+    });
+    expect(result.ok).toBe(true);
+    expect(seen).toHaveLength(2);
+    // Validated copies of the current set, not the records the view holds.
+    expect(seen).toEqual([copies[0], copies[1]]);
+  });
+
+  it("still publishes from fresh copies of unchanged records", () => {
+    const { view, item, fonds, other } = keptView();
+    const result = ok(
+      run(view, item.id, structuredClone([other, fonds, item]), {
+        templateFor: () => structuredClone(TPL),
+      }),
+    );
+    expect(everything(result)).toContain("SECRET-old-creator");
   });
 });

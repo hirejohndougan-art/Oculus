@@ -27,6 +27,13 @@
  *   fields aside), with the default checkers and any the caller gives in
  *   `checkers`. Identifier values need `makeIdentifierChecker` (D-015). Any
  *   problem refuses the output, with the check's issues.
+ * - **A kept view is checked against the catalog as it is now, if asked.**
+ *   A view holds the records and templates it was built from (D-020). With
+ *   `records` (the current set), the record's ancestry is found again and
+ *   must be the same records with the same stored content
+ *   (`record_changed`); with `templateFor`, every template on the way must
+ *   be unchanged (`template_changed`). Only both together catch every
+ *   change; building the view at publish time is still the rule.
  * - **Publishing is the caller's statement.** Records have no publish state
  *   yet, so the caller passes `published`, the IDs of every record that is
  *   published. The record itself must be in it (`not_published`). A place
@@ -83,9 +90,11 @@ import { shown, type JsonValue } from "./plain-data.js";
 import { publicViewOrigin } from "./effective-brand.js";
 import {
   MAX_RECORD_SET,
+  currentAncestry,
   effectivePublishIssues,
   type EffectiveRecord,
   type PublicRecord,
+  type RecordLookup,
   type TemplateLookup,
 } from "./effective.js";
 import {
@@ -149,8 +158,21 @@ export interface PublishOptions {
    * was built from, and output is refused if any of their templates differs
    * from the one the view used (`template_changed`): a parent's field made
    * staff since would otherwise still publish the value its child inherited.
+   * With `records`, it is asked with the records as they are now.
    */
   readonly templateFor?: TemplateLookup;
+  /**
+   * The records as they are now, a list or a lookup from `indexRecords`, the
+   * same kind `effectiveRecord` takes. When given, the record and its parents
+   * are found again in it, and output is refused unless they are the same
+   * records, in the same order, with the same stored content as when the view
+   * was made (`record_changed`, naming the record that differs, never its
+   * values): an ancestor's value changed or emptied since, or a record moved
+   * to another parent or level, would otherwise still publish the old
+   * inherited values. Only `records` and `templateFor` together catch every
+   * change to a kept view (D-0XX).
+   */
+  readonly records?: RecordLookup | readonly CatalogRecord[];
 }
 
 /** Dublin Core as term → values, in order (see the module header). */
@@ -340,7 +362,10 @@ interface Budget {
  * visibility and fields, even if the template has changed since. Pass the
  * template lookup as it is now in `templateFor` to have a view refused when
  * the template of the record or of any ancestor has changed
- * (`template_changed`).
+ * (`template_changed`), and the records as they are now in `records` to have
+ * it refused when the record or any ancestor has been edited, moved or
+ * removed since (`record_changed`). Only the two together catch every change;
+ * either alone leaves the other kind of change unseen.
  *
  * **"Passes the template check" means the configured check.** Checkers given
  * in `checkers` replace the defaults for their kinds (as
@@ -375,7 +400,8 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
       "This is not a public view from publicView, so it can't be published.",
     );
   }
-  const { baseUrl, published, checkers, currentTemplate, templateFor } = readOptions(options);
+  const { baseUrl, published, checkers, currentTemplate, templateFor, records } =
+    readOptions(options);
   if (!published.has(view.id)) {
     fail([], "not_published", "This record is not in the published list, so it can't be output.");
   }
@@ -394,7 +420,9 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
       );
     }
   }
-  if (templateFor !== undefined) sameChainTemplates(templateFor, origin.chain);
+  // With `records`, the templates are looked up for the records as they are now.
+  const chain = records === undefined ? origin.chain : sameAncestry(records, origin.chain);
+  if (templateFor !== undefined) sameChainTemplates(templateFor, chain);
   const checked = validateDublinCoreMapping(mapping, template);
   if (!checked.ok) throw new OutputError(checked.issues);
   if (
@@ -500,6 +528,71 @@ function sameChainTemplates(
   }
 }
 
+/**
+ * The record's ancestry as it is in `records` now, each step with the template
+ * the view used for it. Refused unless it is the same records, in the same
+ * order, with the same stored content (compared as validated data, with
+ * object keys in sorted order) as the view was built from. Issues name the
+ * record by ID only; the messages never quote titles or values.
+ */
+function sameAncestry(
+  records: unknown,
+  chain: readonly { readonly record: CatalogRecord; readonly template: FieldTemplate }[],
+): readonly { readonly record: CatalogRecord; readonly template: FieldTemplate }[] {
+  const first = chain[0];
+  if (first === undefined) fail([], "unreadable", "The public view could not be read.");
+  const found = currentAncestry(first.record.id, records);
+  if (!found.ok) {
+    const problem = found.issues[0];
+    if (problem === undefined || SET_PROBLEMS.has(problem.code)) {
+      fail(
+        ["records"],
+        "invalid_options",
+        "The records option must be a list of records or a lookup from indexRecords.",
+      );
+    }
+    const where = problem.path[0];
+    fail(
+      ["records", isRecordId(where) ? where : first.record.id],
+      "record_changed",
+      "The record or one of its parents can no longer be found as it was when this public view was made: it has been removed, or its parent is missing or not valid. Make the view again with effectiveRecord and publicView, and publish that.",
+    );
+  }
+  const current = found.value;
+  const length = Math.max(current.length, chain.length);
+  for (let i = 0; i < length; i += 1) {
+    const now = current[i];
+    const then = chain[i];
+    if (
+      now === undefined ||
+      then === undefined ||
+      canonicalJson(now) !== canonicalJson(then.record)
+    ) {
+      const id = (now ?? then?.record ?? first.record).id;
+      fail(
+        ["records", id],
+        "record_changed",
+        i === 0
+          ? "The record has been edited or moved since this public view was made. Make the view again with effectiveRecord and publicView, and publish that."
+          : "A parent record has been edited, moved or replaced since this public view was made. Make the view again with effectiveRecord and publicView, and publish that.",
+      );
+    }
+  }
+  return Object.freeze(
+    chain.map((step, i) =>
+      Object.freeze({ record: current[i] ?? step.record, template: step.template }),
+    ),
+  );
+}
+
+/** Problems with the set itself, not with the record or its ancestry. */
+const SET_PROBLEMS: ReadonlySet<string> = new Set([
+  "not_a_list",
+  "too_many_records",
+  "unreadable_entry",
+  "unreadable",
+]);
+
 /** Plain data as JSON text with object keys sorted, for comparing. */
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) {
@@ -510,7 +603,7 @@ function canonicalJson(value: unknown): string {
     const keys = Object.keys(obj).sort();
     return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(obj[k])}`).join(",")}}`;
   }
-  // Validated templates hold only text, numbers, true/false and null here.
+  // Validated templates and records hold only text, numbers, true/false and null here.
   return JSON.stringify(value);
 }
 
@@ -585,6 +678,7 @@ const OPTION_KEYS: ReadonlySet<string> = new Set([
   "checkers",
   "currentTemplate",
   "templateFor",
+  "records",
 ]);
 
 interface ReadOptions {
@@ -593,6 +687,7 @@ interface ReadOptions {
   readonly checkers: unknown;
   readonly currentTemplate: unknown;
   readonly templateFor: TemplateLookup | undefined;
+  readonly records: unknown;
 }
 
 function readOptions(options: unknown): ReadOptions {
@@ -613,7 +708,9 @@ function readOptions(options: unknown): ReadOptions {
     fail(["templateFor"], "invalid_options", "The templateFor option must be a function.");
   }
   const templateFor = lookup as TemplateLookup | undefined;
-  return { baseUrl, published, checkers, currentTemplate, templateFor };
+  // Checked when it is used: it may be a list or a lookup from indexRecords.
+  const records = dataProp(options, "records");
+  return { baseUrl, published, checkers, currentTemplate, templateFor, records };
 }
 
 /** An own data property, or undefined. A getter, hidden property or Proxy value fails. */

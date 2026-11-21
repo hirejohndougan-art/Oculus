@@ -305,17 +305,39 @@ export function effectiveRecord(
     if (typeof templateFor !== "function") {
       fail([], "no_template_lookup", "templateFor must be a function.");
     }
-    // Callers may pass anything at run time, whatever the type says.
-    const given: unknown = records;
-    const state = typeof given === "object" && given !== null ? LOOKUPS.get(given) : undefined;
-    const lookup = state ?? stateOf(buildLookup(records));
-    const up = ancestry(recordId, lookup);
+    const up = ancestry(recordId, lookupFor(records));
     const templates = templatesFor(up, templateFor);
     const checkers = ownSetting(options, "checkers");
     return { ok: true, value: compose(up, templates, checkers) };
   } catch (error) {
     return failure(error);
   }
+}
+
+/**
+ * For `public-output.ts` only (not exported from the package): the record and
+ * its ancestors as they are in `records` now, the record first, found exactly
+ * as `effectiveRecord` finds them (a list or a lookup from `indexRecords`).
+ * Fails, with the issue `effectiveRecord` would give, when the record or any
+ * ancestor can't be found, read or trusted. Never throws.
+ */
+export function currentAncestry(
+  recordId: RecordId,
+  records: unknown,
+): Validated<readonly CatalogRecord[]> {
+  try {
+    if (!isRecordId(recordId)) fail([], "invalid_id", "The record ID must be a record ID.");
+    return { ok: true, value: Object.freeze(ancestry(recordId, lookupFor(records))) };
+  } catch (error) {
+    return failure(error);
+  }
+}
+
+/** The index for `records`: the one `indexRecords` made, or a new one built from a list. */
+function lookupFor(records: unknown): LookupState {
+  // Callers may pass anything at run time, whatever the type says.
+  const state = typeof records === "object" && records !== null ? LOOKUPS.get(records) : undefined;
+  return state ?? stateOf(buildLookup(records));
 }
 
 function stateOf(lookup: RecordLookup): LookupState {
