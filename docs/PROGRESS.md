@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-21 15:45 CT — manual (John) — Site editor structure
+- Result: done (plan recorded; no code)
+- What changed: John's site editor parts (headers, footers, pages, popups, plus global blocks, notice bar, menus, record templates, exhibits, forms and site-wide settings) added to the Phase 4 note in ROADMAP.md, drawn on the Oculus Site Design whiteboard. Fixed the "Oculusolybius" typo in DESIGN.md left by the D-018 rename.
+- Decisions: none yet (news and events placement is open)
+- Review: n/a
+- Gate: PASS · tests_passing 1956 (unchanged)
+- Next: T-005a remaining part (identifier types)
+
 ## 2026-11-21 14:55 CT — manual (John) — D-025 System managers and site managers
 - Result: done (decision recorded; no code)
 - What changed: John's roles: system managers can do everything (create and set up sites, install plugins and themes, all users, System settings); site managers have full control of only their assigned sites (one or more) and choose among installed plugins and themes. PLATFORM_PLAN.md §3 and T-041 updated; plugins are new, so P-001 (plugin security model) is added before any plugin system. The Oculus Sitemap whiteboard shows the same structure.

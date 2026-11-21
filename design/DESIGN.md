@@ -109,7 +109,7 @@ All text pairs above pass WCAG AA contrast (4.5:1) at their sizes.
 - **Last step:** always a review summary. Every line has an **Edit** button that jumps straight to its step.
 
 ### Public site
-- **Header and footer:** charcoal, with "Dickinson Historical Society / DIGITAL ARCHIVE" on the left. The menu shows the current page with a 3 px accent underline, and Donate is an accent button. The footer ends with "Powered by Oculusolybius · Staff sign in".
+- **Header and footer:** charcoal, with "Dickinson Historical Society / DIGITAL ARCHIVE" on the left. The menu shows the current page with a 3 px accent underline, and Donate is an accent button. The footer ends with "Powered by Oculus · Staff sign in".
 - **Home page:** hero search with suggested searches, collection cards, a featured item, recent additions, a timeline, a map and exhibits.
 - **Other pages:** search with filters in a left column (list or grid view), an item page with a media viewer, tabbed record details and a citation, and a finding aid as an expandable series › file › item tree.
 
