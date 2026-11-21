@@ -120,7 +120,9 @@ Decisions first:
 Database:
 - [ ] T-024 **Migrations tooling and the empty schema.** deps: T-020, T-021 (risky)
   - A `packages/db` package with the chosen tool, `npm run db:migrate` that applies migrations forwards to the database named in an environment variable (no password in the repo, not even for tests), and a test that runs every migration on a fresh database. The gate and the CI workflow start a test database as T-020 decided.
-- [ ] T-025 **Schema: records, templates and record types.** deps: T-024, T-012, T-013 (risky)
+- [ ] T-019 **Decision and model: organizations in one install.** deps: T-011 (risky)
+  - D-019 (John): one install holds several organizations, each with its own records, templates, identifier types, rights settings, people, roles and sites. Example: the Historical Society's archives number items like `DS5C740001`; the library it hosts numbers them `DPL1`, `DPL2`, `DPL3`. Add an organization to the core model and scope every record, template, identifier type and vocabulary to one. Identifier uniqueness is per organization, so two organizations can hold the same number. Decide whether an admin can belong to more than one organization (decision entry). The schema (T-025 onward) and roles (T-041) build on this. Check that the identifier format language (D-009) covers both examples, including unpadded auto-numbers (`DPL#{1,9}`).
+- [ ] T-025 **Schema: records, templates and record types.** deps: T-024, T-012, T-013, T-019 (risky)
   - Tables for records (UUID key, kind, record type, template key, title, level, parent, JSONB `fields`, timestamps), plus templates and record types stored as validated JSON with versions. Check constraints and foreign keys back up the core rules. Tests round-trip every preset and invented sample records through the core validators.
 - [ ] T-026 **Schema: identifiers, with uniqueness the database enforces.** deps: T-025, T-014 (risky)
   - Tables for identifier types and current and former identifiers. Each value is stored with its `identifierKey` beside it, and unique indexes enforce the `current` and `all_time` rules, so two saves at the same moment can't take the same number. The next auto-number is given out inside a transaction. Tests race two saves.
@@ -154,7 +156,7 @@ Logins and roles:
   - A user can turn on a second factor as T-023 decided, with single-use recovery codes. An admin can require it for admins. Tests cover replayed codes and brute force.
 - [ ] T-039 **Password reset tokens.** deps: T-036 (risky)
   - Single-use, short-lived reset tokens, stored hashed. A reset ends every session for that user. Requests get the same reply whether or not the account exists. Sending the message goes through an interface with a test double, so this task doesn't need an email service.
-- [ ] T-041 **Roles and collection-level permissions.** deps: T-036, T-032 (risky)
+- [ ] T-041 **Roles and collection-level permissions.** deps: T-036, T-032, T-019 (risky)
   - The four roles in the plan (admin, cataloger, reviewer, read-only), granted for the whole catalog or for chosen fonds or collections and the units below them. The service checks them on every read and write, and anything not granted is refused. Only reviewers and admins publish (mockup Settings). Whether to add the mockup's Scanner and Donor relations roles is a question for John; don't add them before he answers.
 - [ ] T-035 **Optional approval step.** deps: T-034, T-041 (risky)
   - An organization setting that, when on, holds edits and publish requests as pending versions until a reviewer approves or rejects them, with both recorded in the change log. When it's off, saves go straight through as today.

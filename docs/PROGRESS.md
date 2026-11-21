@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-21 02:30 CT — manual (John) — D-019 Several organizations per install
+- Result: done (decision recorded; no code)
+- What changed: John's decision that each site's organization has its own IDs, rights, people and roles (the Society's archives and the library it hosts). PLATFORM_PLAN.md decision 3 updated; new task T-019 (organizations in the model) added before the schema, and T-025 and T-041 now depend on it.
+- Decisions: D-019 (John)
+- Review: n/a
+- Gate: PASS · tests_passing 1278 (unchanged)
+- Next: T-005a Safe template changes (risky)
+
 ## 2026-11-21 01:55 CT — manual (John) — D-018 One name: Oculus
 - Result: done
 - What changed: John dropped the part names. The whole project is Oculus; the staff back end is "the admin" and the public front end is "the public sites". Updated README, PLATFORM_PLAN, ROADMAP (planned packages are now `packages/service` and `packages/api`), AUTOPILOT, DESIGN.md, the mockup screens and the mockup generator (wordmark "Oculus"). "Polybius" stays only where it means the earlier desktop catalog or John's private repository.

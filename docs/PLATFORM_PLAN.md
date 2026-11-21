@@ -10,7 +10,7 @@ Build a general collections platform that runs on the web, one that any archive,
 
 1. **Name:** the whole project is **Oculus** (D-018). Its parts are described plainly: the admin (staff back end) and the public sites. The earlier part names Polybius and Hermes are dropped.
 2. **License:** MIT.
-3. **Multiple sites means one organization with several public sites**, the way Omeka S works. Each install has one catalog. Each site gets its own domain, theme, menus, pages and choice of collections. It is not a hosted service for many organizations.
+3. **One install can hold several organizations** (D-019, replacing "one organization per install"). The Dickinson Historical Society runs its archives and also hosts the library on a separate site. Each organization has its own catalog, ID number formats, rights settings, people and roles, and its own public site or sites (domain, theme, menus, pages and choice of collections). Nothing crosses between organizations unless an admin of both sets it up.
 4. **Web only.** There's no desktop app and no offline mode.
 5. **The public sites stand on their own.** Blueprint's editor moves out of WordPress, and nothing depends on WordPress.
 6. **Built for organizations in general.** The Dickinson Historical Society's setup becomes one preset among several.
