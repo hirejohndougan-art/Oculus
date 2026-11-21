@@ -420,35 +420,69 @@ describe("public output only comes from publicView", () => {
 });
 
 describe("the publish check can't be passed with staff-only rights", () => {
-  const RIGHTS = "http://rightsstatements.org/vocab/CNE/1.0/";
+  const RIGHTS = { uri: "http://rightsstatements.org/vocab/CNE/1.0/" };
+  const rightsDef = (visibility: "public" | "staff" = "public"): FieldDefinition => ({
+    ...def("rights", visibility),
+    kind: "rights",
+  });
 
-  function withRights(fondsVisibility: "public" | "staff", ownRights = false) {
+  function withRights(ownRights = false) {
     const fonds = unit("Fonds", "fonds", undefined, { rights: RIGHTS });
     const item = unit("Item", "item", fonds, ownRights ? { rights: RIGHTS } : {});
-    const fondsT = template([def("rights", fondsVisibility)], "fonds");
-    const itemT = template([def("rights", "public")], "item");
-    const r = effectiveRecord(item.id, [item, fonds], (rec) =>
-      rec.id === fonds.id ? fondsT : itemT,
-    );
+    const r = effectiveRecord(item.id, [item, fonds], () => template([rightsDef()]));
     if (!r.ok) throw new Error("failed");
     return r.value;
   }
 
-  it("refuses rights inherited from a template that marks them staff", () => {
-    const effective = withRights("staff");
-    expect(effective.fields.rights).toBe(RIGHTS);
-    expect(effectivePublishIssues(effective).map((i) => i.code)).toEqual(["rights_not_public"]);
-    expect(canPublishRights(publicView(effective))).toBe(false);
+  it("a template can't mark rights staff, so strictest visibility can't hide inherited rights", () => {
+    // Templates refuse a staff `rights` field (T-007a), so the staff case can
+    // only come from a left-over key, below. Here the fonds' template is refused.
+    const fonds = unit("Fonds", "fonds", undefined, { rights: RIGHTS });
+    const item = unit("Item", "item", fonds);
+    const r = effectiveRecord(item.id, [item, fonds], (rec) =>
+      template([rightsDef(rec.id === fonds.id ? "staff" : "public")], "t"),
+    );
+    expect(codeOf(r)).toBe("invalid_template");
   });
 
-  it("accepts public inherited rights, and the record's own public rights", () => {
-    expect(effectivePublishIssues(withRights("public"))).toEqual([]);
-    expect(effectivePublishIssues(withRights("staff", true))).toEqual([]);
+  it("refuses rights stored under a key the record's template doesn't have (left over, so staff)", () => {
+    const item = unit("Item", "item", undefined, { rights: RIGHTS });
+    const r = effectiveRecord(item.id, [item], () => template([def("note", "public")]));
+    if (!r.ok) throw new Error("failed");
+    expect(r.value.fields.rights).toEqual(RIGHTS);
+    expect(r.value.entries[0]).toMatchObject({
+      key: "rights",
+      visibility: "staff",
+      inTemplate: false,
+    });
+    expect(effectivePublishIssues(r.value).map((i) => i.code)).toEqual(["rights_not_public"]);
+    expect(canPublishRights(publicView(r.value))).toBe(false);
+    // The wrong check can't be used to get round it either.
+    expect(rightsPublishIssues(r.value).map((i) => i.code)).toEqual([
+      "use_effective_publish_issues",
+    ]);
+  });
+
+  it("accepts inherited rights, and the record's own rights", () => {
+    expect(effectivePublishIssues(withRights())).toEqual([]);
+    expect(effectivePublishIssues(withRights(true))).toEqual([]);
+  });
+
+  it("an inherited rights value the rights checker refuses is left out, so rights are missing", () => {
+    const fonds = unit("Fonds", "fonds", undefined, {
+      rights: { uri: "https://rightsstatements.org/page/InC/1.0/" },
+    });
+    const item = unit("Item", "item", fonds);
+    const r = effectiveRecord(item.id, [item, fonds], () => template([rightsDef()]));
+    if (!r.ok) throw new Error("failed");
+    expect(r.value.fields).toEqual({});
+    expect(r.value.notes[0]?.code).toBe("not_valid_here");
+    expect(effectivePublishIssues(r.value).map((i) => i.code)).toEqual(["rights_missing"]);
   });
 
   it("reports missing rights as missing", () => {
     const item = unit("Item", "item");
-    const r = effectiveRecord(item.id, [item], () => template([def("rights", "public")]));
+    const r = effectiveRecord(item.id, [item], () => template([rightsDef()]));
     if (!r.ok) throw new Error("failed");
     expect(effectivePublishIssues(r.value).map((i) => i.code)).toEqual(["rights_missing"]);
   });
@@ -548,14 +582,12 @@ describe("checkers can't change what was checked", () => {
 });
 
 describe("rightsPublishIssues refuses an effective record", () => {
-  it("so staff-only rights can't pass by the wrong check", () => {
-    const RIGHTS = "http://rightsstatements.org/vocab/CNE/1.0/";
+  it("even when its rights would pass, so callers must use effectivePublishIssues", () => {
+    const RIGHTS = { uri: "http://rightsstatements.org/vocab/CNE/1.0/" };
     const fonds = unit("Fonds", "fonds", undefined, { rights: RIGHTS });
     const item = unit("Item", "item", fonds);
-    const r = effectiveRecord(item.id, [item, fonds], (rec) =>
-      rec.id === fonds.id
-        ? template([def("rights", "staff")], "fonds")
-        : template([def("rights", "public")], "item"),
+    const r = effectiveRecord(item.id, [item, fonds], () =>
+      template([{ ...def("rights", "public"), kind: "rights" }]),
     );
     if (!r.ok) throw new Error("failed");
     expect(isEffectiveRecord(r.value)).toBe(true);
@@ -563,7 +595,7 @@ describe("rightsPublishIssues refuses an effective record", () => {
       "use_effective_publish_issues",
     ]);
     expect(canPublishRights(r.value)).toBe(false);
-    expect(effectivePublishIssues(r.value).map((i) => i.code)).toEqual(["rights_not_public"]);
+    expect(effectivePublishIssues(r.value)).toEqual([]);
     expect(isEffectiveRecord({ ...r.value })).toBe(false);
     expect(isEffectiveRecord(publicView(r.value))).toBe(false);
   });

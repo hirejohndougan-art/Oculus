@@ -187,13 +187,6 @@ export {
 export type { DublinCoreTerm, DublinCoreEntry, DublinCoreMapping } from "./dublin-core.js";
 
 export { checkRightsValue, makeIdentifierChecker } from "./field-checkers.js";
-export type {
-  RightsSource,
-  RightsCategory,
-  RightsTerm,
-  RightsChange,
-  NormalizedRights,
-} from "./rights.js";
 
 export {
   MAX_RECORD_SET,

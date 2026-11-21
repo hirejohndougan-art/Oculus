@@ -241,6 +241,16 @@ export const RIGHTS_REQUIRED_KINDS = Object.freeze([
 /** Kinds the rule doesn't apply to. Any other kind, or none, is checked (fail closed). */
 const RIGHTS_EXEMPT_KINDS: ReadonlySet<string> = new Set(["agent", "place", "event"]);
 
+const USE_EFFECTIVE: readonly Issue[] = Object.freeze([
+  Object.freeze(
+    issue(
+      ["fields", RIGHTS_FIELD_KEY],
+      "use_effective_publish_issues",
+      "This is an effective record: check it with effectivePublishIssues, which also checks the rights are public.",
+    ),
+  ),
+]);
+
 /**
  * The publishing rule: the problems that keep a record's rights from being
  * published, or an empty list if there are none. An object, archival unit or
@@ -252,22 +262,14 @@ const RIGHTS_EXEMPT_KINDS: ReadonlySet<string> = new Set(["agent", "place", "eve
  * place and event records need none. A record with any other kind, or none,
  * is checked as if it needed one.
  *
- * Call it on the exact frozen copy that will be published (the validated
- * record, or once inheritance exists the effective record from T-008), not on
- * an object that will be copied or changed afterwards. Only own, enumerable
+ * Call it on the exact frozen copy that will be published, not on an object
+ * that will be copied or changed afterwards. For an archival unit that
+ * inherits, use `effectivePublishIssues` (T-008) instead: this check refuses
+ * an effective record with `use_effective_publish_issues`, because it can't
+ * see the strictest-visibility rule. Only own, enumerable
  * data properties count; getters, hidden properties and Proxies are reported
  * as unreadable. Never throws.
  */
-const USE_EFFECTIVE: readonly Issue[] = Object.freeze([
-  Object.freeze(
-    issue(
-      ["fields", RIGHTS_FIELD_KEY],
-      "use_effective_publish_issues",
-      "This is an effective record: check it with effectivePublishIssues, which also checks the rights are public.",
-    ),
-  ),
-]);
-
 export function rightsPublishIssues(record: unknown): readonly Issue[] {
   const path = ["fields", RIGHTS_FIELD_KEY] as const;
   const unreadable = Object.freeze([

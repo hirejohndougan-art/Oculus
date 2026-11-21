@@ -21,8 +21,8 @@ import {
 } from "./index.js";
 
 const T = "2026-11-20T16:05:00.000Z";
-const CNE = "http://rightsstatements.org/vocab/CNE/1.0/";
-const INC = "http://rightsstatements.org/vocab/InC/1.0/";
+const CNE = { uri: "http://rightsstatements.org/vocab/CNE/1.0/" };
+const INC = { uri: "http://rightsstatements.org/vocab/InC/1.0/" };
 
 function unit(
   title: string,
@@ -63,7 +63,7 @@ function template(fields: readonly FieldDefinition[], key = "archive"): FieldTem
 
 /** The template most tests use: the mockup's fields. */
 const ARCHIVE = template([
-  field({ key: "rights", label: "Rights" }),
+  field({ key: "rights", label: "Rights", kind: "rights" }),
   field({ key: "creator", label: "Creator" }),
   field({
     key: "access",
@@ -211,7 +211,7 @@ describe("the record's own value wins", () => {
     const series = unit("S", "series", fonds, { creator: "B" });
     const item = unit("I", "item", series, { rights: INC });
     const e = ok(effectiveRecord(item.id, [item, series, fonds], all(ARCHIVE)));
-    expect(e.fields.rights).toBe(INC);
+    expect(e.fields.rights).toEqual(INC);
     expect(entry(e, "rights")?.own).toBe(true);
     // The nearest unit with a value wins over one further up.
     expect(e.fields.creator).toBe("B");
@@ -699,7 +699,7 @@ describe("indexRecords: one set, many records", () => {
     let rights = 0;
     for (const item of items) {
       const e = ok(effectiveRecord(item.id, index.value, counting));
-      if (e.fields.rights === CNE) rights += 1;
+      if (JSON.stringify(e.fields.rights) === JSON.stringify(CNE)) rights += 1;
     }
     expect(rights).toBe(20_000);
     expect(asked).toBe(60_000);

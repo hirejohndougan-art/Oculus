@@ -588,8 +588,11 @@ export function publicView(effective: EffectiveRecord): PublicRecord | undefined
 /**
  * The rights publish check for an effective record: `rightsPublishIssues`
  * run on its public view, so rights that are inherited count, and rights
- * that are staff-only here (by the strictest-visibility rule) don't. Returns
- * an empty list when the rights can be published. Never throws.
+ * that aren't public here don't (`rights_not_public`). Templates require the
+ * `rights` field to be public (T-007a), so today that happens only for a
+ * left-over `rights` value whose key isn't in the record's template; the
+ * check also stands in case a staff rights field is ever allowed. Returns an
+ * empty list when the rights can be published. Never throws.
  */
 export function effectivePublishIssues(effective: EffectiveRecord): readonly Issue[] {
   try {
