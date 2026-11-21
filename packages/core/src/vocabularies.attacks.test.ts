@@ -227,23 +227,71 @@ describe("near-duplicate detection can't be overloaded", () => {
     expect(r.ok && r.value.truncated).toBe(false);
   });
 
-  it("stays within its budget on long labels that share most of their words", () => {
-    // Hostile: 20,000 invented labels of about 470 characters, the same words
-    // in the same order, differing only in the last word. Every pair shares
-    // every block and needs a full edit-distance band.
-    const words = Array.from(
-      { length: 70 },
-      (_, i) => `word${String.fromCharCode(97 + (i % 26))}x`,
+  // The worst inputs found in review, at the full 50,000 terms. Each must
+  // finish in about 2 seconds; the bound leaves room for a slow CI machine.
+  const N = 50_000;
+  const tag = (i: number): string =>
+    String.fromCharCode(
+      97 + (i % 26),
+      97 + (Math.floor(i / 26) % 26),
+      97 + (Math.floor(i / 676) % 26),
+      97 + (Math.floor(i / 17576) % 26),
     );
-    const base = words.join(" ");
-    const terms = Array.from({ length: 20_000 }, (_, i) => ({
-      label: `${base} ${String.fromCharCode(97 + (i % 26), 97 + (Math.floor(i / 26) % 26), 97 + (Math.floor(i / 676) % 26))}`,
-    }));
+  const shared = Array.from({ length: 120 }, (_, i) => tag(i * 37).slice(0, 3)).join(" ");
+  const timed = (terms: unknown[]): { ms: number; limits: readonly string[]; found: number } => {
     const start = Date.now();
-    const r = findNearDuplicateTerms(terms, { maxCandidates: 50 });
-    const took = Date.now() - start;
-    expect(r.ok && r.value.limitsReached).toContain("spelling_budget");
-    expect(r.ok && r.value.truncated).toBe(true);
-    expect(took).toBeLessThan(5000);
+    const r = findNearDuplicateTerms(terms, { maxCandidates: 10_000 });
+    const ms = Date.now() - start;
+    if (!r.ok) throw new Error(JSON.stringify(r.issues));
+    return { ms, limits: r.value.limitsReached, found: r.value.candidates.length };
+  };
+
+  it("is fast on long labels sharing 120 words, told apart by a number", () => {
+    const r = timed(Array.from({ length: N }, (_, i) => ({ label: `${shared} ${String(i)}` })));
+    expect(r.found).toBe(0);
+    expect(r.ms).toBeLessThan(5000);
+  });
+
+  it("stays within budget on long labels sharing 120 words, told apart by a word", () => {
+    const r = timed(
+      Array.from({ length: N }, (_, i) => ({ label: `${tag(i)} ${shared}`.slice(0, 500) })),
+    );
+    expect(r.limits).toContain("spelling_budget");
+    expect(r.ms).toBeLessThan(5000);
+  });
+
+  it("is fast when every term has a GNIS URI (only same_uri can apply)", () => {
+    const r = timed(
+      Array.from({ length: N }, (_, i) => ({
+        label: `${tag(i)} ${shared}`.slice(0, 500),
+        uri: `https://example.org/gnis/${String(i)}`,
+        vocabulary: "gnis",
+      })),
+    );
+    expect([r.found, r.limits]).toEqual([0, []]);
+    expect(r.ms).toBeLessThan(5000);
+  });
+
+  it("is fast with one local term among long GNIS terms", () => {
+    const r = timed([
+      { label: `${tag(1)} ${shared}`.slice(0, 500) },
+      ...Array.from({ length: N - 1 }, (_, i) => ({
+        label: `${tag(i)} ${shared}`.slice(0, 500),
+        uri: `https://example.org/gnis/${String(i)}`,
+        vocabulary: "gnis",
+      })),
+    ]);
+    expect(r.ms).toBeLessThan(5000);
+  });
+
+  it("doesn't run out of memory on labels that unfold to many characters", () => {
+    // U+FDFA unfolds to 18 characters: 450 of them would be an 8,100-letter key.
+    const r = findNearDuplicateTerms(
+      Array.from({ length: N }, (_, i) => ({ label: `${"\ufdfa".repeat(450)} ${tag(i)}` })),
+    );
+    if (!r.ok) throw new Error("expected ok");
+    expect(r.value.skipped).toHaveLength(N);
+    expect(r.value.skipped[0]?.issues[0]?.code).toBe("too_long_to_compare");
+    expect(r.value.limitsReached).toEqual(["long_labels"]);
   });
 });

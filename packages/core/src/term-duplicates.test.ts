@@ -35,6 +35,25 @@ describe("termWords and termMatchKey", () => {
     expect(termWords("GH&H Railroad")).toEqual(["ghh", "railroad"]);
     expect(termWords("G.H.&H. Railroad")).toEqual(["ghh", "railroad"]);
   });
+
+  it("join spaced initials into one word", () => {
+    expect(termWords("G. H. & H. Railroad")).toEqual(["ghh", "railroad"]);
+    expect(termWords("G H H Railroad")).toEqual(["ghh", "railroad"]);
+    expect(termWords("G H and H Railroad")).toEqual(["ghh", "railroad"]);
+  });
+
+  it("keep a decimal point between digits as a break", () => {
+    expect(termWords("Size 1.5 inches")).toEqual(["size", "1", "5", "inches"]);
+  });
+
+  it("remove accents only from Latin, Greek and Cyrillic letters", () => {
+    expect(termMatchKey("Ἀθῆναι")).toBe("αθηναι");
+    expect(termMatchKey("Ёлка")).toBe("елка");
+    // Devanagari vowel signs are letters of the word, not accents.
+    expect(termMatchKey("कमल")).not.toBe(termMatchKey("कमला"));
+    expect(termMatchKey("किताब")).not.toBe(termMatchKey("कातिब"));
+    expect(termMatchKey("किताब")).toBe("किताब".normalize("NFKD"));
+  });
 });
 
 describe("boundedDistance", () => {
@@ -323,6 +342,90 @@ describe("findNearDuplicateTerms: results and limits", () => {
     expect(summary(c)).toEqual([[0, 1, "same_uri"]]);
   });
 
+  it("never pairs labels told apart by a letter, Roman numeral or letter-digit designator", () => {
+    for (const [a, b] of [
+      ["World War I", "World War II"],
+      ["Henry VII", "Henry VIII"],
+      ["Louis XIV", "Louis XV"],
+      ["Box 12a", "Box 12b"],
+      ["Folder A", "Folder B"],
+      ["Series 1A", "Series 1B"],
+      ["Railroad depot, part I", "Railroad depot, part V"],
+    ] as const) {
+      expect(find([{ label: a }, { label: b }]), `${a} / ${b}`).toEqual([]);
+    }
+    // The same designators still pair, and "a" is an article, not a designator.
+    expect(summary(find([{ label: "World War II" }, { label: "world war II" }]))).toEqual([
+      [0, 1, "same_label"],
+    ]);
+    expect(summary(find([{ label: "A history of Texas" }, { label: "Texas history" }]))).toEqual([
+      [0, 1, "same_words"],
+    ]);
+  });
+
+  it("pairs spaced initials with the full name", () => {
+    const c = find([
+      { label: "Galveston, Houston and Henderson Railroad" },
+      { label: "G. H. & H. Railroad" },
+      { label: "G H H Railroad" },
+    ]);
+    expect(summary(c)).toEqual([
+      [1, 2, "same_label"],
+      [0, 1, "abbreviation"],
+    ]);
+  });
+
+  it("finds an abbreviation however many copies of it there are", () => {
+    const r = findNearDuplicateTerms(
+      [
+        { label: "Galveston Houston Henderson" },
+        ...Array.from({ length: 21 }, () => ({ label: "GHH" })),
+      ],
+      { maxCandidates: 1000 },
+    );
+    if (!r.ok) throw new Error("expected ok");
+    expect(r.value.candidates.filter((c) => c.reason === "abbreviation")).toHaveLength(1);
+    expect(r.value.limitsReached).toEqual([]);
+  });
+
+  it("finds every pair one edit apart among short keys, whatever the position", () => {
+    // No shared word, prefix or ending: found through keys with a letter removed.
+    expect(summary(find([{ label: "Depot" }, { label: "Dexot" }]))).toEqual([
+      [0, 1, "similar_spelling"],
+    ]);
+    expect(summary(find([{ label: "Depot" }, { label: "Deopt" }]))).toEqual([
+      [0, 1, "similar_spelling"],
+    ]);
+    expect(summary(find([{ label: "Depots" }, { label: "Depos" }]))).toEqual([
+      [0, 1, "similar_spelling"],
+    ]);
+  });
+
+  it("finds long keys changed at both ends through their middle letters", () => {
+    expect(summary(find([{ label: "Xailroadstations" }, { label: "railroadstationZ" }]))).toEqual([
+      [0, 1, "similar_spelling"],
+    ]);
+  });
+
+  it("doesn't mark an ordinary long heading as truncated", () => {
+    const r = findNearDuplicateTerms([
+      {
+        label:
+          "Galveston, Houston and Henderson Railroad Company--History--19th century--Pictorial works--Texas--Galveston County--Maps--Sources",
+      },
+    ]);
+    expect(r.ok && [r.value.truncated, r.value.limitsReached]).toEqual([false, []]);
+  });
+
+  it("only compares URIs when every term has one", () => {
+    const r = findNearDuplicateTerms([
+      { label: "Depot", uri: "https://example.org/gnis/1", vocabulary: "gnis" },
+      { label: "Depot", uri: "https://example.org/gnis/2", vocabulary: "gnis" },
+      { label: "Depot", uri: "http://example.org/gnis/1", vocabulary: "gnis" },
+    ]);
+    expect(r.ok && summary(r.value.candidates)).toEqual([[0, 2, "same_uri"]]);
+  });
+
   it("says which limits cut the search short", () => {
     const limits = (terms: unknown[]): readonly string[] => {
       const r = findNearDuplicateTerms(terms, { maxCandidates: 10_000 });
@@ -333,19 +436,30 @@ describe("findNearDuplicateTerms: results and limits", () => {
     expect(limits(Array.from(letters, (ch) => ({ label: `Depot ${ch}${ch}${ch}x` })))).toEqual([
       "large_blocks",
     ]);
-    // 21 labels with the same words: only 20 are kept as expansions.
+    // 21 different labels with the same significant words: only 20 are kept.
+    const small = ["the", "of", "and", "a", "an", "at", "by", "for", "in", "on", "to"];
+    const variants = small.flatMap((p) => small.map((q) => `${p} GH ${q} Railroad`)).slice(0, 21);
     expect(
-      limits([
-        { label: "GH Railroad" },
-        ...Array.from({ length: 21 }, () => ({ label: "Galveston Houston Railroad" })),
-      ]),
+      limits([{ label: "Galveston Houston Railroad" }, ...variants.map((label) => ({ label }))]),
     ).toContain("abbreviation_matches");
-    // More than 12 significant words: not checked for abbreviations.
-    expect(
-      limits([
-        { label: "one two three four five six seven eight nine ten eleven twelve thirteen" },
-      ]),
-    ).toEqual(["long_labels"]);
+    // More than 16 different words: only the first 16 make spelling blocks.
+    const words = Array.from({ length: 17 }, (_, i) => `word${String.fromCharCode(97 + i)}`);
+    expect(limits([{ label: words.join(" ") }, { label: "wordq" }])).toEqual(["block_words"]);
+  });
+
+  it("skips labels too long to compare once unfolded, and says so", () => {
+    // U+FDFA unfolds to 18 characters, so 450 of them are 8,100.
+    const r = findNearDuplicateTerms([
+      { label: "\ufdfa".repeat(450) },
+      { label: "Depot" },
+      { label: "depot" },
+    ]);
+    if (!r.ok) throw new Error("expected ok");
+    expect(r.value.skipped.map((x) => [x.index, x.issues[0]?.code])).toEqual([
+      [0, "too_long_to_compare"],
+    ]);
+    expect(r.value.limitsReached).toEqual(["long_labels"]);
+    expect(summary(r.value.candidates)).toEqual([[1, 2, "same_label"]]);
   });
 
   it("stops the abbreviation check at its budget and says so", () => {

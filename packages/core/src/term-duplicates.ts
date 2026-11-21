@@ -11,18 +11,27 @@
  * - `same_uri`: two entries whose URIs have the same `termUriKey` (so http
  *   and https copies of a Nomenclature or GNIS address meet), so the same term.
  * - `same_label`: the labels match once case, accents, spacing and
- *   punctuation are ignored, and `&` is read as "and".
+ *   punctuation are ignored, `&` is read as "and", and spaced initials are
+ *   run together ("G. H. & H." is "GHH").
  * - `same_words`: the same words in another order, ignoring small words
  *   such as "and", "of" and "the" ("History of Dickinson", "Dickinson history").
- * - `abbreviation`: one label has the initials of a run of the other's words
- *   where the other has the words ("GH&H Railroad").
+ * - `abbreviation`: one label has the initials of a run of 2 to 8 of the
+ *   other's words where the other has the words ("GH&H Railroad", "G H H
+ *   Railroad"). The abbreviated label has at most 12 significant words.
  * - `similar_spelling`: the comparison keys are at most 1 edit apart (2 for
  *   keys of 10 or more letters), counting a swap of two neighbouring letters
  *   as one edit. Keys shorter than 5 letters aren't compared this way.
- * For every reason but `same_uri`, the numbers in the two labels must be the
- * same numbers, as separate numbers: "Hurricane, 1900" and "Hurricane, 1915",
- * "Box 1-2" and "Box 12", "Size 1.5" and "Size 15" are never paired, because
- * a different number is a different thing.
+ *
+ * Designators must match. For every reason but `same_uri`, the two labels
+ * must have the same designators, as separate tokens: numbers ("Box 1-2" and
+ * "Box 12", "Size 1.5" and "Size 15" differ), tokens mixing letters and
+ * digits ("12a", "1B"), single letters ("Folder A") and Roman numerals written
+ * in capitals from I to XXXIX ("World War II", "Henry VIII", "Louis XIV").
+ * A different designator is a different thing.
+ *
+ * Accents are removed only from Latin, Greek and Cyrillic letters. Other
+ * scripts keep their combining marks, because in Devanagari and many other
+ * scripts they are vowels ("कमल" and "कमला" are different words).
  *
  * Which pairs are looked at: a pair where at least one term has no URI (every
  * local term, and outside terms entered without one). Two terms that both
@@ -30,16 +39,23 @@
  * paired by `same_uri`. A group of terms sharing one key is reported as
  * pairs with one of its members, so n terms give n - 1 pairs, not n².
  *
- * Messy data doesn't stop the check: a term the vocabulary rules refuse is
- * left out and listed in `skipped` with its problems.
+ * Messy data doesn't stop the check: a term the vocabulary rules refuse, or
+ * whose label is too long to compare once normalized (some characters expand
+ * to many letters), is left out and listed in `skipped` with the reason.
  *
  * It is not quadratic, and its work is budgeted. Exact reasons come from
- * grouping by a key in a Map. Spelling compares only terms that share a
- * block (a word, or the first or last three letters of the key); a block
- * with more than 20 terms is sorted and each term is compared with its 8
- * nearest neighbours. The spelling check's work is counted in character
- * cells (the two keys' lengths multiplied, for each pair compared) against
- * `MAX_SPELLING_CELLS`. When any limit cuts the search short, `truncated` is
+ * grouping by a key in a Map. Spelling compares only terms with the same
+ * designators that share a block: one of their first 16 words, the first or
+ * last three letters of the key, and for keys under 10 letters every key with
+ * one letter removed (which finds every pair one edit apart), for longer keys
+ * letters 4 to 6 from each end. A pair of keys of 10 or more letters with no
+ * word in common is missed only when one edit is an insertion or deletion
+ * among the first three letters and the other among the last three. A block
+ * with more than 20 terms is sorted and each term compared with its 8
+ * nearest neighbours on each side. Every pair visited is charged against
+ * `MAX_SPELLING_CELLS` (at least 500 cells, or the product of the two keys'
+ * lengths when their distance is worked out), and visited once however many
+ * blocks it shares. When any limit cuts the search short, `truncated` is
  * true and `limitsReached` says which.
  */
 import { type Issue, type Validated } from "./issues.js";
@@ -69,10 +85,10 @@ export interface DuplicateCandidate {
   readonly distance?: number;
 }
 
-/** A term left out because it isn't a valid term. */
+/** A term left out of the comparison. */
 export interface SkippedTerm {
   readonly index: number;
-  /** Its problems, with paths starting at its index. */
+  /** Why, with paths starting at its index. */
   readonly issues: readonly Issue[];
 }
 
@@ -83,21 +99,37 @@ export interface SkippedTerm {
  * - `spelling_budget`: the spelling check used up `MAX_SPELLING_CELLS`.
  * - `large_blocks`: a block of different keys was compared by sorted
  *   neighbours only.
- * - `abbreviation_matches`: more than 20 labels had the same words, and only
- *   20 of them were checked as expansions of an abbreviation.
- * - `abbreviation_budget`: the abbreviation check used up its budget of
- *   `MAX_ABBREVIATION_CHARS` characters of expanded forms.
- * - `long_labels`: labels with more than 12 significant words weren't
- *   checked for abbreviations.
+ * - `block_words`: a label had more than 16 different words, and only the
+ *   first 16 were used to find spelling partners.
+ * - `abbreviation_matches`: more than 20 different labels had the same
+ *   significant words in the same order, and only 20 of them were checked
+ *   against expanded forms. (Copies of one label count once: they are paired
+ *   with each other by `same_label`, and the abbreviation with one of them.)
+ * - `abbreviation_budget`: the abbreviation check used up
+ *   `MAX_ABBREVIATION_WORK`.
+ * - `long_labels`: some labels were too long to compare once normalized,
+ *   and are listed in `skipped`.
  */
 export type DuplicateLimit =
   | "candidates"
   | "collected"
   | "spelling_budget"
   | "large_blocks"
+  | "block_words"
   | "abbreviation_matches"
   | "abbreviation_budget"
   | "long_labels";
+
+const LIMIT_ORDER: readonly DuplicateLimit[] = [
+  "candidates",
+  "collected",
+  "spelling_budget",
+  "large_blocks",
+  "block_words",
+  "abbreviation_matches",
+  "abbreviation_budget",
+  "long_labels",
+];
 
 export interface DuplicateReport {
   /** Strongest reasons first, in `DUPLICATE_REASONS` order, then by index. */
@@ -106,7 +138,7 @@ export interface DuplicateReport {
   readonly truncated: boolean;
   /** Which limits were reached; empty when the search was complete. */
   readonly limitsReached: readonly DuplicateLimit[];
-  /** Terms left out because they aren't valid, in index order. */
+  /** Terms left out, in index order. */
   readonly skipped: readonly SkippedTerm[];
 }
 
@@ -120,31 +152,38 @@ export const MAX_DUPLICATE_TERMS = 50_000;
 export const DEFAULT_DUPLICATE_CANDIDATES = 500;
 export const MAX_DUPLICATE_CANDIDATES = 10_000;
 /**
- * The spelling check's work budget, in character cells: for each pair
- * compared, the product of the two keys' lengths (at least 64, for the fixed
- * cost of a comparison). Sized to keep the check under about a second.
+ * The spelling check's work budget, in character cells. Each pair visited
+ * costs at least `VISIT_CELLS`; a pair whose distance is worked out costs the
+ * product of the two keys' lengths if that is more. It also bounds the
+ * pairs remembered as visited (at most 4,000,000).
  */
 export const MAX_SPELLING_CELLS = 2_000_000_000;
-
+const VISIT_CELLS = 500;
 /**
- * The abbreviation check's work budget: the characters of the shortened forms
- * it builds to look up. One is built only when its initials are a word some
- * label uses, so ordinary lists use a small part of this.
+ * The abbreviation check's work budget: one unit per run of words looked at,
+ * plus the characters of each shortened form built to look up.
  */
-export const MAX_ABBREVIATION_CHARS = 20_000_000;
+export const MAX_ABBREVIATION_WORK = 20_000_000;
+/** The longest normalized label compared, in UTF-16 units. */
+export const MAX_COMPARED_KEY_LENGTH = 2000;
 
 /** A block bigger than this is compared by sorted neighbours, not all pairs. */
 const BLOCK_ALL_PAIRS = 20;
 const NEIGHBOURS = 8;
-/** Abbreviations replace a run of 2 to 8 words, in labels of at most 12 significant words. */
+/** Words of a label used as spelling blocks. */
+const MAX_BLOCK_WORDS = 16;
+/** Abbreviations replace a run of 2 to 8 words. */
 const MIN_RUN = 2;
 const MAX_RUN = 8;
-const MAX_WORDS_FOR_ABBREVIATION = 12;
-/** Labels kept for one word sequence, as expansions of an abbreviation. */
+/**
+ * An abbreviated label has at most this many significant words ("GHH
+ * Railroad" has two), so its expanded form has at most 12 + 7.
+ */
+const MAX_ABBREVIATED_WORDS = 12;
+/** Labels kept for one word sequence, as partners of an abbreviation. */
 const MAX_PER_KEY = 20;
 /** Candidates kept before sorting; past this the report is truncated. */
 const MAX_COLLECTED = 100_000;
-const MIN_CELLS_PER_PAIR = 64;
 
 const SMALL_WORDS: ReadonlySet<string> = new Set([
   "a",
@@ -169,30 +208,30 @@ interface Prepared {
   readonly hasUri: boolean;
   /** All words run together: the comparison key. */
   readonly key: string;
-  /** The key as code points, for edit distance. */
-  readonly chars: readonly string[];
+  /** The key for edit distance: the key itself, or its code points if it has any above U+FFFF. */
+  readonly chars: ArrayLike<string>;
   /** Words without the small words, in order. */
   readonly significant: readonly string[];
-  /** The numbers in the label, each one separately, in order. */
-  readonly numbers: string;
-  /** The same numbers sorted, for `same_words`. */
-  readonly sortedNumbers: string;
+  /** Numbers, letter-digit tokens, single letters and Roman numerals, in order. */
+  readonly designators: string;
+  /** The same, sorted, for `same_words`. */
+  readonly sortedDesignators: string;
+}
+
+interface Analysed {
+  readonly words: string[];
+  readonly designators: string[];
 }
 
 /**
- * Words of a label for comparison: accents and case removed, `.` and
- * apostrophes dropped, `&` inside a word dropped ("GH&H" → "ghh") and `&`
- * between words read as "and", then split at anything not a letter or digit.
+ * Words of a label for comparison: compatibility forms unfolded (NFKD),
+ * accents removed from Latin, Greek and Cyrillic letters, case folded, `.`
+ * and apostrophes dropped, `&` inside a word dropped ("GH&H" → "ghh") and `&`
+ * between words read as "and", split at anything not a letter, mark or
+ * digit, and runs of single letters joined ("G H and H" → "ghh").
  */
 export function termWords(label: string): string[] {
-  const text = label
-    .normalize("NFKD")
-    .replace(/\p{M}/gu, "")
-    .toLowerCase()
-    .replace(/['’.]/g, "")
-    .replace(/(?<=[\p{L}\p{N}])&(?=[\p{L}\p{N}])/gu, "")
-    .replace(/&/g, " and ");
-  return text.split(/[^\p{L}\p{N}]+/u).filter((w) => w.length > 0);
+  return analyse(label).words;
 }
 
 /** The comparison key for a label: its words run together. */
@@ -200,12 +239,139 @@ export function termMatchKey(label: string): string {
   return termWords(label).join("");
 }
 
+function analyse(label: string, unfolded = label.normalize("NFKD")): Analysed {
+  const text = stripAccents(unfolded)
+    // Periods go, except between digits ("1.5" stays two numbers).
+    .replace(/['\u2019]|\.(?!\p{N})|(?<!\p{N})\./gu, "")
+    .replace(/(?<=[\p{L}\p{M}\p{N}])&(?=[\p{L}\p{M}\p{N}])/gu, "")
+    .replace(/&/g, " and ");
+  const raw = text.split(/[^\p{L}\p{M}\p{N}]+/u).filter((w) => w.length > 0);
+  const anyNumber = /\p{N}/u.test(text);
+  const words: string[] = [];
+  const designators: string[] = [];
+  for (let i = 0; i < raw.length; i += 1) {
+    const token = raw[i] ?? "";
+    if (isLetter(token)) {
+      // A run of single letters, maybe with "and" between: initials.
+      let run = token;
+      let j = i + 1;
+      while (j < raw.length) {
+        const next = raw[j] ?? "";
+        if (isLetter(next)) {
+          run += next;
+          j += 1;
+        } else if (next.toLowerCase() === "and" && isLetter(raw[j + 1] ?? "")) {
+          j += 1;
+        } else {
+          break;
+        }
+      }
+      if (j > i + 1) {
+        words.push(run.toLowerCase());
+        i = j - 1;
+        continue;
+      }
+    }
+    const lower = token.toLowerCase();
+    words.push(lower);
+    // "a" is an article, not a designator ("A history of Texas").
+    if (
+      (anyNumber && /\p{N}/u.test(token)) ||
+      (lower !== "a" && isLetter(token)) ||
+      isRoman(token)
+    ) {
+      designators.push(lower);
+    }
+  }
+  return { words, designators };
+}
+
+/** One letter (one code point, plus any marks it kept). */
+function isLetter(token: string): boolean {
+  const c = token.charCodeAt(0);
+  if (token.length === 1 && c < 128) return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+  // Longer tokens starting with an ASCII character are never one letter
+  // (accents on Latin letters were removed).
+  if (c < 128 || token.length > 8) return false;
+  return /^\p{L}\p{M}*$/u.test(token);
+}
+
+function isRoman(token: string): boolean {
+  const c = token.charCodeAt(0);
+  return (c === 73 || c === 86 || c === 88) && token.length <= 8 && ROMAN.test(token);
+}
+
+/** A Roman numeral in capitals, I to XXXIX. */
+const ROMAN = /^(?=[IVX])X{0,3}(?:IX|IV|V?I{0,3})$/;
+
+/**
+ * Remove combining accents (U+0300–U+036F and the other combining
+ * diacritical mark blocks) that follow a Latin, Greek or Cyrillic letter.
+ * Marks on other scripts are kept. One pass, no regex: linear time.
+ */
+function stripAccents(text: string): string {
+  let any = false;
+  for (let i = 0; i < text.length && !any; i += 1) any = isDiacritic(text.charCodeAt(i));
+  if (!any) return text;
+  // Copy the text in runs between the accents that go.
+  const parts: string[] = [];
+  let runStart = 0;
+  let latinLike = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const c = text.charCodeAt(i);
+    if (isDiacritic(c)) {
+      if (latinLike) {
+        parts.push(text.slice(runStart, i));
+        runStart = i + 1;
+      }
+      continue;
+    }
+    // The last letter decides whether accents after it go. Cyrillic's own
+    // combining marks (titlo and the like) keep the Cyrillic letter's state.
+    if (!isOtherMark(c)) latinLike = isLatinGreekCyrillic(c);
+  }
+  parts.push(text.slice(runStart));
+  return parts.join("");
+}
+
+function isDiacritic(c: number): boolean {
+  return (
+    (c >= 0x0300 && c <= 0x036f) ||
+    (c >= 0x1ab0 && c <= 0x1aff) ||
+    (c >= 0x1dc0 && c <= 0x1dff) ||
+    (c >= 0x20d0 && c <= 0x20ff) ||
+    (c >= 0xfe20 && c <= 0xfe2f)
+  );
+}
+
+/** Combining marks of the Cyrillic block (titlo and the like), which never end a letter. */
+function isOtherMark(c: number): boolean {
+  return c >= 0x0483 && c <= 0x0489;
+}
+
+function isLatinGreekCyrillic(c: number): boolean {
+  return (
+    (c >= 0x41 && c <= 0x5a) ||
+    (c >= 0x61 && c <= 0x7a) ||
+    (c >= 0xc0 && c <= 0x24f && c !== 0xd7 && c !== 0xf7) ||
+    (c >= 0x370 && c <= 0x52f) ||
+    (c >= 0x1c80 && c <= 0x1c8f) ||
+    (c >= 0x1e00 && c <= 0x1fff) ||
+    (c >= 0x2c60 && c <= 0x2c7f) ||
+    (c >= 0x2de0 && c <= 0x2dff) ||
+    (c >= 0xa640 && c <= 0xa69f) ||
+    (c >= 0xa720 && c <= 0xa7ff) ||
+    (c >= 0xab30 && c <= 0xab6f)
+  );
+}
+
 /**
  * List pairs of terms that may be duplicates. `input` is a list of terms in
  * the `controlled_term` shape. Each is checked with `validateControlledTerm`;
- * one that fails is left out and listed in `skipped`, and the rest are still
- * compared. Fails only when `input` isn't a readable list or `options` is
- * bad. Never changes the input and never throws.
+ * one that fails, or whose label is too long to compare, is left out and
+ * listed in `skipped`, and the rest are still compared. Fails only when
+ * `input` isn't a readable list or `options` is bad. Never changes the input
+ * and never throws.
  */
 export function findNearDuplicateTerms(
   input: unknown,
@@ -231,13 +397,40 @@ export function findNearDuplicateTerms(
     const list = input as readonly unknown[];
     const terms: Prepared[] = [];
     const skipped: SkippedTerm[] = [];
+    let tooLong = false;
     const length = list.length;
+    const read: Validated<ControlledTerm>[] = [];
+    for (let i = 0; i < length; i += 1) read.push(readTerm(list, i));
+    // Only pairs with a term that has no URI can pair by label. With none,
+    // only same_uri applies, so the labels needn't be analysed at all.
+    const byLabel = read.some((r) => r.ok && r.value.uri === undefined);
     for (let i = 0; i < length; i += 1) {
-      const result = readTerm(list, i);
-      if (result.ok) terms.push(prepare(result.value, i));
-      else skipped.push(Object.freeze({ index: i, issues: result.issues }));
+      const result = read[i];
+      if (result === undefined) continue;
+      const prepared = result.ok ? prepare(result.value, i, byLabel) : undefined;
+      if (prepared !== undefined) {
+        terms.push(prepared);
+      } else {
+        if (result.ok) tooLong = true;
+        skipped.push(
+          Object.freeze({
+            index: i,
+            issues: result.ok
+              ? Object.freeze([
+                  Object.freeze({
+                    path: Object.freeze([i, "label"]),
+                    code: "too_long_to_compare",
+                    message: `This label is too long to compare once its characters are unfolded (more than ${String(MAX_COMPARED_KEY_LENGTH)}).`,
+                  }),
+                ])
+              : result.issues,
+          }),
+        );
+      }
     }
-    return { ok: true, value: findIn(terms, max, Object.freeze(skipped)) };
+    const out = new Collector(terms, max);
+    if (tooLong) out.limits.add("long_labels");
+    return { ok: true, value: findIn(terms, out, Object.freeze(skipped), byLabel) };
   } catch {
     issues.add([], "unreadable", "The terms could not be read as plain data.");
     return { ok: false, issues: Object.freeze([...issues.items]) };
@@ -289,19 +482,36 @@ function readMax(options: unknown, issues: IssueList): number {
   return value;
 }
 
-function prepare(term: ControlledTerm, index: number): Prepared {
-  const words = termWords(term.label);
+/** The term ready to compare, or undefined when its label is too long once normalized. */
+function prepare(term: ControlledTerm, index: number, byLabel: boolean): Prepared | undefined {
+  if (!byLabel) {
+    return {
+      index,
+      term,
+      hasUri: term.uri !== undefined,
+      key: "",
+      chars: "",
+      significant: [],
+      designators: "",
+      sortedDesignators: "",
+    };
+  }
+  // NFKD can make one character many (U+FDFA becomes 18), so check the
+  // unfolded length before doing anything else with it.
+  const unfolded = term.label.normalize("NFKD");
+  if (unfolded.length > MAX_COMPARED_KEY_LENGTH) return undefined;
+  const { words, designators } = analyse(term.label, unfolded);
   const key = words.join("");
-  const numbers = term.label.normalize("NFKC").match(/\p{Nd}+/gu) ?? [];
+  if (key.length > MAX_COMPARED_KEY_LENGTH) return undefined;
   return {
     index,
     term,
     hasUri: term.uri !== undefined,
     key,
-    chars: Array.from(key),
+    chars: /[\ud800-\udfff]/.test(key) ? Array.from(key) : key,
     significant: words.filter((w) => !SMALL_WORDS.has(w)),
-    numbers: numbers.join(","),
-    sortedNumbers: [...numbers].sort().join(","),
+    designators: designators.join(","),
+    sortedDesignators: [...designators].sort().join(","),
   };
 }
 
@@ -314,15 +524,17 @@ class Collector {
     private readonly max: number,
   ) {}
 
-  /** Pairs worth a look: at least one term without a URI, or a shared URI. */
+  /** Pairs worth a look: at least one term without a URI and the same designators, or a shared URI. */
   eligible(i: number, j: number, reason: DuplicateReason): boolean {
     const a = this.terms[i];
     const b = this.terms[j];
     if (a === undefined || b === undefined || i === j) return false;
     if (reason === "same_uri") return true;
-    const sameNumbers =
-      reason === "same_words" ? a.sortedNumbers === b.sortedNumbers : a.numbers === b.numbers;
-    return (!a.hasUri || !b.hasUri) && sameNumbers;
+    const same =
+      reason === "same_words"
+        ? a.sortedDesignators === b.sortedDesignators
+        : a.designators === b.designators;
+    return (!a.hasUri || !b.hasUri) && same;
   }
 
   /** True if this pair was already reported (under a stronger reason). */
@@ -363,16 +575,7 @@ class Collector {
         x.second - y.second,
     );
     if (sorted.length > this.max) this.limits.add("candidates");
-    const order: readonly DuplicateLimit[] = [
-      "candidates",
-      "collected",
-      "spelling_budget",
-      "large_blocks",
-      "abbreviation_matches",
-      "abbreviation_budget",
-      "long_labels",
-    ];
-    const limitsReached = Object.freeze(order.filter((l) => this.limits.has(l)));
+    const limitsReached = Object.freeze(LIMIT_ORDER.filter((l) => this.limits.has(l)));
     return Object.freeze({
       candidates: Object.freeze(sorted.slice(0, this.max)),
       truncated: limitsReached.length > 0,
@@ -410,35 +613,72 @@ function pairId(i: number, j: number, n: number): number {
 
 function findIn(
   terms: readonly Prepared[],
-  max: number,
+  out: Collector,
   skipped: readonly SkippedTerm[],
+  byLabel: boolean,
 ): DuplicateReport {
-  const out = new Collector(terms, max);
-  // Exact groupings, strongest first. The numbers are part of the key, so
-  // "Box 1-2" and "Box 12" (key "box12" both) never meet.
+  // Exact groupings, strongest first. The designators are part of the key,
+  // so "Box 1-2" and "Box 12" (key "box12" both) never meet.
   groupPairs(terms, out, "same_uri", (t) =>
     t.term.uri === undefined ? undefined : termUriKey(t.term.uri),
   );
-  groupPairs(terms, out, "same_label", (t) => (t.key === "" ? undefined : `${t.numbers}|${t.key}`));
-  groupPairs(terms, out, "same_words", (t) =>
-    t.significant.length < 2
-      ? undefined
-      : `${t.sortedNumbers}|${[...t.significant].sort().join(" ")}`,
+  if (!byLabel) return out.report(skipped);
+  groupPairs(terms, out, "same_label", (t) =>
+    t.key === "" ? undefined : `${t.designators}|${t.key}`,
   );
+  // Sorting every label's words is slow for long labels, so terms are first
+  // grouped by an order-free hash of their words; only terms that share a
+  // hash get the exact sorted key.
+  const hashCount = new Map<string, number>();
+  const wordHash = terms.map((t) => {
+    if (t.significant.length < 2) return undefined;
+    const h = `${t.sortedDesignators}|${unorderedHash(t.significant)}`;
+    hashCount.set(h, (hashCount.get(h) ?? 0) + 1);
+    return h;
+  });
+  // Copies of one label have one sorted key: work it out once.
+  const sortedByLabel = new Map<string, string>();
+  groupPairs(terms, out, "same_words", (t, i) => {
+    const h = wordHash[i];
+    if (h === undefined || (hashCount.get(h) ?? 0) < 2) return undefined;
+    const labelKey = `${t.designators}|${t.key}`;
+    let sorted = sortedByLabel.get(labelKey);
+    if (sorted === undefined) {
+      sorted = `${t.sortedDesignators}|${[...t.significant].sort().join(" ")}`;
+      sortedByLabel.set(labelKey, sorted);
+    }
+    return sorted;
+  });
   abbreviations(terms, out);
   spelling(terms, out);
   return out.report(skipped);
+}
+
+/** A hash of a list of words that ignores their order (two 32-bit FNV-1a sums). */
+function unorderedHash(words: readonly string[]): string {
+  let sum = 0;
+  let mix = 0;
+  for (const w of words) {
+    let h = 0x811c9dc5;
+    for (let k = 0; k < w.length; k += 1) {
+      h ^= w.charCodeAt(k);
+      h = Math.imul(h, 0x01000193);
+    }
+    sum = (sum + (h >>> 0)) >>> 0;
+    mix = (mix + Math.imul(h ^ (h >>> 15), 0x2c1b3c6d)) >>> 0;
+  }
+  return `${String(words.length)}:${String(sum)}:${String(mix)}`;
 }
 
 function groupPairs(
   terms: readonly Prepared[],
   out: Collector,
   reason: DuplicateReason,
-  keyOf: (t: Prepared) => string | undefined,
+  keyOf: (t: Prepared, i: number) => string | undefined,
 ): void {
   const groups = new Map<string, number[]>();
   terms.forEach((t, i) => {
-    const key = keyOf(t);
+    const key = keyOf(t, i);
     if (key === undefined) return;
     const list = groups.get(key);
     if (list === undefined) groups.set(key, [i]);
@@ -456,47 +696,71 @@ function groupPairs(
 }
 
 function abbreviations(terms: readonly Prepared[], out: Collector): void {
-  // Every label's significant words in order, so an expanded form can be looked up.
+  // Every label's significant words in order, so a shortened form can be
+  // looked up. Shortened forms are built from the longer label, so each list
+  // holds the labels that might be the abbreviation.
+  // Labels with the same key (already paired by same_label) are entered
+  // once, by one member, preferring one without a URI, so copies of one
+  // label don't fill a list.
   const byWords = new Map<string, number[]>();
+  const entered = new Map<string, number>();
   terms.forEach((t, i) => {
-    if (t.significant.length === 0) return;
-    if (t.significant.length > MAX_WORDS_FOR_ABBREVIATION) {
-      out.limits.add("long_labels");
+    if (t.significant.length === 0 || t.significant.length > MAX_ABBREVIATED_WORDS) return;
+    const key = t.significant.join(" ");
+    const labelKey = `${t.designators}|${t.key}`;
+    const before = entered.get(labelKey);
+    if (before !== undefined) {
+      // Swap in this one if the entered member has a URI and this one hasn't.
+      if (terms[before]?.hasUri === true && !t.hasUri) {
+        const list = byWords.get(key);
+        const at = list?.indexOf(before) ?? -1;
+        if (list !== undefined && at >= 0) {
+          list[at] = i;
+          entered.set(labelKey, i);
+        }
+      }
       return;
     }
-    const key = t.significant.join(" ");
     const list = byWords.get(key);
     if (list === undefined) byWords.set(key, [i]);
     else if (list.length < MAX_PER_KEY) list.push(i);
-    // A label of one word can't be the expansion of an abbreviation.
-    else if (t.significant.length >= MIN_RUN) out.limits.add("abbreviation_matches");
+    else {
+      out.limits.add("abbreviation_matches");
+      return;
+    }
+    entered.set(labelKey, i);
   });
-  // Words that could be an abbreviation: a short form is only built when its
-  // initials are one of these, which keeps the work small.
+  // Words that could be an abbreviation: a shortened form is only built when
+  // its initials are one of these, which keeps the work small.
   const shortWords = new Set<string>();
   for (const key of byWords.keys()) {
-    for (const w of key.split(" "))
-      if (w.length >= MIN_RUN && w.length <= MAX_RUN) shortWords.add(w);
+    for (const w of key.split(" ")) {
+      if (w.length >= MIN_RUN && w.length <= MAX_RUN * 2) shortWords.add(w);
+    }
   }
-  let chars = 0;
+  let work = 0;
   for (let j = 0; j < terms.length; j += 1) {
     const words = terms[j]?.significant ?? [];
-    if (words.length < MIN_RUN || words.length > MAX_WORDS_FOR_ABBREVIATION) continue;
+    // The shortened form has words.length - len + 1 words, at most
+    // MAX_ABBREVIATED_WORDS, so longer labels can't be expanded forms.
+    if (words.length < MIN_RUN || words.length > MAX_ABBREVIATED_WORDS + MAX_RUN - 1) continue;
     if (out.full) return;
     for (let start = 0; start < words.length; start += 1) {
       let initials = "";
       for (let len = 1; len <= MAX_RUN && start + len <= words.length; len += 1) {
-        const w = words[start + len - 1] ?? "";
-        // Initials of words that are numbers would make "1900 1915" into "11".
-        if (/^\p{N}/u.test(w)) break;
-        initials += Array.from(w)[0] ?? "";
-        if (len < MIN_RUN || !shortWords.has(initials)) continue;
-        const short = [...words.slice(0, start), initials, ...words.slice(start + len)].join(" ");
-        chars += short.length;
-        if (chars > MAX_ABBREVIATION_CHARS) {
+        work += 1;
+        if (work > MAX_ABBREVIATION_WORK) {
           out.limits.add("abbreviation_budget");
           return;
         }
+        const w = words[start + len - 1] ?? "";
+        // Initials of numbers would make "1900 1915" into "11".
+        if (/^\p{N}/u.test(w)) break;
+        initials += Array.from(w)[0] ?? "";
+        if (len < MIN_RUN || words.length - len + 1 > MAX_ABBREVIATED_WORDS) continue;
+        if (!shortWords.has(initials)) continue;
+        const short = [...words.slice(0, start), initials, ...words.slice(start + len)].join(" ");
+        work += short.length;
         for (const i of byWords.get(short) ?? []) {
           if (!out.has(i, j)) out.add(i, j, "abbreviation");
         }
@@ -506,6 +770,17 @@ function abbreviations(terms: readonly Prepared[], out: Collector): void {
 }
 
 function spelling(terms: readonly Prepared[], out: Collector): void {
+  // Only pairs with a term that has no URI can pair; with none, nothing to do.
+  if (!terms.some((t) => !t.hasUri)) return;
+  // A term can only pair by spelling with one that has the same designators
+  // and one of the two has no URI; terms with no such partner get no blocks.
+  const groupsByDesignators = new Map<string, { count: number; withoutUri: number }>();
+  for (const t of terms) {
+    const g = groupsByDesignators.get(t.designators) ?? { count: 0, withoutUri: 0 };
+    g.count += 1;
+    if (!t.hasUri) g.withoutUri += 1;
+    groupsByDesignators.set(t.designators, g);
+  }
   const blocks = new Map<string, number[]>();
   const put = (key: string, i: number): void => {
     const list = blocks.get(key);
@@ -513,110 +788,190 @@ function spelling(terms: readonly Prepared[], out: Collector): void {
     else list.push(i);
   };
   terms.forEach((t, i) => {
-    if (t.chars.length < 5) return;
-    for (const w of new Set(t.significant)) if (w.length >= 3) put(`w:${w}`, i);
-    put(`p:${t.chars.slice(0, 3).join("")}`, i);
-    put(`s:${t.chars.slice(-3).join("")}`, i);
+    const n = t.chars.length;
+    if (n < 5) return;
+    const group = groupsByDesignators.get(t.designators);
+    if (group === undefined || group.count < 2) return;
+    if (group.withoutUri === 0) return;
+    // Designators must match, so they are part of every block key.
+    const d = `${t.designators}|`;
+    const slice = (from: number, to: number): string => {
+      let s = "";
+      for (let k = from; k < to; k += 1) s += t.chars[k] ?? "";
+      return s;
+    };
+    const words = new Set<string>();
+    for (const w of t.significant) {
+      if (w.length < 3 || words.has(w)) continue;
+      if (words.size === MAX_BLOCK_WORDS) {
+        out.limits.add("block_words");
+        break;
+      }
+      words.add(w);
+    }
+    for (const w of words) put(`${d}w:${w}`, i);
+    put(`${d}p:${slice(0, 3)}`, i);
+    put(`${d}s:${slice(n - 3, n)}`, i);
+    if (n < 10) {
+      // Every key with one letter removed: two keys one edit apart always
+      // share one (a key one letter longer shares the shorter key itself).
+      put(`${d}x:${slice(0, n)}`, i);
+      for (let k = 0; k < n; k += 1) put(`${d}x:${slice(0, k)}${slice(k + 1, n)}`, i);
+    } else {
+      put(`${d}m:${slice(3, 6)}`, i);
+      put(`${d}n:${slice(n - 6, n - 3)}`, i);
+    }
   });
-  // A pair that shares several blocks is compared once.
-  const compared = new Set<number>();
+
+  // Every term's place in key order, forwards and from the end, worked out
+  // once, so sorting a big block is sorting numbers.
+  let cached: { forward: number[]; backward: number[] } | undefined;
+  const ranks = (): { forward: number[]; backward: number[] } => {
+    if (cached !== undefined) return cached;
+    const order = (cmp: (x: number, y: number) => number): number[] => {
+      const rank = new Array<number>(terms.length).fill(0);
+      terms
+        .map((_, i) => i)
+        .sort((x, y) => cmp(x, y) || x - y)
+        .forEach((i, r) => (rank[i] = r));
+      return rank;
+    };
+    cached = {
+      forward: order((x, y) => {
+        const a = terms[x]?.key ?? "";
+        const b = terms[y]?.key ?? "";
+        return a < b ? -1 : a > b ? 1 : 0;
+      }),
+      backward: order((x, y) => compareFromEnd(terms[x]?.chars ?? "", terms[y]?.chars ?? "")),
+    };
+    return cached;
+  };
+
+  const visited = new Set<number>();
   let cells = 0;
-  const compare = (i: number, j: number): boolean => {
+  /** Visit one pair; false when the budget has run out. */
+  const visit = (i: number, j: number): boolean => {
+    const id = pairId(i, j, terms.length);
+    if (visited.has(id)) return true;
     const a = terms[i];
     const b = terms[j];
     if (a === undefined || b === undefined) return true;
-    const cost = Math.max(MIN_CELLS_PER_PAIR, a.chars.length * b.chars.length);
-    if (cells + cost > MAX_SPELLING_CELLS || out.full) {
-      out.limits.add(out.full ? "collected" : "spelling_budget");
+    const product = a.chars.length * b.chars.length;
+    const needsDistance =
+      a.key !== b.key && !out.has(i, j) && out.eligible(i, j, "similar_spelling");
+    const cost = needsDistance ? Math.max(VISIT_CELLS, product) : VISIT_CELLS;
+    if (cells + cost > MAX_SPELLING_CELLS) {
+      out.limits.add("spelling_budget");
       return false;
     }
-    const id = pairId(i, j, terms.length);
-    if (compared.has(id)) return true;
-    // Checks that need no edit distance are charged the fixed cost only.
-    if (out.has(i, j) || !out.eligible(i, j, "similar_spelling") || a.key === b.key) {
-      cells += MIN_CELLS_PER_PAIR;
-      return true;
+    if (out.full) {
+      out.limits.add("collected");
+      return false;
     }
     cells += cost;
-    compared.add(id);
+    visited.add(id);
+    if (!needsDistance) return true;
     const limit = Math.min(a.chars.length, b.chars.length) >= 10 ? 2 : 1;
     const d = boundedDistance(a.chars, b.chars, limit);
     if (d <= limit) out.add(i, j, "similar_spelling", d);
     return true;
   };
+
   for (const [key, list] of blocks) {
     if (list.length < 2) continue;
+    // A block with only URI terms can't give a pair.
+    if (!list.some((i) => terms[i]?.hasUri === false)) continue;
     if (list.length <= BLOCK_ALL_PAIRS) {
       for (let x = 0; x < list.length; x += 1) {
         for (let y = x + 1; y < list.length; y += 1) {
-          if (!compare(list[x] ?? 0, list[y] ?? 0)) return;
+          const i = list[x] ?? 0;
+          const j = list[y] ?? 0;
+          if (terms[i]?.hasUri === true && terms[j]?.hasUri === true) continue;
+          if (!visit(i, j)) return;
         }
       }
       continue;
     }
-    // Sorted neighbourhood: sort by the key (by the reversed key for a
-    // block of shared endings) and compare each term with the next few.
-    // Only neighbours are compared, so a pair further apart can be missed,
-    // unless every key in the block is the same (then there is nothing to find).
+    // Sorted neighbourhood: sort by the key (by the reversed key for a block
+    // of shared endings) and compare each term without a URI with the
+    // nearest few on each side. Only neighbours are compared, so a pair
+    // further apart can be missed, unless every key in the block is the same.
     const first = terms[list[0] ?? 0]?.key;
     if (list.some((i) => terms[i]?.key !== first)) out.limits.add("large_blocks");
-    const reversed = key.startsWith("s:");
-    const sortKey = (i: number): string => {
-      const chars = terms[i]?.chars ?? [];
-      return (reversed ? [...chars].reverse() : chars).join("");
-    };
-    const sorted = list
-      .map((i) => [sortKey(i), i] as const)
-      .sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : x[1] - y[1]))
-      .map(([, i]) => i);
+    const rank = key.includes("|s:") || key.includes("|n:") ? ranks().backward : ranks().forward;
+    const sorted = [...list].sort((x, y) => (rank[x] ?? 0) - (rank[y] ?? 0));
     for (let x = 0; x < sorted.length; x += 1) {
-      for (let y = x + 1; y <= x + NEIGHBOURS && y < sorted.length; y += 1) {
-        if (!compare(sorted[x] ?? 0, sorted[y] ?? 0)) return;
+      const i = sorted[x] ?? 0;
+      if (terms[i]?.hasUri !== false) continue;
+      const from = Math.max(0, x - NEIGHBOURS);
+      const to = Math.min(sorted.length - 1, x + NEIGHBOURS);
+      for (let y = from; y <= to; y += 1) {
+        const j = sorted[y] ?? 0;
+        // Looking back, only at terms with a URI: a term without one before
+        // this one already looked forward at it.
+        if (y === x || (y < x && terms[j]?.hasUri !== true)) continue;
+        if (!visit(i, j)) return;
       }
     }
   }
 }
 
+/** Compare two keys character by character from the end. */
+function compareFromEnd(a: ArrayLike<string>, b: ArrayLike<string>): number {
+  const n = Math.min(a.length, b.length);
+  for (let k = 1; k <= n; k += 1) {
+    const x = a[a.length - k] ?? "";
+    const y = b[b.length - k] ?? "";
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  return a.length - b.length;
+}
+
 /**
  * The optimal string alignment distance between `a` and `b` (insertions,
  * deletions, substitutions and swaps of two neighbouring characters), or
- * `limit + 1` as soon as it is known to be more than `limit`. Only cells
- * within `limit` of the diagonal are computed, so the cost is about
- * length × (2 × limit + 1).
+ * `limit + 1` as soon as it is known to be more than `limit`. `a` and `b`
+ * are lists of characters (a string works when it has no characters above
+ * U+FFFF). Only cells within `limit` of the diagonal are computed, so the
+ * cost is about length × (2 × limit + 1).
  */
-export function boundedDistance(a: readonly string[], b: readonly string[], limit: number): number {
+export function boundedDistance(a: ArrayLike<string>, b: ArrayLike<string>, limit: number): number {
   const over = limit + 1;
   if (Math.abs(a.length - b.length) > limit) return over;
   const n = a.length;
   const m = b.length;
-  // Three rows, reused: two back (for swaps), previous and current. Each row
-  // is written only around its band, plus one cell either side set to
-  // "over", which is all the next rows read.
-  let prev2 = new Array<number>(m + 1).fill(over);
-  let prev = new Array<number>(m + 1).fill(over);
-  let cur = new Array<number>(m + 1).fill(over);
-  for (let j = 0; j <= Math.min(m, limit); j += 1) prev[j] = j;
+  // Three rows, reused across calls: two back (for swaps), previous and
+  // current. Each row is written only around its band, plus one cell either
+  // side set to "over", which is all the next rows read.
+  if (scratch.length < 3 * (m + 1)) scratch = new Int32Array(3 * (m + 1) * 2);
+  const rows = scratch;
+  let prev2 = 0;
+  let prev = m + 1;
+  let cur = 2 * (m + 1);
+  rows.fill(over, 0, 3 * (m + 1));
+  for (let j = 0; j <= Math.min(m, limit); j += 1) rows[prev + j] = j;
   for (let i = 1; i <= n; i += 1) {
     const from = Math.max(1, i - limit);
     const to = Math.min(m, i + limit);
-    for (let j = Math.max(0, from - 1); j <= Math.min(m, to + 1); j += 1) cur[j] = over;
+    for (let j = Math.max(0, from - 1); j <= Math.min(m, to + 1); j += 1) rows[cur + j] = over;
     let best = over;
     if (from === 1) {
-      cur[0] = i <= limit ? i : over;
-      best = cur[0];
+      best = i <= limit ? i : over;
+      rows[cur] = best;
     }
+    const ai = a[i - 1];
     for (let j = from; j <= to; j += 1) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      const cost = ai === b[j - 1] ? 0 : 1;
       let v = Math.min(
-        (prev[j] ?? over) + 1,
-        (cur[j - 1] ?? over) + 1,
-        (prev[j - 1] ?? over) + cost,
+        (rows[prev + j] ?? over) + 1,
+        (rows[cur + j - 1] ?? over) + 1,
+        (rows[prev + j - 1] ?? over) + cost,
       );
-      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
-        v = Math.min(v, (prev2[j - 2] ?? over) + 1);
+      if (i > 1 && j > 1 && ai === b[j - 2] && a[i - 2] === b[j - 1]) {
+        v = Math.min(v, (rows[prev2 + j - 2] ?? over) + 1);
       }
       v = Math.min(v, over);
-      cur[j] = v;
+      rows[cur + j] = v;
       if (v < best) best = v;
     }
     if (best > limit) return over;
@@ -625,5 +980,8 @@ export function boundedDistance(a: readonly string[], b: readonly string[], limi
     prev = cur;
     cur = spare;
   }
-  return Math.min(prev[m] ?? over, over);
+  return Math.min(rows[prev + m] ?? over, over);
 }
+
+/** Rows for `boundedDistance`, kept between calls (it never runs re-entrantly). */
+let scratch = new Int32Array(3 * 64);

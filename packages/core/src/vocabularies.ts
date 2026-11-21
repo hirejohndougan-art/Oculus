@@ -24,7 +24,8 @@
  * - `nomenclature`: Nomenclature 4.0 for Museum Cataloging. nomenclature.info
  *   couldn't be reached from the build sandbox, so its term URI form is not
  *   confirmed. Only the site is checked: a URI must be on nomenclature.info
- *   (the address AASLH gives for the online Nomenclature).
+ *   (the address AASLH gives for the online Nomenclature), with no port of
+ *   its own, and not the bare site root.
  * - `gnis`: the USGS Geographic Names Information System. The USGS sites
  *   couldn't be reached either, so a GNIS URI is checked only as a web
  *   address (by the template check), not against a pattern.
@@ -330,11 +331,17 @@ function checkUri(
       }
       return;
     case "site":
-      if (!NOMENCLATURE_HOSTS.has(hostOf(uri))) {
+      if (!NOMENCLATURE_HOSTS.has(hostOf(uri)) || portOf(uri) !== "") {
         issues.add(
           path,
           "wrong_site",
           `${shown(uri)} is not on nomenclature.info, where ${vocab.shortLabel} terms are published.`,
+        );
+      } else if (pathOf(uri) === "/" || pathOf(uri) === "") {
+        issues.add(
+          path,
+          "not_a_term",
+          `${shown(uri)} is the Nomenclature site itself, not one of its terms.`,
         );
       }
       return;
@@ -390,7 +397,7 @@ function looseHost(uri: string): string {
 /**
  * A key for comparing term URIs: two URIs with the same key name the same
  * term. It ignores the scheme (http or https), the case of the host name,
- * trailing dots on the host, the ports 80 and 443, and trailing slashes on
+ * trailing dots on the host, each scheme's default port, and trailing slashes on
  * the path. It is only for comparing; stored URIs are never changed. Text
  * that isn't a web address is its own key.
  */
@@ -398,11 +405,30 @@ export function termUriKey(uri: string): string {
   try {
     const url = new URL(uri);
     if (url.protocol !== "http:" && url.protocol !== "https:") return uri;
-    const port = url.port === "" || url.port === "80" || url.port === "443" ? "" : `:${url.port}`;
+    // URL drops a scheme's own default port (80 for http, 443 for https), so
+    // http://host:443 keeps its port and doesn't meet https://host.
+    const port = url.port === "" ? "" : `:${url.port}`;
     const path = trimEnd(url.pathname, "/");
     return `//${trimEnd(url.hostname, ".")}${port}${path}${url.search}${url.hash}`;
   } catch {
     return uri;
+  }
+}
+
+/** The port written in a web address, or "" for none or the scheme's default. */
+function portOf(uri: string): string {
+  try {
+    return new URL(uri).port;
+  } catch {
+    return "";
+  }
+}
+
+function pathOf(uri: string): string {
+  try {
+    return new URL(uri).pathname;
+  } catch {
+    return "";
   }
 }
 

@@ -248,6 +248,16 @@ describe("validateControlledTerm: refused terms", () => {
     ).toBe("invalid_lccn");
   });
 
+  it("refuses the bare Nomenclature site and addresses with their own port", () => {
+    const nom = (uri: string): string | undefined =>
+      code({ label: "Lantern", uri, vocabulary: "nomenclature" });
+    expect(nom("https://nomenclature.info/")).toBe("not_a_term");
+    expect(nom("https://www.nomenclature.info")).toBe("not_a_term");
+    expect(nom("https://nomenclature.info:8443/nom/1")).toBe("wrong_site");
+    expect(nom("http://nomenclature.info:443/nom/1")).toBe("wrong_site");
+    expect(nom("https://nomenclature.info:443/nom/1")).toBeUndefined(); // the default port
+  });
+
   it("refuses a Nomenclature URI on another site", () => {
     expect(
       code({ label: "Lantern", uri: "https://example.org/nom/1", vocabulary: "nomenclature" }),
@@ -301,6 +311,8 @@ describe("termUriKey", () => {
     ]) {
       expect(termUriKey(uri), uri).not.toBe(key);
     }
+    // http on port 443 is not https.
+    expect(termUriKey("http://nomenclature.info:443/nom/1234")).not.toBe(key);
     expect(termUriKey("not a url")).toBe("not a url");
     expect(termUriKey("ftp://example.org/x")).toBe("ftp://example.org/x");
   });
