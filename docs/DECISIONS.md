@@ -176,3 +176,9 @@ System managers and site managers decide which record fields a site's record pag
 Publishing a site change runs a check first. Problems that break the WCAG 2.1 AA requirement (plan §5) block publishing until fixed: text that is too low in contrast to read, images with no alt text, controls with no accessible name, and click targets under 44 × 44 px (DESIGN.md §4). Minor problems only warn, and the editor can publish anyway: links that may be broken, and similar issues that can't be confirmed automatically. The exact list of which checks block is set when the editor is built (Phase 4).
 - **Rejected:** blocking on everything (an urgent notice could be held up by an unconfirmed link); warnings only (accessibility problems would pile up).
 
+## D-028 — Events: the one exception to complete separation (2026-11-21, John)
+Each site creates and manages its own events, and sites don't share them. The one exception to D-019's complete separation between organizations: in each site's admin, its site managers can see the events of every other site on the install, in any organization, and import the ones they want into their own calendar. John: "This is the only exception."
+- **Only published events are offered** for import, so drafts and anything not yet public never cross between organizations.
+- **An import is an independent copy** that the importing site owns and can edit, noting which site it came from. Nothing stays linked, so nothing keeps reading across afterwards. (Chosen by the autopilot because John didn't say; he can switch it to linked copies.)
+- **Nothing else crosses:** records, people, templates, media and every other kind of content stay separate as D-019 says. Any future request to share something else needs its own decision from John.
+
