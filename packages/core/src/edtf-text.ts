@@ -177,7 +177,26 @@ export function edtfFromText(
 
 function readRange(text: string, options: EdtfFromTextOptions): Piece {
   // "ca. 1920-1925": a qualifier in front applies to both ends.
-  const { rest, qualifier } = readQualifier(text);
+  const read = readQualifier(text);
+  const piece = readRangeParts(text, read.rest, read.qualifier, options);
+  // "1920-1925?": EDTF puts a qualifier on one end of an interval (LoC EDTF
+  // 2019, level 1 extended interval), but in free text a trailing "?" can
+  // doubt the end year or the whole range. Don't guess which (T-003a).
+  if (read.trailing && (piece.edtf.includes("/") || piece.edtf.includes(".."))) {
+    fail(
+      "ambiguous",
+      `In ${shown(text)} the “?” could doubt the end year or the whole range. Write “probably …” in front to doubt the whole range, or enter EDTF such as 1920/1925?.`,
+    );
+  }
+  return piece;
+}
+
+function readRangeParts(
+  text: string,
+  rest: string,
+  qualifier: string,
+  options: EdtfFromTextOptions,
+): Piece {
   // "between 1920 and 1925" is one unknown date in that span (DACS 2.4),
   // which EDTF writes as a one-of set; "from 1920 to 1925" is the whole span.
   const between = /^between (.+?) (?:and|-) (.+)$/.exec(rest);
@@ -283,8 +302,9 @@ function ambiguousForm(text: string): string | undefined {
   return undefined;
 }
 
-function readQualifier(text: string): { rest: string; qualifier: string } {
+function readQualifier(text: string): { rest: string; qualifier: string; trailing: boolean } {
   let rest = text;
+  let trailing = false;
   let approximate = false;
   let uncertain = false;
   for (let round = 0; round < 2; round++) {
@@ -321,10 +341,11 @@ function readQualifier(text: string): { rest: string; qualifier: string } {
   }
   if (rest.endsWith("?")) {
     uncertain = true;
+    trailing = true;
     rest = rest.slice(0, -1).trim();
   }
   const qualifier = approximate && uncertain ? "%" : approximate ? "~" : uncertain ? "?" : "";
-  return { rest, qualifier };
+  return { rest, qualifier, trailing };
 }
 
 function readSingle(raw: string, qualifier: string, options: EdtfFromTextOptions): Piece {

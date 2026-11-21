@@ -19,8 +19,9 @@
  * (`Y-17E7`) and significant digits (`1950S2`). They are for geological and
  * astronomical time, not collections.
  * Deliberately strict: each part takes one qualifier, and a date takes only
- * one qualifier after its parts (`2004?-06~-11` is rejected; write
- * `?2004-~06-11`).
+ * one qualifier after its parts. `2004?-06~-11` is not among the spec's
+ * examples and is rejected; the error gives the same meaning written with
+ * prefixes, `%2004-~06-11` (a suffix also applies to every part on its left).
  *
  * Every valid date gets `earliest` and `latest` calendar days. They are
  * guaranteed to contain every day the expression could mean, and can be a
@@ -309,6 +310,31 @@ const GROUPINGS: Readonly<Record<number, Grouping>> = {
   41: [0, 7, 1, 0, 12, 31],
 };
 
+/**
+ * The same meaning written with prefix qualifiers only. A suffix applies to
+ * its part and every part to its left (LoC EDTF 2019, level 2 group
+ * qualification), so `2004?-06~-11` means the year is uncertain and
+ * approximate and the month approximate: `%2004-~06-11`.
+ */
+function prefixForm(
+  parts: readonly string[],
+  prefixes: readonly (string | undefined)[],
+  suffixes: readonly (string | undefined)[],
+): string {
+  return parts
+    .map((part, i) => {
+      let { uncertain, approximate } = qualOf(prefixes[i]);
+      for (const q of suffixes.slice(i)) {
+        const parsed = qualOf(q);
+        uncertain ||= parsed.uncertain;
+        approximate ||= parsed.approximate;
+      }
+      const q = uncertain && approximate ? "%" : uncertain ? "?" : approximate ? "~" : "";
+      return `${q}${part}`;
+    })
+    .join("-");
+}
+
 function parseDate(text: string): Span {
   const span = parseDateBounds(text);
   // A year whose first digit is X (XXXX, XXX1) says nothing useful about
@@ -339,7 +365,10 @@ function parseDateBounds(text: string): Omit<Span, "anchor"> {
   let uncertain = false;
   let approximate = false;
   if (suffixes.filter((q) => q !== undefined).length > 1) {
-    fail("invalid_syntax", "A date can have only one qualifier (?, ~ or %) after its parts.");
+    fail(
+      "invalid_syntax",
+      `A date can have only one qualifier (?, ~ or %) after its parts. Put each qualifier in front of the part it applies to instead: ${prefixForm(parts, prefixes, suffixes)}.`,
+    );
   }
   for (let i = 0; i <= last; i++) {
     const pre = prefixes[i];

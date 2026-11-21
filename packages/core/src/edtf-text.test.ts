@@ -32,6 +32,7 @@ describe("edtfFromText", () => {
     ["c. 1920", "1920~"],
     ["approx. 1920", "1920~"],
     ["1920?", "1920?"],
+    ["1920s?", "192X?"],
     ["probably 1920", "1920?"],
     ["ca. 1920?", "1920%"],
     ["about June 1920", "1920-06~"],
@@ -120,6 +121,9 @@ describe("edtfFromText", () => {
     ["mid-1950s to late 1960s", "195X/196X"],
     ["1920-06", "1920-06"],
     ["ca. 1920-1925", "1920~/1925~"],
+    // A qualifier in front doubts the whole range (T-003a).
+    ["probably 1920-1925", "1920?/1925?"],
+    ["probably between 1920 and 1925", "[1920?..1925?]"],
   ])("range %j", (text, edtf) => {
     expect(read(text).edtf).toBe(edtf);
   });
@@ -139,6 +143,13 @@ describe("edtfFromText", () => {
     ["ca. 1920-25?", "ambiguous"],
     ["1920-25.", "ambiguous"],
     ["1920-25?", "ambiguous"],
+    // A trailing "?" after a range could doubt the end or the whole (T-003a).
+    ["1920-1925?", "ambiguous"],
+    ["1920 - 1925 ?", "ambiguous"],
+    ["ca. 1920-1925?", "ambiguous"],
+    ["from 1920 to 1925?", "ambiguous"],
+    ["between 1920 and 1925?", "ambiguous"],
+    ["1920s-1930s?", "ambiguous"],
     ["1920-21~", "ambiguous"],
     ["1901-12", "ambiguous"],
     ["1905-08", "ambiguous"],
