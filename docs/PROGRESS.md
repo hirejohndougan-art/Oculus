@@ -2,6 +2,15 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-21 03:27 CT — upkeep — U-001 Direct tests for the shared helpers
+- Result: done
+- What changed: `npm outdated` shows only TypeScript 7 and Vite 8, both new majors turned down in D-006; the blockers still hold (typescript-eslint 8.73 peers TypeScript `<6.1`; Vite 8 requires MPL-2.0 `lightningcss`), so no bump and T-001b now tracks them. Everything else is current. Nine public helpers that every validator relies on had no tests of their own; `plain-data.test.ts` and `helpers.test.ts` now check their results directly (frozen copy, every refusal code and path, each limit at and over its edge, bounded work on hostile input). Tests only, no code changed; nothing they found was a bug. Commit 2436814.
+- Decisions: none (D-006 still covers the two majors)
+- Review: n/a (tests only)
+- Note: local `main` in the sandbox was stale again (origin/main had been rewritten before this run, not by it); this run started from origin/main and pushed a fast-forward.
+- Gate: PASS · tests_passing 1393 (was 1278) · npm audit clean
+- Next: T-005a Safe template changes (risky)
+
 ## 2026-11-21 02:30 CT — manual (John) — D-019 Several organizations per install
 - Result: done (decision recorded; no code)
 - What changed: John's decision that each site's organization has its own IDs, rights, people and roles (the Society's archives and the library it hosts). PLATFORM_PLAN.md decision 3 updated; new task T-019 (organizations in the model) added before the schema, and T-025 and T-041 now depend on it.
