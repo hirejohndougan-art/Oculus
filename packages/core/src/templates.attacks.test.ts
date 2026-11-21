@@ -6,6 +6,7 @@ import {
   checkRecordAgainstTemplate,
   validateRecord,
   validateTemplate,
+  webUrlProblem,
   type CatalogRecord,
   type FieldTemplate,
   type Validated,
@@ -231,5 +232,132 @@ describe("hostile record values", () => {
       },
     } as unknown as CatalogRecord;
     expect(checkRecordAgainstTemplate(fake, tpl).map((i) => i.code)).toEqual(["unreadable"]);
+  });
+});
+
+// Findings of the independent review of T-005. Each test fails without its fix.
+describe("review fixes", () => {
+  function rec(fields: Record<string, unknown>): CatalogRecord {
+    const r = validateRecord({
+      kind: "object",
+      id: ID,
+      title: "X",
+      createdAt: T,
+      updatedAt: T,
+      fields,
+    });
+    if (!r.ok) throw new Error(JSON.stringify(r.issues));
+    return r.value;
+  }
+  function t(fields: unknown[]): FieldTemplate {
+    const r = validateTemplate(base(fields));
+    if (!r.ok) throw new Error(JSON.stringify(r.issues));
+    return r.value;
+  }
+  function listField(i: number): Record<string, unknown> {
+    return field({
+      key: `list_${String(i)}`,
+      kind: "list",
+      options: Array.from({ length: 500 }, (_, j) => ({ value: `v${String(j)}`, label: "Label" })),
+    });
+  }
+
+  it("1. accepts 20 list fields of 500 options, and names the field that goes over the total", () => {
+    const twenty = Array.from({ length: 20 }, (_, i) => listField(i));
+    expect(validateTemplate(base(twenty)).ok).toBe(true);
+    const r = validateTemplate(base([...twenty, listField(20)]));
+    expect(codes(r)).toEqual(["too_many_options"]);
+    expect(r.ok ? [] : r.issues.map((i) => i.path.join("."))).toEqual(["fields.20.options"]);
+  });
+
+  it("2. fails closed on a template that never went through validateTemplate", () => {
+    const unknownKind = {
+      ...base(),
+      fields: [field({ kind: "number" })],
+    } as unknown as FieldTemplate;
+    expect(
+      checkRecordAgainstTemplate(rec({ note: "anything" }), unknownKind).map((i) => i.code),
+    ).toEqual(["invalid_template"]);
+    const noVisibility = base([{ ...field(), visibility: undefined }]) as unknown as FieldTemplate;
+    expect(checkRecordAgainstTemplate(rec({}), noVisibility).map((i) => i.code)).toEqual([
+      "invalid_template",
+    ]);
+  });
+
+  it("3. ignores optional settings inherited from a polluted Object.prototype", () => {
+    const proto = Object.prototype as Record<string, unknown>;
+    const tpl = t([
+      field(),
+      field({ key: "term", kind: "controlled_term" }),
+      field({ key: "date", kind: "date", required: true, inherited: true }),
+    ]);
+    const called: string[] = [];
+    proto.maxLength = 1e9;
+    proto.vocabularies = ["nothing"];
+    proto.allowMissingInherited = true;
+    proto.text = () => {
+      called.push("text");
+      return [];
+    };
+    try {
+      const issues = checkRecordAgainstTemplate(
+        rec({ note: "x".repeat(5000), term: { label: "Depots", vocabulary: "lcsh" } }),
+        tpl,
+        { checkers: {} },
+      );
+      expect(issues.map((i) => i.code).sort()).toEqual(["invalid_text", "required"]);
+      expect(called).toEqual([]);
+    } finally {
+      delete proto.maxLength;
+      delete proto.vocabularies;
+      delete proto.allowMissingInherited;
+      delete proto.text;
+    }
+  });
+
+  it("4. fails closed when a checker's path has parts that aren't text or whole numbers", () => {
+    const tpl = t([field()]);
+    for (const path of [[{}], ["uri", null], [1.5], [Number.NaN]]) {
+      const issues = checkRecordAgainstTemplate(rec({ note: "x" }), tpl, {
+        checkers: { text: () => [{ code: "bad", message: "Bad.", path: path as string[] }] },
+      });
+      expect(issues.map((i) => i.code)).toEqual(["check_failed"]);
+    }
+  });
+
+  it("5. refuses prototype keys as template keys and codes", () => {
+    expect(codes(validateTemplate({ ...base(), key: "constructor" }))).toEqual(["invalid_key"]);
+    expect(codes(validateTemplate({ ...base(), key: "prototype" }))).toEqual(["invalid_key"]);
+    expect(
+      codes(
+        validateTemplate(base([field({ kind: "controlled_term", vocabularies: ["constructor"] })])),
+      ),
+    ).toEqual(["invalid_code"]);
+    expect(
+      codes(
+        validateTemplate(base([field({ kind: "identifier", identifierTypes: ["prototype"] })])),
+      ),
+    ).toEqual(["invalid_code"]);
+    expect(
+      codes(
+        validateTemplate(base([field({ standards: [{ standard: "constructor", element: "x" }] })])),
+      ),
+    ).toEqual(["invalid_code"]);
+    const tpl = t([field({ key: "term", kind: "controlled_term" })]);
+    const issues = checkRecordAgainstTemplate(
+      rec({ term: { label: "x", vocabulary: "constructor" } }),
+      tpl,
+    );
+    expect(issues.map((i) => i.code)).toEqual(["invalid_code"]);
+  });
+
+  it("6. refuses backslashes in web addresses", () => {
+    for (const url of [
+      "https://\\evil.example/",
+      "https://example.org\\@evil.example/",
+      "https://example.org/a\\b",
+    ]) {
+      expect(webUrlProblem(url), url).toBeDefined();
+    }
   });
 });

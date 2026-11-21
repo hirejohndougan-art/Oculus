@@ -141,18 +141,29 @@ export const MAX_URL_LENGTH = 2000;
 /** The longest an identifier value, a term label or a place name may be. */
 export const MAX_SHORT_TEXT_LENGTH = 500;
 
+/** All the options in all a template's list fields together. */
+export const MAX_TEMPLATE_OPTIONS = 10_000;
+
+// Room for a template at every per-item limit: up to 200 fields of about 400
+// values each without options (80,000), plus 10,000 options of 5 values each
+// (50,000). Text: 10,000 options with two 200-character parts (4,000,000),
+// plus help text and labels on every field.
 const TEMPLATE_READ_LIMITS: ReadLimits = {
   maxDepth: 6,
-  maxValues: 50_000,
+  maxValues: 150_000,
   maxStringLength: MAX_HELP_LENGTH,
   maxKeyLength: 64,
-  maxTotalChars: 1_000_000,
+  maxTotalChars: 5_000_000,
 };
 
 /** The same rule `validateRecord` applies to keys in `fields`. */
 const FIELD_KEY = /^[a-z][a-z0-9_]{0,63}$/;
 /** Template keys, standard codes, vocabulary codes and identifier types. */
 const CODE = /^[a-z][a-z0-9_-]{0,63}$/;
+/** A code that matches CODE and isn't a prototype key (`constructor`, `prototype`). */
+function isCode(value: unknown): value is string {
+  return typeof value === "string" && CODE.test(value) && !FORBIDDEN_KEYS.has(value);
+}
 const LINE_BREAKS = /[\t\n\r\u2028\u2029]/;
 
 const TEMPLATE_KEYS: ReadonlySet<string> = new Set([
@@ -197,14 +208,19 @@ export function isFieldKey(key: unknown): key is string {
 /**
  * Why `text` isn't an acceptable web address, or undefined if it is. Only
  * http and https, with a host and no user name or password (which would be
- * published with the link). Nothing is ever fetched.
+ * published with the link). Backslashes are refused: browsers and servers
+ * read them differently (`https://example.org\@evil.example/`).
+ *
+ * This is a check on what is stored, not a fetch guard. It does not block
+ * internal hosts (`localhost`, `10.0.0.1`, `169.254.169.254`), so anything
+ * that later fetches these URLs (a link checker) must do its own SSRF checks.
  */
 export function webUrlProblem(text: string): string | undefined {
   if (text.length > MAX_URL_LENGTH) {
     return `is longer than ${String(MAX_URL_LENGTH)} characters`;
   }
-  if (!/^https?:\/\/[^\s/?#]/.test(text) || /\s/.test(text)) {
-    return "must be a web address starting with http:// or https://, with no spaces";
+  if (!/^https?:\/\/[^\s/?#\\]/.test(text) || /[\s\\]/.test(text)) {
+    return "must be a web address starting with http:// or https://, with no spaces or backslashes";
   }
   let url: URL;
   try {
@@ -252,7 +268,7 @@ function checkTemplate(input: unknown): Validated<FieldTemplate> {
   const t = ownOnly(copy);
 
   unknownProps(t, TEMPLATE_KEYS, [], "a template", issues);
-  if (typeof t.key !== "string" || !CODE.test(t.key)) {
+  if (!isCode(t.key)) {
     issues.add(
       ["key"],
       "invalid_key",
@@ -274,8 +290,22 @@ function checkTemplate(input: unknown): Validated<FieldTemplate> {
     );
   } else {
     const seen = new Set<string>();
+    let options = 0;
+    let reported = false;
     (fields as readonly JsonValue[]).forEach((field, i) => {
       if (issues.full) return;
+      if (isPlainObject(field) && Object.hasOwn(field, "options")) {
+        const list = field.options;
+        options += Array.isArray(list) ? list.length : 0;
+        if (options > MAX_TEMPLATE_OPTIONS && !reported) {
+          reported = true;
+          issues.add(
+            ["fields", i, "options"],
+            "too_many_options",
+            `All the list fields together can have at most ${String(MAX_TEMPLATE_OPTIONS)} options; this field goes over.`,
+          );
+        }
+      }
       const key = checkField(field, ["fields", i], issues);
       if (key === undefined) return;
       if (seen.has(key)) {
@@ -436,7 +466,7 @@ function checkCodes(
   }
   const seen = new Set<string>();
   (value as readonly JsonValue[]).forEach((code, i) => {
-    if (typeof code !== "string" || !CODE.test(code)) {
+    if (!isCode(code)) {
       issues.add(
         [...path, i],
         "invalid_code",
@@ -475,7 +505,7 @@ function checkStandards(
     }
     const m = ownOnly(mapping);
     unknownProps(m, new Set(["standard", "element", "uri"]), [...path, i], "a mapping", issues);
-    if (typeof m.standard !== "string" || !CODE.test(m.standard)) {
+    if (!isCode(m.standard)) {
       issues.add(
         [...path, i, "standard"],
         "invalid_code",
@@ -552,17 +582,36 @@ export interface TemplateCheckOptions {
 }
 
 /**
- * Check a record's `fields` against its template. Both must already be
- * validated (`validateRecord`, `validateTemplate`). Returns every problem
- * found, or an empty list. Never throws.
+ * Check a record's `fields` against its template. The record must already
+ * be validated (`validateRecord`). The template is validated again here, so
+ * a template that never went through `validateTemplate` fails closed with
+ * `invalid_template` instead of letting values through. Returns every
+ * problem found, or an empty list. Never throws.
+ *
+ * Optional settings, in the template and in `options`, are read only as own
+ * properties, so a polluted `Object.prototype` can't change them.
  */
 export function checkRecordAgainstTemplate(
   record: CatalogRecord,
-  template: FieldTemplate,
+  untrustedTemplate: FieldTemplate,
   options: TemplateCheckOptions = {},
 ): Issue[] {
   const issues = new IssueList();
   try {
+    const checked = validateTemplate(untrustedTemplate);
+    if (!checked.ok) {
+      issues.add(
+        [],
+        "invalid_template",
+        "The template is not valid, so the record can't be checked against it. Check it with validateTemplate.",
+      );
+      return issues.items;
+    }
+    const template = checked.value;
+    const settings: CheckSettings = {
+      allowMissingInherited: ownValue(options, "allowMissingInherited") === true,
+      checkers: ownValue(options, "checkers"),
+    };
     if (!template.appliesTo.includes(record.kind)) {
       issues.add(
         ["kind"],
@@ -571,8 +620,13 @@ export function checkRecordAgainstTemplate(
       );
       return issues.items;
     }
+    // Null-prototype copies: an optional setting that isn't there reads as
+    // undefined, never as something inherited.
+    const fields = template.fields.map(
+      (f) => Object.freeze(Object.assign(Object.create(null) as object, f)) as FieldDefinition,
+    );
     const byKey = new Map<string, FieldDefinition>();
-    for (const field of template.fields) byKey.set(field.key, field);
+    for (const field of fields) byKey.set(field.key, field);
 
     for (const key of Object.keys(record.fields)) {
       if (!byKey.has(key)) {
@@ -584,12 +638,12 @@ export function checkRecordAgainstTemplate(
       }
     }
 
-    for (const field of template.fields) {
+    for (const field of fields) {
       if (issues.full) break;
       const path = ["fields", field.key];
       const value = Object.hasOwn(record.fields, field.key) ? record.fields[field.key] : undefined;
       if (value === undefined) {
-        if (field.required && !(field.inherited && options.allowMissingInherited === true)) {
+        if (field.required && !(field.inherited && settings.allowMissingInherited)) {
           issues.add(path, "required", `${shown(field.label)} is required.`);
         }
         continue;
@@ -599,11 +653,11 @@ export function checkRecordAgainstTemplate(
         continue;
       }
       if (field.repeatable) {
-        checkRepeated(value, field, path, record, options, issues);
+        checkRepeated(value, field, path, record, settings, issues);
       } else if (Array.isArray(value)) {
         issues.add(path, "not_repeatable", `${shown(field.label)} takes one value, not a list.`);
       } else {
-        checkOne(value, field, path, record, options, issues);
+        checkOne(value, field, path, record, settings, issues);
       }
     }
   } catch {
@@ -617,7 +671,7 @@ function checkRepeated(
   field: FieldDefinition,
   path: readonly (string | number)[],
   record: CatalogRecord,
-  options: TemplateCheckOptions,
+  settings: CheckSettings,
   issues: IssueList,
 ): void {
   if (!Array.isArray(value)) {
@@ -649,7 +703,7 @@ function checkRepeated(
       issues.add([...path, i], "invalid_value", "Each value in the list must be a single value.");
       return;
     }
-    checkOne(item, field, [...path, i], record, options, issues);
+    checkOne(item, field, [...path, i], record, settings, issues);
     if (issues.count > before) return;
     // Exact repeats only: the same object with its keys in another order
     // isn't caught, which is harmless.
@@ -664,17 +718,20 @@ function checkOne(
   field: FieldDefinition,
   path: readonly (string | number)[],
   record: CatalogRecord,
-  options: TemplateCheckOptions,
+  settings: CheckSettings,
   issues: IssueList,
 ): void {
   const before = issues.count;
   checkShape(value, field, path, issues);
   if (issues.count > before) return;
-  const checker = options.checkers?.[field.kind];
+  const checker = ownValue(settings.checkers, field.kind);
   if (checker === undefined) return;
   let problems: unknown;
   try {
-    problems = checker(value, field, record);
+    problems =
+      typeof checker === "function"
+        ? (checker as FieldValueChecker)(value, field, record)
+        : undefined;
   } catch {
     problems = undefined;
   }
@@ -694,8 +751,12 @@ function checkOne(
     }
     const sub = (p.path ?? []) as readonly unknown[];
     const parts = sub.filter(
-      (x): x is string | number => typeof x === "string" || typeof x === "number",
+      (x): x is string | number => typeof x === "string" || Number.isInteger(x),
     );
+    if (parts.length !== sub.length) {
+      issues.add(path, "check_failed", `${shown(field.label)} could not be checked.`);
+      return;
+    }
     issues.add([...path, ...parts], p.code, p.message);
   }
 }
@@ -802,7 +863,25 @@ function checkShape(
       }
       return;
     }
+    default:
+      // Unreachable for a validated template; fail closed if it ever happens.
+      issues.add(
+        path,
+        "invalid_kind",
+        "This field's kind is unknown, so no value can be accepted.",
+      );
   }
+}
+
+interface CheckSettings {
+  readonly allowMissingInherited: boolean;
+  readonly checkers: unknown;
+}
+
+/** `obj[key]` if it is an own property of an object, otherwise undefined. */
+function ownValue(obj: unknown, key: string): unknown {
+  if (typeof obj !== "object" || obj === null || !Object.hasOwn(obj, key)) return undefined;
+  return (obj as Record<string, unknown>)[key];
 }
 
 function objectValue(
@@ -841,7 +920,7 @@ function checkAllowedCode(
 ): void {
   if (value === undefined) {
     issues.add(path, "required", `This value needs a ${what}.`);
-  } else if (typeof value !== "string" || !CODE.test(value)) {
+  } else if (!isCode(value)) {
     issues.add(
       path,
       "invalid_code",
