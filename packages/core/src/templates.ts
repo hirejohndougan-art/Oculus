@@ -30,6 +30,11 @@
  * its vocabulary (T-009), an identifier type exists and is unique (T-004), a
  * rights URI is a known statement (T-007) or a place record exists is for
  * those modules: they plug in through `TemplateCheckOptions.checkers`.
+ * The ready-made ones are in `field-checkers.ts` (D-015). The rights checker
+ * runs by default. The identifier checker needs the organization's
+ * identifier types, so the caller must pass one (`makeIdentifierChecker`):
+ * without it, identifier values are refused with `unchecked`, never accepted
+ * unchecked.
  *
  * A field is `required` (the record must have a value) and/or `repeatable`
  * (the value is a list of one or more values; otherwise it is one value).
@@ -49,6 +54,7 @@ import {
   type ReadLimits,
 } from "./plain-data.js";
 import { parseEdtf } from "./edtf.js";
+import { checkRightsValue } from "./field-checkers.js";
 import { isRecordId } from "./record-id.js";
 import { RECORD_KINDS, isRecordKind, type CatalogRecord, type RecordKind } from "./records.js";
 import { types } from "node:util";
@@ -572,7 +578,14 @@ export type FieldValueChecker = (
 ) => readonly FieldProblem[];
 
 export interface TemplateCheckOptions {
-  readonly checkers?: Readonly<Partial<Record<FieldKind, FieldValueChecker>>>;
+  /**
+   * Checkers by field kind. One given here replaces the default for its kind
+   * (`rights` has one). Leaving a kind out, or giving `undefined`, keeps the
+   * default, so a default can't be switched off by accident; to skip a check
+   * on purpose, pass a checker that returns `[]`. Values of the `identifier`
+   * kind are refused (`unchecked`) unless a checker is given.
+   */
+  readonly checkers?: Readonly<Partial<Record<FieldKind, FieldValueChecker | undefined>>>;
   /**
    * Don't report a missing required field that is `inherited`, because a
    * unit higher up may supply it. Use when saving one unit; check the
@@ -724,8 +737,18 @@ function checkOne(
   const before = issues.count;
   checkShape(value, field, path, issues);
   if (issues.count > before) return;
-  const checker = ownValue(settings.checkers, field.kind);
-  if (checker === undefined) return;
+  const given = ownValue(settings.checkers, field.kind);
+  const checker = given === undefined ? DEFAULT_CHECKERS.get(field.kind) : given;
+  if (checker === undefined) {
+    if (CHECKER_REQUIRED.has(field.kind)) {
+      issues.add(
+        path,
+        "unchecked",
+        `${shown(field.label)} can't be checked without the organization's identifier types, so it can't be accepted. Pass checkers.identifier (makeIdentifierChecker).`,
+      );
+    }
+    return;
+  }
   let problems: unknown;
   try {
     problems =
@@ -872,6 +895,14 @@ function checkShape(
       );
   }
 }
+
+/** Checkers that run when the caller gives none for the kind (D-015). */
+const DEFAULT_CHECKERS: ReadonlyMap<FieldKind, FieldValueChecker> = new Map<
+  FieldKind,
+  FieldValueChecker
+>([["rights", checkRightsValue]]);
+/** Kinds whose values are refused when no checker is given, because no default can exist. */
+const CHECKER_REQUIRED: ReadonlySet<FieldKind> = new Set<FieldKind>(["identifier"]);
 
 interface CheckSettings {
   readonly allowMissingInherited: boolean;

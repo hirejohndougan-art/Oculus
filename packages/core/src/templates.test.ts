@@ -5,11 +5,13 @@ import {
   MAX_TEXT_LENGTH,
   checkRecordAgainstTemplate,
   isFieldKey,
+  makeIdentifierChecker,
   validateRecord,
   validateTemplate,
   webUrlProblem,
   type CatalogRecord,
   type FieldTemplate,
+  type FieldValueChecker,
   type Issue,
   type TemplateCheckOptions,
   type Validated,
@@ -137,8 +139,28 @@ function goodFields(): Record<string, unknown> {
   };
 }
 
-function check(fields: Record<string, unknown>, options?: TemplateCheckOptions): Issue[] {
-  return checkRecordAgainstTemplate(record(fields), template(), options);
+/** The sample organization's identifier types. Invented. */
+const IDENTIFIER_TYPES = [
+  { key: "accession", label: "Accession number", uniqueness: "all_time" },
+  { key: "legacy", label: "Legacy number", uniqueness: "none" },
+];
+
+function identifierChecker(): FieldValueChecker {
+  const made = makeIdentifierChecker(IDENTIFIER_TYPES);
+  if (!made.ok) throw new Error(JSON.stringify(made.issues));
+  return made.value;
+}
+
+/**
+ * Checks against the full template. The identifier kind has no default
+ * checker (D-015), so the sample organization's one is passed unless the
+ * test passes its own.
+ */
+function check(fields: Record<string, unknown>, options: TemplateCheckOptions = {}): Issue[] {
+  return checkRecordAgainstTemplate(record(fields), template(), {
+    ...options,
+    checkers: { identifier: identifierChecker(), ...options.checkers },
+  });
 }
 
 function without(key: string): Record<string, unknown> {
@@ -399,9 +421,10 @@ describe("checkRecordAgainstTemplate: the record as a whole", () => {
   });
 
   it("accepts each kind the template lists", () => {
-    expect(checkRecordAgainstTemplate(record(goodFields(), "archival_unit"), template())).toEqual(
-      [],
-    );
+    const checkers = { identifier: identifierChecker() };
+    expect(
+      checkRecordAgainstTemplate(record(goodFields(), "archival_unit"), template(), { checkers }),
+    ).toEqual([]);
   });
 
   it("reports fields the template doesn't have", () => {
