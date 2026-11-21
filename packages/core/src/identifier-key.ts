@@ -9,13 +9,14 @@
  *
  * 1. applies Unicode NFKC, which turns full-width, superscript, ligature and
  *    other compatibility forms into their plain letters and digits;
- * 2. folds case (upper, then lower, so `ß` and `SS` meet);
- * 3. turns Cyrillic and Greek letters that look like Latin letters into those
- *    Latin letters, and every kind of dash or minus into `-`;
+ * 2. turns Cyrillic, Greek and Armenian letters that look like Latin letters
+ *    into those Latin letters, and every kind of dash or minus into `-`;
+ * 3. folds case (upper, then lower, so `ß` and `SS` meet);
  * 4. removes all spaces and invisible (default-ignorable) characters.
  *
  * The key is deliberately conservative: it can make two different
- * identifiers compare equal (a Cyrillic `в` meets a Latin `b`), but it should
+ * identifiers compare equal (a Cyrillic small `в`, shaped like a small
+ * capital B, meets a Latin `b`), but it should
  * never let two identifiers that look the same compare different. For a
  * uniqueness check or a search, a false "same" is a question for a person; a
  * false "different" is a duplicate number nobody notices. Digits and letters
@@ -23,9 +24,35 @@
  * because real numbering schemes use both.
  */
 
-/** Lowercase Cyrillic and Greek letters (after case folding) and the Latin letter they look like. */
+/**
+ * Cyrillic, Greek and Armenian letters that look like a Latin letter, and that
+ * letter. Applied before case folding, with capital and small forms listed
+ * separately, because they can look like different Latin letters (Greek `Η`
+ * looks like `H`, small `η` like `n`). The cost: inside Greek or Cyrillic text,
+ * such a capital and its small form no longer compare equal.
+ */
 const LOOKALIKES: ReadonlyMap<string, string> = new Map([
-  // Cyrillic, lower case forms of letters that look Latin in either case
+  ["А", "A"],
+  ["В", "B"],
+  ["Е", "E"],
+  ["Ё", "Ë"],
+  ["К", "K"],
+  ["М", "M"],
+  ["Н", "H"],
+  ["О", "O"],
+  ["Р", "P"],
+  ["С", "C"],
+  ["Т", "T"],
+  ["У", "Y"],
+  ["Х", "X"],
+  ["Ѕ", "S"],
+  ["І", "I"],
+  ["Ї", "Ï"],
+  ["Ј", "J"],
+  ["Һ", "H"],
+  ["Ԛ", "Q"],
+  ["Ԝ", "W"],
+  ["Ӏ", "I"],
   ["а", "a"],
   ["в", "b"],
   ["е", "e"],
@@ -48,22 +75,40 @@ const LOOKALIKES: ReadonlyMap<string, string> = new Map([
   ["ԛ", "q"],
   ["ԝ", "w"],
   ["ӏ", "l"],
-  // Greek
+  ["п", "n"],
+  ["г", "r"],
+  ["Α", "A"],
+  ["Β", "B"],
+  ["Ε", "E"],
+  ["Ζ", "Z"],
+  ["Η", "H"],
+  ["Ι", "I"],
+  ["Κ", "K"],
+  ["Μ", "M"],
+  ["Ν", "N"],
+  ["Ο", "O"],
+  ["Ρ", "P"],
+  ["Τ", "T"],
+  ["Υ", "Y"],
+  ["Χ", "X"],
+  ["Ϲ", "C"],
   ["α", "a"],
-  ["β", "b"],
   ["ε", "e"],
-  ["ζ", "z"],
-  ["η", "h"],
   ["ι", "i"],
   ["κ", "k"],
-  ["μ", "m"],
-  ["ν", "n"],
+  ["ν", "v"],
   ["ο", "o"],
   ["ρ", "p"],
   ["τ", "t"],
-  ["υ", "y"],
+  ["υ", "u"],
   ["χ", "x"],
-  // Latin dotless i
+  ["η", "n"],
+  ["ϲ", "c"],
+  ["օ", "o"],
+  ["ս", "u"],
+  ["հ", "h"],
+  ["ո", "n"],
+  ["ց", "g"],
   ["ı", "i"],
   // Dashes and minus signs (full-width and small forms are handled by NFKC)
   ["\u2010", "-"],
@@ -84,7 +129,7 @@ const SPACE_OR_INVISIBLE = /[\s\p{Default_Ignorable_Code_Point}]+/gu;
  * identifier". Never shown to people and never stored as the identifier.
  */
 export function identifierKey(value: string): string {
-  const folded = value.normalize("NFKC").toUpperCase().toLowerCase();
-  const mapped = folded.replace(ANY_CHAR, (ch) => LOOKALIKES.get(ch) ?? ch);
-  return mapped.normalize("NFKC").replace(SPACE_OR_INVISIBLE, "");
+  const mapped = value.normalize("NFKC").replace(ANY_CHAR, (ch) => LOOKALIKES.get(ch) ?? ch);
+  const folded = mapped.toUpperCase().toLowerCase();
+  return folded.normalize("NFKC").replace(SPACE_OR_INVISIBLE, "");
 }

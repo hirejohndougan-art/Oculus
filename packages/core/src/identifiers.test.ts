@@ -566,6 +566,13 @@ describe("nextIdentifier", () => {
     expect(nextIdentifier(OBJECT_NO, all)).toEqual({ ok: true, value: "DHS-0051" });
   });
 
+  it("a number past the limit can't make a type without a format run out (review fix)", () => {
+    const rest: IdentifierType = { ...OBJECT_NO };
+    delete (rest as { pattern?: string }).pattern;
+    const all = [set(a, [["object_number", "DHS-12"]], [["object_number", "DHS-9999999999999"]])];
+    expect(nextIdentifier(rest, all)).toEqual({ ok: true, value: "DHS-0013" });
+  });
+
   it("says which number filled the format", () => {
     const r = nextIdentifier(OBJECT_NO, [set(a, [["object_number", "DHS-9999"]])]);
     expect(r.ok ? "" : r.issues[0]?.message).toBe(
@@ -679,6 +686,7 @@ describe("retireIdentifier", () => {
         note: "First time\nSecond time",
       },
     ]);
+    expect(r.ok && droppedIdentifiers(again, r.value)).toEqual([]);
     const plain = retireIdentifier(again, { type: "object_number", value: "DHS-0001" });
     expect(plain.ok && plain.value.former).toEqual(again.former);
     const long = retireIdentifier(
@@ -732,8 +740,8 @@ describe("droppedIdentifiers", () => {
     const before = set(id, [["object_number", "DHS-0001"]], [["omeka_id", "77"]]);
     const after = set(id, [["object_number", "DHS-0002"]]);
     expect(droppedIdentifiers(before, after)).toEqual([
-      { type: "object_number", value: "DHS-0001" },
-      { type: "omeka_id", value: "77" },
+      { type: "object_number", value: "DHS-0001", lost: "identifier" },
+      { type: "omeka_id", value: "77", lost: "identifier" },
     ]);
   });
 
@@ -741,7 +749,37 @@ describe("droppedIdentifiers", () => {
     const before = set(id, [["object_number", "DHS-0001"]]);
     expect(droppedIdentifiers(before, set(id, [], [["object_number", "DHS-0001"]]))).toEqual([]);
     expect(droppedIdentifiers(before, set(id, [["object_number", "dhs-0001"]]))).toEqual([
-      { type: "object_number", value: "DHS-0001" },
+      { type: "object_number", value: "DHS-0001", lost: "identifier" },
     ]);
+  });
+
+  it("reports a former entry whose date or note was lost (review fix)", () => {
+    const later = "2027-01-05T10:00:00.000Z";
+    const before: RecordIdentifiers = {
+      recordId: id,
+      current: [],
+      former: [{ type: "omeka_id", value: "77", retiredAt: T, note: "Old site" }],
+    };
+    const after = (f: { retiredAt?: string; note?: string }): RecordIdentifiers => ({
+      recordId: id,
+      current: [],
+      former: [{ type: "omeka_id", value: "77", ...f }],
+    });
+    expect(droppedIdentifiers(before, after({}))).toEqual([
+      { type: "omeka_id", value: "77", lost: "history" },
+    ]);
+    expect(droppedIdentifiers(before, after({ retiredAt: T }))).toHaveLength(1);
+    expect(droppedIdentifiers(before, after({ note: "Old site" }))).toHaveLength(1);
+    expect(droppedIdentifiers(before, after({ retiredAt: T, note: "Other" }))).toHaveLength(1);
+    expect(
+      droppedIdentifiers(
+        before,
+        after({ retiredAt: "2020-01-01T00:00:00.000Z", note: "Old site" }),
+      ),
+    ).toHaveLength(1);
+    // What retireIdentifier does on a second retirement is not a loss.
+    expect(
+      droppedIdentifiers(before, after({ retiredAt: later, note: "Old site\nAgain" })),
+    ).toEqual([]);
   });
 });

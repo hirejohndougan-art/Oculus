@@ -32,6 +32,14 @@ describe("identifierKey", () => {
     expect(same("box", "Ьox")).toBe(false); // Cyrillic soft sign doesn't look like b
   });
 
+  it("maps capital and small forms to the Latin letter each looks like (review fix)", () => {
+    expect(same("HAN-1", "ΗΑΝ-1")).toBe(true); // Greek capitals Η Α Ν
+    expect(same("nav-1", "ηαν-1")).toBe(true); // Greek small η α ν look like n a v
+    expect(same("nu-1", "пս-1")).toBe(true); // Cyrillic п, Armenian ս
+    expect(same("ro-1", "гօ-1")).toBe(true); // Cyrillic г, Armenian օ
+    expect(same("Ηη", "ΗΗ")).toBe(false); // the documented cost, inside Greek text
+  });
+
   it("treats every dash and minus as a hyphen", () => {
     for (const dash of ["\u2010", "\u2011", "\u2012", "\u2013", "\u2014", "\u2015", "\u2212"]) {
       expect(same("DHS-0001", `DHS${dash}0001`)).toBe(true);

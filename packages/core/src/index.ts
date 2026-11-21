@@ -105,4 +105,5 @@ export type {
   FormerIdentifier,
   RecordIdentifiers,
   IdentifierMatch,
+  DroppedIdentifier,
 } from "./identifiers.js";

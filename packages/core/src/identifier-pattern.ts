@@ -102,7 +102,9 @@ function compile(input: unknown): IdentifierPattern {
   if (problem !== undefined) fail("bad_characters", `This format ${problem}.`);
   if (input.trim() !== input) fail("untrimmed", "The format starts or ends with spaces.");
 
-  const chars = Array.from(input);
+  // Compared in composed form (NFC), so an accented letter typed as a letter
+  // plus a combining accent still matches.
+  const chars = Array.from(input.normalize("NFC"));
   const slots: Slot[] = [];
   /** Where the last single token's slot starts, so `{n,m}` can repeat it. */
   let last: Slot | undefined;
@@ -203,7 +205,7 @@ function slotMatches(slot: Slot, ch: string): boolean {
  */
 export function matchesIdentifierPattern(pattern: IdentifierPattern, value: string): boolean {
   if (typeof value !== "string" || value.length > pattern.maxLength * 2) return false;
-  const chars = Array.from(value);
+  const chars = Array.from(value.normalize("NFC"));
   if (chars.length < pattern.minLength || chars.length > pattern.maxLength) return false;
   const slots = pattern.slots;
   const n = slots.length;

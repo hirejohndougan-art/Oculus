@@ -112,6 +112,16 @@ describe("matchesIdentifierPattern", () => {
     expect(matchesIdentifierPattern(p, "АВ-12")).toBe(false); // Cyrillic А and В
   });
 
+  it("compares accented letters in composed form (review fix)", () => {
+    const composed = compile("\u00c9-#");
+    const decomposed = compile("E\u0301-#");
+    for (const p of [composed, decomposed]) {
+      expect(matchesIdentifierPattern(p, "\u00c9-1")).toBe(true);
+      expect(matchesIdentifierPattern(p, "E\u0301-1")).toBe(true);
+    }
+    expect(decomposed.source).toBe("E\u0301-#");
+  });
+
   it("refuses non-text values", () => {
     expect(matchesIdentifierPattern(compile("#"), 1 as unknown as string)).toBe(false);
   });

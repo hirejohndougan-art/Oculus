@@ -22,6 +22,16 @@
  * characters ignored) but always stored exactly as typed. There is no database
  * yet, so nothing here can stop two people taking the same next number at the
  * same moment; the save path must re-check uniqueness when it writes.
+ *
+ * Not decided here, and left to later tasks:
+ * - Which identifier types are public. Every function here works on whatever
+ *   records it is given, former identifiers included, and former notes can be
+ *   internal. A public site or public search must pass in published records
+ *   only, and show only the identifier types the organization has made public.
+ * - Changing an identifier type. Tightening a format, removing a type or
+ *   making it unique can make existing records fail `validateRecordIdentifiers`;
+ *   the admin screen must check the records (or move the old values to the
+ *   former list) before saving the change.
  */
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import { IssueList, readPlainData, shown, textProblem, type JsonValue } from "./plain-data.js";
@@ -91,6 +101,17 @@ export interface RecordIdentifiers {
   readonly recordId: RecordId;
   readonly current: readonly Identifier[];
   readonly former: readonly FormerIdentifier[];
+}
+
+/** An identifier a change would lose. */
+export interface DroppedIdentifier {
+  readonly type: string;
+  readonly value: string;
+  /**
+   * `identifier`: it appears nowhere afterwards. `history`: it is still there,
+   * but a former entry's retirement date or note was removed or changed.
+   */
+  readonly lost: "identifier" | "history";
 }
 
 /** One place an identifier was found. */
@@ -869,7 +890,9 @@ export function nextIdentifier(
     const rest = key.slice(start.length);
     if (!/^[0-9]{1,15}$/.test(rest)) return;
     const n = Number(rest);
-    if (n <= highest) return;
+    // Numbers past the limit can never be given out, so they can't clash; one
+    // stray value must not make the type run out of numbers.
+    if (n <= highest || n > MAX_AUTO_NUMBER) return;
     // A number this type's format could never give out (an old or mistyped
     // `DHS-0001000000` under `DHS-####`) can't clash with a new one, so it
     // must not push the count past what the format allows.
@@ -910,7 +933,7 @@ export function nextIdentifier(
  * `newPrimary` can also be given to move the primary mark when retiring a
  * non-primary identifier. If exactly this value is already listed as former
  * (it was retired before and reinstated), that one entry is kept, with the new
- * date and both notes. Returns a new frozen object. Never throws.
+ * date if one is given (otherwise the old one) and both notes. Returns a new frozen object. Never throws.
  */
 export function retireIdentifier(
   identifiers: RecordIdentifiers,
@@ -1010,19 +1033,39 @@ export function retireIdentifier(
 export function droppedIdentifiers(
   before: RecordIdentifiers,
   after: RecordIdentifiers,
-): readonly { readonly type: string; readonly value: string }[] {
+): readonly DroppedIdentifier[] {
   const kept = new Set<string>();
-  for (const item of [...after.current, ...after.former])
-    kept.add(`${item.type}\u0000${item.value}`);
-  const dropped: { type: string; value: string }[] = [];
+  for (const item of [...after.current, ...after.former]) kept.add(pairKey(item));
+  const afterFormer = new Map<string, FormerIdentifier>();
+  for (const item of after.former) afterFormer.set(pairKey(item), item);
+  const dropped: DroppedIdentifier[] = [];
   const reported = new Set<string>();
-  for (const item of [...before.current, ...before.former]) {
-    const key = `${item.type}\u0000${item.value}`;
-    if (kept.has(key) || reported.has(key)) continue;
+  const report = (item: { type: string; value: string }, lost: DroppedIdentifier["lost"]): void => {
+    const key = pairKey(item);
+    if (reported.has(key)) return;
     reported.add(key);
-    dropped.push(Object.freeze({ type: item.type, value: item.value }));
+    dropped.push(Object.freeze({ type: item.type, value: item.value, lost }));
+  };
+  for (const item of [...before.current, ...before.former]) {
+    if (!kept.has(pairKey(item))) report(item, "identifier");
+  }
+  // A former entry's date and note are its history: losing them, or changing
+  // them other than as retireIdentifier does (a newer date, a note added
+  // after the old one), is reported too.
+  for (const item of before.former) {
+    if (!kept.has(pairKey(item))) continue;
+    const later = afterFormer.get(pairKey(item));
+    const dateLost =
+      item.retiredAt !== undefined &&
+      (later?.retiredAt === undefined || later.retiredAt < item.retiredAt);
+    const noteLost = item.note !== undefined && later?.note?.startsWith(item.note) !== true;
+    if (dateLost || noteLost) report(item, "history");
   }
   return Object.freeze(dropped);
+}
+
+function pairKey(item: { readonly type: string; readonly value: string }): string {
+  return `${item.type}\u0000${item.value}`;
 }
 
 // ---------------------------------------------------------------------------
