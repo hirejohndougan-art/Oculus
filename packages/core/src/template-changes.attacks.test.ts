@@ -126,6 +126,48 @@ describe("staff values made public by a template change", () => {
   });
 });
 
+describe("template changes that could publish without records or other templates", () => {
+  it("reports a public field re-added when records weren't given", () => {
+    const r = ok(
+      templateChanges(
+        dacs("remove"),
+        dacs((f) => ({ ...f, visibility: "public" })),
+      ),
+    );
+    const change = r.changes.find((c) => c.code === "made_public");
+    expect(change?.key).toBe("notes");
+    expect(change?.needsConfirmation).toBe(true);
+    expect(r.recordsChecked).toBe(false);
+  });
+
+  it("reports a record kind added to a template with public fields", () => {
+    const wider = { ...DACS_ARCHIVAL_UNIT_PRESET, appliesTo: ["archival_unit", "object"] };
+    const asset = {
+      kind: "object",
+      id: B,
+      title: "Postcard",
+      createdAt: T,
+      updatedAt: T,
+      fields: { scope_and_content: SECRET },
+    };
+    const r = ok(templateChanges(DACS_ARCHIVAL_UNIT_PRESET, wider, [asset]));
+    const change = r.changes.find((c) => c.code === "kind_added");
+    expect(change?.key).toBe("object");
+    expect(change?.recordIds).toEqual([B]);
+    expect(change?.needsConfirmation).toBe(true);
+    expect(JSON.stringify(r)).not.toContain("555-0100");
+  });
+
+  it("needs confirmation when a public field starts being inherited", () => {
+    const before = dacs((f) => ({ ...f, visibility: "public" }));
+    const after = dacs((f) => ({ ...f, visibility: "public", inherited: true }));
+    const r = ok(templateChanges(before, after, []));
+    expect(r.changes.map((c) => [c.code, c.needsConfirmation])).toEqual([
+      ["inherited_changed", true],
+    ]);
+  });
+});
+
 describe("hostile input", () => {
   const publicNotes = dacs((f) => ({ ...f, visibility: "public" }));
 

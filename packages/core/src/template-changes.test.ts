@@ -138,8 +138,8 @@ describe("templateChanges", () => {
     ]);
   });
 
-  it("reports inherited and public-to-staff changes as information only", () => {
-    const r = run(template(field({ visibility: "public" })), template(field({ inherited: true })), [
+  it("reports no longer inherited and public-to-staff changes as information only", () => {
+    const r = run(template(field({ visibility: "public", inherited: true })), template(field()), [
       record(A, { note: "x" }),
     ]);
     expect(summary(r.changes)).toEqual([
@@ -147,6 +147,38 @@ describe("templateChanges", () => {
       ["made_staff", "note", false],
     ]);
     expect(r.needsConfirmation).toBe(false);
+  });
+
+  it("reports an added record kind, needing confirmation only with a public field", () => {
+    const pub = template(TITLE);
+    const r = run(pub, { ...pub, appliesTo: ["object", "digital_asset"] }, [record(A, {})]);
+    expect(summary(r.changes)).toEqual([["kind_added", "digital_asset", true]]);
+    expect(r.changes[0]?.recordCount).toBe(0);
+    const staff = template(field());
+    expect(
+      summary(run(staff, { ...staff, appliesTo: ["object", "event"] }, [record(A, {})]).changes),
+    ).toEqual([["kind_added", "event", false]]);
+  });
+
+  it("needs confirmation when a field starts being inherited", () => {
+    const r = run(template(field()), template(field({ inherited: true })), []);
+    expect(summary(r.changes)).toEqual([["inherited_changed", "note", true]]);
+  });
+
+  it("needs confirmation to remove an inherited field even when no record holds a value", () => {
+    const r = run(template(TITLE, field({ inherited: true })), template(TITLE), [record(A, {})]);
+    expect(summary(r.changes)).toEqual([["key_removed", "note", true]]);
+  });
+
+  it("reports every added field when records weren't given", () => {
+    const pub = field({ key: "extra", visibility: "public" });
+    const r = run(template(TITLE), template(TITLE, field(), pub));
+    expect(summary(r.changes)).toEqual([
+      ["key_reused", "note", true],
+      ["made_public", "extra", true],
+      ["key_reused", "extra", true],
+    ]);
+    expect(r.changes[1]?.message).toContain("weren't checked");
   });
 
   it("refuses two different templates", () => {

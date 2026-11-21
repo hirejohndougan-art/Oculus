@@ -11,16 +11,29 @@
  *
  * - `made_public`: a field goes from staff to public, or a new public field
  *   uses a key that records already hold left-over (staff) values for.
- *   Always needs confirmation, with or without records.
+ *   Always needs confirmation. Without records, every new public field is
+ *   reported, since its key may hold left-overs nobody can see.
  * - `key_reused`: a new field uses a key the old template lacked, and records
  *   hold left-over values for it, which will now be read as the new field's.
+ *   Without records, every new field is reported.
+ * - `kind_added`: `appliesTo` gains a record kind. Records of that kind may
+ *   hold values (stored under another template, possibly staff) under keys
+ *   this template publishes. Needs confirmation when the template has any
+ *   public field.
  * - `key_removed`: a field is gone; records keep its values as left-overs.
  * - `kind_changed`: stored values may no longer fit the field.
  * - `repeatable_changed`: stored lists or single values no longer fit; when
  *   a field stops repeating, `recordsWithSeveralValues` lists the records
  *   that can't be converted without dropping values.
  * - `option_removed`: a list option is gone (`option` names it).
- * - `inherited_changed`, `made_staff`: informational.
+ * - `inherited_changed`: needs confirmation when a field starts being
+ *   inherited, since lower levels then take values from above.
+ * - `made_staff`: informational.
+ *
+ * Removing an inherited field, or making a field inherited, also changes
+ * what descendants using other templates receive (D-013's strictest
+ * visibility along the way). Those descendants are not in `recordIds`;
+ * such changes always need confirmation instead.
  *
  * When `records` (the records that use the template) are given, each change
  * lists the IDs of the records holding a value for its key. Without them,
@@ -36,7 +49,7 @@
  */
 import { issue, type Issue, type Validated } from "./issues.js";
 import { shown, type JsonValue } from "./plain-data.js";
-import { validateRecord, type CatalogRecord } from "./records.js";
+import { validateRecord, type CatalogRecord, type RecordKind } from "./records.js";
 import type { RecordId } from "./record-id.js";
 import { validateTemplate, type FieldDefinition, type FieldTemplate } from "./templates.js";
 import { MAX_RECORD_SET } from "./effective.js";
@@ -45,6 +58,7 @@ import { types } from "node:util";
 export const TEMPLATE_CHANGE_CODES = [
   "made_public",
   "key_reused",
+  "kind_added",
   "key_removed",
   "kind_changed",
   "repeatable_changed",
@@ -59,13 +73,17 @@ export const MAX_LISTED_RECORDS = 10_000;
 
 export interface TemplateChange {
   readonly code: TemplateChangeCode;
-  /** The field key the change is about. */
+  /** The field key the change is about; for `kind_added`, the record kind added. */
   readonly key: string;
   /** True when the change must be confirmed by a person before the template is saved. */
   readonly needsConfirmation: boolean;
   /** Plain English; names the key and counts, never a stored value. */
   readonly message: string;
-  /** Records holding a value for `key` (for `option_removed`, using `option`). At most `MAX_LISTED_RECORDS`. */
+  /**
+   * Records holding a value for `key` (for `option_removed`, using `option`;
+   * for `kind_added`, the records of that kind given). At most
+   * `MAX_LISTED_RECORDS`.
+   */
   readonly recordIds: readonly RecordId[];
   /** How many records hold such a value, even beyond the listed IDs. */
   readonly recordCount: number;
@@ -142,7 +160,7 @@ function compare(
   for (const [key, was] of oldFields) {
     const now = newFields.get(key);
     if (now === undefined) {
-      found.push({ code: "key_removed", key });
+      found.push({ code: "key_removed", key, wasInherited: was.inherited });
       continue;
     }
     if (was.visibility === "staff" && now.visibility === "public") {
@@ -158,7 +176,9 @@ function compare(
         if (!kept.has(o.value)) found.push({ code: "option_removed", key, option: o.value });
       }
     }
-    if (was.inherited !== now.inherited) found.push({ code: "inherited_changed", key });
+    if (was.inherited !== now.inherited) {
+      found.push({ code: "inherited_changed", key, nowInherited: now.inherited });
+    }
     if (was.visibility === "public" && now.visibility === "staff") {
       found.push({ code: "made_staff", key });
     }
@@ -167,17 +187,24 @@ function compare(
   const added: FieldDefinition[] = [];
   for (const [key, now] of newFields) if (!oldFields.has(key)) added.push(now);
 
-  const usage = records === undefined ? undefined : scan(records, found, added);
+  const oldKinds = new Set<RecordKind>(before.value.appliesTo);
+  const newKinds = after.value.appliesTo.filter((k) => !oldKinds.has(k));
+  const hasPublic = after.value.fields.some((f) => f.visibility === "public");
+
+  const usage = records === undefined ? undefined : scan(records, found, added, newKinds);
   const changes: TemplateChange[] = [];
   for (const f of found) changes.push(finish(f, usage));
-  if (usage !== undefined) {
-    for (const now of added) {
-      const held = usage.byKey.get(now.key);
-      if (held === undefined || held.count === 0) continue;
-      if (now.visibility === "public")
-        changes.push(finish({ code: "made_public", key: now.key, leftOver: true }, usage));
-      changes.push(finish({ code: "key_reused", key: now.key }, usage));
+  for (const now of added) {
+    // Without records, any new key may hold left-overs nobody can see.
+    const held = usage?.byKey.get(now.key);
+    if (usage !== undefined && (held === undefined || held.count === 0)) continue;
+    if (now.visibility === "public") {
+      changes.push(finish({ code: "made_public", key: now.key, leftOver: true }, usage));
     }
+    changes.push(finish({ code: "key_reused", key: now.key }, usage));
+  }
+  for (const kind of newKinds) {
+    changes.push(finish({ code: "kind_added", key: kind, hasPublic }, usage));
   }
 
   return {
@@ -200,6 +227,12 @@ interface Found {
   readonly toSingle?: boolean;
   /** made_public: the key was only a left-over in the records. */
   readonly leftOver?: boolean;
+  /** key_removed: the field was inherited, so descendants may change. */
+  readonly wasInherited?: boolean;
+  /** inherited_changed: the field is inherited now. */
+  readonly nowInherited?: boolean;
+  /** kind_added: the new template has a public field. */
+  readonly hasPublic?: boolean;
 }
 
 /** Records found for one key or one option. */
@@ -219,6 +252,8 @@ interface Usage {
   readonly byOption: ReadonlyMap<string, ReadonlyMap<string, Held>>;
   /** Records holding more than one value, by key. */
   readonly several: ReadonlyMap<string, Held>;
+  /** Records of each record kind `appliesTo` gained. */
+  readonly byKind: ReadonlyMap<string, Held>;
 }
 
 /** One pass over the records, looking only at the keys that changed or are new. */
@@ -226,7 +261,10 @@ function scan(
   records: readonly CatalogRecord[],
   found: readonly Found[],
   added: readonly FieldDefinition[],
+  newKinds: readonly RecordKind[],
 ): Usage {
+  const byKind = new Map<string, Held>();
+  for (const kind of newKinds) byKind.set(kind, new Held());
   const byKey = new Map<string, Held>();
   const byOption = new Map<string, Map<string, Held>>();
   const several = new Map<string, Held>();
@@ -246,6 +284,7 @@ function scan(
 
   const keys = [...byKey];
   for (const record of records) {
+    byKind.get(record.kind)?.add(record.id);
     for (const [key, held] of keys) {
       if (!Object.hasOwn(record.fields, key)) continue;
       const value: JsonValue | undefined = record.fields[key];
@@ -265,7 +304,7 @@ function scan(
       }
     }
   }
-  return { byKey, byOption, several };
+  return { byKey, byOption, several, byKind };
 }
 
 function finish(f: Found, usage: Usage | undefined): TemplateChange {
@@ -274,15 +313,32 @@ function finish(f: Found, usage: Usage | undefined): TemplateChange {
       ? undefined
       : f.code === "option_removed" && f.option !== undefined
         ? usage.byOption.get(f.key)?.get(f.option)
-        : usage.byKey.get(f.key);
+        : f.code === "kind_added"
+          ? usage.byKind.get(f.key)
+          : usage.byKey.get(f.key);
   const count = held?.count ?? 0;
   const affected = usage === undefined || count > 0;
-  const needsConfirmation =
-    f.code === "made_public"
-      ? true
-      : f.code === "inherited_changed" || f.code === "made_staff"
-        ? false
-        : affected;
+  let needsConfirmation: boolean;
+  switch (f.code) {
+    case "made_public":
+      needsConfirmation = true;
+      break;
+    case "made_staff":
+      needsConfirmation = false;
+      break;
+    case "inherited_changed":
+      // Descendants on other templates aren't in the records checked here.
+      needsConfirmation = f.nowInherited === true;
+      break;
+    case "kind_added":
+      needsConfirmation = f.hasPublic === true;
+      break;
+    case "key_removed":
+      needsConfirmation = affected || f.wasInherited === true;
+      break;
+    default:
+      needsConfirmation = affected;
+  }
   const several = f.toSingle === true ? usage?.several.get(f.key) : undefined;
   const change: TemplateChange = {
     code: f.code,
@@ -310,13 +366,25 @@ function message(f: Found, count: number | undefined, several: number): string {
         : `${records(count)} hold a value for it.`;
   switch (f.code) {
     case "made_public":
+      if (f.leftOver === true && count === undefined) {
+        return `The new public field ${key} may use a key that records still hold staff-only left-over values for. Records weren't checked, so saving could publish them. Confirm first.`;
+      }
       return f.leftOver === true
         ? `The new public field ${key} uses a key that ${records(count ?? 0)} still hold values for from a removed field. Left-over values are staff only; saving publishes them. Confirm first.`
         : `The field ${key} changes from staff to public, which publishes every value stored while it was staff. ${held} Confirm first.`;
     case "key_reused":
-      return `The new field ${key} uses a key that ${records(count ?? 0)} hold left-over values for. Those values will be read as this field's. Check that they fit.`;
+      if (count === undefined) {
+        return `The new field ${key} may use a key that records hold left-over values for. Records weren't checked. Check that any such values fit.`;
+      }
+      return `The new field ${key} uses a key that ${records(count)} hold left-over values for. Those values will be read as this field's. Check that they fit.`;
     case "key_removed":
-      return `The field ${key} is removed. ${held} Those values stay in the records as staff-only left-overs.`;
+      return `The field ${key} is removed. ${held} Those values stay in the records as staff-only left-overs.${f.wasInherited === true ? " It was inherited, so lower levels using other templates may change what they show." : ""}`;
+    case "kind_added":
+      return `The template now also applies to ${key} records. ${
+        count === undefined
+          ? "Records weren't checked."
+          : `${records(count)} of that kind were given.`
+      }${f.hasPublic === true ? " Their values under this template's public field keys, including ones stored as staff, would be published. Confirm first." : ""}`;
     case "kind_changed":
       return `The field ${key} changes kind. ${held} Those values may no longer fit.`;
     case "repeatable_changed":
@@ -332,7 +400,9 @@ function message(f: Found, count: number | undefined, several: number): string {
             : `${records(count)} use it.`
       }`;
     case "inherited_changed":
-      return `The field ${key} changes whether lower levels inherit it.`;
+      return f.nowInherited === true
+        ? `The field ${key} is now inherited, so lower levels, including ones using other templates, take its value from above. Confirm first.`
+        : `The field ${key} is no longer inherited by lower levels.`;
     case "made_staff":
       return `The field ${key} changes from public to staff, so it will no longer be published.`;
   }
