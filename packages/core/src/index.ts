@@ -184,3 +184,5 @@ export {
   mappingForTemplate,
 } from "./dublin-core.js";
 export type { DublinCoreTerm, DublinCoreEntry, DublinCoreMapping } from "./dublin-core.js";
+
+export { checkRightsValue, makeIdentifierChecker } from "./field-checkers.js";
