@@ -1,6 +1,7 @@
 // Shared test fixtures for public-output tests (not exported from the package).
 import {
   effectiveRecord,
+  makeIdentifierChecker,
   newRecordId,
   publicView,
   type ArchivalLevel,
@@ -140,3 +141,14 @@ export function everything(out: {
     out.oaiDcXml,
   ].join("\n");
 }
+
+const identifierChecker = makeIdentifierChecker([
+  { key: "accession_number", label: "Accession number", uniqueness: "none" },
+  { key: "secret_type_code", label: "Secret type", uniqueness: "none" },
+]);
+if (!identifierChecker.ok) throw new Error("identifier types");
+/** The checkers publicOutput needs for the fixtures' identifier field. */
+export const CHECKERS = Object.freeze({ identifier: identifierChecker.value });
+
+/** The mapping entry kinds that need rights must have. */
+export const RIGHTS_ENTRY = Object.freeze({ field: "rights", term: "rights" });

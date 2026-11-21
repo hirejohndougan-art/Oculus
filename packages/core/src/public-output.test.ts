@@ -24,6 +24,8 @@ import {
   record,
   template,
   viewOf,
+  CHECKERS,
+  RIGHTS_ENTRY,
 } from "./public-output.fixtures.js";
 
 function ok(result: Validated<PublicOutput>): PublicOutput {
@@ -40,7 +42,7 @@ function out(
   published: readonly RecordId[] = [view.id],
   mapping: unknown = MAPPING,
 ) {
-  return publicOutput(view, mapping, { baseUrl: BASE, published });
+  return publicOutput(view, mapping, { baseUrl: BASE, published, checkers: CHECKERS });
 }
 
 const PLACE_ID = newRecordId();
@@ -78,18 +80,19 @@ describe("publicOutput: the three forms", () => {
     expect(o.id).toBe(url);
     expect(o.dublinCore).toEqual({
       title: ["Dickinson Station and Park"],
+      identifier: [url, "2026.015"],
+      type: ["http://purl.org/dc/dcmitype/PhysicalObject"],
       rights: [CNE],
       description: ["A postcard of the station."],
       created: ["1909~"],
       accessRights: ["Open to all"],
       subject: ["Railroads", "Parks"],
-      identifier: ["2026.015"],
       relation: ["https://example.org/station"],
       spatial: ["Dickinson (Tex.)"],
       creator: ["Unknown photographer"],
       rightsHolder: ["The Society"],
     });
-    expect(Object.keys(o.dublinCore)[0]).toBe("title");
+    expect(Object.keys(o.dublinCore).slice(0, 3)).toEqual(["title", "identifier", "type"]);
     expect(Object.isFrozen(o.dublinCore)).toBe(true);
     expect(Object.isFrozen(o)).toBe(true);
   });
@@ -108,13 +111,13 @@ describe("publicOutput: the three forms", () => {
       "dcterms:rights": { "@id": CNE },
       "dcterms:description": "A postcard of the station.",
       "dcterms:created": "1909~",
-      "dcterms:accessRights": "Open to all",
+      "dcterms:accessRights": { "rdfs:label": "Open to all" },
       "dcterms:subject": [{ "@id": LCSH, "rdfs:label": "Railroads" }, "Parks"],
       "dcterms:identifier": "2026.015",
       "dcterms:relation": { "@id": "https://example.org/station" },
-      "dcterms:spatial": "Dickinson (Tex.)",
-      "dcterms:creator": "Unknown photographer",
-      "dcterms:rightsHolder": "The Society",
+      "dcterms:spatial": { "rdfs:label": "Dickinson (Tex.)" },
+      "dcterms:creator": { "rdfs:label": "Unknown photographer" },
+      "dcterms:rightsHolder": { "rdfs:label": "The Society" },
     });
     expect(Object.keys(o.jsonLd).slice(0, 3)).toEqual(["@context", "@id", "@type"]);
     expect(JSON.parse(o.jsonLdText)).toEqual(o.jsonLd);
@@ -127,13 +130,15 @@ describe("publicOutput: the three forms", () => {
         '<?xml version="1.0" encoding="UTF-8"?>',
         `<oai_dc:dc xmlns:oai_dc="${OAI_DC_NAMESPACE}" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="${OAI_DC_NAMESPACE} http://www.openarchives.org/OAI/2.0/oai_dc.xsd">`,
         "  <dc:title>Dickinson Station and Park</dc:title>",
+        `  <dc:identifier>${url}</dc:identifier>`,
+        "  <dc:identifier>2026.015</dc:identifier>",
+        "  <dc:type>http://purl.org/dc/dcmitype/PhysicalObject</dc:type>",
         `  <dc:rights>${CNE}</dc:rights>`,
         "  <dc:description>A postcard of the station.</dc:description>",
         "  <dc:date>1909~</dc:date>",
         "  <dc:rights>Open to all</dc:rights>",
         "  <dc:subject>Railroads</dc:subject>",
         "  <dc:subject>Parks</dc:subject>",
-        "  <dc:identifier>2026.015</dc:identifier>",
         "  <dc:relation>https://example.org/station</dc:relation>",
         "  <dc:coverage>Dickinson (Tex.)</dc:coverage>",
         "  <dc:creator>Unknown photographer</dc:creator>",
@@ -177,6 +182,7 @@ describe("publicOutput: the three forms", () => {
     const mapping = {
       template: "out",
       entries: [
+        RIGHTS_ENTRY,
         { field: "creator", term: "description" },
         { field: "description", term: "description" },
         { field: "description", term: "abstract" },
@@ -192,7 +198,10 @@ describe("publicOutput: the three forms", () => {
   });
 
   it("puts a mapped title field after the record's own title", () => {
-    const mapping = { template: "out", entries: [{ field: "extent", term: "title" }] };
+    const mapping = {
+      template: "out",
+      entries: [RIGHTS_ENTRY, { field: "extent", term: "title" }],
+    };
     expect(ok(out(view, [view.id], mapping)).dublinCore.title).toEqual([
       "Dickinson Station and Park",
       "1 postcard",
@@ -202,7 +211,12 @@ describe("publicOutput: the three forms", () => {
   it("leaves out a mapped field with no value", () => {
     const bare = record("object", "Bare", { rights: { uri: CNE } });
     const o = ok(out(viewOf([bare], bare.id)));
-    expect(o.dublinCore).toEqual({ title: ["Bare"], rights: [CNE] });
+    expect(o.dublinCore).toEqual({
+      title: ["Bare"],
+      identifier: [BASE + bare.id],
+      type: ["http://purl.org/dc/dcmitype/PhysicalObject"],
+      rights: [CNE],
+    });
   });
 });
 
@@ -221,7 +235,7 @@ describe("publicOutput: places and the published list", () => {
     const item = fullObject();
     const o = ok(out(viewOf([item], item.id), [item.id]));
     expect(everything(o)).not.toContain(PLACE_ID);
-    expect(o.jsonLd["dcterms:spatial"]).toBe("Dickinson (Tex.)");
+    expect(o.jsonLd["dcterms:spatial"]).toEqual({ "rdfs:label": "Dickinson (Tex.)" });
   });
 
   it("prefers a place's gazetteer URI to a record link", () => {
@@ -314,11 +328,13 @@ describe("publicOutput: inheritance", () => {
     const o = ok(out(viewOf([item, fonds], item.id)));
     expect(o.dublinCore).toEqual({
       title: ["Item"],
+      identifier: [BASE + item.id],
       rights: [CNE],
       description: ["Own"],
       creator: ["The Society"],
     });
-    // The parent isn't published, and nothing names it.
+    // The parent isn't published (D-016: its public values may still be
+    // published on a published child), and nothing names it.
     expect(everything(o)).not.toContain(fonds.id);
     expect(everything(o)).not.toContain("Fonds F1");
   });
@@ -338,17 +354,27 @@ describe("publicOutput: refusals", () => {
   it("refuses a record with a left-over rights value it can't publish", () => {
     const noRights = template(TPL.fields.filter((f) => f.key !== "rights"));
     const item = record("object", "Left-over rights", { rights: { uri: CNE } });
-    const mapping = { template: "out", entries: [{ field: "creator", term: "creator" }] };
-    expect(codes(out(viewOf([item], item.id, noRights), [item.id], mapping))).toEqual([
-      "rights_not_public",
-    ]);
+    // This template has no rights field, so no valid mapping can map one: the
+    // publish check runs first and says why (rights_not_mapped would follow).
+    const valid = { template: "out", entries: [{ field: "creator", term: "creator" }] };
+    const withRights = { template: "out", entries: [RIGHTS_ENTRY] };
+    for (const mapping of [valid, withRights]) {
+      expect(codes(out(viewOf([item], item.id, noRights), [item.id], mapping))).toEqual([
+        "rights_not_public",
+      ]);
+    }
   });
 
   it("refuses an invalid mapping with its issues", () => {
     const item = fullObject();
     const view = viewOf([item], item.id);
     expect(
-      codes(out(view, [view.id], { template: "out", entries: [{ field: "x", term: "title" }] })),
+      codes(
+        out(view, [view.id], {
+          template: "out",
+          entries: [RIGHTS_ENTRY, { field: "x", term: "title" }],
+        }),
+      ),
     ).toEqual(["unknown_field"]);
     expect(
       codes(
@@ -386,9 +412,9 @@ describe("publicOutput: refusals", () => {
     for (const fields of bad) {
       const item = record("object", "Bad", { rights: { uri: CNE }, ...fields });
       const result = out(viewOf([item], item.id));
-      expect(codes(result), JSON.stringify(fields)).toEqual(["invalid_value"]);
+      expect(result.ok, JSON.stringify(fields)).toBe(false);
       const key = Object.keys(fields)[0];
-      expect(result.ok ? undefined : result.issues[0]?.path).toEqual(["fields", key]);
+      expect(result.ok ? undefined : result.issues[0]?.path.slice(0, 2)).toEqual(["fields", key]);
     }
   });
 
@@ -400,7 +426,11 @@ describe("publicOutput: refusals", () => {
   it("refuses a field over its list and repeat limits", () => {
     const tooMany = Array.from({ length: 501 }, (_, i) => ({ label: `t${String(i)}` }));
     const item = record("object", "Many", { rights: { uri: CNE }, subjects: tooMany });
-    expect(codes(out(viewOf([item], item.id)))).toEqual(["invalid_value"]);
+    const result = out(viewOf([item], item.id));
+    expect(result.ok ? undefined : result.issues[0]?.path.slice(0, 2)).toEqual([
+      "fields",
+      "subjects",
+    ]);
   });
 
   it("accepts every kind's value when the template's field is single or repeatable as stored", () => {
@@ -409,7 +439,7 @@ describe("publicOutput: refusals", () => {
       field({ key: "dates", kind: "date", repeatable: true }),
     ]);
     const item = record("object", "Dates", { rights: { uri: CNE }, dates: ["1909", "1910/1912"] });
-    const mapping = { template: "out", entries: [{ field: "dates", term: "date" }] };
+    const mapping = { template: "out", entries: [RIGHTS_ENTRY, { field: "dates", term: "date" }] };
     expect(ok(out(viewOf([item], item.id, tpl), [item.id], mapping)).dublinCore.date).toEqual([
       "1909",
       "1910/1912",
@@ -423,9 +453,9 @@ describe("publicOutput: the base URL", () => {
 
   it("accepts http and https base URLs ending in /", () => {
     for (const baseUrl of ["https://archive.example.org/", "http://localhost:8080/items/", BASE]) {
-      expect(ok(publicOutput(view, MAPPING, { baseUrl, published: [view.id] })).id).toBe(
-        baseUrl + view.id,
-      );
+      expect(
+        ok(publicOutput(view, MAPPING, { baseUrl, published: [view.id], checkers: CHECKERS })).id,
+      ).toBe(baseUrl + view.id);
     }
   });
 
@@ -457,6 +487,224 @@ describe("publicOutput: the base URL", () => {
         codes(publicOutput(view, MAPPING, { baseUrl, published: [view.id] } as never)),
         String(baseUrl).slice(0, 60),
       ).toEqual(["invalid_base_url"]);
+    }
+  });
+});
+
+describe("publicOutput: the template check", () => {
+  it("refuses own values the template refuses: too long, a line break in one-line text", () => {
+    const long = `${"x".repeat(5000)}\n${"y".repeat(14)}`;
+    const item = record("object", "Long", { rights: { uri: CNE }, extent: long });
+    const mapping = {
+      template: "out",
+      entries: [RIGHTS_ENTRY, { field: "extent", term: "extent" }],
+    };
+    const result = out(viewOf([item], item.id), [item.id], mapping);
+    expect(result.ok).toBe(false);
+    expect(result.ok ? [] : result.issues.map((i) => i.path.slice(0, 2))).toContainEqual([
+      "fields",
+      "extent",
+    ]);
+  });
+
+  it("refuses an LCSH term whose URI is not an LC authority", () => {
+    const item = record("object", "Evil", {
+      rights: { uri: CNE },
+      subjects: [{ label: "Railroads", uri: "http://evil.example/notlc", vocabulary: "lcsh" }],
+    });
+    const result = out(viewOf([item], item.id));
+    expect(result.ok ? [] : result.issues.map((i) => i.path.slice(0, 2))).toContainEqual([
+      "fields",
+      "subjects",
+    ]);
+  });
+
+  it("refuses identifier values when no identifier checker is given", () => {
+    const item = fullObject();
+    const view = viewOf([item], item.id);
+    const result = publicOutput(view, MAPPING, { baseUrl: BASE, published: [view.id] });
+    expect(codes(result)).toContain("unchecked");
+  });
+
+  it("uses the caller's checkers, which replace the default for their kind", () => {
+    const item = fullObject();
+    const view = viewOf([item], item.id);
+    const refuse = () => [{ code: "no_thanks", message: "Refused." }];
+    const result = publicOutput(view, MAPPING, {
+      baseUrl: BASE,
+      published: [view.id],
+      checkers: { ...CHECKERS, long_text: refuse },
+    });
+    expect(codes(result)).toContain("no_thanks");
+  });
+
+  it("refuses checkers given as a Proxy or a getter", () => {
+    const item = fullObject();
+    const view = viewOf([item], item.id);
+    const proxy = { baseUrl: BASE, published: [view.id], checkers: new Proxy(CHECKERS, {}) };
+    expect(codes(publicOutput(view, MAPPING, proxy))).toEqual(["invalid_options"]);
+    const getter = { baseUrl: BASE, published: [view.id] };
+    Object.defineProperty(getter, "checkers", { enumerable: true, get: () => CHECKERS });
+    expect(codes(publicOutput(view, MAPPING, getter))).toEqual(["invalid_options"]);
+  });
+});
+
+describe("publicOutput: rights must be mapped", () => {
+  it("refuses an object, archival unit or digital asset whose rights aren't mapped to rights or license", () => {
+    for (const kind of ["object", "archival_unit", "digital_asset"] as const) {
+      const r = record(kind, "R", { rights: { uri: CNE }, creator: "x" });
+      const view = viewOf([r], r.id);
+      for (const entries of [
+        [{ field: "creator", term: "creator" }],
+        [{ field: "rights", term: "accessRights" }],
+        [],
+      ]) {
+        expect(codes(out(view, [view.id], { template: "out", entries }))).toEqual([
+          "rights_not_mapped",
+        ]);
+      }
+      const license = { template: "out", entries: [{ field: "rights", term: "license" }] };
+      expect(ok(out(view, [view.id], license)).jsonLd["dcterms:license"]).toEqual({ "@id": CNE });
+    }
+  });
+
+  it("doesn't need rights mapped for agents, places and events", () => {
+    for (const kind of ["agent", "place", "event"] as const) {
+      const r = record(kind, "R", { creator: "x" });
+      const mapping = { template: "out", entries: [{ field: "creator", term: "creator" }] };
+      expect(out(viewOf([r], r.id), [r.id], mapping).ok).toBe(true);
+    }
+  });
+});
+
+describe("publicOutput: JSON-LD term ranges", () => {
+  const item = fullObject();
+  const view = viewOf([item], item.id);
+  const lcsh = { "@id": LCSH, "rdfs:label": "Railroads" };
+
+  function under(field: string, term: string) {
+    const mapping = { template: "out", entries: [RIGHTS_ENTRY, { field, term }] };
+    return ok(out(view, [view.id], mapping)).jsonLd[`dcterms:${term}`];
+  }
+
+  it("writes literal-range terms as text only, never an IRI", () => {
+    for (const term of [
+      "title",
+      "alternative",
+      "date",
+      "created",
+      "description",
+      "abstract",
+      "identifier",
+      "bibliographicCitation",
+    ]) {
+      expect(under("subjects", term), term).toEqual(
+        term === "title"
+          ? ["Dickinson Station and Park", "Railroads", "Parks"]
+          : ["Railroads", "Parks"],
+      );
+      const link = under("website", term);
+      expect(JSON.stringify(link)).not.toContain("@id");
+      expect(link).toEqual(
+        term === "title"
+          ? ["Dickinson Station and Park", "https://example.org/station"]
+          : "https://example.org/station",
+      );
+    }
+    expect(under("rights", "description")).toBe(CNE);
+  });
+
+  it("writes class-range terms as an IRI node, or a label node without a URI", () => {
+    for (const term of [
+      "creator",
+      "contributor",
+      "publisher",
+      "rightsHolder",
+      "format",
+      "extent",
+      "medium",
+      "language",
+      "coverage",
+      "spatial",
+      "temporal",
+      "accessRights",
+      "license",
+      "provenance",
+    ]) {
+      expect(under("subjects", term), term).toEqual([lcsh, { "rdfs:label": "Parks" }]);
+      expect(under("creator", term), term).toEqual({ "rdfs:label": "Unknown photographer" });
+    }
+    // Under rights, after the record's own rights.
+    expect(under("creator", "rights")).toEqual([
+      { "@id": CNE },
+      { "rdfs:label": "Unknown photographer" },
+    ]);
+  });
+
+  it("never writes a term's URI as dcterms:type: LCSH concepts aren't classes", () => {
+    expect(under("subjects", "type")).toEqual([
+      { "rdfs:label": "Railroads" },
+      { "rdfs:label": "Parks" },
+    ]);
+    expect(under("website", "type")).toEqual({ "rdfs:label": "https://example.org/station" });
+  });
+
+  it("writes terms with no range as an IRI node for a URI, otherwise text", () => {
+    for (const term of [
+      "subject",
+      "source",
+      "relation",
+      "isPartOf",
+      "hasPart",
+      "isFormatOf",
+      "hasFormat",
+    ]) {
+      expect(under("subjects", term), term).toEqual([lcsh, "Parks"]);
+      expect(under("website", term), term).toEqual({ "@id": "https://example.org/station" });
+    }
+  });
+
+  it("only ever uses its fixed keys in value nodes", () => {
+    const mapping = {
+      template: "out",
+      entries: [
+        RIGHTS_ENTRY,
+        ...TPL.fields
+          .filter((f) => f.visibility === "public")
+          .flatMap((f) =>
+            ["creator", "subject", "type", "title"].map((term) => ({ field: f.key, term })),
+          ),
+      ],
+    };
+    const doc = ok(out(view, [view.id, PLACE_ID], mapping)).jsonLd;
+    const keys = new Set<string>();
+    const walk = (v: unknown): void => {
+      if (Array.isArray(v)) v.forEach(walk);
+      else if (typeof v === "object" && v !== null) {
+        for (const [k, inner] of Object.entries(v)) {
+          keys.add(k);
+          walk(inner);
+        }
+      }
+    };
+    for (const [k, v] of Object.entries(doc)) if (k !== "@context") walk(v);
+    expect([...keys].sort()).toEqual(["@id", "rdfs:label"]);
+  });
+});
+
+describe("publicOutput: URIs must be canonical", () => {
+  it("refuses URIs not written as a URL parser writes them back", () => {
+    for (const fields of [
+      { website: { url: "http:example.org" } },
+      { website: { url: "https://example.org" } },
+      { website: { url: "HTTPS://example.org/" } },
+      { places: [{ label: "x", uri: "https://Example.org/x" }] },
+      { places: [{ label: "x", uri: "https://ex\u00e4mple.org/x" }] },
+      { places: [{ label: "x", uri: "https://example.org/%7e/../x" }] },
+    ]) {
+      const item = record("object", "I", { rights: { uri: CNE }, ...fields });
+      const result = out(viewOf([item], item.id));
+      expect(result.ok, JSON.stringify(fields)).toBe(false);
     }
   });
 });

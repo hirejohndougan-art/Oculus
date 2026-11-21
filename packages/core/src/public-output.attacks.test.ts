@@ -24,6 +24,8 @@ import {
   record,
   template,
   viewOf,
+  CHECKERS,
+  RIGHTS_ENTRY,
 } from "./public-output.fixtures.js";
 
 function ok(result: Validated<PublicOutput>): PublicOutput {
@@ -38,7 +40,7 @@ function codes(result: Validated<unknown>): string[] {
 const ch = (code: number): string => String.fromCharCode(code);
 
 function out(view: PublicRecord, mapping: unknown = MAPPING, id = view.id) {
-  return publicOutput(view, mapping, { baseUrl: BASE, published: [id] });
+  return publicOutput(view, mapping, { baseUrl: BASE, published: [id], checkers: CHECKERS });
 }
 
 describe("staff values never reach any output form", () => {
@@ -83,9 +85,12 @@ describe("staff values never reach any output form", () => {
     // Even a mapping that maps every public field can't reach them.
     const mapAll = {
       template: "out",
-      entries: TPL.fields
-        .filter((f) => f.visibility === "public")
-        .map((f) => ({ field: f.key, term: "description" })),
+      entries: [
+        RIGHTS_ENTRY,
+        ...TPL.fields
+          .filter((f) => f.visibility === "public")
+          .map((f) => ({ field: f.key, term: "description" })),
+      ],
     };
     for (const mapping of [MAPPING, mapAll]) {
       const all = everything(ok(out(view, mapping)));
@@ -104,11 +109,19 @@ describe("staff values never reach any output form", () => {
     const view = viewOf([item], item.id);
     expect(
       codes(
-        out(view, { template: "out", entries: [{ field: "donor_note", term: "description" }] }),
+        out(view, {
+          template: "out",
+          entries: [RIGHTS_ENTRY, { field: "donor_note", term: "description" }],
+        }),
       ),
     ).toEqual(["staff_field"]);
     expect(
-      codes(out(view, { template: "out", entries: [{ field: "left_over", term: "description" }] })),
+      codes(
+        out(view, {
+          template: "out",
+          entries: [RIGHTS_ENTRY, { field: "left_over", term: "description" }],
+        }),
+      ),
     ).toEqual(["unknown_field"]);
   });
 
@@ -145,7 +158,7 @@ describe("staff values never reach any output form", () => {
     const view = viewOf([item], item.id);
     for (const term of ["identifier", "title", "description", "subject", "relation"]) {
       const all = everything(
-        ok(out(view, { template: "out", entries: [{ field: "number", term }] })),
+        ok(out(view, { template: "out", entries: [RIGHTS_ENTRY, { field: "number", term }] })),
       );
       expect(all).toContain("2026.015");
       expect(all).not.toContain("secret_type_code");
@@ -375,7 +388,8 @@ describe("injection", () => {
     expect(doc["@type"]).toBe("dcmitype:PhysicalObject");
     expect(doc["dcterms:title"]).toBe("@graph");
     expect(doc["dcterms:subject"]).toEqual(sneaky);
-    expect(doc["dcterms:creator"]).toBe("@type");
+    // creator has a class range, so text goes in a label node, still as text.
+    expect(doc["dcterms:creator"]).toEqual({ "rdfs:label": "@type" });
     expect(doc["@context"]).toEqual(o.jsonLd["@context"]);
   });
 
@@ -389,9 +403,9 @@ describe("injection", () => {
       { places: [{ label: "x", uri: "vbscript:x" }] },
     ]) {
       const item = record("object", "I", { rights: { uri: CNE }, ...fields });
-      expect(codes(out(viewOf([item], item.id))), JSON.stringify(fields)).toEqual([
-        "invalid_value",
-      ]);
+      const result = out(viewOf([item], item.id));
+      expect(result.ok, JSON.stringify(fields)).toBe(false);
+      expect(codes(result)).not.toContain("unreadable");
     }
   });
 
@@ -418,6 +432,37 @@ describe("injection", () => {
   });
 });
 
+describe("prototype pollution", () => {
+  afterEach(() => {
+    const proto = Object.prototype as Record<string, unknown>;
+    delete proto.iri;
+    delete proto.labelled;
+    delete proto.level;
+  });
+
+  it("can't add an IRI, label or type to output values through Object.prototype", () => {
+    const item = record("object", "I", {
+      rights: { uri: CNE },
+      description: "plain",
+      creator: "someone",
+      subjects: [{ label: "local" }],
+    });
+    const unit = record("archival_unit", "U", { rights: { uri: CNE } }, { level: "item" });
+    const clean = ok(out(viewOf([item], item.id)));
+    const cleanUnit = ok(out(viewOf([unit], unit.id)));
+    Object.assign(Object.prototype, {
+      iri: "https://evil.example/",
+      labelled: true,
+      level: "fonds",
+    });
+    const polluted = ok(out(viewOf([item], item.id)));
+    expect(everything(polluted)).not.toContain("evil");
+    expect(polluted).toEqual(clean);
+    expect(ok(out(viewOf([unit], unit.id))).jsonLd["@type"]).toBeUndefined();
+    expect(ok(out(viewOf([unit], unit.id)))).toEqual(cleanUnit);
+  });
+});
+
 describe("huge inputs", () => {
   it("refuses output over the size limit, quickly", () => {
     const keys = ["a", "b", "c", "d", "e", "f", "g", "h", "i"];
@@ -440,7 +485,7 @@ describe("huge inputs", () => {
     ] as const;
     const mapping = {
       template: "out",
-      entries: keys.flatMap((f) => terms.map((term) => ({ field: f, term }))),
+      entries: [RIGHTS_ENTRY, ...keys.flatMap((f) => terms.map((term) => ({ field: f, term })))],
     };
     const started = performance.now();
     expect(codes(out(view, mapping))).toEqual(["too_large"]);
@@ -450,8 +495,8 @@ describe("huge inputs", () => {
 
   it("counts URIs against the size limit too", () => {
     const uri = `https://e.example/${"u".repeat(1970)}`;
-    const subjects = Array.from({ length: 300 }, (_, i) => ({ label: String(i), uri }));
-    const item = record("object", "URIs", { rights: { uri: CNE }, subjects });
+    const places = Array.from({ length: 300 }, (_, i) => ({ label: String(i), uri }));
+    const item = record("object", "URIs", { rights: { uri: CNE }, places });
     const view = viewOf([item], item.id);
     const terms = [
       "subject",
@@ -466,13 +511,50 @@ describe("huge inputs", () => {
     ];
     const mapping = {
       template: "out",
-      entries: terms.map((term) => ({ field: "subjects", term })),
+      entries: [RIGHTS_ENTRY, ...terms.map((term) => ({ field: "places", term }))],
     };
     expect(300 * uri.length * terms.length).toBeGreaterThan(MAX_OUTPUT_CHARS);
     expect(codes(out(view, mapping))).toEqual(["too_large"]);
     expect(
-      out(view, { template: "out", entries: [{ field: "subjects", term: "subject" }] }).ok,
+      out(view, {
+        template: "out",
+        entries: [RIGHTS_ENTRY, { field: "places", term: "spatial" }],
+      }).ok,
     ).toBe(true);
+  });
+
+  function escapingRecord(char: string) {
+    const keys = ["a", "b", "c", "d", "e", "f", "g", "h", "i"];
+    const tpl = template([
+      field({ key: "rights", kind: "rights" }),
+      ...keys.map((key) => field({ key, kind: "long_text" })),
+    ]);
+    const fields: Record<string, string> = {};
+    for (const key of keys) fields[key] = char.repeat(99_000);
+    const item = record("object", "Big", { rights: { uri: CNE }, ...fields });
+    const view = viewOf([item], item.id, tpl);
+    const mapping = {
+      template: "out",
+      entries: [RIGHTS_ENTRY, ...keys.map((f) => ({ field: f, term: "description" }))],
+    };
+    return { view, mapping, values: 9 * 99_000 };
+  }
+
+  it("caps the JSON text as produced, escapes included", () => {
+    // "<" is 1 character of value but 6 in jsonLdText (and 4 in XML).
+    const { view, mapping, values } = escapingRecord("<");
+    expect(values).toBeLessThan(MAX_OUTPUT_CHARS);
+    const result = out(view, mapping);
+    expect(codes(result)).toEqual(["too_large"]);
+    expect(result.ok ? [] : result.issues[0]?.path).toEqual(["jsonLdText"]);
+  });
+
+  it("caps the XML as produced, escapes included", () => {
+    // "'" is 1 character in JSON but 6 in XML (&apos;).
+    const { view, mapping } = escapingRecord("'");
+    const result = out(view, mapping);
+    expect(codes(result)).toEqual(["too_large"]);
+    expect(result.ok ? [] : result.issues[0]?.path).toEqual(["oaiDcXml"]);
   });
 
   it("handles a record near every limit in good time", () => {

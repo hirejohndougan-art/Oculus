@@ -258,7 +258,7 @@ const USE_EFFECTIVE: readonly Issue[] = Object.freeze([
  * accepted, canonical `uri`; a plain string there is refused (`not_an_object`),
  * so the old shape can't slip through. Unknown properties and a `note` that
  * isn't text are refused too, as the template does, so this rule stands on
- * its own. The note is published with the URI; agent,
+ * its own. The note is kept staff-side and is not published (D-016); agent,
  * place and event records need none. A record with any other kind, or none,
  * is checked as if it needed one.
  *

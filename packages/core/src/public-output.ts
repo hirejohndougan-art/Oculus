@@ -15,49 +15,67 @@
  * - **Only mapped public entries go out.** The caller's Dublin Core mapping is
  *   checked with `validateDublinCoreMapping` against the exact template the
  *   view was built with, every time (a mapping for another template, or one
- *   naming a staff field, is refused). Output holds the record's title, its
- *   URL, and the values of the view's entries that the mapping maps. Nothing
- *   else is read: no notes, no `from`, no ancestors, no labels, no stored
- *   record, no identifier types, no list option codes.
+ *   naming a staff field, is refused). An object, archival unit or digital
+ *   asset must have its `rights` field mapped to `rights` or `license`
+ *   (`rights_not_mapped`). Output holds the record's title, its URL, its
+ *   DCMI type, and the values of the view's entries that the mapping maps.
+ *   Nothing else is read: no notes, no `from`, no ancestors, no labels, no
+ *   identifier types, no list option codes, no rights notes.
+ * - **Every published value passes the template check.** Own values reach
+ *   the view unchecked (D-013), so the view's values are checked with
+ *   `checkRecordAgainstTemplate` against the view's template (required
+ *   fields aside), with the default checkers and any the caller gives in
+ *   `checkers`. Identifier values need `makeIdentifierChecker` (D-015). Any
+ *   problem refuses the output, with the check's issues.
  * - **Publishing is the caller's statement.** Records have no publish state
  *   yet, so the caller passes `published`, the IDs of every record that is
  *   published. The record itself must be in it (`not_published`). A place
  *   value's `recordId` becomes a link only when that record is in it;
  *   otherwise the place goes out as its name (and gazetteer URI) alone, so
  *   output never reveals that an unpublished record exists or what its ID is.
- * - **Every field kind is handled explicitly, and checked again here,**
- *   because own values reach the view without a template check (D-013):
- *   text and long text as the text; a date as its EDTF text (checked with
- *   `parseEdtf`); a list choice as its option's label; a controlled term as
- *   its label, with its URI as `@id` in JSON-LD; an identifier as its value
- *   only; a link as its URL; rights as the statement's URI (`{"@id": uri}` in
- *   JSON-LD; the note is not output); a place as its name, with an `@id` from
- *   its URI or a published place record. A value of the wrong shape, an
- *   unknown property, a list value the template doesn't offer or a URL that
- *   isn't plain http(s) refuses the whole output (`invalid_value`): nothing
- *   is guessed or dropped quietly.
+ *   Public values inherited from an unpublished ancestor are published on
+ *   the child; the ancestor's title and ID never appear.
+ * - **Every field kind is handled explicitly, and its shape checked again
+ *   here:** text and long text as the text; a date as its EDTF text; a list
+ *   choice as its option's label; a controlled term as its label, with its
+ *   URI; an identifier as its value only; a link as its URL; rights as the
+ *   statement's URI (never the note); a place as its name, with a URI from
+ *   its gazetteer URI or a published place record. URIs must be http(s) and
+ *   written exactly as a URL parser writes them back (so only printable
+ *   ASCII). Anything off refuses the whole output (`invalid_value`).
  *
  * Three forms come out of one call, from the same checked values:
  * - `dublinCore`: term → list of text, using the DCMI Metadata Terms names
- *   (`title`, `created`, `spatial` …).
+ *   (`title`, `created`, `spatial` …). It starts with the title, the record's
+ *   public URL as an `identifier` and its DCMI type as a `type` (when the
+ *   kind has one), then the mapped values. It is text only: terms and places
+ *   by label, links and rights by URL.
  * - `jsonLd` (and `jsonLdText`): a compacted JSON-LD document with an inline
  *   `@context` for `dcterms:`, `dcmitype:` and `rdfs:`, `@id` from the
  *   caller's base URL plus the record ID, and an `@type` from the record's
- *   kind (see `TYPE_FOR`). Keys are only ever `@context`, `@id`, `@type` and
- *   `dcterms:<term>` from the closed list in `dublin-core.ts`; text values
- *   are JSON strings, never objects, so text such as `"@id"` stays text.
- *   `jsonLdText` also writes `<`, `>`, `&`, U+2028 and U+2029 as `\u` escapes,
- *   so it can sit inside a `<script type="application/ld+json">` element.
- * - `oaiDcXml`: the OAI-PMH `oai_dc` record (the 15 Dublin Core elements).
- *   Refined terms are written as the element they refine (`created` as
- *   `dc:date`, `spatial` as `dc:coverage`); `rightsHolder` and `provenance`
- *   refine no element and are left out of this form only. Text is escaped
- *   (`& < > " '`, and carriage return as `&#13;`), and any character XML 1.0
- *   doesn't allow (most control characters, lone surrogates, U+FFFE, U+FFFF)
- *   refuses the output in every form (`bad_characters`).
+ *   kind (see `TYPE_FOR`). Keys are only ever `@context`, `@id`, `@type`,
+ *   `rdfs:label` and `dcterms:<term>` from the closed list in
+ *   `dublin-core.ts`. Each term is written according to its range in DCMI
+ *   Metadata Terms (`RANGE`): literal-range terms get text only (a URL is
+ *   a plain string); class-range terms get `{"@id"}` for a URI, otherwise a
+ *   node `{"rdfs:label"}` (and `type` always a label node, since a
+ *   vocabulary concept is not a class); terms with no range get `{"@id"}`
+ *   for a URI and text otherwise. `jsonLdText` also writes `<`, `>`, `&`,
+ *   U+2028 and U+2029 as escapes, so it can sit inside a
+ *   `<script type="application/ld+json">` element.
+ * - `oaiDcXml`: the OAI-PMH `oai_dc` record (the 15 Dublin Core elements),
+ *   with the same text as `dublinCore`. Refined terms are written as the
+ *   element they refine (`created` as `dc:date`, `spatial` as
+ *   `dc:coverage`); `rightsHolder` and `provenance` refine no element and are
+ *   left out of this form only. Text is escaped (`& < > " '`, and carriage
+ *   return as `&#13;`), and any character XML 1.0 doesn't allow refuses the
+ *   output in every form (`bad_characters`). The declaration says UTF-8, so
+ *   the caller must encode the string as UTF-8.
  *
- * Output is capped at MAX_OUTPUT_CHARS characters of values. Nothing here
- * throws; every problem comes back as issues.
+ * Each form is capped at MAX_OUTPUT_CHARS characters as produced (escapes
+ * included; `dublinCore` counts its values), and values are counted against
+ * the same cap while they are read. Nothing here throws; every problem comes
+ * back as issues.
  */
 import { types } from "node:util";
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
@@ -75,10 +93,17 @@ import {
   type DublinCoreTerm,
 } from "./dublin-core.js";
 import { parseEdtf } from "./edtf.js";
-import { rightsTerm } from "./rights.js";
+import { RIGHTS_FIELD_KEY, RIGHTS_REQUIRED_KINDS, rightsTerm } from "./rights.js";
 import { isRecordId, type RecordId } from "./record-id.js";
-import type { ArchivalLevel, RecordKind } from "./records.js";
-import { MAX_REPEATS, MAX_URL_LENGTH, type FieldDefinition } from "./templates.js";
+import type { CatalogRecord, RecordKind } from "./records.js";
+import {
+  MAX_REPEATS,
+  MAX_URL_LENGTH,
+  checkRecordAgainstTemplate,
+  type FieldDefinition,
+  type FieldTemplate,
+  type TemplateCheckOptions,
+} from "./templates.js";
 
 export const DCMITYPE_NAMESPACE = "http://purl.org/dc/dcmitype/";
 export const RDFS_NAMESPACE = "http://www.w3.org/2000/01/rdf-schema#";
@@ -88,7 +113,10 @@ export const OAI_DC_SCHEMA = "http://www.openarchives.org/OAI/2.0/oai_dc.xsd";
 
 /** The longest a base URL may be. */
 export const MAX_BASE_URL_LENGTH = MAX_URL_LENGTH;
-/** The most characters of values (title, text, URLs) one output may hold. */
+/**
+ * The most characters each form may hold as produced: `jsonLdText`,
+ * `oaiDcXml`, and the values of `dublinCore` added together.
+ */
 export const MAX_OUTPUT_CHARS = 5_000_000;
 
 export interface PublishOptions {
@@ -100,9 +128,15 @@ export interface PublishOptions {
   readonly baseUrl: string;
   /** The IDs of every published record. The record itself must be one. */
   readonly published: readonly RecordId[];
+  /**
+   * Checkers for the template check, as `checkRecordAgainstTemplate` takes
+   * them. Identifier values are refused unless one is given for `identifier`
+   * (`makeIdentifierChecker`).
+   */
+  readonly checkers?: TemplateCheckOptions["checkers"];
 }
 
-/** Dublin Core as term → values, title first, then in mapping order. */
+/** Dublin Core as term → values, in order (see the module header). */
 export type DublinCoreValues = Readonly<Partial<Record<DublinCoreTerm, readonly string[]>>>;
 
 export interface PublicOutput {
@@ -113,7 +147,7 @@ export interface PublicOutput {
   readonly jsonLd: Readonly<Record<string, JsonValue>>;
   /** `jsonLd` as JSON text, safe inside an HTML script element. */
   readonly jsonLdText: string;
-  /** The record as an OAI-PMH `oai_dc:dc` XML document. */
+  /** The record as an OAI-PMH `oai_dc:dc` XML document; encode it as UTF-8. */
   readonly oaiDcXml: string;
 }
 
@@ -130,6 +164,49 @@ const TYPE_FOR: ReadonlyMap<RecordKind, string> = new Map<RecordKind, string>([
   ["event", "dcmitype:Event"],
   ["agent", "dcterms:Agent"],
   ["place", "dcterms:Location"],
+]);
+
+/**
+ * How each term's value is written in JSON-LD, from its range in DCMI
+ * Metadata Terms: `literal` (rdfs:Literal; description and abstract, which
+ * declare no range, are treated as literal), `class` (a non-literal class
+ * such as Agent, Location or RightsStatement) or `any` (no range declared;
+ * values are often other resources).
+ */
+type Range = "literal" | "class" | "any";
+
+const RANGE: ReadonlyMap<DublinCoreTerm, Range> = new Map<DublinCoreTerm, Range>([
+  ["title", "literal"],
+  ["alternative", "literal"],
+  ["date", "literal"],
+  ["created", "literal"],
+  ["description", "literal"],
+  ["abstract", "literal"],
+  ["identifier", "literal"],
+  ["bibliographicCitation", "literal"],
+  ["creator", "class"],
+  ["contributor", "class"],
+  ["publisher", "class"],
+  ["rightsHolder", "class"],
+  ["type", "class"],
+  ["format", "class"],
+  ["extent", "class"],
+  ["medium", "class"],
+  ["language", "class"],
+  ["coverage", "class"],
+  ["spatial", "class"],
+  ["temporal", "class"],
+  ["rights", "class"],
+  ["accessRights", "class"],
+  ["license", "class"],
+  ["provenance", "class"],
+  ["subject", "any"],
+  ["source", "any"],
+  ["relation", "any"],
+  ["isPartOf", "any"],
+  ["hasPart", "any"],
+  ["isFormatOf", "any"],
+  ["hasFormat", "any"],
 ]);
 
 /** The `oai_dc` element each term is written as: itself, or the element it refines. */
@@ -170,6 +247,10 @@ const OAI_DC_ELEMENT: ReadonlyMap<DublinCoreTerm, string | undefined> = new Map<
   ["provenance", undefined],
 ]);
 
+/** The terms a rights field must be mapped to, for kinds that need rights. */
+const RIGHTS_TERMS: ReadonlySet<string> = new Set(["rights", "license"]);
+const NEEDS_RIGHTS: ReadonlySet<string> = new Set(RIGHTS_REQUIRED_KINDS);
+
 // ---------------------------------------------------------------------------
 
 /** Thrown inside this module only; `publicOutput` turns it into issues. */
@@ -183,11 +264,23 @@ function fail(path: readonly (string | number)[], code: string, message: string)
   throw new OutputError([issue(path, code, message)]);
 }
 
-/** One checked value: its text, and for JSON-LD an IRI (with the text as its label, or not). */
+/**
+ * One checked value: its text, and an IRI (with the text as its label, or
+ * not). Made with a null prototype and every property its own, so nothing on
+ * Object.prototype can add an IRI.
+ */
 interface OutValue {
   readonly text: string;
-  readonly iri?: string;
+  readonly iri: string | undefined;
   readonly labelled: boolean;
+}
+
+function outValue(text: string, iri?: string, labelled = false): OutValue {
+  const value = Object.create(null) as { text: string; iri: string | undefined; labelled: boolean };
+  value.text = text;
+  value.iri = iri;
+  value.labelled = labelled;
+  return Object.freeze(value);
 }
 
 interface Budget {
@@ -198,8 +291,8 @@ interface Budget {
  * Dublin Core, JSON-LD and `oai_dc` XML for one published record (see the
  * module header). `view` must be what `publicView` returned, `mapping` a
  * Dublin Core mapping for the template that record uses, and `options` the
- * base URL and the published record IDs. Fails, with every reason found
- * where there are several, when anything is off. Never throws.
+ * base URL, the published record IDs and any checkers. Fails, with the
+ * issues found, when anything is off. Never throws.
  */
 export function publicOutput(
   view: PublicRecord,
@@ -215,7 +308,7 @@ export function publicOutput(
         : [issue([], "unreadable", "The public output could not be made from this data.")];
     return Object.freeze({
       ok: false,
-      issues: Object.freeze(issues.map((i) => Object.freeze(i))),
+      issues: Object.freeze(issues.map((i) => Object.freeze({ ...i }))),
     });
   }
 }
@@ -229,25 +322,38 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
       "This is not a public view from publicView, so it can't be published.",
     );
   }
-  const { baseUrl, published } = readOptions(options);
+  const { baseUrl, published, checkers } = readOptions(options);
   if (!published.has(view.id)) {
     fail([], "not_published", "This record is not in the published list, so it can't be output.");
   }
   // The effective record the view was made from, from the mark beside it.
-  const blocked = effectivePublishIssues(origin.effective as EffectiveRecord);
+  const effective = origin.effective as EffectiveRecord;
+  const blocked = effectivePublishIssues(effective);
   if (blocked.length > 0) throw new OutputError(blocked);
-  const checked = validateDublinCoreMapping(mapping, origin.template);
+  const template = origin.template;
+  const checked = validateDublinCoreMapping(mapping, template);
   if (!checked.ok) throw new OutputError(checked.issues);
+  if (
+    NEEDS_RIGHTS.has(view.kind) &&
+    !checked.value.entries.some((e) => e.field === RIGHTS_FIELD_KEY && RIGHTS_TERMS.has(e.term))
+  ) {
+    fail(
+      ["entries"],
+      "rights_not_mapped",
+      `The mapping must map the ${RIGHTS_FIELD_KEY} field to rights or license, because this kind of record can't be published without its rights.`,
+    );
+  }
+  templateCheck(effective.record, view, template, checkers);
 
   const byKey = new Map<string, FieldDefinition>();
-  for (const field of origin.template.fields) byKey.set(field.key, field);
+  for (const field of template.fields) byKey.set(field.key, field);
   const entries = new Map<string, JsonValue>();
   for (const entry of view.entries) entries.set(entry.key, entry.value);
 
   const budget: Budget = { chars: 0 };
-  const recordUrl = baseUrl + view.id;
+  const recordUrl = safeText(baseUrl + view.id, ["id"], budget);
   const terms = new Map<DublinCoreTerm, OutValue[]>();
-  terms.set("title", [{ text: safeText(view.title, ["title"], budget), labelled: false }]);
+  terms.set("title", [outValue(safeText(view.title, ["title"], budget))]);
   for (const { field, term } of checked.value.entries) {
     const value = entries.get(field);
     // Not in the view: empty, staff only along the way, or not inherited.
@@ -263,35 +369,74 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
     else list.push(...values);
   }
 
-  safeText(recordUrl, ["id"], budget);
-  const dublinCore = Object.freeze(
-    Object.fromEntries(
-      [...terms].map(([term, values]) => [term, Object.freeze(values.map((v) => v.text))]),
-    ),
-  ) as DublinCoreValues;
-  const jsonLd = jsonLdDocument(recordUrl, typeFor(view.kind, origin.level), terms);
+  const type = typeFor(view.kind, origin);
+  const dublinCore = dublinCoreValues(terms, recordUrl, type);
+  const jsonLd = jsonLdDocument(recordUrl, type, terms);
+  const jsonLdText = scriptSafeJson(jsonLd);
+  capped(jsonLdText.length, "jsonLdText");
   return Object.freeze({
     id: recordUrl,
     dublinCore,
     jsonLd,
-    jsonLdText: scriptSafeJson(jsonLd),
-    oaiDcXml: oaiDc(terms),
+    jsonLdText,
+    oaiDcXml: oaiDc(dublinCore),
   });
 }
 
-function typeFor(kind: RecordKind, level: ArchivalLevel | undefined): string | undefined {
-  if (kind === "archival_unit" && (level === undefined || level === "item")) return undefined;
+/**
+ * Check the view's values with `checkRecordAgainstTemplate`, as the record
+ * they belong to, against the view's own template. Required fields are not
+ * checked: a value can be left out of the view because it is staff only.
+ */
+function templateCheck(
+  record: CatalogRecord,
+  view: PublicRecord,
+  template: FieldTemplate,
+  checkers: unknown,
+): void {
+  const loose: FieldTemplate = {
+    ...template,
+    fields: template.fields.map((f) => ({ ...f, required: false })),
+  };
+  const probe = Object.freeze({ ...record, fields: view.fields }) as CatalogRecord;
+  const problems = checkRecordAgainstTemplate(
+    probe,
+    loose,
+    (checkers === undefined ? {} : { checkers }) as TemplateCheckOptions,
+  );
+  if (problems.length > 0) throw new OutputError(problems);
+}
+
+/** The kind's class, as a compact IRI (`dcmitype:Collection`), or undefined. */
+function typeFor(kind: RecordKind, origin: object): string | undefined {
+  if (kind === "archival_unit") {
+    const level: unknown = Object.hasOwn(origin, "level")
+      ? (origin as { level: unknown }).level
+      : undefined;
+    if (level === undefined || level === "item") return undefined;
+  }
   return TYPE_FOR.get(kind);
+}
+
+function capped(length: number, form: string): void {
+  if (length > MAX_OUTPUT_CHARS) {
+    fail(
+      [form],
+      "too_large",
+      `The ${form} output would be more than ${String(MAX_OUTPUT_CHARS)} characters, so it isn't made.`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Options.
 
-const OPTION_KEYS: ReadonlySet<string> = new Set(["baseUrl", "published"]);
+const OPTION_KEYS: ReadonlySet<string> = new Set(["baseUrl", "published", "checkers"]);
 
 interface ReadOptions {
   readonly baseUrl: string;
   readonly published: ReadonlySet<RecordId>;
+  readonly checkers: unknown;
 }
 
 function readOptions(options: unknown): ReadOptions {
@@ -305,7 +450,8 @@ function readOptions(options: unknown): ReadOptions {
   }
   const baseUrl = checkBaseUrl(dataProp(options, "baseUrl"));
   const published = readPublished(dataProp(options, "published"));
-  return { baseUrl, published };
+  const checkers = dataProp(options, "checkers");
+  return { baseUrl, published, checkers };
 }
 
 /** An own data property, or undefined. A getter, hidden property or Proxy value fails. */
@@ -329,8 +475,8 @@ function checkBaseUrl(value: unknown): string {
   if (value.length > MAX_BASE_URL_LENGTH) {
     return bad(`can be at most ${String(MAX_BASE_URL_LENGTH)} characters`);
   }
-  if (/[\s\\]/.test(value) || NOT_XML_CHAR.test(value)) {
-    return bad("can't hold spaces, backslashes or control characters");
+  if (!PRINTABLE_ASCII.test(value) || value.includes("\\")) {
+    return bad("can't hold spaces, backslashes, control or non-ASCII characters");
   }
   if (value.includes("?") || value.includes("#")) return bad("can't have a query or fragment");
   let url: URL;
@@ -416,17 +562,17 @@ function valueOf(
   switch (def.kind) {
     case "text":
     case "long_text":
-      return { text: nonBlank(value, invalid), labelled: false };
+      return outValue(nonBlank(value, invalid));
     case "date": {
       const text = nonBlank(value, invalid);
       if (!parseEdtf(text).ok) return invalid();
-      return { text, labelled: false };
+      return outValue(text);
     }
     case "list": {
       const code = nonBlank(value, invalid);
       const option = (def.options ?? []).find((o) => o.value === code);
       if (option === undefined) return invalid();
-      return { text: option.label, labelled: false };
+      return outValue(option.label);
     }
     case "controlled_term": {
       const term = props(value, TERM_KEYS, invalid);
@@ -434,15 +580,13 @@ function valueOf(
       const uri = optionalIri(term.get("uri"), invalid);
       const vocabulary = term.get("vocabulary");
       if (vocabulary !== undefined && typeof vocabulary !== "string") return invalid();
-      return uri === undefined
-        ? { text: label, labelled: false }
-        : { text: label, iri: uri, labelled: true };
+      return uri === undefined ? outValue(label) : outValue(label, uri, true);
     }
     case "identifier": {
       // Only the value: identifier types are staff only (T-004 review).
       const id = props(value, IDENTIFIER_KEYS, invalid);
       if (typeof id.get("type") !== "string") return invalid();
-      return { text: nonBlank(id.get("value"), invalid), labelled: false };
+      return outValue(nonBlank(id.get("value"), invalid));
     }
     case "link": {
       const link = props(value, LINK_KEYS, invalid);
@@ -450,14 +594,14 @@ function valueOf(
       if (label !== undefined && typeof label !== "string") return invalid();
       const url = optionalIri(link.get("url"), invalid);
       if (url === undefined) return invalid();
-      return { text: url, iri: url, labelled: false };
+      return outValue(url, url);
     }
     case "rights": {
       const rights = props(value, RIGHTS_KEYS, invalid);
       const uri = rights.get("uri");
-      // The note is not output (D-016).
+      // The note is not published (D-016).
       if (typeof uri !== "string" || rightsTerm(uri) === undefined) return invalid();
-      return { text: uri, iri: uri, labelled: false };
+      return outValue(uri, uri);
     }
     case "place": {
       const place = props(value, PLACE_KEYS, invalid);
@@ -465,13 +609,13 @@ function valueOf(
       const uri = optionalIri(place.get("uri"), invalid);
       const recordId = place.get("recordId");
       if (recordId !== undefined && !isRecordId(recordId)) return invalid();
-      if (uri !== undefined) return { text: label, iri: uri, labelled: true };
+      if (uri !== undefined) return outValue(label, uri, true);
       // A place record is linked only when it is published; otherwise its
       // existence and ID stay unsaid.
       if (recordId !== undefined && ctx.published.has(recordId)) {
-        return { text: label, iri: ctx.baseUrl + recordId, labelled: true };
+        return outValue(label, ctx.baseUrl + recordId, true);
       }
-      return { text: label, labelled: false };
+      return outValue(label);
     }
   }
 }
@@ -504,13 +648,21 @@ function nonBlank(value: unknown, invalid: () => never): string {
   return value;
 }
 
-/** Characters an IRI can't hold as they are (RFC 3987), plus backslash. */
-const NOT_IN_IRI = /[\s<>"{}|\\^`]/;
+/** Printable ASCII only: no spaces, controls, invisible, direction or other non-ASCII characters. */
+const PRINTABLE_ASCII = /^[\x21-\x7e]+$/;
 
-/** An absolute http(s) URL with no user name or password, as stored; or undefined when absent. */
+/**
+ * An absolute http(s) URL with no user name or password, written exactly as
+ * a URL parser writes it back; or undefined when absent.
+ */
 function optionalIri(value: unknown, invalid: () => never): string | undefined {
   if (value === undefined) return undefined;
-  if (typeof value !== "string" || value.length > MAX_URL_LENGTH || NOT_IN_IRI.test(value)) {
+  if (
+    typeof value !== "string" ||
+    value.length > MAX_URL_LENGTH ||
+    !PRINTABLE_ASCII.test(value) ||
+    value.includes("\\")
+  ) {
     return invalid();
   }
   let url: URL;
@@ -521,6 +673,7 @@ function optionalIri(value: unknown, invalid: () => never): string | undefined {
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") return invalid();
   if (url.username !== "" || url.password !== "") return invalid();
+  if (url.href !== value) return invalid();
   return value;
 }
 
@@ -540,18 +693,42 @@ function safeText(text: string, path: readonly (string | number)[], budget: Budg
     );
   }
   budget.chars += text.length;
-  if (budget.chars > MAX_OUTPUT_CHARS) {
-    fail(
-      [],
-      "too_large",
-      `The output would be more than ${String(MAX_OUTPUT_CHARS)} characters, so it isn't made.`,
-    );
-  }
+  capped(budget.chars, "values");
   return text;
 }
 
 // ---------------------------------------------------------------------------
 // The three forms.
+
+function dublinCoreValues(
+  terms: ReadonlyMap<DublinCoreTerm, readonly OutValue[]>,
+  recordUrl: string,
+  type: string | undefined,
+): DublinCoreValues {
+  const lists = new Map<DublinCoreTerm, string[]>();
+  const add = (term: DublinCoreTerm, text: string): void => {
+    const list = lists.get(term);
+    if (list === undefined) lists.set(term, [text]);
+    else list.push(text);
+  };
+  for (const v of terms.get("title") ?? []) add("title", v.text);
+  add("identifier", recordUrl);
+  // The DCMI Type Vocabulary types only; Agent and Location are classes, not types.
+  if (type?.startsWith("dcmitype:") === true) {
+    add("type", DCMITYPE_NAMESPACE + type.slice("dcmitype:".length));
+  }
+  let chars = 0;
+  for (const [term, values] of terms) {
+    if (term === "title") continue;
+    for (const v of values) add(term, v.text);
+  }
+  for (const list of lists.values()) for (const text of list) chars += text.length;
+  capped(chars, "dublinCore");
+  const values: DublinCoreValues = Object.freeze(
+    Object.fromEntries([...lists].map(([term, list]) => [term, Object.freeze(list)])),
+  );
+  return values;
+}
 
 const CONTEXT: Readonly<Record<string, JsonValue>> = Object.freeze({
   dcterms: DCTERMS_NAMESPACE,
@@ -570,7 +747,8 @@ function jsonLdDocument(
   ];
   if (type !== undefined) pairs.push(["@type", type]);
   for (const [term, values] of terms) {
-    const items = values.map(jsonLdValue);
+    const range = RANGE.get(term) ?? "literal";
+    const items = values.map((v) => jsonLdValue(term, range, v));
     const [only] = items;
     pairs.push([
       `dcterms:${term}`,
@@ -581,11 +759,14 @@ function jsonLdDocument(
   return Object.freeze(Object.fromEntries(pairs));
 }
 
-function jsonLdValue(value: OutValue): JsonValue {
-  if (value.iri === undefined) return value.text;
-  return Object.freeze(
-    value.labelled ? { "@id": value.iri, "rdfs:label": value.text } : { "@id": value.iri },
-  );
+function jsonLdValue(term: DublinCoreTerm, range: Range, value: OutValue): JsonValue {
+  if (range === "literal") return value.text;
+  // A vocabulary concept or a web page is not a class, so `type` never takes an IRI here.
+  const iri = term === "type" ? undefined : value.iri;
+  if (iri === undefined) {
+    return range === "class" ? Object.freeze({ "rdfs:label": value.text }) : value.text;
+  }
+  return Object.freeze(value.labelled ? { "@id": iri, "rdfs:label": value.text } : { "@id": iri });
 }
 
 /** JSON text with `<`, `>`, `&`, U+2028 and U+2029 escaped: the same value, safe in a script element. */
@@ -596,16 +777,25 @@ function scriptSafeJson(value: JsonValue): string {
   );
 }
 
-function oaiDc(terms: ReadonlyMap<DublinCoreTerm, readonly OutValue[]>): string {
+function oaiDc(dublinCore: DublinCoreValues): string {
   const lines = [
     '<?xml version="1.0" encoding="UTF-8"?>',
     `<oai_dc:dc xmlns:oai_dc="${OAI_DC_NAMESPACE}" xmlns:dc="${DC_ELEMENTS_NAMESPACE}" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="${OAI_DC_NAMESPACE} ${OAI_DC_SCHEMA}">`,
   ];
-  for (const [term, values] of terms) {
+  let length = lines[0]?.length ?? 0;
+  length += lines[1]?.length ?? 0;
+  for (const [term, values] of Object.entries(dublinCore) as [
+    DublinCoreTerm,
+    readonly string[],
+  ][]) {
     const element = OAI_DC_ELEMENT.get(term);
     if (element === undefined) continue;
-    for (const value of values)
-      lines.push(`  <dc:${element}>${xmlText(value.text)}</dc:${element}>`);
+    for (const value of values) {
+      const line = `  <dc:${element}>${xmlText(value)}</dc:${element}>`;
+      length += line.length + 1;
+      capped(length, "oaiDcXml");
+      lines.push(line);
+    }
   }
   lines.push("</oai_dc:dc>", "");
   return lines.join("\n");

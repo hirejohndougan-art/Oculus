@@ -28,9 +28,9 @@
  * - `rights`: `{ uri, note? }`, a rights statement or license URI. One per
  *   record: the kind is only allowed in a single, public, non-repeating field
  *   with the key `rights`, the field the publish rule reads (rights.ts,
- *   D-011, D-015). The note is published with the URI, so it must never hold
- *   donor names or contact details; private rights notes go in a separate
- *   staff field.
+ *   D-011, D-015). The note is kept staff-side and is not published (D-016,
+ *   superseding D-015); still keep donor names and contact details out of
+ *   it, and put private rights notes in a separate staff field.
  * - `place`: `{ label, uri?, recordId? }`, a place by name, with a gazetteer
  *   URI (GNIS) or the ID of a place record if known.
  *
@@ -440,7 +440,7 @@ function checkField(
 
 /**
  * The publish rule reads one rights value from `fields.rights` and publishes
- * it, note included (D-011, D-015). So the `rights` kind and the key `rights`
+ * its URI; the note is not published (D-011, D-015, D-016). So the `rights` kind and the key `rights`
  * go together, the field holds one value, and it is public. Duplicate keys
  * are refused elsewhere, so a template has at most one rights field.
  */
@@ -476,7 +476,7 @@ function checkRightsField(
     issues.add(
       [...path, "visibility"],
       "rights_not_public",
-      'The rights field is published with the record, note included, so its visibility must be "public". Keep private rights notes in a separate staff field.',
+      'The rights field is published with the record, so its visibility must be "public". Keep private rights notes in a separate staff field.',
     );
   }
 }
