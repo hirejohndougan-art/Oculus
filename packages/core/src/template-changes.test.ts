@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   templateChanges,
+  validateLegacyTemplate,
+  validateTemplate,
   type TemplateChange,
   type TemplateChanges,
   newOrganizationId,
@@ -242,6 +244,22 @@ describe("templateChanges", () => {
     expect(r.changes.map((c) => [c.code, c.removedCodes, c.recordIds])).toEqual([
       ["identifier_type_removed", ["call_number"], [A]],
     ]);
+  });
+
+  it("can fix a template stored with hyphenated identifier type codes (D-0XX)", () => {
+    const id = (types: string[]) =>
+      field({ key: "ref", kind: "identifier", identifierTypes: types });
+    const legacy = template(id(["accession", "call-number"]));
+    expect(validateTemplate(legacy).ok).toBe(false);
+    expect(validateLegacyTemplate(legacy).ok).toBe(true);
+    const r = run(legacy, template(id(["accession", "call_number"])), [
+      record(A, { ref: { type: "call-number", value: "1" } }),
+    ]);
+    expect(r.changes.map((c) => [c.code, c.removedCodes, c.recordIds])).toEqual([
+      ["identifier_type_removed", ["call-number"], [A]],
+    ]);
+    // The new version must follow the rule.
+    expect(templateChanges(legacy, legacy).ok).toBe(false);
   });
 
   it("reports a field made required with the records lacking it", () => {

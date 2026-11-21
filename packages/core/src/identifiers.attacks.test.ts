@@ -12,6 +12,7 @@ import {
   retireIdentifier,
   uniquenessIssues,
   validateIdentifierType,
+  validateNewIdentifierType,
   validateIdentifierTypes,
   validateRecordIdentifiers,
   type IdentifierType,
@@ -60,21 +61,29 @@ describe("built-in names can't stand in for identifier types", () => {
     },
   );
 
-  it("refuses prototype keys as type keys, as templates do (D-0XX)", () => {
+  it("a stored type named 'constructor' still works; a new one is refused (D-0XX)", () => {
+    const type = {
+      key: "constructor",
+      label: "Odd",
+      organizationId: ORG,
+      uniqueness: "current",
+    } as const;
+    expect(validateIdentifierType(type).ok).toBe(true);
+    expect(validateIdentifierTypes([type]).ok).toBe(true);
+    const r = validateRecordIdentifiers(
+      {
+        recordId: newRecordId(),
+        organizationId: ORG,
+        current: [{ type: "constructor", value: "1", primary: true }],
+        former: [{ type: "prototype", value: "0" }],
+      },
+      [type],
+    );
+    expect(r.ok).toBe(true);
     for (const key of ["constructor", "prototype"]) {
-      const type = { key, label: "Odd", organizationId: ORG, uniqueness: "current" } as const;
-      expect(codes(validateIdentifierType(type))).toEqual(["invalid_key"]);
-      const r = validateRecordIdentifiers(
-        {
-          recordId: newRecordId(),
-          organizationId: ORG,
-          current: [],
-          former: [{ type: key, value: "1" }],
-        },
-        TYPES,
-      );
-      expect(codes(r)).toEqual(["invalid_type"]);
+      expect(codes(validateNewIdentifierType({ ...type, key }))).toEqual(["reserved_key"]);
     }
+    expect(validateNewIdentifierType({ ...type, key: "accession" }).ok).toBe(true);
   });
 
   it("__proto__ keys are refused, not merged", () => {

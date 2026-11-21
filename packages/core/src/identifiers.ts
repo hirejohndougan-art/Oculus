@@ -190,14 +190,24 @@ export const MAX_QUERY_LENGTH = 1000;
 const TYPE_KEY = /^[a-z][a-z0-9_]{0,63}$/;
 
 /**
- * The one rule for identifier type keys (D-0XX): 1 to 64 lower case ASCII
+ * The rule for new identifier type keys (D-0XX): 1 to 64 lower case ASCII
  * letters, digits and underscores, starting with a letter, and not a
  * prototype key (`constructor`, `prototype`). Template `identifierTypes`
- * lists and the `type` of identifier values in records use it too, so a
- * template can only name a type that could exist.
+ * lists and the `type` of identifier values in template fields use it too,
+ * so a template can only name a type that could exist.
+ *
+ * Types stored before this rule may be keyed `constructor` or `prototype`:
+ * `validateIdentifierType(s)` still accept them, so existing data keeps
+ * working; `validateNewIdentifierType` refuses them, and
+ * `identifierTypeChanges` reports them as `reserved_key` until renamed.
  */
 export function isIdentifierTypeKey(value: unknown): value is string {
-  return typeof value === "string" && TYPE_KEY.test(value) && !FORBIDDEN_KEYS.has(value);
+  return isStoredTypeKey(value) && !FORBIDDEN_KEYS.has(value);
+}
+
+/** Keys stored types may have: the rule above, plus the legacy reserved keys. */
+function isStoredTypeKey(value: unknown): value is string {
+  return typeof value === "string" && TYPE_KEY.test(value);
 }
 
 /** The rule above in words, for messages. */
@@ -248,6 +258,20 @@ export function validateIdentifierType(input: unknown): Validated<IdentifierType
     if (issues.count > 0) return { ok: false, issues: issues.items };
     return { ok: true, value: copy as unknown as IdentifierType };
   }, "This identifier type could not be read as plain data.");
+}
+
+/**
+ * Check an identifier type being created: as `validateIdentifierType`, and its
+ * key must follow `isIdentifierTypeKey` (no `constructor` or `prototype`,
+ * which older stored types may still have). Never throws.
+ */
+export function validateNewIdentifierType(input: unknown): Validated<IdentifierType> {
+  const checked = validateIdentifierType(input);
+  if (!checked.ok || isIdentifierTypeKey(checked.value.key)) return checked;
+  return {
+    ok: false,
+    issues: [issue(["key"], "reserved_key", `${shown(checked.value.key)} can't be used as a key.`)],
+  };
 }
 
 /**
@@ -334,12 +358,8 @@ function checkType(
       "Every identifier type belongs to one organization: organizationId must be an organization ID.",
     );
   }
-  if (!isIdentifierTypeKey(view.key)) {
-    issues.add(
-      [...at, "key"],
-      "invalid_key",
-      `The key is ${IDENTIFIER_TYPE_KEY_RULE}, and can't be constructor or prototype.`,
-    );
+  if (!isStoredTypeKey(view.key)) {
+    issues.add([...at, "key"], "invalid_key", `The key is ${IDENTIFIER_TYPE_KEY_RULE}.`);
   }
   checkLine(view.label, [...at, "label"], "label", MAX_TYPE_LABEL_LENGTH, issues);
 
@@ -530,6 +550,35 @@ export function validateRecordIdentifiers(
   }, "These identifiers could not be read as plain data.");
 }
 
+/**
+ * Read one record's stored identifiers for a check over existing data
+ * (`identifierTypeChanges`): every safety and shape rule of
+ * `validateRecordIdentifiers`, but a current identifier may name a type that
+ * no longer exists or not fit its type's format, since stored data can
+ * already be stranded. Internal: not exported from the package. Never throws.
+ */
+export function readStoredIdentifiers(input: unknown): Validated<RecordIdentifiers> {
+  return guarded(() => {
+    const issues = new IssueList();
+    const copy = readTop(
+      input,
+      SET_LIMITS,
+      issues,
+      "A record's identifiers must be a plain object.",
+    );
+    if (copy === undefined) return { ok: false, issues: issues.items };
+    const view = ownOnly(copy);
+    unknownKeys(view, ["recordId", "current", "former"], [], "a record's identifiers", issues);
+    if (!isRecordId(view.recordId)) {
+      issues.add(["recordId"], "invalid_id", "recordId must be a record ID.");
+    }
+    checkCurrent(view.current, undefined, issues);
+    checkFormer(view.former, issues);
+    if (issues.count > 0) return { ok: false, issues: issues.items };
+    return { ok: true, value: copy as unknown as RecordIdentifiers };
+  }, "These identifiers could not be read as plain data.");
+}
+
 interface CompiledType {
   readonly type: IdentifierType;
   readonly pattern: IdentifierPattern | undefined;
@@ -548,9 +597,10 @@ function typeMap(identifierTypes: readonly IdentifierType[]): Map<string, Compil
   return byKey;
 }
 
+/** `byKey` undefined: stored data, any well-formed type key, no format check. */
 function checkCurrent(
   list: JsonValue | undefined,
-  byKey: Map<string, CompiledType>,
+  byKey: Map<string, CompiledType> | undefined,
   issues: IssueList,
 ): void {
   if (!Array.isArray(list)) {
@@ -576,12 +626,21 @@ function checkCurrent(
     }
     const item = ownOnly(raw);
     unknownKeys(item, ["type", "value", "primary"], at, "an identifier", issues);
-    const known = typeof item.type === "string" ? byKey.get(item.type) : undefined;
+    const known =
+      byKey === undefined
+        ? isStoredTypeKey(item.type)
+          ? { type: { key: item.type, label: item.type }, pattern: undefined }
+          : undefined
+        : typeof item.type === "string"
+          ? byKey.get(item.type)
+          : undefined;
     if (known === undefined) {
       issues.add(
         [...at, "type"],
-        "unknown_type",
-        `${shown(item.type)} is not one of this organization's identifier types.`,
+        byKey === undefined ? "invalid_type" : "unknown_type",
+        byKey === undefined
+          ? "The type must be an identifier type key."
+          : `${shown(item.type)} is not one of this organization's identifier types.`,
       );
     }
     const valueOk = checkValue(item.value, [...at, "value"], issues);
@@ -644,7 +703,7 @@ function checkFormer(list: JsonValue | undefined, issues: IssueList): void {
     }
     const item = ownOnly(raw);
     unknownKeys(item, ["type", "value", "retiredAt", "note"], at, "a former identifier", issues);
-    if (!isIdentifierTypeKey(item.type)) {
+    if (!isStoredTypeKey(item.type)) {
       issues.add([...at, "type"], "invalid_type", "The type must be an identifier type key.");
     }
     if (

@@ -118,13 +118,26 @@ describe("records that can't be read refuse the whole check", () => {
   it("an invalid identifier set or record among valid ones refuses, rather than skipping it", () => {
     const badSet = use([
       ...SETS,
-      set(newRecordId(), [{ type: "nope", value: "1", primary: true }]),
+      set(newRecordId(), [{ type: "Not A Key", value: "1", primary: true }]),
     ]);
     expect(codes(identifierTypeChanges(DONOR, { ...DONOR, public: true }, badSet))).toEqual([
       "invalid_entry",
     ]);
     const badRecord = use(SETS, [record(A, {}), { kind: "object", id: B }]);
     expect(codes(identifierTypeDeletion(DONOR, badRecord))).toEqual(["invalid_entry"]);
+  });
+
+  it("stranded stored values (a removed type, a value off its format) are counted, not refused", () => {
+    const strict: IdentifierType = { ...OBJECT, pattern: "DHS-####" };
+    const sets = [
+      set(A, [{ type: "removed_type", value: "1", primary: true }]),
+      set(B, [{ type: "object_number", value: "OLD 5", primary: true }]),
+    ];
+    const existing = { identifierTypes: [DONOR, strict], identifiers: sets, records: [] };
+    const r = ok(identifierTypeChanges(strict, { ...strict, key: "object_no" }, existing));
+    expect(r.changes.map((c) => [c.code, c.recordIds])).toEqual([["key_changed", [B]]]);
+    const del = ok(identifierTypeDeletion(strict, existing));
+    expect(del.changes.map((c) => [c.code, c.recordIds])).toEqual([["type_deleted", [B]]]);
   });
 
   it("refuses an ID used twice, so one record can't shadow another", () => {
@@ -217,6 +230,8 @@ describe("hostile input", () => {
   it("refuses types that break the key rule, hyphens and prototype keys included", () => {
     for (const key of ["call-number", "constructor", "__proto__", "Accession", ""]) {
       expect(identifierTypeChanges(DONOR, { ...DONOR, key }).ok).toBe(false);
+    }
+    for (const key of ["call-number", "__proto__", "Accession", ""]) {
       expect(identifierTypeDeletion({ ...DONOR, key }).ok).toBe(false);
     }
     // And templates can no longer name a hyphenated type (D-0XX).
@@ -232,6 +247,25 @@ describe("hostile input", () => {
     };
     const t = validateTemplate({ key: "t", label: "T", appliesTo: ["object"], fields: [field] });
     expect(codes(t)).toEqual(["invalid_code"]);
+  });
+
+  it("a stored type keyed 'constructor' must be renamed when edited, and can be deleted", () => {
+    const legacy: IdentifierType = { key: "constructor", label: "Old", uniqueness: "none" };
+    const existing = {
+      identifierTypes: [legacy],
+      identifiers: [set(A, [{ type: "constructor", value: "7", primary: true }])],
+      records: [],
+    };
+    const r = ok(identifierTypeChanges(legacy, { ...legacy, label: "Older" }, existing));
+    expect(r.changes.map((c) => [c.code, c.needsConfirmation, c.recordIds])).toEqual([
+      ["reserved_key", true, [A]],
+    ]);
+    const renamed = ok(identifierTypeChanges(legacy, { ...legacy, key: "old_number" }, existing));
+    expect(renamed.changes.map((c) => c.code)).toEqual(["key_changed"]);
+    expect(codes(identifierTypeChanges(DONOR, { ...DONOR, key: "prototype" }))).toEqual([
+      "reserved_key",
+    ]);
+    expect(ok(identifierTypeDeletion(legacy, existing)).changes[0]?.recordIds).toEqual([A]);
   });
 
   it("non-objects of every kind are refused, never thrown on", () => {

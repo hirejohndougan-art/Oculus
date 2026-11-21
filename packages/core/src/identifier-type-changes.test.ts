@@ -116,7 +116,7 @@ describe("identifierTypeChanges", () => {
     expect(summary(none)).toEqual([["made_public", true, []]]);
     const pub = { ...ACCESSION, public: true };
     const back = ok(identifierTypeChanges(pub, ACCESSION, use(SETS, [], [pub, BOX])));
-    expect(summary(back)).toEqual([["made_staff", false, []]]);
+    expect(summary(back)).toEqual([["made_staff", false, []]]); // no records in fields
   });
 
   it("reports current values, not former ones, that a new format refuses", () => {
@@ -269,6 +269,79 @@ describe("identifierTypeChanges", () => {
       identifierTypeChanges(ACCESSION, without(ACCESSION, "autoNumber"), use(SETS)),
     );
     expect(summary(removed)).toEqual([["auto_number_changed", false, []]]);
+  });
+
+  it("reports numbers held only in template fields, which nextIdentifier doesn't count", () => {
+    const manual = without(ACCESSION, "autoNumber", "pattern");
+    const r = ok(
+      identifierTypeChanges(
+        manual,
+        without(ACCESSION, "pattern"),
+        use([], [record(A, { number: { type: "accession", value: "DHS-0001" } })], [manual]),
+      ),
+    );
+    expect(summary(r)).toEqual([["auto_number_changed", true, [A]]]);
+  });
+
+  it("compares by the whole prefix, digits included, and by year then sequence", () => {
+    const manual: IdentifierType = { key: "accession", label: "Accession", uniqueness: "current" };
+    const prefixed = {
+      ...manual,
+      autoNumber: { style: "prefix", prefix: "M1-", digits: 4 },
+    } as const;
+    const r = ok(
+      identifierTypeChanges(
+        manual,
+        prefixed,
+        use([set(A, [{ type: "accession", value: "M1 0009" }])], [], [manual]),
+      ),
+    );
+    expect(summary(r)).toEqual([["auto_number_changed", true, [A]]]);
+    const yearly = { ...manual, autoNumber: { style: "year", separator: ".", digits: 3 } } as const;
+    const y = ok(
+      identifierTypeChanges(
+        manual,
+        yearly,
+        use([set(B, [{ type: "accession", value: "2026015" }])], [], [manual]),
+      ),
+    );
+    expect(summary(y)).toEqual([["auto_number_changed", true, [B]]]);
+  });
+
+  it("making a type staff lists records holding it in public template fields", () => {
+    const pub = { ...BOX, public: true };
+    const tpl = (visibility: string) => ({
+      key: "objects",
+      label: "Objects",
+      appliesTo: ["object"],
+      fields: [
+        {
+          key: "number",
+          label: "Number",
+          kind: "identifier",
+          required: false,
+          repeatable: true,
+          visibility,
+          inherited: false,
+        },
+      ],
+    });
+    const records = [
+      record(A, { number: [{ type: "box", value: "12" }] }),
+      record(B, { other: { type: "box", value: "13" } }),
+    ];
+    const base = { identifierTypes: [ACCESSION, pub], identifiers: [], records };
+    const withTemplates = ok(
+      identifierTypeChanges(pub, BOX, { ...base, templates: [tpl("public")] }),
+    );
+    expect(summary(withTemplates)).toEqual([["made_staff", true, [A]]]);
+    const staffOnly = ok(identifierTypeChanges(pub, BOX, { ...base, templates: [tpl("staff")] }));
+    expect(summary(staffOnly)).toEqual([["made_staff", false, []]]);
+    // Without templates every field counts.
+    expect(summary(ok(identifierTypeChanges(pub, BOX, base)))).toEqual([
+      ["made_staff", true, [A, B]],
+    ]);
+    expect(summary(ok(identifierTypeChanges(pub, BOX)))).toEqual([["made_staff", true, []]]);
   });
 
   it("without records, every change that could affect records needs confirmation", () => {

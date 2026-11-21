@@ -30,15 +30,25 @@
  * - `auto_number_changed`: auto-numbering is added or changed. `recordIds`
  *   are the records holding a number the new numbering would give out again
  *   written differently (another separator, a prefix without its dash), so
- *   the uniqueness check, which compares exact keys, wouldn't catch it.
+ *   the uniqueness check, which compares exact keys, wouldn't catch it, or
+ *   held only in a template field, which `nextIdentifier` doesn't count.
  *   Needs confirmation only when there are such records.
- * - `uniqueness_loosened`, `made_staff`, auto-numbering removed:
- *   informational.
+ * - `reserved_key`: a type stored with the key `constructor` or `prototype`
+ *   (allowed before D-0XX) is edited without renaming it; needs
+ *   confirmation, and renaming onto a reserved key is refused.
+ * - `made_staff`: `public` goes from true to false. A staff type is refused
+ *   in public template fields (D-022), so `recordIds` are the records holding
+ *   a value of it in a field public for their kind in some template (any
+ *   field when `templates` isn't given); needs confirmation when there are.
+ * - `uniqueness_loosened`, auto-numbering removed: informational.
  *
  * `existing` holds what the type is used by: `identifierTypes` (the
  * organization's current list, which must contain `oldType` exactly),
  * `identifiers` (every record's identifiers) and `records` (the catalog
- * records, whose template `identifier` fields hold `{ type, value }`). An
+ * records, whose template `identifier` fields hold `{ type, value }`), and
+ * optionally `templates`. Stored identifier sets are read leniently: a value
+ * of a removed type or one that never fit its format is already stranded, and
+ * is counted, not refused. An
  * empty list means "there are none": pass nothing when they are unknown.
  * Without it, `recordsChecked` is false and every change that could affect
  * records needs confirmation.
@@ -46,7 +56,7 @@
  * Messages name the type key and give counts only: they never quote a
  * stored value. Everything is validated first (the types with
  * `validateIdentifierType` and `validateIdentifierTypes`, each identifier
- * set with `validateRecordIdentifiers`, each record with `validateRecord`);
+ * set for shape and safety only, each template with `validateLegacyTemplate`, each record with `validateRecord`);
  * any doubt refuses the whole comparison with issues. The work is linear in
  * the identifiers and field values, each matched at most once against a
  * format, the same work as validating them. Never throws.
@@ -58,8 +68,9 @@ import type { RecordId } from "./record-id.js";
 import {
   MAX_AUTO_NUMBER,
   validateIdentifierType,
+  isIdentifierTypeKey,
+  readStoredIdentifiers,
   validateIdentifierTypes,
-  validateRecordIdentifiers,
   type AutoNumbering,
   type IdentifierType,
   type RecordIdentifiers,
@@ -72,10 +83,12 @@ import {
   type IdentifierPattern,
 } from "./identifier-pattern.js";
 import { MAX_LISTED_RECORDS } from "./template-changes.js";
+import { validateLegacyTemplate, type FieldTemplate } from "./templates.js";
 import { MAX_RECORD_SET } from "./effective.js";
 import { types } from "node:util";
 
 export const IDENTIFIER_TYPE_CHANGE_CODES = [
+  "reserved_key",
   "key_changed",
   "type_deleted",
   "made_public",
@@ -110,7 +123,11 @@ export interface IdentifierTypeChanges {
   readonly recordsChecked: boolean;
 }
 
-/** What an identifier type is used by. Every list is required; an empty one means "none". */
+/**
+ * What an identifier type is used by. `identifierTypes`, `identifiers` and
+ * `records` are required; an empty list means "none". `templates` is
+ * optional: without it, every field is treated as possibly public.
+ */
 export interface IdentifierTypeUse {
   /** The organization's identifier types as they are now, including the one being changed. */
   readonly identifierTypes: readonly IdentifierType[];
@@ -118,6 +135,8 @@ export interface IdentifierTypeUse {
   readonly identifiers: readonly RecordIdentifiers[];
   /** Every catalog record, for `{ type, value }` values in template `identifier` fields. */
   readonly records: readonly CatalogRecord[];
+  /** The organization's templates (as stored), to tell which fields are public. */
+  readonly templates?: readonly FieldTemplate[];
 }
 
 /**
@@ -191,6 +210,17 @@ function compare(
   const changes: IdentifierTypeChange[] = [];
   const unchecked = use === undefined;
 
+  // `constructor` and `prototype` were allowed before D-0XX: a stored type
+  // keeps working, but can't be created, and an edit must rename it.
+  if (!isIdentifierTypeKey(now.key)) {
+    if (now.key !== was.key) {
+      return fail(["newType", "key"], "reserved_key", `${shown(now.key)} can't be used as a key.`);
+    }
+    changes.push(
+      change("reserved_key", key, use === undefined ? undefined : holders(use, key), true),
+    );
+  }
+
   if (now.key !== was.key) {
     const held = use === undefined ? undefined : holders(use, key);
     changes.push(change("key_changed", key, held, unchecked || (held?.count ?? 0) > 0, now.key));
@@ -238,7 +268,8 @@ function compare(
     );
   }
   if (was.public === true && now.public !== true) {
-    changes.push(change("made_staff", key, use === undefined ? undefined : new Held(), false));
+    const held = use === undefined ? undefined : inPublicFields(use, key);
+    changes.push(change("made_staff", key, held, unchecked || (held?.count ?? 0) > 0));
   }
   return done(changes, use);
 }
@@ -264,6 +295,8 @@ interface Use {
   readonly identifierTypes: readonly IdentifierType[];
   readonly identifiers: readonly RecordIdentifiers[];
   readonly records: readonly CatalogRecord[];
+  /** Field keys that are public in some template, by record kind; undefined when unknown. */
+  readonly publicKeys: ReadonlyMap<string, ReadonlySet<string>> | undefined;
 }
 
 function readType(input: unknown, root: string): Validated<IdentifierType> {
@@ -304,7 +337,12 @@ function readUse(input: unknown, type: IdentifierType): Validated<Use> {
     );
   }
   for (const name of Object.keys(input)) {
-    if (name !== "identifierTypes" && name !== "identifiers" && name !== "records") {
+    if (
+      name !== "identifierTypes" &&
+      name !== "identifiers" &&
+      name !== "records" &&
+      name !== "templates"
+    ) {
       return fail(
         ["existing", name],
         "unknown_property",
@@ -332,18 +370,41 @@ function readUse(input: unknown, type: IdentifierType): Validated<Use> {
   const identifiers = readList(
     own(input, "identifiers"),
     "identifiers",
-    (item) => validateRecordIdentifiers(item, typesRead.value),
+    // Stored sets may already hold stranded values (a removed type, a value
+    // that never fit the format): those are read, not refused.
+    readStoredIdentifiers,
     (set) => set.recordId,
   );
   if (!identifiers.ok) return identifiers;
   const records = readList(own(input, "records"), "records", validateRecord, (r) => r.id);
   if (!records.ok) return records;
+  let publicKeys: Map<string, Set<string>> | undefined;
+  const templatesInput = own(input, "templates");
+  if (templatesInput !== undefined || Object.hasOwn(input, "templates")) {
+    const templates = readList(templatesInput, "templates", validateLegacyTemplate);
+    if (!templates.ok) return templates;
+    publicKeys = new Map();
+    for (const t of templates.value) {
+      for (const f of t.fields) {
+        if (f.kind !== "identifier" || f.visibility !== "public") continue;
+        for (const kind of t.appliesTo) {
+          let keys = publicKeys.get(kind);
+          if (keys === undefined) {
+            keys = new Set();
+            publicKeys.set(kind, keys);
+          }
+          keys.add(f.key);
+        }
+      }
+    }
+  }
   return {
     ok: true,
     value: {
       identifierTypes: typesRead.value,
       identifiers: identifiers.value,
       records: records.value,
+      publicKeys,
     },
   };
 }
@@ -359,7 +420,7 @@ function readList<T>(
   input: unknown,
   name: string,
   validate: (item: unknown) => Validated<T>,
-  idOf: (item: T) => RecordId,
+  idOf?: (item: T) => RecordId,
 ): Validated<readonly T[]> {
   if (types.isProxy(input) || !Array.isArray(input)) {
     return fail(["existing", name], "not_a_list", `existing.${name} must be a list.`);
@@ -384,15 +445,15 @@ function readList<T>(
         `Entry ${String(i)} in existing.${name} is not valid, so the change can't be checked safely.`,
       );
     }
-    const id = idOf(checked.value);
-    if (seen.has(id)) {
+    const id = idOf?.(checked.value);
+    if (id !== undefined && seen.has(id)) {
       return fail(
         ["existing", name, i],
         "duplicate_id",
         `Entry ${String(i)} in existing.${name} uses a record ID already in the list.`,
       );
     }
-    seen.add(id);
+    if (id !== undefined) seen.add(id);
     out.push(checked.value);
   }
   return { ok: true, value: out };
@@ -435,7 +496,9 @@ class Held {
 }
 
 /** Each `{ type, value }` identifier value in a record's fields, as a field holds it. */
-function* fieldIdentifiers(record: CatalogRecord): Generator<{ type: string; value: string }> {
+function* fieldIdentifiers(
+  record: CatalogRecord,
+): Generator<{ type: string; value: string; field: string }> {
   for (const name of Object.keys(record.fields)) {
     const value: JsonValue | undefined = record.fields[name];
     if (value === undefined) continue;
@@ -446,7 +509,7 @@ function* fieldIdentifiers(record: CatalogRecord): Generator<{ type: string; val
       if (!isPlainObject(item)) continue;
       const type = Object.hasOwn(item, "type") ? item.type : undefined;
       const v = Object.hasOwn(item, "value") ? item.value : undefined;
-      if (typeof type === "string" && typeof v === "string") yield { type, value: v };
+      if (typeof type === "string" && typeof v === "string") yield { type, value: v, field: name };
     }
   }
 }
@@ -462,6 +525,27 @@ function holders(use: Use, key: string): Held {
   for (const record of use.records) {
     for (const item of fieldIdentifiers(record)) {
       if (item.type === key) {
+        held.add(record.id);
+        break;
+      }
+    }
+  }
+  return held;
+}
+
+/**
+ * Records holding a value of the type in a template field that is public for
+ * their kind in some template (records don't name their template yet,
+ * T-012), or in any field when the templates weren't given. A staff type is
+ * refused in public fields (D-022), so these stop passing the check.
+ */
+function inPublicFields(use: Use, key: string): Held {
+  const held = new Held();
+  for (const record of use.records) {
+    const publicHere = use.publicKeys?.get(record.kind);
+    if (use.publicKeys !== undefined && publicHere === undefined) continue;
+    for (const item of fieldIdentifiers(record)) {
+      if (item.type === key && (publicHere === undefined || publicHere.has(item.field))) {
         held.add(record.id);
         break;
       }
@@ -532,7 +616,7 @@ const NOT_LETTER_OR_DIGIT = /[^\p{L}\p{N}]/gu;
 
 /**
  * Records holding a number the new auto-numbering would give out again,
- * written differently. `nextIdentifier` counts only values of exactly the new
+ * written differently, or held only in a template field. `nextIdentifier` counts only values of exactly the new
  * form (`DHS-0007` for prefix `DHS-`) and gives out the highest plus one. A
  * value of another form that reads the same once separators are ignored
  * (`DHS 0009`, `DHS0009` or `DHS/0009`), with a number above that highest,
@@ -574,16 +658,18 @@ function reissued(use: Use, key: string, auto: AutoNumbering, source: string | u
       return undefined;
     return { head, n };
   };
-  /** The group and number of any value, ignoring separators. */
+  /**
+   * The group and number a value would have in the new form once separators
+   * are ignored: the type's whole prefix (`M1-` reads `M1 0009` as 9), or a
+   * four-digit year (`2026015` is 2026, number 15), then the sequence.
+   */
   const loose = (value: string): { head: string; n: number } | undefined => {
-    const k = identifierKey(value);
-    let i = k.length;
-    while (i > 0 && k.charCodeAt(i - 1) >= 48 && k.charCodeAt(i - 1) <= 57) i -= 1;
-    const digits = k.slice(i);
-    if (!NUMBER.test(digits)) return undefined;
-    const head = k.slice(0, i).replace(NOT_LETTER_OR_DIGIT, "");
-    if (auto.style === "year" ? !/^[0-9]{4}$/.test(head) : head !== prefixHead) return undefined;
-    return { head, n: Number(digits) };
+    const k = identifierKey(value).replace(NOT_LETTER_OR_DIGIT, "");
+    const head = auto.style === "year" ? k.slice(0, 4) : prefixHead;
+    if (auto.style === "year" ? !/^[0-9]{4}$/.test(head) : !k.startsWith(head)) return undefined;
+    const rest = k.slice(head.length);
+    if (!NUMBER.test(rest)) return undefined;
+    return { head, n: Number(rest) };
   };
 
   const highest = new Map<string, number>();
@@ -599,6 +685,16 @@ function reissued(use: Use, key: string, auto: AutoNumbering, source: string | u
       const l = loose(item.value);
       if (l !== undefined && l.n >= 1 && l.n <= MAX_AUTO_NUMBER)
         others.push({ id: set.recordId, ...l });
+    }
+  }
+  // nextIdentifier doesn't see numbers held only in template fields, so any
+  // of them, even of exactly the new form, can be given out again.
+  for (const record of use.records) {
+    for (const item of fieldIdentifiers(record)) {
+      if (item.type !== key) continue;
+      const l = exact(item.value) ?? loose(item.value);
+      if (l !== undefined && l.n >= 1 && l.n <= MAX_AUTO_NUMBER)
+        others.push({ id: record.id, ...l });
     }
   }
   const held = new Held();
@@ -649,6 +745,12 @@ function message(
         ? "No record is affected."
         : `${records(count)} ${what}. ${after}`;
   switch (code) {
+    case "reserved_key":
+      return `The identifier type key ${key} is no longer allowed (it is a reserved word). Rename the type; ${
+        count === undefined
+          ? "records weren't checked, so any record may hold values of it."
+          : `${records(count)} hold values of it, which must move to the new key.`
+      }`;
     case "key_changed":
       return `The identifier type ${key} gets the new key ${shown(detail ?? "")}. ${some(
         "hold values of it",

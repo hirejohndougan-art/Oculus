@@ -58,7 +58,9 @@
  *
  * Messages name keys and give counts only: they never quote a stored value,
  * since a staff value is exactly what this guards. Everything is validated
- * first (both templates with `validateTemplate`, every record with
+ * first (the old template with `validateLegacyTemplate`, so a template
+ * stored with hyphenated identifier type codes can still be fixed, the new
+ * one with `validateTemplate`, every record with
  * `validateRecord`); any doubt refuses the whole comparison with issues. The
  * work is linear in the records times the keys that changed. Never throws.
  */
@@ -70,6 +72,7 @@ import type { RecordId } from "./record-id.js";
 import {
   MAX_LONG_TEXT_LENGTH,
   MAX_TEXT_LENGTH,
+  validateLegacyTemplate,
   validateTemplate,
   type FieldDefinition,
   type FieldTemplate,
@@ -167,7 +170,8 @@ function compare(
   recordsInput: unknown,
 ): Validated<TemplateChanges> {
   const issues: Issue[] = [];
-  const before = validateTemplate(oldInput);
+  // The stored version may predate the identifier type key rule (D-0XX).
+  const before = validateLegacyTemplate(oldInput);
   if (!before.ok) issues.push(...prefixed("oldTemplate", before.issues));
   const after = validateTemplate(newInput);
   if (!after.ok) issues.push(...prefixed("newTemplate", after.issues));

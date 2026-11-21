@@ -286,8 +286,24 @@ export function webUrlProblem(text: string): string | undefined {
  * row) and return a frozen copy, or every problem found. Never throws.
  */
 export function validateTemplate(input: unknown): Validated<FieldTemplate> {
+  return readTemplate(input, IDENTIFIER_CODE);
+}
+
+/**
+ * Read a template stored before identifier type codes followed the
+ * identifier type key rule (D-0XX): as `validateTemplate`, but an
+ * `identifierTypes` list may still hold hyphenated codes. Use it only to read
+ * an existing template, such as the old side of `templateChanges`, so it can
+ * be fixed; new and edited templates go through `validateTemplate`, which
+ * refuses them. Never throws.
+ */
+export function validateLegacyTemplate(input: unknown): Validated<FieldTemplate> {
+  return readTemplate(input, LEGACY_IDENTIFIER_CODE);
+}
+
+function readTemplate(input: unknown, identifierCode: CodeRule): Validated<FieldTemplate> {
   try {
-    return checkTemplate(input);
+    return checkTemplate(input, identifierCode);
   } catch {
     return {
       ok: false,
@@ -296,7 +312,7 @@ export function validateTemplate(input: unknown): Validated<FieldTemplate> {
   }
 }
 
-function checkTemplate(input: unknown): Validated<FieldTemplate> {
+function checkTemplate(input: unknown, identifierCode: CodeRule): Validated<FieldTemplate> {
   if (types.isProxy(input) || !isPlainObject(input)) {
     return {
       ok: false,
@@ -347,7 +363,7 @@ function checkTemplate(input: unknown): Validated<FieldTemplate> {
           );
         }
       }
-      const key = checkField(field, ["fields", i], issues);
+      const key = checkField(field, ["fields", i], issues, identifierCode);
       if (key === undefined) return;
       if (seen.has(key)) {
         issues.add(["fields", i, "key"], "duplicate_key", `Two fields use the key ${shown(key)}.`);
@@ -387,6 +403,7 @@ function checkField(
   value: JsonValue,
   path: readonly (string | number)[],
   issues: IssueList,
+  identifierCode: CodeRule,
 ): string | undefined {
   if (!isPlainObject(value)) {
     issues.add(path, "not_an_object", "Each field must be an object.");
@@ -447,7 +464,7 @@ function checkField(
       [...path, "identifierTypes"],
       "identifier type",
       issues,
-      IDENTIFIER_CODE,
+      identifierCode,
     );
   }
   if ((kind === "text" || kind === "long_text") && f.maxLength !== undefined) {
@@ -572,6 +589,8 @@ const GENERAL_CODE: CodeRule = {
 };
 /** The identifier type key rule (D-0XX): a template can name only a type that could exist. */
 const IDENTIFIER_CODE: CodeRule = { test: isIdentifierTypeKey, rule: IDENTIFIER_TYPE_KEY_RULE };
+/** Stored templates only: the old rule, hyphens allowed (`validateLegacyTemplate`). */
+const LEGACY_IDENTIFIER_CODE: CodeRule = GENERAL_CODE;
 
 function checkCodes(
   value: JsonValue,
