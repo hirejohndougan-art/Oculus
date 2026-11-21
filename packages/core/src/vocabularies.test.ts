@@ -6,6 +6,7 @@ import {
   controlledTermChecker,
   isLocalTerm,
   normalizeTermUri,
+  termUriKey,
   validateControlledTerm,
   validateRecord,
   validateTemplate,
@@ -170,6 +171,19 @@ describe("validateControlledTerm: refused terms", () => {
     );
   });
 
+  it("refuses LC and Nomenclature hosts for GNIS however the host is written", () => {
+    for (const uri of [
+      "http://id.loc.gov:80/authorities/subjects/sh85063195",
+      "http://id.loc.gov./authorities/subjects/sh85063195",
+      "https://ID.LOC.GOV:8443/authorities/names/n79021164",
+      "http://www.id.loc.gov/authorities/subjects/sh85063195",
+      "https://nomenclature.info.:443/nom/1",
+      "https://WWW.NOMENCLATURE.INFO/nom/1",
+    ]) {
+      expect(code({ label: "X", uri, vocabulary: "gnis" }), uri).toBe("wrong_vocabulary");
+    }
+  });
+
   it("refuses LC URI variants as not canonical, naming the canonical form", () => {
     for (const uri of [
       "https://id.loc.gov/authorities/subjects/sh85063195",
@@ -260,6 +274,35 @@ describe("validateControlledTerm: refused terms", () => {
     expect(code({ label: "X", note: "y" })).toBe("unknown_property");
     expect(code("Hurricanes")).toBe("not_an_object");
     expect(code(null)).toBe("not_an_object");
+  });
+});
+
+describe("termUriKey", () => {
+  it("ignores scheme, host case, trailing dots and slashes, and ports 80 and 443", () => {
+    const key = termUriKey("http://nomenclature.info/nom/1234");
+    for (const uri of [
+      "https://nomenclature.info/nom/1234",
+      "https://NOMENCLATURE.INFO/nom/1234/",
+      "http://nomenclature.info.:80/nom/1234",
+      "https://nomenclature.info:443/nom/1234//",
+    ]) {
+      expect(termUriKey(uri), uri).toBe(key);
+    }
+  });
+
+  it("keeps what can name a different term", () => {
+    const key = termUriKey("https://nomenclature.info/nom/1234");
+    for (const uri of [
+      "https://nomenclature.info/nom/1235",
+      "https://nomenclature.info/NOM/1234",
+      "https://nomenclature.info:8080/nom/1234",
+      "https://nomenclature.info/nom/1234?lang=fr",
+      "https://www.nomenclature.info/nom/1234",
+    ]) {
+      expect(termUriKey(uri), uri).not.toBe(key);
+    }
+    expect(termUriKey("not a url")).toBe("not a url");
+    expect(termUriKey("ftp://example.org/x")).toBe("ftp://example.org/x");
   });
 });
 

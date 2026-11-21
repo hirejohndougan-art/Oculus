@@ -8,7 +8,8 @@
  * anything: what to do with a pair is a person's decision.
  *
  * Only classical text methods are used (no AI, D-004):
- * - `same_uri`: two entries with the same URI, so the same term.
+ * - `same_uri`: two entries whose URIs have the same `termUriKey` (so http
+ *   and https copies of a Nomenclature or GNIS address meet), so the same term.
  * - `same_label`: the labels match once case, accents, spacing and
  *   punctuation are ignored, and `&` is read as "and".
  * - `same_words`: the same words in another order, ignoring small words
@@ -17,26 +18,34 @@
  *   where the other has the words ("GH&H Railroad").
  * - `similar_spelling`: the comparison keys are at most 1 edit apart (2 for
  *   keys of 10 or more letters), counting a swap of two neighbouring letters
- *   as one edit. Keys shorter than 5 letters aren't compared this way, and
- *   labels whose numbers differ ("Hurricane, 1900" and "Hurricane, 1915")
- *   are never paired, because a different number is a different thing.
+ *   as one edit. Keys shorter than 5 letters aren't compared this way.
+ * For every reason but `same_uri`, the numbers in the two labels must be the
+ * same numbers, as separate numbers: "Hurricane, 1900" and "Hurricane, 1915",
+ * "Box 1-2" and "Box 12", "Size 1.5" and "Size 15" are never paired, because
+ * a different number is a different thing.
  *
- * Which pairs are looked at: a pair with at least one local term (no
- * vocabulary, or `local`). Two terms from outside vocabularies with
- * different URIs are different authorities by definition, so they are only
- * paired when they share a URI.
+ * Which pairs are looked at: a pair where at least one term has no URI (every
+ * local term, and outside terms entered without one). Two terms that both
+ * have URIs are different terms unless the URIs match, so they are only
+ * paired by `same_uri`. A group of terms sharing one key is reported as
+ * pairs with one of its members, so n terms give n - 1 pairs, not n².
  *
- * It is not quadratic. Exact reasons come from grouping by a key in a Map.
- * Spelling compares only terms that share a block (a word, or the first or
- * last three letters of the key); a block with more than 20 terms is sorted
- * and each term is compared with its 8 nearest neighbours instead. The total
- * number of comparisons and the number of pairs returned are both capped,
- * and `truncated` says when a cap was reached.
+ * Messy data doesn't stop the check: a term the vocabulary rules refuse is
+ * left out and listed in `skipped` with its problems.
+ *
+ * It is not quadratic, and its work is budgeted. Exact reasons come from
+ * grouping by a key in a Map. Spelling compares only terms that share a
+ * block (a word, or the first or last three letters of the key); a block
+ * with more than 20 terms is sorted and each term is compared with its 8
+ * nearest neighbours. The spelling check's work is counted in character
+ * cells (the two keys' lengths multiplied, for each pair compared) against
+ * `MAX_SPELLING_CELLS`. When any limit cuts the search short, `truncated` is
+ * true and `limitsReached` says which.
  */
-import type { Validated } from "./issues.js";
-import { IssueList, readPlainData, shown, type JsonValue, type ReadLimits } from "./plain-data.js";
-import { MAX_SHORT_TEXT_LENGTH, MAX_URL_LENGTH } from "./templates.js";
-import { checkTermValue, isLocalTerm, type ControlledTerm } from "./vocabularies.js";
+import { type Issue, type Validated } from "./issues.js";
+import { IssueList, shown } from "./plain-data.js";
+import { types } from "node:util";
+import { termUriKey, validateControlledTerm, type ControlledTerm } from "./vocabularies.js";
 
 export const DUPLICATE_REASONS = [
   "same_uri",
@@ -60,11 +69,45 @@ export interface DuplicateCandidate {
   readonly distance?: number;
 }
 
+/** A term left out because it isn't a valid term. */
+export interface SkippedTerm {
+  readonly index: number;
+  /** Its problems, with paths starting at its index. */
+  readonly issues: readonly Issue[];
+}
+
+/**
+ * A limit that cut the search short:
+ * - `candidates`: more candidates were found than `maxCandidates`.
+ * - `collected`: more than 100,000 candidates were found before sorting.
+ * - `spelling_budget`: the spelling check used up `MAX_SPELLING_CELLS`.
+ * - `large_blocks`: a block of different keys was compared by sorted
+ *   neighbours only.
+ * - `abbreviation_matches`: more than 20 labels had the same words, and only
+ *   20 of them were checked as expansions of an abbreviation.
+ * - `abbreviation_budget`: the abbreviation check used up its budget of
+ *   `MAX_ABBREVIATION_CHARS` characters of expanded forms.
+ * - `long_labels`: labels with more than 12 significant words weren't
+ *   checked for abbreviations.
+ */
+export type DuplicateLimit =
+  | "candidates"
+  | "collected"
+  | "spelling_budget"
+  | "large_blocks"
+  | "abbreviation_matches"
+  | "abbreviation_budget"
+  | "long_labels";
+
 export interface DuplicateReport {
   /** Strongest reasons first, in `DUPLICATE_REASONS` order, then by index. */
   readonly candidates: readonly DuplicateCandidate[];
-  /** True when there may be more candidates than were returned. */
+  /** True when there may be candidates that weren't found or returned. */
   readonly truncated: boolean;
+  /** Which limits were reached; empty when the search was complete. */
+  readonly limitsReached: readonly DuplicateLimit[];
+  /** Terms left out because they aren't valid, in index order. */
+  readonly skipped: readonly SkippedTerm[];
 }
 
 export interface DuplicateOptions {
@@ -76,8 +119,19 @@ export interface DuplicateOptions {
 export const MAX_DUPLICATE_TERMS = 50_000;
 export const DEFAULT_DUPLICATE_CANDIDATES = 500;
 export const MAX_DUPLICATE_CANDIDATES = 10_000;
-/** The most label comparisons for spelling one call makes. */
-export const MAX_SPELLING_COMPARISONS = 5_000_000;
+/**
+ * The spelling check's work budget, in character cells: for each pair
+ * compared, the product of the two keys' lengths (at least 64, for the fixed
+ * cost of a comparison). Sized to keep the check under about a second.
+ */
+export const MAX_SPELLING_CELLS = 2_000_000_000;
+
+/**
+ * The abbreviation check's work budget: the characters of the shortened forms
+ * it builds to look up. One is built only when its initials are a word some
+ * label uses, so ordinary lists use a small part of this.
+ */
+export const MAX_ABBREVIATION_CHARS = 20_000_000;
 
 /** A block bigger than this is compared by sorted neighbours, not all pairs. */
 const BLOCK_ALL_PAIRS = 20;
@@ -86,10 +140,11 @@ const NEIGHBOURS = 8;
 const MIN_RUN = 2;
 const MAX_RUN = 8;
 const MAX_WORDS_FOR_ABBREVIATION = 12;
-/** Pairs found for one abbreviation key, at most. */
+/** Labels kept for one word sequence, as expansions of an abbreviation. */
 const MAX_PER_KEY = 20;
 /** Candidates kept before sorting; past this the report is truncated. */
 const MAX_COLLECTED = 100_000;
+const MIN_CELLS_PER_PAIR = 64;
 
 const SMALL_WORDS: ReadonlySet<string> = new Set([
   "a",
@@ -105,27 +160,23 @@ const SMALL_WORDS: ReadonlySet<string> = new Set([
   "to",
 ]);
 
-const LIST_READ_LIMITS: ReadLimits = {
-  maxDepth: 3,
-  maxValues: 1 + MAX_DUPLICATE_TERMS * 7,
-  maxStringLength: MAX_URL_LENGTH,
-  maxKeyLength: 64,
-  maxTotalChars: MAX_DUPLICATE_TERMS * (MAX_SHORT_TEXT_LENGTH + 200),
-};
-
 const RANK: ReadonlyMap<DuplicateReason, number> = new Map(DUPLICATE_REASONS.map((r, i) => [r, i]));
 
 interface Prepared {
+  /** The term's position in the caller's list. */
+  readonly index: number;
   readonly term: ControlledTerm;
-  readonly local: boolean;
+  readonly hasUri: boolean;
   /** All words run together: the comparison key. */
   readonly key: string;
   /** The key as code points, for edit distance. */
   readonly chars: readonly string[];
   /** Words without the small words, in order. */
   readonly significant: readonly string[];
-  /** The numbers in the label, in order. */
+  /** The numbers in the label, each one separately, in order. */
   readonly numbers: string;
+  /** The same numbers sorted, for `same_words`. */
+  readonly sortedNumbers: string;
 }
 
 /**
@@ -138,22 +189,23 @@ export function termWords(label: string): string[] {
     .normalize("NFKD")
     .replace(/\p{M}/gu, "")
     .toLowerCase()
-    .replace(/['\u2019.]/g, "")
+    .replace(/['’.]/g, "")
     .replace(/(?<=[\p{L}\p{N}])&(?=[\p{L}\p{N}])/gu, "")
     .replace(/&/g, " and ");
   return text.split(/[^\p{L}\p{N}]+/u).filter((w) => w.length > 0);
 }
 
-/** The comparison key for a label: its words run together. Equal keys mean `same_label`. */
+/** The comparison key for a label: its words run together. */
 export function termMatchKey(label: string): string {
   return termWords(label).join("");
 }
 
 /**
  * List pairs of terms that may be duplicates. `input` is a list of terms in
- * the `controlled_term` shape; every one is checked first, and if any is
- * invalid the call fails with their problems (nothing is skipped silently).
- * Never changes the input and never throws.
+ * the `controlled_term` shape. Each is checked with `validateControlledTerm`;
+ * one that fails is left out and listed in `skipped`, and the rest are still
+ * compared. Fails only when `input` isn't a readable list or `options` is
+ * bad. Never changes the input and never throws.
  */
 export function findNearDuplicateTerms(
   input: unknown,
@@ -162,8 +214,12 @@ export function findNearDuplicateTerms(
   const issues = new IssueList();
   try {
     const max = readMax(options, issues);
-    if (!Array.isArray(input)) {
-      issues.add([], "not_a_list", "The terms must be a list.");
+    if (
+      !Array.isArray(input) ||
+      types.isProxy(input) ||
+      Object.getPrototypeOf(input) !== Array.prototype
+    ) {
+      issues.add([], "not_a_list", "The terms must be an ordinary list.");
     } else if (input.length > MAX_DUPLICATE_TERMS) {
       issues.add(
         [],
@@ -172,24 +228,41 @@ export function findNearDuplicateTerms(
       );
     }
     if (issues.count > 0) return { ok: false, issues: Object.freeze([...issues.items]) };
-    const data = readPlainData(input, [], LIST_READ_LIMITS, issues);
-    const terms: ControlledTerm[] = [];
-    if (Array.isArray(data)) {
-      const list = data as readonly JsonValue[];
-      for (let i = 0; i < list.length && !issues.full; i += 1) {
-        const item = list[i];
-        const term = item === undefined ? undefined : checkTermValue(item, [i], issues);
-        if (term !== undefined) terms.push(term);
-      }
+    const list = input as readonly unknown[];
+    const terms: Prepared[] = [];
+    const skipped: SkippedTerm[] = [];
+    const length = list.length;
+    for (let i = 0; i < length; i += 1) {
+      const result = readTerm(list, i);
+      if (result.ok) terms.push(prepare(result.value, i));
+      else skipped.push(Object.freeze({ index: i, issues: result.issues }));
     }
-    if (data === undefined || issues.count > 0) {
-      return { ok: false, issues: Object.freeze([...issues.items]) };
-    }
-    return { ok: true, value: findIn(terms.map(prepare), max) };
+    return { ok: true, value: findIn(terms, max, Object.freeze(skipped)) };
   } catch {
     issues.add([], "unreadable", "The terms could not be read as plain data.");
     return { ok: false, issues: Object.freeze([...issues.items]) };
   }
+}
+
+/** Read item `i` as its own value: a hole or getter is that item's problem only. */
+function readTerm(list: readonly unknown[], i: number): Validated<ControlledTerm> {
+  const fail = (code: string, message: string): Validated<ControlledTerm> => ({
+    ok: false,
+    issues: Object.freeze([Object.freeze({ path: Object.freeze([i]), code, message })]),
+  });
+  const descriptor = Object.getOwnPropertyDescriptor(list, i);
+  if (descriptor === undefined) return fail("holes", "This place in the list is empty.");
+  if (!("value" in descriptor) || descriptor.enumerable !== true) {
+    return fail("not_plain_data", "List items can't be getters, setters or hidden.");
+  }
+  const result = validateControlledTerm(descriptor.value);
+  if (result.ok) return result;
+  return {
+    ok: false,
+    issues: Object.freeze(
+      result.issues.map((x) => Object.freeze({ ...x, path: Object.freeze([i, ...x.path]) })),
+    ),
+  };
 }
 
 function readMax(options: unknown, issues: IssueList): number {
@@ -216,34 +289,40 @@ function readMax(options: unknown, issues: IssueList): number {
   return value;
 }
 
-function prepare(term: ControlledTerm): Prepared {
+function prepare(term: ControlledTerm, index: number): Prepared {
   const words = termWords(term.label);
   const key = words.join("");
+  const numbers = term.label.normalize("NFKC").match(/\p{Nd}+/gu) ?? [];
   return {
+    index,
     term,
-    local: isLocalTerm(term),
+    hasUri: term.uri !== undefined,
     key,
     chars: Array.from(key),
     significant: words.filter((w) => !SMALL_WORDS.has(w)),
-    numbers: (term.label.normalize("NFKC").match(/[0-9]+/g) ?? []).join(","),
+    numbers: numbers.join(","),
+    sortedNumbers: [...numbers].sort().join(","),
   };
 }
 
 class Collector {
   readonly found: DuplicateCandidate[] = [];
   private readonly seen = new Set<number>();
-  truncated = false;
+  readonly limits = new Set<DuplicateLimit>();
   constructor(
     private readonly terms: readonly Prepared[],
     private readonly max: number,
   ) {}
 
-  /** Pairs worth a look: at least one local term, or a shared URI. */
+  /** Pairs worth a look: at least one term without a URI, or a shared URI. */
   eligible(i: number, j: number, reason: DuplicateReason): boolean {
     const a = this.terms[i];
     const b = this.terms[j];
     if (a === undefined || b === undefined || i === j) return false;
-    return reason === "same_uri" || a.local || b.local;
+    if (reason === "same_uri") return true;
+    const sameNumbers =
+      reason === "same_words" ? a.sortedNumbers === b.sortedNumbers : a.numbers === b.numbers;
+    return (!a.hasUri || !b.hasUri) && sameNumbers;
   }
 
   /** True if this pair was already reported (under a stronger reason). */
@@ -256,17 +335,16 @@ class Collector {
     const id = pairId(i, j, this.terms.length);
     if (this.seen.has(id)) return;
     if (this.found.length >= MAX_COLLECTED) {
-      this.truncated = true;
+      this.limits.add("collected");
       return;
     }
     this.seen.add(id);
-    const first = Math.min(i, j);
-    const second = Math.max(i, j);
+    const [x, y] = i < j ? [i, j] : [j, i];
     const candidate: DuplicateCandidate = {
-      first,
-      second,
+      first: this.terms[x]?.index ?? x,
+      second: this.terms[y]?.index ?? y,
       reason,
-      message: this.message(first, second, reason, distance),
+      message: this.message(x, y, reason, distance),
       ...(distance === undefined ? {} : { distance }),
     };
     this.found.push(Object.freeze(candidate));
@@ -276,7 +354,7 @@ class Collector {
     return this.found.length >= MAX_COLLECTED;
   }
 
-  report(): DuplicateReport {
+  report(skipped: readonly SkippedTerm[]): DuplicateReport {
     const sorted = [...this.found].sort(
       (x, y) =>
         (RANK.get(x.reason) ?? 0) - (RANK.get(y.reason) ?? 0) ||
@@ -284,10 +362,22 @@ class Collector {
         x.first - y.first ||
         x.second - y.second,
     );
-    const truncated = this.truncated || sorted.length > this.max;
+    if (sorted.length > this.max) this.limits.add("candidates");
+    const order: readonly DuplicateLimit[] = [
+      "candidates",
+      "collected",
+      "spelling_budget",
+      "large_blocks",
+      "abbreviation_matches",
+      "abbreviation_budget",
+      "long_labels",
+    ];
+    const limitsReached = Object.freeze(order.filter((l) => this.limits.has(l)));
     return Object.freeze({
       candidates: Object.freeze(sorted.slice(0, this.max)),
-      truncated,
+      truncated: limitsReached.length > 0,
+      limitsReached,
+      skipped,
     });
   }
 
@@ -318,20 +408,26 @@ function pairId(i: number, j: number, n: number): number {
   return Math.min(i, j) * n + Math.max(i, j);
 }
 
-function findIn(terms: readonly Prepared[], max: number): DuplicateReport {
+function findIn(
+  terms: readonly Prepared[],
+  max: number,
+  skipped: readonly SkippedTerm[],
+): DuplicateReport {
   const out = new Collector(terms, max);
-
-  // 1. Exact groupings, strongest first. Each group is reported as pairs with
-  // one member (the first local term, or the first term for a shared URI),
-  // so a group of n terms gives n - 1 pairs, not n².
-  groupPairs(terms, out, "same_uri", (t) => t.term.uri);
-  groupPairs(terms, out, "same_label", (t) => (t.key === "" ? undefined : t.key));
+  // Exact groupings, strongest first. The numbers are part of the key, so
+  // "Box 1-2" and "Box 12" (key "box12" both) never meet.
+  groupPairs(terms, out, "same_uri", (t) =>
+    t.term.uri === undefined ? undefined : termUriKey(t.term.uri),
+  );
+  groupPairs(terms, out, "same_label", (t) => (t.key === "" ? undefined : `${t.numbers}|${t.key}`));
   groupPairs(terms, out, "same_words", (t) =>
-    t.significant.length < 2 ? undefined : [...t.significant].sort().join(" "),
+    t.significant.length < 2
+      ? undefined
+      : `${t.sortedNumbers}|${[...t.significant].sort().join(" ")}`,
   );
   abbreviations(terms, out);
   spelling(terms, out);
-  return out.report();
+  return out.report(skipped);
 }
 
 function groupPairs(
@@ -351,7 +447,9 @@ function groupPairs(
   for (const list of groups.values()) {
     if (out.full) return;
     if (list.length < 2) continue;
-    const hub = reason === "same_uri" ? list[0] : list.find((i) => terms[i]?.local === true);
+    // The hub is a term every other member may pair with: any member for a
+    // shared URI, otherwise one without a URI.
+    const hub = reason === "same_uri" ? list[0] : list.find((i) => terms[i]?.hasUri === false);
     if (hub === undefined) continue;
     for (const i of list) if (i !== hub) out.add(hub, i, reason);
   }
@@ -361,28 +459,50 @@ function abbreviations(terms: readonly Prepared[], out: Collector): void {
   // Every label's significant words in order, so an expanded form can be looked up.
   const byWords = new Map<string, number[]>();
   terms.forEach((t, i) => {
-    if (t.significant.length === 0 || t.significant.length > MAX_WORDS_FOR_ABBREVIATION) return;
+    if (t.significant.length === 0) return;
+    if (t.significant.length > MAX_WORDS_FOR_ABBREVIATION) {
+      out.limits.add("long_labels");
+      return;
+    }
     const key = t.significant.join(" ");
     const list = byWords.get(key);
     if (list === undefined) byWords.set(key, [i]);
     else if (list.length < MAX_PER_KEY) list.push(i);
+    // A label of one word can't be the expansion of an abbreviation.
+    else if (t.significant.length >= MIN_RUN) out.limits.add("abbreviation_matches");
   });
-  terms.forEach((t, j) => {
-    const words = t.significant;
-    if (words.length < MIN_RUN || words.length > MAX_WORDS_FOR_ABBREVIATION || out.full) return;
+  // Words that could be an abbreviation: a short form is only built when its
+  // initials are one of these, which keeps the work small.
+  const shortWords = new Set<string>();
+  for (const key of byWords.keys()) {
+    for (const w of key.split(" "))
+      if (w.length >= MIN_RUN && w.length <= MAX_RUN) shortWords.add(w);
+  }
+  let chars = 0;
+  for (let j = 0; j < terms.length; j += 1) {
+    const words = terms[j]?.significant ?? [];
+    if (words.length < MIN_RUN || words.length > MAX_WORDS_FOR_ABBREVIATION) continue;
+    if (out.full) return;
     for (let start = 0; start < words.length; start += 1) {
-      for (let len = MIN_RUN; len <= MAX_RUN && start + len <= words.length; len += 1) {
-        const run = words.slice(start, start + len);
+      let initials = "";
+      for (let len = 1; len <= MAX_RUN && start + len <= words.length; len += 1) {
+        const w = words[start + len - 1] ?? "";
         // Initials of words that are numbers would make "1900 1915" into "11".
-        if (run.some((w) => /^[0-9]/.test(w))) continue;
-        const initials = run.map((w) => Array.from(w)[0] ?? "").join("");
+        if (/^\p{N}/u.test(w)) break;
+        initials += Array.from(w)[0] ?? "";
+        if (len < MIN_RUN || !shortWords.has(initials)) continue;
         const short = [...words.slice(0, start), initials, ...words.slice(start + len)].join(" ");
+        chars += short.length;
+        if (chars > MAX_ABBREVIATION_CHARS) {
+          out.limits.add("abbreviation_budget");
+          return;
+        }
         for (const i of byWords.get(short) ?? []) {
           if (!out.has(i, j)) out.add(i, j, "abbreviation");
         }
       }
     }
-  });
+  }
 }
 
 function spelling(terms: readonly Prepared[], out: Collector): void {
@@ -398,19 +518,27 @@ function spelling(terms: readonly Prepared[], out: Collector): void {
     put(`p:${t.chars.slice(0, 3).join("")}`, i);
     put(`s:${t.chars.slice(-3).join("")}`, i);
   });
-  let comparisons = 0;
+  // A pair that shares several blocks is compared once.
+  const compared = new Set<number>();
+  let cells = 0;
   const compare = (i: number, j: number): boolean => {
-    if (out.has(i, j) || !out.eligible(i, j, "similar_spelling")) return true;
-    if (comparisons >= MAX_SPELLING_COMPARISONS || out.full) {
-      out.truncated = true;
-      return false;
-    }
-    comparisons += 1;
     const a = terms[i];
     const b = terms[j];
-    if (a === undefined || b === undefined || a.key === b.key || a.numbers !== b.numbers) {
+    if (a === undefined || b === undefined) return true;
+    const cost = Math.max(MIN_CELLS_PER_PAIR, a.chars.length * b.chars.length);
+    if (cells + cost > MAX_SPELLING_CELLS || out.full) {
+      out.limits.add(out.full ? "collected" : "spelling_budget");
+      return false;
+    }
+    const id = pairId(i, j, terms.length);
+    if (compared.has(id)) return true;
+    // Checks that need no edit distance are charged the fixed cost only.
+    if (out.has(i, j) || !out.eligible(i, j, "similar_spelling") || a.key === b.key) {
+      cells += MIN_CELLS_PER_PAIR;
       return true;
     }
+    cells += cost;
+    compared.add(id);
     const limit = Math.min(a.chars.length, b.chars.length) >= 10 ? 2 : 1;
     const d = boundedDistance(a.chars, b.chars, limit);
     if (d <= limit) out.add(i, j, "similar_spelling", d);
@@ -428,6 +556,10 @@ function spelling(terms: readonly Prepared[], out: Collector): void {
     }
     // Sorted neighbourhood: sort by the key (by the reversed key for a
     // block of shared endings) and compare each term with the next few.
+    // Only neighbours are compared, so a pair further apart can be missed,
+    // unless every key in the block is the same (then there is nothing to find).
+    const first = terms[list[0] ?? 0]?.key;
+    if (list.some((i) => terms[i]?.key !== first)) out.limits.add("large_blocks");
     const reversed = key.startsWith("s:");
     const sortKey = (i: number): string => {
       const chars = terms[i]?.chars ?? [];

@@ -216,6 +216,7 @@ export {
   validateControlledTerm,
   controlledTermChecker,
   normalizeTermUri,
+  termUriKey,
 } from "./vocabularies.js";
 export type {
   VocabularyCode,
@@ -230,7 +231,8 @@ export {
   MAX_DUPLICATE_TERMS,
   DEFAULT_DUPLICATE_CANDIDATES,
   MAX_DUPLICATE_CANDIDATES,
-  MAX_SPELLING_COMPARISONS,
+  MAX_SPELLING_CELLS,
+  MAX_ABBREVIATION_CHARS,
   termWords,
   termMatchKey,
   boundedDistance,
@@ -241,4 +243,6 @@ export type {
   DuplicateCandidate,
   DuplicateReport,
   DuplicateOptions,
+  DuplicateLimit,
+  SkippedTerm,
 } from "./term-duplicates.js";

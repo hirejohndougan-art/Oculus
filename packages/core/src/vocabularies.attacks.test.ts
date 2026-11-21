@@ -66,7 +66,8 @@ describe("controlled terms can't be fooled", () => {
     );
     expect(validateControlledTerm(evil).ok).toBe(false);
     expect(findNearDuplicateTerms(evil).ok).toBe(false);
-    expect(findNearDuplicateTerms([evil]).ok).toBe(false);
+    const r = findNearDuplicateTerms([evil]);
+    expect(r.ok && r.value.skipped.map((x) => x.index)).toEqual([0]);
   });
 
   it("treats built-in names as unknown vocabularies", () => {
@@ -144,12 +145,42 @@ describe("near-duplicate detection can't be overloaded", () => {
     expect(codeOf(findNearDuplicateTerms(huge))).toBe("too_many");
   });
 
-  it("refuses a sparse list and a list with extra properties", () => {
+  it("skips holes and getters in the list, and never runs a getter", () => {
+    let ran = false;
     // eslint-disable-next-line no-sparse-arrays -- the hole is the attack
-    expect(codeOf(findNearDuplicateTerms([{ label: "A" }, , { label: "B" }]))).toBe("holes");
+    const list: unknown[] = [{ label: "Depot" }, , { label: "depot" }];
+    Object.defineProperty(list, 3, {
+      get() {
+        ran = true;
+        return { label: "Depot" };
+      },
+      enumerable: true,
+    });
+    const r = findNearDuplicateTerms(list);
+    if (!r.ok) throw new Error("expected ok");
+    expect(r.value.skipped.map((x) => [x.index, x.issues[0]?.code])).toEqual([
+      [1, "holes"],
+      [3, "not_plain_data"],
+    ]);
+    expect(r.value.candidates.map((c) => [c.first, c.second])).toEqual([[0, 2]]);
+    expect(ran).toBe(false);
+  });
+
+  it("only reads the list's items, so extra properties can't run", () => {
+    let ran = false;
     const extra = [{ label: "A" }] as unknown[] & { forEach?: unknown };
-    extra.forEach = () => undefined;
-    expect(codeOf(findNearDuplicateTerms(extra))).toBe("not_plain_data");
+    extra.forEach = () => {
+      ran = true;
+    };
+    expect(findNearDuplicateTerms(extra).ok).toBe(true);
+    expect(ran).toBe(false);
+  });
+
+  it("refuses a Proxy list or an array with another prototype", () => {
+    expect(codeOf(findNearDuplicateTerms(new Proxy([{ label: "A" }], {})))).toBe("not_a_list");
+    const odd = [{ label: "A" }];
+    Object.setPrototypeOf(odd, null);
+    expect(codeOf(findNearDuplicateTerms(odd))).toBe("not_a_list");
   });
 
   it("ignores a maxCandidates inherited from Object.prototype", () => {
@@ -194,5 +225,25 @@ describe("near-duplicate detection can't be overloaded", () => {
     const r = findNearDuplicateTerms(terms, { maxCandidates: 10_000 });
     expect(r.ok && r.value.candidates.length).toBe(4999);
     expect(r.ok && r.value.truncated).toBe(false);
+  });
+
+  it("stays within its budget on long labels that share most of their words", () => {
+    // Hostile: 20,000 invented labels of about 470 characters, the same words
+    // in the same order, differing only in the last word. Every pair shares
+    // every block and needs a full edit-distance band.
+    const words = Array.from(
+      { length: 70 },
+      (_, i) => `word${String.fromCharCode(97 + (i % 26))}x`,
+    );
+    const base = words.join(" ");
+    const terms = Array.from({ length: 20_000 }, (_, i) => ({
+      label: `${base} ${String.fromCharCode(97 + (i % 26), 97 + (Math.floor(i / 26) % 26), 97 + (Math.floor(i / 676) % 26))}`,
+    }));
+    const start = Date.now();
+    const r = findNearDuplicateTerms(terms, { maxCandidates: 50 });
+    const took = Date.now() - start;
+    expect(r.ok && r.value.limitsReached).toContain("spelling_budget");
+    expect(r.ok && r.value.truncated).toBe(true);
+    expect(took).toBeLessThan(5000);
   });
 });

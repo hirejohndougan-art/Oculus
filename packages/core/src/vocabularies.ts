@@ -32,11 +32,15 @@
  *
  * Rules (D-014): a term with no vocabulary is a local term and can't have a
  * URI. A URI is optional for the other vocabularies, because an LCSH heading
- * built with subdivisions often has no authority record of its own; when a
- * URI is given, it must be that vocabulary's canonical form. Variants (https,
+ * built with subdivisions often has no authority record of its own. When a
+ * URI is given, it must pass what is checked for its vocabulary (above). For
+ * the LC vocabularies that means the exact canonical form: variants (https,
  * `www.`, `.html` or `.json` on the end, a trailing slash, an upper case
- * prefix, a query or fragment) are refused with `not_canonical`; only
+ * prefix, a query or fragment) are refused with `not_canonical`, and only
  * `normalizeTermUri` turns them into the canonical URI, listing every change.
+ * Nomenclature and GNIS URIs are stored as given, since their canonical form
+ * isn't known; `termUriKey` compares them loosely (scheme, host case, a
+ * trailing slash or dot) without changing what is stored.
  *
  * `controlledTermChecker` plugs these rules into `checkRecordAgainstTemplate`
  * as `checkers.controlled_term`. Lookups use Maps, so text such as
@@ -233,12 +237,8 @@ export const controlledTermChecker: FieldValueChecker = (value) => {
   );
 };
 
-/**
- * Check an already-copied plain value as a term; adds problems to `issues`.
- * Shared with the near-duplicate finder so both apply the same rules.
- * @internal
- */
-export function checkTermValue(
+/** Check an already-copied plain value as a term; adds problems to `issues`. */
+function checkTermValue(
   value: JsonValue,
   path: readonly (string | number)[],
   issues: IssueList,
@@ -339,7 +339,9 @@ function checkUri(
       }
       return;
     case "web_address":
-      if (NOMENCLATURE_HOSTS.has(hostOf(uri)) || lc.idLocGov) {
+      // Compared by host name (any port, case or trailing dot), so an LC or
+      // Nomenclature address written another way can't pass as GNIS.
+      if (OTHER_VOCABULARY_HOSTS.has(looseHost(uri)) || lc.idLocGov) {
         issues.add(
           path,
           "wrong_vocabulary",
@@ -371,6 +373,44 @@ function urlProblem(text: string): string | undefined {
     return `can be at most ${String(MAX_URL_LENGTH)} characters`;
   }
   return webUrlProblem(text);
+}
+
+/** Hosts whose addresses belong to a vocabulary other than GNIS. */
+const OTHER_VOCABULARY_HOSTS: ReadonlySet<string> = new Set([
+  "id.loc.gov",
+  "www.id.loc.gov",
+  ...NOMENCLATURE_HOSTS,
+]);
+
+/** The host name in lower case, without trailing dots ("ID.loc.gov." → "id.loc.gov"). */
+function looseHost(uri: string): string {
+  return trimEnd(hostOf(uri), ".");
+}
+
+/**
+ * A key for comparing term URIs: two URIs with the same key name the same
+ * term. It ignores the scheme (http or https), the case of the host name,
+ * trailing dots on the host, the ports 80 and 443, and trailing slashes on
+ * the path. It is only for comparing; stored URIs are never changed. Text
+ * that isn't a web address is its own key.
+ */
+export function termUriKey(uri: string): string {
+  try {
+    const url = new URL(uri);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return uri;
+    const port = url.port === "" || url.port === "80" || url.port === "443" ? "" : `:${url.port}`;
+    const path = trimEnd(url.pathname, "/");
+    return `//${trimEnd(url.hostname, ".")}${port}${path}${url.search}${url.hash}`;
+  } catch {
+    return uri;
+  }
+}
+
+/** `text` without any trailing `ch` (a loop, not a regex, so it is linear). */
+function trimEnd(text: string, ch: string): string {
+  let end = text.length;
+  while (end > 0 && text[end - 1] === ch) end -= 1;
+  return text.slice(0, end);
 }
 
 /** The lower-case host name of a web address that already passed `webUrlProblem`. */

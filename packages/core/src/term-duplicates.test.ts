@@ -169,7 +169,7 @@ describe("findNearDuplicateTerms: reasons", () => {
 });
 
 describe("findNearDuplicateTerms: what it leaves alone", () => {
-  it("never pairs two outside terms with different URIs", () => {
+  it("never pairs two terms that both have URIs, unless the URIs match", () => {
     expect(
       find([
         { label: "Railroads", uri: RAILROADS, vocabulary: "lcsh" },
@@ -178,14 +178,50 @@ describe("findNearDuplicateTerms: what it leaves alone", () => {
           uri: "http://id.loc.gov/authorities/names/n00000001",
           vocabulary: "lcnaf",
         },
-        { label: "Railroad", vocabulary: "lcsh" },
+        { label: "Railroad", uri: "https://example.org/gnis/1", vocabulary: "gnis" },
       ]),
     ).toEqual([]);
+  });
+
+  it("does compare outside terms entered without a URI", () => {
+    expect(
+      summary(
+        find([
+          { label: "Railroads", vocabulary: "lcsh" },
+          { label: "railroads", vocabulary: "lcsh" },
+          { label: "Railroad", uri: RAILROADS, vocabulary: "lcsh" },
+        ]),
+      ),
+    ).toEqual([
+      [0, 1, "same_label"],
+      [0, 2, "similar_spelling"],
+      [1, 2, "similar_spelling"],
+    ]);
   });
 
   it("doesn't pair labels whose numbers differ", () => {
     expect(find([{ label: "Hurricane, 1900" }, { label: "Hurricane, 1915" }])).toEqual([]);
     expect(find([{ label: "Box 12" }, { label: "Box 13" }])).toEqual([]);
+  });
+
+  it("treats numbers as separate numbers for every reason", () => {
+    // Same key once punctuation and spaces go, but different numbers.
+    expect(find([{ label: "Box 1-2" }, { label: "Box 12" }])).toEqual([]);
+    expect(find([{ label: "Size 1.5 inches" }, { label: "Size 15 inches" }])).toEqual([]);
+    expect(find([{ label: "Route 6, 6" }, { label: "Route 66" }])).toEqual([]);
+    // Same words in another order, numbers split differently.
+    expect(find([{ label: "Box 1 2 depot" }, { label: "depot box 12" }])).toEqual([]);
+    // An abbreviation whose numbers differ.
+    expect(
+      find([{ label: "Galveston Houston Henderson Railroad 1 2" }, { label: "GHH Railroad 12" }]),
+    ).toEqual([]);
+    // The same numbers still pair.
+    expect(summary(find([{ label: "Box 1-2" }, { label: "box 1 2" }]))).toEqual([
+      [0, 1, "same_label"],
+    ]);
+    expect(summary(find([{ label: "Depot 1900, box 3" }, { label: "box 3 depot 1900" }]))).toEqual([
+      [0, 1, "same_words"],
+    ]);
   });
 
   it("doesn't compare short keys by spelling", () => {
@@ -237,10 +273,13 @@ describe("findNearDuplicateTerms: results and limits", () => {
   it("caps the candidates and says so", () => {
     const terms = Array.from({ length: 30 }, () => ({ label: "Depot" }));
     const capped = findNearDuplicateTerms(terms, { maxCandidates: 5 });
-    expect(capped.ok && [capped.value.candidates.length, capped.value.truncated]).toEqual([
-      5,
-      true,
-    ]);
+    expect(
+      capped.ok && [
+        capped.value.candidates.length,
+        capped.value.truncated,
+        capped.value.limitsReached,
+      ],
+    ).toEqual([5, true, ["candidates"]]);
     const all = findNearDuplicateTerms(terms);
     expect(all.ok && [all.value.candidates.length, all.value.truncated]).toEqual([29, false]);
     const many = findNearDuplicateTerms(Array.from({ length: 600 }, () => ({ label: "Depot" })));
@@ -250,20 +289,76 @@ describe("findNearDuplicateTerms: results and limits", () => {
   it("returns an empty report for an empty list", () => {
     expect(findNearDuplicateTerms([])).toEqual({
       ok: true,
-      value: { candidates: [], truncated: false },
+      value: { candidates: [], truncated: false, limitsReached: [], skipped: [] },
     });
   });
 
-  it("fails with every bad term's problem rather than skipping it", () => {
+  it("skips invalid terms, lists them with their problems, and compares the rest", () => {
     const r = findNearDuplicateTerms([
       { label: "Depot" },
       { label: "" },
       { label: "X", uri: "https://example.org/x", vocabulary: "local" },
+      { label: "depot" },
+      "Depot",
     ]);
-    expect(r.ok ? [] : r.issues.map((i) => [i.path.join("."), i.code])).toEqual([
-      ["1.label", "invalid_text"],
-      ["2.uri", "local_uri"],
+    if (!r.ok) throw new Error(JSON.stringify(r.issues));
+    expect(summary(r.value.candidates)).toEqual([[0, 3, "same_label"]]);
+    expect(
+      r.value.skipped.map((x) => [x.index, x.issues.map((i) => [i.path.join("."), i.code])]),
+    ).toEqual([
+      [1, [["1.label", "invalid_text"]]],
+      [2, [["2.uri", "local_uri"]]],
+      [4, [["4", "not_an_object"]]],
     ]);
+    expect(Object.isFrozen(r.value.skipped)).toBe(true);
+    expect(r.value.truncated).toBe(false);
+  });
+
+  it("matches URIs by termUriKey, so http and https copies are the same", () => {
+    const c = find([
+      { label: "Lantern", uri: "http://nomenclature.info/nom/1234", vocabulary: "nomenclature" },
+      { label: "Lanterns", uri: "https://NOMENCLATURE.info/nom/1234/", vocabulary: "nomenclature" },
+      { label: "Lamp", uri: "https://nomenclature.info/nom/1235", vocabulary: "nomenclature" },
+    ]);
+    expect(summary(c)).toEqual([[0, 1, "same_uri"]]);
+  });
+
+  it("says which limits cut the search short", () => {
+    const limits = (terms: unknown[]): readonly string[] => {
+      const r = findNearDuplicateTerms(terms, { maxCandidates: 10_000 });
+      return r.ok ? r.value.limitsReached : ["failed"];
+    };
+    // 25 different keys sharing a word: only neighbours are compared.
+    const letters = "abcdefghijklmnopqrstuvwxy";
+    expect(limits(Array.from(letters, (ch) => ({ label: `Depot ${ch}${ch}${ch}x` })))).toEqual([
+      "large_blocks",
+    ]);
+    // 21 labels with the same words: only 20 are kept as expansions.
+    expect(
+      limits([
+        { label: "GH Railroad" },
+        ...Array.from({ length: 21 }, () => ({ label: "Galveston Houston Railroad" })),
+      ]),
+    ).toContain("abbreviation_matches");
+    // More than 12 significant words: not checked for abbreviations.
+    expect(
+      limits([
+        { label: "one two three four five six seven eight nine ten eleven twelve thirteen" },
+      ]),
+    ).toEqual(["long_labels"]);
+  });
+
+  it("stops the abbreviation check at its budget and says so", () => {
+    // Every run of words has initials that are a word some label uses.
+    const runs = "aa aaa aaaa aaaaa aaaaaa aaaaaaa aaaaaaaa";
+    const terms = [
+      { label: runs },
+      ...Array.from({ length: 12_000 }, (_, i) => ({
+        label: `${"alpha ".repeat(11)}a${String.fromCharCode(97 + (i % 26), 97 + (Math.floor(i / 26) % 26), 97 + (Math.floor(i / 676) % 26))}`,
+      })),
+    ];
+    const r = findNearDuplicateTerms(terms);
+    expect(r.ok && r.value.limitsReached).toContain("abbreviation_budget");
   });
 
   it("refuses bad input and options", () => {
