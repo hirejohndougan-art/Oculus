@@ -16,6 +16,21 @@ These are never picked by a run. The weekly report repeats each question until J
 
 The data model in TypeScript, written for any archive or museum rather than one organization. There is no server or database yet: these are pure, tested modules in `packages/core`.
 
+- [x] S-001 **Public output re-checks ancestors' templates.** (risky, security run 2026-11-21)
+  - A view kept from earlier published a value inherited from a parent whose template had since made the field staff; `currentTemplate` compared only the record's own template. Fixed with `templateFor` (D-020).
+- [ ] S-001a **Stale ancestry in a kept view.** deps: S-001 (risky)
+  - `templateFor` re-checks the ancestors the view was built with. A record moved to another parent since, or a template chosen from record data that has changed, isn't caught. Compare the chain against current records too (e.g. an optional record lookup), or make kept views expire.
+- [ ] S-002 **Stored staff values published when their field turns public.** (risky) Fold into T-005a.
+  - A value entered while its field was staff is published silently once the field is made public or a removed staff key is reused by a new public field (e.g. DACS `notes`). T-005a's template comparison must report these records and require confirmation; consider refusing key reuse for a different field.
+- [ ] S-003 **Precomposed Greek and Cyrillic lookalikes in identifiers.** (risky)
+  - `identifierKey` misses `Ӧ`/`Ö`, `Ӓ`/`Ä`, `Ά`/`Á`, `έ`/`é`, `ό`/`ó`, `Ӑ`/`Ă` and others, because NFKC keeps them precomposed: two identical-looking identifiers pass the uniqueness check. Decompose before mapping, then recompose. Also treat U+2800 (Braille blank) like a space or refuse it.
+- [ ] S-004 **En and em dashes bypass the free-text date ambiguity guard.** (risky)
+  - `edtfFromText("1920–25")` returns `1920-25` (spring 1920) instead of flagging it like `"1920-25"`; the guard at `edtf-text.ts` checks only ASCII `-` before dashes are normalised. Normalise first, then check.
+- [ ] S-005 **Near-duplicate term detection over its time target.** (risky)
+  - 50,000 labels of 6–7 short random words take about 3.6 s against the 2 s target (`term-duplicates.ts` `spelling`), because short keys are charged the 500-cell minimum. Tighten the budget or the blocking.
+- [ ] S-006 **Identifier types have no visibility.** (risky)
+  - A public `identifier` field with no `identifierTypes` publishes values of any type, including ones an organization treats as private. Decide whether types get a `public` flag (staff by default, as the T-004 review asked) and refuse unlisted types in public fields.
+
 - [x] T-001 **Project scaffold and gate.**
   - An npm workspaces repo with `packages/core`: TypeScript in strict mode, ESLint, Prettier and Vitest.
   - `npm run gate` runs format, lint, typecheck, tests, build, `npm audit --audit-level=high` and a license check (MIT, BSD, ISC, Apache-2.0 or similarly permissive only).

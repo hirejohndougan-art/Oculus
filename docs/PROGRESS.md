@@ -2,6 +2,17 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-21 05:51 CT — security — S-001 Public output re-checks ancestors' templates
+- Result: done (findings; most serious fixed)
+- Security: `npm audit` 0 vulnerabilities. Secret scan of the whole tree and every commit (keys, tokens, passwords, private keys, `.env`, URL credentials, emails, phone numbers): nothing; only obvious fakes in tests (`user:pw@example.org`). No private data about real people. GitHub Dependabot/code-scanning alerts still not reachable (T-001a, needs John). Code review: every commit since the last security run (T-002 to U-001, all of `packages/core`) by two independent reviewers (public boundary; input handling, CI and gate scripts), each finding proven with a test. Confirmed: a stale public view still published a value inherited from a parent whose template had since made that field staff (medium, fixed here); stored staff values published once their field turns public (S-002); precomposed Greek/Cyrillic lookalikes beat identifier uniqueness (S-003); en/em dashes bypass the date ambiguity guard (S-004); term-duplicate detection at ~3.6 s vs a 2 s target (S-005); identifier types without visibility (S-006). CI workflow is read-only with no secrets; gate script has no shell injection.
+- What changed: public views remember every record up the tree with the template used; `publicOutput` takes `templateFor` and re-checks them all (`template_changed`); `currentTemplate` alone is refused for a record with parents (`ancestor_templates_unchecked`). Attack tests in `public-output.attacks.test.ts` fail without the fix.
+- Decisions: D-020
+- Review: one independent review of the diff: safe. It noted the ancestry itself isn't re-checked (S-001a), DECISIONS not updated (fixed) and a test not checking the issue path (fixed).
+- Sources: OWASP ASVS 4.0.3 V8 (data protection), V5 (validation); Unicode UAX #15 (NFKC keeps precomposed letters).
+- Note: the history on GitHub was rewritten before this run (the root commit is now T-005 and the local `main` had diverged); not by this run. This run built from origin/main and pushes a fast-forward.
+- Gate: PASS · tests_passing 1397 (was 1393) · npm audit clean
+- Next: T-005a Safe template changes (risky), now including S-002
+
 ## 2026-11-21 03:27 CT — upkeep — U-001 Direct tests for the shared helpers
 - Result: done
 - What changed: `npm outdated` shows only TypeScript 7 and Vite 8, both new majors turned down in D-006; the blockers still hold (typescript-eslint 8.73 peers TypeScript `<6.1`; Vite 8 requires MPL-2.0 `lightningcss`), so no bump and T-001b now tracks them. Everything else is current. Nine public helpers that every validator relies on had no tests of their own; `plain-data.test.ts` and `helpers.test.ts` now check their results directly (frozen copy, every refusal code and path, each limit at and over its edge, bounded work on hostile input). Tests only, no code changed; nothing they found was a bug. Commit 2436814.
