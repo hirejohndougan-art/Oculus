@@ -206,3 +206,22 @@ export type {
   TemplateLookup,
   RecordLookup,
 } from "./effective.js";
+
+export {
+  VOCABULARY_CODES,
+  VOCABULARIES,
+  MAX_TERM_URI_TEXT_LENGTH,
+  vocabulary,
+  isLocalTerm,
+  validateControlledTerm,
+  controlledTermChecker,
+  normalizeTermUri,
+} from "./vocabularies.js";
+export type {
+  VocabularyCode,
+  UriCheck,
+  Vocabulary,
+  ControlledTerm,
+  TermUriChange,
+  NormalizedTermUri,
+} from "./vocabularies.js";
