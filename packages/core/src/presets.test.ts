@@ -8,11 +8,13 @@ import {
   STANDARD_PRESETS,
   checkRecordAgainstTemplate,
   isDublinCoreTerm,
+  makeIdentifierChecker,
   standardPreset,
   validateRecord,
   validateTemplate,
   type CatalogRecord,
   type FieldTemplate,
+  type TemplateCheckOptions,
 } from "./index.js";
 
 const ID = "3f1c2a9e-8b7d-4c6e-9a1b-2d3e4f5a6b7c";
@@ -291,6 +293,15 @@ describe("visibility", () => {
 });
 
 describe("records checked against the presets", () => {
+  // Identifier values need the organization's types to be checked (D-015).
+  // Invented sample types for the identifier fields the presets use.
+  const made = makeIdentifierChecker([
+    { key: "call_number", label: "Call number", pattern: "MS-####.#", uniqueness: "current" },
+    { key: "accession_number", label: "Accession number", uniqueness: "all_time" },
+  ]);
+  if (!made.ok) throw new Error(JSON.stringify(made.issues));
+  const withIds: TemplateCheckOptions = { checkers: { identifier: made.value } };
+
   it("a complete DACS item passes, and missing required elements are reported", () => {
     const fields = {
       reference_code: { type: "call_number", value: "MS-0001.1" },
@@ -304,7 +315,11 @@ describe("records checked against the presets", () => {
       acquisition_source: "Invented donor, 2001.",
     };
     expect(
-      checkRecordAgainstTemplate(record("archival_unit", fields), DACS_ARCHIVAL_UNIT_PRESET),
+      checkRecordAgainstTemplate(
+        record("archival_unit", fields),
+        DACS_ARCHIVAL_UNIT_PRESET,
+        withIds,
+      ),
     ).toEqual([]);
     const issues = checkRecordAgainstTemplate(
       record("archival_unit", { date: "1909" }),
@@ -328,13 +343,14 @@ describe("records checked against the presets", () => {
       acquisition_method: "gift",
       [RIGHTS_FIELD_KEY]: RIGHTS,
     };
-    expect(checkRecordAgainstTemplate(record("object", fields), SPECTRUM_OBJECT_PRESET)).toEqual(
-      [],
-    );
+    expect(
+      checkRecordAgainstTemplate(record("object", fields), SPECTRUM_OBJECT_PRESET, withIds),
+    ).toEqual([]);
     expect(
       checkRecordAgainstTemplate(
         record("object", { ...fields, acquisition_method: "stolen" }),
         SPECTRUM_OBJECT_PRESET,
+        withIds,
       ).map((i) => i.code),
     ).toEqual(["not_an_option"]);
   });
