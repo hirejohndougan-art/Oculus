@@ -99,6 +99,8 @@ export {
   MAX_FORMER_IDENTIFIERS,
   MAX_FORMER_NOTE_LENGTH,
   MAX_QUERY_LENGTH,
+  IDENTIFIER_TYPE_KEY_RULE,
+  isIdentifierTypeKey,
   validateIdentifierType,
   validateIdentifierTypes,
   validateRecordIdentifiers,

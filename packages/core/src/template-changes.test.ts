@@ -235,12 +235,12 @@ describe("templateChanges", () => {
   it("reports a dropped identifier type with the records using it", () => {
     const id = (types?: string[]) =>
       field({ key: "ref", kind: "identifier", ...(types ? { identifierTypes: types } : {}) });
-    const r = run(template(id(["accession", "call-number"])), template(id(["accession"])), [
-      record(A, { ref: { type: "call-number", value: "1" } }),
+    const r = run(template(id(["accession", "call_number"])), template(id(["accession"])), [
+      record(A, { ref: { type: "call_number", value: "1" } }),
       record(B, { ref: { type: "accession", value: "2" } }),
     ]);
     expect(r.changes.map((c) => [c.code, c.removedCodes, c.recordIds])).toEqual([
-      ["identifier_type_removed", ["call-number"], [A]],
+      ["identifier_type_removed", ["call_number"], [A]],
     ]);
   });
 

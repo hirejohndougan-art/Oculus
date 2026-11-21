@@ -48,7 +48,14 @@
  *   former list) before saving the change.
  */
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
-import { IssueList, readPlainData, shown, textProblem, type JsonValue } from "./plain-data.js";
+import {
+  FORBIDDEN_KEYS,
+  IssueList,
+  readPlainData,
+  shown,
+  textProblem,
+  type JsonValue,
+} from "./plain-data.js";
 import { types } from "node:util";
 import { isRecordId, type RecordId } from "./record-id.js";
 import {
@@ -94,7 +101,7 @@ export type AutoNumbering =
 export interface IdentifierType {
   /** The organization that defined the type (D-019, D-030). Types are never shared. */
   readonly organizationId: OrganizationId;
-  /** Stable key, e.g. `accession_number`. Lower case letters, digits and underscores. */
+  /** Stable key, e.g. `accession_number`. See `isIdentifierTypeKey`. */
   readonly key: string;
   /** What people see, e.g. "Accession number". */
   readonly label: string;
@@ -179,6 +186,21 @@ export const MAX_FORMER_NOTE_LENGTH = 1000;
 export const MAX_QUERY_LENGTH = 1000;
 
 const TYPE_KEY = /^[a-z][a-z0-9_]{0,63}$/;
+
+/**
+ * The one rule for identifier type keys (D-0XX): 1 to 64 lower case ASCII
+ * letters, digits and underscores, starting with a letter, and not a
+ * prototype key (`constructor`, `prototype`). Template `identifierTypes`
+ * lists and the `type` of identifier values in records use it too, so a
+ * template can only name a type that could exist.
+ */
+export function isIdentifierTypeKey(value: unknown): value is string {
+  return typeof value === "string" && TYPE_KEY.test(value) && !FORBIDDEN_KEYS.has(value);
+}
+
+/** The rule above in words, for messages. */
+export const IDENTIFIER_TYPE_KEY_RULE =
+  "1 to 64 lower case letters, digits and underscores, starting with a letter";
 const ONE_LINE_BREAKS = /[\t\n\r\u2028\u2029]/;
 /**
  * Invisible characters (default-ignorable, which takes in the Hangul fillers)
@@ -310,11 +332,11 @@ function checkType(
       "Every identifier type belongs to one organization: organizationId must be an organization ID.",
     );
   }
-  if (typeof view.key !== "string" || !TYPE_KEY.test(view.key)) {
+  if (!isIdentifierTypeKey(view.key)) {
     issues.add(
       [...at, "key"],
       "invalid_key",
-      "The key is 1 to 64 lower case letters, digits and underscores, starting with a letter.",
+      `The key is ${IDENTIFIER_TYPE_KEY_RULE}, and can't be constructor or prototype.`,
     );
   }
   checkLine(view.label, [...at, "label"], "label", MAX_TYPE_LABEL_LENGTH, issues);
@@ -620,7 +642,7 @@ function checkFormer(list: JsonValue | undefined, issues: IssueList): void {
     }
     const item = ownOnly(raw);
     unknownKeys(item, ["type", "value", "retiredAt", "note"], at, "a former identifier", issues);
-    if (typeof item.type !== "string" || !TYPE_KEY.test(item.type)) {
+    if (!isIdentifierTypeKey(item.type)) {
       issues.add([...at, "type"], "invalid_type", "The type must be an identifier type key.");
     }
     if (

@@ -23,7 +23,9 @@
  *   vocabulary is a local term (D-014), so it is allowed wherever `local`
  *   is. A field's `vocabularies` may list only the codes in
  *   `VOCABULARY_CODES` (vocabularies.ts).
- * - `identifier`: `{ type, value }`, such as an accession number.
+ * - `identifier`: `{ type, value }`, such as an accession number. The type
+ *   and a field's `identifierTypes` follow the identifier type key rule
+ *   (`isIdentifierTypeKey`, D-0XX): no hyphens.
  * - `link`: `{ url, label? }`, a web link (http or https).
  * - `rights`: `{ uri, note? }`, a rights statement or license URI. One per
  *   record: the kind is only allowed in a single, public, non-repeating field
@@ -78,6 +80,7 @@ import { RIGHTS_FIELD_KEY } from "./rights.js";
 // which they load doesn't matter.
 import { VOCABULARY_CODES, controlledTermChecker } from "./vocabularies.js";
 import { isRecordId } from "./record-id.js";
+import { IDENTIFIER_TYPE_KEY_RULE, isIdentifierTypeKey } from "./identifiers.js";
 import {
   RECORD_KINDS,
   isRecordKind,
@@ -193,7 +196,10 @@ const TEMPLATE_READ_LIMITS: ReadLimits = {
 
 /** The same rule `validateRecord` applies to keys in `fields`. */
 const FIELD_KEY = /^[a-z][a-z0-9_]{0,63}$/;
-/** Template keys, standard codes, vocabulary codes and identifier types. */
+/**
+ * Template keys, standard codes and vocabulary codes. Identifier types follow
+ * the identifier type key rule instead (`isIdentifierTypeKey`, no hyphens).
+ */
 const CODE = /^[a-z][a-z0-9_-]{0,63}$/;
 /** A code that matches CODE and isn't a prototype key (`constructor`, `prototype`). */
 function isCode(value: unknown): value is string {
@@ -436,7 +442,13 @@ function checkField(
     checkVocabularyCodes(f.vocabularies, [...path, "vocabularies"], issues);
   }
   if (kind === "identifier" && f.identifierTypes !== undefined) {
-    checkCodes(f.identifierTypes, [...path, "identifierTypes"], "identifier type", issues);
+    checkCodes(
+      f.identifierTypes,
+      [...path, "identifierTypes"],
+      "identifier type",
+      issues,
+      IDENTIFIER_CODE,
+    );
   }
   if ((kind === "text" || kind === "long_text") && f.maxLength !== undefined) {
     const cap = kind === "text" ? MAX_TEXT_LENGTH : MAX_LONG_TEXT_LENGTH;
@@ -549,11 +561,24 @@ function checkVocabularyCodes(
   });
 }
 
+/** How a kind of code is checked, and the rule in words. */
+interface CodeRule {
+  readonly test: (value: unknown) => value is string;
+  readonly rule: string;
+}
+const GENERAL_CODE: CodeRule = {
+  test: isCode,
+  rule: "lower case letters, digits, hyphens and underscores, starting with a letter",
+};
+/** The identifier type key rule (D-0XX): a template can name only a type that could exist. */
+const IDENTIFIER_CODE: CodeRule = { test: isIdentifierTypeKey, rule: IDENTIFIER_TYPE_KEY_RULE };
+
 function checkCodes(
   value: JsonValue,
   path: readonly (string | number)[],
   what: string,
   issues: IssueList,
+  rule: CodeRule = GENERAL_CODE,
 ): void {
   if (!Array.isArray(value) || value.length === 0 || value.length > MAX_ALLOWED_CODES) {
     issues.add(
@@ -565,11 +590,11 @@ function checkCodes(
   }
   const seen = new Set<string>();
   (value as readonly JsonValue[]).forEach((code, i) => {
-    if (!isCode(code)) {
+    if (!rule.test(code)) {
       issues.add(
         [...path, i],
         "invalid_code",
-        `A ${what} code is lower case letters, digits, hyphens and underscores, starting with a letter.`,
+        `${/^[aeiou]/.test(what) ? "An" : "A"} ${what} code is ${rule.rule}.`,
       );
     } else if (seen.has(code)) {
       issues.add([...path, i], "duplicate", `${shown(code)} is listed twice.`);
@@ -1132,7 +1157,14 @@ function checkShape(
     case "identifier": {
       const v = objectValue(value, ["type", "value"], path, label, issues);
       if (v === undefined) return;
-      checkAllowedCode(v.type, field.identifierTypes, [...path, "type"], "identifier type", issues);
+      checkAllowedCode(
+        v.type,
+        field.identifierTypes,
+        [...path, "type"],
+        "identifier type",
+        issues,
+        IDENTIFIER_CODE,
+      );
       requiredLine(v.value, [...path, "value"], "The identifier", issues);
       return;
     }
@@ -1237,15 +1269,12 @@ function checkAllowedCode(
   path: readonly (string | number)[],
   what: string,
   issues: IssueList,
+  rule: CodeRule = GENERAL_CODE,
 ): void {
   if (value === undefined) {
     issues.add(path, "required", `This value needs a ${what}.`);
-  } else if (!isCode(value)) {
-    issues.add(
-      path,
-      "invalid_code",
-      `The ${what} is a code of lower case letters, digits, hyphens and underscores.`,
-    );
+  } else if (!rule.test(value)) {
+    issues.add(path, "invalid_code", `The ${what} is a code of ${rule.rule}.`);
   } else if (allowed !== undefined && !allowed.includes(value)) {
     issues.add(
       path,

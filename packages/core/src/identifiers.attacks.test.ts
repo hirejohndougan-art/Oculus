@@ -60,24 +60,21 @@ describe("built-in names can't stand in for identifier types", () => {
     },
   );
 
-  it("a type the organization names 'constructor' works like any other", () => {
-    const type = {
-      key: "constructor",
-      label: "Odd",
-      organizationId: ORG,
-      uniqueness: "current",
-    } as const;
-    expect(validateIdentifierType(type).ok).toBe(true);
-    const r = validateRecordIdentifiers(
-      {
-        recordId: newRecordId(),
-        organizationId: ORG,
-        current: [{ type: "constructor", value: "1", primary: true }],
-        former: [],
-      },
-      [type],
-    );
-    expect(r.ok).toBe(true);
+  it("refuses prototype keys as type keys, as templates do (D-0XX)", () => {
+    for (const key of ["constructor", "prototype"]) {
+      const type = { key, label: "Odd", organizationId: ORG, uniqueness: "current" } as const;
+      expect(codes(validateIdentifierType(type))).toEqual(["invalid_key"]);
+      const r = validateRecordIdentifiers(
+        {
+          recordId: newRecordId(),
+          organizationId: ORG,
+          current: [],
+          former: [{ type: key, value: "1" }],
+        },
+        TYPES,
+      );
+      expect(codes(r)).toEqual(["invalid_type"]);
+    }
   });
 
   it("__proto__ keys are refused, not merged", () => {

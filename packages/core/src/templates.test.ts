@@ -374,6 +374,14 @@ describe("validateTemplate: field definitions", () => {
     expect(fieldCodes(field({ kind: "identifier", identifierTypes: ["call number"] }))).toEqual([
       "invalid_code",
     ]);
+    // Identifier type codes follow the identifier type key rule (D-0XX), so a
+    // template can't name a type that could never exist; other codes still
+    // take hyphens.
+    expect(fieldCodes(field({ kind: "identifier", identifierTypes: ["call-number"] }))).toEqual([
+      "invalid_code",
+    ]);
+    expect(fieldCodes(field({ kind: "identifier", identifierTypes: ["call_number"] }))).toEqual([]);
+    expect(codes(validateTemplate({ ...fullTemplate(), key: "sample-photo-2" }))).toEqual([]);
   });
 
   it("checks standards mappings", () => {
@@ -619,6 +627,9 @@ describe("checkRecordAgainstTemplate: each kind", () => {
     expect(id({ type: "legacy", value: " P-12" })).toEqual(["invalid_text"]);
     expect(id({ value: "P-12" })).toEqual(["required"]);
     expect(id("P-12")).toEqual(["not_an_object"]);
+    // The identifier type key rule (D-0XX): no hyphens, no prototype keys.
+    expect(id({ type: "call-number", value: "P-12" })).toEqual(["invalid_code"]);
+    expect(id({ type: "constructor", value: "P-12" })).toEqual(["invalid_code"]);
   });
 
   it("link: { url, label? } with an http or https url", () => {
