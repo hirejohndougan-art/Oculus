@@ -23,7 +23,7 @@
  */
 import { issue, type Validated } from "./issues.js";
 import { shown, textProblem } from "./plain-data.js";
-import { BLANK_CHARACTERS } from "./identifier-key.js";
+import { BLANK_CHARACTERS, MAX_MARK_RUN, hasTooManyMarks } from "./identifier-key.js";
 
 /** The longest format text accepted. */
 export const MAX_PATTERN_LENGTH = 100;
@@ -100,7 +100,10 @@ function compile(input: unknown): IdentifierPattern {
   const problem =
     textProblem(input) ??
     (/[\t\n\r\u2028\u2029]/.test(input) ? "contains a line break or tab" : undefined) ??
-    (INVISIBLE.test(input) ? "contains invisible or blank characters" : undefined);
+    (INVISIBLE.test(input) ? "contains invisible or blank characters" : undefined) ??
+    (hasTooManyMarks(input)
+      ? `has a letter with more than ${String(MAX_MARK_RUN)} accents or other marks`
+      : undefined);
   if (problem !== undefined) fail("bad_characters", `This format ${problem}.`);
   if (input.trim() !== input) fail("untrimmed", "The format starts or ends with spaces.");
 

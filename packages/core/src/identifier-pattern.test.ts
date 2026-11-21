@@ -44,6 +44,7 @@ describe("parseIdentifierPattern", () => {
     ["A\u202eB", "bad_characters"],
     ["A\u00adB", "bad_characters"],
     ["A\u2800B", "bad_characters"], // Braille blank (S-003)
+    [`A${"\u0301".repeat(9)}B`, "bad_characters"], // too many marks (S-003)
     ["{3}", "invalid_repeat"],
     ["#{3", "invalid_repeat"],
     ["#}", "invalid_repeat"],

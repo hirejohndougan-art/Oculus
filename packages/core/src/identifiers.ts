@@ -41,7 +41,12 @@ import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import { IssueList, readPlainData, shown, textProblem, type JsonValue } from "./plain-data.js";
 import { types } from "node:util";
 import { isRecordId, type RecordId } from "./record-id.js";
-import { BLANK_CHARACTERS, identifierKey } from "./identifier-key.js";
+import {
+  BLANK_CHARACTERS,
+  MAX_MARK_RUN,
+  hasTooManyMarks,
+  identifierKey,
+} from "./identifier-key.js";
 import {
   matchesIdentifierPattern,
   parseIdentifierPattern,
@@ -370,6 +375,8 @@ function checkAutoNumber(
           "invisible_characters",
           "The prefix contains invisible or blank characters.",
         );
+      } else if (hasTooManyMarks(prefix)) {
+        issues.add([...at, "prefix"], "too_many_marks", TOO_MANY_MARKS);
       } else if (/\p{Nd}$/u.test(prefix) || /[0-9]$/.test(identifierKey(prefix))) {
         // `X1` + `0001` would read back as `X10001`: the number can't be found again.
         issues.add([...at, "prefix"], "prefix_ends_in_digit", "The prefix can't end with a digit.");
@@ -564,6 +571,8 @@ function checkFormer(list: JsonValue | undefined, issues: IssueList): void {
   });
 }
 
+const TOO_MANY_MARKS = `A letter can carry at most ${String(MAX_MARK_RUN)} accents or other marks.`;
+
 /** Rules every stored identifier value follows, whatever its type. */
 function checkValue(
   value: JsonValue | undefined,
@@ -577,6 +586,10 @@ function checkValue(
       "invisible_characters",
       "The identifier contains invisible or blank characters, which would make two different numbers look the same.",
     );
+    return false;
+  }
+  if (typeof value === "string" && hasTooManyMarks(value)) {
+    issues.add(at, "too_many_marks", TOO_MANY_MARKS);
     return false;
   }
   return true;

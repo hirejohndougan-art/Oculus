@@ -74,14 +74,13 @@ describe("identifierKey", () => {
     expect(same("\uac00", "\u1100\u1160\u1161")).toBe(true);
   });
 
-  it("compares over-long text and long runs of marks exactly", () => {
-    const long = "A".repeat(1001);
-    expect(same(long, long)).toBe(true);
-    expect(same(long, long.toLowerCase())).toBe(false);
+  it("gives equivalent spellings with long runs of marks one key", () => {
+    const long = "A".repeat(5000);
+    expect(same(long, long.toLowerCase())).toBe(true);
     const marks = "a" + "\u0301".repeat(31);
-    expect(same(marks, marks)).toBe(true);
-    expect(same(marks, "A" + "\u0301".repeat(31))).toBe(false);
-    expect(same("a" + "\u0301".repeat(30), "A" + "\u0301".repeat(30))).toBe(true);
+    expect(same(marks, "A" + "\u0301".repeat(31))).toBe(true);
+    expect(same(marks, "\u00e1" + "\u0301".repeat(30))).toBe(true);
+    expect(same(marks, "a" + "\u0301".repeat(30))).toBe(false);
   });
 
   it("treats blank-looking characters as spaces (S-003)", () => {

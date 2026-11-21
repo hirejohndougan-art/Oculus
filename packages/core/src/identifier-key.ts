@@ -26,12 +26,15 @@
  *    spaces and invisible characters NFKC itself may have produced.
  *
  * Cost: Unicode normalization sorts each run of combining marks, which takes
- * time growing with the square of the run's length. So text longer than
- * `KEY_INPUT_LIMIT` characters, or with a run of more than `MAX_MARK_RUN`
- * combining marks, is not normalized at all: its key is the text exactly as
- * given, marked so it can only ever equal the same text. No valid identifier
- * or query is like that (values are at most 200 characters, queries 1000),
- * and the key then costs time in proportion to the text's length.
+ * time growing with the square of the run's length. So the key first splits
+ * every character on its own (NFKD, one character at a time, which needs no
+ * sorting) and measures the runs of marks. Canonically equivalent spellings
+ * (`Ö` + marks, `O` + diaeresis + marks, the same marks in another order)
+ * always give the same runs. Text with a run of more than `MAX_MARK_RUN`
+ * marks skips steps 2 and 5: its marks are sorted by code point instead, so
+ * equivalent spellings still meet, and the key costs time in proportion to
+ * the text's length. `identifiers.ts` refuses such runs in stored values,
+ * prefixes and formats, so only queries and old data take that path.
  *
  * The key is deliberately conservative: it can make two different
  * identifiers compare equal (a Cyrillic small `в`, shaped like a small
@@ -165,34 +168,61 @@ const LOOKALIKES: ReadonlyMap<string, string> = new Map([
  */
 export const BLANK_CHARACTERS = String.raw`\u2800|\u{16FE4}|\u{1D159}`;
 
-/** Longer text is compared exactly, not normalized (see the module header). */
-export const KEY_INPUT_LIMIT = 1000;
-/** More combining marks in a row than this, and text is compared exactly. */
-export const MAX_MARK_RUN = 30;
+/**
+ * The most combining marks one letter may carry, counted after splitting
+ * accented letters (`ǘ` is u + two marks). Real identifiers use one or two.
+ */
+export const MAX_MARK_RUN = 8;
 const MARK_RUN = /\p{M}+/gu;
+const LOW_SURROGATES = /[\uDC00-\uDFFF]/g;
 
 /** The number of code points: UTF-16 length less the trailing surrogates. */
 function codePoints(text: string): number {
   return text.length - (text.match(LOW_SURROGATES)?.length ?? 0);
 }
-const LOW_SURROGATES = /[\uDC00-\uDFFF]/g;
 
-/**
- * Whether the text has more than `MAX_MARK_RUN` combining marks in a row.
- * Scans each run once; a counted repeat (`\p{M}{31}`) re-scans from every
- * position and was ten times slower.
- */
-function hasLongMarkRun(text: string): boolean {
+/** Whether the text has more than `MAX_MARK_RUN` marks in a row. One pass. */
+function hasLongRun(text: string): boolean {
   for (const run of text.matchAll(MARK_RUN)) {
     if (run[0].length > MAX_MARK_RUN && codePoints(run[0]) > MAX_MARK_RUN) return true;
   }
   return false;
 }
+
 /**
- * Starts the key of text that is compared exactly. Normalized keys never
+ * The text with spaces, invisibles and blanks removed and decomposed (NFKD),
+ * and whether it has a run of more than `MAX_MARK_RUN` marks. The answer is
+ * the same for every canonically equivalent spelling, and the work is linear:
+ * a run already too long before decomposing (decomposing never shortens a
+ * run) is decomposed one character at a time, which needs no sorting;
+ * otherwise every run is short enough to sort cheaply.
+ */
+function decompose(value: string): { readonly text: string; readonly long: boolean } {
+  const visible = value.replace(OGHAM_SPACE, "-").replace(SPACE_OR_INVISIBLE, "");
+  // NFKD can give a space before a mark (U+00A8 is space + diaeresis): those go too.
+  if (hasLongRun(visible)) {
+    const text = visible.replace(ANY_CHAR, (ch) => ch.normalize("NFKD"));
+    return { text: text.replace(SPACE_OR_INVISIBLE, ""), long: true };
+  }
+  const text = visible.normalize("NFKD").replace(SPACE_OR_INVISIBLE, "");
+  return { text, long: hasLongRun(text) };
+}
+
+/**
+ * Whether some letter in the text carries more than `MAX_MARK_RUN` combining
+ * marks, counted the way `identifierKey` counts them. Linear time.
+ */
+export function hasTooManyMarks(value: string): boolean {
+  return decompose(value).long;
+}
+
+/**
+ * Starts the key of text with an over-long run of marks. Other keys never
  * contain U+FEFF, which is default-ignorable and so always removed.
  */
-const EXACT = "\ufeff";
+const SORTED_MARKS = "\ufeff";
+
+const byCodePoint = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
 const ANY_CHAR = /./gsu;
 /** The Ogham space mark counts as a space to `\s`, but is drawn as a dash. */
@@ -207,13 +237,17 @@ const SPACE_OR_INVISIBLE = new RegExp(
  * identifier". Never shown to people and never stored as the identifier.
  */
 export function identifierKey(value: string): string {
-  if (value.length > KEY_INPUT_LIMIT) return EXACT + value;
-  const visible = value.replace(OGHAM_SPACE, "-").replace(SPACE_OR_INVISIBLE, "");
-  // Checked after removing invisibles, which could otherwise split one run.
-  if (hasLongMarkRun(visible)) return EXACT + value;
-  // NFKC can turn a compatibility space into a plain one: remove those too.
-  const split = visible.normalize("NFKC").replace(SPACE_OR_INVISIBLE, "").normalize("NFD");
-  const mapped = split.replace(ANY_CHAR, (ch) => LOOKALIKES.get(ch) ?? ch);
+  const { text, long } = decompose(value);
+  const mapped = text.replace(ANY_CHAR, (ch) => LOOKALIKES.get(ch) ?? ch);
   const folded = mapped.toUpperCase().toLowerCase();
+  if (long) {
+    // Marks sorted by code point instead of canonical order: equivalent
+    // spellings meet, and so may a few that differ only in mark order.
+    const split = folded.replace(ANY_CHAR, (ch) => ch.normalize("NFD"));
+    return (
+      SORTED_MARKS + split.replace(MARK_RUN, (run) => Array.from(run).sort(byCodePoint).join(""))
+    );
+  }
+  // Every run of marks is short, so this is linear in the text's length.
   return folded.normalize("NFKC").replace(SPACE_OR_INVISIBLE, "");
 }

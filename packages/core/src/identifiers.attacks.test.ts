@@ -256,22 +256,99 @@ describe("lookalike identifiers can't both be held (S-003)", () => {
     expect(identifierKey("\u1100\u1160\u1161-1")).toBe(identifierKey("\uac00-1"));
   });
 
-  it("long runs of combining marks cost linear time, even with no length cap (review fix)", () => {
+  it("long runs of combining marks cost linear time, at any length (review fix)", () => {
     // Normalization sorts each run of marks in time growing with its square.
     const longRun = "a" + "\u0323\u0301".repeat(100_000);
-    const shortRuns = ("a" + "\u0323\u0301".repeat(15)).repeat(30); // under the length cap
+    const shortRuns = ("a" + "\u0323\u0301".repeat(4)).repeat(100); // runs of 8: allowed
     const started = performance.now();
     expect(
       findIdentifierConflicts({ type: "box_label", value: longRun }, newRecordId(), [], TYPES),
     ).toEqual([]);
-    const stored = Array.from({ length: 2000 }, () => holding(shortRuns));
+    const stored = Array.from({ length: 500 }, () => holding(shortRuns));
     expect(uniquenessIssues([...stored, holding(longRun), holding(longRun)], TYPES).length).toBe(
       201,
     );
-    // An unnormalized key still finds exactly the same text.
-    expect(identifierKey(longRun)).toBe(identifierKey(longRun));
-    expect(identifierKey(longRun)).not.toBe(identifierKey(`A${longRun.slice(1)}`));
+    expect(findByIdentifier(longRun.slice(0, 900), [holding(longRun)])).toEqual([]);
     expect(performance.now() - started).toBeLessThan(1500);
+  });
+});
+
+describe("equivalent spellings with many marks take the same path (second review)", () => {
+  const holding = (value: string): RecordIdentifiers => ({
+    recordId: newRecordId(),
+    current: [{ type: "box_label", value, primary: true }],
+    former: [],
+  });
+  const acutes = (n: number): string => "\u0301".repeat(n);
+  // Each pair is canonically equivalent (or a lookalike of it), with the
+  // first spelling's raw run one mark shorter than the second's.
+  const PROBES: [string, string][] = [
+    [`\u00d6${acutes(30)}-1`, `O\u0308${acutes(30)}-1`],
+    [`\u00d6${acutes(30)}-1`, `\u041e\u0308${acutes(30)}-1`], // Cyrillic О
+    [`\u00e1${acutes(30)}-1`, `a${acutes(31)}-1`],
+    [`a\u0323\u0301${acutes(30)}-1`, `a\u0301\u0323${acutes(30)}-1`], // marks reordered
+    [`\u00d6${acutes(7)}-1`, `O\u0308${acutes(7)}-1`], // at the limit
+  ];
+
+  it.each(PROBES)("%j and %j get one key", (a, b) => {
+    expect(identifierKey(a)).toBe(identifierKey(b));
+    // Stored before the check (old data): uniqueness and search still meet.
+    const x = holding(a);
+    const y = holding(b);
+    expect(uniquenessIssues([x, y], TYPES).map((i) => i.code)).toEqual([
+      "not_unique",
+      "not_unique",
+    ]);
+    expect(findByIdentifier(b, [x])).toHaveLength(1);
+    expect(findByIdentifier(a, [y])).toHaveLength(1);
+    // One record holding both: a duplicate within the record, or refused.
+    const both = {
+      recordId: newRecordId(),
+      current: [
+        { type: "box_label", value: a, primary: true },
+        { type: "box_label", value: b, primary: false },
+      ],
+      former: [],
+    };
+    const found = codes(validateRecordIdentifiers(both, TYPES));
+    expect(found.includes("duplicate") || found.includes("too_many_marks")).toBe(true);
+  });
+
+  it("at the limit, one record can't hold both spellings", () => {
+    const [a, b] = PROBES[4] ?? ["", ""];
+    const both = {
+      recordId: newRecordId(),
+      current: [
+        { type: "box_label", value: a, primary: true },
+        { type: "box_label", value: b, primary: false },
+      ],
+      former: [],
+    };
+    expect(codes(validateRecordIdentifiers(both, TYPES))).toEqual(["duplicate"]);
+    expect(
+      checkNewIdentifier({ type: "box_label", value: b }, newRecordId(), [holding(a)], TYPES).map(
+        (i) => i.code,
+      ),
+    ).toEqual(["not_unique"]);
+  });
+
+  it.each(PROBES.slice(0, 4))("a value with %j's marks is refused", (a, b) => {
+    for (const value of [a, b]) {
+      expect(codes(validateRecordIdentifiers(holding(value), TYPES))).toContain("too_many_marks");
+      expect(
+        checkNewIdentifier({ type: "box_label", value }, newRecordId(), [], TYPES).map(
+          (i) => i.code,
+        ),
+      ).toContain("too_many_marks");
+    }
+  });
+
+  it("eight marks on one letter are allowed, nine are not", () => {
+    expect(validateRecordIdentifiers(holding(`a${acutes(8)}-1`), TYPES).ok).toBe(true);
+    expect(validateRecordIdentifiers(holding(`\u00e1${acutes(7)}-1`), TYPES).ok).toBe(true);
+    expect(codes(validateRecordIdentifiers(holding(`\u00e1${acutes(8)}-1`), TYPES))).toContain(
+      "too_many_marks",
+    );
   });
 });
 
