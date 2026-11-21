@@ -18,18 +18,23 @@ The data model in TypeScript, written for any archive or museum rather than one 
 
 - [x] S-001 **Public output re-checks ancestors' templates.** (risky, security run 2026-11-21)
   - A view kept from earlier published a value inherited from a parent whose template had since made the field staff; `currentTemplate` compared only the record's own template. Fixed with `templateFor` (D-020).
-- [ ] S-001a **Stale ancestry in a kept view.** deps: S-001 (risky)
+- [x] S-001a **Stale ancestry in a kept view.** deps: S-001 (risky) Done: `records` option, `record_changed` (D-021).
   - `templateFor` re-checks the ancestors the view was built with. A record moved to another parent since, or a template chosen from record data that has changed, isn't caught. Compare the chain against current records too (e.g. an optional record lookup), or make kept views expire.
-- [ ] S-002 **Stored staff values published when their field turns public.** (risky) Fold into T-005a.
+- [x] S-002 **Stored staff values published when their field turns public.** (risky) Done: `templateChanges` (D-023), the main part of T-005a.
   - A value entered while its field was staff is published silently once the field is made public or a removed staff key is reused by a new public field (e.g. DACS `notes`). T-005a's template comparison must report these records and require confirmation; consider refusing key reuse for a different field.
-- [ ] S-003 **Precomposed Greek and Cyrillic lookalikes in identifiers.** (risky)
+- [x] S-003 **Precomposed Greek and Cyrillic lookalikes in identifiers.** (risky) Done (D-024).
   - `identifierKey` misses `Ӧ`/`Ö`, `Ӓ`/`Ä`, `Ά`/`Á`, `έ`/`é`, `ό`/`ó`, `Ӑ`/`Ă` and others, because NFKC keeps them precomposed: two identical-looking identifiers pass the uniqueness check. Decompose before mapping, then recompose. Also treat U+2800 (Braille blank) like a space or refuse it.
-- [ ] S-004 **En and em dashes bypass the free-text date ambiguity guard.** (risky)
+- [x] S-004 **En and em dashes bypass the free-text date ambiguity guard.** (risky) Done; also a dash after "probably"/"maybe" is flagged.
   - `edtfFromText("1920–25")` returns `1920-25` (spring 1920) instead of flagging it like `"1920-25"`; the guard at `edtf-text.ts` checks only ASCII `-` before dashes are normalised. Normalise first, then check.
-- [ ] S-005 **Near-duplicate term detection over its time target.** (risky)
+- [x] S-005 **Near-duplicate term detection over its time target.** (risky) Done: lossless prefilters, faster distance, same recall. One shape (44-letter keys from two letters) still takes ~3.1 s; see S-005a.
   - 50,000 labels of 6–7 short random words take about 3.6 s against the 2 s target (`term-duplicates.ts` `spelling`), because short keys are charged the 500-cell minimum. Tighten the budget or the blocking.
-- [ ] S-006 **Identifier types have no visibility.** (risky)
+- [x] S-006 **Identifier types have no visibility.** (risky) Done: `public` flag, staff by default (D-022). Callers must pass `checkers.identifier` to `effectiveRecord` or identifiers aren't published.
   - A public `identifier` field with no `identifierTypes` publishes values of any type, including ones an organization treats as private. Decide whether types get a `public` flag (staff by default, as the T-004 review asked) and refuse unlisted types in public fields.
+- [ ] S-005a **Two-letter keys in near-duplicate detection.** deps: S-005
+  - 50,000 keys of 44 letters drawn from two letters take ~3.1 s (target 2 s); about 0.7 s is the abbreviation pass. Needs a bit-parallel distance or faster abbreviation work, without losing pairs.
+- [ ] S-006a **Inherited identifier lists with one staff-type number.** deps: S-006
+  - A repeatable identifier list inherited through public fields is dropped whole from the child's effective record (staff side too) when one number is a staff type; staff see only a `not_valid_here` note. Keep the staff copy on the child. The checker's refusal message also names the staff type's label.
+
 
 - [x] T-001 **Project scaffold and gate.**
   - An npm workspaces repo with `packages/core`: TypeScript in strict mode, ESLint, Prettier and Vitest.
@@ -65,7 +70,8 @@ The data model in TypeScript, written for any archive or museum rather than one 
   - Validation of a record against its template.
 - [x] T-007a **Wire the field kinds to their modules.** deps: T-004, T-005, T-007
   - Ready-made checkers for the template `identifier` kind (T-004 identifier types) and `rights` kind (T-007 `validateRightsUri`), so `checkRecordAgainstTemplate` uses them by default.
-- [ ] T-005a **Safe template changes.** deps: T-005 (risky)
+- [~] T-005a **Safe template changes.** deps: T-005 (risky)
+  - Done in S-002 (D-023): `templateChanges` for field templates. Left: the identifier-type part and the `identifierTypes` hyphen alignment below.
   - Compare a new version of a template with the old one before it's saved. Switching a field from `staff` to `public` would publish existing staff data, so it must be reported for confirmation. Renaming or removing a key, changing its kind or `repeatable`, or dropping a list option must report the records affected rather than strand their data.
   - The same check for identifier types (T-004): editing or deleting a type checks existing records first.
   - Template `identifierTypes` codes allow hyphens but identifier type keys don't; align them.
