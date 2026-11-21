@@ -17,7 +17,8 @@ import {
 const ID = "3f1c2a9e-8b7d-4c6e-9a1b-2d3e4f5a6b7c";
 const T = "2026-11-20T16:05:00.000Z";
 const INC = "http://rightsstatements.org/vocab/InC/1.0/";
-const TYPES = [{ key: "legacy", label: "Legacy number", uniqueness: "none" }];
+// Public, so values may sit in the public fields used here (D-0XX).
+const TYPES = [{ key: "legacy", label: "Legacy number", uniqueness: "none", public: true }];
 
 function field(extra: Record<string, unknown>): Record<string, unknown> {
   return {
@@ -168,6 +169,40 @@ describe("hostile values given straight to a checker", () => {
   it("refuses hostile identifier types without throwing", () => {
     for (const types of [new Proxy(TYPES, {}), [new Proxy(TYPES[0] ?? {}, {})], null, "legacy"]) {
       expect(makeIdentifierChecker(types).ok).toBe(false);
+    }
+  });
+});
+
+describe("staff identifier types can't be made public by accident (D-0XX)", () => {
+  const STAFF = [{ key: "donor_file", label: "Donor file number", uniqueness: "none" }];
+
+  it("a public flag on Object.prototype doesn't make a type public", () => {
+    const proto = Object.prototype as Record<string, unknown>;
+    proto.public = true;
+    try {
+      const made = makeIdentifierChecker(STAFF);
+      if (!made.ok) throw new Error("types");
+      const r = checkRecordAgainstTemplate(
+        record({ number: { type: "donor_file", value: "DF-12" } }),
+        NUMBER,
+        { checkers: { identifier: made.value } },
+      );
+      expect(codes(r)).toEqual(["private_identifier_type"]);
+    } finally {
+      delete proto.public;
+    }
+  });
+
+  it("a field object with a hostile visibility counts as public", () => {
+    const made = makeIdentifierChecker(STAFF);
+    if (!made.ok) throw new Error("types");
+    for (const f of [
+      { visibility: "Staff" },
+      { visibility: ["staff"] },
+      Object.create({ visibility: "staff" }) as object,
+    ]) {
+      const found = made.value({ type: "donor_file", value: "DF-12" }, f as FieldDefinition, rec);
+      expect(codes(found)).toEqual(["private_identifier_type"]);
     }
   });
 });

@@ -21,7 +21,11 @@ const T = "2026-11-20T16:05:00.000Z";
 const INC = "http://rightsstatements.org/vocab/InC/1.0/";
 const CC_BY = "https://creativecommons.org/licenses/by/4.0/";
 
-/** The sample organization's identifier types. Invented. */
+/**
+ * The sample organization's identifier types. Invented. Both are public, so
+ * their values may sit in the public fields used below; types are staff only
+ * by default (D-0XX), tested under "identifier type visibility".
+ */
 const TYPES = [
   {
     key: "accession",
@@ -29,8 +33,9 @@ const TYPES = [
     pattern: "####.###",
     uniqueness: "all_time",
     autoNumber: { style: "year", separator: ".", digits: 3 },
+    public: true,
   },
-  { key: "legacy", label: "Legacy number", uniqueness: "none" },
+  { key: "legacy", label: "Legacy number", uniqueness: "none", public: true },
 ];
 
 function field(extra: Record<string, unknown> = {}): Record<string, unknown> {
@@ -336,5 +341,64 @@ describe("a record that passes its template can be published (rights)", () => {
     expect(codes(fromTemplate)).toEqual(["not_canonical"]);
     expect(codes(fromPublish)).toEqual(["not_canonical"]);
     expect(paths(fromTemplate)).toEqual(paths(fromPublish));
+  });
+});
+
+describe("identifier type visibility (D-0XX)", () => {
+  const MIXED = [
+    { key: "object_number", label: "Object number", uniqueness: "current", public: true },
+    { key: "donor_file", label: "Donor file number", uniqueness: "none" },
+    { key: "box_label", label: "Box label", uniqueness: "none", public: false },
+  ];
+  const STAFF_NUMBERS = template([
+    field({
+      key: "numbers",
+      label: "Staff numbers",
+      kind: "identifier",
+      repeatable: true,
+      visibility: "staff",
+    }),
+  ]);
+
+  it("refuses a staff type's value in a public field, at the type", () => {
+    const checkers = { identifier: identifierChecker(MIXED) };
+    const r = checkNumbers(
+      [
+        { type: "object_number", value: "2026.015" },
+        { type: "donor_file", value: "DF-12" },
+        { type: "box_label", value: "Box 4" },
+      ],
+      { checkers },
+    );
+    expect(codes(r)).toEqual(["private_identifier_type", "private_identifier_type"]);
+    expect(paths(r)).toEqual(["fields.numbers.1.type", "fields.numbers.2.type"]);
+    expect(r[0]?.message).toContain("Donor file number");
+  });
+
+  it("accepts any type in a staff field", () => {
+    const checkers = { identifier: identifierChecker(MIXED) };
+    const r = checkRecordAgainstTemplate(
+      record({
+        numbers: [
+          { type: "object_number", value: "2026.015" },
+          { type: "donor_file", value: "DF-12" },
+        ],
+      }),
+      STAFF_NUMBERS,
+      { checkers },
+    );
+    expect(r).toEqual([]);
+  });
+
+  it("treats a field that doesn't say staff as public", () => {
+    const check = identifierChecker(MIXED);
+    expect(codes(check({ type: "donor_file", value: "DF-12" }, anyField, rec))).toEqual([
+      "private_identifier_type",
+    ]);
+    expect(check({ type: "object_number", value: "1" }, anyField, rec)).toEqual([]);
+  });
+
+  it("refuses a type marked public other than with true", () => {
+    expect(makeIdentifierChecker([{ ...MIXED[1], public: "true" }]).ok).toBe(false);
   });
 });

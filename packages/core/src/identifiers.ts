@@ -23,13 +23,17 @@
  * yet, so nothing here can stop two people taking the same next number at the
  * same moment; the save path must re-check uniqueness when it writes.
  *
+ * - **Which types are public** (D-0XX). A type is staff only unless it says
+ *   `public: true`. Only values of public types may sit in a public template
+ *   field (`makeIdentifierChecker` reports `private_identifier_type`), and
+ *   `publicOutput` publishes only those. Every function in this module still
+ *   works on whatever records it is given, former identifiers included, and
+ *   former notes can be internal: a public site or public search must pass in
+ *   published records only, and show only public types.
+ *
  * Not decided here, and left to later tasks:
- * - Which identifier types are public. Every function here works on whatever
- *   records it is given, former identifiers included, and former notes can be
- *   internal. A public site or public search must pass in published records
- *   only, and show only the identifier types the organization has made public.
- * - Changing an identifier type. Tightening a format, removing a type or
- *   making it unique can make existing records fail `validateRecordIdentifiers`;
+ * - Changing an identifier type. Tightening a format, removing a type,
+ *   making it unique or making it staff only can make existing records fail `validateRecordIdentifiers`;
  *   the admin screen must check the records (or move the old values to the
  *   former list) before saving the change.
  */
@@ -74,6 +78,12 @@ export interface IdentifierType {
   readonly pattern?: string;
   readonly uniqueness: UniquenessRule;
   readonly autoNumber?: AutoNumbering;
+  /**
+   * True if values of this type may be published (an object or accession
+   * number, say). Left out or false, the type is staff only: its values are
+   * refused in public template fields and never reach public output (D-0XX).
+   */
+  readonly public?: boolean;
 }
 
 /** A current identifier on a record. */
@@ -245,7 +255,7 @@ function checkType(
   const view = ownOnly(type);
   unknownKeys(
     view,
-    ["key", "label", "pattern", "uniqueness", "autoNumber"],
+    ["key", "label", "pattern", "uniqueness", "autoNumber", "public"],
     at,
     "an identifier type",
     issues,
@@ -270,6 +280,13 @@ function checkType(
       [...at, "uniqueness"],
       "invalid_uniqueness",
       `Uniqueness must be one of: ${UNIQUENESS_RULES.join(", ")}.`,
+    );
+  }
+  if (view.public !== undefined && typeof view.public !== "boolean") {
+    issues.add(
+      [...at, "public"],
+      "invalid_public",
+      "public must be true or false. Left out, the type is staff only.",
     );
   }
   if (view.autoNumber !== undefined) {

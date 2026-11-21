@@ -167,6 +167,86 @@ describe("staff values never reach any output form", () => {
   });
 });
 
+describe("staff identifier types never reach any output form (D-0XX)", () => {
+  // `donor_file_number` is staff only (the default) in the fixtures' types.
+  const SECRET = "DF-SECRET-0042";
+  const staffItem = () =>
+    record("object", "I", {
+      rights: { uri: CNE },
+      number: { type: "donor_file_number", value: SECRET },
+    });
+
+  it("refuses a staff type's value in a public field, wherever it is mapped", () => {
+    const item = staffItem();
+    const view = viewOf([item], item.id);
+    for (const term of ["identifier", "title", "description", "subject", "relation"]) {
+      const result = out(view, {
+        template: "out",
+        entries: [RIGHTS_ENTRY, { field: "number", term }],
+      });
+      expect(result.ok).toBe(false);
+      expect(codes(result)).toEqual(["private_identifier_type"]);
+      expect(JSON.stringify(result)).not.toContain(SECRET);
+    }
+  });
+
+  it("refuses it in a repeatable field mixed with public numbers", () => {
+    const fields = TPL.fields.map((f) => (f.key === "number" ? { ...f, repeatable: true } : f));
+    const tpl = template(fields);
+    const item = record("object", "I", {
+      rights: { uri: CNE },
+      number: [
+        { type: "accession_number", value: "2026.015" },
+        { type: "donor_file_number", value: SECRET },
+      ],
+    });
+    const result = out(viewOf([item], item.id, tpl));
+    expect(codes(result)).toEqual(["private_identifier_type"]);
+    expect(JSON.stringify(result)).not.toContain(SECRET);
+  });
+
+  it("refuses it even with a lax identifier checker that accepts everything", () => {
+    const item = staffItem();
+    const view = viewOf([item], item.id);
+    for (const identifier of [() => [], Object.assign(() => [], CHECKERS.identifier)]) {
+      const result = publicOutput(view, MAPPING, {
+        baseUrl: BASE,
+        published: [view.id],
+        checkers: { identifier },
+      });
+      expect(result.ok).toBe(false);
+      expect(codes(result)).toEqual(["unchecked"]);
+      expect(JSON.stringify(result)).not.toContain(SECRET);
+    }
+  });
+
+  it("refuses a lax checker for public types too: it can't say which types are public", () => {
+    const item = record("object", "I", {
+      rights: { uri: CNE },
+      number: { type: "accession_number", value: "2026.015" },
+    });
+    const view = viewOf([item], item.id);
+    const result = publicOutput(view, MAPPING, {
+      baseUrl: BASE,
+      published: [view.id],
+      checkers: { identifier: () => [] },
+    });
+    expect(codes(result)).toEqual(["unchecked"]);
+  });
+
+  it("still publishes a public type's value in Dublin Core, JSON-LD and oai_dc", () => {
+    const item = record("object", "I", {
+      rights: { uri: CNE },
+      number: { type: "accession_number", value: "2026.015" },
+    });
+    const o = ok(out(viewOf([item], item.id)));
+    expect(o.dublinCore.identifier).toContain("2026.015");
+    expect(o.jsonLdText).toContain("2026.015");
+    expect(o.oaiDcXml).toContain("<dc:identifier>2026.015</dc:identifier>");
+    expect(everything(o)).not.toContain("accession_number");
+  });
+});
+
 describe("forged and copied public views are refused", () => {
   const item = record("object", "I", { rights: { uri: CNE }, description: "x" });
   const effective = effectiveOf([item], item.id);

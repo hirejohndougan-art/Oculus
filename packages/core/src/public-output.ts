@@ -34,6 +34,12 @@
  *   (`record_changed`); with `templateFor`, every template on the way must
  *   be unchanged (`template_changed`). Only both together catch every
  *   change; building the view at publish time is still the rule.
+ * - **Only public identifier types go out** (D-0XX). The checker from
+ *   `makeIdentifierChecker` refuses a staff type's value in a public field
+ *   (`private_identifier_type`), and the identifier value is checked again
+ *   here against the public types that checker was made with. A
+ *   hand-written identifier checker says nothing about which types are
+ *   public, so with one, identifier values are refused, never published.
  * - **Publishing is the caller's statement.** Records have no publish state
  *   yet, so the caller passes `published`, the IDs of every record that is
  *   published. The record itself must be in it (`not_published`). A place
@@ -103,6 +109,7 @@ import {
   type DublinCoreTerm,
 } from "./dublin-core.js";
 import { parseEdtf } from "./edtf.js";
+import { publicIdentifierTypesOf } from "./field-checkers.js";
 import { RIGHTS_FIELD_KEY, RIGHTS_REQUIRED_KINDS, rightsTerm } from "./rights.js";
 import { isRecordId, type RecordId } from "./record-id.js";
 import type { CatalogRecord, RecordKind } from "./records.js";
@@ -141,8 +148,9 @@ export interface PublishOptions {
   readonly published: readonly RecordId[];
   /**
    * Checkers for the template check, as `checkRecordAgainstTemplate` takes
-   * them. Identifier values are refused unless one is given for `identifier`
-   * (`makeIdentifierChecker`).
+   * them. Identifier values are refused unless the one for `identifier` was
+   * made by `makeIdentifierChecker`, and are published only when their type
+   * is public.
    */
   readonly checkers?: TemplateCheckOptions["checkers"];
   /**
@@ -437,6 +445,10 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
   }
   templateCheck(effective.record, view, template, checkers);
 
+  const publicIdentifierTypes = publicIdentifierTypesOf(
+    isPlainObject(checkers) ? dataProp(checkers, "identifier") : undefined,
+  );
+
   const byKey = new Map<string, FieldDefinition>();
   for (const field of template.fields) byKey.set(field.key, field);
   const entries = new Map<string, JsonValue>();
@@ -455,7 +467,7 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
     if (def?.visibility !== "public") {
       fail(["fields", field], "staff_field", "Only public template fields can be published.");
     }
-    const values = valuesOf(value, def, { baseUrl, published, budget });
+    const values = valuesOf(value, def, { baseUrl, published, publicIdentifierTypes, budget });
     const list = terms.get(term);
     if (list === undefined) terms.set(term, values);
     else list.push(...values);
@@ -784,6 +796,8 @@ function readPublished(value: unknown): ReadonlySet<RecordId> {
 interface Context {
   readonly baseUrl: string;
   readonly published: ReadonlySet<RecordId>;
+  /** From the identifier checker; undefined if it wasn't made by makeIdentifierChecker. */
+  readonly publicIdentifierTypes: ReadonlySet<string> | undefined;
   readonly budget: Budget;
 }
 
@@ -843,9 +857,24 @@ function valueOf(
       return uri === undefined ? outValue(label) : outValue(label, uri, true);
     }
     case "identifier": {
-      // Only the value: identifier types are staff only (T-004 review).
+      // Only the value, never the type, and only for a public type (D-0XX).
       const id = props(value, IDENTIFIER_KEYS, invalid);
-      if (typeof id.get("type") !== "string") return invalid();
+      const type = id.get("type");
+      if (typeof type !== "string") return invalid();
+      if (ctx.publicIdentifierTypes === undefined) {
+        fail(
+          ["fields", def.key],
+          "unchecked",
+          `${shown(def.label)} can't be published without knowing which identifier types are public. Pass checkers.identifier from makeIdentifierChecker.`,
+        );
+      }
+      if (!ctx.publicIdentifierTypes.has(type)) {
+        fail(
+          ["fields", def.key],
+          "private_identifier_type",
+          `${shown(def.label)} holds a number of a staff only identifier type, so the record can't be published. Mark the type public, or move the number to a staff field.`,
+        );
+      }
       return outValue(nonBlank(id.get("value"), invalid));
     }
     case "link": {

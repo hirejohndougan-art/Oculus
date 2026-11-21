@@ -142,9 +142,13 @@ export function everything(out: {
   ].join("\n");
 }
 
+// Both types are public, so their values may be published; the type key
+// itself must still never appear in output. `donor_file_number` is staff
+// only (the default), so its values must never be published (D-0XX).
 const identifierChecker = makeIdentifierChecker([
-  { key: "accession_number", label: "Accession number", uniqueness: "none" },
-  { key: "secret_type_code", label: "Secret type", uniqueness: "none" },
+  { key: "accession_number", label: "Accession number", uniqueness: "none", public: true },
+  { key: "secret_type_code", label: "Secret type", uniqueness: "none", public: true },
+  { key: "donor_file_number", label: "Donor file number", uniqueness: "none" },
 ]);
 if (!identifierChecker.ok) throw new Error("identifier types");
 /** The checkers publicOutput needs for the fixtures' identifier field. */

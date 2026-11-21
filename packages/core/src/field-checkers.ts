@@ -13,7 +13,8 @@
  * - `makeIdentifierChecker(types)`, for the `identifier` kind: the `type`
  *   must be one of the organization's identifier types, and the `value` must
  *   follow the rules every identifier follows and fit that type's format
- *   (identifiers.ts, D-009). It needs the organization's types, so it can't
+ *   (identifiers.ts, D-009). In a public field the type must also be
+ *   public (D-0XX). It needs the organization's types, so it can't
  *   be a default. Instead `checkRecordAgainstTemplate` refuses identifier
  *   values when no checker is given, rather than letting them through
  *   unchecked.
@@ -76,13 +77,34 @@ export const checkRightsValue: FieldValueChecker = (value) => {
 };
 
 /**
+ * The public identifier type keys of each checker `makeIdentifierChecker`
+ * made, so `publicOutput` can check again, at the boundary, that it publishes
+ * only values of public types. Keyed by the checker itself, never by shape.
+ */
+const PUBLIC_TYPES = new WeakMap<object, ReadonlySet<string>>();
+
+/**
+ * The keys of the public identifier types a checker from
+ * `makeIdentifierChecker` was made with, or undefined for any other value
+ * (a hand-written checker says nothing about which types are public).
+ * Internal: not exported from the package.
+ */
+export function publicIdentifierTypesOf(checker: unknown): ReadonlySet<string> | undefined {
+  if (typeof checker !== "function") return undefined;
+  const found = PUBLIC_TYPES.get(checker);
+  return found === undefined ? undefined : new Set(found);
+}
+
+/**
  * Make the checker for `identifier` values (`{ type, value }`) from the
  * organization's identifier types. The types are untrusted (they are edited
  * in the admin screens), so they are checked first with
  * `validateIdentifierTypes`; if they aren't valid, no checker is made.
  *
  * The checker reports `unknown_type` for a type the organization doesn't
- * have, and the identifier problems `checkNewIdentifier` reports for the
+ * have, `private_identifier_type` for a type that isn't `public` in a
+ * field that is (so a staff number is neither published nor quietly left
+ * out), and the identifier problems `checkNewIdentifier` reports for the
  * value (`untrimmed`, `too_long`, `control_characters`,
  * `invisible_characters`, `format_mismatch` …), except uniqueness, which
  * needs every record. Never throws.
@@ -91,9 +113,14 @@ export function makeIdentifierChecker(identifierTypes: unknown): Validated<Field
   const checked = validateIdentifierTypes(identifierTypes);
   if (!checked.ok) return checked;
   const byKey = new Map<string, IdentifierType>();
-  for (const type of checked.value) byKey.set(type.key, type);
+  const publicKeys = new Set<string>();
+  for (const type of checked.value) {
+    byKey.set(type.key, type);
+    // Own property only: a polluted Object.prototype can't make a type public.
+    if (Object.hasOwn(type, "public") && type.public === true) publicKeys.add(type.key);
+  }
 
-  const checker: FieldValueChecker = (value, _field, record) => {
+  const checker: FieldValueChecker = (value, field, record) => {
     try {
       if (!isPlainObject(value)) {
         return problems([
@@ -107,6 +134,15 @@ export function makeIdentifierChecker(identifierTypes: unknown): Validated<Field
           {
             code: "unknown_type",
             message: `${shown(typeKey)} is not one of this organization's identifier types.`,
+            path: ["type"],
+          },
+        ]);
+      }
+      if (own(field, "visibility") !== "staff" && !publicKeys.has(type.key)) {
+        return problems([
+          {
+            code: "private_identifier_type",
+            message: `${shown(type.label)} numbers are staff only, so they can't go in ${shown(field.label)}, which is public. Mark the type public, or use a staff field.`,
             path: ["type"],
           },
         ]);
@@ -125,5 +161,6 @@ export function makeIdentifierChecker(identifierTypes: unknown): Validated<Field
       return UNREADABLE;
     }
   };
+  PUBLIC_TYPES.set(checker, new Set(publicKeys));
   return { ok: true, value: checker };
 }

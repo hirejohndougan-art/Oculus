@@ -81,6 +81,9 @@ describe("validateIdentifierType", () => {
     [{ ...BOX, uniqueness: "sometimes" }, "invalid_uniqueness"],
     [{ ...BOX, pattern: "#{" }, "invalid_repeat"],
     [{ ...BOX, colour: "red" }, "unknown_property"],
+    [{ ...BOX, public: "yes" }, "invalid_public"],
+    [{ ...BOX, public: 1 }, "invalid_public"],
+    [{ ...BOX, public: null }, "invalid_public"],
     [{ ...BOX, autoNumber: "yes" }, "not_an_object"],
     [{ ...BOX, autoNumber: { style: "roman", digits: 3 } }, "invalid_style"],
     [{ ...BOX, autoNumber: { style: "year", separator: ":", digits: 3 } }, "invalid_separator"],
@@ -114,6 +117,17 @@ describe("validateIdentifierType", () => {
   it("refuses something that isn't an object", () => {
     expect(codes(validateIdentifierType("accession"))).toEqual(["not_an_object"]);
     expect(codes(validateIdentifierType(null))).toEqual(["not_an_object"]);
+  });
+});
+
+describe("identifier type visibility (D-0XX)", () => {
+  it("accepts public true or false, and leaving it out", () => {
+    for (const value of [true, false]) {
+      const r = validateIdentifierType({ ...BOX, public: value });
+      expect(r.ok && r.value.public).toBe(value);
+    }
+    const r = validateIdentifierType(BOX);
+    expect(r.ok && Object.hasOwn(r.value, "public")).toBe(false);
   });
 });
 
