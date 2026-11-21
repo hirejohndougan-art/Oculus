@@ -59,7 +59,7 @@ def sites():
         f'<div style="display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; align-items: center"><span><strong style="{H6}; font-size: 18px">{name}</strong><br><span style="font-size: 14px; color: #4a5056">{addr}</span></span>{pill(st, tone)}</div>'
         + table(['Page', 'Kind', 'Last edited'], pages, link='AdminSiteEditor.dc.html', minw=480)
         + '<div style="display: flex; flex-wrap: wrap; gap: 10px">' + a_btn('Edit pages', 'AdminSiteEditor.dc.html', 'p') + a_btn('View site', 'Main.dc.html', 's') + b_btn('Site settings', 's') + '</div>')
-    inner = (page_head('Public sites', 'Hermes publishes the catalog live: one organization can run several public sites, each with its own look and its own choice of what to show. There is no export or import step.',
+    inner = (page_head('Public sites', 'Oculus publishes the catalog live: one organization can run several public sites, each with its own look and its own choice of what to show. There is no export or import step.',
                        a_btn('+ New public site', 'WizSite.dc.html', 'p'))
              + site('Digital Archive', '[archive address]', 'Live', 'green', [('Home', 'Page', '[date]'), ('Browse', 'Template', '[date]'), ('Item page', 'Template', '[date]'), ('Finding aid', 'Template', '[date]'), ('Saving the Dickinson Depot', 'Exhibit', '[date]')])
              + site('[Second site]', '[address]', 'Draft', 'gray', [('Home', 'Page', '[date]')]))

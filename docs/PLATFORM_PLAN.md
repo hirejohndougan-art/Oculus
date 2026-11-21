@@ -4,20 +4,20 @@
 
 ## Goal
 
-Build a general collections platform that runs on the web, one that any archive, museum or historical society could use. It grows out of **Polybius**, the Dickinson Historical Society's desktop catalog, which becomes the staff back end. **Hermes** becomes the public front end, with a drag-and-drop site builder based on the editor from Blueprint, the WordPress page builder already used on the Society's websites. Together they replace Omeka S completely. Archives, museum objects and media live in one system, and there's no export/import step between the catalog and the website.
+Build a general collections platform that runs on the web, one that any archive, museum or historical society could use. It grows out of Polybius, the Dickinson Historical Society's earlier desktop catalog, which becomes the staff admin. The public sites get a drag-and-drop site builder based on the editor from Blueprint, the WordPress page builder already used on the Society's websites. Together they replace Omeka S completely. Archives, museum objects and media live in one system, and there's no export/import step between the catalog and the website.
 
 ## Decisions
 
-1. **Name:** the platform is **Oculus**. Polybius (back end) and Hermes (public sites) are the names of its two parts.
+1. **Name:** the whole project is **Oculus** (D-018). Its parts are described plainly: the admin (staff back end) and the public sites. The earlier part names Polybius and Hermes are dropped.
 2. **License:** MIT.
 3. **Multiple sites means one organization with several public sites**, the way Omeka S works. Each install has one catalog. Each site gets its own domain, theme, menus, pages and choice of collections. It is not a hosted service for many organizations.
 4. **Web only.** There's no desktop app and no offline mode.
-5. **Hermes stands on its own.** Blueprint's editor moves out of WordPress, and nothing depends on WordPress.
+5. **The public sites stand on their own.** Blueprint's editor moves out of WordPress, and nothing depends on WordPress.
 6. **Built for organizations in general.** The Dickinson Historical Society's setup becomes one preset among several.
 
 ## Principles
 
-- **One writer:** only the Polybius API writes to the catalog database. Hermes and the importers go through it, and Hermes reads only what's published.
+- **One writer:** only the Oculus API writes to the catalog database. The public sites and the importers go through it, and the public sites read only what's published.
 - Flag problems instead of making things up, and never automate changes silently.
 - An optional human review step before edits or publishing go live.
 - Full version history on every record, so any version can be restored.
@@ -55,7 +55,7 @@ Build a general collections platform that runs on the web, one that any archive,
 - Checksums confirm the masters haven't changed.
 - IIIF, at least the manifests, because larger organizations will expect it.
 
-## 5. Hermes public sites
+## 5. Public sites
 
 - Bring over Blueprint's editor: the element tree (boxes, sections and columns, widgets), drafts vs. published versions, revisions, design system and responsive settings.
 - **Collection widgets:** search box, faceted browse, item grid, item page template, finding-aid tree, exhibit, timeline, map, featured item and recent additions.
@@ -74,7 +74,7 @@ EAD import and export, CSV import and export, OAI-PMH, JSON-LD and IIIF manifest
 
 ## 8. Proposed technology
 
-TypeScript throughout, a Node.js API and a PostgreSQL database (it has full-text search built in, and JSONB columns for the template-defined fields). Files go in S3-compatible storage. The Polybius admin and the Hermes editor use React. It needs a VPS or managed cloud server, because shared web hosting won't be enough.
+TypeScript throughout, a Node.js API and a PostgreSQL database (it has full-text search built in, and JSONB columns for the template-defined fields). Files go in S3-compatible storage. The admin and the page editor use React. It needs a VPS or managed cloud server, because shared web hosting won't be enough.
 
 ## 9. Installs by other organizations
 
@@ -88,7 +88,7 @@ That means building an installer, database migrations for upgrades, backup and r
 1. Record model and ID numbers, in TypeScript
 2. Server: database, API, logins, roles and the change log; the admin screens move to the browser
 3. Media handling
-4. Hermes: public site, the page editor and collection widgets
+4. Public sites: the page editor and collection widgets
 5. Multiple sites per install
 6. Omeka S migration, and the Dickinson Historical Society's cutover (the Society stays on Omeka until here)
 7. Connections to other systems (OAI-PMH, IIIF and so on)
@@ -104,6 +104,6 @@ Each phase has to be usable and tested before the next one starts. Realistically
 
 ## Open questions
 
-- Should Hermes and Polybius be one combined server app, or two apps that share the database through the API?
+- Should the admin and the public sites be one combined server app, or two apps that share the database through the API?
 - Where will the Historical Society host it, and what's the budget for hosting and storage? (One option looked at: shared-host Node plans support PostgreSQL but not WebSockets, and background jobs aren't confirmed.)
-- Should the Society's other websites eventually move to Hermes?
+- Should the Society's other websites eventually move to Oculus?

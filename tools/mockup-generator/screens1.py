@@ -22,7 +22,7 @@ def login():
             '<span style="font-size: 13px">Aerial view of Dickinson, Texas, late 1920s · Dickinson Historical Society</span></div></div>'
             '<main style="flex: 1 1 480px; background: #f3f5f8; display: flex; align-items: center; justify-content: center; padding: 48px 32px; box-sizing: border-box">'
             '<div style="width: 100%; max-width: 420px; display: flex; flex-direction: column; gap: 22px">'
-            '<div style="display: flex; flex-direction: column; gap: 4px"><span style="font-family: Roboto, sans-serif; font-weight: 700; font-size: 34px; color: #111111">Polybius</span>'
+            '<div style="display: flex; flex-direction: column; gap: 4px"><span style="font-family: Roboto, sans-serif; font-weight: 700; font-size: 34px; color: #111111">Oculus</span>'
             '<span style="font-size: 15px; color: #4a5056">Dickinson Historical Society · collections and archive</span></div>'
             f'<h1 style="margin: 0; {H}; font-size: 24px">Sign in</h1>'
             + field('em', 'Email', ph='you@example.org', kind='email') + field('pw', 'Password', kind='password') +
@@ -101,7 +101,7 @@ def deeds():
         ('2026.[013]', 'Dickinson ISD Legacy Center', pill('Signed', 'green'), 'Transfer agreement on file', '<a href="#">Open PDF</a>'),
         ('2026.[012]', '[Donor name]', pill('Signed', 'green'), 'Copyright transfers to DHS', '<a href="#">Open PDF</a>'),
     ]
-    inner = (page_head('Deeds of gift', 'The legal record that a donor gave materials to the Society. Polybius drafts the deed from the accession, and you attach the signed copy when it comes back.',
+    inner = (page_head('Deeds of gift', 'The legal record that a donor gave materials to the Society. Oculus drafts the deed from the accession, and you attach the signed copy when it comes back.',
                        a_btn('+ Log an accession', 'WizAccession.dc.html', 's'))
              + note('<strong>[N] accessions are missing a signed deed.</strong> Until one is on file, their items can be cataloged but are held back from the public site.', 'amber')
              + table(['Accession', 'Donor', 'Deed status', 'Rights recorded', ''], rows, minw=820))
@@ -133,7 +133,7 @@ def scan_inbox():
     inner = (page_head('Scan Inbox', 'Scans land here from the scanner or an upload. Catalog them one after another: the cataloging guide opens with each file already attached and any embedded details filled in.',
                        a_btn('Catalog the [N] ready files', 'WizCatalog.dc.html', 'p') + b_btn('Upload files', 's'))
              + '<div style="display: flex; flex-wrap: wrap; gap: 14px; align-items: center; padding: 18px; border: 2px dashed #8b939c; border-radius: 6px; background: #ffffff">'
-             + '<span style="font-weight: 600">Drop scans here</span><span style="font-size: 14px; color: #4a5056">TIFF, JPEG, PDF, WAV, MP3, MP4 · or point your scanner at the Polybius upload folder</span></div>'
+             + '<span style="font-weight: 600">Drop scans here</span><span style="font-size: 14px; color: #4a5056">TIFF, JPEG, PDF, WAV, MP3, MP4 · or point your scanner at the Oculus upload folder</span></div>'
              + f'<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 16px">{tiles}</div>')
     screen('ScanInbox', 'Scan Inbox', inner, sp, h=1300)
 

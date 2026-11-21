@@ -64,7 +64,7 @@ Until T-001 is merged there is no gate. T-001's run sets it up and must show it 
   - `npm audit`
   - a secret scan of the whole tree and of commits since the last security run (keys, tokens, passwords, private keys, `.env` files)
   - GitHub's security alerts (`gh api repos/hirejohndougan-art/oculus/dependabot/alerts` and `/code-scanning/alerts`, if reachable)
-  - a review of every commit since the last security run, against OWASP ASVS and the "Security" risk in the plan: injection, auth and permission checks, input validation, output escaping, file paths, outbound requests, unsafe deserialization, private data reaching public output, and the separation between Polybius (private) and Hermes (public)
+  - a review of every commit since the last security run, against OWASP ASVS and the "Security" risk in the plan: injection, auth and permission checks, input validation, output escaping, file paths, outbound requests, unsafe deserialization, private data reaching public output, and the separation between the admin (private) and the public sites (public)
 
   Fix the most serious real finding (one per run) and add the others to ROADMAP.md as `(risky)` tasks at the top of the current phase. If all is clean, write "clean" in the PROGRESS entry and do a build task.
 

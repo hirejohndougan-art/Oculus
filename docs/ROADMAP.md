@@ -6,9 +6,9 @@ Phases follow [PLATFORM_PLAN.md](PLATFORM_PLAN.md) §10. Marks and procedure: [A
 
 These are never picked by a run. The weekly report repeats each question until John answers it.
 
-- [ ] Q-1 One server app for Polybius and Hermes, or two apps sharing the database through the API? (needs John) Needed before Phase 2.
+- [ ] Q-1 One server app for the admin and the public sites, or two apps sharing the database through the API? (needs John) Needed before Phase 2.
 - [ ] Q-2 Hosting for the Historical Society, and the budget for hosting and storage. (needs John) Needed before Phase 2 deploys anywhere.
-- [ ] Q-3 Should the Society's other websites move to Hermes eventually? (needs John) Not needed until Phase 5.
+- [ ] Q-3 Should the Society's other websites move to Oculus eventually? (needs John) Not needed until Phase 5.
 - [ ] Q-4 Roles: the mockup shows "Scanner" and "Donor relations" roles that the plan doesn't have. Should Phase 2 add them? (needs John) Needed before T-041.
 - [ ] Q-5 OCR: common OCR engines ship trained models. Does D-004 (no AI in the product) rule them out, or is classical OCR allowed? (needs John) Needed before OCR work.
 
@@ -105,7 +105,7 @@ The data model in TypeScript, written for any archive or museum rather than one 
 
 ## Phase 2 — Server, database, logins, roles and change log
 
-Written by T-011 ([review](reports/2026-11-phase1-review.md)). Q-1 (one app or two) and Q-2 (hosting and budget) were unanswered, so tasks that need either say `deps: Q-1` or `deps: Q-2` and wait. Everything else is written so it works whatever John answers: one PostgreSQL database, the Polybius service layer as the only writer, and an HTTP API in its own package. Library choices are decision tasks. Each choice must be permissively licensed (D-002), actively maintained (a release in the last 12 months and more than one maintainer, or a foundation behind it), free of AI features and SDKs (D-004), with a small dependency tree, and must pass `npm audit` and the license check.
+Written by T-011 ([review](reports/2026-11-phase1-review.md)). Q-1 (one app or two) and Q-2 (hosting and budget) were unanswered, so tasks that need either say `deps: Q-1` or `deps: Q-2` and wait. Everything else is written so it works whatever John answers: one PostgreSQL database, the service layer as the only writer, and an HTTP API in its own package. Library choices are decision tasks. Each choice must be permissively licensed (D-002), actively maintained (a release in the last 12 months and more than one maintainer, or a foundation behind it), free of AI features and SDKs (D-004), with a small dependency tree, and must pass `npm audit` and the license check.
 
 Decisions first:
 - [ ] T-020 **Decision: PostgreSQL version and database tests.** deps: T-011
@@ -140,8 +140,8 @@ Change log and versions:
   - Every update names the version it started from. A save based on an older version is refused with a list of what changed since, so two people can't silently overwrite each other's work. No locks or WebSockets are needed.
 
 The writer:
-- [ ] T-032 **The Polybius service layer: one writer.** deps: T-026, T-029, T-031 (risky)
-  - A `packages/polybius` service, with no HTTP yet, that holds the only database role allowed to write. Every save validates the record, checks it against its template (with the identifier checker), re-checks identifier uniqueness inside the transaction, and writes the version and change log. Tests try to write around it with every other role and fail.
+- [ ] T-032 **The service layer: one writer.** deps: T-026, T-029, T-031 (risky)
+  - A `packages/service` service, with no HTTP yet, that holds the only database role allowed to write. Every save validates the record, checks it against its template (with the identifier checker), re-checks identifier uniqueness inside the transaction, and writes the version and change log. Tests try to write around it with every other role and fail.
 - [ ] T-034 **Workflow states and a real publish state.** deps: T-032, T-016 (risky)
   - Records get a stored state (draft, ready for review, published, withdrawn, as in the mockup), changed only through the service. Publishing runs `effectivePublishIssues` and the accession deed check at that moment. `publicOutput` takes published IDs from the database instead of the caller's `published` list (replacing that part of D-016, with a decision entry and closing the last part of T-010a). Shape it so publishing can later be per site (Phase 5, "Show on these sites") without a schema rewrite.
 
@@ -160,14 +160,14 @@ Logins and roles:
   - An organization setting that, when on, holds edits and publish requests as pending versions until a reviewer approves or rejects them, with both recorded in the change log. When it's off, saves go straight through as today.
 
 The API:
-- [ ] T-042 **Polybius HTTP API: records, templates and identifier types.** deps: T-022, T-032, T-037, T-041 (risky)
-  - JSON endpoints in their own package (`packages/polybius-api`) that wrap the service layer for reading, creating and updating records, templates and identifier types. Request size limits, input checked with the core validators, errors without stack traces, and a test for each endpoint with no session, the wrong role and the wrong collection. How it is deployed alongside Hermes waits on Q-1 (T-050).
+- [ ] T-042 **HTTP API: records, templates and identifier types.** deps: T-022, T-032, T-037, T-041 (risky)
+  - JSON endpoints in their own package (`packages/api`) that wrap the service layer for reading, creating and updating records, templates and identifier types. Request size limits, input checked with the core validators, errors without stack traces, and a test for each endpoint with no session, the wrong role and the wrong collection. How it is deployed alongside the public sites waits on Q-1 (T-050).
 - [ ] T-043 **API: history, restore, approval and publishing.** deps: T-042, T-030, T-034, T-035 (risky)
   - Endpoints for versions, compare, restore, the change log, the approval queue and publish/unpublish, with the same permission tests as T-042.
 
 Admin screens in the browser:
 - [ ] T-044 **Decision: how the React admin is built.** deps: T-011
-  - Choose how the Polybius admin is built and served in development: React with the already-pinned Vite 7 (D-006), routing, and how forms are generated from templates. Use the Phase 2 criteria, plus WCAG 2.1 AA support and DESIGN.md's tokens. Where it is served from in production waits on Q-1. Decision entry.
+  - Choose how the admin is built and served in development: React with the already-pinned Vite 7 (D-006), routing, and how forms are generated from templates. Use the Phase 2 criteria, plus WCAG 2.1 AA support and DESIGN.md's tokens. Where it is served from in production waits on Q-1. Decision entry.
 - [ ] T-045 **Admin: sign-in and the screen frame.** deps: T-044, T-042 (risky)
   - The Login screen, the sidebar and the top bar from DESIGN.md, wired to sign-in, two-factor and sign-out, and accessible (WCAG 2.1 AA, keyboard and screen reader tested).
 - [ ] T-046 **Admin: item list and record editor.** deps: T-045, T-043 (risky)
@@ -180,8 +180,8 @@ Admin screens in the browser:
   - A screen listing pending changes and records ready for review, with approve and reject, available to reviewers and admins only.
 
 Waiting on John:
-- [ ] T-050 **Server layout for Polybius and Hermes.** deps: Q-1, T-042 (risky)
-  - Set up the server the way John answers Q-1: one app, or two apps sharing the database through the API. Either way, Hermes may read only published data, through a read-only path (its own database role or a public read API) that tests show can't reach staff fields or unpublished records.
+- [ ] T-050 **Server layout for the admin and the public sites.** deps: Q-1, T-042 (risky)
+  - Set up the server the way John answers Q-1: one app, or two apps sharing the database through the API. Either way, the public sites may read only published data, through a read-only path (its own database role or a public read API) that tests show can't reach staff fields or unpublished records.
 - [ ] T-040 **Sending password reset email.** deps: Q-2, T-039 (risky)
   - Deliver reset and invitation messages through the email service the hosting answer allows, with its credentials only in environment variables, and nothing about the account in the message beyond the link.
 - [ ] T-051 **Deploy and run.** deps: Q-2, T-050, T-052 (risky)
@@ -192,7 +192,7 @@ Waiting on John:
 
 ## Phase 3 — Media
 Tasks to be written when Phase 2 is done. Carried forward:
-- [ ] M-001 **Serve active file types safely.** (risky) From the T-002 review: a digital asset's media type can be `text/html`, `image/svg+xml`, `application/xhtml+xml` or a script type, which is legitimate for born-digital files. When media is served, never send the stored media type as-is for these. Serve them as downloads (`Content-Disposition: attachment`), from a separate origin from the public sites, with a sandboxing Content-Security-Policy and `X-Content-Type-Options: nosniff`, and test that an uploaded HTML or SVG file can't run script on a Hermes site.
+- [ ] M-001 **Serve active file types safely.** (risky) From the T-002 review: a digital asset's media type can be `text/html`, `image/svg+xml`, `application/xhtml+xml` or a script type, which is legitimate for born-digital files. When media is served, never send the stored media type as-is for these. Serve them as downloads (`Content-Disposition: attachment`), from a separate origin from the public sites, with a sandboxing Content-Security-Policy and `X-Content-Type-Options: nosniff`, and test that an uploaded HTML or SVG file can't run script on a public site.
 
 ## Phases 4–7
-Hermes public sites and editor; multiple sites; Omeka S migration and the Historical Society cutover; connections to other systems. See PLATFORM_PLAN.md §10.
+Public sites and editor; multiple sites; Omeka S migration and the Historical Society cutover; connections to other systems. See PLATFORM_PLAN.md §10.

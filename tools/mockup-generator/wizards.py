@@ -12,19 +12,19 @@ def chk2(items):
 def setup():
     sp = Spec()
     steps = [
-        ('Welcome to Polybius', 'Polybius keeps your whole archive in one place: what came in, what it is, where it sits on the shelf, and what the public can see. Setup takes about ten minutes, and you can change every answer later in Settings.',
+        ('Welcome to Oculus', 'Oculus keeps your whole archive in one place: what came in, what it is, where it sits on the shelf, and what the public can see. Setup takes about ten minutes, and you can change every answer later in Settings.',
          note('You’ll set up your organization, how ID numbers look, the rights for your catalog descriptions, and which standard word lists to use. If you have an Omeka site, you can bring it in at the end.', 'blue')),
         ('Your organization', 'This name appears on finding aids, labels, deeds of gift and your public site.',
          card(grid(field('o-name', 'Organization name', 'Dickinson Historical Society') + field('o-short', 'Short name or initials', 'DHS', hint='Used on box labels and ID numbers')
                    + field('o-city', 'City and state', 'Dickinson, Texas') + field('o-kind', 'Kind of organization', kind='select', options=['Historical society', 'Museum', 'Archive', 'Library special collection']))
               + field('o-email', 'Contact email for researchers', ph='[email]'))),
-        ('Do you have an Omeka site?', 'Polybius can bring in an existing Omeka S site: items, item sets, files and links. Old Omeka addresses keep working because each one redirects to the new record.',
+        ('Do you have an Omeka site?', 'Oculus can bring in an existing Omeka S site: items, item sets, files and links. Old Omeka addresses keep working because each one redirects to the new record.',
          sp.choice('omeka', [opt('Yes, import it after setup', 'You’ll connect it in Import &amp; export. Nothing changes on the Omeka site.', 'Good. After setup, open Import &amp; export and choose “Omeka S site”. The Historical Society stays live on Omeka until you switch over.'),
                              opt('Yes, but not now', 'Start fresh; you can import any time.'), opt('No Omeka site', 'Start with an empty catalog.')], init=0)),
         ('How should ID numbers look?', 'Every record gets a catalog ID. Pick a pattern; existing numbers from an import are kept as “former” IDs.',
          sp.choice('scheme', [opt('Prefix and number', 'DHS-0001, DHS-0002 …', 'New records will be numbered DHS-0001 upward. Accession numbers stay year-based (2026.015).'),
                               opt('Year-based', '2026.001.001: accession, then item', 'Each item takes its accession number plus its own number, so the donor trail is in the ID itself.'),
-                              opt('Keep the numbers I already use', 'Type your own for each record', 'Polybius will ask for an ID on every new record and warn you about duplicates.')], init=0)),
+                              opt('Keep the numbers I already use', 'Type your own for each record', 'Oculus will ask for an ID on every new record and warn you about duplicates.')], init=0)),
         ('Catalog description rights', 'Separate from the rights in your photos and documents: may other people reuse the descriptions you write?',
          sp.choice('crights', [opt('CC0: anyone may reuse them', 'Recommended. Lets libraries, Wikipedia and search engines use your records freely.'),
                                opt('CC BY: reuse with credit'), opt('All rights reserved')], init=0)),
@@ -61,7 +61,7 @@ def accession():
          sp.choice('restr', [opt('No restrictions'), opt('Closed until a date', '', 'Choose the date below. Nothing from this accession will be published before then.'),
                              opt('Staff and researchers only', 'Not on the public site'), opt('Other condition')], init=0, cols=220)
          + field('r-note', 'Notes about restrictions', ph='[Anything the donor asked for, in their words]', kind='textarea')),
-        ('Review &amp; save', 'Polybius will assign the accession number and draft the deed of gift for signature.',
+        ('Review &amp; save', 'Oculus will assign the accession number and draft the deed of gift for signature.',
          summary([('Donor', '[Donor name] ({{ch_dkind_chosen}})', 0), ('Received', '[date] · {{ch_method_chosen}}', 1), ('Materials', 'Interview recordings with release forms · [extent]', 2),
                   ('Copyright', '{{ch_copy_chosen}}', 3), ('Restrictions', '{{ch_restr_chosen}}', 4)])
          + note('Accession number <strong>2026.[015]</strong> will be assigned, and a deed of gift will be drafted in Deeds.', 'green')),
@@ -80,7 +80,7 @@ def catalog():
              + '<div style="display: flex; flex-wrap: wrap; gap: 10px">' + b_btn('Replace file', 's') + b_btn('Use a placeholder instead', 's') + '</div></div></div>')
     steps = [
         ('What kind of item is this?', 'Pick the option that best fits. This shapes the wording of later questions.', sp.choice('type', types, init=0, cols=200, compact=True)),
-        ('Attach a scan or pick a placeholder', 'If you have a digital scan, attach it and Polybius pulls any embedded details it can find. No scan yet? Pick a placeholder and the item goes on the Needs Scanning list.', media),
+        ('Attach a scan or pick a placeholder', 'If you have a digital scan, attach it and Oculus pulls any embedded details it can find. No scan yet? Pick a placeholder and the item goes on the Needs Scanning list.', media),
         ('Which donation did this come from?', 'Linking the accession keeps the chain of custody from donor to shelf. Not from a logged accession, or not sure? Skip it.',
          sp.choice('acc', [opt('2026.[011] · City of Dickinson', 'Incorporation papers and photographs, 1958–1980'), opt('2026.[012] · [Donor name]', 'Railroad Center photographs'),
                            opt('Not from a logged accession'), opt('I’m not sure')], init=3, cols=300)),
@@ -90,7 +90,7 @@ def catalog():
          field('c-creator', 'Creator', ph='[Photographer unknown]') + '<div style="display: flex; flex-direction: column; gap: 6px; font-size: 14px"><strong>Names already in Authorities</strong>'
          + ''.join(f'<span style="padding: 8px 12px; border: 1px solid #d7dce2; border-radius: 4px; background: #ffffff">{n}</span>' for n in ['Dickinson Historical Society', 'Galveston, Houston and Henderson Railroad']) + '</div>'),
         ('When was it made?', 'Type a date any way you like: “August 1920”, “around 1920”, “1920s”. Leave it blank if it’s truly unknown.',
-         field('c-date', 'Date', 'late 1920s', hint='As written on the photograph.') + note('Polybius reads this as <strong>192X</strong> (the 1920s, leaning late) for sorting and the timeline. It still shows “late 1920s” to visitors.', 'green')),
+         field('c-date', 'Date', 'late 1920s', hint='As written on the photograph.') + note('Oculus reads this as <strong>192X</strong> (the 1920s, leaning late) for sorting and the timeline. It still shows “late 1920s” to visitors.', 'green')),
         ('Describe what you see.', 'Write for someone who can’t see the item. Describe what’s actually in it, plainly and in order, so the words alone paint the picture. Don’t interpret or guess.',
          field('c-desc', 'Description', 'Black-and-white aerial photograph of downtown Dickinson taken from the top of the school building. Hand-lettered paper labels point to Parks/Dees Home, Pilastrini Grocery, Lukens Home, Dees Garage, the hotel, the post office, Benson Feed Store, Lucy Home, the railroad depot and Old First Methodist. 45th Street (1997) runs across the foreground.', kind='textarea', rows=6)),
         ('What topics or themes does this cover?', 'Subjects help researchers find this item. Pick suggestions or type your own.',
@@ -111,7 +111,7 @@ def catalog():
          + field('c-coll', 'Collection', kind='select', options=['Becoming a City', 'Historic Railroad Center', 'General collection › Photographs', '+ New collection…'])),
         ('Where will it be stored?', 'The physical spot: which box and folder. Skip it if you’re not sure yet.',
          grid(field('c-box', 'Box', kind='select', options=['Box [003] · Archive room › Shelf B (95% full)', 'Box [002] · Archive room › Shelf A', '+ New box…']) + field('c-folder', 'Folder', ph='[00]'))
-         + note('Box [003] is nearly full. Polybius will remind you when it’s time to start a new one.', 'amber')),
+         + note('Box [003] is nearly full. Oculus will remind you when it’s time to start a new one.', 'amber')),
         ('Review and save', 'Here’s the record that will be created. Click Edit on any line to go back to it.',
          summary([('Type', '{{ch_type_chosen}}', 0), ('File', 'dhs_scan_0412.tif', 1), ('Accession', '{{ch_acc_chosen}}', 2), ('Title', 'Aerial View of Dickinson, Texas', 3),
                   ('Creator', '[Photographer unknown]', 4), ('Date', 'late 1920s (192X)', 5), ('Subjects', 'Aerial photographs; Dickinson (Tex.)--History; Downtowns', 7),
@@ -141,24 +141,24 @@ def collection():
 
 def importer():
     sp = Spec()
-    mapping = table(['Column in your file', 'Example', 'Polybius field'], [
+    mapping = table(['Column in your file', 'Example', 'Oculus field'], [
         ('Title', 'Dickinson Station and Park', f'<select aria-label="Field for Title" style="{SEL}; min-width: 200px"><option>Title</option></select>'),
         ('Date', '1909', f'<select aria-label="Field for Date" style="{SEL}; min-width: 200px"><option>Date as written</option></select>'),
         ('Item Type', 'Still Image', f'<select aria-label="Field for Item Type" style="{SEL}; min-width: 200px"><option>Type</option></select>'),
         ('Subject', 'Railroads; Depots', f'<select aria-label="Field for Subject" style="{SEL}; min-width: 200px"><option>Subjects (split on ;)</option></select>'),
         ('Box', '12', f'<select aria-label="Field for Box" style="{SEL}; min-width: 200px"><option>Shelf location</option></select>'),
         ('Notes2', '[text]', f'<select aria-label="Field for Notes2" style="{SEL}; min-width: 200px"><option>Don’t import</option></select>')], minw=640)
-    review = table(['Your row', 'Match in Polybius', 'What will happen'], [
+    review = table(['Your row', 'Match in Oculus', 'What will happen'], [
         ('Dickinson Station and Park', 'DHS-[0001] (same title, same date)', pill('Update', 'blue')),
         ('Loading Strawberries', 'No match', pill('New record', 'green')),
         ('Depot move 1967', 'Dickinson Depot Move (1967)?', pill('Check: possible match', 'amber')),
         ('[Untitled]', 'No title', pill('Skip', 'gray'))], minw=640)
     steps = [
-        ('What are you bringing in?', 'Polybius can read a spreadsheet (CSV or Excel) or an Omeka S site, and matches what it finds against records you already have so nothing is doubled.',
+        ('What are you bringing in?', 'Oculus can read a spreadsheet (CSV or Excel) or an Omeka S site, and matches what it finds against records you already have so nothing is doubled.',
          sp.choice('src', [opt('A spreadsheet', 'CSV or Excel, from PastPerfect, a volunteer’s list, anything'), opt('An Omeka S site', 'Items, item sets, files and links')], init=1, cols=280)
          + '<div style="padding: 22px; border: 2px dashed #8b939c; border-radius: 6px; background: #ffffff; font-size: 14px"><strong>Drop a spreadsheet here</strong> or choose a file</div>'),
-        ('Match your columns', 'Tell Polybius which column goes into which field. It guessed the obvious ones.', mapping),
-        ('Connect your Omeka site', 'Polybius reads the site; it never changes anything on it. Each old Omeka address will redirect to the new record, so links in emails and on other sites keep working.',
+        ('Match your columns', 'Tell Oculus which column goes into which field. It guessed the obvious ones.', mapping),
+        ('Connect your Omeka site', 'Oculus reads the site; it never changes anything on it. Each old Omeka address will redirect to the new record, so links in emails and on other sites keep working.',
          grid(field('i-url', 'Omeka S address', ph='[archive address]') + field('i-key', 'API key identity', ph='[key identity]') + field('i-cred', 'API key credential', ph='[credential]', kind='password'))
          + note('Found [N] items in [N] item sets, and [N] files ([size] GB).', 'green')),
         ('Review the matches', 'Check anything marked as a possible match before importing. You can undo the whole import afterward.', review),
@@ -174,7 +174,7 @@ def newsite():
     sp = Spec()
     steps = [
         ('Name and address', 'A public site shows records you choose, live from the catalog. You can run several, for example the Digital Archive and a separate exhibit site.',
-         grid(field('n-name', 'Site name', 'Railroad Center') + field('n-addr', 'Address', ph='[address]', hint='Use your own domain or a free Hermes address'))),
+         grid(field('n-name', 'Site name', 'Railroad Center') + field('n-addr', 'Address', ph='[address]', hint='Use your own domain or a free Oculus address'))),
         ('Pick a look', 'Start from a look, then change colors and fonts in the editor.',
          sp.choice('look', [opt('Match the Historical Society website', 'Charcoal, white and orange; Roboto and Open Sans'), opt('Plain and quiet', 'Lots of white space, serif headings'),
                             opt('Dark gallery', 'For image-heavy exhibits')], init=0, cols=240)),

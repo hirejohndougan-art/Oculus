@@ -59,7 +59,7 @@ Phase 1 was to build the record model and ID numbers as plain, tested TypeScript
 
 1. **Phase 2 is the security-heavy phase, and autopilot merges without a person.** Logins, sessions, password reset, roles and the public/private line are all built here. Independent reviews help, but nobody should deploy before a person reviews it, and ideally a professional test (plan, "Security").
 2. **Hosting is unknown (Q-2).** It decides email for password reset, background jobs and WebSockets. Phase 2 tasks avoid needing WebSockets (edit conflicts use version numbers), and mark email and deployment `deps: Q-2`.
-3. **One app or two is unknown (Q-1).** The database, the service layer and the API don't depend on it. How Hermes reads published data does (T-050).
+3. **One app or two is unknown (Q-1).** The database, the service layer and the API don't depend on it. How the public sites read published data does (T-050).
 4. **The core works on whole snapshots in memory** (`indexRecords` checks every record it's given, up to 1,000,000). The server must load only the records a call needs, such as a record's chain of ancestors, or saves will slow as the catalog grows.
 5. **Specs written from memory.** EDTF, DCMI, Nomenclature and GNIS details couldn't be checked from the sandbox (T-003a, T-009a, T-010a).
 6. **Private data.** Donors, researchers and users are real people. The public repo must keep using invented test data, and donor contact details need tighter access than "staff".

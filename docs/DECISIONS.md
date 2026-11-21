@@ -15,7 +15,7 @@ Three scheduled sessions each night (build, upkeep, security) do one task each, 
 Oculus contains no hosted AI, no AI SDKs and no pretrained models. Suggestion features use classical retrieval: BM25 plus a curated synonym list.
 
 ## D-005 — Platform name and parts (2026-11-20, John)
-The platform is **Oculus**. Its staff back end is called **Polybius** and its public sites are called **Hermes**. These are names for parts of one product, not separate products.
+The platform is **Oculus**. Its staff back end is called **Polybius** and its public sites are called **Hermes**. These are names for parts of one product, not separate products. **Superseded by D-018.**
 
 ## D-006 — Toolchain, Node version and the license allowlist (2026-11-20, autopilot T-001)
 npm workspaces (`packages/*`), TypeScript 6.0 in strict mode (plus `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes`), ESLint 10 with typescript-eslint's strict type-checked rules, Prettier 3 and Vitest 5. `.nvmrc` is Node 26, the Active LTS line ("Lithium", LTS from October 2026, supported to April 2029); `engines` allows Node 22 and later, because the build sandbox runs 22. ES modules only.
@@ -110,3 +110,6 @@ Terms keep the D-010 shape `{label, uri?, vocabulary?}`. Six vocabulary codes: `
 Checked against the LoC EDTF specification (loc.gov/standards/datetime/edtf.html, 2019-02-04).
 - **Two suffix qualifiers stay refused.** The spec's level 2 examples put at most one qualifier after the parts (`2004-06~-11`, `2004?-06-11`) and use prefixes for anything finer (`?2004-06-~11`, `2004-%06-11`). `2004?-06~-11` isn't among them, so D-008's strict reading stands. Since a suffix applies to its part and every part to its left, the error message gives the same meaning in prefixes (`%2004-~06-11`). Rejected: accepting it, which would let two spellings of one meaning into stored data. Loosening later won't break stored dates.
 - **"?" after a free-text range is flagged, not guessed.** In EDTF a qualifier belongs to one interval end, but in free text "1920-1925?" can doubt the end year or the whole range. A qualifier in front ("probably 1920-1925", "ca. 1920-1925") still applies to both ends. A single date that reads as an interval ("19th century?") isn't a range and isn't flagged. Rejected: `?` on both ends (the old behaviour), which guessed.
+
+## D-018 — One name: Oculus (2026-11-21, John)
+The entire project is called **Oculus**. The part names Polybius (staff back end) and Hermes (public sites) are dropped; supersedes D-005. The parts are described plainly: **the admin** for the staff back end and **the public sites**, with "Oculus" as the wordmark on both. Planned packages are named for what they do (`packages/service`, `packages/api`), not after the old names. "Polybius" still appears only where it means the Society's earlier desktop catalog or John's private repository of that name (D-004's origin, D-007, the licensing rule in AUTOPILOT.md and DESIGN.md's source map), because those are real, separate things.

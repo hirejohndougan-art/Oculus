@@ -15,9 +15,9 @@ wizards.setup(); wizards.accession(); wizards.catalog(); wizards.collection(); w
 _cp = os.path.join(OUT, 'canvas.json')
 canvas = json.load(open(_cp if os.path.exists(_cp) else REPO_CANVAS))
 canvas['title'] = 'Oculus mockup'
-FILES['AdminSiteEditor.dc.html'] = ('Hermes site editor', 1440, 1000)
+FILES['AdminSiteEditor.dc.html'] = ('Public site editor', 1440, 1000)
 rows = [
-    ('Polybius back end: sign in, dashboard and intake', ['Login', 'AdminDashboard', 'Accessions', 'Deeds', 'Donors', 'ScanInbox', 'NeedsScanning']),
+    ('Oculus back end: sign in, dashboard and intake', ['Login', 'AdminDashboard', 'Accessions', 'Deeds', 'Donors', 'ScanInbox', 'NeedsScanning']),
     ('Catalog', ['Items', 'AdminRecord', 'NeedsSorting', 'OCR', 'DataCleaning', 'Authorities']),
     ('Arrange & describe, storage and preservation', ['Fonds', 'Series', 'Collections', 'FindingAidAdmin', 'Subjects', 'EffectiveRecord', 'Storage', 'Preservation']),
     ('Circulation, public sites, reports and settings', ['Checkouts', 'Whereabouts', 'ExhibitsAdmin', 'Researchers', 'Conservators', 'Sites', 'AdminSiteEditor', 'Submissions', 'Reports', 'Settings']),
@@ -26,7 +26,7 @@ rows = [
 boards = {k: v for k, v in canvas['boards'].items() if k in ('Main.dc.html', 'Browse.dc.html', 'Item.dc.html', 'FindingAid.dc.html')}
 order = list(boards.keys())
 notes = {'t1': canvas['notes']['t1']}
-canvas['notes']['t1']['text'] = 'Hermes public site: Dickinson Historical Society Digital Archive'
+canvas['notes']['t1']['text'] = 'Public site: Dickinson Historical Society Digital Archive'
 y = 3200 + 120 + 260
 for ri, (title, names) in enumerate(rows):
     notes[f'r{ri}'] = {'x': 0, 'y': y - 260, 'text': title, 'kind': 'title1', 'maxW': 1520 * len(names) - 80}

@@ -2,8 +2,8 @@
 
 A click-through mockup of the whole platform: 41 screens.
 
-- **Public site (Hermes), 4 screens:** home, search and browse, item page, finding aid.
-- **Back end (Polybius), 31 screens:** sign-in, dashboard, intake, catalog, arrangement, storage, preservation, circulation, public sites and page editor, reports and settings.
+- **Public site, 4 screens:** home, search and browse, item page, finding aid.
+- **Back end (admin), 31 screens:** sign-in, dashboard, intake, catalog, arrangement, storage, preservation, circulation, public sites and page editor, reports and settings.
 - **Wizards, 6:** first-run setup, log an accession, catalog an item (14 steps, with the filing guide), new collection, import & reconcile, and new public site.
 
 `canvas.json` lays the screens out in rows; `screens/` holds one file per screen.

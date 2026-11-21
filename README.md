@@ -10,10 +10,10 @@ An *oculus* is the round opening at the top of a dome, like the Pantheon's: a wi
 
 | Part | Who uses it | What it does |
 |---|---|---|
-| **Polybius** (back end) | Staff and volunteers | Accessions and deeds of gift, cataloging, scans and OCR, authorities and subjects, arrangement (fonds › series › collection), physical storage, preservation checks, circulation, reports and an audit trail |
-| **Hermes** (public sites) | Visitors and researchers | Search and browse, item pages, finding aids, exhibits, timeline and map, built with a drag-and-drop page editor. One organization can run several sites. |
+| **Admin** (staff back end) | Staff and volunteers | Accessions and deeds of gift, cataloging, scans and OCR, authorities and subjects, arrangement (fonds › series › collection), physical storage, preservation checks, circulation, reports and an audit trail |
+| **Public sites** | Visitors and researchers | Search and browse, item pages, finding aids, exhibits, timeline and map, built with a drag-and-drop page editor. One organization can run several sites. |
 
-Records are published live: when you publish a record in Polybius, it shows on the Hermes sites chosen for it. There is no export/import step between the catalog and the website.
+Records are published live: when you publish a record in the admin, it shows on the public sites chosen for it. There is no export/import step between the catalog and the website.
 
 ## What's here
 

@@ -2,8 +2,8 @@
 
 The look and the screen patterns from the Oculus click-through mockup, made for the Dickinson Historical Society in October 2026. Use this guide to build the real screens so they match the mockup.
 
-- **Polybius** is the staff back end: cataloging, intake, arrangement, storage, circulation, settings.
-- **Hermes** is the public website it publishes to (the Digital Archive), plus the drag-and-drop page editor.
+- **The admin** is the staff back end: cataloging, intake, arrangement, storage, circulation, settings.
+- **The public sites** are the websites it publishes to (the Digital Archive), plus the drag-and-drop page editor.
 
 The mockup screens are in [`../mockup/`](../mockup/). Color and type values are in [`tokens/`](tokens/).
 
@@ -92,7 +92,7 @@ All text pairs above pass WCAG AA contrast (4.5:1) at their sizes.
 
 ### Back end: sidebar + content
 - **Sidebar:** 236–260 px wide, `--frame-dark`.
-  - The "Polybius" wordmark sits at 22 px with the organization name under it.
+  - The "Oculus" wordmark sits at 22 px with the organization name under it.
   - Menu groups have uppercase labels; the items under a group are indented 22 px.
   - The selected item gets a `--nav-active` fill and a 3 px accent bar on the left.
   - Badges (`[N]`) are right-aligned in `--nav-text-muted`.
@@ -101,15 +101,15 @@ All text pairs above pass WCAG AA contrast (4.5:1) at their sizes.
 - On a narrow screen the sidebar wraps above the content instead of shrinking it.
 
 ### Wizards: full page
-- **Top bar:** dark, showing "Polybius · wizard name · Step X of N", plus a "Save draft & close" button.
+- **Top bar:** dark, showing "Oculus · wizard name · Step X of N", plus a "Save draft & close" button.
 - **Progress bar:** 5 px, accent fill.
 - **Step rail:** dark, on the left. Each step is a 26 px numbered circle and its title: done steps show ✓, the current step is filled with the accent. Every step is clickable, so you can jump back.
 - **Content:** max width 900 px. Each step is one plain question as the h1, a short explanation, then the inputs.
 - **Footer:** "Cancel" on step 1, "← Back" after that, the note "Answers save as a draft after every step", then "Next →", or the finish button on the last step.
 - **Last step:** always a review summary. Every line has an **Edit** button that jumps straight to its step.
 
-### Public site (Hermes)
-- **Header and footer:** charcoal, with "Dickinson Historical Society / DIGITAL ARCHIVE" on the left. The menu shows the current page with a 3 px accent underline, and Donate is an accent button. The footer ends with "Powered by Hermes + Polybius · Staff sign in".
+### Public site
+- **Header and footer:** charcoal, with "Dickinson Historical Society / DIGITAL ARCHIVE" on the left. The menu shows the current page with a 3 px accent underline, and Donate is an accent button. The footer ends with "Powered by Oculusolybius · Staff sign in".
 - **Home page:** hero search with suggested searches, collection cards, a featured item, recent additions, a timeline, a map and exhibits.
 - **Other pages:** search with filters in a left column (list or grid view), an item page with a media viewer, tabbed record details and a citation, and a finding aid as an expandable series › file › item tree.
 
@@ -141,9 +141,9 @@ All text pairs above pass WCAG AA contrast (4.5:1) at their sizes.
 
 ## 8. Screen inventory
 
-Each screen is listed with its mockup file name and the Polybius module it corresponds to (in `app/src/lib/ui/`).
+Each screen is listed with its mockup file name and the module it corresponds to in the Society's earlier Polybius desktop catalog (in `app/src/lib/ui/`; file names there are that app's, not Oculus names).
 
-| Screen | File | Polybius module |
+| Screen | File | Earlier desktop module |
 |---|---|---|
 | Sign in | `Login` | (new; web version) |
 | Dashboard | `AdminDashboard` | `dashboard.jsx` |
@@ -166,15 +166,15 @@ Each screen is listed with its mockup file name and the Polybius module it corre
 | Preservation | `Preservation` | `preservationScreen.jsx` |
 | Checkouts, Whereabouts, Exhibits, Researchers, Conservators | `Checkouts`, `Whereabouts`, `ExhibitsAdmin`, `Researchers`, `Conservators` | `checkouts.jsx`, `whereabouts.jsx`, `exhibits.jsx`, `researchers.jsx`, `conservators.jsx` |
 | Public sites | `Sites` | `hermesView.jsx` (reworked as site manager) |
-| Hermes page editor | `AdminSiteEditor` | (new; Blueprint editor moved out of WordPress) |
+| Public page editor | `AdminSiteEditor` | (new; Blueprint editor moved out of WordPress) |
 | Public submissions | `Submissions` | `hermesView.jsx` (public intake review) |
 | Audit & Reports | `Reports` | `reportsView.jsx`, `reportScreens.jsx` |
 | Settings | `Settings` | `settingsView.jsx` |
-| Public: home, browse, item, finding aid | `Main`, `Browse`, `Item`, `FindingAid` | (Hermes widgets) |
+| Public: home, browse, item, finding aid | `Main`, `Browse`, `Item`, `FindingAid` | (public-site widgets) |
 
 **Wizards:**
 
-| Wizard | File | Steps | Polybius source |
+| Wizard | File | Steps | Earlier desktop source |
 |---|---|---|---|
 | First-run setup | `WizSetup` | Welcome · Organization · Omeka site? · ID numbers · Description rights · Vocabularies · Review | `firstRun.jsx` |
 | Log an accession | `WizAccession` | Donor · When and how · Materials · Copyright & rights · Restrictions · Review | `intake.jsx` |

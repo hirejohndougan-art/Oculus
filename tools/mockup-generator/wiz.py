@@ -23,7 +23,7 @@ def wizard(file, name, steps, cancel_href, finish_label, finish_href, spec, h=10
               f'<sc-if value="{{{{isLast}}}}" hint-placeholder-val="{{{{ false }}}}">{a_btn(finish_label, finish_href, "p")}</sc-if></div>')
     html = ('<div style="font-family: \'Open Sans\', system-ui, sans-serif; color: #2f3337; background: #f3f5f8; min-height: 100vh; display: flex; flex-direction: column">'
             '<header style="background: #1d2023; color: #ffffff; padding: 12px 24px; display: flex; flex-wrap: wrap; align-items: center; gap: 16px">'
-            '<span style="font-family: Roboto, sans-serif; font-weight: 700; font-size: 18px">Polybius</span>'
+            '<span style="font-family: Roboto, sans-serif; font-weight: 700; font-size: 18px">Oculus</span>'
             f'<span style="font-size: 15px; color: #dfe3e7">{name}</span>'
             '<span style="margin-left: auto; font-size: 14px; color: #dfe3e7">Step {{stepNum}} of {{stepCount}}</span>'
             f'<a href="{cancel_href}" style="display: inline-flex; align-items: center; min-height: 40px; padding: 0 14px; color: #ffffff; border: 1px solid #6b7178; border-radius: 4px; text-decoration: none; font-size: 14px">Save draft &amp; close</a></header>'

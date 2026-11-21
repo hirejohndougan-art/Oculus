@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-21 01:55 CT — manual (John) — D-018 One name: Oculus
+- Result: done
+- What changed: John dropped the part names. The whole project is Oculus; the staff back end is "the admin" and the public front end is "the public sites". Updated README, PLATFORM_PLAN, ROADMAP (planned packages are now `packages/service` and `packages/api`), AUTOPILOT, DESIGN.md, the mockup screens and the mockup generator (wordmark "Oculus"). "Polybius" stays only where it means the earlier desktop catalog or John's private repository.
+- Decisions: D-018 (John; supersedes D-005)
+- Review: n/a (names in docs and mockups only; no code)
+- Gate: PASS · tests_passing 1278 (unchanged) · npm audit clean
+- Next: T-005a Safe template changes (risky)
+
 ## 2026-11-21 00:39 CT — build — T-003a EDTF review follow-ups
 - Result: done
 - What changed: read the LoC EDTF spec (2019-02-04) and tested every example string in it (`edtf.spec-examples.test.ts`): all parse at their level except exponential years and significant digits, left out by D-008. `2004?-06~-11` stays refused, and the error now gives the prefix form `%2004-~06-11` (the old doc comment's `?2004-~06-11` dropped the year's `~`). Free text with a trailing `?` after a range ("1920-1925?") is flagged as ambiguous instead of getting `?` on both ends. Commits b468c26, 48abbc9.

@@ -1,4 +1,4 @@
-"""Shared building blocks for the Polybius back-end mockup artboards."""
+"""Shared building blocks for the Oculus back-end mockup artboards."""
 import json, os, re
 
 OUT = os.environ.get('OCULUS_MOCKUP_OUT', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'out'))
@@ -247,7 +247,7 @@ NAV = [
     ('Preservation', 'Preservation', None),
     ('Circulation', None, [('Checkouts', 'Checkouts', None), ('Whereabouts', 'Whereabouts', None), ('Exhibits', 'ExhibitsAdmin', None),
                            ('Researchers', 'Researchers', None), ('Conservators', 'Conservators', None)]),
-    ('Public sites (Hermes)', None, [('Sites &amp; pages', 'Sites', None), ('Public submissions', 'Submissions', '[N]')]),
+    ('Public sites', None, [('Sites &amp; pages', 'Sites', None), ('Public submissions', 'Submissions', '[N]')]),
     ('Import &amp; export', 'WizImport', None),
     ('Audit &amp; Reports', 'Reports', None),
     ('Settings', 'Settings', None),
@@ -264,9 +264,9 @@ def nav_link(label, target, badge, active, sub):
             f'border-radius: 4px; text-decoration: none; color: #ffffff; font-size: 14px; background: {bg}; border-left: 3px solid {line}">{label}{b}</a>')
 
 def sidebar(active):
-    out = ('<nav aria-label="Polybius" style="flex: 1 1 236px; max-width: 260px; background: #26292c; color: #ffffff; display: flex; flex-direction: column; padding: 18px 12px 24px; gap: 2px; box-sizing: border-box">'
+    out = ('<nav aria-label="Oculus" style="flex: 1 1 236px; max-width: 260px; background: #26292c; color: #ffffff; display: flex; flex-direction: column; padding: 18px 12px 24px; gap: 2px; box-sizing: border-box">'
            '<a href="AdminDashboard.dc.html" style="display: flex; flex-direction: column; gap: 2px; padding: 4px 10px 16px; text-decoration: none; color: #ffffff">'
-           '<span style="font-family: Roboto, sans-serif; font-weight: 700; font-size: 22px">Polybius</span>'
+           '<span style="font-family: Roboto, sans-serif; font-weight: 700; font-size: 22px">Oculus</span>'
            '<span style="font-size: 13px; color: #c9cdd1">Dickinson Historical Society</span></a>')
     for label, target, kids in NAV:
         if kids:
