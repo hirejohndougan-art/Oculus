@@ -225,3 +225,20 @@ export type {
   TermUriChange,
   NormalizedTermUri,
 } from "./vocabularies.js";
+export {
+  DUPLICATE_REASONS,
+  MAX_DUPLICATE_TERMS,
+  DEFAULT_DUPLICATE_CANDIDATES,
+  MAX_DUPLICATE_CANDIDATES,
+  MAX_SPELLING_COMPARISONS,
+  termWords,
+  termMatchKey,
+  boundedDistance,
+  findNearDuplicateTerms,
+} from "./term-duplicates.js";
+export type {
+  DuplicateReason,
+  DuplicateCandidate,
+  DuplicateReport,
+  DuplicateOptions,
+} from "./term-duplicates.js";
