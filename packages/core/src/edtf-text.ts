@@ -75,6 +75,13 @@ const SEASONS: ReadonlyMap<string, string> = new Map([
 ]);
 
 const APPROXIMATE = /^(?:about|around|approximately|approx\.?|circa|ca\.?|c\.?|abt\.?)\s*/;
+/**
+ * Every dash-like character: hyphens, en and em dashes, the figure dash,
+ * horizontal bar, small and full-width hyphen-minus (all Unicode "Pd"), plus
+ * the minus sign and hyphen bullet. They all become "-" before any check, so
+ * "1920–25" is flagged exactly like "1920-25" (S-004).
+ */
+const DASHES = /[\p{Pd}\u2212\u2043]/gu;
 const UNCERTAIN = /^(?:probably|possibly|perhaps|maybe)\s+/;
 const UNDATED =
   /^(?:undated|n\.\s*d\.?|nd|no date|date unknown|unknown|unknown date|\[?n\.d\.\]?)$/;
@@ -133,24 +140,23 @@ export function edtfFromText(
   if (problem !== undefined) {
     return { ok: false, issues: [issue([], "invalid_text", `The date text ${problem}.`)] };
   }
-  const guard = ambiguousForm(trimmed);
+  // Every check below reads this copy, never the raw text, so no dash can
+  // slip past a guard that looks for "-". Digits are not folded: full-width
+  // and other non-ASCII digits are simply not read.
+  const dashed = trimmed.replace(DASHES, "-");
+  const guard = ambiguousForm(dashed);
   if (guard !== undefined) return { ok: false, issues: [issue([], "ambiguous", guard)] };
 
-  const exact = parseEdtf(trimmed);
+  const exact = parseEdtf(dashed);
   if (exact.ok) {
     return {
       ok: true,
-      value: Object.freeze({ edtf: trimmed, note: undefined, date: exact.value }),
+      value: Object.freeze({ edtf: dashed, note: undefined, date: exact.value }),
     };
   }
 
   try {
-    const text = trimmed
-      .toLowerCase()
-      .replace(/[–—]/g, "-")
-      .replace(/\s+/g, " ")
-      .replace(/\.$/, "")
-      .trim();
+    const text = dashed.toLowerCase().replace(/\s+/g, " ").replace(/\.$/, "").trim();
     if (UNDATED.test(text)) fail("undated", "The text says the item is undated.");
     const piece = readRange(text, options);
     const parsed = parseEdtf(piece.edtf);
@@ -284,12 +290,13 @@ function joinRange(
 }
 
 /**
- * Forms that read two ways in free text, checked before anything else. Returns
- * the message, or undefined if the text is fine.
+ * Forms that read two ways in free text, checked before anything else, on
+ * text whose dashes are already all "-". Returns the message, or undefined if
+ * the text is fine.
  */
 function ambiguousForm(text: string): string | undefined {
   // A dash before the first year: "until 1920", or a BCE year?
-  if (/^[-\u2013\u2014]\s*\d/.test(text)) {
+  if (/^-\s*\d/.test(text)) {
     return `${shown(text)} starts with a dash: it could mean “until” or a year BCE. Enter ../1920 for “until 1920”.`;
   }
   // "1920-25" is EDTF's spring 1920, and "1901-05" is May 1901, but in free
