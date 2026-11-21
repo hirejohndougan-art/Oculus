@@ -36,8 +36,10 @@
  *   only within its organization. `validateIdentifierTypes`,
  *   `validateRecordIdentifiers`, `uniquenessIssues`, `checkNewIdentifier` and
  *   `nextIdentifier` refuse inputs of more than one organization
- *   (`mixed_organizations`). `findByIdentifier` and `findIdentifierConflicts`
- *   don't check yet (T-019c): pass them one organization's sets only.
+ *   (`mixed_organizations`), and so do `findByIdentifier` and
+ *   `findIdentifierConflicts`, which return a `Validated` list for that
+ *   reason. An entry that doesn't say which organization it belongs to
+ *   counts as another organization's.
  *
  * Not decided here, and left to later tasks:
  * - Changing an identifier type. Tightening a format, removing a type,
@@ -810,9 +812,24 @@ export function uniquenessIssues(
  * The identifiers held by other records that a new identifier would clash
  * with under its type's uniqueness rule. Empty when it is free to use, when
  * the rule is `none`, or when the type is unknown (`checkNewIdentifier`
- * reports that).
+ * reports that). Fails with `mixed_organizations` when the records and types
+ * belong to more than one organization, or any doesn't say which (D-0XX):
+ * another organization's holders are never listed. Never throws.
  */
 export function findIdentifierConflicts(
+  candidate: { readonly type: string; readonly value: string },
+  recordId: RecordId,
+  all: readonly RecordIdentifiers[],
+  identifierTypes: readonly IdentifierType[],
+): Validated<readonly IdentifierMatch[]> {
+  return guarded(() => {
+    const mixed = mixedIssue(all, identifierTypes);
+    if (mixed !== undefined) return { ok: false, issues: [mixed] };
+    return { ok: true, value: Object.freeze(conflicts(candidate, recordId, all, identifierTypes)) };
+  }, "These identifiers could not be read as plain data.");
+}
+
+function conflicts(
   candidate: { readonly type: string; readonly value: string },
   recordId: RecordId,
   all: readonly RecordIdentifiers[],
@@ -881,13 +898,13 @@ export function checkNewIdentifier(
     if (known.pattern !== undefined && !matchesIdentifierPattern(known.pattern, item.value)) {
       issues.add(["value"], "format_mismatch", patternMismatchMessage(known.pattern, item.value));
     }
-    const conflicts = findIdentifierConflicts(
+    // The organization check ran above, so the sets are this organization's.
+    const first = conflicts(
       { type: known.type.key, value: item.value },
       recordId,
       all,
       identifierTypes,
-    );
-    const first = conflicts[0];
+    )[0];
     if (first !== undefined) {
       issues.add(
         ["value"],
@@ -910,11 +927,26 @@ export function checkNewIdentifier(
  * exact. Current matches come before former ones. Options: `type` limits the
  * search to one identifier type; `includeFormer: false` leaves former
  * identifiers out. Bad queries (not text, empty, too long) find nothing.
+ * Fails with `mixed_organizations` when the sets belong to more than one
+ * organization, or any doesn't say which (D-0XX): a search never returns
+ * another organization's records. Never throws.
  */
 export function findByIdentifier(
   query: unknown,
   all: readonly RecordIdentifiers[],
   options: { readonly type?: string; readonly includeFormer?: boolean } = {},
+): Validated<readonly IdentifierMatch[]> {
+  return guarded(() => {
+    const mixed = mixedIssue(all, []);
+    if (mixed !== undefined) return { ok: false, issues: [mixed] };
+    return { ok: true, value: search(query, all, options) };
+  }, "These identifiers could not be read as plain data.");
+}
+
+function search(
+  query: unknown,
+  all: readonly RecordIdentifiers[],
+  options: { readonly type?: string; readonly includeFormer?: boolean },
 ): readonly IdentifierMatch[] {
   if (typeof query !== "string" || query.length > MAX_QUERY_LENGTH) return Object.freeze([]);
   const key = identifierKey(query);
@@ -1179,14 +1211,21 @@ function pairKey(item: { readonly type: string; readonly value: string }): strin
 // Helpers
 
 /**
- * The `mixed_organizations` issue when the (validated) record identifiers and
- * types name more than one organization, else undefined.
+ * The `mixed_organizations` issue when the record identifiers and types name
+ * more than one organization, or any of them names none (or can't be read),
+ * else undefined.
  */
 function mixedIssue(
   all: readonly RecordIdentifiers[],
   identifierTypes: readonly IdentifierType[],
 ): Issue | undefined {
-  return oneOrganization([...all, ...identifierTypes]) === "mixed"
+  let items: unknown[];
+  try {
+    items = [...all, ...identifierTypes];
+  } catch {
+    return mixedOrganizationsIssue([], "These identifiers and identifier types");
+  }
+  return oneOrganization(items) === "mixed"
     ? mixedOrganizationsIssue([], "These identifiers and identifier types")
     : undefined;
 }

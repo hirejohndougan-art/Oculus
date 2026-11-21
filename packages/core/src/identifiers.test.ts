@@ -22,6 +22,12 @@ import {
   newOrganizationId,
 } from "./index.js";
 
+/** The list from a Validated result; fails the test if it was refused. */
+function listed<T>(result: Validated<readonly T[]>): readonly T[] {
+  if (!result.ok) throw new Error(JSON.stringify(result.issues));
+  return result.value;
+}
+
 const ORG = newOrganizationId();
 
 const ACCESSION: IdentifierType = {
@@ -419,7 +425,9 @@ describe("uniqueness", () => {
       set(b, [["box_label", "x"]], [["accession_number", "2026.016"]]),
     ];
     expect(
-      findIdentifierConflicts({ type: "accession_number", value: "2026.015" }, c, all, TYPES),
+      listed(
+        findIdentifierConflicts({ type: "accession_number", value: "2026.015" }, c, all, TYPES),
+      ),
     ).toEqual([
       {
         recordId: a,
@@ -430,7 +438,9 @@ describe("uniqueness", () => {
       },
     ]);
     expect(
-      findIdentifierConflicts({ type: "accession_number", value: "2026.016" }, c, all, TYPES),
+      listed(
+        findIdentifierConflicts({ type: "accession_number", value: "2026.016" }, c, all, TYPES),
+      ),
     ).toEqual([
       {
         recordId: b,
@@ -442,13 +452,21 @@ describe("uniqueness", () => {
     ]);
     // The record itself, an unused value, a 'none' type and an unknown type: no clash.
     expect(
-      findIdentifierConflicts({ type: "accession_number", value: "2026.015" }, a, all, TYPES),
+      listed(
+        findIdentifierConflicts({ type: "accession_number", value: "2026.015" }, a, all, TYPES),
+      ),
     ).toEqual([]);
     expect(
-      findIdentifierConflicts({ type: "accession_number", value: "2026.017" }, c, all, TYPES),
+      listed(
+        findIdentifierConflicts({ type: "accession_number", value: "2026.017" }, c, all, TYPES),
+      ),
     ).toEqual([]);
-    expect(findIdentifierConflicts({ type: "box_label", value: "x" }, c, all, TYPES)).toEqual([]);
-    expect(findIdentifierConflicts({ type: "nope", value: "x" }, c, all, TYPES)).toEqual([]);
+    expect(
+      listed(findIdentifierConflicts({ type: "box_label", value: "x" }, c, all, TYPES)),
+    ).toEqual([]);
+    expect(listed(findIdentifierConflicts({ type: "nope", value: "x" }, c, all, TYPES))).toEqual(
+      [],
+    );
   });
 
   it("checkNewIdentifier explains every problem with a new identifier", () => {
@@ -512,36 +530,36 @@ describe("findByIdentifier", () => {
   ];
 
   it("finds current and former holders, current first", () => {
-    expect(findByIdentifier("DHS-0001", all)).toEqual([
+    expect(listed(findByIdentifier("DHS-0001", all))).toEqual([
       { recordId: a, type: "object_number", value: "DHS-0001", status: "current", primary: true },
       { recordId: b, type: "object_number", value: "DHS-0001", status: "former", primary: false },
     ]);
-    expect(findByIdentifier("77", all).map((m) => m.recordId)).toEqual([b]);
+    expect(listed(findByIdentifier("77", all)).map((m) => m.recordId)).toEqual([b]);
   });
 
   it("ignores case, spaces and lookalikes in the query", () => {
-    expect(findByIdentifier(" dhs \u2013 0002 ", all).map((m) => m.recordId)).toEqual([b]);
-    expect(findByIdentifier("ВОХ4", all).map((m) => m.value)).toEqual(["Box 4"]);
+    expect(listed(findByIdentifier(" dhs \u2013 0002 ", all)).map((m) => m.recordId)).toEqual([b]);
+    expect(listed(findByIdentifier("ВОХ4", all)).map((m) => m.value)).toEqual(["Box 4"]);
   });
 
   it("can be limited to one type, or to current identifiers", () => {
     expect(
-      findByIdentifier("DHS-0001", all, { includeFormer: false }).map((m) => m.recordId),
+      listed(findByIdentifier("DHS-0001", all, { includeFormer: false })).map((m) => m.recordId),
     ).toEqual([a]);
-    expect(findByIdentifier("Box 4", all, { type: "object_number" })).toEqual([]);
-    expect(findByIdentifier("Box 4", all, { type: "box_label" })).toHaveLength(1);
+    expect(listed(findByIdentifier("Box 4", all, { type: "object_number" }))).toEqual([]);
+    expect(listed(findByIdentifier("Box 4", all, { type: "box_label" }))).toHaveLength(1);
   });
 
   it("finds nothing for bad queries", () => {
-    expect(findByIdentifier("", all)).toEqual([]);
-    expect(findByIdentifier("   ", all)).toEqual([]);
-    expect(findByIdentifier(42, all)).toEqual([]);
-    expect(findByIdentifier("x".repeat(1001), all)).toEqual([]);
-    expect(findByIdentifier("DHS-9999", all)).toEqual([]);
+    expect(listed(findByIdentifier("", all))).toEqual([]);
+    expect(listed(findByIdentifier("   ", all))).toEqual([]);
+    expect(listed(findByIdentifier(42, all))).toEqual([]);
+    expect(listed(findByIdentifier("x".repeat(1001), all))).toEqual([]);
+    expect(listed(findByIdentifier("DHS-9999", all))).toEqual([]);
   });
 
   it("returns frozen results", () => {
-    const found = findByIdentifier("DHS-0001", all);
+    const found = listed(findByIdentifier("DHS-0001", all));
     expect(Object.isFrozen(found)).toBe(true);
     expect(Object.isFrozen(found[0])).toBe(true);
   });
@@ -664,7 +682,7 @@ describe("retireIdentifier", () => {
     ]);
     expect(Object.isFrozen(r.value)).toBe(true);
     expect(droppedIdentifiers(start, r.value)).toEqual([]);
-    expect(findByIdentifier("Box 4", [r.value])[0]?.status).toBe("former");
+    expect(listed(findByIdentifier("Box 4", [r.value]))[0]?.status).toBe("former");
   });
 
   it("won't pick a new primary silently", () => {

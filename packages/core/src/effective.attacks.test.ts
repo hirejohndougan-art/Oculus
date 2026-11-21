@@ -860,3 +860,26 @@ describe("one organization's records can't be read or mixed with another's (D-01
     expect(r.ok && r.value.fields.creator).toBe("SECRET other organization's creator");
   });
 });
+
+describe("another organization's invalid record still refuses the set (review of T-019)", () => {
+  it("counts every entry's organization, valid or not", () => {
+    const fonds = unit("Fonds", "fonds", undefined, { note: "Own note" });
+    const item = unit("Item", "item", fonds);
+    // Invalid (no title) but plainly another organization's.
+    const broken = {
+      ...unit("x", "fonds", undefined, { note: "SECRET" }),
+      title: "",
+      organizationId: newOrganizationId(),
+    };
+    for (const set of [
+      [item, fonds, broken],
+      [broken, item, fonds],
+    ]) {
+      const index = indexRecords(set);
+      expect(index.ok ? undefined : index.issues[0]?.code).toBe("mixed_organizations");
+      expect(codeOf(effectiveRecord(item.id, set as CatalogRecord[], () => PUBLIC_NOTE))).toBe(
+        "mixed_organizations",
+      );
+    }
+  });
+});

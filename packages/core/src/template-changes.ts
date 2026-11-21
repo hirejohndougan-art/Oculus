@@ -65,6 +65,7 @@
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import { shown, type JsonValue } from "./plain-data.js";
 import { validateRecord, type CatalogRecord, type RecordKind } from "./records.js";
+import { mixedOrganizationsIssue } from "./organizations.js";
 import type { RecordId } from "./record-id.js";
 import {
   MAX_LONG_TEXT_LENGTH,
@@ -616,6 +617,12 @@ function readRecords(input: unknown): Validated<readonly CatalogRecord[]> {
           ),
         ],
       };
+    }
+    // One organization's records only (D-019, D-0XX): a list that mixes in
+    // another organization's records is refused, never filtered.
+    const first = out[0];
+    if (first !== undefined && first.organizationId !== checked.value.organizationId) {
+      return { ok: false, issues: [mixedOrganizationsIssue(["records", i], "The records")] };
     }
     if (seen.has(checked.value.id)) {
       return {

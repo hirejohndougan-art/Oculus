@@ -302,3 +302,20 @@ describe("records must follow the template being changed", () => {
     expect(ok(templateChanges(DACS_ARCHIVAL_UNIT_PRESET, makePublic)).legacyRecords).toBe(0);
   });
 });
+
+describe("another organization's records can't be mixed into the check (D-019)", () => {
+  it("refuses a list holding another organization's record, wherever it is", () => {
+    const other = { ...unit(B, { notes: SECRET }), organizationId: newOrganizationId() };
+    const before = dacs((f) => f);
+    const after = dacs((f) => ({ ...f, visibility: "public" }));
+    for (const records of [
+      [unit(A, {}), other],
+      [other, unit(A, {})],
+    ]) {
+      const r = templateChanges(before, after, records);
+      expect(codes(r)).toEqual(["mixed_organizations"]);
+      expect(JSON.stringify(r)).not.toContain(SECRET);
+      expect(JSON.stringify(r)).not.toContain(B);
+    }
+  });
+});

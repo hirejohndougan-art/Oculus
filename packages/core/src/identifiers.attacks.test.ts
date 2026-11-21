@@ -20,6 +20,12 @@ import {
   newOrganizationId,
 } from "./index.js";
 
+/** The list from a Validated result; fails the test if it was refused. */
+function listed<T>(result: Validated<readonly T[]>): readonly T[] {
+  if (!result.ok) throw new Error(JSON.stringify(result.issues));
+  return result.value;
+}
+
 const ORG = newOrganizationId();
 
 const BOX: IdentifierType = {
@@ -272,7 +278,9 @@ describe("lookalike identifiers can't both be held (S-003)", () => {
       const odd = holding(`A${blank}\u0301-1`);
       expect(uniquenessIssues([odd, holding("Á-1")], TYPES)).toHaveLength(2);
       expect(
-        findIdentifierConflicts({ type: "box_label", value: "Á-1" }, newRecordId(), [odd], TYPES),
+        listed(
+          findIdentifierConflicts({ type: "box_label", value: "Á-1" }, newRecordId(), [odd], TYPES),
+        ),
       ).toHaveLength(1);
     },
   );
@@ -287,13 +295,15 @@ describe("lookalike identifiers can't both be held (S-003)", () => {
     const shortRuns = ("a" + "\u0323\u0301".repeat(4)).repeat(100); // runs of 8: allowed
     const started = performance.now();
     expect(
-      findIdentifierConflicts({ type: "box_label", value: longRun }, newRecordId(), [], TYPES),
+      listed(
+        findIdentifierConflicts({ type: "box_label", value: longRun }, newRecordId(), [], TYPES),
+      ),
     ).toEqual([]);
     const stored = Array.from({ length: 500 }, () => holding(shortRuns));
     expect(uniquenessIssues([...stored, holding(longRun), holding(longRun)], TYPES).length).toBe(
       201,
     );
-    expect(findByIdentifier(longRun.slice(0, 900), [holding(longRun)])).toEqual([]);
+    expect(listed(findByIdentifier(longRun.slice(0, 900), [holding(longRun)]))).toEqual([]);
     expect(performance.now() - started).toBeLessThan(1500);
   });
 });
@@ -325,8 +335,8 @@ describe("equivalent spellings with many marks take the same path (second review
       "not_unique",
       "not_unique",
     ]);
-    expect(findByIdentifier(b, [x])).toHaveLength(1);
-    expect(findByIdentifier(a, [y])).toHaveLength(1);
+    expect(listed(findByIdentifier(b, [x]))).toHaveLength(1);
+    expect(listed(findByIdentifier(a, [y]))).toHaveLength(1);
     // One record holding both: a duplicate within the record, or refused.
     const both = {
       recordId: newRecordId(),
@@ -432,7 +442,7 @@ describe("size limits", () => {
     const found = uniquenessIssues(all, TYPES);
     expect(found).toHaveLength(201); // 200 issues, then "too_many_issues"
     expect(found[200]?.code).toBe("too_many_issues");
-    expect(findByIdentifier("b-9999", all)).toHaveLength(2);
+    expect(listed(findByIdentifier("b-9999", all))).toHaveLength(2);
     expect(nextIdentifier(auto, all)).toEqual({ ok: true, value: "B-10000" });
     expect(performance.now() - started).toBeLessThan(3000);
   });
@@ -440,7 +450,7 @@ describe("size limits", () => {
   it("a query is capped before it is normalized", () => {
     // U+FDFA expands to 18 characters under NFKC.
     const started = performance.now();
-    expect(findByIdentifier("\ufdfa".repeat(1_000_000), [])).toEqual([]);
+    expect(listed(findByIdentifier("\ufdfa".repeat(1_000_000), []))).toEqual([]);
     expect(performance.now() - started).toBeLessThan(100);
   });
 });
@@ -543,5 +553,107 @@ describe("one organization's numbers can't be read or mixed with another's (D-01
   it("retireIdentifier keeps the record's organization", () => {
     const r = retireIdentifier(ownSet, { type: "box_label", value: "DPL1" });
     expect(r.ok && r.value.organizationId).toBe(ORG);
+  });
+});
+
+describe("entries that don't say their organization can't slip past the check (review of T-019)", () => {
+  const theirs = newRecordId();
+  // Another organization's set with its organizationId left out, or forged.
+  const base = {
+    recordId: theirs,
+    current: [{ type: "box_label", value: "DPL9", primary: true }],
+    former: [{ type: "box_label", value: "DPL1" }],
+  };
+  const unowned = base as unknown as RecordIdentifiers;
+  const forged = { ...base, organizationId: "other" } as unknown as RecordIdentifiers;
+  const behindGetter = Object.defineProperty({ ...base }, "organizationId", {
+    get: () => ORG,
+    enumerable: true,
+  }) as unknown as RecordIdentifiers;
+  const own: RecordIdentifiers = {
+    recordId: newRecordId(),
+    organizationId: ORG,
+    current: [],
+    former: [],
+  };
+  const auto: IdentifierType = {
+    ...BOX,
+    autoNumber: { style: "prefix", prefix: "DPL", digits: 1 },
+  };
+
+  it.each([
+    ["missing", [unowned]],
+    ["missing, after an own set", [own, unowned]],
+    ["forged", [forged, own]],
+    ["behind a getter", [behindGetter]],
+  ])("refuses a set whose organizationId is %s", (_, all) => {
+    const fresh = newRecordId();
+    const results: unknown[] = [
+      uniquenessIssues(all, TYPES),
+      checkNewIdentifier({ type: "box_label", value: "DPL1" }, fresh, all, TYPES),
+      nextIdentifier(auto, all),
+      findIdentifierConflicts({ type: "box_label", value: "DPL9" }, fresh, all, TYPES),
+      findByIdentifier("DPL9", all),
+    ];
+    for (const r of results) {
+      const issues = Array.isArray(r) ? r : (r as { issues?: unknown }).issues;
+      expect((issues as { code: string }[]).map((i) => i.code)).toEqual(["mixed_organizations"]);
+      expect(JSON.stringify(r)).not.toContain(theirs);
+      expect(JSON.stringify(r)).not.toContain("DPL10");
+    }
+  });
+
+  it("an identifier type with no organization is refused too", () => {
+    const typeless = {
+      key: BOX.key,
+      label: BOX.label,
+      uniqueness: BOX.uniqueness,
+    } as unknown as IdentifierType;
+    expect(codes(validateRecordIdentifiers(own, [typeless]))).toEqual(["mixed_organizations"]);
+    expect(uniquenessIssues([own], [typeless]).map((i) => i.code)).toEqual(["mixed_organizations"]);
+  });
+});
+
+describe("the searches refuse a mixed set instead of returning another organization's holders", () => {
+  const OTHER = newOrganizationId();
+  const theirs = newRecordId();
+  const mine: RecordIdentifiers = {
+    recordId: newRecordId(),
+    organizationId: ORG,
+    current: [{ type: "box_label", value: "B-1", primary: true }],
+    former: [],
+  };
+  const other: RecordIdentifiers = {
+    recordId: theirs,
+    organizationId: OTHER,
+    current: [{ type: "box_label", value: "B-1", primary: true }],
+    former: [{ type: "box_label", value: "B-2" }],
+  };
+
+  it("findByIdentifier", () => {
+    expect(codes(findByIdentifier("B-1", [mine, other]))).toEqual(["mixed_organizations"]);
+    expect(JSON.stringify(findByIdentifier("B-2", [other, mine]))).not.toContain(theirs);
+    expect(listed(findByIdentifier("B-1", [mine]))).toHaveLength(1);
+  });
+
+  it("findIdentifierConflicts", () => {
+    const r = findIdentifierConflicts(
+      { type: "box_label", value: "B-1" },
+      newRecordId(),
+      [mine, other],
+      TYPES,
+    );
+    expect(codes(r)).toEqual(["mixed_organizations"]);
+    expect(JSON.stringify(r)).not.toContain(theirs);
+    expect(
+      codes(
+        findIdentifierConflicts(
+          { type: "box_label", value: "B-1" },
+          newRecordId(),
+          [mine],
+          [{ ...BOX, organizationId: OTHER }],
+        ),
+      ),
+    ).toEqual(["mixed_organizations"]);
   });
 });

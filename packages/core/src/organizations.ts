@@ -185,26 +185,54 @@ function knownOrganization(id: OrganizationId, organizations: unknown): boolean 
 
 /**
  * The one organization every item names, `undefined` for no items, or
- * `"mixed"` when two items name different organizations. Items are already
- * validated, so `organizationId` is a plain property.
+ * `"mixed"` when two items name different organizations **or any item
+ * doesn't name a valid one** (missing, not an organization ID, behind a
+ * getter or a Proxy), at any position: an item that doesn't say which
+ * organization it belongs to could be another organization's. Each
+ * `organizationId` is read as a plain own data property, so no getter runs.
+ * Never throws: a list that can't be walked counts as `"mixed"`.
  */
-export function oneOrganization(
-  items: Iterable<{ readonly organizationId: OrganizationId }>,
-): OrganizationId | "mixed" | undefined {
-  let found: OrganizationId | undefined;
-  for (const item of items) {
-    if (found === undefined) found = item.organizationId;
-    else if (item.organizationId !== found) return "mixed";
+export function oneOrganization(items: Iterable<unknown>): OrganizationId | "mixed" | undefined {
+  try {
+    let found: OrganizationId | undefined;
+    for (const item of items) {
+      const owner = organizationIdOf(item);
+      if (owner === undefined) return "mixed";
+      if (found === undefined) found = owner;
+      else if (owner !== found) return "mixed";
+    }
+    return found;
+  } catch {
+    return "mixed";
   }
-  return found;
 }
 
-/** The issue a function gives when it is handed data from more than one organization. */
+/**
+ * An item's own `organizationId`, read as a plain data property, or
+ * undefined when it is missing, not an organization ID, a getter, or the
+ * item isn't a readable object. Never throws.
+ */
+export function organizationIdOf(item: unknown): OrganizationId | undefined {
+  try {
+    if (typeof item !== "object" || item === null || types.isProxy(item)) return undefined;
+    const slot = Object.getOwnPropertyDescriptor(item, "organizationId");
+    if (slot === undefined || !("value" in slot)) return undefined;
+    const owner: unknown = slot.value;
+    return isOrganizationId(owner) ? owner : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The issue a function gives when it is handed data from more than one
+ * organization, or data that doesn't say which organization it belongs to.
+ */
 export function mixedOrganizationsIssue(path: readonly (string | number)[], what: string): Issue {
   return issue(
     path,
     "mixed_organizations",
-    `${what} belong to more than one organization. Each organization is kept completely separate, so they can't be used together.`,
+    `${what} belong to more than one organization, or don't all say which one they belong to. Each organization is kept completely separate, so they can't be used together.`,
   );
 }
 

@@ -10,7 +10,14 @@ import {
   type ArchivalUnitRecord,
   type RecordId,
   newOrganizationId,
+  type Validated,
 } from "./index.js";
+
+/** The list from a Validated result; fails the test if it was refused. */
+function listed<T>(result: Validated<readonly T[]>): readonly T[] {
+  if (!result.ok) throw new Error(JSON.stringify(result.issues));
+  return result.value;
+}
 
 const ORG = newOrganizationId();
 
@@ -217,13 +224,13 @@ describe("unfiledUnits", () => {
     const a: ArchivalUnitRecord = { ...unit("A", "series", undefined, aId), parentId: bId };
     const b: ArchivalUnitRecord = { ...unit("B", "series", undefined, bId), parentId: aId };
     const hanger = unit("Hanger", "item", a);
-    expect(unfiledUnits([a, b, hanger]).map((u) => u.title)).toEqual(["A", "B"]);
+    expect(listed(unfiledUnits([a, b, hanger])).map((u) => u.title)).toEqual(["A", "B"]);
   });
 
   it("includes duplicated units and units filed under a duplicated ID", () => {
     const x = unit("X", "fonds");
     const c = unit("C", "series", x);
-    expect(unfiledUnits([x, { ...x }, c]).map((u) => u.title)).toEqual(["X", "X", "C"]);
+    expect(listed(unfiledUnits([x, { ...x }, c])).map((u) => u.title)).toEqual(["X", "X", "C"]);
   });
 
   it("doesn't throw when reporting a unit whose title isn't text", () => {
@@ -236,7 +243,7 @@ describe("unfiledUnits", () => {
 
   it("includes units whose parent isn't in the set, so they aren't lost", () => {
     const lost = unit("Lost", "item", unit("Gone", "fonds"));
-    expect(unfiledUnits([lost]).map((u) => u.title)).toEqual(["Lost"]);
+    expect(listed(unfiledUnits([lost])).map((u) => u.title)).toEqual(["Lost"]);
   });
 
   it("lists units with no parent except fonds and collections", () => {
@@ -245,7 +252,7 @@ describe("unfiledUnits", () => {
     const loose = unit("Loose item", "item");
     const looseSeries = unit("Loose series", "series");
     const filed = unit("Filed", "item", f);
-    expect(unfiledUnits([f, c, loose, looseSeries, filed]).map((u) => u.title)).toEqual([
+    expect(listed(unfiledUnits([f, c, loose, looseSeries, filed])).map((u) => u.title)).toEqual([
       "Loose item",
       "Loose series",
     ]);

@@ -11,9 +11,13 @@
  * - A unit with no parent is either a top-level fonds or collection, or a unit
  *   that hasn't been filed yet (the "Needs Sorting" list). Neither is an error.
  * - Items hold nothing.
+ * - One organization at a time (D-019, D-0XX): `validateArrangement` and
+ *   `unfiledUnits` refuse a set holding units of more than one organization,
+ *   or a unit that doesn't say which (`mixed_organizations`).
  */
 import type { ArchivalLevel, ArchivalUnitRecord } from "./records.js";
-import type { Issue } from "./issues.js";
+import type { Issue, Validated } from "./issues.js";
+import { mixedOrganizationsIssue, oneOrganization } from "./organizations.js";
 import { IssueList, shown } from "./plain-data.js";
 import type { RecordId } from "./record-id.js";
 
@@ -43,9 +47,13 @@ export function canFileUnder(child: ArchivalLevel, parent: ArchivalLevel): boole
  * don't exist, levels filed under the wrong level, loops, and trees deeper
  * than MAX_ARRANGEMENT_DEPTH. Units with no parent are fine. Runs in time
  * proportional to the number of units, whatever their shape, and stops after
- * a few hundred problems.
+ * a few hundred problems. Units of more than one organization are refused
+ * with the one issue `mixed_organizations`.
  */
 export function validateArrangement(units: readonly ArchivalUnitRecord[]): Issue[] {
+  if (oneOrganization(units) === "mixed") {
+    return [mixedOrganizationsIssue([], "These units")];
+  }
   const issues = new IssueList();
 
   // Units whose ID appears more than once can't be placed reliably: report
@@ -161,8 +169,21 @@ export function validateArrangement(units: readonly ArchivalUnitRecord[]): Issue
  * - units whose parent isn't in the set
  * - units that share an ID with another unit, or are filed under such an ID
  * - units in a loop (the units hanging under a loop are reached through it)
+ *
+ * Fails with `mixed_organizations` when the units belong to more than one
+ * organization, or any doesn't say which (D-0XX), so another organization's
+ * units are never listed. That is why it returns a `Validated` list.
  */
-export function unfiledUnits(units: readonly ArchivalUnitRecord[]): ArchivalUnitRecord[] {
+export function unfiledUnits(
+  units: readonly ArchivalUnitRecord[],
+): Validated<readonly ArchivalUnitRecord[]> {
+  if (oneOrganization(units) === "mixed") {
+    return { ok: false, issues: [mixedOrganizationsIssue([], "These units")] };
+  }
+  return { ok: true, value: Object.freeze(unfiled(units)) };
+}
+
+function unfiled(units: readonly ArchivalUnitRecord[]): ArchivalUnitRecord[] {
   const count = new Map<RecordId, number>();
   for (const unit of units) count.set(unit.id, (count.get(unit.id) ?? 0) + 1);
   const byId = new Map<RecordId, ArchivalUnitRecord>();

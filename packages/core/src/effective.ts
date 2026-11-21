@@ -48,8 +48,9 @@
  * deeper than MAX_ARRANGEMENT_DEPTH makes the whole result fail, because a
  * record whose ancestors can't be trusted can't be published safely.
  *
- * **One organization per set** (D-019, D-0XX). A set holding valid records
- * of more than one organization is refused whole (`mixed_organizations`),
+ * **One organization per set** (D-019, D-0XX). A set holding records of
+ * more than one organization (valid or not, whenever their organizationId
+ * can be read) is refused whole (`mixed_organizations`),
  * so a record can never inherit from, or be published with, another
  * organization's units.
  *
@@ -86,7 +87,7 @@ import { publicIdentifierTypesOf } from "./field-checkers.js";
 import { types } from "node:util";
 import { MAX_ARRANGEMENT_DEPTH, canFileUnder } from "./arrangement.js";
 import { isRecordId, type RecordId } from "./record-id.js";
-import { mixedOrganizationsIssue, type OrganizationId } from "./organizations.js";
+import { mixedOrganizationsIssue, organizationIdOf, type OrganizationId } from "./organizations.js";
 import {
   validateRecord,
   type ArchivalLevel,
@@ -241,8 +242,9 @@ const LOOKUPS = new WeakMap<object, LookupState>();
  * as invalid under the ID it carries. An entry with no ID that can be read
  * as plain data (a hole, a getter, a Proxy, not a record) fails the whole
  * index, since it could hide a duplicate. IDs used more than once are
- * remembered, and using one fails. Valid records of more than one
- * organization fail the whole index (`mixed_organizations`). Never throws.
+ * remembered, and using one fails. Entries of more than one organization
+ * (valid or not, whenever their organizationId can be read) fail the whole
+ * index (`mixed_organizations`). Never throws.
  */
 export function indexRecords(records: unknown): Validated<RecordLookup> {
   try {
@@ -284,11 +286,12 @@ function buildLookup(records: unknown): RecordLookup {
     // Every organization is kept completely separate (D-019): a set holding
     // records of two organizations is refused whole, never filtered, so a
     // query that forgot its organization filter fails instead of reading
-    // across (D-0XX).
-    if (checked.ok) {
-      const owner = checked.value.organizationId;
-      if (organization === undefined) organization = owner;
-      else if (owner !== organization) {
+    // across (D-0XX). Every entry counts, valid or not, whenever its
+    // organizationId can be read.
+    const owner = checked.ok ? checked.value.organizationId : organizationIdOf(record);
+    if (owner !== undefined) {
+      organization ??= owner;
+      if (owner !== organization) {
         const mixed = mixedOrganizationsIssue([i], "The records in the set");
         fail(mixed.path, mixed.code, mixed.message);
       }
