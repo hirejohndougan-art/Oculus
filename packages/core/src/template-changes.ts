@@ -26,6 +26,14 @@
  *   a field stops repeating, `recordsWithSeveralValues` lists the records
  *   that can't be converted without dropping values.
  * - `option_removed`: a list option is gone (`option` names it).
+ * - `max_length_lowered`: `maxLength` drops below some stored values.
+ * - `vocabulary_removed`, `identifier_type_removed`: `vocabularies` or
+ *   `identifierTypes` narrows (`removedCodes` names the codes dropped; a
+ *   list where there was none narrows from "any"); `recordIds` are the
+ *   records with a value the new list doesn't allow. A term with no
+ *   vocabulary counts as `local`.
+ * - `made_required`: `required` turns on; `recordIds` are the records
+ *   without a value.
  * - `inherited_changed`: needs confirmation when a field starts being
  *   inherited, since lower levels then take values from above.
  * - `made_staff`: informational.
@@ -36,7 +44,9 @@
  * such changes always need confirmation instead.
  *
  * When `records` (the records that use the template) are given, each change
- * lists the IDs of the records holding a value for its key. Without them,
+ * lists the IDs of the records holding a value for its key (or, for the
+ * codes above that say so, the records the change strands). An empty list
+ * means "there are no records": pass nothing when they are unknown. Without them,
  * left-over keys can't be seen, so `recordsChecked` is false and every change
  * that could affect records needs confirmation. Callers saving a template
  * should pass the records.
@@ -47,11 +57,17 @@
  * `validateRecord`); any doubt refuses the whole comparison with issues. The
  * work is linear in the records times the keys that changed. Never throws.
  */
-import { issue, type Issue, type Validated } from "./issues.js";
+import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import { shown, type JsonValue } from "./plain-data.js";
 import { validateRecord, type CatalogRecord, type RecordKind } from "./records.js";
 import type { RecordId } from "./record-id.js";
-import { validateTemplate, type FieldDefinition, type FieldTemplate } from "./templates.js";
+import {
+  MAX_LONG_TEXT_LENGTH,
+  MAX_TEXT_LENGTH,
+  validateTemplate,
+  type FieldDefinition,
+  type FieldTemplate,
+} from "./templates.js";
 import { MAX_RECORD_SET } from "./effective.js";
 import { types } from "node:util";
 
@@ -63,6 +79,10 @@ export const TEMPLATE_CHANGE_CODES = [
   "kind_changed",
   "repeatable_changed",
   "option_removed",
+  "max_length_lowered",
+  "vocabulary_removed",
+  "identifier_type_removed",
+  "made_required",
   "inherited_changed",
   "made_staff",
 ] as const;
@@ -80,8 +100,12 @@ export interface TemplateChange {
   /** Plain English; names the key and counts, never a stored value. */
   readonly message: string;
   /**
-   * Records holding a value for `key` (for `option_removed`, using `option`;
-   * for `kind_added`, the records of that kind given). At most
+   * Records holding a value for `key`. For `option_removed`, those using
+   * `option`; for `max_length_lowered`, `vocabulary_removed` and
+   * `identifier_type_removed`, those holding a value the new field refuses;
+   * for `made_required`, those without a value. For `kind_added`, the given
+   * records of that kind, usually none yet, since they used another
+   * template: the change is reported whatever the count. At most
    * `MAX_LISTED_RECORDS`.
    */
   readonly recordIds: readonly RecordId[];
@@ -89,6 +113,8 @@ export interface TemplateChange {
   readonly recordCount: number;
   /** `option_removed` only: the option value the template dropped. */
   readonly option?: string;
+  /** `vocabulary_removed` and `identifier_type_removed` only: the codes dropped (empty when narrowing from any). */
+  readonly removedCodes?: readonly string[];
   /** `repeatable_changed` from true to false only: records holding more than one value. */
   readonly recordsWithSeveralValues?: readonly RecordId[];
 }
@@ -176,6 +202,7 @@ function compare(
         if (!kept.has(o.value)) found.push({ code: "option_removed", key, option: o.value });
       }
     }
+    if (was.kind === now.kind) found.push(...stranding(key, was, now));
     if (was.inherited !== now.inherited) {
       found.push({ code: "inherited_changed", key, nowInherited: now.inherited });
     }
@@ -233,6 +260,68 @@ interface Found {
   readonly nowInherited?: boolean;
   /** kind_added: the new template has a public field. */
   readonly hasPublic?: boolean;
+  /** True for one stored value the changed field no longer accepts. */
+  readonly refuses?: (item: JsonValue) => boolean;
+  /** made_required: the affected records are those without a value. */
+  readonly missing?: boolean;
+  readonly removedCodes?: readonly string[];
+}
+
+/** Changes to a field of the same kind that leave stored values or records not fitting it. */
+function stranding(key: string, was: FieldDefinition, now: FieldDefinition): Found[] {
+  const out: Found[] = [];
+  if (now.kind === "text" || now.kind === "long_text") {
+    const cap = now.kind === "text" ? MAX_TEXT_LENGTH : MAX_LONG_TEXT_LENGTH;
+    const max = now.maxLength ?? cap;
+    if (max < (was.maxLength ?? cap)) {
+      out.push({
+        code: "max_length_lowered",
+        key,
+        refuses: (item) => typeof item === "string" && item.length > max,
+      });
+    }
+  }
+  if (now.kind === "controlled_term") {
+    const f = narrowing("vocabulary_removed", key, was.vocabularies, now.vocabularies, (item) =>
+      isPlainObject(item) && typeof item.vocabulary === "string" ? item.vocabulary : "local",
+    );
+    if (f !== undefined) out.push(f);
+  }
+  if (now.kind === "identifier") {
+    const f = narrowing(
+      "identifier_type_removed",
+      key,
+      was.identifierTypes,
+      now.identifierTypes,
+      (item) => (isPlainObject(item) && typeof item.type === "string" ? item.type : undefined),
+    );
+    if (f !== undefined) out.push(f);
+  }
+  if (!was.required && now.required) out.push({ code: "made_required", key, missing: true });
+  return out;
+}
+
+/** A change when `now` allows fewer codes than `was` (undefined allows any). */
+function narrowing(
+  code: TemplateChangeCode,
+  key: string,
+  was: readonly string[] | undefined,
+  now: readonly string[] | undefined,
+  codeOf: (item: JsonValue) => string | undefined,
+): Found | undefined {
+  if (now === undefined) return undefined;
+  const allowed = new Set(now);
+  const removed = was === undefined ? [] : was.filter((c) => !allowed.has(c));
+  if (was !== undefined && removed.length === 0) return undefined;
+  return {
+    code,
+    key,
+    removedCodes: Object.freeze(removed),
+    refuses: (item) => {
+      const c = codeOf(item);
+      return c !== undefined && !allowed.has(c);
+    },
+  };
 }
 
 /** Records found for one key or one option. */
@@ -254,6 +343,8 @@ interface Usage {
   readonly several: ReadonlyMap<string, Held>;
   /** Records of each record kind `appliesTo` gained. */
   readonly byKind: ReadonlyMap<string, Held>;
+  /** Records a stranding change affects, by change. */
+  readonly byFound: ReadonlyMap<Found, Held>;
 }
 
 /** One pass over the records, looking only at the keys that changed or are new. */
@@ -283,8 +374,26 @@ function scan(
   for (const now of added) byKey.set(now.key, new Held());
 
   const keys = [...byKey];
+  const byFound = new Map<Found, Held>();
+  for (const f of found)
+    if (f.refuses !== undefined || f.missing === true) byFound.set(f, new Held());
+  const tests = [...byFound];
   for (const record of records) {
     byKind.get(record.kind)?.add(record.id);
+    for (const [f, held] of tests) {
+      const has = Object.hasOwn(record.fields, f.key);
+      if (f.missing === true) {
+        if (!has) held.add(record.id);
+        continue;
+      }
+      if (!has || f.refuses === undefined) continue;
+      const value = record.fields[f.key];
+      if (value === undefined) continue;
+      const list: readonly JsonValue[] = Array.isArray(value)
+        ? (value as readonly JsonValue[])
+        : [value];
+      if (list.some(f.refuses)) held.add(record.id);
+    }
     for (const [key, held] of keys) {
       if (!Object.hasOwn(record.fields, key)) continue;
       const value: JsonValue | undefined = record.fields[key];
@@ -304,7 +413,7 @@ function scan(
       }
     }
   }
-  return { byKey, byOption, several, byKind };
+  return { byKey, byOption, several, byKind, byFound };
 }
 
 function finish(f: Found, usage: Usage | undefined): TemplateChange {
@@ -315,7 +424,7 @@ function finish(f: Found, usage: Usage | undefined): TemplateChange {
         ? usage.byOption.get(f.key)?.get(f.option)
         : f.code === "kind_added"
           ? usage.byKind.get(f.key)
-          : usage.byKey.get(f.key);
+          : (usage.byFound.get(f) ?? usage.byKey.get(f.key));
   const count = held?.count ?? 0;
   const affected = usage === undefined || count > 0;
   let needsConfirmation: boolean;
@@ -348,6 +457,7 @@ function finish(f: Found, usage: Usage | undefined): TemplateChange {
     recordIds: Object.freeze([...(held?.ids ?? [])]),
     recordCount: count,
     ...(f.option === undefined ? {} : { option: f.option }),
+    ...(f.removedCodes === undefined ? {} : { removedCodes: f.removedCodes }),
     ...(f.toSingle === true && usage !== undefined
       ? { recordsWithSeveralValues: Object.freeze([...(several?.ids ?? [])]) }
       : {}),
@@ -399,6 +509,14 @@ function message(f: Found, count: number | undefined, several: number): string {
             ? "No record uses it."
             : `${records(count)} use it.`
       }`;
+    case "max_length_lowered":
+      return `The field ${key} gets a lower length limit. ${stranded(count, "hold a value longer than the new limit")}`;
+    case "vocabulary_removed":
+      return `The field ${key} allows fewer vocabularies. ${stranded(count, "hold a term the field no longer allows")}`;
+    case "identifier_type_removed":
+      return `The field ${key} allows fewer identifier types. ${stranded(count, "hold an identifier of a type the field no longer allows")}`;
+    case "made_required":
+      return `The field ${key} becomes required. ${stranded(count, "have no value for it")}`;
     case "inherited_changed":
       return f.nowInherited === true
         ? `The field ${key} is now inherited, so lower levels, including ones using other templates, take its value from above. Confirm first.`
@@ -406,6 +524,12 @@ function message(f: Found, count: number | undefined, several: number): string {
     case "made_staff":
       return `The field ${key} changes from public to staff, so it will no longer be published.`;
   }
+}
+
+function stranded(count: number | undefined, what: string): string {
+  if (count === undefined) return "Records weren't checked, so any record may be affected.";
+  if (count === 0) return "No record is affected.";
+  return `${records(count)} ${what}, and would no longer pass the template check.`;
 }
 
 function records(count: number): string {

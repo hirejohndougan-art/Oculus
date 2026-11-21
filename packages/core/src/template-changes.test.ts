@@ -181,6 +181,65 @@ describe("templateChanges", () => {
     expect(r.changes[1]?.message).toContain("weren't checked");
   });
 
+  it("reports a lower maxLength with the records holding longer values", () => {
+    const r = run(template(field()), template(field({ maxLength: 3 })), [
+      record(A, { note: "abcd" }),
+      record(B, { note: "abc" }),
+    ]);
+    expect(summary(r.changes)).toEqual([["max_length_lowered", "note", true]]);
+    expect(r.changes[0]?.recordIds).toEqual([A]);
+    const none = run(template(field()), template(field({ maxLength: 3 })), [
+      record(B, { note: "a" }),
+    ]);
+    expect(summary(none.changes)).toEqual([["max_length_lowered", "note", false]]);
+    expect(summary(run(template(field({ maxLength: 3 })), template(field())).changes)).toEqual([]);
+  });
+
+  it("reports a dropped vocabulary with the records using it, local terms included", () => {
+    const term = (extra: Record<string, unknown>) =>
+      field({ key: "subject", kind: "controlled_term", repeatable: true, ...extra });
+    const r = run(
+      template(term({ vocabularies: ["lcsh", "local"] })),
+      template(term({ vocabularies: ["lcsh"] })),
+      [
+        record(A, { subject: [{ label: "Ships", vocabulary: "lcsh" }] }),
+        record(B, { subject: [{ label: "Ships" }] }),
+      ],
+    );
+    expect(r.changes.map((c) => [c.code, c.removedCodes, c.recordIds])).toEqual([
+      ["vocabulary_removed", ["local"], [B]],
+    ]);
+    const fromAny = run(template(term({})), template(term({ vocabularies: ["lcsh"] })), [
+      record(B, { subject: [{ label: "Ships" }] }),
+    ]);
+    expect(fromAny.changes.map((c) => [c.code, c.removedCodes, c.recordIds])).toEqual([
+      ["vocabulary_removed", [], [B]],
+    ]);
+  });
+
+  it("reports a dropped identifier type with the records using it", () => {
+    const id = (types?: string[]) =>
+      field({ key: "ref", kind: "identifier", ...(types ? { identifierTypes: types } : {}) });
+    const r = run(template(id(["accession", "call-number"])), template(id(["accession"])), [
+      record(A, { ref: { type: "call-number", value: "1" } }),
+      record(B, { ref: { type: "accession", value: "2" } }),
+    ]);
+    expect(r.changes.map((c) => [c.code, c.removedCodes, c.recordIds])).toEqual([
+      ["identifier_type_removed", ["call-number"], [A]],
+    ]);
+  });
+
+  it("reports a field made required with the records lacking it", () => {
+    const r = run(template(field()), template(field({ required: true })), [
+      record(A, { note: "x" }),
+      record(B, {}),
+    ]);
+    expect(summary(r.changes)).toEqual([["made_required", "note", true]]);
+    expect(r.changes[0]?.recordIds).toEqual([B]);
+    const unknown = run(template(field()), template(field({ required: true })));
+    expect(summary(unknown.changes)).toEqual([["made_required", "note", true]]);
+  });
+
   it("refuses two different templates", () => {
     const result = templateChanges(template(field()), { ...template(field()), key: "other" });
     expect(result.ok ? [] : result.issues.map((i) => i.code)).toEqual(["different_template"]);
