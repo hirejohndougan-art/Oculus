@@ -657,3 +657,65 @@ describe("the searches refuse a mixed set instead of returning another organizat
     ).toEqual(["mixed_organizations"]);
   });
 });
+
+describe("the set functions read their input once (second review of T-019)", () => {
+  const theirs = newRecordId();
+  const own: RecordIdentifiers = {
+    recordId: newRecordId(),
+    organizationId: ORG,
+    current: [{ type: "box_label", value: "B-1", primary: true }],
+    former: [],
+  };
+  const otherSet: RecordIdentifiers = {
+    recordId: theirs,
+    organizationId: newOrganizationId(),
+    current: [{ type: "box_label", value: "B-1", primary: true }],
+    former: [],
+  };
+
+  it("an iterator that yields another organization's set the second time is not walked", () => {
+    let walks = 0;
+    const tricky = [own];
+    Object.defineProperty(tricky, Symbol.iterator, {
+      value: function* () {
+        walks += 1;
+        yield walks === 1 ? own : otherSet;
+      },
+    });
+    const r = findByIdentifier("B-1", tricky);
+    expect(JSON.stringify(r)).not.toContain(theirs);
+    expect(JSON.stringify(uniquenessIssues(tricky, TYPES))).not.toContain(theirs);
+  });
+
+  it("a current list behind a getter is refused, not read", () => {
+    let reads = 0;
+    const sneaky: RecordIdentifiers = Object.defineProperty({ ...own }, "current", {
+      get: () => (reads++ === 0 ? own.current : otherSet.current),
+      enumerable: true,
+    });
+    const r = findByIdentifier("B-1", [sneaky]);
+    expect(r.ok).toBe(false);
+    expect(reads).toBe(0);
+  });
+
+  it("a Proxy list is refused", () => {
+    const proxy = new Proxy([own], {});
+    expect(codes(findByIdentifier("B-1", proxy))).toEqual(["not_a_list"]);
+    expect(
+      codes(
+        findIdentifierConflicts({ type: "box_label", value: "B-1" }, newRecordId(), proxy, TYPES),
+      ),
+    ).toEqual(["not_a_list"]);
+    expect(uniquenessIssues(proxy, TYPES).map((i) => i.code)).toEqual(["not_a_list"]);
+    expect(
+      checkNewIdentifier({ type: "box_label", value: "B-1" }, newRecordId(), proxy, TYPES).map(
+        (i) => i.code,
+      ),
+    ).toEqual(["not_a_list"]);
+    expect(
+      codes(
+        nextIdentifier({ ...BOX, autoNumber: { style: "prefix", prefix: "B-", digits: 1 } }, proxy),
+      ),
+    ).toEqual(["not_a_list"]);
+  });
+});

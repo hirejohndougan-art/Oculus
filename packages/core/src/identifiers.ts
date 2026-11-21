@@ -55,6 +55,7 @@ import {
   isOrganizationId,
   mixedOrganizationsIssue,
   oneOrganization,
+  organizationIdOf,
   type OrganizationId,
 } from "./organizations.js";
 import {
@@ -779,11 +780,12 @@ function formerMatch(recordId: RecordId, item: FormerIdentifier): IdentifierMatc
  * issue `mixed_organizations`, records or types of more than one organization.
  */
 export function uniquenessIssues(
-  all: readonly RecordIdentifiers[],
-  identifierTypes: readonly IdentifierType[],
+  allInput: readonly RecordIdentifiers[],
+  typesInput: readonly IdentifierType[],
 ): Issue[] {
-  const mixed = mixedIssue(all, identifierTypes);
-  if (mixed !== undefined) return [mixed];
+  const snap = snapshot(allInput, typesInput);
+  if (!snap.ok) return [...snap.issues];
+  const { sets: all, types: identifierTypes } = snap.value;
   const byKey = typeMap(identifierTypes);
   const ruleOf = (type: string): UniquenessRule => byKey.get(type)?.type.uniqueness ?? "none";
   const groups = holdersByKey(all, (type) => ruleOf(type) === "all_time");
@@ -823,9 +825,10 @@ export function findIdentifierConflicts(
   identifierTypes: readonly IdentifierType[],
 ): Validated<readonly IdentifierMatch[]> {
   return guarded(() => {
-    const mixed = mixedIssue(all, identifierTypes);
-    if (mixed !== undefined) return { ok: false, issues: [mixed] };
-    return { ok: true, value: Object.freeze(conflicts(candidate, recordId, all, identifierTypes)) };
+    const snap = snapshot(all, identifierTypes);
+    if (!snap.ok) return snap;
+    const { sets, types } = snap.value;
+    return { ok: true, value: Object.freeze(conflicts(candidate, recordId, sets, types)) };
   }, "These identifiers could not be read as plain data.");
 }
 
@@ -868,12 +871,13 @@ function conflicts(
 export function checkNewIdentifier(
   candidate: unknown,
   recordId: RecordId,
-  all: readonly RecordIdentifiers[],
-  identifierTypes: readonly IdentifierType[],
+  allInput: readonly RecordIdentifiers[],
+  typesInput: readonly IdentifierType[],
 ): Issue[] {
   return guardedIssues(() => {
-    const mixed = mixedIssue(all, identifierTypes);
-    if (mixed !== undefined) return [mixed];
+    const snap = snapshot(allInput, typesInput);
+    if (!snap.ok) return [...snap.issues];
+    const { sets: all, types: identifierTypes } = snap.value;
     const issues = new IssueList();
     const copy = readTop(candidate, TYPE_LIMITS, issues, "An identifier must be a plain object.");
     if (copy === undefined) return issues.items;
@@ -937,9 +941,9 @@ export function findByIdentifier(
   options: { readonly type?: string; readonly includeFormer?: boolean } = {},
 ): Validated<readonly IdentifierMatch[]> {
   return guarded(() => {
-    const mixed = mixedIssue(all, []);
-    if (mixed !== undefined) return { ok: false, issues: [mixed] };
-    return { ok: true, value: search(query, all, options) };
+    const snap = snapshot(all, []);
+    if (!snap.ok) return snap;
+    return { ok: true, value: search(query, snap.value.sets, options) };
   }, "These identifiers could not be read as plain data.");
 }
 
@@ -994,12 +998,15 @@ function formatAutoNumber(auto: AutoNumbering, n: number, year: number): string 
  * belong to more than one organization (`mixed_organizations`).
  */
 export function nextIdentifier(
-  type: IdentifierType,
-  all: readonly RecordIdentifiers[],
+  typeInput: IdentifierType,
+  allInput: readonly RecordIdentifiers[],
   options: { readonly year?: number } = {},
 ): Validated<string> {
-  const mixed = mixedIssue(all, [type]);
-  if (mixed !== undefined) return { ok: false, issues: [mixed] };
+  const snap = snapshot(allInput, [typeInput]);
+  if (!snap.ok) return snap;
+  const { sets: all } = snap.value;
+  const type = snap.value.types[0];
+  if (type === undefined) return fail("unreadable", "The identifier type could not be read.");
   const auto = type.autoNumber;
   if (auto === undefined) {
     return fail("no_auto_number", `${type.label} numbers are not given out automatically.`);
@@ -1210,24 +1217,118 @@ function pairKey(item: { readonly type: string; readonly value: string }): strin
 // ---------------------------------------------------------------------------
 // Helpers
 
+/** The most record identifier sets the set functions take at once. */
+const MAX_IDENTIFIER_SETS = 1_000_000;
+
 /**
- * The `mixed_organizations` issue when the record identifiers and types name
- * more than one organization, or any of them names none (or can't be read),
- * else undefined.
+ * Stored values are copied whatever their length (the work on them is linear,
+ * and a set read back from storage must still be checkable); the other
+ * limits are a record's own.
  */
-function mixedIssue(
-  all: readonly RecordIdentifiers[],
-  identifierTypes: readonly IdentifierType[],
-): Issue | undefined {
-  let items: unknown[];
+const SNAPSHOT_LIMITS = { ...SET_LIMITS, maxStringLength: SET_LIMITS.maxTotalChars } as const;
+
+interface Snapshot {
+  readonly sets: readonly RecordIdentifiers[];
+  readonly types: readonly IdentifierType[];
+}
+
+const MIXED = (): Issue => mixedOrganizationsIssue([], "These identifiers and identifier types");
+
+/**
+ * One plain, frozen copy of the record identifier sets and the types, made
+ * before anything else looks at them, so the check and the work see exactly
+ * the same data: a list walked twice (a Proxy, a getter, an iterator that
+ * yields something else the second time) can't show the organization check
+ * one set and the search another (D-0XX). Proxies and getters are refused;
+ * each set must have a record ID and lists of `{ type, value }`; the types
+ * must pass `validateIdentifierTypes`. Then everything must name one
+ * organization (`mixed_organizations`, also for a set or type that names
+ * none). Never throws.
+ */
+function snapshot(all: unknown, identifierTypes: unknown): Validated<Snapshot> {
   try {
-    items = [...all, ...identifierTypes];
+    const typesRead = validateIdentifierTypes(identifierTypes);
+    if (!typesRead.ok) {
+      // A type of another organization, or one that names none.
+      const mixed = typesRead.issues.some(
+        (i) => i.code === "mixed_organizations" || i.code === "invalid_organization",
+      );
+      return {
+        ok: false,
+        issues: [
+          mixed
+            ? MIXED()
+            : issue(
+                [],
+                "invalid_identifier_types",
+                "The identifier types aren't valid. Check them with validateIdentifierTypes.",
+              ),
+        ],
+      };
+    }
+    if (types.isProxy(all) || !Array.isArray(all)) {
+      return fail("not_a_list", "The records' identifiers must be given as a list.");
+    }
+    const length = all.length;
+    if (length > MAX_IDENTIFIER_SETS) {
+      return fail(
+        "too_many_records",
+        `At most ${String(MAX_IDENTIFIER_SETS)} records' identifiers can be looked through at once.`,
+      );
+    }
+    const sets: RecordIdentifiers[] = [];
+    for (let i = 0; i < length; i += 1) {
+      // Each slot, and the entry's organization, read as plain data properties.
+      const slot = Object.getOwnPropertyDescriptor(all, i);
+      const entry: unknown = slot !== undefined && "value" in slot ? slot.value : undefined;
+      if (organizationIdOf(entry) === undefined) return { ok: false, issues: [MIXED()] };
+      const issues = new IssueList();
+      const copy = readTop(entry, SNAPSHOT_LIMITS, issues, "");
+      if (copy === undefined || !isSetShape(copy)) {
+        return {
+          ok: false,
+          issues: [
+            issue(
+              [i],
+              "invalid_identifiers",
+              `Entry ${String(i)} is not a record's identifiers. Check it with validateRecordIdentifiers.`,
+            ),
+          ],
+        };
+      }
+      sets.push(copy);
+    }
+    const value: Snapshot = Object.freeze({
+      sets: Object.freeze(sets),
+      types: typesRead.value,
+    });
+    if (oneOrganization([...value.sets, ...value.types]) === "mixed") {
+      return { ok: false, issues: [MIXED()] };
+    }
+    return { ok: true, value };
   } catch {
-    return mixedOrganizationsIssue([], "These identifiers and identifier types");
+    return fail("unreadable", "These identifiers could not be read as plain data.");
   }
-  return oneOrganization(items) === "mixed"
-    ? mixedOrganizationsIssue([], "These identifiers and identifier types")
-    : undefined;
+}
+
+/** The shape the set functions rely on, in a plain copy. */
+function isSetShape(
+  copy: Readonly<Record<string, JsonValue>>,
+): copy is Readonly<Record<string, JsonValue>> & RecordIdentifiers {
+  const view = ownOnly(copy);
+  if (!isRecordId(view.recordId) || !isOrganizationId(view.organizationId)) return false;
+  const items = (list: JsonValue | undefined, current: boolean): boolean =>
+    Array.isArray(list) &&
+    list.every((item) => {
+      if (!isPlainObject(item)) return false;
+      const own = ownOnly(item as Readonly<Record<string, JsonValue>>);
+      return (
+        typeof own.type === "string" &&
+        typeof own.value === "string" &&
+        (!current || typeof own.primary === "boolean")
+      );
+    });
+  return items(view.current, true) && items(view.former, false);
 }
 
 function fail<T>(code: string, message: string): Validated<T> {
@@ -1254,7 +1355,7 @@ function guardedIssues(run: () => Issue[]): Issue[] {
 /** Copy a top-level plain object safely, or report why not. */
 function readTop(
   input: unknown,
-  limits: typeof TYPE_LIMITS | typeof SET_LIMITS,
+  limits: typeof TYPE_LIMITS | typeof SET_LIMITS | typeof SNAPSHOT_LIMITS,
   issues: IssueList,
   notObject: string,
 ): Readonly<Record<string, JsonValue>> | undefined {

@@ -214,3 +214,20 @@ describe("staff identifier types can't be made public by accident (D-022)", () =
     }
   });
 });
+
+describe("one organization's identifier checker can't vouch for another's numbers (D-019)", () => {
+  // Organization B made `legacy` public; for this record's organization it is staff.
+  const otherTypes = [{ ...TYPES[0], organizationId: newOrganizationId() }];
+
+  it("refuses every value of a record of another organization, or of none", () => {
+    const made = makeIdentifierChecker(otherTypes);
+    if (!made.ok) throw new Error("bad fixture");
+    expect(codes(made.value({ type: "legacy", value: "P-12" }, anyField, rec))).toEqual([
+      "wrong_organization_checker",
+    ]);
+    const unowned = { ...rec, organizationId: undefined } as unknown as CatalogRecord;
+    expect(codes(made.value({ type: "legacy", value: "P-12" }, anyField, unowned))).toEqual([
+      "wrong_organization_checker",
+    ]);
+  });
+});

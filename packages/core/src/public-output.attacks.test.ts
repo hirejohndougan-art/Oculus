@@ -7,6 +7,7 @@ import {
   effectiveRecord,
   indexRecords,
   indexTemplates,
+  makeIdentifierChecker,
   newOrganizationId,
   newRecordId,
   publicOutput,
@@ -1078,5 +1079,78 @@ describe("public output won't use another organization's records (D-019)", () =>
     expect(codes(result)).toEqual(["mixed_organizations"]);
     expect(result.ok ? [] : result.issues[0]?.path).toEqual(["records"]);
     expect(JSON.stringify(result)).not.toContain("SECRET");
+  });
+});
+
+describe("another organization's identifier checker can't publish a staff number (D-019)", () => {
+  // This organization's `accession_number` is staff only; another organization
+  // has a public type with the same key.
+  const OTHER_PUBLIC = makeIdentifierChecker([
+    {
+      key: "accession_number",
+      label: "Accession number",
+      organizationId: newOrganizationId(),
+      uniqueness: "none",
+      public: true,
+    },
+  ]);
+  if (!OTHER_PUBLIC.ok) throw new Error("bad fixture");
+  const other = { identifier: OTHER_PUBLIC.value };
+  const MAP = { template: "out", entries: [RIGHTS_ENTRY, { field: "number", term: "identifier" }] };
+
+  it("leaves the number staff in the effective record, and publishing waits", () => {
+    const item = record("object", "Item", {
+      rights: { uri: CNE },
+      number: { type: "accession_number", value: "SECRET-0001" },
+    });
+    const built = effectiveRecord(item.id, [item], () => TPL, { checkers: other });
+    if (!built.ok) throw new Error(JSON.stringify(built.issues));
+    expect(built.value.entries.find((e) => e.key === "number")?.visibility).toBe("staff");
+    expect(built.value.notes.map((n) => n.code)).toContain("wrong_organization_checker");
+    const view = publicView(built.value);
+    expect(JSON.stringify(view)).not.toContain("SECRET");
+  });
+
+  it("refuses at the output boundary when the view was made with the right checker", () => {
+    const item = record("object", "Item", {
+      rights: { uri: CNE },
+      number: { type: "accession_number", value: "SECRET-0001" },
+    });
+    const view = viewOf([item], item.id);
+    const result = publicOutput(view, MAP, {
+      baseUrl: BASE,
+      published: [item.id],
+      checkers: other,
+    });
+    expect(codes(result)).toEqual(["wrong_organization_checker"]);
+    expect(JSON.stringify(result)).not.toContain("SECRET");
+  });
+});
+
+describe("a set entry that doesn't say its organization refuses the set (second review of T-019)", () => {
+  it.each([
+    ["missing", (r: object) => ({ ...r, organizationId: undefined })],
+    ["not an organization ID", (r: object) => ({ ...r, organizationId: "nope" })],
+    [
+      "behind a getter",
+      (r: object) =>
+        Object.defineProperty({ ...r }, "organizationId", { get: () => "x", enumerable: true }),
+    ],
+  ])("when its organizationId is %s", (_, spoil) => {
+    const fonds = record("archival_unit", "Fonds", { rights: { uri: CNE } }, { level: "fonds" });
+    const item = record("archival_unit", "Item", {}, { level: "item", parentId: fonds.id });
+    const view = viewOf([item, fonds], item.id);
+    const stray = spoil(record("object", "SECRET stray", {}));
+    const index = indexRecords([item, fonds, stray]);
+    expect(index.ok ? "" : index.issues[0]?.code).toBe("mixed_organizations");
+    const out = publicOutput(view, MAPPING, {
+      baseUrl: BASE,
+      published: [item.id],
+      checkers: CHECKERS,
+      templateFor: () => TPL,
+      records: [item, fonds, stray] as never,
+    });
+    expect(codes(out)).toEqual(["mixed_organizations"]);
+    expect(JSON.stringify(out)).not.toContain("SECRET");
   });
 });

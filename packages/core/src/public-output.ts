@@ -112,7 +112,7 @@ import {
   type DublinCoreTerm,
 } from "./dublin-core.js";
 import { parseEdtf } from "./edtf.js";
-import { publicIdentifierTypesOf } from "./field-checkers.js";
+import { isOtherOrganizationsChecker, publicIdentifierTypesOf } from "./field-checkers.js";
 import { RIGHTS_FIELD_KEY, RIGHTS_REQUIRED_KINDS, rightsTerm } from "./rights.js";
 import { isRecordId, type RecordId } from "./record-id.js";
 import type { CatalogRecord, FieldValue, RecordKind } from "./records.js";
@@ -465,10 +465,20 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
   // check and the type check below read the full values the view's entries
   // came from, in the effective record.
   const full = fullValues(view, effective, template);
+  const identifierChecker = isPlainObject(checkers) ? dataProp(checkers, "identifier") : undefined;
+  // One organization's checker never vouches for another's numbers (D-0XX).
+  if (isOtherOrganizationsChecker(identifierChecker, effective.record.organizationId)) {
+    fail(
+      ["checkers", "identifier"],
+      "wrong_organization_checker",
+      "checkers.identifier was made from another organization's identifier types. Make it from this record's organization's types.",
+    );
+  }
   templateCheck(effective.record, full, template, checkers);
 
   const publicIdentifierTypes = publicIdentifierTypesOf(
-    isPlainObject(checkers) ? dataProp(checkers, "identifier") : undefined,
+    identifierChecker,
+    effective.record.organizationId,
   );
 
   const byKey = new Map<string, FieldDefinition>();

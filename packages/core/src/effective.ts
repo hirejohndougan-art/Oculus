@@ -49,8 +49,8 @@
  * record whose ancestors can't be trusted can't be published safely.
  *
  * **One organization per set** (D-019, D-0XX). A set holding records of
- * more than one organization (valid or not, whenever their organizationId
- * can be read) is refused whole (`mixed_organizations`),
+ * more than one organization (valid or not), or an entry that doesn't say
+ * which, is refused whole (`mixed_organizations`),
  * so a record can never inherit from, or be published with, another
  * organization's units.
  *
@@ -83,7 +83,7 @@ import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import { RIGHTS_FIELD_KEY, rightsPublishIssues } from "./rights.js";
 import { markEffective, markPublicView } from "./effective-brand.js";
 import { shown } from "./plain-data.js";
-import { publicIdentifierTypesOf } from "./field-checkers.js";
+import { isOtherOrganizationsChecker, publicIdentifierTypesOf } from "./field-checkers.js";
 import { types } from "node:util";
 import { MAX_ARRANGEMENT_DEPTH, canFileUnder } from "./arrangement.js";
 import { isRecordId, type RecordId } from "./record-id.js";
@@ -287,14 +287,14 @@ function buildLookup(records: unknown): RecordLookup {
     // records of two organizations is refused whole, never filtered, so a
     // query that forgot its organization filter fails instead of reading
     // across (D-0XX). Every entry counts, valid or not, whenever its
-    // organizationId can be read.
+    // organizationId can be read. An entry whose organizationId is missing,
+    // not an organization ID or behind a getter could be any organization's,
+    // so it refuses the set too, rather than sitting in it as "invalid".
     const owner = checked.ok ? checked.value.organizationId : organizationIdOf(record);
-    if (owner !== undefined) {
-      organization ??= owner;
-      if (owner !== organization) {
-        const mixed = mixedOrganizationsIssue([i], "The records in the set");
-        fail(mixed.path, mixed.code, mixed.message);
-      }
+    organization ??= owner;
+    if (owner === undefined || owner !== organization) {
+      const mixed = mixedOrganizationsIssue([i], "The records in the set");
+      fail(mixed.path, mixed.code, mixed.message);
     }
     byId.set(
       id,
@@ -648,7 +648,7 @@ function compose(
   }
 
   const fitting = dropUnfit(target, own.template, candidates, up, notes, checkers);
-  const kept = withholdIdentifiers(fitting, own.byKey, notes, checkers);
+  const kept = withholdIdentifiers(fitting, own.byKey, notes, checkers, target.organizationId);
 
   const chainUp = up.map(step);
   const entries = kept.map((c) => {
@@ -732,6 +732,7 @@ function withoutRightsNote(value: FieldValue): FieldValue {
 const WITHHELD_IDENTIFIER: ReadonlySet<string> = new Set([
   "private_identifier_type",
   "identifier_types_unknown",
+  "wrong_organization_checker",
 ]);
 
 /**
@@ -745,11 +746,25 @@ function withholdIdentifiers(
   byKey: ReadonlyMap<string, FieldDefinition>,
   notes: Issue[],
   checkers: unknown,
+  organizationId: OrganizationId,
 ): readonly Candidate[] {
-  const publicTypes = publicIdentifierTypesOf(ownChecker(checkers, "identifier"));
+  const checker = ownChecker(checkers, "identifier");
+  // Another organization's checker says nothing about this one's types (D-0XX).
+  const otherOrganization = isOtherOrganizationsChecker(checker, organizationId);
+  const publicTypes = publicIdentifierTypesOf(checker, organizationId);
   return candidates.map((c) => {
     if (c.visibility !== "public" || !c.inTemplate || byKey.get(c.key)?.kind !== "identifier") {
       return c;
+    }
+    if (otherOrganization) {
+      notes.push(
+        issue(
+          ["fields", c.key],
+          "wrong_organization_checker",
+          `${shown(c.label)} is kept staff only: checkers.identifier was made from another organization's identifier types.`,
+        ),
+      );
+      return { ...c, visibility: "staff" };
     }
     if (publicTypes === undefined) {
       notes.push(
