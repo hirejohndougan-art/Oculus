@@ -97,3 +97,24 @@ describe("edtfFromText with dashes other than ASCII '-' (S-004)", () => {
     },
   );
 });
+
+describe("edtfFromText with a dash after a qualifier", () => {
+  it.each([
+    "probably -1920",
+    "probably –1920",
+    "maybe −1920",
+    "possibly -1920",
+    "perhaps -1920",
+    "Probably - 1920",
+    "probably -1920?",
+  ])("flags %j as ambiguous instead of reading a year BCE", (text) => {
+    expect(outcome(text)).toBe("issue ambiguous");
+  });
+
+  it.each(["˗1920", "➖1920", "1920˗25", "1920➖25", "probably ˗1920"])(
+    "does not read minus-like %j as a dash or a year BCE",
+    (text) => {
+      expect(outcome(text)).toBe("issue unreadable");
+    },
+  );
+});

@@ -365,8 +365,17 @@ function readSingle(raw: string, qualifier: string, options: EdtfFromTextOptions
   const text = raw.trim();
   const q = qualifier;
 
+  // A dash in front of a date after a qualifier ("probably -1920") or as a
+  // range end reads two ways, exactly like one at the very start.
+  if (/^-\s*\d/.test(text)) {
+    fail(
+      "ambiguous",
+      `${shown(raw)} starts with a dash: it could mean “until” or a year BCE. Enter ../1920 for “until 1920”.`,
+    );
+  }
+
   // Already EDTF on its own ("1920", "1920-06").
-  if (/^-?\d{4}(?:-\d{2}){0,2}$/.test(text) && parseEdtf(text).ok) {
+  if (/^\d{4}(?:-\d{2}){0,2}$/.test(text) && parseEdtf(text).ok) {
     return { edtf: `${text}${q}`, keep: false };
   }
 
