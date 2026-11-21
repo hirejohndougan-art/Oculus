@@ -52,12 +52,12 @@
  * word in common is missed only when one edit is an insertion or deletion
  * among the first three letters and the other among the last three. A block
  * with more than 20 terms is sorted and each term compared with its 8
- * nearest neighbours on each side. A pair whose keys differ in more letters
- * than the edits allowed could change is passed over without working out
- * its distance. Every pair visited is charged against `MAX_SPELLING_CELLS`
- * (500 cells, 2,000 when its distance is worked out, or the product of the
- * two keys' lengths when that is more and a distance is needed), and visited
- * once however many blocks it shares. When any limit cuts the search short,
+ * nearest neighbours on each side. A pair whose keys differ in more letters,
+ * or in how many times letters appear, than the edits allowed could change
+ * is passed over without working out its distance. Every pair visited is
+ * charged against `MAX_SPELLING_CELLS` (at least 500 cells, or the product of
+ * the two keys' lengths when their distance is worked out), and visited once
+ * however many blocks it shares. When any limit cuts the search short,
  * `truncated` is true and `limitsReached` says which.
  */
 import { type Issue, type Validated } from "./issues.js";
@@ -155,20 +155,12 @@ export const DEFAULT_DUPLICATE_CANDIDATES = 500;
 export const MAX_DUPLICATE_CANDIDATES = 10_000;
 /**
  * The spelling check's work budget, in character cells. Each pair visited
- * costs at least `VISIT_CELLS`, and a pair whose distance is worked out at
- * least `DISTANCE_CELLS`; a pair that needs a distance costs the product of
- * the two keys' lengths if that is more. It also bounds the pairs remembered
- * as visited (at most 4,000,000) and the distances worked out (at most
- * 1,000,000), so 50,000 hostile terms stay near 2 seconds.
+ * costs `VISIT_CELLS`; a pair whose distance is worked out costs the product
+ * of the two keys' lengths if that is more. It also bounds the pairs
+ * remembered as visited (at most 4,000,000).
  */
 export const MAX_SPELLING_CELLS = 2_000_000_000;
-/** A visit: remembering the pair and checking it is worth a distance. */
 const VISIT_CELLS = 500;
-/**
- * A distance worked out, however short the keys: measured at about twice a
- * visit, charged at four times so that the distances stay within the time.
- */
-const DISTANCE_CELLS = 2000;
 /**
  * The abbreviation check's work budget: one unit per run of words looked at,
  * plus the characters of each shortened form built to look up.
@@ -857,23 +849,48 @@ function spelling(terms: readonly Prepared[], out: Collector): void {
     return cached;
   };
 
-  // Which letters (folded into 32 buckets) each key has. One edit changes
-  // the set by at most two buckets, so keys whose sets differ in more than
-  // 2 × limit buckets can't be within the limit, and their distance needn't
-  // be worked out.
+  // Two summaries of each key's letters, by code point as `chars` holds
+  // them: which letters it has, folded into 32 buckets, and how many of each,
+  // folded into 8 buckets of 4 bits that count round from 15 to 0. One edit
+  // takes away at most one letter and adds at most one, so it changes the
+  // first by at most two buckets and the counts by at most two in all
+  // (folding, and measuring counts the short way round, only make
+  // differences smaller). Keys whose summaries differ by more than
+  // 2 × limit can't be within the limit, and their distance needn't be
+  // worked out.
   const letterSets = new Int32Array(terms.length);
+  const letterCounts = new Int32Array(terms.length);
   terms.forEach((t, i) => {
     let set = 0;
-    // By code point, as `chars` holds them.
-    for (const c of t.key) set |= 1 << ((c.codePointAt(0) ?? 0) & 31);
+    let counts = 0;
+    for (const c of t.key) {
+      const code = c.codePointAt(0) ?? 0;
+      set |= 1 << (code & 31);
+      const shift = (code & 7) * 4;
+      const count = (counts >>> shift) & 15;
+      counts = (counts & ~(15 << shift)) | (((count + 1) & 15) << shift);
+    }
     letterSets[i] = set;
+    letterCounts[i] = counts;
   });
+  const lettersWithin = (i: number, j: number, limit: number): boolean => {
+    if (bitCount((letterSets[i] ?? 0) ^ (letterSets[j] ?? 0)) > 2 * limit) return false;
+    const x = letterCounts[i] ?? 0;
+    const y = letterCounts[j] ?? 0;
+    let apart = 0;
+    for (let shift = 0; shift < 32; shift += 4) {
+      const gap = Math.abs(((x >>> shift) & 15) - ((y >>> shift) & 15));
+      apart += Math.min(gap, 16 - gap);
+    }
+    return apart <= 2 * limit;
+  };
 
   const visited = new PairSet();
   let cells = 0;
   /** Visit one pair; false when the budget has run out. */
   const visit = (i: number, j: number): boolean => {
-    if (visited.has(i, j)) return true;
+    // Remembered now: if the budget stops the search below, it stops for good.
+    if (!visited.add(i, j)) return true;
     const a = terms[i];
     const b = terms[j];
     if (a === undefined || b === undefined) return true;
@@ -881,11 +898,9 @@ function spelling(terms: readonly Prepared[], out: Collector): void {
     const needsDistance =
       a.key !== b.key && !out.has(i, j) && out.eligible(i, j, "similar_spelling");
     const limit = Math.min(a.chars.length, b.chars.length) >= 10 ? 2 : 1;
-    const worked =
-      needsDistance && bitCount((letterSets[i] ?? 0) ^ (letterSets[j] ?? 0)) <= 2 * limit;
-    const cost = needsDistance
-      ? Math.max(worked ? DISTANCE_CELLS : VISIT_CELLS, product)
-      : VISIT_CELLS;
+    // Charged only for the work done: a pair passed over costs a visit.
+    const worked = needsDistance && lettersWithin(i, j, limit);
+    const cost = worked ? Math.max(VISIT_CELLS, product) : VISIT_CELLS;
     if (cells + cost > MAX_SPELLING_CELLS) {
       out.limits.add("spelling_budget");
       return false;
@@ -895,7 +910,6 @@ function spelling(terms: readonly Prepared[], out: Collector): void {
       return false;
     }
     cells += cost;
-    visited.add(i, j);
     if (!worked) return true;
     const d = boundedDistance(a.chars, b.chars, limit);
     if (d <= limit) out.add(i, j, "similar_spelling", d);
@@ -958,26 +972,27 @@ class PairSet {
   private high = new Int32Array(1 << 12);
   private size = 0;
 
-  has(i: number, j: number): boolean {
-    return this.low[this.slot(Math.min(i, j), Math.max(i, j))] !== -1;
-  }
-
-  add(i: number, j: number): void {
+  /** Add the pair; false if it was there already. */
+  add(i: number, j: number): boolean {
     const x = Math.min(i, j);
     const y = Math.max(i, j);
     const at = this.slot(x, y);
-    if (this.low[at] !== -1) return;
+    if (this.low[at] !== -1) return false;
     this.low[at] = x;
     this.high[at] = y;
     this.size += 1;
     if (this.size * 2 > this.low.length) this.grow();
+    return true;
   }
 
   /** Where the pair is, or the empty slot where it would go. */
   private slot(x: number, y: number): number {
     const mask = this.low.length - 1;
-    let at = (Math.imul(x, 0x9e3779b1) ^ Math.imul(y, 0x85ebca6b)) >>> 0;
-    at = (at ^ (at >>> 15)) & mask;
+    // Mixed with MurmurHash3's finaliser, so evenly spaced positions spread.
+    let h = Math.imul(x, 0x9e3779b1) ^ y;
+    h = Math.imul(h ^ (h >>> 16), 0x85ebca6b);
+    h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
+    let at = (h ^ (h >>> 16)) & mask;
     for (;;) {
       const l = this.low[at] ?? -1;
       if (l === -1 || (l === x && this.high[at] === y)) return at;
@@ -1025,39 +1040,65 @@ export function boundedDistance(a: ArrayLike<string>, b: ArrayLike<string>, limi
   if (Math.abs(a.length - b.length) > limit) return over;
   const n = a.length;
   const m = b.length;
+  // Compared as numbers, which is much faster than as one-letter strings.
+  if (codesA.length < n) codesA = new Int32Array(n * 2);
+  if (codesB.length < m) codesB = new Int32Array(m * 2);
+  const ca = codesA;
+  const cb = codesB;
+  if (typeof a === "string" && typeof b === "string") {
+    for (let k = 0; k < n; k += 1) ca[k] = a.charCodeAt(k);
+    for (let k = 0; k < m; k += 1) cb[k] = b.charCodeAt(k);
+  } else {
+    // Lists of characters: number each different character.
+    const ids = new Map<string, number>();
+    const id = (c: string | undefined): number => {
+      const key = c ?? "";
+      let v = ids.get(key);
+      if (v === undefined) ids.set(key, (v = ids.size));
+      return v;
+    };
+    for (let k = 0; k < n; k += 1) ca[k] = id(a[k]);
+    for (let k = 0; k < m; k += 1) cb[k] = id(b[k]);
+  }
   // Three rows, reused across calls: two back (for swaps), previous and
   // current. Each row is written only around its band, plus one cell either
-  // side set to "over", which is all the next rows read.
+  // side set to "over", which is all the next rows read, so nothing needs
+  // clearing between calls.
   if (scratch.length < 3 * (m + 1)) scratch = new Int32Array(3 * (m + 1) * 2);
   const rows = scratch;
   let prev2 = 0;
   let prev = m + 1;
   let cur = 2 * (m + 1);
-  rows.fill(over, 0, 3 * (m + 1));
-  for (let j = 0; j <= Math.min(m, limit); j += 1) rows[prev + j] = j;
+  // Row 0: only its first limit + 2 cells are ever read.
+  for (let j = 0; j <= Math.min(m, limit + 1); j += 1) rows[prev + j] = Math.min(j, over);
   for (let i = 1; i <= n; i += 1) {
     const from = Math.max(1, i - limit);
     const to = Math.min(m, i + limit);
     for (let j = Math.max(0, from - 1); j <= Math.min(m, to + 1); j += 1) rows[cur + j] = over;
     let best = over;
     if (from === 1) {
-      best = i <= limit ? i : over;
-      rows[cur] = best;
+      rows[cur] = i <= limit ? i : over;
+      best = Math.min(over, (rows[cur] ?? over) + Math.abs(n - i - m));
     }
-    const ai = a[i - 1];
+    const ai = ca[i - 1] ?? -1;
+    const aPrev = i > 1 ? (ca[i - 2] ?? -1) : -2;
     for (let j = from; j <= to; j += 1) {
-      const cost = ai === b[j - 1] ? 0 : 1;
+      const bj = cb[j - 1] ?? -1;
+      const cost = ai === bj ? 0 : 1;
       let v = Math.min(
         (rows[prev + j] ?? over) + 1,
         (rows[cur + j - 1] ?? over) + 1,
         (rows[prev + j - 1] ?? over) + cost,
       );
-      if (i > 1 && j > 1 && ai === b[j - 2] && a[i - 2] === b[j - 1]) {
+      if (j > 1 && ai === (cb[j - 2] ?? -1) && aPrev === bj) {
         v = Math.min(v, (rows[prev2 + j - 2] ?? over) + 1);
       }
       v = Math.min(v, over);
       rows[cur + j] = v;
-      if (v < best) best = v;
+      // What's left of the two keys differs in length by this much, so at
+      // least that many more edits are needed from this cell.
+      const atLeast = v + Math.abs(n - i - (m - j));
+      if (atLeast < best) best = atLeast;
     }
     if (best > limit) return over;
     const spare = prev2;
@@ -1068,5 +1109,7 @@ export function boundedDistance(a: ArrayLike<string>, b: ArrayLike<string>, limi
   return Math.min(rows[prev + m] ?? over, over);
 }
 
-/** Rows for `boundedDistance`, kept between calls (it never runs re-entrantly). */
+/** Rows and codes for `boundedDistance`, kept between calls (it never runs re-entrantly). */
 let scratch = new Int32Array(3 * 64);
+let codesA = new Int32Array(64);
+let codesB = new Int32Array(64);

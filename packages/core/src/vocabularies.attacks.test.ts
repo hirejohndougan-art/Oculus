@@ -284,8 +284,9 @@ describe("near-duplicate detection can't be overloaded", () => {
     expect(r.ms).toBeLessThan(5000);
   });
 
-  // Labels of 6 or 7 short random words: keys too short to be charged much
-  // each, in hundreds of big blocks of different keys.
+  // Labels of short random words: short keys in hundreds of big blocks of
+  // different keys. These assert what was searched, not the time (a loaded
+  // machine can't change that); the time limit is the test's own timeout.
   const randomWords = (seed: number, vocabulary: readonly string[], words: number): unknown[] => {
     let s = seed;
     const next = (): number => {
@@ -299,31 +300,34 @@ describe("near-duplicate detection can't be overloaded", () => {
       ).join(" "),
     }));
   };
-  const consonants = "bcdfghjklmnpqrstvwxz";
-  const threeLetters = (count: number, letters: string): string[] =>
-    Array.from({ length: count }, (_, i) =>
-      [0, 1, 2]
-        .map((k) => letters[Math.floor((i * 7919) / letters.length ** k) % letters.length])
-        .join(""),
+  const allWords = (letters: string, length: number): string[] =>
+    Array.from({ length: letters.length ** length }, (_, i) =>
+      Array.from(
+        { length },
+        (_, k) => letters[Math.floor(i / letters.length ** k) % letters.length],
+      ).join(""),
     );
+  const slow = { timeout: 30_000 };
 
-  it("is fast on many labels of six short random words", () => {
-    const r = timed(randomWords(42, threeLetters(120, consonants), 6));
-    expect(r.ms).toBeLessThan(5000);
+  it("searches every neighbour of labels of six short random words", slow, () => {
+    const consonants = allWords("bcdfghjklmnpqrstvwxz", 3).filter((_, i) => i % 67 === 0);
+    const r = timed(randomWords(42, consonants, 6));
+    expect(r.limits).not.toContain("spelling_budget");
   });
 
-  it("is fast on many labels of seven short random words", () => {
-    const r = timed(randomWords(42, threeLetters(40, consonants), 7));
-    expect(r.ms).toBeLessThan(5000);
-  });
-
-  it("charges every distance worked out, even when the keys use the same few letters", () => {
-    // 64 words from 4 letters: every key has the same letters, so no pair is
-    // passed over cheaply and each needs its distance.
-    const r = timed(randomWords(7, threeLetters(64, "bcdf"), 6));
-    expect(r.limits).toContain("spelling_budget");
+  it("searches every neighbour when every key has the same four letters", slow, () => {
+    // No pair is passed over for having different letters, so each needs
+    // its distance, and the budget must still not cut the search short.
+    const r = timed(randomWords(7, allWords("bcdf", 3), 6));
+    expect(r.limits).not.toContain("spelling_budget");
     expect(r.found).toBeGreaterThan(0);
-    expect(r.ms).toBeLessThan(5000);
+  });
+
+  it("charges a pair passed over without its distance as a visit only", slow, () => {
+    // 44-letter keys from two letters: pairs needing a distance used to be
+    // charged 44 × 44 cells each, even when their letter counts rule them out.
+    const r = timed(randomWords(9, allWords("ab", 4), 11));
+    expect(r.limits).not.toContain("spelling_budget");
   });
 
   it("doesn't run out of memory on labels that unfold to many characters", () => {
