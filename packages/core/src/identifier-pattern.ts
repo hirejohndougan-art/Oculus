@@ -23,6 +23,7 @@
  */
 import { issue, type Validated } from "./issues.js";
 import { shown, textProblem } from "./plain-data.js";
+import { BLANK_CHARACTERS } from "./identifier-key.js";
 
 /** The longest format text accepted. */
 export const MAX_PATTERN_LENGTH = 100;
@@ -69,7 +70,8 @@ function fail(code: string, message: string): never {
   throw new PatternError(code, message);
 }
 
-const INVISIBLE = /[\p{Default_Ignorable_Code_Point}]/u;
+/** Invisible characters and blank-looking ones (see `BLANK_CHARACTERS`). */
+const INVISIBLE = new RegExp(`[\\p{Default_Ignorable_Code_Point}]|${BLANK_CHARACTERS}`, "u");
 
 /**
  * Check and compile a format. Never throws; returns the compiled format or one
@@ -98,7 +100,7 @@ function compile(input: unknown): IdentifierPattern {
   const problem =
     textProblem(input) ??
     (/[\t\n\r\u2028\u2029]/.test(input) ? "contains a line break or tab" : undefined) ??
-    (INVISIBLE.test(input) ? "contains invisible characters" : undefined);
+    (INVISIBLE.test(input) ? "contains invisible or blank characters" : undefined);
   if (problem !== undefined) fail("bad_characters", `This format ${problem}.`);
   if (input.trim() !== input) fail("untrimmed", "The format starts or ends with spaces.");
 

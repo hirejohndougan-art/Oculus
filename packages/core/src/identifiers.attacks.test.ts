@@ -5,6 +5,7 @@ import {
   MAX_FORMER_IDENTIFIERS,
   checkNewIdentifier,
   findByIdentifier,
+  identifierKey,
   newRecordId,
   nextIdentifier,
   uniquenessIssues,
@@ -149,6 +150,98 @@ describe("messages can't be used to hide or reorder text", () => {
       TYPES,
     );
     expect(r.ok ? "" : r.issues[0]?.message).toContain("\u2026");
+  });
+});
+
+describe("lookalike identifiers can't both be held (S-003)", () => {
+  // Each pair looks the same on screen: a Latin accented letter, and a
+  // precomposed Cyrillic or Greek one that NFKC alone keeps apart.
+  const PAIRS: [string, string][] = [
+    ["Ä-1", "\u04d2-1"], // Cyrillic Ӓ
+    ["Ö-1", "\u04e6-1"], // Cyrillic Ӧ
+    ["Ă-1", "\u04d0-1"], // Cyrillic Ӑ
+    ["Á-1", "\u0386-1"], // Greek Ά (tonos)
+    ["é-1", "\u03ad-1"], // Greek έ
+    ["ó-1", "\u03cc-1"], // Greek ό
+    ["Á-1", "\u0391\u0341-1"], // Greek Α + combining tone mark
+  ];
+  const holding = (value: string): RecordIdentifiers => ({
+    recordId: newRecordId(),
+    current: [{ type: "box_label", value, primary: true }],
+    former: [],
+  });
+
+  it.each(PAIRS)("%s and %s are one identifier", (latin, other) => {
+    const a = holding(latin);
+    const b = holding(other);
+    expect(validateRecordIdentifiers(a, TYPES).ok).toBe(true);
+    expect(validateRecordIdentifiers(b, TYPES).ok).toBe(true);
+    expect(uniquenessIssues([a, b], TYPES).map((i) => i.code)).toEqual([
+      "not_unique",
+      "not_unique",
+    ]);
+    expect(
+      checkNewIdentifier({ type: "box_label", value: other }, newRecordId(), [a], TYPES).map(
+        (i) => i.code,
+      ),
+    ).toEqual(["not_unique"]);
+    expect(
+      checkNewIdentifier({ type: "box_label", value: latin }, newRecordId(), [b], TYPES).map(
+        (i) => i.code,
+      ),
+    ).toEqual(["not_unique"]);
+  });
+
+  it("the accent still tells identifiers apart", () => {
+    const a = holding("\u04e6-1"); // Cyrillic Ӧ
+    expect(uniquenessIssues([a, holding("O-1")], TYPES)).toEqual([]);
+    expect(
+      checkNewIdentifier({ type: "box_label", value: "O-1" }, newRecordId(), [a], TYPES),
+    ).toEqual([]);
+  });
+
+  const BLANKS = ["\u2800", "\u{16FE4}", "\u{1D159}", "\u3164", "\u115f", "\u1160", "\uffa0"];
+
+  it.each(BLANKS)("a blank-looking %j is refused in a value", (blank) => {
+    for (const value of [`DHS-${blank}0001`, `DHS-0001${blank}`, blank]) {
+      expect(codes(validateRecordIdentifiers(holding(value), TYPES))).toContain(
+        "invisible_characters",
+      );
+      expect(
+        checkNewIdentifier({ type: "box_label", value }, newRecordId(), [], TYPES).map(
+          (i) => i.code,
+        ),
+      ).toContain("invisible_characters");
+    }
+  });
+
+  it.each(BLANKS)("a value with %j already stored still clashes with the plain one", (blank) => {
+    // Values that got in before this check (or from an import) still meet.
+    const odd = holding(`DHS-0001${blank}`);
+    expect(uniquenessIssues([odd, holding("DHS-0001")], TYPES).map((i) => i.code)).toEqual([
+      "not_unique",
+      "not_unique",
+    ]);
+    expect(
+      checkNewIdentifier({ type: "box_label", value: "DHS-0001" }, newRecordId(), [odd], TYPES).map(
+        (i) => i.code,
+      ),
+    ).toEqual(["not_unique"]);
+  });
+
+  it("the key stays linear on long runs of accented lookalikes and marks", () => {
+    const time = (text: string): number => {
+      const started = performance.now();
+      identifierKey(text);
+      return performance.now() - started;
+    };
+    // Mixed combining classes make NFD reorder each run of marks.
+    const unit = "\u04e6\u0301\u0323\u0386\u03ad";
+    time(unit.repeat(1000)); // warm up
+    const small = time(unit.repeat(20_000));
+    const large = time(unit.repeat(200_000));
+    expect(large).toBeLessThan(Math.max(small, 1) * 30);
+    expect(large).toBeLessThan(2000);
   });
 });
 

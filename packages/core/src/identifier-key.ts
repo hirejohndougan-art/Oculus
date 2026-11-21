@@ -8,11 +8,18 @@
  * when their keys are equal. The key:
  *
  * 1. applies Unicode NFKC, which turns full-width, superscript, ligature and
- *    other compatibility forms into their plain letters and digits;
- * 2. turns Cyrillic, Greek and Armenian letters that look like Latin letters
- *    into those Latin letters, and every kind of dash or minus into `-`;
+ *    other compatibility forms into their plain letters and digits, then NFD,
+ *    which splits every accented letter into its base letter and combining
+ *    marks (Cyrillic `Ӧ` becomes `О` + diaeresis, Greek `Ά` becomes `Α` +
+ *    acute; the Greek tonos and the Latin acute are the same mark after NFD);
+ * 2. turns Cyrillic, Greek and Armenian base letters that look like Latin
+ *    letters into those Latin letters, and every kind of dash or minus into
+ *    `-`; combining marks are kept, so `Ӧ` meets `Ö` and not `O`;
  * 3. folds case (upper, then lower, so `ß` and `SS` meet);
- * 4. removes all spaces and invisible (default-ignorable) characters.
+ * 4. recomposes (NFKC), so an accented letter typed as one character and as
+ *    letter + mark meet, while `Č` and `C` stay different;
+ * 5. removes all spaces, invisible (default-ignorable) characters and the
+ *    few visible characters that draw nothing at all (`BLANK_CHARACTERS`).
  *
  * The key is deliberately conservative: it can make two different
  * identifiers compare equal (a Cyrillic small `в`, shaped like a small
@@ -29,13 +36,14 @@
  * letter. Applied before case folding, with capital and small forms listed
  * separately, because they can look like different Latin letters (Greek `Η`
  * looks like `H`, small `η` like `n`). The cost: inside Greek or Cyrillic text,
- * such a capital and its small form no longer compare equal.
+ * such a capital and its small form no longer compare equal. Only base
+ * letters are listed: accented forms (`Ё`, `Ӧ`, `Ά`, `έ` …) are split by NFD
+ * first and reach this table as base letter + mark.
  */
 const LOOKALIKES: ReadonlyMap<string, string> = new Map([
   ["А", "A"],
   ["В", "B"],
   ["Е", "E"],
-  ["Ё", "Ë"],
   ["К", "K"],
   ["М", "M"],
   ["Н", "H"],
@@ -47,7 +55,6 @@ const LOOKALIKES: ReadonlyMap<string, string> = new Map([
   ["Х", "X"],
   ["Ѕ", "S"],
   ["І", "I"],
-  ["Ї", "Ï"],
   ["Ј", "J"],
   ["Һ", "H"],
   ["Ԛ", "Q"],
@@ -56,7 +63,6 @@ const LOOKALIKES: ReadonlyMap<string, string> = new Map([
   ["а", "a"],
   ["в", "b"],
   ["е", "e"],
-  ["ё", "ë"],
   ["к", "k"],
   ["м", "m"],
   ["н", "h"],
@@ -68,7 +74,6 @@ const LOOKALIKES: ReadonlyMap<string, string> = new Map([
   ["х", "x"],
   ["ѕ", "s"],
   ["і", "i"],
-  ["ї", "ï"],
   ["ј", "j"],
   ["ԁ", "d"],
   ["һ", "h"],
@@ -121,15 +126,31 @@ const LOOKALIKES: ReadonlyMap<string, string> = new Map([
   ["\u2212", "-"],
 ]);
 
+/**
+ * Visible characters that draw nothing, are not spaces to `\s` and are not
+ * default-ignorable: U+2800 BRAILLE PATTERN BLANK, U+16FE4 KHITAN SMALL SCRIPT
+ * FILLER and U+1D159 MUSICAL SYMBOL NULL NOTEHEAD. The key treats them as
+ * spaces (removed), and `identifiers.ts` refuses them in stored values like
+ * invisible characters. The Hangul fillers (U+115F, U+1160, U+3164, U+FFA0)
+ * need no entry: they are default-ignorable already. Written as regex
+ * alternatives, not a character class, because U+16FE4 is a combining mark.
+ */
+export const BLANK_CHARACTERS = String.raw`\u2800|\u{16FE4}|\u{1D159}`;
+
 const ANY_CHAR = /./gsu;
-const SPACE_OR_INVISIBLE = /[\s\p{Default_Ignorable_Code_Point}]+/gu;
+const SPACE_OR_INVISIBLE = new RegExp(
+  `(?:[\\s\\p{Default_Ignorable_Code_Point}]|${BLANK_CHARACTERS})+`,
+  "gu",
+);
 
 /**
  * The comparison key for an identifier. Equal keys mean "treat as the same
  * identifier". Never shown to people and never stored as the identifier.
  */
 export function identifierKey(value: string): string {
-  const mapped = value.normalize("NFKC").replace(ANY_CHAR, (ch) => LOOKALIKES.get(ch) ?? ch);
+  // Every step is a single pass over the text, so the key stays linear-time.
+  const split = value.normalize("NFKC").normalize("NFD");
+  const mapped = split.replace(ANY_CHAR, (ch) => LOOKALIKES.get(ch) ?? ch);
   const folded = mapped.toUpperCase().toLowerCase();
   return folded.normalize("NFKC").replace(SPACE_OR_INVISIBLE, "");
 }

@@ -40,6 +40,37 @@ describe("identifierKey", () => {
     expect(same("Ηη", "ΗΗ")).toBe(false); // the documented cost, inside Greek text
   });
 
+  it("splits accented lookalikes before mapping, and keeps the accent (S-003)", () => {
+    expect(same("Ö-1", "\u04e6-1")).toBe(true); // Cyrillic Ӧ
+    expect(same("Ä-1", "\u04d2-1")).toBe(true); // Cyrillic Ӓ
+    expect(same("Ă-1", "\u04d0-1")).toBe(true); // Cyrillic Ӑ
+    expect(same("Ë-1", "\u0401-1")).toBe(true); // Cyrillic Ё, still
+    expect(same("Á-1", "\u0386-1")).toBe(true); // Greek Ά
+    expect(same("é-1", "\u03ad-1")).toBe(true); // Greek έ
+    expect(same("ó-1", "\u03cc-1")).toBe(true); // Greek ό
+    expect(same("Á-1", "\u0391\u0341-1")).toBe(true); // Greek Α + tone mark U+0341
+    expect(same("Á-1", "A\u0301-1")).toBe(true);
+    // The accent still counts: a lookalike with a mark is not the bare letter.
+    expect(same("O-1", "\u04e6-1")).toBe(false);
+    expect(same("A-1", "\u0386-1")).toBe(false);
+    expect(same("Ö-1", "O-1")).toBe(false);
+    expect(same("Ö-1", "Ó-1")).toBe(false);
+  });
+
+  it("treats blank-looking characters as spaces (S-003)", () => {
+    for (const blank of [
+      "\u2800",
+      "\u{16FE4}",
+      "\u{1D159}",
+      "\u3164",
+      "\u115f",
+      "\u1160",
+      "\uffa0",
+    ]) {
+      expect(same("DHS-0001", `DHS-${blank}0001`)).toBe(true);
+    }
+  });
+
   it("treats every dash and minus as a hyphen", () => {
     for (const dash of ["\u2010", "\u2011", "\u2012", "\u2013", "\u2014", "\u2015", "\u2212"]) {
       expect(same("DHS-0001", `DHS${dash}0001`)).toBe(true);

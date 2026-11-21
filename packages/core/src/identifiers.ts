@@ -41,7 +41,7 @@ import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import { IssueList, readPlainData, shown, textProblem, type JsonValue } from "./plain-data.js";
 import { types } from "node:util";
 import { isRecordId, type RecordId } from "./record-id.js";
-import { identifierKey } from "./identifier-key.js";
+import { BLANK_CHARACTERS, identifierKey } from "./identifier-key.js";
 import {
   matchesIdentifierPattern,
   parseIdentifierPattern,
@@ -154,7 +154,12 @@ export const MAX_QUERY_LENGTH = 1000;
 
 const TYPE_KEY = /^[a-z][a-z0-9_]{0,63}$/;
 const ONE_LINE_BREAKS = /[\t\n\r\u2028\u2029]/;
-const INVISIBLE = /[\p{Default_Ignorable_Code_Point}]/u;
+/**
+ * Invisible characters (default-ignorable, which takes in the Hangul fillers)
+ * and the visible ones that draw nothing, such as the Braille blank. The
+ * comparison key ignores them all; stored values may not hold them.
+ */
+const INVISIBLE = new RegExp(`[\\p{Default_Ignorable_Code_Point}]|${BLANK_CHARACTERS}`, "u");
 const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
 const TYPE_LIMITS = {
@@ -363,7 +368,7 @@ function checkAutoNumber(
         issues.add(
           [...at, "prefix"],
           "invisible_characters",
-          "The prefix contains invisible characters.",
+          "The prefix contains invisible or blank characters.",
         );
       } else if (/\p{Nd}$/u.test(prefix) || /[0-9]$/.test(identifierKey(prefix))) {
         // `X1` + `0001` would read back as `X10001`: the number can't be found again.
@@ -570,7 +575,7 @@ function checkValue(
     issues.add(
       at,
       "invisible_characters",
-      "The identifier contains invisible characters, which would make two different numbers look the same.",
+      "The identifier contains invisible or blank characters, which would make two different numbers look the same.",
     );
     return false;
   }
