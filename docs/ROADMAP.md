@@ -197,4 +197,4 @@ Tasks to be written when Phase 2 is done. Carried forward:
 - [ ] M-001 **Serve active file types safely.** (risky) From the T-002 review: a digital asset's media type can be `text/html`, `image/svg+xml`, `application/xhtml+xml` or a script type, which is legitimate for born-digital files. When media is served, never send the stored media type as-is for these. Serve them as downloads (`Content-Disposition: attachment`), from a separate origin from the public sites, with a sandboxing Content-Security-Policy and `X-Content-Type-Options: nosniff`, and test that an uploaded HTML or SVG file can't run script on a public site.
 
 ## Phases 4–7
-Public sites and editor; multiple sites; Omeka S migration and the Historical Society cutover; connections to other systems. See PLATFORM_PLAN.md §10.
+Public sites and editor (John, 2026-11-21: each site gets a **Design** item in its menu, opening one page with tabs for Menus, Pages, Themes, Headers and Footers, all editable, with changes kept as a draft until published); multiple sites; Omeka S migration and the Historical Society cutover; connections to other systems. See PLATFORM_PLAN.md §10.
