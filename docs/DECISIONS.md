@@ -172,3 +172,7 @@ System managers and site managers decide which record fields a site's record pag
 - **Per site.** One organization's sites can show different fields of the same records. Feeds for the whole organization (OAI-PMH) follow the Dublin Core mapping, not a site's toggles.
 - **Rejected:** using the toggle as the public/staff switch (it would let a display setting publish staff data without D-023's confirmation); hiding fields only in the browser.
 
+## D-027 — The check before publishing: serious problems block, minor ones warn (2026-11-21, John)
+Publishing a site change runs a check first. Problems that break the WCAG 2.1 AA requirement (plan §5) block publishing until fixed: text that is too low in contrast to read, images with no alt text, controls with no accessible name, and click targets under 44 × 44 px (DESIGN.md §4). Minor problems only warn, and the editor can publish anyway: links that may be broken, and similar issues that can't be confirmed automatically. The exact list of which checks block is set when the editor is built (Phase 4).
+- **Rejected:** blocking on everything (an urgent notice could be held up by an unconfirmed link); warnings only (accessibility problems would pile up).
+
