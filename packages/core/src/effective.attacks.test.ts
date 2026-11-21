@@ -4,6 +4,7 @@
 import { describe, expect, it } from "vitest";
 import {
   canPublishRights,
+  makeIdentifierChecker,
   effectivePublishIssues,
   effectiveRecord,
   indexRecords,
@@ -598,5 +599,99 @@ describe("rightsPublishIssues refuses an effective record", () => {
     expect(effectivePublishIssues(r.value)).toEqual([]);
     expect(isEffectiveRecord({ ...r.value })).toBe(false);
     expect(isEffectiveRecord(publicView(r.value))).toBe(false);
+  });
+});
+
+describe("staff identifier types never reach the public view (D-0XX)", () => {
+  const SECRET = "DF-SECRET-0042";
+  const made = makeIdentifierChecker([
+    { key: "object_number", label: "Object number", uniqueness: "none", public: true },
+    { key: "donor_file_number", label: "Donor file number", uniqueness: "none" },
+  ]);
+  if (!made.ok) throw new Error("types");
+  const checkers = { identifier: made.value };
+  function numberDef(visibility: "public" | "staff", repeatable = false): FieldDefinition {
+    return { ...def("number", visibility), kind: "identifier", repeatable };
+  }
+  const PUBLIC_NUMBER = template([numberDef("public")], "public-number");
+  const STAFF_NUMBER = template([numberDef("staff")], "staff-number");
+  const staffValue = { type: "donor_file_number", value: SECRET };
+
+  it("keeps a record's own staff-type value out of the view, marks it staff and blocks publishing", () => {
+    const item = unit("Item", "item", undefined, { number: staffValue });
+    const r = effectiveRecord(item.id, [item], () => PUBLIC_NUMBER, { checkers });
+    if (!r.ok) throw new Error("effective");
+    expect(r.value.entries.map((e) => [e.key, e.visibility])).toEqual([["number", "staff"]]);
+    expect(r.value.notes.map((n) => n.code)).toEqual(["private_identifier_type"]);
+    const view = publicView(r.value);
+    expect(view?.entries).toEqual([]);
+    expect(JSON.stringify(view)).not.toContain(SECRET);
+    expect(effectivePublishIssues(r.value).map((i) => i.code)).toEqual(["private_identifier_type"]);
+  });
+
+  it("holds back a list when any one of its numbers is of a staff type", () => {
+    const tpl = template([numberDef("public", true)], "public-numbers");
+    const item = unit("Item", "item", undefined, {
+      number: [{ type: "object_number", value: "2026.015" }, staffValue],
+    });
+    const r = effectiveRecord(item.id, [item], () => tpl, { checkers });
+    if (!r.ok) throw new Error("effective");
+    expect(JSON.stringify(publicView(r.value))).not.toContain(SECRET);
+    expect(effectivePublishIssues(r.value).map((i) => i.code)).toEqual(["private_identifier_type"]);
+  });
+
+  it("holds back every identifier value when the identifier types aren't known", () => {
+    const item = unit("Item", "item", undefined, {
+      number: { type: "object_number", value: "2026.015" },
+    });
+    for (const options of [{}, { checkers: { identifier: () => [] } }, { checkers: {} }]) {
+      const r = effectiveRecord(item.id, [item], () => PUBLIC_NUMBER, options);
+      if (!r.ok) throw new Error("effective");
+      expect(publicView(r.value)?.entries).toEqual([]);
+      expect(r.value.entries[0]?.visibility).toBe("staff");
+      expect(effectivePublishIssues(r.value).map((i) => i.code)).toEqual([
+        "identifier_types_unknown",
+      ]);
+    }
+  });
+
+  it("gives a public type's value to the view as { value } only, never its type", () => {
+    const item = unit("Item", "item", undefined, {
+      number: { type: "object_number", value: "2026.015" },
+    });
+    const r = effectiveRecord(item.id, [item], () => PUBLIC_NUMBER, { checkers });
+    if (!r.ok) throw new Error("effective");
+    expect(publicView(r.value)?.fields).toEqual({ number: { value: "2026.015" } });
+    // Only the missing rights (these samples have none), nothing about identifiers.
+    expect(effectivePublishIssues(r.value).map((i) => i.code)).toEqual(["rights_missing"]);
+  });
+
+  it("keeps a staff-type value inherited as staff, for the staff Effective Record", () => {
+    // Staff on the fonds, public on the item: the strictest makes it staff,
+    // so it must not be refused as if it were going public.
+    const fonds = unit("Fonds", "fonds", undefined, { number: staffValue });
+    const item = unit("Item", "item", fonds);
+    const lookup: TemplateLookup = (r) => (r.id === fonds.id ? STAFF_NUMBER : PUBLIC_NUMBER);
+    const r = effectiveRecord(item.id, [item, fonds], lookup, { checkers });
+    if (!r.ok) throw new Error("effective");
+    expect(r.value.entries.map((e) => [e.key, e.visibility, e.value])).toEqual([
+      ["number", "staff", staffValue],
+    ]);
+    expect(r.value.notes).toEqual([]);
+    expect(JSON.stringify(publicView(r.value))).not.toContain(SECRET);
+    // Only the missing rights (these samples have none), nothing about identifiers.
+    expect(effectivePublishIssues(r.value).map((i) => i.code)).toEqual(["rights_missing"]);
+  });
+
+  it("leaves out, with a note, a staff-type value that would be inherited as public", () => {
+    const fonds = unit("Fonds", "fonds", undefined, { number: staffValue });
+    const item = unit("Item", "item", fonds);
+    const r = effectiveRecord(item.id, [item, fonds], () => PUBLIC_NUMBER, { checkers });
+    if (!r.ok) throw new Error("effective");
+    expect(r.value.entries).toEqual([]);
+    expect(r.value.notes.map((n) => n.code)).toEqual(["not_valid_here"]);
+    expect(JSON.stringify(publicView(r.value))).not.toContain(SECRET);
+    // Only the missing rights (these samples have none), nothing about identifiers.
+    expect(effectivePublishIssues(r.value).map((i) => i.code)).toEqual(["rights_missing"]);
   });
 });

@@ -60,11 +60,24 @@
  * the record's template. `effectivePublishIssues` is the rights publish
  * check (`rightsPublishIssues`) run on that public view, and also refuses
  * rights that are staff-only here. Nothing here throws.
+ *
+ * **Identifier values** (D-0XX). Identifier types are staff only unless
+ * marked public, and only the identifier checker in `options.checkers` (from
+ * `makeIdentifierChecker`) knows which are public. Checkers judge an
+ * inherited value by its effective visibility, so a staff-type number
+ * inherited into a staff field stays, and one that would become public is
+ * left out with a note. A public field whose own value is of a staff type, or
+ * any identifier value when no identifier checker made by
+ * `makeIdentifierChecker` is given, is kept but marked `staff`, with a note
+ * (`private_identifier_type`, `identifier_types_unknown`), and
+ * `effectivePublishIssues` refuses to publish the record until it is fixed.
+ * The public view holds an identifier as `{ value }` only, never its type.
  */
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import { RIGHTS_FIELD_KEY, rightsPublishIssues } from "./rights.js";
 import { markEffective, markPublicView } from "./effective-brand.js";
 import { shown } from "./plain-data.js";
+import { publicIdentifierTypesOf } from "./field-checkers.js";
 import { types } from "node:util";
 import { MAX_ARRANGEMENT_DEPTH, canFileUnder } from "./arrangement.js";
 import { isRecordId, type RecordId } from "./record-id.js";
@@ -549,7 +562,8 @@ function compose(
     });
   }
 
-  const kept = dropUnfit(target, own.template, candidates, up, notes, checkers);
+  const fitting = dropUnfit(target, own.template, candidates, up, notes, checkers);
+  const kept = withholdIdentifiers(fitting, own.byKey, notes, checkers);
 
   const chainUp = up.map(step);
   const entries = kept.map((c) => {
@@ -583,7 +597,12 @@ function compose(
       Object.freeze({
         key: e.key,
         label: e.label,
-        value: e.key === RIGHTS_FIELD_KEY ? withoutRightsNote(e.value) : e.value,
+        value:
+          e.key === RIGHTS_FIELD_KEY
+            ? withoutRightsNote(e.value)
+            : own.byKey.get(e.key)?.kind === "identifier"
+              ? withoutIdentifierType(e.value)
+              : e.value,
         own: e.own,
       }),
     );
@@ -624,6 +643,77 @@ function withoutRightsNote(value: FieldValue): FieldValue {
   return Object.freeze(Object.fromEntries(Object.entries(value).filter(([key]) => key !== "note")));
 }
 
+/** Notes that mean a public identifier value was held back: publishing must wait. */
+const WITHHELD_IDENTIFIER: ReadonlySet<string> = new Set([
+  "private_identifier_type",
+  "identifier_types_unknown",
+]);
+
+/**
+ * Mark `staff`, with a note, every public identifier value the public may not
+ * see: one whose type (or any of whose types, for a list) isn't public, or
+ * any at all when the identifier checker can't say which types are public
+ * (D-0XX). The value stays in the effective record for staff.
+ */
+function withholdIdentifiers(
+  candidates: readonly Candidate[],
+  byKey: ReadonlyMap<string, FieldDefinition>,
+  notes: Issue[],
+  checkers: unknown,
+): readonly Candidate[] {
+  const publicTypes = publicIdentifierTypesOf(ownChecker(checkers, "identifier"));
+  return candidates.map((c) => {
+    if (c.visibility !== "public" || !c.inTemplate || byKey.get(c.key)?.kind !== "identifier") {
+      return c;
+    }
+    if (publicTypes === undefined) {
+      notes.push(
+        issue(
+          ["fields", c.key],
+          "identifier_types_unknown",
+          `${shown(c.label)} is kept staff only: without checkers.identifier from makeIdentifierChecker, there is no telling whether its identifier type is public.`,
+        ),
+      );
+      return { ...c, visibility: "staff" };
+    }
+    const items = Array.isArray(c.value) ? c.value : [c.value];
+    const allPublic = items.every((item) => {
+      if (!isPlainObject(item) || !Object.hasOwn(item, "type")) return false;
+      const type = item.type;
+      return typeof type === "string" && publicTypes.has(type);
+    });
+    if (allPublic) return c;
+    notes.push(
+      issue(
+        ["fields", c.key],
+        "private_identifier_type",
+        `${shown(c.label)} holds a number of a staff only identifier type, so it is kept staff only and the record can't be published. Mark the type public, or move the number to a staff field.`,
+      ),
+    );
+    return { ...c, visibility: "staff" };
+  });
+}
+
+/** A checker given as an own data property of `checkers`, or undefined. */
+function ownChecker(checkers: unknown, kind: string): unknown {
+  if (!isPlainObject(checkers)) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(checkers, kind);
+  return descriptor !== undefined && "value" in descriptor ? descriptor.value : undefined;
+}
+
+/**
+ * An identifier value as `{ value }` only: identifier types are never
+ * published (D-016), so the public view doesn't hold them. Only values whose
+ * every item is a plain object with a public type get here.
+ */
+function withoutIdentifierType(value: FieldValue): FieldValue {
+  const strip = (item: FieldValue): FieldValue =>
+    isPlainObject(item) && Object.hasOwn(item, "value")
+      ? Object.freeze({ value: item.value as FieldValue })
+      : Object.freeze({});
+  return Array.isArray(value) ? Object.freeze(value.map(strip)) : strip(value);
+}
+
 /** The public view of each effective record made here, made at the same time. */
 const PUBLIC_VIEWS = new WeakMap<object, PublicRecord>();
 
@@ -659,6 +749,10 @@ export function effectivePublishIssues(effective: EffectiveRecord): readonly Iss
           ),
         ),
       ]);
+    }
+    const withheld = effective.notes.filter((n) => WITHHELD_IDENTIFIER.has(n.code));
+    if (withheld.length > 0) {
+      return Object.freeze(withheld.map((n) => Object.freeze(issue(n.path, n.code, n.message))));
     }
     const found = rightsPublishIssues(view);
     if (found.length === 0) return found;
@@ -743,9 +837,19 @@ function dropUnfit(
 ): readonly Candidate[] {
   const inherited = candidates.filter((c) => c.from !== 0);
   if (inherited.length === 0) return candidates;
+  // Checkers judge each inherited value by its effective visibility, not the
+  // receiving field's: a value staff along the way is checked as staff, so a
+  // staff-type identifier inherited into a public field isn't refused for
+  // going public when it never will (D-0XX). Rights fields must be public in
+  // every template, so they are never made staff here.
+  const staffHere = new Set(inherited.filter((c) => c.visibility === "staff").map((c) => c.key));
   const loose: FieldTemplate = {
     ...template,
-    fields: template.fields.map((f) => ({ ...f, required: false })),
+    fields: template.fields.map((f) =>
+      staffHere.has(f.key) && f.kind !== "rights"
+        ? { ...f, required: false, visibility: "staff" as const }
+        : { ...f, required: false },
+    ),
   };
   // Frozen, so a checker can't change a value after it was checked (or
   // before another checker sees it). The values themselves are already

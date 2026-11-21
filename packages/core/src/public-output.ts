@@ -37,7 +37,8 @@
  * - **Only public identifier types go out** (D-0XX). The checker from
  *   `makeIdentifierChecker` refuses a staff type's value in a public field
  *   (`private_identifier_type`), and the identifier value is checked again
- *   here against the public types that checker was made with. A
+ *   here against the public types that checker was made with, reading the
+ *   type from the effective record (the public view holds `{ value }` only). A
  *   hand-written identifier checker says nothing about which types are
  *   public, so with one, identifier values are refused, never published.
  * - **Publishing is the caller's statement.** Records have no publish state
@@ -112,7 +113,7 @@ import { parseEdtf } from "./edtf.js";
 import { publicIdentifierTypesOf } from "./field-checkers.js";
 import { RIGHTS_FIELD_KEY, RIGHTS_REQUIRED_KINDS, rightsTerm } from "./rights.js";
 import { isRecordId, type RecordId } from "./record-id.js";
-import type { CatalogRecord, RecordKind } from "./records.js";
+import type { CatalogRecord, FieldValue, RecordKind } from "./records.js";
 import {
   MAX_REPEATS,
   MAX_URL_LENGTH,
@@ -443,7 +444,11 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
       `The mapping must map the ${RIGHTS_FIELD_KEY} field to rights or license, because this kind of record can't be published without its rights.`,
     );
   }
-  templateCheck(effective.record, view, template, checkers);
+  // The view holds identifiers as `{ value }` only (D-0XX); the template
+  // check and the type check below read the full values the view's entries
+  // came from, in the effective record.
+  const full = fullValues(view, effective, template);
+  templateCheck(effective.record, full, template, checkers);
 
   const publicIdentifierTypes = publicIdentifierTypesOf(
     isPlainObject(checkers) ? dataProp(checkers, "identifier") : undefined,
@@ -467,7 +472,10 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
     if (def?.visibility !== "public") {
       fail(["fields", field], "staff_field", "Only public template fields can be published.");
     }
-    const values = valuesOf(value, def, { baseUrl, published, publicIdentifierTypes, budget });
+    if (def.kind === "identifier") {
+      publicTypesOnly(full[field], def, publicIdentifierTypes);
+    }
+    const values = valuesOf(value, def, { baseUrl, published, budget });
     const list = terms.get(term);
     if (list === undefined) terms.set(term, values);
     else list.push(...values);
@@ -620,13 +628,70 @@ function canonicalJson(value: unknown): string {
 }
 
 /**
+ * The view's values for checking, with each identifier field's value taken
+ * from the effective record instead (the view leaves out its type). Only
+ * keys in the view are read, and the effective entry for each is public.
+ */
+function fullValues(
+  view: PublicRecord,
+  effective: EffectiveRecord,
+  template: FieldTemplate,
+): Readonly<Record<string, FieldValue>> {
+  const kinds = new Map(template.fields.map((f) => [f.key, f.kind]));
+  const out: [string, FieldValue][] = [];
+  for (const entry of view.entries) {
+    if (kinds.get(entry.key) !== "identifier") {
+      out.push([entry.key, entry.value]);
+      continue;
+    }
+    const source = effective.entries.find((e) => e.key === entry.key);
+    if (source?.visibility !== "public" || !source.inTemplate) {
+      fail(["fields", entry.key], "staff_field", "Only public template fields can be published.");
+    }
+    out.push([entry.key, source.value]);
+  }
+  // Object.fromEntries defines own properties, so no key can reach a prototype.
+  return Object.freeze(Object.fromEntries(out));
+}
+
+/**
+ * Refuse unless every identifier in `value` is of a type the identifier
+ * checker knows to be public. A checker not made by `makeIdentifierChecker`
+ * can't say, so any identifier value is refused with it (D-0XX).
+ */
+function publicTypesOnly(
+  value: FieldValue | undefined,
+  def: FieldDefinition,
+  publicTypes: ReadonlySet<string> | undefined,
+): void {
+  if (publicTypes === undefined) {
+    fail(
+      ["fields", def.key],
+      "unchecked",
+      `${shown(def.label)} can't be published without knowing which identifier types are public. Pass checkers.identifier from makeIdentifierChecker.`,
+    );
+  }
+  const items = Array.isArray(value) ? value : [value];
+  for (const item of items) {
+    const type = isPlainObject(item) && Object.hasOwn(item, "type") ? item.type : undefined;
+    if (typeof type !== "string" || !publicTypes.has(type)) {
+      fail(
+        ["fields", def.key],
+        "private_identifier_type",
+        `${shown(def.label)} holds a number of a staff only identifier type, so the record can't be published. Mark the type public, or move the number to a staff field.`,
+      );
+    }
+  }
+}
+
+/**
  * Check the view's values with `checkRecordAgainstTemplate`, as the record
  * they belong to, against the view's own template. Required fields are not
  * checked: a value can be left out of the view because it is staff only.
  */
 function templateCheck(
   record: CatalogRecord,
-  view: PublicRecord,
+  fields: Readonly<Record<string, FieldValue>>,
   template: FieldTemplate,
   checkers: unknown,
 ): void {
@@ -634,7 +699,7 @@ function templateCheck(
     ...template,
     fields: template.fields.map((f) => ({ ...f, required: false })),
   };
-  const probe = Object.freeze({ ...record, fields: view.fields }) as CatalogRecord;
+  const probe = Object.freeze({ ...record, fields }) as CatalogRecord;
   const problems = checkRecordAgainstTemplate(
     probe,
     loose,
@@ -796,8 +861,6 @@ function readPublished(value: unknown): ReadonlySet<RecordId> {
 interface Context {
   readonly baseUrl: string;
   readonly published: ReadonlySet<RecordId>;
-  /** From the identifier checker; undefined if it wasn't made by makeIdentifierChecker. */
-  readonly publicIdentifierTypes: ReadonlySet<string> | undefined;
   readonly budget: Budget;
 }
 
@@ -857,24 +920,9 @@ function valueOf(
       return uri === undefined ? outValue(label) : outValue(label, uri, true);
     }
     case "identifier": {
-      // Only the value, never the type, and only for a public type (D-0XX).
+      // Only the value: the view holds no type, and the type was checked
+      // public by publicTypesOnly (D-0XX).
       const id = props(value, IDENTIFIER_KEYS, invalid);
-      const type = id.get("type");
-      if (typeof type !== "string") return invalid();
-      if (ctx.publicIdentifierTypes === undefined) {
-        fail(
-          ["fields", def.key],
-          "unchecked",
-          `${shown(def.label)} can't be published without knowing which identifier types are public. Pass checkers.identifier from makeIdentifierChecker.`,
-        );
-      }
-      if (!ctx.publicIdentifierTypes.has(type)) {
-        fail(
-          ["fields", def.key],
-          "private_identifier_type",
-          `${shown(def.label)} holds a number of a staff only identifier type, so the record can't be published. Mark the type public, or move the number to a staff field.`,
-        );
-      }
       return outValue(nonBlank(id.get("value"), invalid));
     }
     case "link": {
@@ -910,7 +958,7 @@ function valueOf(
 }
 
 const TERM_KEYS: ReadonlySet<string> = new Set(["label", "uri", "vocabulary"]);
-const IDENTIFIER_KEYS: ReadonlySet<string> = new Set(["type", "value"]);
+const IDENTIFIER_KEYS: ReadonlySet<string> = new Set(["value"]);
 const LINK_KEYS: ReadonlySet<string> = new Set(["url", "label"]);
 const RIGHTS_KEYS: ReadonlySet<string> = new Set(["uri", "note"]);
 const PLACE_KEYS: ReadonlySet<string> = new Set(["label", "uri", "recordId"]);

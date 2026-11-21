@@ -215,7 +215,8 @@ describe("staff identifier types never reach any output form (D-0XX)", () => {
         checkers: { identifier },
       });
       expect(result.ok).toBe(false);
-      expect(codes(result)).toEqual(["unchecked"]);
+      // The effective record already holds it back (D-0XX).
+      expect(codes(result)).toEqual(["private_identifier_type"]);
       expect(JSON.stringify(result)).not.toContain(SECRET);
     }
   });

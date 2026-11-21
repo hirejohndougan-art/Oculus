@@ -105,12 +105,25 @@ export function record(
   return { kind, ...base, ...byKind[kind], ...extra } as CatalogRecord;
 }
 
+// Both types are public, so their values may be published; the type key
+// itself must still never appear in output. `donor_file_number` is staff
+// only (the default), so its values must never be published (D-0XX).
+const identifierChecker = makeIdentifierChecker([
+  { key: "accession_number", label: "Accession number", uniqueness: "none", public: true },
+  { key: "secret_type_code", label: "Secret type", uniqueness: "none", public: true },
+  { key: "donor_file_number", label: "Donor file number", uniqueness: "none" },
+]);
+if (!identifierChecker.ok) throw new Error("identifier types");
+/** The checkers publicOutput needs for the fixtures' identifier field. */
+export const CHECKERS = Object.freeze({ identifier: identifierChecker.value });
+
 export function effectiveOf(
   records: readonly CatalogRecord[],
   id: RecordId,
   tpl: FieldTemplate = TPL,
 ): EffectiveRecord {
-  const result = effectiveRecord(id, records, () => tpl);
+  // With the identifier checker, so public-type numbers reach the view (D-0XX).
+  const result = effectiveRecord(id, records, () => tpl, { checkers: CHECKERS });
   if (!result.ok) throw new Error(JSON.stringify(result.issues));
   return result.value;
 }
@@ -141,18 +154,6 @@ export function everything(out: {
     out.oaiDcXml,
   ].join("\n");
 }
-
-// Both types are public, so their values may be published; the type key
-// itself must still never appear in output. `donor_file_number` is staff
-// only (the default), so its values must never be published (D-0XX).
-const identifierChecker = makeIdentifierChecker([
-  { key: "accession_number", label: "Accession number", uniqueness: "none", public: true },
-  { key: "secret_type_code", label: "Secret type", uniqueness: "none", public: true },
-  { key: "donor_file_number", label: "Donor file number", uniqueness: "none" },
-]);
-if (!identifierChecker.ok) throw new Error("identifier types");
-/** The checkers publicOutput needs for the fixtures' identifier field. */
-export const CHECKERS = Object.freeze({ identifier: identifierChecker.value });
 
 /** The mapping entry kinds that need rights must have. */
 export const RIGHTS_ENTRY = Object.freeze({ field: "rights", term: "rights" });
