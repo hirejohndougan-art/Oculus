@@ -51,6 +51,11 @@
  * that could affect records needs confirmation. Callers saving a template
  * should pass the records.
  *
+ * Every record given must name this template in its `templateKey`
+ * (`record_not_for_template` refuses the whole comparison otherwise, D-0XX).
+ * Records with no `templateKey` are allowed, since older records have none,
+ * but are counted in `legacyRecords`: nothing confirms they use this template.
+ *
  * Messages name keys and give counts only: they never quote a stored value,
  * since a staff value is exactly what this guards. Everything is validated
  * first (both templates with `validateTemplate`, every record with
@@ -126,6 +131,12 @@ export interface TemplateChanges {
   readonly needsConfirmation: boolean;
   /** False when no records were given, so left-over keys and affected records weren't checked. */
   readonly recordsChecked: boolean;
+  /**
+   * How many of the records given name no template (stored before records
+   * did, D-0XX). Their template can't be confirmed, so a caller should treat
+   * them as possibly belonging to another template. 0 with no records.
+   */
+  readonly legacyRecords: number;
 }
 
 /**
@@ -178,6 +189,25 @@ function compare(
     const read = readRecords(recordsInput);
     if (!read.ok) return read;
     records = read.value;
+  }
+  // Only records that follow this template may be counted for it (D-0XX):
+  // another template's record would be listed in this one's confirmation.
+  let legacyRecords = 0;
+  for (const [i, record] of (records ?? []).entries()) {
+    if (record.templateKey === undefined) {
+      legacyRecords += 1;
+    } else if (record.templateKey !== after.value.key) {
+      return {
+        ok: false,
+        issues: [
+          issue(
+            ["records", i, "templateKey"],
+            "record_not_for_template",
+            `Record ${String(i)} in the list follows another template, not ${shown(after.value.key)}, so the change can't be checked against it.`,
+          ),
+        ],
+      };
+    }
   }
 
   const oldFields = byKey(before.value);
@@ -240,6 +270,7 @@ function compare(
       changes: Object.freeze(changes),
       needsConfirmation: changes.some((c) => c.needsConfirmation),
       recordsChecked: records !== undefined,
+      legacyRecords,
     }),
   };
 }

@@ -120,6 +120,7 @@ import {
   MAX_REPEATS,
   MAX_URL_LENGTH,
   checkRecordAgainstTemplate,
+  storedTemplateKey,
   validateTemplate,
   type FieldDefinition,
   type FieldTemplate,
@@ -426,8 +427,8 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
   // Checked again at the boundary: every template the view was built with is
   // the one its record names (D-0XX).
   for (const step of origin.chain) {
-    const named = Object.hasOwn(step.record, "templateKey") ? step.record.templateKey : undefined;
-    if (named !== undefined && named !== step.template.key) {
+    const named = storedTemplateKey(step.record);
+    if (!named.ok || (named.value !== undefined && named.value !== step.template.key)) {
       fail(
         ["templateKey"],
         "template_mismatch",

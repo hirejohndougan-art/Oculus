@@ -267,3 +267,33 @@ describe("hostile input", () => {
     }
   });
 });
+
+// Independent review of T-012: records of another template must not be
+// counted (or listed) in this template's confirmation.
+describe("records must follow the template being changed", () => {
+  const key = DACS_ARCHIVAL_UNIT_PRESET.key;
+  const makePublic = dacs((f) => ({ ...f, visibility: "public" }));
+
+  it("refuses the whole comparison for a record of another template", () => {
+    const other = { ...unit(A, { notes: SECRET }), templateKey: "other-template" };
+    const r = templateChanges(DACS_ARCHIVAL_UNIT_PRESET, makePublic, [
+      { ...unit(B, {}), templateKey: key },
+      other,
+    ]);
+    expect(codes(r)).toEqual(["record_not_for_template"]);
+    expect(r.ok ? [] : r.issues[0]?.path).toEqual(["records", 1, "templateKey"]);
+    expect(JSON.stringify(r)).not.toContain("555-0100");
+  });
+
+  it("counts records of this template, and says how many name no template", () => {
+    const r = ok(
+      templateChanges(DACS_ARCHIVAL_UNIT_PRESET, makePublic, [
+        { ...unit(A, { notes: SECRET }), templateKey: key },
+        unit(B, {}),
+      ]),
+    );
+    expect(r.legacyRecords).toBe(1);
+    expect(r.changes.find((c) => c.code === "made_public")?.recordIds).toEqual([A]);
+    expect(ok(templateChanges(DACS_ARCHIVAL_UNIT_PRESET, makePublic)).legacyRecords).toBe(0);
+  });
+});

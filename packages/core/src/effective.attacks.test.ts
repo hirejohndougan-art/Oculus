@@ -770,3 +770,16 @@ describe("a record is never worked out with another template's definitions", () 
     expect(JSON.stringify(r)).not.toContain("Donor");
   });
 });
+
+// Independent review of T-012: the template lookup must not see a record
+// whose templateKey is there but unreadable as an older keyless one.
+describe("an unreadable templateKey is refused, not read as no key", () => {
+  it("refuses an own templateKey that is undefined, in the set given", () => {
+    const item = {
+      ...unit("Item", "item", undefined, { note: "Donor's home address" }),
+      templateKey: undefined,
+    };
+    const r = effectiveRecord(item.id, [item as unknown as CatalogRecord], () => PUBLIC_NOTE);
+    expect(codeOf(r)).toBe("invalid_record");
+  });
+});

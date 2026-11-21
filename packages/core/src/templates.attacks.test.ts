@@ -233,7 +233,8 @@ describe("hostile record values", () => {
         throw new Error("boom");
       },
     } as unknown as CatalogRecord;
-    expect(checkRecordAgainstTemplate(fake, tpl).map((i) => i.code)).toEqual(["unreadable"]);
+    // Refused by validating the record first (T-012 review), before any field is read.
+    expect(checkRecordAgainstTemplate(fake, tpl).map((i) => i.code)).toEqual(["invalid_record"]);
   });
 });
 
@@ -495,6 +496,63 @@ describe("hostile template registries", () => {
     expect(Object.isFrozen(registry.value)).toBe(true);
     expect(checkRecordAgainstTemplate(r.value, registry.value).map((i) => i.code)).toEqual([
       "unknown_field",
+    ]);
+  });
+});
+
+// Independent review of T-012: a record whose templateKey is there but not a
+// plain key must never pass as an older record with no key, which any
+// template would be accepted for.
+describe("a templateKey that is there but unreadable is not 'no key'", () => {
+  const staff = { ...base([field({ visibility: "staff" })]), key: "donor-files" };
+  const pub = { ...base([field({ visibility: "public" })]), key: "public-objects" };
+  function rec(): CatalogRecord {
+    const r = validateRecord({
+      kind: "object",
+      id: ID,
+      title: "Chair",
+      templateKey: "donor-files",
+      createdAt: T,
+      updatedAt: T,
+      fields: { note: "Donor's home address" },
+    });
+    if (!r.ok) throw new Error(JSON.stringify(r.issues));
+    return r.value;
+  }
+
+  it("refuses an own templateKey that is undefined", () => {
+    const spread = { ...rec(), templateKey: undefined } as unknown as CatalogRecord;
+    expect(
+      checkRecordAgainstTemplate(spread, pub as unknown as FieldTemplate).map((i) => i.code),
+    ).toEqual(["invalid_record"]);
+  });
+
+  it("refuses a templateKey getter, without running it", () => {
+    let ran = false;
+    const r = { ...rec() } as Record<string, unknown>;
+    delete r.templateKey;
+    Object.defineProperty(r, "templateKey", {
+      enumerable: true,
+      get: () => {
+        ran = true;
+        return undefined;
+      },
+    });
+    expect(
+      checkRecordAgainstTemplate(
+        r as unknown as CatalogRecord,
+        pub as unknown as FieldTemplate,
+      ).map((i) => i.code),
+    ).toEqual(["invalid_record"]);
+    expect(ran).toBe(false);
+  });
+
+  it("refuses them through a registry too", () => {
+    const registry = indexTemplates([staff, pub]);
+    if (!registry.ok) throw new Error("registry");
+    const spread = { ...rec(), templateKey: undefined } as unknown as CatalogRecord;
+    expect(checkRecordAgainstTemplate(spread, registry.value).map((i) => i.code)).toEqual([
+      "invalid_record",
     ]);
   });
 });

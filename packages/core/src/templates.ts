@@ -82,6 +82,7 @@ import {
   RECORD_KINDS,
   isRecordKind,
   isTemplateKey,
+  validateRecord,
   type CatalogRecord,
   type RecordKind,
 } from "./records.js";
@@ -735,6 +736,36 @@ function refused(
 }
 
 /**
+ * The record's `templateKey`: undefined only when the record has no own
+ * `templateKey` property at all (a record stored before records named their
+ * template). An own property that is undefined, a getter or anything not a
+ * valid key is refused (`invalid_template_key`), never read as "no key": that
+ * would let the record be checked against any template. For this module,
+ * `effective.ts` and `public-output.ts` (not exported from the package).
+ * Never runs a getter; never throws.
+ */
+export function storedTemplateKey(record: unknown): Validated<string | undefined> {
+  try {
+    if (typeof record !== "object" || record === null || types.isProxy(record)) {
+      return refused([], "invalid_record", "This is not a record. Check it with validateRecord.");
+    }
+    const d = Object.getOwnPropertyDescriptor(record, "templateKey");
+    if (d === undefined) return { ok: true, value: undefined };
+    const value: unknown = "value" in d ? d.value : undefined;
+    if (!("value" in d) || !isTemplateKey(value)) {
+      return refused(
+        ["templateKey"],
+        "invalid_template_key",
+        "The record's templateKey is not a valid template key, so its template can't be found.",
+      );
+    }
+    return { ok: true, value };
+  } catch {
+    return refused([], "unreadable", "The record's template could not be found.");
+  }
+}
+
+/**
  * The validated template `record` follows: from a registry, the one its
  * `templateKey` names; otherwise `given`, validated, which must have the
  * record's `templateKey` (if it has one) as its key. For this module,
@@ -744,7 +775,9 @@ function refused(
  */
 export function templateOfRecord(record: CatalogRecord, given: unknown): Validated<FieldTemplate> {
   try {
-    const stored = Object.hasOwn(record, "templateKey") ? record.templateKey : undefined;
+    const key = storedTemplateKey(record);
+    if (!key.ok) return key;
+    const stored = key.value;
     const registered = isTemplateRegistry(given) ? REGISTRIES.get(given) : undefined;
     if (registered !== undefined) {
       if (stored === undefined) {
@@ -850,6 +883,18 @@ export function checkRecordAgainstTemplate(
 ): Issue[] {
   const issues = new IssueList();
   try {
+    // The record is validated here too, so a hand-made record (a templateKey
+    // that is undefined or a getter, say) can't pass as an older keyless one.
+    const valid = validateRecord(record);
+    if (!valid.ok) {
+      issues.add(
+        [],
+        "invalid_record",
+        "The record is not valid, so it can't be checked against a template. Check it with validateRecord.",
+      );
+      return issues.items;
+    }
+    record = valid.value;
     const found = templateOfRecord(record, untrustedTemplate);
     if (!found.ok) return [...found.issues];
     const template = found.value;
