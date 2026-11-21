@@ -8,6 +8,7 @@ import {
   effectivePublishIssues,
   effectiveRecord,
   indexRecords,
+  indexTemplates,
   isEffectiveRecord,
   publicView,
   rightsPublishIssues,
@@ -693,5 +694,79 @@ describe("staff identifier types never reach the public view (D-022)", () => {
     expect(JSON.stringify(publicView(r.value))).not.toContain(SECRET);
     // Only the missing rights (these samples have none), nothing about identifiers.
     expect(effectivePublishIssues(r.value).map((i) => i.code)).toEqual(["rights_missing"]);
+  });
+});
+
+// A record names its template (D-0XX). The S-002 review's leak: a lookup
+// that puts a record under another template (a bug, a stale cache, a record
+// "moved" with nothing in it saying so) checked its staff values against a
+// template that makes the same key public.
+describe("a record is never worked out with another template's definitions", () => {
+  function keyed(title: string, templateKey: string, parent?: { readonly id: RecordId }) {
+    return { ...unit(title, "item", parent, { note: "Donor's home address" }), templateKey };
+  }
+
+  it("refuses a lookup that gives a record a template other than the one it names", () => {
+    const item = keyed("Item", "staff-note");
+    const r = effectiveRecord(item.id, [item], () => PUBLIC_NOTE);
+    expect(codeOf(r)).toBe("template_mismatch");
+    expect(r.ok ? [] : r.issues[0]?.path).toEqual([item.id, "templateKey"]);
+  });
+
+  it("refuses it for an ancestor too", () => {
+    const fonds = {
+      ...unit("Fonds", "fonds", undefined, { note: "Donor" }),
+      templateKey: "staff-note",
+    };
+    const item = { ...unit("Item", "item", fonds), templateKey: "public-note" };
+    const r = effectiveRecord(item.id, [item, fonds], () => PUBLIC_NOTE);
+    expect(codeOf(r)).toBe("template_mismatch");
+    expect(r.ok ? [] : r.issues[0]?.path).toEqual([fonds.id, "templateKey"]);
+  });
+
+  it("finds each record's own template in a registry, so the staff value stays staff", () => {
+    const fonds = {
+      ...unit("Fonds", "fonds", undefined, { note: "Donor" }),
+      templateKey: "staff-note",
+    };
+    const item = { ...unit("Item", "item", fonds), templateKey: "public-note" };
+    const registry = indexTemplates([PUBLIC_NOTE, STAFF_NOTE]);
+    if (!registry.ok) throw new Error("registry");
+    const r = effectiveRecord(item.id, [item, fonds], registry.value);
+    if (!r.ok) throw new Error(JSON.stringify(r.issues));
+    expect(r.value.entries.find((e) => e.key === "note")?.visibility).toBe("staff");
+    expect(JSON.stringify(publicView(r.value))).not.toContain("Donor");
+  });
+
+  it("keeps an own value staff under the template the record names, whatever else the registry has", () => {
+    const item = keyed("Item", "staff-note");
+    const registry = indexTemplates([PUBLIC_NOTE, STAFF_NOTE]);
+    if (!registry.ok) throw new Error("registry");
+    const r = effectiveRecord(item.id, [item], registry.value);
+    if (!r.ok) throw new Error(JSON.stringify(r.issues));
+    expect(publicView(r.value)?.entries).toEqual([]);
+  });
+
+  it("refuses a record with no templateKey, or an unknown one, through a registry", () => {
+    const registry = indexTemplates([PUBLIC_NOTE]);
+    if (!registry.ok) throw new Error("registry");
+    const keyless = unit("Item", "item", undefined, { note: "x" });
+    expect(codeOf(effectiveRecord(keyless.id, [keyless], registry.value))).toBe("no_template_key");
+    const unknown = keyed("Item", "staff-note");
+    expect(codeOf(effectiveRecord(unknown.id, [unknown], registry.value))).toBe("unknown_template");
+  });
+
+  it("refuses a registry-shaped object, or a Proxy function, as the template source", () => {
+    const item = keyed("Item", "public-note");
+    const fake = Object.freeze({ size: 1 }) as unknown as TemplateLookup;
+    expect(codeOf(effectiveRecord(item.id, [item], fake))).toBe("no_template_lookup");
+    const proxy = new Proxy(() => PUBLIC_NOTE, {});
+    expect(codeOf(effectiveRecord(item.id, [item], proxy))).toBe("no_template_lookup");
+  });
+
+  it("never quotes the record's values in the refusal", () => {
+    const item = keyed("Item", "staff-note");
+    const r = effectiveRecord(item.id, [item], () => PUBLIC_NOTE);
+    expect(JSON.stringify(r)).not.toContain("Donor");
   });
 });

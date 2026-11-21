@@ -6,6 +6,7 @@ import {
   MAX_TITLE_LENGTH,
   RECORD_KINDS,
   createRecord,
+  isTemplateKey,
   newRecordId,
   validateRecord,
   type Issue,
@@ -397,5 +398,46 @@ describe("createRecord", () => {
     expect(r.ok).toBe(true);
     if (r.ok) expect(Date.parse(r.value.createdAt)).toBeGreaterThanOrEqual(before - 1);
     expect(newRecordId()).not.toBe(r.ok ? r.value.id : "");
+  });
+});
+
+describe("templateKey (D-0XX)", () => {
+  it("keeps the key of the template a record follows", () => {
+    const r = validateRecord(base({ kind: "object", templateKey: "spectrum-object" }));
+    expect(r.ok && r.value.templateKey).toBe("spectrum-object");
+  });
+
+  it("is optional, for records stored before records named their template", () => {
+    const r = validateRecord(base({ kind: "object" }));
+    expect(r.ok).toBe(true);
+    expect(r.ok && "templateKey" in r.value).toBe(false);
+  });
+
+  it("takes the same keys validateTemplate takes for a template", () => {
+    expect(isTemplateKey("a")).toBe(true);
+    expect(isTemplateKey("dacs_file-2")).toBe(true);
+    expect(isTemplateKey(`a${"b".repeat(63)}`)).toBe(true);
+    for (const bad of ["", "A", "1a", "-a", "a b", "a.b", `a${"b".repeat(64)}`, " a", "a\n"]) {
+      expect(isTemplateKey(bad)).toBe(false);
+      expect(codes(validateRecord(base({ kind: "object", templateKey: bad })))).toEqual([
+        "invalid_template_key",
+      ]);
+    }
+  });
+
+  it("refuses a template key that isn't text", () => {
+    for (const bad of [1, true, null, ["a"], { key: "a" }]) {
+      expect(codes(validateRecord(base({ kind: "event", templateKey: bad })))).toEqual([
+        "invalid_template_key",
+      ]);
+    }
+  });
+
+  it("is set by createRecord", () => {
+    const r = createRecord({ kind: "object", title: "Chair", templateKey: "objects" });
+    expect(r.ok && r.value.templateKey).toBe("objects");
+    expect(codes(createRecord({ kind: "object", title: "Chair", templateKey: "Objects" }))).toEqual(
+      ["invalid_template_key"],
+    );
   });
 });

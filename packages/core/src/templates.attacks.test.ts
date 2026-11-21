@@ -4,6 +4,8 @@
 import { describe, expect, it } from "vitest";
 import {
   checkRecordAgainstTemplate,
+  indexTemplates,
+  isTemplateRegistry,
   validateRecord,
   validateTemplate,
   webUrlProblem,
@@ -359,5 +361,140 @@ describe("review fixes", () => {
     ]) {
       expect(webUrlProblem(url), url).toBeDefined();
     }
+  });
+});
+
+// A record names its template (D-0XX). The S-002 review's leak: a record
+// moved to another template, with nothing in the record saying so, has its
+// staff values checked (and published) under a key the other template makes
+// public.
+describe("a record is never checked against another template", () => {
+  const staffTpl = base([field({ visibility: "staff" })]);
+  staffTpl.key = "donor-files";
+  const publicTpl = base([field({ visibility: "public" })]);
+  publicTpl.key = "public-objects";
+
+  function rec(extra: Record<string, unknown> = {}): CatalogRecord {
+    const r = validateRecord({
+      kind: "object",
+      id: ID,
+      title: "Chair",
+      templateKey: "donor-files",
+      createdAt: T,
+      updatedAt: T,
+      fields: { note: "Donor's home address" },
+      ...extra,
+    });
+    if (!r.ok) throw new Error(JSON.stringify(r.issues));
+    return r.value;
+  }
+
+  it("refuses a template whose key isn't the record's templateKey", () => {
+    const issues = checkRecordAgainstTemplate(rec(), publicTpl as unknown as FieldTemplate);
+    expect(issues.map((i) => i.code)).toEqual(["template_mismatch"]);
+    expect(issues[0]?.path).toEqual(["templateKey"]);
+    expect(JSON.stringify(issues)).not.toContain("Donor");
+  });
+
+  it("refuses it through a registry too: the record's key decides, not the caller", () => {
+    const registry = indexTemplates([publicTpl]);
+    if (!registry.ok) throw new Error("registry");
+    expect(checkRecordAgainstTemplate(rec(), registry.value).map((i) => i.code)).toEqual([
+      "unknown_template",
+    ]);
+  });
+
+  it("refuses a record with no templateKey through a registry", () => {
+    const registry = indexTemplates([staffTpl, publicTpl]);
+    if (!registry.ok) throw new Error("registry");
+    const keyless = validateRecord({
+      kind: "object",
+      id: ID,
+      title: "Chair",
+      createdAt: T,
+      updatedAt: T,
+      fields: {},
+    });
+    if (!keyless.ok) throw new Error("record");
+    expect(checkRecordAgainstTemplate(keyless.value, registry.value).map((i) => i.code)).toEqual([
+      "no_template_key",
+    ]);
+  });
+
+  it("doesn't take a hand-made object of the registry's shape as a registry", () => {
+    const fake = Object.freeze({ size: 1 });
+    expect(isTemplateRegistry(fake)).toBe(false);
+    expect(
+      checkRecordAgainstTemplate(rec(), fake as unknown as FieldTemplate).map((i) => i.code),
+    ).toEqual(["invalid_template"]);
+  });
+});
+
+describe("hostile template registries", () => {
+  it("refuses a Proxy or a non-list without reading it", () => {
+    let read = false;
+    const proxy = new Proxy([base()], {
+      get: (t, k) => {
+        read = true;
+        return Reflect.get(t, k) as unknown;
+      },
+    });
+    expect(codes(indexTemplates(proxy))).toEqual(["not_a_list"]);
+    expect(read).toBe(false);
+    for (const bad of [undefined, null, {}, "t", { 0: base(), length: 1 }]) {
+      expect(codes(indexTemplates(bad))).toEqual(["not_a_list"]);
+    }
+  });
+
+  it("refuses two templates with the same key, so neither can stand in for the other", () => {
+    const staff = base([field({ visibility: "staff" })]);
+    const pub = base([field({ visibility: "public" })]);
+    const r = indexTemplates([staff, pub]);
+    expect(codes(r)).toEqual(["duplicate_key"]);
+    expect(r.ok ? [] : r.issues[0]?.path).toEqual([1, "key"]);
+  });
+
+  it("refuses the whole list for one invalid template, a hole or a getter", () => {
+    expect(codes(indexTemplates([base(), { ...base(), key: "Bad" }]))).toEqual(["invalid_key"]);
+    // eslint-disable-next-line no-sparse-arrays
+    expect(indexTemplates([base(), ,]).ok).toBe(false);
+    let ran = false;
+    const list: unknown[] = [];
+    Object.defineProperty(list, 0, {
+      enumerable: true,
+      get: () => {
+        ran = true;
+        return base();
+      },
+    });
+    expect(indexTemplates(list).ok).toBe(false);
+    expect(ran).toBe(false);
+  });
+
+  it("refuses a template keyed constructor or __proto__", () => {
+    for (const key of ["constructor", "prototype", "__proto__"]) {
+      expect(indexTemplates([{ ...base(), key }]).ok).toBe(false);
+    }
+  });
+
+  it("is a snapshot: later edits to the caller's template are not seen", () => {
+    const tpl = base([field()]);
+    const registry = indexTemplates([tpl]);
+    if (!registry.ok) throw new Error("registry");
+    (tpl.fields as unknown[]).push(field({ key: "extra" }));
+    const r = validateRecord({
+      kind: "object",
+      id: ID,
+      title: "Chair",
+      templateKey: "t",
+      createdAt: T,
+      updatedAt: T,
+      fields: { extra: "x" },
+    });
+    if (!r.ok) throw new Error("record");
+    expect(Object.isFrozen(registry.value)).toBe(true);
+    expect(checkRecordAgainstTemplate(r.value, registry.value).map((i) => i.code)).toEqual([
+      "unknown_field",
+    ]);
   });
 });

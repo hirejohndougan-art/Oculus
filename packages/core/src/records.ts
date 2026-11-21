@@ -16,7 +16,7 @@
  * JSON. Which fields a record must have is the job of field templates (T-005).
  */
 import { issue, isPlainObject, type Validated } from "./issues.js";
-import { IssueList, readPlainData, shown, type JsonValue } from "./plain-data.js";
+import { FORBIDDEN_KEYS, IssueList, readPlainData, shown, type JsonValue } from "./plain-data.js";
 import { types } from "node:util";
 import { isRecordId, newRecordId, type RecordId } from "./record-id.js";
 
@@ -47,6 +47,14 @@ interface RecordBase {
   readonly createdAt: string;
   /** ISO 8601 UTC timestamp; never earlier than `createdAt`. */
   readonly updatedAt: string;
+  /**
+   * The key of the field template this record follows (D-0XX). The checks,
+   * `effectiveRecord` and `publicOutput` find the template from it, and
+   * refuse a template with any other key. Left out only by records stored
+   * before records named their template; those can be checked only through a
+   * template lookup function, never through a registry from `indexTemplates`.
+   */
+  readonly templateKey?: string;
   /** Template-defined fields, keyed by field key (`date`, `subjects` …). */
   readonly fields: Readonly<Record<string, FieldValue>>;
 }
@@ -113,6 +121,8 @@ const READ_LIMITS = {
 } as const;
 
 const FIELD_KEY = /^[a-z][a-z0-9_]{0,63}$/;
+/** Template keys: the same rule `validateTemplate` applies to a template's `key`. */
+const TEMPLATE_KEY = /^[a-z][a-z0-9_-]{0,63}$/;
 /** Characters allowed in stored text but not in a one-line title. */
 const TITLE_BREAKS = /[\t\n\r\u2028\u2029]/;
 /** Exactly the form Date.prototype.toISOString() writes, so stored timestamps sort as text. */
@@ -120,7 +130,15 @@ const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 /** RFC 6838 type/subtype, restricted-name characters only, no parameters. */
 const MEDIA_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/;
 
-const COMMON_KEYS = ["id", "kind", "title", "createdAt", "updatedAt", "fields"] as const;
+const COMMON_KEYS = [
+  "id",
+  "kind",
+  "title",
+  "templateKey",
+  "createdAt",
+  "updatedAt",
+  "fields",
+] as const;
 const EXTRA_KEYS: Readonly<Record<RecordKind, readonly string[]>> = {
   object: [],
   archival_unit: ["level", "parentId"],
@@ -180,6 +198,13 @@ function check(input: unknown): Validated<CatalogRecord> {
     issues.add(["id"], "invalid_id", "The ID must be a lowercase version 4 UUID.");
   }
   checkTitle(record.title, issues);
+  if (record.templateKey !== undefined && !isTemplateKey(record.templateKey)) {
+    issues.add(
+      ["templateKey"],
+      "invalid_template_key",
+      "The template key is 1 to 64 lower case letters, digits, hyphens and underscores, starting with a letter.",
+    );
+  }
   checkTimestamps(record.createdAt, record.updatedAt, issues);
   checkFields(record.fields, issues);
 
@@ -238,7 +263,21 @@ function ownOnly(
   return view;
 }
 
-/** The fields a caller supplies when making a new record. */
+/**
+ * True if `key` can be a template key: 1 to 64 lower case letters, digits,
+ * hyphens and underscores, starting with a letter, and not a prototype key
+ * (`constructor`, `prototype`). `validateTemplate` checks a template's `key`
+ * and `validateRecord` a record's `templateKey` with this one rule.
+ */
+export function isTemplateKey(key: unknown): key is string {
+  return typeof key === "string" && TEMPLATE_KEY.test(key) && !FORBIDDEN_KEYS.has(key);
+}
+
+/**
+ * The fields a caller supplies when making a new record. `templateKey` is
+ * optional in the type only so older callers keep working; give it for
+ * every new record (D-0XX).
+ */
 export type NewRecordInput =
   | { readonly kind: "object"; readonly title: string }
   | { readonly kind: "event"; readonly title: string }
@@ -266,7 +305,10 @@ export type NewRecordInput =
  * `now` is for tests; it defaults to the current time.
  */
 export function createRecord(
-  input: NewRecordInput & { readonly fields?: Readonly<Record<string, FieldValue>> },
+  input: NewRecordInput & {
+    readonly templateKey?: string;
+    readonly fields?: Readonly<Record<string, FieldValue>>;
+  },
   now: Date = new Date(),
 ): Validated<CatalogRecord> {
   try {

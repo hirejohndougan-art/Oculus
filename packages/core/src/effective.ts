@@ -91,11 +91,13 @@ import {
 } from "./records.js";
 import {
   checkRecordAgainstTemplate,
-  validateTemplate,
+  isTemplateRegistry,
+  templateOfRecord,
   type FieldDefinition,
   type FieldTemplate,
   type FieldVisibility,
   type TemplateCheckOptions,
+  type TemplateRegistry,
 } from "./templates.js";
 
 /** The most records a set given to `indexRecords` or `effectiveRecord` may hold. */
@@ -180,8 +182,15 @@ export interface EffectiveOptions {
  * with a frozen copy. Returning undefined or throwing fails the result. What
  * it returns is validated (copied) each time, so returning one object that
  * changes between calls can't make one record use another's definitions.
+ * For a record with a `templateKey`, the template returned must have that
+ * key (`template_mismatch`, D-0XX). Prefer a registry from `indexTemplates`,
+ * which finds each record's template by its `templateKey`; a function is
+ * the only way to work out records stored without one.
  */
 export type TemplateLookup = (record: CatalogRecord) => FieldTemplate | undefined;
+
+/** Where each record's template comes from: a registry (preferred) or a lookup function. */
+export type TemplateSource = TemplateRegistry | TemplateLookup;
 
 /** A frozen snapshot of a set of records, indexed by ID, from `indexRecords`. Opaque. */
 export interface RecordLookup {
@@ -303,20 +312,26 @@ function fetchRecord(state: LookupState, id: RecordId): Fetched {
  * (see the module header for the rules). `records` is the set to find the
  * record and its parents in, either a list or a lookup from `indexRecords`.
  * Passing a list validates the whole list on every call; for many records
- * from one set, index it once. `templateFor` gives each record's template.
- * Fails, with one issue, when the record or any ancestor can't be found,
- * read or trusted. Never throws.
+ * from one set, index it once. `templateFor` gives each record's template:
+ * a registry from `indexTemplates` (each record's template is the one its
+ * `templateKey` names) or a lookup function (whose answer must have the
+ * record's `templateKey`, when it has one). Fails, with one issue, when the
+ * record or any ancestor can't be found, read or trusted. Never throws.
  */
 export function effectiveRecord(
   recordId: RecordId,
   records: RecordLookup | readonly CatalogRecord[],
-  templateFor: TemplateLookup,
+  templateFor: TemplateSource,
   options: EffectiveOptions = {},
 ): Validated<EffectiveRecord> {
   try {
     if (!isRecordId(recordId)) fail([], "invalid_id", "The record ID must be a record ID.");
-    if (typeof templateFor !== "function") {
-      fail([], "no_template_lookup", "templateFor must be a function.");
+    if (!isTemplateSource(templateFor)) {
+      fail(
+        [],
+        "no_template_lookup",
+        "templateFor must be a registry from indexTemplates or a function.",
+      );
     }
     const up = ancestry(recordId, lookupFor(records));
     const templates = templatesFor(up, templateFor);
@@ -449,33 +464,80 @@ interface CheckedTemplate {
   readonly byKey: ReadonlyMap<string, FieldDefinition>;
 }
 
-/** Each record's validated template, in the same order as `up`. */
-function templatesFor(
-  up: readonly CatalogRecord[],
-  templateFor: TemplateLookup,
-): readonly CheckedTemplate[] {
-  // Validated (copied) for every record, even when the same object comes back
-  // twice: the lookup may have changed it in between.
-  return up.map((record) => {
-    let given: unknown;
+/** True for a registry from `indexTemplates` or a function (not a Proxy). */
+export function isTemplateSource(value: unknown): value is TemplateSource {
+  if (isTemplateRegistry(value)) return true;
+  return typeof value === "function" && !types.isProxy(value);
+}
+
+/**
+ * For this module and `public-output.ts` only (not exported from the
+ * package): the validated template `record` follows, from a registry or a
+ * lookup function, refusing one whose key isn't the record's `templateKey`.
+ * Issues name the record by ID; messages may quote its title (staff side).
+ * A lookup function's answer is validated (copied) on every call, even when
+ * the same object comes back twice: the lookup may have changed it in between.
+ */
+export function templateFromSource(
+  record: CatalogRecord,
+  source: TemplateSource,
+): Validated<FieldTemplate> {
+  let given: unknown = source;
+  if (!isTemplateRegistry(source)) {
     try {
-      given = templateFor(record);
+      given = source(record);
     } catch {
-      fail(
+      return failed(
         [record.id],
         "template_lookup_failed",
         `Finding the template for ${shown(record.title)} failed.`,
       );
     }
     if (given === undefined) {
-      fail([record.id], "no_template", `${shown(record.title)} has no template.`);
+      return failed([record.id], "no_template", `${shown(record.title)} has no template.`);
     }
-    const result = validateTemplate(given);
+  }
+  const result = templateOfRecord(record, given);
+  if (result.ok) return result;
+  const problem = result.issues[0];
+  if (problem?.code === "invalid_template") {
+    return failed(
+      [record.id],
+      "invalid_template",
+      `The template for ${shown(record.title)} is not valid. Check it with validateTemplate.`,
+    );
+  }
+  return failed(
+    [record.id, ...(problem?.path ?? [])],
+    problem?.code ?? "unreadable",
+    problem?.message ?? "The record's template could not be found.",
+  );
+}
+
+function failed(
+  path: readonly (string | number)[],
+  code: string,
+  message: string,
+): { readonly ok: false; readonly issues: readonly Issue[] } {
+  return Object.freeze({
+    ok: false,
+    issues: Object.freeze([Object.freeze(issue(path, code, message))]),
+  });
+}
+
+/** Each record's validated template, in the same order as `up`. */
+function templatesFor(
+  up: readonly CatalogRecord[],
+  templateFor: TemplateSource,
+): readonly CheckedTemplate[] {
+  return up.map((record) => {
+    const result = templateFromSource(record, templateFor);
     if (!result.ok) {
+      const problem = result.issues[0];
       fail(
-        [record.id],
-        "invalid_template",
-        `The template for ${shown(record.title)} is not valid. Check it with validateTemplate.`,
+        problem?.path ?? [record.id],
+        problem?.code ?? "unreadable",
+        problem?.message ?? "The record's template could not be found.",
       );
     }
     const byKey = new Map<string, FieldDefinition>();

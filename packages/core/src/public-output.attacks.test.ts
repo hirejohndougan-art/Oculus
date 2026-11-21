@@ -6,6 +6,7 @@ import {
   MAX_RECORD_SET,
   effectiveRecord,
   indexRecords,
+  indexTemplates,
   newRecordId,
   publicOutput,
   publicView,
@@ -911,5 +912,132 @@ describe("the records changed after the view was made (S-001a)", () => {
       }),
     );
     expect(everything(result)).toContain("SECRET-old-creator");
+  });
+});
+
+// Records name their template (D-0XX). A record must never be published under
+// a template other than the one it names, however the caller's lookup or a
+// kept view would have it.
+describe("records are published only under the template they name", () => {
+  const HOLDER_MAP = {
+    template: "out",
+    entries: [RIGHTS_ENTRY, { field: "holder", term: "rightsHolder" }],
+  };
+  // The same fields as TPL, but `holder` is staff: a donor's name.
+  const STAFF_HOLDER = template(
+    TPL.fields.map((f) => (f.key === "holder" ? { ...f, visibility: "staff" as const } : f)),
+    "donor-records",
+  );
+
+  function registry(...templates: unknown[]) {
+    const r = indexTemplates(templates);
+    if (!r.ok) throw new Error(JSON.stringify(r.issues));
+    return r.value;
+  }
+
+  function keyedItem(templateKey: string) {
+    return record(
+      "object",
+      "Chair",
+      { rights: { uri: CNE }, holder: "SECRET-donor-name" },
+      { templateKey },
+    );
+  }
+
+  it("publishes with a registry as templateFor, finding the template by the record's key", () => {
+    const item = keyedItem("out");
+    const templates = registry(TPL, STAFF_HOLDER);
+    const built = effectiveRecord(item.id, [item], templates, { checkers: CHECKERS });
+    if (!built.ok) throw new Error(JSON.stringify(built.issues));
+    const view = publicView(built.value);
+    if (view === undefined) throw new Error("no view");
+    const out = ok(
+      publicOutput(view, HOLDER_MAP, {
+        baseUrl: BASE,
+        published: [item.id],
+        checkers: CHECKERS,
+        templateFor: templates,
+        records: [item],
+      }),
+    );
+    expect(everything(out)).toContain("SECRET-donor-name");
+  });
+
+  it("never builds a view under another template from a lookup that ignores the record's key", () => {
+    const item = keyedItem("donor-records");
+    const built = effectiveRecord(item.id, [item], () => TPL, { checkers: CHECKERS });
+    expect(codes(built)).toEqual(["template_mismatch"]);
+  });
+
+  it("refuses a kept view when the lookup now gives the record another template", () => {
+    const item = keyedItem("donor-records");
+    const built = effectiveRecord(item.id, [item], registry(STAFF_HOLDER), { checkers: CHECKERS });
+    if (!built.ok) throw new Error(JSON.stringify(built.issues));
+    const view = publicView(built.value);
+    if (view === undefined) throw new Error("no view");
+    const result = publicOutput(
+      view,
+      { template: "donor-records", entries: [RIGHTS_ENTRY] },
+      {
+        baseUrl: BASE,
+        published: [item.id],
+        checkers: CHECKERS,
+        templateFor: () => TPL,
+      },
+    );
+    expect(codes(result)).toEqual(["template_mismatch"]);
+    expect(result.ok ? [] : result.issues[0]?.path).toEqual(["templateFor"]);
+    expect(JSON.stringify(result)).not.toContain("SECRET");
+  });
+
+  it("refuses a kept view once the record has been moved to a template that makes a value staff", () => {
+    // Built while the record followed `out`, where `holder` is public; then
+    // the record is moved to `donor-records`, where `holder` is staff.
+    const item = keyedItem("out");
+    const templates = registry(TPL, STAFF_HOLDER);
+    const built = effectiveRecord(item.id, [item], templates, { checkers: CHECKERS });
+    if (!built.ok) throw new Error(JSON.stringify(built.issues));
+    const view = publicView(built.value);
+    if (view === undefined) throw new Error("no view");
+    expect(view.fields.holder).toBe("SECRET-donor-name");
+    const moved = { ...item, templateKey: "donor-records" };
+    const result = publicOutput(view, HOLDER_MAP, {
+      baseUrl: BASE,
+      published: [item.id],
+      checkers: CHECKERS,
+      templateFor: templates,
+      records: [moved],
+    });
+    expect(codes(result)).toEqual(["record_changed"]);
+    expect(result.ok ? [] : result.issues[0]?.path).toEqual(["records", item.id]);
+    expect(JSON.stringify(result)).not.toContain("SECRET");
+    // A view built now follows the template the record names: nothing to publish.
+    const fresh = effectiveRecord(item.id, [moved], templates, { checkers: CHECKERS });
+    if (!fresh.ok) throw new Error(JSON.stringify(fresh.issues));
+    expect(publicView(fresh.value)?.fields.holder).toBeUndefined();
+  });
+
+  it("refuses a record with no templateKey when templateFor is a registry", () => {
+    const item = record("object", "Chair", { rights: { uri: CNE } });
+    const view = viewOf([item], item.id);
+    const result = publicOutput(view, MAPPING, {
+      baseUrl: BASE,
+      published: [item.id],
+      checkers: CHECKERS,
+      templateFor: registry(TPL),
+    });
+    expect(codes(result)).toEqual(["no_template_key"]);
+  });
+
+  it("refuses a registry-shaped object as templateFor", () => {
+    const item = record("object", "Chair", { rights: { uri: CNE } });
+    const view = viewOf([item], item.id);
+    const result = publicOutput(view, MAPPING, {
+      baseUrl: BASE,
+      published: [item.id],
+      checkers: CHECKERS,
+      templateFor: Object.freeze({ size: 1 }),
+    });
+    expect(codes(result)).toEqual(["invalid_options"]);
   });
 });

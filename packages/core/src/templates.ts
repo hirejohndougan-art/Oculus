@@ -52,6 +52,14 @@
  * `visibility` has no default: every field says `public` or `staff`, so a
  * template can't make a field public by leaving something out. Staff-only
  * fields must never reach public output (T-010).
+ *
+ * **A record names its template** (`templateKey`, D-0XX). The checks take
+ * either one template or a registry from `indexTemplates`, the organization's
+ * templates validated once and found by key. Either way, a record whose
+ * `templateKey` names a different template than the one given is refused
+ * (`template_mismatch`), never checked against it: a record moved silently
+ * to another template could have its staff values published under a key the
+ * other template makes public.
  */
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import {
@@ -70,7 +78,13 @@ import { RIGHTS_FIELD_KEY } from "./rights.js";
 // which they load doesn't matter.
 import { VOCABULARY_CODES, controlledTermChecker } from "./vocabularies.js";
 import { isRecordId } from "./record-id.js";
-import { RECORD_KINDS, isRecordKind, type CatalogRecord, type RecordKind } from "./records.js";
+import {
+  RECORD_KINDS,
+  isRecordKind,
+  isTemplateKey,
+  type CatalogRecord,
+  type RecordKind,
+} from "./records.js";
 import { types } from "node:util";
 
 export const FIELD_KINDS = [
@@ -288,7 +302,7 @@ function checkTemplate(input: unknown): Validated<FieldTemplate> {
   const t = ownOnly(copy);
 
   unknownProps(t, TEMPLATE_KEYS, [], "a template", issues);
-  if (!isCode(t.key)) {
+  if (!isTemplateKey(t.key)) {
     issues.add(
       ["key"],
       "invalid_key",
@@ -632,6 +646,146 @@ function checkHelp(value: JsonValue, path: readonly (string | number)[], issues:
 }
 
 // ---------------------------------------------------------------------------
+// The template registry: an organization's templates, found by key.
+
+/** The most templates one registry from `indexTemplates` may hold. */
+export const MAX_REGISTRY_TEMPLATES = 1000;
+
+/**
+ * An organization's templates, each validated once and found by its key,
+ * from `indexTemplates`. Opaque and frozen: one consistent snapshot, which
+ * must be built again after any template is edited. Anything else passed as
+ * one is not a registry.
+ */
+export interface TemplateRegistry {
+  /** How many templates it holds. */
+  readonly size: number;
+}
+
+/** Registries made by `indexTemplates`, with their validated templates by key. */
+const REGISTRIES = new WeakMap<object, ReadonlyMap<string, FieldTemplate>>();
+
+/**
+ * Validate a list of templates once and index them by key, for
+ * `checkRecordAgainstTemplate`, `effectiveRecord` and `publicOutput`. Each
+ * template is validated (copied) now, so later changes to the caller's
+ * objects are not seen. Any invalid template, a key used twice, a hole,
+ * getter or Proxy refuses the whole list: a registry that quietly left one
+ * out could not say which template a record follows. The keys come from the
+ * templates themselves, never from a separate map that could disagree with
+ * them. Never throws.
+ */
+export function indexTemplates(templates: unknown): Validated<TemplateRegistry> {
+  try {
+    if (types.isProxy(templates) || !Array.isArray(templates)) {
+      return refused([], "not_a_list", "The templates must be given as a list.");
+    }
+    const length = templates.length;
+    if (length > MAX_REGISTRY_TEMPLATES) {
+      return refused(
+        [],
+        "too_many",
+        `A registry can hold at most ${String(MAX_REGISTRY_TEMPLATES)} templates.`,
+      );
+    }
+    const byKey = new Map<string, FieldTemplate>();
+    const issues = new IssueList();
+    for (let i = 0; i < length && !issues.full; i += 1) {
+      // Read each slot as a plain data property, so a getter can't run.
+      const slot = Object.getOwnPropertyDescriptor(templates, i);
+      const given: unknown = slot !== undefined && "value" in slot ? slot.value : undefined;
+      const checked = validateTemplate(given);
+      if (!checked.ok) {
+        for (const found of checked.issues) {
+          issues.add([i, ...found.path], found.code, found.message);
+        }
+        continue;
+      }
+      const key = checked.value.key;
+      if (byKey.has(key)) {
+        issues.add(
+          [i, "key"],
+          "duplicate_key",
+          `More than one template has the key ${shown(key)}.`,
+        );
+        continue;
+      }
+      byKey.set(key, checked.value);
+    }
+    if (issues.count > 0) return { ok: false, issues: issues.items };
+    const registry: TemplateRegistry = Object.freeze({ size: byKey.size });
+    REGISTRIES.set(registry, byKey);
+    return { ok: true, value: registry };
+  } catch {
+    return refused([], "unreadable", "The templates could not be read as plain data.");
+  }
+}
+
+/** True if `value` is a registry made by `indexTemplates`. */
+export function isTemplateRegistry(value: unknown): value is TemplateRegistry {
+  return typeof value === "object" && value !== null && REGISTRIES.has(value);
+}
+
+function refused(
+  path: readonly (string | number)[],
+  code: string,
+  message: string,
+): { readonly ok: false; readonly issues: readonly Issue[] } {
+  return { ok: false, issues: [issue(path, code, message)] };
+}
+
+/**
+ * The validated template `record` follows: from a registry, the one its
+ * `templateKey` names; otherwise `given`, validated, which must have the
+ * record's `templateKey` (if it has one) as its key. For this module,
+ * `effective.ts` and `public-output.ts` (not exported from the package).
+ * Messages name template keys only, never a record's title or values.
+ * Never throws.
+ */
+export function templateOfRecord(record: CatalogRecord, given: unknown): Validated<FieldTemplate> {
+  try {
+    const stored = Object.hasOwn(record, "templateKey") ? record.templateKey : undefined;
+    const registered = isTemplateRegistry(given) ? REGISTRIES.get(given) : undefined;
+    if (registered !== undefined) {
+      if (stored === undefined) {
+        return refused(
+          ["templateKey"],
+          "no_template_key",
+          "This record doesn't say which template it follows, so its template can't be found in the registry. Give it a templateKey.",
+        );
+      }
+      const template = registered.get(stored);
+      if (template === undefined) {
+        return refused(
+          ["templateKey"],
+          "unknown_template",
+          `There is no template with the key ${shown(stored)} in the registry.`,
+        );
+      }
+      return { ok: true, value: template };
+    }
+    const checked = validateTemplate(given);
+    if (!checked.ok) {
+      return refused(
+        [],
+        "invalid_template",
+        "The template is not valid, so the record can't be checked against it. Check it with validateTemplate.",
+      );
+    }
+    if (stored !== undefined && checked.value.key !== stored) {
+      return refused(
+        ["templateKey"],
+        "template_mismatch",
+        `This record follows the template ${shown(stored)}, not ${shown(checked.value.key)}, so it can't be checked against that one.`,
+      );
+    }
+    return checked;
+  } catch {
+    return refused([], "unreadable", "The record's template could not be found.");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Checking a record against its template.
 
 /** A problem a plugged-in checker found, relative to the value it was given. */
@@ -679,26 +833,26 @@ export interface TemplateCheckOptions {
  * `invalid_template` instead of letting values through. Returns every
  * problem found, or an empty list. Never throws.
  *
+ * In place of the template, a registry from `indexTemplates` may be given:
+ * the template is then the one the record's `templateKey` names
+ * (`no_template_key` without one, `unknown_template` if the registry doesn't
+ * have it). A template given directly must have the record's `templateKey`
+ * as its key (`template_mismatch`); a record with no `templateKey` (stored
+ * before records named their template) is checked against it as before.
+ *
  * Optional settings, in the template and in `options`, are read only as own
  * properties, so a polluted `Object.prototype` can't change them.
  */
 export function checkRecordAgainstTemplate(
   record: CatalogRecord,
-  untrustedTemplate: FieldTemplate,
+  untrustedTemplate: FieldTemplate | TemplateRegistry,
   options: TemplateCheckOptions = {},
 ): Issue[] {
   const issues = new IssueList();
   try {
-    const checked = validateTemplate(untrustedTemplate);
-    if (!checked.ok) {
-      issues.add(
-        [],
-        "invalid_template",
-        "The template is not valid, so the record can't be checked against it. Check it with validateTemplate.",
-      );
-      return issues.items;
-    }
-    const template = checked.value;
+    const found = templateOfRecord(record, untrustedTemplate);
+    if (!found.ok) return [...found.issues];
+    const template = found.value;
     const settings: CheckSettings = {
       allowMissingInherited: ownValue(options, "allowMissingInherited") === true,
       checkers: ownValue(options, "checkers"),

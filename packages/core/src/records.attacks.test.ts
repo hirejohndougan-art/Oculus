@@ -6,6 +6,7 @@ import {
   MAX_RECORD_CHARS,
   MAX_STRING_LENGTH,
   createRecord,
+  isTemplateKey,
   validateRecord,
   type Issue,
   type Validated,
@@ -311,5 +312,49 @@ describe("second review", () => {
     const list: unknown[] = [1];
     Object.defineProperty(list, 0, { value: 9, enumerable: false });
     expect(codes(validateRecord({ ...valid(), fields: { list } }))).toEqual(["not_plain_data"]);
+  });
+});
+
+describe("hostile template keys (D-0XX)", () => {
+  it("refuses prototype keys as a template key", () => {
+    for (const bad of ["constructor", "prototype", "__proto__"]) {
+      expect(codes(validateRecord({ ...valid(), templateKey: bad }))).toEqual([
+        "invalid_template_key",
+      ]);
+    }
+  });
+
+  it("doesn't read a templateKey from Object.prototype", () => {
+    const proto = Object.prototype as Record<string, unknown>;
+    proto.templateKey = "public-everything";
+    try {
+      const r = validateRecord(valid());
+      expect(r.ok).toBe(true);
+      expect(r.ok && Object.hasOwn(r.value, "templateKey")).toBe(false);
+    } finally {
+      delete proto.templateKey;
+    }
+  });
+
+  it("refuses a getter for the template key without running it", () => {
+    let ran = false;
+    const input = valid();
+    Object.defineProperty(input, "templateKey", {
+      enumerable: true,
+      get: () => {
+        ran = true;
+        return "t";
+      },
+    });
+    expect(validateRecord(input).ok).toBe(false);
+    expect(ran).toBe(false);
+  });
+
+  it("refuses lookalike and invisible characters in the key", () => {
+    for (const bad of ["t\u0435mplate", "t\u200bx", "t\u0000", "\uff54"]) {
+      const r = validateRecord({ ...valid(), templateKey: bad });
+      expect(r.ok).toBe(false);
+      expect(isTemplateKey(bad)).toBe(false);
+    }
   });
 });

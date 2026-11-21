@@ -99,10 +99,12 @@ import {
   MAX_RECORD_SET,
   currentAncestry,
   effectivePublishIssues,
+  isTemplateSource,
+  templateFromSource,
   type EffectiveRecord,
   type PublicRecord,
   type RecordLookup,
-  type TemplateLookup,
+  type TemplateSource,
 } from "./effective.js";
 import {
   DCTERMS_NAMESPACE,
@@ -162,14 +164,16 @@ export interface PublishOptions {
    */
   readonly currentTemplate?: unknown;
   /**
-   * The template lookup as it is now, the same kind `effectiveRecord` takes.
-   * When given, it is asked again for the record and every ancestor the view
-   * was built from, and output is refused if any of their templates differs
-   * from the one the view used (`template_changed`): a parent's field made
-   * staff since would otherwise still publish the value its child inherited.
-   * With `records`, it is asked with the records as they are now.
+   * The templates as they are now: a registry from `indexTemplates` or a
+   * lookup function, the same kinds `effectiveRecord` takes. When given, the
+   * template of the record and of every ancestor the view was built from is
+   * found again, and output is refused if any differs from the one the view
+   * used (`template_changed`): a parent's field made staff since would
+   * otherwise still publish the value its child inherited. A template whose
+   * key isn't the record's `templateKey` is refused (`template_mismatch`).
+   * With `records`, the templates are found for the records as they are now.
    */
-  readonly templateFor?: TemplateLookup;
+  readonly templateFor?: TemplateSource;
   /**
    * The records as they are now, a list or a lookup from `indexRecords`, the
    * same kind `effectiveRecord` takes. When given, the record and its parents
@@ -419,6 +423,18 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
   const blocked = effectivePublishIssues(effective);
   if (blocked.length > 0) throw new OutputError(blocked);
   const template = origin.template;
+  // Checked again at the boundary: every template the view was built with is
+  // the one its record names (D-0XX).
+  for (const step of origin.chain) {
+    const named = Object.hasOwn(step.record, "templateKey") ? step.record.templateKey : undefined;
+    if (named !== undefined && named !== step.template.key) {
+      fail(
+        ["templateKey"],
+        "template_mismatch",
+        "This public view was made with a template its record doesn't follow, so it can't be published.",
+      );
+    }
+  }
   if (currentTemplate !== undefined) {
     sameTemplate(currentTemplate, template);
     if (origin.chain.length > 1 && templateFor === undefined) {
@@ -524,19 +540,32 @@ function sameTemplate(current: unknown, captured: FieldTemplate): void {
  * or changed visibility changes what the child may publish.
  */
 function sameChainTemplates(
-  templateFor: TemplateLookup,
+  templateFor: TemplateSource,
   chain: readonly { readonly record: CatalogRecord; readonly template: FieldTemplate }[],
 ): void {
   for (const [index, step] of chain.entries()) {
     const path = index === 0 ? ["templateFor"] : ["templateFor", step.record.id];
-    let given: unknown;
-    try {
-      given = templateFor(step.record);
-    } catch {
-      fail(path, "template_lookup_failed", "Finding a template with templateFor failed.");
+    const checked = templateFromSource(step.record, templateFor);
+    // Messages here never quote the record's title (the lookup's own do).
+    const code = checked.ok ? undefined : checked.issues[0]?.code;
+    if (code === "template_lookup_failed") {
+      fail(path, code, "Finding a template with templateFor failed.");
     }
-    const checked = given === undefined ? undefined : validateTemplate(given);
-    if (checked?.ok !== true || canonicalJson(checked.value) !== canonicalJson(step.template)) {
+    if (code === "template_mismatch") {
+      fail(
+        path,
+        code,
+        "The template found for this record is not the one the record names, so it can't be published.",
+      );
+    }
+    if (code === "no_template_key") {
+      fail(
+        path,
+        code,
+        "This record doesn't say which template it follows, so its template can't be found in the registry.",
+      );
+    }
+    if (!checked.ok || canonicalJson(checked.value) !== canonicalJson(step.template)) {
       fail(
         path,
         "template_changed",
@@ -763,7 +792,7 @@ interface ReadOptions {
   readonly published: ReadonlySet<RecordId>;
   readonly checkers: unknown;
   readonly currentTemplate: unknown;
-  readonly templateFor: TemplateLookup | undefined;
+  readonly templateFor: TemplateSource | undefined;
   readonly records: unknown;
 }
 
@@ -781,10 +810,14 @@ function readOptions(options: unknown): ReadOptions {
   const checkers = dataProp(options, "checkers");
   const currentTemplate = dataProp(options, "currentTemplate");
   const lookup = dataProp(options, "templateFor");
-  if (lookup !== undefined && (typeof lookup !== "function" || types.isProxy(lookup))) {
-    fail(["templateFor"], "invalid_options", "The templateFor option must be a function.");
+  if (lookup !== undefined && !isTemplateSource(lookup)) {
+    fail(
+      ["templateFor"],
+      "invalid_options",
+      "The templateFor option must be a registry from indexTemplates or a function.",
+    );
   }
-  const templateFor = lookup as TemplateLookup | undefined;
+  const templateFor = lookup;
   // Checked when it is used: it may be a list or a lookup from indexRecords.
   const records = dataProp(options, "records");
   return { baseUrl, published, checkers, currentTemplate, templateFor, records };

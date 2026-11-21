@@ -21,6 +21,7 @@ export {
   createRecord,
   isRecordKind,
   isArchivalLevel,
+  isTemplateKey,
 } from "./records.js";
 export type {
   RecordKind,
@@ -127,6 +128,9 @@ export {
   webUrlProblem,
   validateTemplate,
   checkRecordAgainstTemplate,
+  MAX_REGISTRY_TEMPLATES,
+  indexTemplates,
+  isTemplateRegistry,
 } from "./templates.js";
 export type {
   FieldKind,
@@ -138,6 +142,7 @@ export type {
   FieldProblem,
   FieldValueChecker,
   TemplateCheckOptions,
+  TemplateRegistry,
 } from "./templates.js";
 
 export { TEMPLATE_CHANGE_CODES, MAX_LISTED_RECORDS, templateChanges } from "./template-changes.js";
@@ -207,6 +212,7 @@ export type {
   PublicField,
   PublicRecord,
   TemplateLookup,
+  TemplateSource,
   RecordLookup,
 } from "./effective.js";
 

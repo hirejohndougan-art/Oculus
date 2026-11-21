@@ -3,7 +3,10 @@ import {
   MAX_REPEATS,
   MAX_TEMPLATE_FIELDS,
   MAX_TEXT_LENGTH,
+  MAX_REGISTRY_TEMPLATES,
   checkRecordAgainstTemplate,
+  indexTemplates,
+  isTemplateRegistry,
   isFieldKey,
   makeIdentifierChecker,
   validateRecord,
@@ -782,5 +785,80 @@ describe("webUrlProblem", () => {
     ]) {
       expect(webUrlProblem(url), url).toBeDefined();
     }
+  });
+});
+
+describe("template registries and record template keys (D-0XX)", () => {
+  const objects = {
+    key: "objects",
+    label: "Objects",
+    appliesTo: ["object"],
+    fields: [
+      {
+        key: "note",
+        label: "Note",
+        kind: "text",
+        required: true,
+        repeatable: false,
+        visibility: "public",
+        inherited: false,
+      },
+    ],
+  };
+  const events = { ...objects, key: "events", label: "Events", appliesTo: ["event"] };
+
+  function rec(templateKey: string | undefined, fields: Record<string, unknown> = {}) {
+    const r = validateRecord({
+      kind: "object",
+      id: "3f1c2a9e-8b7d-4c6e-9a1b-2d3e4f5a6b7c",
+      title: "Chair",
+      ...(templateKey === undefined ? {} : { templateKey }),
+      createdAt: "2026-11-20T16:05:00.000Z",
+      updatedAt: "2026-11-20T16:05:00.000Z",
+      fields,
+    });
+    if (!r.ok) throw new Error(JSON.stringify(r.issues));
+    return r.value;
+  }
+
+  it("indexes templates by key, validated once", () => {
+    const r = indexTemplates([objects, events]);
+    expect(r.ok && r.value.size).toBe(2);
+    expect(r.ok && isTemplateRegistry(r.value)).toBe(true);
+    expect(indexTemplates([]).ok).toBe(true);
+  });
+
+  it("checks a record against the template its templateKey names", () => {
+    const r = indexTemplates([objects, events]);
+    if (!r.ok) throw new Error("registry");
+    expect(checkRecordAgainstTemplate(rec("objects", { note: "Oak" }), r.value)).toEqual([]);
+    expect(checkRecordAgainstTemplate(rec("objects"), r.value).map((i) => i.code)).toEqual([
+      "required",
+    ]);
+    // A registry template for another kind is still refused.
+    expect(checkRecordAgainstTemplate(rec("events"), r.value).map((i) => i.code)).toEqual([
+      "wrong_template",
+    ]);
+  });
+
+  it("accepts a template given directly when its key is the record's templateKey", () => {
+    const t = validateTemplate(objects);
+    if (!t.ok) throw new Error("template");
+    expect(checkRecordAgainstTemplate(rec("objects", { note: "Oak" }), t.value)).toEqual([]);
+  });
+
+  it("still checks a record with no templateKey against a template given directly", () => {
+    const t = validateTemplate(objects);
+    if (!t.ok) throw new Error("template");
+    expect(checkRecordAgainstTemplate(rec(undefined, { note: "Oak" }), t.value)).toEqual([]);
+  });
+
+  it("refuses more than MAX_REGISTRY_TEMPLATES templates", () => {
+    const many = Array.from({ length: MAX_REGISTRY_TEMPLATES + 1 }, (_, i) => ({
+      ...objects,
+      key: `t${String(i)}`,
+    }));
+    const r = indexTemplates(many);
+    expect(r.ok ? [] : r.issues.map((i) => i.code)).toEqual(["too_many"]);
   });
 });
