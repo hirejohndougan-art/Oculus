@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { identifierKey } from "./index.js";
+import { hasTooManyMarks } from "./identifier-key.js";
 
 const same = (a: string, b: string): boolean => identifierKey(a) === identifierKey(b);
 
@@ -81,6 +82,28 @@ describe("identifierKey", () => {
     expect(same(marks, "A" + "\u0301".repeat(31))).toBe(true);
     expect(same(marks, "\u00e1" + "\u0301".repeat(30))).toBe(true);
     expect(same(marks, "a" + "\u0301".repeat(30))).toBe(false);
+  });
+
+  it("counts marks that only appear after decomposing (S-003 third review)", () => {
+    // Half-width ﾞ (U+FF9E) is not a mark, but NFKD turns it into U+3099.
+    const sneaky = "a" + "\u0301".repeat(8) + "\uff9e";
+    expect(hasTooManyMarks(sneaky)).toBe(true);
+    expect(identifierKey(sneaky).startsWith("\ufeff")).toBe(true); // the sorted-marks path
+    expect(hasTooManyMarks("a" + "\u0301".repeat(7) + "\uff9e")).toBe(false);
+    expect(same("ｶﾞ-1", "ガ-1")).toBe(true);
+  });
+
+  it("long runs that grow on decomposing stay linear (S-003 third review)", () => {
+    const value = "a" + ("\u0301".repeat(8) + "\uff9e").repeat(20_000);
+    const started = performance.now();
+    identifierKey(value);
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
+  it("U+0345 sorts with the other marks before case folding (S-003 third review)", () => {
+    const acutes = "\u0301".repeat(9);
+    expect(same(`\u03b1\u0345${acutes}-1`, `\u03b1${acutes}\u0345-1`)).toBe(true);
+    expect(`\u03b1\u0345${acutes}`.normalize("NFD")).toBe(`\u03b1${acutes}\u0345`.normalize("NFD"));
   });
 
   it("treats blank-looking characters as spaces (S-003)", () => {

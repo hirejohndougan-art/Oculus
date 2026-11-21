@@ -190,21 +190,20 @@ function hasLongRun(text: string): boolean {
 }
 
 /**
- * The text with spaces, invisibles and blanks removed and decomposed (NFKD),
- * and whether it has a run of more than `MAX_MARK_RUN` marks. The answer is
- * the same for every canonically equivalent spelling, and the work is linear:
- * a run already too long before decomposing (decomposing never shortens a
- * run) is decomposed one character at a time, which needs no sorting;
- * otherwise every run is short enough to sort cheaply.
+ * The text with spaces, invisibles and blanks removed and every character
+ * decomposed on its own (NFKD), and whether it has a run of more than
+ * `MAX_MARK_RUN` marks. This is NFKD except that marks are not yet put in
+ * canonical order, the step that can be slow; so the answer is the same for
+ * every canonically equivalent spelling, and the work is linear. Decomposing
+ * the whole text at once is not safe: characters that are not marks can
+ * decompose into marks (half-width `ﾞ` U+FF9E becomes U+3099) and so build a
+ * long run no check on the text before decomposing would see.
  */
 function decompose(value: string): { readonly text: string; readonly long: boolean } {
   const visible = value.replace(OGHAM_SPACE, "-").replace(SPACE_OR_INVISIBLE, "");
+  const split = visible.replace(NOT_ASCII, (ch) => ch.normalize("NFKD"));
   // NFKD can give a space before a mark (U+00A8 is space + diaeresis): those go too.
-  if (hasLongRun(visible)) {
-    const text = visible.replace(ANY_CHAR, (ch) => ch.normalize("NFKD"));
-    return { text: text.replace(SPACE_OR_INVISIBLE, ""), long: true };
-  }
-  const text = visible.normalize("NFKD").replace(SPACE_OR_INVISIBLE, "");
+  const text = split.replace(SPACE_OR_INVISIBLE, "");
   return { text, long: hasLongRun(text) };
 }
 
@@ -225,6 +224,8 @@ const SORTED_MARKS = "\ufeff";
 const byCodePoint = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
 const ANY_CHAR = /./gsu;
+/** Printable ASCII is already decomposed; the rest is split one character at a time. */
+const NOT_ASCII = /[^ -~]/gu;
 /** The Ogham space mark counts as a space to `\s`, but is drawn as a dash. */
 const OGHAM_SPACE = /\u1680/gu;
 const SPACE_OR_INVISIBLE = new RegExp(
@@ -239,15 +240,15 @@ const SPACE_OR_INVISIBLE = new RegExp(
 export function identifierKey(value: string): string {
   const { text, long } = decompose(value);
   const mapped = text.replace(ANY_CHAR, (ch) => LOOKALIKES.get(ch) ?? ch);
-  const folded = mapped.toUpperCase().toLowerCase();
   if (long) {
     // Marks sorted by code point instead of canonical order: equivalent
     // spellings meet, and so may a few that differ only in mark order.
-    const split = folded.replace(ANY_CHAR, (ch) => ch.normalize("NFD"));
-    return (
-      SORTED_MARKS + split.replace(MARK_RUN, (run) => Array.from(run).sort(byCodePoint).join(""))
-    );
+    // Sorted before case folding, which turns U+0345 (a mark) into `ι` and
+    // would otherwise split a run at a place that depends on the order.
+    const sorted = mapped.replace(MARK_RUN, (run) => Array.from(run).sort(byCodePoint).join(""));
+    return SORTED_MARKS + sorted.toUpperCase().toLowerCase();
   }
+  const folded = mapped.toUpperCase().toLowerCase();
   // Every run of marks is short, so this is linear in the text's length.
   return folded.normalize("NFKC").replace(SPACE_OR_INVISIBLE, "");
 }
