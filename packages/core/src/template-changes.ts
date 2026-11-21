@@ -1,0 +1,411 @@
+/**
+ * Safe template changes (roadmap T-005a, security S-002, decision D-0XX).
+ *
+ * A template edit can publish data or strand it. A value entered while its
+ * field was `staff` is published as soon as the field is made `public`, and
+ * the same happens when a staff field is removed (its values stay in the
+ * records as left-over keys, which are staff) and a public field is later
+ * added with the same key. `templateChanges(oldTemplate, newTemplate,
+ * records?)` compares two versions of one template before the new one is
+ * saved and lists what needs a person's confirmation:
+ *
+ * - `made_public`: a field goes from staff to public, or a new public field
+ *   uses a key that records already hold left-over (staff) values for.
+ *   Always needs confirmation, with or without records.
+ * - `key_reused`: a new field uses a key the old template lacked, and records
+ *   hold left-over values for it, which will now be read as the new field's.
+ * - `key_removed`: a field is gone; records keep its values as left-overs.
+ * - `kind_changed`: stored values may no longer fit the field.
+ * - `repeatable_changed`: stored lists or single values no longer fit; when
+ *   a field stops repeating, `recordsWithSeveralValues` lists the records
+ *   that can't be converted without dropping values.
+ * - `option_removed`: a list option is gone (`option` names it).
+ * - `inherited_changed`, `made_staff`: informational.
+ *
+ * When `records` (the records that use the template) are given, each change
+ * lists the IDs of the records holding a value for its key. Without them,
+ * left-over keys can't be seen, so `recordsChecked` is false and every change
+ * that could affect records needs confirmation. Callers saving a template
+ * should pass the records.
+ *
+ * Messages name keys and give counts only: they never quote a stored value,
+ * since a staff value is exactly what this guards. Everything is validated
+ * first (both templates with `validateTemplate`, every record with
+ * `validateRecord`); any doubt refuses the whole comparison with issues. The
+ * work is linear in the records times the keys that changed. Never throws.
+ */
+import { issue, type Issue, type Validated } from "./issues.js";
+import { shown, type JsonValue } from "./plain-data.js";
+import { validateRecord, type CatalogRecord } from "./records.js";
+import type { RecordId } from "./record-id.js";
+import { validateTemplate, type FieldDefinition, type FieldTemplate } from "./templates.js";
+import { MAX_RECORD_SET } from "./effective.js";
+import { types } from "node:util";
+
+export const TEMPLATE_CHANGE_CODES = [
+  "made_public",
+  "key_reused",
+  "key_removed",
+  "kind_changed",
+  "repeatable_changed",
+  "option_removed",
+  "inherited_changed",
+  "made_staff",
+] as const;
+export type TemplateChangeCode = (typeof TEMPLATE_CHANGE_CODES)[number];
+
+/** The most record IDs one change lists; `recordCount` always gives the full number. */
+export const MAX_LISTED_RECORDS = 10_000;
+
+export interface TemplateChange {
+  readonly code: TemplateChangeCode;
+  /** The field key the change is about. */
+  readonly key: string;
+  /** True when the change must be confirmed by a person before the template is saved. */
+  readonly needsConfirmation: boolean;
+  /** Plain English; names the key and counts, never a stored value. */
+  readonly message: string;
+  /** Records holding a value for `key` (for `option_removed`, using `option`). At most `MAX_LISTED_RECORDS`. */
+  readonly recordIds: readonly RecordId[];
+  /** How many records hold such a value, even beyond the listed IDs. */
+  readonly recordCount: number;
+  /** `option_removed` only: the option value the template dropped. */
+  readonly option?: string;
+  /** `repeatable_changed` from true to false only: records holding more than one value. */
+  readonly recordsWithSeveralValues?: readonly RecordId[];
+}
+
+export interface TemplateChanges {
+  /** Every change, frozen, in the order of the old template's fields, then the new fields. */
+  readonly changes: readonly TemplateChange[];
+  /** True if any change needs confirmation. */
+  readonly needsConfirmation: boolean;
+  /** False when no records were given, so left-over keys and affected records weren't checked. */
+  readonly recordsChecked: boolean;
+}
+
+/**
+ * Compare a template with the version about to replace it, and list the
+ * changes that need confirmation (see the module header). `records` are the
+ * records that use the template; leave it out only when there are none to
+ * check, since left-over keys are found only through them. Never throws.
+ */
+export function templateChanges(
+  oldTemplate: unknown,
+  newTemplate: unknown,
+  records?: unknown,
+): Validated<TemplateChanges> {
+  try {
+    return compare(oldTemplate, newTemplate, records);
+  } catch {
+    return {
+      ok: false,
+      issues: [issue([], "unreadable", "These templates or records could not be read.")],
+    };
+  }
+}
+
+function compare(
+  oldInput: unknown,
+  newInput: unknown,
+  recordsInput: unknown,
+): Validated<TemplateChanges> {
+  const issues: Issue[] = [];
+  const before = validateTemplate(oldInput);
+  if (!before.ok) issues.push(...prefixed("oldTemplate", before.issues));
+  const after = validateTemplate(newInput);
+  if (!after.ok) issues.push(...prefixed("newTemplate", after.issues));
+  if (!before.ok || !after.ok) return { ok: false, issues };
+  if (before.value.key !== after.value.key) {
+    return {
+      ok: false,
+      issues: [
+        issue(
+          ["newTemplate", "key"],
+          "different_template",
+          `These are two different templates (${shown(before.value.key)} and ${shown(after.value.key)}), not two versions of one.`,
+        ),
+      ],
+    };
+  }
+
+  let records: readonly CatalogRecord[] | undefined;
+  if (recordsInput !== undefined) {
+    const read = readRecords(recordsInput);
+    if (!read.ok) return read;
+    records = read.value;
+  }
+
+  const oldFields = byKey(before.value);
+  const newFields = byKey(after.value);
+  const found: Found[] = [];
+  for (const [key, was] of oldFields) {
+    const now = newFields.get(key);
+    if (now === undefined) {
+      found.push({ code: "key_removed", key });
+      continue;
+    }
+    if (was.visibility === "staff" && now.visibility === "public") {
+      found.push({ code: "made_public", key });
+    }
+    if (was.kind !== now.kind) found.push({ code: "kind_changed", key });
+    if (was.repeatable !== now.repeatable) {
+      found.push({ code: "repeatable_changed", key, toSingle: was.repeatable });
+    }
+    if (was.kind === "list" && now.kind === "list") {
+      const kept = new Set((now.options ?? []).map((o) => o.value));
+      for (const o of was.options ?? []) {
+        if (!kept.has(o.value)) found.push({ code: "option_removed", key, option: o.value });
+      }
+    }
+    if (was.inherited !== now.inherited) found.push({ code: "inherited_changed", key });
+    if (was.visibility === "public" && now.visibility === "staff") {
+      found.push({ code: "made_staff", key });
+    }
+  }
+  // New keys: only records can show whether they hold left-over values.
+  const added: FieldDefinition[] = [];
+  for (const [key, now] of newFields) if (!oldFields.has(key)) added.push(now);
+
+  const usage = records === undefined ? undefined : scan(records, found, added);
+  const changes: TemplateChange[] = [];
+  for (const f of found) changes.push(finish(f, usage));
+  if (usage !== undefined) {
+    for (const now of added) {
+      const held = usage.byKey.get(now.key);
+      if (held === undefined || held.count === 0) continue;
+      if (now.visibility === "public")
+        changes.push(finish({ code: "made_public", key: now.key, leftOver: true }, usage));
+      changes.push(finish({ code: "key_reused", key: now.key }, usage));
+    }
+  }
+
+  return {
+    ok: true,
+    value: Object.freeze({
+      changes: Object.freeze(changes),
+      needsConfirmation: changes.some((c) => c.needsConfirmation),
+      recordsChecked: records !== undefined,
+    }),
+  };
+}
+
+// ---------------------------------------------------------------------------
+
+interface Found {
+  readonly code: TemplateChangeCode;
+  readonly key: string;
+  readonly option?: string;
+  /** repeatable_changed: the field stops repeating. */
+  readonly toSingle?: boolean;
+  /** made_public: the key was only a left-over in the records. */
+  readonly leftOver?: boolean;
+}
+
+/** Records found for one key or one option. */
+class Held {
+  readonly ids: RecordId[] = [];
+  count = 0;
+  add(id: RecordId): void {
+    this.count += 1;
+    if (this.ids.length < MAX_LISTED_RECORDS) this.ids.push(id);
+  }
+}
+
+interface Usage {
+  /** Records holding any value, by key. */
+  readonly byKey: ReadonlyMap<string, Held>;
+  /** Records holding a list value, by key, then option value. */
+  readonly byOption: ReadonlyMap<string, ReadonlyMap<string, Held>>;
+  /** Records holding more than one value, by key. */
+  readonly several: ReadonlyMap<string, Held>;
+}
+
+/** One pass over the records, looking only at the keys that changed or are new. */
+function scan(
+  records: readonly CatalogRecord[],
+  found: readonly Found[],
+  added: readonly FieldDefinition[],
+): Usage {
+  const byKey = new Map<string, Held>();
+  const byOption = new Map<string, Map<string, Held>>();
+  const several = new Map<string, Held>();
+  for (const f of found) {
+    byKey.set(f.key, new Held());
+    if (f.code === "option_removed" && f.option !== undefined) {
+      let options = byOption.get(f.key);
+      if (options === undefined) {
+        options = new Map<string, Held>();
+        byOption.set(f.key, options);
+      }
+      options.set(f.option, new Held());
+    }
+    if (f.code === "repeatable_changed" && f.toSingle === true) several.set(f.key, new Held());
+  }
+  for (const now of added) byKey.set(now.key, new Held());
+
+  const keys = [...byKey];
+  for (const record of records) {
+    for (const [key, held] of keys) {
+      if (!Object.hasOwn(record.fields, key)) continue;
+      const value: JsonValue | undefined = record.fields[key];
+      if (value === undefined) continue;
+      held.add(record.id);
+      const list: readonly JsonValue[] = Array.isArray(value)
+        ? (value as readonly JsonValue[])
+        : [value];
+      if (list.length > 1) several.get(key)?.add(record.id);
+      const options = byOption.get(key);
+      if (options === undefined) continue;
+      const seen = new Set<string>();
+      for (const item of list) {
+        if (typeof item !== "string" || seen.has(item)) continue;
+        seen.add(item);
+        options.get(item)?.add(record.id);
+      }
+    }
+  }
+  return { byKey, byOption, several };
+}
+
+function finish(f: Found, usage: Usage | undefined): TemplateChange {
+  const held =
+    usage === undefined
+      ? undefined
+      : f.code === "option_removed" && f.option !== undefined
+        ? usage.byOption.get(f.key)?.get(f.option)
+        : usage.byKey.get(f.key);
+  const count = held?.count ?? 0;
+  const affected = usage === undefined || count > 0;
+  const needsConfirmation =
+    f.code === "made_public"
+      ? true
+      : f.code === "inherited_changed" || f.code === "made_staff"
+        ? false
+        : affected;
+  const several = f.toSingle === true ? usage?.several.get(f.key) : undefined;
+  const change: TemplateChange = {
+    code: f.code,
+    key: f.key,
+    needsConfirmation,
+    message: message(f, usage === undefined ? undefined : count, several?.count ?? 0),
+    recordIds: Object.freeze([...(held?.ids ?? [])]),
+    recordCount: count,
+    ...(f.option === undefined ? {} : { option: f.option }),
+    ...(f.toSingle === true && usage !== undefined
+      ? { recordsWithSeveralValues: Object.freeze([...(several?.ids ?? [])]) }
+      : {}),
+  };
+  return Object.freeze(change);
+}
+
+/** The message for one change. `count` is undefined when no records were given. */
+function message(f: Found, count: number | undefined, several: number): string {
+  const key = shown(f.key);
+  const held =
+    count === undefined
+      ? "Records weren't checked, so any record may hold a value for it."
+      : count === 0
+        ? "No record holds a value for it."
+        : `${records(count)} hold a value for it.`;
+  switch (f.code) {
+    case "made_public":
+      return f.leftOver === true
+        ? `The new public field ${key} uses a key that ${records(count ?? 0)} still hold values for from a removed field. Left-over values are staff only; saving publishes them. Confirm first.`
+        : `The field ${key} changes from staff to public, which publishes every value stored while it was staff. ${held} Confirm first.`;
+    case "key_reused":
+      return `The new field ${key} uses a key that ${records(count ?? 0)} hold left-over values for. Those values will be read as this field's. Check that they fit.`;
+    case "key_removed":
+      return `The field ${key} is removed. ${held} Those values stay in the records as staff-only left-overs.`;
+    case "kind_changed":
+      return `The field ${key} changes kind. ${held} Those values may no longer fit.`;
+    case "repeatable_changed":
+      return f.toSingle === true
+        ? `The field ${key} stops repeating. ${held}${several > 0 ? ` ${records(several)} hold more than one value, which can't be kept in one.` : ""}`
+        : `The field ${key} starts repeating. ${held} Each value must become a list.`;
+    case "option_removed":
+      return `An option is removed from the list field ${key}. ${
+        count === undefined
+          ? "Records weren't checked, so any record may use it."
+          : count === 0
+            ? "No record uses it."
+            : `${records(count)} use it.`
+      }`;
+    case "inherited_changed":
+      return `The field ${key} changes whether lower levels inherit it.`;
+    case "made_staff":
+      return `The field ${key} changes from public to staff, so it will no longer be published.`;
+  }
+}
+
+function records(count: number): string {
+  return count === 1 ? "1 record" : `${String(count)} records`;
+}
+
+function byKey(template: FieldTemplate): ReadonlyMap<string, FieldDefinition> {
+  const map = new Map<string, FieldDefinition>();
+  for (const f of template.fields) map.set(f.key, f);
+  return map;
+}
+
+function prefixed(root: string, list: readonly Issue[]): Issue[] {
+  return list.map((i) => issue([root, ...i.path], i.code, i.message));
+}
+
+/** Validate every record; any unreadable record, or an ID used twice, refuses them all. */
+function readRecords(input: unknown): Validated<readonly CatalogRecord[]> {
+  if (types.isProxy(input) || !Array.isArray(input)) {
+    return {
+      ok: false,
+      issues: [issue(["records"], "not_a_list", "The records must be given as a list.")],
+    };
+  }
+  const length = input.length;
+  if (length > MAX_RECORD_SET) {
+    return {
+      ok: false,
+      issues: [
+        issue(
+          ["records"],
+          "too_many_records",
+          `At most ${String(MAX_RECORD_SET)} records can be checked at once.`,
+        ),
+      ],
+    };
+  }
+  const out: CatalogRecord[] = [];
+  const seen = new Set<RecordId>();
+  for (let i = 0; i < length; i += 1) {
+    // Read each slot as a plain data property, so a getter can't run.
+    const slot = Object.getOwnPropertyDescriptor(input, i);
+    const checked = validateRecord(slot !== undefined && "value" in slot ? slot.value : undefined);
+    // A record that can't be read could hide a staff value, so nothing is guessed.
+    if (!checked.ok) {
+      return {
+        ok: false,
+        issues: [
+          issue(
+            ["records", i],
+            "invalid_record",
+            `Record ${String(i)} in the list is not a valid record, so the change can't be checked safely.`,
+          ),
+        ],
+      };
+    }
+    if (seen.has(checked.value.id)) {
+      return {
+        ok: false,
+        issues: [
+          issue(
+            ["records", i],
+            "duplicate_id",
+            `Record ${String(i)} uses an ID already in the list.`,
+          ),
+        ],
+      };
+    }
+    seen.add(checked.value.id);
+    out.push(checked.value);
+  }
+  return { ok: true, value: out };
+}

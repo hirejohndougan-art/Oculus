@@ -140,6 +140,9 @@ export type {
   TemplateCheckOptions,
 } from "./templates.js";
 
+export { TEMPLATE_CHANGE_CODES, MAX_LISTED_RECORDS, templateChanges } from "./template-changes.js";
+export type { TemplateChangeCode, TemplateChange, TemplateChanges } from "./template-changes.js";
+
 export {
   RIGHTS_FIELD_KEY,
   RIGHTS_REQUIRED_KINDS,
