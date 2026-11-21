@@ -606,3 +606,108 @@ describe("huge inputs", () => {
     expect(content).toContain("&amp;&amp;");
   });
 });
+
+describe("a parent's template changed after the view was made (security run 2026-11-21)", () => {
+  const CREATOR_MAP = {
+    template: "out",
+    entries: [RIGHTS_ENTRY, { field: "creator", term: "creator" }],
+  };
+  const staffCreator = (key: string) =>
+    template(
+      TPL.fields.map((f) => (f.key === "creator" ? { ...f, visibility: "staff" as const } : f)),
+      key,
+    );
+
+  // The fonds's template marks `creator` public and inherited when the view is
+  // made; then an admin makes it staff. The item's inherited value is staff now.
+  function staleView() {
+    let fondsTemplate = template(TPL.fields, "fonds");
+    const fonds = record(
+      "archival_unit",
+      "Fonds",
+      { rights: { uri: CNE }, creator: "SECRET-now-staff" },
+      { level: "fonds" },
+    );
+    const item = record("archival_unit", "Item", {}, { level: "item", parentId: fonds.id });
+    const lookup = (r: { id: string }) => (r.id === fonds.id ? fondsTemplate : TPL);
+    const built = effectiveRecord(item.id, [item, fonds], lookup);
+    if (!built.ok) throw new Error(JSON.stringify(built.issues));
+    const view = publicView(built.value);
+    if (view === undefined) throw new Error("no view");
+    expect(view.fields.creator).toBe("SECRET-now-staff");
+    fondsTemplate = staffCreator("fonds");
+    return { view, item, lookup };
+  }
+
+  it("refuses with templateFor, naming the parent", () => {
+    const { view, item, lookup } = staleView();
+    const result = publicOutput(view, CREATOR_MAP, {
+      baseUrl: BASE,
+      published: [item.id],
+      checkers: CHECKERS,
+      templateFor: lookup,
+    });
+    expect(codes(result)).toEqual(["template_changed"]);
+    expect(JSON.stringify(result)).not.toContain("SECRET");
+  });
+
+  it("refuses currentTemplate alone for a record with parents, which used to publish", () => {
+    const { view, item } = staleView();
+    const result = publicOutput(view, CREATOR_MAP, {
+      baseUrl: BASE,
+      published: [item.id],
+      checkers: CHECKERS,
+      currentTemplate: TPL,
+    });
+    expect(codes(result)).toEqual(["ancestor_templates_unchecked"]);
+  });
+
+  it("refuses when templateFor now finds no template, throws, or isn't a function", () => {
+    const { view, item } = staleView();
+    const run = (templateFor: unknown) =>
+      publicOutput(view, CREATOR_MAP, {
+        baseUrl: BASE,
+        published: [item.id],
+        checkers: CHECKERS,
+        templateFor: templateFor as () => undefined,
+      });
+    expect(codes(run(() => undefined))).toEqual(["template_changed"]);
+    expect(
+      codes(
+        run(() => {
+          throw new Error("boom");
+        }),
+      ),
+    ).toEqual(["template_lookup_failed"]);
+    expect(codes(run("TPL"))).toEqual(["invalid_options"]);
+    expect(codes(run(new Proxy(() => TPL, {})))).toEqual(["invalid_options"]);
+  });
+
+  it("still publishes when no template along the way has changed", () => {
+    const fondsTemplate = template(TPL.fields, "fonds");
+    const fonds = record(
+      "archival_unit",
+      "Fonds",
+      { rights: { uri: CNE }, creator: "Public creator" },
+      { level: "fonds" },
+    );
+    const item = record("archival_unit", "Item", {}, { level: "item", parentId: fonds.id });
+    // Fresh copies each call: compared as data, not by identity.
+    const lookup = (r: { id: string }) =>
+      r.id === fonds.id ? structuredClone(fondsTemplate) : structuredClone(TPL);
+    const built = effectiveRecord(item.id, [item, fonds], lookup);
+    if (!built.ok) throw new Error(JSON.stringify(built.issues));
+    const view = publicView(built.value);
+    if (view === undefined) throw new Error("no view");
+    const result = ok(
+      publicOutput(view, CREATOR_MAP, {
+        baseUrl: BASE,
+        published: [item.id],
+        checkers: CHECKERS,
+        currentTemplate: TPL,
+        templateFor: lookup,
+      }),
+    );
+    expect(everything(result)).toContain("Public creator");
+  });
+});

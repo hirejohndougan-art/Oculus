@@ -4,7 +4,7 @@
  * (which imports `rights.ts`). `rightsPublishIssues` refuses an effective
  * record, because only `effectivePublishIssues` applies the visibility rule.
  */
-import type { ArchivalLevel } from "./records.js";
+import type { ArchivalLevel, CatalogRecord } from "./records.js";
 import type { FieldTemplate } from "./templates.js";
 
 const EFFECTIVE = new WeakSet<object>();
@@ -25,11 +25,15 @@ export function isEffectiveRecord(value: unknown): boolean {
  * and find the checks it needs without being handed them by the caller: the
  * effective record (for `effectivePublishIssues`), the validated template the
  * view was built with (for each field's kind and list options), and the
- * record's arrangement level. Nothing here is published as it is.
+ * record's arrangement level, and every record on the way up with the
+ * template it was read with (so a template changed since, the record's own
+ * or an ancestor's, can be refused). Nothing here is published as it is.
  */
 export interface PublicViewOrigin {
   readonly effective: object;
   readonly template: FieldTemplate;
+  /** The record first, then its ancestors, each with the validated template used for it. */
+  readonly chain: readonly { readonly record: CatalogRecord; readonly template: FieldTemplate }[];
   /** For archival units only. */
   readonly level?: ArchivalLevel;
 }

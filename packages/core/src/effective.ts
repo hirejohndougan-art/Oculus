@@ -578,6 +578,13 @@ function compose(
   markPublicView(view, {
     effective,
     template: own.template,
+    chain: Object.freeze(
+      up.map((record, i) => {
+        const used = templates[i];
+        if (used === undefined) fail([], "unreadable", "The record could not be read.");
+        return Object.freeze({ record, template: used.template });
+      }),
+    ),
     ...(target.kind === "archival_unit" ? { level: target.level } : {}),
   });
   return effective;

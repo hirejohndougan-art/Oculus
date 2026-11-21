@@ -86,6 +86,7 @@ import {
   effectivePublishIssues,
   type EffectiveRecord,
   type PublicRecord,
+  type TemplateLookup,
 } from "./effective.js";
 import {
   DCTERMS_NAMESPACE,
@@ -138,8 +139,18 @@ export interface PublishOptions {
   /**
    * The record's template as it is now. When given, output is refused if it
    * differs from the template the view was built with (`template_changed`).
+   * It checks only the record's own template, so for a record with parents
+   * it must come with `templateFor` (`ancestor_templates_unchecked`).
    */
   readonly currentTemplate?: unknown;
+  /**
+   * The template lookup as it is now, the same kind `effectiveRecord` takes.
+   * When given, it is asked again for the record and every ancestor the view
+   * was built from, and output is refused if any of their templates differs
+   * from the one the view used (`template_changed`): a parent's field made
+   * staff since would otherwise still publish the value its child inherited.
+   */
+  readonly templateFor?: TemplateLookup;
 }
 
 /** Dublin Core as term → values, in order (see the module header). */
@@ -327,8 +338,9 @@ interface Budget {
  * **Build the view fresh at publish time.** A view records the template it
  * was made with; a view kept from earlier publishes under that template's
  * visibility and fields, even if the template has changed since. Pass the
- * record's template as it is now in `currentTemplate` to have a changed one
- * refused (`template_changed`).
+ * template lookup as it is now in `templateFor` to have a view refused when
+ * the template of the record or of any ancestor has changed
+ * (`template_changed`).
  *
  * **"Passes the template check" means the configured check.** Checkers given
  * in `checkers` replace the defaults for their kinds (as
@@ -363,7 +375,7 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
       "This is not a public view from publicView, so it can't be published.",
     );
   }
-  const { baseUrl, published, checkers, currentTemplate } = readOptions(options);
+  const { baseUrl, published, checkers, currentTemplate, templateFor } = readOptions(options);
   if (!published.has(view.id)) {
     fail([], "not_published", "This record is not in the published list, so it can't be output.");
   }
@@ -372,7 +384,17 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
   const blocked = effectivePublishIssues(effective);
   if (blocked.length > 0) throw new OutputError(blocked);
   const template = origin.template;
-  if (currentTemplate !== undefined) sameTemplate(currentTemplate, template);
+  if (currentTemplate !== undefined) {
+    sameTemplate(currentTemplate, template);
+    if (origin.chain.length > 1 && templateFor === undefined) {
+      fail(
+        ["currentTemplate"],
+        "ancestor_templates_unchecked",
+        "This record inherits from parent records, and currentTemplate checks only its own template. Pass templateFor too, so a parent's template changed since the view was made is caught.",
+      );
+    }
+  }
+  if (templateFor !== undefined) sameChainTemplates(templateFor, origin.chain);
   const checked = validateDublinCoreMapping(mapping, template);
   if (!checked.ok) throw new OutputError(checked.issues);
   if (
@@ -444,6 +466,37 @@ function sameTemplate(current: unknown, captured: FieldTemplate): void {
       "template_changed",
       "The record's template has changed since this public view was made. Make the view again with effectiveRecord and publicView, and publish that.",
     );
+  }
+}
+
+/**
+ * Refuse when the template the lookup gives now, for the record or any of its
+ * ancestors, is not the one the view was built with. Every step is checked,
+ * not only those a value came from: a parent whose field became `inherited`
+ * or changed visibility changes what the child may publish.
+ */
+function sameChainTemplates(
+  templateFor: TemplateLookup,
+  chain: readonly { readonly record: CatalogRecord; readonly template: FieldTemplate }[],
+): void {
+  for (const [index, step] of chain.entries()) {
+    const path = index === 0 ? ["templateFor"] : ["templateFor", step.record.id];
+    let given: unknown;
+    try {
+      given = templateFor(step.record);
+    } catch {
+      fail(path, "template_lookup_failed", "Finding a template with templateFor failed.");
+    }
+    const checked = given === undefined ? undefined : validateTemplate(given);
+    if (checked?.ok !== true || canonicalJson(checked.value) !== canonicalJson(step.template)) {
+      fail(
+        path,
+        "template_changed",
+        index === 0
+          ? "The record's template has changed since this public view was made. Make the view again with effectiveRecord and publicView, and publish that."
+          : "The template of a parent record has changed since this public view was made. Make the view again with effectiveRecord and publicView, and publish that.",
+      );
+    }
   }
 }
 
@@ -531,6 +584,7 @@ const OPTION_KEYS: ReadonlySet<string> = new Set([
   "published",
   "checkers",
   "currentTemplate",
+  "templateFor",
 ]);
 
 interface ReadOptions {
@@ -538,6 +592,7 @@ interface ReadOptions {
   readonly published: ReadonlySet<RecordId>;
   readonly checkers: unknown;
   readonly currentTemplate: unknown;
+  readonly templateFor: TemplateLookup | undefined;
 }
 
 function readOptions(options: unknown): ReadOptions {
@@ -553,7 +608,12 @@ function readOptions(options: unknown): ReadOptions {
   const published = readPublished(dataProp(options, "published"));
   const checkers = dataProp(options, "checkers");
   const currentTemplate = dataProp(options, "currentTemplate");
-  return { baseUrl, published, checkers, currentTemplate };
+  const lookup = dataProp(options, "templateFor");
+  if (lookup !== undefined && (typeof lookup !== "function" || types.isProxy(lookup))) {
+    fail(["templateFor"], "invalid_options", "The templateFor option must be a function.");
+  }
+  const templateFor = lookup as TemplateLookup | undefined;
+  return { baseUrl, published, checkers, currentTemplate, templateFor };
 }
 
 /** An own data property, or undefined. A getter, hidden property or Proxy value fails. */
