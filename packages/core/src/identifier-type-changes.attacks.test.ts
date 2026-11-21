@@ -5,6 +5,7 @@
 import { describe, expect, it } from "vitest";
 import {
   identifierTypeChanges,
+  identifierTypeCreation,
   identifierTypeDeletion,
   newRecordId,
   validateTemplate,
@@ -111,6 +112,53 @@ describe("staff numbers published by a type change", () => {
     );
     expect(codes(bad)).toEqual(["invalid_entry"]);
     expect(JSON.stringify(bad)).not.toContain("555-0100");
+  });
+});
+
+describe("stranded staff values adopted by a public type", () => {
+  // donor_file was deleted; its staff value stays in record A.
+  const PUBLIC_ACC: IdentifierType = {
+    key: "accession",
+    label: "Accession number",
+    uniqueness: "current",
+    pattern: "DHS-####",
+    public: true,
+  };
+  const existing = {
+    identifierTypes: [PUBLIC_ACC],
+    identifiers: [set(A, [{ type: "donor_file", value: "SECRET-1", primary: true }])],
+    records: [record(B, { file: { type: "donor_file", value: SECRET } })],
+  };
+
+  it("renaming a public type onto the key reports the adopted values as made public", () => {
+    const r = ok(identifierTypeChanges(PUBLIC_ACC, { ...PUBLIC_ACC, key: "donor_file" }, existing));
+    expect(r.changes.map((c) => [c.code, c.needsConfirmation, c.recordIds])).toEqual([
+      ["key_changed", false, []],
+      ["key_adopts_values", true, [A, B]],
+      ["made_public", true, [A, B]],
+    ]);
+    expect(r.changes[1]?.misfitRecordIds).toEqual([A, B]);
+    expect(JSON.stringify(r)).not.toContain("SECRET-1");
+    expect(JSON.stringify(r)).not.toContain("555-0100");
+  });
+
+  it("creating a public type with that key reports them too", () => {
+    const created = { ...PUBLIC_ACC, key: "donor_file" };
+    const r = ok(identifierTypeCreation(created, existing));
+    expect(r.changes.map((c) => [c.code, c.recordIds])).toEqual([
+      ["key_adopts_values", [A, B]],
+      ["made_public", [A, B]],
+    ]);
+    expect(r.needsConfirmation).toBe(true);
+    // Without records, it may adopt values nobody can see.
+    expect(ok(identifierTypeCreation(created)).changes.map((c) => c.code)).toEqual([
+      "key_adopts_values",
+      "made_public",
+    ]);
+    expect(codes(identifierTypeCreation(PUBLIC_ACC, existing))).toEqual(["key_taken"]);
+    expect(codes(identifierTypeCreation({ ...created, key: "constructor" }))).toEqual([
+      "reserved_key",
+    ]);
   });
 });
 

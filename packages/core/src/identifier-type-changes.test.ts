@@ -308,6 +308,83 @@ describe("identifierTypeChanges", () => {
     expect(summary(y)).toEqual([["auto_number_changed", true, [B]]]);
   });
 
+  it("checks adopted values against the type's uniqueness rule, old values included", () => {
+    const r = ok(
+      identifierTypeChanges(
+        ACCESSION,
+        { ...ACCESSION, key: "old_accession" },
+        use([
+          set(A, [{ type: "accession", value: "DHS-0001" }]),
+          set(B, [{ type: "old_accession", value: "dhs-0001" }]),
+        ]),
+      ),
+    );
+    const adopt = r.changes.find((c) => c.code === "key_adopts_values");
+    expect(adopt?.recordIds).toEqual([B]);
+    expect(adopt?.clashRecordIds).toEqual([A, B]);
+    // Letters in a format are case-sensitive, so "dhs-0001" doesn't fit "DHS-####".
+    expect(adopt?.misfitRecordIds).toEqual([B]);
+    expect(adopt?.message).toContain("1 record holds values");
+  });
+
+  it("reports templates naming a renamed or deleted type", () => {
+    const tpl = (key: string, types: string[]) => ({
+      key,
+      label: "T",
+      appliesTo: ["object"],
+      fields: [
+        {
+          key: "number",
+          label: "Number",
+          kind: "identifier",
+          required: false,
+          repeatable: false,
+          visibility: "staff",
+          inherited: false,
+          identifierTypes: types,
+        },
+      ],
+    });
+    const existing = {
+      ...use([]),
+      templates: [tpl("photos", ["accession", "box"]), tpl("boxes", ["box"])],
+    };
+    const renamed = ok(identifierTypeChanges(BOX, { ...BOX, key: "carton" }, existing));
+    const refs = renamed.changes.find((c) => c.code === "templates_reference_type");
+    expect([refs?.needsConfirmation, refs?.templateKeys]).toEqual([true, ["photos", "boxes"]]);
+    const deleted = ok(identifierTypeDeletion(ACCESSION, existing));
+    expect(deleted.changes.map((c) => [c.code, c.templateKeys])).toEqual([
+      ["type_deleted", undefined],
+      ["templates_reference_type", ["photos"]],
+    ]);
+    expect(deleted.changes[1]?.message).toContain("1 template lists");
+  });
+
+  it("doesn't count numbers that only look like the new form", () => {
+    const manual: IdentifierType = { key: "accession", label: "Accession", uniqueness: "none" };
+    const yearly = { ...manual, autoNumber: { style: "year", separator: ".", digits: 3 } } as const;
+    const y = ok(
+      identifierTypeChanges(
+        manual,
+        yearly,
+        use([set(A, [{ type: "accession", value: "123456" }])], [], [manual]),
+      ),
+    );
+    expect(summary(y)).toEqual([["auto_number_changed", false, []]]);
+    const prefixed = {
+      ...manual,
+      autoNumber: { style: "prefix", prefix: "DHS-", digits: 4 },
+    } as const;
+    const p = ok(
+      identifierTypeChanges(
+        manual,
+        prefixed,
+        use([set(A, [{ type: "accession", value: "DHS-2026-0015" }])], [], [manual]),
+      ),
+    );
+    expect(summary(p)).toEqual([["auto_number_changed", false, []]]);
+  });
+
   it("making a type staff lists records holding it in public template fields", () => {
     const pub = { ...BOX, public: true };
     const tpl = (visibility: string) => ({
@@ -358,6 +435,7 @@ describe("identifierTypeChanges", () => {
     expect(r.recordsChecked).toBe(false);
     expect(summary(r)).toEqual([
       ["key_changed", true, []],
+      ["key_adopts_values", true, []],
       ["made_public", true, []],
       ["format_changed", true, []],
       ["uniqueness_tightened", true, []],

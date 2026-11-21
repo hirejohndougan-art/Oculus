@@ -301,6 +301,83 @@ export function validateLegacyTemplate(input: unknown): Validated<FieldTemplate>
   return readTemplate(input, LEGACY_IDENTIFIER_CODE);
 }
 
+/** The most templates `legacyTemplateIssues` looks through at once. */
+export const MAX_TEMPLATE_SET = 10_000;
+
+/** A stored template that `validateTemplate` would refuse. */
+export interface LegacyTemplateProblem {
+  /** Where it is in the list given. */
+  readonly index: number;
+  /** Its key, when it has a readable one. */
+  readonly key?: string;
+  /**
+   * True when it is valid except for identifier type codes the key rule
+   * (D-0XX) no longer allows: fix those codes and save it again
+   * (`templateChanges` reads it). False when it is invalid for other reasons too.
+   */
+  readonly fixable: boolean;
+  /** The identifier type codes that no longer follow the rule. */
+  readonly identifierTypes: readonly string[];
+}
+
+/**
+ * Find stored templates that `validateTemplate` refuses, such as ones whose
+ * `identifierTypes` hold hyphenated codes from before D-0XX, so an upgrade
+ * can have them re-saved before the records using them stop being checked
+ * and published. Never throws.
+ */
+export function legacyTemplateIssues(
+  templates: unknown,
+): Validated<readonly LegacyTemplateProblem[]> {
+  try {
+    if (types.isProxy(templates) || !Array.isArray(templates)) {
+      return { ok: false, issues: [issue([], "not_a_list", "The templates must be a list.")] };
+    }
+    const length = templates.length;
+    if (length > MAX_TEMPLATE_SET) {
+      return {
+        ok: false,
+        issues: [
+          issue(
+            [],
+            "too_many",
+            `At most ${String(MAX_TEMPLATE_SET)} templates can be checked at once.`,
+          ),
+        ],
+      };
+    }
+    const out: LegacyTemplateProblem[] = [];
+    for (let i = 0; i < length; i += 1) {
+      const slot = Object.getOwnPropertyDescriptor(templates, i);
+      const item: unknown = slot !== undefined && "value" in slot ? slot.value : undefined;
+      if (validateTemplate(item).ok) continue;
+      const legacy = validateLegacyTemplate(item);
+      const codes: string[] = [];
+      if (legacy.ok) {
+        for (const f of legacy.value.fields) {
+          for (const c of f.identifierTypes ?? []) {
+            if (!isIdentifierTypeKey(c) && !codes.includes(c)) codes.push(c);
+          }
+        }
+      }
+      out.push(
+        Object.freeze({
+          index: i,
+          ...(legacy.ok ? { key: legacy.value.key } : {}),
+          fixable: legacy.ok,
+          identifierTypes: Object.freeze(codes),
+        }),
+      );
+    }
+    return { ok: true, value: Object.freeze(out) };
+  } catch {
+    return {
+      ok: false,
+      issues: [issue([], "unreadable", "These templates could not be read as plain data.")],
+    };
+  }
+}
+
 function readTemplate(input: unknown, identifierCode: CodeRule): Validated<FieldTemplate> {
   try {
     return checkTemplate(input, identifierCode);

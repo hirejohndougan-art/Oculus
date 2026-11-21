@@ -145,6 +145,8 @@ export {
   webUrlProblem,
   validateTemplate,
   validateLegacyTemplate,
+  legacyTemplateIssues,
+  MAX_TEMPLATE_SET,
   checkRecordAgainstTemplate,
   MAX_REGISTRY_TEMPLATES,
   indexTemplates,
@@ -161,6 +163,7 @@ export type {
   FieldValueChecker,
   TemplateCheckOptions,
   TemplateRegistry,
+  LegacyTemplateProblem,
 } from "./templates.js";
 
 export { TEMPLATE_CHANGE_CODES, MAX_LISTED_RECORDS, templateChanges } from "./template-changes.js";
@@ -170,6 +173,7 @@ export {
   IDENTIFIER_TYPE_CHANGE_CODES,
   identifierTypeChanges,
   identifierTypeDeletion,
+  identifierTypeCreation,
 } from "./identifier-type-changes.js";
 export type {
   IdentifierTypeChangeCode,

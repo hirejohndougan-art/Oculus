@@ -8,6 +8,7 @@ import {
   indexTemplates,
   isTemplateRegistry,
   isFieldKey,
+  legacyTemplateIssues,
   makeIdentifierChecker,
   validateRecord,
   validateTemplate,
@@ -382,6 +383,20 @@ describe("validateTemplate: field definitions", () => {
     ]);
     expect(fieldCodes(field({ kind: "identifier", identifierTypes: ["call_number"] }))).toEqual([]);
     expect(codes(validateTemplate({ ...fullTemplate(), key: "sample-photo-2" }))).toEqual([]);
+  });
+
+  it("lists stored templates that need re-saving under the identifier type key rule", () => {
+    const legacy = fullTemplate();
+    const fields = (legacy.fields as Record<string, unknown>[]).map((f) =>
+      f.kind === "identifier" ? { ...f, identifierTypes: ["accession", "call-number"] } : f,
+    );
+    const r = legacyTemplateIssues([fullTemplate(), { ...legacy, fields }, { key: "x" }]);
+    expect(r.ok && r.value).toEqual([
+      { index: 1, key: "sample-photo", fixable: true, identifierTypes: ["call-number"] },
+      { index: 2, fixable: false, identifierTypes: [] },
+    ]);
+    expect(legacyTemplateIssues("x").ok).toBe(false);
+    expect(legacyTemplateIssues(new Proxy([], {})).ok).toBe(false);
   });
 
   it("checks standards mappings", () => {

@@ -14,7 +14,18 @@
  *   former ones no longer count for the type's uniqueness or auto-numbering,
  *   so their numbers can be given out again under the new key. `recordIds`
  *   are the records holding any value of the type.
- * - `type_deleted`: the same, for a type being deleted.
+ * - `key_adopts_values`: the new key already has values stored under it,
+ *   left from a deleted type (they were staff, since a removed type's values
+ *   are read leniently and never published). The type takes them over:
+ *   `recordIds` lists them, `misfitRecordIds` those that don't fit its
+ *   format and `clashRecordIds` those clashing under its uniqueness rule.
+ *   Always needs confirmation; a public type also reports `made_public`
+ *   for them. `identifierTypeCreation(type, existing?)` runs the same check
+ *   for a new type.
+ * - `type_deleted`: as `key_changed`, for a type being deleted.
+ * - `templates_reference_type`: on a rename or deletion, when `templates`
+ *   are given, the templates whose `identifierTypes` name the old key
+ *   (`templateKeys`). Needs confirmation.
  * - `made_public`: `public` goes from false (or left out) to true, which
  *   publishes values that were staff only. **Always needs confirmation**,
  *   like a field made public (D-023). `recordIds` are the records holding a
@@ -71,6 +82,7 @@ import {
   isIdentifierTypeKey,
   readStoredIdentifiers,
   validateIdentifierTypes,
+  validateNewIdentifierType,
   type AutoNumbering,
   type IdentifierType,
   type RecordIdentifiers,
@@ -90,7 +102,9 @@ import { types } from "node:util";
 export const IDENTIFIER_TYPE_CHANGE_CODES = [
   "reserved_key",
   "key_changed",
+  "key_adopts_values",
   "type_deleted",
+  "templates_reference_type",
   "made_public",
   "format_changed",
   "uniqueness_tightened",
@@ -102,7 +116,11 @@ export type IdentifierTypeChangeCode = (typeof IDENTIFIER_TYPE_CHANGE_CODES)[num
 
 export interface IdentifierTypeChange {
   readonly code: IdentifierTypeChangeCode;
-  /** The key of the type as it was (the old key, for `key_changed`). */
+  /**
+   * The key of the type as it was (the old key, for `key_changed`); for
+   * `key_adopts_values` and the `made_public` that comes with it, the key
+   * whose stored values the type takes over.
+   */
   readonly type: string;
   /** True when a person must confirm the change before the type is saved or deleted. */
   readonly needsConfirmation: boolean;
@@ -112,6 +130,12 @@ export interface IdentifierTypeChange {
   readonly recordIds: readonly RecordId[];
   /** How many records it affects, even beyond the listed IDs. */
   readonly recordCount: number;
+  /** `key_adopts_values` only: adopted values' records that don't fit the type's format. */
+  readonly misfitRecordIds?: readonly RecordId[];
+  /** `key_adopts_values` only: records whose values clash under the type's uniqueness rule. */
+  readonly clashRecordIds?: readonly RecordId[];
+  /** `templates_reference_type` only: the templates whose `identifierTypes` name the key. */
+  readonly templateKeys?: readonly string[];
 }
 
 export interface IdentifierTypeChanges {
@@ -172,8 +196,100 @@ export function identifierTypeDeletion(
       use = u.value;
     }
     const held = use === undefined ? undefined : holders(use, t.key);
-    return done([change("type_deleted", t.key, held, held === undefined || held.count > 0)], use);
+    const changes = [change("type_deleted", t.key, held, held === undefined || held.count > 0)];
+    const refs = use === undefined ? undefined : referencing(use, t.key);
+    if (refs !== undefined) changes.push(refs);
+    return done(changes, use);
   });
+}
+
+/**
+ * Check an identifier type about to be created (`validateNewIdentifierType`,
+ * and its key must be free). Values stored under that key, left from a
+ * deleted type, become this type's: `key_adopts_values` lists them (with
+ * those that don't fit its format or clash under its uniqueness rule), and a
+ * public type also reports `made_public`, since left-over values were staff.
+ * Leave `existing` out only when the records are unknown. Never throws.
+ */
+export function identifierTypeCreation(
+  type: unknown,
+  existing?: unknown,
+): Validated<IdentifierTypeChanges> {
+  return guarded(() => {
+    if (types.isProxy(type)) {
+      return fail(["type"], "not_an_object", "An identifier type must be a plain object.");
+    }
+    const checked = validateNewIdentifierType(type);
+    if (!checked.ok) {
+      return {
+        ok: false,
+        issues: checked.issues.map((i) => issue(["type", ...i.path], i.code, i.message)),
+      };
+    }
+    const t = normal(checked.value);
+    let use: Use | undefined;
+    if (existing !== undefined) {
+      const u = readUse(existing, t, false);
+      if (!u.ok) return u;
+      use = u.value;
+    }
+    return done(adoption(t, [], use), use);
+  });
+}
+
+/**
+ * The changes when `type` takes over values already stored under its key
+ * (`alsoKeys`: other keys whose values it keeps, for the uniqueness check).
+ */
+function adoption(
+  type: IdentifierType,
+  alsoKeys: readonly string[],
+  use: Use | undefined,
+  reportPublic = true,
+): IdentifierTypeChange[] {
+  const out: IdentifierTypeChange[] = [];
+  if (use === undefined) {
+    out.push(change("key_adopts_values", type.key, undefined, true));
+    if (type.public === true && reportPublic) {
+      out.push(change("made_public", type.key, undefined, true, { leftOver: true }));
+    }
+    return out;
+  }
+  const adopted = holders(use, type.key);
+  if (adopted.count === 0) return out;
+  const misfit = type.pattern === undefined ? new Held() : misfits(use, type.key, type.pattern);
+  const clash =
+    type.uniqueness === "none"
+      ? new Held()
+      : clashes(use, [type.key, ...alsoKeys], type.uniqueness);
+  out.push(
+    Object.freeze({
+      ...change("key_adopts_values", type.key, adopted, true, {
+        misfits: misfit.count,
+        clashes: clash.count,
+      }),
+      misfitRecordIds: Object.freeze([...misfit.ids]),
+      clashRecordIds: Object.freeze([...clash.ids]),
+    }),
+  );
+  if (type.public === true && reportPublic) {
+    out.push(change("made_public", type.key, adopted, true, { leftOver: true }));
+  }
+  return out;
+}
+
+/** Templates whose `identifierTypes` lists name `key`, when templates were given. */
+function referencing(use: Use, key: string): IdentifierTypeChange | undefined {
+  if (use.templates === undefined) return undefined;
+  const keys: string[] = [];
+  for (const t of use.templates) {
+    if (t.fields.some((f) => f.identifierTypes?.includes(key) === true)) keys.push(t.key);
+  }
+  if (keys.length === 0) return undefined;
+  const base = change("templates_reference_type", key, new Held(), true, {
+    text: String(keys.length),
+  });
+  return Object.freeze({ ...base, templateKeys: Object.freeze(keys) });
 }
 
 // ---------------------------------------------------------------------------
@@ -223,12 +339,22 @@ function compare(
 
   if (now.key !== was.key) {
     const held = use === undefined ? undefined : holders(use, key);
-    changes.push(change("key_changed", key, held, unchecked || (held?.count ?? 0) > 0, now.key));
+    changes.push(
+      change("key_changed", key, held, unchecked || (held?.count ?? 0) > 0, { text: now.key }),
+    );
+    // Values left under the new key by a deleted type become this type's.
+    // A type made public here reports the adopted values in its own made_public.
+    changes.push(...adoption(now, [key], use, was.public === true));
+    const refs = use === undefined ? undefined : referencing(use, key);
+    if (refs !== undefined) changes.push(refs);
   }
   if (was.public !== true && now.public === true) {
-    changes.push(
-      change("made_public", key, use === undefined ? undefined : holders(use, key), true),
-    );
+    let held: Held | undefined;
+    if (use !== undefined) {
+      held = holders(use, key);
+      if (now.key !== key) for (const id of holders(use, now.key).all()) held.add(id);
+    }
+    changes.push(change("made_public", key, held, true));
   }
   if (now.pattern !== undefined && now.pattern !== was.pattern) {
     const held = use === undefined ? undefined : misfits(use, key, now.pattern);
@@ -242,14 +368,9 @@ function compare(
   if (!sameAuto(was.autoNumber, now.autoNumber)) {
     if (now.autoNumber === undefined) {
       changes.push(
-        change(
-          "auto_number_changed",
-          key,
-          use === undefined ? undefined : new Held(),
-          false,
-          undefined,
-          true,
-        ),
+        change("auto_number_changed", key, use === undefined ? undefined : new Held(), false, {
+          removed: true,
+        }),
       );
     } else {
       const held = use === undefined ? undefined : reissued(use, key, now.autoNumber, now.pattern);
@@ -258,13 +379,9 @@ function compare(
   }
   if (strictness(now.uniqueness) < strictness(was.uniqueness)) {
     changes.push(
-      change(
-        "uniqueness_loosened",
-        key,
-        use === undefined ? undefined : new Held(),
-        false,
-        now.uniqueness,
-      ),
+      change("uniqueness_loosened", key, use === undefined ? undefined : new Held(), false, {
+        text: now.uniqueness,
+      }),
     );
   }
   if (was.public === true && now.public !== true) {
@@ -297,6 +414,8 @@ interface Use {
   readonly records: readonly CatalogRecord[];
   /** Field keys that are public in some template, by record kind; undefined when unknown. */
   readonly publicKeys: ReadonlyMap<string, ReadonlySet<string>> | undefined;
+  /** The templates given, or undefined. */
+  readonly templates: readonly FieldTemplate[] | undefined;
 }
 
 function readType(input: unknown, root: string): Validated<IdentifierType> {
@@ -328,7 +447,8 @@ function normal(t: IdentifierType): IdentifierType {
   });
 }
 
-function readUse(input: unknown, type: IdentifierType): Validated<Use> {
+/** `listed`: the type must be in the list exactly (an edit or deletion), or absent from it (a creation). */
+function readUse(input: unknown, type: IdentifierType, listed = true): Validated<Use> {
   if (types.isProxy(input) || !isPlainObject(input)) {
     return fail(
       ["existing"],
@@ -359,8 +479,15 @@ function readUse(input: unknown, type: IdentifierType): Validated<Use> {
       ),
     };
   }
-  const listed = typesRead.value.find((t) => t.key === type.key);
-  if (listed === undefined || !sameType(normal(listed), type)) {
+  const found = typesRead.value.find((t) => t.key === type.key);
+  if (!listed && found !== undefined) {
+    return fail(
+      ["type", "key"],
+      "key_taken",
+      `Another identifier type already uses the key ${shown(type.key)}.`,
+    );
+  }
+  if (listed && (found === undefined || !sameType(normal(found), type))) {
     return fail(
       ["existing", "identifierTypes"],
       "type_not_listed",
@@ -379,10 +506,12 @@ function readUse(input: unknown, type: IdentifierType): Validated<Use> {
   const records = readList(own(input, "records"), "records", validateRecord, (r) => r.id);
   if (!records.ok) return records;
   let publicKeys: Map<string, Set<string>> | undefined;
+  let templateList: readonly FieldTemplate[] | undefined;
   const templatesInput = own(input, "templates");
   if (templatesInput !== undefined || Object.hasOwn(input, "templates")) {
     const templates = readList(templatesInput, "templates", validateLegacyTemplate);
     if (!templates.ok) return templates;
+    templateList = templates.value;
     publicKeys = new Map();
     for (const t of templates.value) {
       for (const f of t.fields) {
@@ -405,6 +534,7 @@ function readUse(input: unknown, type: IdentifierType): Validated<Use> {
       identifiers: identifiers.value,
       records: records.value,
       publicKeys,
+      templates: templateList,
     },
   };
 }
@@ -492,6 +622,10 @@ class Held {
   }
   get count(): number {
     return this.seen.size;
+  }
+  /** Every record found, beyond the listed ones too. */
+  all(): IterableIterator<RecordId> {
+    return this.seen.values();
   }
 }
 
@@ -586,7 +720,8 @@ function strictness(rule: UniquenessRule): number {
  * count under `all_time`). Values in template fields aren't part of the
  * uniqueness check (D-009), so they aren't counted here either.
  */
-function clashes(use: Use, key: string, rule: UniquenessRule): Held {
+function clashes(use: Use, key: string | readonly string[], rule: UniquenessRule): Held {
+  const keys = new Set(typeof key === "string" ? [key] : key);
   const owners = new Map<string, RecordId | null>();
   const add = (value: string, id: RecordId): void => {
     const k = identifierKey(value);
@@ -595,14 +730,14 @@ function clashes(use: Use, key: string, rule: UniquenessRule): Held {
     else if (first !== id) owners.set(k, null);
   };
   for (const set of use.identifiers) {
-    for (const i of set.current) if (i.type === key) add(i.value, set.recordId);
+    for (const i of set.current) if (keys.has(i.type)) add(i.value, set.recordId);
     if (rule === "all_time")
-      for (const i of set.former) if (i.type === key) add(i.value, set.recordId);
+      for (const i of set.former) if (keys.has(i.type)) add(i.value, set.recordId);
   }
   const held = new Held();
   for (const set of use.identifiers) {
     const values = [...set.current, ...(rule === "all_time" ? set.former : [])];
-    if (values.some((i) => i.type === key && owners.get(identifierKey(i.value)) === null)) {
+    if (values.some((i) => keys.has(i.type) && owners.get(identifierKey(i.value)) === null)) {
       held.add(set.recordId);
     }
   }
@@ -664,11 +799,26 @@ function reissued(use: Use, key: string, auto: AutoNumbering, source: string | u
    * four-digit year (`2026015` is 2026, number 15), then the sequence.
    */
   const loose = (value: string): { head: string; n: number } | undefined => {
-    const k = identifierKey(value).replace(NOT_LETTER_OR_DIGIT, "");
-    const head = auto.style === "year" ? k.slice(0, 4) : prefixHead;
-    if (auto.style === "year" ? !/^[0-9]{4}$/.test(head) : !k.startsWith(head)) return undefined;
-    const rest = k.slice(head.length);
-    if (!NUMBER.test(rest)) return undefined;
+    const k = identifierKey(value);
+    // Walk past the head's letters and digits (any separators between them).
+    const want = auto.style === "year" ? 4 : prefixHead.length;
+    let head = "";
+    let i = 0;
+    while (i < k.length && head.length < want) {
+      const ch = String.fromCodePoint(k.codePointAt(i) ?? 0);
+      if (/[\p{L}\p{N}]/u.test(ch)) head += ch;
+      i += ch.length;
+    }
+    if (auto.style === "year" ? !/^[0-9]{4}$/.test(head) : head !== prefixHead) return undefined;
+    // Then only separators and one run of digits: `DHS-2026-0015` isn't a
+    // DHS- number, it has two.
+    const tail = /^([^\p{L}\p{N}]*)([0-9]+)$/u.exec(k.slice(i));
+    const sep = tail?.[1];
+    const rest = tail?.[2];
+    if (sep === undefined || rest === undefined || !NUMBER.test(rest)) return undefined;
+    // With nothing between them, the split is a guess (`123456` read as year
+    // 1234): only a sequence at least as wide as the numbering pads to counts.
+    if (sep.length === 0 && rest.length < auto.digits) return undefined;
     return { head, n: Number(rest) };
   };
 
@@ -710,20 +860,32 @@ function reissued(use: Use, key: string, auto: AutoNumbering, source: string | u
 // ---------------------------------------------------------------------------
 // Results and messages
 
+/** Extra detail for one message. */
+interface Detail {
+  /** key_changed: the new key; uniqueness_loosened: the new rule; templates_reference_type: the template count. */
+  readonly text?: string;
+  /** auto_number_changed: numbering removed. */
+  readonly removed?: boolean;
+  /** made_public: the values were left under the key by a deleted type. */
+  readonly leftOver?: boolean;
+  /** key_adopts_values: how many records don't fit the format, and how many clash. */
+  readonly misfits?: number;
+  readonly clashes?: number;
+}
+
 function change(
   code: IdentifierTypeChangeCode,
   type: string,
   held: Held | undefined,
   needsConfirmation: boolean,
-  detail?: string,
-  removed?: boolean,
+  detail: Detail = {},
 ): IdentifierTypeChange {
   const count = held?.count ?? 0;
   return Object.freeze({
     code,
     type,
     needsConfirmation,
-    message: message(code, type, held === undefined ? undefined : count, detail, removed === true),
+    message: message(code, type, held === undefined ? undefined : count, detail),
     recordIds: Object.freeze([...(held?.ids ?? [])]),
     recordCount: count,
   });
@@ -733,41 +895,65 @@ function message(
   code: IdentifierTypeChangeCode,
   type: string,
   count: number | undefined,
-  detail: string | undefined,
-  removed: boolean,
+  detail: Detail,
 ): string {
   const key = shown(type);
   const unchecked = "Records weren't checked, so any record may be affected.";
+  /** "1 record holds …" or "3 records hold …". */
+  const agree = (n: number, verb: string): string =>
+    `${records(n)} ${n === 1 ? verb.replace(/^hold\b/, "holds") : verb}`;
   const some = (what: string, after: string): string =>
     count === undefined
       ? `${unchecked} ${after}`
       : count === 0
         ? "No record is affected."
-        : `${records(count)} ${what}. ${after}`;
+        : `${agree(count, what)}. ${after}`;
   switch (code) {
     case "reserved_key":
       return `The identifier type key ${key} is no longer allowed (it is a reserved word). Rename the type; ${
         count === undefined
           ? "records weren't checked, so any record may hold values of it."
-          : `${records(count)} hold values of it, which must move to the new key.`
+          : count === 0
+            ? "no record holds values of it."
+            : `${agree(count, "hold values of it")}, which must move to the new key.`
       }`;
     case "key_changed":
-      return `The identifier type ${key} gets the new key ${shown(detail ?? "")}. ${some(
+      return `The identifier type ${key} gets the new key ${shown(detail.text ?? "")}. ${some(
         "hold values of it",
         "Their values keep the old key: current ones would no longer pass the check, and former ones would stop protecting their numbers from being given out again. Confirm first.",
       )}`;
+    case "key_adopts_values":
+      if (count === undefined) {
+        return `Records weren't checked, so values may already be stored under the key ${key} (left from a deleted type, and staff only); this type would take them over. Confirm first.`;
+      }
+      return `${agree(count, "hold values")} stored under the key ${key}, left from a deleted type; this type takes them over.${
+        (detail.misfits ?? 0) > 0
+          ? ` ${agree(detail.misfits ?? 0, "hold one that doesn't fit its format")}.`
+          : ""
+      }${
+        (detail.clashes ?? 0) > 0
+          ? ` ${agree(detail.clashes ?? 0, "hold one another record also holds")}, against its uniqueness rule.`
+          : ""
+      } Confirm first.`;
     case "type_deleted":
       return `The identifier type ${key} is deleted. ${some(
         "hold values of it",
         "Current values would no longer pass the check, and former ones would stop protecting their numbers from being given out again. Confirm first.",
       )}`;
+    case "templates_reference_type":
+      return `${detail.text === "1" ? "1 template lists" : `${detail.text ?? "Some"} templates list`} the identifier type ${key} in a field's allowed types; update ${detail.text === "1" ? "it" : "them"} too, or the fields will name a type that doesn't exist. Confirm first.`;
     case "made_public":
+      if (detail.leftOver === true) {
+        return count === undefined
+          ? `The new public type ${key} may take over staff-only values left under its key. Records weren't checked, so saving could publish them. Confirm first.`
+          : `The public type ${key} takes over values left under its key by a deleted type, which were staff only; ${agree(count, "hold them")}. Saving publishes them. Confirm first.`;
+      }
       return `The identifier type ${key} changes from staff to public, which publishes every value of it in public fields. ${
         count === undefined
           ? "Records weren't checked, so any record may hold one."
           : count === 0
             ? "No record holds one now."
-            : `${records(count)} hold values of it.`
+            : `${agree(count, "hold values of it")}.`
       } Confirm first.`;
     case "format_changed":
       return `The identifier type ${key} gets a new format. ${some(
@@ -780,17 +966,22 @@ function message(
         "Those would no longer pass the uniqueness check.",
       )}`;
     case "auto_number_changed":
-      if (removed) return `The identifier type ${key} stops giving out numbers automatically.`;
+      if (detail.removed === true) {
+        return `The identifier type ${key} stops giving out numbers automatically.`;
+      }
       return `Auto-numbering changes for the identifier type ${key}. ${some(
-        "hold a number it would give out again, written differently (with another separator or prefix)",
+        "hold a number it would give out again, written differently (with another separator or prefix) or only in a template field",
         "Confirm first.",
       )}`;
     case "uniqueness_loosened":
-      return detail === "none"
+      return detail.text === "none"
         ? `The identifier type ${key} no longer has to be unique, so two records may share a value.`
         : `The identifier type ${key} only has to be unique among current values, so a retired number may be given to another record.`;
     case "made_staff":
-      return `The identifier type ${key} changes from public to staff, so its values will no longer be published.`;
+      return `The identifier type ${key} changes from public to staff, so its values will no longer be published. ${some(
+        "hold one in a public template field",
+        "Those would no longer pass the check, since a staff type isn't allowed there.",
+      )}`;
   }
 }
 
