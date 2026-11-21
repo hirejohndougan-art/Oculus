@@ -44,11 +44,21 @@
  * deeper than MAX_ARRANGEMENT_DEPTH makes the whole result fail, because a
  * record whose ancestors can't be trusted can't be published safely.
  *
- * Every record on the way up is re-checked with `validateRecord`, so the
- * result is built from frozen copies, never from the caller's objects. The
- * result is frozen. Nothing here throws.
+ * Every record is checked with `validateRecord` when the set is indexed, so
+ * an index is one consistent, frozen snapshot of the set, never the caller's
+ * objects. Later edits to those objects are not seen: build a new index after
+ * any edit. Templates are validated afresh for every record on every call.
+ *
+ * **Public output must only ever come from `publicView`.** The effective
+ * record itself holds staff-only values (in `fields`, `entries`, `record`)
+ * and `notes`, which can quote values and staff labels. `publicView` keeps
+ * only the entries whose effective visibility is `public` and whose key is in
+ * the record's template. `effectivePublishIssues` is the rights publish
+ * check (`rightsPublishIssues`) run on that public view, and also refuses
+ * rights that are staff-only here. Nothing here throws.
  */
 import { issue, type Issue, type Validated } from "./issues.js";
+import { RIGHTS_FIELD_KEY, rightsPublishIssues } from "./rights.js";
 import { shown } from "./plain-data.js";
 import { types } from "node:util";
 import { MAX_ARRANGEMENT_DEPTH, canFileUnder } from "./arrangement.js";
@@ -67,6 +77,7 @@ import {
   type FieldDefinition,
   type FieldTemplate,
   type FieldVisibility,
+  type TemplateCheckOptions,
 } from "./templates.js";
 
 /** The most records a set given to `indexRecords` or `effectiveRecord` may hold. */
@@ -101,26 +112,59 @@ export interface EffectiveRecord {
   readonly id: RecordId;
   readonly kind: RecordKind;
   readonly title: string;
-  /** The effective values, keyed by field key. Includes staff fields; filter by `entries`. */
+  /** The effective values, keyed by field key. Includes staff values: never publish; use `publicView`. */
   readonly fields: Readonly<Record<string, FieldValue>>;
   /** The same values in template order (left-over fields last), with their source and visibility. */
   readonly entries: readonly EffectiveField[];
   /** From the top of the tree down; the last step is the record itself. */
   readonly chain: readonly ChainStep[];
-  /** Inherited values that were left out, and why. */
+  /** Inherited values that were left out, and why. Staff only: may quote values and labels. */
   readonly notes: readonly Issue[];
-  /** The record as stored (a validated, frozen copy). */
+  /** The record as stored (a validated, frozen copy). Staff only. */
   readonly record: CatalogRecord;
 }
 
+/** One field as the public may see it. */
+export interface PublicField {
+  readonly key: string;
+  readonly label: string;
+  readonly value: FieldValue;
+  /** True when the value is the record's own; false when inherited. */
+  readonly own: boolean;
+}
+
 /**
- * Gives the template a record uses. Called at most once per record on the
- * way up, with a frozen copy. Returning undefined or throwing fails the
- * result. The template is validated before it is used.
+ * The only part of an effective record that may be published: the entries
+ * whose effective visibility is `public` and whose key is in the record's
+ * template. No notes, no stored record, and no ancestors' IDs or titles.
+ */
+export interface PublicRecord {
+  readonly id: RecordId;
+  readonly kind: RecordKind;
+  readonly title: string;
+  readonly fields: Readonly<Record<string, FieldValue>>;
+  readonly entries: readonly PublicField[];
+}
+
+export interface EffectiveOptions {
+  /**
+   * The same plug-in checks `checkRecordAgainstTemplate` takes. Inherited
+   * values go through them against the receiving record's template, and a
+   * value they refuse is left out. The record a checker is given is the
+   * receiving record holding only its inherited values.
+   */
+  readonly checkers?: TemplateCheckOptions["checkers"];
+}
+
+/**
+ * Gives the template a record uses. Called once per record on the way up,
+ * with a frozen copy. Returning undefined or throwing fails the result. What
+ * it returns is validated (copied) each time, so returning one object that
+ * changes between calls can't make one record use another's definitions.
  */
 export type TemplateLookup = (record: CatalogRecord) => FieldTemplate | undefined;
 
-/** A set of records indexed by ID, from `indexRecords`. Opaque. */
+/** A frozen snapshot of a set of records, indexed by ID, from `indexRecords`. Opaque. */
 export interface RecordLookup {
   /** How many records were indexed. */
   readonly size: number;
@@ -148,11 +192,8 @@ type Fetched =
   | { readonly ok: false; readonly why: "missing" | "duplicate" | "invalid" };
 
 interface LookupState {
-  /** The caller's objects, by the ID they had when indexed. */
-  readonly raw: ReadonlyMap<RecordId, unknown>;
-  readonly duplicated: ReadonlySet<RecordId>;
-  /** Validated copies (or why not), so each record is checked once per lookup. */
-  readonly checked: Map<RecordId, Fetched>;
+  /** Validated, frozen copies, by ID, or why the ID can't be used. Never changed after indexing. */
+  readonly byId: ReadonlyMap<RecordId, Fetched>;
 }
 
 /** Lookups made by `indexRecords`; anything else passed as one is refused. */
@@ -160,10 +201,12 @@ const LOOKUPS = new WeakMap<object, LookupState>();
 
 /**
  * Index a set of records by ID, once, for many `effectiveRecord` calls.
- * Entries that aren't plain records with a valid ID are skipped (a parent
- * that is skipped is then reported missing). IDs used more than once are
- * remembered, and using one fails. Each record is validated the first time
- * it is needed, and that frozen copy is used from then on. Never throws.
+ * Every record is validated now, so the index is one consistent snapshot:
+ * later changes to the caller's objects are not seen, and an index must be
+ * built again after any edit. A record that fails validation is remembered
+ * as invalid under the ID it carries; entries with no readable ID are
+ * skipped (a parent that is skipped is then reported missing). IDs used more
+ * than once are remembered, and using one fails. Never throws.
  */
 export function indexRecords(records: unknown): Validated<RecordLookup> {
   try {
@@ -185,20 +228,26 @@ function buildLookup(records: unknown): RecordLookup {
       `At most ${String(MAX_RECORD_SET)} records can be looked through at once.`,
     );
   }
-  const raw = new Map<RecordId, unknown>();
-  const duplicated = new Set<RecordId>();
+  const byId = new Map<RecordId, Fetched>();
   for (let i = 0; i < length; i += 1) {
     // Read each slot as a plain data property, so a getter can't run.
     const slot = Object.getOwnPropertyDescriptor(records, i);
     if (slot === undefined || !("value" in slot)) continue;
     const record: unknown = slot.value;
-    const id = idOf(record);
+    const checked = validateRecord(record);
+    const id = checked.ok ? checked.value.id : idOf(record);
     if (id === undefined) continue;
-    if (raw.has(id)) duplicated.add(id);
-    else raw.set(id, record);
+    byId.set(
+      id,
+      byId.has(id)
+        ? DUPLICATE
+        : checked.ok
+          ? Object.freeze({ ok: true, record: checked.value })
+          : INVALID,
+    );
   }
-  const lookup: RecordLookup = Object.freeze({ size: raw.size });
-  LOOKUPS.set(lookup, { raw, duplicated, checked: new Map() });
+  const lookup: RecordLookup = Object.freeze({ size: byId.size });
+  LOOKUPS.set(lookup, { byId });
   return lookup;
 }
 
@@ -211,24 +260,12 @@ function idOf(record: unknown): RecordId | undefined {
   return isRecordId(id) ? id : undefined;
 }
 
+const DUPLICATE: Fetched = Object.freeze({ ok: false, why: "duplicate" });
+const INVALID: Fetched = Object.freeze({ ok: false, why: "invalid" });
+const MISSING: Fetched = Object.freeze({ ok: false, why: "missing" });
+
 function fetchRecord(state: LookupState, id: RecordId): Fetched {
-  const known = state.checked.get(id);
-  if (known !== undefined) return known;
-  let result: Fetched;
-  if (state.duplicated.has(id)) {
-    result = { ok: false, why: "duplicate" };
-  } else if (!state.raw.has(id)) {
-    result = { ok: false, why: "missing" };
-  } else {
-    const checked = validateRecord(state.raw.get(id));
-    // The copy must still carry the ID it was indexed under.
-    result =
-      checked.ok && checked.value.id === id
-        ? { ok: true, record: checked.value }
-        : { ok: false, why: "invalid" };
-  }
-  state.checked.set(id, result);
-  return result;
+  return state.byId.get(id) ?? MISSING;
 }
 
 // ---------------------------------------------------------------------------
@@ -238,13 +275,16 @@ function fetchRecord(state: LookupState, id: RecordId): Fetched {
  * from the units above it, each with its source and effective visibility
  * (see the module header for the rules). `records` is the set to find the
  * record and its parents in, either a list or a lookup from `indexRecords`.
- * `templateFor` gives each record's template. Fails, with one issue, when
- * the record or any ancestor can't be found, read or trusted. Never throws.
+ * Passing a list validates the whole list on every call; for many records
+ * from one set, index it once. `templateFor` gives each record's template.
+ * Fails, with one issue, when the record or any ancestor can't be found,
+ * read or trusted. Never throws.
  */
 export function effectiveRecord(
   recordId: RecordId,
   records: RecordLookup | readonly CatalogRecord[],
   templateFor: TemplateLookup,
+  options: EffectiveOptions = {},
 ): Validated<EffectiveRecord> {
   try {
     if (!isRecordId(recordId)) fail([], "invalid_id", "The record ID must be a record ID.");
@@ -257,7 +297,8 @@ export function effectiveRecord(
     const lookup = state ?? stateOf(buildLookup(records));
     const up = ancestry(recordId, lookup);
     const templates = templatesFor(up, templateFor);
-    return { ok: true, value: compose(up, templates) };
+    const checkers = ownSetting(options, "checkers");
+    return { ok: true, value: compose(up, templates, checkers) };
   } catch (error) {
     return failure(error);
   }
@@ -364,8 +405,8 @@ function templatesFor(
   up: readonly CatalogRecord[],
   templateFor: TemplateLookup,
 ): readonly CheckedTemplate[] {
-  // The same template object is validated once per call.
-  const seen = new Map<unknown, CheckedTemplate>();
+  // Validated (copied) for every record, even when the same object comes back
+  // twice: the lookup may have changed it in between.
   return up.map((record) => {
     let given: unknown;
     try {
@@ -380,21 +421,17 @@ function templatesFor(
     if (given === undefined) {
       fail([record.id], "no_template", `${shown(record.title)} has no template.`);
     }
-    let checked = seen.get(given);
-    if (checked === undefined) {
-      const result = validateTemplate(given);
-      if (!result.ok) {
-        fail(
-          [record.id],
-          "invalid_template",
-          `The template for ${shown(record.title)} is not valid. Check it with validateTemplate.`,
-        );
-      }
-      const byKey = new Map<string, FieldDefinition>();
-      for (const field of result.value.fields) byKey.set(field.key, field);
-      checked = { template: result.value, byKey };
-      seen.set(given, checked);
+    const result = validateTemplate(given);
+    if (!result.ok) {
+      fail(
+        [record.id],
+        "invalid_template",
+        `The template for ${shown(record.title)} is not valid. Check it with validateTemplate.`,
+      );
     }
+    const byKey = new Map<string, FieldDefinition>();
+    for (const field of result.value.fields) byKey.set(field.key, field);
+    const checked: CheckedTemplate = { template: result.value, byKey };
     if (!checked.template.appliesTo.includes(record.kind)) {
       fail(
         [record.id],
@@ -421,6 +458,7 @@ interface Candidate {
 function compose(
   up: readonly CatalogRecord[],
   templates: readonly CheckedTemplate[],
+  checkers: unknown,
 ): EffectiveRecord {
   const target = up[0];
   const own = templates[0];
@@ -475,7 +513,7 @@ function compose(
     });
   }
 
-  const kept = dropUnfit(target, own.template, candidates, up, notes);
+  const kept = dropUnfit(target, own.template, candidates, up, notes, checkers);
 
   const chainUp = up.map(step);
   const entries = kept.map((c) => {
@@ -493,7 +531,7 @@ function compose(
   });
   // Object.fromEntries defines own properties, so no key can reach a prototype.
   const fields = Object.freeze(Object.fromEntries(entries.map((e) => [e.key, e.value])));
-  return Object.freeze({
+  const effective: EffectiveRecord = Object.freeze({
     id: target.id,
     kind: target.kind,
     title: target.title,
@@ -503,6 +541,75 @@ function compose(
     notes: Object.freeze(notes.map((n) => Object.freeze(n))),
     record: target,
   });
+  const shownEntries = entries
+    .filter((e) => e.visibility === "public" && e.inTemplate)
+    .map((e) => Object.freeze({ key: e.key, label: e.label, value: e.value, own: e.own }));
+  PUBLIC_VIEWS.set(
+    effective,
+    Object.freeze({
+      id: target.id,
+      kind: target.kind,
+      title: target.title,
+      fields: Object.freeze(Object.fromEntries(shownEntries.map((e) => [e.key, e.value]))),
+      entries: Object.freeze(shownEntries),
+    }),
+  );
+  return effective;
+}
+
+/** The public view of each effective record made here, made at the same time. */
+const PUBLIC_VIEWS = new WeakMap<object, PublicRecord>();
+
+/**
+ * The only part of an effective record that may be published (see
+ * `PublicRecord`). Undefined for anything `effectiveRecord` didn't return, so
+ * a hand-made or altered object can't be passed off as checked. Never throws.
+ */
+export function publicView(effective: EffectiveRecord): PublicRecord | undefined {
+  const given: unknown = effective;
+  return typeof given === "object" && given !== null ? PUBLIC_VIEWS.get(given) : undefined;
+}
+
+/**
+ * The rights publish check for an effective record: `rightsPublishIssues`
+ * run on its public view, so rights that are inherited count, and rights
+ * that are staff-only here (by the strictest-visibility rule) don't. Returns
+ * an empty list when the rights can be published. Never throws.
+ */
+export function effectivePublishIssues(effective: EffectiveRecord): readonly Issue[] {
+  try {
+    const view = publicView(effective);
+    if (view === undefined) {
+      return Object.freeze([
+        Object.freeze(
+          issue(
+            [],
+            "not_effective",
+            "This is not an effective record from effectiveRecord, so it can't be checked.",
+          ),
+        ),
+      ]);
+    }
+    const found = rightsPublishIssues(view);
+    if (found.length === 0) return found;
+    const hidden = effective.entries.some(
+      (e) => e.key === RIGHTS_FIELD_KEY && (e.visibility !== "public" || !e.inTemplate),
+    );
+    if (!hidden) return found;
+    return Object.freeze([
+      Object.freeze(
+        issue(
+          ["fields", RIGHTS_FIELD_KEY],
+          "rights_not_public",
+          "The rights value is staff only for this record, so it can't be published. Make the rights field public in every template along the way, or give the record its own public rights.",
+        ),
+      ),
+    ]);
+  } catch {
+    return Object.freeze([
+      Object.freeze(issue([], "unreadable", "The effective record could not be read.")),
+    ]);
+  }
 }
 
 /** The value the nearest ancestor gives for `field`, or undefined. */
@@ -548,8 +655,9 @@ function inherit(
 }
 
 /**
- * Check the inherited values against the record's own template and leave out
- * any that don't fit (a list option it doesn't have, a lower length limit).
+ * Check the inherited values against the record's own template, with the
+ * caller's plug-in checkers, and leave out any that don't fit (a list option
+ * it doesn't have, a lower length limit, a value a checker refuses).
  * Own values are the record's business and aren't checked here. Required
  * fields are not checked either: that's for whoever checks the record.
  */
@@ -559,6 +667,7 @@ function dropUnfit(
   candidates: readonly Candidate[],
   up: readonly CatalogRecord[],
   notes: Issue[],
+  checkers: unknown,
 ): readonly Candidate[] {
   const inherited = candidates.filter((c) => c.from !== 0);
   if (inherited.length === 0) return candidates;
@@ -570,7 +679,11 @@ function dropUnfit(
     ...target,
     fields: Object.fromEntries(inherited.map((c) => [c.key, c.value])),
   } as CatalogRecord;
-  const problems = checkRecordAgainstTemplate(probe, loose);
+  const problems = checkRecordAgainstTemplate(
+    probe,
+    loose,
+    (checkers === undefined ? {} : { checkers }) as TemplateCheckOptions,
+  );
   const unfit = new Map<string, string>();
   let unsure = false;
   for (const problem of problems) {
@@ -633,4 +746,22 @@ function describe(field: FieldDefinition): string {
 
 function article(level: ArchivalLevel): string {
   return `${level === "item" ? "An" : "A"} ${level}`;
+}
+
+/**
+ * An own data property of the caller's options, or undefined when it isn't
+ * there. Options that can't be read plainly (a Proxy, a getter) fail the
+ * result, so plug-in checks are never skipped without saying so.
+ */
+function ownSetting(options: unknown, key: string): unknown {
+  if (options === undefined) return undefined;
+  if (typeof options !== "object" || options === null || types.isProxy(options)) {
+    fail([], "invalid_options", "The options must be a plain object.");
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(options, key);
+  if (descriptor === undefined) return undefined;
+  if (!("value" in descriptor)) {
+    fail([], "invalid_options", `The ${key} option can't be a getter.`);
+  }
+  return descriptor.value;
 }

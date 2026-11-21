@@ -3,8 +3,12 @@
 // staff-only value reaching public output through inheritance.
 import { describe, expect, it } from "vitest";
 import {
+  canPublishRights,
+  effectivePublishIssues,
   effectiveRecord,
   indexRecords,
+  publicView,
+  type EffectiveRecord,
   newRecordId,
   type ArchivalLevel,
   type ArchivalUnitRecord,
@@ -102,6 +106,24 @@ describe("staff values can't be made public", () => {
     };
     const r = effectiveRecord(item.id, [item, fonds], lookup);
     expect(r.ok && r.value.entries[0]?.visibility).toBe("staff");
+  });
+
+  it("by returning one template object for every record and making it staff in between", () => {
+    // Public when asked for the item, staff when asked for the fonds: the
+    // fonds' value is staff where it is stored, so it must stay staff.
+    const shared = { ...PUBLIC_NOTE, fields: [{ ...def("note", "public") }] };
+    const fonds = unit("Fonds", "fonds", undefined, { note: "Donor's home address" });
+    const item = unit("Item", "item", fonds);
+    const lookup: TemplateLookup = (r) => {
+      const first = shared.fields[0];
+      if (first !== undefined) {
+        (first as { visibility: string }).visibility = r.id === fonds.id ? "staff" : "public";
+      }
+      return shared;
+    };
+    const r = effectiveRecord(item.id, [item, fonds], lookup);
+    expect(r.ok && r.value.entries[0]?.visibility).toBe("staff");
+    expect(r.ok && publicView(r.value)?.fields).toEqual({});
   });
 
   it("by a Proxy template that answers differently each time", () => {
@@ -221,25 +243,38 @@ describe("the caller's objects can't change the result once read", () => {
     expect(r.ok && r.value.fields.note).toBe("Original");
   });
 
-  it("a record whose id changed after indexing is refused", () => {
-    const fonds = unit("Fonds", "fonds");
-    const item = unit("Item", "item", fonds);
-    const index = indexRecords([item, fonds]);
-    if (!index.ok) throw new Error("not indexed");
-    (fonds as { id: RecordId }).id = newRecordId();
-    expect(codeOf(effectiveRecord(item.id, index.value, () => PUBLIC_NOTE))).toBe("invalid_parent");
-  });
-
-  it("a lookup keeps the copy it validated first", () => {
+  it("an index is a snapshot: changes to the input after indexing are not seen", () => {
     const fonds = unit("Fonds", "fonds", undefined, { note: "First" });
     const item = unit("Item", "item", fonds);
     const index = indexRecords([item, fonds]);
     if (!index.ok) throw new Error("not indexed");
-    const before = effectiveRecord(item.id, index.value, () => PUBLIC_NOTE);
+    (fonds.fields as Record<string, FieldValue>).note = "Changed";
+    (fonds as { id: RecordId }).id = newRecordId();
+    const r = effectiveRecord(item.id, index.value, () => PUBLIC_NOTE);
+    expect(r.ok && r.value.fields.note).toBe("First");
+    expect(r.ok && r.value.chain[0]?.id).not.toBe(fonds.id);
+  });
+
+  it("two lookups from one index see the same snapshot, even if the input changed between them", () => {
+    const fonds = unit("Fonds", "fonds", undefined, { note: "First" });
+    const a = unit("A", "item", fonds);
+    const b = unit("B", "item", fonds);
+    const index = indexRecords([a, b, fonds]);
+    if (!index.ok) throw new Error("not indexed");
     (fonds.fields as Record<string, FieldValue>).note = "Second";
-    const after = effectiveRecord(item.id, index.value, () => PUBLIC_NOTE);
-    expect(before.ok && before.value.fields.note).toBe("First");
-    expect(after.ok && after.value.fields.note).toBe("First");
+    const first = effectiveRecord(a.id, index.value, () => PUBLIC_NOTE);
+    (fonds.fields as Record<string, FieldValue>).note = "Third";
+    const second = effectiveRecord(b.id, index.value, () => PUBLIC_NOTE);
+    expect(first.ok && first.value.fields.note).toBe("First");
+    expect(second.ok && second.value.fields.note).toBe("First");
+  });
+
+  it("an invalid record is remembered under its ID when indexed", () => {
+    const fonds = unit("Fonds", "fonds");
+    const item = unit("Item", "item", fonds);
+    const index = indexRecords([item, { ...fonds, title: " bad" }]);
+    if (!index.ok) throw new Error("not indexed");
+    expect(codeOf(effectiveRecord(item.id, index.value, () => PUBLIC_NOTE))).toBe("invalid_parent");
   });
 });
 
@@ -299,3 +334,145 @@ function optionList(count: number): { value: string; label: string }[] {
     label: `O${String(i)}`,
   }));
 }
+
+describe("public output only comes from publicView", () => {
+  function tree() {
+    const fonds = unit("Fonds", "fonds", undefined, {
+      note: "Donor's home address",
+      creator: "Society",
+      old_key: "Left over",
+    });
+    const item = unit("Item", "item", fonds, { secret: "Staff remark", old_item: "Left over too" });
+    const fondsT = template([def("note", "staff"), def("creator", "public")], "fonds");
+    const itemT = template(
+      [def("note", "public"), def("creator", "public"), def("secret", "staff")],
+      "item",
+    );
+    const lookup: TemplateLookup = (r) => (r.id === fonds.id ? fondsT : itemT);
+    const r = effectiveRecord(item.id, [item, fonds], lookup);
+    if (!r.ok) throw new Error("failed");
+    return r.value;
+  }
+
+  it("has only public, in-template entries; never a staff value, own or inherited", () => {
+    const effective = tree();
+    // The full effective record does hold them, for staff screens.
+    expect(effective.fields.note).toBe("Donor's home address");
+    expect(effective.fields.secret).toBe("Staff remark");
+    const view = publicView(effective);
+    expect(view?.fields).toEqual({ creator: "Society" });
+    expect(view?.entries).toEqual([
+      { key: "creator", label: "creator", value: "Society", own: false },
+    ]);
+    const text = JSON.stringify(view);
+    for (const leak of ["Donor", "Staff remark", "Left over", "Fonds"]) {
+      expect(text).not.toContain(leak);
+    }
+  });
+
+  it("carries no notes, stored record or chain, and is frozen", () => {
+    const view = publicView(tree());
+    expect(Object.keys(view ?? {}).sort()).toEqual(["entries", "fields", "id", "kind", "title"]);
+    expect(Object.isFrozen(view)).toBe(true);
+    expect(Object.isFrozen(view?.fields)).toBe(true);
+    expect(view?.entries.every((e) => Object.isFrozen(e))).toBe(true);
+  });
+
+  it("keeps notes, which can quote values, out of the public view", () => {
+    const fondsT = template([{ ...def("note", "staff"), kind: "long_text" }], "fonds");
+    const fonds = unit("Fonds", "fonds", undefined, { note: "Quoted secret" });
+    const item = unit("Item", "item", fonds);
+    const r = effectiveRecord(item.id, [item, fonds], (rec) =>
+      rec.id === fonds.id ? fondsT : PUBLIC_NOTE,
+    );
+    if (!r.ok) throw new Error("failed");
+    expect(r.value.notes).toHaveLength(1);
+    expect(JSON.stringify(publicView(r.value))).not.toContain("note");
+  });
+
+  it("gives nothing for a hand-made or copied effective record", () => {
+    const effective = tree();
+    const copy = { ...effective, fields: { note: "x" } } as EffectiveRecord;
+    expect(publicView(copy)).toBeUndefined();
+    expect(publicView(null as unknown as EffectiveRecord)).toBeUndefined();
+    expect(effectivePublishIssues(copy)[0]?.code).toBe("not_effective");
+  });
+});
+
+describe("the publish check can't be passed with staff-only rights", () => {
+  const RIGHTS = "http://rightsstatements.org/vocab/CNE/1.0/";
+
+  function withRights(fondsVisibility: "public" | "staff", ownRights = false) {
+    const fonds = unit("Fonds", "fonds", undefined, { rights: RIGHTS });
+    const item = unit("Item", "item", fonds, ownRights ? { rights: RIGHTS } : {});
+    const fondsT = template([def("rights", fondsVisibility)], "fonds");
+    const itemT = template([def("rights", "public")], "item");
+    const r = effectiveRecord(item.id, [item, fonds], (rec) =>
+      rec.id === fonds.id ? fondsT : itemT,
+    );
+    if (!r.ok) throw new Error("failed");
+    return r.value;
+  }
+
+  it("refuses rights inherited from a template that marks them staff", () => {
+    const effective = withRights("staff");
+    expect(effective.fields.rights).toBe(RIGHTS);
+    expect(effectivePublishIssues(effective).map((i) => i.code)).toEqual(["rights_not_public"]);
+    expect(canPublishRights(publicView(effective))).toBe(false);
+  });
+
+  it("accepts public inherited rights, and the record's own public rights", () => {
+    expect(effectivePublishIssues(withRights("public"))).toEqual([]);
+    expect(effectivePublishIssues(withRights("staff", true))).toEqual([]);
+  });
+
+  it("reports missing rights as missing", () => {
+    const item = unit("Item", "item");
+    const r = effectiveRecord(item.id, [item], () => template([def("rights", "public")]));
+    if (!r.ok) throw new Error("failed");
+    expect(effectivePublishIssues(r.value).map((i) => i.code)).toEqual(["rights_missing"]);
+  });
+});
+
+describe("plug-in checkers run on inherited values", () => {
+  const refuseBad = {
+    text: (value: unknown) =>
+      value === "bad" ? [{ code: "refused", message: "This value is refused." }] : [],
+  };
+
+  it("an inherited value a checker refuses is left out, with a note", () => {
+    const fonds = unit("Fonds", "fonds", undefined, { note: "bad" });
+    const item = unit("Item", "item", fonds);
+    const r = effectiveRecord(item.id, [item, fonds], () => PUBLIC_NOTE, { checkers: refuseBad });
+    expect(r.ok && r.value.fields).toEqual({});
+    expect(r.ok && r.value.notes[0]?.code).toBe("not_valid_here");
+    // Without the checker, the same value is inherited.
+    const plain = effectiveRecord(item.id, [item, fonds], () => PUBLIC_NOTE);
+    expect(plain.ok && plain.value.fields).toEqual({ note: "bad" });
+  });
+
+  it("a checker that throws makes the inherited value fail, not pass", () => {
+    const fonds = unit("Fonds", "fonds", undefined, { note: "fine" });
+    const item = unit("Item", "item", fonds);
+    const r = effectiveRecord(item.id, [item, fonds], () => PUBLIC_NOTE, {
+      checkers: {
+        text: () => {
+          throw new Error("boom");
+        },
+      },
+    });
+    expect(r.ok && r.value.fields).toEqual({});
+  });
+
+  it("options that can't be read plainly fail instead of skipping the checks", () => {
+    const item = unit("Item", "item");
+    const proxy = new Proxy({ checkers: refuseBad }, {});
+    expect(codeOf(effectiveRecord(item.id, [item], () => PUBLIC_NOTE, proxy))).toBe(
+      "invalid_options",
+    );
+    const getter = Object.defineProperty({}, "checkers", { get: () => refuseBad });
+    expect(codeOf(effectiveRecord(item.id, [item], () => PUBLIC_NOTE, getter))).toBe(
+      "invalid_options",
+    );
+  });
+});
