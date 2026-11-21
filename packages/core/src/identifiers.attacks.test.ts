@@ -9,6 +9,7 @@ import {
   identifierKey,
   newRecordId,
   nextIdentifier,
+  retireIdentifier,
   uniquenessIssues,
   validateIdentifierType,
   validateIdentifierTypes,
@@ -16,9 +17,17 @@ import {
   type IdentifierType,
   type RecordIdentifiers,
   type Validated,
+  newOrganizationId,
 } from "./index.js";
 
-const BOX: IdentifierType = { key: "box_label", label: "Box label", uniqueness: "current" };
+const ORG = newOrganizationId();
+
+const BOX: IdentifierType = {
+  key: "box_label",
+  label: "Box label",
+  organizationId: ORG,
+  uniqueness: "current",
+};
 const TYPES = [BOX];
 
 function codes(result: Validated<unknown>): string[] {
@@ -30,7 +39,12 @@ describe("built-in names can't stand in for identifier types", () => {
     "%s is an unknown type unless the organization defines it",
     (type) => {
       const r = validateRecordIdentifiers(
-        { recordId: newRecordId(), current: [{ type, value: "1", primary: true }], former: [] },
+        {
+          recordId: newRecordId(),
+          organizationId: ORG,
+          current: [{ type, value: "1", primary: true }],
+          former: [],
+        },
         TYPES,
       );
       expect(codes(r)).toEqual(["unknown_type"]);
@@ -41,11 +55,17 @@ describe("built-in names can't stand in for identifier types", () => {
   );
 
   it("a type the organization names 'constructor' works like any other", () => {
-    const type = { key: "constructor", label: "Odd", uniqueness: "current" } as const;
+    const type = {
+      key: "constructor",
+      label: "Odd",
+      organizationId: ORG,
+      uniqueness: "current",
+    } as const;
     expect(validateIdentifierType(type).ok).toBe(true);
     const r = validateRecordIdentifiers(
       {
         recordId: newRecordId(),
+        organizationId: ORG,
         current: [{ type: "constructor", value: "1", primary: true }],
         former: [],
       },
@@ -84,6 +104,7 @@ describe("hostile objects", () => {
 
     const throwing = {
       recordId: newRecordId(),
+      organizationId: ORG,
       current: [],
       get former(): never {
         throw new Error("boom");
@@ -112,6 +133,7 @@ describe("hostile objects", () => {
   it("the result is a frozen copy the caller can't change afterwards", () => {
     const input = {
       recordId: newRecordId(),
+      organizationId: ORG,
       current: [{ type: "box_label", value: "A", primary: true }],
       former: [],
     };
@@ -130,6 +152,7 @@ describe("messages can't be used to hide or reorder text", () => {
     const r = validateRecordIdentifiers(
       {
         recordId: newRecordId(),
+        organizationId: ORG,
         current: [{ type: 'x"\u2028', value: "1", primary: true }],
         former: [],
       },
@@ -145,6 +168,7 @@ describe("messages can't be used to hide or reorder text", () => {
     const r = validateRecordIdentifiers(
       {
         recordId: newRecordId(),
+        organizationId: ORG,
         current: [{ type: "box_label", value: "A", primary: true, ["k".repeat(64)]: 1 }],
         former: [],
       },
@@ -178,6 +202,7 @@ describe("lookalike identifiers can't both be held (S-003)", () => {
   ];
   const holding = (value: string): RecordIdentifiers => ({
     recordId: newRecordId(),
+    organizationId: ORG,
     current: [{ type: "box_label", value, primary: true }],
     former: [],
   });
@@ -276,6 +301,7 @@ describe("lookalike identifiers can't both be held (S-003)", () => {
 describe("equivalent spellings with many marks take the same path (second review)", () => {
   const holding = (value: string): RecordIdentifiers => ({
     recordId: newRecordId(),
+    organizationId: ORG,
     current: [{ type: "box_label", value, primary: true }],
     former: [],
   });
@@ -304,6 +330,7 @@ describe("equivalent spellings with many marks take the same path (second review
     // One record holding both: a duplicate within the record, or refused.
     const both = {
       recordId: newRecordId(),
+      organizationId: ORG,
       current: [
         { type: "box_label", value: a, primary: true },
         { type: "box_label", value: b, primary: false },
@@ -318,6 +345,7 @@ describe("equivalent spellings with many marks take the same path (second review
     const [a, b] = PROBES[4] ?? ["", ""];
     const both = {
       recordId: newRecordId(),
+      organizationId: ORG,
       current: [
         { type: "box_label", value: a, primary: true },
         { type: "box_label", value: b, primary: false },
@@ -359,18 +387,31 @@ describe("size limits", () => {
       value: `B${String(i)}`,
     }));
     expect(
-      codes(validateRecordIdentifiers({ recordId: newRecordId(), current: [], former }, TYPES)),
+      codes(
+        validateRecordIdentifiers(
+          { recordId: newRecordId(), organizationId: ORG, current: [], former },
+          TYPES,
+        ),
+      ),
     ).toEqual(["too_many"]);
   });
 
   it("refuses a huge or deeply nested input quickly", () => {
     const started = performance.now();
-    const huge = { recordId: newRecordId(), current: [], former: new Array(1_000_000).fill(0) };
+    const huge = {
+      recordId: newRecordId(),
+      organizationId: ORG,
+      current: [],
+      former: new Array(1_000_000).fill(0),
+    };
     expect(validateRecordIdentifiers(huge, TYPES).ok).toBe(false);
     let deep: unknown = "x";
     for (let i = 0; i < 10_000; i += 1) deep = [deep];
     expect(
-      validateRecordIdentifiers({ recordId: newRecordId(), current: deep, former: [] }, TYPES).ok,
+      validateRecordIdentifiers(
+        { recordId: newRecordId(), organizationId: ORG, current: deep, former: [] },
+        TYPES,
+      ).ok,
     ).toBe(false);
     expect(validateIdentifierTypes(new Array(1_000_000).fill(BOX)).ok).toBe(false);
     expect(performance.now() - started).toBeLessThan(1000);
@@ -379,6 +420,7 @@ describe("size limits", () => {
   it("uniqueness, search and numbering stay linear over many records", () => {
     const all: RecordIdentifiers[] = Array.from({ length: 20_000 }, (_, i) => ({
       recordId: newRecordId(),
+      organizationId: ORG,
       current: [{ type: "box_label", value: `B-${String(i % 10_000)}`, primary: true }],
       former: [],
     }));
@@ -400,5 +442,106 @@ describe("size limits", () => {
     const started = performance.now();
     expect(findByIdentifier("\ufdfa".repeat(1_000_000), [])).toEqual([]);
     expect(performance.now() - started).toBeLessThan(100);
+  });
+});
+
+describe("one organization's numbers can't be read or mixed with another's (D-019)", () => {
+  // D-019's case: two organizations in one install, both numbering `DPL1`.
+  const OTHER = newOrganizationId();
+  const OTHER_BOX: IdentifierType = { ...BOX, organizationId: OTHER, label: "Other box" };
+  const mine = newRecordId();
+  const theirs = newRecordId();
+  const ownSet: RecordIdentifiers = {
+    recordId: mine,
+    organizationId: ORG,
+    current: [{ type: "box_label", value: "DPL1", primary: true }],
+    former: [],
+  };
+  const otherSet: RecordIdentifiers = {
+    recordId: theirs,
+    organizationId: OTHER,
+    current: [{ type: "box_label", value: "DPL1", primary: true }],
+    former: [{ type: "box_label", value: "DPL7" }],
+  };
+
+  it("uniquenessIssues refuses a mixed set instead of reporting the other organization's holder", () => {
+    for (const all of [
+      [ownSet, otherSet],
+      [otherSet, ownSet],
+    ]) {
+      const issues = uniquenessIssues(all, TYPES);
+      expect(issues.map((i) => i.code)).toEqual(["mixed_organizations"]);
+      expect(JSON.stringify(issues)).not.toContain(theirs);
+    }
+    expect(uniquenessIssues([ownSet], [BOX, OTHER_BOX]).map((i) => i.code)).toEqual([
+      "mixed_organizations",
+    ]);
+  });
+
+  it("checkNewIdentifier won't look at another organization's records or use its types", () => {
+    const fresh = newRecordId();
+    // Without the check, this would say "already used by another record",
+    // telling one organization what the other holds.
+    const mixed = checkNewIdentifier(
+      { type: "box_label", value: "DPL1" },
+      fresh,
+      [otherSet],
+      TYPES,
+    );
+    expect(mixed.map((i) => i.code)).toEqual(["mixed_organizations"]);
+    expect(
+      checkNewIdentifier({ type: "box_label", value: "X" }, fresh, [ownSet, otherSet], TYPES).map(
+        (i) => i.code,
+      ),
+    ).toEqual(["mixed_organizations"]);
+    expect(
+      checkNewIdentifier({ type: "box_label", value: "X" }, fresh, [ownSet], [OTHER_BOX]).map(
+        (i) => i.code,
+      ),
+    ).toEqual(["mixed_organizations"]);
+  });
+
+  it("nextIdentifier won't count another organization's numbers", () => {
+    const auto: IdentifierType = {
+      ...BOX,
+      autoNumber: { style: "prefix", prefix: "DPL", digits: 1 },
+    };
+    expect(codes(nextIdentifier(auto, [ownSet, otherSet]))).toEqual(["mixed_organizations"]);
+    expect(codes(nextIdentifier({ ...auto, organizationId: OTHER }, [ownSet]))).toEqual([
+      "mixed_organizations",
+    ]);
+  });
+
+  it("validateRecordIdentifiers won't check a record's numbers against another organization's types", () => {
+    expect(codes(validateRecordIdentifiers(ownSet, [OTHER_BOX]))).toEqual(["mixed_organizations"]);
+    expect(codes(validateRecordIdentifiers(ownSet, [BOX, OTHER_BOX]))).toEqual([
+      "mixed_organizations",
+    ]);
+    const unowned = { recordId: mine, current: ownSet.current, former: [] };
+    expect(codes(validateRecordIdentifiers(unowned, TYPES))).toEqual(["invalid_organization"]);
+  });
+
+  it("validateIdentifierTypes refuses one list holding two organizations' types", () => {
+    expect(codes(validateIdentifierTypes([BOX, { ...OTHER_BOX, key: "other_box" }]))).toEqual([
+      "mixed_organizations",
+    ]);
+    const unowned = { key: BOX.key, label: BOX.label, uniqueness: BOX.uniqueness };
+    expect(codes(validateIdentifierType(unowned))).toEqual(["invalid_organization"]);
+  });
+
+  it("the same number in two organizations is fine when each is checked on its own", () => {
+    expect(uniquenessIssues([ownSet], TYPES)).toEqual([]);
+    expect(uniquenessIssues([otherSet], [OTHER_BOX])).toEqual([]);
+    expect(
+      checkNewIdentifier({ type: "box_label", value: "DPL1" }, newRecordId(), [ownSet], TYPES),
+    ).not.toEqual([]);
+    expect(
+      checkNewIdentifier({ type: "box_label", value: "DPL7" }, newRecordId(), [ownSet], TYPES),
+    ).toEqual([]);
+  });
+
+  it("retireIdentifier keeps the record's organization", () => {
+    const r = retireIdentifier(ownSet, { type: "box_label", value: "DPL1" });
+    expect(r.ok && r.value.organizationId).toBe(ORG);
   });
 });

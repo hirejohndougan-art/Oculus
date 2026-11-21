@@ -2,6 +2,7 @@
 import {
   effectiveRecord,
   makeIdentifierChecker,
+  newOrganizationId,
   newRecordId,
   publicView,
   type ArchivalLevel,
@@ -16,6 +17,8 @@ import {
 } from "./index.js";
 
 export const T = "2026-11-20T16:05:00.000Z";
+/** The one organization every fixture belongs to. */
+export const ORG = newOrganizationId();
 export const CNE = "http://rightsstatements.org/vocab/CNE/1.0/";
 export const BASE = "https://archive.example.org/items/";
 export const LCSH = "http://id.loc.gov/authorities/subjects/sh85111283";
@@ -93,7 +96,7 @@ export function record(
   extra: Readonly<Record<string, unknown>> = {},
   id: RecordId = newRecordId(),
 ): CatalogRecord {
-  const base = { id, title, createdAt: T, updatedAt: T, fields };
+  const base = { id, title, organizationId: ORG, createdAt: T, updatedAt: T, fields };
   const byKind: Record<RecordKind, Record<string, unknown>> = {
     object: {},
     archival_unit: { level: "item" satisfies ArchivalLevel },
@@ -109,9 +112,21 @@ export function record(
 // itself must still never appear in output. `donor_file_number` is staff
 // only (the default), so its values must never be published (D-022).
 const identifierChecker = makeIdentifierChecker([
-  { key: "accession_number", label: "Accession number", uniqueness: "none", public: true },
-  { key: "secret_type_code", label: "Secret type", uniqueness: "none", public: true },
-  { key: "donor_file_number", label: "Donor file number", uniqueness: "none" },
+  {
+    key: "accession_number",
+    label: "Accession number",
+    organizationId: ORG,
+    uniqueness: "none",
+    public: true,
+  },
+  {
+    key: "secret_type_code",
+    label: "Secret type",
+    organizationId: ORG,
+    uniqueness: "none",
+    public: true,
+  },
+  { key: "donor_file_number", label: "Donor file number", organizationId: ORG, uniqueness: "none" },
 ]);
 if (!identifierChecker.ok) throw new Error("identifier types");
 /** The checkers publicOutput needs for the fixtures' identifier field. */

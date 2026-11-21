@@ -9,7 +9,10 @@ import {
   type FieldTemplate,
   type TemplateChanges,
   type Validated,
+  newOrganizationId,
 } from "./index.js";
+
+const ORG = newOrganizationId();
 
 const T = "2026-11-20T16:05:00.000Z";
 const A = "3f1c2a9e-8b7d-4c6e-9a1b-2d3e4f5a6b7c";
@@ -22,6 +25,7 @@ function unit(id: string, fields: Record<string, unknown>): Record<string, unkno
     level: "item",
     id,
     title: "Letter",
+    organizationId: ORG,
     createdAt: T,
     updatedAt: T,
     fields,
@@ -146,6 +150,7 @@ describe("template changes that could publish without records or other templates
       kind: "object",
       id: B,
       title: "Postcard",
+      organizationId: ORG,
       createdAt: T,
       updatedAt: T,
       fields: { scope_and_content: SECRET },

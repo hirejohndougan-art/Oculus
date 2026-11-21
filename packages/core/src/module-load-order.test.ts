@@ -29,6 +29,7 @@ describe("module load order", () => {
       kind: "object",
       id: "3f1c2a9e-8b7d-4c6e-9a1b-2d3e4f5a6b7c",
       title: "Postcard",
+      organizationId: "0b5e3c1a-7d2f-4a6b-8c9d-1e2f3a4b5c6d",
       createdAt: "2026-11-20T16:05:00.000Z",
       updatedAt: "2026-11-20T16:05:00.000Z",
       fields: { genre: { label: "Postcards", vocabulary: "local", uri: "https://example.org/x" } },

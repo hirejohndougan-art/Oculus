@@ -10,13 +10,24 @@ import {
   validateRecord,
   type Issue,
   type Validated,
+  newOrganizationId,
 } from "./index.js";
+
+const ORG = newOrganizationId();
 
 const ID = "3f1c2a9e-8b7d-4c6e-9a1b-2d3e4f5a6b7c";
 const T = "2026-11-20T16:05:00.000Z";
 
 function valid(): Record<string, unknown> {
-  return { kind: "object", id: ID, title: "Chair", createdAt: T, updatedAt: T, fields: {} };
+  return {
+    kind: "object",
+    id: ID,
+    title: "Chair",
+    organizationId: ORG,
+    createdAt: T,
+    updatedAt: T,
+    fields: {},
+  };
 }
 
 function codes(result: Validated<unknown>): string[] {
@@ -52,15 +63,17 @@ describe("the returned record is a frozen copy", () => {
 
   it("createRecord doesn't keep the caller's fields object", () => {
     const fields: Record<string, string> = { date: "1909" };
-    const r = createRecord({ kind: "object", title: "Chair", fields });
+    const r = createRecord({ organizationId: ORG, kind: "object", title: "Chair", fields });
     fields.date = "changed";
     expect(r.ok && r.value.fields.date).toBe("1909");
   });
 
   it("createRecord reports an invalid time instead of throwing", () => {
-    expect(codes(createRecord({ kind: "object", title: "Chair" }, new Date(Number.NaN)))).toEqual([
-      "invalid_time",
-    ]);
+    expect(
+      codes(
+        createRecord({ organizationId: ORG, kind: "object", title: "Chair" }, new Date(Number.NaN)),
+      ),
+    ).toEqual(["invalid_time"]);
   });
 });
 
@@ -262,8 +275,12 @@ describe("second review", () => {
     expect(() => createRecord(thrower as never)).not.toThrow();
     expect(createRecord(thrower as never).ok).toBe(false);
     const fakeDate = Object.create(Date.prototype) as Date;
-    expect(() => createRecord({ kind: "object", title: "x" }, fakeDate)).not.toThrow();
-    expect(codes(createRecord({ kind: "object", title: "x" }, fakeDate))).toEqual(["invalid_time"]);
+    expect(() =>
+      createRecord({ organizationId: ORG, kind: "object", title: "x" }, fakeDate),
+    ).not.toThrow();
+    expect(
+      codes(createRecord({ organizationId: ORG, kind: "object", title: "x" }, fakeDate)),
+    ).toEqual(["invalid_time"]);
   });
 
   it("createRecord refuses getters instead of running them", () => {

@@ -9,7 +9,10 @@ import {
   type ArchivalLevel,
   type ArchivalUnitRecord,
   type RecordId,
+  newOrganizationId,
 } from "./index.js";
+
+const ORG = newOrganizationId();
 
 const T = "2026-11-20T16:05:00.000Z";
 
@@ -24,6 +27,7 @@ function unit(
     id,
     title,
     level,
+    organizationId: ORG,
     createdAt: T,
     updatedAt: T,
     fields: {},

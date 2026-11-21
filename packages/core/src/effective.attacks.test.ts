@@ -22,7 +22,10 @@ import {
   type FieldValue,
   type RecordId,
   type TemplateLookup,
+  newOrganizationId,
 } from "./index.js";
+
+const ORG = newOrganizationId();
 
 const T = "2026-11-20T16:05:00.000Z";
 
@@ -37,6 +40,7 @@ function unit(
     id: newRecordId(),
     title,
     level,
+    organizationId: ORG,
     createdAt: T,
     updatedAt: T,
     fields,
@@ -606,8 +610,19 @@ describe("rightsPublishIssues refuses an effective record", () => {
 describe("staff identifier types never reach the public view (D-022)", () => {
   const SECRET = "DF-SECRET-0042";
   const made = makeIdentifierChecker([
-    { key: "object_number", label: "Object number", uniqueness: "none", public: true },
-    { key: "donor_file_number", label: "Donor file number", uniqueness: "none" },
+    {
+      key: "object_number",
+      label: "Object number",
+      organizationId: ORG,
+      uniqueness: "none",
+      public: true,
+    },
+    {
+      key: "donor_file_number",
+      label: "Donor file number",
+      organizationId: ORG,
+      uniqueness: "none",
+    },
   ]);
   if (!made.ok) throw new Error("types");
   const checkers = { identifier: made.value };
@@ -781,5 +796,67 @@ describe("an unreadable templateKey is refused, not read as no key", () => {
     };
     const r = effectiveRecord(item.id, [item as unknown as CatalogRecord], () => PUBLIC_NOTE);
     expect(codeOf(r)).toBe("invalid_record");
+  });
+});
+
+describe("one organization's records can't be read or mixed with another's (D-019)", () => {
+  // Another organization in the same install, holding a fonds of its own.
+  const OTHER = newOrganizationId();
+  const PUBLIC_RIGHTS = template([def("note", "public"), def("creator", "public")], "both");
+
+  function otherFonds(): ArchivalUnitRecord {
+    return {
+      ...unit("Other organization's fonds", "fonds", undefined, {
+        note: "SECRET other organization's note",
+        creator: "SECRET other organization's creator",
+      }),
+      organizationId: OTHER,
+    };
+  }
+
+  it("an item filed under another organization's fonds inherits nothing from it", () => {
+    const fonds = otherFonds();
+    const item = unit("Item", "item", fonds);
+    for (const set of [
+      [item, fonds],
+      [fonds, item],
+    ]) {
+      const r = effectiveRecord(item.id, set, () => PUBLIC_RIGHTS);
+      expect(codeOf(r)).toBe("mixed_organizations");
+      expect(JSON.stringify(r)).not.toContain("SECRET");
+    }
+  });
+
+  it("a set holding a stray record of another organization is refused whole, not filtered", () => {
+    const fonds = unit("Fonds", "fonds", undefined, { note: "Own note" });
+    const item = unit("Item", "item", fonds);
+    const stray = otherFonds();
+    const index = indexRecords([item, fonds, stray]);
+    expect(index.ok ? undefined : index.issues[0]).toMatchObject({
+      code: "mixed_organizations",
+      path: [2],
+    });
+    expect(codeOf(effectiveRecord(item.id, [item, fonds, stray], () => PUBLIC_NOTE))).toBe(
+      "mixed_organizations",
+    );
+    expect(JSON.stringify(index)).not.toContain("SECRET");
+  });
+
+  it("a record whose organizationId was blanked or forged is not a way round the check", () => {
+    const fonds = otherFonds();
+    const item = unit("Item", "item", fonds);
+    for (const organizationId of [undefined, "", "other", OTHER.toUpperCase()]) {
+      const forged = { ...fonds, organizationId } as unknown as CatalogRecord;
+      const r = effectiveRecord(item.id, [item, forged], () => PUBLIC_RIGHTS);
+      expect(r.ok).toBe(false);
+      expect(JSON.stringify(r)).not.toContain("SECRET");
+    }
+  });
+
+  it("each organization's own set still works on its own", () => {
+    const fonds = otherFonds();
+    const item: ArchivalUnitRecord = { ...unit("Item", "item", fonds), organizationId: OTHER };
+    const r = effectiveRecord(item.id, [item, fonds], () => PUBLIC_RIGHTS);
+    expect(r.ok && r.value.fields.creator).toBe("SECRET other organization's creator");
   });
 });

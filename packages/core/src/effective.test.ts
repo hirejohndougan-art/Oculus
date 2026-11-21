@@ -18,7 +18,10 @@ import {
   type FieldValue,
   type RecordId,
   type TemplateLookup,
+  newOrganizationId,
 } from "./index.js";
+
+const ORG = newOrganizationId();
 
 const T = "2026-11-20T16:05:00.000Z";
 const CNE = { uri: "http://rightsstatements.org/vocab/CNE/1.0/" };
@@ -36,6 +39,7 @@ function unit(
     id,
     title,
     level,
+    organizationId: ORG,
     createdAt: T,
     updatedAt: T,
     fields,
@@ -418,6 +422,7 @@ describe("which fields inherit", () => {
       kind: "object",
       id: newRecordId(),
       title: "Lantern",
+      organizationId: ORG,
       createdAt: T,
       updatedAt: T,
       fields: { creator: "Unknown" },
@@ -583,6 +588,7 @@ describe("a hierarchy that can't be trusted fails the whole result", () => {
       kind: "object",
       id: newRecordId(),
       title: "Lantern",
+      organizationId: ORG,
       createdAt: T,
       updatedAt: T,
       fields: {},

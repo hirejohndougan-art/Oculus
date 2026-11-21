@@ -31,6 +31,14 @@
  *   former notes can be internal: a public site or public search must pass in
  *   published records only, and show only public types.
  *
+ * - **One organization at a time** (D-019, D-0XX). Identifier types and a
+ *   record's identifiers carry their `organizationId`, and a number is unique
+ *   only within its organization. `validateIdentifierTypes`,
+ *   `validateRecordIdentifiers`, `uniquenessIssues`, `checkNewIdentifier` and
+ *   `nextIdentifier` refuse inputs of more than one organization
+ *   (`mixed_organizations`). `findByIdentifier` and `findIdentifierConflicts`
+ *   don't check yet (T-019c): pass them one organization's sets only.
+ *
  * Not decided here, and left to later tasks:
  * - Changing an identifier type. Tightening a format, removing a type,
  *   making it unique or making it staff only can make existing records fail `validateRecordIdentifiers`;
@@ -41,6 +49,12 @@ import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import { IssueList, readPlainData, shown, textProblem, type JsonValue } from "./plain-data.js";
 import { types } from "node:util";
 import { isRecordId, type RecordId } from "./record-id.js";
+import {
+  isOrganizationId,
+  mixedOrganizationsIssue,
+  oneOrganization,
+  type OrganizationId,
+} from "./organizations.js";
 import {
   BLANK_CHARACTERS,
   MAX_MARK_RUN,
@@ -75,6 +89,8 @@ export type AutoNumbering =
 
 /** An identifier type defined by the organization. */
 export interface IdentifierType {
+  /** The organization that defined the type (D-019, D-0XX). Types are never shared. */
+  readonly organizationId: OrganizationId;
   /** Stable key, e.g. `accession_number`. Lower case letters, digits and underscores. */
   readonly key: string;
   /** What people see, e.g. "Accession number". */
@@ -114,6 +130,8 @@ export interface FormerIdentifier {
 /** All identifiers of one record. */
 export interface RecordIdentifiers {
   readonly recordId: RecordId;
+  /** The organization the record belongs to (D-0XX). */
+  readonly organizationId: OrganizationId;
   readonly current: readonly Identifier[];
   readonly former: readonly FormerIdentifier[];
 }
@@ -234,12 +252,24 @@ export function validateIdentifierTypes(input: unknown): Validated<readonly Iden
     if (copy === undefined || !Array.isArray(copy)) return { ok: false, issues: issues.items };
     const list = copy as readonly JsonValue[];
     const seen = new Set<string>();
+    let organization: string | undefined;
     list.forEach((item, index) => {
       if (!isPlainObject(item)) {
         issues.add([index], "not_an_object", "An identifier type must be a plain object.");
         return;
       }
       checkType(item, [index], issues);
+      const owner = item.organizationId;
+      if (isOrganizationId(owner)) {
+        organization ??= owner;
+        if (owner !== organization) {
+          const mixed = mixedOrganizationsIssue(
+            [index, "organizationId"],
+            "These identifier types",
+          );
+          issues.add(mixed.path, mixed.code, mixed.message);
+        }
+      }
       const key = item.key;
       if (typeof key === "string") {
         if (seen.has(key)) {
@@ -265,11 +295,18 @@ function checkType(
   const view = ownOnly(type);
   unknownKeys(
     view,
-    ["key", "label", "pattern", "uniqueness", "autoNumber", "public"],
+    ["organizationId", "key", "label", "pattern", "uniqueness", "autoNumber", "public"],
     at,
     "an identifier type",
     issues,
   );
+  if (!isOrganizationId(view.organizationId)) {
+    issues.add(
+      [...at, "organizationId"],
+      "invalid_organization",
+      "Every identifier type belongs to one organization: organizationId must be an organization ID.",
+    );
+  }
   if (typeof view.key !== "string" || !TYPE_KEY.test(view.key)) {
     issues.add(
       [...at, "key"],
@@ -414,9 +451,32 @@ export function validateRecordIdentifiers(
     );
     if (copy === undefined) return { ok: false, issues: issues.items };
     const view = ownOnly(copy);
-    unknownKeys(view, ["recordId", "current", "former"], [], "a record's identifiers", issues);
+    unknownKeys(
+      view,
+      ["recordId", "organizationId", "current", "former"],
+      [],
+      "a record's identifiers",
+      issues,
+    );
     if (!isRecordId(view.recordId)) {
       issues.add(["recordId"], "invalid_id", "recordId must be a record ID.");
+    }
+    const owner = view.organizationId;
+    if (!isOrganizationId(owner)) {
+      issues.add(
+        ["organizationId"],
+        "invalid_organization",
+        "A record's identifiers belong to its organization: organizationId must be an organization ID.",
+      );
+    } else if (oneOrganization([{ organizationId: owner }, ...identifierTypes]) === "mixed") {
+      // Another organization's types are refused outright, never used to
+      // check this record's numbers (D-019, D-0XX).
+      return {
+        ok: false,
+        issues: [
+          mixedOrganizationsIssue(["organizationId"], "These identifiers and identifier types"),
+        ],
+      };
     }
     const byKey = typeMap(identifierTypes);
     checkCurrent(view.current, byKey, issues);
@@ -713,12 +773,15 @@ function formerMatch(recordId: RecordId, item: FormerIdentifier): IdentifierMatc
  * Check every record's identifiers against each type's uniqueness rule.
  * Reports every holder of a value that more than one record uses (with the
  * path `[recordId, "current" | "former", index]`). Linear in the number of
- * identifiers; stops after a few hundred problems.
+ * identifiers; stops after a few hundred problems. Refuses, with the one
+ * issue `mixed_organizations`, records or types of more than one organization.
  */
 export function uniquenessIssues(
   all: readonly RecordIdentifiers[],
   identifierTypes: readonly IdentifierType[],
 ): Issue[] {
+  const mixed = mixedIssue(all, identifierTypes);
+  if (mixed !== undefined) return [mixed];
   const byKey = typeMap(identifierTypes);
   const ruleOf = (type: string): UniquenessRule => byKey.get(type)?.type.uniqueness ?? "none";
   const groups = holdersByKey(all, (type) => ruleOf(type) === "all_time");
@@ -780,7 +843,10 @@ export function findIdentifierConflicts(
  * Check an identifier before giving it to a record: its type exists, the value
  * is well-formed and fits the type's format, and no other record holds it
  * under the type's uniqueness rule. Returns every problem; empty means go
- * ahead. Never throws.
+ * ahead. Records or types of more than one organization are refused with the
+ * one issue `mixed_organizations`: a number is unique within its own
+ * organization only, and another organization's numbers are never looked at.
+ * Never throws.
  */
 export function checkNewIdentifier(
   candidate: unknown,
@@ -789,6 +855,8 @@ export function checkNewIdentifier(
   identifierTypes: readonly IdentifierType[],
 ): Issue[] {
   return guardedIssues(() => {
+    const mixed = mixedIssue(all, identifierTypes);
+    if (mixed !== undefined) return [mixed];
     const issues = new IssueList();
     const copy = readTop(candidate, TYPE_LIMITS, issues, "An identifier must be a plain object.");
     if (copy === undefined) return issues.items;
@@ -890,13 +958,16 @@ function formatAutoNumber(auto: AutoNumbering, n: number, year: number): string 
  *
  * Fails, rather than guessing, when the type has no auto-numbering, the year
  * is missing, the numbers have run out, or the next number won't fit the
- * type's format (`DHS-####` after `DHS-9999`).
+ * type's format (`DHS-####` after `DHS-9999`), or the records and the type
+ * belong to more than one organization (`mixed_organizations`).
  */
 export function nextIdentifier(
   type: IdentifierType,
   all: readonly RecordIdentifiers[],
   options: { readonly year?: number } = {},
 ): Validated<string> {
+  const mixed = mixedIssue(all, [type]);
+  if (mixed !== undefined) return { ok: false, issues: [mixed] };
   const auto = type.autoNumber;
   if (auto === undefined) {
     return fail("no_auto_number", `${type.label} numbers are not given out automatically.`);
@@ -1054,6 +1125,7 @@ export function retireIdentifier(
     ok: true,
     value: Object.freeze({
       recordId: identifiers.recordId,
+      organizationId: identifiers.organizationId,
       current: Object.freeze(current),
       former: Object.freeze(former),
     }),
@@ -1105,6 +1177,19 @@ function pairKey(item: { readonly type: string; readonly value: string }): strin
 
 // ---------------------------------------------------------------------------
 // Helpers
+
+/**
+ * The `mixed_organizations` issue when the (validated) record identifiers and
+ * types name more than one organization, else undefined.
+ */
+function mixedIssue(
+  all: readonly RecordIdentifiers[],
+  identifierTypes: readonly IdentifierType[],
+): Issue | undefined {
+  return oneOrganization([...all, ...identifierTypes]) === "mixed"
+    ? mixedOrganizationsIssue([], "These identifiers and identifier types")
+    : undefined;
+}
 
 function fail<T>(code: string, message: string): Validated<T> {
   return { ok: false, issues: [issue([], code, message)] };

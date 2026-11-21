@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { templateChanges, type TemplateChange, type TemplateChanges } from "./index.js";
+import {
+  templateChanges,
+  type TemplateChange,
+  type TemplateChanges,
+  newOrganizationId,
+} from "./index.js";
+
+const ORG = newOrganizationId();
 
 const T = "2026-11-20T16:05:00.000Z";
 const A = "3f1c2a9e-8b7d-4c6e-9a1b-2d3e4f5a6b7c";
@@ -24,7 +31,15 @@ function template(...fields: Record<string, unknown>[]): Record<string, unknown>
 }
 
 function record(id: string, fields: Record<string, unknown>): Record<string, unknown> {
-  return { kind: "object", id, title: "Postcard", createdAt: T, updatedAt: T, fields };
+  return {
+    kind: "object",
+    id,
+    title: "Postcard",
+    organizationId: ORG,
+    createdAt: T,
+    updatedAt: T,
+    fields,
+  };
 }
 
 function run(oldT: unknown, newT: unknown, records?: unknown): TemplateChanges {

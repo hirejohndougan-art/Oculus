@@ -15,7 +15,10 @@ import {
   type CatalogRecord,
   type FieldTemplate,
   type TemplateCheckOptions,
+  newOrganizationId,
 } from "./index.js";
+
+const ORG = newOrganizationId();
 
 const ID = "3f1c2a9e-8b7d-4c6e-9a1b-2d3e4f5a6b7c";
 const T = "2026-11-20T16:05:00.000Z";
@@ -36,6 +39,7 @@ function record(kind: string, fields: Record<string, unknown>): CatalogRecord {
     kind,
     id: ID,
     title: "Dickinson Station and Park",
+    organizationId: ORG,
     createdAt: T,
     updatedAt: T,
     fields,
@@ -302,10 +306,17 @@ describe("records checked against the presets", () => {
       key: "call_number",
       label: "Call number",
       pattern: "MS-####.#",
+      organizationId: ORG,
       uniqueness: "current",
       public: true,
     },
-    { key: "accession_number", label: "Accession number", uniqueness: "all_time", public: true },
+    {
+      key: "accession_number",
+      label: "Accession number",
+      organizationId: ORG,
+      uniqueness: "all_time",
+      public: true,
+    },
   ]);
   if (!made.ok) throw new Error(JSON.stringify(made.issues));
   const withIds: TemplateCheckOptions = { checkers: { identifier: made.value } };

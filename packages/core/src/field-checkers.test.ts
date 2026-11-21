@@ -14,7 +14,10 @@ import {
   type FieldValueChecker,
   type Issue,
   type TemplateCheckOptions,
+  newOrganizationId,
 } from "./index.js";
+
+const ORG = newOrganizationId();
 
 const ID = "3f1c2a9e-8b7d-4c6e-9a1b-2d3e4f5a6b7c";
 const T = "2026-11-20T16:05:00.000Z";
@@ -31,11 +34,12 @@ const TYPES = [
     key: "accession",
     label: "Accession number",
     pattern: "####.###",
+    organizationId: ORG,
     uniqueness: "all_time",
     autoNumber: { style: "year", separator: ".", digits: 3 },
     public: true,
   },
-  { key: "legacy", label: "Legacy number", uniqueness: "none", public: true },
+  { key: "legacy", label: "Legacy number", organizationId: ORG, uniqueness: "none", public: true },
 ];
 
 function field(extra: Record<string, unknown> = {}): Record<string, unknown> {
@@ -67,6 +71,7 @@ function record(fields: Record<string, unknown>): CatalogRecord {
     kind: "object",
     id: ID,
     title: "Dickinson Station and Park",
+    organizationId: ORG,
     createdAt: T,
     updatedAt: T,
     fields,
@@ -138,7 +143,9 @@ describe("checkRightsValue", () => {
 
 describe("makeIdentifierChecker", () => {
   it("refuses identifier types that aren't valid, and makes no checker", () => {
-    const r = makeIdentifierChecker([{ key: "Accession", label: "A", uniqueness: "none" }]);
+    const r = makeIdentifierChecker([
+      { key: "Accession", label: "A", organizationId: ORG, uniqueness: "none" },
+    ]);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(codes(r.issues)).toEqual(["invalid_key"]);
     const notList = makeIdentifierChecker({ accession: {} });
@@ -324,6 +331,7 @@ describe("a record that passes its template can be published (rights)", () => {
   it("checkRecordAgainstTemplate and rightsPublishIssues agree on { uri, note? }", () => {
     const t = template([field({ key: "rights", label: "Rights", kind: "rights", required: true })]);
     const made = createRecord({
+      organizationId: ORG,
       kind: "object",
       title: "Invented lantern",
       fields: { rights: { uri: INC, note: "Rights holder unknown." } },
@@ -346,9 +354,21 @@ describe("a record that passes its template can be published (rights)", () => {
 
 describe("identifier type visibility (D-022)", () => {
   const MIXED = [
-    { key: "object_number", label: "Object number", uniqueness: "current", public: true },
-    { key: "donor_file", label: "Donor file number", uniqueness: "none" },
-    { key: "box_label", label: "Box label", uniqueness: "none", public: false },
+    {
+      key: "object_number",
+      label: "Object number",
+      organizationId: ORG,
+      uniqueness: "current",
+      public: true,
+    },
+    { key: "donor_file", label: "Donor file number", organizationId: ORG, uniqueness: "none" },
+    {
+      key: "box_label",
+      label: "Box label",
+      organizationId: ORG,
+      uniqueness: "none",
+      public: false,
+    },
   ];
   const STAFF_NUMBERS = template([
     field({

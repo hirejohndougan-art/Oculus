@@ -162,3 +162,18 @@ describe("attacks: formats can't make matching slow", () => {
     expect(matchesIdentifierPattern(compile(".+"), ".+")).toBe(true);
   });
 });
+
+describe("D-019's two organizations' numbers", () => {
+  it("covers the archives' DS5C740001 and the library's unpadded DPL1, DPL2, DPL3", () => {
+    const archive = parseIdentifierPattern("DS5C74####");
+    const library = parseIdentifierPattern("DPL#{1,9}");
+    if (!archive.ok || !library.ok) throw new Error("pattern refused");
+    expect(matchesIdentifierPattern(archive.value, "DS5C740001")).toBe(true);
+    expect(matchesIdentifierPattern(archive.value, "DS5C74001")).toBe(false);
+    for (const value of ["DPL1", "DPL2", "DPL3", "DPL123456789"]) {
+      expect(matchesIdentifierPattern(library.value, value)).toBe(true);
+    }
+    expect(matchesIdentifierPattern(library.value, "DPL")).toBe(false);
+    expect(matchesIdentifierPattern(library.value, "DPL1234567890")).toBe(false);
+  });
+});

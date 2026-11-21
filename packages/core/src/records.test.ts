@@ -11,7 +11,10 @@ import {
   validateRecord,
   type Issue,
   type Validated,
+  newOrganizationId,
 } from "./index.js";
+
+const ORG = newOrganizationId();
 
 const ID = "3f1c2a9e-8b7d-4c6e-9a1b-2d3e4f5a6b7c";
 const OTHER = "9b2e4c1a-7d3f-4e8a-b5c6-1a2b3c4d5e6f";
@@ -21,6 +24,7 @@ function base(extra: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     id: ID,
     title: "Dickinson Station and Park",
+    organizationId: ORG,
     createdAt: T,
     updatedAt: T,
     fields: {},
@@ -215,6 +219,7 @@ describe("validateRecord: common properties", () => {
       [
         "invalid_agent_type",
         "invalid_id",
+        "invalid_organization",
         "invalid_timestamp",
         "invalid_timestamp",
         "not_an_object",
@@ -340,6 +345,7 @@ describe("createRecord", () => {
   it("adds a fresh ID, matching timestamps and empty fields", () => {
     const r = createRecord(
       {
+        organizationId: ORG,
         kind: "agent",
         title: "Galveston, Houston and Henderson Railroad",
         agentType: "organization",
@@ -355,14 +361,15 @@ describe("createRecord", () => {
   });
 
   it("makes a different ID each time", () => {
-    const a = createRecord({ kind: "object", title: "Plow" }, now);
-    const b = createRecord({ kind: "object", title: "Plow" }, now);
+    const a = createRecord({ organizationId: ORG, kind: "object", title: "Plow" }, now);
+    const b = createRecord({ organizationId: ORG, kind: "object", title: "Plow" }, now);
     expect(a.ok && b.ok && a.value.id !== b.value.id).toBe(true);
   });
 
   it("keeps the fields it was given", () => {
     const r = createRecord(
       {
+        organizationId: ORG,
         kind: "archival_unit",
         title: "Loading Strawberries",
         level: "item",
@@ -378,6 +385,7 @@ describe("createRecord", () => {
       kind: "object",
       title: "Plow",
       id: ID,
+      organizationId: ORG,
       createdAt: "2000-01-01T00:00:00Z",
     } as never;
     const r = createRecord(sneaky, now);
@@ -388,13 +396,13 @@ describe("createRecord", () => {
   });
 
   it("reports problems instead of making a bad record", () => {
-    const r = createRecord({ kind: "object", title: "  " }, now);
+    const r = createRecord({ organizationId: ORG, kind: "object", title: "  " }, now);
     expect(codes(r)).toEqual(["required"]);
   });
 
   it("uses the current time by default", () => {
     const before = Date.now();
-    const r = createRecord({ kind: "event", title: "The Galveston Storm" });
+    const r = createRecord({ organizationId: ORG, kind: "event", title: "The Galveston Storm" });
     expect(r.ok).toBe(true);
     if (r.ok) expect(Date.parse(r.value.createdAt)).toBeGreaterThanOrEqual(before - 1);
     expect(newRecordId()).not.toBe(r.ok ? r.value.id : "");

@@ -7,6 +7,7 @@ import {
   effectiveRecord,
   indexRecords,
   indexTemplates,
+  newOrganizationId,
   newRecordId,
   publicOutput,
   publicView,
@@ -1039,5 +1040,43 @@ describe("records are published only under the template they name", () => {
       templateFor: Object.freeze({ size: 1 }),
     });
     expect(codes(result)).toEqual(["invalid_options"]);
+  });
+});
+
+describe("public output won't use another organization's records (D-019)", () => {
+  const CREATOR_MAP = {
+    template: "out",
+    entries: [RIGHTS_ENTRY, { field: "creator", term: "creator" }],
+  };
+
+  it("refuses a current set that mixes in another organization's records", () => {
+    const fonds = record(
+      "archival_unit",
+      "Fonds",
+      { rights: { uri: CNE }, creator: "Own creator" },
+      { level: "fonds" },
+    );
+    const item = record("archival_unit", "Item", {}, { level: "item", parentId: fonds.id });
+    const built = effectiveRecord(item.id, [item, fonds], () => TPL);
+    if (!built.ok) throw new Error(JSON.stringify(built.issues));
+    const view = publicView(built.value);
+    if (view === undefined) throw new Error("no view");
+    const stray = record(
+      "archival_unit",
+      "Other organization's fonds",
+      { rights: { uri: CNE }, creator: "SECRET other creator" },
+      { level: "fonds", organizationId: newOrganizationId() },
+    );
+    const options = {
+      baseUrl: BASE,
+      published: [item.id],
+      checkers: CHECKERS,
+      templateFor: () => TPL,
+    };
+    expect(publicOutput(view, CREATOR_MAP, { ...options, records: [item, fonds] }).ok).toBe(true);
+    const result = publicOutput(view, CREATOR_MAP, { ...options, records: [item, fonds, stray] });
+    expect(codes(result)).toEqual(["mixed_organizations"]);
+    expect(result.ok ? [] : result.issues[0]?.path).toEqual(["records"]);
+    expect(JSON.stringify(result)).not.toContain("SECRET");
   });
 });

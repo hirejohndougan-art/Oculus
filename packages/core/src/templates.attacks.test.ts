@@ -12,7 +12,10 @@ import {
   type CatalogRecord,
   type FieldTemplate,
   type Validated,
+  newOrganizationId,
 } from "./index.js";
+
+const ORG = newOrganizationId();
 
 const ID = "3f1c2a9e-8b7d-4c6e-9a1b-2d3e4f5a6b7c";
 const T = "2026-11-20T16:05:00.000Z";
@@ -168,6 +171,7 @@ describe("hostile record values", () => {
       kind: "object",
       id: ID,
       title: "X",
+      organizationId: ORG,
       createdAt: T,
       updatedAt: T,
       fields,
@@ -245,6 +249,7 @@ describe("review fixes", () => {
       kind: "object",
       id: ID,
       title: "X",
+      organizationId: ORG,
       createdAt: T,
       updatedAt: T,
       fields,

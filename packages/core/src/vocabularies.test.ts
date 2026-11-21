@@ -15,7 +15,10 @@ import {
   type FieldTemplate,
   type Issue,
   type Validated,
+  newOrganizationId,
 } from "./index.js";
+
+const ORG = newOrganizationId();
 
 // Real id.loc.gov URIs and labels, checked against id.loc.gov on 2026-11-20.
 const RAILROAD_STATIONS = "http://id.loc.gov/authorities/subjects/sh85111042";
@@ -419,6 +422,7 @@ describe("controlledTermChecker with checkRecordAgainstTemplate", () => {
       kind: "object",
       id: ID,
       title: "Passengers at the depot",
+      organizationId: ORG,
       createdAt: T,
       updatedAt: T,
       fields,

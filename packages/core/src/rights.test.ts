@@ -15,8 +15,11 @@ import {
   type NormalizedRights,
 } from "./rights.js";
 import { createRecord } from "./records.js";
+import { newOrganizationId } from "./organizations.js";
 import { MAX_HELP_LENGTH } from "./templates.js";
 import type { Validated } from "./issues.js";
+
+const ORG = newOrganizationId();
 
 function normal(text: string): NormalizedRights {
   const r = normalizeRightsUri(text);
@@ -345,6 +348,7 @@ describe("the publishing rule", () => {
 
   it("works on a real validated record", () => {
     const made = createRecord({
+      organizationId: ORG,
       kind: "object",
       title: "Invented plow",
       fields: { rights: { uri: "http://rightsstatements.org/vocab/NoC-US/1.0/" } },
@@ -448,11 +452,16 @@ describe("the publishing rule", () => {
       { kind: "place", title: "Invented Bayou" },
       { kind: "event", title: "Invented Festival" },
     ] as const) {
-      const made = createRecord(input);
+      const made = createRecord({ organizationId: ORG, ...input });
       expect(made.ok).toBe(true);
       if (made.ok) expect(canPublishRights(made.value)).toBe(true);
     }
-    const unit = createRecord({ kind: "archival_unit", title: "Invented Series", level: "series" });
+    const unit = createRecord({
+      organizationId: ORG,
+      kind: "archival_unit",
+      title: "Invented Series",
+      level: "series",
+    });
     expect(unit.ok && canPublishRights(unit.value)).toBe(false);
   });
 

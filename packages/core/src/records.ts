@@ -19,6 +19,7 @@ import { issue, isPlainObject, type Validated } from "./issues.js";
 import { FORBIDDEN_KEYS, IssueList, readPlainData, shown, type JsonValue } from "./plain-data.js";
 import { types } from "node:util";
 import { isRecordId, newRecordId, type RecordId } from "./record-id.js";
+import { isOrganizationId, type OrganizationId } from "./organizations.js";
 
 export const RECORD_KINDS = [
   "object",
@@ -42,6 +43,11 @@ export type FieldValue = JsonValue;
 
 interface RecordBase {
   readonly id: RecordId;
+  /**
+   * The organization the record belongs to (D-019, D-0XX). It never changes,
+   * and the units a record is filed under or represents belong to the same one.
+   */
+  readonly organizationId: OrganizationId;
   readonly title: string;
   /** ISO 8601 UTC timestamp, e.g. `2026-11-20T16:05:00.000Z`. */
   readonly createdAt: string;
@@ -132,6 +138,7 @@ const MEDIA_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]
 
 const COMMON_KEYS = [
   "id",
+  "organizationId",
   "kind",
   "title",
   "templateKey",
@@ -196,6 +203,13 @@ function check(input: unknown): Validated<CatalogRecord> {
 
   if (!isRecordId(record.id)) {
     issues.add(["id"], "invalid_id", "The ID must be a lowercase version 4 UUID.");
+  }
+  if (!isOrganizationId(record.organizationId)) {
+    issues.add(
+      ["organizationId"],
+      "invalid_organization",
+      "Every record belongs to one organization: organizationId must be an organization ID.",
+    );
   }
   checkTitle(record.title, issues);
   if (record.templateKey !== undefined && !isTemplateKey(record.templateKey)) {
@@ -278,7 +292,7 @@ export function isTemplateKey(key: unknown): key is string {
  * optional in the type only so older callers keep working; give it for
  * every new record (D-029).
  */
-export type NewRecordInput =
+export type NewRecordInput = { readonly organizationId: OrganizationId } & (
   | { readonly kind: "object"; readonly title: string }
   | { readonly kind: "event"; readonly title: string }
   | {
@@ -298,7 +312,8 @@ export type NewRecordInput =
       readonly kind: "place";
       readonly title: string;
       readonly coordinates?: { readonly lat: number; readonly lng: number };
-    };
+    }
+);
 
 /**
  * Make a new record with a fresh ID and timestamps, then validate it.

@@ -594,6 +594,10 @@ function sameAncestry(
   const found = currentAncestry(first.record.id, records);
   if (!found.ok) {
     const problem = found.issues[0];
+    if (problem?.code === "mixed_organizations") {
+      // Each organization is kept separate (D-019, D-0XX): never filtered.
+      fail(["records"], problem.code, problem.message);
+    }
     if (problem === undefined || SET_PROBLEMS.has(problem.code)) {
       fail(
         ["records"],

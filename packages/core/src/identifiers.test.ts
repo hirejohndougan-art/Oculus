@@ -19,12 +19,16 @@ import {
   type RecordIdentifiers,
   type RecordId,
   type Validated,
+  newOrganizationId,
 } from "./index.js";
+
+const ORG = newOrganizationId();
 
 const ACCESSION: IdentifierType = {
   key: "accession_number",
   label: "Accession number",
   pattern: "####.#{3,4}",
+  organizationId: ORG,
   uniqueness: "all_time",
   autoNumber: { style: "year", separator: ".", digits: 3 },
 };
@@ -32,10 +36,16 @@ const OBJECT_NO: IdentifierType = {
   key: "object_number",
   label: "Object number",
   pattern: "DHS-####",
+  organizationId: ORG,
   uniqueness: "current",
   autoNumber: { style: "prefix", prefix: "DHS-", digits: 4 },
 };
-const BOX: IdentifierType = { key: "box_label", label: "Box label", uniqueness: "none" };
+const BOX: IdentifierType = {
+  key: "box_label",
+  label: "Box label",
+  organizationId: ORG,
+  uniqueness: "none",
+};
 const TYPES = [ACCESSION, OBJECT_NO, BOX];
 
 const T = "2026-11-20T16:05:00.000Z";
@@ -51,6 +61,7 @@ function set(
 ): RecordIdentifiers {
   return {
     recordId,
+    organizationId: ORG,
     current: current.map(([type, value, primary], i) => ({
       type,
       value,
@@ -78,7 +89,7 @@ describe("validateIdentifierType", () => {
     [{ ...BOX, label: "" }, "required"],
     [{ ...BOX, label: " Box" }, "untrimmed"],
     [{ ...BOX, label: "Box\nlabel" }, "control_characters"],
-    [{ ...BOX, uniqueness: "sometimes" }, "invalid_uniqueness"],
+    [{ ...BOX, organizationId: ORG, uniqueness: "sometimes" }, "invalid_uniqueness"],
     [{ ...BOX, pattern: "#{" }, "invalid_repeat"],
     [{ ...BOX, colour: "red" }, "unknown_property"],
     [{ ...BOX, public: "yes" }, "invalid_public"],
@@ -140,7 +151,11 @@ describe("validateIdentifierTypes", () => {
   });
 
   it("reports problems inside each type with its position", () => {
-    const r = validateIdentifierTypes([BOX, { ...BOX, key: "x", uniqueness: "maybe" }, 5]);
+    const r = validateIdentifierTypes([
+      BOX,
+      { ...BOX, key: "x", organizationId: ORG, uniqueness: "maybe" },
+      5,
+    ]);
     expect(r.ok ? [] : r.issues.map((i) => [i.path, i.code])).toEqual([
       [[1, "uniqueness"], "invalid_uniqueness"],
       [[2], "not_an_object"],
@@ -164,6 +179,7 @@ describe("validateRecordIdentifiers", () => {
   it("accepts any number of identifiers with one primary, and former ones", () => {
     const input = {
       recordId: id,
+      organizationId: ORG,
       current: [
         { type: "accession_number", value: "2026.015", primary: false },
         { type: "object_number", value: "DHS-0001", primary: true },
@@ -183,7 +199,10 @@ describe("validateRecordIdentifiers", () => {
   });
 
   it("accepts a record with no identifiers yet", () => {
-    const r = validateRecordIdentifiers({ recordId: id, current: [], former: [] }, TYPES);
+    const r = validateRecordIdentifiers(
+      { recordId: id, organizationId: ORG, current: [], former: [] },
+      TYPES,
+    );
     expect(r.ok).toBe(true);
     if (r.ok) expect(primaryIdentifier(r.value)).toBeUndefined();
   });
@@ -271,7 +290,12 @@ describe("validateRecordIdentifiers", () => {
     [7, "required"],
   ])("refuses the value %j (%s)", (value, expected) => {
     const r = validateRecordIdentifiers(
-      { recordId: id, current: [{ type: "box_label", value, primary: true }], former: [] },
+      {
+        recordId: id,
+        organizationId: ORG,
+        current: [{ type: "box_label", value, primary: true }],
+        former: [],
+      },
       TYPES,
     );
     expect(codes(r)).toContain(expected);
@@ -279,20 +303,31 @@ describe("validateRecordIdentifiers", () => {
 
   it("checks the shape", () => {
     expect(
-      codes(validateRecordIdentifiers({ recordId: "x", current: [], former: [] }, TYPES)),
+      codes(
+        validateRecordIdentifiers(
+          { recordId: "x", organizationId: ORG, current: [], former: [] },
+          TYPES,
+        ),
+      ),
     ).toEqual(["invalid_id"]);
-    expect(codes(validateRecordIdentifiers({ recordId: id }, TYPES))).toEqual([
+    expect(codes(validateRecordIdentifiers({ recordId: id, organizationId: ORG }, TYPES))).toEqual([
       "not_a_list",
       "not_a_list",
     ]);
     expect(
-      codes(validateRecordIdentifiers({ recordId: id, current: [], former: [], extra: 1 }, TYPES)),
+      codes(
+        validateRecordIdentifiers(
+          { recordId: id, organizationId: ORG, current: [], former: [], extra: 1 },
+          TYPES,
+        ),
+      ),
     ).toEqual(["unknown_property"]);
     expect(
       codes(
         validateRecordIdentifiers(
           {
             recordId: id,
+            organizationId: ORG,
             current: [{ type: "box_label", value: "A", primary: "yes", rank: 1 }, 3],
             former: [
               { type: "Bad Type", value: "A" },
@@ -322,9 +357,14 @@ describe("validateRecordIdentifiers", () => {
       value: `B${String(i)}`,
       primary: i === 0,
     }));
-    expect(codes(validateRecordIdentifiers({ recordId: id, current, former: [] }, TYPES))).toEqual([
-      "too_many",
-    ]);
+    expect(
+      codes(
+        validateRecordIdentifiers(
+          { recordId: id, organizationId: ORG, current, former: [] },
+          TYPES,
+        ),
+      ),
+    ).toEqual(["too_many"]);
   });
 });
 
@@ -683,6 +723,7 @@ describe("retireIdentifier", () => {
   it("merges into an exact former entry: newest date, both notes", () => {
     const again: RecordIdentifiers = {
       recordId: id,
+      organizationId: ORG,
       current: [{ type: "object_number", value: "DHS-0001", primary: true }],
       former: [{ type: "object_number", value: "DHS-0001", retiredAt: T, note: "First time" }],
     };
@@ -771,11 +812,13 @@ describe("droppedIdentifiers", () => {
     const later = "2027-01-05T10:00:00.000Z";
     const before: RecordIdentifiers = {
       recordId: id,
+      organizationId: ORG,
       current: [],
       former: [{ type: "omeka_id", value: "77", retiredAt: T, note: "Old site" }],
     };
     const after = (f: { retiredAt?: string; note?: string }): RecordIdentifiers => ({
       recordId: id,
+      organizationId: ORG,
       current: [],
       former: [{ type: "omeka_id", value: "77", ...f }],
     });

@@ -18,7 +18,10 @@ import {
   type Issue,
   type TemplateCheckOptions,
   type Validated,
+  newOrganizationId,
 } from "./index.js";
+
+const ORG = newOrganizationId();
 
 const ID = "3f1c2a9e-8b7d-4c6e-9a1b-2d3e4f5a6b7c";
 const PLACE_ID = "9b2e4c1a-7d3f-4e8a-b5c6-1a2b3c4d5e6f";
@@ -111,6 +114,7 @@ function record(fields: Record<string, unknown>, kind = "object"): CatalogRecord
     kind,
     id: ID,
     title: "Dickinson Station and Park",
+    organizationId: ORG,
     createdAt: T,
     updatedAt: T,
     fields,
@@ -144,8 +148,8 @@ function goodFields(): Record<string, unknown> {
 
 /** The sample organization's identifier types. Invented. */
 const IDENTIFIER_TYPES = [
-  { key: "accession", label: "Accession number", uniqueness: "all_time" },
-  { key: "legacy", label: "Legacy number", uniqueness: "none" },
+  { key: "accession", label: "Accession number", organizationId: ORG, uniqueness: "all_time" },
+  { key: "legacy", label: "Legacy number", organizationId: ORG, uniqueness: "none" },
 ];
 
 function identifierChecker(): FieldValueChecker {
