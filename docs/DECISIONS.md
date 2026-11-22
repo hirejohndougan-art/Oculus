@@ -12,7 +12,7 @@ The code is MIT-licensed, so any archive, museum or historical society can use i
 Three scheduled sessions each night (build, upkeep, security) do one task each, check it against the gate, and merge to `main` themselves. This is the same model as John's Blueprint, Argus and FerroJS projects. John can switch to pull requests he approves by changing step j of AUTOPILOT.md and recording it here.
 
 ## D-004 — No AI inside the product (carried over from the Polybius project)
-Oculus contains no hosted AI, no AI SDKs and no pretrained models. Suggestion features use classical retrieval: BM25 plus a curated synonym list.
+Oculus contains no hosted AI, no AI SDKs and no pretrained models. Suggestion features use classical retrieval: BM25 plus a curated synonym list. One exception: OCR may use an engine's trained text-recognition models (D-033).
 
 ## D-005 — Platform name and parts (2026-11-20, John)
 The platform is **Oculus**. Its staff back end is called **Polybius** and its public sites are called **Hermes**. These are names for parts of one product, not separate products. **Superseded by D-018.**
@@ -226,3 +226,11 @@ How D-019's complete separation is modelled in `packages/core`, before there is 
 
 ## D-032 — The Society's other websites stay where they are (2026-11-22, John)
 John's answer to Q-3: no. The Dickinson Historical Society's other websites (such as Visit Dickinson and the Galveston County Museums site) are not moving to Oculus. Oculus's public sites are for the archives, collections and libraries its organizations hold, and the site editor (Phases 4 and 5) is built for those, not to replace the other sites' tourism listings, directories or general web pages. Nothing here stops a link from those sites to an Oculus site.
+
+## D-033 — OCR may use trained recognition models (2026-11-22, John)
+John's answer to Q-5: allow it for OCR. Reading the text on scanned pages may use an OCR engine that ships trained models (for example Tesseract's LSTM models), as the one exception to D-004. The exception is narrow:
+- **OCR only.** It covers turning page images into text and the layout analysis that comes with it. It does not open the door to AI anywhere else: no hosted AI, no AI SDKs, no language models, no generated descriptions, summaries, subjects or translations, and no other trained models.
+- **Runs locally.** The engine and its models run on Oculus's own server. Scans are never sent to an outside service to be read.
+- **Permissive licenses, engine and models alike** (D-002). The model files are dependencies too and go through the license check; the choice of engine gets its own decision entry when OCR is planned.
+- **OCR text is marked as machine-read**, kept apart from text a person wrote or checked, and staff can correct it. It is staff-only until someone chooses to publish it.
+

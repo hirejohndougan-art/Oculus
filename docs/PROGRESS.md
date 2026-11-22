@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-22 05:50 CT — manual (John) — Q-5 OCR and D-004
+- Result: done (decision recorded; no code)
+- What changed: John answered Q-5: allow trained models for OCR. Recorded as D-033, a narrow exception to D-004 (OCR only, run locally, permissive licenses for engine and model files, machine-read text marked and staff-only until published). D-004, ROADMAP.md (Q-5 closed, Phase 3 note) and AUTOPILOT.md's rule updated.
+- Decisions: D-033 (John)
+- Review: n/a
+- Gate: PASS · tests_passing 2114 (unchanged)
+- Next: T-019b Organizations on vocabularies, terms, rights settings and Dublin Core mappings (risky)
+
 ## 2026-11-22 05:40 CT — manual (John) — Q-3 The Society's other websites
 - Result: done (decision recorded; no code)
 - What changed: John answered Q-3: no, the Society's other websites stay where they are. Recorded as D-032; Q-3 closed in ROADMAP.md and removed from PLATFORM_PLAN.md's open questions; AUTOPILOT.md's list of John's decisions updated.

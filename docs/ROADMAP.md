@@ -10,7 +10,7 @@ These are never picked by a run. The weekly report repeats each question until J
 - [ ] Q-2 Hosting for the Historical Society, and the budget for hosting and storage. (needs John) Needed before Phase 2 deploys anywhere.
 - [x] Q-3 Should the Society's other websites move to Oculus eventually? John: no (D-032).
 - [ ] Q-4 Roles: the mockup shows "Scanner" and "Donor relations" roles that the plan doesn't have. Should Phase 2 add them? (needs John) Needed before T-041.
-- [ ] Q-5 OCR: common OCR engines ship trained models. Does D-004 (no AI in the product) rule them out, or is classical OCR allowed? (needs John) Needed before OCR work.
+- [x] Q-5 OCR: common OCR engines ship trained models. Does D-004 (no AI in the product) rule them out, or is classical OCR allowed? John: allow it for OCR, locally run and permissively licensed (D-033).
 
 ## Phase 1 — Record model and ID numbers
 
@@ -126,7 +126,7 @@ The data model in TypeScript, written for any archive or museum rather than one 
 
 - Phase 6 (Omeka migration): records with rights stored as a plain URI string need converting to `{ uri }`; add CC 1.0–3.0 licenses if the Omeka data uses them (D-011).
 - Not yet in any phase (T-011 review): reading-room researchers and checkouts (mockup Researchers, Checkouts). Researchers are private data about real people. Place it at a monthly review.
-- Phase 3: OCR (mockup OCR) may conflict with D-004 if the engine ships trained models. Ask John before planning it.
+- Phase 3: OCR (mockup OCR) may use an engine with trained models, run locally and permissively licensed (D-033). Choosing the engine is a decision task when Phase 3 is planned.
 - Later: looking up LCSH, LCNAF and LCGFT terms while cataloging needs either downloaded vocabulary data or live requests to id.loc.gov (outbound requests, a security review). Printable reports (mockup Reports), Data Cleaning and Subjects screens, and box labels with QR codes still need a phase.
 
 ## Phase 2 — Server, database, logins, roles and change log
