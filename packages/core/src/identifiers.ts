@@ -568,9 +568,22 @@ export function readStoredIdentifiers(input: unknown): Validated<RecordIdentifie
     );
     if (copy === undefined) return { ok: false, issues: issues.items };
     const view = ownOnly(copy);
-    unknownKeys(view, ["recordId", "current", "former"], [], "a record's identifiers", issues);
+    unknownKeys(
+      view,
+      ["recordId", "organizationId", "current", "former"],
+      [],
+      "a record's identifiers",
+      issues,
+    );
     if (!isRecordId(view.recordId)) {
       issues.add(["recordId"], "invalid_id", "recordId must be a record ID.");
+    }
+    if (!isOrganizationId(view.organizationId)) {
+      issues.add(
+        ["organizationId"],
+        "invalid_organization",
+        "A record's identifiers belong to its organization: organizationId must be an organization ID.",
+      );
     }
     checkCurrent(view.current, undefined, issues);
     checkFormer(view.former, issues);

@@ -5,6 +5,7 @@
 import { describe, expect, it } from "vitest";
 import {
   identifierTypeChanges,
+  newOrganizationId,
   identifierTypeCreation,
   identifierTypeDeletion,
   newRecordId,
@@ -16,13 +17,20 @@ import {
 import { MAX_RECORD_SET } from "./effective.js";
 
 // Invented sample data.
+const ORG = newOrganizationId();
 const T = "2026-11-20T16:05:00.000Z";
 const A = "3f1c2a9e-8b7d-4c6e-9a1b-2d3e4f5a6b7c";
 const B = "4a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
 const SECRET = "Donor file 555-0100 Jane Example";
 
-const DONOR: IdentifierType = { key: "donor_file", label: "Donor file", uniqueness: "none" };
+const DONOR: IdentifierType = {
+  organizationId: ORG,
+  key: "donor_file",
+  label: "Donor file",
+  uniqueness: "none",
+};
 const OBJECT: IdentifierType = {
+  organizationId: ORG,
   key: "object_number",
   label: "Object number",
   uniqueness: "current",
@@ -34,11 +42,19 @@ function set(
   current: unknown[],
   former: unknown[] = [],
 ): Record<string, unknown> {
-  return { recordId, current, former };
+  return { recordId, organizationId: ORG, current, former };
 }
 
 function record(id: string, fields: Record<string, unknown>): Record<string, unknown> {
-  return { kind: "object", id, title: "Postcard", createdAt: T, updatedAt: T, fields };
+  return {
+    kind: "object",
+    organizationId: ORG,
+    id,
+    title: "Postcard",
+    createdAt: T,
+    updatedAt: T,
+    fields,
+  };
 }
 
 const SETS = [
@@ -91,6 +107,7 @@ describe("staff numbers published by a type change", () => {
       identifierTypeChanges(
         DONOR,
         {
+          organizationId: ORG,
           key: "donor_ref",
           label: "Donor file",
           pattern: "D-###",
@@ -118,6 +135,7 @@ describe("staff numbers published by a type change", () => {
 describe("stranded staff values adopted by a public type", () => {
   // donor_file was deleted; its staff value stays in record A.
   const PUBLIC_ACC: IdentifierType = {
+    organizationId: ORG,
     key: "accession",
     label: "Accession number",
     uniqueness: "current",
@@ -186,6 +204,34 @@ describe("records that can't be read refuse the whole check", () => {
     expect(r.changes.map((c) => [c.code, c.recordIds])).toEqual([["key_changed", [B]]]);
     const del = ok(identifierTypeDeletion(strict, existing));
     expect(del.changes.map((c) => [c.code, c.recordIds])).toEqual([["type_deleted", [B]]]);
+  });
+
+  it("refuses data of another organization, or data that doesn't say whose it is (D-030)", () => {
+    const OTHER = newOrganizationId();
+    const theirs = { ...set(newRecordId(), []), organizationId: OTHER };
+    const unowned = Object.fromEntries(
+      Object.entries(set(newRecordId(), [])).filter(([k]) => k !== "organizationId"),
+    );
+    for (const [identifiers, code] of [
+      [[...SETS, theirs], "mixed_organizations"],
+      [[...SETS, unowned], "invalid_entry"],
+    ] as const) {
+      expect(codes(identifierTypeDeletion(DONOR, use(identifiers)))).toEqual([code]);
+      expect(
+        codes(identifierTypeCreation({ ...DONOR, key: "new_type" }, use(identifiers))),
+      ).toEqual([code]);
+    }
+    const otherRecord = { ...record(A, {}), organizationId: OTHER };
+    expect(codes(identifierTypeDeletion(DONOR, use(SETS, [otherRecord])))).toEqual([
+      "mixed_organizations",
+    ]);
+    // The type itself must be the organization's, and stay in it.
+    expect(codes(identifierTypeChanges(DONOR, { ...DONOR, organizationId: OTHER }, use()))).toEqual(
+      ["mixed_organizations"],
+    );
+    const foreign = { ...DONOR, key: "new_type", organizationId: OTHER };
+    expect(codes(identifierTypeCreation(foreign, use()))).toEqual(["mixed_organizations"]);
+    expect(identifierTypeDeletion({ ...DONOR, organizationId: undefined }).ok).toBe(false);
   });
 
   it("refuses an ID used twice, so one record can't shadow another", () => {
@@ -298,7 +344,12 @@ describe("hostile input", () => {
   });
 
   it("a stored type keyed 'constructor' must be renamed when edited, and can be deleted", () => {
-    const legacy: IdentifierType = { key: "constructor", label: "Old", uniqueness: "none" };
+    const legacy: IdentifierType = {
+      organizationId: ORG,
+      key: "constructor",
+      label: "Old",
+      uniqueness: "none",
+    };
     const existing = {
       identifierTypes: [legacy],
       identifiers: [set(A, [{ type: "constructor", value: "7", primary: true }])],
@@ -334,7 +385,12 @@ describe("hostile input", () => {
     const start = Date.now();
     const r = identifierTypeChanges(
       wide,
-      { ...wide, pattern: "@*{0,99}*{0,98}", uniqueness: "all_time", public: true },
+      {
+        ...wide,
+        pattern: "@*{0,99}*{0,98}",
+        uniqueness: "all_time",
+        public: true,
+      },
       { identifierTypes: [wide], identifiers: sets, records: [] },
     );
     expect(Date.now() - start).toBeLessThan(10_000);

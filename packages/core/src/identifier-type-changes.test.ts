@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   MAX_LISTED_RECORDS,
+  newOrganizationId,
   identifierTypeChanges,
   identifierTypeCreation,
   identifierTypeDeletion,
@@ -11,19 +12,21 @@ import {
 } from "./index.js";
 
 // Invented sample data.
+const ORG = newOrganizationId();
 const T = "2026-11-20T16:05:00.000Z";
 const A = "3f1c2a9e-8b7d-4c6e-9a1b-2d3e4f5a6b7c";
 const B = "4a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
 const C = "5b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e";
 
 const ACCESSION: IdentifierType = {
+  organizationId: ORG,
   key: "accession",
   label: "Accession number",
   pattern: "DHS-####",
   uniqueness: "current",
   autoNumber: { style: "prefix", prefix: "DHS-", digits: 4 },
 };
-const BOX: IdentifierType = { key: "box", label: "Box", uniqueness: "none" };
+const BOX: IdentifierType = { organizationId: ORG, key: "box", label: "Box", uniqueness: "none" };
 
 /** `type` with `keys` left out (undefined isn't allowed in place of a missing property). */
 function without(type: IdentifierType, ...keys: (keyof IdentifierType)[]): IdentifierType {
@@ -40,13 +43,22 @@ function set(
 ): Record<string, unknown> {
   return {
     recordId,
+    organizationId: ORG,
     current: current.map((c, i) => ({ ...c, primary: i === 0 })),
     former,
   };
 }
 
 function record(id: string, fields: Record<string, unknown>): Record<string, unknown> {
-  return { kind: "object", id, title: "Postcard", createdAt: T, updatedAt: T, fields };
+  return {
+    kind: "object",
+    organizationId: ORG,
+    id,
+    title: "Postcard",
+    createdAt: T,
+    updatedAt: T,
+    fields,
+  };
 }
 
 function use(
@@ -232,6 +244,7 @@ describe("identifierTypeChanges", () => {
 
   it("checks year numbering per year, and a former number counts", () => {
     const year: IdentifierType = {
+      organizationId: ORG,
       key: "accession",
       label: "Accession number",
       uniqueness: "all_time",
@@ -285,7 +298,12 @@ describe("identifierTypeChanges", () => {
   });
 
   it("compares by the whole prefix, digits included, and by year then sequence", () => {
-    const manual: IdentifierType = { key: "accession", label: "Accession", uniqueness: "current" };
+    const manual: IdentifierType = {
+      organizationId: ORG,
+      key: "accession",
+      label: "Accession",
+      uniqueness: "current",
+    };
     const prefixed = {
       ...manual,
       autoNumber: { style: "prefix", prefix: "M1-", digits: 4 },
@@ -362,7 +380,12 @@ describe("identifierTypeChanges", () => {
   });
 
   it("doesn't count numbers that only look like the new form", () => {
-    const manual: IdentifierType = { key: "accession", label: "Accession", uniqueness: "none" };
+    const manual: IdentifierType = {
+      organizationId: ORG,
+      key: "accession",
+      label: "Accession",
+      uniqueness: "none",
+    };
     const yearly = { ...manual, autoNumber: { style: "year", separator: ".", digits: 3 } } as const;
     const y = ok(
       identifierTypeChanges(
@@ -420,6 +443,7 @@ describe("identifierTypeChanges", () => {
 
   it("creating a type with numbering checks adopted values for reissue", () => {
     const created: IdentifierType = {
+      organizationId: ORG,
       key: "acc",
       label: "Acc",
       uniqueness: "none",
@@ -476,6 +500,7 @@ describe("identifierTypeChanges", () => {
   it("without records, every change that could affect records needs confirmation", () => {
     const r = ok(
       identifierTypeChanges(BOX, {
+        organizationId: ORG,
         key: "carton",
         label: "Carton",
         pattern: "C-###",

@@ -97,6 +97,7 @@ import {
 import { MAX_LISTED_RECORDS } from "./template-changes.js";
 import { validateLegacyTemplate, type FieldTemplate } from "./templates.js";
 import { MAX_RECORD_SET } from "./effective.js";
+import { mixedOrganizationsIssue, oneOrganization } from "./organizations.js";
 import { types } from "node:util";
 
 export const IDENTIFIER_TYPE_CHANGE_CODES = [
@@ -315,6 +316,12 @@ function compare(
   }
   const was = before.value;
   const now = after.value;
+  if (now.organizationId !== was.organizationId) {
+    return {
+      ok: false,
+      issues: [mixedOrganizationsIssue(["newType", "organizationId"], "These identifier types")],
+    };
+  }
   let use: Use | undefined;
   if (existing !== undefined) {
     const u = readUse(existing, was);
@@ -461,6 +468,7 @@ function normal(t: IdentifierType): IdentifierType {
   const pattern = Object.hasOwn(t, "pattern") ? t.pattern : undefined;
   const autoNumber = Object.hasOwn(t, "autoNumber") ? t.autoNumber : undefined;
   return Object.freeze({
+    organizationId: t.organizationId,
     key: t.key,
     label: t.label,
     uniqueness: t.uniqueness,
@@ -550,6 +558,21 @@ function readUse(input: unknown, type: IdentifierType, listed = true): Validated
       }
     }
   }
+  // Every list belongs to the type's organization (D-030): a set, record or
+  // type of another one, or one that doesn't say, refuses the check.
+  for (const [name, list] of [
+    ["identifierTypes", typesRead.value],
+    ["identifiers", identifiers.value],
+    ["records", records.value],
+  ] as const) {
+    const owner = oneOrganization([type, ...list]);
+    if (owner === "mixed") {
+      return {
+        ok: false,
+        issues: [mixedOrganizationsIssue(["existing", name], `The type and existing.${name}`)],
+      };
+    }
+  }
   return {
     ok: true,
     value: {
@@ -614,6 +637,7 @@ function readList<T>(
 
 function sameType(a: IdentifierType, b: IdentifierType): boolean {
   return (
+    a.organizationId === b.organizationId &&
     a.key === b.key &&
     a.label === b.label &&
     a.pattern === b.pattern &&
