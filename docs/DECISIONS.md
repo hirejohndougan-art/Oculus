@@ -162,7 +162,7 @@ Two levels of management, refining D-019's system admins and site roles:
 - **System managers** can do everything, across the whole install. They sign in, create and set up the sites, install plugins and themes, manage every user and which sites each person can use, and run System settings.
 - **Site managers** manage only the sites assigned to them, one or more. On those sites they have full control (content, catalog, Design, Site settings and the site's people and roles), and they choose among the plugins and themes a system manager has installed. They can't install anything, create sites, or see or change sites they aren't assigned to.
 - **Site managers can change anything on their sites (John, same day):** every part of the site's design, including the installed theme they picked (colours, fonts, layouts, headers, footers, templates). Theme updates must not overwrite a site's own changes, so a site's changes are stored separately from the theme.
-- Site roles below a site manager (the plan's cataloger, reviewer and read-only, and Q-4's open question about Scanner and Donor relations) are granted per site, as T-041 defines them.
+- Site roles below a site manager (cataloger, reviewer, read-only, Scanner, Donor relations, and custom roles made by system managers, D-036) are granted per site, as T-041 defines them.
 - **Plugins** are new to the plan. What a plugin may do and how it is checked before install (it runs code on the server) is undecided and gets its own decision task before any plugin system is built (P-001).
 
 ## D-026 — Show or hide each field on a site's record pages (2026-11-21, John)
@@ -245,4 +245,14 @@ John's answer to Q-2: the Historical Society uses SiteGround, but other organiza
 - **Email through one interface:** SMTP by default, so any host's mail or a mail service works (T-040).
 - **SiteGround first.** Its knowledge base lists PostgreSQL alongside MySQL ("The supported databases are MySQL and PostgreSQL", updated 2025-08-13), and its technology page says Node.js apps run "on the same hosting plans". Whether a long-running Node process is allowed on the Society's plan is not confirmed and is checked with John before T-051. No budget was given; the plan assumes the Society's existing SiteGround plan.
 - Sources: https://www.siteground.com/kb/what_databases_can_i_use_with_my_account, https://www.siteground.com/technology (read 2026-11-22).
+
+## D-036 — Scanner and Donor relations roles, and custom roles made by system managers (2026-11-22, John)
+John's answer to Q-4: add both roles, and let system managers create custom roles too.
+- **Roles are made of permissions.** The code defines a fixed list of permissions (for example: view staff records, edit descriptions, upload and attach scans, publish and unpublish, see and edit donor and accession records, manage a site's people). A role is a named set of them. The service layer checks permissions, never role names, so built-in and custom roles are checked the same way.
+- **Built-in roles** below the site manager: cataloger, reviewer, read-only, and the two new ones:
+  - **Scanner:** uploads scans and other files and attaches them to existing records; can see the records it attaches to; can't edit descriptions, publish, or see donor or accession records.
+  - **Donor relations:** sees and edits donors, accessions and deeds of gift (always staff-only data, T-016); can see the records an accession produced; can't edit descriptions or publish.
+- **Custom roles.** System managers can create, rename, edit and delete roles built from the same permission list, for any organization. Each custom role belongs to one organization (D-019, D-030) and is granted per site or for chosen fonds or collections, like a built-in role. A custom role can never include system-manager powers (installing plugins and themes, creating sites, System settings, managing users across the install); those stay with system managers only. Built-in roles can't be deleted, so there is always a working set.
+- **Safe changes.** Editing or deleting a role that people hold shows who is affected first; deleting one in use needs those people moved to another role. Adding a sensitive permission to a role (publish, donor data, manage people) needs confirmation, like making a template field public (D-023). Every role change goes in the change log.
+- **Rejected:** fixed roles only (John asked for custom roles); letting site managers create roles (not asked; they assign the roles that exist); roles checked by name in code (a renamed or custom role would then be checked wrongly).
 

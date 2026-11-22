@@ -105,6 +105,6 @@ Each phase has to be usable and tested before the next one starts. Realistically
 
 ## Open questions
 
-Answered: one server app (D-034); hosting stays flexible, with SiteGround for the Society (D-035); the Society's other websites stay where they are (D-032); OCR may use trained models (D-033).
+Answered: one server app (D-034); hosting stays flexible, with SiteGround for the Society (D-035); the Society's other websites stay where they are (D-032); OCR may use trained models (D-033); Scanner and Donor relations roles, plus custom roles made by system managers (D-036).
 
-- Roles: should the mockup's "Scanner" and "Donor relations" roles be added (Q-4)?
+None open right now.

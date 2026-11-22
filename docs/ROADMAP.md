@@ -9,7 +9,7 @@ These are never picked by a run. The weekly report repeats each question until J
 - [x] Q-1 One server app for the admin and the public sites, or two apps sharing the database through the API? John: one app (D-034).
 - [x] Q-2 Hosting for the Historical Society, and the budget for hosting and storage. John: SiteGround for the Society, but any host must work (D-035).
 - [x] Q-3 Should the Society's other websites move to Oculus eventually? John: no (D-032).
-- [ ] Q-4 Roles: the mockup shows "Scanner" and "Donor relations" roles that the plan doesn't have. Should Phase 2 add them? (needs John) Asked 2026-11-22, not answered yet. Until he answers, T-041 builds the plan's roles only, in a way that lets more be added later without a schema change.
+- [x] Q-4 Roles: the mockup shows "Scanner" and "Donor relations" roles that the plan doesn't have. Should Phase 2 add them? John: yes, and system managers can create custom roles (D-036).
 - [x] Q-5 OCR: common OCR engines ship trained models. Does D-004 (no AI in the product) rule them out, or is classical OCR allowed? John: allow it for OCR, locally run and permissively licensed (D-033).
 
 ## Phase 1 — Record model and ID numbers
@@ -193,7 +193,10 @@ Logins and roles:
 - [ ] T-039 **Password reset tokens.** deps: T-036 (risky)
   - Single-use, short-lived reset tokens, stored hashed. A reset ends every session for that user. Requests get the same reply whether or not the account exists. Sending the message goes through an interface with a test double, so this task doesn't need an email service.
 - [ ] T-041 **Roles and collection-level permissions.** deps: T-036, T-032, T-019 (risky)
-  - D-025 (John): system managers can do everything (sites, plugins, themes, users, System settings); site managers have full control of only their assigned sites and choose among installed plugins and themes. Below them, the roles in the plan (cataloger, reviewer, read-only), granted for the whole catalog or for chosen fonds or collections and the units below them. The service checks them on every read and write, and anything not granted is refused. Only reviewers and admins publish (mockup Settings). Whether to add the mockup's Scanner and Donor relations roles is a question for John; don't add them before he answers.
+  - D-025 (John): system managers can do everything (sites, plugins, themes, users, System settings); site managers have full control of only their assigned sites and choose among installed plugins and themes. Below them, roles granted for the whole catalog or for chosen fonds or collections and the units below them. The service checks them on every read and write, and anything not granted is refused.
+  - D-036 (John): roles are sets of permissions from a fixed list, and the service checks permissions, never role names. Built-in roles: cataloger, reviewer, read-only, Scanner (upload and attach scans only) and Donor relations (donors, accessions and deeds only). Only roles with the publish permission publish (reviewers and site managers by default; mockup Settings).
+- [ ] T-041a **Custom roles.** deps: T-041 (risky)
+  - D-036: system managers create, edit and delete roles from the permission list, each owned by one organization. No custom role can hold system-manager powers; built-in roles can't be deleted. Editing or deleting a role in use shows who is affected, deleting one in use needs those people moved, adding publish, donor-data or people permissions needs confirmation, and every change goes in the change log. Tests try to grant a system power through a custom role, use another organization's role, and keep a deleted role's access.
 - [ ] T-035 **Optional approval step.** deps: T-034, T-041 (risky)
   - An organization setting that, when on, holds edits and publish requests as pending versions until a reviewer approves or rejects them, with both recorded in the change log. When it's off, saves go straight through as today.
 
@@ -212,7 +215,7 @@ Admin screens in the browser:
   - The Item Records list and the Record editor (mockup Items, AdminRecord), with the form built from the record's template, ID numbers, the History tab with compare and restore, the edit-conflict message, and blocked actions that explain themselves ("Can't publish yet: choose a rights statement").
 - [ ] T-047 **Admin: templates and identifier types.** deps: T-046, T-005a (risky)
   - Screens to edit field templates, record types and identifier types (Settings, ID numbers tab), which show T-005a's safe-change report and require confirmation before a staff field becomes public or records are affected.
-- [ ] T-048 **Admin: people, roles and the audit trail.** deps: T-045, T-041, T-043 (risky)
+- [ ] T-048 **Admin: people, roles and the audit trail.** deps: T-045, T-041, T-041a, T-043 (risky)
   - Settings › People & roles (invite, change role, grant collections, require two-factor) and the Audit trail on Audit & Reports, with search by person, record and date.
 - [ ] T-049 **Admin: review queue.** deps: T-046, T-035 (risky)
   - A screen listing pending changes and records ready for review, with approve and reject, available to reviewers and admins only.
