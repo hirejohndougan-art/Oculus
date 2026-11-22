@@ -144,5 +144,5 @@ John asked (2026-11-21) that every progress report to him starts with this summa
   - Note the source and license of anything adapted from elsewhere.
 - **No AI in the product** (D-004): no hosted AI, no AI SDKs and no pretrained models inside Oculus. The only exception is OCR, which may use an engine's trained models, run locally and permissively licensed (D-033).
 - **Leave real systems alone.** Never touch the live Dickinson Historical Society sites, its Omeka S archive, or any server. Oculus runs only in this sandbox until John deploys it.
-- **Don't decide `(needs John)` items.** These include hosting and one or two server apps. (Whether the Society's other sites move to Oculus is answered: no, D-032.)
+- **Don't decide `(needs John)` items.** These include deploying anywhere and the extra roles in Q-4. (Answered: one app, D-034; flexible hosting with SiteGround first, D-035; the Society's other sites stay put, D-032.)
 - One task per run. Leave `main` passing the gate.

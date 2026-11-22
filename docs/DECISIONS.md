@@ -234,3 +234,15 @@ John's answer to Q-5: allow it for OCR. Reading the text on scanned pages may us
 - **Permissive licenses, engine and models alike** (D-002). The model files are dependencies too and go through the license check; the choice of engine gets its own decision entry when OCR is planned.
 - **OCR text is marked as machine-read**, kept apart from text a person wrote or checked, and staff can correct it. It is staff-only until someone chooses to publish it.
 
+## D-034 — One server app for the admin and the public sites (2026-11-22, John)
+John's answer to Q-1: one app. The admin and the public sites run in one Node server program, which is simpler and cheaper to host and to update. It does not loosen the published/private boundary: inside the app, the public sites read only through their own read-only path (a separate database role, or views, that can see only published public data), never through the service layer's writer role or the staff queries, and tests show that path can't reach staff fields or unpublished records (T-050). Rejected: two apps sharing the database through the API (a stronger wall, but more to host and run, which John chose against).
+
+## D-035 — Hosting stays flexible; SiteGround is the Society's host (2026-11-22, John)
+John's answer to Q-2: the Historical Society uses SiteGround, but other organizations may use other hosts, so Oculus must not depend on one. What follows:
+- **Plain requirements only:** a supported Node.js LTS and a PostgreSQL database, configured entirely through environment variables. No host-specific APIs, no WebSockets, no required container platform.
+- **Background work is optional.** Anything scheduled (backups, session and token cleanup) is a command that can be run by cron, a host's scheduler, or by hand; Oculus keeps working, more slowly cleaned up, if none runs.
+- **File storage behind one interface:** local disk by default, with S3-compatible object storage as an option, so scans can live wherever a host or budget allows (Phase 3).
+- **Email through one interface:** SMTP by default, so any host's mail or a mail service works (T-040).
+- **SiteGround first.** Its knowledge base lists PostgreSQL alongside MySQL ("The supported databases are MySQL and PostgreSQL", updated 2025-08-13), and its technology page says Node.js apps run "on the same hosting plans". Whether a long-running Node process is allowed on the Society's plan is not confirmed and is checked with John before T-051. No budget was given; the plan assumes the Society's existing SiteGround plan.
+- Sources: https://www.siteground.com/kb/what_databases_can_i_use_with_my_account, https://www.siteground.com/technology (read 2026-11-22).
+

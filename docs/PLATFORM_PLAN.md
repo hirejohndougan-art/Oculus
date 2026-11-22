@@ -105,7 +105,6 @@ Each phase has to be usable and tested before the next one starts. Realistically
 
 ## Open questions
 
-Answered: the Society's other websites stay where they are (D-032).
+Answered: one server app (D-034); hosting stays flexible, with SiteGround for the Society (D-035); the Society's other websites stay where they are (D-032); OCR may use trained models (D-033).
 
-- Should the admin and the public sites be one combined server app, or two apps that share the database through the API?
-- Where will the Historical Society host it, and what's the budget for hosting and storage? (One option looked at: shared-host Node plans support PostgreSQL but not WebSockets, and background jobs aren't confirmed.)
+- Roles: should the mockup's "Scanner" and "Donor relations" roles be added (Q-4)?

@@ -2,6 +2,15 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-22 06:10 CT — manual (John) — Q-1 and Q-2 answered; Q-4 assumption
+- Result: done (decisions recorded; no code)
+- What changed: Q-1: one server app, with the public sites on their own read-only path (D-034). Q-2: SiteGround for the Society, but Oculus stays host-flexible (Node LTS, PostgreSQL, environment variables, optional scheduled commands, SMTP, local or S3-compatible files; D-035). T-050 and T-040 no longer wait on John; T-051 still needs him to confirm his SiteGround plan allows a long-running Node process. Q-4 wasn't answered: T-041 builds the plan's roles so more can be added later.
+- Decisions: D-034, D-035 (John)
+- Sources: https://www.siteground.com/kb/what_databases_can_i_use_with_my_account, https://www.siteground.com/technology
+- Review: n/a
+- Gate: PASS · tests_passing 2114 (unchanged)
+- Next: T-019b Organizations on vocabularies, terms, rights settings and Dublin Core mappings (risky)
+
 ## 2026-11-22 05:50 CT — manual (John) — Q-5 OCR and D-004
 - Result: done (decision recorded; no code)
 - What changed: John answered Q-5: allow trained models for OCR. Recorded as D-033, a narrow exception to D-004 (OCR only, run locally, permissive licenses for engine and model files, machine-read text marked and staff-only until published). D-004, ROADMAP.md (Q-5 closed, Phase 3 note) and AUTOPILOT.md's rule updated.

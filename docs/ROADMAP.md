@@ -6,10 +6,10 @@ Phases follow [PLATFORM_PLAN.md](PLATFORM_PLAN.md) §10. Marks and procedure: [A
 
 These are never picked by a run. The weekly report repeats each question until John answers it.
 
-- [ ] Q-1 One server app for the admin and the public sites, or two apps sharing the database through the API? (needs John) Needed before Phase 2.
-- [ ] Q-2 Hosting for the Historical Society, and the budget for hosting and storage. (needs John) Needed before Phase 2 deploys anywhere.
+- [x] Q-1 One server app for the admin and the public sites, or two apps sharing the database through the API? John: one app (D-034).
+- [x] Q-2 Hosting for the Historical Society, and the budget for hosting and storage. John: SiteGround for the Society, but any host must work (D-035).
 - [x] Q-3 Should the Society's other websites move to Oculus eventually? John: no (D-032).
-- [ ] Q-4 Roles: the mockup shows "Scanner" and "Donor relations" roles that the plan doesn't have. Should Phase 2 add them? (needs John) Needed before T-041.
+- [ ] Q-4 Roles: the mockup shows "Scanner" and "Donor relations" roles that the plan doesn't have. Should Phase 2 add them? (needs John) Asked 2026-11-22, not answered yet. Until he answers, T-041 builds the plan's roles only, in a way that lets more be added later without a schema change.
 - [x] Q-5 OCR: common OCR engines ship trained models. Does D-004 (no AI in the product) rule them out, or is classical OCR allowed? John: allow it for OCR, locally run and permissively licensed (D-033).
 
 ## Phase 1 — Record model and ID numbers
@@ -167,7 +167,7 @@ Database:
 - [ ] T-028 **Staff search.** deps: T-025, T-026 (risky)
   - PostgreSQL full-text search over titles and text fields, and lookup by current or former identifier through the comparison key (§2 "old numbers stay searchable"), with ranking and accent-insensitive matching. This is staff search only. A public search (Phase 4) must index only published public views, and this index must never be used for it.
 - [ ] T-052 **Backup and restore tools.** deps: T-024 (risky)
-  - A script that backs up the database to a file and one that restores it into an empty database, with a test that restores a backup and finds every record and version. When and where backups run waits on Q-2 (T-051).
+  - A script that backs up the database to a file and one that restores it into an empty database, with a test that restores a backup and finds every record and version. Backups are a command any scheduler can run (D-035); where the copies go is set up in T-051.
 
 Change log and versions:
 - [ ] T-029 **Change log and version history.** deps: T-025 (risky)
@@ -217,13 +217,13 @@ Admin screens in the browser:
 - [ ] T-049 **Admin: review queue.** deps: T-046, T-035 (risky)
   - A screen listing pending changes and records ready for review, with approve and reject, available to reviewers and admins only.
 
-Waiting on John:
-- [ ] T-050 **Server layout for the admin and the public sites.** deps: Q-1, T-042 (risky)
-  - Set up the server the way John answers Q-1: one app, or two apps sharing the database through the API. Either way, the public sites may read only published data, through a read-only path (its own database role or a public read API) that tests show can't reach staff fields or unpublished records.
-- [ ] T-040 **Sending password reset email.** deps: Q-2, T-039 (risky)
-  - Deliver reset and invitation messages through the email service the hosting answer allows, with its credentials only in environment variables, and nothing about the account in the message beyond the link.
-- [ ] T-051 **Deploy and run.** deps: Q-2, T-050, T-052 (risky)
-  - Production setup for John's chosen host: TLS, secrets from the environment, scheduled backups and an off-site copy (T-052), session and token cleanup as a background job if the host allows one, and a written runbook for updates and restore (§9). Never deploy without John.
+Server and deployment:
+- [ ] T-050 **Server layout for the admin and the public sites.** deps: T-042 (risky)
+  - One app (D-034). The public sites may read only published data, through a read-only path (its own database role or a public read API) that tests show can't reach staff fields or unpublished records.
+- [ ] T-040 **Sending password reset email.** deps: T-039 (risky)
+  - Deliver reset and invitation messages over SMTP (D-035), so any host's mail or a mail service works, with its credentials only in environment variables, and nothing about the account in the message beyond the link.
+- [ ] T-051 **Deploy and run.** deps: T-050, T-052 (needs John) (risky)
+  - Production setup for any host meeting D-035, with SiteGround as the first: confirm with John that his plan allows a long-running Node process, then TLS, secrets from the environment, scheduled backups and an off-site copy (T-052), session and token cleanup as commands a scheduler or cron can run, and a written runbook for updates and restore (§9). Never deploy without John.
 
 - [ ] T-053 **Phase 2 review.** deps: T-020 to T-052
   - Check Phase 2 against PLATFORM_PLAN.md §3 and the "one writer" principle, get an independent security review of the whole of Phase 2, and write the Phase 3 tasks (including M-001).
