@@ -44,7 +44,7 @@ export type FieldValue = JsonValue;
 interface RecordBase {
   readonly id: RecordId;
   /**
-   * The organization the record belongs to (D-019, D-0XX). It never changes,
+   * The organization the record belongs to (D-019, D-030). It never changes,
    * and the units a record is filed under or represents belong to the same one.
    */
   readonly organizationId: OrganizationId;

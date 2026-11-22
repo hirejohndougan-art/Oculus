@@ -1,5 +1,5 @@
 // Attacks on the arrangement checks: one organization's units must never be
-// checked or listed together with another's (D-019, D-0XX).
+// checked or listed together with another's (D-019, D-030).
 import { describe, expect, it } from "vitest";
 import {
   newOrganizationId,

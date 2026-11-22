@@ -31,7 +31,7 @@
  *   former notes can be internal: a public site or public search must pass in
  *   published records only, and show only public types.
  *
- * - **One organization at a time** (D-019, D-0XX). Identifier types and a
+ * - **One organization at a time** (D-019, D-030). Identifier types and a
  *   record's identifiers carry their `organizationId`, and a number is unique
  *   only within its organization. `validateIdentifierTypes`,
  *   `validateRecordIdentifiers`, `uniquenessIssues`, `checkNewIdentifier` and
@@ -92,7 +92,7 @@ export type AutoNumbering =
 
 /** An identifier type defined by the organization. */
 export interface IdentifierType {
-  /** The organization that defined the type (D-019, D-0XX). Types are never shared. */
+  /** The organization that defined the type (D-019, D-030). Types are never shared. */
   readonly organizationId: OrganizationId;
   /** Stable key, e.g. `accession_number`. Lower case letters, digits and underscores. */
   readonly key: string;
@@ -133,7 +133,7 @@ export interface FormerIdentifier {
 /** All identifiers of one record. */
 export interface RecordIdentifiers {
   readonly recordId: RecordId;
-  /** The organization the record belongs to (D-0XX). */
+  /** The organization the record belongs to (D-030). */
   readonly organizationId: OrganizationId;
   readonly current: readonly Identifier[];
   readonly former: readonly FormerIdentifier[];
@@ -473,7 +473,7 @@ export function validateRecordIdentifiers(
       );
     }
     // The types are read once, validated, and that copy is what both the
-    // organization check and the format checks use (D-0XX).
+    // organization check and the format checks use (D-030).
     const typesRead = readTypes(identifierTypes);
     if (!typesRead.ok) {
       return {
@@ -490,7 +490,7 @@ export function validateRecordIdentifiers(
       oneOrganization([{ organizationId: owner }, ...typesRead.value]) === "mixed"
     ) {
       // Another organization's types are refused outright, never used to
-      // check this record's numbers (D-019, D-0XX).
+      // check this record's numbers (D-019, D-030).
       return {
         ok: false,
         issues: [
@@ -832,7 +832,7 @@ export function uniquenessIssues(
  * with under its type's uniqueness rule. Empty when it is free to use, when
  * the rule is `none`, or when the type is unknown (`checkNewIdentifier`
  * reports that). Fails with `mixed_organizations` when the records and types
- * belong to more than one organization, or any doesn't say which (D-0XX):
+ * belong to more than one organization, or any doesn't say which (D-030):
  * another organization's holders are never listed. Never throws.
  */
 export function findIdentifierConflicts(
@@ -949,7 +949,7 @@ export function checkNewIdentifier(
  * search to one identifier type; `includeFormer: false` leaves former
  * identifiers out. Bad queries (not text, empty, too long) find nothing.
  * Fails with `mixed_organizations` when the sets belong to more than one
- * organization, or any doesn't say which (D-0XX): a search never returns
+ * organization, or any doesn't say which (D-030): a search never returns
  * another organization's records. Never throws.
  */
 export function findByIdentifier(
@@ -1256,7 +1256,7 @@ const MIXED = (): Issue => mixedOrganizationsIssue([], "These identifiers and id
  * before anything else looks at them, so the check and the work see exactly
  * the same data: a list walked twice (a Proxy, a getter, an iterator that
  * yields something else the second time) can't show the organization check
- * one set and the search another (D-0XX). Proxies and getters are refused;
+ * one set and the search another (D-030). Proxies and getters are refused;
  * each set must have a record ID and lists of `{ type, value }`; the types
  * must pass `validateIdentifierTypes`. Then everything must name one
  * organization (`mixed_organizations`, also for a set or type that names

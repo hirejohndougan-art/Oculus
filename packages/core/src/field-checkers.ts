@@ -88,7 +88,7 @@ interface MadeChecker {
  * The public identifier type keys and the organization of each checker
  * `makeIdentifierChecker` made, so `effectiveRecord` and `publicOutput` can
  * check again, at the boundary, that they publish only values of public
- * types, of the record's own organization (D-0XX). Keyed by the checker
+ * types, of the record's own organization (D-030). Keyed by the checker
  * itself, never by shape.
  */
 const MADE = new WeakMap<object, MadeChecker>();
@@ -137,7 +137,7 @@ export function isOtherOrganizationsChecker(checker: unknown, organizationId: un
  * out), and the identifier problems `checkNewIdentifier` reports for the
  * value (`untrimmed`, `too_long`, `control_characters`,
  * `invisible_characters`, `format_mismatch` …), except uniqueness, which
- * needs every record. The types are one organization's (D-0XX), and the
+ * needs every record. The types are one organization's (D-030), and the
  * checker refuses every value of a record of any other organization, or of
  * one that doesn't say which (`wrong_organization_checker`), so one
  * organization's `public` types can't wave through another's staff numbers.

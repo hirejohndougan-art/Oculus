@@ -466,7 +466,7 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
   // came from, in the effective record.
   const full = fullValues(view, effective, template);
   const identifierChecker = isPlainObject(checkers) ? dataProp(checkers, "identifier") : undefined;
-  // One organization's checker never vouches for another's numbers (D-0XX).
+  // One organization's checker never vouches for another's numbers (D-030).
   if (isOtherOrganizationsChecker(identifierChecker, effective.record.organizationId)) {
     fail(
       ["checkers", "identifier"],
@@ -605,7 +605,7 @@ function sameAncestry(
   if (!found.ok) {
     const problem = found.issues[0];
     if (problem?.code === "mixed_organizations") {
-      // Each organization is kept separate (D-019, D-0XX): never filtered.
+      // Each organization is kept separate (D-019, D-030): never filtered.
       fail(["records"], problem.code, problem.message);
     }
     if (problem === undefined || SET_PROBLEMS.has(problem.code)) {

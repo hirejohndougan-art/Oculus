@@ -48,7 +48,7 @@
  * deeper than MAX_ARRANGEMENT_DEPTH makes the whole result fail, because a
  * record whose ancestors can't be trusted can't be published safely.
  *
- * **One organization per set** (D-019, D-0XX). A set holding records of
+ * **One organization per set** (D-019, D-030). A set holding records of
  * more than one organization (valid or not), or an entry that doesn't say
  * which, is refused whole (`mixed_organizations`),
  * so a record can never inherit from, or be published with, another
@@ -286,7 +286,7 @@ function buildLookup(records: unknown): RecordLookup {
     // Every organization is kept completely separate (D-019): a set holding
     // records of two organizations is refused whole, never filtered, so a
     // query that forgot its organization filter fails instead of reading
-    // across (D-0XX). Every entry counts, valid or not, whenever its
+    // across (D-030). Every entry counts, valid or not, whenever its
     // organizationId can be read. An entry whose organizationId is missing,
     // not an organization ID or behind a getter could be any organization's,
     // so it refuses the set too, rather than sitting in it as "invalid".
@@ -749,7 +749,7 @@ function withholdIdentifiers(
   organizationId: OrganizationId,
 ): readonly Candidate[] {
   const checker = ownChecker(checkers, "identifier");
-  // Another organization's checker says nothing about this one's types (D-0XX).
+  // Another organization's checker says nothing about this one's types (D-030).
   const otherOrganization = isOtherOrganizationsChecker(checker, organizationId);
   const publicTypes = publicIdentifierTypesOf(checker, organizationId);
   return candidates.map((c) => {

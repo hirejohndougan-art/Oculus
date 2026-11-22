@@ -11,7 +11,7 @@
  * - A unit with no parent is either a top-level fonds or collection, or a unit
  *   that hasn't been filed yet (the "Needs Sorting" list). Neither is an error.
  * - Items hold nothing.
- * - One organization at a time (D-019, D-0XX): `validateArrangement` and
+ * - One organization at a time (D-019, D-030): `validateArrangement` and
  *   `unfiledUnits` refuse a set holding units of more than one organization,
  *   or a unit that doesn't say which (`mixed_organizations`).
  */
@@ -172,7 +172,7 @@ export function validateArrangement(input: readonly ArchivalUnitRecord[]): Issue
  * - units in a loop (the units hanging under a loop are reached through it)
  *
  * Fails with `mixed_organizations` when the units belong to more than one
- * organization, or any doesn't say which (D-0XX), so another organization's
+ * organization, or any doesn't say which (D-030), so another organization's
  * units are never listed. That is why it returns a `Validated` list.
  */
 export function unfiledUnits(
@@ -188,7 +188,7 @@ const MAX_UNITS = 1_000_000;
 
 /**
  * The caller's units, read once into frozen shallow copies, so the
- * organization check and the work see exactly the same units (D-0XX): a
+ * organization check and the work see exactly the same units (D-030): a
  * list that reads differently the second time (a custom iterator, a getter,
  * a Proxy) can't show the check one organization's units and the work
  * another's. A Proxy or anything but an array is refused (`not_a_list`), as

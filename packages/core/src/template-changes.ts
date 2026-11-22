@@ -618,7 +618,7 @@ function readRecords(input: unknown): Validated<readonly CatalogRecord[]> {
         ],
       };
     }
-    // One organization's records only (D-019, D-0XX): a list that mixes in
+    // One organization's records only (D-019, D-030): a list that mixes in
     // another organization's records is refused, never filtered.
     const first = out[0];
     if (first !== undefined && first.organizationId !== checked.value.organizationId) {

@@ -1,5 +1,5 @@
 /**
- * Organizations and sites (decisions D-019, D-025, D-028, D-0XX).
+ * Organizations and sites (decisions D-019, D-025, D-028, D-030).
  *
  * One Oculus install can hold several organizations: the Dickinson Historical
  * Society's archives and the library it hosts, say. Each is treated as a
@@ -8,7 +8,7 @@
  * it alone, and nothing reads across. A **site** is a public (or password
  * protected) website, and every site belongs to exactly one organization.
  *
- * **How data says which organization it belongs to** (D-0XX). Everything an
+ * **How data says which organization it belongs to** (D-030). Everything an
  * organization owns carries its `organizationId` as part of the stored value,
  * the way a database row will carry an `organization_id` column. Functions
  * that work on a set of things (a set of records, a set of record
@@ -22,7 +22,7 @@
  *
  * Organization and site IDs are random version 4 UUIDs, like record IDs, and
  * never change; names can. Roles (D-025) and imported events (D-028) are not
- * modelled yet; see D-0XX for how they will attach.
+ * modelled yet; see D-030 for how they will attach.
  */
 import { randomUUID } from "node:crypto";
 import { types } from "node:util";
