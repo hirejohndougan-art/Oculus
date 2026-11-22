@@ -46,7 +46,7 @@ Until T-001 is merged there is no gate. T-001's run sets it up and must show it 
 **a. Read the state.** Run `git pull`. Read PLATFORM_PLAN.md, ROADMAP.md, the top 5 entries of PROGRESS.md and the DECISIONS.md titles (open any entry that bears on your task). Note today's date and time in America/Chicago, and which session you are: the scheduled prompt says so.
 
 **Special runs.** The **build** session does these *instead of* a roadmap task, then goes to step k:
-- **Weekly report:** on Sundays, if `docs/reports/<today>.md` doesn't exist, write it. Cover what merged this week, tasks done and stuck, the gate and `tests_passing` trend, dependency and security findings, everything marked `(needs John)` with the question he needs to answer, and next week's plan. One page.
+- **Weekly report:** on Sundays, if `docs/reports/<today>.md` doesn't exist, write it. Cover what merged this week, tasks done and stuck, the gate and `tests_passing` trend, dependency and security findings, everything marked `(needs John)` with the question he needs to answer, and next week's plan. Start it with the progress summary (below). One page.
 - **Monthly review:** on the first build run on or after the 1st of a month, if `docs/reports/<YYYY-MM>-review.md` doesn't exist, check the direction against PLATFORM_PLAN.md and re-plan: add, split or remove tasks, and write the next phase's tasks. Revisit every `[!]` task: reset it with a new approach, split it, or drop it with a decision entry. Write the review file.
 
 **b. Check main.** If the last PROGRESS entry says the gate failed, or `main` has commits after the last recorded PASS, run the gate. If it fails, **fixing main is this run's task**: it outranks everything.
@@ -103,6 +103,16 @@ A failed attempt means the gate can't be made to pass, the review finds problems
 - Write what you tried and where it broke in the PROGRESS entry, then stop.
 
 At **attempts: 3**, mark the task `[!]`. Later runs skip it, and the monthly review revisits it.
+
+## Progress summary
+
+John asked (2026-11-21) that every progress report to him starts with this summary: the weekly report, the monthly review, and any answer to "how is it going" or "show me the progress".
+
+- **Project complete:** done tasks ÷ all tasks, as a percentage. Count `[x]` as done, `[~]` as half done, and every other task in ROADMAP.md. Don't count the `Q-` questions.
+- **Each phase:** the same percentage for every phase that has tasks. For phases with no tasks written yet, say "not planned yet".
+- **Small jobs:** the same percentage for the follow-ups and fixes (`T-NNNa`-style tasks and `S-`, `U-` and `M-` tasks), counted on their own.
+- **Needs a decision:** a bullet list of every `(needs John)` item and `Q-` question, each with the question in one line.
+- **Estimated time to finish:** tasks left ÷ tasks done per day over the last 7 days (or since the project started, if that's shorter). Phases with no tasks yet are estimated at the average size of the phases that have them. Give the date and the number of days, and say that the estimate assumes the current pace and grows if phases turn out bigger.
 
 ## PROGRESS entry format
 
