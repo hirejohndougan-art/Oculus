@@ -122,7 +122,7 @@ describe("standard presets", () => {
     }
   });
 
-  it("templateFromPreset won't move a template to another organization", () => {
+  it("templateFromPreset refuses a template that already names an organization", () => {
     const mine = templateFromPreset(DACS_ARCHIVAL_UNIT_PRESET, ORG);
     if (!mine.ok) throw new Error("bad fixture");
     const r = templateFromPreset(mine.value, newOrganizationId());

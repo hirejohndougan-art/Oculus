@@ -102,6 +102,7 @@ import {
   isOrganizationId,
   mixedOrganizationsIssue,
   oneOrganization,
+  organizationIdOf,
   type OrganizationId,
 } from "./organizations.js";
 
@@ -354,7 +355,9 @@ export interface LegacyTemplateProblem {
  * Find stored templates that `validateTemplate` refuses, such as ones whose
  * `identifierTypes` hold hyphenated codes from before D-031, so an upgrade
  * can have them re-saved before the records using them stop being checked
- * and published. Never throws.
+ * and published. The list must be one organization's templates
+ * (`mixed_organizations`); a template with no `organizationId` is reported
+ * as not fixable. Never throws.
  */
 export function legacyTemplateIssues(
   templates: unknown,
@@ -376,10 +379,25 @@ export function legacyTemplateIssues(
         ],
       };
     }
-    const out: LegacyTemplateProblem[] = [];
+    // One organization's templates at a time (D-030): a list naming two
+    // organizations is refused, so the report never shows another
+    // organization's keys or codes. An entry with no readable organization
+    // is reported as not fixable.
+    const items: unknown[] = [];
+    const owners = new Set<OrganizationId>();
     for (let i = 0; i < length; i += 1) {
       const slot = Object.getOwnPropertyDescriptor(templates, i);
       const item: unknown = slot !== undefined && "value" in slot ? slot.value : undefined;
+      items.push(item);
+      const owner = organizationIdOf(item);
+      if (owner !== undefined) owners.add(owner);
+    }
+    if (owners.size > 1) {
+      return { ok: false, issues: [mixedOrganizationsIssue([], "These templates")] };
+    }
+    const out: LegacyTemplateProblem[] = [];
+    for (let i = 0; i < length; i += 1) {
+      const item = items[i];
       if (validateTemplate(item).ok) continue;
       const legacy = validateLegacyTemplate(item);
       // Read from a safe copy, so a template invalid for other reasons still

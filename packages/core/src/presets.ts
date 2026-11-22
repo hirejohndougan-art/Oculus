@@ -886,9 +886,11 @@ export function standardPreset(key: unknown): TemplatePreset | undefined {
  * An organization's own template made from a preset: a copy of `preset`
  * with `organizationId` added, validated with `validateTemplate`. `preset`
  * may be a built-in preset or any template-shaped value without an
- * organization (one that already names an organization is refused, so a
- * template can't be moved to another organization by copying it this way).
- * Never throws.
+ * organization. One that already names an organization is refused, as a
+ * guard against mistakes: this is not a security boundary (a caller holding
+ * another organization's template could remove its organizationId first).
+ * The service layer (T-032) loads only the session's organization's data,
+ * which is what keeps organizations apart. Never throws.
  */
 export function templateFromPreset(
   preset: unknown,

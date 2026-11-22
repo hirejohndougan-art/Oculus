@@ -98,6 +98,12 @@ describe("a template names its organization", () => {
     expect(r.ok && r.value.organizationId).toBe(ORG);
   });
 
+  it("legacyTemplateIssues refuses two organizations' templates and quotes neither", () => {
+    const r = legacyTemplateIssues([template(ORG, "mine"), template(OTHER, "other-secret-key")]);
+    expect(codes(r)).toEqual(["mixed_organizations"]);
+    expect(JSON.stringify(r)).not.toContain("other-secret-key");
+  });
+
   it("legacyTemplateIssues reports a template without one as not fixable", () => {
     const missing = withoutOrganization(template(ORG));
     const r = legacyTemplateIssues([template(ORG), missing]);
