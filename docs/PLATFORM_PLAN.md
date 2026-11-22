@@ -105,6 +105,7 @@ Each phase has to be usable and tested before the next one starts. Realistically
 
 ## Open questions
 
+Answered: the Society's other websites stay where they are (D-032).
+
 - Should the admin and the public sites be one combined server app, or two apps that share the database through the API?
 - Where will the Historical Society host it, and what's the budget for hosting and storage? (One option looked at: shared-host Node plans support PostgreSQL but not WebSockets, and background jobs aren't confirmed.)
-- Should the Society's other websites eventually move to Oculus?

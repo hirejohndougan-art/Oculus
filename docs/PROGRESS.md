@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-22 05:40 CT — manual (John) — Q-3 The Society's other websites
+- Result: done (decision recorded; no code)
+- What changed: John answered Q-3: no, the Society's other websites stay where they are. Recorded as D-032; Q-3 closed in ROADMAP.md and removed from PLATFORM_PLAN.md's open questions; AUTOPILOT.md's list of John's decisions updated.
+- Decisions: D-032 (John)
+- Review: n/a
+- Gate: PASS · tests_passing 2114 (unchanged)
+- Next: T-019b Organizations on vocabularies, terms, rights settings and Dublin Core mappings (risky)
+
 ## 2026-11-22 05:15 CT — manual (John: "Continue") — T-019a Organizations on templates
 - Result: done
 - What changed: templates carry a required `organizationId`. Every path that picks a record's template (`checkRecordAgainstTemplate`, `effectiveRecord` with a lookup or a registry, for the record and its ancestors, and `publicOutput`) refuses another organization's (`wrong_organization`); `indexTemplates` and `legacyTemplateIssues` refuse mixed lists; `templateChanges` refuses two organizations' templates or another organization's records; identifier type changes refuse another organization's templates. Presets are now organization-free `TemplatePreset`s, and `templateFromPreset` makes an organization's copy. Commits 82cd40e, e53e04b.
