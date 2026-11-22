@@ -471,7 +471,24 @@ export function validateRecordIdentifiers(
         "invalid_organization",
         "A record's identifiers belong to its organization: organizationId must be an organization ID.",
       );
-    } else if (oneOrganization([{ organizationId: owner }, ...identifierTypes]) === "mixed") {
+    }
+    // The types are read once, validated, and that copy is what both the
+    // organization check and the format checks use (D-0XX).
+    const typesRead = readTypes(identifierTypes);
+    if (!typesRead.ok) {
+      return {
+        ok: false,
+        issues: typesRead.issues.map((i) =>
+          i.code === "mixed_organizations"
+            ? mixedOrganizationsIssue(["organizationId"], "These identifiers and identifier types")
+            : i,
+        ),
+      };
+    }
+    if (
+      isOrganizationId(owner) &&
+      oneOrganization([{ organizationId: owner }, ...typesRead.value]) === "mixed"
+    ) {
       // Another organization's types are refused outright, never used to
       // check this record's numbers (D-019, D-0XX).
       return {
@@ -481,7 +498,7 @@ export function validateRecordIdentifiers(
         ],
       };
     }
-    const byKey = typeMap(identifierTypes);
+    const byKey = typeMap(typesRead.value);
     checkCurrent(view.current, byKey, issues);
     checkFormer(view.former, issues);
     if (issues.count > 0) return { ok: false, issues: issues.items };
@@ -1245,27 +1262,36 @@ const MIXED = (): Issue => mixedOrganizationsIssue([], "These identifiers and id
  * organization (`mixed_organizations`, also for a set or type that names
  * none). Never throws.
  */
+/**
+ * The caller's identifier types, read once into a validated, frozen copy, so
+ * what decides a check is exactly what was validated. A type of another
+ * organization, or one that names none, gives `mixed_organizations`; any
+ * other problem `invalid_identifier_types`. Never throws.
+ */
+function readTypes(identifierTypes: unknown): Validated<readonly IdentifierType[]> {
+  const read = validateIdentifierTypes(identifierTypes);
+  if (read.ok) return read;
+  const mixed = read.issues.some(
+    (i) => i.code === "mixed_organizations" || i.code === "invalid_organization",
+  );
+  return {
+    ok: false,
+    issues: [
+      mixed
+        ? MIXED()
+        : issue(
+            [],
+            "invalid_identifier_types",
+            "The identifier types aren't valid. Check them with validateIdentifierTypes.",
+          ),
+    ],
+  };
+}
+
 function snapshot(all: unknown, identifierTypes: unknown): Validated<Snapshot> {
   try {
-    const typesRead = validateIdentifierTypes(identifierTypes);
-    if (!typesRead.ok) {
-      // A type of another organization, or one that names none.
-      const mixed = typesRead.issues.some(
-        (i) => i.code === "mixed_organizations" || i.code === "invalid_organization",
-      );
-      return {
-        ok: false,
-        issues: [
-          mixed
-            ? MIXED()
-            : issue(
-                [],
-                "invalid_identifier_types",
-                "The identifier types aren't valid. Check them with validateIdentifierTypes.",
-              ),
-        ],
-      };
-    }
+    const typesRead = readTypes(identifierTypes);
+    if (!typesRead.ok) return typesRead;
     if (types.isProxy(all) || !Array.isArray(all)) {
       return fail("not_a_list", "The records' identifiers must be given as a list.");
     }

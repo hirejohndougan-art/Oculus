@@ -719,3 +719,39 @@ describe("the set functions read their input once (second review of T-019)", () 
     ).toEqual(["not_a_list"]);
   });
 });
+
+describe("validateRecordIdentifiers reads the types once (third review of T-019)", () => {
+  const OTHER = newOrganizationId();
+  const set: RecordIdentifiers = {
+    recordId: newRecordId(),
+    organizationId: ORG,
+    current: [{ type: "box_label", value: "anything goes", primary: true }],
+    former: [],
+  };
+  // This organization's format, and another organization's looser one.
+  const strict: IdentifierType = { ...BOX, pattern: "B-###" };
+  const loose: IdentifierType = { ...BOX, organizationId: OTHER };
+
+  it("an iterator that shows the check this organization's type and the format check another's is refused", () => {
+    let walks = 0;
+    const types = [strict];
+    Object.defineProperty(types, Symbol.iterator, {
+      value: function* () {
+        walks += 1;
+        yield walks === 1 ? strict : loose;
+      },
+    });
+    const r = validateRecordIdentifiers(set, types);
+    expect(r.ok).toBe(false);
+  });
+
+  it("a type behind a getter, or a Proxy list, is refused", () => {
+    const getter = Object.defineProperty({ ...strict }, "pattern", {
+      get: () => undefined,
+      enumerable: true,
+    });
+    expect(validateRecordIdentifiers(set, [getter]).ok).toBe(false);
+    expect(validateRecordIdentifiers(set, new Proxy([strict], {})).ok).toBe(false);
+    expect(codes(validateRecordIdentifiers(set, [loose]))).toEqual(["mixed_organizations"]);
+  });
+});

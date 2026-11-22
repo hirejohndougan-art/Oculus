@@ -16,7 +16,8 @@
  *   or a unit that doesn't say which (`mixed_organizations`).
  */
 import type { ArchivalLevel, ArchivalUnitRecord } from "./records.js";
-import type { Issue, Validated } from "./issues.js";
+import { types } from "node:util";
+import { isPlainObject, type Issue, type Validated } from "./issues.js";
 import { mixedOrganizationsIssue, oneOrganization } from "./organizations.js";
 import { IssueList, shown } from "./plain-data.js";
 import type { RecordId } from "./record-id.js";
@@ -50,10 +51,10 @@ export function canFileUnder(child: ArchivalLevel, parent: ArchivalLevel): boole
  * a few hundred problems. Units of more than one organization are refused
  * with the one issue `mixed_organizations`.
  */
-export function validateArrangement(units: readonly ArchivalUnitRecord[]): Issue[] {
-  if (oneOrganization(units) === "mixed") {
-    return [mixedOrganizationsIssue([], "These units")];
-  }
+export function validateArrangement(input: readonly ArchivalUnitRecord[]): Issue[] {
+  const read = readUnits(input);
+  if (!read.ok) return [...read.issues];
+  const units = read.value;
   const issues = new IssueList();
 
   // Units whose ID appears more than once can't be placed reliably: report
@@ -175,12 +176,81 @@ export function validateArrangement(units: readonly ArchivalUnitRecord[]): Issue
  * units are never listed. That is why it returns a `Validated` list.
  */
 export function unfiledUnits(
-  units: readonly ArchivalUnitRecord[],
+  input: readonly ArchivalUnitRecord[],
 ): Validated<readonly ArchivalUnitRecord[]> {
-  if (oneOrganization(units) === "mixed") {
-    return { ok: false, issues: [mixedOrganizationsIssue([], "These units")] };
+  const read = readUnits(input);
+  if (!read.ok) return read;
+  return { ok: true, value: Object.freeze(unfiled(read.value)) };
+}
+
+/** The most units `validateArrangement` and `unfiledUnits` take at once. */
+const MAX_UNITS = 1_000_000;
+
+/**
+ * The caller's units, read once into frozen shallow copies, so the
+ * organization check and the work see exactly the same units (D-0XX): a
+ * list that reads differently the second time (a custom iterator, a getter,
+ * a Proxy) can't show the check one organization's units and the work
+ * another's. A Proxy or anything but an array is refused (`not_a_list`), as
+ * is an entry that isn't a plain object or has a getter (`unreadable_entry`);
+ * then every unit must name one organization (`mixed_organizations`). Only
+ * the units' own data properties are copied; nothing runs. Never throws.
+ */
+function readUnits(input: unknown): Validated<readonly ArchivalUnitRecord[]> {
+  try {
+    if (types.isProxy(input) || !Array.isArray(input)) {
+      return refuse([], "not_a_list", "The units must be given as a list.");
+    }
+    const length = input.length;
+    if (length > MAX_UNITS) {
+      return refuse(
+        [],
+        "too_many_units",
+        `At most ${String(MAX_UNITS)} units can be checked at once.`,
+      );
+    }
+    const units: ArchivalUnitRecord[] = [];
+    for (let i = 0; i < length; i += 1) {
+      const slot = Object.getOwnPropertyDescriptor(input, i);
+      const entry: unknown = slot !== undefined && "value" in slot ? slot.value : undefined;
+      const copy = shallowCopy(entry);
+      if (copy === undefined) {
+        return refuse(
+          [i],
+          "unreadable_entry",
+          `Entry ${String(i)} in the list can't be read as plain data.`,
+        );
+      }
+      units.push(copy as unknown as ArchivalUnitRecord);
+    }
+    if (oneOrganization(units) === "mixed") {
+      return { ok: false, issues: [mixedOrganizationsIssue([], "These units")] };
+    }
+    return { ok: true, value: Object.freeze(units) };
+  } catch {
+    return refuse([], "unreadable", "The units could not be read as plain data.");
   }
-  return { ok: true, value: Object.freeze(unfiled(units)) };
+}
+
+/** A frozen copy of a plain object's own data properties, or undefined. */
+function shallowCopy(entry: unknown): Readonly<Record<string, unknown>> | undefined {
+  if (types.isProxy(entry) || !isPlainObject(entry)) return undefined;
+  const copy = Object.create(null) as Record<string, unknown>;
+  for (const key of Reflect.ownKeys(entry)) {
+    if (typeof key !== "string") return undefined;
+    const descriptor = Object.getOwnPropertyDescriptor(entry, key);
+    if (descriptor === undefined || !("value" in descriptor)) return undefined;
+    copy[key] = descriptor.value;
+  }
+  return Object.freeze(copy);
+}
+
+function refuse(
+  path: readonly (string | number)[],
+  code: string,
+  message: string,
+): { readonly ok: false; readonly issues: readonly Issue[] } {
+  return { ok: false, issues: [{ path, code, message }] };
 }
 
 function unfiled(units: readonly ArchivalUnitRecord[]): ArchivalUnitRecord[] {
