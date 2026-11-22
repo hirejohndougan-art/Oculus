@@ -817,6 +817,7 @@ describe("template registries and record template keys (D-029)", () => {
       id: "3f1c2a9e-8b7d-4c6e-9a1b-2d3e4f5a6b7c",
       title: "Chair",
       ...(templateKey === undefined ? {} : { templateKey }),
+      organizationId: ORG,
       createdAt: "2026-11-20T16:05:00.000Z",
       updatedAt: "2026-11-20T16:05:00.000Z",
       fields,

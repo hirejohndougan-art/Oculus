@@ -442,10 +442,22 @@ describe("templateKey (D-029)", () => {
   });
 
   it("is set by createRecord", () => {
-    const r = createRecord({ kind: "object", title: "Chair", templateKey: "objects" });
+    const r = createRecord({
+      organizationId: ORG,
+      kind: "object",
+      title: "Chair",
+      templateKey: "objects",
+    });
     expect(r.ok && r.value.templateKey).toBe("objects");
-    expect(codes(createRecord({ kind: "object", title: "Chair", templateKey: "Objects" }))).toEqual(
-      ["invalid_template_key"],
-    );
+    expect(
+      codes(
+        createRecord({
+          organizationId: ORG,
+          kind: "object",
+          title: "Chair",
+          templateKey: "Objects",
+        }),
+      ),
+    ).toEqual(["invalid_template_key"]);
   });
 });
