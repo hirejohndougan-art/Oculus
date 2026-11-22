@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-22 05:15 CT — manual (John: "Continue") — T-019a Organizations on templates
+- Result: done
+- What changed: templates carry a required `organizationId`. Every path that picks a record's template (`checkRecordAgainstTemplate`, `effectiveRecord` with a lookup or a registry, for the record and its ancestors, and `publicOutput`) refuses another organization's (`wrong_organization`); `indexTemplates` and `legacyTemplateIssues` refuse mixed lists; `templateChanges` refuses two organizations' templates or another organization's records; identifier type changes refuse another organization's templates. Presets are now organization-free `TemplatePreset`s, and `templateFromPreset` makes an organization's copy. Commits 82cd40e, e53e04b.
+- Decisions: D-030 (new "Templates" bullet; D-031 note updated)
+- Review: one independent review. Safe: no path used another organization's template, and no message leaked another organization's IDs or values. It found that `legacyTemplateIssues` reported another organization's template keys, that `templateFromPreset`'s "won't move a template" guard was overstated, and that Dublin Core mappings have no organization yet. The first two are fixed (with a test); the third is now part of T-019b.
+- Gate: PASS · tests_passing 2114 (was 2091) · npm audit clean
+- Next: T-019b Organizations on vocabularies, terms, rights settings and Dublin Core mappings (risky)
+
 ## 2026-11-21 17:30 CT — manual (John: "Continue building") — T-005a, T-012, T-019 (part)
 - Result: done (T-005a, T-012); partial (T-019, follow-ups T-019a, T-019b, T-019d)
 - What changed: **T-005a** identifier type changes are checked before saving (format, uniqueness, reissued numbers, made public or staff, renamed onto leftover values, deleted, templates that name the type) and template `identifierTypes` follow the identifier type key rule, with legacy templates still readable. **T-012** records store `templateKey`; `indexTemplates` gives a registry that `checkRecordAgainstTemplate`, `effectiveRecord` and `publicOutput` accept; a record checked against another template is refused. **T-019** organizations and sites in the model; `organizationId` required on records, identifier types and identifier sets; mixed or unowned sets refused, inputs read once, identifier checkers tied to their organization.
