@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-21 17:30 CT — manual (John: "Continue building") — T-005a, T-012, T-019 (part)
+- Result: done (T-005a, T-012); partial (T-019, follow-ups T-019a, T-019b, T-019d)
+- What changed: **T-005a** identifier type changes are checked before saving (format, uniqueness, reissued numbers, made public or staff, renamed onto leftover values, deleted, templates that name the type) and template `identifierTypes` follow the identifier type key rule, with legacy templates still readable. **T-012** records store `templateKey`; `indexTemplates` gives a registry that `checkRecordAgainstTemplate`, `effectiveRecord` and `publicOutput` accept; a record checked against another template is refused. **T-019** organizations and sites in the model; `organizationId` required on records, identifier types and identifier sets; mixed or unowned sets refused, inputs read once, identifier checkers tied to their organization.
+- Decisions: D-029 (records name their template, no version pin), D-030 (organizations in the core model), D-031 (identifier type changes; one key rule)
+- Review: T-012 two rounds (a present-but-undefined key fell back to legacy; templateChanges took other templates' records); safe after fixes. T-005a three rounds (one stranded value blocked later checks, legacy data broke, made-staff and reissue gaps, a rename adopting leftover staff values published them, unchecked mode trusted the old type); all fixed. T-019 three rounds (an entry with no organization skipped the check and leaked numbers across organizations, another organization's identifier checker published staff values, double reads of hostile lists); all fixed.
+- Gate: PASS · tests_passing 2091 (was 1956) · npm audit clean
+- Next: T-019a Organizations on templates and record types
+
 ## 2026-11-21 15:45 CT — manual (John) — Site editor structure
 - Result: done (plan recorded; no code)
 - What changed: John's site editor parts (headers, footers, pages, popups, plus global blocks, notice bar, menus, record templates, exhibits, forms and site-wide settings) added to the Phase 4 note in ROADMAP.md, drawn on the Oculus Site Design whiteboard. Fixed the "Oculusolybius" typo in DESIGN.md left by the D-018 rename.

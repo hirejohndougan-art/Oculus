@@ -70,8 +70,8 @@ The data model in TypeScript, written for any archive or museum rather than one 
   - Validation of a record against its template.
 - [x] T-007a **Wire the field kinds to their modules.** deps: T-004, T-005, T-007
   - Ready-made checkers for the template `identifier` kind (T-004 identifier types) and `rights` kind (T-007 `validateRightsUri`), so `checkRecordAgainstTemplate` uses them by default.
-- [~] T-005a **Safe template changes.** deps: T-005 (risky)
-  - Done in S-002 (D-023): `templateChanges` for field templates. Left: the identifier-type part and the `identifierTypes` hyphen alignment below.
+- [x] T-005a **Safe template changes.** deps: T-005 (risky)
+  - Done: `templateChanges` for field templates (S-002, D-023); `identifierTypeChanges`, `identifierTypeDeletion`, `identifierTypeCreation` and `legacyTemplateIssues`, and one key rule for identifier types (D-031).
   - Compare a new version of a template with the old one before it's saved. Switching a field from `staff` to `public` would publish existing staff data, so it must be reported for confirmation. Renaming or removing a key, changing its kind or `repeatable`, or dropping a list option must report the records affected rather than strand their data.
   - The same check for identifier types (T-004): editing or deleting a type checks existing records first.
   - Template `identifierTypes` codes allow hyphens but identifier type keys don't; align them.
@@ -106,7 +106,7 @@ The data model in TypeScript, written for any archive or museum rather than one 
   - Check the model against PLATFORM_PLAN.md §1–2 and the mockup screens.
   - Write the Phase 2 tasks, server and database, using whatever John has answered for Q-1 and Q-2 so far.
   - Done: [reports/2026-11-phase1-review.md](reports/2026-11-phase1-review.md). Q-1 and Q-2 were unanswered, so the Phase 2 tasks that need them say so. The gaps it found are T-012 to T-018.
-- [ ] T-012 **Records name their template.** deps: T-005, T-008
+- [x] T-012 **Records name their template.** deps: T-005, T-008 Done: `templateKey` on records, `indexTemplates` registry, mismatches refused; no version pin (D-029).
   - Each record stores the key of the template it follows, so the checks and `effectiveRecord` find the template from the record instead of from a lookup the caller supplies. Decide whether a record also pins a template version (decision entry). The database schema (T-025) needs this.
 - [ ] T-013 **Organization-defined record types.** deps: T-012
   - PLATFORM_PLAN.md §1 says "admins can add more types", but the six kinds are a fixed list. Decide between new kinds and organization-defined types built on the six (say "Oral history" as a kind of digital asset, with its own default template), then build the type definition and its validator (decision entry).
@@ -145,8 +145,16 @@ Decisions first:
 Database:
 - [ ] T-024 **Migrations tooling and the empty schema.** deps: T-020, T-021 (risky)
   - A `packages/db` package with the chosen tool, `npm run db:migrate` that applies migrations forwards to the database named in an environment variable (no password in the repo, not even for tests), and a test that runs every migration on a fresh database. The gate and the CI workflow start a test database as T-020 decided.
-- [ ] T-019 **Decision and model: organizations in one install.** deps: T-011 (risky)
+- [~] T-019 **Decision and model: organizations in one install.** deps: T-011 (risky)
   - D-019 (John): one install holds several organizations, each with its own records, templates, identifier types, rights settings, people, roles and sites. Example: the Historical Society's archives number items like `DS5C740001`; the library it hosts numbers them `DPL1`, `DPL2`, `DPL3`. Add an organization to the core model and scope every record, template, identifier type and vocabulary to one. Identifier uniqueness is per organization, so two organizations can hold the same number. Separation is complete, as if each were its own copy of Oculus (D-019): nothing is shared, including templates, vocabularies and people lists. One person can have access to several organizations with separate roles in each and switch between them; a session always works in exactly one. Tests try to read or write across organizations through every core function and fail. Also from D-019: a site can be password protected (an extra check on top of sign-in and roles; decide how the site password is stored and rate-limited, with the security review), and System settings cover the whole install, set only by system admins. Users are managed for all sites in one place, and after sign-in a person sees only the sites they have a role on (D-019). The schema (T-025 onward) and roles (T-041) build on this. Check that the identifier format language (D-009) covers both examples, including unpadded auto-numbers (`DPL#{1,9}`).
+  - Done (D-030): `Organization` and `Site` types; records, identifier types and identifier sets carry a required `organizationId`; every function taking a set refuses mixed or unowned entries and reads its input once; identifier checkers are tied to their organization.
+- [ ] T-019a **Organizations on templates and record types.** deps: T-019 (risky)
+  - `organizationId` on templates (and record types, T-013); `effectiveRecord`, `templateChanges` and `publicOutput` refuse another organization's template; `indexTemplates` refuses a mixed registry.
+- [ ] T-019b **Organizations on vocabularies, terms and rights settings.** deps: T-019 (risky)
+- [ ] T-019d **Site passwords.** deps: T-019, T-023 (risky)
+  - How a password-protected site (D-019) stores its password and rate-limits attempts; needs the Phase 2 password decision.
+- [ ] T-012a **Follow-ups from T-012 and T-005a.** deps: T-012, T-005a
+  - `made_staff` and `templateChanges` pick records by `templateKey`; compare the two templates when a record moves to another template; `nextIdentifier` also counts numbers held in template identifier fields; remove the lookup-function path once every record has a key.
 - [ ] T-025 **Schema: records, templates and record types.** deps: T-024, T-012, T-013, T-019 (risky)
   - Tables for records (UUID key, kind, record type, template key, title, level, parent, JSONB `fields`, timestamps), plus templates and record types stored as validated JSON with versions. Check constraints and foreign keys back up the core rules. Tests round-trip every preset and invented sample records through the core validators.
 - [ ] T-026 **Schema: identifiers, with uniqueness the database enforces.** deps: T-025, T-014 (risky)
