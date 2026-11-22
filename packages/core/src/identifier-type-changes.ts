@@ -1,5 +1,5 @@
 /**
- * Safe identifier type changes (roadmap T-005a, decision D-0XX).
+ * Safe identifier type changes (roadmap T-005a, decision D-031).
  *
  * Editing or deleting one of the organization's identifier types (D-009) can
  * strand stored numbers, give a used number out again, or publish numbers
@@ -45,7 +45,7 @@
  *   held only in a template field, which `nextIdentifier` doesn't count.
  *   Needs confirmation only when there are such records.
  * - `reserved_key`: a type stored with the key `constructor` or `prototype`
- *   (allowed before D-0XX) is edited without renaming it; needs
+ *   (allowed before D-031) is edited without renaming it; needs
  *   confirmation, and renaming onto a reserved key is refused.
  * - `made_staff`: `public` goes from true to false. A staff type is refused
  *   in public template fields (D-022), so `recordIds` are the records holding
@@ -343,7 +343,7 @@ function compare(
   // public already when the stored one is staff.
   const madePublic = now.public === true && (was.public !== true || unchecked);
 
-  // `constructor` and `prototype` were allowed before D-0XX: a stored type
+  // `constructor` and `prototype` were allowed before D-031: a stored type
   // keeps working, but can't be created, and an edit must rename it.
   if (!isIdentifierTypeKey(now.key)) {
     if (now.key !== was.key) {

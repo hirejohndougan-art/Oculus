@@ -170,7 +170,7 @@ function compare(
   recordsInput: unknown,
 ): Validated<TemplateChanges> {
   const issues: Issue[] = [];
-  // The stored version may predate the identifier type key rule (D-0XX).
+  // The stored version may predate the identifier type key rule (D-031).
   const before = validateLegacyTemplate(oldInput);
   if (!before.ok) issues.push(...prefixed("oldTemplate", before.issues));
   const after = validateTemplate(newInput);

@@ -246,7 +246,7 @@ describe("templateChanges", () => {
     ]);
   });
 
-  it("can fix a template stored with hyphenated identifier type codes (D-0XX)", () => {
+  it("can fix a template stored with hyphenated identifier type codes (D-031)", () => {
     const id = (types: string[]) =>
       field({ key: "ref", kind: "identifier", identifierTypes: types });
     const legacy = template(id(["accession", "call-number"]));

@@ -1,4 +1,4 @@
-// Attacks on identifier type changes (T-005a, D-0XX): an identifier type edit
+// Attacks on identifier type changes (T-005a, D-031): an identifier type edit
 // must not publish staff numbers, strand values or reissue a used number
 // without anyone noticing, and hostile types or records must be refused
 // without throwing.
@@ -328,7 +328,7 @@ describe("hostile input", () => {
     for (const key of ["call-number", "__proto__", "Accession", ""]) {
       expect(identifierTypeDeletion({ ...DONOR, key }).ok).toBe(false);
     }
-    // And templates can no longer name a hyphenated type (D-0XX).
+    // And templates can no longer name a hyphenated type (D-031).
     const field = {
       key: "ref",
       label: "Ref",

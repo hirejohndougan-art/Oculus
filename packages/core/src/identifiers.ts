@@ -45,7 +45,7 @@
  * type, making it unique or changing its numbering can make existing records
  * fail `validateRecordIdentifiers` or give a used number out again, and
  * making it public publishes staff values. `identifierTypeChanges` and
- * `identifierTypeDeletion` (identifier-type-changes.ts, D-0XX) report the
+ * `identifierTypeDeletion` (identifier-type-changes.ts, D-031) report the
  * records affected; the admin screen must show them and get confirmation
  * before saving.
  */
@@ -190,7 +190,7 @@ export const MAX_QUERY_LENGTH = 1000;
 const TYPE_KEY = /^[a-z][a-z0-9_]{0,63}$/;
 
 /**
- * The rule for new identifier type keys (D-0XX): 1 to 64 lower case ASCII
+ * The rule for new identifier type keys (D-031): 1 to 64 lower case ASCII
  * letters, digits and underscores, starting with a letter, and not a
  * prototype key (`constructor`, `prototype`). Template `identifierTypes`
  * lists and the `type` of identifier values in template fields use it too,

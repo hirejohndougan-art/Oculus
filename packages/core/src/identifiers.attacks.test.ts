@@ -61,7 +61,7 @@ describe("built-in names can't stand in for identifier types", () => {
     },
   );
 
-  it("a stored type named 'constructor' still works; a new one is refused (D-0XX)", () => {
+  it("a stored type named 'constructor' still works; a new one is refused (D-031)", () => {
     const type = {
       key: "constructor",
       label: "Odd",

@@ -25,7 +25,7 @@
  *   `VOCABULARY_CODES` (vocabularies.ts).
  * - `identifier`: `{ type, value }`, such as an accession number. The type
  *   and a field's `identifierTypes` follow the identifier type key rule
- *   (`isIdentifierTypeKey`, D-0XX): no hyphens.
+ *   (`isIdentifierTypeKey`, D-031): no hyphens.
  * - `link`: `{ url, label? }`, a web link (http or https).
  * - `rights`: `{ uri, note? }`, a rights statement or license URI. One per
  *   record: the kind is only allowed in a single, public, non-repeating field
@@ -291,7 +291,7 @@ export function validateTemplate(input: unknown): Validated<FieldTemplate> {
 
 /**
  * Read a template stored before identifier type codes followed the
- * identifier type key rule (D-0XX): as `validateTemplate`, but an
+ * identifier type key rule (D-031): as `validateTemplate`, but an
  * `identifierTypes` list may still hold hyphenated codes. Use it only to read
  * an existing template, such as the old side of `templateChanges`, so it can
  * be fixed; new and edited templates go through `validateTemplate`, which
@@ -312,7 +312,7 @@ export interface LegacyTemplateProblem {
   readonly key?: string;
   /**
    * True when it is valid except for identifier type codes the key rule
-   * (D-0XX) no longer allows: fix those codes and save it again
+   * (D-031) no longer allows: fix those codes and save it again
    * (`templateChanges` reads it). False when it is invalid for other reasons too.
    */
   readonly fixable: boolean;
@@ -322,7 +322,7 @@ export interface LegacyTemplateProblem {
 
 /**
  * Find stored templates that `validateTemplate` refuses, such as ones whose
- * `identifierTypes` hold hyphenated codes from before D-0XX, so an upgrade
+ * `identifierTypes` hold hyphenated codes from before D-031, so an upgrade
  * can have them re-saved before the records using them stop being checked
  * and published. Never throws.
  */
@@ -682,7 +682,7 @@ const GENERAL_CODE: CodeRule = {
   test: isCode,
   rule: "lower case letters, digits, hyphens and underscores, starting with a letter",
 };
-/** The identifier type key rule (D-0XX): a template can name only a type that could exist. */
+/** The identifier type key rule (D-031): a template can name only a type that could exist. */
 const IDENTIFIER_CODE: CodeRule = { test: isIdentifierTypeKey, rule: IDENTIFIER_TYPE_KEY_RULE };
 /** Stored templates only: the old rule, hyphens allowed (`validateLegacyTemplate`). */
 const LEGACY_IDENTIFIER_CODE: CodeRule = GENERAL_CODE;
