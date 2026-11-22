@@ -16,7 +16,7 @@ import {
   presetDublinCoreMapping,
   validateDublinCoreMapping,
   type DublinCoreMapping,
-  type FieldTemplate,
+  type TemplatePreset,
   type Validated,
 } from "./index.js";
 
@@ -24,7 +24,7 @@ function codes(result: Validated<unknown>): string[] {
   return result.ok ? [] : result.issues.map((i) => i.code);
 }
 
-const PAIRS: readonly (readonly [DublinCoreMapping, FieldTemplate])[] = [
+const PAIRS: readonly (readonly [DublinCoreMapping, TemplatePreset])[] = [
   [DACS_DUBLIN_CORE, DACS_ARCHIVAL_UNIT_PRESET],
   [SPECTRUM_DUBLIN_CORE, SPECTRUM_OBJECT_PRESET],
   [DIGITAL_ASSET_DUBLIN_CORE, DIGITAL_ASSET_PRESET],
@@ -276,7 +276,7 @@ describe("validateDublinCoreMapping", () => {
 });
 
 describe("mappingForTemplate", () => {
-  function copyOf(preset: FieldTemplate, key: string) {
+  function copyOf(preset: TemplatePreset, key: string) {
     const copy = JSON.parse(JSON.stringify(preset)) as {
       key: string;
       fields: { key: string; visibility: string }[];

@@ -61,7 +61,7 @@ function def(key: string, visibility: "public" | "staff", inherited = true): Fie
 }
 
 function template(fields: FieldDefinition[], key = "t"): FieldTemplate {
-  return { key, label: key, appliesTo: ["archival_unit"], fields };
+  return { key, label: key, organizationId: ORG, appliesTo: ["archival_unit"], fields };
 }
 
 const PUBLIC_NOTE = template([def("note", "public")], "public-note");
@@ -856,8 +856,18 @@ describe("one organization's records can't be read or mixed with another's (D-01
   it("each organization's own set still works on its own", () => {
     const fonds = otherFonds();
     const item: ArchivalUnitRecord = { ...unit("Item", "item", fonds), organizationId: OTHER };
-    const r = effectiveRecord(item.id, [item, fonds], () => PUBLIC_RIGHTS);
+    const ownTemplate = { ...PUBLIC_RIGHTS, organizationId: OTHER };
+    const r = effectiveRecord(item.id, [item, fonds], () => ownTemplate);
     expect(r.ok && r.value.fields.creator).toBe("SECRET other organization's creator");
+  });
+
+  it("another organization's template is refused, not used (T-019a)", () => {
+    const fonds = otherFonds();
+    const item: ArchivalUnitRecord = { ...unit("Item", "item", fonds), organizationId: OTHER };
+    // PUBLIC_RIGHTS belongs to ORG; the records belong to OTHER.
+    const r = effectiveRecord(item.id, [item, fonds], () => PUBLIC_RIGHTS);
+    expect(codeOf(r)).toBe("wrong_organization");
+    expect(JSON.stringify(r)).not.toContain("SECRET");
   });
 });
 

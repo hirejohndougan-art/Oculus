@@ -37,7 +37,13 @@ function field(extra: Record<string, unknown>): Record<string, unknown> {
 }
 
 function template(fields: unknown[]): FieldTemplate {
-  const r = validateTemplate({ key: "t", label: "T", appliesTo: ["object"], fields });
+  const r = validateTemplate({
+    key: "t",
+    label: "T",
+    organizationId: ORG,
+    appliesTo: ["object"],
+    fields,
+  });
   if (!r.ok) throw new Error(JSON.stringify(r.issues));
   return r.value;
 }

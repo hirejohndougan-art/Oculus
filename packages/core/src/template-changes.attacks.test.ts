@@ -13,6 +13,8 @@ import {
 } from "./index.js";
 
 const ORG = newOrganizationId();
+/** The DACS preset as this organization's template. */
+const DACS = { ...DACS_ARCHIVAL_UNIT_PRESET, organizationId: ORG } as FieldTemplate;
 
 const T = "2026-11-20T16:05:00.000Z";
 const A = "3f1c2a9e-8b7d-4c6e-9a1b-2d3e4f5a6b7c";
@@ -36,11 +38,11 @@ function unit(id: string, fields: Record<string, unknown>): Record<string, unkno
 function dacs(
   edit: ((f: Record<string, unknown>) => Record<string, unknown>) | "remove",
 ): FieldTemplate {
-  const fields = DACS_ARCHIVAL_UNIT_PRESET.fields.flatMap((f): unknown[] => {
+  const fields = DACS.fields.flatMap((f): unknown[] => {
     if (f.key !== "notes") return [f];
     return edit === "remove" ? [] : [edit({ ...f })];
   });
-  return { ...DACS_ARCHIVAL_UNIT_PRESET, fields } as FieldTemplate;
+  return { ...DACS, fields } as FieldTemplate;
 }
 
 function codes(result: Validated<unknown>): string[] {
@@ -58,7 +60,7 @@ describe("staff values made public by a template change", () => {
   it("reports a staff field made public, with the record holding a value", () => {
     const r = ok(
       templateChanges(
-        DACS_ARCHIVAL_UNIT_PRESET,
+        DACS,
         dacs((f) => ({ ...f, visibility: "public" })),
         RECORDS,
       ),
@@ -72,7 +74,7 @@ describe("staff values made public by a template change", () => {
 
   it("reports a staff field removed and then added back as public", () => {
     const removed = dacs("remove");
-    const first = ok(templateChanges(DACS_ARCHIVAL_UNIT_PRESET, removed, RECORDS));
+    const first = ok(templateChanges(DACS, removed, RECORDS));
     expect(first.changes.map((c) => [c.code, c.key, c.recordIds])).toEqual([
       ["key_removed", "notes", [A]],
     ]);
@@ -91,18 +93,18 @@ describe("staff values made public by a template change", () => {
     const removed = dacs("remove");
     const results = [
       templateChanges(
-        DACS_ARCHIVAL_UNIT_PRESET,
+        DACS,
         dacs((f) => ({ ...f, visibility: "public" })),
         RECORDS,
       ),
-      templateChanges(DACS_ARCHIVAL_UNIT_PRESET, removed, RECORDS),
+      templateChanges(DACS, removed, RECORDS),
       templateChanges(
         removed,
         dacs((f) => ({ ...f, visibility: "public" })),
         RECORDS,
       ),
       templateChanges(
-        DACS_ARCHIVAL_UNIT_PRESET,
+        DACS,
         dacs((f) => ({ ...f, kind: "text" })),
         RECORDS,
       ),
@@ -119,7 +121,7 @@ describe("staff values made public by a template change", () => {
     });
     const r = ok(
       templateChanges(
-        DACS_ARCHIVAL_UNIT_PRESET,
+        DACS,
         dacs((f) => ({ ...f, visibility: "public" })),
         many,
       ),
@@ -145,7 +147,7 @@ describe("template changes that could publish without records or other templates
   });
 
   it("reports a record kind added to a template with public fields", () => {
-    const wider = { ...DACS_ARCHIVAL_UNIT_PRESET, appliesTo: ["archival_unit", "object"] };
+    const wider = { ...DACS, appliesTo: ["archival_unit", "object"] };
     const asset = {
       kind: "object",
       id: B,
@@ -155,7 +157,7 @@ describe("template changes that could publish without records or other templates
       updatedAt: T,
       fields: { scope_and_content: SECRET },
     };
-    const r = ok(templateChanges(DACS_ARCHIVAL_UNIT_PRESET, wider, [asset]));
+    const r = ok(templateChanges(DACS, wider, [asset]));
     const change = r.changes.find((c) => c.code === "kind_added");
     expect(change?.key).toBe("object");
     expect(change?.recordIds).toEqual([B]);
@@ -177,19 +179,17 @@ describe("hostile input", () => {
   const publicNotes = dacs((f) => ({ ...f, visibility: "public" }));
 
   it("refuses Proxy templates and records lists", () => {
-    expect(
-      codes(templateChanges(new Proxy({ ...DACS_ARCHIVAL_UNIT_PRESET }, {}), publicNotes)),
-    ).toEqual(["not_an_object"]);
-    expect(
-      codes(templateChanges(DACS_ARCHIVAL_UNIT_PRESET, publicNotes, new Proxy([...RECORDS], {}))),
-    ).toEqual(["not_a_list"]);
+    expect(codes(templateChanges(new Proxy({ ...DACS }, {}), publicNotes))).toEqual([
+      "not_an_object",
+    ]);
+    expect(codes(templateChanges(DACS, publicNotes, new Proxy([...RECORDS], {})))).toEqual([
+      "not_a_list",
+    ]);
   });
 
   it("refuses a Proxy record, which could hide a staff value", () => {
     const records = [new Proxy(unit(A, { notes: SECRET }), {})];
-    expect(codes(templateChanges(DACS_ARCHIVAL_UNIT_PRESET, publicNotes, records))).toEqual([
-      "invalid_record",
-    ]);
+    expect(codes(templateChanges(DACS, publicNotes, records))).toEqual(["invalid_record"]);
   });
 
   it("refuses getters without running them", () => {
@@ -202,9 +202,7 @@ describe("hostile input", () => {
         return unit(A, {});
       },
     });
-    expect(codes(templateChanges(DACS_ARCHIVAL_UNIT_PRESET, publicNotes, records))).toEqual([
-      "invalid_record",
-    ]);
+    expect(codes(templateChanges(DACS, publicNotes, records))).toEqual(["invalid_record"]);
     const t = { ...publicNotes };
     Object.defineProperty(t, "fields", {
       enumerable: true,
@@ -213,7 +211,7 @@ describe("hostile input", () => {
         return publicNotes.fields;
       },
     });
-    expect(templateChanges(DACS_ARCHIVAL_UNIT_PRESET, t).ok).toBe(false);
+    expect(templateChanges(DACS, t).ok).toBe(false);
     expect(ran).toBe(false);
   });
 
@@ -231,12 +229,12 @@ describe("hostile input", () => {
 
   it("refuses a huge template quickly", () => {
     const fields = Array.from({ length: 100_000 }, (_, i) => ({
-      ...DACS_ARCHIVAL_UNIT_PRESET.fields[0],
+      ...DACS.fields[0],
       key: `f${String(i)}`,
     }));
     const start = Date.now();
-    const result = templateChanges(DACS_ARCHIVAL_UNIT_PRESET, {
-      ...DACS_ARCHIVAL_UNIT_PRESET,
+    const result = templateChanges(DACS, {
+      ...DACS,
       fields,
     });
     expect(result.ok).toBe(false);
@@ -245,20 +243,14 @@ describe("hostile input", () => {
 
   it("refuses duplicate record IDs, which could hide a value", () => {
     const records = [unit(A, {}), unit(A, { notes: SECRET })];
-    expect(codes(templateChanges(DACS_ARCHIVAL_UNIT_PRESET, publicNotes, records))).toEqual([
-      "duplicate_id",
-    ]);
+    expect(codes(templateChanges(DACS, publicNotes, records))).toEqual(["duplicate_id"]);
   });
 
   it("refuses records that aren't a list, and a sparse list", () => {
-    expect(
-      codes(templateChanges(DACS_ARCHIVAL_UNIT_PRESET, publicNotes, { 0: RECORDS[0] })),
-    ).toEqual(["not_a_list"]);
+    expect(codes(templateChanges(DACS, publicNotes, { 0: RECORDS[0] }))).toEqual(["not_a_list"]);
     const sparse: unknown[] = [RECORDS[0]];
     sparse[2] = RECORDS[1];
-    expect(codes(templateChanges(DACS_ARCHIVAL_UNIT_PRESET, publicNotes, sparse))).toEqual([
-      "invalid_record",
-    ]);
+    expect(codes(templateChanges(DACS, publicNotes, sparse))).toEqual(["invalid_record"]);
   });
 
   it("ignores a polluted Object.prototype", () => {
@@ -276,15 +268,12 @@ describe("hostile input", () => {
 // Independent review of T-012: records of another template must not be
 // counted (or listed) in this template's confirmation.
 describe("records must follow the template being changed", () => {
-  const key = DACS_ARCHIVAL_UNIT_PRESET.key;
+  const key = DACS.key;
   const makePublic = dacs((f) => ({ ...f, visibility: "public" }));
 
   it("refuses the whole comparison for a record of another template", () => {
     const other = { ...unit(A, { notes: SECRET }), templateKey: "other-template" };
-    const r = templateChanges(DACS_ARCHIVAL_UNIT_PRESET, makePublic, [
-      { ...unit(B, {}), templateKey: key },
-      other,
-    ]);
+    const r = templateChanges(DACS, makePublic, [{ ...unit(B, {}), templateKey: key }, other]);
     expect(codes(r)).toEqual(["record_not_for_template"]);
     expect(r.ok ? [] : r.issues[0]?.path).toEqual(["records", 1, "templateKey"]);
     expect(JSON.stringify(r)).not.toContain("555-0100");
@@ -292,14 +281,14 @@ describe("records must follow the template being changed", () => {
 
   it("counts records of this template, and says how many name no template", () => {
     const r = ok(
-      templateChanges(DACS_ARCHIVAL_UNIT_PRESET, makePublic, [
+      templateChanges(DACS, makePublic, [
         { ...unit(A, { notes: SECRET }), templateKey: key },
         unit(B, {}),
       ]),
     );
     expect(r.legacyRecords).toBe(1);
     expect(r.changes.find((c) => c.code === "made_public")?.recordIds).toEqual([A]);
-    expect(ok(templateChanges(DACS_ARCHIVAL_UNIT_PRESET, makePublic)).legacyRecords).toBe(0);
+    expect(ok(templateChanges(DACS, makePublic)).legacyRecords).toBe(0);
   });
 });
 

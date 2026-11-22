@@ -339,7 +339,13 @@ describe("hostile input", () => {
       inherited: false,
       identifierTypes: ["call-number"],
     };
-    const t = validateTemplate({ key: "t", label: "T", appliesTo: ["object"], fields: [field] });
+    const t = validateTemplate({
+      key: "t",
+      label: "T",
+      organizationId: ORG,
+      appliesTo: ["object"],
+      fields: [field],
+    });
     expect(codes(t)).toEqual(["invalid_code"]);
   });
 

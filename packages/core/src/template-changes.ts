@@ -67,7 +67,7 @@
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import { shown, type JsonValue } from "./plain-data.js";
 import { validateRecord, type CatalogRecord, type RecordKind } from "./records.js";
-import { mixedOrganizationsIssue } from "./organizations.js";
+import { mixedOrganizationsIssue, oneOrganization } from "./organizations.js";
 import type { RecordId } from "./record-id.js";
 import {
   MAX_LONG_TEXT_LENGTH,
@@ -189,11 +189,30 @@ function compare(
     };
   }
 
+  // A template never moves between organizations (D-030), and its records
+  // are its organization's: anything else would compare or list another
+  // organization's data.
+  if (after.value.organizationId !== before.value.organizationId) {
+    return {
+      ok: false,
+      issues: [mixedOrganizationsIssue(["newTemplate", "organizationId"], "These two templates")],
+    };
+  }
+
   let records: readonly CatalogRecord[] | undefined;
   if (recordsInput !== undefined) {
     const read = readRecords(recordsInput);
     if (!read.ok) return read;
     records = read.value;
+    if (
+      records.length > 0 &&
+      oneOrganization([after.value, ...records]) !== after.value.organizationId
+    ) {
+      return {
+        ok: false,
+        issues: [mixedOrganizationsIssue(["records"], "The template and these records")],
+      };
+    }
   }
   // Only records that follow this template may be counted for it (D-029):
   // another template's record would be listed in this one's confirmation.

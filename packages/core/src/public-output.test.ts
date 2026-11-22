@@ -16,6 +16,7 @@ import {
 } from "./index.js";
 import {
   BASE,
+  ORG,
   CNE,
   LCSH,
   MAPPING,
@@ -811,7 +812,7 @@ describe("publicOutput: digital assets and DCMI types", () => {
       rights: { uri: CNE },
       resource_type: "StillImage",
     });
-    const view = viewOf([asset], asset.id, DIGITAL_ASSET_PRESET);
+    const view = viewOf([asset], asset.id, { ...DIGITAL_ASSET_PRESET, organizationId: ORG });
     const o = ok(
       publicOutput(view, DIGITAL_ASSET_DUBLIN_CORE, {
         baseUrl: BASE,

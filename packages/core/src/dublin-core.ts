@@ -26,7 +26,7 @@
 import { issue, isPlainObject, type Validated } from "./issues.js";
 import { IssueList, readPlainData, shown, type JsonValue, type ReadLimits } from "./plain-data.js";
 import { RIGHTS_FIELD_KEY } from "./rights.js";
-import { isFieldKey, validateTemplate, type FieldDefinition } from "./templates.js";
+import { isFieldKey, validateTemplateShape, type FieldDefinition } from "./templates.js";
 import { types } from "node:util";
 
 export const DCTERMS_NAMESPACE = "http://purl.org/dc/terms/";
@@ -149,7 +149,7 @@ function notAnObject(): Validated<never> {
 }
 
 function checkMapping(mapping: unknown, template: unknown): Validated<DublinCoreMapping> {
-  const checked = validateTemplate(template);
+  const checked = validateTemplateShape(template);
   if (!checked.ok) return invalidTemplate();
   if (types.isProxy(mapping) || !isPlainObject(mapping)) return notAnObject();
   const issues = new IssueList();
@@ -332,7 +332,7 @@ export function mappingForTemplate(
   template: unknown,
 ): Validated<DublinCoreMapping> {
   try {
-    const checked = validateTemplate(template);
+    const checked = validateTemplateShape(template);
     if (!checked.ok) return invalidTemplate();
     if (types.isProxy(mapping) || !isPlainObject(mapping)) return notAnObject();
     // Copy own, enumerable data properties only; a getter or a hidden

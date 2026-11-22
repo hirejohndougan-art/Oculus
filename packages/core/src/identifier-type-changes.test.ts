@@ -346,10 +346,41 @@ describe("identifierTypeChanges", () => {
     expect(adopt?.message).toContain("1 record holds values");
   });
 
+  it("refuses a template of another organization in the list (T-019a)", () => {
+    const tpl = (organizationId: string) => ({
+      key: "photos",
+      label: "T",
+      organizationId,
+      appliesTo: ["object"],
+      fields: [
+        {
+          key: "number",
+          label: "Number",
+          kind: "identifier",
+          required: false,
+          repeatable: false,
+          visibility: "staff",
+          inherited: false,
+          identifierTypes: ["box"],
+        },
+      ],
+    });
+    const mine = { ...use([]), templates: [tpl(ORG)] };
+    expect(identifierTypeChanges(BOX, { ...BOX, key: "carton" }, mine).ok).toBe(true);
+    const mixed = { ...use([]), templates: [tpl(ORG), tpl(newOrganizationId())] };
+    const r = identifierTypeChanges(BOX, { ...BOX, key: "carton" }, mixed);
+    expect(r.ok ? [] : r.issues.map((i) => [i.code, i.path.join(".")])).toEqual([
+      ["mixed_organizations", "existing.templates"],
+    ]);
+    const theirs = { ...use([]), templates: [tpl(newOrganizationId())] };
+    expect(identifierTypeDeletion(BOX, theirs).ok).toBe(false);
+  });
+
   it("reports templates naming a renamed or deleted type", () => {
     const tpl = (key: string, types: string[]) => ({
       key,
       label: "T",
+      organizationId: ORG,
       appliesTo: ["object"],
       fields: [
         {
@@ -466,6 +497,7 @@ describe("identifierTypeChanges", () => {
     const tpl = (visibility: string) => ({
       key: "objects",
       label: "Objects",
+      organizationId: ORG,
       appliesTo: ["object"],
       fields: [
         {

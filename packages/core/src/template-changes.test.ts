@@ -29,7 +29,7 @@ function field(extra: Record<string, unknown> = {}): Record<string, unknown> {
 }
 
 function template(...fields: Record<string, unknown>[]): Record<string, unknown> {
-  return { key: "t", label: "T", appliesTo: ["object"], fields };
+  return { key: "t", label: "T", organizationId: ORG, appliesTo: ["object"], fields };
 }
 
 function record(id: string, fields: Record<string, unknown>): Record<string, unknown> {

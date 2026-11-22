@@ -10,15 +10,25 @@ import {
   isDublinCoreTerm,
   makeIdentifierChecker,
   standardPreset,
+  templateFromPreset,
   validateRecord,
   validateTemplate,
   type CatalogRecord,
   type FieldTemplate,
+  type TemplatePreset,
   type TemplateCheckOptions,
   newOrganizationId,
 } from "./index.js";
 
 const ORG = newOrganizationId();
+/** A preset as this organization's template. */
+function own(preset: TemplatePreset): FieldTemplate {
+  return { ...preset, organizationId: ORG };
+}
+
+function codesOf(r: { ok: boolean; issues?: readonly { code: string }[] }): string[] {
+  return r.ok ? [] : (r.issues ?? []).map((i) => i.code);
+}
 
 const ID = "3f1c2a9e-8b7d-4c6e-9a1b-2d3e4f5a6b7c";
 const T = "2026-11-20T16:05:00.000Z";
@@ -28,7 +38,7 @@ function isDeepFrozen(value: unknown): boolean {
   return Object.isFrozen(value) && Object.values(value).every(isDeepFrozen);
 }
 
-function fieldOf(preset: FieldTemplate, key: string) {
+function fieldOf(preset: TemplatePreset, key: string) {
   const f = preset.fields.find((x) => x.key === key);
   if (f === undefined) throw new Error(`no field ${key}`);
   return f;
@@ -62,11 +72,20 @@ describe("standard presets", () => {
   });
 
   it.each(STANDARD_PRESETS.map((p) => [p.key, p] as const))(
-    "%s passes validateTemplate unchanged",
+    "%s becomes a valid template of an organization unchanged",
     (_key, preset) => {
-      const result = validateTemplate(preset);
+      const result = templateFromPreset(preset, ORG);
       expect(result.ok ? [] : result.issues).toEqual([]);
-      if (result.ok) expect(result.value).toEqual(preset);
+      if (result.ok) expect(result.value).toEqual({ ...preset, organizationId: ORG });
+    },
+  );
+
+  it.each(STANDARD_PRESETS.map((p) => [p.key, p] as const))(
+    "%s has no organization, so it can't be used as a template itself",
+    (_key, preset) => {
+      expect(Object.hasOwn(preset, "organizationId")).toBe(false);
+      const result = validateTemplate(preset);
+      expect(result.ok ? [] : result.issues.map((i) => i.code)).toEqual(["invalid_organization"]);
     },
   );
 
@@ -93,7 +112,51 @@ describe("standard presets", () => {
       visibility: "public",
       inherited: false,
     });
-    expect(validateTemplate(copy).ok).toBe(true);
+    expect(templateFromPreset(copy, ORG).ok).toBe(true);
+  });
+
+  it("templateFromPreset needs a real organization ID", () => {
+    for (const bad of [undefined, "", "org", ORG.toUpperCase(), 1, null]) {
+      const r = templateFromPreset(DACS_ARCHIVAL_UNIT_PRESET, bad);
+      expect(r.ok ? [] : r.issues.map((i) => i.code)).toEqual(["invalid_organization"]);
+    }
+  });
+
+  it("templateFromPreset won't move a template to another organization", () => {
+    const mine = templateFromPreset(DACS_ARCHIVAL_UNIT_PRESET, ORG);
+    if (!mine.ok) throw new Error("bad fixture");
+    const r = templateFromPreset(mine.value, newOrganizationId());
+    expect(r.ok ? [] : r.issues.map((i) => i.code)).toEqual(["has_organization"]);
+  });
+
+  it("templateFromPreset runs no getters and refuses Proxies and non-objects", () => {
+    let ran = false;
+    const sneaky = { ...DACS_ARCHIVAL_UNIT_PRESET };
+    Object.defineProperty(sneaky, "label", {
+      get: () => {
+        ran = true;
+        return "Label";
+      },
+      enumerable: true,
+    });
+    const r = templateFromPreset(sneaky, ORG);
+    expect(r.ok ? [] : r.issues.map((i) => i.code)).toEqual(["not_plain_data"]);
+    expect(ran).toBe(false);
+    expect(codesOf(templateFromPreset(new Proxy(DACS_ARCHIVAL_UNIT_PRESET, {}), ORG))).toEqual([
+      "not_an_object",
+    ]);
+    expect(codesOf(templateFromPreset([DACS_ARCHIVAL_UNIT_PRESET], ORG))).toEqual([
+      "not_an_object",
+    ]);
+    expect(codesOf(templateFromPreset("dacs-archival-unit", ORG))).toEqual(["not_an_object"]);
+  });
+
+  it("templateFromPreset copies, so later changes to the preset object aren't seen", () => {
+    const source = JSON.parse(JSON.stringify(DACS_ARCHIVAL_UNIT_PRESET)) as { label: string };
+    const r = templateFromPreset(source, ORG);
+    source.label = "Changed";
+    expect(r.ok && r.value.label).toBe(DACS_ARCHIVAL_UNIT_PRESET.label);
+    expect(r.ok && Object.isFrozen(r.value)).toBe(true);
   });
 
   it("each describes the right record kind", () => {
@@ -236,7 +299,7 @@ describe("visibility", () => {
   );
 
   it("staff-only fields are exactly the ones chosen", () => {
-    const staff = (p: FieldTemplate) =>
+    const staff = (p: TemplatePreset) =>
       p.fields.filter((f) => f.visibility === "staff").map((f) => f.key);
     expect(staff(DACS_ARCHIVAL_UNIT_PRESET)).toEqual([
       "custodial_history",
@@ -336,19 +399,19 @@ describe("records checked against the presets", () => {
     expect(
       checkRecordAgainstTemplate(
         record("archival_unit", fields),
-        DACS_ARCHIVAL_UNIT_PRESET,
+        own(DACS_ARCHIVAL_UNIT_PRESET),
         withIds,
       ),
     ).toEqual([]);
     const issues = checkRecordAgainstTemplate(
       record("archival_unit", { date: "1909" }),
-      DACS_ARCHIVAL_UNIT_PRESET,
+      own(DACS_ARCHIVAL_UNIT_PRESET),
     );
     expect(issues.map((i) => i.path.join("."))).toContain("fields.reference_code");
     // Inherited elements may come from a unit higher up.
     const saving = checkRecordAgainstTemplate(
       record("archival_unit", { date: "1909" }),
-      DACS_ARCHIVAL_UNIT_PRESET,
+      own(DACS_ARCHIVAL_UNIT_PRESET),
       { allowMissingInherited: true },
     );
     expect(saving.map((i) => i.path.join("."))).not.toContain("fields.repository");
@@ -363,12 +426,12 @@ describe("records checked against the presets", () => {
       [RIGHTS_FIELD_KEY]: RIGHTS,
     };
     expect(
-      checkRecordAgainstTemplate(record("object", fields), SPECTRUM_OBJECT_PRESET, withIds),
+      checkRecordAgainstTemplate(record("object", fields), own(SPECTRUM_OBJECT_PRESET), withIds),
     ).toEqual([]);
     expect(
       checkRecordAgainstTemplate(
         record("object", { ...fields, acquisition_method: "stolen" }),
-        SPECTRUM_OBJECT_PRESET,
+        own(SPECTRUM_OBJECT_PRESET),
         withIds,
       ).map((i) => i.code),
     ).toEqual(["not_an_option"]);
@@ -381,10 +444,12 @@ describe("records checked against the presets", () => {
       [RIGHTS_FIELD_KEY]: RIGHTS,
     };
     expect(
-      checkRecordAgainstTemplate(record("digital_asset", fields), DIGITAL_ASSET_PRESET),
+      checkRecordAgainstTemplate(record("digital_asset", fields), own(DIGITAL_ASSET_PRESET)),
     ).toEqual([]);
     expect(
-      checkRecordAgainstTemplate(record("object", {}), DIGITAL_ASSET_PRESET).map((i) => i.code),
+      checkRecordAgainstTemplate(record("object", {}), own(DIGITAL_ASSET_PRESET)).map(
+        (i) => i.code,
+      ),
     ).toEqual(["wrong_template"]);
   });
 });

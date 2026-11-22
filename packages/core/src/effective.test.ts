@@ -62,7 +62,7 @@ function field(def: Def): FieldDefinition {
 }
 
 function template(fields: readonly FieldDefinition[], key = "archive"): FieldTemplate {
-  return { key, label: key, appliesTo: ["archival_unit", "object"], fields };
+  return { key, label: key, organizationId: ORG, appliesTo: ["archival_unit", "object"], fields };
 }
 
 /** The template most tests use: the mockup's fields. */

@@ -390,6 +390,7 @@ describe("controlledTermChecker with checkRecordAgainstTemplate", () => {
     const r = validateTemplate({
       key: "sample-photo",
       label: "Photograph",
+      organizationId: ORG,
       appliesTo: ["object"],
       fields: [
         {

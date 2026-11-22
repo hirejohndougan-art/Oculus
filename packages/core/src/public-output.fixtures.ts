@@ -66,6 +66,7 @@ export function template(fields: readonly FieldDefinition[] = FIELDS, key = "out
   return {
     key,
     label: key,
+    organizationId: ORG,
     appliesTo: ["object", "archival_unit", "digital_asset", "agent", "place", "event"],
     fields,
   };

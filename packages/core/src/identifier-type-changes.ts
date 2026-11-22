@@ -564,6 +564,7 @@ function readUse(input: unknown, type: IdentifierType, listed = true): Validated
     ["identifierTypes", typesRead.value],
     ["identifiers", identifiers.value],
     ["records", records.value],
+    ["templates", templateList ?? []],
   ] as const) {
     const owner = oneOrganization([type, ...list]);
     if (owner === "mixed") {

@@ -9,9 +9,11 @@
  * - `dublin-core-digital-asset`: digital assets (scans, recordings,
  *   born-digital files) described with Dublin Core terms.
  *
- * They are plain, frozen data: an admin copies one and edits it in the
- * browser, and the copy goes through `validateTemplate` like any other
- * template. Nothing here is for one organization; a historical society that
+ * They are plain, frozen data with no organization: an organization's
+ * template is made from one with `templateFromPreset`, which adds the
+ * organization and validates the copy like any other template (D-030,
+ * T-019a). The admin then edits that copy in the browser. Nothing here is
+ * for one organization; a historical society that
  * keeps both archives and objects (such as the Dickinson Historical Society)
  * uses the DACS and Spectrum presets side by side, with the digital asset
  * preset for its scans.
@@ -49,7 +51,18 @@
  * `dublin-core.ts`, not in `standards` here.
  */
 import { RIGHTS_FIELD_KEY } from "./rights.js";
-import type { FieldDefinition, FieldTemplate, StandardMapping } from "./templates.js";
+import { types } from "node:util";
+import { issue, isPlainObject, type Validated } from "./issues.js";
+import { isOrganizationId } from "./organizations.js";
+import {
+  validateTemplate,
+  type FieldDefinition,
+  type FieldTemplate,
+  type StandardMapping,
+} from "./templates.js";
+
+/** A starting template with no organization yet (`templateFromPreset`). */
+export type TemplatePreset = Omit<FieldTemplate, "organizationId">;
 
 const DC = "http://purl.org/dc/terms/";
 
@@ -826,7 +839,7 @@ const DIGITAL_ASSET_FIELDS: readonly FieldDefinition[] = [
 
 // ---------------------------------------------------------------------------
 
-export const DACS_ARCHIVAL_UNIT_PRESET: FieldTemplate = deepFreeze({
+export const DACS_ARCHIVAL_UNIT_PRESET: TemplatePreset = deepFreeze({
   key: "dacs-archival-unit",
   label: "Archival unit (DACS)",
   description:
@@ -835,7 +848,7 @@ export const DACS_ARCHIVAL_UNIT_PRESET: FieldTemplate = deepFreeze({
   fields: DACS_FIELDS,
 });
 
-export const SPECTRUM_OBJECT_PRESET: FieldTemplate = deepFreeze({
+export const SPECTRUM_OBJECT_PRESET: TemplatePreset = deepFreeze({
   key: "spectrum-object",
   label: "Museum object (Spectrum)",
   description:
@@ -844,7 +857,7 @@ export const SPECTRUM_OBJECT_PRESET: FieldTemplate = deepFreeze({
   fields: SPECTRUM_FIELDS,
 });
 
-export const DIGITAL_ASSET_PRESET: FieldTemplate = deepFreeze({
+export const DIGITAL_ASSET_PRESET: TemplatePreset = deepFreeze({
   key: "dublin-core-digital-asset",
   label: "Digital asset (Dublin Core)",
   description:
@@ -854,17 +867,90 @@ export const DIGITAL_ASSET_PRESET: FieldTemplate = deepFreeze({
 });
 
 /** Every built-in preset, in the order the admin screens offer them. */
-export const STANDARD_PRESETS: readonly FieldTemplate[] = Object.freeze([
+export const STANDARD_PRESETS: readonly TemplatePreset[] = Object.freeze([
   DACS_ARCHIVAL_UNIT_PRESET,
   SPECTRUM_OBJECT_PRESET,
   DIGITAL_ASSET_PRESET,
 ]);
 
-const BY_KEY: ReadonlyMap<string, FieldTemplate> = new Map(STANDARD_PRESETS.map((p) => [p.key, p]));
+const BY_KEY: ReadonlyMap<string, TemplatePreset> = new Map(
+  STANDARD_PRESETS.map((p) => [p.key, p]),
+);
 
 /** The built-in preset with this key, or undefined. Never throws. */
-export function standardPreset(key: unknown): FieldTemplate | undefined {
+export function standardPreset(key: unknown): TemplatePreset | undefined {
   return typeof key === "string" ? BY_KEY.get(key) : undefined;
+}
+
+/**
+ * An organization's own template made from a preset: a copy of `preset`
+ * with `organizationId` added, validated with `validateTemplate`. `preset`
+ * may be a built-in preset or any template-shaped value without an
+ * organization (one that already names an organization is refused, so a
+ * template can't be moved to another organization by copying it this way).
+ * Never throws.
+ */
+export function templateFromPreset(
+  preset: unknown,
+  organizationId: unknown,
+): Validated<FieldTemplate> {
+  try {
+    if (types.isProxy(preset) || !isPlainObject(preset)) {
+      return {
+        ok: false,
+        issues: [issue([], "not_an_object", "A preset must be a plain object.")],
+      };
+    }
+    if (!isOrganizationId(organizationId)) {
+      return {
+        ok: false,
+        issues: [
+          issue(
+            ["organizationId"],
+            "invalid_organization",
+            "A template made from a preset belongs to one organization: organizationId must be an organization ID.",
+          ),
+        ],
+      };
+    }
+    if (Object.hasOwn(preset, "organizationId")) {
+      return {
+        ok: false,
+        issues: [
+          issue(
+            ["organizationId"],
+            "has_organization",
+            "This already belongs to an organization. Presets have none; copy the template within its own organization instead.",
+          ),
+        ],
+      };
+    }
+    // Copy the top level by descriptor, so no getter runs; validateTemplate
+    // then reads the copy as plain data, refusing getters and Proxies inside.
+    const copy: Record<string, unknown> = {};
+    for (const key of Reflect.ownKeys(preset)) {
+      const slot = Object.getOwnPropertyDescriptor(preset, key);
+      if (typeof key === "symbol" || slot === undefined || !("value" in slot) || !slot.enumerable) {
+        return {
+          ok: false,
+          issues: [issue([], "not_plain_data", "A preset must hold only plain data.")],
+        };
+      }
+      Object.defineProperty(copy, key, {
+        value: slot.value,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    }
+    copy.organizationId = organizationId;
+    return validateTemplate(copy);
+  } catch {
+    return {
+      ok: false,
+      issues: [issue([], "unreadable", "This preset could not be read as plain data.")],
+    };
+  }
 }
 
 function deepFreeze<T>(value: T): T {

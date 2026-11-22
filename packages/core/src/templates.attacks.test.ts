@@ -38,7 +38,7 @@ function field(extra: Record<string, unknown> = {}): Record<string, unknown> {
 }
 
 function base(fields: unknown[] = [field()]): Record<string, unknown> {
-  return { key: "t", label: "T", appliesTo: ["object"], fields };
+  return { key: "t", label: "T", organizationId: ORG, appliesTo: ["object"], fields };
 }
 
 describe("hostile templates", () => {

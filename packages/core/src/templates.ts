@@ -62,6 +62,14 @@
  * (`template_mismatch`), never checked against it: a record moved silently
  * to another template could have its staff values published under a key the
  * other template makes public.
+ *
+ * **A template belongs to one organization** (`organizationId`, D-019,
+ * D-030, T-019a). Each organization has its own templates, so a template of
+ * another organization is never used for a record: `templateOfRecord` (and
+ * so the record check, `effectiveRecord` and `publicOutput`) refuses it with
+ * `wrong_organization`, and `indexTemplates` refuses a list holding two
+ * organizations' templates (`mixed_organizations`). Presets (presets.ts)
+ * have no organization; `templateFromPreset` makes an organization's copy.
  */
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import {
@@ -90,6 +98,12 @@ import {
   type RecordKind,
 } from "./records.js";
 import { types } from "node:util";
+import {
+  isOrganizationId,
+  mixedOrganizationsIssue,
+  oneOrganization,
+  type OrganizationId,
+} from "./organizations.js";
 
 export const FIELD_KINDS = [
   "text",
@@ -150,8 +164,10 @@ export interface FieldDefinition {
 }
 
 export interface FieldTemplate {
-  /** Stable key for the template, e.g. `dacs-archival-unit`. */
+  /** Stable key for the template, e.g. `dacs-archival-unit`. Unique within its organization. */
   readonly key: string;
+  /** The organization the template belongs to (D-030). Never changes. */
+  readonly organizationId: OrganizationId;
   readonly label: string;
   readonly description?: string;
   /** The record kinds this template can describe. */
@@ -209,6 +225,7 @@ const LINE_BREAKS = /[\t\n\r\u2028\u2029]/;
 
 const TEMPLATE_KEYS: ReadonlySet<string> = new Set([
   "key",
+  "organizationId",
   "label",
   "description",
   "appliesTo",
@@ -286,7 +303,20 @@ export function webUrlProblem(text: string): string | undefined {
  * row) and return a frozen copy, or every problem found. Never throws.
  */
 export function validateTemplate(input: unknown): Validated<FieldTemplate> {
-  return readTemplate(input, IDENTIFIER_CODE);
+  return readTemplate(input, IDENTIFIER_CODE, true);
+}
+
+/**
+ * As `validateTemplate`, but `organizationId` may be left out (if present it
+ * must still be valid), so a preset can be checked too. Only for checks
+ * about a template's fields, such as a Dublin Core mapping (dublin-core.ts);
+ * never for choosing the template a record follows. Not exported from the
+ * package. Never throws.
+ */
+export function validateTemplateShape(
+  input: unknown,
+): Validated<FieldTemplate | Omit<FieldTemplate, "organizationId">> {
+  return readTemplate(input, IDENTIFIER_CODE, false);
 }
 
 /**
@@ -298,7 +328,7 @@ export function validateTemplate(input: unknown): Validated<FieldTemplate> {
  * refuses them. Never throws.
  */
 export function validateLegacyTemplate(input: unknown): Validated<FieldTemplate> {
-  return readTemplate(input, LEGACY_IDENTIFIER_CODE);
+  return readTemplate(input, LEGACY_IDENTIFIER_CODE, true);
 }
 
 /** The most templates `legacyTemplateIssues` looks through at once. */
@@ -396,9 +426,13 @@ export function legacyTemplateIssues(
   }
 }
 
-function readTemplate(input: unknown, identifierCode: CodeRule): Validated<FieldTemplate> {
+function readTemplate(
+  input: unknown,
+  identifierCode: CodeRule,
+  needsOrganization: boolean,
+): Validated<FieldTemplate> {
   try {
-    return checkTemplate(input, identifierCode);
+    return checkTemplate(input, identifierCode, needsOrganization);
   } catch {
     return {
       ok: false,
@@ -407,7 +441,11 @@ function readTemplate(input: unknown, identifierCode: CodeRule): Validated<Field
   }
 }
 
-function checkTemplate(input: unknown, identifierCode: CodeRule): Validated<FieldTemplate> {
+function checkTemplate(
+  input: unknown,
+  identifierCode: CodeRule,
+  needsOrganization: boolean,
+): Validated<FieldTemplate> {
   if (types.isProxy(input) || !isPlainObject(input)) {
     return {
       ok: false,
@@ -425,6 +463,16 @@ function checkTemplate(input: unknown, identifierCode: CodeRule): Validated<Fiel
       ["key"],
       "invalid_key",
       "The template key is 1 to 64 lower case letters, digits, hyphens and underscores, starting with a letter.",
+    );
+  }
+  if (
+    (needsOrganization || t.organizationId !== undefined) &&
+    !isOrganizationId(t.organizationId)
+  ) {
+    issues.add(
+      ["organizationId"],
+      "invalid_organization",
+      "Every template belongs to one organization: organizationId must be an organization ID.",
     );
   }
   checkLabel(t.label, ["label"], "The template", issues);
@@ -805,6 +853,18 @@ export interface TemplateRegistry {
 /** Registries made by `indexTemplates`, with their validated templates by key. */
 const REGISTRIES = new WeakMap<object, ReadonlyMap<string, FieldTemplate>>();
 
+/** True when `template` and `record` belong to the same organization. */
+function sameOrganization(template: FieldTemplate, record: CatalogRecord): boolean {
+  return oneOrganization([template, record]) === template.organizationId;
+}
+
+const WRONG_ORGANIZATION = (key: string) =>
+  issue(
+    ["organizationId"],
+    "wrong_organization",
+    `The template ${shown(key)} belongs to another organization than this record. Each organization uses only its own templates.`,
+  );
+
 /**
  * Validate a list of templates once and index them by key, for
  * `checkRecordAgainstTemplate`, `effectiveRecord` and `publicOutput`. Each
@@ -813,7 +873,9 @@ const REGISTRIES = new WeakMap<object, ReadonlyMap<string, FieldTemplate>>();
  * getter or Proxy refuses the whole list: a registry that quietly left one
  * out could not say which template a record follows. The keys come from the
  * templates themselves, never from a separate map that could disagree with
- * them. Never throws.
+ * them. All the templates must belong to one organization
+ * (`mixed_organizations`): a registry is one organization's templates.
+ * Never throws.
  */
 export function indexTemplates(templates: unknown): Validated<TemplateRegistry> {
   try {
@@ -829,6 +891,7 @@ export function indexTemplates(templates: unknown): Validated<TemplateRegistry> 
       );
     }
     const byKey = new Map<string, FieldTemplate>();
+    const owners: FieldTemplate[] = [];
     const issues = new IssueList();
     for (let i = 0; i < length && !issues.full; i += 1) {
       // Read each slot as a plain data property, so a getter can't run.
@@ -851,8 +914,12 @@ export function indexTemplates(templates: unknown): Validated<TemplateRegistry> 
         continue;
       }
       byKey.set(key, checked.value);
+      owners.push(checked.value);
     }
     if (issues.count > 0) return { ok: false, issues: issues.items };
+    if (oneOrganization(owners) === "mixed") {
+      return { ok: false, issues: [mixedOrganizationsIssue([], "These templates")] };
+    }
     const registry: TemplateRegistry = Object.freeze({ size: byKey.size });
     REGISTRIES.set(registry, byKey);
     return { ok: true, value: registry };
@@ -907,7 +974,8 @@ export function storedTemplateKey(record: unknown): Validated<string | undefined
 /**
  * The validated template `record` follows: from a registry, the one its
  * `templateKey` names; otherwise `given`, validated, which must have the
- * record's `templateKey` (if it has one) as its key. For this module,
+ * record's `templateKey` (if it has one) as its key. Either way the template
+ * must belong to the record's organization (`wrong_organization`). For this module,
  * `effective.ts` and `public-output.ts` (not exported from the package).
  * Messages name template keys only, never a record's title or values.
  * Never throws.
@@ -934,6 +1002,9 @@ export function templateOfRecord(record: CatalogRecord, given: unknown): Validat
           `There is no template with the key ${shown(stored)} in the registry.`,
         );
       }
+      if (!sameOrganization(template, record)) {
+        return { ok: false, issues: [WRONG_ORGANIZATION(template.key)] };
+      }
       return { ok: true, value: template };
     }
     const checked = validateTemplate(given);
@@ -950,6 +1021,9 @@ export function templateOfRecord(record: CatalogRecord, given: unknown): Validat
         "template_mismatch",
         `This record follows the template ${shown(stored)}, not ${shown(checked.value.key)}, so it can't be checked against that one.`,
       );
+    }
+    if (!sameOrganization(checked.value, record)) {
+      return { ok: false, issues: [WRONG_ORGANIZATION(checked.value.key)] };
     }
     return checked;
   } catch {
@@ -1011,6 +1085,8 @@ export interface TemplateCheckOptions {
  * have it). A template given directly must have the record's `templateKey`
  * as its key (`template_mismatch`); a record with no `templateKey` (stored
  * before records named their template) is checked against it as before.
+ * The template must belong to the record's organization
+ * (`wrong_organization`, D-030).
  *
  * Optional settings, in the template and in `options`, are read only as own
  * properties, so a polluted `Object.prototype` can't change them.

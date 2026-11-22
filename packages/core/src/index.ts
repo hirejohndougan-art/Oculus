@@ -211,7 +211,9 @@ export {
   DIGITAL_ASSET_PRESET,
   STANDARD_PRESETS,
   standardPreset,
+  templateFromPreset,
 } from "./presets.js";
+export type { TemplatePreset } from "./presets.js";
 
 export {
   DCTERMS_NAMESPACE,

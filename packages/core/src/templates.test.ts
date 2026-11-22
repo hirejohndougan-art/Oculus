@@ -59,6 +59,7 @@ function fullTemplate(): Record<string, unknown> {
     key: "sample-photo",
     label: "Photograph",
     description: "For single photographs and postcards.",
+    organizationId: ORG,
     appliesTo: ["archival_unit", "object"],
     fields: [
       field({
@@ -433,6 +434,7 @@ describe("validateTemplate: field definitions", () => {
     const r = validateTemplate({
       key: "Bad Key",
       label: "",
+      organizationId: ORG,
       appliesTo: ["thing"],
       fields: [field({ kind: "number", visibility: "everyone" })],
     });
@@ -828,6 +830,7 @@ describe("template registries and record template keys (D-029)", () => {
   const objects = {
     key: "objects",
     label: "Objects",
+    organizationId: ORG,
     appliesTo: ["object"],
     fields: [
       {
