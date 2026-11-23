@@ -48,6 +48,20 @@
  *   identifier sets as they are now; `identifiers_unknown` without them),
  *   and every number must still be one (`identifier_changed`), so a number
  *   retired or moved since isn't published from a kept view.
+ * - **A record whose deed of gift isn't signed is held back** (T-016, D-043).
+ *   `accessions` (the organization's register from `indexAccessions`) is
+ *   passed to `effectivePublishIssues`, which refuses an object, archival
+ *   unit or digital asset without it (`accessions_unknown`) and one an
+ *   accession with a deed `missing` or `sent` produced, or produced an
+ *   ancestor or the record a digital asset represents (`deed_not_signed`).
+ *   With `records`, what a digital asset represents is found again in them.
+ *   A link to an object, archival unit or digital asset goes out live only
+ *   when `records` is given and the linked record, its ancestry and what it
+ *   represents, all found in `records` now, are known to the register and
+ *   none is held back; otherwise it goes out as its label only, as if
+ *   unpublished (so a page published without `accessions` or `records`
+ *   shows such links as labels). The check is only as fresh as the register: make it at
+ *   publish time. Nothing of an accession or a donor is read here.
  * - **Publishing is the caller's statement.** Records have no publish state
  *   yet, so the caller passes `published`, the IDs of every record that is
  *   published. The record itself must be in it (`not_published`). Public
@@ -115,8 +129,11 @@ import { publicViewOrigin } from "./effective-brand.js";
 import {
   MAX_RECORD_SET,
   currentAncestry,
+  currentRepresented,
+  deedIssuesNow,
   effectivePublishIssues,
   isTemplateSource,
+  linkDeedCheck,
   templateFromSource,
   type EffectiveRecord,
   type PublicRecord,
@@ -211,7 +228,9 @@ export interface PublishOptions {
    * values): an ancestor's value changed or emptied since, or a record moved
    * to another parent or level, would otherwise still publish the old
    * inherited values. Only `records` and `templateFor` together catch every
-   * change to a kept view (D-021).
+   * change to a kept view (D-021). Links to objects, archival units and
+   * digital assets are deed-checked in it too, and without it go out as
+   * their labels only (D-043).
    */
   readonly records?: RecordLookup | readonly CatalogRecord[];
   /**
@@ -227,6 +246,14 @@ export interface PublishOptions {
    * number twice: `invalid_identifiers`).
    */
   readonly identifiers?: readonly RecordIdentifiers[];
+  /**
+   * The organization's accession register from `indexAccessions`, as it is
+   * now (D-043). Required for an object, archival unit or digital asset
+   * (`accessions_unknown` without it): output is refused for a record held
+   * back because a deed of gift it needs isn't signed (`deed_not_signed`),
+   * checked against this register, never the one the view was made with.
+   */
+  readonly accessions?: unknown;
 }
 
 /** Dublin Core as term → values, in order (see the module header). */
@@ -461,15 +488,29 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
       "This is not a public view from publicView, so it can't be published.",
     );
   }
-  const { baseUrl, published, checkers, currentTemplate, templateFor, records, identifiers } =
-    readOptions(options);
+  const {
+    baseUrl,
+    published,
+    checkers,
+    currentTemplate,
+    templateFor,
+    records,
+    identifiers,
+    accessions,
+  } = readOptions(options);
   if (!published.has(view.id)) {
     fail([], "not_published", "This record is not in the published list, so it can't be output.");
   }
   // The effective record the view was made from, from the mark beside it.
   const effective = origin.effective as EffectiveRecord;
-  const blocked = effectivePublishIssues(effective);
+  // The deed check fails closed without the register (D-043).
+  const blocked = effectivePublishIssues(effective, accessions === undefined ? {} : { accessions });
   if (blocked.length > 0) throw new OutputError(blocked);
+  // With `records`, what a digital asset shows is found again as it is now.
+  if (records !== undefined && effective.record.kind === "digital_asset") {
+    const now = deedIssuesNow(effective, accessions, currentRepresented(effective.record, records));
+    if (now.length > 0) throw new OutputError(now);
+  }
   const template = origin.template;
   // Checked again at the boundary: every template the view was built with is
   // the one its record names (D-029).
@@ -551,12 +592,19 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
   const recordUrl = safeText(baseUrl + view.id, ["id"], budget);
   const terms = new Map<DublinCoreTerm, OutValue[]>();
   terms.set("title", [outValue(safeText(view.title, ["title"], budget))]);
+  // Links are deed-checked against the records as they are now (D-043).
+  const deedClears = linkDeedCheck(accessions, records, organizationId);
   const linkable = (def: FieldDefinition, id: RecordId): boolean => {
     // Never the record itself, and only a published record of this
     // organization, of a kind the field allows (D-016, D-030, D-039).
     if (id === view.id || !published.has(id)) return false;
     const kind = linkTargetKind(linkCheckers.get(def.kind), organizationId, id);
-    return kind !== undefined && linkKindsOf(def).includes(kind);
+    if (kind === undefined || !linkKindsOf(def).includes(kind)) return false;
+    // A record a deed holds back, or one above it or that it shows, is
+    // treated as unpublished (D-043), and so is one the register or the
+    // current records can't vouch for: without `records`, an object,
+    // archival unit or digital asset is never linked.
+    return deedClears(id, kind);
   };
   for (const { field, term } of checked.value.entries) {
     const shownValue = entries.get(field);
@@ -955,6 +1003,7 @@ const OPTION_KEYS: ReadonlySet<string> = new Set([
   "templateFor",
   "records",
   "identifiers",
+  "accessions",
 ]);
 
 interface ReadOptions {
@@ -965,6 +1014,7 @@ interface ReadOptions {
   readonly templateFor: TemplateSource | undefined;
   readonly records: unknown;
   readonly identifiers: unknown;
+  readonly accessions: unknown;
 }
 
 function readOptions(options: unknown): ReadOptions {
@@ -993,7 +1043,18 @@ function readOptions(options: unknown): ReadOptions {
   const records = dataProp(options, "records");
   // Read once, when it is used.
   const identifiers = dataProp(options, "identifiers");
-  return { baseUrl, published, checkers, currentTemplate, templateFor, records, identifiers };
+  // Checked by effectivePublishIssues, which reads only its held record IDs.
+  const accessions = dataProp(options, "accessions");
+  return {
+    baseUrl,
+    published,
+    checkers,
+    currentTemplate,
+    templateFor,
+    records,
+    identifiers,
+    accessions,
+  };
 }
 
 /** An own data property, or undefined. A getter, hidden property or Proxy value fails. */

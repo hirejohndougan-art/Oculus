@@ -101,6 +101,7 @@
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import { RIGHTS_FIELD_KEY, rightsPublishIssues } from "./rights.js";
 import { markEffective, markPublicView } from "./effective-brand.js";
+import { deedHoldsOf } from "./accession-holds.js";
 import { shown } from "./plain-data.js";
 import { isOtherOrganizationsChecker, publicIdentifierTypesOf } from "./field-checkers.js";
 import { types } from "node:util";
@@ -221,6 +222,16 @@ export interface EffectiveOptions {
    * organization's public types is still refused by the identifier checker.
    */
   readonly identifiers?: readonly RecordIdentifiers[];
+}
+
+/** Options for `effectivePublishIssues`. */
+export interface PublishCheckOptions {
+  /**
+   * The organization's accession register from `indexAccessions`, made at
+   * publish time. Required to publish an object, archival unit or digital
+   * asset (D-043): without it they are refused (`accessions_unknown`).
+   */
+  readonly accessions?: unknown;
 }
 
 /**
@@ -395,13 +406,69 @@ export function effectiveRecord(
         "templateFor must be a registry from indexTemplates or a function.",
       );
     }
-    const up = ancestry(recordId, lookupFor(records));
+    const state = lookupFor(records);
+    const up = ancestry(recordId, state);
     const templates = templatesFor(up, templateFor);
     const checkers = ownSetting(options, "checkers");
     const identifiers = identifierSets(ownSetting(options, "identifiers"), up);
-    return { ok: true, value: compose(up, templates, checkers, identifiers) };
+    const effective = compose(up, templates, checkers, identifiers);
+    REPRESENTED.set(effective, representedIn(up[0], state));
+    return { ok: true, value: effective };
   } catch (error) {
     return failure(error);
+  }
+}
+
+/**
+ * For a digital asset, the record it represents and that record's ancestors
+ * (and so on, when what it represents is itself a digital asset that
+ * represents something), as the records set held them when the effective
+ * record was made; `null` when any of them couldn't be found or trusted.
+ * Absent for anything that represents nothing. Read by the deed check.
+ */
+const REPRESENTED = new WeakMap<object, readonly RecordId[] | null>();
+
+const MAX_REPRESENTS_HOPS = 8;
+
+/** The represented records' IDs, with their ancestries, or null when not all can be found. */
+function representedIn(
+  record: CatalogRecord | undefined,
+  state: LookupState,
+): readonly RecordId[] | null {
+  const ids: RecordId[] = [];
+  const seen = new Set<RecordId>();
+  let at = record;
+  for (let hop = 0; hop <= MAX_REPRESENTS_HOPS; hop += 1) {
+    if (at?.kind !== "digital_asset" || at.represents === undefined) {
+      return Object.freeze(ids);
+    }
+    if (seen.has(at.represents)) return Object.freeze(ids);
+    seen.add(at.represents);
+    let up: readonly CatalogRecord[];
+    try {
+      up = ancestry(at.represents, state);
+    } catch {
+      return null;
+    }
+    for (const r of up) ids.push(r.id);
+    at = up[0];
+  }
+  return null;
+}
+
+/**
+ * For `public-output.ts` only: what `record` represents, with ancestries, in
+ * `records` (a list or a lookup from `indexRecords`) as they are now, or null
+ * when any of it can't be found or trusted. Never throws.
+ */
+export function currentRepresented(
+  record: CatalogRecord,
+  records: unknown,
+): readonly RecordId[] | null {
+  try {
+    return representedIn(record, lookupFor(records));
+  } catch {
+    return null;
   }
 }
 
@@ -1035,10 +1102,27 @@ export function publicView(effective: EffectiveRecord): PublicRecord | undefined
  * that aren't public here don't (`rights_not_public`). Templates require the
  * `rights` field to be public (T-007a), so today that happens only for a
  * left-over `rights` value whose key isn't in the record's template; the
- * check also stands in case a staff rights field is ever allowed. Returns an
- * empty list when the rights can be published. Never throws.
+ * check also stands in case a staff rights field is ever allowed.
+ *
+ * **The deed check** (T-016, D-043) runs last. For an object, archival unit
+ * or digital asset, `options.accessions` must be the organization's register
+ * from `indexAccessions`, made at publish time: without it the record is
+ * refused (`accessions_unknown`), with anything else (`invalid_accessions`)
+ * or another organization's register (`mixed_organizations`) too. A record
+ * the register holds back, or whose ancestor or represented record it holds
+ * back, is refused (`deed_not_signed`); the message names no donor,
+ * accession or number. The record, its current ancestry and, for a
+ * digital asset, the record it represents with that record's ancestry (from
+ * the records `effectiveRecord` was given; `represented_record_unknown` when
+ * they aren't there) must all be records the register knows
+ * (`accessions_out_of_date`). The check is only as fresh as the register:
+ * make it at publish time, as T-034 will. Returns an empty list when the record can be
+ * published. Never throws.
  */
-export function effectivePublishIssues(effective: EffectiveRecord): readonly Issue[] {
+export function effectivePublishIssues(
+  effective: EffectiveRecord,
+  options?: PublishCheckOptions,
+): readonly Issue[] {
   try {
     const view = publicView(effective);
     if (view === undefined) {
@@ -1057,7 +1141,8 @@ export function effectivePublishIssues(effective: EffectiveRecord): readonly Iss
       return Object.freeze(withheld.map((n) => Object.freeze(issue(n.path, n.code, n.message))));
     }
     const found = rightsPublishIssues(view);
-    if (found.length === 0) return found;
+    // Last, so every other reason is reported first; any reason blocks.
+    if (found.length === 0) return deedIssues(effective, options);
     const hidden = effective.entries.some(
       (e) => e.key === RIGHTS_FIELD_KEY && (e.visibility !== "public" || !e.inTemplate),
     );
@@ -1076,6 +1161,147 @@ export function effectivePublishIssues(effective: EffectiveRecord): readonly Iss
       Object.freeze(issue([], "unreadable", "The effective record could not be read.")),
     ]);
   }
+}
+
+function representsSomething(record: CatalogRecord): boolean {
+  return record.kind === "digital_asset" && record.represents !== undefined;
+}
+
+/**
+ * For `public-output.ts` only: the deed check again, with what a digital
+ * asset represents found in the records as they are now
+ * (`currentRepresented`). Never throws.
+ */
+export function deedIssuesNow(
+  effective: EffectiveRecord,
+  accessions: unknown,
+  represented: readonly RecordId[] | null,
+): readonly Issue[] {
+  try {
+    return deedIssues(effective, accessions === undefined ? {} : { accessions }, represented);
+  } catch {
+    return Object.freeze([
+      Object.freeze(issue([], "unreadable", "The effective record could not be read.")),
+    ]);
+  }
+}
+
+/**
+ * For `public-output.ts` only: the deed check for link targets (D-043). The
+ * function it returns says whether a link to `id` (whose kind, as the link
+ * checker saw it, is `kind`) may go out live as far as deeds go. A target of
+ * an accessioned kind, as the checker or the records now have it, may be
+ * linked only when `records` (a list or a lookup from `indexRecords`) is
+ * given and the target, its current ancestry and, for a digital asset, what
+ * it represents with that record's ancestry (found exactly as the record's
+ * own check finds them, with the same loop and hop rules) are all known to
+ * `accessions` (a register of `organizationId`) and none is held back.
+ * Anything that can't be found, read or trusted answers false. Never throws.
+ */
+export function linkDeedCheck(
+  accessions: unknown,
+  records: unknown,
+  organizationId: OrganizationId,
+): (id: RecordId, kind: string) => boolean {
+  const holds = deedHoldsOf(accessions);
+  let state: LookupState | undefined;
+  try {
+    state = records === undefined ? undefined : lookupFor(records);
+  } catch {
+    state = undefined;
+  }
+  return (id, kind) => {
+    try {
+      const got = state === undefined ? undefined : fetchRecord(state, id);
+      const now = got?.ok === true ? got.record : undefined;
+      // Not of an accessioned kind, by the checker or by the records now.
+      if (!ACCESSIONED.has(kind) && (now === undefined || !ACCESSIONED.has(now.kind))) {
+        return true;
+      }
+      if (holds?.organizationId !== organizationId) return false;
+      if (state === undefined || now === undefined) return false;
+      if (now.organizationId !== organizationId) return false;
+      const up = ancestry(id, state);
+      const shows = representedIn(up[0], state);
+      if (shows === null) return false;
+      const ids = [...up.map((r) => r.id), ...shows];
+      return ids.every((at) => holds.isKnown(at) && !holds.isHeld(at));
+    } catch {
+      return false;
+    }
+  };
+}
+
+/** The kinds an accession can produce, so the only ones the deed check applies to. */
+const ACCESSIONED: ReadonlySet<string> = new Set(["object", "archival_unit", "digital_asset"]);
+
+/**
+ * The deed check (D-043): fails closed. Reads only the register's
+ * organization and held record IDs (`accession-holds.ts`), never an
+ * accession. Throws only on unreadable options, which the caller turns
+ * into `unreadable`.
+ */
+function deedIssues(
+  effective: EffectiveRecord,
+  options: unknown,
+  represented?: readonly RecordId[] | null,
+): readonly Issue[] {
+  const refuse = (code: string, message: string): readonly Issue[] =>
+    Object.freeze([Object.freeze(issue(["accessions"], code, message))]);
+  let given: unknown;
+  try {
+    given = ownSetting(options, "accessions");
+  } catch {
+    return refuse("invalid_options", "The options must be a plain object { accessions }.");
+  }
+  const record = effective.record;
+  const needed = ACCESSIONED.has(record.kind);
+  if (given === undefined) {
+    return needed
+      ? refuse(
+          "accessions_unknown",
+          "Publishing this record needs the organization's accession register (indexAccessions), to check its deed of gift is signed.",
+        )
+      : Object.freeze([]);
+  }
+  const holds = deedHoldsOf(given);
+  if (holds === undefined) {
+    return refuse(
+      "invalid_accessions",
+      "The accessions option must be the register made by indexAccessions.",
+    );
+  }
+  if (holds.organizationId !== record.organizationId) {
+    return Object.freeze([
+      Object.freeze(mixedOrganizationsIssue(["accessions"], "This record and these accessions")),
+    ]);
+  }
+  if (!needed) return Object.freeze([]);
+  const ids: RecordId[] = effective.chain.map((step) => step.id);
+  // What a digital asset shows: the represented record's ancestors aren't in
+  // this record's chain, so they are found from the records too.
+  const shows = represented === undefined ? REPRESENTED.get(effective) : represented;
+  if (shows === null || (shows === undefined && representsSomething(record))) {
+    return refuse(
+      "represented_record_unknown",
+      "This digital asset represents a record that isn't in the records given (or one of its parents isn't), so its deed of gift can't be checked.",
+    );
+  }
+  ids.push(...(shows ?? []));
+  // A register that doesn't know a record can't say a deed doesn't hold it.
+  if (!ids.every((id) => holds.isKnown(id))) {
+    return refuse(
+      "accessions_out_of_date",
+      "The accession register doesn't know this record, a record above it or the record it shows. Make the register again from the organization's records as they are now.",
+    );
+  }
+  if (ids.some((id) => holds.isHeld(id))) {
+    return refuse(
+      "deed_not_signed",
+      "This record came from an accession whose deed of gift isn't signed yet, so it is held back from the public site. Mark the deed as signed in Deeds once the signed copy is on file.",
+    );
+  }
+  return Object.freeze([]);
 }
 
 /** The value the nearest ancestor gives for `field`, or undefined. */
