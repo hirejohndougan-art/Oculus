@@ -847,7 +847,17 @@ export function primaryIdentifier(identifiers: RecordIdentifiers): Identifier | 
  * (`mixed_organizations` otherwise, also for a set that names none), keyed
  * by record ID. A record ID listed twice is refused
  * (`duplicate_identifiers`): which of the two sets is the record's would be
- * a guess. Internal: not exported from the package. Never throws.
+ * a guess. Each set must also keep the rules a single set can be checked
+ * for without its types (`invalid_identifiers`): exactly one primary when
+ * it has current identifiers, and no number listed twice as current (by
+ * type and comparison key). A number both current and former is allowed
+ * (retired, then reinstated, as `retireIdentifier` keeps it). Whether each
+ * type exists and fits its format, and uniqueness across records, need the
+ * organization's types and every record: callers must pass sets already
+ * checked with `validateRecordIdentifiers` and `uniquenessIssues` on the
+ * save path. (A value of a type that isn't one of the organization's can't
+ * be published anyway: the identifier checker refuses it.) Internal: not
+ * exported from the package. Never throws.
  */
 export function readIdentifierSets(
   all: unknown,
@@ -856,6 +866,13 @@ export function readIdentifierSets(
   if (!snap.ok) return snap;
   const byRecord = new Map<RecordId, RecordIdentifiers>();
   for (const [index, set] of snap.value.sets.entries()) {
+    const broken = setRuleBroken(set);
+    if (broken !== undefined) {
+      return {
+        ok: false,
+        issues: [issue([index], "invalid_identifiers", broken)],
+      };
+    }
     if (byRecord.has(set.recordId)) {
       return {
         ok: false,
@@ -871,6 +888,23 @@ export function readIdentifierSets(
     byRecord.set(set.recordId, set);
   }
   return { ok: true, value: byRecord };
+}
+
+/** Why one set breaks a rule it can be checked for on its own, or undefined. Messages quote no values. */
+function setRuleBroken(set: RecordIdentifiers): string | undefined {
+  const primaries = set.current.filter((c) => c.primary).length;
+  if (set.current.length > 0 && primaries !== 1) {
+    return "A record's current identifiers must have exactly one primary.";
+  }
+  const current = new Set<string>();
+  for (const c of set.current) {
+    const key = `${c.type}\u0000${identifierKey(c.value)}`;
+    if (current.has(key)) return "A record lists the same current identifier twice.";
+    current.add(key);
+  }
+  // A number both current and former is allowed: it was retired and later
+  // reinstated, and `retireIdentifier` keeps its history (D-009).
+  return undefined;
 }
 
 /**

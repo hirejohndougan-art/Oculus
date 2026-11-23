@@ -44,8 +44,9 @@
  * - **Numbers live in `RecordIdentifiers`** (D-038). A view publishes an
  *   identifier value only when the record it came from held it as a current
  *   identifier when the view was built (`effectiveRecord`'s `identifiers`).
- *   With `identifiers` (the identifier sets as they are now), every
- *   published number must still be one (`identifier_changed`), so a number
+ *   A view holding any identifier value also needs `identifiers` here (the
+ *   identifier sets as they are now; `identifiers_unknown` without them),
+ *   and every number must still be one (`identifier_changed`), so a number
  *   retired or moved since isn't published from a kept view.
  * - **Publishing is the caller's statement.** Records have no publish state
  *   yet, so the caller passes `published`, the IDs of every record that is
@@ -201,10 +202,15 @@ export interface PublishOptions {
   readonly records?: RecordLookup | readonly CatalogRecord[];
   /**
    * The identifiers (`RecordIdentifiers`) as they are now, of the record and
-   * the ancestors its values come from, all of its organization. When
-   * given, output is refused unless every published identifier value is
-   * still one of the current identifiers of the record it came from
-   * (`identifier_changed`, naming the field, never the number) (D-038).
+   * the ancestors its values come from, all of its organization (D-038).
+   * Required when the view holds any identifier value (`identifiers_unknown`
+   * without it): output is refused unless every identifier value is still
+   * one of the current identifiers of the record it came from
+   * (`identifier_changed`, naming the field, never the number). The sets
+   * must already have passed `validateRecordIdentifiers` and
+   * `uniquenessIssues` on the save path; here only the rules one set can be
+   * checked for on its own are checked again (one primary, no current
+   * number twice: `invalid_identifiers`).
    */
   readonly identifiers?: readonly RecordIdentifiers[];
 }
@@ -485,7 +491,6 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
   // check and the type check below read the full values the view's entries
   // came from, in the effective record.
   const full = fullValues(view, effective, template);
-  if (identifiers !== undefined) stillHeld(identifiers, view, effective, template);
   const identifierChecker = isPlainObject(checkers) ? dataProp(checkers, "identifier") : undefined;
   // One organization's checker never vouches for another's numbers (D-030).
   if (isOtherOrganizationsChecker(identifierChecker, effective.record.organizationId)) {
@@ -529,6 +534,8 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
     else list.push(...values);
   }
 
+  // After the type checks, so a staff type is reported as such first.
+  stillHeld(identifiers, view, effective, template);
   const types = typesFor(view.kind, origin, terms.get("type") ?? []);
   const dublinCore = dublinCoreValues(terms, recordUrl, types);
   const jsonLd = jsonLdDocument(recordUrl, types, terms);
@@ -722,8 +729,10 @@ function fullValues(
 /**
  * Refuse unless every identifier value in the view is still one of the
  * current identifiers, in `given` (the caller's sets as they are now), of
- * the record it came from (D-038). Sets of another organization are refused
- * whole. Issues name the field only, never the number.
+ * the record it came from (D-038). A view with identifier values and no
+ * `given` is refused (`identifiers_unknown`): fail closed, as in
+ * `effectiveRecord`. Sets of another organization are refused whole.
+ * Issues name the field only, never the number.
  */
 function stillHeld(
   given: unknown,
@@ -731,6 +740,16 @@ function stillHeld(
   effective: EffectiveRecord,
   template: FieldTemplate,
 ): void {
+  const kinds = new Map(template.fields.map((f) => [f.key, f.kind]));
+  const numbered = view.entries.filter((e) => kinds.get(e.key) === "identifier");
+  if (given === undefined) {
+    if (numbered.length === 0) return;
+    fail(
+      ["identifiers"],
+      "identifiers_unknown",
+      "This record shows identifier values, so publishing needs the identifiers option (the records' identifiers as they are now), to check each number is still the record's.",
+    );
+  }
   const read = readIdentifierSets(given);
   if (!read.ok) {
     const code = read.issues[0]?.code;
@@ -738,12 +757,13 @@ function stillHeld(
       const mixed = mixedOrganizationsIssue(["identifiers"], "These records and identifiers");
       fail(mixed.path, mixed.code, mixed.message);
     }
+    if (code === "duplicate_identifiers" || code === "invalid_identifiers") {
+      fail(["identifiers"], code, read.issues[0]?.message ?? "These identifiers aren't valid.");
+    }
     fail(
       ["identifiers"],
-      code === "duplicate_identifiers" ? code : "invalid_options",
-      code === "duplicate_identifiers"
-        ? "Two sets of identifiers name the same record."
-        : "The identifiers option must be a list of records' identifiers.",
+      "invalid_options",
+      "The identifiers option must be a list of records' identifiers.",
     );
   }
   for (const set of read.value.values()) {
@@ -752,9 +772,7 @@ function stillHeld(
       fail(mixed.path, mixed.code, mixed.message);
     }
   }
-  const kinds = new Map(template.fields.map((f) => [f.key, f.kind]));
-  for (const entry of view.entries) {
-    if (kinds.get(entry.key) !== "identifier") continue;
+  for (const entry of numbered) {
     const source = effective.entries.find((e) => e.key === entry.key);
     const set = source === undefined ? undefined : read.value.get(source.from.id);
     const value: FieldValue | undefined = source?.value;

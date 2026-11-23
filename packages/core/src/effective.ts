@@ -201,7 +201,12 @@ export interface EffectiveOptions {
    * value is published only when the record it comes from holds it as a
    * current identifier; without this option, none is. Sets for other
    * records of the organization may be included and are ignored. A record
-   * with no set here holds no identifiers.
+   * with no set here holds no identifiers. The sets must already have
+   * passed `validateRecordIdentifiers` and `uniquenessIssues` on the save
+   * path; here only the rules one set can be checked for on its own are
+   * checked again (exactly one primary, no current number twice:
+   * `invalid_identifiers`). A held value of a type that isn't one of the
+   * organization's public types is still refused by the identifier checker.
    */
   readonly identifiers?: readonly RecordIdentifiers[];
 }

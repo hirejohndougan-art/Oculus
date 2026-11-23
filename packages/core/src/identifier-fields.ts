@@ -27,7 +27,14 @@
  *   `identifiers_unknown`), and `effectivePublishIssues` refuses publishing.
  * - **Public output.** `publicOutput`'s `identifiers` option checks again,
  *   at the boundary, that every published number is still a current
- *   identifier of the record it came from (`identifier_changed`).
+ *   identifier of the record it came from (`identifier_changed`). A view
+ *   holding identifier values is refused without it (`identifiers_unknown`).
+ *
+ * `identifierFieldIssues` has no caller inside this package yet: the save
+ * path that must run it on every record save is the service layer (T-032).
+ * Until then nothing stops a stored field from pointing at a number the
+ * record doesn't hold, but such a number is never published (the second
+ * and third points above).
  *
  * Which numbers may be published is still the type's `public` flag (D-022):
  * the record's primary number, like any other, reaches public output only

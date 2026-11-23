@@ -176,6 +176,13 @@ export function effectiveOf(
   return result.value;
 }
 
+const VIEW_IDENTIFIERS = new WeakMap<object, RecordIdentifiers[]>();
+
+/** The identifiers a view from `viewOf` was built with, to pass to publicOutput (D-038). */
+export function idsOf(view: PublicRecord): RecordIdentifiers[] {
+  return VIEW_IDENTIFIERS.get(view) ?? [];
+}
+
 export function viewOf(
   records: readonly CatalogRecord[],
   id: RecordId,
@@ -183,6 +190,7 @@ export function viewOf(
 ): PublicRecord {
   const view = publicView(effectiveOf(records, id, tpl));
   if (view === undefined) throw new Error("no public view");
+  VIEW_IDENTIFIERS.set(view, identifiersFor(records));
   return view;
 }
 
