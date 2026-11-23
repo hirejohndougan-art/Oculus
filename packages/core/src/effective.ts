@@ -67,13 +67,17 @@
  * check (`rightsPublishIssues`) run on that public view, and also refuses
  * rights that are staff-only here. Nothing here throws.
  *
- * **Identifier values** (D-022). Identifier types are staff only unless
- * marked public, and only the identifier checker in `options.checkers` (from
- * `makeIdentifierChecker`) knows which are public. Checkers judge an
+ * **Identifier values** (D-022, D-041). Identifier types are staff only
+ * unless marked public, and only the identifier checker in `options.checkers`
+ * (from `makeIdentifierChecker`) knows which are public. Checkers judge an
  * inherited value by its effective visibility, so a staff-type number
- * inherited into a staff field stays, and one that would become public is
- * left out with a note. A public field whose own value is of a staff type, or
- * any identifier value when no identifier checker made by
+ * inherited into a staff field stays. One inherited into a public field is
+ * kept too, marked `staff` with an `inherited_staff_identifier` note, so the
+ * staff copy the parent holds doesn't vanish on the child and the rest of a
+ * list isn't lost with it; nothing of it is published, and publishing the
+ * child is not refused, because the mistake is on the record that holds the
+ * number. A public field whose own value is of a staff type, or any
+ * identifier value when no identifier checker made by
  * `makeIdentifierChecker` is given, is kept but marked `staff`, with a note
  * (`private_identifier_type`, `identifier_types_unknown`), and
  * `effectivePublishIssues` refuses to publish the record until it is fixed.
@@ -943,14 +947,6 @@ function dropUnfit(
   // going public when it never will (D-022). Rights fields must be public in
   // every template, so they are never made staff here.
   const staffHere = new Set(inherited.filter((c) => c.visibility === "staff").map((c) => c.key));
-  const loose: FieldTemplate = {
-    ...template,
-    fields: template.fields.map((f) =>
-      staffHere.has(f.key) && f.kind !== "rights"
-        ? { ...f, required: false, visibility: "staff" as const }
-        : { ...f, required: false },
-    ),
-  };
   // Frozen, so a checker can't change a value after it was checked (or
   // before another checker sees it). The values themselves are already
   // frozen copies from validateRecord.
@@ -958,22 +954,57 @@ function dropUnfit(
     Object.fromEntries(inherited.map((c) => [c.key, c.value])),
   );
   const probe = Object.freeze({ ...target, fields: probeFields }) as CatalogRecord;
-  const problems = checkRecordAgainstTemplate(
-    probe,
-    loose,
-    (checkers === undefined ? {} : { checkers }) as TemplateCheckOptions,
-  );
-  const unfit = new Map<string, string>();
-  let unsure = false;
-  for (const problem of problems) {
-    const [where, key] = problem.path;
-    if (where === "fields" && typeof key === "string") {
-      if (!unfit.has(key)) unfit.set(key, problem.message);
-    } else {
-      // A problem we can't place (the check stopped early, or couldn't run):
-      // keep none of the inherited values, rather than guess.
-      unsure = true;
+  const check = (): { unfit: Map<string, Issue[]>; unsure: boolean } => {
+    const loose: FieldTemplate = {
+      ...template,
+      fields: template.fields.map((f) =>
+        staffHere.has(f.key) && f.kind !== "rights"
+          ? { ...f, required: false, visibility: "staff" as const }
+          : { ...f, required: false },
+      ),
+    };
+    const problems = checkRecordAgainstTemplate(
+      probe,
+      loose,
+      (checkers === undefined ? {} : { checkers }) as TemplateCheckOptions,
+    );
+    const unfit = new Map<string, Issue[]>();
+    let unsure = false;
+    for (const problem of problems) {
+      const [where, key] = problem.path;
+      if (where === "fields" && typeof key === "string") {
+        const list = unfit.get(key);
+        if (list === undefined) unfit.set(key, [problem]);
+        else list.push(problem);
+      } else {
+        // A problem we can't place (the check stopped early, or couldn't run):
+        // keep none of the inherited values, rather than guess.
+        unsure = true;
+      }
     }
+    return { unfit, unsure };
+  };
+  let { unfit, unsure } = check();
+  // An identifier value inherited as public whose only problem is a number
+  // of a staff only type (a mistake on the unit it came from, which can't be
+  // published until it is fixed) is kept for staff (S-006a): it is checked
+  // again as staff, so every number's format is still checked, and if that
+  // passes it is kept, marked staff, so neither the staff-type number nor
+  // the rest of the list reaches the public view.
+  const madeStaff = new Set<string>();
+  if (!unsure) {
+    for (const c of inherited) {
+      const found = unfit.get(c.key);
+      if (
+        c.visibility === "public" &&
+        template.fields.some((f) => f.key === c.key && f.kind === "identifier") &&
+        found?.every((p) => p.code === "private_identifier_type") === true
+      ) {
+        madeStaff.add(c.key);
+        staffHere.add(c.key);
+      }
+    }
+    if (madeStaff.size > 0) ({ unfit, unsure } = check());
   }
   const kept: Candidate[] = [];
   for (const c of candidates) {
@@ -983,11 +1014,22 @@ function dropUnfit(
     }
     const why = unsure
       ? "it could not be checked against this record's template."
-      : unfit.get(c.key);
+      : unfit.get(c.key)?.[0]?.message;
     const checked = ownField(probeFields, c.key);
     if (why === undefined && checked === c.value) {
       // Keep exactly the value that was checked.
-      kept.push({ ...c, value: checked });
+      if (madeStaff.has(c.key)) {
+        notes.push(
+          issue(
+            ["fields", c.key],
+            "inherited_staff_identifier",
+            `${shown(c.label)} is inherited from ${shown(up[c.from]?.title)} with a number of a staff only identifier type, so here it is staff only and isn't published.`,
+          ),
+        );
+        kept.push({ ...c, value: checked, visibility: "staff" });
+      } else {
+        kept.push({ ...c, value: checked });
+      }
       continue;
     }
     notes.push(

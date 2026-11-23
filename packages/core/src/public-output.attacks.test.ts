@@ -224,6 +224,50 @@ describe("staff identifier types never reach any output form (D-022)", () => {
     }
   });
 
+  it("publishes nothing of an inherited list kept staff for one staff-type number (S-006a)", () => {
+    // The child keeps the staff copy of the list (D-041), so the output must
+    // hold neither the staff number nor the public one beside it, and the
+    // fonds's title and ID must not appear either.
+    const fields = TPL.fields.map((f) =>
+      f.key === "number" ? { ...f, repeatable: true, inherited: true } : f,
+    );
+    const tpl = template(fields);
+    const fonds = record(
+      "archival_unit",
+      "SECRET-fonds-title",
+      {
+        rights: { uri: CNE },
+        number: [
+          { type: "accession_number", value: "2026.015" },
+          { type: "donor_file_number", value: SECRET },
+        ],
+      },
+      { level: "fonds" },
+    );
+    const item = record(
+      "archival_unit",
+      "Item",
+      { description: "Public text" },
+      { level: "item", parentId: fonds.id },
+    );
+    const effective = effectiveOf([item, fonds], item.id, tpl);
+    // Staff do see it, with the note that says why it stays staff.
+    expect(effective.fields.number).toEqual([
+      { type: "accession_number", value: "2026.015" },
+      { type: "donor_file_number", value: SECRET },
+    ]);
+    expect(effective.notes.map((n) => n.code)).toContain("inherited_staff_identifier");
+    const view = publicView(effective);
+    if (view === undefined) throw new Error("no view");
+    expect(Object.hasOwn(view.fields, "number")).toBe(false);
+    const all = everything(ok(out(view, { template: "out", entries: MAPPING.entries })));
+    expect(all).toContain("Public text");
+    expect(all).not.toContain(SECRET);
+    expect(all).not.toContain("2026.015");
+    expect(all).not.toContain("SECRET");
+    expect(all).not.toContain(fonds.id);
+  });
+
   it("refuses a lax checker for public types too: it can't say which types are public", () => {
     const item = record("object", "I", {
       rights: { uri: CNE },

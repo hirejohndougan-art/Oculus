@@ -699,16 +699,97 @@ describe("staff identifier types never reach the public view (D-022)", () => {
     expect(effectivePublishIssues(r.value).map((i) => i.code)).toEqual(["rights_missing"]);
   });
 
-  it("leaves out, with a note, a staff-type value that would be inherited as public", () => {
+  // S-006a. These three used to expect the value dropped from the child
+  // altogether, with a `not_valid_here` note and nothing for staff: the staff
+  // copy the parent holds simply disappeared on the child, and a list lost
+  // its public numbers with it. The value is now kept for staff, marked
+  // staff, so nothing of it is published.
+  it("keeps, as staff, a staff-type value that would be inherited as public", () => {
     const fonds = unit("Fonds", "fonds", undefined, { number: staffValue });
     const item = unit("Item", "item", fonds);
     const r = effectiveRecord(item.id, [item, fonds], () => PUBLIC_NUMBER, { checkers });
     if (!r.ok) throw new Error("effective");
-    expect(r.value.entries).toEqual([]);
-    expect(r.value.notes.map((n) => n.code)).toEqual(["not_valid_here"]);
+    expect(r.value.entries.map((e) => [e.key, e.visibility, e.own, e.value])).toEqual([
+      ["number", "staff", false, staffValue],
+    ]);
+    expect(r.value.notes.map((n) => n.code)).toEqual(["inherited_staff_identifier"]);
+    expect(publicView(r.value)?.entries).toEqual([]);
     expect(JSON.stringify(publicView(r.value))).not.toContain(SECRET);
     // Only the missing rights (these samples have none), nothing about identifiers.
     expect(effectivePublishIssues(r.value).map((i) => i.code)).toEqual(["rights_missing"]);
+  });
+
+  it("keeps the whole inherited list for staff when one of its numbers is a staff type", () => {
+    const tpl = template([numberDef("public", true)], "public-numbers");
+    const numbers = [{ type: "object_number", value: "2026.015" }, staffValue];
+    const fonds = unit("Fonds", "fonds", undefined, { number: numbers });
+    const item = unit("Item", "item", fonds);
+    const r = effectiveRecord(item.id, [item, fonds], () => tpl, { checkers });
+    if (!r.ok) throw new Error("effective");
+    expect(r.value.entries.map((e) => [e.key, e.visibility, e.value])).toEqual([
+      ["number", "staff", numbers],
+    ]);
+    expect(r.value.fields.number).toEqual(numbers);
+    expect(r.value.notes.map((n) => n.code)).toEqual(["inherited_staff_identifier"]);
+    // The public number of the list isn't published either: the list is one
+    // value, and part of it is staff only.
+    expect(publicView(r.value)?.entries).toEqual([]);
+    expect(JSON.stringify(publicView(r.value))).not.toContain(SECRET);
+  });
+
+  it("still leaves out an inherited number that doesn't fit for another reason", () => {
+    // An unknown type is not a visibility problem: nothing is kept, as before.
+    const fonds = unit("Fonds", "fonds", undefined, {
+      number: [
+        { type: "object_number", value: "2026.015" },
+        { type: "ghost", value: "G-1" },
+      ],
+    });
+    const item = unit("Item", "item", fonds);
+    const tpl = template([numberDef("public", true)], "public-numbers");
+    const r = effectiveRecord(item.id, [item, fonds], () => tpl, { checkers });
+    if (!r.ok) throw new Error("effective");
+    expect(r.value.entries).toEqual([]);
+    expect(r.value.notes.map((n) => n.code)).toEqual(["not_valid_here"]);
+  });
+
+  it("leaves out an inherited staff-type number that doesn't fit its type's format", () => {
+    // Kept as staff only if it passes every other check: a staff-type number
+    // that doesn't fit its own format is still refused, so nothing is kept.
+    const made = makeIdentifierChecker([
+      {
+        key: "donor_file_number",
+        label: "Donor file number",
+        organizationId: ORG,
+        uniqueness: "none",
+        pattern: "DF-####",
+      },
+    ]);
+    if (!made.ok) throw new Error("types");
+    const fonds = unit("Fonds", "fonds", undefined, {
+      number: { type: "donor_file_number", value: "NOT-A-NUMBER" },
+    });
+    const item = unit("Item", "item", fonds);
+    const r = effectiveRecord(item.id, [item, fonds], () => PUBLIC_NUMBER, {
+      checkers: { identifier: made.value },
+    });
+    if (!r.ok) throw new Error("effective");
+    expect(r.value.entries).toEqual([]);
+    expect(r.value.notes.map((n) => n.code)).toEqual(["not_valid_here"]);
+    expect(JSON.stringify(publicView(r.value))).not.toContain("NOT-A-NUMBER");
+  });
+
+  it("never names the staff type's label in a note or a checker's message", () => {
+    const fonds = unit("Fonds", "fonds", undefined, { number: staffValue });
+    const item = unit("Item", "item", fonds);
+    const own = unit("Own", "item", undefined, { number: staffValue });
+    for (const r of [
+      effectiveRecord(item.id, [item, fonds], () => PUBLIC_NUMBER, { checkers }),
+      effectiveRecord(own.id, [own], () => PUBLIC_NUMBER, { checkers }),
+    ]) {
+      if (!r.ok) throw new Error("effective");
+      expect(JSON.stringify(r.value.notes)).not.toContain("Donor file number");
+    }
   });
 });
 

@@ -398,7 +398,9 @@ describe("identifier type visibility (D-022)", () => {
     );
     expect(codes(r)).toEqual(["private_identifier_type", "private_identifier_type"]);
     expect(paths(r)).toEqual(["fields.numbers.1.type", "fields.numbers.2.type"]);
-    expect(r[0]?.message).toContain("Donor file number");
+    // The type's key, so the admin can find it; never its label (S-006a).
+    expect(r[0]?.message).toContain("donor_file");
+    expect(r[0]?.message).not.toContain("Donor file number");
   });
 
   it("accepts any type in a staff field", () => {
