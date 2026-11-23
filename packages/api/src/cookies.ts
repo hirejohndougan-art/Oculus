@@ -13,7 +13,9 @@
  *   such a copy can make the browser's requests fail until it is cleared.
  * - `Max-Age` is at most 400 days, in the writer and in the check alike.
  * - Values are base64url text only (session tokens are random bytes); any
- *   other value reads as absent.
+ *   other value reads as absent. Names, values and the Cookie header must be
+ *   `typeof "string"` before any other check (an object's `toString` could
+ *   pass the check and then write something else).
  * - `setOculusCookie` and `clearOculusCookie` (reached through the route
  *   reply, server.ts) are the only writers; they write the header text
  *   themselves. Every cookie gets the `__Host-` prefix (it is part of the
@@ -37,7 +39,8 @@ const LOWERCASE_NAMES: ReadonlySet<string> = new Set([...NAMES].map((n) => n.toL
 const VALUE = /^[A-Za-z0-9_-]{1,512}$/;
 
 function cookiePairs(header: string | undefined): { name: string; value: string }[] {
-  if (header === undefined || header === "") return [];
+  // Only a string is read: no array, boxed String or object with a toString.
+  if (typeof header !== "string" || header === "") return [];
   return header.split(";").map((pair) => {
     const eq = pair.indexOf("=");
     return eq === -1
@@ -60,7 +63,8 @@ export function cookieHeaderProblem(header: string | undefined): Refusal | undef
 }
 
 function checkName(name: string): void {
-  if (!NAMES.has(name)) throw new Error(`not an Oculus cookie: ${name}`);
+  if (typeof name !== "string" || !NAMES.has(name))
+    throw new Error(`not an Oculus cookie: ${name}`);
 }
 
 /** The value of one Oculus cookie in a `Cookie` header, or `undefined` when absent or malformed. */
@@ -108,7 +112,11 @@ export function setOculusCookie(
   options: CookieWriteOptions = {},
 ): void {
   checkName(name);
-  if (!VALUE.test(value)) throw new Error("cookie values must be 1 to 512 base64url characters");
+  // typeof first: an object's toString could answer the check one way and
+  // the header text another.
+  if (typeof value !== "string" || !VALUE.test(value)) {
+    throw new Error("cookie values must be 1 to 512 base64url characters");
+  }
   const { maxAgeSeconds } = options;
   if (maxAgeSeconds !== undefined && !isMaxAge(maxAgeSeconds)) {
     throw new Error(

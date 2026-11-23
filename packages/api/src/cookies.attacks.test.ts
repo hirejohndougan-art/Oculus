@@ -7,6 +7,7 @@ import {
   MAX_COOKIE_AGE_SECONDS,
   OCULUS_COOKIES,
   cookieHeaderProblem,
+  readOculusCookie,
   replyCookieProblem,
   setCookieProblem,
   setOculusCookie,
@@ -115,6 +116,13 @@ describe("writing cookies", () => {
     const built = await testServer({}, [
       route("/bad-name", (r) => r.setCookie("tracker" as OculusCookieName, "x")),
       route("/bad-value", (r) => r.setCookie(SESSION, "x; Domain=evil.example")),
+      // Not a string, though it turns into a good one: refused before any check.
+      route("/object-value", (r) =>
+        r.setCookie(SESSION, { toString: () => "abcDEF123" } as unknown as string),
+      ),
+      route("/boxed-value", (r) =>
+        r.setCookie(SESSION, new String("abcDEF123") as unknown as string),
+      ),
       route("/raw-header", (r) => r.header("Set-Cookie", `${SESSION}=x; Path=/`)),
       route("/raw-header-case", (r) => r.header("sEt-CoOkIe", "tracker=1")),
       route("/hijack", (r) => {
@@ -138,6 +146,8 @@ describe("writing cookies", () => {
     for (const url of [
       "/bad-name",
       "/bad-value",
+      "/object-value",
+      "/boxed-value",
       "/raw-header",
       "/raw-header-case",
       "/hijack",
@@ -149,6 +159,15 @@ describe("writing cookies", () => {
       expect(res.json(), url).toEqual({ error: "internal_error" });
       expect(res.headers["set-cookie"], url).toBeUndefined();
     }
+  });
+
+  it("reads a Cookie header only when it is a string", () => {
+    const header = [`${SESSION}=abc`, `${SESSION}=def`] as unknown as string;
+    expect(cookieHeaderProblem(header)).toBeUndefined();
+    expect(readOculusCookie(header, SESSION)).toBeUndefined();
+    expect(
+      readOculusCookie({ toString: () => `${SESSION}=abc` } as unknown as string, SESSION),
+    ).toBe(undefined);
   });
 
   it("can't change the server from a handler after start", async () => {
