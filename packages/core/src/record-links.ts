@@ -51,6 +51,12 @@
  * output: it may be another kind of value, such as a record link's label,
  * left in a field a template edit made a place.
  *
+ * A template edit that narrows a field's `recordKinds` is reported by
+ * `templateChanges` as `record_kind_removed` when given this checker
+ * (`options.linkChecker`); labels that no longer match the linked record's
+ * title are listed by `findStaleLinkLabels` (link-label-report.ts, staff
+ * only). Both are T-015a (D-055).
+ *
  * Checkers never throw, and return frozen lists of problems whose paths are
  * relative to the value (`["recordId"]`).
  */

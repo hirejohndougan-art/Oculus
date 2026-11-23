@@ -155,8 +155,9 @@ The data model in TypeScript, written for any archive or museum rather than one 
   - A borrowed item that becomes the organization's (bought or given) needs a link from an accession to close its loan in. Link a condition check's `loanId` to the loan book and warn when a loan out goes without a recent fit check. Valuation, insurance and authoriser fields.
 - [ ] T-013a **Record type edits checked against records.** deps: T-013
   - Editing a record type's kind or key, or deleting it, should list the records that use it first, as `templateChanges` does for templates; optionally a `recordTypes` input on `templateChanges`.
-- [ ] T-015a **Link follow-ups.** deps: T-015
+- [x] T-015a **Link follow-ups.** deps: T-015
   - `templateChanges` should report a narrowed `recordKinds` with the records whose links no longer fit; a report of link labels that no longer match the linked record's name.
+  - Done: D-055: `record_kind_removed` in `templateChanges` (records found through the organization's record link checker, `options.linkChecker`); `findStaleLinkLabels`, a staff-only Data Cleaning report of link and place labels that differ from the linked record's title, for one organization only.
 - [ ] S-007 **Messages in `publicOutput` issues.** (risky) deps: T-014
   - From the integration review: `publicOutput` passes the template check's problems through as they are, and the identifier checker's `unknown_type` and `format_mismatch` messages quote a type key or a number. Decide whether `publicOutput` issues are staff-only (and say so) or replace those messages with fixed text.
 - [x] U-003 **Small hardening and test speed.**
