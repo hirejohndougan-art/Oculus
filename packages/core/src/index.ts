@@ -184,7 +184,12 @@ export type {
 } from "./record-types.js";
 
 export { TEMPLATE_CHANGE_CODES, MAX_LISTED_RECORDS, templateChanges } from "./template-changes.js";
-export type { TemplateChangeCode, TemplateChange, TemplateChanges } from "./template-changes.js";
+export type {
+  TemplateChangeCode,
+  TemplateChange,
+  TemplateChangeOptions,
+  TemplateChanges,
+} from "./template-changes.js";
 
 export {
   IDENTIFIER_TYPE_CHANGE_CODES,

@@ -46,6 +46,11 @@ export function linkTargetKind(
   return made.kinds.get(recordId);
 }
 
+/** True for a checker `makeRecordLinkChecker` made (from any organization's records, or none). */
+export function isMadeLinkChecker(checker: unknown): boolean {
+  return typeof checker === "function" && MADE.has(checker);
+}
+
 /**
  * True for a checker `makeRecordLinkChecker` made from the records of an
  * organization other than `organizationId`.
