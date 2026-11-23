@@ -459,6 +459,8 @@ export {
   latestCondition,
   fitToMove,
   needingConservation,
+  conditionLoanProblems,
+  loansOutWithoutFitCheck,
 } from "./condition-checks.js";
 export type {
   ConditionCheckId,
@@ -467,6 +469,8 @@ export type {
   ConditionCheck,
   ConditionLog,
   FitToMove,
+  ConditionLoanProblem,
+  LoanFitWarning,
 } from "./condition-checks.js";
 export type {
   LocationId,

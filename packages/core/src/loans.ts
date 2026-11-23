@@ -47,7 +47,7 @@
  * in names are listed by `unexplainedDepartures`, and `loan_out` moves no
  * loan out names or extends by `unexplainedLoanMoves`.
  *
- * **Valuation, insurance and authorisation** (T-018a2, D-060): a loan may
+ * **Valuation, insurance and authorisation** (T-018a2, D-059): a loan may
  * carry the agreed `valuation` (`{ amount, currency }`, the amount a decimal
  * string such as "12500.00" and the currency an ISO 4217 code, never a
  * floating-point number, so no value is ever rounded), who insures it
@@ -72,6 +72,7 @@ import { randomUUID } from "node:crypto";
 import { types } from "node:util";
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import { loanAcquisitionsOf, type LoanAcquisitions } from "./accession-loans.js";
+import { markLoanFacts, type LoanFact } from "./loan-facts.js";
 import { isOrganizationId, mixedOrganizationsIssue, type OrganizationId } from "./organizations.js";
 import { IssueList, shown, type JsonValue } from "./plain-data.js";
 import { isRecordId, type RecordId } from "./record-id.js";
@@ -1252,6 +1253,29 @@ function buildBook(log: MoveLog, loans: readonly Loan[], linked: Linked): Valida
     byRecord: frozenByRecord,
     unexplained,
     unexplainedOut,
+  });
+  // What condition checks may see (loan-facts.ts): IDs, directions,
+  // statuses, items and start days only.
+  const facts = new Map<string, LoanFact>();
+  for (const [id, { loan, items }] of byId) {
+    facts.set(
+      id,
+      Object.freeze({
+        id,
+        direction: loan.direction,
+        status: loan.status,
+        items: Object.freeze(
+          items.map((item) =>
+            Object.freeze({ recordId: item.recordId, startedOn: item.started?.movedOn ?? null }),
+          ),
+        ),
+      }),
+    );
+  }
+  markLoanFacts(book, {
+    organizationId,
+    loan: (id) => facts.get(id),
+    loans: Object.freeze([...facts.values()]),
   });
   return { ok: true, value: book };
 }

@@ -23,15 +23,24 @@
  * `conditionHistory`, `latestCondition`, `fitToMove` and
  * `needingConservation` read only the snapshot. Every check carries a
  * required `organizationId` and a log that mixes organizations is refused
- * (D-030). A check's `recordId`, `checkerId` and `loanId` are only checked
- * for being IDs: the service layer (T-032) checks they are the same
- * organization's. Nothing here throws on bad input.
+ * (D-030). A check's `recordId` and `checkerId` are only checked for being
+ * IDs: the service layer (T-032) checks they are the same organization's.
+ *
+ * **Checks and the loan book** (T-018a2, D-059). A new check that names a
+ * `loanId` is saved only against the loan book (`withConditionCheck`'s
+ * `loans`): the loan must be in it and list the record. Checks already in a
+ * log are checked against a book by `conditionLoanProblems`.
+ * `loansOutWithoutFitCheck` lists the items of agreed loans out that went
+ * out, or are waiting to go, without a fit-to-move check recent enough: the
+ * caller gives the window (`maxAgeDays`) and the day. The loan book is read
+ * through `loan-facts.ts`, never `loans.ts`. Nothing here throws on bad input.
  */
 import { randomUUID } from "node:crypto";
 import { types } from "node:util";
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import { isOrganizationId, mixedOrganizationsIssue, type OrganizationId } from "./organizations.js";
 import { IssueList, readPlainData, type JsonValue } from "./plain-data.js";
+import { loanFactsOf, type LoanFacts } from "./loan-facts.js";
 import { isRecordId, type RecordId } from "./record-id.js";
 import {
   MAX_STORAGE_NOTE_LENGTH,
@@ -127,6 +136,29 @@ export interface FitToMove {
    * older than `maxAgeDays`. `unchecked`: no check on or before the day.
    */
   readonly because: "fit" | "unfit" | "stale" | "unchecked";
+  /** The check the answer is based on, or null when there is none. */
+  readonly check: ConditionCheck | null;
+}
+
+/** A check whose `loanId` doesn't fit the loan book, as `conditionLoanProblems` lists it. */
+export interface ConditionLoanProblem {
+  readonly checkId: ConditionCheckId;
+  readonly recordId: RecordId;
+  readonly loanId: string;
+  /** `unknown_loan`: no such loan in the book. `not_on_loan`: the loan doesn't list the record. */
+  readonly code: "unknown_loan" | "not_on_loan";
+}
+
+/** An item of a loan out without a recent fit-to-move check, as `loansOutWithoutFitCheck` lists it. */
+export interface LoanFitWarning {
+  readonly loanId: string;
+  readonly recordId: RecordId;
+  /** True when the item has gone out (its `loan_out` is linked); judged on that day. */
+  readonly sent: boolean;
+  /** The day judged on: the day it went out, or `today` while it hasn't. */
+  readonly on: string;
+  /** Why: `unfit`, `stale` or `unchecked` (see `FitToMove`). */
+  readonly because: "unfit" | "stale" | "unchecked";
   /** The check the answer is based on, or null when there is none. */
   readonly check: ConditionCheck | null;
 }
@@ -354,13 +386,17 @@ export function isConditionLog(value: unknown): value is ConditionLog {
  * the log with it added. Its `recordedAt` can't be later than `now` (a few
  * minutes of clock slack), since checks on one day are ordered by it and a
  * check stamped in the future would stay "latest" for ever: make new checks
- * with `createConditionCheck`. The given log is not changed. `now` is for
- * tests. Never throws.
+ * with `createConditionCheck`. A check naming a `loanId` needs `loans`, the
+ * organization's loan book (`loans_unknown`; anything else
+ * `not_a_loan_book`, another organization's `mixed_organizations`): the
+ * loan must be in it (`unknown_loan`) and list the record (`not_on_loan`).
+ * The given log is not changed. `now` is for tests. Never throws.
  */
 export function withConditionCheck(
   log: ConditionLog,
   check: unknown,
   now: Date = new Date(),
+  loans?: object,
 ): Validated<ConditionLog> {
   try {
     const data = logData(log);
@@ -386,6 +422,19 @@ export function withConditionCheck(
     }
     if (data.ids.has(next.id)) {
       return refused(["id"], "duplicate_id", "A check with this ID is already in the log.");
+    }
+    if (next.loanId !== undefined) {
+      if (loans === undefined) {
+        return refused(
+          ["loanId"],
+          "loans_unknown",
+          "A check made for a loan is checked against the loan book: give it.",
+        );
+      }
+      const facts = factsFor(loans, data.organizationId);
+      if (!facts.ok) return facts;
+      const code = loanLinkProblem(facts.value, next);
+      if (code !== undefined) return refused(["loanId"], code, LOAN_LINK_MESSAGES[code]);
     }
     if (data.size >= MAX_CONDITION_CHECKS) {
       return refused(
@@ -466,13 +515,7 @@ export function fitToMove(
       return refused(["on"], "invalid_date", "on must be a day written YYYY-MM-DD.");
     const givenAge = readOption(options, "maxAgeDays");
     const maxAge = givenAge ?? DEFAULT_FIT_TO_MOVE_DAYS;
-    if (typeof maxAge !== "number" || !Number.isInteger(maxAge) || maxAge < 0 || maxAge > 36_500) {
-      return refused(
-        ["maxAgeDays"],
-        "invalid_age",
-        "maxAgeDays must be a whole number of days from 0 to 36500.",
-      );
-    }
+    if (!isAge(maxAge)) return badAge();
     const check = latestOf(data, recordId, on);
     const answer = (because: FitToMove["because"]): Validated<FitToMove> => ({
       ok: true,
@@ -481,6 +524,104 @@ export function fitToMove(
     if (check === null) return answer("unchecked");
     if ((Date.parse(on) - Date.parse(check.checkedOn)) / DAY_MS > maxAge) return answer("stale");
     return answer(canMove(check) ? "fit" : "unfit");
+  } catch {
+    return refused([], "unreadable", "The options could not be read.");
+  }
+}
+
+/**
+ * The checks in the log whose `loanId` doesn't fit `loans`, the
+ * organization's loan book: no such loan (`unknown_loan`), or a loan that
+ * doesn't list the checked record (`not_on_loan`). Oldest first. Refuses
+ * anything but a loan book of the log's organization. Never throws.
+ */
+export function conditionLoanProblems(
+  log: ConditionLog,
+  loans: unknown,
+): Validated<readonly ConditionLoanProblem[]> {
+  try {
+    const data = logData(log);
+    if (data === undefined) return notALog();
+    const facts = factsFor(loans, data.organizationId);
+    if (!facts.ok) return facts;
+    const found: { check: ConditionCheck; problem: ConditionLoanProblem }[] = [];
+    for (const history of data.byRecord.values()) {
+      for (const check of history) {
+        const code = loanLinkProblem(facts.value, check);
+        if (check.loanId === undefined || code === undefined) continue;
+        found.push({
+          check,
+          problem: Object.freeze({
+            checkId: check.id,
+            recordId: check.recordId,
+            loanId: check.loanId,
+            code,
+          }),
+        });
+      }
+    }
+    found.sort((a, b) => byWhen(a.check, b.check));
+    return { ok: true, value: Object.freeze(found.map((f) => f.problem)) };
+  } catch {
+    return refused([], "unreadable", "The condition checks could not be checked.");
+  }
+}
+
+/**
+ * The items of loans out that went, or are to go, without a recent
+ * fit-to-move check (Spectrum: check condition before an object is lent).
+ * Every `agreed` loan out in `loans` is looked at: an item that went out is
+ * judged by `fitToMove` on the day of its linked `loan_out`; one not yet
+ * sent, on `today` (`YYYY-MM-DD`, the organization's own date). Listed when
+ * the answer isn't `fit`. `maxAgeDays` is required: how recent a check must
+ * be is the organization's rule, not this module's. By loan, in the book's
+ * order, then by item. Never throws.
+ */
+export function loansOutWithoutFitCheck(
+  log: ConditionLog,
+  loans: unknown,
+  options: { readonly today: unknown; readonly maxAgeDays: unknown },
+): Validated<readonly LoanFitWarning[]> {
+  try {
+    const data = logData(log);
+    if (data === undefined) return notALog();
+    const facts = factsFor(loans, data.organizationId);
+    if (!facts.ok) return facts;
+    const today = readOption(options, "today");
+    if (!isIsoDay(today)) {
+      return refused(["today"], "invalid_date", "today must be a day written YYYY-MM-DD.");
+    }
+    const maxAge = readOption(options, "maxAgeDays");
+    if (maxAge === undefined) {
+      return refused(
+        ["maxAgeDays"],
+        "required",
+        "Say how many days old a fit-to-move check may be: maxAgeDays.",
+      );
+    }
+    if (!isAge(maxAge)) return badAge();
+    const found: LoanFitWarning[] = [];
+    for (const loan of facts.value.loans) {
+      if (loan.direction !== "out" || loan.status !== "agreed") continue;
+      for (const item of loan.items) {
+        const on = item.startedOn ?? today;
+        const answer = fitToMove(log, item.recordId, { on, maxAgeDays: maxAge });
+        if (!answer.ok) return answer;
+        const { because, check } = answer.value;
+        if (because === "fit") continue;
+        found.push(
+          Object.freeze({
+            loanId: loan.id,
+            recordId: item.recordId,
+            sent: item.startedOn !== null,
+            on,
+            because,
+            check,
+          }),
+        );
+      }
+    }
+    return { ok: true, value: Object.freeze(found) };
   } catch {
     return refused([], "unreadable", "The options could not be read.");
   }
@@ -503,6 +644,53 @@ export function needingConservation(log: ConditionLog): Validated<readonly Condi
 
 // ---------------------------------------------------------------------------
 // Helpers
+
+function isAge(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 36_500;
+}
+
+function badAge(): { readonly ok: false; readonly issues: readonly Issue[] } {
+  return refused(
+    ["maxAgeDays"],
+    "invalid_age",
+    "maxAgeDays must be a whole number of days from 0 to 36500.",
+  );
+}
+
+const LOAN_LINK_MESSAGES = {
+  unknown_loan: "There is no such loan in the loan book.",
+  not_on_loan: "This loan doesn't list the checked record.",
+} as const;
+
+/** The loan book's facts, checked: a book of `organizationId`. */
+function factsFor(loans: unknown, organizationId: OrganizationId): Validated<LoanFacts> {
+  const facts = types.isProxy(loans) ? undefined : loanFactsOf(loans);
+  if (facts === undefined) {
+    return refused(
+      ["loans"],
+      "not_a_loan_book",
+      "Give the loan book made by indexLoans or withLoan.",
+    );
+  }
+  if (facts.organizationId !== organizationId) {
+    return {
+      ok: false,
+      issues: [mixedOrganizationsIssue([], "This loan book and the condition log")],
+    };
+  }
+  return { ok: true, value: facts };
+}
+
+/** What is wrong with a check's `loanId` against the book, or undefined. */
+function loanLinkProblem(
+  facts: LoanFacts,
+  check: ConditionCheck,
+): ConditionLoanProblem["code"] | undefined {
+  if (check.loanId === undefined) return undefined;
+  const loan = facts.loan(check.loanId);
+  if (loan === undefined) return "unknown_loan";
+  return loan.items.some((item) => item.recordId === check.recordId) ? undefined : "not_on_loan";
+}
 
 /** True when a check says the record can be moved. */
 function canMove(check: ConditionCheck): boolean {

@@ -1,4 +1,4 @@
-// Valuation, insurance and authoriser fields on loans (T-018a2, D-060):
+// Valuation, insurance and authoriser fields on loans (T-018a2, D-059):
 // staff-only, a valuation as a decimal string with an ISO 4217 code, never a
 // float, and nothing of them quoted in a message.
 import { afterEach, describe, expect, it } from "vitest";
