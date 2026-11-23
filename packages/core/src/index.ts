@@ -260,6 +260,17 @@ export type {
 
 export { checkRightsValue, makeIdentifierChecker } from "./field-checkers.js";
 export { makeRecordLinkChecker } from "./record-links.js";
+export {
+  DEFAULT_STALE_LINK_LABELS,
+  MAX_STALE_LINK_LABELS,
+  findStaleLinkLabels,
+} from "./link-label-report.js";
+export type {
+  SkippedLinkRecord,
+  StaleLinkLabel,
+  StaleLinkLabelsOptions,
+  StaleLinkLabelsReport,
+} from "./link-label-report.js";
 
 export { identifierFieldIssues } from "./identifier-fields.js";
 
