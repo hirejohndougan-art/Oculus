@@ -78,6 +78,13 @@
  * (`private_identifier_type`, `identifier_types_unknown`), and
  * `effectivePublishIssues` refuses to publish the record until it is fixed.
  * The public view holds an identifier as `{ value }` only, never its type.
+ *
+ * **Links to other records** (T-015, D-039). The public view holds a
+ * `record_link` value as `{ label }` and a place as `{ label, uri? }`: never
+ * the ID of the record linked to, which may be unpublished or (by mistake)
+ * another organization's. Only `publicOutput` reads the ID, from the
+ * effective record, and links it when it can prove the record is published
+ * and the organization's own.
  */
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import { RIGHTS_FIELD_KEY, rightsPublishIssues } from "./rights.js";
@@ -384,6 +391,26 @@ export function currentAncestry(
   }
 }
 
+/**
+ * For `record-links.ts` only (not exported from the package): every record in
+ * `records` (a list or a lookup from `indexRecords`) by ID, as the validated,
+ * frozen copy the index holds, or undefined for an ID used twice or a record
+ * that isn't valid. A set mixing organizations, or one that can't be read, is
+ * refused with the issue `indexRecords` gives. Never throws.
+ */
+export function recordsById(
+  records: unknown,
+): Validated<ReadonlyMap<RecordId, CatalogRecord | undefined>> {
+  try {
+    const state = lookupFor(records);
+    const out = new Map<RecordId, CatalogRecord | undefined>();
+    for (const [id, got] of state.byId) out.set(id, got.ok ? got.record : undefined);
+    return { ok: true, value: out };
+  } catch (error) {
+    return failure(error);
+  }
+}
+
 /** The index for `records`: the one `indexRecords` made, or a new one built from a list. */
 function lookupFor(records: unknown): LookupState {
   // Callers may pass anything at run time, whatever the type says.
@@ -685,9 +712,7 @@ function compose(
         value:
           e.key === RIGHTS_FIELD_KEY
             ? withoutRightsNote(e.value)
-            : own.byKey.get(e.key)?.kind === "identifier"
-              ? withoutIdentifierType(e.value)
-              : e.value,
+            : publicValue(e.value, own.byKey.get(e.key)?.kind),
         own: e.own,
       }),
     );
@@ -799,6 +824,31 @@ function ownChecker(checkers: unknown, kind: string): unknown {
   if (!isPlainObject(checkers)) return undefined;
   const descriptor = Object.getOwnPropertyDescriptor(checkers, kind);
   return descriptor !== undefined && "value" in descriptor ? descriptor.value : undefined;
+}
+
+/**
+ * A public entry's value as the public view holds it: identifiers without
+ * their type, and links to records without the ID linked to (D-039).
+ */
+function publicValue(value: FieldValue, kind: FieldDefinition["kind"] | undefined): FieldValue {
+  if (kind === "identifier") return withoutIdentifierType(value);
+  if (kind === "record_link" || kind === "place") return withoutRecordId(value);
+  return value;
+}
+
+/**
+ * A `record_link` or place value without its `recordId`: whether the record
+ * linked to may be named is for `publicOutput` to decide (D-016, D-039).
+ * Anything that isn't a plain object is left as it is, for the publish check
+ * to refuse.
+ */
+function withoutRecordId(value: FieldValue): FieldValue {
+  const strip = (item: FieldValue): FieldValue =>
+    isPlainObject(item) && Object.hasOwn(item, "recordId")
+      ? // Object.fromEntries defines own properties, so no key can reach a prototype.
+        Object.freeze(Object.fromEntries(Object.entries(item).filter(([k]) => k !== "recordId")))
+      : item;
+  return Array.isArray(value) ? Object.freeze(value.map(strip)) : strip(value);
 }
 
 /**

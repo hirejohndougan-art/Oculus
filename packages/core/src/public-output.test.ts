@@ -29,6 +29,7 @@ import {
   viewOf,
   CHECKERS,
   RIGHTS_ENTRY,
+  linkChecker,
 } from "./public-output.fixtures.js";
 
 function ok(result: Validated<PublicOutput>): PublicOutput {
@@ -224,14 +225,31 @@ describe("publicOutput: the three forms", () => {
 });
 
 describe("publicOutput: places and the published list", () => {
-  it("links a place record that is published", () => {
+  it("links a place record that is published and found by the record link checker", () => {
     const item = fullObject();
-    const o = ok(out(viewOf([item], item.id), [item.id, PLACE_ID]));
+    const place = record("place", "Dickinson", {}, {}, PLACE_ID);
+    const links = linkChecker([item, place]);
+    const o = ok(
+      publicOutput(viewOf([item], item.id), MAPPING, {
+        baseUrl: BASE,
+        published: [item.id, PLACE_ID],
+        checkers: { ...CHECKERS, place: links },
+      }),
+    );
     expect(o.jsonLd["dcterms:spatial"]).toEqual({
       "@id": BASE + PLACE_ID,
       "rdfs:label": "Dickinson (Tex.)",
     });
     expect(o.dublinCore.spatial).toEqual(["Dickinson (Tex.)"]);
+  });
+
+  it("gives a published place record's name only when no record link checker vouches for it", () => {
+    // Before D-039 the published list alone was enough, which would link an
+    // ID of another organization's published place (D-030).
+    const item = fullObject();
+    const o = ok(out(viewOf([item], item.id), [item.id, PLACE_ID]));
+    expect(o.jsonLd["dcterms:spatial"]).toEqual({ "rdfs:label": "Dickinson (Tex.)" });
+    expect(everything(o)).not.toContain(PLACE_ID);
   });
 
   it("gives an unpublished place record's name only, never its ID", () => {

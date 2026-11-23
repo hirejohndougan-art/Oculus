@@ -2,6 +2,7 @@
 import {
   effectiveRecord,
   makeIdentifierChecker,
+  makeRecordLinkChecker,
   newOrganizationId,
   newRecordId,
   publicView,
@@ -11,6 +12,7 @@ import {
   type FieldDefinition,
   type FieldTemplate,
   type FieldValue,
+  type FieldValueChecker,
   type PublicRecord,
   type RecordId,
   type RecordKind,
@@ -132,6 +134,13 @@ const identifierChecker = makeIdentifierChecker([
 if (!identifierChecker.ok) throw new Error("identifier types");
 /** The checkers publicOutput needs for the fixtures' identifier field. */
 export const CHECKERS = Object.freeze({ identifier: identifierChecker.value });
+
+/** A record link checker made from `records` (D-039). */
+export function linkChecker(records: readonly CatalogRecord[]): FieldValueChecker {
+  const made = makeRecordLinkChecker(records);
+  if (!made.ok) throw new Error(JSON.stringify(made.issues));
+  return made.value;
+}
 
 export function effectiveOf(
   records: readonly CatalogRecord[],

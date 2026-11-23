@@ -35,17 +35,28 @@
  *   it, and put private rights notes in a separate staff field.
  * - `place`: `{ label, uri?, recordId? }`, a place by name, with a gazetteer
  *   URI (GNIS) or the ID of a place record if known.
+ * - `record_link`: `{ recordId, label }`, a link to another record of the
+ *   same organization, such as a creator on the Authorities list (an agent
+ *   record) or a related record (T-015, D-039). `label` is the name this
+ *   record shows for it, and the only part published when the linked record
+ *   isn't. A field's `recordKinds` may limit the kinds it links to (left
+ *   out: any kind).
  *
- * Only the structure of the last five is checked here. Whether a term is in
+ * Only the structure of the last six is checked here. Whether a term is in
  * its vocabulary (T-009), an identifier type exists and is unique (T-004), a
- * rights URI is a known statement (T-007) or a place record exists is for
- * those modules: they plug in through `TemplateCheckOptions.checkers`.
- * The ready-made ones are in `field-checkers.ts` (D-015) and
- * `vocabularies.ts` (D-014). The rights and controlled term checkers run by
- * default. The identifier checker needs the organization's
- * identifier types, so the caller must pass one (`makeIdentifierChecker`):
- * without it, identifier values are refused with `unchecked`, never accepted
- * unchecked.
+ * rights URI is a known statement (T-007) or a linked record exists, is of
+ * the right kind and belongs to the same organization (T-015) is for those
+ * modules: they plug in through `TemplateCheckOptions.checkers`.
+ * The ready-made ones are in `field-checkers.ts` (D-015),
+ * `vocabularies.ts` (D-014) and `record-links.ts` (D-039). The rights and
+ * controlled term checkers run by default. The identifier checker needs the
+ * organization's identifier types and the record link checker its records,
+ * so the caller must pass them (`makeIdentifierChecker`,
+ * `makeRecordLinkChecker`): without one, identifier and record link values
+ * are refused with `unchecked`, never accepted unchecked. A place's
+ * `recordId` is checked by the record link checker when one is given as
+ * `checkers.place`; without it the place is accepted, but public output
+ * never links it.
  *
  * A field is `required` (the record must have a value) and/or `repeatable`
  * (the value is a list of one or more values; otherwise it is one value).
@@ -116,6 +127,7 @@ export const FIELD_KINDS = [
   "link",
   "rights",
   "place",
+  "record_link",
 ] as const;
 export type FieldKind = (typeof FIELD_KINDS)[number];
 
@@ -162,6 +174,8 @@ export interface FieldDefinition {
   readonly identifierTypes?: readonly string[];
   /** `text` and `long_text` fields only: a lower length limit than the default. */
   readonly maxLength?: number;
+  /** `record_link` fields only: the record kinds a value may link to. Left out: any kind. */
+  readonly recordKinds?: readonly RecordKind[];
 }
 
 export interface FieldTemplate {
@@ -246,6 +260,7 @@ const FIELD_PROPS: ReadonlySet<string> = new Set([
   "vocabularies",
   "identifierTypes",
   "maxLength",
+  "recordKinds",
 ]);
 /** Properties that only some kinds may have. */
 const KIND_ONLY: ReadonlyMap<string, readonly FieldKind[]> = new Map<string, readonly FieldKind[]>([
@@ -253,6 +268,7 @@ const KIND_ONLY: ReadonlyMap<string, readonly FieldKind[]> = new Map<string, rea
   ["vocabularies", ["controlled_term"]],
   ["identifierTypes", ["identifier"]],
   ["maxLength", ["text", "long_text"]],
+  ["recordKinds", ["record_link"]],
 ]);
 
 export function isFieldKind(value: unknown): value is FieldKind {
@@ -628,6 +644,9 @@ function checkField(
       identifierCode,
     );
   }
+  if (kind === "record_link" && f.recordKinds !== undefined) {
+    checkRecordKinds(f.recordKinds, [...path, "recordKinds"], issues);
+  }
   if ((kind === "text" || kind === "long_text") && f.maxLength !== undefined) {
     const cap = kind === "text" ? MAX_TEXT_LENGTH : MAX_LONG_TEXT_LENGTH;
     if (typeof f.maxLength !== "number" || !Number.isInteger(f.maxLength) || f.maxLength < 1) {
@@ -717,6 +736,32 @@ function checkOptions(
       seen.add(o.value);
     }
     checkLabel(o.label, [...path, i, "label"], "Each option", issues);
+  });
+}
+
+/** A `record_link` field's `recordKinds`: 1 to 6 distinct record kinds. */
+function checkRecordKinds(
+  value: JsonValue,
+  path: readonly (string | number)[],
+  issues: IssueList,
+): void {
+  if (!Array.isArray(value) || value.length === 0 || value.length > RECORD_KINDS.length) {
+    issues.add(
+      path,
+      "invalid_list",
+      `recordKinds must list 1 to ${String(RECORD_KINDS.length)} record kinds (${RECORD_KINDS.join(", ")}), or be left out to allow any.`,
+    );
+    return;
+  }
+  const seen = new Set<string>();
+  (value as readonly JsonValue[]).forEach((kind, i) => {
+    if (!isRecordKind(kind)) {
+      issues.add([...path, i], "invalid_kind", `Record kinds are: ${RECORD_KINDS.join(", ")}.`);
+    } else if (seen.has(kind)) {
+      issues.add([...path, i], "duplicate", `${kind} is listed twice.`);
+    } else {
+      seen.add(kind);
+    }
   });
 }
 
@@ -1079,7 +1124,8 @@ export interface TemplateCheckOptions {
    * (`rights` has one). Leaving a kind out, or giving `undefined`, keeps the
    * default, so a default can't be switched off by accident; to skip a check
    * on purpose, pass a checker that returns `[]`. Values of the `identifier`
-   * kind are refused (`unchecked`) unless a checker is given.
+   * and `record_link` kinds are refused (`unchecked`) unless a checker is
+   * given.
    */
   readonly checkers?: Readonly<Partial<Record<FieldKind, FieldValueChecker | undefined>>>;
   /**
@@ -1250,11 +1296,12 @@ function checkOne(
   const given = ownValue(settings.checkers, field.kind);
   const checker = given === undefined ? defaultChecker(field.kind) : given;
   if (checker === undefined) {
-    if (CHECKER_REQUIRED.has(field.kind)) {
+    const needs = CHECKER_REQUIRED.get(field.kind);
+    if (needs !== undefined) {
       issues.add(
         path,
         "unchecked",
-        `${shown(field.label)} can't be checked without the organization's identifier types, so it can't be accepted. Pass checkers.identifier (makeIdentifierChecker).`,
+        `${shown(field.label)} can't be checked without ${needs}, so it can't be accepted.`,
       );
     }
     return;
@@ -1410,6 +1457,21 @@ function checkShape(
       }
       return;
     }
+    case "record_link": {
+      const v = objectValue(value, ["recordId", "label"], path, label, issues);
+      if (v === undefined) return;
+      if (v.recordId === undefined) {
+        issues.add(
+          [...path, "recordId"],
+          "required",
+          "A record link needs the ID of the record it links to.",
+        );
+      } else if (!isRecordId(v.recordId)) {
+        issues.add([...path, "recordId"], "invalid_id", "recordId must be a record ID.");
+      }
+      requiredLine(v.label, [...path, "label"], "The link's label", issues);
+      return;
+    }
     default:
       // Unreachable for a validated template; fail closed if it ever happens.
       issues.add(
@@ -1430,8 +1492,20 @@ function defaultChecker(kind: FieldKind): FieldValueChecker | undefined {
   if (kind === "controlled_term") return controlledTermChecker;
   return undefined;
 }
-/** Kinds whose values are refused when no checker is given, because no default can exist. */
-const CHECKER_REQUIRED: ReadonlySet<FieldKind> = new Set<FieldKind>(["identifier"]);
+/**
+ * Kinds whose values are refused when no checker is given, because no default
+ * can exist, with what the checker needs.
+ */
+const CHECKER_REQUIRED: ReadonlyMap<FieldKind, string> = new Map<FieldKind, string>([
+  [
+    "identifier",
+    "the organization's identifier types. Pass checkers.identifier (makeIdentifierChecker)",
+  ],
+  [
+    "record_link",
+    "the organization's records, to find the record it links to. Pass checkers.record_link (makeRecordLinkChecker)",
+  ],
+]);
 
 interface CheckSettings {
   readonly allowMissingInherited: boolean;
