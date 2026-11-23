@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-23 18:00 CT — manual (John: "do a long building") — T-024 Migrations tooling and the empty schema; T-018a stuck
+- Result: T-024 done; T-018a stuck (attempts: 3)
+- What changed: **T-024** (D-057) `packages/db`: `pg` 8.23.1 behind one `sql` tag (every value a parameter, extended protocol only, placeholders can't touch surrounding text); a forward-only migration runner holding its advisory lock on a separate connection, one transaction and savepoint per file, refusing any file that ended, prepared or escaped the runner's transaction (`transaction_ended`), re-reading the record before and after COMMIT (`applied_not_recorded`), `lock_lost`, `commit_unknown`, `connection_failed`; `npm run db:migrate`; lint keeping `pg` inside `packages/db`; the gate starts a throwaway PostgreSQL (as the postgres user when root, socket only, minimal env, always cleaned up); CI runs the gate against postgres:15 and :19 with a summary `gate` job. **T-018a** stuck: three reviews each found ways to hide an overdue loan through caller-supplied accession registers; new approach recorded (close loans only in the service layer, T-032); branch pushed; S-012 and S-013 added for gaps on main.
+- Decisions: D-057
+- Review: five independent rounds on T-024 (multi-statement queries, half-applied migrations in many forms, settings leaking between files, placeholder mis-binding, root environment, lock swaps, other applications' prepared transactions, idle timeouts, deferred-trigger tricks); every finding fixed with a test.
+- Gate: PASS · tests_passing 2761 (was 2661) · npm audit clean
+- Next: T-022a (HTTP layer, final fixes), then T-025 (schema: records, templates and record types)
+
 ## 2026-11-23 15:30 CT — manual (John: "do a long building") — S-010, S-007, T-013a, T-015a, T-016a
 - Result: done (built in parallel worktrees, each reviewed, merged into integrate-2; gate on the result)
 - What changed: **S-010** (D-054) `publicOutput` requires current `records` and `templateFor` for every view and indexes records once, so a kept view can't publish data made staff, moved or deleted since. **S-007** `publicOutput` issues are staff-only and their field messages are fixed text. **T-013a** (D-053) `recordTypeChanges`/`recordTypeDeletion` list the records an edit strands; without the records, always needs confirmation. **T-015a** (D-055) `templateChanges` reports narrowed link kinds (fail closed on any link the checker can't resolve); `findStaleLinkLabels` staff report; a record link checker's organization comes from the whole set and an organization-less checker refuses everything. **T-016a** (D-056) accession restrictions (closed until a date; staff and researchers only) hold records back like an unsigned deed; `today` is the caller's.
