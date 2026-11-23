@@ -10,6 +10,28 @@ permissions:
 jobs:
   gate:
     runs-on: ubuntu-latest
+    # The oldest and newest supported PostgreSQL majors (D-049).
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["15", "19"]
+    name: gate (PostgreSQL ${{ matrix.postgres }})
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          # Trust authentication: no password in the repository, not even for
+          # tests. The container is reachable only from this job (D-049).
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+    env:
+      OCULUS_TEST_DATABASE_URL: postgresql://postgres@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v5
         with:
