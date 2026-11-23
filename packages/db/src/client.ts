@@ -1,0 +1,230 @@
+/**
+ * The only file that calls the `pg` driver's `query` (D-050, enforced by lint).
+ *
+ * Every query sent from here is an `Sql` value made by the `sql` tag and goes
+ * through the extended protocol (text and parameters sent separately, one
+ * statement only). The two exceptions are internal and not exported from the
+ * package: `runScript`, which runs a whole migration file from
+ * `packages/db/migrations` for the runner, and `createDatabase` /
+ * `dropDatabase`, which take only names matching `DATABASE_NAME`.
+ *
+ * Type parsers are set explicitly (D-050): `int8` and `numeric` come back as
+ * strings (never lossy numbers), and `date`, `timestamp`, `timestamptz` and
+ * `interval` come back as the server's text, never as JavaScript Dates, so a
+ * day stays the day D-008 stored. Sessions use UTC, ISO dates and ISO 8601
+ * intervals so that text is the same on every server.
+ */
+import pg from "pg";
+import { isSql, type Sql } from "./sql.js";
+
+/** A row as `pg` returns it. */
+export type Row = object;
+
+export interface Queryable {
+  /** Runs a query and returns its rows. */
+  rows<R extends Row = Row>(query: Sql): Promise<R[]>;
+  /** Runs a statement and returns the number of rows it touched. */
+  execute(query: Sql): Promise<number>;
+}
+
+export interface Database extends Queryable {
+  /** Runs `work` in one transaction: committed if it resolves, rolled back if it throws. */
+  transaction<T>(work: (tx: Queryable) => Promise<T>): Promise<T>;
+  /** Closes every connection. */
+  close(): Promise<void>;
+}
+
+export interface DatabaseOptions {
+  /** Most connections in the pool (default 10). */
+  max?: number;
+  /** Name shown in pg_stat_activity. */
+  applicationName?: string;
+}
+
+const OID = {
+  int8: 20,
+  numeric: 1700,
+  date: 1082,
+  timestamp: 1114,
+  timestamptz: 1184,
+  interval: 1186,
+  textArray: 1009,
+  int8Array: 1016,
+  numericArray: 1231,
+  dateArray: 1182,
+  timestampArray: 1115,
+  timestamptzArray: 1185,
+  intervalArray: 1187,
+} as const;
+
+const asText = (value: string): string => value;
+/** pg's own parsers, looked up by plain OID number. */
+const builtinParser = pg.types.getTypeParser as (
+  oid: number,
+  format: "text" | "binary",
+) => (value: string) => unknown;
+const textArrayParser = builtinParser(OID.textArray, "text");
+
+const TEXT_TYPES = new Set<number>([
+  OID.int8,
+  OID.numeric,
+  OID.date,
+  OID.timestamp,
+  OID.timestamptz,
+  OID.interval,
+]);
+const TEXT_ARRAY_TYPES = new Set<number>([
+  OID.int8Array,
+  OID.numericArray,
+  OID.dateArray,
+  OID.timestampArray,
+  OID.timestamptzArray,
+  OID.intervalArray,
+]);
+
+/** The type parsers every Oculus connection uses (not pg's global ones). */
+export const typeParsers = {
+  getTypeParser(oid: number, format?: "text" | "binary"): (value: string) => unknown {
+    if (format !== "binary") {
+      if (TEXT_TYPES.has(oid)) return asText;
+      if (TEXT_ARRAY_TYPES.has(oid)) return textArrayParser;
+    }
+    return builtinParser(oid, format ?? "text");
+  },
+};
+
+/** Server settings for every session (the server's own text formats). */
+export const SESSION_OPTIONS = "-c TimeZone=UTC -c DateStyle=ISO,YMD -c IntervalStyle=iso_8601";
+
+export function clientConfig(connectionString: string): pg.ClientConfig {
+  return { connectionString, types: typeParsers, options: SESSION_OPTIONS };
+}
+
+function checked(query: Sql): pg.QueryConfig {
+  if (!isSql(query)) throw new TypeError("Queries must be made with the sql tag.");
+  return { text: query.text, values: query.values };
+}
+
+function queryable(target: pg.Pool | pg.PoolClient | pg.Client): Queryable {
+  return {
+    async rows<R extends Row = Row>(query: Sql): Promise<R[]> {
+      const result = await target.query(checked(query));
+      return result.rows as R[];
+    },
+    async execute(query: Sql): Promise<number> {
+      const result = await target.query(checked(query));
+      return result.rowCount ?? 0;
+    },
+  };
+}
+
+/** Opens a connection pool. The connection string comes from the environment, never the repo. */
+export function openDatabase(connectionString: string, options: DatabaseOptions = {}): Database {
+  const pool = new pg.Pool({
+    ...clientConfig(connectionString),
+    max: options.max ?? 10,
+    ...(options.applicationName === undefined ? {} : { application_name: options.applicationName }),
+  });
+  // An idle connection that fails (a server restart) is dropped by the pool;
+  // without a listener the error would crash the process.
+  pool.on("error", () => undefined);
+  const base = queryable(pool);
+  return {
+    ...base,
+    async transaction<T>(work: (tx: Queryable) => Promise<T>): Promise<T> {
+      const client = await pool.connect();
+      let broken = false;
+      try {
+        await client.query("BEGIN");
+        const result = await work(queryable(client));
+        await client.query("COMMIT");
+        return result;
+      } catch (error) {
+        try {
+          await client.query("ROLLBACK");
+        } catch {
+          broken = true;
+        }
+        throw error;
+      } finally {
+        client.release(broken);
+      }
+    },
+    async close(): Promise<void> {
+      await pool.end();
+    },
+  };
+}
+
+/** A single dedicated connection, for the migration runner (it holds a session lock). */
+export interface Session extends Queryable {
+  close(): Promise<void>;
+  /** Runs `BEGIN`, `COMMIT` or `ROLLBACK`. */
+  control(statement: "BEGIN" | "COMMIT" | "ROLLBACK"): Promise<void>;
+  /** @internal Runs a whole migration file (several statements) with the simple protocol. */
+  runScript(text: string): Promise<void>;
+}
+
+export async function openSession(connectionString: string): Promise<Session> {
+  const client = new pg.Client({ ...clientConfig(connectionString), application_name: "oculus" });
+  // Errors after connecting (the server going away) surface on the next query.
+  client.on("error", () => undefined);
+  await client.connect();
+  return {
+    ...queryable(client),
+    async close() {
+      await client.end();
+    },
+    async control(statement) {
+      await client.query(statement);
+    },
+    async runScript(text: string) {
+      await client.query(text);
+    },
+  };
+}
+
+/** Database names `createDatabase` and `dropDatabase` accept: plain lower-case names. */
+export const DATABASE_NAME = /^[a-z][a-z0-9_]{0,62}$/;
+
+function databaseIdentifier(name: string): string {
+  if (typeof name !== "string" || !DATABASE_NAME.test(name)) {
+    throw new TypeError("Database names must match /^[a-z][a-z0-9_]{0,62}$/.");
+  }
+  return `"${name}"`;
+}
+
+/**
+ * Creates an empty database (CREATE DATABASE can't take a parameter or run in
+ * a transaction, so the name is checked against `DATABASE_NAME` and quoted).
+ */
+export async function createDatabase(adminConnectionString: string, name: string): Promise<void> {
+  const statement = `CREATE DATABASE ${databaseIdentifier(name)} TEMPLATE template0 ENCODING 'UTF8'`;
+  const client = new pg.Client(clientConfig(adminConnectionString));
+  await client.connect();
+  try {
+    await client.query(statement);
+  } finally {
+    await client.end();
+  }
+}
+
+/** Drops a database, closing any connections still open to it. */
+export async function dropDatabase(adminConnectionString: string, name: string): Promise<void> {
+  const statement = `DROP DATABASE IF EXISTS ${databaseIdentifier(name)} WITH (FORCE)`;
+  const client = new pg.Client(clientConfig(adminConnectionString));
+  await client.connect();
+  try {
+    await client.query(statement);
+  } finally {
+    await client.end();
+  }
+}
+
+/** The same server URL with another database name. */
+export function withDatabaseName(connectionString: string, name: string): string {
+  databaseIdentifier(name);
+  const url = new URL(connectionString);
+  url.pathname = `/${name}`;
+  return url.toString();
+}
