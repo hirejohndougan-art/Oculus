@@ -28,13 +28,17 @@
  *   fields aside), with the default checkers and any the caller gives in
  *   `checkers`. Identifier values need `makeIdentifierChecker` (D-015). Any
  *   problem refuses the output, with the check's issues.
- * - **A kept view is checked against the catalog as it is now, if asked.**
- *   A view holds the records and templates it was built from (D-020). With
- *   `records` (the current set), the record's ancestry is found again and
- *   must be the same records with the same stored content
- *   (`record_changed`); with `templateFor`, every template on the way must
- *   be unchanged (`template_changed`). Only both together catch every
- *   change; building the view at publish time is still the rule.
+ * - **Every view is checked against the catalog as it is now** (D-054).
+ *   A view holds the records and templates it was built from (D-020), and
+ *   nothing in it says whether it was made a moment ago or kept from
+ *   earlier, so every view is treated as kept. `records` (the current set)
+ *   and `templateFor` (the current templates) are both required
+ *   (`records_unknown`, `templates_unknown` without them): the record's
+ *   ancestry is found again and must be the same records with the same
+ *   stored content (`record_changed`, D-021), and every template on the way
+ *   must be unchanged (`template_changed`, D-020). A caller that builds the
+ *   view and publishes it in one step passes the same records and templates
+ *   it gave `effectiveRecord`.
  * - **Only public identifier types go out** (D-022). The checker from
  *   `makeIdentifierChecker` refuses a staff type's value in a public field
  *   (`private_identifier_type`), and the identifier value is checked again
@@ -55,13 +59,12 @@
  *   unit or digital asset without it (`accessions_unknown`) and one an
  *   accession with a deed `missing` or `sent` produced, or produced an
  *   ancestor or the record a digital asset represents (`deed_not_signed`).
- *   With `records`, what a digital asset represents is found again in them.
- *   A link to an object, archival unit or digital asset goes out only
- *   when `records` is given and the linked record, its ancestry and what it
- *   represents, all found in `records` now, are known to the register and
- *   none is held back; otherwise nothing of it goes out, as if unpublished
- *   (so a page published without `accessions` or `records` shows no such
- *   links, D-045). The check is only as fresh as the register: make it at
+ *   What a digital asset represents is found again in `records`. A link to
+ *   an object, archival unit or digital asset goes out only when the linked
+ *   record, its ancestry and what it represents, all found in `records` now,
+ *   are known to the register and none is held back; otherwise nothing of
+ *   it goes out, as if unpublished (so a page published without
+ *   `accessions` shows no such links, D-045). The check is only as fresh as the register: make it at
  *   publish time. Nothing of an accession or a donor is read here.
  * - **Publishing is the caller's statement.** Records have no publish state
  *   yet, so the caller passes `published`, the IDs of every record that is
@@ -175,7 +178,6 @@ import {
   MAX_URL_LENGTH,
   checkRecordAgainstTemplate,
   storedTemplateKey,
-  validateTemplate,
   type FieldDefinition,
   type FieldTemplate,
   type TemplateCheckOptions,
@@ -215,37 +217,29 @@ export interface PublishOptions {
    */
   readonly checkers?: TemplateCheckOptions["checkers"];
   /**
-   * The record's template as it is now. When given, output is refused if it
-   * differs from the template the view was built with (`template_changed`).
-   * It checks only the record's own template, so for a record with parents
-   * it must come with `templateFor` (`ancestor_templates_unchecked`).
+   * Required (D-054): the templates as they are now, a registry from
+   * `indexTemplates` or a lookup function, the same kinds `effectiveRecord`
+   * takes (`templates_unknown` without it). The template of the record and
+   * of every ancestor, as they are in `records` now, is found again, and
+   * output is refused if any differs from the one the view used
+   * (`template_changed`): a field made staff since, the record's own or a
+   * parent's, would otherwise still publish its value. A template whose key
+   * isn't the record's `templateKey` is refused (`template_mismatch`).
    */
-  readonly currentTemplate?: unknown;
+  readonly templateFor: TemplateSource;
   /**
-   * The templates as they are now: a registry from `indexTemplates` or a
-   * lookup function, the same kinds `effectiveRecord` takes. When given, the
-   * template of the record and of every ancestor the view was built from is
-   * found again, and output is refused if any differs from the one the view
-   * used (`template_changed`): a parent's field made staff since would
-   * otherwise still publish the value its child inherited. A template whose
-   * key isn't the record's `templateKey` is refused (`template_mismatch`).
-   * With `records`, the templates are found for the records as they are now.
+   * Required (D-054): the records as they are now, a list or a lookup from
+   * `indexRecords`, the same kind `effectiveRecord` takes (`records_unknown`
+   * without it). The record and its parents are found again in it, and
+   * output is refused unless they are the same records, in the same order,
+   * with the same stored content as when the view was made
+   * (`record_changed`, naming the record that differs, never its values): a
+   * record removed, an ancestor's value changed or emptied, or a record
+   * moved to another parent or level would otherwise still publish the old
+   * values (D-021). Links to objects, archival units and digital assets are
+   * deed-checked in it too (D-043, D-045).
    */
-  readonly templateFor?: TemplateSource;
-  /**
-   * The records as they are now, a list or a lookup from `indexRecords`, the
-   * same kind `effectiveRecord` takes. When given, the record and its parents
-   * are found again in it, and output is refused unless they are the same
-   * records, in the same order, with the same stored content as when the view
-   * was made (`record_changed`, naming the record that differs, never its
-   * values): an ancestor's value changed or emptied since, or a record moved
-   * to another parent or level, would otherwise still publish the old
-   * inherited values. Only `records` and `templateFor` together catch every
-   * change to a kept view (D-021). Links to objects, archival units and
-   * digital assets are deed-checked in it too, and without it don't go out
-   * at all (D-043, D-045).
-   */
-  readonly records?: RecordLookup | readonly CatalogRecord[];
+  readonly records: RecordLookup | readonly CatalogRecord[];
   /**
    * The identifiers (`RecordIdentifiers`) as they are now, of the record and
    * the ancestors its values come from, all of its organization (D-038).
@@ -458,15 +452,14 @@ interface Budget {
  * base URL, the published record IDs and any checkers. Fails, with the
  * issues found, when anything is off. Never throws.
  *
- * **Build the view fresh at publish time.** A view records the template it
- * was made with; a view kept from earlier publishes under that template's
- * visibility and fields, even if the template has changed since. Pass the
- * template lookup as it is now in `templateFor` to have a view refused when
- * the template of the record or of any ancestor has changed
- * (`template_changed`), and the records as they are now in `records` to have
- * it refused when the record or any ancestor has been edited, moved or
- * removed since (`record_changed`). Only the two together catch every change;
- * either alone leaves the other kind of change unseen.
+ * **The catalog as it is now is required.** A view records the records and
+ * templates it was made with, and a view can't show whether it was made a
+ * moment ago, so `records` and `templateFor` must give the records and
+ * templates as they are now: the view is refused when the record or any
+ * ancestor has been edited, moved or removed since (`record_changed`), or
+ * the template of any of them has changed (`template_changed`). Without
+ * either, nothing is published (`records_unknown`, `templates_unknown`,
+ * D-054).
  *
  * **"Passes the template check" means the configured check.** Checkers given
  * in `checkers` replace the defaults for their kinds (as
@@ -501,16 +494,8 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
       "This is not a public view from publicView, so it can't be published.",
     );
   }
-  const {
-    baseUrl,
-    published,
-    checkers,
-    currentTemplate,
-    templateFor,
-    records,
-    identifiers,
-    accessions,
-  } = readOptions(options);
+  const { baseUrl, published, checkers, templateFor, records, identifiers, accessions } =
+    readOptions(options);
   if (!published.has(view.id)) {
     fail([], "not_published", "This record is not in the published list, so it can't be output.");
   }
@@ -519,8 +504,8 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
   // The deed check fails closed without the register (D-043).
   const blocked = effectivePublishIssues(effective, accessions === undefined ? {} : { accessions });
   if (blocked.length > 0) throw new OutputError(blocked);
-  // With `records`, what a digital asset shows is found again as it is now.
-  if (records !== undefined && effective.record.kind === "digital_asset") {
+  // What a digital asset shows is found again in the records as they are now.
+  if (effective.record.kind === "digital_asset") {
     const now = deedIssuesNow(effective, accessions, currentRepresented(effective.record, records));
     if (now.length > 0) throw new OutputError(now);
   }
@@ -537,19 +522,10 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
       );
     }
   }
-  if (currentTemplate !== undefined) {
-    sameTemplate(currentTemplate, template);
-    if (origin.chain.length > 1 && templateFor === undefined) {
-      fail(
-        ["currentTemplate"],
-        "ancestor_templates_unchecked",
-        "This record inherits from parent records, and currentTemplate checks only its own template. Pass templateFor too, so a parent's template changed since the view was made is caught.",
-      );
-    }
-  }
-  // With `records`, the templates are looked up for the records as they are now.
-  const chain = records === undefined ? origin.chain : sameAncestry(records, origin.chain);
-  if (templateFor !== undefined) sameChainTemplates(templateFor, chain);
+  // Fail closed (D-054): nothing says whether this view was kept from
+  // earlier, so it is always checked against the records and templates now.
+  const chain = sameAncestry(records, origin.chain);
+  sameChainTemplates(templateFor, chain);
   const checked = validateDublinCoreMapping(mapping, template);
   if (!checked.ok) throw new OutputError(checked.issues);
   if (
@@ -664,29 +640,6 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
     jsonLdText,
     oaiDcXml: oaiDc(dublinCore),
   });
-}
-
-/**
- * Refuse when the record's template today is not the one the view was built
- * with: a view kept from earlier would publish under the old visibility and
- * fields. Compared as validated data, with object keys in sorted order.
- */
-function sameTemplate(current: unknown, captured: FieldTemplate): void {
-  const checked = validateTemplate(current);
-  if (!checked.ok) {
-    fail(
-      ["currentTemplate"],
-      "invalid_template",
-      "currentTemplate is not a valid template. Check it with validateTemplate.",
-    );
-  }
-  if (canonicalJson(checked.value) !== canonicalJson(captured)) {
-    fail(
-      ["currentTemplate"],
-      "template_changed",
-      "The record's template has changed since this public view was made. Make the view again with effectiveRecord and publicView, and publish that.",
-    );
-  }
 }
 
 /**
@@ -1033,7 +986,6 @@ const OPTION_KEYS: ReadonlySet<string> = new Set([
   "baseUrl",
   "published",
   "checkers",
-  "currentTemplate",
   "templateFor",
   "records",
   "identifiers",
@@ -1044,8 +996,7 @@ interface ReadOptions {
   readonly baseUrl: string;
   readonly published: ReadonlySet<RecordId>;
   readonly checkers: unknown;
-  readonly currentTemplate: unknown;
-  readonly templateFor: TemplateSource | undefined;
+  readonly templateFor: TemplateSource;
   readonly records: unknown;
   readonly identifiers: unknown;
   readonly accessions: unknown;
@@ -1063,18 +1014,37 @@ function readOptions(options: unknown): ReadOptions {
   const baseUrl = checkBaseUrl(dataProp(options, "baseUrl"));
   const published = readPublished(dataProp(options, "published"));
   const checkers = dataProp(options, "checkers");
-  const currentTemplate = dataProp(options, "currentTemplate");
-  const lookup = dataProp(options, "templateFor");
-  if (lookup !== undefined && !isTemplateSource(lookup)) {
+  const templateFor = dataProp(options, "templateFor");
+  // Checked when it is used: it may be a list or a lookup from indexRecords.
+  const records = dataProp(options, "records");
+  // Both are required, whether the view was made just now or kept (D-054).
+  const missing: Issue[] = [];
+  if (records === undefined) {
+    missing.push(
+      issue(
+        ["records"],
+        "records_unknown",
+        "Publishing needs the records option (the records as they are now), to check the record and its parents haven't changed since the public view was made.",
+      ),
+    );
+  }
+  if (templateFor === undefined) {
+    missing.push(
+      issue(
+        ["templateFor"],
+        "templates_unknown",
+        "Publishing needs the templateFor option (the templates as they are now), to check no template has changed since the public view was made.",
+      ),
+    );
+  }
+  if (missing.length > 0) throw new OutputError(missing);
+  if (!isTemplateSource(templateFor)) {
     fail(
       ["templateFor"],
       "invalid_options",
       "The templateFor option must be a registry from indexTemplates or a function.",
     );
   }
-  const templateFor = lookup;
-  // Checked when it is used: it may be a list or a lookup from indexRecords.
-  const records = dataProp(options, "records");
   // Read once, when it is used.
   const identifiers = dataProp(options, "identifiers");
   // Checked by effectivePublishIssues, which reads only its held record IDs.
@@ -1083,7 +1053,6 @@ function readOptions(options: unknown): ReadOptions {
     baseUrl,
     published,
     checkers,
-    currentTemplate,
     templateFor,
     records,
     identifiers,

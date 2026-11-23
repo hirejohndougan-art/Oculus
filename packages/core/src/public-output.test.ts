@@ -906,16 +906,16 @@ describe("publicView: rights notes", () => {
   });
 });
 
-describe("publicOutput: currentTemplate", () => {
+describe("publicOutput: templateFor", () => {
   const item = record("object", "I", { rights: { uri: CNE }, donor_note: "SECRET" });
   const view = viewOf([item], item.id);
-  const run = (currentTemplate: unknown) =>
+  const run = (current: unknown) =>
     publicOutput(view, MAPPING, {
       ...nowOf(view),
+      templateFor: () => current as FieldTemplate,
       baseUrl: BASE,
       accessions: accessionsFor(view),
       published: [view.id],
-      currentTemplate,
     });
 
   it("publishes when the template is unchanged, even as a fresh copy in another key order", () => {
@@ -934,8 +934,20 @@ describe("publicOutput: currentTemplate", () => {
   });
 
   it("refuses an invalid current template", () => {
-    expect(codes(run({ key: "out" }))).toEqual(["invalid_template"]);
-    expect(codes(run(new Proxy(TPL, {})))).toEqual(["invalid_options"]);
+    const result = run({ key: "out" });
+    expect(codes(result)).toEqual(["template_changed"]);
+    expect(JSON.stringify(result)).not.toContain("SECRET");
+  });
+
+  it("no longer takes currentTemplate (D-054)", () => {
+    const result = publicOutput(view, MAPPING, {
+      ...nowOf(view),
+      baseUrl: BASE,
+      accessions: accessionsFor(view),
+      published: [view.id],
+      currentTemplate: TPL,
+    } as never);
+    expect(codes(result)).toEqual(["invalid_options"]);
   });
 });
 

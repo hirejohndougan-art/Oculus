@@ -868,16 +868,21 @@ describe("a parent's template changed after the view was made (security run 2026
     expect(JSON.stringify(result)).not.toContain("SECRET");
   });
 
-  it("refuses currentTemplate alone for a record with parents, which used to publish", () => {
+  it("refuses currentTemplate, which checked only the record's own template (D-054)", () => {
     const { view, item } = staleView();
-    const result = publicOutput(view, CREATOR_MAP, {
-      baseUrl: BASE,
-      accessions: accessionsFor(view),
-      published: [item.id],
-      checkers: CHECKERS,
-      currentTemplate: TPL,
-    });
-    expect(codes(result)).toEqual(["ancestor_templates_unchecked"]);
+    // It once published here; since D-054 it is no longer an option at all.
+    for (const extra of [{}, nowOf(view)]) {
+      const result = publicOutput(view, CREATOR_MAP, {
+        ...extra,
+        baseUrl: BASE,
+        accessions: accessionsFor(view),
+        published: [item.id],
+        checkers: CHECKERS,
+        currentTemplate: TPL,
+      } as never);
+      expect(codes(result)).toEqual(["invalid_options"]);
+      expect(JSON.stringify(result)).not.toContain("SECRET");
+    }
   });
 
   it("refuses when templateFor now finds no template, throws, or isn't a function", () => {
@@ -926,7 +931,6 @@ describe("a parent's template changed after the view was made (security run 2026
         accessions: accessionsFor(view),
         published: [item.id],
         checkers: CHECKERS,
-        currentTemplate: TPL,
         templateFor: lookup,
       }),
     );
@@ -987,8 +991,11 @@ describe("the records changed after the view was made (S-001a)", () => {
   it("refuses when an ancestor's value has changed since, naming the ancestor", () => {
     const { view, item, fonds, other } = keptView();
     const edited = { ...fonds, fields: { ...fonds.fields, creator: "New creator" } };
-    // templateFor alone can't see it: the templates are unchanged.
-    expect(run(view, item.id, undefined).ok).toBe(true);
+    // templateFor alone can't see it (the templates are unchanged), so
+    // since D-054 publishing without the records is refused outright.
+    const without = run(view, item.id, undefined);
+    expect(codes(without)).toEqual(["records_unknown"]);
+    expect(JSON.stringify(without)).not.toContain("SECRET");
     refusedAt(run(view, item.id, [item, edited, other]), fonds.id);
     const indexed = indexRecords([item, edited, other]);
     if (!indexed.ok) throw new Error("bad fixture");
