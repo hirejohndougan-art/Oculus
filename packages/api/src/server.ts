@@ -193,20 +193,51 @@ function clientError(error: { code?: string }, socket: Socket): void {
   );
 }
 
-/** What the log gets for a 500 a handler caused: a summary of plain strings, never the value. */
-const failures = new WeakMap<Refusal, ThrownSummary>();
+/**
+ * What the log gets for a 500 a handler caused: a summary of plain strings,
+ * never the value. Keyed by the request (not the Refusal), so two requests
+ * can never share an entry.
+ */
+const failures = new WeakMap<FastifyRequest, ThrownSummary>();
 
 /**
- * Registers one application route. Whatever the handler throws or rejects
- * with is caught here and replaced by a fresh Refusal (errors.ts), so no
- * value of the handler's (its getters, a Proxy, a `headers` object) ever
- * reaches Fastify, its default error handler, a diagnostics_channel
- * subscriber or the logger. The request view carries an AbortSignal that
- * fires on the handler timeout or when the client goes away; from then on
- * the reply view throws.
+ * Logs a failure the client can no longer be told about (the handler timed
+ * out and its 503 is sent, or the client has gone): the same fixed-shape
+ * record of plain strings, with the method and path only. Never throws.
+ */
+function logLateFailure(request: FastifyRequest, fresh: Refusal, thrown: unknown): void {
+  try {
+    request.log.error(
+      {
+        failure: {
+          status: fresh.statusCode,
+          code: fresh.code,
+          method: request.method,
+          path: pathOf(request.raw.url ?? ""),
+          ...summarizeThrown(thrown),
+        },
+      },
+      "request failed after the reply was sent",
+    );
+  } catch {
+    // A logger that fails can't change the reply, which is already sent.
+  }
+}
+
+/**
+ * Registers one application route (already checked and copied by
+ * `checkRoute`). Whatever the handler throws or rejects with is caught here
+ * and replaced by a fresh Refusal (errors.ts), so no value of the handler's
+ * (its getters, a Proxy, a `headers` object) ever reaches Fastify, its
+ * default error handler, a diagnostics_channel subscriber or the logger. The
+ * request view carries an AbortSignal that fires on the handler timeout or
+ * when the client goes away; from then on the reply view throws, and a late
+ * result or failure is never handed to Fastify (which would log the request
+ * URL, query string included, and the error object).
  */
 function addRoute(app: FastifyInstance, route: OculusRoute): void {
   const credentials = route.credentials === true;
+  const handler = route.handler;
   app.route({
     method: route.method,
     url: route.path,
@@ -226,9 +257,10 @@ function addRoute(app: FastifyInstance, route: OculusRoute): void {
       const response = reply.raw;
       if (response.writableEnded || response.destroyed) stop();
       else response.once("close", stop);
+      const ended = (): boolean => controller.signal.aborted || reply.sent;
       let body: unknown;
       try {
-        const result: unknown = await route.handler(
+        const result: unknown = await handler(
           oculusRequest(request, controller.signal),
           oculusReply(reply, () => running),
         );
@@ -237,14 +269,21 @@ function addRoute(app: FastifyInstance, route: OculusRoute): void {
         body = resultBody(result);
       } catch (thrown) {
         const fresh = rebuildThrown(thrown);
-        if (fresh.statusCode >= 500) failures.set(fresh, summarizeThrown(thrown));
+        if (ended()) {
+          // Too late to answer: Fastify would log `{ err }` (pino's error
+          // serializer throws on a frozen Refusal) and then "reply already
+          // sent" with the full URL. Log the summary here and stop.
+          logLateFailure(request, fresh, thrown);
+          return undefined;
+        }
+        if (fresh.statusCode >= 500) failures.set(request, summarizeThrown(thrown));
         throw fresh;
       } finally {
         running = false;
         response.removeListener("close", stop);
       }
       // Timed out (the 503 is already sent) or the client has gone.
-      if (controller.signal.aborted) return undefined;
+      if (ended()) return undefined;
       return reply.send(body);
     },
   });
@@ -294,6 +333,60 @@ function sendDirect(reply: FastifyReply, status: number, code: string): void {
   }
 }
 
+/** What the log shows for an error object Fastify passes to the logger. */
+const OMITTED_ERROR = Object.freeze({ type: "omitted", message: "", stack: "" });
+
+/** Fields a log record may carry; Fastify's own and the `failure` record. */
+const LOG_FIELDS: ReadonlySet<string> = new Set([
+  "req",
+  "res",
+  "failure",
+  "responseTime",
+  "statusCode",
+]);
+
+/**
+ * A query string (`?` and what follows up to white space) removed from a log
+ * message. Fastify writes `request.url` into some messages ("Reply was
+ * already sent … in "/x?q=…"", "Route GET:/x?q=… not found").
+ */
+export function withoutQuery(text: string): string {
+  return text.replace(/\?\S+/g, "");
+}
+
+/** The merging object of a log call, rebuilt from the allowed fields only. */
+function safeLogFields(value: unknown): Record<string, unknown> {
+  const fields: Record<string, unknown> = {};
+  if (typeof value !== "object" || value === null) return fields;
+  if (value instanceof Error) {
+    fields.err = OMITTED_ERROR;
+    return fields;
+  }
+  for (const key of Object.keys(value)) {
+    if (key === "err") fields.err = OMITTED_ERROR;
+    else if (LOG_FIELDS.has(key)) fields[key] = (value as Record<string, unknown>)[key];
+  }
+  return fields;
+}
+
+/**
+ * pino's `logMethod` hook: every log call (Fastify's and ours) goes out as
+ * at most a rebuilt merging object and one message with any query string
+ * removed. Error objects are never serialized, their messages never become
+ * the log message, and printf-style arguments are dropped.
+ */
+function safeLogCall(this: unknown, args: unknown[], method: (...args: unknown[]) => void): void {
+  const [first, second] = args;
+  if (typeof first === "string") {
+    method.call(this, withoutQuery(first));
+    return;
+  }
+  const fields = safeLogFields(first);
+  // Without a message pino would take `err.message`; give it a fixed one.
+  const message = typeof second === "string" ? withoutQuery(second) : "log record";
+  method.call(this, fields, message);
+}
+
 /** Builds the configured Oculus server and waits until it is ready. */
 export async function buildServer(options: ServerOptions = {}): Promise<FastifyInstance> {
   const timeouts = chooseTimeouts(options.timeouts);
@@ -311,7 +404,12 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
           serializers: {
             // Method and path only: no query string, headers, cookies or address.
             req: (req) => ({ method: req.method, url: pathOf(req.url) }),
+            // Never looks at the error: pino's own serializer writes to it (and
+            // throws on a frozen Refusal) and copies its message, which for
+            // Fastify's own errors can hold the URL with its query string.
+            err: () => OMITTED_ERROR,
           },
+          hooks: { logMethod: safeLogCall },
         };
 
   const app: FastifyInstance = Fastify({
@@ -356,8 +454,7 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
 
   app.addHook("onRoute", (route) => {
     const problem = routeOptionsProblem(route);
-    if (problem !== undefined)
-      throw new Error(`${route.method.toString()} ${route.url}: ${problem}`);
+    if (problem !== undefined) throw new Error(`${route.url}: ${problem}`);
     routes.add(route.method, route.url);
   });
 
@@ -384,7 +481,8 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
     try {
       const { statusCode, body } = errorReply(error);
       if (statusCode >= 500) {
-        const thrown = failures.get(error as Refusal) ?? summarizeThrown(error);
+        const thrown = failures.get(request) ?? summarizeThrown(error);
+        failures.delete(request);
         // A fixed-shape record of plain strings; never the error object itself.
         request.log.error(
           { failure: { status: statusCode, code: body.error, ...thrown } },
@@ -409,7 +507,7 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
       .send({ error: wrongMethod ? "method_not_allowed" : "not_found" });
   });
 
-  addRoute(app, { method: "GET", path: "/health", handler: () => ({ status: "ok" }) });
+  addRoute(app, checkRoute({ method: "GET", path: "/health", handler: () => ({ status: "ok" }) }));
   for (const route of appRoutes) addRoute(app, route);
 
   await app.ready();

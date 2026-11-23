@@ -121,24 +121,44 @@ const ROUTE_KEYS: ReadonlySet<string> = new Set([
   "handler",
 ]);
 
-/** Checks a route given by application code; throws when it isn't a plain `OculusRoute`. */
+/**
+ * Checks a route given by application code and returns a frozen copy of its
+ * fields, each read exactly once; throws when it isn't a plain `OculusRoute`.
+ * The server registers only the copy, so a getter can't pass the check with
+ * one value and register another (a `method` that says GET here and TRACE
+ * later).
+ */
 export function checkRoute(route: unknown): OculusRoute {
   if (typeof route !== "object" || route === null) throw new Error("a route must be an object");
   for (const key of Object.keys(route)) {
     if (!ROUTE_KEYS.has(key)) throw new Error(`route option not allowed: ${key}`);
   }
   const r = route as Partial<Record<keyof OculusRoute, unknown>>;
-  if (!ROUTE_METHODS.includes(r.method as RouteMethod)) {
-    throw new Error(`route method not allowed: ${String(r.method)}`);
+  const method = r.method;
+  const path = r.path;
+  const form = r.form;
+  const credentials = r.credentials;
+  const handler = r.handler;
+  if (typeof method !== "string" || !ROUTE_METHODS.includes(method as RouteMethod)) {
+    throw new Error(`route method not allowed: ${String(method)}`);
   }
-  if (typeof r.path !== "string") throw new Error("route path must be text");
-  for (const flag of ["form", "credentials"] as const) {
-    if (r[flag] !== undefined && typeof r[flag] !== "boolean") {
+  if (typeof path !== "string") throw new Error("route path must be text");
+  for (const [flag, value] of [
+    ["form", form],
+    ["credentials", credentials],
+  ] as const) {
+    if (value !== undefined && typeof value !== "boolean") {
       throw new Error(`route ${flag} must be true or false`);
     }
   }
-  if (typeof r.handler !== "function") throw new Error("route handler must be a function");
-  return route as OculusRoute;
+  if (typeof handler !== "function") throw new Error("route handler must be a function");
+  return Object.freeze({
+    method: method as RouteMethod,
+    path,
+    form: form === true,
+    credentials: credentials === true,
+    handler: handler as OculusRoute["handler"],
+  });
 }
 
 function deepFreeze<T>(value: T): T {
@@ -244,18 +264,22 @@ export function plainData(
     throw new Error("handler result: only plain objects and arrays are data");
   }
   seen.add(value);
-  const descriptors = Object.getOwnPropertyDescriptors(value);
+  // One descriptor at a time, never all at once: the size is checked before
+  // anything is read, so a 3,000,000-item array or a million-key object is
+  // refused without building a descriptor for every entry.
   const read = (key: string): unknown => {
-    const descriptor = descriptors[key];
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (descriptor === undefined) return undefined;
     if (!("value" in descriptor)) throw new Error("handler result: getters are not data");
     return descriptor.value;
   };
+  const remaining = MAX_RESULT_NODES - budget.nodes;
   let copy: unknown;
   if (isArray) {
     const length = read("length");
     if (typeof length !== "number") throw new Error("handler result: bad array");
     if (length > MAX_RESULT_ARRAY_LENGTH) throw new Error("handler result: array too long");
+    if (length > remaining) throw new Error("handler result: too many values");
     const list: unknown[] = [];
     for (let i = 0; i < length; i++) {
       const item = read(String(i));
@@ -263,10 +287,15 @@ export function plainData(
     }
     copy = list;
   } else {
+    const keys = Reflect.ownKeys(value);
+    if (keys.length > remaining) throw new Error("handler result: too many values");
     const object: Record<string, unknown> = {};
-    for (const key of Object.keys(descriptors)) {
-      if (!descriptors[key]?.enumerable) continue;
-      const item = read(key);
+    for (const key of keys) {
+      if (typeof key !== "string") continue;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor?.enumerable) continue;
+      if (!("value" in descriptor)) throw new Error("handler result: getters are not data");
+      const item: unknown = descriptor.value;
       if (item === undefined) continue;
       spendText(key, budget);
       // defineProperty, so a "__proto__" key stays an ordinary key.
@@ -351,6 +380,8 @@ export function routeConfig(route: OculusRoute): { readonly oculus: OculusRouteC
   });
 }
 
+const ROUTE_METHODS_WITH_HEAD: ReadonlySet<string> = new Set([...ROUTE_METHODS, "HEAD"]);
+
 /** Fastify's own keys on a route as onRoute sees it. */
 const FASTIFY_ROUTE_KEYS: ReadonlySet<string> = new Set([
   "method",
@@ -368,12 +399,17 @@ const FASTIFY_ROUTE_KEYS: ReadonlySet<string> = new Set([
 
 /**
  * Why a route Fastify is about to add breaks the rules, or `undefined`.
- * Refused: any option outside the set above (an error handler, hooks other
+ * Refused: a method other than ours (and HEAD), any option outside the set above (an error handler, hooks other
  * than Fastify's own HEAD `onSend`, a handler timeout, schemas, compilers,
  * constraints), a prefix, and a body limit other than the credentials limit
  * on a credentials route and none elsewhere.
  */
 export function routeOptionsProblem(route: RouteOptions): string | undefined {
+  // One method per route, one of ours, or the HEAD route Fastify adds for a GET.
+  const method: unknown = route.method;
+  if (typeof method !== "string" || !ROUTE_METHODS_WITH_HEAD.has(method)) {
+    return "route method not allowed";
+  }
   for (const [key, value] of Object.entries(route)) {
     if (value === undefined) continue;
     if (!FASTIFY_ROUTE_KEYS.has(key)) return `route option not allowed: ${key}`;

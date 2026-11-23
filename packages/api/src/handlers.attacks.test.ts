@@ -176,6 +176,30 @@ describe("handler results", () => {
     expect(Date.now() - started).toBeLessThan(3_000);
   });
 
+  it.each([
+    ["a 3,000,000-item array", (): unknown => new Array<number>(3_000_000).fill(0), 50],
+    [
+      "an object with more keys than the value cap",
+      (): unknown => {
+        const object: Record<string, number> = {};
+        for (let i = 0; i <= MAX_RESULT_NODES; i++) object[`k${String(i)}`] = 0;
+        return object;
+      },
+      1_200,
+    ],
+  ])("refuses %s before reading its entries", (_name, make, cpuMs) => {
+    const value = make();
+    const heapBefore = process.memoryUsage().heapUsed;
+    // This thread's CPU time only: other test files may run alongside.
+    const cpuBefore = process.threadCpuUsage();
+    expect(() => plainData(value)).toThrow(/array too long|too many values/);
+    const cpu = process.threadCpuUsage(cpuBefore);
+    // A descriptor for every entry takes seconds and hundreds of MiB; the
+    // object's own key list (Reflect.ownKeys) is all that may be built.
+    expect((cpu.user + cpu.system) / 1000).toBeLessThan(cpuMs);
+    expect(process.memoryUsage().heapUsed - heapBefore).toBeLessThan(64 * 1024 * 1024);
+  });
+
   it("sends results up to the caps", async () => {
     const built = await testServer({}, [
       get("/x", () => new Array<number>(MAX_RESULT_ARRAY_LENGTH).fill(1)),
@@ -463,6 +487,41 @@ describe("headers a handler writes", () => {
     ["a Retry-After that isn't a number", (r: OculusReply) => r.header("Retry-After", "1.5")],
     ["a content type with a quoted parameter", (r: OculusReply) => r.type('text/html; a="b"')],
     ["a content type without a subtype", (r: OculusReply) => r.type("text")],
+    ["an ETag longer than the cap", (r: OculusReply) => r.header("ETag", `"${"a".repeat(1023)}"`)],
+    [
+      "a Vary longer than the cap",
+      (r: OculusReply) => r.header("Vary", Array.from({ length: 200 }, () => "Accept").join(", ")),
+    ],
+    ["Vary: *", (r: OculusReply) => r.header("Vary", "*")],
+    ["Vary with a * in the list", (r: OculusReply) => r.header("Vary", "Accept, *")],
+    [
+      "a Last-Modified on a day that doesn't exist",
+      (r: OculusReply) => r.header("Last-Modified", "Mon, 30 Feb 2026 10:00:00 GMT"),
+    ],
+    [
+      "a Last-Modified with the wrong weekday",
+      (r: OculusReply) => r.header("Last-Modified", "Mon, 22 Nov 2026 10:00:00 GMT"),
+    ],
+    [
+      "a Last-Modified at hour 25",
+      (r: OculusReply) => r.header("Last-Modified", "Sun, 22 Nov 2026 25:00:00 GMT"),
+    ],
+    ["a Retry-After over a day", (r: OculusReply) => r.header("Retry-After", "86401")],
+    ["a Retry-After of 999999999", (r: OculusReply) => r.header("Retry-After", "999999999")],
+    [
+      "a Retry-After date years ahead",
+      (r: OculusReply) => r.header("Retry-After", "Fri, 01 Jan 2100 00:00:00 GMT"),
+    ],
+    ["text/html", (r: OculusReply) => r.type("text/html")],
+    ["TEXT/HTML with a charset", (r: OculusReply) => r.type("TEXT/HTML; charset=utf-8")],
+    ["image/svg+xml", (r: OculusReply) => r.type("image/svg+xml")],
+    ["application/xhtml+xml", (r: OculusReply) => r.type("application/xhtml+xml")],
+    ["a charset other than utf-8", (r: OculusReply) => r.type("text/plain; charset=utf-7")],
+    ["a latin1 JSON charset", (r: OculusReply) => r.type("application/json; Charset=ISO-8859-1")],
+    [
+      "a content type longer than the cap",
+      (r: OculusReply) => r.type(`text/plain; a=${"b".repeat(1024)}`),
+    ],
   ])("refuses %s with a plain 500", async (_name, act) => {
     const built = await testServer({}, [writes(act)]);
     app = built.app;
@@ -513,6 +572,27 @@ describe("headers a handler writes", () => {
     expect(res.headers["retry-after"]).toBe("120");
     expect(res.headers["content-type"]).toBe("application/ld+json; charset=utf-8");
   });
+
+  it.each([
+    ["Retry-After of exactly a day", (r: OculusReply) => r.header("Retry-After", "86400")],
+    [
+      "a Retry-After date an hour ahead",
+      (r: OculusReply) => r.header("Retry-After", new Date(Date.now() + 3_600_000).toUTCString()),
+    ],
+    ["an ETag at the cap", (r: OculusReply) => r.header("ETag", `"${"a".repeat(1022)}"`)],
+    ["XML for OAI-PMH", (r: OculusReply) => r.type("text/xml; charset=UTF-8")],
+  ])("allows %s", async (_name, act) => {
+    const built = await testServer({}, [
+      get("/w", (_request, reply) => {
+        act(reply);
+        return "<ok/>";
+      }),
+    ]);
+    app = built.app;
+    const res = await app.inject({ method: "GET", url: "/w" });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toBe("<ok/>");
+  });
 });
 
 describe("error replies", () => {
@@ -524,7 +604,7 @@ describe("error replies", () => {
           .header("ETag", '"DS5C740001"')
           .header("Location", "/after")
           .header("Content-Language", "en")
-          .type("text/html")
+          .type("text/plain")
           .setCookie(OCULUS_COOKIES.session, "abcDEF123");
         throw new Error("boom");
       }),
@@ -541,6 +621,18 @@ describe("error replies", () => {
 });
 
 describe("security headers", () => {
+  it("include a CSP that loads nothing, frames nothing, posts no form and sets no base", () => {
+    const csp = SECURITY_HEADERS["content-security-policy"] ?? "";
+    for (const directive of [
+      "default-src 'none'",
+      "frame-ancestors 'none'",
+      "form-action 'none'",
+      "base-uri 'none'",
+    ]) {
+      expect(csp.split("; ")).toContain(directive);
+    }
+  });
+
   function expectDefaults(headers: Record<string, unknown>, what: string): void {
     for (const [name, value] of Object.entries(SECURITY_HEADERS)) {
       expect(headers[name], `${what}: ${name}`).toBe(value);
@@ -553,7 +645,7 @@ describe("security headers", () => {
         throw new Error("x");
       }),
       get("/text", (_request, reply) => {
-        reply.type("text/html; charset=utf-8");
+        reply.type("text/plain; charset=utf-8");
         return "<p>x</p>";
       }),
     ]);

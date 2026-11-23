@@ -5,7 +5,7 @@
 import { tracingChannel } from "node:diagnostics_channel";
 import { afterEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
-import { Refusal } from "./errors.js";
+import { Refusal, errorReply, internalError, rebuildThrown, summarizeThrown } from "./errors.js";
 import { SECURITY_HEADERS } from "./headers.js";
 import type { OculusRoute } from "./routes.js";
 import { rawRequest, testServer } from "./test-server.fixtures.js";
@@ -257,6 +257,161 @@ describe("Refusal", () => {
     expect(Object.isFrozen(refusal)).toBe(true);
     for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(refusal))) {
       expect("value" in descriptor).toBe(true);
+    }
+  });
+});
+
+describe("a handler that fails after its time is up", () => {
+  it.each([
+    ["rejects with an Error", () => new Error("late failure")],
+    ["rejects with a Refusal", () => new Refusal(409, "edit_conflict")],
+  ])("%s: the log gets the fixed-shape summary and never the query string", async (name, make) => {
+    const lines: string[] = [];
+    let finished!: () => void;
+    const done = new Promise<void>((resolve) => (finished = resolve));
+    const built = await testServer(
+      { timeouts: { handler: 50 }, logger: { stream: { write: (l) => lines.push(l) } } },
+      [
+        {
+          method: "GET",
+          path: "/late",
+          handler: async () => {
+            try {
+              await new Promise((resolve) => setTimeout(resolve, 150));
+              throw make();
+            } finally {
+              setTimeout(finished, 20);
+            }
+          },
+        },
+      ],
+    );
+    app = built.app;
+    const res = await rawRequest(app, "GET", "/late?q=PRIVQ");
+    expect(res.status, name).toBe(503);
+    expect(res.body, name).toBe('{"error":"unavailable"}');
+    await done;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const log = lines.join("\n");
+    expect(log, name).not.toContain("PRIVQ");
+    expect(log, name).not.toMatch(/FST_ERR|TypeError|already sent/i);
+    const late = lines.filter((l) => l.includes('"failure"') && l.includes("after the reply"));
+    expect(late.length, name).toBe(1);
+    expect(late[0], name).toContain('"path":"/late"');
+    expect(late[0], name).toContain('"method":"GET"');
+  });
+});
+
+describe("the server logger", () => {
+  it("never writes a query string or an error object, whatever Fastify passes it", async () => {
+    const lines: string[] = [];
+    const built = await testServer({ logger: { stream: { write: (l) => lines.push(l) } } });
+    app = built.app;
+    const frozen = new Refusal(500, "internal_error");
+    app.log.warn({ err: new Error('Reply was already sent in "/a?q=PRIVQ" (GET)') });
+    app.log.error({ err: frozen }, "Promise errored, but reply.sent = true was set");
+    app.log.error(new Error("/a?q=PRIVQ"));
+    app.log.info("Route GET:/a?q=PRIVQ not found");
+    app.log.info({ extra: "PRIVQ", res: { statusCode: 200 } }, 'in "/a?q=PRIVQ"');
+    expect(lines.length).toBe(5);
+    const log = lines.join("\n");
+    expect(log).not.toContain("PRIVQ");
+    expect(log).not.toContain("internal_error");
+    expect(log).toContain("Route GET:/a not found");
+  });
+});
+
+describe("summarizeThrown and the stack", () => {
+  let ran = 0;
+  const counted = (): never => {
+    ran++;
+    throw new Error("getter ran");
+  };
+
+  it.each([
+    [
+      "a class with a throwing name getter",
+      () => {
+        class Sneaky extends Error {
+          override get name(): string {
+            return counted();
+          }
+        }
+        return new Sneaky("secret detail");
+      },
+    ],
+    [
+      "an Error with an own throwing name getter",
+      () => Object.defineProperty(new Error("m"), "name", { get: counted }),
+    ],
+    [
+      "an Error with an own throwing message getter",
+      () => Object.defineProperty(new Error("m"), "message", { get: counted }),
+    ],
+    [
+      "an Error whose prototype is swapped for one with a name getter",
+      () =>
+        Object.setPrototypeOf(
+          new Error("m"),
+          Object.create(Error.prototype, { name: { get: counted } }) as object,
+        ) as object,
+    ],
+  ])("never runs a getter for the stack: %s", (_name, make) => {
+    ran = 0;
+    const value = make();
+    ran = 0;
+    const summary = summarizeThrown(value);
+    expect(ran).toBe(0);
+    expect(summary.stack).toBe("");
+    expect(rebuildThrown(value).statusCode).toBe(500);
+    expect(ran).toBe(0);
+  });
+
+  it("still logs the stack of a plain built-in error", () => {
+    for (const error of [new Error("m"), new TypeError("t"), new RangeError("r")]) {
+      const summary = summarizeThrown(error);
+      expect(summary.stack).toContain(`${error.name}: ${error.message}`);
+      expect(summary.stack).toContain("throws.attacks.test");
+    }
+  });
+});
+
+describe("rebuildThrown with a tampered Refusal.prototype", () => {
+  const keys = ["name", "statusCode", "code", "stack", "message"] as const;
+
+  it("never throws and still answers a plain 500", async () => {
+    const saved = keys.map((key) => Object.getOwnPropertyDescriptor(Refusal.prototype, key));
+    let ran = 0;
+    for (const key of keys) {
+      Object.defineProperty(Refusal.prototype, key, {
+        configurable: true,
+        get: () => undefined,
+        set: () => {
+          ran++;
+          throw new Error("setter ran");
+        },
+      });
+    }
+    try {
+      for (const thrown of [new Error("x"), "x", null, { statusCode: 409 }]) {
+        const fresh = rebuildThrown(thrown);
+        expect(Object.isFrozen(fresh)).toBe(true);
+        expect(errorReply(fresh)).toEqual({
+          statusCode: 500,
+          body: { error: "internal_error" },
+        });
+      }
+      expect(internalError().statusCode).toBe(500);
+      expect(ran).toBe(0);
+      const built = await testServer({}, [thrower(() => new Error("x"))]);
+      app = built.app;
+      expectPlain500(await wireGet(app), "tampered prototype");
+    } finally {
+      keys.forEach((key, i) => {
+        const descriptor = saved[i];
+        if (descriptor === undefined) Reflect.deleteProperty(Refusal.prototype, key);
+        else Object.defineProperty(Refusal.prototype, key, descriptor);
+      });
     }
   });
 });

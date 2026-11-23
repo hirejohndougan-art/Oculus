@@ -11,7 +11,13 @@
  * sees it (`rebuildThrown`, server.ts), and is logged only as a
  * fixed-shape summary of plain strings (`summarizeThrown`): a thrown value
  * can carry getters, a Proxy or a `headers` object that Fastify's default
- * error handler would copy onto the reply.
+ * error handler would copy onto the reply. Only own data properties are
+ * read, so no getter the value carries is called; a Proxy's traps
+ * (`getPrototypeOf`, `getOwnPropertyDescriptor`) do run, always inside a
+ * try/catch. V8's own `stack` getter is called only for a value whose whole
+ * prototype chain is built-in Error prototypes and whose own `name` and
+ * `message` are data, because formatting the stack reads `name` and
+ * `message` (and runs any getter there).
  */
 
 /** Codes are short lowercase words joined by underscores (`not_found`). */
@@ -27,11 +33,12 @@ function isErrorStatus(status: unknown): status is number {
  * or 3xx isn't an error) and the code a short lowercase word (`CODE`); the
  * constructor throws otherwise. A Refusal is frozen and has only data
  * properties, `stack` included, so whoever reads it (Fastify, the logger,
- * a diagnostics_channel subscriber) runs no code of anyone's.
+ * a diagnostics_channel subscriber) runs no code of anyone's. Its fields
+ * are defined, never assigned, so a setter added to a prototype can't run.
  */
 export class Refusal extends Error {
-  readonly statusCode: number;
-  readonly code: string;
+  declare readonly statusCode: number;
+  declare readonly code: string;
 
   constructor(statusCode: number, code: string) {
     if (!isErrorStatus(statusCode)) throw new Error("Refusal status must be 400 to 599");
@@ -39,22 +46,30 @@ export class Refusal extends Error {
       throw new Error("Refusal code must be a short lowercase word");
     }
     super(code);
-    Object.defineProperty(this, "stack", {
-      value: `Refusal: ${code}`,
+    const field = (value: unknown): PropertyDescriptor => ({
+      value,
       writable: false,
       enumerable: false,
       configurable: false,
     });
-    this.name = "Refusal";
-    this.statusCode = statusCode;
-    this.code = code;
+    Object.defineProperty(this, "stack", field(`Refusal: ${code}`));
+    Object.defineProperty(this, "name", field("Refusal"));
+    Object.defineProperty(this, "statusCode", { ...field(statusCode), enumerable: true });
+    Object.defineProperty(this, "code", { ...field(code), enumerable: true });
     Object.freeze(this);
   }
 }
 
-/** The 500 the client sees for anything that isn't a deliberate refusal. */
+/** Built once at start-up: the 500 to fall back on when nothing else can be built. */
+const INTERNAL_REFUSAL: Refusal = new Refusal(500, "internal_error");
+
+/** The 500 the client sees for anything that isn't a deliberate refusal. Never throws. */
 export function internalError(): Refusal {
-  return new Refusal(500, "internal_error");
+  try {
+    return new Refusal(500, "internal_error");
+  } catch {
+    return INTERNAL_REFUSAL;
+  }
 }
 
 /** An own data property, read without running a getter; `undefined` otherwise. */
@@ -67,8 +82,9 @@ function ownData(value: object, key: string): unknown {
  * A fresh Refusal standing for whatever a handler threw, never the thrown
  * value itself. A Refusal (by prototype) with an own status of 400 to 599
  * and a well-formed code is rebuilt from those two values; anything else,
- * or anything that throws while being looked at (a Proxy, a getter), is a
- * plain internal 500. Never throws.
+ * or anything that throws while being looked at (a Proxy's trap), is a
+ * plain internal 500. Never throws: if even that can't be built, the
+ * frozen 500 made at start-up is returned.
  */
 export function rebuildThrown(thrown: unknown): Refusal {
   try {
@@ -81,7 +97,7 @@ export function rebuildThrown(thrown: unknown): Refusal {
     }
     return new Refusal(status, code);
   } catch {
-    return internalError();
+    return INTERNAL_REFUSAL;
   }
 }
 
@@ -103,14 +119,57 @@ const NATIVE_STACK_GET: unknown = Reflect.get(
   "get",
 );
 
+/** The engine's own Error prototypes: none of them has a getter of its own. */
+const BUILT_IN_ERROR_PROTOTYPES: ReadonlySet<object> = new Set<object>([
+  Error.prototype,
+  EvalError.prototype,
+  RangeError.prototype,
+  ReferenceError.prototype,
+  SyntaxError.prototype,
+  TypeError.prototype,
+  URIError.prototype,
+  AggregateError.prototype,
+]);
+
+/**
+ * True when every prototype of the value is a built-in Error prototype
+ * (then `Object.prototype`) and its own `name` and `message`, if any, are
+ * data: V8's stack getter formats `name: message`, running any getter it
+ * finds there, so it is called only on such values.
+ */
+function plainErrorShape(value: object): boolean {
+  let proto: unknown = Object.getPrototypeOf(value);
+  if (typeof proto !== "object" || proto === null || !BUILT_IN_ERROR_PROTOTYPES.has(proto)) {
+    return false;
+  }
+  for (let i = 0; i < 5; i++) {
+    if (proto === Object.prototype) break;
+    if (typeof proto !== "object" || proto === null || !BUILT_IN_ERROR_PROTOTYPES.has(proto)) {
+      return false;
+    }
+    proto = Object.getPrototypeOf(proto);
+  }
+  if (proto !== Object.prototype) return false;
+  for (const key of ["name", "message"]) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor !== undefined && !("value" in descriptor)) return false;
+  }
+  return true;
+}
+
 function stackOf(value: object): string {
   try {
     const descriptor = Object.getOwnPropertyDescriptor(value, "stack");
     if (descriptor === undefined) return "";
     let stack: unknown;
     if ("value" in descriptor) stack = descriptor.value;
-    // Only the engine's own getter is called, never one the value brought.
-    else if (typeof NATIVE_STACK_GET === "function" && descriptor.get === NATIVE_STACK_GET) {
+    // Only the engine's own getter is called, never one the value brought,
+    // and only on a value with nothing of its own for it to run.
+    else if (
+      typeof NATIVE_STACK_GET === "function" &&
+      descriptor.get === NATIVE_STACK_GET &&
+      plainErrorShape(value)
+    ) {
       stack = Reflect.apply(NATIVE_STACK_GET, value, []);
     }
     return typeof stack === "string" ? stack.slice(0, 4000) : "";
@@ -136,8 +195,9 @@ function nameOf(value: object): string {
 
 /**
  * A fixed-shape summary of a thrown value for the log: own data properties
- * only (no getter it brought is run) and V8's own stack. Never throws, and
- * never returns the value or any object from it.
+ * only (no getter is called) and V8's own stack for plain built-in errors
+ * (`plainErrorShape`). Never throws, and never returns the value or any
+ * object from it.
  */
 export function summarizeThrown(thrown: unknown): ThrownSummary {
   try {
