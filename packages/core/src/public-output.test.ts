@@ -9,6 +9,7 @@ import {
   effectivePublishIssues,
   newRecordId,
   publicOutput,
+  publicView,
   type PublicOutput,
   type PublicRecord,
   type RecordId,
@@ -30,6 +31,7 @@ import {
   idsOf,
   CHECKERS,
   RIGHTS_ENTRY,
+  linkChecker,
 } from "./public-output.fixtures.js";
 
 function ok(result: Validated<PublicOutput>): PublicOutput {
@@ -230,14 +232,33 @@ describe("publicOutput: the three forms", () => {
 });
 
 describe("publicOutput: places and the published list", () => {
-  it("links a place record that is published", () => {
+  it("links a place record that is published and found by the record link checker", () => {
     const item = fullObject();
-    const o = ok(out(viewOf([item], item.id), [item.id, PLACE_ID]));
+    const place = record("place", "Dickinson", {}, {}, PLACE_ID);
+    const links = linkChecker([item, place]);
+    const view = viewOf([item], item.id);
+    const o = ok(
+      publicOutput(view, MAPPING, {
+        baseUrl: BASE,
+        published: [item.id, PLACE_ID],
+        checkers: { ...CHECKERS, place: links },
+        identifiers: idsOf(view),
+      }),
+    );
     expect(o.jsonLd["dcterms:spatial"]).toEqual({
       "@id": BASE + PLACE_ID,
       "rdfs:label": "Dickinson (Tex.)",
     });
     expect(o.dublinCore.spatial).toEqual(["Dickinson (Tex.)"]);
+  });
+
+  it("gives a published place record's name only when no record link checker vouches for it", () => {
+    // Before D-039 the published list alone was enough, which would link an
+    // ID of another organization's published place (D-030).
+    const item = fullObject();
+    const o = ok(out(viewOf([item], item.id), [item.id, PLACE_ID]));
+    expect(o.jsonLd["dcterms:spatial"]).toEqual({ "rdfs:label": "Dickinson (Tex.)" });
+    expect(everything(o)).not.toContain(PLACE_ID);
   });
 
   it("gives an unpublished place record's name only, never its ID", () => {
@@ -429,7 +450,9 @@ describe("publicOutput: refusals", () => {
 
   it("refuses a rights value with extra properties through the publish check", () => {
     const item = record("object", "Bad", { rights: { uri: CNE, extra: 1 } });
-    expect(codes(out(viewOf([item], item.id)))).toEqual(["unknown_property"]);
+    // Held back when the view is made (D-039), so the extra property never reaches it.
+    expect(publicView(effectiveOf([item], item.id))?.fields.rights).toBeUndefined();
+    expect(codes(out(viewOf([item], item.id)))).toEqual(["does_not_fit_field"]);
   });
 
   it("refuses a field over its list and repeat limits", () => {

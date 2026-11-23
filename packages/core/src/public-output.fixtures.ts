@@ -2,6 +2,7 @@
 import {
   effectiveRecord,
   makeIdentifierChecker,
+  makeRecordLinkChecker,
   newOrganizationId,
   newRecordId,
   publicView,
@@ -11,6 +12,7 @@ import {
   type FieldDefinition,
   type FieldTemplate,
   type FieldValue,
+  type FieldValueChecker,
   type PublicRecord,
   type RecordId,
   type RecordIdentifiers,
@@ -159,6 +161,13 @@ export function identifiersFor(records: readonly CatalogRecord[]): RecordIdentif
     }
     return { recordId: r.id, organizationId: r.organizationId, current, former: [] };
   });
+}
+
+/** A record link checker made from `records` (D-039). */
+export function linkChecker(records: readonly CatalogRecord[]): FieldValueChecker {
+  const made = makeRecordLinkChecker(records);
+  if (!made.ok) throw new Error(JSON.stringify(made.issues));
+  return made.value;
 }
 
 export function effectiveOf(

@@ -90,6 +90,13 @@
  * inherited from) doesn't hold as current is kept but marked `staff`
  * (`identifier_not_held`), and without `options.identifiers` every public
  * identifier value is (`identifiers_unknown`). Either note refuses publishing.
+ *
+ * **Links to other records** (T-015, D-039). The public view holds a
+ * `record_link` value as `{ label }` and a place as `{ label, uri? }`: never
+ * the ID of the record linked to, which may be unpublished or (by mistake)
+ * another organization's. Only `publicOutput` reads the ID, from the
+ * effective record, and links it when it can prove the record is published
+ * and the organization's own.
  */
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import { RIGHTS_FIELD_KEY, rightsPublishIssues } from "./rights.js";
@@ -116,6 +123,7 @@ import {
 import {
   checkRecordAgainstTemplate,
   isTemplateRegistry,
+  valueFitsField,
   templateOfRecord,
   type FieldDefinition,
   type FieldTemplate,
@@ -411,6 +419,26 @@ export function currentAncestry(
   try {
     if (!isRecordId(recordId)) fail([], "invalid_id", "The record ID must be a record ID.");
     return { ok: true, value: Object.freeze(ancestry(recordId, lookupFor(records))) };
+  } catch (error) {
+    return failure(error);
+  }
+}
+
+/**
+ * For `record-links.ts` only (not exported from the package): every record in
+ * `records` (a list or a lookup from `indexRecords`) by ID, as the validated,
+ * frozen copy the index holds, or undefined for an ID used twice or a record
+ * that isn't valid. A set mixing organizations, or one that can't be read, is
+ * refused with the issue `indexRecords` gives. Never throws.
+ */
+export function recordsById(
+  records: unknown,
+): Validated<ReadonlyMap<RecordId, CatalogRecord | undefined>> {
+  try {
+    const state = lookupFor(records);
+    const out = new Map<RecordId, CatalogRecord | undefined>();
+    for (const [id, got] of state.byId) out.set(id, got.ok ? got.record : undefined);
+    return { ok: true, value: out };
   } catch (error) {
     return failure(error);
   }
@@ -718,7 +746,8 @@ function compose(
   }
 
   const fitting = dropUnfit(target, own.template, candidates, up, notes, checkers);
-  const typed = withholdIdentifiers(fitting, own.byKey, notes, checkers, target.organizationId);
+  const shaped = withholdMisfits(fitting, own.byKey, notes);
+  const typed = withholdIdentifiers(shaped, own.byKey, notes, checkers, target.organizationId);
   const kept = withholdUnheld(typed, own.byKey, notes, up, identifiers);
 
   const chainUp = up.map(step);
@@ -756,9 +785,7 @@ function compose(
         value:
           e.key === RIGHTS_FIELD_KEY
             ? withoutRightsNote(e.value)
-            : own.byKey.get(e.key)?.kind === "identifier"
-              ? withoutIdentifierType(e.value)
-              : e.value,
+            : publicValue(e.value, own.byKey.get(e.key)?.kind),
         own: e.own,
       }),
     );
@@ -799,14 +826,47 @@ function withoutRightsNote(value: FieldValue): FieldValue {
   return Object.freeze(Object.fromEntries(Object.entries(value).filter(([key]) => key !== "note")));
 }
 
-/** Notes that mean a public identifier value was held back: publishing must wait. */
+/**
+ * Notes that mean a public value was held back (an identifier, or a value
+ * that doesn't fit its field): publishing must wait.
+ */
 const WITHHELD_IDENTIFIER: ReadonlySet<string> = new Set([
   "private_identifier_type",
   "identifier_types_unknown",
   "wrong_organization_checker",
   "identifiers_unknown",
   "identifier_not_held",
+  "does_not_fit_field",
 ]);
+
+/**
+ * Mark `staff`, with a note that blocks publishing, every public value whose
+ * structure doesn't fit its field as the template has it now: a value kept
+ * from before a template edit (a record link, an identifier with its type,
+ * a rights value with its note, left in a field since made text) must never
+ * be copied into the public view as it is (D-039). Inherited values were
+ * already checked by `dropUnfit`; this catches own values. The note never
+ * quotes the value.
+ */
+function withholdMisfits(
+  candidates: readonly Candidate[],
+  byKey: ReadonlyMap<string, FieldDefinition>,
+  notes: Issue[],
+): readonly Candidate[] {
+  return candidates.map((c) => {
+    if (c.visibility !== "public" || !c.inTemplate) return c;
+    const def = byKey.get(c.key);
+    if (def !== undefined && valueFitsField(c.value, def)) return c;
+    notes.push(
+      issue(
+        ["fields", c.key],
+        "does_not_fit_field",
+        `${shown(c.label)} holds a value that doesn't fit the field as it is now, so it is kept staff only and the record can't be published. Correct the value, or check it with checkRecordAgainstTemplate.`,
+      ),
+    );
+    return { ...c, visibility: "staff" };
+  });
+}
 
 /**
  * Mark `staff`, with a note, every public identifier value the public may not
@@ -915,6 +975,32 @@ function ownChecker(checkers: unknown, kind: string): unknown {
   if (!isPlainObject(checkers)) return undefined;
   const descriptor = Object.getOwnPropertyDescriptor(checkers, kind);
   return descriptor !== undefined && "value" in descriptor ? descriptor.value : undefined;
+}
+
+/**
+ * A public entry's value as the public view holds it: identifiers without
+ * their type, and links to records without the ID linked to (D-039).
+ */
+function publicValue(value: FieldValue, kind: FieldDefinition["kind"] | undefined): FieldValue {
+  if (kind === "identifier") return withoutIdentifierType(value);
+  // Every kind: a public view never holds a linked record ID (D-039), even
+  // if a value of another shape ever got this far.
+  return withoutRecordId(value);
+}
+
+/**
+ * A `record_link` or place value without its `recordId`: whether the record
+ * linked to may be named is for `publicOutput` to decide (D-016, D-039).
+ * Anything that isn't a plain object is left as it is, for the publish check
+ * to refuse.
+ */
+function withoutRecordId(value: FieldValue): FieldValue {
+  const strip = (item: FieldValue): FieldValue =>
+    isPlainObject(item) && Object.hasOwn(item, "recordId")
+      ? // Object.fromEntries defines own properties, so no key can reach a prototype.
+        Object.freeze(Object.fromEntries(Object.entries(item).filter(([k]) => k !== "recordId")))
+      : item;
+  return Array.isArray(value) ? Object.freeze(value.map(strip)) : strip(value);
 }
 
 /**
