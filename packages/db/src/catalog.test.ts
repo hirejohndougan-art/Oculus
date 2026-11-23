@@ -864,6 +864,31 @@ describe("organizations stay separate, even through direct SQL", () => {
     ).toEqual({ code: FOREIGN_KEY, constraint: "template_versions_organization_id_key_fkey" });
   });
 
+  it("an exact-type to_jsonb overload can't switch the identity check off", async () => {
+    await ready();
+    const lone = made({
+      organizationId: ARCHIVES,
+      kind: "object",
+      title: "A shadowed chair",
+      templateKey: "spectrum-object",
+    });
+    ok(await insertRecord(db, lone));
+    // An overload for the exact row type beats pg_catalog.to_jsonb(anyelement)
+    // unless the trigger function's search path is fixed.
+    await db.execute(sql`CREATE FUNCTION public.to_jsonb(public.records) RETURNS jsonb
+      LANGUAGE sql AS 'SELECT ''{}''::jsonb'`);
+    try {
+      expect(
+        await refusedBy(
+          sql`UPDATE public.records SET organization_id = ${LIBRARY}::uuid
+              WHERE organization_id = ${ARCHIVES}::uuid AND id = ${lone.id}::uuid`,
+        ),
+      ).toEqual({ code: IDENTITY, constraint: "records_organization_id_fixed" });
+    } finally {
+      await db.execute(sql`DROP FUNCTION public.to_jsonb(public.records)`);
+    }
+  });
+
   it("moving a record, a unit with children or a lone record to another organization is refused", async () => {
     await ready();
     const parent = await archivesUnit();

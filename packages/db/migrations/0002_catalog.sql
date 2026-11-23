@@ -24,8 +24,10 @@
 -- column (a parent, a represented record, a template, a record type) is
 -- refused.
 --
--- What identifies a row never changes (catalog_keep_identity, at the end): no
--- UPDATE can move a row to another organization or give it another ID, key or
+-- What identifies a row never changes (catalog_keep_identity, at the end; its
+-- triggers are named zzzz_* so they fire after any other BEFORE UPDATE trigger,
+-- which fire in name order, and nothing can change a row after the check): no
+-- UPDATE by a role that does not own the tables (T-029) can move a row to another organization or give it another ID, key or
 -- version number, even a row nothing points at.
 
 -- One organization in the install. The ID is a random version 4 UUID that
@@ -174,7 +176,11 @@ CREATE INDEX records_represents ON public.records (organization_id, represents_i
 -- template version) move to another organization (D-019). Raised as
 -- SQLSTATE 23000 with the constraint named <table>_<column>_fixed.
 CREATE FUNCTION public.catalog_keep_identity() RETURNS trigger
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql
+-- A fixed search path, so no function or operator a role creates elsewhere
+-- (for example an exact-type to_jsonb overload) can replace the checks.
+SET search_path = pg_catalog, pg_temp
+AS $$
 DECLARE
   column_name text;
 BEGIN
@@ -189,15 +195,15 @@ BEGIN
 END
 $$;
 
-CREATE TRIGGER organizations_keep_identity BEFORE UPDATE ON public.organizations
+CREATE TRIGGER zzzz_organizations_keep_identity BEFORE UPDATE ON public.organizations
   FOR EACH ROW EXECUTE FUNCTION public.catalog_keep_identity('id');
-CREATE TRIGGER templates_keep_identity BEFORE UPDATE ON public.templates
+CREATE TRIGGER zzzz_templates_keep_identity BEFORE UPDATE ON public.templates
   FOR EACH ROW EXECUTE FUNCTION public.catalog_keep_identity('organization_id', 'key');
-CREATE TRIGGER template_versions_keep_identity BEFORE UPDATE ON public.template_versions
+CREATE TRIGGER zzzz_template_versions_keep_identity BEFORE UPDATE ON public.template_versions
   FOR EACH ROW EXECUTE FUNCTION public.catalog_keep_identity('organization_id', 'key', 'version');
-CREATE TRIGGER record_types_keep_identity BEFORE UPDATE ON public.record_types
+CREATE TRIGGER zzzz_record_types_keep_identity BEFORE UPDATE ON public.record_types
   FOR EACH ROW EXECUTE FUNCTION public.catalog_keep_identity('organization_id', 'key');
-CREATE TRIGGER record_type_versions_keep_identity BEFORE UPDATE ON public.record_type_versions
+CREATE TRIGGER zzzz_record_type_versions_keep_identity BEFORE UPDATE ON public.record_type_versions
   FOR EACH ROW EXECUTE FUNCTION public.catalog_keep_identity('organization_id', 'key', 'version');
-CREATE TRIGGER records_keep_identity BEFORE UPDATE ON public.records
+CREATE TRIGGER zzzz_records_keep_identity BEFORE UPDATE ON public.records
   FOR EACH ROW EXECUTE FUNCTION public.catalog_keep_identity('organization_id', 'id');

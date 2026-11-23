@@ -16,13 +16,17 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const repo = process.cwd();
-const checkout = mkdtempSync(join(tmpdir(), "oculus-clean-"));
+let checkout = "";
+
+beforeAll(() => {
+  checkout = mkdtempSync(join(tmpdir(), "oculus-clean-"));
+});
 
 afterAll(() => {
-  rmSync(checkout, { recursive: true, force: true });
+  if (checkout !== "") rmSync(checkout, { recursive: true, force: true });
 });
 
 function copy(path) {
@@ -62,6 +66,9 @@ describe("npm run db:migrate from a clean checkout", () => {
       cwd: checkout,
       env,
       encoding: "utf8",
+      // spawnSync blocks the event loop, so Vitest's own timeout can't fire.
+      timeout: 110_000,
+      killSignal: "SIGKILL",
     });
     const output = `${result.stdout}${result.stderr}`;
     expect(output).toContain("OCULUS_DATABASE_URL is not set");
