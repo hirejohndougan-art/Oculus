@@ -118,7 +118,9 @@ describe("another organization's data is refused, never filtered", () => {
   it("refuses another organization's move in a log or added to one", () => {
     const theirs = move(item, home.id, "return", { organizationId: OTHER });
     expect(codes(indexMoves(idx, [move(item, vault.id), theirs]))).toEqual(["mixed_organizations"]);
-    expect(codes(withMove(log, theirs))).toEqual(["mixed_organizations"]);
+    expect(codes(withMove(log, theirs, new Date("2026-11-21T00:00:00.000Z")))).toEqual([
+      "mixed_organizations",
+    ]);
     expect(ok(whereabouts(log, item))?.current.id).toBe(vault.id);
   });
 
@@ -226,6 +228,21 @@ describe("forged indexes and logs", () => {
     const first = ok(moveHistory(log, item))[0];
     if (first === undefined) throw new Error("no history");
     expect(codes(withMove(log, { ...first, locationId: home.id }))).toEqual(["duplicate_id"]);
+  });
+
+  it("can't pin a record's location by stamping a move in the future (second review)", () => {
+    const now = new Date("2026-11-21T12:00:00.000Z");
+    const forged = move(item, home.id, "other", {
+      movedOn: "2026-11-21",
+      recordedAt: "9999-12-30T00:00:00.000Z",
+    });
+    expect(codes(withMove(log, forged, now))).toEqual(["future_recorded"]);
+    const fine = move(item, home.id, "other", {
+      movedOn: "2026-11-21",
+      recordedAt: "2026-11-21T12:04:00.000Z",
+    });
+    expect(ok(withMove(log, fine, now)).size).toBe(2);
+    expect(codes(withMove(log, fine, new Date(Number.NaN)))).toEqual(["invalid_time"]);
   });
 
   it("can't delete a location that is in a record's history", () => {

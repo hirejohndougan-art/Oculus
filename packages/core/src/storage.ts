@@ -228,6 +228,8 @@ export const MAX_MOVES = 1_000_000;
 /** Between two path parts in a location label. */
 export const LOCATION_SEPARATOR = " › ";
 
+/** How far a new move's `recordedAt` may be ahead of the clock (servers drift). */
+const RECORDED_AT_SLACK_MS = 5 * 60_000;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const ISO_DAY = /^(\d{4})-(\d{2})-(\d{2})$/;
@@ -634,7 +636,8 @@ export function indexLocations(levels: unknown, locations: unknown): Validated<L
           children.set(parent.id, kids);
         }
       }
-      const group = loc.parentId ?? `top:${loc.kind === "external" ? "external" : "inside"}`;
+      // Top-level rooms and outside places share one list, so they share one name space.
+      const group = loc.parentId ?? "top";
       const names = siblingNames.get(group) ?? new Set<string>();
       const folded = fold(loc.name);
       if (names.has(folded)) {
@@ -855,16 +858,32 @@ export function isMoveLog(value: unknown): value is MoveLog {
 /**
  * Check a new move against a log before saving it, and return the log with
  * it added. The new move is checked as `indexMoves` would check it, in its
- * place in its record's history (so a back-dated move must fit too). The
- * given log is not changed. Never throws.
+ * place in its record's history (so a back-dated move must fit too), and its
+ * `recordedAt` can't be later than `now` (a few minutes of clock slack):
+ * moves on one day are ordered by `recordedAt`, so a move stamped in the
+ * future would stay "latest" for ever. Make new moves with
+ * `createStorageMove`, which stamps the real time; never take `recordedAt`
+ * from a client. The given log is not changed. Each call copies the log's
+ * indexes, so add moves in bulk (an import) with `indexMoves`, not one
+ * `withMove` at a time. `now` is for tests. Never throws.
  */
-export function withMove(log: MoveLog, move: unknown): Validated<MoveLog> {
+export function withMove(log: MoveLog, move: unknown, now: Date = new Date()): Validated<MoveLog> {
   try {
     const data = logData(log);
     if (data === undefined) return notALog();
     const checked = validateStorageMove(move);
     if (!checked.ok) return checked;
     const next = checked.value;
+    const time = Date.prototype.getTime.call(now);
+    if (Number.isNaN(time))
+      return refused([], "invalid_time", "The current time is not a valid date.");
+    if (Date.parse(next.recordedAt) > time + RECORDED_AT_SLACK_MS) {
+      return refused(
+        ["recordedAt"],
+        "future_recorded",
+        "This move says it was written down later than now. Make new moves with createStorageMove.",
+      );
+    }
     if (next.organizationId !== data.index.organizationId) {
       return { ok: false, issues: [mixedOrganizationsIssue([], "This move and the move log")] };
     }
@@ -914,8 +933,10 @@ export function whereabouts(log: MoveLog, recordId: RecordId): Validated<Whereab
 }
 
 /**
- * Every record that has a normal location and is somewhere else (mockup
- * Whereabouts), soonest due back first; those with no expected date last.
+ * Every record that is away (see `Whereabouts.away`: somewhere other than its
+ * normal location, or out on a temporary move before it was ever placed;
+ * mockup Whereabouts), soonest due back first, those with no date last. A
+ * record never placed stays away until a placement records its home.
  */
 export function awayFromNormal(log: MoveLog): Validated<readonly Whereabouts[]> {
   const data = logData(log);

@@ -42,6 +42,13 @@ function ok<T>(result: Validated<T>): T {
   return result.value;
 }
 
+/** The clock for adding moves: an hour after the fixture moves were written down. */
+const NOW = new Date("2026-11-23T18:00:00.000Z");
+
+function addMove(log: MoveLog, m: unknown): Validated<MoveLog> {
+  return withMove(log, m, NOW);
+}
+
 function codes(result: Validated<unknown>): string[] {
   return result.ok ? [] : result.issues.map((i) => i.code);
 }
@@ -172,6 +179,17 @@ describe("validateStorageLocation", () => {
     expect(codes(validateStorageLocation({ ...room, agentId: newRecordId() }))).toEqual([
       "agent_not_external",
     ]);
+  });
+
+  it("refuses a room and an outside place with the same name, both listed at the top", () => {
+    expect(
+      codes(
+        indexLocations(LEVELS, [
+          room,
+          { ...conservator, id: newLocationId(), name: "archive ROOM" },
+        ]),
+      ),
+    ).toEqual(["duplicate_name"]);
   });
 
   it("refuses the path separator in a name (review fix)", () => {
@@ -387,7 +405,7 @@ describe("whereabouts", () => {
     expect(w?.normal).toBeNull();
     expect(w?.away).toBe(true);
     expect(w?.expectedReturnOn).toBe("2026-11-01");
-    const placed = ok(withMove(log, move(tape, box1.id, "2026-11-22", "placement")));
+    const placed = ok(addMove(log, move(tape, box1.id, "2026-11-22", "placement")));
     expect(ok(whereabouts(placed, tape))?.away).toBe(false);
     const parked = ok(indexMoves(idx, [move(tape, shelfB.id, "2026-11-20", "correction")]));
     expect(ok(whereabouts(parked, tape))?.away).toBe(false);
@@ -406,7 +424,7 @@ describe("whereabouts", () => {
   });
 
   it("a return brings it home and clears the expected date", () => {
-    const back = ok(withMove(log, move(deed, folder1.id, "2026-11-22", "return")));
+    const back = ok(addMove(log, move(deed, folder1.id, "2026-11-22", "return")));
     const w = ok(whereabouts(back, deed));
     expect(w?.away).toBe(false);
     expect(w?.expectedReturnOn).toBeNull();
@@ -417,14 +435,14 @@ describe("whereabouts", () => {
   });
 
   it("rehousing changes the normal location", () => {
-    const next = ok(withMove(log, move(print, shelfB.id, "2026-11-22", "rehousing")));
+    const next = ok(addMove(log, move(print, shelfB.id, "2026-11-22", "rehousing")));
     const w = ok(whereabouts(next, print));
     expect(w?.normalLabel).toBe("Archive room › Shelf B");
     expect(w?.away).toBe(false);
   });
 
   it("a correction records where it is without changing home", () => {
-    const next = ok(withMove(log, move(deed, box1.id, "2026-11-22", "correction")));
+    const next = ok(addMove(log, move(deed, box1.id, "2026-11-22", "correction")));
     const w = ok(whereabouts(next, deed));
     expect(w?.currentLabel).toBe("Archive room › Shelf A › Box 001");
     expect(w?.normalLabel).toBe("Archive room › Shelf A › Box 001 › Folder 1");
@@ -432,13 +450,13 @@ describe("whereabouts", () => {
   });
 
   it("a later move with no date keeps the due date, so it stays overdue (review fix)", () => {
-    const next = ok(withMove(log, move(deed, shelfB.id, "2026-11-22", "correction")));
+    const next = ok(addMove(log, move(deed, shelfB.id, "2026-11-22", "correction")));
     expect(ok(whereabouts(next, deed))?.expectedReturnOn).toBe("2026-10-31");
     expect(ok(overdueReturns(next, "2026-11-23")).map((w) => w.recordId)).toContain(deed);
-    const other = ok(withMove(log, move(deed, case2.id, "2026-11-22", "other")));
+    const other = ok(addMove(log, move(deed, case2.id, "2026-11-22", "other")));
     expect(ok(whereabouts(other, deed))?.expectedReturnOn).toBe("2026-10-31");
     const later = ok(
-      withMove(
+      addMove(
         log,
         move(deed, case2.id, "2026-11-22", "exhibition", { expectedReturnOn: "2027-01-05" }),
       ),
@@ -463,28 +481,28 @@ describe("whereabouts", () => {
 
   it("checks a back-dated move in its place in the history", () => {
     // Placed in Box 001 on 2026-01-05; a return dated before that has no home to go to.
-    expect(codes(withMove(log, move(print, box1.id, "2025-12-01", "return")))).toEqual([
+    expect(codes(addMove(log, move(print, box1.id, "2025-12-01", "return")))).toEqual([
       "not_normal_location",
     ]);
   });
 
   it("refuses a return that doesn't go home, and a home outside", () => {
-    expect(codes(withMove(log, move(print, shelfB.id, "2026-11-22", "return")))).toEqual([
+    expect(codes(addMove(log, move(print, shelfB.id, "2026-11-22", "return")))).toEqual([
       "not_normal_location",
     ]);
-    expect(codes(withMove(log, move(tape, box1.id, "2026-11-22", "return")))).toEqual([
+    expect(codes(addMove(log, move(tape, box1.id, "2026-11-22", "return")))).toEqual([
       "not_normal_location",
     ]);
-    expect(codes(withMove(log, move(tape, conservator.id, "2026-11-22", "placement")))).toEqual([
+    expect(codes(addMove(log, move(tape, conservator.id, "2026-11-22", "placement")))).toEqual([
       "external_normal_location",
     ]);
   });
 
   it("refuses unknown locations and duplicate move IDs", () => {
-    expect(codes(withMove(log, move(print, newLocationId(), "2026-11-22", "other")))).toEqual([
+    expect(codes(addMove(log, move(print, newLocationId(), "2026-11-22", "other")))).toEqual([
       "unknown_location",
     ]);
-    expect(codes(withMove(log, moves[0]))).toEqual(["duplicate_id"]);
+    expect(codes(addMove(log, moves[0]))).toEqual(["duplicate_id"]);
     expect(codes(indexMoves(idx, [moves[0], moves[0]]))).toEqual(["duplicate_id"]);
     expect(codes(indexMoves(idx, [move(print, newLocationId(), "2026-11-22", "other")]))).toEqual([
       "unknown_location",
@@ -492,7 +510,7 @@ describe("whereabouts", () => {
   });
 
   it("lists a box's contents, and everything within it", () => {
-    const l2 = ok(withMove(log, move(tape, folder1.id, "2026-11-22", "placement")));
+    const l2 = ok(addMove(log, move(tape, folder1.id, "2026-11-22", "placement")));
     expect(ok(locationContents(l2, folder1.id))).toEqual([tape]);
     expect(ok(locationContents(l2, box1.id))).toEqual([]);
     expect(ok(locationContents(l2, room.id, { within: true }))).toEqual([tape]);
