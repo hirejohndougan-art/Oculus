@@ -172,17 +172,23 @@ Written by T-011 ([review](reports/2026-11-phase1-review.md)). Q-1 (one app or t
 
 Decisions first:
   - Done: `templateChanges` reads `templateKey` as an own data property; the blowup tests assert their limits in process CPU time (`process.cpuUsage`, every thread, so garbage collection counts) with the same numbers, and their wall-clock timeouts became hang guards (3× the limit, at least 30 s). Reviewed: the first version timed only the main thread, which was 25–70% looser; fixed.
-- [ ] T-020 **Decision: PostgreSQL version and database tests.** deps: T-011
+- [x] T-020 **Decision: PostgreSQL version and database tests.** deps: T-011
   - Choose the PostgreSQL major versions Oculus supports (community-supported releases only), and how the gate runs database tests: locally (the sandbox has PostgreSQL 16) and in GitHub Actions (a service container). The gate must stay one command and must not get weaker. The decision entry says Q-2 may narrow the version range later.
-- [ ] T-021 **Decision: database access and migrations.** deps: T-020
+  - Done (D-049): PostgreSQL 15–19, the oldest and newest tested in CI; the gate starts a throwaway local server (initdb and pg_ctl, socket only) or uses `OCULUS_TEST_DATABASE_URL`, and fails rather than skips without a database.
+- [x] T-021 **Decision: database access and migrations.** deps: T-020
   - Compare a plain driver with hand-written SQL, a query builder and an ORM (for example `pg`, `postgres`, Kysely, Drizzle; check each license and release history yourself). Pick one, plus a migration approach, against the Phase 2 criteria and these: parameterized queries only, JSONB and full-text search usable without raw-string building, migrations a person can read as SQL, and TypeScript types. Decision entry.
-- [ ] T-022 **Decision: Node HTTP framework.** deps: T-011
+  - Done (D-050): `pg` with hand-written SQL through one `sql` tag; plain `.sql` forward-only migrations run by our own runner with checksums and an advisory lock. `pg` has one npm maintainer, an exception to the Phase 2 rule recorded in D-050 (every Node PostgreSQL driver has one).
+- [x] T-022 **Decision: Node HTTP framework.** deps: T-011
   - Compare Node's built-in `http` with maintained frameworks (for example Fastify, Hono, Express 5) against the Phase 2 criteria and these: its security record (GitHub advisories), request size limits, cookie handling, and no need for WebSockets (a host may not allow them, Q-2). Decision entry.
-- [ ] T-023 **Decision: passwords, two-factor and sessions.** deps: T-011
+  - Done (D-051, John): Fastify 5 with our own content-type parsers, limits, cookie and Origin rules (T-022a).
+- [x] T-023 **Decision: passwords, two-factor and sessions.** deps: T-011
   - Choose password hashing (OWASP Password Storage Cheat Sheet: Argon2id, or Node's built-in scrypt), the second factor (TOTP per RFC 6238, with recovery codes; WebAuthn later or now), and server-side sessions in PostgreSQL versus signed tokens, against OWASP ASVS and the Phase 2 criteria. Prefer `node:crypto` where it is enough. Decision entry.
 
 Database:
-- [ ] T-024 **Migrations tooling and the empty schema.** deps: T-020, T-021 (risky)
+  - Done (D-052): scrypt in PHC strings (Argon2id once Node ≥24.7 is the floor), two-step sign-in required for all staff (John) with TOTP and recovery codes, sessions hashed in PostgreSQL, 4 hours idle (John) and 12 hours absolute by default.
+- [ ] T-022a **The HTTP layer on Fastify.** deps: T-022 (risky)
+  - D-051's rules, each with an attack test: Oculus's own content-type parsers (exact JSON and form types only, 415 otherwise, no compressed bodies), byte-counted limits (1 MiB, 8 KiB on sign-in, two-step and site password posts), path refusals (encoded slashes, backslashes, `..`, NUL), 404/405 before handlers, `@fastify/cookie` only for Oculus's names with one `__Host-` writer, the Origin/`Sec-Fetch-Site` check on changes, `trustProxy` only when an environment variable names the proxy, short timeouts, errors without stack traces.
+- [ ] T-024 **Migrations tooling and the empty schema.** deps: T-020, T-021 (risky) Build it as D-049 and D-050 say: `packages/db` with `pg`, the `sql` tag and the migration runner; lint keeps `pg` inside `packages/db`; `db:migrate` refuses servers older than 15; CI runs the gate against `postgres:15` and `postgres:19`.
   - A `packages/db` package with the chosen tool, `npm run db:migrate` that applies migrations forwards to the database named in an environment variable (no password in the repo, not even for tests), and a test that runs every migration on a fresh database. The gate and the CI workflow start a test database as T-020 decided.
 - [~] T-019 **Decision and model: organizations in one install.** deps: T-011 (risky)
   - D-019 (John): one install holds several organizations, each with its own records, templates, identifier types, rights settings, people, roles and sites. Example: the Historical Society's archives number items like `DS5C740001`; the library it hosts numbers them `DPL1`, `DPL2`, `DPL3`. Add an organization to the core model and scope every record, template, identifier type and vocabulary to one. Identifier uniqueness is per organization, so two organizations can hold the same number. Separation is complete, as if each were its own copy of Oculus (D-019): nothing is shared, including templates, vocabularies and people lists. One person can have access to several organizations with separate roles in each and switch between them; a session always works in exactly one. Tests try to read or write across organizations through every core function and fail. Also from D-019: a site can be password protected (an extra check on top of sign-in and roles; decide how the site password is stored and rate-limited, with the security review), and System settings cover the whole install, set only by system admins. Users are managed for all sites in one place, and after sign-in a person sees only the sites they have a role on (D-019). The schema (T-025 onward) and roles (T-041) build on this. Check that the identifier format language (D-009) covers both examples, including unpadded auto-numbers (`DPL#{1,9}`).
@@ -198,7 +204,7 @@ Database:
   - Done (D-047); independent review: safe.
 - [ ] T-019b2 **Organizations on local term lists and rights settings.** deps: T-019b1, T-027 (risky)
   - When local vocabularies, stored authority terms (T-027) or per-organization rights settings become stored data, give each a required `organizationId` and refuse mixed or unowned sets, as D-030 does.
-- [ ] T-019d **Site passwords.** deps: T-019, T-023 (risky)
+- [ ] T-019d **Site passwords.** deps: T-019, T-023, T-037 (risky) As D-052: hashed like a user password, at least 15 characters, a version that ends unlocks when it changes, unlocks kept on the session, throttled per user per site and per site, never a permanent lockout.
   - How a password-protected site (D-019) stores its password and rate-limits attempts; needs the Phase 2 password decision.
 - [ ] T-012a **Follow-ups from T-012 and T-005a.** deps: T-012, T-005a
   - `made_staff` and `templateChanges` pick records by `templateKey`; compare the two templates when a record moves to another template; `nextIdentifier` also counts numbers held in template identifier fields; remove the lookup-function path once every record has a key.
@@ -230,9 +236,9 @@ The writer:
 Logins and roles:
 - [ ] T-036 **User accounts and password sign-in.** deps: T-023, T-024 (risky)
   - Users, passwords hashed as T-023 decided, sign-in with rate limiting and lockout per OWASP ASVS, and the same reply for a wrong user name as for a wrong password. Accounts are created by an admin's invitation; there is no public sign-up.
-- [ ] T-037 **Sessions.** deps: T-036, T-022 (risky)
+- [ ] T-037 **Sessions.** deps: T-036, T-022a (risky) As D-052: hashed tokens in PostgreSQL, the session's one organization (D-019), 4 hours idle and 12 hours absolute by default, re-entering the password for sensitive changes, a person's list of their own sessions, a cleanup command.
   - Server-side sessions with random IDs stored hashed, cookies with HttpOnly, Secure and SameSite, idle and absolute time limits, a new session ID at sign-in and on any role change, sign-out everywhere, and CSRF protection on every change.
-- [ ] T-038 **Optional two-factor sign-in.** deps: T-037 (risky)
+- [ ] T-038 **Two-factor sign-in, required for all staff.** deps: T-037 (risky) As D-052 (John: required for everyone, set up at first sign-in): TOTP (re-read RFC 6238 first), the secret encrypted with `OCULUS_SECRET_KEY`, 10 recovery codes stored hashed; the QR encoder is this task's own dependency choice.
   - A user can turn on a second factor as T-023 decided, with single-use recovery codes. An admin can require it for admins. Tests cover replayed codes and brute force.
 - [ ] T-039 **Password reset tokens.** deps: T-036 (risky)
   - Single-use, short-lived reset tokens, stored hashed. A reset ends every session for that user. Requests get the same reply whether or not the account exists. Sending the message goes through an interface with a test double, so this task doesn't need an email service.
@@ -245,7 +251,7 @@ Logins and roles:
   - An organization setting that, when on, holds edits and publish requests as pending versions until a reviewer approves or rejects them, with both recorded in the change log. When it's off, saves go straight through as today.
 
 The API:
-- [ ] T-042 **HTTP API: records, templates and identifier types.** deps: T-022, T-032, T-037, T-041 (risky)
+- [ ] T-042 **HTTP API: records, templates and identifier types.** deps: T-022a, T-032, T-037, T-041 (risky)
   - JSON endpoints in their own package (`packages/api`) that wrap the service layer for reading, creating and updating records, templates and identifier types. Request size limits, input checked with the core validators, errors without stack traces, and a test for each endpoint with no session, the wrong role and the wrong collection. How it is deployed alongside the public sites waits on Q-1 (T-050).
 - [ ] T-043 **API: history, restore, approval and publishing.** deps: T-042, T-030, T-034, T-035 (risky)
   - Endpoints for versions, compare, restore, the change log, the approval queue and publish/unpublish, with the same permission tests as T-042.
@@ -274,6 +280,9 @@ Server and deployment:
 
 - [ ] T-053 **Phase 2 review.** deps: T-020 to T-052
   - Check Phase 2 against PLATFORM_PLAN.md §3 and the "one writer" principle, get an independent security review of the whole of Phase 2, and write the Phase 3 tasks (including M-001).
+
+- [ ] U-004 **Move password hashing to Argon2id.** deps: T-036
+  - When the `engines` floor reaches Node 24.7 (Node 22 support ends April 2027), switch new hashes to `crypto.argon2` (OWASP settings) with a decision entry; PHC strings move each user over at sign-in (D-052).
 
 ## Phase 3 — Media
 Tasks to be written when Phase 2 is done. Carried forward:

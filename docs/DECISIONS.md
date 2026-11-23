@@ -346,3 +346,186 @@ Extends D-030 and D-012 to Dublin Core mappings, the one kind of organization da
 - **Copies.** `mappingFromPreset(preset, template)` makes an organization's mapping from a preset for one of its templates: `template` becomes the template's key and `organizationId` the template's organization, then the whole copy is checked. A mapping that already has an `organizationId` (even `null`) is refused (`has_organization`), as a guard against mistakes rather than a security boundary, as with `templateFromPreset`. `mappingForTemplate(mapping, template)` still re-targets a mapping to another template, but only within its own organization: it keeps the mapping's `organizationId`, so another organization's mapping or one without an organization is refused.
 - **Rejected:** letting a mapping without an organization match any template (a missing owner would silently match every organization, D-030); having `mappingForTemplate` adopt the template's organization for an organization-less mapping (one function would both re-target and change ownership, so stripping `organizationId` from another organization's mapping would be enough to take it over; a separate `mappingFromPreset` makes the adoption explicit); keeping `validateTemplateShape` so mappings can still be checked against presets (nothing outside tests did that, and a check that accepts an unowned template is the kind of path that reads across organizations); reporting the usual entry issues alongside `wrong_organization` (they would name another organization's field keys).
 - **Vocabularies, terms and rights settings (T-019b2).** Not changed here: in `packages/core` vocabularies and rights terms are built-in standard lists, controlled terms are stored inside records (which carry an `organizationId`), and there are no stored rights settings yet. When local term lists, stored authority terms (T-027) or rights settings become data, they get the same required `organizationId`.
+
+## D-049 — PostgreSQL 15 to 19, and a throwaway test database inside the gate (2026-11-23, autopilot T-020)
+**Versions.** Oculus supports every PostgreSQL major version the community still supports, and no others. On 2026-11-23 that is **15, 16, 17, 18 and 19**. PostgreSQL 14 had its final release on 2026-11-12 and is not supported. The range moves with postgresql.org's versioning page. Each major gets 5 years, so 15 drops after its final release on 2027-11-11 (16: 2028-11-09). A new major is added once CI passes on it.
+- **Write SQL for the oldest supported version.** Nothing newer than 15 may be used until the floor rises. For example, `uuidv7()` is new in 18 and `JSON_TABLE()` is new in 17. UUIDs come from `gen_random_uuid()` or from Node's `crypto.randomUUID()`.
+- **`db:migrate` checks the server first.** It reads `server_version_num` and refuses to run below 15. Above the newest major CI tests, it gives a warning.
+- **Hosting may narrow the range later.** Q-2/D-035/D-046 may narrow it, for example to the versions SiteGround's shared plans offer. Its knowledge base lists PostgreSQL but no version could be read here, so this is checked with SiteGround before T-051. The range never widens to a version the community no longer supports. If a host offers only an end-of-life version, that host doesn't meet D-035.
+
+**Database tests in the gate.** `npm run gate` stays one command, and database tests are ordinary Vitest tests that count toward `tests_passing`.
+- **Where the gate gets its database.** If `OCULUS_TEST_DATABASE_URL` is set, the gate uses that server (CI does this). Otherwise it starts its own throwaway server:
+  - It runs `initdb` into a new temporary directory, finding the binaries through `PG_BIN` or `pg_config --bindir`.
+  - It starts the server with `pg_ctl start -w`, listening only on a Unix socket in that directory (`listen_addresses=''`, so no TCP port) and with `fsync=off`.
+  - It runs Vitest, then always stops the server with `pg_ctl stop -m fast` and deletes the directory, whether the tests passed or not. No server is left running.
+- **No password anywhere.** Local tests use trust authentication on the private socket.
+- **Running as root.** `initdb` refuses to run as root, and the build sandbox runs as root. So under uid 0 the gate runs `initdb` and `pg_ctl` as the `postgres` system user (`runuser -u postgres`), with the temporary directory owned by that user.
+- **The sandbox.** It has PostgreSQL 16.15 at `/usr/lib/postgresql/16/bin` (`pg_config --bindir`). The current 16.x minor is 16.16. There is a client-only Docker with no daemon. The system cluster `16/main` is stopped and stays unused.
+- **No silent skips.** If there is no URL and no PostgreSQL binaries, the gate fails with a message saying how to provide one. A database test with no database fails; it is never skipped.
+- **Test isolation.** Each test file works in its own freshly created database and drops it afterwards. T-024 decides the details, such as cloning a migrated template database.
+- **GitHub Actions.** The `gate` job runs `npm run gate` once per PostgreSQL version: 15 (the oldest supported) and 19 (the newest). Each uses an official `postgres:<major>` service container:
+  - It has a `pg_isready` health check and port 5432 mapped to the runner.
+  - It uses `POSTGRES_HOST_AUTH_METHOD: trust`, so there is no password in the repository, not even for tests. The container is reachable only from that job.
+  - `OCULUS_TEST_DATABASE_URL` points at `localhost`.
+  - If no `postgres:19` image is published yet when T-024 runs, it uses 18 and adds a follow-up task.
+
+**Rejected:**
+- Supporting 14 or older (14 is end-of-life).
+- Testing only the sandbox's 16 (misses both ends of the range).
+- Testing all five majors in CI (the oldest and newest catch use of newer features and breakage on a new release, at a fraction of the CI minutes).
+- Pointing tests at the long-running system cluster (state leaks between runs, and a server is left running).
+- Docker or Testcontainers locally (the sandbox has no Docker daemon).
+- `embedded-postgres`-style npm packages (they download server binaries the license check can't see).
+- Skipping database tests when no database is available, or mocking the database (both weaken the gate).
+- A password in the workflow file.
+
+**Sources:**
+- https://www.postgresql.org/support/versioning/ (supported versions and final-release dates; read 2026-11-23, page showing 19.0 released 2026-11-19)
+- https://www.postgresql.org/message-id/attachment/201383/20260813updaterelease.md (14 end-of-life notice)
+- https://www.postgresql.org/docs/release/18.0/ (`uuidv7()`)
+- https://www.postgresql.org/docs/release/17.0/ (`JSON_TABLE()`)
+- `initdb` run as root in the sandbox ("cannot be run as root")
+- Not read (requests blocked): https://docs.github.com/en/actions/tutorials/use-containerized-services/create-postgresql-service-containers and https://www.siteground.com/kb/postgresql-manager. T-024 reads the GitHub page before writing the workflow.
+
+## D-050 — Database access: the `pg` driver with hand-written SQL through one `sql` tag; plain `.sql` migrations run by our own runner (2026-11-23, autopilot T-021)
+**The driver and the queries.** `pg` (node-postgres) with hand-written SQL. `pg` is a runtime dependency of `packages/db` only, and `@types/pg` is a dev dependency.
+- **One place imports the driver.** `packages/db` is the only package that imports `pg`, and lint enforces this with `no-restricted-imports`.
+- **Every query goes through one `sql` tagged template.** It is written in `packages/db` and turns each `${value}` into a `$n` parameter, returning `{ text, values }` for `pg`.
+  - There is no raw-string escape hatch. Table and column names are written in the SQL text, never interpolated.
+  - Lint bans calling `.query()` with anything but the tag's result.
+- **JSONB without building strings.** Values go in as parameters (`${JSON.stringify(v)}::jsonb`). A template field's key is a parameter too (`fields -> ${key}`), never part of a path string.
+- **Full-text search without building strings.** It uses `websearch_to_tsquery(${config}::regconfig, ${q})`, and the search text is always a parameter.
+- **TypeScript types.** Each query function declares its row type. Types aren't generated from the database, so every query has a test that runs it against the migrated test database (D-050 T-020), and a mismatch fails the gate.
+- **Type parsers.** T-024 sets them explicitly: `int8` and `numeric` come back as strings, not lossy numbers, and dates come back the way D-008 stores them.
+- **Separate roles.** The public sites' read-only path is a separate connection pool with its own database role (D-034).
+
+**Migrations.** Plain SQL files in `packages/db/migrations/NNNN_short_name.sql`, forward only, applied by a small runner in `packages/db` (`npm run db:migrate`, T-024). The runner:
+- takes a `pg_advisory_lock`, so two runs can't migrate at once;
+- runs each file in its own transaction;
+- records the file name, a SHA-256 of its contents and the time in an `oculus_migrations` table;
+- refuses to run if an applied file was edited, is missing, or a new file sorts before an applied one.
+- **No down migrations.** Undoing a migration is a restore from backup (T-052).
+- **Statements that can't run in a transaction** (for example `CREATE INDEX CONCURRENTLY`) are left for T-024 to decide, if they're ever needed.
+
+**Candidates checked** (npm registry and npm's advisory database, 2026-11-23):
+- **`pg` 8.23.1** (released 2026-09-30):
+  - MIT; 14 packages in all, every one MIT or ISC; no install scripts that run.
+  - One advisory ever: GHSA-wc9v-mj63-m9g5, a critical code-execution bug affecting only versions before 7.1.2 (fixed in 2017).
+  - One npm maintainer.
+- **`postgres` 4.1.1** (porsager; released 2026-11-11):
+  - Unlicense; no dependencies; no advisories; tagged templates built in.
+  - One maintainer; 4.0.0 is a new major from 2026-10-29.
+- **Kysely 0.29.9** (query builder; released 2026-11-12):
+  - MIT; no dependencies, but needs `pg` to talk to PostgreSQL; two maintainers.
+  - Four high-severity advisories in its 0.26–0.28 lines, injection through JSON path keys and `sql.lit`: GHSA-pv5w-4p9q-p3v2, GHSA-wmrf-hv6w-mr66, GHSA-8cpq-38p9-67gx, GHSA-fr9j-6mvq-frcv.
+- **Drizzle ORM 0.45.4** (released 2026-10-08):
+  - Apache-2.0; four maintainers; needs `pg` or `postgres`.
+  - A high-severity SQL injection through identifiers, fixed in 0.45.2: GHSA-gpj5-g38j-94v9.
+  - `drizzle-kit` 0.31.11, which writes its migrations, brings esbuild, tsx and the deprecated `@esbuild-kit` loader, with 4 moderate advisories (GHSA-67mh-4wv8-2f99).
+- **`node-pg-migrate` 9.0.0:**
+  - MIT; three maintainers; 36 packages.
+  - 3 moderate advisories through `glob`/`minimatch` (GHSA-3g3m-2fjr-6pw4, GHSA-g3hv-75wg-m249).
+
+**Why `pg`.** It passes the license check and has a small, audited dependency tree. Plain SQL is exactly what the PostgreSQL docs describe, so JSONB, full-text search, roles and views (D-034) need no translation layer. Its 15-year record has one old advisory. It is also the driver Kysely, Drizzle and the migration tools are built on, so a query builder would add a layer, not replace `pg`.
+
+**An exception to the Phase 2 rule "more than one maintainer, or a foundation behind it".** `pg` has one npm maintainer. So does `postgres`, and both ORMs and query builders still need one of these two drivers, while Node has no built-in PostgreSQL client. The risk is contained because only `packages/db` imports the driver. If `pg` stops being maintained, moving to `postgres` changes one package. Upkeep watches its release dates.
+
+**Rejected:**
+- **`postgres` (porsager).** The close second: no dependencies, and parameters by construction. But it has the same single maintainer, and its 4.x line is under a month old. Its `sql.unsafe` would need the same lint ban. Revisit if `pg` goes quiet.
+- **Kysely.** It still needs `pg`, it is pre-1.0, and its 2026 advisories are in the JSON-path building this project would lean on for JSONB. Its migrator writes migrations in TypeScript, not SQL.
+- **Drizzle.** It is pre-1.0 (1.0 is still in beta), and the schema lives in TypeScript with SQL generated from it, so the SQL a person reads is a by-product. drizzle-kit's tree carries esbuild advisories. It also had an identifier-injection advisory this year.
+- **`node-pg-migrate`.** Its default migrations are JavaScript, and its tree has 36 packages with moderate advisories.
+- **graphile-migrate.** One maintainer, and dependencies years out of date (chalk 3, yargs 15, `@types/node` 14).
+- **dbmate.** A Go binary delivered through npm, outside the npm license check and audit.
+- **postgres-shift.** WTFPL, which is not on D-006's list.
+- **Down migrations.** Usually untested, and they can drop data. Restore from backup instead.
+
+**Sources:**
+- `npm view <pkg> license version time maintainers dependencies` and scratch installs with `--ignore-scripts`, `npm ls --all` and `npm audit`, each in its own directory under /tmp.
+- npm's bulk advisory API, given every published version of `pg`, `postgres`, `kysely`, `drizzle-orm` and `drizzle-kit`.
+- The GitHub advisory pages couldn't be opened from the sandbox (requests blocked), so the advisory IDs and ranges are as npm's advisory API reports them.
+
+## D-051 — The HTTP server: Fastify 5 (2026-11-23, John and autopilot T-022)
+John chose a well-known framework over a hand-written layer, so a future maintainer meets something familiar. Oculus serves its JSON API, the admin's built files and the server-built public pages (D-034) with **Fastify 5** (MIT, an OpenJS Foundation project, five npm maintainers), pinned at 5.12.8 or later.
+- **Why Fastify.** Of the frameworks compared it has the best defaults for this task: a 1 MiB body limit, protection against prototype poisoning in JSON bodies, schema-checked routes and an exact router (find-my-way) rather than route strings turned into regular expressions. It needs no WebSockets (D-035, D-046).
+- **Its record, and what we do about it.** It installs 48 packages (all MIT, ISC or BSD-3-Clause, D-002) and has 20 GitHub advisories over its life, 10 high. Six were in 2026: Content-Type parsing that let bodies skip validation (GHSA-jx2c-rxcm-jvmq, GHSA-247c-9743-5963, GHSA-573f-x89g-hqp9), an authentication bypass through malformed URLs (GHSA-p68q-wchp-6fh7, fixed in 5.12.2) and X-Forwarded-* spoofing (GHSA-444r-cwp2-x5xf, GHSA-3m5p-2c4r-xxw2). So Oculus:
+  - registers its own content-type parsers for exactly `application/json` and, on form routes, `application/x-www-form-urlencoded`, and refuses everything else with 415, including compressed bodies;
+  - leaves `trustProxy` off unless an environment variable names the trusted proxy;
+  - checks every body again with the core validators, never trusting the route schema alone;
+  - doesn't use the default logger for request bodies or cookies.
+- **The rules on top** (T-022a builds them; `(risky)`, independent review, an attack test for each):
+  - **Bodies:** 1 MiB default, 8 KiB for sign-in, two-step and site password posts, counted for chunked bodies.
+  - **Paths:** encoded slashes, backslashes, `..` and NUL refused; unknown routes 404, wrong methods 405, before any handler.
+  - **Cookies:** `@fastify/cookie` (OpenJS, MIT), read only for Oculus's own names; the same Oculus cookie twice is refused; written only through one helper that sets `__Host-`, `Secure`, `HttpOnly`, `SameSite` and `Path=/` (ASVS 5.0 3.3.1–3.3.4).
+  - **Changes:** any method other than GET or HEAD carries an `Origin` matching the host or `Sec-Fetch-Site: same-origin`, plus T-037's CSRF token (ASVS 5.0 3.5.1, 3.5.3).
+  - **Timeouts** shorter than Node's defaults; **errors** without stack traces (T-042).
+  - Any other Fastify plugin is its own dependency decision.
+- **Rejected:**
+  - **A small layer on `node:http`** (the autopilot's first draft): fewest outside parts, but security code that only the autopilot and its reviewers would know — John preferred the familiar framework.
+  - **Express 5:** 65 packages and a history of body-limit and ReDoS bugs in its parts (body-parser GHSA-v422-hmwv-36x6, GHSA-27r3-jxmh-p828; path-to-regexp GHSA-9wv6-86v2-598j, GHSA-j3q9-mxjg-w52f); no cookie reading without another package.
+  - **Hono:** one npm maintainer, and repeated body-limit and cookie bugs (GHSA-9vqf-7f2p-gf9v, GHSA-26pp-8wgv-hjvm and others).
+- **Upkeep:** Fastify's advisories are watched like every dependency (npm audit in the gate, Dependabot); a Fastify major version gets its own decision entry.
+- Sources: https://fastify.dev/docs/latest/Reference/Server/ ; https://nodejs.org/api/http.html ; the npm advisory bulk endpoint (GitHub Advisory Database) for fastify, @fastify/cookie, find-my-way, express, body-parser, path-to-regexp, hono and @hono/node-server; OWASP ASVS 5.0 V3; `npm view` and trial installs, all read 2026-11-23.
+
+## D-052 — Passwords with scrypt now and Argon2id later, two-step sign-in required for all staff (TOTP and recovery codes), sessions stored in PostgreSQL (2026-11-23, autopilot T-023)
+Everything here uses `node:crypto` (`scrypt`, `randomBytes`, `createHmac`, `createHash`, `timingSafeEqual`, AES-256-GCM). No new dependency is needed. Checked against OWASP ASVS 5.0 V6 (Authentication), V7 (Session Management) and V3.3 (cookies).
+
+**Passwords**
+- **scrypt from `node:crypto` for now, N=2^14, r=8, p=5 (16 MiB).** This is one of OWASP's equal-strength scrypt settings, and the one that uses the least memory per sign-in, which matters on shared hosting (D-046). It took about 0.2 s in the sandbox, against 0.5 s and 128 MiB for N=2^17, p=1.
+  - The salt is 16 random bytes and the key is 32 bytes.
+  - Hashing always uses the async `crypto.scrypt` (the libuv thread pool), never `scryptSync`, and only a few hashes run at once, so a burst of sign-ins can't starve the server.
+  - Each hash is stored as one PHC-format string with the algorithm and its settings (`$scrypt$ln=14,r=8,p=5$<salt>$<hash>`). When the settings or the algorithm change, a password is re-hashed at the next sign-in. Hashes are compared with `timingSafeEqual`.
+- **Argon2id later.** OWASP prefers Argon2id (m=19456 KiB, t=2, p=1), and `crypto.argon2()` exists only from Node 24.7.0 and needs OpenSSL 3.2 or later. Oculus still supports Node 22 (D-006), and the build sandbox runs 22.23.5, where it is missing, so the gate couldn't test it. When the `engines` floor is raised to 24.7 or later (Node 22's support ends in April 2027), a decision entry switches new hashes to Argon2id, and the PHC format moves each user over at sign-in.
+- **Password rules (ASVS 5.0 6.2):**
+  - Length is at least 8 characters (6.2.1), with 15 recommended on the form. At least 64 characters are allowed (6.2.9); the cap is 1,024 bytes, which keeps request size bounded.
+  - There are no composition rules (6.2.5), no forced rotation (6.2.10) and no hints or secret questions (6.4.2).
+  - The password is hashed exactly as received, with no trimming, case changes or truncation (6.2.8).
+  - A new password is checked against a bundled list of at least the 3,000 most common passwords (6.2.4) and a list of context words such as "oculus", "dickinson", "historical" and the organization's name (6.1.2, 6.2.11). The list's own license must pass D-002.
+  - A check against breached passwords (6.2.12, for example the Have I Been Pwned range API) would be an outbound request. It is left as a later, off-by-default option with its own security review.
+- **Sign-in throttling (ASVS 6.1.1, 6.3.1, 6.3.8):**
+  - Failures are counted in PostgreSQL (no Redis needed) per account and per client address. The client address comes from the socket unless a trusted proxy is configured (D-051).
+  - Each counter brings a growing delay and then a temporary block, never a permanent lockout, so nobody can lock a colleague out by guessing.
+  - A wrong user name gets the same reply and the same timing as a wrong password: it is checked against a dummy hash.
+  - The rules are written down, as 6.1.1 asks.
+- **Rejected:**
+  - The npm `argon2` package: a native add-on with prebuilt binaries, a poor fit for shared hosts, and a new dependency where Node will soon do the job.
+  - bcrypt: legacy only, and it ignores everything past 72 bytes.
+  - PBKDF2.
+  - A pepper: an extra secret in the environment that, if lost, makes every password fail. OWASP calls it defence in depth only.
+
+**Two-step sign-in**
+- **TOTP per RFC 6238, built with `node:crypto` alone.** It uses HMAC-SHA-1, which every authenticator app supports, with 6 digits and 30-second steps. One step either side is accepted for clock drift, using the server's clock only (ASVS 6.5.5, 6.5.8).
+  - The secret is 20 random bytes (160 bits, RFC 4226's recommended length). It is shown as RFC 4648 base32 text and as an `otpauth://` link.
+  - The last accepted time step is stored per user, so a code is never accepted twice, even within its window (RFC 6238 §5.2, ASVS 6.5.1).
+  - Code attempts are throttled like passwords.
+- **The TOTP secret is encrypted at rest** with AES-256-GCM under a key from an environment variable (`OCULUS_SECRET_KEY`, never in the repository). It can't be hashed, because the server must read it to check codes. If that key is lost, two-step sign-in stops working but nothing else does. People then use recovery codes, or a system manager resets their two-step sign-in (D-019).
+- **Recovery codes:** 10 single-use codes, each 120 random bits (24 Crockford base32 characters in groups of 4). They are shown once and stored as SHA-256 hashes. ASVS 6.5.2 allows a plain hash at 112 bits or more, so checking a code is not ten scrypt runs. Making a new set replaces the old set, and each use is logged.
+- **QR code:** the setup screen needs an encoder to show the `otpauth://` link as a QR code. Choosing one (for example `uqr`, MIT, no dependencies) is T-038's own dependency decision. Without one, the screen shows the key as text.
+- **WebAuthn (passkeys) later, not now.** It needs CBOR and COSE parsing of authenticator data, which means either a library or a lot of hand-written parsing, and ASVS asks for phishing-resistant factors only at Level 3 (6.3.3). Factors are stored in their own table, keyed by type, so WebAuthn can be added later without a schema rewrite.
+- **Required for every staff account (John, 2026-11-23; ASVS 5.0 6.3.3 Level 2).** A new account sets up two-step sign-in at its first sign-in, before it can do anything else; it can't be turned off, only reset (new secret, new recovery codes) by the person or a system manager. This replaces the plan's "optional, admins can require it" (§3).
+- Resetting two-step sign-in, changing a password and changing the sign-in email all need the password again, and the second factor if it is on (ASVS 7.5.1). Afterwards the person is offered "sign out everywhere else" (7.4.3).
+
+**Sessions: server-side in PostgreSQL**
+- **The session token:**
+  - The token is 32 random bytes from `randomBytes` (256 bits; ASVS 7.2.3 asks for 128). Only its SHA-256 hash is stored, so a database leak gives no usable sessions.
+  - It is a new token at every sign-in and at any change of role or privilege (7.2.4).
+  - Each session row holds the user, the one organization the session is working in (D-019), the creation and last-seen times, and the sites unlocked in it (T-019d).
+- **The cookie:** `__Host-oculus_session`, with `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/` and no `Domain` (ASVS 3.3.1–3.3.4), written only through T-022's cookie function.
+  - The admin should be served from its own hostname, separate from the public sites (ASVS 3.5.4), so the session cookie is never sent to a public page. T-050 and T-051 set that up.
+- **CSRF:** a token for each session, required on every change, together with T-022's Origin check.
+- **Time limits:**
+  - **4 hours idle (John, 2026-11-23)** and 12 hours absolute by default. John chose 4 hours so long cataloguing sessions aren't interrupted; it is longer than NIST SP 800-63B's 30-minute AAL2 figure, which is acceptable here because two-step sign-in is required for everyone. System managers can change both within bounds in System settings, and T-037 documents them as ASVS 7.1.1 asks.
+  - There is no limit on parallel sessions, but a person can see their sessions and end any of them (7.1.2, 7.5.2), and a system manager can end anyone's (7.4.5). Deactivating an account or resetting a password ends all of its sessions (7.4.2, T-039).
+  - Expired rows are deleted by a cleanup command any scheduler can run (D-035). An expired session is refused even if the cleanup never runs.
+- **Rejected: signed tokens (JWT or signed cookies).** Sign-out, sign-out everywhere, deactivation and role changes would all need a revocation list in the database anyway (ASVS 7.4.1). A signing key would have to be managed and rotated, and the history of JWT algorithm-confusion bugs (for example GHSA-f67f-6cw9-8mq4 in Hono) shows the risk. PostgreSQL is already required, so stored sessions cost nothing extra.
+
+**Site passwords (T-019d)**
+- **Stored:** a site's password is hashed exactly like a user's password, as a PHC string on the site row. Only a system manager can set it, after entering their own password again. It is never shown or emailed.
+  - Because many staff share it, its minimum is 15 characters (ASVS 6.2.1's recommended length), and it is checked against the same common-password and context-word lists.
+  - The row keeps a version number. Changing the password raises the version, which ends every existing unlock.
+- **Unlocking:** after sign-in, entering the right site password records an unlock (site and password version) on the server-side session row, never in a separate cookie, and issues a new session token. The unlock ends with the session or when the password changes. The service layer checks for the unlock on every request for that site, not only in the admin screens.
+- **Rate limiting:** the same PostgreSQL throttle as sign-in, counted per user per site and per site overall, with growing delays and a temporary block (never a permanent lockout). Every failure is written to the change log, and the form is an 8 KiB form post with the CSRF token and the Origin check.
+- Sources:
+  - OWASP Password Storage Cheat Sheet, Session Management Cheat Sheet and Multifactor Authentication Cheat Sheet (github.com/OWASP/CheatSheetSeries); OWASP ASVS 5.0 chapters V3, V6 and V7 (github.com/OWASP/ASVS, 5.0/en). These were read 2026-11-23.
+  - Node.js `crypto` docs (doc/api/crypto.md: `argon2` added in v24.7.0 and needs OpenSSL 3.2; `scrypt`'s `maxmem`) and the CHANGELOG_V24 entries for argon2, also read 2026-11-23.
+  - RFC 6238 and RFC 4226. Their text could not be fetched in this run: the sandbox proxy blocked rfc-editor.org and ietf.org. The time step, the one-step drift window, the no-reuse rule (§5.2) and the 160-bit key length are as the RFCs state them, and T-038 should re-read them before building.
