@@ -57,40 +57,48 @@
  *   ancestor or the record a digital asset represents (`deed_not_signed`).
  *   An accession's access restriction in force on the register's day holds
  *   back the same records, and links to them, in the same way
- *   (`access_restricted`, T-016a, D-053b).
+ *   (`access_restricted`, T-016a, D-056).
  *   With `records`, what a digital asset represents is found again in them.
- *   A link to an object, archival unit or digital asset goes out live only
+ *   A link to an object, archival unit or digital asset goes out only
  *   when `records` is given and the linked record, its ancestry and what it
  *   represents, all found in `records` now, are known to the register and
- *   none is held back; otherwise it goes out as its label only, as if
- *   unpublished (so a page published without `accessions` or `records`
- *   shows such links as labels). The check is only as fresh as the register: make it at
+ *   none is held back; otherwise nothing of it goes out, as if unpublished
+ *   (so a page published without `accessions` or `records` shows no such
+ *   links, D-045). The check is only as fresh as the register: make it at
  *   publish time. Nothing of an accession or a donor is read here.
  * - **Publishing is the caller's statement.** Records have no publish state
  *   yet, so the caller passes `published`, the IDs of every record that is
  *   published. The record itself must be in it (`not_published`). Public
  *   values inherited from an unpublished ancestor are published on the
  *   child; the ancestor's title and ID never appear.
- * - **Links to other records name them only when that is safe** (D-016,
- *   D-039). A `record_link` value, or a place value's `recordId`, becomes a
- *   link (`baseUrl` + ID) only when all of these hold: the record linked to
- *   is in `published`; the checker given for the kind (`checkers.record_link`
- *   or `checkers.place`) was made by `makeRecordLinkChecker` from this
- *   record's organization's records and holds it, so it is the
- *   organization's own and not another's (D-030); and it is of a kind the
- *   field allows. Otherwise the value goes out as its label alone (and a
- *   place's gazetteer URI), so output never reveals that an unpublished or
- *   another organization's record exists, or what its ID is. The linked
- *   record's own title and values are never read: the label is this record's
- *   own public text. The public view holds no linked IDs at all; they are
- *   read from the effective record.
+ * - **Links to other records go out only when that is safe** (D-016,
+ *   D-039, D-045). A `record_link` value, or a place value's `recordId`,
+ *   becomes a link (`baseUrl` + ID) only when all of these hold: the record
+ *   linked to is in `published`, and not held back by a deed (above); the
+ *   checker given for the kind (`checkers.record_link` or `checkers.place`)
+ *   was made by `makeRecordLinkChecker` from this record's organization's
+ *   records and holds it, so it is the organization's own and not another's
+ *   (D-030); it is of a kind the field allows; and it isn't the record
+ *   itself. Otherwise a `record_link` value puts out nothing at all: no ID,
+ *   no label, no placeholder (a term left with no values is left out), so
+ *   output never reveals that an unpublished, held back or another
+ *   organization's record exists, its ID, or a label copied from it. A place
+ *   value naming a place record keeps its own name (and gazetteer URI),
+ *   without the link, only when `checkers.place` was made by
+ *   `makeRecordLinkChecker` for this organization and holds that record as
+ *   a place; otherwise nothing of the value goes out (D-048). The linked record's
+ *   own title and values are never read. The public view holds no
+ *   `record_link` values and no linked IDs at all; they are read from the
+ *   effective record, for the keys `effectiveRecord` recorded beside the
+ *   view.
  * - **Every field kind is handled explicitly, and its shape checked again
  *   here:** text and long text as the text; a date as its EDTF text; a list
  *   choice as its option's label; a controlled term as its label, with its
  *   URI; an identifier as its value only; a link as its URL; rights as the
  *   statement's URI (never the note); a place as its name, with a URI from
  *   its gazetteer URI or a published place record; a record link as its
- *   label, with the linked record's URL when it may be named. URIs must be http(s) and
+ *   label with the linked record's URL when it may be named, and otherwise
+ *   not at all. URIs must be http(s) and
  *   written exactly as a URL parser writes them back (so only printable
  *   ASCII). Anything off refuses the whole output (`invalid_value`).
  *
@@ -159,7 +167,11 @@ import {
   type RecordIdentifiers,
 } from "./identifiers.js";
 import { mixedOrganizationsIssue } from "./organizations.js";
-import { isOtherOrganizationsLinkChecker, linkTargetKind } from "./record-links.js";
+import {
+  isOtherOrganizationsLinkChecker,
+  linkTargetKind,
+  placeNameMayShow,
+} from "./record-link-brand.js";
 import { RECORD_KINDS, type CatalogRecord, type FieldValue, type RecordKind } from "./records.js";
 import {
   MAX_REPEATS,
@@ -202,7 +214,7 @@ export interface PublishOptions {
    * is public. Record links (and a place's `recordId`) are published as
    * links only when the checker for their kind was made by
    * `makeRecordLinkChecker` from this organization's records; make it at
-   * publish time.
+   * publish time. With any other checker, no record link goes out (D-045).
    */
   readonly checkers?: TemplateCheckOptions["checkers"];
   /**
@@ -233,8 +245,8 @@ export interface PublishOptions {
    * to another parent or level, would otherwise still publish the old
    * inherited values. Only `records` and `templateFor` together catch every
    * change to a kept view (D-021). Links to objects, archival units and
-   * digital assets are deed-checked in it too, and without it go out as
-   * their labels only (D-043).
+   * digital assets are deed-checked in it too, and without it don't go out
+   * at all (D-043, D-045).
    */
   readonly records?: RecordLookup | readonly CatalogRecord[];
   /**
@@ -557,7 +569,7 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
   // The view holds identifiers as `{ value }` only (D-022); the template
   // check and the type check below read the full values the view's entries
   // came from, in the effective record.
-  const full = fullValues(view, effective, template);
+  const full = fullValues(view, effective, template, origin.links);
   const identifierChecker = isPlainObject(checkers) ? dataProp(checkers, "identifier") : undefined;
   // One organization's checker never vouches for another's numbers (D-030).
   if (isOtherOrganizationsChecker(identifierChecker, effective.record.organizationId)) {
@@ -592,6 +604,8 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
   for (const field of template.fields) byKey.set(field.key, field);
   const entries = new Map<string, JsonValue>();
   for (const entry of view.entries) entries.set(entry.key, entry.value);
+  // The view holds no record links (D-045); their values come from `full`.
+  const linkKeys: ReadonlySet<string> = new Set(origin.links);
 
   const budget: Budget = { chars: 0 };
   const recordUrl = safeText(baseUrl + view.id, ["id"], budget);
@@ -611,8 +625,12 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
     // archival unit or digital asset is never linked.
     return deedClears(id, kind);
   };
+  // A place value's name shows only when its place record, if it names one,
+  // is vouched for by this organization's place checker (D-048).
+  const placeShows = (place: JsonValue): boolean =>
+    placeNameMayShow(place, linkCheckers.get("place"), organizationId, view.id);
   for (const { field, term } of checked.value.entries) {
-    const shownValue = entries.get(field);
+    const shownValue = entries.get(field) ?? (linkKeys.has(field) ? full[field] : undefined);
     // Not in the view: empty, staff only along the way, or not inherited.
     if (shownValue === undefined) continue;
     const def = byKey.get(field);
@@ -629,7 +647,9 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
     if (value === undefined) {
       fail(["fields", field], "unreadable", "The public view could not be read.");
     }
-    const values = valuesOf(value, def, { baseUrl, published, budget, linkable });
+    const values = valuesOf(value, def, { baseUrl, published, budget, linkable, placeShows });
+    // Every record link that may not be named was left out (D-045).
+    if (values.length === 0) continue;
     const list = terms.get(term);
     if (list === undefined) terms.set(term, values);
     else list.push(...values);
@@ -815,26 +835,39 @@ function linkKindsOf(def: FieldDefinition): readonly RecordKind[] {
 /**
  * The view's values for checking, with each identifier, record link and
  * place field's value taken from the effective record instead (the view
- * leaves out identifier types and linked record IDs). Only keys in the view
- * are read, and the effective entry for each is public.
+ * leaves out identifier types, linked record IDs and record links). Only
+ * keys in the view, and the public record link keys `effectiveRecord`
+ * recorded beside it (`links`), are read, and the effective entry for each
+ * is public.
  */
 function fullValues(
   view: PublicRecord,
   effective: EffectiveRecord,
   template: FieldTemplate,
+  links: readonly string[],
 ): Readonly<Record<string, FieldValue>> {
   const kinds = new Map(template.fields.map((f) => [f.key, f.kind]));
   const out: [string, FieldValue][] = [];
+  const fromEffective = (key: string): FieldValue => {
+    const source = effective.entries.find((e) => e.key === key);
+    if (source?.visibility !== "public" || !source.inTemplate) {
+      fail(["fields", key], "staff_field", "Only public template fields can be published.");
+    }
+    return source.value;
+  };
   for (const entry of view.entries) {
     if (!FULL_KINDS.has(kinds.get(entry.key) ?? "")) {
       out.push([entry.key, entry.value]);
       continue;
     }
-    const source = effective.entries.find((e) => e.key === entry.key);
-    if (source?.visibility !== "public" || !source.inTemplate) {
-      fail(["fields", entry.key], "staff_field", "Only public template fields can be published.");
+    out.push([entry.key, fromEffective(entry.key)]);
+  }
+  // The record links the view leaves out (D-045), checked like the rest.
+  for (const key of links) {
+    if (kinds.get(key) !== "record_link" || view.entries.some((e) => e.key === key)) {
+      fail(["fields", key], "unreadable", "The public view could not be read.");
     }
-    out.push([entry.key, source.value]);
+    out.push([key, fromEffective(key)]);
   }
   // Object.fromEntries defines own properties, so no key can reach a prototype.
   return Object.freeze(Object.fromEntries(out));
@@ -1136,6 +1169,8 @@ interface Context {
   readonly budget: Budget;
   /** True when a value of `def` may link to the record `id` (see the module header). */
   readonly linkable: (def: FieldDefinition, id: RecordId) => boolean;
+  /** False for a place value whose place record can't be vouched for (D-048). */
+  readonly placeShows: (place: JsonValue) => boolean;
 }
 
 function valuesOf(value: JsonValue, def: FieldDefinition, ctx: Context): OutValue[] {
@@ -1155,13 +1190,17 @@ function valuesOf(value: JsonValue, def: FieldDefinition, ctx: Context): OutValu
     if (Array.isArray(value)) return invalid();
     list = [value];
   }
-  return list.map((one, i) => {
-    const out = valueOf(one, def, ctx, invalid);
+  const out: OutValue[] = [];
+  for (const [i, one] of list.entries()) {
+    const item = valueOf(one, def, ctx, invalid);
+    // A record link that may not be named puts out nothing (D-045).
+    if (item === undefined) continue;
     const where = def.repeatable ? [...path, i] : path;
-    safeText(out.text, where, ctx.budget);
-    if (out.iri !== undefined && out.iri !== out.text) safeText(out.iri, where, ctx.budget);
-    return out;
-  });
+    safeText(item.text, where, ctx.budget);
+    if (item.iri !== undefined && item.iri !== item.text) safeText(item.iri, where, ctx.budget);
+    out.push(item);
+  }
+  return out;
 }
 
 function valueOf(
@@ -1169,7 +1208,7 @@ function valueOf(
   def: FieldDefinition,
   ctx: Context,
   invalid: () => never,
-): OutValue {
+): OutValue | undefined {
   switch (def.kind) {
     case "text":
     case "long_text":
@@ -1220,6 +1259,10 @@ function valueOf(
       const uri = optionalIri(place.get("uri"), invalid);
       const recordId = place.get("recordId");
       if (recordId !== undefined && !isRecordId(recordId)) return invalid();
+      // Not at all when the place record it names isn't vouched for as this
+      // organization's place: it may be another kind of value left in a
+      // field a template edit made a place (D-048).
+      if (!ctx.placeShows(value)) return undefined;
       if (uri !== undefined) return outValue(label, uri, true);
       // A place record is linked only when it is published and this
       // organization's; otherwise its existence and ID stay unsaid.
@@ -1233,10 +1276,11 @@ function valueOf(
       const label = nonBlank(link.get("label"), invalid);
       const recordId = link.get("recordId");
       if (!isRecordId(recordId)) return invalid();
-      // As for places: the label alone unless the record may be named.
+      // Nothing at all, not even the label, unless the record may be named
+      // (D-045): the label may be copied from a private record.
       return ctx.linkable(def, recordId)
         ? outValue(label, ctx.baseUrl + recordId, true)
-        : outValue(label);
+        : undefined;
     }
   }
 }

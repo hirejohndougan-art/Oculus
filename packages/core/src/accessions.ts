@@ -17,7 +17,7 @@
  * - the day it was **received** (an EDTF day, `YYYY-MM-DD`, D-008), the
  *   acquisition **method**, a description of the **materials**, any
  *   **restrictions** the source asked for, in their words, and a staff note;
- * - an optional structured **access restriction** (T-016a, D-053b, mockup
+ * - an optional structured **access restriction** (T-016a, D-056, mockup
  *   Log an accession): `{ kind: "closed_until", until }` (nothing from it is
  *   published before the day `until`) or `{ kind: "staff_and_researchers" }`
  *   (never on the public site). The free-text `restrictions` stay notes and

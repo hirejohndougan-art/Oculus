@@ -1,6 +1,6 @@
 /**
  * The holds of an accession register (T-016 and T-016a, decisions D-043
- * and D-053b), in a
+ * and D-056), in a
  * module of its own so that `effective.ts` and `public-output.ts` can run
  * the deed check without importing `accessions.ts`, and so without ever
  * holding an accession, a donor's name or contact details, materials,

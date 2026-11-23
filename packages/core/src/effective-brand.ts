@@ -34,6 +34,11 @@ export interface PublicViewOrigin {
   readonly template: FieldTemplate;
   /** The record first, then its ancestors, each with the validated template used for it. */
   readonly chain: readonly { readonly record: CatalogRecord; readonly template: FieldTemplate }[];
+  /**
+   * The keys of the public `record_link` entries the view leaves out (D-045):
+   * `publicOutput` reads their values from the effective record.
+   */
+  readonly links: readonly string[];
   /** For archival units only. */
   readonly level?: ArchivalLevel;
 }
