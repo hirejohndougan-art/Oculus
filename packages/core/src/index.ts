@@ -404,6 +404,9 @@ export {
   MAX_LOAN_ITEMS,
   MAX_LOAN_NUMBER_LENGTH,
   MAX_LOAN_PURPOSE_LENGTH,
+  MAX_INSURANCE_REFERENCE_LENGTH,
+  MAX_AUTHORISER_NAME_LENGTH,
+  LOAN_INSURERS,
   newLoanId,
   isLoanId,
   validateLoan,
@@ -435,6 +438,8 @@ export type {
   LoanItemState,
   LoanState,
   LoanProblems,
+  LoanInsurer,
+  LoanValuation,
 } from "./loans.js";
 
 export {

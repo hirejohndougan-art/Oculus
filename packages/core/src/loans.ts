@@ -47,6 +47,14 @@
  * in names are listed by `unexplainedDepartures`, and `loan_out` moves no
  * loan out names or extends by `unexplainedLoanMoves`.
  *
+ * **Valuation, insurance and authorisation** (T-018a2, D-060): a loan may
+ * carry the agreed `valuation` (`{ amount, currency }`, the amount a decimal
+ * string such as "12500.00" and the currency an ISO 4217 code, never a
+ * floating-point number, so no value is ever rounded), who insures it
+ * (`insuredBy`, with an optional `insuranceReference`) and who authorised
+ * it (`authorisedBy`, `authorisedOn`, optional `authoriserId`). Messages
+ * never quote a valuation or a reference.
+ *
  * **Everything here is staff-only**, like storage: loans name lenders,
  * borrowers, values and dates. Nothing in `effective.ts` or
  * `public-output.ts` reads it, and a test checks no module but `index.ts`
@@ -117,6 +125,24 @@ export const LOAN_STATUSES = [
 ] as const;
 export type LoanStatus = (typeof LOAN_STATUSES)[number];
 
+/**
+ * Who insures the loan (Spectrum "Insurance/indemnity"): the lender's
+ * policy, the borrower's, a government indemnity scheme, or another
+ * arrangement described in `terms`.
+ */
+export const LOAN_INSURERS = ["lender", "borrower", "indemnity", "other"] as const;
+export type LoanInsurer = (typeof LOAN_INSURERS)[number];
+
+/**
+ * A money value: `amount` a decimal string (up to 15 digits, up to 4 after
+ * the point, no sign, no exponent, no grouping), `currency` an ISO 4217
+ * alphabetic code such as "USD". Never a number, so it is never rounded.
+ */
+export interface LoanValuation {
+  readonly amount: string;
+  readonly currency: string;
+}
+
 /** Statuses under which nothing may have moved yet. */
 const NOT_AGREED: readonly LoanStatus[] = ["requested", "declined", "cancelled"];
 
@@ -156,6 +182,18 @@ interface LoanBase {
   readonly purpose?: string;
   /** Special conditions of the loan: insurance, display, environment. */
   readonly terms?: string;
+  /** The value agreed for the loan's items together, for insurance. Staff-only. */
+  readonly valuation?: LoanValuation;
+  /** Who insures the items while on loan. */
+  readonly insuredBy?: LoanInsurer;
+  /** The policy or indemnity reference (one line). Staff-only. */
+  readonly insuranceReference?: string;
+  /** Who authorised the loan for the organization, as a name (one line). */
+  readonly authorisedBy?: string;
+  /** Optionally, the agent record of who authorised it. */
+  readonly authoriserId?: RecordId;
+  /** The day it was authorised, `YYYY-MM-DD`; only with `authorisedBy`. */
+  readonly authorisedOn?: string;
   readonly note?: string;
 }
 
@@ -248,6 +286,12 @@ export const MAX_LOANS = 50_000;
 export const MAX_LOAN_ITEMS = 500;
 export const MAX_LOAN_NUMBER_LENGTH = 100;
 export const MAX_LOAN_PURPOSE_LENGTH = 200;
+export const MAX_INSURANCE_REFERENCE_LENGTH = 200;
+export const MAX_AUTHORISER_NAME_LENGTH = 200;
+
+/** A decimal amount: digits, optionally a point and 1 to 4 more digits. No sign, exponent or grouping. */
+const AMOUNT = /^(?:0|[1-9][0-9]{0,14})(?:\.[0-9]{1,4})?$/;
+const CURRENCY = /^[A-Z]{3}$/;
 
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const ONE_LINE_BREAKS = /[\t\n\r\u2028\u2029]/;
@@ -256,17 +300,18 @@ const ONE_LINE_BREAKS = /[\t\n\r\u2028\u2029]/;
  * Read limits sized from the shape (review fix: 500 full items didn't fit).
  * A full item is one object, three keys and three IDs: at most 7 values and
  * 15 + 13 + 8 key characters plus 3 × 36 ID characters (144). The loan's own
- * keys and values (13 keys, three 2000-character texts) get 40 values and
- * 8000 characters; the items array is one value more.
+ * keys and values (19 keys, three 2000-character texts, a valuation object
+ * and three 200-character lines) get 48 values and 9000 characters; the
+ * items array is one value more.
  */
 const ITEM_VALUES = 7;
 const ITEM_CHARS = 144;
 const LOAN_LIMITS = {
   maxDepth: 3,
-  maxValues: 41 + ITEM_VALUES * MAX_LOAN_ITEMS,
+  maxValues: 49 + ITEM_VALUES * MAX_LOAN_ITEMS,
   maxStringLength: MAX_STORAGE_NOTE_LENGTH,
   maxKeyLength: 64,
-  maxTotalChars: 8000 + ITEM_CHARS * MAX_LOAN_ITEMS,
+  maxTotalChars: 9000 + ITEM_CHARS * MAX_LOAN_ITEMS,
 } as const;
 
 const LOAN_KEYS = [
@@ -281,6 +326,12 @@ const LOAN_KEYS = [
   "statusOn",
   "purpose",
   "terms",
+  "valuation",
+  "insuredBy",
+  "insuranceReference",
+  "authorisedBy",
+  "authoriserId",
+  "authorisedOn",
   "note",
   "items",
 ] as const;
@@ -369,6 +420,58 @@ export function validateLoan(input: unknown, now: Date = new Date()): Validated<
     checkLine(d.purpose, ["purpose"], "purpose", MAX_LOAN_PURPOSE_LENGTH, false, issues);
     checkText(d.terms, ["terms"], "The terms", issues);
     checkText(d.note, ["note"], "A note", issues);
+    checkValuation(d.valuation, issues);
+    if (d.insuredBy !== undefined && !(LOAN_INSURERS as readonly unknown[]).includes(d.insuredBy)) {
+      issues.add(
+        ["insuredBy"],
+        "invalid_insurer",
+        `insuredBy must be one of: ${LOAN_INSURERS.join(", ")}.`,
+      );
+    }
+    checkLine(
+      d.insuranceReference,
+      ["insuranceReference"],
+      "insurance reference",
+      MAX_INSURANCE_REFERENCE_LENGTH,
+      false,
+      issues,
+    );
+    checkLine(
+      d.authorisedBy,
+      ["authorisedBy"],
+      "authoriser's name",
+      MAX_AUTHORISER_NAME_LENGTH,
+      false,
+      issues,
+    );
+    if (d.authoriserId !== undefined && !isRecordId(d.authoriserId)) {
+      issues.add(["authoriserId"], "invalid_id", "authoriserId must be a record ID.");
+    }
+    if (
+      (d.authoriserId !== undefined || d.authorisedOn !== undefined) &&
+      d.authorisedBy === undefined
+    ) {
+      issues.add(
+        ["authorisedBy"],
+        "required",
+        "Say who authorised the loan when giving the authoriser's record or the day.",
+      );
+    }
+    if (d.authorisedOn !== undefined) {
+      if (!isIsoDay(d.authorisedOn)) {
+        issues.add(
+          ["authorisedOn"],
+          "invalid_date",
+          "authorisedOn must be a day written YYYY-MM-DD.",
+        );
+      } else if (d.authorisedOn > dayAfter(time)) {
+        issues.add(
+          ["authorisedOn"],
+          "future_authorisation",
+          "The loan can't be authorised on a day after today.",
+        );
+      }
+    }
     if (status === "acquired" && direction === "out") {
       issues.add(
         ["status"],
@@ -1366,6 +1469,45 @@ function checkItems(
       );
     }
   });
+}
+
+/**
+ * A valuation `{ amount, currency }`: own data properties only, the amount a
+ * decimal string, never a number (a float would round it). Never quotes it.
+ */
+function checkValuation(value: JsonValue | undefined, issues: IssueList): void {
+  if (value === undefined) return;
+  if (!isPlainObject(value)) {
+    issues.add(
+      ["valuation"],
+      "invalid_valuation",
+      'A valuation is { amount, currency }, e.g. { amount: "12500.00", currency: "USD" }.',
+    );
+    return;
+  }
+  const own = (key: string): JsonValue | undefined => {
+    const slot = Object.getOwnPropertyDescriptor(value, key);
+    return slot !== undefined && "value" in slot ? (slot.value as JsonValue) : undefined;
+  };
+  if (Object.keys(value).some((key) => key !== "amount" && key !== "currency")) {
+    issues.add(["valuation"], "unknown_property", "A valuation has only amount and currency.");
+  }
+  const amount = own("amount");
+  if (typeof amount !== "string" || !AMOUNT.test(amount)) {
+    issues.add(
+      ["valuation", "amount"],
+      "invalid_amount",
+      'The amount must be a decimal written as text, such as "12500.00": digits, then optionally a point and up to 4 digits. Never a number.',
+    );
+  }
+  const currency = own("currency");
+  if (typeof currency !== "string" || !CURRENCY.test(currency)) {
+    issues.add(
+      ["valuation", "currency"],
+      "invalid_currency",
+      'The currency must be an ISO 4217 code of three capital letters, such as "USD".',
+    );
+  }
 }
 
 function checkLine(
