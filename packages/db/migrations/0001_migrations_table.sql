@@ -1,4 +1,4 @@
--- The empty schema: only the migration runner's own bookkeeping table (D-050, D-053).
+-- The empty schema: only the migration runner's own bookkeeping table (D-050, D-057).
 -- One row per applied migration file, written by the runner in the same
 -- transaction as the file. Applied files never change; write a new file instead.
 CREATE TABLE public.oculus_migrations (

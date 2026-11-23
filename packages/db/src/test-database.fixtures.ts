@@ -1,5 +1,5 @@
 /**
- * Test databases (D-049, D-053). `npm run gate` starts a throwaway server and
+ * Test databases (D-049, D-057). `npm run gate` starts a throwaway server and
  * sets OCULUS_TEST_DATABASE_URL; CI points it at a service container. Each
  * test file makes its own fresh databases on that server and drops them
  * afterwards. With no server, database tests fail; they are never skipped.

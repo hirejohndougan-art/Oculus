@@ -32,7 +32,7 @@ import { sql } from "./sql.js";
 export const OLDEST_MAJOR = 15;
 export const NEWEST_TESTED_MAJOR = 19;
 
-/** The advisory lock key every runner takes (D-053): "oculus" in ASCII. */
+/** The advisory lock key every runner takes (D-057): "oculus" in ASCII. */
 export const MIGRATION_LOCK_KEY = 0x6f63756c7573n;
 
 /** File names the runner accepts. */

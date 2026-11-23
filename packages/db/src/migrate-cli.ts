@@ -1,6 +1,6 @@
 /**
  * `npm run db:migrate`: applies every pending migration to the database named
- * by the OCULUS_DATABASE_URL environment variable (D-053). The URL is never
+ * by the OCULUS_DATABASE_URL environment variable (D-057). The URL is never
  * printed, since it may hold a password.
  */
 import { pathToFileURL } from "node:url";
