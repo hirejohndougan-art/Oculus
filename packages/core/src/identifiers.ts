@@ -19,9 +19,11 @@
  *   without losing it, and list identifiers a change would drop.
  *
  * Identifiers are compared by `identifierKey` (case, spaces and lookalike
- * characters ignored) but always stored exactly as typed. There is no database
- * yet, so nothing here can stop two people taking the same next number at the
- * same moment; the save path must re-check uniqueness when it writes.
+ * characters ignored) but always stored exactly as typed. Pure functions
+ * can't stop two people taking the same next number at the same moment: the
+ * database does (`packages/db`, `0003_identifiers.sql`, D-061), with unique
+ * indexes on each value's stored `identifierKey` and a locked counter for
+ * auto-numbering.
  *
  * - **Which types are public** (D-022). A type is staff only unless it says
  *   `public: true`. Only values of public types may sit in a public template
