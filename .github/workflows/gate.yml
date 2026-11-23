@@ -35,6 +35,21 @@ jobs:
     env:
       OCULUS_TEST_DATABASE_URL: postgresql://postgres@localhost:5432/postgres
     steps:
+      # The migration runner's tests prepare a transaction, which needs
+      # max_prepared_transactions above 0 (the image's default is 0). A
+      # service container can't be given server options, so it is set and the
+      # container restarted. Without it those tests fail; they never skip (D-057).
+      - name: Allow prepared transactions
+        env:
+          CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          docker exec "$CONTAINER" psql -U postgres -c "ALTER SYSTEM SET max_prepared_transactions = 10"
+          docker restart "$CONTAINER"
+          for i in $(seq 1 60); do
+            docker exec "$CONTAINER" pg_isready -U postgres && break
+            sleep 1
+          done
+          docker exec "$CONTAINER" psql -U postgres -tAc "SHOW max_prepared_transactions" | grep -qx 10
       - uses: actions/checkout@v5
         with:
           persist-credentials: false

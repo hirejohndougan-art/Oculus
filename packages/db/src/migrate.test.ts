@@ -1,7 +1,8 @@
 // The migration runner: every migration on a fresh database, the refusals
 // (edited, missing, out-of-order and badly named files, old servers, files
-// that end the transaction), and two runners at once (the advisory lock).
-import { createHash } from "node:crypto";
+// that end the transaction or release the lock), and two runners at once
+// (the advisory lock).
+import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -254,13 +255,127 @@ describe("refusals", () => {
     },
   );
 
-  it("reports a file that rolls back and then fails as failed: nothing of it stays", async () => {
+  it.each([
+    [
+      "ROLLBACK; BEGIN; CREATE; COMMIT",
+      "ROLLBACK;\nBEGIN;\nCREATE TABLE early (id int);\nCOMMIT;\nSELECT * FROM nowhere;",
+    ],
+    [
+      "ROLLBACK; CREATE; COMMIT",
+      "ROLLBACK;\nCREATE TABLE early (id int);\nCOMMIT;\nSELECT * FROM nowhere;",
+    ],
+    [
+      "ROLLBACK; CREATE; COMMIT; BEGIN",
+      "ROLLBACK;\nCREATE TABLE early (id int);\nCOMMIT;\nBEGIN;\nSELECT * FROM nowhere;",
+    ],
+    [
+      "ROLLBACK; CREATE; COMMIT; BEGIN; SAVEPOINT oculus_migration",
+      "ROLLBACK;\nCREATE TABLE early (id int);\nCOMMIT;\nBEGIN;\nSAVEPOINT oculus_migration;\nSELECT * FROM nowhere;",
+    ],
+  ])(
+    "reports a file that rolls back, commits something of its own (%s) and then fails as transaction_ended",
+    async (_form, body) => {
+      const db = await database();
+      const dir = migrationsDir({ "0002_escape.sql": body });
+      const error = await refusal(migrate({ connectionString: db.url, dir }));
+      expect(error.code).toBe("transaction_ended");
+      expect(await tables(db.url)).toEqual(["early", "oculus_migrations"]);
+      expect((await recorded(db.url)).map((r) => r.name)).toEqual(["0001_migrations_table.sql"]);
+    },
+  );
+
+  it("reports a file that rolls back the runner's transaction and then fails as transaction_ended", async () => {
+    // Nothing of this file stays, but once the runner's transaction is gone
+    // the runner can't tell that from the cases above, so a person checks.
     const db = await database();
     const dir = migrationsDir({
       "0002_rollback.sql": "CREATE TABLE gone (id int);\nROLLBACK;\nBEGIN;\nSELECT * FROM nowhere;",
     });
-    expect((await refusal(migrate({ connectionString: db.url, dir }))).code).toBe("failed");
+    expect((await refusal(migrate({ connectionString: db.url, dir }))).code).toBe(
+      "transaction_ended",
+    );
     expect(await tables(db.url)).toEqual(["oculus_migrations"]);
+  });
+
+  it("reports a file that fails inside its own savepoints as failed, and rolls it all back", async () => {
+    const db = await database();
+    const dir = migrationsDir({
+      "0002_savepoints.sql":
+        "CREATE TABLE a (id int);\nSAVEPOINT s1;\nCREATE TABLE b (id int);\nRELEASE SAVEPOINT s1;\nSAVEPOINT s2;\nSELECT * FROM nowhere;",
+    });
+    const error = await refusal(migrate({ connectionString: db.url, dir }));
+    expect(error.code).toBe("failed");
+    expect(error.message).toContain("nowhere");
+    expect(await tables(db.url)).toEqual(["oculus_migrations"]);
+  });
+
+  it.each([
+    ["and stops", ""],
+    ["and then fails", "\nSELECT * FROM nowhere;"],
+  ])(
+    "refuses a file that prepares the runner's transaction (PREPARE TRANSACTION) %s, naming it",
+    async (_form, tail) => {
+      const db = await database();
+      const session = await openSession(db.url);
+      const gid = `oculus_test_${randomBytes(6).toString("hex")}`;
+      try {
+        // The test server allows prepared transactions (scripts/test-database.mjs;
+        // CI sets it too). Without that this test fails; it is never skipped.
+        const [setting] = await session.rows<{ n: string }>(
+          sql`SELECT current_setting('max_prepared_transactions') AS n`,
+        );
+        expect(Number(setting?.n), "max_prepared_transactions must be above 0").toBeGreaterThan(0);
+        const dir = migrationsDir({
+          "0002_prepare.sql": `CREATE TABLE px (id int);\nPREPARE TRANSACTION '${gid}';${tail}`,
+          "0003_after.sql": "CREATE TABLE after (id int);",
+        });
+        const error = await refusal(migrate({ connectionString: db.url, dir }));
+        expect(error.code).toBe("transaction_ended");
+        expect(error.message).toContain(`"${gid}"`);
+        expect(error.message).toMatch(/COMMIT PREPARED or ROLLBACK PREPARED/);
+        expect((await recorded(db.url)).map((r) => r.name)).toEqual(["0001_migrations_table.sql"]);
+        const prepared = await session.rows<{ gid: string }>(
+          sql`SELECT gid FROM pg_prepared_xacts WHERE gid = ${gid}`,
+        );
+        expect(prepared).toEqual([{ gid }]);
+      } finally {
+        await session.runScript(`ROLLBACK PREPARED '${gid}'`).catch(() => undefined);
+        await session.close();
+      }
+      expect(await tables(db.url)).toEqual(["oculus_migrations"]);
+    },
+  );
+
+  it.each([
+    ["pg_advisory_unlock_all()", "SELECT pg_advisory_unlock_all();"],
+    ["pg_advisory_unlock(key)", `SELECT pg_advisory_unlock(${String(MIGRATION_LOCK_KEY)});`],
+  ])(
+    "refuses a file that releases the runner's lock with %s, before anything of it commits",
+    async (_form, unlock) => {
+      const db = await database();
+      const dir = migrationsDir({
+        "0002_unlock.sql": `CREATE TABLE u (id int);\n${unlock}`,
+        "0003_after.sql": "CREATE TABLE after (id int);",
+      });
+      const error = await refusal(migrate({ connectionString: db.url, dir }));
+      expect(error.code).toBe("lock_lost");
+      expect(error.message).toContain("0002_unlock.sql");
+      expect(await tables(db.url)).toEqual(["oculus_migrations"]);
+      expect((await recorded(db.url)).map((r) => r.name)).toEqual(["0001_migrations_table.sql"]);
+    },
+  );
+
+  it("blames the first migration only when the bookkeeping table is missing", async () => {
+    const db = await database();
+    const dir = migrationsDir({
+      "0002_column.sql":
+        "ALTER TABLE oculus_migrations ADD CONSTRAINT no_more CHECK (false) NOT VALID;",
+    });
+    const error = await refusal(migrate({ connectionString: db.url, dir }));
+    expect(error.code).toBe("failed");
+    expect(error.message).toMatch(/could not be recorded/);
+    expect(error.message).not.toMatch(/first migration/);
+    expect((await recorded(db.url)).map((r) => r.name)).toEqual(["0001_migrations_table.sql"]);
   });
 
   it("clears a file's prepared statements and temporary tables before the next file", async () => {
@@ -303,6 +418,7 @@ describe("refusals", () => {
     writeFileSync(join(dir, "0001_other.sql"), "CREATE TABLE other (id int);");
     const error = await refusal(migrate({ connectionString: db.url, dir }));
     expect(error.code).toBe("failed");
+    expect(error.message).toMatch(/the first migration must create public.oculus_migrations/);
     expect(await tables(db.url)).toEqual([]);
   });
 

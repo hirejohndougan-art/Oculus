@@ -15,9 +15,13 @@
  *   creates that table, so a fresh database is migrated like any other.
  *
  * A file that ends the runner's transaction itself (COMMIT, END, ROLLBACK,
- * COMMIT AND CHAIN) is refused as `transaction_ended`, also when it opens a
- * new transaction and then fails: the server is asked whether the runner's
- * transaction ID committed. Statements that can't run in a transaction
+ * COMMIT AND CHAIN, PREPARE TRANSACTION) is refused as `transaction_ended`,
+ * whether it then succeeds or fails: a file is recorded, or reported as plain
+ * `failed`, only if the session is still in the runner's own transaction (same
+ * transaction ID, in progress, inside a block; after a failure, the runner's
+ * savepoint must still be there) and the runner's own COMMIT or ROLLBACK is
+ * what ends it. A file that releases the runner's advisory lock is refused as
+ * `lock_lost` before anything of it commits. Statements that can't run in a transaction
  * (CREATE INDEX CONCURRENTLY) are not supported. Right after each file, inside
  * its transaction, and again after it, the session is reset (RESET ALL, RESET
  * ROLE, RESET SESSION AUTHORIZATION, DISCARD TEMP, DEALLOCATE ALL), and the
@@ -70,6 +74,7 @@ export class MigrationError extends Error {
       | "out_of_order"
       | "transaction_ended"
       | "lock_timeout"
+      | "lock_lost"
       | "failed",
     message: string,
     options?: ErrorOptions,
@@ -200,6 +205,12 @@ async function appliedMigrations(session: Session): Promise<AppliedMigration[]> 
   );
 }
 
+/** What the runner knows about its own transaction: its ID and start time. */
+interface Started {
+  xid: string;
+  at: string;
+}
+
 /** What the server says about a transaction ID: in progress, committed or aborted. */
 async function transactionStatus(session: Session, xid: string): Promise<string | undefined> {
   const [row] = await session.rows<{ status: string | null }>(
@@ -208,59 +219,153 @@ async function transactionStatus(session: Session, xid: string): Promise<string 
   return row?.status ?? undefined;
 }
 
+/**
+ * Whether the session is still inside the runner's own transaction, which is
+ * still running: the server reports a transaction block, the current
+ * transaction ID is the one the runner was given (an ID is never reused, so a
+ * file that ended the transaction, even with PREPARE TRANSACTION, can't be in
+ * it again), and the server says that ID is in progress. Only then can nothing
+ * the file did have been committed on its own.
+ */
+async function inRunnersTransaction(session: Session, started: Started): Promise<boolean> {
+  if (session.transactionState() !== "in_block") return false;
+  const [row] = await session.rows<{ xid: string | null; status: string | null }>(
+    sql`SELECT pg_catalog.pg_current_xact_id_if_assigned()::pg_catalog.text AS xid,
+               pg_catalog.pg_xact_status(${started.xid}::pg_catalog.xid8) AS status`,
+  );
+  return (
+    row?.xid === started.xid &&
+    row.status === "in progress" &&
+    session.transactionState() === "in_block"
+  );
+}
+
+/**
+ * After a file failed: whether it failed inside the runner's transaction,
+ * which it never ended. A failed statement leaves the runner's block failed;
+ * a session that is outside a block, or in a block that still works, has left
+ * the runner's transaction. In a failed block, rolling back to the savepoint
+ * the runner made before the file works only in the runner's own transaction,
+ * and then the transaction ID must be the runner's.
+ */
+async function failedInRunnersTransaction(session: Session, started: Started): Promise<boolean> {
+  if (session.transactionState() !== "failed_block") return false;
+  try {
+    await session.control("ROLLBACK TO SAVEPOINT oculus_migration");
+    return await inRunnersTransaction(session, started);
+  } catch {
+    return false;
+  }
+}
+
+/** Prepared transactions in this database made since the runner's transaction began. */
+async function preparedSince(session: Session, started: Started): Promise<string[]> {
+  const rows = await session.rows<{ gid: string }>(
+    sql`SELECT gid FROM pg_catalog.pg_prepared_xacts
+        WHERE database = pg_catalog.current_database()
+          AND prepared >= ${started.at}::pg_catalog.timestamptz
+        ORDER BY prepared, gid`,
+  );
+  return rows.map((row) => row.gid);
+}
+
+/** Whether this session still holds the runner's advisory lock (a file may release it). */
+async function holdsLock(session: Session): Promise<boolean> {
+  const [row] = await session.rows<{ held: boolean }>(
+    sql`SELECT EXISTS (
+          SELECT 1 FROM pg_catalog.pg_locks
+          WHERE locktype = 'advisory' AND pid = pg_catalog.pg_backend_pid() AND granted
+            AND classid = ${String(MIGRATION_LOCK_KEY >> 32n)}::pg_catalog.oid
+            AND objid = ${String(MIGRATION_LOCK_KEY & 0xffffffffn)}::pg_catalog.oid
+            AND objsubid = 1
+        ) AS held`,
+  );
+  return row?.held === true;
+}
+
+function transactionEnded(file: MigrationFile, prepared: readonly string[]): MigrationError {
+  const resolve =
+    prepared.length === 0
+      ? ""
+      : ` It left prepared transaction${prepared.length === 1 ? "" : "s"} ${prepared.map((gid) => JSON.stringify(gid)).join(", ")}, still holding its changes and locks: resolve ${prepared.length === 1 ? "it" : "each"} with COMMIT PREPARED or ROLLBACK PREPARED (see pg_prepared_xacts) first.`;
+  return new MigrationError(
+    "transaction_ended",
+    `${file.name} ended the runner's transaction (COMMIT, ROLLBACK, END, COMMIT AND CHAIN or PREPARE TRANSACTION in the file), or the runner could not confirm that it didn't. Part of it may have been applied and it is not recorded; a person must check the database before migrating again.${resolve}`,
+  );
+}
+
 async function applyOne(session: Session, file: MigrationFile): Promise<void> {
-  const ended = (): MigrationError =>
-    new MigrationError(
-      "transaction_ended",
-      `${file.name} ended the runner's transaction (COMMIT, ROLLBACK, END or COMMIT AND CHAIN in the file). Part of it may have been applied and it is not recorded; a person must check the database before migrating again.`,
-    );
-  let started: string | undefined;
+  let started: Started | undefined;
+  // An object, so the outer catch sees what the inner one set.
+  const script = { failed: false };
   let committed = false;
   await session.control("BEGIN");
   try {
     // Gives the transaction an ID now, so whether the file ended it can be
     // asked of the server afterwards, whether the file then failed or not.
-    const [row] = await session.rows<{ xid: string }>(
-      sql`SELECT pg_catalog.pg_current_xact_id()::text AS xid`,
+    const [row] = await session.rows<Started>(
+      sql`SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS xid,
+                 pg_catalog.now()::pg_catalog.text AS at`,
     );
-    started = row?.xid;
+    started = row;
     if (started === undefined) throw new MigrationError("failed", "No transaction ID.");
+    // Only the runner's own transaction has this savepoint, so after a failure
+    // rolling back to it shows whether the failed block is still the runner's.
+    await session.control("SAVEPOINT oculus_migration");
     try {
       await session.runScript(file.text);
     } catch (error) {
+      script.failed = true;
       throw new MigrationError("failed", `${file.name} failed: ${(error as Error).message}`, {
         cause: error,
       });
     }
+    if (session.transactionState() !== "in_block") throw transactionEnded(file, []);
     // Inside the transaction, so a file's SET, prepared statements and
     // temporary tables can't reach the runner's own statements below.
     await resetSession(session);
-    if ((await transactionStatus(session, started)) !== "in progress") throw ended();
+    if (!(await inRunnersTransaction(session, started))) throw transactionEnded(file, []);
+    if ((await preparedSince(session, started)).length > 0) throw transactionEnded(file, []);
+    if (!(await holdsLock(session))) {
+      throw new MigrationError(
+        "lock_lost",
+        `${file.name} released the runner's advisory lock (pg_advisory_unlock_all() or pg_advisory_unlock() in the file), so another run could migrate at the same time. Nothing of it was applied; remove that call.`,
+      );
+    }
     try {
       await session.execute(
         sql`INSERT INTO public.oculus_migrations (name, sha256) VALUES (${file.name}, ${file.sha256})`,
       );
     } catch (error) {
+      const missing = (error as { code?: string }).code === "42P01";
       throw new MigrationError(
         "failed",
-        `${file.name} ran but could not be recorded (the first migration must create public.oculus_migrations): ${(error as Error).message}`,
+        `${file.name} ran but could not be recorded${missing ? " (the first migration must create public.oculus_migrations)" : ""}: ${(error as Error).message}`,
         { cause: error },
       );
     }
     await session.control("COMMIT");
     committed = true;
   } catch (error) {
-    await session.control("ROLLBACK").catch(() => undefined);
-    // The runner's transaction is aborted now, unless the file committed it
-    // (COMMIT, END, COMMIT AND CHAIN), in which case part of the file stays.
-    if (
-      started !== undefined &&
-      !(error instanceof MigrationError && error.code === "transaction_ended")
-    ) {
-      const status = await transactionStatus(session, started).catch(() => undefined);
-      if (status === "committed") throw ended();
+    let failure = error;
+    if (started !== undefined) {
+      // A failed file counts as plain `failed` only if it failed inside the
+      // runner's transaction, which it never ended (so it committed nothing).
+      if (script.failed && !(await failedInRunnersTransaction(session, started))) {
+        failure = transactionEnded(file, []);
+      }
+      await session.control("ROLLBACK").catch(() => undefined);
+      // The runner's own ROLLBACK must be what ended its transaction.
+      const status = await transactionStatus(session, started.xid).catch(() => undefined);
+      if (status !== "aborted") failure = transactionEnded(file, []);
+      if (failure instanceof MigrationError && failure.code === "transaction_ended") {
+        const prepared = await preparedSince(session, started).catch(() => []);
+        failure = transactionEnded(file, prepared);
+      }
+    } else {
+      await session.control("ROLLBACK").catch(() => undefined);
     }
-    throw error;
+    throw failure;
   } finally {
     // Again after the transaction, for anything a failed or ended file left.
     // A reset that fails after a file committed stops the run, saying so.

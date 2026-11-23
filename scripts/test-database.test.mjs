@@ -39,6 +39,7 @@ describe("throwaway test database helpers", () => {
     expect(options).toContain("-h ''");
     expect(options).toContain("-k /tmp/oculus-pg-abc");
     expect(options).toContain("-F");
+    expect(options).toContain("-c max_prepared_transactions=10");
     for (const unsafe of ["/tmp/a b", "/tmp/a'b", "/tmp/a;rm -rf x", "/tmp/$(x)"]) {
       expect(() => serverOptions(unsafe)).toThrow(/can't pass on safely/);
     }

@@ -59,7 +59,10 @@ function findRunuser() {
  */
 const SAFE_PATH = /^[A-Za-z0-9_./-]+$/;
 
-/** The postgres options: no TCP, socket in `dir` (owner only), durability off. */
+/**
+ * The postgres options: no TCP, socket in `dir` (owner only), durability off,
+ * prepared transactions allowed.
+ */
 export function serverOptions(dir) {
   if (!SAFE_PATH.test(dir)) {
     throw new Error(`The temporary directory ${dir} has characters pg_ctl can't pass on safely.`);
@@ -72,6 +75,8 @@ export function serverOptions(dir) {
     "-c synchronous_commit=off",
     "-c full_page_writes=off",
     "-c max_connections=100",
+    // The migration runner's tests prepare a transaction (D-057).
+    "-c max_prepared_transactions=10",
   ].join(" ");
 }
 

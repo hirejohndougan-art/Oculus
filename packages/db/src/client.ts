@@ -169,11 +169,25 @@ export function openDatabase(connectionString: string, options: DatabaseOptions 
 /** A single dedicated connection, for the migration runner (it holds a session lock). */
 export interface Session extends Queryable {
   close(): Promise<void>;
-  /** Runs `BEGIN`, `COMMIT` or `ROLLBACK`. */
-  control(statement: "BEGIN" | "COMMIT" | "ROLLBACK"): Promise<void>;
+  /** Runs `BEGIN`, `COMMIT`, `ROLLBACK` or one of the runner's savepoint statements. */
+  control(statement: ControlStatement): Promise<void>;
   /** @internal Runs a whole migration file (several statements) with the simple protocol. */
   runScript(text: string): Promise<void>;
+  /**
+   * The transaction state the server reported after the last statement
+   * (ReadyForQuery): outside a transaction block, inside one, inside a failed
+   * one, or not known (no answer yet, or the connection is gone).
+   */
+  transactionState(): "idle" | "in_block" | "failed_block" | "unknown";
 }
+
+/** The fixed transaction-control statements a session may send. */
+export type ControlStatement =
+  | "BEGIN"
+  | "COMMIT"
+  | "ROLLBACK"
+  | "SAVEPOINT oculus_migration"
+  | "ROLLBACK TO SAVEPOINT oculus_migration";
 
 export async function openSession(connectionString: string): Promise<Session> {
   const client = new pg.Client({ ...clientConfig(connectionString), application_name: "oculus" });
@@ -189,7 +203,25 @@ export async function openSession(connectionString: string): Promise<Session> {
       await client.query(statement);
     },
     async runScript(text: string) {
-      await client.query(text);
+      try {
+        await client.query(text);
+      } catch (error) {
+        // pg rejects on the error before the server's ReadyForQuery arrives,
+        // so the transaction state would still be the one from before the
+        // file. An empty query (allowed even in a failed block) waits for it.
+        await client.query("").catch(() => undefined);
+        throw error;
+      }
+    },
+    transactionState() {
+      const status = client.getTransactionStatus();
+      return status === "I"
+        ? "idle"
+        : status === "T"
+          ? "in_block"
+          : status === "E"
+            ? "failed_block"
+            : "unknown";
     },
   };
 }
