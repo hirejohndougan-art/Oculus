@@ -25,7 +25,21 @@
  *   are all worked out from the log and never stored on their own (Spectrum
  *   asks for one location entry per object, so the two can't disagree).
  *   `placement` and `rehousing` moves set the normal location; a `return`
- *   must go back to it.
+ *   must go back to it. A `departure` (a borrowed record going back to its
+ *   lender, decision D-044) goes to an outside location and ends the normal
+ *   location: the record is no longer in the organization's care, so it is
+ *   not "away". It may only leave from inside the organization while the
+ *   record is not away, and only a placement (the record borrowed again) may
+ *   follow it, so neither a departure nor one back-dated before later moves
+ *   can hide a loan out or other temporary move that is still outstanding.
+ *   The one exception puts right a departure to the wrong place: a
+ *   `correction` to another outside location, written down after the
+ *   departure, which leaves the record departed.
+ *   An expected return date stays outstanding until a `return`: a
+ *   correction, placement or rehousing while it is out keeps the record away
+ *   and on the overdue list. While it is outstanding, only an extension (a
+ *   temporary move with the same reason to the same location) can move the
+ *   date; any other dated move keeps the earlier date.
  *
  * Every location, move and set of levels carries a required `organizationId`
  * and any set mixing organizations is refused (D-030). Like `indexTemplates`
@@ -57,7 +71,7 @@ import {
   oneOrganization,
   type OrganizationId,
 } from "./organizations.js";
-import { IssueList, readPlainData, shown, type JsonValue } from "./plain-data.js";
+import { IssueList, readPlainData, shown, type JsonValue, type ReadLimits } from "./plain-data.js";
 import { isRecordId, type RecordId } from "./record-id.js";
 
 declare const locationIdBrand: unique symbol;
@@ -81,14 +95,17 @@ export type LocationKind = (typeof LOCATION_KINDS)[number];
  * Why a record moved. `placement` (first housing) and `rehousing` (a new
  * permanent home) set the record's normal location. `return` goes back to
  * it. `correction` records where a record really is (found elsewhere in a
- * shelf audit) without changing its normal location. The rest are temporary
- * and may give an expected return date.
+ * shelf audit) without changing its normal location. `departure` sends a
+ * record out of the organization's care for good (a loan in going back to its
+ * lender): it goes to an outside location and clears the normal location.
+ * The rest are temporary and may give an expected return date.
  */
 export const MOVE_REASONS = [
   "placement",
   "rehousing",
   "return",
   "correction",
+  "departure",
   "exhibition",
   "loan_out",
   "conservation",
@@ -202,15 +219,19 @@ export interface Whereabouts {
   readonly normal: StorageLocation | null;
   readonly normalLabel: string | null;
   /**
-   * True when it is somewhere other than its normal location, or, when no
-   * normal location was ever recorded, when its latest move was temporary
-   * (or gave a return date still in force).
+   * True while an expected return date is outstanding (given since the last
+   * `return`), and otherwise when it is somewhere other than its normal
+   * location, or, when no normal location was ever recorded, when its
+   * latest move was temporary. False once it has departed.
    */
   readonly away: boolean;
   /**
-   * When it is due back, if it is away: the latest expected return date
-   * given since it last left its normal location, so a later move with no
-   * date (a correction, say) keeps the earlier one.
+   * When it is due back, if it is away: the expected return date given since
+   * its last `return`. Only a return clears it, so a later correction,
+   * placement, rehousing or dateless move keeps it, and a record out on loan
+   * can't leave the overdue list without coming back. A later dated move
+   * replaces it only as an extension (the same reason, to the same location
+   * as the move that gave it); any other dated move keeps the earlier date.
    */
   readonly expectedReturnOn: string | null;
   /** The latest move. */
@@ -743,8 +764,11 @@ const MOVE_LOGS = new WeakMap<object, LogData>();
  * share an ID, a move goes to a location not in the index, a placement or
  * rehousing goes to an outside location (`external_normal_location`), a
  * return doesn't go to the record's normal location at the time
- * (`not_normal_location`), or any move belongs to another organization than
- * the index (`mixed_organizations`). Never throws.
+ * (`not_normal_location`), a departure leaves while the record is away or
+ * outside (`departure_while_away`), a move other than a placement (or a
+ * correction to an outside location, written down after the departure)
+ * follows a departure (`move_after_departure`), or any move belongs to another
+ * organization than the index (`mixed_organizations`). Never throws.
  */
 export function indexMoves(index: LocationIndex, moves: unknown): Validated<MoveLog> {
   try {
@@ -933,10 +957,12 @@ export function whereabouts(log: MoveLog, recordId: RecordId): Validated<Whereab
 }
 
 /**
- * Every record that is away (see `Whereabouts.away`: somewhere other than its
- * normal location, or out on a temporary move before it was ever placed;
- * mockup Whereabouts), soonest due back first, those with no date last. A
- * record never placed stays away until a placement records its home.
+ * Every record that is away (see `Whereabouts.away`: with an expected return
+ * date outstanding, somewhere other than its normal location, or out on a
+ * temporary move before it was ever placed; mockup Whereabouts), soonest due
+ * back first, those with no date last. While a date is outstanding only a
+ * `return` brings a record back: one never placed needs a placement to give
+ * it a home and then a return there.
  */
 export function awayFromNormal(log: MoveLog): Validated<readonly Whereabouts[]> {
   const data = logData(log);
@@ -1040,8 +1066,112 @@ export function checkLocationDeletion(log: MoveLog, locationId: unknown): Valida
   return issues.length > 0 ? { ok: false, issues } : { ok: true, value: true };
 }
 
+/**
+ * One location of the index a log was built on, or `undefined`. Lets the
+ * loans module (D-044) see where a past move went without a second index
+ * that could disagree with the log.
+ */
+export function logLocation(log: MoveLog, id: unknown): StorageLocation | undefined {
+  const data = logData(log);
+  return data !== undefined && isLocationId(id) ? data.index.byId.get(id) : undefined;
+}
+
+/**
+ * Every `departure` move in a log, oldest first, so the loans module can
+ * report any that no loan in explains (D-044).
+ */
+export function departures(log: MoveLog): Validated<readonly StorageMove[]> {
+  return movesWithReason(log, "departure");
+}
+
+/**
+ * Every move with one reason in a log, oldest first: for the loans module,
+ * which reports `loan_out` moves no loan out explains (D-044).
+ */
+export function movesWithReason(
+  log: MoveLog,
+  reason: MoveReason,
+): Validated<readonly StorageMove[]> {
+  const data = logData(log);
+  if (data === undefined) return notALog();
+  const found: StorageMove[] = [];
+  for (const history of data.byRecord.values()) {
+    for (const move of history) if (move.reason === reason) found.push(move);
+  }
+  return { ok: true, value: Object.freeze(found.sort(byWhen)) };
+}
+
 // ---------------------------------------------------------------------------
-// Helpers
+// Helpers. The exported ones are shared with the other staff-only modules
+// (loans.ts, condition-checks.ts) and are not part of the package's API.
+
+/**
+ * What the log says about a record after some of its moves: the one walk
+ * that both `summarize` and `historyIssues` use, so they can't disagree.
+ */
+interface HistoryState {
+  /** The latest placement's or rehousing's location, cleared by a departure. */
+  normal: LocationId | undefined;
+  /**
+   * The outstanding due date, given by a temporary move since the last
+   * `return` (or departure). Only a `return` ends it; a correction, a
+   * placement, a rehousing or a dateless move never clears it, so a record
+   * out on a loan can't drop off the overdue list by being "found" at home
+   * or given a new home on paper (review fix). Bring it back with a return.
+   * While it is outstanding, a later dated move replaces it only as an
+   * extension (the same reason, to the same location as `dueFrom`); any
+   * other dated move keeps the earlier of the two dates, so a research trip
+   * dated 2099 can't push a loan out off the overdue list (review fix).
+   */
+  due: string | null;
+  /** The move that gave `due`. */
+  dueFrom: StorageMove | undefined;
+  /**
+   * True after a departure until the next placement: only a placement, or a
+   * correction to an outside location written down after the departure, may
+   * follow.
+   */
+  departed: boolean;
+  /** The departure, while `departed`. */
+  departure: StorageMove | undefined;
+  last: StorageMove | undefined;
+}
+
+function startState(): HistoryState {
+  return {
+    normal: undefined,
+    due: null,
+    dueFrom: undefined,
+    departed: false,
+    departure: undefined,
+    last: undefined,
+  };
+}
+
+function step(state: HistoryState, move: StorageMove): void {
+  if (NORMAL_LOCATION_REASONS.includes(move.reason)) state.normal = move.locationId;
+  else if (move.reason === "departure") state.normal = undefined;
+  if (move.reason === "return" || move.reason === "departure") {
+    state.due = null;
+    state.dueFrom = undefined;
+  } else if (move.expectedReturnOn !== undefined) {
+    const from = state.dueFrom;
+    const extension =
+      from === undefined || (from.reason === move.reason && from.locationId === move.locationId);
+    if (state.due === null || extension || move.expectedReturnOn < state.due) {
+      state.due = move.expectedReturnOn;
+      state.dueFrom = move;
+    }
+  }
+  if (move.reason === "departure") {
+    state.departed = true;
+    state.departure = move;
+  } else if (move.reason === "placement") {
+    state.departed = false;
+    state.departure = undefined;
+  }
+  state.last = move;
+}
 
 /** Problems with one record's history, oldest move first. */
 function historyIssues(
@@ -1050,9 +1180,24 @@ function historyIssues(
   pathOf: (move: StorageMove) => readonly (string | number)[],
 ): Issue[] {
   const problems: Issue[] = [];
-  let normal: LocationId | undefined;
+  // What `summarize` would say just before each move.
+  const state = startState();
   for (const move of history) {
+    const { normal } = state;
     const place = index.byId.get(move.locationId);
+    const before = problems.length;
+    if (move.reason === "departure" && !inCare(index, state)) {
+      // A departure would wipe the normal location and the due date, so a
+      // record out on loan (or anywhere temporary) could vanish from the
+      // overdue list (found in review). It must be home, inside, first.
+      problems.push(
+        issue(
+          pathOf(move),
+          "departure_while_away",
+          "A record can only depart from a location inside the organization, while it is not away on a temporary move. Record its return first.",
+        ),
+      );
+    }
     if (NORMAL_LOCATION_REASONS.includes(move.reason)) {
       if (place?.kind === "external") {
         problems.push(
@@ -1063,20 +1208,84 @@ function historyIssues(
           ),
         );
       }
-      normal = move.locationId;
+    } else if (move.reason === "departure") {
+      if (place?.kind !== "external") {
+        problems.push(
+          issue(
+            pathOf(move),
+            "departure_not_external",
+            "A departure leaves the organization's care, so it goes to an outside location (the lender).",
+          ),
+        );
+      }
     } else if (move.reason === "return" && move.locationId !== normal) {
       problems.push(
         issue(
           pathOf(move),
           "not_normal_location",
           normal === undefined
-            ? "This record has no normal location yet, so it can't be returned. Record a placement instead."
+            ? "This record has no normal location yet, so it can't be returned. Record a placement to give it a home, then a return there: while an expected return date is outstanding, only a return brings it back."
             : "A return must go back to the record's normal location at the time.",
         ),
       );
     }
+    // A departure recorded to the wrong outside location may be put right by
+    // a correction to another outside location: the record stays departed
+    // (not in care, no normal location), only its whereabouts change. The
+    // correction must be written down after the departure, so a departure
+    // back-dated before a correction can't make a record found outside
+    // vanish from the away list.
+    const fixesDeparture =
+      move.reason === "correction" &&
+      place?.kind === "external" &&
+      state.departure !== undefined &&
+      move.recordedAt > state.departure.recordedAt;
+    if (
+      state.departed &&
+      move.reason !== "placement" &&
+      !fixesDeparture &&
+      problems.length === before
+    ) {
+      // A departed record is no longer here: only a placement (borrowed
+      // again) can follow. So a departure back-dated before a later move
+      // (a loan out still outstanding) makes the history invalid instead of
+      // wiping the normal location while the record is out (review fix).
+      problems.push(
+        issue(
+          pathOf(move),
+          "move_after_departure",
+          "This record departed before this move. Only a placement, or a correction to another outside location, can follow a departure; check the departure's date.",
+        ),
+      );
+    }
+    step(state, move);
   }
   return problems;
+}
+
+/**
+ * True when a record is inside the organization and not away (the same rule
+ * as `Whereabouts.away`): the only state it may depart from.
+ */
+function inCare(index: IndexData, state: HistoryState): boolean {
+  const { last } = state;
+  if (last === undefined || state.departed) return false;
+  const kind = index.byId.get(last.locationId)?.kind;
+  if (kind === undefined || kind === "external") return false;
+  return !isAway(state);
+}
+
+/** `Whereabouts.away` for a state with at least one move. */
+function isAway(state: HistoryState): boolean {
+  const { last } = state;
+  if (last === undefined || state.departed) return false;
+  // An outstanding due date keeps it away, even at its normal location,
+  // until a return is recorded.
+  if (state.due !== null) return true;
+  if (state.normal !== undefined) return last.locationId !== state.normal;
+  // With no normal location recorded, a record is away while its latest
+  // stretch is temporary: sent out for digitization before it was ever placed.
+  return TEMPORARY_MOVE_REASONS.includes(last.reason);
 }
 
 function summarize(
@@ -1089,15 +1298,11 @@ function summarize(
   const last = history[history.length - 1];
   if (last === undefined) return undefined;
   // Walk the history: the normal location is the latest placement or
-  // rehousing; the due date is the latest one given since the record last
-  // left home, so a later correction or dateless move doesn't drop it.
-  let normalId: LocationId | undefined;
-  let dueOn: string | null = null;
-  for (const move of history) {
-    if (NORMAL_LOCATION_REASONS.includes(move.reason)) normalId = move.locationId;
-    if (move.locationId === normalId) dueOn = null;
-    else if (move.expectedReturnOn !== undefined) dueOn = move.expectedReturnOn;
-  }
+  // rehousing; the due date is the latest one given since the last return,
+  // so a later correction, placement or dateless move doesn't drop it.
+  const state = startState();
+  for (const move of history) step(state, move);
+  const normalId = state.normal;
   const current = index.byId.get(last.locationId);
   const currentLabel = index.labels.get(last.locationId);
   if (current === undefined || currentLabel === undefined) return undefined;
@@ -1106,12 +1311,8 @@ function summarize(
   if (normalId !== undefined && (normal === undefined || normalLabel === undefined)) {
     return undefined;
   }
-  // With no normal location recorded, a record is away while its latest
-  // stretch is temporary: sent out for digitization before it was ever placed.
-  const away =
-    normal !== undefined
-      ? normal.id !== current.id
-      : dueOn !== null || TEMPORARY_MOVE_REASONS.includes(last.reason);
+  // A record that departed is no longer the organization's to have away.
+  const away = isAway(state);
   return Object.freeze({
     recordId,
     current,
@@ -1121,7 +1322,7 @@ function summarize(
     normal: normal ?? null,
     normalLabel: normalLabel ?? null,
     away,
-    expectedReturnOn: away ? dueOn : null,
+    expectedReturnOn: away ? state.due : null,
     lastMove: last,
   });
 }
@@ -1178,7 +1379,7 @@ function byName(a: StorageLocation, b: StorageLocation): number {
 }
 
 /** Case- and form-insensitive comparison key for names. */
-function fold(text: string): string {
+export function fold(text: string): string {
   return text.normalize("NFC").toLowerCase();
 }
 
@@ -1186,7 +1387,7 @@ function fold(text: string): string {
  * Read a caller's list once into a frozen shallow copy: Proxies, non-arrays,
  * holes and getters are refused, so nothing reads differently twice.
  */
-function readList(input: unknown, max: number, what: string): Validated<readonly unknown[]> {
+export function readList(input: unknown, max: number, what: string): Validated<readonly unknown[]> {
   if (types.isProxy(input) || !Array.isArray(input)) {
     return refused([], "not_a_list", `The ${what} must be given as a list.`);
   }
@@ -1207,15 +1408,15 @@ function readList(input: unknown, max: number, what: string): Validated<readonly
   return { ok: true, value: Object.freeze(copy) };
 }
 
-interface TopView {
+export interface TopView {
   readonly copy: Readonly<Record<string, JsonValue>>;
   readonly data: Readonly<Record<string, JsonValue | undefined>>;
 }
 
-function readTop(
+export function readTop(
   input: unknown,
   notObject: string,
-  limits: typeof FLAT_LIMITS | typeof LEVEL_LIMITS,
+  limits: ReadLimits,
   issues: IssueList,
 ): TopView | undefined {
   if (types.isProxy(input) || !isPlainObject(input)) {
@@ -1276,7 +1477,7 @@ function checkOneLine(
   return issues.count === before;
 }
 
-function checkNote(value: JsonValue | undefined, issues: IssueList): void {
+export function checkNote(value: JsonValue | undefined, issues: IssueList): void {
   if (value === undefined) return;
   if (typeof value !== "string" || value.trim().length === 0) {
     issues.add(
@@ -1293,7 +1494,7 @@ function checkNote(value: JsonValue | undefined, issues: IssueList): void {
   }
 }
 
-function unknownKeys(
+export function unknownKeys(
   view: Readonly<Record<string, JsonValue | undefined>>,
   allowed: readonly string[],
   what: string,
@@ -1308,7 +1509,7 @@ function unknownKeys(
 }
 
 /** Milliseconds since 1970, or undefined if not a real ISO 8601 UTC timestamp. */
-function parseUtc(value: unknown): number | undefined {
+export function parseUtc(value: unknown): number | undefined {
   if (typeof value !== "string" || !ISO_UTC.test(value)) return undefined;
   const ms = Date.parse(value);
   if (Number.isNaN(ms)) return undefined;
@@ -1316,7 +1517,7 @@ function parseUtc(value: unknown): number | undefined {
 }
 
 /** The UTC day after the one `ms` falls on, as `YYYY-MM-DD`. */
-function dayAfter(ms: number): string {
+export function dayAfter(ms: number): string {
   const day = new Date(ms + 86_400_000).toISOString().slice(0, 10);
   // Past year 9999 the ISO form grows a sign; every allowed day is earlier.
   return ISO_DAY.test(day) ? day : "9999-12-31";
@@ -1337,7 +1538,7 @@ function notALog(): { readonly ok: false; readonly issues: readonly Issue[] } {
   return refused([], "not_a_move_log", "Give the move log made by indexMoves or withMove.");
 }
 
-function refused(
+export function refused(
   path: readonly (string | number)[],
   code: string,
   message: string,
@@ -1345,7 +1546,7 @@ function refused(
   return { ok: false, issues: [issue(path, code, message)] };
 }
 
-function guarded<T>(run: () => Validated<T>, message: string): Validated<T> {
+export function guarded<T>(run: () => Validated<T>, message: string): Validated<T> {
   try {
     return run();
   } catch {

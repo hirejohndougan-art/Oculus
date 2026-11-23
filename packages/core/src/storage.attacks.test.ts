@@ -267,7 +267,10 @@ describe("storage stays staff-only", () => {
     }
   });
 
-  it("no module but the package index imports storage", () => {
+  // Changed in T-018: the loans and condition-check modules are staff-only too
+  // (D-044) and build on storage; storage.ts is still out of reach of every
+  // module that makes public output.
+  it("no module but the package index and the other staff-only modules imports storage", () => {
     // Any static or dynamic import, with or without an extension, in any folder.
     const here = dirname(fileURLToPath(import.meta.url));
     const mentions = /["'`](?:\.{1,2}\/)+(?:[^"'`]*\/)?storage(?:\.[jt]s)?["'`]/;
@@ -275,7 +278,7 @@ describe("storage stays staff-only", () => {
       .filter((f) => /\.[cm]?[jt]sx?$/.test(f) && !/\.test\.ts$|\.fixtures\.ts$/.test(f))
       .filter((f) => f !== "storage.ts")
       .filter((f) => mentions.test(readFileSync(join(here, f), "utf8")));
-    expect(importers).toEqual(["index.ts"]);
+    expect(importers.sort()).toEqual(["condition-checks.ts", "index.ts", "loans.ts"]);
     expect(mentions.test('await import("./storage")')).toBe(true);
     expect(mentions.test('from "../core/storage.js"')).toBe(true);
   });
