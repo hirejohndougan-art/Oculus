@@ -1,7 +1,8 @@
 /**
  * @oculus/db: the only package that talks to PostgreSQL (D-050). Every query
  * is written with the `sql` tag; `migrate` applies `packages/db/migrations`;
- * `catalog.ts` reads and writes the catalog tables through core's validators.
+ * `catalog.ts` reads and writes the catalog tables and `identifiers.ts` the
+ * identifier tables, both through core's validators.
  */
 export { sql, joinSql, isSql, Sql, MAX_PARAMETERS } from "./sql.js";
 export type { SqlScalar, SqlValue } from "./sql.js";
@@ -30,3 +31,11 @@ export {
   readRecord,
 } from "./catalog.js";
 export type { StoredTemplate, StoredRecordType } from "./catalog.js";
+export {
+  readIdentifierTypes,
+  insertIdentifierType,
+  updateIdentifierType,
+  saveRecordIdentifiers,
+  readRecordIdentifiers,
+  allocateIdentifier,
+} from "./identifiers.js";
