@@ -762,11 +762,10 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
     const keys = MOVE_KEYS[loan.direction];
     const items: ItemData[] = [];
     loan.items.forEach((item, j) => {
-      const fields = item as unknown as Readonly<Record<string, MoveId | undefined>>;
       const history = moveHistory(log, item.recordId);
       const moves = history.ok ? history.value : [];
       const find = (key: string): { move: StorageMove; index: number } | null | undefined => {
-        const id = fields[key];
+        const id = ownLink(item, key);
         if (id === undefined) return null;
         named.add(id);
         const first = usedMoves.get(id);
@@ -1031,16 +1030,13 @@ function removedLinks(before: Entry, next: Loan): Issue[] {
   const keys = MOVE_KEYS[next.direction];
   const ending = next.direction === "out" ? "return" : "departure";
   const found: Issue[] = [];
-  const nextItems = next.items as readonly unknown[] as readonly Readonly<
-    Record<string, string | undefined>
-  >[];
+  const nextItems: readonly (LoanInItem | LoanOutItem)[] = next.items;
   before.loan.items.forEach((item, j) => {
-    const old = item as unknown as Readonly<Record<string, string | undefined>>;
-    if (old[keys.start] === undefined) return;
-    const back = old[keys.end] !== undefined && (before.items[j]?.ended ?? null) !== null;
+    if (ownLink(item, keys.start) === undefined) return;
+    const back = ownLink(item, keys.end) !== undefined && (before.items[j]?.ended ?? null) !== null;
     const k = nextItems.findIndex((i) => i.recordId === item.recordId);
     const now = nextItems[k];
-    if (now?.[keys.start] === undefined) {
+    if (now === undefined || ownLink(now, keys.start) === undefined) {
       if (!back) {
         found.push(
           issue(
@@ -1052,7 +1048,7 @@ function removedLinks(before: Entry, next: Loan): Issue[] {
       }
       return;
     }
-    if (old[keys.end] !== undefined && now[keys.end] === undefined) {
+    if (ownLink(item, keys.end) !== undefined && ownLink(now, keys.end) === undefined) {
       found.push(
         issue(
           ["items", k, keys.end],
@@ -1063,6 +1059,19 @@ function removedLinks(before: Entry, next: Loan): Issue[] {
     }
   });
   return found;
+}
+
+/**
+ * An item's move link, read only as its own data property (S-012): an
+ * inherited `departureMoveId` on a polluted `Object.prototype` must never
+ * link a real move and take a loan off the overdue list. Validated copies
+ * have no prototype already; this keeps every read safe on its own.
+ */
+function ownLink(item: LoanInItem | LoanOutItem, key: string): MoveId | undefined {
+  const slot = Object.getOwnPropertyDescriptor(item, key);
+  if (slot === undefined || !("value" in slot)) return undefined;
+  const value: unknown = slot.value;
+  return isMoveId(value) ? value : undefined;
 }
 
 function stateOf(data: BookData, entry: Entry): LoanState {
