@@ -34,12 +34,15 @@ import {
   publicOutput,
   publicView,
   reindexLoans,
+  unexplainedDepartures,
+  whereabouts,
   validateConditionCheck,
   validateLoan,
   validateRecord,
   withConditionCheck,
   withLoan,
   type ConditionCheck,
+  type LoanIn,
   type LoanBook,
   type LoanOut,
   type PublicRecord,
@@ -425,5 +428,111 @@ describe("loans and condition checks stay staff-only", () => {
       expect(importers).toEqual(["index.ts"]);
       expect(mentions.test(`await import("./${name}")`)).toBe(true);
     }
+  });
+});
+
+// S-012: a polluted Object.prototype must not supply a loan item's move links.
+const LENDER = newRecordId();
+const lenderPlace = {
+  id: newLocationId(),
+  organizationId: ORG,
+  kind: "external",
+  name: "Railroad society",
+  agentId: LENDER,
+};
+const LENDING_INDEX = ok(
+  indexLocations({ organizationId: ORG, levels: ["Room"] }, [
+    shelf,
+    borrowerPlace,
+    lenderPlace,
+  ] as StorageLocation[]),
+);
+
+/** Run `body` with `Object.prototype[key]` set to `value`, always restoring it. */
+function polluted<T>(fields: Readonly<Record<string, string>>, body: () => T): T {
+  const proto = Object.prototype as Record<string, unknown>;
+  try {
+    for (const [key, value] of Object.entries(fields)) proto[key] = value;
+    return body();
+  } finally {
+    for (const key of Object.keys(fields)) Reflect.deleteProperty(proto, key);
+  }
+}
+
+describe("a polluted prototype can't link moves (S-012)", () => {
+  const lantern = newRecordId();
+  const arrived = move(lantern, shelf.id, "2026-10-01", "placement");
+  // A real departure no loan names: the lantern went back on some other paper.
+  const gone = move(lantern, lenderPlace.id, "2026-10-20", "departure");
+  const log = ok(indexMoves(LENDING_INDEX, [arrived, gone, placed, sent]));
+  const loanIn: LoanIn = {
+    id: newLoanId(),
+    organizationId: ORG,
+    direction: "in",
+    number: "LI-1",
+    agentId: LENDER,
+    beginOn: "2026-10-01",
+    endOn: "2026-11-01",
+    status: "agreed",
+    statusOn: "2026-09-15",
+    items: [{ recordId: lantern, arrivalMoveId: arrived.id }],
+  };
+  const back = move(print, shelf.id, "2026-11-10", "return");
+  const lentLog = ok(indexMoves(LENDING_INDEX, [placed, sent, back]));
+
+  it("an inherited departureMoveId doesn't take a loan in off overdueLoans", () => {
+    const fields = { departureMoveId: gone.id, returnMoveId: back.id };
+    const book = polluted(fields, () => ok(indexLoans(log, [loanIn], NOW)));
+    polluted(fields, () => {
+      expect(ok(loanState(book, loanIn.id)).phase).toBe("on_loan");
+      expect(ok(overdueLoans(book, "2026-11-20")).map((s) => s.loan.id)).toEqual([loanIn.id]);
+      expect(ok(unexplainedDepartures(book)).map((m) => m.id)).toEqual([gone.id]);
+      // Nor through withLoan or reindexLoans.
+      const edited = ok(withLoan(ok(indexLoans(log, [], NOW)), loanIn, NOW));
+      expect(ok(overdueLoans(edited, "2026-11-20")).map((s) => s.loan.id)).toEqual([loanIn.id]);
+      const again = ok(reindexLoans(edited, log));
+      expect(ok(loanState(again, loanIn.id)).items[0]?.ended).toBeNull();
+    });
+    // And once the prototype is clean, the book still reads the same.
+    expect(ok(overdueLoans(book, "2026-11-20")).map((s) => s.loan.id)).toEqual([loanIn.id]);
+  });
+
+  it("an inherited returnMoveId or loanOutMoveId doesn't return or start a loan out", () => {
+    const lent = loan({ endOn: "2026-11-15" });
+    const fields = { returnMoveId: back.id, loanOutMoveId: sent.id };
+    polluted(fields, () => {
+      const book = ok(indexLoans(lentLog, [lent], NOW));
+      expect(ok(loanState(book, lent.id)).phase).toBe("on_loan");
+      expect(ok(overdueLoans(book, "2026-11-20")).map((s) => s.loan.id)).toEqual([lent.id]);
+      // An item with no links of its own stays not started.
+      const pending = loan({ number: "LO-2", items: [{ recordId: newRecordId() }] });
+      const other = ok(indexLoans(lentLog, [pending], NOW));
+      expect(ok(loanState(other, pending.id)).items[0]?.started).toBeNull();
+    });
+  });
+
+  it("an edit can't drop a link by inheriting it back", () => {
+    const book = ok(indexLoans(log, [loanIn], NOW));
+    polluted({ arrivalMoveId: arrived.id }, () => {
+      expect(codes(withLoan(book, { ...loanIn, items: [{ recordId: lantern }] }, NOW))).toEqual([
+        "link_removed",
+      ]);
+    });
+  });
+
+  it("validated storage copies inherit nothing either", () => {
+    polluted({ expectedReturnOn: "2000-01-01", parentId: borrowerPlace.id }, () => {
+      const index = ok(
+        indexLocations({ organizationId: ORG, levels: ["Room"] }, [
+          shelf,
+          borrowerPlace,
+        ] as StorageLocation[]),
+      );
+      const plain = ok(indexMoves(index, [placed]));
+      const where = ok(whereabouts(plain, print));
+      expect(where?.away).toBe(false);
+      expect(where?.expectedReturnOn).toBeNull();
+      expect(Object.getPrototypeOf(ok(validateLoan(loan(), NOW)))).toBeNull();
+    });
   });
 });

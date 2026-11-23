@@ -1423,12 +1423,37 @@ export function readTop(
     issues.add([], "not_an_object", notObject);
     return undefined;
   }
-  const copy = readPlainData(input, [], limits, issues);
-  if (copy === undefined || !isPlainObject(copy)) return undefined;
+  const read = readPlainData(input, [], limits, issues);
+  if (read === undefined || !isPlainObject(read)) return undefined;
+  // The copy the validators return has no prototype at any depth (S-012), so
+  // an optional field left out (a loan item's `departureMoveId`, a move's
+  // `expectedReturnOn`, a location's `parentId`) reads as undefined even when
+  // `Object.prototype` has been polluted, wherever the copy is read later.
+  const copy = withoutPrototypes(read) as Readonly<Record<string, JsonValue>>;
   // Read only the copy's own properties, never anything inherited.
   const data = Object.create(null) as Record<string, JsonValue | undefined>;
   for (const key of Object.keys(copy)) data[key] = copy[key];
   return { copy, data };
+}
+
+/**
+ * A frozen copy of plain data whose objects have a null prototype, so a
+ * missing key never finds an inherited value. Arrays stay arrays (indexes
+ * are read below their length only, and plain data has no holes).
+ */
+function withoutPrototypes(value: JsonValue): JsonValue {
+  if (Array.isArray(value)) {
+    return Object.freeze((value as readonly JsonValue[]).map(withoutPrototypes));
+  }
+  if (typeof value === "object" && value !== null) {
+    const out = Object.create(null) as Record<string, JsonValue>;
+    for (const key of Object.keys(value)) {
+      const item = Object.getOwnPropertyDescriptor(value, key)?.value as JsonValue;
+      out[key] = withoutPrototypes(item);
+    }
+    return Object.freeze(out);
+  }
+  return value;
 }
 
 function checkOrganization(value: JsonValue | undefined, what: string, issues: IssueList): void {
