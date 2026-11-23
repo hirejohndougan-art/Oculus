@@ -240,6 +240,7 @@ Database:
 Change log and versions:
 - [ ] T-029 **Change log and version history.** deps: T-025 (risky)
   - Every write stores a full new version of the record (who, when, which fields changed, an optional reason) in an append-only table, in the same transaction as the change. The database role the app uses can't update or delete versions. This feeds the mockup's History tab and Audit trail.
+  - Built on branch `autopilot/T-029` (D-063): migration 0005 (`records.version`, append-only `record_versions` kept in step with every record write by triggers), `insertRecord` with who/why, `updateRecord` with `expectedVersion`, `readStoredRecord`, `readVersions`/`readVersion`. App-role GRANTs are documented in D-063 for T-032/T-051. Follow-ups: tie `user:` actors to users (T-036); append-only triggers for template and record type versions.
 - [ ] T-030 **Compare and restore versions.** deps: T-029 (risky)
   - Compare any two versions field by field. Restoring writes a new version equal to an old one, never deleting history, and runs today's template, identifier uniqueness and rights checks first, reporting anything the old version no longer passes instead of saving it.
 - [ ] T-031 **Edit-conflict protection.** deps: T-029 (risky)
