@@ -8,9 +8,54 @@ permissions:
   contents: read
 
 jobs:
-  gate:
+  gate-postgres:
     runs-on: ubuntu-latest
+    # The oldest and newest supported PostgreSQL majors (D-049). Images are
+    # not pinned to digests yet: no digest could be checked against the
+    # registry from the build sandbox (D-057).
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["15", "19"]
+    name: gate-postgres (PostgreSQL ${{ matrix.postgres }})
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          # Trust authentication: no password in the repository, not even for
+          # tests. The container is reachable only from this job (D-049).
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+    env:
+      OCULUS_TEST_DATABASE_URL: postgresql://postgres@localhost:5432/postgres
     steps:
+      # The migration runner's tests prepare a transaction, which needs
+      # max_prepared_transactions above 0 (the image's default is 0). A
+      # service container can't be given server options, so it is set and the
+      # container restarted. Without it those tests fail; they never skip (D-057).
+      - name: Allow prepared transactions
+        env:
+          CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          docker exec "$CONTAINER" psql -U postgres -c "ALTER SYSTEM SET max_prepared_transactions = 10"
+          docker restart "$CONTAINER"
+          ready=no
+          for i in $(seq 1 60); do
+            if docker exec "$CONTAINER" pg_isready -U postgres; then ready=yes; break; fi
+            sleep 1
+          done
+          if [ "$ready" != yes ]; then
+            echo "::error::PostgreSQL did not come back within 60 s after the restart."
+            docker logs "$CONTAINER" | tail -n 50
+            exit 1
+          fi
+          docker exec "$CONTAINER" psql -U postgres -tAc "SHOW max_prepared_transactions" | grep -qx 10
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
@@ -20,3 +65,16 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run gate
+
+  # The one check to require: passes only if every PostgreSQL version passed.
+  gate:
+    needs: gate-postgres
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every PostgreSQL version passed
+        env:
+          RESULT: ${{ needs.gate-postgres.result }}
+        run: |
+          echo "gate-postgres: $RESULT"
+          test "$RESULT" = "success"
