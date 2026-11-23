@@ -293,6 +293,18 @@ export type {
   SkippedTerm,
 } from "./term-duplicates.js";
 export {
+  LC_VOCABULARY_CODES,
+  DEFAULT_TERMS_WITHOUT_URI,
+  MAX_TERMS_WITHOUT_URI,
+  findLcTermsWithoutUri,
+} from "./term-uri-report.js";
+export type {
+  LcVocabularyCode,
+  TermWithoutUri,
+  TermsWithoutUriReport,
+  TermsWithoutUriOptions,
+} from "./term-uri-report.js";
+export {
   DCMITYPE_NAMESPACE,
   RDFS_NAMESPACE,
   DC_ELEMENTS_NAMESPACE,

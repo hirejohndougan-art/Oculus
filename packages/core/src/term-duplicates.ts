@@ -439,8 +439,11 @@ export function findNearDuplicateTerms(
   }
 }
 
-/** Read item `i` as its own value: a hole or getter is that item's problem only. */
-function readTerm(list: readonly unknown[], i: number): Validated<ControlledTerm> {
+/**
+ * Read item `i` as its own value: a hole or getter is that item's problem
+ * only. Also used by `term-uri-report.ts`; not part of the public API.
+ */
+export function readTerm(list: readonly unknown[], i: number): Validated<ControlledTerm> {
   const fail = (code: string, message: string): Validated<ControlledTerm> => ({
     ok: false,
     issues: Object.freeze([Object.freeze({ path: Object.freeze([i]), code, message })]),
