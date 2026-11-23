@@ -25,11 +25,13 @@
 -- A former identifier may name a type that no longer exists or never did
 -- (imported history, D-009); its holding's rule is then null and it counts
 -- for nothing, as in core. When a type with that key is created later, its
--- rule is filled in (insertIdentifierType), so the indexes then check those
--- values too. A current identifier always names an existing type.
+-- rule is filled in (zzzz_identifier_types_adopt_holdings, however the type
+-- is inserted), so the indexes then check those values too. A current
+-- identifier always names an existing type.
 --
 -- Writes of holdings and of types meet at one lock per (organization, type
--- key), a transaction-level advisory lock (identifier_type_lock_key): every
+-- key bucket), a transaction-level advisory lock (identifier_type_lock_key,
+-- 64 buckets per organization, so a transaction never holds more): every
 -- holding write takes it shared, in its trigger, and every type insert,
 -- update or delete takes it exclusive, in its trigger, so direct writers are
 -- covered too. A type and a holding of its key are then never written at the
@@ -37,7 +39,9 @@
 -- type created at the same moment could each miss the other, leaving a
 -- number outside both unique indexes for good. allocateIdentifier takes the
 -- lock exclusive too, so it waits for saves of the type that haven't
--- committed (and they wait for it).
+-- committed (and they wait for it). All of this needs each statement to take
+-- a new snapshot, so these writes refuse to run outside Read Committed
+-- (identifier_require_read_committed).
 --
 -- Nothing cascades on delete: a type, a record or a holding something points
 -- at can't be deleted. Identity is fixed by catalog_keep_identity (0002), with
@@ -158,13 +162,78 @@ CREATE TABLE public.identifier_counters (
 );
 
 -- The advisory lock key of one organization's identifier type key (see the
--- top of this file). A hash: two types may share a key, which only makes them
--- wait for each other.
+-- top of this file): one of 64 keys (buckets) per
+-- organization, picked by a hash of the type key. However many type keys a
+-- transaction writes (a record's former numbers may name up to 500 unknown
+-- ones), it holds at most 64 of these locks per organization it writes for
+-- (a job spanning many organizations in one transaction holds 64 for each:
+-- commit per organization). Two types in one bucket only wait for each other,
+-- or, rarely, deadlock into a clean retry (D-061).
+CREATE FUNCTION public.identifier_type_lock_bucket(type_key text)
+RETURNS integer
+LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+SET search_path = pg_catalog, pg_temp
+AS $$ SELECT (hashtextextended(type_key, 0) & 63)::integer $$;
+
+CREATE FUNCTION public.identifier_bucket_lock_key(organization_id uuid, bucket integer)
+RETURNS bigint
+LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+SET search_path = pg_catalog, pg_temp
+AS $$
+  SELECT hashtextextended(
+    'oculus.identifier_type/' || organization_id::text || '/' || bucket::text, 0)
+$$;
+
 CREATE FUNCTION public.identifier_type_lock_key(organization_id uuid, type_key text)
 RETURNS bigint
 LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
 SET search_path = pg_catalog, pg_temp
-AS $$ SELECT hashtextextended('oculus.identifier_type/' || organization_id::text || '/' || type_key, 0) $$;
+AS $$
+  SELECT public.identifier_bucket_lock_key(
+    organization_id, public.identifier_type_lock_bucket(type_key))
+$$;
+
+-- Every write here relies on each statement taking a new snapshot (it reads
+-- what was committed while it waited for a lock). Under Repeatable Read or
+-- Serializable a statement reads the transaction's first snapshot instead,
+-- and a type and a holding written at the same moment could miss each other
+-- again, so writes are refused there (SQLSTATE OC061).
+CREATE FUNCTION public.identifier_require_read_committed() RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  IF current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION 'Identifier writes must run in a Read Committed transaction, not %.',
+        current_setting('transaction_isolation')
+      USING ERRCODE = 'OC061';
+  END IF;
+END
+$$;
+
+-- Takes the lock of every given type key of one organization, shared or
+-- exclusive, each bucket once, in bucket order (the same in every
+-- organization): two callers never take two buckets in opposite orders.
+CREATE FUNCTION public.identifier_type_locks(organization_id uuid, type_keys text[], exclusive boolean)
+RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  bucket integer;
+BEGIN
+  PERFORM public.identifier_require_read_committed();
+  FOR bucket IN
+    SELECT DISTINCT public.identifier_type_lock_bucket(k) FROM unnest(type_keys) AS k ORDER BY 1
+  LOOP
+    IF exclusive THEN
+      PERFORM pg_advisory_xact_lock(public.identifier_bucket_lock_key(organization_id, bucket));
+    ELSE
+      PERFORM pg_advisory_xact_lock_shared(public.identifier_bucket_lock_key(organization_id, bucket));
+    END IF;
+  END LOOP;
+END
+$$;
 
 -- Types take their key's lock exclusive before they change. On update and
 -- delete the row is already locked when a BEFORE trigger runs, so a save
@@ -175,6 +244,7 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
+  PERFORM public.identifier_require_read_committed();
   IF TG_OP = 'DELETE' THEN
     PERFORM pg_advisory_xact_lock(public.identifier_type_lock_key(OLD.organization_id, OLD.key));
     RETURN OLD;
@@ -187,17 +257,41 @@ $$;
 CREATE TRIGGER zzzz_identifier_types_lock BEFORE INSERT OR UPDATE OR DELETE ON public.identifier_types
   FOR EACH ROW EXECUTE FUNCTION public.identifier_types_lock();
 
+-- A new type adopts the holdings already stored under its key (former numbers
+-- of a deleted or imported type, D-009): their rule is filled in by the
+-- holdings' trigger below, and the unique indexes check them in this same
+-- statement, so a clash refuses the type. In the database, not the
+-- application, so a type inserted by direct SQL adopts them too. It runs
+-- after the type's lock was taken (BEFORE trigger above), so its own
+-- statement sees every holding committed before then.
+CREATE FUNCTION public.identifier_types_adopt_holdings() RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  UPDATE public.identifier_holdings h SET uniqueness = NULL
+  WHERE h.organization_id = NEW.organization_id AND h.type_key = NEW.key
+    AND h.uniqueness IS NULL;
+  RETURN NULL;
+END
+$$;
+
+CREATE TRIGGER zzzz_identifier_types_adopt_holdings AFTER INSERT ON public.identifier_types
+  FOR EACH ROW EXECUTE FUNCTION public.identifier_types_adopt_holdings();
+
 -- A holding's rule is always its type's, never what the writer sent: set on
 -- every insert and update (including the foreign key's cascade, which runs
 -- after the type row changed, so it reads the new rule), after taking the
 -- type key's lock shared, so a type being created or changed at the same
 -- moment is waited for and then seen (each statement here takes a new
--- snapshot). Fixed search path, as catalog_keep_identity.
+-- snapshot, which is why Read Committed is required). Fixed search path, as
+-- catalog_keep_identity.
 CREATE FUNCTION public.identifier_holdings_take_rule() RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
+  PERFORM public.identifier_require_read_committed();
   PERFORM pg_advisory_xact_lock_shared(
     public.identifier_type_lock_key(NEW.organization_id, NEW.type_key));
   NEW.uniqueness := (
