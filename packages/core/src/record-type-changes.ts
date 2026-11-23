@@ -1,5 +1,5 @@
 /**
- * Safe record type changes (roadmap T-013a, decisions D-037, D-053a).
+ * Safe record type changes (roadmap T-013a, decisions D-037, D-053).
  *
  * A record names its record type in `recordTypeKey`, and `checkRecordType`
  * refuses a record whose type is missing (`unknown_record_type`) or of
@@ -17,11 +17,16 @@
  * - `key_adopts_records`: records already name the new key, left from a
  *   deleted type; the renamed type takes them over. `recordIds` lists them,
  *   `mismatchRecordIds` those whose kind isn't the type's (they would fail
- *   with `wrong_kind`). Without `existing` it is reported in case there are.
+ *   with `wrong_kind`); `mismatchCount` counts them all. Without `existing`
+ *   it is reported in case there are.
  * - `kind_changed`: the kind changes. `recordIds` are the records of the
  *   type (naming the old key) whose kind isn't the new one; a record's kind
  *   decides its fields and structure, so these fail with `wrong_kind`.
  * - `type_deleted`: `recordIds` are the records naming the type.
+ * - `unverified`: `recordTypeChanges` without `existing`. The old type is
+ *   then only the caller's word (it may be stale, or already claim the new
+ *   kind), so the edit always needs confirmation, even when the two versions
+ *   look the same.
  *
  * Each needs confirmation when it affects records, and whenever `existing`
  * isn't given. The label, description and default template are not
@@ -53,9 +58,10 @@ import type { RecordId } from "./record-id.js";
 import { MAX_RECORD_TYPES, readRecordType, type RecordType } from "./record-types.js";
 import { MAX_LISTED_RECORDS } from "./template-changes.js";
 import { MAX_RECORD_SET } from "./effective.js";
-import { mixedOrganizationsIssue, oneOrganization } from "./organizations.js";
+import { mixedOrganizationsIssue, oneOrganization, organizationIdOf } from "./organizations.js";
 
 export const RECORD_TYPE_CHANGE_CODES = [
+  "unverified",
   "key_changed",
   "key_adopts_records",
   "kind_changed",
@@ -75,8 +81,10 @@ export interface RecordTypeChange {
   readonly recordIds: readonly RecordId[];
   /** How many records it affects, even beyond the listed IDs. */
   readonly recordCount: number;
-  /** `key_adopts_records` only: adopted records whose kind isn't the type's. */
+  /** `key_adopts_records` only: adopted records whose kind isn't the type's. At most `MAX_LISTED_RECORDS`. */
   readonly mismatchRecordIds?: readonly RecordId[];
+  /** `key_adopts_records` only: how many adopted records are of another kind, even beyond the listed IDs. */
+  readonly mismatchCount?: number;
 }
 
 export interface RecordTypeChanges {
@@ -107,6 +115,22 @@ export function recordTypeChanges(
   existing?: unknown,
 ): Validated<RecordTypeChanges> {
   return guarded(() => {
+    // The new type's organization is compared before its shape is checked,
+    // so another organization's type, valid or not, gets no message about
+    // its properties. Non-objects and Proxies are left to the shape check.
+    const owner = organizationIdOf(oldType);
+    if (
+      owner !== undefined &&
+      typeof newType === "object" &&
+      newType !== null &&
+      !types.isProxy(newType) &&
+      organizationIdOf(newType) !== owner
+    ) {
+      return {
+        ok: false,
+        issues: [mixedOrganizationsIssue(["newType", "organizationId"], "These record types")],
+      };
+    }
     const before = readType(oldType, "oldType");
     const after = readType(newType, "newType");
     if (!before.ok || !after.ok) {
@@ -140,6 +164,10 @@ export function recordTypeChanges(
     }
     const unchecked = use === undefined;
     const changes: RecordTypeChange[] = [];
+    // Without the stored list the old type is only the caller's word: it may
+    // be stale or claim the new kind or key already, hiding a change that
+    // strands every record of the type. So it always needs confirmation.
+    if (unchecked) changes.push(change("unverified", was.key, undefined, true));
     if (now.key !== was.key) {
       const held = use === undefined ? undefined : naming(use, was.key);
       changes.push(
@@ -155,6 +183,7 @@ export function recordTypeChanges(
             Object.freeze({
               ...change("key_adopts_records", now.key, adopted, true, undefined, mismatched.count),
               mismatchRecordIds: Object.freeze([...mismatched.ids]),
+              mismatchCount: mismatched.count,
             }),
           );
         }
@@ -445,6 +474,8 @@ function message(
         ? "No record is affected."
         : `${agree(count, what)}. ${after}`;
   switch (code) {
+    case "unverified":
+      return `The record type ${key} wasn't checked against the stored type or records, so its key or kind may already differ from what is stored, and saving could strand every record of it. Confirm first.`;
     case "key_changed":
       return `The record type ${key} gets the new key ${shown(text)}. ${some(
         "name the old key",

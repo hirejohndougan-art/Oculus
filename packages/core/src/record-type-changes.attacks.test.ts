@@ -1,4 +1,4 @@
-// Attacks on record type changes (T-013a, D-053a): a record type edit must
+// Attacks on record type changes (T-013a, D-053): a record type edit must
 // not strand records unseen, another organization's data must never show in
 // a message, and hostile input must be refused without throwing.
 import { describe, expect, it } from "vitest";
@@ -77,6 +77,16 @@ describe("other organizations' data", () => {
     expect(text(r)).not.toContain("secret");
   });
 
+  it("another organization's malformed new type gets only mixed_organizations", () => {
+    const bad = { ...THEIRS, label: "", secretProperty: "secret value", kind: "secret-kind" };
+    const r = recordTypeChanges(ORAL, bad);
+    expect(codes(r)).toEqual(["mixed_organizations"]);
+    expect(text(r)).not.toContain("secret");
+    const noOrg: Record<string, unknown> = { ...ORAL, secretProperty: 1 };
+    delete noOrg.organizationId;
+    expect(codes(recordTypeChanges(ORAL, noOrg))).toEqual(["mixed_organizations"]);
+  });
+
   it("another organization's type list can't reveal which keys it holds", () => {
     // Renaming onto a key the other organization has: no key_taken.
     const r = recordTypeChanges(
@@ -113,6 +123,30 @@ describe("other organizations' data", () => {
     );
     expect(codes(r)).toEqual(["mixed_organizations"]);
     expect(text(r)).not.toContain(B);
+  });
+});
+
+describe("a stale or forged old type", () => {
+  it("without existing, an edit that looks like nothing still needs confirmation", () => {
+    // Stored kind is digital_asset; the caller claims the old kind was object
+    // already, so the two versions given look the same.
+    const claimed = { ...ORAL, kind: "object" };
+    const r = ok(recordTypeChanges(claimed, { ...claimed }));
+    expect(r.recordsChecked).toBe(false);
+    expect(r.changes.map((c) => c.code)).toEqual(["unverified"]);
+    expect(r.needsConfirmation).toBe(true);
+    expect(r.changes[0]?.message).toContain("wasn't checked against the stored type");
+  });
+
+  it("with existing, the same claim is refused", () => {
+    const claimed = { ...ORAL, kind: "object" };
+    expect(codes(recordTypeChanges(claimed, { ...claimed }, use()))).toEqual(["type_not_listed"]);
+  });
+
+  it("with existing, an unchanged type needs no confirmation and isn't unverified", () => {
+    const r = ok(recordTypeChanges(ORAL, { ...ORAL }, use()));
+    expect(r.changes).toEqual([]);
+    expect(r.needsConfirmation).toBe(false);
   });
 });
 
@@ -185,6 +219,26 @@ describe("oversized lists", () => {
     });
     expect(codes(recordTypeDeletion(ORAL, use([], types)))).toEqual(["too_many"]);
     expect(reads).toBe(0);
+  });
+
+  it("counts every mismatched adopted record beyond the listed IDs", () => {
+    const left = Array.from({ length: MAX_LISTED_RECORDS + 3 }, () => ({
+      ...record(newRecordId(), "interview"),
+      kind: "object",
+      mediaType: undefined,
+    })).map((r) => {
+      const copy: Record<string, unknown> = { ...r };
+      delete copy.mediaType;
+      return copy;
+    });
+    const r = ok(recordTypeChanges(ORAL, { ...ORAL, key: "interview" }, use(left)));
+    const adopt = r.changes.find((c) => c.code === "key_adopts_records");
+    expect(adopt?.recordCount).toBe(MAX_LISTED_RECORDS + 3);
+    expect(adopt?.mismatchRecordIds?.length).toBe(MAX_LISTED_RECORDS);
+    expect(adopt?.mismatchCount).toBe(MAX_LISTED_RECORDS + 3);
+    expect(adopt?.message).toContain(
+      `${String(MAX_LISTED_RECORDS + 3)} records are of another kind`,
+    );
   });
 
   it(`lists at most MAX_LISTED_RECORDS IDs but counts every record`, () => {

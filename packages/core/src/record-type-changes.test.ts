@@ -1,4 +1,4 @@
-// T-013a: record type edits and deletions list the records they strand (D-037, D-053a).
+// T-013a: record type edits and deletions list the records they strand (D-037, D-053).
 import { describe, expect, it } from "vitest";
 import {
   RECORD_TYPE_CHANGE_CODES,
@@ -127,6 +127,7 @@ describe("recordTypeChanges", () => {
     expect(adopt?.type).toBe("interview");
     expect(adopt?.recordCount).toBe(1);
     expect(adopt?.mismatchRecordIds).toEqual([]);
+    expect(adopt?.mismatchCount).toBe(0);
     expect(adopt?.needsConfirmation).toBe(true);
     expect(adopt?.message).toMatch(/^1 record already names the key "interview"/);
   });
@@ -139,6 +140,7 @@ describe("recordTypeChanges", () => {
     const r = ok(recordTypeChanges(ORAL, { ...ORAL, key: "interview" }, use(left)));
     const adopt = r.changes.find((c) => c.code === "key_adopts_records");
     expect(adopt?.mismatchRecordIds).toEqual(["6c4d5e6f-7a8b-4c9d-8e1f-2a3b4c5d6e7f"]);
+    expect(adopt?.mismatchCount).toBe(1);
     expect(adopt?.message).toContain("1 record is of another kind");
   });
 
@@ -171,12 +173,13 @@ describe("recordTypeChanges", () => {
     const r = ok(recordTypeChanges(ORAL, { ...ORAL, key: "interview", kind: "object" }));
     expect(r.recordsChecked).toBe(false);
     expect(r.changes.map((c) => c.code)).toEqual([
+      "unverified",
       "key_changed",
       "key_adopts_records",
       "kind_changed",
     ]);
     expect(r.changes.every((c) => c.needsConfirmation)).toBe(true);
-    expect(r.changes[0]?.message).toContain("Records weren't checked");
+    expect(r.changes[1]?.message).toContain("Records weren't checked");
   });
 
   it("records without a type are ignored", () => {
