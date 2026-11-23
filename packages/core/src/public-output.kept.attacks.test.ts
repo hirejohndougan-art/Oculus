@@ -21,6 +21,7 @@ import {
   ORG,
   RIGHTS_ENTRY,
   TPL,
+  noAccessions,
   record,
   template,
 } from "./public-output.fixtures.js";
@@ -183,5 +184,71 @@ describe("a kept view published without the catalog as it is now (S-010, D-054)"
     const result = publish(view, { records: [item], templateFor: () => structuredClone(TPL) });
     if (!result.ok) throw new Error(JSON.stringify(result.issues));
     expect(result.value.dublinCore.creator).toEqual(["Public creator"]);
+  });
+
+  it("refuses a templateFor that now returns a Proxy or an invalid template", () => {
+    const item = record("archival_unit", "Item", { rights: { uri: CNE }, creator: "SECRET-c" });
+    const view = keep(item.id, [item], () => TPL);
+    for (const given of [new Proxy(TPL, {}), { key: "out" }, { ...TPL, fields: "SECRET" }]) {
+      const result = publish(view, { records: [item], templateFor: () => given });
+      expect(codes(result)).toEqual(["template_changed"]);
+      expect(JSON.stringify(result)).not.toContain("SECRET");
+    }
+  });
+
+  it("refuses records that list the record twice", () => {
+    const item = record("archival_unit", "Item", { rights: { uri: CNE }, creator: "SECRET-c" });
+    const view = keep(item.id, [item], () => TPL);
+    for (const twice of [
+      [item, item],
+      [item, { ...item, title: "SECRET-copy" }],
+    ]) {
+      const result = publish(view, { records: twice, templateFor: () => TPL });
+      expect(codes(result)).toEqual(["record_changed"]);
+      expect(JSON.stringify(result)).not.toContain("SECRET");
+    }
+  });
+
+  it("reports records it can't use as invalid_options, before any deed check", () => {
+    const object = record("object", "Vase", { rights: { uri: CNE } });
+    const asset = record(
+      "digital_asset",
+      "Scan",
+      { rights: { uri: CNE } },
+      { represents: object.id },
+    );
+    const view = keep(asset.id, [asset, object], () => TPL);
+    for (const records of [null, {}, "records", new Proxy([asset, object], {})]) {
+      const result = publish(view, { records, templateFor: () => TPL });
+      expect(codes(result)).toEqual(["invalid_options"]);
+      expect(result.ok ? [] : result.issues[0]?.path).toEqual(["records"]);
+    }
+  });
+
+  it("reads one snapshot of a records list: a templateFor that edits the list changes nothing", () => {
+    const object = record("object", "Vase", { rights: { uri: CNE } });
+    const asset = record(
+      "digital_asset",
+      "Scan",
+      { rights: { uri: CNE } },
+      { represents: object.id },
+    );
+    const view = keep(asset.id, [asset, object], () => TPL);
+    const list: CatalogRecord[] = [asset, object];
+    const editing = () => {
+      // Drops what the asset represents once the ancestry has been checked.
+      list.length = 1;
+      return TPL;
+    };
+    const result = publicOutput(view, CREATOR_MAP, {
+      baseUrl: BASE,
+      accessions: noAccessions(ORG, [asset, object]),
+      published: [view.id],
+      checkers: CHECKERS,
+      records: list,
+      templateFor: editing,
+    });
+    expect(codes(result)).toEqual([]);
+    expect(list).toHaveLength(1);
   });
 });

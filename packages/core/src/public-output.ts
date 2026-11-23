@@ -158,6 +158,7 @@ import {
   effectivePublishIssues,
   isTemplateSource,
   linkDeedCheck,
+  recordIndex,
   templateFromSource,
   type EffectiveRecord,
   type PublicRecord,
@@ -249,7 +250,10 @@ export interface PublishOptions {
    * record removed, an ancestor's value changed or emptied, or a record
    * moved to another parent or level would otherwise still publish the old
    * values (D-021). Links to objects, archival units and digital assets are
-   * deed-checked in it too (D-043, D-045).
+   * deed-checked in it too (D-043, D-045). A list is validated and indexed
+   * once per call and every check reads that one index; pass a lookup from
+   * `indexRecords`, made at publish time, to index a large set only once
+   * for many records.
    */
   readonly records: RecordLookup | readonly CatalogRecord[];
   /**
@@ -513,14 +517,10 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
   }
   // The effective record the view was made from, from the mark beside it.
   const effective = origin.effective as EffectiveRecord;
-  // The deed check fails closed without the register (D-043).
-  const blocked = effectivePublishIssues(effective, accessions === undefined ? {} : { accessions });
-  if (blocked.length > 0) throw new OutputError(fixedFieldMessages(blocked, PUBLISH_CHECK_MESSAGE));
-  // What a digital asset shows is found again in the records as they are now.
-  if (effective.record.kind === "digital_asset") {
-    const now = deedIssuesNow(effective, accessions, currentRepresented(effective.record, records));
-    if (now.length > 0) throw new OutputError(fixedFieldMessages(now, PUBLISH_CHECK_MESSAGE));
-  }
+  // The records as they are now, indexed once: every check below reads this
+  // one snapshot, so nothing (a template lookup included) can change what a
+  // later check sees.
+  const index = indexOnce(records);
   const template = origin.template;
   // Checked again at the boundary: every template the view was built with is
   // the one its record names (D-029).
@@ -535,9 +535,18 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
     }
   }
   // Fail closed (D-054): nothing says whether this view was kept from
-  // earlier, so it is always checked against the records and templates now.
-  const chain = sameAncestry(records, origin.chain);
+  // earlier, so it is always checked against the records and templates now,
+  // before the deed checks, so unusable options are reported as such.
+  const chain = sameAncestry(index, origin.chain);
   sameChainTemplates(templateFor, chain);
+  // The deed check fails closed without the register (D-043).
+  const blocked = effectivePublishIssues(effective, accessions === undefined ? {} : { accessions });
+  if (blocked.length > 0) throw new OutputError(fixedFieldMessages(blocked, PUBLISH_CHECK_MESSAGE));
+  // What a digital asset shows is found again in the records as they are now.
+  if (effective.record.kind === "digital_asset") {
+    const now = deedIssuesNow(effective, accessions, currentRepresented(effective.record, index));
+    if (now.length > 0) throw new OutputError(fixedFieldMessages(now, PUBLISH_CHECK_MESSAGE));
+  }
   const checked = validateDublinCoreMapping(mapping, template);
   if (!checked.ok) throw new OutputError(checked.issues);
   if (
@@ -596,7 +605,7 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
   const terms = new Map<DublinCoreTerm, OutValue[]>();
   terms.set("title", [outValue(safeText(view.title, ["title"], budget))]);
   // Links are deed-checked against the records as they are now (D-043).
-  const deedClears = linkDeedCheck(accessions, records, organizationId);
+  const deedClears = linkDeedCheck(accessions, index, organizationId);
   const linkable = (def: FieldDefinition, id: RecordId): boolean => {
     // Never the record itself, and only a published record of this
     // organization, of a kind the field allows (D-016, D-030, D-039).
@@ -605,8 +614,8 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
     if (kind === undefined || !linkKindsOf(def).includes(kind)) return false;
     // A record a deed holds back, or one above it or that it shows, is
     // treated as unpublished (D-043), and so is one the register or the
-    // current records can't vouch for: without `records`, an object,
-    // archival unit or digital asset is never linked.
+    // current records can't vouch for: an object, archival unit or digital
+    // asset not found in them is never linked.
     return deedClears(id, kind);
   };
   // A place value's name shows only when its place record, if it names one,
@@ -699,6 +708,26 @@ function sameChainTemplates(
 }
 
 /**
+ * `records` as one index from `indexRecords` (a list is indexed once here).
+ * A set mixing organizations is refused as such; anything else that can't be
+ * indexed is `invalid_options`.
+ */
+function indexOnce(records: unknown): RecordLookup {
+  const indexed = recordIndex(records);
+  if (indexed.ok) return indexed.value;
+  const problem = indexed.issues[0];
+  if (problem?.code === "mixed_organizations") {
+    // Each organization is kept separate (D-019, D-030): never filtered.
+    fail(["records"], problem.code, problem.message);
+  }
+  fail(
+    ["records"],
+    "invalid_options",
+    "The records option must be a list of records or a lookup from indexRecords.",
+  );
+}
+
+/**
  * The record's ancestry as it is in `records` now, each step with the template
  * the view used for it. Refused unless it is the same records, in the same
  * order, with the same stored content (compared as validated data, with
@@ -706,7 +735,7 @@ function sameChainTemplates(
  * record by ID only; the messages never quote titles or values.
  */
 function sameAncestry(
-  records: unknown,
+  records: RecordLookup,
   chain: readonly { readonly record: CatalogRecord; readonly template: FieldTemplate }[],
 ): readonly { readonly record: CatalogRecord; readonly template: FieldTemplate }[] {
   const first = chain[0];

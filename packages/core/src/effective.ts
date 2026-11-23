@@ -484,6 +484,19 @@ export function currentRepresented(
 }
 
 /**
+ * For `public-output.ts` only (not exported from the package): `records` as
+ * one index, so every later check reads the same snapshot: a lookup from
+ * `indexRecords` as it is, or a list indexed (and validated) once now. Fails
+ * with the issue `indexRecords` gives. Never throws.
+ */
+export function recordIndex(records: unknown): Validated<RecordLookup> {
+  if (typeof records === "object" && records !== null && LOOKUPS.has(records)) {
+    return { ok: true, value: records as RecordLookup };
+  }
+  return indexRecords(records);
+}
+
+/**
  * For `public-output.ts` only (not exported from the package): the record and
  * its ancestors as they are in `records` now, the record first, found exactly
  * as `effectiveRecord` finds them (a list or a lookup from `indexRecords`).
@@ -1223,8 +1236,9 @@ export function deedIssuesNow(
  * function it returns says whether a link to `id` (whose kind, as the link
  * checker saw it, is `kind`) may go out live as far as deeds go. A target of
  * an accessioned kind, as the checker or the records now have it, may be
- * linked only when `records` (a list or a lookup from `indexRecords`) is
- * given and the target, its current ancestry and, for a digital asset, what
+ * linked only when the target, found in `records` (the records as they are
+ * now; `publicOutput` passes the one lookup from `indexRecords` it uses for
+ * every check), its current ancestry and, for a digital asset, what
  * it represents with that record's ancestry (found exactly as the record's
  * own check finds them, with the same loop and hop rules) are all known to
  * `accessions` (a register of `organizationId`) and none is held back.
