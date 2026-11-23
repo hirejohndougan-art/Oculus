@@ -1,6 +1,6 @@
 // `npm run gate`: every check in docs/AUTOPILOT.md "The gate", in order.
 // Stops at the first failure.
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mkdirSync, rmSync } from "node:fs";
 import { findPostgresBin, startTestDatabase } from "./test-database.mjs";
 
@@ -30,9 +30,12 @@ const steps = [
 ];
 
 // The database the tests use (D-049): OCULUS_TEST_DATABASE_URL if set (CI),
-// otherwise a throwaway server started just for the test step and always
-// stopped and deleted afterwards, even on failure or Ctrl-C.
+// otherwise a throwaway server started just for the test step and stopped and
+// deleted afterwards, even on failure. Steps run as async child processes, so a
+// SIGINT, SIGTERM or SIGHUP to the gate is handled at once: the running step is
+// stopped, then the server.
 let testDatabase;
+let child;
 const stopTestDatabase = () => {
   testDatabase?.stop();
   testDatabase = undefined;
@@ -40,6 +43,15 @@ const stopTestDatabase = () => {
 process.on("exit", stopTestDatabase);
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
   process.on(signal, () => {
+    console.error(`\nGATE FAIL: stopped by ${signal}`);
+    // Each step runs in its own process group, so this reaches npx's children too.
+    if (child?.pid !== undefined) {
+      try {
+        process.kill(-child.pid, "SIGTERM");
+      } catch {
+        // The step had already ended.
+      }
+    }
     stopTestDatabase();
     process.exit(1);
   });
@@ -60,19 +72,33 @@ function testEnvironment() {
   return { ...process.env, OCULUS_TEST_DATABASE_URL: testDatabase.url };
 }
 
+function runStep(cmd, args, env) {
+  return new Promise((resolve) => {
+    child = spawn(cmd, args, { stdio: "inherit", env, detached: true });
+    child.on("error", (error) => {
+      console.error(error.message);
+      resolve(1);
+    });
+    child.on("close", (code) => {
+      child = undefined;
+      resolve(code ?? 1);
+    });
+  });
+}
+
 for (const [name, cmd, args] of steps) {
   console.log(`\n=== ${name} ===`);
-  let result;
+  let status;
   try {
     const env = name.startsWith("Tests") ? testEnvironment() : process.env;
-    result = spawnSync(cmd, args, { stdio: "inherit", env });
+    status = await runStep(cmd, args, env);
   } catch (error) {
     console.error(error instanceof Error ? error.message : error);
-    result = { status: 1 };
+    status = 1;
   } finally {
     stopTestDatabase();
   }
-  if (result.status !== 0) {
+  if (status !== 0) {
     console.error(`\nGATE FAIL at: ${name}`);
     process.exit(1);
   }
