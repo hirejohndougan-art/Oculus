@@ -11,6 +11,7 @@ const PROBES = [
   "lint-probe/*.cts",
   "lint-probe/*.tsx",
   "packages/db/src/lint-probe.ts",
+  "scripts/lint-probe.ts",
 ];
 
 const eslint = new ESLint({
@@ -52,6 +53,9 @@ describe("pg stays inside packages/db", () => {
   it("refuses static imports and re-exports of the driver outside packages/db", async () => {
     for (const code of imports) {
       expect(await problems(code, OUTSIDE), code).toContain("no-restricted-imports");
+      expect(await problems(code, "scripts/lint-probe.ts"), code).toContain(
+        "no-restricted-imports",
+      );
     }
   });
 
@@ -117,6 +121,18 @@ describe(".query() only in client.ts, and sql only as a tag", () => {
       "no-restricted-syntax",
     ]);
     expect(await problems(queries, CLIENT)).toEqual([]);
+  });
+
+  it("refuses .query() with a computed name in single quotes, and with a template literal", async () => {
+    const declare =
+      "declare const client: { query(s: string): void };\ndeclare const pool: { query(s: string): void };\ndeclare const x: string;\n";
+    for (const call of ["client['query'](x);", "pool.query(`SELECT ${x}`);"]) {
+      expect(await problems(declare + call, OUTSIDE), call).toEqual(["no-restricted-syntax"]);
+      expect(await problems(declare + call, "scripts/lint-probe.ts"), call).toEqual([
+        "no-restricted-syntax",
+      ]);
+      expect(await problems(declare + call, CLIENT), call).toEqual([]);
+    }
   });
 
   it("refuses calling sql as a function, even in client.ts", async () => {
