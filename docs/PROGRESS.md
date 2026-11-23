@@ -2,6 +2,15 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-23 12:40 CT — manual (John: "do a long building") — S-009a, S-011, S-011a, T-019b1, U-003, T-020, T-021, T-022, T-023
+- Result: done (four branches built in parallel worktrees, reviewed, merged into one integration branch; gate on the result)
+- What changed: **S-009a** identifier type lists, accession registers and template registries check organization before validating, and `validateIdentifierTypes` gives only organization issues for a mixed list, so no message names another organization's keys. **S-011** (D-045, John) the public view holds no record links; `publicOutput` names a link only when it may, otherwise nothing at all. **S-011a** (D-048, John) a place name shows even when its place record isn't public, but only when the organization's own place checker vouches for it. **T-019b1** (D-047) Dublin Core mappings belong to an organization; built-in mappings are presets. **U-003** `templateChanges` reads `templateKey` as an own property; blowup tests assert process CPU time, so a busy machine no longer fails them. **T-020 to T-023** Phase 2 decisions: PostgreSQL 15–19 with a throwaway test database (D-049), `pg` with hand-written SQL and plain `.sql` migrations (D-050), Fastify 5 (D-051, John), scrypt passwords, two-step sign-in required for all staff and 4-hour idle sessions (D-052, John).
+- Decisions: D-047, D-048 (John), D-049, D-050, D-051 (John), D-052 (John)
+- Review: every branch had an independent review. S-009a: round 1 found the leak still open in `validateIdentifierTypes` and `makeIdentifierChecker`; round 2 found non-object entries skipped; both fixed with attack tests (S-009b added for lists wholly owned by another organization). S-011: round 1 found a record link left in a field changed to `place` published a donor's label; fixed (D-048 rule); round 2 safe (S-011c added). U-003: the first version timed only the main thread, 25–70% looser than wall clock; switched to process CPU time. T-019b1: safe (wording fixes). Decision drafts were researched by separate agents; John chose Fastify, required two-step sign-in and a 4-hour idle limit.
+- Note: builders couldn't start their own reviewers; the reviews were run from the main session. `git stash` is shared between worktrees: builders now save patches to /tmp instead.
+- Gate: PASS · tests_passing 2530 (was 2502) · npm audit clean
+- Next: T-013a and T-016a (built, in review), T-024 (building); then S-010, S-007, T-015a, T-018a, S-009b, S-011c, T-022a
+
 ## 2026-11-23 10:55 CT — manual (John: "continue") — S-009 Identifier type creation reveals another organization's keys
 - Result: done
 - What changed: `readUse` in `identifier-type-changes.ts` checks `existing.identifierTypes`' organization before looking the key up, so `identifierTypeCreation`, `identifierTypeDeletion` and `identifierTypeChanges` give the same `mixed_organizations` answer whether or not another organization's list holds the key. Attack test in `identifier-type-changes.attacks.test.ts` (fails without the fix).

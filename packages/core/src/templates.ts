@@ -41,8 +41,8 @@
  * - `record_link`: `{ recordId, label }`, a link to another record of the
  *   same organization, such as a creator on the Authorities list (an agent
  *   record) or a related record (T-015, D-039). `label` is the name this
- *   record shows for it, and the only part published when the linked record
- *   isn't. A field's `recordKinds` may limit the kinds it links to (left
+ *   record shows staff for it; publicly a link shows only when the linked
+ *   record may be named, and otherwise nothing at all (D-045). A field's `recordKinds` may limit the kinds it links to (left
  *   out: any kind).
  *
  * Only the structure of the last six is checked here. Whether a term is in

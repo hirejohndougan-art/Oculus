@@ -180,11 +180,12 @@ export function effectiveOf(
   records: readonly CatalogRecord[],
   id: RecordId,
   tpl: FieldTemplate = TPL,
+  checkers: Record<string, unknown> = CHECKERS,
 ): EffectiveRecord {
   // With the identifier checker, so public-type numbers reach the view
   // (D-022), and the records' identifiers, which hold them (D-038).
   const result = effectiveRecord(id, records, () => tpl, {
-    checkers: CHECKERS,
+    checkers: checkers,
     identifiers: identifiersFor(records),
   });
   if (!result.ok) throw new Error(JSON.stringify(result.issues));
@@ -202,8 +203,9 @@ export function viewOf(
   records: readonly CatalogRecord[],
   id: RecordId,
   tpl: FieldTemplate = TPL,
+  checkers: Record<string, unknown> = CHECKERS,
 ): PublicRecord {
-  const view = publicView(effectiveOf(records, id, tpl));
+  const view = publicView(effectiveOf(records, id, tpl, checkers));
   if (view === undefined) throw new Error("no public view");
   VIEW_IDENTIFIERS.set(view, identifiersFor(records));
   return view;
@@ -233,11 +235,19 @@ export const RIGHTS_ENTRY = Object.freeze({ field: "rights", term: "rights" });
  * An organization's accession register with no accessions, made from
  * `records` (D-043): it knows those records and holds none back.
  */
+/** The organization's day the fixtures' registers are made on (invented). */
+export const TODAY = "2026-11-23";
+
 export function noAccessions(
   organizationId: OrganizationId,
   records: readonly CatalogRecord[] = [],
 ): AccessionRegister {
-  const made = indexAccessions(organizationId, { accessions: [], records, identifierTypes: [] });
+  const made = indexAccessions(organizationId, {
+    accessions: [],
+    records,
+    identifierTypes: [],
+    today: TODAY,
+  });
   if (!made.ok) throw new Error(JSON.stringify(made.issues));
   return made.value;
 }

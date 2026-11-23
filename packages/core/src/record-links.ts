@@ -1,5 +1,5 @@
 /**
- * Links between records (roadmap T-015, decision D-039).
+ * Links between records (roadmap T-015, decisions D-039 and D-045).
  *
  * A `record_link` field (templates.ts) holds `{ recordId, label }`: a link
  * from one record to another of the same organization, such as an item's
@@ -27,12 +27,43 @@
  * whether an ID belongs to another organization: an ID that isn't this
  * organization's is "not found", whatever it is.
  *
+ * The checker belongs to the organization of the set it was made from, read
+ * from every entry, valid or not, or to the `organizationId` given for an
+ * empty set (records of another organization than the one given are
+ * refused). One made from an empty set with no organization belongs to
+ * none: it refuses every value that names a record (`no_organization_checker`;
+ * a place with only a name needs no record), and nothing
+ * that accepts a checker trusts it (T-015a review).
+ *
  * The checker holds a snapshot of each record's ID, kind and organization
  * only, taken when it is made: make it again after records are added,
  * removed or changed kind. `publicOutput` reads the same snapshot (through
  * `linkTargetKind`) to decide whether a link may name the record it points
  * at: only one made by this function, for the record's own organization,
- * can; with any other checker, links go out as their labels alone.
+ * can.
+ *
+ * **Public sites show nothing of a link they can't follow** (D-045). A
+ * `record_link` whose record is unpublished, held back by a deed (D-043),
+ * another organization's, or can't be vouched for (any other checker) puts
+ * nothing in public output: no ID, no label, no placeholder, since a label
+ * copied from the record (a donor's name, a private item's title) would
+ * reveal it. The public view (`publicView`) holds no `record_link` values
+ * at all. Staff views (the effective record) keep every link.
+ *
+ * **A place value naming a place record shows its name only when vouched
+ * for** (D-048): the checker given as `checkers.place` (to `effectiveRecord`
+ * and to `publicOutput`) must be one made here, for the record's own
+ * organization, holding that record as a place. Then the name (and gazetteer
+ * URI) is shown even when the place record isn't published, never its ID or
+ * a link. Otherwise the whole value is left out of the public view and
+ * output: it may be another kind of value, such as a record link's label,
+ * left in a field a template edit made a place.
+ *
+ * A template edit that narrows a field's `recordKinds` is reported by
+ * `templateChanges` as `record_kind_removed` when given this checker
+ * (`options.linkChecker`); labels that no longer match the linked record's
+ * title are listed by `findStaleLinkLabels` (link-label-report.ts, staff
+ * only). Both are T-015a (D-055).
  *
  * Checkers never throw, and return frozen lists of problems whose paths are
  * relative to the value (`["recordId"]`).
@@ -40,21 +71,13 @@
 import { type Validated } from "./issues.js";
 import { RECORD_KINDS, type RecordKind } from "./records.js";
 import { isRecordId, type RecordId } from "./record-id.js";
-import { organizationIdOf, type OrganizationId } from "./organizations.js";
-import { recordsById } from "./effective.js";
+import { isOrganizationId, organizationIdOf, type OrganizationId } from "./organizations.js";
+import { recordSet } from "./effective.js";
 import type { FieldProblem, FieldValueChecker } from "./templates.js";
 import { isPlainObject } from "./issues.js";
+import { markLinkChecker } from "./record-link-brand.js";
 
-/** What `makeRecordLinkChecker` remembers about each checker it made. */
-interface MadeLinkChecker {
-  /** The organization of the records; undefined when made from an empty set. */
-  readonly organizationId: OrganizationId | undefined;
-  /** Each record's kind by ID, or undefined for an ID that can't be used. */
-  readonly kinds: ReadonlyMap<RecordId, RecordKind | undefined>;
-}
-
-/** Keyed by the checker itself, never by shape. */
-const MADE = new WeakMap<object, MadeLinkChecker>();
+export { isOtherOrganizationsLinkChecker, linkTargetKind } from "./record-link-brand.js";
 
 const NONE: readonly FieldProblem[] = Object.freeze([]);
 
@@ -91,17 +114,54 @@ function allowedKinds(field: unknown): readonly RecordKind[] | undefined {
  * `indexRecords`. A set that holds records of more than one organization, or
  * can't be read, makes no checker (the issue `indexRecords` gives). See the
  * module header for what it checks. Never throws.
+ *
+ * The checker's organization is the set's, read from every entry, valid or
+ * not, so a set of another organization's invalid records still makes that
+ * organization's checker. Give `organizationId` to say whose records these
+ * must be: a set of another organization is refused (`wrong_organization`,
+ * naming nothing), and an empty set then makes that organization's checker,
+ * which holds no records. A checker made from an empty set without
+ * `organizationId` belongs to no organization: it refuses every link, and
+ * nothing that accepts a checker trusts it for anything.
  */
-export function makeRecordLinkChecker(records: unknown): Validated<FieldValueChecker> {
-  const found = recordsById(records);
-  if (!found.ok) return found;
-  const kinds = new Map<RecordId, RecordKind | undefined>();
-  let organizationId: OrganizationId | undefined;
-  for (const [id, record] of found.value) {
-    kinds.set(id, record?.kind);
-    // The set is one organization's (indexRecords refuses a mixed one).
-    organizationId ??= record?.organizationId;
+export function makeRecordLinkChecker(
+  records: unknown,
+  organizationId?: unknown,
+): Validated<FieldValueChecker> {
+  if (organizationId !== undefined && !isOrganizationId(organizationId)) {
+    return {
+      ok: false,
+      issues: [
+        Object.freeze({
+          path: Object.freeze(["organizationId"]),
+          code: "invalid_organization",
+          message: "Give a valid organization ID.",
+        }),
+      ],
+    };
   }
+  const found = recordSet(records);
+  if (!found.ok) return found;
+  if (
+    organizationId !== undefined &&
+    found.value.organizationId !== undefined &&
+    found.value.organizationId !== organizationId
+  ) {
+    return {
+      ok: false,
+      issues: [
+        Object.freeze({
+          path: Object.freeze([]),
+          code: "wrong_organization",
+          message:
+            "These records belong to another organization, so they can't make this organization's record link checker.",
+        }),
+      ],
+    };
+  }
+  const owner: OrganizationId | undefined = found.value.organizationId ?? organizationId;
+  const kinds = new Map<RecordId, RecordKind | undefined>();
+  for (const [id, record] of found.value.byId) kinds.set(id, record?.kind);
 
   const checker: FieldValueChecker = (value, field, record) => {
     try {
@@ -109,8 +169,7 @@ export function makeRecordLinkChecker(records: unknown): Validated<FieldValueChe
       if (typeof (record as unknown) !== "object" || (record as unknown) === null) {
         return UNREADABLE;
       }
-      const owner = organizationIdOf(record);
-      if (organizationId !== undefined && owner !== organizationId) {
+      if (owner !== undefined && organizationIdOf(record) !== owner) {
         return problem(
           "wrong_organization_checker",
           "This record link checker was made from another organization's records, so it can't check this record's links.",
@@ -129,13 +188,21 @@ export function makeRecordLinkChecker(records: unknown): Validated<FieldValueChe
       const target = own(value, "recordId");
       // A place may name no place record; a record_link must name one.
       if (target === undefined && own(field, "kind") === "place") return NONE;
+      // A checker of no organization vouches for no record (a name-only
+      // place, above, needs none).
+      if (owner === undefined) {
+        return problem(
+          "no_organization_checker",
+          "This record link checker was made from no records and for no organization, so it can't check any link.",
+        );
+      }
       if (!isRecordId(target)) {
         return problem("invalid_id", "recordId must be a record ID.", ["recordId"]);
       }
       if (target === own(record, "id")) {
         return problem("self_link", "A record can't link to itself.", ["recordId"]);
       }
-      if (organizationId === undefined || !kinds.has(target)) {
+      if (!kinds.has(target)) {
         return problem(
           "unknown_record",
           "There is no record with this ID in this organization's records.",
@@ -162,39 +229,6 @@ export function makeRecordLinkChecker(records: unknown): Validated<FieldValueChe
       return UNREADABLE;
     }
   };
-  MADE.set(checker, Object.freeze({ organizationId, kinds }));
+  markLinkChecker(checker, owner, kinds);
   return { ok: true, value: checker };
-}
-
-/**
- * The kind of the record `recordId` names, when `checker` was made by
- * `makeRecordLinkChecker` from `organizationId`'s records and holds a usable
- * record with that ID; otherwise undefined (any other checker, another
- * organization's, an unknown or unusable ID). For `public-output.ts` only
- * (not exported from the package). Never throws.
- */
-export function linkTargetKind(
-  checker: unknown,
-  organizationId: unknown,
-  recordId: unknown,
-): RecordKind | undefined {
-  if (typeof checker !== "function" || !isRecordId(recordId)) return undefined;
-  const made = MADE.get(checker);
-  if (made?.organizationId === undefined || made.organizationId !== organizationId) {
-    return undefined;
-  }
-  return made.kinds.get(recordId);
-}
-
-/**
- * True for a checker `makeRecordLinkChecker` made from the records of an
- * organization other than `organizationId`. For `public-output.ts` only.
- */
-export function isOtherOrganizationsLinkChecker(
-  checker: unknown,
-  organizationId: unknown,
-): boolean {
-  if (typeof checker !== "function") return false;
-  const made = MADE.get(checker)?.organizationId;
-  return made !== undefined && made !== organizationId;
 }

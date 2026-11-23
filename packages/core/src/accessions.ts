@@ -16,7 +16,12 @@
  *   transferring body, as a record link `{ recordId, label }` (D-039);
  * - the day it was **received** (an EDTF day, `YYYY-MM-DD`, D-008), the
  *   acquisition **method**, a description of the **materials**, any
- *   **restrictions** the source asked for, and a staff note;
+ *   **restrictions** the source asked for, in their words, and a staff note;
+ * - an optional structured **access restriction** (T-016a, D-056, mockup
+ *   Log an accession): `{ kind: "closed_until", until }` (nothing from it is
+ *   published before the day `until`) or `{ kind: "staff_and_researchers" }`
+ *   (never on the public site). The free-text `restrictions` stay notes and
+ *   hold nothing back; "Other condition" in the mockup is notes only;
  * - the **deed of gift**: `missing`, `sent` (out for signature), `signed`
  *   (with the day, if known) or `not_needed` (a transfer, a purchase with a
  *   bill of sale, a find in the collection). A gift always needs one, so
@@ -35,15 +40,20 @@
  * a donor, a number, materials or restrictions.
  *
  * **The deed check.** A record is held back from publishing when an
- * accession whose deed is needed but not signed (`missing` or `sent`)
- * produced it, produced a unit it is filed below, or produced the record a
- * digital asset `represents`. `effectivePublishIssues` and `publicOutput`
+ * accession that holds produced it, produced a unit it is filed below, or
+ * produced the record a digital asset `represents`. An accession holds when
+ * its deed is needed but not signed (`missing` or `sent`), or when its access
+ * restriction is in force on the register's day (`today`, given by the
+ * caller: core never reads the clock). A `closed_until` restriction is in
+ * force while `today` is before `until`, so from `until` on it holds nothing;
+ * `staff_and_researchers` is always in force. `effectivePublishIssues` and `publicOutput`
  * take the register as `accessions` and refuse without it: for an object,
  * archival unit or digital asset, publishing without it is refused
  * (`accessions_unknown`), as is another organization's register
  * (`mixed_organizations`) or anything not made by `indexAccessions`
- * (`invalid_accessions`). Held back: `deed_not_signed`, whose message names
- * no donor, number or accession. The record, every record in its current
+ * (`invalid_accessions`). Held back: `deed_not_signed` or
+ * `access_restricted`, whose messages name no donor, number, accession,
+ * restriction or date. The record, every record in its current
  * ancestry and, for a digital asset, the record it represents with that
  * record's current ancestry must all be ones the register knows
  * (`accessions_out_of_date`), and none may be held back.
@@ -58,7 +68,8 @@
  * record changes. Caller lists are read once; Proxies, getters, holes and
  * prototype keys are refused. Nothing here throws on bad input.
  *
- * Messages never quote contact details, materials, restrictions or notes.
+ * Messages never quote contact details, materials, restrictions (free text
+ * or structured, nor a restriction's date) or notes.
  * Accession numbers are staff-only too: a public identifier type can't
  * number an accession (`public_type`).
  *
@@ -68,16 +79,21 @@
  * service layer (T-032, roles in T-041) must check that before calling.
  *
  * **Only as fresh as the register.** The deed check reads the holds the
- * register worked out from the accessions and records it was made with.
+ * register worked out from the accessions and records it was made with, on
+ * the day it was given. A register kept past that day still holds a
+ * restriction that has since ended (it errs on the side of holding); one
+ * given a day later than the real one would let a record out early, so
+ * `today` must be the organization's own calendar day, worked out by the
+ * caller in the organization's time zone.
  * Make the register at publish time, from the organization's records as
  * they are now, as T-034 will; a record the register doesn't know is
  * refused (`accessions_out_of_date`) rather than let through.
  */
 import { randomUUID } from "node:crypto";
 import { types } from "node:util";
-import { markDeedHolds } from "./accession-holds.js";
+import { markDeedHolds, type HoldReason } from "./accession-holds.js";
 import { daysInMonth } from "./edtf.js";
-import { recordsById } from "./effective.js";
+import { recordSet } from "./effective.js";
 import { identifierKey } from "./identifier-key.js";
 import { matchesIdentifierPattern, parseIdentifierPattern } from "./identifier-pattern.js";
 import {
@@ -125,6 +141,26 @@ export type DeedStatus = (typeof DEED_STATUSES)[number];
 /** Deed statuses that hold the accession's records back from publishing. */
 export const DEED_HOLD_STATUSES: readonly DeedStatus[] = Object.freeze(["missing", "sent"]);
 
+/** The kinds of structured access restriction (mockup Log an accession). */
+export const ACCESS_RESTRICTION_KINDS = ["closed_until", "staff_and_researchers"] as const;
+export type AccessRestrictionKind = (typeof ACCESS_RESTRICTION_KINDS)[number];
+
+/**
+ * A structured access restriction, which holds the accession's records back
+ * from publishing while it is in force. Staff-only, like the accession.
+ */
+export type AccessRestriction =
+  | {
+      /** Closed until a day: nothing is published before `until`. */
+      readonly kind: "closed_until";
+      /** The first day the records may be published, `YYYY-MM-DD`. */
+      readonly until: string;
+    }
+  | {
+      /** Staff and researchers only: never on the public site. */
+      readonly kind: "staff_and_researchers";
+    };
+
 /** The record kinds an accession can produce. Agents, places and events aren't accessioned. */
 export const ACCESSIONED_KINDS: readonly RecordKind[] = Object.freeze([
   "object",
@@ -158,8 +194,10 @@ export interface Accession {
   readonly method: AcquisitionMethod;
   /** What arrived, described as a whole. */
   readonly materials: string;
-  /** What the source asked for: closed for a time, no reproductions … */
+  /** What the source asked for, in their words. Notes only: holds nothing back. */
   readonly restrictions?: string;
+  /** A structured restriction that holds the records back while in force. */
+  readonly accessRestriction?: AccessRestriction;
   readonly deedStatus: DeedStatus;
   /** For a signed deed: the day it was signed, `YYYY-MM-DD`, if known. */
   readonly deedSignedOn?: string;
@@ -184,6 +222,8 @@ export interface AccessionRegister {
   readonly organizationId: OrganizationId;
   /** How many accessions. */
   readonly size: number;
+  /** The day (`YYYY-MM-DD`) restrictions were judged on: the `today` given. */
+  readonly heldAsOf: string;
 }
 
 /** What `indexAccessions` reads. */
@@ -195,6 +235,11 @@ export interface AccessionRegisterInput {
   readonly records: unknown;
   /** The organization's identifier types. */
   readonly identifierTypes: readonly IdentifierType[];
+  /**
+   * The organization's calendar day now, `YYYY-MM-DD`, in its own time zone:
+   * which restrictions are in force is judged on it. Required.
+   */
+  readonly today: string;
 }
 
 export const MAX_ACCESSIONS = 100_000;
@@ -213,7 +258,7 @@ const LINE_BREAKS = /[\t\n\r\u2028\u2029]/;
 
 const ACCESSION_LIMITS = {
   maxDepth: 3,
-  maxValues: 40 + 3 * MAX_ACCESSION_RECORDS,
+  maxValues: 45 + 3 * MAX_ACCESSION_RECORDS,
   maxStringLength: MAX_MATERIALS_LENGTH,
   maxKeyLength: 64,
   maxTotalChars: 20_000 + MAX_ACCESSION_RECORDS * (MAX_LINK_LABEL_LENGTH + 64),
@@ -235,6 +280,7 @@ const ACCESSION_KEYS: ReadonlySet<string> = new Set([
   "method",
   "materials",
   "restrictions",
+  "accessRestriction",
   "deedStatus",
   "deedSignedOn",
   "records",
@@ -253,6 +299,7 @@ const INPUT_KEYS: ReadonlySet<string> = new Set([
   "contacts",
   "records",
   "identifierTypes",
+  "today",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -320,6 +367,7 @@ export function validateAccession(input: unknown): Validated<Accession> {
       false,
       issues,
     );
+    if (d.accessRestriction !== undefined) checkRestriction(d.accessRestriction, issues);
     checkText(d.note, ["note"], "note", MAX_ACCESSION_NOTE_LENGTH, false, issues);
     const deed = d.deedStatus;
     if (!(DEED_STATUSES as readonly unknown[]).includes(deed)) {
@@ -423,8 +471,10 @@ interface RegisterData {
   readonly byNumber: ReadonlyMap<string, Accession>;
   /** Record → accessions that list it. */
   readonly byRecord: ReadonlyMap<RecordId, readonly Accession[]>;
-  /** Record → accessions holding it back (directly, by an ancestor, or by what it represents). */
-  readonly holds: ReadonlyMap<RecordId, readonly AccessionId[]>;
+  /** Record → accessions whose unsigned deed holds it back (directly, by an ancestor, or by what it represents). */
+  readonly deeds: ReadonlyMap<RecordId, readonly AccessionId[]>;
+  /** Record → accessions whose restriction, in force on the register's day, holds it back. */
+  readonly restricted: ReadonlyMap<RecordId, readonly AccessionId[]>;
   readonly contacts: ReadonlyMap<RecordId, DonorContact>;
   readonly types: ReadonlyMap<string, IdentifierType>;
 }
@@ -465,7 +515,7 @@ export function indexAccessions(
     }
     const given: unknown = input;
     if (types.isProxy(given) || !isPlainObject(given)) {
-      return refused([], "invalid_input", "Give { accessions, records, identifierTypes }.");
+      return refused([], "invalid_input", "Give { accessions, records, identifierTypes, today }.");
     }
     for (const key of Reflect.ownKeys(given)) {
       if (typeof key !== "string" || !INPUT_KEYS.has(key)) {
@@ -483,6 +533,15 @@ export function indexAccessions(
         return refused([key], "invalid_input", `${key} can't be a getter.`);
       }
       parts.set(key, slot?.value);
+    }
+    // The day restrictions are judged on comes from the caller, never the clock.
+    const today = parts.get("today");
+    if (!isDay(today)) {
+      return refused(
+        ["today"],
+        "invalid_today",
+        "Give today's date in the organization's time zone, written YYYY-MM-DD, as today.",
+      );
     }
     const mixed = (path: readonly (string | number)[]): Validated<AccessionRegister> => ({
       ok: false,
@@ -521,19 +580,25 @@ export function indexAccessions(
     for (const t of typesRead.value) if (!typeByKey.has(t.key)) typeByKey.set(t.key, t);
 
     // Records: one snapshot, read once, this organization's only.
-    const found = recordsById(parts.get("records"));
+    const found = recordSet(parts.get("records"));
     if (!found.ok) {
       if (found.issues.some((i) => i.code === "mixed_organizations")) return mixed(["records"]);
       return prefixed(["records"], found.issues);
     }
+    // The set's organization is read from every entry, valid or not, so
+    // another organization's invalid records are refused too.
+    if (found.value.organizationId !== undefined && found.value.organizationId !== organizationId) {
+      return mixed(["records"]);
+    }
     const usable: CatalogRecord[] = [];
-    for (const record of found.value.values()) {
+    for (const record of found.value.byId.values()) {
       if (record === undefined) continue;
       if (record.organizationId !== organizationId) return mixed(["records"]);
       usable.push(record);
     }
-    // Made from the frozen copies the snapshot holds, never from the caller's list again.
-    const made = makeRecordLinkChecker(usable);
+    // Made from the frozen copies the snapshot holds, never from the caller's
+    // list again, and for this organization even when no record is valid.
+    const made = makeRecordLinkChecker(usable, organizationId);
     if (!made.ok) return prefixed(["records"], made.issues);
     const checker = made.value;
 
@@ -654,25 +719,43 @@ export function indexAccessions(
     });
     if (issues.count > 0) return { ok: false, issues: issues.items };
 
-    const holds = deedHolds(accessions, usable);
+    const deeds = heldBy(
+      accessions.filter((a) => DEED_HOLD_STATUSES.includes(a.deedStatus)),
+      usable,
+    );
+    const restricted = heldBy(
+      accessions.filter((a) => restrictionInForce(ownData(a, "accessRestriction"), today)),
+      usable,
+    );
     const frozenByRecord = new Map<RecordId, readonly Accession[]>();
     for (const [id, list] of byRecord) frozenByRecord.set(id, Object.freeze(list));
-    const register: AccessionRegister = Object.freeze({ organizationId, size: byId.size });
+    const register: AccessionRegister = Object.freeze({
+      organizationId,
+      size: byId.size,
+      heldAsOf: today,
+    });
     REGISTERS.set(register, {
       organizationId,
       byId,
       list: Object.freeze(accessions),
       byNumber,
       byRecord: frozenByRecord,
-      holds,
+      deeds,
+      restricted,
       contacts: contactsByAgent,
       types: typeByKey,
     });
     // Shared as lookups only, so the sets themselves can't be changed.
     const known = new Set(usable.map((r) => r.id));
+    const reasons = (id: RecordId): readonly HoldReason[] =>
+      Object.freeze([
+        ...(deeds.has(id) ? (["deed"] as const) : []),
+        ...(restricted.has(id) ? (["restriction"] as const) : []),
+      ]);
     markDeedHolds(register, {
       organizationId,
-      isHeld: (id) => holds.has(id),
+      isHeld: (id) => deeds.has(id) || restricted.has(id),
+      holdReasons: reasons,
       isKnown: (id) => known.has(id),
     });
     return { ok: true, value: register };
@@ -742,22 +825,35 @@ export function accessionsAwaitingDeeds(register: AccessionRegister): readonly A
 }
 
 /**
- * The accessions holding `recordId` back from publishing: those with a deed
- * needed but not signed that produced it, a unit it is filed below, or the
- * record it represents, as the records were when the register was made.
- * Empty when it isn't held back.
+ * The accessions holding `recordId` back from publishing by their deed:
+ * those with a deed needed but not signed that produced it, a unit it is
+ * filed below, or the record it represents, as the records were when the
+ * register was made. Empty when no deed holds it back.
  */
 export function deedHoldsOn(register: AccessionRegister, recordId: unknown): readonly Accession[] {
-  const data = dataOf(register);
-  if (data === undefined || !isRecordId(recordId)) return Object.freeze([]);
-  const ids = data.holds.get(recordId) ?? [];
-  return Object.freeze(ids.flatMap((id) => data.byId.get(id) ?? []));
+  return holdsIn(register, recordId, "deeds");
 }
 
-/** Every record held back by a deed, by ID, in no particular order. */
+/**
+ * The accessions holding `recordId` back by an access restriction in force
+ * on the register's day (`heldAsOf`), found as `deedHoldsOn` finds them.
+ * Empty when no restriction holds it back.
+ */
+export function restrictionHoldsOn(
+  register: AccessionRegister,
+  recordId: unknown,
+): readonly Accession[] {
+  return holdsIn(register, recordId, "restricted");
+}
+
+/**
+ * Every record held back, by a deed or by a restriction in force on the
+ * register's day, by ID, in no particular order.
+ */
 export function recordsHeldBack(register: AccessionRegister): readonly RecordId[] {
   const data = dataOf(register);
-  return Object.freeze(data === undefined ? [] : [...data.holds.keys()]);
+  if (data === undefined) return Object.freeze([]);
+  return Object.freeze([...new Set([...data.deeds.keys(), ...data.restricted.keys()])]);
 }
 
 /** The contact details for one source agent, or undefined. Staff with Donor relations only. */
@@ -815,10 +911,50 @@ export function nextAccessionNumber(
 // Internals
 
 /**
- * Record → the holding accessions, following each produced record down the
- * arrangement (`parentId`) and to the digital assets that represent it.
+ * True when `restriction` holds records back on `today` (both days checked
+ * `YYYY-MM-DD`, so compared as text): `closed_until` while `today` is before
+ * `until`, `staff_and_researchers` always, no restriction never.
  */
-function deedHolds(
+function restrictionInForce(restriction: AccessRestriction | undefined, today: string): boolean {
+  if (restriction === undefined) return false;
+  // Validated, so both are own properties; read as such all the same, and
+  // anything unexpected holds.
+  const own = (key: string): unknown =>
+    Object.prototype.hasOwnProperty.call(restriction, key)
+      ? (restriction as unknown as Record<string, unknown>)[key]
+      : undefined;
+  const kind = own("kind");
+  const until = own("until");
+  if (kind === "closed_until" && isDay(until)) return today < until;
+  return true;
+}
+
+/**
+ * `key` of `value` as an own data property, never inherited or behind a
+ * getter, so a polluted Object.prototype can't add one (D-056).
+ */
+function ownData<T extends object, K extends keyof T & string>(value: T, key: K): T[K] | undefined {
+  const slot = Object.getOwnPropertyDescriptor(value, key);
+  return slot !== undefined && "value" in slot ? (slot.value as T[K]) : undefined;
+}
+
+function holdsIn(
+  register: AccessionRegister,
+  recordId: unknown,
+  which: "deeds" | "restricted",
+): readonly Accession[] {
+  const data = dataOf(register);
+  if (data === undefined || !isRecordId(recordId)) return Object.freeze([]);
+  const ids = data[which].get(recordId) ?? [];
+  return Object.freeze(ids.flatMap((id) => data.byId.get(id) ?? []));
+}
+
+/**
+ * Record → the given (holding) accessions, following each produced record
+ * down the arrangement (`parentId`) and to the digital assets that represent
+ * it.
+ */
+function heldBy(
   accessions: readonly Accession[],
   records: readonly CatalogRecord[],
 ): ReadonlyMap<RecordId, readonly AccessionId[]> {
@@ -835,7 +971,6 @@ function deedHolds(
   }
   const holds = new Map<RecordId, AccessionId[]>();
   for (const a of accessions) {
-    if (!DEED_HOLD_STATUSES.includes(a.deedStatus)) continue;
     const seen = new Set<RecordId>();
     const queue: RecordId[] = a.records.map((l) => l.recordId);
     for (let id = queue.pop(); id !== undefined; id = queue.pop()) {
@@ -992,6 +1127,53 @@ function checkText(
   }
   const problem = textProblem(value);
   if (problem !== undefined) issues.add(path, "bad_characters", `The ${what} ${problem}.`);
+}
+
+function checkRestriction(value: JsonValue, issues: IssueList): void {
+  const path = ["accessRestriction"];
+  if (!isPlainObject(value)) {
+    issues.add(
+      path,
+      "invalid_restriction",
+      `An access restriction must be { kind } with kind one of: ${ACCESS_RESTRICTION_KINDS.join(", ")}.`,
+    );
+    return;
+  }
+  // Own properties only: an `until` on Object.prototype must never complete
+  // a restriction left without one.
+  const own = (key: string): JsonValue | undefined =>
+    Object.prototype.hasOwnProperty.call(value, key)
+      ? (value as Readonly<Record<string, JsonValue>>)[key]
+      : undefined;
+  const v = value as Readonly<Record<string, JsonValue>>;
+  const kind = own("kind");
+  const allowed = kind === "closed_until" ? ["kind", "until"] : ["kind"];
+  // Reported once, at the restriction itself: the path never carries the
+  // unknown key's text (D-056: restrictions are never quoted).
+  if (Object.keys(v).some((key) => !allowed.includes(key))) {
+    issues.add(
+      path,
+      "unknown_property",
+      kind === "closed_until"
+        ? "A closed-until restriction has only kind and until."
+        : "This access restriction has only kind.",
+    );
+  }
+  if (!(ACCESS_RESTRICTION_KINDS as readonly unknown[]).includes(kind)) {
+    issues.add(
+      [...path, "kind"],
+      "invalid_restriction",
+      `The restriction kind must be one of: ${ACCESS_RESTRICTION_KINDS.join(", ")}. Write any other condition in restrictions.`,
+    );
+    return;
+  }
+  if (kind === "closed_until" && !isDay(own("until"))) {
+    issues.add(
+      [...path, "until"],
+      "invalid_date",
+      "until must be the first day the records may be published, written YYYY-MM-DD.",
+    );
+  }
 }
 
 function checkOrganization(value: JsonValue | undefined, what: string, issues: IssueList): void {

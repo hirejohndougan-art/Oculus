@@ -91,17 +91,24 @@
  * (`identifier_not_held`), and without `options.identifiers` every public
  * identifier value is (`identifiers_unknown`). Either note refuses publishing.
  *
- * **Links to other records** (T-015, D-039). The public view holds a
- * `record_link` value as `{ label }` and a place as `{ label, uri? }`: never
- * the ID of the record linked to, which may be unpublished or (by mistake)
- * another organization's. Only `publicOutput` reads the ID, from the
- * effective record, and links it when it can prove the record is published
- * and the organization's own.
+ * **Links to other records** (T-015, D-039, D-045). The public view holds
+ * no `record_link` value at all, not even its label: the record linked to
+ * may be unpublished, held back by a deed or (by mistake) another
+ * organization's, and a label copied from it (a donor's name, a private
+ * item's title) would reveal it. A place is held as `{ label, uri? }`, never
+ * with the ID of a place record, and only when it names no place record or
+ * `options.checkers.place` (from `makeRecordLinkChecker`, for this
+ * organization) holds the one it names as a place (D-048); otherwise it is
+ * left out. Only `publicOutput` reads links, from the
+ * effective record, and puts out a link (its URL and label) only when it can
+ * prove the record is published, not held back and the organization's own;
+ * otherwise nothing of it. The effective record (staff) keeps every link.
  */
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import { RIGHTS_FIELD_KEY, rightsPublishIssues } from "./rights.js";
 import { markEffective, markPublicView } from "./effective-brand.js";
 import { deedHoldsOf } from "./accession-holds.js";
+import { placeNameMayShow } from "./record-link-brand.js";
 import { shown } from "./plain-data.js";
 import { isOtherOrganizationsChecker, publicIdentifierTypesOf } from "./field-checkers.js";
 import { types } from "node:util";
@@ -190,6 +197,10 @@ export interface PublicField {
  * The only part of an effective record that may be published: the entries
  * whose effective visibility is `public` and whose key is in the record's
  * template. No notes, no stored record, and no ancestors' IDs or titles.
+ * Public `record_link` entries are not in it at all (D-045), and a place
+ * value whose place record isn't vouched for is left out (D-048): public
+ * pages must take links to other records from `publicOutput`, which puts
+ * out only those that may be named.
  */
 export interface PublicRecord {
   readonly id: RecordId;
@@ -279,6 +290,11 @@ type Fetched =
 interface LookupState {
   /** Validated, frozen copies, by ID, or why the ID can't be used. Never changed after indexing. */
   readonly byId: ReadonlyMap<RecordId, Fetched>;
+  /**
+   * The organization of every entry, valid or not (buildLookup refuses an
+   * entry without a readable one); undefined only for an empty set.
+   */
+  readonly organizationId: OrganizationId | undefined;
 }
 
 /** Lookups made by `indexRecords`; anything else passed as one is refused. */
@@ -356,7 +372,7 @@ function buildLookup(records: unknown): RecordLookup {
     );
   }
   const lookup: RecordLookup = Object.freeze({ size: byId.size });
-  LOOKUPS.set(lookup, { byId });
+  LOOKUPS.set(lookup, { byId, organizationId: organization });
   return lookup;
 }
 
@@ -501,11 +517,26 @@ export function currentAncestry(
 export function recordsById(
   records: unknown,
 ): Validated<ReadonlyMap<RecordId, CatalogRecord | undefined>> {
+  const set = recordSet(records);
+  return set.ok ? { ok: true, value: set.value.byId } : set;
+}
+
+/**
+ * For other modules in this package (not exported from the package): like
+ * `recordsById`, with the organization of the set. That organization is
+ * read from every entry, valid or not (an entry without a readable one
+ * refuses the set), so a set of another organization's invalid records
+ * still has that organization. Undefined only for an empty set. Never throws.
+ */
+export function recordSet(records: unknown): Validated<{
+  readonly byId: ReadonlyMap<RecordId, CatalogRecord | undefined>;
+  readonly organizationId: OrganizationId | undefined;
+}> {
   try {
     const state = lookupFor(records);
-    const out = new Map<RecordId, CatalogRecord | undefined>();
-    for (const [id, got] of state.byId) out.set(id, got.ok ? got.record : undefined);
-    return { ok: true, value: out };
+    const byId = new Map<RecordId, CatalogRecord | undefined>();
+    for (const [id, got] of state.byId) byId.set(id, got.ok ? got.record : undefined);
+    return { ok: true, value: { byId, organizationId: state.organizationId } };
   } catch (error) {
     return failure(error);
   }
@@ -843,19 +874,38 @@ function compose(
     notes: Object.freeze(notes.map((n) => Object.freeze(n))),
     record: target,
   });
-  const shownEntries = entries
-    .filter((e) => e.visibility === "public" && e.inTemplate)
-    .map((e) =>
-      Object.freeze({
-        key: e.key,
-        label: e.label,
-        value:
-          e.key === RIGHTS_FIELD_KEY
-            ? withoutRightsNote(e.value)
-            : publicValue(e.value, own.byKey.get(e.key)?.kind),
-        own: e.own,
-      }),
-    );
+  const publicEntries = entries.filter((e) => e.visibility === "public" && e.inTemplate);
+  // A record link may point at a record that isn't published, is held back
+  // or isn't this organization's, which the view can't know: so it holds no
+  // record link at all, not even the label (D-045). `publicOutput` adds the
+  // links it can prove may be named, from the effective record.
+  const isLink = (e: { readonly key: string }): boolean =>
+    own.byKey.get(e.key)?.kind === "record_link";
+  // A place value naming a place record shows its name only when the
+  // organization's own place checker holds that record as a place (D-048).
+  const placeChecker = ownChecker(checkers, "place");
+  const shownPlaces = (value: FieldValue): FieldValue | undefined => {
+    const shows = (item: FieldValue): boolean =>
+      placeNameMayShow(item, placeChecker, target.organizationId, target.id);
+    if (!Array.isArray(value)) return shows(value) ? value : undefined;
+    const kept = value.filter(shows);
+    return kept.length === 0 ? undefined : Object.freeze(kept);
+  };
+  const shownEntries = publicEntries
+    .filter((e) => !isLink(e))
+    .flatMap((e) => {
+      const kind = own.byKey.get(e.key)?.kind;
+      const value = kind === "place" ? shownPlaces(e.value) : e.value;
+      if (value === undefined) return [];
+      return [
+        Object.freeze({
+          key: e.key,
+          label: e.label,
+          value: e.key === RIGHTS_FIELD_KEY ? withoutRightsNote(value) : publicValue(value, kind),
+          own: e.own,
+        }),
+      ];
+    });
   markEffective(effective);
   const view: PublicRecord = Object.freeze({
     id: target.id,
@@ -876,6 +926,7 @@ function compose(
         return Object.freeze({ record, template: used.template });
       }),
     ),
+    links: Object.freeze(publicEntries.filter(isLink).map((e) => e.key)),
     ...(target.kind === "archival_unit" ? { level: target.level } : {}),
   });
   return effective;
@@ -1056,8 +1107,9 @@ function publicValue(value: FieldValue, kind: FieldDefinition["kind"] | undefine
 }
 
 /**
- * A `record_link` or place value without its `recordId`: whether the record
+ * A place value (or anything else) without its `recordId`: whether the record
  * linked to may be named is for `publicOutput` to decide (D-016, D-039).
+ * `record_link` values never get here: the view leaves them out (D-045).
  * Anything that isn't a plain object is left as it is, for the publish check
  * to refuse.
  */
@@ -1110,8 +1162,10 @@ export function publicView(effective: EffectiveRecord): PublicRecord | undefined
  * refused (`accessions_unknown`), with anything else (`invalid_accessions`)
  * or another organization's register (`mixed_organizations`) too. A record
  * the register holds back, or whose ancestor or represented record it holds
- * back, is refused (`deed_not_signed`); the message names no donor,
- * accession or number. The record, its current ancestry and, for a
+ * back, is refused: `deed_not_signed` for an unsigned deed,
+ * `access_restricted` for an access restriction in force on the register's
+ * day (T-016a, D-056), both when both hold. The messages name no donor,
+ * accession, number, restriction or date. The record, its current ancestry and, for a
  * digital asset, the record it represents with that record's ancestry (from
  * the records `effectiveRecord` was given; `represented_record_unknown` when
  * they aren't there) must all be records the register knows
@@ -1295,13 +1349,34 @@ function deedIssues(
       "The accession register doesn't know this record, a record above it or the record it shows. Make the register again from the organization's records as they are now.",
     );
   }
-  if (ids.some((id) => holds.isHeld(id))) {
-    return refuse(
-      "deed_not_signed",
-      "This record came from an accession whose deed of gift isn't signed yet, so it is held back from the public site. Mark the deed as signed in Deeds once the signed copy is on file.",
+  // Why, never which accession, restriction or date (D-043, D-056).
+  const reasons = new Set(ids.flatMap((id) => holds.holdReasons(id)));
+  const found: Issue[] = [];
+  if (reasons.has("deed")) {
+    found.push(
+      issue(
+        ["accessions"],
+        "deed_not_signed",
+        "This record came from an accession whose deed of gift isn't signed yet, so it is held back from the public site. Mark the deed as signed in Deeds once the signed copy is on file.",
+      ),
     );
   }
-  return Object.freeze([]);
+  if (reasons.has("restriction")) {
+    found.push(
+      issue(
+        ["accessions"],
+        "access_restricted",
+        "This record came from an accession with an access restriction in force, so it is held back from the public site. See the accession's restrictions.",
+      ),
+    );
+  }
+  // Fails closed: held for a reason this check doesn't name is still held.
+  if (found.length === 0 && ids.some((id) => holds.isHeld(id))) {
+    found.push(
+      issue(["accessions"], "held_back", "This record is held back from the public site."),
+    );
+  }
+  return Object.freeze(found.map((f) => Object.freeze(f)));
 }
 
 /** The value the nearest ancestor gives for `field`, or undefined. */

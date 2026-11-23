@@ -30,6 +30,7 @@ import {
   OTHER,
   RECORDS,
   SECRET,
+  TODAY,
   TYPES,
   ACCESSION_TYPE,
   accession,
@@ -180,7 +181,12 @@ describe("a record whose deed is missing can't be published", () => {
     const list = [a];
     const records = [...RECORDS];
     const register = ok(
-      indexAccessions(ORG, { accessions: list as never, records, identifierTypes: TYPES }),
+      indexAccessions(ORG, {
+        accessions: list as never,
+        records,
+        identifierTypes: TYPES,
+        today: TODAY,
+      }),
     );
     a.deedStatus = "signed";
     list.length = 0;
@@ -198,6 +204,7 @@ describe("a record whose deed is missing can't be published", () => {
           accessions: [accession({ records: [{ recordId: donor.id, label: "Donor" }] })],
           records: RECORDS,
           identifierTypes: TYPES,
+          today: TODAY,
         }),
       ),
     ).toEqual(["wrong_record_kind"]);
@@ -260,7 +267,7 @@ describe("a scan can't publish what a deed holds back (T-016 review)", () => {
   });
 });
 
-describe("a link to a held record names only its label (T-016 review)", () => {
+describe("a link to a held record shows nothing, not even its label (T-016 review, D-045)", () => {
   it("even when the held record is in the published list", async () => {
     const { linkChecker, template, field, FIELDS } = await import("./public-output.fixtures.js");
     const tpl = template([
@@ -309,7 +316,8 @@ describe("a link to a held record names only its label (T-016 review)", () => {
     });
     const out = everything(run(held));
     expect(out).not.toContain(BASE + item.id);
-    expect(out).toContain("Held item");
+    expect(out).not.toContain("Held item");
+    expect(out).toContain("Free vase");
     expect(out).toContain(BASE + vase.id);
     // Once the deed is signed, both are links.
     const signed = registerOf(
@@ -391,8 +399,8 @@ describe("a link is deed-checked through its target's parents and what it shows 
       const out = page.publishWith(register, now);
       expect(out).not.toContain(BASE + item.id);
       expect(out).not.toContain(BASE + scan.id);
-      expect(out).toContain("Item label");
-      expect(out).toContain("Scan label");
+      expect(out).not.toContain("Item label");
+      expect(out).not.toContain("Scan label");
       expect(leaks(out)).toEqual([]);
     }
     // A record outside the fonds is a live link, but only with the records.
@@ -402,7 +410,7 @@ describe("a link is deed-checked through its target's parents and what it shows 
 
   it("not when the register was made without the record a digital asset shows", () => {
     const page = pageLinking([{ recordId: scan.id, label: "Scan label" }], RECORDS);
-    // A signed deed, so only the item the register doesn't know keeps the scan a label.
+    // A signed deed, so only the item the register doesn't know keeps the scan out.
     const without = registerOf([fondsDeed("signed")], {
       records: page.records.filter((r) => r.id !== item.id),
     });
@@ -428,7 +436,7 @@ describe("a link is deed-checked through its target's parents and what it shows 
     const now = page.records.map((r) => (r.id === unit.id ? moved : r));
     const out = page.publishWith(register, now);
     expect(out).not.toContain(BASE + unit.id);
-    expect(out).toContain("Unit label");
+    expect(out).not.toContain("Unit label");
     expect(leaks(out)).toEqual([]);
   });
 
@@ -443,7 +451,7 @@ describe("a link is deed-checked through its target's parents and what it shows 
     );
     const out = page.publishWith(undefined, page.records);
     expect(out).not.toContain(BASE + vase.id);
-    expect(out).toContain("Vase label");
+    expect(out).not.toContain("Vase label");
     expect(out).toContain(BASE + donor.id);
     // With a register made now, the vase is a link.
     const now = registerOf([], { records: page.records });
@@ -457,6 +465,7 @@ describe("accession numbers are staff-only", () => {
       accessions: [accession()],
       records: RECORDS,
       identifierTypes: [{ ...ACCESSION_TYPE, public: true }],
+      today: TODAY,
     });
     expect(codes(r)).toEqual(["public_type"]);
   });
@@ -492,6 +501,7 @@ describe("another organization's accessions are never used or read", () => {
         accessions: [],
         records: RECORDS,
         identifierTypes: TYPES,
+        today: TODAY,
         ...input,
       });
     const cases = [
@@ -536,6 +546,7 @@ describe("another organization's accessions are never used or read", () => {
       ],
       records: RECORDS,
       identifierTypes: TYPES,
+      today: TODAY,
     });
     expect(codes(r)).toEqual(["unknown_record", "unknown_record"]);
     expect(messages(r)).not.toContain("Their");
@@ -552,6 +563,7 @@ describe("another organization's accessions are never used or read", () => {
         accessions: [],
         records: [theirs, theirDonor],
         identifierTypes: [],
+        today: TODAY,
       }),
     );
     expect(donorContact(register, donor.id)).toBeUndefined();
@@ -598,11 +610,13 @@ describe("donor details never leak", () => {
         accessions: [accession({ number: { type: "accession_number", value: "2026-14" } })],
         records: RECORDS,
         identifierTypes: TYPES,
+        today: TODAY,
       }),
       indexAccessions(ORG, {
         accessions: [accession(), { ...accession(), number: accession().number }],
         records: RECORDS,
         identifierTypes: TYPES,
+        today: TODAY,
       }),
     ];
     for (const r of bad) {
@@ -614,11 +628,21 @@ describe("donor details never leak", () => {
   it("not through what the publish check can see of a register", () => {
     const holds = deedHoldsOf(register);
     // Lookups only: no set to read donor data from, or to change.
-    expect(Object.keys(holds ?? {}).sort()).toEqual(["isHeld", "isKnown", "organizationId"]);
+    expect(Object.keys(holds ?? {}).sort()).toEqual([
+      "holdReasons",
+      "isHeld",
+      "isKnown",
+      "organizationId",
+    ]);
     expect(leaks(JSON.stringify(holds))).toEqual([]);
     expect(Object.isFrozen(holds)).toBe(true);
     expect(holds?.isHeld(item.id)).toBe(true);
     expect(holds?.isHeld(vase.id)).toBe(false);
+    // Why, never which accession or restriction, and the answer can't be changed.
+    const why = holds?.holdReasons(item.id);
+    expect(why).toEqual(["deed"]);
+    expect(Object.isFrozen(why)).toBe(true);
+    expect(holds?.holdReasons(vase.id)).toEqual([]);
   });
 
   it("not by any module but the package index importing accessions", () => {
@@ -635,7 +659,7 @@ describe("donor details never leak", () => {
 });
 
 describe("hostile input to the register", () => {
-  const base = { accessions: [], records: RECORDS, identifierTypes: TYPES };
+  const base = { accessions: [], records: RECORDS, identifierTypes: TYPES, today: TODAY };
 
   it("refuses a Proxy, getters, unknown keys and a bad organization", () => {
     expect(codes(indexAccessions(ORG, new Proxy(base, {}) as never))).toEqual(["invalid_input"]);
@@ -691,5 +715,33 @@ describe("hostile input to the register", () => {
   it("refuses an accession listing more records than allowed", () => {
     const many = Array.from({ length: 5001 }, () => ({ recordId: fonds.id, label: "x" }));
     expect(validateAccession(accession({ records: many })).ok).toBe(false);
+  });
+});
+
+describe("the register's record link checker (T-015a review)", () => {
+  it("refuses a set of another organization's invalid records as mixed, naming nothing", () => {
+    const invalid = { ...donor, organizationId: OTHER, title: "" };
+    const r = indexAccessions(ORG, {
+      accessions: [accession()],
+      records: [invalid],
+      identifierTypes: TYPES,
+      today: TODAY,
+    });
+    expect(codes(r)).toEqual(["mixed_organizations"]);
+    const text = JSON.stringify(r);
+    for (const leak of [OTHER, SECRET.donor, donor.id]) expect(text).not.toContain(leak);
+  });
+
+  it("gives unknown_record, not no_organization_checker, when no record is valid", () => {
+    for (const records of [[], [{ ...donor, title: "" }]]) {
+      const r = indexAccessions(ORG, {
+        accessions: [accession()],
+        records,
+        identifierTypes: TYPES,
+        today: TODAY,
+      });
+      expect(codes(r)).toContain("unknown_record");
+      expect(codes(r)).not.toContain("no_organization_checker");
+    }
   });
 });
