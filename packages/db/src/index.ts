@@ -57,6 +57,8 @@ export {
 } from "./vocabularies.js";
 export type {
   StoredTerm,
+  StoredTerms,
+  TermCountScope,
   TermUsage,
   RecordTerms,
   TermCount,

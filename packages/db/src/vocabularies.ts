@@ -15,16 +15,32 @@
  * (so an http and an https copy of one Nomenclature address are one term, and
  * a record's stale label for an LCSH heading still counts under the heading);
  * any other is its vocabulary and its exact label. No vocabulary and `local`
- * are the same (D-014). Spellings that differ are different terms: finding
- * them is Data Cleaning's (`findNearDuplicateTerms`), never this key's. It is
- * stored as the SHA-256 of that text, in hex, so it always fits in an index.
+ * are the same (D-014). Spellings that differ are different terms, including
+ * labels that differ only invisibly (a composed and a decomposed accent, NFC
+ * and NFD), exactly as core compares labels: finding them is Data Cleaning's
+ * (`findNearDuplicateTerms` pairs those as `same_label`), never this key's. It
+ * is stored as the SHA-256 of that text, in hex, so it always fits in an index.
  *
  * **The usage index is kept here, not by a trigger** (D-062). Which fields of
  * a record hold terms is in its template, and the key needs core's
  * `termUriKey`, so `refreshRecordTerms` rebuilds a record's usages from the
  * record and its template as stored. Whoever saves a record calls it in the
  * same transaction (the service layer, T-032); `recordsWithStaleTerms` finds
- * any record changed without it, from what each index was built from.
+ * any record changed without it, from what each index was built from. Each
+ * usage keeps its field's visibility (`public` or `staff`) from the template
+ * version the index was built from. A refresh that is refused because the
+ * record or its template no longer validates removes the record's usages and
+ * its index row, so nothing old is counted and the record reads as stale.
+ *
+ * **The counts and lists here are STAFF-ONLY.** They count every record,
+ * published or not, and `termUsageCounts` must be told its `scope`: `staff`
+ * (every field) or `public_fields` (only fields whose visibility is public).
+ * Even `public_fields` counts unpublished records, so public Subjects counts
+ * are not these: they must also count only published records, which is the
+ * service and public layers' job (T-034, T-050). No label is ever taken from
+ * a record for display: a term the organization hasn't stored is shown by its
+ * key, vocabulary and URI only (a record's label could be from a staff field
+ * or an unpublished record).
  *
  * Every read and write names one organization (D-019, D-030): the tables'
  * keys and foreign keys all include it, so another organization's terms,
@@ -48,6 +64,7 @@ import {
   termUriKey,
   validateControlledTerm,
   type ControlledTerm,
+  type FieldVisibility,
   type Issue,
   type OrganizationId,
   type RecordId,
@@ -69,6 +86,8 @@ export interface StoredTerm {
 /** One term a record uses in one field, as the record holds it. */
 export interface TermUsage {
   readonly fieldKey: string;
+  /** The field's visibility in the template version the index was built from. */
+  readonly visibility: FieldVisibility;
   readonly termKey: string;
   readonly term: ControlledTerm;
 }
@@ -84,20 +103,43 @@ export interface RecordTerms {
   readonly skipped: readonly Issue[];
 }
 
-/** How many records use one term. */
+/**
+ * Which usages `termUsageCounts` counts. Both are for staff: neither leaves
+ * out unpublished records (see the header).
+ */
+export type TermCountScope = "staff" | "public_fields";
+
+/** How many records use one term (staff-only, see the header). */
 export interface TermCount {
   readonly termKey: string;
-  /** The stored term, or (if it isn't stored) the term as one record holds it. */
-  readonly term: ControlledTerm;
-  /** The stored term's ID, if the organization stored it. */
-  readonly storedTermId?: string;
+  /** The term's vocabulary; `local` for a local term. */
+  readonly vocabulary: string;
+  /**
+   * The organization's stored copy of the term, if it stored one: the only
+   * label a count shows.
+   */
+  readonly stored?: StoredTerm;
+  /**
+   * For a term the organization hasn't stored that has a URI: the URI as one
+   * counted usage holds it (the smallest in byte order). A term not stored
+   * has no label here: a record's label could be from a staff field or an
+   * unpublished record. List its records with `recordsUsingTerm`.
+   */
+  readonly uri?: string;
   readonly records: number;
 }
 
 export interface TermCounts {
-  /** Most used first, then by label (byte order) and key. */
+  /** By term key, for paging: sorting for display is the caller's. */
   readonly counts: readonly TermCount[];
-  /** True when there were more than `limit`. */
+  /** True when there were more than `limit`: ask again with `after` the last key. */
+  readonly truncated: boolean;
+}
+
+export interface StoredTerms {
+  /** By term key, for paging. */
+  readonly terms: readonly StoredTerm[];
+  /** True when there were more than `limit`: ask again with `after` the last key. */
   readonly truncated: boolean;
 }
 
@@ -127,6 +169,20 @@ const SAVE_KEYS: ReadonlySet<string> = new Set(["organizationId", "id", "term"])
 
 const UNIQUE = "23505";
 const FOREIGN_KEY = "23503";
+const DEADLOCK = "40P01";
+const SERIALIZATION = "40001";
+
+/** A deadlock or serialization failure, as a clean `retry` issue; else undefined. */
+function retryIssue<T>(error: unknown): Validated<T> | undefined {
+  const code = dbError(error)?.code;
+  return code === DEADLOCK || code === SERIALIZATION
+    ? refused(
+        [],
+        "retry",
+        "Another change to this record ran at the same time. Roll back the transaction and try it again.",
+      )
+    : undefined;
+}
 
 function refused<T>(
   path: readonly (string | number)[],
@@ -350,23 +406,38 @@ export async function readTerm(
 }
 
 /**
- * The organization's stored terms, validated, ordered by vocabulary (local
- * terms first) and label (byte order). A row that doesn't validate refuses
- * the list, with its index in the path.
+ * The organization's stored terms, validated, by term key: at most `limit`
+ * (default `DEFAULT_TERM_LIST_LIMIT`, at most `MAX_TERM_LIST_LIMIT`) after the
+ * key `after`, for reading a long list in pages (the order is stable while
+ * terms are added or renamed). Sorting by label for display is the caller's.
+ * A row that doesn't validate refuses the page, with its index in the path.
  */
 export async function readTerms(
   db: Queryable,
   organizationId: OrganizationId,
-): Promise<Validated<readonly StoredTerm[]>> {
+  options: { readonly limit?: number; readonly after?: string } = {},
+): Promise<Validated<StoredTerms>> {
   if (!isOrganizationId(organizationId)) {
     return refused(["organizationId"], "invalid_organization", BAD_ORGANIZATION);
   }
+  const limit = checkLimit(options.limit);
+  if (!limit.ok) return limit;
+  const after = checkAfterKey(options.after);
+  if (!after.ok) return after;
   const rows = await db.rows<TermRow>(sql`
     SELECT id::text AS id, vocabulary, uri, label, term_key FROM public.terms
     WHERE organization_id = ${organizationId}::uuid
-    ORDER BY coalesce(vocabulary, 'local') = 'local' DESC, vocabulary COLLATE "C" NULLS FIRST,
-             label COLLATE "C", id`);
-  return termsFromRows(rows, (row, term) => storedTerm(organizationId, row, term));
+      AND (${after.value}::text IS NULL OR term_key > ${after.value}::text)
+    ORDER BY term_key
+    LIMIT ${limit.value + 1}::integer`);
+  const read = termsFromRows(rows.slice(0, limit.value), (row, term) =>
+    storedTerm(organizationId, row, term),
+  );
+  if (!read.ok) return read;
+  return {
+    ok: true,
+    value: Object.freeze({ terms: read.value, truncated: rows.length > limit.value }),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -380,11 +451,16 @@ export async function readTerms(
  * refuses is left out and listed in `skipped`. Values of fields the template
  * doesn't have are not indexed. The record is locked for the rest of the
  * transaction, so two refreshes of it never interleave, and what the index
- * was built from is kept for `recordsWithStaleTerms`.
+ * was built from is kept for `recordsWithStaleTerms`. Each usage keeps its
+ * field's visibility in that template version.
  *
  * Call it in the transaction that saves the record. Refused: a record the
- * organization doesn't have (`unknown_record`), and a record or template
- * that no longer validates (their issues). Run inside a transaction.
+ * organization doesn't have (`unknown_record`); a record or template that no
+ * longer validates (their issues), in which case the record's usages and its
+ * index row are removed, so no old usage is counted and
+ * `recordsWithStaleTerms` lists the record until a refresh succeeds; and a
+ * deadlock or serialization failure with a concurrent change (`retry`: roll
+ * back and run the transaction again). Run inside a transaction.
  */
 export async function refreshRecordTerms(
   db: Queryable,
@@ -404,21 +480,32 @@ export async function refreshRecordTerms(
     if (locked === undefined) {
       return refused(["recordId"], "unknown_record", "The organization has no such record.");
     }
+    const where = sql`organization_id = ${org}::uuid AND record_id = ${recordId}::uuid`;
+    /** Refused: the old usages go, so they are never counted, and the record reads as stale. */
+    const unindexed = async (issues: readonly Issue[]): Promise<Validated<RecordTerms>> => {
+      await db.execute(sql`DELETE FROM public.record_terms WHERE ${where}`);
+      await db.execute(sql`DELETE FROM public.record_term_index WHERE ${where}`);
+      return { ok: false, issues };
+    };
     // The row is locked, so this reads the same fields the digest was made of.
     const record = await readRecord(db, org, recordId);
     if (record === undefined) {
       return refused(["recordId"], "unknown_record", "The organization has no such record.");
     }
-    if (!record.ok) return record;
+    if (!record.ok) return unindexed(record.issues);
     const templateKey = record.value.templateKey;
     if (templateKey === undefined) {
-      return refused(["templateKey"], "no_template_key", "The record names no template.");
+      return unindexed([
+        issue(["templateKey"], "no_template_key", "The record names no template."),
+      ]);
     }
     const stored = await readTemplate(db, org, templateKey);
     if (stored === undefined) {
-      return refused(["templateKey"], "unknown_template", "The record's template is gone.");
+      return unindexed([
+        issue(["templateKey"], "unknown_template", "The record's template is gone."),
+      ]);
     }
-    if (!stored.ok) return stored;
+    if (!stored.ok) return unindexed(stored.issues);
     const { version, template } = stored.value;
 
     const usages: TermUsage[] = [];
@@ -445,13 +532,18 @@ export async function refreshRecordTerms(
         const id = `${field.key}\u0000${key}`;
         if (seen.has(id)) return;
         seen.add(id);
-        usages.push(Object.freeze({ fieldKey: field.key, termKey: key, term: term.value }));
+        usages.push(
+          Object.freeze({
+            fieldKey: field.key,
+            visibility: field.visibility,
+            termKey: key,
+            term: term.value,
+          }),
+        );
       });
     }
 
-    await db.execute(sql`
-      DELETE FROM public.record_terms
-      WHERE organization_id = ${org}::uuid AND record_id = ${recordId}::uuid`);
+    await db.execute(sql`DELETE FROM public.record_terms WHERE ${where}`);
     await db.execute(sql`
       INSERT INTO public.record_term_index
         (organization_id, record_id, template_key, template_version, fields_digest)
@@ -463,15 +555,16 @@ export async function refreshRecordTerms(
     if (usages.length > 0) {
       await db.execute(sql`
         INSERT INTO public.record_terms
-          (organization_id, record_id, field_key, term_key, vocabulary, uri, label)
-        SELECT ${org}::uuid, ${recordId}::uuid, u.field_key, u.term_key, u.vocabulary, u.uri,
-               u.label
+          (organization_id, record_id, field_key, visibility, term_key, vocabulary, uri, label)
+        SELECT ${org}::uuid, ${recordId}::uuid, u.field_key, u.visibility, u.term_key,
+               u.vocabulary, u.uri, u.label
         FROM unnest(${usages.map((u) => u.fieldKey)}::text[],
+                    ${usages.map((u) => u.visibility)}::text[],
                     ${usages.map((u) => u.termKey)}::text[],
                     ${usages.map((u) => u.term.vocabulary ?? null)}::text[],
                     ${usages.map((u) => u.term.uri ?? null)}::text[],
                     ${usages.map((u) => u.term.label)}::text[])
-             AS u(field_key, term_key, vocabulary, uri, label)`);
+             AS u(field_key, visibility, term_key, vocabulary, uri, label)`);
     }
     return {
       ok: true,
@@ -485,13 +578,20 @@ export async function refreshRecordTerms(
     };
   });
   if (result.done) return result.value;
+  const retry = retryIssue<RecordTerms>(result.error);
+  if (retry) return retry;
   throw result.error;
 }
 
 /**
  * Removes a record's usage index, for a record about to be deleted (nothing
  * cascades: the index's foreign key refuses deleting an indexed record).
- * Returns how many usages were removed. Run inside a transaction.
+ * Locks the record first (`FOR UPDATE`, as deleting it will), so it waits for
+ * a concurrent save and refresh of the record instead of deadlocking with
+ * it: the same order as `refreshRecordTerms`, record before index. Returns
+ * how many usages were removed (0 for a record the organization doesn't
+ * have). A deadlock or serialization failure is refused as `retry`. Run
+ * inside a transaction.
  */
 export async function clearRecordTerms(
   db: Queryable,
@@ -503,12 +603,18 @@ export async function clearRecordTerms(
   }
   if (!isRecordId(recordId)) return refused(["recordId"], "invalid_id", BAD_RECORD);
   const result = await inSavepoint(db, async () => {
+    await db.rows(sql`
+      SELECT 1 FROM public.records
+      WHERE organization_id = ${organizationId}::uuid AND id = ${recordId}::uuid
+      FOR UPDATE`);
     const where = sql`organization_id = ${organizationId}::uuid AND record_id = ${recordId}::uuid`;
     const removed = await db.execute(sql`DELETE FROM public.record_terms WHERE ${where}`);
     await db.execute(sql`DELETE FROM public.record_term_index WHERE ${where}`);
     return removed;
   });
   if (result.done) return { ok: true, value: result.value };
+  const retry = retryIssue<number>(result.error);
+  if (retry) return retry;
   throw result.error;
 }
 
@@ -523,6 +629,13 @@ function checkLimit(limit: number | undefined): Validated<number> {
       );
 }
 
+function checkAfterKey(after: string | undefined): Validated<string | null> {
+  if (after === undefined) return { ok: true, value: null };
+  return typeof after === "string" && TERM_KEY.test(after)
+    ? { ok: true, value: after }
+    : refused(["after"], "invalid_term_key", "A term key is 64 lowercase hex digits.");
+}
+
 function checkFieldKey(fieldKey: string | undefined): Validated<string | null> {
   if (fieldKey === undefined) return { ok: true, value: null };
   return isFieldKey(fieldKey)
@@ -530,72 +643,145 @@ function checkFieldKey(fieldKey: string | undefined): Validated<string | null> {
     : refused(["fieldKey"], "invalid_field_key", "That is not a field key.");
 }
 
-interface CountRow extends TermColumns {
+interface CountRow {
+  term_key: string;
   stored_id: string | null;
+  stored_vocabulary: string | null;
+  stored_uri: string | null;
+  stored_label: string | null;
+  used_vocabulary: string | null;
+  used_uri: string | null;
   records: number;
 }
 
+const SCOPES: readonly unknown[] = ["staff", "public_fields"];
+
+/** A count row as a `TermCount`, its stored term or URI checked against its key. */
+function countFromRow(org: OrganizationId, row: CountRow): Validated<TermCount> {
+  if (row.stored_id !== null && row.stored_label !== null) {
+    const id = row.stored_id;
+    const term = termFromRow({
+      vocabulary: row.stored_vocabulary,
+      uri: row.stored_uri,
+      label: row.stored_label,
+      term_key: row.term_key,
+    });
+    if (!term.ok) return term;
+    return {
+      ok: true,
+      value: Object.freeze({
+        termKey: row.term_key,
+        vocabulary: term.value.vocabulary ?? "local",
+        stored: Object.freeze({ organizationId: org, id, term: term.value, termKey: row.term_key }),
+        records: row.records,
+      }),
+    };
+  }
+  const vocabulary = row.used_vocabulary ?? "local";
+  if (row.used_uri === null) {
+    // A local or label-only term: its key is all that is shown.
+    return {
+      ok: true,
+      value: Object.freeze({ termKey: row.term_key, vocabulary, records: row.records }),
+    };
+  }
+  // A URI term's key doesn't depend on its label, so a placeholder label
+  // checks the vocabulary and URI against the key without reading a label.
+  const checked = validateControlledTerm({ label: "-", vocabulary, uri: row.used_uri });
+  if (!checked.ok) return checked;
+  if (keyOf(checked.value) !== row.term_key) {
+    return refused([], "row_mismatch", "A term usage doesn't match its term key.");
+  }
+  return {
+    ok: true,
+    value: Object.freeze({
+      termKey: row.term_key,
+      vocabulary,
+      uri: row.used_uri,
+      records: row.records,
+    }),
+  };
+}
+
 /**
- * How many of the organization's records use each term, from the index (the
- * Subjects counts): every term an indexed record uses, and every stored term,
- * with 0 when no record uses it (an unused term, for Data Cleaning). With
- * `fieldKey`, only usages in that field count, and terms no record uses
- * there are left out. A record using a term twice counts once.
+ * STAFF-ONLY: how many of the organization's records use each term, from the
+ * index, published or not (see the header; public Subjects counts must also
+ * leave out unpublished records, T-034/T-050). `scope` must be given:
+ * `staff` counts usages in every field, `public_fields` only in fields whose
+ * visibility was `public` when the record was indexed. Every term a counted
+ * usage has, and every stored term, with 0 when no record uses it (an unused
+ * term, for Data Cleaning). With `fieldKey`, only usages in that field count,
+ * and terms no record uses there are left out. A record using a term twice
+ * counts once. A term the organization hasn't stored is shown by key,
+ * vocabulary and URI, never by a label from a record.
+ *
+ * By term key, at most `limit` after the key `after`, for reading in pages;
+ * ranking (most used first) is the caller's, over all pages.
  */
 export async function termUsageCounts(
   db: Queryable,
   organizationId: OrganizationId,
-  options: { readonly fieldKey?: string; readonly limit?: number } = {},
+  options: {
+    readonly scope: TermCountScope;
+    readonly fieldKey?: string;
+    readonly limit?: number;
+    readonly after?: string;
+  },
 ): Promise<Validated<TermCounts>> {
   if (!isOrganizationId(organizationId)) {
     return refused(["organizationId"], "invalid_organization", BAD_ORGANIZATION);
+  }
+  const scope = ownValue(options, "scope");
+  if (!SCOPES.includes(scope)) {
+    return refused(["scope"], "invalid_scope", 'The scope is "staff" or "public_fields".');
   }
   const limit = checkLimit(options.limit);
   if (!limit.ok) return limit;
   const field = checkFieldKey(options.fieldKey);
   if (!field.ok) return field;
+  const after = checkAfterKey(options.after);
+  if (!after.ok) return after;
   const org = organizationId;
+  const publicOnly = scope === "public_fields";
   const rows = await db.rows<CountRow>(sql`
     WITH used AS (
-      SELECT term_key, count(DISTINCT record_id)::integer AS records
+      SELECT term_key, count(DISTINCT record_id)::integer AS records,
+             min(coalesce(vocabulary, 'local')) AS vocabulary, min(uri COLLATE "C") AS uri
       FROM public.record_terms
       WHERE organization_id = ${org}::uuid
         AND (${field.value}::text IS NULL OR field_key = ${field.value}::text)
+        AND (NOT ${publicOnly}::boolean OR visibility = 'public')
+        AND (${after.value}::text IS NULL OR term_key > ${after.value}::text)
       GROUP BY term_key
-    ), sample AS (
-      SELECT DISTINCT ON (u.term_key) u.term_key, u.vocabulary, u.uri, u.label
-      FROM public.record_terms u
-      WHERE u.organization_id = ${org}::uuid
-        AND (${field.value}::text IS NULL OR u.field_key = ${field.value}::text)
-      ORDER BY u.term_key, u.label COLLATE "C", u.record_id, u.field_key
     ), stored AS (
       SELECT id, term_key, vocabulary, uri, label FROM public.terms
       WHERE organization_id = ${org}::uuid
+        AND (${after.value}::text IS NULL OR term_key > ${after.value}::text)
     )
-    SELECT coalesce(t.term_key, s.term_key) AS term_key,
-           t.id::text AS stored_id,
-           CASE WHEN t.term_key IS NULL THEN s.vocabulary ELSE t.vocabulary END AS vocabulary,
-           CASE WHEN t.term_key IS NULL THEN s.uri ELSE t.uri END AS uri,
-           coalesce(t.label, s.label) AS label,
-           coalesce(used.records, 0) AS records
-    FROM sample s
-    JOIN used ON used.term_key = s.term_key
-    FULL JOIN stored t ON t.term_key = s.term_key
-    WHERE ${field.value}::text IS NULL OR s.term_key IS NOT NULL
-    ORDER BY coalesce(used.records, 0) DESC, coalesce(t.label, s.label) COLLATE "C",
-             coalesce(t.term_key, s.term_key)
+    SELECT coalesce(t.term_key, u.term_key) AS term_key,
+           t.id::text AS stored_id, t.vocabulary AS stored_vocabulary, t.uri AS stored_uri,
+           t.label AS stored_label, u.vocabulary AS used_vocabulary, u.uri AS used_uri,
+           coalesce(u.records, 0) AS records
+    FROM used u
+    FULL JOIN stored t ON t.term_key = u.term_key
+    WHERE ${field.value}::text IS NULL OR u.term_key IS NOT NULL
+    ORDER BY coalesce(t.term_key, u.term_key)
     LIMIT ${limit.value + 1}::integer`);
-  const truncated = rows.length > limit.value;
-  const read = termsFromRows(rows.slice(0, limit.value), (row, term): TermCount =>
-    Object.freeze({
-      termKey: row.term_key,
-      term,
-      ...(row.stored_id === null ? {} : { storedTermId: row.stored_id }),
-      records: row.records,
-    }),
-  );
-  if (!read.ok) return read;
-  return { ok: true, value: Object.freeze({ counts: read.value, truncated }) };
+  const counts: TermCount[] = [];
+  for (const [index, row] of rows.slice(0, limit.value).entries()) {
+    const count = countFromRow(org, row);
+    if (!count.ok) {
+      return {
+        ok: false,
+        issues: count.issues.map((i) => issue([index, ...i.path], i.code, i.message)),
+      };
+    }
+    counts.push(count.value);
+  }
+  return {
+    ok: true,
+    value: Object.freeze({ counts: Object.freeze(counts), truncated: rows.length > limit.value }),
+  };
 }
 
 /**

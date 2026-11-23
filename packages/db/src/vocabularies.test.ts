@@ -8,6 +8,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import {
   STANDARD_PRESETS,
   createRecord,
+  findNearDuplicateTerms,
   newOrganizationId,
   templateFromPreset,
   validateControlledTerm,
@@ -36,6 +37,9 @@ import {
   saveTerm,
   termKey,
   termUsageCounts,
+  type StoredTerms,
+  type TermCounts,
+  type TermCountScope,
 } from "./vocabularies.js";
 
 // ---------------------------------------------------------------------------
@@ -142,13 +146,56 @@ const refresh = (org: OrganizationId, id: RecordId): ReturnType<typeof refreshRe
 
 const keyOf = (term: unknown): string => ok(termKey(term));
 
-/** Each term key's count, by label, for compact expectations. */
+/**
+ * Each term's count, by its stored label, else its URI, else its key (a term
+ * not stored has no label), for compact expectations. Staff scope unless
+ * `public_fields` is asked for.
+ */
 async function countsByLabel(
   org: OrganizationId,
   fieldKey?: string,
+  scope: TermCountScope = "staff",
 ): Promise<Record<string, number>> {
-  const result = ok(await termUsageCounts(db, org, fieldKey === undefined ? {} : { fieldKey }));
-  return Object.fromEntries(result.counts.map((c) => [c.term.label, c.records]));
+  const result = ok(
+    await termUsageCounts(db, org, fieldKey === undefined ? { scope } : { scope, fieldKey }),
+  );
+  return Object.fromEntries(
+    result.counts.map((c) => [c.stored?.term.label ?? c.uri ?? c.termKey, c.records]),
+  );
+}
+
+/** A new template version of spectrum-object with these fields made staff-only. */
+async function staffFields(org: OrganizationId, keys: readonly string[]): Promise<void> {
+  const template = ok(await readTemplate(db, org, "spectrum-object")).template;
+  ok(
+    await insertTemplateVersion(db, {
+      ...template,
+      fields: template.fields.map((f) =>
+        keys.includes(f.key) ? { ...f, visibility: "staff" as const } : f,
+      ),
+    }),
+  );
+}
+
+/** A promise and the function that settles it, to step two transactions in turn. */
+function signal(): { promise: Promise<void>; resolve: () => void } {
+  let resolve: () => void = () => undefined;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+/** Waits until some connection to the test database is waiting for a lock. */
+async function someoneWaitsForALock(): Promise<void> {
+  for (let i = 0; i < 200; i += 1) {
+    const [row] = await db.rows<{ n: number }>(sql`
+      SELECT count(*)::integer AS n FROM pg_stat_activity
+      WHERE datname = current_database() AND wait_event_type = 'Lock'`);
+    if ((row?.n ?? 0) > 0) return;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  throw new Error("No connection waited for a lock.");
 }
 
 // ---------------------------------------------------------------------------
@@ -185,13 +232,9 @@ describe("stored terms", () => {
       expect(ok(await readTerm(db, org, saved.id))).toEqual(saved);
     }
     const all = ok(await readTerms(db, org));
-    expect(all.map((s) => s.term.label)).toEqual([
-      "Invented Street depot",
-      "Wood",
-      "Railroads",
-      "Chair",
-    ]);
-    expect(all.every((s) => s.organizationId === org)).toBe(true);
+    expect(all.truncated).toBe(false);
+    expect(all.terms.map((s) => s.termKey)).toEqual([LCSH, CHAIR, DEPOT, WOOD].map(keyOf).sort());
+    expect(all.terms.every((s) => s.organizationId === org)).toBe(true);
   });
 
   it("are stored once per organization, also when written two ways", async () => {
@@ -220,7 +263,7 @@ describe("stored terms", () => {
     expect(codes(await tx((q) => saveTerm(q, { organizationId: org, term: CHAIR })))).toEqual([
       "term_exists",
     ]);
-    expect(ok(await readTerms(db, org))).toHaveLength(3);
+    expect(ok(await readTerms(db, org)).terms).toHaveLength(3);
   });
 
   it("can be renamed by ID, never onto another stored term", async () => {
@@ -342,19 +385,28 @@ describe("the usage index", () => {
     const c = await record(org, { object_name: CHAIR });
     for (const id of [a, b, c]) ok(await refresh(org, id));
 
-    const counts = ok(await termUsageCounts(db, org));
+    const counts = ok(await termUsageCounts(db, org, { scope: "staff" }));
     expect(counts.truncated).toBe(false);
-    expect(
-      counts.counts.map((x) => [x.term.label, x.records, x.storedTermId !== undefined]),
-    ).toEqual([
-      ["Railroad", 2, false],
-      ["Chair", 1, false],
-      ["Invented Street depot", 1, true],
-      ["Unused", 0, true],
-    ]);
-    expect(counts.counts[3]?.storedTermId).toBe(unused.id);
+    expect(counts.counts.map((x) => x.termKey)).toEqual(
+      [LCSH, CHAIR, DEPOT, { label: "Unused" }].map(keyOf).sort(),
+    );
+    expect(await countsByLabel(org)).toEqual({
+      [LCSH.uri]: 2,
+      [CHAIR.uri]: 1,
+      "Invented Street depot": 1,
+      Unused: 0,
+    });
+    const byKey = new Map(counts.counts.map((c) => [c.termKey, c]));
+    expect(byKey.get(keyOf({ label: "Unused" }))?.stored?.id).toBe(unused.id);
+    // A term not stored is shown by vocabulary and URI, never a record's label.
+    expect(byKey.get(keyOf(LCSH))).toEqual({
+      termKey: keyOf(LCSH),
+      vocabulary: "lcsh",
+      uri: LCSH.uri,
+      records: 2,
+    });
     expect(await countsByLabel(org, "subjects")).toEqual({
-      Railroad: 2,
+      [LCSH.uri]: 2,
       "Invented Street depot": 1,
     });
     expect(await countsByLabel(org, "materials")).toEqual({ "Invented Street depot": 1 });
@@ -371,7 +423,7 @@ describe("the usage index", () => {
     expect(next.records.map((r) => r.recordId)).toEqual([high]);
     expect(next.truncated).toBe(false);
 
-    const top = ok(await termUsageCounts(db, org, { limit: 1 }));
+    const top = ok(await termUsageCounts(db, org, { scope: "staff", limit: 1 }));
     expect(top.counts).toHaveLength(1);
     expect(top.truncated).toBe(true);
   });
@@ -382,14 +434,14 @@ describe("the usage index", () => {
     const id = await record(org, { subjects: [DEPOT] });
     expect(ok(await recordsWithStaleTerms(db, org)).recordIds).toEqual([id]);
     ok(await refresh(org, id));
-    expect(await countsByLabel(org)).toEqual({ "Invented Street depot": 1 });
+    expect(await countsByLabel(org)).toEqual({ [keyOf(DEPOT)]: 1 });
 
     await db.execute(sql`
       UPDATE public.records SET fields = ${JSON.stringify({ subjects: [LCSH] })}::jsonb
       WHERE organization_id = ${org}::uuid AND id = ${id}::uuid`);
     expect(ok(await recordsWithStaleTerms(db, org)).recordIds).toEqual([id]);
     ok(await refresh(org, id));
-    expect(await countsByLabel(org)).toEqual({ Railroads: 1 });
+    expect(await countsByLabel(org)).toEqual({ [LCSH.uri]: 1 });
     expect(ok(await recordsUsingTerm(db, org, keyOf(DEPOT))).records).toEqual([]);
     expect(ok(await recordsWithStaleTerms(db, org)).recordIds).toEqual([]);
 
@@ -406,7 +458,7 @@ describe("the usage index", () => {
         WHERE organization_id = ${org}::uuid AND id = ${id}::uuid`);
       ok(await refreshRecordTerms(q, org, id));
     });
-    expect(ok(await termUsageCounts(db, org)).counts).toEqual([]);
+    expect(ok(await termUsageCounts(db, org, { scope: "staff" })).counts).toEqual([]);
     expect(ok(await recordsWithStaleTerms(db, org)).recordIds).toEqual([]);
   });
 
@@ -429,10 +481,23 @@ describe("the usage index", () => {
     const org = await organization();
     expect(codes(await refresh(org, crypto.randomUUID() as RecordId))).toEqual(["unknown_record"]);
     expect(codes(await refresh(org, "x" as RecordId))).toEqual(["invalid_id"]);
-    expect(codes(await termUsageCounts(db, org, { limit: 0 }))).toEqual(["invalid_limit"]);
-    expect(codes(await termUsageCounts(db, org, { fieldKey: "Bad-Key" }))).toEqual([
+    expect(codes(await termUsageCounts(db, org, { scope: "staff", limit: 0 }))).toEqual([
+      "invalid_limit",
+    ]);
+    expect(codes(await termUsageCounts(db, org, { scope: "staff", fieldKey: "Bad-Key" }))).toEqual([
       "invalid_field_key",
     ]);
+    expect(codes(await termUsageCounts(db, org, { scope: "public" as TermCountScope }))).toEqual([
+      "invalid_scope",
+    ]);
+    expect(codes(await termUsageCounts(db, org, {} as { scope: TermCountScope }))).toEqual([
+      "invalid_scope",
+    ]);
+    expect(codes(await termUsageCounts(db, org, { scope: "staff", after: "abc" }))).toEqual([
+      "invalid_term_key",
+    ]);
+    expect(codes(await readTerms(db, org, { after: "abc" }))).toEqual(["invalid_term_key"]);
+    expect(codes(await readTerms(db, org, { limit: 10_001 }))).toEqual(["invalid_limit"]);
     expect(codes(await recordsUsingTerm(db, org, "abc"))).toEqual(["invalid_term_key"]);
     expect(
       codes(await recordsUsingTerm(db, org, keyOf(DEPOT), { after: "x" as RecordId })),
@@ -440,6 +505,206 @@ describe("the usage index", () => {
     await expect(refreshRecordTerms(db, org, crypto.randomUUID() as RecordId)).rejects.toThrow(
       /inside a transaction/,
     );
+  });
+});
+
+describe("staff-only counts (the scope, no labels from records)", () => {
+  it("never shows a record's label for a term the organization hasn't stored", async () => {
+    await ready();
+    const org = await organization();
+    await staffFields(org, ["techniques"]);
+    // A staff note typed as the label of an LCSH heading, in a staff field.
+    const secret = { ...LCSH, label: "AAA secret note about donor" };
+    const a = await record(org, { subjects: [LCSH], techniques: [secret] });
+    const b = await record(org, { techniques: [{ label: "Secret donor family" }] });
+    const built = ok(await refresh(org, a));
+    expect(built.usages.map((u) => [u.fieldKey, u.visibility])).toEqual([
+      ["techniques", "staff"],
+      ["subjects", "public"],
+    ]);
+    ok(await refresh(org, b));
+
+    const staff = ok(await termUsageCounts(db, org, { scope: "staff" }));
+    expect(JSON.stringify(staff)).not.toMatch(/secret/i);
+    expect(staff.counts.find((c) => c.termKey === keyOf(LCSH))).toEqual({
+      termKey: keyOf(LCSH),
+      vocabulary: "lcsh",
+      uri: LCSH.uri,
+      records: 1,
+    });
+    // A local term not stored: its key only, never its label.
+    expect(staff.counts.find((c) => c.termKey === keyOf({ label: "Secret donor family" }))).toEqual(
+      { termKey: keyOf({ label: "Secret donor family" }), vocabulary: "local", records: 1 },
+    );
+
+    // public_fields counts only usages in public fields.
+    expect(await countsByLabel(org, undefined, "public_fields")).toEqual({ [LCSH.uri]: 1 });
+    expect(await countsByLabel(org, "techniques", "public_fields")).toEqual({});
+    expect(await countsByLabel(org, "techniques")).toEqual({
+      [LCSH.uri]: 1,
+      [keyOf({ label: "Secret donor family" })]: 1,
+    });
+
+    // A stored term shows the organization's own label, whatever records hold.
+    ok(await tx((q) => saveTerm(q, { organizationId: org, term: LCSH })));
+    const named = ok(await termUsageCounts(db, org, { scope: "staff" }));
+    expect(JSON.stringify(named)).not.toMatch(/secret/i);
+    expect(named.counts.find((c) => c.termKey === keyOf(LCSH))?.stored?.term.label).toBe(
+      "Railroads",
+    );
+  });
+
+  it("reads a usage whose URI doesn't match its key as row_mismatch", async () => {
+    await ready();
+    const org = await organization();
+    const id = await record(org, { subjects: [LCSH] });
+    ok(await refresh(org, id));
+    // Another LCSH heading's URI, under this heading's key.
+    await db.execute(sql`UPDATE public.record_terms
+                         SET uri = 'http://id.loc.gov/authorities/subjects/sh85021262'
+                         WHERE organization_id = ${org}::uuid`);
+    const read = await termUsageCounts(db, org, { scope: "staff" });
+    expect(read.ok ? [] : read.issues.map((i) => [i.path, i.code])).toEqual([
+      [[0], "row_mismatch"],
+    ]);
+  });
+});
+
+describe("paging", () => {
+  it("reads counts and stored terms in pages by term key", async () => {
+    await ready();
+    const org = await organization();
+    const labels = ["Alpha", "Beta", "Gamma", "Delta", "Epsilon"];
+    for (const label of labels.slice(0, 3)) {
+      ok(await tx((q) => saveTerm(q, { organizationId: org, term: { label } })));
+    }
+    const id = await record(org, { subjects: labels.slice(2).map((label) => ({ label })) });
+    ok(await refresh(org, id));
+    const keys = labels.map((label) => keyOf({ label })).sort();
+
+    const seen: string[] = [];
+    let after: string | undefined;
+    for (;;) {
+      const page: TermCounts = ok(
+        await termUsageCounts(db, org, {
+          scope: "staff",
+          limit: 2,
+          ...(after === undefined ? {} : { after }),
+        }),
+      );
+      seen.push(...page.counts.map((c) => c.termKey));
+      after = page.counts.at(-1)?.termKey;
+      if (!page.truncated) break;
+    }
+    expect(seen).toEqual(keys);
+
+    const stored: string[] = [];
+    after = undefined;
+    for (;;) {
+      const page: StoredTerms = ok(
+        await readTerms(db, org, { limit: 1, ...(after === undefined ? {} : { after }) }),
+      );
+      stored.push(...page.terms.map((t) => t.termKey));
+      after = page.terms.at(-1)?.termKey;
+      if (!page.truncated) break;
+    }
+    expect(stored).toEqual(
+      labels
+        .slice(0, 3)
+        .map((label) => keyOf({ label }))
+        .sort(),
+    );
+  });
+});
+
+describe("a refused refresh", () => {
+  it("removes the record's old usages and leaves it stale", async () => {
+    await ready();
+    const org = await organization();
+    const id = await record(org, { subjects: [DEPOT, LCSH] });
+    ok(await refresh(org, id));
+    const usages = async (): Promise<unknown[]> =>
+      db.rows(sql`SELECT term_key FROM public.record_terms
+                  WHERE organization_id = ${org}::uuid AND record_id = ${id}::uuid`);
+    expect(await usages()).toHaveLength(2);
+    // The record no longer validates (a field key core refuses).
+    await db.execute(sql`
+      UPDATE public.records SET fields = ${JSON.stringify({ "Bad Key": [DEPOT] })}::jsonb
+      WHERE organization_id = ${org}::uuid AND id = ${id}::uuid`);
+    const refused = await refresh(org, id);
+    expect(refused.ok).toBe(false);
+    expect(codes(refused)).not.toContain("unknown_record");
+    expect(await usages()).toEqual([]);
+    expect(ok(await recordsWithStaleTerms(db, org)).recordIds).toEqual([id]);
+    expect(await countsByLabel(org)).toEqual({});
+    expect(ok(await recordsUsingTerm(db, org, keyOf(DEPOT))).records).toEqual([]);
+  });
+});
+
+describe("concurrent changes", () => {
+  it("clearing a record's terms waits for a concurrent save instead of deadlocking", async () => {
+    await ready();
+    const org = await organization();
+    const id = await record(org, { subjects: [DEPOT] });
+    ok(await refresh(org, id));
+    const where = sql`organization_id = ${org}::uuid AND id = ${id}::uuid`;
+    const saved = signal();
+    const go = signal();
+    // B saves the record (locking it), then refreshes its terms when told.
+    const save = tx(async (q) => {
+      await q.execute(sql`
+        UPDATE public.records SET fields = ${JSON.stringify({ subjects: [DEPOT, LCSH] })}::jsonb
+        WHERE ${where}`);
+      saved.resolve();
+      await go.promise;
+      return refreshRecordTerms(q, org, id);
+    });
+    await saved.promise;
+    // A clears the record's terms and deletes it.
+    const remove = tx(async (q) => {
+      const cleared = await clearRecordTerms(q, org, id);
+      await q.execute(sql`DELETE FROM public.records WHERE ${where}`);
+      return cleared;
+    });
+    // A is now waiting for B's lock on the record.
+    await someoneWaitsForALock();
+    go.resolve();
+    const [refreshed, cleared] = await Promise.allSettled([save, remove]);
+    expect(refreshed.status).toBe("fulfilled");
+    expect(cleared.status).toBe("fulfilled");
+    if (refreshed.status === "fulfilled") expect(ok(refreshed.value).usages).toHaveLength(2);
+    // A cleared what B had just indexed, then deleted the record.
+    if (cleared.status === "fulfilled") expect(ok(cleared.value)).toBe(2);
+    expect(await db.rows(sql`SELECT 1 FROM public.records WHERE ${where}`)).toEqual([]);
+    expect(await countsByLabel(org)).toEqual({});
+  });
+
+  it("refuses with retry when a concurrent change makes the transaction fail", async () => {
+    await ready();
+    const org = await organization();
+    const id = await record(org, { subjects: [DEPOT] });
+    ok(await refresh(org, id));
+    const where = sql`organization_id = ${org}::uuid AND id = ${id}::uuid`;
+    await tx(async (q) => {
+      await q.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`);
+      await q.rows(sql`SELECT 1 FROM public.records WHERE ${where}`);
+      // Another connection changes the record after this snapshot.
+      await db.execute(sql`UPDATE public.records SET fields = '{}'::jsonb WHERE ${where}`);
+      expect(codes(await clearRecordTerms(q, org, id))).toEqual(["retry"]);
+      expect(codes(await refreshRecordTerms(q, org, id))).toEqual(["retry"]);
+    });
+    // Nothing was changed by the refused calls.
+    expect(await countsByLabel(org)).toEqual({ [keyOf(DEPOT)]: 1 });
+  });
+});
+
+describe("labels that differ only invisibly", () => {
+  it("are separate terms by design, and Data Cleaning pairs them", () => {
+    const composed = { label: "Café" };
+    const decomposed = { label: "Café" };
+    expect(keyOf(composed)).not.toBe(keyOf(decomposed));
+    const report = ok(findNearDuplicateTerms([composed, decomposed]));
+    expect(JSON.stringify(report)).toMatch(/same_label/);
   });
 });
 
@@ -462,7 +727,7 @@ describe("organization separation", () => {
     ]);
     expect(ok(await recordsUsingTerm(db, archives, keyOf(LCSH))).records).toEqual([]);
     expect(await readTerm(db, archives, theirs.id)).toBeUndefined();
-    expect(ok(await readTerms(db, archives))).toHaveLength(1);
+    expect(ok(await readTerms(db, archives)).terms).toHaveLength(1);
     // Another organization's record isn't found, and its index is untouched.
     expect(codes(await refresh(archives, other))).toEqual(["unknown_record"]);
     expect(ok(await recordsWithStaleTerms(db, archives)).recordIds).toEqual([]);
@@ -470,7 +735,10 @@ describe("organization separation", () => {
       codes(await tx((q) => saveTerm(q, { organizationId: archives, id: theirs.id, term: WOOD }))),
     ).toEqual(["unknown_term"]);
     expect(ok(await tx((q) => clearRecordTerms(q, archives, other)))).toBe(0);
-    expect(await countsByLabel(library)).toEqual({ "Invented Street depot": 1, Railroads: 1 });
+    expect(await countsByLabel(library)).toEqual({
+      "Invented Street depot": 1,
+      [LCSH.uri]: 1,
+    });
   });
 
   it("refuses direct SQL that points at another organization's rows", async () => {
@@ -495,8 +763,9 @@ describe("organization separation", () => {
           SELECT ${archives}::uuid, ${mine}::uuid, key, version, ${"0".repeat(32)}
           FROM public.template_versions WHERE organization_id = ${library}::uuid AND version = 2`,
       // A usage of one organization on another's indexed record.
-      sql`INSERT INTO public.record_terms (organization_id, record_id, field_key, term_key, label)
-          VALUES (${archives}::uuid, ${other}::uuid, 'subjects', ${key}, 'x')`,
+      sql`INSERT INTO public.record_terms
+            (organization_id, record_id, field_key, visibility, term_key, label)
+          VALUES (${archives}::uuid, ${other}::uuid, 'subjects', 'public', ${key}, 'x')`,
       // A stored term of an organization that doesn't exist.
       sql`INSERT INTO public.terms (organization_id, id, label, term_key)
           VALUES (${newOrganizationId()}::uuid, ${crypto.randomUUID()}::uuid, 'x', ${key})`,

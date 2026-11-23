@@ -1,6 +1,6 @@
 -- Vocabularies and terms (T-027, D-062): each organization's stored terms
 -- (its local terms and the authority terms it has saved), and an index of
--- which records use which terms, so the Subjects counts and Data Cleaning are
+-- which records use which terms, so staff Subjects counts and Data Cleaning are
 -- worked out from the index, never by reading every record's fields.
 --
 -- A term is identified by its term key, worked out by packages/db from core's
@@ -67,13 +67,18 @@ CREATE TABLE public.record_term_index (
     REFERENCES public.template_versions (organization_id, key, version)
 );
 
--- One term one record uses in one field: the field's key, the term's key, and
--- the term as the record holds it (its first value with that key in the
--- field), so a stale label on an authority term can be listed.
+-- One term one record uses in one field: the field's key, the field's
+-- visibility in the template version the index was built from, the term's
+-- key, and the term as the record holds it (its first value with that key in
+-- the field). Staff-only data: the label can come from a staff field or an
+-- unpublished record, so the counts never show it (D-062). Public counts must
+-- use only usages whose visibility is 'public', and only of published records
+-- (the service and public layers, T-034 and T-050).
 CREATE TABLE public.record_terms (
   organization_id uuid NOT NULL,
   record_id uuid NOT NULL,
   field_key text NOT NULL CHECK (field_key ~ '^[a-z][a-z0-9_]{0,63}$'),
+  visibility text NOT NULL CHECK (visibility IN ('public', 'staff')),
   term_key text NOT NULL CHECK (term_key ~ '^[0-9a-f]{64}$'),
   vocabulary text
     CHECK (vocabulary IN ('lcsh', 'lcnaf', 'lcgft', 'nomenclature', 'gnis', 'local')),
