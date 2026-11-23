@@ -18,6 +18,7 @@
     "typecheck": "npm run typecheck --workspaces",
     "test": "vitest run",
     "build": "npm run build --workspaces",
+    "db:migrate": "npm run db:migrate -w @oculus/db",
     "audit": "npm audit --audit-level=high",
     "licenses": "node scripts/check-licenses.mjs",
     "baseline": "node scripts/check-baseline.mjs",
