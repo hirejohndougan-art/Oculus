@@ -90,11 +90,34 @@ describe("trustProxy", () => {
     "10.0.0.1,",
     "::1/129",
     "uniquelocal",
+    "0.0.0.0/0",
+    "8.0.0.0/8",
+    "1.2.0.0/15",
+    "::/0",
+    "2001:db8::/16",
+    "10.0.0.0/7",
+    "fc00::/6",
   ])("refuses to start with %j", async (value) => {
     expect(() => trustedProxyFromEnv({ [TRUSTED_PROXY_ENV]: value })).toThrow(TRUSTED_PROXY_ENV);
     await expect(testServer({ env: { [TRUSTED_PROXY_ENV]: value } })).rejects.toThrow(
       TRUSTED_PROXY_ENV,
     );
+  });
+
+  it("allows narrow public ranges and private blocks", () => {
+    for (const value of [
+      "203.0.113.0/24",
+      "198.51.0.0/16",
+      "2001:db8::/32",
+      "10.0.0.0/8",
+      "172.16.0.0/12",
+      "192.168.0.0/16",
+      "127.0.0.0/8",
+      "fd00::/8",
+      "::1/128",
+    ]) {
+      expect(trustedProxyFromEnv({ [TRUSTED_PROXY_ENV]: value }), value).toEqual([value]);
+    }
   });
 
   it("reads unset and blank as off", () => {
