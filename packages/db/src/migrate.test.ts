@@ -31,11 +31,14 @@ const ALL_TABLES = [
   "oculus_migrations",
   "organizations",
   "record_identifiers",
+  "record_term_index",
+  "record_terms",
   "record_type_versions",
   "record_types",
   "records",
   "template_versions",
   "templates",
+  "terms",
 ];
 
 const FIRST = readFileSync(join(defaultMigrationsDir(), "0001_migrations_table.sql"));
