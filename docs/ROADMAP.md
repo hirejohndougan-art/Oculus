@@ -47,6 +47,8 @@ The data model in TypeScript, written for any archive or museum rather than one 
   - Both majors were turned down in D-006 and the upkeep run of 2026-11-21 found the reasons still hold: typescript-eslint 8.73 supports only TypeScript `<6.1`, and Vite 8 still depends on MPL-2.0 `lightningcss`. Move when typescript-eslint supports TypeScript 7, or when Vite drops `lightningcss` as a required dependency; each move gets its own decision entry.
 - [x] U-001 **Direct tests for the shared helpers.** (upkeep)
   - `readPlainData`, `textProblem`, `isPlainObject`, `IssueList`, the kind and level guards, `isLeapYear` and `patternMismatchMessage` had no tests of their own (`plain-data.test.ts`, `helpers.test.ts`).
+- [x] U-002 **Direct tests for the organization helpers.** (upkeep)
+  - `oneOrganization`, `organizationIdOf`, `mixedOrganizationsIssue` (used by every module that keeps organizations apart) and the public `isIdentifierTypeKey` had no tests of their own (`organization-helpers.test.ts`).
 - [x] T-002 **Record types.** deps: T-001
   - Types and validators for object, archival unit (collection > series > file > item, nested to any depth), digital asset, agent (person, organization, family), place and event.
   - Every record has a permanent internal UUID.

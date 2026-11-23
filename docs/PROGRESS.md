@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-23 03:27 CT — upkeep — U-002 Direct tests for the organization helpers
+- Result: done
+- What changed: `npm outdated` shows nothing to update within majors; TypeScript 7 and Vite 8 are still blocked (typescript-eslint 8.73.0 still needs TypeScript `<6.1`, Vite 8.3.8 still requires MPL-2.0 `lightningcss`), so T-001b stays open. Added 17 direct tests for `oneOrganization`, `organizationIdOf`, `mixedOrganizationsIssue` and `isIdentifierTypeKey` (getters and Proxies never run, inherited IDs ignored, unowned items at any position give `mixed`, unwalkable lists don't throw, the issue names no organization, the key rule and prototype keys). Commit 9ea22c2. Test-only; no code changed.
+- Decisions: none
+- Review: n/a (tests only)
+- Gate: PASS · tests_passing 2131 (was 2114) · npm audit clean
+- Next: T-019b Organizations on vocabularies, terms, rights settings and Dublin Core mappings (risky)
+
 ## 2026-11-22 06:30 CT — manual (John) — Q-4 Roles
 - Result: done (decision recorded; no code)
 - What changed: John added the Scanner and Donor relations roles and asked that system managers can create custom roles. D-036: roles are sets of permissions from a fixed list, checked by permission rather than by name; custom roles belong to one organization and can't hold system-manager powers. T-041 updated; new task T-041a (custom roles); T-048 waits on it. Every Q- question is now answered.
