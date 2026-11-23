@@ -12,6 +12,11 @@
  * - `place`: a named place, optionally with a map position.
  * - `event`: something that happened (a storm, a festival, an election).
  *
+ * The six kinds are fixed. An organization adds its own record types on top
+ * of them (D-037, `record-types.ts`): "Oral history" is a kind of digital
+ * asset with its own default template. A record names its type in
+ * `recordTypeKey`.
+ *
  * The template-defined fields are checked here only for being safe, plain
  * JSON. Which fields a record must have is the job of field templates (T-005).
  */
@@ -61,6 +66,16 @@ interface RecordBase {
    * template lookup function, never through a registry from `indexTemplates`.
    */
   readonly templateKey?: string;
+  /**
+   * The key of the organization's record type this record is (D-037), such
+   * as `oral-history` for a digital asset. A label and a starting point only:
+   * the type's kind must be the record's `kind` (`checkRecordType`), and its
+   * default template fills in `templateKey` when the record is made
+   * (`recordTypeDefaults`), but the checks always find the template from
+   * `templateKey`, never from the type. A record that names a type must name
+   * its template too.
+   */
+  readonly recordTypeKey?: string;
   /** Template-defined fields, keyed by field key (`date`, `subjects` …). */
   readonly fields: Readonly<Record<string, FieldValue>>;
 }
@@ -142,6 +157,7 @@ const COMMON_KEYS = [
   "kind",
   "title",
   "templateKey",
+  "recordTypeKey",
   "createdAt",
   "updatedAt",
   "fields",
@@ -219,6 +235,22 @@ function check(input: unknown): Validated<CatalogRecord> {
       "The template key is 1 to 64 lower case letters, digits, hyphens and underscores, starting with a letter.",
     );
   }
+  if (record.recordTypeKey !== undefined) {
+    if (!isRecordTypeKey(record.recordTypeKey)) {
+      issues.add(
+        ["recordTypeKey"],
+        "invalid_record_type_key",
+        "The record type key is 1 to 64 lower case letters, digits, hyphens and underscores, starting with a letter.",
+      );
+    }
+    if (record.templateKey === undefined) {
+      issues.add(
+        ["templateKey"],
+        "template_key_required",
+        "A record that names a record type must also name its template (templateKey).",
+      );
+    }
+  }
   checkTimestamps(record.createdAt, record.updatedAt, issues);
   checkFields(record.fields, issues);
 
@@ -288,6 +320,15 @@ export function isTemplateKey(key: unknown): key is string {
 }
 
 /**
+ * True if `key` can be a record type key (D-037). The same rule as a
+ * template key: 1 to 64 lower case letters, digits, hyphens and underscores,
+ * starting with a letter, and not a prototype key.
+ */
+export function isRecordTypeKey(key: unknown): key is string {
+  return isTemplateKey(key);
+}
+
+/**
  * The fields a caller supplies when making a new record. `templateKey` is
  * optional in the type only so older callers keep working; give it for
  * every new record (D-029).
@@ -322,6 +363,7 @@ export type NewRecordInput = { readonly organizationId: OrganizationId } & (
 export function createRecord(
   input: NewRecordInput & {
     readonly templateKey?: string;
+    readonly recordTypeKey?: string;
     readonly fields?: Readonly<Record<string, FieldValue>>;
   },
   now: Date = new Date(),
