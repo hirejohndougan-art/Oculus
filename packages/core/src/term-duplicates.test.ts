@@ -8,6 +8,10 @@ import {
   termWords,
   type DuplicateCandidate,
 } from "./index.js";
+import {
+  boundedDistance as referenceDistance,
+  findNearDuplicateTerms as referenceFind,
+} from "./term-duplicates.fixtures.js";
 
 const RAILROADS = "http://id.loc.gov/authorities/subjects/sh85110904";
 const HURRICANES = "http://id.loc.gov/authorities/subjects/sh85063195";
@@ -111,6 +115,146 @@ describe("boundedDistance", () => {
         expect(d(a, b, limit), `${a} ${b}`).toBe(Math.min(full(a, b), limit + 1));
       }
     }
+  });
+
+  it("gives what the code before S-005a gave, for strings and lists, on every short pair", () => {
+    // Every pair of keys of up to 7 letters from two letters, then long
+    // random keys from two and three letters: the narrower band and the
+    // strings read as needed must not change a single answer.
+    const keys = [""];
+    for (let length = 1; length <= 7; length += 1) {
+      for (let x = 0; x < 2 ** length; x += 1) {
+        keys.push(Array.from({ length }, (_, k) => ((x >> k) & 1 ? "b" : "a")).join(""));
+      }
+    }
+    const check = (a: string, b: string, limit: number): void => {
+      const expected = referenceDistance(Array.from(a), Array.from(b), limit);
+      expect(boundedDistance(a, b, limit), `${a} ${b} ${String(limit)}`).toBe(expected);
+      expect(boundedDistance(Array.from(a), Array.from(b), limit)).toBe(expected);
+    };
+    for (const a of keys) {
+      for (const b of keys) {
+        if (Math.abs(a.length - b.length) <= 3) for (const limit of [1, 2, 3]) check(a, b, limit);
+      }
+    }
+    let seed = 11;
+    const rand = (n: number): number => {
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      return seed % n;
+    };
+    for (let k = 0; k < 20_000; k += 1) {
+      const letters = k % 2 === 0 ? "ab" : "abc";
+      const a = Array.from({ length: 10 + rand(50) }, () => letters[rand(letters.length)]).join("");
+      // Mostly near copies, so many pairs are within the limit.
+      let b = a;
+      for (let e = rand(4); e > 0; e -= 1) {
+        const at = rand(b.length + 1);
+        const c = letters[rand(letters.length)] ?? "a";
+        const op = rand(4);
+        if (op === 0) b = b.slice(0, at) + c + b.slice(at);
+        else if (op === 1) b = b.slice(0, at) + b.slice(at + 1);
+        else if (op === 2) b = b.slice(0, at) + c + b.slice(at + 1);
+        else b = b.slice(0, at) + b.slice(at + 1, at + 2) + b.slice(at, at + 1) + b.slice(at + 2);
+      }
+      if (k % 5 === 0)
+        b = Array.from({ length: a.length + rand(3) }, () => letters[rand(2)]).join("");
+      check(a, b, 1 + rand(2));
+    }
+  });
+});
+
+describe("findNearDuplicateTerms finds what the code before S-005a found", () => {
+  // Randomized lists built to reach every part of the search: abbreviations
+  // and their expanded forms, near spellings from two or three letters (big
+  // blocks of different keys, compared by sorted neighbours), designators,
+  // terms with URIs, copies and short keys. The whole report must be the same.
+  const makeTerms = (seed: number, size: number): unknown[] => {
+    let s = seed;
+    const rand = (n: number): number => {
+      s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+      return Math.floor((s / 2 ** 32) * n);
+    };
+    const pick = <T>(list: readonly T[]): T => list[rand(list.length)] as T;
+    // Deseret letters are above U+FFFF (two UTF-16 units each).
+    const plain = [
+      "Galveston",
+      "Houston",
+      "Henderson",
+      "Railroad",
+      "Depot",
+      "Bay",
+      "Clear",
+      "Creek",
+      "𐐔𐐯𐑅𐐨𐑉𐐯𐐻",
+      "𐐨𐐯𐐻",
+    ];
+    const twoLetter = ["ab", "ba", "aab", "abab", "bbaa", "abba", "baab", "aaa", "bbb"];
+    const designators = ["", "", "", " 2", " 1900", " II", " 12a", " B"];
+    const terms: unknown[] = [];
+    for (let i = 0; i < size; i += 1) {
+      const shape = rand(10);
+      let label: string;
+      if (shape < 4) {
+        label = Array.from({ length: 1 + rand(11) }, () => pick(twoLetter)).join(" ");
+      } else if (shape < 7) {
+        label = Array.from({ length: 2 + rand(6) }, () => pick(plain)).join(" ");
+      } else if (shape < 9 && terms.length > 0) {
+        // An earlier label changed: a run of words shortened to initials,
+        // a letter changed, or two neighbouring letters swapped.
+        const earlier = (pick(terms) as { label: string }).label;
+        const words = earlier.split(" ");
+        const change = rand(3);
+        if (change === 0 && words.length >= 2) {
+          const start = rand(words.length - 1);
+          const len = 2 + rand(Math.min(7, words.length - start - 1));
+          const initials = words
+            .slice(start, start + len)
+            .map((w) => Array.from(w)[0] ?? "")
+            .join(rand(2) === 0 ? "" : " ");
+          label = [...words.slice(0, start), initials, ...words.slice(start + len)].join(" ");
+        } else {
+          const at = rand(Math.max(1, earlier.length - 1));
+          label =
+            change === 1
+              ? earlier.slice(0, at) + pick(["a", "b", "x"]) + earlier.slice(at + 1)
+              : earlier.slice(0, at) +
+                earlier.slice(at + 1, at + 2) +
+                earlier.slice(at, at + 1) +
+                earlier.slice(at + 2);
+        }
+      } else if (rand(2) === 0) {
+        // Keys of more than 128 letters, which the spelling check reads
+        // another way.
+        label = Array.from({ length: 18 + rand(6) }, () => pick(plain)).join(" ");
+      } else {
+        label = pick(plain);
+      }
+      label = (label.trim() || "Depot") + pick(designators);
+      terms.push(
+        rand(8) === 0
+          ? { label, uri: `https://example.org/gnis/${String(rand(50))}`, vocabulary: "gnis" }
+          : { label },
+      );
+    }
+    return terms;
+  };
+
+  it("on many randomized lists of terms", { timeout: 60_000 }, () => {
+    let pairs = 0;
+    const reasons = new Set<string>();
+    for (let seed = 1; seed <= 40; seed += 1) {
+      const terms = makeTerms(seed, seed % 4 === 0 ? 3000 : 400);
+      const now = findNearDuplicateTerms(terms, { maxCandidates: 10_000 });
+      const before = referenceFind(terms, { maxCandidates: 10_000 });
+      expect(now, `seed ${String(seed)}`).toEqual(before);
+      if (now.ok) {
+        pairs += now.value.candidates.length;
+        for (const c of now.value.candidates) reasons.add(c.reason);
+      }
+    }
+    // The lists really did reach every reason, so the comparison means something.
+    expect(pairs).toBeGreaterThan(1000);
+    expect([...reasons].sort()).toEqual([...DUPLICATE_REASONS].sort());
   });
 });
 

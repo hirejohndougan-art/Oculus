@@ -330,6 +330,15 @@ describe("near-duplicate detection can't be overloaded", () => {
     expect(r.limits).not.toContain("spelling_budget");
   });
 
+  it("is fast on 44-letter keys from two letters", slow, () => {
+    // S-005a: about 3.2–4 s before (mostly the edit distance of ~700,000
+    // pairs, the set of ~4.9 million pair visits and the abbreviation pass);
+    // about 1.5–1.9 s now on the same machine, with the same pairs found.
+    const r = timed(randomWords(9, allWords("ab", 4), 11));
+    expect(r.found).toBeGreaterThan(0);
+    expect(r.ms).toBeLessThan(5000);
+  });
+
   it("doesn't run out of memory on labels that unfold to many characters", () => {
     // U+FDFA unfolds to 18 characters: 450 of them would be an 8,100-letter key.
     const r = findNearDuplicateTerms(

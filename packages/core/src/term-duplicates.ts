@@ -182,6 +182,25 @@ const MAX_RUN = 8;
  * Railroad" has two), so its expanded form has at most 12 + 7.
  */
 const MAX_ABBREVIATED_WORDS = 12;
+/** Word places indexed per entered label: more than `MAX_ABBREVIATED_WORDS`. */
+const PLACES = 16;
+/**
+ * Numbers kept per term for the spelling check: length, key number, letter
+ * set, letter counts, designators number.
+ */
+const FACTS = 5;
+/** The kinds of spelling block (see `spelling`). */
+const BLOCK_W = 0;
+const BLOCK_P = 1;
+const BLOCK_S = 2;
+const BLOCK_X = 3;
+const BLOCK_M = 4;
+const BLOCK_N = 5;
+const BLOCK_KINDS = 6;
+/** Pairs of positions at most this far apart are kept as bits (a multiple of 32). */
+const NEAR = 128;
+/** Keys up to this many characters are copied into one array for the spelling check. */
+const POOLED_LENGTH = 128;
 /** Labels kept for one word sequence, as partners of an abbreviation. */
 const MAX_PER_KEY = 20;
 /** Candidates kept before sorting; past this the report is truncated. */
@@ -733,12 +752,30 @@ function abbreviations(terms: readonly Prepared[], out: Collector): void {
     entered.set(labelKey, i);
   });
   // Words that could be an abbreviation: a shortened form is only built when
-  // its initials are one of these, which keeps the work small.
-  const shortWords = new Set<string>();
-  for (const key of byWords.keys()) {
-    for (const w of key.split(" ")) {
-      if (w.length >= MIN_RUN && w.length <= MAX_RUN * 2) shortWords.add(w);
-    }
+  // its initials are one of these, which keeps the work small. They are
+  // filed by a hash of their UTF-16 units (`unitHash`), so initials can be
+  // looked up as they grow, a character at a time, without making text.
+  // Also where they stand: `atPlace[count * PLACES + p]` holds the words at
+  // place p of the entered labels with `count` words. A shortened form can
+  // only be one of them if its initials are among the words at its own place
+  // in labels of its own length, so the rest are never built.
+  const shortWords = new Map<number, string[]>();
+  const atPlace: (Set<string> | undefined)[] = [];
+  const hashed = new Set<string>();
+  for (const list of byWords.values()) {
+    // Every label in a list has these significant words.
+    const words = terms[list[0] ?? -1]?.significant ?? [];
+    words.forEach((w, p) => {
+      if (w.length < MIN_RUN || w.length > MAX_RUN * 2) return;
+      (atPlace[words.length * PLACES + p] ??= new Set()).add(w);
+      if (hashed.has(w)) return;
+      hashed.add(w);
+      let h = 0;
+      for (let k = 0; k < w.length; k += 1) h = unitHash(h, w.charCodeAt(k));
+      const same = shortWords.get(h);
+      if (same === undefined) shortWords.set(h, [w]);
+      else same.push(w);
+    });
   }
   let work = 0;
   for (let j = 0; j < terms.length; j += 1) {
@@ -747,28 +784,81 @@ function abbreviations(terms: readonly Prepared[], out: Collector): void {
     // MAX_ABBREVIATED_WORDS, so longer labels can't be expanded forms.
     if (words.length < MIN_RUN || words.length > MAX_ABBREVIATED_WORDS + MAX_RUN - 1) continue;
     if (out.full) return;
+    // Each word's first character (as a code point) and whether it is a
+    // number, and the label's length, worked out once per label rather than
+    // once per run.
+    const firsts: number[] = [];
+    const numeric: boolean[] = [];
+    let total = words.length - 1;
+    for (const w of words) {
+      firsts.push(w.codePointAt(0) ?? 0);
+      // Initials of numbers would make "1900 1915" into "11".
+      numeric.push(/^\p{N}/u.test(w));
+      total += w.length;
+    }
+    /** The short word whose units are the initials of words start to end, if any. */
+    const initialsWord = (hash: number, start: number, end: number): string | undefined =>
+      shortWords.get(hash)?.find((w) => {
+        let pos = 0;
+        for (let k = start; k <= end; k += 1) {
+          const c = firsts[k] ?? 0;
+          if (c > 0xffff) {
+            if (w.charCodeAt(pos) !== 0xd800 + ((c - 0x10000) >> 10)) return false;
+            if (w.charCodeAt(pos + 1) !== 0xdc00 + ((c - 0x10000) & 0x3ff)) return false;
+            pos += 2;
+          } else {
+            if (w.charCodeAt(pos) !== c) return false;
+            pos += 1;
+          }
+        }
+        return pos === w.length;
+      });
     for (let start = 0; start < words.length; start += 1) {
-      let initials = "";
+      // The initials' hash and length in UTF-16 units, and the characters of
+      // the run's words and the spaces between them.
+      let hash = 0;
+      let initials = 0;
+      let run = -1;
       for (let len = 1; len <= MAX_RUN && start + len <= words.length; len += 1) {
         work += 1;
         if (work > MAX_ABBREVIATION_WORK) {
           out.limits.add("abbreviation_budget");
           return;
         }
-        const w = words[start + len - 1] ?? "";
-        // Initials of numbers would make "1900 1915" into "11".
-        if (/^\p{N}/u.test(w)) break;
-        initials += Array.from(w)[0] ?? "";
-        if (len < MIN_RUN || words.length - len + 1 > MAX_ABBREVIATED_WORDS) continue;
-        if (!shortWords.has(initials)) continue;
-        const short = [...words.slice(0, start), initials, ...words.slice(start + len)].join(" ");
-        work += short.length;
+        const at = start + len - 1;
+        if (numeric[at] === true) break;
+        const c = firsts[at] ?? 0;
+        if (c > 0xffff) {
+          hash = unitHash(
+            unitHash(hash, 0xd800 + ((c - 0x10000) >> 10)),
+            0xdc00 + ((c - 0x10000) & 0x3ff),
+          );
+          initials += 2;
+        } else {
+          hash = unitHash(hash, c);
+          initials += 1;
+        }
+        run += (words[at]?.length ?? 0) + 1;
+        const count = words.length - len + 1;
+        if (len < MIN_RUN || count > MAX_ABBREVIATED_WORDS) continue;
+        const word = initialsWord(hash, start, at);
+        if (word === undefined) continue;
+        // Charged as if the shortened form were built, so the budget runs
+        // out at the same place whether or not it is.
+        work += total - run + initials;
+        if (atPlace[count * PLACES + start]?.has(word) !== true) continue;
+        const short = [...words.slice(0, start), word, ...words.slice(start + len)].join(" ");
         for (const i of byWords.get(short) ?? []) {
           if (!out.has(i, j)) out.add(i, j, "abbreviation");
         }
       }
     }
   }
+}
+
+/** A hash of UTF-16 units, one unit at a time (31 × hash + unit, in 32 bits). */
+function unitHash(hash: number, unit: number): number {
+  return (Math.imul(hash, 31) + unit) | 0;
 }
 
 function spelling(terms: readonly Prepared[], out: Collector): void {
@@ -783,11 +873,26 @@ function spelling(terms: readonly Prepared[], out: Collector): void {
     if (!t.hasUri) g.withoutUri += 1;
     groupsByDesignators.set(t.designators, g);
   }
-  const blocks = new Map<string, number[]>();
-  const put = (key: string, i: number): void => {
-    const list = blocks.get(key);
-    if (list === undefined) blocks.set(key, [i]);
-    else list.push(i);
+  // A block is the terms with the same designators sharing one of: a word
+  // (w), the first three letters (p), the last three (s), for keys under 10
+  // letters the key with one letter removed (x), and for longer keys letters
+  // 4 to 6 from the start (m) or from the end (n). Blocks are searched in the
+  // order they were first made; each is found through its designators, its
+  // kind and its text, and `fromEnd` marks the kinds sorted from the end.
+  const blocks: number[][] = [];
+  const fromEnd: boolean[] = [];
+  const blockIndex = new Map<string, Map<string, number>[]>();
+  const put = (byKind: Map<string, number>[], kind: number, text: string, i: number): void => {
+    const index = byKind[kind];
+    if (index === undefined) return;
+    const at = index.get(text);
+    if (at === undefined) {
+      index.set(text, blocks.length);
+      blocks.push([i]);
+      fromEnd.push(kind === BLOCK_S || kind === BLOCK_N);
+    } else {
+      blocks[at]?.push(i);
+    }
   };
   terms.forEach((t, i) => {
     const n = t.chars.length;
@@ -795,11 +900,18 @@ function spelling(terms: readonly Prepared[], out: Collector): void {
     const group = groupsByDesignators.get(t.designators);
     if (group === undefined || group.count < 2) return;
     if (group.withoutUri === 0) return;
-    // Designators must match, so they are part of every block key.
-    const d = `${t.designators}|`;
+    // Designators must match, so they choose the blocks' index.
+    let byKind = blockIndex.get(t.designators);
+    if (byKind === undefined) {
+      byKind = Array.from({ length: BLOCK_KINDS }, () => new Map<string, number>());
+      blockIndex.set(t.designators, byKind);
+    }
+    const chars = t.chars;
     const slice = (from: number, to: number): string => {
+      // A key without characters above U+FFFF is its own list of characters.
+      if (typeof chars === "string") return chars.slice(from, to);
       let s = "";
-      for (let k = from; k < to; k += 1) s += t.chars[k] ?? "";
+      for (let k = from; k < to; k += 1) s += chars[k] ?? "";
       return s;
     };
     const words = new Set<string>();
@@ -811,43 +923,64 @@ function spelling(terms: readonly Prepared[], out: Collector): void {
       }
       words.add(w);
     }
-    for (const w of words) put(`${d}w:${w}`, i);
-    put(`${d}p:${slice(0, 3)}`, i);
-    put(`${d}s:${slice(n - 3, n)}`, i);
+    for (const w of words) put(byKind, BLOCK_W, w, i);
+    put(byKind, BLOCK_P, slice(0, 3), i);
+    put(byKind, BLOCK_S, slice(n - 3, n), i);
     if (n < 10) {
       // Every key with one letter removed: two keys one edit apart always
       // share one (a key one letter longer shares the shorter key itself).
-      put(`${d}x:${slice(0, n)}`, i);
-      for (let k = 0; k < n; k += 1) put(`${d}x:${slice(0, k)}${slice(k + 1, n)}`, i);
+      put(byKind, BLOCK_X, slice(0, n), i);
+      for (let k = 0; k < n; k += 1) put(byKind, BLOCK_X, slice(0, k) + slice(k + 1, n), i);
     } else {
-      put(`${d}m:${slice(3, 6)}`, i);
-      put(`${d}n:${slice(n - 6, n - 3)}`, i);
+      put(byKind, BLOCK_M, slice(3, 6), i);
+      put(byKind, BLOCK_N, slice(n - 6, n - 3), i);
     }
   });
 
   // Every term's place in key order, forwards and from the end, worked out
-  // once, so sorting a big block is sorting numbers.
-  let cached: { forward: number[]; backward: number[] } | undefined;
-  const ranks = (): { forward: number[]; backward: number[] } => {
-    if (cached !== undefined) return cached;
-    const order = (cmp: (x: number, y: number) => number): number[] => {
-      const rank = new Array<number>(terms.length).fill(0);
-      terms
-        .map((_, i) => i)
-        .sort((x, y) => cmp(x, y) || x - y)
-        .forEach((i, r) => (rank[i] = r));
-      return rank;
-    };
-    cached = {
-      forward: order((x, y) => {
+  // once, so sorting a big block is sorting numbers. Places are all
+  // different (ties go by position), so `byRank` turns a place back into
+  // the term.
+  const order = (cmp: (x: number, y: number) => number): Order => {
+    const rank = new Int32Array(terms.length);
+    const byRank = Int32Array.from(terms.map((_, i) => i).sort((x, y) => cmp(x, y) || x - y));
+    byRank.forEach((i, r) => (rank[i] = r));
+    return { rank, byRank };
+  };
+  // The pairs are visited by forward place, not by position in the list:
+  // what is kept about each term below is laid out in key order, so the
+  // neighbours a big block compares sit close together in memory. With no
+  // big block, nothing is sorted and a term's place is its position.
+  if (!blocks.some((list) => list.length >= 2)) return;
+  const forward = blocks.some((list) => list.length > BLOCK_ALL_PAIRS)
+    ? order((x, y) => {
         const a = terms[x]?.key ?? "";
         const b = terms[y]?.key ?? "";
         return a < b ? -1 : a > b ? 1 : 0;
-      }),
-      backward: order((x, y) => compareFromEnd(terms[x]?.chars ?? "", terms[y]?.chars ?? "")),
-    };
-    return cached;
+      })
+    : { rank: Int32Array.from(terms, (_, i) => i), byRank: Int32Array.from(terms, (_, i) => i) };
+  let backwardOrder: Order | undefined;
+  const backward = (): Order => {
+    if (backwardOrder !== undefined) return backwardOrder;
+    // A key with no characters above U+FFFF compares from the end exactly as
+    // its reverse compares from the start, which is much faster.
+    const reversed = terms.map((t) => {
+      if (typeof t.chars !== "string") return undefined;
+      // Keys are at most MAX_COMPARED_KEY_LENGTH units, few enough to spread.
+      const units = new Array<number>(t.chars.length);
+      for (let k = 0; k < units.length; k += 1) units[k] = t.chars.charCodeAt(units.length - 1 - k);
+      return String.fromCharCode(...units);
+    });
+    backwardOrder = order((x, y) => {
+      const a = reversed[x];
+      const b = reversed[y];
+      if (a !== undefined && b !== undefined) return a < b ? -1 : a > b ? 1 : 0;
+      return compareFromEnd(terms[x]?.chars ?? "", terms[y]?.chars ?? "");
+    });
+    return backwardOrder;
   };
+  const place = forward.rank;
+  const termAt = forward.byRank;
 
   // Two summaries of each key's letters, by code point as `chars` holds
   // them: which letters it has, folded into 32 buckets, and how many of each,
@@ -858,9 +991,18 @@ function spelling(terms: readonly Prepared[], out: Collector): void {
   // differences smaller). Keys whose summaries differ by more than
   // 2 × limit can't be within the limit, and their distance needn't be
   // worked out.
-  const letterSets = new Int32Array(terms.length);
-  const letterCounts = new Int32Array(terms.length);
-  terms.forEach((t, i) => {
+  //
+  // These, each key's length in characters and a number for each different
+  // key sit side by side in `facts`, FACTS numbers for each place, so
+  // passing over a pair reads two short runs of memory instead of two terms
+  // and their keys. `uri` says which places hold a term with a URI.
+  const facts = new Int32Array(terms.length * FACTS);
+  const uri = new Uint8Array(terms.length);
+  const keyIds = new Map<string, number>();
+  const designatorIds = new Map<string, number>();
+  termAt.forEach((i, r) => {
+    const t = terms[i];
+    if (t === undefined) return;
     let set = 0;
     let counts = 0;
     for (const c of t.key) {
@@ -870,13 +1012,47 @@ function spelling(terms: readonly Prepared[], out: Collector): void {
       const count = (counts >>> shift) & 15;
       counts = (counts & ~(15 << shift)) | (((count + 1) & 15) << shift);
     }
-    letterSets[i] = set;
-    letterCounts[i] = counts;
+    let keyId = keyIds.get(t.key);
+    if (keyId === undefined) keyIds.set(t.key, (keyId = keyIds.size));
+    facts[r * FACTS] = t.chars.length;
+    facts[r * FACTS + 1] = keyId;
+    facts[r * FACTS + 2] = set;
+    facts[r * FACTS + 3] = counts;
+    let designatorId = designatorIds.get(t.designators);
+    if (designatorId === undefined) {
+      designatorIds.set(t.designators, (designatorId = designatorIds.size));
+    }
+    facts[r * FACTS + 4] = designatorId;
+    uri[r] = t.hasUri ? 1 : 0;
   });
-  const lettersWithin = (i: number, j: number, limit: number): boolean => {
-    if (bitCount((letterSets[i] ?? 0) ^ (letterSets[j] ?? 0)) > 2 * limit) return false;
-    const x = letterCounts[i] ?? 0;
-    const y = letterCounts[j] ?? 0;
+  // Each key of at most POOLED_LENGTH characters as numbers (its code
+  // points), one after another in key order, so working out a distance reads
+  // neighbouring runs of one array rather than two strings anywhere in
+  // memory. `pooledAt` is where a place's key starts, or -1 for a longer key.
+  const pooledAt = new Int32Array(terms.length).fill(-1);
+  let pooledLength = 0;
+  termAt.forEach((i, r) => {
+    const length = terms[i]?.chars.length ?? POOLED_LENGTH + 1;
+    if (length > POOLED_LENGTH) return;
+    pooledAt[r] = pooledLength;
+    pooledLength += length;
+  });
+  const pool = new Int32Array(pooledLength);
+  termAt.forEach((i, r) => {
+    const chars = terms[i]?.chars ?? "";
+    const start = pooledAt[r] ?? -1;
+    if (start < 0) return;
+    for (let k = 0; k < chars.length; k += 1) {
+      pool[start + k] =
+        typeof chars === "string" ? chars.charCodeAt(k) : (chars[k]?.codePointAt(0) ?? 0);
+    }
+  });
+  const lettersWithin = (p: number, q: number, limit: number): boolean => {
+    const setA = facts[p * FACTS + 2] ?? 0;
+    const setB = facts[q * FACTS + 2] ?? 0;
+    if (bitCount(setA ^ setB) > 2 * limit) return false;
+    const x = facts[p * FACTS + 3] ?? 0;
+    const y = facts[q * FACTS + 3] ?? 0;
     let apart = 0;
     for (let shift = 0; shift < 32; shift += 4) {
       const gap = Math.abs(((x >>> shift) & 15) - ((y >>> shift) & 15));
@@ -885,21 +1061,29 @@ function spelling(terms: readonly Prepared[], out: Collector): void {
     return apart <= 2 * limit;
   };
 
-  const visited = new PairSet();
+  const visited = new PairSet(terms.length);
   let cells = 0;
-  /** Visit one pair; false when the budget has run out. */
-  const visit = (i: number, j: number): boolean => {
+  /** Visit the pair at places p and q; false when the budget has run out. */
+  const visit = (p: number, q: number): boolean => {
     // Remembered now: if the budget stops the search below, it stops for good.
-    if (!visited.add(i, j)) return true;
-    const a = terms[i];
-    const b = terms[j];
-    if (a === undefined || b === undefined) return true;
-    const product = a.chars.length * b.chars.length;
-    const needsDistance =
-      a.key !== b.key && !out.has(i, j) && out.eligible(i, j, "similar_spelling");
-    const limit = Math.min(a.chars.length, b.chars.length) >= 10 ? 2 : 1;
-    // Charged only for the work done: a pair passed over costs a visit.
-    const worked = needsDistance && lettersWithin(i, j, limit);
+    if (!visited.add(p, q)) return true;
+    const lengthA = facts[p * FACTS] ?? 0;
+    const lengthB = facts[q * FACTS] ?? 0;
+    const product = lengthA * lengthB;
+    const limit = Math.min(lengthA, lengthB) >= 10 ? 2 : 1;
+    const i = termAt[p] ?? 0;
+    const j = termAt[q] ?? 0;
+    // Charged only for the work done: a pair passed over costs a visit. The
+    // cheapest tests come first; none of them changes anything. Different
+    // keys, a term without a URI and the same designators are what
+    // `out.eligible` asks for a spelling pair (different keys mean two
+    // different terms).
+    const worked =
+      facts[p * FACTS + 1] !== facts[q * FACTS + 1] &&
+      (uri[p] === 0 || uri[q] === 0) &&
+      facts[p * FACTS + 4] === facts[q * FACTS + 4] &&
+      lettersWithin(p, q, limit) &&
+      !out.has(i, j);
     const cost = worked ? Math.max(VISIT_CELLS, product) : VISIT_CELLS;
     if (cells + cost > MAX_SPELLING_CELLS) {
       out.limits.add("spelling_budget");
@@ -911,22 +1095,36 @@ function spelling(terms: readonly Prepared[], out: Collector): void {
     }
     cells += cost;
     if (!worked) return true;
-    const d = boundedDistance(a.chars, b.chars, limit);
+    const startA = pooledAt[p] ?? -1;
+    const startB = pooledAt[q] ?? -1;
+    let d: number;
+    if (startA >= 0 && startB >= 0) {
+      d = codeDistance(pool, startA, lengthA, pool, startB, lengthB, limit);
+    } else {
+      const a = terms[i];
+      const b = terms[j];
+      if (a === undefined || b === undefined) return true;
+      d = boundedDistance(a.chars, b.chars, limit);
+    }
     if (d <= limit) out.add(i, j, "similar_spelling", d);
     return true;
   };
 
-  for (const [key, list] of blocks) {
+  for (let block = 0; block < blocks.length; block += 1) {
+    const list = blocks[block] ?? [];
     if (list.length < 2) continue;
+    // Places, in the list's order.
+    const places = new Int32Array(list.length);
+    for (let k = 0; k < list.length; k += 1) places[k] = place[list[k] ?? 0] ?? 0;
     // A block with only URI terms can't give a pair.
-    if (!list.some((i) => terms[i]?.hasUri === false)) continue;
-    if (list.length <= BLOCK_ALL_PAIRS) {
-      for (let x = 0; x < list.length; x += 1) {
-        for (let y = x + 1; y < list.length; y += 1) {
-          const i = list[x] ?? 0;
-          const j = list[y] ?? 0;
-          if (terms[i]?.hasUri === true && terms[j]?.hasUri === true) continue;
-          if (!visit(i, j)) return;
+    if (!places.some((p) => uri[p] === 0)) continue;
+    if (places.length <= BLOCK_ALL_PAIRS) {
+      for (let x = 0; x < places.length; x += 1) {
+        for (let y = x + 1; y < places.length; y += 1) {
+          const p = places[x] ?? 0;
+          const q = places[y] ?? 0;
+          if (uri[p] === 1 && uri[q] === 1) continue;
+          if (!visit(p, q)) return;
         }
       }
       continue;
@@ -935,24 +1133,37 @@ function spelling(terms: readonly Prepared[], out: Collector): void {
     // of shared endings) and compare each term without a URI with the
     // nearest few on each side. Only neighbours are compared, so a pair
     // further apart can be missed, unless every key in the block is the same.
-    const first = terms[list[0] ?? 0]?.key;
-    if (list.some((i) => terms[i]?.key !== first)) out.limits.add("large_blocks");
-    const rank = key.includes("|s:") || key.includes("|n:") ? ranks().backward : ranks().forward;
-    const sorted = [...list].sort((x, y) => (rank[x] ?? 0) - (rank[y] ?? 0));
+    const first = facts[(places[0] ?? 0) * FACTS + 1];
+    if (places.some((p) => facts[p * FACTS + 1] !== first)) out.limits.add("large_blocks");
+    let sorted: Int32Array;
+    if (fromEnd[block] === true) {
+      const { rank, byRank } = backward();
+      sorted = Int32Array.from(list, (i) => rank[i] ?? 0)
+        .sort()
+        .map((r) => place[byRank[r] ?? 0] ?? 0);
+    } else {
+      sorted = places.sort();
+    }
     for (let x = 0; x < sorted.length; x += 1) {
-      const i = sorted[x] ?? 0;
-      if (terms[i]?.hasUri !== false) continue;
+      const p = sorted[x] ?? 0;
+      if (uri[p] !== 0) continue;
       const from = Math.max(0, x - NEIGHBOURS);
       const to = Math.min(sorted.length - 1, x + NEIGHBOURS);
       for (let y = from; y <= to; y += 1) {
-        const j = sorted[y] ?? 0;
+        const q = sorted[y] ?? 0;
         // Looking back, only at terms with a URI: a term without one before
         // this one already looked forward at it.
-        if (y === x || (y < x && terms[j]?.hasUri !== true)) continue;
-        if (!visit(i, j)) return;
+        if (y === x || (y < x && uri[q] !== 1)) continue;
+        if (!visit(p, q)) return;
       }
     }
   }
+}
+
+/** A term's place in an order of all terms, and the term at each place. */
+interface Order {
+  readonly rank: Int32Array;
+  readonly byRank: Int32Array;
 }
 
 /** How many bits of a 32-bit number are set. */
@@ -963,56 +1174,72 @@ function bitCount(x: number): number {
 }
 
 /**
- * A set of pairs of term positions (each below 2^31), in typed arrays with
- * open addressing: far less memory and time than a `Set` of numbers that
- * outgrow small integers. Pairs are unordered.
+ * A set of pairs of term positions (of a list of at most 65,535 terms), in
+ * one typed array with open addressing, four bytes a pair: far less memory
+ * and time than a `Set` of numbers that outgrow small integers. Pairs are
+ * unordered.
  */
 class PairSet {
-  private low = new Int32Array(1 << 12).fill(-1);
-  private high = new Int32Array(1 << 12);
+  /**
+   * Each pair is one number, lower × n + higher, which is below n² and so
+   * below 2^32 for n up to 65,535; stored as its 32 bits, so the empty
+   * mark -1 (2^32 - 1) is never a pair.
+   */
+  private table = new Int32Array(1 << 12).fill(-1);
   private size = 0;
+  /**
+   * Pairs of positions 1 to NEAR apart, which are most of them when the
+   * positions are places in key order, as one bit each: bit d - 1 of the
+   * lower position's NEAR bits. Far fewer cache misses than the table.
+   */
+  private readonly near: Int32Array;
+
+  constructor(private readonly n: number) {
+    if (n > 65_535) throw new RangeError("PairSet holds positions below 65,535.");
+    this.near = new Int32Array(n * (NEAR / 32));
+  }
 
   /** Add the pair; false if it was there already. */
   add(i: number, j: number): boolean {
     const x = Math.min(i, j);
     const y = Math.max(i, j);
-    const at = this.slot(x, y);
-    if (this.low[at] !== -1) return false;
-    this.low[at] = x;
-    this.high[at] = y;
+    const gap = y - x - 1;
+    if (gap >= 0 && gap < NEAR) {
+      const at = x * (NEAR / 32) + (gap >>> 5);
+      const bit = 1 << (gap & 31);
+      const word = this.near[at] ?? 0;
+      if ((word & bit) !== 0) return false;
+      this.near[at] = word | bit;
+      return true;
+    }
+    const key = (x * this.n + y) | 0;
+    const at = this.slot(key);
+    if (this.table[at] !== -1) return false;
+    this.table[at] = key;
     this.size += 1;
-    if (this.size * 2 > this.low.length) this.grow();
+    if (this.size * 2 > this.table.length) this.grow();
     return true;
   }
 
   /** Where the pair is, or the empty slot where it would go. */
-  private slot(x: number, y: number): number {
-    const mask = this.low.length - 1;
-    // Mixed with MurmurHash3's finaliser, so evenly spaced positions spread.
-    let h = Math.imul(x, 0x9e3779b1) ^ y;
-    h = Math.imul(h ^ (h >>> 16), 0x85ebca6b);
+  private slot(key: number): number {
+    const table = this.table;
+    const mask = table.length - 1;
+    // MurmurHash3's finaliser, so evenly spaced pairs spread.
+    let h = Math.imul(key ^ (key >>> 16), 0x85ebca6b);
     h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
     let at = (h ^ (h >>> 16)) & mask;
     for (;;) {
-      const l = this.low[at] ?? -1;
-      if (l === -1 || (l === x && this.high[at] === y)) return at;
+      const k = table[at] ?? -1;
+      if (k === -1 || k === key) return at;
       at = (at + 1) & mask;
     }
   }
 
   private grow(): void {
-    const low = this.low;
-    const high = this.high;
-    this.low = new Int32Array(low.length * 2).fill(-1);
-    this.high = new Int32Array(low.length * 2);
-    for (let k = 0; k < low.length; k += 1) {
-      const x = low[k] ?? -1;
-      if (x === -1) continue;
-      const y = high[k] ?? 0;
-      const at = this.slot(x, y);
-      this.low[at] = x;
-      this.high[at] = y;
-    }
+    const old = this.table;
+    this.table = new Int32Array(old.length * 2).fill(-1);
+    for (const key of old) if (key !== -1) this.table[this.slot(key)] = key;
   }
 }
 
@@ -1032,22 +1259,18 @@ function compareFromEnd(a: ArrayLike<string>, b: ArrayLike<string>): number {
  * deletions, substitutions and swaps of two neighbouring characters), or
  * `limit + 1` as soon as it is known to be more than `limit`. `a` and `b`
  * are lists of characters (a string works when it has no characters above
- * U+FFFF). Only cells within `limit` of the diagonal are computed, so the
- * cost is about length × (2 × limit + 1).
+ * U+FFFF). See `codeDistance` for how it is worked out.
  */
 export function boundedDistance(a: ArrayLike<string>, b: ArrayLike<string>, limit: number): number {
-  const over = limit + 1;
-  if (Math.abs(a.length - b.length) > limit) return over;
+  if (Math.abs(a.length - b.length) > limit) return limit + 1;
   const n = a.length;
   const m = b.length;
   // Compared as numbers, which is much faster than as one-letter strings.
   if (codesA.length < n) codesA = new Int32Array(n * 2);
   if (codesB.length < m) codesB = new Int32Array(m * 2);
-  const ca = codesA;
-  const cb = codesB;
   if (typeof a === "string" && typeof b === "string") {
-    for (let k = 0; k < n; k += 1) ca[k] = a.charCodeAt(k);
-    for (let k = 0; k < m; k += 1) cb[k] = b.charCodeAt(k);
+    for (let k = 0; k < n; k += 1) codesA[k] = a.charCodeAt(k);
+    for (let k = 0; k < m; k += 1) codesB[k] = b.charCodeAt(k);
   } else {
     // Lists of characters: number each different character.
     const ids = new Map<string, number>();
@@ -1057,59 +1280,109 @@ export function boundedDistance(a: ArrayLike<string>, b: ArrayLike<string>, limi
       if (v === undefined) ids.set(key, (v = ids.size));
       return v;
     };
-    for (let k = 0; k < n; k += 1) ca[k] = id(a[k]);
-    for (let k = 0; k < m; k += 1) cb[k] = id(b[k]);
+    for (let k = 0; k < n; k += 1) codesA[k] = id(a[k]);
+    for (let k = 0; k < m; k += 1) codesB[k] = id(b[k]);
   }
-  // Three rows, reused across calls: two back (for swaps), previous and
-  // current. Each row is written only around its band, plus one cell either
-  // side set to "over", which is all the next rows read, so nothing needs
-  // clearing between calls.
-  if (scratch.length < 3 * (m + 1)) scratch = new Int32Array(3 * (m + 1) * 2);
-  const rows = scratch;
-  let prev2 = 0;
-  let prev = m + 1;
-  let cur = 2 * (m + 1);
-  // Row 0: only its first limit + 2 cells are ever read.
-  for (let j = 0; j <= Math.min(m, limit + 1); j += 1) rows[prev + j] = Math.min(j, over);
-  for (let i = 1; i <= n; i += 1) {
-    const from = Math.max(1, i - limit);
-    const to = Math.min(m, i + limit);
-    for (let j = Math.max(0, from - 1); j <= Math.min(m, to + 1); j += 1) rows[cur + j] = over;
-    let best = over;
-    if (from === 1) {
-      rows[cur] = i <= limit ? i : over;
-      best = Math.min(over, (rows[cur] ?? over) + Math.abs(n - i - m));
-    }
-    const ai = ca[i - 1] ?? -1;
-    const aPrev = i > 1 ? (ca[i - 2] ?? -1) : -2;
-    for (let j = from; j <= to; j += 1) {
-      const bj = cb[j - 1] ?? -1;
-      const cost = ai === bj ? 0 : 1;
-      let v = Math.min(
-        (rows[prev + j] ?? over) + 1,
-        (rows[cur + j - 1] ?? over) + 1,
-        (rows[prev + j - 1] ?? over) + cost,
-      );
-      if (j > 1 && ai === (cb[j - 2] ?? -1) && aPrev === bj) {
-        v = Math.min(v, (rows[prev2 + j - 2] ?? over) + 1);
-      }
-      v = Math.min(v, over);
-      rows[cur + j] = v;
-      // What's left of the two keys differs in length by this much, so at
-      // least that many more edits are needed from this cell.
-      const atLeast = v + Math.abs(n - i - (m - j));
-      if (atLeast < best) best = atLeast;
-    }
-    if (best > limit) return over;
-    const spare = prev2;
-    prev2 = prev;
-    prev = cur;
-    cur = spare;
-  }
-  return Math.min(rows[prev + m] ?? over, over);
+  return codeDistance(codesA, 0, n, codesB, 0, m, limit);
 }
 
-/** Rows and codes for `boundedDistance`, kept between calls (it never runs re-entrantly). */
-let scratch = new Int32Array(3 * 64);
+/**
+ * `boundedDistance` of `n` characters of `ca` from `startA` and `m` of `cb`
+ * from `startB`, given as numbers that are equal exactly when the
+ * characters are (never negative).
+ *
+ * It follows diagonals rather than filling a table (Ukkonen, "Algorithms
+ * for approximate string matching", 1985; Landau and Vishkin, 1989): cell
+ * (i, j) is on diagonal j - i, and for e = 0, 1, … up to `limit` it keeps,
+ * for each diagonal, the furthest row reachable with at most e edits. From
+ * the furthest rows with e - 1 edits, one more edit (a substitution, an
+ * insertion, a deletion, or a swap of the two characters after the furthest
+ * row) gives a new row, and matching characters then slide it along its
+ * diagonal for free. The distance is the first e that reaches the end. This
+ * is the same table's answer because, along a diagonal, its values never go
+ * down, so only the furthest row with each count matters; the tests check
+ * it against the full table on every pair of short keys. Only diagonals
+ * low to high are followed: a path of at most `limit` edits from diagonal 0
+ * to diagonal m - n leaves the diagonal only by inserting or deleting, one
+ * diagonal per edit, so it never goes further. The work is about
+ * (limit + 1)² steps plus the characters slid over, so keys that differ
+ * early are given up at once.
+ */
+function codeDistance(
+  ca: Int32Array,
+  startA: number,
+  n: number,
+  cb: Int32Array,
+  startB: number,
+  m: number,
+  limit: number,
+): number {
+  const over = limit + 1;
+  if (Math.abs(n - m) > limit) return over;
+  const delta = m - n;
+  const low = Math.ceil((delta - limit) / 2);
+  const high = Math.floor((delta + limit) / 2);
+  // One spare diagonal either side, never reached, so d - 1 and d + 1 can be
+  // read without checks. Diagonal d is at d + shift.
+  const width = high - low + 3;
+  if (rowsA.length < width) {
+    rowsA = new Int32Array(width * 2);
+    rowsB = new Int32Array(width * 2);
+  }
+  let before = rowsA;
+  let now = rowsB;
+  before.fill(UNREACHED, 0, width);
+  now.fill(UNREACHED, 0, width);
+  const shift = 1 - low;
+  /** Slide along diagonal d from row r while the characters match. */
+  const slide = (r: number, d: number): number => {
+    let row = r;
+    while (row < n && row + d < m && ca[startA + row] === cb[startB + row + d]) row += 1;
+    return row;
+  };
+  before[shift] = slide(0, 0);
+  if (delta === 0 && before[shift] === n) return 0;
+  for (let e = 1; e <= limit; e += 1) {
+    const from = Math.max(low, -e);
+    const to = Math.min(high, e);
+    for (let d = from; d <= to; d += 1) {
+      const at = d + shift;
+      // Already reached with fewer edits.
+      const stay = before[at] ?? UNREACHED;
+      let r = stay;
+      // A substitution: one row and one column on.
+      if (stay >= 0 && stay < n && stay + d < m && stay + 1 > r) r = stay + 1;
+      // An insertion: one column on, from diagonal d - 1.
+      const inserted = before[at - 1] ?? UNREACHED;
+      if (inserted >= 0 && inserted + d <= m && inserted > r) r = inserted;
+      // A deletion: one row on, from diagonal d + 1.
+      const deleted = before[at + 1] ?? UNREACHED;
+      if (deleted >= 0 && deleted < n && deleted + 1 > r) r = deleted + 1;
+      // A swap of the next two characters.
+      if (
+        stay >= 0 &&
+        stay + 2 <= n &&
+        stay + d + 2 <= m &&
+        ca[startA + stay] === cb[startB + stay + d + 1] &&
+        ca[startA + stay + 1] === cb[startB + stay + d] &&
+        stay + 2 > r
+      ) {
+        r = stay + 2;
+      }
+      now[at] = r >= 0 ? slide(r, d) : UNREACHED;
+    }
+    if (now[delta + shift] === n) return e;
+    const spare = before;
+    before = now;
+    now = spare;
+  }
+  return over;
+}
+
+/** A diagonal not reached (yet). */
+const UNREACHED = -1_000_000_000;
+/** Codes and diagonals for the distance, kept between calls (it never runs re-entrantly). */
+let rowsA = new Int32Array(16);
+let rowsB = new Int32Array(16);
 let codesA = new Int32Array(64);
 let codesB = new Int32Array(64);
