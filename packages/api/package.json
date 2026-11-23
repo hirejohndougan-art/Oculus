@@ -1,0 +1,23 @@
+{
+  "name": "@oculus/api",
+  "version": "0.0.0",
+  "description": "Oculus HTTP layer: the configured Fastify server and its security rules (D-051).",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "fastify": "5.12.8"
+  }
+}

@@ -1,0 +1,515 @@
+/**
+ * The Oculus HTTP server: Fastify 5 with the rules of D-051 and D-058 on top.
+ *
+ * `buildServer` returns a ready Fastify instance (call `listen` to serve, or
+ * `inject` in tests). Its only route of its own is `GET /health`; the
+ * application's routes come in `options.routes` as plain `OculusRoute`s
+ * (routes.ts). Application code never gets the Fastify instance, request or
+ * reply, only a frozen request view and a narrow reply, so it can't add
+ * parsers, hooks or error handlers, raise limits, hijack replies, reach the
+ * raw socket or server, or write cookies around the writer; handlers return
+ * plain data or text only. Every route Fastify adds is checked again in
+ * onRoute, and the instance is ready (closed to changes) on return.
+ *
+ * The rules, each with an attack test in this package:
+ * 1. Bodies (body.ts): only Oculus's parsers: exact `application/json`, and
+ *    `application/x-www-form-urlencoded` on form routes; 415 for any other
+ *    type, a body without a type, and compressed bodies; prototype keys,
+ *    repeated JSON keys and form fields, nesting deeper than 64, non-finite
+ *    numbers, a byte order mark, bad UTF-8 and bad percent-encoding refused.
+ * 2. Limits (body.ts, routes.ts): counted in bytes, chunked bodies included:
+ *    1 MiB by default, 8 KiB on credentials routes (sign-in, two-step, site
+ *    password); routes can't choose their own.
+ * 3. Paths (paths.ts): encoded slashes, backslashes, dots and unreserved
+ *    characters, `.`/`..` segments, NUL and other control characters, double
+ *    encoding and `//` refused with 400 in the first onRequest hook, before
+ *    any handler. Unknown paths get 404 (an empty `:param` counts as
+ *    unknown) and known paths with the wrong method 405 (with `Allow`); the
+ *    router is case-sensitive and normalizes nothing.
+ * 4. Cookies (cookies.ts): no cookie plugin; only Oculus's own names are
+ *    read, an Oculus name sent twice is refused, and every `Set-Cookie` must
+ *    be one the writer issued (`__Host-`, Secure, HttpOnly, SameSite Lax or
+ *    Strict, Path=/, nothing else) or it is removed and the reply is a 500.
+ * 5. Changes (origin.ts): every method other than GET and HEAD needs an
+ *    `Origin` listed in `OCULUS_ORIGINS` and naming the request's host, or
+ *    `Sec-Fetch-Site: same-origin`; else 403.
+ * 6. Proxies (proxy.ts): `trustProxy` is off unless `OCULUS_TRUSTED_PROXY`
+ *    names the proxy's addresses, in ranges no wider than D-058 allows.
+ * 7. Timeouts: explicit and shorter than Node's and Fastify's defaults
+ *    (`SERVER_TIMEOUTS`); options can only shorten them.
+ *    After the handler timeout the request view's `signal` fires and the
+ *    reply stops working.
+ * 8. Errors (errors.ts): `{ "error": "<code>" }` only, never a message or a
+ *    stack trace, including requests Node itself can't parse; 5xx details go
+ *    to the server log as a fixed-shape record of plain strings. Whatever a
+ *    handler throws is replaced by a fresh Refusal before Fastify sees it,
+ *    and the error handler can't throw (it falls back to a fixed 500), so
+ *    Fastify's default error handler never runs. Every header and cookie the
+ *    handler set is dropped from an error reply. The request logger records
+ *    the method and path only.
+ * 9. Headers (headers.ts): handlers write only the allowlisted headers
+ *    (Content-Language, ETag, Last-Modified, Vary, a same-origin Location,
+ *    Retry-After, and the Content-Type through `type()`), and every reply,
+ *    the router's own errors included, carries nosniff, no-referrer, a CSP
+ *    that loads nothing and `Cache-Control: no-store`.
+ *
+ * Adding another Fastify plugin, parser or error handler is its own decision
+ * (D-051).
+ */
+import type { Socket } from "node:net";
+import Fastify, {
+  type FastifyInstance,
+  type FastifyReply,
+  type FastifyRequest,
+  type FastifyServerOptions,
+} from "fastify";
+import {
+  CREDENTIALS_BODY_LIMIT,
+  DEFAULT_BODY_LIMIT,
+  bodyHeaderProblem,
+  registerBodyParsers,
+} from "./body.js";
+import { cookieHeaderProblem, replyCookieProblem } from "./cookies.js";
+import {
+  Refusal,
+  errorReply,
+  rebuildThrown,
+  summarizeThrown,
+  type ThrownSummary,
+} from "./errors.js";
+import { SECURITY_HEADERS } from "./headers.js";
+import { failsOriginCheck, originsFromEnv } from "./origin.js";
+import { RouteTable, pathOf, pathProblem } from "./paths.js";
+import { trustedProxyFromEnv } from "./proxy.js";
+import {
+  checkRoute,
+  oculusReply,
+  oculusRequest,
+  resultBody,
+  routeConfig,
+  routeOptionsProblem,
+  type OculusRoute,
+} from "./routes.js";
+
+/** Milliseconds. Node's defaults: no socket timeout, 300 s request, 60 s headers. */
+export interface ServerTimeouts {
+  /** Idle socket. */
+  readonly connection: number;
+  /** The whole request, headers and body, must arrive within this. */
+  readonly request: number;
+  /** The headers must arrive within this (slow-header attacks). */
+  readonly headers: number;
+  /** Idle keep-alive connection between requests (Fastify's default is 72 s). */
+  readonly keepAlive: number;
+  /** A handler that runs longer is answered with 503. */
+  readonly handler: number;
+}
+
+export const SERVER_TIMEOUTS: ServerTimeouts = {
+  connection: 30_000,
+  request: 30_000,
+  headers: 10_000,
+  keepAlive: 5_000,
+  handler: 30_000,
+};
+
+/** How often Node checks the request and headers timeouts (its default is 30 s). */
+const TIMEOUT_CHECK_INTERVAL = 1_000;
+const MAX_PARAM_LENGTH = 100;
+
+export interface ServerOptions {
+  /** Where `OCULUS_ORIGINS` and `OCULUS_TRUSTED_PROXY` are read; defaults to `process.env`. */
+  readonly env?: Readonly<Record<string, string | undefined>>;
+  /**
+   * Log requests (method and path only) and server errors, to standard output
+   * or to the given stream. Off by default.
+   */
+  readonly logger?: boolean | { readonly stream: { write(line: string): void } };
+  /** Shorter timeouts, for tests; a longer value is refused. */
+  readonly timeouts?: Partial<ServerTimeouts>;
+  /** The application's routes (routes.ts); nothing else can add one. */
+  readonly routes?: readonly OculusRoute[];
+}
+
+function chooseTimeouts(overrides: Partial<ServerTimeouts> = {}): ServerTimeouts {
+  const result = { ...SERVER_TIMEOUTS };
+  for (const key of Object.keys(SERVER_TIMEOUTS) as (keyof ServerTimeouts)[]) {
+    const value = overrides[key];
+    if (value === undefined) continue;
+    if (!Number.isInteger(value) || value <= 0 || value > SERVER_TIMEOUTS[key]) {
+      throw new Error(
+        `timeouts.${key} must be a whole number from 1 to ${String(SERVER_TIMEOUTS[key])}`,
+      );
+    }
+    result[key] = value;
+  }
+  // Node requires the headers timeout to be no longer than the request timeout.
+  return { ...result, headers: Math.min(result.headers, result.request) };
+}
+
+/** The first rule an incoming request breaks, checked before routing's handler. */
+function requestRefusal(
+  request: FastifyRequest,
+  origins: ReadonlySet<string>,
+): Refusal | undefined {
+  if (pathProblem(request.raw.url) !== undefined) return new Refusal(400, "bad_path");
+  // The router lets `/items/` reach `/items/:id` with an empty id; treat it as unknown.
+  const params = (request.params ?? {}) as Record<string, unknown>;
+  for (const [name, value] of Object.entries(params)) {
+    if (name !== "*" && value === "") return new Refusal(404, "not_found");
+  }
+  const refusal = bodyHeaderProblem(request) ?? cookieHeaderProblem(request.headers.cookie);
+  if (refusal !== undefined) return refusal;
+  if (failsOriginCheck(request, origins)) return new Refusal(403, "cross_origin");
+  return undefined;
+}
+
+const CLIENT_ERRORS: Readonly<Record<string, readonly [number, string, string]>> = {
+  HPE_HEADER_OVERFLOW: [431, "headers_too_large", "Request Header Fields Too Large"],
+  ERR_HTTP_REQUEST_TIMEOUT: [408, "request_timeout", "Request Timeout"],
+};
+
+/** Requests Node can't parse: the same `{ "error": code }` shape, then close. */
+function clientError(error: { code?: string }, socket: Socket): void {
+  if (error.code === "ECONNRESET" || !socket.writable) {
+    socket.destroy();
+    return;
+  }
+  const [status, code, reason] = CLIENT_ERRORS[error.code ?? ""] ?? [
+    400,
+    "bad_request",
+    "Bad Request",
+  ];
+  const body = JSON.stringify({ error: code });
+  socket.end(
+    `HTTP/1.1 ${String(status)} ${reason}\r\n` +
+      "Content-Type: application/json; charset=utf-8\r\n" +
+      `Content-Length: ${String(Buffer.byteLength(body))}\r\n` +
+      Object.entries(SECURITY_HEADERS)
+        .map(([name, value]) => `${name}: ${value}\r\n`)
+        .join("") +
+      "Connection: close\r\n\r\n" +
+      body,
+  );
+}
+
+/**
+ * What the log gets for a 500 a handler caused: a summary of plain strings,
+ * never the value. Keyed by the request (not the Refusal), so two requests
+ * can never share an entry.
+ */
+const failures = new WeakMap<FastifyRequest, ThrownSummary>();
+
+/**
+ * Logs a failure the client can no longer be told about (the handler timed
+ * out and its 503 is sent, or the client has gone): the same fixed-shape
+ * record of plain strings, with the method and path only. Never throws.
+ */
+function logLateFailure(request: FastifyRequest, fresh: Refusal, thrown: unknown): void {
+  try {
+    request.log.error(
+      {
+        failure: {
+          status: fresh.statusCode,
+          code: fresh.code,
+          method: request.method,
+          path: pathOf(request.raw.url ?? ""),
+          ...summarizeThrown(thrown),
+        },
+      },
+      "request failed after the reply was sent",
+    );
+  } catch {
+    // A logger that fails can't change the reply, which is already sent.
+  }
+}
+
+/**
+ * Registers one application route (already checked and copied by
+ * `checkRoute`). Whatever the handler throws or rejects with is caught here
+ * and replaced by a fresh Refusal (errors.ts), so no value of the handler's
+ * (its getters, a Proxy, a `headers` object) ever reaches Fastify, its
+ * default error handler, a diagnostics_channel subscriber or the logger. The
+ * request view carries an AbortSignal that fires on the handler timeout or
+ * when the client goes away; from then on the reply view throws, and a late
+ * result or failure is never handed to Fastify (which would log the request
+ * URL, query string included, and the error object).
+ */
+function addRoute(app: FastifyInstance, route: OculusRoute): void {
+  const credentials = route.credentials === true;
+  const handler = route.handler;
+  app.route({
+    method: route.method,
+    url: route.path,
+    ...(credentials ? { bodyLimit: CREDENTIALS_BODY_LIMIT } : {}),
+    config: routeConfig(route),
+    handler: async (request, reply) => {
+      const controller = new AbortController();
+      let running = true;
+      const stop = (): void => {
+        running = false;
+        if (!controller.signal.aborted) controller.abort(new Error("the request has ended"));
+      };
+      // The response closes during the handler only when the handler
+      // timeout has sent its 503 or the connection is gone. (Fastify's
+      // `request.signal` can't be used: it also fires when the request
+      // body has been read, while the handler is still working.)
+      const response = reply.raw;
+      if (response.writableEnded || response.destroyed) stop();
+      else response.once("close", stop);
+      const ended = (): boolean => controller.signal.aborted || reply.sent;
+      let body: unknown;
+      try {
+        const result: unknown = await handler(
+          oculusRequest(request, controller.signal),
+          oculusReply(reply, () => running),
+        );
+        // Copied as plain data before Fastify sees it: a Response, stream or
+        // Buffer would skip the header checks below (routes.ts).
+        body = resultBody(result);
+      } catch (thrown) {
+        const fresh = rebuildThrown(thrown);
+        if (ended()) {
+          // Too late to answer: Fastify would log `{ err }` (pino's error
+          // serializer throws on a frozen Refusal) and then "reply already
+          // sent" with the full URL. Log the summary here and stop.
+          logLateFailure(request, fresh, thrown);
+          return undefined;
+        }
+        if (fresh.statusCode >= 500) failures.set(request, summarizeThrown(thrown));
+        throw fresh;
+      } finally {
+        running = false;
+        response.removeListener("close", stop);
+      }
+      // Timed out (the 503 is already sent) or the client has gone.
+      if (ended()) return undefined;
+      return reply.send(body);
+    },
+  });
+}
+
+const FALLBACK_BODY = '{"error":"internal_error"}';
+
+/**
+ * The last resort when the error handler itself fails: a fixed 500 written
+ * straight to the socket with the security headers, or a closed connection
+ * if the reply has already started. Never throws.
+ */
+function sendFallback(reply: FastifyReply): void {
+  try {
+    const raw = reply.raw;
+    if (raw.headersSent || raw.writableEnded) {
+      raw.destroy();
+      return;
+    }
+    void reply.hijack();
+    for (const name of raw.getHeaderNames()) raw.removeHeader(name);
+    raw.writeHead(500, {
+      ...SECURITY_HEADERS,
+      "content-type": "application/json; charset=utf-8",
+      "content-length": String(Buffer.byteLength(FALLBACK_BODY)),
+    });
+    raw.end(FALLBACK_BODY);
+  } catch {
+    try {
+      reply.raw.destroy();
+    } catch {
+      // Nothing is left to try.
+    }
+  }
+}
+
+/** `{ "error": code }` with the security headers, for replies that skip onSend. */
+function sendDirect(reply: FastifyReply, status: number, code: string): void {
+  try {
+    void reply
+      .code(status)
+      .headers(SECURITY_HEADERS)
+      .type("application/json; charset=utf-8")
+      .send(JSON.stringify({ error: code }));
+  } catch {
+    sendFallback(reply);
+  }
+}
+
+/** What the log shows for an error object Fastify passes to the logger. */
+const OMITTED_ERROR = Object.freeze({ type: "omitted", message: "", stack: "" });
+
+/** Fields a log record may carry; Fastify's own and the `failure` record. */
+const LOG_FIELDS: ReadonlySet<string> = new Set([
+  "req",
+  "res",
+  "failure",
+  "responseTime",
+  "statusCode",
+]);
+
+/**
+ * A query string (`?` and what follows up to white space) removed from a log
+ * message. Fastify writes `request.url` into some messages ("Reply was
+ * already sent … in "/x?q=…"", "Route GET:/x?q=… not found").
+ */
+export function withoutQuery(text: string): string {
+  return text.replace(/\?\S+/g, "");
+}
+
+/** The merging object of a log call, rebuilt from the allowed fields only. */
+function safeLogFields(value: unknown): Record<string, unknown> {
+  const fields: Record<string, unknown> = {};
+  if (typeof value !== "object" || value === null) return fields;
+  if (value instanceof Error) {
+    fields.err = OMITTED_ERROR;
+    return fields;
+  }
+  for (const key of Object.keys(value)) {
+    if (key === "err") fields.err = OMITTED_ERROR;
+    else if (LOG_FIELDS.has(key)) fields[key] = (value as Record<string, unknown>)[key];
+  }
+  return fields;
+}
+
+/**
+ * pino's `logMethod` hook: every log call (Fastify's and ours) goes out as
+ * at most a rebuilt merging object and one message with any query string
+ * removed. Error objects are never serialized, their messages never become
+ * the log message, and printf-style arguments are dropped.
+ */
+function safeLogCall(this: unknown, args: unknown[], method: (...args: unknown[]) => void): void {
+  const [first, second] = args;
+  if (typeof first === "string") {
+    method.call(this, withoutQuery(first));
+    return;
+  }
+  const fields = safeLogFields(first);
+  // Without a message pino would take `err.message`; give it a fixed one.
+  const message = typeof second === "string" ? withoutQuery(second) : "log record";
+  method.call(this, fields, message);
+}
+
+/** Builds the configured Oculus server and waits until it is ready. */
+export async function buildServer(options: ServerOptions = {}): Promise<FastifyInstance> {
+  const timeouts = chooseTimeouts(options.timeouts);
+  const env = options.env ?? process.env;
+  const trustProxy = trustedProxyFromEnv(env);
+  const origins = originsFromEnv(env);
+  const appRoutes = (options.routes ?? []).map(checkRoute);
+
+  const logger: FastifyServerOptions["logger"] =
+    options.logger === undefined || options.logger === false
+      ? false
+      : {
+          level: "info",
+          ...(options.logger === true ? {} : { stream: options.logger.stream }),
+          serializers: {
+            // Method and path only: no query string, headers, cookies or address.
+            req: (req) => ({ method: req.method, url: pathOf(req.url) }),
+            // Never looks at the error: pino's own serializer writes to it (and
+            // throws on a frozen Refusal) and copies its message, which for
+            // Fastify's own errors can hold the URL with its query string.
+            err: () => OMITTED_ERROR,
+          },
+          hooks: { logMethod: safeLogCall },
+        };
+
+  const app: FastifyInstance = Fastify({
+    logger,
+    trustProxy,
+    bodyLimit: DEFAULT_BODY_LIMIT,
+    onProtoPoisoning: "error",
+    onConstructorPoisoning: "error",
+    connectionTimeout: timeouts.connection,
+    requestTimeout: timeouts.request,
+    keepAliveTimeout: timeouts.keepAlive,
+    handlerTimeout: timeouts.handler,
+    http: {
+      headersTimeout: timeouts.headers,
+      connectionsCheckingInterval: TIMEOUT_CHECK_INTERVAL,
+    },
+    requestIdHeader: false,
+    exposeHeadRoutes: true,
+    return503OnClosing: true,
+    allowErrorHandlerOverride: false,
+    routerOptions: {
+      caseSensitive: true,
+      ignoreTrailingSlash: false,
+      ignoreDuplicateSlashes: false,
+      allowUnsafeRegex: false,
+      // useSemicolonDelimiter stays at its default, false (Fastify's types
+      // don't list it here); paths.attacks.test.ts checks it.
+      maxParamLength: MAX_PARAM_LENGTH,
+    },
+    frameworkErrors: (_error, _request, reply) => {
+      // A URL the router can't decode (`/items/%C0%AF`) or a parameter
+      // longer than maxParamLength. These replies skip the onSend hook, so
+      // the security headers are set here. The reply type here is generic.
+      sendDirect(reply, 400, "bad_request");
+    },
+    clientErrorHandler: clientError,
+  });
+
+  const routes = new RouteTable(MAX_PARAM_LENGTH);
+
+  registerBodyParsers(app);
+
+  app.addHook("onRoute", (route) => {
+    const problem = routeOptionsProblem(route);
+    if (problem !== undefined) throw new Error(`${route.url}: ${problem}`);
+    routes.add(route.method, route.url);
+  });
+
+  // Rule 3 first: nothing else looks at a refused path.
+  app.addHook("onRequest", (request, _reply, done) => {
+    done(requestRefusal(request, origins));
+  });
+
+  app.addHook("onSend", async (_request, reply, payload) => {
+    if (replyCookieProblem(reply, reply.getHeader("set-cookie")) !== undefined) {
+      reply.removeHeader("set-cookie");
+      throw new Error("a Set-Cookie header broke the cookie rules");
+    }
+    for (const [name, value] of Object.entries(SECURITY_HEADERS)) void reply.header(name, value);
+    return payload;
+  });
+
+  // The error handler can't throw: if anything in it fails (a logger whose
+  // stream throws, say), the fixed fallback is written instead, so Fastify's
+  // own default error handler (which sends the message and copies
+  // `error.headers`) is never reached. It reads the error only through
+  // errorReply and summarizeThrown, which never throw.
+  app.setErrorHandler((error, request, reply) => {
+    try {
+      const { statusCode, body } = errorReply(error);
+      if (statusCode >= 500) {
+        const thrown = failures.get(request) ?? summarizeThrown(error);
+        failures.delete(request);
+        // A fixed-shape record of plain strings; never the error object itself.
+        request.log.error(
+          { failure: { status: statusCode, code: body.error, ...thrown } },
+          "request failed",
+        );
+      }
+      // Nothing the handler set (headers, cookies, Location) goes out with an error.
+      for (const name of Object.keys(reply.getHeaders())) reply.removeHeader(name);
+      return reply.code(statusCode).type("application/json; charset=utf-8").send(body);
+    } catch {
+      sendFallback(reply);
+      return undefined;
+    }
+  });
+
+  app.setNotFoundHandler((request, reply) => {
+    const allowed = routes.allowedMethods(pathOf(request.raw.url ?? ""));
+    const wrongMethod = allowed.length > 0 && !allowed.includes(request.method);
+    if (wrongMethod) reply.header("allow", allowed.join(", "));
+    return reply
+      .code(wrongMethod ? 405 : 404)
+      .send({ error: wrongMethod ? "method_not_allowed" : "not_found" });
+  });
+
+  addRoute(app, checkRoute({ method: "GET", path: "/health", handler: () => ({ status: "ok" }) }));
+  for (const route of appRoutes) addRoute(app, route);
+
+  await app.ready();
+  return app;
+}
