@@ -37,6 +37,10 @@ describe("path refusals (400 before any handler)", () => {
     "/items/%ff",
     "/items/%zz",
     "/items/%",
+    "/item%73/1",
+    "/items/%31",
+    "/%68ealth",
+    "/items/a%7Eb",
   ])("refuses %s, sent raw over a socket", async (url) => {
     const { calls } = await setup();
     if (app === undefined) throw new Error("no app");
@@ -92,6 +96,7 @@ describe("path refusals (400 before any handler)", () => {
     expect(calls.count).toBe(2);
     expect(pathProblem("/files/a..b")).toBeUndefined();
     expect(pathProblem("/items/")).toBeUndefined();
+    expect(pathProblem("/files/caf%C3%A9%20%21")).toBeUndefined();
   });
 
   it("doesn't treat ; as a delimiter, ignore case or trailing slashes", async () => {
@@ -176,9 +181,16 @@ describe("404 and 405", () => {
 
   it("refuses an application route with unsupported syntax at start-up", async () => {
     await expect(
-      testServer({}, (r) => {
-        r.get("/bad/:id(^\\d+$)", () => ({}));
-      }),
+      testServer({}, [{ method: "GET", path: "/bad/:id(^\\d+$)", handler: () => ({}) }]),
     ).rejects.toThrow(/router syntax/);
+  });
+
+  it("treats an empty parameter as an unknown path, never reaching the handler", async () => {
+    const { calls } = await setup();
+    if (app === undefined) throw new Error("no app");
+    const res = await app.inject({ method: "GET", url: "/items/" });
+    expect(res.statusCode).toBe(404);
+    expect(res.json()).toEqual({ error: "not_found" });
+    expect(calls.count).toBe(0);
   });
 });

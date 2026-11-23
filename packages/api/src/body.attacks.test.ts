@@ -4,8 +4,16 @@ import { Readable } from "node:stream";
 import { gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
-import { CREDENTIALS_BODY_LIMIT, DEFAULT_BODY_LIMIT, isExactMediaType } from "./body.js";
-import { SAME_ORIGIN, testServer } from "./test-server.fixtures.js";
+import {
+  CREDENTIALS_BODY_LIMIT,
+  DEFAULT_BODY_LIMIT,
+  MAX_JSON_DEPTH,
+  isExactMediaType,
+  parseFormBody,
+} from "./body.js";
+import { SAME_ORIGIN, TEST_ENV, testServer } from "./test-server.fixtures.js";
+import { buildServer } from "./server.js";
+import type { OculusRoute } from "./routes.js";
 
 let app: FastifyInstance | undefined;
 afterEach(async () => {
@@ -122,10 +130,16 @@ describe("content types (415)", () => {
     expect(calls.count).toBe(0);
   });
 
-  it("checks media types exactly", () => {
+  it("checks media types exactly, with RFC 9110 whitespace", () => {
     expect(isExactMediaType("application/json", "application/json")).toBe(true);
     expect(isExactMediaType(undefined, "application/json")).toBe(false);
-    expect(isExactMediaType("application/json ; charset = utf-8", "application/json")).toBe(true);
+    expect(isExactMediaType("application/json ;\tcharset=utf-8", "application/json")).toBe(true);
+    expect(isExactMediaType("application/json; charset = utf-8", "application/json")).toBe(false);
+    expect(isExactMediaType("application/json; charset =utf-8", "application/json")).toBe(false);
+    expect(isExactMediaType("application/json;\u000bcharset=utf-8", "application/json")).toBe(
+      false,
+    );
+    expect(isExactMediaType("application/json; charset=utf-8 ", "application/json")).toBe(false);
     expect(
       isExactMediaType("application/json; charset=utf-8; charset=utf-8", "application/json"),
     ).toBe(false);
@@ -188,11 +202,88 @@ describe("body contents", () => {
     expect(calls.count).toBe(0);
   });
 
-  it("survives deeply nested JSON", async () => {
+  it("refuses JSON nested deeper than 64, and survives very deep input", async () => {
+    const { calls } = await setup();
+    const nest = (n: number) => "[".repeat(n) + "]".repeat(n);
+    expect((await post("/accept", "application/json", nest(MAX_JSON_DEPTH))).statusCode).toBe(200);
+    const objects = '{"a":'.repeat(MAX_JSON_DEPTH) + "1" + "}".repeat(MAX_JSON_DEPTH);
+    expect((await post("/accept", "application/json", objects)).statusCode).toBe(200);
+    for (const payload of [
+      nest(MAX_JSON_DEPTH + 1),
+      nest(200_000),
+      '{"a":' + nest(MAX_JSON_DEPTH) + "}",
+    ]) {
+      const res = await post("/accept", "application/json", payload);
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toEqual({ error: "too_deep" });
+    }
+    expect(calls.count).toBe(2);
+  });
+
+  it.each([
+    ['{"role":"viewer","role":"admin"}', "repeated_key"],
+    ['{"role":"viewer","r\\u006fle":"admin"}', "repeated_key"],
+    ['[{"a":1,"b":{"a":2},"a":3}]', "repeated_key"],
+    ["1e400", "bad_number"],
+    ['{"n":-1e400}', "bad_number"],
+    ["[1, 2e308]", "bad_number"],
+  ])("refuses %s", async (payload, code) => {
+    const { calls } = await setup();
+    const res = await post("/echo", "application/json", payload);
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toEqual({ error: code });
+    expect(calls.count).toBe(0);
+  });
+
+  it("accepts the same key in different objects and keys that only look alike", async () => {
     await setup();
-    const deep = "[".repeat(200_000) + "]".repeat(200_000);
-    const res = await post("/accept", "application/json", deep);
+    const res = await post(
+      "/echo",
+      "application/json",
+      '[{"a":1},{"a":2},{"a":{"a":3}},{"A":1,"a":"\\"a\\""}]',
+    );
     expect(res.statusCode).toBe(200);
+    expect((await post("/echo", "application/json", '{"n":1.5e300,"m":-0.5}')).statusCode).toBe(
+      200,
+    );
+  });
+
+  it("refuses a byte order mark", async () => {
+    const { calls } = await setup();
+    const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+    expect(
+      (await post("/echo", "application/json", Buffer.concat([bom, Buffer.from("{}")]))).statusCode,
+    ).toBe(400);
+    expect(
+      (
+        await post(
+          "/form",
+          "application/x-www-form-urlencoded",
+          Buffer.concat([bom, Buffer.from("a=1")]),
+        )
+      ).statusCode,
+    ).toBe(400);
+    expect(calls.count).toBe(0);
+  });
+
+  it.each(["a=%FF", "a=%C3", "a=%", "a=%z1", "a=%e9t%e9", "%ED%A0%80=1"])(
+    "refuses bad percent-encoding in forms: %s",
+    async (payload) => {
+      const { calls } = await setup();
+      const res = await post("/form", "application/x-www-form-urlencoded", payload);
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toEqual({ error: "bad_body" });
+      expect(calls.count).toBe(0);
+    },
+  );
+
+  it("decodes forms like browsers send them", () => {
+    expect(parseFormBody(Buffer.from("a=caf%C3%A9+au+lait&&b&c=&d=1%2B1%3D2"))).toEqual({
+      a: "café au lait",
+      b: "",
+      c: "",
+      d: "1+1=2",
+    });
   });
 });
 
@@ -259,14 +350,22 @@ describe("byte-counted limits (413)", () => {
     expect(calls.count).toBe(0);
   });
 
-  it("doesn't let a credentials route raise its own limit", async () => {
+  it("holds JSON credentials routes to 8 KiB too", async () => {
     const { calls } = await setup();
-    const res = await post(
-      "/sign-in-greedy",
-      "application/json",
-      JSON.stringify("x".repeat(CREDENTIALS_BODY_LIMIT)),
-    );
+    const payload = JSON.stringify("x".repeat(CREDENTIALS_BODY_LIMIT));
+    const res = await post("/sign-in-json", "application/json", payload);
     expect(res.statusCode).toBe(413);
     expect(calls.count).toBe(0);
+  });
+
+  it("doesn't let a route choose its own body limit", async () => {
+    const greedy = {
+      method: "POST",
+      path: "/greedy",
+      credentials: true,
+      bodyLimit: 10 * 1024 * 1024,
+      handler: () => ({}),
+    } as unknown as OculusRoute;
+    await expect(buildServer({ env: TEST_ENV, routes: [greedy] })).rejects.toThrow(/bodyLimit/);
   });
 });
