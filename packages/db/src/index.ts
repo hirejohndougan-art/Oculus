@@ -1,8 +1,9 @@
 /**
  * @oculus/db: the only package that talks to PostgreSQL (D-050). Every query
  * is written with the `sql` tag; `migrate` applies `packages/db/migrations`;
- * `catalog.ts` reads and writes the catalog tables and `identifiers.ts` the
- * identifier tables, both through core's validators.
+ * `catalog.ts` reads and writes the catalog tables, `identifiers.ts` the
+ * identifier tables and `vocabularies.ts` the stored terms and the index of
+ * which records use them, all through core's validators.
  */
 export { sql, joinSql, isSql, Sql, MAX_PARAMETERS } from "./sql.js";
 export type { SqlScalar, SqlValue } from "./sql.js";
@@ -41,3 +42,25 @@ export {
   allocateIdentifiers,
 } from "./identifiers.js";
 export type { AllocationRequest, StoredRecordIdentifiers } from "./identifiers.js";
+export {
+  termKey,
+  saveTerm,
+  readTerm,
+  readTerms,
+  refreshRecordTerms,
+  clearRecordTerms,
+  termUsageCounts,
+  recordsUsingTerm,
+  recordsWithStaleTerms,
+  DEFAULT_TERM_LIST_LIMIT,
+  MAX_TERM_LIST_LIMIT,
+} from "./vocabularies.js";
+export type {
+  StoredTerm,
+  TermUsage,
+  RecordTerms,
+  TermCount,
+  TermCounts,
+  TermUsers,
+  StaleRecords,
+} from "./vocabularies.js";
