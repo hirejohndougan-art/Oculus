@@ -15,9 +15,18 @@
 -- (a unit filed under its own descendant), a parent that is an archival unit
 -- at a higher level, a record type of the record's kind, a template that
 -- applies to the record's kind, and the fields themselves against the
--- template.
+-- template. That includes links to other records inside fields (record_link
+-- values): JSON has no foreign key, so checking that a link names a record of
+-- the same organization, and refusing to delete a record others link to, are
+-- the service layer's too.
 --
--- Nothing here cascades: deleting a row that others point at is refused.
+-- Nothing here cascades: deleting a row that another row points at through a
+-- column (a parent, a represented record, a template, a record type) is
+-- refused.
+--
+-- What identifies a row never changes (catalog_keep_identity, at the end): no
+-- UPDATE can move a row to another organization or give it another ID, key or
+-- version number, even a row nothing points at.
 
 -- One organization in the install. The ID is a random version 4 UUID that
 -- never changes; the name can.
@@ -94,7 +103,11 @@ CREATE TABLE public.record_type_versions (
 -- Catalog records (records.ts). The columns every kind has, then the ones
 -- only some kinds have, then the template-defined fields as JSONB.
 CREATE TABLE public.records (
-  id uuid PRIMARY KEY
+  -- Unique within its organization only: the key is (organization_id, id), so
+  -- another organization holding the same ID is never refused and learns
+  -- nothing about this one's IDs. The service layer makes the IDs (random
+  -- version 4 UUIDs), never the person.
+  id uuid NOT NULL
     CHECK (id::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'),
   organization_id uuid NOT NULL REFERENCES public.organizations (id),
   kind text NOT NULL
@@ -126,8 +139,8 @@ CREATE TABLE public.records (
     CHECK (date_trunc('milliseconds', updated_at AT TIME ZONE 'UTC') = updated_at AT TIME ZONE 'UTC'),
   CHECK (updated_at >= created_at),
 
-  -- The target of the composite foreign keys below.
-  UNIQUE (organization_id, id),
+  -- Also the target of the composite foreign keys below.
+  PRIMARY KEY (organization_id, id),
   FOREIGN KEY (organization_id, template_key) REFERENCES public.templates (organization_id, key),
   FOREIGN KEY (organization_id, record_type_key)
     REFERENCES public.record_types (organization_id, key),
@@ -154,3 +167,37 @@ CREATE INDEX records_parent ON public.records (organization_id, parent_id)
   WHERE parent_id IS NOT NULL;
 CREATE INDEX records_represents ON public.records (organization_id, represents_id)
   WHERE represents_id IS NOT NULL;
+
+-- What identifies a row can't be changed by UPDATE: its organization, and its
+-- ID, key or version number. The trigger's arguments name those columns. A
+-- foreign key alone would let a row nothing points at (a lone record, a
+-- template version) move to another organization (D-019). Raised as
+-- SQLSTATE 23000 with the constraint named <table>_<column>_fixed.
+CREATE FUNCTION public.catalog_keep_identity() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+  column_name text;
+BEGIN
+  FOREACH column_name IN ARRAY TG_ARGV LOOP
+    IF to_jsonb(NEW) -> column_name IS DISTINCT FROM to_jsonb(OLD) -> column_name THEN
+      RAISE EXCEPTION '%.% identifies the row and can''t be changed.', TG_TABLE_NAME, column_name
+        USING ERRCODE = 'integrity_constraint_violation',
+              CONSTRAINT = TG_TABLE_NAME || '_' || column_name || '_fixed';
+    END IF;
+  END LOOP;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER organizations_keep_identity BEFORE UPDATE ON public.organizations
+  FOR EACH ROW EXECUTE FUNCTION public.catalog_keep_identity('id');
+CREATE TRIGGER templates_keep_identity BEFORE UPDATE ON public.templates
+  FOR EACH ROW EXECUTE FUNCTION public.catalog_keep_identity('organization_id', 'key');
+CREATE TRIGGER template_versions_keep_identity BEFORE UPDATE ON public.template_versions
+  FOR EACH ROW EXECUTE FUNCTION public.catalog_keep_identity('organization_id', 'key', 'version');
+CREATE TRIGGER record_types_keep_identity BEFORE UPDATE ON public.record_types
+  FOR EACH ROW EXECUTE FUNCTION public.catalog_keep_identity('organization_id', 'key');
+CREATE TRIGGER record_type_versions_keep_identity BEFORE UPDATE ON public.record_type_versions
+  FOR EACH ROW EXECUTE FUNCTION public.catalog_keep_identity('organization_id', 'key', 'version');
+CREATE TRIGGER records_keep_identity BEFORE UPDATE ON public.records
+  FOR EACH ROW EXECUTE FUNCTION public.catalog_keep_identity('organization_id', 'id');

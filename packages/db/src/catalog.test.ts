@@ -25,7 +25,7 @@ import {
   type TemplateCheckOptions,
   type Validated,
 } from "@oculus/core";
-import { openDatabase, type Database } from "./client.js";
+import { openDatabase, type Database, type Queryable, type Row } from "./client.js";
 import {
   insertOrganization,
   insertRecord,
@@ -37,7 +37,7 @@ import {
   readTemplate,
 } from "./catalog.js";
 import { migrate } from "./migrate.js";
-import { sql } from "./sql.js";
+import { sql, type Sql } from "./sql.js";
 import { freshDatabase, type TestDatabase } from "./test-database.fixtures.js";
 
 // ---------------------------------------------------------------------------
@@ -113,6 +113,8 @@ async function refusedBy(
 const FOREIGN_KEY = "23503";
 const CHECK = "23514";
 const NOT_NULL = "23502";
+const UNIQUE = "23505";
+const IDENTITY = "23000"; // catalog_keep_identity: integrity_constraint_violation
 
 // ---------------------------------------------------------------------------
 // Invented sample data.
@@ -409,8 +411,7 @@ describe("templates", () => {
 describe("record types", () => {
   it("round-trip, checked against their default template", async () => {
     await ready();
-    const template = ok(await readTemplate(db, ARCHIVES, "dublin-core-digital-asset")).template;
-    const stored = ok(await insertRecordTypeVersion(db, scanType(ARCHIVES), template));
+    const stored = ok(await insertRecordTypeVersion(db, scanType(ARCHIVES)));
     expect(stored.version).toBe(1);
     expect(ok(await readRecordType(db, ARCHIVES, "scan"))).toEqual({
       version: 1,
@@ -420,22 +421,73 @@ describe("record types", () => {
     expect(await readRecordType(db, LIBRARY, "scan")).toBeUndefined();
   });
 
-  it("refuses a default template that doesn't fit, or is another organization's", async () => {
+  it("refuses a default template that doesn't fit, or that the organization doesn't have", async () => {
     await ready();
-    const objectTemplate = ok(await readTemplate(db, ARCHIVES, "spectrum-object")).template;
     expect(
       codes(
-        await insertRecordTypeVersion(
-          db,
-          { ...scanType(ARCHIVES), key: "photo", defaultTemplateKey: "spectrum-object" },
-          objectTemplate,
-        ),
+        await insertRecordTypeVersion(db, {
+          ...scanType(ARCHIVES),
+          key: "photo",
+          defaultTemplateKey: "spectrum-object",
+        }),
       ),
     ).toContain("template_wrong_kind");
-    const theirs = ok(await readTemplate(db, LIBRARY, "dublin-core-digital-asset")).template;
+    const org = newOrganizationId();
+    ok(await insertOrganization(db, { id: org, name: "No templates" }));
+    // The archives and the library have the template; this organization doesn't.
+    expect(codes(await insertRecordTypeVersion(db, scanType(org)))).toContain("unknown_template");
     expect(
-      codes(await insertRecordTypeVersion(db, { ...scanType(ARCHIVES), key: "photo" }, theirs)),
-    ).toContain("wrong_organization");
+      codes(await insertRecordTypeVersion(db, { ...scanType(org), kind: "spaceship" })),
+    ).toContain("invalid_kind");
+  });
+
+  it("checks against the stored template, never one the caller hands in", async () => {
+    await ready();
+    const org = newOrganizationId();
+    ok(await insertOrganization(db, { id: org, name: "Objects only" }));
+    const objects = { ...authorityTemplate(org), key: "objects-only", appliesTo: ["object"] };
+    ok(await insertTemplateVersion(db, objects));
+    // A made-up copy of the template claiming it applies to digital assets.
+    const fake = { ...objects, appliesTo: ["object", "digital_asset"] };
+    const type = { ...scanType(org), defaultTemplateKey: "objects-only" };
+    const insertWith = insertRecordTypeVersion as (
+      ...args: unknown[]
+    ) => ReturnType<typeof insertRecordTypeVersion>;
+    expect(codes(await insertWith(db, type, fake))).toContain("template_wrong_kind");
+    expect(await readRecordType(db, org, "scan")).toBeUndefined();
+    expect(
+      await db.rows(sql`SELECT key FROM public.record_types WHERE organization_id = ${org}::uuid`),
+    ).toEqual([]);
+  });
+
+  it("refuses the write if the default template changes between the check and the insert", async () => {
+    await ready();
+    const org = newOrganizationId();
+    ok(await insertOrganization(db, { id: org, name: "Racing" }));
+    const photos = { ...authorityTemplate(org), key: "photos", appliesTo: ["digital_asset"] };
+    ok(await insertTemplateVersion(db, photos));
+    // Right after the template is read, someone saves a version that no
+    // longer applies to digital assets.
+    let raced = false;
+    const racing: Queryable = {
+      async rows<R extends Row = Row>(query: Sql): Promise<R[]> {
+        const rows = await db.rows<R>(query);
+        if (!raced) {
+          raced = true;
+          ok(await insertTemplateVersion(db, { ...photos, appliesTo: ["object"] }));
+        }
+        return rows;
+      },
+      execute: (query) => db.execute(query),
+    };
+    const type = { ...scanType(org), defaultTemplateKey: "photos" };
+    expect(codes(await insertRecordTypeVersion(racing, type))).toEqual(["template_changed"]);
+    expect(raced).toBe(true);
+    expect(
+      await db.rows(sql`SELECT key FROM public.record_types WHERE organization_id = ${org}::uuid`),
+    ).toEqual([]);
+    // Now checked against version 2, it is refused for what it is.
+    expect(codes(await insertRecordTypeVersion(db, type))).toContain("template_wrong_kind");
   });
 });
 
@@ -452,13 +504,7 @@ describe("records", () => {
     }
     templates.push(ok(await insertTemplateVersion(db, authorityTemplate(org))).template);
     const registry = ok(indexTemplates(templates));
-    const type = ok(
-      await insertRecordTypeVersion(
-        db,
-        scanType(org),
-        ok(await readTemplate(db, org, "dublin-core-digital-asset")).template,
-      ),
-    ).recordType;
+    const type = ok(await insertRecordTypeVersion(db, scanType(org))).recordType;
     const types = ok(indexRecordTypes([type], registry));
     const options = identifierChecker(org);
 
@@ -631,6 +677,16 @@ describe("the tables back up core's rules against direct SQL", () => {
         )
       ).code,
     ).toBe(FOREIGN_KEY);
+    expect(
+      await refusedBy(
+        rawRecord({
+          kind: "digital_asset",
+          mediaType: "image/tiff",
+          represents: newRecordId(),
+          template: "dublin-core-digital-asset",
+        }),
+      ),
+    ).toEqual({ code: FOREIGN_KEY, constraint: "records_organization_id_represents_id_fkey" });
   });
 
   it("titles, keys, fields and timestamps follow core's rules", async () => {
@@ -760,10 +816,7 @@ describe("organizations stay separate, even through direct SQL", () => {
       code: FOREIGN_KEY,
       constraint: "records_organization_id_template_key_fkey",
     });
-    const template = ok(await readTemplate(db, ARCHIVES, "dublin-core-digital-asset")).template;
-    ok(
-      await insertRecordTypeVersion(db, { ...scanType(ARCHIVES), key: "archives-only" }, template),
-    );
+    ok(await insertRecordTypeVersion(db, { ...scanType(ARCHIVES), key: "archives-only" }));
     expect(
       await refusedBy(
         rawRecord({
@@ -800,8 +853,9 @@ describe("organizations stay separate, even through direct SQL", () => {
     await ready();
     const org = newOrganizationId();
     ok(await insertOrganization(db, { id: org, name: "Squatter" }));
-    // The JSON claims the archives, matching the row, but the row's key
-    // belongs only to the archives' templates.
+    // The JSON names the new organization, matching the row, so the checks
+    // pass; but that organization has no "authority" template of its own
+    // (only the archives and the library do), so the foreign key refuses it.
     const theirs = JSON.stringify(authorityTemplate(org));
     expect(
       await refusedBy(sql`
@@ -810,7 +864,7 @@ describe("organizations stay separate, even through direct SQL", () => {
     ).toEqual({ code: FOREIGN_KEY, constraint: "template_versions_organization_id_key_fkey" });
   });
 
-  it("moving a record or its parent to another organization is refused", async () => {
+  it("moving a record, a unit with children or a lone record to another organization is refused", async () => {
     await ready();
     const parent = await archivesUnit();
     const child = made({
@@ -822,20 +876,125 @@ describe("organizations stay separate, even through direct SQL", () => {
       templateKey: "dacs-archival-unit",
     });
     ok(await insertRecord(db, child));
-    expect(
-      (
+    // A lone record: nothing points at it and it points at nothing but its
+    // template, which the library has under the same key.
+    const lone = made({
+      organizationId: ARCHIVES,
+      kind: "object",
+      title: "A lone chair",
+      templateKey: "spectrum-object",
+    });
+    ok(await insertRecord(db, lone));
+    for (const id of [lone.id, child.id, parent]) {
+      expect(
         await refusedBy(
-          sql`UPDATE public.records SET organization_id = ${LIBRARY}::uuid WHERE id = ${child.id}::uuid`,
-        )
-      ).code,
-    ).toBe(FOREIGN_KEY);
+          sql`UPDATE public.records SET organization_id = ${LIBRARY}::uuid
+              WHERE organization_id = ${ARCHIVES}::uuid AND id = ${id}::uuid`,
+        ),
+      ).toEqual({ code: IDENTITY, constraint: "records_organization_id_fixed" });
+    }
+    // Nor can it take another ID.
     expect(
-      (
-        await refusedBy(
-          sql`UPDATE public.records SET organization_id = ${LIBRARY}::uuid WHERE id = ${parent}::uuid`,
-        )
-      ).code,
-    ).toBe(FOREIGN_KEY);
+      await refusedBy(
+        sql`UPDATE public.records SET id = ${newRecordId()}::uuid
+            WHERE organization_id = ${ARCHIVES}::uuid AND id = ${lone.id}::uuid`,
+      ),
+    ).toEqual({ code: IDENTITY, constraint: "records_id_fixed" });
+    expect(ok(await readRecord(db, ARCHIVES, lone.id))).toEqual(lone);
+    expect(await readRecord(db, LIBRARY, lone.id)).toBeUndefined();
+    // Other columns can still be edited.
+    expect(
+      await db.execute(
+        sql`UPDATE public.records SET title = 'A lone chair, edited'
+            WHERE organization_id = ${ARCHIVES}::uuid AND id = ${lone.id}::uuid`,
+      ),
+    ).toBe(1);
+  });
+
+  it("templates, record types and their versions can't move to another organization or be renumbered", async () => {
+    await ready();
+    const org = newOrganizationId();
+    ok(await insertOrganization(db, { id: org, name: "Movers" }));
+    ok(await insertTemplateVersion(db, authorityTemplate(org)));
+    ok(await insertTemplateVersion(db, { ...authorityTemplate(org), label: "Second" }));
+    const dublinCore = STANDARD_PRESETS.find((p) => p.key === "dublin-core-digital-asset");
+    ok(await insertTemplateVersion(db, ok(templateFromPreset(dublinCore, org))));
+    ok(await insertRecordTypeVersion(db, scanType(org)));
+    // A template identity with no versions, which nothing points at.
+    await db.execute(
+      sql`INSERT INTO public.templates (organization_id, key) VALUES (${org}::uuid, 'unused')`,
+    );
+    const where = sql`organization_id = ${org}::uuid`;
+    const attempts: [Sql, string][] = [
+      [
+        sql`UPDATE public.templates SET organization_id = ${LIBRARY}::uuid WHERE ${where} AND key = 'unused'`,
+        "templates_organization_id_fixed",
+      ],
+      [
+        sql`UPDATE public.templates SET key = 'renamed' WHERE ${where} AND key = 'unused'`,
+        "templates_key_fixed",
+      ],
+      // The library has an "authority" template too, so only the trigger stops these.
+      [
+        sql`UPDATE public.template_versions
+            SET organization_id = ${LIBRARY}::uuid,
+                definition = jsonb_set(definition, '{organizationId}', to_jsonb(${LIBRARY}::text))
+            WHERE ${where} AND key = 'authority' AND version = 2`,
+        "template_versions_organization_id_fixed",
+      ],
+      [
+        sql`UPDATE public.template_versions SET version = 7 WHERE ${where} AND key = 'authority' AND version = 2`,
+        "template_versions_version_fixed",
+      ],
+      [
+        sql`UPDATE public.record_type_versions
+            SET organization_id = ${LIBRARY}::uuid,
+                definition = jsonb_set(definition, '{organizationId}', to_jsonb(${LIBRARY}::text))
+            WHERE ${where} AND key = 'scan'`,
+        "record_type_versions_organization_id_fixed",
+      ],
+      [
+        sql`UPDATE public.record_types SET organization_id = ${LIBRARY}::uuid WHERE ${where} AND key = 'scan'`,
+        "record_types_organization_id_fixed",
+      ],
+    ];
+    for (const [query, constraint] of attempts) {
+      expect(await refusedBy(query)).toEqual({ code: IDENTITY, constraint });
+    }
+    expect(ok(await readTemplate(db, org, "authority"))).toMatchObject({ version: 2 });
+    expect(ok(await readRecordType(db, org, "scan")).recordType.organizationId).toBe(org);
+  });
+
+  it("an organization's ID never changes", async () => {
+    await ready();
+    const org = newOrganizationId();
+    ok(await insertOrganization(db, { id: org, name: "Lone organization" }));
+    expect(
+      await refusedBy(
+        sql`UPDATE public.organizations SET id = ${newOrganizationId()}::uuid WHERE id = ${org}::uuid`,
+      ),
+    ).toEqual({ code: IDENTITY, constraint: "organizations_id_fixed" });
+  });
+
+  it("two organizations can hold the same record ID; one organization can't hold it twice", async () => {
+    await ready();
+    const mine = made({
+      organizationId: ARCHIVES,
+      kind: "object",
+      title: "The archives' chair",
+      templateKey: "spectrum-object",
+    });
+    ok(await insertRecord(db, mine));
+    // The library gets the same ID (by chance, or because it guessed it): it
+    // is stored, and nothing tells the library the archives has it.
+    const theirs = { ...mine, organizationId: LIBRARY, title: "The library's chair" };
+    ok(await insertRecord(db, theirs));
+    expect(ok(await readRecord(db, ARCHIVES, mine.id))).toEqual(mine);
+    expect(ok(await readRecord(db, LIBRARY, mine.id))).toEqual(theirs);
+    await expect(insertRecord(db, { ...mine, title: "Again" })).rejects.toMatchObject({
+      code: UNIQUE,
+      constraint: "records_pkey",
+    });
   });
 
   it("two organizations can use the same template and record type keys", async () => {
@@ -844,8 +1003,7 @@ describe("organizations stay separate, even through direct SQL", () => {
     const library = ok(await readTemplate(db, LIBRARY, "spectrum-object")).template;
     expect(archives.organizationId).toBe(ARCHIVES);
     expect(library.organizationId).toBe(LIBRARY);
-    const template = ok(await readTemplate(db, LIBRARY, "dublin-core-digital-asset")).template;
-    ok(await insertRecordTypeVersion(db, scanType(LIBRARY), template));
+    ok(await insertRecordTypeVersion(db, scanType(LIBRARY)));
     expect(ok(await readRecordType(db, LIBRARY, "scan")).recordType.organizationId).toBe(LIBRARY);
   });
 });

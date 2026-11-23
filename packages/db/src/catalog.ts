@@ -12,22 +12,29 @@
  * Every read names the organization (D-019, D-030): a record, template or
  * record type is looked up by its organization and its own ID or key, so
  * asking for another organization's row finds nothing. The tables' foreign
- * keys all include `organization_id`, so a write can't point across either.
+ * keys all include `organization_id`, so a write can't point across either,
+ * and triggers keep every row's organization, ID, key and version fixed.
  *
  * What is left to the service layer (T-032): which organization a session may
- * use, transactions spanning several writes, checking a record's fields
- * against its template (that needs the organization's identifier types and
- * records, `checkRecordAgainstTemplate`), a record type of the record's kind
+ * use, making record IDs, transactions spanning several writes, checking a
+ * record's fields against its template (that needs the organization's
+ * identifier types and records, `checkRecordAgainstTemplate`), links inside
+ * `fields` naming records of the same organization (the organization's
+ * `makeRecordLinkChecker`; JSON has no foreign key), refusing to delete a
+ * record others link to, a record type of the record's kind
  * (`checkRecordType`), and cycles in the arrangement (`validateArrangement`).
  *
  * Database errors (a foreign key or check refusing a row, a lost connection)
- * are thrown as `pg` reports them.
+ * are thrown as `pg` reports them. Their text names tables, constraints and
+ * values: the service layer turns them into its own messages and never shows
+ * a person the raw text.
  */
 import {
   issue,
   isOrganizationId,
   isRecordId,
   isTemplateKey,
+  indexTemplates,
   validateOrganization,
   validateRecord,
   validateRecordType,
@@ -163,25 +170,47 @@ function storedTemplate(
 
 /**
  * Stores a record type as its organization's next version of that key, as
- * `insertTemplateVersion` does. `template` is the type's default template
- * (say from `readTemplate`): `validateRecordType` checks it belongs to the
- * type's organization, has the type's `defaultTemplateKey` and applies to the
- * type's kind, and the table's foreign key checks that the organization has
- * stored a template with that key.
+ * `insertTemplateVersion` does. The type is checked against the current
+ * version of its default template as stored (`validateRecordType`: the
+ * template exists in the type's organization and applies to the type's kind),
+ * never against a template the caller holds, which may be stale or made up.
+ * The insert then happens only if that version is still the current one, in
+ * the same statement; if another version was saved in between, nothing is
+ * stored and the issue is `template_changed` (read and try again).
  */
 export async function insertRecordTypeVersion(
   db: Queryable,
   input: unknown,
-  template: FieldTemplate,
 ): Promise<Validated<StoredRecordType>> {
-  const valid = validateRecordType(input, template);
+  const org = ownString(input, "organizationId");
+  const templateKey = ownString(input, "defaultTemplateKey");
+  if (org === undefined || !isOrganizationId(org) || templateKey === undefined) {
+    // validateRecordType says what is wrong with the type itself.
+    return withoutTemplate(input);
+  }
+  const [current] = isTemplateKey(templateKey)
+    ? await db.rows<{ version: number; definition: unknown }>(sql`
+        SELECT version, definition FROM public.template_versions
+        WHERE organization_id = ${org}::uuid AND key = ${templateKey}
+        ORDER BY version DESC
+        LIMIT 1`)
+    : [];
+  if (current === undefined) return withoutTemplate(input);
+  const template = storedTemplate(current.version, current.definition, org, templateKey);
+  if (!template.ok) return template;
+  const valid = validateRecordType(input, template.value.template);
   if (!valid.ok) return valid;
   const type = valid.value;
-  const org = type.organizationId;
   const [row] = await db.rows<{ version: number }>(sql`
-    WITH identity AS (
+    WITH still_current AS (
+      SELECT 1 FROM public.template_versions
+      WHERE organization_id = ${org}::uuid AND key = ${templateKey}
+      HAVING max(version) = ${current.version}::integer
+        AND bool_or(version = ${current.version}::integer
+                    AND definition = ${JSON.stringify(current.definition)}::jsonb)
+    ), identity AS (
       INSERT INTO public.record_types (organization_id, key)
-      VALUES (${org}::uuid, ${type.key})
+      SELECT ${org}::uuid, ${type.key} FROM still_current
       ON CONFLICT (organization_id, key) DO NOTHING
     )
     INSERT INTO public.record_type_versions
@@ -190,9 +219,48 @@ export async function insertRecordTypeVersion(
            ${type.defaultTemplateKey}, ${JSON.stringify(type)}::jsonb
     FROM public.record_type_versions
     WHERE organization_id = ${org}::uuid AND key = ${type.key}
+    HAVING EXISTS (SELECT 1 FROM still_current)
     RETURNING version`);
-  if (row === undefined) throw new Error("The record type version was not stored.");
+  if (row === undefined) {
+    return refused(
+      ["defaultTemplateKey"],
+      "template_changed",
+      "The default template changed while the record type was being saved. Try again.",
+    );
+  }
   return { ok: true, value: Object.freeze({ version: row.version, recordType: type }) };
+}
+
+/**
+ * The issues of a record type whose default template can't be read: its own
+ * problems, and `unknown_template`.
+ */
+function withoutTemplate(input: unknown): Validated<StoredRecordType> {
+  const result = validateRecordType(input, NO_TEMPLATES);
+  return result.ok
+    ? refused(["defaultTemplateKey"], "unknown_template", "There is no such template.")
+    : result;
+}
+
+/** No templates: what `validateRecordType` gets when none can be read. */
+const NO_TEMPLATES = (() => {
+  const registry = indexTemplates([]);
+  if (!registry.ok) throw new Error("An empty template registry was refused.");
+  return registry.value;
+})();
+
+/** An own data property that is a string, never through a getter. */
+function ownString(value: unknown, key: string): string | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  try {
+    const slot = Object.getOwnPropertyDescriptor(value, key);
+    return slot !== undefined && "value" in slot && typeof slot.value === "string"
+      ? slot.value
+      : undefined;
+  } catch {
+    // A proxy's trap threw; validateRecordType reports the value as unreadable.
+    return undefined;
+  }
 }
 
 /**
@@ -297,6 +365,18 @@ interface RecordRow {
  * Stores a new record. It must name its template (`templateKey`): every
  * stored record does (D-029), so a keyless one is refused here
  * (`no_template_key`) before the database would.
+ *
+ * **Callers must check the record first** with `checkRecordAgainstTemplate`,
+ * giving it the organization's templates, identifier checker and record link
+ * checker (`makeRecordLinkChecker` over the organization's own records). This
+ * function checks the record's shape only: the database can't see inside
+ * `fields`, so a `record_link` value naming another organization's record,
+ * or a record that doesn't exist, would be stored as given. That check is the
+ * service layer's (T-032).
+ *
+ * The ID is unique within the organization only (the table's key is
+ * `(organization_id, id)`); one the organization already has is refused by
+ * the primary key.
  */
 export async function insertRecord(
   db: Queryable,
