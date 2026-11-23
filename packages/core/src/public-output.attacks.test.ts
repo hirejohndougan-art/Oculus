@@ -13,8 +13,10 @@ import {
   publicOutput,
   publicView,
   validateRecord,
+  type FieldValue,
   type PublicOutput,
   type PublicRecord,
+  type RecordId,
   type Validated,
 } from "./index.js";
 import {
@@ -1152,5 +1154,127 @@ describe("a set entry that doesn't say its organization refuses the set (second 
     });
     expect(codes(out)).toEqual(["mixed_organizations"]);
     expect(JSON.stringify(out)).not.toContain("SECRET");
+  });
+});
+
+// D-038: numbers live in RecordIdentifiers. Each attack tries to get a
+// staff-type number, or one the record no longer holds, into output.
+describe("public output publishes only numbers the record holds (D-038)", () => {
+  const MAP = { template: "out", entries: [RIGHTS_ENTRY, { field: "number", term: "identifier" }] };
+  const PUBLIC_NUMBER = { type: "accession_number", value: "2026.015" };
+  interface IdSet {
+    recordId: RecordId;
+    organizationId: string;
+    current: { type: string; value: string; primary: boolean }[];
+    former: { type: string; value: string }[];
+  }
+  function itemWith(number: FieldValue) {
+    return record("object", "Item", { rights: { uri: CNE }, number });
+  }
+  function publish(view: PublicRecord, id: RecordId, identifiers?: unknown) {
+    return publicOutput(view, MAP, {
+      baseUrl: BASE,
+      published: [id],
+      checkers: CHECKERS,
+      ...(identifiers === undefined ? {} : { identifiers: identifiers as never }),
+    });
+  }
+
+  it("refuses a view made without the record's identifiers", () => {
+    const item = itemWith(PUBLIC_NUMBER);
+    const built = effectiveRecord(item.id, [item], () => TPL, { checkers: CHECKERS });
+    if (!built.ok) throw new Error(JSON.stringify(built.issues));
+    const view = publicView(built.value);
+    if (view === undefined) throw new Error("no view");
+    const result = publish(view, item.id);
+    expect(codes(result)).toEqual(["identifiers_unknown"]);
+    expect(JSON.stringify(result)).not.toContain("2026.015");
+  });
+
+  it("refuses a staff-type primary number relabelled as a public type in the field", () => {
+    const item = itemWith({ type: "accession_number", value: "SECRET-DF-1" });
+    const identifiers: IdSet[] = [
+      {
+        recordId: item.id,
+        organizationId: item.organizationId,
+        current: [{ type: "donor_file_number", value: "SECRET-DF-1", primary: true }],
+        former: [],
+      },
+    ];
+    const built = effectiveRecord(item.id, [item], () => TPL, {
+      checkers: CHECKERS,
+      identifiers: identifiers as never,
+    });
+    if (!built.ok) throw new Error(JSON.stringify(built.issues));
+    const view = publicView(built.value);
+    if (view === undefined) throw new Error("no view");
+    expect(JSON.stringify(view)).not.toContain("SECRET");
+    const result = publish(view, item.id, identifiers);
+    expect(codes(result)).toEqual(["identifier_not_held"]);
+    expect(JSON.stringify(result)).not.toContain("SECRET");
+  });
+
+  it("refuses a staff-type primary number the record holds, in a public field", () => {
+    const item = itemWith({ type: "donor_file_number", value: "SECRET-DF-2" });
+    const view = viewOf([item], item.id);
+    expect(JSON.stringify(view)).not.toContain("SECRET");
+    const result = publish(view, item.id);
+    expect(codes(result)).toEqual(["private_identifier_type"]);
+    expect(JSON.stringify(result)).not.toContain("SECRET");
+  });
+
+  it("publishes a held public number, and checks it again against the identifiers as they are now", () => {
+    const item = itemWith(PUBLIC_NUMBER);
+    const view = viewOf([item], item.id);
+    const now: IdSet = {
+      recordId: item.id,
+      organizationId: item.organizationId,
+      current: [{ ...PUBLIC_NUMBER, primary: true }],
+      former: [],
+    };
+    expect(ok(publish(view, item.id, [now])).dublinCore.identifier).toContain("2026.015");
+    // Retired since the view was made: a kept view must not publish it.
+    const retired: IdSet = {
+      ...now,
+      current: [{ type: "accession_number", value: "2026.016", primary: true }],
+      former: [PUBLIC_NUMBER],
+    };
+    const result = publish(view, item.id, [retired]);
+    expect(codes(result)).toEqual(["identifier_changed"]);
+    expect(result.ok ? [] : result.issues[0]?.path).toEqual(["fields", "number"]);
+    expect(JSON.stringify(result)).not.toContain("2026.015");
+    // Moved to another record of the organization: not this record's any more.
+    const elsewhere: IdSet = { ...now, recordId: newRecordId() };
+    expect(codes(publish(view, item.id, [elsewhere, { ...now, current: [] }]))).toEqual([
+      "identifier_changed",
+    ]);
+    // Now held as a staff type with the same text.
+    const restyled: IdSet = {
+      ...now,
+      current: [{ type: "donor_file_number", value: "2026.015", primary: true }],
+    };
+    expect(codes(publish(view, item.id, [restyled]))).toEqual(["identifier_changed"]);
+  });
+
+  it("refuses identifiers of another organization, duplicates and unreadable sets", () => {
+    const item = itemWith(PUBLIC_NUMBER);
+    const view = viewOf([item], item.id);
+    const now: IdSet = {
+      recordId: item.id,
+      organizationId: item.organizationId,
+      current: [{ ...PUBLIC_NUMBER, primary: true }],
+      former: [],
+    };
+    expect(
+      codes(publish(view, item.id, [{ ...now, organizationId: newOrganizationId() }])),
+    ).toEqual(["mixed_organizations"]);
+    expect(codes(publish(view, item.id, [now, now]))).toEqual(["duplicate_identifiers"]);
+    expect(codes(publish(view, item.id, [{ ...now, current: "2026.015" }]))).toEqual([
+      "invalid_options",
+    ]);
+    expect(codes(publish(view, item.id, new Proxy([now], {})))).toEqual(["invalid_options"]);
+    const getter = { baseUrl: BASE, published: [item.id], checkers: CHECKERS };
+    Object.defineProperty(getter, "identifiers", { get: () => [now], enumerable: true });
+    expect(codes(publicOutput(view, MAP, getter))).toEqual(["invalid_options"]);
   });
 });
