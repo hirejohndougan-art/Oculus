@@ -546,11 +546,13 @@ describe("one organization's numbers can't be read or mixed with another's (D-01
       [BOX, theirs("secret_key"), { ...theirs("secret_key"), uniqueness: "maybe" }],
       [BOX, unowned("secret_key"), unowned("secret_key")],
       [BOX, { ...BOX, organizationId: "not-an-id", key: "secret_key" }, theirs("secret_key")],
+      [5, theirs("secret_key"), theirs("secret_key")],
+      ["x", BOX, theirs("secret_key"), theirs("secret_key")],
     ]) {
       const r = validateIdentifierTypes(list);
       expect(r.ok).toBe(false);
       for (const code of codes(r)) {
-        expect(["mixed_organizations", "invalid_organization"]).toContain(code);
+        expect(["mixed_organizations", "invalid_organization", "not_an_object"]).toContain(code);
       }
       expect(JSON.stringify(r)).not.toContain("secret_key");
     }

@@ -286,6 +286,11 @@ export function validateNewIdentifierType(input: unknown): Validated<IdentifierT
  * whose organization can't be read, gets only organization issues
  * (`mixed_organizations`, `invalid_organization`), never one naming a key
  * (S-009a). Never throws.
+ *
+ * A list wholly owned by one other organization still gets messages that name
+ * its keys: this function doesn't know the caller's organization. Callers must
+ * check the list's organization first and never show another organization's
+ * issues (S-009b).
  */
 export function validateIdentifierTypes(input: unknown): Validated<readonly IdentifierType[]> {
   return guarded(() => {
@@ -361,20 +366,28 @@ function organizationIssues(list: readonly JsonValue[]): Issue[] {
   if (list.length < 2) return [];
   let first: OrganizationId | undefined;
   let mixed = false;
-  const found: { index: number; owner: OrganizationId | undefined }[] = [];
+  const found: { index: number; owner: OrganizationId | undefined; object: boolean }[] = [];
   for (const [index, item] of list.entries()) {
-    if (!isPlainObject(item)) continue;
+    // An entry that isn't an object says no organization either: it makes the
+    // list mixed, so no key from the rest of the list is quoted (S-009a).
+    if (!isPlainObject(item)) {
+      mixed = true;
+      found.push({ index, owner: undefined, object: false });
+      continue;
+    }
     const value = ownOnly(item).organizationId;
     const owner = isOrganizationId(value) ? value : undefined;
     if (owner === undefined) mixed = true;
     else if (first === undefined) first = owner;
     else if (owner !== first) mixed = true;
-    found.push({ index, owner });
+    found.push({ index, owner, object: true });
   }
   if (!mixed) return [];
   const out: Issue[] = [];
-  for (const { index, owner } of found) {
-    if (owner === undefined) {
+  for (const { index, owner, object } of found) {
+    if (!object) {
+      out.push(issue([index], "not_an_object", "An identifier type must be an object."));
+    } else if (owner === undefined) {
       out.push(
         issue(
           [index, "organizationId"],

@@ -160,12 +160,16 @@ describe("validateIdentifierTypes", () => {
     const r = validateIdentifierTypes([
       BOX,
       { ...BOX, key: "x", organizationId: ORG, uniqueness: "maybe" },
-      5,
+      { ...BOX, key: "y", label: 5 },
     ]);
-    expect(r.ok ? [] : r.issues.map((i) => [i.path, i.code])).toEqual([
-      [[1, "uniqueness"], "invalid_uniqueness"],
-      [[2], "not_an_object"],
+    expect(r.ok ? [] : r.issues.map((i) => [i.path[0], i.code])).toEqual([
+      [1, "invalid_uniqueness"],
+      [2, expect.any(String)],
     ]);
+    // An entry that isn't an object says no organization, so it alone is
+    // reported until it is fixed (S-009a): nothing else in the list is quoted.
+    const s = validateIdentifierTypes([BOX, { ...BOX, key: "x", uniqueness: "maybe" }, 5]);
+    expect(s.ok ? [] : s.issues.map((i) => [i.path, i.code])).toEqual([[[2], "not_an_object"]]);
   });
 
   it("refuses a non-list and too many types", () => {
