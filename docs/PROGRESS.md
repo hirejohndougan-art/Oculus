@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-23 20:45 CT — manual (John: "do a long building") — T-025 Schema: records, templates and record types
+- Result: done
+- What changed: migration `0002_catalog.sql`: organizations; templates and record types as identity rows plus versioned, validated JSON; records keyed by `(organization_id, id)`; every foreign key between catalog rows includes the organization; checks back up core's rules; `catalog_keep_identity` (fixed search path, fires last) refuses any UPDATE that changes a row's organization or identity. `packages/db/src/catalog.ts` inserts and reads with core validation on both sides; record type versions are checked against the stored default template in the same statement. `npm run db:migrate` builds core first (with a clean-checkout test).
+- Decisions: D-060
+- Review: two independent rounds (records movable between organizations by UPDATE, global record IDs, db:migrate failing on a fresh clone, overclaimed delete and link protections, trusting a caller's template; then the trigger's search path, trigger order, test cleanup); all fixed with tests.
+- Gate: PASS · tests_passing 3210 (was 3175) · npm audit clean
+- Next: T-026 Schema: identifiers, with uniqueness the database enforces (risky); T-027; T-029
+
 ## 2026-11-23 20:00 CT — manual (John: "do a long building") — S-012 Loan link reads use own properties; S-013 deferred
 - Result: S-012 done; S-013 attempt 1 not merged (joins the loans redesign with T-018a)
 - What changed: `readTop` in storage.ts returns frozen prototype-free copies at every depth (storage, loans, condition checks); loans read item links through `ownLink`, so a polluted `Object.prototype` can't link a departure and hide an overdue loan. S-013's `unlinked_arrival` rule (branch `autopilot/S-012`, b623eb9) was reviewed: still hideable in five ways and too many false positives; it is redesigned together with T-018a.

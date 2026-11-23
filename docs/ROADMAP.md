@@ -223,8 +223,9 @@ Database:
   - How a password-protected site (D-019) stores its password and rate-limits attempts; needs the Phase 2 password decision.
 - [ ] T-012a **Follow-ups from T-012 and T-005a.** deps: T-012, T-005a
   - `made_staff` and `templateChanges` pick records by `templateKey`; compare the two templates when a record moves to another template; `nextIdentifier` also counts numbers held in template identifier fields; remove the lookup-function path once every record has a key.
-- [ ] T-025 **Schema: records, templates and record types.** deps: T-024, T-012, T-013, T-019 (risky)
+- [x] T-025 **Schema: records, templates and record types.** deps: T-024, T-012, T-013, T-019 (risky)
   - Tables for records (UUID key, kind, record type, template key, title, level, parent, JSONB `fields`, timestamps), plus templates and record types stored as validated JSON with versions. Check constraints and foreign keys back up the core rules. Tests round-trip every preset and invented sample records through the core validators.
+  - Done (D-060): migration 0002 (organizations; templates and record types as identity rows plus versioned validated JSON; records keyed by organization and ID) with composite organization foreign keys, checks backing core rules, and a trigger keeping each row's organization and identity fixed; `catalog.ts` validates with core before writing and after reading. Two independent reviews. Left to T-029 and T-032: a non-owner app role, append-only versions, IDs made by the service, link checks and refusing deletes of linked records.
 - [ ] T-026 **Schema: identifiers, with uniqueness the database enforces.** deps: T-025, T-014 (risky)
   - Tables for identifier types and current and former identifiers. Each value is stored with its `identifierKey` beside it, and unique indexes enforce the `current` and `all_time` rules, so two saves at the same moment can't take the same number. The next auto-number is given out inside a transaction. Tests race two saves.
 - [ ] T-027 **Schema: vocabularies and terms.** deps: T-025
