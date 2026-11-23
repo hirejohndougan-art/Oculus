@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-23 17:50 CT — manual (John: "continue") — T-026 Schema: identifiers, with uniqueness the database enforces
+- Result: done
+- What changed: migration `0003_identifiers.sql`: identifier types per organization; holdings carrying the type's uniqueness rule (copied by trigger, kept current by a cascading foreign key, adopted by a trigger when a type is created); partial unique indexes on `(organization_id, type_key, key)` for `current` and `all_time`; current and former value tables; auto-number counters. `packages/db/src/identifiers.ts`: saves write holdings in sorted order then release; allocation under counter and type-key locks; bucketed advisory locks (64 per organization); Read Committed only; lenient reads; clean `not_unique`, `retry` and `read_committed_required` issues.
+- Decisions: D-061
+- Review: three independent rounds (type creation racing a save let an `all_time` number be given twice; swap and opposite-order deadlocks; strict reads after an allowed type edit; unbounded advisory locks; the race returning under Repeatable Read; direct-SQL type inserts not adopting holdings), all fixed with two-connection race tests; final round's remaining notes (per-organization lock bound, bucket-collision deadlocks ending in `retry`) documented.
+- Gate: PASS · tests_passing 3261 (was 3223) · npm audit clean
+- Next: T-027 (term tables, in second review), then T-029 change log and version history
+
 ## 2026-11-23 16:45 CT — manual (John: "continue") — S-009b, S-011c
 - Result: done
 - What changed: **S-009b** `validateIdentifierTypes(types, organizationId)` and `makeIdentifierChecker(types, organizationId)` take the caller's organization and refuse any list holding another organization's entry before quoting anything (D-030 amended). **S-011c** a public record link whose target no longer exists is left out of public output like an unpublished one, with a staff-only `link_target_missing` warning in `staffWarnings`; saving such a link is still refused (D-045 amended).
