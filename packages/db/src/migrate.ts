@@ -14,12 +14,15 @@
  *   hash in `oculus_migrations` in that same transaction. The first file
  *   creates that table, so a fresh database is migrated like any other.
  *
- * A file that ends the runner's transaction itself (COMMIT, ROLLBACK) is
- * detected and refused, also when it fails afterwards; statements that can't
- * run in a transaction (CREATE INDEX CONCURRENTLY) are not supported. After
- * each file the session's settings are reset (RESET ALL, RESET ROLE, RESET
- * SESSION AUTHORIZATION), and the runner names its table with its schema, so a
- * file's SET can't move the next file's tables or the bookkeeping (D-057).
+ * A file that ends the runner's transaction itself (COMMIT, END, ROLLBACK,
+ * COMMIT AND CHAIN) is refused as `transaction_ended`, also when it opens a
+ * new transaction and then fails: the server is asked whether the runner's
+ * transaction ID committed. Statements that can't run in a transaction
+ * (CREATE INDEX CONCURRENTLY) are not supported. Right after each file, inside
+ * its transaction, and again after it, the session is reset (RESET ALL, RESET
+ * ROLE, RESET SESSION AUTHORIZATION, DISCARD TEMP, DEALLOCATE ALL), and the
+ * runner names its table and functions with their schemas, so a file can't
+ * change what the next file or the runner's own statements do (D-057).
  */
 import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
@@ -189,7 +192,7 @@ export interface MigrateResult {
 
 async function appliedMigrations(session: Session): Promise<AppliedMigration[]> {
   const [exists] = await session.rows<{ exists: boolean }>(
-    sql`SELECT to_regclass(${BOOKKEEPING_TABLE}) IS NOT NULL AS exists`,
+    sql`SELECT pg_catalog.to_regclass(${BOOKKEEPING_TABLE}) IS NOT NULL AS exists`,
   );
   if (!exists?.exists) return [];
   return session.rows<AppliedMigration>(
@@ -197,42 +200,42 @@ async function appliedMigrations(session: Session): Promise<AppliedMigration[]> 
   );
 }
 
-async function currentTransaction(session: Session): Promise<string | undefined> {
-  const [row] = await session.rows<{ xid: string | null }>(
-    sql`SELECT pg_current_xact_id_if_assigned()::text AS xid`,
+/** What the server says about a transaction ID: in progress, committed or aborted. */
+async function transactionStatus(session: Session, xid: string): Promise<string | undefined> {
+  const [row] = await session.rows<{ status: string | null }>(
+    sql`SELECT pg_catalog.pg_xact_status(${xid}::pg_catalog.xid8) AS status`,
   );
-  return row?.xid ?? undefined;
+  return row?.status ?? undefined;
 }
 
 async function applyOne(session: Session, file: MigrationFile): Promise<void> {
-  let failed = false;
+  const ended = (): MigrationError =>
+    new MigrationError(
+      "transaction_ended",
+      `${file.name} ended the runner's transaction (COMMIT, ROLLBACK, END or COMMIT AND CHAIN in the file). Part of it may have been applied and it is not recorded; a person must check the database before migrating again.`,
+    );
+  let started: string | undefined;
+  let committed = false;
   await session.control("BEGIN");
   try {
-    // Gives the transaction an ID now, so a file that commits or rolls back
-    // the runner's transaction is noticed afterwards, whether it then fails or not.
-    const [started] = await session.rows<{ xid: string }>(
-      sql`SELECT pg_current_xact_id()::text AS xid`,
+    // Gives the transaction an ID now, so whether the file ended it can be
+    // asked of the server afterwards, whether the file then failed or not.
+    const [row] = await session.rows<{ xid: string }>(
+      sql`SELECT pg_catalog.pg_current_xact_id()::text AS xid`,
     );
-    const ended = (): MigrationError =>
-      new MigrationError(
-        "transaction_ended",
-        `${file.name} ended the runner's transaction (COMMIT or ROLLBACK in the file). Part of it may have been applied and it is not recorded; a person must check the database before migrating again.`,
-      );
+    started = row?.xid;
+    if (started === undefined) throw new MigrationError("failed", "No transaction ID.");
     try {
       await session.runScript(file.text);
     } catch (error) {
-      // Still inside the runner's transaction, the failed file left it aborted
-      // and this check fails too; if the check answers, the transaction was ended.
-      const xid = await currentTransaction(session).then(
-        (id) => ({ id }),
-        () => undefined,
-      );
-      if (xid !== undefined && xid.id !== started?.xid) throw ended();
       throw new MigrationError("failed", `${file.name} failed: ${(error as Error).message}`, {
         cause: error,
       });
     }
-    if ((await currentTransaction(session)) !== started?.xid) throw ended();
+    // Inside the transaction, so a file's SET, prepared statements and
+    // temporary tables can't reach the runner's own statements below.
+    await resetSession(session);
+    if ((await transactionStatus(session, started)) !== "in progress") throw ended();
     try {
       await session.execute(
         sql`INSERT INTO public.oculus_migrations (name, sha256) VALUES (${file.name}, ${file.sha256})`,
@@ -245,16 +248,34 @@ async function applyOne(session: Session, file: MigrationFile): Promise<void> {
       );
     }
     await session.control("COMMIT");
+    committed = true;
   } catch (error) {
-    failed = true;
     await session.control("ROLLBACK").catch(() => undefined);
+    // The runner's transaction is aborted now, unless the file committed it
+    // (COMMIT, END, COMMIT AND CHAIN), in which case part of the file stays.
+    if (
+      started !== undefined &&
+      !(error instanceof MigrationError && error.code === "transaction_ended")
+    ) {
+      const status = await transactionStatus(session, started).catch(() => undefined);
+      if (status === "committed") throw ended();
+    }
     throw error;
   } finally {
-    // Settings a file changed with SET (search_path, role, timeouts) must not
-    // carry over to the next file or to the runner's own queries. A reset that
-    // fails stops the run (unless the file already failed, which stops it anyway).
-    const reset = resetSession(session);
-    await (failed ? reset.catch(() => undefined) : reset);
+    // Again after the transaction, for anything a failed or ended file left.
+    // A reset that fails after a file committed stops the run, saying so.
+    try {
+      await resetSession(session);
+    } catch (error) {
+      if (committed) {
+        // eslint-disable-next-line no-unsafe-finally
+        throw new MigrationError(
+          "failed",
+          `${file.name} was applied and recorded, but the session could not be reset afterwards, so the run stopped there: ${(error as Error).message}`,
+          { cause: error },
+        );
+      }
+    }
   }
 }
 
@@ -262,6 +283,8 @@ async function resetSession(session: Session): Promise<void> {
   await session.execute(sql`RESET ALL`);
   await session.execute(sql`RESET ROLE`);
   await session.execute(sql`RESET SESSION AUTHORIZATION`);
+  await session.execute(sql`DISCARD TEMP`);
+  await session.execute(sql`DEALLOCATE ALL`);
 }
 
 /** Applies every pending migration. Safe to run at the same time as another runner. */
@@ -275,15 +298,17 @@ export async function migrate(options: MigrateOptions): Promise<MigrateResult> {
   const session = await openSession(options.connectionString);
   try {
     const [version] = await session.rows<{ v: string }>(
-      sql`SELECT current_setting('server_version_num') AS v`,
+      sql`SELECT pg_catalog.current_setting('server_version_num') AS v`,
     );
     const serverVersionNum = Number(version?.v);
     const warning = checkServerVersion(serverVersionNum);
     if (warning) log(`Warning: ${warning}`);
 
-    await session.execute(sql`SELECT set_config('lock_timeout', ${String(lockTimeoutMs)}, false)`);
+    await session.execute(
+      sql`SELECT pg_catalog.set_config('lock_timeout', ${String(lockTimeoutMs)}, false)`,
+    );
     try {
-      await session.execute(sql`SELECT pg_advisory_lock(${MIGRATION_LOCK_KEY})`);
+      await session.execute(sql`SELECT pg_catalog.pg_advisory_lock(${MIGRATION_LOCK_KEY})`);
     } catch (error) {
       if ((error as { code?: string }).code === "55P03") {
         throw new MigrationError(
@@ -294,7 +319,7 @@ export async function migrate(options: MigrateOptions): Promise<MigrateResult> {
       }
       throw error;
     }
-    await session.execute(sql`SELECT set_config('lock_timeout', '0', false)`);
+    await session.execute(sql`SELECT pg_catalog.set_config('lock_timeout', '0', false)`);
     try {
       const pending = pendingMigrations(files, await appliedMigrations(session));
       const applied: string[] = [];
@@ -307,7 +332,7 @@ export async function migrate(options: MigrateOptions): Promise<MigrateResult> {
       return { applied, serverVersionNum };
     } finally {
       await session
-        .execute(sql`SELECT pg_advisory_unlock(${MIGRATION_LOCK_KEY})`)
+        .execute(sql`SELECT pg_catalog.pg_advisory_unlock(${MIGRATION_LOCK_KEY})`)
         .catch(() => undefined);
     }
   } finally {

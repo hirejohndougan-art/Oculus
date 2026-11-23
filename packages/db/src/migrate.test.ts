@@ -226,21 +226,56 @@ describe("refusals", () => {
     }
   });
 
-  it("reports a file that commits and then fails as ending the transaction, and stops", async () => {
+  it.each([
+    ["COMMIT", "CREATE TABLE early (id int);\nCOMMIT;\nSELECT * FROM nowhere;"],
+    ["COMMIT; BEGIN", "CREATE TABLE early (id int);\nCOMMIT;\nBEGIN;\nSELECT * FROM nowhere;"],
+    ["COMMIT AND CHAIN", "CREATE TABLE early (id int);\nCOMMIT AND CHAIN;\nSELECT * FROM nowhere;"],
+    [
+      "END; START TRANSACTION",
+      "CREATE TABLE early (id int);\nEND;\nSTART TRANSACTION;\nSELECT * FROM nowhere;",
+    ],
+  ])(
+    "reports a file that ends the transaction with %s and then fails as transaction_ended, and stops",
+    async (_form, body) => {
+      const db = await database();
+      const dir = migrationsDir({
+        "0002_escape.sql": body,
+        "0003_after.sql": "CREATE TABLE after (id int);",
+      });
+      const error = await refusal(migrate({ connectionString: db.url, dir }));
+      expect(error.code).toBe("transaction_ended");
+      expect(error.message).toMatch(/a person must check/);
+      // What the file committed stays; it isn't recorded and nothing after it ran.
+      expect(await tables(db.url)).toEqual(["early", "oculus_migrations"]);
+      expect((await recorded(db.url)).map((r) => r.name)).toEqual(["0001_migrations_table.sql"]);
+      // A later run doesn't carry on as if nothing happened.
+      expect((await refusal(migrate({ connectionString: db.url, dir }))).code).toBe("failed");
+      expect(await tables(db.url)).toEqual(["early", "oculus_migrations"]);
+    },
+  );
+
+  it("reports a file that rolls back and then fails as failed: nothing of it stays", async () => {
     const db = await database();
     const dir = migrationsDir({
-      "0002_escape.sql": "CREATE TABLE early (id int);\nCOMMIT;\nSELECT * FROM nowhere;",
-      "0003_after.sql": "CREATE TABLE after (id int);",
+      "0002_rollback.sql": "CREATE TABLE gone (id int);\nROLLBACK;\nBEGIN;\nSELECT * FROM nowhere;",
     });
-    const error = await refusal(migrate({ connectionString: db.url, dir }));
-    expect(error.code).toBe("transaction_ended");
-    expect(error.message).toMatch(/a person must check/);
-    // What the file committed stays; it isn't recorded and nothing after it ran.
-    expect(await tables(db.url)).toEqual(["early", "oculus_migrations"]);
-    expect((await recorded(db.url)).map((r) => r.name)).toEqual(["0001_migrations_table.sql"]);
-    // A later run doesn't carry on as if nothing happened.
     expect((await refusal(migrate({ connectionString: db.url, dir }))).code).toBe("failed");
-    expect(await tables(db.url)).toEqual(["early", "oculus_migrations"]);
+    expect(await tables(db.url)).toEqual(["oculus_migrations"]);
+  });
+
+  it("clears a file's prepared statements and temporary tables before the next file", async () => {
+    const db = await database();
+    const dir = migrationsDir({
+      // A temporary table and a role change that would otherwise catch the
+      // runner's INSERT; a prepared statement that would otherwise linger.
+      "0002_tricks.sql":
+        "CREATE TEMP TABLE oculus_migrations (name text, sha256 text);\nPREPARE lingering AS SELECT 1;\nSET search_path = pg_temp, public;",
+      "0003_next.sql": "PREPARE lingering AS SELECT 2;\nCREATE TABLE t3 (id int);",
+    });
+    const result = await migrate({ connectionString: db.url, dir });
+    expect(result.applied).toHaveLength(3);
+    expect((await recorded(db.url)).map((r) => r.name)).toEqual(result.applied);
+    expect(await tables(db.url)).toEqual(["oculus_migrations", "t3"]);
   });
 
   it("doesn't let one file's settings reach the next file or the runner", async () => {
