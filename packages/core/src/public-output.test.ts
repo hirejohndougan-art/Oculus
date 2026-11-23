@@ -421,7 +421,10 @@ describe("publicOutput: refusals", () => {
     const view = viewOf([item], item.id);
     const result = out(view);
     expect(result.ok).toBe(false);
-    expect(result.ok ? [] : result.issues).toEqual(effectivePublishIssues(effective));
+    // The same codes and paths; the messages are fixed text here (S-007).
+    const strip = (list: readonly { path: unknown; code: string }[]) =>
+      list.map(({ path, code }) => ({ path, code }));
+    expect(strip(result.ok ? [] : result.issues)).toEqual(strip(effectivePublishIssues(effective)));
     expect(codes(result)).toEqual(["rights_missing"]);
   });
 

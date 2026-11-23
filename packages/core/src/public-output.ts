@@ -27,7 +27,8 @@
  *   `checkRecordAgainstTemplate` against the view's template (required
  *   fields aside), with the default checkers and any the caller gives in
  *   `checkers`. Identifier values need `makeIdentifierChecker` (D-015). Any
- *   problem refuses the output, with the check's issues.
+ *   problem refuses the output, with the check's codes and paths (see
+ *   "Issues" below).
  * - **Every view is checked against the catalog as it is now** (D-054).
  *   A view holds the records and templates it was built from (D-020), and
  *   nothing in it says whether it was made a moment ago or kept from
@@ -133,6 +134,17 @@
  * included; `dublinCore` counts its values), and values are counted against
  * the same cap while they are read. Nothing here throws; every problem comes
  * back as issues.
+ *
+ * **Issues are for staff only** (S-007, D-016). They say why a record isn't
+ * published, which is the admin's business: a public site, API or OAI-PMH
+ * response shows a record as not available and never passes them on. Even
+ * so, no message quotes a stored value, an identifier number or an
+ * identifier type key. The template check's issues (its checkers' messages
+ * quote numbers, type keys and values: `unknown_type`, `format_mismatch`)
+ * and the publish check's issues about a field (a rights value's text) come
+ * back with fixed text, keeping their code and path. Messages written here
+ * name at most a field's label, an option's name or the base URL, which are
+ * configuration, not record data.
  */
 import { types } from "node:util";
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
@@ -503,11 +515,11 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
   const effective = origin.effective as EffectiveRecord;
   // The deed check fails closed without the register (D-043).
   const blocked = effectivePublishIssues(effective, accessions === undefined ? {} : { accessions });
-  if (blocked.length > 0) throw new OutputError(blocked);
+  if (blocked.length > 0) throw new OutputError(fixedFieldMessages(blocked, PUBLISH_CHECK_MESSAGE));
   // What a digital asset shows is found again in the records as they are now.
   if (effective.record.kind === "digital_asset") {
     const now = deedIssuesNow(effective, accessions, currentRepresented(effective.record, records));
-    if (now.length > 0) throw new OutputError(now);
+    if (now.length > 0) throw new OutputError(fixedFieldMessages(now, PUBLISH_CHECK_MESSAGE));
   }
   const template = origin.template;
   // Checked again at the boundary: every template the view was built with is
@@ -938,7 +950,28 @@ function templateCheck(
     loose,
     (checkers === undefined ? {} : { checkers }) as TemplateCheckOptions,
   );
-  if (problems.length > 0) throw new OutputError(problems);
+  // Checker messages quote values (a number, a type key, a date's text), so
+  // none is passed on (S-007); the code and path say what and where.
+  if (problems.length > 0) {
+    throw new OutputError(problems.map((p) => issue(p.path, p.code, TEMPLATE_CHECK_MESSAGE)));
+  }
+}
+
+/** The message of every issue the template check (and its checkers) found here. */
+const TEMPLATE_CHECK_MESSAGE =
+  "A value here doesn't pass the template check, so the record can't be published. The code and path say what and where; check the record with checkRecordAgainstTemplate for the details.";
+/** The message of every issue about a field that the publish check found here. */
+const PUBLISH_CHECK_MESSAGE =
+  "A value here can't be published as it is. The code and path say why and where; check the record with effectivePublishIssues for the details.";
+
+/**
+ * `issues` with each message about a field (a path starting with `fields`)
+ * replaced by `message`: messages written elsewhere about a value may quote
+ * it, and `publicOutput`'s messages never do (S-007). Others, such as the
+ * deed check's, are fixed text already and are kept.
+ */
+function fixedFieldMessages(issues: readonly Issue[], message: string): readonly Issue[] {
+  return issues.map((i) => (i.path[0] === "fields" ? issue(i.path, i.code, message) : i));
 }
 
 /**
