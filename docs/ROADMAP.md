@@ -24,7 +24,7 @@ The data model in TypeScript, written for any archive or museum rather than one 
   - `validateIdentifierTypes` runs before the organization check, so another organization's invalid list (two entries sharing a key) gets a message naming that key. Not a probe (the answer doesn't depend on the key asked about); check the organization first or drop the key from that message if `existing` can come from another organization.
 - [ ] S-010 **Kept views publish without re-checks by default.** (risky, security run 2026-11-23)
   - `publicOutput` re-checks a kept view against current records and templates only when the caller passes `records` and `templateFor`; without them a value whose field has since been made staff is still published, while the identifier check already fails closed. Make both required for a kept view (or have the service layer always build the view at publish time), with an attack test.
-- [ ] S-011 **Link labels to unpublished or other organizations' records.** (risky, security run 2026-11-23)
+- [ ] S-011 **Link labels to unpublished or other organizations' records.** (risky, security run 2026-11-23) John decided (D-045): show nothing publicly for such links, not even the label.
   - A `record_link`'s label is published even when its target is unpublished or another organization's; only the ID is held back. If labels are filled from the target's title (e.g. a donor's name), that leaks. Decide: hold back labels of unpublished targets, or require staff-written labels and say so in `record-links.ts`; fix the module header's "never reveals that an unpublished record exists".
 - [x] S-001 **Public output re-checks ancestors' templates.** (risky, security run 2026-11-21)
   - A view kept from earlier published a value inherited from a parent whose template had since made the field staff; `currentTemplate` compared only the record's own template. Fixed with `templateFor` (D-020).
@@ -53,7 +53,7 @@ The data model in TypeScript, written for any archive or museum rather than one 
   - `npm run gate` runs format, lint, typecheck, tests, build, `npm audit --audit-level=high` and a license check (MIT, BSD, ISC, Apache-2.0 or similarly permissive only).
   - `gate-baseline.json`, `.nvmrc` with the current Node LTS, and a GitHub Actions workflow that runs the gate on every push.
   - At least one real test, so the gate shows it is working.
-- [ ] T-001a **Turn on GitHub security alerts.** (needs John)
+- [ ] T-001a **Turn on GitHub security alerts.** (needs John) John is turning them on (2026-11-23).
   - Dependabot alerts are disabled on the repository and code scanning isn't reachable from the autopilot. John: enable Dependabot alerts and CodeQL default setup in the repo's Settings → Code security, so the security run can read them.
 - [ ] T-001b **Revisit TypeScript 7 and Vite 8.**
   - Both majors were turned down in D-006 and the upkeep run of 2026-11-21 found the reasons still hold: typescript-eslint 8.73 supports only TypeScript `<6.1`, and Vite 8 still depends on MPL-2.0 `lightningcss`. Move when typescript-eslint supports TypeScript 7, or when Vite drops `lightningcss` as a required dependency; each move gets its own decision entry.
@@ -259,7 +259,7 @@ Server and deployment:
   - One app (D-034). The public sites may read only published data, through a read-only path (its own database role or a public read API) that tests show can't reach staff fields or unpublished records.
 - [ ] T-040 **Sending password reset email.** deps: T-039 (risky)
   - Deliver reset and invitation messages over SMTP (D-035), so any host's mail or a mail service works, with its credentials only in environment variables, and nothing about the account in the message beyond the link.
-- [ ] T-051 **Deploy and run.** deps: T-050, T-052 (needs John) (risky)
+- [ ] T-051 **Deploy and run.** deps: T-050, T-052 (needs John) (risky) John: SiteGround shared hosting (D-046); confirm with SiteGround support that an always-running Node process is allowed.
   - Production setup for any host meeting D-035, with SiteGround as the first: confirm with John that his plan allows a long-running Node process, then TLS, secrets from the environment, scheduled backups and an off-site copy (T-052), session and token cleanup as commands a scheduler or cron can run, and a written runbook for updates and restore (§9). Never deploy without John.
 
 - [ ] T-053 **Phase 2 review.** deps: T-020 to T-052

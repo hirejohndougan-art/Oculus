@@ -330,3 +330,12 @@ Spectrum "Loans in", "Loans out" and "Condition checking and technical assessmen
 - **Not done yet:** a borrowed item that stays for good (bought or given) can't close its loan in until acquisitions can link to it; authoriser, valuation and insurance fields; linking a check's `loanId` to the loan book; saving a move and its loan edit in one transaction (T-032).
 - Sources: Spectrum 5.0 "Loans in", "Loans out" and "Condition checking and technical assessment", as reproduced by a museum (pitstonemuseum.co.uk/pims/spectrum-5.0/), read 2026-11-23; the 5.1 procedure text couldn't be reached.
 
+## D-045 — Links to private records show nothing on public sites (2026-11-23, John)
+John's answer for S-011: when a published record links to a record that isn't published, or belongs to another organization, the public site shows nothing for that link: no ID, no label, no placeholder. Staff still see the link.
+- **Why:** a label copied from the target (a donor's name, a private item's title) would reveal the private record. Showing nothing is the only answer that can't leak.
+- **Rejected:** publishing the target's label without its ID (the D-039 behaviour, which this replaces); a staff-written public label (more work for staff, and an easy place to type a private name).
+- **Changes:** S-011 implements it; the `record-links.ts` header and D-039 are updated to match.
+
+## D-046 — The Society's SiteGround plan is shared hosting (2026-11-23, John)
+John's answer for T-051: the Historical Society is on a SiteGround shared hosting plan (StartUp, GrowBig or GoGeek). Whether a shared plan allows an always-running Node.js process is not confirmed: SiteGround says Node.js runs on its hosting plans (D-035), but a long-running process on shared hosting is commonly limited or stopped. Before T-051, ask SiteGround support directly, and if it isn't allowed, compare upgrading the plan with another host meeting D-035. Nothing before T-051 depends on this.
+
