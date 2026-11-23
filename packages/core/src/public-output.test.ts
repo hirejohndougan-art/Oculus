@@ -27,6 +27,7 @@ import {
   record,
   template,
   viewOf,
+  idsOf,
   CHECKERS,
   RIGHTS_ENTRY,
 } from "./public-output.fixtures.js";
@@ -45,7 +46,12 @@ function out(
   published: readonly RecordId[] = [view.id],
   mapping: unknown = MAPPING,
 ) {
-  return publicOutput(view, mapping, { baseUrl: BASE, published, checkers: CHECKERS });
+  return publicOutput(view, mapping, {
+    baseUrl: BASE,
+    published,
+    checkers: CHECKERS,
+    identifiers: idsOf(view),
+  });
 }
 
 const PLACE_ID = newRecordId();
@@ -457,7 +463,14 @@ describe("publicOutput: the base URL", () => {
   it("accepts http and https base URLs ending in /", () => {
     for (const baseUrl of ["https://archive.example.org/", "http://localhost:8080/items/", BASE]) {
       expect(
-        ok(publicOutput(view, MAPPING, { baseUrl, published: [view.id], checkers: CHECKERS })).id,
+        ok(
+          publicOutput(view, MAPPING, {
+            baseUrl,
+            published: [view.id],
+            checkers: CHECKERS,
+            identifiers: idsOf(view),
+          }),
+        ).id,
       ).toBe(baseUrl + view.id);
     }
   });

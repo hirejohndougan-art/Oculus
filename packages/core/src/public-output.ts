@@ -41,6 +41,13 @@
  *   type from the effective record (the public view holds `{ value }` only). A
  *   hand-written identifier checker says nothing about which types are
  *   public, so with one, identifier values are refused, never published.
+ * - **Numbers live in `RecordIdentifiers`** (D-038). A view publishes an
+ *   identifier value only when the record it came from held it as a current
+ *   identifier when the view was built (`effectiveRecord`'s `identifiers`).
+ *   A view holding any identifier value also needs `identifiers` here (the
+ *   identifier sets as they are now; `identifiers_unknown` without them),
+ *   and every number must still be one (`identifier_changed`), so a number
+ *   retired or moved since isn't published from a kept view.
  * - **Publishing is the caller's statement.** Records have no publish state
  *   yet, so the caller passes `published`, the IDs of every record that is
  *   published. The record itself must be in it (`not_published`). A place
@@ -114,6 +121,12 @@ import { parseEdtf } from "./edtf.js";
 import { isOtherOrganizationsChecker, publicIdentifierTypesOf } from "./field-checkers.js";
 import { RIGHTS_FIELD_KEY, RIGHTS_REQUIRED_KINDS, rightsTerm } from "./rights.js";
 import { isRecordId, type RecordId } from "./record-id.js";
+import {
+  holdsCurrentIdentifier,
+  readIdentifierSets,
+  type RecordIdentifiers,
+} from "./identifiers.js";
+import { mixedOrganizationsIssue } from "./organizations.js";
 import type { CatalogRecord, FieldValue, RecordKind } from "./records.js";
 import {
   MAX_REPEATS,
@@ -186,6 +199,19 @@ export interface PublishOptions {
    * change to a kept view (D-021).
    */
   readonly records?: RecordLookup | readonly CatalogRecord[];
+  /**
+   * The identifiers (`RecordIdentifiers`) as they are now, of the record and
+   * the ancestors its values come from, all of its organization (D-038).
+   * Required when the view holds any identifier value (`identifiers_unknown`
+   * without it): output is refused unless every identifier value is still
+   * one of the current identifiers of the record it came from
+   * (`identifier_changed`, naming the field, never the number). The sets
+   * must already have passed `validateRecordIdentifiers` and
+   * `uniquenessIssues` on the save path; here only the rules one set can be
+   * checked for on its own are checked again (one primary, no current
+   * number twice: `invalid_identifiers`).
+   */
+  readonly identifiers?: readonly RecordIdentifiers[];
 }
 
 /** Dublin Core as term → values, in order (see the module header). */
@@ -420,7 +446,7 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
       "This is not a public view from publicView, so it can't be published.",
     );
   }
-  const { baseUrl, published, checkers, currentTemplate, templateFor, records } =
+  const { baseUrl, published, checkers, currentTemplate, templateFor, records, identifiers } =
     readOptions(options);
   if (!published.has(view.id)) {
     fail([], "not_published", "This record is not in the published list, so it can't be output.");
@@ -514,6 +540,8 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
     else list.push(...values);
   }
 
+  // After the type checks, so a staff type is reported as such first.
+  stillHeld(identifiers, view, effective, template);
   const types = typesFor(view.kind, origin, terms.get("type") ?? []);
   const dublinCore = dublinCoreValues(terms, recordUrl, types);
   const jsonLd = jsonLdDocument(recordUrl, types, terms);
@@ -705,6 +733,71 @@ function fullValues(
 }
 
 /**
+ * Refuse unless every identifier value in the view is still one of the
+ * current identifiers, in `given` (the caller's sets as they are now), of
+ * the record it came from (D-038). A view with identifier values and no
+ * `given` is refused (`identifiers_unknown`): fail closed, as in
+ * `effectiveRecord`. Sets of another organization are refused whole.
+ * Issues name the field only, never the number.
+ */
+function stillHeld(
+  given: unknown,
+  view: PublicRecord,
+  effective: EffectiveRecord,
+  template: FieldTemplate,
+): void {
+  const kinds = new Map(template.fields.map((f) => [f.key, f.kind]));
+  const numbered = view.entries.filter((e) => kinds.get(e.key) === "identifier");
+  if (given === undefined) {
+    if (numbered.length === 0) return;
+    fail(
+      ["identifiers"],
+      "identifiers_unknown",
+      "This record shows identifier values, so publishing needs the identifiers option (the records' identifiers as they are now), to check each number is still the record's.",
+    );
+  }
+  const read = readIdentifierSets(given);
+  if (!read.ok) {
+    const code = read.issues[0]?.code;
+    if (code === "mixed_organizations") {
+      const mixed = mixedOrganizationsIssue(["identifiers"], "These records and identifiers");
+      fail(mixed.path, mixed.code, mixed.message);
+    }
+    if (code === "duplicate_identifiers" || code === "invalid_identifiers") {
+      fail(["identifiers"], code, read.issues[0]?.message ?? "These identifiers aren't valid.");
+    }
+    fail(
+      ["identifiers"],
+      "invalid_options",
+      "The identifiers option must be a list of records' identifiers.",
+    );
+  }
+  for (const set of read.value.values()) {
+    if (set.organizationId !== effective.record.organizationId) {
+      const mixed = mixedOrganizationsIssue(["identifiers"], "These records and identifiers");
+      fail(mixed.path, mixed.code, mixed.message);
+    }
+  }
+  for (const entry of numbered) {
+    const source = effective.entries.find((e) => e.key === entry.key);
+    const set = source === undefined ? undefined : read.value.get(source.from.id);
+    const value: FieldValue | undefined = source?.value;
+    const items: readonly FieldValue[] = Array.isArray(value)
+      ? value
+      : value === undefined
+        ? []
+        : [value];
+    if (items.length === 0 || !items.every((item) => holdsCurrentIdentifier(set, item))) {
+      fail(
+        ["fields", entry.key],
+        "identifier_changed",
+        "A number this field shows is no longer one of its record's current identifiers. Make the view again with effectiveRecord and publicView, and publish that.",
+      );
+    }
+  }
+}
+
+/**
  * Refuse unless every identifier in `value` is of a type the identifier
  * checker knows to be public. A checker not made by `makeIdentifierChecker`
  * can't say, so any identifier value is refused with it (D-022).
@@ -806,6 +899,7 @@ const OPTION_KEYS: ReadonlySet<string> = new Set([
   "currentTemplate",
   "templateFor",
   "records",
+  "identifiers",
 ]);
 
 interface ReadOptions {
@@ -815,6 +909,7 @@ interface ReadOptions {
   readonly currentTemplate: unknown;
   readonly templateFor: TemplateSource | undefined;
   readonly records: unknown;
+  readonly identifiers: unknown;
 }
 
 function readOptions(options: unknown): ReadOptions {
@@ -841,7 +936,9 @@ function readOptions(options: unknown): ReadOptions {
   const templateFor = lookup;
   // Checked when it is used: it may be a list or a lookup from indexRecords.
   const records = dataProp(options, "records");
-  return { baseUrl, published, checkers, currentTemplate, templateFor, records };
+  // Read once, when it is used.
+  const identifiers = dataProp(options, "identifiers");
+  return { baseUrl, published, checkers, currentTemplate, templateFor, records, identifiers };
 }
 
 /** An own data property, or undefined. A getter, hidden property or Proxy value fails. */

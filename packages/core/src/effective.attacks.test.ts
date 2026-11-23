@@ -675,7 +675,16 @@ describe("staff identifier types never reach the public view (D-022)", () => {
     const item = unit("Item", "item", undefined, {
       number: { type: "object_number", value: "2026.015" },
     });
-    const r = effectiveRecord(item.id, [item], () => PUBLIC_NUMBER, { checkers });
+    // The record holds the number in its identifiers (D-038).
+    const identifiers = [
+      {
+        recordId: item.id,
+        organizationId: ORG,
+        current: [{ type: "object_number", value: "2026.015", primary: true }],
+        former: [],
+      },
+    ];
+    const r = effectiveRecord(item.id, [item], () => PUBLIC_NUMBER, { checkers, identifiers });
     if (!r.ok) throw new Error("effective");
     expect(publicView(r.value)?.fields).toEqual({ number: { value: "2026.015" } });
     // Only the missing rights (these samples have none), nothing about identifiers.
@@ -790,6 +799,229 @@ describe("staff identifier types never reach the public view (D-022)", () => {
       if (!r.ok) throw new Error("effective");
       expect(JSON.stringify(r.value.notes)).not.toContain("Donor file number");
     }
+  });
+});
+
+// D-038: numbers live in RecordIdentifiers; an identifier field only points
+// at one of its record's current identifiers. Each attack tries to get a
+// staff-type number, or a number the record doesn't hold, into the view.
+describe("an identifier field publishes only a number its record holds (D-038)", () => {
+  const OTHER_ORG = newOrganizationId();
+  const DONOR = "DF-SECRET-0042";
+  const made = makeIdentifierChecker([
+    {
+      key: "object_number",
+      label: "Object number",
+      organizationId: ORG,
+      uniqueness: "none",
+      public: true,
+    },
+    {
+      key: "donor_file_number",
+      label: "Donor file number",
+      organizationId: ORG,
+      uniqueness: "none",
+    },
+  ]);
+  if (!made.ok) throw new Error("types");
+  const checkers = { identifier: made.value };
+  function numberDef(inherited = false, repeatable = false): FieldDefinition {
+    return { ...def("number", "public", inherited), kind: "identifier", repeatable };
+  }
+  const PUBLIC_NUMBER = template([numberDef()], "public-number");
+  interface Current {
+    type: string;
+    value: string;
+    primary: boolean;
+  }
+  function held(
+    record: { readonly id: RecordId },
+    current: Current[],
+    former: { type: string; value: string }[] = [],
+    organizationId = ORG,
+  ) {
+    return { recordId: record.id, organizationId, current, former };
+  }
+  function viewText(r: ReturnType<typeof effectiveRecord>): string {
+    if (!r.ok) throw new Error(JSON.stringify(r.issues));
+    return JSON.stringify(publicView(r.value));
+  }
+
+  it("withholds a number shown in a field when the record holds no identifiers at all", () => {
+    const item = unit("Item", "item", undefined, {
+      number: { type: "object_number", value: "2026.015" },
+    });
+    const r = effectiveRecord(item.id, [item], () => PUBLIC_NUMBER, { checkers, identifiers: [] });
+    if (!r.ok) throw new Error("effective");
+    expect(publicView(r.value)?.entries).toEqual([]);
+    expect(r.value.entries[0]?.visibility).toBe("staff");
+    expect(effectivePublishIssues(r.value).map((i) => i.code)).toEqual(["identifier_not_held"]);
+  });
+
+  it("withholds every public number when the identifiers aren't given", () => {
+    const item = unit("Item", "item", undefined, {
+      number: { type: "object_number", value: "2026.015" },
+    });
+    const r = effectiveRecord(item.id, [item], () => PUBLIC_NUMBER, { checkers });
+    if (!r.ok) throw new Error("effective");
+    expect(publicView(r.value)?.entries).toEqual([]);
+    expect(effectivePublishIssues(r.value).map((i) => i.code)).toEqual(["identifiers_unknown"]);
+  });
+
+  it("refuses a staff-type primary number relabelled in the field as a public type", () => {
+    // The record's primary number is a donor file number; the field claims
+    // the same text is an object number, which is a public type.
+    const item = unit("Item", "item", undefined, {
+      number: { type: "object_number", value: DONOR },
+    });
+    const identifiers = [held(item, [{ type: "donor_file_number", value: DONOR, primary: true }])];
+    const r = effectiveRecord(item.id, [item], () => PUBLIC_NUMBER, { checkers, identifiers });
+    expect(viewText(r)).not.toContain(DONOR);
+    if (!r.ok) throw new Error("effective");
+    expect(effectivePublishIssues(r.value).map((i) => i.code)).toEqual(["identifier_not_held"]);
+  });
+
+  it("refuses a staff-type primary number in a public field even when the record holds it", () => {
+    const item = unit("Item", "item", undefined, {
+      number: { type: "donor_file_number", value: DONOR },
+    });
+    const identifiers = [held(item, [{ type: "donor_file_number", value: DONOR, primary: true }])];
+    const r = effectiveRecord(item.id, [item], () => PUBLIC_NUMBER, { checkers, identifiers });
+    expect(viewText(r)).not.toContain(DONOR);
+    if (!r.ok) throw new Error("effective");
+    expect(effectivePublishIssues(r.value).map((i) => i.code)).toEqual(["private_identifier_type"]);
+  });
+
+  it("refuses a lookalike spelling of a held number: matching is exact", () => {
+    const item = unit("Item", "item", undefined, {
+      number: { type: "object_number", value: "2026.0l5" },
+    });
+    const identifiers = [held(item, [{ type: "object_number", value: "2026.015", primary: true }])];
+    const r = effectiveRecord(item.id, [item], () => PUBLIC_NUMBER, { checkers, identifiers });
+    expect(viewText(r)).not.toContain("2026.0l5");
+    if (!r.ok) throw new Error("effective");
+    expect(effectivePublishIssues(r.value).map((i) => i.code)).toEqual(["identifier_not_held"]);
+  });
+
+  it("refuses a former (retired) number", () => {
+    const item = unit("Item", "item", undefined, {
+      number: { type: "object_number", value: "1999.001" },
+    });
+    const identifiers = [
+      held(
+        item,
+        [{ type: "object_number", value: "2026.015", primary: true }],
+        [{ type: "object_number", value: "1999.001" }],
+      ),
+    ];
+    const r = effectiveRecord(item.id, [item], () => PUBLIC_NUMBER, { checkers, identifiers });
+    expect(viewText(r)).not.toContain("1999.001");
+  });
+
+  it("refuses a number held by another record, not this one", () => {
+    const item = unit("Item", "item", undefined, {
+      number: { type: "object_number", value: "2026.015" },
+    });
+    const other = unit("Other", "item");
+    const identifiers = [
+      held(other, [{ type: "object_number", value: "2026.015", primary: true }]),
+      held(item, []),
+    ];
+    const r = effectiveRecord(item.id, [item], () => PUBLIC_NUMBER, { checkers, identifiers });
+    expect(viewText(r)).not.toContain("2026.015");
+  });
+
+  it("holds back a list when any one of its numbers isn't held", () => {
+    const tpl = template([numberDef(false, true)], "public-numbers");
+    const item = unit("Item", "item", undefined, {
+      number: [
+        { type: "object_number", value: "2026.015" },
+        { type: "object_number", value: "2026.016" },
+      ],
+    });
+    const identifiers = [held(item, [{ type: "object_number", value: "2026.015", primary: true }])];
+    const r = effectiveRecord(item.id, [item], () => tpl, { checkers, identifiers });
+    expect(viewText(r)).not.toContain("2026.015");
+  });
+
+  it("checks an inherited number against the ancestor that holds it, not the child", () => {
+    const tpl = template([numberDef(true)], "public-number-inherited");
+    const fonds = unit("Fonds", "fonds", undefined, {
+      number: { type: "object_number", value: "F-1" },
+    });
+    const item = unit("Item", "item", fonds);
+    // Only the child claims to hold it: not enough.
+    const childOnly = [held(item, [{ type: "object_number", value: "F-1", primary: true }])];
+    const bad = effectiveRecord(item.id, [item, fonds], () => tpl, {
+      checkers,
+      identifiers: childOnly,
+    });
+    expect(viewText(bad)).not.toContain("F-1");
+    const good = effectiveRecord(item.id, [item, fonds], () => tpl, {
+      checkers,
+      identifiers: [held(fonds, [{ type: "object_number", value: "F-1", primary: true }])],
+    });
+    if (!good.ok) throw new Error("effective");
+    expect(publicView(good.value)?.fields).toEqual({ number: { value: "F-1" } });
+  });
+
+  it("refuses identifiers of another organization outright", () => {
+    const item = unit("Item", "item", undefined, {
+      number: { type: "object_number", value: "2026.015" },
+    });
+    const identifiers = [
+      held(item, [{ type: "object_number", value: "2026.015", primary: true }], [], OTHER_ORG),
+    ];
+    const r = effectiveRecord(item.id, [item], () => PUBLIC_NUMBER, { checkers, identifiers });
+    expect(codeOf(r)).toBe("mixed_organizations");
+  });
+
+  it("refuses two sets for one record, Proxies, getters and malformed sets", () => {
+    const item = unit("Item", "item", undefined, {
+      number: { type: "object_number", value: "2026.015" },
+    });
+    const set = held(item, [{ type: "object_number", value: "2026.015", primary: true }]);
+    const run = (identifiers: unknown) =>
+      codeOf(
+        effectiveRecord(item.id, [item], () => PUBLIC_NUMBER, {
+          checkers,
+          identifiers: identifiers as never,
+        }),
+      );
+    expect(run([set, held(item, [])])).toBe("duplicate_identifiers");
+    expect(run(new Proxy([set], {}))).toBe("invalid_options");
+    expect(run([new Proxy(set, {})])).toBe("mixed_organizations");
+    expect(run([{ ...set, current: "2026.015" }])).toBe("invalid_identifiers");
+    expect(run("2026.015")).toBe("invalid_identifiers");
+    const getter = { checkers };
+    Object.defineProperty(getter, "identifiers", { get: () => [set], enumerable: true });
+    expect(codeOf(effectiveRecord(item.id, [item], () => PUBLIC_NUMBER, getter))).toBe(
+      "invalid_options",
+    );
+  });
+
+  it("reads the identifiers once: a list that changes after the call doesn't matter", () => {
+    const item = unit("Item", "item", undefined, {
+      number: { type: "object_number", value: "2026.015" },
+    });
+    const current = [{ type: "object_number", value: "2026.015", primary: true }];
+    const identifiers = [held(item, current)];
+    const r = effectiveRecord(item.id, [item], () => PUBLIC_NUMBER, { checkers, identifiers });
+    current[0] = { type: "donor_file_number", value: DONOR, primary: true };
+    if (!r.ok) throw new Error("effective");
+    expect(publicView(r.value)?.fields).toEqual({ number: { value: "2026.015" } });
+  });
+
+  it("leaves staff identifier fields alone: they are never published", () => {
+    const tpl = template([{ ...numberDef(), visibility: "staff" }], "staff-number-2");
+    const item = unit("Item", "item", undefined, {
+      number: { type: "donor_file_number", value: DONOR },
+    });
+    const r = effectiveRecord(item.id, [item], () => tpl, { checkers, identifiers: [] });
+    if (!r.ok) throw new Error("effective");
+    expect(r.value.entries[0]?.visibility).toBe("staff");
+    expect(r.value.notes).toEqual([]);
+    expect(viewText(r)).not.toContain(DONOR);
   });
 });
 

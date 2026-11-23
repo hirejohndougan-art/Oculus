@@ -41,6 +41,12 @@
  *   reason. An entry that doesn't say which organization it belongs to
  *   counts as another organization's.
  *
+ * - **This is the one home for numbers** (D-038). A template field of kind
+ *   `identifier` stores no number of its own: its `{ type, value }` must
+ *   name one of the record's current identifiers here, exactly
+ *   (`identifierFieldIssues`, identifier-fields.ts). `effectiveRecord` and
+ *   `publicOutput` publish a field's number only when its record holds it.
+ *
  * Changing an identifier type: tightening a format, removing or renaming a
  * type, making it unique or changing its numbering can make existing records
  * fail `validateRecordIdentifiers` or give a used number out again, and
@@ -830,6 +836,100 @@ function isUtcTimestamp(value: unknown): boolean {
 /** The record's primary identifier, if it has any current ones. */
 export function primaryIdentifier(identifiers: RecordIdentifiers): Identifier | undefined {
   return identifiers.current.find((i) => i.primary);
+}
+
+// ---------------------------------------------------------------------------
+// One home for numbers (D-038)
+
+/**
+ * Many records' identifiers, read once into plain, frozen copies (Proxies,
+ * getters and malformed sets refused), all of one organization
+ * (`mixed_organizations` otherwise, also for a set that names none), keyed
+ * by record ID. A record ID listed twice is refused
+ * (`duplicate_identifiers`): which of the two sets is the record's would be
+ * a guess. Each set must also keep the rules a single set can be checked
+ * for without its types (`invalid_identifiers`): exactly one primary when
+ * it has current identifiers, and no number listed twice as current (by
+ * type and comparison key). A number both current and former is allowed
+ * (retired, then reinstated, as `retireIdentifier` keeps it). Whether each
+ * type exists and fits its format, and uniqueness across records, need the
+ * organization's types and every record: callers must pass sets already
+ * checked with `validateRecordIdentifiers` and `uniquenessIssues` on the
+ * save path. (A value of a type that isn't one of the organization's can't
+ * be published anyway: the identifier checker refuses it.) Internal: not
+ * exported from the package. Never throws.
+ */
+export function readIdentifierSets(
+  all: unknown,
+): Validated<ReadonlyMap<RecordId, RecordIdentifiers>> {
+  const snap = snapshot(all, []);
+  if (!snap.ok) return snap;
+  const byRecord = new Map<RecordId, RecordIdentifiers>();
+  for (const [index, set] of snap.value.sets.entries()) {
+    const broken = setRuleBroken(set);
+    if (broken !== undefined) {
+      return {
+        ok: false,
+        issues: [issue([index], "invalid_identifiers", broken)],
+      };
+    }
+    if (byRecord.has(set.recordId)) {
+      return {
+        ok: false,
+        issues: [
+          issue(
+            [index, "recordId"],
+            "duplicate_identifiers",
+            "Two sets of identifiers name the same record.",
+          ),
+        ],
+      };
+    }
+    byRecord.set(set.recordId, set);
+  }
+  return { ok: true, value: byRecord };
+}
+
+/** Why one set breaks a rule it can be checked for on its own, or undefined. Messages quote no values. */
+function setRuleBroken(set: RecordIdentifiers): string | undefined {
+  const primaries = set.current.filter((c) => c.primary).length;
+  if (set.current.length > 0 && primaries !== 1) {
+    return "A record's current identifiers must have exactly one primary.";
+  }
+  const current = new Set<string>();
+  for (const c of set.current) {
+    const key = `${c.type}\u0000${identifierKey(c.value)}`;
+    if (current.has(key)) return "A record lists the same current identifier twice.";
+    current.add(key);
+  }
+  // A number both current and former is allowed: it was retired and later
+  // reinstated, and `retireIdentifier` keeps its history (D-009).
+  return undefined;
+}
+
+/**
+ * True when `item` is `{ type, value }` (own data properties, both text)
+ * naming exactly one of the current identifiers in `set`: the same type key
+ * and the same value, character for character. A template `identifier`
+ * field only points at one of its record's current identifiers (D-038);
+ * anything else, a former number, a lookalike spelling or another type's
+ * number, is not held. Internal. Never throws.
+ */
+export function holdsCurrentIdentifier(set: RecordIdentifiers | undefined, item: unknown): boolean {
+  try {
+    if (set === undefined || types.isProxy(item) || !isPlainObject(item)) return false;
+    const type = Object.getOwnPropertyDescriptor(item, "type");
+    const value = Object.getOwnPropertyDescriptor(item, "value");
+    if (type === undefined || value === undefined || !("value" in type) || !("value" in value)) {
+      return false;
+    }
+    const t: unknown = type.value;
+    const v: unknown = value.value;
+    if (typeof t !== "string" || typeof v !== "string") return false;
+    return set.current.some((c) => c.type === t && c.value === v);
+  } catch {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
