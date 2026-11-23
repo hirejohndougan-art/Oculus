@@ -234,7 +234,7 @@ The writer:
 - [ ] T-032 **The service layer: one writer.** deps: T-026, T-029, T-031 (risky)
   - A `packages/service` service, with no HTTP yet, that holds the only database role allowed to write. Every save validates the record, checks it against its template (with the identifier checker), re-checks identifier uniqueness inside the transaction, and writes the version and change log. Tests try to write around it with every other role and fail.
 - [ ] T-034 **Workflow states and a real publish state.** deps: T-032, T-016 (risky)
-  - Records get a stored state (draft, ready for review, published, withdrawn, as in the mockup), changed only through the service. Publishing runs `effectivePublishIssues` and the accession deed check at that moment. `publicOutput` takes published IDs from the database instead of the caller's `published` list (replacing that part of D-016, with a decision entry and closing the last part of T-010a). Shape it so publishing can later be per site (Phase 5, "Show on these sites") without a schema rewrite.
+  - Records get a stored state (draft, ready for review, published, withdrawn, as in the mockup), changed only through the service. Publishing runs `effectivePublishIssues` and the accession deed check at that moment. `publicOutput` gets `records` and `templateFor` loaded in the same read, never from a cache (D-054). `publicOutput` takes published IDs from the database instead of the caller's `published` list (replacing that part of D-016, with a decision entry and closing the last part of T-010a). Shape it so publishing can later be per site (Phase 5, "Show on these sites") without a schema rewrite.
 
 Logins and roles:
 - [ ] T-036 **User accounts and password sign-in.** deps: T-023, T-024 (risky)
@@ -275,7 +275,7 @@ Admin screens in the browser:
 
 Server and deployment:
 - [ ] T-050 **Server layout for the admin and the public sites.** deps: T-042 (risky)
-  - One app (D-034). The public sites may read only published data, through a read-only path (its own database role or a public read API) that tests show can't reach staff fields or unpublished records.
+  - One app (D-034). The public sites may read only published data, through a read-only path (its own database role or a public read API) that tests show can't reach staff fields or unpublished records. Public pages render only `publicOutput` results, never a `publicView` directly, and build them with the records and templates loaded at publish or request time (D-054).
 - [ ] T-040 **Sending password reset email.** deps: T-039 (risky)
   - Deliver reset and invitation messages over SMTP (D-035), so any host's mail or a mail service works, with its credentials only in environment variables, and nothing about the account in the message beyond the link.
 - [ ] T-051 **Deploy and run.** deps: T-050, T-052 (needs John) (risky) John: SiteGround shared hosting (D-046); confirm with SiteGround support that an always-running Node process is allowed.
