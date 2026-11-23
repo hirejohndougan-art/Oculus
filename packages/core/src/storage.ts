@@ -563,6 +563,8 @@ export function indexLocations(levels: unknown, locations: unknown): Validated<L
         byId.set(loc.id, loc);
       }
     });
+    // With two locations under one ID, parents and names can't be checked reliably.
+    if (issues.count > 0) return { ok: false, issues: issues.items };
     const children = new Map<LocationId, LocationId[]>();
     const siblingNames = new Map<string, Set<string>>();
     valid.forEach((loc, i) => {

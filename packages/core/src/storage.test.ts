@@ -1,0 +1,484 @@
+import { describe, expect, it } from "vitest";
+import {
+  DEFAULT_STORAGE_LEVELS,
+  awayFromNormal,
+  checkLocationDeletion,
+  createStorageMove,
+  indexLocations,
+  indexMoves,
+  isIsoDay,
+  isLocationId,
+  isLocationIndex,
+  isMoveLog,
+  locationChildren,
+  locationContents,
+  locationLabel,
+  locationPath,
+  moveHistory,
+  newLocationId,
+  newMoveId,
+  newOrganizationId,
+  newRecordId,
+  overdueReturns,
+  storageLocation,
+  validateStorageLevels,
+  validateStorageLocation,
+  validateStorageMove,
+  whereabouts,
+  withMove,
+  type LocationIndex,
+  type MoveLog,
+  type StorageLocation,
+  type StorageMove,
+  type Validated,
+} from "./index.js";
+
+const ORG = newOrganizationId();
+const LEVELS = { organizationId: ORG, levels: [...DEFAULT_STORAGE_LEVELS] };
+
+function ok<T>(result: Validated<T>): T {
+  if (!result.ok) throw new Error(JSON.stringify(result.issues));
+  return result.value;
+}
+
+function codes(result: Validated<unknown>): string[] {
+  return result.ok ? [] : result.issues.map((i) => i.code);
+}
+
+function loc(
+  name: string,
+  level: number | undefined,
+  extra: Partial<StorageLocation> = {},
+): StorageLocation {
+  return {
+    id: newLocationId(),
+    organizationId: ORG,
+    kind: "storage",
+    name,
+    ...(level === undefined ? {} : { level }),
+    ...extra,
+  };
+}
+
+// Archive room › Shelf A › Box 001 › Folder 1; Shelf B; Map room › Flat file 1 (skips Shelf);
+// Exhibit hall › Case 2 (display); a conservator (outside).
+const room = loc("Archive room", 0);
+const shelfA = loc("Shelf A", 1, { parentId: room.id });
+const shelfB = loc("Shelf B", 1, { parentId: room.id });
+const box1 = loc("Box 001", 2, { parentId: shelfA.id, container: true });
+const folder1 = loc("Folder 1", 3, { parentId: box1.id, container: true });
+const mapRoom = loc("Map room", 0);
+const flatFile = loc("Flat file 1", 2, { parentId: mapRoom.id, container: true });
+const hall = loc("Exhibit hall", 0, { kind: "display" });
+const case2 = loc("Case 2", 1, { kind: "display", parentId: hall.id });
+const conservator = {
+  id: newLocationId(),
+  organizationId: ORG,
+  kind: "external",
+  name: "Paper conservator",
+  agentId: newRecordId(),
+} as StorageLocation;
+const ALL = [room, shelfA, shelfB, box1, folder1, mapRoom, flatFile, hall, case2, conservator];
+
+function index(list: readonly unknown[] = ALL): LocationIndex {
+  return ok(indexLocations(LEVELS, list));
+}
+
+const T0 = "2026-11-23T16:05:00.000Z";
+let tick = 0;
+function move(
+  recordId: string,
+  locationId: string,
+  movedOn: string,
+  reason: StorageMove["reason"],
+  extra: Partial<StorageMove> = {},
+): StorageMove {
+  tick += 1;
+  return {
+    id: newMoveId(),
+    organizationId: ORG,
+    recordId,
+    locationId,
+    movedOn,
+    reason,
+    recordedAt: new Date(Date.parse(T0) + tick * 1000).toISOString(),
+    ...extra,
+  } as StorageMove;
+}
+
+describe("storage levels", () => {
+  it("accepts the default levels and an organization's own", () => {
+    expect(ok(validateStorageLevels(LEVELS)).levels).toEqual(["Room", "Shelf", "Box", "Folder"]);
+    expect(ok(validateStorageLevels({ organizationId: ORG, levels: ["Building"] })).levels).toEqual(
+      ["Building"],
+    );
+  });
+
+  it("refuses empty, duplicate, untrimmed, multi-line and too many levels", () => {
+    expect(codes(validateStorageLevels({ organizationId: ORG, levels: [] }))).toEqual(["required"]);
+    expect(codes(validateStorageLevels({ organizationId: ORG, levels: ["Box", "box"] }))).toEqual([
+      "duplicate_level",
+    ]);
+    expect(codes(validateStorageLevels({ organizationId: ORG, levels: [" Box"] }))).toEqual([
+      "untrimmed",
+    ]);
+    expect(codes(validateStorageLevels({ organizationId: ORG, levels: ["A\tB"] }))).toEqual([
+      "control_characters",
+    ]);
+    expect(
+      codes(validateStorageLevels({ organizationId: ORG, levels: "123456789".split("") })),
+    ).toEqual(["too_many"]);
+    expect(codes(validateStorageLevels({ organizationId: ORG, levels: [""] }))).toEqual([
+      "required",
+    ]);
+  });
+
+  it("requires an organization", () => {
+    expect(codes(validateStorageLevels({ levels: ["Room"] }))).toEqual(["invalid_organization"]);
+  });
+});
+
+describe("validateStorageLocation", () => {
+  it("accepts storage, display and outside locations", () => {
+    for (const l of ALL) expect(ok(validateStorageLocation(l))).toEqual(l);
+    expect(isLocationId(room.id)).toBe(true);
+  });
+
+  it("returns a frozen copy, not the caller's object", () => {
+    const given = { ...room };
+    const copy = ok(validateStorageLocation(given));
+    expect(copy).not.toBe(given);
+    expect(Object.isFrozen(copy)).toBe(true);
+  });
+
+  it("needs a level inside and refuses one outside", () => {
+    expect(codes(validateStorageLocation({ ...room, level: undefined }))).toContain(
+      "undefined_value",
+    );
+    const noLevel = Object.fromEntries(Object.entries(room).filter(([k]) => k !== "level"));
+    expect(codes(validateStorageLocation(noLevel))).toEqual(["invalid_level"]);
+    expect(codes(validateStorageLocation({ ...room, level: 1.5 }))).toEqual(["invalid_level"]);
+    expect(codes(validateStorageLocation({ ...room, level: -1 }))).toEqual(["invalid_level"]);
+    expect(codes(validateStorageLocation({ ...conservator, level: 0 }))).toEqual([
+      "external_level",
+    ]);
+    expect(codes(validateStorageLocation({ ...conservator, parentId: room.id }))).toEqual([
+      "external_parent",
+    ]);
+    expect(codes(validateStorageLocation({ ...conservator, container: true }))).toEqual([
+      "external_container",
+    ]);
+    expect(codes(validateStorageLocation({ ...room, agentId: newRecordId() }))).toEqual([
+      "agent_not_external",
+    ]);
+  });
+
+  it("refuses a location sitting in itself, bad IDs, kinds and notes", () => {
+    expect(codes(validateStorageLocation({ ...room, parentId: room.id }))).toEqual([
+      "self_reference",
+    ]);
+    expect(codes(validateStorageLocation({ ...room, id: "BOX-1" }))).toEqual(["invalid_id"]);
+    expect(codes(validateStorageLocation({ ...room, kind: "attic" }))).toEqual(["invalid_kind"]);
+    expect(codes(validateStorageLocation({ ...room, container: false }))).toEqual([
+      "invalid_container",
+    ]);
+    expect(codes(validateStorageLocation({ ...room, note: "  " }))).toEqual(["invalid_note"]);
+    expect(
+      ok(validateStorageLocation({ ...room, note: "Key at front desk.\nAsk before opening." }))
+        .note,
+    ).toContain("\n");
+    expect(codes(validateStorageLocation({ ...room, shelfMark: "x" }))).toEqual([
+      "unknown_property",
+    ]);
+  });
+});
+
+describe("indexLocations", () => {
+  it("indexes a tree and labels paths", () => {
+    const idx = index();
+    expect(isLocationIndex(idx)).toBe(true);
+    expect(idx.size).toBe(ALL.length);
+    expect(idx.levels).toEqual(["Room", "Shelf", "Box", "Folder"]);
+    expect(locationLabel(idx, folder1.id)).toBe("Archive room › Shelf A › Box 001 › Folder 1");
+    expect(locationLabel(idx, flatFile.id)).toBe("Map room › Flat file 1");
+    expect(locationLabel(idx, conservator.id)).toBe("Paper conservator");
+    expect(locationPath(idx, box1.id)?.map((l) => l.name)).toEqual([
+      "Archive room",
+      "Shelf A",
+      "Box 001",
+    ]);
+    expect(storageLocation(idx, shelfB.id)).toEqual(shelfB);
+    expect(locationPath(idx, newLocationId())).toBeUndefined();
+    expect(locationLabel(idx, "nope")).toBeUndefined();
+  });
+
+  it("lists children by name, numbers in order", () => {
+    const box2 = loc("Box 2", 2, { parentId: shelfA.id });
+    const box10 = loc("Box 10", 2, { parentId: shelfA.id });
+    const idx = index([...ALL, box10, box2]);
+    expect(locationChildren(idx, shelfA.id).map((l) => l.name)).toEqual([
+      "Box 001",
+      "Box 2",
+      "Box 10",
+    ]);
+    expect(locationChildren(idx, undefined).map((l) => l.name)).toEqual([
+      "Archive room",
+      "Exhibit hall",
+      "Map room",
+      "Paper conservator",
+    ]);
+  });
+
+  it("refuses unknown parents, wrong level order, unnamed levels and outside parents", () => {
+    expect(codes(indexLocations(LEVELS, [loc("Shelf", 1, { parentId: newLocationId() })]))).toEqual(
+      ["unknown_parent"],
+    );
+    expect(codes(indexLocations(LEVELS, [room, loc("Room 2", 0, { parentId: room.id })]))).toEqual([
+      "level_order",
+    ]);
+    expect(codes(indexLocations(LEVELS, [shelfA, loc("Up", 0, { parentId: shelfA.id })]))).toEqual([
+      "unknown_parent",
+      "level_order",
+    ]);
+    expect(
+      codes(indexLocations({ organizationId: ORG, levels: ["Room"] }, [room, shelfA])),
+    ).toEqual(["unknown_level"]);
+    const inside = {
+      ...loc("Drawer", 1),
+      parentId: conservator.id,
+    };
+    expect(codes(indexLocations(LEVELS, [conservator, inside]))).toEqual(["external_parent"]);
+  });
+
+  it("refuses duplicate IDs and sibling names, but allows the same name elsewhere", () => {
+    expect(codes(indexLocations(LEVELS, [room, room]))).toEqual(["duplicate_id"]);
+    expect(
+      codes(indexLocations(LEVELS, [room, shelfA, loc("shelf a", 1, { parentId: room.id })])),
+    ).toEqual(["duplicate_name"]);
+    const otherBox = loc("Box 001", 2, { parentId: shelfB.id });
+    expect(index([...ALL, otherBox]).size).toBe(ALL.length + 1);
+  });
+
+  it("reports the levels' problems under levels", () => {
+    const r = indexLocations({ organizationId: ORG, levels: [] }, []);
+    expect(r.ok ? [] : r.issues.map((i) => i.path)).toEqual([["levels", "levels"]]);
+  });
+
+  it("follows a container when it moves to another shelf", () => {
+    const moved = { ...box1, parentId: shelfB.id };
+    const idx = index(ALL.map((l) => (l.id === box1.id ? moved : l)));
+    expect(locationLabel(idx, folder1.id)).toBe("Archive room › Shelf B › Box 001 › Folder 1");
+  });
+});
+
+describe("moves", () => {
+  it("validates a move and makes one with createStorageMove", () => {
+    const m = move(newRecordId(), box1.id, "2026-11-20", "placement");
+    expect(ok(validateStorageMove(m))).toEqual(m);
+    const made = ok(
+      createStorageMove(
+        {
+          organizationId: ORG,
+          recordId: m.recordId,
+          locationId: case2.id,
+          movedOn: "2026-11-20",
+          reason: "exhibition",
+          expectedReturnOn: "2027-03-01",
+        },
+        new Date(T0),
+      ),
+    );
+    expect(made.recordedAt).toBe(T0);
+    expect(made.id).not.toBe(m.id);
+    expect(codes(createStorageMove({ ...m }, new Date(Number.NaN)))).toEqual(["invalid_time"]);
+  });
+
+  it("checks dates, reasons and expected return dates", () => {
+    const r = newRecordId();
+    expect(codes(validateStorageMove(move(r, box1.id, "2026-02-30", "placement")))).toEqual([
+      "invalid_date",
+    ]);
+    expect(codes(validateStorageMove(move(r, box1.id, "2026-11-20", "lost" as never)))).toEqual([
+      "invalid_reason",
+    ]);
+    expect(
+      codes(
+        validateStorageMove(
+          move(r, box1.id, "2026-11-20", "rehousing", { expectedReturnOn: "2027-01-01" }),
+        ),
+      ),
+    ).toEqual(["unexpected_return_date"]);
+    expect(
+      codes(
+        validateStorageMove(
+          move(r, case2.id, "2026-11-20", "exhibition", { expectedReturnOn: "2026-11-19" }),
+        ),
+      ),
+    ).toEqual(["return_before_move"]);
+    expect(
+      ok(
+        validateStorageMove(
+          move(r, case2.id, "2026-11-20", "exhibition", { expectedReturnOn: "2026-11-20" }),
+        ),
+      ).expectedReturnOn,
+    ).toBe("2026-11-20");
+  });
+
+  it("allows a back-dated move and a day of time-zone slack, but not a later one", () => {
+    const r = newRecordId();
+    expect(ok(validateStorageMove(move(r, box1.id, "1998-04-02", "placement"))).movedOn).toBe(
+      "1998-04-02",
+    );
+    const at = { recordedAt: "2026-11-20T23:30:00.000Z" };
+    expect(ok(validateStorageMove(move(r, box1.id, "2026-11-21", "placement", at))).movedOn).toBe(
+      "2026-11-21",
+    );
+    expect(codes(validateStorageMove(move(r, box1.id, "2026-11-22", "placement", at)))).toEqual([
+      "future_move",
+    ]);
+  });
+
+  it("isIsoDay accepts real days only", () => {
+    expect(isIsoDay("2024-02-29")).toBe(true);
+    expect(isIsoDay("2023-02-29")).toBe(false);
+    expect(isIsoDay("0999-01-01")).toBe(false);
+    expect(isIsoDay("2026-1-01")).toBe(false);
+    expect(isIsoDay(20261120)).toBe(false);
+  });
+});
+
+describe("whereabouts", () => {
+  const print = newRecordId(); // "Dickinson Depot Move" print
+  const deed = newRecordId(); // 1849 land transfer
+  const tape = newRecordId(); // never placed, only sent out
+  const idx = index();
+  const moves = [
+    move(print, box1.id, "2026-01-05", "placement"),
+    move(print, case2.id, "2026-09-01", "exhibition", { expectedReturnOn: "2027-02-01" }),
+    move(deed, folder1.id, "2025-06-10", "placement"),
+    move(deed, conservator.id, "2026-08-01", "conservation", { expectedReturnOn: "2026-10-31" }),
+    move(tape, conservator.id, "2026-10-01", "digitization", { expectedReturnOn: "2026-11-01" }),
+  ];
+  const log: MoveLog = ok(indexMoves(idx, moves));
+
+  it("works out current and normal location from the log", () => {
+    expect(isMoveLog(log)).toBe(true);
+    expect(log.size).toBe(5);
+    expect(log.records).toBe(3);
+    const w = ok(whereabouts(log, print));
+    expect(w?.currentLabel).toBe("Exhibit hall › Case 2");
+    expect(w?.normalLabel).toBe("Archive room › Shelf A › Box 001");
+    expect(w?.away).toBe(true);
+    expect(w?.since).toBe("2026-09-01");
+    expect(w?.reason).toBe("exhibition");
+    expect(w?.expectedReturnOn).toBe("2027-02-01");
+    expect(ok(whereabouts(log, newRecordId()))).toBeNull();
+  });
+
+  it("an item with no normal location is not counted as away", () => {
+    const w = ok(whereabouts(log, tape));
+    expect(w?.normal).toBeNull();
+    expect(w?.away).toBe(false);
+    expect(w?.expectedReturnOn).toBeNull();
+  });
+
+  it("lists items away, soonest due first, and the overdue ones", () => {
+    expect(ok(awayFromNormal(log)).map((w) => w.recordId)).toEqual([deed, print]);
+    expect(ok(overdueReturns(log, "2026-11-23")).map((w) => w.recordId)).toEqual([deed]);
+    expect(ok(overdueReturns(log, "2026-10-31"))).toEqual([]);
+    expect(ok(overdueReturns(log, "2027-02-02")).map((w) => w.recordId)).toEqual([deed, print]);
+    expect(codes(overdueReturns(log, "today"))).toEqual(["invalid_date"]);
+  });
+
+  it("a return brings it home and clears the expected date", () => {
+    const back = ok(withMove(log, move(deed, folder1.id, "2026-11-22", "return")));
+    const w = ok(whereabouts(back, deed));
+    expect(w?.away).toBe(false);
+    expect(w?.expectedReturnOn).toBeNull();
+    expect(ok(overdueReturns(back, "2026-11-23"))).toEqual([]);
+    expect(back.size).toBe(6);
+    // The old log is unchanged.
+    expect(ok(overdueReturns(log, "2026-11-23")).map((w2) => w2.recordId)).toEqual([deed]);
+  });
+
+  it("rehousing changes the normal location", () => {
+    const next = ok(withMove(log, move(print, shelfB.id, "2026-11-22", "rehousing")));
+    const w = ok(whereabouts(next, print));
+    expect(w?.normalLabel).toBe("Archive room › Shelf B");
+    expect(w?.away).toBe(false);
+  });
+
+  it("a correction records where it is without changing home", () => {
+    const next = ok(withMove(log, move(deed, box1.id, "2026-11-22", "correction")));
+    const w = ok(whereabouts(next, deed));
+    expect(w?.currentLabel).toBe("Archive room › Shelf A › Box 001");
+    expect(w?.normalLabel).toBe("Archive room › Shelf A › Box 001 › Folder 1");
+    expect(w?.away).toBe(true);
+  });
+
+  it("keeps the history oldest first, ordering same-day moves by when they were written", () => {
+    const history = ok(moveHistory(log, print));
+    expect(history.map((m) => m.reason)).toEqual(["placement", "exhibition"]);
+    const a = move(tape, box1.id, "2026-11-22", "placement", {
+      recordedAt: "2026-11-22T10:00:00.000Z",
+    });
+    const b = move(tape, conservator.id, "2026-11-22", "digitization", {
+      recordedAt: "2026-11-22T09:00:00.000Z",
+    });
+    const l2 = ok(indexMoves(idx, [...moves, a, b]));
+    expect(ok(moveHistory(l2, tape)).map((m) => m.id)).toEqual([moves[4]?.id, b.id, a.id]);
+    expect(ok(whereabouts(l2, tape))?.current.id).toBe(box1.id);
+    expect(ok(moveHistory(log, newRecordId()))).toEqual([]);
+  });
+
+  it("checks a back-dated move in its place in the history", () => {
+    // Placed in Box 001 on 2026-01-05; a return dated before that has no home to go to.
+    expect(codes(withMove(log, move(print, box1.id, "2025-12-01", "return")))).toEqual([
+      "not_normal_location",
+    ]);
+  });
+
+  it("refuses a return that doesn't go home, and a home outside", () => {
+    expect(codes(withMove(log, move(print, shelfB.id, "2026-11-22", "return")))).toEqual([
+      "not_normal_location",
+    ]);
+    expect(codes(withMove(log, move(tape, box1.id, "2026-11-22", "return")))).toEqual([
+      "not_normal_location",
+    ]);
+    expect(codes(withMove(log, move(tape, conservator.id, "2026-11-22", "placement")))).toEqual([
+      "external_normal_location",
+    ]);
+  });
+
+  it("refuses unknown locations and duplicate move IDs", () => {
+    expect(codes(withMove(log, move(print, newLocationId(), "2026-11-22", "other")))).toEqual([
+      "unknown_location",
+    ]);
+    expect(codes(withMove(log, moves[0]))).toEqual(["duplicate_id"]);
+    expect(codes(indexMoves(idx, [moves[0], moves[0]]))).toEqual(["duplicate_id"]);
+    expect(codes(indexMoves(idx, [move(print, newLocationId(), "2026-11-22", "other")]))).toEqual([
+      "unknown_location",
+    ]);
+  });
+
+  it("lists a box's contents, and everything within it", () => {
+    const l2 = ok(withMove(log, move(tape, folder1.id, "2026-11-22", "placement")));
+    expect(ok(locationContents(l2, folder1.id))).toEqual([tape]);
+    expect(ok(locationContents(l2, box1.id))).toEqual([]);
+    expect(ok(locationContents(l2, room.id, { within: true }))).toEqual([tape]);
+    expect(ok(locationContents(l2, conservator.id))).toEqual([deed]);
+    expect(codes(locationContents(l2, newLocationId()))).toEqual(["unknown_location"]);
+  });
+
+  it("never deletes a location with children or history", () => {
+    expect(codes(checkLocationDeletion(log, shelfA.id))).toEqual(["has_children"]);
+    expect(codes(checkLocationDeletion(log, folder1.id))).toEqual(["in_history"]);
+    expect(ok(checkLocationDeletion(log, shelfB.id))).toBe(true);
+    expect(codes(checkLocationDeletion(log, newLocationId()))).toEqual(["unknown_location"]);
+  });
+
+  it("refuses a log whose location was removed from the index", () => {
+    const smaller = index(ALL.filter((l) => l.id !== case2.id));
+    expect(codes(indexMoves(smaller, moves))).toEqual(["unknown_location"]);
+  });
+});
