@@ -38,16 +38,15 @@
  * accession whose deed is needed but not signed (`missing` or `sent`)
  * produced it, produced a unit it is filed below, or produced the record a
  * digital asset `represents`. `effectivePublishIssues` and `publicOutput`
- * take the register as `accessions` and fail closed: for an object,
+ * take the register as `accessions` and refuse without it: for an object,
  * archival unit or digital asset, publishing without it is refused
  * (`accessions_unknown`), as is another organization's register
  * (`mixed_organizations`) or anything not made by `indexAccessions`
  * (`invalid_accessions`). Held back: `deed_not_signed`, whose message names
- * no donor, number or accession. The holds are worked out from the records
- * the register was made with; a unit filed below a held one later is still
- * caught through its own ancestry, but a digital asset representing a
- * record the register doesn't know is refused (`accessions_out_of_date`).
- * Make the register at publish time.
+ * no donor, number or accession. The record, every record in its current
+ * ancestry and, for a digital asset, the record it represents with that
+ * record's current ancestry must all be ones the register knows
+ * (`accessions_out_of_date`), and none may be held back.
  *
  * **One organization** (D-019, D-030). `indexAccessions` takes the
  * organization the register is for and refuses any accession, contact,
@@ -60,6 +59,19 @@
  * prototype keys are refused. Nothing here throws on bad input.
  *
  * Messages never quote contact details, materials, restrictions or notes.
+ * Accession numbers are staff-only too: a public identifier type can't
+ * number an accession (`public_type`).
+ *
+ * **No role check here.** `donorContact` and the other queries return what
+ * the register holds to whoever calls them. Only staff with the Donor
+ * relations permission (D-036) may see donors, contacts and accessions; the
+ * service layer (T-032, roles in T-041) must check that before calling.
+ *
+ * **Only as fresh as the register.** The deed check reads the holds the
+ * register worked out from the accessions and records it was made with.
+ * Make the register at publish time, from the organization's records as
+ * they are now, as T-034 will; a record the register doesn't know is
+ * refused (`accessions_out_of_date`) rather than let through.
  */
 import { randomUUID } from "node:crypto";
 import { types } from "node:util";
@@ -554,6 +566,12 @@ export function indexAccessions(
           "unknown_type",
           "The accession number's type is not one of this organization's identifier types.",
         );
+      } else if (type.public === true) {
+        issues.add(
+          ["accessions", i, "number", "type"],
+          "public_type",
+          "Accession numbers are staff-only, so their type can't be a public identifier type. Choose a staff type.",
+        );
       } else if (type.pattern !== undefined) {
         const pattern = parseIdentifierPattern(type.pattern);
         if (pattern.ok && !matchesIdentifierPattern(pattern.value, a.number.value)) {
@@ -629,10 +647,12 @@ export function indexAccessions(
       contacts: contactsByAgent,
       types: typeByKey,
     });
+    // Shared as lookups only, so the sets themselves can't be changed.
+    const known = new Set(usable.map((r) => r.id));
     markDeedHolds(register, {
       organizationId,
-      held: new Set(holds.keys()),
-      known: new Set(usable.map((r) => r.id)),
+      isHeld: (id) => holds.has(id),
+      isKnown: (id) => known.has(id),
     });
     return { ok: true, value: register };
   } catch {

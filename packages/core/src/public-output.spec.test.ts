@@ -28,7 +28,15 @@ import {
   type PublicOutput,
   type Validated,
 } from "./index.js";
-import { ACCESSIONS, BASE, CHECKERS, CNE, LCSH, record, viewOf } from "./public-output.fixtures.js";
+import {
+  accessionsFor,
+  BASE,
+  CHECKERS,
+  CNE,
+  LCSH,
+  record,
+  viewOf,
+} from "./public-output.fixtures.js";
 
 interface Quad {
   readonly subject: { readonly termType: string; readonly value: string };
@@ -116,7 +124,7 @@ function everyTermOutput(): PublicOutput {
   return ok(
     publicOutput(view, mapping, {
       baseUrl: BASE,
-      accessions: ACCESSIONS,
+      accessions: accessionsFor(view),
       published: [view.id],
       checkers: CHECKERS,
     }),
@@ -246,7 +254,11 @@ describe("JSON-LD through a JSON-LD 1.1 processor", () => {
     const view = viewOf([other], other.id);
     const mapping = { template: "out", entries: [{ field: "creator", term: "creator" }] };
     const e = ok(
-      publicOutput(view, mapping, { baseUrl: BASE, accessions: ACCESSIONS, published: [view.id] }),
+      publicOutput(view, mapping, {
+        baseUrl: BASE,
+        accessions: accessionsFor(view),
+        published: [view.id],
+      }),
     );
     const quads = await jsonld.toRDF(JSON.parse(e.jsonLdText), OPTIONS);
     expect(quads.find((q) => q.predicate.value === RDF_TYPE)?.object.value).toBe(

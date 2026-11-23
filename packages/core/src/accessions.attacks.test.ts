@@ -163,7 +163,7 @@ describe("a record whose deed is missing can't be published", () => {
 
   it("not from a kept view: the register as it is now decides", () => {
     const view = publicView(effectiveOf(item));
-    expect(ok(publish(view, { accessions: noAccessions(ORG) })).id).toBe(BASE + item.id);
+    expect(ok(publish(view, { accessions: noAccessions(ORG, RECORDS) })).id).toBe(BASE + item.id);
     expect(codes(publish(view, { accessions: held() }))).toEqual(["deed_not_signed"]);
   });
 
@@ -193,6 +193,130 @@ describe("a record whose deed is missing can't be published", () => {
         }),
       ),
     ).toEqual(["wrong_record_kind"]);
+  });
+});
+
+describe("a scan can't publish what a deed holds back (T-016 review)", () => {
+  const rights = { rights: { uri: CNE } };
+  const free = record("archival_unit", "Free fonds", rights, { level: "fonds" });
+  const unit = record("archival_unit", "Unit", rights, { level: "series", parentId: free.id });
+  const shot = record("digital_asset", "Shot", rights, { represents: unit.id });
+  const heldFonds = record("archival_unit", "Held fonds", rights, { level: "fonds" });
+  const heldSeries = record("archival_unit", "Held series", rights, {
+    level: "series",
+    parentId: heldFonds.id,
+  });
+  const before = [free, unit, shot, heldFonds, heldSeries, donor];
+  const holdsFonds = (records: readonly unknown[]) =>
+    registerOf([accession({ records: [{ recordId: heldFonds.id, label: "Held" }] })], { records });
+
+  it("not after the represented unit moved under a held series, with a register made before", () => {
+    const register = holdsFonds(before);
+    const moved = { ...unit, level: "file", parentId: heldSeries.id } as typeof unit;
+    const now = [free, moved, shot, heldFonds, heldSeries, donor];
+    const e = effectiveOf(shot, now);
+    expect(codes(effectivePublishIssues(e, { accessions: register }))).toEqual(["deed_not_signed"]);
+    expect(codes(publish(publicView(e), { accessions: register, records: now }))).toEqual([
+      "deed_not_signed",
+    ]);
+  });
+
+  it("not with a kept view, when publicOutput is given the records as they are now", () => {
+    const register = holdsFonds(before);
+    const view = publicView(effectiveOf(shot, before));
+    expect(ok(publish(view, { accessions: register, records: before })).id).toBe(BASE + shot.id);
+    const moved = { ...unit, level: "file", parentId: heldSeries.id } as typeof unit;
+    const now = [free, moved, shot, heldFonds, heldSeries, donor];
+    expect(codes(publish(view, { accessions: register, records: now }))).toEqual([
+      "deed_not_signed",
+    ]);
+  });
+
+  it("not with a register made without a record in between", () => {
+    // The register was made without the series, so it can't see the unit is below the fonds.
+    const register = holdsFonds([free, heldFonds, donor, shot, unit]);
+    const below = { ...unit, level: "file", parentId: heldSeries.id } as typeof unit;
+    const now = [free, below, shot, heldFonds, heldSeries, donor];
+    expect(codes(effectivePublishIssues(effectiveOf(shot, now), { accessions: register }))).toEqual(
+      ["accessions_out_of_date"],
+    );
+  });
+
+  it("not with an empty register, for any accessioned kind", () => {
+    const empty = registerOf([], { records: [] });
+    for (const r of [fonds, item, scan, vase]) {
+      expect(codes(effectivePublishIssues(effectiveOf(r), { accessions: empty })), r.title).toEqual(
+        ["accessions_out_of_date"],
+      );
+    }
+  });
+});
+
+describe("a link to a held record names only its label (T-016 review)", () => {
+  it("even when the held record is in the published list", async () => {
+    const { linkChecker, template, field, FIELDS } = await import("./public-output.fixtures.js");
+    const tpl = template([
+      ...FIELDS,
+      field({ key: "related", kind: "record_link", repeatable: true }),
+    ]);
+    const map = {
+      template: "out",
+      entries: [
+        { field: "rights", term: "rights" },
+        { field: "related", term: "relation" },
+      ],
+    };
+    const page = record("object", "Page", {
+      rights: { uri: CNE },
+      related: [
+        { recordId: item.id, label: "Held item" },
+        { recordId: vase.id, label: "Free vase" },
+      ],
+    });
+    const records = [...RECORDS, page];
+    const checkers = { ...CHECKERS, record_link: linkChecker(records) };
+    const e = ok(
+      (await import("./index.js")).effectiveRecord(page.id, records, () => tpl, {
+        checkers,
+        identifiers: identifiersFor(records),
+      }),
+    );
+    const view = publicView(e);
+    if (view === undefined) throw new Error("no public view");
+    const run = (accessions: unknown) =>
+      ok(
+        publicOutput(view, map, {
+          baseUrl: BASE,
+          published: [page.id, item.id, vase.id],
+          checkers,
+          identifiers: identifiersFor(records),
+          accessions,
+        }),
+      );
+    const held = registerOf([accession({ records: [{ recordId: fonds.id, label: "F" }] })], {
+      records,
+    });
+    const out = everything(run(held));
+    expect(out).not.toContain(BASE + item.id);
+    expect(out).toContain("Held item");
+    expect(out).toContain(BASE + vase.id);
+    // Once the deed is signed, both are links.
+    const signed = registerOf(
+      [accession({ deedStatus: "signed", records: [{ recordId: fonds.id, label: "F" }] })],
+      { records },
+    );
+    expect(everything(run(signed))).toContain(BASE + item.id);
+  });
+});
+
+describe("accession numbers are staff-only", () => {
+  it("refuses a public identifier type as an accession number type", () => {
+    const r = indexAccessions(ORG, {
+      accessions: [accession()],
+      records: RECORDS,
+      identifierTypes: [{ ...ACCESSION_TYPE, public: true }],
+    });
+    expect(codes(r)).toEqual(["public_type"]);
   });
 });
 
@@ -331,9 +455,12 @@ describe("donor details never leak", () => {
 
   it("not through what the publish check can see of a register", () => {
     const holds = deedHoldsOf(register);
-    expect(Object.keys(holds ?? {}).sort()).toEqual(["held", "known", "organizationId"]);
-    expect(leaks(JSON.stringify([...(holds?.held ?? [])]))).toEqual([]);
+    // Lookups only: no set to read donor data from, or to change.
+    expect(Object.keys(holds ?? {}).sort()).toEqual(["isHeld", "isKnown", "organizationId"]);
+    expect(leaks(JSON.stringify(holds))).toEqual([]);
     expect(Object.isFrozen(holds)).toBe(true);
+    expect(holds?.isHeld(item.id)).toBe(true);
+    expect(holds?.isHeld(vase.id)).toBe(false);
   });
 
   it("not by any module but the package index importing accessions", () => {

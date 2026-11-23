@@ -406,13 +406,69 @@ export function effectiveRecord(
         "templateFor must be a registry from indexTemplates or a function.",
       );
     }
-    const up = ancestry(recordId, lookupFor(records));
+    const state = lookupFor(records);
+    const up = ancestry(recordId, state);
     const templates = templatesFor(up, templateFor);
     const checkers = ownSetting(options, "checkers");
     const identifiers = identifierSets(ownSetting(options, "identifiers"), up);
-    return { ok: true, value: compose(up, templates, checkers, identifiers) };
+    const effective = compose(up, templates, checkers, identifiers);
+    REPRESENTED.set(effective, representedIn(up[0], state));
+    return { ok: true, value: effective };
   } catch (error) {
     return failure(error);
+  }
+}
+
+/**
+ * For a digital asset, the record it represents and that record's ancestors
+ * (and so on, when what it represents is itself a digital asset that
+ * represents something), as the records set held them when the effective
+ * record was made; `null` when any of them couldn't be found or trusted.
+ * Absent for anything that represents nothing. Read by the deed check.
+ */
+const REPRESENTED = new WeakMap<object, readonly RecordId[] | null>();
+
+const MAX_REPRESENTS_HOPS = 8;
+
+/** The represented records' IDs, with their ancestries, or null when not all can be found. */
+function representedIn(
+  record: CatalogRecord | undefined,
+  state: LookupState,
+): readonly RecordId[] | null {
+  const ids: RecordId[] = [];
+  const seen = new Set<RecordId>();
+  let at = record;
+  for (let hop = 0; hop <= MAX_REPRESENTS_HOPS; hop += 1) {
+    if (at?.kind !== "digital_asset" || at.represents === undefined) {
+      return Object.freeze(ids);
+    }
+    if (seen.has(at.represents)) return Object.freeze(ids);
+    seen.add(at.represents);
+    let up: readonly CatalogRecord[];
+    try {
+      up = ancestry(at.represents, state);
+    } catch {
+      return null;
+    }
+    for (const r of up) ids.push(r.id);
+    at = up[0];
+  }
+  return null;
+}
+
+/**
+ * For `public-output.ts` only: what `record` represents, with ancestries, in
+ * `records` (a list or a lookup from `indexRecords`) as they are now, or null
+ * when any of it can't be found or trusted. Never throws.
+ */
+export function currentRepresented(
+  record: CatalogRecord,
+  records: unknown,
+): readonly RecordId[] | null {
+  try {
+    return representedIn(record, lookupFor(records));
+  } catch {
+    return null;
   }
 }
 
@@ -1055,10 +1111,12 @@ export function publicView(effective: EffectiveRecord): PublicRecord | undefined
  * or another organization's register (`mixed_organizations`) too. A record
  * the register holds back, or whose ancestor or represented record it holds
  * back, is refused (`deed_not_signed`); the message names no donor,
- * accession or number. A digital asset representing a record the register
- * wasn't made with is refused too (`accessions_out_of_date`): that record's
- * ancestors aren't in the asset's chain, so only a register made from the
- * records as they are now can say whether a deed holds it back. Returns an empty list when the record can be
+ * accession or number. The record, its current ancestry and, for a
+ * digital asset, the record it represents with that record's ancestry (from
+ * the records `effectiveRecord` was given; `represented_record_unknown` when
+ * they aren't there) must all be records the register knows
+ * (`accessions_out_of_date`). The check is only as fresh as the register:
+ * make it at publish time, as T-034 will. Returns an empty list when the record can be
  * published. Never throws.
  */
 export function effectivePublishIssues(
@@ -1105,6 +1163,35 @@ export function effectivePublishIssues(
   }
 }
 
+function representsSomething(record: CatalogRecord): boolean {
+  return record.kind === "digital_asset" && record.represents !== undefined;
+}
+
+/**
+ * For `public-output.ts` only: the deed check again, with what a digital
+ * asset represents found in the records as they are now
+ * (`currentRepresented`). Never throws.
+ */
+export function deedIssuesNow(
+  effective: EffectiveRecord,
+  accessions: unknown,
+  represented: readonly RecordId[] | null,
+): readonly Issue[] {
+  try {
+    return deedIssues(effective, accessions === undefined ? {} : { accessions }, represented);
+  } catch {
+    return Object.freeze([
+      Object.freeze(issue([], "unreadable", "The effective record could not be read.")),
+    ]);
+  }
+}
+
+/** True when a deed may hold `id` back or `accessions` can't say: for link targets. */
+export function deedMayHold(accessions: unknown, id: RecordId): boolean {
+  const holds = deedHoldsOf(accessions);
+  return holds === undefined || !holds.isKnown(id) || holds.isHeld(id);
+}
+
 /** The kinds an accession can produce, so the only ones the deed check applies to. */
 const ACCESSIONED: ReadonlySet<string> = new Set(["object", "archival_unit", "digital_asset"]);
 
@@ -1114,7 +1201,11 @@ const ACCESSIONED: ReadonlySet<string> = new Set(["object", "archival_unit", "di
  * accession. Throws only on unreadable options, which the caller turns
  * into `unreadable`.
  */
-function deedIssues(effective: EffectiveRecord, options: unknown): readonly Issue[] {
+function deedIssues(
+  effective: EffectiveRecord,
+  options: unknown,
+  represented?: readonly RecordId[] | null,
+): readonly Issue[] {
   const refuse = (code: string, message: string): readonly Issue[] =>
     Object.freeze([Object.freeze(issue(["accessions"], code, message))]);
   let given: unknown;
@@ -1147,18 +1238,24 @@ function deedIssues(effective: EffectiveRecord, options: unknown): readonly Issu
   }
   if (!needed) return Object.freeze([]);
   const ids: RecordId[] = effective.chain.map((step) => step.id);
-  if (record.kind === "digital_asset" && record.represents !== undefined) {
-    // The represented record's ancestors aren't in this record's chain, so
-    // only a register that knows it can say whether a deed holds it back.
-    if (!holds.known.has(record.represents)) {
-      return refuse(
-        "accessions_out_of_date",
-        "This record shows a record the accession register doesn't know. Make the register again from the organization's records as they are now.",
-      );
-    }
-    ids.push(record.represents);
+  // What a digital asset shows: the represented record's ancestors aren't in
+  // this record's chain, so they are found from the records too.
+  const shows = represented === undefined ? REPRESENTED.get(effective) : represented;
+  if (shows === null || (shows === undefined && representsSomething(record))) {
+    return refuse(
+      "represented_record_unknown",
+      "This digital asset represents a record that isn't in the records given (or one of its parents isn't), so its deed of gift can't be checked.",
+    );
   }
-  if (ids.some((id) => holds.held.has(id))) {
+  ids.push(...(shows ?? []));
+  // A register that doesn't know a record can't say a deed doesn't hold it.
+  if (!ids.every((id) => holds.isKnown(id))) {
+    return refuse(
+      "accessions_out_of_date",
+      "The accession register doesn't know this record, a record above it or the record it shows. Make the register again from the organization's records as they are now.",
+    );
+  }
+  if (ids.some((id) => holds.isHeld(id))) {
     return refuse(
       "deed_not_signed",
       "This record came from an accession whose deed of gift isn't signed yet, so it is held back from the public site. Mark the deed as signed in Deeds once the signed copy is on file.",

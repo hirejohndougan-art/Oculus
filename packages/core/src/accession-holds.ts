@@ -19,9 +19,9 @@ export interface DeedHolds {
    * but not signed (`missing` or `sent`), filed below one, or a digital
    * asset representing one, as the records were when the register was made.
    */
-  readonly held: ReadonlySet<RecordId>;
-  /** Every record the register was made with, held back or not. */
-  readonly known: ReadonlySet<RecordId>;
+  isHeld(id: RecordId): boolean;
+  /** True for a record the register was made with, held back or not. */
+  isKnown(id: RecordId): boolean;
 }
 
 const HOLDS = new WeakMap<object, DeedHolds>();

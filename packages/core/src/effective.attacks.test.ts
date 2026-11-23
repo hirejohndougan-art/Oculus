@@ -24,7 +24,7 @@ import {
   type TemplateLookup,
   newOrganizationId,
 } from "./index.js";
-import { noAccessions } from "./public-output.fixtures.js";
+import { accessionsFor } from "./public-output.fixtures.js";
 
 const ORG = newOrganizationId();
 
@@ -473,7 +473,7 @@ describe("the publish check can't be passed with staff-only rights", () => {
   it("accepts inherited rights, and the record's own rights", () => {
     // With an accession register, as publishing an archival unit needs (D-043).
     for (const e of [withRights(), withRights(true)]) {
-      const accessions = noAccessions(e.record.organizationId);
+      const accessions = accessionsFor(e);
       expect(effectivePublishIssues(e, { accessions })).toEqual([]);
     }
   });
@@ -605,7 +605,7 @@ describe("rightsPublishIssues refuses an effective record", () => {
       "use_effective_publish_issues",
     ]);
     expect(canPublishRights(r.value)).toBe(false);
-    const accessions = noAccessions(r.value.record.organizationId);
+    const accessions = accessionsFor(r.value);
     expect(effectivePublishIssues(r.value, { accessions })).toEqual([]);
     expect(isEffectiveRecord({ ...r.value })).toBe(false);
     expect(isEffectiveRecord(publicView(r.value))).toBe(false);

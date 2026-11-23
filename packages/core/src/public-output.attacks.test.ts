@@ -22,7 +22,7 @@ import {
   type Validated,
 } from "./index.js";
 import {
-  ACCESSIONS,
+  accessionsFor,
   BASE,
   CNE,
   MAPPING,
@@ -52,7 +52,7 @@ const ch = (code: number): string => String.fromCharCode(code);
 function out(view: PublicRecord, mapping: unknown = MAPPING, id = view.id) {
   return publicOutput(view, mapping, {
     baseUrl: BASE,
-    accessions: ACCESSIONS,
+    accessions: accessionsFor(view),
     published: [id],
     checkers: CHECKERS,
     identifiers: idsOf(view),
@@ -226,7 +226,7 @@ describe("staff identifier types never reach any output form (D-022)", () => {
     for (const identifier of [() => [], Object.assign(() => [], CHECKERS.identifier)]) {
       const result = publicOutput(view, MAPPING, {
         baseUrl: BASE,
-        accessions: ACCESSIONS,
+        accessions: accessionsFor(view),
         published: [view.id],
         checkers: { identifier },
       });
@@ -289,7 +289,7 @@ describe("staff identifier types never reach any output form (D-022)", () => {
     const view = viewOf([item], item.id);
     const result = publicOutput(view, MAPPING, {
       baseUrl: BASE,
-      accessions: ACCESSIONS,
+      accessions: accessionsFor(view),
       published: [view.id],
       checkers: { identifier: () => [] },
     });
@@ -381,7 +381,7 @@ describe("hostile options", () => {
   it("refuses a Proxy without reading it", () => {
     let reads = 0;
     const proxy = new Proxy(
-      { baseUrl: BASE, accessions: ACCESSIONS, published: [view.id] },
+      { baseUrl: BASE, accessions: accessionsFor(view), published: [view.id] },
       {
         get(t, k, r) {
           reads++;
@@ -413,10 +413,15 @@ describe("hostile options", () => {
     Object.defineProperty(hidden, "baseUrl", { value: BASE, enumerable: false });
     expect(run(hidden)).toEqual(["invalid_options"]);
     expect(
-      run({ baseUrl: BASE, accessions: ACCESSIONS, published: [view.id], force: true }),
+      run({ baseUrl: BASE, accessions: accessionsFor(view), published: [view.id], force: true }),
     ).toEqual(["invalid_options"]);
     expect(
-      run({ baseUrl: BASE, accessions: ACCESSIONS, published: [view.id], [Symbol("x")]: 1 }),
+      run({
+        baseUrl: BASE,
+        accessions: accessionsFor(view),
+        published: [view.id],
+        [Symbol("x")]: 1,
+      }),
     ).toEqual(["invalid_options"]);
     expect(
       run(
@@ -431,7 +436,7 @@ describe("hostile options", () => {
 
   it("refuses a Proxy or a getter inside the published list", () => {
     expect(
-      run({ baseUrl: BASE, accessions: ACCESSIONS, published: new Proxy([view.id], {}) }),
+      run({ baseUrl: BASE, accessions: accessionsFor(view), published: new Proxy([view.id], {}) }),
     ).toEqual(["invalid_options"]);
     const list: unknown[] = [];
     let calls = 0;
@@ -442,14 +447,14 @@ describe("hostile options", () => {
         return view.id;
       },
     });
-    expect(run({ baseUrl: BASE, accessions: ACCESSIONS, published: list })).toEqual([
+    expect(run({ baseUrl: BASE, accessions: accessionsFor(view), published: list })).toEqual([
       "invalid_published",
     ]);
     expect(calls).toBe(0);
     // A hole is not an ID.
     const holey: unknown[] = [];
     holey[1] = view.id;
-    expect(run({ baseUrl: BASE, accessions: ACCESSIONS, published: holey })).toEqual([
+    expect(run({ baseUrl: BASE, accessions: accessionsFor(view), published: holey })).toEqual([
       "invalid_published",
     ]);
   });
@@ -464,7 +469,7 @@ describe("hostile options", () => {
   it("refuses a published list over the limit without reading it", () => {
     const huge: unknown[] = [];
     huge.length = MAX_RECORD_SET + 1;
-    expect(run({ baseUrl: BASE, accessions: ACCESSIONS, published: huge })).toEqual([
+    expect(run({ baseUrl: BASE, accessions: accessionsFor(view), published: huge })).toEqual([
       "invalid_published",
     ]);
   });
@@ -746,7 +751,9 @@ describe("huge inputs", () => {
     const published = Array.from({ length: 100_000 }, () => newRecordId());
     published.push(view.id);
     const started = performance.now();
-    const o = ok(publicOutput(view, MAPPING, { baseUrl: BASE, accessions: ACCESSIONS, published }));
+    const o = ok(
+      publicOutput(view, MAPPING, { baseUrl: BASE, accessions: accessionsFor(view), published }),
+    );
     expect(performance.now() - started).toBeLessThan(2000);
     expect(o.dublinCore.subject).toHaveLength(500);
     const content = o.oaiDcXml.replace(
@@ -794,7 +801,7 @@ describe("a parent's template changed after the view was made (security run 2026
     const { view, item, lookup, fondsId } = staleView();
     const result = publicOutput(view, CREATOR_MAP, {
       baseUrl: BASE,
-      accessions: ACCESSIONS,
+      accessions: accessionsFor(view),
       published: [item.id],
       checkers: CHECKERS,
       templateFor: lookup,
@@ -808,7 +815,7 @@ describe("a parent's template changed after the view was made (security run 2026
     const { view, item } = staleView();
     const result = publicOutput(view, CREATOR_MAP, {
       baseUrl: BASE,
-      accessions: ACCESSIONS,
+      accessions: accessionsFor(view),
       published: [item.id],
       checkers: CHECKERS,
       currentTemplate: TPL,
@@ -821,7 +828,7 @@ describe("a parent's template changed after the view was made (security run 2026
     const run = (templateFor: unknown) =>
       publicOutput(view, CREATOR_MAP, {
         baseUrl: BASE,
-        accessions: ACCESSIONS,
+        accessions: accessionsFor(view),
         published: [item.id],
         checkers: CHECKERS,
         templateFor: templateFor as () => undefined,
@@ -857,7 +864,7 @@ describe("a parent's template changed after the view was made (security run 2026
     const result = ok(
       publicOutput(view, CREATOR_MAP, {
         baseUrl: BASE,
-        accessions: ACCESSIONS,
+        accessions: accessionsFor(view),
         published: [item.id],
         checkers: CHECKERS,
         currentTemplate: TPL,
@@ -902,7 +909,7 @@ describe("the records changed after the view was made (S-001a)", () => {
   function run(view: PublicRecord, id: string, records: unknown, extra: object = {}) {
     return publicOutput(view, CREATOR_MAP, {
       baseUrl: BASE,
-      accessions: ACCESSIONS,
+      accessions: accessionsFor(view),
       published: [id as PublicRecord["id"]],
       checkers: CHECKERS,
       templateFor: () => TPL,
@@ -1027,7 +1034,7 @@ describe("records are published only under the template they name", () => {
     const out = ok(
       publicOutput(view, HOLDER_MAP, {
         baseUrl: BASE,
-        accessions: ACCESSIONS,
+        accessions: accessionsFor(view),
         published: [item.id],
         checkers: CHECKERS,
         templateFor: templates,
@@ -1054,7 +1061,7 @@ describe("records are published only under the template they name", () => {
       { template: "donor-records", entries: [RIGHTS_ENTRY] },
       {
         baseUrl: BASE,
-        accessions: ACCESSIONS,
+        accessions: accessionsFor(view),
         published: [item.id],
         checkers: CHECKERS,
         templateFor: () => TPL,
@@ -1078,7 +1085,7 @@ describe("records are published only under the template they name", () => {
     const moved = { ...item, templateKey: "donor-records" };
     const result = publicOutput(view, HOLDER_MAP, {
       baseUrl: BASE,
-      accessions: ACCESSIONS,
+      accessions: accessionsFor(view),
       published: [item.id],
       checkers: CHECKERS,
       templateFor: templates,
@@ -1098,7 +1105,7 @@ describe("records are published only under the template they name", () => {
     const view = viewOf([item], item.id);
     const result = publicOutput(view, MAPPING, {
       baseUrl: BASE,
-      accessions: ACCESSIONS,
+      accessions: accessionsFor(view),
       published: [item.id],
       checkers: CHECKERS,
       templateFor: registry(TPL),
@@ -1111,7 +1118,7 @@ describe("records are published only under the template they name", () => {
     const view = viewOf([item], item.id);
     const result = publicOutput(view, MAPPING, {
       baseUrl: BASE,
-      accessions: ACCESSIONS,
+      accessions: accessionsFor(view),
       published: [item.id],
       checkers: CHECKERS,
       templateFor: Object.freeze({ size: 1 }),
@@ -1146,7 +1153,7 @@ describe("public output won't use another organization's records (D-019)", () =>
     );
     const options = {
       baseUrl: BASE,
-      accessions: ACCESSIONS,
+      accessions: accessionsFor(view),
       published: [item.id],
       checkers: CHECKERS,
       templateFor: () => TPL,
@@ -1196,7 +1203,7 @@ describe("another organization's identifier checker can't publish a staff number
     const view = viewOf([item], item.id);
     const result = publicOutput(view, MAP, {
       baseUrl: BASE,
-      accessions: ACCESSIONS,
+      accessions: accessionsFor(view),
       published: [item.id],
       checkers: other,
     });
@@ -1223,7 +1230,7 @@ describe("a set entry that doesn't say its organization refuses the set (second 
     expect(index.ok ? "" : index.issues[0]?.code).toBe("mixed_organizations");
     const out = publicOutput(view, MAPPING, {
       baseUrl: BASE,
-      accessions: ACCESSIONS,
+      accessions: accessionsFor(view),
       published: [item.id],
       checkers: CHECKERS,
       templateFor: () => TPL,
@@ -1251,7 +1258,7 @@ describe("public output publishes only numbers the record holds (D-038)", () => 
   function publish(view: PublicRecord, id: RecordId, identifiers?: unknown) {
     return publicOutput(view, MAP, {
       baseUrl: BASE,
-      accessions: ACCESSIONS,
+      accessions: accessionsFor(view),
       published: [id],
       checkers: CHECKERS,
       ...(identifiers === undefined ? {} : { identifiers: identifiers as never }),
@@ -1353,7 +1360,7 @@ describe("public output publishes only numbers the record holds (D-038)", () => 
     expect(codes(publish(view, item.id, new Proxy([now], {})))).toEqual(["invalid_options"]);
     const getter = {
       baseUrl: BASE,
-      accessions: ACCESSIONS,
+      accessions: accessionsFor(view),
       published: [item.id],
       checkers: CHECKERS,
     };
@@ -1387,13 +1394,15 @@ describe("a kept view can't publish a retired number (T-014 review)", () => {
     if (!built.ok) throw new Error(JSON.stringify(built.issues));
     const view = publicView(built.value);
     if (view === undefined) throw new Error("no view");
+    views.set(item.id, view);
     const retired = retireIdentifier(before, NUMBER, { newPrimary: NEXT });
     if (!retired.ok) throw new Error("retire");
     return { item, view, before, after: retired.value };
   }
+  const views = new Map<RecordId, unknown>();
   const options = (id: RecordId, extra: object = {}) => ({
     baseUrl: BASE,
-    accessions: ACCESSIONS,
+    accessions: accessionsFor(views.get(id)),
     published: [id],
     checkers: CHECKERS,
     ...extra,
@@ -1413,6 +1422,7 @@ describe("a kept view can't publish a retired number (T-014 review)", () => {
   it("publishes a view with no identifier values without the option", () => {
     const item = record("object", "Item", { rights: { uri: CNE }, description: "A card" });
     const view = viewOf([item], item.id);
+    views.set(item.id, view);
     const map = { template: "out", entries: [RIGHTS_ENTRY] };
     expect(publicOutput(view, map, options(item.id)).ok).toBe(true);
   });

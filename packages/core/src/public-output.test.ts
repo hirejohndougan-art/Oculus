@@ -16,7 +16,7 @@ import {
   type Validated,
 } from "./index.js";
 import {
-  ACCESSIONS,
+  accessionsFor,
   BASE,
   ORG,
   CNE,
@@ -51,7 +51,7 @@ function out(
 ) {
   return publicOutput(view, mapping, {
     baseUrl: BASE,
-    accessions: ACCESSIONS,
+    accessions: accessionsFor(view),
     published,
     checkers: CHECKERS,
     identifiers: idsOf(view),
@@ -242,7 +242,7 @@ describe("publicOutput: places and the published list", () => {
     const o = ok(
       publicOutput(view, MAPPING, {
         baseUrl: BASE,
-        accessions: ACCESSIONS,
+        accessions: accessionsFor(view),
         published: [item.id, PLACE_ID],
         checkers: { ...CHECKERS, place: links },
         identifiers: idsOf(view),
@@ -303,7 +303,7 @@ describe("publicOutput: places and the published list", () => {
         codes(
           publicOutput(view, MAPPING, {
             baseUrl: BASE,
-            accessions: ACCESSIONS,
+            accessions: accessionsFor(view),
             published,
           } as never),
         ),
@@ -499,7 +499,7 @@ describe("publicOutput: the base URL", () => {
           publicOutput(view, MAPPING, {
             baseUrl,
             published: [view.id],
-            accessions: ACCESSIONS,
+            accessions: accessionsFor(view),
             checkers: CHECKERS,
             identifiers: idsOf(view),
           }),
@@ -573,7 +573,7 @@ describe("publicOutput: the template check", () => {
     const view = viewOf([item], item.id);
     const result = publicOutput(view, MAPPING, {
       baseUrl: BASE,
-      accessions: ACCESSIONS,
+      accessions: accessionsFor(view),
       published: [view.id],
     });
     expect(codes(result)).toContain("unchecked");
@@ -585,7 +585,7 @@ describe("publicOutput: the template check", () => {
     const refuse = () => [{ code: "no_thanks", message: "Refused." }];
     const result = publicOutput(view, MAPPING, {
       baseUrl: BASE,
-      accessions: ACCESSIONS,
+      accessions: accessionsFor(view),
       published: [view.id],
       checkers: { ...CHECKERS, long_text: refuse },
     });
@@ -597,12 +597,12 @@ describe("publicOutput: the template check", () => {
     const view = viewOf([item], item.id);
     const proxy = {
       baseUrl: BASE,
-      accessions: ACCESSIONS,
+      accessions: accessionsFor(view),
       published: [view.id],
       checkers: new Proxy(CHECKERS, {}),
     };
     expect(codes(publicOutput(view, MAPPING, proxy))).toEqual(["invalid_options"]);
-    const getter = { baseUrl: BASE, accessions: ACCESSIONS, published: [view.id] };
+    const getter = { baseUrl: BASE, accessions: accessionsFor(view), published: [view.id] };
     Object.defineProperty(getter, "checkers", { enumerable: true, get: () => CHECKERS });
     expect(codes(publicOutput(view, MAPPING, getter))).toEqual(["invalid_options"]);
   });
@@ -815,7 +815,7 @@ describe("publicOutput: IRIs RFC 3987 allows", () => {
         publicOutput(view, MAPPING, {
           baseUrl: "http://[::1]/items/",
           published: [view.id],
-          accessions: ACCESSIONS,
+          accessions: accessionsFor(view),
         }),
       ).id,
     ).toBe(`http://[::1]/items/${view.id}`);
@@ -841,7 +841,7 @@ describe("publicOutput: currentTemplate", () => {
   const run = (currentTemplate: unknown) =>
     publicOutput(view, MAPPING, {
       baseUrl: BASE,
-      accessions: ACCESSIONS,
+      accessions: accessionsFor(view),
       published: [view.id],
       currentTemplate,
     });
@@ -877,7 +877,7 @@ describe("publicOutput: digital assets and DCMI types", () => {
     const o = ok(
       publicOutput(view, DIGITAL_ASSET_DUBLIN_CORE, {
         baseUrl: BASE,
-        accessions: ACCESSIONS,
+        accessions: accessionsFor(view),
         published: [view.id],
         checkers: CHECKERS,
       }),

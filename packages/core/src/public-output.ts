@@ -54,7 +54,11 @@
  *   unit or digital asset without it (`accessions_unknown`) and one an
  *   accession with a deed `missing` or `sent` produced, or produced an
  *   ancestor or the record a digital asset represents (`deed_not_signed`).
- *   Nothing of an accession or a donor is read here.
+ *   With `records`, what a digital asset represents is found again in them.
+ *   A link to an object, archival unit or digital asset that a deed holds
+ *   back, or that the register doesn't know, goes out as its label only, as
+ *   if unpublished. The check is only as fresh as the register: make it at
+ *   publish time. Nothing of an accession or a donor is read here.
  * - **Publishing is the caller's statement.** Records have no publish state
  *   yet, so the caller passes `published`, the IDs of every record that is
  *   published. The record itself must be in it (`not_published`). Public
@@ -122,6 +126,9 @@ import { publicViewOrigin } from "./effective-brand.js";
 import {
   MAX_RECORD_SET,
   currentAncestry,
+  currentRepresented,
+  deedIssuesNow,
+  deedMayHold,
   effectivePublishIssues,
   isTemplateSource,
   templateFromSource,
@@ -157,6 +164,13 @@ import {
   type FieldTemplate,
   type TemplateCheckOptions,
 } from "./templates.js";
+
+/** Kinds an accession produces: links to them need the deed check too. */
+const ACCESSIONED_LINK_KINDS: ReadonlySet<string> = new Set([
+  "object",
+  "archival_unit",
+  "digital_asset",
+]);
 
 export const DCMITYPE_NAMESPACE = "http://purl.org/dc/dcmitype/";
 export const RDFS_NAMESPACE = "http://www.w3.org/2000/01/rdf-schema#";
@@ -494,6 +508,11 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
   // The deed check fails closed without the register (D-043).
   const blocked = effectivePublishIssues(effective, accessions === undefined ? {} : { accessions });
   if (blocked.length > 0) throw new OutputError(blocked);
+  // With `records`, what a digital asset shows is found again as it is now.
+  if (records !== undefined && effective.record.kind === "digital_asset") {
+    const now = deedIssuesNow(effective, accessions, currentRepresented(effective.record, records));
+    if (now.length > 0) throw new OutputError(now);
+  }
   const template = origin.template;
   // Checked again at the boundary: every template the view was built with is
   // the one its record names (D-029).
@@ -580,7 +599,10 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
     // organization, of a kind the field allows (D-016, D-030, D-039).
     if (id === view.id || !published.has(id)) return false;
     const kind = linkTargetKind(linkCheckers.get(def.kind), organizationId, id);
-    return kind !== undefined && linkKindsOf(def).includes(kind);
+    if (kind === undefined || !linkKindsOf(def).includes(kind)) return false;
+    // A record a deed holds back is treated as unpublished (D-043), and so is
+    // one the register can't vouch for.
+    return !ACCESSIONED_LINK_KINDS.has(kind) || !deedMayHold(accessions, id);
   };
   for (const { field, term } of checked.value.entries) {
     const shownValue = entries.get(field);

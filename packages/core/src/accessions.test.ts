@@ -307,45 +307,51 @@ describe("the deed check (mockup Deeds)", () => {
     expect(effectivePublishIssues(effectiveOf(vase), { accessions })).toEqual([]);
   });
 
-  it("holds back a unit filed below after the register was made, through its ancestry", () => {
-    const accessions = holding("missing");
+  it("refuses a register that doesn't know the record, its ancestry or what it shows", () => {
+    const stale = holding("missing");
     const late = record("archival_unit", "Filed later", {}, { level: "item", parentId: series.id });
-    const records = [...RECORDS, late];
-    expect(codes(effectivePublishIssues(effectiveOf(late, records), { accessions }))).toEqual([
-      "deed_not_signed",
-    ]);
-    // And a scan made later of a record already held back.
     const lateScan = record(
       "digital_asset",
       "Late scan",
       { rights: { uri: CNE } },
-      { represents: item.id },
+      { represents: late.id },
     );
-    expect(
-      codes(effectivePublishIssues(effectiveOf(lateScan, [...RECORDS, lateScan]), { accessions })),
-    ).toEqual(["deed_not_signed"]);
-    // A scan of a unit filed after the register was made: its ancestry isn't
-    // in the scan's chain, so a register that doesn't know the unit refuses.
-    const lateUnit = record(
-      "archival_unit",
-      "Late unit",
-      {},
-      { level: "item", parentId: series.id },
-    );
-    const scanOfLate = record(
-      "digital_asset",
-      "Scan of late unit",
-      { rights: { uri: CNE } },
-      { represents: lateUnit.id },
-    );
-    const now = [...RECORDS, lateUnit, scanOfLate];
-    expect(codes(effectivePublishIssues(effectiveOf(scanOfLate, now), { accessions }))).toEqual([
-      "accessions_out_of_date",
-    ]);
+    const now = [...RECORDS, late, lateScan];
+    for (const r of [late, lateScan]) {
+      expect(
+        codes(effectivePublishIssues(effectiveOf(r, now), { accessions: stale })),
+        r.title,
+      ).toEqual(["accessions_out_of_date"]);
+    }
+    // A register made from the records as they are now decides.
     const fresh = registerOf([accession({ method: "transfer" })], { records: now });
+    for (const r of [late, lateScan]) {
+      expect(
+        codes(effectivePublishIssues(effectiveOf(r, now), { accessions: fresh })),
+        r.title,
+      ).toEqual(["deed_not_signed"]);
+    }
+    // An empty register knows nothing, so it clears nothing.
     expect(
-      codes(effectivePublishIssues(effectiveOf(scanOfLate, now), { accessions: fresh })),
-    ).toEqual(["deed_not_signed"]);
+      codes(
+        effectivePublishIssues(effectiveOf(vase), { accessions: registerOf([], { records: [] }) }),
+      ),
+    ).toEqual(["accessions_out_of_date"]);
+  });
+
+  it("refuses a scan whose represented record isn't in the records given", () => {
+    const orphan = record(
+      "digital_asset",
+      "Orphan scan",
+      { rights: { uri: CNE } },
+      {
+        represents: item.id,
+      },
+    );
+    const accessions = registerOf([], { records: [...RECORDS, orphan] });
+    expect(codes(effectivePublishIssues(effectiveOf(orphan, [orphan]), { accessions }))).toEqual([
+      "represented_record_unknown",
+    ]);
   });
 
   it("needs no register for agents, places and events, which aren't accessioned", () => {

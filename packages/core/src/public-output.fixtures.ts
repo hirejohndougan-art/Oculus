@@ -1,7 +1,9 @@
 // Shared test fixtures for public-output tests (not exported from the package).
+import { publicViewOrigin } from "./effective-brand.js";
 import {
   effectiveRecord,
   indexAccessions,
+  isEffectiveRecord,
   makeIdentifierChecker,
   makeRecordLinkChecker,
   newOrganizationId,
@@ -227,19 +229,29 @@ export function everything(out: {
 export const RIGHTS_ENTRY = Object.freeze({ field: "rights", term: "rights" });
 
 /**
- * The fixtures' organization's accession register, with no accessions, so
- * no deed holds anything back. Publishing an object, archival unit or
- * digital asset needs one (D-043).
+ * An organization's accession register with no accessions, made from
+ * `records` (D-043): it knows those records and holds none back.
  */
-export const ACCESSIONS: AccessionRegister = noAccessions(ORG);
-
-/** An organization's accession register with no accessions (D-043). */
-export function noAccessions(organizationId: OrganizationId): AccessionRegister {
-  const made = indexAccessions(organizationId, {
-    accessions: [],
-    records: [],
-    identifierTypes: [],
-  });
+export function noAccessions(
+  organizationId: OrganizationId,
+  records: readonly CatalogRecord[] = [],
+): AccessionRegister {
+  const made = indexAccessions(organizationId, { accessions: [], records, identifierTypes: [] });
   if (!made.ok) throw new Error(JSON.stringify(made.issues));
   return made.value;
+}
+
+/**
+ * A register with no accessions that knows the records a public view (or
+ * effective record) was made from, so publishing it needs no deed (D-043).
+ * For anything else, an empty register of the fixtures' organization.
+ */
+export function accessionsFor(viewOrEffective: unknown): AccessionRegister {
+  const view = isEffectiveRecord(viewOrEffective)
+    ? publicView(viewOrEffective as EffectiveRecord)
+    : viewOrEffective;
+  const origin = publicViewOrigin(view);
+  if (origin === undefined) return noAccessions(ORG);
+  const records = origin.chain.map((step) => step.record);
+  return noAccessions(records[0]?.organizationId ?? ORG, records);
 }

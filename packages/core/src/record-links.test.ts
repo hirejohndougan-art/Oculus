@@ -20,7 +20,7 @@ import {
   type Validated,
 } from "./index.js";
 import {
-  ACCESSIONS,
+  accessionsFor,
   BASE,
   CHECKERS,
   CNE,
@@ -109,7 +109,7 @@ function output(
   if (view === undefined) throw new Error("no view");
   return publicOutput(view, LINK_MAPPING, {
     baseUrl: BASE,
-    accessions: ACCESSIONS,
+    accessions: accessionsFor(view),
     published,
     checkers: checkers,
   });
