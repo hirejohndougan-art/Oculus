@@ -4,6 +4,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   checkRecordAgainstTemplate,
+  effectivePublishIssues,
   effectiveRecord,
   indexRecords,
   makeRecordLinkChecker,
@@ -421,7 +422,7 @@ describe("hostile values and options", () => {
     const links = linkChecker(all);
     const checkers = { ...CHECKERS, record_link: links };
     const result = output(viewOf(all, item.id, checkers), [item.id, agent.id], checkers);
-    expect(codes(result)).toEqual(["unknown_property"]);
+    expect(codes(result)).toEqual(["does_not_fit_field"]);
   });
 
   it("refuses a checker given behind a getter", () => {
@@ -456,5 +457,84 @@ describe("hostile values and options", () => {
     expect(
       links({ recordId: item.id, label: "x" }, hostile as never, item).map((p) => p.code),
     ).toEqual(["unreadable"]);
+  });
+});
+
+describe("a value kept from before a template change never reaches the public view", () => {
+  // Each field was once another kind; the template now makes it public text
+  // (templateChanges reports only kind_changed). The stored value still has
+  // the old shape, with a linked ID, an identifier type or a rights note.
+  const secretId = newRecordId();
+  const RIGHTS_DEF = field({ key: "rights", label: "Rights", kind: "rights" });
+  const probes: readonly [string, boolean, unknown][] = [
+    ["record link", false, { recordId: secretId, label: "Linked" }],
+    ["list of record links", true, [{ recordId: secretId, label: "Linked" }]],
+    ["place", true, [{ label: "Somewhere", recordId: secretId }]],
+    ["identifier", false, { type: "SECRET_donor_file", value: "SECRET-42" }],
+    ["rights", false, { uri: CNE, note: "SECRET-rights-note" }],
+  ];
+
+  for (const [name, repeatable, stored] of probes) {
+    it(`holds back a ${name} value left in a field now made text`, () => {
+      const rights = RIGHTS_DEF;
+      const now = template([rights, field({ key: "kept", repeatable })], "changed");
+      const item = {
+        ...record("object", "Postcard", { rights: { uri: CNE }, kept: stored as never }),
+        templateKey: "changed",
+      } as CatalogRecord;
+      const effective = ok(effectiveRecord(item.id, [item], () => now, { checkers: CHECKERS }));
+      const view = publicView(effective);
+      if (view === undefined) throw new Error("no view");
+      const text = JSON.stringify(view);
+      expect(view.fields.kept).toBeUndefined();
+      expect(text).not.toContain(secretId);
+      expect(text).not.toContain("SECRET");
+      expect(effective.notes.map((n) => [n.code, n.path])).toEqual([
+        ["does_not_fit_field", ["fields", "kept"]],
+      ]);
+      expect(JSON.stringify(effective.notes)).not.toContain("SECRET");
+      expect(effectivePublishIssues(effective).map((i) => i.code)).toEqual(["does_not_fit_field"]);
+      const mapping = {
+        template: "changed",
+        entries: [
+          { field: "rights", term: "rights" },
+          { field: "kept", term: "description" },
+        ],
+      };
+      const result = publicOutput(view, mapping, {
+        baseUrl: BASE,
+        published: [item.id, secretId],
+        checkers: CHECKERS,
+      });
+      expect(codes(result)).toEqual(["does_not_fit_field"]);
+      expect(JSON.stringify(result)).not.toContain(secretId);
+      expect(JSON.stringify(result)).not.toContain("SECRET");
+    });
+  }
+
+  it("holds back a rights value with a smuggled property, keeping its note out", () => {
+    const item = {
+      ...record("object", "Postcard", {
+        rights: { uri: CNE, note: "SECRET-note", recordId: secretId },
+      }),
+      templateKey: "changed",
+    } as CatalogRecord;
+    const now = template([RIGHTS_DEF], "changed");
+    const effective = ok(effectiveRecord(item.id, [item], () => now, { checkers: CHECKERS }));
+    const text = JSON.stringify(publicView(effective));
+    expect(text).not.toContain("SECRET");
+    expect(text).not.toContain(secretId);
+    expect(effectivePublishIssues(effective).length).toBeGreaterThan(0);
+  });
+
+  it("still publishes a value that fits the field as it is now", () => {
+    const now = template([RIGHTS_DEF, field({ key: "kept" })], "changed");
+    const item = {
+      ...record("object", "Postcard", { rights: { uri: CNE }, kept: "Plain text" }),
+      templateKey: "changed",
+    } as CatalogRecord;
+    const effective = ok(effectiveRecord(item.id, [item], () => now, { checkers: CHECKERS }));
+    expect(publicView(effective)?.fields.kept).toBe("Plain text");
+    expect(effectivePublishIssues(effective)).toEqual([]);
   });
 });

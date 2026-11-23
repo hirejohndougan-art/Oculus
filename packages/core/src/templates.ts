@@ -1341,6 +1341,41 @@ function checkOne(
   }
 }
 
+/**
+ * True when `value` has the structure `field` takes as it is now: a list of
+ * 1 to MAX_REPEATS values for a repeatable field, one value otherwise, each
+ * passing the built-in check for the field's kind. No checkers run. For
+ * `effective.ts` (not exported from the package), so a value stored under
+ * an older version of the field (a record link kept in a field since made
+ * text) never reaches a public view. Never throws.
+ */
+export function valueFitsField(value: JsonValue, field: FieldDefinition): boolean {
+  try {
+    // A null-prototype copy, as checkRecordAgainstTemplate uses: an optional
+    // setting that isn't there reads as undefined, never as something inherited.
+    const def = Object.freeze(
+      Object.assign(Object.create(null) as object, field),
+    ) as FieldDefinition;
+    const issues = new IssueList();
+    const one = (item: JsonValue): void => {
+      if (item === null || Array.isArray(item)) {
+        issues.add([], "invalid_value", "not a single value");
+        return;
+      }
+      checkShape(item, def, [], issues);
+    };
+    if (def.repeatable) {
+      if (!Array.isArray(value) || value.length === 0 || value.length > MAX_REPEATS) return false;
+      for (const item of value as readonly JsonValue[]) one(item);
+    } else {
+      one(value);
+    }
+    return issues.count === 0;
+  } catch {
+    return false;
+  }
+}
+
 /** The built-in structure check for one value of `field`'s kind. */
 function checkShape(
   value: JsonValue,

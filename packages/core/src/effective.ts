@@ -106,6 +106,7 @@ import {
 import {
   checkRecordAgainstTemplate,
   isTemplateRegistry,
+  valueFitsField,
   templateOfRecord,
   type FieldDefinition,
   type FieldTemplate,
@@ -675,7 +676,8 @@ function compose(
   }
 
   const fitting = dropUnfit(target, own.template, candidates, up, notes, checkers);
-  const kept = withholdIdentifiers(fitting, own.byKey, notes, checkers, target.organizationId);
+  const shaped = withholdMisfits(fitting, own.byKey, notes);
+  const kept = withholdIdentifiers(shaped, own.byKey, notes, checkers, target.organizationId);
 
   const chainUp = up.map(step);
   const entries = kept.map((c) => {
@@ -753,12 +755,45 @@ function withoutRightsNote(value: FieldValue): FieldValue {
   return Object.freeze(Object.fromEntries(Object.entries(value).filter(([key]) => key !== "note")));
 }
 
-/** Notes that mean a public identifier value was held back: publishing must wait. */
+/**
+ * Notes that mean a public value was held back (an identifier, or a value
+ * that doesn't fit its field): publishing must wait.
+ */
 const WITHHELD_IDENTIFIER: ReadonlySet<string> = new Set([
   "private_identifier_type",
   "identifier_types_unknown",
   "wrong_organization_checker",
+  "does_not_fit_field",
 ]);
+
+/**
+ * Mark `staff`, with a note that blocks publishing, every public value whose
+ * structure doesn't fit its field as the template has it now: a value kept
+ * from before a template edit (a record link, an identifier with its type,
+ * a rights value with its note, left in a field since made text) must never
+ * be copied into the public view as it is (D-039). Inherited values were
+ * already checked by `dropUnfit`; this catches own values. The note never
+ * quotes the value.
+ */
+function withholdMisfits(
+  candidates: readonly Candidate[],
+  byKey: ReadonlyMap<string, FieldDefinition>,
+  notes: Issue[],
+): readonly Candidate[] {
+  return candidates.map((c) => {
+    if (c.visibility !== "public" || !c.inTemplate) return c;
+    const def = byKey.get(c.key);
+    if (def !== undefined && valueFitsField(c.value, def)) return c;
+    notes.push(
+      issue(
+        ["fields", c.key],
+        "does_not_fit_field",
+        `${shown(c.label)} holds a value that doesn't fit the field as it is now, so it is kept staff only and the record can't be published. Correct the value, or check it with checkRecordAgainstTemplate.`,
+      ),
+    );
+    return { ...c, visibility: "staff" };
+  });
+}
 
 /**
  * Mark `staff`, with a note, every public identifier value the public may not
@@ -832,8 +867,9 @@ function ownChecker(checkers: unknown, kind: string): unknown {
  */
 function publicValue(value: FieldValue, kind: FieldDefinition["kind"] | undefined): FieldValue {
   if (kind === "identifier") return withoutIdentifierType(value);
-  if (kind === "record_link" || kind === "place") return withoutRecordId(value);
-  return value;
+  // Every kind: a public view never holds a linked record ID (D-039), even
+  // if a value of another shape ever got this far.
+  return withoutRecordId(value);
 }
 
 /**

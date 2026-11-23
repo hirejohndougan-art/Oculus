@@ -9,6 +9,7 @@ import {
   effectivePublishIssues,
   newRecordId,
   publicOutput,
+  publicView,
   type PublicOutput,
   type PublicRecord,
   type RecordId,
@@ -441,7 +442,9 @@ describe("publicOutput: refusals", () => {
 
   it("refuses a rights value with extra properties through the publish check", () => {
     const item = record("object", "Bad", { rights: { uri: CNE, extra: 1 } });
-    expect(codes(out(viewOf([item], item.id)))).toEqual(["unknown_property"]);
+    // Held back when the view is made (D-039), so the extra property never reaches it.
+    expect(publicView(effectiveOf([item], item.id))?.fields.rights).toBeUndefined();
+    expect(codes(out(viewOf([item], item.id)))).toEqual(["does_not_fit_field"]);
   });
 
   it("refuses a field over its list and repeat limits", () => {
