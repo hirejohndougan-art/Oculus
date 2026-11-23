@@ -4,6 +4,7 @@
 // two runners at once (the advisory lock, held on its own connection).
 import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { connect, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -91,6 +92,64 @@ async function waitForActivity(url: string, fragment: string): Promise<void> {
     throw new Error(`No session ran ${fragment}`);
   } finally {
     await db.close();
+  }
+}
+
+/**
+ * A proxy in front of the test server that cuts a connection, both ways, when
+ * the client sends a simple-protocol `COMMIT`. It listens on a Unix socket of
+ * its own, which the returned URL names.
+ */
+async function commitDroppingProxy(url: string): Promise<{ url: string; close(): Promise<void> }> {
+  const target = new URL(url);
+  // The gate's server listens on a socket directory (`?host=`), CI's on TCP.
+  const socketDir = target.searchParams.get("host");
+  const port = target.port === "" ? "5432" : target.port;
+  const host = socketDir ?? target.hostname;
+  const upstreamOf = (): Socket =>
+    host.startsWith("/") ? connect(join(host, `.s.PGSQL.${port}`)) : connect(Number(port), host);
+  const dir = mkdtempSync(join(tmpdir(), "oculus-proxy-"));
+  dirs.push(dir);
+  const commit = Buffer.concat([Buffer.from("COMMIT"), Buffer.from([0])]);
+  const sockets = new Set<Socket>();
+  const server = createServer((client) => {
+    const upstream = upstreamOf();
+    sockets.add(client).add(upstream);
+    client.on("data", (chunk: Buffer) => {
+      if (chunk.includes(commit)) {
+        client.destroy();
+        upstream.destroy();
+      } else {
+        upstream.write(chunk);
+      }
+    });
+    upstream.on("data", (chunk: Buffer) => client.write(chunk));
+    client.on("close", () => upstream.destroy());
+    upstream.on("close", () => client.destroy());
+    client.on("error", () => undefined);
+    upstream.on("error", () => undefined);
+  });
+  await new Promise<void>((resolve) => server.listen(join(dir, `.s.PGSQL.${port}`), resolve));
+  target.searchParams.set("host", dir);
+  return {
+    url: target.toString(),
+    close: () =>
+      new Promise<void>((resolve) => {
+        for (const socket of sockets) socket.destroy();
+        server.close(() => {
+          resolve();
+        });
+      }),
+  };
+}
+
+/** Runs `ALTER DATABASE <the test database> <change>`; new connections see it. */
+async function alterDatabase(db: TestDatabase, change: string): Promise<void> {
+  const session = await openSession(db.url);
+  try {
+    await session.runScript(`ALTER DATABASE ${db.name} ${change}`);
+  } finally {
+    await session.close();
   }
 }
 
@@ -433,6 +492,102 @@ describe("refusals", () => {
     },
   );
 
+  it("keeps the lock through a file longer than the database's idle_session_timeout", async () => {
+    const db = await database();
+    await alterDatabase(db, "SET idle_session_timeout = '1s'");
+    try {
+      const dir = migrationsDir({
+        "0002_long.sql": "SELECT pg_sleep(2);\nCREATE TABLE long_one (id int);",
+        "0003_after.sql": "CREATE TABLE after (id int);",
+      });
+      const result = await migrate({ connectionString: db.url, dir });
+      expect(result.applied).toEqual([
+        "0001_migrations_table.sql",
+        "0002_long.sql",
+        "0003_after.sql",
+      ]);
+    } finally {
+      await alterDatabase(db, "RESET idle_session_timeout");
+    }
+    expect((await recorded(db.url)).map((r) => r.name)).toHaveLength(3);
+  });
+
+  it("stops with lock_lost when the last file's deferred trigger ends the lock connection", async () => {
+    // Without running deferred triggers before the last lock check, this
+    // would end the lock at COMMIT and the run would report plain success.
+    const db = await database();
+    const dir = migrationsDir({
+      "0002_late_kill.sql": `CREATE FUNCTION kill_lock() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM pg_terminate_backend(pid, 5000) FROM pg_stat_activity
+    WHERE datname = current_database() AND application_name = 'oculus-migrate-lock';
+  RETURN NULL;
+END $$;
+CREATE TABLE k (id int);
+CREATE CONSTRAINT TRIGGER k_kill AFTER INSERT ON k DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION kill_lock();
+INSERT INTO k VALUES (1);`,
+    });
+    const error = await refusal(migrate({ connectionString: db.url, dir }));
+    expect(error.code).toBe("lock_lost");
+    expect(error.message).toContain("0002_late_kill.sql");
+    expect(await tables(db.url)).toEqual(["oculus_migrations"]);
+    expect((await recorded(db.url)).map((r) => r.name)).toEqual(["0001_migrations_table.sql"]);
+  });
+
+  it("refuses a file whose deferred trigger deletes its own bookkeeping row", async () => {
+    const db = await database();
+    const dir = migrationsDir({
+      "0002_unrecord.sql": `CREATE FUNCTION unrecord() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  DELETE FROM public.oculus_migrations WHERE name = NEW.name;
+  RETURN NULL;
+END $$;
+CREATE TABLE marker (id int);
+CREATE CONSTRAINT TRIGGER unrecord AFTER INSERT ON public.oculus_migrations
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION unrecord();`,
+      "0003_after.sql": "CREATE TABLE after (id int);",
+    });
+    const error = await refusal(migrate({ connectionString: db.url, dir }));
+    expect(error.code).toBe("transaction_ended");
+    expect(error.message).toContain("0002_unrecord.sql");
+    // Rolled back, not applied without its row.
+    expect(await tables(db.url)).toEqual(["oculus_migrations"]);
+    expect((await recorded(db.url)).map((r) => r.name)).toEqual(["0001_migrations_table.sql"]);
+  });
+
+  it("doesn't lose the lock when a file locks pg_database", async () => {
+    const db = await database();
+    const dir = migrationsDir({
+      "0002_catalog.sql":
+        "LOCK TABLE pg_catalog.pg_database IN ACCESS EXCLUSIVE MODE;\nCREATE TABLE c (id int);",
+    });
+    // A short lock timeout, so a check that waited on pg_database would fail fast.
+    const result = await migrate({ connectionString: db.url, dir, lockTimeoutMs: 1000 });
+    expect(result.applied).toEqual(["0001_migrations_table.sql", "0002_catalog.sql"]);
+  });
+
+  it("names the cause when the migrating role can't open its second connection", async () => {
+    const db = await database();
+    const role = `oculus_one_${randomBytes(6).toString("hex")}`;
+    const admin = await openSession(db.url);
+    try {
+      // Superusers ignore connection limits, so an ordinary role.
+      await admin.runScript(`CREATE ROLE ${role} LOGIN CONNECTION LIMIT 1`);
+      const url = new URL(db.url);
+      url.username = role;
+      const error = await refusal(migrate({ connectionString: url.toString() }));
+      expect(error.code).toBe("connection_failed");
+      expect(error.message).toMatch(/second one/);
+      expect(error.message).toMatch(/CONNECTION LIMIT/);
+      expect((error.cause as { code?: string }).code).toBe("53300");
+    } finally {
+      await admin.runScript(`DROP ROLE IF EXISTS ${role}`).catch(() => undefined);
+      await admin.close();
+    }
+    expect(await tables(db.url)).toEqual([]);
+  });
+
   it("records a file normally while another application holds a prepared transaction", async () => {
     const db = await database();
     const other = await openSession(db.url);
@@ -480,7 +635,7 @@ describe("refusals", () => {
     }
   });
 
-  it("reports a deferred constraint that fails at the runner's COMMIT as failed, naming the file", async () => {
+  it("reports a deferred constraint that fails as failed, naming the file, before the runner's COMMIT", async () => {
     const db = await database();
     const dir = migrationsDir({
       "0002_deferred.sql":
@@ -490,15 +645,16 @@ describe("refusals", () => {
     const error = await refusal(migrate({ connectionString: db.url, dir }));
     expect(error.code).toBe("failed");
     expect(error.message).toContain("0002_deferred.sql");
-    expect(error.message).toMatch(/COMMIT/);
+    expect(error.message).toMatch(/deferred constraints and triggers/);
     expect(await tables(db.url)).toEqual(["oculus_migrations"]);
     expect((await recorded(db.url)).map((r) => r.name)).toEqual(["0001_migrations_table.sql"]);
   });
 
-  it("says the outcome is unknown when the connection is lost during the runner's COMMIT", async () => {
+  it("refuses a file whose deferred trigger ends its own connection, recording nothing", async () => {
+    // The trigger runs before the runner's COMMIT (SET CONSTRAINTS ALL
+    // IMMEDIATE), so the connection is gone before anything is committed.
     const db = await database();
     const dir = migrationsDir({
-      // A deferred trigger, run at COMMIT, ends its own connection.
       "0002_die.sql": `CREATE FUNCTION die() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   PERFORM pg_terminate_backend(pg_backend_pid());
@@ -512,11 +668,31 @@ INSERT INTO d VALUES (1);`,
       "0003_after.sql": "CREATE TABLE after (id int);",
     });
     const error = await refusal(migrate({ connectionString: db.url, dir }));
-    expect(error.code).toBe("commit_unknown");
+    expect(error.code).toBe("transaction_ended");
     expect(error.message).toContain("0002_die.sql");
-    expect(error.message).toMatch(/unknown/);
-    expect(error.message).toMatch(/a person must check whether 0002_die.sql is recorded/);
-    expect(await tables(db.url)).not.toContain("after");
+    expect(await tables(db.url)).toEqual(["oculus_migrations"]);
+    expect((await recorded(db.url)).map((r) => r.name)).toEqual(["0001_migrations_table.sql"]);
+  });
+
+  it("says the outcome is unknown when the connection is lost during the runner's COMMIT", async () => {
+    const db = await database();
+    const proxy = await commitDroppingProxy(db.url);
+    try {
+      const dir = migrationsDir({
+        "0002_lost.sql": "CREATE TABLE lost (id int);",
+        "0003_after.sql": "CREATE TABLE after (id int);",
+      });
+      const error = await refusal(migrate({ connectionString: proxy.url, dir }));
+      expect(error.code).toBe("commit_unknown");
+      // The first COMMIT the proxy sees is 0001's.
+      expect(error.message).toContain("0001_migrations_table.sql");
+      expect(error.message).toMatch(
+        /a person must check whether 0001_migrations_table.sql is recorded/,
+      );
+      expect(await tables(db.url)).not.toContain("after");
+    } finally {
+      await proxy.close();
+    }
   });
 
   it("reports a file that releases the runner's savepoint and then fails as transaction_ended, keeping nothing", async () => {
@@ -674,6 +850,21 @@ describe("two runners at once", () => {
     } finally {
       await holder.close();
     }
+  });
+
+  it("reports a statement_timeout that ends the wait for the lock as lock_timeout", async () => {
+    const holder = await openSession(db.url);
+    await alterDatabase(db, "SET statement_timeout = '200ms'");
+    try {
+      await holder.execute(sql`SELECT pg_advisory_lock(${MIGRATION_LOCK_KEY})`);
+      const error = await refusal(migrate({ connectionString: db.url, lockTimeoutMs: 20_000 }));
+      expect(error.code).toBe("lock_timeout");
+      expect(error.message).toMatch(/statement_timeout \(200ms\)/);
+    } finally {
+      await alterDatabase(db, "RESET statement_timeout");
+      await holder.close();
+    }
+    expect(await tables(db.url)).toEqual([]);
   });
 
   it("never runs files of two runners at once, even if a file swaps the lock for its own", async () => {
