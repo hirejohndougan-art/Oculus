@@ -146,7 +146,10 @@ async function loadTypes(
       : sql`SELECT key, definition FROM public.identifier_types
             WHERE organization_id = ${organizationId}::uuid ORDER BY key`,
   );
-  const valid = validateIdentifierTypes(rows.map((row) => row.definition));
+  const valid = validateIdentifierTypes(
+    rows.map((row) => row.definition),
+    organizationId,
+  );
   if (!valid.ok) return valid;
   // The table's checks tie the JSON to its row; this is the second line.
   for (const [index, type] of valid.value.entries()) {
