@@ -260,7 +260,7 @@ describe("a scan can't publish what a deed holds back (T-016 review)", () => {
   });
 });
 
-describe("a link to a held record names only its label (T-016 review)", () => {
+describe("a link to a held record shows nothing, not even its label (T-016 review, D-045)", () => {
   it("even when the held record is in the published list", async () => {
     const { linkChecker, template, field, FIELDS } = await import("./public-output.fixtures.js");
     const tpl = template([
@@ -308,7 +308,8 @@ describe("a link to a held record names only its label (T-016 review)", () => {
     });
     const out = everything(run(held));
     expect(out).not.toContain(BASE + item.id);
-    expect(out).toContain("Held item");
+    expect(out).not.toContain("Held item");
+    expect(out).toContain("Free vase");
     expect(out).toContain(BASE + vase.id);
     // Once the deed is signed, both are links.
     const signed = registerOf(
@@ -389,8 +390,8 @@ describe("a link is deed-checked through its target's parents and what it shows 
       const out = page.publishWith(register, now);
       expect(out).not.toContain(BASE + item.id);
       expect(out).not.toContain(BASE + scan.id);
-      expect(out).toContain("Item label");
-      expect(out).toContain("Scan label");
+      expect(out).not.toContain("Item label");
+      expect(out).not.toContain("Scan label");
       expect(leaks(out)).toEqual([]);
     }
     // A record outside the fonds is a live link, but only with the records.
@@ -400,7 +401,7 @@ describe("a link is deed-checked through its target's parents and what it shows 
 
   it("not when the register was made without the record a digital asset shows", () => {
     const page = pageLinking([{ recordId: scan.id, label: "Scan label" }], RECORDS);
-    // A signed deed, so only the item the register doesn't know keeps the scan a label.
+    // A signed deed, so only the item the register doesn't know keeps the scan out.
     const without = registerOf([fondsDeed("signed")], {
       records: page.records.filter((r) => r.id !== item.id),
     });
@@ -426,7 +427,7 @@ describe("a link is deed-checked through its target's parents and what it shows 
     const now = page.records.map((r) => (r.id === unit.id ? moved : r));
     const out = page.publishWith(register, now);
     expect(out).not.toContain(BASE + unit.id);
-    expect(out).toContain("Unit label");
+    expect(out).not.toContain("Unit label");
     expect(leaks(out)).toEqual([]);
   });
 
@@ -441,7 +442,7 @@ describe("a link is deed-checked through its target's parents and what it shows 
     );
     const out = page.publishWith(undefined, page.records);
     expect(out).not.toContain(BASE + vase.id);
-    expect(out).toContain("Vase label");
+    expect(out).not.toContain("Vase label");
     expect(out).toContain(BASE + donor.id);
     // With a register made now, the vase is a link.
     const now = registerOf([], { records: page.records });

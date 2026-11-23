@@ -1,5 +1,5 @@
 /**
- * Links between records (roadmap T-015, decision D-039).
+ * Links between records (roadmap T-015, decisions D-039 and D-045).
  *
  * A `record_link` field (templates.ts) holds `{ recordId, label }`: a link
  * from one record to another of the same organization, such as an item's
@@ -32,7 +32,16 @@
  * removed or changed kind. `publicOutput` reads the same snapshot (through
  * `linkTargetKind`) to decide whether a link may name the record it points
  * at: only one made by this function, for the record's own organization,
- * can; with any other checker, links go out as their labels alone.
+ * can.
+ *
+ * **Public sites show nothing of a link they can't follow** (D-045). A
+ * `record_link` whose record is unpublished, held back by a deed (D-043),
+ * another organization's, or can't be vouched for (any other checker) puts
+ * nothing in public output: no ID, no label, no placeholder, since a label
+ * copied from the record (a donor's name, a private item's title) would
+ * reveal it. The public view (`publicView`) holds no `record_link` values
+ * at all. Staff views (the effective record) keep every link. A place value
+ * keeps its own name publicly, without the link.
  *
  * Checkers never throw, and return frozen lists of problems whose paths are
  * relative to the value (`["recordId"]`).
