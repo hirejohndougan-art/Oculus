@@ -148,6 +148,38 @@ describe("sql tag", () => {
   });
 });
 
+describe("placeholders can't run into the text around them", () => {
+  it("refuses a digit, letter, _ or $ right after a value", () => {
+    for (const make of [
+      () => sql`SELECT ${"a"}0`,
+      () => sql`SELECT ${"a"}_x`,
+      () => sql`SELECT ${"a"}abc`,
+      () => sql`SELECT ${"a"}$`,
+      () => sql`SELECT ${sql`${"a"}`}1`,
+      () => sql`SELECT ${"a"}${sql`9`}`,
+    ]) {
+      expect(make).toThrow(/touches the text/);
+    }
+  });
+
+  it("refuses an identifier character or $ right before a value", () => {
+    for (const make of [
+      () => sql`SELECT col${"a"}`,
+      () => sql`SELECT $${"a"}`,
+      () => sql`SELECT 1${"a"}`,
+      () => sql`SELECT é${"a"}`,
+      () => sql`SELECT ${sql`x`}${"a"}`,
+    ]) {
+      expect(make).toThrow(/touches the text/);
+    }
+  });
+
+  it("allows spaces, operators, casts and brackets", () => {
+    const q = sql`SELECT (${1})::int, ${2}+${3}, ARRAY[${4}], ${5},${6}`;
+    expect(q.text).toBe("SELECT ($1)::int, $2+$3, ARRAY[$4], $5,$6");
+  });
+});
+
 describe("joinSql", () => {
   it("joins fragments with a separator and renumbers", () => {
     const q = sql`SELECT * FROM t WHERE id IN (${joinSql(

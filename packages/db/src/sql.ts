@@ -23,6 +23,26 @@ export type SqlValue = SqlScalar | readonly SqlValue[];
 
 const brand = Symbol("oculus.sql");
 
+/**
+ * Characters that would join a `$n` placeholder to the text around it: after
+ * it, a digit makes another parameter number (`${a}0` would read `$10`) and a
+ * letter, `_` or `$` is trailing junk; before it, they make it part of an
+ * identifier (`col$1`) or a dollar quote (`$$1`). PostgreSQL identifiers also
+ * take any non-ASCII letter.
+ */
+const JOINS_AFTER = /^[0-9A-Za-z_$\u0080-\uffff]/;
+const JOINS_BEFORE = /[0-9A-Za-z_$\u0080-\uffff]$/;
+
+function checkPlaceholders(parts: readonly string[]): void {
+  for (let i = 1; i < parts.length; i++) {
+    if (JOINS_BEFORE.test(parts[i - 1] ?? "") || JOINS_AFTER.test(parts[i] ?? "")) {
+      throw new TypeError(
+        `sql: parameter ${String(i)} touches the text next to it; put a space or operator between them.`,
+      );
+    }
+  }
+}
+
 /** A query or fragment made by `sql`. Only `sql` and `joinSql` can make one. */
 export class Sql {
   /** The literal SQL parts; always one more than `values`. */
@@ -31,6 +51,7 @@ export class Sql {
 
   constructor(token: symbol, parts: readonly string[], values: readonly SqlValue[]) {
     if (token !== brand) throw new TypeError("Sql values are made only by the sql tag.");
+    checkPlaceholders(parts);
     this.#parts = parts;
     this.#values = values;
     Object.freeze(this);
