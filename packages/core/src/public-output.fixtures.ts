@@ -235,11 +235,19 @@ export const RIGHTS_ENTRY = Object.freeze({ field: "rights", term: "rights" });
  * An organization's accession register with no accessions, made from
  * `records` (D-043): it knows those records and holds none back.
  */
+/** The organization's day the fixtures' registers are made on (invented). */
+export const TODAY = "2026-11-23";
+
 export function noAccessions(
   organizationId: OrganizationId,
   records: readonly CatalogRecord[] = [],
 ): AccessionRegister {
-  const made = indexAccessions(organizationId, { accessions: [], records, identifierTypes: [] });
+  const made = indexAccessions(organizationId, {
+    accessions: [],
+    records,
+    identifierTypes: [],
+    today: TODAY,
+  });
   if (!made.ok) throw new Error(JSON.stringify(made.issues));
   return made.value;
 }

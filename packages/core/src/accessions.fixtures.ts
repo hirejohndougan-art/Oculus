@@ -14,9 +14,9 @@ import {
   type OrganizationId,
   type Validated,
 } from "./index.js";
-import { CHECKERS, ORG, TPL, identifiersFor, record } from "./public-output.fixtures.js";
+import { CHECKERS, ORG, TODAY, TPL, identifiersFor, record } from "./public-output.fixtures.js";
 
-export { ORG };
+export { ORG, TODAY };
 export const OTHER: OrganizationId = newOrganizationId();
 export const CNE = "http://rightsstatements.org/vocab/CNE/1.0/";
 
@@ -100,13 +100,14 @@ export function codes(r: Validated<unknown> | readonly { code: string }[]): stri
 
 export function registerOf(
   accessions: readonly unknown[],
-  extra: { contacts?: readonly unknown[]; records?: unknown } = {},
+  extra: { contacts?: readonly unknown[]; records?: unknown; today?: string } = {},
 ): AccessionRegister {
   return ok(
     indexAccessions(ORG, {
       accessions: accessions as Accession[],
       records: extra.records ?? RECORDS,
       identifierTypes: TYPES,
+      today: extra.today ?? TODAY,
       ...(extra.contacts === undefined ? {} : { contacts: extra.contacts as DonorContact[] }),
     }),
   );

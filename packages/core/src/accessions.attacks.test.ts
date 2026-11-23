@@ -30,6 +30,7 @@ import {
   OTHER,
   RECORDS,
   SECRET,
+  TODAY,
   TYPES,
   ACCESSION_TYPE,
   accession,
@@ -180,7 +181,12 @@ describe("a record whose deed is missing can't be published", () => {
     const list = [a];
     const records = [...RECORDS];
     const register = ok(
-      indexAccessions(ORG, { accessions: list as never, records, identifierTypes: TYPES }),
+      indexAccessions(ORG, {
+        accessions: list as never,
+        records,
+        identifierTypes: TYPES,
+        today: TODAY,
+      }),
     );
     a.deedStatus = "signed";
     list.length = 0;
@@ -198,6 +204,7 @@ describe("a record whose deed is missing can't be published", () => {
           accessions: [accession({ records: [{ recordId: donor.id, label: "Donor" }] })],
           records: RECORDS,
           identifierTypes: TYPES,
+          today: TODAY,
         }),
       ),
     ).toEqual(["wrong_record_kind"]);
@@ -458,6 +465,7 @@ describe("accession numbers are staff-only", () => {
       accessions: [accession()],
       records: RECORDS,
       identifierTypes: [{ ...ACCESSION_TYPE, public: true }],
+      today: TODAY,
     });
     expect(codes(r)).toEqual(["public_type"]);
   });
@@ -493,6 +501,7 @@ describe("another organization's accessions are never used or read", () => {
         accessions: [],
         records: RECORDS,
         identifierTypes: TYPES,
+        today: TODAY,
         ...input,
       });
     const cases = [
@@ -537,6 +546,7 @@ describe("another organization's accessions are never used or read", () => {
       ],
       records: RECORDS,
       identifierTypes: TYPES,
+      today: TODAY,
     });
     expect(codes(r)).toEqual(["unknown_record", "unknown_record"]);
     expect(messages(r)).not.toContain("Their");
@@ -553,6 +563,7 @@ describe("another organization's accessions are never used or read", () => {
         accessions: [],
         records: [theirs, theirDonor],
         identifierTypes: [],
+        today: TODAY,
       }),
     );
     expect(donorContact(register, donor.id)).toBeUndefined();
@@ -599,11 +610,13 @@ describe("donor details never leak", () => {
         accessions: [accession({ number: { type: "accession_number", value: "2026-14" } })],
         records: RECORDS,
         identifierTypes: TYPES,
+        today: TODAY,
       }),
       indexAccessions(ORG, {
         accessions: [accession(), { ...accession(), number: accession().number }],
         records: RECORDS,
         identifierTypes: TYPES,
+        today: TODAY,
       }),
     ];
     for (const r of bad) {
@@ -615,11 +628,21 @@ describe("donor details never leak", () => {
   it("not through what the publish check can see of a register", () => {
     const holds = deedHoldsOf(register);
     // Lookups only: no set to read donor data from, or to change.
-    expect(Object.keys(holds ?? {}).sort()).toEqual(["isHeld", "isKnown", "organizationId"]);
+    expect(Object.keys(holds ?? {}).sort()).toEqual([
+      "holdReasons",
+      "isHeld",
+      "isKnown",
+      "organizationId",
+    ]);
     expect(leaks(JSON.stringify(holds))).toEqual([]);
     expect(Object.isFrozen(holds)).toBe(true);
     expect(holds?.isHeld(item.id)).toBe(true);
     expect(holds?.isHeld(vase.id)).toBe(false);
+    // Why, never which accession or restriction, and the answer can't be changed.
+    const why = holds?.holdReasons(item.id);
+    expect(why).toEqual(["deed"]);
+    expect(Object.isFrozen(why)).toBe(true);
+    expect(holds?.holdReasons(vase.id)).toEqual([]);
   });
 
   it("not by any module but the package index importing accessions", () => {
@@ -636,7 +659,7 @@ describe("donor details never leak", () => {
 });
 
 describe("hostile input to the register", () => {
-  const base = { accessions: [], records: RECORDS, identifierTypes: TYPES };
+  const base = { accessions: [], records: RECORDS, identifierTypes: TYPES, today: TODAY };
 
   it("refuses a Proxy, getters, unknown keys and a bad organization", () => {
     expect(codes(indexAccessions(ORG, new Proxy(base, {}) as never))).toEqual(["invalid_input"]);
