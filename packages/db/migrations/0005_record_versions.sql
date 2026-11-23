@@ -6,11 +6,16 @@
 -- What the database guarantees, for every writer (the data-access layer,
 -- direct SQL, a bug), not only for packages/db:
 -- - records.version counts the record's writes: an INSERT starts at 1 and
---   every UPDATE adds exactly 1 (zzzz_records_version_step).
+--   every UPDATE adds exactly 1 (zzzz_records_version_step). An ID that has
+--   versions (a deleted record's) can never be inserted again, a record's
+--   kind never changes (zzzz_records_keep_identity) and its updated_at never
+--   goes backwards.
 -- - At COMMIT, the version row for each written record's current version
---   exists and holds exactly the record as it now is
---   (zzzz_records_have_version, deferred). A record write without its version
---   can't commit, and a version can't be written without its record write.
+--   exists, was written by this same transaction and holds exactly the
+--   record as it now is (zzzz_records_have_version, deferred). A record
+--   write without its own new version can't commit, even one that winds the
+--   row back to an older stored version, and a version can't be written
+--   without its record write.
 -- - A version row is accepted only as the next number for its record (no
 --   gap, no duplicate), only when the record row already carries that number,
 --   and only if its snapshot is exactly that row (record_snapshot below). Who
@@ -24,7 +29,8 @@
 --   never run as the owner.
 --
 -- Versions have no foreign key to records: the history of a deleted record
--- stays (deleting records is the service layer's, T-032). They are keyed by
+-- stays, and its ID is never used again (deleting records is the service
+-- layer's, T-032, which writes a deletion version first). They are keyed by
 -- (organization_id, record_id, version), so the organization is in every
 -- lookup (D-019), and the snapshot must be the row of that organization's
 -- record, so no version can be filed under another organization's record.
@@ -80,7 +86,9 @@ CREATE TABLE public.record_versions (
   -- `system:` and a lower-case name for imports, migrations and jobs.
   actor text NOT NULL CONSTRAINT record_versions_actor_format
     CHECK (actor ~ '^(user:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|system:[a-z][a-z0-9_-]{0,63})$'),
-  -- When: the database's clock at the write, in whole milliseconds.
+  -- When: the database's clock at the write, in whole milliseconds. History
+  -- is ordered by version number (and by recorded_at across records); the
+  -- record's own updatedAt is the writer's and only never goes backwards.
   recorded_at timestamptz NOT NULL
     CHECK (date_trunc('milliseconds', recorded_at AT TIME ZONE 'UTC') = recorded_at AT TIME ZONE 'UTC'),
   -- Which fields changed since the previous version (every one for version
@@ -90,6 +98,9 @@ CREATE TABLE public.record_versions (
   changed_fields text[] NOT NULL,
   -- Why, if the person said: one trimmed line or paragraph, no control
   -- characters but line breaks.
+  -- The top-level transaction that wrote the row (set by the trigger), so the
+  -- COMMIT check can tell this transaction's version from an older one.
+  written_in xid8 NOT NULL,
   reason text CONSTRAINT record_versions_reason_format
     CHECK (reason <> '' AND length(reason) <= 2000 AND btrim(reason, E' \n') = reason
            AND reason !~ '[\x01-\x09\x0b-\x1f\x7f]'),
@@ -151,6 +162,8 @@ BEGIN
       AND version = NEW.version - 1;
   END IF;
   NEW.recorded_at := date_trunc('milliseconds', now());
+  -- The top-level transaction, also when written inside a savepoint.
+  NEW.written_in := pg_current_xact_id();
   SELECT coalesce(array_agg(name ORDER BY name COLLATE "C"), '{}') INTO NEW.changed_fields
   FROM (
     SELECT k AS name
@@ -201,10 +214,27 @@ BEGIN
         USING ERRCODE = 'integrity_constraint_violation',
               CONSTRAINT = 'records_version_step';
     END IF;
-  ELSIF NEW.version IS DISTINCT FROM OLD.version + 1 THEN
-    RAISE EXCEPTION 'Every write of a record is its next version.'
-      USING ERRCODE = 'integrity_constraint_violation',
-            CONSTRAINT = 'records_version_step';
+    -- A deleted record's ID is never used again: its history stays its own.
+    -- (A record that still exists is refused by the primary key instead.)
+    IF EXISTS (SELECT 1 FROM public.record_versions
+               WHERE organization_id = NEW.organization_id AND record_id = NEW.id)
+       AND NOT EXISTS (SELECT 1 FROM public.records
+                       WHERE organization_id = NEW.organization_id AND id = NEW.id) THEN
+      RAISE EXCEPTION 'This record ID was used before and can''t be used again.'
+        USING ERRCODE = 'integrity_constraint_violation',
+              CONSTRAINT = 'records_id_used_before';
+    END IF;
+  ELSE
+    IF NEW.version IS DISTINCT FROM OLD.version + 1 THEN
+      RAISE EXCEPTION 'Every write of a record is its next version.'
+        USING ERRCODE = 'integrity_constraint_violation',
+              CONSTRAINT = 'records_version_step';
+    END IF;
+    IF NEW.updated_at < OLD.updated_at THEN
+      RAISE EXCEPTION 'A record''s updatedAt never goes backwards.'
+        USING ERRCODE = 'integrity_constraint_violation',
+              CONSTRAINT = 'records_updated_at_backwards';
+    END IF;
   END IF;
   RETURN NEW;
 END
@@ -224,16 +254,20 @@ AS $$
 DECLARE
   current_row public.records;
   stored jsonb;
+  stored_in xid8;
 BEGIN
   SELECT * INTO current_row FROM public.records
   WHERE organization_id = NEW.organization_id AND id = NEW.id;
   IF NOT FOUND OR current_row.version <> NEW.version THEN
     RETURN NULL;
   END IF;
-  SELECT record INTO stored FROM public.record_versions
+  SELECT record, written_in INTO stored, stored_in FROM public.record_versions
   WHERE organization_id = NEW.organization_id AND record_id = NEW.id
     AND version = NEW.version;
-  IF stored IS NULL OR stored IS DISTINCT FROM public.record_snapshot(current_row) THEN
+  -- The version must be this transaction's own: an older stored version
+  -- with the same content (a record wound back) doesn't count.
+  IF stored IS NULL OR stored_in IS DISTINCT FROM pg_current_xact_id()
+     OR stored IS DISTINCT FROM public.record_snapshot(current_row) THEN
     RAISE EXCEPTION 'A record was written without storing its version.'
       USING ERRCODE = 'integrity_constraint_violation',
             CONSTRAINT = 'records_have_version';
@@ -246,11 +280,18 @@ CREATE CONSTRAINT TRIGGER zzzz_records_have_version AFTER INSERT OR UPDATE ON pu
   DEFERRABLE INITIALLY DEFERRED
   FOR EACH ROW EXECUTE FUNCTION public.records_require_version();
 
+-- A record's kind never changes, so a unit with children never becomes an
+-- object and a represented record never changes kind under its scans. Added
+-- to the identity trigger of 0002 (raised as records_kind_fixed).
+DROP TRIGGER zzzz_records_keep_identity ON public.records;
+CREATE TRIGGER zzzz_records_keep_identity BEFORE UPDATE ON public.records
+  FOR EACH ROW EXECUTE FUNCTION public.catalog_keep_identity('organization_id', 'id', 'kind');
+
 -- Records stored before this migration get their first version, written by
 -- the migration (none exist in a deployed database).
 INSERT INTO public.record_versions (organization_id, record_id, version, record, actor,
-                                    recorded_at, changed_fields)
+                                    recorded_at, changed_fields, written_in)
 SELECT r.organization_id, r.id, r.version, public.record_snapshot(r), 'system:migration_0005',
-       now(), '{}'
+       now(), '{}', pg_current_xact_id()
 FROM public.records r
 ORDER BY r.organization_id, r.id;

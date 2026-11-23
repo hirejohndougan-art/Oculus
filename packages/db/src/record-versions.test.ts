@@ -494,10 +494,130 @@ describe("a record and its version are written together", () => {
       sql`DELETE FROM public.records WHERE organization_id = ${org}::uuid AND id = ${record.id}::uuid`,
     );
     expect(await numbers(org, record.id)).toEqual([1]);
-    expect(await refusal(tx((q) => insertRecord(q, record, SYSTEM)))).toEqual({
-      code: IDENTITY,
-      constraint: "record_versions_next_number",
+    expect(codes(await tx((q) => insertRecord(q, record, SYSTEM)))).toEqual(["id_used_before"]);
+    expect(
+      await refusal(
+        db.execute(sql`
+          INSERT INTO public.records (id, organization_id, kind, template_key, title, fields,
+                                      created_at, updated_at)
+          VALUES (${record.id}::uuid, ${org}::uuid, 'object', 'spectrum-object', ${record.title},
+                  ${JSON.stringify(record.fields)}::jsonb, ${T}::timestamptz, ${T}::timestamptz)`),
+      ),
+    ).toEqual({ code: IDENTITY, constraint: "records_id_used_before" });
+    expect(await numbers(org, record.id)).toEqual([1]);
+    // A record that still exists is refused by the primary key, as before.
+    const live = await stored(org);
+    expect(await refusal(tx((q) => insertRecord(q, live, SYSTEM)))).toMatchObject({
+      code: "23505",
     });
+  });
+
+  it("a record wound back to an older stored version can't commit without its own new version", async () => {
+    await ready();
+    const org = await organization();
+    const record = await stored(org);
+    const next = edited(record, "Second title");
+    ok(await tx((q) => updateRecord(q, next, { expectedVersion: 1, ...SYSTEM })));
+    const where = sql`organization_id = ${org}::uuid AND id = ${record.id}::uuid`;
+    // Even with the step trigger off (only the owner can), version 1's content
+    // under number 1, or version 2's again under number 2, is not this
+    // transaction's version.
+    for (const statement of [
+      sql`UPDATE public.records SET title = ${record.title}, updated_at = ${T}::timestamptz,
+                                    version = 1 WHERE ${where}`,
+      sql`UPDATE public.records SET title = ${next.title} WHERE ${where}`,
+    ]) {
+      expect(
+        await refusal(
+          tx(async (q) => {
+            await q.execute(
+              sql`ALTER TABLE public.records DISABLE TRIGGER zzzz_records_version_step`,
+            );
+            await q.execute(statement);
+            // Run the COMMIT check now (a trigger can't be re-enabled while
+            // its events are pending); the transaction rolls back either way.
+            await q.execute(sql`SET CONSTRAINTS ALL IMMEDIATE`);
+            await q.execute(
+              sql`ALTER TABLE public.records ENABLE TRIGGER zzzz_records_version_step`,
+            );
+          }),
+        ),
+      ).toEqual({ code: IDENTITY, constraint: "records_have_version" });
+    }
+    expect(ok(await readStoredRecord(db, org, record.id))).toEqual({ version: 2, record: next });
+  });
+
+  it("an update meeting history out of step with the record is a clean version_conflict", async () => {
+    await ready();
+    const org = await organization();
+    const record = await stored(org);
+    ok(await tx((q) => updateRecord(q, edited(record, "Two"), { expectedVersion: 1, ...SYSTEM })));
+    // The owner winds the row back to version 1 with every check off.
+    await tx(async (q) => {
+      await q.execute(sql`ALTER TABLE public.records DISABLE TRIGGER zzzz_records_version_step`);
+      await q.execute(sql`ALTER TABLE public.records DISABLE TRIGGER zzzz_records_have_version`);
+      await q.execute(sql`
+        UPDATE public.records SET title = ${record.title}, updated_at = ${T}::timestamptz,
+                                  version = 1
+        WHERE organization_id = ${org}::uuid AND id = ${record.id}::uuid`);
+      await q.execute(sql`ALTER TABLE public.records ENABLE TRIGGER zzzz_records_version_step`);
+      await q.execute(sql`ALTER TABLE public.records ENABLE TRIGGER zzzz_records_have_version`);
+    });
+    expect(
+      codes(
+        await tx((q) =>
+          updateRecord(q, edited(record, "Three"), { expectedVersion: 1, ...SYSTEM }),
+        ),
+      ),
+    ).toEqual(["version_conflict"]);
+    expect(await numbers(org, record.id)).toEqual([1, 2]);
+  });
+
+  it("a record's kind never changes; its template may, through updateRecord", async () => {
+    await ready();
+    const org = await organization();
+    const record = await stored(org);
+    const asEvent = { ...edited(record, "Now an event"), kind: "event" };
+    expect(
+      codes(await tx((q) => updateRecord(q, asEvent, { expectedVersion: 1, ...SYSTEM }))),
+    ).toEqual(["kind_changed"]);
+    expect(
+      await refusal(
+        db.execute(sql`UPDATE public.records SET kind = 'event', version = version + 1
+                       WHERE organization_id = ${org}::uuid AND id = ${record.id}::uuid`),
+      ),
+    ).toEqual({ code: IDENTITY, constraint: "records_kind_fixed" });
+    const retemplated = { ...edited(record, "Filed as a place note"), templateKey: "places" };
+    const v2 = ok(await tx((q) => updateRecord(q, retemplated, { expectedVersion: 1, ...SYSTEM })));
+    expect(v2.changedFields).toEqual(["templateKey", "title"]);
+    expect(await numbers(org, record.id)).toEqual([1, 2]);
+  });
+
+  it("updatedAt never goes backwards", async () => {
+    await ready();
+    const org = await organization();
+    const record = await stored(org);
+    ok(
+      await tx((q) => updateRecord(q, edited(record, "Later"), { expectedVersion: 1, ...SYSTEM })),
+    );
+    const earlier = { ...record, title: "Earlier", updatedAt: T };
+    expect(
+      codes(await tx((q) => updateRecord(q, earlier, { expectedVersion: 2, ...SYSTEM }))),
+    ).toEqual(["updated_before"]);
+    expect(
+      await refusal(
+        db.execute(sql`UPDATE public.records SET updated_at = ${T}::timestamptz,
+                                                 version = version + 1
+                       WHERE organization_id = ${org}::uuid AND id = ${record.id}::uuid`),
+      ),
+    ).toEqual({ code: IDENTITY, constraint: "records_updated_at_backwards" });
+    // The same instant is allowed (a second save within the millisecond).
+    ok(
+      await tx((q) =>
+        updateRecord(q, edited(record, "Same instant"), { expectedVersion: 2, ...SYSTEM }),
+      ),
+    );
+    expect(await numbers(org, record.id)).toEqual([1, 2, 3]);
   });
 });
 
@@ -620,6 +740,30 @@ describe("versions are append-only", () => {
       ]) {
         expect((await refusal(app.execute(statement))).code).toBe(DENIED);
       }
+      // The reviewer's sequence: delete the record (now at version 2) and
+      // insert it again with exactly version 1's content, in one transaction.
+      expect(
+        await refusal(
+          app.transaction(async (q) => {
+            await q.execute(sql`DELETE FROM public.records
+                                WHERE organization_id = ${org}::uuid AND id = ${record.id}::uuid`);
+            await q.execute(sql`
+              INSERT INTO public.records (id, organization_id, kind, template_key, title, fields,
+                                          created_at, updated_at)
+              VALUES (${record.id}::uuid, ${org}::uuid, 'object', 'spectrum-object',
+                      ${record.title}, ${JSON.stringify(record.fields)}::jsonb,
+                      ${T}::timestamptz, ${T}::timestamptz)`);
+          }),
+        ),
+      ).toEqual({ code: IDENTITY, constraint: "records_id_used_before" });
+      // The follow-on: an update reproducing stored version 2's content.
+      expect(
+        await refusal(
+          app.execute(sql`UPDATE public.records SET version = version + 1
+                          WHERE organization_id = ${org}::uuid AND id = ${record.id}::uuid`),
+        ),
+      ).toEqual({ code: IDENTITY, constraint: "records_have_version" });
+      expect(ok(await readStoredRecord(app, org, record.id)).version).toBe(2);
       // And it can't write a record without its version either.
       expect(
         await refusal(

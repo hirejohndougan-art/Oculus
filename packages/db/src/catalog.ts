@@ -399,6 +399,46 @@ function sqlState(error: unknown): string | undefined {
   return typeof code === "string" ? code : undefined;
 }
 
+/** The constraint a database error names, if any. */
+function constraintOf(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const { constraint } = error as { constraint?: unknown };
+  return typeof constraint === "string" ? constraint : undefined;
+}
+
+const ID_USED_BEFORE =
+  "This record ID was used before (by a record since deleted) and can't be used again.";
+
+/**
+ * The version triggers' refusals (D-063) that a racing or out-of-step write
+ * can meet, as clean issues; anything else is thrown.
+ */
+function versionRefusal<T>(error: unknown): Validated<T> | undefined {
+  if (sqlState(error) !== INTEGRITY) return undefined;
+  switch (constraintOf(error)) {
+    case "records_id_used_before":
+      return refused(["id"], "id_used_before", ID_USED_BEFORE);
+    case "records_version_step":
+    case "record_versions_next_number":
+    case "record_versions_with_record_write":
+      return refused(
+        ["expectedVersion"],
+        "version_conflict",
+        "The record's stored versions are not where this write expected them. Read it again.",
+      );
+    case "records_kind_fixed":
+      return refused(["kind"], "kind_changed", KIND_FIXED);
+    case "records_updated_at_backwards":
+      return refused(["updatedAt"], "updated_before", UPDATED_BEFORE);
+    default:
+      return undefined;
+  }
+}
+
+const INTEGRITY = "23000";
+const KIND_FIXED = "A record's kind never changes; make a new record instead.";
+const UPDATED_BEFORE = "updatedAt can't be earlier than the stored record's.";
+
 /**
  * Runs `work` inside a savepoint of the caller's transaction, as
  * `identifiers.ts` and `vocabularies.ts` do: if it throws, everything it did
@@ -444,6 +484,8 @@ async function inSavepoint<T>(
         "Another change to this record ran at the same time. Roll back the transaction and try it again.",
       );
     }
+    const clean = versionRefusal<T>(error);
+    if (clean) return clean;
     throw error;
   }
 }
@@ -481,7 +523,8 @@ const NO_TEMPLATE_KEY = "Every stored record names its template (templateKey).";
  *
  * The ID is unique within the organization only (the table's key is
  * `(organization_id, id)`); one the organization already has is refused by
- * the primary key. Runs in a savepoint of the caller's transaction (outside
+ * the primary key; a deleted record's ID (one with history) is refused as
+ * `id_used_before`, since it is never used again. Runs in a savepoint of the caller's transaction (outside
  * one it throws); a database error is thrown after the savepoint is rolled
  * back, so no row and no version stays.
  */
@@ -499,7 +542,16 @@ export async function insertRecord(
     return refused(["templateKey"], "no_template_key", NO_TEMPLATE_KEY);
   }
   const c = columnsOf(r);
-  return inSavepoint(db, async () => {
+  return inSavepoint(db, async (): Promise<Validated<CatalogRecord>> => {
+    // A deleted record's ID has history and is never used again (the
+    // trigger refuses it too, records_id_used_before).
+    const [used] = await db.rows(sql`
+      SELECT 1 FROM public.record_versions
+      WHERE organization_id = ${r.organizationId}::uuid AND record_id = ${r.id}::uuid
+        AND NOT EXISTS (SELECT 1 FROM public.records
+                        WHERE organization_id = ${r.organizationId}::uuid AND id = ${r.id}::uuid)
+      LIMIT 1`);
+    if (used !== undefined) return refused(["id"], "id_used_before", ID_USED_BEFORE);
     await db.execute(sql`
       INSERT INTO public.records (
         id, organization_id, kind, template_key, record_type_key, title,
@@ -522,7 +574,12 @@ export async function insertRecord(
  * Replaces a stored record with `input` and stores it as the record's next
  * version, together: both or neither (T-029, D-063). The record is found by
  * its organization and ID, which never change; its `createdAt` must be the
- * stored one (`created_at_changed`). Refused, storing nothing:
+ * stored one (`created_at_changed`), its kind never changes (`kind_changed`,
+ * also refused by the database) and its `updatedAt` can't be earlier than
+ * the stored one (`updated_before`; history is ordered by version number and
+ * the database's `recordedAt`, never by `updatedAt`). Its template may change
+ * here, and only here: callers check the record against the new template
+ * first, as for any save. Refused, storing nothing:
  * `unknown_record`; `version_conflict` when the record is no longer at
  * `expectedVersion` (someone saved since: read it again); `retry` on a
  * deadlock or serialization failure. Of two updates from the same version at
@@ -581,10 +638,17 @@ export async function updateRecord(
         updated_at = ${r.updatedAt}::timestamptz, version = version + 1
       WHERE organization_id = ${r.organizationId}::uuid AND id = ${r.id}::uuid
         AND version = ${expected}::integer AND created_at = ${r.createdAt}::timestamptz
+        AND kind = ${r.kind} AND updated_at <= ${r.updatedAt}::timestamptz
       RETURNING version`);
     if (row === undefined) {
-      const [current] = await db.rows<{ version: number; created: boolean }>(sql`
-        SELECT version, created_at = ${r.createdAt}::timestamptz AS created
+      const [current] = await db.rows<{
+        version: number;
+        created: boolean;
+        kind: string;
+        forward: boolean;
+      }>(sql`
+        SELECT version, created_at = ${r.createdAt}::timestamptz AS created, kind,
+               updated_at <= ${r.updatedAt}::timestamptz AS forward
         FROM public.records
         WHERE organization_id = ${r.organizationId}::uuid AND id = ${r.id}::uuid`);
       if (current === undefined) {
@@ -597,7 +661,11 @@ export async function updateRecord(
           `The record was saved by someone else since version ${String(expected)}; it is now at version ${String(current.version)}. Read it again.`,
         );
       }
-      return refused(["createdAt"], "created_at_changed", "A record's createdAt never changes.");
+      if (!current.created) {
+        return refused(["createdAt"], "created_at_changed", "A record's createdAt never changes.");
+      }
+      if (current.kind !== r.kind) return refused(["kind"], "kind_changed", KIND_FIXED);
+      return refused(["updatedAt"], "updated_before", UPDATED_BEFORE);
     }
     return { ok: true, value: await writeVersion(db, r, row.version, who.value) };
   });
