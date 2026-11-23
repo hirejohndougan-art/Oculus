@@ -932,6 +932,12 @@ function ownData<T extends object, K extends keyof T & string>(value: T, key: K)
   return slot !== undefined && "value" in slot ? (slot.value as T[K]) : undefined;
 }
 
+/** `key` of a plain JSON object as an own data property, or undefined. */
+function ownJson(value: object, key: string): JsonValue | undefined {
+  const slot = Object.getOwnPropertyDescriptor(value, key);
+  return slot !== undefined && "value" in slot ? (slot.value as JsonValue) : undefined;
+}
+
 function holdsIn(
   register: AccessionRegister,
   recordId: unknown,
@@ -1021,8 +1027,7 @@ function checkNumber(value: JsonValue | undefined, issues: IssueList): void {
     issues.add(["number"], "required", "Every accession needs a number: { type, value }.");
     return;
   }
-  const v = value as Readonly<Record<string, JsonValue>>;
-  for (const key of Object.keys(v)) {
+  for (const key of Object.keys(value)) {
     if (key !== "type" && key !== "value") {
       issues.add(
         ["number", key],
@@ -1031,10 +1036,20 @@ function checkNumber(value: JsonValue | undefined, issues: IssueList): void {
       );
     }
   }
-  if (typeof v.type !== "string" || !/^[a-z][a-z0-9_]{0,63}$/.test(v.type)) {
+  // Own data properties only: a `type` or `value` on Object.prototype must
+  // never complete a number left without one (T-018a review follow-up).
+  const type = ownJson(value, "type");
+  if (typeof type !== "string" || !/^[a-z][a-z0-9_]{0,63}$/.test(type)) {
     issues.add(["number", "type"], "invalid_type", "The type must be an identifier type key.");
   }
-  checkLine(v.value, ["number", "value"], "number", MAX_IDENTIFIER_LENGTH, issues, true);
+  checkLine(
+    ownJson(value, "value"),
+    ["number", "value"],
+    "number",
+    MAX_IDENTIFIER_LENGTH,
+    issues,
+    true,
+  );
 }
 
 /** True when `value` is a usable link `{ recordId, label }`; otherwise adds the issues. */
@@ -1049,16 +1064,22 @@ function checkLink(
     return false;
   }
   const before = issues.count;
-  const v = value as Readonly<Record<string, JsonValue>>;
-  for (const key of Object.keys(v)) {
+  for (const key of Object.keys(value)) {
     if (key !== "recordId" && key !== "label") {
       issues.add([...path, key], "unknown_property", "A link has only recordId and label.");
     }
   }
-  if (!isRecordId(v.recordId)) {
+  if (!isRecordId(ownJson(value, "recordId"))) {
     issues.add([...path, "recordId"], "invalid_id", "recordId must be a record ID.");
   }
-  checkLine(v.label, [...path, "label"], "label", MAX_LINK_LABEL_LENGTH, issues, true);
+  checkLine(
+    ownJson(value, "label"),
+    [...path, "label"],
+    "label",
+    MAX_LINK_LABEL_LENGTH,
+    issues,
+    true,
+  );
   return issues.count === before;
 }
 

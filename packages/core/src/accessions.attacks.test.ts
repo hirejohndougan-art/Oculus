@@ -155,6 +155,46 @@ describe("a record whose deed is missing can't be published", () => {
     afterEach(() => {
       delete (Object.prototype as Record<string, unknown>).accessions;
       delete (Object.prototype as Record<string, unknown>).deedStatus;
+      delete (Object.prototype as Record<string, unknown>).type;
+      delete (Object.prototype as Record<string, unknown>).value;
+    });
+
+    it("a number's type or value on Object.prototype doesn't complete a number left without one", () => {
+      (Object.prototype as Record<string, unknown>).type = "accession_number";
+      (Object.prototype as Record<string, unknown>).value = "2026.099";
+      expect(codes(validateAccession(accession({ number: { value: "2026.001" } })))).toEqual([
+        "invalid_type",
+      ]);
+      expect(codes(validateAccession(accession({ number: { type: "accession_number" } })))).toEqual(
+        ["required"],
+      );
+      expect(codes(validateAccession(accession({ number: {} })))).toEqual([
+        "invalid_type",
+        "required",
+      ]);
+      const r = indexAccessions(ORG, {
+        accessions: [accession({ number: { value: "2026.001" } })],
+        records: RECORDS,
+        identifierTypes: TYPES,
+        today: TODAY,
+      });
+      expect(codes(r)).toEqual(["invalid_type"]);
+    });
+
+    it("a link's record ID or label on Object.prototype doesn't complete a link", () => {
+      (Object.prototype as Record<string, unknown>).recordId = donor.id;
+      (Object.prototype as Record<string, unknown>).label = "Inherited";
+      try {
+        expect(codes(validateAccession(accession({ sourceAgent: { label: "Donor" } })))).toEqual([
+          "invalid_id",
+        ]);
+        expect(codes(validateAccession(accession({ records: [{ recordId: fonds.id }] })))).toEqual([
+          "required",
+        ]);
+      } finally {
+        delete (Object.prototype as Record<string, unknown>).recordId;
+        delete (Object.prototype as Record<string, unknown>).label;
+      }
     });
 
     it("a register on Object.prototype isn't taken as the option", () => {
