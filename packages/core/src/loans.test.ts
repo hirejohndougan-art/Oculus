@@ -3,6 +3,7 @@ import {
   MAX_LOAN_ITEMS,
   createStorageMove,
   unexplainedDepartures,
+  unexplainedLoanMoves,
   indexLocations,
   indexLoans,
   indexMoves,
@@ -747,5 +748,135 @@ describe("review fixes", () => {
     );
     expect(ok(unexplainedDepartures(named))).toEqual([]);
     expect(codes(unexplainedDepartures({ ...named }))).toEqual(["not_a_loan_book"]);
+  });
+});
+
+describe("an overdue loan can't be hidden by editing it (review fixes)", () => {
+  const closing = { status: "closed" as const, statusOn: "2026-11-23" };
+
+  it("a loan out can't drop an item's link, or the item, while it is out", () => {
+    const out = loanOut();
+    const b = book([out]);
+    const mapItem = { recordId: map, loanOutMoveId: mapOut.id, returnMoveId: mapBack.id };
+    const unlinked = { ...out, ...closing, items: [{ recordId: print }, mapItem] };
+    expect(codes(withLoan(b, unlinked))).toEqual(["link_removed"]);
+    expect(codes(withLoan(b, { ...out, ...closing, items: [mapItem] }))).toEqual(["link_removed"]);
+    // Not closed, the same: the link stays until the return is recorded.
+    expect(codes(withLoan(b, { ...out, items: [{ recordId: print }, mapItem] }))).toEqual([
+      "link_removed",
+    ]);
+    // A recorded return link can't be dropped either.
+    const reopened = {
+      ...out,
+      items: [
+        { recordId: print, loanOutMoveId: printOut.id },
+        { recordId: map, loanOutMoveId: mapOut.id },
+      ],
+    };
+    expect(codes(withLoan(b, reopened))).toEqual(["link_removed"]);
+    // An item that is back may be taken off the loan.
+    const fewer = ok(
+      withLoan(b, { ...out, items: [{ recordId: print, loanOutMoveId: printOut.id }] }),
+    );
+    expect(ok(overdueLoans(fewer, "2026-11-23")).map((s) => s.loan.id)).toEqual([out.id]);
+    expect(ok(overdueLoans(b, "2026-11-23")).map((s) => s.loan.id)).toEqual([out.id]);
+  });
+
+  it("a closed loan out with a record's loan_out left unlinked stays overdue", () => {
+    // Saved past withLoan (an import, two saves racing).
+    const mapItem = { recordId: map, loanOutMoveId: mapOut.id, returnMoveId: mapBack.id };
+    const closed = loanOut({ ...closing, items: [{ recordId: print }, mapItem] });
+    const b = book([closed]);
+    const state = ok(loanState(b, closed.id));
+    expect(state.phase).toBe("unknown");
+    expect(state.problems.map((p) => [p.code, p.path])).toEqual([
+      ["closed_with_unlinked_move", ["items", 0]],
+    ]);
+    expect(ok(overdueLoans(b, "2026-11-23")).map((s) => s.loan.id)).toEqual([closed.id]);
+    expect(ok(unexplainedLoanMoves(b)).map((m) => m.id)).toEqual([printOut.id]);
+    // With the item gone from the loan altogether, the move is still listed.
+    const gone = book([loanOut({ ...closing, items: [mapItem] })]);
+    expect(ok(loanProblems(gone))).toEqual([]);
+    expect(ok(unexplainedLoanMoves(gone)).map((m) => m.id)).toEqual([printOut.id]);
+    // A loan_out to another borrower, or outside the period, isn't this loan's.
+    const elsewhere = ok(
+      indexMoves(INDEX, [
+        placePrint,
+        move(print, conservator.id, "2026-09-01", "loan_out", { expectedReturnOn: "2026-10-01" }),
+        move(print, shelf.id, "2026-09-20", "return"),
+        placeMap,
+        mapOut,
+        mapBack,
+      ]),
+    );
+    expect(problemCodes(indexLoans(elsewhere, [closed]))).toEqual([]);
+  });
+
+  it("lists loan_out moves no loan out names or extends", () => {
+    expect(ok(unexplainedLoanMoves(book([loanOut()])))).toEqual([]);
+    expect(ok(unexplainedLoanMoves(book([]))).map((m) => m.id)).toEqual([printOut.id, mapOut.id]);
+    // An extension (another loan_out to the same place before the return) is explained.
+    const extension = move(print, borrowerPlace.id, "2026-11-10", "loan_out", {
+      expectedReturnOn: "2027-01-31",
+    });
+    const extended = ok(withMove(LOG, extension, NOW));
+    expect(ok(unexplainedLoanMoves(book([loanOut()], extended)))).toEqual([]);
+    // After the return, a new loan_out is not.
+    const again = move(map, borrowerPlace.id, "2026-11-20", "loan_out", {
+      expectedReturnOn: "2026-12-20",
+    });
+    const later = ok(withMove(LOG, again, NOW));
+    expect(ok(unexplainedLoanMoves(book([loanOut()], later))).map((m) => m.id)).toEqual([again.id]);
+    expect(codes(unexplainedLoanMoves({ ...book([]) }))).toEqual(["not_a_loan_book"]);
+  });
+
+  it("a loan in can't drop its arrival link, and closes only once every item has departed", () => {
+    const lin = loanIn();
+    const b = book([lin]);
+    const unlinked = { ...lin, ...closing, items: [{ recordId: lantern }] };
+    expect(codes(withLoan(b, unlinked))).toEqual(["link_removed"]);
+    // Saved past withLoan: the borrowed lantern is still here, so the closed
+    // loan has a problem and is listed overdue after its end date.
+    const raced = book([unlinked]);
+    const state = ok(loanState(raced, lin.id));
+    expect(state.phase).toBe("unknown");
+    expect(state.problems.map((p) => p.code)).toEqual(["closed_without_departure"]);
+    expect(ok(overdueLoans(raced, "2027-04-01")).map((s) => s.loan.id)).toEqual([lin.id]);
+    // An item that never arrived (no move since the loan began) needs no departure.
+    const neverCame = loanIn({ ...closing, items: [{ recordId: newRecordId() }] });
+    expect(ok(loanState(book([neverCame]), neverCame.id)).phase).toBe("closed");
+    // The ordinary way: it departs to the lender, the loan names it, then closes.
+    const departure = move(lantern, lenderPlace.id, "2026-11-20", "departure");
+    const log = ok(withMove(LOG, departure, NOW));
+    const linked = {
+      ...lin,
+      items: [{ recordId: lantern, arrivalMoveId: lanternIn.id, departureMoveId: departure.id }],
+    };
+    let after = ok(withLoan(ok(reindexLoans(b, log)), linked));
+    after = ok(withLoan(after, { ...linked, ...closing }));
+    expect(ok(loanState(after, lin.id)).phase).toBe("closed");
+    expect(ok(overdueLoans(after, "2027-06-01"))).toEqual([]);
+    // Once it has departed, the item may come off the loan.
+    expect(ok(withLoan(after, { ...linked, items: [{ recordId: newRecordId() }] })).size).toBe(1);
+  });
+
+  it("a link may be changed to another move that fits", () => {
+    const record = newRecordId();
+    const home = move(record, shelf.id, "2026-01-10", "placement");
+    const first = move(record, borrowerPlace.id, "2026-09-01", "loan_out", {
+      expectedReturnOn: "2026-11-15",
+    });
+    const second = move(record, borrowerPlace.id, "2026-09-02", "loan_out", {
+      expectedReturnOn: "2026-11-15",
+    });
+    const log = ok(indexMoves(INDEX, [home, first, second]));
+    const out = loanOut({ items: [{ recordId: record, loanOutMoveId: second.id }] });
+    const b = book([out], log);
+    expect(ok(unexplainedLoanMoves(b)).map((m) => m.id)).toEqual([first.id]);
+    const relinked = ok(
+      withLoan(b, { ...out, items: [{ recordId: record, loanOutMoveId: first.id }] }),
+    );
+    expect(ok(unexplainedLoanMoves(relinked))).toEqual([]);
+    expect(ok(loanState(relinked, out.id)).phase).toBe("on_loan");
   });
 });

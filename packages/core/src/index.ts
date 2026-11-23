@@ -401,6 +401,7 @@ export {
   loanOutMove,
   loanProblems,
   unexplainedDepartures,
+  unexplainedLoanMoves,
 } from "./loans.js";
 export type {
   LoanId,

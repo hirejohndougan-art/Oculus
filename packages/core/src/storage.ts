@@ -1081,11 +1081,22 @@ export function logLocation(log: MoveLog, id: unknown): StorageLocation | undefi
  * report any that no loan in explains (D-044).
  */
 export function departures(log: MoveLog): Validated<readonly StorageMove[]> {
+  return movesWithReason(log, "departure");
+}
+
+/**
+ * Every move with one reason in a log, oldest first: for the loans module,
+ * which reports `loan_out` moves no loan out explains (D-044).
+ */
+export function movesWithReason(
+  log: MoveLog,
+  reason: MoveReason,
+): Validated<readonly StorageMove[]> {
   const data = logData(log);
   if (data === undefined) return notALog();
   const found: StorageMove[] = [];
   for (const history of data.byRecord.values()) {
-    for (const move of history) if (move.reason === "departure") found.push(move);
+    for (const move of history) if (move.reason === reason) found.push(move);
   }
   return { ok: true, value: Object.freeze(found.sort(byWhen)) };
 }

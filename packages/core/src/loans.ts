@@ -29,8 +29,14 @@
  * making the whole book unreadable; its phase is `unknown` and it stays on
  * the overdue list, so a missing or stale link never hides an item still
  * out. `withLoan` never saves a loan with problems, nor an edit that gives
- * another loan one (claiming its move, overlapping it). Departures
- * no loan in names are listed by `unexplainedDepartures`.
+ * another loan one (claiming its move, overlapping it), nor an edit that
+ * drops a recorded move link (`link_removed`): a link is changed to the
+ * right move, never to nothing, and an item that went out comes off the loan
+ * only once it is back. A closed loan out can't leave a record's `loan_out`
+ * to its borrower in the loan period unlinked, and a closed loan in needs
+ * every item's departure (unless the item never arrived). Departures no loan
+ * in names are listed by `unexplainedDepartures`, and `loan_out` moves no
+ * loan out names or extends by `unexplainedLoanMoves`.
  *
  * **Everything here is staff-only**, like storage: loans name lenders,
  * borrowers, values and dates. Nothing in `effective.ts` or
@@ -63,6 +69,7 @@ import {
   isMoveLog,
   logLocation,
   moveHistory,
+  movesWithReason,
   readList,
   readTop,
   refused,
@@ -355,6 +362,8 @@ interface BookData {
   readonly byRecord: ReadonlyMap<RecordId, readonly LoanId[]>;
   /** Departure moves in the log that no loan in names. */
   readonly unexplained: readonly StorageMove[];
+  /** `loan_out` moves in the log that no loan out names or extends. */
+  readonly unexplainedOut: readonly StorageMove[];
 }
 
 interface Entry {
@@ -390,6 +399,11 @@ const LOAN_BOOKS = new WeakMap<object, BookData>();
  * - overlaps another loan of the same record the same way
  *   (`overlapping_loans`, on every loan involved): a record is lent to one
  *   borrower at a time.
+ * And a `closed` loan out whose record has a `loan_out` move to the borrower,
+ * in the loan period, that no loan explains (`closed_with_unlinked_move`),
+ * or a `closed` loan in with an item that has no departure linked although
+ * its record has a move dated on or after `beginOn`
+ * (`closed_without_departure`).
  * A loan with any of these is in phase `unknown` and listed by
  * `overdueLoans` once past its end date. `now` is for tests. Never throws.
  */
@@ -433,7 +447,9 @@ export function isLoanBook(value: unknown): value is LoanBook {
  * and is refused with any problem `indexLoans` would report for it, or if it
  * would give any other loan in the book a problem that loan didn't have
  * (reported under `["otherLoans", <loan id>, ...]`). Problems other loans
- * already had don't block it. The given book is not changed. `now` is for
+ * already had don't block it. An edit may not drop a move link the saved
+ * loan records, nor an item whose start move is recorded, unless the saved
+ * end link names a move in the log (`link_removed`). The given book is not changed. `now` is for
  * tests. Never throws.
  */
 export function withLoan(
@@ -454,6 +470,13 @@ export function withLoan(
         "direction_changed",
         "A loan in can't become a loan out, or the other way round. Record a new loan.",
       );
+    }
+    if (before !== undefined) {
+      // An edit can't drop a recorded link (review fix): with the link gone,
+      // `closed_with_items_out` no longer applies, so an item still out
+      // could be closed off the overdue lists.
+      const removed = removedLinks(before, next);
+      if (removed.length > 0) return { ok: false, issues: removed };
     }
     if (before === undefined && data.loans.length >= MAX_LOANS) {
       return refused([], "too_many", `A book can hold at most ${String(MAX_LOANS)} loans.`);
@@ -576,6 +599,21 @@ export function unexplainedDepartures(book: LoanBook): Validated<readonly Storag
   const data = bookData(book);
   if (data === undefined) return notABook();
   return { ok: true, value: data.unexplained };
+}
+
+/**
+ * `loan_out` moves in the move log that no loan out explains, oldest first:
+ * none of its items names the move as its `loanOutMoveId`, and it isn't an
+ * extension of one that is (a later `loan_out` of the same record to the same
+ * location, before that item's return). Each is a record sent to a borrower
+ * with no loan on file for it, or a loan whose link was never recorded.
+ * Reported, not refused, like `unexplainedDepartures`; the record itself is
+ * still on `overdueReturns` by the move's own date.
+ */
+export function unexplainedLoanMoves(book: LoanBook): Validated<readonly StorageMove[]> {
+  const data = bookData(book);
+  if (data === undefined) return notABook();
+  return { ok: true, value: data.unexplainedOut };
 }
 
 /**
@@ -704,6 +742,8 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
     string,
     { start: number; end: number; loanId: LoanId; at: number; j: number }[]
   >();
+  /** Loan out items that went out: the history indexes between their start and end. */
+  const lent: { recordId: RecordId; from: number; to: number; locationId: string }[] = [];
   loans.forEach((loan, i) => {
     if (issues.full) return;
     if (byId.has(loan.id)) {
@@ -827,6 +867,14 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
             : "This item arrived outside the loan period.",
         );
       }
+      if (start && loan.direction === "out") {
+        lent.push({
+          recordId: item.recordId,
+          from: start.index,
+          to: end ? end.index : moves.length,
+          locationId: start.move.locationId,
+        });
+      }
       if (start) {
         const spanKey = `${loan.direction} ${item.recordId}`;
         const list = spans.get(spanKey) ?? [];
@@ -877,6 +925,69 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
     }
   }
   if (issues.count > 0) return { ok: false, issues: issues.items };
+  // A `loan_out` move is explained when a loan item names it, or when it
+  // extends one: the same record to the same place, after the named
+  // `loan_out` and before that item's return.
+  const explained = new Set<string>(named);
+  for (const span of lent) {
+    const history = moveHistory(log, span.recordId);
+    const moves = history.ok ? history.value : [];
+    for (let k = span.from + 1; k < span.to && k < moves.length; k += 1) {
+      const m = moves[k];
+      if (m?.reason === "loan_out" && m.locationId === span.locationId) explained.add(m.id);
+    }
+  }
+  const outs = movesWithReason(log, "loan_out");
+  const unexplainedOut = Object.freeze(
+    (outs.ok ? outs.value : []).filter((m) => !explained.has(m.id)),
+  );
+  const strayByRecord = new Map<RecordId, StorageMove[]>();
+  for (const m of unexplainedOut) {
+    const list = strayByRecord.get(m.recordId) ?? [];
+    list.push(m);
+    strayByRecord.set(m.recordId, list);
+  }
+  for (const { loan, items } of byId.values()) {
+    if (loan.status !== "closed") continue;
+    items.forEach((item, j) => {
+      if (loan.direction === "out") {
+        // A closed loan out can't leave a record's loan_out to this borrower,
+        // in the loan period, unlinked (review fix): the item may be out.
+        const stray = (strayByRecord.get(item.recordId) ?? []).some((m) => {
+          const place = logLocation(log, m.locationId);
+          return (
+            place?.kind === "external" &&
+            place.agentId === loan.agentId &&
+            m.movedOn >= loan.beginOn &&
+            m.movedOn <= loan.endOn
+          );
+        });
+        if (stray) {
+          flag(
+            loan.id,
+            ["items", j],
+            "closed_with_unlinked_move",
+            "This record went out to the borrower during the loan in a move no loan names. Link it to this item, and its return, before closing.",
+          );
+        }
+      } else if (item.ended === null) {
+        // A closed loan in needs every item's departure (review fix), unless
+        // the record never arrived: no move of it is dated in or after the
+        // loan period. Otherwise a borrowed item could stay past the end date
+        // with nothing to show it.
+        const history = moveHistory(log, item.recordId);
+        const arrived = (history.ok ? history.value : []).some((m) => m.movedOn >= loan.beginOn);
+        if (arrived) {
+          flag(
+            loan.id,
+            ["items", j],
+            "closed_without_departure",
+            "A loan in can't be closed until this item's departure to the lender is recorded and linked. Only an item that never arrived (no move since the loan began) needs none.",
+          );
+        }
+      }
+    });
+  }
   const entries = new Map<LoanId, Entry>();
   for (const [id, { loan, items }] of byId) {
     entries.set(
@@ -898,6 +1009,7 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
     byId: entries,
     byRecord: frozenByRecord,
     unexplained,
+    unexplainedOut,
   });
   return { ok: true, value: book };
 }
@@ -905,6 +1017,52 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
 /** Identifies one problem of one loan, to compare a loan's problems before and after an edit. */
 function problemKey(found: Issue): string {
   return `${found.code} ${JSON.stringify(found.path)}`;
+}
+
+/**
+ * The move links an edit removes from the saved loan (`link_removed`). A
+ * link may be changed to another move (which must then fit the log), never
+ * dropped: not an item's start or end link, and not an item whose start is
+ * recorded, unless the saved loan's end link names a move the log holds (the
+ * item is back, so dropping it hides nothing). A wrong link is put right by
+ * linking the right move, or by recording a correcting move.
+ */
+function removedLinks(before: Entry, next: Loan): Issue[] {
+  const keys = MOVE_KEYS[next.direction];
+  const ending = next.direction === "out" ? "return" : "departure";
+  const found: Issue[] = [];
+  const nextItems = next.items as readonly unknown[] as readonly Readonly<
+    Record<string, string | undefined>
+  >[];
+  before.loan.items.forEach((item, j) => {
+    const old = item as unknown as Readonly<Record<string, string | undefined>>;
+    if (old[keys.start] === undefined) return;
+    const back = old[keys.end] !== undefined && (before.items[j]?.ended ?? null) !== null;
+    const k = nextItems.findIndex((i) => i.recordId === item.recordId);
+    const now = nextItems[k];
+    if (now?.[keys.start] === undefined) {
+      if (!back) {
+        found.push(
+          issue(
+            now === undefined ? ["items"] : ["items", k, keys.start],
+            "link_removed",
+            `Record ${item.recordId} has its ${keys.start} recorded on this loan, so it can't be taken off the loan or unlinked until its ${ending} is recorded. Link the right move instead.`,
+          ),
+        );
+      }
+      return;
+    }
+    if (old[keys.end] !== undefined && now[keys.end] === undefined) {
+      found.push(
+        issue(
+          ["items", k, keys.end],
+          "link_removed",
+          `This item's ${keys.end} is recorded on this loan; link the right move instead of removing it.`,
+        ),
+      );
+    }
+  });
+  return found;
 }
 
 function stateOf(data: BookData, entry: Entry): LoanState {
