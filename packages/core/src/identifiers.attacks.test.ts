@@ -20,6 +20,7 @@ import {
   type Validated,
   newOrganizationId,
 } from "./index.js";
+import { cpuClock, hangGuard } from "./cpu-time.fixtures.js";
 
 /** The list from a Validated result; fails the test if it was refused. */
 function listed<T>(result: Validated<readonly T[]>): readonly T[] {
@@ -295,23 +296,29 @@ describe("lookalike identifiers can't both be held (S-003)", () => {
     expect(identifierKey("\u1100\u1160\u1161-1")).toBe(identifierKey("\uac00-1"));
   });
 
-  it("long runs of combining marks cost linear time, at any length (review fix)", () => {
-    // Normalization sorts each run of marks in time growing with its square.
-    const longRun = "a" + "\u0323\u0301".repeat(100_000);
-    const shortRuns = ("a" + "\u0323\u0301".repeat(4)).repeat(100); // runs of 8: allowed
-    const started = performance.now();
-    expect(
-      listed(
-        findIdentifierConflicts({ type: "box_label", value: longRun }, newRecordId(), [], TYPES),
-      ),
-    ).toEqual([]);
-    const stored = Array.from({ length: 500 }, () => holding(shortRuns));
-    expect(uniquenessIssues([...stored, holding(longRun), holding(longRun)], TYPES).length).toBe(
-      201,
-    );
-    expect(listed(findByIdentifier(longRun.slice(0, 900), [holding(longRun)]))).toEqual([]);
-    expect(performance.now() - started).toBeLessThan(1500);
-  });
+  // Time limits here are CPU time, not the wall clock (U-003): a busy
+  // machine can't fail them, and a quadratic version still would.
+  it(
+    "long runs of combining marks cost linear time, at any length (review fix)",
+    hangGuard(1500),
+    () => {
+      // Normalization sorts each run of marks in time growing with its square.
+      const longRun = "a" + "\u0323\u0301".repeat(100_000);
+      const shortRuns = ("a" + "\u0323\u0301".repeat(4)).repeat(100); // runs of 8: allowed
+      const elapsed = cpuClock();
+      expect(
+        listed(
+          findIdentifierConflicts({ type: "box_label", value: longRun }, newRecordId(), [], TYPES),
+        ),
+      ).toEqual([]);
+      const stored = Array.from({ length: 500 }, () => holding(shortRuns));
+      expect(uniquenessIssues([...stored, holding(longRun), holding(longRun)], TYPES).length).toBe(
+        201,
+      );
+      expect(listed(findByIdentifier(longRun.slice(0, 900), [holding(longRun)]))).toEqual([]);
+      expect(elapsed()).toBeLessThan(1500);
+    },
+  );
 });
 
 describe("equivalent spellings with many marks take the same path (second review)", () => {
@@ -412,8 +419,9 @@ describe("size limits", () => {
     ).toEqual(["too_many"]);
   });
 
-  it("refuses a huge or deeply nested input quickly", () => {
-    const started = performance.now();
+  // CPU time, not the wall clock (U-003), like the limits above.
+  it("refuses a huge or deeply nested input quickly", hangGuard(1000), () => {
+    const elapsed = cpuClock();
     const huge = {
       recordId: newRecordId(),
       organizationId: ORG,
@@ -430,10 +438,10 @@ describe("size limits", () => {
       ).ok,
     ).toBe(false);
     expect(validateIdentifierTypes(new Array(1_000_000).fill(BOX)).ok).toBe(false);
-    expect(performance.now() - started).toBeLessThan(1000);
+    expect(elapsed()).toBeLessThan(1000);
   });
 
-  it("uniqueness, search and numbering stay linear over many records", () => {
+  it("uniqueness, search and numbering stay linear over many records", hangGuard(3000), () => {
     const all: RecordIdentifiers[] = Array.from({ length: 20_000 }, (_, i) => ({
       recordId: newRecordId(),
       organizationId: ORG,
@@ -444,20 +452,20 @@ describe("size limits", () => {
       ...BOX,
       autoNumber: { style: "prefix", prefix: "B-", digits: 1 },
     };
-    const started = performance.now();
+    const elapsed = cpuClock();
     const found = uniquenessIssues(all, TYPES);
     expect(found).toHaveLength(201); // 200 issues, then "too_many_issues"
     expect(found[200]?.code).toBe("too_many_issues");
     expect(listed(findByIdentifier("b-9999", all))).toHaveLength(2);
     expect(nextIdentifier(auto, all)).toEqual({ ok: true, value: "B-10000" });
-    expect(performance.now() - started).toBeLessThan(3000);
+    expect(elapsed()).toBeLessThan(3000);
   });
 
-  it("a query is capped before it is normalized", () => {
+  it("a query is capped before it is normalized", hangGuard(100), () => {
     // U+FDFA expands to 18 characters under NFKC.
-    const started = performance.now();
+    const elapsed = cpuClock();
     expect(listed(findByIdentifier("\ufdfa".repeat(1_000_000), []))).toEqual([]);
-    expect(performance.now() - started).toBeLessThan(100);
+    expect(elapsed()).toBeLessThan(100);
   });
 });
 

@@ -218,9 +218,12 @@ function compare(
   // another template's record would be listed in this one's confirmation.
   let legacyRecords = 0;
   for (const [i, record] of (records ?? []).entries()) {
-    if (record.templateKey === undefined) {
+    // An own data property only: a `templateKey` inherited from a polluted
+    // `Object.prototype` (or a getter there) must not decide whose record it is.
+    const templateKey = own(record, "templateKey");
+    if (templateKey === undefined) {
       legacyRecords += 1;
-    } else if (record.templateKey !== after.value.key) {
+    } else if (templateKey !== after.value.key) {
       return {
         ok: false,
         issues: [
@@ -599,6 +602,12 @@ function byKey(template: FieldTemplate): ReadonlyMap<string, FieldDefinition> {
 
 function prefixed(root: string, list: readonly Issue[]): Issue[] {
   return list.map((i) => issue([root, ...i.path], i.code, i.message));
+}
+
+/** An own data property, never a getter or an inherited one. */
+function own(obj: object, name: string): unknown {
+  const d = Object.getOwnPropertyDescriptor(obj, name);
+  return d !== undefined && "value" in d ? d.value : undefined;
 }
 
 /** Validate every record; any unreadable record, or an ID used twice, refuses them all. */

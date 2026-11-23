@@ -156,7 +156,7 @@ The data model in TypeScript, written for any archive or museum rather than one 
   - `templateChanges` should report a narrowed `recordKinds` with the records whose links no longer fit; a report of link labels that no longer match the linked record's name.
 - [ ] S-007 **Messages in `publicOutput` issues.** (risky) deps: T-014
   - From the integration review: `publicOutput` passes the template check's problems through as they are, and the identifier checker's `unknown_type` and `format_mismatch` messages quote a type key or a number. Decide whether `publicOutput` issues are staff-only (and say so) or replace those messages with fixed text.
-- [ ] U-003 **Small hardening and test speed.**
+- [x] U-003 **Small hardening and test speed.**
   - `template-changes.ts` reads `record.templateKey` without checking it is the record's own property; read it as an own data property. The wall-clock tests in `vocabularies.attacks`, `identifiers.attacks`, `term-duplicates` and `effective` fail when the 2-CPU machine is busy: measure relative to a baseline run in the same process, or move the heaviest behind a separate script that the gate still runs.
 
 ## Later phases: notes
@@ -171,6 +171,7 @@ The data model in TypeScript, written for any archive or museum rather than one 
 Written by T-011 ([review](reports/2026-11-phase1-review.md)). Q-1 (one app or two) and Q-2 (hosting and budget) were unanswered, so tasks that need either say `deps: Q-1` or `deps: Q-2` and wait. Everything else is written so it works whatever John answers: one PostgreSQL database, the service layer as the only writer, and an HTTP API in its own package. Library choices are decision tasks. Each choice must be permissively licensed (D-002), actively maintained (a release in the last 12 months and more than one maintainer, or a foundation behind it), free of AI features and SDKs (D-004), with a small dependency tree, and must pass `npm audit` and the license check.
 
 Decisions first:
+  - Done: `templateChanges` reads `templateKey` as an own data property; the blowup tests assert their limits in process CPU time (`process.cpuUsage`, every thread, so garbage collection counts) with the same numbers, and their wall-clock timeouts became hang guards (3× the limit, at least 30 s). Reviewed: the first version timed only the main thread, which was 25–70% looser; fixed.
 - [ ] T-020 **Decision: PostgreSQL version and database tests.** deps: T-011
   - Choose the PostgreSQL major versions Oculus supports (community-supported releases only), and how the gate runs database tests: locally (the sandbox has PostgreSQL 16) and in GitHub Actions (a service container). The gate must stay one command and must not get weaker. The decision entry says Q-2 may narrow the version range later.
 - [ ] T-021 **Decision: database access and migrations.** deps: T-020

@@ -12,6 +12,7 @@ import {
   boundedDistance as referenceDistance,
   findNearDuplicateTerms as referenceFind,
 } from "./term-duplicates.fixtures.js";
+import { cpuClock, hangGuard } from "./cpu-time.fixtures.js";
 
 const RAILROADS = "http://id.loc.gov/authorities/subjects/sh85110904";
 const HURRICANES = "http://id.loc.gov/authorities/subjects/sh85063195";
@@ -140,50 +141,60 @@ describe("boundedDistance", () => {
     expect(boundedDistance("a".repeat(600), "b".repeat(600), 1e9)).toBe(600);
   });
 
-  it("gives what the code before S-005a gave, for strings and lists, on every short pair", () => {
-    // Every pair of keys of up to 7 letters from two letters, then long
-    // random keys from two and three letters: the narrower band and the
-    // strings read as needed must not change a single answer.
-    const keys = [""];
-    for (let length = 1; length <= 7; length += 1) {
-      for (let x = 0; x < 2 ** length; x += 1) {
-        keys.push(Array.from({ length }, (_, k) => ((x >> k) & 1 ? "b" : "a")).join(""));
+  // Its limit was vitest's default 5-second timeout; now it is CPU time
+  // (U-003), so a busy machine can't fail it. The timeout is a hang guard.
+  it(
+    "gives what the code before S-005a gave, for strings and lists, on every short pair",
+    hangGuard(5000),
+    () => {
+      const elapsed = cpuClock();
+      // Every pair of keys of up to 7 letters from two letters, then long
+      // random keys from two and three letters: the narrower band and the
+      // strings read as needed must not change a single answer.
+      const keys = [""];
+      for (let length = 1; length <= 7; length += 1) {
+        for (let x = 0; x < 2 ** length; x += 1) {
+          keys.push(Array.from({ length }, (_, k) => ((x >> k) & 1 ? "b" : "a")).join(""));
+        }
       }
-    }
-    const check = (a: string, b: string, limit: number): void => {
-      const expected = referenceDistance(Array.from(a), Array.from(b), limit);
-      expect(boundedDistance(a, b, limit), `${a} ${b} ${String(limit)}`).toBe(expected);
-      expect(boundedDistance(Array.from(a), Array.from(b), limit)).toBe(expected);
-    };
-    for (const a of keys) {
-      for (const b of keys) {
-        if (Math.abs(a.length - b.length) <= 3) for (const limit of [1, 2, 3]) check(a, b, limit);
+      const check = (a: string, b: string, limit: number): void => {
+        const expected = referenceDistance(Array.from(a), Array.from(b), limit);
+        expect(boundedDistance(a, b, limit), `${a} ${b} ${String(limit)}`).toBe(expected);
+        expect(boundedDistance(Array.from(a), Array.from(b), limit)).toBe(expected);
+      };
+      for (const a of keys) {
+        for (const b of keys) {
+          if (Math.abs(a.length - b.length) <= 3) for (const limit of [1, 2, 3]) check(a, b, limit);
+        }
       }
-    }
-    let seed = 11;
-    const rand = (n: number): number => {
-      seed = (seed * 1103515245 + 12345) % 2147483648;
-      return seed % n;
-    };
-    for (let k = 0; k < 20_000; k += 1) {
-      const letters = k % 2 === 0 ? "ab" : "abc";
-      const a = Array.from({ length: 10 + rand(50) }, () => letters[rand(letters.length)]).join("");
-      // Mostly near copies, so many pairs are within the limit.
-      let b = a;
-      for (let e = rand(4); e > 0; e -= 1) {
-        const at = rand(b.length + 1);
-        const c = letters[rand(letters.length)] ?? "a";
-        const op = rand(4);
-        if (op === 0) b = b.slice(0, at) + c + b.slice(at);
-        else if (op === 1) b = b.slice(0, at) + b.slice(at + 1);
-        else if (op === 2) b = b.slice(0, at) + c + b.slice(at + 1);
-        else b = b.slice(0, at) + b.slice(at + 1, at + 2) + b.slice(at, at + 1) + b.slice(at + 2);
+      let seed = 11;
+      const rand = (n: number): number => {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        return seed % n;
+      };
+      for (let k = 0; k < 20_000; k += 1) {
+        const letters = k % 2 === 0 ? "ab" : "abc";
+        const a = Array.from({ length: 10 + rand(50) }, () => letters[rand(letters.length)]).join(
+          "",
+        );
+        // Mostly near copies, so many pairs are within the limit.
+        let b = a;
+        for (let e = rand(4); e > 0; e -= 1) {
+          const at = rand(b.length + 1);
+          const c = letters[rand(letters.length)] ?? "a";
+          const op = rand(4);
+          if (op === 0) b = b.slice(0, at) + c + b.slice(at);
+          else if (op === 1) b = b.slice(0, at) + b.slice(at + 1);
+          else if (op === 2) b = b.slice(0, at) + c + b.slice(at + 1);
+          else b = b.slice(0, at) + b.slice(at + 1, at + 2) + b.slice(at, at + 1) + b.slice(at + 2);
+        }
+        if (k % 5 === 0)
+          b = Array.from({ length: a.length + rand(3) }, () => letters[rand(2)]).join("");
+        check(a, b, 1 + rand(2));
       }
-      if (k % 5 === 0)
-        b = Array.from({ length: a.length + rand(3) }, () => letters[rand(2)]).join("");
-      check(a, b, 1 + rand(2));
-    }
-  });
+      expect(elapsed()).toBeLessThan(5000);
+    },
+  );
 });
 
 describe("findNearDuplicateTerms finds what the code before S-005a found", () => {
@@ -262,7 +273,9 @@ describe("findNearDuplicateTerms finds what the code before S-005a found", () =>
     return terms;
   };
 
-  it("on many randomized lists of terms", { timeout: 60_000 }, () => {
+  // The 60 seconds that were the test's timeout are CPU time now (U-003).
+  it("on many randomized lists of terms", hangGuard(60_000), () => {
+    const elapsed = cpuClock();
     let pairs = 0;
     const reasons = new Set<string>();
     for (let seed = 1; seed <= 40; seed += 1) {
@@ -278,6 +291,7 @@ describe("findNearDuplicateTerms finds what the code before S-005a found", () =>
     // The lists really did reach every reason, so the comparison means something.
     expect(pairs).toBeGreaterThan(1000);
     expect([...reasons].sort()).toEqual([...DUPLICATE_REASONS].sort());
+    expect(elapsed()).toBeLessThan(60_000);
   });
 });
 
@@ -674,7 +688,9 @@ describe("findNearDuplicateTerms: results and limits", () => {
     expect(summary(r.value.candidates)).toEqual([[1, 2, "same_label"]]);
   });
 
-  it("stops the abbreviation check at its budget and says so", () => {
+  // Its limit was vitest's default 5-second timeout; now CPU time (U-003).
+  it("stops the abbreviation check at its budget and says so", hangGuard(5000), () => {
+    const elapsed = cpuClock();
     // Every run of words has initials that are a word some label uses.
     const runs = "aa aaa aaaa aaaaa aaaaaa aaaaaaa aaaaaaaa";
     const terms = [
@@ -685,6 +701,7 @@ describe("findNearDuplicateTerms: results and limits", () => {
     ];
     const r = findNearDuplicateTerms(terms);
     expect(r.ok && r.value.limitsReached).toContain("abbreviation_budget");
+    expect(elapsed()).toBeLessThan(5000);
   });
 
   it("refuses bad input and options", () => {

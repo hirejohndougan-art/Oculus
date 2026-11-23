@@ -13,6 +13,7 @@ import {
   type FieldDefinition,
 } from "./index.js";
 import { findNearDuplicateTerms as referenceFind } from "./term-duplicates.fixtures.js";
+import { cpuClock, hangGuard } from "./cpu-time.fixtures.js";
 
 const HURRICANES = "http://id.loc.gov/authorities/subjects/sh85063195";
 
@@ -116,8 +117,9 @@ describe("controlled terms can't be fooled", () => {
     ).toBe(false);
   });
 
-  it("doesn't take long on a huge or pathological URI", () => {
-    const start = Date.now();
+  // CPU time, not the wall clock (U-003): a busy machine can't fail it.
+  it("doesn't take long on a huge or pathological URI", hangGuard(1000), () => {
+    const elapsed = cpuClock();
     const long = `http://id.loc.gov/${"a/".repeat(240)}`;
     expect(normalizeTermUri(long).ok).toBe(false);
     expect(normalizeTermUri(`http://id.loc.gov/${"9".repeat(480)}`).ok).toBe(false);
@@ -128,7 +130,7 @@ describe("controlled terms can't be fooled", () => {
         vocabulary: "gnis",
       }).ok,
     ).toBe(false);
-    expect(Date.now() - start).toBeLessThan(1000);
+    expect(elapsed()).toBeLessThan(1000);
   });
 
   it("the checker never throws, even when given something that isn't a term", () => {
@@ -207,20 +209,24 @@ describe("near-duplicate detection can't be overloaded", () => {
     expect(ran).toBe(false);
   });
 
-  it("stays fast on many terms that share a word, a prefix and an ending", () => {
-    // 20,000 invented labels in one huge block: compared with neighbours only.
-    const terms = Array.from({ length: 20_000 }, (_, i) => ({
-      label: `Railroad depot ${String.fromCharCode(97 + (i % 26))}${String.fromCharCode(97 + (Math.floor(i / 26) % 26))}${String.fromCharCode(97 + (Math.floor(i / 676) % 26))} depot`,
-    }));
-    const start = Date.now();
-    const r = findNearDuplicateTerms(terms, { maxCandidates: 10 });
-    expect(Date.now() - start).toBeLessThan(10_000);
-    expect(r.ok).toBe(true);
-    if (r.ok) {
-      expect(r.value.candidates).toHaveLength(10);
-      expect(r.value.truncated).toBe(true);
-    }
-  });
+  it(
+    "stays fast on many terms that share a word, a prefix and an ending",
+    hangGuard(10_000),
+    () => {
+      // 20,000 invented labels in one huge block: compared with neighbours only.
+      const terms = Array.from({ length: 20_000 }, (_, i) => ({
+        label: `Railroad depot ${String.fromCharCode(97 + (i % 26))}${String.fromCharCode(97 + (Math.floor(i / 26) % 26))}${String.fromCharCode(97 + (Math.floor(i / 676) % 26))} depot`,
+      }));
+      const elapsed = cpuClock();
+      const r = findNearDuplicateTerms(terms, { maxCandidates: 10 });
+      expect(elapsed()).toBeLessThan(10_000);
+      expect(r.ok).toBe(true);
+      if (r.ok) {
+        expect(r.value.candidates).toHaveLength(10);
+        expect(r.value.truncated).toBe(true);
+      }
+    },
+  );
 
   it("gives n - 1 pairs, not n², for many copies of the same term", () => {
     const terms = Array.from({ length: 5000 }, () => ({ label: "Depot" }));
@@ -231,6 +237,8 @@ describe("near-duplicate detection can't be overloaded", () => {
 
   // The worst inputs found in review, at the full 50,000 terms. Each must
   // finish in about 2 seconds; the bound leaves room for a slow CI machine.
+  // Times are this process's CPU time (U-003), so a busy machine can't fail
+  // them; the wall-clock timeout is only a hang guard.
   const N = 50_000;
   const tag = (i: number): string =>
     String.fromCharCode(
@@ -240,21 +248,22 @@ describe("near-duplicate detection can't be overloaded", () => {
       97 + (Math.floor(i / 17576) % 26),
     );
   const shared = Array.from({ length: 120 }, (_, i) => tag(i * 37).slice(0, 3)).join(" ");
+  const fast = hangGuard(5000);
   const timed = (terms: unknown[]): { ms: number; limits: readonly string[]; found: number } => {
-    const start = Date.now();
+    const elapsed = cpuClock();
     const r = findNearDuplicateTerms(terms, { maxCandidates: 10_000 });
-    const ms = Date.now() - start;
+    const ms = elapsed();
     if (!r.ok) throw new Error(JSON.stringify(r.issues));
     return { ms, limits: r.value.limitsReached, found: r.value.candidates.length };
   };
 
-  it("is fast on long labels sharing 120 words, told apart by a number", () => {
+  it("is fast on long labels sharing 120 words, told apart by a number", fast, () => {
     const r = timed(Array.from({ length: N }, (_, i) => ({ label: `${shared} ${String(i)}` })));
     expect(r.found).toBe(0);
     expect(r.ms).toBeLessThan(5000);
   });
 
-  it("stays within budget on long labels sharing 120 words, told apart by a word", () => {
+  it("stays within budget on long labels sharing 120 words, told apart by a word", fast, () => {
     const r = timed(
       Array.from({ length: N }, (_, i) => ({ label: `${tag(i)} ${shared}`.slice(0, 500) })),
     );
@@ -262,7 +271,7 @@ describe("near-duplicate detection can't be overloaded", () => {
     expect(r.ms).toBeLessThan(5000);
   });
 
-  it("is fast when every term has a GNIS URI (only same_uri can apply)", () => {
+  it("is fast when every term has a GNIS URI (only same_uri can apply)", fast, () => {
     const r = timed(
       Array.from({ length: N }, (_, i) => ({
         label: `${tag(i)} ${shared}`.slice(0, 500),
@@ -274,7 +283,7 @@ describe("near-duplicate detection can't be overloaded", () => {
     expect(r.ms).toBeLessThan(5000);
   });
 
-  it("is fast with one local term among long GNIS terms", () => {
+  it("is fast with one local term among long GNIS terms", fast, () => {
     const r = timed([
       { label: `${tag(1)} ${shared}`.slice(0, 500) },
       ...Array.from({ length: N - 1 }, (_, i) => ({
@@ -287,8 +296,9 @@ describe("near-duplicate detection can't be overloaded", () => {
   });
 
   // Labels of short random words: short keys in hundreds of big blocks of
-  // different keys. These assert what was searched, not the time (a loaded
-  // machine can't change that); the time limit is the test's own timeout.
+  // different keys. These assert what was searched (a loaded machine can't
+  // change that), and the 30 seconds that used to be the test's own
+  // timeout, now as CPU time (U-003).
   const randomWords = (seed: number, vocabulary: readonly string[], words: number): unknown[] => {
     let s = seed;
     const next = (): number => {
@@ -309,12 +319,14 @@ describe("near-duplicate detection can't be overloaded", () => {
         (_, k) => letters[Math.floor(i / letters.length ** k) % letters.length],
       ).join(""),
     );
-  const slow = { timeout: 30_000 };
+  const SLOW_MS = 30_000;
+  const slow = hangGuard(SLOW_MS);
 
   it("searches every neighbour of labels of six short random words", slow, () => {
     const consonants = allWords("bcdfghjklmnpqrstvwxz", 3).filter((_, i) => i % 67 === 0);
     const r = timed(randomWords(42, consonants, 6));
     expect(r.limits).not.toContain("spelling_budget");
+    expect(r.ms).toBeLessThan(SLOW_MS);
   });
 
   it("searches every neighbour when every key has the same four letters", slow, () => {
@@ -323,6 +335,7 @@ describe("near-duplicate detection can't be overloaded", () => {
     const r = timed(randomWords(7, allWords("bcdf", 3), 6));
     expect(r.limits).not.toContain("spelling_budget");
     expect(r.found).toBeGreaterThan(0);
+    expect(r.ms).toBeLessThan(SLOW_MS);
   });
 
   it("charges a pair passed over without its distance as a visit only", slow, () => {
@@ -330,6 +343,7 @@ describe("near-duplicate detection can't be overloaded", () => {
     // charged 44 × 44 cells each, even when their letter counts rule them out.
     const r = timed(randomWords(9, allWords("ab", 4), 11));
     expect(r.limits).not.toContain("spelling_budget");
+    expect(r.ms).toBeLessThan(SLOW_MS);
   });
 
   // S-005a. The shapes that took longest, each compared with the code as it
@@ -337,17 +351,19 @@ describe("near-duplicate detection can't be overloaded", () => {
   // terms, in the same process: the whole report must be identical (so no
   // pair is lost and the limits are reported the same, budgets included),
   // and the new code must be clearly faster. The ratio is what is asserted,
-  // not the seconds: a loaded machine slows both runs alike, while a wall
-  // clock bound either passes for the old code too or turns flaky.
+  // not the seconds: a wall clock bound either passes for the old code too
+  // or turns flaky. Both runs are timed in this process's CPU time (U-003):
+  // on the wall clock, load that came or went between the two runs moved
+  // the ratio past its bound.
   const against = (terms: unknown[]): { ratio: number; ms: number; limits: readonly string[] } => {
     // The new code runs first, so it pays for warming up anything the two
     // share: the ratio can only understate how much faster it is.
-    const start = Date.now();
+    const elapsed = cpuClock();
     const now = findNearDuplicateTerms(terms, { maxCandidates: 10_000 });
-    const ms = Date.now() - start;
-    const before = Date.now();
+    const ms = elapsed();
+    const before = cpuClock();
     const old = referenceFind(terms, { maxCandidates: 10_000 });
-    const oldMs = Math.max(1, Date.now() - before);
+    const oldMs = Math.max(1, before());
     expect(now).toEqual(old);
     if (!now.ok) throw new Error(JSON.stringify(now.issues));
     return { ratio: ms / oldMs, ms, limits: now.value.limitsReached };
@@ -369,6 +385,7 @@ describe("near-duplicate detection can't be overloaded", () => {
   it("finds the same pairs when every key has the same four letters", slow, () => {
     const r = against(randomWords(7, allWords("bcdf", 3), 6));
     expect(r.ratio).toBeLessThan(0.9);
+    expect(r.ms).toBeLessThan(SLOW_MS);
   });
 
   it("reaches the same limits when the spelling budget runs out", slow, () => {
@@ -377,6 +394,7 @@ describe("near-duplicate detection can't be overloaded", () => {
     );
     expect(r.limits).toContain("spelling_budget");
     expect(r.limits).toContain("candidates");
+    expect(r.ms).toBeLessThan(SLOW_MS);
   });
 
   it("stops the abbreviation check at the same place", slow, () => {
@@ -390,6 +408,7 @@ describe("near-duplicate detection can't be overloaded", () => {
       })),
     ]);
     expect(r.limits).toContain("abbreviation_budget");
+    expect(r.ms).toBeLessThan(SLOW_MS);
   });
 
   it("holds pairs of positions as numbers only while the term limit allows it", () => {
@@ -403,8 +422,10 @@ describe("near-duplicate detection can't be overloaded", () => {
     expect(MAX_PAIR_SET_TERMS ** 2 - 1).toBeLessThan(2 ** 32 - 1);
   });
 
-  it("doesn't run out of memory on labels that unfold to many characters", () => {
+  // Its limit was vitest's default 5-second timeout; now CPU time (U-003).
+  it("doesn't run out of memory on labels that unfold to many characters", fast, () => {
     // U+FDFA unfolds to 18 characters: 450 of them would be an 8,100-letter key.
+    const elapsed = cpuClock();
     const r = findNearDuplicateTerms(
       Array.from({ length: N }, (_, i) => ({ label: `${"\ufdfa".repeat(450)} ${tag(i)}` })),
     );
@@ -412,5 +433,6 @@ describe("near-duplicate detection can't be overloaded", () => {
     expect(r.value.skipped).toHaveLength(N);
     expect(r.value.skipped[0]?.issues[0]?.code).toBe("too_long_to_compare");
     expect(r.value.limitsReached).toEqual(["long_labels"]);
+    expect(elapsed()).toBeLessThan(5000);
   });
 });
