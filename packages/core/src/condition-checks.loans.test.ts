@@ -232,6 +232,37 @@ describe("loans out without a recent fit-to-move check", () => {
     expect(ok(warn(l, 365)).map((w) => [w.recordId, w.because])).toEqual([[print, "unchecked"]]);
   });
 
+  it("a check on the day it went out counts only if written down before the move", () => {
+    const after = check(print, "2026-09-01");
+    expect(after.recordedAt > printOut.recordedAt).toBe(true);
+    const mapOk = check(map, "2026-11-01");
+    expect(ok(warn(log([after, mapOk]), 30)).map((w) => [w.recordId, w.because])).toEqual([
+      [print, "unchecked"],
+    ]);
+    const before = check(print, "2026-09-01", { recordedAt: "2026-11-23T15:00:00.000Z" });
+    expect(before.recordedAt < printOut.recordedAt).toBe(true);
+    expect(ok(warn(log([before, mapOk]), 30))).toEqual([]);
+  });
+
+  it("an item whose named loan_out isn't in the log is reported, never taken as not sent", () => {
+    const broken: LoanOut = {
+      ...out,
+      id: newLoanId(),
+      number: "LO-2026-009",
+      items: [{ recordId: map, loanOutMoveId: newMoveId() }],
+    };
+    const b = ok(indexLoans(LOG, [broken], NOW));
+    const found = ok(
+      loansOutWithoutFitCheck(log([check(map, "2026-11-20")]), b, {
+        today: TODAY,
+        maxAgeDays: 30,
+      }),
+    );
+    expect(found.map((w) => [w.recordId, w.sent, w.because])).toEqual([
+      [map, true, "move_unknown"],
+    ]);
+  });
+
   it("lists an unfit item, and ignores loans not agreed and loans in", () => {
     const l = log([
       check(print, "2026-08-20", { condition: "needs_conservation" }),

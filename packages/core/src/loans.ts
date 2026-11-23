@@ -1335,9 +1335,21 @@ function buildBook(log: MoveLog, loans: readonly Loan[], linked: Linked): Valida
         direction: loan.direction,
         status: loan.status,
         items: Object.freeze(
-          items.map((item) =>
-            Object.freeze({ recordId: item.recordId, startedOn: item.started?.movedOn ?? null }),
-          ),
+          items.map((item, j) => {
+            const given = loan.items[j] as unknown as Readonly<Record<string, unknown>>;
+            const named = given[MOVE_KEYS[loan.direction].start] !== undefined;
+            return Object.freeze({
+              recordId: item.recordId,
+              started:
+                item.started === null
+                  ? null
+                  : Object.freeze({
+                      on: item.started.movedOn,
+                      recordedAt: item.started.recordedAt,
+                    }),
+              startNamed: named,
+            });
+          }),
         ),
       }),
     );

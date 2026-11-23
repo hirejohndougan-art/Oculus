@@ -153,12 +153,16 @@ export interface ConditionLoanProblem {
 export interface LoanFitWarning {
   readonly loanId: string;
   readonly recordId: RecordId;
-  /** True when the item has gone out (its `loan_out` is linked); judged on that day. */
+  /** True when the loan names the item's `loan_out`; judged at that move. */
   readonly sent: boolean;
-  /** The day judged on: the day it went out, or `today` while it hasn't. */
+  /** The day judged on: the day it went out, or `today` while no `loan_out` is named. */
   readonly on: string;
-  /** Why: `unfit`, `stale` or `unchecked` (see `FitToMove`). */
-  readonly because: "unfit" | "stale" | "unchecked";
+  /**
+   * Why: `unfit`, `stale` or `unchecked` (see `FitToMove`), or
+   * `move_unknown` when the named `loan_out` isn't in the move log, so when
+   * it went can't be known (never taken as not sent).
+   */
+  readonly because: "unfit" | "stale" | "unchecked" | "move_unknown";
   /** The check the answer is based on, or null when there is none. */
   readonly check: ConditionCheck | null;
 }
@@ -604,21 +608,33 @@ export function loansOutWithoutFitCheck(
     for (const loan of facts.value.loans) {
       if (loan.direction !== "out" || loan.status !== "agreed") continue;
       for (const item of loan.items) {
-        const on = item.startedOn ?? today;
-        const answer = fitToMove(log, item.recordId, { on, maxAgeDays: maxAge });
-        if (!answer.ok) return answer;
-        const { because, check } = answer.value;
-        if (because === "fit") continue;
-        found.push(
-          Object.freeze({
-            loanId: loan.id,
-            recordId: item.recordId,
-            sent: item.startedOn !== null,
-            on,
-            because,
-            check,
-          }),
-        );
+        const warn = (
+          on: string,
+          because: LoanFitWarning["because"],
+          check: ConditionCheck | null,
+        ): void => {
+          found.push(
+            Object.freeze({
+              loanId: loan.id,
+              recordId: item.recordId,
+              sent: item.startNamed,
+              on,
+              because,
+              check,
+            }),
+          );
+        };
+        if (item.startNamed && item.started === null) {
+          // A named loan_out the log doesn't hold: when it went can't be
+          // known, so never judged as not yet sent (review fix).
+          warn(today, "move_unknown", null);
+          continue;
+        }
+        const on = item.started?.on ?? today;
+        // Only a check written down before the move counts on its day (review fix).
+        const check = latestBefore(data, item.recordId, on, item.started?.recordedAt);
+        const because = judge(check, on, maxAge);
+        if (because !== "fit") warn(on, because, check);
       }
     }
     return { ok: true, value: Object.freeze(found) };
@@ -644,6 +660,35 @@ export function needingConservation(log: ConditionLog): Validated<readonly Condi
 
 // ---------------------------------------------------------------------------
 // Helpers
+
+/**
+ * The record's latest check made on or before `on`; with `recordedBy`, one
+ * made on `on` itself counts only if written down no later than that time.
+ */
+function latestBefore(
+  data: LogData,
+  recordId: RecordId,
+  on: string,
+  recordedBy: string | undefined,
+): ConditionCheck | null {
+  const history = data.byRecord.get(recordId) ?? [];
+  for (let i = history.length - 1; i >= 0; i -= 1) {
+    const check = history[i];
+    if (check === undefined || check.checkedOn > on) continue;
+    if (check.checkedOn === on && recordedBy !== undefined && check.recordedAt > recordedBy) {
+      continue;
+    }
+    return check;
+  }
+  return null;
+}
+
+/** `fitToMove`'s answer for a check found for day `on`. */
+function judge(check: ConditionCheck | null, on: string, maxAge: number): FitToMove["because"] {
+  if (check === null) return "unchecked";
+  if ((Date.parse(on) - Date.parse(check.checkedOn)) / DAY_MS > maxAge) return "stale";
+  return canMove(check) ? "fit" : "unfit";
+}
 
 function isAge(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 36_500;

@@ -6,7 +6,7 @@
  *
  * A book made by `indexLoans`, `withLoan` or `reindexLoans` shares here only
  * its organization and, per loan, its ID, direction, status and items (each
- * record and the day its linked start move happened). Never a number,
+ * record, and the day and recorded time of its linked start move). Never a number,
  * agent, valuation, insurance, terms or notes. For other modules in this
  * package only: not exported from the package.
  */
@@ -17,10 +17,13 @@ import type { RecordId } from "./record-id.js";
 export interface LoanFactItem {
   readonly recordId: RecordId;
   /**
-   * The day of the item's linked start move: its `loan_out` (loan out) or
-   * arrival (loan in). Null while none is linked.
+   * The item's linked start move, its `loan_out` (loan out) or arrival
+   * (loan in): the day it happened and when it was written down. Null while
+   * none is linked, or when the named move isn't in the move log.
    */
-  readonly startedOn: string | null;
+  readonly started: { readonly on: string; readonly recordedAt: string } | null;
+  /** True when the loan names a start move for the item, found in the log or not. */
+  readonly startNamed: boolean;
 }
 
 /** One loan, as condition checks see it. */
