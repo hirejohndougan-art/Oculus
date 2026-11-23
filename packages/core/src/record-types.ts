@@ -462,7 +462,9 @@ export function checkRecordType(
       );
     }
     const r = valid.value;
-    const key = r.recordTypeKey;
+    // An own property only: a polluted Object.prototype must not give a
+    // record without a type one.
+    const key = Object.hasOwn(r, "recordTypeKey") ? r.recordTypeKey : undefined;
     if (key === undefined) {
       return refusedList(
         ["recordTypeKey"],
