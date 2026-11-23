@@ -13,6 +13,7 @@ import {
   type FieldValue,
   type PublicRecord,
   type RecordId,
+  type RecordIdentifiers,
   type RecordKind,
 } from "./index.js";
 
@@ -133,13 +134,44 @@ if (!identifierChecker.ok) throw new Error("identifier types");
 /** The checkers publicOutput needs for the fixtures' identifier field. */
 export const CHECKERS = Object.freeze({ identifier: identifierChecker.value });
 
+/**
+ * Each record's identifiers, holding as current exactly the `{ type, value }`
+ * numbers its fields show (D-038: a field only points at a number the record
+ * holds), the first one primary.
+ */
+export function identifiersFor(records: readonly CatalogRecord[]): RecordIdentifiers[] {
+  return records.map((r) => {
+    const current: { type: string; value: string; primary: boolean }[] = [];
+    for (const value of Object.values(r.fields)) {
+      for (const item of Array.isArray(value) ? value : [value]) {
+        if (
+          typeof item === "object" &&
+          item !== null &&
+          !Array.isArray(item) &&
+          Object.keys(item).sort().join() === "type,value" &&
+          typeof item.type === "string" &&
+          typeof item.value === "string" &&
+          !current.some((c) => c.type === item.type && c.value === item.value)
+        ) {
+          current.push({ type: item.type, value: item.value, primary: current.length === 0 });
+        }
+      }
+    }
+    return { recordId: r.id, organizationId: r.organizationId, current, former: [] };
+  });
+}
+
 export function effectiveOf(
   records: readonly CatalogRecord[],
   id: RecordId,
   tpl: FieldTemplate = TPL,
 ): EffectiveRecord {
-  // With the identifier checker, so public-type numbers reach the view (D-022).
-  const result = effectiveRecord(id, records, () => tpl, { checkers: CHECKERS });
+  // With the identifier checker, so public-type numbers reach the view
+  // (D-022), and the records' identifiers, which hold them (D-038).
+  const result = effectiveRecord(id, records, () => tpl, {
+    checkers: CHECKERS,
+    identifiers: identifiersFor(records),
+  });
   if (!result.ok) throw new Error(JSON.stringify(result.issues));
   return result.value;
 }

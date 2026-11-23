@@ -78,6 +78,14 @@
  * (`private_identifier_type`, `identifier_types_unknown`), and
  * `effectivePublishIssues` refuses to publish the record until it is fixed.
  * The public view holds an identifier as `{ value }` only, never its type.
+ *
+ * **Numbers live in `RecordIdentifiers`** (D-038). An identifier field only
+ * points at one of its record's current identifiers. `options.identifiers`
+ * gives the identifiers of the record and its ancestors; a public identifier
+ * value its source record (the record itself, or the ancestor it is
+ * inherited from) doesn't hold as current is kept but marked `staff`
+ * (`identifier_not_held`), and without `options.identifiers` every public
+ * identifier value is (`identifiers_unknown`). Either note refuses publishing.
  */
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import { RIGHTS_FIELD_KEY, rightsPublishIssues } from "./rights.js";
@@ -88,6 +96,11 @@ import { types } from "node:util";
 import { MAX_ARRANGEMENT_DEPTH, canFileUnder } from "./arrangement.js";
 import { isRecordId, type RecordId } from "./record-id.js";
 import { mixedOrganizationsIssue, organizationIdOf, type OrganizationId } from "./organizations.js";
+import {
+  holdsCurrentIdentifier,
+  readIdentifierSets,
+  type RecordIdentifiers,
+} from "./identifiers.js";
 import {
   validateRecord,
   type ArchivalLevel,
@@ -182,6 +195,15 @@ export interface EffectiveOptions {
    * be staff only: checkers see staff data and must not publish or log it.
    */
   readonly checkers?: TemplateCheckOptions["checkers"];
+  /**
+   * The identifiers (`RecordIdentifiers`) of the record and of the ancestors
+   * it inherits from, all of its organization (D-038). A public identifier
+   * value is published only when the record it comes from holds it as a
+   * current identifier; without this option, none is. Sets for other
+   * records of the organization may be included and are ignored. A record
+   * with no set here holds no identifiers.
+   */
+  readonly identifiers?: readonly RecordIdentifiers[];
 }
 
 /**
@@ -359,7 +381,8 @@ export function effectiveRecord(
     const up = ancestry(recordId, lookupFor(records));
     const templates = templatesFor(up, templateFor);
     const checkers = ownSetting(options, "checkers");
-    return { ok: true, value: compose(up, templates, checkers) };
+    const identifiers = identifierSets(ownSetting(options, "identifiers"), up);
+    return { ok: true, value: compose(up, templates, checkers, identifiers) };
   } catch (error) {
     return failure(error);
   }
@@ -589,10 +612,48 @@ interface Candidate {
   readonly inTemplate: boolean;
 }
 
+/**
+ * The caller's identifier sets, read once (D-038), or undefined when none
+ * were given. Sets of another organization than the records', or a set
+ * given twice for one record, fail the whole result: a set that might not
+ * be the record's can't vouch for its numbers.
+ */
+function identifierSets(
+  given: unknown,
+  up: readonly CatalogRecord[],
+): ReadonlyMap<RecordId, RecordIdentifiers> | undefined {
+  if (given === undefined) return undefined;
+  const read = readIdentifierSets(given);
+  if (!read.ok) {
+    const problem = read.issues[0];
+    if (problem?.code === "mixed_organizations") {
+      const mixed = mixedOrganizationsIssue(["identifiers"], "These records and identifiers");
+      fail(mixed.path, mixed.code, mixed.message);
+    }
+    if (problem?.code === "duplicate_identifiers") {
+      fail(["identifiers"], problem.code, problem.message);
+    }
+    fail(
+      ["identifiers"],
+      "invalid_identifiers",
+      "The identifiers option must be a list of records' identifiers. Check each with validateRecordIdentifiers.",
+    );
+  }
+  const owner = up[0]?.organizationId;
+  for (const set of read.value.values()) {
+    if (set.organizationId !== owner) {
+      const mixed = mixedOrganizationsIssue(["identifiers"], "These records and identifiers");
+      fail(mixed.path, mixed.code, mixed.message);
+    }
+  }
+  return read.value;
+}
+
 function compose(
   up: readonly CatalogRecord[],
   templates: readonly CheckedTemplate[],
   checkers: unknown,
+  identifiers: ReadonlyMap<RecordId, RecordIdentifiers> | undefined,
 ): EffectiveRecord {
   const target = up[0];
   const own = templates[0];
@@ -648,7 +709,8 @@ function compose(
   }
 
   const fitting = dropUnfit(target, own.template, candidates, up, notes, checkers);
-  const kept = withholdIdentifiers(fitting, own.byKey, notes, checkers, target.organizationId);
+  const typed = withholdIdentifiers(fitting, own.byKey, notes, checkers, target.organizationId);
+  const kept = withholdUnheld(typed, own.byKey, notes, up, identifiers);
 
   const chainUp = up.map(step);
   const entries = kept.map((c) => {
@@ -733,6 +795,8 @@ const WITHHELD_IDENTIFIER: ReadonlySet<string> = new Set([
   "private_identifier_type",
   "identifier_types_unknown",
   "wrong_organization_checker",
+  "identifiers_unknown",
+  "identifier_not_held",
 ]);
 
 /**
@@ -788,6 +852,49 @@ function withholdIdentifiers(
         ["fields", c.key],
         "private_identifier_type",
         `${shown(c.label)} holds a number of a staff only identifier type, so it is kept staff only and the record can't be published. Mark the type public, or move the number to a staff field.`,
+      ),
+    );
+    return { ...c, visibility: "staff" };
+  });
+}
+
+/**
+ * Mark `staff`, with a note, every public identifier value that isn't one of
+ * the current identifiers of the record it comes from: the record itself for
+ * its own value, the ancestor for an inherited one (D-038). With no
+ * identifier sets given, every public identifier value. The value stays in
+ * the effective record for staff.
+ */
+function withholdUnheld(
+  candidates: readonly Candidate[],
+  byKey: ReadonlyMap<string, FieldDefinition>,
+  notes: Issue[],
+  up: readonly CatalogRecord[],
+  identifiers: ReadonlyMap<RecordId, RecordIdentifiers> | undefined,
+): readonly Candidate[] {
+  return candidates.map((c) => {
+    if (c.visibility !== "public" || !c.inTemplate || byKey.get(c.key)?.kind !== "identifier") {
+      return c;
+    }
+    if (identifiers === undefined) {
+      notes.push(
+        issue(
+          ["fields", c.key],
+          "identifiers_unknown",
+          `${shown(c.label)} is kept staff only: without the identifiers option there is no telling whether the record holds this number.`,
+        ),
+      );
+      return { ...c, visibility: "staff" };
+    }
+    const source = up[c.from];
+    const set = source === undefined ? undefined : identifiers.get(source.id);
+    const items: readonly FieldValue[] = Array.isArray(c.value) ? c.value : [c.value];
+    if (items.length > 0 && items.every((item) => holdsCurrentIdentifier(set, item))) return c;
+    notes.push(
+      issue(
+        ["fields", c.key],
+        "identifier_not_held",
+        `${shown(c.label)} is kept staff only: it shows a number that isn't one of ${c.from === 0 ? "this record's" : "its source record's"} current identifiers, so the record can't be published. Add the number to the record's identifiers, or choose one it has.`,
       ),
     );
     return { ...c, visibility: "staff" };

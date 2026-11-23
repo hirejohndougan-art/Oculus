@@ -833,6 +833,69 @@ export function primaryIdentifier(identifiers: RecordIdentifiers): Identifier | 
 }
 
 // ---------------------------------------------------------------------------
+// One home for numbers (D-038)
+
+/**
+ * Many records' identifiers, read once into plain, frozen copies (Proxies,
+ * getters and malformed sets refused), all of one organization
+ * (`mixed_organizations` otherwise, also for a set that names none), keyed
+ * by record ID. A record ID listed twice is refused
+ * (`duplicate_identifiers`): which of the two sets is the record's would be
+ * a guess. Internal: not exported from the package. Never throws.
+ */
+export function readIdentifierSets(
+  all: unknown,
+): Validated<ReadonlyMap<RecordId, RecordIdentifiers>> {
+  const snap = snapshot(all, []);
+  if (!snap.ok) return snap;
+  const byRecord = new Map<RecordId, RecordIdentifiers>();
+  for (const [index, set] of snap.value.sets.entries()) {
+    if (byRecord.has(set.recordId)) {
+      return {
+        ok: false,
+        issues: [
+          issue(
+            [index, "recordId"],
+            "duplicate_identifiers",
+            "Two sets of identifiers name the same record.",
+          ),
+        ],
+      };
+    }
+    byRecord.set(set.recordId, set);
+  }
+  return { ok: true, value: byRecord };
+}
+
+/**
+ * True when `item` is `{ type, value }` (own data properties, both text)
+ * naming exactly one of the current identifiers in `set`: the same type key
+ * and the same value, character for character. A template `identifier`
+ * field only points at one of its record's current identifiers (D-038);
+ * anything else, a former number, a lookalike spelling or another type's
+ * number, is not held. Internal. Never throws.
+ */
+export function holdsCurrentIdentifier(
+  set: RecordIdentifiers | undefined,
+  item: unknown,
+): boolean {
+  try {
+    if (set === undefined || types.isProxy(item) || !isPlainObject(item)) return false;
+    const type = Object.getOwnPropertyDescriptor(item, "type");
+    const value = Object.getOwnPropertyDescriptor(item, "value");
+    if (type === undefined || value === undefined || !("value" in type) || !("value" in value)) {
+      return false;
+    }
+    const t: unknown = type.value;
+    const v: unknown = value.value;
+    if (typeof t !== "string" || typeof v !== "string") return false;
+    return set.current.some((c) => c.type === t && c.value === v);
+  } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Uniqueness
 
 interface Holder {
