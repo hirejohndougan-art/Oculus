@@ -324,6 +324,28 @@ describe("the deed check (mockup Deeds)", () => {
     expect(
       codes(effectivePublishIssues(effectiveOf(lateScan, [...RECORDS, lateScan]), { accessions })),
     ).toEqual(["deed_not_signed"]);
+    // A scan of a unit filed after the register was made: its ancestry isn't
+    // in the scan's chain, so a register that doesn't know the unit refuses.
+    const lateUnit = record(
+      "archival_unit",
+      "Late unit",
+      {},
+      { level: "item", parentId: series.id },
+    );
+    const scanOfLate = record(
+      "digital_asset",
+      "Scan of late unit",
+      { rights: { uri: CNE } },
+      { represents: lateUnit.id },
+    );
+    const now = [...RECORDS, lateUnit, scanOfLate];
+    expect(codes(effectivePublishIssues(effectiveOf(scanOfLate, now), { accessions }))).toEqual([
+      "accessions_out_of_date",
+    ]);
+    const fresh = registerOf([accession({ method: "transfer" })], { records: now });
+    expect(
+      codes(effectivePublishIssues(effectiveOf(scanOfLate, now), { accessions: fresh })),
+    ).toEqual(["deed_not_signed"]);
   });
 
   it("needs no register for agents, places and events, which aren't accessioned", () => {

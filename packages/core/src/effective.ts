@@ -1055,7 +1055,10 @@ export function publicView(effective: EffectiveRecord): PublicRecord | undefined
  * or another organization's register (`mixed_organizations`) too. A record
  * the register holds back, or whose ancestor or represented record it holds
  * back, is refused (`deed_not_signed`); the message names no donor,
- * accession or number. Returns an empty list when the record can be
+ * accession or number. A digital asset representing a record the register
+ * wasn't made with is refused too (`accessions_out_of_date`): that record's
+ * ancestors aren't in the asset's chain, so only a register made from the
+ * records as they are now can say whether a deed holds it back. Returns an empty list when the record can be
  * published. Never throws.
  */
 export function effectivePublishIssues(
@@ -1145,6 +1148,14 @@ function deedIssues(effective: EffectiveRecord, options: unknown): readonly Issu
   if (!needed) return Object.freeze([]);
   const ids: RecordId[] = effective.chain.map((step) => step.id);
   if (record.kind === "digital_asset" && record.represents !== undefined) {
+    // The represented record's ancestors aren't in this record's chain, so
+    // only a register that knows it can say whether a deed holds it back.
+    if (!holds.known.has(record.represents)) {
+      return refuse(
+        "accessions_out_of_date",
+        "This record shows a record the accession register doesn't know. Make the register again from the organization's records as they are now.",
+      );
+    }
     ids.push(record.represents);
   }
   if (ids.some((id) => holds.held.has(id))) {

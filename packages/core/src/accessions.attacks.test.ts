@@ -331,7 +331,7 @@ describe("donor details never leak", () => {
 
   it("not through what the publish check can see of a register", () => {
     const holds = deedHoldsOf(register);
-    expect(Object.keys(holds ?? {}).sort()).toEqual(["held", "organizationId"]);
+    expect(Object.keys(holds ?? {}).sort()).toEqual(["held", "known", "organizationId"]);
     expect(leaks(JSON.stringify([...(holds?.held ?? [])]))).toEqual([]);
     expect(Object.isFrozen(holds)).toBe(true);
   });

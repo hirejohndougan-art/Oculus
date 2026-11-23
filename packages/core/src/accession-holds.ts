@@ -20,6 +20,8 @@ export interface DeedHolds {
    * asset representing one, as the records were when the register was made.
    */
   readonly held: ReadonlySet<RecordId>;
+  /** Every record the register was made with, held back or not. */
+  readonly known: ReadonlySet<RecordId>;
 }
 
 const HOLDS = new WeakMap<object, DeedHolds>();

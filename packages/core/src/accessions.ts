@@ -43,7 +43,11 @@
  * (`accessions_unknown`), as is another organization's register
  * (`mixed_organizations`) or anything not made by `indexAccessions`
  * (`invalid_accessions`). Held back: `deed_not_signed`, whose message names
- * no donor, number or accession.
+ * no donor, number or accession. The holds are worked out from the records
+ * the register was made with; a unit filed below a held one later is still
+ * caught through its own ancestry, but a digital asset representing a
+ * record the register doesn't know is refused (`accessions_out_of_date`).
+ * Make the register at publish time.
  *
  * **One organization** (D-019, D-030). `indexAccessions` takes the
  * organization the register is for and refuses any accession, contact,
@@ -625,7 +629,11 @@ export function indexAccessions(
       contacts: contactsByAgent,
       types: typeByKey,
     });
-    markDeedHolds(register, { organizationId, held: new Set(holds.keys()) });
+    markDeedHolds(register, {
+      organizationId,
+      held: new Set(holds.keys()),
+      known: new Set(usable.map((r) => r.id)),
+    });
     return { ok: true, value: register };
   } catch {
     return refused([], "unreadable", "The accessions could not be read as plain data.");
