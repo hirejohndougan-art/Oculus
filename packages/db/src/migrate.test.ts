@@ -24,8 +24,13 @@ import { freshDatabase, type TestDatabase } from "./test-database.fixtures.js";
 
 /** Every table the real migrations create, in name order. */
 const ALL_TABLES = [
+  "former_identifiers",
+  "identifier_counters",
+  "identifier_holdings",
+  "identifier_types",
   "oculus_migrations",
   "organizations",
+  "record_identifiers",
   "record_type_versions",
   "record_types",
   "records",
