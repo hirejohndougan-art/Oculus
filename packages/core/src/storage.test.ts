@@ -462,13 +462,94 @@ describe("whereabouts", () => {
     expect(ok(overdueReturns(next, "2026-11-23")).map((w) => w.recordId)).toContain(deed);
     const other = ok(addMove(log, move(deed, case2.id, "2026-11-22", "other")));
     expect(ok(whereabouts(other, deed))?.expectedReturnOn).toBe("2026-10-31");
+    // A later dated move that isn't an extension keeps the earlier date (review fix).
     const later = ok(
       addMove(
         log,
         move(deed, case2.id, "2026-11-22", "exhibition", { expectedReturnOn: "2027-01-05" }),
       ),
     );
-    expect(ok(whereabouts(later, deed))?.expectedReturnOn).toBe("2027-01-05");
+    expect(ok(whereabouts(later, deed))?.expectedReturnOn).toBe("2026-10-31");
+  });
+
+  it("only an extension moves an outstanding due date; any other dated move keeps the earliest (review fix)", () => {
+    const lent = newRecordId();
+    const borrower = {
+      id: newLocationId(),
+      organizationId: ORG,
+      kind: "external",
+      name: "Borrowing museum",
+      agentId: newRecordId(),
+    } as StorageLocation;
+    const idx2 = index([...ALL, borrower]);
+    const out = [
+      move(lent, box1.id, "2026-01-05", "placement"),
+      move(lent, borrower.id, "2026-09-01", "loan_out", { expectedReturnOn: "2026-11-15" }),
+    ];
+    const l2 = ok(indexMoves(idx2, out));
+    const late = (l: MoveLog): string[] =>
+      ok(overdueReturns(l, "2026-11-20")).map((w) => w.recordId);
+    expect(late(l2)).toEqual([lent]);
+    // A research move to an in-house shelf, conservation at another vendor, or
+    // a loan_out to another place, each dated 2099, can't push it off the list.
+    for (const hiding of [
+      move(lent, shelfB.id, "2026-11-01", "research", { expectedReturnOn: "2099-12-31" }),
+      move(lent, conservator.id, "2026-11-01", "conservation", { expectedReturnOn: "2099-12-31" }),
+      move(lent, conservator.id, "2026-11-01", "loan_out", { expectedReturnOn: "2099-12-31" }),
+      move(lent, borrower.id, "2026-11-01", "exhibition", { expectedReturnOn: "2099-12-31" }),
+    ]) {
+      const next = ok(addMove(l2, hiding));
+      expect(ok(whereabouts(next, lent))?.expectedReturnOn).toBe("2026-11-15");
+      expect(late(next)).toEqual([lent]);
+      // An earlier date from such a move counts: the earliest stays.
+      const sooner = ok(
+        addMove(l2, { ...hiding, id: newMoveId(), expectedReturnOn: "2026-11-05" }),
+      );
+      expect(ok(whereabouts(sooner, lent))?.expectedReturnOn).toBe("2026-11-05");
+    }
+    // The normal extension: another loan_out to the same borrower with a new date.
+    const extended = ok(
+      addMove(
+        l2,
+        move(lent, borrower.id, "2026-11-10", "loan_out", { expectedReturnOn: "2027-01-31" }),
+      ),
+    );
+    expect(ok(whereabouts(extended, lent))?.expectedReturnOn).toBe("2027-01-31");
+    expect(late(extended)).toEqual([]);
+    // An extension may also shorten it, and a return still ends it.
+    const shortened = ok(
+      addMove(
+        extended,
+        move(lent, borrower.id, "2026-11-12", "loan_out", { expectedReturnOn: "2026-11-18" }),
+      ),
+    );
+    expect(late(shortened)).toEqual([lent]);
+    const back = ok(addMove(shortened, move(lent, box1.id, "2026-11-19", "return")));
+    expect(late(back)).toEqual([]);
+    // Once back, a new trip sets its own date.
+    const again = ok(
+      addMove(
+        back,
+        move(lent, shelfB.id, "2026-11-19", "research", { expectedReturnOn: "2099-12-31" }),
+      ),
+    );
+    expect(ok(whereabouts(again, lent))?.expectedReturnOn).toBe("2099-12-31");
+  });
+
+  it("ordinary history: placed, digitized with a date, returned, rehoused", () => {
+    const r = newRecordId();
+    const l2 = ok(
+      indexMoves(idx, [
+        move(r, box1.id, "2026-01-05", "placement"),
+        move(r, conservator.id, "2026-03-01", "digitization", { expectedReturnOn: "2026-04-01" }),
+        move(r, box1.id, "2026-03-20", "return"),
+        move(r, shelfB.id, "2026-05-01", "rehousing"),
+      ]),
+    );
+    const w = ok(whereabouts(l2, r));
+    expect(w?.away).toBe(false);
+    expect(w?.expectedReturnOn).toBeNull();
+    expect(w?.normal?.id).toBe(shelfB.id);
   });
 
   it("a correction or new home while out doesn't clear the due date; a return does (review fix)", () => {

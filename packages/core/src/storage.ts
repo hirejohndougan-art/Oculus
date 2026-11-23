@@ -32,9 +32,11 @@
  *   record is not away, and only a placement (the record borrowed again) may
  *   follow it, so neither a departure nor one back-dated before later moves
  *   can hide a loan out or other temporary move that is still outstanding.
- *   An expected return date stays outstanding until a `return` (or a later
- *   temporary move with its own date): a correction, placement or rehousing
- *   while it is out keeps the record away and on the overdue list.
+ *   An expected return date stays outstanding until a `return`: a
+ *   correction, placement or rehousing while it is out keeps the record away
+ *   and on the overdue list. While it is outstanding, only an extension (a
+ *   temporary move with the same reason to the same location) can move the
+ *   date; any other dated move keeps the earlier date.
  *
  * Every location, move and set of levels carries a required `organizationId`
  * and any set mixing organizations is refused (D-030). Like `indexTemplates`
@@ -221,11 +223,12 @@ export interface Whereabouts {
    */
   readonly away: boolean;
   /**
-   * When it is due back, if it is away: the latest expected return date
-   * given since its last `return`. Only a return clears it (or a later
-   * temporary move replaces it with its own date), so a later correction,
+   * When it is due back, if it is away: the expected return date given since
+   * its last `return`. Only a return clears it, so a later correction,
    * placement, rehousing or dateless move keeps it, and a record out on loan
-   * can't leave the overdue list without coming back.
+   * can't leave the overdue list without coming back. A later dated move
+   * replaces it only as an extension (the same reason, to the same location
+   * as the move that gave it); any other dated move keeps the earlier date.
    */
   readonly expectedReturnOn: string | null;
   /** The latest move. */
@@ -1093,28 +1096,43 @@ interface HistoryState {
   /** The latest placement's or rehousing's location, cleared by a departure. */
   normal: LocationId | undefined;
   /**
-   * The outstanding due date: the latest `expectedReturnOn` given since the
-   * last `return` (or departure). Only a `return` ends it, or a later
-   * temporary move with a date of its own replaces it; a correction, a
+   * The outstanding due date, given by a temporary move since the last
+   * `return` (or departure). Only a `return` ends it; a correction, a
    * placement, a rehousing or a dateless move never clears it, so a record
    * out on a loan can't drop off the overdue list by being "found" at home
    * or given a new home on paper (review fix). Bring it back with a return.
+   * While it is outstanding, a later dated move replaces it only as an
+   * extension (the same reason, to the same location as `dueFrom`); any
+   * other dated move keeps the earlier of the two dates, so a research trip
+   * dated 2099 can't push a loan out off the overdue list (review fix).
    */
   due: string | null;
+  /** The move that gave `due`. */
+  dueFrom: StorageMove | undefined;
   /** True after a departure until the next placement: no other move may follow. */
   departed: boolean;
   last: StorageMove | undefined;
 }
 
 function startState(): HistoryState {
-  return { normal: undefined, due: null, departed: false, last: undefined };
+  return { normal: undefined, due: null, dueFrom: undefined, departed: false, last: undefined };
 }
 
 function step(state: HistoryState, move: StorageMove): void {
   if (NORMAL_LOCATION_REASONS.includes(move.reason)) state.normal = move.locationId;
   else if (move.reason === "departure") state.normal = undefined;
-  if (move.reason === "return" || move.reason === "departure") state.due = null;
-  else if (move.expectedReturnOn !== undefined) state.due = move.expectedReturnOn;
+  if (move.reason === "return" || move.reason === "departure") {
+    state.due = null;
+    state.dueFrom = undefined;
+  } else if (move.expectedReturnOn !== undefined) {
+    const from = state.dueFrom;
+    const extension =
+      from === undefined || (from.reason === move.reason && from.locationId === move.locationId);
+    if (state.due === null || extension || move.expectedReturnOn < state.due) {
+      state.due = move.expectedReturnOn;
+      state.dueFrom = move;
+    }
+  }
   if (move.reason === "departure") state.departed = true;
   else if (move.reason === "placement") state.departed = false;
   state.last = move;
