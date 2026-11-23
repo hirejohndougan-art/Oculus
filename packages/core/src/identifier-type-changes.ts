@@ -510,6 +510,19 @@ function readUse(input: unknown, type: IdentifierType, listed = true): Validated
       ),
     };
   }
+  // The list's organization is checked before any key is looked up in it, so
+  // another organization's list can't reveal which keys it holds (S-009).
+  if (oneOrganization([type, ...typesRead.value]) === "mixed") {
+    return {
+      ok: false,
+      issues: [
+        mixedOrganizationsIssue(
+          ["existing", "identifierTypes"],
+          "The type and existing.identifierTypes",
+        ),
+      ],
+    };
+  }
   const found = typesRead.value.find((t) => t.key === type.key);
   if (!listed && found !== undefined) {
     return fail(

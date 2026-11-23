@@ -234,6 +234,42 @@ describe("records that can't be read refuse the whole check", () => {
     expect(identifierTypeDeletion({ ...DONOR, organizationId: undefined }).ok).toBe(false);
   });
 
+  it("another organization's type list can't reveal which keys it holds (S-009)", () => {
+    const OTHER = newOrganizationId();
+    const theirs = (key: string): IdentifierType => ({ ...DONOR, organizationId: OTHER, key });
+    const probe = (key: string) => ({ ...DONOR, organizationId: OTHER, key });
+    const listOf = (...keys: string[]) => ({
+      identifierTypes: keys.map(theirs),
+      identifiers: [],
+      records: [],
+    });
+    // Creating: a key the other list holds and one it doesn't give the same answer.
+    const held = identifierTypeCreation({ ...DONOR, key: "secret_key" }, listOf("secret_key"));
+    const free = identifierTypeCreation({ ...DONOR, key: "secret_key" }, listOf("other_key"));
+    expect(codes(held)).toEqual(["mixed_organizations"]);
+    expect(held).toEqual(free);
+    expect(JSON.stringify(held)).not.toContain("secret_key");
+    // Editing and deleting: a type matching the other list's entry exactly, or not.
+    for (const fn of [
+      (t: IdentifierType, e: unknown) => identifierTypeDeletion(t, e),
+      (t: IdentifierType, e: unknown) => identifierTypeChanges(t, t, e),
+    ]) {
+      const match = fn(DONOR, listOf("donor_file"));
+      const miss = fn(DONOR, listOf("unrelated"));
+      expect(codes(match)).toEqual(["mixed_organizations"]);
+      expect(match).toEqual(miss);
+    }
+    // A list mixing ours and theirs is refused whatever key is looked up.
+    const mixed = { identifierTypes: [DONOR, theirs("secret_key")], identifiers: [], records: [] };
+    expect(codes(identifierTypeCreation({ ...DONOR, key: "secret_key" }, mixed))).toEqual([
+      "mixed_organizations",
+    ]);
+    // Their own list still works for them.
+    expect(codes(identifierTypeCreation(probe("secret_key"), listOf("secret_key")))).toEqual([
+      "key_taken",
+    ]);
+  });
+
   it("refuses an ID used twice, so one record can't shadow another", () => {
     expect(codes(identifierTypeDeletion(DONOR, use([...SETS, set(A, [])])))).toEqual([
       "duplicate_id",
