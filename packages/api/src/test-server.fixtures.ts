@@ -2,11 +2,16 @@
 import { connect } from "node:net";
 import type { AddressInfo } from "node:net";
 import type { FastifyInstance } from "fastify";
-import { readOculusCookie, setOculusCookie, OCULUS_COOKIES } from "./cookies.js";
+import { readOculusCookie, OCULUS_COOKIES } from "./cookies.js";
+import { ORIGINS_ENV } from "./origin.js";
+import type { OculusRoute } from "./routes.js";
 import { buildServer, type ServerOptions } from "./server.js";
 
 /** Headers that pass the Origin check under `inject` (its Host is localhost:80). */
 export const SAME_ORIGIN = { origin: "http://localhost" } as const;
+
+/** The environment test servers start with. */
+export const TEST_ENV = { [ORIGINS_ENV]: "http://localhost" } as const;
 
 export interface HandlerCalls {
   count: number;
@@ -15,63 +20,68 @@ export interface HandlerCalls {
 /** A server with echo routes; `calls.count` counts handler runs. */
 export async function testServer(
   options: Omit<ServerOptions, "routes"> = {},
-  extraRoutes?: (app: FastifyInstance) => void,
+  extraRoutes: readonly OculusRoute[] = [],
 ): Promise<{ app: FastifyInstance; calls: HandlerCalls }> {
   const calls: HandlerCalls = { count: 0 };
-  const app = await buildServer({
-    env: {},
-    ...options,
-    routes: (r) => {
-      r.post("/echo", (request) => {
-        calls.count++;
-        return { body: request.body ?? null };
-      });
-      r.post("/accept", () => {
+  const echo = (request: { body: unknown }) => {
+    calls.count++;
+    return { body: request.body ?? null };
+  };
+  const routes: OculusRoute[] = [
+    { method: "POST", path: "/echo", handler: echo },
+    {
+      method: "POST",
+      path: "/accept",
+      handler: () => {
         calls.count++;
         return { ok: true };
-      });
-      r.post("/form", { config: { oculus: { form: true } } }, (request) => {
-        calls.count++;
-        return { body: request.body ?? null };
-      });
-      r.post("/sign-in", { config: { oculus: { form: true, credentials: true } } }, (request) => {
-        calls.count++;
-        return { body: request.body ?? null };
-      });
-      r.post(
-        "/sign-in-greedy",
-        { bodyLimit: 10 * 1024 * 1024, config: { oculus: { credentials: true } } },
-        (request) => {
-          calls.count++;
-          return { body: request.body ?? null };
-        },
-      );
-      r.get("/items/:id", (request) => {
+      },
+    },
+    { method: "POST", path: "/form", form: true, handler: echo },
+    { method: "POST", path: "/sign-in", form: true, credentials: true, handler: echo },
+    { method: "POST", path: "/sign-in-json", credentials: true, handler: echo },
+    {
+      method: "GET",
+      path: "/items/:id",
+      handler: (request) => {
         calls.count++;
         return { params: request.params };
-      });
-      r.get("/files/*", (request) => {
+      },
+    },
+    {
+      method: "GET",
+      path: "/files/*",
+      handler: (request) => {
         calls.count++;
         return { params: request.params };
-      });
-      r.get("/whoami", (request) => {
+      },
+    },
+    {
+      method: "GET",
+      path: "/whoami",
+      handler: (request) => {
         calls.count++;
         return {
           ip: request.ip,
           host: request.host,
           protocol: request.protocol,
           session: readOculusCookie(request, OCULUS_COOKIES.session) ?? null,
-          cookies: (request as unknown as { cookies: unknown }).cookies,
+          hasCookies: "cookies" in request,
         };
-      });
-      r.post("/session", (_request, reply) => {
-        calls.count++;
-        setOculusCookie(reply, OCULUS_COOKIES.session, "abcDEF123_-", { maxAgeSeconds: 3600 });
-        return { ok: true };
-      });
-      extraRoutes?.(r);
+      },
     },
-  });
+    {
+      method: "POST",
+      path: "/session",
+      handler: (_request, reply) => {
+        calls.count++;
+        reply.setCookie(OCULUS_COOKIES.session, "abcDEF123_-", { maxAgeSeconds: 3600 });
+        return { ok: true };
+      },
+    },
+    ...extraRoutes,
+  ];
+  const app = await buildServer({ ...options, env: { ...TEST_ENV, ...options.env }, routes });
   return { app, calls };
 }
 

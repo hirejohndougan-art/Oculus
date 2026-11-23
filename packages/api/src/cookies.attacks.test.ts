@@ -2,13 +2,16 @@
 // duplicates refused, one __Host- writer.
 import { afterEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
+import type { FastifyReply } from "fastify";
 import {
   OCULUS_COOKIES,
   cookieHeaderProblem,
+  replyCookieProblem,
   setCookieProblem,
   setOculusCookie,
   type OculusCookieName,
 } from "./cookies.js";
+import type { OculusReply, OculusRoute } from "./routes.js";
 import { SAME_ORIGIN, testServer } from "./test-server.fixtures.js";
 
 let app: FastifyInstance | undefined;
@@ -34,10 +37,10 @@ describe("reading cookies", () => {
   it("reads the Oculus session cookie and nothing else", async () => {
     const { res } = await whoami(`theme=dark; ${SESSION}=tok_EN-123; tracker=abc`);
     expect(res.statusCode).toBe(200);
-    const body = res.json<{ session: string | null; cookies: unknown }>();
+    const body = res.json<{ session: string | null; hasCookies: boolean }>();
     expect(body.session).toBe("tok_EN-123");
-    // @fastify/cookie's parsing hook is off: request.cookies is never filled.
-    expect(body.cookies).toBeNull();
+    // No cookie plugin: there is no request.cookies holding the other cookies.
+    expect(body.hasCookies).toBe(false);
   });
 
   it.each([
@@ -99,77 +102,150 @@ describe("writing cookies", () => {
     expect(setCookieProblem(header)).toBeUndefined();
   });
 
-  it("refuses names and values outside the rules", async () => {
-    const built = await testServer({}, (r) => {
-      r.post("/bad-name", (_q, reply) => {
-        setOculusCookie(reply, "tracker" as OculusCookieName, "x");
-        return {};
-      });
-      r.post("/bad-value", (_q, reply) => {
-        setOculusCookie(reply, SESSION, "x; Domain=evil.example");
-        return {};
-      });
+  it("refuses names, values and headers outside the rules", async () => {
+    const route = (path: string, act: (reply: OculusReply) => void): OculusRoute => ({
+      method: "GET",
+      path,
+      handler: (_q, reply) => {
+        act(reply);
+        return { leaked: "no" };
+      },
     });
+    const built = await testServer({}, [
+      route("/bad-name", (r) => r.setCookie("tracker" as OculusCookieName, "x")),
+      route("/bad-value", (r) => r.setCookie(SESSION, "x; Domain=evil.example")),
+      route("/raw-header", (r) => r.header("Set-Cookie", `${SESSION}=x; Path=/`)),
+      route("/raw-header-case", (r) => r.header("sEt-CoOkIe", "tracker=1")),
+      route("/hijack", (r) => {
+        (r as unknown as { hijack: () => void }).hijack();
+      }),
+      route("/raw", (r) => {
+        (r as unknown as { raw: { setHeader: (n: string, v: string) => void } }).raw.setHeader(
+          "set-cookie",
+          "tracker=1",
+        );
+      }),
+      route("/plugin-writer", (r) => {
+        (r as unknown as { setCookie: (n: string, v: string, o: object) => void }).setCookie(
+          "tracker",
+          "1",
+          {},
+        );
+      }),
+    ]);
     app = built.app;
-    for (const url of ["/bad-name", "/bad-value"]) {
-      const res = await app.inject({ method: "POST", url, headers: SAME_ORIGIN });
-      expect(res.statusCode).toBe(500);
-      expect(res.json()).toEqual({ error: "internal_error" });
-      expect(res.headers["set-cookie"]).toBeUndefined();
-    }
-  });
-
-  it("strips any cookie written around the helper and fails the reply", async () => {
-    const built = await testServer({}, (r) => {
-      r.get("/raw-header", (_q, reply) => {
-        void reply.header("set-cookie", `${SESSION}=x; Path=/`);
-        return { leaked: "no" };
-      });
-      r.get("/plugin-writer", (_q, reply) => {
-        void reply.setCookie("tracker", "1", { path: "/" });
-        return { leaked: "no" };
-      });
-      r.get("/domain", (_q, reply) => {
-        void reply.setCookie(SESSION, "x", {
-          path: "/",
-          secure: true,
-          httpOnly: true,
-          sameSite: "lax",
-          domain: "example.org",
-        });
-        return { leaked: "no" };
-      });
-      r.get("/mixed", (_q, reply) => {
-        setOculusCookie(reply, SESSION, "good");
-        void reply.setCookie("tracker", "1");
-        return { leaked: "no" };
-      });
-    });
-    app = built.app;
-    for (const url of ["/raw-header", "/plugin-writer", "/domain", "/mixed"]) {
+    for (const url of [
+      "/bad-name",
+      "/bad-value",
+      "/raw-header",
+      "/raw-header-case",
+      "/hijack",
+      "/raw",
+      "/plugin-writer",
+    ]) {
       const res = await app.inject({ method: "GET", url });
       expect(res.statusCode, url).toBe(500);
+      expect(res.json(), url).toEqual({ error: "internal_error" });
       expect(res.headers["set-cookie"], url).toBeUndefined();
-      expect(res.body).not.toContain("leaked");
     }
   });
 
-  it("checks each Set-Cookie value", () => {
+  it("can't change the server from a handler after start", async () => {
+    const built = await testServer({}, [
+      {
+        method: "GET",
+        path: "/tamper",
+        handler: (request) => {
+          request.server.addContentTypeParser("text/plain", (_r, _b, done) => {
+            done(null, "x");
+          });
+          return {};
+        },
+      },
+      {
+        method: "GET",
+        path: "/tamper-errors",
+        handler: (request) => {
+          request.server.setErrorHandler(() => "leak");
+          return {};
+        },
+      },
+    ]);
+    app = built.app;
+    for (const url of ["/tamper", "/tamper-errors"]) {
+      const res = await app.inject({ method: "GET", url });
+      // Fastify refuses the change; the reply is a plain error, never "leak".
+      expect(res.statusCode, url).toBeGreaterThanOrEqual(400);
+      expect(Object.keys(res.json<object>())).toEqual(["error"]);
+    }
+    const res = await app.inject({
+      method: "POST",
+      url: "/echo",
+      headers: { ...SAME_ORIGIN, "content-type": "text/plain" },
+      payload: "x",
+    });
+    expect(res.statusCode).toBe(415);
+    expect("parseCookie" in app).toBe(false);
+  });
+
+  it("refuses at start a route that carries options beyond the narrow API", async () => {
+    for (const extra of [
+      { errorHandler: () => "leak" },
+      { handlerTimeout: 600_000 },
+      { onSend: () => undefined },
+      { schema: {} },
+    ]) {
+      const route = {
+        method: "GET",
+        path: "/x",
+        handler: () => ({}),
+        ...extra,
+      } as unknown as OculusRoute;
+      await expect(testServer({}, [route])).rejects.toThrow(/route option not allowed/);
+    }
+  });
+
+  it("sends only cookies the writer issued for that reply", () => {
+    const reply = { header: () => reply } as unknown as FastifyReply;
+    const good = `${SESSION}=a; Path=/; HttpOnly; Secure; SameSite=Lax`;
+    expect(replyCookieProblem(reply, good)).toBe("not written by the cookie writer");
+    setOculusCookie(reply, SESSION, "a");
+    expect(replyCookieProblem(reply, good)).toBeUndefined();
+    expect(replyCookieProblem(reply, [good, "tracker=1"])).toBe("not written by the cookie writer");
+    expect(replyCookieProblem(reply, undefined)).toBeUndefined();
+  });
+
+  it("checks each Set-Cookie value the way browsers read it", () => {
     const good = `${SESSION}=a; Path=/; HttpOnly; Secure; SameSite=Strict`;
     expect(setCookieProblem(good)).toBeUndefined();
-    expect(setCookieProblem(`${SESSION}=a; Path=/; HttpOnly; SameSite=Lax`)).toBe("missing Secure");
-    expect(setCookieProblem(`${SESSION}=a; Path=/; Secure; SameSite=Lax`)).toBe("missing HttpOnly");
-    expect(setCookieProblem(`${SESSION}=a; Path=/admin; HttpOnly; Secure; SameSite=Lax`)).toBe(
-      "missing Path=/",
-    );
-    expect(setCookieProblem(`${SESSION}=a; Path=/; HttpOnly; Secure; SameSite=None`)).toBe(
-      "missing SameSite",
-    );
-    expect(setCookieProblem(`${SESSION}=a; Path=/; Path=/x; HttpOnly; Secure; SameSite=Lax`)).toBe(
-      "second Path",
-    );
-    expect(setCookieProblem(`oculus_session=a; Path=/; HttpOnly; Secure; SameSite=Lax`)).toBe(
-      "not an Oculus cookie",
-    );
+    expect(
+      setCookieProblem(`${SESSION}=a;path=/;httponly;SECURE;samesite=lax;max-age=10`),
+    ).toBeUndefined();
+    expect(
+      setCookieProblem(`${SESSION}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax`),
+    ).toBeUndefined();
+    const bad = [
+      `${SESSION}=a; Path=/; HttpOnly; SameSite=Lax`,
+      `${SESSION}=a; Path=/; Secure; SameSite=Lax`,
+      `${SESSION}=a; Path=/admin; HttpOnly; Secure; SameSite=Lax`,
+      `${SESSION}=a; Path=/; HttpOnly; Secure; SameSite=None`,
+      `${SESSION}=a; Path=/; HttpOnly; Secure`,
+      `${SESSION}=a; Path=/; Path=/x; HttpOnly; Secure; SameSite=Lax`,
+      `${SESSION}=a; Path=/; HttpOnly; Secure; SameSite=Lax; SameSite=None`,
+      `${SESSION}=a; Path=/; HttpOnly; Secure; SameSite=None; SameSite=Lax`,
+      `${SESSION}=a; Path=/; Path=/; HttpOnly; Secure; SameSite=Lax`,
+      `${SESSION}=a; Path=/; HttpOnly; Secure; Secure; SameSite=Lax`,
+      `${SESSION}=a; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=10; max-age=99999`,
+      `${SESSION}=a; Path=/; HttpOnly; Secure; SameSite=Lax; samesite=none`,
+      `${SESSION}=a; Path=/; HttpOnly; Secure; SameSite=Lax; Domain=example.org`,
+      `${SESSION}=a; Path=/; HttpOnly; Secure; SameSite=Lax;  DOMAIN = example.org`,
+      `${SESSION}=a; Path=/; HttpOnly; Secure; SameSite=Lax; Partitioned`,
+      `${SESSION}=a; Path=/; HttpOnly; Secure=no; SameSite=Lax`,
+      `${SESSION}=a; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=-1`,
+      `${SESSION}=a b; Path=/; HttpOnly; Secure; SameSite=Lax`,
+      `oculus_session=a; Path=/; HttpOnly; Secure; SameSite=Lax`,
+      SESSION,
+    ];
+    for (const value of bad) expect(setCookieProblem(value), value).toBeDefined();
   });
 });

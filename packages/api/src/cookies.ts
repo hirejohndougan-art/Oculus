@@ -1,22 +1,26 @@
 /**
  * Cookies: read only Oculus's own, write only through one helper (D-051, D-052).
  *
- * - `@fastify/cookie` is registered with its parsing hook off, so
- *   `request.cookies` is never filled and no other cookie is read.
- *   `readOculusCookie` reads one of `OCULUS_COOKIES` from the raw header.
+ * - No cookie plugin is registered, so `request.cookies` doesn't exist and no
+ *   other cookie is ever parsed. `readOculusCookie` reads one of
+ *   `OCULUS_COOKIES` from the raw header (D-058: `@fastify/cookie` dropped,
+ *   because its `setCookie` parses every cookie into `request.cookies` and
+ *   its parser keeps the first of two copies).
  * - A request that sends any Oculus cookie name more than once (compared
  *   without regard to case, so `__host-oculus_session` counts) is refused
  *   with 400: a second copy can be planted by a sibling site or script, and
- *   picking either one would be a guess.
+ *   picking either one would be a guess. The cost (D-058): whoever can plant
+ *   such a copy can make the browser's requests fail until it is cleared.
  * - Values are base64url text only (session tokens are random bytes); any
  *   other value reads as absent.
- * - `setOculusCookie` and `clearOculusCookie` are the only writers. Every
- *   cookie gets the `__Host-` prefix (it is part of the name), `Secure`,
- *   `HttpOnly`, `SameSite` (`Lax` unless `Strict` is asked for), `Path=/`
- *   and no `Domain` (ASVS 5.0 3.3.1–3.3.4).
- * - `setCookieProblem` checks every `Set-Cookie` header just before a reply
- *   is sent; a cookie written any other way (a plugin, a raw header) is
- *   removed and the reply becomes a 500.
+ * - `setOculusCookie` and `clearOculusCookie` (reached through the route
+ *   reply, server.ts) are the only writers; they write the header text
+ *   themselves. Every cookie gets the `__Host-` prefix (it is part of the
+ *   name), `Secure`, `HttpOnly`, `SameSite` (`Lax` unless `Strict` is asked
+ *   for), `Path=/` and no `Domain` (ASVS 5.0 3.3.1–3.3.4).
+ * - Just before a reply is sent, every `Set-Cookie` value must be one the
+ *   writer issued for that reply and must pass `setCookieProblem`; otherwise
+ *   it is removed and the reply becomes a 500.
  */
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { Refusal } from "./errors.js";
@@ -76,6 +80,16 @@ export interface CookieWriteOptions {
   readonly sameSite?: "lax" | "strict";
 }
 
+/** The Set-Cookie values the writer issued, per reply. */
+const issued = new WeakMap<FastifyReply, string[]>();
+
+function issue(reply: FastifyReply, header: string): void {
+  const list = issued.get(reply) ?? [];
+  list.push(header);
+  issued.set(reply, list);
+  void reply.header("set-cookie", [...list]);
+}
+
 /** Writes an Oculus cookie with the fixed safe attributes. */
 export function setOculusCookie(
   reply: FastifyReply,
@@ -86,43 +100,68 @@ export function setOculusCookie(
   checkName(name);
   if (!VALUE.test(value)) throw new Error("cookie values must be 1 to 512 base64url characters");
   const { maxAgeSeconds } = options;
-  if (maxAgeSeconds !== undefined && (!Number.isInteger(maxAgeSeconds) || maxAgeSeconds < 0)) {
+  if (maxAgeSeconds !== undefined && (!Number.isSafeInteger(maxAgeSeconds) || maxAgeSeconds < 0)) {
     throw new Error("maxAgeSeconds must be a whole number of seconds, 0 or more");
   }
-  reply.setCookie(name, value, {
-    path: "/",
-    secure: true,
-    httpOnly: true,
-    sameSite: options.sameSite ?? "lax",
-    ...(maxAgeSeconds === undefined ? {} : { maxAge: maxAgeSeconds }),
-  });
+  const sameSite = options.sameSite === "strict" ? "Strict" : "Lax";
+  const maxAge = maxAgeSeconds === undefined ? "" : `; Max-Age=${String(maxAgeSeconds)}`;
+  issue(reply, `${name}=${value}${maxAge}; Path=/; HttpOnly; Secure; SameSite=${sameSite}`);
 }
 
 /** Tells the browser to drop an Oculus cookie, with the same attributes. */
 export function clearOculusCookie(reply: FastifyReply, name: OculusCookieName): void {
   checkName(name);
-  reply.clearCookie(name, { path: "/", secure: true, httpOnly: true, sameSite: "lax" });
+  issue(reply, `${name}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax`);
 }
 
-/** Why one `Set-Cookie` value breaks the rules, or `undefined` if it is fine. */
+const ATTRIBUTE_NAMES = new Set(["path", "httponly", "secure", "samesite", "max-age"]);
+
+/**
+ * Why one `Set-Cookie` value breaks the rules, or `undefined` if it is fine.
+ * Attributes are read the way browsers read them (RFC 6265bis §5.6: names
+ * without case, spaces trimmed), and each may appear once. Only `Path=/`,
+ * `HttpOnly`, `Secure`, `SameSite=Lax|Strict` and `Max-Age` are allowed.
+ */
 export function setCookieProblem(setCookie: string): string | undefined {
-  const [pair = "", ...attributes] = setCookie.split(";").map((part) => part.trim());
-  const name = pair.slice(0, Math.max(pair.indexOf("="), 0));
+  const [pair = "", ...attributes] = setCookie.split(";");
+  const eq = pair.indexOf("=");
+  if (eq === -1) return "no name";
+  const name = pair.slice(0, eq).trim();
+  const value = pair.slice(eq + 1).trim();
   if (!NAMES.has(name)) return "not an Oculus cookie";
-  const lower = attributes.map((a) => a.toLowerCase());
-  if (!lower.includes("secure")) return "missing Secure";
-  if (!lower.includes("httponly")) return "missing HttpOnly";
-  if (!lower.includes("path=/")) return "missing Path=/";
-  if (!lower.some((a) => a === "samesite=lax" || a === "samesite=strict"))
-    return "missing SameSite";
-  if (lower.some((a) => a.startsWith("domain="))) return "has Domain";
-  if (lower.some((a) => a.startsWith("path=") && a !== "path=/")) return "second Path";
+  if (value !== "" && !VALUE.test(value)) return "bad value";
+  const seen = new Map<string, string>();
+  for (const attribute of attributes) {
+    const at = attribute.indexOf("=");
+    const key = (at === -1 ? attribute : attribute.slice(0, at)).trim().toLowerCase();
+    const val = at === -1 ? "" : attribute.slice(at + 1).trim();
+    if (!ATTRIBUTE_NAMES.has(key)) return `attribute not allowed: ${key}`;
+    if (seen.has(key)) return `repeated attribute: ${key}`;
+    seen.set(key, val);
+  }
+  if (!seen.has("secure")) return "missing Secure";
+  if (!seen.has("httponly")) return "missing HttpOnly";
+  if (seen.get("path") !== "/") return "missing Path=/";
+  const sameSite = seen.get("samesite")?.toLowerCase();
+  if (sameSite !== "lax" && sameSite !== "strict") return "missing SameSite";
+  if (seen.get("secure") !== "" || seen.get("httponly") !== "") return "flag with a value";
+  const maxAge = seen.get("max-age");
+  if (maxAge !== undefined && !/^\d{1,10}$/.test(maxAge)) return "bad Max-Age";
   return undefined;
 }
 
-/** Every Set-Cookie value on a reply, as a list. */
-export function setCookieValues(header: number | string | string[] | undefined): string[] {
-  if (header === undefined) return [];
-  if (Array.isArray(header)) return header;
-  return [String(header)];
+/** Why a reply's Set-Cookie values must not be sent, or `undefined`. */
+export function replyCookieProblem(
+  reply: FastifyReply,
+  header: number | string | string[] | undefined,
+): string | undefined {
+  if (header === undefined) return undefined;
+  const values = Array.isArray(header) ? header : [String(header)];
+  const mine = issued.get(reply) ?? [];
+  for (const value of values) {
+    if (!mine.includes(value)) return "not written by the cookie writer";
+    const problem = setCookieProblem(value);
+    if (problem !== undefined) return problem;
+  }
+  return undefined;
 }
