@@ -78,6 +78,7 @@ import { validateRecord, type CatalogRecord } from "./records.js";
 import type { RecordId } from "./record-id.js";
 import {
   MAX_AUTO_NUMBER,
+  MAX_IDENTIFIER_TYPES,
   validateIdentifierType,
   isIdentifierTypeKey,
   readStoredIdentifiers,
@@ -501,7 +502,32 @@ function readUse(input: unknown, type: IdentifierType, listed = true): Validated
       );
     }
   }
-  const typesRead = validateIdentifierTypes(own(input, "identifierTypes"));
+  const typesInput = own(input, "identifierTypes");
+  const mixedTypes = (): Validated<Use> => ({
+    ok: false,
+    issues: [
+      mixedOrganizationsIssue(
+        ["existing", "identifierTypes"],
+        "The type and existing.identifierTypes",
+      ),
+    ],
+  });
+  // The list's organization is checked before the list is validated, so
+  // another organization's list, valid or not, gets no message naming its
+  // keys (S-009a). Each entry and its organizationId are read as plain own
+  // data properties, as `oneOrganization` does; a list too long or not a
+  // list is left to validateIdentifierTypes, whose messages for those name
+  // nothing.
+  if (
+    !types.isProxy(typesInput) &&
+    Array.isArray(typesInput) &&
+    typesInput.length <= MAX_IDENTIFIER_TYPES
+  ) {
+    const entries: unknown[] = [];
+    for (let i = 0; i < typesInput.length; i += 1) entries.push(own(typesInput, String(i)));
+    if (oneOrganization([type, ...entries]) === "mixed") return mixedTypes();
+  }
+  const typesRead = validateIdentifierTypes(typesInput);
   if (!typesRead.ok) {
     return {
       ok: false,
@@ -510,19 +536,9 @@ function readUse(input: unknown, type: IdentifierType, listed = true): Validated
       ),
     };
   }
-  // The list's organization is checked before any key is looked up in it, so
-  // another organization's list can't reveal which keys it holds (S-009).
-  if (oneOrganization([type, ...typesRead.value]) === "mixed") {
-    return {
-      ok: false,
-      issues: [
-        mixedOrganizationsIssue(
-          ["existing", "identifierTypes"],
-          "The type and existing.identifierTypes",
-        ),
-      ],
-    };
-  }
+  // Checked again on the validated copy before any key is looked up in it,
+  // so another organization's list can't reveal which keys it holds (S-009).
+  if (oneOrganization([type, ...typesRead.value]) === "mixed") return mixedTypes();
   const found = typesRead.value.find((t) => t.key === type.key);
   if (!listed && found !== undefined) {
     return fail(

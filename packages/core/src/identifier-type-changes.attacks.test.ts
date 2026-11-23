@@ -270,6 +270,46 @@ describe("records that can't be read refuse the whole check", () => {
     ]);
   });
 
+  it("another organization's invalid type list gets no message naming its keys (S-009a)", () => {
+    const OTHER = newOrganizationId();
+    const theirs = (key: string): IdentifierType => ({ ...DONOR, organizationId: OTHER, key });
+    // Two entries sharing a key: invalid, so validated alone it names the key.
+    const twice = [theirs("secret_key"), theirs("secret_key")];
+    const lists = [twice, [DONOR, ...twice], [...twice, DONOR]];
+    for (const identifierTypes of lists) {
+      const existing = { identifierTypes, identifiers: [], records: [] };
+      for (const r of [
+        identifierTypeCreation({ ...DONOR, key: "new_type" }, existing),
+        identifierTypeDeletion(DONOR, existing),
+        identifierTypeChanges(DONOR, DONOR, existing),
+      ]) {
+        expect(codes(r)).toEqual(["mixed_organizations"]);
+        expect(JSON.stringify(r)).not.toContain("secret_key");
+      }
+    }
+    // An entry whose organizationId is a getter is refused without running it.
+    let ran = false;
+    const sneaky = {
+      ...DONOR,
+      key: "secret_key",
+      get organizationId() {
+        ran = true;
+        return ORG;
+      },
+    };
+    const r = identifierTypeDeletion(DONOR, {
+      identifierTypes: [DONOR, sneaky, sneaky],
+      identifiers: [],
+      records: [],
+    });
+    expect(codes(r)).toEqual(["mixed_organizations"]);
+    expect(JSON.stringify(r)).not.toContain("secret_key");
+    expect(ran).toBe(false);
+    // The organization's own invalid list still says what is wrong with it.
+    const own = { identifierTypes: [DONOR, DONOR], identifiers: [], records: [] };
+    expect(codes(identifierTypeDeletion(DONOR, own))).toEqual(["duplicate_key"]);
+  });
+
   it("refuses an ID used twice, so one record can't shadow another", () => {
     expect(codes(identifierTypeDeletion(DONOR, use([...SETS, set(A, [])])))).toEqual([
       "duplicate_id",
