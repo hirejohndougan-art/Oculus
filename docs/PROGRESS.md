@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-23 19:00 CT — manual (John: "do a long building") — T-022a The HTTP layer on Fastify
+- Result: done
+- What changed: `packages/api` (D-058) on Fastify 5.12.8, its only runtime dependency (`@fastify/cookie` dropped because its writer parsed every cookie). App routes are plain objects checked once and frozen; handlers get a frozen request view (never Fastify, `raw` or the socket), an `AbortSignal`, and may return only plain data or text within size caps; every throw or rejection is rebuilt as a fresh `Refusal` (400-599) or a plain 500, and late failures are logged by Oculus; handlers may set only allowlisted headers and Oculus cookies through one `__Host-` writer; exact JSON and form parsers (depth, duplicate keys, non-finite numbers, strict UTF-8), byte-counted limits (1 MiB, 8 KiB on credential routes), path refusals, 404/405 before handlers, Origin checked against `OCULUS_ORIGINS`, trusted proxies limited, security headers (nosniff, no-referrer, CSP, no-store) on every reply including Node and router errors, and logs holding method and path only.
+- Decisions: D-058 (amends D-051: no `@fastify/cookie`)
+- Review: five independent rounds (route options and the routes callback switching rules off, cookies parsed by the plugin, returned Response objects and request.server/raw escapes, hostile thrown values reaching Fastify's own error handlers, header blocklist gaps, late rejections logging query strings); every finding fixed with a test.
+- Gate: PASS · tests_passing 3171 (was 2761) · npm audit clean · licenses 205 packages permissive
+- Next: T-025 Schema: records, templates and record types (risky); S-009b, S-011c, S-012, S-013
+
 ## 2026-11-23 18:00 CT — manual (John: "do a long building") — T-024 Migrations tooling and the empty schema; T-018a stuck
 - Result: T-024 done; T-018a stuck (attempts: 3)
 - What changed: **T-024** (D-057) `packages/db`: `pg` 8.23.1 behind one `sql` tag (every value a parameter, extended protocol only, placeholders can't touch surrounding text); a forward-only migration runner holding its advisory lock on a separate connection, one transaction and savepoint per file, refusing any file that ended, prepared or escaped the runner's transaction (`transaction_ended`), re-reading the record before and after COMMIT (`applied_not_recorded`), `lock_lost`, `commit_unknown`, `connection_failed`; `npm run db:migrate`; lint keeping `pg` inside `packages/db`; the gate starts a throwaway PostgreSQL (as the postgres user when root, socket only, minimal env, always cleaned up); CI runs the gate against postgres:15 and :19 with a summary `gate` job. **T-018a** stuck: three reviews each found ways to hide an overdue loan through caller-supplied accession registers; new approach recorded (close loans only in the service layer, T-032); branch pushed; S-012 and S-013 added for gaps on main.
