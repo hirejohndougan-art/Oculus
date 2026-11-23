@@ -6,8 +6,9 @@
  *
  * A register made by `indexAccessions` shares here only its organization
  * and, per loan in an accession names (`loanInId`), each such accession's
- * ID, the records it produced, the day it was received and whether title has
- * passed (its deed is signed or not needed). Never a donor, number,
+ * ID, the records it produced, its source agent's ID, the day it was received,
+ * whether and when title passed (its deed is signed or not needed), and the
+ * register's day. Never a donor, number,
  * materials, restrictions or notes. For other modules in this package only:
  * not exported from the package.
  */
@@ -20,18 +21,28 @@ export interface LoanAcquisition {
   readonly accessionId: string;
   /** The records it produced. */
   readonly recordIds: readonly RecordId[];
+  /** The source agent: who the records came from. Must be the loan's lender. */
+  readonly sourceAgentId: RecordId;
   /** The day it was received, `YYYY-MM-DD`. */
   readonly receivedOn: string;
   /**
-   * True when the records are the organization's: the deed of gift is signed
-   * or not needed. A gift whose deed is missing or sent hasn't passed title.
+   * True when the records are the organization's: the deed of gift is
+   * signed (with its signing day) or not needed. A gift whose deed is
+   * missing or sent, or signed with no day, hasn't passed title for this.
    */
   readonly titlePassed: boolean;
+  /**
+   * The day title passed: the signing day of a signed deed, the day received
+   * when no deed is needed; null otherwise.
+   */
+  readonly titlePassedOn: string | null;
 }
 
 /** What a register shares with the loan book. Nothing else. */
 export interface LoanAcquisitions {
   readonly organizationId: OrganizationId;
+  /** The register's day (`heldAsOf`): nothing dated after it has happened yet. */
+  readonly heldAsOf: string;
   /** The accessions naming `loanId` as the loan in they came from, in register order. */
   acquisitionsOf(loanId: string): readonly LoanAcquisition[];
 }

@@ -29,6 +29,7 @@ import {
   type StorageMove,
   type Validated,
 } from "./index.js";
+import { record } from "./public-output.fixtures.js";
 import {
   ORG,
   RECORDS,
@@ -165,7 +166,7 @@ describe("an accession closes a loan in", () => {
     const register = registerOf([bought(loan)]);
     const agreed = ok(book([loan], register));
     const acquired = ok(
-      withLoan(agreed, { ...loan, status: "acquired", statusOn: "2026-11-02" }, NOW),
+      withLoan(agreed, { ...loan, status: "acquired", statusOn: "2026-11-02" }, NOW, register),
     );
     const state = ok(loanState(acquired, loan.id));
     expect(state.phase).toBe("acquired");
@@ -309,8 +310,8 @@ describe("an overdue loan in is never taken off the list by an unchecked acquisi
     const a = bought(loan);
     const b = ok(book([loan], registerOf([a])));
     expect(overdueIds(b)).toEqual([]);
-    // Moves changed, accessions didn't: the book's register stays.
-    expect(overdueIds(ok(reindexLoans(b, LOG)))).toEqual([]);
+    // Moves changed, accessions didn't: the register is given again.
+    expect(overdueIds(ok(reindexLoans(b, LOG, registerOf([a]))))).toEqual([]);
     const unlinked: Record<string, unknown> = { ...a };
     delete unlinked.loanInId;
     const again = ok(reindexLoans(b, LOG, registerOf([unlinked])));
@@ -325,9 +326,10 @@ describe("an overdue loan in is never taken off the list by an unchecked acquisi
         { recordId: bell, arrivalMoveId: bellIn.id, departureMoveId: bellBack.id },
       ],
     });
-    const b = ok(book([loan], registerOf([bought(loan)])));
+    const register = registerOf([bought(loan)]);
+    const b = ok(book([loan], register));
     const dropped = { ...loan, items: [loan.items[1]] };
-    expect(codes(withLoan(b, dropped, NOW))).toEqual(["link_removed"]);
+    expect(codes(withLoan(b, dropped, NOW, register))).toEqual(["link_removed"]);
   });
 });
 
@@ -366,5 +368,80 @@ describe("hostile registers", () => {
     );
     expect(accessionsOfLoan(register, loan.id)).toEqual([]);
     expect(overdueIds(ok(book([loan], register)))).toEqual([loan.id]);
+  });
+});
+
+describe("review fixes: an overdue loan in stays listed", () => {
+  it("not by an accession received, or signed, after the register's day", () => {
+    const loan = loanIn();
+    const late = book([loan], registerOf([bought(loan, { receivedOn: "2026-12-01" })]));
+    expect(problems(late)).toEqual(["acquisition_in_future"]);
+    expect(overdueIds(ok(late))).toEqual([loan.id]);
+    const signedLater = book(
+      [loan],
+      registerOf([
+        bought(loan, { method: "gift", deedStatus: "signed", deedSignedOn: "2026-12-01" }),
+      ]),
+    );
+    expect(problems(signedLater)).toEqual(["acquisition_in_future"]);
+    expect(overdueIds(ok(signedLater))).toEqual([loan.id]);
+  });
+
+  it("not by a signed deed with no signing day", () => {
+    const loan = loanIn();
+    const register = registerOf([bought(loan, { method: "gift", deedStatus: "signed" })]);
+    const b = ok(book([loan], register));
+    expect(ok(loanState(b, loan.id)).items[0]?.out).toBe(true);
+    expect(overdueIds(b)).toEqual([loan.id]);
+    const signedOn = registerOf([
+      bought(loan, { method: "gift", deedStatus: "signed", deedSignedOn: "2026-11-05" }),
+    ]);
+    expect(overdueIds(ok(book([loan], signedOn)))).toEqual([]);
+  });
+
+  it("not by an accession whose source isn't the lender", () => {
+    const stranger = record("agent", "Someone else", {});
+    const loan = loanIn();
+    const register = registerOf(
+      [bought(loan, { sourceAgent: { recordId: stranger.id, label: "Someone else" } })],
+      { records: [...RECORDS, stranger] },
+    );
+    const b = book([loan], register);
+    expect(problems(b)).toEqual(["acquired_from_another_source"]);
+    expect(ok(loanState(ok(b), loan.id)).phase).toBe("unknown");
+    expect(overdueIds(ok(b))).toEqual([loan.id]);
+  });
+
+  it("not by keeping a stale register: edits and re-checks need it given again", () => {
+    const loan = loanIn();
+    const register = registerOf([bought(loan)]);
+    const b = ok(book([loan], register));
+    expect(b.accessionsAsOf).toBe(TODAY);
+    expect(ok(book([loan])).accessionsAsOf).toBeNull();
+    expect(codes(withLoan(b, { ...loan, note: "Edited." }, NOW))).toEqual(["accessions_not_given"]);
+    expect(codes(reindexLoans(b, LOG))).toEqual(["accessions_not_given"]);
+    expect(ok(withLoan(b, { ...loan, note: "Edited." }, NOW, register)).size).toBe(1);
+  });
+
+  it("an agreed loan whose items were acquired is in phase acquired, not returned", () => {
+    const loan = loanIn();
+    const b = ok(book([loan], registerOf([bought(loan)])));
+    expect(ok(loanState(b, loan.id)).phase).toBe("acquired");
+  });
+
+  it("not by an acquired record that later left, linked or not", () => {
+    const gone = move(lantern, lenderPlace.id, "2026-11-10", "departure");
+    const log = ok(indexMoves(INDEX, [lanternIn, bellIn, bellBack, gone]));
+    const loan = loanIn();
+    const b = book([loan], registerOf([bought(loan)]), log);
+    expect(problems(b)).toEqual(["acquired_and_departed"]);
+    expect(overdueIds(ok(b))).toEqual([loan.id]);
+  });
+
+  it("not by marking it acquired before the accession", () => {
+    const loan = loanIn({ status: "acquired", statusOn: "2026-10-15" });
+    const b = book([loan], registerOf([bought(loan)]));
+    expect(problems(b)).toEqual(["acquired_before_acquisition"]);
+    expect(overdueIds(ok(b))).toEqual([loan.id]);
   });
 });

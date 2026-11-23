@@ -214,6 +214,13 @@ export type Loan = LoanIn | LoanOut;
 export interface LoanBook {
   readonly organizationId: OrganizationId;
   readonly size: number;
+  /**
+   * The day (`heldAsOf`) of the accession register the book was checked
+   * against, or null when none was given. A book with a register must be
+   * given the register as it is now on every `withLoan` and `reindexLoans`
+   * (`accessions_not_given`), so a stale one is never kept by accident.
+   */
+  readonly accessionsAsOf: string | null;
 }
 
 /**
@@ -225,6 +232,7 @@ export interface LoanBook {
  * `LoanState.problems`), whatever its status: its links don't fit the move
  * log, so it can't be shown as returned or not yet out.
  */
+/** (`acquired` also for an agreed loan in with nothing out and at least one item acquired.) */
 export type LoanPhase =
   | "requested"
   | "agreed"
@@ -495,6 +503,8 @@ interface ItemData {
   readonly started: StorageMove | null;
   readonly ended: StorageMove | null;
   readonly acquiredBy: readonly string[];
+  /** For an acquired item: the day it became the organization's, else null. */
+  readonly acquiredOn: string | null;
 }
 
 interface BookData {
@@ -618,10 +628,13 @@ export function withLoan(
   book: LoanBook,
   loan: unknown,
   now: Date = new Date(),
+  accessions?: object,
 ): Validated<LoanBook> {
   try {
     const data = bookData(book);
     if (data === undefined) return notABook();
+    const linked = currentAcquisitions(data, accessions, data.organizationId);
+    if (!linked.ok) return linked;
     const checked = validateLoan(loan, now);
     if (!checked.ok) return checked;
     const next = checked.value;
@@ -648,10 +661,7 @@ export function withLoan(
         ? [...data.loans, next]
         : data.loans.map((l) => (l.id === next.id ? next : l));
     const at = before === undefined ? data.loans.length : data.loans.indexOf(before.loan);
-    const built = buildBook(data.log, loans, {
-      register: data.register,
-      acquisitions: data.acquisitions,
-    });
+    const built = buildBook(data.log, loans, linked.value);
     if (!built.ok) {
       // Report the edited loan's problems without its position in the book.
       return {
@@ -692,9 +702,10 @@ export function withLoan(
 
 /**
  * Check every loan again against a new move log (after `withMove` or
- * `reindexLocations`), and a new accession register when one is given
- * (after an accession is saved; left out, the book's own register stays),
- * and return the book built on them. A loan they no longer fit is kept with
+ * `reindexLocations`) and the accession register as it is now, and return
+ * the book built on them. A book made with a register must be given one
+ * (`accessions_not_given`): the old one is never reused, since an accession
+ * saved since may have dropped or changed its link (review fix). A loan they no longer fit is kept with
  * its problems (see `indexLoans`). Never throws.
  */
 export function reindexLoans(
@@ -706,10 +717,7 @@ export function reindexLoans(
     const data = bookData(book);
     if (data === undefined) return notABook();
     if (!isMoveLog(log)) return notALog();
-    const linked =
-      accessions === undefined
-        ? acquisitionsFor(data.register, log.organizationId)
-        : acquisitionsFor(accessions, log.organizationId);
+    const linked = currentAcquisitions(data, accessions, log.organizationId);
     if (!linked.ok) return linked;
     return buildBook(log, data.loans, linked.value);
   } catch {
@@ -888,6 +896,26 @@ export function loanOutMove(
 interface Linked {
   readonly register: object | undefined;
   readonly acquisitions: LoanAcquisitions | undefined;
+}
+
+/**
+ * The register for an edit or a re-check: the one given, checked. A book
+ * made with a register can't go on without one (review fix: a kept register
+ * could keep a loan off the overdue list after its accession changed).
+ */
+function currentAcquisitions(
+  data: BookData,
+  accessions: unknown,
+  organizationId: OrganizationId,
+): Validated<Linked> {
+  if (accessions === undefined && data.register !== undefined) {
+    return refused(
+      ["accessions"],
+      "accessions_not_given",
+      "This loan book was checked against the accession register: give the register as it is now.",
+    );
+  }
+  return acquisitionsFor(accessions, organizationId);
 }
 
 /** The loan links of an accession register, checked; undefined given, none. */
@@ -1072,10 +1100,43 @@ function buildBook(log: MoveLog, loans: readonly Loan[], linked: Linked): Valida
       // accession that names this loan, produced the record and has passed
       // title counts, and only once the item's arrival is linked.
       let acquiredBy: readonly string[] = [];
+      let acquiredOn: string | null = null;
       if (loan.direction === "in" && acquisitions !== undefined) {
-        const found = acquisitions
+        const naming = acquisitions
           .acquisitionsOf(loan.id)
-          .filter((a) => a.titlePassed && a.recordIds.includes(item.recordId));
+          .filter((a) => a.recordIds.includes(item.recordId));
+        const asOf = acquisitions.heldAsOf;
+        let blocked = false;
+        // Review fixes: an accession from someone other than the lender, or
+        // dated after the register's day, never closes the loan.
+        if (naming.some((a) => a.sourceAgentId !== loan.agentId)) {
+          blocked = true;
+          flag(
+            loan.id,
+            ["items", j],
+            "acquired_from_another_source",
+            "An accession naming this loan has a source other than the lender.",
+          );
+        }
+        if (
+          naming.some(
+            (a) => a.receivedOn > asOf || (a.titlePassedOn !== null && a.titlePassedOn > asOf),
+          )
+        ) {
+          blocked = true;
+          flag(
+            loan.id,
+            ["items", j],
+            "acquisition_in_future",
+            "An accession naming this loan is received or signed after today.",
+          );
+        }
+        const found = naming.filter((a) => a.titlePassed && a.titlePassedOn !== null);
+        // A departure anywhere after the arrival: the record left (review fix).
+        const leftLater =
+          start !== null &&
+          start !== undefined &&
+          moves.some((m, k) => k > start.index && m.reason === "departure");
         if (found.length > 0) {
           if (start === null) {
             flag(
@@ -1084,12 +1145,12 @@ function buildBook(log: MoveLog, loans: readonly Loan[], linked: Linked): Valida
               "acquired_without_arrival",
               "An accession acquired this item, but its arrival on this loan isn't linked. Link the arrival placement.",
             );
-          } else if (end) {
+          } else if (end || leftLater) {
             flag(
               loan.id,
               ["items", j],
               "acquired_and_departed",
-              "This item went back to the lender on this loan, so an accession can't have acquired it from the loan.",
+              "This item left the organization's care after it arrived on this loan, so it can't count as acquired and here.",
             );
           } else if (start && found.some((a) => a.receivedOn < start.move.movedOn)) {
             flag(
@@ -1098,8 +1159,12 @@ function buildBook(log: MoveLog, loans: readonly Loan[], linked: Linked): Valida
               "acquired_before_arrival",
               "An accession acquiring this item is dated before the item arrived on this loan.",
             );
-          } else if (start && end === null) {
+          } else if (start && end === null && !blocked) {
             acquiredBy = Object.freeze(found.map((a) => a.accessionId));
+            // The earliest day any of them made it the organization's.
+            acquiredOn = found
+              .map((a) => maxDay(a.receivedOn, a.titlePassedOn ?? a.receivedOn, start.move.movedOn))
+              .reduce((x, y) => (y < x ? y : x));
           }
         }
       }
@@ -1129,6 +1194,7 @@ function buildBook(log: MoveLog, loans: readonly Loan[], linked: Linked): Valida
           started: start ? start.move : null,
           ended: end ? end.move : null,
           acquiredBy,
+          acquiredOn,
         }),
       );
       const mine = byRecord.get(item.recordId) ?? [];
@@ -1242,7 +1308,11 @@ function buildBook(log: MoveLog, loans: readonly Loan[], linked: Linked): Valida
   );
   const frozenByRecord = new Map<RecordId, readonly LoanId[]>();
   for (const [recordId, ids] of byRecord) frozenByRecord.set(recordId, Object.freeze(ids));
-  const book: LoanBook = Object.freeze({ organizationId, size: byId.size });
+  const book: LoanBook = Object.freeze({
+    organizationId,
+    size: byId.size,
+    accessionsAsOf: acquisitions?.heldAsOf ?? null,
+  });
   LOAN_BOOKS.set(book, {
     log,
     register: linked.register,
@@ -1301,6 +1371,19 @@ function checkAcquired(
     );
     return;
   }
+  const latest = items.reduce<string | null>(
+    (day, item) =>
+      item.acquiredOn !== null && (day === null || item.acquiredOn > day) ? item.acquiredOn : day,
+    null,
+  );
+  if (latest !== null && loan.statusOn < latest) {
+    flag(
+      loan.id,
+      ["statusOn"],
+      "acquired_before_acquisition",
+      "The loan is marked acquired on a day before an item arrived, was received or its deed was signed.",
+    );
+  }
   if (!items.some((item) => item.acquiredBy.length > 0)) {
     flag(
       loan.id,
@@ -1324,6 +1407,11 @@ function checkAcquired(
       );
     }
   });
+}
+
+/** The latest of some `YYYY-MM-DD` days. */
+function maxDay(...days: readonly string[]): string {
+  return days.reduce((x, y) => (y > x ? y : x));
 }
 
 /** Identifies one problem of one loan, to compare a loan's problems before and after an edit. */
@@ -1403,6 +1491,7 @@ function stateOf(data: BookData, entry: Entry): LoanState {
   if (entry.problems.length > 0) phase = "unknown";
   else if (loan.status !== "agreed") phase = loan.status;
   else if (states.some((s) => s.out)) phase = "on_loan";
+  else if (states.some((s) => s.acquiredBy.length > 0)) phase = "acquired";
   else if (states.some((s) => s.started !== null)) phase = "returned";
   else phase = "agreed";
   return Object.freeze({ loan, phase, items: Object.freeze(states), problems: entry.problems });

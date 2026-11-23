@@ -790,8 +790,15 @@ export function indexAccessions(
             Object.freeze({
               accessionId: a.id,
               recordIds: Object.freeze(a.records.map((l) => l.recordId)),
+              sourceAgentId: a.sourceAgent.recordId,
               receivedOn: a.receivedOn,
-              titlePassed: a.deedStatus === "signed" || a.deedStatus === "not_needed",
+              // A signed deed with no signing day hasn't shown when title
+              // passed, so it can't close a loan (review fix).
+              titlePassed:
+                a.deedStatus === "not_needed" ||
+                (a.deedStatus === "signed" && ownData(a, "deedSignedOn") !== undefined),
+              titlePassedOn:
+                a.deedStatus === "signed" ? (ownData(a, "deedSignedOn") ?? null) : a.receivedOn,
             }),
           ),
         ),
@@ -830,6 +837,7 @@ export function indexAccessions(
     const none: readonly LoanAcquisition[] = Object.freeze([]);
     markLoanAcquisitions(register, {
       organizationId,
+      heldAsOf: today,
       acquisitionsOf: (loanId) => sharedByLoan.get(loanId) ?? none,
     });
     return { ok: true, value: register };
