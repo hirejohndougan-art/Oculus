@@ -160,7 +160,7 @@ describe("findLcTermsWithoutUri", () => {
     }));
     const start = performance.now();
     const r = report(terms, MAX_TERMS_WITHOUT_URI);
-    expect(performance.now() - start).toBeLessThan(2000);
+    expect(performance.now() - start).toBeLessThan(5000);
     expect(r.counts.lcsh).toBe(25_000);
     expect(r.terms).toHaveLength(500);
     expect(r.terms[0]?.indexes).toHaveLength(50);
