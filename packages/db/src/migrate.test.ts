@@ -22,6 +22,17 @@ import {
 import { sql } from "./sql.js";
 import { freshDatabase, type TestDatabase } from "./test-database.fixtures.js";
 
+/** Every table the real migrations create, in name order. */
+const ALL_TABLES = [
+  "oculus_migrations",
+  "organizations",
+  "record_type_versions",
+  "record_types",
+  "records",
+  "template_versions",
+  "templates",
+];
+
 const FIRST = readFileSync(join(defaultMigrationsDir(), "0001_migrations_table.sql"));
 
 const dirs: string[] = [];
@@ -198,10 +209,10 @@ describe("every migration on a fresh database", () => {
     expect(await recorded(db.url)).toEqual(rows);
   });
 
-  it("leaves the empty schema: only the bookkeeping table", async () => {
+  it("creates the bookkeeping table and the catalog tables, and nothing else", async () => {
     const db = await database();
     await migrate({ connectionString: db.url });
-    expect(await tables(db.url)).toEqual(["oculus_migrations"]);
+    expect(await tables(db.url)).toEqual(ALL_TABLES);
   });
 
   it("applies new files in order on a later run", async () => {
@@ -916,7 +927,8 @@ describe("two runners at once", () => {
       expect(finished).toBe(false);
       expect(await tables(db.url)).toEqual([]);
       await holder.execute(sql`SELECT pg_advisory_unlock(${MIGRATION_LOCK_KEY})`);
-      expect((await waiting).applied).toEqual(["0001_migrations_table.sql"]);
+      const files = await readMigrations(defaultMigrationsDir());
+      expect((await waiting).applied).toEqual(files.map((f) => f.name));
     } finally {
       await holder.close();
     }
@@ -991,7 +1003,11 @@ describe("two runners at once", () => {
   it("releases the lock after a refusal", async () => {
     const dir = migrationsDir({ "0002_bad.sql": "SELECT * FROM nowhere;" });
     expect((await refusal(migrate({ connectionString: db.url, dir }))).code).toBe("failed");
-    const result = await migrate({ connectionString: db.url, lockTimeoutMs: 1000 });
+    const result = await migrate({
+      connectionString: db.url,
+      dir: migrationsDir(),
+      lockTimeoutMs: 1000,
+    });
     expect(result.applied).toEqual([]);
   });
 });
@@ -1019,7 +1035,7 @@ describe("npm run db:migrate", () => {
       ),
     ).toBe(0);
     expect(out.join("\n")).toMatch(/Applied 0001_migrations_table.sql/);
-    expect(await tables(url)).toEqual(["oculus_migrations"]);
+    expect(await tables(url)).toEqual(ALL_TABLES);
 
     const bad = url.replace(/\/oculus_test_[0-9a-f]+/, "/oculus_test_missing");
     expect(
