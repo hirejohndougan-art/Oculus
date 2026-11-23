@@ -1,0 +1,430 @@
+// Links between records (T-015, D-039): the record_link field kind, the
+// record link checker, inheritance and public output.
+import { describe, expect, it } from "vitest";
+import {
+  FIELD_KINDS,
+  checkRecordAgainstTemplate,
+  effectiveRecord,
+  indexRecords,
+  makeRecordLinkChecker,
+  newOrganizationId,
+  newRecordId,
+  publicOutput,
+  publicView,
+  validateTemplate,
+  type CatalogRecord,
+  type FieldDefinition,
+  type FieldValueChecker,
+  type PublicOutput,
+  type RecordId,
+  type Validated,
+} from "./index.js";
+import {
+  BASE,
+  CHECKERS,
+  CNE,
+  FIELDS,
+  ORG,
+  field,
+  linkChecker,
+  record,
+  template,
+} from "./public-output.fixtures.js";
+
+function ok<T>(result: Validated<T>): T {
+  if (!result.ok) throw new Error(JSON.stringify(result.issues));
+  return result.value;
+}
+
+function codes(result: Validated<unknown>): string[] {
+  return result.ok ? [] : result.issues.map((i) => i.code);
+}
+
+/** The fixtures' fields plus a creator linked to the Authorities list and related records. */
+const LINK_FIELDS: readonly FieldDefinition[] = [
+  ...FIELDS.filter((f) => f.key !== "creator"),
+  field({
+    key: "creator",
+    label: "Creator",
+    kind: "record_link",
+    recordKinds: ["agent"],
+    inherited: true,
+  }),
+  field({ key: "related", label: "Related", kind: "record_link", repeatable: true }),
+  field({ key: "donor", label: "Donor", kind: "record_link", visibility: "staff" }),
+];
+const LINK_TPL = template(LINK_FIELDS, "links");
+const LINK_MAPPING = {
+  template: "links",
+  entries: [
+    { field: "rights", term: "rights" },
+    { field: "creator", term: "creator" },
+    { field: "related", term: "relation" },
+    { field: "places", term: "spatial" },
+  ],
+};
+
+const withKey = (r: CatalogRecord): CatalogRecord => ({ ...r, templateKey: "links" });
+
+function sample() {
+  const agent = withKey(record("agent", "Dickinson, John", {}));
+  const event = withKey(record("event", "Storm of 1900", {}));
+  const place = withKey(record("place", "Dickinson (Tex.)", {}));
+  const item = withKey(
+    record("object", "Dickinson Station and Park", {
+      rights: { uri: CNE },
+      creator: { recordId: agent.id, label: "Dickinson, John" },
+      related: [
+        { recordId: event.id, label: "Storm of 1900" },
+        { recordId: place.id, label: "Dickinson" },
+      ],
+      places: [{ label: "Dickinson (Tex.)", recordId: place.id }],
+    }),
+  );
+  return { agent, event, place, item, all: [agent, event, place, item] };
+}
+
+function checkersFor(records: readonly CatalogRecord[]) {
+  const links = linkChecker(records);
+  return { ...CHECKERS, record_link: links, place: links };
+}
+
+function check(r: CatalogRecord, checkers?: Record<string, FieldValueChecker>): string[] {
+  return checkRecordAgainstTemplate(
+    r,
+    LINK_TPL,
+    checkers === undefined ? {} : { checkers: checkers as never },
+  ).map((i) => i.code);
+}
+
+function output(
+  records: readonly CatalogRecord[],
+  id: RecordId,
+  published: readonly RecordId[],
+  checkers: Record<string, unknown> = checkersFor(records),
+): Validated<PublicOutput> {
+  const effective = ok(
+    effectiveRecord(id, records, () => LINK_TPL, { checkers: checkers as never }),
+  );
+  const view = publicView(effective);
+  if (view === undefined) throw new Error("no view");
+  return publicOutput(view, LINK_MAPPING, {
+    baseUrl: BASE,
+    published,
+    checkers: checkers as never,
+  });
+}
+
+describe("the record_link field kind", () => {
+  const def = (extra: Record<string, unknown>) => ({
+    key: "creator",
+    label: "Creator",
+    kind: "record_link",
+    required: false,
+    repeatable: false,
+    visibility: "public",
+    inherited: false,
+    ...extra,
+  });
+  const tpl = (extra: Record<string, unknown>) => ({
+    key: "t",
+    label: "T",
+    organizationId: ORG,
+    appliesTo: ["object"],
+    fields: [def(extra)],
+  });
+
+  it("is a field kind, with optional recordKinds", () => {
+    expect(FIELD_KINDS).toContain("record_link");
+    expect(codes(validateTemplate(tpl({})))).toEqual([]);
+    expect(codes(validateTemplate(tpl({ recordKinds: ["agent"] })))).toEqual([]);
+    expect(codes(validateTemplate(tpl({ recordKinds: ["agent", "place", "event"] })))).toEqual([]);
+  });
+
+  it("refuses bad recordKinds lists", () => {
+    expect(codes(validateTemplate(tpl({ recordKinds: [] })))).toEqual(["invalid_list"]);
+    expect(codes(validateTemplate(tpl({ recordKinds: "agent" })))).toEqual(["invalid_list"]);
+    expect(codes(validateTemplate(tpl({ recordKinds: ["person"] })))).toEqual(["invalid_kind"]);
+    expect(codes(validateTemplate(tpl({ recordKinds: ["agent", "agent"] })))).toEqual([
+      "duplicate",
+    ]);
+    expect(
+      codes(validateTemplate(tpl({ recordKinds: [...Array<string>(7).fill("agent")] }))),
+    ).toEqual(["invalid_list"]);
+  });
+
+  it("allows recordKinds on record_link fields only", () => {
+    expect(codes(validateTemplate(tpl({ kind: "place", recordKinds: ["place"] })))).toEqual([
+      "not_for_kind",
+    ]);
+    expect(codes(validateTemplate(tpl({ kind: "text", recordKinds: ["agent"] })))).toEqual([
+      "not_for_kind",
+    ]);
+  });
+
+  it("checks the value's shape: { recordId, label }", () => {
+    const { agent, all } = sample();
+    const checkers = checkersFor(all);
+    const value = (creator: unknown): string[] =>
+      check(withKey(record("object", "X", { rights: { uri: CNE }, creator } as never)), checkers);
+    expect(value({ recordId: agent.id, label: "Dickinson, John" })).toEqual([]);
+    expect(value({ label: "Dickinson, John" })).toEqual(["required"]);
+    expect(value({ recordId: agent.id })).toEqual(["invalid_text"]);
+    expect(value({ recordId: agent.id, label: " Dickinson" })).toEqual(["invalid_text"]);
+    expect(value({ recordId: "123", label: "x" })).toEqual(["invalid_id"]);
+    expect(value({ recordId: agent.id, label: "x", uri: "https://example.org/" })).toEqual([
+      "unknown_property",
+    ]);
+    expect(value("Dickinson, John")).toEqual(["not_an_object"]);
+    expect(value([{ recordId: agent.id, label: "x" }])).toEqual(["not_repeatable"]);
+  });
+
+  it("refuses record_link values when no record link checker is given", () => {
+    const { item } = sample();
+    expect(check(item, { ...CHECKERS })).toEqual(["unchecked", "unchecked", "unchecked"]);
+    const problem = checkRecordAgainstTemplate(item, LINK_TPL, { checkers: CHECKERS })[0];
+    expect(problem?.message).toContain("makeRecordLinkChecker");
+  });
+
+  it("accepts a valid record with the record link checker", () => {
+    const { item, all } = sample();
+    expect(check(item, checkersFor(all))).toEqual([]);
+  });
+});
+
+describe("makeRecordLinkChecker", () => {
+  it("is made from a list or an index from indexRecords", () => {
+    const { item, all } = sample();
+    const fromIndex = ok(makeRecordLinkChecker(ok(indexRecords(all))));
+    expect(check(item, { ...CHECKERS, record_link: fromIndex, place: fromIndex })).toEqual([]);
+  });
+
+  it("refuses a link to a record that isn't in the organization's records", () => {
+    const { item, all } = sample();
+    const links = linkChecker(all.filter((r) => r.kind !== "agent"));
+    const problems = checkRecordAgainstTemplate(item, LINK_TPL, {
+      checkers: { ...CHECKERS, record_link: links, place: links },
+    });
+    expect(problems.map((p) => [p.code, p.path])).toEqual([
+      ["unknown_record", ["fields", "creator", "recordId"]],
+    ]);
+  });
+
+  it("refuses a target of a kind the field doesn't allow", () => {
+    const { event, all } = sample();
+    const r = withKey(
+      record("object", "X", {
+        rights: { uri: CNE },
+        creator: { recordId: event.id, label: "Storm" },
+      }),
+    );
+    expect(check(r, checkersFor([...all, r]))).toEqual(["wrong_record_kind"]);
+  });
+
+  it("allows any kind when recordKinds is left out", () => {
+    const { all } = sample();
+    const related = all.map((t) => ({ recordId: t.id, label: t.title }));
+    const r = withKey(record("object", "X", { rights: { uri: CNE }, related }));
+    expect(check(r, checkersFor([...all, r]))).toEqual([]);
+  });
+
+  it("refuses a place value naming a record that isn't a place", () => {
+    const { agent, all } = sample();
+    const r = withKey(
+      record("object", "X", {
+        rights: { uri: CNE },
+        places: [{ label: "Somewhere", recordId: agent.id }],
+      }),
+    );
+    expect(check(r, checkersFor([...all, r]))).toEqual(["wrong_record_kind"]);
+  });
+
+  it("accepts a place with no recordId, and checks nothing else about it", () => {
+    const r = withKey(
+      record("object", "X", { rights: { uri: CNE }, places: [{ label: "Dickinson Bayou" }] }),
+    );
+    expect(check(r, checkersFor([r]))).toEqual([]);
+  });
+
+  it("refuses a link from a record to itself", () => {
+    const id = newRecordId();
+    const r = withKey(
+      record(
+        "object",
+        "X",
+        { rights: { uri: CNE }, related: [{ recordId: id, label: "Me" }] },
+        {},
+        id,
+      ),
+    );
+    expect(check(r, checkersFor([r]))).toEqual(["self_link"]);
+  });
+
+  it("refuses a link to an ID used twice or a record that isn't valid", () => {
+    const { item, agent } = sample();
+    const twice = linkChecker([item, agent, { ...agent, title: "Other" }]);
+    const bad = linkChecker([item, { ...agent, title: "" }]);
+    for (const links of [twice, bad]) {
+      const problems = checkRecordAgainstTemplate(
+        withKey(record("object", "X", { rights: { uri: CNE }, creator: item.fields.creator })),
+        LINK_TPL,
+        { checkers: { ...CHECKERS, record_link: links } },
+      );
+      expect(problems.map((p) => p.code)).toEqual(["unusable_record"]);
+    }
+  });
+
+  it("knows no records when made from an empty set", () => {
+    const { item } = sample();
+    const links = linkChecker([]);
+    expect(check(item, { ...CHECKERS, record_link: links, place: links })).toEqual([
+      "unknown_record",
+      "unknown_record",
+      "unknown_record",
+      "unknown_record",
+    ]);
+  });
+
+  it("is only for record_link and place values", () => {
+    const { all, item } = sample();
+    const links = linkChecker(all);
+    expect(links("x", field({ key: "title" }), item).map((p) => p.code)).toEqual(["wrong_checker"]);
+  });
+
+  it("checks against a snapshot: later changes to the caller's records are not seen", () => {
+    const { agent, item } = sample();
+    const mutable = { ...agent, kind: "agent" } as Record<string, unknown>;
+    const links = linkChecker([item, mutable as never]);
+    mutable.kind = "event";
+    mutable.id = newRecordId();
+    expect(check(item, { ...CHECKERS, record_link: links })).toEqual([
+      // related values: the event and place are not in this set.
+      "unknown_record",
+      "unknown_record",
+    ]);
+  });
+
+  it("refuses a set that mixes organizations", () => {
+    const { all } = sample();
+    const other = { ...record("agent", "Other", {}), organizationId: newOrganizationId() };
+    expect(codes(makeRecordLinkChecker([...all, other]))).toEqual(["mixed_organizations"]);
+    expect(codes(makeRecordLinkChecker("nope"))).toEqual(["not_a_list"]);
+  });
+});
+
+describe("record links and inheritance", () => {
+  it("lets a unit's creator link come down to its items", () => {
+    const { agent } = sample();
+    const fonds = withKey(
+      record(
+        "archival_unit",
+        "Dickinson family papers",
+        { rights: { uri: CNE }, creator: { recordId: agent.id, label: "Dickinson, John" } },
+        { level: "fonds" },
+      ),
+    );
+    const item = withKey(
+      record("archival_unit", "Letter", {}, { level: "item", parentId: fonds.id }),
+    );
+    const all = [agent, fonds, item];
+    const effective = ok(
+      effectiveRecord(item.id, all, () => LINK_TPL, { checkers: checkersFor(all) }),
+    );
+    expect(effective.fields.creator).toEqual({ recordId: agent.id, label: "Dickinson, John" });
+    expect(effective.entries.find((e) => e.key === "creator")?.own).toBe(false);
+  });
+
+  it("leaves out an inherited link no record link checker has checked", () => {
+    const { agent } = sample();
+    const fonds = withKey(
+      record(
+        "archival_unit",
+        "Papers",
+        { creator: { recordId: agent.id, label: "Dickinson, John" } },
+        { level: "fonds" },
+      ),
+    );
+    const item = withKey(
+      record("archival_unit", "Letter", {}, { level: "item", parentId: fonds.id }),
+    );
+    const effective = ok(
+      effectiveRecord(item.id, [agent, fonds, item], () => LINK_TPL, { checkers: CHECKERS }),
+    );
+    expect(effective.fields.creator).toBeUndefined();
+    expect(effective.notes.map((n) => n.code)).toEqual(["not_valid_here"]);
+  });
+});
+
+describe("the public view holds no linked record IDs", () => {
+  it("keeps the label (and a place's gazetteer URI) only", () => {
+    const { item, all } = sample();
+    const effective = ok(
+      effectiveRecord(item.id, all, () => LINK_TPL, { checkers: checkersFor(all) }),
+    );
+    const view = publicView(effective);
+    expect(view?.fields.creator).toEqual({ label: "Dickinson, John" });
+    expect(view?.fields.related).toEqual([{ label: "Storm of 1900" }, { label: "Dickinson" }]);
+    expect(view?.fields.places).toEqual([{ label: "Dickinson (Tex.)" }]);
+    for (const other of all.filter((r) => r.id !== item.id)) {
+      expect(JSON.stringify(view)).not.toContain(other.id);
+    }
+    // The staff-side effective record still has them.
+    expect(effective.fields.creator).toEqual({ recordId: all[0]?.id, label: "Dickinson, John" });
+  });
+});
+
+describe("publicOutput: record links", () => {
+  it("links published records of the organization, with their labels", () => {
+    const { agent, event, place, item, all } = sample();
+    const o = ok(output(all, item.id, [item.id, agent.id, event.id, place.id]));
+    expect(o.jsonLd["dcterms:creator"]).toEqual({
+      "@id": BASE + agent.id,
+      "rdfs:label": "Dickinson, John",
+    });
+    expect(o.jsonLd["dcterms:relation"]).toEqual([
+      { "@id": BASE + event.id, "rdfs:label": "Storm of 1900" },
+      { "@id": BASE + place.id, "rdfs:label": "Dickinson" },
+    ]);
+    expect(o.jsonLd["dcterms:spatial"]).toEqual({
+      "@id": BASE + place.id,
+      "rdfs:label": "Dickinson (Tex.)",
+    });
+    expect(o.dublinCore.creator).toEqual(["Dickinson, John"]);
+    expect(o.dublinCore.relation).toEqual(["Storm of 1900", "Dickinson"]);
+    expect(o.oaiDcXml).toContain("<dc:creator>Dickinson, John</dc:creator>");
+  });
+
+  it("gives an unpublished record's label only", () => {
+    const { agent, event, place, item, all } = sample();
+    const o = ok(output(all, item.id, [item.id, place.id]));
+    expect(o.jsonLd["dcterms:creator"]).toEqual({ "rdfs:label": "Dickinson, John" });
+    // dcterms:relation has no declared range, so a label alone is plain text.
+    expect(o.jsonLd["dcterms:relation"]).toEqual([
+      "Storm of 1900",
+      { "@id": BASE + place.id, "rdfs:label": "Dickinson" },
+    ]);
+    const text = JSON.stringify(o);
+    expect(text).not.toContain(agent.id);
+    expect(text).not.toContain(event.id);
+  });
+
+  it("refuses to publish a record whose link the checker refuses", () => {
+    const { item, all } = sample();
+    const links = linkChecker(all.filter((r) => r.kind !== "agent"));
+    const result = output(all, item.id, [item.id], {
+      ...CHECKERS,
+      record_link: links,
+      place: links,
+    });
+    expect(codes(result)).toEqual(["unknown_record"]);
+  });
+
+  it("refuses to publish record_link values with no record link checker", () => {
+    const { item, all } = sample();
+    expect(codes(output(all, item.id, [item.id], { ...CHECKERS }))).toEqual([
+      "unchecked",
+      "unchecked",
+      "unchecked",
+    ]);
+  });
+});
