@@ -79,8 +79,10 @@
  *   no label, no placeholder (a term left with no values is left out), so
  *   output never reveals that an unpublished, held back or another
  *   organization's record exists, its ID, or a label copied from it. A place
- *   keeps its own name (and gazetteer URI), without the link: the name is
- *   the place value itself, not text about the record. The linked record's
+ *   value naming a place record keeps its own name (and gazetteer URI),
+ *   without the link, only when `checkers.place` was made by
+ *   `makeRecordLinkChecker` for this organization and holds that record as
+ *   a place; otherwise nothing of the value goes out (D-048). The linked record's
  *   own title and values are never read. The public view holds no
  *   `record_link` values and no linked IDs at all; they are read from the
  *   effective record, for the keys `effectiveRecord` recorded beside the
@@ -161,7 +163,11 @@ import {
   type RecordIdentifiers,
 } from "./identifiers.js";
 import { mixedOrganizationsIssue } from "./organizations.js";
-import { isOtherOrganizationsLinkChecker, linkTargetKind } from "./record-links.js";
+import {
+  isOtherOrganizationsLinkChecker,
+  linkTargetKind,
+  placeNameMayShow,
+} from "./record-link-brand.js";
 import { RECORD_KINDS, type CatalogRecord, type FieldValue, type RecordKind } from "./records.js";
 import {
   MAX_REPEATS,
@@ -614,6 +620,10 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
     // archival unit or digital asset is never linked.
     return deedClears(id, kind);
   };
+  // A place value's name shows only when its place record, if it names one,
+  // is vouched for by this organization's place checker (D-048).
+  const placeShows = (place: JsonValue): boolean =>
+    placeNameMayShow(place, linkCheckers.get("place"), organizationId, view.id);
   for (const { field, term } of checked.value.entries) {
     const shownValue = entries.get(field) ?? (linkKeys.has(field) ? full[field] : undefined);
     // Not in the view: empty, staff only along the way, or not inherited.
@@ -632,7 +642,7 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
     if (value === undefined) {
       fail(["fields", field], "unreadable", "The public view could not be read.");
     }
-    const values = valuesOf(value, def, { baseUrl, published, budget, linkable });
+    const values = valuesOf(value, def, { baseUrl, published, budget, linkable, placeShows });
     // Every record link that may not be named was left out (D-045).
     if (values.length === 0) continue;
     const list = terms.get(term);
@@ -1154,6 +1164,8 @@ interface Context {
   readonly budget: Budget;
   /** True when a value of `def` may link to the record `id` (see the module header). */
   readonly linkable: (def: FieldDefinition, id: RecordId) => boolean;
+  /** False for a place value whose place record can't be vouched for (D-048). */
+  readonly placeShows: (place: JsonValue) => boolean;
 }
 
 function valuesOf(value: JsonValue, def: FieldDefinition, ctx: Context): OutValue[] {
@@ -1242,6 +1254,10 @@ function valueOf(
       const uri = optionalIri(place.get("uri"), invalid);
       const recordId = place.get("recordId");
       if (recordId !== undefined && !isRecordId(recordId)) return invalid();
+      // Not at all when the place record it names isn't vouched for as this
+      // organization's place: it may be another kind of value left in a
+      // field a template edit made a place (D-048).
+      if (!ctx.placeShows(value)) return undefined;
       if (uri !== undefined) return outValue(label, uri, true);
       // A place record is linked only when it is published and this
       // organization's; otherwise its existence and ID stay unsaid.

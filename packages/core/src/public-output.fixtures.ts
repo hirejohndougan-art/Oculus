@@ -179,11 +179,12 @@ export function effectiveOf(
   records: readonly CatalogRecord[],
   id: RecordId,
   tpl: FieldTemplate = TPL,
+  checkers: Record<string, unknown> = CHECKERS,
 ): EffectiveRecord {
   // With the identifier checker, so public-type numbers reach the view
   // (D-022), and the records' identifiers, which hold them (D-038).
   const result = effectiveRecord(id, records, () => tpl, {
-    checkers: CHECKERS,
+    checkers: checkers as never,
     identifiers: identifiersFor(records),
   });
   if (!result.ok) throw new Error(JSON.stringify(result.issues));
@@ -201,8 +202,9 @@ export function viewOf(
   records: readonly CatalogRecord[],
   id: RecordId,
   tpl: FieldTemplate = TPL,
+  checkers: Record<string, unknown> = CHECKERS,
 ): PublicRecord {
-  const view = publicView(effectiveOf(records, id, tpl));
+  const view = publicView(effectiveOf(records, id, tpl, checkers));
   if (view === undefined) throw new Error("no public view");
   VIEW_IDENTIFIERS.set(view, identifiersFor(records));
   return view;

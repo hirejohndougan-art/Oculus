@@ -96,7 +96,10 @@
  * may be unpublished, held back by a deed or (by mistake) another
  * organization's, and a label copied from it (a donor's name, a private
  * item's title) would reveal it. A place is held as `{ label, uri? }`, never
- * with the ID of a place record. Only `publicOutput` reads links, from the
+ * with the ID of a place record, and only when it names no place record or
+ * `options.checkers.place` (from `makeRecordLinkChecker`, for this
+ * organization) holds the one it names as a place (D-048); otherwise it is
+ * left out. Only `publicOutput` reads links, from the
  * effective record, and puts out a link (its URL and label) only when it can
  * prove the record is published, not held back and the organization's own;
  * otherwise nothing of it. The effective record (staff) keeps every link.
@@ -105,6 +108,7 @@ import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import { RIGHTS_FIELD_KEY, rightsPublishIssues } from "./rights.js";
 import { markEffective, markPublicView } from "./effective-brand.js";
 import { deedHoldsOf } from "./accession-holds.js";
+import { placeNameMayShow } from "./record-link-brand.js";
 import { shown } from "./plain-data.js";
 import { isOtherOrganizationsChecker, publicIdentifierTypesOf } from "./field-checkers.js";
 import { types } from "node:util";
@@ -193,6 +197,10 @@ export interface PublicField {
  * The only part of an effective record that may be published: the entries
  * whose effective visibility is `public` and whose key is in the record's
  * template. No notes, no stored record, and no ancestors' IDs or titles.
+ * Public `record_link` entries are not in it at all (D-045), and a place
+ * value whose place record isn't vouched for is left out (D-048): public
+ * pages must take links to other records from `publicOutput`, which puts
+ * out only those that may be named.
  */
 export interface PublicRecord {
   readonly id: RecordId;
@@ -853,19 +861,31 @@ function compose(
   // links it can prove may be named, from the effective record.
   const isLink = (e: { readonly key: string }): boolean =>
     own.byKey.get(e.key)?.kind === "record_link";
+  // A place value naming a place record shows its name only when the
+  // organization's own place checker holds that record as a place (D-048).
+  const placeChecker = ownChecker(checkers, "place");
+  const shownPlaces = (value: FieldValue): FieldValue | undefined => {
+    const shows = (item: FieldValue): boolean =>
+      placeNameMayShow(item, placeChecker, target.organizationId, target.id);
+    if (!Array.isArray(value)) return shows(value) ? value : undefined;
+    const kept = value.filter(shows);
+    return kept.length === 0 ? undefined : Object.freeze(kept);
+  };
   const shownEntries = publicEntries
     .filter((e) => !isLink(e))
-    .map((e) =>
-      Object.freeze({
-        key: e.key,
-        label: e.label,
-        value:
-          e.key === RIGHTS_FIELD_KEY
-            ? withoutRightsNote(e.value)
-            : publicValue(e.value, own.byKey.get(e.key)?.kind),
-        own: e.own,
-      }),
-    );
+    .flatMap((e) => {
+      const kind = own.byKey.get(e.key)?.kind;
+      const value = kind === "place" ? shownPlaces(e.value) : e.value;
+      if (value === undefined) return [];
+      return [
+        Object.freeze({
+          key: e.key,
+          label: e.label,
+          value: e.key === RIGHTS_FIELD_KEY ? withoutRightsNote(value) : publicValue(value, kind),
+          own: e.own,
+        }),
+      ];
+    });
   markEffective(effective);
   const view: PublicRecord = Object.freeze({
     id: target.id,

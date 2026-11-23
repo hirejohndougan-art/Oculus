@@ -333,6 +333,115 @@ describe("D-045: a link the public may not follow leaves no trace", () => {
   });
 });
 
+describe("D-048: a place value shows its name only when its place record is vouched for", () => {
+  // A template edit made a record_link field a place. The stored value
+  // { recordId, label } still fits a place, but its label is a record link's
+  // label, here copied from an unpublished donor agent.
+  const PLACE_TPL = template(
+    [
+      ...FIELDS.filter((f) => f.key !== "creator"),
+      field({ key: "creator", label: "Creator", kind: "place" }),
+    ] satisfies readonly FieldDefinition[],
+    "links",
+  );
+  const PLACE_MAPPING = {
+    template: "links",
+    entries: [
+      { field: "rights", term: "rights" },
+      { field: "creator", term: "spatial" },
+      { field: "places", term: "coverage" },
+    ],
+  };
+
+  function publish(records: CatalogRecord[], id: RecordId, checkers: Record<string, unknown>) {
+    const effective = ok(effectiveRecord(id, records, () => PLACE_TPL, { checkers: checkers }));
+    const view = publicView(effective);
+    if (view === undefined) throw new Error("no view");
+    const result = publicOutput(view, PLACE_MAPPING, {
+      baseUrl: BASE,
+      accessions: accessionsFor(view),
+      published: records.map((r) => r.id),
+      checkers: checkers,
+    });
+    return { effective, view, result };
+  }
+
+  it("withholds a record link's label left in a field made a place, with no place checker", () => {
+    const donor = withKey(record("agent", "SECRET-donor-name", {}));
+    const item = withKey(
+      record("object", "Postcard", {
+        rights: { uri: CNE },
+        creator: { recordId: donor.id, label: "SECRET-donor-name" },
+      } as never),
+    );
+    const { effective, view, result } = publish([donor, item], item.id, { ...CHECKERS });
+    expect(JSON.stringify(view)).not.toContain("SECRET");
+    expect(view.fields.creator).toBeUndefined();
+    const o = ok(result);
+    expectNothingOf(everything(o), donor);
+    expect(o.dublinCore.spatial).toBeUndefined();
+    // Staff still see it.
+    expect(effective.fields.creator).toEqual({ recordId: donor.id, label: "SECRET-donor-name" });
+  });
+
+  it("withholds it when a lax place checker lets a non-place record through", () => {
+    const donor = withKey(record("agent", "SECRET-donor-name", {}));
+    const item = withKey(
+      record("object", "Postcard", {
+        rights: { uri: CNE },
+        creator: { recordId: donor.id, label: "SECRET-donor-name" },
+      } as never),
+    );
+    const { view, result } = publish([donor, item], item.id, { ...CHECKERS, place: lax });
+    expect(JSON.stringify(view)).not.toContain("SECRET");
+    expectNothingOf(everything(ok(result)), donor);
+  });
+
+  it("withholds it with the organization's place checker, which knows the record isn't a place", () => {
+    const donor = withKey(record("agent", "SECRET-donor-name", {}));
+    const item = withKey(
+      record("object", "Postcard", {
+        rights: { uri: CNE },
+        creator: { recordId: donor.id, label: "SECRET-donor-name" },
+      } as never),
+    );
+    const all = [donor, item];
+    const { view, result } = publish(all, item.id, { ...CHECKERS, place: linkChecker(all) });
+    expect(JSON.stringify(view)).not.toContain("SECRET");
+    // Left out of the view, so output never sees it (the checker refuses it when saving).
+    expectNothingOf(everything(ok(result)), donor);
+  });
+
+  it("keeps only the vouched places of a list, with the name of an unpublished place record", () => {
+    const place = withKey(record("place", "Dickinson", {}));
+    const donor = withKey(record("agent", "SECRET-donor-name", {}));
+    const item = withKey(
+      record("object", "Postcard", {
+        rights: { uri: CNE },
+        places: [
+          { label: "Dickinson (Tex.)", recordId: place.id },
+          { label: "SECRET-donor-name", recordId: donor.id },
+          { label: "Galveston Bay" },
+        ],
+      }),
+    );
+    const all = [place, donor, item];
+    // Own values reach the view unchecked (D-013); the view still keeps
+    // only the places the organization's place checker vouches for.
+    const made = linkChecker(all);
+    const effective = ok(
+      effectiveRecord(item.id, all, () => PLACE_TPL, { checkers: { ...CHECKERS, place: made } }),
+    );
+    expect(effective.notes.map((n) => n.code)).toEqual([]);
+    const view = publicView(effective);
+    expect(view?.fields.places).toEqual([
+      { label: "Dickinson (Tex.)" },
+      { label: "Galveston Bay" },
+    ]);
+    expect(JSON.stringify(view)).not.toContain("SECRET");
+  });
+});
+
 describe("another organization's record is never linked or named", () => {
   const otherOrg = newOrganizationId();
   const theirs = {
@@ -373,7 +482,9 @@ describe("another organization's record is never linked or named", () => {
       [item.id, theirs.id, theirPlace.id],
       checkers,
     );
-    expect(codes(result)).toEqual(["unknown_record", "unknown_record"]);
+    // The place value isn't vouched for, so the view never held it (D-048);
+    // the record link is still refused.
+    expect(codes(result)).toEqual(["unknown_record"]);
     expectNothingOf(JSON.stringify(result), theirs, theirPlace);
   });
 
@@ -388,7 +499,7 @@ describe("another organization's record is never linked or named", () => {
     expectNothingOf(everything(o), theirs, theirPlace);
   });
 
-  it("gives the label only for a place with no place checker, though their ID is published", () => {
+  it("gives nothing for a place with no place checker, though their ID is published (D-048)", () => {
     const item = withKey(
       record("object", "Postcard", {
         rights: { uri: CNE },
@@ -396,7 +507,8 @@ describe("another organization's record is never linked or named", () => {
       }),
     );
     const o = ok(output(viewOf([item], item.id, CHECKERS), [item.id, theirPlace.id], CHECKERS));
-    expect(o.jsonLd["dcterms:spatial"]).toEqual({ "rdfs:label": "Their place" });
+    expect(o.jsonLd["dcterms:spatial"]).toBeUndefined();
+    expect(everything(o)).not.toContain("Their place");
     expectNothingOf(everything(o), theirPlace);
   });
 
