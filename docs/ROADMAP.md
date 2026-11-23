@@ -146,8 +146,9 @@ The data model in TypeScript, written for any archive or museum rather than one 
 - [x] T-018 **Loans and condition checks.** deps: T-017
   - Spectrum loans in and out (lender or borrower agent, dates, items, status) and condition checks (date, who checked, condition, notes), as dated entries on objects and archival units (mockup Whereabouts, Conservators, record "Condition"). Staff-only.
   - Done: D-044: loans in and out that point at moves, condition checks and fit to move, and a `departure` move reason; overdue loans can't be hidden.
-- [ ] T-016a **Structured restrictions on accessions.** deps: T-016 (risky)
+- [x] T-016a **Structured restrictions on accessions.** deps: T-016 (risky)
   - Restrictions are free text today and hold nothing back. Add structured ones (closed until a date; staff and researchers only, as in the Log an accession mockup) that hold records back like an unsigned deed.
+  - Done: `accessRestriction` (`closed_until` with `until`, or `staff_and_researchers`) holds the record, units below, scans and links exactly as an unsigned deed does (`access_restricted`); `indexAccessions` requires the caller's `today` (organization's local day), kept as `heldAsOf`; `restrictionHoldsOn`; free-text restrictions stay notes (D-053b, to be renumbered). For T-034: build the register with the real local day at publish time, and re-publish when a `closed_until` date passes.
 - [ ] T-018a **Loan follow-ups.** deps: T-018, T-016
   - A borrowed item that becomes the organization's (bought or given) needs a link from an accession to close its loan in. Link a condition check's `loanId` to the loan book and warn when a loan out goes without a recent fit check. Valuation, insurance and authoriser fields.
 - [ ] T-013a **Record type edits checked against records.** deps: T-013
