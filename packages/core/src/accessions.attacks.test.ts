@@ -12,13 +12,16 @@ import {
   deedHoldsOn,
   donorContact,
   effectivePublishIssues,
+  effectiveRecord,
   indexAccessions,
   publicOutput,
   publicView,
   validateAccession,
   validateDonorContact,
+  type CatalogRecord,
   type Issue,
   type PublicRecord,
+  type RecordId,
 } from "./index.js";
 import { deedHoldsOf } from "./accession-holds.js";
 import {
@@ -39,16 +42,21 @@ import {
   ok,
   registerOf,
   scan,
+  series,
   vase,
 } from "./accessions.fixtures.js";
 import {
   BASE,
   CHECKERS,
+  FIELDS,
   MAPPING,
   everything,
+  field,
   identifiersFor,
+  linkChecker,
   noAccessions,
   record,
+  template,
 } from "./public-output.fixtures.js";
 
 const SECRETS = Object.values(SECRET);
@@ -291,6 +299,8 @@ describe("a link to a held record names only its label (T-016 review)", () => {
           checkers,
           identifiers: identifiersFor(records),
           accessions,
+          // Links to accessioned kinds are live only with the records (D-043).
+          records,
         }),
       );
     const held = registerOf([accession({ records: [{ recordId: fonds.id, label: "F" }] })], {
@@ -306,6 +316,136 @@ describe("a link to a held record names only its label (T-016 review)", () => {
       { records },
     );
     expect(everything(run(signed))).toContain(BASE + item.id);
+  });
+});
+
+describe("a link is deed-checked through its target's parents and what it shows (T-016 second review)", () => {
+  const rights = { rights: { uri: CNE } };
+  const LINKS_TPL = template([
+    ...FIELDS,
+    field({ key: "related", kind: "record_link", repeatable: true }),
+  ]);
+  const RIGHTS_MAP = { field: "rights", term: "rights" };
+  const RELATED_MAP = { field: "related", term: "relation" };
+
+  /** A page linking to `links`, among `others`, and a way to publish it. */
+  function pageLinking(
+    links: readonly { recordId: RecordId; label: string }[],
+    others: readonly CatalogRecord[],
+    kind: "object" | "agent" = "object",
+  ) {
+    const page =
+      kind === "agent"
+        ? record("agent", "Page", { related: links })
+        : record("object", "Page", { ...rights, related: links });
+    const records = [...others, page];
+    const checkers = { ...CHECKERS, record_link: linkChecker(records) };
+    const view = viewOrThrow(
+      ok(
+        effectiveRecord(page.id, records, () => LINKS_TPL, {
+          checkers,
+          identifiers: identifiersFor(records),
+        }),
+      ),
+    );
+    const map = {
+      template: "out",
+      entries: kind === "agent" ? [RELATED_MAP] : [RIGHTS_MAP, RELATED_MAP],
+    };
+    const publishWith = (accessions: unknown, now: readonly CatalogRecord[] | undefined) =>
+      everything(
+        ok(
+          publicOutput(view, map, {
+            baseUrl: BASE,
+            published: records.map((r) => r.id),
+            checkers,
+            identifiers: identifiersFor(records),
+            templateFor: () => LINKS_TPL,
+            ...(accessions === undefined ? {} : { accessions }),
+            ...(now === undefined ? {} : { records: now }),
+          }),
+        ),
+      );
+    return { records, publishWith };
+  }
+
+  const fondsDeed = (deedStatus: string) =>
+    accession({ deedStatus, records: [{ recordId: fonds.id, label: "F" }] });
+
+  it("not when the register was made without a record above the target", () => {
+    const page = pageLinking(
+      [
+        { recordId: item.id, label: "Item label" },
+        { recordId: scan.id, label: "Scan label" },
+        { recordId: vase.id, label: "Vase label" },
+      ],
+      RECORDS,
+    );
+    // Every record but the series, so the register can't see the item is under the fonds.
+    const register = registerOf([fondsDeed("missing")], {
+      records: page.records.filter((r) => r.id !== series.id),
+    });
+    for (const now of [page.records, undefined]) {
+      const out = page.publishWith(register, now);
+      expect(out).not.toContain(BASE + item.id);
+      expect(out).not.toContain(BASE + scan.id);
+      expect(out).toContain("Item label");
+      expect(out).toContain("Scan label");
+      expect(leaks(out)).toEqual([]);
+    }
+    // A record outside the fonds is a live link, but only with the records.
+    expect(page.publishWith(register, page.records)).toContain(BASE + vase.id);
+    expect(page.publishWith(register, undefined)).not.toContain(BASE + vase.id);
+  });
+
+  it("not when the register was made without the record a digital asset shows", () => {
+    const page = pageLinking([{ recordId: scan.id, label: "Scan label" }], RECORDS);
+    // A signed deed, so only the item the register doesn't know keeps the scan a label.
+    const without = registerOf([fondsDeed("signed")], {
+      records: page.records.filter((r) => r.id !== item.id),
+    });
+    expect(page.publishWith(without, page.records)).not.toContain(BASE + scan.id);
+    const whole = registerOf([fondsDeed("signed")], { records: page.records });
+    expect(page.publishWith(whole, page.records)).toContain(BASE + scan.id);
+  });
+
+  it("not after the target moved under a held fonds, with a register made before", () => {
+    const free = record("archival_unit", "Free fonds", rights, { level: "fonds" });
+    const unit = record("archival_unit", "Unit", rights, { level: "series", parentId: free.id });
+    const heldFonds = record("archival_unit", "Held fonds", rights, { level: "fonds" });
+    const page = pageLinking(
+      [{ recordId: unit.id, label: "Unit label" }],
+      [free, unit, heldFonds, donor],
+    );
+    const register = registerOf(
+      [accession({ records: [{ recordId: heldFonds.id, label: "Held" }] })],
+      { records: page.records },
+    );
+    expect(page.publishWith(register, page.records)).toContain(BASE + unit.id);
+    const moved = { ...unit, parentId: heldFonds.id } as CatalogRecord;
+    const now = page.records.map((r) => (r.id === unit.id ? moved : r));
+    const out = page.publishWith(register, now);
+    expect(out).not.toContain(BASE + unit.id);
+    expect(out).toContain("Unit label");
+    expect(leaks(out)).toEqual([]);
+  });
+
+  it("not from an agent's page published without a register", () => {
+    const page = pageLinking(
+      [
+        { recordId: vase.id, label: "Vase label" },
+        { recordId: donor.id, label: "Agent label" },
+      ],
+      RECORDS,
+      "agent",
+    );
+    const out = page.publishWith(undefined, page.records);
+    expect(out).not.toContain(BASE + vase.id);
+    expect(out).toContain("Vase label");
+    expect(out).toContain(BASE + donor.id);
+    // With a register made now, the vase is a link.
+    const now = registerOf([], { records: page.records });
+    expect(page.publishWith(now, page.records)).toContain(BASE + vase.id);
   });
 });
 

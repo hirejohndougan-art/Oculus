@@ -55,9 +55,12 @@
  *   accession with a deed `missing` or `sent` produced, or produced an
  *   ancestor or the record a digital asset represents (`deed_not_signed`).
  *   With `records`, what a digital asset represents is found again in them.
- *   A link to an object, archival unit or digital asset that a deed holds
- *   back, or that the register doesn't know, goes out as its label only, as
- *   if unpublished. The check is only as fresh as the register: make it at
+ *   A link to an object, archival unit or digital asset goes out live only
+ *   when `records` is given and the linked record, its ancestry and what it
+ *   represents, all found in `records` now, are known to the register and
+ *   none is held back; otherwise it goes out as its label only, as if
+ *   unpublished (so a page published without `accessions` or `records`
+ *   shows such links as labels). The check is only as fresh as the register: make it at
  *   publish time. Nothing of an accession or a donor is read here.
  * - **Publishing is the caller's statement.** Records have no publish state
  *   yet, so the caller passes `published`, the IDs of every record that is
@@ -128,9 +131,9 @@ import {
   currentAncestry,
   currentRepresented,
   deedIssuesNow,
-  deedMayHold,
   effectivePublishIssues,
   isTemplateSource,
+  linkDeedCheck,
   templateFromSource,
   type EffectiveRecord,
   type PublicRecord,
@@ -164,13 +167,6 @@ import {
   type FieldTemplate,
   type TemplateCheckOptions,
 } from "./templates.js";
-
-/** Kinds an accession produces: links to them need the deed check too. */
-const ACCESSIONED_LINK_KINDS: ReadonlySet<string> = new Set([
-  "object",
-  "archival_unit",
-  "digital_asset",
-]);
 
 export const DCMITYPE_NAMESPACE = "http://purl.org/dc/dcmitype/";
 export const RDFS_NAMESPACE = "http://www.w3.org/2000/01/rdf-schema#";
@@ -232,7 +228,9 @@ export interface PublishOptions {
    * values): an ancestor's value changed or emptied since, or a record moved
    * to another parent or level, would otherwise still publish the old
    * inherited values. Only `records` and `templateFor` together catch every
-   * change to a kept view (D-021).
+   * change to a kept view (D-021). Links to objects, archival units and
+   * digital assets are deed-checked in it too, and without it go out as
+   * their labels only (D-043).
    */
   readonly records?: RecordLookup | readonly CatalogRecord[];
   /**
@@ -594,15 +592,19 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
   const recordUrl = safeText(baseUrl + view.id, ["id"], budget);
   const terms = new Map<DublinCoreTerm, OutValue[]>();
   terms.set("title", [outValue(safeText(view.title, ["title"], budget))]);
+  // Links are deed-checked against the records as they are now (D-043).
+  const deedClears = linkDeedCheck(accessions, records, organizationId);
   const linkable = (def: FieldDefinition, id: RecordId): boolean => {
     // Never the record itself, and only a published record of this
     // organization, of a kind the field allows (D-016, D-030, D-039).
     if (id === view.id || !published.has(id)) return false;
     const kind = linkTargetKind(linkCheckers.get(def.kind), organizationId, id);
     if (kind === undefined || !linkKindsOf(def).includes(kind)) return false;
-    // A record a deed holds back is treated as unpublished (D-043), and so is
-    // one the register can't vouch for.
-    return !ACCESSIONED_LINK_KINDS.has(kind) || !deedMayHold(accessions, id);
+    // A record a deed holds back, or one above it or that it shows, is
+    // treated as unpublished (D-043), and so is one the register or the
+    // current records can't vouch for: without `records`, an object,
+    // archival unit or digital asset is never linked.
+    return deedClears(id, kind);
   };
   for (const { field, term } of checked.value.entries) {
     const shownValue = entries.get(field);

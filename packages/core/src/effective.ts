@@ -1186,10 +1186,50 @@ export function deedIssuesNow(
   }
 }
 
-/** True when a deed may hold `id` back or `accessions` can't say: for link targets. */
-export function deedMayHold(accessions: unknown, id: RecordId): boolean {
+/**
+ * For `public-output.ts` only: the deed check for link targets (D-043). The
+ * function it returns says whether a link to `id` (whose kind, as the link
+ * checker saw it, is `kind`) may go out live as far as deeds go. A target of
+ * an accessioned kind, as the checker or the records now have it, may be
+ * linked only when `records` (a list or a lookup from `indexRecords`) is
+ * given and the target, its current ancestry and, for a digital asset, what
+ * it represents with that record's ancestry (found exactly as the record's
+ * own check finds them, with the same loop and hop rules) are all known to
+ * `accessions` (a register of `organizationId`) and none is held back.
+ * Anything that can't be found, read or trusted answers false. Never throws.
+ */
+export function linkDeedCheck(
+  accessions: unknown,
+  records: unknown,
+  organizationId: OrganizationId,
+): (id: RecordId, kind: string) => boolean {
   const holds = deedHoldsOf(accessions);
-  return holds === undefined || !holds.isKnown(id) || holds.isHeld(id);
+  let state: LookupState | undefined;
+  try {
+    state = records === undefined ? undefined : lookupFor(records);
+  } catch {
+    state = undefined;
+  }
+  return (id, kind) => {
+    try {
+      const got = state === undefined ? undefined : fetchRecord(state, id);
+      const now = got?.ok === true ? got.record : undefined;
+      // Not of an accessioned kind, by the checker or by the records now.
+      if (!ACCESSIONED.has(kind) && (now === undefined || !ACCESSIONED.has(now.kind))) {
+        return true;
+      }
+      if (holds?.organizationId !== organizationId) return false;
+      if (state === undefined || now === undefined) return false;
+      if (now.organizationId !== organizationId) return false;
+      const up = ancestry(id, state);
+      const shows = representedIn(up[0], state);
+      if (shows === null) return false;
+      const ids = [...up.map((r) => r.id), ...shows];
+      return ids.every((at) => holds.isKnown(at) && !holds.isHeld(at));
+    } catch {
+      return false;
+    }
+  };
 }
 
 /** The kinds an accession can produce, so the only ones the deed check applies to. */
