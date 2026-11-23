@@ -2,6 +2,17 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-23 05:51 CT — security — S-008 Another organization's template keys revealed
+- Result: done (findings; most serious fixed)
+- Security: `npm audit` 0 vulnerabilities. Secret scan of the whole tree and every commit since the last security run (`ec7153e..91763eb`; keys, tokens, private keys, JWTs, `.env`, URL credentials, emails, phone numbers): nothing; only obvious fakes in tests (`user:pw@example.org`). No private data about real people on `main`. Note: the leftover branches `autopilot/T-004` to `T-011` on GitHub still hold John's three original commits with his personal commit email (now gone from `main`); deleting those merged branches on GitHub would remove it from the branch list (this run can't delete remote branches). Dependabot and code-scanning alerts: not reachable from this run (T-001a, needs John). Code review of every commit since the last security run (T-005a, T-012, T-013, T-014, T-015, T-017, T-019, T-019a, T-009a, T-010a, S-005a, S-006a, U-002) by two independent reviewers (public boundary; organization isolation and input handling), with scratch tests: no high or medium findings, nothing private reaches `publicView` or `publicOutput`. Low findings: another organization's template keys revealed by check order and messages (fixed here, S-008); the same for identifier type creation (S-009); kept views publish without re-checks unless the caller passes `records` and `templateFor` (S-010); link labels to unpublished targets (S-011). No changes to `scripts/` or `.github/` in the range.
+- What changed: `templateOfRecord` checks the template's (or registry's) organization before comparing or looking up the key; `wrong_organization` names no key. Attack tests in `templates.organizations.test.ts` (4 fail without the fix). Commit 8b3d556.
+- Decisions: none
+- Review: one independent review of the diff: safe (noted the inner registry check can no longer fail; kept as defence in depth).
+- Sources: OWASP ASVS 4.0.3 V4.2.1, V7.4.1.
+- Note: local `main` in the sandbox was stale again (origin/main had been rewritten before this run, not by it); this run built from origin/main and pushed a fast-forward.
+- Gate: PASS · tests_passing 2365 (was 2360) · npm audit clean
+- Next: T-016 Accessions and deeds of gift (risky); security follow-ups S-009, S-010, S-011
+
 ## 2026-11-23 03:27 CT — upkeep — U-002 Direct tests for the organization helpers
 - Result: done
 - What changed: `npm outdated` shows nothing to update within majors; TypeScript 7 and Vite 8 are still blocked (typescript-eslint 8.73.0 still needs TypeScript `<6.1`, Vite 8.3.8 still requires MPL-2.0 `lightningcss`), so T-001b stays open. Added 17 direct tests for `oneOrganization`, `organizationIdOf`, `mixedOrganizationsIssue` and `isIdentifierTypeKey` (getters and Proxies never run, inherited IDs ignored, unowned items at any position give `mixed`, unwalkable lists don't throw, the issue names no organization, the key rule and prototype keys). Commit 9ea22c2. Test-only; no code changed.

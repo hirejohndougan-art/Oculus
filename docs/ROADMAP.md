@@ -16,6 +16,14 @@ These are never picked by a run. The weekly report repeats each question until J
 
 The data model in TypeScript, written for any archive or museum rather than one organization. There is no server or database yet: these are pure, tested modules in `packages/core`.
 
+- [x] S-008 **Another organization's template keys revealed.** (risky, security run 2026-11-23) Done.
+  - `templateOfRecord` compared or looked up a record's `templateKey` before checking the template's organization: `template_mismatch` quoted another organization's key, `unknown_template` vs `wrong_organization` told which keys another organization's registry holds, and `wrong_organization` named the key. Now the organization is checked first and the message names no key.
+- [ ] S-009 **Identifier type creation reveals another organization's keys.** (risky, security run 2026-11-23)
+  - `identifierTypeCreation` with another organization's `identifierTypes` gives `key_taken` when that organization has the key and `mixed_organizations` otherwise (`identifier-type-changes.ts` `readUse` with `listed=false`, before the check at about line 563). Check the organization first, as S-008 did for templates.
+- [ ] S-010 **Kept views publish without re-checks by default.** (risky, security run 2026-11-23)
+  - `publicOutput` re-checks a kept view against current records and templates only when the caller passes `records` and `templateFor`; without them a value whose field has since been made staff is still published, while the identifier check already fails closed. Make both required for a kept view (or have the service layer always build the view at publish time), with an attack test.
+- [ ] S-011 **Link labels to unpublished or other organizations' records.** (risky, security run 2026-11-23)
+  - A `record_link`'s label is published even when its target is unpublished or another organization's; only the ID is held back. If labels are filled from the target's title (e.g. a donor's name), that leaks. Decide: hold back labels of unpublished targets, or require staff-written labels and say so in `record-links.ts`; fix the module header's "never reveals that an unpublished record exists".
 - [x] S-001 **Public output re-checks ancestors' templates.** (risky, security run 2026-11-21)
   - A view kept from earlier published a value inherited from a parent whose template had since made the field staff; `currentTemplate` compared only the record's own template. Fixed with `templateFor` (D-020).
 - [x] S-001a **Stale ancestry in a kept view.** deps: S-001 (risky) Done: `records` option, `record_changed` (D-021).
