@@ -189,9 +189,9 @@ Database:
 - [~] T-019b **Organizations on vocabularies, terms, rights settings and Dublin Core mappings.** deps: T-019 (risky)
   - From the T-019a review: a Dublin Core mapping is matched to a template by key only, so one organization's mapping passes for another's template with the same key. Nothing private can be published that way (every entry must be a public field of the target template), but mappings should carry an `organizationId` like everything else.
   - Split: in `packages/core` today only Dublin Core mappings are organization data. Vocabularies (`VOCABULARIES`) and rights terms (`RIGHTS_TERMS`) are built-in standard lists, controlled terms are stored inside records (which carry an `organizationId`), and there are no rights settings stored as data yet.
-- [~] T-019b1 **Organizations on Dublin Core mappings.** deps: T-019a (risky)
+- [x] T-019b1 **Organizations on Dublin Core mappings.** deps: T-019a (risky)
   - `organizationId` on `DublinCoreMapping`; `validateDublinCoreMapping`, `mappingForTemplate` and `publicOutput` refuse another organization's mapping without naming its keys; the built-in mappings become organization-free presets with `mappingFromPreset` to make an organization's copy, like `templateFromPreset`.
-  - Built (D-047), gate passing; waiting for the independent review (step i) before it counts as done.
+  - Done (D-047); independent review: safe.
 - [ ] T-019b2 **Organizations on local term lists and rights settings.** deps: T-019b1, T-027 (risky)
   - When local vocabularies, stored authority terms (T-027) or per-organization rights settings become stored data, give each a required `organizationId` and refuse mixed or unowned sets, as D-030 does.
 - [ ] T-019d **Site passwords.** deps: T-019, T-023 (risky)
