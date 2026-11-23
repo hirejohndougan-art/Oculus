@@ -372,7 +372,7 @@ describe("D-048: a place value shows its name only when its place record is vouc
       record("object", "Postcard", {
         rights: { uri: CNE },
         creator: { recordId: donor.id, label: "SECRET-donor-name" },
-      } as never),
+      }),
     );
     const { effective, view, result } = publish([donor, item], item.id, { ...CHECKERS });
     expect(JSON.stringify(view)).not.toContain("SECRET");
@@ -390,7 +390,7 @@ describe("D-048: a place value shows its name only when its place record is vouc
       record("object", "Postcard", {
         rights: { uri: CNE },
         creator: { recordId: donor.id, label: "SECRET-donor-name" },
-      } as never),
+      }),
     );
     const { view, result } = publish([donor, item], item.id, { ...CHECKERS, place: lax });
     expect(JSON.stringify(view)).not.toContain("SECRET");
@@ -403,7 +403,7 @@ describe("D-048: a place value shows its name only when its place record is vouc
       record("object", "Postcard", {
         rights: { uri: CNE },
         creator: { recordId: donor.id, label: "SECRET-donor-name" },
-      } as never),
+      }),
     );
     const all = [donor, item];
     const { view, result } = publish(all, item.id, { ...CHECKERS, place: linkChecker(all) });

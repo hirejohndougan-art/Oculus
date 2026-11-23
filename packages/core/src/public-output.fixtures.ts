@@ -184,7 +184,7 @@ export function effectiveOf(
   // With the identifier checker, so public-type numbers reach the view
   // (D-022), and the records' identifiers, which hold them (D-038).
   const result = effectiveRecord(id, records, () => tpl, {
-    checkers: checkers as never,
+    checkers: checkers,
     identifiers: identifiersFor(records),
   });
   if (!result.ok) throw new Error(JSON.stringify(result.issues));
