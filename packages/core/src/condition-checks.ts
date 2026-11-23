@@ -575,7 +575,8 @@ export function conditionLoanProblems(
  * The items of loans out that went, or are to go, without a recent
  * fit-to-move check (Spectrum: check condition before an object is lent).
  * Every `agreed` loan out in `loans` is looked at: an item that went out is
- * judged by `fitToMove` on the day of its linked `loan_out`; one not yet
+ * judged by `fitToMove` on the day of its linked `loan_out`, counting only
+ * checks written down no later than that move; one not yet
  * sent, on `today` (`YYYY-MM-DD`, the organization's own date). Listed when
  * the answer isn't `fit`. `maxAgeDays` is required: how recent a check must
  * be is the organization's rule, not this module's. By loan, in the book's
@@ -631,7 +632,7 @@ export function loansOutWithoutFitCheck(
           continue;
         }
         const on = item.started?.on ?? today;
-        // Only a check written down before the move counts on its day (review fix).
+        // Only a check written down no later than the move counts (review fixes).
         const check = latestBefore(data, item.recordId, on, item.started?.recordedAt);
         const because = judge(check, on, maxAge);
         if (because !== "fit") warn(on, because, check);
@@ -662,8 +663,10 @@ export function needingConservation(log: ConditionLog): Validated<readonly Condi
 // Helpers
 
 /**
- * The record's latest check made on or before `on`; with `recordedBy`, one
- * made on `on` itself counts only if written down no later than that time.
+ * The record's latest check made on or before `on`; with `recordedBy` (the
+ * move's recorded time), only a check written down no later than that time
+ * counts, whatever day it is dated (review fix: a check back-dated after the
+ * item left says nothing about it before it left).
  */
 function latestBefore(
   data: LogData,
@@ -675,7 +678,7 @@ function latestBefore(
   for (let i = history.length - 1; i >= 0; i -= 1) {
     const check = history[i];
     if (check === undefined || check.checkedOn > on) continue;
-    if (check.checkedOn === on && recordedBy !== undefined && check.recordedAt > recordedBy) {
+    if (recordedBy !== undefined && Date.parse(check.recordedAt) > Date.parse(recordedBy)) {
       continue;
     }
     return check;

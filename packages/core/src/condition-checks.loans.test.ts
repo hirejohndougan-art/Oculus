@@ -147,6 +147,9 @@ function check(
   } as ConditionCheck;
 }
 
+/** Written down on its own day, long before the print went out. */
+const EARLY = { recordedAt: "2026-08-20T12:00:00.000Z" };
+
 function log(list: readonly unknown[]): ConditionLog {
   return ok(indexConditionChecks(ORG, list));
 }
@@ -218,7 +221,7 @@ describe("loans out without a recent fit-to-move check", () => {
     loansOutWithoutFitCheck(l, BOOK, { today, maxAgeDays });
 
   it("judges a sent item on the day it went out, an unsent one on today", () => {
-    const l = log([check(print, "2026-08-20"), check(map, "2026-11-01")]);
+    const l = log([check(print, "2026-08-20", EARLY), check(map, "2026-11-01")]);
     expect(ok(warn(l, 30))).toEqual([]);
     const stale = ok(warn(l, 10));
     expect(stale.map((w) => [w.recordId, w.sent, w.on, w.because])).toEqual([
@@ -244,6 +247,16 @@ describe("loans out without a recent fit-to-move check", () => {
     expect(ok(warn(log([before, mapOk]), 30))).toEqual([]);
   });
 
+  it("a check back-dated before the move but written down after it doesn't count", () => {
+    const backDated = check(print, "2026-08-20");
+    expect(backDated.recordedAt > printOut.recordedAt).toBe(true);
+    const mapOk = check(map, "2026-11-01");
+    expect(ok(warn(log([backDated, mapOk]), 30)).map((w) => [w.recordId, w.because])).toEqual([
+      [print, "unchecked"],
+    ]);
+    expect(ok(warn(log([check(print, "2026-08-20", EARLY), mapOk]), 30))).toEqual([]);
+  });
+
   it("an item whose named loan_out isn't in the log is reported, never taken as not sent", () => {
     const broken: LoanOut = {
       ...out,
@@ -265,7 +278,7 @@ describe("loans out without a recent fit-to-move check", () => {
 
   it("lists an unfit item, and ignores loans not agreed and loans in", () => {
     const l = log([
-      check(print, "2026-08-20", { condition: "needs_conservation" }),
+      check(print, "2026-08-20", { condition: "needs_conservation", ...EARLY }),
       check(map, "2026-11-01", { fitToMove: false }),
     ]);
     expect(ok(warn(l, 365)).map((w) => [w.loanId, w.recordId, w.because])).toEqual([
