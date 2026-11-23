@@ -70,7 +70,7 @@ describe("built-in names can't stand in for identifier types", () => {
       uniqueness: "current",
     } as const;
     expect(validateIdentifierType(type).ok).toBe(true);
-    expect(validateIdentifierTypes([type]).ok).toBe(true);
+    expect(validateIdentifierTypes([type], ORG).ok).toBe(true);
     const r = validateRecordIdentifiers(
       {
         recordId: newRecordId(),
@@ -103,7 +103,7 @@ describe("hostile objects", () => {
   it("Proxies, getters and throwing getters are refused without throwing", () => {
     const proxy = new Proxy({ ...BOX }, {});
     expect(codes(validateIdentifierType(proxy))).toEqual(["not_an_object"]);
-    expect(codes(validateIdentifierTypes(new Proxy([BOX], {})))).toEqual(["not_a_list"]);
+    expect(codes(validateIdentifierTypes(new Proxy([BOX], {}), ORG))).toEqual(["not_a_list"]);
 
     let reads = 0;
     const getter = {
@@ -437,7 +437,7 @@ describe("size limits", () => {
         TYPES,
       ).ok,
     ).toBe(false);
-    expect(validateIdentifierTypes(new Array(1_000_000).fill(BOX)).ok).toBe(false);
+    expect(validateIdentifierTypes(new Array(1_000_000).fill(BOX), ORG).ok).toBe(false);
     expect(elapsed()).toBeLessThan(1000);
   });
 
@@ -557,20 +557,69 @@ describe("one organization's numbers can't be read or mixed with another's (D-01
       [5, theirs("secret_key"), theirs("secret_key")],
       ["x", BOX, theirs("secret_key"), theirs("secret_key")],
     ]) {
-      const r = validateIdentifierTypes(list);
+      const r = validateIdentifierTypes(list, ORG);
       expect(r.ok).toBe(false);
-      for (const code of codes(r)) {
-        expect(["mixed_organizations", "invalid_organization", "not_an_object"]).toContain(code);
-      }
+      expect(new Set(codes(r))).toEqual(new Set(["mixed_organizations"]));
       expect(JSON.stringify(r)).not.toContain("secret_key");
     }
     // One organization's own duplicate still names the key.
-    const own = validateIdentifierTypes([BOX, { ...BOX, label: "Again" }]);
+    const own = validateIdentifierTypes([BOX, { ...BOX, label: "Again" }], ORG);
     expect(codes(own)).toEqual(["duplicate_key"]);
   });
 
+  it("validateIdentifierTypes names no key of a list wholly another organization's (S-009b)", () => {
+    const theirs = (key: string): IdentifierType => ({ ...OTHER_BOX, key });
+    for (const list of [
+      [theirs("secret_key"), theirs("secret_key")],
+      [{ ...theirs("secret_key"), uniqueness: "maybe", pattern: "[[" }],
+      [{ ...theirs("secret_key"), secret_property: 1 }],
+      [{ ...theirs("secret_key"), label: "x".repeat(5000) }],
+      [theirs("secret_key")],
+    ]) {
+      const r = validateIdentifierTypes(list, ORG);
+      expect(r.ok).toBe(false);
+      expect(new Set(codes(r))).toEqual(new Set(["mixed_organizations"]));
+      expect(JSON.stringify(r)).not.toContain("secret");
+      // Checked for their own organization, the list gets the full check.
+      if (list.length > 1)
+        expect(codes(validateIdentifierTypes(list, OTHER))).toContain("duplicate_key");
+    }
+  });
+
+  it("validateIdentifierTypes reads each entry's organization as plain own data (S-009b)", () => {
+    const getter = Object.defineProperty({ ...BOX, key: "secret_key" }, "organizationId", {
+      get: () => ORG,
+      enumerable: true,
+    });
+    const inherited = Object.assign(Object.create({ organizationId: ORG }) as object, {
+      key: "secret_key",
+      label: "Inherited",
+      uniqueness: "none",
+    });
+    const slotGetter: unknown[] = [BOX];
+    Object.defineProperty(slotGetter, 1, { get: () => BOX, enumerable: true });
+    for (const list of [
+      [getter, getter],
+      [inherited, inherited],
+      [new Proxy({ ...BOX, key: "secret_key" }, {}), BOX],
+      slotGetter,
+    ]) {
+      const r = validateIdentifierTypes(list, ORG);
+      expect(r.ok).toBe(false);
+      expect(new Set(codes(r))).toEqual(new Set(["mixed_organizations"]));
+      expect(JSON.stringify(r)).not.toContain("secret");
+    }
+  });
+
+  it("validateIdentifierTypes needs the caller's organization", () => {
+    for (const org of [undefined, null, "", "not-an-id", OTHER.toUpperCase()]) {
+      expect(codes(validateIdentifierTypes([BOX], org as never))).toEqual(["invalid_organization"]);
+    }
+    expect(validateIdentifierTypes([], ORG).ok).toBe(true);
+  });
+
   it("validateIdentifierTypes refuses one list holding two organizations' types", () => {
-    expect(codes(validateIdentifierTypes([BOX, { ...OTHER_BOX, key: "other_box" }]))).toEqual([
+    expect(codes(validateIdentifierTypes([BOX, { ...OTHER_BOX, key: "other_box" }], ORG))).toEqual([
       "mixed_organizations",
     ]);
     const unowned = { key: BOX.key, label: BOX.label, uniqueness: BOX.uniqueness };

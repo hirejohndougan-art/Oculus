@@ -614,21 +614,24 @@ describe("rightsPublishIssues refuses an effective record", () => {
 
 describe("staff identifier types never reach the public view (D-022)", () => {
   const SECRET = "DF-SECRET-0042";
-  const made = makeIdentifierChecker([
-    {
-      key: "object_number",
-      label: "Object number",
-      organizationId: ORG,
-      uniqueness: "none",
-      public: true,
-    },
-    {
-      key: "donor_file_number",
-      label: "Donor file number",
-      organizationId: ORG,
-      uniqueness: "none",
-    },
-  ]);
+  const made = makeIdentifierChecker(
+    [
+      {
+        key: "object_number",
+        label: "Object number",
+        organizationId: ORG,
+        uniqueness: "none",
+        public: true,
+      },
+      {
+        key: "donor_file_number",
+        label: "Donor file number",
+        organizationId: ORG,
+        uniqueness: "none",
+      },
+    ],
+    ORG,
+  );
   if (!made.ok) throw new Error("types");
   const checkers = { identifier: made.value };
   function numberDef(visibility: "public" | "staff", repeatable = false): FieldDefinition {
@@ -752,22 +755,25 @@ describe("staff identifier types never reach the public view (D-022)", () => {
   });
 
   it("never quotes a staff-type number that fails its format in the child's notes", () => {
-    const formatted = makeIdentifierChecker([
-      {
-        key: "object_number",
-        label: "Object number",
-        organizationId: ORG,
-        uniqueness: "none",
-        public: true,
-      },
-      {
-        key: "donor_file_number",
-        label: "Donor file number",
-        organizationId: ORG,
-        uniqueness: "none",
-        pattern: "D-####",
-      },
-    ]);
+    const formatted = makeIdentifierChecker(
+      [
+        {
+          key: "object_number",
+          label: "Object number",
+          organizationId: ORG,
+          uniqueness: "none",
+          public: true,
+        },
+        {
+          key: "donor_file_number",
+          label: "Donor file number",
+          organizationId: ORG,
+          uniqueness: "none",
+          pattern: "D-####",
+        },
+      ],
+      ORG,
+    );
     if (!formatted.ok) throw new Error("types");
     const fonds = unit("Fonds", "fonds", undefined, {
       number: { type: "donor_file_number", value: SECRET },
@@ -801,15 +807,18 @@ describe("staff identifier types never reach the public view (D-022)", () => {
   it("leaves out an inherited staff-type number that doesn't fit its type's format", () => {
     // Kept as staff only if it passes every other check: a staff-type number
     // that doesn't fit its own format is still refused, so nothing is kept.
-    const made = makeIdentifierChecker([
-      {
-        key: "donor_file_number",
-        label: "Donor file number",
-        organizationId: ORG,
-        uniqueness: "none",
-        pattern: "DF-####",
-      },
-    ]);
+    const made = makeIdentifierChecker(
+      [
+        {
+          key: "donor_file_number",
+          label: "Donor file number",
+          organizationId: ORG,
+          uniqueness: "none",
+          pattern: "DF-####",
+        },
+      ],
+      ORG,
+    );
     if (!made.ok) throw new Error("types");
     const fonds = unit("Fonds", "fonds", undefined, {
       number: { type: "donor_file_number", value: "NOT-A-NUMBER" },
@@ -844,21 +853,24 @@ describe("staff identifier types never reach the public view (D-022)", () => {
 describe("an identifier field publishes only a number its record holds (D-038)", () => {
   const OTHER_ORG = newOrganizationId();
   const DONOR = "DF-SECRET-0042";
-  const made = makeIdentifierChecker([
-    {
-      key: "object_number",
-      label: "Object number",
-      organizationId: ORG,
-      uniqueness: "none",
-      public: true,
-    },
-    {
-      key: "donor_file_number",
-      label: "Donor file number",
-      organizationId: ORG,
-      uniqueness: "none",
-    },
-  ]);
+  const made = makeIdentifierChecker(
+    [
+      {
+        key: "object_number",
+        label: "Object number",
+        organizationId: ORG,
+        uniqueness: "none",
+        public: true,
+      },
+      {
+        key: "donor_file_number",
+        label: "Donor file number",
+        organizationId: ORG,
+        uniqueness: "none",
+      },
+    ],
+    ORG,
+  );
   if (!made.ok) throw new Error("types");
   const checkers = { identifier: made.value };
   function numberDef(inherited = false, repeatable = false): FieldDefinition {

@@ -155,7 +155,7 @@ const IDENTIFIER_TYPES = [
 ];
 
 function identifierChecker(): FieldValueChecker {
-  const made = makeIdentifierChecker(IDENTIFIER_TYPES);
+  const made = makeIdentifierChecker(IDENTIFIER_TYPES, ORG);
   if (!made.ok) throw new Error(JSON.stringify(made.issues));
   return made.value;
 }

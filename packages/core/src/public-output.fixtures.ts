@@ -121,23 +121,31 @@ export function record(
 // Both types are public, so their values may be published; the type key
 // itself must still never appear in output. `donor_file_number` is staff
 // only (the default), so its values must never be published (D-022).
-const identifierChecker = makeIdentifierChecker([
-  {
-    key: "accession_number",
-    label: "Accession number",
-    organizationId: ORG,
-    uniqueness: "none",
-    public: true,
-  },
-  {
-    key: "secret_type_code",
-    label: "Secret type",
-    organizationId: ORG,
-    uniqueness: "none",
-    public: true,
-  },
-  { key: "donor_file_number", label: "Donor file number", organizationId: ORG, uniqueness: "none" },
-]);
+const identifierChecker = makeIdentifierChecker(
+  [
+    {
+      key: "accession_number",
+      label: "Accession number",
+      organizationId: ORG,
+      uniqueness: "none",
+      public: true,
+    },
+    {
+      key: "secret_type_code",
+      label: "Secret type",
+      organizationId: ORG,
+      uniqueness: "none",
+      public: true,
+    },
+    {
+      key: "donor_file_number",
+      label: "Donor file number",
+      organizationId: ORG,
+      uniqueness: "none",
+    },
+  ],
+  ORG,
+);
 if (!identifierChecker.ok) throw new Error("identifier types");
 /** The checkers publicOutput needs for the fixtures' identifier field. */
 export const CHECKERS = Object.freeze({ identifier: identifierChecker.value });

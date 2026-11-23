@@ -362,25 +362,28 @@ describe("visibility", () => {
 describe("records checked against the presets", () => {
   // Identifier values need the organization's types to be checked (D-015).
   // Invented sample types for the identifier fields the presets use.
-  const made = makeIdentifierChecker([
-    // Call and accession numbers are usually published with the record, so
-    // these are marked public; types are staff only by default (D-022).
-    {
-      key: "call_number",
-      label: "Call number",
-      pattern: "MS-####.#",
-      organizationId: ORG,
-      uniqueness: "current",
-      public: true,
-    },
-    {
-      key: "accession_number",
-      label: "Accession number",
-      organizationId: ORG,
-      uniqueness: "all_time",
-      public: true,
-    },
-  ]);
+  const made = makeIdentifierChecker(
+    [
+      // Call and accession numbers are usually published with the record, so
+      // these are marked public; types are staff only by default (D-022).
+      {
+        key: "call_number",
+        label: "Call number",
+        pattern: "MS-####.#",
+        organizationId: ORG,
+        uniqueness: "current",
+        public: true,
+      },
+      {
+        key: "accession_number",
+        label: "Accession number",
+        organizationId: ORG,
+        uniqueness: "all_time",
+        public: true,
+      },
+    ],
+    ORG,
+  );
   if (!made.ok) throw new Error(JSON.stringify(made.issues));
   const withIds: TemplateCheckOptions = { checkers: { identifier: made.value } };
 

@@ -63,7 +63,7 @@ function record(fields: Record<string, unknown>): CatalogRecord {
 }
 
 function identifierChecker(): FieldValueChecker {
-  const made = makeIdentifierChecker(TYPES);
+  const made = makeIdentifierChecker(TYPES, ORG);
   if (!made.ok) throw new Error(JSON.stringify(made.issues));
   return made.value;
 }
@@ -180,7 +180,7 @@ describe("hostile values given straight to a checker", () => {
 
   it("refuses hostile identifier types without throwing", () => {
     for (const types of [new Proxy(TYPES, {}), [new Proxy(TYPES[0] ?? {}, {})], null, "legacy"]) {
-      expect(makeIdentifierChecker(types).ok).toBe(false);
+      expect(makeIdentifierChecker(types, ORG).ok).toBe(false);
     }
   });
 });
@@ -194,7 +194,7 @@ describe("staff identifier types can't be made public by accident (D-022)", () =
     const proto = Object.prototype as Record<string, unknown>;
     proto.public = true;
     try {
-      const made = makeIdentifierChecker(STAFF);
+      const made = makeIdentifierChecker(STAFF, ORG);
       if (!made.ok) throw new Error("types");
       const r = checkRecordAgainstTemplate(
         record({ number: { type: "donor_file", value: "DF-12" } }),
@@ -208,7 +208,7 @@ describe("staff identifier types can't be made public by accident (D-022)", () =
   });
 
   it("a field object with a hostile visibility counts as public", () => {
-    const made = makeIdentifierChecker(STAFF);
+    const made = makeIdentifierChecker(STAFF, ORG);
     if (!made.ok) throw new Error("types");
     for (const f of [
       { visibility: "Staff" },
@@ -223,7 +223,8 @@ describe("staff identifier types can't be made public by accident (D-022)", () =
 
 describe("one organization's identifier checker can't vouch for another's numbers (D-019)", () => {
   // Organization B made `legacy` public; for this record's organization it is staff.
-  const otherTypes = [{ ...TYPES[0], organizationId: newOrganizationId() }];
+  const OTHER_ORG = newOrganizationId();
+  const otherTypes = [{ ...TYPES[0], organizationId: OTHER_ORG }];
 
   it("a type list mixing in another organization's types names none of their keys (S-009a)", () => {
     const OTHER = newOrganizationId();
@@ -232,7 +233,7 @@ describe("one organization's identifier checker can't vouch for another's number
       [...TYPES, theirs, theirs],
       [theirs, theirs, ...TYPES],
     ]) {
-      const made = makeIdentifierChecker(list);
+      const made = makeIdentifierChecker(list, ORG);
       if (made.ok) throw new Error("a mixed list must be refused");
       expect(codes(made.issues)).toContain("mixed_organizations");
       expect(codes(made.issues)).not.toContain("duplicate_key");
@@ -240,8 +241,67 @@ describe("one organization's identifier checker can't vouch for another's number
     }
   });
 
+  it("a list wholly another organization's names none of its keys (S-009b)", () => {
+    const theirs = { ...TYPES[0], key: "secret_key", organizationId: OTHER_ORG };
+    for (const list of [
+      // Invalid: two types share a key, one has a bad format and uniqueness.
+      [theirs, theirs],
+      [theirs, { ...theirs, key: "secret_other", pattern: "[[", uniqueness: "maybe" }],
+      [{ ...theirs, label: "" }],
+      // Valid as their own list, but not the caller's.
+      [theirs],
+    ]) {
+      const made = makeIdentifierChecker(list, ORG);
+      if (made.ok) throw new Error("another organization's list must be refused");
+      expect(new Set(codes(made.issues))).toEqual(new Set(["mixed_organizations"]));
+      expect(JSON.stringify(made)).not.toContain("secret");
+      // Their own organization still gets the full, keyed check.
+      if (list.length > 1 || list[0]?.label === "") {
+        const own = makeIdentifierChecker(list, OTHER_ORG);
+        expect(own.ok).toBe(false);
+      }
+    }
+  });
+
+  it("refuses entries naming no organization, or behind a getter, before reading them (S-009b)", () => {
+    const unowned = { key: "secret_key", label: "Unowned", uniqueness: "none" };
+    const getter = Object.defineProperty({ ...TYPES[0], key: "secret_key" }, "organizationId", {
+      get: () => ORG,
+      enumerable: true,
+    });
+    const holes: unknown[] = [];
+    holes.length = 2;
+    for (const list of [[unowned, unowned], [getter, getter], [...TYPES, 5, 5], holes]) {
+      const made = makeIdentifierChecker(list, ORG);
+      if (made.ok) throw new Error("must be refused");
+      expect(new Set(codes(made.issues))).toEqual(new Set(["mixed_organizations"]));
+      expect(JSON.stringify(made)).not.toContain("secret");
+    }
+  });
+
+  it("needs a real organization ID", () => {
+    for (const org of [undefined, "", "not-an-id", { id: ORG }]) {
+      const made = makeIdentifierChecker(TYPES, org as never);
+      if (made.ok) throw new Error("must be refused");
+      expect(codes(made.issues)).toEqual(["invalid_organization"]);
+    }
+  });
+
+  it("a checker made with no types still belongs to its organization (S-009b)", () => {
+    const made = makeIdentifierChecker([], OTHER_ORG);
+    if (!made.ok) throw new Error("an empty list is valid");
+    expect(codes(made.value({ type: "legacy", value: "P-12" }, anyField, rec))).toEqual([
+      "wrong_organization_checker",
+    ]);
+    const mine = makeIdentifierChecker([], ORG);
+    if (!mine.ok) throw new Error("an empty list is valid");
+    expect(codes(mine.value({ type: "legacy", value: "P-12" }, anyField, rec))).toEqual([
+      "unknown_type",
+    ]);
+  });
+
   it("refuses every value of a record of another organization, or of none", () => {
-    const made = makeIdentifierChecker(otherTypes);
+    const made = makeIdentifierChecker(otherTypes, OTHER_ORG);
     if (!made.ok) throw new Error("bad fixture");
     expect(codes(made.value({ type: "legacy", value: "P-12" }, anyField, rec))).toEqual([
       "wrong_organization_checker",
