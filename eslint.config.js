@@ -1,5 +1,6 @@
 import js from "@eslint/js";
 import tseslint from "typescript-eslint";
+import { dbRules } from "./eslint.db-rules.js";
 
 export default tseslint.config(
   {
@@ -25,4 +26,5 @@ export default tseslint.config(
       globals: { process: "readonly", console: "readonly" },
     },
   },
+  ...dbRules,
 );
