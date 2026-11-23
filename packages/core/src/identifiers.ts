@@ -282,7 +282,10 @@ export function validateNewIdentifierType(input: unknown): Validated<IdentifierT
 
 /**
  * Check an organization's whole list of identifier types: each type, plus no
- * two with the same key. Never throws.
+ * two with the same key. A list mixing organizations, or holding a type
+ * whose organization can't be read, gets only organization issues
+ * (`mixed_organizations`, `invalid_organization`), never one naming a key
+ * (S-009a). Never throws.
  */
 export function validateIdentifierTypes(input: unknown): Validated<readonly IdentifierType[]> {
   return guarded(() => {
@@ -308,6 +311,8 @@ export function validateIdentifierTypes(input: unknown): Validated<readonly Iden
     const copy = readPlainData(input, [], TYPES_LIMITS, issues);
     if (copy === undefined || !Array.isArray(copy)) return { ok: false, issues: issues.items };
     const list = copy as readonly JsonValue[];
+    const owners = organizationIssues(list);
+    if (owners.length > 0) return { ok: false, issues: owners };
     const seen = new Set<string>();
     let organization: string | undefined;
     list.forEach((item, index) => {
@@ -342,6 +347,46 @@ export function validateIdentifierTypes(input: unknown): Validated<readonly Iden
     if (issues.count > 0) return { ok: false, issues: issues.items };
     return { ok: true, value: list as unknown as readonly IdentifierType[] };
   }, "These identifier types could not be read as plain data.");
+}
+
+/**
+ * The organization issues of a list of two or more types that mixes
+ * organizations, or holds a type whose organization can't be read: one per
+ * such entry, and nothing else, so no issue quotes a key of a type that may
+ * be another organization's (S-009a). Empty when the list is one
+ * organization's (or holds at most one type). Entries that aren't objects
+ * hold no key and are left to the full check.
+ */
+function organizationIssues(list: readonly JsonValue[]): Issue[] {
+  if (list.length < 2) return [];
+  let first: OrganizationId | undefined;
+  let mixed = false;
+  const found: { index: number; owner: OrganizationId | undefined }[] = [];
+  for (const [index, item] of list.entries()) {
+    if (!isPlainObject(item)) continue;
+    const value = ownOnly(item).organizationId;
+    const owner = isOrganizationId(value) ? value : undefined;
+    if (owner === undefined) mixed = true;
+    else if (first === undefined) first = owner;
+    else if (owner !== first) mixed = true;
+    found.push({ index, owner });
+  }
+  if (!mixed) return [];
+  const out: Issue[] = [];
+  for (const { index, owner } of found) {
+    if (owner === undefined) {
+      out.push(
+        issue(
+          [index, "organizationId"],
+          "invalid_organization",
+          "Every identifier type belongs to one organization: organizationId must be an organization ID.",
+        ),
+      );
+    } else if (owner !== first) {
+      out.push(mixedOrganizationsIssue([index, "organizationId"], "These identifier types"));
+    }
+  }
+  return out;
 }
 
 function checkType(

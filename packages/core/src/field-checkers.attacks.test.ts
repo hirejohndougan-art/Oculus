@@ -225,6 +225,21 @@ describe("one organization's identifier checker can't vouch for another's number
   // Organization B made `legacy` public; for this record's organization it is staff.
   const otherTypes = [{ ...TYPES[0], organizationId: newOrganizationId() }];
 
+  it("a type list mixing in another organization's types names none of their keys (S-009a)", () => {
+    const OTHER = newOrganizationId();
+    const theirs = { ...TYPES[0], key: "secret_key", organizationId: OTHER };
+    for (const list of [
+      [...TYPES, theirs, theirs],
+      [theirs, theirs, ...TYPES],
+    ]) {
+      const made = makeIdentifierChecker(list);
+      if (made.ok) throw new Error("a mixed list must be refused");
+      expect(codes(made.issues)).toContain("mixed_organizations");
+      expect(codes(made.issues)).not.toContain("duplicate_key");
+      expect(JSON.stringify(made)).not.toContain("secret_key");
+    }
+  });
+
   it("refuses every value of a record of another organization, or of none", () => {
     const made = makeIdentifierChecker(otherTypes);
     if (!made.ok) throw new Error("bad fixture");

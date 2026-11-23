@@ -537,6 +537,28 @@ describe("one organization's numbers can't be read or mixed with another's (D-01
     expect(codes(validateRecordIdentifiers(unowned, TYPES))).toEqual(["invalid_organization"]);
   });
 
+  it("validateIdentifierTypes names no key of a list mixing organizations (S-009a)", () => {
+    const theirs = (key: string): IdentifierType => ({ ...OTHER_BOX, key });
+    const unowned = (key: string) => ({ key, label: "Unowned", uniqueness: "none" });
+    for (const list of [
+      [BOX, theirs("secret_key"), theirs("secret_key")],
+      [theirs("secret_key"), theirs("secret_key"), BOX],
+      [BOX, theirs("secret_key"), { ...theirs("secret_key"), uniqueness: "maybe" }],
+      [BOX, unowned("secret_key"), unowned("secret_key")],
+      [BOX, { ...BOX, organizationId: "not-an-id", key: "secret_key" }, theirs("secret_key")],
+    ]) {
+      const r = validateIdentifierTypes(list);
+      expect(r.ok).toBe(false);
+      for (const code of codes(r)) {
+        expect(["mixed_organizations", "invalid_organization"]).toContain(code);
+      }
+      expect(JSON.stringify(r)).not.toContain("secret_key");
+    }
+    // One organization's own duplicate still names the key.
+    const own = validateIdentifierTypes([BOX, { ...BOX, label: "Again" }]);
+    expect(codes(own)).toEqual(["duplicate_key"]);
+  });
+
   it("validateIdentifierTypes refuses one list holding two organizations' types", () => {
     expect(codes(validateIdentifierTypes([BOX, { ...OTHER_BOX, key: "other_box" }]))).toEqual([
       "mixed_organizations",
