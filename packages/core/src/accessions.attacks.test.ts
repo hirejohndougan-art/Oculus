@@ -725,6 +725,7 @@ describe("the register's record link checker (T-015a review)", () => {
       accessions: [accession()],
       records: [invalid],
       identifierTypes: TYPES,
+      today: TODAY,
     });
     expect(codes(r)).toEqual(["mixed_organizations"]);
     const text = JSON.stringify(r);
@@ -737,6 +738,7 @@ describe("the register's record link checker (T-015a review)", () => {
         accessions: [accession()],
         records,
         identifierTypes: TYPES,
+        today: TODAY,
       });
       expect(codes(r)).toContain("unknown_record");
       expect(codes(r)).not.toContain("no_organization_checker");
