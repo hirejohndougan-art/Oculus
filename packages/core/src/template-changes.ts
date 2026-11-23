@@ -604,13 +604,13 @@ function prefixed(root: string, list: readonly Issue[]): Issue[] {
   return list.map((i) => issue([root, ...i.path], i.code, i.message));
 }
 
-/** Validate every record; any unreadable record, or an ID used twice, refuses them all. */
 /** An own data property, never a getter or an inherited one. */
 function own(obj: object, name: string): unknown {
   const d = Object.getOwnPropertyDescriptor(obj, name);
   return d !== undefined && "value" in d ? d.value : undefined;
 }
 
+/** Validate every record; any unreadable record, or an ID used twice, refuses them all. */
 function readRecords(input: unknown): Validated<readonly CatalogRecord[]> {
   if (types.isProxy(input) || !Array.isArray(input)) {
     return {

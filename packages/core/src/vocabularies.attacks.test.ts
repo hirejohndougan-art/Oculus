@@ -237,7 +237,7 @@ describe("near-duplicate detection can't be overloaded", () => {
 
   // The worst inputs found in review, at the full 50,000 terms. Each must
   // finish in about 2 seconds; the bound leaves room for a slow CI machine.
-  // Times are this thread's CPU time (U-003), so a busy machine can't fail
+  // Times are this process's CPU time (U-003), so a busy machine can't fail
   // them; the wall-clock timeout is only a hang guard.
   const N = 50_000;
   const tag = (i: number): string =>
@@ -352,7 +352,7 @@ describe("near-duplicate detection can't be overloaded", () => {
   // pair is lost and the limits are reported the same, budgets included),
   // and the new code must be clearly faster. The ratio is what is asserted,
   // not the seconds: a wall clock bound either passes for the old code too
-  // or turns flaky. Both runs are timed in this thread's CPU time (U-003):
+  // or turns flaky. Both runs are timed in this process's CPU time (U-003):
   // on the wall clock, load that came or went between the two runs moved
   // the ratio past its bound.
   const against = (terms: unknown[]): { ratio: number; ms: number; limits: readonly string[] } => {

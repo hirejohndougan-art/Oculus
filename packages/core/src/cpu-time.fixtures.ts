@@ -5,10 +5,14 @@
  * time themselves on the wall clock, which also counts the time the test
  * waits while other processes use the CPU: on a busy 2-CPU machine (the
  * gate's other test files, other builds) the same work took two to three
- * times as long and the tests failed. `cpuClock` measures only the CPU time
- * this thread spent running the work, which other processes can't add to,
- * so the limits stay exactly as tight as they were: a quadratic version of
- * the code uses as much more CPU as it used to take wall time, and fails.
+ * times as long and the tests failed. `cpuClock` measures the CPU time this
+ * process spent (`process.cpuUsage`), which other processes can't add to.
+ * Vitest runs each test file in its own process, so other test files don't
+ * count either. The whole process is counted, not just the main thread, so
+ * the garbage collector's helper threads count too: on an idle machine this
+ * matches the old wall-clock reading within a few percent, so the limits stay
+ * as tight as they were, including for blowups that are mostly garbage
+ * collection (the U-003 review measured the main thread alone at 25-70% less).
  *
  * Every such test keeps its limit as a CPU-time assertion, and its vitest
  * `timeout` (which is wall clock) becomes a hang guard only: `hangGuard`
@@ -20,18 +24,14 @@ interface Usage {
   system: number;
 }
 
-/** This thread's CPU time so far, in microseconds. */
+/** This process's CPU time so far (every thread), in microseconds. */
 function usage(): Usage {
-  // `process.threadCpuUsage` (newer Node releases) leaves out other
-  // threads, such as the garbage collector's helpers. Where it is missing,
-  // the whole process is counted, which only ever counts more, never less.
-  const thread = (process as { threadCpuUsage?: () => Usage }).threadCpuUsage;
-  return typeof thread === "function" ? thread.call(process) : process.cpuUsage();
+  return process.cpuUsage();
 }
 
 /**
  * Start a CPU-time stopwatch: the function returned gives the CPU
- * milliseconds this thread has used since.
+ * milliseconds this process has used since.
  */
 export function cpuClock(): () => number {
   const start = usage();
@@ -43,9 +43,9 @@ export function cpuClock(): () => number {
 
 /**
  * Test options for a test whose limit is `limitMs` of CPU time: a wall-clock
- * timeout that only stops a hang, at four times the limit and at least a
- * minute.
+ * timeout that only stops a hang, at three times the limit and at least
+ * 30 seconds.
  */
 export function hangGuard(limitMs: number): { timeout: number } {
-  return { timeout: Math.max(60_000, limitMs * 4) };
+  return { timeout: Math.max(30_000, limitMs * 3) };
 }
