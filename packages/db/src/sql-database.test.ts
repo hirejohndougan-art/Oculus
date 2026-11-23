@@ -130,6 +130,17 @@ describe("values are only ever data", () => {
     });
   });
 
+  it("runs one statement only, even when the query has no values", async () => {
+    await ready();
+    await expect(db.execute(sql`SELECT 1; DROP TABLE victims`)).rejects.toThrow(
+      /multiple commands/,
+    );
+    await expect(
+      db.transaction((tx) => tx.execute(sql`SELECT 1; DELETE FROM victims`)),
+    ).rejects.toThrow(/multiple commands/);
+    await victimsIntact();
+  });
+
   it("refuses a query that wasn't made by the tag", async () => {
     await ready();
     const raw = { text: "DROP TABLE victims", values: [] } as unknown as ReturnType<typeof sql>;

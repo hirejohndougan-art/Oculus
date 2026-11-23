@@ -100,9 +100,19 @@ export function clientConfig(connectionString: string): pg.ClientConfig {
   return { connectionString, types: typeParsers, options: SESSION_OPTIONS };
 }
 
+/**
+ * Always the extended protocol, even with no values: pg would otherwise send a
+ * value-less query with the simple protocol, which runs several statements.
+ * (`queryMode` is in pg 8.x but missing from @types/pg.)
+ */
 function checked(query: Sql): pg.QueryConfig {
   if (!isSql(query)) throw new TypeError("Queries must be made with the sql tag.");
-  return { text: query.text, values: query.values };
+  const config: pg.QueryConfig & { queryMode: "extended" } = {
+    text: query.text,
+    values: query.values,
+    queryMode: "extended",
+  };
+  return config;
 }
 
 function queryable(target: pg.Pool | pg.PoolClient | pg.Client): Queryable {
