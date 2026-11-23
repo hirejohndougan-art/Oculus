@@ -16,6 +16,7 @@ import {
   type Validated,
 } from "./index.js";
 import {
+  ACCESSIONS,
   BASE,
   ORG,
   CNE,
@@ -50,6 +51,7 @@ function out(
 ) {
   return publicOutput(view, mapping, {
     baseUrl: BASE,
+    accessions: ACCESSIONS,
     published,
     checkers: CHECKERS,
     identifiers: idsOf(view),
@@ -240,6 +242,7 @@ describe("publicOutput: places and the published list", () => {
     const o = ok(
       publicOutput(view, MAPPING, {
         baseUrl: BASE,
+        accessions: ACCESSIONS,
         published: [item.id, PLACE_ID],
         checkers: { ...CHECKERS, place: links },
         identifiers: idsOf(view),
@@ -296,9 +299,15 @@ describe("publicOutput: places and the published list", () => {
       undefined,
       new Set([view.id]),
     ]) {
-      expect(codes(publicOutput(view, MAPPING, { baseUrl: BASE, published } as never))).toEqual([
-        "invalid_published",
-      ]);
+      expect(
+        codes(
+          publicOutput(view, MAPPING, {
+            baseUrl: BASE,
+            accessions: ACCESSIONS,
+            published,
+          } as never),
+        ),
+      ).toEqual(["invalid_published"]);
     }
   });
 });
@@ -490,6 +499,7 @@ describe("publicOutput: the base URL", () => {
           publicOutput(view, MAPPING, {
             baseUrl,
             published: [view.id],
+            accessions: ACCESSIONS,
             checkers: CHECKERS,
             identifiers: idsOf(view),
           }),
@@ -561,7 +571,11 @@ describe("publicOutput: the template check", () => {
   it("refuses identifier values when no identifier checker is given", () => {
     const item = fullObject();
     const view = viewOf([item], item.id);
-    const result = publicOutput(view, MAPPING, { baseUrl: BASE, published: [view.id] });
+    const result = publicOutput(view, MAPPING, {
+      baseUrl: BASE,
+      accessions: ACCESSIONS,
+      published: [view.id],
+    });
     expect(codes(result)).toContain("unchecked");
   });
 
@@ -571,6 +585,7 @@ describe("publicOutput: the template check", () => {
     const refuse = () => [{ code: "no_thanks", message: "Refused." }];
     const result = publicOutput(view, MAPPING, {
       baseUrl: BASE,
+      accessions: ACCESSIONS,
       published: [view.id],
       checkers: { ...CHECKERS, long_text: refuse },
     });
@@ -580,9 +595,14 @@ describe("publicOutput: the template check", () => {
   it("refuses checkers given as a Proxy or a getter", () => {
     const item = fullObject();
     const view = viewOf([item], item.id);
-    const proxy = { baseUrl: BASE, published: [view.id], checkers: new Proxy(CHECKERS, {}) };
+    const proxy = {
+      baseUrl: BASE,
+      accessions: ACCESSIONS,
+      published: [view.id],
+      checkers: new Proxy(CHECKERS, {}),
+    };
     expect(codes(publicOutput(view, MAPPING, proxy))).toEqual(["invalid_options"]);
-    const getter = { baseUrl: BASE, published: [view.id] };
+    const getter = { baseUrl: BASE, accessions: ACCESSIONS, published: [view.id] };
     Object.defineProperty(getter, "checkers", { enumerable: true, get: () => CHECKERS });
     expect(codes(publicOutput(view, MAPPING, getter))).toEqual(["invalid_options"]);
   });
@@ -791,7 +811,13 @@ describe("publicOutput: IRIs RFC 3987 allows", () => {
       ).toEqual(["invalid_base_url"]);
     }
     expect(
-      ok(publicOutput(view, MAPPING, { baseUrl: "http://[::1]/items/", published: [view.id] })).id,
+      ok(
+        publicOutput(view, MAPPING, {
+          baseUrl: "http://[::1]/items/",
+          published: [view.id],
+          accessions: ACCESSIONS,
+        }),
+      ).id,
     ).toBe(`http://[::1]/items/${view.id}`);
   });
 });
@@ -813,7 +839,12 @@ describe("publicOutput: currentTemplate", () => {
   const item = record("object", "I", { rights: { uri: CNE }, donor_note: "SECRET" });
   const view = viewOf([item], item.id);
   const run = (currentTemplate: unknown) =>
-    publicOutput(view, MAPPING, { baseUrl: BASE, published: [view.id], currentTemplate });
+    publicOutput(view, MAPPING, {
+      baseUrl: BASE,
+      accessions: ACCESSIONS,
+      published: [view.id],
+      currentTemplate,
+    });
 
   it("publishes when the template is unchanged, even as a fresh copy in another key order", () => {
     const copy = JSON.parse(JSON.stringify(TPL)) as Record<string, unknown>;
@@ -846,6 +877,7 @@ describe("publicOutput: digital assets and DCMI types", () => {
     const o = ok(
       publicOutput(view, DIGITAL_ASSET_DUBLIN_CORE, {
         baseUrl: BASE,
+        accessions: ACCESSIONS,
         published: [view.id],
         checkers: CHECKERS,
       }),

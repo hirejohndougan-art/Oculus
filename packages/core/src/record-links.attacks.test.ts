@@ -21,6 +21,7 @@ import {
   type Validated,
 } from "./index.js";
 import {
+  ACCESSIONS,
   BASE,
   CHECKERS,
   CNE,
@@ -93,7 +94,12 @@ function output(
   published: readonly RecordId[],
   checkers: Record<string, unknown>,
 ): Validated<PublicOutput> {
-  return publicOutput(view, MAPPING, { baseUrl: BASE, published, checkers: checkers });
+  return publicOutput(view, MAPPING, {
+    baseUrl: BASE,
+    accessions: ACCESSIONS,
+    published,
+    checkers: checkers,
+  });
 }
 
 const lax: FieldValueChecker = () => [];
@@ -184,6 +190,7 @@ describe("an unpublished record linked to never shows", () => {
       codes(
         publicOutput(view, staffMapping, {
           baseUrl: BASE,
+          accessions: ACCESSIONS,
           published: [item.id, agent.id],
           checkers,
         }),
@@ -503,6 +510,7 @@ describe("a value kept from before a template change never reaches the public vi
       };
       const result = publicOutput(view, mapping, {
         baseUrl: BASE,
+        accessions: ACCESSIONS,
         published: [item.id, secretId],
         checkers: CHECKERS,
       });
@@ -535,6 +543,6 @@ describe("a value kept from before a template change never reaches the public vi
     } as CatalogRecord;
     const effective = ok(effectiveRecord(item.id, [item], () => now, { checkers: CHECKERS }));
     expect(publicView(effective)?.fields.kept).toBe("Plain text");
-    expect(effectivePublishIssues(effective)).toEqual([]);
+    expect(effectivePublishIssues(effective, { accessions: ACCESSIONS })).toEqual([]);
   });
 });

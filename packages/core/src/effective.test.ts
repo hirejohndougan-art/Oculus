@@ -20,6 +20,7 @@ import {
   type TemplateLookup,
   newOrganizationId,
 } from "./index.js";
+import { noAccessions } from "./public-output.fixtures.js";
 
 const ORG = newOrganizationId();
 
@@ -186,7 +187,9 @@ describe("effectiveRecord: the mockup's Effective Record screen", () => {
 
   it("is what the rights publish check runs on, through effectivePublishIssues", () => {
     expect(rightsPublishIssues(item)[0]?.code).toBe("rights_missing");
-    expect(effectivePublishIssues(effective)).toEqual([]);
+    // With an accession register, as publishing needs (D-043).
+    const accessions = noAccessions(effective.record.organizationId);
+    expect(effectivePublishIssues(effective, { accessions })).toEqual([]);
     expect(canPublishRights(publicView(effective))).toBe(true);
     // rightsPublishIssues can't see the visibility rule, so it refuses the effective record.
     expect(rightsPublishIssues(effective)[0]?.code).toBe("use_effective_publish_issues");

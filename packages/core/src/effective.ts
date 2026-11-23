@@ -101,6 +101,7 @@
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import { RIGHTS_FIELD_KEY, rightsPublishIssues } from "./rights.js";
 import { markEffective, markPublicView } from "./effective-brand.js";
+import { deedHoldsOf } from "./accession-holds.js";
 import { shown } from "./plain-data.js";
 import { isOtherOrganizationsChecker, publicIdentifierTypesOf } from "./field-checkers.js";
 import { types } from "node:util";
@@ -221,6 +222,16 @@ export interface EffectiveOptions {
    * organization's public types is still refused by the identifier checker.
    */
   readonly identifiers?: readonly RecordIdentifiers[];
+}
+
+/** Options for `effectivePublishIssues`. */
+export interface PublishCheckOptions {
+  /**
+   * The organization's accession register from `indexAccessions`, made at
+   * publish time. Required to publish an object, archival unit or digital
+   * asset (D-043): without it they are refused (`accessions_unknown`).
+   */
+  readonly accessions?: unknown;
 }
 
 /**
@@ -1035,10 +1046,22 @@ export function publicView(effective: EffectiveRecord): PublicRecord | undefined
  * that aren't public here don't (`rights_not_public`). Templates require the
  * `rights` field to be public (T-007a), so today that happens only for a
  * left-over `rights` value whose key isn't in the record's template; the
- * check also stands in case a staff rights field is ever allowed. Returns an
- * empty list when the rights can be published. Never throws.
+ * check also stands in case a staff rights field is ever allowed.
+ *
+ * **The deed check** (T-016, D-043) runs last. For an object, archival unit
+ * or digital asset, `options.accessions` must be the organization's register
+ * from `indexAccessions`, made at publish time: without it the record is
+ * refused (`accessions_unknown`), with anything else (`invalid_accessions`)
+ * or another organization's register (`mixed_organizations`) too. A record
+ * the register holds back, or whose ancestor or represented record it holds
+ * back, is refused (`deed_not_signed`); the message names no donor,
+ * accession or number. Returns an empty list when the record can be
+ * published. Never throws.
  */
-export function effectivePublishIssues(effective: EffectiveRecord): readonly Issue[] {
+export function effectivePublishIssues(
+  effective: EffectiveRecord,
+  options?: PublishCheckOptions,
+): readonly Issue[] {
   try {
     const view = publicView(effective);
     if (view === undefined) {
@@ -1057,7 +1080,8 @@ export function effectivePublishIssues(effective: EffectiveRecord): readonly Iss
       return Object.freeze(withheld.map((n) => Object.freeze(issue(n.path, n.code, n.message))));
     }
     const found = rightsPublishIssues(view);
-    if (found.length === 0) return found;
+    // Last, so every other reason is reported first; any reason blocks.
+    if (found.length === 0) return deedIssues(effective, options);
     const hidden = effective.entries.some(
       (e) => e.key === RIGHTS_FIELD_KEY && (e.visibility !== "public" || !e.inTemplate),
     );
@@ -1076,6 +1100,60 @@ export function effectivePublishIssues(effective: EffectiveRecord): readonly Iss
       Object.freeze(issue([], "unreadable", "The effective record could not be read.")),
     ]);
   }
+}
+
+/** The kinds an accession can produce, so the only ones the deed check applies to. */
+const ACCESSIONED: ReadonlySet<string> = new Set(["object", "archival_unit", "digital_asset"]);
+
+/**
+ * The deed check (D-043): fails closed. Reads only the register's
+ * organization and held record IDs (`accession-holds.ts`), never an
+ * accession. Throws only on unreadable options, which the caller turns
+ * into `unreadable`.
+ */
+function deedIssues(effective: EffectiveRecord, options: unknown): readonly Issue[] {
+  const refuse = (code: string, message: string): readonly Issue[] =>
+    Object.freeze([Object.freeze(issue(["accessions"], code, message))]);
+  let given: unknown;
+  try {
+    given = ownSetting(options, "accessions");
+  } catch {
+    return refuse("invalid_options", "The options must be a plain object { accessions }.");
+  }
+  const record = effective.record;
+  const needed = ACCESSIONED.has(record.kind);
+  if (given === undefined) {
+    return needed
+      ? refuse(
+          "accessions_unknown",
+          "Publishing this record needs the organization's accession register (indexAccessions), to check its deed of gift is signed.",
+        )
+      : Object.freeze([]);
+  }
+  const holds = deedHoldsOf(given);
+  if (holds === undefined) {
+    return refuse(
+      "invalid_accessions",
+      "The accessions option must be the register made by indexAccessions.",
+    );
+  }
+  if (holds.organizationId !== record.organizationId) {
+    return Object.freeze([
+      Object.freeze(mixedOrganizationsIssue(["accessions"], "This record and these accessions")),
+    ]);
+  }
+  if (!needed) return Object.freeze([]);
+  const ids: RecordId[] = effective.chain.map((step) => step.id);
+  if (record.kind === "digital_asset" && record.represents !== undefined) {
+    ids.push(record.represents);
+  }
+  if (ids.some((id) => holds.held.has(id))) {
+    return refuse(
+      "deed_not_signed",
+      "This record came from an accession whose deed of gift isn't signed yet, so it is held back from the public site. Mark the deed as signed in Deeds once the signed copy is on file.",
+    );
+  }
+  return Object.freeze([]);
 }
 
 /** The value the nearest ancestor gives for `field`, or undefined. */

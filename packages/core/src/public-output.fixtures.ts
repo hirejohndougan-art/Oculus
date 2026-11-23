@@ -1,6 +1,7 @@
 // Shared test fixtures for public-output tests (not exported from the package).
 import {
   effectiveRecord,
+  indexAccessions,
   makeIdentifierChecker,
   makeRecordLinkChecker,
   newOrganizationId,
@@ -17,6 +18,8 @@ import {
   type RecordId,
   type RecordIdentifiers,
   type RecordKind,
+  type AccessionRegister,
+  type OrganizationId,
 } from "./index.js";
 
 export const T = "2026-11-20T16:05:00.000Z";
@@ -222,3 +225,21 @@ export function everything(out: {
 
 /** The mapping entry kinds that need rights must have. */
 export const RIGHTS_ENTRY = Object.freeze({ field: "rights", term: "rights" });
+
+/**
+ * The fixtures' organization's accession register, with no accessions, so
+ * no deed holds anything back. Publishing an object, archival unit or
+ * digital asset needs one (D-043).
+ */
+export const ACCESSIONS: AccessionRegister = noAccessions(ORG);
+
+/** An organization's accession register with no accessions (D-043). */
+export function noAccessions(organizationId: OrganizationId): AccessionRegister {
+  const made = indexAccessions(organizationId, {
+    accessions: [],
+    records: [],
+    identifierTypes: [],
+  });
+  if (!made.ok) throw new Error(JSON.stringify(made.issues));
+  return made.value;
+}

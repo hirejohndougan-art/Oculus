@@ -48,6 +48,13 @@
  *   identifier sets as they are now; `identifiers_unknown` without them),
  *   and every number must still be one (`identifier_changed`), so a number
  *   retired or moved since isn't published from a kept view.
+ * - **A record whose deed of gift isn't signed is held back** (T-016, D-043).
+ *   `accessions` (the organization's register from `indexAccessions`) is
+ *   passed to `effectivePublishIssues`, which refuses an object, archival
+ *   unit or digital asset without it (`accessions_unknown`) and one an
+ *   accession with a deed `missing` or `sent` produced, or produced an
+ *   ancestor or the record a digital asset represents (`deed_not_signed`).
+ *   Nothing of an accession or a donor is read here.
  * - **Publishing is the caller's statement.** Records have no publish state
  *   yet, so the caller passes `published`, the IDs of every record that is
  *   published. The record itself must be in it (`not_published`). Public
@@ -227,6 +234,14 @@ export interface PublishOptions {
    * number twice: `invalid_identifiers`).
    */
   readonly identifiers?: readonly RecordIdentifiers[];
+  /**
+   * The organization's accession register from `indexAccessions`, as it is
+   * now (D-043). Required for an object, archival unit or digital asset
+   * (`accessions_unknown` without it): output is refused for a record held
+   * back because a deed of gift it needs isn't signed (`deed_not_signed`),
+   * checked against this register, never the one the view was made with.
+   */
+  readonly accessions?: unknown;
 }
 
 /** Dublin Core as term → values, in order (see the module header). */
@@ -461,14 +476,23 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
       "This is not a public view from publicView, so it can't be published.",
     );
   }
-  const { baseUrl, published, checkers, currentTemplate, templateFor, records, identifiers } =
-    readOptions(options);
+  const {
+    baseUrl,
+    published,
+    checkers,
+    currentTemplate,
+    templateFor,
+    records,
+    identifiers,
+    accessions,
+  } = readOptions(options);
   if (!published.has(view.id)) {
     fail([], "not_published", "This record is not in the published list, so it can't be output.");
   }
   // The effective record the view was made from, from the mark beside it.
   const effective = origin.effective as EffectiveRecord;
-  const blocked = effectivePublishIssues(effective);
+  // The deed check fails closed without the register (D-043).
+  const blocked = effectivePublishIssues(effective, accessions === undefined ? {} : { accessions });
   if (blocked.length > 0) throw new OutputError(blocked);
   const template = origin.template;
   // Checked again at the boundary: every template the view was built with is
@@ -955,6 +979,7 @@ const OPTION_KEYS: ReadonlySet<string> = new Set([
   "templateFor",
   "records",
   "identifiers",
+  "accessions",
 ]);
 
 interface ReadOptions {
@@ -965,6 +990,7 @@ interface ReadOptions {
   readonly templateFor: TemplateSource | undefined;
   readonly records: unknown;
   readonly identifiers: unknown;
+  readonly accessions: unknown;
 }
 
 function readOptions(options: unknown): ReadOptions {
@@ -993,7 +1019,18 @@ function readOptions(options: unknown): ReadOptions {
   const records = dataProp(options, "records");
   // Read once, when it is used.
   const identifiers = dataProp(options, "identifiers");
-  return { baseUrl, published, checkers, currentTemplate, templateFor, records, identifiers };
+  // Checked by effectivePublishIssues, which reads only its held record IDs.
+  const accessions = dataProp(options, "accessions");
+  return {
+    baseUrl,
+    published,
+    checkers,
+    currentTemplate,
+    templateFor,
+    records,
+    identifiers,
+    accessions,
+  };
 }
 
 /** An own data property, or undefined. A getter, hidden property or Proxy value fails. */
