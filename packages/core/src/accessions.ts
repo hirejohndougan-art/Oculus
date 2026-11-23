@@ -82,13 +82,19 @@ import { identifierKey } from "./identifier-key.js";
 import { matchesIdentifierPattern, parseIdentifierPattern } from "./identifier-pattern.js";
 import {
   MAX_IDENTIFIER_LENGTH,
+  MAX_IDENTIFIER_TYPES,
   nextIdentifier,
   validateIdentifierTypes,
   type IdentifierType,
   type RecordIdentifiers,
 } from "./identifiers.js";
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
-import { isOrganizationId, mixedOrganizationsIssue, type OrganizationId } from "./organizations.js";
+import {
+  isOrganizationId,
+  mixedOrganizationsIssue,
+  organizationIdOf,
+  type OrganizationId,
+} from "./organizations.js";
 import { IssueList, readPlainData, textProblem, type JsonValue } from "./plain-data.js";
 import { isRecordId, type RecordId } from "./record-id.js";
 import { makeRecordLinkChecker } from "./record-links.js";
@@ -485,8 +491,23 @@ export function indexAccessions(
       ],
     });
 
-    // Identifier types: one validated copy, this organization's only.
-    const typesRead = validateIdentifierTypes(parts.get("identifierTypes"));
+    // Identifier types: one validated copy, this organization's only. Each
+    // entry's organization is checked first, read as a plain own data
+    // property, so another organization's list, valid or not, gets no
+    // message naming its keys (S-009a).
+    const typesInput = parts.get("identifierTypes");
+    if (
+      !types.isProxy(typesInput) &&
+      Array.isArray(typesInput) &&
+      typesInput.length <= MAX_IDENTIFIER_TYPES
+    ) {
+      for (let i = 0; i < typesInput.length; i += 1) {
+        const slot = Object.getOwnPropertyDescriptor(typesInput, i);
+        const entry: unknown = slot !== undefined && "value" in slot ? slot.value : undefined;
+        if (organizationIdOf(entry) !== organizationId) return mixed(["identifierTypes"]);
+      }
+    }
+    const typesRead = validateIdentifierTypes(typesInput);
     if (!typesRead.ok) {
       if (typesRead.issues.some((i) => i.code === "mixed_organizations")) {
         return mixed(["identifierTypes"]);

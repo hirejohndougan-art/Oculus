@@ -499,12 +499,28 @@ describe("another organization's accessions are never used or read", () => {
       { records: [theirs, theirDonor] },
       { identifierTypes: [{ ...ACCESSION_TYPE, organizationId: OTHER }] },
       { identifierTypes: [...TYPES, { ...ACCESSION_TYPE, key: "x", organizationId: OTHER }] },
+      // Their invalid list (two entries sharing a key) is refused as theirs,
+      // never validated into a message naming the key (S-009a).
+      {
+        identifierTypes: [
+          { ...ACCESSION_TYPE, key: "their_key", organizationId: OTHER },
+          { ...ACCESSION_TYPE, key: "their_key", organizationId: OTHER },
+        ],
+      },
+      {
+        identifierTypes: [
+          ...TYPES,
+          { ...ACCESSION_TYPE, key: "their_key", organizationId: OTHER },
+          { ...ACCESSION_TYPE, key: "their_key", organizationId: OTHER },
+        ],
+      },
     ];
     for (const c of cases) {
       const r = run(c);
       expect(codes(r), JSON.stringify(Object.keys(c))).toEqual(["mixed_organizations"]);
       expect(messages(r)).not.toContain(OTHER);
       expect(messages(r)).not.toContain("Their");
+      expect(JSON.stringify(r)).not.toContain("their_key");
     }
   });
 
