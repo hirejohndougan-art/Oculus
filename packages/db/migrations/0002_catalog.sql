@@ -134,8 +134,8 @@ CREATE TABLE public.records (
   -- A parent or represented record must be of the same organization.
   FOREIGN KEY (organization_id, parent_id) REFERENCES public.records (organization_id, id),
   FOREIGN KEY (organization_id, represents_id) REFERENCES public.records (organization_id, id),
-  CHECK (parent_id <> id),
-  CHECK (represents_id <> id),
+  CONSTRAINT records_not_own_parent CHECK (parent_id <> id),
+  CONSTRAINT records_not_own_representation CHECK (represents_id <> id),
 
   -- Each kind has exactly its own columns.
   CHECK ((kind = 'archival_unit') = (level IS NOT NULL)),
