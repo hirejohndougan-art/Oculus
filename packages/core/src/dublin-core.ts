@@ -198,10 +198,7 @@ function wrongOrganization(): Validated<never> {
 }
 
 /** The organization problem of a mapping, if any, for a template of `owner`. */
-function organizationProblem(
-  value: unknown,
-  owner: OrganizationId,
-): Validated<never> | undefined {
+function organizationProblem(value: unknown, owner: OrganizationId): Validated<never> | undefined {
   if (!isOrganizationId(value)) return invalidOrganization();
   if (value !== owner) return wrongOrganization();
   return undefined;
@@ -367,18 +364,21 @@ export const SPECTRUM_DUBLIN_CORE: DublinCoreMappingPreset = mapping("spectrum-o
   [RIGHTS_FIELD_KEY, "rights"],
 ]);
 
-export const DIGITAL_ASSET_DUBLIN_CORE: DublinCoreMappingPreset = mapping("dublin-core-digital-asset", [
-  ["identifier", "identifier"],
-  ["resource_type", "type"],
-  ["date_created", "created"],
-  ["creators", "creator"],
-  ["description", "description"],
-  ["extent", "extent"],
-  ["languages", "language"],
-  ["subjects", "subject"],
-  ["places", "spatial"],
-  [RIGHTS_FIELD_KEY, "rights"],
-]);
+export const DIGITAL_ASSET_DUBLIN_CORE: DublinCoreMappingPreset = mapping(
+  "dublin-core-digital-asset",
+  [
+    ["identifier", "identifier"],
+    ["resource_type", "type"],
+    ["date_created", "created"],
+    ["creators", "creator"],
+    ["description", "description"],
+    ["extent", "extent"],
+    ["languages", "language"],
+    ["subjects", "subject"],
+    ["places", "spatial"],
+    [RIGHTS_FIELD_KEY, "rights"],
+  ],
+);
 
 const BY_TEMPLATE: ReadonlyMap<string, DublinCoreMappingPreset> = new Map(
   [DACS_DUBLIN_CORE, SPECTRUM_DUBLIN_CORE, DIGITAL_ASSET_DUBLIN_CORE].map((m) => [m.template, m]),

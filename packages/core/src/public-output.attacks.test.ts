@@ -167,7 +167,8 @@ describe("staff values never reach any output form", () => {
         }
       }
     }
-    const { organizationId: _dropped, ...unowned } = MAPPING;
+    const unowned: Record<string, unknown> = { ...MAPPING };
+    delete unowned.organizationId;
     expect(codes(out(view, unowned))).toEqual(["invalid_organization"]);
     expect(codes(out(view, { ...MAPPING, organizationId: "not-an-id" }))).toEqual([
       "invalid_organization",

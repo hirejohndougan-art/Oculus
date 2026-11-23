@@ -230,7 +230,8 @@ describe("Dublin Core mappings across organizations (D-030, D-047)", () => {
   });
 
   it("a mapping that doesn't say which organization it belongs to is refused", () => {
-    const { organizationId: _dropped, ...noOrg } = OTHERS_MAPPING;
+    const noOrg: Record<string, unknown> = { ...OTHERS_MAPPING };
+    delete noOrg.organizationId;
     for (const owner of [undefined, null, "", "not-an-id", 1, ORG.toUpperCase(), [ORG]]) {
       const mapping = owner === undefined ? noOrg : { ...noOrg, organizationId: owner };
       onlyIssue(validateDublinCoreMapping(mapping, DACS_T), "invalid_organization");
@@ -243,7 +244,8 @@ describe("Dublin Core mappings across organizations (D-030, D-047)", () => {
 
   it("an organizationId inherited from a polluted Object.prototype is not read", () => {
     (Object.prototype as Record<string, unknown>).organizationId = ORG;
-    const { organizationId: _dropped, ...noOrg } = DACS_M;
+    const noOrg: Record<string, unknown> = { ...DACS_M };
+    delete noOrg.organizationId;
     expect(codes(validateDublinCoreMapping(noOrg, DACS_T))).toEqual(["invalid_organization"]);
     expect(codes(mappingForTemplate(noOrg, DACS_T))).toEqual(["invalid_organization"]);
   });
