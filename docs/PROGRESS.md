@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-23 17:31 CT — manual (John: "continue") — T-027 Schema: vocabularies and terms
+- Result: done
+- What changed: migration `0004_vocabularies.sql`: an organization's stored local and authority terms (keyed by vocabulary plus `termUriKey`, or label), and a staff-only index of which records use which terms with what it was built from. `packages/db/src/vocabularies.ts`: save/read terms, `refreshRecordTerms`/`clearRecordTerms` under the record lock (refused refreshes clear old usages), staff-only `termUsageCounts` that never shows text from records (stored copy or canonical URI only), paging, and `recordsWithStaleTerms`.
+- Decisions: D-062
+- Review: three independent rounds (staff-field labels shown as a heading's label; a save/delete deadlock; old usages counted after a refused refresh; a private note hidden in a dot-segment URI; a public-fields count that didn't follow core's visibility rules — removed; stale-check paging); all fixed with tests.
+- Gate: PASS · tests_passing 3287 (was 3261) · npm audit clean
+- Next: T-029 Change log and version history (risky)
+
 ## 2026-11-23 17:20 CT — manual (John: "continue") — T-026 Schema: identifiers, with uniqueness the database enforces
 - Result: done
 - What changed: migration `0003_identifiers.sql`: identifier types per organization; holdings carrying the type's uniqueness rule (copied by trigger, kept current by a cascading foreign key, adopted by a trigger when a type is created); partial unique indexes on `(organization_id, type_key, key)` for `current` and `all_time`; current and former value tables; auto-number counters. `packages/db/src/identifiers.ts`: saves write holdings in sorted order then release; allocation under counter and type-key locks; bucketed advisory locks (64 per organization); Read Committed only; lenient reads; clean `not_unique`, `retry` and `read_committed_required` issues.
