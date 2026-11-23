@@ -160,11 +160,20 @@ function notReadCommitted<T>(): Validated<T> {
 function cleanRefusal<T>(error: unknown): Validated<T> | undefined {
   const code = dbError(error)?.code ?? "";
   if (code === NOT_READ_COMMITTED) return notReadCommitted();
+  if (code === "53200") {
+    // Out of shared memory: lock memory, or a genuine out-of-memory. Retrying
+    // inside the same transaction can't help.
+    return refused(
+      [],
+      "retry",
+      "The database ran short of memory for this change. Roll back the whole transaction and try again.",
+    );
+  }
   return TRANSIENT.has(code)
     ? refused(
         [],
         "retry",
-        "Another change to the same identifiers happened at the same moment. Try again.",
+        "Another change to the same identifiers happened at the same moment. Roll back and try again.",
       )
     : undefined;
 }

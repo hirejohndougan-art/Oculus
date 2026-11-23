@@ -165,9 +165,10 @@ CREATE TABLE public.identifier_counters (
 -- top of this file): one of 64 keys (buckets) per
 -- organization, picked by a hash of the type key. However many type keys a
 -- transaction writes (a record's former numbers may name up to 500 unknown
--- ones), it holds at most 64 of these locks per organization, so it can't
--- fill the server's shared lock table. Two types in one bucket only wait for
--- each other.
+-- ones), it holds at most 64 of these locks per organization it writes for
+-- (a job spanning many organizations in one transaction holds 64 for each:
+-- commit per organization). Two types in one bucket only wait for each other,
+-- or, rarely, deadlock into a clean retry (D-061).
 CREATE FUNCTION public.identifier_type_lock_bucket(type_key text)
 RETURNS integer
 LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
