@@ -942,7 +942,8 @@ const WRONG_ORGANIZATION = () =>
  * out could not say which template a record follows. The keys come from the
  * templates themselves, never from a separate map that could disagree with
  * them. All the templates must belong to one organization
- * (`mixed_organizations`): a registry is one organization's templates.
+ * (`mixed_organizations`, checked first, so no issue ever quotes another
+ * organization's template): a registry is one organization's templates.
  * Never throws.
  */
 export function indexTemplates(templates: unknown): Validated<TemplateRegistry> {
@@ -958,13 +959,24 @@ export function indexTemplates(templates: unknown): Validated<TemplateRegistry> 
         `A registry can hold at most ${String(MAX_REGISTRY_TEMPLATES)} templates.`,
       );
     }
+    // Read each slot as a plain data property, so a getter can't run. The
+    // organization is checked before any template is validated, so a list
+    // mixing in another organization's templates gets no message naming
+    // their keys (S-009a). An entry that doesn't say whose it is counts as
+    // mixed only beside others; alone, validation says what is wrong.
+    const items: unknown[] = [];
+    for (let i = 0; i < length; i += 1) {
+      const slot = Object.getOwnPropertyDescriptor(templates, i);
+      items.push(slot !== undefined && "value" in slot ? slot.value : undefined);
+    }
+    if (items.length > 1 && oneOrganization(items) === "mixed") {
+      return { ok: false, issues: [mixedOrganizationsIssue([], "These templates")] };
+    }
     const byKey = new Map<string, FieldTemplate>();
     const owners: FieldTemplate[] = [];
     const issues = new IssueList();
     for (let i = 0; i < length && !issues.full; i += 1) {
-      // Read each slot as a plain data property, so a getter can't run.
-      const slot = Object.getOwnPropertyDescriptor(templates, i);
-      const given: unknown = slot !== undefined && "value" in slot ? slot.value : undefined;
+      const given = items[i];
       const checked = validateTemplate(given);
       if (!checked.ok) {
         for (const found of checked.issues) {

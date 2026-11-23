@@ -151,6 +151,33 @@ describe("indexTemplates holds one organization's templates", () => {
     }
   });
 
+  it("names no key of another organization's templates in a mixed list (S-009a)", () => {
+    const dupField = {
+      ...template(OTHER, "their_template"),
+      fields: [...template(OTHER).fields, ...template(OTHER).fields].map((f) => ({
+        ...f,
+        key: "their_field",
+      })),
+    };
+    for (const list of [
+      // Their two templates sharing a key, beside ours.
+      [template(ORG, "a"), template(OTHER, "their_key"), template(OTHER, "their_key")],
+      // Ours and theirs sharing a key.
+      [template(ORG, "their_key"), template(OTHER, "their_key")],
+      // Their template with two fields sharing a key.
+      [template(ORG, "a"), dupField],
+      // An entry that doesn't say whose it is, beside ours.
+      [template(ORG, "a"), template(undefined, "their_key"), template(undefined, "their_key")],
+    ]) {
+      const r = indexTemplates(list);
+      expect(codes(r)).toEqual(["mixed_organizations"]);
+      expect(JSON.stringify(r)).not.toContain("their_");
+    }
+    // One organization's own duplicate still says which key.
+    const own = indexTemplates([template(ORG, "a"), template(ORG, "a")]);
+    expect(codes(own)).toEqual(["duplicate_key"]);
+  });
+
   it("two organizations can each have a template with the same key", () => {
     expect(indexTemplates([template(ORG)]).ok).toBe(true);
     expect(indexTemplates([template(OTHER)]).ok).toBe(true);
