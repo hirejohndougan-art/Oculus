@@ -27,6 +27,13 @@
  * whether an ID belongs to another organization: an ID that isn't this
  * organization's is "not found", whatever it is.
  *
+ * The checker belongs to the organization of the set it was made from, read
+ * from every entry, valid or not, or to the `organizationId` given for an
+ * empty set (records of another organization than the one given are
+ * refused). One made from an empty set with no organization belongs to
+ * none: it refuses every value (`no_organization_checker`), and nothing
+ * that accepts a checker trusts it (T-015a review).
+ *
  * The checker holds a snapshot of each record's ID, kind and organization
  * only, taken when it is made: make it again after records are added,
  * removed or changed kind. `publicOutput` reads the same snapshot (through
@@ -63,8 +70,8 @@
 import { type Validated } from "./issues.js";
 import { RECORD_KINDS, type RecordKind } from "./records.js";
 import { isRecordId, type RecordId } from "./record-id.js";
-import { organizationIdOf, type OrganizationId } from "./organizations.js";
-import { recordsById } from "./effective.js";
+import { isOrganizationId, organizationIdOf, type OrganizationId } from "./organizations.js";
+import { recordSet } from "./effective.js";
 import type { FieldProblem, FieldValueChecker } from "./templates.js";
 import { isPlainObject } from "./issues.js";
 import { markLinkChecker } from "./record-link-brand.js";
@@ -106,17 +113,54 @@ function allowedKinds(field: unknown): readonly RecordKind[] | undefined {
  * `indexRecords`. A set that holds records of more than one organization, or
  * can't be read, makes no checker (the issue `indexRecords` gives). See the
  * module header for what it checks. Never throws.
+ *
+ * The checker's organization is the set's, read from every entry, valid or
+ * not, so a set of another organization's invalid records still makes that
+ * organization's checker. Give `organizationId` to say whose records these
+ * must be: a set of another organization is refused (`wrong_organization`,
+ * naming nothing), and an empty set then makes that organization's checker,
+ * which holds no records. A checker made from an empty set without
+ * `organizationId` belongs to no organization: it refuses every link, and
+ * nothing that accepts a checker trusts it for anything.
  */
-export function makeRecordLinkChecker(records: unknown): Validated<FieldValueChecker> {
-  const found = recordsById(records);
-  if (!found.ok) return found;
-  const kinds = new Map<RecordId, RecordKind | undefined>();
-  let organizationId: OrganizationId | undefined;
-  for (const [id, record] of found.value) {
-    kinds.set(id, record?.kind);
-    // The set is one organization's (indexRecords refuses a mixed one).
-    organizationId ??= record?.organizationId;
+export function makeRecordLinkChecker(
+  records: unknown,
+  organizationId?: unknown,
+): Validated<FieldValueChecker> {
+  if (organizationId !== undefined && !isOrganizationId(organizationId)) {
+    return {
+      ok: false,
+      issues: [
+        Object.freeze({
+          path: Object.freeze(["organizationId"]),
+          code: "invalid_organization",
+          message: "Give a valid organization ID.",
+        }),
+      ],
+    };
   }
+  const found = recordSet(records);
+  if (!found.ok) return found;
+  if (
+    organizationId !== undefined &&
+    found.value.organizationId !== undefined &&
+    found.value.organizationId !== organizationId
+  ) {
+    return {
+      ok: false,
+      issues: [
+        Object.freeze({
+          path: Object.freeze([]),
+          code: "wrong_organization",
+          message:
+            "These records belong to another organization, so they can't make this organization's record link checker.",
+        }),
+      ],
+    };
+  }
+  const owner: OrganizationId | undefined = found.value.organizationId ?? organizationId;
+  const kinds = new Map<RecordId, RecordKind | undefined>();
+  for (const [id, record] of found.value.byId) kinds.set(id, record?.kind);
 
   const checker: FieldValueChecker = (value, field, record) => {
     try {
@@ -124,8 +168,13 @@ export function makeRecordLinkChecker(records: unknown): Validated<FieldValueChe
       if (typeof (record as unknown) !== "object" || (record as unknown) === null) {
         return UNREADABLE;
       }
-      const owner = organizationIdOf(record);
-      if (organizationId !== undefined && owner !== organizationId) {
+      if (owner === undefined) {
+        return problem(
+          "no_organization_checker",
+          "This record link checker was made from no records and for no organization, so it can't check any link.",
+        );
+      }
+      if (organizationIdOf(record) !== owner) {
         return problem(
           "wrong_organization_checker",
           "This record link checker was made from another organization's records, so it can't check this record's links.",
@@ -150,7 +199,7 @@ export function makeRecordLinkChecker(records: unknown): Validated<FieldValueChe
       if (target === own(record, "id")) {
         return problem("self_link", "A record can't link to itself.", ["recordId"]);
       }
-      if (organizationId === undefined || !kinds.has(target)) {
+      if (!kinds.has(target)) {
         return problem(
           "unknown_record",
           "There is no record with this ID in this organization's records.",
@@ -177,6 +226,6 @@ export function makeRecordLinkChecker(records: unknown): Validated<FieldValueChe
       return UNREADABLE;
     }
   };
-  markLinkChecker(checker, organizationId, kinds);
+  markLinkChecker(checker, owner, kinds);
   return { ok: true, value: checker };
 }

@@ -52,6 +52,15 @@ export function isMadeLinkChecker(checker: unknown): boolean {
 }
 
 /**
+ * The organization a checker `makeRecordLinkChecker` made belongs to;
+ * undefined for any other value, and for one made from an empty set with no
+ * organization given (which must not be trusted for anything).
+ */
+export function linkCheckerOrganization(checker: unknown): OrganizationId | undefined {
+  return typeof checker === "function" ? MADE.get(checker)?.organizationId : undefined;
+}
+
+/**
  * True for a checker `makeRecordLinkChecker` made from the records of an
  * organization other than `organizationId`.
  */
