@@ -15,6 +15,10 @@
  * keys all include `organization_id`, so a write can't point across either,
  * and triggers keep every row's organization, ID, key and version fixed.
  *
+ * Every record write stores the record's next version with it, in one
+ * savepoint (`insertRecord`, `updateRecord`; `record-versions.ts`, D-063):
+ * the database refuses a record write without its version at COMMIT.
+ *
  * What is left to the service layer (T-032): which organization a session may
  * use, making record IDs, transactions spanning several writes, checking a
  * record's fields against its template (that needs the organization's
@@ -41,6 +45,7 @@ import {
   validateTemplate,
   type CatalogRecord,
   type FieldTemplate,
+  type Issue,
   type Organization,
   type OrganizationId,
   type RecordId,
@@ -48,6 +53,12 @@ import {
   type Validated,
 } from "@oculus/core";
 import type { Queryable } from "./client.js";
+import {
+  validateRecordChange,
+  writeVersion,
+  type RecordChange,
+  type RecordVersion,
+} from "./record-versions.js";
 import { sql } from "./sql.js";
 
 /** A template as stored: the validated template and its version number. */
@@ -361,10 +372,104 @@ interface RecordRow {
   updated_at: string;
 }
 
+/** A record as stored now: the validated record and its version number. */
+export interface StoredRecord {
+  readonly version: number;
+  readonly record: CatalogRecord;
+}
+
+/** What `updateRecord` needs beyond the record: the version the edit started from, who and why. */
+export interface RecordUpdate extends RecordChange {
+  /**
+   * The version the person's edit started from (`readStoredRecord`, or the
+   * last version written). If the record has been written since, nothing is
+   * stored and the issue is `version_conflict` (T-031 adds what changed).
+   */
+  readonly expectedVersion: number;
+}
+
+const DEADLOCK = "40P01";
+const SERIALIZATION = "40001";
+const NO_TRANSACTION = "25P01";
+
+/** The SQLSTATE of a database error, if it is one. */
+function sqlState(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const { code } = error as { code?: unknown };
+  return typeof code === "string" ? code : undefined;
+}
+
 /**
- * Stores a new record. It must name its template (`templateKey`): every
- * stored record does (D-029), so a keyless one is refused here
- * (`no_template_key`) before the database would.
+ * Runs `work` inside a savepoint of the caller's transaction, as
+ * `identifiers.ts` and `vocabularies.ts` do: if it throws, everything it did
+ * (the record row and its version alike) is rolled back to the savepoint and
+ * the caller's transaction stays usable. A deadlock or serialization failure
+ * is returned as `retry`; any other error is thrown after the rollback.
+ */
+async function inSavepoint<T>(
+  db: Queryable,
+  work: () => Promise<Validated<T>>,
+): Promise<Validated<T>> {
+  try {
+    await db.execute(sql`SAVEPOINT oculus_catalog`);
+  } catch (error) {
+    if (sqlState(error) === NO_TRANSACTION) {
+      throw new Error("Record writes must run inside a transaction (Database.transaction).", {
+        cause: error,
+      });
+    }
+    throw error;
+  }
+  let result: Validated<T>;
+  try {
+    result = await work();
+    if (!result.ok) {
+      // A refusal found inside: nothing of it stays.
+      await db.execute(sql`ROLLBACK TO SAVEPOINT oculus_catalog`);
+    }
+    await db.execute(sql`RELEASE SAVEPOINT oculus_catalog`);
+    return result;
+  } catch (error) {
+    try {
+      await db.execute(sql`ROLLBACK TO SAVEPOINT oculus_catalog`);
+      await db.execute(sql`RELEASE SAVEPOINT oculus_catalog`);
+    } catch {
+      throw new Error("Rolling back a record write failed.", { cause: error });
+    }
+    const code = sqlState(error);
+    if (code === DEADLOCK || code === SERIALIZATION) {
+      return refused(
+        [],
+        "retry",
+        "Another change to this record ran at the same time. Roll back the transaction and try it again.",
+      );
+    }
+    throw error;
+  }
+}
+
+/** The kind-specific columns of a validated record. */
+function columnsOf(r: CatalogRecord) {
+  const coordinates = r.kind === "place" ? r.coordinates : undefined;
+  return {
+    level: r.kind === "archival_unit" ? r.level : null,
+    parentId: r.kind === "archival_unit" ? (r.parentId ?? null) : null,
+    mediaType: r.kind === "digital_asset" ? r.mediaType : null,
+    represents: r.kind === "digital_asset" ? (r.represents ?? null) : null,
+    agentType: r.kind === "agent" ? r.agentType : null,
+    lat: coordinates?.lat ?? null,
+    lng: coordinates?.lng ?? null,
+  };
+}
+
+const NO_TEMPLATE_KEY = "Every stored record names its template (templateKey).";
+
+/**
+ * Stores a new record and its version 1 (T-029, D-063), together: both or
+ * neither. It must name its template (`templateKey`): every stored record
+ * does (D-029), so a keyless one is refused here (`no_template_key`) before
+ * the database would. `change` says who made it and, optionally, why
+ * (`validateRecordChange`).
  *
  * **Callers must check the record first** with `checkRecordAgainstTemplate`,
  * giving it the organization's templates, identifier checker and record link
@@ -376,41 +481,155 @@ interface RecordRow {
  *
  * The ID is unique within the organization only (the table's key is
  * `(organization_id, id)`); one the organization already has is refused by
- * the primary key.
+ * the primary key. Runs in a savepoint of the caller's transaction (outside
+ * one it throws); a database error is thrown after the savepoint is rolled
+ * back, so no row and no version stays.
  */
 export async function insertRecord(
   db: Queryable,
   input: unknown,
+  change: RecordChange,
 ): Promise<Validated<CatalogRecord>> {
+  const who = validateRecordChange(change);
+  if (!who.ok) return { ok: false, issues: who.issues.map(underChange) };
   const valid = validateRecord(input);
   if (!valid.ok) return valid;
   const r = valid.value;
   if (r.templateKey === undefined) {
+    return refused(["templateKey"], "no_template_key", NO_TEMPLATE_KEY);
+  }
+  const c = columnsOf(r);
+  return inSavepoint(db, async () => {
+    await db.execute(sql`
+      INSERT INTO public.records (
+        id, organization_id, kind, template_key, record_type_key, title,
+        level, parent_id, media_type, represents_id, agent_type, latitude, longitude,
+        fields, created_at, updated_at, version
+      ) VALUES (
+        ${r.id}::uuid, ${r.organizationId}::uuid, ${r.kind}, ${r.templateKey},
+        ${r.recordTypeKey ?? null}, ${r.title},
+        ${c.level}, ${c.parentId}::uuid, ${c.mediaType}, ${c.represents}::uuid, ${c.agentType},
+        ${c.lat}::double precision, ${c.lng}::double precision,
+        ${JSON.stringify(r.fields)}::jsonb, ${r.createdAt}::timestamptz, ${r.updatedAt}::timestamptz,
+        1
+      )`);
+    await writeVersion(db, r, 1, who.value);
+    return valid;
+  });
+}
+
+/**
+ * Replaces a stored record with `input` and stores it as the record's next
+ * version, together: both or neither (T-029, D-063). The record is found by
+ * its organization and ID, which never change; its `createdAt` must be the
+ * stored one (`created_at_changed`). Refused, storing nothing:
+ * `unknown_record`; `version_conflict` when the record is no longer at
+ * `expectedVersion` (someone saved since: read it again); `retry` on a
+ * deadlock or serialization failure. Of two updates from the same version at
+ * the same moment, the second waits for the first and is then refused with
+ * `version_conflict`, so neither overwrites the other unseen.
+ *
+ * As for `insertRecord`, callers check the record against its template first
+ * (T-032). Runs in a savepoint of the caller's transaction.
+ */
+export async function updateRecord(
+  db: Queryable,
+  input: unknown,
+  update: RecordUpdate,
+): Promise<Validated<RecordVersion>> {
+  const expected = ownValue(update, "expectedVersion");
+  if (
+    typeof expected !== "number" ||
+    !Number.isInteger(expected) ||
+    expected < 1 ||
+    expected >= 2 ** 31 - 1
+  ) {
     return refused(
-      ["templateKey"],
-      "no_template_key",
-      "Every stored record names its template (templateKey).",
+      ["expectedVersion"],
+      "invalid_version",
+      "Name the version the edit started from: a whole number from 1.",
     );
   }
-  const level = r.kind === "archival_unit" ? r.level : null;
-  const parentId = r.kind === "archival_unit" ? (r.parentId ?? null) : null;
-  const mediaType = r.kind === "digital_asset" ? r.mediaType : null;
-  const represents = r.kind === "digital_asset" ? (r.represents ?? null) : null;
-  const agentType = r.kind === "agent" ? r.agentType : null;
-  const coordinates = r.kind === "place" ? r.coordinates : undefined;
-  await db.execute(sql`
-    INSERT INTO public.records (
-      id, organization_id, kind, template_key, record_type_key, title,
-      level, parent_id, media_type, represents_id, agent_type, latitude, longitude,
-      fields, created_at, updated_at
-    ) VALUES (
-      ${r.id}::uuid, ${r.organizationId}::uuid, ${r.kind}, ${r.templateKey},
-      ${r.recordTypeKey ?? null}, ${r.title},
-      ${level}, ${parentId}::uuid, ${mediaType}, ${represents}::uuid, ${agentType},
-      ${coordinates?.lat ?? null}::double precision, ${coordinates?.lng ?? null}::double precision,
-      ${JSON.stringify(r.fields)}::jsonb, ${r.createdAt}::timestamptz, ${r.updatedAt}::timestamptz
-    )`);
-  return valid;
+  const extra = ownKeysBeyond(update, UPDATE_KEYS);
+  if (extra !== undefined) {
+    return refused(
+      ["change", extra],
+      "unknown_property",
+      "An update has only expectedVersion, actor and reason.",
+    );
+  }
+  const changeInput: Record<string, unknown> = { actor: ownValue(update, "actor") };
+  const reason = ownValue(update, "reason");
+  if (reason !== undefined) changeInput.reason = reason;
+  const who = validateRecordChange(changeInput);
+  if (!who.ok) return { ok: false, issues: who.issues.map(underChange) };
+  const valid = validateRecord(input);
+  if (!valid.ok) return valid;
+  const r = valid.value;
+  if (r.templateKey === undefined) {
+    return refused(["templateKey"], "no_template_key", NO_TEMPLATE_KEY);
+  }
+  const c = columnsOf(r);
+  return inSavepoint(db, async (): Promise<Validated<RecordVersion>> => {
+    const [row] = await db.rows<{ version: number }>(sql`
+      UPDATE public.records SET
+        kind = ${r.kind}, template_key = ${r.templateKey}, record_type_key = ${r.recordTypeKey ?? null},
+        title = ${r.title}, level = ${c.level}, parent_id = ${c.parentId}::uuid,
+        media_type = ${c.mediaType}, represents_id = ${c.represents}::uuid,
+        agent_type = ${c.agentType}, latitude = ${c.lat}::double precision,
+        longitude = ${c.lng}::double precision, fields = ${JSON.stringify(r.fields)}::jsonb,
+        updated_at = ${r.updatedAt}::timestamptz, version = version + 1
+      WHERE organization_id = ${r.organizationId}::uuid AND id = ${r.id}::uuid
+        AND version = ${expected}::integer AND created_at = ${r.createdAt}::timestamptz
+      RETURNING version`);
+    if (row === undefined) {
+      const [current] = await db.rows<{ version: number; created: boolean }>(sql`
+        SELECT version, created_at = ${r.createdAt}::timestamptz AS created
+        FROM public.records
+        WHERE organization_id = ${r.organizationId}::uuid AND id = ${r.id}::uuid`);
+      if (current === undefined) {
+        return refused(["id"], "unknown_record", "The organization has no such record.");
+      }
+      if (current.version !== expected) {
+        return refused(
+          ["expectedVersion"],
+          "version_conflict",
+          `The record was saved by someone else since version ${String(expected)}; it is now at version ${String(current.version)}. Read it again.`,
+        );
+      }
+      return refused(["createdAt"], "created_at_changed", "A record's createdAt never changes.");
+    }
+    return { ok: true, value: await writeVersion(db, r, row.version, who.value) };
+  });
+}
+
+/** An issue of the change (who and why), under `change` in the path. */
+function underChange(i: Issue): Issue {
+  return issue(["change", ...i.path], i.code, i.message);
+}
+
+const UPDATE_KEYS: ReadonlySet<string> = new Set(["expectedVersion", "actor", "reason"]);
+
+/** The first own key not in `allowed` (or one that can't be read), if any. */
+function ownKeysBeyond(value: unknown, allowed: ReadonlySet<string>): string | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  try {
+    const key = Reflect.ownKeys(value).find((k) => typeof k !== "string" || !allowed.has(k));
+    return key === undefined ? undefined : String(key);
+  } catch {
+    return "(unreadable)";
+  }
+}
+
+/** An own data property, never through a getter or a proxy's trap. */
+function ownValue(value: unknown, key: string): unknown {
+  if (typeof value !== "object" || value === null) return undefined;
+  try {
+    const slot = Object.getOwnPropertyDescriptor(value, key);
+    return slot !== undefined && "value" in slot ? (slot.value as unknown) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -422,18 +641,33 @@ export async function readRecord(
   organizationId: OrganizationId,
   id: RecordId,
 ): Promise<Validated<CatalogRecord> | undefined> {
+  const stored = await readStoredRecord(db, organizationId, id);
+  if (!stored?.ok) return stored;
+  return { ok: true, value: stored.value.record };
+}
+
+/**
+ * As `readRecord`, with the record's current version number: what an edit
+ * starts from and passes to `updateRecord` as `expectedVersion`.
+ */
+export async function readStoredRecord(
+  db: Queryable,
+  organizationId: OrganizationId,
+  id: RecordId,
+): Promise<Validated<StoredRecord> | undefined> {
   if (!isOrganizationId(organizationId)) {
     return refused(["organizationId"], "invalid_organization", BAD_ORGANIZATION);
   }
   if (!isRecordId(id)) {
     return refused(["id"], "invalid_id", "The record ID must be a lowercase version 4 UUID.");
   }
-  const [row] = await db.rows<RecordRow>(sql`
+  const [row] = await db.rows<RecordRow & { version: number }>(sql`
     SELECT id::text AS id, organization_id::text AS organization_id, kind, template_key,
            record_type_key, title, level, parent_id::text AS parent_id, media_type,
            represents_id::text AS represents_id, agent_type, latitude, longitude, fields,
            to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
-           to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+           to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+           version
     FROM public.records
     WHERE organization_id = ${organizationId}::uuid AND id = ${id}::uuid`);
   if (row === undefined) return undefined;
@@ -442,7 +676,7 @@ export async function readRecord(
   if (valid.value.organizationId !== organizationId || valid.value.id !== id) {
     return refused([], "row_mismatch", "The stored record doesn't match its row.");
   }
-  return valid;
+  return { ok: true, value: Object.freeze({ version: row.version, record: valid.value }) };
 }
 
 /**

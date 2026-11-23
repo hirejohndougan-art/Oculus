@@ -26,7 +26,12 @@ import {
 } from "./catalog.js";
 import { migrate } from "./migrate.js";
 import { sql, type Sql } from "./sql.js";
-import { freshDatabase, type TestDatabase } from "./test-database.fixtures.js";
+import {
+  freshDatabase,
+  storeDirectVersion,
+  writeRecordDirectly,
+  type TestDatabase,
+} from "./test-database.fixtures.js";
 import {
   clearRecordTerms,
   readTerm,
@@ -138,7 +143,7 @@ async function record(org: OrganizationId, fields: Record<string, JsonValue>): P
       new Date(T),
     ),
   );
-  ok(await insertRecord(db, made));
+  ok(await db.transaction((tx) => insertRecord(tx, made, { actor: "system:test" })));
   return made.id;
 }
 
@@ -420,9 +425,15 @@ describe("the usage index", () => {
     ok(await refresh(org, id));
     expect(await countsByLabel(org)).toEqual({ [keyOf(DEPOT)]: 1 });
 
-    await db.execute(sql`
-      UPDATE public.records SET fields = ${JSON.stringify({ subjects: [LCSH] })}::jsonb
-      WHERE organization_id = ${org}::uuid AND id = ${id}::uuid`);
+    await writeRecordDirectly(
+      db,
+      sql`
+        UPDATE public.records
+        SET fields = ${JSON.stringify({ subjects: [LCSH] })}::jsonb, version = version + 1
+        WHERE organization_id = ${org}::uuid AND id = ${id}::uuid`,
+      org,
+      id,
+    );
     expect(ok(await recordsWithStaleTerms(db, org)).recordIds).toEqual([id]);
     ok(await refresh(org, id));
     expect(await countsByLabel(org)).toEqual({ [LCSH.uri]: 1 });
@@ -438,8 +449,9 @@ describe("the usage index", () => {
     // Saving the record and refreshing in one transaction keeps them together.
     await tx(async (q) => {
       await q.execute(sql`
-        UPDATE public.records SET fields = '{}'::jsonb
+        UPDATE public.records SET fields = '{}'::jsonb, version = version + 1
         WHERE organization_id = ${org}::uuid AND id = ${id}::uuid`);
+      await storeDirectVersion(q, org, id);
       ok(await refreshRecordTerms(q, org, id));
     });
     expect(ok(await termUsageCounts(db, org, {})).counts).toEqual([]);
@@ -650,9 +662,15 @@ describe("a refused refresh", () => {
                   WHERE organization_id = ${org}::uuid AND record_id = ${id}::uuid`);
     expect(await usages()).toHaveLength(2);
     // The record no longer validates (a field key core refuses).
-    await db.execute(sql`
-      UPDATE public.records SET fields = ${JSON.stringify({ "Bad Key": [DEPOT] })}::jsonb
-      WHERE organization_id = ${org}::uuid AND id = ${id}::uuid`);
+    await writeRecordDirectly(
+      db,
+      sql`
+        UPDATE public.records
+        SET fields = ${JSON.stringify({ "Bad Key": [DEPOT] })}::jsonb, version = version + 1
+        WHERE organization_id = ${org}::uuid AND id = ${id}::uuid`,
+      org,
+      id,
+    );
     const refused = await refresh(org, id);
     expect(refused.ok).toBe(false);
     expect(codes(refused)).not.toContain("unknown_record");
@@ -671,9 +689,15 @@ describe("stale records", () => {
     const broken: RecordId[] = [];
     for (let i = 0; i < 3; i += 1) {
       const id = await record(org, { subjects: [DEPOT] });
-      await db.execute(sql`
-        UPDATE public.records SET fields = ${JSON.stringify({ "Bad Key": [DEPOT] })}::jsonb
-        WHERE organization_id = ${org}::uuid AND id = ${id}::uuid`);
+      await writeRecordDirectly(
+        db,
+        sql`
+          UPDATE public.records
+          SET fields = ${JSON.stringify({ "Bad Key": [DEPOT] })}::jsonb, version = version + 1
+          WHERE organization_id = ${org}::uuid AND id = ${id}::uuid`,
+        org,
+        id,
+      );
       expect((await refresh(org, id)).ok).toBe(false);
       broken.push(id);
     }
@@ -721,8 +745,10 @@ describe("concurrent changes", () => {
     // B saves the record (locking it), then refreshes its terms when told.
     const save = tx(async (q) => {
       await q.execute(sql`
-        UPDATE public.records SET fields = ${JSON.stringify({ subjects: [DEPOT, LCSH] })}::jsonb
+        UPDATE public.records
+        SET fields = ${JSON.stringify({ subjects: [DEPOT, LCSH] })}::jsonb, version = version + 1
         WHERE ${where}`);
+      await storeDirectVersion(q, org, id);
       saved.resolve();
       await go.promise;
       return refreshRecordTerms(q, org, id);
@@ -757,7 +783,12 @@ describe("concurrent changes", () => {
       await q.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`);
       await q.rows(sql`SELECT 1 FROM public.records WHERE ${where}`);
       // Another connection changes the record after this snapshot.
-      await db.execute(sql`UPDATE public.records SET fields = '{}'::jsonb WHERE ${where}`);
+      await writeRecordDirectly(
+        db,
+        sql`UPDATE public.records SET fields = '{}'::jsonb, version = version + 1 WHERE ${where}`,
+        org,
+        id,
+      );
       expect(codes(await clearRecordTerms(q, org, id))).toEqual(["retry"]);
       expect(codes(await refreshRecordTerms(q, org, id))).toEqual(["retry"]);
     });

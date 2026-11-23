@@ -5,7 +5,14 @@
  * afterwards. With no server, database tests fail; they are never skipped.
  */
 import { randomBytes } from "node:crypto";
-import { createDatabase, dropDatabase, withDatabaseName } from "./client.js";
+import {
+  createDatabase,
+  dropDatabase,
+  withDatabaseName,
+  type Database,
+  type Queryable,
+} from "./client.js";
+import { sql, type Sql } from "./sql.js";
 
 export const TEST_URL_VARIABLE = "OCULUS_TEST_DATABASE_URL";
 
@@ -35,4 +42,40 @@ export async function freshDatabase(): Promise<TestDatabase> {
     url: withDatabaseName(server, name),
     drop: () => dropDatabase(server, name),
   };
+}
+
+/**
+ * Stores the version the database requires after a direct INSERT or UPDATE of
+ * a record (T-029, D-063): the row as it now is, as its current version, by
+ * the invented actor `system:direct_sql`. A direct UPDATE must also add 1 to
+ * `version`. Run it in the same transaction as the write.
+ */
+export async function storeDirectVersion(
+  q: Queryable,
+  organizationId: string,
+  recordId: string,
+): Promise<void> {
+  await q.execute(sql`
+    INSERT INTO public.record_versions (organization_id, record_id, version, record, actor)
+    SELECT organization_id, id, version, public.record_snapshot(r), 'system:direct_sql'
+    FROM public.records r
+    WHERE organization_id = ${organizationId}::uuid AND id = ${recordId}::uuid`);
+}
+
+/**
+ * Runs a direct INSERT or UPDATE of one record and stores its version, in
+ * one transaction, as any direct SQL writer must since T-029. Returns the
+ * number of rows the statement touched.
+ */
+export function writeRecordDirectly(
+  db: Database,
+  statement: Sql,
+  organizationId: string,
+  recordId: string,
+): Promise<number> {
+  return db.transaction(async (q) => {
+    const touched = await q.execute(statement);
+    await storeDirectVersion(q, organizationId, recordId);
+    return touched;
+  });
 }

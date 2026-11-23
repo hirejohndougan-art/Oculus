@@ -38,7 +38,7 @@ import {
 } from "./catalog.js";
 import { migrate } from "./migrate.js";
 import { sql, type Sql } from "./sql.js";
-import { freshDatabase, type TestDatabase } from "./test-database.fixtures.js";
+import { freshDatabase, writeRecordDirectly, type TestDatabase } from "./test-database.fixtures.js";
 
 // ---------------------------------------------------------------------------
 // One migrated database for the file, set up lazily inside each test (not in
@@ -87,6 +87,11 @@ function ok<T>(result: Validated<T> | undefined): T {
   if (result === undefined) throw new Error("not found");
   if (!result.ok) throw new Error(JSON.stringify(result.issues));
   return result.value;
+}
+
+/** `insertRecord` in a transaction of its own, by an invented system actor (T-029). */
+function insertRecordInTx(database: Database, input: unknown): Promise<Validated<CatalogRecord>> {
+  return database.transaction((tx) => insertRecord(tx, input, { actor: "system:test" }));
 }
 
 function codes(result: Validated<unknown> | undefined): string[] {
@@ -516,7 +521,7 @@ describe("records", () => {
     for (const record of records) {
       // Parents and represented records are inserted first, as a service would.
       expect(checkRecordAgainstTemplate(record, registry, options)).toEqual([]);
-      expect(ok(await insertRecord(db, record))).toEqual(record);
+      expect(ok(await insertRecordInTx(db, record))).toEqual(record);
     }
     for (const record of records) {
       const back = ok(await readRecord(db, org, record.id));
@@ -541,7 +546,7 @@ describe("records", () => {
       ),
     );
     const edited = { ...record, updatedAt: LATER };
-    ok(await insertRecord(db, edited));
+    ok(await insertRecordInTx(db, edited));
     expect(ok(await readRecord(db, ARCHIVES, record.id))).toMatchObject({
       createdAt: T,
       updatedAt: LATER,
@@ -553,8 +558,8 @@ describe("records", () => {
     const keyless = ok(
       createRecord({ organizationId: ARCHIVES, kind: "object", title: "No template" }),
     );
-    expect(codes(await insertRecord(db, keyless))).toEqual(["no_template_key"]);
-    expect(codes(await insertRecord(db, { ...keyless, kind: "spaceship" }))).toEqual([
+    expect(codes(await insertRecordInTx(db, keyless))).toEqual(["no_template_key"]);
+    expect(codes(await insertRecordInTx(db, { ...keyless, kind: "spaceship" }))).toEqual([
       "invalid_kind",
     ]);
   });
@@ -567,7 +572,7 @@ describe("records", () => {
       title: "The archives' own",
       templateKey: "spectrum-object",
     });
-    ok(await insertRecord(db, record));
+    ok(await insertRecordInTx(db, record));
     expect(ok(await readRecord(db, ARCHIVES, record.id))).toEqual(record);
     expect(await readRecord(db, LIBRARY, record.id)).toBeUndefined();
     expect(await readRecord(db, ARCHIVES, newRecordId())).toBeUndefined();
@@ -584,9 +589,13 @@ describe("records", () => {
       title: "Tampered",
       templateKey: "spectrum-object",
     });
-    ok(await insertRecord(db, record));
-    await db.execute(
-      sql`UPDATE public.records SET fields = '{"Bad Key": 1}' WHERE id = ${record.id}::uuid`,
+    ok(await insertRecordInTx(db, record));
+    await writeRecordDirectly(
+      db,
+      sql`UPDATE public.records SET fields = '{"Bad Key": 1}', version = version + 1
+          WHERE id = ${record.id}::uuid`,
+      ARCHIVES,
+      record.id,
     );
     expect(codes(await readRecord(db, ARCHIVES, record.id))).toEqual(["invalid_field_key"]);
   });
@@ -612,13 +621,16 @@ describe("the tables back up core's rules against direct SQL", () => {
   it("each kind has exactly its own columns", async () => {
     await ready();
     const unit = newRecordId();
-    await db.execute(
+    await writeRecordDirectly(
+      db,
       rawRecord({
         id: unit,
         kind: "archival_unit",
         level: "fonds",
         template: "dacs-archival-unit",
       }),
+      ARCHIVES,
+      unit,
     );
     for (const query of [
       rawRecord({ kind: "archival_unit", template: "dacs-archival-unit" }), // no level
@@ -765,7 +777,7 @@ describe("organizations stay separate, even through direct SQL", () => {
       title: "The archives' fonds",
       templateKey: "dacs-archival-unit",
     });
-    ok(await insertRecord(db, unit));
+    ok(await insertRecordInTx(db, unit));
     return unit.id;
   }
 
@@ -792,7 +804,7 @@ describe("organizations stay separate, even through direct SQL", () => {
       title: "The library's item",
       templateKey: "dacs-archival-unit",
     });
-    await expect(insertRecord(db, child)).rejects.toMatchObject({ code: FOREIGN_KEY });
+    await expect(insertRecordInTx(db, child)).rejects.toMatchObject({ code: FOREIGN_KEY });
   });
 
   it("a file can't represent another organization's record", async () => {
@@ -875,7 +887,7 @@ describe("organizations stay separate, even through direct SQL", () => {
       title: "A shadowed chair",
       templateKey: "spectrum-object",
     });
-    ok(await insertRecord(db, lone));
+    ok(await insertRecordInTx(db, lone));
     // An overload for the exact row type beats pg_catalog.to_jsonb(anyelement)
     // unless the trigger function's search path is fixed.
     await db.execute(sql`CREATE FUNCTION public.to_jsonb(public.records) RETURNS jsonb
@@ -903,7 +915,7 @@ describe("organizations stay separate, even through direct SQL", () => {
       title: "A series",
       templateKey: "dacs-archival-unit",
     });
-    ok(await insertRecord(db, child));
+    ok(await insertRecordInTx(db, child));
     // A lone record: nothing points at it and it points at nothing but its
     // template, which the library has under the same key.
     const lone = made({
@@ -912,7 +924,7 @@ describe("organizations stay separate, even through direct SQL", () => {
       title: "A lone chair",
       templateKey: "spectrum-object",
     });
-    ok(await insertRecord(db, lone));
+    ok(await insertRecordInTx(db, lone));
     for (const id of [lone.id, child.id, parent]) {
       expect(
         await refusedBy(
@@ -932,9 +944,12 @@ describe("organizations stay separate, even through direct SQL", () => {
     expect(await readRecord(db, LIBRARY, lone.id)).toBeUndefined();
     // Other columns can still be edited.
     expect(
-      await db.execute(
-        sql`UPDATE public.records SET title = 'A lone chair, edited'
+      await writeRecordDirectly(
+        db,
+        sql`UPDATE public.records SET title = 'A lone chair, edited', version = version + 1
             WHERE organization_id = ${ARCHIVES}::uuid AND id = ${lone.id}::uuid`,
+        ARCHIVES,
+        lone.id,
       ),
     ).toBe(1);
   });
@@ -1012,14 +1027,14 @@ describe("organizations stay separate, even through direct SQL", () => {
       title: "The archives' chair",
       templateKey: "spectrum-object",
     });
-    ok(await insertRecord(db, mine));
+    ok(await insertRecordInTx(db, mine));
     // The library gets the same ID (by chance, or because it guessed it): it
     // is stored, and nothing tells the library the archives has it.
     const theirs = { ...mine, organizationId: LIBRARY, title: "The library's chair" };
-    ok(await insertRecord(db, theirs));
+    ok(await insertRecordInTx(db, theirs));
     expect(ok(await readRecord(db, ARCHIVES, mine.id))).toEqual(mine);
     expect(ok(await readRecord(db, LIBRARY, mine.id))).toEqual(theirs);
-    await expect(insertRecord(db, { ...mine, title: "Again" })).rejects.toMatchObject({
+    await expect(insertRecordInTx(db, { ...mine, title: "Again" })).rejects.toMatchObject({
       code: UNIQUE,
       constraint: "records_pkey",
     });

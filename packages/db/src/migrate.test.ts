@@ -35,6 +35,7 @@ const ALL_TABLES = [
   "record_terms",
   "record_type_versions",
   "record_types",
+  "record_versions",
   "records",
   "template_versions",
   "templates",

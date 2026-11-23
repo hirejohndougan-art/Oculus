@@ -144,7 +144,7 @@ async function record(org: OrganizationId, title = "An invented chair"): Promise
       new Date(T),
     ),
   );
-  ok(await insertRecord(db, made));
+  ok(await db.transaction((tx) => insertRecord(tx, made, { actor: "system:test" })));
   return made.id;
 }
 
