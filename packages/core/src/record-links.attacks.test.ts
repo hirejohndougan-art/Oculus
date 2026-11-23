@@ -849,3 +849,29 @@ describe("the checker's organization (T-015a review)", () => {
     expect(text).not.toContain(all[0]?.id ?? "?");
   });
 });
+
+describe("a checker of no organization (T-015a second review)", () => {
+  it("lets a place that names no record through: a name needs no checker", () => {
+    const none = ok(makeRecordLinkChecker([]));
+    const item = withKey(
+      record("object", "Postcard", { rights: { uri: CNE }, places: [{ label: "Dickinson" }] }),
+    );
+    expect(
+      checkRecordAgainstTemplate(item, LINK_TPL, {
+        checkers: { ...CHECKERS, place: none },
+      }).map((i) => i.code),
+    ).toEqual([]);
+    expect(none({ label: "Dickinson" }, field({ key: "p", kind: "place" }), item)).toEqual([]);
+  });
+
+  it("is refused up front by publicOutput, for record_link and for place", () => {
+    const item = withKey(record("object", "Postcard", { rights: { uri: CNE } }));
+    const view = viewOf([item], item.id, CHECKERS);
+    const none = ok(makeRecordLinkChecker([]));
+    for (const kind of ["record_link", "place"]) {
+      expect(codes(output(view, [item.id], { ...CHECKERS, [kind]: none }))).toEqual([
+        "no_organization_checker",
+      ]);
+    }
+  });
+});

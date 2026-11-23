@@ -31,7 +31,8 @@
  * from every entry, valid or not, or to the `organizationId` given for an
  * empty set (records of another organization than the one given are
  * refused). One made from an empty set with no organization belongs to
- * none: it refuses every value (`no_organization_checker`), and nothing
+ * none: it refuses every value that names a record (`no_organization_checker`;
+ * a place with only a name needs no record), and nothing
  * that accepts a checker trusts it (T-015a review).
  *
  * The checker holds a snapshot of each record's ID, kind and organization
@@ -168,13 +169,7 @@ export function makeRecordLinkChecker(
       if (typeof (record as unknown) !== "object" || (record as unknown) === null) {
         return UNREADABLE;
       }
-      if (owner === undefined) {
-        return problem(
-          "no_organization_checker",
-          "This record link checker was made from no records and for no organization, so it can't check any link.",
-        );
-      }
-      if (organizationIdOf(record) !== owner) {
+      if (owner !== undefined && organizationIdOf(record) !== owner) {
         return problem(
           "wrong_organization_checker",
           "This record link checker was made from another organization's records, so it can't check this record's links.",
@@ -193,6 +188,14 @@ export function makeRecordLinkChecker(
       const target = own(value, "recordId");
       // A place may name no place record; a record_link must name one.
       if (target === undefined && own(field, "kind") === "place") return NONE;
+      // A checker of no organization vouches for no record (a name-only
+      // place, above, needs none).
+      if (owner === undefined) {
+        return problem(
+          "no_organization_checker",
+          "This record link checker was made from no records and for no organization, so it can't check any link.",
+        );
+      }
       if (!isRecordId(target)) {
         return problem("invalid_id", "recordId must be a record ID.", ["recordId"]);
       }

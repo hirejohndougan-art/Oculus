@@ -165,7 +165,9 @@ import {
 } from "./identifiers.js";
 import { mixedOrganizationsIssue } from "./organizations.js";
 import {
+  isMadeLinkChecker,
   isOtherOrganizationsLinkChecker,
+  linkCheckerOrganization,
   linkTargetKind,
   placeNameMayShow,
 } from "./record-link-brand.js";
@@ -579,6 +581,14 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
   const linkCheckers = new Map<string, unknown>();
   for (const kind of LINK_KINDS) {
     const linkChecker = isPlainObject(checkers) ? dataProp(checkers, kind) : undefined;
+    // A checker of no organization vouches for nothing: refused outright.
+    if (isMadeLinkChecker(linkChecker) && linkCheckerOrganization(linkChecker) === undefined) {
+      fail(
+        ["checkers", kind],
+        "no_organization_checker",
+        `checkers.${kind} was made from no records and for no organization. Make it from this record's organization's records, or give makeRecordLinkChecker the organization.`,
+      );
+    }
     // One organization's records never vouch for another's links (D-030).
     if (isOtherOrganizationsLinkChecker(linkChecker, organizationId)) {
       fail(
