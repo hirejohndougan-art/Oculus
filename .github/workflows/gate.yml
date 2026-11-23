@@ -45,10 +45,16 @@ jobs:
         run: |
           docker exec "$CONTAINER" psql -U postgres -c "ALTER SYSTEM SET max_prepared_transactions = 10"
           docker restart "$CONTAINER"
+          ready=no
           for i in $(seq 1 60); do
-            docker exec "$CONTAINER" pg_isready -U postgres && break
+            if docker exec "$CONTAINER" pg_isready -U postgres; then ready=yes; break; fi
             sleep 1
           done
+          if [ "$ready" != yes ]; then
+            echo "::error::PostgreSQL did not come back within 60 s after the restart."
+            docker logs "$CONTAINER" | tail -n 50
+            exit 1
+          fi
           docker exec "$CONTAINER" psql -U postgres -tAc "SHOW max_prepared_transactions" | grep -qx 10
       - uses: actions/checkout@v5
         with:
