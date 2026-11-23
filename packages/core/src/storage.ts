@@ -31,8 +31,21 @@
  * and any set mixing organizations is refused (D-030). Like `indexTemplates`
  * and `indexRecords`, `indexLocations` and `indexMoves` validate a whole list
  * once into a frozen, opaque snapshot (recognised by a WeakMap, never by
- * shape) that the query functions read; rebuild it after a change. Nothing
- * here throws on bad input.
+ * shape) that the query functions read; rebuild it after a change. Check a
+ * new move with `withMove`, and an edit to the levels or locations with
+ * `reindexLocations`, before saving either, so an edit that would make the
+ * history unreadable is refused rather than locking staff out of it.
+ *
+ * **What this can't know.** A move's `recordId` and an outside location's
+ * `agentId` are only checked for being IDs: this module holds no records, so
+ * the service layer (T-032) must check they are records of the same
+ * organization, and resolve them only through that organization's records.
+ * A container's own moves are location edits, so they show in the change log
+ * (Phase 2), not in a record's move history; the records inside follow it,
+ * and a box put in a display case does not make its records "away". Record
+ * each item's move when that matters. `container` marks what can be labelled
+ * and moved as a unit; nothing here refuses re-filing another location.
+ * Nothing here throws on bad input.
  */
 import { randomUUID } from "node:crypto";
 import { types } from "node:util";
@@ -188,9 +201,17 @@ export interface Whereabouts {
   /** Its normal location, or null when no placement or rehousing was recorded. */
   readonly normal: StorageLocation | null;
   readonly normalLabel: string | null;
-  /** True when it has a normal location and is somewhere else. */
+  /**
+   * True when it is somewhere other than its normal location, or, when no
+   * normal location was ever recorded, when its latest move was temporary
+   * (or gave a return date still in force).
+   */
   readonly away: boolean;
-  /** When it is due back, from the latest move, if it is away. */
+  /**
+   * When it is due back, if it is away: the latest expected return date
+   * given since it last left its normal location, so a later move with no
+   * date (a correction, say) keeps the earlier one.
+   */
   readonly expectedReturnOn: string | null;
   /** The latest move. */
   readonly lastMove: StorageMove;
@@ -201,9 +222,9 @@ export const MAX_LEVEL_NAME_LENGTH = 60;
 export const MAX_LOCATION_NAME_LENGTH = 200;
 export const MAX_STORAGE_NOTE_LENGTH = 2000;
 /** The most locations one index may hold. */
-export const MAX_LOCATIONS = 20_000;
+export const MAX_LOCATIONS = 200_000;
 /** The most moves one log may hold. */
-export const MAX_MOVES = 200_000;
+export const MAX_MOVES = 1_000_000;
 /** Between two path parts in a location label. */
 export const LOCATION_SEPARATOR = " › ";
 
@@ -492,9 +513,16 @@ export function createStorageMove(
   input: Omit<StorageMove, "id" | "recordedAt">,
   now: Date = new Date(),
 ): Validated<StorageMove> {
+  let time: number;
   try {
-    const time = Date.prototype.getTime.call(now);
-    if (Number.isNaN(time)) throw new RangeError("invalid time");
+    time = Date.prototype.getTime.call(now);
+  } catch {
+    time = Number.NaN;
+  }
+  if (Number.isNaN(time)) {
+    return refused([], "invalid_time", "The time the move was recorded is not a valid date.");
+  }
+  try {
     if (types.isProxy(input) || !isPlainObject(input)) {
       return refused([], "not_an_object", "A move must be a plain object.");
     }
@@ -507,7 +535,7 @@ export function createStorageMove(
       recordedAt: new Date(time).toISOString(),
     });
   } catch {
-    return refused([], "invalid_time", "The time the move was recorded is not a valid date.");
+    return refused([], "unreadable", "This move could not be read as plain data.");
   }
 }
 
@@ -734,43 +762,89 @@ export function indexMoves(index: LocationIndex, moves: unknown): Validated<Move
       }
     });
     if (issues.count > 0) return { ok: false, issues: issues.items };
-    if (valid.some(({ move }) => move.organizationId !== data.organizationId)) {
-      return { ok: false, issues: [mixedOrganizationsIssue([], "These moves and locations")] };
-    }
-    const ids = new Set<MoveId>();
-    const byRecord = new Map<RecordId, StorageMove[]>();
-    for (const { move, at } of valid) {
-      if (issues.full) break;
-      if (ids.has(move.id)) {
-        issues.add([at, "id"], "duplicate_id", "Two moves have the same ID.");
-        continue;
-      }
-      ids.add(move.id);
-      if (!data.byId.has(move.locationId)) {
-        issues.add(
-          [at, "locationId"],
-          "unknown_location",
-          "This move goes to a location that doesn't exist.",
-        );
-        continue;
-      }
-      const list = byRecord.get(move.recordId) ?? [];
-      list.push(move);
-      byRecord.set(move.recordId, list);
-    }
-    if (issues.count > 0) return { ok: false, issues: issues.items };
-    const sorted = new Map<RecordId, readonly StorageMove[]>();
-    for (const [recordId, list] of byRecord) {
-      const history = Object.freeze(list.sort(byWhen));
-      for (const found of historyIssues(data, history))
-        issues.add(found.path, found.code, found.message);
-      sorted.set(recordId, history);
-    }
-    if (issues.count > 0) return { ok: false, issues: issues.items };
-    return { ok: true, value: makeLog({ index: data, ids, byRecord: sorted, size: ids.size }) };
+    return buildLog(data, valid);
   } catch {
     return refused([], "unreadable", "The moves could not be read as plain data.");
   }
+}
+
+/**
+ * Check an edit to the storage levels or locations (a rename, a box moved
+ * to another shelf, a level removed in Settings, a location deleted)
+ * against the moves before saving it: the new levels and locations are
+ * indexed, and every move already in `log` is checked again against them.
+ * Returns the new index and the log rebuilt on it, or every problem, so an
+ * edit that would make the history unreadable (a used location deleted, a
+ * normal location turned into an outside one, a level still in use
+ * removed) is refused instead of saved. Never throws.
+ */
+export function reindexLocations(
+  log: MoveLog,
+  levels: unknown,
+  locations: unknown,
+): Validated<{ readonly index: LocationIndex; readonly log: MoveLog }> {
+  try {
+    const data = logData(log);
+    if (data === undefined) return notALog();
+    const index = indexLocations(levels, locations);
+    if (!index.ok) return index;
+    const next = indexData(index.value);
+    if (next === undefined) return notAnIndex();
+    const moves: { move: StorageMove; at: string | number }[] = [];
+    for (const history of data.byRecord.values()) {
+      for (const move of history) moves.push({ move, at: move.id });
+    }
+    const rebuilt = buildLog(next, moves);
+    if (!rebuilt.ok) return rebuilt;
+    return { ok: true, value: Object.freeze({ index: index.value, log: rebuilt.value }) };
+  } catch {
+    return refused([], "unreadable", "The locations could not be read as plain data.");
+  }
+}
+
+/** Index already validated moves; `at` is where each came from, for issue paths. */
+function buildLog(
+  data: IndexData,
+  valid: readonly { readonly move: StorageMove; readonly at: string | number }[],
+): Validated<MoveLog> {
+  const issues = new IssueList();
+  if (valid.some(({ move }) => move.organizationId !== data.organizationId)) {
+    return { ok: false, issues: [mixedOrganizationsIssue([], "These moves and locations")] };
+  }
+  const where = new Map<MoveId, string | number>();
+  const ids = new Set<MoveId>();
+  const byRecord = new Map<RecordId, StorageMove[]>();
+  for (const { move, at } of valid) {
+    if (issues.full) break;
+    if (ids.has(move.id)) {
+      issues.add([at, "id"], "duplicate_id", "Two moves have the same ID.");
+      continue;
+    }
+    ids.add(move.id);
+    where.set(move.id, at);
+    if (!data.byId.has(move.locationId)) {
+      issues.add(
+        [at, "locationId"],
+        "unknown_location",
+        "This move goes to a location that doesn't exist.",
+      );
+      continue;
+    }
+    const list = byRecord.get(move.recordId) ?? [];
+    list.push(move);
+    byRecord.set(move.recordId, list);
+  }
+  if (issues.count > 0) return { ok: false, issues: issues.items };
+  const sorted = new Map<RecordId, readonly StorageMove[]>();
+  for (const [recordId, list] of byRecord) {
+    const history = Object.freeze(list.sort(byWhen));
+    for (const found of historyIssues(data, history, (m) => [where.get(m.id) ?? m.id])) {
+      issues.add(found.path, found.code, found.message);
+    }
+    sorted.set(recordId, history);
+  }
+  if (issues.count > 0) return { ok: false, issues: issues.items };
+  return { ok: true, value: makeLog({ index: data, ids, byRecord: sorted, size: ids.size }) };
 }
 
 /** True if `value` is a log made by `indexMoves` or `withMove`. */
@@ -806,7 +880,7 @@ export function withMove(log: MoveLog, move: unknown): Validated<MoveLog> {
       );
     }
     const history = Object.freeze([...(data.byRecord.get(next.recordId) ?? []), next].sort(byWhen));
-    const problems = historyIssues(data.index, history);
+    const problems = historyIssues(data.index, history, (m) => (m.id === next.id ? [] : [m.id]));
     if (problems.length > 0) return { ok: false, issues: problems };
     const byRecord = new Map(data.byRecord);
     byRecord.set(next.recordId, history);
@@ -949,7 +1023,11 @@ export function checkLocationDeletion(log: MoveLog, locationId: unknown): Valida
 // Helpers
 
 /** Problems with one record's history, oldest move first. */
-function historyIssues(index: IndexData, history: readonly StorageMove[]): Issue[] {
+function historyIssues(
+  index: IndexData,
+  history: readonly StorageMove[],
+  pathOf: (move: StorageMove) => readonly (string | number)[],
+): Issue[] {
   const problems: Issue[] = [];
   let normal: LocationId | undefined;
   for (const move of history) {
@@ -958,7 +1036,7 @@ function historyIssues(index: IndexData, history: readonly StorageMove[]): Issue
       if (place?.kind === "external") {
         problems.push(
           issue(
-            ["moves", move.id],
+            pathOf(move),
             "external_normal_location",
             "A record's normal location must be inside the organization; use a temporary reason such as loan_out or conservation.",
           ),
@@ -968,7 +1046,7 @@ function historyIssues(index: IndexData, history: readonly StorageMove[]): Issue
     } else if (move.reason === "return" && move.locationId !== normal) {
       problems.push(
         issue(
-          ["moves", move.id],
+          pathOf(move),
           "not_normal_location",
           normal === undefined
             ? "This record has no normal location yet, so it can't be returned. Record a placement instead."
@@ -989,9 +1067,15 @@ function summarize(
   // `undefined` answers below can't happen; they keep the types honest.
   const last = history[history.length - 1];
   if (last === undefined) return undefined;
+  // Walk the history: the normal location is the latest placement or
+  // rehousing; the due date is the latest one given since the record last
+  // left home, so a later correction or dateless move doesn't drop it.
   let normalId: LocationId | undefined;
+  let dueOn: string | null = null;
   for (const move of history) {
     if (NORMAL_LOCATION_REASONS.includes(move.reason)) normalId = move.locationId;
+    if (move.locationId === normalId) dueOn = null;
+    else if (move.expectedReturnOn !== undefined) dueOn = move.expectedReturnOn;
   }
   const current = index.byId.get(last.locationId);
   const currentLabel = index.labels.get(last.locationId);
@@ -1001,7 +1085,12 @@ function summarize(
   if (normalId !== undefined && (normal === undefined || normalLabel === undefined)) {
     return undefined;
   }
-  const away = normal !== undefined && normal.id !== current.id;
+  // With no normal location recorded, a record is away while its latest
+  // stretch is temporary: sent out for digitization before it was ever placed.
+  const away =
+    normal !== undefined
+      ? normal.id !== current.id
+      : dueOn !== null || TEMPORARY_MOVE_REASONS.includes(last.reason);
   return Object.freeze({
     recordId,
     current,
@@ -1011,7 +1100,7 @@ function summarize(
     normal: normal ?? null,
     normalLabel: normalLabel ?? null,
     away,
-    expectedReturnOn: away ? (last.expectedReturnOn ?? null) : null,
+    expectedReturnOn: away ? dueOn : null,
     lastMove: last,
   });
 }
@@ -1148,6 +1237,13 @@ function checkOneLine(
   }
   if (value.length > max) {
     issues.add(path, "too_long", `A ${what} name can be at most ${String(max)} characters.`);
+  }
+  if (value.includes("\u203a")) {
+    issues.add(
+      path,
+      "separator_in_name",
+      `A ${what} name can't contain "\u203a", which separates the parts of a location's path.`,
+    );
   }
   if (ONE_LINE_BREAKS.test(value)) {
     issues.add(

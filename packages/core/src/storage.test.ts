@@ -20,6 +20,7 @@ import {
   newOrganizationId,
   newRecordId,
   overdueReturns,
+  reindexLocations,
   storageLocation,
   validateStorageLevels,
   validateStorageLocation,
@@ -170,6 +171,12 @@ describe("validateStorageLocation", () => {
     ]);
     expect(codes(validateStorageLocation({ ...room, agentId: newRecordId() }))).toEqual([
       "agent_not_external",
+    ]);
+  });
+
+  it("refuses the path separator in a name (review fix)", () => {
+    expect(codes(validateStorageLocation({ ...room, name: "Room 2 › Shelf C" }))).toEqual([
+      "separator_in_name",
     ]);
   });
 
@@ -375,18 +382,26 @@ describe("whereabouts", () => {
     expect(ok(whereabouts(log, newRecordId()))).toBeNull();
   });
 
-  it("an item with no normal location is not counted as away", () => {
+  it("an item never placed is away while its latest move is temporary (review fix)", () => {
     const w = ok(whereabouts(log, tape));
     expect(w?.normal).toBeNull();
-    expect(w?.away).toBe(false);
-    expect(w?.expectedReturnOn).toBeNull();
+    expect(w?.away).toBe(true);
+    expect(w?.expectedReturnOn).toBe("2026-11-01");
+    const placed = ok(withMove(log, move(tape, box1.id, "2026-11-22", "placement")));
+    expect(ok(whereabouts(placed, tape))?.away).toBe(false);
+    const parked = ok(indexMoves(idx, [move(tape, shelfB.id, "2026-11-20", "correction")]));
+    expect(ok(whereabouts(parked, tape))?.away).toBe(false);
   });
 
   it("lists items away, soonest due first, and the overdue ones", () => {
-    expect(ok(awayFromNormal(log)).map((w) => w.recordId)).toEqual([deed, print]);
-    expect(ok(overdueReturns(log, "2026-11-23")).map((w) => w.recordId)).toEqual([deed]);
+    expect(ok(awayFromNormal(log)).map((w) => w.recordId)).toEqual([deed, tape, print]);
+    expect(ok(overdueReturns(log, "2026-11-23")).map((w) => w.recordId)).toEqual([deed, tape]);
     expect(ok(overdueReturns(log, "2026-10-31"))).toEqual([]);
-    expect(ok(overdueReturns(log, "2027-02-02")).map((w) => w.recordId)).toEqual([deed, print]);
+    expect(ok(overdueReturns(log, "2027-02-02")).map((w) => w.recordId)).toEqual([
+      deed,
+      tape,
+      print,
+    ]);
     expect(codes(overdueReturns(log, "today"))).toEqual(["invalid_date"]);
   });
 
@@ -395,10 +410,10 @@ describe("whereabouts", () => {
     const w = ok(whereabouts(back, deed));
     expect(w?.away).toBe(false);
     expect(w?.expectedReturnOn).toBeNull();
-    expect(ok(overdueReturns(back, "2026-11-23"))).toEqual([]);
+    expect(ok(overdueReturns(back, "2026-11-23")).map((w2) => w2.recordId)).toEqual([tape]);
     expect(back.size).toBe(6);
     // The old log is unchanged.
-    expect(ok(overdueReturns(log, "2026-11-23")).map((w2) => w2.recordId)).toEqual([deed]);
+    expect(ok(overdueReturns(log, "2026-11-23")).map((w2) => w2.recordId)).toEqual([deed, tape]);
   });
 
   it("rehousing changes the normal location", () => {
@@ -414,6 +429,21 @@ describe("whereabouts", () => {
     expect(w?.currentLabel).toBe("Archive room › Shelf A › Box 001");
     expect(w?.normalLabel).toBe("Archive room › Shelf A › Box 001 › Folder 1");
     expect(w?.away).toBe(true);
+  });
+
+  it("a later move with no date keeps the due date, so it stays overdue (review fix)", () => {
+    const next = ok(withMove(log, move(deed, shelfB.id, "2026-11-22", "correction")));
+    expect(ok(whereabouts(next, deed))?.expectedReturnOn).toBe("2026-10-31");
+    expect(ok(overdueReturns(next, "2026-11-23")).map((w) => w.recordId)).toContain(deed);
+    const other = ok(withMove(log, move(deed, case2.id, "2026-11-22", "other")));
+    expect(ok(whereabouts(other, deed))?.expectedReturnOn).toBe("2026-10-31");
+    const later = ok(
+      withMove(
+        log,
+        move(deed, case2.id, "2026-11-22", "exhibition", { expectedReturnOn: "2027-01-05" }),
+      ),
+    );
+    expect(ok(whereabouts(later, deed))?.expectedReturnOn).toBe("2027-01-05");
   });
 
   it("keeps the history oldest first, ordering same-day moves by when they were written", () => {
@@ -480,5 +510,36 @@ describe("whereabouts", () => {
   it("refuses a log whose location was removed from the index", () => {
     const smaller = index(ALL.filter((l) => l.id !== case2.id));
     expect(codes(indexMoves(smaller, moves))).toEqual(["unknown_location"]);
+  });
+
+  it("checks location and level edits against the history before saving (review fix)", () => {
+    const moved = ALL.map((l) => (l.id === box1.id ? { ...box1, parentId: shelfB.id } : l));
+    const next = ok(reindexLocations(log, LEVELS, moved));
+    expect(next.index.size).toBe(ALL.length);
+    expect(ok(whereabouts(next.log, print))?.normalLabel).toBe("Archive room › Shelf B › Box 001");
+    expect(next.log.size).toBe(log.size);
+    // A used location deleted, or a level still in use removed.
+    const deleted = reindexLocations(
+      log,
+      LEVELS,
+      ALL.filter((l) => l.id !== case2.id),
+    );
+    expect(codes(deleted)).toEqual(["unknown_location"]);
+    expect(deleted.ok ? [] : deleted.issues[0]?.path).toEqual([moves[1]?.id, "locationId"]);
+    expect(
+      codes(reindexLocations(log, { organizationId: ORG, levels: ["Room", "Shelf", "Box"] }, ALL)),
+    ).toEqual(["unknown_level"]);
+    expect(codes(reindexLocations({ ...log }, LEVELS, ALL))).toEqual(["not_a_move_log"]);
+  });
+
+  it("refuses turning a normal location into an outside one", () => {
+    const shelfBMoves = [move(print, shelfB.id, "2026-11-01", "placement")];
+    const l2 = ok(indexMoves(idx, shelfBMoves));
+    const changed = ALL.map((l) =>
+      l.id === shelfB.id
+        ? { id: shelfB.id, organizationId: ORG, kind: "external", name: "Shelf B" }
+        : l,
+    );
+    expect(codes(reindexLocations(l2, LEVELS, changed))).toEqual(["external_normal_location"]);
   });
 });

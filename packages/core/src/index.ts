@@ -333,6 +333,7 @@ export {
   locationLabel,
   locationChildren,
   indexMoves,
+  reindexLocations,
   isMoveLog,
   withMove,
   moveHistory,

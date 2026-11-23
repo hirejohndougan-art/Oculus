@@ -250,10 +250,15 @@ describe("storage stays staff-only", () => {
   });
 
   it("no module but the package index imports storage", () => {
+    // Any static or dynamic import, with or without an extension, in any folder.
     const here = dirname(fileURLToPath(import.meta.url));
-    const importers = readdirSync(here)
-      .filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts") && f !== "storage.ts")
-      .filter((f) => /from\s+["']\.\/storage\.js["']/.test(readFileSync(join(here, f), "utf8")));
+    const mentions = /["'`](?:\.{1,2}\/)+(?:[^"'`]*\/)?storage(?:\.[jt]s)?["'`]/;
+    const importers = (readdirSync(here, { recursive: true }) as string[])
+      .filter((f) => /\.[cm]?[jt]sx?$/.test(f) && !/\.test\.ts$|\.fixtures\.ts$/.test(f))
+      .filter((f) => f !== "storage.ts")
+      .filter((f) => mentions.test(readFileSync(join(here, f), "utf8")));
     expect(importers).toEqual(["index.ts"]);
+    expect(mentions.test('await import("./storage")')).toBe(true);
+    expect(mentions.test('from "../core/storage.js"')).toBe(true);
   });
 });
