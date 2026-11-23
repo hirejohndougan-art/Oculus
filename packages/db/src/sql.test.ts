@@ -174,6 +174,14 @@ describe("placeholders can't run into the text around them", () => {
     }
   });
 
+  it("refuses two placeholders side by side", () => {
+    expect(() => sql`SELECT ${"a"}${"b"}`).toThrow(/side by side/);
+    expect(() => sql`SELECT ${sql`${"a"}`}${sql`${"b"}`}`).toThrow(/side by side/);
+    expect(() => sql`SELECT ${"a"}${sql``}${"b"}`).toThrow(/side by side/);
+    expect(() => joinSql([sql`${"a"}`, sql`${"b"}`], sql``)).toThrow(/side by side/);
+    expect(joinSql([sql`${"a"}`], sql``).text).toBe("$1");
+  });
+
   it("allows spaces, operators, casts and brackets", () => {
     const q = sql`SELECT (${1})::int, ${2}+${3}, ARRAY[${4}], ${5},${6}`;
     expect(q.text).toBe("SELECT ($1)::int, $2+$3, ARRAY[$4], $5,$6");

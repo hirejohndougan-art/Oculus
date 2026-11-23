@@ -24,7 +24,8 @@ export type SqlValue = SqlScalar | readonly SqlValue[];
 const brand = Symbol("oculus.sql");
 
 /**
- * Characters that would join a `$n` placeholder to the text around it: after
+ * Two placeholders may not touch (`$1$2`), and characters that would join a
+ * `$n` placeholder to the text around it are refused: after
  * it, a digit makes another parameter number (`${a}0` would read `$10`) and a
  * letter, `_` or `$` is trailing junk; before it, they make it part of an
  * identifier (`col$1`) or a dollar quote (`$$1`). PostgreSQL identifiers also
@@ -34,6 +35,13 @@ const JOINS_AFTER = /^[0-9A-Za-z_$\u0080-\uffff]/;
 const JOINS_BEFORE = /[0-9A-Za-z_$\u0080-\uffff]$/;
 
 function checkPlaceholders(parts: readonly string[]): void {
+  for (let i = 1; i < parts.length - 1; i++) {
+    if (parts[i] === "") {
+      throw new TypeError(
+        `sql: parameters ${String(i)} and ${String(i + 1)} are side by side ($${String(i)}$${String(i + 1)}); put a space or operator between them.`,
+      );
+    }
+  }
   for (let i = 1; i < parts.length; i++) {
     if (JOINS_BEFORE.test(parts[i - 1] ?? "") || JOINS_AFTER.test(parts[i] ?? "")) {
       throw new TypeError(
