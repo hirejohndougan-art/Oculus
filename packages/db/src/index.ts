@@ -38,4 +38,6 @@ export {
   saveRecordIdentifiers,
   readRecordIdentifiers,
   allocateIdentifier,
+  allocateIdentifiers,
 } from "./identifiers.js";
+export type { AllocationRequest, StoredRecordIdentifiers } from "./identifiers.js";

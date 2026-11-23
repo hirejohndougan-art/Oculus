@@ -21,6 +21,7 @@ import { openDatabase, type Database, type Queryable } from "./client.js";
 import { insertOrganization, insertRecord, insertTemplateVersion } from "./catalog.js";
 import {
   allocateIdentifier,
+  allocateIdentifiers,
   insertIdentifierType,
   readIdentifierTypes,
   readRecordIdentifiers,
@@ -158,16 +159,74 @@ function numbers(
 const save = (set: unknown): Promise<Validated<RecordIdentifiers>> =>
   tx((q) => saveRecordIdentifiers(q, set));
 
-/** Waits until some session of the test database is waiting on a lock. */
-async function someoneWaits(): Promise<void> {
+/** Waits until `count` sessions of the test database are waiting on a lock. */
+async function someoneWaits(count = 1): Promise<void> {
   for (let i = 0; i < 500; i++) {
     const [row] = await db.rows<{ n: number }>(sql`
       SELECT count(*)::integer AS n FROM pg_catalog.pg_stat_activity
       WHERE datname = current_database() AND wait_event_type = 'Lock'`);
-    if ((row?.n ?? 0) > 0) return;
+    if ((row?.n ?? 0) >= count) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error("Nothing started waiting.");
+}
+
+/**
+ * Resolves when `work` has settled or some session waits on a lock, whichever
+ * comes first: to orchestrate a race that must work with or without waiting.
+ */
+async function settledOrWaiting(work: Promise<unknown>): Promise<void> {
+  const state = { done: false };
+  const settled = work.then(
+    () => {
+      state.done = true;
+    },
+    () => {
+      state.done = true;
+    },
+  );
+  for (let i = 0; i < 500 && !state.done; i++) {
+    const [row] = await db.rows<{ n: number }>(sql`
+      SELECT count(*)::integer AS n FROM pg_catalog.pg_stat_activity
+      WHERE datname = current_database() AND wait_event_type = 'Lock'`);
+    if ((row?.n ?? 0) > 0) return;
+    await Promise.race([settled, new Promise((resolve) => setTimeout(resolve, 10))]);
+  }
+  if (!state.done) throw new Error("Neither settled nor waited.");
+}
+
+/** A promise and the function that resolves it. */
+function gate(): { opened: Promise<void>; open: () => void } {
+  let open = (): void => undefined;
+  const opened = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  return { opened, open };
+}
+
+/** Runs `work` in a transaction that stays open until `until` resolves. */
+function heldOpen<T>(
+  work: (q: Queryable) => Promise<T>,
+  until: Promise<void>,
+): { done: Promise<T>; ran: Promise<T> } {
+  let ran!: (value: T) => void;
+  let failed!: (error: unknown) => void;
+  const result = new Promise<T>((resolve, reject) => {
+    ran = resolve;
+    failed = reject;
+  });
+  const done = tx(async (q) => {
+    try {
+      const value = await work(q);
+      ran(value);
+      await until;
+      return value;
+    } catch (error) {
+      failed(error);
+      throw error;
+    }
+  });
+  return { done, ran: result };
 }
 
 // ---------------------------------------------------------------------------
@@ -360,6 +419,83 @@ describe("a record's identifiers", () => {
       UPDATE public.record_identifiers SET value = 'DHS-0099'
       WHERE organization_id = ${org}::uuid AND record_id = ${id}::uuid`);
     expect(codes(await readRecordIdentifiers(db, org, id))).toEqual(["key_outdated"]);
+  });
+});
+
+describe("reading a record's identifiers after its types changed", () => {
+  it("a value stranded by an allowed format change is read, with an issue beside it (D-031)", async () => {
+    await ready();
+    const org = await organization();
+    const id = await record(org);
+    const set = numbers(
+      org,
+      id,
+      [
+        ["object_number", "DHS-0001"],
+        ["box_label", "Box 1"],
+      ],
+      [{ type: "object_number", value: "old 7" }],
+    );
+    ok(await save(set));
+    const box = sampleTypes(org)[2];
+    ok(await tx((q) => updateIdentifierType(q, { ...box, pattern: "B-###" })));
+    const read = await readRecordIdentifiers(db, org, id);
+    expect(read).toEqual({
+      ok: true,
+      value: set,
+      issues: [expect.objectContaining({ path: ["current", 1, "value"], code: "format_mismatch" })],
+    });
+    // A save of the same set is still refused: new values must fit.
+    expect(codes(await save(set))).toEqual(["format_mismatch"]);
+  });
+
+  it("current and former identifiers are read from one moment", async () => {
+    await ready();
+    const org = await organization();
+    const id = await record(org);
+    const before = numbers(org, id, [["object_number", "DHS-0001"]]);
+    const after = numbers(
+      org,
+      id,
+      [["object_number", "DHS-0002"]],
+      [{ type: "object_number", value: "DHS-0001" }],
+    );
+    ok(await save(before));
+    // Right after the reader reads the current identifiers, another session
+    // renumbers the record.
+    let first = true;
+    const interrupted: Queryable = {
+      async rows(query) {
+        const rows = await db.rows(query);
+        if (first && query.text.includes("record_identifiers")) {
+          first = false;
+          ok(await save(after));
+        }
+        return rows as never;
+      },
+      execute: (query) => db.execute(query),
+    };
+    const read = ok(await readRecordIdentifiers(interrupted, org, id));
+    expect([before, after]).toContainEqual(read);
+  });
+});
+
+describe("savepoints", () => {
+  it("when rolling back to the savepoint fails too, the first error is kept as the cause", async () => {
+    const original = new Error("the work failed");
+    const broken: Queryable = {
+      rows: () => Promise.reject(original),
+      execute: (query) =>
+        query.text.startsWith("ROLLBACK")
+          ? Promise.reject(new Error("the rollback failed"))
+          : Promise.resolve(0),
+    };
+    const thrown = await allocateIdentifier(broken, newOrganizationId(), "object_number").then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).cause).toBe(original);
   });
 });
 
@@ -643,6 +779,198 @@ describe("auto-numbering", () => {
     const library = await organization("Invented Public Library");
     ok(await save(numbers(archives, await record(archives), [["object_number", "DHS-0500"]])));
     expect(ok(await tx((q) => allocateIdentifier(q, library, "object_number")))).toBe("DHS-0001");
+  });
+});
+
+describe("races between saves, type changes and allocations", () => {
+  const omeka = (org: OrganizationId): IdentifierType => ({
+    organizationId: org,
+    key: "omeka_id",
+    label: "Omeka ID",
+    uniqueness: "all_time",
+  });
+
+  /** Holdings of the type left with no rule although the type exists. */
+  async function ruleless(org: OrganizationId, typeKey: string): Promise<number> {
+    const [row] = await db.rows<{ n: number }>(sql`
+      SELECT count(*)::integer AS n FROM public.identifier_holdings h
+      WHERE h.organization_id = ${org}::uuid AND h.type_key = ${typeKey}
+        AND h.uniqueness IS NULL
+        AND EXISTS (SELECT 1 FROM public.identifier_types t
+                    WHERE t.organization_id = h.organization_id AND t.key = h.type_key)`);
+    return row?.n ?? 0;
+  }
+
+  /**
+   * Runs the writes `start` makes with every holding write of `org` held at a
+   * test-only trigger until all of them wait there, then lets them all go at
+   * once: each has done everything before its first holding write.
+   */
+  async function paused<T>(org: OrganizationId, start: () => Promise<T>[]): Promise<T[]> {
+    const PAUSE = 715026;
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS public.test_paused (organization_id uuid PRIMARY KEY)`);
+    await db.execute(sql`
+      CREATE OR REPLACE FUNCTION public.test_pause_holdings() RETURNS trigger
+      LANGUAGE plpgsql AS $$
+      BEGIN
+        IF EXISTS (SELECT 1 FROM public.test_paused WHERE organization_id = NEW.organization_id) THEN
+          PERFORM pg_advisory_xact_lock_shared(715026);
+        END IF;
+        RETURN NEW;
+      END $$`);
+    await db.execute(sql`
+      CREATE OR REPLACE TRIGGER aaaa_test_pause BEFORE INSERT OR UPDATE ON public.identifier_holdings
+      FOR EACH ROW EXECUTE FUNCTION public.test_pause_holdings()`);
+    await db.execute(sql`INSERT INTO public.test_paused VALUES (${org}::uuid)`);
+    const release = gate();
+    const holder = heldOpen(
+      (q) => q.execute(sql`SELECT pg_advisory_xact_lock(${PAUSE})`),
+      release.opened,
+    );
+    try {
+      await holder.ran;
+      const writes = start();
+      await someoneWaits(writes.length);
+      release.open();
+      await holder.done;
+      return await Promise.all(writes);
+    } finally {
+      release.open();
+      await holder.done.catch(() => undefined);
+      await db.execute(sql`DROP TRIGGER aaaa_test_pause ON public.identifier_holdings`);
+      await db.execute(sql`DELETE FROM public.test_paused WHERE organization_id = ${org}::uuid`);
+    }
+  }
+
+  it("a save before a type is created, committed after: the new type still counts its number", async () => {
+    await ready();
+    const org = await organization();
+    const [a, b] = [await record(org), await record(org)];
+    const commit = gate();
+    // a's save writes a former number of a type that doesn't exist yet, and stays uncommitted.
+    const saving = heldOpen(
+      (q) => saveRecordIdentifiers(q, numbers(org, a, [], [{ type: "omeka_id", value: "812" }])),
+      commit.opened,
+    );
+    ok(await saving.ran);
+    // The type is created meanwhile: it must wait for the save, or it can't see a's number.
+    const creating = tx((q) => insertIdentifierType(q, omeka(org)));
+    await settledOrWaiting(creating);
+    commit.open();
+    ok(await saving.done);
+    ok(await creating);
+    expect(await ruleless(org, "omeka_id")).toBe(0);
+    expect(codes(await save(numbers(org, b, [], [{ type: "omeka_id", value: "812" }])))).toEqual([
+      "not_unique",
+    ]);
+  });
+
+  it("a type created before a save, committed after: the save still takes its rule", async () => {
+    await ready();
+    const org = await organization();
+    const [a, b] = [await record(org), await record(org)];
+    const commit = gate();
+    const creating = heldOpen((q) => insertIdentifierType(q, omeka(org)), commit.opened);
+    ok(await creating.ran);
+    // a's save of a former number under the uncommitted type's key.
+    const saving = save(numbers(org, a, [], [{ type: "omeka_id", value: "812" }]));
+    await settledOrWaiting(saving);
+    commit.open();
+    ok(await creating.done);
+    ok(await saving);
+    expect(await ruleless(org, "omeka_id")).toBe(0);
+    expect(codes(await save(numbers(org, b, [], [{ type: "omeka_id", value: "812" }])))).toEqual([
+      "not_unique",
+    ]);
+  });
+
+  it("two records swapping numbers at the same moment get not_unique, never a deadlock", async () => {
+    await ready();
+    const org = await organization();
+    const [a, b] = [await record(org), await record(org)];
+    ok(await save(numbers(org, a, [["object_number", "DHS-0001"]])));
+    ok(await save(numbers(org, b, [["object_number", "DHS-0002"]])));
+    const results = await paused(org, () => [
+      save(numbers(org, a, [["object_number", "DHS-0002"]])),
+      save(numbers(org, b, [["object_number", "DHS-0001"]])),
+    ]);
+    expect(results.map((r) => codes(r))).toEqual([["not_unique"], ["not_unique"]]);
+    expect(ok(await readRecordIdentifiers(db, org, a))).toEqual(
+      numbers(org, a, [["object_number", "DHS-0001"]]),
+    );
+  });
+
+  it("allocations of two types in opposite order: in one call, no deadlock; in two, a clean retry", async () => {
+    await ready();
+    const org = await organization();
+    const year = { year: 2026 };
+    // T1 takes accession_number, then object_number (the fixed order); T2
+    // asks for both in one call, the other way round. T2 must wait for T1
+    // without holding object_number, or T1 and T2 wait for each other.
+    const tookFirst = gate();
+    const next = gate();
+    const tookSecond = gate();
+    const first = tx(async (q) => {
+      try {
+        const accession = ok(await allocateIdentifier(q, org, "accession_number", year));
+        tookFirst.open();
+        await next.opened;
+        const objectNumber = ok(await allocateIdentifier(q, org, "object_number"));
+        return [accession, objectNumber];
+      } finally {
+        tookFirst.open();
+        tookSecond.open();
+      }
+    });
+    await tookFirst.opened;
+    const second = tx((q) =>
+      allocateIdentifiers(q, org, [
+        { typeKey: "object_number" },
+        { typeKey: "accession_number", ...year },
+      ]),
+    );
+    await someoneWaits();
+    next.open();
+    await tookSecond.opened;
+    expect(await first).toEqual(["2026.001", "DHS-0001"]);
+    expect(ok(await second)).toEqual(["DHS-0002", "2026.002"]);
+
+    // Two calls in opposite order can deadlock: the database picks one, which
+    // gets a clean `retry` (its transaction still usable), and the other goes on.
+    const tookA = gate();
+    const tookB = gate();
+    const run = (mine: string, theirs: string, took: () => void, wait: Promise<void>) =>
+      tx(async (q) => {
+        ok(await allocateIdentifier(q, org, mine, year));
+        took();
+        await wait;
+        const result = await allocateIdentifier(q, org, theirs, year);
+        const [row] = await q.rows<{ one: number }>(sql`SELECT 1 AS one`);
+        return { result, row };
+      });
+    const one = run("object_number", "accession_number", tookA.open, tookB.opened);
+    const two = run("accession_number", "object_number", tookB.open, tookA.opened);
+    const outcomes = await Promise.all([one, two]);
+    expect(outcomes.map((o) => codes(o.result)).sort()).toEqual([[], ["retry"]]);
+    expect(outcomes.map((o) => o.row)).toEqual([{ one: 1 }, { one: 1 }]);
+  });
+
+  it("an allocation waits for a save typing the next number by hand, and gives out the one after", async () => {
+    await ready();
+    const org = await organization();
+    const id = await record(org);
+    const commit = gate();
+    const saving = heldOpen(
+      (q) => saveRecordIdentifiers(q, numbers(org, id, [["object_number", "DHS-0001"]])),
+      commit.opened,
+    );
+    ok(await saving.ran);
+    const allocating = tx((q) => allocateIdentifier(q, org, "object_number"));
+    await settledOrWaiting(allocating);
+    commit.open();
+    ok(await saving.done);
+    expect(ok(await allocating)).toBe("DHS-0002");
   });
 });
 

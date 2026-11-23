@@ -10,7 +10,9 @@
  * value's `identifierKey` beside it; reads validate again and check every
  * stored key is still `identifierKey(value)`, so a row changed by hand, or a
  * key computed by an older `identifierKey` (D-024: changing the key is a
- * migration), reads as issues.
+ * migration), reads as issues. A value stranded by an allowed type change (a
+ * new format) is read leniently, as D-031 reads stored sets: returned, with
+ * an issue beside it.
  *
  * Uniqueness is the database's: the tables' unique indexes on
  * `(organization_id, type_key, key)` enforce each type's `current` or
@@ -19,7 +21,11 @@
  * database's text. Every write runs inside a savepoint in the caller's
  * transaction, so a refusal leaves that transaction usable and unchanged;
  * these functions must be called inside `Database.transaction` (outside one
- * they throw).
+ * they throw). Holdings are written in a fixed order and type changes, saves
+ * and allocations meet at one lock per type key (D-061), so saves never
+ * deadlock each other; a deadlock the database still breaks (allocations of
+ * several types one call at a time, in opposite orders) comes back as a
+ * clean `retry` refusal.
  *
  * Every read and write names one organization (D-019, D-030); the tables'
  * keys and foreign keys all include it, so another organization's records,
@@ -108,10 +114,31 @@ async function inSavepoint<T>(
     await db.execute(sql`RELEASE SAVEPOINT oculus_identifiers`);
     return { done: true, value };
   } catch (error) {
-    await db.execute(sql`ROLLBACK TO SAVEPOINT oculus_identifiers`);
-    await db.execute(sql`RELEASE SAVEPOINT oculus_identifiers`);
+    try {
+      await db.execute(sql`ROLLBACK TO SAVEPOINT oculus_identifiers`);
+      await db.execute(sql`RELEASE SAVEPOINT oculus_identifiers`);
+    } catch {
+      // The transaction is unusable now; keep why it failed in the first place.
+      throw new Error("Rolling back an identifier write failed.", {
+        cause: error,
+      });
+    }
     return { done: false, error };
   }
+}
+
+/** The SQLSTATEs of a deadlock and a serialization failure: try again. */
+const TRANSIENT = new Set(["40P01", "40001"]);
+
+/** A clean refusal for a write the database broke off to resolve a deadlock. */
+function retryIfTransient<T>(error: unknown): Validated<T> | undefined {
+  return TRANSIENT.has(dbError(error)?.code ?? "")
+    ? refused(
+        [],
+        "retry",
+        "Another change to the same identifiers happened at the same moment. Try again.",
+      )
+    : undefined;
 }
 
 /** An own data property, never through a getter or a proxy's trap. */
@@ -146,6 +173,14 @@ async function loadTypes(
       : sql`SELECT key, definition FROM public.identifier_types
             WHERE organization_id = ${organizationId}::uuid ORDER BY key`,
   );
+  return checkTypes(rows, organizationId);
+}
+
+/** Stored type rows, validated as one list and checked against their rows. */
+function checkTypes(
+  rows: readonly { key: string; definition: unknown }[],
+  organizationId: OrganizationId,
+): Validated<readonly IdentifierType[]> {
   const valid = validateIdentifierTypes(
     rows.map((row) => row.definition),
     organizationId,
@@ -217,6 +252,8 @@ export async function insertIdentifierType(
     return valid;
   });
   if (result.done) return result.value;
+  const retry = retryIfTransient<IdentifierType>(result.error);
+  if (retry !== undefined) return retry;
   const error = dbError(result.error);
   if (error?.code === UNIQUE && error.constraint === "identifier_types_pkey") {
     return refused(["key"], "key_taken", "Another identifier type already uses this key.");
@@ -258,6 +295,8 @@ export async function updateIdentifierType(
       : refused(["key"], "unknown_type", "The organization has no identifier type with this key.");
   });
   if (result.done) return result.value;
+  const retry = retryIfTransient<IdentifierType>(result.error);
+  if (retry !== undefined) return retry;
   const error = dbError(result.error);
   if (error?.code === UNIQUE && RULE_INDEXES.has(error.constraint)) {
     return refused(
@@ -297,7 +336,10 @@ interface FormerRow {
  * refused (`not_unique`, at the value's path) by the database's unique
  * indexes, also when the other save is happening at the same moment: the
  * second waits for the first and is refused if it committed. Nothing is
- * stored then, and the transaction stays usable. Run inside a transaction.
+ * stored then, and the transaction stays usable. Two records swapping
+ * numbers at the same moment are both refused, never deadlocked: holdings
+ * are written in a fixed order before any is deleted. Run inside a
+ * transaction.
  *
  * Callers must check `droppedIdentifiers` first: a number left out is gone,
  * and under `all_time` free to be given to another record.
@@ -324,9 +366,9 @@ export async function saveRecordIdentifiers(
       return refused(["recordId"], "unknown_record", "The organization has no such record.");
     }
     const where = sql`organization_id = ${org}::uuid AND record_id = ${set.recordId}::uuid`;
+    // The value rows point at holdings; they are this record's alone.
     await db.execute(sql`DELETE FROM public.record_identifiers WHERE ${where}`);
     await db.execute(sql`DELETE FROM public.former_identifiers WHERE ${where}`);
-    await db.execute(sql`DELETE FROM public.identifier_holdings WHERE ${where}`);
 
     const holdings = new Map<string, { type: string; key: string; current: boolean }>();
     const hold = (type: string, key: string, current: boolean): void => {
@@ -344,14 +386,33 @@ export async function saveRecordIdentifiers(
       hold(item.type, formerKeys[i] ?? "", false);
     });
     const held = [...holdings.values()];
+    const heldTypes = held.map((h) => h.type);
+    const heldKeys = held.map((h) => h.key);
+    // Holdings the record keeps or takes are written first, one statement in
+    // a fixed order (type, then key, byte order), and only then are the ones
+    // it lets go of deleted. So a save that waits on another's number (an
+    // uncommitted holding of it) has written only numbers before it in that
+    // order and deleted none: two saves can't each wait for the other (two
+    // records swapping numbers each meet the other's number still held, and
+    // are refused). The trigger takes the types' locks in the same order.
     if (held.length > 0) {
       await db.execute(sql`
         INSERT INTO public.identifier_holdings
           (organization_id, record_id, type_key, key, current)
         SELECT ${org}::uuid, ${set.recordId}::uuid, h.type_key, h.key, h.current
-        FROM unnest(${held.map((h) => h.type)}::text[], ${held.map((h) => h.key)}::text[],
-                    ${held.map((h) => h.current)}::boolean[]) AS h(type_key, key, current)`);
+        FROM unnest(${heldTypes}::text[], ${heldKeys}::text[],
+                    ${held.map((h) => h.current)}::boolean[]) AS h(type_key, key, current)
+        ORDER BY h.type_key COLLATE "C", h.key COLLATE "C"
+        ON CONFLICT (organization_id, record_id, type_key, key)
+          DO UPDATE SET current = EXCLUDED.current
+          WHERE identifier_holdings.current IS DISTINCT FROM EXCLUDED.current`);
     }
+    await db.execute(sql`
+      DELETE FROM public.identifier_holdings h
+      WHERE h.organization_id = ${org}::uuid AND h.record_id = ${set.recordId}::uuid
+        AND NOT EXISTS (
+          SELECT 1 FROM unnest(${heldTypes}::text[], ${heldKeys}::text[]) AS kept(type_key, key)
+          WHERE kept.type_key = h.type_key AND kept.key = h.key)`);
     if (set.current.length > 0) {
       await db.execute(sql`
         INSERT INTO public.record_identifiers
@@ -378,6 +439,8 @@ export async function saveRecordIdentifiers(
     return valid;
   });
   if (result.done) return result.value;
+  const retry = retryIfTransient<RecordIdentifiers>(result.error);
+  if (retry !== undefined) return retry;
   const error = dbError(result.error);
   if (error?.code === UNIQUE && RULE_INDEXES.has(error.constraint)) {
     return clashes(db, org, input);
@@ -457,59 +520,101 @@ async function clashes(
 }
 
 /**
- * The record's identifiers as stored, validated against the organization's
- * types as they are now (`validateRecordIdentifiers`), with every stored
- * comparison key checked against `identifierKey(value)` (`key_outdated`).
- * `undefined` if the organization has no such record (including when another
- * organization has).
+ * A record's identifiers as stored: the set, and the issues of values that
+ * no longer fit their type (a format changed since they were saved, D-031).
+ */
+export type StoredRecordIdentifiers =
+  | { readonly ok: true; readonly value: RecordIdentifiers; readonly issues: readonly Issue[] }
+  | { readonly ok: false; readonly issues: readonly Issue[] };
+
+/** Codes of values stranded by an allowed type change: reported, not refused. */
+const STRANDED = new Set(["format_mismatch"]);
+
+/**
+ * The record's identifiers as stored, read leniently as D-031 reads stored
+ * sets: every shape and safety rule of `validateRecordIdentifiers` against the
+ * organization's types as they are now applies, but a current value that no
+ * longer fits its type's format (the format changed after it was saved) is
+ * still returned, with a `format_mismatch` issue at its path in `issues`.
+ * Every stored comparison key is checked against `identifierKey(value)`; a
+ * mismatch refuses the read (`key_outdated`), since uniqueness then can't be
+ * trusted. Records, values and types are read in one statement, so from one
+ * moment. `undefined` if the organization has no such record (including when
+ * another organization has).
  */
 export async function readRecordIdentifiers(
   db: Queryable,
   organizationId: OrganizationId,
   recordId: RecordId,
-): Promise<Validated<RecordIdentifiers> | undefined> {
+): Promise<StoredRecordIdentifiers | undefined> {
   if (!isOrganizationId(organizationId)) {
-    return refused(["organizationId"], "invalid_organization", BAD_ORGANIZATION);
+    return {
+      ok: false,
+      issues: [issue(["organizationId"], "invalid_organization", BAD_ORGANIZATION)],
+    };
   }
-  if (!isRecordId(recordId)) return refused(["recordId"], "invalid_id", BAD_RECORD);
-  const [record] = await db.rows(sql`
-    SELECT 1 FROM public.records
-    WHERE organization_id = ${organizationId}::uuid AND id = ${recordId}::uuid`);
-  if (record === undefined) return undefined;
+  if (!isRecordId(recordId)) {
+    return { ok: false, issues: [issue(["recordId"], "invalid_id", BAD_RECORD)] };
+  }
   const where = sql`organization_id = ${organizationId}::uuid AND record_id = ${recordId}::uuid`;
-  const current = await db.rows<CurrentRow>(sql`
-    SELECT type_key, value, key, is_primary FROM public.record_identifiers
-    WHERE ${where} ORDER BY position`);
-  const former = await db.rows<FormerRow>(sql`
-    SELECT type_key, value, key, note,
-           to_char(retired_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS retired_at
-    FROM public.former_identifiers
-    WHERE ${where} ORDER BY position`);
-  const types = await loadTypes(db, organizationId, false);
+  const [row] = await db.rows<{
+    current: CurrentRow[] | null;
+    former: FormerRow[] | null;
+    types: { key: string; definition: unknown }[] | null;
+  }>(sql`
+    SELECT
+      (SELECT json_agg(json_build_object('type_key', type_key, 'value', value, 'key', key,
+                                         'is_primary', is_primary) ORDER BY position)
+       FROM public.record_identifiers WHERE ${where}) AS current,
+      (SELECT json_agg(json_build_object(
+                'type_key', type_key, 'value', value, 'key', key, 'note', note,
+                'retired_at',
+                to_char(retired_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'))
+              ORDER BY position)
+       FROM public.former_identifiers WHERE ${where}) AS former,
+      (SELECT json_agg(json_build_object('key', key, 'definition', definition) ORDER BY key)
+       FROM public.identifier_types WHERE organization_id = ${organizationId}::uuid) AS types
+    FROM public.records
+    WHERE organization_id = ${organizationId}::uuid AND id = ${recordId}::uuid`);
+  if (row === undefined) return undefined;
+  const current = row.current ?? [];
+  const former = row.former ?? [];
+  const types = checkTypes(row.types ?? [], organizationId);
   if (!types.ok) return types;
-  const valid = validateRecordIdentifiers(
-    {
-      recordId,
-      organizationId,
-      current: current.map((row) => ({
-        type: row.type_key,
-        value: row.value,
-        primary: row.is_primary,
-      })),
-      former: former.map((row) => {
-        const item: Record<string, string> = { type: row.type_key, value: row.value };
-        if (row.retired_at !== null) item.retiredAt = row.retired_at;
-        if (row.note !== null) item.note = row.note;
-        return item;
-      }),
-    },
-    types.value,
+  const stored = {
+    recordId,
+    organizationId,
+    current: current.map((item) => ({
+      type: item.type_key,
+      value: item.value,
+      primary: item.is_primary,
+    })),
+    former: former.map((item) => {
+      const entry: Record<string, string> = { type: item.type_key, value: item.value };
+      if (item.retired_at !== null) entry.retiredAt = item.retired_at;
+      if (item.note !== null) entry.note = item.note;
+      return entry;
+    }),
+  };
+  // Checked against the types without their formats, then the formats alone.
+  const unformatted = types.value.map(
+    (type) =>
+      Object.fromEntries(
+        Object.entries(type).filter(([key]) => key !== "pattern"),
+      ) as unknown as IdentifierType,
   );
+  const valid = validateRecordIdentifiers(stored, unformatted);
   if (!valid.ok) return valid;
+  const strict = validateRecordIdentifiers(stored, types.value);
+  const stranded = strict.ok ? [] : strict.issues.filter((i) => STRANDED.has(i.code));
+  if (!strict.ok && stranded.length !== strict.issues.length) {
+    // Anything else the formats add is refused, as before.
+    return strict;
+  }
   const outdated: Issue[] = [];
   const checkKeys = (rows: readonly { value: string; key: string }[], list: string): void => {
-    rows.forEach((row, index) => {
-      if (row.key !== identifierKey(row.value)) {
+    rows.forEach((item, index) => {
+      if (item.key !== identifierKey(item.value)) {
         outdated.push(
           issue(
             [list, index, "value"],
@@ -522,11 +627,18 @@ export async function readRecordIdentifiers(
   };
   checkKeys(current, "current");
   checkKeys(former, "former");
-  return outdated.length > 0 ? { ok: false, issues: outdated } : valid;
+  if (outdated.length > 0) return { ok: false, issues: outdated };
+  return { ok: true, value: valid.value, issues: stranded };
 }
 
 // ---------------------------------------------------------------------------
 // Auto-numbering
+
+/** One number to give out: the type's key, and the year for year numbering. */
+export interface AllocationRequest {
+  readonly typeKey: string;
+  readonly year?: number;
+}
 
 /**
  * Gives out the next auto-number of one of the organization's types, as
@@ -536,10 +648,18 @@ export async function readRecordIdentifiers(
  * for year-based numbering). Gaps are not filled and may appear; a number is
  * never given out twice.
  *
- * The type's counter row is locked until the transaction ends, so a second
- * allocation of the type waits, then sees the first's number. Save the number
- * with `saveRecordIdentifiers` in the same transaction; if the save is
+ * The type's key lock (the one saves of its numbers take, D-061) and its
+ * counter row are held until the transaction ends: a second allocation of the
+ * type waits and then sees the first's number, a save of the type's numbers
+ * that hasn't committed is waited for (so a number typed by hand is never
+ * given out again), and saves of the type wait for this transaction. Save the
+ * number with `saveRecordIdentifiers` in the same transaction; if the save is
  * refused, roll back, or the number stays used. Run inside a transaction.
+ *
+ * A transaction that needs numbers of several types must get them in one
+ * `allocateIdentifiers` call, which locks them in a fixed order: two
+ * transactions allocating two types one by one in opposite orders can each
+ * wait for the other, and the database then refuses one (`retry`).
  */
 export async function allocateIdentifier(
   db: Queryable,
@@ -547,69 +667,156 @@ export async function allocateIdentifier(
   typeKey: string,
   options: { readonly year?: number } = {},
 ): Promise<Validated<string>> {
+  const request: AllocationRequest =
+    options.year === undefined ? { typeKey } : { typeKey, year: options.year };
+  const result = await allocateIdentifiers(db, organizationId, [request]);
+  if (!result.ok) {
+    // One request: its issues at their own paths, without the list index.
+    return {
+      ok: false,
+      issues: result.issues.map((i) =>
+        i.path[0] === 0 ? issue(i.path.slice(1), i.code, i.message) : i,
+      ),
+    };
+  }
+  const [value] = result.value;
+  return value === undefined
+    ? refused([], "unreadable", "No number was given out.")
+    : { ok: true, value };
+}
+
+/**
+ * Gives out one number per request, as `allocateIdentifier` does, in the
+ * order asked, locking the types and counters in a fixed order (type key,
+ * then series, byte order) whatever the order asked, so two calls naming the
+ * same types never wait for each other. Issues are at `[index, ...]`. Run
+ * inside a transaction.
+ */
+export async function allocateIdentifiers(
+  db: Queryable,
+  organizationId: OrganizationId,
+  requests: readonly AllocationRequest[],
+): Promise<Validated<readonly string[]>> {
   if (!isOrganizationId(organizationId)) {
     return refused(["organizationId"], "invalid_organization", BAD_ORGANIZATION);
   }
-  if (typeof typeKey !== "string" || !STORED_TYPE_KEY.test(typeKey)) {
-    return refused(["type"], "invalid_type", "That is not an identifier type key.");
+  if (!Array.isArray(requests) || requests.length === 0 || requests.length > 100) {
+    return refused([], "invalid_requests", "Ask for between 1 and 100 numbers.");
   }
-  const result = await inSavepoint(db, async (): Promise<Validated<string>> => {
+  const asked: { typeKey: string; options: { year?: number } }[] = [];
+  for (const [index, raw] of requests.entries()) {
+    const typeKey = ownValue(raw, "typeKey");
+    const year = ownValue(raw, "year");
+    if (typeof typeKey !== "string" || !STORED_TYPE_KEY.test(typeKey)) {
+      return refused([index, "type"], "invalid_type", "That is not an identifier type key.");
+    }
+    if (year !== undefined && typeof year !== "number") {
+      return refused([index, "year"], "invalid_year", "The year must be a number.");
+    }
+    asked.push({ typeKey, options: year === undefined ? {} : { year } });
+  }
+  const result = await inSavepoint(db, async (): Promise<Validated<readonly string[]>> => {
     const types = await loadTypes(db, organizationId, true);
     if (!types.ok) return types;
-    const type = types.value.find((t) => t.key === typeKey);
-    if (type === undefined) {
-      return refused(
-        ["type"],
-        "unknown_type",
-        "The organization has no identifier type with this key.",
-      );
+    const plan: { index: number; type: IdentifierType; series: string }[] = [];
+    for (const [index, { typeKey, options }] of asked.entries()) {
+      const type = types.value.find((t) => t.key === typeKey);
+      if (type === undefined) {
+        return refused(
+          [index, "type"],
+          "unknown_type",
+          "The organization has no identifier type with this key.",
+        );
+      }
+      // Core's own refusals (no auto-numbering, no year) before any lock.
+      const first = nextIdentifier(type, [], options);
+      if (!first.ok) {
+        return {
+          ok: false,
+          issues: first.issues.map((i) => issue([index, ...i.path], i.code, i.message)),
+        };
+      }
+      plan.push({
+        index,
+        type,
+        series: type.autoNumber?.style === "year" ? String(options.year) : "",
+      });
     }
-    // Core's own refusals (no auto-numbering, no year) before any counter.
-    const first = nextIdentifier(type, [], options);
-    if (!first.ok) return first;
-    const series = type.autoNumber?.style === "year" ? String(options.year) : "";
-    await db.execute(sql`
-      INSERT INTO public.identifier_counters (organization_id, type_key, series)
-      VALUES (${organizationId}::uuid, ${typeKey}, ${series})
-      ON CONFLICT DO NOTHING`);
-    const [counter] = await db.rows<{ last_value: string | null }>(sql`
-      SELECT last_value FROM public.identifier_counters
-      WHERE organization_id = ${organizationId}::uuid AND type_key = ${typeKey}
-        AND series = ${series}
-      FOR UPDATE`);
-    // Read after the lock: a statement started now sees every number an
-    // allocation that held the lock before saved and committed.
-    const held = await db.rows<{ record_id: string; value: string }>(sql`
-      SELECT record_id::text AS record_id, value FROM public.record_identifiers
-      WHERE organization_id = ${organizationId}::uuid AND type_key = ${typeKey}
-      UNION ALL
-      SELECT record_id::text, value FROM public.former_identifiers
-      WHERE organization_id = ${organizationId}::uuid AND type_key = ${typeKey}`);
-    const byRecord = new Map<string, { type: string; value: string }[]>();
-    for (const row of held) {
-      const list = byRecord.get(row.record_id) ?? [];
-      list.push({ type: typeKey, value: row.value });
-      byRecord.set(row.record_id, list);
+    const byteOrder = (a: string, b: string): number =>
+      Buffer.compare(Buffer.from(a), Buffer.from(b));
+    plan.sort((a, b) => byteOrder(a.type.key, b.type.key) || byteOrder(a.series, b.series));
+    const given: string[] = [];
+    for (const { index, type, series } of plan) {
+      const next = await allocateOne(db, organizationId, type, series, asked[index]?.options ?? {});
+      if (!next.ok) {
+        return {
+          ok: false,
+          issues: next.issues.map((i) => issue([index, ...i.path], i.code, i.message)),
+        };
+      }
+      given[index] = next.value;
     }
-    // The counter's last number counts as held by a record of its own.
-    const last = counter?.last_value;
-    if (last !== undefined && last !== null) {
-      byRecord.set(newRecordId(), [{ type: typeKey, value: last }]);
-    }
-    const sets = [...byRecord].map(([recordId, former]) => ({
-      recordId,
-      organizationId,
-      current: [],
-      former,
-    }));
-    const next = nextIdentifier(type, sets as unknown as readonly RecordIdentifiers[], options);
-    if (!next.ok) return next;
-    await db.execute(sql`
-      UPDATE public.identifier_counters SET last_value = ${next.value}
-      WHERE organization_id = ${organizationId}::uuid AND type_key = ${typeKey}
-        AND series = ${series}`);
-    return next;
+    return { ok: true, value: given };
   });
   if (result.done) return result.value;
+  const retry = retryIfTransient<readonly string[]>(result.error);
+  if (retry !== undefined) return retry;
   throw result.error;
+}
+
+/** One allocation, its type's key lock and counter taken in that order. */
+async function allocateOne(
+  db: Queryable,
+  organizationId: OrganizationId,
+  type: IdentifierType,
+  series: string,
+  options: { readonly year?: number },
+): Promise<Validated<string>> {
+  const typeKey = type.key;
+  // Waits for saves of the type's numbers that haven't committed, and makes
+  // later ones wait for this transaction (the holdings' trigger takes it shared).
+  await db.rows(
+    sql`SELECT pg_advisory_xact_lock(public.identifier_type_lock_key(${organizationId}::uuid, ${typeKey}))`,
+  );
+  await db.execute(sql`
+    INSERT INTO public.identifier_counters (organization_id, type_key, series)
+    VALUES (${organizationId}::uuid, ${typeKey}, ${series})
+    ON CONFLICT DO NOTHING`);
+  const [counter] = await db.rows<{ last_value: string | null }>(sql`
+    SELECT last_value FROM public.identifier_counters
+    WHERE organization_id = ${organizationId}::uuid AND type_key = ${typeKey}
+      AND series = ${series}
+    FOR UPDATE`);
+  // Read after the locks: a statement started now sees every number an
+  // earlier holder of them saved and committed.
+  const held = await db.rows<{ record_id: string; value: string }>(sql`
+    SELECT record_id::text AS record_id, value FROM public.record_identifiers
+    WHERE organization_id = ${organizationId}::uuid AND type_key = ${typeKey}
+    UNION ALL
+    SELECT record_id::text, value FROM public.former_identifiers
+    WHERE organization_id = ${organizationId}::uuid AND type_key = ${typeKey}`);
+  const byRecord = new Map<string, { type: string; value: string }[]>();
+  for (const row of held) {
+    const list = byRecord.get(row.record_id) ?? [];
+    list.push({ type: typeKey, value: row.value });
+    byRecord.set(row.record_id, list);
+  }
+  // The counter's last number counts as held by a record of its own.
+  const last = counter?.last_value;
+  if (last !== undefined && last !== null) {
+    byRecord.set(newRecordId(), [{ type: typeKey, value: last }]);
+  }
+  const sets = [...byRecord].map(([recordId, former]) => ({
+    recordId,
+    organizationId,
+    current: [],
+    former,
+  }));
+  const next = nextIdentifier(type, sets as unknown as readonly RecordIdentifiers[], options);
+  if (!next.ok) return next;
+  await db.execute(sql`
+    UPDATE public.identifier_counters SET last_value = ${next.value}
+    WHERE organization_id = ${organizationId}::uuid AND type_key = ${typeKey}
+      AND series = ${series}`);
+  return next;
 }

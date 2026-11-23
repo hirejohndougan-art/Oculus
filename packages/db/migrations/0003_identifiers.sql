@@ -28,6 +28,17 @@
 -- rule is filled in (insertIdentifierType), so the indexes then check those
 -- values too. A current identifier always names an existing type.
 --
+-- Writes of holdings and of types meet at one lock per (organization, type
+-- key), a transaction-level advisory lock (identifier_type_lock_key): every
+-- holding write takes it shared, in its trigger, and every type insert,
+-- update or delete takes it exclusive, in its trigger, so direct writers are
+-- covered too. A type and a holding of its key are then never written at the
+-- same moment: without it, a save that read "no such type" (null rule) and a
+-- type created at the same moment could each miss the other, leaving a
+-- number outside both unique indexes for good. allocateIdentifier takes the
+-- lock exclusive too, so it waits for saves of the type that haven't
+-- committed (and they wait for it).
+--
 -- Nothing cascades on delete: a type, a record or a holding something points
 -- at can't be deleted. Identity is fixed by catalog_keep_identity (0002), with
 -- triggers named zzzz_* as there.
@@ -146,15 +157,49 @@ CREATE TABLE public.identifier_counters (
   FOREIGN KEY (organization_id, type_key) REFERENCES public.identifier_types (organization_id, key)
 );
 
+-- The advisory lock key of one organization's identifier type key (see the
+-- top of this file). A hash: two types may share a key, which only makes them
+-- wait for each other.
+CREATE FUNCTION public.identifier_type_lock_key(organization_id uuid, type_key text)
+RETURNS bigint
+LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+SET search_path = pg_catalog, pg_temp
+AS $$ SELECT hashtextextended('oculus.identifier_type/' || organization_id::text || '/' || type_key, 0) $$;
+
+-- Types take their key's lock exclusive before they change. On update and
+-- delete the row is already locked when a BEFORE trigger runs, so a save
+-- holding the type FOR SHARE is waited for first, in the same order a save
+-- takes them (type rows, then this lock).
+CREATE FUNCTION public.identifier_types_lock() RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    PERFORM pg_advisory_xact_lock(public.identifier_type_lock_key(OLD.organization_id, OLD.key));
+    RETURN OLD;
+  END IF;
+  PERFORM pg_advisory_xact_lock(public.identifier_type_lock_key(NEW.organization_id, NEW.key));
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER zzzz_identifier_types_lock BEFORE INSERT OR UPDATE OR DELETE ON public.identifier_types
+  FOR EACH ROW EXECUTE FUNCTION public.identifier_types_lock();
+
 -- A holding's rule is always its type's, never what the writer sent: set on
 -- every insert and update (including the foreign key's cascade, which runs
--- after the type row changed, so it reads the new rule). Fixed search path,
--- as catalog_keep_identity.
+-- after the type row changed, so it reads the new rule), after taking the
+-- type key's lock shared, so a type being created or changed at the same
+-- moment is waited for and then seen (each statement here takes a new
+-- snapshot). Fixed search path, as catalog_keep_identity.
 CREATE FUNCTION public.identifier_holdings_take_rule() RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
+  PERFORM pg_advisory_xact_lock_shared(
+    public.identifier_type_lock_key(NEW.organization_id, NEW.type_key));
   NEW.uniqueness := (
     SELECT t.uniqueness FROM public.identifier_types t
     WHERE t.organization_id = NEW.organization_id AND t.key = NEW.type_key
