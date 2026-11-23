@@ -81,9 +81,7 @@ function viewOf(
   id: RecordId,
   checkers: Record<string, unknown>,
 ): PublicRecord {
-  const effective = ok(
-    effectiveRecord(id, records, () => LINK_TPL, { checkers: checkers as never }),
-  );
+  const effective = ok(effectiveRecord(id, records, () => LINK_TPL, { checkers: checkers }));
   const view = publicView(effective);
   if (view === undefined) throw new Error("no view");
   return view;
@@ -94,7 +92,7 @@ function output(
   published: readonly RecordId[],
   checkers: Record<string, unknown>,
 ): Validated<PublicOutput> {
-  return publicOutput(view, MAPPING, { baseUrl: BASE, published, checkers: checkers as never });
+  return publicOutput(view, MAPPING, { baseUrl: BASE, published, checkers: checkers });
 }
 
 const lax: FieldValueChecker = () => [];

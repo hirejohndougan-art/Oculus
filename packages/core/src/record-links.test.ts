@@ -93,7 +93,7 @@ function check(r: CatalogRecord, checkers?: Record<string, FieldValueChecker>): 
   return checkRecordAgainstTemplate(
     r,
     LINK_TPL,
-    checkers === undefined ? {} : { checkers: checkers as never },
+    checkers === undefined ? {} : { checkers: checkers },
   ).map((i) => i.code);
 }
 
@@ -103,15 +103,13 @@ function output(
   published: readonly RecordId[],
   checkers: Record<string, unknown> = checkersFor(records),
 ): Validated<PublicOutput> {
-  const effective = ok(
-    effectiveRecord(id, records, () => LINK_TPL, { checkers: checkers as never }),
-  );
+  const effective = ok(effectiveRecord(id, records, () => LINK_TPL, { checkers: checkers }));
   const view = publicView(effective);
   if (view === undefined) throw new Error("no view");
   return publicOutput(view, LINK_MAPPING, {
     baseUrl: BASE,
     published,
-    checkers: checkers as never,
+    checkers: checkers,
   });
 }
 
@@ -266,7 +264,12 @@ describe("makeRecordLinkChecker", () => {
     const bad = linkChecker([item, { ...agent, title: "" }]);
     for (const links of [twice, bad]) {
       const problems = checkRecordAgainstTemplate(
-        withKey(record("object", "X", { rights: { uri: CNE }, creator: item.fields.creator })),
+        withKey(
+          record("object", "X", {
+            rights: { uri: CNE },
+            creator: { recordId: agent.id, label: "Dickinson, John" },
+          }),
+        ),
         LINK_TPL,
         { checkers: { ...CHECKERS, record_link: links } },
       );
