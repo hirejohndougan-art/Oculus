@@ -132,13 +132,19 @@ The data model in TypeScript, written for any archive or museum rather than one 
 - [x] T-015 **Links between records.** deps: T-012 (risky)
   - Values that point at agent, place or event records: a creator linked to the Authorities list (mockup Authorities, record "Creator"), and related records. Public output follows the D-016 rule: a link to an unpublished record goes out as its label only, never its ID.
   - Done: D-039: a `record_link` kind and `makeRecordLinkChecker`; links name a record only when it is published and the organization's own; the public view holds no linked IDs.
-- [ ] T-016 **Accessions and deeds of gift.** deps: T-012, T-015 (risky)
+- [x] T-016 **Accessions and deeds of gift.** deps: T-012, T-015 (risky)
   - An accession model (Spectrum acquisition and accessioning): its number (an identifier type), source agent, date received, method, materials, restrictions, deed status (missing, sent, signed, not needed) and the records it produced. A check that holds back from publishing any record whose accession needs a signed deed it doesn't have (mockup Deeds). Accessions and donor contact details are always staff-only.
+  - Done: D-043: a staff-only accession register per organization; a deed check that refuses publishing held records and makes links to them labels.
 - [x] T-017 **Storage locations and moves.** deps: T-012
   - Storage levels the organization names (Room › Shelf › Box › Folder, from Settings), containers, a record's normal and current location, and moves with a reason and an expected return date (Spectrum location and movement control; mockup Storage and Whereabouts). Staff-only.
   - Done: D-040: storage levels, locations and a move log as the only truth, staff-only, per organization (`storage.ts`).
-- [ ] T-018 **Loans and condition checks.** deps: T-017
+- [x] T-018 **Loans and condition checks.** deps: T-017
   - Spectrum loans in and out (lender or borrower agent, dates, items, status) and condition checks (date, who checked, condition, notes), as dated entries on objects and archival units (mockup Whereabouts, Conservators, record "Condition"). Staff-only.
+  - Done: D-044: loans in and out that point at moves, condition checks and fit to move, and a `departure` move reason; overdue loans can't be hidden.
+- [ ] T-016a **Structured restrictions on accessions.** deps: T-016 (risky)
+  - Restrictions are free text today and hold nothing back. Add structured ones (closed until a date; staff and researchers only, as in the Log an accession mockup) that hold records back like an unsigned deed.
+- [ ] T-018a **Loan follow-ups.** deps: T-018, T-016
+  - A borrowed item that becomes the organization's (bought or given) needs a link from an accession to close its loan in. Link a condition check's `loanId` to the loan book and warn when a loan out goes without a recent fit check. Valuation, insurance and authoriser fields.
 - [ ] T-013a **Record type edits checked against records.** deps: T-013
   - Editing a record type's kind or key, or deleting it, should list the records that use it first, as `templateChanges` does for templates; optionally a `recordTypes` input on `templateChanges`.
 - [ ] T-015a **Link follow-ups.** deps: T-015
