@@ -746,6 +746,37 @@ describe("staff identifier types never reach the public view (D-022)", () => {
     expect(JSON.stringify(publicView(r.value))).not.toContain(SECRET);
   });
 
+  it("never quotes a staff-type number that fails its format in the child's notes", () => {
+    const formatted = makeIdentifierChecker([
+      {
+        key: "object_number",
+        label: "Object number",
+        organizationId: ORG,
+        uniqueness: "none",
+        public: true,
+      },
+      {
+        key: "donor_file_number",
+        label: "Donor file number",
+        organizationId: ORG,
+        uniqueness: "none",
+        pattern: "D-####",
+      },
+    ]);
+    if (!formatted.ok) throw new Error("types");
+    const fonds = unit("Fonds", "fonds", undefined, {
+      number: { type: "donor_file_number", value: SECRET },
+    });
+    const item = unit("Item", "item", fonds);
+    const r = effectiveRecord(item.id, [item, fonds], () => PUBLIC_NUMBER, {
+      checkers: { identifier: formatted.value },
+    });
+    if (!r.ok) throw new Error("effective");
+    expect(r.value.notes.map((n) => n.code)).toEqual(["not_valid_here"]);
+    expect(JSON.stringify(r.value.notes)).not.toContain(SECRET);
+    expect(JSON.stringify(publicView(r.value))).not.toContain(SECRET);
+  });
+
   it("still leaves out an inherited number that doesn't fit for another reason", () => {
     // An unknown type is not a visibility problem: nothing is kept, as before.
     const fonds = unit("Fonds", "fonds", undefined, {

@@ -1214,9 +1214,16 @@ function dropUnfit(
       continue;
     }
     const result = madeStaff.has(c.key) && asStaff !== undefined ? asStaff : first;
+    const problem = result.unsure ? undefined : result.unfit.get(c.key)?.[0];
+    // A key made staff holds a staff-type number: never quote the checker's
+    // message (it can name the number) in another record's notes.
     const why = result.unsure
       ? "it could not be checked against this record's template."
-      : result.unfit.get(c.key)?.[0]?.message;
+      : problem === undefined
+        ? undefined
+        : madeStaff.has(c.key)
+          ? "it holds a number of a staff only identifier type that doesn't pass this record's checks."
+          : problem.message;
     const checked = ownField(probeFields, c.key);
     if (why === undefined && checked === c.value) {
       // Keep exactly the value that was checked.
