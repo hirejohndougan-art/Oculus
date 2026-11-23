@@ -1,7 +1,7 @@
 // Attacks on template changes (security S-002): a template edit must not
 // publish staff values without anyone noticing, and hostile templates or
 // records must be refused without throwing.
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   DACS_ARCHIVAL_UNIT_PRESET,
   MAX_LISTED_RECORDS,
@@ -289,6 +289,40 @@ describe("records must follow the template being changed", () => {
     expect(r.legacyRecords).toBe(1);
     expect(r.changes.find((c) => c.code === "made_public")?.recordIds).toEqual([A]);
     expect(ok(templateChanges(DACS, makePublic)).legacyRecords).toBe(0);
+  });
+
+  // U-003: the record's own `templateKey` decides, never an inherited one.
+  describe("with Object.prototype polluted", () => {
+    afterEach(() => {
+      delete (Object.prototype as Record<string, unknown>).templateKey;
+    });
+
+    it("an inherited templateKey doesn't make a legacy record another template's", () => {
+      (Object.prototype as Record<string, unknown>).templateKey = "other-template";
+      const r = ok(templateChanges(DACS, makePublic, [unit(A, { notes: SECRET })]));
+      expect(r.legacyRecords).toBe(1);
+      expect(r.changes.find((c) => c.code === "made_public")?.recordIds).toEqual([A]);
+    });
+
+    it("an inherited templateKey doesn't make a legacy record this template's", () => {
+      (Object.prototype as Record<string, unknown>).templateKey = key;
+      const r = ok(templateChanges(DACS, makePublic, [unit(A, { notes: SECRET })]));
+      expect(r.legacyRecords).toBe(1);
+    });
+
+    it("an inherited templateKey getter is never run", () => {
+      let ran = false;
+      Object.defineProperty(Object.prototype, "templateKey", {
+        configurable: true,
+        get() {
+          ran = true;
+          return "other-template";
+        },
+      });
+      const r = ok(templateChanges(DACS, makePublic, [unit(A, { notes: SECRET })]));
+      expect(r.legacyRecords).toBe(1);
+      expect(ran).toBe(false);
+    });
   });
 });
 

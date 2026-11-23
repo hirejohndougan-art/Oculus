@@ -218,9 +218,12 @@ function compare(
   // another template's record would be listed in this one's confirmation.
   let legacyRecords = 0;
   for (const [i, record] of (records ?? []).entries()) {
-    if (record.templateKey === undefined) {
+    // An own data property only: a `templateKey` inherited from a polluted
+    // `Object.prototype` (or a getter there) must not decide whose record it is.
+    const templateKey = own(record, "templateKey");
+    if (templateKey === undefined) {
       legacyRecords += 1;
-    } else if (record.templateKey !== after.value.key) {
+    } else if (templateKey !== after.value.key) {
       return {
         ok: false,
         issues: [
@@ -602,6 +605,12 @@ function prefixed(root: string, list: readonly Issue[]): Issue[] {
 }
 
 /** Validate every record; any unreadable record, or an ID used twice, refuses them all. */
+/** An own data property, never a getter or an inherited one. */
+function own(obj: object, name: string): unknown {
+  const d = Object.getOwnPropertyDescriptor(obj, name);
+  return d !== undefined && "value" in d ? d.value : undefined;
+}
+
 function readRecords(input: unknown): Validated<readonly CatalogRecord[]> {
   if (types.isProxy(input) || !Array.isArray(input)) {
     return {
