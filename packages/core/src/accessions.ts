@@ -911,8 +911,16 @@ export function nextAccessionNumber(
  */
 function restrictionInForce(restriction: AccessRestriction | undefined, today: string): boolean {
   if (restriction === undefined) return false;
-  if (restriction.kind === "staff_and_researchers") return true;
-  return today < restriction.until;
+  // Validated, so both are own properties; read as such all the same, and
+  // anything unexpected holds.
+  const own = (key: string): unknown =>
+    Object.prototype.hasOwnProperty.call(restriction, key)
+      ? (restriction as unknown as Record<string, unknown>)[key]
+      : undefined;
+  const kind = own("kind");
+  const until = own("until");
+  if (kind === "closed_until" && isDay(until)) return today < until;
+  return true;
 }
 
 function holdsIn(
@@ -1116,8 +1124,14 @@ function checkRestriction(value: JsonValue, issues: IssueList): void {
     );
     return;
   }
+  // Own properties only: an `until` on Object.prototype must never complete
+  // a restriction left without one.
+  const own = (key: string): JsonValue | undefined =>
+    Object.prototype.hasOwnProperty.call(value, key)
+      ? (value as Readonly<Record<string, JsonValue>>)[key]
+      : undefined;
   const v = value as Readonly<Record<string, JsonValue>>;
-  const kind = v.kind;
+  const kind = own("kind");
   const allowed = kind === "closed_until" ? ["kind", "until"] : ["kind"];
   for (const key of Object.keys(v)) {
     if (!allowed.includes(key)) {
@@ -1138,7 +1152,7 @@ function checkRestriction(value: JsonValue, issues: IssueList): void {
     );
     return;
   }
-  if (kind === "closed_until" && !isDay(v.until)) {
+  if (kind === "closed_until" && !isDay(own("until"))) {
     issues.add(
       [...path, "until"],
       "invalid_date",
