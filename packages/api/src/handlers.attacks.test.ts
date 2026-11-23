@@ -8,7 +8,16 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { OCULUS_COOKIES } from "./cookies.js";
 import { SECURITY_HEADERS } from "./headers.js";
-import { plainData, routeConfig, type OculusReply, type OculusRoute } from "./routes.js";
+import {
+  MAX_RESULT_ARRAY_LENGTH,
+  MAX_RESULT_NODES,
+  MAX_RESULT_TEXT_BYTES,
+  plainData,
+  routeConfig,
+  type OculusReply,
+  type OculusRequest,
+  type OculusRoute,
+} from "./routes.js";
 import { buildServer } from "./server.js";
 import { SAME_ORIGIN, TEST_ENV, rawRequest, testServer } from "./test-server.fixtures.js";
 
@@ -129,6 +138,54 @@ describe("handler results", () => {
     expect(res.body).toBe(body);
   });
 
+  it.each([
+    ["an array longer than the cap", () => new Array<number>(MAX_RESULT_ARRAY_LENGTH + 1).fill(0)],
+    [
+      "a sparse array with a huge length",
+      () => {
+        const list: unknown[] = [];
+        list.length = 2 ** 32 - 1;
+        return list;
+      },
+    ],
+    [
+      "too many values in all",
+      () =>
+        Array.from({ length: 20 }, () =>
+          Array.from({ length: MAX_RESULT_NODES / 20 }, (_v, i) => i),
+        ),
+    ],
+    ["too much text in all", () => Array.from({ length: 17 }, () => "x".repeat(1024 * 1024))],
+    ["too much text in keys", () => ({ ["k".repeat(MAX_RESULT_TEXT_BYTES + 1)]: 1 })],
+    ["a text result larger than the cap", () => "x".repeat(MAX_RESULT_TEXT_BYTES + 1)],
+    [
+      "one object shared so often the copy would double at every level",
+      () => {
+        let shared: unknown = { leaf: "x" };
+        for (let i = 0; i < 40; i++) shared = [shared, shared];
+        return shared;
+      },
+    ],
+  ])("answers %s with a plain 500, quickly", async (_name, handler) => {
+    const built = await testServer({}, [get("/x", handler)]);
+    app = built.app;
+    const started = Date.now();
+    const res = await app.inject({ method: "GET", url: "/x" });
+    expect(res.statusCode).toBe(500);
+    expect(res.json()).toEqual({ error: "internal_error" });
+    expect(Date.now() - started).toBeLessThan(3_000);
+  });
+
+  it("sends results up to the caps", async () => {
+    const built = await testServer({}, [
+      get("/x", () => new Array<number>(MAX_RESULT_ARRAY_LENGTH).fill(1)),
+    ]);
+    app = built.app;
+    const res = await app.inject({ method: "GET", url: "/x" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json<unknown[]>().length).toBe(MAX_RESULT_ARRAY_LENGTH);
+  });
+
   it("copies data as it checks it, so a Proxy can't change it afterwards", () => {
     let reads = 0;
     const tricky = new Proxy(
@@ -190,6 +247,7 @@ describe("the request a handler gets", () => {
         "path",
         "protocol",
         "query",
+        "signal",
       ].sort(),
     );
     for (const key of ["server", "raw", "socket", "log", "routeOptions", "context"]) {
@@ -248,8 +306,92 @@ describe("the request a handler gets", () => {
     ]);
     app = built.app;
     await app.inject({ method: "GET", url: "/late" });
-    expect(() => late?.header("x-late", "1")).toThrow(/after the handler/);
+    expect(() => late?.header("etag", '"late"')).toThrow(/after the handler/);
     expect(() => late?.setCookie(OCULUS_COOKIES.session, "abc")).toThrow(/after the handler/);
+  });
+
+  it("is told when the handler has run out of time, and the reply stops working", async () => {
+    let signal: AbortSignal | undefined;
+    let abortedDuring = false;
+    let lateWrite: unknown;
+    let finished!: () => void;
+    const done = new Promise<void>((resolve) => (finished = resolve));
+    const built = await testServer({ timeouts: { handler: 50 } }, [
+      get("/slow", async (request: OculusRequest, reply) => {
+        signal = request.signal;
+        request.signal.addEventListener("abort", () => (abortedDuring = true));
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        try {
+          reply.setCookie(OCULUS_COOKIES.session, "late123");
+        } catch (error) {
+          lateWrite = error;
+        }
+        finished();
+        return { late: true };
+      }),
+    ]);
+    app = built.app;
+    const res = await app.inject({ method: "GET", url: "/slow" });
+    expect(res.statusCode).toBe(503);
+    expect(res.headers["set-cookie"]).toBeUndefined();
+    await done;
+    expect(signal?.aborted).toBe(true);
+    expect(abortedDuring).toBe(true);
+    expect(lateWrite).toBeInstanceOf(Error);
+  });
+
+  it("gets a signal that stays quiet for a request that finishes in time", async () => {
+    let signal: AbortSignal | undefined;
+    let abortedDuring: boolean | undefined;
+    const built = await testServer({}, [
+      {
+        method: "POST",
+        path: "/quick",
+        handler: async (request) => {
+          signal = request.signal;
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          abortedDuring = request.signal.aborted;
+          return { ok: true };
+        },
+      },
+    ]);
+    app = built.app;
+    // Over a real socket: Node closes the request once its body is read,
+    // which must not count as the client going away.
+    const res = await rawRequest(
+      app,
+      "POST",
+      "/quick",
+      { ...SAME_ORIGIN, "content-type": "application/json" },
+      '{"a":1}',
+    );
+    expect(res.status).toBe(200);
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(abortedDuring).toBe(false);
+  });
+
+  it("gets a signal that fires when the client goes away", async () => {
+    let started!: () => void;
+    const running = new Promise<void>((resolve) => (started = resolve));
+    let aborted!: () => void;
+    const abortedPromise = new Promise<void>((resolve) => (aborted = resolve));
+    const built = await testServer({}, [
+      get("/wait", (request) => {
+        request.signal.addEventListener("abort", () => {
+          aborted();
+        });
+        started();
+        return new Promise(() => undefined);
+      }),
+    ]);
+    app = built.app;
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const { port } = app.server.address() as AddressInfo;
+    const socket = connect({ host: "127.0.0.1", port });
+    socket.write("GET /wait HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    await running;
+    socket.destroy();
+    await abortedPromise;
   });
 });
 
@@ -294,6 +436,33 @@ describe("headers a handler writes", () => {
     ["Location with a backslash", (r: OculusReply) => r.header("Location", "/\\evil.example")],
     ["Location with a tab", (r: OculusReply) => r.header("Location", "/\t/evil.example")],
     ["Location without a slash", (r: OculusReply) => r.header("Location", "evil.example")],
+    // Not on the allowlist (D-058).
+    ["X-Accel-Redirect", (r: OculusReply) => r.header("X-Accel-Redirect", "/internal/secret")],
+    ["X-Sendfile", (r: OculusReply) => r.header("X-Sendfile", "/etc/passwd")],
+    [
+      "Link preconnect",
+      (r: OculusReply) => r.header("Link", "<https://evil.example>; rel=preconnect"),
+    ],
+    ["Alt-Svc", (r: OculusReply) => r.header("Alt-Svc", 'h3=":443"; ma=86400')],
+    ["NEL", (r: OculusReply) => r.header("NEL", '{"report_to":"x","max_age":1}')],
+    ["Report-To", (r: OculusReply) => r.header("Report-To", '{"group":"x"}')],
+    ["Reporting-Endpoints", (r: OculusReply) => r.header("Reporting-Endpoints", 'x="https://e"')],
+    ["WWW-Authenticate", (r: OculusReply) => r.header("WWW-Authenticate", "Basic")],
+    ["Expires", (r: OculusReply) => r.header("Expires", "Thu, 01 Jan 2099 00:00:00 GMT")],
+    ["Pragma", (r: OculusReply) => r.header("Pragma", "public")],
+    ["Age", (r: OculusReply) => r.header("Age", "1")],
+    ["Surrogate-Control", (r: OculusReply) => r.header("Surrogate-Control", "max-age=9")],
+    ["Content-Disposition", (r: OculusReply) => r.header("Content-Disposition", "attachment")],
+    ["Content-Type through header()", (r: OculusReply) => r.header("Content-Type", "text/html")],
+    ["Server", (r: OculusReply) => r.header("Server", "x")],
+    ["a custom X- header", (r: OculusReply) => r.header("X-A", "1")],
+    ["an ETag without quotes", (r: OculusReply) => r.header("ETag", "v1")],
+    ["a Last-Modified that isn't a date", (r: OculusReply) => r.header("Last-Modified", "soon")],
+    ["a Vary with a bad list", (r: OculusReply) => r.header("Vary", "Accept;x")],
+    ["a Content-Language with a URL", (r: OculusReply) => r.header("Content-Language", "a/b")],
+    ["a Retry-After that isn't a number", (r: OculusReply) => r.header("Retry-After", "1.5")],
+    ["a content type with a quoted parameter", (r: OculusReply) => r.type('text/html; a="b"')],
+    ["a content type without a subtype", (r: OculusReply) => r.type("text")],
   ])("refuses %s with a plain 500", async (_name, act) => {
     const built = await testServer({}, [writes(act)]);
     app = built.app;
@@ -319,15 +488,30 @@ describe("headers a handler writes", () => {
     expect(res.body).toBe('{"error":"internal_error"}');
   });
 
-  it("allows ordinary headers and a same-origin Location", async () => {
+  it("allows the allowlisted headers and a same-origin Location", async () => {
     const built = await testServer({}, [
-      writes((r) => r.status(303).header("Location", "/items/1?x=1").header("ETag", '"v1"')),
+      writes((r) =>
+        r
+          .status(303)
+          .header("Location", "/items/1?x=1")
+          .header("ETag", 'W/"v1"')
+          .header("Last-Modified", "Sun, 22 Nov 2026 10:00:00 GMT")
+          .header("Content-Language", "en, es-MX")
+          .header("Vary", "Accept, Accept-Language")
+          .header("Retry-After", "120")
+          .type("application/ld+json; charset=utf-8"),
+      ),
     ]);
     app = built.app;
     const res = await app.inject({ method: "GET", url: "/w" });
     expect(res.statusCode).toBe(303);
     expect(res.headers.location).toBe("/items/1?x=1");
-    expect(res.headers.etag).toBe('"v1"');
+    expect(res.headers.etag).toBe('W/"v1"');
+    expect(res.headers["last-modified"]).toBe("Sun, 22 Nov 2026 10:00:00 GMT");
+    expect(res.headers["content-language"]).toBe("en, es-MX");
+    expect(res.headers.vary).toBe("Accept, Accept-Language");
+    expect(res.headers["retry-after"]).toBe("120");
+    expect(res.headers["content-type"]).toBe("application/ld+json; charset=utf-8");
   });
 });
 
@@ -337,7 +521,7 @@ describe("error replies", () => {
       get("/fail", (_request, reply) => {
         reply
           .status(201)
-          .header("X-Record", "DS5C740001")
+          .header("ETag", '"DS5C740001"')
           .header("Location", "/after")
           .header("Content-Language", "en")
           .type("text/html")
@@ -350,7 +534,7 @@ describe("error replies", () => {
     expect(res.statusCode).toBe(500);
     expect(res.json()).toEqual({ error: "internal_error" });
     expect(res.headers["content-type"]).toBe("application/json; charset=utf-8");
-    for (const name of ["x-record", "location", "content-language", "set-cookie"]) {
+    for (const name of ["etag", "location", "content-language", "set-cookie"]) {
       expect(res.headers[name], name).toBeUndefined();
     }
   });
@@ -387,6 +571,21 @@ describe("security headers", () => {
       const res = await app.inject({ method, url });
       expect(res.statusCode, url).toBe(status);
       expectDefaults(res.headers, `${method} ${url}`);
+    }
+  });
+
+  it.each([
+    ["a URL the router can't decode", "/items/%C0%AF"],
+    ["a parameter longer than the router allows", `/items/${"a".repeat(101)}`],
+  ])("are on the router's own error replies: %s", async (_name, url) => {
+    const built = await testServer();
+    app = built.app;
+    const res = await rawRequest(app, "GET", url);
+    expect(res.status).toBe(400);
+    expect(res.body).toBe('{"error":"bad_request"}');
+    expect(built.calls.count).toBe(0);
+    for (const [name, value] of Object.entries(SECURITY_HEADERS)) {
+      expect(res.head.toLowerCase()).toContain(`${name}: ${value}`.toLowerCase());
     }
   });
 

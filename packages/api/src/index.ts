@@ -13,7 +13,13 @@ export {
 } from "./body.js";
 export type { OculusRouteConfig } from "./body.js";
 
-export { ROUTE_METHODS, REQUEST_HEADERS } from "./routes.js";
+export {
+  ROUTE_METHODS,
+  REQUEST_HEADERS,
+  MAX_RESULT_ARRAY_LENGTH,
+  MAX_RESULT_NODES,
+  MAX_RESULT_TEXT_BYTES,
+} from "./routes.js";
 export type {
   OculusRoute,
   OculusReply,
@@ -22,7 +28,7 @@ export type {
   RouteMethod,
 } from "./routes.js";
 
-export { SECURITY_HEADERS } from "./headers.js";
+export { SECURITY_HEADERS, HANDLER_HEADER_NAMES } from "./headers.js";
 
 export {
   OCULUS_COOKIES,

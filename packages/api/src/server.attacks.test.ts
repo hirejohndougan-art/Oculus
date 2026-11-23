@@ -158,6 +158,7 @@ describe("error replies", () => {
           }),
         ),
       },
+      { method: "GET", path: "/refused", handler: thrower(new Refusal(403, "no_access")) },
       {
         method: "GET",
         path: "/weird-status",
@@ -173,7 +174,9 @@ describe("error replies", () => {
     for (const [url, status, code] of [
       ["/boom", 500, "internal_error"],
       ["/boom-async", 500, "internal_error"],
-      ["/client-error", 403, "forbidden"],
+      // Only a Refusal chooses its status; any other thrown value is a 500 (D-058).
+      ["/client-error", 500, "internal_error"],
+      ["/refused", 403, "no_access"],
       ["/weird-status", 500, "internal_error"],
       ["/not-error", 500, "internal_error"],
     ] as const) {
@@ -229,6 +232,10 @@ describe("error replies", () => {
     const all = lines.join("\n");
     expect(all).toContain('"url":"/boom"');
     expect(all).toContain("kaboom");
+    // A fixed-shape record with the thrown error's own stack, read without its getters.
+    expect(all).toContain(
+      '"failure":{"status":500,"code":"internal_error","name":"Error","message":"kaboom","stack":"Error: kaboom',
+    );
     expect(all).not.toContain("sekrit");
   });
 });

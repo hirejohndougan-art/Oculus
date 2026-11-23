@@ -37,14 +37,21 @@
  *    names the proxy's addresses, in ranges no wider than D-058 allows.
  * 7. Timeouts: explicit and shorter than Node's and Fastify's defaults
  *    (`SERVER_TIMEOUTS`); options can only shorten them.
+ *    After the handler timeout the request view's `signal` fires and the
+ *    reply stops working.
  * 8. Errors (errors.ts): `{ "error": "<code>" }` only, never a message or a
  *    stack trace, including requests Node itself can't parse; 5xx details go
- *    to the server log. Every header and cookie the handler set is dropped
- *    from an error reply. The request logger records the method and path only.
- * 9. Headers (headers.ts): handlers write only valid, ordinary headers (no
- *    CORS, framing, security headers, or a `Location` off the site), and
- *    every reply carries nosniff, no-referrer, a CSP that loads nothing and
- *    `Cache-Control: no-store`.
+ *    to the server log as a fixed-shape record of plain strings. Whatever a
+ *    handler throws is replaced by a fresh Refusal before Fastify sees it,
+ *    and the error handler can't throw (it falls back to a fixed 500), so
+ *    Fastify's default error handler never runs. Every header and cookie the
+ *    handler set is dropped from an error reply. The request logger records
+ *    the method and path only.
+ * 9. Headers (headers.ts): handlers write only the allowlisted headers
+ *    (Content-Language, ETag, Last-Modified, Vary, a same-origin Location,
+ *    Retry-After, and the Content-Type through `type()`), and every reply,
+ *    the router's own errors included, carries nosniff, no-referrer, a CSP
+ *    that loads nothing and `Cache-Control: no-store`.
  *
  * Adding another Fastify plugin, parser or error handler is its own decision
  * (D-051).
@@ -63,7 +70,13 @@ import {
   registerBodyParsers,
 } from "./body.js";
 import { cookieHeaderProblem, replyCookieProblem } from "./cookies.js";
-import { Refusal, errorReply } from "./errors.js";
+import {
+  Refusal,
+  errorReply,
+  rebuildThrown,
+  summarizeThrown,
+  type ThrownSummary,
+} from "./errors.js";
 import { SECURITY_HEADERS } from "./headers.js";
 import { failsOriginCheck, originsFromEnv } from "./origin.js";
 import { RouteTable, pathOf, pathProblem } from "./paths.js";
@@ -72,7 +85,7 @@ import {
   checkRoute,
   oculusReply,
   oculusRequest,
-  plainData,
+  resultBody,
   routeConfig,
   routeOptionsProblem,
   type OculusRoute,
@@ -180,6 +193,18 @@ function clientError(error: { code?: string }, socket: Socket): void {
   );
 }
 
+/** What the log gets for a 500 a handler caused: a summary of plain strings, never the value. */
+const failures = new WeakMap<Refusal, ThrownSummary>();
+
+/**
+ * Registers one application route. Whatever the handler throws or rejects
+ * with is caught here and replaced by a fresh Refusal (errors.ts), so no
+ * value of the handler's (its getters, a Proxy, a `headers` object) ever
+ * reaches Fastify, its default error handler, a diagnostics_channel
+ * subscriber or the logger. The request view carries an AbortSignal that
+ * fires on the handler timeout or when the client goes away; from then on
+ * the reply view throws.
+ */
 function addRoute(app: FastifyInstance, route: OculusRoute): void {
   const credentials = route.credentials === true;
   app.route({
@@ -188,23 +213,85 @@ function addRoute(app: FastifyInstance, route: OculusRoute): void {
     ...(credentials ? { bodyLimit: CREDENTIALS_BODY_LIMIT } : {}),
     config: routeConfig(route),
     handler: async (request, reply) => {
+      const controller = new AbortController();
       let running = true;
-      let result: unknown;
+      const stop = (): void => {
+        running = false;
+        if (!controller.signal.aborted) controller.abort(new Error("the request has ended"));
+      };
+      // The response closes during the handler only when the handler
+      // timeout has sent its 503 or the connection is gone. (Fastify's
+      // `request.signal` can't be used: it also fires when the request
+      // body has been read, while the handler is still working.)
+      const response = reply.raw;
+      if (response.writableEnded || response.destroyed) stop();
+      else response.once("close", stop);
+      let body: unknown;
       try {
-        result = await route.handler(
-          oculusRequest(request),
+        const result: unknown = await route.handler(
+          oculusRequest(request, controller.signal),
           oculusReply(reply, () => running),
         );
+        // Copied as plain data before Fastify sees it: a Response, stream or
+        // Buffer would skip the header checks below (routes.ts).
+        body = resultBody(result);
+      } catch (thrown) {
+        const fresh = rebuildThrown(thrown);
+        if (fresh.statusCode >= 500) failures.set(fresh, summarizeThrown(thrown));
+        throw fresh;
       } finally {
         running = false;
+        response.removeListener("close", stop);
       }
-      // Copied as plain data before Fastify sees it: a Response, stream or
-      // Buffer would skip the header checks below (routes.ts).
-      return reply.send(
-        result === undefined || typeof result === "string" ? result : plainData(result),
-      );
+      // Timed out (the 503 is already sent) or the client has gone.
+      if (controller.signal.aborted) return undefined;
+      return reply.send(body);
     },
   });
+}
+
+const FALLBACK_BODY = '{"error":"internal_error"}';
+
+/**
+ * The last resort when the error handler itself fails: a fixed 500 written
+ * straight to the socket with the security headers, or a closed connection
+ * if the reply has already started. Never throws.
+ */
+function sendFallback(reply: FastifyReply): void {
+  try {
+    const raw = reply.raw;
+    if (raw.headersSent || raw.writableEnded) {
+      raw.destroy();
+      return;
+    }
+    void reply.hijack();
+    for (const name of raw.getHeaderNames()) raw.removeHeader(name);
+    raw.writeHead(500, {
+      ...SECURITY_HEADERS,
+      "content-type": "application/json; charset=utf-8",
+      "content-length": String(Buffer.byteLength(FALLBACK_BODY)),
+    });
+    raw.end(FALLBACK_BODY);
+  } catch {
+    try {
+      reply.raw.destroy();
+    } catch {
+      // Nothing is left to try.
+    }
+  }
+}
+
+/** `{ "error": code }` with the security headers, for replies that skip onSend. */
+function sendDirect(reply: FastifyReply, status: number, code: string): void {
+  try {
+    void reply
+      .code(status)
+      .headers(SECURITY_HEADERS)
+      .type("application/json; charset=utf-8")
+      .send(JSON.stringify({ error: code }));
+  } catch {
+    sendFallback(reply);
+  }
 }
 
 /** Builds the configured Oculus server and waits until it is ready. */
@@ -255,9 +342,10 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
       maxParamLength: MAX_PARAM_LENGTH,
     },
     frameworkErrors: (_error, _request, reply) => {
-      // A URL the router can't decode; the reply type here is generic.
-      const plain = reply as FastifyReply;
-      void plain.code(400).send({ error: "bad_request" });
+      // A URL the router can't decode (`/items/%C0%AF`) or a parameter
+      // longer than maxParamLength. These replies skip the onSend hook, so
+      // the security headers are set here. The reply type here is generic.
+      sendDirect(reply, 400, "bad_request");
     },
     clientErrorHandler: clientError,
   });
@@ -287,12 +375,29 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
     return payload;
   });
 
+  // The error handler can't throw: if anything in it fails (a logger whose
+  // stream throws, say), the fixed fallback is written instead, so Fastify's
+  // own default error handler (which sends the message and copies
+  // `error.headers`) is never reached. It reads the error only through
+  // errorReply and summarizeThrown, which never throw.
   app.setErrorHandler((error, request, reply) => {
-    const { statusCode, body } = errorReply(error);
-    if (statusCode >= 500) request.log.error({ err: error }, "request failed");
-    // Nothing the handler set (headers, cookies, Location) goes out with an error.
-    for (const name of Object.keys(reply.getHeaders())) reply.removeHeader(name);
-    return reply.code(statusCode).type("application/json; charset=utf-8").send(body);
+    try {
+      const { statusCode, body } = errorReply(error);
+      if (statusCode >= 500) {
+        const thrown = failures.get(error as Refusal) ?? summarizeThrown(error);
+        // A fixed-shape record of plain strings; never the error object itself.
+        request.log.error(
+          { failure: { status: statusCode, code: body.error, ...thrown } },
+          "request failed",
+        );
+      }
+      // Nothing the handler set (headers, cookies, Location) goes out with an error.
+      for (const name of Object.keys(reply.getHeaders())) reply.removeHeader(name);
+      return reply.code(statusCode).type("application/json; charset=utf-8").send(body);
+    } catch {
+      sendFallback(reply);
+      return undefined;
+    }
   });
 
   app.setNotFoundHandler((request, reply) => {

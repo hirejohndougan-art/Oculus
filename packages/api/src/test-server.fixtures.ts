@@ -87,7 +87,7 @@ export async function testServer(
 
 /**
  * Sends one raw HTTP/1.1 request over a real socket (127.0.0.1, a free port)
- * and returns the status code and body. `inject` can't be used for path
+ * and returns the status code, the head (status line and headers) and body. `inject` can't be used for path
  * attacks: it resolves `..`, `%2e` and backslashes before the server sees them.
  */
 export async function rawRequest(
@@ -96,7 +96,7 @@ export async function rawRequest(
   target: string,
   headers: Record<string, string> = {},
   body = "",
-): Promise<{ status: number; body: string }> {
+): Promise<{ status: number; head: string; body: string }> {
   if (!app.server.listening) await app.listen({ host: "127.0.0.1", port: 0 });
   const { port } = app.server.address() as AddressInfo;
   const lines = [`${method} ${target} HTTP/1.1`, "Host: localhost", "Connection: close"];
@@ -114,5 +114,6 @@ export async function rawRequest(
     socket.write(text, "latin1");
   });
   const status = Number(/^HTTP\/1\.1 (\d{3})/.exec(response)?.[1] ?? "0");
-  return { status, body: response.slice(response.indexOf("\r\n\r\n") + 4) };
+  const end = response.indexOf("\r\n\r\n");
+  return { status, head: response.slice(0, end), body: response.slice(end + 4) };
 }

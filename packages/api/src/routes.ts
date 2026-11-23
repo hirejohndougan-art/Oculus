@@ -6,18 +6,19 @@
  * flags and a handler. The handler gets:
  * - an `OculusRequest`: a frozen copy of the method, path, parameters, query,
  *   parsed body, client address, host, scheme, the Oculus cookies and a few
- *   ordinary headers. Never the Fastify request, its `raw` message, socket
+ *   ordinary headers, plus an AbortSignal that fires on the handler timeout
+ *   or when the client goes away. Never the Fastify request, its `raw` message, socket
  *   or `server` (from which the raw response and the listening server are
  *   one step away).
- * - an `OculusReply`, which can set the status, ordinary headers (headers.ts)
+ * - an `OculusReply`, which can set the status, the allowlisted headers (headers.ts)
  *   and the content type, and write Oculus cookies through the one cookie
  *   writer. It has no `hijack`, no `raw`, no way to write `Set-Cookie`,
  *   framing, CORS or security headers, and stops working once the handler
- *   has returned.
+ *   has returned or the request has ended.
  * The handler returns `undefined`, a string, or plain JSON data (objects,
  * arrays, strings, finite numbers, booleans, null). Anything else (a Web
  * `Response`, a stream, a Buffer, a Date, a class instance, a getter, a
- * cycle) is refused with a 500 before Fastify sees it: Fastify copies a
+ * cycle, or a result over the size caps) is refused with a 500 before Fastify sees it: Fastify copies a
  * `Response`'s headers after every check has run. The data is copied as it
  * is checked, so what is sent is what was checked.
  * Nothing in the API adds parsers, hooks, error handlers, body limits or
@@ -38,7 +39,7 @@ import {
   type CookieWriteOptions,
   type OculusCookieName,
 } from "./cookies.js";
-import { replyHeaderProblem } from "./headers.js";
+import { contentTypeProblem, replyHeaderProblem } from "./headers.js";
 import { pathOf } from "./paths.js";
 
 export const ROUTE_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"] as const;
@@ -47,9 +48,13 @@ export type RouteMethod = (typeof ROUTE_METHODS)[number];
 export interface OculusReply {
   /** The status code, 200 to 599. */
   status(code: number): OculusReply;
-  /** An ordinary header; Set-Cookie and framing headers are refused. */
+  /**
+   * One of the headers handlers may write (headers.ts `HANDLER_HEADER_NAMES`:
+   * Content-Language, ETag, Last-Modified, Vary, a same-origin Location,
+   * Retry-After), with a well-formed value; anything else throws.
+   */
   header(name: string, value: string): OculusReply;
-  /** The Content-Type. */
+  /** The Content-Type: a media type with simple parameters. */
   type(contentType: string): OculusReply;
   setCookie(name: OculusCookieName, value: string, options?: CookieWriteOptions): OculusReply;
   clearCookie(name: OculusCookieName): OculusReply;
@@ -85,6 +90,12 @@ export interface OculusRequest {
   readonly headers: Readonly<Partial<Record<RequestHeaderName, string>>>;
   /** The Oculus cookies sent, well-formed values only (cookies.ts). */
   readonly cookies: Readonly<Partial<Record<OculusCookieName, string>>>;
+  /**
+   * Aborted when the handler has run out of time (its 503 is already sent)
+   * or the client has gone away. From then on the reply throws; a handler
+   * with side effects (writes, outbound requests) should stop.
+   */
+  readonly signal: AbortSignal;
 }
 
 export interface OculusRoute {
@@ -151,7 +162,7 @@ function textEntries(source: unknown): [string, string | readonly string[]][] {
 }
 
 /** The frozen request view handed to handlers; holds no reference to Fastify or Node objects. */
-export function oculusRequest(request: FastifyRequest): OculusRequest {
+export function oculusRequest(request: FastifyRequest, signal: AbortSignal): OculusRequest {
   const headers: Partial<Record<RequestHeaderName, string>> = {};
   for (const name of REQUEST_HEADERS) {
     const value: unknown = request.headers[name];
@@ -176,20 +187,50 @@ export function oculusRequest(request: FastifyRequest): OculusRequest {
     protocol: request.protocol,
     headers: Object.freeze(headers),
     cookies: Object.freeze(cookies),
+    signal,
   });
 }
 
 /** How deeply a handler's result may nest. */
 const MAX_RESULT_DEPTH = 256;
+/** The longest array in a handler's result. */
+export const MAX_RESULT_ARRAY_LENGTH = 100_000;
+/** Values (objects, arrays, strings, numbers…) in a result, counted at every visit. */
+export const MAX_RESULT_NODES = 1_000_000;
+/** UTF-8 bytes of all strings (keys included) in a result, or of a text result. */
+export const MAX_RESULT_TEXT_BYTES = 16 * 1024 * 1024;
+
+interface Budget {
+  nodes: number;
+  bytes: number;
+}
+
+function spendText(text: string, budget: Budget): void {
+  budget.bytes += Buffer.byteLength(text, "utf8");
+  if (budget.bytes > MAX_RESULT_TEXT_BYTES) throw new Error("handler result: too much text");
+}
 
 /**
  * A copy of a handler's result made only of plain JSON data, read once.
  * Throws on anything else: class instances (Response, streams, Buffers,
  * Dates, Maps), functions, symbols, bigints, non-finite numbers, getters,
- * cycles and nesting deeper than `MAX_RESULT_DEPTH`.
+ * cycles and nesting deeper than `MAX_RESULT_DEPTH`; and on results larger
+ * than the caps above. Every visit counts, so an object referenced from
+ * many places (which would otherwise be copied again and again, doubling at
+ * each level) is counted each time.
  */
-export function plainData(value: unknown, depth = 0, seen = new Set<object>()): unknown {
-  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+export function plainData(
+  value: unknown,
+  depth = 0,
+  seen = new Set<object>(),
+  budget: Budget = { nodes: 0, bytes: 0 },
+): unknown {
+  if (++budget.nodes > MAX_RESULT_NODES) throw new Error("handler result: too many values");
+  if (typeof value === "string") {
+    spendText(value, budget);
+    return value;
+  }
+  if (value === null || typeof value === "boolean") return value;
   if (typeof value === "number") {
     if (!Number.isFinite(value)) throw new Error("handler result: non-finite number");
     return value;
@@ -214,10 +255,11 @@ export function plainData(value: unknown, depth = 0, seen = new Set<object>()): 
   if (isArray) {
     const length = read("length");
     if (typeof length !== "number") throw new Error("handler result: bad array");
+    if (length > MAX_RESULT_ARRAY_LENGTH) throw new Error("handler result: array too long");
     const list: unknown[] = [];
     for (let i = 0; i < length; i++) {
       const item = read(String(i));
-      list.push(item === undefined ? null : plainData(item, depth + 1, seen));
+      list.push(item === undefined ? null : plainData(item, depth + 1, seen, budget));
     }
     copy = list;
   } else {
@@ -226,9 +268,10 @@ export function plainData(value: unknown, depth = 0, seen = new Set<object>()): 
       if (!descriptors[key]?.enumerable) continue;
       const item = read(key);
       if (item === undefined) continue;
+      spendText(key, budget);
       // defineProperty, so a "__proto__" key stays an ordinary key.
       Object.defineProperty(object, key, {
-        value: plainData(item, depth + 1, seen),
+        value: plainData(item, depth + 1, seen, budget),
         enumerable: true,
         writable: true,
         configurable: true,
@@ -241,12 +284,28 @@ export function plainData(value: unknown, depth = 0, seen = new Set<object>()): 
 }
 
 /**
+ * What a handler returned, as the body to send: `undefined`, a string (at
+ * most `MAX_RESULT_TEXT_BYTES`), or a `plainData` copy. Throws otherwise.
+ */
+export function resultBody(result: unknown): unknown {
+  if (result === undefined) return undefined;
+  if (typeof result === "string") {
+    spendText(result, { nodes: 0, bytes: 0 });
+    return result;
+  }
+  return plainData(result);
+}
+
+/**
  * The narrow reply handed to handlers. `open` says whether the handler is
- * still running; once it has returned, every method throws.
+ * still running; once it has returned (or timed out, or the client has gone), every method throws.
  */
 export function oculusReply(reply: FastifyReply, open: () => boolean = () => true): OculusReply {
   const check = (): void => {
-    if (!open()) throw new Error("the reply can't be changed after the handler has returned");
+    if (!open())
+      throw new Error(
+        "the reply can't be changed after the handler has returned or the request has ended",
+      );
   };
   const wrapped: OculusReply = Object.freeze({
     status(code: number) {
@@ -266,7 +325,7 @@ export function oculusReply(reply: FastifyReply, open: () => boolean = () => tru
     },
     type(contentType: string) {
       check();
-      const problem = replyHeaderProblem("content-type", contentType);
+      const problem = contentTypeProblem(contentType);
       if (problem !== undefined) throw new Error(problem);
       void reply.type(contentType);
       return wrapped;
