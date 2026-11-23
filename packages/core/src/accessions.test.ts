@@ -41,11 +41,19 @@ import {
   series,
   vase,
 } from "./accessions.fixtures.js";
-import { BASE, CHECKERS, MAPPING, identifiersFor, record } from "./public-output.fixtures.js";
+import {
+  BASE,
+  CHECKERS,
+  MAPPING,
+  identifiersFor,
+  nowOf,
+  record,
+} from "./public-output.fixtures.js";
 
 function publish(view: PublicRecord | undefined, accessions: unknown, records = RECORDS) {
   if (view === undefined) throw new Error("no public view");
   return publicOutput(view, MAPPING, {
+    ...nowOf(view),
     baseUrl: BASE,
     published: [view.id],
     checkers: CHECKERS,

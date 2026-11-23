@@ -33,6 +33,7 @@ import {
   record,
   template,
   ORG,
+  nowOf,
 } from "./public-output.fixtures.js";
 
 function ok<T>(result: Validated<T>): T {
@@ -98,6 +99,7 @@ function output(
   checkers: Record<string, unknown>,
 ): Validated<PublicOutput> {
   return publicOutput(view, MAPPING, {
+    ...nowOf(view),
     baseUrl: BASE,
     accessions: accessionsFor(view),
     published,
@@ -197,6 +199,7 @@ describe("an unpublished record linked to never shows", () => {
     expect(
       codes(
         publicOutput(view, staffMapping, {
+          ...nowOf(view),
           baseUrl: BASE,
           accessions: accessionsFor(view),
           published: [item.id, agent.id],
@@ -361,6 +364,7 @@ describe("D-048: a place value shows its name only when its place record is vouc
     const view = publicView(effective);
     if (view === undefined) throw new Error("no view");
     const result = publicOutput(view, PLACE_MAPPING, {
+      ...nowOf(view),
       baseUrl: BASE,
       accessions: accessionsFor(view),
       published: records.map((r) => r.id),
@@ -745,6 +749,7 @@ describe("a value kept from before a template change never reaches the public vi
         ],
       };
       const result = publicOutput(view, mapping, {
+        ...nowOf(view),
         baseUrl: BASE,
         accessions: accessionsFor(view),
         published: [item.id, secretId],

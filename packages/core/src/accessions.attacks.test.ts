@@ -57,6 +57,8 @@ import {
   noAccessions,
   record,
   template,
+  nowOf,
+  TPL,
 } from "./public-output.fixtures.js";
 
 const SECRETS = Object.values(SECRET);
@@ -64,6 +66,9 @@ const SECRETS = Object.values(SECRET);
 function publish(view: PublicRecord | undefined, options: Record<string, unknown>) {
   if (view === undefined) throw new Error("no public view");
   return publicOutput(view, MAPPING, {
+    // The records and template the views here are made from (D-054).
+    records: RECORDS,
+    templateFor: () => TPL,
     baseUrl: BASE,
     published: [view.id],
     checkers: CHECKERS,
@@ -136,6 +141,7 @@ describe("a record whose deed is missing can't be published", () => {
       codes(effectivePublishIssues(e, new Proxy({ accessions: noAccessions(ORG) }, {}))),
     ).toEqual(["invalid_options"]);
     const options = {
+      ...nowOf(e),
       baseUrl: BASE,
       published: [item.id],
       checkers: CHECKERS,
@@ -295,6 +301,7 @@ describe("a link to a held record shows nothing, not even its label (T-016 revie
     const run = (accessions: unknown) =>
       ok(
         publicOutput(view, map, {
+          ...nowOf(view),
           baseUrl: BASE,
           published: [page.id, item.id, vase.id],
           checkers,
@@ -365,7 +372,8 @@ describe("a link is deed-checked through its target's parents and what it shows 
             identifiers: identifiersFor(records),
             templateFor: () => LINKS_TPL,
             ...(accessions === undefined ? {} : { accessions }),
-            ...(now === undefined ? {} : { records: now }),
+            // Records are required (D-054): "none" is a set without the linked records.
+            records: now ?? [page],
           }),
         ),
       );
@@ -396,7 +404,7 @@ describe("a link is deed-checked through its target's parents and what it shows 
       expect(out).not.toContain("Scan label");
       expect(leaks(out)).toEqual([]);
     }
-    // A record outside the fonds is a live link, but only with the records.
+    // A record outside the fonds is a live link, but only when the records hold it.
     expect(page.publishWith(register, page.records)).toContain(BASE + vase.id);
     expect(page.publishWith(register, undefined)).not.toContain(BASE + vase.id);
   });

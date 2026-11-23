@@ -258,3 +258,25 @@ export function accessionsFor(viewOrEffective: unknown): AccessionRegister {
   const records = origin.chain.map((step) => step.record);
   return noAccessions(records[0]?.organizationId ?? ORG, records);
 }
+
+/**
+ * The records and templates a public view (or effective record) was made
+ * from, as `publicOutput` requires them (D-054): for publishing a view made
+ * just now, when nothing has changed since. Tests of a kept view pass the
+ * records and templates as they are after the change instead.
+ */
+export function nowOf(viewOrEffective: unknown): {
+  readonly records: readonly CatalogRecord[];
+  readonly templateFor: (record: CatalogRecord) => FieldTemplate | undefined;
+} {
+  const view = isEffectiveRecord(viewOrEffective)
+    ? publicView(viewOrEffective as EffectiveRecord)
+    : viewOrEffective;
+  const origin = publicViewOrigin(view);
+  if (origin === undefined) return { records: [], templateFor: () => undefined };
+  const templates = new Map(origin.chain.map((step) => [step.record.id, step.template]));
+  return {
+    records: origin.chain.map((step) => step.record),
+    templateFor: (r) => templates.get(r.id),
+  };
+}

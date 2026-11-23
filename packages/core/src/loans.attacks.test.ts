@@ -47,7 +47,7 @@ import {
   type StorageMove,
   type Validated,
 } from "./index.js";
-import { BASE, CHECKERS, MAPPING } from "./public-output.fixtures.js";
+import { BASE, CHECKERS, MAPPING, nowOf } from "./public-output.fixtures.js";
 
 const ORG = newOrganizationId();
 const OTHER = newOrganizationId();
@@ -405,6 +405,7 @@ describe("loans and condition checks stay staff-only", () => {
     ]) {
       expect(publicView(thing as never)).toBeUndefined();
       const out = publicOutput(thing as unknown as PublicRecord, MAPPING, {
+        ...nowOf(thing as unknown as PublicRecord),
         baseUrl: BASE,
         published: [print],
         checkers: CHECKERS,

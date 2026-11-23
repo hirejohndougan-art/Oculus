@@ -36,7 +36,7 @@ import {
   type StorageMove,
   type Validated,
 } from "./index.js";
-import { accessionsFor, BASE, CHECKERS, MAPPING } from "./public-output.fixtures.js";
+import { accessionsFor, BASE, CHECKERS, MAPPING, nowOf } from "./public-output.fixtures.js";
 
 const ORG = newOrganizationId();
 const OTHER = newOrganizationId();
@@ -258,6 +258,7 @@ describe("storage stays staff-only", () => {
     for (const thing of [home, move(item, home.id), w, idx, log]) {
       expect(publicView(thing as never)).toBeUndefined();
       const out = publicOutput(thing as unknown as PublicRecord, MAPPING, {
+        ...nowOf(thing as unknown as PublicRecord),
         baseUrl: BASE,
         accessions: accessionsFor(thing),
         published: [item],

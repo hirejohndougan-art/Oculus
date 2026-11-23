@@ -30,6 +30,7 @@ import {
   linkChecker,
   record,
   template,
+  nowOf,
 } from "./public-output.fixtures.js";
 
 function ok<T>(result: Validated<T>): T {
@@ -109,6 +110,7 @@ function output(
   const view = publicView(effective);
   if (view === undefined) throw new Error("no view");
   return publicOutput(view, LINK_MAPPING, {
+    ...nowOf(view),
     baseUrl: BASE,
     accessions: accessionsFor(view),
     published,

@@ -37,6 +37,7 @@ import {
   record,
   viewOf,
   ORG,
+  nowOf,
 } from "./public-output.fixtures.js";
 
 interface Quad {
@@ -125,6 +126,7 @@ function everyTermOutput(): PublicOutput {
   };
   return ok(
     publicOutput(view, mapping, {
+      ...nowOf(view),
       baseUrl: BASE,
       accessions: accessionsFor(view),
       published: [view.id],
@@ -261,6 +263,7 @@ describe("JSON-LD through a JSON-LD 1.1 processor", () => {
     };
     const e = ok(
       publicOutput(view, mapping, {
+        ...nowOf(view),
         baseUrl: BASE,
         accessions: accessionsFor(view),
         published: [view.id],

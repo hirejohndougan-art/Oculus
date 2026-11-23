@@ -35,6 +35,7 @@ import {
   CHECKERS,
   RIGHTS_ENTRY,
   linkChecker,
+  nowOf,
 } from "./public-output.fixtures.js";
 
 function ok(result: Validated<PublicOutput>): PublicOutput {
@@ -67,6 +68,7 @@ function out(
   mapping: unknown = MAPPING,
 ) {
   return publicOutput(view, mapping, {
+    ...nowOf(view),
     baseUrl: BASE,
     accessions: accessionsFor(view),
     published,
@@ -258,6 +260,7 @@ describe("publicOutput: places and the published list", () => {
     const view = viewOf([item], item.id);
     const o = ok(
       publicOutput(view, MAPPING, {
+        ...nowOf(view),
         baseUrl: BASE,
         accessions: accessionsFor(view),
         published: [item.id, PLACE_ID],
@@ -282,6 +285,7 @@ describe("publicOutput: places and the published list", () => {
     expect(view.fields.places).toBeUndefined();
     const o = ok(
       publicOutput(view, MAPPING, {
+        ...nowOf(view),
         baseUrl: BASE,
         accessions: accessionsFor(view),
         published: [item.id, PLACE_ID],
@@ -332,6 +336,7 @@ describe("publicOutput: places and the published list", () => {
       expect(
         codes(
           publicOutput(view, MAPPING, {
+            ...nowOf(view),
             baseUrl: BASE,
             accessions: accessionsFor(view),
             published,
@@ -537,6 +542,7 @@ describe("publicOutput: the base URL", () => {
       expect(
         ok(
           publicOutput(view, MAPPING, {
+            ...nowOf(view),
             baseUrl,
             published: [view.id],
             accessions: accessionsFor(view),
@@ -573,7 +579,9 @@ describe("publicOutput: the base URL", () => {
       undefined,
     ]) {
       expect(
-        codes(publicOutput(view, MAPPING, { baseUrl, published: [view.id] } as never)),
+        codes(
+          publicOutput(view, MAPPING, { ...nowOf(view), baseUrl, published: [view.id] } as never),
+        ),
         String(baseUrl).slice(0, 60),
       ).toEqual(["invalid_base_url"]);
     }
@@ -613,6 +621,7 @@ describe("publicOutput: the template check", () => {
     const item = fullObject();
     const view = viewOf([item], item.id);
     const result = publicOutput(view, MAPPING, {
+      ...nowOf(view),
       baseUrl: BASE,
       accessions: accessionsFor(view),
       published: [view.id],
@@ -625,6 +634,7 @@ describe("publicOutput: the template check", () => {
     const view = viewOf([item], item.id);
     const refuse = () => [{ code: "no_thanks", message: "Refused." }];
     const result = publicOutput(view, MAPPING, {
+      ...nowOf(view),
       baseUrl: BASE,
       accessions: accessionsFor(view),
       published: [view.id],
@@ -637,13 +647,19 @@ describe("publicOutput: the template check", () => {
     const item = fullObject();
     const view = viewOf([item], item.id);
     const proxy = {
+      ...nowOf(view),
       baseUrl: BASE,
       accessions: accessionsFor(view),
       published: [view.id],
       checkers: new Proxy(CHECKERS, {}),
     };
     expect(codes(publicOutput(view, MAPPING, proxy))).toEqual(["invalid_options"]);
-    const getter = { baseUrl: BASE, accessions: accessionsFor(view), published: [view.id] };
+    const getter = {
+      ...nowOf(view),
+      baseUrl: BASE,
+      accessions: accessionsFor(view),
+      published: [view.id],
+    };
     Object.defineProperty(getter, "checkers", { enumerable: true, get: () => CHECKERS });
     expect(codes(publicOutput(view, MAPPING, getter))).toEqual(["invalid_options"]);
   });
@@ -860,13 +876,14 @@ describe("publicOutput: IRIs RFC 3987 allows", () => {
       "https://example.org/%zz/",
     ]) {
       expect(
-        codes(publicOutput(view, MAPPING, { baseUrl, published: [view.id] })),
+        codes(publicOutput(view, MAPPING, { ...nowOf(view), baseUrl, published: [view.id] })),
         baseUrl,
       ).toEqual(["invalid_base_url"]);
     }
     expect(
       ok(
         publicOutput(view, MAPPING, {
+          ...nowOf(view),
           baseUrl: "http://[::1]/items/",
           published: [view.id],
           accessions: accessionsFor(view),
@@ -894,6 +911,7 @@ describe("publicOutput: currentTemplate", () => {
   const view = viewOf([item], item.id);
   const run = (currentTemplate: unknown) =>
     publicOutput(view, MAPPING, {
+      ...nowOf(view),
       baseUrl: BASE,
       accessions: accessionsFor(view),
       published: [view.id],
@@ -933,6 +951,7 @@ describe("publicOutput: digital assets and DCMI types", () => {
         view,
         { ...DIGITAL_ASSET_DUBLIN_CORE, organizationId: ORG },
         {
+          ...nowOf(view),
           baseUrl: BASE,
           accessions: accessionsFor(view),
           published: [view.id],
