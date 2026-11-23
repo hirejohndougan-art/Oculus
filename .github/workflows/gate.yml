@@ -56,6 +56,20 @@ jobs:
             exit 1
           fi
           docker exec "$CONTAINER" psql -U postgres -tAc "SHOW max_prepared_transactions" | grep -qx 10
+      # Backup and restore tests run pg_dump and pg_restore, which must be at
+      # least as new as the server (D-064): the runner's own client is older
+      # than 19, so install the matching client from the PostgreSQL apt
+      # repository (https://www.postgresql.org/download/linux/ubuntu/) and
+      # point PG_BIN at it.
+      - name: PostgreSQL ${{ matrix.postgres }} client tools
+        env:
+          PG_MAJOR: ${{ matrix.postgres }}
+        run: |
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y "postgresql-client-$PG_MAJOR"
+          echo "PG_BIN=/usr/lib/postgresql/$PG_MAJOR/bin" >> "$GITHUB_ENV"
+          "/usr/lib/postgresql/$PG_MAJOR/bin/pg_dump" --version
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
