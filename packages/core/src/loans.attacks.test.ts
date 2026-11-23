@@ -405,7 +405,7 @@ describe("loans and condition checks stay staff-only", () => {
     ]) {
       expect(publicView(thing as never)).toBeUndefined();
       const out = publicOutput(thing as unknown as PublicRecord, MAPPING, {
-        ...nowOf(thing as unknown as PublicRecord),
+        ...nowOf(thing),
         baseUrl: BASE,
         published: [print],
         checkers: CHECKERS,

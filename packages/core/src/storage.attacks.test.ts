@@ -258,7 +258,7 @@ describe("storage stays staff-only", () => {
     for (const thing of [home, move(item, home.id), w, idx, log]) {
       expect(publicView(thing as never)).toBeUndefined();
       const out = publicOutput(thing as unknown as PublicRecord, MAPPING, {
-        ...nowOf(thing as unknown as PublicRecord),
+        ...nowOf(thing),
         baseUrl: BASE,
         accessions: accessionsFor(thing),
         published: [item],
