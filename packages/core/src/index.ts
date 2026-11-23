@@ -232,6 +232,8 @@ export type { DublinCoreTerm, DublinCoreEntry, DublinCoreMapping } from "./dubli
 
 export { checkRightsValue, makeIdentifierChecker } from "./field-checkers.js";
 
+export { identifierFieldIssues } from "./identifier-fields.js";
+
 export {
   MAX_RECORD_SET,
   indexRecords,

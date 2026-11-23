@@ -25,7 +25,10 @@
  *   `VOCABULARY_CODES` (vocabularies.ts).
  * - `identifier`: `{ type, value }`, such as an accession number. The type
  *   and a field's `identifierTypes` follow the identifier type key rule
- *   (`isIdentifierTypeKey`, D-031): no hyphens.
+ *   (`isIdentifierTypeKey`, D-031): no hyphens. The number itself lives in
+ *   the record's `RecordIdentifiers`; the field only says which of its
+ *   current identifiers it shows, and must name one exactly
+ *   (`identifierFieldIssues`, identifier-fields.ts, D-038).
  * - `link`: `{ url, label? }`, a web link (http or https).
  * - `rights`: `{ uri, note? }`, a rights statement or license URI. One per
  *   record: the kind is only allowed in a single, public, non-repeating field

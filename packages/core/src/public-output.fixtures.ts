@@ -143,17 +143,17 @@ export function identifiersFor(records: readonly CatalogRecord[]): RecordIdentif
   return records.map((r) => {
     const current: { type: string; value: string; primary: boolean }[] = [];
     for (const value of Object.values(r.fields)) {
-      for (const item of Array.isArray(value) ? value : [value]) {
+      const items: readonly unknown[] = Array.isArray(value) ? value : [value];
+      for (const item of items) {
+        if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
+        const { type, value: text, ...rest } = item as Record<string, unknown>;
         if (
-          typeof item === "object" &&
-          item !== null &&
-          !Array.isArray(item) &&
-          Object.keys(item).sort().join() === "type,value" &&
-          typeof item.type === "string" &&
-          typeof item.value === "string" &&
-          !current.some((c) => c.type === item.type && c.value === item.value)
+          Object.keys(rest).length === 0 &&
+          typeof type === "string" &&
+          typeof text === "string" &&
+          !current.some((c) => c.type === type && c.value === text)
         ) {
-          current.push({ type: item.type, value: item.value, primary: current.length === 0 });
+          current.push({ type, value: text, primary: current.length === 0 });
         }
       }
     }

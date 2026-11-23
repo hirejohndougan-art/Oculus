@@ -735,7 +735,12 @@ describe("an identifier field publishes only a number its record holds (D-038)",
       uniqueness: "none",
       public: true,
     },
-    { key: "donor_file_number", label: "Donor file number", organizationId: ORG, uniqueness: "none" },
+    {
+      key: "donor_file_number",
+      label: "Donor file number",
+      organizationId: ORG,
+      uniqueness: "none",
+    },
   ]);
   if (!made.ok) throw new Error("types");
   const checkers = { identifier: made.value };
@@ -743,7 +748,11 @@ describe("an identifier field publishes only a number its record holds (D-038)",
     return { ...def("number", "public", inherited), kind: "identifier", repeatable };
   }
   const PUBLIC_NUMBER = template([numberDef()], "public-number");
-  type Current = { type: string; value: string; primary: boolean };
+  interface Current {
+    type: string;
+    value: string;
+    primary: boolean;
+  }
   function held(
     record: { readonly id: RecordId },
     current: Current[],
