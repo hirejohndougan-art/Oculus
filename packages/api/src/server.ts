@@ -4,10 +4,12 @@
  * `buildServer` returns a ready Fastify instance (call `listen` to serve, or
  * `inject` in tests). Its only route of its own is `GET /health`; the
  * application's routes come in `options.routes` as plain `OculusRoute`s
- * (routes.ts). Application code never gets the Fastify instance or reply, so
- * it can't add parsers, hooks or error handlers, raise limits, hijack replies
- * or write cookies around the writer; every route Fastify adds is checked
- * again in onRoute, and the instance is ready (closed to changes) on return.
+ * (routes.ts). Application code never gets the Fastify instance, request or
+ * reply, only a frozen request view and a narrow reply, so it can't add
+ * parsers, hooks or error handlers, raise limits, hijack replies, reach the
+ * raw socket or server, or write cookies around the writer; handlers return
+ * plain data or text only. Every route Fastify adds is checked again in
+ * onRoute, and the instance is ready (closed to changes) on return.
  *
  * The rules, each with an attack test in this package:
  * 1. Bodies (body.ts): only Oculus's parsers: exact `application/json`, and
@@ -37,7 +39,12 @@
  *    (`SERVER_TIMEOUTS`); options can only shorten them.
  * 8. Errors (errors.ts): `{ "error": "<code>" }` only, never a message or a
  *    stack trace, including requests Node itself can't parse; 5xx details go
- *    to the server log. The request logger records the method and path only.
+ *    to the server log. Every header and cookie the handler set is dropped
+ *    from an error reply. The request logger records the method and path only.
+ * 9. Headers (headers.ts): handlers write only valid, ordinary headers (no
+ *    CORS, framing, security headers, or a `Location` off the site), and
+ *    every reply carries nosniff, no-referrer, a CSP that loads nothing and
+ *    `Cache-Control: no-store`.
  *
  * Adding another Fastify plugin, parser or error handler is its own decision
  * (D-051).
@@ -57,10 +64,19 @@ import {
 } from "./body.js";
 import { cookieHeaderProblem, replyCookieProblem } from "./cookies.js";
 import { Refusal, errorReply } from "./errors.js";
+import { SECURITY_HEADERS } from "./headers.js";
 import { failsOriginCheck, originsFromEnv } from "./origin.js";
 import { RouteTable, pathOf, pathProblem } from "./paths.js";
 import { trustedProxyFromEnv } from "./proxy.js";
-import { checkRoute, oculusReply, routeOptionsProblem, type OculusRoute } from "./routes.js";
+import {
+  checkRoute,
+  oculusReply,
+  oculusRequest,
+  plainData,
+  routeConfig,
+  routeOptionsProblem,
+  type OculusRoute,
+} from "./routes.js";
 
 /** Milliseconds. Node's defaults: no socket timeout, 300 s request, 60 s headers. */
 export interface ServerTimeouts {
@@ -156,7 +172,10 @@ function clientError(error: { code?: string }, socket: Socket): void {
     `HTTP/1.1 ${String(status)} ${reason}\r\n` +
       "Content-Type: application/json; charset=utf-8\r\n" +
       `Content-Length: ${String(Buffer.byteLength(body))}\r\n` +
-      "Cache-Control: no-store\r\nConnection: close\r\n\r\n" +
+      Object.entries(SECURITY_HEADERS)
+        .map(([name, value]) => `${name}: ${value}\r\n`)
+        .join("") +
+      "Connection: close\r\n\r\n" +
       body,
   );
 }
@@ -167,10 +186,23 @@ function addRoute(app: FastifyInstance, route: OculusRoute): void {
     method: route.method,
     url: route.path,
     ...(credentials ? { bodyLimit: CREDENTIALS_BODY_LIMIT } : {}),
-    config: { oculus: { form: route.form === true, credentials } },
+    config: routeConfig(route),
     handler: async (request, reply) => {
-      const result = await route.handler(request, oculusReply(reply));
-      return result === undefined ? reply.send() : result;
+      let running = true;
+      let result: unknown;
+      try {
+        result = await route.handler(
+          oculusRequest(request),
+          oculusReply(reply, () => running),
+        );
+      } finally {
+        running = false;
+      }
+      // Copied as plain data before Fastify sees it: a Response, stream or
+      // Buffer would skip the header checks below (routes.ts).
+      return reply.send(
+        result === undefined || typeof result === "string" ? result : plainData(result),
+      );
     },
   });
 }
@@ -225,7 +257,7 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
     frameworkErrors: (_error, _request, reply) => {
       // A URL the router can't decode; the reply type here is generic.
       const plain = reply as FastifyReply;
-      void plain.code(400).header("cache-control", "no-store").send({ error: "bad_request" });
+      void plain.code(400).send({ error: "bad_request" });
     },
     clientErrorHandler: clientError,
   });
@@ -251,17 +283,16 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
       reply.removeHeader("set-cookie");
       throw new Error("a Set-Cookie header broke the cookie rules");
     }
+    for (const [name, value] of Object.entries(SECURITY_HEADERS)) void reply.header(name, value);
     return payload;
   });
 
   app.setErrorHandler((error, request, reply) => {
     const { statusCode, body } = errorReply(error);
     if (statusCode >= 500) request.log.error({ err: error }, "request failed");
-    return reply
-      .code(statusCode)
-      .type("application/json; charset=utf-8")
-      .header("cache-control", "no-store")
-      .send(body);
+    // Nothing the handler set (headers, cookies, Location) goes out with an error.
+    for (const name of Object.keys(reply.getHeaders())) reply.removeHeader(name);
+    return reply.code(statusCode).type("application/json; charset=utf-8").send(body);
   });
 
   app.setNotFoundHandler((request, reply) => {
@@ -270,7 +301,6 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
     if (wrongMethod) reply.header("allow", allowed.join(", "));
     return reply
       .code(wrongMethod ? 405 : 404)
-      .header("cache-control", "no-store")
       .send({ error: wrongMethod ? "method_not_allowed" : "not_found" });
   });
 

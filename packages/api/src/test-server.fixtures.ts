@@ -2,7 +2,7 @@
 import { connect } from "node:net";
 import type { AddressInfo } from "node:net";
 import type { FastifyInstance } from "fastify";
-import { readOculusCookie, OCULUS_COOKIES } from "./cookies.js";
+import { OCULUS_COOKIES } from "./cookies.js";
 import { ORIGINS_ENV } from "./origin.js";
 import type { OculusRoute } from "./routes.js";
 import { buildServer, type ServerOptions } from "./server.js";
@@ -65,8 +65,8 @@ export async function testServer(
           ip: request.ip,
           host: request.host,
           protocol: request.protocol,
-          session: readOculusCookie(request, OCULUS_COOKIES.session) ?? null,
-          hasCookies: "cookies" in request,
+          session: request.cookies[OCULUS_COOKIES.session] ?? null,
+          cookieNames: Object.keys(request.cookies),
         };
       },
     },

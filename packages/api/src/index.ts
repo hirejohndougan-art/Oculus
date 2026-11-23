@@ -13,10 +13,24 @@ export {
 } from "./body.js";
 export type { OculusRouteConfig } from "./body.js";
 
-export { ROUTE_METHODS } from "./routes.js";
-export type { OculusRoute, OculusReply, RouteMethod } from "./routes.js";
+export { ROUTE_METHODS, REQUEST_HEADERS } from "./routes.js";
+export type {
+  OculusRoute,
+  OculusReply,
+  OculusRequest,
+  RequestHeaderName,
+  RouteMethod,
+} from "./routes.js";
 
-export { OCULUS_COOKIES, readOculusCookie, setOculusCookie, clearOculusCookie } from "./cookies.js";
+export { SECURITY_HEADERS } from "./headers.js";
+
+export {
+  OCULUS_COOKIES,
+  MAX_COOKIE_AGE_SECONDS,
+  readOculusCookie,
+  setOculusCookie,
+  clearOculusCookie,
+} from "./cookies.js";
 export type { OculusCookieName, CookieWriteOptions } from "./cookies.js";
 
 export { Refusal, errorReply } from "./errors.js";

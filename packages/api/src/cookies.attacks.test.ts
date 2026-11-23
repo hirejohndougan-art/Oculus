@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import type { FastifyReply } from "fastify";
 import {
+  MAX_COOKIE_AGE_SECONDS,
   OCULUS_COOKIES,
   cookieHeaderProblem,
   replyCookieProblem,
@@ -37,10 +38,10 @@ describe("reading cookies", () => {
   it("reads the Oculus session cookie and nothing else", async () => {
     const { res } = await whoami(`theme=dark; ${SESSION}=tok_EN-123; tracker=abc`);
     expect(res.statusCode).toBe(200);
-    const body = res.json<{ session: string | null; hasCookies: boolean }>();
+    const body = res.json<{ session: string | null; cookieNames: string[] }>();
     expect(body.session).toBe("tok_EN-123");
-    // No cookie plugin: there is no request.cookies holding the other cookies.
-    expect(body.hasCookies).toBe(false);
+    // No cookie plugin: the handler's request holds the Oculus cookie only.
+    expect(body.cookieNames).toEqual([SESSION]);
   });
 
   it.each([
@@ -151,14 +152,17 @@ describe("writing cookies", () => {
   });
 
   it("can't change the server from a handler after start", async () => {
+    // Handlers get no `server` (routes.ts); a handler that goes looking for
+    // one fails, and the server's parsers and error handler are unchanged.
+    interface Tamper {
+      server: { addContentTypeParser: () => void; setErrorHandler: () => void };
+    }
     const built = await testServer({}, [
       {
         method: "GET",
         path: "/tamper",
         handler: (request) => {
-          request.server.addContentTypeParser("text/plain", (_r, _b, done) => {
-            done(null, "x");
-          });
+          (request as unknown as Tamper).server.addContentTypeParser();
           return {};
         },
       },
@@ -166,7 +170,7 @@ describe("writing cookies", () => {
         method: "GET",
         path: "/tamper-errors",
         handler: (request) => {
-          request.server.setErrorHandler(() => "leak");
+          (request as unknown as Tamper).server.setErrorHandler();
           return {};
         },
       },
@@ -174,9 +178,8 @@ describe("writing cookies", () => {
     app = built.app;
     for (const url of ["/tamper", "/tamper-errors"]) {
       const res = await app.inject({ method: "GET", url });
-      // Fastify refuses the change; the reply is a plain error, never "leak".
-      expect(res.statusCode, url).toBeGreaterThanOrEqual(400);
-      expect(Object.keys(res.json<object>())).toEqual(["error"]);
+      expect(res.statusCode, url).toBe(500);
+      expect(res.json<object>(), url).toEqual({ error: "internal_error" });
     }
     const res = await app.inject({
       method: "POST",
@@ -202,6 +205,30 @@ describe("writing cookies", () => {
         ...extra,
       } as unknown as OculusRoute;
       await expect(testServer({}, [route])).rejects.toThrow(/route option not allowed/);
+    }
+  });
+
+  it("uses the same Max-Age limit in the writer and in the check before sending", () => {
+    for (const seconds of [
+      0,
+      3600,
+      MAX_COOKIE_AGE_SECONDS,
+      MAX_COOKIE_AGE_SECONDS + 1,
+      9_999_999_999,
+      100_000_000_000,
+      Number.MAX_SAFE_INTEGER,
+    ]) {
+      const reply = { header: () => reply } as unknown as FastifyReply;
+      const header = `${SESSION}=a; Max-Age=${String(seconds)}; Path=/; HttpOnly; Secure; SameSite=Lax`;
+      const checkAccepts = setCookieProblem(header) === undefined;
+      let writerAccepts = true;
+      try {
+        setOculusCookie(reply, SESSION, "a", { maxAgeSeconds: seconds });
+      } catch {
+        writerAccepts = false;
+      }
+      expect(writerAccepts, String(seconds)).toBe(checkAccepts);
+      expect(checkAccepts, String(seconds)).toBe(seconds <= MAX_COOKIE_AGE_SECONDS);
     }
   });
 

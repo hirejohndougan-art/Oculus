@@ -11,6 +11,7 @@
  *   with 400: a second copy can be planted by a sibling site or script, and
  *   picking either one would be a guess. The cost (D-058): whoever can plant
  *   such a copy can make the browser's requests fail until it is cleared.
+ * - `Max-Age` is at most 400 days, in the writer and in the check alike.
  * - Values are base64url text only (session tokens are random bytes); any
  *   other value reads as absent.
  * - `setOculusCookie` and `clearOculusCookie` (reached through the route
@@ -22,7 +23,7 @@
  *   writer issued for that reply and must pass `setCookieProblem`; otherwise
  *   it is removed and the reply becomes a 500.
  */
-import type { FastifyReply, FastifyRequest } from "fastify";
+import type { FastifyReply } from "fastify";
 import { Refusal } from "./errors.js";
 
 export const OCULUS_COOKIES = {
@@ -62,16 +63,25 @@ function checkName(name: string): void {
   if (!NAMES.has(name)) throw new Error(`not an Oculus cookie: ${name}`);
 }
 
-/** The value of one Oculus cookie, or `undefined` when absent or malformed. */
+/** The value of one Oculus cookie in a `Cookie` header, or `undefined` when absent or malformed. */
 export function readOculusCookie(
-  request: FastifyRequest,
+  header: string | undefined,
   name: OculusCookieName,
 ): string | undefined {
   checkName(name);
-  const header = request.headers.cookie;
   if (cookieHeaderProblem(header) !== undefined) return undefined;
   const pair = cookiePairs(header).find((p) => p.name === name);
   return pair !== undefined && VALUE.test(pair.value) ? pair.value : undefined;
+}
+
+/**
+ * The longest `Max-Age`: 400 days, the cap browsers apply (RFC 6265bis
+ * §5.6.2). The writer and the check before sending use the same limit.
+ */
+export const MAX_COOKIE_AGE_SECONDS = 400 * 24 * 60 * 60;
+
+function isMaxAge(seconds: number): boolean {
+  return Number.isSafeInteger(seconds) && seconds >= 0 && seconds <= MAX_COOKIE_AGE_SECONDS;
 }
 
 export interface CookieWriteOptions {
@@ -100,8 +110,10 @@ export function setOculusCookie(
   checkName(name);
   if (!VALUE.test(value)) throw new Error("cookie values must be 1 to 512 base64url characters");
   const { maxAgeSeconds } = options;
-  if (maxAgeSeconds !== undefined && (!Number.isSafeInteger(maxAgeSeconds) || maxAgeSeconds < 0)) {
-    throw new Error("maxAgeSeconds must be a whole number of seconds, 0 or more");
+  if (maxAgeSeconds !== undefined && !isMaxAge(maxAgeSeconds)) {
+    throw new Error(
+      `maxAgeSeconds must be a whole number of seconds from 0 to ${String(MAX_COOKIE_AGE_SECONDS)}`,
+    );
   }
   const sameSite = options.sameSite === "strict" ? "Strict" : "Lax";
   const maxAge = maxAgeSeconds === undefined ? "" : `; Max-Age=${String(maxAgeSeconds)}`;
@@ -146,7 +158,9 @@ export function setCookieProblem(setCookie: string): string | undefined {
   if (sameSite !== "lax" && sameSite !== "strict") return "missing SameSite";
   if (seen.get("secure") !== "" || seen.get("httponly") !== "") return "flag with a value";
   const maxAge = seen.get("max-age");
-  if (maxAge !== undefined && !/^\d{1,10}$/.test(maxAge)) return "bad Max-Age";
+  if (maxAge !== undefined && !(/^\d{1,8}$/.test(maxAge) && isMaxAge(Number(maxAge)))) {
+    return "bad Max-Age";
+  }
   return undefined;
 }
 
