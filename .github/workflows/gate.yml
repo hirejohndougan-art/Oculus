@@ -8,14 +8,16 @@ permissions:
   contents: read
 
 jobs:
-  gate:
+  gate-postgres:
     runs-on: ubuntu-latest
-    # The oldest and newest supported PostgreSQL majors (D-049).
+    # The oldest and newest supported PostgreSQL majors (D-049). Images are
+    # not pinned to digests yet: no digest could be checked against the
+    # registry from the build sandbox (D-057).
     strategy:
       fail-fast: false
       matrix:
         postgres: ["15", "19"]
-    name: gate (PostgreSQL ${{ matrix.postgres }})
+    name: gate-postgres (PostgreSQL ${{ matrix.postgres }})
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}
@@ -42,3 +44,16 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run gate
+
+  # The one check to require: passes only if every PostgreSQL version passed.
+  gate:
+    needs: gate-postgres
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every PostgreSQL version passed
+        env:
+          RESULT: ${{ needs.gate-postgres.result }}
+        run: |
+          echo "gate-postgres: $RESULT"
+          test "$RESULT" = "success"
