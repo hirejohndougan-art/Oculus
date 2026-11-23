@@ -290,6 +290,7 @@ Admin screens in the browser:
 Server and deployment:
 - [ ] T-050 **Server layout for the admin and the public sites.** deps: T-042 (risky)
   - One app (D-034). The public sites may read only published data, through a read-only path (its own database role or a public read API) that tests show can't reach staff fields or unpublished records. Public pages render only `publicOutput` results, never a `publicView` directly, and build them with the records and templates loaded at publish or request time (D-054).
+  - Render only `publicOutput`'s public forms (`dublinCore`, `jsonLd`, `jsonLdText`, `oaiDcXml`), never the whole result: `staffWarnings` is staff-only (S-011c).
 - [ ] T-040 **Sending password reset email.** deps: T-039 (risky)
   - Deliver reset and invitation messages over SMTP (D-035), so any host's mail or a mail service works, with its credentials only in environment variables, and nothing about the account in the message beyond the link.
 - [ ] T-051 **Deploy and run.** deps: T-050, T-052 (needs John) (risky) John: SiteGround shared hosting (D-046); confirm with SiteGround support that an always-running Node process is allowed.
