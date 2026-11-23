@@ -290,6 +290,11 @@ type Fetched =
 interface LookupState {
   /** Validated, frozen copies, by ID, or why the ID can't be used. Never changed after indexing. */
   readonly byId: ReadonlyMap<RecordId, Fetched>;
+  /**
+   * The organization of every entry, valid or not (buildLookup refuses an
+   * entry without a readable one); undefined only for an empty set.
+   */
+  readonly organizationId: OrganizationId | undefined;
 }
 
 /** Lookups made by `indexRecords`; anything else passed as one is refused. */
@@ -367,7 +372,7 @@ function buildLookup(records: unknown): RecordLookup {
     );
   }
   const lookup: RecordLookup = Object.freeze({ size: byId.size });
-  LOOKUPS.set(lookup, { byId });
+  LOOKUPS.set(lookup, { byId, organizationId: organization });
   return lookup;
 }
 
@@ -512,11 +517,26 @@ export function currentAncestry(
 export function recordsById(
   records: unknown,
 ): Validated<ReadonlyMap<RecordId, CatalogRecord | undefined>> {
+  const set = recordSet(records);
+  return set.ok ? { ok: true, value: set.value.byId } : set;
+}
+
+/**
+ * For other modules in this package (not exported from the package): like
+ * `recordsById`, with the organization of the set. That organization is
+ * read from every entry, valid or not (an entry without a readable one
+ * refuses the set), so a set of another organization's invalid records
+ * still has that organization. Undefined only for an empty set. Never throws.
+ */
+export function recordSet(records: unknown): Validated<{
+  readonly byId: ReadonlyMap<RecordId, CatalogRecord | undefined>;
+  readonly organizationId: OrganizationId | undefined;
+}> {
   try {
     const state = lookupFor(records);
-    const out = new Map<RecordId, CatalogRecord | undefined>();
-    for (const [id, got] of state.byId) out.set(id, got.ok ? got.record : undefined);
-    return { ok: true, value: out };
+    const byId = new Map<RecordId, CatalogRecord | undefined>();
+    for (const [id, got] of state.byId) byId.set(id, got.ok ? got.record : undefined);
+    return { ok: true, value: { byId, organizationId: state.organizationId } };
   } catch (error) {
     return failure(error);
   }

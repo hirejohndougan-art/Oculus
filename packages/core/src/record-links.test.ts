@@ -280,14 +280,27 @@ describe("makeRecordLinkChecker", () => {
     }
   });
 
-  it("knows no records when made from an empty set", () => {
+  it("knows no records when made from an empty set for an organization", () => {
     const { item } = sample();
-    const links = linkChecker([]);
+    const links = ok(makeRecordLinkChecker([], ORG));
     expect(check(item, { ...CHECKERS, record_link: links, place: links })).toEqual([
       "unknown_record",
       "unknown_record",
       "unknown_record",
       "unknown_record",
+    ]);
+  });
+
+  // Changed in T-015a: an empty set with no organization makes a checker that
+  // belongs to nobody, which refuses every link (before: unknown_record).
+  it("refuses every link when made from an empty set for no organization", () => {
+    const { item } = sample();
+    const links = linkChecker([]);
+    expect(check(item, { ...CHECKERS, record_link: links, place: links })).toEqual([
+      "no_organization_checker",
+      "no_organization_checker",
+      "no_organization_checker",
+      "no_organization_checker",
     ]);
   });
 
