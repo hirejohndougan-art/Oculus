@@ -97,6 +97,22 @@ describe("trustProxy", () => {
     "2001:db8::/16",
     "10.0.0.0/7",
     "fc00::/6",
+    // IPv6 blocks that carry IPv4 addresses get the IPv4 rule.
+    "::ffff:0:0/96",
+    "::ffff:0.0.0.0/96",
+    "::ffff:8.0.0.0/104",
+    "::/96",
+    "::/32",
+    "::/64",
+    "64:ff9b::/96",
+    "64:ff9b::/32",
+    "64:ff9b::808:0/104",
+    "2002::/16",
+    "2002::/24",
+    "2002:800::/24",
+    // Zone ids.
+    "fe80::1%eth0",
+    "fe80::%eth0/64",
   ])("refuses to start with %j", async (value) => {
     expect(() => trustedProxyFromEnv({ [TRUSTED_PROXY_ENV]: value })).toThrow(TRUSTED_PROXY_ENV);
     await expect(testServer({ env: { [TRUSTED_PROXY_ENV]: value } })).rejects.toThrow(
@@ -115,6 +131,13 @@ describe("trustProxy", () => {
       "127.0.0.0/8",
       "fd00::/8",
       "::1/128",
+      "::ffff:203.0.113.0/120",
+      "::ffff:10.0.0.0/104",
+      "::ffff:c633:6400/112",
+      "64:ff9b::cb00:7100/120",
+      "2002:cb00:7100::/40",
+      "2002:0a00::/24",
+      "::ffff:203.0.113.9",
     ]) {
       expect(trustedProxyFromEnv({ [TRUSTED_PROXY_ENV]: value }), value).toEqual([value]);
     }
