@@ -129,7 +129,13 @@ async function commitDroppingProxy(url: string): Promise<{ url: string; close():
     client.on("error", () => undefined);
     upstream.on("error", () => undefined);
   });
-  await new Promise<void>((resolve) => server.listen(join(dir, `.s.PGSQL.${port}`), resolve));
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(join(dir, `.s.PGSQL.${port}`), () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
   target.searchParams.set("host", dir);
   return {
     url: target.toString(),
@@ -556,6 +562,67 @@ CREATE CONSTRAINT TRIGGER unrecord AFTER INSERT ON public.oculus_migrations
     expect((await recorded(db.url)).map((r) => r.name)).toEqual(["0001_migrations_table.sql"]);
   });
 
+  it("stops with applied_not_recorded when a re-deferred trigger deletes the file's row at the runner's COMMIT", async () => {
+    // r1's deferred trigger runs at SET CONSTRAINTS ALL IMMEDIATE, defers
+    // everything again and queues r2's, which then runs at the COMMIT, after
+    // the runner's last look at its row before the COMMIT.
+    const db = await database();
+    const dir = migrationsDir({
+      "0002_redefer.sql": `CREATE FUNCTION unrecord_late() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  DELETE FROM public.oculus_migrations WHERE name = '0002_redefer.sql';
+  RETURN NULL;
+END $$;
+CREATE FUNCTION redefer() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  SET CONSTRAINTS ALL DEFERRED;
+  INSERT INTO r2 VALUES (1);
+  RETURN NULL;
+END $$;
+CREATE TABLE r1 (id int);
+CREATE TABLE r2 (id int);
+CREATE CONSTRAINT TRIGGER r1_redefer AFTER INSERT ON r1 DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION redefer();
+CREATE CONSTRAINT TRIGGER r2_unrecord AFTER INSERT ON r2 DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION unrecord_late();
+INSERT INTO r1 VALUES (1);`,
+      "0003_after.sql": "CREATE TABLE after (id int);",
+    });
+    const error = await refusal(migrate({ connectionString: db.url, dir }));
+    expect(error.code).toBe("applied_not_recorded");
+    expect(error.message).toContain("0002_redefer.sql was applied");
+    expect(error.message).toMatch(/record it by hand/);
+    expect(error.message).toMatch(/run stopped/);
+    // Applied (its tables are there), not recorded, and nothing after it ran.
+    expect(await tables(db.url)).toEqual(["oculus_migrations", "r1", "r2"]);
+    expect((await recorded(db.url)).map((r) => r.name)).toEqual(["0001_migrations_table.sql"]);
+  });
+
+  it("reports a re-deferred foreign key that fails at the runner's COMMIT as failed, keeping nothing", async () => {
+    const db = await database();
+    const dir = migrationsDir({
+      "0002_late_fk.sql": `CREATE TABLE p (id int PRIMARY KEY);
+CREATE TABLE c (p_id int REFERENCES p DEFERRABLE INITIALLY DEFERRED);
+CREATE FUNCTION redefer() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  SET CONSTRAINTS ALL DEFERRED;
+  INSERT INTO c VALUES (1);
+  RETURN NULL;
+END $$;
+CREATE TABLE r1 (id int);
+CREATE CONSTRAINT TRIGGER r1_redefer AFTER INSERT ON r1 DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION redefer();
+INSERT INTO r1 VALUES (1);`,
+      "0003_after.sql": "CREATE TABLE after (id int);",
+    });
+    const error = await refusal(migrate({ connectionString: db.url, dir }));
+    expect(error.code).toBe("failed");
+    expect(error.message).toContain("0002_late_fk.sql failed at COMMIT");
+    expect(error.message).toMatch(/foreign key/);
+    expect(await tables(db.url)).toEqual(["oculus_migrations"]);
+    expect((await recorded(db.url)).map((r) => r.name)).toEqual(["0001_migrations_table.sql"]);
+  });
+
   it("doesn't lose the lock when a file locks pg_database", async () => {
     const db = await database();
     const dir = migrationsDir({
@@ -582,8 +649,11 @@ CREATE CONSTRAINT TRIGGER unrecord AFTER INSERT ON public.oculus_migrations
       expect(error.message).toMatch(/CONNECTION LIMIT/);
       expect((error.cause as { code?: string }).code).toBe("53300");
     } finally {
-      await admin.runScript(`DROP ROLE IF EXISTS ${role}`).catch(() => undefined);
-      await admin.close();
+      try {
+        await admin.runScript(`DROP ROLE IF EXISTS ${role}`);
+      } finally {
+        await admin.close();
+      }
     }
     expect(await tables(db.url)).toEqual([]);
   });
@@ -862,6 +932,35 @@ describe("two runners at once", () => {
       expect(error.message).toMatch(/statement_timeout \(200ms\)/);
     } finally {
       await alterDatabase(db, "RESET statement_timeout");
+      await holder.close();
+    }
+    expect(await tables(db.url)).toEqual([]);
+  });
+
+  it("reports a transaction_timeout (PostgreSQL 17+) that ends the wait for the lock as lock_timeout", async () => {
+    const holder = await openSession(db.url);
+    try {
+      const [setting] = await holder.rows<{ t: string | null }>(
+        sql`SELECT current_setting('transaction_timeout', true) AS t`,
+      );
+      const [version] = await holder.rows<{ v: string }>(
+        sql`SELECT current_setting('server_version_num') AS v`,
+      );
+      if (Number(version?.v) < 170000) {
+        // Before 17 the setting doesn't exist, and the runner leaves it alone.
+        expect(setting?.t).toBeNull();
+        return;
+      }
+      await alterDatabase(db, "SET transaction_timeout = '200ms'");
+      try {
+        await holder.execute(sql`SELECT pg_advisory_lock(${MIGRATION_LOCK_KEY})`);
+        const error = await refusal(migrate({ connectionString: db.url, lockTimeoutMs: 20_000 }));
+        expect(error.code).toBe("lock_timeout");
+        expect(error.message).toMatch(/transaction_timeout \(200ms\)/);
+      } finally {
+        await alterDatabase(db, "RESET transaction_timeout");
+      }
+    } finally {
       await holder.close();
     }
     expect(await tables(db.url)).toEqual([]);

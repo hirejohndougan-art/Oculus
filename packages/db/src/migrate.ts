@@ -23,7 +23,9 @@
  * transaction ID, in progress, inside a block; after a failure, the runner's
  * savepoint must still be there) and the runner's own COMMIT or ROLLBACK is
  * what ends it. Before recording a file the runner runs its deferred triggers
- * and constraints (SET CONSTRAINTS ALL IMMEDIATE) and checks its row is there.
+ * and constraints (SET CONSTRAINTS ALL IMMEDIATE) and checks its row is there;
+ * after the COMMIT it checks the row once more, and if a trigger that ran at
+ * COMMIT removed it the run stops as `applied_not_recorded`.
  * Before each file, before its COMMIT, after it and after a failure the
  * runner checks that its lock connection is alive and still holds the lock;
  * if not, the run stops as `lock_lost`. The lock connection turns off
@@ -82,6 +84,7 @@ export class MigrationError extends Error {
       | "lock_timeout"
       | "lock_lost"
       | "commit_unknown"
+      | "applied_not_recorded"
       | "connection_failed"
       | "failed",
     message: string,
@@ -299,8 +302,9 @@ async function preparedByFile(session: Session, started: Started): Promise<strin
  *
  * It reads only functions over shared memory (`pg_lock_status()` and
  * `pg_stat_get_activity()`, which the `pg_locks` and `pg_stat_activity` views
- * wrap), never a catalog table, so a file holding a lock on one (say
- * `LOCK pg_catalog.pg_database`) can't make this check wait and fail.
+ * wrap), and takes no catalog table locks beyond parsing, so a file holding a
+ * lock on a catalog (say `LOCK pg_catalog.pg_database`) can't make this check
+ * wait and fail.
  */
 async function lockHeld(lock: Lock): Promise<boolean> {
   try {
@@ -497,6 +501,25 @@ async function applyOne(session: Session, lock: Lock, file: MigrationFile): Prom
       }
     }
   }
+  // A deferred trigger can still run at the runner's COMMIT, after the row was
+  // read above: one fired by SET CONSTRAINTS ALL IMMEDIATE can defer
+  // constraints again and queue another, which then deletes or changes the
+  // file's row. The file is in by then; check its row is too.
+  const recordedRow = await session
+    .rows<{ present: boolean }>(
+      sql`SELECT EXISTS (SELECT 1 FROM public.oculus_migrations
+                         WHERE name = ${file.name} AND sha256 = ${file.sha256}) AS present`,
+    )
+    .then(
+      ([row]) => row?.present === true,
+      () => false,
+    );
+  if (!recordedRow) {
+    throw new MigrationError(
+      "applied_not_recorded",
+      `${file.name} was applied, but its record in public.oculus_migrations is missing or changed (or could not be read) after the COMMIT (a deferred trigger in the file, for example). A person must check the database and record it by hand (its name and SHA-256 ${file.sha256}). The run stopped there.`,
+    );
+  }
   // The lock can still be lost between the last check and the COMMIT (the
   // network, an administrator). The file is in by then; say so, and stop.
   if (!(await lockHeld(lock))) {
@@ -537,11 +560,17 @@ export async function migrate(options: MigrateOptions): Promise<MigrateResult> {
     // takes: a role, database or server idle_session_timeout would end it and
     // lose the lock. It never stays in a transaction, but the same goes for
     // idle_in_transaction_session_timeout.
-    const [settings] = await lockSession.rows<{ statementTimeout: string }>(
+    // transaction_timeout exists from PostgreSQL 17 (null before); like
+    // statement_timeout it bounds the wait below and is turned off after it.
+    const [settings] = await lockSession.rows<{
+      statementTimeout: string;
+      transactionTimeout: string | null;
+    }>(
       sql`SELECT pg_catalog.set_config('idle_session_timeout', '0', false),
                  pg_catalog.set_config('idle_in_transaction_session_timeout', '0', false),
                  pg_catalog.set_config('lock_timeout', ${String(lockTimeoutMs)}, false),
-                 pg_catalog.current_setting('statement_timeout') AS "statementTimeout"`,
+                 pg_catalog.current_setting('statement_timeout') AS "statementTimeout",
+                 pg_catalog.current_setting('transaction_timeout', true) AS "transactionTimeout"`,
     );
     try {
       await lockSession.execute(sql`SELECT pg_catalog.pg_advisory_lock(${MIGRATION_LOCK_KEY})`);
@@ -561,13 +590,27 @@ export async function migrate(options: MigrateOptions): Promise<MigrateResult> {
           { cause: error },
         );
       }
+      if (code === "25P04") {
+        // PostgreSQL 17+: transaction_timeout ends the session, not just the wait.
+        throw new MigrationError(
+          "lock_timeout",
+          `The wait for the migration lock was ended before lockTimeoutMs (${String(lockTimeoutMs)} ms): the role, database or server sets transaction_timeout (${settings?.transactionTimeout ?? "unknown"}). Another migration run is probably holding the lock.`,
+          { cause: error },
+        );
+      }
       throw error;
     }
     try {
-      // Only now: until the lock is taken the role's statement_timeout bounds
-      // the wait (above). The checks below must not be cut short by it, and
-      // lock_timeout still bounds any lock wait they could meet.
+      // Only now: until the lock is taken the role's statement_timeout (and,
+      // from PostgreSQL 17, transaction_timeout) bounds the wait (above). The
+      // checks below must not be cut short by them, and lock_timeout still
+      // bounds any lock wait they could meet.
       await lockSession.execute(sql`SELECT pg_catalog.set_config('statement_timeout', '0', false)`);
+      if (typeof settings?.transactionTimeout === "string") {
+        await lockSession.execute(
+          sql`SELECT pg_catalog.set_config('transaction_timeout', '0', false)`,
+        );
+      }
       const [backend] = await lockSession.rows<{ pid: number }>(
         sql`SELECT pg_catalog.pg_backend_pid() AS pid`,
       );
