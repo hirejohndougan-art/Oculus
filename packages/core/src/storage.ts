@@ -953,10 +953,12 @@ export function whereabouts(log: MoveLog, recordId: RecordId): Validated<Whereab
 }
 
 /**
- * Every record that is away (see `Whereabouts.away`: somewhere other than its
- * normal location, or out on a temporary move before it was ever placed;
- * mockup Whereabouts), soonest due back first, those with no date last. A
- * record never placed stays away until a placement records its home.
+ * Every record that is away (see `Whereabouts.away`: with an expected return
+ * date outstanding, somewhere other than its normal location, or out on a
+ * temporary move before it was ever placed; mockup Whereabouts), soonest due
+ * back first, those with no date last. While a date is outstanding only a
+ * `return` brings a record back: one never placed needs a placement to give
+ * it a home and then a return there.
  */
 export function awayFromNormal(log: MoveLog): Validated<readonly Whereabouts[]> {
   const data = logData(log);
@@ -1189,7 +1191,7 @@ function historyIssues(
           pathOf(move),
           "not_normal_location",
           normal === undefined
-            ? "This record has no normal location yet, so it can't be returned. Record a placement instead."
+            ? "This record has no normal location yet, so it can't be returned. Record a placement to give it a home, then a return there: while an expected return date is outstanding, only a return brings it back."
             : "A return must go back to the record's normal location at the time.",
         ),
       );

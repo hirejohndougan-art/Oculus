@@ -616,9 +616,10 @@ describe("whereabouts", () => {
     expect(codes(addMove(log, move(print, shelfB.id, "2026-11-22", "return")))).toEqual([
       "not_normal_location",
     ]);
-    expect(codes(addMove(log, move(tape, box1.id, "2026-11-22", "return")))).toEqual([
-      "not_normal_location",
-    ]);
+    const unplaced = addMove(log, move(tape, box1.id, "2026-11-22", "return"));
+    expect(codes(unplaced)).toEqual(["not_normal_location"]);
+    // The message sends staff the way that works: a placement, then a return.
+    expect(unplaced.ok ? "" : unplaced.issues[0]?.message).toMatch(/placement.*then a return/);
     expect(codes(addMove(log, move(tape, conservator.id, "2026-11-22", "placement")))).toEqual([
       "external_normal_location",
     ]);
