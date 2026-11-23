@@ -183,6 +183,18 @@ export type {
   RecordTypeRegistry,
 } from "./record-types.js";
 
+export {
+  RECORD_TYPE_CHANGE_CODES,
+  recordTypeChanges,
+  recordTypeDeletion,
+} from "./record-type-changes.js";
+export type {
+  RecordTypeChangeCode,
+  RecordTypeChange,
+  RecordTypeChanges,
+  RecordTypeUse,
+} from "./record-type-changes.js";
+
 export { TEMPLATE_CHANGE_CODES, MAX_LISTED_RECORDS, templateChanges } from "./template-changes.js";
 export type { TemplateChangeCode, TemplateChange, TemplateChanges } from "./template-changes.js";
 
