@@ -1,5 +1,5 @@
 /**
- * Links between records (roadmap T-015, decision D-039).
+ * Links between records (roadmap T-015, decisions D-039 and D-045).
  *
  * A `record_link` field (templates.ts) holds `{ recordId, label }`: a link
  * from one record to another of the same organization, such as an item's
@@ -32,7 +32,24 @@
  * removed or changed kind. `publicOutput` reads the same snapshot (through
  * `linkTargetKind`) to decide whether a link may name the record it points
  * at: only one made by this function, for the record's own organization,
- * can; with any other checker, links go out as their labels alone.
+ * can.
+ *
+ * **Public sites show nothing of a link they can't follow** (D-045). A
+ * `record_link` whose record is unpublished, held back by a deed (D-043),
+ * another organization's, or can't be vouched for (any other checker) puts
+ * nothing in public output: no ID, no label, no placeholder, since a label
+ * copied from the record (a donor's name, a private item's title) would
+ * reveal it. The public view (`publicView`) holds no `record_link` values
+ * at all. Staff views (the effective record) keep every link.
+ *
+ * **A place value naming a place record shows its name only when vouched
+ * for** (D-048): the checker given as `checkers.place` (to `effectiveRecord`
+ * and to `publicOutput`) must be one made here, for the record's own
+ * organization, holding that record as a place. Then the name (and gazetteer
+ * URI) is shown even when the place record isn't published, never its ID or
+ * a link. Otherwise the whole value is left out of the public view and
+ * output: it may be another kind of value, such as a record link's label,
+ * left in a field a template edit made a place.
  *
  * Checkers never throw, and return frozen lists of problems whose paths are
  * relative to the value (`["recordId"]`).
@@ -44,17 +61,9 @@ import { organizationIdOf, type OrganizationId } from "./organizations.js";
 import { recordsById } from "./effective.js";
 import type { FieldProblem, FieldValueChecker } from "./templates.js";
 import { isPlainObject } from "./issues.js";
+import { markLinkChecker } from "./record-link-brand.js";
 
-/** What `makeRecordLinkChecker` remembers about each checker it made. */
-interface MadeLinkChecker {
-  /** The organization of the records; undefined when made from an empty set. */
-  readonly organizationId: OrganizationId | undefined;
-  /** Each record's kind by ID, or undefined for an ID that can't be used. */
-  readonly kinds: ReadonlyMap<RecordId, RecordKind | undefined>;
-}
-
-/** Keyed by the checker itself, never by shape. */
-const MADE = new WeakMap<object, MadeLinkChecker>();
+export { isOtherOrganizationsLinkChecker, linkTargetKind } from "./record-link-brand.js";
 
 const NONE: readonly FieldProblem[] = Object.freeze([]);
 
@@ -162,39 +171,6 @@ export function makeRecordLinkChecker(records: unknown): Validated<FieldValueChe
       return UNREADABLE;
     }
   };
-  MADE.set(checker, Object.freeze({ organizationId, kinds }));
+  markLinkChecker(checker, organizationId, kinds);
   return { ok: true, value: checker };
-}
-
-/**
- * The kind of the record `recordId` names, when `checker` was made by
- * `makeRecordLinkChecker` from `organizationId`'s records and holds a usable
- * record with that ID; otherwise undefined (any other checker, another
- * organization's, an unknown or unusable ID). For `public-output.ts` only
- * (not exported from the package). Never throws.
- */
-export function linkTargetKind(
-  checker: unknown,
-  organizationId: unknown,
-  recordId: unknown,
-): RecordKind | undefined {
-  if (typeof checker !== "function" || !isRecordId(recordId)) return undefined;
-  const made = MADE.get(checker);
-  if (made?.organizationId === undefined || made.organizationId !== organizationId) {
-    return undefined;
-  }
-  return made.kinds.get(recordId);
-}
-
-/**
- * True for a checker `makeRecordLinkChecker` made from the records of an
- * organization other than `organizationId`. For `public-output.ts` only.
- */
-export function isOtherOrganizationsLinkChecker(
-  checker: unknown,
-  organizationId: unknown,
-): boolean {
-  if (typeof checker !== "function") return false;
-  const made = MADE.get(checker)?.organizationId;
-  return made !== undefined && made !== organizationId;
 }

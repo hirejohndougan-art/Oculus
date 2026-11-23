@@ -10,6 +10,8 @@ import {
   newRecordId,
   publicOutput,
   publicView,
+  type CatalogRecord,
+  type FieldTemplate,
   type PublicOutput,
   type PublicRecord,
   type RecordId,
@@ -28,7 +30,7 @@ import {
   field,
   record,
   template,
-  viewOf,
+  viewOf as fixtureViewOf,
   idsOf,
   CHECKERS,
   RIGHTS_ENTRY,
@@ -44,6 +46,21 @@ function codes(result: Validated<unknown>): string[] {
   return result.ok ? [] : result.issues.map((i) => i.code);
 }
 
+const PLACE_ID = newRecordId();
+/** The organization's place record, so a place value naming it is vouched for (D-048). */
+const PLACE = record("place", "Dickinson", {}, {}, PLACE_ID);
+const WITH_PLACES = { ...CHECKERS, place: linkChecker([PLACE]) };
+
+/** A view made with the place checker, as publishing does. */
+function viewOf(
+  records: readonly CatalogRecord[],
+  id: RecordId,
+  tpl?: FieldTemplate,
+  checkers: Record<string, unknown> = WITH_PLACES,
+): PublicRecord {
+  return fixtureViewOf(records, id, tpl, checkers);
+}
+
 function out(
   view: PublicRecord,
   published: readonly RecordId[] = [view.id],
@@ -53,12 +70,10 @@ function out(
     baseUrl: BASE,
     accessions: accessionsFor(view),
     published,
-    checkers: CHECKERS,
+    checkers: WITH_PLACES,
     identifiers: idsOf(view),
   });
 }
-
-const PLACE_ID = newRecordId();
 
 /** An object with a value in every mapped field. */
 function fullObject(id: RecordId = newRecordId()) {
@@ -257,13 +272,26 @@ describe("publicOutput: places and the published list", () => {
     expect(o.dublinCore.spatial).toEqual(["Dickinson (Tex.)"]);
   });
 
-  it("gives a published place record's name only when no record link checker vouches for it", () => {
-    // Before D-039 the published list alone was enough, which would link an
-    // ID of another organization's published place (D-030).
+  it("shows nothing of a place naming a place record no place checker vouches for (D-048)", () => {
+    // Before D-039 the published list alone was enough to link it, which
+    // would link an ID of another organization's published place (D-030).
+    // Before D-048 its name still went out, though the value might be a
+    // record link's label left in a field a template edit made a place.
     const item = fullObject();
-    const o = ok(out(viewOf([item], item.id), [item.id, PLACE_ID]));
-    expect(o.jsonLd["dcterms:spatial"]).toEqual({ "rdfs:label": "Dickinson (Tex.)" });
+    const view = viewOf([item], item.id, undefined, CHECKERS);
+    expect(view.fields.places).toBeUndefined();
+    const o = ok(
+      publicOutput(view, MAPPING, {
+        baseUrl: BASE,
+        accessions: accessionsFor(view),
+        published: [item.id, PLACE_ID],
+        checkers: CHECKERS,
+        identifiers: idsOf(view),
+      }),
+    );
+    expect(o.jsonLd["dcterms:spatial"]).toBeUndefined();
     expect(everything(o)).not.toContain(PLACE_ID);
+    expect(everything(o)).not.toContain("Dickinson (Tex.)");
   });
 
   it("gives an unpublished place record's name only, never its ID", () => {

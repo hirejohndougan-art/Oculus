@@ -1,6 +1,7 @@
-// Attack tests for links between records (T-015, D-039): trying to get an
-// unpublished or another organization's record ID, title or values into
-// public output through a record_link or a place's recordId.
+// Attack tests for links between records (T-015, D-039, D-045): trying to
+// get an unpublished, held back or another organization's record ID, title,
+// values or link label into public output through a record_link or a place's
+// recordId.
 import { afterEach, describe, expect, it } from "vitest";
 import {
   checkRecordAgainstTemplate,
@@ -131,7 +132,11 @@ describe("an unpublished record linked to never shows", () => {
     const checkers = { ...CHECKERS, record_link: links, place: links };
     const o = ok(output(viewOf(all, item.id, checkers), [item.id], checkers));
     expectNothingOf(everything(o), agent, place);
-    expect(o.dublinCore.creator).toEqual(["Unknown photographer"]);
+    // Not even the label (D-045); a place keeps its own name.
+    expect(o.dublinCore.creator).toBeUndefined();
+    expect(o.dublinCore.relation).toBeUndefined();
+    expect(everything(o)).not.toContain("Unknown photographer");
+    expect(o.dublinCore.spatial).toEqual(["Dickinson"]);
   });
 
   it("leaves out the ID even when the label is blank-looking or odd text", () => {
@@ -167,7 +172,8 @@ describe("an unpublished record linked to never shows", () => {
     const links = linkChecker(all);
     const checkers = { ...CHECKERS, record_link: links };
     const o = ok(output(viewOf(all, item.id, checkers), [item.id], checkers));
-    expect(o.dublinCore.subject).toEqual(["The family"]);
+    expect(o.dublinCore.subject).toBeUndefined();
+    expect(everything(o)).not.toContain("The family");
     expectNothingOf(everything(o), agent, fonds);
   });
 
@@ -221,6 +227,223 @@ describe("an unpublished record linked to never shows", () => {
   });
 });
 
+describe("D-045: a link the public may not follow leaves no trace", () => {
+  /** An agent whose title is a private name, copied into the link label. */
+  const privateName = "SECRET-donor-name";
+
+  function linking(
+    links: { creator?: unknown; related?: unknown },
+    ...others: readonly CatalogRecord[]
+  ): { item: CatalogRecord; all: CatalogRecord[]; checkers: Record<string, unknown> } {
+    const item = withKey(record("object", "Postcard", { rights: { uri: CNE }, ...links } as never));
+    const all = [...others, item];
+    const made = linkChecker(all);
+    return { item, all, checkers: { ...CHECKERS, record_link: made, place: made } };
+  }
+
+  it("puts out no ID, label or placeholder for a label copied from an unpublished record", () => {
+    const agent = withKey(record("agent", privateName, {}));
+    const { item, all, checkers } = linking(
+      { creator: { recordId: agent.id, label: privateName } },
+      agent,
+    );
+    const effective = ok(effectiveRecord(item.id, all, () => LINK_TPL, { checkers }));
+    const view = publicView(effective);
+    if (view === undefined) throw new Error("no view");
+    expect(JSON.stringify(view)).not.toContain("SECRET");
+    const o = ok(output(view, [item.id], checkers));
+    expectNothingOf(everything(o), agent);
+    expect(Object.keys(o.dublinCore)).not.toContain("creator");
+    expect(Object.keys(o.jsonLd)).not.toContain("dcterms:creator");
+    expect(o.oaiDcXml).not.toContain("dc:creator");
+    // Staff still see the link.
+    expect(effective.fields.creator).toEqual({ recordId: agent.id, label: privateName });
+  });
+
+  it("keeps only the links that may be named in a list, with no gap or empty value", () => {
+    const hidden = withKey(record("agent", privateName, {}));
+    const shown = withKey(record("event", "Storm of 1900", {}));
+    const { item, all, checkers } = linking(
+      {
+        related: [
+          { recordId: hidden.id, label: privateName },
+          { recordId: shown.id, label: "Storm of 1900" },
+          { recordId: hidden.id, label: `${privateName}-again` },
+        ],
+      },
+      hidden,
+      shown,
+    );
+    const o = ok(output(viewOf(all, item.id, checkers), [item.id, shown.id], checkers));
+    expectNothingOf(everything(o), hidden);
+    expect(o.dublinCore.relation).toEqual(["Storm of 1900"]);
+    expect(o.jsonLd["dcterms:relation"]).toEqual({
+      "@id": BASE + shown.id,
+      "rdfs:label": "Storm of 1900",
+    });
+    expect(o.oaiDcXml.match(/<dc:relation>/g)).toHaveLength(1);
+    expect(o.oaiDcXml).not.toMatch(/<dc:relation\s*\/>|<dc:relation><\/dc:relation>/);
+  });
+
+  it("leaves the term out of every form when no link in a list may be named", () => {
+    const a = withKey(record("agent", privateName, {}));
+    const b = withKey(record("event", "SECRET-event", {}));
+    const { item, all, checkers } = linking(
+      {
+        related: [
+          { recordId: a.id, label: privateName },
+          { recordId: b.id, label: "SECRET-event-label" },
+        ],
+      },
+      a,
+      b,
+    );
+    const o = ok(output(viewOf(all, item.id, checkers), [item.id], checkers));
+    expectNothingOf(everything(o), a, b);
+    expect(o.dublinCore.relation).toBeUndefined();
+    expect(o.jsonLd["dcterms:relation"]).toBeUndefined();
+    expect(o.oaiDcXml).not.toContain("dc:relation");
+  });
+
+  it("puts out nothing for a held-back-kind target published without the records", () => {
+    // An object can't be shown to be clear of deed holds without `records`
+    // (D-043), so its link is treated as unpublished: nothing goes out.
+    const other = withKey(record("object", "SECRET-held-object", { rights: { uri: CNE } }));
+    const { item, all, checkers } = linking(
+      { related: [{ recordId: other.id, label: "SECRET-held-label" }] },
+      other,
+    );
+    const o = ok(output(viewOf(all, item.id, checkers), [item.id, other.id], checkers));
+    expectNothingOf(everything(o), other);
+  });
+
+  it("never holds a link label in the public view, even to a published record", () => {
+    const agent = withKey(record("agent", "Photographer", {}));
+    const { item, all, checkers } = linking(
+      { creator: { recordId: agent.id, label: "SECRET-view-label" } },
+      agent,
+    );
+    const view = viewOf(all, item.id, checkers);
+    expect(JSON.stringify(view)).not.toContain("SECRET");
+    expect(view.fields.creator).toBeUndefined();
+    // Output adds it, because the record may be named.
+    const o = ok(output(view, [item.id, agent.id], checkers));
+    expect(o.jsonLd["dcterms:creator"]).toEqual({
+      "@id": BASE + agent.id,
+      "rdfs:label": "SECRET-view-label",
+    });
+  });
+});
+
+describe("D-048: a place value shows its name only when its place record is vouched for", () => {
+  // A template edit made a record_link field a place. The stored value
+  // { recordId, label } still fits a place, but its label is a record link's
+  // label, here copied from an unpublished donor agent.
+  const PLACE_TPL = template(
+    [
+      ...FIELDS.filter((f) => f.key !== "creator"),
+      field({ key: "creator", label: "Creator", kind: "place" }),
+    ] satisfies readonly FieldDefinition[],
+    "links",
+  );
+  const PLACE_MAPPING = {
+    template: "links",
+    entries: [
+      { field: "rights", term: "rights" },
+      { field: "creator", term: "spatial" },
+      { field: "places", term: "coverage" },
+    ],
+  };
+
+  function publish(records: CatalogRecord[], id: RecordId, checkers: Record<string, unknown>) {
+    const effective = ok(effectiveRecord(id, records, () => PLACE_TPL, { checkers: checkers }));
+    const view = publicView(effective);
+    if (view === undefined) throw new Error("no view");
+    const result = publicOutput(view, PLACE_MAPPING, {
+      baseUrl: BASE,
+      accessions: accessionsFor(view),
+      published: records.map((r) => r.id),
+      checkers: checkers,
+    });
+    return { effective, view, result };
+  }
+
+  it("withholds a record link's label left in a field made a place, with no place checker", () => {
+    const donor = withKey(record("agent", "SECRET-donor-name", {}));
+    const item = withKey(
+      record("object", "Postcard", {
+        rights: { uri: CNE },
+        creator: { recordId: donor.id, label: "SECRET-donor-name" },
+      }),
+    );
+    const { effective, view, result } = publish([donor, item], item.id, { ...CHECKERS });
+    expect(JSON.stringify(view)).not.toContain("SECRET");
+    expect(view.fields.creator).toBeUndefined();
+    const o = ok(result);
+    expectNothingOf(everything(o), donor);
+    expect(o.dublinCore.spatial).toBeUndefined();
+    // Staff still see it.
+    expect(effective.fields.creator).toEqual({ recordId: donor.id, label: "SECRET-donor-name" });
+  });
+
+  it("withholds it when a lax place checker lets a non-place record through", () => {
+    const donor = withKey(record("agent", "SECRET-donor-name", {}));
+    const item = withKey(
+      record("object", "Postcard", {
+        rights: { uri: CNE },
+        creator: { recordId: donor.id, label: "SECRET-donor-name" },
+      }),
+    );
+    const { view, result } = publish([donor, item], item.id, { ...CHECKERS, place: lax });
+    expect(JSON.stringify(view)).not.toContain("SECRET");
+    expectNothingOf(everything(ok(result)), donor);
+  });
+
+  it("withholds it with the organization's place checker, which knows the record isn't a place", () => {
+    const donor = withKey(record("agent", "SECRET-donor-name", {}));
+    const item = withKey(
+      record("object", "Postcard", {
+        rights: { uri: CNE },
+        creator: { recordId: donor.id, label: "SECRET-donor-name" },
+      }),
+    );
+    const all = [donor, item];
+    const { view, result } = publish(all, item.id, { ...CHECKERS, place: linkChecker(all) });
+    expect(JSON.stringify(view)).not.toContain("SECRET");
+    // Left out of the view, so output never sees it (the checker refuses it when saving).
+    expectNothingOf(everything(ok(result)), donor);
+  });
+
+  it("keeps only the vouched places of a list, with the name of an unpublished place record", () => {
+    const place = withKey(record("place", "Dickinson", {}));
+    const donor = withKey(record("agent", "SECRET-donor-name", {}));
+    const item = withKey(
+      record("object", "Postcard", {
+        rights: { uri: CNE },
+        places: [
+          { label: "Dickinson (Tex.)", recordId: place.id },
+          { label: "SECRET-donor-name", recordId: donor.id },
+          { label: "Galveston Bay" },
+        ],
+      }),
+    );
+    const all = [place, donor, item];
+    // Own values reach the view unchecked (D-013); the view still keeps
+    // only the places the organization's place checker vouches for.
+    const made = linkChecker(all);
+    const effective = ok(
+      effectiveRecord(item.id, all, () => PLACE_TPL, { checkers: { ...CHECKERS, place: made } }),
+    );
+    expect(effective.notes.map((n) => n.code)).toEqual([]);
+    const view = publicView(effective);
+    expect(view?.fields.places).toEqual([
+      { label: "Dickinson (Tex.)" },
+      { label: "Galveston Bay" },
+    ]);
+    expect(JSON.stringify(view)).not.toContain("SECRET");
+  });
+});
+
 describe("another organization's record is never linked or named", () => {
   const otherOrg = newOrganizationId();
   const theirs = {
@@ -261,21 +484,24 @@ describe("another organization's record is never linked or named", () => {
       [item.id, theirs.id, theirPlace.id],
       checkers,
     );
-    expect(codes(result)).toEqual(["unknown_record", "unknown_record"]);
+    // The place value isn't vouched for, so the view never held it (D-048);
+    // the record link is still refused.
+    expect(codes(result)).toEqual(["unknown_record"]);
     expectNothingOf(JSON.stringify(result), theirs, theirPlace);
   });
 
-  it("gives the label only when a lax checker lets their ID through", () => {
+  it("gives nothing, not even the label, when a lax checker lets their ID through", () => {
     const item = ours();
     const checkers = { ...CHECKERS, record_link: lax, place: lax };
     const o = ok(
       output(viewOf([item], item.id, checkers), [item.id, theirs.id, theirPlace.id], checkers),
     );
-    expect(o.dublinCore.creator).toEqual(["Their agent"]);
+    expect(o.dublinCore.creator).toBeUndefined();
+    expect(everything(o)).not.toContain("Their agent");
     expectNothingOf(everything(o), theirs, theirPlace);
   });
 
-  it("gives the label only for a place with no place checker, though their ID is published", () => {
+  it("gives nothing for a place with no place checker, though their ID is published (D-048)", () => {
     const item = withKey(
       record("object", "Postcard", {
         rights: { uri: CNE },
@@ -283,7 +509,8 @@ describe("another organization's record is never linked or named", () => {
       }),
     );
     const o = ok(output(viewOf([item], item.id, CHECKERS), [item.id, theirPlace.id], CHECKERS));
-    expect(o.jsonLd["dcterms:spatial"]).toEqual({ "rdfs:label": "Their place" });
+    expect(o.jsonLd["dcterms:spatial"]).toBeUndefined();
+    expect(everything(o)).not.toContain("Their place");
     expectNothingOf(everything(o), theirPlace);
   });
 
@@ -328,23 +555,26 @@ describe("a link is named only when everything vouches for it", () => {
     return { agent, event, item, all: [agent, event, item] };
   }
 
-  it("gives the label only when a lax record_link checker is used, even for a published target", () => {
+  it("gives nothing when a lax record_link checker is used, even for a published target", () => {
     const { agent, event, item, all } = setup();
     const checkers = { ...CHECKERS, record_link: lax };
     const o = ok(output(viewOf(all, item.id, checkers), [item.id, agent.id, event.id], checkers));
     expectNothingOf(everything(o), agent, event);
+    expect(everything(o)).not.toContain("Photographer");
+    expect(everything(o)).not.toContain("An event");
   });
 
-  it("gives the label only when the made checker is passed for the other kind only", () => {
+  it("gives nothing when the made checker is passed for the other kind only", () => {
     const { agent, event, item, all } = setup();
     const links = linkChecker(all);
     // Only checkers.place is the made one; record_link values are checked laxly.
     const checkers = { ...CHECKERS, record_link: lax, place: links };
     const o = ok(output(viewOf(all, item.id, checkers), [item.id, agent.id, event.id], checkers));
     expectNothingOf(everything(o), agent, event);
+    expect(everything(o)).not.toContain("Photographer");
   });
 
-  it("gives the label only for a target of a kind the field doesn't allow, with a lax checker", () => {
+  it("gives nothing for a target of a kind the field doesn't allow, with a lax checker", () => {
     const { event, item } = setup();
     const r = withKey(
       record("object", "Postcard", {
@@ -362,6 +592,7 @@ describe("a link is named only when everything vouches for it", () => {
     const laxCheckers = { ...CHECKERS, record_link: lax };
     const o = ok(output(viewOf([event, r], r.id, laxCheckers), [r.id, event.id], laxCheckers));
     expectNothingOf(everything(o), event);
+    expect(everything(o)).not.toContain("An event as creator");
   });
 
   it("never links a record to itself", () => {
@@ -370,14 +601,15 @@ describe("a link is named only when everything vouches for it", () => {
       record(
         "object",
         "Self",
-        { rights: { uri: CNE }, related: [{ recordId: id, label: "Me" }] },
+        { rights: { uri: CNE }, related: [{ recordId: id, label: "Self link label" }] },
         {},
         id,
       ),
     );
     const checkers = { ...CHECKERS, record_link: lax };
     const o = ok(output(viewOf([r], id, checkers), [id], checkers));
-    expect(o.jsonLd["dcterms:relation"]).toBe("Me");
+    expect(o.jsonLd["dcterms:relation"]).toBeUndefined();
+    expect(everything(o)).not.toContain("Self link label");
   });
 
   it("uses the checker's snapshot: a record added to the caller's list later isn't vouched for", () => {

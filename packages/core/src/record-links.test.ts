@@ -362,14 +362,17 @@ describe("record links and inheritance", () => {
 });
 
 describe("the public view holds no linked record IDs", () => {
-  it("keeps the label (and a place's gazetteer URI) only", () => {
+  it("holds no record link at all, and a place's name (and gazetteer URI) only", () => {
     const { item, all } = sample();
     const effective = ok(
       effectiveRecord(item.id, all, () => LINK_TPL, { checkers: checkersFor(all) }),
     );
     const view = publicView(effective);
-    expect(view?.fields.creator).toEqual({ label: "Dickinson, John" });
-    expect(view?.fields.related).toEqual([{ label: "Storm of 1900" }, { label: "Dickinson" }]);
+    // D-045: the view can't tell whether a linked record may be named.
+    expect(view?.fields.creator).toBeUndefined();
+    expect(view?.fields.related).toBeUndefined();
+    expect(view?.entries.map((e) => e.key)).not.toContain("creator");
+    expect(JSON.stringify(view)).not.toContain("Storm of 1900");
     expect(view?.fields.places).toEqual([{ label: "Dickinson (Tex.)" }]);
     for (const other of all.filter((r) => r.id !== item.id)) {
       expect(JSON.stringify(view)).not.toContain(other.id);
@@ -400,18 +403,22 @@ describe("publicOutput: record links", () => {
     expect(o.oaiDcXml).toContain("<dc:creator>Dickinson, John</dc:creator>");
   });
 
-  it("gives an unpublished record's label only", () => {
+  it("gives nothing for a link to an unpublished record, not even its label (D-045)", () => {
     const { agent, event, place, item, all } = sample();
     const o = ok(output(all, item.id, [item.id, place.id]));
-    expect(o.jsonLd["dcterms:creator"]).toEqual({ "rdfs:label": "Dickinson, John" });
-    // dcterms:relation has no declared range, so a label alone is plain text.
-    expect(o.jsonLd["dcterms:relation"]).toEqual([
-      "Storm of 1900",
-      { "@id": BASE + place.id, "rdfs:label": "Dickinson" },
-    ]);
+    expect(o.jsonLd["dcterms:creator"]).toBeUndefined();
+    expect(o.dublinCore.creator).toBeUndefined();
+    // Only the published place is left, as a single value.
+    expect(o.jsonLd["dcterms:relation"]).toEqual({
+      "@id": BASE + place.id,
+      "rdfs:label": "Dickinson",
+    });
+    expect(o.dublinCore.relation).toEqual(["Dickinson"]);
     const text = JSON.stringify(o);
     expect(text).not.toContain(agent.id);
     expect(text).not.toContain(event.id);
+    expect(text).not.toContain("Dickinson, John");
+    expect(text).not.toContain("Storm of 1900");
   });
 
   it("refuses to publish a record whose link the checker refuses", () => {
