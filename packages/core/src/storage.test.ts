@@ -800,6 +800,51 @@ describe("departure (D-044)", () => {
     expect(ok(addMove(log, move(r, shelfB.id, "2026-11-12", "placement"))).size).toBe(3);
   });
 
+  it("a correction to another outside location puts right a departure to the wrong place", () => {
+    const r = newRecordId();
+    const gone = [
+      move(r, box1.id, "2026-10-01", "placement"),
+      move(r, conservator.id, "2026-11-10", "departure"),
+    ];
+    const log = ok(indexMoves(withLender, gone));
+    const fixed = ok(addMove(log, move(r, lender.id, "2026-11-12", "correction")));
+    const w = ok(whereabouts(fixed, r));
+    expect(w?.current.id).toBe(lender.id);
+    expect(w?.normal).toBeNull();
+    expect(w?.away).toBe(false);
+    expect(ok(awayFromNormal(fixed))).toEqual([]);
+    // Still departed: only a placement (or another such correction) may follow.
+    expect(codes(addMove(fixed, move(r, box1.id, "2026-11-13", "return")))).toEqual([
+      "not_normal_location",
+    ]);
+    expect(codes(addMove(fixed, move(r, box1.id, "2026-11-13", "rehousing")))).toEqual([
+      "move_after_departure",
+    ]);
+    expect(codes(addMove(fixed, move(r, lender.id, "2026-11-13", "departure")))).toEqual([
+      "departure_while_away",
+    ]);
+    expect(ok(addMove(fixed, move(r, conservator.id, "2026-11-13", "correction"))).size).toBe(4);
+    expect(ok(addMove(fixed, move(r, shelfB.id, "2026-11-20", "placement"))).size).toBe(4);
+    // Not to a location inside: that would say a departed record is here.
+    expect(codes(addMove(log, move(r, shelfB.id, "2026-11-12", "correction")))).toEqual([
+      "move_after_departure",
+    ]);
+  });
+
+  it("a departure back-dated before a correction outside is refused", () => {
+    const r = newRecordId();
+    // Found at the conservator in an audit (away from home, no date).
+    const found = [
+      move(r, box1.id, "2026-10-01", "placement"),
+      move(r, conservator.id, "2026-11-12", "correction"),
+    ];
+    const log = ok(indexMoves(withLender, found));
+    expect(ok(awayFromNormal(log)).map((w) => w.recordId)).toEqual([r]);
+    // Written down later, dated before the correction.
+    const backDated = move(r, lender.id, "2026-11-05", "departure");
+    expect(codes(addMove(log, backDated))).toEqual(["move_after_departure"]);
+  });
+
   it("departs only from inside the organization, while home (review fix)", () => {
     const r = newRecordId();
     // Never placed anywhere: never in the organization's care.

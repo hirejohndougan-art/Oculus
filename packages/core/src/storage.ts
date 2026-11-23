@@ -32,6 +32,9 @@
  *   record is not away, and only a placement (the record borrowed again) may
  *   follow it, so neither a departure nor one back-dated before later moves
  *   can hide a loan out or other temporary move that is still outstanding.
+ *   The one exception puts right a departure to the wrong place: a
+ *   `correction` to another outside location, written down after the
+ *   departure, which leaves the record departed.
  *   An expected return date stays outstanding until a `return`: a
  *   correction, placement or rehousing while it is out keeps the record away
  *   and on the overdue list. While it is outstanding, only an extension (a
@@ -762,8 +765,9 @@ const MOVE_LOGS = new WeakMap<object, LogData>();
  * rehousing goes to an outside location (`external_normal_location`), a
  * return doesn't go to the record's normal location at the time
  * (`not_normal_location`), a departure leaves while the record is away or
- * outside (`departure_while_away`), a move other than a placement follows a
- * departure (`move_after_departure`), or any move belongs to another
+ * outside (`departure_while_away`), a move other than a placement (or a
+ * correction to an outside location, written down after the departure)
+ * follows a departure (`move_after_departure`), or any move belongs to another
  * organization than the index (`mixed_organizations`). Never throws.
  */
 export function indexMoves(index: LocationIndex, moves: unknown): Validated<MoveLog> {
@@ -1111,13 +1115,26 @@ interface HistoryState {
   due: string | null;
   /** The move that gave `due`. */
   dueFrom: StorageMove | undefined;
-  /** True after a departure until the next placement: no other move may follow. */
+  /**
+   * True after a departure until the next placement: only a placement, or a
+   * correction to an outside location written down after the departure, may
+   * follow.
+   */
   departed: boolean;
+  /** The departure, while `departed`. */
+  departure: StorageMove | undefined;
   last: StorageMove | undefined;
 }
 
 function startState(): HistoryState {
-  return { normal: undefined, due: null, dueFrom: undefined, departed: false, last: undefined };
+  return {
+    normal: undefined,
+    due: null,
+    dueFrom: undefined,
+    departed: false,
+    departure: undefined,
+    last: undefined,
+  };
 }
 
 function step(state: HistoryState, move: StorageMove): void {
@@ -1135,8 +1152,13 @@ function step(state: HistoryState, move: StorageMove): void {
       state.dueFrom = move;
     }
   }
-  if (move.reason === "departure") state.departed = true;
-  else if (move.reason === "placement") state.departed = false;
+  if (move.reason === "departure") {
+    state.departed = true;
+    state.departure = move;
+  } else if (move.reason === "placement") {
+    state.departed = false;
+    state.departure = undefined;
+  }
   state.last = move;
 }
 
@@ -1196,7 +1218,23 @@ function historyIssues(
         ),
       );
     }
-    if (state.departed && move.reason !== "placement" && problems.length === before) {
+    // A departure recorded to the wrong outside location may be put right by
+    // a correction to another outside location: the record stays departed
+    // (not in care, no normal location), only its whereabouts change. The
+    // correction must be written down after the departure, so a departure
+    // back-dated before a correction can't make a record found outside
+    // vanish from the away list.
+    const fixesDeparture =
+      move.reason === "correction" &&
+      place?.kind === "external" &&
+      state.departure !== undefined &&
+      move.recordedAt > state.departure.recordedAt;
+    if (
+      state.departed &&
+      move.reason !== "placement" &&
+      !fixesDeparture &&
+      problems.length === before
+    ) {
       // A departed record is no longer here: only a placement (borrowed
       // again) can follow. So a departure back-dated before a later move
       // (a loan out still outstanding) makes the history invalid instead of
@@ -1205,7 +1243,7 @@ function historyIssues(
         issue(
           pathOf(move),
           "move_after_departure",
-          "This record departed before this move. Only a placement can follow a departure; check the departure's date.",
+          "This record departed before this move. Only a placement, or a correction to another outside location, can follow a departure; check the departure's date.",
         ),
       );
     }

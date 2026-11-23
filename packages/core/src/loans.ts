@@ -780,7 +780,17 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
       const crossing = loan.direction === "out" ? start : end;
       const crossingKey = loan.direction === "out" ? keys.start : keys.end;
       if (crossing) {
-        const place = logLocation(log, crossing.move.locationId);
+        // A departure to the wrong outside location may be put right by the
+        // corrections that follow it (storage.ts); the last one says where it went.
+        let placeId = crossing.move.locationId;
+        if (loan.direction === "in") {
+          for (let k = crossing.index + 1; k < moves.length; k += 1) {
+            const next = moves[k];
+            if (next?.reason !== "correction") break;
+            placeId = next.locationId;
+          }
+        }
+        const place = logLocation(log, placeId);
         if (place?.kind !== "external" || place.agentId !== loan.agentId) {
           flag(
             loan.id,

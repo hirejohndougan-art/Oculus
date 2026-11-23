@@ -388,6 +388,19 @@ describe("loan states and the move log", () => {
     expect(ok(overdueLoans(b, "2027-06-01"))).toEqual([]);
   });
 
+  it("a departure to the wrong place, put right by a correction, still goes back to the lender", () => {
+    const wrong = move(lantern, conservator.id, "2026-11-20", "departure");
+    const log = ok(withMove(LOG, wrong, NOW));
+    const loan = loanIn({
+      items: [{ recordId: lantern, arrivalMoveId: lanternIn.id, departureMoveId: wrong.id }],
+    });
+    expect(problemCodes(indexLoans(log, [loan]))).toEqual(["not_agent_location"]);
+    const fixed = ok(withMove(log, move(lantern, lenderPlace.id, "2026-11-21", "correction"), NOW));
+    const b = book([loan], fixed);
+    expect(ok(loanState(b, loan.id)).phase).toBe("returned");
+    expect(ok(whereabouts(fixed, lantern))?.current.id).toBe(lenderPlace.id);
+  });
+
   it("lists a record's loans as dated entries", () => {
     const first = loanOut({
       number: "LO-2025-004",
