@@ -2,6 +2,15 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-23 15:30 CT — manual (John: "do a long building") — S-010, S-007, T-013a, T-015a, T-016a
+- Result: done (built in parallel worktrees, each reviewed, merged into integrate-2; gate on the result)
+- What changed: **S-010** (D-054) `publicOutput` requires current `records` and `templateFor` for every view and indexes records once, so a kept view can't publish data made staff, moved or deleted since. **S-007** `publicOutput` issues are staff-only and their field messages are fixed text. **T-013a** (D-053) `recordTypeChanges`/`recordTypeDeletion` list the records an edit strands; without the records, always needs confirmation. **T-015a** (D-055) `templateChanges` reports narrowed link kinds (fail closed on any link the checker can't resolve); `findStaleLinkLabels` staff report; a record link checker's organization comes from the whole set and an organization-less checker refuses everything. **T-016a** (D-056) accession restrictions (closed until a date; staff and researchers only) hold records back like an unsigned deed; `today` is the caller's.
+- Decisions: D-053, D-054, D-055, D-056
+- Review: every branch had an independent review; T-013a (needsConfirmation false without records), T-015a (empty, stale or organization-less checkers made narrowing look harmless; another organization's invalid records got through; two rounds), S-010 (check order, stale docs) and T-016a (prototype reads, quoted keys) had findings, all fixed with tests.
+- Note: a builder's `git merge` was blocked by the permission system; John approved it.
+- Gate: PASS · tests_passing 2661 (was 2530) · npm audit clean
+- Next: T-024 (database package, third review), T-022a (HTTP layer, third round of fixes), T-018a (loans, third round of fixes)
+
 ## 2026-11-23 12:40 CT — manual (John: "do a long building") — S-009a, S-011, S-011a, T-019b1, U-003, T-020, T-021, T-022, T-023
 - Result: done (four branches built in parallel worktrees, reviewed, merged into one integration branch; gate on the result)
 - What changed: **S-009a** identifier type lists, accession registers and template registries check organization before validating, and `validateIdentifierTypes` gives only organization issues for a mixed list, so no message names another organization's keys. **S-011** (D-045, John) the public view holds no record links; `publicOutput` names a link only when it may, otherwise nothing at all. **S-011a** (D-048, John) a place name shows even when its place record isn't public, but only when the organization's own place checker vouches for it. **T-019b1** (D-047) Dublin Core mappings belong to an organization; built-in mappings are presets. **U-003** `templateChanges` reads `templateKey` as an own property; blowup tests assert process CPU time, so a busy machine no longer fails them. **T-020 to T-023** Phase 2 decisions: PostgreSQL 15–19 with a throwaway test database (D-049), `pg` with hand-written SQL and plain `.sql` migrations (D-050), Fastify 5 (D-051, John), scrypt passwords, two-step sign-in required for all staff and 4-hour idle sessions (D-052, John).
