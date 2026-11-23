@@ -347,6 +347,7 @@ describe("D-048: a place value shows its name only when its place record is vouc
     "links",
   );
   const PLACE_MAPPING = {
+    organizationId: ORG,
     template: "links",
     entries: [
       { field: "rights", term: "rights" },
