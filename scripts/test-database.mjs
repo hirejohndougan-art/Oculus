@@ -35,9 +35,22 @@ export function socketUrl(socketDir, database = "postgres") {
   return `postgresql://postgres@localhost/${database}?host=${encodeURIComponent(socketDir)}`;
 }
 
-/** The only environment the server commands see. */
-export function serverEnvironment(env = process.env) {
-  return { PATH: env.PATH ?? "/usr/bin:/bin", LANG: "C", LC_ALL: "C" };
+/**
+ * The only environment the server commands see: a fixed PATH (the binaries
+ * are called by full path; runuser and the shell pg_ctl starts need the
+ * rest), never the caller's.
+ */
+export function serverEnvironment() {
+  return { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" };
+}
+
+/** runuser by full path, found in the usual places only. */
+function findRunuser() {
+  const found = ["/usr/sbin/runuser", "/sbin/runuser", "/usr/bin/runuser", "/bin/runuser"].find(
+    (path) => existsSync(path),
+  );
+  if (!found) throw new Error("Running as root needs runuser to start PostgreSQL as postgres.");
+  return found;
 }
 
 /**
@@ -68,6 +81,7 @@ export function serverOptions(dir) {
  */
 export function startTestDatabase({ bin, log = console.log } = {}) {
   const asRoot = typeof process.getuid === "function" && process.getuid() === 0;
+  const runuser = asRoot ? findRunuser() : undefined;
   const dir = mkdtempSync(join(tmpdir(), "oculus-pg-"));
   const data = join(dir, "data");
   const logFile = join(dir, "server.log");
@@ -77,7 +91,7 @@ export function startTestDatabase({ bin, log = console.log } = {}) {
 
   const run = (program, args) => {
     const [cmd, argv] = asRoot
-      ? ["runuser", ["-u", "postgres", "--", join(bin, program), ...args]]
+      ? [runuser, ["-u", "postgres", "--", join(bin, program), ...args]]
       : [join(bin, program), args];
     const result = spawnSync(cmd, argv, { cwd: dir, env, encoding: "utf8" });
     if (result.status !== 0) {

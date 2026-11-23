@@ -24,14 +24,14 @@ describe("throwaway test database helpers", () => {
     }
   });
 
-  it("gives the server commands only PATH and a C locale, never the caller's environment", () => {
-    const env = serverEnvironment({
-      PATH: "/usr/bin",
-      OCULUS_DATABASE_URL: "postgresql://fake@example.invalid/x",
-      PGPASSWORD: "obviously-fake",
-      LD_PRELOAD: "/tmp/x.so",
-    });
-    expect(env).toEqual({ PATH: "/usr/bin", LANG: "C", LC_ALL: "C" });
+  it("gives the server commands a fixed PATH and a C locale, never the caller's environment", () => {
+    const saved = process.env.PATH;
+    process.env.PATH = "/tmp/attacker-bin:/usr/bin";
+    try {
+      expect(serverEnvironment()).toEqual({ PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" });
+    } finally {
+      process.env.PATH = saved;
+    }
   });
 
   it("passes settings on the command line: no TCP, socket in the directory, fsync off", () => {
