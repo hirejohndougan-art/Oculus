@@ -718,7 +718,7 @@ export function indexAccessions(
       usable,
     );
     const restricted = heldBy(
-      accessions.filter((a) => restrictionInForce(a.accessRestriction, today)),
+      accessions.filter((a) => restrictionInForce(ownData(a, "accessRestriction"), today)),
       usable,
     );
     const frozenByRecord = new Map<RecordId, readonly Accession[]>();
@@ -921,6 +921,15 @@ function restrictionInForce(restriction: AccessRestriction | undefined, today: s
   const until = own("until");
   if (kind === "closed_until" && isDay(until)) return today < until;
   return true;
+}
+
+/**
+ * `key` of `value` as an own data property, never inherited or behind a
+ * getter, so a polluted Object.prototype can't add one (D-056).
+ */
+function ownData<T extends object, K extends keyof T & string>(value: T, key: K): T[K] | undefined {
+  const slot = Object.getOwnPropertyDescriptor(value, key);
+  return slot !== undefined && "value" in slot ? (slot.value as T[K]) : undefined;
 }
 
 function holdsIn(
@@ -1133,16 +1142,16 @@ function checkRestriction(value: JsonValue, issues: IssueList): void {
   const v = value as Readonly<Record<string, JsonValue>>;
   const kind = own("kind");
   const allowed = kind === "closed_until" ? ["kind", "until"] : ["kind"];
-  for (const key of Object.keys(v)) {
-    if (!allowed.includes(key)) {
-      issues.add(
-        [...path, key],
-        "unknown_property",
-        kind === "closed_until"
-          ? "A closed-until restriction has only kind and until."
-          : "This access restriction has only kind.",
-      );
-    }
+  // Reported once, at the restriction itself: the path never carries the
+  // unknown key's text (D-056: restrictions are never quoted).
+  if (Object.keys(v).some((key) => !allowed.includes(key))) {
+    issues.add(
+      path,
+      "unknown_property",
+      kind === "closed_until"
+        ? "A closed-until restriction has only kind and until."
+        : "This access restriction has only kind.",
+    );
   }
   if (!(ACCESS_RESTRICTION_KINDS as readonly unknown[]).includes(kind)) {
     issues.add(

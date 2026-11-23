@@ -155,10 +155,50 @@ describe("validateAccession: structured restrictions", () => {
     }
   });
 
+  it("never puts an unknown key's text in an issue, and reports it once", () => {
+    const key = "Quarrington_letters_sealed";
+    const r = validateAccession(
+      accession({
+        accessRestriction: { kind: "staff_and_researchers", [key]: "x", [`${key}_2`]: "y" },
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.issues.map((i) => [i.code, i.path])).toEqual([
+      ["unknown_property", ["accessRestriction"]],
+    ]);
+    expect(JSON.stringify(r)).not.toContain("Quarrington");
+    const closed = validateAccession(
+      accession({ accessRestriction: { kind: "closed_until", until: UNTIL, [key]: UNTIL } }),
+    );
+    expect(codes(closed)).toEqual(["unknown_property"]);
+    expect(JSON.stringify(closed)).not.toContain("Quarrington");
+    expect(JSON.stringify(closed)).not.toContain(UNTIL);
+  });
+
   describe("with Object.prototype polluted", () => {
     afterEach(() => {
       delete (Object.prototype as Record<string, unknown>).until;
       delete (Object.prototype as Record<string, unknown>).today;
+      delete (Object.prototype as Record<string, unknown>).accessRestriction;
+    });
+
+    it("a restriction on the prototype isn't added to an accession that has none", () => {
+      const free = accession({ deedStatus: "signed" });
+      (Object.prototype as Record<string, unknown>).accessRestriction = {
+        kind: "staff_and_researchers",
+      };
+      const made = indexAccessions(ORG, {
+        accessions: [free],
+        records: RECORDS,
+        identifierTypes: TYPES,
+        today: TODAY,
+      });
+      delete (Object.prototype as Record<string, unknown>).accessRestriction;
+      const register = ok(made);
+      expect(recordsHeldBack(register)).toEqual([]);
+      expect(restrictionHoldsOn(register, fonds.id)).toEqual([]);
+      expect(issuesOf(fonds, register)).toEqual([]);
     });
 
     it("an end date on the prototype doesn't complete a restriction left without one", () => {
