@@ -399,6 +399,8 @@ export {
   loanState,
   overdueLoans,
   loanOutMove,
+  loanProblems,
+  unexplainedDepartures,
 } from "./loans.js";
 export type {
   LoanId,
@@ -413,6 +415,7 @@ export type {
   LoanPhase,
   LoanItemState,
   LoanState,
+  LoanProblems,
 } from "./loans.js";
 
 export {

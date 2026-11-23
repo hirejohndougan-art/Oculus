@@ -22,8 +22,12 @@
  * The loan's `status` is the agreement's state (Spectrum's loan status):
  * `requested`, `agreed`, `declined`, `cancelled` or `closed`. Whether items
  * are out or back is worked out from the moves (`loanState`'s `phase`). An
- * item can't have moved before the loan was agreed, and a loan can't be
- * closed while an item is still out.
+ * item can't have moved before the loan was agreed, a linked `loan_out` or
+ * arrival must fall within the loan period, and a loan can't be closed while
+ * an item is still out. A loan the move log no longer fits (a return
+ * back-dated by a later storage edit) is kept with its `problems` rather than
+ * making the whole book unreadable; `withLoan` never saves one. Departures
+ * no loan in names are listed by `unexplainedDepartures`.
  *
  * **Everything here is staff-only**, like storage: loans name lenders,
  * borrowers, values and dates. Nothing in `effective.ts` or
@@ -46,6 +50,8 @@ import { IssueList, shown, type JsonValue } from "./plain-data.js";
 import { isRecordId, type RecordId } from "./record-id.js";
 import {
   MAX_STORAGE_NOTE_LENGTH,
+  dayAfter,
+  departures,
   fold,
   guarded,
   isIsoDay,
@@ -178,6 +184,20 @@ export interface LoanState {
   readonly loan: Loan;
   readonly phase: LoanPhase;
   readonly items: readonly LoanItemState[];
+  /**
+   * What no longer fits the move log since the loan was saved (a move
+   * back-dated into the loan, a linked move outside the loan period …), with
+   * paths inside the loan. Empty for a sound loan. `withLoan` never saves a
+   * loan with problems; `indexLoans` and `reindexLoans` keep it and report
+   * them here, so one stale loan doesn't make every other loan unreadable.
+   */
+  readonly problems: readonly Issue[];
+}
+
+/** One loan's problems, as `loanProblems` lists them. */
+export interface LoanProblems {
+  readonly loanId: LoanId;
+  readonly problems: readonly Issue[];
 }
 
 export const MAX_LOANS = 50_000;
@@ -188,12 +208,21 @@ export const MAX_LOAN_PURPOSE_LENGTH = 200;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const ONE_LINE_BREAKS = /[\t\n\r\u2028\u2029]/;
 
+/**
+ * Read limits sized from the shape (review fix: 500 full items didn't fit).
+ * A full item is one object, three keys and three IDs: at most 7 values and
+ * 15 + 13 + 8 key characters plus 3 × 36 ID characters (144). The loan's own
+ * keys and values (13 keys, three 2000-character texts) get 40 values and
+ * 8000 characters; the items array is one value more.
+ */
+const ITEM_VALUES = 7;
+const ITEM_CHARS = 144;
 const LOAN_LIMITS = {
   maxDepth: 3,
-  maxValues: 40 + 4 * MAX_LOAN_ITEMS,
+  maxValues: 41 + ITEM_VALUES * MAX_LOAN_ITEMS,
   maxStringLength: MAX_STORAGE_NOTE_LENGTH,
   maxKeyLength: 64,
-  maxTotalChars: 12_000 + 160 * MAX_LOAN_ITEMS,
+  maxTotalChars: 8000 + ITEM_CHARS * MAX_LOAN_ITEMS,
 } as const;
 
 const LOAN_KEYS = [
@@ -230,10 +259,16 @@ export function isLoanId(value: unknown): value is LoanId {
 
 /**
  * Check one loan from untrusted input, on its own (its moves are checked
- * against the move log by `indexLoans`). Returns a fresh, frozen copy, or
- * every problem found. Never throws.
+ * against the move log by `indexLoans`). `statusOn` can't be later than the
+ * day after `now` (a day of slack for time zones, as for moves). Returns a
+ * fresh, frozen copy, or every problem found. `now` is for tests. Never
+ * throws.
  */
-export function validateLoan(input: unknown): Validated<Loan> {
+export function validateLoan(input: unknown, now: Date = new Date()): Validated<Loan> {
+  const time = timeOf(now);
+  if (time === undefined) {
+    return refused([], "invalid_time", "The current time is not a valid date.");
+  }
   return guarded(() => {
     const issues = new IssueList();
     const view = readTop(input, "A loan must be a plain object.", LOAN_LIMITS, issues);
@@ -267,6 +302,13 @@ export function validateLoan(input: unknown): Validated<Loan> {
       if (!isIsoDay(d[key])) {
         issues.add([key], "invalid_date", `${key} must be a day written YYYY-MM-DD.`);
       }
+    }
+    if (isIsoDay(d.statusOn) && d.statusOn > dayAfter(time)) {
+      issues.add(
+        ["statusOn"],
+        "future_status",
+        "The status can't be dated after today. Set it when it happens.",
+      );
     }
     if (isIsoDay(d.beginOn) && isIsoDay(d.endOn) && d.endOn < d.beginOn) {
       issues.add(["endOn"], "end_before_begin", "The loan ends before it begins.");
@@ -304,8 +346,16 @@ interface BookData {
   readonly organizationId: OrganizationId;
   /** Loans in the order given. */
   readonly loans: readonly Loan[];
-  readonly byId: ReadonlyMap<LoanId, { readonly loan: Loan; readonly items: readonly ItemData[] }>;
+  readonly byId: ReadonlyMap<LoanId, Entry>;
   readonly byRecord: ReadonlyMap<RecordId, readonly LoanId[]>;
+  /** Departure moves in the log that no loan in names. */
+  readonly unexplained: readonly StorageMove[];
+}
+
+interface Entry {
+  readonly loan: Loan;
+  readonly items: readonly ItemData[];
+  readonly problems: readonly Issue[];
 }
 
 const LOAN_BOOKS = new WeakMap<object, BookData>();
@@ -313,10 +363,19 @@ const LOAN_BOOKS = new WeakMap<object, BookData>();
 /**
  * Validate one organization's loans once, against its move log, and index
  * them. Refuses the whole list when a loan is invalid, two share an ID or a
- * number (loans in and out are numbered apart), a loan belongs to another
- * organization than the log (`mixed_organizations`), or an item's move:
+ * number (loans in and out are numbered apart), or a loan belongs to another
+ * organization than the log (`mixed_organizations`).
+ *
+ * A loan whose links to the move log don't fit is kept, with its problems in
+ * `loanState(...).problems` and `loanProblems`, rather than refused with
+ * every other loan: one valid storage move (a return back-dated between a
+ * linked `loan_out` and its linked return) can make a saved loan stale, and
+ * that must not make the whole book unreadable. `withLoan` refuses to save a
+ * loan with any of these problems. An item's move:
  * - isn't in the log for that record (`unknown_move`), or is named by two
- *   items (`move_reused`);
+ *   items (`move_reused`, on the later loan);
+ * - starts outside the loan period: a `loan_out` or arrival before `beginOn`
+ *   or after `endOn` (`move_outside_loan`);
  * - has the wrong reason (`wrong_move_reason`: `loan_out` and `return` for a
  *   loan out, `placement` and `departure` for a loan in);
  * - goes somewhere other than an outside location of the borrower or lender
@@ -324,10 +383,15 @@ const LOAN_BOOKS = new WeakMap<object, BookData>();
  * - ends before it started, or isn't the record's first return (or
  *   departure) after it started (`end_out_of_order`);
  * - overlaps another loan of the same record the same way
- *   (`overlapping_loans`): a record is lent to one borrower at a time.
- * Never throws.
+ *   (`overlapping_loans`, on the later loan): a record is lent to one
+ *   borrower at a time.
+ * `now` is for tests. Never throws.
  */
-export function indexLoans(log: MoveLog, loans: unknown): Validated<LoanBook> {
+export function indexLoans(
+  log: MoveLog,
+  loans: unknown,
+  now: Date = new Date(),
+): Validated<LoanBook> {
   try {
     if (!isMoveLog(log)) return notALog();
     const list = readList(loans, MAX_LOANS, "loans");
@@ -336,7 +400,7 @@ export function indexLoans(log: MoveLog, loans: unknown): Validated<LoanBook> {
     const valid: Loan[] = [];
     list.value.forEach((given, i) => {
       if (issues.full) return;
-      const checked = validateLoan(given);
+      const checked = validateLoan(given, now);
       if (!checked.ok) {
         for (const found of checked.issues)
           issues.add([i, ...found.path], found.code, found.message);
@@ -359,14 +423,20 @@ export function isLoanBook(value: unknown): value is LoanBook {
 /**
  * Check a new or edited loan (same `id`: a status change, an extension, an
  * item sent or returned) against the book and its move log before saving
- * it, and return the book with it in place. A loan can't change direction.
- * The given book is not changed. Never throws.
+ * it, and return the book with it in place. A loan can't change direction,
+ * and is refused with any problem `indexLoans` would report for it (other
+ * loans' problems don't block it). The given book is not changed. `now` is
+ * for tests. Never throws.
  */
-export function withLoan(book: LoanBook, loan: unknown): Validated<LoanBook> {
+export function withLoan(
+  book: LoanBook,
+  loan: unknown,
+  now: Date = new Date(),
+): Validated<LoanBook> {
   try {
     const data = bookData(book);
     if (data === undefined) return notABook();
-    const checked = validateLoan(loan);
+    const checked = validateLoan(loan, now);
     if (!checked.ok) return checked;
     const next = checked.value;
     const before = data.byId.get(next.id);
@@ -386,14 +456,17 @@ export function withLoan(book: LoanBook, loan: unknown): Validated<LoanBook> {
         : data.loans.map((l) => (l.id === next.id ? next : l));
     const at = before === undefined ? data.loans.length : data.loans.indexOf(before.loan);
     const built = buildBook(data.log, loans);
-    if (built.ok) return built;
-    // Report the edited loan's problems without its position in the book.
-    return {
-      ok: false,
-      issues: built.issues.map((f) =>
-        f.path[0] === at ? issue(f.path.slice(1), f.code, f.message) : f,
-      ),
-    };
+    if (!built.ok) {
+      // Report the edited loan's problems without its position in the book.
+      return {
+        ok: false,
+        issues: built.issues.map((f) =>
+          f.path[0] === at ? issue(f.path.slice(1), f.code, f.message) : f,
+        ),
+      };
+    }
+    const problems = bookData(built.value)?.byId.get(next.id)?.problems ?? [];
+    return problems.length > 0 ? { ok: false, issues: problems } : built;
   } catch {
     return refused([], "unreadable", "The loan could not be read as plain data.");
   }
@@ -401,7 +474,8 @@ export function withLoan(book: LoanBook, loan: unknown): Validated<LoanBook> {
 
 /**
  * Check every loan again against a new move log (after `withMove` or
- * `reindexLocations`), and return the book built on it. Never throws.
+ * `reindexLocations`), and return the book built on it. A loan the new log
+ * no longer fits is kept with its problems (see `indexLoans`). Never throws.
  */
 export function reindexLoans(book: LoanBook, log: MoveLog): Validated<LoanBook> {
   try {
@@ -445,7 +519,33 @@ export function loanState(book: LoanBook, id: unknown): Validated<LoanState> {
   if (data === undefined) return notABook();
   const entry = isLoanId(id) ? data.byId.get(id) : undefined;
   if (entry === undefined) return refused([], "unknown_loan", "There is no such loan.");
-  return { ok: true, value: stateOf(data, entry.loan, entry.items) };
+  return { ok: true, value: stateOf(data, entry) };
+}
+
+/** Every loan with problems (see `indexLoans`), in the book's order. */
+export function loanProblems(book: LoanBook): Validated<readonly LoanProblems[]> {
+  const data = bookData(book);
+  if (data === undefined) return notABook();
+  const found: LoanProblems[] = [];
+  for (const loan of data.loans) {
+    const problems = data.byId.get(loan.id)?.problems ?? [];
+    if (problems.length > 0) found.push(Object.freeze({ loanId: loan.id, problems }));
+  }
+  return { ok: true, value: Object.freeze(found) };
+}
+
+/**
+ * Departure moves in the move log that no loan in names as an item's
+ * `departureMoveId`, oldest first. A departure is how a borrowed record goes
+ * back, so one no loan explains is a record that left the organization's
+ * care without a reason on file. They are reported, not refused: the move
+ * and the loan edit naming it are two saves (T-032 should make them one
+ * transaction and check this list is empty afterwards).
+ */
+export function unexplainedDepartures(book: LoanBook): Validated<readonly StorageMove[]> {
+  const data = bookData(book);
+  if (data === undefined) return notABook();
+  return { ok: true, value: data.unexplained };
 }
 
 /**
@@ -460,9 +560,9 @@ export function overdueLoans(book: LoanBook, today: unknown): Validated<readonly
   if (!isIsoDay(today))
     return refused([], "invalid_date", "Today must be a day written YYYY-MM-DD.");
   const found: LoanState[] = [];
-  for (const { loan, items } of data.byId.values()) {
-    if (loan.endOn >= today) continue;
-    const state = stateOf(data, loan, items);
+  for (const entry of data.byId.values()) {
+    if (entry.loan.endOn >= today) continue;
+    const state = stateOf(data, entry);
     if (state.phase === "on_loan") found.push(state);
   }
   return {
@@ -504,6 +604,13 @@ export function loanOutMove(
     if (!isIsoDay(movedOn)) {
       return refused(["movedOn"], "invalid_date", "movedOn must be a day written YYYY-MM-DD.");
     }
+    if (movedOn < l.beginOn) {
+      return refused(
+        ["movedOn"],
+        "before_loan_begin",
+        "The loan period hasn't begun on that day; change the loan's begin date first.",
+      );
+    }
     if (l.endOn < movedOn) {
       return refused(
         ["movedOn"],
@@ -533,17 +640,34 @@ export function loanOutMove(
 // Helpers
 
 function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
+  /** Problems that refuse the whole book. */
   const issues = new IssueList();
+  /** Per loan: link problems, paths inside the loan. */
+  const linkProblems = new Map<LoanId, Issue[]>();
+  const flag = (
+    loanId: LoanId,
+    path: readonly (string | number)[],
+    code: string,
+    message: string,
+  ): void => {
+    const mine = linkProblems.get(loanId) ?? [];
+    if (mine.length < 50) mine.push(issue(path, code, message));
+    linkProblems.set(loanId, mine);
+  };
   const organizationId = log.organizationId;
   if (loans.some((l) => l.organizationId !== organizationId)) {
     return { ok: false, issues: [mixedOrganizationsIssue([], "These loans and the move log")] };
   }
   const byId = new Map<LoanId, { loan: Loan; items: readonly ItemData[] }>();
+  const named = new Set<MoveId>();
   const numbers = new Set<string>();
   const usedMoves = new Set<MoveId>();
   const byRecord = new Map<RecordId, LoanId[]>();
   /** Per record and direction: [start index, end index or Infinity] in its history. */
-  const spans = new Map<string, { start: number; end: number; at: number; j: number }[]>();
+  const spans = new Map<
+    string,
+    { start: number; end: number; loanId: LoanId; at: number; j: number }[]
+  >();
   loans.forEach((loan, i) => {
     if (issues.full) return;
     if (byId.has(loan.id)) {
@@ -568,9 +692,11 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
       const find = (key: string): { move: StorageMove; index: number } | null | undefined => {
         const id = fields[key];
         if (id === undefined) return null;
+        named.add(id);
         if (usedMoves.has(id)) {
-          issues.add(
-            [i, "items", j, key],
+          flag(
+            loan.id,
+            ["items", j, key],
             "move_reused",
             "Another loan item already names this move.",
           );
@@ -580,8 +706,9 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
         const index = moves.findIndex((m) => m.id === id);
         const move = moves[index];
         if (move === undefined) {
-          issues.add(
-            [i, "items", j, key],
+          flag(
+            loan.id,
+            ["items", j, key],
             "unknown_move",
             "This move isn't in the move log for this record.",
           );
@@ -594,15 +721,17 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
       const startReason = loan.direction === "out" ? "loan_out" : "placement";
       const endReason = loan.direction === "out" ? "return" : "departure";
       if (start && start.move.reason !== startReason) {
-        issues.add(
-          [i, "items", j, keys.start],
+        flag(
+          loan.id,
+          ["items", j, keys.start],
           "wrong_move_reason",
           `${keys.start} must name a ${startReason} move.`,
         );
       }
       if (end && end.move.reason !== endReason) {
-        issues.add(
-          [i, "items", j, keys.end],
+        flag(
+          loan.id,
+          ["items", j, keys.end],
           "wrong_move_reason",
           `${keys.end} must name a ${endReason} move.`,
         );
@@ -613,8 +742,9 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
       if (crossing) {
         const place = logLocation(log, crossing.move.locationId);
         if (place?.kind !== "external" || place.agentId !== loan.agentId) {
-          issues.add(
-            [i, "items", j, crossingKey],
+          flag(
+            loan.id,
+            ["items", j, crossingKey],
             "not_agent_location",
             loan.direction === "out"
               ? "A loan out goes to an outside location whose agent is the borrower."
@@ -625,8 +755,9 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
       if (start && end) {
         const firstEnd = moves.findIndex((m, k) => k > start.index && m.reason === endReason);
         if (end.index <= start.index || firstEnd !== end.index) {
-          issues.add(
-            [i, "items", j, keys.end],
+          flag(
+            loan.id,
+            ["items", j, keys.end],
             "end_out_of_order",
             loan.direction === "out"
               ? "The return must be the record's first return after it went out on this loan."
@@ -634,10 +765,28 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
           );
         }
       }
+      // The loan period bounds when an item may go out (or arrive); it may
+      // come back late, which is what overdue means (review fix).
+      if (start && (start.move.movedOn < loan.beginOn || start.move.movedOn > loan.endOn)) {
+        flag(
+          loan.id,
+          ["items", j, keys.start],
+          "move_outside_loan",
+          loan.direction === "out"
+            ? "This item went out outside the loan period."
+            : "This item arrived outside the loan period.",
+        );
+      }
       if (start) {
         const spanKey = `${loan.direction} ${item.recordId}`;
         const list = spans.get(spanKey) ?? [];
-        list.push({ start: start.index, end: end ? end.index : Infinity, at: i, j });
+        list.push({
+          start: start.index,
+          end: end ? end.index : Infinity,
+          loanId: loan.id,
+          at: i,
+          j,
+        });
         spans.set(spanKey, list);
       }
       items.push(
@@ -659,8 +808,9 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
       const prev = list[k - 1];
       const span = list[k];
       if (prev !== undefined && span !== undefined && span.start < prev.end) {
-        issues.add(
-          [span.at, "items", span.j],
+        flag(
+          span.loanId,
+          ["items", span.j],
           "overlapping_loans",
           "This record is still out on another loan.",
         );
@@ -668,6 +818,17 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
     }
   }
   if (issues.count > 0) return { ok: false, issues: issues.items };
+  const entries = new Map<LoanId, Entry>();
+  for (const [id, { loan, items }] of byId) {
+    entries.set(
+      id,
+      Object.freeze({ loan, items, problems: Object.freeze(linkProblems.get(id) ?? []) }),
+    );
+  }
+  const gone = departures(log);
+  const unexplained = Object.freeze(
+    (gone.ok ? gone.value : []).filter((move) => !named.has(move.id)),
+  );
   const frozenByRecord = new Map<RecordId, readonly LoanId[]>();
   for (const [recordId, ids] of byRecord) frozenByRecord.set(recordId, Object.freeze(ids));
   const book: LoanBook = Object.freeze({ organizationId, size: byId.size });
@@ -675,13 +836,15 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
     log,
     organizationId,
     loans: Object.freeze([...loans]),
-    byId,
+    byId: entries,
     byRecord: frozenByRecord,
+    unexplained,
   });
   return { ok: true, value: book };
 }
 
-function stateOf(data: BookData, loan: Loan, items: readonly ItemData[]): LoanState {
+function stateOf(data: BookData, entry: Entry): LoanState {
+  const { loan, items } = entry;
   const states = items.map((item): LoanItemState => {
     const out = item.started !== null && item.ended === null;
     let dueBack: string | null = null;
@@ -703,7 +866,7 @@ function stateOf(data: BookData, loan: Loan, items: readonly ItemData[]): LoanSt
   else if (states.some((s) => s.out)) phase = "on_loan";
   else if (states.some((s) => s.started !== null)) phase = "returned";
   else phase = "agreed";
-  return Object.freeze({ loan, phase, items: Object.freeze(states) });
+  return Object.freeze({ loan, phase, items: Object.freeze(states), problems: entry.problems });
 }
 
 function checkItems(
@@ -840,6 +1003,15 @@ function checkText(
       "too_long",
       `${what} can be at most ${String(MAX_STORAGE_NOTE_LENGTH)} characters.`,
     );
+  }
+}
+
+function timeOf(now: unknown): number | undefined {
+  try {
+    const time = Date.prototype.getTime.call(now);
+    return Number.isNaN(time) ? undefined : time;
+  } catch {
+    return undefined;
   }
 }
 

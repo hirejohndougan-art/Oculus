@@ -20,6 +20,7 @@ import {
   loanById,
   loanList,
   loanOutMove,
+  loanProblems,
   loanState,
   loansOfRecord,
   needingConservation,
@@ -39,6 +40,7 @@ import {
   withConditionCheck,
   withLoan,
   type ConditionCheck,
+  type LoanBook,
   type LoanOut,
   type PublicRecord,
   type StorageLocation,
@@ -58,6 +60,13 @@ function ok<T>(result: Validated<T>): T {
 
 function codes(result: Validated<unknown>): string[] {
   return result.ok ? [] : result.issues.map((i) => i.code);
+}
+
+/** A refusal's codes, or else the codes of every loan's problems in the book. */
+function problemCodes(result: Validated<LoanBook>): string[] {
+  if (!result.ok) return result.issues.map((i) => i.code);
+  const found = loanProblems(result.value);
+  return found.ok ? found.value.flatMap((p) => p.problems.map((i) => i.code)) : ["?"];
 }
 
 function messages(result: Validated<unknown>): string {
@@ -162,8 +171,8 @@ describe("another organization's data is refused, never filtered", () => {
       ]),
     );
     const theirLog = ok(indexMoves(theirIndex, []));
-    expect(codes(indexLoans(theirLog, [loan()]))).toEqual(["mixed_organizations"]);
-    expect(codes(reindexLoans(BOOK, theirLog))).toEqual(["mixed_organizations"]);
+    expect(problemCodes(indexLoans(theirLog, [loan()]))).toEqual(["mixed_organizations"]);
+    expect(problemCodes(reindexLoans(BOOK, theirLog))).toEqual(["mixed_organizations"]);
   });
 
   it("refuses another organization's condition check, and a log with no organization", () => {
@@ -190,7 +199,7 @@ describe("hostile lists and objects", () => {
       expect(codes(result)).toEqual(["not_a_list"]);
     }
     // eslint-disable-next-line no-sparse-arrays -- a hole is the attack
-    expect(codes(indexLoans(LOG, [loan(), , loan()]))).toEqual(["unreadable_entry"]);
+    expect(problemCodes(indexLoans(LOG, [loan(), , loan()]))).toEqual(["unreadable_entry"]);
     const tricky: unknown[] = [];
     let reads = 0;
     Object.defineProperty(tricky, 0, {
@@ -246,7 +255,7 @@ describe("hostile lists and objects", () => {
   it("keeps work bounded on huge input", () => {
     const loans: unknown[] = [];
     loans.length = MAX_LOANS + 1;
-    expect(codes(indexLoans(LOG, loans))).toEqual(["too_many"]);
+    expect(problemCodes(indexLoans(LOG, loans))).toEqual(["too_many"]);
     const checks: unknown[] = [];
     checks.length = MAX_CONDITION_CHECKS + 1;
     expect(codes(indexConditionChecks(ORG, checks))).toEqual(["too_many"]);
@@ -287,8 +296,8 @@ describe("forged snapshots and borrowed moves", () => {
     }
     expect(loanById(forged, newLoanId())).toBeUndefined();
     expect(codes(withLoan(new Proxy(BOOK, {}), loan()))).toEqual(["not_a_loan_book"]);
-    expect(codes(indexLoans({ ...LOG }, []))).toEqual(["not_a_move_log"]);
-    expect(codes(reindexLoans(BOOK, { ...LOG }))).toEqual(["not_a_move_log"]);
+    expect(problemCodes(indexLoans({ ...LOG }, []))).toEqual(["not_a_move_log"]);
+    expect(problemCodes(reindexLoans(BOOK, { ...LOG }))).toEqual(["not_a_move_log"]);
     const forgedChecks = { ...CHECKS };
     for (const result of [
       withConditionCheck(forgedChecks, check(), NOW),
@@ -303,15 +312,38 @@ describe("forged snapshots and borrowed moves", () => {
 
   it("can't claim a move that went to another agent's location", () => {
     // The same move, claimed by a loan to someone else.
-    expect(codes(indexLoans(LOG, [loan({ agentId: newRecordId() })]))).toEqual([
+    expect(problemCodes(indexLoans(LOG, [loan({ agentId: newRecordId() })]))).toEqual([
       "not_agent_location",
     ]);
+  });
+
+  it("can't pass off an old loan_out or placement as this loan's (review fix)", () => {
+    // A 2030 loan claiming the 2026 loan_out; a loan in claiming a placement from before it.
+    const later = loan({ beginOn: "2030-01-01", endOn: "2030-06-01", statusOn: "2026-11-01" });
+    expect(codes(withLoan(ok(indexLoans(LOG, [])), later, NOW))).toEqual(["move_outside_loan"]);
+    const borrowedIn = {
+      ...loan(),
+      direction: "in",
+      beginOn: "2026-06-01",
+      endOn: "2027-06-01",
+      items: [{ recordId: print, arrivalMoveId: placed.id }],
+    };
+    expect(codes(withLoan(ok(indexLoans(LOG, [])), borrowedIn, NOW))).toEqual([
+      "move_outside_loan",
+    ]);
+  });
+
+  it("can't back-date the clock or a status into the future", () => {
+    expect(codes(validateLoan(loan(), new Proxy(NOW, {})))).toEqual(["invalid_time"]);
+    expect(codes(withLoan(BOOK, loan({ statusOn: "2099-01-01" }), NOW))).toEqual(["future_status"]);
   });
 
   it("can't claim another record's move, or a move missing from the log", () => {
     const other = newRecordId();
     expect(
-      codes(indexLoans(LOG, [loan({ items: [{ recordId: other, loanOutMoveId: sent.id }] })])),
+      problemCodes(
+        indexLoans(LOG, [loan({ items: [{ recordId: other, loanOutMoveId: sent.id }] })]),
+      ),
     ).toEqual(["unknown_move"]);
   });
 
@@ -320,7 +352,7 @@ describe("forged snapshots and borrowed moves", () => {
       "closed_with_items_out",
     ]);
     expect(
-      codes(
+      problemCodes(
         indexLoans(LOG, [
           loan({ items: [{ recordId: print, loanOutMoveId: sent.id, returnMoveId: placed.id }] }),
         ]),

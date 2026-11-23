@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  MAX_LOAN_ITEMS,
   createStorageMove,
+  unexplainedDepartures,
   indexLocations,
   indexLoans,
   indexMoves,
@@ -9,6 +11,7 @@ import {
   loanById,
   loanList,
   loanOutMove,
+  loanProblems,
   loanState,
   loansOfRecord,
   newLoanId,
@@ -44,6 +47,13 @@ function ok<T>(result: Validated<T>): T {
 
 function codes(result: Validated<unknown>): string[] {
   return result.ok ? [] : result.issues.map((i) => i.code);
+}
+
+/** A refusal's codes, or else the codes of every loan's problems in the book. */
+function problemCodes(result: Validated<LoanBook>): string[] {
+  if (!result.ok) return result.issues.map((i) => i.code);
+  const found = loanProblems(result.value);
+  return found.ok ? found.value.flatMap((p) => p.problems.map((i) => i.code)) : ["?"];
 }
 
 const BORROWER = newRecordId();
@@ -400,24 +410,28 @@ describe("loan states and the move log", () => {
 describe("indexLoans refuses loans that disagree with the move log", () => {
   it("a move not in the log for that record", () => {
     expect(
-      codes(
+      problemCodes(
         indexLoans(LOG, [loanOut({ items: [{ recordId: print, loanOutMoveId: newMoveId() }] })]),
       ),
     ).toEqual(["unknown_move"]);
     // Another record's move.
     expect(
-      codes(indexLoans(LOG, [loanOut({ items: [{ recordId: print, loanOutMoveId: mapOut.id }] })])),
+      problemCodes(
+        indexLoans(LOG, [loanOut({ items: [{ recordId: print, loanOutMoveId: mapOut.id }] })]),
+      ),
     ).toEqual(["unknown_move"]);
   });
 
   it("a move with the wrong reason", () => {
     expect(
-      codes(
+      problemCodes(
         indexLoans(LOG, [loanOut({ items: [{ recordId: print, loanOutMoveId: placePrint.id }] })]),
       ),
-    ).toEqual(["wrong_move_reason", "not_agent_location"]);
+    ).toEqual(["wrong_move_reason", "not_agent_location", "move_outside_loan"]);
     expect(
-      codes(indexLoans(LOG, [loanIn({ items: [{ recordId: map, arrivalMoveId: mapBack.id }] })])),
+      problemCodes(
+        indexLoans(LOG, [loanIn({ items: [{ recordId: map, arrivalMoveId: mapBack.id }] })]),
+      ),
     ).toEqual(["wrong_move_reason"]);
   });
 
@@ -425,7 +439,7 @@ describe("indexLoans refuses loans that disagree with the move log", () => {
     const toConservator = move(print, conservator.id, "2026-09-01", "loan_out");
     const log = ok(indexMoves(INDEX, [placePrint, toConservator]));
     expect(
-      codes(
+      problemCodes(
         indexLoans(log, [
           loanOut({ items: [{ recordId: print, loanOutMoveId: toConservator.id }] }),
         ]),
@@ -437,7 +451,7 @@ describe("indexLoans refuses loans that disagree with the move log", () => {
     const away = move(lantern, borrowerPlace.id, "2026-11-01", "departure");
     const log = ok(indexMoves(INDEX, [lanternIn, away]));
     expect(
-      codes(
+      problemCodes(
         indexLoans(log, [
           loanIn({
             items: [{ recordId: lantern, arrivalMoveId: lanternIn.id, departureMoveId: away.id }],
@@ -454,7 +468,7 @@ describe("indexLoans refuses loans that disagree with the move log", () => {
     const lateBack = move(print, shelf.id, "2026-11-22", "return");
     const log = ok(indexMoves(INDEX, [placePrint, early, printOut, firstBack, second, lateBack]));
     expect(
-      codes(
+      problemCodes(
         indexLoans(log, [
           loanOut({
             items: [{ recordId: print, loanOutMoveId: printOut.id, returnMoveId: early.id }],
@@ -463,7 +477,7 @@ describe("indexLoans refuses loans that disagree with the move log", () => {
       ),
     ).toEqual(["end_out_of_order"]);
     expect(
-      codes(
+      problemCodes(
         indexLoans(log, [
           loanOut({
             items: [{ recordId: print, loanOutMoveId: printOut.id, returnMoveId: lateBack.id }],
@@ -477,7 +491,7 @@ describe("indexLoans refuses loans that disagree with the move log", () => {
     const again = move(print, borrowerPlace.id, "2026-10-01", "loan_out");
     const log = ok(indexMoves(INDEX, [...MOVES, again]));
     expect(
-      codes(
+      problemCodes(
         indexLoans(log, [
           loanOut(),
           loanOut({ number: "LO-2026-002", items: [{ recordId: print, loanOutMoveId: again.id }] }),
@@ -485,7 +499,7 @@ describe("indexLoans refuses loans that disagree with the move log", () => {
       ),
     ).toEqual(["overlapping_loans"]);
     expect(
-      codes(
+      problemCodes(
         indexLoans(LOG, [
           loanOut(),
           loanOut({
@@ -499,9 +513,9 @@ describe("indexLoans refuses loans that disagree with the move log", () => {
 
   it("duplicate IDs and numbers; numbers in and out are kept apart", () => {
     const a = loanOut();
-    expect(codes(indexLoans(LOG, [a, { ...a, number: "LO-9" }]))).toEqual(["duplicate_id"]);
+    expect(problemCodes(indexLoans(LOG, [a, { ...a, number: "LO-9" }]))).toEqual(["duplicate_id"]);
     expect(
-      codes(
+      problemCodes(
         indexLoans(LOG, [a, loanOut({ number: "lo-2026-001", items: [{ recordId: lantern }] })]),
       ),
     ).toEqual(["duplicate_number"]);
@@ -511,7 +525,7 @@ describe("indexLoans refuses loans that disagree with the move log", () => {
   it("re-checks every loan when the move log changes", () => {
     const b = book([loanOut()]);
     const other = ok(indexMoves(INDEX, [placePrint, placeMap]));
-    expect(codes(reindexLoans(b, other))).toContain("unknown_move");
+    expect(problemCodes(reindexLoans(b, other))).toContain("unknown_move");
   });
 
   it("withLoan refuses changing a loan's direction, and reports without the book position", () => {
@@ -520,5 +534,128 @@ describe("indexLoans refuses loans that disagree with the move log", () => {
     expect(codes(withLoan(b, { ...loanIn(), id: out.id }))).toEqual(["direction_changed"]);
     const bad = withLoan(b, { ...out, items: [{ recordId: print, loanOutMoveId: newMoveId() }] });
     expect(bad.ok ? [] : bad.issues[0]?.path).toEqual(["items", 0, "loanOutMoveId"]);
+  });
+});
+
+describe("review fixes", () => {
+  it("a linked loan_out or arrival must fall within the loan period", () => {
+    const record = newRecordId();
+    const old = move(record, shelf.id, "2020-01-01", "placement");
+    const oldOut = move(record, borrowerPlace.id, "2020-03-01", "loan_out");
+    const log = ok(indexMoves(INDEX, [old, oldOut]));
+    const out = loanOut({ items: [{ recordId: record, loanOutMoveId: oldOut.id }] });
+    expect(problemCodes(indexLoans(log, [out]))).toEqual(["move_outside_loan"]);
+    expect(codes(withLoan(book([], log), out))).toEqual(["move_outside_loan"]);
+    const late = move(record, borrowerPlace.id, "2026-12-02", "loan_out", {
+      recordedAt: "2026-12-02T12:00:00.000Z",
+    });
+    const log2 = ok(
+      indexMoves(INDEX, [old, oldOut, move(record, shelf.id, "2020-06-01", "return"), late]),
+    );
+    expect(
+      problemCodes(
+        indexLoans(log2, [loanOut({ items: [{ recordId: record, loanOutMoveId: late.id }] })]),
+      ),
+    ).toEqual(["move_outside_loan"]);
+    // A loan in can't claim a 1990 placement as its arrival.
+    const borrowed = newRecordId();
+    const ancient = move(borrowed, shelf.id, "1990-05-01", "placement");
+    const log3 = ok(indexMoves(INDEX, [ancient]));
+    expect(
+      problemCodes(
+        indexLoans(log3, [loanIn({ items: [{ recordId: borrowed, arrivalMoveId: ancient.id }] })]),
+      ),
+    ).toEqual(["move_outside_loan"]);
+  });
+
+  it("loanOutMove refuses a day before the loan begins", () => {
+    const pending = loanOut({ items: [{ recordId: print }] });
+    expect(codes(loanOutMove(pending, print, borrowerPlace.id, "2026-08-31"))).toEqual([
+      "before_loan_begin",
+    ]);
+    expect(ok(loanOutMove(pending, print, borrowerPlace.id, "2026-09-01")).movedOn).toBe(
+      "2026-09-01",
+    );
+  });
+
+  it("a loan can hold MAX_LOAN_ITEMS items with both moves named, either way", () => {
+    const full = (direction: "in" | "out") =>
+      Array.from({ length: MAX_LOAN_ITEMS }, () =>
+        direction === "out"
+          ? { recordId: newRecordId(), loanOutMoveId: newMoveId(), returnMoveId: newMoveId() }
+          : { recordId: newRecordId(), arrivalMoveId: newMoveId(), departureMoveId: newMoveId() },
+      );
+    const out = {
+      ...loanOut(),
+      items: full("out"),
+      terms: "x".repeat(2000),
+      note: "y".repeat(2000),
+    };
+    expect(ok(validateLoan(out)).items).toHaveLength(MAX_LOAN_ITEMS);
+    expect(ok(validateLoan({ ...loanIn(), items: full("in") })).items).toHaveLength(MAX_LOAN_ITEMS);
+  });
+
+  it("a loan's status can't be dated in the future (a day of slack)", () => {
+    expect(ok(validateLoan(loanOut({ statusOn: "2026-11-24" }), NOW)).statusOn).toBe("2026-11-24");
+    expect(codes(validateLoan(loanOut({ statusOn: "2026-11-25" }), NOW))).toEqual([
+      "future_status",
+    ]);
+    expect(codes(withLoan(book([]), loanOut({ statusOn: "2026-11-25" }), NOW))).toEqual([
+      "future_status",
+    ]);
+    expect(codes(validateLoan(loanOut(), new Date(Number.NaN)))).toEqual(["invalid_time"]);
+  });
+
+  it("a back-dated return makes one loan stale without refusing the book", () => {
+    const out = loanOut();
+    const inLoan = loanIn();
+    const b = book([out, inLoan]);
+    // A valid storage move: map came back earlier than the linked return says.
+    const earlier = move(map, shelf.id, "2026-10-01", "return");
+    const log = ok(withMove(LOG, earlier, NOW));
+    const stale = ok(reindexLoans(b, log));
+    expect(ok(loanProblems(stale))).toEqual([
+      {
+        loanId: out.id,
+        problems: [
+          expect.objectContaining({ code: "end_out_of_order", path: ["items", 1, "returnMoveId"] }),
+        ],
+      },
+    ]);
+    expect(ok(loanState(stale, out.id)).problems).toHaveLength(1);
+    expect(ok(loanState(stale, inLoan.id)).problems).toEqual([]);
+    // The stale loan can't be saved as it is; the other loan still can.
+    expect(codes(withLoan(stale, out))).toEqual(["end_out_of_order"]);
+    expect(ok(withLoan(stale, { ...inLoan, note: "Lender visited." })).size).toBe(2);
+    // Relinking the loan to the earlier return fixes it.
+    const fixed = ok(
+      withLoan(stale, {
+        ...out,
+        items: [
+          { recordId: print, loanOutMoveId: printOut.id },
+          { recordId: map, loanOutMoveId: mapOut.id, returnMoveId: earlier.id },
+        ],
+      }),
+    );
+    expect(ok(loanProblems(fixed))).toEqual([]);
+  });
+
+  it("reports departures no loan in names", () => {
+    const departure = move(lantern, lenderPlace.id, "2026-11-20", "departure");
+    const log = ok(withMove(LOG, departure, NOW));
+    const unnamed = book([loanIn()], log);
+    expect(ok(unexplainedDepartures(unnamed)).map((m) => m.id)).toEqual([departure.id]);
+    const named = book(
+      [
+        loanIn({
+          items: [
+            { recordId: lantern, arrivalMoveId: lanternIn.id, departureMoveId: departure.id },
+          ],
+        }),
+      ],
+      log,
+    );
+    expect(ok(unexplainedDepartures(named))).toEqual([]);
+    expect(codes(unexplainedDepartures({ ...named }))).toEqual(["not_a_loan_book"]);
   });
 });
