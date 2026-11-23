@@ -96,11 +96,7 @@ import {
   type FieldTemplate,
 } from "./templates.js";
 import { MAX_RECORD_SET } from "./effective.js";
-import {
-  isMadeLinkChecker,
-  linkCheckerOrganization,
-  linkTargetKind,
-} from "./record-link-brand.js";
+import { isMadeLinkChecker, linkCheckerOrganization, linkTargetKind } from "./record-link-brand.js";
 import { RECORD_KINDS } from "./records.js";
 import type { OrganizationId } from "./organizations.js";
 import { types } from "node:util";
