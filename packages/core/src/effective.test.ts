@@ -21,6 +21,7 @@ import {
   newOrganizationId,
 } from "./index.js";
 import { accessionsFor } from "./public-output.fixtures.js";
+import { cpuClock, hangGuard } from "./cpu-time.fixtures.js";
 
 const ORG = newOrganizationId();
 
@@ -689,28 +690,36 @@ describe("indexRecords: one set, many records", () => {
     expect(asked.some((r) => records.includes(r as ArchivalUnitRecord))).toBe(false);
   });
 
-  it("stays linear: 20,000 items under one collection, 100,000 records in all", () => {
-    const fonds = unit("F", "fonds", undefined, { rights: CNE, creator: "A" });
-    const collection = unit("C", "collection", fonds, { type: "Photographs" });
-    const items: ArchivalUnitRecord[] = [];
-    for (let i = 0; i < 20_000; i += 1) items.push(unit(`I${String(i)}`, "item", collection));
-    const others: ArchivalUnitRecord[] = [];
-    for (let i = 0; i < 80_000; i += 1) others.push(unit(`O${String(i)}`, "fonds"));
-    const index = indexRecords([...others, fonds, collection, ...items]);
-    if (!index.ok) throw new Error("not indexed");
-    // Count the work instead of timing it: each item asks for exactly one
-    // template per record on its chain (3), whatever the size of the set.
-    let asked = 0;
-    const counting: TemplateLookup = () => {
-      asked += 1;
-      return ARCHIVE;
-    };
-    let rights = 0;
-    for (const item of items) {
-      const e = ok(effectiveRecord(item.id, index.value, counting));
-      if (JSON.stringify(e.fields.rights) === JSON.stringify(CNE)) rights += 1;
-    }
-    expect(rights).toBe(20_000);
-    expect(asked).toBe(60_000);
-  }, 30_000);
+  // The 30 seconds that were the test's timeout are CPU time now (U-003),
+  // so a busy machine can't fail it; the timeout is a hang guard only.
+  it(
+    "stays linear: 20,000 items under one collection, 100,000 records in all",
+    hangGuard(30_000),
+    () => {
+      const elapsed = cpuClock();
+      const fonds = unit("F", "fonds", undefined, { rights: CNE, creator: "A" });
+      const collection = unit("C", "collection", fonds, { type: "Photographs" });
+      const items: ArchivalUnitRecord[] = [];
+      for (let i = 0; i < 20_000; i += 1) items.push(unit(`I${String(i)}`, "item", collection));
+      const others: ArchivalUnitRecord[] = [];
+      for (let i = 0; i < 80_000; i += 1) others.push(unit(`O${String(i)}`, "fonds"));
+      const index = indexRecords([...others, fonds, collection, ...items]);
+      if (!index.ok) throw new Error("not indexed");
+      // Count the work instead of timing it: each item asks for exactly one
+      // template per record on its chain (3), whatever the size of the set.
+      let asked = 0;
+      const counting: TemplateLookup = () => {
+        asked += 1;
+        return ARCHIVE;
+      };
+      let rights = 0;
+      for (const item of items) {
+        const e = ok(effectiveRecord(item.id, index.value, counting));
+        if (JSON.stringify(e.fields.rights) === JSON.stringify(CNE)) rights += 1;
+      }
+      expect(rights).toBe(20_000);
+      expect(asked).toBe(60_000);
+      expect(elapsed()).toBeLessThan(30_000);
+    },
+  );
 });
