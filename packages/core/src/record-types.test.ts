@@ -324,7 +324,7 @@ describe("indexRecordTypes and recordTypeDefaults", () => {
   it("refuses an unknown key, a bad key and a registry it didn't make", () => {
     expect(codes(recordTypeDefaults(types(), "letters"))).toEqual(["unknown_record_type"]);
     expect(codes(recordTypeDefaults(types(), "constructor"))).toEqual(["invalid_record_type_key"]);
-    expect(codes(recordTypeDefaults({ size: 1 } as never, "oral-history"))).toEqual([
+    expect(codes(recordTypeDefaults({ size: 1 }, "oral-history"))).toEqual([
       "no_record_type_registry",
     ]);
   });
@@ -389,7 +389,7 @@ describe("checkRecordType", () => {
     expect(
       codes(checkRecordType(record(), { key: "oral-history" } as unknown as RecordType)),
     ).toEqual(["invalid_record_type"]);
-    expect(codes(checkRecordType(record(), { size: 1 } as never))).toEqual(["invalid_record_type"]);
+    expect(codes(checkRecordType(record(), { size: 1 }))).toEqual(["invalid_record_type"]);
   });
 
   it("returns frozen results", () => {
