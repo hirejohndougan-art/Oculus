@@ -1110,8 +1110,10 @@ export function publicView(effective: EffectiveRecord): PublicRecord | undefined
  * refused (`accessions_unknown`), with anything else (`invalid_accessions`)
  * or another organization's register (`mixed_organizations`) too. A record
  * the register holds back, or whose ancestor or represented record it holds
- * back, is refused (`deed_not_signed`); the message names no donor,
- * accession or number. The record, its current ancestry and, for a
+ * back, is refused: `deed_not_signed` for an unsigned deed,
+ * `access_restricted` for an access restriction in force on the register's
+ * day (T-016a, D-053b), both when both hold. The messages name no donor,
+ * accession, number, restriction or date. The record, its current ancestry and, for a
  * digital asset, the record it represents with that record's ancestry (from
  * the records `effectiveRecord` was given; `represented_record_unknown` when
  * they aren't there) must all be records the register knows
@@ -1295,13 +1297,34 @@ function deedIssues(
       "The accession register doesn't know this record, a record above it or the record it shows. Make the register again from the organization's records as they are now.",
     );
   }
-  if (ids.some((id) => holds.isHeld(id))) {
-    return refuse(
-      "deed_not_signed",
-      "This record came from an accession whose deed of gift isn't signed yet, so it is held back from the public site. Mark the deed as signed in Deeds once the signed copy is on file.",
+  // Why, never which accession, restriction or date (D-043, D-053b).
+  const reasons = new Set(ids.flatMap((id) => holds.holdReasons(id)));
+  const found: Issue[] = [];
+  if (reasons.has("deed")) {
+    found.push(
+      issue(
+        ["accessions"],
+        "deed_not_signed",
+        "This record came from an accession whose deed of gift isn't signed yet, so it is held back from the public site. Mark the deed as signed in Deeds once the signed copy is on file.",
+      ),
     );
   }
-  return Object.freeze([]);
+  if (reasons.has("restriction")) {
+    found.push(
+      issue(
+        ["accessions"],
+        "access_restricted",
+        "This record came from an accession with an access restriction in force, so it is held back from the public site. See the accession's restrictions.",
+      ),
+    );
+  }
+  // Fails closed: held for a reason this check doesn't name is still held.
+  if (found.length === 0 && ids.some((id) => holds.isHeld(id))) {
+    found.push(
+      issue(["accessions"], "held_back", "This record is held back from the public site."),
+    );
+  }
+  return Object.freeze(found.map((f) => Object.freeze(f)));
 }
 
 /** The value the nearest ancestor gives for `field`, or undefined. */

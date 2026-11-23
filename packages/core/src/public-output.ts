@@ -55,6 +55,9 @@
  *   unit or digital asset without it (`accessions_unknown`) and one an
  *   accession with a deed `missing` or `sent` produced, or produced an
  *   ancestor or the record a digital asset represents (`deed_not_signed`).
+ *   An accession's access restriction in force on the register's day holds
+ *   back the same records, and links to them, in the same way
+ *   (`access_restricted`, T-016a, D-053b).
  *   With `records`, what a digital asset represents is found again in them.
  *   A link to an object, archival unit or digital asset goes out live only
  *   when `records` is given and the linked record, its ancestry and what it
@@ -251,7 +254,8 @@ export interface PublishOptions {
    * The organization's accession register from `indexAccessions`, as it is
    * now (D-043). Required for an object, archival unit or digital asset
    * (`accessions_unknown` without it): output is refused for a record held
-   * back because a deed of gift it needs isn't signed (`deed_not_signed`),
+   * back because a deed of gift it needs isn't signed (`deed_not_signed`)
+   * or an access restriction is in force (`access_restricted`),
    * checked against this register, never the one the view was made with.
    */
   readonly accessions?: unknown;
