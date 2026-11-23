@@ -48,7 +48,11 @@
  * nothing in public output: no ID, no label, no placeholder, since a label
  * copied from the record (a donor's name, a private item's title) would
  * reveal it. The public view (`publicView`) holds no `record_link` values
- * at all. Staff views (the effective record) keep every link.
+ * at all. Staff views (the effective record) keep every link. A link whose
+ * record no longer exists (`unknown_record` from this checker) is left out
+ * the same way when publishing, and `publicOutput` reports it to staff as
+ * `link_target_missing` in `staffWarnings` rather than refusing the record;
+ * saving it is still refused (S-011c).
  *
  * **A place value naming a place record shows its name only when vouched
  * for** (D-048): the checker given as `checkers.place` (to `effectiveRecord`

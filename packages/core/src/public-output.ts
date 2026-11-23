@@ -86,7 +86,11 @@
  *   itself. Otherwise a `record_link` value puts out nothing at all: no ID,
  *   no label, no placeholder (a term left with no values is left out), so
  *   output never reveals that an unpublished, held back or another
- *   organization's record exists, its ID, or a label copied from it. A place
+ *   organization's record exists, its ID, or a label copied from it. A
+ *   `record_link` to a record the checker doesn't hold (deleted since) is
+ *   left out the same way, instead of refusing the record, and listed in
+ *   `staffWarnings` as `link_target_missing` (S-011c, D-045); saving such a
+ *   link is still refused (`unknown_record`). A place
  *   value naming a place record keeps its own name (and gazetteer URI),
  *   without the link, only when `checkers.place` was made by
  *   `makeRecordLinkChecker` for this organization and holds that record as
@@ -298,6 +302,15 @@ export interface PublicOutput {
   readonly jsonLdText: string;
   /** The record as an OAI-PMH `oai_dc:dc` XML document; encode it as UTF-8. */
   readonly oaiDcXml: string;
+  /**
+   * **Staff only, never published.** What was left out that staff should
+   * fix, as fixed-text issues naming a field and position only: today
+   * `link_target_missing`, a public `record_link` whose record no longer
+   * exists (deleted, or not in the record link checker), left out of every
+   * form as an unpublished one is (S-011c, D-045). No form above holds any of
+   * it. Empty when there is nothing to report.
+   */
+  readonly staffWarnings: readonly Issue[];
 }
 
 /**
@@ -600,7 +613,7 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
     }
     linkCheckers.set(kind, linkChecker);
   }
-  templateCheck(effective.record, full, template, checkers);
+  const staffWarnings = templateCheck(effective.record, full, template, checkers);
 
   const publicIdentifierTypes = publicIdentifierTypesOf(
     identifierChecker,
@@ -674,6 +687,7 @@ function build(view: PublicRecord, mapping: unknown, options: PublishOptions): P
     jsonLd,
     jsonLdText,
     oaiDcXml: oaiDc(dublinCore),
+    staffWarnings,
   });
 }
 
@@ -976,13 +990,21 @@ function publicTypesOnly(
  * Check the view's values with `checkRecordAgainstTemplate`, as the record
  * they belong to, against the view's own template. Required fields are not
  * checked: a value can be left out of the view because it is staff only.
+ *
+ * A `record_link` value whose record the checker doesn't hold
+ * (`unknown_record`: deleted since, or never in the organization's records)
+ * doesn't refuse the record (S-011c): such a link is never linkable (the
+ * checker holds no kind for it), so it is left out of every form exactly as
+ * an unpublished one is (D-045), and is returned as a staff warning
+ * (`link_target_missing`) instead. The save-time check still refuses it.
+ * Any other problem refuses the output.
  */
 function templateCheck(
   record: CatalogRecord,
   fields: Readonly<Record<string, FieldValue>>,
   template: FieldTemplate,
   checkers: unknown,
-): void {
+): readonly Issue[] {
   const loose: FieldTemplate = {
     ...template,
     fields: template.fields.map((f) => ({ ...f, required: false })),
@@ -993,12 +1015,35 @@ function templateCheck(
     loose,
     (checkers === undefined ? {} : { checkers }) as TemplateCheckOptions,
   );
-  // Checker messages quote values (a number, a type key, a date's text), so
-  // none is passed on (S-007); the code and path say what and where.
-  if (problems.length > 0) {
-    throw new OutputError(problems.map((p) => issue(p.path, p.code, TEMPLATE_CHECK_MESSAGE)));
+  const linkKeys = new Set(
+    template.fields.filter((f) => f.kind === "record_link").map((f) => f.key),
+  );
+  const warnings: Issue[] = [];
+  const refusals: Issue[] = [];
+  for (const p of problems) {
+    const [root, key] = p.path;
+    if (
+      p.code === "unknown_record" &&
+      root === "fields" &&
+      typeof key === "string" &&
+      linkKeys.has(key) &&
+      p.path[p.path.length - 1] === "recordId"
+    ) {
+      warnings.push(issue(p.path, "link_target_missing", LINK_TARGET_MISSING_MESSAGE));
+    } else {
+      // Checker messages quote values (a number, a type key, a date's
+      // text), so none is passed on (S-007); the code and path say what and
+      // where.
+      refusals.push(issue(p.path, p.code, TEMPLATE_CHECK_MESSAGE));
+    }
   }
+  if (refusals.length > 0) throw new OutputError(refusals);
+  return Object.freeze(warnings.map((w) => Object.freeze({ ...w })));
 }
+
+/** The message of every `link_target_missing` staff warning. */
+const LINK_TARGET_MISSING_MESSAGE =
+  "This link's record isn't one of this organization's records now (it was deleted, or the record link checker doesn't hold it), so the link was left out of the public output. Remove the link, point it at another record, or make the checker from the current records.";
 
 /** The message of every issue the template check (and its checkers) found here. */
 const TEMPLATE_CHECK_MESSAGE =

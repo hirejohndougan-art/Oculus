@@ -87,7 +87,7 @@ function record(fields: Record<string, unknown>): CatalogRecord {
 }
 
 function identifierChecker(types: unknown = TYPES): FieldValueChecker {
-  const made = makeIdentifierChecker(types);
+  const made = makeIdentifierChecker(types, ORG);
   if (!made.ok) throw new Error(JSON.stringify(made.issues));
   return made.value;
 }
@@ -149,12 +149,13 @@ describe("checkRightsValue", () => {
 
 describe("makeIdentifierChecker", () => {
   it("refuses identifier types that aren't valid, and makes no checker", () => {
-    const r = makeIdentifierChecker([
-      { key: "Accession", label: "A", organizationId: ORG, uniqueness: "none" },
-    ]);
+    const r = makeIdentifierChecker(
+      [{ key: "Accession", label: "A", organizationId: ORG, uniqueness: "none" }],
+      ORG,
+    );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(codes(r.issues)).toEqual(["invalid_key"]);
-    const notList = makeIdentifierChecker({ accession: {} });
+    const notList = makeIdentifierChecker({ accession: {} }, ORG);
     expect(notList.ok).toBe(false);
     if (!notList.ok) expect(codes(notList.issues)).toEqual(["not_a_list"]);
   });
@@ -429,6 +430,6 @@ describe("identifier type visibility (D-022)", () => {
   });
 
   it("refuses a type marked public other than with true", () => {
-    expect(makeIdentifierChecker([{ ...MIXED[1], public: "true" }]).ok).toBe(false);
+    expect(makeIdentifierChecker([{ ...MIXED[1], public: "true" }], ORG).ok).toBe(false);
   });
 });

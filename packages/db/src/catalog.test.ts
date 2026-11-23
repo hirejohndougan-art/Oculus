@@ -256,23 +256,26 @@ function sampleRecords(org: OrganizationId): CatalogRecord[] {
 
 const identifierChecker = (org: OrganizationId): TemplateCheckOptions => {
   const checker = ok(
-    makeIdentifierChecker([
-      {
-        key: "call_number",
-        label: "Call number",
-        pattern: "MS-####.#",
-        organizationId: org,
-        uniqueness: "current",
-        public: true,
-      },
-      {
-        key: "accession_number",
-        label: "Accession number",
-        organizationId: org,
-        uniqueness: "all_time",
-        public: true,
-      },
-    ]),
+    makeIdentifierChecker(
+      [
+        {
+          key: "call_number",
+          label: "Call number",
+          pattern: "MS-####.#",
+          organizationId: org,
+          uniqueness: "current",
+          public: true,
+        },
+        {
+          key: "accession_number",
+          label: "Accession number",
+          organizationId: org,
+          uniqueness: "all_time",
+          public: true,
+        },
+      ],
+      org,
+    ),
   );
   return { checkers: { identifier: checker }, allowMissingInherited: true };
 };

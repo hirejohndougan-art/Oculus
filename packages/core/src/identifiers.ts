@@ -35,9 +35,11 @@
  *
  * - **One organization at a time** (D-019, D-030). Identifier types and a
  *   record's identifiers carry their `organizationId`, and a number is unique
- *   only within its organization. `validateIdentifierTypes`,
- *   `validateRecordIdentifiers`, `uniquenessIssues`, `checkNewIdentifier` and
- *   `nextIdentifier` refuse inputs of more than one organization
+ *   only within its organization. `validateIdentifierTypes` takes the
+ *   caller's organization and refuses any type not of it before reading
+ *   anything else (S-009b); `validateRecordIdentifiers`, `uniquenessIssues`,
+ *   `checkNewIdentifier` and `nextIdentifier` refuse inputs of more than one
+ *   organization
  *   (`mixed_organizations`), and so do `findByIdentifier` and
  *   `findIdentifierConflicts`, which return a `Validated` list for that
  *   reason. An entry that doesn't say which organization it belongs to
@@ -284,17 +286,43 @@ export function validateNewIdentifierType(input: unknown): Validated<IdentifierT
 
 /**
  * Check an organization's whole list of identifier types: each type, plus no
- * two with the same key. A list mixing organizations, or holding a type
- * whose organization can't be read, gets only organization issues
- * (`mixed_organizations`, `invalid_organization`), never one naming a key
- * (S-009a). Never throws.
- *
- * A list wholly owned by one other organization still gets messages that name
- * its keys: this function doesn't know the caller's organization. Callers must
- * check the list's organization first and never show another organization's
- * issues (S-009b).
+ * two with the same key. `organizationId` is the caller's organization: every
+ * entry must be one of its types, read as a plain own data property before
+ * anything else about the list is looked at. Any entry that isn't (another
+ * organization's, one naming none, one that isn't a plain object, or one
+ * behind a getter) refuses the list with only `mixed_organizations` issues,
+ * so no message ever names a key of another organization's list, valid or
+ * not, mixed or wholly theirs (S-009a, S-009b). An `organizationId` that
+ * isn't an organization ID is `invalid_organization`. Never throws.
  */
-export function validateIdentifierTypes(input: unknown): Validated<readonly IdentifierType[]> {
+export function validateIdentifierTypes(
+  input: unknown,
+  organizationId: OrganizationId,
+): Validated<readonly IdentifierType[]> {
+  if (!isOrganizationId(organizationId)) {
+    return {
+      ok: false,
+      issues: [
+        issue(
+          ["organizationId"],
+          "invalid_organization",
+          "Say which organization these identifier types must belong to: organizationId must be an organization ID.",
+        ),
+      ],
+    };
+  }
+  return readTypeList(input, organizationId);
+}
+
+/**
+ * `validateIdentifierTypes`, or with no organization given, the organization
+ * of the list's first entry (for the set functions here, which take types and
+ * identifiers together and report nothing but fixed text, `readTypes`).
+ */
+function readTypeList(
+  input: unknown,
+  organizationId: OrganizationId | undefined,
+): Validated<readonly IdentifierType[]> {
   return guarded(() => {
     const issues = new IssueList();
     if (types.isProxy(input) || !Array.isArray(input)) {
@@ -315,30 +343,23 @@ export function validateIdentifierTypes(input: unknown): Validated<readonly Iden
         ],
       };
     }
+    const owner = organizationId ?? organizationIdOf(entryAt(input, 0));
+    const owners = organizationIssues(input, owner);
+    if (owners.length > 0) return { ok: false, issues: owners };
     const copy = readPlainData(input, [], TYPES_LIMITS, issues);
     if (copy === undefined || !Array.isArray(copy)) return { ok: false, issues: issues.items };
     const list = copy as readonly JsonValue[];
-    const owners = organizationIssues(list);
-    if (owners.length > 0) return { ok: false, issues: owners };
+    // Checked again on the copy, which is what is validated and returned.
+    if (organizationIssues(list, owner).length > 0) {
+      return { ok: false, issues: [mixedOrganizationsIssue([], "These identifier types")] };
+    }
     const seen = new Set<string>();
-    let organization: string | undefined;
     list.forEach((item, index) => {
       if (!isPlainObject(item)) {
         issues.add([index], "not_an_object", "An identifier type must be a plain object.");
         return;
       }
       checkType(item, [index], issues);
-      const owner = item.organizationId;
-      if (isOrganizationId(owner)) {
-        organization ??= owner;
-        if (owner !== organization) {
-          const mixed = mixedOrganizationsIssue(
-            [index, "organizationId"],
-            "These identifier types",
-          );
-          issues.add(mixed.path, mixed.code, mixed.message);
-        }
-      }
       const key = item.key;
       if (typeof key === "string") {
         if (seen.has(key)) {
@@ -356,48 +377,25 @@ export function validateIdentifierTypes(input: unknown): Validated<readonly Iden
   }, "These identifier types could not be read as plain data.");
 }
 
+/** A list's slot as a plain data property, or undefined (a hole, a getter). */
+function entryAt(list: readonly unknown[], index: number): unknown {
+  const slot = Object.getOwnPropertyDescriptor(list, index);
+  return slot !== undefined && "value" in slot ? slot.value : undefined;
+}
+
 /**
- * The organization issues of a list of two or more types that mixes
- * organizations, or holds a type whose organization can't be read: one per
- * such entry, and nothing else, so no issue quotes a key of a type that may
- * be another organization's (S-009a). Empty when the list is one
- * organization's (or holds at most one type). Entries that aren't objects
- * hold no key and are left to the full check.
+ * One `mixed_organizations` issue per entry that isn't a type of `owner`:
+ * its slot and its `organizationId` read as plain own data properties
+ * (`organizationIdOf`: Proxies and getters count as another organization's),
+ * and nothing else read, so no issue quotes a key of a type that may be
+ * another organization's (S-009a, S-009b). Empty when every entry is
+ * `owner`'s; with no `owner`, every entry is refused.
  */
-function organizationIssues(list: readonly JsonValue[]): Issue[] {
-  if (list.length < 2) return [];
-  let first: OrganizationId | undefined;
-  let mixed = false;
-  const found: { index: number; owner: OrganizationId | undefined; object: boolean }[] = [];
-  for (const [index, item] of list.entries()) {
-    // An entry that isn't an object says no organization either: it makes the
-    // list mixed, so no key from the rest of the list is quoted (S-009a).
-    if (!isPlainObject(item)) {
-      mixed = true;
-      found.push({ index, owner: undefined, object: false });
-      continue;
-    }
-    const value = ownOnly(item).organizationId;
-    const owner = isOrganizationId(value) ? value : undefined;
-    if (owner === undefined) mixed = true;
-    else if (first === undefined) first = owner;
-    else if (owner !== first) mixed = true;
-    found.push({ index, owner, object: true });
-  }
-  if (!mixed) return [];
+function organizationIssues(list: readonly unknown[], owner: OrganizationId | undefined): Issue[] {
   const out: Issue[] = [];
-  for (const { index, owner, object } of found) {
-    if (!object) {
-      out.push(issue([index], "not_an_object", "An identifier type must be an object."));
-    } else if (owner === undefined) {
-      out.push(
-        issue(
-          [index, "organizationId"],
-          "invalid_organization",
-          "Every identifier type belongs to one organization: organizationId must be an organization ID.",
-        ),
-      );
-    } else if (owner !== first) {
+  for (let index = 0; index < list.length; index += 1) {
+    const found = organizationIdOf(entryAt(list, index));
+    if (owner === undefined || found !== owner) {
       out.push(mixedOrganizationsIssue([index, "organizationId"], "These identifier types"));
     }
   }
@@ -1525,7 +1523,7 @@ const MIXED = (): Issue => mixedOrganizationsIssue([], "These identifiers and id
  * other problem `invalid_identifier_types`. Never throws.
  */
 function readTypes(identifierTypes: unknown): Validated<readonly IdentifierType[]> {
-  const read = validateIdentifierTypes(identifierTypes);
+  const read = readTypeList(identifierTypes, undefined);
   if (read.ok) return read;
   const mixed = read.issues.some(
     (i) => i.code === "mixed_organizations" || i.code === "invalid_organization",

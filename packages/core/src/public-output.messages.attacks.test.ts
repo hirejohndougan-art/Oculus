@@ -33,16 +33,19 @@ function codes(result: Validated<unknown>): string[] {
   return result.ok ? [] : result.issues.map((i) => i.code);
 }
 
-const checker = makeIdentifierChecker([
-  {
-    key: "accession_number",
-    label: "Accession number",
-    organizationId: ORG,
-    uniqueness: "none",
-    pattern: "D-####",
-    public: true,
-  },
-]);
+const checker = makeIdentifierChecker(
+  [
+    {
+      key: "accession_number",
+      label: "Accession number",
+      organizationId: ORG,
+      uniqueness: "none",
+      pattern: "D-####",
+      public: true,
+    },
+  ],
+  ORG,
+);
 if (!checker.ok) throw new Error("identifier types");
 const CHECKERS = Object.freeze({ identifier: checker.value });
 

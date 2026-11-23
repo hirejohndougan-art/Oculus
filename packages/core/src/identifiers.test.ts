@@ -150,36 +150,42 @@ describe("identifier type visibility (D-022)", () => {
 
 describe("validateIdentifierTypes", () => {
   it("accepts a list and reports duplicate keys", () => {
-    expect(validateIdentifierTypes(TYPES).ok).toBe(true);
-    const r = validateIdentifierTypes([BOX, { ...BOX, label: "Other" }]);
+    expect(validateIdentifierTypes(TYPES, ORG).ok).toBe(true);
+    const r = validateIdentifierTypes([BOX, { ...BOX, label: "Other" }], ORG);
     expect(codes(r)).toEqual(["duplicate_key"]);
     expect(r.ok ? [] : r.issues[0]?.path).toEqual([1, "key"]);
   });
 
   it("reports problems inside each type with its position", () => {
-    const r = validateIdentifierTypes([
-      BOX,
-      { ...BOX, key: "x", organizationId: ORG, uniqueness: "maybe" },
-      { ...BOX, key: "y", label: 5 },
-    ]);
+    const r = validateIdentifierTypes(
+      [
+        BOX,
+        { ...BOX, key: "x", organizationId: ORG, uniqueness: "maybe" },
+        { ...BOX, key: "y", label: 5 },
+      ],
+      ORG,
+    );
     expect(r.ok ? [] : r.issues.map((i) => [i.path[0], i.code])).toEqual([
       [1, "invalid_uniqueness"],
       [2, expect.any(String)],
     ]);
-    // An entry that isn't an object says no organization, so it alone is
-    // reported until it is fixed (S-009a): nothing else in the list is quoted.
-    const s = validateIdentifierTypes([BOX, { ...BOX, key: "x", uniqueness: "maybe" }, 5]);
-    expect(s.ok ? [] : s.issues.map((i) => [i.path, i.code])).toEqual([[[2], "not_an_object"]]);
+    // An entry that isn't an object isn't one of the caller's types, so it
+    // alone is reported until it is fixed (S-009a, S-009b): nothing else in
+    // the list is quoted.
+    const s = validateIdentifierTypes([BOX, { ...BOX, key: "x", uniqueness: "maybe" }, 5], ORG);
+    expect(s.ok ? [] : s.issues.map((i) => [i.path, i.code])).toEqual([
+      [[2, "organizationId"], "mixed_organizations"],
+    ]);
   });
 
   it("refuses a non-list and too many types", () => {
-    expect(codes(validateIdentifierTypes({}))).toEqual(["not_a_list"]);
+    expect(codes(validateIdentifierTypes({}, ORG))).toEqual(["not_a_list"]);
     const many = Array.from({ length: MAX_IDENTIFIER_TYPES + 1 }, (_, i) => ({
       ...BOX,
       key: `t${String(i)}`,
     }));
-    expect(codes(validateIdentifierTypes(many))).toEqual(["too_many"]);
-    expect(validateIdentifierTypes(many.slice(1)).ok).toBe(true);
+    expect(codes(validateIdentifierTypes(many, ORG))).toEqual(["too_many"]);
+    expect(validateIdentifierTypes(many.slice(1), ORG).ok).toBe(true);
   });
 });
 

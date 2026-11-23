@@ -2,6 +2,15 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-23 16:45 CT — manual (John: "continue") — S-009b, S-011c
+- Result: done
+- What changed: **S-009b** `validateIdentifierTypes(types, organizationId)` and `makeIdentifierChecker(types, organizationId)` take the caller's organization and refuse any list holding another organization's entry before quoting anything (D-030 amended). **S-011c** a public record link whose target no longer exists is left out of public output like an unpublished one, with a staff-only `link_target_missing` warning in `staffWarnings`; saving such a link is still refused (D-045 amended).
+- Decisions: D-030 and D-045 amended
+- Review: independent review: safe (notes: T-050 must render only the public forms, never `staffWarnings`).
+- Note: the first gate run failed because a reviewer's cleanup removed the gate's temporary database socket mid-run; the re-run passed.
+- Gate: PASS · tests_passing 3223 (was 3210) · npm audit clean
+- Next: T-026 (identifier schema, fixing review findings)
+
 ## 2026-11-23 16:05 CT — manual (John: "do a long building") — T-025 Schema: records, templates and record types
 - Result: done
 - What changed: migration `0002_catalog.sql`: organizations; templates and record types as identity rows plus versioned, validated JSON; records keyed by `(organization_id, id)`; every foreign key between catalog rows includes the organization; checks back up core's rules; `catalog_keep_identity` (fixed search path, fires last) refuses any UPDATE that changes a row's organization or identity. `packages/db/src/catalog.ts` inserts and reads with core validation on both sides; record type versions are checked against the stored default template in the same statement. `npm run db:migrate` builds core first (with a clean-checkout test).

@@ -10,7 +10,7 @@
  *   canonical URI of an accepted rights statement or license
  *   (`validateRightsUri`, rights.ts, D-011). It needs nothing from the
  *   organization, so `checkRecordAgainstTemplate` runs it by default.
- * - `makeIdentifierChecker(types)`, for the `identifier` kind: the `type`
+ * - `makeIdentifierChecker(types, organizationId)`, for the `identifier` kind: the `type`
  *   must be one of the organization's identifier types, and the `value` must
  *   follow the rules every identifier follows and fit that type's format
  *   (identifiers.ts, D-009). In a public field the type must also be
@@ -80,8 +80,8 @@ export const checkRightsValue: FieldValueChecker = (value) => {
 /** What `makeIdentifierChecker` remembers about each checker it made. */
 interface MadeChecker {
   readonly publicKeys: ReadonlySet<string>;
-  /** The organization its types belong to; undefined when it was made with no types. */
-  readonly organizationId: OrganizationId | undefined;
+  /** The organization it was made for (its types are that organization's). */
+  readonly organizationId: OrganizationId;
 }
 
 /**
@@ -107,10 +107,7 @@ export function publicIdentifierTypesOf(
 ): ReadonlySet<string> | undefined {
   if (typeof checker !== "function") return undefined;
   const found = MADE.get(checker);
-  if (found === undefined) return undefined;
-  // Made with no types: it knows no public type, for any organization.
-  if (found.organizationId === undefined) return new Set();
-  if (found.organizationId !== organizationId) return undefined;
+  if (found === undefined || found.organizationId !== organizationId) return undefined;
   return new Set(found.publicKeys);
 }
 
@@ -120,16 +117,19 @@ export function publicIdentifierTypesOf(
  */
 export function isOtherOrganizationsChecker(checker: unknown, organizationId: unknown): boolean {
   if (typeof checker !== "function") return false;
-  const found = MADE.get(checker);
-  const made = found?.organizationId;
+  const made = MADE.get(checker)?.organizationId;
   return made !== undefined && made !== organizationId;
 }
 
 /**
  * Make the checker for `identifier` values (`{ type, value }`) from the
- * organization's identifier types. The types are untrusted (they are edited
- * in the admin screens), so they are checked first with
- * `validateIdentifierTypes`; if they aren't valid, no checker is made.
+ * identifier types of the organization `organizationId`, the caller's. The
+ * types are untrusted (they are edited in the admin screens), so they are
+ * checked first with `validateIdentifierTypes(identifierTypes,
+ * organizationId)`; if they aren't valid, no checker is made. A list holding
+ * any type that isn't that organization's is refused with
+ * `mixed_organizations` only, so another organization's list never gets a
+ * message naming its keys (S-009b).
  *
  * The checker reports `unknown_type` for a type the organization doesn't
  * have, `private_identifier_type` for a type that isn't `public` in a
@@ -137,19 +137,20 @@ export function isOtherOrganizationsChecker(checker: unknown, organizationId: un
  * out), and the identifier problems `checkNewIdentifier` reports for the
  * value (`untrimmed`, `too_long`, `control_characters`,
  * `invisible_characters`, `format_mismatch` …), except uniqueness, which
- * needs every record. The types are one organization's (D-030), and the
- * checker refuses every value of a record of any other organization, or of
- * one that doesn't say which (`wrong_organization_checker`), so one
- * organization's `public` types can't wave through another's staff numbers.
- * Never throws.
+ * needs every record. The checker belongs to `organizationId`, even when
+ * made with no types (D-030), and refuses every value of a record of any
+ * other organization, or of one that doesn't say which
+ * (`wrong_organization_checker`), so one organization's `public` types can't
+ * wave through another's staff numbers. Never throws.
  */
-export function makeIdentifierChecker(identifierTypes: unknown): Validated<FieldValueChecker> {
-  const checked = validateIdentifierTypes(identifierTypes);
+export function makeIdentifierChecker(
+  identifierTypes: unknown,
+  organizationId: OrganizationId,
+): Validated<FieldValueChecker> {
+  const checked = validateIdentifierTypes(identifierTypes, organizationId);
   if (!checked.ok) return checked;
   const byKey = new Map<string, IdentifierType>();
   const publicKeys = new Set<string>();
-  // validateIdentifierTypes refuses a list of more than one organization.
-  const organizationId = checked.value[0]?.organizationId;
   for (const type of checked.value) {
     byKey.set(type.key, type);
     // Own property only: a polluted Object.prototype can't make a type public.
@@ -162,9 +163,7 @@ export function makeIdentifierChecker(identifierTypes: unknown): Validated<Field
       if (typeof (record as unknown) !== "object" || (record as unknown) === null) {
         return UNREADABLE;
       }
-      // With no types there is no organization, and every type is unknown.
-      const owner = organizationIdOf(record);
-      if (organizationId !== undefined && owner !== organizationId) {
+      if (organizationIdOf(record) !== organizationId) {
         return problems([
           {
             code: "wrong_organization_checker",

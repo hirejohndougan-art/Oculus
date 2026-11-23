@@ -1247,15 +1247,19 @@ describe("public output won't use another organization's records (D-019)", () =>
 describe("another organization's identifier checker can't publish a staff number (D-019)", () => {
   // This organization's `accession_number` is staff only; another organization
   // has a public type with the same key.
-  const OTHER_PUBLIC = makeIdentifierChecker([
-    {
-      key: "accession_number",
-      label: "Accession number",
-      organizationId: newOrganizationId(),
-      uniqueness: "none",
-      public: true,
-    },
-  ]);
+  const otherOrganization = newOrganizationId();
+  const OTHER_PUBLIC = makeIdentifierChecker(
+    [
+      {
+        key: "accession_number",
+        label: "Accession number",
+        organizationId: otherOrganization,
+        uniqueness: "none",
+        public: true,
+      },
+    ],
+    otherOrganization,
+  );
   if (!OTHER_PUBLIC.ok) throw new Error("bad fixture");
   const other = { identifier: OTHER_PUBLIC.value };
   const MAP = {

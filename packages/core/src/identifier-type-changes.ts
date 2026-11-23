@@ -78,7 +78,6 @@ import { validateRecord, type CatalogRecord } from "./records.js";
 import type { RecordId } from "./record-id.js";
 import {
   MAX_AUTO_NUMBER,
-  MAX_IDENTIFIER_TYPES,
   validateIdentifierType,
   isIdentifierTypeKey,
   readStoredIdentifiers,
@@ -512,23 +511,13 @@ function readUse(input: unknown, type: IdentifierType, listed = true): Validated
       ),
     ],
   });
-  // The list's organization is checked before the list is validated, so
-  // another organization's list, valid or not, gets no message naming its
-  // keys (S-009a). Each entry and its organizationId are read as plain own
-  // data properties, as `oneOrganization` does; a list too long or not a
-  // list is left to validateIdentifierTypes, whose messages for those name
-  // nothing.
-  if (
-    !types.isProxy(typesInput) &&
-    Array.isArray(typesInput) &&
-    typesInput.length <= MAX_IDENTIFIER_TYPES
-  ) {
-    const entries: unknown[] = [];
-    for (let i = 0; i < typesInput.length; i += 1) entries.push(own(typesInput, String(i)));
-    if (oneOrganization([type, ...entries]) === "mixed") return mixedTypes();
-  }
-  const typesRead = validateIdentifierTypes(typesInput);
+  // validateIdentifierTypes checks every entry's organization (as a plain own
+  // data property) against the type's before anything else, so another
+  // organization's list, valid or not, gets no message naming its keys
+  // (S-009a, S-009b).
+  const typesRead = validateIdentifierTypes(typesInput, type.organizationId);
   if (!typesRead.ok) {
+    if (typesRead.issues.some((i) => i.code === "mixed_organizations")) return mixedTypes();
     return {
       ok: false,
       issues: typesRead.issues.map((i) =>
