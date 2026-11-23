@@ -36,6 +36,7 @@ export {
   isRecordKind,
   isArchivalLevel,
   isTemplateKey,
+  isRecordTypeKey,
 } from "./records.js";
 export type {
   RecordKind,
@@ -165,6 +166,22 @@ export type {
   TemplateRegistry,
   LegacyTemplateProblem,
 } from "./templates.js";
+
+export {
+  MAX_RECORD_TYPES,
+  validateRecordType,
+  indexRecordTypes,
+  isRecordTypeRegistry,
+  recordTypeDefaults,
+  recordTypeTemplateIssues,
+  checkRecordType,
+} from "./record-types.js";
+export type {
+  RecordType,
+  RecordTypeDefaults,
+  RecordTypeProblem,
+  RecordTypeRegistry,
+} from "./record-types.js";
 
 export { TEMPLATE_CHANGE_CODES, MAX_LISTED_RECORDS, templateChanges } from "./template-changes.js";
 export type { TemplateChangeCode, TemplateChange, TemplateChanges } from "./template-changes.js";

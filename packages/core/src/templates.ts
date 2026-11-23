@@ -951,6 +951,27 @@ export function isTemplateRegistry(value: unknown): value is TemplateRegistry {
   return typeof value === "object" && value !== null && REGISTRIES.has(value);
 }
 
+/**
+ * The validated template with `key` in a registry from `indexTemplates`, or
+ * undefined when `registry` is not one or holds no such key. For
+ * `record-types.ts` (not exported from the package). Never throws.
+ */
+export function registeredTemplate(registry: unknown, key: string): FieldTemplate | undefined {
+  if (!isTemplateRegistry(registry)) return undefined;
+  return REGISTRIES.get(registry)?.get(key);
+}
+
+/**
+ * The organization whose templates a registry from `indexTemplates` holds,
+ * or undefined when `registry` is not one or is empty. For `record-types.ts`
+ * (not exported from the package). Never throws.
+ */
+export function templateRegistryOrganization(registry: unknown): OrganizationId | undefined {
+  if (!isTemplateRegistry(registry)) return undefined;
+  for (const template of REGISTRIES.get(registry)?.values() ?? []) return template.organizationId;
+  return undefined;
+}
+
 function refused(
   path: readonly (string | number)[],
   code: string,
