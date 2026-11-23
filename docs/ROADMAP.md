@@ -30,12 +30,14 @@ The data model in TypeScript, written for any archive or museum rather than one 
   - 50,000 labels of 6–7 short random words take about 3.6 s against the 2 s target (`term-duplicates.ts` `spelling`), because short keys are charged the 500-cell minimum. Tighten the budget or the blocking.
 - [x] S-006 **Identifier types have no visibility.** (risky) Done: `public` flag, staff by default (D-022). Callers must pass `checkers.identifier` to `effectiveRecord` or identifiers aren't published.
   - A public `identifier` field with no `identifierTypes` publishes values of any type, including ones an organization treats as private. Decide whether types get a `public` flag (staff by default, as the T-004 review asked) and refuse unlisted types in public fields.
-- [ ] S-005a **Two-letter keys in near-duplicate detection.** deps: S-005
+- [x] S-005a **Two-letter keys in near-duplicate detection.** deps: S-005
   - 50,000 keys of 44 letters drawn from two letters take ~3.1 s (target 2 s); about 0.7 s is the abbreviation pass. Needs a bit-parallel distance or faster abbreviation work, without losing pairs.
-- [ ] S-006a **Inherited identifier lists with one staff-type number.** deps: S-006
+  - Done: 50,000 two-letter keys now take about 1.7–1.8 s (was 3.7–4.7 s): a diagonal bounded edit distance, pair visits kept as bits and cheaper abbreviation work, with tests that compare every hostile shape against the old algorithm.
+- [x] S-006a **Inherited identifier lists with one staff-type number.** deps: S-006
   - A repeatable identifier list inherited through public fields is dropped whole from the child's effective record (staff side too) when one number is a staff type; staff see only a `not_valid_here` note. Keep the staff copy on the child. The checker's refusal message also names the staff type's label.
 
 
+  - Done: the inherited value is kept as the child's staff value (D-041); no message names the staff type or quotes its number.
 - [x] T-001 **Project scaffold and gate.**
   - An npm workspaces repo with `packages/core`: TypeScript in strict mode, ESLint, Prettier and Vitest.
   - `npm run gate` runs format, lint, typecheck, tests, build, `npm audit --audit-level=high` and a license check (MIT, BSD, ISC, Apache-2.0 or similarly permissive only).
@@ -92,37 +94,51 @@ The data model in TypeScript, written for any archive or museum rather than one 
   - A vocabulary and term model (LCSH, LCNAF, LCGFT, Nomenclature 4.0, GNIS and local terms), stored as URIs plus labels.
   - Near-duplicate detection for local terms, to feed Data Cleaning.
   - No downloaded vocabulary data yet.
-- [ ] T-009a **Vocabulary follow-ups.** deps: T-009
+- [~] T-009a **Vocabulary follow-ups.** deps: T-009
   - Confirm the Nomenclature 4.0 and GNIS URI patterns from nomenclature.info and USGS once they can be reached, and tighten those checks.
   - A Data Cleaning report of LC-vocabulary terms with no URI.
+  - Done: `findLcTermsWithoutUri`, the Data Cleaning report of LC terms with no URI. Still open: the Nomenclature 4.0 and GNIS URI forms (nomenclature.info and the USGS pages couldn't be read on 2026-11-23).
 - [x] T-010 **Dublin Core and JSON-LD output.** deps: T-006, T-007, T-008
   - Turn a published record into Dublin Core and JSON-LD.
   - Unpublished and staff-only fields never appear in the output. (risky)
   - Fields not in the record's template (left over after a template edit) count as staff-only. Identifier types are staff-only unless marked public, and former-identifier notes are never published (from the T-004 review).
   - Build public output only from `publicView(effective)` and check it with `effectivePublishIssues` (D-013); never from `fields` or `record`.
   - Identifier fields publish only `value`, never `type`. The Dublin Core mapping doesn't check that a field's kind fits its term: handle each kind explicitly.
-- [ ] T-010a **Check public output against the specs.** deps: T-010
+- [x] T-010a **Check public output against the specs.** deps: T-010
   - DCMI term ranges, the DCMI Type URIs, the oai_dc namespace and schema location and the XML 1.0 Char rule were written from knowledge, because dublincore.org, openarchives.org and w3.org couldn't be reached. Check them against the specs when they can be read, and add a JSON-LD processor check in a test if a permissive dev dependency is acceptable (decision entry).
   - Records need a real publish state (Phase 2); `published` is the caller's word until then.
+  - Done: checked against DCMI Terms, OAI-PMH 2.0, XML 1.0 and JSON-LD 1.1 (D-042); `dcterms:type` now has no range, and a test runs the output through a JSON-LD processor. The publish-state part moves to T-034.
 - [x] T-011 **Phase 1 review.** deps: T-001 to T-010
   - Check the model against PLATFORM_PLAN.md §1–2 and the mockup screens.
   - Write the Phase 2 tasks, server and database, using whatever John has answered for Q-1 and Q-2 so far.
   - Done: [reports/2026-11-phase1-review.md](reports/2026-11-phase1-review.md). Q-1 and Q-2 were unanswered, so the Phase 2 tasks that need them say so. The gaps it found are T-012 to T-018.
 - [x] T-012 **Records name their template.** deps: T-005, T-008 Done: `templateKey` on records, `indexTemplates` registry, mismatches refused; no version pin (D-029).
   - Each record stores the key of the template it follows, so the checks and `effectiveRecord` find the template from the record instead of from a lookup the caller supplies. Decide whether a record also pins a template version (decision entry). The database schema (T-025) needs this.
-- [ ] T-013 **Organization-defined record types.** deps: T-012
+- [x] T-013 **Organization-defined record types.** deps: T-012
   - Record types carry a required `organizationId` and are refused across organizations, like templates (D-030, T-019a).
   - PLATFORM_PLAN.md §1 says "admins can add more types", but the six kinds are a fixed list. Decide between new kinds and organization-defined types built on the six (say "Oral history" as a kind of digital asset, with its own default template), then build the type definition and its validator (decision entry).
-- [ ] T-014 **One home for identifiers, and public identifier types.** deps: T-004, T-010 (risky)
+  - Done: D-037: organization record types on the six kinds, with a registry, defaults and `recordTypeTemplateIssues`.
+- [x] T-014 **One home for identifiers, and public identifier types.** deps: T-004, T-010 (risky)
   - Numbers can live both in `RecordIdentifiers` (identifiers.ts) and in template fields of kind `identifier` (`reference_code`, `object_number`). Pick one source of truth (decision entry) and add a `public` flag to identifier types, so a primary number reaches public output only when its type is public.
-- [ ] T-015 **Links between records.** deps: T-012 (risky)
+  - Done: D-038: numbers live in `RecordIdentifiers`; fields point at a current identifier; `publicOutput` requires the identifier sets and refuses numbers no longer held.
+- [x] T-015 **Links between records.** deps: T-012 (risky)
   - Values that point at agent, place or event records: a creator linked to the Authorities list (mockup Authorities, record "Creator"), and related records. Public output follows the D-016 rule: a link to an unpublished record goes out as its label only, never its ID.
+  - Done: D-039: a `record_link` kind and `makeRecordLinkChecker`; links name a record only when it is published and the organization's own; the public view holds no linked IDs.
 - [ ] T-016 **Accessions and deeds of gift.** deps: T-012, T-015 (risky)
   - An accession model (Spectrum acquisition and accessioning): its number (an identifier type), source agent, date received, method, materials, restrictions, deed status (missing, sent, signed, not needed) and the records it produced. A check that holds back from publishing any record whose accession needs a signed deed it doesn't have (mockup Deeds). Accessions and donor contact details are always staff-only.
-- [ ] T-017 **Storage locations and moves.** deps: T-012
+- [x] T-017 **Storage locations and moves.** deps: T-012
   - Storage levels the organization names (Room › Shelf › Box › Folder, from Settings), containers, a record's normal and current location, and moves with a reason and an expected return date (Spectrum location and movement control; mockup Storage and Whereabouts). Staff-only.
+  - Done: D-040: storage levels, locations and a move log as the only truth, staff-only, per organization (`storage.ts`).
 - [ ] T-018 **Loans and condition checks.** deps: T-017
   - Spectrum loans in and out (lender or borrower agent, dates, items, status) and condition checks (date, who checked, condition, notes), as dated entries on objects and archival units (mockup Whereabouts, Conservators, record "Condition"). Staff-only.
+- [ ] T-013a **Record type edits checked against records.** deps: T-013
+  - Editing a record type's kind or key, or deleting it, should list the records that use it first, as `templateChanges` does for templates; optionally a `recordTypes` input on `templateChanges`.
+- [ ] T-015a **Link follow-ups.** deps: T-015
+  - `templateChanges` should report a narrowed `recordKinds` with the records whose links no longer fit; a report of link labels that no longer match the linked record's name.
+- [ ] S-007 **Messages in `publicOutput` issues.** (risky) deps: T-014
+  - From the integration review: `publicOutput` passes the template check's problems through as they are, and the identifier checker's `unknown_type` and `format_mismatch` messages quote a type key or a number. Decide whether `publicOutput` issues are staff-only (and say so) or replace those messages with fixed text.
+- [ ] U-003 **Small hardening and test speed.**
+  - `template-changes.ts` reads `record.templateKey` without checking it is the record's own property; read it as an own data property. The wall-clock tests in `vocabularies.attacks`, `identifiers.attacks`, `term-duplicates` and `effective` fail when the 2-CPU machine is busy: measure relative to a baseline run in the same process, or move the heaviest behind a separate script that the gate still runs.
 
 ## Later phases: notes
 

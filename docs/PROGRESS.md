@@ -10,6 +10,16 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Gate: PASS · tests_passing 2131 (was 2114) · npm audit clean
 - Next: T-019b Organizations on vocabularies, terms, rights settings and Dublin Core mappings (risky)
 
+## 2026-11-23 05:30 CT — manual (John: "Hard push on phase 1") — T-013, T-014, T-015, T-017, S-005a, S-006a, T-009a (part), T-010a
+- Result: done (six branches built in parallel worktrees, merged one at a time into one integration branch, gate on the result); T-009a partial
+- What changed: **T-013** organization record types on the six kinds (`record-types.ts`). **T-014** numbers live only in `RecordIdentifiers`; identifier fields point at a current identifier (`identifier-fields.ts`); `effectiveRecord` and `publicOutput` take the identifier sets. **T-015** a `record_link` kind and `makeRecordLinkChecker` (`record-links.ts`); the public view holds no linked IDs. **T-017** storage levels, locations and moves (`storage.ts`). **S-005a** near-duplicate detection on 50,000 two-letter keys in ~1.8 s (was ~4 s). **S-006a** inherited staff-type identifiers kept for staff. **T-009a** LC terms with no URI report. **T-010a** output checked against the specs; `dcterms:type` has no range; `jsonld` test-only dev dependency.
+- Decisions: D-037, D-038, D-039, D-040, D-041, D-042
+- Review: every branch had an independent review. T-017 and S-005a/S-006a: two rounds each by their builders' reviewers (T-017: due dates lost, never-placed items, edits that made the log unreadable, a forged future `recordedAt`; S-005a: a timing test that proved nothing, unbounded working arrays; all fixed). T-013: safe; `recordTypeDefaults` could create a record in another organization and one broken template disabled all record types; both fixed. T-014: a retired number could be published from a kept view, and identifier sets were only shape-checked; fixed. T-015: a link left in a field changed to text kept its ID in the public view; fixed (misfit values are held back). T-009a/T-010a: safe. A second review of the merged result found no leak; it found a staff-type number quoted in a child's staff note, fixed with a test, and raised S-007 (messages in `publicOutput` issues).
+- Note: the gate's timing tests failed while six agents shared the 2-CPU machine (they fail on main under the same load); the final gate ran on a quiet machine. U-003 makes them robust.
+- Sources: see D-040 and D-042.
+- Gate: PASS · tests_passing 2360 (was 2131) · npm audit clean
+- Next: T-016 Accessions and deeds of gift (risky), then T-018 Loans and condition checks
+
 ## 2026-11-22 06:30 CT — manual (John) — Q-4 Roles
 - Result: done (decision recorded; no code)
 - What changed: John added the Scanner and Donor relations roles and asked that system managers can create custom roles. D-036: roles are sets of permissions from a fixed list, checked by permission rather than by name; custom roles belong to one organization and can't hold system-manager powers. T-041 updated; new task T-041a (custom roles); T-048 waits on it. Every Q- question is now answered.
