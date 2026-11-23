@@ -4,6 +4,7 @@ import {
   awayFromNormal,
   checkLocationDeletion,
   createStorageMove,
+  departures,
   indexLocations,
   indexMoves,
   isIsoDay,
@@ -626,5 +627,57 @@ describe("departure (D-044)", () => {
       ]),
     );
     expect(ok(whereabouts(log, borrowed))?.normal?.id).toBe(shelfB.id);
+  });
+
+  it("can't hide an overdue loan out by departing (review fix)", () => {
+    const lent = newRecordId();
+    const moves = [
+      move(lent, box1.id, "2026-01-01", "placement"),
+      move(lent, conservator.id, "2026-02-01", "loan_out", { expectedReturnOn: "2026-03-01" }),
+    ];
+    const before = ok(indexMoves(withLender, moves));
+    expect(ok(overdueReturns(before, "2026-11-20")).map((w) => w.recordId)).toEqual([lent]);
+    const vanish = move(lent, lender.id, "2026-11-20", "departure");
+    expect(codes(indexMoves(withLender, [...moves, vanish]))).toEqual(["departure_while_away"]);
+    expect(codes(addMove(before, vanish))).toEqual(["departure_while_away"]);
+  });
+
+  it("departs only from inside the organization, while home (review fix)", () => {
+    const r = newRecordId();
+    // Never placed anywhere: never in the organization's care.
+    expect(codes(indexMoves(withLender, [move(r, lender.id, "2026-11-10", "departure")]))).toEqual([
+      "departure_while_away",
+    ]);
+    // In a display case away from its normal location.
+    expect(
+      codes(
+        indexMoves(withLender, [
+          move(r, box1.id, "2026-10-01", "placement"),
+          move(r, case2.id, "2026-10-05", "exhibition"),
+          move(r, lender.id, "2026-11-10", "departure"),
+        ]),
+      ),
+    ).toEqual(["departure_while_away"]);
+    // Departed twice.
+    expect(
+      codes(
+        indexMoves(withLender, [
+          move(r, box1.id, "2026-10-01", "placement"),
+          move(r, lender.id, "2026-11-10", "departure"),
+          move(r, lender.id, "2026-11-11", "departure"),
+        ]),
+      ),
+    ).toEqual(["departure_while_away"]);
+    // Back home after the exhibition, it may go.
+    const fine = ok(
+      indexMoves(withLender, [
+        move(r, box1.id, "2026-10-01", "placement"),
+        move(r, case2.id, "2026-10-05", "exhibition", { expectedReturnOn: "2026-10-30" }),
+        move(r, box1.id, "2026-10-29", "return"),
+        move(r, lender.id, "2026-11-10", "departure"),
+      ]),
+    );
+    expect(ok(departures(fine)).map((m) => m.recordId)).toEqual([r]);
+    expect(codes(departures({ ...fine }))).toEqual(["not_a_move_log"]);
   });
 });

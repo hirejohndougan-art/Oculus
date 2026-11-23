@@ -28,7 +28,9 @@
  *   must go back to it. A `departure` (a borrowed record going back to its
  *   lender, decision D-044) goes to an outside location and ends the normal
  *   location: the record is no longer in the organization's care, so it is
- *   not "away".
+ *   not "away". It may only leave from inside the organization while the
+ *   record is not away, so it can never hide a loan out or other temporary
+ *   move that is still outstanding.
  *
  * Every location, move and set of levels carries a required `organizationId`
  * and any set mixing organizations is refused (D-030). Like `indexTemplates`
@@ -1056,6 +1058,20 @@ export function logLocation(log: MoveLog, id: unknown): StorageLocation | undefi
   return data !== undefined && isLocationId(id) ? data.index.byId.get(id) : undefined;
 }
 
+/**
+ * Every `departure` move in a log, oldest first, so the loans module can
+ * report any that no loan in explains (D-044).
+ */
+export function departures(log: MoveLog): Validated<readonly StorageMove[]> {
+  const data = logData(log);
+  if (data === undefined) return notALog();
+  const found: StorageMove[] = [];
+  for (const history of data.byRecord.values()) {
+    for (const move of history) if (move.reason === "departure") found.push(move);
+  }
+  return { ok: true, value: Object.freeze(found.sort(byWhen)) };
+}
+
 // ---------------------------------------------------------------------------
 // Helpers. The exported ones are shared with the other staff-only modules
 // (loans.ts, condition-checks.ts) and are not part of the package's API.
@@ -1068,8 +1084,24 @@ function historyIssues(
 ): Issue[] {
   const problems: Issue[] = [];
   let normal: LocationId | undefined;
+  // What `summarize` would say just before each move: where the record is and
+  // whether a temporary move (and its due date) is still in force.
+  let last: StorageMove | undefined;
+  let due: string | null = null;
   for (const move of history) {
     const place = index.byId.get(move.locationId);
+    if (move.reason === "departure" && !inCare(index, normal, due, last)) {
+      // A departure would wipe the normal location and the due date, so a
+      // record out on loan (or anywhere temporary) could vanish from the
+      // overdue list (found in review). It must be home, inside, first.
+      problems.push(
+        issue(
+          pathOf(move),
+          "departure_while_away",
+          "A record can only depart from a location inside the organization, while it is not away on a temporary move. Record its return first.",
+        ),
+      );
+    }
     if (NORMAL_LOCATION_REASONS.includes(move.reason)) {
       if (place?.kind === "external") {
         problems.push(
@@ -1103,8 +1135,28 @@ function historyIssues(
         ),
       );
     }
+    if (move.locationId === normal || move.reason === "departure") due = null;
+    else if (move.expectedReturnOn !== undefined) due = move.expectedReturnOn;
+    last = move;
   }
   return problems;
+}
+
+/**
+ * True when, after `last`, a record is inside the organization and not away
+ * (the same rule as `Whereabouts.away`): the only state it may depart from.
+ */
+function inCare(
+  index: IndexData,
+  normal: LocationId | undefined,
+  due: string | null,
+  last: StorageMove | undefined,
+): boolean {
+  if (last === undefined || last.reason === "departure") return false;
+  const kind = index.byId.get(last.locationId)?.kind;
+  if (kind === undefined || kind === "external") return false;
+  if (normal !== undefined) return last.locationId === normal;
+  return due === null && !TEMPORARY_MOVE_REASONS.includes(last.reason);
 }
 
 function summarize(

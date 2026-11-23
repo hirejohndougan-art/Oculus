@@ -376,6 +376,7 @@ export {
   locationContents,
   checkLocationDeletion,
   logLocation,
+  departures,
 } from "./storage.js";
 
 export {
