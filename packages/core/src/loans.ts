@@ -218,7 +218,9 @@ export interface LoanBook {
    * The day (`heldAsOf`) of the accession register the book was checked
    * against, or null when none was given. A book with a register must be
    * given the register as it is now on every `withLoan` and `reindexLoans`
-   * (`accessions_not_given`), so a stale one is never kept by accident.
+   * (`accessions_not_given`), never an older one (`stale_accessions`), so a
+   * stale one is never kept by accident. A same-day register can't be told
+   * from a fresh one: T-032 builds it in the same save (D-059).
    */
   readonly accessionsAsOf: string | null;
 }
@@ -230,9 +232,9 @@ export interface LoanBook {
  * gone back), `returned` when every item that moved is back, `agreed` before
  * anything moved. `unknown` for any loan with problems (see
  * `LoanState.problems`), whatever its status: its links don't fit the move
- * log, so it can't be shown as returned or not yet out.
+ * log, so it can't be shown as returned or not yet out. `acquired` also for
+ * an agreed loan in with nothing out and at least one item acquired.
  */
-/** (`acquired` also for an agreed loan in with nothing out and at least one item acquired.) */
 export type LoanPhase =
   | "requested"
   | "agreed"
@@ -505,6 +507,8 @@ interface ItemData {
   readonly acquiredBy: readonly string[];
   /** For an acquired item: the day it became the organization's, else null. */
   readonly acquiredOn: string | null;
+  /** Each accession in `acquiredBy` with the day it made the record the organization's. */
+  readonly acquiredDays: readonly { readonly accessionId: string; readonly on: string }[];
 }
 
 interface BookData {
@@ -564,15 +568,22 @@ const LOAN_BOOKS = new WeakMap<object, BookData>();
  * Loans in are also checked against `accessions`, the organization's
  * accession register (`indexAccessions`, made now), when given (D-059): an
  * item an accession acquired must have its arrival linked
- * (`acquired_without_arrival`), no departure (`acquired_and_departed`), and
- * the accession can't be received before the arrival
- * (`acquired_before_arrival`). An `acquired` loan needs a register
- * (`acquisitions_unknown`), at least one item acquired (`nothing_acquired`)
- * and every other item that arrived gone back (`acquired_with_items_out`).
+ * (`acquired_without_arrival`), no departure after it, linked or not
+ * (`acquired_and_departed`), and the accession can't be received before the
+ * arrival (`acquired_before_arrival`). Every accession naming the loan and
+ * the record must have the lender as its source
+ * (`acquired_from_another_source`) and be received and signed on or before
+ * the register's day (`acquisition_in_future`). An `acquired` loan needs a
+ * register (`acquisitions_unknown`), at least one item acquired
+ * (`nothing_acquired`), a `statusOn` no earlier than the day each acquired
+ * item became the organization's (`acquired_before_acquisition`), and every
+ * other item that arrived gone back (`acquired_with_items_out`, also for an
+ * agreed loan in with something acquired and no linked item out).
  * A `closed` loan in still needs every arrived item's departure, so an
  * acquired one is refused (`closed_with_items_out`): mark it `acquired`.
  * Anything but a register is refused (`invalid_accessions`), as is one of
- * another organization (`mixed_organizations`).
+ * another organization (`mixed_organizations`) or one dated after the day
+ * after `now` (`register_in_future`).
  * A loan with any of these is in phase `unknown` and listed by
  * `overdueLoans` once past its end date. `now` is for tests. Never throws.
  */
@@ -584,7 +595,9 @@ export function indexLoans(
 ): Validated<LoanBook> {
   try {
     if (!isMoveLog(log)) return notALog();
-    const linked = acquisitionsFor(accessions, log.organizationId);
+    const time = timeOf(now);
+    if (time === undefined) return badTime();
+    const linked = acquisitionsFor(accessions, log.organizationId, time);
     if (!linked.ok) return linked;
     const list = readList(loans, MAX_LOANS, "loans");
     if (!list.ok) return list;
@@ -621,8 +634,12 @@ export function isLoanBook(value: unknown): value is LoanBook {
  * (reported under `["otherLoans", <loan id>, ...]`). Problems other loans
  * already had don't block it. An edit may not drop a move link the saved
  * loan records, nor an item whose start move is recorded, unless the saved
- * end link names a move in the log (`link_removed`). The given book is not changed. `now` is for
- * tests. Never throws.
+ * end link names a move in the log (`link_removed`), nor change the lender
+ * or borrower once an item's start move is named or an accession names the
+ * loan (`agent_changed`). A book made with a register needs the register as
+ * it is now (`accessions_not_given`), not an older one (`stale_accessions`)
+ * and not one dated after `now` (`register_in_future`). The given book is
+ * not changed. `now` is for tests. Never throws.
  */
 export function withLoan(
   book: LoanBook,
@@ -633,7 +650,9 @@ export function withLoan(
   try {
     const data = bookData(book);
     if (data === undefined) return notABook();
-    const linked = currentAcquisitions(data, accessions, data.organizationId);
+    const time = timeOf(now);
+    if (time === undefined) return badTime();
+    const linked = currentAcquisitions(data, accessions, data.organizationId, time);
     if (!linked.ok) return linked;
     const checked = validateLoan(loan, now);
     if (!checked.ok) return checked;
@@ -644,6 +663,20 @@ export function withLoan(
         ["direction"],
         "direction_changed",
         "A loan in can't become a loan out, or the other way round. Record a new loan.",
+      );
+    }
+    if (
+      before !== undefined &&
+      before.loan.agentId !== next.agentId &&
+      agentFixed(data, linked.value, before)
+    ) {
+      // Review fix: with the lender changed, "an acquisition's source must be
+      // the lender" and "it went back to the lender" would check against the
+      // new agent, so an accession or a move could close an overdue loan.
+      return refused(
+        ["agentId"],
+        "agent_changed",
+        "The lender or borrower can't change once an item has moved on this loan or an accession names it. Record a new loan.",
       );
     }
     if (before !== undefined) {
@@ -704,20 +737,25 @@ export function withLoan(
  * Check every loan again against a new move log (after `withMove` or
  * `reindexLocations`) and the accession register as it is now, and return
  * the book built on them. A book made with a register must be given one
- * (`accessions_not_given`): the old one is never reused, since an accession
- * saved since may have dropped or changed its link (review fix). A loan they no longer fit is kept with
- * its problems (see `indexLoans`). Never throws.
+ * (`accessions_not_given`), and not one older than the book's
+ * (`stale_accessions`), since an accession saved since may have dropped or
+ * changed its link (review fixes); nor one dated after `now`
+ * (`register_in_future`). A loan they no longer fit is kept with its
+ * problems (see `indexLoans`). `now` is for tests. Never throws.
  */
 export function reindexLoans(
   book: LoanBook,
   log: MoveLog,
   accessions?: object,
+  now: Date = new Date(),
 ): Validated<LoanBook> {
   try {
     const data = bookData(book);
     if (data === undefined) return notABook();
     if (!isMoveLog(log)) return notALog();
-    const linked = currentAcquisitions(data, accessions, log.organizationId);
+    const time = timeOf(now);
+    if (time === undefined) return badTime();
+    const linked = currentAcquisitions(data, accessions, log.organizationId, time);
     if (!linked.ok) return linked;
     return buildBook(log, data.loans, linked.value);
   } catch {
@@ -805,7 +843,8 @@ export function unexplainedLoanMoves(book: LoanBook): Validated<readonly Storage
  * (`YYYY-MM-DD`, the organization's own date) being later: lent items not
  * back, and borrowed items not yet gone back to their lender. A loan past
  * its end date with problems (phase `unknown`) is listed too, with its
- * problems, since a missing or stale link may hide an item still out.
+ * problems, since a missing or stale link may hide an item still out. An
+ * acquisition counts only if received and title passed on or before `today`.
  * Longest overdue first.
  */
 export function overdueLoans(book: LoanBook, today: unknown): Validated<readonly LoanState[]> {
@@ -816,8 +855,12 @@ export function overdueLoans(book: LoanBook, today: unknown): Validated<readonly
   const found: LoanState[] = [];
   for (const entry of data.byId.values()) {
     if (entry.loan.endOn >= today) continue;
-    const state = stateOf(data, entry);
-    if (state.phase === "on_loan" || state.phase === "unknown") found.push(state);
+    // Acquisitions dated after `today` haven't happened yet on that day
+    // (review fix), whatever day the register was made on.
+    const state = stateOf(data, entry, today);
+    if (state.phase === "on_loan" || state.phase === "unknown" || state.items.some((s) => s.out)) {
+      found.push(state);
+    }
   }
   return {
     ok: true,
@@ -907,6 +950,7 @@ function currentAcquisitions(
   data: BookData,
   accessions: unknown,
   organizationId: OrganizationId,
+  time: number,
 ): Validated<Linked> {
   if (accessions === undefined && data.register !== undefined) {
     return refused(
@@ -915,11 +959,34 @@ function currentAcquisitions(
       "This loan book was checked against the accession register: give the register as it is now.",
     );
   }
-  return acquisitionsFor(accessions, organizationId);
+  const linked = acquisitionsFor(accessions, organizationId, time);
+  if (!linked.ok) return linked;
+  // Review fix: an older register than the book's may still hold a link an
+  // accession saved since has dropped. One of the same day can't be told
+  // from a fresh one: T-032 builds it in the same save (D-059).
+  const asOf = linked.value.acquisitions?.heldAsOf;
+  const had = data.acquisitions?.heldAsOf;
+  if (asOf !== undefined && had !== undefined && asOf < had) {
+    return refused(
+      ["accessions"],
+      "stale_accessions",
+      "This accession register is older than the one the loan book was checked against: give the register as it is now.",
+    );
+  }
+  return linked;
 }
 
-/** The loan links of an accession register, checked; undefined given, none. */
-function acquisitionsFor(accessions: unknown, organizationId: OrganizationId): Validated<Linked> {
+/**
+ * The loan links of an accession register, checked; undefined given, none.
+ * A register dated after the day after `time` (a day of slack for time
+ * zones) is refused (`register_in_future`, review fix): its day is what
+ * `acquisition_in_future` compares against.
+ */
+function acquisitionsFor(
+  accessions: unknown,
+  organizationId: OrganizationId,
+  time: number,
+): Validated<Linked> {
   if (accessions === undefined) {
     return { ok: true, value: { register: undefined, acquisitions: undefined } };
   }
@@ -934,7 +1001,32 @@ function acquisitionsFor(accessions: unknown, organizationId: OrganizationId): V
   if (acquisitions.organizationId !== organizationId) {
     return { ok: false, issues: [mixedOrganizationsIssue([], "These loans and the accessions")] };
   }
+  if (acquisitions.heldAsOf > dayAfter(time)) {
+    return refused(
+      ["accessions"],
+      "register_in_future",
+      "This accession register is dated after today. Make it with today's date.",
+    );
+  }
   return { ok: true, value: { register: accessions as object, acquisitions } };
+}
+
+/**
+ * True when a loan's agent can no longer change: an item's start move is
+ * named, or an accession (in the book's register or the one given) names it.
+ */
+function agentFixed(data: BookData, linked: Linked, before: Entry): boolean {
+  const key = MOVE_KEYS[before.loan.direction].start;
+  const moved = before.loan.items.some(
+    (item) => (item as unknown as Readonly<Record<string, unknown>>)[key] !== undefined,
+  );
+  if (moved) return true;
+  if (before.loan.direction !== "in") return false;
+  const id = before.loan.id;
+  return (
+    (data.acquisitions?.acquisitionsOf(id).length ?? 0) > 0 ||
+    (linked.acquisitions?.acquisitionsOf(id).length ?? 0) > 0
+  );
 }
 
 function buildBook(log: MoveLog, loans: readonly Loan[], linked: Linked): Validated<LoanBook> {
@@ -1101,6 +1193,7 @@ function buildBook(log: MoveLog, loans: readonly Loan[], linked: Linked): Valida
       // title counts, and only once the item's arrival is linked.
       let acquiredBy: readonly string[] = [];
       let acquiredOn: string | null = null;
+      let acquiredDays: readonly { readonly accessionId: string; readonly on: string }[] = [];
       if (loan.direction === "in" && acquisitions !== undefined) {
         const naming = acquisitions
           .acquisitionsOf(loan.id)
@@ -1161,10 +1254,16 @@ function buildBook(log: MoveLog, loans: readonly Loan[], linked: Linked): Valida
             );
           } else if (start && end === null && !blocked) {
             acquiredBy = Object.freeze(found.map((a) => a.accessionId));
+            acquiredDays = Object.freeze(
+              found.map((a) =>
+                Object.freeze({
+                  accessionId: a.accessionId,
+                  on: maxDay(a.receivedOn, a.titlePassedOn ?? a.receivedOn, start.move.movedOn),
+                }),
+              ),
+            );
             // The earliest day any of them made it the organization's.
-            acquiredOn = found
-              .map((a) => maxDay(a.receivedOn, a.titlePassedOn ?? a.receivedOn, start.move.movedOn))
-              .reduce((x, y) => (y < x ? y : x));
+            acquiredOn = acquiredDays.map((a) => a.on).reduce((x, y) => (y < x ? y : x));
           }
         }
       }
@@ -1195,6 +1294,7 @@ function buildBook(log: MoveLog, loans: readonly Loan[], linked: Linked): Valida
           ended: end ? end.move : null,
           acquiredBy,
           acquiredOn,
+          acquiredDays,
         }),
       );
       const mine = byRecord.get(item.recordId) ?? [];
@@ -1253,6 +1353,19 @@ function buildBook(log: MoveLog, loans: readonly Loan[], linked: Linked): Valida
   for (const { loan, items } of byId.values()) {
     if (loan.status === "acquired") {
       checkAcquired(log, loan, items, acquisitions !== undefined, flag);
+      continue;
+    }
+    // An agreed loan in with something acquired and no linked item out would
+    // be in phase `acquired`: every other item that arrived must have gone
+    // back, as for the status (review fix: an arrival left unlinked hid it).
+    if (
+      loan.status === "agreed" &&
+      items.some((item) => item.acquiredBy.length > 0) &&
+      !items.some(
+        (item) => item.started !== null && item.ended === null && item.acquiredBy.length === 0,
+      )
+    ) {
+      checkItemsBack(log, loan, items, flag);
       continue;
     }
     if (loan.status !== "closed") continue;
@@ -1404,6 +1517,20 @@ function checkAcquired(
       "No accession acquired an item of this loan: link the accession to the loan (its loanInId) first.",
     );
   }
+  checkItemsBack(log, loan, items, flag);
+}
+
+/**
+ * Every item of a loan in that arrived (a linked arrival, or any move of its
+ * record since the loan began) is acquired or gone back to the lender
+ * (`acquired_with_items_out`).
+ */
+function checkItemsBack(
+  log: MoveLog,
+  loan: Loan,
+  items: readonly ItemData[],
+  flag: (loanId: LoanId, path: readonly (string | number)[], code: string, message: string) => void,
+): void {
   items.forEach((item, j) => {
     if (item.acquiredBy.length > 0 || item.ended !== null) return;
     const history = moveHistory(log, item.recordId);
@@ -1477,10 +1604,18 @@ function removedLinks(before: Entry, next: Loan): Issue[] {
   return found;
 }
 
-function stateOf(data: BookData, entry: Entry): LoanState {
+/**
+ * A loan's state; with `asOf` (a day), counting only the acquisitions that
+ * made a record the organization's on or before it.
+ */
+function stateOf(data: BookData, entry: Entry, asOf?: string): LoanState {
   const { loan, items } = entry;
   const states = items.map((item): LoanItemState => {
-    const out = item.started !== null && item.ended === null && item.acquiredBy.length === 0;
+    const acquiredBy =
+      asOf === undefined
+        ? item.acquiredBy
+        : Object.freeze(item.acquiredDays.filter((a) => a.on <= asOf).map((a) => a.accessionId));
+    const out = item.started !== null && item.ended === null && acquiredBy.length === 0;
     let dueBack: string | null = null;
     if (out && loan.direction === "out") {
       const where = whereabouts(data.log, item.recordId);
@@ -1490,7 +1625,7 @@ function stateOf(data: BookData, entry: Entry): LoanState {
       recordId: item.recordId,
       started: item.started,
       ended: item.ended,
-      acquiredBy: item.acquiredBy,
+      acquiredBy,
       out,
       dueBack,
       dueMatchesLoan: !(out && loan.direction === "out") || dueBack === loan.endOn,
@@ -1712,6 +1847,10 @@ function byEnd(a: Loan, b: Loan): number {
 
 function notALog(): { readonly ok: false; readonly issues: readonly Issue[] } {
   return refused([], "not_a_move_log", "Give the move log made by indexMoves or withMove.");
+}
+
+function badTime(): { readonly ok: false; readonly issues: readonly Issue[] } {
+  return refused([], "invalid_time", "The current time is not a valid date.");
 }
 
 function notABook(): { readonly ok: false; readonly issues: readonly Issue[] } {

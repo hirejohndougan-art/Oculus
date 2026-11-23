@@ -445,3 +445,86 @@ describe("review fixes: an overdue loan in stays listed", () => {
     expect(overdueIds(ok(b))).toEqual([loan.id]);
   });
 });
+
+describe("second review: an overdue loan in stays listed", () => {
+  it("refuses a register dated after today, on index, edit and re-check", () => {
+    const loan = loanIn();
+    const ahead = registerOf([bought(loan, { receivedOn: "2026-11-25" })], {
+      today: "2026-11-26",
+    });
+    expect(codes(book([loan], ahead))).toEqual(["register_in_future"]);
+    const b = ok(book([loan], registerOf([])));
+    expect(codes(withLoan(b, { ...loan, note: "Edited." }, NOW, ahead))).toEqual([
+      "register_in_future",
+    ]);
+    expect(codes(reindexLoans(b, LOG, ahead, NOW))).toEqual(["register_in_future"]);
+    // The day after now is slack for time zones, as for moves.
+    expect(codes(book([loan], registerOf([], { today: "2026-11-24" })))).toEqual([]);
+  });
+
+  it("overdueLoans ignores acquisitions dated after its own today", () => {
+    const loan = loanIn({ endOn: "2026-10-20" });
+    const b = ok(book([loan], registerOf([bought(loan)])));
+    expect(ok(loanState(b, loan.id)).phase).toBe("acquired");
+    expect(overdueIds(b, "2026-10-25")).toEqual([loan.id]);
+    expect(overdueIds(b, "2026-11-05")).toEqual([]);
+    const marked = { ...loan, status: "acquired", statusOn: "2026-11-02" };
+    const acquired = ok(book([marked], registerOf([bought(loan)])));
+    expect(overdueIds(acquired, "2026-10-25")).toEqual([loan.id]);
+    expect(overdueIds(acquired, "2026-11-05")).toEqual([]);
+  });
+
+  it("refuses a register older than the one the book was checked against", () => {
+    const loan = loanIn();
+    const a = bought(loan);
+    const b = ok(book([loan], registerOf([a])));
+    const old = registerOf([a], { today: "2026-11-20" });
+    expect(codes(reindexLoans(b, LOG, old, NOW))).toEqual(["stale_accessions"]);
+    expect(codes(withLoan(b, { ...loan, note: "Edited." }, NOW, old))).toEqual([
+      "stale_accessions",
+    ]);
+    // A book made from an older register takes a newer one.
+    const older = ok(book([loan], registerOf([], { today: "2026-11-20" })));
+    expect(ok(reindexLoans(older, LOG, registerOf([a]), NOW)).accessionsAsOf).toBe(TODAY);
+  });
+
+  it("refuses changing the lender once an item moved or an accession names the loan", () => {
+    const stranger = record("agent", "Someone else", {});
+    const loan = loanIn();
+    const register = registerOf(
+      [bought(loan, { sourceAgent: { recordId: stranger.id, label: "Someone else" } })],
+      { records: [...RECORDS, stranger] },
+    );
+    const b = ok(book([loan], register));
+    expect(overdueIds(b)).toEqual([loan.id]);
+    expect(codes(withLoan(b, { ...loan, agentId: stranger.id }, NOW, register))).toEqual([
+      "agent_changed",
+    ]);
+    // An accession alone fixes the lender too.
+    const unmoved = loanIn({ items: [{ recordId: lantern }] });
+    const named = registerOf(
+      [bought(unmoved, { sourceAgent: { recordId: stranger.id, label: "Someone else" } })],
+      { records: [...RECORDS, stranger] },
+    );
+    const nb = ok(book([unmoved], named));
+    expect(codes(withLoan(nb, { ...unmoved, agentId: stranger.id }, NOW, named))).toEqual([
+      "agent_changed",
+    ]);
+    // Before anything moved or was accessioned, the lender can still be corrected.
+    const fresh = loanIn({ items: [{ recordId: lantern }] });
+    const empty = registerOf([]);
+    const fb = ok(book([fresh], empty));
+    expect(ok(withLoan(fb, { ...fresh, agentId: stranger.id }, NOW, empty)).size).toBe(1);
+  });
+
+  it("an agreed loan with an item acquired and another arrived but unlinked is not acquired", () => {
+    const log = ok(indexMoves(INDEX, [lanternIn, bellIn]));
+    const loan = loanIn({
+      items: [{ recordId: lantern, arrivalMoveId: lanternIn.id }, { recordId: bell }],
+    });
+    const b = book([loan], registerOf([bought(loan)]), log);
+    expect(problems(b)).toEqual(["acquired_with_items_out"]);
+    expect(ok(loanState(ok(b), loan.id)).phase).toBe("unknown");
+    expect(overdueIds(ok(b))).toEqual([loan.id]);
+  });
+});
