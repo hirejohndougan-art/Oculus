@@ -25,7 +25,10 @@
  *   are all worked out from the log and never stored on their own (Spectrum
  *   asks for one location entry per object, so the two can't disagree).
  *   `placement` and `rehousing` moves set the normal location; a `return`
- *   must go back to it.
+ *   must go back to it. A `departure` (a borrowed record going back to its
+ *   lender, decision D-044) goes to an outside location and ends the normal
+ *   location: the record is no longer in the organization's care, so it is
+ *   not "away".
  *
  * Every location, move and set of levels carries a required `organizationId`
  * and any set mixing organizations is refused (D-030). Like `indexTemplates`
@@ -57,7 +60,7 @@ import {
   oneOrganization,
   type OrganizationId,
 } from "./organizations.js";
-import { IssueList, readPlainData, shown, type JsonValue } from "./plain-data.js";
+import { IssueList, readPlainData, shown, type JsonValue, type ReadLimits } from "./plain-data.js";
 import { isRecordId, type RecordId } from "./record-id.js";
 
 declare const locationIdBrand: unique symbol;
@@ -81,14 +84,17 @@ export type LocationKind = (typeof LOCATION_KINDS)[number];
  * Why a record moved. `placement` (first housing) and `rehousing` (a new
  * permanent home) set the record's normal location. `return` goes back to
  * it. `correction` records where a record really is (found elsewhere in a
- * shelf audit) without changing its normal location. The rest are temporary
- * and may give an expected return date.
+ * shelf audit) without changing its normal location. `departure` sends a
+ * record out of the organization's care for good (a loan in going back to its
+ * lender): it goes to an outside location and clears the normal location.
+ * The rest are temporary and may give an expected return date.
  */
 export const MOVE_REASONS = [
   "placement",
   "rehousing",
   "return",
   "correction",
+  "departure",
   "exhibition",
   "loan_out",
   "conservation",
@@ -1040,8 +1046,19 @@ export function checkLocationDeletion(log: MoveLog, locationId: unknown): Valida
   return issues.length > 0 ? { ok: false, issues } : { ok: true, value: true };
 }
 
+/**
+ * One location of the index a log was built on, or `undefined`. Lets the
+ * loans module (D-044) see where a past move went without a second index
+ * that could disagree with the log.
+ */
+export function logLocation(log: MoveLog, id: unknown): StorageLocation | undefined {
+  const data = logData(log);
+  return data !== undefined && isLocationId(id) ? data.index.byId.get(id) : undefined;
+}
+
 // ---------------------------------------------------------------------------
-// Helpers
+// Helpers. The exported ones are shared with the other staff-only modules
+// (loans.ts, condition-checks.ts) and are not part of the package's API.
 
 /** Problems with one record's history, oldest move first. */
 function historyIssues(
@@ -1064,6 +1081,17 @@ function historyIssues(
         );
       }
       normal = move.locationId;
+    } else if (move.reason === "departure") {
+      if (place?.kind !== "external") {
+        problems.push(
+          issue(
+            pathOf(move),
+            "departure_not_external",
+            "A departure leaves the organization's care, so it goes to an outside location (the lender).",
+          ),
+        );
+      }
+      normal = undefined;
     } else if (move.reason === "return" && move.locationId !== normal) {
       problems.push(
         issue(
@@ -1095,7 +1123,8 @@ function summarize(
   let dueOn: string | null = null;
   for (const move of history) {
     if (NORMAL_LOCATION_REASONS.includes(move.reason)) normalId = move.locationId;
-    if (move.locationId === normalId) dueOn = null;
+    else if (move.reason === "departure") normalId = undefined;
+    if (move.locationId === normalId || move.reason === "departure") dueOn = null;
     else if (move.expectedReturnOn !== undefined) dueOn = move.expectedReturnOn;
   }
   const current = index.byId.get(last.locationId);
@@ -1108,10 +1137,13 @@ function summarize(
   }
   // With no normal location recorded, a record is away while its latest
   // stretch is temporary: sent out for digitization before it was ever placed.
+  // A record that departed is no longer the organization's to have away.
   const away =
-    normal !== undefined
-      ? normal.id !== current.id
-      : dueOn !== null || TEMPORARY_MOVE_REASONS.includes(last.reason);
+    last.reason === "departure"
+      ? false
+      : normal !== undefined
+        ? normal.id !== current.id
+        : dueOn !== null || TEMPORARY_MOVE_REASONS.includes(last.reason);
   return Object.freeze({
     recordId,
     current,
@@ -1178,7 +1210,7 @@ function byName(a: StorageLocation, b: StorageLocation): number {
 }
 
 /** Case- and form-insensitive comparison key for names. */
-function fold(text: string): string {
+export function fold(text: string): string {
   return text.normalize("NFC").toLowerCase();
 }
 
@@ -1186,7 +1218,7 @@ function fold(text: string): string {
  * Read a caller's list once into a frozen shallow copy: Proxies, non-arrays,
  * holes and getters are refused, so nothing reads differently twice.
  */
-function readList(input: unknown, max: number, what: string): Validated<readonly unknown[]> {
+export function readList(input: unknown, max: number, what: string): Validated<readonly unknown[]> {
   if (types.isProxy(input) || !Array.isArray(input)) {
     return refused([], "not_a_list", `The ${what} must be given as a list.`);
   }
@@ -1207,15 +1239,15 @@ function readList(input: unknown, max: number, what: string): Validated<readonly
   return { ok: true, value: Object.freeze(copy) };
 }
 
-interface TopView {
+export interface TopView {
   readonly copy: Readonly<Record<string, JsonValue>>;
   readonly data: Readonly<Record<string, JsonValue | undefined>>;
 }
 
-function readTop(
+export function readTop(
   input: unknown,
   notObject: string,
-  limits: typeof FLAT_LIMITS | typeof LEVEL_LIMITS,
+  limits: ReadLimits,
   issues: IssueList,
 ): TopView | undefined {
   if (types.isProxy(input) || !isPlainObject(input)) {
@@ -1276,7 +1308,7 @@ function checkOneLine(
   return issues.count === before;
 }
 
-function checkNote(value: JsonValue | undefined, issues: IssueList): void {
+export function checkNote(value: JsonValue | undefined, issues: IssueList): void {
   if (value === undefined) return;
   if (typeof value !== "string" || value.trim().length === 0) {
     issues.add(
@@ -1293,7 +1325,7 @@ function checkNote(value: JsonValue | undefined, issues: IssueList): void {
   }
 }
 
-function unknownKeys(
+export function unknownKeys(
   view: Readonly<Record<string, JsonValue | undefined>>,
   allowed: readonly string[],
   what: string,
@@ -1308,7 +1340,7 @@ function unknownKeys(
 }
 
 /** Milliseconds since 1970, or undefined if not a real ISO 8601 UTC timestamp. */
-function parseUtc(value: unknown): number | undefined {
+export function parseUtc(value: unknown): number | undefined {
   if (typeof value !== "string" || !ISO_UTC.test(value)) return undefined;
   const ms = Date.parse(value);
   if (Number.isNaN(ms)) return undefined;
@@ -1316,7 +1348,7 @@ function parseUtc(value: unknown): number | undefined {
 }
 
 /** The UTC day after the one `ms` falls on, as `YYYY-MM-DD`. */
-function dayAfter(ms: number): string {
+export function dayAfter(ms: number): string {
   const day = new Date(ms + 86_400_000).toISOString().slice(0, 10);
   // Past year 9999 the ISO form grows a sign; every allowed day is earlier.
   return ISO_DAY.test(day) ? day : "9999-12-31";
@@ -1337,7 +1369,7 @@ function notALog(): { readonly ok: false; readonly issues: readonly Issue[] } {
   return refused([], "not_a_move_log", "Give the move log made by indexMoves or withMove.");
 }
 
-function refused(
+export function refused(
   path: readonly (string | number)[],
   code: string,
   message: string,
@@ -1345,7 +1377,7 @@ function refused(
   return { ok: false, issues: [issue(path, code, message)] };
 }
 
-function guarded<T>(run: () => Validated<T>, message: string): Validated<T> {
+export function guarded<T>(run: () => Validated<T>, message: string): Validated<T> {
   try {
     return run();
   } catch {

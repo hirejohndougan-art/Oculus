@@ -561,3 +561,70 @@ describe("whereabouts", () => {
     expect(codes(reindexLocations(l2, LEVELS, changed))).toEqual(["external_normal_location"]);
   });
 });
+
+describe("departure (D-044)", () => {
+  const idx = index();
+  const borrowed = newRecordId();
+  const lender = {
+    id: newLocationId(),
+    organizationId: ORG,
+    kind: "external",
+    name: "Lending museum",
+    agentId: newRecordId(),
+  } as StorageLocation;
+  const withLender = index([...ALL, lender]);
+
+  it("a departed record has no normal location and is not away", () => {
+    const log = ok(
+      indexMoves(withLender, [
+        move(borrowed, box1.id, "2026-10-01", "placement"),
+        move(borrowed, lender.id, "2026-11-10", "departure"),
+      ]),
+    );
+    const w = ok(whereabouts(log, borrowed));
+    expect(w?.current.id).toBe(lender.id);
+    expect(w?.normal).toBeNull();
+    expect(w?.away).toBe(false);
+    expect(w?.expectedReturnOn).toBeNull();
+    expect(ok(awayFromNormal(log))).toEqual([]);
+    expect(ok(locationContents(log, box1.id))).toEqual([]);
+  });
+
+  it("goes to an outside location only, takes no return date, and ends the normal location", () => {
+    expect(
+      codes(
+        indexMoves(idx, [
+          move(borrowed, box1.id, "2026-10-01", "placement"),
+          move(borrowed, shelfB.id, "2026-11-10", "departure"),
+        ]),
+      ),
+    ).toEqual(["departure_not_external"]);
+    expect(
+      codes(
+        validateStorageMove(
+          move(borrowed, lender.id, "2026-11-10", "departure", { expectedReturnOn: "2026-12-01" }),
+        ),
+      ),
+    ).toEqual(["unexpected_return_date"]);
+    expect(
+      codes(
+        indexMoves(withLender, [
+          move(borrowed, box1.id, "2026-10-01", "placement"),
+          move(borrowed, lender.id, "2026-11-10", "departure"),
+          move(borrowed, box1.id, "2026-11-12", "return"),
+        ]),
+      ),
+    ).toEqual(["not_normal_location"]);
+  });
+
+  it("a later placement brings a borrowed-again record back into care", () => {
+    const log = ok(
+      indexMoves(withLender, [
+        move(borrowed, box1.id, "2026-10-01", "placement"),
+        move(borrowed, lender.id, "2026-11-10", "departure"),
+        move(borrowed, shelfB.id, "2026-11-20", "placement"),
+      ]),
+    );
+    expect(ok(whereabouts(log, borrowed))?.normal?.id).toBe(shelfB.id);
+  });
+});

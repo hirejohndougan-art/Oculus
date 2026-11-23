@@ -375,6 +375,7 @@ export {
   overdueReturns,
   locationContents,
   checkLocationDeletion,
+  logLocation,
 } from "./storage.js";
 export type {
   LocationId,
