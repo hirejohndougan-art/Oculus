@@ -28,7 +28,10 @@ export interface Queryable {
 }
 
 export interface Database extends Queryable {
-  /** Runs `work` in one transaction: committed if it resolves, rolled back if it throws. */
+  /**
+   * Runs `work` in one Read Committed transaction (whatever the server's
+   * default): committed if it resolves, rolled back if it throws.
+   */
   transaction<T>(work: (tx: Queryable) => Promise<T>): Promise<T>;
   /** Closes every connection. */
   close(): Promise<void>;
@@ -145,7 +148,10 @@ export function openDatabase(connectionString: string, options: DatabaseOptions 
       const client = await pool.connect();
       let broken = false;
       try {
-        await client.query("BEGIN");
+        // Explicitly, whatever the server's default_transaction_isolation:
+        // the identifier writes' locking needs a new snapshot per statement
+        // (D-061), and every caller expects Read Committed's behaviour.
+        await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
         const result = await work(queryable(client));
         await client.query("COMMIT");
         return result;

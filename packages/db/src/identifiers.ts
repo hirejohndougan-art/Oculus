@@ -21,11 +21,13 @@
  * database's text. Every write runs inside a savepoint in the caller's
  * transaction, so a refusal leaves that transaction usable and unchanged;
  * these functions must be called inside `Database.transaction` (outside one
- * they throw). Holdings are written in a fixed order and type changes, saves
- * and allocations meet at one lock per type key (D-061), so saves never
- * deadlock each other; a deadlock the database still breaks (allocations of
- * several types one call at a time, in opposite orders) comes back as a
- * clean `retry` refusal.
+ * they throw), which is Read Committed; in another isolation level they
+ * refuse (`read_committed_required`), as the database's triggers do. Holdings
+ * are written in a fixed order and type changes, saves and allocations meet
+ * at one lock per type key bucket (D-061: at most 64 per organization), so
+ * saves never deadlock each other; a deadlock the database still breaks
+ * (allocations of several types one call at a time, in opposite orders) or a
+ * full lock table comes back as a clean `retry` refusal.
  *
  * Every read and write names one organization (D-019, D-030); the tables'
  * keys and foreign keys all include it, so another organization's records,
@@ -94,11 +96,14 @@ function dbError(error: unknown): { code: string; constraint: string } | undefin
  * everything it did is rolled back to the savepoint (the transaction stays
  * usable) and the error is returned for the caller to map; errors it doesn't
  * map are rethrown. Outside a transaction `SAVEPOINT` fails, and so does this.
+ * Outside Read Committed nothing is done and the write is refused
+ * (`read_committed_required`): the locks of D-061 only keep writes apart when
+ * every statement takes a new snapshot. The database refuses such writes too.
  */
 async function inSavepoint<T>(
   db: Queryable,
-  work: () => Promise<T>,
-): Promise<{ done: true; value: T } | { done: false; error: unknown }> {
+  work: () => Promise<Validated<T>>,
+): Promise<{ done: true; value: Validated<T> } | { done: false; error: unknown }> {
   try {
     await db.execute(sql`SAVEPOINT oculus_identifiers`);
   } catch (error) {
@@ -110,7 +115,10 @@ async function inSavepoint<T>(
     throw error;
   }
   try {
-    const value = await work();
+    const [level] = await db.rows<{ level: string }>(
+      sql`SELECT current_setting('transaction_isolation') AS level`,
+    );
+    const value = level?.level === "read committed" ? await work() : notReadCommitted<T>();
     await db.execute(sql`RELEASE SAVEPOINT oculus_identifiers`);
     return { done: true, value };
   } catch (error) {
@@ -127,12 +135,32 @@ async function inSavepoint<T>(
   }
 }
 
-/** The SQLSTATEs of a deadlock and a serialization failure: try again. */
-const TRANSIENT = new Set(["40P01", "40001"]);
+/**
+ * The SQLSTATEs worth trying again: a deadlock, a serialization failure, and
+ * the server's shared lock table full (53200, out of shared memory: many
+ * transactions holding many locks at once).
+ */
+const TRANSIENT = new Set(["40P01", "40001", "53200"]);
+/** Raised by the database's triggers outside Read Committed (0003, D-061). */
+const NOT_READ_COMMITTED = "OC061";
 
-/** A clean refusal for a write the database broke off to resolve a deadlock. */
-function retryIfTransient<T>(error: unknown): Validated<T> | undefined {
-  return TRANSIENT.has(dbError(error)?.code ?? "")
+function notReadCommitted<T>(): Validated<T> {
+  return refused(
+    [],
+    "read_committed_required",
+    "Identifier writes must run in a Read Committed transaction.",
+  );
+}
+
+/**
+ * A clean refusal for a write the database broke off: to resolve a deadlock or
+ * for lack of lock memory (`retry`), or because the transaction isn't Read
+ * Committed (`read_committed_required`, a direct statement's trigger).
+ */
+function cleanRefusal<T>(error: unknown): Validated<T> | undefined {
+  const code = dbError(error)?.code ?? "";
+  if (code === NOT_READ_COMMITTED) return notReadCommitted();
+  return TRANSIENT.has(code)
     ? refused(
         [],
         "retry",
@@ -242,17 +270,15 @@ export async function insertIdentifierType(
         `An organization can have at most ${String(MAX_IDENTIFIER_TYPES)} identifier types.`,
       );
     }
+    // The table's trigger (zzzz_identifier_types_adopt_holdings) gives the
+    // holdings already stored under the key the new type's rule.
     await db.execute(sql`
       INSERT INTO public.identifier_types (organization_id, key, uniqueness, definition)
       VALUES (${org}::uuid, ${type.key}, ${type.uniqueness}, ${JSON.stringify(type)}::jsonb)`);
-    // The holdings' trigger fills in the new type's rule.
-    await db.execute(sql`
-      UPDATE public.identifier_holdings SET uniqueness = NULL
-      WHERE organization_id = ${org}::uuid AND type_key = ${type.key} AND uniqueness IS NULL`);
     return valid;
   });
   if (result.done) return result.value;
-  const retry = retryIfTransient<IdentifierType>(result.error);
+  const retry = cleanRefusal<IdentifierType>(result.error);
   if (retry !== undefined) return retry;
   const error = dbError(result.error);
   if (error?.code === UNIQUE && error.constraint === "identifier_types_pkey") {
@@ -295,7 +321,7 @@ export async function updateIdentifierType(
       : refused(["key"], "unknown_type", "The organization has no identifier type with this key.");
   });
   if (result.done) return result.value;
-  const retry = retryIfTransient<IdentifierType>(result.error);
+  const retry = cleanRefusal<IdentifierType>(result.error);
   if (retry !== undefined) return retry;
   const error = dbError(result.error);
   if (error?.code === UNIQUE && RULE_INDEXES.has(error.constraint)) {
@@ -394,8 +420,13 @@ export async function saveRecordIdentifiers(
     // uncommitted holding of it) has written only numbers before it in that
     // order and deleted none: two saves can't each wait for the other (two
     // records swapping numbers each meet the other's number still held, and
-    // are refused). The trigger takes the types' locks in the same order.
+    // are refused). The types' key locks are taken first, shared, each bucket
+    // once and in one fixed order (the trigger takes them again, already held):
+    // at most 64 per organization however many keys the former numbers name.
     if (held.length > 0) {
+      await db.rows(
+        sql`SELECT public.identifier_type_locks(${org}::uuid, ${heldTypes}::text[], false)`,
+      );
       await db.execute(sql`
         INSERT INTO public.identifier_holdings
           (organization_id, record_id, type_key, key, current)
@@ -439,7 +470,7 @@ export async function saveRecordIdentifiers(
     return valid;
   });
   if (result.done) return result.value;
-  const retry = retryIfTransient<RecordIdentifiers>(result.error);
+  const retry = cleanRefusal<RecordIdentifiers>(result.error);
   if (retry !== undefined) return retry;
   const error = dbError(result.error);
   if (error?.code === UNIQUE && RULE_INDEXES.has(error.constraint)) {
@@ -687,10 +718,10 @@ export async function allocateIdentifier(
 
 /**
  * Gives out one number per request, as `allocateIdentifier` does, in the
- * order asked, locking the types and counters in a fixed order (type key,
- * then series, byte order) whatever the order asked, so two calls naming the
- * same types never wait for each other. Issues are at `[index, ...]`. Run
- * inside a transaction.
+ * order asked, locking the types' key buckets in bucket order and then the
+ * counters (type key, then series, byte order) whatever the order asked, so
+ * two calls naming the same types never wait for each other. Issues are at
+ * `[index, ...]`. Run inside a transaction.
  */
 export async function allocateIdentifiers(
   db: Queryable,
@@ -745,6 +776,14 @@ export async function allocateIdentifiers(
     const byteOrder = (a: string, b: string): number =>
       Buffer.compare(Buffer.from(a), Buffer.from(b));
     plan.sort((a, b) => byteOrder(a.type.key, b.type.key) || byteOrder(a.series, b.series));
+    // The types' key locks, exclusive, in the database's fixed order (as saves
+    // take them, shared): waits for saves of the types' numbers that haven't
+    // committed, and makes later ones wait for this transaction. Then the
+    // counters, each behind its type's lock.
+    await db.rows(
+      sql`SELECT public.identifier_type_locks(${organizationId}::uuid,
+            ${plan.map((p) => p.type.key)}::text[], true)`,
+    );
     const given: string[] = [];
     for (const { index, type, series } of plan) {
       const next = await allocateOne(db, organizationId, type, series, asked[index]?.options ?? {});
@@ -759,12 +798,12 @@ export async function allocateIdentifiers(
     return { ok: true, value: given };
   });
   if (result.done) return result.value;
-  const retry = retryIfTransient<readonly string[]>(result.error);
+  const retry = cleanRefusal<readonly string[]>(result.error);
   if (retry !== undefined) return retry;
   throw result.error;
 }
 
-/** One allocation, its type's key lock and counter taken in that order. */
+/** One allocation, its type's key lock already held: its counter, then the number. */
 async function allocateOne(
   db: Queryable,
   organizationId: OrganizationId,
@@ -773,11 +812,6 @@ async function allocateOne(
   options: { readonly year?: number },
 ): Promise<Validated<string>> {
   const typeKey = type.key;
-  // Waits for saves of the type's numbers that haven't committed, and makes
-  // later ones wait for this transaction (the holdings' trigger takes it shared).
-  await db.rows(
-    sql`SELECT pg_advisory_xact_lock(public.identifier_type_lock_key(${organizationId}::uuid, ${typeKey}))`,
-  );
   await db.execute(sql`
     INSERT INTO public.identifier_counters (organization_id, type_key, series)
     VALUES (${organizationId}::uuid, ${typeKey}, ${series})

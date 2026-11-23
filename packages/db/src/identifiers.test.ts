@@ -4,7 +4,7 @@
 // organization only, also when two saves race; auto-numbering never gives a
 // number out twice; and direct SQL can't move rows, forge a rule or point
 // across organizations (D-019, D-061).
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import {
   STANDARD_PRESETS,
   createRecord,
@@ -17,7 +17,7 @@ import {
   type RecordIdentifiers,
   type Validated,
 } from "@oculus/core";
-import { openDatabase, type Database, type Queryable } from "./client.js";
+import { openDatabase, openSession, type Database, type Queryable } from "./client.js";
 import { insertOrganization, insertRecord, insertTemplateVersion } from "./catalog.js";
 import {
   allocateIdentifier,
@@ -34,6 +34,12 @@ import { freshDatabase, type TestDatabase } from "./test-database.fixtures.js";
 
 // ---------------------------------------------------------------------------
 // One migrated database for the file, set up lazily inside each test.
+
+// The races below poll for a session waiting on a lock, and give up after
+// POLL_LIMIT_MS with a clear error: well before the test itself times out,
+// so a slow machine sees why, not a bare timeout.
+const POLL_LIMIT_MS = 5_000;
+vi.setConfig({ testTimeout: 30_000 });
 
 const T = "2026-11-20T16:05:00.000Z";
 let setup: Promise<{ testDb: TestDatabase; db: Database }> | undefined;
@@ -161,14 +167,17 @@ const save = (set: unknown): Promise<Validated<RecordIdentifiers>> =>
 
 /** Waits until `count` sessions of the test database are waiting on a lock. */
 async function someoneWaits(count = 1): Promise<void> {
-  for (let i = 0; i < 500; i++) {
+  const deadline = Date.now() + POLL_LIMIT_MS;
+  while (Date.now() < deadline) {
     const [row] = await db.rows<{ n: number }>(sql`
       SELECT count(*)::integer AS n FROM pg_catalog.pg_stat_activity
       WHERE datname = current_database() AND wait_event_type = 'Lock'`);
     if ((row?.n ?? 0) >= count) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  throw new Error("Nothing started waiting.");
+  throw new Error(
+    `Fewer than ${String(count)} sessions started waiting on a lock within ${String(POLL_LIMIT_MS)} ms.`,
+  );
 }
 
 /**
@@ -185,14 +194,19 @@ async function settledOrWaiting(work: Promise<unknown>): Promise<void> {
       state.done = true;
     },
   );
-  for (let i = 0; i < 500 && !state.done; i++) {
+  const deadline = Date.now() + POLL_LIMIT_MS;
+  while (Date.now() < deadline && !state.done) {
     const [row] = await db.rows<{ n: number }>(sql`
       SELECT count(*)::integer AS n FROM pg_catalog.pg_stat_activity
       WHERE datname = current_database() AND wait_event_type = 'Lock'`);
     if ((row?.n ?? 0) > 0) return;
     await Promise.race([settled, new Promise((resolve) => setTimeout(resolve, 10))]);
   }
-  if (!state.done) throw new Error("Neither settled nor waited.");
+  if (!state.done) {
+    throw new Error(
+      `The work neither settled nor waited on a lock within ${String(POLL_LIMIT_MS)} ms.`,
+    );
+  }
 }
 
 /** A promise and the function that resolves it. */
@@ -496,6 +510,19 @@ describe("savepoints", () => {
     );
     expect(thrown).toBeInstanceOf(Error);
     expect((thrown as Error).cause).toBe(original);
+  });
+
+  it("a full lock table (53200, out of shared memory) is a clean retry, never the raw error", async () => {
+    const full: Queryable = {
+      rows: <R extends object>() =>
+        Promise.resolve([{ level: "read committed" }] as unknown as R[]),
+      execute: (query) =>
+        query.text.includes("UPDATE public.identifier_types")
+          ? Promise.reject(Object.assign(new Error("out of shared memory"), { code: "53200" }))
+          : Promise.resolve(0),
+    };
+    const [, , boxLabel] = sampleTypes(newOrganizationId());
+    expect(codes(await updateIdentifierType(full, boxLabel))).toEqual(["retry"]);
   });
 });
 
@@ -905,36 +932,43 @@ describe("races between saves, type changes and allocations", () => {
     await ready();
     const org = await organization();
     const year = { year: 2026 };
-    // T1 takes accession_number, then object_number (the fixed order); T2
-    // asks for both in one call, the other way round. T2 must wait for T1
-    // without holding object_number, or T1 and T2 wait for each other.
+    // The fixed order is the types' lock buckets' (the same in every
+    // organization); these two types are in different buckets.
+    const order = await db.rows<{ key: string; bucket: number }>(sql`
+      SELECT k AS key, public.identifier_type_lock_bucket(k) AS bucket
+      FROM unnest(ARRAY['accession_number', 'object_number']) AS k ORDER BY 2`);
+    const [lower, higher] = order.map((row) => row.key);
+    expect(new Set(order.map((row) => row.bucket)).size).toBe(2);
+    if (lower === undefined || higher === undefined) throw new Error("no order");
+    const ask = (typeKey: string) =>
+      typeKey === "accession_number" ? { typeKey, ...year } : { typeKey };
+    const nth = (typeKey: string, n: number): string =>
+      typeKey === "accession_number" ? `2026.00${String(n)}` : `DHS-000${String(n)}`;
+    // T1 takes the lower bucket's type, then the higher's (the fixed order);
+    // T2 asks for both in one call, the other way round. T2 must wait for T1
+    // without holding the higher one, or T1 and T2 wait for each other.
     const tookFirst = gate();
     const next = gate();
     const tookSecond = gate();
     const first = tx(async (q) => {
       try {
-        const accession = ok(await allocateIdentifier(q, org, "accession_number", year));
+        const a = ok(await allocateIdentifiers(q, org, [ask(lower)]));
         tookFirst.open();
         await next.opened;
-        const objectNumber = ok(await allocateIdentifier(q, org, "object_number"));
-        return [accession, objectNumber];
+        const b = ok(await allocateIdentifiers(q, org, [ask(higher)]));
+        return [...a, ...b];
       } finally {
         tookFirst.open();
         tookSecond.open();
       }
     });
     await tookFirst.opened;
-    const second = tx((q) =>
-      allocateIdentifiers(q, org, [
-        { typeKey: "object_number" },
-        { typeKey: "accession_number", ...year },
-      ]),
-    );
+    const second = tx((q) => allocateIdentifiers(q, org, [ask(higher), ask(lower)]));
     await someoneWaits();
     next.open();
     await tookSecond.opened;
-    expect(await first).toEqual(["2026.001", "DHS-0001"]);
-    expect(ok(await second)).toEqual(["DHS-0002", "2026.002"]);
+    expect(await first).toEqual([nth(lower, 1), nth(higher, 1)]);
+    expect(ok(await second)).toEqual([nth(higher, 2), nth(lower, 2)]);
 
     // Two calls in opposite order can deadlock: the database picks one, which
     // gets a clean `retry` (its transaction still usable), and the other goes on.
@@ -971,6 +1005,178 @@ describe("races between saves, type changes and allocations", () => {
     commit.open();
     ok(await saving.done);
     expect(ok(await allocating)).toBe("DHS-0002");
+  });
+
+  /**
+   * Advisory locks this transaction holds: lock objects, each counted once
+   * (pg_locks lists one row per mode, and allocating holds a bucket both
+   * shared and exclusive).
+   */
+  async function advisoryLocks(q: Queryable): Promise<number> {
+    const [row] = await q.rows<{ n: number }>(sql`
+      SELECT count(DISTINCT (classid, objid, objsubid))::integer AS n FROM pg_catalog.pg_locks
+      WHERE locktype = 'advisory' AND pid = pg_backend_pid()`);
+    return row?.n ?? 0;
+  }
+
+  /** 500 former numbers, each of its own type key no type has. */
+  const unknownTypes = (prefix: string): { type: string; value: string }[] =>
+    Array.from({ length: 500 }, (_, i) => ({
+      type: `${prefix}_${String(i).padStart(3, "0")}`,
+      value: "1",
+    }));
+
+  it("the type key locks are bounded: 500 unknown former types take at most 64 per organization, save after save", async () => {
+    await ready();
+    const org = await organization();
+    const library = await organization("Invented Public Library");
+    const ids = [await record(org), await record(org), await record(org)];
+    const theirs = await record(library);
+    const counts = await tx(async (q) => {
+      const seen: number[] = [];
+      for (const [n, id] of ids.entries()) {
+        ok(
+          await saveRecordIdentifiers(
+            q,
+            numbers(
+              org,
+              id,
+              [["object_number", `DHS-000${String(n + 1)}`]],
+              unknownTypes(`old${String(n)}`),
+            ),
+          ),
+        );
+        seen.push(await advisoryLocks(q));
+      }
+      ok(await allocateIdentifier(q, org, "object_number"));
+      seen.push(await advisoryLocks(q));
+      // Another organization's buckets are its own: at most 64 more.
+      ok(await saveRecordIdentifiers(q, numbers(library, theirs, [], unknownTypes("old0"))));
+      seen.push(await advisoryLocks(q));
+      return seen;
+    });
+    expect(counts.slice(0, 4).every((n) => n > 1 && n <= 64)).toBe(true);
+    expect(counts[4]).toBeGreaterThan(64);
+    expect(counts[4]).toBeLessThanOrEqual(128);
+  });
+
+  it("a write outside Read Committed is refused cleanly, by the functions and by the database", async () => {
+    await ready();
+    const org = await organization();
+    const id = await record(org);
+    for (const level of [
+      sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`,
+      sql`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`,
+    ]) {
+      const results = await tx(async (q) => {
+        await q.execute(level);
+        const outcomes = [
+          await saveRecordIdentifiers(q, numbers(org, id, [["object_number", "DHS-0001"]])),
+          await allocateIdentifier(q, org, "object_number"),
+          await insertIdentifierType(q, omeka(org)),
+          await updateIdentifierType(q, { ...omeka(org), uniqueness: "current" }),
+        ];
+        // The transaction is still usable.
+        const [row] = await q.rows<{ one: number }>(sql`SELECT 1 AS one`);
+        return { outcomes, row };
+      });
+      expect(results.outcomes.map((r) => codes(r))).toEqual([
+        ["read_committed_required"],
+        ["read_committed_required"],
+        ["read_committed_required"],
+        ["read_committed_required"],
+      ]);
+      expect(results.row).toEqual({ one: 1 });
+    }
+    expect(ok(await readRecordIdentifiers(db, org, id))).toEqual(numbers(org, id, []));
+    expect(ok(await readIdentifierTypes(db, org)).map((t) => t.key)).not.toContain("omeka_id");
+    // Direct writers too: holdings, types and the lock function check it.
+    const direct = async (statement: Sql): Promise<string> =>
+      tx(async (q) => {
+        await q.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`);
+        await q.execute(statement);
+      }).then(
+        () => "",
+        (error: unknown) => (error as { code?: string }).code ?? "",
+      );
+    expect(
+      await direct(sql`
+        INSERT INTO public.identifier_holdings (organization_id, record_id, type_key, key, current)
+        VALUES (${org}::uuid, ${id}::uuid, 'omeka_id', '812', false)`),
+    ).toBe("OC061");
+    expect(
+      await direct(sql`
+        INSERT INTO public.identifier_types (organization_id, key, uniqueness, definition)
+        VALUES (${org}::uuid, 'omeka_id', 'all_time', ${JSON.stringify(omeka(org))}::jsonb)`),
+    ).toBe("OC061");
+    expect(
+      await direct(sql`SELECT public.identifier_type_locks(${org}::uuid, ARRAY['omeka_id'], true)`),
+    ).toBe("OC061");
+  });
+
+  it("on a database defaulting to Repeatable Read, transactions are still Read Committed: never a duplicate", async () => {
+    await ready();
+    if (setup === undefined) throw new Error("not set up");
+    const { testDb } = await setup;
+    const org = await organization();
+    const [a, b] = [await record(org), await record(org)];
+    const alter = async (change: string): Promise<void> => {
+      const session = await openSession(testDb.url);
+      try {
+        await session.runScript(`ALTER DATABASE ${testDb.name} ${change}`);
+      } finally {
+        await session.close();
+      }
+    };
+    await alter("SET default_transaction_isolation = 'repeatable read'");
+    // New connections see the new default.
+    const other = openDatabase(testDb.url, { max: 4 });
+    try {
+      // A statement outside Database.transaction runs under the default: refused.
+      const refusal = await other
+        .execute(
+          sql`
+          INSERT INTO public.identifier_holdings (organization_id, record_id, type_key, key, current)
+          VALUES (${org}::uuid, ${b}::uuid, 'stray_id', '1', false)`,
+        )
+        .then(
+          () => "",
+          (error: unknown) => (error as { code?: string }).code ?? "",
+        );
+      expect(refusal).toBe("OC061");
+      // The race of a save and a type created at the same moment, as above.
+      const commit = gate();
+      let saved = (): void => undefined;
+      const ran = new Promise<void>((resolve) => {
+        saved = resolve;
+      });
+      const saving = other.transaction(async (q) => {
+        const result = await saveRecordIdentifiers(
+          q,
+          numbers(org, a, [], [{ type: "omeka_id", value: "812" }]),
+        );
+        saved();
+        await commit.opened;
+        return result;
+      });
+      await ran;
+      const creating = other.transaction((q) => insertIdentifierType(q, omeka(org)));
+      await settledOrWaiting(creating);
+      commit.open();
+      ok(await saving);
+      ok(await creating);
+      expect(await ruleless(org, "omeka_id")).toBe(0);
+      expect(
+        codes(
+          await other.transaction((q) =>
+            saveRecordIdentifiers(q, numbers(org, b, [], [{ type: "omeka_id", value: "812" }])),
+          ),
+        ),
+      ).toEqual(["not_unique"]);
+    } finally {
+      await other.close();
+      await alter("RESET default_transaction_isolation");
+    }
   });
 });
 
@@ -1068,6 +1274,23 @@ describe("organizations stay separate, even through direct SQL", () => {
     expect(codes(await save(numbers(org, b, [], [{ type: "omeka_id", value: "812" }])))).toEqual([
       "not_unique",
     ]);
+  });
+
+  it("a type inserted by direct SQL adopts the former numbers already stored under its key", async () => {
+    await ready();
+    const org = await organization();
+    const [a, b] = [await record(org), await record(org)];
+    ok(await save(numbers(org, a, [], [{ type: "omeka_id", value: "812" }])));
+    const omeka: IdentifierType = {
+      organizationId: org,
+      key: "omeka_id",
+      label: "Omeka ID",
+      uniqueness: "all_time",
+    };
+    await db.execute(sql`
+      INSERT INTO public.identifier_types (organization_id, key, uniqueness, definition)
+      VALUES (${org}::uuid, 'omeka_id', 'all_time', ${JSON.stringify(omeka)}::jsonb)`);
+    expect(codes(await save(numbers(org, b, [["omeka_id", "812"]])))).toEqual(["not_unique"]);
   });
 
   it("what identifies a row never changes: organization, record, type, key, position, series", async () => {
