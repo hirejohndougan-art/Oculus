@@ -5,8 +5,10 @@
  * `NNNN_short_name.sql`, applied forwards only, in name order. The runner:
  * - checks the server is PostgreSQL 15 or newer (D-049), warning above the
  *   newest major CI tests;
- * - takes a session-level advisory lock, so two runs never migrate at once
- *   (the second waits, then finds nothing left to do);
+ * - takes a session-level advisory lock on a connection of its own, which
+ *   never runs a migration file, so two runs never migrate at once (the
+ *   second waits, then finds nothing left to do) and no file can release it;
+ *   files run on a second connection;
  * - checks every applied file is still there, unedited (SHA-256 of its bytes),
  *   and that no new file sorts before an applied one, refusing to run at all
  *   otherwise;
@@ -20,8 +22,9 @@
  * `failed`, only if the session is still in the runner's own transaction (same
  * transaction ID, in progress, inside a block; after a failure, the runner's
  * savepoint must still be there) and the runner's own COMMIT or ROLLBACK is
- * what ends it. A file that releases the runner's advisory lock is refused as
- * `lock_lost` before anything of it commits. Statements that can't run in a transaction
+ * what ends it. Before each file, before recording it and after a failure the
+ * runner checks that its lock connection is alive and still holds the lock;
+ * if not, the run stops as `lock_lost`. Statements that can't run in a transaction
  * (CREATE INDEX CONCURRENTLY) are not supported. Right after each file, inside
  * its transaction, and again after it, the session is reset (RESET ALL, RESET
  * ROLE, RESET SESSION AUTHORIZATION, DISCARD TEMP, DEALLOCATE ALL), and the
@@ -75,6 +78,7 @@ export class MigrationError extends Error {
       | "transaction_ended"
       | "lock_timeout"
       | "lock_lost"
+      | "commit_unknown"
       | "failed",
     message: string,
     options?: ErrorOptions,
@@ -205,10 +209,20 @@ async function appliedMigrations(session: Session): Promise<AppliedMigration[]> 
   );
 }
 
-/** What the runner knows about its own transaction: its ID and start time. */
+/** What the runner knows about its own transaction: its ID. */
 interface Started {
   xid: string;
-  at: string;
+}
+
+/**
+ * The runner's lock: a session-level advisory lock held by a connection of
+ * its own, which never runs a migration file, so no file can release it
+ * (advisory locks belong to the session that took them).
+ */
+interface Lock {
+  session: Session;
+  /** The backend that took the lock. */
+  pid: number;
 }
 
 /** What the server says about a transaction ID: in progress, committed or aborted. */
@@ -258,30 +272,48 @@ async function failedInRunnersTransaction(session: Session, started: Started): P
   }
 }
 
-/** Prepared transactions in this database made since the runner's transaction began. */
-async function preparedSince(session: Session, started: Started): Promise<string[]> {
+/**
+ * The prepared transaction the file made of the runner's own transaction, if
+ * any: only one whose transaction ID is the runner's, never another
+ * application's.
+ */
+async function preparedByFile(session: Session, started: Started): Promise<string[]> {
   const rows = await session.rows<{ gid: string }>(
     sql`SELECT gid FROM pg_catalog.pg_prepared_xacts
         WHERE database = pg_catalog.current_database()
-          AND prepared >= ${started.at}::pg_catalog.timestamptz
-        ORDER BY prepared, gid`,
+          AND transaction = pg_catalog.xid(${started.xid}::pg_catalog.xid8)
+        ORDER BY gid`,
   );
   return rows.map((row) => row.gid);
 }
 
-/** Whether this session still holds the runner's advisory lock (a file may release it). */
-async function holdsLock(session: Session): Promise<boolean> {
-  const [row] = await session.rows<{ held: boolean }>(
-    sql`SELECT EXISTS (
-          SELECT 1 FROM pg_catalog.pg_locks
-          WHERE locktype = 'advisory' AND pid = pg_catalog.pg_backend_pid() AND granted
-            AND classid = ${String(MIGRATION_LOCK_KEY >> 32n)}::pg_catalog.oid
-            AND objid = ${String(MIGRATION_LOCK_KEY & 0xffffffffn)}::pg_catalog.oid
-            AND objsubid = 1
-        ) AS held`,
-  );
-  return row?.held === true;
+/**
+ * Whether the runner still holds its lock: the lock connection answers, is
+ * still the backend that took the lock, and that backend holds the lock
+ * exclusively. Any error (the connection is gone) counts as lost.
+ */
+async function lockHeld(lock: Lock): Promise<boolean> {
+  try {
+    const [row] = await lock.session.rows<{ held: boolean }>(
+      sql`SELECT pg_catalog.pg_backend_pid() = ${lock.pid}::pg_catalog.int4 AND EXISTS (
+            SELECT 1 FROM pg_catalog.pg_locks
+            WHERE locktype = 'advisory' AND pid = ${lock.pid}::pg_catalog.int4
+              AND mode = 'ExclusiveLock' AND granted
+              AND database = (SELECT oid FROM pg_catalog.pg_database
+                              WHERE datname = pg_catalog.current_database())
+              AND classid = ${String(MIGRATION_LOCK_KEY >> 32n)}::pg_catalog.oid
+              AND objid = ${String(MIGRATION_LOCK_KEY & 0xffffffffn)}::pg_catalog.oid
+              AND objsubid = 1
+          ) AS held`,
+    );
+    return row?.held === true;
+  } catch {
+    return false;
+  }
 }
+
+const LOCK_LOST =
+  "the runner's advisory lock was lost (its connection ended, or no longer holds the lock), so another run could migrate at the same time";
 
 function transactionEnded(file: MigrationFile, prepared: readonly string[]): MigrationError {
   const resolve =
@@ -294,18 +326,23 @@ function transactionEnded(file: MigrationFile, prepared: readonly string[]): Mig
   );
 }
 
-async function applyOne(session: Session, file: MigrationFile): Promise<void> {
+async function applyOne(session: Session, lock: Lock, file: MigrationFile): Promise<void> {
+  if (!(await lockHeld(lock))) {
+    throw new MigrationError(
+      "lock_lost",
+      `Before ${file.name} ran, ${LOCK_LOST}. Nothing of it was applied; check that no other run is migrating, then run again.`,
+    );
+  }
   let started: Started | undefined;
   // An object, so the outer catch sees what the inner one set.
-  const script = { failed: false };
+  const stage = { scriptFailed: false, commitFailed: false };
   let committed = false;
   await session.control("BEGIN");
   try {
     // Gives the transaction an ID now, so whether the file ended it can be
     // asked of the server afterwards, whether the file then failed or not.
     const [row] = await session.rows<Started>(
-      sql`SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS xid,
-                 pg_catalog.now()::pg_catalog.text AS at`,
+      sql`SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS xid`,
     );
     started = row;
     if (started === undefined) throw new MigrationError("failed", "No transaction ID.");
@@ -315,7 +352,7 @@ async function applyOne(session: Session, file: MigrationFile): Promise<void> {
     try {
       await session.runScript(file.text);
     } catch (error) {
-      script.failed = true;
+      stage.scriptFailed = true;
       throw new MigrationError("failed", `${file.name} failed: ${(error as Error).message}`, {
         cause: error,
       });
@@ -324,12 +361,13 @@ async function applyOne(session: Session, file: MigrationFile): Promise<void> {
     // Inside the transaction, so a file's SET, prepared statements and
     // temporary tables can't reach the runner's own statements below.
     await resetSession(session);
+    // A PREPARE TRANSACTION in the file changes the transaction ID, so this
+    // catches it too.
     if (!(await inRunnersTransaction(session, started))) throw transactionEnded(file, []);
-    if ((await preparedSince(session, started)).length > 0) throw transactionEnded(file, []);
-    if (!(await holdsLock(session))) {
+    if (!(await lockHeld(lock))) {
       throw new MigrationError(
         "lock_lost",
-        `${file.name} released the runner's advisory lock (pg_advisory_unlock_all() or pg_advisory_unlock() in the file), so another run could migrate at the same time. Nothing of it was applied; remove that call.`,
+        `While ${file.name} ran, ${LOCK_LOST}. Nothing of it was applied or recorded; check that no other run is migrating, then run again.`,
       );
     }
     try {
@@ -344,14 +382,38 @@ async function applyOne(session: Session, file: MigrationFile): Promise<void> {
         { cause: error },
       );
     }
-    await session.control("COMMIT");
+    try {
+      await session.control("COMMIT");
+    } catch (error) {
+      stage.commitFailed = true;
+      throw error;
+    }
     committed = true;
   } catch (error) {
     let failure = error;
-    if (started !== undefined) {
+    if (started === undefined) {
+      await session.control("ROLLBACK").catch(() => undefined);
+    } else if (stage.commitFailed) {
+      // A COMMIT that fails on the server (a deferred constraint) ends the
+      // transaction aborted. If the server can't be asked (the connection is
+      // gone), nobody here knows whether the COMMIT happened.
+      const status = await transactionStatus(session, started.xid).catch(() => undefined);
+      failure =
+        status === "aborted"
+          ? new MigrationError(
+              "failed",
+              `${file.name} failed at COMMIT, so nothing of it was applied or recorded: ${(error as Error).message}`,
+              { cause: error },
+            )
+          : new MigrationError(
+              "commit_unknown",
+              `The connection was lost during the COMMIT of ${file.name}, so whether it was applied and recorded is unknown: a person must check whether ${file.name} is recorded in public.oculus_migrations (and whether its changes are in the database) before migrating again. (${(error as Error).message})`,
+              { cause: error },
+            );
+    } else {
       // A failed file counts as plain `failed` only if it failed inside the
       // runner's transaction, which it never ended (so it committed nothing).
-      if (script.failed && !(await failedInRunnersTransaction(session, started))) {
+      if (stage.scriptFailed && !(await failedInRunnersTransaction(session, started))) {
         failure = transactionEnded(file, []);
       }
       await session.control("ROLLBACK").catch(() => undefined);
@@ -359,11 +421,26 @@ async function applyOne(session: Session, file: MigrationFile): Promise<void> {
       const status = await transactionStatus(session, started.xid).catch(() => undefined);
       if (status !== "aborted") failure = transactionEnded(file, []);
       if (failure instanceof MigrationError && failure.code === "transaction_ended") {
-        const prepared = await preparedSince(session, started).catch(() => []);
+        const prepared = await preparedByFile(session, started).catch(() => []);
         failure = transactionEnded(file, prepared);
       }
-    } else {
-      await session.control("ROLLBACK").catch(() => undefined);
+    }
+    // A failing file may also have ended the lock's connection.
+    if (!(failure instanceof MigrationError && failure.code === "lock_lost")) {
+      if (!(await lockHeld(lock))) {
+        failure =
+          failure instanceof MigrationError && failure.code === "failed"
+            ? new MigrationError(
+                "lock_lost",
+                `${file.name} failed and was rolled back, and ${LOCK_LOST}. Check that no other run is migrating, then fix the file and run again. (${failure.message})`,
+                { cause: failure },
+              )
+            : new MigrationError(
+                failure instanceof MigrationError ? failure.code : "lock_lost",
+                `${(failure as Error).message} Also, ${LOCK_LOST}.`,
+                { cause: failure },
+              );
+      }
     }
     throw failure;
   } finally {
@@ -400,20 +477,21 @@ export async function migrate(options: MigrateOptions): Promise<MigrateResult> {
     throw new TypeError("lockTimeoutMs must be a positive whole number.");
   }
   const files = await readMigrations(options.dir ?? defaultMigrationsDir());
-  const session = await openSession(options.connectionString);
+  // The lock's own connection: it takes the lock and never runs a file.
+  const lockSession = await openSession(options.connectionString, "oculus-migrate-lock");
   try {
-    const [version] = await session.rows<{ v: string }>(
+    const [version] = await lockSession.rows<{ v: string }>(
       sql`SELECT pg_catalog.current_setting('server_version_num') AS v`,
     );
     const serverVersionNum = Number(version?.v);
     const warning = checkServerVersion(serverVersionNum);
     if (warning) log(`Warning: ${warning}`);
 
-    await session.execute(
+    await lockSession.execute(
       sql`SELECT pg_catalog.set_config('lock_timeout', ${String(lockTimeoutMs)}, false)`,
     );
     try {
-      await session.execute(sql`SELECT pg_catalog.pg_advisory_lock(${MIGRATION_LOCK_KEY})`);
+      await lockSession.execute(sql`SELECT pg_catalog.pg_advisory_lock(${MIGRATION_LOCK_KEY})`);
     } catch (error) {
       if ((error as { code?: string }).code === "55P03") {
         throw new MigrationError(
@@ -424,23 +502,34 @@ export async function migrate(options: MigrateOptions): Promise<MigrateResult> {
       }
       throw error;
     }
-    await session.execute(sql`SELECT pg_catalog.set_config('lock_timeout', '0', false)`);
     try {
-      const pending = pendingMigrations(files, await appliedMigrations(session));
-      const applied: string[] = [];
-      for (const file of pending) {
-        await applyOne(session, file);
-        applied.push(file.name);
-        log(`Applied ${file.name}`);
+      const [backend] = await lockSession.rows<{ pid: number }>(
+        sql`SELECT pg_catalog.pg_backend_pid() AS pid`,
+      );
+      if (backend === undefined) throw new MigrationError("lock_lost", "No backend ID.");
+      const lock: Lock = { session: lockSession, pid: backend.pid };
+      // The files' connection. It is closed before the lock is released, so
+      // nothing of a file's can still be running when another run starts.
+      const session = await openSession(options.connectionString, "oculus-migrate");
+      try {
+        const pending = pendingMigrations(files, await appliedMigrations(session));
+        const applied: string[] = [];
+        for (const file of pending) {
+          await applyOne(session, lock, file);
+          applied.push(file.name);
+          log(`Applied ${file.name}`);
+        }
+        if (applied.length === 0) log("Nothing to migrate.");
+        return { applied, serverVersionNum };
+      } finally {
+        await session.close().catch(() => undefined);
       }
-      if (applied.length === 0) log("Nothing to migrate.");
-      return { applied, serverVersionNum };
     } finally {
-      await session
+      await lockSession
         .execute(sql`SELECT pg_catalog.pg_advisory_unlock(${MIGRATION_LOCK_KEY})`)
         .catch(() => undefined);
     }
   } finally {
-    await session.close().catch(() => undefined);
+    await lockSession.close().catch(() => undefined);
   }
 }

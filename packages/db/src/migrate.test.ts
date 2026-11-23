@@ -1,7 +1,7 @@
 // The migration runner: every migration on a fresh database, the refusals
 // (edited, missing, out-of-order and badly named files, old servers, files
-// that end the transaction or release the lock), and two runners at once
-// (the advisory lock).
+// that end the transaction or the lock's connection, failures at COMMIT), and
+// two runners at once (the advisory lock, held on its own connection).
 import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -58,6 +58,37 @@ async function tables(url: string): Promise<string[]> {
           WHERE table_schema = 'public' ORDER BY table_name`,
     );
     return rows.map((row) => row.t);
+  } finally {
+    await db.close();
+  }
+}
+
+const KEY = String(MIGRATION_LOCK_KEY);
+
+/** The rows of the `probe` table a test file made. */
+async function probe(url: string): Promise<{ taken: boolean }[]> {
+  const db = openDatabase(url, { max: 1 });
+  try {
+    return await db.rows(sql`SELECT taken FROM probe`);
+  } finally {
+    await db.close();
+  }
+}
+
+/** Waits until another session in this database is running a query containing `fragment`. */
+async function waitForActivity(url: string, fragment: string): Promise<void> {
+  const db = openDatabase(url, { max: 1 });
+  try {
+    for (let i = 0; i < 500; i++) {
+      const [row] = await db.rows<{ n: number }>(
+        sql`SELECT count(*)::int AS n FROM pg_stat_activity
+            WHERE datname = current_database() AND pid <> pg_backend_pid()
+              AND state = 'active' AND strpos(query, ${fragment}) > 0`,
+      );
+      if ((row?.n ?? 0) > 0) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`No session ran ${fragment}`);
   } finally {
     await db.close();
   }
@@ -350,20 +381,165 @@ describe("refusals", () => {
     ["pg_advisory_unlock_all()", "SELECT pg_advisory_unlock_all();"],
     ["pg_advisory_unlock(key)", `SELECT pg_advisory_unlock(${String(MIGRATION_LOCK_KEY)});`],
   ])(
-    "refuses a file that releases the runner's lock with %s, before anything of it commits",
+    "doesn't let a file release the runner's lock with %s: the lock is on another connection",
     async (_form, unlock) => {
       const db = await database();
       const dir = migrationsDir({
-        "0002_unlock.sql": `CREATE TABLE u (id int);\n${unlock}`,
+        // After the unlock, a lock another session holds can't be taken.
+        "0002_unlock.sql": `${unlock}\nCREATE TABLE probe AS SELECT pg_try_advisory_xact_lock(${KEY}) AS taken;`,
+        "0003_after.sql": "CREATE TABLE after (id int);",
+      });
+      const result = await migrate({ connectionString: db.url, dir });
+      expect(result.applied).toHaveLength(3);
+      expect(await probe(db.url)).toEqual([{ taken: false }]);
+    },
+  );
+
+  it.each([
+    [
+      "pg_advisory_unlock_all() and pg_advisory_xact_lock(key)",
+      `SELECT pg_advisory_unlock_all();\nCREATE TABLE probe AS SELECT pg_try_advisory_xact_lock(${KEY}) AS taken;`,
+    ],
+    [
+      "pg_advisory_unlock_all() and pg_advisory_lock_shared(key)",
+      `SELECT pg_advisory_unlock_all();\nCREATE TABLE probe AS SELECT pg_try_advisory_lock_shared(${KEY}) AS taken;`,
+    ],
+  ])("doesn't let a file swap the runner's lock for its own with %s", async (_form, body) => {
+    const db = await database();
+    const dir = migrationsDir({ "0002_swap.sql": body });
+    const result = await migrate({ connectionString: db.url, dir });
+    expect(result.applied).toHaveLength(2);
+    // The runner's lock was held, by another session, all through the file.
+    expect(await probe(db.url)).toEqual([{ taken: false }]);
+  });
+
+  it.each([
+    ["succeeds", "CREATE TABLE k (id int);"],
+    ["then fails", "CREATE TABLE k (id int);\nSELECT * FROM nowhere;"],
+  ])(
+    "stops with lock_lost when a file ends the runner's lock connection and %s",
+    async (_form, tail) => {
+      const db = await database();
+      const dir = migrationsDir({
+        "0002_kill.sql": `SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity
+          WHERE datname = current_database() AND pid <> pg_backend_pid();\n${tail}`,
         "0003_after.sql": "CREATE TABLE after (id int);",
       });
       const error = await refusal(migrate({ connectionString: db.url, dir }));
       expect(error.code).toBe("lock_lost");
-      expect(error.message).toContain("0002_unlock.sql");
+      expect(error.message).toContain("0002_kill.sql");
       expect(await tables(db.url)).toEqual(["oculus_migrations"]);
       expect((await recorded(db.url)).map((r) => r.name)).toEqual(["0001_migrations_table.sql"]);
     },
   );
+
+  it("records a file normally while another application holds a prepared transaction", async () => {
+    const db = await database();
+    const other = await openSession(db.url);
+    const gid = `other_app_${randomBytes(6).toString("hex")}`;
+    try {
+      const dir = migrationsDir({
+        "0002_slow.sql": "CREATE TABLE slow (id int);\nSELECT pg_sleep(0.4);",
+      });
+      const running = migrate({ connectionString: db.url, dir });
+      await waitForActivity(db.url, "pg_sleep(0.4)");
+      // Another application prepares a transaction while the file runs.
+      await other.control("BEGIN");
+      await other.rows(sql`SELECT pg_current_xact_id()`);
+      await other.runScript(`PREPARE TRANSACTION '${gid}'`);
+      const result = await running;
+      expect(result.applied).toEqual(["0001_migrations_table.sql", "0002_slow.sql"]);
+      expect((await recorded(db.url)).map((r) => r.name)).toEqual(result.applied);
+    } finally {
+      await other.runScript(`ROLLBACK PREPARED '${gid}'`).catch(() => undefined);
+      await other.close();
+    }
+  });
+
+  it("names only the file's own prepared transaction, never another application's", async () => {
+    const db = await database();
+    const other = await openSession(db.url);
+    const gid = `other_app_${randomBytes(6).toString("hex")}`;
+    try {
+      const dir = migrationsDir({
+        "0002_escape.sql":
+          "CREATE TABLE early (id int);\nCOMMIT;\nSELECT pg_sleep(0.4);\nSELECT * FROM nowhere;",
+      });
+      const running = refusal(migrate({ connectionString: db.url, dir }));
+      await waitForActivity(db.url, "pg_sleep(0.4)");
+      await other.control("BEGIN");
+      await other.rows(sql`SELECT pg_current_xact_id()`);
+      await other.runScript(`PREPARE TRANSACTION '${gid}'`);
+      const error = await running;
+      expect(error.code).toBe("transaction_ended");
+      expect(error.message).not.toContain(gid);
+      expect(error.message).not.toMatch(/PREPARED/);
+    } finally {
+      await other.runScript(`ROLLBACK PREPARED '${gid}'`).catch(() => undefined);
+      await other.close();
+    }
+  });
+
+  it("reports a deferred constraint that fails at the runner's COMMIT as failed, naming the file", async () => {
+    const db = await database();
+    const dir = migrationsDir({
+      "0002_deferred.sql":
+        "CREATE TABLE p (id int PRIMARY KEY);\nCREATE TABLE c (p_id int REFERENCES p DEFERRABLE INITIALLY DEFERRED);\nINSERT INTO c VALUES (1);",
+      "0003_after.sql": "CREATE TABLE after (id int);",
+    });
+    const error = await refusal(migrate({ connectionString: db.url, dir }));
+    expect(error.code).toBe("failed");
+    expect(error.message).toContain("0002_deferred.sql");
+    expect(error.message).toMatch(/COMMIT/);
+    expect(await tables(db.url)).toEqual(["oculus_migrations"]);
+    expect((await recorded(db.url)).map((r) => r.name)).toEqual(["0001_migrations_table.sql"]);
+  });
+
+  it("says the outcome is unknown when the connection is lost during the runner's COMMIT", async () => {
+    const db = await database();
+    const dir = migrationsDir({
+      // A deferred trigger, run at COMMIT, ends its own connection.
+      "0002_die.sql": `CREATE FUNCTION die() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM pg_terminate_backend(pg_backend_pid());
+  PERFORM pg_sleep(5);
+  RETURN NULL;
+END $$;
+CREATE TABLE d (id int);
+CREATE CONSTRAINT TRIGGER d_die AFTER INSERT ON d DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION die();
+INSERT INTO d VALUES (1);`,
+      "0003_after.sql": "CREATE TABLE after (id int);",
+    });
+    const error = await refusal(migrate({ connectionString: db.url, dir }));
+    expect(error.code).toBe("commit_unknown");
+    expect(error.message).toContain("0002_die.sql");
+    expect(error.message).toMatch(/unknown/);
+    expect(error.message).toMatch(/a person must check whether 0002_die.sql is recorded/);
+    expect(await tables(db.url)).not.toContain("after");
+  });
+
+  it("reports a file that releases the runner's savepoint and then fails as transaction_ended, keeping nothing", async () => {
+    const db = await database();
+    const dir = migrationsDir({
+      "0002_release.sql":
+        "CREATE TABLE r (id int);\nRELEASE SAVEPOINT oculus_migration;\nSELECT * FROM nowhere;",
+    });
+    expect((await refusal(migrate({ connectionString: db.url, dir }))).code).toBe(
+      "transaction_ended",
+    );
+    expect(await tables(db.url)).toEqual(["oculus_migrations"]);
+    expect((await recorded(db.url)).map((r) => r.name)).toEqual(["0001_migrations_table.sql"]);
+  });
+
+  it("records a file that releases the runner's savepoint and succeeds", async () => {
+    const db = await database();
+    const dir = migrationsDir({
+      "0002_release.sql": "CREATE TABLE r (id int);\nRELEASE SAVEPOINT oculus_migration;",
+    });
+    expect((await migrate({ connectionString: db.url, dir })).applied).toHaveLength(2);
+    expect(await tables(db.url)).toEqual(["oculus_migrations", "r"]);
+  });
 
   it("blames the first migration only when the bookkeeping table is missing", async () => {
     const db = await database();
@@ -498,6 +674,28 @@ describe("two runners at once", () => {
     } finally {
       await holder.close();
     }
+  });
+
+  it("never runs files of two runners at once, even if a file swaps the lock for its own", async () => {
+    const dir = migrationsDir({
+      "0002_swap.sql": `SELECT pg_advisory_unlock_all();\nSELECT pg_try_advisory_xact_lock(${KEY});\nSELECT pg_sleep(0.4);`,
+      "0003_t.sql": "SELECT pg_sleep(0.3);\nCREATE TABLE t3 (id int);",
+    });
+    let firstDone = false;
+    const first = migrate({ connectionString: db.url, dir }).then((r) => {
+      firstDone = true;
+      return r;
+    });
+    await waitForActivity(db.url, "pg_sleep(0.4)");
+    const second = migrate({ connectionString: db.url, dir, lockTimeoutMs: 20_000 }).then((r) => {
+      // The second runner got the lock only after the first had finished.
+      expect(firstDone).toBe(true);
+      return r;
+    });
+    const [a, b] = await Promise.all([first, second]);
+    expect(a.applied).toEqual(["0001_migrations_table.sql", "0002_swap.sql", "0003_t.sql"]);
+    expect(b.applied).toEqual([]);
+    expect(await recorded(db.url)).toHaveLength(3);
   });
 
   it("releases the lock after a refusal", async () => {

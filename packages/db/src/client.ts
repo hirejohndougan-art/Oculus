@@ -189,8 +189,14 @@ export type ControlStatement =
   | "SAVEPOINT oculus_migration"
   | "ROLLBACK TO SAVEPOINT oculus_migration";
 
-export async function openSession(connectionString: string): Promise<Session> {
-  const client = new pg.Client({ ...clientConfig(connectionString), application_name: "oculus" });
+export async function openSession(
+  connectionString: string,
+  applicationName = "oculus",
+): Promise<Session> {
+  const client = new pg.Client({
+    ...clientConfig(connectionString),
+    application_name: applicationName,
+  });
   // Errors after connecting (the server going away) surface on the next query.
   client.on("error", () => undefined);
   await client.connect();
