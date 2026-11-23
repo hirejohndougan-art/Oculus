@@ -44,6 +44,7 @@ export {
 export type { AllocationRequest, StoredRecordIdentifiers } from "./identifiers.js";
 export {
   termKey,
+  canonicalTermUri,
   saveTerm,
   readTerm,
   readTerms,
@@ -58,7 +59,6 @@ export {
 export type {
   StoredTerm,
   StoredTerms,
-  TermCountScope,
   TermUsage,
   RecordTerms,
   TermCount,

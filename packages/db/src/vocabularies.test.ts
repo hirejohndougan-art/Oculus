@@ -35,11 +35,12 @@ import {
   recordsWithStaleTerms,
   refreshRecordTerms,
   saveTerm,
+  canonicalTermUri,
   termKey,
   termUsageCounts,
   type StoredTerms,
+  type StaleRecords,
   type TermCounts,
-  type TermCountScope,
 } from "./vocabularies.js";
 
 // ---------------------------------------------------------------------------
@@ -148,32 +149,15 @@ const keyOf = (term: unknown): string => ok(termKey(term));
 
 /**
  * Each term's count, by its stored label, else its URI, else its key (a term
- * not stored has no label), for compact expectations. Staff scope unless
- * `public_fields` is asked for.
+ * not stored has no label), for compact expectations.
  */
 async function countsByLabel(
   org: OrganizationId,
   fieldKey?: string,
-  scope: TermCountScope = "staff",
 ): Promise<Record<string, number>> {
-  const result = ok(
-    await termUsageCounts(db, org, fieldKey === undefined ? { scope } : { scope, fieldKey }),
-  );
+  const result = ok(await termUsageCounts(db, org, fieldKey === undefined ? {} : { fieldKey }));
   return Object.fromEntries(
     result.counts.map((c) => [c.stored?.term.label ?? c.uri ?? c.termKey, c.records]),
-  );
-}
-
-/** A new template version of spectrum-object with these fields made staff-only. */
-async function staffFields(org: OrganizationId, keys: readonly string[]): Promise<void> {
-  const template = ok(await readTemplate(db, org, "spectrum-object")).template;
-  ok(
-    await insertTemplateVersion(db, {
-      ...template,
-      fields: template.fields.map((f) =>
-        keys.includes(f.key) ? { ...f, visibility: "staff" as const } : f,
-      ),
-    }),
   );
 }
 
@@ -385,7 +369,7 @@ describe("the usage index", () => {
     const c = await record(org, { object_name: CHAIR });
     for (const id of [a, b, c]) ok(await refresh(org, id));
 
-    const counts = ok(await termUsageCounts(db, org, { scope: "staff" }));
+    const counts = ok(await termUsageCounts(db, org, {}));
     expect(counts.truncated).toBe(false);
     expect(counts.counts.map((x) => x.termKey)).toEqual(
       [LCSH, CHAIR, DEPOT, { label: "Unused" }].map(keyOf).sort(),
@@ -423,7 +407,7 @@ describe("the usage index", () => {
     expect(next.records.map((r) => r.recordId)).toEqual([high]);
     expect(next.truncated).toBe(false);
 
-    const top = ok(await termUsageCounts(db, org, { scope: "staff", limit: 1 }));
+    const top = ok(await termUsageCounts(db, org, { limit: 1 }));
     expect(top.counts).toHaveLength(1);
     expect(top.truncated).toBe(true);
   });
@@ -458,7 +442,7 @@ describe("the usage index", () => {
         WHERE organization_id = ${org}::uuid AND id = ${id}::uuid`);
       ok(await refreshRecordTerms(q, org, id));
     });
-    expect(ok(await termUsageCounts(db, org, { scope: "staff" })).counts).toEqual([]);
+    expect(ok(await termUsageCounts(db, org, {})).counts).toEqual([]);
     expect(ok(await recordsWithStaleTerms(db, org)).recordIds).toEqual([]);
   });
 
@@ -481,21 +465,17 @@ describe("the usage index", () => {
     const org = await organization();
     expect(codes(await refresh(org, crypto.randomUUID() as RecordId))).toEqual(["unknown_record"]);
     expect(codes(await refresh(org, "x" as RecordId))).toEqual(["invalid_id"]);
-    expect(codes(await termUsageCounts(db, org, { scope: "staff", limit: 0 }))).toEqual([
-      "invalid_limit",
-    ]);
-    expect(codes(await termUsageCounts(db, org, { scope: "staff", fieldKey: "Bad-Key" }))).toEqual([
+    expect(codes(await termUsageCounts(db, org, { limit: 0 }))).toEqual(["invalid_limit"]);
+    expect(codes(await termUsageCounts(db, org, { fieldKey: "Bad-Key" }))).toEqual([
       "invalid_field_key",
     ]);
-    expect(codes(await termUsageCounts(db, org, { scope: "public" as TermCountScope }))).toEqual([
-      "invalid_scope",
+    // There is no public option: asking for one is refused, never ignored.
+    const publicScope = { scope: "public_fields" } as Parameters<typeof termUsageCounts>[2];
+    expect(codes(await termUsageCounts(db, org, publicScope))).toEqual(["unknown_option"]);
+    expect(codes(await recordsWithStaleTerms(db, org, { after: "x" as RecordId }))).toEqual([
+      "invalid_id",
     ]);
-    expect(codes(await termUsageCounts(db, org, {} as { scope: TermCountScope }))).toEqual([
-      "invalid_scope",
-    ]);
-    expect(codes(await termUsageCounts(db, org, { scope: "staff", after: "abc" }))).toEqual([
-      "invalid_term_key",
-    ]);
+    expect(codes(await termUsageCounts(db, org, { after: "abc" }))).toEqual(["invalid_term_key"]);
     expect(codes(await readTerms(db, org, { after: "abc" }))).toEqual(["invalid_term_key"]);
     expect(codes(await readTerms(db, org, { limit: 10_001 }))).toEqual(["invalid_limit"]);
     expect(codes(await recordsUsingTerm(db, org, "abc"))).toEqual(["invalid_term_key"]);
@@ -508,23 +488,19 @@ describe("the usage index", () => {
   });
 });
 
-describe("staff-only counts (the scope, no labels from records)", () => {
+describe("staff-only counts (nothing typed in a record shown as a term)", () => {
   it("never shows a record's label for a term the organization hasn't stored", async () => {
     await ready();
     const org = await organization();
-    await staffFields(org, ["techniques"]);
-    // A staff note typed as the label of an LCSH heading, in a staff field.
+    // A staff note typed as the label of an LCSH heading.
     const secret = { ...LCSH, label: "AAA secret note about donor" };
     const a = await record(org, { subjects: [LCSH], techniques: [secret] });
     const b = await record(org, { techniques: [{ label: "Secret donor family" }] });
     const built = ok(await refresh(org, a));
-    expect(built.usages.map((u) => [u.fieldKey, u.visibility])).toEqual([
-      ["techniques", "staff"],
-      ["subjects", "public"],
-    ]);
+    expect(built.usages.map((u) => u.fieldKey)).toEqual(["techniques", "subjects"]);
     ok(await refresh(org, b));
 
-    const staff = ok(await termUsageCounts(db, org, { scope: "staff" }));
+    const staff = ok(await termUsageCounts(db, org, {}));
     expect(JSON.stringify(staff)).not.toMatch(/secret/i);
     expect(staff.counts.find((c) => c.termKey === keyOf(LCSH))).toEqual({
       termKey: keyOf(LCSH),
@@ -537,9 +513,7 @@ describe("staff-only counts (the scope, no labels from records)", () => {
       { termKey: keyOf({ label: "Secret donor family" }), vocabulary: "local", records: 1 },
     );
 
-    // public_fields counts only usages in public fields.
-    expect(await countsByLabel(org, undefined, "public_fields")).toEqual({ [LCSH.uri]: 1 });
-    expect(await countsByLabel(org, "techniques", "public_fields")).toEqual({});
+    // Every field counts: these counts are staff-only.
     expect(await countsByLabel(org, "techniques")).toEqual({
       [LCSH.uri]: 1,
       [keyOf({ label: "Secret donor family" })]: 1,
@@ -547,11 +521,60 @@ describe("staff-only counts (the scope, no labels from records)", () => {
 
     // A stored term shows the organization's own label, whatever records hold.
     ok(await tx((q) => saveTerm(q, { organizationId: org, term: LCSH })));
-    const named = ok(await termUsageCounts(db, org, { scope: "staff" }));
+    const named = ok(await termUsageCounts(db, org, {}));
     expect(JSON.stringify(named)).not.toMatch(/secret/i);
     expect(named.counts.find((c) => c.termKey === keyOf(LCSH))?.stored?.term.label).toBe(
       "Railroads",
     );
+  });
+
+  it("shows a term's canonical URI, never the URI as a record typed it", async () => {
+    await ready();
+    const org = await organization();
+    // The same term key as CHAIR (dot segments resolve, the scheme is ignored),
+    // with a staff note hidden in the path.
+    const typed = "http://nomenclature.info/nom/AAA-secret-note/../1";
+    const odd = { label: "Chair", vocabulary: "nomenclature", uri: typed };
+    expect(ok(validateControlledTerm(odd)).uri).toBe(typed);
+    expect(keyOf(odd)).toBe(keyOf(CHAIR));
+    expect(canonicalTermUri(typed)).toBe("http://nomenclature.info/nom/1");
+    const a = await record(org, { object_name: CHAIR });
+    const b = await record(org, { techniques: [odd] });
+    for (const id of [a, b]) ok(await refresh(org, id));
+
+    const all = ok(await termUsageCounts(db, org));
+    expect(JSON.stringify(all)).not.toMatch(/secret|\.\./i);
+    expect(all.counts).toEqual([
+      {
+        termKey: keyOf(CHAIR),
+        vocabulary: "nomenclature",
+        uri: "http://nomenclature.info/nom/1",
+        records: 2,
+      },
+    ]);
+    // Only the odd spelling counted (one field): still the canonical form.
+    const inField = ok(await termUsageCounts(db, org, { fieldKey: "techniques" }));
+    expect(JSON.stringify(inField)).not.toMatch(/secret|\.\./i);
+    expect(inField.counts.map((c) => [c.uri, c.records])).toEqual([
+      ["http://nomenclature.info/nom/1", 1],
+    ]);
+    // A stored term shows the organization's own URI.
+    ok(await tx((q) => saveTerm(q, { organizationId: org, term: CHAIR })));
+    const named = ok(await termUsageCounts(db, org));
+    expect(JSON.stringify(named)).not.toMatch(/secret/i);
+    expect(named.counts.map((c) => [c.stored?.term.uri, c.uri, c.records])).toEqual([
+      [CHAIR.uri, undefined, 2],
+    ]);
+  });
+
+  it("canonical URIs: scheme and host lower case, dot segments resolved, no credentials", () => {
+    expect(canonicalTermUri("HTTPS://Nomenclature.INFO/nom/./a/../1/")).toBe(
+      "https://nomenclature.info/nom/1",
+    );
+    expect(canonicalTermUri("https://user:pass@example.org:8443/x?q=1#f")).toBe(
+      "https://example.org:8443/x?q=1#f",
+    );
+    expect(canonicalTermUri("not a url")).toBe("not a url");
   });
 
   it("reads a usage whose URI doesn't match its key as row_mismatch", async () => {
@@ -563,7 +586,7 @@ describe("staff-only counts (the scope, no labels from records)", () => {
     await db.execute(sql`UPDATE public.record_terms
                          SET uri = 'http://id.loc.gov/authorities/subjects/sh85021262'
                          WHERE organization_id = ${org}::uuid`);
-    const read = await termUsageCounts(db, org, { scope: "staff" });
+    const read = await termUsageCounts(db, org, {});
     expect(read.ok ? [] : read.issues.map((i) => [i.path, i.code])).toEqual([
       [[0], "row_mismatch"],
     ]);
@@ -587,7 +610,6 @@ describe("paging", () => {
     for (;;) {
       const page: TermCounts = ok(
         await termUsageCounts(db, org, {
-          scope: "staff",
           limit: 2,
           ...(after === undefined ? {} : { after }),
         }),
@@ -638,6 +660,52 @@ describe("a refused refresh", () => {
     expect(ok(await recordsWithStaleTerms(db, org)).recordIds).toEqual([id]);
     expect(await countsByLabel(org)).toEqual({});
     expect(ok(await recordsUsingTerm(db, org, keyOf(DEPOT))).records).toEqual([]);
+  });
+});
+
+describe("stale records", () => {
+  it("are listed in pages, so records that stay stale never hide the rest", async () => {
+    await ready();
+    const org = await organization();
+    // Three records whose refresh is always refused (fields core refuses)...
+    const broken: RecordId[] = [];
+    for (let i = 0; i < 3; i += 1) {
+      const id = await record(org, { subjects: [DEPOT] });
+      await db.execute(sql`
+        UPDATE public.records SET fields = ${JSON.stringify({ "Bad Key": [DEPOT] })}::jsonb
+        WHERE organization_id = ${org}::uuid AND id = ${id}::uuid`);
+      expect((await refresh(org, id)).ok).toBe(false);
+      broken.push(id);
+    }
+    // ...and one good stale record, after all of them by ID.
+    const highest = [...broken].sort().at(-1) ?? "";
+    let good = await record(org, { subjects: [LCSH] });
+    while (good < highest) {
+      await db.execute(sql`DELETE FROM public.records
+                           WHERE organization_id = ${org}::uuid AND id = ${good}::uuid`);
+      good = await record(org, { subjects: [LCSH] });
+    }
+
+    // A job refreshing everything stale, a page of 3 at a time.
+    const seen: RecordId[] = [];
+    let after: RecordId | undefined;
+    for (let pages = 0; pages < 10; pages += 1) {
+      const page: StaleRecords = ok(
+        await recordsWithStaleTerms(db, org, {
+          limit: 3,
+          ...(after === undefined ? {} : { after }),
+        }),
+      );
+      for (const id of page.recordIds) {
+        seen.push(id);
+        await refresh(org, id);
+      }
+      after = page.recordIds.at(-1);
+      if (!page.truncated) break;
+    }
+    expect(seen).toContain(good);
+    expect(await countsByLabel(org)).toEqual({ [LCSH.uri]: 1 });
+    expect(ok(await recordsWithStaleTerms(db, org)).recordIds).toEqual([...broken].sort());
   });
 });
 
@@ -764,8 +832,8 @@ describe("organization separation", () => {
           FROM public.template_versions WHERE organization_id = ${library}::uuid AND version = 2`,
       // A usage of one organization on another's indexed record.
       sql`INSERT INTO public.record_terms
-            (organization_id, record_id, field_key, visibility, term_key, label)
-          VALUES (${archives}::uuid, ${other}::uuid, 'subjects', 'public', ${key}, 'x')`,
+            (organization_id, record_id, field_key, term_key, label)
+          VALUES (${archives}::uuid, ${other}::uuid, 'subjects', ${key}, 'x')`,
       // A stored term of an organization that doesn't exist.
       sql`INSERT INTO public.terms (organization_id, id, label, term_key)
           VALUES (${newOrganizationId()}::uuid, ${crypto.randomUUID()}::uuid, 'x', ${key})`,

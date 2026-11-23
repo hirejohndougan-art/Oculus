@@ -26,21 +26,22 @@
  * `termUriKey`, so `refreshRecordTerms` rebuilds a record's usages from the
  * record and its template as stored. Whoever saves a record calls it in the
  * same transaction (the service layer, T-032); `recordsWithStaleTerms` finds
- * any record changed without it, from what each index was built from. Each
- * usage keeps its field's visibility (`public` or `staff`) from the template
- * version the index was built from. A refresh that is refused because the
+ * any record changed without it, from what each index was built from. A
+ * refresh that is refused because the
  * record or its template no longer validates removes the record's usages and
  * its index row, so nothing old is counted and the record reads as stale.
  *
- * **The counts and lists here are STAFF-ONLY.** They count every record,
- * published or not, and `termUsageCounts` must be told its `scope`: `staff`
- * (every field) or `public_fields` (only fields whose visibility is public).
- * Even `public_fields` counts unpublished records, so public Subjects counts
- * are not these: they must also count only published records, which is the
- * service and public layers' job (T-034, T-050). No label is ever taken from
- * a record for display: a term the organization hasn't stored is shown by its
- * key, vocabulary and URI only (a record's label could be from a staff field
- * or an unpublished record).
+ * **The counts and lists here are STAFF-ONLY.** They count every usage in
+ * every field of every record, published or not; the index keeps no field
+ * visibility and has no public option. Public Subjects counts are never
+ * worked out from this index: they come from what is published (`publicOutput`
+ * or the public views of published records, or an index built from those at
+ * publish time), the service and public layers' job (T-034, T-050). Nothing
+ * typed in a record is ever shown as a term's name or address: a term the
+ * organization hasn't stored is shown by its key, vocabulary and, for a URI
+ * term, the canonical URI rebuilt from what the key is made of (scheme and
+ * host lower case, dot segments resolved, no user name, password or trailing
+ * slash), never a URI or label as a record holds it.
  *
  * Every read and write names one organization (D-019, D-030): the tables'
  * keys and foreign keys all include it, so another organization's terms,
@@ -64,7 +65,6 @@ import {
   termUriKey,
   validateControlledTerm,
   type ControlledTerm,
-  type FieldVisibility,
   type Issue,
   type OrganizationId,
   type RecordId,
@@ -86,8 +86,6 @@ export interface StoredTerm {
 /** One term a record uses in one field, as the record holds it. */
 export interface TermUsage {
   readonly fieldKey: string;
-  /** The field's visibility in the template version the index was built from. */
-  readonly visibility: FieldVisibility;
   readonly termKey: string;
   readonly term: ControlledTerm;
 }
@@ -103,12 +101,6 @@ export interface RecordTerms {
   readonly skipped: readonly Issue[];
 }
 
-/**
- * Which usages `termUsageCounts` counts. Both are for staff: neither leaves
- * out unpublished records (see the header).
- */
-export type TermCountScope = "staff" | "public_fields";
-
 /** How many records use one term (staff-only, see the header). */
 export interface TermCount {
   readonly termKey: string;
@@ -120,10 +112,12 @@ export interface TermCount {
    */
   readonly stored?: StoredTerm;
   /**
-   * For a term the organization hasn't stored that has a URI: the URI as one
-   * counted usage holds it (the smallest in byte order). A term not stored
-   * has no label here: a record's label could be from a staff field or an
-   * unpublished record. List its records with `recordsUsingTerm`.
+   * For a term the organization hasn't stored that has a URI: its canonical
+   * URI (`canonicalTermUri`), rebuilt from the parts its key is made of, so
+   * nothing a record typed beyond the term's address (dot segments, a user
+   * name) is shown. Its scheme is that of one counted usage. A term not
+   * stored has no label here: a record's label could be from a staff field or
+   * an unpublished record. List its records with `recordsUsingTerm`.
    */
   readonly uri?: string;
   readonly records: number;
@@ -154,7 +148,9 @@ export interface TermUsers {
 }
 
 export interface StaleRecords {
+  /** By record ID. */
   readonly recordIds: readonly RecordId[];
+  /** True when there were more than `limit`: ask again with `after` the last ID. */
   readonly truncated: boolean;
 }
 
@@ -256,6 +252,25 @@ function keyOf(term: ControlledTerm): string {
       ? `${vocab}\u0000label\u0000${term.label}`
       : `${vocab}\u0000uri\u0000${termUriKey(term.uri)}`;
   return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+/**
+ * The canonical form of a term URI, for display: for a web address, its
+ * scheme followed by `termUriKey(uri)`, i.e. rebuilt from the parsed parts
+ * the key is made of (scheme and host lower case, dot segments resolved, the
+ * scheme's default port, user name and password and trailing slashes and
+ * dots dropped). Two URIs with one key differ here at most in scheme. Any
+ * other URI is its own key, so it is returned as it is.
+ */
+export function canonicalTermUri(uri: string): string {
+  let url: URL;
+  try {
+    url = new URL(uri);
+  } catch {
+    return uri;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return uri;
+  return `${url.protocol}${termUriKey(uri)}`;
 }
 
 /** A term's key (see the header), after checking it with `validateControlledTerm`. */
@@ -451,8 +466,7 @@ export async function readTerms(
  * refuses is left out and listed in `skipped`. Values of fields the template
  * doesn't have are not indexed. The record is locked for the rest of the
  * transaction, so two refreshes of it never interleave, and what the index
- * was built from is kept for `recordsWithStaleTerms`. Each usage keeps its
- * field's visibility in that template version.
+ * was built from is kept for `recordsWithStaleTerms`.
  *
  * Call it in the transaction that saves the record. Refused: a record the
  * organization doesn't have (`unknown_record`); a record or template that no
@@ -532,14 +546,7 @@ export async function refreshRecordTerms(
         const id = `${field.key}\u0000${key}`;
         if (seen.has(id)) return;
         seen.add(id);
-        usages.push(
-          Object.freeze({
-            fieldKey: field.key,
-            visibility: field.visibility,
-            termKey: key,
-            term: term.value,
-          }),
-        );
+        usages.push(Object.freeze({ fieldKey: field.key, termKey: key, term: term.value }));
       });
     }
 
@@ -555,16 +562,15 @@ export async function refreshRecordTerms(
     if (usages.length > 0) {
       await db.execute(sql`
         INSERT INTO public.record_terms
-          (organization_id, record_id, field_key, visibility, term_key, vocabulary, uri, label)
-        SELECT ${org}::uuid, ${recordId}::uuid, u.field_key, u.visibility, u.term_key,
+          (organization_id, record_id, field_key, term_key, vocabulary, uri, label)
+        SELECT ${org}::uuid, ${recordId}::uuid, u.field_key, u.term_key,
                u.vocabulary, u.uri, u.label
         FROM unnest(${usages.map((u) => u.fieldKey)}::text[],
-                    ${usages.map((u) => u.visibility)}::text[],
                     ${usages.map((u) => u.termKey)}::text[],
                     ${usages.map((u) => u.term.vocabulary ?? null)}::text[],
                     ${usages.map((u) => u.term.uri ?? null)}::text[],
                     ${usages.map((u) => u.term.label)}::text[])
-             AS u(field_key, visibility, term_key, vocabulary, uri, label)`);
+             AS u(field_key, term_key, vocabulary, uri, label)`);
     }
     return {
       ok: true,
@@ -654,7 +660,7 @@ interface CountRow {
   records: number;
 }
 
-const SCOPES: readonly unknown[] = ["staff", "public_fields"];
+const COUNT_OPTIONS: ReadonlySet<string> = new Set(["fieldKey", "limit", "after"]);
 
 /** A count row as a `TermCount`, its stored term or URI checked against its key. */
 function countFromRow(org: OrganizationId, row: CountRow): Validated<TermCount> {
@@ -685,9 +691,12 @@ function countFromRow(org: OrganizationId, row: CountRow): Validated<TermCount> 
       value: Object.freeze({ termKey: row.term_key, vocabulary, records: row.records }),
     };
   }
+  // Never the URI as a record holds it (it can carry text the key ignores,
+  // such as dot segments): its canonical form, rebuilt from the key's parts.
   // A URI term's key doesn't depend on its label, so a placeholder label
   // checks the vocabulary and URI against the key without reading a label.
-  const checked = validateControlledTerm({ label: "-", vocabulary, uri: row.used_uri });
+  const uri = canonicalTermUri(row.used_uri);
+  const checked = validateControlledTerm({ label: "-", vocabulary, uri });
   if (!checked.ok) return checked;
   if (keyOf(checked.value) !== row.term_key) {
     return refused([], "row_mismatch", "A term usage doesn't match its term key.");
@@ -697,7 +706,7 @@ function countFromRow(org: OrganizationId, row: CountRow): Validated<TermCount> 
     value: Object.freeze({
       termKey: row.term_key,
       vocabulary,
-      uri: row.used_uri,
+      uri,
       records: row.records,
     }),
   };
@@ -705,15 +714,15 @@ function countFromRow(org: OrganizationId, row: CountRow): Validated<TermCount> 
 
 /**
  * STAFF-ONLY: how many of the organization's records use each term, from the
- * index, published or not (see the header; public Subjects counts must also
- * leave out unpublished records, T-034/T-050). `scope` must be given:
- * `staff` counts usages in every field, `public_fields` only in fields whose
- * visibility was `public` when the record was indexed. Every term a counted
- * usage has, and every stored term, with 0 when no record uses it (an unused
- * term, for Data Cleaning). With `fieldKey`, only usages in that field count,
- * and terms no record uses there are left out. A record using a term twice
- * counts once. A term the organization hasn't stored is shown by key,
- * vocabulary and URI, never by a label from a record.
+ * index: every field, every record, published or not. Never for a public
+ * site (see the header: public Subjects counts come from published output,
+ * T-034/T-050). Every term a counted usage has, and every stored term, with 0
+ * when no record uses it (an unused term, for Data Cleaning). With
+ * `fieldKey`, only usages in that field count, and terms no record uses there
+ * are left out. A record using a term twice counts once. A term the
+ * organization hasn't stored is shown by key, vocabulary and canonical URI,
+ * never by a label or URI as a record holds it. Any option but `fieldKey`,
+ * `limit` and `after` is refused (`unknown_option`).
  *
  * By term key, at most `limit` after the key `after`, for reading in pages;
  * ranking (most used first) is the caller's, over all pages.
@@ -722,18 +731,24 @@ export async function termUsageCounts(
   db: Queryable,
   organizationId: OrganizationId,
   options: {
-    readonly scope: TermCountScope;
     readonly fieldKey?: string;
     readonly limit?: number;
     readonly after?: string;
-  },
+  } = {},
 ): Promise<Validated<TermCounts>> {
   if (!isOrganizationId(organizationId)) {
     return refused(["organizationId"], "invalid_organization", BAD_ORGANIZATION);
   }
-  const scope = ownValue(options, "scope");
-  if (!SCOPES.includes(scope)) {
-    return refused(["scope"], "invalid_scope", 'The scope is "staff" or "public_fields".');
+  // A caller asking for something these counts don't do (such as a public
+  // scope, which they never had a safe form of) is refused, not ignored.
+  for (const key of Object.keys(options)) {
+    if (!COUNT_OPTIONS.has(key)) {
+      return refused(
+        [key],
+        "unknown_option",
+        "Only fieldKey, limit and after can be given: these counts are staff-only.",
+      );
+    }
   }
   const limit = checkLimit(options.limit);
   if (!limit.ok) return limit;
@@ -742,7 +757,6 @@ export async function termUsageCounts(
   const after = checkAfterKey(options.after);
   if (!after.ok) return after;
   const org = organizationId;
-  const publicOnly = scope === "public_fields";
   const rows = await db.rows<CountRow>(sql`
     WITH used AS (
       SELECT term_key, count(DISTINCT record_id)::integer AS records,
@@ -750,7 +764,6 @@ export async function termUsageCounts(
       FROM public.record_terms
       WHERE organization_id = ${org}::uuid
         AND (${field.value}::text IS NULL OR field_key = ${field.value}::text)
-        AND (NOT ${publicOnly}::boolean OR visibility = 'public')
         AND (${after.value}::text IS NULL OR term_key > ${after.value}::text)
       GROUP BY term_key
     ), stored AS (
@@ -832,24 +845,32 @@ export async function recordsUsingTerm(
  * The organization's records whose usage index is missing or out of date:
  * never refreshed, or whose fields, template or template version changed
  * since. A maintenance check that reads every record of the organization
- * (the counts never do): refresh what it lists.
+ * (the counts never do): refresh what it lists. By record ID, at most `limit`
+ * after the ID `after`: a record whose refresh keeps being refused stays
+ * stale, so a job working through the list passes `after` the last ID it saw
+ * and so reaches the records beyond a page of ones it can't fix.
  */
 export async function recordsWithStaleTerms(
   db: Queryable,
   organizationId: OrganizationId,
-  options: { readonly limit?: number } = {},
+  options: { readonly limit?: number; readonly after?: RecordId } = {},
 ): Promise<Validated<StaleRecords>> {
   if (!isOrganizationId(organizationId)) {
     return refused(["organizationId"], "invalid_organization", BAD_ORGANIZATION);
   }
   const limit = checkLimit(options.limit);
   if (!limit.ok) return limit;
+  if (options.after !== undefined && !isRecordId(options.after)) {
+    return refused(["after"], "invalid_id", BAD_RECORD);
+  }
+  const after = options.after ?? null;
   const rows = await db.rows<{ id: string }>(sql`
     SELECT r.id::text AS id
     FROM public.records r
     LEFT JOIN public.record_term_index i
       ON i.organization_id = r.organization_id AND i.record_id = r.id
     WHERE r.organization_id = ${organizationId}::uuid
+      AND (${after}::uuid IS NULL OR r.id > ${after}::uuid)
       AND (i.record_id IS NULL
            OR i.template_key <> r.template_key
            OR i.fields_digest <> md5(r.fields::text)
