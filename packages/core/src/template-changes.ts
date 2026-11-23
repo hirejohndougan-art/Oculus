@@ -39,8 +39,9 @@
  *   organization's record link checker (`makeRecordLinkChecker`), given as
  *   `options.linkChecker`; without it every record holding a link under the
  *   key is listed, since any of them may be affected. A link the checker
- *   doesn't hold (a deleted record) already fails the template check and
- *   isn't counted. A place field always links to place records, so it can't
+ *   can't resolve to a kind (a record it doesn't hold, such as a deleted one
+ *   or one added after it was made, an ID used twice, an invalid record) is
+ *   counted too, since its kind is unknown. A place field always links to place records, so it can't
  *   narrow; changing a field between `record_link` and `place` is
  *   `kind_changed`, which lists every record holding a value.
  * - `made_required`: `required` turns on; `recordIds` are the records
@@ -63,8 +64,9 @@
  * should pass the records.
  *
  * A record link checker made from another organization's records is refused
- * (`wrong_organization_checker`), and anything else given as one
- * (`not_a_link_checker`), before any record is read: its record kinds would
+ * (`wrong_organization_checker`), as is one that belongs to no organization
+ * (`no_organization_checker`: made from an empty set with no organization
+ * given) and anything else given as one (`not_a_link_checker`), before any record is read: its record kinds would
  * describe another organization's records. Messages name neither.
  *
  * Every record given must name this template in its `templateKey`
@@ -96,7 +98,7 @@ import {
 import { MAX_RECORD_SET } from "./effective.js";
 import {
   isMadeLinkChecker,
-  isOtherOrganizationsLinkChecker,
+  linkCheckerOrganization,
   linkTargetKind,
 } from "./record-link-brand.js";
 import { RECORD_KINDS } from "./records.js";
@@ -426,8 +428,11 @@ function stranding(
         refuses: (item) => {
           if (!isPlainObject(item) || !Object.hasOwn(item, "recordId")) return false;
           if (kindOf === undefined) return true;
+          // A link the checker can't resolve to a kind (not in its records,
+          // an ID used twice, an invalid record, or a checker made before the
+          // record was) may well be affected: fail closed.
           const kind = kindOf(item.recordId);
-          return kind !== undefined && !allowed.has(kind);
+          return kind === undefined || !allowed.has(kind);
         },
       });
     }
@@ -463,7 +468,14 @@ function readLinkChecker(options: unknown, organizationId: OrganizationId): Vali
       "linkChecker must be a record link checker made by makeRecordLinkChecker.",
     );
   }
-  if (isOtherOrganizationsLinkChecker(checker, organizationId)) {
+  const owner = linkCheckerOrganization(checker);
+  if (owner === undefined) {
+    return bad(
+      "no_organization_checker",
+      "This record link checker was made from no records and for no organization. Make it from this organization's records, or give makeRecordLinkChecker the organization.",
+    );
+  }
+  if (owner !== organizationId) {
     return bad(
       "wrong_organization_checker",
       "This record link checker was made from another organization's records, so it can't be used for this template.",
@@ -694,7 +706,7 @@ function message(f: Found, count: number | undefined, several: number): string {
             : `Linked records weren't checked, so the ${records(count)} holding links for it may link to a kind it no longer allows.`
         }`;
       }
-      return `The field ${key} links to fewer kinds of record. ${stranded(count, "link to a record of a kind the field no longer allows")}`;
+      return `The field ${key} links to fewer kinds of record. ${stranded(count, "link to a record of a kind the field no longer allows, or to one the record link checker doesn't know")}`;
     case "made_required":
       return `The field ${key} becomes required. ${stranded(count, "have no value for it")}`;
     case "inherited_changed":

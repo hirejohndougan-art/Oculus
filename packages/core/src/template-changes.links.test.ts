@@ -149,7 +149,7 @@ describe("record_kind_removed", () => {
     expect(change.recordIds).toEqual([holder.id]);
   });
 
-  it("doesn't count a link to a record the checker doesn't hold", () => {
+  it("counts a link the checker can't resolve to a kind as possibly affected", () => {
     const s = sample();
     const dangling = withKey(
       record("object", "Orphan", { creator: { recordId: newRecordId(), label: "gone" } }),
@@ -157,7 +157,45 @@ describe("record_kind_removed", () => {
     const result = templateChanges(AGENT_OR_EVENT, AGENT, [dangling], {
       linkChecker: s.checker,
     });
-    expect(only(result, "record_kind_removed").recordCount).toBe(0);
+    const change = only(result, "record_kind_removed");
+    expect(change.recordIds).toEqual([dangling.id]);
+    expect(change.needsConfirmation).toBe(true);
+    expect(change.message).toContain("doesn't know");
+  });
+
+  it("counts every link when the checker is stale (made before the targets)", () => {
+    const s = sample();
+    const stale = ok(makeRecordLinkChecker([s.none]));
+    const change = only(
+      templateChanges(AGENT_OR_EVENT, AGENT, s.users, { linkChecker: stale }),
+      "record_kind_removed",
+    );
+    expect([...change.recordIds].sort()).toEqual([s.byAgent.id, s.byEvent.id].sort());
+    expect(change.needsConfirmation).toBe(true);
+  });
+
+  it("counts a link to an ID used twice or to an invalid record", () => {
+    const twice = record("agent", "Twice", {});
+    const broken = { ...record("agent", "Broken", {}), title: "" };
+    const a = withKey(record("object", "A", { creator: { recordId: twice.id, label: "Twice" } }));
+    const b = withKey(record("object", "B", { creator: { recordId: broken.id, label: "Broken" } }));
+    const checker = ok(makeRecordLinkChecker([twice, { ...twice }, broken, a, b]));
+    const change = only(
+      templateChanges(AGENT_OR_EVENT, AGENT, [a, b], { linkChecker: checker }),
+      "record_kind_removed",
+    );
+    expect([...change.recordIds].sort()).toEqual([a.id, b.id].sort());
+  });
+
+  it("accepts an empty checker made for this organization, counting every link", () => {
+    const s = sample();
+    const empty = ok(makeRecordLinkChecker([], ORG));
+    const change = only(
+      templateChanges(AGENT_OR_EVENT, AGENT, s.users, { linkChecker: empty }),
+      "record_kind_removed",
+    );
+    expect(change.recordCount).toBe(2);
+    expect(change.needsConfirmation).toBe(true);
   });
 
   it("without a checker lists every record holding a link, and needs confirmation", () => {
@@ -213,6 +251,25 @@ describe("record_kind_removed attacks", () => {
     expect(
       codes(templateChanges(AGENT_OR_EVENT, AGENT, undefined, { linkChecker: checker })),
     ).toEqual(["wrong_organization_checker"]);
+  });
+
+  it("refuses a checker made from no records for no organization", () => {
+    const s = sample();
+    const empty = ok(makeRecordLinkChecker([]));
+    expect(codes(templateChanges(AGENT_OR_EVENT, AGENT, s.users, { linkChecker: empty }))).toEqual([
+      "no_organization_checker",
+    ]);
+  });
+
+  it("refuses a checker made from another organization's invalid records", () => {
+    const s = sample();
+    const other = newOrganizationId();
+    const invalid = { ...record("event", SECRET_TITLE, {}, { organizationId: other }), title: "" };
+    const checker = ok(makeRecordLinkChecker([invalid]));
+    const result = templateChanges(AGENT_OR_EVENT, AGENT, s.users, { linkChecker: checker });
+    expect(codes(result)).toEqual(["wrong_organization_checker"]);
+    const text = JSON.stringify(result);
+    for (const leak of [other, invalid.id, SECRET_TITLE]) expect(text).not.toContain(leak);
   });
 
   it("refuses a hand-made checker or a Proxy of a real one", () => {
