@@ -226,6 +226,41 @@ describe("refusals", () => {
     }
   });
 
+  it("reports a file that commits and then fails as ending the transaction, and stops", async () => {
+    const db = await database();
+    const dir = migrationsDir({
+      "0002_escape.sql": "CREATE TABLE early (id int);\nCOMMIT;\nSELECT * FROM nowhere;",
+      "0003_after.sql": "CREATE TABLE after (id int);",
+    });
+    const error = await refusal(migrate({ connectionString: db.url, dir }));
+    expect(error.code).toBe("transaction_ended");
+    expect(error.message).toMatch(/a person must check/);
+    // What the file committed stays; it isn't recorded and nothing after it ran.
+    expect(await tables(db.url)).toEqual(["early", "oculus_migrations"]);
+    expect((await recorded(db.url)).map((r) => r.name)).toEqual(["0001_migrations_table.sql"]);
+    // A later run doesn't carry on as if nothing happened.
+    expect((await refusal(migrate({ connectionString: db.url, dir }))).code).toBe("failed");
+    expect(await tables(db.url)).toEqual(["early", "oculus_migrations"]);
+  });
+
+  it("doesn't let one file's settings reach the next file or the runner", async () => {
+    const db = await database();
+    const dir = migrationsDir({
+      "0002_settings.sql":
+        "CREATE SCHEMA elsewhere;\nCREATE TABLE elsewhere.oculus_migrations (name text, sha256 text);\nSET search_path = elsewhere;\nSET statement_timeout = 1;",
+      "0003_table.sql": "SELECT pg_sleep(0.05);\nCREATE TABLE t3 (id int);",
+    });
+    const result = await migrate({ connectionString: db.url, dir });
+    expect(result.applied).toEqual([
+      "0001_migrations_table.sql",
+      "0002_settings.sql",
+      "0003_table.sql",
+    ]);
+    expect(await tables(db.url)).toEqual(["oculus_migrations", "t3"]);
+    expect((await recorded(db.url)).map((r) => r.name)).toEqual(result.applied);
+    expect((await migrate({ connectionString: db.url, dir })).applied).toEqual([]);
+  });
+
   it("refuses a first file that doesn't create the bookkeeping table", async () => {
     const db = await database();
     const dir = mkdtempSync(join(tmpdir(), "oculus-migrations-"));

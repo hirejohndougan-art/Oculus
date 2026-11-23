@@ -1,5 +1,5 @@
 /**
- * The migration runner (D-050, D-053).
+ * The migration runner (D-050, D-057).
  *
  * Migrations are plain SQL files in `packages/db/migrations`, named
  * `NNNN_short_name.sql`, applied forwards only, in name order. The runner:
@@ -15,8 +15,11 @@
  *   creates that table, so a fresh database is migrated like any other.
  *
  * A file that ends the runner's transaction itself (COMMIT, ROLLBACK) is
- * detected and refused; statements that can't run in a transaction (CREATE
- * INDEX CONCURRENTLY) are not supported (D-053).
+ * detected and refused, also when it fails afterwards; statements that can't
+ * run in a transaction (CREATE INDEX CONCURRENTLY) are not supported. After
+ * each file the session's settings are reset (RESET ALL, RESET ROLE, RESET
+ * SESSION AUTHORIZATION), and the runner names its table with its schema, so a
+ * file's SET can't move the next file's tables or the bookkeeping (D-057).
  */
 import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
@@ -35,8 +38,8 @@ export const MIGRATION_LOCK_KEY = 0x6f63756c7573n;
 /** File names the runner accepts. */
 export const MIGRATION_FILE = /^(\d{4})_[a-z0-9]+(?:_[a-z0-9]+)*\.sql$/;
 
-/** The table the first migration creates. */
-export const BOOKKEEPING_TABLE = "oculus_migrations";
+/** The table the first migration creates, always named with its schema. */
+export const BOOKKEEPING_TABLE = "public.oculus_migrations";
 
 export function defaultMigrationsDir(): string {
   return fileURLToPath(new URL("../migrations/", import.meta.url));
@@ -190,7 +193,7 @@ async function appliedMigrations(session: Session): Promise<AppliedMigration[]> 
   );
   if (!exists?.exists) return [];
   return session.rows<AppliedMigration>(
-    sql`SELECT name, sha256 FROM oculus_migrations ORDER BY name`,
+    sql`SELECT name, sha256 FROM public.oculus_migrations ORDER BY name`,
   );
 }
 
@@ -202,42 +205,63 @@ async function currentTransaction(session: Session): Promise<string | undefined>
 }
 
 async function applyOne(session: Session, file: MigrationFile): Promise<void> {
+  let failed = false;
   await session.control("BEGIN");
   try {
     // Gives the transaction an ID now, so a file that commits or rolls back
-    // the runner's transaction is noticed afterwards.
+    // the runner's transaction is noticed afterwards, whether it then fails or not.
     const [started] = await session.rows<{ xid: string }>(
       sql`SELECT pg_current_xact_id()::text AS xid`,
     );
+    const ended = (): MigrationError =>
+      new MigrationError(
+        "transaction_ended",
+        `${file.name} ended the runner's transaction (COMMIT or ROLLBACK in the file). Part of it may have been applied and it is not recorded; a person must check the database before migrating again.`,
+      );
     try {
       await session.runScript(file.text);
     } catch (error) {
+      // Still inside the runner's transaction, the failed file left it aborted
+      // and this check fails too; if the check answers, the transaction was ended.
+      const xid = await currentTransaction(session).then(
+        (id) => ({ id }),
+        () => undefined,
+      );
+      if (xid !== undefined && xid.id !== started?.xid) throw ended();
       throw new MigrationError("failed", `${file.name} failed: ${(error as Error).message}`, {
         cause: error,
       });
     }
-    if ((await currentTransaction(session)) !== started?.xid) {
-      throw new MigrationError(
-        "transaction_ended",
-        `${file.name} ended the runner's transaction (COMMIT or ROLLBACK in the file). Part of it may have been applied; check the database before running again.`,
-      );
-    }
+    if ((await currentTransaction(session)) !== started?.xid) throw ended();
     try {
       await session.execute(
-        sql`INSERT INTO oculus_migrations (name, sha256) VALUES (${file.name}, ${file.sha256})`,
+        sql`INSERT INTO public.oculus_migrations (name, sha256) VALUES (${file.name}, ${file.sha256})`,
       );
     } catch (error) {
       throw new MigrationError(
         "failed",
-        `${file.name} ran but could not be recorded (the first migration must create oculus_migrations): ${(error as Error).message}`,
+        `${file.name} ran but could not be recorded (the first migration must create public.oculus_migrations): ${(error as Error).message}`,
         { cause: error },
       );
     }
     await session.control("COMMIT");
   } catch (error) {
+    failed = true;
     await session.control("ROLLBACK").catch(() => undefined);
     throw error;
+  } finally {
+    // Settings a file changed with SET (search_path, role, timeouts) must not
+    // carry over to the next file or to the runner's own queries. A reset that
+    // fails stops the run (unless the file already failed, which stops it anyway).
+    const reset = resetSession(session);
+    await (failed ? reset.catch(() => undefined) : reset);
   }
+}
+
+async function resetSession(session: Session): Promise<void> {
+  await session.execute(sql`RESET ALL`);
+  await session.execute(sql`RESET ROLE`);
+  await session.execute(sql`RESET SESSION AUTHORIZATION`);
 }
 
 /** Applies every pending migration. Safe to run at the same time as another runner. */
