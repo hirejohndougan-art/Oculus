@@ -157,7 +157,7 @@ The data model in TypeScript, written for any archive or museum rather than one 
   - Editing a record type's kind or key, or deleting it, should list the records that use it first, as `templateChanges` does for templates; optionally a `recordTypes` input on `templateChanges`.
 - [ ] T-015a **Link follow-ups.** deps: T-015
   - `templateChanges` should report a narrowed `recordKinds` with the records whose links no longer fit; a report of link labels that no longer match the linked record's name.
-- [ ] S-007 **Messages in `publicOutput` issues.** (risky) deps: T-014
+- [x] S-007 **Messages in `publicOutput` issues.** (risky) deps: T-014 Done: issues are staff only, and template-check and field publish-check messages are fixed text, code and path kept (D-016 "Issues").
   - From the integration review: `publicOutput` passes the template check's problems through as they are, and the identifier checker's `unknown_type` and `format_mismatch` messages quote a type key or a number. Decide whether `publicOutput` issues are staff-only (and say so) or replace those messages with fixed text.
 - [x] U-003 **Small hardening and test speed.**
   - `template-changes.ts` reads `record.templateKey` without checking it is the record's own property; read it as an own data property. The wall-clock tests in `vocabularies.attacks`, `identifiers.attacks`, `term-duplicates` and `effective` fail when the 2-CPU machine is busy: measure relative to a baseline run in the same process, or move the heaviest behind a separate script that the gate still runs.
