@@ -480,19 +480,21 @@ describe("another organization's record is never linked or named", () => {
     expectNothingOf(JSON.stringify(problems), theirs, theirPlace);
   });
 
-  it("refuses to publish it, though their ID is in the published list", () => {
+  it("gives nothing of it, though their ID is in the published list", () => {
     const item = ours();
     const links = linkChecker([item]);
     const checkers = { ...CHECKERS, record_link: links, place: links };
-    const result = output(
-      viewOf([item], item.id, checkers),
-      [item.id, theirs.id, theirPlace.id],
-      checkers,
+    const o = ok(
+      output(viewOf([item], item.id, checkers), [item.id, theirs.id, theirPlace.id], checkers),
     );
     // The place value isn't vouched for, so the view never held it (D-048);
-    // the record link is still refused.
-    expect(codes(result)).toEqual(["unknown_record"]);
-    expectNothingOf(JSON.stringify(result), theirs, theirPlace);
+    // the record link, not in this organization's records, is left out as
+    // if deleted (S-011c), not even its label, and staff are warned.
+    expect(o.dublinCore.creator).toBeUndefined();
+    expect(everything(o)).not.toContain("Their agent");
+    expect(everything(o)).not.toContain("Their place");
+    expectNothingOf(JSON.stringify(o), theirs, theirPlace);
+    expect(o.staffWarnings.map((w) => w.code)).toEqual(["link_target_missing"]);
   });
 
   it("gives nothing, not even the label, when a lax checker lets their ID through", () => {
@@ -623,9 +625,13 @@ describe("a link is named only when everything vouches for it", () => {
     const links = linkChecker(list);
     list.push(agent);
     const checkers = { ...CHECKERS, record_link: links };
-    expect(
-      codes(output(viewOf([agent, event, item], item.id, checkers), [item.id, agent.id], checkers)),
-    ).toEqual(["unknown_record"]);
+    // Not vouched for, so left out as a deleted record's link is (S-011c).
+    const o = ok(
+      output(viewOf([agent, event, item], item.id, checkers), [item.id, agent.id], checkers),
+    );
+    expect(JSON.stringify(o.jsonLd)).not.toContain(agent.id);
+    expect(o.dublinCore.creator).toBeUndefined();
+    expect(o.staffWarnings.map((w) => w.code)).toEqual(["link_target_missing"]);
   });
 });
 

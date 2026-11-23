@@ -437,14 +437,14 @@ describe("publicOutput: record links", () => {
   });
 
   it("refuses to publish a record whose link the checker refuses", () => {
-    const { item, all } = sample();
-    const links = linkChecker(all.filter((r) => r.kind !== "agent"));
-    const result = output(all, item.id, [item.id], {
-      ...CHECKERS,
-      record_link: links,
-      place: links,
-    });
-    expect(codes(result)).toEqual(["unknown_record"]);
+    const { event, item, all } = sample();
+    // A creator that is an event, not an agent: the field doesn't allow it.
+    const wrong = {
+      ...item,
+      fields: { ...item.fields, creator: { recordId: event.id, label: "X" } },
+    };
+    const records = all.map((r) => (r.id === item.id ? wrong : r));
+    expect(codes(output(records, item.id, [item.id, event.id]))).toEqual(["wrong_record_kind"]);
   });
 
   it("refuses to publish record_link values with no record link checker", () => {
@@ -454,5 +454,96 @@ describe("publicOutput: record links", () => {
       "unchecked",
       "unchecked",
     ]);
+  });
+});
+
+describe("publicOutput: links to deleted records (S-011c, D-045)", () => {
+  /** The sample with `gone` deleted: the records and checkers as they are now. */
+  function without(gone: (r: CatalogRecord) => boolean) {
+    const { agent, event, place, item, all } = sample();
+    const now = all.filter((r) => !gone(r));
+    return { agent, event, place, item, now };
+  }
+
+  it("publishes the record without a link to a deleted record, and warns staff", () => {
+    const { agent, event, place, item, now } = without((r) => r.kind === "agent");
+    const o = ok(output(now, item.id, [item.id, event.id, place.id]));
+    expect(o.jsonLd["dcterms:creator"]).toBeUndefined();
+    expect(o.dublinCore.creator).toBeUndefined();
+    expect(o.oaiDcXml).not.toContain("dc:creator");
+    // The other links still go out.
+    expect(o.dublinCore.relation).toEqual(["Storm of 1900", "Dickinson"]);
+    for (const form of [JSON.stringify(o.dublinCore), o.jsonLdText, o.oaiDcXml, o.id]) {
+      expect(form).not.toContain(agent.id);
+      expect(form).not.toContain("Dickinson, John");
+      expect(form).not.toContain("link_target_missing");
+    }
+    expect(o.staffWarnings.map((w) => [w.code, w.path])).toEqual([
+      ["link_target_missing", ["fields", "creator", "recordId"]],
+    ]);
+    // The warning names neither the record nor the label.
+    expect(JSON.stringify(o.staffWarnings)).not.toContain(agent.id);
+    expect(JSON.stringify(o.staffWarnings)).not.toContain("Dickinson, John");
+  });
+
+  it("drops only the deleted record from a repeatable link field", () => {
+    const { event, place, item, now } = without((r) => r.kind === "event");
+    const published = [
+      item.id,
+      place.id,
+      ...now.filter((r) => r.kind === "agent").map((r) => r.id),
+    ];
+    const o = ok(output(now, item.id, published));
+    expect(o.jsonLd["dcterms:relation"]).toEqual({
+      "@id": BASE + place.id,
+      "rdfs:label": "Dickinson",
+    });
+    expect(o.dublinCore.relation).toEqual(["Dickinson"]);
+    for (const form of [JSON.stringify(o.dublinCore), o.jsonLdText, o.oaiDcXml]) {
+      expect(form).not.toContain(event.id);
+      expect(form).not.toContain("Storm of 1900");
+    }
+    expect(o.staffWarnings.map((w) => [w.code, w.path])).toEqual([
+      ["link_target_missing", ["fields", "related", 0, "recordId"]],
+    ]);
+  });
+
+  it("leaves a term out when every link in it is to a deleted record", () => {
+    const { item, now } = without((r) => r.kind === "event" || r.kind === "agent");
+    const place = now.find((r) => r.kind === "place");
+    if (place === undefined) throw new Error("fixture");
+    // The place record is still there, unpublished: relation shows nothing.
+    const o = ok(output(now, item.id, [item.id]));
+    expect(o.dublinCore.relation).toBeUndefined();
+    expect(o.dublinCore.creator).toBeUndefined();
+    expect(o.oaiDcXml).not.toContain("dc:relation");
+    expect(o.staffWarnings.map((w) => w.code)).toEqual([
+      "link_target_missing",
+      "link_target_missing",
+    ]);
+  });
+
+  it("gives no warning when every linked record exists", () => {
+    const { agent, event, place, item, all } = sample();
+    expect(ok(output(all, item.id, [item.id, agent.id, event.id, place.id])).staffWarnings).toEqual(
+      [],
+    );
+    // Unpublished but present: dropped as before, with no warning (D-045).
+    expect(ok(output(all, item.id, [item.id])).staffWarnings).toEqual([]);
+  });
+
+  it("still refuses a link to a deleted record when the record is saved", () => {
+    const { item, now } = without((r) => r.kind === "agent");
+    expect(check(item, checkersFor(now))).toEqual(["unknown_record"]);
+  });
+
+  it("leaves out a place naming a deleted place record, as D-048 already did", () => {
+    const { place, item, now } = without((r) => r.kind === "place");
+    const o = ok(output(now, item.id, [item.id, ...now.map((r) => r.id)]));
+    expect(o.dublinCore.spatial).toBeUndefined();
+    expect(o.jsonLdText).not.toContain(place.id);
+    expect(o.oaiDcXml).not.toContain("Dickinson (Tex.)");
+    // The related link to the place record is a record_link: warned about.
+    expect(o.staffWarnings.map((w) => w.path)).toEqual([["fields", "related", 1, "recordId"]]);
   });
 });
