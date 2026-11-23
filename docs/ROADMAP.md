@@ -155,8 +155,9 @@ The data model in TypeScript, written for any archive or museum rather than one 
 - [~] T-018a **Loan follow-ups.** deps: T-018, T-016
   - A borrowed item that becomes the organization's (bought or given) needs a link from an accession to close its loan in. Link a condition check's `loanId` to the loan book and warn when a loan out goes without a recent fit check. Valuation, insurance and authoriser fields.
   - Split (three modules, three features): T-018a1 and T-018a2.
-- [ ] T-018a1 **A borrowed item acquired closes its loan in.** deps: T-018, T-016 (risky)
+- [x] T-018a1 **A borrowed item acquired closes its loan in.** deps: T-018, T-016 (risky)
   - An accession links to the loan in it came from; the loan book checks that link against the accession register, so the item stops being out, the loan can be marked acquired and overdue lists stop listing it, while the move history stays. An unverified link never takes a loan off the overdue list (D-044). Also the review follow-up: `checkNumber` in accessions.ts reads `type` and `value` as own data properties.
+  - Done: D-059: an accession's `loanInId` (gift, purchase, bequest or transfer only), shared with the loan book through `accession-loans.ts`; `indexLoans`/`reindexLoans` take the register; an item is acquired once title has passed, after its linked arrival, and isn't out; loan status and phase `acquired`; without a register, or with any mismatch, the loan is `unknown` and stays overdue. `checkNumber` and `checkLink` read own data properties (attack tests). `accessionsOfLoan` query.
 - [ ] T-018a2 **Condition checks against the loan book; valuation, insurance and authoriser.** deps: T-018a1
   - A condition check's `loanId` is checked against the loan book, and a report lists loan out items sent (or about to be sent) without a recent fit-to-move check, the window passed in. Staff-only valuation (a decimal string with a currency code, never a float), insurance and authoriser fields on loans.
 - [x] T-013a **Record type edits checked against records.** deps: T-013

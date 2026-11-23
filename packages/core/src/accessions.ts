@@ -27,7 +27,14 @@
  *   bill of sale, a find in the collection). A gift always needs one, so
  *   `not_needed` is refused for a gift;
  * - the **records it produced**: the objects, archival units and digital
- *   assets cataloged from it, as record links.
+ *   assets cataloged from it, as record links;
+ * - optionally the **loan in it came from** (`loanInId`, T-018a1, D-059):
+ *   a borrowed record the organization has bought or been given. The loan
+ *   book (`loans.ts`, through `accession-loans.ts`) then counts the loan's
+ *   items this accession produced as the organization's, once title has
+ *   passed (the deed signed or not needed), so the loan in can be marked
+ *   `acquired` and stops being overdue. Only a gift, purchase, bequest or
+ *   transfer can come from a loan (`loan_method`).
  *
  * A **donor contact** holds the email, phone and address of a source agent.
  *
@@ -92,6 +99,7 @@
 import { randomUUID } from "node:crypto";
 import { types } from "node:util";
 import { markDeedHolds, type HoldReason } from "./accession-holds.js";
+import { markLoanAcquisitions, type LoanAcquisition } from "./accession-loans.js";
 import { daysInMonth } from "./edtf.js";
 import { recordsById } from "./effective.js";
 import { identifierKey } from "./identifier-key.js";
@@ -137,6 +145,17 @@ export type AcquisitionMethod = (typeof ACQUISITION_METHODS)[number];
 /** Where the deed of gift (the signed transfer of title) stands. */
 export const DEED_STATUSES = ["missing", "sent", "signed", "not_needed"] as const;
 export type DeedStatus = (typeof DEED_STATUSES)[number];
+
+/**
+ * The methods by which a borrowed record can become the organization's: it
+ * was given (a gift, bequest or transfer) or bought (D-059).
+ */
+export const LOAN_ACQUISITION_METHODS: readonly AcquisitionMethod[] = Object.freeze([
+  "gift",
+  "purchase",
+  "bequest",
+  "transfer",
+]);
 
 /** Deed statuses that hold the accession's records back from publishing. */
 export const DEED_HOLD_STATUSES: readonly DeedStatus[] = Object.freeze(["missing", "sent"]);
@@ -203,6 +222,12 @@ export interface Accession {
   readonly deedSignedOn?: string;
   /** The objects, archival units and digital assets cataloged from it. */
   readonly records: readonly AccessionLink[];
+  /**
+   * The loan in (a loan ID) these records were borrowed on before the
+   * organization bought or was given them (D-059). Checked against the loan
+   * book by `loans.ts`, never here.
+   */
+  readonly loanInId?: string;
   readonly note?: string;
 }
 
@@ -258,7 +283,7 @@ const LINE_BREAKS = /[\t\n\r\u2028\u2029]/;
 
 const ACCESSION_LIMITS = {
   maxDepth: 3,
-  maxValues: 45 + 3 * MAX_ACCESSION_RECORDS,
+  maxValues: 46 + 3 * MAX_ACCESSION_RECORDS,
   maxStringLength: MAX_MATERIALS_LENGTH,
   maxKeyLength: 64,
   maxTotalChars: 20_000 + MAX_ACCESSION_RECORDS * (MAX_LINK_LABEL_LENGTH + 64),
@@ -284,6 +309,7 @@ const ACCESSION_KEYS: ReadonlySet<string> = new Set([
   "deedStatus",
   "deedSignedOn",
   "records",
+  "loanInId",
   "note",
 ]);
 const CONTACT_KEYS: ReadonlySet<string> = new Set([
@@ -398,6 +424,20 @@ export function validateAccession(input: unknown): Validated<Accession> {
         );
       }
     }
+    if (d.loanInId !== undefined) {
+      if (!(typeof d.loanInId === "string" && UUID_V4.test(d.loanInId))) {
+        issues.add(["loanInId"], "invalid_id", "loanInId must be a loan ID.");
+      } else if (
+        (ACQUISITION_METHODS as readonly unknown[]).includes(method) &&
+        !LOAN_ACQUISITION_METHODS.includes(method as AcquisitionMethod)
+      ) {
+        issues.add(
+          ["loanInId"],
+          "loan_method",
+          `A borrowed record becomes the organization's only by one of: ${LOAN_ACQUISITION_METHODS.join(", ")}.`,
+        );
+      }
+    }
     const records = d.records;
     if (!Array.isArray(records)) {
       issues.add(
@@ -477,6 +517,8 @@ interface RegisterData {
   readonly restricted: ReadonlyMap<RecordId, readonly AccessionId[]>;
   readonly contacts: ReadonlyMap<RecordId, DonorContact>;
   readonly types: ReadonlyMap<string, IdentifierType>;
+  /** Loan ID → the accessions naming it as their `loanInId`, in register order. */
+  readonly byLoan: ReadonlyMap<string, readonly Accession[]>;
 }
 
 const REGISTERS = new WeakMap<object, RegisterData>();
@@ -723,6 +765,32 @@ export function indexAccessions(
     );
     const frozenByRecord = new Map<RecordId, readonly Accession[]>();
     for (const [id, list] of byRecord) frozenByRecord.set(id, Object.freeze(list));
+    const byLoan = new Map<string, Accession[]>();
+    for (const a of accessions) {
+      const loanId = ownData(a, "loanInId");
+      if (loanId === undefined || byId.get(a.id) !== a) continue;
+      const list = byLoan.get(loanId) ?? [];
+      list.push(a);
+      byLoan.set(loanId, list);
+    }
+    const frozenByLoan = new Map<string, readonly Accession[]>();
+    const sharedByLoan = new Map<string, readonly LoanAcquisition[]>();
+    for (const [loanId, list] of byLoan) {
+      frozenByLoan.set(loanId, Object.freeze(list));
+      sharedByLoan.set(
+        loanId,
+        Object.freeze(
+          list.map((a) =>
+            Object.freeze({
+              accessionId: a.id,
+              recordIds: Object.freeze(a.records.map((l) => l.recordId)),
+              receivedOn: a.receivedOn,
+              titlePassed: a.deedStatus === "signed" || a.deedStatus === "not_needed",
+            }),
+          ),
+        ),
+      );
+    }
     const register: AccessionRegister = Object.freeze({
       organizationId,
       size: byId.size,
@@ -738,6 +806,7 @@ export function indexAccessions(
       restricted,
       contacts: contactsByAgent,
       types: typeByKey,
+      byLoan: frozenByLoan,
     });
     // Shared as lookups only, so the sets themselves can't be changed.
     const known = new Set(usable.map((r) => r.id));
@@ -751,6 +820,11 @@ export function indexAccessions(
       isHeld: (id) => deeds.has(id) || restricted.has(id),
       holdReasons: reasons,
       isKnown: (id) => known.has(id),
+    });
+    const none: readonly LoanAcquisition[] = Object.freeze([]);
+    markLoanAcquisitions(register, {
+      organizationId,
+      acquisitionsOf: (loanId) => sharedByLoan.get(loanId) ?? none,
     });
     return { ok: true, value: register };
   } catch {
@@ -802,6 +876,19 @@ export function accessionsOfRecord(
   const data = dataOf(register);
   if (data === undefined || !isRecordId(recordId)) return Object.freeze([]);
   return data.byRecord.get(recordId) ?? Object.freeze([]);
+}
+
+/**
+ * The accessions that name `loanId` as the loan in their records came from
+ * (D-059), in register order. Empty for anything else.
+ */
+export function accessionsOfLoan(
+  register: AccessionRegister,
+  loanId: unknown,
+): readonly Accession[] {
+  const data = dataOf(register);
+  if (data === undefined || typeof loanId !== "string") return Object.freeze([]);
+  return data.byLoan.get(loanId) ?? Object.freeze([]);
 }
 
 /**

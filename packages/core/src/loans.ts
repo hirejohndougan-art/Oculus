@@ -20,7 +20,16 @@
  *   `departure` move to an outside location whose `agentId` is the lender.
  *
  * The loan's `status` is the agreement's state (Spectrum's loan status):
- * `requested`, `agreed`, `declined`, `cancelled` or `closed`. Whether items
+ * `requested`, `agreed`, `declined`, `cancelled` or `closed`, and for a loan
+ * in also `acquired`: the organization bought or was given some of what it
+ * borrowed (T-018a1, D-059). An item is acquired when an accession in the
+ * register given to `indexLoans` names the loan as its `loanInId`, produced
+ * the item's record, has passed title (deed signed or not needed) and was
+ * received on or after the item's linked arrival. An acquired item is no
+ * longer out, so it leaves the overdue list; its moves stay as they are.
+ * Without a register nothing counts as acquired, and an `acquired` loan has a
+ * problem (`acquisitions_unknown`), so it is never taken off the overdue
+ * list unchecked. Whether items
  * are out or back is worked out from the moves (`loanState`'s `phase`). An
  * item can't have moved before the loan was agreed, a linked `loan_out` or
  * arrival must fall within the loan period, and a loan can't be closed while
@@ -54,6 +63,7 @@
 import { randomUUID } from "node:crypto";
 import { types } from "node:util";
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
+import { loanAcquisitionsOf, type LoanAcquisitions } from "./accession-loans.js";
 import { isOrganizationId, mixedOrganizationsIssue, type OrganizationId } from "./organizations.js";
 import { IssueList, shown, type JsonValue } from "./plain-data.js";
 import { isRecordId, type RecordId } from "./record-id.js";
@@ -93,9 +103,18 @@ export type LoanDirection = (typeof LOAN_DIRECTIONS)[number];
  * The agreement's state. Spectrum's loan status starts at `requested`; a
  * request is `agreed` (signed) or `declined`; an agreed loan can be
  * `cancelled` before anything moves; `closed` once everything is back and
- * every condition of the loan is met.
+ * every condition of the loan is met. `acquired` (loans in only, D-059):
+ * closed because the organization bought or was given items it borrowed;
+ * every item that arrived is either acquired by an accession or gone back.
  */
-export const LOAN_STATUSES = ["requested", "agreed", "declined", "cancelled", "closed"] as const;
+export const LOAN_STATUSES = [
+  "requested",
+  "agreed",
+  "declined",
+  "cancelled",
+  "closed",
+  "acquired",
+] as const;
 export type LoanStatus = (typeof LOAN_STATUSES)[number];
 
 /** Statuses under which nothing may have moved yet. */
@@ -160,7 +179,7 @@ export interface LoanBook {
 
 /**
  * Where a loan stands. The agreement's `status` where it says everything
- * (`requested`, `declined`, `cancelled`, `closed`); for an agreed loan,
+ * (`requested`, `declined`, `cancelled`, `closed`, `acquired`); for an agreed loan,
  * `on_loan` while any item is out (lent and not back, or borrowed and not
  * gone back), `returned` when every item that moved is back, `agreed` before
  * anything moved. `unknown` for any loan with problems (see
@@ -168,7 +187,15 @@ export interface LoanBook {
  * log, so it can't be shown as returned or not yet out.
  */
 export type LoanPhase =
-  "requested" | "agreed" | "on_loan" | "returned" | "declined" | "cancelled" | "closed" | "unknown";
+  | "requested"
+  | "agreed"
+  | "on_loan"
+  | "returned"
+  | "declined"
+  | "cancelled"
+  | "closed"
+  | "acquired"
+  | "unknown";
 
 /** One item of a loan, with its moves. */
 export interface LoanItemState {
@@ -177,7 +204,12 @@ export interface LoanItemState {
   readonly started: StorageMove | null;
   /** Loan out: the `return` move. Loan in: the `departure`. */
   readonly ended: StorageMove | null;
-  /** True between the two. */
+  /**
+   * Loan in: the IDs of the accessions that made this borrowed record the
+   * organization's (D-059). Empty otherwise.
+   */
+  readonly acquiredBy: readonly string[];
+  /** True between the two, unless the record was acquired. */
   readonly out: boolean;
   /**
    * Loan out, while out: the expected return date the move log holds for
@@ -337,6 +369,13 @@ export function validateLoan(input: unknown, now: Date = new Date()): Validated<
     checkLine(d.purpose, ["purpose"], "purpose", MAX_LOAN_PURPOSE_LENGTH, false, issues);
     checkText(d.terms, ["terms"], "The terms", issues);
     checkText(d.note, ["note"], "A note", issues);
+    if (status === "acquired" && direction === "out") {
+      issues.add(
+        ["status"],
+        "not_a_loan_in",
+        "Only a loan in can end with the organization acquiring what it borrowed.",
+      );
+    }
     if (knownDirection) {
       checkItems(d.items, direction, knownStatus ? (status as LoanStatus) : undefined, issues);
     } else if (!Array.isArray(d.items)) {
@@ -351,10 +390,14 @@ interface ItemData {
   readonly recordId: RecordId;
   readonly started: StorageMove | null;
   readonly ended: StorageMove | null;
+  readonly acquiredBy: readonly string[];
 }
 
 interface BookData {
   readonly log: MoveLog;
+  /** The accession register the book was checked against, if one was given. */
+  readonly register: object | undefined;
+  readonly acquisitions: LoanAcquisitions | undefined;
   readonly organizationId: OrganizationId;
   /** Loans in the order given. */
   readonly loans: readonly Loan[];
@@ -404,6 +447,18 @@ const LOAN_BOOKS = new WeakMap<object, BookData>();
  * or a `closed` loan in with an item that has no departure linked although
  * its record has a move dated on or after `beginOn`
  * (`closed_without_departure`).
+ * Loans in are also checked against `accessions`, the organization's
+ * accession register (`indexAccessions`, made now), when given (D-059): an
+ * item an accession acquired must have its arrival linked
+ * (`acquired_without_arrival`), no departure (`acquired_and_departed`), and
+ * the accession can't be received before the arrival
+ * (`acquired_before_arrival`). An `acquired` loan needs a register
+ * (`acquisitions_unknown`), at least one item acquired (`nothing_acquired`)
+ * and every other item that arrived gone back (`acquired_with_items_out`).
+ * A `closed` loan in still needs every arrived item's departure, so an
+ * acquired one is refused (`closed_with_items_out`): mark it `acquired`.
+ * Anything but a register is refused (`invalid_accessions`), as is one of
+ * another organization (`mixed_organizations`).
  * A loan with any of these is in phase `unknown` and listed by
  * `overdueLoans` once past its end date. `now` is for tests. Never throws.
  */
@@ -411,9 +466,12 @@ export function indexLoans(
   log: MoveLog,
   loans: unknown,
   now: Date = new Date(),
+  accessions?: object,
 ): Validated<LoanBook> {
   try {
     if (!isMoveLog(log)) return notALog();
+    const linked = acquisitionsFor(accessions, log.organizationId);
+    if (!linked.ok) return linked;
     const list = readList(loans, MAX_LOANS, "loans");
     if (!list.ok) return list;
     const issues = new IssueList();
@@ -429,7 +487,7 @@ export function indexLoans(
       }
     });
     if (issues.count > 0) return { ok: false, issues: issues.items };
-    return buildBook(log, valid);
+    return buildBook(log, valid, linked.value);
   } catch {
     return refused([], "unreadable", "The loans could not be read as plain data.");
   }
@@ -486,7 +544,10 @@ export function withLoan(
         ? [...data.loans, next]
         : data.loans.map((l) => (l.id === next.id ? next : l));
     const at = before === undefined ? data.loans.length : data.loans.indexOf(before.loan);
-    const built = buildBook(data.log, loans);
+    const built = buildBook(data.log, loans, {
+      register: data.register,
+      acquisitions: data.acquisitions,
+    });
     if (!built.ok) {
       // Report the edited loan's problems without its position in the book.
       return {
@@ -527,15 +588,26 @@ export function withLoan(
 
 /**
  * Check every loan again against a new move log (after `withMove` or
- * `reindexLocations`), and return the book built on it. A loan the new log
- * no longer fits is kept with its problems (see `indexLoans`). Never throws.
+ * `reindexLocations`), and a new accession register when one is given
+ * (after an accession is saved; left out, the book's own register stays),
+ * and return the book built on them. A loan they no longer fit is kept with
+ * its problems (see `indexLoans`). Never throws.
  */
-export function reindexLoans(book: LoanBook, log: MoveLog): Validated<LoanBook> {
+export function reindexLoans(
+  book: LoanBook,
+  log: MoveLog,
+  accessions?: object,
+): Validated<LoanBook> {
   try {
     const data = bookData(book);
     if (data === undefined) return notABook();
     if (!isMoveLog(log)) return notALog();
-    return buildBook(log, data.loans);
+    const linked =
+      accessions === undefined
+        ? acquisitionsFor(data.register, log.organizationId)
+        : acquisitionsFor(accessions, log.organizationId);
+    if (!linked.ok) return linked;
+    return buildBook(log, data.loans, linked.value);
   } catch {
     return refused([], "unreadable", "The loans could not be checked.");
   }
@@ -709,7 +781,32 @@ export function loanOutMove(
 // ---------------------------------------------------------------------------
 // Helpers
 
-function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
+interface Linked {
+  readonly register: object | undefined;
+  readonly acquisitions: LoanAcquisitions | undefined;
+}
+
+/** The loan links of an accession register, checked; undefined given, none. */
+function acquisitionsFor(accessions: unknown, organizationId: OrganizationId): Validated<Linked> {
+  if (accessions === undefined) {
+    return { ok: true, value: { register: undefined, acquisitions: undefined } };
+  }
+  const acquisitions = types.isProxy(accessions) ? undefined : loanAcquisitionsOf(accessions);
+  if (acquisitions === undefined) {
+    return refused(
+      ["accessions"],
+      "invalid_accessions",
+      "Give the accession register made by indexAccessions, or leave it out.",
+    );
+  }
+  if (acquisitions.organizationId !== organizationId) {
+    return { ok: false, issues: [mixedOrganizationsIssue([], "These loans and the accessions")] };
+  }
+  return { ok: true, value: { register: accessions as object, acquisitions } };
+}
+
+function buildBook(log: MoveLog, loans: readonly Loan[], linked: Linked): Validated<LoanBook> {
+  const { acquisitions } = linked;
   /** Problems that refuse the whole book. */
   const issues = new IssueList();
   /** Per loan: link problems, paths inside the loan. */
@@ -867,6 +964,41 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
             : "This item arrived outside the loan period.",
         );
       }
+      // A borrowed record the organization acquired (D-059): only an
+      // accession that names this loan, produced the record and has passed
+      // title counts, and only once the item's arrival is linked.
+      let acquiredBy: readonly string[] = [];
+      if (loan.direction === "in" && acquisitions !== undefined) {
+        const found = acquisitions
+          .acquisitionsOf(loan.id)
+          .filter((a) => a.titlePassed && a.recordIds.includes(item.recordId));
+        if (found.length > 0) {
+          if (start === null) {
+            flag(
+              loan.id,
+              ["items", j],
+              "acquired_without_arrival",
+              "An accession acquired this item, but its arrival on this loan isn't linked. Link the arrival placement.",
+            );
+          } else if (end) {
+            flag(
+              loan.id,
+              ["items", j],
+              "acquired_and_departed",
+              "This item went back to the lender on this loan, so an accession can't have acquired it from the loan.",
+            );
+          } else if (start && found.some((a) => a.receivedOn < start.move.movedOn)) {
+            flag(
+              loan.id,
+              ["items", j],
+              "acquired_before_arrival",
+              "An accession acquiring this item is dated before the item arrived on this loan.",
+            );
+          } else if (start && end === null) {
+            acquiredBy = Object.freeze(found.map((a) => a.accessionId));
+          }
+        }
+      }
       if (start && loan.direction === "out") {
         lent.push({
           recordId: item.recordId,
@@ -892,6 +1024,7 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
           recordId: item.recordId,
           started: start ? start.move : null,
           ended: end ? end.move : null,
+          acquiredBy,
         }),
       );
       const mine = byRecord.get(item.recordId) ?? [];
@@ -948,6 +1081,10 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
     strayByRecord.set(m.recordId, list);
   }
   for (const { loan, items } of byId.values()) {
+    if (loan.status === "acquired") {
+      checkAcquired(log, loan, items, acquisitions !== undefined, flag);
+      continue;
+    }
     if (loan.status !== "closed") continue;
     items.forEach((item, j) => {
       if (loan.direction === "out") {
@@ -1004,6 +1141,8 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
   const book: LoanBook = Object.freeze({ organizationId, size: byId.size });
   LOAN_BOOKS.set(book, {
     log,
+    register: linked.register,
+    acquisitions,
     organizationId,
     loans: Object.freeze([...loans]),
     byId: entries,
@@ -1012,6 +1151,52 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
     unexplainedOut,
   });
   return { ok: true, value: book };
+}
+
+/**
+ * An `acquired` loan in (D-059): checked against a register, at least one
+ * item acquired, and every other item that arrived (a linked arrival, or any
+ * move of its record since the loan began) gone back to the lender.
+ */
+function checkAcquired(
+  log: MoveLog,
+  loan: Loan,
+  items: readonly ItemData[],
+  checked: boolean,
+  flag: (loanId: LoanId, path: readonly (string | number)[], code: string, message: string) => void,
+): void {
+  if (!checked) {
+    flag(
+      loan.id,
+      ["status"],
+      "acquisitions_unknown",
+      "An acquired loan is checked against the accession register: give it to indexLoans.",
+    );
+    return;
+  }
+  if (!items.some((item) => item.acquiredBy.length > 0)) {
+    flag(
+      loan.id,
+      ["status"],
+      "nothing_acquired",
+      "No accession acquired an item of this loan: link the accession to the loan (its loanInId) first.",
+    );
+  }
+  items.forEach((item, j) => {
+    if (item.acquiredBy.length > 0 || item.ended !== null) return;
+    const history = moveHistory(log, item.recordId);
+    const arrived =
+      item.started !== null ||
+      (history.ok ? history.value : []).some((m) => m.movedOn >= loan.beginOn);
+    if (arrived) {
+      flag(
+        loan.id,
+        ["items", j],
+        "acquired_with_items_out",
+        "This item was neither acquired nor sent back: record its departure, or its accession, before marking the loan acquired.",
+      );
+    }
+  });
 }
 
 /** Identifies one problem of one loan, to compare a loan's problems before and after an edit. */
@@ -1068,7 +1253,7 @@ function removedLinks(before: Entry, next: Loan): Issue[] {
 function stateOf(data: BookData, entry: Entry): LoanState {
   const { loan, items } = entry;
   const states = items.map((item): LoanItemState => {
-    const out = item.started !== null && item.ended === null;
+    const out = item.started !== null && item.ended === null && item.acquiredBy.length === 0;
     let dueBack: string | null = null;
     if (out && loan.direction === "out") {
       const where = whereabouts(data.log, item.recordId);
@@ -1078,6 +1263,7 @@ function stateOf(data: BookData, entry: Entry): LoanState {
       recordId: item.recordId,
       started: item.started,
       ended: item.ended,
+      acquiredBy: item.acquiredBy,
       out,
       dueBack,
       dueMatchesLoan: !(out && loan.direction === "out") || dueBack === loan.endOn,

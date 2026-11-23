@@ -478,6 +478,7 @@ export type {
 
 export {
   ACQUISITION_METHODS,
+  LOAN_ACQUISITION_METHODS,
   DEED_STATUSES,
   DEED_HOLD_STATUSES,
   ACCESS_RESTRICTION_KINDS,
@@ -500,6 +501,7 @@ export {
   accessionById,
   accessionsByNumber,
   accessionsOfRecord,
+  accessionsOfLoan,
   accessionsAwaitingDeeds,
   deedHoldsOn,
   restrictionHoldsOn,
