@@ -2,6 +2,7 @@
 // Stops at the first failure.
 import { spawnSync } from "node:child_process";
 import { mkdirSync, rmSync } from "node:fs";
+import { findPostgresBin, startTestDatabase } from "./test-database.mjs";
 
 // Start clean so the baseline check can never read an old test report.
 rmSync(".gate", { recursive: true, force: true });
@@ -28,9 +29,49 @@ const steps = [
   ["tests_passing baseline", "npm", ["run", "baseline"]],
 ];
 
+// The database the tests use (D-049): OCULUS_TEST_DATABASE_URL if set (CI),
+// otherwise a throwaway server started just for the test step and always
+// stopped and deleted afterwards, even on failure or Ctrl-C.
+let testDatabase;
+const stopTestDatabase = () => {
+  testDatabase?.stop();
+  testDatabase = undefined;
+};
+process.on("exit", stopTestDatabase);
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(signal, () => {
+    stopTestDatabase();
+    process.exit(1);
+  });
+}
+
+function testEnvironment() {
+  if (process.env.OCULUS_TEST_DATABASE_URL) {
+    console.log("Using the database server in OCULUS_TEST_DATABASE_URL.");
+    return process.env;
+  }
+  const bin = findPostgresBin();
+  if (!bin) {
+    throw new Error(
+      "No PostgreSQL for the database tests. Install PostgreSQL 15 or newer (so `pg_config --bindir` finds initdb and pg_ctl), set PG_BIN to its bin directory, or set OCULUS_TEST_DATABASE_URL to a server where tests may create databases.",
+    );
+  }
+  testDatabase = startTestDatabase({ bin });
+  return { ...process.env, OCULUS_TEST_DATABASE_URL: testDatabase.url };
+}
+
 for (const [name, cmd, args] of steps) {
   console.log(`\n=== ${name} ===`);
-  const result = spawnSync(cmd, args, { stdio: "inherit" });
+  let result;
+  try {
+    const env = name.startsWith("Tests") ? testEnvironment() : process.env;
+    result = spawnSync(cmd, args, { stdio: "inherit", env });
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : error);
+    result = { status: 1 };
+  } finally {
+    stopTestDatabase();
+  }
   if (result.status !== 0) {
     console.error(`\nGATE FAIL at: ${name}`);
     process.exit(1);
