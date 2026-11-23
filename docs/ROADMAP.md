@@ -18,8 +18,10 @@ The data model in TypeScript, written for any archive or museum rather than one 
 
 - [x] S-008 **Another organization's template keys revealed.** (risky, security run 2026-11-23) Done.
   - `templateOfRecord` compared or looked up a record's `templateKey` before checking the template's organization: `template_mismatch` quoted another organization's key, `unknown_template` vs `wrong_organization` told which keys another organization's registry holds, and `wrong_organization` named the key. Now the organization is checked first and the message names no key.
-- [ ] S-009 **Identifier type creation reveals another organization's keys.** (risky, security run 2026-11-23)
+- [x] S-009 **Identifier type creation reveals another organization's keys.** (risky, security run 2026-11-23) Done: the list's organization is checked before any key lookup, for creation, edits and deletion.
   - `identifierTypeCreation` with another organization's `identifierTypes` gives `key_taken` when that organization has the key and `mixed_organizations` otherwise (`identifier-type-changes.ts` `readUse` with `listed=false`, before the check at about line 563). Check the organization first, as S-008 did for templates.
+- [ ] S-009a **Invalid foreign type lists name a key.** (from the S-009 review)
+  - `validateIdentifierTypes` runs before the organization check, so another organization's invalid list (two entries sharing a key) gets a message naming that key. Not a probe (the answer doesn't depend on the key asked about); check the organization first or drop the key from that message if `existing` can come from another organization.
 - [ ] S-010 **Kept views publish without re-checks by default.** (risky, security run 2026-11-23)
   - `publicOutput` re-checks a kept view against current records and templates only when the caller passes `records` and `templateFor`; without them a value whose field has since been made staff is still published, while the identifier check already fails closed. Make both required for a kept view (or have the service layer always build the view at publish time), with an attack test.
 - [ ] S-011 **Link labels to unpublished or other organizations' records.** (risky, security run 2026-11-23)

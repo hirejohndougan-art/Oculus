@@ -2,6 +2,15 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-23 10:55 CT — manual (John: "continue") — S-009 Identifier type creation reveals another organization's keys
+- Result: done
+- What changed: `readUse` in `identifier-type-changes.ts` checks `existing.identifierTypes`' organization before looking the key up, so `identifierTypeCreation`, `identifierTypeDeletion` and `identifierTypeChanges` give the same `mixed_organizations` answer whether or not another organization's list holds the key. Attack test in `identifier-type-changes.attacks.test.ts` (fails without the fix).
+- Decisions: none
+- Review: one independent review of the diff: safe. It noted an older, non-probing gap (invalid foreign list's message names a key), added as S-009a.
+- Sources: OWASP ASVS 4.0.3 V4.2.1.
+- Gate: PASS · tests_passing 2502 (was 2501) · npm audit clean
+- Next: S-010 Kept views publish without re-checks by default (risky)
+
 ## 2026-11-23 08:40 CT — manual (John: "Hard push on phase 1") — T-016, T-018
 - Result: done (two branches built in parallel worktrees, fixed after review, merged; gate on the result)
 - What changed: **T-016** accessions and deeds of gift (`accessions.ts`, `accession-holds.ts`): a staff-only register per organization; `effectivePublishIssues` and `publicOutput` take `accessions` and refuse records whose deed is missing or sent (and units below, and assets representing them); links to held records go out as labels. **T-018** loans in and out (`loans.ts`) and condition checks (`condition-checks.ts`) on the move log, and a `departure` move reason in `storage.ts`.
