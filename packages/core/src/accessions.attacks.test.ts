@@ -268,6 +268,7 @@ describe("a link to a held record names only its label (T-016 review)", () => {
       field({ key: "related", kind: "record_link", repeatable: true }),
     ]);
     const map = {
+      organizationId: ORG,
       template: "out",
       entries: [
         { field: "rights", term: "rights" },
@@ -349,6 +350,7 @@ describe("a link is deed-checked through its target's parents and what it shows 
       ),
     );
     const map = {
+      organizationId: ORG,
       template: "out",
       entries: kind === "agent" ? [RELATED_MAP] : [RIGHTS_MAP, RELATED_MAP],
     };

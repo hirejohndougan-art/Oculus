@@ -56,6 +56,7 @@ const LINK_FIELDS: readonly FieldDefinition[] = [
 ];
 const LINK_TPL = template(LINK_FIELDS, "links");
 const LINK_MAPPING = {
+  organizationId: ORG,
   template: "links",
   entries: [
     { field: "rights", term: "rights" },

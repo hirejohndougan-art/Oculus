@@ -323,20 +323,7 @@ export function webUrlProblem(text: string): string | undefined {
  * row) and return a frozen copy, or every problem found. Never throws.
  */
 export function validateTemplate(input: unknown): Validated<FieldTemplate> {
-  return readTemplate(input, IDENTIFIER_CODE, true);
-}
-
-/**
- * As `validateTemplate`, but `organizationId` may be left out (if present it
- * must still be valid), so a preset can be checked too. Only for checks
- * about a template's fields, such as a Dublin Core mapping (dublin-core.ts);
- * never for choosing the template a record follows. Not exported from the
- * package. Never throws.
- */
-export function validateTemplateShape(
-  input: unknown,
-): Validated<FieldTemplate | Omit<FieldTemplate, "organizationId">> {
-  return readTemplate(input, IDENTIFIER_CODE, false);
+  return readTemplate(input, IDENTIFIER_CODE);
 }
 
 /**
@@ -348,7 +335,7 @@ export function validateTemplateShape(
  * refuses them. Never throws.
  */
 export function validateLegacyTemplate(input: unknown): Validated<FieldTemplate> {
-  return readTemplate(input, LEGACY_IDENTIFIER_CODE, true);
+  return readTemplate(input, LEGACY_IDENTIFIER_CODE);
 }
 
 /** The most templates `legacyTemplateIssues` looks through at once. */
@@ -463,13 +450,9 @@ export function legacyTemplateIssues(
   }
 }
 
-function readTemplate(
-  input: unknown,
-  identifierCode: CodeRule,
-  needsOrganization: boolean,
-): Validated<FieldTemplate> {
+function readTemplate(input: unknown, identifierCode: CodeRule): Validated<FieldTemplate> {
   try {
-    return checkTemplate(input, identifierCode, needsOrganization);
+    return checkTemplate(input, identifierCode);
   } catch {
     return {
       ok: false,
@@ -478,11 +461,7 @@ function readTemplate(
   }
 }
 
-function checkTemplate(
-  input: unknown,
-  identifierCode: CodeRule,
-  needsOrganization: boolean,
-): Validated<FieldTemplate> {
+function checkTemplate(input: unknown, identifierCode: CodeRule): Validated<FieldTemplate> {
   if (types.isProxy(input) || !isPlainObject(input)) {
     return {
       ok: false,
@@ -502,10 +481,7 @@ function checkTemplate(
       "The template key is 1 to 64 lower case letters, digits, hyphens and underscores, starting with a letter.",
     );
   }
-  if (
-    (needsOrganization || t.organizationId !== undefined) &&
-    !isOrganizationId(t.organizationId)
-  ) {
+  if (!isOrganizationId(t.organizationId)) {
     issues.add(
       ["organizationId"],
       "invalid_organization",

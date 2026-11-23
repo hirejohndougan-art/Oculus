@@ -14,8 +14,9 @@
  *   produced. There is no "publish anyway".
  * - **Only mapped public entries go out.** The caller's Dublin Core mapping is
  *   checked with `validateDublinCoreMapping` against the exact template the
- *   view was built with, every time (a mapping for another template, or one
- *   naming a staff field, is refused). An object, archival unit or digital
+ *   view was built with, every time (a mapping for another template, of
+ *   another organization or of none (D-047), or one naming a staff field, is
+ *   refused). An object, archival unit or digital
  *   asset must have its `rights` field mapped to `rights` or `license`
  *   (`rights_not_mapped`). Output holds the record's title, its URL, its
  *   DCMI type, and the values of the view's entries that the mapping maps.

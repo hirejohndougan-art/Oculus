@@ -36,6 +36,7 @@ import {
   LCSH,
   record,
   viewOf,
+  ORG,
 } from "./public-output.fixtures.js";
 
 interface Quad {
@@ -115,6 +116,7 @@ function everyTermOutput(): PublicOutput {
   const view = viewOf([item], item.id);
   const fields = ["subjects", "website", "creator", "description"];
   const mapping = {
+    organizationId: ORG,
     template: "out",
     entries: [
       { field: "rights", term: "rights" },
@@ -252,7 +254,11 @@ describe("JSON-LD through a JSON-LD 1.1 processor", () => {
   it("types an event as dcmitype:Event", async () => {
     const other = record("event", "Storm of 1900", { creator: "Unknown" });
     const view = viewOf([other], other.id);
-    const mapping = { template: "out", entries: [{ field: "creator", term: "creator" }] };
+    const mapping = {
+      organizationId: ORG,
+      template: "out",
+      entries: [{ field: "creator", term: "creator" }],
+    };
     const e = ok(
       publicOutput(view, mapping, {
         baseUrl: BASE,

@@ -31,6 +31,7 @@ import {
   linkChecker,
   record,
   template,
+  ORG,
 } from "./public-output.fixtures.js";
 
 function ok<T>(result: Validated<T>): T {
@@ -53,6 +54,7 @@ const LINK_TPL = template(
   "links",
 );
 const MAPPING = {
+  organizationId: ORG,
   template: "links",
   entries: [
     { field: "rights", term: "rights" },
@@ -502,6 +504,7 @@ describe("a value kept from before a template change never reaches the public vi
       expect(JSON.stringify(effective.notes)).not.toContain("SECRET");
       expect(effectivePublishIssues(effective).map((i) => i.code)).toEqual(["does_not_fit_field"]);
       const mapping = {
+        organizationId: ORG,
         template: "changed",
         entries: [
           { field: "rights", term: "rights" },
