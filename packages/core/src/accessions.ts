@@ -93,7 +93,7 @@ import { randomUUID } from "node:crypto";
 import { types } from "node:util";
 import { markDeedHolds, type HoldReason } from "./accession-holds.js";
 import { daysInMonth } from "./edtf.js";
-import { recordsById } from "./effective.js";
+import { recordSet } from "./effective.js";
 import { identifierKey } from "./identifier-key.js";
 import { matchesIdentifierPattern, parseIdentifierPattern } from "./identifier-pattern.js";
 import {
@@ -580,19 +580,25 @@ export function indexAccessions(
     for (const t of typesRead.value) if (!typeByKey.has(t.key)) typeByKey.set(t.key, t);
 
     // Records: one snapshot, read once, this organization's only.
-    const found = recordsById(parts.get("records"));
+    const found = recordSet(parts.get("records"));
     if (!found.ok) {
       if (found.issues.some((i) => i.code === "mixed_organizations")) return mixed(["records"]);
       return prefixed(["records"], found.issues);
     }
+    // The set's organization is read from every entry, valid or not, so
+    // another organization's invalid records are refused too.
+    if (found.value.organizationId !== undefined && found.value.organizationId !== organizationId) {
+      return mixed(["records"]);
+    }
     const usable: CatalogRecord[] = [];
-    for (const record of found.value.values()) {
+    for (const record of found.value.byId.values()) {
       if (record === undefined) continue;
       if (record.organizationId !== organizationId) return mixed(["records"]);
       usable.push(record);
     }
-    // Made from the frozen copies the snapshot holds, never from the caller's list again.
-    const made = makeRecordLinkChecker(usable);
+    // Made from the frozen copies the snapshot holds, never from the caller's
+    // list again, and for this organization even when no record is valid.
+    const made = makeRecordLinkChecker(usable, organizationId);
     if (!made.ok) return prefixed(["records"], made.issues);
     const checker = made.value;
 
