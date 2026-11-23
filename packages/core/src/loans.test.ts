@@ -497,7 +497,7 @@ describe("indexLoans refuses loans that disagree with the move log", () => {
           loanOut({ number: "LO-2026-002", items: [{ recordId: print, loanOutMoveId: again.id }] }),
         ]),
       ),
-    ).toEqual(["overlapping_loans"]);
+    ).toEqual(["overlapping_loans", "overlapping_loans"]);
     expect(
       problemCodes(
         indexLoans(LOG, [
@@ -508,7 +508,7 @@ describe("indexLoans refuses loans that disagree with the move log", () => {
           }),
         ]),
       ),
-    ).toEqual(["move_reused"]);
+    ).toEqual(["move_reused", "move_reused"]);
   });
 
   it("duplicate IDs and numbers; numbers in and out are kept apart", () => {
@@ -638,6 +638,83 @@ describe("review fixes", () => {
       }),
     );
     expect(ok(loanProblems(fixed))).toEqual([]);
+  });
+
+  // A decoy loan listed before the genuine one, to the same borrower, running to 2099.
+  const decoy = (items: LoanOut["items"]): LoanOut =>
+    loanOut({ number: "LO-DECOY", beginOn: "2026-08-01", endOn: "2099-12-31", items });
+
+  it("editing an earlier loan to claim a later loan's move is refused (review fix)", () => {
+    const genuine = loanOut();
+    const bait = decoy([{ recordId: print }]);
+    const b = book([bait, genuine]);
+    expect(ok(overdueLoans(b, "2026-11-23")).map((s) => s.loan.number)).toEqual(["LO-2026-001"]);
+    const stolen = { ...bait, items: [{ recordId: print, loanOutMoveId: printOut.id }] };
+    expect(codes(withLoan(b, stolen))).toEqual(["move_reused"]);
+    // Saved anyway (two saves racing, an import): both loans are flagged, and
+    // the genuine one stays overdue instead of looking returned.
+    const raced = book([stolen, genuine]);
+    expect(ok(loanProblems(raced)).map((p) => p.loanId)).toEqual([stolen.id, genuine.id]);
+    const late = ok(overdueLoans(raced, "2026-11-23"));
+    expect(late.map((s) => [s.loan.number, s.phase])).toEqual([["LO-2026-001", "unknown"]]);
+    expect(late[0]?.problems.map((p) => p.code)).toEqual(["move_reused"]);
+    expect(ok(loanState(raced, stolen.id)).phase).toBe("unknown");
+  });
+
+  it("an earlier loan can't steer an overlap onto a later, genuine loan (review fix)", () => {
+    const record = newRecordId();
+    const home = move(record, shelf.id, "2026-01-10", "placement");
+    const early = move(record, borrowerPlace.id, "2026-08-15", "loan_out");
+    const out = move(record, borrowerPlace.id, "2026-09-01", "loan_out", {
+      expectedReturnOn: "2026-11-15",
+    });
+    const log = ok(indexMoves(INDEX, [home, early, out]));
+    const genuine = loanOut({ items: [{ recordId: record, loanOutMoveId: out.id }] });
+    const bait = decoy([{ recordId: record }]);
+    const b = book([bait, genuine], log);
+    const steered = { ...bait, items: [{ recordId: record, loanOutMoveId: early.id }] };
+    expect(codes(withLoan(b, steered))).toEqual(["overlapping_loans"]);
+    const raced = book([steered, genuine], log);
+    expect(ok(loanProblems(raced)).map((p) => p.loanId)).toEqual([steered.id, genuine.id]);
+    // Three loans: the third overlaps the first, not only its neighbour.
+    const third = loanOut({
+      number: "LO-2026-003",
+      items: [{ recordId: record, loanOutMoveId: out.id }],
+    });
+    const short = move(record, borrowerPlace.id, "2026-08-20", "loan_out");
+    const shortBack = move(record, shelf.id, "2026-08-25", "return");
+    const log3 = ok(indexMoves(INDEX, [home, early, short, shortBack, out]));
+    const middle = decoy([
+      { recordId: record, loanOutMoveId: short.id, returnMoveId: shortBack.id },
+    ]);
+    const first = loanOut({
+      number: "LO-2026-000",
+      beginOn: "2026-08-01",
+      items: [{ recordId: record, loanOutMoveId: early.id }],
+    });
+    expect(problemCodes(indexLoans(log3, [first, middle, third]))).toEqual([
+      "overlapping_loans",
+      "overlapping_loans",
+      "overlapping_loans",
+    ]);
+  });
+
+  it("a loan whose link went missing stays on the overdue list as unknown (review fix)", () => {
+    const genuine = loanOut();
+    const b = book([genuine]);
+    // The loan_out move is no longer in the log (a bad import, an edit).
+    const without = ok(
+      indexMoves(
+        INDEX,
+        MOVES.filter((m) => m.id !== printOut.id),
+      ),
+    );
+    const stale = ok(reindexLoans(b, without));
+    const state = ok(loanState(stale, genuine.id));
+    expect(state.phase).toBe("unknown");
+    expect(state.problems.map((p) => p.code)).toEqual(["unknown_move"]);
+    expect(ok(overdueLoans(stale, "2026-11-23")).map((s) => s.loan.id)).toEqual([genuine.id]);
+    expect(ok(overdueLoans(stale, "2026-11-15"))).toEqual([]);
   });
 
   it("reports departures no loan in names", () => {

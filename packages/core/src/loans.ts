@@ -26,7 +26,10 @@
  * arrival must fall within the loan period, and a loan can't be closed while
  * an item is still out. A loan the move log no longer fits (a return
  * back-dated by a later storage edit) is kept with its `problems` rather than
- * making the whole book unreadable; `withLoan` never saves one. Departures
+ * making the whole book unreadable; its phase is `unknown` and it stays on
+ * the overdue list, so a missing or stale link never hides an item still
+ * out. `withLoan` never saves a loan with problems, nor an edit that gives
+ * another loan one (claiming its move, overlapping it). Departures
  * no loan in names are listed by `unexplainedDepartures`.
  *
  * **Everything here is staff-only**, like storage: loans name lenders,
@@ -153,10 +156,12 @@ export interface LoanBook {
  * (`requested`, `declined`, `cancelled`, `closed`); for an agreed loan,
  * `on_loan` while any item is out (lent and not back, or borrowed and not
  * gone back), `returned` when every item that moved is back, `agreed` before
- * anything moved.
+ * anything moved. `unknown` for any loan with problems (see
+ * `LoanState.problems`), whatever its status: its links don't fit the move
+ * log, so it can't be shown as returned or not yet out.
  */
 export type LoanPhase =
-  "requested" | "agreed" | "on_loan" | "returned" | "declined" | "cancelled" | "closed";
+  "requested" | "agreed" | "on_loan" | "returned" | "declined" | "cancelled" | "closed" | "unknown";
 
 /** One item of a loan, with its moves. */
 export interface LoanItemState {
@@ -373,7 +378,7 @@ const LOAN_BOOKS = new WeakMap<object, BookData>();
  * that must not make the whole book unreadable. `withLoan` refuses to save a
  * loan with any of these problems. An item's move:
  * - isn't in the log for that record (`unknown_move`), or is named by two
- *   items (`move_reused`, on the later loan);
+ *   items (`move_reused`, on every loan naming it);
  * - starts outside the loan period: a `loan_out` or arrival before `beginOn`
  *   or after `endOn` (`move_outside_loan`);
  * - has the wrong reason (`wrong_move_reason`: `loan_out` and `return` for a
@@ -383,9 +388,10 @@ const LOAN_BOOKS = new WeakMap<object, BookData>();
  * - ends before it started, or isn't the record's first return (or
  *   departure) after it started (`end_out_of_order`);
  * - overlaps another loan of the same record the same way
- *   (`overlapping_loans`, on the later loan): a record is lent to one
+ *   (`overlapping_loans`, on every loan involved): a record is lent to one
  *   borrower at a time.
- * `now` is for tests. Never throws.
+ * A loan with any of these is in phase `unknown` and listed by
+ * `overdueLoans` once past its end date. `now` is for tests. Never throws.
  */
 export function indexLoans(
   log: MoveLog,
@@ -424,9 +430,11 @@ export function isLoanBook(value: unknown): value is LoanBook {
  * Check a new or edited loan (same `id`: a status change, an extension, an
  * item sent or returned) against the book and its move log before saving
  * it, and return the book with it in place. A loan can't change direction,
- * and is refused with any problem `indexLoans` would report for it (other
- * loans' problems don't block it). The given book is not changed. `now` is
- * for tests. Never throws.
+ * and is refused with any problem `indexLoans` would report for it, or if it
+ * would give any other loan in the book a problem that loan didn't have
+ * (reported under `["otherLoans", <loan id>, ...]`). Problems other loans
+ * already had don't block it. The given book is not changed. `now` is for
+ * tests. Never throws.
  */
 export function withLoan(
   book: LoanBook,
@@ -465,8 +473,30 @@ export function withLoan(
         ),
       };
     }
-    const problems = bookData(built.value)?.byId.get(next.id)?.problems ?? [];
-    return problems.length > 0 ? { ok: false, issues: problems } : built;
+    const after = bookData(built.value);
+    if (after === undefined) return notABook();
+    const problems = after.byId.get(next.id)?.problems ?? [];
+    if (problems.length > 0) return { ok: false, issues: problems };
+    // Nor may the edit give any other loan a problem it didn't have (review
+    // fix): claiming another loan's move, or overlapping it, would otherwise
+    // be saved and hide that loan's overdue item.
+    const caused: Issue[] = [];
+    for (const [id, entry] of after.byId) {
+      if (id === next.id) continue;
+      const had = new Set((data.byId.get(id)?.problems ?? []).map(problemKey));
+      for (const found of entry.problems) {
+        if (!had.has(problemKey(found))) {
+          caused.push(
+            issue(
+              ["otherLoans", id, ...found.path],
+              found.code,
+              `This edit would give loan ${shown(entry.loan.number)} a problem: ${found.message}`,
+            ),
+          );
+        }
+      }
+    }
+    return caused.length > 0 ? { ok: false, issues: caused } : built;
   } catch {
     return refused([], "unreadable", "The loan could not be read as plain data.");
   }
@@ -551,8 +581,10 @@ export function unexplainedDepartures(book: LoanBook): Validated<readonly Storag
 /**
  * Every loan with an item still out after its end date, `today`
  * (`YYYY-MM-DD`, the organization's own date) being later: lent items not
- * back, and borrowed items not yet gone back to their lender. Longest
- * overdue first.
+ * back, and borrowed items not yet gone back to their lender. A loan past
+ * its end date with problems (phase `unknown`) is listed too, with its
+ * problems, since a missing or stale link may hide an item still out.
+ * Longest overdue first.
  */
 export function overdueLoans(book: LoanBook, today: unknown): Validated<readonly LoanState[]> {
   const data = bookData(book);
@@ -563,7 +595,7 @@ export function overdueLoans(book: LoanBook, today: unknown): Validated<readonly
   for (const entry of data.byId.values()) {
     if (entry.loan.endOn >= today) continue;
     const state = stateOf(data, entry);
-    if (state.phase === "on_loan") found.push(state);
+    if (state.phase === "on_loan" || state.phase === "unknown") found.push(state);
   }
   return {
     ok: true,
@@ -661,7 +693,11 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
   const byId = new Map<LoanId, { loan: Loan; items: readonly ItemData[] }>();
   const named = new Set<MoveId>();
   const numbers = new Set<string>();
-  const usedMoves = new Set<MoveId>();
+  /** Each named move's first claimant, and whether it was flagged as shared yet. */
+  const usedMoves = new Map<
+    MoveId,
+    { loanId: LoanId; path: readonly (string | number)[]; flagged: boolean }
+  >();
   const byRecord = new Map<RecordId, LoanId[]>();
   /** Per record and direction: [start index, end index or Infinity] in its history. */
   const spans = new Map<
@@ -693,16 +729,20 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
         const id = fields[key];
         if (id === undefined) return null;
         named.add(id);
-        if (usedMoves.has(id)) {
-          flag(
-            loan.id,
-            ["items", j, key],
-            "move_reused",
-            "Another loan item already names this move.",
-          );
+        const first = usedMoves.get(id);
+        if (first !== undefined) {
+          // Flag every loan that names it, never only the later one: which
+          // loan comes first in the list says nothing about which is right,
+          // and an edit to an earlier loan must not make a later, genuine
+          // loan look returned (review fix).
+          if (!first.flagged) {
+            first.flagged = true;
+            flag(first.loanId, first.path, "move_reused", "Another loan item names this move too.");
+          }
+          flag(loan.id, ["items", j, key], "move_reused", "Another loan item names this move too.");
           return undefined;
         }
-        usedMoves.add(id);
+        usedMoves.set(id, { loanId: loan.id, path: ["items", j, key], flagged: false });
         const index = moves.findIndex((m) => m.id === id);
         const move = moves[index];
         if (move === undefined) {
@@ -804,17 +844,26 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
   });
   for (const list of spans.values()) {
     list.sort((a, b) => a.start - b.start);
-    for (let k = 1; k < list.length; k += 1) {
-      const prev = list[k - 1];
-      const span = list[k];
-      if (prev !== undefined && span !== undefined && span.start < prev.end) {
-        flag(
-          span.loanId,
-          ["items", span.j],
-          "overlapping_loans",
-          "This record is still out on another loan.",
-        );
+    // Both loans of an overlap are flagged (review fix), and each span is
+    // compared with the one reaching furthest so far, not only its neighbour.
+    const flagged = new Set<(typeof list)[number]>();
+    const overlap = (span: (typeof list)[number]): void => {
+      if (flagged.has(span)) return;
+      flagged.add(span);
+      flag(
+        span.loanId,
+        ["items", span.j],
+        "overlapping_loans",
+        "This record is out on another loan at the same time.",
+      );
+    };
+    let reach: (typeof list)[number] | undefined;
+    for (const span of list) {
+      if (reach !== undefined && span.start < reach.end) {
+        overlap(reach);
+        overlap(span);
       }
+      if (reach === undefined || span.end > reach.end) reach = span;
     }
   }
   if (issues.count > 0) return { ok: false, issues: issues.items };
@@ -843,6 +892,11 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
   return { ok: true, value: book };
 }
 
+/** Identifies one problem of one loan, to compare a loan's problems before and after an edit. */
+function problemKey(found: Issue): string {
+  return `${found.code} ${JSON.stringify(found.path)}`;
+}
+
 function stateOf(data: BookData, entry: Entry): LoanState {
   const { loan, items } = entry;
   const states = items.map((item): LoanItemState => {
@@ -862,7 +916,11 @@ function stateOf(data: BookData, entry: Entry): LoanState {
     });
   });
   let phase: LoanPhase;
-  if (loan.status !== "agreed") phase = loan.status;
+  // A loan whose links don't fit the move log may have an item out that a
+  // missing or stale link hides, so it never looks returned or not started
+  // (review fix).
+  if (entry.problems.length > 0) phase = "unknown";
+  else if (loan.status !== "agreed") phase = loan.status;
   else if (states.some((s) => s.out)) phase = "on_loan";
   else if (states.some((s) => s.started !== null)) phase = "returned";
   else phase = "agreed";
