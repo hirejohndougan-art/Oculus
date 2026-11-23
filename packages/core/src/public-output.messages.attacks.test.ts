@@ -118,11 +118,11 @@ describe("publicOutput issue messages quote no values (S-007)", () => {
   });
 
   it("a rights value that isn't { uri }: its text isn't quoted", () => {
-    const item = record("object", "Item", { rights: "SECRET rights text" as never });
+    const item = record("object", "Item", { rights: "SECRET rights text" });
     const built = effectiveRecord(item.id, [item], () => TPL);
     if (!built.ok) throw new Error(JSON.stringify(built.issues));
     const view = publicView(built.value);
-    if (view === undefined) return; // refused before a view exists: nothing to publish
+    if (view === undefined) throw new Error("no view");
     const result = publicOutput(view, MAPPING, {
       ...nowOf(view),
       baseUrl: BASE,
