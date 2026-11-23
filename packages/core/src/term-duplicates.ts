@@ -157,9 +157,10 @@ export interface DuplicateOptions {
 export const MAX_DUPLICATE_TERMS = 50_000;
 /**
  * The most terms `PairSet` can hold pairs of: a pair of positions below n is
- * at most n² - n - 1, which must be below 2^32 - 1.
+ * at most n² - 1 (a term can share a block with itself, so a position can be
+ * paired with itself), which must be below 2^32 - 1, the empty mark.
  */
-export const MAX_PAIR_SET_TERMS = 65_536;
+export const MAX_PAIR_SET_TERMS = 65_535;
 export const DEFAULT_DUPLICATE_CANDIDATES = 500;
 export const MAX_DUPLICATE_CANDIDATES = 10_000;
 /**
@@ -1191,8 +1192,8 @@ function bitCount(x: number): number {
 class PairSet {
   /**
    * Each pair is one number, lower × n + higher, which is below n² and so
-   * at most n² - n - 1 and so below 2^32 - 1 (the empty mark -1 as 32 bits)
-   * for n up to MAX_PAIR_SET_TERMS; stored as its 32 bits.
+   * at most n² - 1 and so below 2^32 - 1 (the empty mark -1 as 32 bits) for
+   * n up to MAX_PAIR_SET_TERMS; stored as its 32 bits.
    */
   private table = new Int32Array(1 << 12).fill(-1);
   private size = 0;
@@ -1326,10 +1327,16 @@ function codeDistance(
   cb: Int32Array,
   startB: number,
   m: number,
-  limit: number,
+  given: number,
 ): number {
+  if (Math.abs(n - m) > given) return given + 1;
+  // Substituting the characters they share and inserting or deleting the
+  // rest is `longer` edits, so the distance is never more than that: a
+  // larger limit (or one that isn't a number) is the same as `longer`, and
+  // the work and the memory below follow the limit, not the caller's number.
+  const longer = Math.max(n, m);
+  const limit = given < longer ? given : longer;
   const over = limit + 1;
-  if (Math.abs(n - m) > limit) return over;
   const delta = m - n;
   const low = Math.ceil((delta - limit) / 2);
   const high = Math.floor((delta + limit) / 2);

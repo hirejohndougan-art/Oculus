@@ -117,6 +117,29 @@ describe("boundedDistance", () => {
     }
   });
 
+  it("takes a limit past the keys' length, or one that isn't a number, as their length", () => {
+    // The work and the memory follow the limit, so a huge limit must not
+    // make it allocate for that limit (it used to be bounded by the keys).
+    const full = (a: string, b: string, limit: number): number =>
+      referenceDistance(Array.from(a), Array.from(b), limit);
+    let seed = 3;
+    const rand = (n: number): number => {
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      return seed % n;
+    };
+    for (let k = 0; k < 500; k += 1) {
+      const a = Array.from({ length: rand(10) }, () => "abc"[rand(3)]).join("");
+      const b = Array.from({ length: rand(10) }, () => "abc"[rand(3)]).join("");
+      const exact = full(a, b, Math.max(a.length, b.length));
+      for (const limit of [Math.max(a.length, b.length), 1e9, Number.POSITIVE_INFINITY, NaN]) {
+        expect(boundedDistance(a, b, limit), `${a} ${b} ${String(limit)}`).toBe(exact);
+        expect(boundedDistance(Array.from(a), Array.from(b), limit)).toBe(exact);
+      }
+    }
+    expect(boundedDistance("abc", "abd", Number.POSITIVE_INFINITY)).toBe(1);
+    expect(boundedDistance("a".repeat(600), "b".repeat(600), 1e9)).toBe(600);
+  });
+
   it("gives what the code before S-005a gave, for strings and lists, on every short pair", () => {
     // Every pair of keys of up to 7 letters from two letters, then long
     // random keys from two and three letters: the narrower band and the

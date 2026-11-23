@@ -340,12 +340,14 @@ describe("near-duplicate detection can't be overloaded", () => {
   // not the seconds: a loaded machine slows both runs alike, while a wall
   // clock bound either passes for the old code too or turns flaky.
   const against = (terms: unknown[]): { ratio: number; ms: number; limits: readonly string[] } => {
-    const before = Date.now();
-    const old = referenceFind(terms, { maxCandidates: 10_000 });
-    const oldMs = Math.max(1, Date.now() - before);
+    // The new code runs first, so it pays for warming up anything the two
+    // share: the ratio can only understate how much faster it is.
     const start = Date.now();
     const now = findNearDuplicateTerms(terms, { maxCandidates: 10_000 });
     const ms = Date.now() - start;
+    const before = Date.now();
+    const old = referenceFind(terms, { maxCandidates: 10_000 });
+    const oldMs = Math.max(1, Date.now() - before);
     expect(now).toEqual(old);
     if (!now.ok) throw new Error(JSON.stringify(now.issues));
     return { ratio: ms / oldMs, ms, limits: now.value.limitsReached };
@@ -355,7 +357,10 @@ describe("near-duplicate detection can't be overloaded", () => {
     // About 3.2-4 s before (mostly the edit distance of ~700,000 pairs, the
     // set of ~4.9 million pair visits and the abbreviation pass); about
     // 1.5-1.9 s now on the machine this was measured on, under the 2 s
-    // target. The same ~455 pairs are found.
+    // target. The same ~455 pairs are found. The 2 s itself can't be
+    // asserted here: this machine runs several builds at once, which can
+    // double any wall-clock figure, so the test holds the ratio between the
+    // two runs and the run's own report records the seconds measured.
     const r = against(randomWords(9, allWords("ab", 4), 11));
     expect(r.ratio).toBeLessThan(0.8);
     expect(r.ms).toBeLessThan(5000);
@@ -392,7 +397,10 @@ describe("near-duplicate detection can't be overloaded", () => {
     // one 32-bit number, so raising MAX_DUPLICATE_TERMS past this needs a
     // different set, not a bigger limit.
     expect(MAX_DUPLICATE_TERMS).toBeLessThanOrEqual(MAX_PAIR_SET_TERMS);
-    expect(MAX_PAIR_SET_TERMS ** 2 - MAX_PAIR_SET_TERMS - 1).toBeLessThan(2 ** 32 - 1);
+    // The largest pair is the last position with itself: a term can share a
+    // block with itself (two ways of dropping a letter from "aabbc" give the
+    // same shortened key), so that pair must fit below the empty mark too.
+    expect(MAX_PAIR_SET_TERMS ** 2 - 1).toBeLessThan(2 ** 32 - 1);
   });
 
   it("doesn't run out of memory on labels that unfold to many characters", () => {
