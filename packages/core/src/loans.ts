@@ -34,7 +34,13 @@
  * right move, never to nothing, and an item that went out comes off the loan
  * only once it is back. A closed loan out can't leave a record's `loan_out`
  * to its borrower in the loan period unlinked, and a closed loan in needs
- * every item's departure (unless the item never arrived). Departures no loan
+ * every item's departure (unless the item never arrived). A loan in whose
+ * record came into the organization's locations around or after its begin
+ * date in a move it doesn't link has a problem too (`unlinked_arrival`), so
+ * an arrival never linked can't leave it `agreed` or `returned` past its end.
+ * Item links are read only as own data properties, and validated copies have
+ * no prototype, so a polluted `Object.prototype` links nothing (S-012).
+ * Departures no loan
  * in names are listed by `unexplainedDepartures`, and `loan_out` moves no
  * loan out names or extends by `unexplainedLoanMoves`.
  *
@@ -403,7 +409,11 @@ const LOAN_BOOKS = new WeakMap<object, BookData>();
  * in the loan period, that no loan explains (`closed_with_unlinked_move`),
  * or a `closed` loan in with an item that has no departure linked although
  * its record has a move dated on or after `beginOn`
- * (`closed_without_departure`).
+ * (`closed_without_departure`); or a loan in (any status) whose item's
+ * record moved into one of the organization's own locations, dated no more
+ * than `ARRIVAL_LEAD_DAYS` before `beginOn` or later, in a move outside the
+ * item's linked stay and outside any linked stay of another loan in of the
+ * record whose period doesn't overlap this one (`unlinked_arrival`).
  * A loan with any of these is in phase `unknown` and listed by
  * `overdueLoans` once past its end date. `now` is for tests. Never throws.
  */
@@ -924,6 +934,7 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
     }
   }
   if (issues.count > 0) return { ok: false, issues: issues.items };
+  flagUnlinkedArrivals(log, byId, spans, flag);
   // A `loan_out` move is explained when a loan item names it, or when it
   // extends one: the same record to the same place, after the named
   // `loan_out` and before that item's return.
@@ -1011,6 +1022,78 @@ function buildBook(log: MoveLog, loans: readonly Loan[]): Validated<LoanBook> {
     unexplainedOut,
   });
   return { ok: true, value: book };
+}
+
+/**
+ * How many days before a loan in begins its record may arrive and still
+ * count as arriving for it (S-013): borrowed objects are often delivered,
+ * checked and installed in the weeks before the loan period opens. A month
+ * covers that; anything earlier is the record's own past, not this loan.
+ */
+export const ARRIVAL_LEAD_DAYS = 30;
+
+/**
+ * Flag a loan in whose record came into the organization's care without a
+ * link (S-013, D-044): a move of an item's record to one of the
+ * organization's own locations (storage or display) dated no more than
+ * `ARRIVAL_LEAD_DAYS` before `beginOn`, or later, that the loan doesn't
+ * account for. Without this an item that arrived unlinked left the loan
+ * `agreed` (or `returned`, beside a linked item that went back) past its end
+ * date, and off `overdueLoans`. A move is accounted for when it falls in the
+ * item's own linked stay (from before its linked arrival to its linked
+ * departure, or onward while it hasn't departed), or in another loan in's
+ * linked stay of the same record whose period doesn't overlap this loan's
+ * (the record borrowed again, or before). A stay of another loan whose
+ * period overlaps this one doesn't count: two agreements for the same object
+ * at once can't hide either.
+ */
+function flagUnlinkedArrivals(
+  log: MoveLog,
+  byId: ReadonlyMap<LoanId, { loan: Loan; items: readonly ItemData[] }>,
+  spans: ReadonlyMap<string, readonly { start: number; end: number; loanId: LoanId; j: number }[]>,
+  flag: (loanId: LoanId, path: readonly (string | number)[], code: string, message: string) => void,
+): void {
+  for (const { loan, items } of byId.values()) {
+    if (loan.direction !== "in") continue;
+    const from = daysBefore(loan.beginOn, ARRIVAL_LEAD_DAYS);
+    items.forEach((item, j) => {
+      const history = moveHistory(log, item.recordId);
+      const moves = history.ok ? history.value : [];
+      const stays = spans.get(`in ${item.recordId}`) ?? [];
+      const own = stays.find((s) => s.loanId === loan.id && s.j === j);
+      const accounted = (k: number): boolean => {
+        if (own !== undefined && k <= own.end) return true;
+        return stays.some((s) => {
+          if (s.loanId === loan.id || k < s.start || k > s.end) return false;
+          const other = byId.get(s.loanId)?.loan;
+          return other !== undefined && (other.endOn < loan.beginOn || loan.endOn < other.beginOn);
+        });
+      };
+      const unlinked = moves.some((m, k) => {
+        if (m.movedOn < from || accounted(k)) return false;
+        const place = logLocation(log, m.locationId);
+        return place !== undefined && place.kind !== "external";
+      });
+      if (unlinked) {
+        flag(
+          loan.id,
+          ["items", j],
+          "unlinked_arrival",
+          own === undefined
+            ? "This record came into the organization's care around or after the loan began, but the item names no arrival. Link the arrival placement to this item."
+            : "This record came back into the organization's care after the departure linked here, in a move no loan in names. Record the loan it came on.",
+        );
+      }
+    });
+  }
+}
+
+/** The day `days` days before `day` (`YYYY-MM-DD`), or the first allowed day. */
+function daysBefore(day: string, days: number): string {
+  const earlier = new Date(Date.parse(`${day}T00:00:00.000Z`) - days * 86_400_000)
+    .toISOString()
+    .slice(0, 10);
+  return isIsoDay(earlier) ? earlier : "0000-01-01";
 }
 
 /** Identifies one problem of one loan, to compare a loan's problems before and after an edit. */

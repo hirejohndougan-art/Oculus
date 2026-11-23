@@ -420,6 +420,7 @@ export {
   MAX_LOAN_ITEMS,
   MAX_LOAN_NUMBER_LENGTH,
   MAX_LOAN_PURPOSE_LENGTH,
+  ARRIVAL_LEAD_DAYS,
   newLoanId,
   isLoanId,
   validateLoan,

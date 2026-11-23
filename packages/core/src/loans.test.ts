@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  ARRIVAL_LEAD_DAYS,
   MAX_LOAN_ITEMS,
   createStorageMove,
   unexplainedDepartures,
@@ -840,7 +841,11 @@ describe("an overdue loan can't be hidden by editing it (review fixes)", () => {
     const raced = book([unlinked]);
     const state = ok(loanState(raced, lin.id));
     expect(state.phase).toBe("unknown");
-    expect(state.problems.map((p) => p.code)).toEqual(["closed_without_departure"]);
+    // It arrived without a link too (S-013), which also keeps it listed.
+    expect(state.problems.map((p) => p.code)).toEqual([
+      "unlinked_arrival",
+      "closed_without_departure",
+    ]);
     expect(ok(overdueLoans(raced, "2027-04-01")).map((s) => s.loan.id)).toEqual([lin.id]);
     // An item that never arrived (no move since the loan began) needs no departure.
     const neverCame = loanIn({ ...closing, items: [{ recordId: newRecordId() }] });
@@ -878,5 +883,132 @@ describe("an overdue loan can't be hidden by editing it (review fixes)", () => {
     );
     expect(ok(unexplainedLoanMoves(relinked))).toEqual([]);
     expect(ok(loanState(relinked, out.id)).phase).toBe("on_loan");
+  });
+});
+
+describe("an arrival with no link can't hide a loan in (S-013)", () => {
+  // A vase borrowed from the railroad society, 2026-10-01 to 2027-03-31.
+  const vase = newRecordId();
+  const vaseIn = move(vase, shelf.id, "2026-10-01", "placement");
+  const vaseLog = ok(indexMoves(INDEX, [...MOVES, vaseIn]));
+  const vaseLoan = (extra: Partial<LoanIn> = {}): LoanIn =>
+    loanIn({ number: "LI-2026-002", items: [{ recordId: vase }], ...extra });
+  const codesOf = (b: LoanBook, id: string): string[] =>
+    ok(loanState(b, id)).problems.map((p) => p.code);
+
+  it("an agreed loan whose item arrived unlinked is unknown, and overdue after its end", () => {
+    const lin = vaseLoan();
+    const b = book([lin], vaseLog);
+    expect(ok(loanState(b, lin.id)).phase).toBe("unknown");
+    expect(codesOf(b, lin.id)).toEqual(["unlinked_arrival"]);
+    expect(ok(overdueLoans(b, "2027-04-01")).map((s) => s.loan.id)).toEqual([lin.id]);
+    // Not before its end date.
+    expect(ok(overdueLoans(b, "2027-03-31"))).toEqual([]);
+    // withLoan won't save it so; linking the arrival puts it right.
+    expect(codes(withLoan(book([], vaseLog), lin))).toEqual(["unlinked_arrival"]);
+    const linked = { ...lin, items: [{ recordId: vase, arrivalMoveId: vaseIn.id }] };
+    const fixed = ok(withLoan(b, linked));
+    expect(ok(loanState(fixed, lin.id)).phase).toBe("on_loan");
+    expect(ok(loanProblems(fixed))).toEqual([]);
+  });
+
+  it("a returned linked item beside an unlinked arrival doesn't show returned", () => {
+    const departure = move(lantern, lenderPlace.id, "2026-11-20", "departure");
+    const log = ok(withMove(vaseLog, departure, NOW));
+    const lin = loanIn({
+      items: [
+        { recordId: lantern, arrivalMoveId: lanternIn.id, departureMoveId: departure.id },
+        { recordId: vase },
+      ],
+    });
+    const b = book([lin], log);
+    const state = ok(loanState(b, lin.id));
+    expect(state.phase).toBe("unknown");
+    expect(state.problems.map((p) => [p.code, p.path])).toEqual([
+      ["unlinked_arrival", ["items", 1]],
+    ]);
+    expect(ok(overdueLoans(b, "2027-04-01")).map((s) => s.loan.id)).toEqual([lin.id]);
+  });
+
+  it(`counts arrivals up to ${String(ARRIVAL_LEAD_DAYS)} days before the loan begins`, () => {
+    const early = newRecordId();
+    const lin = loanIn({ number: "LI-2026-003", items: [{ recordId: early }] });
+    // 30 days before 2026-10-01 counts; 31 days before is the record's own past.
+    const at30 = ok(indexMoves(INDEX, [move(early, shelf.id, "2026-09-01", "placement")]));
+    expect(codesOf(book([lin], at30), lin.id)).toEqual(["unlinked_arrival"]);
+    const at31 = ok(indexMoves(INDEX, [move(early, shelf.id, "2026-08-31", "placement")]));
+    expect(ok(loanState(book([lin], at31), lin.id)).phase).toBe("agreed");
+    // Any move into the organization's own locations counts, not only a placement.
+    const fixedUp = ok(indexMoves(INDEX, [move(early, shelf.id, "2026-10-05", "rehousing")]));
+    expect(codesOf(book([lin], fixedUp), lin.id)).toEqual(["unlinked_arrival"]);
+    // Requested, cancelled and closed loans too: something arrived for them.
+    for (const status of ["requested", "cancelled", "closed"] as const) {
+      const other = { ...lin, status };
+      expect(codesOf(book([other], at30), lin.id)).toContain("unlinked_arrival");
+    }
+  });
+
+  it("a correctly linked loan is unaffected", () => {
+    // On loan, with a rehousing during its stay: no problem.
+    const rehoused = move(lantern, room.id, "2026-11-01", "rehousing");
+    const log = ok(withMove(LOG, rehoused, NOW));
+    const lin = loanIn();
+    expect(ok(loanState(book([lin], log), lin.id)).phase).toBe("on_loan");
+    expect(ok(loanProblems(book([lin], log)))).toEqual([]);
+    // Gone back and closed: still none.
+    const departure = move(lantern, lenderPlace.id, "2026-11-10", "departure");
+    const gone = ok(withMove(log, departure, NOW));
+    const closed = loanIn({
+      endOn: "2026-11-10",
+      status: "closed",
+      statusOn: "2026-11-12",
+      items: [{ recordId: lantern, arrivalMoveId: lanternIn.id, departureMoveId: departure.id }],
+    });
+    expect(ok(loanState(book([closed], gone), closed.id)).phase).toBe("closed");
+    // Borrowed again soon after on its own linked loan: neither loan has a problem.
+    const again = move(lantern, shelf.id, "2026-11-15", "placement");
+    const twice = ok(withMove(gone, again, NOW));
+    const second = loanIn({
+      number: "LI-2026-010",
+      beginOn: "2026-11-15",
+      endOn: "2027-02-01",
+      items: [{ recordId: lantern, arrivalMoveId: again.id }],
+    });
+    const b = book([closed, second], twice);
+    expect(ok(loanProblems(b))).toEqual([]);
+    expect(ok(loanState(b, closed.id)).phase).toBe("closed");
+    expect(ok(loanState(b, second.id)).phase).toBe("on_loan");
+    // A loan in that never arrived stays agreed.
+    const pending = loanIn({ number: "LI-2026-009", items: [{ recordId: newRecordId() }] });
+    expect(ok(loanState(book([pending]), pending.id)).phase).toBe("agreed");
+  });
+
+  it("an unlinked return after the linked departure makes the loan unknown", () => {
+    const departure = move(lantern, lenderPlace.id, "2026-11-10", "departure");
+    const back = move(lantern, shelf.id, "2026-11-20", "placement");
+    const log = ok(indexMoves(INDEX, [...MOVES, departure, back]));
+    const closed = loanIn({
+      endOn: "2026-11-10",
+      status: "closed",
+      statusOn: "2026-11-12",
+      items: [{ recordId: lantern, arrivalMoveId: lanternIn.id, departureMoveId: departure.id }],
+    });
+    const b = book([closed], log);
+    expect(codesOf(b, closed.id)).toEqual(["unlinked_arrival"]);
+    expect(ok(overdueLoans(b, "2026-11-21")).map((s) => s.loan.id)).toEqual([closed.id]);
+  });
+
+  it("another loan in claiming the arrival over the same period doesn't clear it", () => {
+    const lin = vaseLoan();
+    const decoy = vaseLoan({
+      number: "LI-2026-099",
+      endOn: "2099-12-31",
+      items: [{ recordId: vase, arrivalMoveId: vaseIn.id }],
+    });
+    const b = book([lin, decoy], vaseLog);
+    expect(codesOf(b, lin.id)).toEqual(["unlinked_arrival"]);
+    expect(ok(overdueLoans(b, "2027-04-01")).map((s) => s.loan.id)).toEqual([lin.id]);
+    // Nor can the decoy be added to a book that holds the loan.
+    expect(ok(loanState(b, decoy.id)).phase).toBe("on_loan");
   });
 });
