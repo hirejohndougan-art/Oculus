@@ -149,14 +149,17 @@ The data model in TypeScript, written for any archive or museum rather than one 
 - [x] T-018 **Loans and condition checks.** deps: T-017
   - Spectrum loans in and out (lender or borrower agent, dates, items, status) and condition checks (date, who checked, condition, notes), as dated entries on objects and archival units (mockup Whereabouts, Conservators, record "Condition"). Staff-only.
   - Done: D-044: loans in and out that point at moves, condition checks and fit to move, and a `departure` move reason; overdue loans can't be hidden.
-- [ ] T-016a **Structured restrictions on accessions.** deps: T-016 (risky)
+- [x] T-016a **Structured restrictions on accessions.** deps: T-016 (risky)
   - Restrictions are free text today and hold nothing back. Add structured ones (closed until a date; staff and researchers only, as in the Log an accession mockup) that hold records back like an unsigned deed.
+  - Done: `accessRestriction` (`closed_until` with `until`, or `staff_and_researchers`) holds the record, units below, scans and links exactly as an unsigned deed does (`access_restricted`); `indexAccessions` requires the caller's `today` (organization's local day), kept as `heldAsOf`; `restrictionHoldsOn`; free-text restrictions stay notes (D-056). For T-034: build the register with the real local day at publish time, and re-publish when a `closed_until` date passes.
 - [ ] T-018a **Loan follow-ups.** deps: T-018, T-016
   - A borrowed item that becomes the organization's (bought or given) needs a link from an accession to close its loan in. Link a condition check's `loanId` to the loan book and warn when a loan out goes without a recent fit check. Valuation, insurance and authoriser fields.
-- [ ] T-013a **Record type edits checked against records.** deps: T-013
+- [x] T-013a **Record type edits checked against records.** deps: T-013
   - Editing a record type's kind or key, or deleting it, should list the records that use it first, as `templateChanges` does for templates; optionally a `recordTypes` input on `templateChanges`.
-- [ ] T-015a **Link follow-ups.** deps: T-015
+  - Done: `recordTypeChanges` and `recordTypeDeletion` (record-type-changes.ts, D-053) report `key_changed`, `key_adopts_records`, `kind_changed`, `type_deleted` and `unverified` (no `existing`) with record IDs, organization checked first; attack tests. The optional `recordTypes` input on `templateChanges` was left out (`recordTypeTemplateIssues` covers it).
+- [x] T-015a **Link follow-ups.** deps: T-015
   - `templateChanges` should report a narrowed `recordKinds` with the records whose links no longer fit; a report of link labels that no longer match the linked record's name.
+  - Done: D-055: `record_kind_removed` in `templateChanges` (records found through the organization's record link checker, `options.linkChecker`); `findStaleLinkLabels`, a staff-only Data Cleaning report of link and place labels that differ from the linked record's title, for one organization only.
 - [x] S-007 **Messages in `publicOutput` issues.** (risky) deps: T-014 Done: issues are staff only, and template-check and field publish-check messages are fixed text, code and path kept (D-016 "Issues").
   - From the integration review: `publicOutput` passes the template check's problems through as they are, and the identifier checker's `unknown_type` and `format_mismatch` messages quote a type key or a number. Decide whether `publicOutput` issues are staff-only (and say so) or replace those messages with fixed text.
 - [x] U-003 **Small hardening and test speed.**
@@ -233,8 +236,9 @@ Change log and versions:
 The writer:
 - [ ] T-032 **The service layer: one writer.** deps: T-026, T-029, T-031 (risky)
   - A `packages/service` service, with no HTTP yet, that holds the only database role allowed to write. Every save validates the record, checks it against its template (with the identifier checker), re-checks identifier uniqueness inside the transaction, and writes the version and change log. Tests try to write around it with every other role and fail.
-- [ ] T-034 **Workflow states and a real publish state.** deps: T-032, T-016 (risky)
+- [ ] T-034 **Workflow states and a real publish state.** deps: T-032, T-016, T-016a (risky)
   - Records get a stored state (draft, ready for review, published, withdrawn, as in the mockup), changed only through the service. Publishing runs `effectivePublishIssues` and the accession deed check at that moment. `publicOutput` gets `records` and `templateFor` loaded in the same read, never from a cache (D-054). `publicOutput` takes published IDs from the database instead of the caller's `published` list (replacing that part of D-016, with a decision entry and closing the last part of T-010a). Shape it so publishing can later be per site (Phase 5, "Show on these sites") without a schema rewrite.
+  - Restrictions (D-056): the publish service builds the accession register itself, at the moment of publishing, from the organization's records and accessions as they are now and with the organization's real local day (worked out from its time zone, never the server's UTC day), and asserts `register.heldAsOf` equals that day before using it. It never accepts a register handed in by a caller. Re-publish (or offer to) when a `closed_until` date passes, and withdraw records newly in `recordsHeldBack`. In the accession form, label `until` "First day it may be published".
 
 Logins and roles:
 - [ ] T-036 **User accounts and password sign-in.** deps: T-023, T-024 (risky)

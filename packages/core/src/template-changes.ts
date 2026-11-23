@@ -32,6 +32,18 @@
  *   list where there was none narrows from "any"); `recordIds` are the
  *   records with a value the new list doesn't allow. A term with no
  *   vocabulary counts as `local`.
+ * - `record_kind_removed`: a `record_link` field's `recordKinds` narrows
+ *   (`removedCodes` names the record kinds dropped; no `recordKinds` allowed
+ *   all six). `recordIds` are the records with a link to a record of a kind
+ *   the field no longer allows. The kinds of linked records come from the
+ *   organization's record link checker (`makeRecordLinkChecker`), given as
+ *   `options.linkChecker`; without it every record holding a link under the
+ *   key is listed, since any of them may be affected. A link the checker
+ *   can't resolve to a kind (a record it doesn't hold, such as a deleted one
+ *   or one added after it was made, an ID used twice, an invalid record) is
+ *   counted too, since its kind is unknown. A place field always links to place records, so it can't
+ *   narrow; changing a field between `record_link` and `place` is
+ *   `kind_changed`, which lists every record holding a value.
  * - `made_required`: `required` turns on; `recordIds` are the records
  *   without a value.
  * - `inherited_changed`: needs confirmation when a field starts being
@@ -50,6 +62,12 @@
  * left-over keys can't be seen, so `recordsChecked` is false and every change
  * that could affect records needs confirmation. Callers saving a template
  * should pass the records.
+ *
+ * A record link checker made from another organization's records is refused
+ * (`wrong_organization_checker`), as is one that belongs to no organization
+ * (`no_organization_checker`: made from an empty set with no organization
+ * given) and anything else given as one (`not_a_link_checker`), before any record is read: its record kinds would
+ * describe another organization's records. Messages name neither.
  *
  * Every record given must name this template in its `templateKey`
  * (`record_not_for_template` refuses the whole comparison otherwise, D-029).
@@ -78,6 +96,9 @@ import {
   type FieldTemplate,
 } from "./templates.js";
 import { MAX_RECORD_SET } from "./effective.js";
+import { isMadeLinkChecker, linkCheckerOrganization, linkTargetKind } from "./record-link-brand.js";
+import { RECORD_KINDS } from "./records.js";
+import type { OrganizationId } from "./organizations.js";
 import { types } from "node:util";
 
 export const TEMPLATE_CHANGE_CODES = [
@@ -91,6 +112,7 @@ export const TEMPLATE_CHANGE_CODES = [
   "max_length_lowered",
   "vocabulary_removed",
   "identifier_type_removed",
+  "record_kind_removed",
   "made_required",
   "inherited_changed",
   "made_staff",
@@ -110,8 +132,10 @@ export interface TemplateChange {
   readonly message: string;
   /**
    * Records holding a value for `key`. For `option_removed`, those using
-   * `option`; for `max_length_lowered`, `vocabulary_removed` and
-   * `identifier_type_removed`, those holding a value the new field refuses;
+   * `option`; for `max_length_lowered`, `vocabulary_removed`,
+   * `identifier_type_removed` and `record_kind_removed`, those holding a
+   * value the new field refuses (for `record_kind_removed` without a link
+   * checker, every record holding a link);
    * for `made_required`, those without a value. For `kind_added`, the given
    * records of that kind, usually none yet, since they used another
    * template: the change is reported whatever the count. At most
@@ -122,10 +146,24 @@ export interface TemplateChange {
   readonly recordCount: number;
   /** `option_removed` only: the option value the template dropped. */
   readonly option?: string;
-  /** `vocabulary_removed` and `identifier_type_removed` only: the codes dropped (empty when narrowing from any). */
+  /**
+   * `vocabulary_removed` and `identifier_type_removed` only: the codes dropped
+   * (empty when narrowing from any). `record_kind_removed`: the record kinds
+   * dropped (from all six when the field had no `recordKinds`).
+   */
   readonly removedCodes?: readonly string[];
   /** `repeatable_changed` from true to false only: records holding more than one value. */
   readonly recordsWithSeveralValues?: readonly RecordId[];
+}
+
+export interface TemplateChangeOptions {
+  /**
+   * The organization's record link checker, from `makeRecordLinkChecker`
+   * made from all of its records: it tells the kind of each linked record,
+   * for `record_kind_removed`. Another organization's checker, or any other
+   * function, refuses the comparison.
+   */
+  readonly linkChecker?: unknown;
 }
 
 export interface TemplateChanges {
@@ -147,15 +185,17 @@ export interface TemplateChanges {
  * Compare a template with the version about to replace it, and list the
  * changes that need confirmation (see the module header). `records` are the
  * records that use the template; leave it out only when there are none to
- * check, since left-over keys are found only through them. Never throws.
+ * check, since left-over keys are found only through them. `options` may
+ * give the organization's record link checker (`linkChecker`). Never throws.
  */
 export function templateChanges(
   oldTemplate: unknown,
   newTemplate: unknown,
   records?: unknown,
+  options?: TemplateChangeOptions,
 ): Validated<TemplateChanges> {
   try {
-    return compare(oldTemplate, newTemplate, records);
+    return compare(oldTemplate, newTemplate, records, options);
   } catch {
     return {
       ok: false,
@@ -168,6 +208,7 @@ function compare(
   oldInput: unknown,
   newInput: unknown,
   recordsInput: unknown,
+  optionsInput: unknown,
 ): Validated<TemplateChanges> {
   const issues: Issue[] = [];
   // The stored version may predate the identifier type key rule (D-031).
@@ -198,6 +239,15 @@ function compare(
       issues: [mixedOrganizationsIssue(["newTemplate", "organizationId"], "These two templates")],
     };
   }
+
+  // The link checker is checked before any record is read.
+  const linkChecker = readLinkChecker(optionsInput, after.value.organizationId);
+  if (!linkChecker.ok) return linkChecker;
+  const organizationId = after.value.organizationId;
+  const kindOf =
+    linkChecker.value === undefined
+      ? undefined
+      : (recordId: unknown) => linkTargetKind(linkChecker.value, organizationId, recordId);
 
   let records: readonly CatalogRecord[] | undefined;
   if (recordsInput !== undefined) {
@@ -259,7 +309,7 @@ function compare(
         if (!kept.has(o.value)) found.push({ code: "option_removed", key, option: o.value });
       }
     }
-    if (was.kind === now.kind) found.push(...stranding(key, was, now));
+    if (was.kind === now.kind) found.push(...stranding(key, was, now, kindOf));
     if (was.inherited !== now.inherited) {
       found.push({ code: "inherited_changed", key, nowInherited: now.inherited });
     }
@@ -322,11 +372,18 @@ interface Found {
   readonly refuses?: (item: JsonValue) => boolean;
   /** made_required: the affected records are those without a value. */
   readonly missing?: boolean;
+  /** record_kind_removed: no link checker, so every link may be affected. */
+  readonly targetsUnchecked?: boolean;
   readonly removedCodes?: readonly string[];
 }
 
 /** Changes to a field of the same kind that leave stored values or records not fitting it. */
-function stranding(key: string, was: FieldDefinition, now: FieldDefinition): Found[] {
+function stranding(
+  key: string,
+  was: FieldDefinition,
+  now: FieldDefinition,
+  kindOf: ((recordId: unknown) => RecordKind | undefined) | undefined,
+): Found[] {
   const out: Found[] = [];
   if (now.kind === "text" || now.kind === "long_text") {
     const cap = now.kind === "text" ? MAX_TEXT_LENGTH : MAX_LONG_TEXT_LENGTH;
@@ -355,8 +412,72 @@ function stranding(key: string, was: FieldDefinition, now: FieldDefinition): Fou
     );
     if (f !== undefined) out.push(f);
   }
+  if (now.kind === "record_link" && now.recordKinds !== undefined) {
+    const allowed = new Set<RecordKind>(now.recordKinds);
+    const removed = (was.recordKinds ?? RECORD_KINDS).filter((k) => !allowed.has(k));
+    if (removed.length > 0) {
+      out.push({
+        code: "record_kind_removed",
+        key,
+        removedCodes: Object.freeze(removed),
+        ...(kindOf === undefined ? { targetsUnchecked: true } : {}),
+        refuses: (item) => {
+          if (!isPlainObject(item) || !Object.hasOwn(item, "recordId")) return false;
+          if (kindOf === undefined) return true;
+          // A link the checker can't resolve to a kind (not in its records,
+          // an ID used twice, an invalid record, or a checker made before the
+          // record was) may well be affected: fail closed.
+          const kind = kindOf(item.recordId);
+          return kind === undefined || !allowed.has(kind);
+        },
+      });
+    }
+  }
   if (!was.required && now.required) out.push({ code: "made_required", key, missing: true });
   return out;
+}
+
+/**
+ * The record link checker in `options`, if any: one `makeRecordLinkChecker`
+ * made, from this organization's records (or none). Anything else refuses
+ * the comparison, with messages that name nothing.
+ */
+function readLinkChecker(options: unknown, organizationId: OrganizationId): Validated<unknown> {
+  if (options === undefined) return { ok: true, value: undefined };
+  const bad = (code: string, message: string): Validated<unknown> => ({
+    ok: false,
+    issues: [issue(["options"], code, message)],
+  });
+  if (types.isProxy(options) || !isPlainObject(options)) {
+    return bad("invalid_options", "The options must be a plain object.");
+  }
+  const d = Object.getOwnPropertyDescriptor(options, "linkChecker");
+  if (d === undefined) return { ok: true, value: undefined };
+  if (!("value" in d)) {
+    return bad("invalid_options", "linkChecker must be a plain property, not a getter.");
+  }
+  const checker: unknown = d.value;
+  if (checker === undefined) return { ok: true, value: undefined };
+  if (!isMadeLinkChecker(checker)) {
+    return bad(
+      "not_a_link_checker",
+      "linkChecker must be a record link checker made by makeRecordLinkChecker.",
+    );
+  }
+  const owner = linkCheckerOrganization(checker);
+  if (owner === undefined) {
+    return bad(
+      "no_organization_checker",
+      "This record link checker was made from no records and for no organization. Make it from this organization's records, or give makeRecordLinkChecker the organization.",
+    );
+  }
+  if (owner !== organizationId) {
+    return bad(
+      "wrong_organization_checker",
+      "This record link checker was made from another organization's records, so it can't be used for this template.",
+    );
+  }
+  return { ok: true, value: checker };
 }
 
 /** A change when `now` allows fewer codes than `was` (undefined allows any). */
@@ -573,6 +694,15 @@ function message(f: Found, count: number | undefined, several: number): string {
       return `The field ${key} allows fewer vocabularies. ${stranded(count, "hold a term the field no longer allows")}`;
     case "identifier_type_removed":
       return `The field ${key} allows fewer identifier types. ${stranded(count, "hold an identifier of a type the field no longer allows")}`;
+    case "record_kind_removed":
+      if (f.targetsUnchecked === true && count !== undefined) {
+        return `The field ${key} links to fewer kinds of record. ${
+          count === 0
+            ? "No record holds a link for it."
+            : `Linked records weren't checked, so the ${records(count)} holding links for it may link to a kind it no longer allows.`
+        }`;
+      }
+      return `The field ${key} links to fewer kinds of record. ${stranded(count, "link to a record of a kind the field no longer allows, or to one the record link checker doesn't know")}`;
     case "made_required":
       return `The field ${key} becomes required. ${stranded(count, "have no value for it")}`;
     case "inherited_changed":

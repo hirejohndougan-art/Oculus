@@ -787,3 +787,96 @@ describe("a value kept from before a template change never reaches the public vi
     expect(effectivePublishIssues(effective, { accessions: accessionsFor(effective) })).toEqual([]);
   });
 });
+
+describe("the checker's organization (T-015a review)", () => {
+  function linked() {
+    const agent = withKey(record("agent", "Dickinson, John", { rights: { uri: CNE } }));
+    const item = withKey(
+      record("object", "Postcard", {
+        rights: { uri: CNE },
+        creator: { recordId: agent.id, label: "SECRET-label" },
+        places: [{ label: "SECRET-place-name", recordId: newRecordId() }],
+      }),
+    );
+    return { agent, item, all: [agent, item] };
+  }
+
+  it("takes another organization from its invalid records, and is refused", () => {
+    const { item, all } = linked();
+    const other = newOrganizationId();
+    const invalid = {
+      ...record("agent", "SECRET-foreign", {}, { organizationId: other }),
+      title: "",
+    };
+    const foreign = ok(makeRecordLinkChecker([invalid]));
+    const checkers = { ...CHECKERS, record_link: foreign, place: foreign };
+    const checked = checkRecordAgainstTemplate(item, LINK_TPL, { checkers });
+    expect(checked.map((i) => i.code)).toContain("wrong_organization_checker");
+    const view = viewOf(all, item.id, { ...CHECKERS, record_link: linkChecker(all) });
+    const result = output(view, [item.id], checkers);
+    expect(codes(result)).toEqual(["wrong_organization_checker"]);
+    expect(JSON.stringify(result)).not.toContain(other);
+  });
+
+  it("refuses records of another organization than the one given", () => {
+    const { all } = linked();
+    const other = newOrganizationId();
+    const result = makeRecordLinkChecker(all, other);
+    expect(codes(result)).toEqual(["wrong_organization"]);
+    expect(JSON.stringify(result)).not.toContain(ORG);
+    expect(JSON.stringify(result)).not.toContain(other);
+    const invalid = {
+      ...record("agent", "x", {}, { organizationId: other }),
+      title: "",
+    };
+    expect(codes(makeRecordLinkChecker([invalid], ORG))).toEqual(["wrong_organization"]);
+    expect(codes(makeRecordLinkChecker(all, "not-an-org"))).toEqual(["invalid_organization"]);
+    expect(makeRecordLinkChecker(all, ORG).ok).toBe(true);
+  });
+
+  it("a checker of no organization vouches for nothing anywhere", () => {
+    const { item, all } = linked();
+    const none = ok(makeRecordLinkChecker([]));
+    const checkers = { ...CHECKERS, record_link: none, place: none };
+    expect(checkRecordAgainstTemplate(item, LINK_TPL, { checkers }).map((i) => i.code)).toContain(
+      "no_organization_checker",
+    );
+    // effectiveRecord: the place name it can't vouch for is left out of the view.
+    const effective = ok(effectiveRecord(item.id, all, () => LINK_TPL, { checkers }));
+    const view = publicView(effective);
+    expect(JSON.stringify(view)).not.toContain("SECRET");
+    // publicOutput: refused or empty of the link, never the label or the ID.
+    const good = viewOf(all, item.id, { ...CHECKERS, record_link: linkChecker(all) });
+    const result = output(good, [item.id, all[0]?.id ?? item.id], checkers);
+    expect(result.ok).toBe(false);
+    const text = JSON.stringify(result);
+    expect(text).not.toContain("SECRET");
+    expect(text).not.toContain(all[0]?.id ?? "?");
+  });
+});
+
+describe("a checker of no organization (T-015a second review)", () => {
+  it("lets a place that names no record through: a name needs no checker", () => {
+    const none = ok(makeRecordLinkChecker([]));
+    const item = withKey(
+      record("object", "Postcard", { rights: { uri: CNE }, places: [{ label: "Dickinson" }] }),
+    );
+    expect(
+      checkRecordAgainstTemplate(item, LINK_TPL, {
+        checkers: { ...CHECKERS, place: none },
+      }).map((i) => i.code),
+    ).toEqual([]);
+    expect(none({ label: "Dickinson" }, field({ key: "p", kind: "place" }), item)).toEqual([]);
+  });
+
+  it("is refused up front by publicOutput, for record_link and for place", () => {
+    const item = withKey(record("object", "Postcard", { rights: { uri: CNE } }));
+    const view = viewOf([item], item.id, CHECKERS);
+    const none = ok(makeRecordLinkChecker([]));
+    for (const kind of ["record_link", "place"]) {
+      expect(codes(output(view, [item.id], { ...CHECKERS, [kind]: none }))).toEqual([
+        "no_organization_checker",
+      ]);
+    }
+  });
+});

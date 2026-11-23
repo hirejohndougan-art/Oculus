@@ -26,6 +26,7 @@ import {
   ORG,
   RECORDS,
   SECRET,
+  TODAY,
   TYPES,
   accession,
   codes,
@@ -178,7 +179,7 @@ describe("indexAccessions and its queries", () => {
     expect(isAccessionRegister(register)).toBe(true);
     expect(isAccessionRegister({ ...register })).toBe(false);
     expect(Object.isFrozen(register)).toBe(true);
-    expect(register).toEqual({ organizationId: ORG, size: 3 });
+    expect(register).toEqual({ organizationId: ORG, size: 3, heldAsOf: TODAY });
     expect(JSON.stringify(register)).not.toContain(SECRET.donor);
   });
 
@@ -244,6 +245,7 @@ describe("indexAccessions and its queries", () => {
             accessions: list as never,
             records: RECORDS,
             identifierTypes: TYPES,
+            today: TODAY,
           }),
         ),
       ).toContain(code);
@@ -258,6 +260,7 @@ describe("indexAccessions and its queries", () => {
           contacts: contacts as never,
           records: RECORDS,
           identifierTypes: TYPES,
+          today: TODAY,
         }),
       );
     expect(run(accession({ sourceAgent: { recordId: fonds.id, label: "Fonds" } }))).toEqual([

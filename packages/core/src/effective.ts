@@ -290,6 +290,11 @@ type Fetched =
 interface LookupState {
   /** Validated, frozen copies, by ID, or why the ID can't be used. Never changed after indexing. */
   readonly byId: ReadonlyMap<RecordId, Fetched>;
+  /**
+   * The organization of every entry, valid or not (buildLookup refuses an
+   * entry without a readable one); undefined only for an empty set.
+   */
+  readonly organizationId: OrganizationId | undefined;
 }
 
 /** Lookups made by `indexRecords`; anything else passed as one is refused. */
@@ -367,7 +372,7 @@ function buildLookup(records: unknown): RecordLookup {
     );
   }
   const lookup: RecordLookup = Object.freeze({ size: byId.size });
-  LOOKUPS.set(lookup, { byId });
+  LOOKUPS.set(lookup, { byId, organizationId: organization });
   return lookup;
 }
 
@@ -490,10 +495,11 @@ export function currentRepresented(
  * with the issue `indexRecords` gives. Never throws.
  */
 export function recordIndex(records: unknown): Validated<RecordLookup> {
-  if (typeof records === "object" && records !== null && LOOKUPS.has(records)) {
-    return { ok: true, value: records as RecordLookup };
+  try {
+    return { ok: true, value: lookupOf(records) };
+  } catch (error) {
+    return failure(error);
   }
-  return indexRecords(records);
 }
 
 /**
@@ -525,21 +531,47 @@ export function currentAncestry(
 export function recordsById(
   records: unknown,
 ): Validated<ReadonlyMap<RecordId, CatalogRecord | undefined>> {
+  const set = recordSet(records);
+  return set.ok ? { ok: true, value: set.value.byId } : set;
+}
+
+/**
+ * For other modules in this package (not exported from the package): like
+ * `recordsById`, with the organization of the set. That organization is
+ * read from every entry, valid or not (an entry without a readable one
+ * refuses the set), so a set of another organization's invalid records
+ * still has that organization. Undefined only for an empty set. Never throws.
+ */
+export function recordSet(records: unknown): Validated<{
+  readonly byId: ReadonlyMap<RecordId, CatalogRecord | undefined>;
+  readonly organizationId: OrganizationId | undefined;
+}> {
   try {
     const state = lookupFor(records);
-    const out = new Map<RecordId, CatalogRecord | undefined>();
-    for (const [id, got] of state.byId) out.set(id, got.ok ? got.record : undefined);
-    return { ok: true, value: out };
+    const byId = new Map<RecordId, CatalogRecord | undefined>();
+    for (const [id, got] of state.byId) byId.set(id, got.ok ? got.record : undefined);
+    return { ok: true, value: { byId, organizationId: state.organizationId } };
   } catch (error) {
     return failure(error);
   }
 }
 
-/** The index for `records`: the one `indexRecords` made, or a new one built from a list. */
-function lookupFor(records: unknown): LookupState {
+/**
+ * The one way a set is indexed (`recordIndex`, `recordSet` and every lookup
+ * here use it): the lookup `indexRecords` made, as it is, or a new one built
+ * from a list. Throws an EffectiveError when the list can't be indexed.
+ */
+function lookupOf(records: unknown): RecordLookup {
   // Callers may pass anything at run time, whatever the type says.
-  const state = typeof records === "object" && records !== null ? LOOKUPS.get(records) : undefined;
-  return state ?? stateOf(buildLookup(records));
+  if (typeof records === "object" && records !== null && LOOKUPS.has(records)) {
+    return records as RecordLookup;
+  }
+  return buildLookup(records);
+}
+
+/** The index state for `records` (see `lookupOf`). */
+function lookupFor(records: unknown): LookupState {
+  return stateOf(lookupOf(records));
 }
 
 function stateOf(lookup: RecordLookup): LookupState {
@@ -1155,8 +1187,10 @@ export function publicView(effective: EffectiveRecord): PublicRecord | undefined
  * refused (`accessions_unknown`), with anything else (`invalid_accessions`)
  * or another organization's register (`mixed_organizations`) too. A record
  * the register holds back, or whose ancestor or represented record it holds
- * back, is refused (`deed_not_signed`); the message names no donor,
- * accession or number. The record, its current ancestry and, for a
+ * back, is refused: `deed_not_signed` for an unsigned deed,
+ * `access_restricted` for an access restriction in force on the register's
+ * day (T-016a, D-056), both when both hold. The messages name no donor,
+ * accession, number, restriction or date. The record, its current ancestry and, for a
  * digital asset, the record it represents with that record's ancestry (from
  * the records `effectiveRecord` was given; `represented_record_unknown` when
  * they aren't there) must all be records the register knows
@@ -1341,13 +1375,34 @@ function deedIssues(
       "The accession register doesn't know this record, a record above it or the record it shows. Make the register again from the organization's records as they are now.",
     );
   }
-  if (ids.some((id) => holds.isHeld(id))) {
-    return refuse(
-      "deed_not_signed",
-      "This record came from an accession whose deed of gift isn't signed yet, so it is held back from the public site. Mark the deed as signed in Deeds once the signed copy is on file.",
+  // Why, never which accession, restriction or date (D-043, D-056).
+  const reasons = new Set(ids.flatMap((id) => holds.holdReasons(id)));
+  const found: Issue[] = [];
+  if (reasons.has("deed")) {
+    found.push(
+      issue(
+        ["accessions"],
+        "deed_not_signed",
+        "This record came from an accession whose deed of gift isn't signed yet, so it is held back from the public site. Mark the deed as signed in Deeds once the signed copy is on file.",
+      ),
     );
   }
-  return Object.freeze([]);
+  if (reasons.has("restriction")) {
+    found.push(
+      issue(
+        ["accessions"],
+        "access_restricted",
+        "This record came from an accession with an access restriction in force, so it is held back from the public site. See the accession's restrictions.",
+      ),
+    );
+  }
+  // Fails closed: held for a reason this check doesn't name is still held.
+  if (found.length === 0 && ids.some((id) => holds.isHeld(id))) {
+    found.push(
+      issue(["accessions"], "held_back", "This record is held back from the public site."),
+    );
+  }
+  return Object.freeze(found.map((f) => Object.freeze(f)));
 }
 
 /** The value the nearest ancestor gives for `field`, or undefined. */

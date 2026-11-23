@@ -183,8 +183,25 @@ export type {
   RecordTypeRegistry,
 } from "./record-types.js";
 
+export {
+  RECORD_TYPE_CHANGE_CODES,
+  recordTypeChanges,
+  recordTypeDeletion,
+} from "./record-type-changes.js";
+export type {
+  RecordTypeChangeCode,
+  RecordTypeChange,
+  RecordTypeChanges,
+  RecordTypeUse,
+} from "./record-type-changes.js";
+
 export { TEMPLATE_CHANGE_CODES, MAX_LISTED_RECORDS, templateChanges } from "./template-changes.js";
-export type { TemplateChangeCode, TemplateChange, TemplateChanges } from "./template-changes.js";
+export type {
+  TemplateChangeCode,
+  TemplateChange,
+  TemplateChangeOptions,
+  TemplateChanges,
+} from "./template-changes.js";
 
 export {
   IDENTIFIER_TYPE_CHANGE_CODES,
@@ -255,6 +272,17 @@ export type {
 
 export { checkRightsValue, makeIdentifierChecker } from "./field-checkers.js";
 export { makeRecordLinkChecker } from "./record-links.js";
+export {
+  DEFAULT_STALE_LINK_LABELS,
+  MAX_STALE_LINK_LABELS,
+  findStaleLinkLabels,
+} from "./link-label-report.js";
+export type {
+  SkippedLinkRecord,
+  StaleLinkLabel,
+  StaleLinkLabelsOptions,
+  StaleLinkLabelsReport,
+} from "./link-label-report.js";
 
 export { identifierFieldIssues } from "./identifier-fields.js";
 
@@ -468,6 +496,7 @@ export {
   ACQUISITION_METHODS,
   DEED_STATUSES,
   DEED_HOLD_STATUSES,
+  ACCESS_RESTRICTION_KINDS,
   ACCESSIONED_KINDS,
   MAX_ACCESSIONS,
   MAX_ACCESSION_RECORDS,
@@ -489,6 +518,7 @@ export {
   accessionsOfRecord,
   accessionsAwaitingDeeds,
   deedHoldsOn,
+  restrictionHoldsOn,
   recordsHeldBack,
   donorContact,
   nextAccessionNumber,
@@ -497,6 +527,8 @@ export type {
   AccessionId,
   AcquisitionMethod,
   DeedStatus,
+  AccessRestriction,
+  AccessRestrictionKind,
   AccessionLink,
   AccessionNumber,
   Accession,
