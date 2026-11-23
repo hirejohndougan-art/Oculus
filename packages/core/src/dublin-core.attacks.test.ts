@@ -4,9 +4,14 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   DACS_ARCHIVAL_UNIT_PRESET,
   DACS_DUBLIN_CORE,
+  newOrganizationId,
+  mappingForTemplate,
+  mappingFromPreset,
   presetDublinCoreMapping,
   standardPreset,
+  templateFromPreset,
   validateDublinCoreMapping,
+  type FieldTemplate,
   type Validated,
 } from "./index.js";
 
@@ -15,6 +20,17 @@ function codes(result: Validated<unknown>): string[] {
 }
 
 const STAFF_ENTRY = { field: "acquisition_source", term: "description" };
+
+const ORG = newOrganizationId();
+
+function ownTemplate(): FieldTemplate {
+  const made = templateFromPreset(DACS_ARCHIVAL_UNIT_PRESET, ORG);
+  if (!made.ok) throw new Error("preset template is invalid");
+  return made.value;
+}
+
+const DACS_T = ownTemplate();
+const DACS_M = { ...DACS_DUBLIN_CORE, organizationId: ORG };
 
 describe("Dublin Core mapping attacks", () => {
   afterEach(() => {
@@ -26,7 +42,7 @@ describe("Dublin Core mapping attacks", () => {
   it("a Proxy mapping is refused without being read", () => {
     let reads = 0;
     const proxy = new Proxy(
-      { template: "dacs-archival-unit", entries: [] },
+      { organizationId: ORG, template: "dacs-archival-unit", entries: [] },
       {
         get(target, key, receiver) {
           reads++;
@@ -34,9 +50,7 @@ describe("Dublin Core mapping attacks", () => {
         },
       },
     );
-    expect(codes(validateDublinCoreMapping(proxy, DACS_ARCHIVAL_UNIT_PRESET))).toEqual([
-      "not_an_object",
-    ]);
+    expect(codes(validateDublinCoreMapping(proxy, DACS_T))).toEqual(["not_an_object"]);
     expect(reads).toBe(0);
   });
 
@@ -50,33 +64,34 @@ describe("Dublin Core mapping attacks", () => {
       },
     };
     const result = validateDublinCoreMapping(
-      { template: "dacs-archival-unit", entries: [entry] },
-      DACS_ARCHIVAL_UNIT_PRESET,
+      { organizationId: ORG, template: "dacs-archival-unit", entries: [entry] },
+      DACS_T,
     );
     expect(result.ok).toBe(false);
   });
 
   it("a getter that throws is reported, not thrown", () => {
     const mapping = {
+      organizationId: ORG,
       template: "dacs-archival-unit",
       get entries(): unknown {
         throw new Error("boom");
       },
     };
-    expect(() => validateDublinCoreMapping(mapping, DACS_ARCHIVAL_UNIT_PRESET)).not.toThrow();
-    expect(validateDublinCoreMapping(mapping, DACS_ARCHIVAL_UNIT_PRESET).ok).toBe(false);
+    expect(() => validateDublinCoreMapping(mapping, DACS_T)).not.toThrow();
+    expect(validateDublinCoreMapping(mapping, DACS_T).ok).toBe(false);
   });
 
   it("a Proxy template fails closed", () => {
-    const proxy = new Proxy(DACS_ARCHIVAL_UNIT_PRESET, {});
-    expect(codes(validateDublinCoreMapping(DACS_DUBLIN_CORE, proxy))).toEqual(["invalid_template"]);
+    const proxy = new Proxy(DACS_T, {});
+    expect(codes(validateDublinCoreMapping(DACS_M, proxy))).toEqual(["invalid_template"]);
   });
 
   it("a polluted toJSON doesn't make distinct entries look like duplicates", () => {
     const proto = Object.prototype as Record<string, unknown>;
     proto.toJSON = () => "same";
     try {
-      expect(validateDublinCoreMapping(DACS_DUBLIN_CORE, DACS_ARCHIVAL_UNIT_PRESET).ok).toBe(true);
+      expect(validateDublinCoreMapping(DACS_M, DACS_T).ok).toBe(true);
     } finally {
       delete proto.toJSON;
     }
@@ -85,8 +100,8 @@ describe("Dublin Core mapping attacks", () => {
   it("entries inherited from a polluted Object.prototype are not read", () => {
     (Object.prototype as Record<string, unknown>).entries = [STAFF_ENTRY];
     const result = validateDublinCoreMapping(
-      { template: "dacs-archival-unit" },
-      DACS_ARCHIVAL_UNIT_PRESET,
+      { organizationId: ORG, template: "dacs-archival-unit" },
+      DACS_T,
     );
     expect(codes(result)).toEqual(["required"]);
   });
@@ -94,8 +109,8 @@ describe("Dublin Core mapping attacks", () => {
   it("a polluted visibility can't make a staff field public", () => {
     (Object.prototype as Record<string, unknown>).visibility = "public";
     const result = validateDublinCoreMapping(
-      { template: "dacs-archival-unit", entries: [STAFF_ENTRY] },
-      DACS_ARCHIVAL_UNIT_PRESET,
+      { organizationId: ORG, template: "dacs-archival-unit", entries: [STAFF_ENTRY] },
+      DACS_T,
     );
     expect(codes(result)).toEqual(["staff_field"]);
   });
@@ -103,8 +118,8 @@ describe("Dublin Core mapping attacks", () => {
   it("a field inherited from a polluted prototype is not read", () => {
     (Object.prototype as Record<string, unknown>).field = "date";
     const result = validateDublinCoreMapping(
-      { template: "dacs-archival-unit", entries: [{ term: "date" }] },
-      DACS_ARCHIVAL_UNIT_PRESET,
+      { organizationId: ORG, template: "dacs-archival-unit", entries: [{ term: "date" }] },
+      DACS_T,
     );
     expect(codes(result)).toEqual(["invalid_field_key"]);
   });
@@ -112,8 +127,8 @@ describe("Dublin Core mapping attacks", () => {
   it("prototype keys in entries are refused", () => {
     const entry = JSON.parse('{"__proto__": {"field": "date"}, "term": "date"}') as unknown;
     const result = validateDublinCoreMapping(
-      { template: "dacs-archival-unit", entries: [entry] },
-      DACS_ARCHIVAL_UNIT_PRESET,
+      { organizationId: ORG, template: "dacs-archival-unit", entries: [entry] },
+      DACS_T,
     );
     expect(result.ok).toBe(false);
   });
@@ -122,8 +137,8 @@ describe("Dublin Core mapping attacks", () => {
     const entries: unknown[] = [];
     Object.defineProperty(entries, "0", { value: STAFF_ENTRY, enumerable: false });
     const result = validateDublinCoreMapping(
-      { template: "dacs-archival-unit", entries },
-      DACS_ARCHIVAL_UNIT_PRESET,
+      { organizationId: ORG, template: "dacs-archival-unit", entries },
+      DACS_T,
     );
     expect(result.ok).toBe(false);
   });
@@ -131,8 +146,12 @@ describe("Dublin Core mapping attacks", () => {
   it("text echoed into messages is escaped", () => {
     const sneaky = "date‮evil";
     const result = validateDublinCoreMapping(
-      { template: "dacs-archival-unit", entries: [{ field: "date", term: sneaky }] },
-      DACS_ARCHIVAL_UNIT_PRESET,
+      {
+        organizationId: ORG,
+        template: "dacs-archival-unit",
+        entries: [{ field: "date", term: sneaky }],
+      },
+      DACS_T,
     );
     expect(result.ok).toBe(false);
     if (result.ok) return;
@@ -143,8 +162,8 @@ describe("Dublin Core mapping attacks", () => {
     const entries = Array.from({ length: 100_000 }, () => STAFF_ENTRY);
     const start = Date.now();
     const result = validateDublinCoreMapping(
-      { template: "dacs-archival-unit", entries },
-      DACS_ARCHIVAL_UNIT_PRESET,
+      { organizationId: ORG, template: "dacs-archival-unit", entries },
+      DACS_T,
     );
     expect(result.ok).toBe(false);
     expect(Date.now() - start).toBeLessThan(2000);
@@ -159,5 +178,148 @@ describe("Dublin Core mapping attacks", () => {
     expect(() => {
       (mapping?.entries as unknown[]).push(STAFF_ENTRY);
     }).toThrow(TypeError);
+  });
+});
+
+describe("Dublin Core mappings across organizations (D-030, D-047)", () => {
+  const OTHER = newOrganizationId();
+  const SECRET_FIELD = "other_orgs_secret_field";
+
+  function otherTemplate(): FieldTemplate {
+    const made = templateFromPreset(DACS_ARCHIVAL_UNIT_PRESET, OTHER);
+    if (!made.ok) throw new Error("preset template is invalid");
+    return made.value;
+  }
+
+  /** Another organization's mapping, for a template with the same key as ours. */
+  const OTHERS_MAPPING = {
+    organizationId: OTHER,
+    template: "dacs-archival-unit",
+    entries: [
+      { field: "date", term: "date" },
+      { field: SECRET_FIELD, term: "description" },
+    ],
+  };
+
+  function onlyIssue(result: Validated<unknown>, code: string): void {
+    expect(codes(result)).toEqual([code]);
+    if (result.ok) return;
+    for (const i of result.issues) {
+      for (const leaked of [SECRET_FIELD, "dacs-archival-unit", OTHER, ORG]) {
+        expect(i.message).not.toContain(leaked);
+        expect(i.path.map(String)).not.toContain(leaked);
+      }
+    }
+  }
+
+  afterEach(() => {
+    delete (Object.prototype as Record<string, unknown>).organizationId;
+  });
+
+  it("another organization's mapping is refused for a template with the same key, naming none of its keys", () => {
+    onlyIssue(validateDublinCoreMapping(OTHERS_MAPPING, DACS_T), "wrong_organization");
+    // Even one that would pass every other check.
+    onlyIssue(
+      validateDublinCoreMapping({ ...DACS_DUBLIN_CORE, organizationId: OTHER }, DACS_T),
+      "wrong_organization",
+    );
+  });
+
+  it("our mapping is refused for another organization's template", () => {
+    onlyIssue(validateDublinCoreMapping(DACS_M, otherTemplate()), "wrong_organization");
+  });
+
+  it("a mapping that doesn't say which organization it belongs to is refused", () => {
+    const noOrg: Record<string, unknown> = { ...OTHERS_MAPPING };
+    delete noOrg.organizationId;
+    for (const owner of [undefined, null, "", "not-an-id", 1, ORG.toUpperCase(), [ORG]]) {
+      const mapping = owner === undefined ? noOrg : { ...noOrg, organizationId: owner };
+      onlyIssue(validateDublinCoreMapping(mapping, DACS_T), "invalid_organization");
+    }
+    // The built-in preset mapping has no organization.
+    expect(codes(validateDublinCoreMapping(DACS_DUBLIN_CORE, DACS_T))).toEqual([
+      "invalid_organization",
+    ]);
+  });
+
+  it("an organizationId inherited from a polluted Object.prototype is not read", () => {
+    (Object.prototype as Record<string, unknown>).organizationId = ORG;
+    const noOrg: Record<string, unknown> = { ...DACS_M };
+    delete noOrg.organizationId;
+    expect(codes(validateDublinCoreMapping(noOrg, DACS_T))).toEqual(["invalid_organization"]);
+    expect(codes(mappingForTemplate(noOrg, DACS_T))).toEqual(["invalid_organization"]);
+  });
+
+  it("an organizationId behind a getter is never run, and refused", () => {
+    let reads = 0;
+    const mapping = {
+      template: "dacs-archival-unit",
+      entries: [{ field: SECRET_FIELD, term: "description" }],
+      get organizationId(): unknown {
+        reads++;
+        return reads === 1 ? ORG : OTHER;
+      },
+    };
+    onlyIssue(validateDublinCoreMapping(mapping, DACS_T), "invalid_organization");
+    expect(codes(mappingForTemplate(mapping, DACS_T))).toEqual(["unreadable"]);
+    expect(codes(mappingFromPreset(mapping, DACS_T))).toEqual(["unreadable"]);
+    expect(reads).toBe(0);
+  });
+
+  it("an unreadable mapping of another organization reports only the organization", () => {
+    const hostile = {
+      organizationId: OTHER,
+      template: "dacs-archival-unit",
+      entries: [{ field: SECRET_FIELD, term: "description" }],
+      get [SECRET_FIELD](): unknown {
+        return 1;
+      },
+    };
+    onlyIssue(validateDublinCoreMapping(hostile, DACS_T), "wrong_organization");
+  });
+
+  it("a preset template (no organization) can't be used to check a mapping", () => {
+    expect(codes(validateDublinCoreMapping(DACS_M, DACS_ARCHIVAL_UNIT_PRESET))).toEqual([
+      "invalid_template",
+    ]);
+    expect(codes(validateDublinCoreMapping(DACS_DUBLIN_CORE, DACS_ARCHIVAL_UNIT_PRESET))).toEqual([
+      "invalid_template",
+    ]);
+  });
+
+  it("mappingForTemplate can't move another organization's mapping onto our template", () => {
+    onlyIssue(mappingForTemplate(OTHERS_MAPPING, DACS_T), "wrong_organization");
+    onlyIssue(mappingForTemplate(DACS_M, otherTemplate()), "wrong_organization");
+    // Nor adopt a mapping with no organization: that is mappingFromPreset's job.
+    expect(codes(mappingForTemplate(DACS_DUBLIN_CORE, DACS_T))).toEqual(["invalid_organization"]);
+  });
+
+  it("mappingFromPreset refuses a mapping that already names an organization", () => {
+    for (const mapping of [OTHERS_MAPPING, DACS_M, { ...DACS_DUBLIN_CORE, organizationId: null }]) {
+      expect(codes(mappingFromPreset(mapping, DACS_T))).toEqual(["has_organization"]);
+    }
+    const hidden = { ...DACS_DUBLIN_CORE };
+    Object.defineProperty(hidden, "organizationId", { value: OTHER, enumerable: false });
+    expect(codes(mappingFromPreset(hidden, DACS_T))).toEqual(["unreadable"]);
+  });
+
+  it("mappingFromPreset gives the template's organization, never an inherited one", () => {
+    (Object.prototype as Record<string, unknown>).organizationId = OTHER;
+    const made = mappingFromPreset(DACS_DUBLIN_CORE, DACS_T);
+    expect(codes(made)).toEqual([]);
+    if (!made.ok) return;
+    expect(Object.hasOwn(made.value, "organizationId")).toBe(true);
+    expect(made.value.organizationId).toBe(ORG);
+    const theirs = mappingFromPreset(DACS_DUBLIN_CORE, otherTemplate());
+    expect(theirs.ok && theirs.value.organizationId).toBe(OTHER);
+    // Each organization's copy passes for its own template only.
+    expect(validateDublinCoreMapping(made.value, DACS_T).ok).toBe(true);
+    onlyIssue(validateDublinCoreMapping(made.value, otherTemplate()), "wrong_organization");
+  });
+
+  it("mappingFromPreset refuses a preset template", () => {
+    expect(codes(mappingFromPreset(DACS_DUBLIN_CORE, DACS_ARCHIVAL_UNIT_PRESET))).toEqual([
+      "invalid_template",
+    ]);
   });
 });

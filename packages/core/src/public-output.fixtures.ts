@@ -83,6 +83,7 @@ export function template(fields: readonly FieldDefinition[] = FIELDS, key = "out
 export const TPL = template();
 
 export const MAPPING = {
+  organizationId: ORG,
   template: "out",
   entries: [
     { field: "rights", term: "rights" },

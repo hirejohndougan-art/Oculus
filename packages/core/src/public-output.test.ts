@@ -193,6 +193,7 @@ describe("publicOutput: the three forms", () => {
 
   it("puts several fields mapped to one term together, in mapping order", () => {
     const mapping = {
+      organizationId: ORG,
       template: "out",
       entries: [
         RIGHTS_ENTRY,
@@ -212,6 +213,7 @@ describe("publicOutput: the three forms", () => {
 
   it("puts a mapped title field after the record's own title", () => {
     const mapping = {
+      organizationId: ORG,
       template: "out",
       entries: [RIGHTS_ENTRY, { field: "extent", term: "title" }],
     };
@@ -395,8 +397,12 @@ describe("publicOutput: refusals", () => {
     const item = record("object", "Left-over rights", { rights: { uri: CNE } });
     // This template has no rights field, so no valid mapping can map one: the
     // publish check runs first and says why (rights_not_mapped would follow).
-    const valid = { template: "out", entries: [{ field: "creator", term: "creator" }] };
-    const withRights = { template: "out", entries: [RIGHTS_ENTRY] };
+    const valid = {
+      organizationId: ORG,
+      template: "out",
+      entries: [{ field: "creator", term: "creator" }],
+    };
+    const withRights = { organizationId: ORG, template: "out", entries: [RIGHTS_ENTRY] };
     for (const mapping of [valid, withRights]) {
       expect(codes(out(viewOf([item], item.id, noRights), [item.id], mapping))).toEqual([
         "rights_not_public",
@@ -410,6 +416,7 @@ describe("publicOutput: refusals", () => {
     expect(
       codes(
         out(view, [view.id], {
+          organizationId: ORG,
           template: "out",
           entries: [RIGHTS_ENTRY, { field: "x", term: "title" }],
         }),
@@ -418,6 +425,7 @@ describe("publicOutput: refusals", () => {
     expect(
       codes(
         out(view, [view.id], {
+          organizationId: ORG,
           template: "out",
           entries: [{ field: "creator", term: "dc:creator" }],
         }),
@@ -480,7 +488,11 @@ describe("publicOutput: refusals", () => {
       field({ key: "dates", kind: "date", repeatable: true }),
     ]);
     const item = record("object", "Dates", { rights: { uri: CNE }, dates: ["1909", "1910/1912"] });
-    const mapping = { template: "out", entries: [RIGHTS_ENTRY, { field: "dates", term: "date" }] };
+    const mapping = {
+      organizationId: ORG,
+      template: "out",
+      entries: [RIGHTS_ENTRY, { field: "dates", term: "date" }],
+    };
     expect(ok(out(viewOf([item], item.id, tpl), [item.id], mapping)).dublinCore.date).toEqual([
       "1909",
       "1910/1912",
@@ -545,6 +557,7 @@ describe("publicOutput: the template check", () => {
     const long = `${"x".repeat(5000)}\n${"y".repeat(14)}`;
     const item = record("object", "Long", { rights: { uri: CNE }, extent: long });
     const mapping = {
+      organizationId: ORG,
       template: "out",
       entries: [RIGHTS_ENTRY, { field: "extent", term: "extent" }],
     };
@@ -618,11 +631,15 @@ describe("publicOutput: rights must be mapped", () => {
         [{ field: "rights", term: "accessRights" }],
         [],
       ]) {
-        expect(codes(out(view, [view.id], { template: "out", entries }))).toEqual([
-          "rights_not_mapped",
-        ]);
+        expect(
+          codes(out(view, [view.id], { organizationId: ORG, template: "out", entries })),
+        ).toEqual(["rights_not_mapped"]);
       }
-      const license = { template: "out", entries: [{ field: "rights", term: "license" }] };
+      const license = {
+        organizationId: ORG,
+        template: "out",
+        entries: [{ field: "rights", term: "license" }],
+      };
       expect(ok(out(view, [view.id], license)).jsonLd["dcterms:license"]).toEqual({ "@id": CNE });
     }
   });
@@ -630,7 +647,11 @@ describe("publicOutput: rights must be mapped", () => {
   it("doesn't need rights mapped for agents, places and events", () => {
     for (const kind of ["agent", "place", "event"] as const) {
       const r = record(kind, "R", { creator: "x" });
-      const mapping = { template: "out", entries: [{ field: "creator", term: "creator" }] };
+      const mapping = {
+        organizationId: ORG,
+        template: "out",
+        entries: [{ field: "creator", term: "creator" }],
+      };
       expect(out(viewOf([r], r.id), [r.id], mapping).ok).toBe(true);
     }
   });
@@ -642,7 +663,11 @@ describe("publicOutput: JSON-LD term ranges", () => {
   const lcsh = { "@id": LCSH, "rdfs:label": "Railroads" };
 
   function under(field: string, term: string) {
-    const mapping = { template: "out", entries: [RIGHTS_ENTRY, { field, term }] };
+    const mapping = {
+      organizationId: ORG,
+      template: "out",
+      entries: [RIGHTS_ENTRY, { field, term }],
+    };
     return ok(out(view, [view.id], mapping)).jsonLd[`dcterms:${term}`];
   }
 
@@ -719,6 +744,7 @@ describe("publicOutput: JSON-LD term ranges", () => {
 
   it("only ever uses its fixed keys in value nodes", () => {
     const mapping = {
+      organizationId: ORG,
       template: "out",
       entries: [
         RIGHTS_ENTRY,
@@ -875,12 +901,16 @@ describe("publicOutput: digital assets and DCMI types", () => {
     });
     const view = viewOf([asset], asset.id, { ...DIGITAL_ASSET_PRESET, organizationId: ORG });
     const o = ok(
-      publicOutput(view, DIGITAL_ASSET_DUBLIN_CORE, {
-        baseUrl: BASE,
-        accessions: accessionsFor(view),
-        published: [view.id],
-        checkers: CHECKERS,
-      }),
+      publicOutput(
+        view,
+        { ...DIGITAL_ASSET_DUBLIN_CORE, organizationId: ORG },
+        {
+          baseUrl: BASE,
+          accessions: accessionsFor(view),
+          published: [view.id],
+          checkers: CHECKERS,
+        },
+      ),
     );
     expect(o.jsonLd["@type"]).toBe("dcmitype:StillImage");
     // dcterms:type has no range, so a list choice with no URI is plain text.
@@ -897,6 +927,7 @@ describe("publicOutput: digital assets and DCMI types", () => {
     ]);
     const item = record("object", "I", { rights: { uri: CNE }, kind_code: "Sound" });
     const mapping = {
+      organizationId: ORG,
       template: "out",
       entries: [RIGHTS_ENTRY, { field: "kind_code", term: "type" }],
     };
@@ -923,7 +954,11 @@ describe("publicOutput: digital assets and DCMI types", () => {
       rights: { uri: CNE },
       kinds: ["Text", "StillImage", "other"],
     });
-    const mapping = { template: "out", entries: [RIGHTS_ENTRY, { field: "kinds", term: "type" }] };
+    const mapping = {
+      organizationId: ORG,
+      template: "out",
+      entries: [RIGHTS_ENTRY, { field: "kinds", term: "type" }],
+    };
     const o = ok(out(viewOf([item], item.id, tpl), [item.id], mapping));
     expect(o.jsonLd["@type"]).toEqual(["dcmitype:Text", "dcmitype:StillImage"]);
   });

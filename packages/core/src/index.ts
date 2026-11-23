@@ -244,8 +244,14 @@ export {
   validateDublinCoreMapping,
   presetDublinCoreMapping,
   mappingForTemplate,
+  mappingFromPreset,
 } from "./dublin-core.js";
-export type { DublinCoreTerm, DublinCoreEntry, DublinCoreMapping } from "./dublin-core.js";
+export type {
+  DublinCoreTerm,
+  DublinCoreEntry,
+  DublinCoreMapping,
+  DublinCoreMappingPreset,
+} from "./dublin-core.js";
 
 export { checkRightsValue, makeIdentifierChecker } from "./field-checkers.js";
 export { makeRecordLinkChecker } from "./record-links.js";

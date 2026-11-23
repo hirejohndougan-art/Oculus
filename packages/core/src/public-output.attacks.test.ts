@@ -36,6 +36,7 @@ import {
   idsOf,
   CHECKERS,
   RIGHTS_ENTRY,
+  ORG,
 } from "./public-output.fixtures.js";
 
 function ok(result: Validated<PublicOutput>): PublicOutput {
@@ -100,6 +101,7 @@ describe("staff values never reach any output form", () => {
     if (view === undefined) throw new Error("no view");
     // Even a mapping that maps every public field can't reach them.
     const mapAll = {
+      organizationId: ORG,
       template: "out",
       entries: [
         RIGHTS_ENTRY,
@@ -126,6 +128,7 @@ describe("staff values never reach any output form", () => {
     expect(
       codes(
         out(view, {
+          organizationId: ORG,
           template: "out",
           entries: [RIGHTS_ENTRY, { field: "donor_note", term: "description" }],
         }),
@@ -134,6 +137,7 @@ describe("staff values never reach any output form", () => {
     expect(
       codes(
         out(view, {
+          organizationId: ORG,
           template: "out",
           entries: [RIGHTS_ENTRY, { field: "left_over", term: "description" }],
         }),
@@ -149,6 +153,28 @@ describe("staff values never reach any output form", () => {
     ]);
   });
 
+  it("refuses another organization's mapping for a template with the same key (D-047)", () => {
+    const item = record("object", "I", { rights: { uri: CNE } });
+    const view = viewOf([item], item.id);
+    const other = newOrganizationId();
+    const theirs = { ...MAPPING, organizationId: other };
+    const result = out(view, theirs);
+    expect(codes(result)).toEqual(["wrong_organization"]);
+    if (!result.ok) {
+      for (const i of result.issues) {
+        for (const leaked of ['"out"', other, ORG, ...MAPPING.entries.map((e) => e.field)]) {
+          expect(i.message).not.toContain(leaked);
+        }
+      }
+    }
+    const unowned: Record<string, unknown> = { ...MAPPING };
+    delete unowned.organizationId;
+    expect(codes(out(view, unowned))).toEqual(["invalid_organization"]);
+    expect(codes(out(view, { ...MAPPING, organizationId: "not-an-id" }))).toEqual([
+      "invalid_organization",
+    ]);
+  });
+
   it("checks the mapping against the template the view was built with, not a later edit", () => {
     // The caller's template object is changed after the view is made: the
     // view's own validated copy still decides.
@@ -160,6 +186,7 @@ describe("staff values never reach any output form", () => {
     if (donor === undefined) throw new Error("no field");
     (donor as { visibility: string }).visibility = "public";
     const result = out(view, {
+      organizationId: ORG,
       template: "out",
       entries: [{ field: "donor_note", term: "description" }],
     });
@@ -174,7 +201,13 @@ describe("staff values never reach any output form", () => {
     const view = viewOf([item], item.id);
     for (const term of ["identifier", "title", "description", "subject", "relation"]) {
       const all = everything(
-        ok(out(view, { template: "out", entries: [RIGHTS_ENTRY, { field: "number", term }] })),
+        ok(
+          out(view, {
+            organizationId: ORG,
+            template: "out",
+            entries: [RIGHTS_ENTRY, { field: "number", term }],
+          }),
+        ),
       );
       expect(all).toContain("2026.015");
       expect(all).not.toContain("secret_type_code");
@@ -196,6 +229,7 @@ describe("staff identifier types never reach any output form (D-022)", () => {
     const view = viewOf([item], item.id);
     for (const term of ["identifier", "title", "description", "subject", "relation"]) {
       const result = out(view, {
+        organizationId: ORG,
         template: "out",
         entries: [RIGHTS_ENTRY, { field: "number", term }],
       });
@@ -273,7 +307,9 @@ describe("staff identifier types never reach any output form (D-022)", () => {
     const view = publicView(effective);
     if (view === undefined) throw new Error("no view");
     expect(Object.hasOwn(view.fields, "number")).toBe(false);
-    const all = everything(ok(out(view, { template: "out", entries: MAPPING.entries })));
+    const all = everything(
+      ok(out(view, { organizationId: ORG, template: "out", entries: MAPPING.entries })),
+    );
     expect(all).toContain("Public text");
     expect(all).not.toContain(SECRET);
     expect(all).not.toContain("2026.015");
@@ -477,7 +513,7 @@ describe("hostile options", () => {
   it("refuses a hostile mapping", () => {
     const proxy = new Proxy(MAPPING, {});
     expect(codes(out(view, proxy))).toEqual(["not_an_object"]);
-    const getter = { template: "out" };
+    const getter = { organizationId: ORG, template: "out" };
     Object.defineProperty(getter, "entries", { enumerable: true, get: () => MAPPING.entries });
     expect(out(view, getter).ok).toBe(false);
   });
@@ -601,7 +637,7 @@ describe("prototype pollution", () => {
     const view = viewOf([item], item.id);
     // One entry: dublin-core.ts compares entries with JSON.stringify, so a
     // polluted toJSON makes it refuse longer mappings (it fails closed).
-    const mapping = { template: "out", entries: [RIGHTS_ENTRY] };
+    const mapping = { organizationId: ORG, template: "out", entries: [RIGHTS_ENTRY] };
     const clean = ok(out(view, mapping));
     const proto = Object.prototype as Record<string, unknown>;
     proto.toJSON = () => "evil";
@@ -665,6 +701,7 @@ describe("huge inputs", () => {
       "relation",
     ] as const;
     const mapping = {
+      organizationId: ORG,
       template: "out",
       entries: [RIGHTS_ENTRY, ...keys.flatMap((f) => terms.map((term) => ({ field: f, term })))],
     };
@@ -691,6 +728,7 @@ describe("huge inputs", () => {
       "extent",
     ];
     const mapping = {
+      organizationId: ORG,
       template: "out",
       entries: [RIGHTS_ENTRY, ...terms.map((term) => ({ field: "places", term }))],
     };
@@ -698,6 +736,7 @@ describe("huge inputs", () => {
     expect(codes(out(view, mapping))).toEqual(["too_large"]);
     expect(
       out(view, {
+        organizationId: ORG,
         template: "out",
         entries: [RIGHTS_ENTRY, { field: "places", term: "spatial" }],
       }).ok,
@@ -715,6 +754,7 @@ describe("huge inputs", () => {
     const item = record("object", "Big", { rights: { uri: CNE }, ...fields });
     const view = viewOf([item], item.id, tpl);
     const mapping = {
+      organizationId: ORG,
       template: "out",
       entries: [RIGHTS_ENTRY, ...keys.map((f) => ({ field: f, term: "description" }))],
     };
@@ -767,6 +807,7 @@ describe("huge inputs", () => {
 
 describe("a parent's template changed after the view was made (security run 2026-11-21)", () => {
   const CREATOR_MAP = {
+    organizationId: ORG,
     template: "out",
     entries: [RIGHTS_ENTRY, { field: "creator", term: "creator" }],
   };
@@ -877,6 +918,7 @@ describe("a parent's template changed after the view was made (security run 2026
 
 describe("the records changed after the view was made (S-001a)", () => {
   const CREATOR_MAP = {
+    organizationId: ORG,
     template: "out",
     entries: [RIGHTS_ENTRY, { field: "creator", term: "creator" }],
   };
@@ -1000,6 +1042,7 @@ describe("the records changed after the view was made (S-001a)", () => {
 // kept view would have it.
 describe("records are published only under the template they name", () => {
   const HOLDER_MAP = {
+    organizationId: ORG,
     template: "out",
     entries: [RIGHTS_ENTRY, { field: "holder", term: "rightsHolder" }],
   };
@@ -1058,7 +1101,7 @@ describe("records are published only under the template they name", () => {
     if (view === undefined) throw new Error("no view");
     const result = publicOutput(
       view,
-      { template: "donor-records", entries: [RIGHTS_ENTRY] },
+      { organizationId: ORG, template: "donor-records", entries: [RIGHTS_ENTRY] },
       {
         baseUrl: BASE,
         accessions: accessionsFor(view),
@@ -1129,6 +1172,7 @@ describe("records are published only under the template they name", () => {
 
 describe("public output won't use another organization's records (D-019)", () => {
   const CREATOR_MAP = {
+    organizationId: ORG,
     template: "out",
     entries: [RIGHTS_ENTRY, { field: "creator", term: "creator" }],
   };
@@ -1180,7 +1224,11 @@ describe("another organization's identifier checker can't publish a staff number
   ]);
   if (!OTHER_PUBLIC.ok) throw new Error("bad fixture");
   const other = { identifier: OTHER_PUBLIC.value };
-  const MAP = { template: "out", entries: [RIGHTS_ENTRY, { field: "number", term: "identifier" }] };
+  const MAP = {
+    organizationId: ORG,
+    template: "out",
+    entries: [RIGHTS_ENTRY, { field: "number", term: "identifier" }],
+  };
 
   it("leaves the number staff in the effective record, and publishing waits", () => {
     const item = record("object", "Item", {
@@ -1244,7 +1292,11 @@ describe("a set entry that doesn't say its organization refuses the set (second 
 // D-038: numbers live in RecordIdentifiers. Each attack tries to get a
 // staff-type number, or one the record no longer holds, into output.
 describe("public output publishes only numbers the record holds (D-038)", () => {
-  const MAP = { template: "out", entries: [RIGHTS_ENTRY, { field: "number", term: "identifier" }] };
+  const MAP = {
+    organizationId: ORG,
+    template: "out",
+    entries: [RIGHTS_ENTRY, { field: "number", term: "identifier" }],
+  };
   const PUBLIC_NUMBER = { type: "accession_number", value: "2026.015" };
   interface IdSet {
     recordId: RecordId;
@@ -1372,7 +1424,11 @@ describe("public output publishes only numbers the record holds (D-038)", () => 
 // Review of T-014: a kept view must not publish a retired number, and
 // identifier sets that break their own rules are refused.
 describe("a kept view can't publish a retired number (T-014 review)", () => {
-  const MAP = { template: "out", entries: [RIGHTS_ENTRY, { field: "number", term: "identifier" }] };
+  const MAP = {
+    organizationId: ORG,
+    template: "out",
+    entries: [RIGHTS_ENTRY, { field: "number", term: "identifier" }],
+  };
   const NUMBER = { type: "accession_number", value: "2026.015" };
   const NEXT = { type: "accession_number", value: "2026.016" };
 
@@ -1423,7 +1479,7 @@ describe("a kept view can't publish a retired number (T-014 review)", () => {
     const item = record("object", "Item", { rights: { uri: CNE }, description: "A card" });
     const view = viewOf([item], item.id);
     views.set(item.id, view);
-    const map = { template: "out", entries: [RIGHTS_ENTRY] };
+    const map = { organizationId: ORG, template: "out", entries: [RIGHTS_ENTRY] };
     expect(publicOutput(view, map, options(item.id)).ok).toBe(true);
   });
 

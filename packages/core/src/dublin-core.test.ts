@@ -13,9 +13,13 @@ import {
   dublinCoreTermUri,
   isDublinCoreTerm,
   mappingForTemplate,
+  mappingFromPreset,
+  newOrganizationId,
   presetDublinCoreMapping,
+  templateFromPreset,
   validateDublinCoreMapping,
-  type DublinCoreMapping,
+  type DublinCoreMappingPreset,
+  type FieldTemplate,
   type TemplatePreset,
   type Validated,
 } from "./index.js";
@@ -24,14 +28,28 @@ function codes(result: Validated<unknown>): string[] {
   return result.ok ? [] : result.issues.map((i) => i.code);
 }
 
-const PAIRS: readonly (readonly [DublinCoreMapping, TemplatePreset])[] = [
+const PAIRS: readonly (readonly [DublinCoreMappingPreset, TemplatePreset])[] = [
   [DACS_DUBLIN_CORE, DACS_ARCHIVAL_UNIT_PRESET],
   [SPECTRUM_DUBLIN_CORE, SPECTRUM_OBJECT_PRESET],
   [DIGITAL_ASSET_DUBLIN_CORE, DIGITAL_ASSET_PRESET],
 ];
 
+const ORG = newOrganizationId();
+
+/** The organization's own copy of a preset template. */
+function own(preset: TemplatePreset): FieldTemplate {
+  const made = templateFromPreset(preset, ORG);
+  if (!made.ok) throw new Error("preset template is invalid");
+  return made.value;
+}
+
+const DACS_T = own(DACS_ARCHIVAL_UNIT_PRESET);
+const SPECTRUM_T = own(SPECTRUM_OBJECT_PRESET);
+const DACS_M = { ...DACS_DUBLIN_CORE, organizationId: ORG };
+const SPECTRUM_M = { ...SPECTRUM_DUBLIN_CORE, organizationId: ORG };
+
 function withEntries(entries: unknown): Record<string, unknown> {
-  return { template: "dacs-archival-unit", entries };
+  return { organizationId: ORG, template: "dacs-archival-unit", entries };
 }
 
 describe("Dublin Core terms", () => {
@@ -52,11 +70,11 @@ describe("Dublin Core terms", () => {
 
 describe("preset mappings", () => {
   it.each(PAIRS.map(([m, t]) => [t.key, m, t] as const))(
-    "%s mapping is valid for its preset",
+    "%s mapping is valid for an organization's copy of its preset",
     (_key, mapping, template) => {
-      const result = validateDublinCoreMapping(mapping, template);
+      const result = mappingFromPreset(mapping, own(template));
       expect(codes(result)).toEqual([]);
-      if (result.ok) expect(result.value).toEqual(mapping);
+      if (result.ok) expect(result.value).toEqual({ ...mapping, organizationId: ORG });
     },
   );
 
@@ -95,19 +113,19 @@ describe("preset mappings", () => {
   });
 
   it("a mapping a preset passes fails once the template makes that field staff-only", () => {
-    const edited = JSON.parse(JSON.stringify(DACS_ARCHIVAL_UNIT_PRESET)) as {
+    const edited = JSON.parse(JSON.stringify(DACS_T)) as {
       fields: { key: string; visibility: string }[];
     };
     for (const f of edited.fields) if (f.key === "scope_and_content") f.visibility = "staff";
-    const result = validateDublinCoreMapping(DACS_DUBLIN_CORE, edited);
+    const result = validateDublinCoreMapping(DACS_M, edited);
     expect(codes(result)).toEqual(["staff_field"]);
   });
 });
 
 describe("validateDublinCoreMapping", () => {
   it("the preset mappings leave out the fields that start as staff-only", () => {
-    const mapped = [DACS_DUBLIN_CORE, SPECTRUM_DUBLIN_CORE, DIGITAL_ASSET_DUBLIN_CORE].flatMap(
-      (m) => m.entries.map((e) => e.field),
+    const mapped = [DACS_M, SPECTRUM_M, DIGITAL_ASSET_DUBLIN_CORE].flatMap((m) =>
+      m.entries.map((e) => e.field),
     );
     for (const field of [
       "custodial_history",
@@ -132,46 +150,34 @@ describe("validateDublinCoreMapping", () => {
     ]) {
       const result = validateDublinCoreMapping(
         withEntries([{ field, term: "description" }]),
-        DACS_ARCHIVAL_UNIT_PRESET,
+        DACS_T,
       );
       expect(codes(result)).toEqual(["staff_field"]);
     }
     const spectrum = validateDublinCoreMapping(
       {
+        organizationId: ORG,
         template: "spectrum-object",
         entries: [
           { field: "valuation", term: "description" },
           { field: "credit_line", term: "contributor" },
         ],
       },
-      SPECTRUM_OBJECT_PRESET,
+      SPECTRUM_T,
     );
     expect(codes(spectrum)).toEqual(["staff_field", "staff_field"]);
   });
 
   it("refuses fields the template doesn't have, and bad keys", () => {
     expect(
-      codes(
-        validateDublinCoreMapping(
-          withEntries([{ field: "nope", term: "title" }]),
-          DACS_ARCHIVAL_UNIT_PRESET,
-        ),
-      ),
+      codes(validateDublinCoreMapping(withEntries([{ field: "nope", term: "title" }]), DACS_T)),
     ).toEqual(["unknown_field"]);
     expect(
-      codes(
-        validateDublinCoreMapping(
-          withEntries([{ field: "Bad Key", term: "title" }]),
-          DACS_ARCHIVAL_UNIT_PRESET,
-        ),
-      ),
+      codes(validateDublinCoreMapping(withEntries([{ field: "Bad Key", term: "title" }]), DACS_T)),
     ).toEqual(["invalid_field_key"]);
     expect(
       codes(
-        validateDublinCoreMapping(
-          withEntries([{ field: "constructor", term: "title" }]),
-          DACS_ARCHIVAL_UNIT_PRESET,
-        ),
+        validateDublinCoreMapping(withEntries([{ field: "constructor", term: "title" }]), DACS_T),
       ),
     ).toEqual(["invalid_field_key"]);
   });
@@ -179,20 +185,13 @@ describe("validateDublinCoreMapping", () => {
   it("refuses terms that aren't listed", () => {
     for (const term of ["Title", "dc:title", "http://purl.org/dc/terms/title", "toString", 5]) {
       expect(
-        codes(
-          validateDublinCoreMapping(
-            withEntries([{ field: "date", term }]),
-            DACS_ARCHIVAL_UNIT_PRESET,
-          ),
-        ),
+        codes(validateDublinCoreMapping(withEntries([{ field: "date", term }]), DACS_T)),
       ).toEqual(["unknown_term"]);
     }
   });
 
   it("refuses a mapping for another template", () => {
-    expect(
-      codes(validateDublinCoreMapping(SPECTRUM_DUBLIN_CORE, DACS_ARCHIVAL_UNIT_PRESET)),
-    ).toContain("wrong_template");
+    expect(codes(validateDublinCoreMapping(SPECTRUM_M, DACS_T))).toContain("wrong_template");
   });
 
   it("refuses duplicate entries but allows two fields on one term", () => {
@@ -200,43 +199,34 @@ describe("validateDublinCoreMapping", () => {
       { field: "date", term: "date" },
       { field: "date", term: "date" },
     ]);
-    expect(codes(validateDublinCoreMapping(dup, DACS_ARCHIVAL_UNIT_PRESET))).toEqual(["duplicate"]);
+    expect(codes(validateDublinCoreMapping(dup, DACS_T))).toEqual(["duplicate"]);
     const two = withEntries([
       { field: "date", term: "date" },
       { field: "bulk_date", term: "date" },
     ]);
-    expect(validateDublinCoreMapping(two, DACS_ARCHIVAL_UNIT_PRESET).ok).toBe(true);
+    expect(validateDublinCoreMapping(two, DACS_T).ok).toBe(true);
   });
 
   it("refuses unknown properties and wrong shapes", () => {
+    expect(codes(validateDublinCoreMapping({ ...DACS_M, extra: 1 }, DACS_T))).toEqual([
+      "unknown_property",
+    ]);
     expect(
       codes(
-        validateDublinCoreMapping({ ...DACS_DUBLIN_CORE, extra: 1 }, DACS_ARCHIVAL_UNIT_PRESET),
+        validateDublinCoreMapping(withEntries([{ field: "date", term: "date", uri: "x" }]), DACS_T),
       ),
     ).toEqual(["unknown_property"]);
-    expect(
-      codes(
-        validateDublinCoreMapping(
-          withEntries([{ field: "date", term: "date", uri: "x" }]),
-          DACS_ARCHIVAL_UNIT_PRESET,
-        ),
-      ),
-    ).toEqual(["unknown_property"]);
-    expect(
-      codes(validateDublinCoreMapping(withEntries("date"), DACS_ARCHIVAL_UNIT_PRESET)),
-    ).toEqual(["required"]);
-    expect(
-      codes(validateDublinCoreMapping(withEntries(["date"]), DACS_ARCHIVAL_UNIT_PRESET)),
-    ).toEqual(["not_an_object"]);
+    expect(codes(validateDublinCoreMapping(withEntries("date"), DACS_T))).toEqual(["required"]);
+    expect(codes(validateDublinCoreMapping(withEntries(["date"]), DACS_T))).toEqual([
+      "not_an_object",
+    ]);
     for (const bad of [null, "x", [], 1]) {
-      expect(codes(validateDublinCoreMapping(bad, DACS_ARCHIVAL_UNIT_PRESET))).toEqual([
-        "not_an_object",
-      ]);
+      expect(codes(validateDublinCoreMapping(bad, DACS_T))).toEqual(["not_an_object"]);
     }
   });
 
   it("allows an empty mapping (nothing published as Dublin Core)", () => {
-    expect(validateDublinCoreMapping(withEntries([]), DACS_ARCHIVAL_UNIT_PRESET).ok).toBe(true);
+    expect(validateDublinCoreMapping(withEntries([]), DACS_T).ok).toBe(true);
   });
 
   it("limits the number of entries", () => {
@@ -244,29 +234,23 @@ describe("validateDublinCoreMapping", () => {
       field: "date",
       term: "date",
     }));
-    expect(codes(validateDublinCoreMapping(withEntries(many), DACS_ARCHIVAL_UNIT_PRESET))).toEqual([
-      "too_many",
-    ]);
+    expect(codes(validateDublinCoreMapping(withEntries(many), DACS_T))).toEqual(["too_many"]);
   });
 
   it("fails closed on an invalid template", () => {
-    for (const template of [null, {}, { ...DACS_ARCHIVAL_UNIT_PRESET, fields: [] }]) {
-      expect(codes(validateDublinCoreMapping(DACS_DUBLIN_CORE, template))).toEqual([
-        "invalid_template",
-      ]);
+    for (const template of [null, {}, { ...DACS_T, fields: [] }]) {
+      expect(codes(validateDublinCoreMapping(DACS_M, template))).toEqual(["invalid_template"]);
     }
-    const noVisibility = JSON.parse(JSON.stringify(DACS_ARCHIVAL_UNIT_PRESET)) as {
+    const noVisibility = JSON.parse(JSON.stringify(DACS_T)) as {
       fields: Record<string, unknown>[];
     };
     for (const f of noVisibility.fields) delete f.visibility;
-    expect(codes(validateDublinCoreMapping(DACS_DUBLIN_CORE, noVisibility))).toEqual([
-      "invalid_template",
-    ]);
+    expect(codes(validateDublinCoreMapping(DACS_M, noVisibility))).toEqual(["invalid_template"]);
   });
 
   it("returns a frozen copy, not the caller's object", () => {
     const input = withEntries([{ field: "date", term: "date" }]);
-    const result = validateDublinCoreMapping(input, DACS_ARCHIVAL_UNIT_PRESET);
+    const result = validateDublinCoreMapping(input, DACS_T);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.value).not.toBe(input);
@@ -276,7 +260,7 @@ describe("validateDublinCoreMapping", () => {
 });
 
 describe("mappingForTemplate", () => {
-  function copyOf(preset: TemplatePreset, key: string) {
+  function copyOf(preset: FieldTemplate, key: string) {
     const copy = JSON.parse(JSON.stringify(preset)) as {
       key: string;
       fields: { key: string; visibility: string }[];
@@ -286,34 +270,30 @@ describe("mappingForTemplate", () => {
   }
 
   it("a preset mapping fails for a copy with a new key, and works once re-targeted", () => {
-    const copy = copyOf(SPECTRUM_OBJECT_PRESET, "my-objects");
-    expect(codes(validateDublinCoreMapping(SPECTRUM_DUBLIN_CORE, copy))).toEqual([
-      "wrong_template",
-    ]);
-    const result = mappingForTemplate(SPECTRUM_DUBLIN_CORE, copy);
+    const copy = copyOf(SPECTRUM_T, "my-objects");
+    expect(codes(validateDublinCoreMapping(SPECTRUM_M, copy))).toEqual(["wrong_template"]);
+    const result = mappingForTemplate(SPECTRUM_M, copy);
     expect(codes(result)).toEqual([]);
     if (!result.ok) return;
     expect(result.value.template).toBe("my-objects");
-    expect(result.value.entries).toEqual(SPECTRUM_DUBLIN_CORE.entries);
+    expect(result.value.entries).toEqual(SPECTRUM_M.entries);
     expect(Object.isFrozen(result.value)).toBe(true);
   });
 
   it("still refuses fields the copy made staff-only or removed", () => {
-    const copy = copyOf(SPECTRUM_OBJECT_PRESET, "my-objects");
+    const copy = copyOf(SPECTRUM_T, "my-objects");
     for (const f of copy.fields) if (f.key === "materials") f.visibility = "staff";
     copy.fields = copy.fields.filter((f) => f.key !== "makers");
-    expect(codes(mappingForTemplate(SPECTRUM_DUBLIN_CORE, copy)).sort()).toEqual([
+    expect(codes(mappingForTemplate(SPECTRUM_M, copy)).sort()).toEqual([
       "staff_field",
       "unknown_field",
     ]);
   });
 
   it("still reports unknown properties, and fails closed on bad input", () => {
-    const copy = copyOf(DACS_ARCHIVAL_UNIT_PRESET, "my-units");
-    expect(codes(mappingForTemplate({ ...DACS_DUBLIN_CORE, extra: 1 }, copy))).toEqual([
-      "unknown_property",
-    ]);
-    expect(codes(mappingForTemplate(DACS_DUBLIN_CORE, { ...copy, fields: [] }))).toEqual([
+    const copy = copyOf(DACS_T, "my-units");
+    expect(codes(mappingForTemplate({ ...DACS_M, extra: 1 }, copy))).toEqual(["unknown_property"]);
+    expect(codes(mappingForTemplate(DACS_M, { ...copy, fields: [] }))).toEqual([
       "invalid_template",
     ]);
     for (const bad of [null, [], "x", new Proxy({ entries: [] }, {})]) {
@@ -335,12 +315,14 @@ describe("mappingForTemplate", () => {
   });
 
   it("ignores entries on a polluted Object.prototype", () => {
-    const copy = copyOf(DACS_ARCHIVAL_UNIT_PRESET, "my-units");
+    const copy = copyOf(DACS_T, "my-units");
     (Object.prototype as Record<string, unknown>).entries = [
       { field: "acquisition_source", term: "description" },
     ];
     try {
-      expect(codes(mappingForTemplate({ template: "x" }, copy))).toEqual(["required"]);
+      expect(codes(mappingForTemplate({ organizationId: ORG, template: "x" }, copy))).toEqual([
+        "required",
+      ]);
     } finally {
       delete (Object.prototype as Record<string, unknown>).entries;
     }

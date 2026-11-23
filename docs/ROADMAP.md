@@ -190,8 +190,14 @@ Database:
 - [x] T-019a **Organizations on templates and record types.** deps: T-019 (risky)
   - `organizationId` on templates (and record types, T-013); `effectiveRecord`, `templateChanges` and `publicOutput` refuse another organization's template; `indexTemplates` refuses a mixed registry.
   - Done (D-030 "Templates"): templates carry a required `organizationId`; every path that picks a record's template refuses another organization's; presets stay organization-free and `templateFromPreset` makes an organization's copy. Record types get theirs in T-013.
-- [ ] T-019b **Organizations on vocabularies, terms, rights settings and Dublin Core mappings.** deps: T-019 (risky)
+- [~] T-019b **Organizations on vocabularies, terms, rights settings and Dublin Core mappings.** deps: T-019 (risky)
   - From the T-019a review: a Dublin Core mapping is matched to a template by key only, so one organization's mapping passes for another's template with the same key. Nothing private can be published that way (every entry must be a public field of the target template), but mappings should carry an `organizationId` like everything else.
+  - Split: in `packages/core` today only Dublin Core mappings are organization data. Vocabularies (`VOCABULARIES`) and rights terms (`RIGHTS_TERMS`) are built-in standard lists, controlled terms are stored inside records (which carry an `organizationId`), and there are no rights settings stored as data yet.
+- [x] T-019b1 **Organizations on Dublin Core mappings.** deps: T-019a (risky)
+  - `organizationId` on `DublinCoreMapping`; `validateDublinCoreMapping`, `mappingForTemplate` and `publicOutput` refuse another organization's mapping without naming its keys; the built-in mappings become organization-free presets with `mappingFromPreset` to make an organization's copy, like `templateFromPreset`.
+  - Done (D-047); independent review: safe.
+- [ ] T-019b2 **Organizations on local term lists and rights settings.** deps: T-019b1, T-027 (risky)
+  - When local vocabularies, stored authority terms (T-027) or per-organization rights settings become stored data, give each a required `organizationId` and refuse mixed or unowned sets, as D-030 does.
 - [ ] T-019d **Site passwords.** deps: T-019, T-023 (risky)
   - How a password-protected site (D-019) stores its password and rate-limits attempts; needs the Phase 2 password decision.
 - [ ] T-012a **Follow-ups from T-012 and T-005a.** deps: T-012, T-005a
