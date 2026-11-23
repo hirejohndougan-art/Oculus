@@ -644,16 +644,10 @@ describe("publicOutput: JSON-LD term ranges", () => {
     ]);
   });
 
-  it("never writes a term's URI as dcterms:type: LCSH concepts aren't classes", () => {
-    expect(under("subjects", "type")).toEqual([
-      { "rdfs:label": "Railroads" },
-      { "rdfs:label": "Parks" },
-    ]);
-    expect(under("website", "type")).toEqual({ "rdfs:label": "https://example.org/station" });
-  });
-
   it("writes terms with no range as an IRI node for a URI, otherwise text", () => {
+    // dcterms:type declares no range in DCMI Metadata Terms (2020-01-20).
     for (const term of [
+      "type",
       "subject",
       "source",
       "relation",
@@ -821,7 +815,8 @@ describe("publicOutput: digital assets and DCMI types", () => {
       }),
     );
     expect(o.jsonLd["@type"]).toBe("dcmitype:StillImage");
-    expect(o.jsonLd["dcterms:type"]).toEqual({ "rdfs:label": "Still image" });
+    // dcterms:type has no range, so a list choice with no URI is plain text.
+    expect(o.jsonLd["dcterms:type"]).toBe("Still image");
     expect(o.dublinCore.type).toEqual(["http://purl.org/dc/dcmitype/StillImage", "Still image"]);
     expect(o.oaiDcXml).toContain("<dc:type>http://purl.org/dc/dcmitype/StillImage</dc:type>");
     expect(o.oaiDcXml).toContain("<dc:type>Still image</dc:type>");

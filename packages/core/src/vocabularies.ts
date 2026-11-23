@@ -25,10 +25,21 @@
  *   couldn't be reached from the build sandbox, so its term URI form is not
  *   confirmed. Only the site is checked: a URI must be on nomenclature.info
  *   (the address AASLH gives for the online Nomenclature), with no port of
- *   its own, and not the bare site root.
+ *   its own, and not the bare site root. Tried again on 2026-11-23 (T-009a):
+ *   nomenclature.info still couldn't be read. Secondary sources (the BARTOC
+ *   vocabulary registry and an archived copy of the Nomenclature ontology)
+ *   give `https://nomenclature.info/nom/` as the vocabulary's URI, but no
+ *   concept URI from the issuer, so the check is not tightened on that.
  * - `gnis`: the USGS Geographic Names Information System. The USGS sites
  *   couldn't be reached either, so a GNIS URI is checked only as a web
- *   address (by the template check), not against a pattern.
+ *   address (by the template check), not against a pattern. On 2026-11-23
+ *   the USGS "Domestic Names" page could be read: it links the search
+ *   application (edits.nationalmap.gov/apps/gaz-domestic) and says features
+ *   have a "unique Feature ID", but gives no URL or URI form for a feature,
+ *   and the application's help page couldn't be read, so this is unchanged.
+ *
+ * `findLcTermsWithoutUri` (term-uri-report.ts) lists LC terms stored with no
+ * URI, for Data Cleaning.
  * - `local`: the organization's own terms. They have no URI yet.
  *
  * Rules (D-014): a term with no vocabulary is a local term and can't have a

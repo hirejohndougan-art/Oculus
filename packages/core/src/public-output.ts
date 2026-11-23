@@ -72,8 +72,7 @@
  *   `dublin-core.ts`. Each term is written according to its range in DCMI
  *   Metadata Terms (`RANGE`): literal-range terms get text only (a URL is
  *   a plain string); class-range terms get `{"@id"}` for a URI, otherwise a
- *   node `{"rdfs:label"}` (and `type` always a label node, since a
- *   vocabulary concept is not a class); terms with no range get `{"@id"}`
+ *   node `{"rdfs:label"}`; terms with no range (`type` among them) get `{"@id"}`
  *   for a URI and text otherwise. `jsonLdText` also writes `<`, `>`, `&`,
  *   U+2028 and U+2029 as escapes, so it can sit inside a
  *   `<script type="application/ld+json">` element.
@@ -225,6 +224,13 @@ const TYPE_FOR: ReadonlyMap<RecordKind, string> = new Map<RecordKind, string>([
  * declare no range, are treated as literal), `class` (a non-literal class
  * such as Agent, Location or RightsStatement) or `any` (no range declared;
  * values are often other resources).
+ *
+ * Checked against https://www.dublincore.org/specifications/dublin-core/dcmi-terms/
+ * (DCMI Recommendation, 2020-01-20) on 2026-11-23: every "Has Range" and
+ * "Range Includes" below matches. `type` declares no range there (an
+ * earlier version of this table gave it a class range), so it is `any`:
+ * a term's URI, such as an LCGFT or Nomenclature concept, goes out as
+ * `{"@id"}`, as DCMI recommends a controlled vocabulary for it.
  */
 type Range = "literal" | "class" | "any";
 
@@ -241,7 +247,6 @@ const RANGE: ReadonlyMap<DublinCoreTerm, Range> = new Map<DublinCoreTerm, Range>
   ["contributor", "class"],
   ["publisher", "class"],
   ["rightsHolder", "class"],
-  ["type", "class"],
   ["format", "class"],
   ["extent", "class"],
   ["medium", "class"],
@@ -254,6 +259,7 @@ const RANGE: ReadonlyMap<DublinCoreTerm, Range> = new Map<DublinCoreTerm, Range>
   ["license", "class"],
   ["provenance", "class"],
   ["subject", "any"],
+  ["type", "any"],
   ["source", "any"],
   ["relation", "any"],
   ["isPartOf", "any"],
@@ -1163,7 +1169,7 @@ function jsonLdDocument(
   else if (types.length > 1) pairs.push(["@type", Object.freeze([...types])]);
   for (const [term, values] of terms) {
     const range = RANGE.get(term) ?? "literal";
-    const items = values.map((v) => jsonLdValue(term, range, v));
+    const items = values.map((v) => jsonLdValue(range, v));
     const [only] = items;
     pairs.push([
       `dcterms:${term}`,
@@ -1174,10 +1180,9 @@ function jsonLdDocument(
   return nullObject(pairs);
 }
 
-function jsonLdValue(term: DublinCoreTerm, range: Range, value: OutValue): JsonValue {
+function jsonLdValue(range: Range, value: OutValue): JsonValue {
   if (range === "literal") return value.text;
-  // A vocabulary concept or a web page is not a class, so `type` never takes an IRI here.
-  const iri = term === "type" ? undefined : value.iri;
+  const iri = value.iri;
   if (iri === undefined) {
     return range === "class" ? nullObject([["rdfs:label", value.text]]) : value.text;
   }
