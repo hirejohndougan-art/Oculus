@@ -42,7 +42,7 @@ import { randomUUID } from "node:crypto";
 import { types } from "node:util";
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import { isOrganizationId, mixedOrganizationsIssue, type OrganizationId } from "./organizations.js";
-import { IssueList, type JsonValue } from "./plain-data.js";
+import { IssueList, shown, type JsonValue } from "./plain-data.js";
 import { isRecordId, type RecordId } from "./record-id.js";
 import {
   MAX_STORAGE_NOTE_LENGTH,
@@ -740,7 +740,7 @@ function checkItems(
         issues.add(
           ["items", j, key],
           "unknown_property",
-          `${JSON.stringify(key.slice(0, 60))} is not a property of a loan ${direction} item.`,
+          `${shown(key)} is not a property of a loan ${direction} item.`,
         );
       }
     }
