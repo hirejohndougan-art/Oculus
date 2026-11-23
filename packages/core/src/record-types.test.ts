@@ -11,6 +11,7 @@ import {
   isRecordTypeRegistry,
   newOrganizationId,
   recordTypeDefaults,
+  recordTypeTemplateIssues,
   templateFromPreset,
   validateRecord,
   validateRecordType,
@@ -301,11 +302,10 @@ describe("indexRecordTypes and recordTypeDefaults", () => {
   });
 
   it("gives what a new record of a type starts with", () => {
-    const d = recordTypeDefaults(types(), "oral-history");
+    const d = recordTypeDefaults(types(), "oral-history", ORG);
     expect(d).toEqual({
       ok: true,
       value: {
-        organizationId: ORG,
         kind: "digital_asset",
         recordTypeKey: "oral-history",
         templateKey: "oral-history",
@@ -314,7 +314,13 @@ describe("indexRecordTypes and recordTypeDefaults", () => {
     if (!d.ok) return;
     expect(Object.isFrozen(d.value)).toBe(true);
     const made = createRecord(
-      { ...d.value, kind: "digital_asset", title: "Interview", mediaType: "audio/wav" },
+      {
+        organizationId: ORG,
+        ...d.value,
+        kind: "digital_asset",
+        title: "Interview",
+        mediaType: "audio/wav",
+      },
       new Date(T),
     );
     expect(made.ok).toBe(true);
@@ -322,11 +328,73 @@ describe("indexRecordTypes and recordTypeDefaults", () => {
   });
 
   it("refuses an unknown key, a bad key and a registry it didn't make", () => {
-    expect(codes(recordTypeDefaults(types(), "letters"))).toEqual(["unknown_record_type"]);
-    expect(codes(recordTypeDefaults(types(), "constructor"))).toEqual(["invalid_record_type_key"]);
-    expect(codes(recordTypeDefaults({ size: 1 }, "oral-history"))).toEqual([
+    expect(codes(recordTypeDefaults(types(), "letters", ORG))).toEqual(["unknown_record_type"]);
+    expect(codes(recordTypeDefaults(types(), "constructor", ORG))).toEqual([
+      "invalid_record_type_key",
+    ]);
+    expect(codes(recordTypeDefaults({ size: 1 }, "oral-history", ORG))).toEqual([
       "no_record_type_registry",
     ]);
+    expect(codes(recordTypeDefaults(types(), "oral-history", "nope" as never))).toEqual([
+      "invalid_organization",
+    ]);
+  });
+});
+
+describe("recordTypeTemplateIssues", () => {
+  const photo = {
+    key: "photograph",
+    organizationId: ORG,
+    label: "Photograph",
+    kind: "object",
+    defaultTemplateKey: "photos",
+  };
+
+  it("is empty when every type's default template is fine", () => {
+    const tr = templates(template(), template("photos", ["object"]));
+    expect(recordTypeTemplateIssues([oralHistory(), photo], tr)).toEqual({ ok: true, value: [] });
+  });
+
+  it("lists the types a template deletion or rename breaks, and keeps the others", () => {
+    // The registry as it would be after "photos" is deleted or renamed.
+    const after = templates(template(), template("pictures", ["object"]));
+    const r = recordTypeTemplateIssues([oralHistory(), photo], after);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.value).toHaveLength(1);
+    expect(r.value[0]).toMatchObject({ index: 1, key: "photograph" });
+    expect(r.value[0]?.issues.map((i) => i.code)).toEqual(["unknown_template"]);
+    expect(Object.isFrozen(r.value)).toBe(true);
+    expect(Object.isFrozen(r.value[0])).toBe(true);
+    // indexRecordTypes refuses the same list as a whole.
+    expect(indexRecordTypes([oralHistory(), photo], after).ok).toBe(false);
+  });
+
+  it("lists the types whose template no longer applies to their kind", () => {
+    const narrowed = templates(template("oral-history", ["object"]));
+    const r = recordTypeTemplateIssues([oralHistory()], narrowed);
+    expect(r.ok && r.value[0]?.issues.map((i) => i.code)).toEqual(["template_wrong_kind"]);
+  });
+
+  it("reports invalid types and repeated keys, with the key when it is valid", () => {
+    const r = recordTypeTemplateIssues(
+      [oralHistory(), oralHistory(), oralHistory({ key: "Bad", label: "" })],
+      templates(),
+    );
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.value.map((p) => [p.index, p.key, p.issues.map((i) => i.code)])).toEqual([
+      [1, "oral-history", ["duplicate_key"]],
+      [2, undefined, ["invalid_key", "invalid_label"]],
+    ]);
+    expect(Object.hasOwn(r.value[1] ?? {}, "key")).toBe(false);
+  });
+
+  it("needs a template registry and a list", () => {
+    expect(codes(recordTypeTemplateIssues([oralHistory()], template() as never))).toEqual([
+      "no_template_registry",
+    ]);
+    expect(codes(recordTypeTemplateIssues("x", templates()))).toEqual(["not_a_list"]);
   });
 });
 

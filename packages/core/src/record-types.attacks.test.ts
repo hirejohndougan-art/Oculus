@@ -8,7 +8,9 @@ import {
   indexRecordTypes,
   indexTemplates,
   newOrganizationId,
+  createRecord,
   recordTypeDefaults,
+  recordTypeTemplateIssues,
   validateRecord,
   validateRecordType,
   type CatalogRecord,
@@ -220,7 +222,7 @@ describe("getters and Proxies", () => {
         return "oral-history";
       },
     };
-    expect(codes(recordTypeDefaults(registry(ORG), key))).toEqual(["invalid_record_type_key"]);
+    expect(codes(recordTypeDefaults(registry(ORG), key, ORG))).toEqual(["invalid_record_type_key"]);
     expect(ran).toBe(0);
   });
 });
@@ -239,7 +241,9 @@ describe("prototype keys", () => {
       expect(
         codes(validateRecordType(type(ORG, { defaultTemplateKey: key }), templates(ORG))),
       ).toContain("invalid_template_key");
-      expect(codes(recordTypeDefaults(registry(ORG), key))).toEqual(["invalid_record_type_key"]);
+      expect(codes(recordTypeDefaults(registry(ORG), key, ORG))).toEqual([
+        "invalid_record_type_key",
+      ]);
     }
     const input = JSON.parse(
       `{"key":"oral-history","organizationId":"${ORG}","label":"Oral history","kind":"digital_asset","defaultTemplateKey":"oral-history","__proto__":{"kind":"object"}}`,
@@ -272,7 +276,9 @@ describe("prototype keys", () => {
   });
 
   it("a type keyed like an Object method isn't found by inheritance", () => {
-    expect(codes(recordTypeDefaults(registry(ORG), "tostring"))).toEqual(["unknown_record_type"]);
+    expect(codes(recordTypeDefaults(registry(ORG), "tostring", ORG))).toEqual([
+      "unknown_record_type",
+    ]);
     expect(
       codes(checkRecordType(record(ORG, { recordTypeKey: "hasownproperty" }), registry(ORG))),
     ).toEqual(["unknown_record_type"]);
@@ -342,9 +348,87 @@ describe("mixed organizations", () => {
     expect(messages(mismatch)).not.toContain(SECRET);
   });
 
-  it("recordTypeDefaults gives the type's own organization", () => {
-    const d = recordTypeDefaults(registry(OTHER, [type(OTHER)]), "oral-history");
-    expect(d.ok && d.value.organizationId).toBe(OTHER);
+  it("recordTypeDefaults refuses another organization's registry before looking up the key", () => {
+    const theirs = registry(OTHER, [type(OTHER)]);
+    expect(codes(recordTypeDefaults(theirs, "oral-history", ORG))).toEqual(["wrong_organization"]);
+    const unknown = recordTypeDefaults(theirs, SECRET, ORG);
+    expect(codes(unknown)).toEqual(["wrong_organization"]);
+    expect(messages(unknown)).not.toContain(SECRET);
+    expect(recordTypeDefaults(theirs, "oral-history", OTHER).ok).toBe(true);
+  });
+
+  it("spreading the defaults can't move a new record into another organization", () => {
+    // The review's attack: the caller's organization first, the defaults spread after.
+    const theirs = registry(OTHER, [type(OTHER)]);
+    expect(recordTypeDefaults(theirs, "oral-history", ORG).ok).toBe(false);
+    // Even for the right registry, the defaults hold no organization to override with.
+    const d = recordTypeDefaults(registry(ORG), "oral-history", ORG);
+    if (!d.ok) throw new Error("bad fixture");
+    expect(Object.hasOwn(d.value, "organizationId")).toBe(false);
+    const made = createRecord(
+      {
+        organizationId: ORG,
+        ...d.value,
+        kind: "digital_asset",
+        title: "Interview",
+        mediaType: "audio/wav",
+      },
+      new Date(T),
+    );
+    expect(made.ok && made.value.organizationId).toBe(ORG);
+  });
+
+  it("recordTypeTemplateIssues refuses mixed lists and another organization's templates, quoting nothing", () => {
+    const mixed = recordTypeTemplateIssues(
+      [type(ORG), type(OTHER, { key: SECRET, defaultTemplateKey: SECRET })],
+      templates(ORG),
+    );
+    expect(codes(mixed)).toEqual(["mixed_organizations"]);
+    expect(messages(mixed)).not.toContain(SECRET);
+    const wrong = recordTypeTemplateIssues([type(ORG)], templates(OTHER, SECRET));
+    expect(codes(wrong)).toEqual(["wrong_organization"]);
+    expect(messages(wrong)).not.toContain(SECRET);
+  });
+});
+
+describe("recordTypeTemplateIssues attacks", () => {
+  it("never runs a getter slot or a getter key, and refuses Proxies", () => {
+    let ran = 0;
+    const list: unknown[] = [type(ORG)];
+    Object.defineProperty(list, 1, {
+      enumerable: true,
+      get() {
+        ran += 1;
+        return type(ORG, { key: "b" });
+      },
+    });
+    const r = recordTypeTemplateIssues(list, templates(ORG));
+    // A getter slot reads as an entry with no organization.
+    expect(codes(r)).toEqual(["mixed_organizations"]);
+    const keyed = type(ORG, { defaultTemplateKey: "missing" });
+    Object.defineProperty(keyed, "key", {
+      enumerable: true,
+      get() {
+        ran += 1;
+        return "oral-history";
+      },
+    });
+    const k = recordTypeTemplateIssues([keyed], templates(ORG));
+    expect(k.ok).toBe(true);
+    if (k.ok) expect(Object.hasOwn(k.value[0] ?? {}, "key")).toBe(false);
+    expect(ran).toBe(0);
+    expect(codes(recordTypeTemplateIssues(new Proxy([type(ORG)], {}), templates(ORG)))).toEqual([
+      "not_a_list",
+    ]);
+    const p = recordTypeTemplateIssues([new Proxy(type(ORG), {})], templates(ORG));
+    expect(codes(p)).toEqual(["mixed_organizations"]);
+  });
+
+  it("never throws", () => {
+    for (const h of [undefined, null, 1, "x", {}, [null], [7]]) {
+      expect(() => recordTypeTemplateIssues(h, templates(ORG))).not.toThrow();
+      expect(() => recordTypeTemplateIssues([type(ORG)], h as never)).not.toThrow();
+    }
   });
 });
 
@@ -374,8 +458,8 @@ describe("never throws", () => {
       expect(() => indexRecordTypes([h], templates(ORG))).not.toThrow();
       expect(() => checkRecordType(h as never, registry(ORG))).not.toThrow();
       expect(() => checkRecordType(record(), h as never)).not.toThrow();
-      expect(() => recordTypeDefaults(h as never, "oral-history")).not.toThrow();
-      expect(() => recordTypeDefaults(registry(ORG), h)).not.toThrow();
+      expect(() => recordTypeDefaults(h as never, "oral-history", ORG)).not.toThrow();
+      expect(() => recordTypeDefaults(registry(ORG), h, ORG)).not.toThrow();
     }
   });
 });

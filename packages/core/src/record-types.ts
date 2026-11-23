@@ -20,7 +20,9 @@
  * organization (`wrong_organization`) that applies to the type's kind
  * (`template_wrong_kind`): `validateRecordType` checks both, against the
  * organization's template registry or the one template. `indexRecordTypes`
- * refuses a list naming two organizations (`mixed_organizations`).
+ * refuses a list naming two organizations (`mixed_organizations`), and any
+ * type whose default template is missing or doesn't fit, so after a template
+ * edit `recordTypeTemplateIssues` lists which types need fixing.
  *
  * **How a record uses its type.** A record names its type in
  * `recordTypeKey` (records.ts). The type is a label and a starting point:
@@ -86,7 +88,6 @@ export interface RecordType {
 
 /** What `recordTypeDefaults` gives for a new record of a type. */
 export interface RecordTypeDefaults {
-  readonly organizationId: OrganizationId;
   readonly kind: RecordKind;
   readonly recordTypeKey: string;
   readonly templateKey: string;
@@ -321,37 +322,12 @@ export function indexRecordTypes(
   templates: TemplateRegistry,
 ): Validated<RecordTypeRegistry> {
   try {
-    if (!isTemplateRegistry(templates)) {
-      return refused(
-        [],
-        "no_template_registry",
-        "Record types are checked against the organization's templates: give a registry from indexTemplates.",
-      );
-    }
-    if (types.isProxy(recordTypes) || !Array.isArray(recordTypes)) {
-      return refused([], "not_a_list", "The record types must be given as a list.");
-    }
-    const length = recordTypes.length;
-    if (length > MAX_RECORD_TYPES) {
-      return refused(
-        [],
-        "too_many",
-        `A registry can hold at most ${String(MAX_RECORD_TYPES)} record types.`,
-      );
-    }
-    // Read each slot once, as a plain data property, so a getter can't run
-    // and every later step sees the same entries.
-    const items: unknown[] = [];
-    for (let i = 0; i < length; i += 1) {
-      const slot = Object.getOwnPropertyDescriptor(recordTypes, i);
-      items.push(slot !== undefined && "value" in slot ? slot.value : undefined);
-    }
-    if (oneOrganization(items) === "mixed") {
-      return { ok: false, issues: [mixedOrganizationsIssue([], "These record types")] };
-    }
+    const read = readTypeList(recordTypes, templates);
+    if (!read.ok) return read;
+    const items = read.value;
     const byKey = new Map<string, RecordType>();
     const issues = new IssueList();
-    for (let i = 0; i < length && !issues.full; i += 1) {
+    for (let i = 0; i < items.length && !issues.full; i += 1) {
       const checked = validateRecordType(items[i], templates);
       if (!checked.ok) {
         for (const found of checked.issues)
@@ -387,16 +363,94 @@ export function isRecordTypeRegistry(value: unknown): value is RecordTypeRegistr
   return typeof value === "object" && value !== null && REGISTRIES.has(value);
 }
 
+/** One record type whose default template no longer works, from `recordTypeTemplateIssues`. */
+export interface RecordTypeProblem {
+  /** Where it is in the list given. */
+  readonly index: number;
+  /** Its key, when it has a valid one. */
+  readonly key?: string;
+  /** Every problem found with it, paths relative to the type. */
+  readonly issues: readonly Issue[];
+}
+
 /**
- * What a new record of the type `key` starts with: its organization, kind,
- * `recordTypeKey` and `templateKey` (the type's default template), from a
- * registry from `indexRecordTypes`, so the template was checked to exist and
- * fit. Spread it into `createRecord` with the kind's own properties (a
+ * Which of an organization's record types `indexRecordTypes` would refuse,
+ * each with its problems, so an admin screen can show which types need
+ * fixing instead of one refusal for the whole list. The usual cause is a
+ * template change: a default template deleted or renamed
+ * (`unknown_template`), or no longer applying to the type's kind
+ * (`template_wrong_kind`). Run it with the template registry as it would be
+ * after a template edit to see which types the edit breaks. A key used twice
+ * is reported on the later type (`duplicate_key`). The list itself must be
+ * one organization's, as must the templates (`mixed_organizations`,
+ * `wrong_organization`, refusing the whole check, so nothing of another
+ * organization is ever listed). An empty list means every type is fine.
+ * Never throws.
+ */
+export function recordTypeTemplateIssues(
+  recordTypes: unknown,
+  templates: TemplateRegistry,
+): Validated<readonly RecordTypeProblem[]> {
+  try {
+    const read = readTypeList(recordTypes, templates);
+    if (!read.ok) return read;
+    const items = read.value;
+    const seen = new Set<string>();
+    const out: RecordTypeProblem[] = [];
+    for (let i = 0; i < items.length; i += 1) {
+      const checked = validateRecordType(items[i], templates);
+      if (checked.ok) {
+        const key = checked.value.key;
+        if (seen.has(key)) {
+          out.push(
+            Object.freeze({
+              index: i,
+              key,
+              issues: Object.freeze([
+                Object.freeze(
+                  issue(
+                    ["key"],
+                    "duplicate_key",
+                    `More than one record type has the key ${shown(key)}.`,
+                  ),
+                ),
+              ]),
+            }),
+          );
+        }
+        seen.add(key);
+        continue;
+      }
+      const key = ownKey(items[i]);
+      out.push(
+        Object.freeze({
+          index: i,
+          ...(key !== undefined ? { key } : {}),
+          issues: Object.freeze(checked.issues.map((found) => Object.freeze(found))),
+        }),
+      );
+    }
+    return { ok: true, value: Object.freeze(out) };
+  } catch {
+    return refused([], "unreadable", "The record types could not be read as plain data.");
+  }
+}
+
+/**
+ * What a new record of the type `key` starts with: its kind, `recordTypeKey`
+ * and `templateKey` (the type's default template), from a registry from
+ * `indexRecordTypes`, so the template was checked to exist and fit. The
+ * registry must be the organization the new record is for,
+ * `organizationId` (`wrong_organization`, checked before the key is looked
+ * up). The result holds no `organizationId`, so spreading it into
+ * `createRecord` next to the caller's own can never change which
+ * organization the record is made in. Add the kind's own properties (a
  * digital asset's `mediaType`, say). Never throws.
  */
 export function recordTypeDefaults(
   registry: RecordTypeRegistry,
   key: unknown,
+  organizationId: OrganizationId,
 ): Validated<RecordTypeDefaults> {
   try {
     const entry = isRecordTypeRegistry(registry) ? REGISTRIES.get(registry) : undefined;
@@ -405,6 +459,20 @@ export function recordTypeDefaults(
         [],
         "no_record_type_registry",
         "Give the organization's record types as a registry from indexRecordTypes.",
+      );
+    }
+    if (!isOrganizationId(organizationId)) {
+      return refused(
+        ["organizationId"],
+        "invalid_organization",
+        "Say which organization the new record is for: organizationId must be an organization ID.",
+      );
+    }
+    if (entry.organizationId !== undefined && entry.organizationId !== organizationId) {
+      return refused(
+        ["organizationId"],
+        "wrong_organization",
+        "These record types belong to another organization than the new record. Each organization uses only its own record types.",
       );
     }
     if (!isRecordTypeKey(key)) {
@@ -418,10 +486,17 @@ export function recordTypeDefaults(
         `There is no record type with the key ${shown(key)}.`,
       );
     }
+    if (type.organizationId !== organizationId) {
+      // A registry holds one organization's types, so this is a second line.
+      return refused(
+        ["organizationId"],
+        "wrong_organization",
+        "This record type belongs to another organization than the new record.",
+      );
+    }
     return {
       ok: true,
       value: Object.freeze({
-        organizationId: type.organizationId,
         kind: type.kind,
         recordTypeKey: type.key,
         templateKey: type.defaultTemplateKey,
@@ -430,6 +505,61 @@ export function recordTypeDefaults(
   } catch {
     return refused([], "unreadable", "The record type could not be read.");
   }
+}
+
+/**
+ * Read a caller's list of record types for `indexRecordTypes` and
+ * `recordTypeTemplateIssues`: a template registry is required, the list must
+ * be a real array of at most `MAX_RECORD_TYPES`, each slot is read once as a
+ * plain data property (no getter runs, every later step sees the same
+ * entries), the entries must name one organization, and the templates must
+ * be that organization's.
+ */
+function readTypeList(recordTypes: unknown, templates: unknown): Validated<readonly unknown[]> {
+  if (!isTemplateRegistry(templates)) {
+    return refused(
+      [],
+      "no_template_registry",
+      "Record types are checked against the organization's templates: give a registry from indexTemplates.",
+    );
+  }
+  if (types.isProxy(recordTypes) || !Array.isArray(recordTypes)) {
+    return refused([], "not_a_list", "The record types must be given as a list.");
+  }
+  const length = recordTypes.length;
+  if (length > MAX_RECORD_TYPES) {
+    return refused(
+      [],
+      "too_many",
+      `At most ${String(MAX_RECORD_TYPES)} record types can be used at once.`,
+    );
+  }
+  const items: unknown[] = [];
+  for (let i = 0; i < length; i += 1) {
+    const slot = Object.getOwnPropertyDescriptor(recordTypes, i);
+    items.push(slot !== undefined && "value" in slot ? slot.value : undefined);
+  }
+  const owner = oneOrganization(items);
+  if (owner === "mixed") {
+    return { ok: false, issues: [mixedOrganizationsIssue([], "These record types")] };
+  }
+  const templateOwner = templateRegistryOrganization(templates);
+  if (owner !== undefined && templateOwner !== undefined && templateOwner !== owner) {
+    return refused(
+      [],
+      "wrong_organization",
+      "These templates belong to another organization than the record types. Each organization uses only its own templates.",
+    );
+  }
+  return { ok: true, value: items };
+}
+
+/** An entry's own `key`, read as a plain data property, when it is a valid key. */
+function ownKey(item: unknown): string | undefined {
+  if (typeof item !== "object" || item === null || types.isProxy(item)) return undefined;
+  const slot = Object.getOwnPropertyDescriptor(item, "key");
+  const value: unknown = slot !== undefined && "value" in slot ? slot.value : undefined;
+  return isRecordTypeKey(value) ? value : undefined;
 }
 
 // ---------------------------------------------------------------------------
