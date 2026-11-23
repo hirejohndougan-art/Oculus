@@ -2,7 +2,7 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
-## 2026-11-23 17:50 CT — manual (John: "continue") — T-026 Schema: identifiers, with uniqueness the database enforces
+## 2026-11-23 17:20 CT — manual (John: "continue") — T-026 Schema: identifiers, with uniqueness the database enforces
 - Result: done
 - What changed: migration `0003_identifiers.sql`: identifier types per organization; holdings carrying the type's uniqueness rule (copied by trigger, kept current by a cascading foreign key, adopted by a trigger when a type is created); partial unique indexes on `(organization_id, type_key, key)` for `current` and `all_time`; current and former value tables; auto-number counters. `packages/db/src/identifiers.ts`: saves write holdings in sorted order then release; allocation under counter and type-key locks; bucketed advisory locks (64 per organization); Read Committed only; lenient reads; clean `not_unique`, `retry` and `read_committed_required` issues.
 - Decisions: D-061
