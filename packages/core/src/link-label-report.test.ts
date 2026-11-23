@@ -319,3 +319,17 @@ describe("findStaleLinkLabels attacks", () => {
     expect(result.truncated).toBe(true);
   });
 });
+
+describe("findStaleLinkLabels: another organization's invalid records (T-015a review)", () => {
+  it("refuses a set of another organization's invalid records, naming nothing", () => {
+    const other = newOrganizationId();
+    const invalid = { ...record("agent", "Roe, Jane", {}, { organizationId: other }), title: "" };
+    const result = findStaleLinkLabels(ORG, [invalid], REGISTRY);
+    expect(codes(result)).toEqual(["wrong_organization"]);
+    const text = JSON.stringify(result);
+    for (const leak of [other, invalid.id, "Roe"]) expect(text).not.toContain(leak);
+    expect(codes(findStaleLinkLabels(ORG, ok(indexRecords([invalid])), REGISTRY))).toEqual([
+      "wrong_organization",
+    ]);
+  });
+});

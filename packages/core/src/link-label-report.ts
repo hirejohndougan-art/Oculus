@@ -36,10 +36,9 @@
  */
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
 import { types } from "node:util";
-import { isOrganizationId, type OrganizationId } from "./organizations.js";
+import { isOrganizationId } from "./organizations.js";
 import { isRecordId, type RecordId } from "./record-id.js";
-import type { CatalogRecord } from "./records.js";
-import { isTemplateSource, recordsById, templateFromSource } from "./effective.js";
+import { isTemplateSource, recordSet, templateFromSource } from "./effective.js";
 import { isTemplateRegistry, templateRegistryOrganization } from "./templates.js";
 
 /** One link whose label differs from the linked record's current title. */
@@ -155,10 +154,15 @@ function report(
     const owner = templateRegistryOrganization(templates);
     if (owner !== undefined && owner !== organizationId) return WRONG_ORGANIZATION("templates");
   }
-  const found = recordsById(recordsInput);
+  const found = recordSet(recordsInput);
   if (!found.ok) return refuse(["records"], found.issues[0]?.code ?? "unreadable", READ_FAILED);
-  const byId = found.value;
-  if (!oneOrganization(byId, organizationId)) return WRONG_ORGANIZATION("records");
+  // The set's organization is read from every entry, valid or not, so
+  // another organization's invalid records are refused too.
+  const set = found.value;
+  if (set.organizationId !== undefined && set.organizationId !== organizationId) {
+    return WRONG_ORGANIZATION("records");
+  }
+  const byId = set.byId;
 
   const entries: StaleLinkLabel[] = [];
   const skipped: SkippedLinkRecord[] = [];
@@ -227,19 +231,6 @@ function report(
 
 const READ_FAILED =
   "The records could not be read as one organization's set. Check them with indexRecords.";
-
-/** True when every valid record in the set is `organizationId`'s (an empty set is). */
-function oneOrganization(
-  byId: ReadonlyMap<RecordId, CatalogRecord | undefined>,
-  organizationId: OrganizationId,
-): boolean {
-  // indexRecords refuses a set mixing organizations, so the first readable
-  // record decides; every one is checked anyway, at no real cost.
-  for (const record of byId.values()) {
-    if (record !== undefined && record.organizationId !== organizationId) return false;
-  }
-  return true;
-}
 
 function normal(text: string): string {
   return text.normalize("NFC").replace(/\s+/gu, " ").trim();
