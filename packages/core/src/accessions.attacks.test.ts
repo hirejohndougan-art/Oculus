@@ -694,3 +694,29 @@ describe("hostile input to the register", () => {
     expect(validateAccession(accession({ records: many })).ok).toBe(false);
   });
 });
+
+describe("the register's record link checker (T-015a review)", () => {
+  it("refuses a set of another organization's invalid records as mixed, naming nothing", () => {
+    const invalid = { ...donor, organizationId: OTHER, title: "" };
+    const r = indexAccessions(ORG, {
+      accessions: [accession()],
+      records: [invalid],
+      identifierTypes: TYPES,
+    });
+    expect(codes(r)).toEqual(["mixed_organizations"]);
+    const text = JSON.stringify(r);
+    for (const leak of [OTHER, SECRET.donor, donor.id]) expect(text).not.toContain(leak);
+  });
+
+  it("gives unknown_record, not no_organization_checker, when no record is valid", () => {
+    for (const records of [[], [{ ...donor, title: "" }]]) {
+      const r = indexAccessions(ORG, {
+        accessions: [accession()],
+        records,
+        identifierTypes: TYPES,
+      });
+      expect(codes(r)).toContain("unknown_record");
+      expect(codes(r)).not.toContain("no_organization_checker");
+    }
+  });
+});
