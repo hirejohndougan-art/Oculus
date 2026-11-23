@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-23 20:00 CT — manual (John: "do a long building") — S-012 Loan link reads use own properties; S-013 deferred
+- Result: S-012 done; S-013 attempt 1 not merged (joins the loans redesign with T-018a)
+- What changed: `readTop` in storage.ts returns frozen prototype-free copies at every depth (storage, loans, condition checks); loans read item links through `ownLink`, so a polluted `Object.prototype` can't link a departure and hide an overdue loan. S-013's `unlinked_arrival` rule (branch `autopilot/S-012`, b623eb9) was reviewed: still hideable in five ways and too many false positives; it is redesigned together with T-018a.
+- Decisions: none (D-044 amendment held back with S-013)
+- Review: independent; S-012 safe, S-013 not.
+- Gate: PASS · tests_passing 3175 (was 3171) · npm audit clean
+- Next: T-025 Schema: records, templates and record types (fixes in second review)
+
 ## 2026-11-23 19:00 CT — manual (John: "do a long building") — T-022a The HTTP layer on Fastify
 - Result: done
 - What changed: `packages/api` (D-058) on Fastify 5.12.8, its only runtime dependency (`@fastify/cookie` dropped because its writer parsed every cookie). App routes are plain objects checked once and frozen; handlers get a frozen request view (never Fastify, `raw` or the socket), an `AbortSignal`, and may return only plain data or text within size caps; every throw or rejection is rebuilt as a fresh `Refusal` (400-599) or a plain 500, and late failures are logged by Oculus; handlers may set only allowlisted headers and Oculus cookies through one `__Host-` writer; exact JSON and form parsers (depth, duplicate keys, non-finite numbers, strict UTF-8), byte-counted limits (1 MiB, 8 KiB on credential routes), path refusals, 404/405 before handlers, Origin checked against `OCULUS_ORIGINS`, trusted proxies limited, security headers (nosniff, no-referrer, CSP, no-store) on every reply including Node and router errors, and logs holding method and path only.
