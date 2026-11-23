@@ -153,8 +153,9 @@ The data model in TypeScript, written for any archive or museum rather than one 
   - Restrictions are free text today and hold nothing back. Add structured ones (closed until a date; staff and researchers only, as in the Log an accession mockup) that hold records back like an unsigned deed.
 - [ ] T-018a **Loan follow-ups.** deps: T-018, T-016
   - A borrowed item that becomes the organization's (bought or given) needs a link from an accession to close its loan in. Link a condition check's `loanId` to the loan book and warn when a loan out goes without a recent fit check. Valuation, insurance and authoriser fields.
-- [ ] T-013a **Record type edits checked against records.** deps: T-013
+- [x] T-013a **Record type edits checked against records.** deps: T-013
   - Editing a record type's kind or key, or deleting it, should list the records that use it first, as `templateChanges` does for templates; optionally a `recordTypes` input on `templateChanges`.
+  - Done: `recordTypeChanges` and `recordTypeDeletion` (record-type-changes.ts, D-053) report `key_changed`, `key_adopts_records`, `kind_changed`, `type_deleted` and `unverified` (no `existing`) with record IDs, organization checked first; attack tests. The optional `recordTypes` input on `templateChanges` was left out (`recordTypeTemplateIssues` covers it).
 - [ ] T-015a **Link follow-ups.** deps: T-015
   - `templateChanges` should report a narrowed `recordKinds` with the records whose links no longer fit; a report of link labels that no longer match the linked record's name.
 - [ ] S-007 **Messages in `publicOutput` issues.** (risky) deps: T-014

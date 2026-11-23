@@ -162,8 +162,12 @@ export function validateRecordType(
   }
 }
 
-/** The shape checks only, without the default template. Never throws. */
-function readRecordType(input: unknown): Validated<RecordType> {
+/**
+ * The shape checks only, without the default template. Never throws. For
+ * other modules in this package (record-type-changes.ts); not exported from
+ * the package.
+ */
+export function readRecordType(input: unknown): Validated<RecordType> {
   try {
     if (types.isProxy(input) || !isPlainObject(input)) {
       return refused([], "not_an_object", "A record type must be a plain object.");
