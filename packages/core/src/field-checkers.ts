@@ -190,17 +190,18 @@ export function makeIdentifierChecker(identifierTypes: unknown): Validated<Field
         ]);
       }
       if (own(field, "visibility") !== "staff" && !publicKeys.has(type.key)) {
-        // The message names the type's key, not its label: a checker's
-        // message travels with the value it refused, into another record's
-        // notes when a value is inherited (effective.ts) and into the
-        // issues `publicOutput` returns, and an organization's own wording
-        // for a staff type ("Donor file number (Maude Nelson bequest)") is
-        // staff business. The key is what an admin screen needs to find the
-        // type and mark it public.
+        // The message names neither the type's label nor its key: a
+        // checker's message travels with the value it refused, into another
+        // record's notes when a value is inherited (effective.ts) and into
+        // the issues `publicOutput` returns, and an organization's own
+        // wording for a staff type ("Donor file number, Maude Nelson
+        // bequest") is staff business. The path points at the value's
+        // `type`, which is where the admin reads the key it must mark
+        // public, so nothing is lost by leaving it out.
         return problems([
           {
             code: "private_identifier_type",
-            message: `This number's identifier type (${shown(type.key)}) is staff only, so it can't go in ${shown(field.label)}, which is public. Mark the type public, or use a staff field.`,
+            message: `This number's identifier type is staff only, so it can't go in ${shown(field.label)}, which is public. Mark the type public, or use a staff field.`,
             path: ["type"],
           },
         ]);

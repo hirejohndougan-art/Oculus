@@ -1,8 +1,11 @@
 /**
- * TEST REFERENCE ONLY, not built or exported: `term-duplicates.ts` exactly as
- * it was before S-005a (commit 9a21c6c), kept so the tests can show the
- * faster code finds the very same pairs on randomized inputs. Don't change
- * it; the module comment below describes the code as it was.
+ * TEST REFERENCE ONLY: `term-duplicates.ts` exactly as it was before S-005a
+ * (commit 9a21c6c), kept so the tests can show the faster code finds the
+ * very same pairs on randomized inputs and on the hostile 50,000-term
+ * shapes. It is left out of the build (`tsconfig.build.json` excludes every
+ * `.fixtures.ts` file under `src`) and `index.ts` doesn't export it, so
+ * nothing ships two copies of this code. Don't change it; the module
+ * comment below describes the code as it was.
  *
  * Finding terms that may be duplicates, for Data Cleaning (decision D-014).
  *

@@ -3,6 +3,7 @@
 import { describe, expect, it } from "vitest";
 import {
   MAX_DUPLICATE_TERMS,
+  MAX_PAIR_SET_TERMS,
   controlledTermChecker,
   findNearDuplicateTerms,
   normalizeTermUri,
@@ -11,6 +12,7 @@ import {
   type CatalogRecord,
   type FieldDefinition,
 } from "./index.js";
+import { findNearDuplicateTerms as referenceFind } from "./term-duplicates.fixtures.js";
 
 const HURRICANES = "http://id.loc.gov/authorities/subjects/sh85063195";
 
@@ -330,13 +332,67 @@ describe("near-duplicate detection can't be overloaded", () => {
     expect(r.limits).not.toContain("spelling_budget");
   });
 
-  it("is fast on 44-letter keys from two letters", slow, () => {
-    // S-005a: about 3.2–4 s before (mostly the edit distance of ~700,000
-    // pairs, the set of ~4.9 million pair visits and the abbreviation pass);
-    // about 1.5–1.9 s now on the same machine, with the same pairs found.
-    const r = timed(randomWords(9, allWords("ab", 4), 11));
-    expect(r.found).toBeGreaterThan(0);
+  // S-005a. The shapes that took longest, each compared with the code as it
+  // was before S-005a (term-duplicates.fixtures.ts) on the same 50,000
+  // terms, in the same process: the whole report must be identical (so no
+  // pair is lost and the limits are reported the same, budgets included),
+  // and the new code must be clearly faster. The ratio is what is asserted,
+  // not the seconds: a loaded machine slows both runs alike, while a wall
+  // clock bound either passes for the old code too or turns flaky.
+  const against = (terms: unknown[]): { ratio: number; ms: number; limits: readonly string[] } => {
+    const before = Date.now();
+    const old = referenceFind(terms, { maxCandidates: 10_000 });
+    const oldMs = Math.max(1, Date.now() - before);
+    const start = Date.now();
+    const now = findNearDuplicateTerms(terms, { maxCandidates: 10_000 });
+    const ms = Date.now() - start;
+    expect(now).toEqual(old);
+    if (!now.ok) throw new Error(JSON.stringify(now.issues));
+    return { ratio: ms / oldMs, ms, limits: now.value.limitsReached };
+  };
+
+  it("is fast on 44-letter keys from two letters, and finds the same pairs", slow, () => {
+    // About 3.2-4 s before (mostly the edit distance of ~700,000 pairs, the
+    // set of ~4.9 million pair visits and the abbreviation pass); about
+    // 1.5-1.9 s now on the machine this was measured on, under the 2 s
+    // target. The same ~455 pairs are found.
+    const r = against(randomWords(9, allWords("ab", 4), 11));
+    expect(r.ratio).toBeLessThan(0.8);
     expect(r.ms).toBeLessThan(5000);
+  });
+
+  it("finds the same pairs when every key has the same four letters", slow, () => {
+    const r = against(randomWords(7, allWords("bcdf", 3), 6));
+    expect(r.ratio).toBeLessThan(0.9);
+  });
+
+  it("reaches the same limits when the spelling budget runs out", slow, () => {
+    const r = against(
+      Array.from({ length: N }, (_, i) => ({ label: `${tag(i)} ${shared}`.slice(0, 500) })),
+    );
+    expect(r.limits).toContain("spelling_budget");
+    expect(r.limits).toContain("candidates");
+  });
+
+  it("stops the abbreviation check at the same place", slow, () => {
+    // The shape from term-duplicates.test.ts: every run of words has
+    // initials that are a word some label uses.
+    const runs = "aa aaa aaaa aaaaa aaaaaa aaaaaaa aaaaaaaa";
+    const r = against([
+      { label: runs },
+      ...Array.from({ length: 12_000 }, (_, i) => ({
+        label: `${"alpha ".repeat(11)}a${String.fromCharCode(97 + (i % 26), 97 + (Math.floor(i / 26) % 26), 97 + (Math.floor(i / 676) % 26))}`,
+      })),
+    ]);
+    expect(r.limits).toContain("abbreviation_budget");
+  });
+
+  it("holds pairs of positions as numbers only while the term limit allows it", () => {
+    // The spelling check's set of visited pairs keeps a pair of positions as
+    // one 32-bit number, so raising MAX_DUPLICATE_TERMS past this needs a
+    // different set, not a bigger limit.
+    expect(MAX_DUPLICATE_TERMS).toBeLessThanOrEqual(MAX_PAIR_SET_TERMS);
+    expect(MAX_PAIR_SET_TERMS ** 2 - MAX_PAIR_SET_TERMS - 1).toBeLessThan(2 ** 32 - 1);
   });
 
   it("doesn't run out of memory on labels that unfold to many characters", () => {

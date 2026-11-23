@@ -149,8 +149,17 @@ export interface DuplicateOptions {
   readonly maxCandidates?: number;
 }
 
-/** The most terms one call reads. */
+/**
+ * The most terms one call reads. It must stay at or below
+ * `MAX_PAIR_SET_TERMS`, which a test checks: the spelling check's set of
+ * visited pairs holds a pair of positions as one 32-bit number.
+ */
 export const MAX_DUPLICATE_TERMS = 50_000;
+/**
+ * The most terms `PairSet` can hold pairs of: a pair of positions below n is
+ * at most n² - n - 1, which must be below 2^32 - 1.
+ */
+export const MAX_PAIR_SET_TERMS = 65_536;
 export const DEFAULT_DUPLICATE_CANDIDATES = 500;
 export const MAX_DUPLICATE_CANDIDATES = 10_000;
 /**
@@ -1182,8 +1191,8 @@ function bitCount(x: number): number {
 class PairSet {
   /**
    * Each pair is one number, lower × n + higher, which is below n² and so
-   * below 2^32 for n up to 65,535; stored as its 32 bits, so the empty
-   * mark -1 (2^32 - 1) is never a pair.
+   * at most n² - n - 1 and so below 2^32 - 1 (the empty mark -1 as 32 bits)
+   * for n up to MAX_PAIR_SET_TERMS; stored as its 32 bits.
    */
   private table = new Int32Array(1 << 12).fill(-1);
   private size = 0;
@@ -1195,7 +1204,9 @@ class PairSet {
   private readonly near: Int32Array;
 
   constructor(private readonly n: number) {
-    if (n > 65_535) throw new RangeError("PairSet holds positions below 65,535.");
+    if (n > MAX_PAIR_SET_TERMS) {
+      throw new RangeError(`PairSet holds at most ${String(MAX_PAIR_SET_TERMS)} terms.`);
+    }
     this.near = new Int32Array(n * (NEAR / 32));
   }
 

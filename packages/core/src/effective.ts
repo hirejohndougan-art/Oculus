@@ -984,17 +984,17 @@ function dropUnfit(
     }
     return { unfit, unsure };
   };
-  let { unfit, unsure } = check();
+  const first = check();
   // An identifier value inherited as public whose only problem is a number
   // of a staff only type (a mistake on the unit it came from, which can't be
-  // published until it is fixed) is kept for staff (S-006a): it is checked
+  // published until it is fixed) is kept for staff (D-041): it is checked
   // again as staff, so every number's format is still checked, and if that
   // passes it is kept, marked staff, so neither the staff-type number nor
   // the rest of the list reaches the public view.
   const madeStaff = new Set<string>();
-  if (!unsure) {
+  if (!first.unsure) {
     for (const c of inherited) {
-      const found = unfit.get(c.key);
+      const found = first.unfit.get(c.key);
       if (
         c.visibility === "public" &&
         template.fields.some((f) => f.key === c.key && f.kind === "identifier") &&
@@ -1004,17 +1004,21 @@ function dropUnfit(
         staffHere.add(c.key);
       }
     }
-    if (madeStaff.size > 0) ({ unfit, unsure } = check());
   }
+  // Only the keys made staff are judged by the second check; every other key
+  // keeps the first check's answer, so loosening one field can't drop a
+  // value that already passed.
+  const asStaff = madeStaff.size > 0 ? check() : undefined;
   const kept: Candidate[] = [];
   for (const c of candidates) {
     if (c.from === 0) {
       kept.push(c);
       continue;
     }
-    const why = unsure
+    const result = madeStaff.has(c.key) && asStaff !== undefined ? asStaff : first;
+    const why = result.unsure
       ? "it could not be checked against this record's template."
-      : unfit.get(c.key)?.[0]?.message;
+      : result.unfit.get(c.key)?.[0]?.message;
     const checked = ownField(probeFields, c.key);
     if (why === undefined && checked === c.value) {
       // Keep exactly the value that was checked.
