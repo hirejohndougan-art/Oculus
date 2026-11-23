@@ -6,7 +6,16 @@ import { describe, expect, it } from "vitest";
 import { dbRules } from "../eslint.db-rules.js";
 
 const linter = new Linter({ configType: "flat" });
-const config = [{ files: ["**/*.ts"], languageOptions: { parser: tseslint.parser } }, ...dbRules];
+const config = [
+  {
+    files: ["**/*.{ts,mts,cts,tsx}"],
+    languageOptions: {
+      parser: tseslint.parser,
+      parserOptions: { ecmaFeatures: { jsx: true } },
+    },
+  },
+  ...dbRules,
+];
 
 function problems(code, filename) {
   return linter.verify(code, config, { filename }).map((m) => m.ruleId ?? m.message);
@@ -46,6 +55,17 @@ describe("pg stays inside packages/db", () => {
     }
   });
 
+  it("covers .mts, .cts and .tsx files", () => {
+    for (const file of [
+      "packages/core/src/example.mts",
+      "packages/core/src/example.cts",
+      "packages/admin/src/Example.tsx",
+    ]) {
+      expect(problems('import pg from "pg";', file), file).toContain("no-restricted-imports");
+      expect(problems('client.query("x");', file), file).toContain("no-restricted-syntax");
+    }
+  });
+
   it("covers plain JavaScript files too", () => {
     expect(problems('import pg from "pg";', "scripts/example.mjs")).toContain(
       "no-restricted-imports",
@@ -73,6 +93,12 @@ describe(".query() only in client.ts, and sql only as a tag", () => {
     expect(problems(code, OUTSIDE)).toEqual(["no-restricted-syntax", "no-restricted-syntax"]);
     expect(problems(code, INSIDE)).toEqual(["no-restricted-syntax", "no-restricted-syntax"]);
     expect(problems(code, CLIENT)).toEqual([]);
+  });
+
+  it("refuses .query() reached by a computed name", () => {
+    for (const code of ['client["query"]("DROP TABLE t");', "client['query'](x);"]) {
+      expect(problems(code, OUTSIDE), code).toEqual(["no-restricted-syntax"]);
+    }
   });
 
   it("refuses calling sql as a function, even in client.ts", () => {

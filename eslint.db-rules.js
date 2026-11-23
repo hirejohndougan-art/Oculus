@@ -4,6 +4,11 @@
 //   values made by the `sql` tag;
 // - `sql` is only ever used as a tag, never called with a made-up array.
 // Exported on their own so scripts/eslint-db-rules.test.mjs can check them.
+//
+// These are a guardrail that catches mistakes, not the security boundary: code
+// can always reach a function in ways lint can't see. The real guard is at run
+// time: client.ts sends only values made by the `sql` tag (a private-field
+// check), always with the extended protocol.
 
 const DRIVER = "^(?:pg|pg-[a-z0-9-]+|pgpass|postgres|postgres-[a-z0-9-]+|@types/pg)(?:/.*)?$";
 // The same pattern inside an esquery selector, where "/" ends the regex.
@@ -28,7 +33,8 @@ const dynamicDriverImports = [
 
 const queryCalls = [
   {
-    selector: "CallExpression[callee.property.name='query']",
+    selector:
+      "CallExpression[callee.property.name='query'], CallExpression[callee.property.value='query']",
     message:
       "Only packages/db/src/client.ts calls .query(); write queries with the sql tag and run them through @oculus/db (D-050).",
   },
@@ -46,7 +52,7 @@ const sqlCalls = [
   },
 ];
 
-const CODE = ["**/*.ts", "**/*.js", "**/*.mjs", "**/*.cjs"];
+const CODE = ["**/*.{ts,mts,cts,tsx,js,mjs,cjs,jsx}"];
 
 export const dbRules = [
   {
