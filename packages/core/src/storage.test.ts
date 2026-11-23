@@ -406,8 +406,13 @@ describe("whereabouts", () => {
     expect(w?.normal).toBeNull();
     expect(w?.away).toBe(true);
     expect(w?.expectedReturnOn).toBe("2026-11-01");
+    // Its first placement gives it a home but doesn't end the digitization's
+    // due date: only a return does (review fix).
     const placed = ok(addMove(log, move(tape, box1.id, "2026-11-22", "placement")));
-    expect(ok(whereabouts(placed, tape))?.away).toBe(false);
+    expect(ok(whereabouts(placed, tape))?.away).toBe(true);
+    expect(ok(whereabouts(placed, tape))?.expectedReturnOn).toBe("2026-11-01");
+    const home = ok(withMove(placed, move(tape, box1.id, "2026-11-22", "return"), NOW));
+    expect(ok(whereabouts(home, tape))?.away).toBe(false);
     const parked = ok(indexMoves(idx, [move(tape, shelfB.id, "2026-11-20", "correction")]));
     expect(ok(whereabouts(parked, tape))?.away).toBe(false);
   });
@@ -436,7 +441,8 @@ describe("whereabouts", () => {
   });
 
   it("rehousing changes the normal location", () => {
-    const next = ok(addMove(log, move(print, shelfB.id, "2026-11-22", "rehousing")));
+    const back = ok(addMove(log, move(print, box1.id, "2026-11-21", "return")));
+    const next = ok(addMove(back, move(print, shelfB.id, "2026-11-22", "rehousing")));
     const w = ok(whereabouts(next, print));
     expect(w?.normalLabel).toBe("Archive room › Shelf B");
     expect(w?.away).toBe(false);
@@ -463,6 +469,44 @@ describe("whereabouts", () => {
       ),
     );
     expect(ok(whereabouts(later, deed))?.expectedReturnOn).toBe("2027-01-05");
+  });
+
+  it("a correction or new home while out doesn't clear the due date; a return does (review fix)", () => {
+    // The deed is out at the conservator, due 2026-10-31, overdue on 2026-11-23.
+    const hidings = [
+      move(deed, folder1.id, "2026-11-22", "correction"),
+      move(deed, shelfB.id, "2026-11-22", "placement"),
+      move(deed, shelfB.id, "2026-11-22", "rehousing"),
+      move(deed, folder1.id, "2026-11-22", "other"),
+    ];
+    for (const hiding of hidings) {
+      const next = ok(addMove(log, hiding));
+      const w = ok(whereabouts(next, deed));
+      expect(w?.away).toBe(true);
+      expect(w?.expectedReturnOn).toBe("2026-10-31");
+      expect(ok(overdueReturns(next, "2026-11-23")).map((x) => x.recordId)).toContain(deed);
+    }
+    // And with it still outstanding, it can't depart either.
+    const lender = {
+      id: newLocationId(),
+      organizationId: ORG,
+      kind: "external",
+      name: "Lender",
+    } as StorageLocation;
+    const found = [...moves, move(deed, folder1.id, "2026-11-22", "correction")];
+    expect(
+      codes(
+        indexMoves(index([...ALL, lender]), [
+          ...found,
+          move(deed, lender.id, "2026-11-23", "departure"),
+        ]),
+      ),
+    ).toEqual(["departure_while_away"]);
+    // A return to the normal location in force (the new home, after a placement) ends it.
+    const rehoused = ok(addMove(log, move(deed, shelfB.id, "2026-11-22", "placement")));
+    const back = ok(addMove(rehoused, move(deed, shelfB.id, "2026-11-23", "return")));
+    expect(ok(whereabouts(back, deed))?.away).toBe(false);
+    expect(ok(overdueReturns(back, "2026-11-24")).map((x) => x.recordId)).not.toContain(deed);
   });
 
   it("keeps the history oldest first, ordering same-day moves by when they were written", () => {
@@ -640,6 +684,38 @@ describe("departure (D-044)", () => {
     const vanish = move(lent, lender.id, "2026-11-20", "departure");
     expect(codes(indexMoves(withLender, [...moves, vanish]))).toEqual(["departure_while_away"]);
     expect(codes(addMove(before, vanish))).toEqual(["departure_while_away"]);
+  });
+
+  it("refuses a departure back-dated before an outstanding loan out (review fix)", () => {
+    const lent = newRecordId();
+    const moves = [
+      move(lent, box1.id, "2026-01-01", "placement"),
+      move(lent, conservator.id, "2026-02-01", "loan_out", { expectedReturnOn: "2026-03-01" }),
+    ];
+    const before = ok(indexMoves(withLender, moves));
+    // Dated between the placement (home) and the loan out: it would wipe the
+    // normal location while the record is out, and refuse the real return.
+    const backDated = move(lent, lender.id, "2026-01-15", "departure");
+    expect(codes(addMove(before, backDated))).toEqual(["move_after_departure"]);
+    expect(codes(indexMoves(withLender, [...moves, backDated]))).toEqual(["move_after_departure"]);
+    expect(ok(overdueReturns(before, "2026-11-20")).map((w) => w.recordId)).toEqual([lent]);
+    const back = ok(addMove(before, move(lent, box1.id, "2026-11-20", "return")));
+    expect(ok(whereabouts(back, lent))?.away).toBe(false);
+  });
+
+  it("only a placement may follow a departure (review fix)", () => {
+    const r = newRecordId();
+    const gone = [
+      move(r, box1.id, "2026-10-01", "placement"),
+      move(r, lender.id, "2026-11-10", "departure"),
+    ];
+    const log = ok(indexMoves(withLender, gone));
+    for (const reason of ["correction", "rehousing", "exhibition", "loan_out", "other"] as const) {
+      expect(codes(addMove(log, move(r, shelfB.id, "2026-11-12", reason)))).toEqual([
+        "move_after_departure",
+      ]);
+    }
+    expect(ok(addMove(log, move(r, shelfB.id, "2026-11-12", "placement"))).size).toBe(3);
   });
 
   it("departs only from inside the organization, while home (review fix)", () => {
