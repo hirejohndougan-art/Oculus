@@ -924,11 +924,13 @@ function sameOrganization(template: FieldTemplate, record: CatalogRecord): boole
   return oneOrganization([template, record]) === template.organizationId;
 }
 
-const WRONG_ORGANIZATION = (key: string) =>
+// Names no template key: the template is another organization's, and its
+// keys are that organization's business (S-008).
+const WRONG_ORGANIZATION = () =>
   issue(
     ["organizationId"],
     "wrong_organization",
-    `The template ${shown(key)} belongs to another organization than this record. Each organization uses only its own templates.`,
+    "The template belongs to another organization than this record. Each organization uses only its own templates.",
   );
 
 /**
@@ -1064,6 +1066,9 @@ export function storedTemplateKey(record: unknown): Validated<string | undefined
  * record's `templateKey` (if it has one) as its key. Either way the template
  * must belong to the record's organization (`wrong_organization`). For this module,
  * `effective.ts` and `public-output.ts` (not exported from the package).
+ * The organization is checked before any key is looked up or compared, so
+ * the answer never says which keys another organization's templates or
+ * registry hold, and no message names another organization's key (S-008).
  * Messages name template keys only, never a record's title or values.
  * Never throws.
  */
@@ -1074,6 +1079,13 @@ export function templateOfRecord(record: CatalogRecord, given: unknown): Validat
     const stored = key.value;
     const registered = isTemplateRegistry(given) ? REGISTRIES.get(given) : undefined;
     if (registered !== undefined) {
+      // A registry is one organization's templates. Refuse another
+      // organization's before looking anything up in it, so the answer
+      // doesn't depend on which keys it holds.
+      const owner = templateRegistryOrganization(given);
+      if (owner !== undefined && owner !== organizationIdOf(record)) {
+        return { ok: false, issues: [WRONG_ORGANIZATION()] };
+      }
       if (stored === undefined) {
         return refused(
           ["templateKey"],
@@ -1090,7 +1102,7 @@ export function templateOfRecord(record: CatalogRecord, given: unknown): Validat
         );
       }
       if (!sameOrganization(template, record)) {
-        return { ok: false, issues: [WRONG_ORGANIZATION(template.key)] };
+        return { ok: false, issues: [WRONG_ORGANIZATION()] };
       }
       return { ok: true, value: template };
     }
@@ -1102,15 +1114,17 @@ export function templateOfRecord(record: CatalogRecord, given: unknown): Validat
         "The template is not valid, so the record can't be checked against it. Check it with validateTemplate.",
       );
     }
+    // The organization first: a mismatch message names the template's key,
+    // which must never be another organization's (S-008).
+    if (!sameOrganization(checked.value, record)) {
+      return { ok: false, issues: [WRONG_ORGANIZATION()] };
+    }
     if (stored !== undefined && checked.value.key !== stored) {
       return refused(
         ["templateKey"],
         "template_mismatch",
         `This record follows the template ${shown(stored)}, not ${shown(checked.value.key)}, so it can't be checked against that one.`,
       );
-    }
-    if (!sameOrganization(checked.value, record)) {
-      return { ok: false, issues: [WRONG_ORGANIZATION(checked.value.key)] };
     }
     return checked;
   } catch {

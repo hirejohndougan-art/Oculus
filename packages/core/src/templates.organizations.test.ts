@@ -198,3 +198,62 @@ describe("templateChanges stays inside one organization", () => {
     expect(r.ok).toBe(false);
   });
 });
+
+// S-008 (security run 2026-11-23): another organization's template keys must
+// not be revealed by the order of the checks, nor named in a message.
+describe("another organization's template keys stay hidden (S-008)", () => {
+  const SECRET_KEY = "board-secret-donors";
+
+  function messages(issues: readonly Issue[]): string {
+    return issues.map((i) => i.message).join("\n");
+  }
+
+  it("a template given directly is refused for its organization before its key is compared", () => {
+    const theirs = template(OTHER, SECRET_KEY);
+    const issues = checkRecordAgainstTemplate(record(ORG, A, "photos"), theirs);
+    expect(codes(issues)).toEqual(["wrong_organization"]);
+    expect(messages(issues)).not.toContain(SECRET_KEY);
+  });
+
+  it("the wrong_organization message names no key, even when the keys match", () => {
+    const issues = checkRecordAgainstTemplate(
+      record(ORG, A, SECRET_KEY),
+      template(OTHER, SECRET_KEY),
+    );
+    expect(codes(issues)).toEqual(["wrong_organization"]);
+    expect(messages(issues)).not.toContain(SECRET_KEY);
+  });
+
+  it("effectiveRecord with another organization's template names no key", () => {
+    const result = effectiveRecord(record(ORG).id, [record(ORG)], () =>
+      template(OTHER, SECRET_KEY),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(codes(result.issues)).toContain("wrong_organization");
+    expect(codes(result.issues)).not.toContain("template_mismatch");
+    expect(messages(result.issues)).not.toContain(SECRET_KEY);
+  });
+
+  it("another organization's registry can't be probed for which keys it holds", () => {
+    const registry = indexTemplates([template(OTHER, "has-it"), template(OTHER, SECRET_KEY)]);
+    if (!registry.ok) throw new Error("bad fixture");
+    const held = checkRecordAgainstTemplate(record(ORG, A, "has-it"), registry.value);
+    const missing = checkRecordAgainstTemplate(record(ORG, A, "not-there"), registry.value);
+    expect(codes(held)).toEqual(["wrong_organization"]);
+    expect(codes(missing)).toEqual(["wrong_organization"]);
+    expect(messages(held)).toBe(messages(missing));
+    expect(messages(held)).not.toContain("has-it");
+  });
+
+  it("the record's own organization still gets unknown_template and template_mismatch", () => {
+    const registry = indexTemplates([template(ORG, "photos")]);
+    if (!registry.ok) throw new Error("bad fixture");
+    expect(codes(checkRecordAgainstTemplate(record(ORG, A, "letters"), registry.value))).toEqual([
+      "unknown_template",
+    ]);
+    expect(
+      codes(checkRecordAgainstTemplate(record(ORG, A, "letters"), template(ORG, "photos"))),
+    ).toEqual(["template_mismatch"]);
+  });
+});
