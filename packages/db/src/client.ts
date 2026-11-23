@@ -175,7 +175,10 @@ export function openDatabase(connectionString: string, options: DatabaseOptions 
 /** A single dedicated connection, for the migration runner (it holds a session lock). */
 export interface Session extends Queryable {
   close(): Promise<void>;
-  /** Runs `BEGIN`, `COMMIT`, `ROLLBACK` or one of the runner's savepoint statements. */
+  /**
+   * Runs `BEGIN` (or the backup's read-only snapshot `BEGIN`), `COMMIT`,
+   * `ROLLBACK` or one of the runner's savepoint statements.
+   */
   control(statement: ControlStatement): Promise<void>;
   /** @internal Runs a whole migration file (several statements) with the simple protocol. */
   runScript(text: string): Promise<void>;
@@ -190,6 +193,7 @@ export interface Session extends Queryable {
 /** The fixed transaction-control statements a session may send. */
 export type ControlStatement =
   | "BEGIN"
+  | "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY"
   | "COMMIT"
   | "ROLLBACK"
   | "SAVEPOINT oculus_migration"
