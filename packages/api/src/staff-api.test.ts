@@ -177,7 +177,7 @@ async function versionOf(id: string): Promise<number> {
 }
 
 describe("every endpoint refuses without a usable session", () => {
-  it("no session, a waiting second-step session, an expired one, a made-up token: 401", async () => {
+  it("no session, a session waiting for its second step, an expired one, a made-up token: 401", async () => {
     const target = await makeObject(w, w.a, w.a1);
     for (const e of endpoints(target.id)) {
       for (const as of [undefined, "pending", "expired", "madeup"]) {

@@ -306,7 +306,7 @@ const WRONG_ORGANIZATION = "This names another organization than the one you are
 async function publishedGate(
   tx: Queryable,
   who: Who,
-  access: Access,
+  checker: RecordAccess,
   affected: readonly RecordId[] | undefined,
   confirmed: boolean,
 ): Promise<ServiceResult<never> | undefined> {
@@ -318,9 +318,7 @@ async function publishedGate(
     );
   }
   if (affected.length === 0) return undefined;
-  if (!access.systemManager) {
-    const checker = new RecordAccess(tx, who.organizationId, access);
-    await checker.settle();
+  if (!checker.access.systemManager) {
     for (const id of affected) {
       const place = await readRecordPlace(tx, who.organizationId, id);
       const denied =
@@ -466,6 +464,11 @@ export function definitionOperations(run: Runner): DefinitionOperations {
         const valid = validateTemplate({ ...copied.value, organizationId: org });
         if (!valid.ok) return valid;
         const template = valid.value;
+        // The arrangement lock first (for scoped grants), as record saves
+        // take it before their definition locks (D-065, D-067), so the two
+        // never wait for each other in opposite orders.
+        const checker = new RecordAccess(tx, org, access.value);
+        await checker.settle();
         // Exclusive until COMMIT: record saves and publishing (shared) wait.
         await lockDefinition(tx, org, "template", template.key, true);
         const current = await readStoredTemplate(tx, org, template.key);
@@ -533,7 +536,7 @@ export function definitionOperations(run: Runner): DefinitionOperations {
             affected = await publishedAmong(tx, org, [...direct]);
           }
         }
-        const gate = await publishedGate(tx, who, access.value, affected, confirmPublished.value);
+        const gate = await publishedGate(tx, who, checker, affected, confirmPublished.value);
         if (gate) return gate;
         const notConfirmed = unconfirmed(needed, confirm.value);
         if (notConfirmed.length > 0) return { ok: false, issues: notConfirmed };
@@ -598,6 +601,10 @@ export function definitionOperations(run: Runner): DefinitionOperations {
           return refusal(["organizationId"], "wrong_organization", WRONG_ORGANIZATION);
         }
         const input = { ...copied.value, organizationId: org };
+        // The arrangement lock first (scoped grants), then the type: the
+        // order record saves take them in (D-067).
+        const checker = new RecordAccess(tx, org, access.value);
+        await checker.settle();
         if (expectedTag === null) {
           const valid = validateNewIdentifierType(input);
           if (!valid.ok) return valid;
@@ -618,7 +625,7 @@ export function definitionOperations(run: Runner): DefinitionOperations {
           // (D-031): published records holding them would show them.
           const affected =
             type.public === true ? await publishedHoldingType(tx, org, type.key) : [];
-          const gate = await publishedGate(tx, who, access.value, affected, confirmPublished.value);
+          const gate = await publishedGate(tx, who, checker, affected, confirmPublished.value);
           if (gate) return gate;
           const notConfirmedNew = unconfirmed(neededNew, confirm.value);
           if (notConfirmedNew.length > 0) return { ok: false, issues: notConfirmedNew };
@@ -661,7 +668,7 @@ export function definitionOperations(run: Runner): DefinitionOperations {
           .map((c) => ({ code: c.code, key: c.type, message: c.message }));
         const madePublic = compared.value.changes.some((c) => c.code === "made_public");
         const affected = madePublic ? await publishedHoldingType(tx, org, type.key) : [];
-        const gate = await publishedGate(tx, who, access.value, affected, confirmPublished.value);
+        const gate = await publishedGate(tx, who, checker, affected, confirmPublished.value);
         if (gate) return gate;
         const notConfirmed = unconfirmed(needed, confirm.value);
         if (notConfirmed.length > 0) return { ok: false, issues: notConfirmed };
