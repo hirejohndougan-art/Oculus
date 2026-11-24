@@ -28,8 +28,8 @@ CREATE INDEX sign_in_known_sources_signed_in ON public.sign_in_known_sources (si
 
 -- Re-entering the password in a signed-in session (reauthenticate) counts on
 -- reauth:<user ID>, not on the account counter strangers can push. The
--- "reset:" keys are T-039's (0015, D-078), kept here so that either branch
--- can merge first.
+-- "reset:" keys (and reset:source:v6 /48 network keys) are 0015's (T-039,
+-- D-078), kept as they are.
 ALTER TABLE public.sign_in_throttles DROP CONSTRAINT sign_in_throttles_key_check;
 ALTER TABLE public.sign_in_throttles ADD CONSTRAINT sign_in_throttles_key_check
-  CHECK (key ~ '^((reset:)?(account:[0-9a-f]{64}|source:v4:[0-9.]{7,15}|source:v6:[0-9a-f:]{7,39}::/64|source:other)|reauth:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$');
+  CHECK (key ~ '^((reset:)?(account:[0-9a-f]{64}|source:v4:[0-9.]{7,15}|source:v6:[0-9a-f:]{7,39}::/64|source:other)|reset:source:v6:[0-9a-f:]{5,29}::/48|reauth:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$');

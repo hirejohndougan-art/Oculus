@@ -278,7 +278,8 @@ export function callOptions(options: unknown, extra: readonly string[] = []): Se
  * rest. Anything else (a programming error, a permission error, a bad
  * option) is thrown again, as everywhere else in this package. A lock
  * timeout (55P03, which T-051's `lock_timeout` raises) is answered `timeout`
- * too, though its class isn't one of S-016's.
+ * too, though its class isn't one of S-016's. Also used by
+ * password-resets.ts; not exported from `@oculus/db`.
  */
 export function failureFor(
   error: unknown,
@@ -1047,6 +1048,30 @@ export async function endAllSessionsForUser(tx: Queryable, userId: UserId): Prom
 }
 
 /**
+ * The live full session whose token hashes to `hash`, as the person acting
+ * through it: their user ID, whether they are a system admin and whether
+ * they entered their password in the last 10 minutes. Read without locking
+ * or refreshing the session (second review, item 1), in the caller's
+ * transaction. For `endUserSessions` and password-resets.ts's admin reset;
+ * not exported from `@oculus/db`.
+ */
+export async function readActingSession(
+  tx: Queryable,
+  hash: Uint8Array,
+): Promise<{ userId: UserId; systemAdmin: boolean; recent: boolean } | undefined> {
+  const rows = await tx.rows<{ user_id: UserId; system_admin: boolean; recent: boolean }>(sql`
+    SELECT s.user_id::text AS user_id, u.system_admin,
+           s.password_at > clock_timestamp()
+             - make_interval(secs => ${RECENT_AUTHENTICATION_SECONDS}) AS recent
+    FROM public.sessions s JOIN public.users u ON u.id = s.user_id
+    WHERE s.token_hash = ${hash} AND ${LIVE_FULL}`);
+  const row = rows[0];
+  return row === undefined
+    ? undefined
+    : { userId: row.user_id, systemAdmin: row.system_admin, recent: row.recent };
+}
+
+/**
  * Ends every session of `userId` (ASVS 5.0 7.4.5), for a system admin
  * acting from their own full session (`adminToken`), who must have entered
  * their password in the last 10 minutes (`reauthentication_required`,
@@ -1072,15 +1097,9 @@ export async function endUserSessions(
   if (hash === undefined) return refused(NO_SESSION.code, NO_SESSION.message);
   try {
     return await inTransaction(db, async (tx) => {
-      const admins = await tx.rows<{ system_admin: boolean; recent: boolean }>(sql`
-        SELECT u.system_admin,
-               s.password_at > clock_timestamp()
-                 - make_interval(secs => ${RECENT_AUTHENTICATION_SECONDS}) AS recent
-        FROM public.sessions s JOIN public.users u ON u.id = s.user_id
-        WHERE s.token_hash = ${hash} AND ${LIVE_FULL}`);
-      const admin = admins[0];
+      const admin = await readActingSession(tx, hash);
       if (admin === undefined) return refused(NO_SESSION.code, NO_SESSION.message);
-      if (!admin.system_admin) return refused("not_permitted", "Only a system admin can do that.");
+      if (!admin.systemAdmin) return refused("not_permitted", "Only a system admin can do that.");
       if (!admin.recent) {
         return refused(
           "reauthentication_required",
@@ -1110,18 +1129,31 @@ export async function deleteExpiredSessions(db: Queryable): Promise<number> {
   return db.execute(sql`DELETE FROM public.sessions s WHERE NOT (${VALID})`);
 }
 
+/**
+ * Deletes password reset links that ended more than a day ago (D-078): every
+ * link ends at most an hour after it was made, used, revoked or expired, so
+ * a day past its end it is only a record. Returns how many went.
+ */
+export async function deleteOldPasswordResets(db: Queryable): Promise<number> {
+  return db.execute(sql`
+    DELETE FROM public.password_resets
+    WHERE expires_at < clock_timestamp() - interval '1 day'`);
+}
+
 /** What `runCleanup` removed. */
 export interface CleanupResult {
   readonly sessions: number;
   readonly signInThrottles: number;
+  readonly passwordResets: number;
   /** Wrong-code counters (T-038) a day old, and those of sessions that have ended. */
   readonly secondStepThrottles: number;
 }
 
 /**
  * The cleanup command's work (`npm run db:cleanup`, D-035: any scheduler can
- * run it, hourly is plenty): ended sessions and sign-in counters no longer
- * needed (D-068). Run it as the writer role.
+ * run it, hourly is plenty): ended sessions, sign-in and reset counters no
+ * longer needed (D-068) and reset links a day past their end (D-078). Run it
+ * as the writer role.
  */
 export async function runCleanup(db: Queryable): Promise<CleanupResult> {
   const sessions = await deleteExpiredSessions(db);
@@ -1133,5 +1165,6 @@ export async function runCleanup(db: Queryable): Promise<CleanupResult> {
     WHERE t.last_failure_at IS NULL OR t.last_failure_at < clock_timestamp() - interval '1 day'
        OR (t.key LIKE 'session:%' AND NOT EXISTS (
              SELECT 1 FROM public.sessions s WHERE 'session:' || s.id::text = t.key))`);
-  return Object.freeze({ sessions, signInThrottles, secondStepThrottles });
+  const passwordResets = await deleteOldPasswordResets(db);
+  return Object.freeze({ sessions, signInThrottles, secondStepThrottles, passwordResets });
 }

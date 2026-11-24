@@ -167,7 +167,7 @@ describe("throttleSourceKey", () => {
 
   it("only makes keys the database's check accepts", () => {
     const check =
-      /^((reset:)?(account:[0-9a-f]{64}|source:v4:[0-9.]{7,15}|source:v6:[0-9a-f:]{7,39}::\/64|source:other)|reauth:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
+      /^((reset:)?(account:[0-9a-f]{64}|source:v4:[0-9.]{7,15}|source:v6:[0-9a-f:]{7,39}::\/64|source:other)|reset:source:v6:[0-9a-f:]{5,29}::\/48|reauth:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
     for (const a of [
       "192.0.2.1",
       "255.255.255.255",
