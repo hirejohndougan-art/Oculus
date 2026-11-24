@@ -68,11 +68,13 @@ export const CATALOG_PERMISSIONS = [
   "donors.edit",
 ] as const;
 
-/** Permissions over the organization as a whole: only from a whole-catalog grant. */
-export const ORGANIZATION_PERMISSIONS = [
-  /** Templates, record types, identifier types and vocabularies (T-047). */
-  "catalog.definitions",
-] as const;
+/**
+ * Permissions over the organization as a whole, from a whole-catalog grant.
+ * None today: `catalog.definitions` was one until John's decision of
+ * 2026-11-24 (D-072) made templates, record types, identifier types and
+ * vocabularies system managers' only, so it is a system permission now.
+ */
+export const ORGANIZATION_PERMISSIONS = [] as const;
 
 /** Permissions over one site: only from a grant on that site (or every site). */
 export const SITE_PERMISSIONS = [
@@ -92,13 +94,20 @@ export const SYSTEM_PERMISSIONS = [
   "system.users",
   /** Install plugins and themes (P-001). */
   "system.plugins",
+  /**
+   * Templates, record types, identifier types and vocabularies (T-047):
+   * system managers only (John, 2026-11-24, D-072).
+   */
+  "catalog.definitions",
 ] as const;
 
 export type CatalogPermission = (typeof CATALOG_PERMISSIONS)[number];
 export type OrganizationPermission = (typeof ORGANIZATION_PERMISSIONS)[number];
 export type SitePermission = (typeof SITE_PERMISSIONS)[number];
 export type SystemPermission = (typeof SYSTEM_PERMISSIONS)[number];
-export type RolePermission = CatalogPermission | OrganizationPermission | SitePermission;
+// OrganizationPermission is empty today (never), so it is left out of the
+// union; add it back when an organization permission exists again.
+export type RolePermission = CatalogPermission | SitePermission;
 export type Permission = RolePermission | SystemPermission;
 
 /** The built-in roles (D-025, D-036). Their keys are stored; their labels are for screens. */

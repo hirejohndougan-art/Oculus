@@ -71,6 +71,12 @@ export interface RecordCheckOptions {
    * the answer never shows whether it exists or what kind it is.
    */
   readonly hiddenLinks?: ReadonlySet<RecordId>;
+  /**
+   * The unit's parent is one the person may not view (T-042 review): it is
+   * checked as a parent that doesn't exist (`missing_parent`, fixed text),
+   * so its level never shows in a `wrong_level` message.
+   */
+  readonly hiddenParent?: boolean;
 }
 
 /**
@@ -260,9 +266,13 @@ export async function recordCheckIssues(
   // The arrangement, when the unit is new or its parent or level changes.
   if (candidate.kind === "archival_unit") {
     if (stored === undefined) {
-      problems.push(...(await arrangementIssues(db, candidate, undefined, found)));
+      problems.push(
+        ...(await arrangementIssues(db, candidate, undefined, found, options.hiddenParent)),
+      );
     } else if (stored.kind === "archival_unit") {
-      problems.push(...(await arrangementIssues(db, candidate, stored, found)));
+      problems.push(
+        ...(await arrangementIssues(db, candidate, stored, found, options.hiddenParent)),
+      );
     }
   }
   return problems;
@@ -324,6 +334,7 @@ async function arrangementIssues(
   unit: CatalogRecord & { kind: "archival_unit" },
   stored: (CatalogRecord & { kind: "archival_unit" }) | undefined,
   found: ReadonlyMap<string, Record<string, unknown>>,
+  hiddenParent = false,
 ): Promise<Issue[]> {
   const org = unit.organizationId;
   const problems: Issue[] = [];
@@ -349,7 +360,7 @@ async function arrangementIssues(
   if (unit.parentId === undefined || (!parentChanged && !levelChanged)) {
     return problems;
   }
-  const parent = found.get(unit.parentId);
+  const parent = hiddenParent ? undefined : found.get(unit.parentId);
   if (parent?.kind !== "archival_unit") {
     problems.push(
       issue(

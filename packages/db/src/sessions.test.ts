@@ -1362,8 +1362,28 @@ describe(
       try {
         const org = await organization();
         const person = await member(org);
+        // How long one sign-in takes on this machine now (scrypt slows under
+        // load), so the disable lands before, during and after the sign-in
+        // whatever the load: delays spread over twice that time.
+        const timedAt = Date.now();
+        const timed = await beginSession(other, {
+          email: person.email,
+          password: PASSWORD,
+          source: source(),
+          organizationId: org,
+        });
+        const signInMs = Math.max(50, Date.now() - timedAt);
+        if (timed.ok) await endSession(db, timed.token);
         let made = 0;
-        for (let round = 0; round < RACE_ROUNDS; round++) {
+        let refused = 0;
+        // Every round checks the safety rule; the loop runs on (bounded)
+        // until both orders have happened, so a slow machine can't make the
+        // race one-sided and the test prove little.
+        for (
+          let round = 0;
+          round < RACE_ROUNDS || ((made === 0 || refused === 0) && round < 4 * RACE_ROUNDS);
+          round++
+        ) {
           // A sign-in refused because the account was disabled counts as a
           // failure (D-068); start each round with no wait.
           await db.execute(sql`DELETE FROM public.sign_in_throttles
@@ -1375,7 +1395,7 @@ describe(
               source: source(),
               organizationId: org,
             }),
-            sleep((round * 37) % 300).then(() =>
+            sleep(Math.round((((round * 37) % 100) / 100) * 2 * signInMs)).then(() =>
               db.execute(
                 sql`UPDATE public.users SET disabled_at = now() WHERE id = ${person.userId}::uuid`,
               ),
@@ -1388,13 +1408,14 @@ describe(
             made += 1;
             expect(await readPendingSession(db, started.token)).toBe(NO_SESSION);
           } else {
+            refused += 1;
             expect(started).toBe(INVALID_CREDENTIALS);
           }
           expect({ round, rows: (await rowsOf(person.userId)).length }).toEqual({ round, rows: 0 });
         }
         // Both orders happened at least once, or the loop proved little.
         expect(made).toBeGreaterThan(0);
-        expect(made).toBeLessThan(RACE_ROUNDS);
+        expect(refused).toBeGreaterThan(0);
       } finally {
         await other.close();
       }

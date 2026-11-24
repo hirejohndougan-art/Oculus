@@ -17,7 +17,7 @@
     "lint": "eslint .",
     "typecheck": "npm run typecheck --workspaces",
     "test": "vitest run",
-    "build": "npm run build --workspaces",
+    "build": "npm run build -w @oculus/core && npm run build -w @oculus/db && npm run build -w @oculus/service && npm run build -w @oculus/api",
     "db:migrate": "npm run db:migrate -w @oculus/db",
     "db:backup": "tsc -p packages/core/tsconfig.build.json && tsc -p packages/db/tsconfig.build.json && exec node packages/db/dist/backup-cli.js backup",
     "db:restore": "tsc -p packages/core/tsconfig.build.json && tsc -p packages/db/tsconfig.build.json && exec node packages/db/dist/backup-cli.js restore",

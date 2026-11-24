@@ -7,6 +7,7 @@ export default defineConfig({
     alias: {
       "@oculus/core": fileURLToPath(new URL("./packages/core/src/index.ts", import.meta.url)),
       "@oculus/db": fileURLToPath(new URL("./packages/db/src/index.ts", import.meta.url)),
+      "@oculus/service": fileURLToPath(new URL("./packages/service/src/index.ts", import.meta.url)),
     },
   },
   test: {

@@ -60,7 +60,12 @@ export interface OculusReply {
   clearCookie(name: OculusCookieName): OculusReply;
 }
 
-/** The request headers a handler can read; every other header stays with the HTTP layer. */
+/**
+ * The request headers a handler can read; every other header stays with the
+ * HTTP layer. `x-oculus-csrf` carries the session's CSRF token on every
+ * change and `x-oculus-site` the working site (T-042, D-079); both are
+ * checked by the API's handlers, never trusted as they are.
+ */
 export const REQUEST_HEADERS = [
   "accept",
   "accept-language",
@@ -69,6 +74,8 @@ export const REQUEST_HEADERS = [
   "if-modified-since",
   "if-none-match",
   "user-agent",
+  "x-oculus-csrf",
+  "x-oculus-site",
 ] as const;
 export type RequestHeaderName = (typeof REQUEST_HEADERS)[number];
 

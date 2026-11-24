@@ -56,7 +56,6 @@ describe("the built-in roles", () => {
         "media.attach",
         "donors.view",
         "donors.edit",
-        "catalog.definitions",
         "site.settings",
         "site.people",
       ],
@@ -191,10 +190,14 @@ describe("permits", () => {
     expect(hasScopedGrants(access([g("cataloger", siteA, fonds)], true))).toBe(false);
   });
 
-  it("organization permissions need a whole-catalog grant", () => {
+  it("definitions are system managers' only (John, 2026-11-24, D-072)", () => {
     expect(
       permits(access([g("site_manager")]), "catalog.definitions", { on: "organization" }),
-    ).toBe(true);
+    ).toBe(false);
+    expect(
+      permits(access([g("site_manager", null)]), "catalog.definitions", { on: "organization" }),
+    ).toBe(false);
+    expect(permits(access([], true), "catalog.definitions", { on: "organization" })).toBe(true);
     expect(permits(access([g("cataloger")]), "catalog.definitions", { on: "organization" })).toBe(
       false,
     );

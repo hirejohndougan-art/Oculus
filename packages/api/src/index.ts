@@ -43,3 +43,14 @@ export { Refusal, errorReply } from "./errors.js";
 export { pathProblem } from "./paths.js";
 export { TRUSTED_PROXY_ENV, trustedProxyFromEnv } from "./proxy.js";
 export { ORIGINS_ENV, originsFromEnv } from "./origin.js";
+
+export {
+  staffApiRoutes,
+  serviceErrorLogger,
+  redactedError,
+  CSRF_HEADER,
+  SITE_HEADER,
+} from "./staff-api.js";
+export type { StaffApiOptions, ApiLogRecord } from "./staff-api.js";
+export { SessionRateLimiter, DEFAULT_RATE_LIMITS } from "./rate-limit.js";
+export type { RateBucket, RateLimits } from "./rate-limit.js";
