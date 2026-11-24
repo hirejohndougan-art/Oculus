@@ -496,6 +496,7 @@ export interface AdminResetOptions {
  * Answers: `ok` with the expiry (stored, sent and still pending);
  * `no_session`, `not_permitted`, `reauthentication_required`;
  * `unknown_user`, `account_disabled`, `cannot_sign_in` (no organization);
+ * `account_changed` (disabled or its password changed at that very moment);
  * `superseded` (a newer link replaced it while it was sent; the newer one
  * works); `delivery_failed` (not sent, revoked);
  * `delivery_failed_may_be_pending`; `retry`, `timeout`,
