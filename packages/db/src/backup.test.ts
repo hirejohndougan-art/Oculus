@@ -312,7 +312,7 @@ async function populated(): Promise<{ testDb: TestDatabase; sample: Sample }> {
           new Date(T),
         ),
       );
-      ok(await insertRecord(db, made));
+      ok(await db.transaction((q) => insertRecord(q, made, { actor: "system:test" })));
       sample.records.push({ org, id: made.id });
       const number = ok(await db.transaction((q) => allocateIdentifier(q, org, "object_number")));
       ok(
