@@ -24,6 +24,9 @@ const steps = [
     ],
   ],
   ["Build", "npm", ["run", "build"]],
+  // The built admin served by Fastify against its own throwaway database, in
+  // a browser, with Siteimprove Alfa's accessibility rules (D-073, D-081).
+  ["End-to-end (Playwright, Alfa)", "npm", ["run", "e2e", "-w", "@oculus/admin"]],
   ["npm audit (high and critical)", "npm", ["run", "audit"]],
   ["License check", "npm", ["run", "licenses"]],
   ["tests_passing baseline", "npm", ["run", "baseline"]],

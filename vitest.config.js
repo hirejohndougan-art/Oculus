@@ -11,6 +11,12 @@ export default defineConfig({
     },
   },
   test: {
-    include: ["packages/*/src/**/*.test.ts", "scripts/**/*.test.mjs"],
+    // `*.test.tsx` are the admin's screen tests (D-073); each says
+    // `// @vitest-environment jsdom` at the top.
+    include: [
+      "packages/*/src/**/*.test.ts",
+      "packages/*/src/**/*.test.tsx",
+      "scripts/**/*.test.mjs",
+    ],
   },
 });

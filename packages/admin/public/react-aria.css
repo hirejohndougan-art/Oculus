@@ -1,0 +1,9 @@
+/* React Aria's press handling adds this rule in an inline <style> element,
+   which the admin's CSP (style-src 'self') refuses. It is served here
+   instead, and index.html links it with the id React Aria looks for
+   ("react-aria-pressable-style"), so React Aria finds it and adds nothing. */
+@layer {
+  [data-react-aria-pressable] {
+    touch-action: pan-x pan-y pinch-zoom;
+  }
+}

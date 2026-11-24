@@ -1,0 +1,36 @@
+// The class names of Frame.module.css (checked by css-modules.test.ts).
+declare const styles: {
+  readonly account: string;
+  readonly accountName: string;
+  readonly body: string;
+  readonly brand: string;
+  readonly card: string;
+  readonly cardLine: string;
+  readonly cardTitle: string;
+  readonly cards: string;
+  readonly content: string;
+  readonly frame: string;
+  readonly initials: string;
+  readonly lead: string;
+  readonly listbox: string;
+  readonly loading: string;
+  readonly menu: string;
+  readonly menuInfo: string;
+  readonly menuItem: string;
+  readonly option: string;
+  readonly organization: string;
+  readonly pageTitle: string;
+  readonly placeholder: string;
+  readonly popover: string;
+  readonly section: string;
+  readonly sectionHeader: string;
+  readonly selector: string;
+  readonly selectorButton: string;
+  readonly selectorLabel: string;
+  readonly separator: string;
+  readonly sidebar: string;
+  readonly skip: string;
+  readonly topbar: string;
+  readonly wordmark: string;
+};
+export default styles;

@@ -1,0 +1,100 @@
+/* Shared controls (design/DESIGN.md §6): fields, buttons and notes. */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.label {
+  font: 600 var(--size-small) var(--font-body);
+  color: var(--text-label);
+}
+.input {
+  min-height: var(--control-height);
+  padding: 0 12px;
+  border: 1px solid var(--border-input);
+  border-radius: var(--radius-control);
+  font: var(--size-body) var(--font-body);
+  background: var(--surface);
+  color: var(--text);
+  width: 100%;
+}
+.input[data-invalid] {
+  border-color: var(--pill-red-text);
+}
+.help {
+  font-size: var(--size-micro);
+  color: var(--text-muted);
+}
+.error {
+  font-size: var(--size-micro);
+  color: var(--pill-red-text);
+}
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: var(--control-height);
+  min-width: 44px;
+  padding: 0 18px;
+  font: 600 var(--size-body) var(--font-heading);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+  text-decoration: none;
+}
+.button[data-disabled] {
+  cursor: default;
+  opacity: 0.7;
+}
+.dark {
+  background: var(--ink);
+  color: #ffffff;
+  border: 0;
+}
+.primary {
+  background: var(--accent);
+  color: var(--on-accent);
+  border: 0;
+}
+.secondary {
+  background: var(--surface);
+  color: var(--ink);
+  border: 1px solid var(--border-input);
+}
+.link {
+  background: none;
+  border: 0;
+  padding: 0;
+  min-height: 44px;
+  font: var(--size-small) var(--font-body);
+  color: var(--link);
+  text-decoration: underline;
+  cursor: pointer;
+}
+.link:hover {
+  color: var(--link-hover);
+}
+.note {
+  padding: 12px 14px;
+  border-radius: var(--radius-control);
+  /* 14px at the browser's default size; rem so paragraphs follow the reader's setting (WCAG 1.4.4). */
+  font: 0.875rem / 1.5 var(--font-body);
+  border: 1px solid;
+  margin: 0;
+}
+.amber {
+  background: var(--note-amber-bg);
+  border-color: var(--note-amber-border);
+  color: var(--note-amber-text);
+}
+.blue {
+  background: var(--note-blue-bg);
+  border-color: var(--note-blue-border);
+  color: var(--note-blue-text);
+}
+.green {
+  background: var(--note-green-bg);
+  border-color: var(--note-green-border);
+  color: var(--note-green-text);
+}
