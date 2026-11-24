@@ -83,6 +83,7 @@ export {
   changeWorkflowState,
   publishCheckIssues,
   readPublicRecord,
+  publicValueSources,
   readWorkflowState,
 } from "./workflow.js";
 export type { PublicRecordOptions, WorkflowChangeResult } from "./workflow.js";

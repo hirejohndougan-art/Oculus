@@ -120,6 +120,7 @@ import {
   lockDefinition,
   linkedIds,
   lockRecord,
+  publicValueSources,
   publishCheckIssues,
   readOrganization,
   readRecordIdentifiers,
@@ -1013,6 +1014,42 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
     return stillPublishable(messages === "own" ? found : fixedMessages(found, []));
   }
 
+  /**
+   * S-020: refused unless the actor may view every record whose values the
+   * record's public output shows besides its own (`publicValueSources`:
+   * ancestors and represented records a public value is inherited from,
+   * and the record a digital asset represents), or with `before`, every
+   * such record not already among `before`. Publishing must not put out
+   * what the publisher can't see. The sources are locked `FOR SHARE` in ID
+   * order and read again: if they changed meanwhile, the operation starts
+   * again (`retry`); otherwise none of them can change (or move to a site
+   * or unit the actor can't see) before COMMIT. Take `checker`'s
+   * arrangement lock (if any) before the record's row lock, as callers do.
+   */
+  async function hiddenSourcesRefusal(
+    tx: Queryable,
+    checker: RecordAccess,
+    organizationId: OrganizationId,
+    recordId: RecordId,
+    before: readonly RecordId[] = [],
+  ): Promise<ServiceRefusal | undefined> {
+    const known = new Set(before);
+    const sources = await publicValueSources(tx, organizationId, recordId, { lock: true });
+    // Unreadable: the publish check, run with it, refuses the record anyway.
+    if (sources === undefined) return undefined;
+    const added = sources.filter((id) => !known.has(id));
+    if (added.length === 0) return undefined;
+    for (const id of added) await lockRecord(tx, organizationId, id, "share");
+    const again = await publicValueSources(tx, organizationId, recordId, { lock: true });
+    if (again?.join() !== sources.join()) return retryRefusal();
+    if ((await checker.hiddenAmong(added)).size === 0) return undefined;
+    return refusal(
+      ["workflowState"],
+      "inherits_from_hidden",
+      "Some values this record would show publicly come from records you can't see, so you can't make them public. Ask someone who can see the records it is filed under.",
+    );
+  }
+
   /** One of the four workflow actions (D-075), as the record's next version. */
   function workflowAction(action: WorkflowAction) {
     return (context: unknown, recordId: RecordId, workflowOptions: unknown) =>
@@ -1030,7 +1067,15 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         // Publishing and withdrawing change what the public sees (D-075):
         // `records.publish` (mayChangePublicOutput). Sending for review and
         // back to draft change the record: whoever may edit it (T-041).
+        let publisher: RecordAccess | undefined;
         if (action === "publish" || action === "withdraw") {
+          if (action === "publish") {
+            // The actor's access for the S-020 check below, read (and its
+            // arrangement lock taken) before the hook locks the row.
+            const allowed = await accessFor(tx, who);
+            if (!allowed.ok) return allowed;
+            publisher = allowed.value;
+          }
           const denied = await publicChangeRefused(tx, who, recordId, action);
           if (denied) return denied;
         } else {
@@ -1048,6 +1093,10 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           // a refusal rolls the change of state back.
           const found = await publishCheckIssues(tx, org, recordId, { lock: true });
           if (found.length > 0) return { ok: false, issues: found };
+          if (publisher !== undefined) {
+            const hidden = await hiddenSourcesRefusal(tx, publisher, org, recordId);
+            if (hidden) return hidden;
+          }
         }
         const version = changed.value;
         return {
@@ -1439,6 +1488,12 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           const denied = await publicChangeRefused(tx, who, recordId, "confirm_made_public");
           if (denied) return denied;
         }
+        // What its public output shows from other records now (S-020): an
+        // edit may add sources only the editor can see.
+        const sourcesBefore =
+          state?.state === "published"
+            ? ((await publicValueSources(tx, org, recordId)) ?? [])
+            : undefined;
         const stamp = now();
         if (!stamp.ok) return stamp;
         const valid = validateRecord({
@@ -1507,6 +1562,10 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         if (terms) return terms;
         const unpublishable = await publishedStillPasses(tx, org, recordId, "own");
         if (unpublishable) return unpublishable;
+        if (sourcesBefore !== undefined) {
+          const hidden = await hiddenSourcesRefusal(tx, checker, org, recordId, sourcesBefore);
+          if (hidden) return hidden;
+        }
         return {
           ok: true,
           value: Object.freeze({
@@ -1607,6 +1666,12 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           editPermissions(place.kind),
         );
         if (mayRestore) return mayRestore;
+        // What a published record's public output shows from other records
+        // now (S-020): a restore may add sources only the person can see.
+        const sourcesBefore =
+          (await readWorkflowState(tx, org, recordId))?.state === "published"
+            ? ((await publicValueSources(tx, org, recordId)) ?? [])
+            : undefined;
         // Saved between the first look and the lock (and still at the
         // version the person saw): the lock decision may be stale.
         if (place.version === expected.value && seen.version !== place.version) {
@@ -1657,6 +1722,10 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         // Fixed messages: a restore's refusal must not quote old values (D-065).
         const unpublishable = await publishedStillPasses(tx, org, recordId, "fixed");
         if (unpublishable) return unpublishable;
+        if (sourcesBefore !== undefined) {
+          const hidden = await hiddenSourcesRefusal(tx, checker, org, recordId, sourcesBefore);
+          if (hidden) return hidden;
+        }
         return restored;
       });
     },

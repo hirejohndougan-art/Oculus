@@ -476,6 +476,46 @@ export async function publishCheckIssues(
   return effectivePublishIssues(effective.value, { accessions: s.accessions });
 }
 
+/**
+ * The records whose values the record's public output would show besides
+ * its own (S-020): every record a public value is inherited from (an
+ * ancestor, or for a digital asset the record it represents or one of its
+ * ancestors), and the record a digital asset represents, read in the
+ * caller's transaction as `publishCheckIssues` reads them. Sorted by ID.
+ * `undefined` if the record or what it depends on can't be read (then the
+ * publish check refuses anyway). The service asks that the person may view
+ * every one of them before publishing, or before an edit of a published
+ * record adds one.
+ */
+export async function publicValueSources(
+  db: Queryable,
+  organizationId: OrganizationId,
+  recordId: RecordId,
+  options: { readonly lock?: boolean } = {},
+): Promise<readonly RecordId[] | undefined> {
+  if (!isOrganizationId(organizationId) || !isRecordId(recordId)) return undefined;
+  const snapshot = await readSnapshot(db, organizationId, recordId, options.lock === true);
+  if (!snapshot.ok) return undefined;
+  const s = snapshot.value;
+  const index = indexRecords(s.records);
+  if (!index.ok) return undefined;
+  const effective = effectiveRecord(recordId, index.value, s.templateFor, {
+    checkers: s.checkers,
+    identifiers: s.identifiers,
+  });
+  if (!effective.ok) return undefined;
+  const sources = new Set<RecordId>();
+  for (const entry of effective.value.entries) {
+    if (!entry.own && entry.inTemplate && entry.visibility === "public") sources.add(entry.from.id);
+  }
+  const record = effective.value.record;
+  if (record.kind === "digital_asset" && record.represents !== undefined) {
+    sources.add(record.represents);
+  }
+  sources.delete(recordId);
+  return [...sources].sort();
+}
+
 // ---------------------------------------------------------------------------
 // The public output
 

@@ -977,6 +977,134 @@ describe("public reads by site, with a role that sees only public output (S-019)
   });
 });
 
+describe("publishing never puts out what the publisher can't see (S-020)", () => {
+  /** A unit of the organization's site, made by Alice (who manages the whole site). */
+  async function unit(
+    org: OrganizationId,
+    title: string,
+    parentId?: RecordId,
+    provenance?: string,
+  ): Promise<CatalogRecord> {
+    return (
+      await create(org, {
+        kind: "archival_unit",
+        level: parentId === undefined ? "fonds" : "series",
+        ...(parentId === undefined ? {} : { parentId }),
+        title,
+        templateKey: "pub-unit",
+        fields: {
+          rights: { uri: INC },
+          ...(provenance === undefined ? {} : { provenance }),
+        },
+      })
+    ).record;
+  }
+
+  /** Carol: a reviewer (who may publish) only below the given units. */
+  async function reviewerBelow(org: OrganizationId, ...units: RecordId[]): Promise<string> {
+    if (folks === undefined) throw new Error("not ready");
+    const carol = await folks.member(org, "Carol");
+    for (const scope of units) {
+      await grant(service, folks.root, org, {
+        userId: carol,
+        role: "reviewer",
+        siteId: siteFor(org),
+        scope,
+      });
+    }
+    return actorOf(carol);
+  }
+
+  it("refuses a scoped reviewer publishing a unit that inherits public values from a unit above their scope", async () => {
+    await ready();
+    const org = await organization();
+    const fonds = await unit(
+      org,
+      "Invented Hidden Fonds",
+      undefined,
+      "Invented hidden provenance.",
+    );
+    const series = await unit(org, "Invented series", fonds.id);
+    const carol = await reviewerBelow(org, series.id);
+    const refused = await service.publish(ctx(org, carol), series.id, { expectedVersion: 1 });
+    expect(codes(refused)).toEqual(["inherits_from_hidden"]);
+    expect(JSON.stringify(refused)).not.toContain(fonds.id);
+    expect(JSON.stringify(refused)).not.toContain("Hidden");
+    expect(await stateOf(org, series.id)).toBe("draft");
+    expect(codes(await publicText(org, series.id))).toEqual(["not_available"]);
+    // Someone who can see the fonds may publish it, with the inherited value.
+    ok(await service.publish(ctx(org), series.id, { expectedVersion: 1 }));
+    expect((await publicText(org, series.id)).text).toContain("Invented hidden provenance.");
+  });
+
+  it("lets the scoped reviewer publish when nothing public comes from above their scope", async () => {
+    await ready();
+    const org = await organization();
+    const fonds = await unit(org, "Invented Plain Fonds");
+    const series = await unit(org, "Invented series", fonds.id);
+    const carol = await reviewerBelow(org, series.id);
+    ok(await service.publish(ctx(org, carol), series.id, { expectedVersion: 1 }));
+    expect(await stateOf(org, series.id)).toBe("published");
+  });
+
+  it("refuses an edit of a published record that makes it inherit from a record the editor can't see", async () => {
+    await ready();
+    const org = await organization();
+    const first = await unit(org, "Invented First Fonds", undefined, "Invented first provenance.");
+    const second = await unit(
+      org,
+      "Invented Second Fonds",
+      undefined,
+      "Invented second provenance.",
+    );
+    const seriesA = await unit(org, "Invented series A", first.id);
+    const seriesB = await unit(org, "Invented series B", second.id);
+    const file = (
+      await create(org, {
+        kind: "archival_unit",
+        level: "file",
+        parentId: seriesA.id,
+        title: "Invented file",
+        templateKey: "pub-unit",
+        fields: { rights: { uri: INC } },
+      })
+    ).record;
+    // Published by Alice, who sees everything: it shows the first fonds' provenance.
+    ok(await service.publish(ctx(org), file.id, { expectedVersion: 1 }));
+    const carol = await reviewerBelow(org, seriesA.id, seriesB.id);
+    // An edit that keeps the same sources is fine for Carol.
+    ok(
+      await service.updateRecord(
+        ctx(org, carol),
+        file.id,
+        { ...file, title: "Invented file, renamed" },
+        { expectedVersion: 2 },
+      ),
+    );
+    // Moving it under series B would put out the second fonds' value, which she can't see.
+    const moved = await service.updateRecord(
+      ctx(org, carol),
+      file.id,
+      { ...file, title: "Invented file, renamed", parentId: seriesB.id },
+      { expectedVersion: 3 },
+    );
+    expect(codes(moved)).toEqual(["inherits_from_hidden"]);
+    const out = await publicText(org, file.id);
+    expect(out.text).toContain("Invented first provenance.");
+    expect(out.text).not.toContain("second provenance");
+    // Alice may move it.
+    ok(
+      await service.updateRecord(
+        ctx(org),
+        file.id,
+        { ...file, title: "Invented file, renamed", parentId: seriesB.id },
+        { expectedVersion: 3 },
+      ),
+    );
+    expect((await publicText(org, file.id)).text).toContain("Invented second provenance.");
+  });
+});
+
 describe("races", () => {
   it("a publish and an edit from the same version: one wins, the other is a version conflict", async () => {
     await ready();
