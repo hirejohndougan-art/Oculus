@@ -601,6 +601,12 @@ describe("hostile and oversized queries", () => {
     expect(codes(await bad({ scope: "public" }))).toEqual(["unknown_option"]);
     expect(codes(await bad({ [Symbol("x")]: 1 }))).toEqual(["unknown_option"]);
     expect(codes(await bad("limit"))).toEqual(["invalid_options"]);
+    // `sites` (T-042) only narrows: "all", or a list of site IDs.
+    for (const sites of ["public", "every", [""], ["nope"], [7], {}, null]) {
+      expect(codes(await bad({ sites })), JSON.stringify(sites)).toEqual(["invalid_sites"]);
+    }
+    expect((await bad({ sites: "all" })).ok).toBe(true);
+    expect((await bad({ sites: [] })).ok).toBe(true);
     for (const limit of [0, -1, 1.5, MAX_SEARCH_LIMIT + 1, "10", Number.NaN]) {
       expect(codes(await bad({ limit })), String(limit)).toEqual(["invalid_limit"]);
     }

@@ -130,6 +130,17 @@ export type {
   StaleRecords,
 } from "./vocabularies.js";
 export {
+  listTemplates,
+  readRecordsUsingTemplate,
+  publishedAmong,
+  publishedHoldingType,
+  lockIdentifierType,
+  identifierKeyInUse,
+  organizationSiteIds,
+  MAX_AFFECTED_PUBLISHED,
+} from "./definitions.js";
+export type { TemplateSummary } from "./definitions.js";
+export {
   searchRecords,
   MAX_SEARCH_QUERY_LENGTH,
   DEFAULT_SEARCH_LIMIT,

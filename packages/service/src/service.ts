@@ -62,6 +62,13 @@
  * sees at once, so each asks `ServiceOptions.mayChangePublicOutput` first:
  * the hook T-041's `records.publish` permission plugs into.
  *
+ * **For the HTTP API** (T-042, D-079): `checkRecord` is the admin's dry
+ * run (today's checks on a draft, nothing written); `searchRecords` is
+ * staff search over the whole sites the person may see, under a
+ * `statement_timeout`; templates and identifier types are read and saved
+ * through `definitions.ts` (`catalog.definitions`, and D-076's gate for
+ * changes that make values public on published records).
+ *
  * Not here yet: loans and accessions (no tables yet; when they are stored,
  * closing a loan by an accession happens here, from the register and loan
  * book read in the same transaction, never from ones a caller hands in,
@@ -76,6 +83,8 @@ import {
   IssueList,
   compareRecords,
   droppedIdentifiers,
+  holdsAnywhere,
+  ROLE_PERMISSIONS,
   identifierFieldIssues,
   isFieldKey,
   isOrganizationId,
@@ -109,6 +118,7 @@ import {
   type Refusal,
 } from "./access.js";
 import { adminOperations, type AdminOperations } from "./admin.js";
+import { definitionOperations, type DefinitionOperations } from "./definitions.js";
 import {
   changeWorkflowState,
   checkWriterConnection,
@@ -120,7 +130,9 @@ import {
   lockDefinition,
   linkedIds,
   lockRecord,
+  organizationSiteIds,
   publishCheckIssues,
+  searchRecords as searchStoredRecords,
   readOrganization,
   readRecordIdentifiers,
   readRecordPlace,
@@ -142,8 +154,10 @@ import {
   type RecordPlace,
   type RecordPosition,
   type RecordVersion,
+  type SearchResults,
   type VersionConflict,
   type WriterRoleProblem,
+  sql,
 } from "@oculus/db";
 
 /**
@@ -306,6 +320,17 @@ export interface ServiceOptions {
     tx: Queryable,
     request: PublicChangeRequest,
   ) => Promise<ServiceRefusal | undefined>;
+  /**
+   * The `statement_timeout` (milliseconds) staff search runs under (D-066,
+   * D-079): a search that takes longer is stopped and answered
+   * `search_timeout`. Default 5,000; 1 to 30,000.
+   */
+  readonly searchTimeoutMs?: number;
+}
+
+/** What `checkRecord` returns: core's issues for the draft as it would be saved now. */
+export interface RecordCheck {
+  readonly issues: readonly Issue[];
 }
 
 /** A record as read (staff view: every field). */
@@ -315,7 +340,7 @@ export interface ReadRecord {
 }
 
 /** The service: every write of a record and its related rows, and who may make them. */
-export interface RecordService extends AdminOperations {
+export interface RecordService extends AdminOperations, DefinitionOperations {
   /** The record as stored, for someone who may view it (`records.view`). */
   readRecord(context: ServiceContext, recordId: RecordId): Promise<ServiceResult<ReadRecord>>;
   /** Makes a new record from `draft` (no ID: the service makes it), checked, with its version 1. */
@@ -383,6 +408,29 @@ export interface RecordService extends AdminOperations {
     recordId: RecordId,
     options: WorkflowOptions,
   ): Promise<ServiceResult<WorkflowChange>>;
+  /**
+   * A dry run (D-073, D-079): the issues a create (no `recordId`) or an
+   * update of `recordId` with `draft` would meet in today's checks, with
+   * nothing written. Refused as the save would be when the person may not
+   * make or edit the record (a record they can't view as `unknown_record`).
+   * Not checked here: identifier numbers, moves between places and the
+   * publish check of a published record; the save checks those.
+   */
+  checkRecord(
+    context: ServiceContext,
+    draft: unknown,
+    options?: unknown,
+  ): Promise<ServiceResult<RecordCheck>>;
+  /**
+   * Staff search (D-066) over the records the person may see on whole
+   * sites (D-074, D-079), under `searchTimeoutMs`. `options`: `limit`
+   * (1 to 200) and `after` (the previous page's `next`).
+   */
+  searchRecords(
+    context: ServiceContext,
+    query: unknown,
+    options?: unknown,
+  ): Promise<ServiceResult<SearchResults>>;
   /** What is wrong with the connection's database role for writing (empty when fit). */
   checkConnection(): Promise<readonly WriterRoleProblem[]>;
 }
@@ -967,6 +1015,10 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
     throw new RangeError("attempts is a whole number from 1 to 10.");
   }
   const onError = options.onError;
+  const searchTimeoutMs = options.searchTimeoutMs ?? 5_000;
+  if (!Number.isInteger(searchTimeoutMs) || searchTimeoutMs < 1 || searchTimeoutMs > 30_000) {
+    throw new RangeError("searchTimeoutMs is a whole number from 1 to 30,000.");
+  }
   const mayChangePublicOutput = options.mayChangePublicOutput ?? publishPermission;
   if (typeof mayChangePublicOutput !== "function") {
     throw new TypeError("mayChangePublicOutput is a function.");
@@ -1712,7 +1764,187 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
       });
     },
 
+    async checkRecord(context, draftInput, checkOptions) {
+      return run("checkRecord", context, async (tx, who): Promise<ServiceResult<RecordCheck>> => {
+        const org = who.organizationId;
+        const found = (issues: readonly Issue[]): ServiceResult<RecordCheck> => ({
+          ok: true,
+          value: Object.freeze({ issues: Object.freeze([...issues]) }),
+        });
+        const opts = readOptions(checkOptions, ["recordId"]);
+        if (!opts.ok) return opts;
+        const recordId = own(opts.value, "recordId");
+        if (recordId !== undefined && !isRecordId(recordId)) return noSuchRecord();
+        if (recordId === undefined) {
+          // As createRecord: who may make it where, then today's checks.
+          const allowed = await accessFor(tx, who, "read");
+          if (!allowed.ok) return allowed;
+          if (who.siteId !== null && !(await allowed.value.worksOn(who.siteId))) {
+            return unknownSite(["context", "siteId"]);
+          }
+          const draft = readDraft(draftInput, org, "create");
+          if (!draft.ok) return found(draft.issues);
+          const namedSite = own(draft.value, "siteId");
+          if (namedSite !== undefined && namedSite !== who.siteId) {
+            return found([
+              issue(["siteId"], "wrong_site", "A new record joins the site you are working in."),
+            ]);
+          }
+          const stamp = now();
+          if (!stamp.ok) return stamp;
+          const valid = validateRecord({
+            fields: {},
+            ...contentOf(draft.value),
+            ...(who.siteId === null ? {} : { siteId: who.siteId }),
+            id: newRecordId(),
+            organizationId: org,
+            createdAt: stamp.value,
+            updatedAt: stamp.value,
+          });
+          if (!valid.ok) return found(valid.issues);
+          const record = valid.value;
+          const denied = await allowed.value.intoPlace(
+            positionOf(record),
+            createPermissions(record.kind),
+            false,
+          );
+          if (denied) {
+            // Not allowed at all: refused as the save is. A parent or scan
+            // target that is missing (or out of sight) is an issue of the draft.
+            if (denied.issues.every((i) => i.code === "not_permitted")) return denied;
+            return found(denied.issues);
+          }
+          if (record.templateKey === undefined) {
+            return found([
+              issue(["templateKey"], "no_template_key", "Every record names its template."),
+            ]);
+          }
+          const hiddenLinks = await allowed.value.hiddenAmong(addedLinks(record));
+          return found(
+            await recordCheckIssues(tx, record, undefined, {
+              messages: "own",
+              identifierFields: false,
+              hiddenLinks,
+            }),
+          );
+        }
+        // As updateRecord: the record must be one the person may edit.
+        const allowed = await mayChange(tx, who, recordId, "share", [], editPermissions);
+        if (!allowed.ok) return allowed;
+        const stored = await readStoredRecord(tx, org, recordId);
+        if (stored === undefined) return noSuchRecord();
+        if (!stored.ok) {
+          return refusal(
+            ["recordId"],
+            "unreadable_record",
+            "The stored record no longer reads as a valid record; it needs repair.",
+          );
+        }
+        const before = stored.value.record;
+        const draft = readDraft(draftInput, org, "update");
+        if (!draft.ok) return found(draft.issues);
+        const namedId = own(draft.value, "id");
+        if (namedId !== undefined && namedId !== recordId) {
+          return found([issue(["id"], "wrong_record", "The draft is of another record.")]);
+        }
+        const content = contentOf(draft.value);
+        if (content.kind !== undefined && content.kind !== before.kind) {
+          return found([
+            issue(
+              ["kind"],
+              "kind_changed",
+              "A record's kind never changes; make a new record instead.",
+            ),
+          ]);
+        }
+        const valid = validateRecord({
+          fields: {},
+          ...(before.siteId === undefined ? {} : { siteId: before.siteId }),
+          ...content,
+          kind: before.kind,
+          id: before.id,
+          organizationId: org,
+          createdAt: before.createdAt,
+          updatedAt: before.updatedAt,
+        });
+        if (!valid.ok) return found(valid.issues);
+        const record = valid.value;
+        if (record.templateKey === undefined) {
+          return found([
+            issue(["templateKey"], "no_template_key", "Every record names its template."),
+          ]);
+        }
+        const hiddenLinks = await allowed.checker.hiddenAmong(addedLinks(record, before));
+        return found(
+          await recordCheckIssues(tx, record, before, {
+            messages: "own",
+            identifierFields: false,
+            hiddenLinks,
+          }),
+        );
+      });
+    },
+
+    async searchRecords(context, query, searchOptions) {
+      return run("searchRecords", context, async (tx, who) => {
+        const org = who.organizationId;
+        const opts = readOptions(searchOptions, ["limit", "after"]);
+        if (!opts.ok) return opts;
+        const access = await readAccess(tx, org, who.actor);
+        if (!access.ok) return access;
+        if (!holdsAnywhere(access.value, "records.view")) return notPermitted();
+        // Only whole sites the person sees every record of (D-074): a
+        // system manager every record; anyone else the sites of their
+        // whole-catalog view grants (every site of the organization for a
+        // grant on every site, never records on no site). Scoped grants
+        // (a unit's subtree) don't widen search yet (D-079): filtering by
+        // subtree in the query is a later task, and filtering the page
+        // afterwards would show, by a short page, that hidden records matched.
+        let sites: "all" | readonly string[];
+        if (access.value.systemManager) {
+          sites = "all";
+        } else {
+          const viewing = access.value.grants.filter(
+            (g) =>
+              g.scope === null &&
+              (ROLE_PERMISSIONS[g.role] as readonly Permission[]).includes("records.view"),
+          );
+          if (viewing.some((g) => g.siteId === null)) {
+            sites = await organizationSiteIds(tx, org);
+          } else {
+            sites = [...new Set(viewing.map((g) => g.siteId as string))];
+          }
+        }
+        // D-066: a statement_timeout for the search's own statement, so a
+        // costly query stops instead of holding a connection. SET LOCAL
+        // ends with this transaction.
+        await tx.rows(
+          sql`SELECT set_config('statement_timeout', ${String(searchTimeoutMs)}, true)`,
+        );
+        try {
+          const limit = own(opts.value, "limit");
+          const after = own(opts.value, "after");
+          const found = await searchStoredRecords(tx, org, query as string, {
+            ...(limit === undefined ? {} : { limit: limit as number }),
+            ...(after === undefined ? {} : { after: after as string }),
+            sites,
+          });
+          return found;
+        } catch (error) {
+          if (sqlState(error) === "57014") {
+            return refusal(
+              ["query"],
+              "search_timeout",
+              "The search took too long and was stopped. Try more specific words.",
+            );
+          }
+          throw error;
+        }
+      });
+    },
+
     ...adminOperations(run),
+    ...definitionOperations(run),
     submitForReview: workflowAction("submit_for_review"),
     returnToDraft: workflowAction("return_to_draft"),
     publish: workflowAction("publish"),

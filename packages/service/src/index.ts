@@ -22,7 +22,16 @@ export type {
   WorkflowChange,
   PublicChange,
   PublicChangeRequest,
+  RecordCheck,
 } from "./service.js";
+export { identifierTypeTag, MAX_TEMPLATE_RECORDS } from "./definitions.js";
+export type {
+  DefinitionOperations,
+  TemplateVersion,
+  TaggedIdentifierType,
+  SavedTemplate,
+  SavedIdentifierType,
+} from "./definitions.js";
 export { contextFromSession, NOT_PERMITTED_MESSAGE } from "./access.js";
 export type { SessionLike } from "./access.js";
 export type { AdminOperations, MyAccess, RoleRequest } from "./admin.js";

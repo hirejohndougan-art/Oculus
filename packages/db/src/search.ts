@@ -40,8 +40,17 @@
  * organization on every page (ranking can't use the index), and the GIN
  * index has no organization column, so a common word costs in proportion to
  * how many records hold it, across all organizations (about 260-540 ms at
- * 50,000 records). Whatever exposes this over HTTP (T-043) must set a
- * `statement_timeout` or cap the matches first (D-066).
+ * 50,000 records). Whatever exposes this over HTTP must set a
+ * `statement_timeout` or cap the matches first (D-066): the service's
+ * `searchRecords` (T-042, D-079) runs it under a `statement_timeout`.
+ *
+ * **Sites.** `sites` (T-042, D-074) narrows the search to records whose
+ * home site is one of the given sites: `"all"` (the default) searches
+ * every record of the organization, records on no site included; a list
+ * never matches a record on no site. It only narrows, never widens: it is
+ * not a public scope, and the service passes the sites the person may see
+ * every record of, so a hit, a page's length or its cursor never says that
+ * a record of another site matched.
  *
  * **Identifiers.** The whole query is also looked up as a number, by core's
  * `identifierKey` in `identifier_holdings` (current and former numbers of
@@ -63,9 +72,11 @@ import {
   identifierKey,
   isOrganizationId,
   isRecordId,
+  isSiteId,
   issue,
   type OrganizationId,
   type RecordId,
+  type SiteId,
   type Validated,
 } from "@oculus/core";
 import type { Queryable } from "./client.js";
@@ -98,9 +109,14 @@ export interface SearchResults {
 export interface SearchOptions {
   readonly limit?: number;
   readonly after?: string;
+  /** Only records whose home site is one of these; `"all"` (default) for every record. */
+  readonly sites?: "all" | readonly string[];
 }
 
-const OPTIONS: ReadonlySet<string> = new Set(["limit", "after"]);
+/** The most sites one search may name. */
+const MAX_SEARCH_SITES = 1000;
+
+const OPTIONS: ReadonlySet<string> = new Set(["limit", "after", "sites"]);
 /** The rank is ts_rank times this, as a whole number. */
 const RANK_SCALE = 1_000_000;
 /** group (0 identifier, 1 text only) . rank key . record ID */
@@ -129,9 +145,30 @@ interface Cursor {
   readonly id: RecordId;
 }
 
-function readOptions(options: unknown): Validated<{ limit: number; after: Cursor | null }> {
+interface ReadOptions {
+  limit: number;
+  after: Cursor | null;
+  sites: readonly SiteId[] | null;
+}
+
+function readSites(value: unknown): Validated<readonly SiteId[] | null> {
+  if (value === undefined || value === "all") return { ok: true, value: null };
+  if (!Array.isArray(value) || value.length > MAX_SEARCH_SITES) {
+    return refused(["sites"], "invalid_sites", 'sites is "all" or a list of site IDs.');
+  }
+  const sites: SiteId[] = [];
+  for (const site of value as unknown[]) {
+    if (!isSiteId(site)) {
+      return refused(["sites"], "invalid_sites", 'sites is "all" or a list of site IDs.');
+    }
+    sites.push(site);
+  }
+  return { ok: true, value: Object.freeze(sites) };
+}
+
+function readOptions(options: unknown): Validated<ReadOptions> {
   if (options === undefined)
-    return { ok: true, value: { limit: DEFAULT_SEARCH_LIMIT, after: null } };
+    return { ok: true, value: { limit: DEFAULT_SEARCH_LIMIT, after: null, sites: null } };
   if (typeof options !== "object" || options === null || Array.isArray(options)) {
     return refused(["options"], "invalid_options", "The options are an object.");
   }
@@ -146,15 +183,17 @@ function readOptions(options: unknown): Validated<{ limit: number; after: Cursor
       return refused(
         [String(key)],
         "unknown_option",
-        "Only limit and after can be given: staff search has no other scope.",
+        "Only limit, after and sites can be given: staff search has no other scope.",
       );
     }
   }
   let limitValue: unknown;
   let afterValue: unknown;
+  let sitesValue: unknown;
   try {
     limitValue = ownValue(options, "limit");
     afterValue = ownValue(options, "after");
+    sitesValue = ownValue(options, "sites");
   } catch {
     return refused(["options"], "invalid_options", "The options are an object.");
   }
@@ -171,7 +210,10 @@ function readOptions(options: unknown): Validated<{ limit: number; after: Cursor
       `The limit is a whole number from 1 to ${String(MAX_SEARCH_LIMIT)}.`,
     );
   }
-  if (afterValue === undefined) return { ok: true, value: { limit, after: null } };
+  const sites = readSites(sitesValue);
+  if (!sites.ok) return sites;
+  if (afterValue === undefined)
+    return { ok: true, value: { limit, after: null, sites: sites.value } };
   const match = typeof afterValue === "string" ? CURSOR.exec(afterValue) : null;
   const id = match?.[3];
   if (!match || !isRecordId(id)) {
@@ -179,7 +221,11 @@ function readOptions(options: unknown): Validated<{ limit: number; after: Cursor
   }
   return {
     ok: true,
-    value: { limit, after: { group: Number(match[1]), rankKey: match[2] ?? "0", id } },
+    value: {
+      limit,
+      after: { group: Number(match[1]), rankKey: match[2] ?? "0", id },
+      sites: sites.value,
+    },
   };
 }
 
@@ -233,8 +279,10 @@ export async function searchRecords(
   if (text === "") return refused(["query"], "empty_query", "Type something to search for.");
   const key = identifierKey(text);
   const numberKey = key === "" ? null : key;
-  const { limit, after } = read.value;
+  const { limit, after, sites } = read.value;
   const org = organizationId;
+  // Every record (null), or only those whose home site is listed.
+  const onSites = sql`(${sites === null}::boolean OR r.site_id = ANY(${sites ?? []}::uuid[]))`;
 
   const tsq = sql`websearch_to_tsquery('pg_catalog.simple'::regconfig, public.search_fold(${text}::text))`;
   const rows = await db.rows<HitRow>(sql`
@@ -246,6 +294,7 @@ export async function searchRecords(
       SELECT r.id, (ts_rank(r.search_document, ${tsq}) * ${RANK_SCALE}::double precision)::bigint AS rank_key
       FROM public.records r
       WHERE r.organization_id = ${org}::uuid
+        AND ${onSites}
         AND querytree(${tsq}) <> 'T'
         AND r.search_document @@ ${tsq}
     ), hits AS (
@@ -255,7 +304,7 @@ export async function searchRecords(
              CASE WHEN i.id IS NOT NULL THEN 0 ELSE 1 END AS grp,
              coalesce(t.rank_key, 0) AS rank_key
       FROM (SELECT id FROM by_identifier UNION SELECT id FROM by_text) m
-      JOIN public.records r ON r.organization_id = ${org}::uuid AND r.id = m.id
+      JOIN public.records r ON r.organization_id = ${org}::uuid AND r.id = m.id AND ${onSites}
       LEFT JOIN by_identifier i ON i.id = m.id
       LEFT JOIN by_text t ON t.id = m.id
     )
