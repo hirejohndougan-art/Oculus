@@ -205,6 +205,8 @@ export {
   SECOND_FACTOR_TABLE_PRIVILEGES,
   DEFAULT_TOTP_ISSUER,
   MAX_ENROLMENT_STARTS,
+  TOTP_CHAIN_LENGTH,
+  ENROLMENT_TOKEN_SECONDS,
 } from "./second-factor.js";
 export type {
   SecondStepRefusal,
@@ -215,6 +217,8 @@ export type {
   ReauthenticationInput,
   SecondFactorStatus,
   ResealResult,
+  EnrolmentMessage,
+  EnrolmentDelivery,
 } from "./second-factor.js";
 export {
   loadSecretKeyring,

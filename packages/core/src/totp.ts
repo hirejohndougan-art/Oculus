@@ -258,22 +258,22 @@ export function hashRecoveryCode(canonical: string): Uint8Array {
 // Throttling code attempts
 
 /**
- * The per-person counter for wrong codes (RFC 4226 §7.3, ASVS 5.0 6.3.1),
- * with D-068's rules (`throttleAttempt`: counted up front, no wait grows
- * while someone keeps trying, never a permanent lockout) but a longer
- * longest wait: a code has only a million values, and only someone who
- * already has the password can reach it. 5 free, then 1, 2, 4 … s up to an
- * hour, forgotten after a day without a failure. Someone who has the
- * password and keeps guessing gets about 17 tries in the first hour and 24
- * a day after that: with three codes valid at any moment, about a 1 in 4,500
- * chance a day, and about 3% over a whole year of trying. A notice to the
- * person after repeated wrong codes (a follow-up for the admin screens)
- * would cut that further.
+ * The per-person counter for wrong TOTP codes (RFC 4226 §7.3, ASVS 5.0
+ * 6.3.1), exactly D-068's account rule: counted up front, no wait grows
+ * while someone keeps trying, never a permanent lockout; 5 free, then 1,
+ * 2, 4 … s up to 15 minutes, forgotten after a day without a failure.
+ * Recovery codes don't count against it (D-077), so a guesser can make the
+ * person wait for TOTP but never keep them out. Someone who has the
+ * password and keeps guessing gets about 96 tries a day: with three codes
+ * valid at any moment, about a 1 in 3,500 chance a day, and about 10% over
+ * a year. So every wait is recorded (`second_step_alerts`) and the person
+ * and the system admins must be told (T-040/T-048, required before
+ * deployment, D-077).
  */
 export const SECOND_STEP_THROTTLE: ThrottleRule = Object.freeze({
   free: 5,
   baseSeconds: 1,
-  maxSeconds: 60 * 60,
+  maxSeconds: 15 * 60,
   resetAfterSeconds: 24 * 60 * 60,
 });
 

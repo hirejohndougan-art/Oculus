@@ -12,14 +12,22 @@
 -- that very session and its user, and that such a row can be written only
 -- with proof that no direct SQL can make up:
 --
---   totp      the next link of the factor's ratchet. At set-up the factor
---             stores sha256(r0), where r_g = HMAC-SHA-256(TOTP secret,
---             label, factor, g). A pass reveals r_g, which must hash to the
---             stored anchor, and stores sha256(r_{g+1}) in its place. Only
---             someone holding the TOTP secret (so the sealed secret and
---             OCULUS_SECRET_KEY) can compute the next link; SHA-256's
---             preimage resistance keeps everyone else out, and the step of
---             the code checked must be after the last one used (no replay).
+--   totp      the next link of the factor's hash chain (S/KEY style, read
+--             backwards). At set-up the application makes
+--             L_0 = HMAC-SHA-256(TOTP secret, label, factor) and
+--             L_{k+1} = sha256(L_k), and the factor stores L_N (N =
+--             chain_length) as its anchor. A pass reveals the next link
+--             back, which must hash to the stored anchor, and that link
+--             itself becomes the new anchor: nothing the pass's writer
+--             chooses. Only someone holding the TOTP secret (so the sealed
+--             secret and OCULUS_SECRET_KEY) can compute a link not yet
+--             revealed; SHA-256's preimage resistance keeps everyone else
+--             out. A link that leaked unused (it was never stored, only
+--             sent) gives at most the passes between it and the anchor,
+--             never the chain beyond it. The code's step must also be after
+--             the last one used (no replay). When the chain is used up the
+--             factor takes no more TOTP passes (recovery codes, then a
+--             reset); there is no re-seeding (D-077).
 --   recovery  an unused recovery code of the factor, hashed here (SHA-256)
 --             and compared with the stored hash. Works without the secret key.
 --
@@ -47,17 +55,20 @@ CREATE TABLE public.second_factors (
   -- The TOTP secret sealed with AES-256-GCM (secret-key.ts): version, key
   -- fingerprint, nonce, tag, then the 20-byte secret.
   secret_box bytea NOT NULL CHECK (octet_length(secret_box) BETWEEN 40 AND 200),
-  -- The ratchet (above): sha256 of the next link, and how many links passed.
+  -- The hash chain (above): the last link revealed (L_N at first), how
+  -- many links have been revealed, and how long the chain is.
   ratchet_anchor bytea NOT NULL CHECK (octet_length(ratchet_anchor) = 32),
   ratchet_generation bigint NOT NULL CHECK (ratchet_generation >= 0),
-  -- Given only in an UPDATE that moves the ratchet; the trigger checks and
-  -- clears it, so it is never stored.
-  ratchet_reveal bytea CHECK (ratchet_reveal IS NULL),
+  chain_length integer NOT NULL CHECK (chain_length BETWEEN 1 AND 1000000),
   -- The last TOTP step accepted (-1: none yet). Codes for it or earlier
   -- steps are never accepted again (RFC 6238 §5.2).
   last_step bigint NOT NULL CHECK (last_step >= -1),
   -- The session waiting for its second step that set this factor up.
   enrol_session_id uuid NOT NULL,
+  -- Set by the trigger: this set-up came after a system admin's reset and
+  -- was allowed by a one-time enrolment token (or follows one in the same
+  -- waiting session).
+  token_authorized boolean NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL,
   confirmed_at timestamptz,
   confirmed_xact xid8,
@@ -68,6 +79,7 @@ CREATE TABLE public.second_factors (
   -- take this record with it.
   revoked_by_pass uuid,
   UNIQUE (user_id, id),
+  CHECK (ratchet_generation <= chain_length),
   CHECK (CASE state
     WHEN 'pending' THEN confirmed_at IS NULL AND revoked_at IS NULL AND ratchet_generation = 0
       AND last_step = -1
@@ -105,11 +117,10 @@ CREATE TABLE public.second_step_passes (
   created_xact xid8 NOT NULL,
   -- The proof, given only in the INSERT; the trigger checks and clears it.
   reveal bytea,
-  next_anchor bytea,
   recovery_code text,
   FOREIGN KEY (user_id, factor_id) REFERENCES public.second_factors (user_id, id)
     ON DELETE CASCADE,
-  CHECK (reveal IS NULL AND next_anchor IS NULL AND recovery_code IS NULL),
+  CHECK (reveal IS NULL AND recovery_code IS NULL),
   CHECK ((purpose = 'admin_reset') = (target_user_id IS NOT NULL)),
   CHECK ((method = 'totp') = (step IS NOT NULL))
 );
@@ -144,17 +155,52 @@ CREATE INDEX second_step_recovery_codes_set ON public.second_step_recovery_codes
 CREATE INDEX second_step_recovery_codes_factor ON public.second_step_recovery_codes (factor_id);
 
 -- ---------------------------------------------------------------------------
--- Wrong-code counters (core's SECOND_STEP_THROTTLE): one per person
--- (user:<id>) and one per session waiting for its second step (session:<id>).
+-- Wrong-code counters: one per person for TOTP codes (user:<id>, core's
+-- SECOND_STEP_THROTTLE), one per session (session:<id>: a waiting session
+-- ends after 5 wrong codes; a full one takes no more), and one per client
+-- address (core's SOURCE_THROTTLE keys, as sign_in_throttles).
 
 CREATE TABLE public.second_step_throttles (
   key text PRIMARY KEY
-    CHECK (key ~ '^(user|session):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'),
+    CHECK (key ~ '^((user|session):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|source:v4:[0-9.]{7,15}|source:v6:[0-9a-f:]{7,39}::/64|source:other)$'),
   failures integer NOT NULL DEFAULT 0 CHECK (failures BETWEEN 0 AND 1000000),
   last_failure_at timestamptz
 );
 
 CREATE INDEX second_step_throttles_last_failure ON public.second_step_throttles (last_failure_at);
+
+-- A person's TOTP codes started to be refused with a wait (and every 10
+-- wrong codes after): someone who has their password is guessing. T-040 and
+-- T-048 tell the person and the system admins from these rows; that notice
+-- is required before deployment (D-077). Insert only.
+CREATE TABLE public.second_step_alerts (
+  id uuid PRIMARY KEY
+    CHECK (id::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'),
+  user_id uuid NOT NULL REFERENCES public.users (id) ON DELETE CASCADE,
+  failures integer NOT NULL CHECK (failures > 0),
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE INDEX second_step_alerts_user ON public.second_step_alerts (user_id, created_at);
+
+-- One-time enrolment tokens: after a system admin's reset, setting up again
+-- needs one, sent to the person's address (D-077), so the password alone
+-- (which the writer role can set, D-068) isn't enough. 32 random bytes,
+-- stored as SHA-256, made only with that admin_reset pass, used once.
+CREATE TABLE public.second_step_enrolment_tokens (
+  user_id uuid NOT NULL REFERENCES public.users (id) ON DELETE CASCADE,
+  token_hash bytea PRIMARY KEY CHECK (octet_length(token_hash) = 32),
+  created_by_pass uuid NOT NULL REFERENCES public.second_step_passes (id) ON DELETE CASCADE,
+  created_at timestamptz NOT NULL,
+  expires_at timestamptz NOT NULL,
+  used_at timestamptz,
+  used_xact xid8,
+  -- The token itself, only in the UPDATE that uses it; checked and cleared.
+  presented text CHECK (presented IS NULL),
+  CHECK (expires_at > created_at AND expires_at <= created_at + interval '7 days')
+);
+
+CREATE INDEX second_step_enrolment_tokens_user ON public.second_step_enrolment_tokens (user_id);
 
 -- ---------------------------------------------------------------------------
 -- The current TOTP step by the database's clock (30-second steps from the
@@ -189,8 +235,7 @@ AS $$
 BEGIN
   IF NOT (NEW.state = 'pending' AND NEW.ratchet_generation = 0 AND NEW.last_step = -1
           AND NEW.confirmed_at IS NULL AND NEW.confirmed_xact IS NULL
-          AND NEW.revoked_at IS NULL AND NEW.revoked_by_pass IS NULL
-          AND NEW.ratchet_reveal IS NULL) THEN
+          AND NEW.revoked_at IS NULL AND NEW.revoked_by_pass IS NULL) THEN
     RAISE EXCEPTION 'A new second factor starts pending, with its ratchet at the start.'
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'second_factors_new';
   END IF;
@@ -204,6 +249,28 @@ BEGIN
     RAISE EXCEPTION 'A second factor is set up from that person''s session waiting for its second step.'
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'second_factors_new_session';
   END IF;
+  -- After a system admin's reset (a factor revoked with a pass, and none
+  -- confirmed since), a one-time enrolment token must have been used in
+  -- this transaction, or an earlier set-up in this same waiting session
+  -- was allowed by one (starting again).
+  NEW.token_authorized := false;
+  IF EXISTS (
+      SELECT 1 FROM public.second_factors r
+      WHERE r.user_id = NEW.user_id AND r.state = 'revoked' AND r.revoked_by_pass IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM public.second_factors c
+                        WHERE c.user_id = NEW.user_id AND c.confirmed_at > r.revoked_at)) THEN
+    IF EXISTS (SELECT 1 FROM public.second_step_enrolment_tokens t
+               WHERE t.user_id = NEW.user_id AND t.used_xact = pg_current_xact_id()
+                 AND t.used_at >= now())
+       OR EXISTS (SELECT 1 FROM public.second_factors e
+                  WHERE e.user_id = NEW.user_id AND e.enrol_session_id = NEW.enrol_session_id
+                    AND e.token_authorized) THEN
+      NEW.token_authorized := true;
+    ELSE
+      RAISE EXCEPTION 'After a reset, setting up again needs the enrolment link sent to the person.'
+        USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'second_factors_new_token';
+    END IF;
+  END IF;
   RETURN NEW;
 END
 $$;
@@ -213,9 +280,9 @@ CREATE TRIGGER second_factors_check_new BEFORE INSERT ON public.second_factors
 
 -- A change to a factor:
 --  * nothing changes once revoked;
---  * the ratchet and last_step move only together, one link at a time, with
---    the link that hashes to the stored anchor (given in ratchet_reveal,
---    then cleared), and only to a later step within two of the clock's;
+--  * the chain and last_step move only together, one link back at a time:
+--    the new anchor must hash to the old one, within the chain's length,
+--    and only to a later step within two of the clock's;
 --  * pending becomes active only with a ratchet move (a code checked);
 --  * active becomes revoked only with a system admin's admin_reset pass for
 --    this person, made in this transaction;
@@ -245,8 +312,9 @@ BEGIN
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'second_factors_stamps';
   END IF;
   IF moved THEN
-    IF NOT (sha256(NEW.ratchet_reveal) = OLD.ratchet_anchor) IS TRUE
+    IF NOT (sha256(NEW.ratchet_anchor) = OLD.ratchet_anchor) IS TRUE
        OR NEW.ratchet_generation IS DISTINCT FROM OLD.ratchet_generation + 1
+       OR NEW.chain_length IS DISTINCT FROM OLD.chain_length
        OR NEW.state = 'revoked' THEN
       RAISE EXCEPTION 'The second step''s ratchet moves only with its next link.'
         USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'second_factors_ratchet';
@@ -256,11 +324,11 @@ BEGIN
       RAISE EXCEPTION 'That code was used already, or is not for now.'
         USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'second_factors_step';
     END IF;
-  ELSIF NEW.ratchet_reveal IS NOT NULL THEN
+  ELSIF NEW.chain_length IS DISTINCT FROM OLD.chain_length
+     OR NEW.token_authorized IS DISTINCT FROM OLD.token_authorized THEN
     RAISE EXCEPTION 'The second step''s ratchet moves only with its next link.'
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'second_factors_ratchet';
   END IF;
-  NEW.ratchet_reveal := NULL;
   IF NEW.state IS DISTINCT FROM OLD.state THEN
     IF OLD.state = 'pending' AND NEW.state = 'active' AND moved THEN
       NEW.confirmed_at := clock_timestamp();
@@ -357,7 +425,7 @@ BEGIN
   IF NEW.method = 'totp' THEN
     -- second_factors_check_change checks the link and the step.
     UPDATE public.second_factors
-    SET ratchet_reveal = NEW.reveal, ratchet_anchor = NEW.next_anchor,
+    SET ratchet_anchor = NEW.reveal,
         ratchet_generation = ratchet_generation + 1, last_step = NEW.step, state = 'active'
     WHERE id = f.id;
   ELSE
@@ -374,7 +442,6 @@ BEGIN
     END IF;
   END IF;
   NEW.reveal := NULL;
-  NEW.next_anchor := NULL;
   NEW.recovery_code := NULL;
   RETURN NEW;
 END
@@ -507,6 +574,67 @@ CREATE TRIGGER zzzz_second_step_recovery_codes_keep_identity BEFORE UPDATE
   ON public.second_step_recovery_codes
   FOR EACH ROW EXECUTE FUNCTION public.catalog_keep_identity(
     'user_id', 'factor_id', 'set_id', 'code_hash', 'created_at', 'created_xact');
+
+-- ---------------------------------------------------------------------------
+-- Enrolment token guards.
+
+-- Made only with a system admin's admin_reset pass for that person, in the
+-- same transaction; unused, stamped now.
+CREATE FUNCTION public.second_step_enrolment_tokens_check_new() RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  IF NOT (NEW.used_at IS NULL AND NEW.used_xact IS NULL AND NEW.presented IS NULL) THEN
+    RAISE EXCEPTION 'A new enrolment token is unused.'
+      USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'second_step_enrolment_tokens_new';
+  END IF;
+  NEW.created_at := clock_timestamp();
+  IF NOT EXISTS (
+      SELECT 1 FROM public.second_step_passes p JOIN public.users a ON a.id = p.user_id
+      WHERE p.id = NEW.created_by_pass AND p.purpose = 'admin_reset'
+        AND p.target_user_id = NEW.user_id AND public.second_step_pass_here(p)
+        AND a.system_admin AND a.disabled_at IS NULL) THEN
+    RAISE EXCEPTION 'Enrolment tokens are made only by a system admin''s reset.'
+      USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'second_step_enrolment_tokens_new';
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER second_step_enrolment_tokens_check_new BEFORE INSERT
+  ON public.second_step_enrolment_tokens
+  FOR EACH ROW EXECUTE FUNCTION public.second_step_enrolment_tokens_check_new();
+
+-- Used once, by presenting it (checked against its hash, then cleared),
+-- before it expires. Nothing else changes.
+CREATE FUNCTION public.second_step_enrolment_tokens_check_change() RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  IF NOT (OLD.used_at IS NULL AND NEW.used_at IS NOT NULL
+          AND OLD.expires_at > clock_timestamp()
+          AND (sha256(convert_to(NEW.presented, 'UTF8')) = OLD.token_hash) IS TRUE
+          AND NEW.expires_at = OLD.expires_at) THEN
+    RAISE EXCEPTION 'An enrolment token is used once, by presenting it, before it expires.'
+      USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'second_step_enrolment_tokens_use';
+  END IF;
+  NEW.used_at := clock_timestamp();
+  NEW.used_xact := pg_current_xact_id();
+  NEW.presented := NULL;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER second_step_enrolment_tokens_check_change BEFORE UPDATE
+  ON public.second_step_enrolment_tokens
+  FOR EACH ROW EXECUTE FUNCTION public.second_step_enrolment_tokens_check_change();
+
+CREATE TRIGGER zzzz_second_step_enrolment_tokens_keep_identity BEFORE UPDATE
+  ON public.second_step_enrolment_tokens
+  FOR EACH ROW EXECUTE FUNCTION public.catalog_keep_identity(
+    'user_id', 'token_hash', 'created_by_pass', 'created_at');
 
 -- ---------------------------------------------------------------------------
 -- Sessions: promotion, the switch copy and re-entering the password are tied
@@ -677,3 +805,9 @@ ALTER TABLE public.second_step_recovery_codes
   ENABLE ALWAYS TRIGGER second_step_recovery_codes_check_change;
 ALTER TABLE public.second_step_recovery_codes
   ENABLE ALWAYS TRIGGER zzzz_second_step_recovery_codes_keep_identity;
+ALTER TABLE public.second_step_enrolment_tokens
+  ENABLE ALWAYS TRIGGER second_step_enrolment_tokens_check_new;
+ALTER TABLE public.second_step_enrolment_tokens
+  ENABLE ALWAYS TRIGGER second_step_enrolment_tokens_check_change;
+ALTER TABLE public.second_step_enrolment_tokens
+  ENABLE ALWAYS TRIGGER zzzz_second_step_enrolment_tokens_keep_identity;

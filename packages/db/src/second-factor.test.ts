@@ -46,6 +46,8 @@ import {
   resetSecondFactor,
   secondFactorStatus,
   startEnrolment,
+  type EnrolmentDelivery,
+  type EnrolmentMessage,
 } from "./second-factor.js";
 import {
   FAKE_TEST_SECRET_KEY,
@@ -184,8 +186,13 @@ async function freshCode(userId: UserId): Promise<string> {
     SELECT last_step::text AS last FROM public.second_factors
     WHERE user_id = ${userId}::uuid AND state = 'active'`);
   const last = BigInt(rows[0]?.last ?? "-1");
-  const now = await stepNow();
-  for (const step of [now - 1n, now, now + 1n]) if (step > last) return hotp(f.secret, step);
+  // The current step first (one step back may leave the window before the
+  // check); if it and the next are used, wait for the clock to move on.
+  for (let i = 0; i < 70; i++) {
+    const now = await stepNow();
+    for (const step of [now, now + 1n]) if (step > last) return hotp(f.secret, step);
+    await new Promise((r) => setTimeout(r, 1000));
+  }
   throw new Error("no unused step in the window");
 }
 
@@ -201,7 +208,10 @@ async function full(
   org: OrganizationId,
 ): Promise<{ token: string; sessionId: SessionId }> {
   const p = await pending(userId, org);
-  const r = await completeSecondStep(db, keys, p.token, { recoveryCode: recovery(userId) });
+  const r = await completeSecondStep(db, keys, p.token, {
+    source: source(),
+    recoveryCode: recovery(userId),
+  });
   if (!r.ok) throw new Error(JSON.stringify(r));
   return { token: r.token, sessionId: p.sessionId };
 }
@@ -280,7 +290,7 @@ describe("the secret key", () => {
     const fake = { currentKeyId: keys.currentKeyId };
     await expect(startEnrolment(db, fake, newSessionToken())).rejects.toThrow(TypeError);
     await expect(
-      completeSecondStep(db, fake, newSessionToken(), { code: "123456" }),
+      completeSecondStep(db, fake, newSessionToken(), { source: source(), code: "123456" }),
     ).rejects.toThrow(TypeError);
   });
 });
@@ -299,7 +309,9 @@ describe("setting up at first sign-in", () => {
     if (!signIn.ok) throw new Error("no sign-in");
     const p = signIn.token;
     // Nothing to check yet.
-    expect(await completeSecondStep(db, keys, p, { code: "123456" })).toMatchObject({
+    expect(
+      await completeSecondStep(db, keys, p, { source: source(), code: "123456" }),
+    ).toMatchObject({
       code: "enrolment_required",
     });
     const start = await startEnrolment(db, keys, p, { issuer: "Invented Society" });
@@ -321,10 +333,10 @@ describe("setting up at first sign-in", () => {
     // A wrong code doesn't confirm it.
     const right = await codeAt(secret);
     const wrong = String((Number(right) + 1) % 1_000_000).padStart(6, "0");
-    expect(await confirmEnrolment(db, keys, p, { code: wrong })).toMatchObject({
+    expect(await confirmEnrolment(db, keys, p, { source: source(), code: wrong })).toMatchObject({
       code: "invalid_code",
     });
-    const done = await confirmEnrolment(db, keys, p, { code: right });
+    const done = await confirmEnrolment(db, keys, p, { source: source(), code: right });
     if (!done.ok) throw new Error(JSON.stringify(done));
     expect(done.recoveryCodes).toHaveLength(10);
     expect(new Set(done.recoveryCodes).size).toBe(10);
@@ -353,11 +365,14 @@ describe("setting up at first sign-in", () => {
       code: "already_enrolled",
     });
     // And the code just used can't sign in again (no replay).
-    expect(await completeSecondStep(db, keys, again.token, { code: right })).toMatchObject({
+    expect(
+      await completeSecondStep(db, keys, again.token, { source: source(), code: right }),
+    ).toMatchObject({
       code: "invalid_code",
     });
     // A recovery code from the set does.
     const r = await completeSecondStep(db, keys, again.token, {
+      source: source(),
       recoveryCode: (done.recoveryCodes[3] ?? "").toLowerCase().replaceAll("-", " "),
     });
     expect(r.ok).toBe(true);
@@ -372,16 +387,16 @@ describe("setting up at first sign-in", () => {
     const first = await startEnrolment(db, keys, a.token);
     if (!first.ok) throw new Error("no start");
     const secret = decodeBase32(first.secret) ?? new Uint8Array();
-    expect(await confirmEnrolment(db, keys, b.token, { code: await codeAt(secret) })).toMatchObject(
-      { code: "enrolment_required" },
-    );
+    expect(
+      await confirmEnrolment(db, keys, b.token, { source: source(), code: await codeAt(secret) }),
+    ).toMatchObject({ code: "enrolment_required" });
     const second = await startEnrolment(db, keys, a.token);
     if (!second.ok) throw new Error("no restart");
     expect(second.secret).not.toBe(first.secret);
     // The first secret no longer works.
-    expect(await confirmEnrolment(db, keys, a.token, { code: await codeAt(secret) })).toMatchObject(
-      { code: "invalid_code" },
-    );
+    expect(
+      await confirmEnrolment(db, keys, a.token, { source: source(), code: await codeAt(secret) }),
+    ).toMatchObject({ code: "invalid_code" });
     const states = await db.rows<{ state: string }>(sql`
       SELECT state FROM public.second_factors WHERE user_id = ${person.userId}::uuid ORDER BY created_at`);
     expect(states.map((s) => s.state)).toEqual(["revoked", "pending"]);
@@ -420,11 +435,15 @@ describe("setting up at first sign-in", () => {
     const start = await startEnrolment(db, keys, p.token);
     if (!start.ok) throw new Error("no start");
     const code = await codeAt(decodeBase32(start.secret) ?? new Uint8Array());
-    expect(await confirmEnrolment(db, keys, p.token, { code })).toMatchObject({
+    expect(await confirmEnrolment(db, keys, p.token, { source: source(), code })).toMatchObject({
       code: "choose_organization",
       organizationIds: [orgA, orgB].sort(),
     });
-    const done = await confirmEnrolment(db, keys, p.token, { code, organizationId: orgB });
+    const done = await confirmEnrolment(db, keys, p.token, {
+      source: source(),
+      code,
+      organizationId: orgB,
+    });
     expect(done).toMatchObject({ ok: true, session: { organizationId: orgB } });
   });
 });
@@ -442,13 +461,16 @@ describe("checking codes", () => {
       const near = [-1n, 0n, 1n].map((d) => hotp(f.secret, now + d));
       const code = await codeAt(f.secret, offset);
       if (near.includes(code)) continue;
-      expect(await completeSecondStep(db, keys, p.token, { code })).toMatchObject({
-        code: "invalid_code",
-      });
+      expect(await completeSecondStep(db, keys, p.token, { source: source(), code })).toMatchObject(
+        {
+          code: "invalid_code",
+        },
+      );
     }
     for (const offset of [-1n, 0n, 1n]) {
       const p = await pending(person.userId, org);
       const r = await completeSecondStep(db, keys, p.token, {
+        source: source(),
         code: await codeAt(f.secret, offset),
       });
       expect({ offset, ok: r.ok }).toEqual({ offset, ok: true });
@@ -457,7 +479,10 @@ describe("checking codes", () => {
     const p = await pending(person.userId, org);
     for (const offset of [-1n, 0n, 1n]) {
       expect(
-        await completeSecondStep(db, keys, p.token, { code: await codeAt(f.secret, offset) }),
+        await completeSecondStep(db, keys, p.token, {
+          source: source(),
+          code: await codeAt(f.secret, offset),
+        }),
       ).toMatchObject({ code: "invalid_code" });
     }
   });
@@ -492,7 +517,10 @@ describe("checking codes", () => {
       const wrong = String((Number(right) + 500_000) % 1_000_000).padStart(6, "0");
       const results = await Promise.all(
         Array.from({ length: 8 }, (_, i) =>
-          completeSecondStep(i % 2 === 0 ? db : other, keys, p.token, { code: wrong }),
+          completeSecondStep(i % 2 === 0 ? db : other, keys, p.token, {
+            source: source(),
+            code: wrong,
+          }),
         ),
       );
       const codes = results.map((r) => (r.ok ? "ok" : r.code)).sort();
@@ -501,38 +529,138 @@ describe("checking codes", () => {
       expect(codes.filter((c) => c === "too_many_attempts").length).toBeGreaterThanOrEqual(1);
       expect(await counters(person.userId)).toBe(5);
       // The session is gone: even the right code can't finish it now.
-      expect(await completeSecondStep(db, keys, p.token, { code: right })).toBe(NO_SESSION);
+      expect(await completeSecondStep(db, keys, p.token, { source: source(), code: right })).toBe(
+        NO_SESSION,
+      );
     } finally {
       await other.close();
     }
   });
 
-  it("makes a person wait after repeated wrong codes, across sessions, without checking the code", async () => {
+  it("makes a guesser at the cap wait for TOTP, but the person still gets in with a recovery code", async () => {
     await ready();
     const org = await organization();
     const person = await member(org);
+    // A password holder guessing TOTP codes, spaced out, has reached the cap.
     await db.execute(sql`
       INSERT INTO public.second_step_throttles (key, failures, last_failure_at)
-      VALUES (${`user:${person.userId}`}, 20, clock_timestamp())`);
+      VALUES (${`user:${person.userId}`}, 40, clock_timestamp())`);
     const p = await pending(person.userId, org);
     const r = await completeSecondStep(db, keys, p.token, {
+      source: source(),
       code: await freshCode(person.userId),
     });
     expect(r).toMatchObject({ ok: false, code: "throttled" });
-    expect(!r.ok && r.code === "throttled" && r.retryAfterSeconds).toBeGreaterThan(3000);
-    expect(await counters(person.userId)).toBe(20);
-    // Recovery codes wait too.
-    expect(
-      await completeSecondStep(db, keys, p.token, { recoveryCode: recovery(person.userId) }),
-    ).toMatchObject({ code: "throttled" });
-    // Once the wait is over, a right code clears the counter.
+    // At most 15 minutes (D-068's cap), never longer.
+    const wait = !r.ok && r.code === "throttled" ? r.retryAfterSeconds : 0;
+    expect(wait).toBeGreaterThan(800);
+    expect(wait).toBeLessThanOrEqual(900);
+    expect(await counters(person.userId)).toBe(40);
+    // The real person, from their own address, signs in with a recovery code.
+    const done = await completeSecondStep(db, keys, p.token, {
+      source: source(),
+      recoveryCode: recovery(person.userId),
+    });
+    expect(done.ok).toBe(true);
+    // The guesser's counter on TOTP stays.
+    expect(await counters(person.userId)).toBe(40);
+    // Once the wait is over, a right code clears it.
     await db.execute(sql`UPDATE public.second_step_throttles
-      SET last_failure_at = clock_timestamp() - interval '2 hours'
+      SET last_failure_at = clock_timestamp() - interval '20 minutes'
       WHERE key = ${`user:${person.userId}`}`);
+    const q = await pending(person.userId, org);
     expect(
-      (await completeSecondStep(db, keys, p.token, { code: await freshCode(person.userId) })).ok,
+      (
+        await completeSecondStep(db, keys, q.token, {
+          source: source(),
+          code: await freshCode(person.userId),
+        })
+      ).ok,
     ).toBe(true);
     expect(await counters(person.userId)).toBe(0);
+  });
+
+  it("records an alert when a person's wrong codes start a wait, for the notice", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const right = await freshCode(person.userId);
+    const wrong = String((Number(right) + 500_000) % 1_000_000).padStart(6, "0");
+    // Five wrong codes over two waiting sessions (four in one, one in another).
+    const a = await pending(person.userId, org);
+    for (let i = 0; i < 4; i++) {
+      await completeSecondStep(db, keys, a.token, { source: source(), code: wrong });
+    }
+    const alerts = async () =>
+      (
+        await db.rows<{ failures: number }>(sql`
+          SELECT failures FROM public.second_step_alerts WHERE user_id = ${person.userId}::uuid`)
+      ).map((x) => x.failures);
+    expect(await alerts()).toEqual([]);
+    const b = await pending(person.userId, org);
+    await completeSecondStep(db, keys, b.token, { source: source(), code: wrong });
+    expect(await alerts()).toEqual([5]);
+    // Recovery codes, never a wait for the person, raise none.
+    await completeSecondStep(db, keys, b.token, {
+      source: source(),
+      recoveryCode: "0000-0000-0000-0000-0000-0000",
+    });
+    expect(await alerts()).toEqual([5]);
+  });
+
+  it("limits wrong codes, recovery codes included, per client address", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const from = source();
+    await db.execute(sql`
+      INSERT INTO public.second_step_throttles (key, failures, last_failure_at)
+      VALUES (${`source:v4:${from}`}, 30, clock_timestamp())`);
+    const p = await pending(person.userId, org);
+    expect(
+      await completeSecondStep(db, keys, p.token, {
+        source: from,
+        recoveryCode: recovery(person.userId),
+      }),
+    ).toMatchObject({ code: "throttled" });
+  });
+
+  it("stops taking TOTP codes when the hash chain is used up; recovery codes still work", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org, { factor: false });
+    factors.set(person.userId, await giveTestFactor(db, keys, person.userId, 5, 2));
+    for (let i = 0; i < 2; i++) {
+      const p = await pending(person.userId, org);
+      const r = await completeSecondStep(db, keys, p.token, {
+        source: source(),
+        code: await freshCode(person.userId),
+      });
+      expect(r.ok).toBe(true);
+      // The stored anchor is now the link just revealed: it hashes to the one before.
+    }
+    const chain = await db.rows<{ generation: string; anchor: Buffer }>(sql`
+      SELECT ratchet_generation::text AS generation, ratchet_anchor AS anchor
+      FROM public.second_factors WHERE user_id = ${person.userId}::uuid`);
+    expect(chain[0]?.generation).toBe("2");
+    const p = await pending(person.userId, org);
+    expect(
+      await completeSecondStep(db, keys, p.token, {
+        source: source(),
+        code: hotp(
+          factors.get(person.userId)?.secret ?? new Uint8Array(20),
+          (await stepNow()) + 1n,
+        ),
+      }),
+    ).toMatchObject({ code: "second_step_unavailable" });
+    expect(
+      (
+        await completeSecondStep(db, keys, p.token, {
+          source: source(),
+          recoveryCode: recovery(person.userId),
+        })
+      ).ok,
+    ).toBe(true);
   });
 
   it("says when the secret can't be opened, and recovery codes still work then", async () => {
@@ -542,12 +670,19 @@ describe("checking codes", () => {
     const p = await pending(person.userId, org);
     const otherKeys = loadSecretKeyring({ OCULUS_SECRET_KEY: FAKE_TEST_SECRET_KEY_2 });
     expect(
-      await completeSecondStep(db, otherKeys, p.token, { code: await freshCode(person.userId) }),
+      await completeSecondStep(db, otherKeys, p.token, {
+        source: source(),
+        code: await freshCode(person.userId),
+      }),
     ).toMatchObject({ code: "second_step_unavailable" });
     expect(await counters(person.userId)).toBe(0);
     expect(
-      (await completeSecondStep(db, otherKeys, p.token, { recoveryCode: recovery(person.userId) }))
-        .ok,
+      (
+        await completeSecondStep(db, otherKeys, p.token, {
+          source: source(),
+          recoveryCode: recovery(person.userId),
+        })
+      ).ok,
     ).toBe(true);
   });
 });
@@ -559,25 +694,34 @@ describe("recovery codes", () => {
     const person = await member(org);
     const code = recovery(person.userId);
     const p = await pending(person.userId, org);
-    const s = await completeSecondStep(db, keys, p.token, { recoveryCode: code });
+    const s = await completeSecondStep(db, keys, p.token, { source: source(), recoveryCode: code });
     if (!s.ok) throw new Error("no sign-in");
     const q = await pending(person.userId, org);
-    expect(await completeSecondStep(db, keys, q.token, { recoveryCode: code })).toMatchObject({
+    expect(
+      await completeSecondStep(db, keys, q.token, { source: source(), recoveryCode: code }),
+    ).toMatchObject({
       code: "invalid_code",
     });
     const old = recovery(person.userId);
     const made = await regenerateRecoveryCodes(db, keys, s.token, {
+      source: source(),
       code: await freshCode(person.userId),
     });
     if (!made.ok) throw new Error(JSON.stringify(made));
     expect(made.recoveryCodes).toHaveLength(10);
-    expect(await completeSecondStep(db, keys, q.token, { recoveryCode: old })).toMatchObject({
+    expect(
+      await completeSecondStep(db, keys, q.token, { source: source(), recoveryCode: old }),
+    ).toMatchObject({
       code: "invalid_code",
     });
     expect(await secondFactorStatus(db, s.token)).toMatchObject({ recoveryCodesLeft: 10 });
     expect(
-      (await completeSecondStep(db, keys, q.token, { recoveryCode: made.recoveryCodes[0] ?? "" }))
-        .ok,
+      (
+        await completeSecondStep(db, keys, q.token, {
+          source: source(),
+          recoveryCode: made.recoveryCodes[0] ?? "",
+        })
+      ).ok,
     ).toBe(true);
     // Each use is logged as a pass.
     const used = await db.rows<{ n: number }>(sql`
@@ -585,9 +729,51 @@ describe("recovery codes", () => {
       WHERE user_id = ${person.userId}::uuid AND method = 'recovery'`);
     expect(used[0]?.n).toBe(2);
     // A new set needs a second step.
-    expect(await regenerateRecoveryCodes(db, keys, s.token, { code: "000000" })).toMatchObject({
+    expect(
+      await regenerateRecoveryCodes(db, keys, s.token, { source: source(), code: "000000" }),
+    ).toMatchObject({
       ok: false,
     });
+  });
+
+  it("are replaced only after a recent re-entry, with at most 5 wrong codes per session", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const s = await full(person.userId, org);
+    await ageSession(s.sessionId, 11 * 60);
+    // A stolen session cookie alone, without the password: refused before any code.
+    expect(
+      await regenerateRecoveryCodes(db, keys, s.token, {
+        source: source(),
+        code: await freshCode(person.userId),
+      }),
+    ).toMatchObject({ code: "reauthentication_required" });
+    const again = await reauthenticate(db, keys, s.token, {
+      password: PASSWORD,
+      source: source(),
+      recoveryCode: recovery(person.userId),
+    });
+    if (!again.ok) throw new Error(JSON.stringify(again));
+    const right = await freshCode(person.userId);
+    const wrong = String((Number(right) + 500_000) % 1_000_000).padStart(6, "0");
+    const results: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const r = await regenerateRecoveryCodes(db, keys, again.token, {
+        source: source(),
+        code: wrong,
+      });
+      results.push(r.ok ? "ok" : r.code);
+    }
+    expect(results).toEqual([
+      "invalid_code",
+      "invalid_code",
+      "invalid_code",
+      "invalid_code",
+      "too_many_attempts",
+    ]);
+    // The session is signed out.
+    expect(await resolveSession(db, again.token)).toBe(NO_SESSION);
   });
 
   it("can't be used by another person, or for another person's session", async () => {
@@ -598,13 +784,24 @@ describe("recovery codes", () => {
     const bob = await member(orgB);
     const p = await pending(bob.userId, orgB);
     expect(
-      await completeSecondStep(db, keys, p.token, { recoveryCode: recovery(alice.userId) }),
+      await completeSecondStep(db, keys, p.token, {
+        source: source(),
+        recoveryCode: recovery(alice.userId),
+      }),
     ).toMatchObject({ code: "invalid_code" });
     expect(
-      await completeSecondStep(db, keys, p.token, { code: await freshCode(alice.userId) }),
+      await completeSecondStep(db, keys, p.token, {
+        source: source(),
+        code: await freshCode(alice.userId),
+      }),
     ).toMatchObject({ code: "invalid_code" });
     expect(
-      (await completeSecondStep(db, keys, p.token, { code: await freshCode(bob.userId) })).ok,
+      (
+        await completeSecondStep(db, keys, p.token, {
+          source: source(),
+          code: await freshCode(bob.userId),
+        })
+      ).ok,
     ).toBe(true);
   });
 });
@@ -616,24 +813,93 @@ describe("races on two connections", () => {
     try {
       const org = await organization();
       const person = await member(org);
-      for (let round = 0; round < 3; round++) {
+      for (let round = 0; round < 2; round++) {
         const a = await pending(person.userId, org);
         const b = await pending(person.userId, org);
         const code = await freshCode(person.userId);
         const both = await Promise.all([
-          completeSecondStep(db, keys, a.token, { code }),
-          completeSecondStep(other, keys, b.token, { code }),
+          completeSecondStep(db, keys, a.token, { source: source(), code }),
+          completeSecondStep(other, keys, b.token, { source: source(), code }),
         ]);
         expect(both.filter((r) => r.ok)).toHaveLength(1);
         expect(both.find((r) => !r.ok)).toMatchObject({ code: "invalid_code" });
         const c = await pending(person.userId, org);
         const rc = recovery(person.userId);
         const same = await Promise.all([
-          completeSecondStep(db, keys, c.token, { recoveryCode: rc }),
-          completeSecondStep(other, keys, c.token, { recoveryCode: rc }),
+          completeSecondStep(db, keys, c.token, { source: source(), recoveryCode: rc }),
+          completeSecondStep(other, keys, c.token, { source: source(), recoveryCode: rc }),
         ]);
         expect(same.filter((r) => r.ok)).toHaveLength(1);
       }
+    } finally {
+      await other.close();
+    }
+  });
+});
+
+describe("a lost race isn't a wrong code", () => {
+  it("gives back the attempt of a right code another connection used first", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const a = await pending(person.userId, org);
+    const b = await pending(person.userId, org);
+    const code = await freshCode(person.userId);
+    const holder = openDatabase(testDb.url, { max: 1 });
+    const other = openDatabase(testDb.url, { max: 4 });
+    try {
+      // Both check the code before either writes its pass: the factor row
+      // is held until both are waiting on it.
+      let release: () => void = () => undefined;
+      const held = new Promise<void>((r) => (release = r));
+      const holding = holder.transaction(async (tx) => {
+        await tx.rows(sql`SELECT 1 FROM public.second_factors
+          WHERE user_id = ${person.userId}::uuid AND state = 'active' FOR UPDATE`);
+        await held;
+      });
+      const racing = Promise.all([
+        completeSecondStep(db, keys, a.token, { source: source(), code }),
+        completeSecondStep(other, keys, b.token, { source: source(), code }),
+      ]);
+      for (let i = 0; i < 200; i++) {
+        const waiting = await db.rows(sql`
+          SELECT 1 FROM pg_stat_activity
+          WHERE datname = current_database() AND wait_event_type = 'Lock'`);
+        if (waiting.length >= 2) break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      release();
+      await holding;
+      const both = await racing;
+      expect(both.filter((r) => r.ok)).toHaveLength(1);
+      expect(both.find((r) => !r.ok)).toMatchObject({ code: "invalid_code" });
+      const loser = both[0].ok ? b : a;
+      const rows = await db.rows<{ key: string; failures: number }>(sql`
+        SELECT key, failures FROM public.second_step_throttles
+        WHERE key IN (${`user:${person.userId}`}, ${`session:${loser.sessionId}`})`);
+      expect(rows.every((r) => r.failures === 0)).toBe(true);
+    } finally {
+      await holder.close();
+      await other.close();
+    }
+  });
+
+  it("serialises two set-up starts for one person, counting nothing", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org, { factor: false });
+    const p = await pending(person.userId, org);
+    const other = openDatabase(testDb.url, { max: 2 });
+    try {
+      const both = await Promise.all([
+        startEnrolment(db, keys, p.token),
+        startEnrolment(other, keys, p.token),
+      ]);
+      expect(both.every((r) => r.ok)).toBe(true);
+      const live = await db.rows(sql`SELECT 1 FROM public.second_factors
+        WHERE user_id = ${person.userId}::uuid AND state = 'pending'`);
+      expect(live).toHaveLength(1);
+      expect(await counters(person.userId)).toBe(0);
     } finally {
       await other.close();
     }
@@ -679,12 +945,18 @@ describe("a system admin's reset", () => {
     const person = await member(org);
     const theirs = await full(person.userId, org);
     const adminSession = await full(admin, org);
+    const sent: EnrolmentMessage[] = [];
     // A person who isn't a system admin can't.
     expect(
       codesOf(
-        await resetSecondFactor(db, keys, theirs.token, admin, {
-          recoveryCode: recovery(person.userId),
-        }),
+        await resetSecondFactor(
+          db,
+          keys,
+          theirs.token,
+          admin,
+          { source: source(), recoveryCode: recovery(person.userId) },
+          deliverTo(sent),
+        ),
       ),
     ).toEqual(["not_permitted"]);
     // Recent means within 10 minutes of entering the password again.
@@ -705,9 +977,14 @@ describe("a system admin's reset", () => {
     });
     expect(
       codesOf(
-        await resetSecondFactor(db, keys, adminSession.token, person.userId, {
-          recoveryCode: recovery(admin),
-        }),
+        await resetSecondFactor(
+          db,
+          keys,
+          adminSession.token,
+          person.userId,
+          { source: source(), recoveryCode: recovery(admin) },
+          deliverTo(sent),
+        ),
       ),
     ).toEqual(["reauthentication_required"]);
     const again = await reauthenticate(db, keys, adminSession.token, {
@@ -717,31 +994,180 @@ describe("a system admin's reset", () => {
     });
     if (!again.ok) throw new Error(JSON.stringify(again));
     expect(
-      codesOf(await resetSecondFactor(db, keys, again.token, person.userId, { code: "000000" })),
+      codesOf(
+        await resetSecondFactor(
+          db,
+          keys,
+          again.token,
+          person.userId,
+          { source: source(), code: "000000" },
+          deliverTo(sent),
+        ),
+      ),
     ).toEqual(["invalid_code"]);
     expect(
       codesOf(
-        await resetSecondFactor(db, keys, again.token, newSessionId() as unknown as UserId, {
-          recoveryCode: recovery(admin),
-        }),
+        await resetSecondFactor(
+          db,
+          keys,
+          again.token,
+          newSessionId() as unknown as UserId,
+          { source: source(), recoveryCode: recovery(admin) },
+          deliverTo(sent),
+        ),
       ),
     ).toEqual(["unknown_user"]);
-    const done = await resetSecondFactor(db, keys, again.token, person.userId, {
-      recoveryCode: recovery(admin),
-    });
-    expect(ok(done)).toEqual({ reset: true, ended: 1 });
+    const done = await resetSecondFactor(
+      db,
+      keys,
+      again.token,
+      person.userId,
+      { source: source(), recoveryCode: recovery(admin) },
+      deliverTo(sent),
+    );
+    expect(ok(done)).toEqual({ reset: true, ended: 1, delivered: true });
     expect(await resolveSession(db, theirs.token)).toBe(NO_SESSION);
+    // One message, to their address, with a token that appears nowhere else.
+    expect(sent).toHaveLength(1);
+    const message = sent[0];
+    if (message === undefined) throw new Error("nothing sent");
+    expect(message.email).toBe(person.email);
+    expect(JSON.stringify(done)).not.toContain(message.token);
+    const stored = await db.rows<{ row: string }>(sql`
+      SELECT to_jsonb(t)::text AS row FROM public.second_step_enrolment_tokens t
+      WHERE user_id = ${person.userId}::uuid`);
+    expect(stored).toHaveLength(1);
+    expect(stored[0]?.row).not.toContain(message.token);
     // Their old recovery codes and authenticator stop; they must set up again.
     const p = await pending(person.userId, org);
     expect(
-      await completeSecondStep(db, keys, p.token, { recoveryCode: recovery(person.userId) }),
+      await completeSecondStep(db, keys, p.token, {
+        source: source(),
+        recoveryCode: recovery(person.userId),
+      }),
     ).toMatchObject({ code: "enrolment_required" });
-    const start = await startEnrolment(db, keys, p.token);
+    // The password alone (a waiting session) isn't enough: the emailed token is.
+    expect(await startEnrolment(db, keys, p.token)).toMatchObject({
+      code: "enrolment_token_required",
+    });
+    expect(
+      await startEnrolment(db, keys, p.token, { enrolmentToken: newSessionToken() }),
+    ).toMatchObject({ code: "enrolment_token_required" });
+    const start = await startEnrolment(db, keys, p.token, { enrolmentToken: message.token });
     expect(start.ok).toBe(true);
+    // Starting again in the same waiting session needs no second token.
+    const restart = await startEnrolment(db, keys, p.token);
+    if (!restart.ok) throw new Error(JSON.stringify(restart));
+    // Another waiting session can't use the token again, or start without it.
+    const q = await pending(person.userId, org);
+    for (const options of [{}, { enrolmentToken: message.token }]) {
+      expect(await startEnrolment(db, keys, q.token, options)).toMatchObject({
+        code: "enrolment_token_required",
+      });
+    }
+    const confirmed = await confirmEnrolment(db, keys, p.token, {
+      source: source(),
+      code: await codeAt(decodeBase32(restart.secret) ?? new Uint8Array()),
+    });
+    expect(confirmed.ok).toBe(true);
     // The admin's own session is untouched.
     expect((await resolveSession(db, again.token)).ok).toBe(true);
+    // The writer can't mint an enrolment token without a reset.
+    await expect(
+      db.execute(sql`INSERT INTO public.second_step_enrolment_tokens
+          (user_id, token_hash, created_by_pass, created_at, expires_at)
+        SELECT ${person.userId}::uuid, sha256('FAKE token'::bytea), id, now(),
+               now() + interval '1 day'
+        FROM public.second_step_passes WHERE purpose = 'admin_reset' LIMIT 1`),
+    ).rejects.toMatchObject({ constraint: "second_step_enrolment_tokens_new" });
+  });
+
+  it("locks user rows before factor rows, so it can't deadlock with a promotion", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const deadlocks = async () =>
+      Number(
+        (
+          await db.rows<{ n: string }>(sql`
+            SELECT deadlocks::text AS n FROM pg_stat_database WHERE datname = current_database()`)
+        )[0]?.n ?? "0",
+      );
+    const adminSession = await full(admin, org);
+    const again = await reauthenticate(db, keys, adminSession.token, {
+      password: ADMIN_PASSWORD,
+      source: source(),
+      recoveryCode: recovery(admin),
+    });
+    if (!again.ok) throw new Error(JSON.stringify(again));
+    const before = await deadlocks();
+    const holder = openDatabase(testDb.url, { max: 1 });
+    const resetter = openDatabase(testDb.url, { max: 2 });
+    try {
+      // A promotion of the person, pinned mid-way: it holds their user row
+      // FOR SHARE and is about to lock the admin's factor (as a pass would).
+      let release: () => void = () => undefined;
+      const held = new Promise<void>((r) => (release = r));
+      const holding = holder.transaction(async (tx) => {
+        await tx.execute(sql`SET LOCAL lock_timeout = '10s'`);
+        await tx.rows(sql`SELECT 1 FROM public.users WHERE id = ${person.userId}::uuid FOR SHARE`);
+        await held;
+        await tx.rows(sql`SELECT 1 FROM public.second_factors
+          WHERE user_id = ${admin}::uuid AND state = 'active' FOR UPDATE`);
+      });
+      const resetting = resetSecondFactor(
+        resetter,
+        keys,
+        again.token,
+        person.userId,
+        { source: source(), recoveryCode: recovery(admin) },
+        deliverTo([]),
+      );
+      // Wait until the reset is waiting on a lock (the person's user row).
+      for (let i = 0; i < 200; i++) {
+        const waiting = await db.rows(sql`
+          SELECT 1 FROM pg_stat_activity
+          WHERE datname = current_database() AND wait_event_type = 'Lock'`);
+        if (waiting.length > 0) break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      release();
+      await holding;
+      expect(ok(await resetting)).toMatchObject({ reset: true });
+    } finally {
+      await holder.close();
+      await resetter.close();
+    }
+    expect(await deadlocks()).toBe(before);
   });
 });
+
+/** Moves a session back in time by `seconds`, as the owner, with its guards off inside the transaction only. */
+async function ageSession(sessionId: SessionId, seconds: number): Promise<void> {
+  await db.transaction(async (q) => {
+    await q.execute(sql`ALTER TABLE public.sessions DISABLE TRIGGER sessions_check_change`);
+    await q.execute(sql`ALTER TABLE public.sessions DISABLE TRIGGER zzzz_sessions_keep_identity`);
+    await q.execute(sql`UPDATE public.sessions SET
+        password_at = password_at - make_interval(secs => ${seconds}),
+        signed_in_at = signed_in_at - make_interval(secs => ${seconds}),
+        created_at = created_at - make_interval(secs => ${seconds}),
+        rotated_at = rotated_at - make_interval(secs => ${seconds}),
+        second_step_at = second_step_at - make_interval(secs => ${seconds}),
+        expires_at = expires_at - make_interval(secs => ${seconds})
+      WHERE id = ${sessionId}::uuid`);
+    await q.execute(sql`ALTER TABLE public.sessions ENABLE ALWAYS TRIGGER sessions_check_change`);
+    await q.execute(
+      sql`ALTER TABLE public.sessions ENABLE ALWAYS TRIGGER zzzz_sessions_keep_identity`,
+    );
+  });
+}
+
+function deliverTo(box: EnrolmentMessage[]): EnrolmentDelivery {
+  return (message) => {
+    box.push(message);
+    return Promise.resolve();
+  };
+}
 
 function codesOf(result: Validated<unknown>): string[] {
   return result.ok ? [] : result.issues.map((i) => i.code);
@@ -759,8 +1185,11 @@ describe("the secret never leaves the package", () => {
     const hex = Buffer.from(secret).toString("hex");
     const seen: unknown[] = [];
     const results: unknown[] = [];
-    results.push(await confirmEnrolment(db, keys, p.token, { code: "000000" }));
-    const done = await confirmEnrolment(db, keys, p.token, { code: await codeAt(secret) });
+    results.push(await confirmEnrolment(db, keys, p.token, { source: source(), code: "000000" }));
+    const done = await confirmEnrolment(db, keys, p.token, {
+      source: source(),
+      code: await codeAt(secret),
+    });
     results.push(done);
     if (!done.ok) throw new Error("no set-up");
     results.push(await secondFactorStatus(db, done.token));
@@ -775,7 +1204,7 @@ describe("the secret never leaves the package", () => {
           slow,
           keys,
           q.token,
-          { recoveryCode: done.recoveryCodes[0] ?? "" },
+          { source: source(), recoveryCode: done.recoveryCodes[0] ?? "" },
           { onError: (e) => seen.push(e) },
         ),
       );
@@ -810,7 +1239,12 @@ describe("key rotation", () => {
     const onlyNew = loadSecretKeyring({ OCULUS_SECRET_KEY: FAKE_TEST_SECRET_KEY_2 });
     const p = await pending(person.userId, org);
     expect(
-      (await completeSecondStep(db, onlyNew, p.token, { code: await freshCode(person.userId) })).ok,
+      (
+        await completeSecondStep(db, onlyNew, p.token, {
+          source: source(),
+          code: await freshCode(person.userId),
+        })
+      ).ok,
     ).toBe(true);
     // Back to the test key for the rest of the file.
     const back = loadSecretKeyring({
@@ -914,6 +1348,7 @@ describe("the database promotes only with a real second step", () => {
       const person = await member(orgA);
       const p = await pending(person.userId, orgA);
       const s = await completeSecondStep(writer, keys, p.token, {
+        source: source(),
         code: await freshCode(person.userId),
       });
       if (!s.ok) throw new Error(JSON.stringify(s));
@@ -922,12 +1357,14 @@ describe("the database promotes only with a real second step", () => {
       const start = await startEnrolment(writer, keys, np.token);
       if (!start.ok) throw new Error("no start");
       const enrolled = await confirmEnrolment(writer, keys, np.token, {
+        source: source(),
         code: await codeAt(decodeBase32(start.secret) ?? new Uint8Array()),
       });
       expect(enrolled.ok).toBe(true);
       expect(
         (
           await regenerateRecoveryCodes(writer, keys, s.token, {
+            source: source(),
             recoveryCode: recovery(person.userId),
           })
         ).ok,
@@ -960,17 +1397,23 @@ describe("the database promotes only with a real second step", () => {
       ] as const) {
         await refusedWith(
           sql`INSERT INTO public.second_step_passes (id, user_id, factor_id, session_id, purpose,
-                method, step, created_at, created_xact, reveal, next_anchor, recovery_code)
+                method, step, created_at, created_xact, reveal, recovery_code)
               VALUES (gen_random_uuid(), ${victim.userId}::uuid, ${vFactor}::uuid,
                 ${v.sessionId}::uuid, 'sign_in', ${method}, ${step}::bigint, now(),
-                pg_current_xact_id(), ${reveal}::bytea, ${reveal}::bytea, ${code})`,
+                pg_current_xact_id(), ${reveal}::bytea, ${code})`,
           /^(second_factors_ratchet|second_step_passes_code)$/,
         );
       }
-      // 3. Move the ratchet or the last step directly.
+      // 3. Move the chain to an anchor of its choosing, lengthen it, or move
+      // the last step directly.
       await refusedWith(
         sql`UPDATE public.second_factors SET ratchet_anchor = ${Buffer.alloc(32, 2)},
-              ratchet_generation = ratchet_generation + 1, ratchet_reveal = ${Buffer.alloc(32, 3)}
+              ratchet_generation = ratchet_generation + 1, last_step = public.totp_step_now()
+            WHERE id = ${vFactor}::uuid`,
+        "second_factors_ratchet",
+      );
+      await refusedWith(
+        sql`UPDATE public.second_factors SET chain_length = chain_length + 1000
             WHERE id = ${vFactor}::uuid`,
         "second_factors_ratchet",
       );
@@ -985,9 +1428,10 @@ describe("the database promotes only with a real second step", () => {
       );
       await expect(
         writer.execute(sql`INSERT INTO public.second_factors (id, user_id, kind, state, secret_box,
-            ratchet_anchor, ratchet_generation, last_step, enrol_session_id, created_at)
+            ratchet_anchor, ratchet_generation, chain_length, last_step, enrol_session_id,
+            created_at)
           VALUES (gen_random_uuid(), ${victim.userId}::uuid, 'totp', 'pending',
-            ${Buffer.alloc(60, 4)}, ${Buffer.alloc(32, 5)}, 0, -1, ${v.sessionId}::uuid, now())`),
+            ${Buffer.alloc(60, 4)}, ${Buffer.alloc(32, 5)}, 0, 100, -1, ${v.sessionId}::uuid, now())`),
       ).rejects.toMatchObject({ code: "23505" });
       // 5. Add recovery codes it knows, or use one up without it.
       await refusedWith(
@@ -1032,8 +1476,12 @@ describe("the database promotes only with a real second step", () => {
       });
       // The victim's session is still waiting, and their real code still works.
       expect(
-        (await completeSecondStep(writer, keys, v.token, { code: await freshCode(victim.userId) }))
-          .ok,
+        (
+          await completeSecondStep(writer, keys, v.token, {
+            source: source(),
+            code: await freshCode(victim.userId),
+          })
+        ).ok,
       ).toBe(true);
       // Switching copies the pass along (the database checks it matches).
       const memberOfB = await member(orgA);

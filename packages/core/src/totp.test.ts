@@ -206,16 +206,16 @@ describe("recovery codes", () => {
 });
 
 describe("the code throttle", () => {
-  it("allows 5 free wrong codes, then waits doubling to an hour, never forever", () => {
+  it("allows 5 free wrong codes, then waits doubling to 15 minutes, never forever", () => {
     expect(throttleDelaySeconds(SECOND_STEP_THROTTLE, 4)).toBe(0);
     expect(throttleDelaySeconds(SECOND_STEP_THROTTLE, 5)).toBe(1);
     expect(throttleDelaySeconds(SECOND_STEP_THROTTLE, 6)).toBe(2);
-    expect(throttleDelaySeconds(SECOND_STEP_THROTTLE, 40)).toBe(3600);
+    expect(throttleDelaySeconds(SECOND_STEP_THROTTLE, 40)).toBe(900);
     const t = 1_000_000_000_000;
     const d = throttleAttempt(SECOND_STEP_THROTTLE, { failures: 40, lastFailureAt: t }, t + 1000);
-    expect(d).toEqual({ allowed: false, retryAfterSeconds: 3599 });
+    expect(d).toEqual({ allowed: false, retryAfterSeconds: 899 });
     expect(
-      throttleAttempt(SECOND_STEP_THROTTLE, { failures: 40, lastFailureAt: t }, t + 3_600_000)
+      throttleAttempt(SECOND_STEP_THROTTLE, { failures: 40, lastFailureAt: t }, t + 900_000)
         .allowed,
     ).toBe(true);
   });

@@ -12,7 +12,7 @@
  * session is refused.
  *
  * A proof carries the **pass**: what the database needs to record the
- * second step (0014): the next link of the factor's TOTP ratchet, or a
+ * second step (0014): the next link of the factor's TOTP hash chain, or a
  * recovery code. `promoteSession` writes it with `writeSecondStepPass`
  * inside its own transaction, just before the session's UPDATE, and the
  * database refuses the promotion without a pass for that session and user
@@ -41,10 +41,8 @@ export type PassMaterial =
       readonly factorId: string;
       /** The TOTP step the code matched. */
       readonly step: bigint;
-      /** The ratchet's next link, r_g; must hash to the stored anchor. */
+      /** The chain's next link back; must hash to the stored anchor, and becomes it. */
       readonly reveal: Uint8Array;
-      /** sha256(r_{g+1}), the new anchor. */
-      readonly nextAnchor: Uint8Array;
     }
   | {
       readonly method: "recovery";
@@ -137,13 +135,12 @@ export async function writeSecondStepPass(
   await tx.execute(sql`
     INSERT INTO public.second_step_passes
       (id, user_id, factor_id, session_id, purpose, method, target_user_id, step,
-       created_at, created_xact, reveal, next_anchor, recovery_code)
+       created_at, created_xact, reveal, recovery_code)
     VALUES (${id}::uuid, ${who.userId}::uuid, ${pass.factorId}::uuid, ${who.sessionId}::uuid,
             ${who.purpose}, ${pass.method}, ${who.targetUserId ?? null}::uuid,
             ${totp === undefined ? null : totp.step.toString()}::bigint,
             clock_timestamp(), pg_current_xact_id(),
-            ${totp?.reveal ?? null}::bytea, ${totp?.nextAnchor ?? null}::bytea,
-            ${recovery?.code ?? null})`);
+            ${totp?.reveal ?? null}::bytea, ${recovery?.code ?? null})`);
   return id;
 }
 

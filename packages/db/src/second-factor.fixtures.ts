@@ -11,7 +11,7 @@ import {
   type UserId,
 } from "@oculus/core";
 import type { Database } from "./client.js";
-import { ratchetLink, secretContext } from "./second-factor.js";
+import { chainLink, secretContext } from "./second-factor.js";
 import { loadSecretKeyring, sealSecret, type SecretKeyring } from "./secret-key.js";
 import { sql } from "./sql.js";
 
@@ -48,6 +48,7 @@ export async function giveTestFactor(
   keys: SecretKeyring,
   userId: UserId,
   count = 60,
+  chainLength = 300,
 ): Promise<TestFactor> {
   const factorId = randomUUID();
   const secret = newTotpSecret();
@@ -63,13 +64,11 @@ export async function giveTestFactor(
       DISABLE TRIGGER second_step_recovery_codes_supersede`);
     await q.execute(sql`
       INSERT INTO public.second_factors
-        (id, user_id, kind, state, secret_box, ratchet_anchor, ratchet_generation, last_step,
-         enrol_session_id, created_at, confirmed_at, confirmed_xact)
+        (id, user_id, kind, state, secret_box, ratchet_anchor, ratchet_generation, chain_length,
+         last_step, enrol_session_id, created_at, confirmed_at, confirmed_xact)
       VALUES (${factorId}::uuid, ${userId}::uuid, 'totp', 'active',
               ${sealSecret(keys, secret, secretContext(factorId, userId))},
-              ${createHash("sha256")
-                .update(ratchetLink(secret, factorId, 0n))
-                .digest()}, 0, -1,
+              ${chainLink(secret, factorId, chainLength)}, 0, ${chainLength}, -1,
               gen_random_uuid(), clock_timestamp(), clock_timestamp(), pg_current_xact_id())`);
     const setId = randomUUID();
     await q.execute(sql`

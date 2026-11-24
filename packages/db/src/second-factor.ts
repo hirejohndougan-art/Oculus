@@ -13,8 +13,8 @@
  *   recovery codes, shown once, and the session becomes full). Everyone
  *   else completes sign-in with `completeSecondStep` (a code or a recovery
  *   code). There is no way to turn it off; a system admin can only reset it
- *   (`resetSecondFactor`), which ends the person's sessions and makes them
- *   set it up again at their next sign-in.
+ *   (`resetSecondFactor`), which ends the person's sessions and sends them a
+ *   one-time enrolment link without which they can't set it up again.
  * - **The secret** is sealed with `OCULUS_SECRET_KEY` (AES-256-GCM) and opened
  *   only here, for one check, then wiped. It is never returned (except once
  *   at set-up), logged or put into an error. Database errors reach
@@ -22,40 +22,45 @@
  *   `where`, which can carry the values sent).
  * - **Codes:** RFC 6238, the database's clock, one step either side, never a
  *   step at or before the last one used; compared in constant time.
- * - **Throttled** per person (core's `SECOND_STEP_THROTTLE`: D-068's rules,
- *   counted up front, waits up to an hour, never a permanent lockout) and,
- *   at sign-in, per waiting session: after `MAX_PENDING_CODE_FAILURES` wrong
- *   codes the session is ended and the person signs in again.
+ * - **Throttled** (D-077): TOTP codes per person (core's
+ *   `SECOND_STEP_THROTTLE`, waits up to 15 minutes, never a permanent
+ *   lockout, each wait recorded in `second_step_alerts` for a notice);
+ *   every code, recovery codes included, per session (a waiting session
+ *   ends after 5 wrong codes, a full one is signed out) and per client
+ *   address. Recovery codes (120 bits) skip the per-person counter, so
+ *   someone guessing TOTP codes with the password can't keep the person out.
  * - **Bound in the database** (0014): every success writes a pass in the
  *   same transaction as what it allows (promotion, the password entered
  *   again, new recovery codes, a reset), and the database refuses those
- *   without it. A pass needs the next link of the factor's TOTP ratchet
+ *   without it. A pass needs the next link back of the factor's hash chain
  *   (computed here from the secret) or a real unused recovery code. Two
- *   uses of one code race on the factor row: one wins, the other is
- *   `invalid_code`.
+ *   uses of one code race on the factor row: one wins; the loser is told
+ *   the code was used, and isn't counted as a wrong guess.
  */
-import { createHash, createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import {
   MAX_PENDING_CODE_FAILURES,
   RECENT_AUTHENTICATION_SECONDS,
-  hashSessionToken,
-  newSessionToken,
   RECOVERY_CODE_COUNT,
   SECOND_STEP_THROTTLE,
+  SOURCE_THROTTLE,
+  encodeBase32,
   hashRecoveryCode,
+  hashSessionToken,
   isOrganizationId,
   isUserId,
   matchTotpStep,
   newRecoveryCode,
+  newSessionToken,
   newTotpSecret,
   normalizeRecoveryCode,
   normalizeTotpCode,
-  encodeBase32,
   otpauthUri,
   throttleAttempt,
+  throttleSourceKey,
   type OrganizationId,
   type SessionId,
-  type ThrottleState,
+  type ThrottleDecision,
   type UserId,
   type Validated,
 } from "@oculus/core";
@@ -112,11 +117,12 @@ const RECENT_SECONDS = RECENT_AUTHENTICATION_SECONDS;
 
 /**
  * What the writer role needs on 0014's tables, beyond SELECT (D-067,
- * D-077): factors are inserted (set-up) and updated (the ratchet, confirming,
+ * D-077): factors are inserted (set-up) and updated (the chain, confirming,
  * re-sealing, a reset; UPDATE is also what the pass trigger's `FOR UPDATE`
- * needs); passes are only inserted; recovery codes are inserted and updated
- * (used, superseded); the wrong-code counters as `sign_in_throttles`.
- * Nothing deletes a factor, a pass or a recovery code.
+ * needs); passes and alerts are only inserted; recovery codes and enrolment
+ * tokens are inserted and updated (used, superseded); the wrong-code
+ * counters as `sign_in_throttles`. Nothing deletes a factor, a pass, a
+ * recovery code, a token or an alert.
  */
 export const SECOND_FACTOR_TABLE_PRIVILEGES: Readonly<Record<string, readonly string[]>> =
   Object.freeze({
@@ -124,6 +130,8 @@ export const SECOND_FACTOR_TABLE_PRIVILEGES: Readonly<Record<string, readonly st
     second_step_passes: Object.freeze(["INSERT"]),
     second_step_recovery_codes: Object.freeze(["INSERT", "UPDATE"]),
     second_step_throttles: Object.freeze(["INSERT", "UPDATE", "DELETE"]),
+    second_step_alerts: Object.freeze(["INSERT"]),
+    second_step_enrolment_tokens: Object.freeze(["INSERT", "UPDATE"]),
   });
 
 /** The issuer shown in authenticator apps unless the caller names another. */
@@ -131,6 +139,16 @@ export const DEFAULT_TOTP_ISSUER = "Oculus";
 
 /** How many times one waiting session may start setting up a factor. */
 export const MAX_ENROLMENT_STARTS = 5;
+
+/**
+ * Links in a new factor's hash chain: how many TOTP passes (sign-ins and
+ * re-entries) it takes before it is used up. 20,000 is about 5 years at 10 a
+ * day; computing a link costs at most 20,000 SHA-256 runs (about 50 ms).
+ */
+export const TOTP_CHAIN_LENGTH = 20_000;
+
+/** How long an enrolment link after a reset works. */
+export const ENROLMENT_TOKEN_SECONDS = 3 * 24 * 60 * 60;
 
 // ---------------------------------------------------------------------------
 // Results
@@ -146,15 +164,27 @@ export type SecondStepRefusal =
     }
   | {
       readonly ok: false;
-      /** Too many wrong codes for this sign-in: the session has ended. */
+      /** Too many wrong codes in this session: it has ended. */
       readonly code: "too_many_attempts";
       readonly message: string;
     }
   | { readonly ok: false; readonly code: "enrolment_required"; readonly message: string }
+  | {
+      readonly ok: false;
+      /** After a reset: the one-time enrolment link sent to the person is needed. */
+      readonly code: "enrolment_token_required";
+      readonly message: string;
+    }
   | { readonly ok: false; readonly code: "already_enrolled"; readonly message: string }
   | {
       readonly ok: false;
-      /** The secret can't be opened (the server's key changed or is wrong): use a recovery code. */
+      /** Enter the password and a code again first (the last 10 minutes). */
+      readonly code: "reauthentication_required";
+      readonly message: string;
+    }
+  | {
+      readonly ok: false;
+      /** The secret can't be opened (key changed or wrong) or its chain is used up: use a recovery code. */
       readonly code: "second_step_unavailable";
       readonly message: string;
     }
@@ -168,16 +198,35 @@ const TOO_MANY: SecondStepRefusal = Object.freeze({
   message: "Too many wrong codes. Sign in again.",
 });
 
+const TOO_MANY_STARTS: SecondStepRefusal = Object.freeze({
+  ok: false,
+  code: "too_many_attempts",
+  message: "Too many tries at setting up. Sign in again.",
+});
+
 const ENROLMENT_REQUIRED: SecondStepRefusal = Object.freeze({
   ok: false,
   code: "enrolment_required",
   message: "Set up two-step sign-in with an authenticator app first.",
 });
 
+const ENROLMENT_TOKEN_REQUIRED: SecondStepRefusal = Object.freeze({
+  ok: false,
+  code: "enrolment_token_required",
+  message:
+    "Your two-step sign-in was reset. Open the set-up link sent to your email address to set it up again.",
+});
+
 const ALREADY_ENROLLED: SecondStepRefusal = Object.freeze({
   ok: false,
   code: "already_enrolled",
   message: "Two-step sign-in is already set up for this account.",
+});
+
+const REAUTHENTICATION_REQUIRED: SecondStepRefusal = Object.freeze({
+  ok: false,
+  code: "reauthentication_required",
+  message: "Enter your password and a code again first.",
 });
 
 const UNAVAILABLE: SecondStepRefusal = Object.freeze({
@@ -190,7 +239,8 @@ const UNAVAILABLE: SecondStepRefusal = Object.freeze({
 const INVALID_REQUEST: SecondStepRefusal = Object.freeze({
   ok: false,
   code: "invalid_request",
-  message: "Give the 6-digit code from your authenticator app, or one recovery code.",
+  message:
+    "Give the 6-digit code from your authenticator app, or one recovery code, and the client address.",
 });
 
 function throttled(retryAfterSeconds: number): SecondStepRefusal {
@@ -226,9 +276,9 @@ function summarize(error: unknown): SecondStepDatabaseError {
 
 /**
  * The call's options with `onError` seeing only a summary of each error: a
- * failed statement here may have carried a ratchet link or a recovery code
- * as a parameter, and pg's `where` and `detail` can repeat parameters
- * (D-068).
+ * failed statement here may have carried a chain link, a recovery code or
+ * an enrolment token as a parameter, and pg's `where` and `detail` can
+ * repeat parameters (D-068).
  */
 function safeOptions(options: unknown, extra: readonly string[] = []): SessionCallOptions {
   const call = callOptions(options, extra);
@@ -264,14 +314,21 @@ function codeInput(input: unknown): CodeInput | undefined {
   return undefined;
 }
 
+/** The client address as given (a string up to 100 characters), or `undefined`. */
+function sourceOf(input: unknown): string | undefined {
+  const source = own(input, "source");
+  return typeof source === "string" && source.length <= 100 ? source : undefined;
+}
+
 // ---------------------------------------------------------------------------
-// Factors and the ratchet
+// Factors and the hash chain
 
 interface FactorRow {
   id: string;
   state: "pending" | "active";
   secret_box: Buffer;
   generation: string;
+  chain_length: number;
   last_step: string;
   enrol_session_id: string;
 }
@@ -279,7 +336,7 @@ interface FactorRow {
 async function liveFactor(q: Queryable, userId: UserId): Promise<FactorRow | undefined> {
   const rows = await q.rows<FactorRow>(sql`
     SELECT id::text AS id, state, secret_box, ratchet_generation::text AS generation,
-           last_step::text AS last_step, enrol_session_id::text AS enrol_session_id
+           chain_length, last_step::text AS last_step, enrol_session_id::text AS enrol_session_id
     FROM public.second_factors WHERE user_id = ${userId}::uuid AND state <> 'revoked'`);
   return rows[0];
 }
@@ -289,15 +346,22 @@ export function secretContext(factorId: string, userId: UserId): string {
   return `oculus totp secret v1\u0000${factorId}\u0000${userId}`;
 }
 
-/** The ratchet's link r_g for a factor (0014). Not exported from `@oculus/db`. */
-export function ratchetLink(secret: Uint8Array, factorId: string, generation: bigint): Buffer {
-  return createHmac("sha256", secret)
-    .update(`oculus second step ratchet v1\u0000${factorId}\u0000${generation.toString()}`, "utf8")
-    .digest();
-}
-
 function sha256(bytes: Uint8Array): Buffer {
   return createHash("sha256").update(bytes).digest();
+}
+
+/**
+ * Link `k` of a factor's hash chain (0014): L_0 = HMAC-SHA-256(secret,
+ * label ‖ factor), L_{k+1} = SHA-256(L_k). The factor stores L_N at set-up;
+ * the pass after `g` earlier ones reveals L_{N-g-1}. Not exported from
+ * `@oculus/db`.
+ */
+export function chainLink(secret: Uint8Array, factorId: string, k: number): Buffer {
+  let link: Buffer = createHmac("sha256", secret)
+    .update(`oculus second step chain v1\u0000${factorId}`, "utf8")
+    .digest();
+  for (let i = 0; i < k; i++) link = sha256(link);
+  return link;
 }
 
 /** The current TOTP step by the database's clock (D-052: one clock decides). */
@@ -329,21 +393,21 @@ async function verifyCode(
     if (factor.state !== "active" || found.length !== 1) return { ok: false, why: "wrong" };
     return { ok: true, pass: { method: "recovery", factorId: factor.id, code: input.code } };
   }
+  const left = factor.chain_length - Number(factor.generation);
+  if (left < 1) return { ok: false, why: "unavailable" };
   const secret = openSecret(keys, factor.secret_box, secretContext(factor.id, userId));
   if (secret === undefined) return { ok: false, why: "unavailable" };
   try {
     const now = await stepNow(db);
     const step = matchTotpStep(secret, input.code, now, BigInt(factor.last_step));
     if (step === undefined) return { ok: false, why: "wrong" };
-    const generation = BigInt(factor.generation);
     return {
       ok: true,
       pass: {
         method: "totp",
         factorId: factor.id,
         step,
-        reveal: ratchetLink(secret, factor.id, generation),
-        nextAnchor: sha256(ratchetLink(secret, factor.id, generation + 1n)),
+        reveal: chainLink(secret, factor.id, left - 1),
       },
     };
   } finally {
@@ -352,36 +416,46 @@ async function verifyCode(
 }
 
 // ---------------------------------------------------------------------------
-// Throttling (core's SECOND_STEP_THROTTLE, D-068's way of counting)
+// Throttling (D-068's way of counting; D-077's counters)
 
 interface Who {
   readonly userId: UserId;
-  /** The session waiting for its second step, at sign-in only. */
-  readonly pendingSessionId?: SessionId;
+  /** The session the code is typed in: waiting for its second step, or full. */
+  readonly sessionId?: SessionId;
+  /** The client address, for its own counter. */
+  readonly source?: string;
 }
 
-function keysFor(who: Who): string[] {
-  const keys = [`user:${who.userId}`];
-  if (who.pendingSessionId !== undefined) keys.push(`session:${who.pendingSessionId}`);
+interface Counted {
+  readonly keys: readonly string[];
+  readonly sessionFailures: number;
+}
+
+/** The counters an attempt with `input` counts against, in key order. */
+function keysFor(who: Who, input: CodeInput): string[] {
+  const keys: string[] = [];
+  // Recovery codes (120 bits) skip the person's counter, so someone
+  // guessing TOTP codes with the password can't keep the person out.
+  if (input.kind === "totp") keys.push(`user:${who.userId}`);
+  if (who.sessionId !== undefined) keys.push(`session:${who.sessionId}`);
+  if (who.source !== undefined) keys.push(throttleSourceKey(who.source));
   return keys.sort();
 }
 
 type Attempt =
-  | { readonly allowed: true; readonly sessionFailures: number }
+  | ({ readonly allowed: true } & Counted)
   | { readonly allowed: false; readonly retryAfterSeconds: number }
   | { readonly allowed: false; readonly exhausted: true };
 
 /**
- * Counts this attempt up front against the person's counter (and the
- * waiting session's), in one short transaction with both rows locked in
- * key order, so codes sent at once are counted one by one; or says how long
- * to wait. An attempt during a wait is not counted (D-068).
+ * Counts this attempt up front against its counters, in one short
+ * transaction with the rows locked in key order, so codes sent at once are
+ * counted one by one; or says how long to wait. An attempt during a wait is
+ * not counted (D-068). When the person's counter starts a wait (and every
+ * 10 wrong codes after), an alert row is written for the notice.
  */
-async function takeCodeAttempt(db: Database, who: Who): Promise<Attempt> {
-  const userKey = `user:${who.userId}`;
-  const sessionKey =
-    who.pendingSessionId === undefined ? undefined : `session:${who.pendingSessionId}`;
-  const keys = keysFor(who);
+async function takeCodeAttempt(db: Database, who: Who, input: CodeInput): Promise<Attempt> {
+  const keys = keysFor(who, input);
   for (let round = 1; ; round++) {
     const decided = await inTransaction(db, async (tx): Promise<Attempt | "row_gone"> => {
       for (const key of keys) {
@@ -397,74 +471,96 @@ async function takeCodeAttempt(db: Database, who: Who): Promise<Attempt> {
         SELECT (extract(epoch FROM clock_timestamp()) * 1000)::float8 AS now_ms`);
       const now = clock[0]?.now_ms;
       if (now === undefined) throw new Error("The database gave no time.");
-      const userRow = rows.find((r) => r.key === userKey);
-      const sessionRow = rows.find((r) => r.key === sessionKey);
-      if (sessionRow !== undefined && sessionRow.failures >= MAX_PENDING_CODE_FAILURES) {
-        return { allowed: false, exhausted: true };
-      }
-      const state: ThrottleState | undefined =
-        userRow === undefined
-          ? undefined
-          : { failures: userRow.failures, lastFailureAt: userRow.last_ms };
-      const decision = throttleAttempt(SECOND_STEP_THROTTLE, state, now);
-      if (!decision.allowed)
-        return { allowed: false, retryAfterSeconds: decision.retryAfterSeconds };
-      await tx.execute(sql`
-        UPDATE public.second_step_throttles
-        SET failures = ${decision.next.failures},
-            last_failure_at = to_timestamp(${decision.next.lastFailureAt}::float8 / 1000)
-        WHERE key = ${userKey}`);
+      const decisions: { key: string; next: number | ThrottleDecision }[] = [];
+      let wait = 0;
       let sessionFailures = 0;
-      if (sessionKey !== undefined) {
-        sessionFailures = (sessionRow?.failures ?? 0) + 1;
-        await tx.execute(sql`
-          UPDATE public.second_step_throttles
-          SET failures = ${sessionFailures}, last_failure_at = clock_timestamp()
-          WHERE key = ${sessionKey}`);
+      for (const row of rows) {
+        if (row.key.startsWith("session:")) {
+          if (row.failures >= MAX_PENDING_CODE_FAILURES) return { allowed: false, exhausted: true };
+          sessionFailures = row.failures + 1;
+          decisions.push({ key: row.key, next: sessionFailures });
+          continue;
+        }
+        const rule = row.key.startsWith("user:") ? SECOND_STEP_THROTTLE : SOURCE_THROTTLE;
+        const d = throttleAttempt(
+          rule,
+          { failures: row.failures, lastFailureAt: row.last_ms },
+          now,
+        );
+        if (!d.allowed) wait = Math.max(wait, d.retryAfterSeconds);
+        decisions.push({ key: row.key, next: d });
       }
-      return { allowed: true, sessionFailures };
+      if (wait > 0) return { allowed: false, retryAfterSeconds: wait };
+      for (const { key, next } of decisions) {
+        if (typeof next === "number") {
+          await tx.execute(sql`
+            UPDATE public.second_step_throttles
+            SET failures = ${next}, last_failure_at = clock_timestamp() WHERE key = ${key}`);
+        } else if (next.allowed) {
+          await tx.execute(sql`
+            UPDATE public.second_step_throttles
+            SET failures = ${next.next.failures},
+                last_failure_at = to_timestamp(${next.next.lastFailureAt}::float8 / 1000)
+            WHERE key = ${key}`);
+          const over = next.next.failures - SECOND_STEP_THROTTLE.free;
+          if (key.startsWith("user:") && over >= 0 && over % 10 === 0) {
+            await tx.execute(sql`
+              INSERT INTO public.second_step_alerts (id, user_id, failures)
+              VALUES (${randomUUID()}::uuid, ${who.userId}::uuid, ${next.next.failures})`);
+          }
+        }
+      }
+      return { allowed: true, keys, sessionFailures };
     });
     if (decided !== "row_gone") return decided;
     if (round >= 3) return { allowed: false, retryAfterSeconds: 1 };
   }
 }
 
-/** A right code: the counters start again. */
-async function clearCodeAttempts(db: Queryable, who: Who): Promise<void> {
+/** A right code: the person's and the session's counters start again; the address's loses one. */
+async function clearCodeAttempts(db: Queryable, counted: Counted): Promise<void> {
+  const personal = counted.keys.filter((k) => !k.startsWith("source:"));
+  const sources = counted.keys.filter((k) => k.startsWith("source:"));
   await db.execute(
-    sql`DELETE FROM public.second_step_throttles WHERE key = ANY(${keysFor(who)}::text[])`,
+    sql`DELETE FROM public.second_step_throttles WHERE key = ANY(${personal}::text[])`,
   );
-}
-
-/** An attempt counted up front whose code couldn't be checked (the secret didn't open). */
-async function giveBackCodeAttempt(db: Queryable, who: Who): Promise<void> {
   await db.execute(sql`
     UPDATE public.second_step_throttles SET failures = greatest(failures - 1, 0)
-    WHERE key = ANY(${keysFor(who)}::text[])`);
+    WHERE key = ANY(${sources}::text[])`);
 }
 
-/** Ends a waiting session after its last allowed wrong code. */
-async function endPending(db: Queryable, sessionId: SessionId): Promise<void> {
+/**
+ * An attempt counted up front that says nothing about the guesser: the
+ * code couldn't be checked (the secret didn't open), or it was right but
+ * lost a race (used meanwhile on another connection).
+ */
+async function giveBackCodeAttempt(db: Queryable, counted: Counted): Promise<void> {
   await db.execute(sql`
-    DELETE FROM public.sessions WHERE id = ${sessionId}::uuid AND stage = 'second_step'`);
+    UPDATE public.second_step_throttles SET failures = greatest(failures - 1, 0)
+    WHERE key = ANY(${[...counted.keys]}::text[])`);
+}
+
+/** Ends a session after its last allowed wrong code. */
+async function endSessionById(db: Queryable, sessionId: SessionId): Promise<void> {
+  await db.execute(sql`DELETE FROM public.sessions WHERE id = ${sessionId}::uuid`);
 }
 
 /** After a wrong code (already counted): `invalid_code`, or the session ends. */
-async function wrongCode(
-  db: Queryable,
-  who: Who,
-  sessionFailures: number,
-): Promise<SecondStepRefusal> {
-  if (who.pendingSessionId !== undefined && sessionFailures >= MAX_PENDING_CODE_FAILURES) {
-    await endPending(db, who.pendingSessionId);
+async function wrongCode(db: Queryable, who: Who, counted: Counted): Promise<SecondStepRefusal> {
+  if (who.sessionId !== undefined && counted.sessionFailures >= MAX_PENDING_CODE_FAILURES) {
+    await endSessionById(db, who.sessionId);
     return TOO_MANY;
   }
   return INVALID_CODE;
 }
 
-type Checked =
-  | { readonly ok: true; readonly pass: PassMaterial; readonly sessionFailures: number }
-  | SecondStepRefusal;
+/** A right code whose pass the database refused because another use won the race. */
+async function lostRace(db: Queryable, counted: Counted): Promise<SecondStepRefusal> {
+  await giveBackCodeAttempt(db, counted);
+  return INVALID_CODE;
+}
+
+type Checked = ({ readonly ok: true; readonly pass: PassMaterial } & Counted) | SecondStepRefusal;
 
 /** The throttle, then the code. On success the counters are left for the caller to clear once the pass is in. */
 async function checkCode(
@@ -474,33 +570,41 @@ async function checkCode(
   factor: FactorRow,
   input: CodeInput,
 ): Promise<Checked> {
-  const attempt = await takeCodeAttempt(db, who);
+  const attempt = await takeCodeAttempt(db, who, input);
   if (!attempt.allowed) {
     if ("exhausted" in attempt) {
-      if (who.pendingSessionId !== undefined) await endPending(db, who.pendingSessionId);
+      if (who.sessionId !== undefined) await endSessionById(db, who.sessionId);
       return TOO_MANY;
     }
     return throttled(attempt.retryAfterSeconds);
   }
   const verified = await verifyCode(db, keys, who.userId, factor, input);
-  if (verified.ok)
-    return { ok: true, pass: verified.pass, sessionFailures: attempt.sessionFailures };
+  if (verified.ok) {
+    return {
+      ok: true,
+      pass: verified.pass,
+      keys: attempt.keys,
+      sessionFailures: attempt.sessionFailures,
+    };
+  }
   if (verified.why === "unavailable") {
-    await giveBackCodeAttempt(db, who);
+    await giveBackCodeAttempt(db, attempt);
     return UNAVAILABLE;
   }
-  return wrongCode(db, who, attempt.sessionFailures);
+  return wrongCode(db, who, attempt);
 }
 
 // ---------------------------------------------------------------------------
 // Completing sign-in
 
-/** What `completeSecondStep` takes: one code, and the organization if one must be chosen. */
+/** What `completeSecondStep` takes: one code, the client address, and the organization if one must be chosen. */
 export interface SecondStepInput {
   /** The 6 digits from the authenticator app (spaces allowed). */
   readonly code?: string;
   /** Or one recovery code. */
   readonly recoveryCode?: string;
+  /** The client address from the HTTP layer (D-058), for its counter. */
+  readonly source: string;
   /** The organization to work in, if the person must choose (`choose_organization`). */
   readonly organizationId?: OrganizationId;
 }
@@ -511,7 +615,7 @@ export interface SecondStepInput {
  * session full, with a **new token**. A recovery code is used up.
  * Refusals: `invalid_code`, `throttled`, `too_many_attempts` (the session
  * ended), `enrolment_required` (set it up first), `second_step_unavailable`
- * (the secret key can't open the secret: use a recovery code),
+ * (the secret can't be opened or its chain is used up: use a recovery code),
  * `invalid_request`, and promotion's own (`choose_organization` and the
  * rest: nothing is used up then, so send the same code again with the
  * organization).
@@ -527,17 +631,22 @@ export async function completeSecondStep(
 > {
   assertSecretKeyring(keys);
   const call = safeOptions(options);
-  if (!hasOnly(input, ["code", "recoveryCode", "organizationId"])) return INVALID_REQUEST;
+  if (!hasOnly(input, ["code", "recoveryCode", "source", "organizationId"])) return INVALID_REQUEST;
   const code = codeInput(input);
+  const source = sourceOf(input);
   const organizationId = own(input, "organizationId");
-  if (code === undefined || (organizationId !== undefined && !isOrganizationId(organizationId))) {
+  if (
+    code === undefined ||
+    source === undefined ||
+    (organizationId !== undefined && !isOrganizationId(organizationId))
+  ) {
     return INVALID_REQUEST;
   }
   try {
     const pending = await readPendingSession(db, token, call);
     if (!pending.ok) return pending;
     const { sessionId, userId } = pending.session;
-    const who: Who = { userId, pendingSessionId: sessionId };
+    const who: Who = { userId, sessionId, source };
     const factor = await liveFactor(db, userId);
     if (factor?.state !== "active") return ENROLMENT_REQUIRED;
     const checked = await checkCode(db, keys, who, factor, code);
@@ -550,16 +659,14 @@ export async function completeSecondStep(
       organizationId === undefined ? {} : { organizationId },
       call,
     );
-    if (!done.ok && done.code === "invalid_code") {
-      return await wrongCode(db, who, checked.sessionFailures);
-    }
+    if (!done.ok && done.code === "invalid_code") return await lostRace(db, checked);
     if (
       done.ok ||
       done.code === "choose_organization" ||
       done.code === "organization_required" ||
       done.code === "not_permitted"
     ) {
-      await clearCodeAttempts(db, who);
+      await clearCodeAttempts(db, checked);
     }
     return done;
   } catch (error) {
@@ -583,15 +690,19 @@ export interface EnrolmentStart {
 export interface EnrolmentOptions extends SessionCallOptions {
   /** Shown in the app as the issuer (no `:`): "Oculus" by default. */
   readonly issuer?: string;
+  /** After a system admin's reset: the one-time token from the link sent to the person. */
+  readonly enrolmentToken?: string;
 }
 
 /**
  * Starts setting up two-step sign-in for the person whose session `token`
  * is waiting for its second step and who has no factor in use: a new
- * 160-bit secret, sealed and stored as pending, returned once as base32
- * text and an `otpauth://` link. Starting again replaces an unconfirmed one
- * (at most `MAX_ENROLMENT_STARTS` per waiting session). Refuses with
- * `already_enrolled` if a factor is in use.
+ * 160-bit secret and its hash chain, sealed and stored as pending, returned
+ * once as base32 text and an `otpauth://` link. Starting again replaces an
+ * unconfirmed one (at most `MAX_ENROLMENT_STARTS` per waiting session).
+ * Refuses with `already_enrolled` if a factor is in use, and with
+ * `enrolment_token_required` after a system admin's reset unless the
+ * one-time token sent to the person is given (once per waiting session).
  */
 export async function startEnrolment(
   db: Database,
@@ -600,9 +711,13 @@ export async function startEnrolment(
   options: EnrolmentOptions = {},
 ): Promise<EnrolmentStart | NoSession | SecondStepRefusal | SessionFailure> {
   assertSecretKeyring(keys);
-  const call = safeOptions(options, ["issuer"]);
+  const call = safeOptions(options, ["issuer", "enrolmentToken"]);
   const issuer = own(options, "issuer") ?? DEFAULT_TOTP_ISSUER;
   if (typeof issuer !== "string") throw new TypeError("issuer is text.");
+  const enrolmentToken = own(options, "enrolmentToken");
+  if (enrolmentToken !== undefined && typeof enrolmentToken !== "string") {
+    throw new TypeError("enrolmentToken is text.");
+  }
   try {
     const pending = await readPendingSession(db, token, call);
     if (!pending.ok) return pending;
@@ -611,7 +726,7 @@ export async function startEnrolment(
     try {
       const factorId = randomUUID();
       const box = sealSecret(keys, secret, secretContext(factorId, userId));
-      const anchor = sha256(ratchetLink(secret, factorId, 0n));
+      const anchor = chainLink(secret, factorId, TOTP_CHAIN_LENGTH);
       const made = await inTransaction(db, async (tx) => {
         // One set-up at a time per person.
         const users = await tx.rows<{ email: string }>(sql`
@@ -624,16 +739,26 @@ export async function startEnrolment(
                  (SELECT count(*)::int FROM public.second_factors
                   WHERE enrol_session_id = ${sessionId}::uuid) AS starts`);
         if (existing[0]?.state === "active") return ALREADY_ENROLLED;
-        if ((existing[0]?.starts ?? 0) >= MAX_ENROLMENT_STARTS) return TOO_MANY;
+        if ((existing[0]?.starts ?? 0) >= MAX_ENROLMENT_STARTS) return TOO_MANY_STARTS;
+        if (typeof enrolmentToken === "string" && enrolmentToken.length <= 100) {
+          // The trigger checks it against its hash and that it is unexpired;
+          // the factor's insert trigger then sees it used in this transaction.
+          await tx.execute(sql`
+            UPDATE public.second_step_enrolment_tokens
+            SET used_at = clock_timestamp(), presented = ${enrolmentToken}
+            WHERE user_id = ${userId}::uuid
+              AND token_hash = sha256(convert_to(${enrolmentToken}, 'UTF8'))
+              AND used_at IS NULL AND expires_at > clock_timestamp()`);
+        }
         await tx.execute(sql`
           UPDATE public.second_factors SET state = 'revoked'
           WHERE user_id = ${userId}::uuid AND state = 'pending'`);
         await tx.execute(sql`
           INSERT INTO public.second_factors
-            (id, user_id, kind, state, secret_box, ratchet_anchor, ratchet_generation, last_step,
-             enrol_session_id, created_at)
-          VALUES (${factorId}::uuid, ${userId}::uuid, 'totp', 'pending', ${box}, ${anchor}, 0, -1,
-                  ${sessionId}::uuid, clock_timestamp())`);
+            (id, user_id, kind, state, secret_box, ratchet_anchor, ratchet_generation,
+             chain_length, last_step, enrol_session_id, created_at)
+          VALUES (${factorId}::uuid, ${userId}::uuid, 'totp', 'pending', ${box}, ${anchor}, 0,
+                  ${TOTP_CHAIN_LENGTH}, -1, ${sessionId}::uuid, clock_timestamp())`);
         return { email };
       });
       if (!("email" in made)) return made;
@@ -646,16 +771,17 @@ export async function startEnrolment(
       secret.fill(0);
     }
   } catch (error) {
+    if (constraintOf(error) === "second_factors_new_token") return ENROLMENT_TOKEN_REQUIRED;
     // The session ended or the account changed between the read and the insert.
-    if (secondStepGuardRefused(error) || sessionGuardOf(error)) return NO_SESSION;
+    if (secondStepGuardRefused(error)) return NO_SESSION;
     return failureFor(error, call);
   }
 }
 
-function sessionGuardOf(error: unknown): boolean {
-  if (typeof error !== "object" || error === null) return false;
+function constraintOf(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
   const { constraint } = error as { constraint?: unknown };
-  return constraint === "second_factors_new_session" || constraint === "second_factors_one_live";
+  return typeof constraint === "string" ? constraint : undefined;
 }
 
 /** A finished set-up: the full session and the recovery codes, shown once. */
@@ -676,16 +802,22 @@ export async function confirmEnrolment(
   db: Database,
   keys: SecretKeyring,
   token: unknown,
-  input: { readonly code: string; readonly organizationId?: OrganizationId },
+  input: {
+    readonly code: string;
+    readonly source: string;
+    readonly organizationId?: OrganizationId;
+  },
   options: SessionCallOptions = {},
 ): Promise<EnrolmentDone | NoSession | PromotionRefusal | SecondStepRefusal | SessionFailure> {
   assertSecretKeyring(keys);
   const call = safeOptions(options);
-  if (!hasOnly(input, ["code", "organizationId"])) return INVALID_REQUEST;
+  if (!hasOnly(input, ["code", "source", "organizationId"])) return INVALID_REQUEST;
   const code = codeInput(input);
+  const source = sourceOf(input);
   const organizationId = own(input, "organizationId");
   if (
     code?.kind !== "totp" ||
+    source === undefined ||
     (organizationId !== undefined && !isOrganizationId(organizationId))
   ) {
     return INVALID_REQUEST;
@@ -694,7 +826,7 @@ export async function confirmEnrolment(
     const pending = await readPendingSession(db, token, call);
     if (!pending.ok) return pending;
     const { sessionId, userId } = pending.session;
-    const who: Who = { userId, pendingSessionId: sessionId };
+    const who: Who = { userId, sessionId, source };
     const factor = await liveFactor(db, userId);
     if (factor?.state === "active") return ALREADY_ENROLLED;
     if (factor?.enrol_session_id !== sessionId) return ENROLMENT_REQUIRED;
@@ -711,16 +843,14 @@ export async function confirmEnrolment(
       organizationId === undefined ? {} : { organizationId },
       call,
     );
-    if (!done.ok && done.code === "invalid_code") {
-      return await wrongCode(db, who, checked.sessionFailures);
-    }
+    if (!done.ok && done.code === "invalid_code") return await lostRace(db, checked);
     if (!done.ok) {
       if (done.code === "choose_organization" || done.code === "organization_required") {
-        await clearCodeAttempts(db, who);
+        await clearCodeAttempts(db, checked);
       }
       return done;
     }
-    await clearCodeAttempts(db, who);
+    await clearCodeAttempts(db, checked);
     return { ...done, recoveryCodes: Object.freeze(recoveryCodes) };
   } catch (error) {
     return failureFor(error, call);
@@ -757,23 +887,26 @@ class RollBack extends Error {
 }
 
 /**
- * Writes a pass for `who` in a transaction and runs `then` in it, mapping a
- * refused pass (a code used meanwhile) to a wrong code. The counters are
- * cleared on success.
+ * Writes a pass for `who` in a transaction (after `first`, which takes the
+ * row locks every path takes before a factor row) and runs `then` in it. A
+ * refused pass (the code used meanwhile) is a lost race, not counted. The
+ * counters are cleared on success.
  */
 async function withPass<T>(
   db: Database,
   who: Who,
-  checked: { readonly pass: PassMaterial; readonly sessionFailures: number },
+  checked: { readonly pass: PassMaterial } & Counted,
   pass: {
     readonly sessionId: SessionId;
     readonly purpose: "reauth" | "recovery_codes" | "admin_reset";
     readonly targetUserId?: UserId;
   },
   then: (tx: Queryable, passId: string) => Promise<T>,
+  first?: (tx: Queryable) => Promise<void>,
 ): Promise<T | SecondStepRefusal> {
   try {
     const result = await inTransaction(db, async (tx) => {
+      await first?.(tx);
       const passId = await writeSecondStepPass(
         tx,
         {
@@ -786,10 +919,10 @@ async function withPass<T>(
       );
       return then(tx, passId);
     });
-    await clearCodeAttempts(db, who);
+    await clearCodeAttempts(db, checked);
     return result;
   } catch (error) {
-    if (secondStepGuardRefused(error)) return wrongCode(db, who, checked.sessionFailures);
+    if (secondStepGuardRefused(error)) return lostRace(db, checked);
     throw error;
   }
 }
@@ -807,8 +940,9 @@ export interface ReauthenticationInput {
  * step again in this session, for a sensitive change (D-052, ASVS 5.0
  * 7.5.1), and gives the session a **new token** (the old one stops). The
  * password is checked as at sign-in (`signIn`'s throttle and failures are
- * passed on); only then the code, with its own throttle. The database
- * records the re-entry only with a pass for this session made in the same
+ * passed on); only then the code, with its own counters (the person's, the
+ * session's: 5 wrong codes end it, the address's). The database records
+ * the re-entry only with a pass for this session made in the same
  * transaction (0014). Afterwards `resolveSession` gives
  * `recentlyAuthenticated: true` for the window asked.
  */
@@ -827,7 +961,8 @@ export async function reauthenticate(
   if (hash === undefined) return NO_SESSION;
   if (!hasOnly(input, ["password", "source", "code", "recoveryCode"])) return NO_SESSION;
   const code = codeInput(input);
-  if (code === undefined) return INVALID_REQUEST;
+  const source = sourceOf(input);
+  if (code === undefined || source === undefined) return INVALID_REQUEST;
   const newToken = newSessionToken();
   try {
     const current = await resolveSession(db, token, call);
@@ -840,12 +975,7 @@ export async function reauthenticate(
     const out: { verified?: VerifiedSignIn } = {};
     const checkedPassword = await signInChecked(
       db,
-      {
-        email,
-        password: own(input, "password") as string,
-        source: own(input, "source") as string,
-        organizationId,
-      },
+      { email, password: own(input, "password") as string, source, organizationId },
       out,
     );
     if (!checkedPassword.ok) return checkedPassword;
@@ -853,7 +983,7 @@ export async function reauthenticate(
     if (checkedPassword.userId !== userId || verified === undefined) return NO_SESSION;
     const factor = await liveFactor(db, userId);
     if (factor?.state !== "active") return ENROLMENT_REQUIRED;
-    const who: Who = { userId };
+    const who: Who = { userId, sessionId, source };
     const checked = await checkCode(db, keys, who, factor, code);
     if (!checked.ok) return checked;
     try {
@@ -866,15 +996,15 @@ export async function reauthenticate(
           // Stamped only if the password checked is still the account's and no
           // "end all" came in between (T-037's second review, R1).
           const rows = await tx.rows<FullRow>(sql`
-          UPDATE public.sessions s
-          SET password_at = clock_timestamp(), last_seen_at = clock_timestamp(),
-              token_hash = ${hashSessionToken(newToken)}, rotated_at = clock_timestamp(),
-              reauth_pass = ${passId}::uuid
-          FROM public.users u
-          WHERE s.token_hash = ${hash} AND s.id = ${sessionId}::uuid AND ${LIVE_FULL}
-            AND u.password_hash = ${verified.passwordHash}
-            AND u.sessions_valid_after = ${verified.sessionsValidAfter}::timestamptz
-          RETURNING ${fullColumns(RECENT_SECONDS)}`);
+            UPDATE public.sessions s
+            SET password_at = clock_timestamp(), last_seen_at = clock_timestamp(),
+                token_hash = ${hashSessionToken(newToken)}, rotated_at = clock_timestamp(),
+                reauth_pass = ${passId}::uuid
+            FROM public.users u
+            WHERE s.token_hash = ${hash} AND s.id = ${sessionId}::uuid AND ${LIVE_FULL}
+              AND u.password_hash = ${verified.passwordHash}
+              AND u.sessions_valid_after = ${verified.sessionsValidAfter}::timestamptz
+            RETURNING ${fullColumns(RECENT_SECONDS)}`);
           const row = rows[0];
           if (row === undefined) throw new RollBack(undefined);
           return { ok: true, token: newToken, session: fullSession(row) } as const;
@@ -894,15 +1024,19 @@ export async function reauthenticate(
 }
 
 /**
- * A new set of 10 recovery codes for the signed-in person, after a code (or
- * one of their current recovery codes); the old set stops working at once.
+ * A new set of 10 recovery codes for the signed-in person; the old set stops
+ * working at once. Needs the password and a code entered again in the last
+ * 10 minutes (`reauthenticate`; `reauthentication_required` otherwise) **and**
+ * a code (or one of their current recovery codes) now, counted per session
+ * (5 wrong codes sign it out) and per client address, so a stolen session
+ * cookie alone can neither replace the codes nor move the person's counter.
  * Returned once; only hashes are stored.
  */
 export async function regenerateRecoveryCodes(
   db: Database,
   keys: SecretKeyring,
   token: unknown,
-  input: { readonly code?: string; readonly recoveryCode?: string },
+  input: { readonly code?: string; readonly recoveryCode?: string; readonly source: string },
   options: SessionCallOptions = {},
 ): Promise<
   | { readonly ok: true; readonly recoveryCodes: readonly string[] }
@@ -912,16 +1046,18 @@ export async function regenerateRecoveryCodes(
 > {
   assertSecretKeyring(keys);
   const call = safeOptions(options);
-  if (!hasOnly(input, ["code", "recoveryCode"])) return INVALID_REQUEST;
+  if (!hasOnly(input, ["code", "recoveryCode", "source"])) return INVALID_REQUEST;
   const code = codeInput(input);
-  if (code === undefined) return INVALID_REQUEST;
+  const source = sourceOf(input);
+  if (code === undefined || source === undefined) return INVALID_REQUEST;
   try {
     const current = await resolveSession(db, token, call);
     if (!current.ok) return current;
+    if (!current.session.recentlyAuthenticated) return REAUTHENTICATION_REQUIRED;
     const { userId, sessionId } = current.session;
     const factor = await liveFactor(db, userId);
     if (factor?.state !== "active") return ENROLMENT_REQUIRED;
-    const who: Who = { userId };
+    const who: Who = { userId, sessionId, source };
     const checked = await checkCode(db, keys, who, factor, code);
     if (!checked.ok) return checked;
     const recoveryCodes = Array.from({ length: RECOVERY_CODE_COUNT }, () => newRecoveryCode());
@@ -948,6 +1084,8 @@ export interface SecondFactorStatus {
   readonly enrolledAt: string | null;
   /** Unused codes of the current set. */
   readonly recoveryCodesLeft: number;
+  /** TOTP passes left before the authenticator must be set up again (warn when low). */
+  readonly totpPassesLeft: number;
 }
 
 /** Whether the signed-in person has two-step sign-in set up, and how many recovery codes are left. */
@@ -960,10 +1098,11 @@ export async function secondFactorStatus(
   try {
     const current = await resolveSession(db, token, call);
     if (!current.ok) return current;
-    const rows = await db.rows<{ enrolled_at: string | null; left: number }>(sql`
+    const rows = await db.rows<{ enrolled_at: string | null; left: number; passes: number }>(sql`
       SELECT to_char(f.confirmed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS enrolled_at,
              (SELECT count(*)::int FROM public.second_step_recovery_codes c
-              WHERE c.factor_id = f.id AND c.used_at IS NULL AND c.superseded_at IS NULL) AS left
+              WHERE c.factor_id = f.id AND c.used_at IS NULL AND c.superseded_at IS NULL) AS left,
+             (f.chain_length - f.ratchet_generation)::int AS passes
       FROM public.second_factors f
       WHERE f.user_id = ${current.session.userId}::uuid AND f.state = 'active'`);
     const row = rows[0];
@@ -972,6 +1111,7 @@ export async function secondFactorStatus(
       enrolled: row !== undefined,
       enrolledAt: row?.enrolled_at ?? null,
       recoveryCodesLeft: row?.left ?? 0,
+      totpPassesLeft: row?.passes ?? 0,
     });
   } catch (error) {
     return failureFor(error, call);
@@ -981,33 +1121,62 @@ export async function secondFactorStatus(
 // ---------------------------------------------------------------------------
 // A system admin's reset
 
+/** The message `resetSecondFactor` sends: the person's address and their one-time set-up token. */
+export interface EnrolmentMessage {
+  readonly email: string;
+  /**
+   * 32 random bytes, base64url. **Secret to the person** (D-068's rule for
+   * invitation tokens): only in the message to their address, never in a
+   * log, a response or a screen.
+   */
+  readonly token: string;
+  /** When it stops working (core's ISO form). */
+  readonly expiresAt: string;
+}
+
+/** Sends an enrolment message (T-040 makes it email). Rejects if it couldn't be sent. */
+export type EnrolmentDelivery = (message: EnrolmentMessage) => Promise<void>;
+
 /**
  * Resets `targetUserId`'s two-step sign-in (D-019, D-052): their factor is
  * revoked, their recovery codes stop working, their wrong-code counter is
- * cleared, and **every session of theirs ends**; at their next sign-in they
- * set it up again. For a system admin acting from their own full session
+ * cleared, **every session of theirs ends**, and a one-time enrolment token
+ * (3 days) is sent to their address with `deliver`: without it they can't
+ * set it up again, so their password alone (which the writer role could
+ * set) is not enough. For a system admin acting from their own full session
  * (`adminToken`), who entered their password and second step in the last
  * 10 minutes (`reauthentication_required`) **and** gives a code (or
- * recovery code) of their own now: the database revokes a factor in use
- * only with a system admin's pass for that person made in the same
- * transaction (0014). Returns whether there was a factor and how many
- * sessions ended.
+ * recovery code) of their own now: the database revokes a factor in use and
+ * makes a token only with a system admin's pass for that person made in the
+ * same transaction (0014). Resetting someone with no factor in use just
+ * sends a new token. Locks the user rows first (in ID order), then factor
+ * rows, as every other path does. Returns whether there was a factor, how
+ * many sessions ended and whether the message went (if not, reset again to
+ * send a new one).
  */
 export async function resetSecondFactor(
   db: Database,
   keys: SecretKeyring,
   adminToken: unknown,
   targetUserId: unknown,
-  input: { readonly code?: string; readonly recoveryCode?: string },
+  input: { readonly code?: string; readonly recoveryCode?: string; readonly source: string },
+  deliver: EnrolmentDelivery,
   options: SessionCallOptions = {},
-): Promise<Validated<{ readonly reset: boolean; readonly ended: number }>> {
+): Promise<
+  Validated<{ readonly reset: boolean; readonly ended: number; readonly delivered: boolean }>
+> {
   assertSecretKeyring(keys);
   const call = safeOptions(options);
+  if (typeof deliver !== "function") throw new TypeError("deliver is a function.");
   if (!isUserId(targetUserId)) return refused("invalid_request", "That isn't a user ID.");
-  if (!hasOnly(input, ["code", "recoveryCode"]))
+  if (!hasOnly(input, ["code", "recoveryCode", "source"])) {
     return refused(INVALID_REQUEST.code, INVALID_REQUEST.message);
+  }
   const code = codeInput(input);
-  if (code === undefined) return refused(INVALID_REQUEST.code, INVALID_REQUEST.message);
+  const source = sourceOf(input);
+  if (code === undefined || source === undefined) {
+    return refused(INVALID_REQUEST.code, INVALID_REQUEST.message);
+  }
   const hash = tokenHash(adminToken);
   if (hash === undefined) return refused(NO_SESSION.code, NO_SESSION.message);
   try {
@@ -1024,7 +1193,6 @@ export async function resetSecondFactor(
       WHERE s.token_hash = ${hash} AND ${LIVE_FULL}`);
     const admin = admins[0];
     if (admin === undefined) return refused(NO_SESSION.code, NO_SESSION.message);
-    const known = await db.rows(sql`SELECT 1 FROM public.users WHERE id = ${targetUserId}::uuid`);
     if (!admin.system_admin) return refused("not_permitted", "Only a system admin can do that.");
     if (!admin.recent) {
       return refused(
@@ -1032,38 +1200,64 @@ export async function resetSecondFactor(
         "Enter your password and code again to reset someone's two-step sign-in.",
       );
     }
-    if (known.length !== 1) return refused("unknown_user", "There is no such user.");
+    const targets = await db.rows<{ email: string }>(sql`
+      SELECT email FROM public.users WHERE id = ${targetUserId}::uuid`);
+    const email = targets[0]?.email;
+    if (email === undefined) return refused("unknown_user", "There is no such user.");
     const factor = await liveFactor(db, admin.user_id);
-    if (factor?.state !== "active")
+    if (factor?.state !== "active") {
       return refused(ENROLMENT_REQUIRED.code, ENROLMENT_REQUIRED.message);
-    const who: Who = { userId: admin.user_id };
+    }
+    const who: Who = { userId: admin.user_id, sessionId: admin.id, source };
     const checked = await checkCode(db, keys, who, factor, code);
     if (!checked.ok) return refused(checked.code, checked.message);
+    const enrolmentToken = randomBytes(32).toString("base64url");
     const done = await withPass(
       db,
       who,
       checked,
       { sessionId: admin.id, purpose: "admin_reset", targetUserId },
       async (tx, passId) => {
-        // The target's row first, as every path that ends sessions does.
-        const target = await tx.rows(sql`
-          SELECT 1 FROM public.users WHERE id = ${targetUserId}::uuid FOR NO KEY UPDATE`);
-        if (target.length !== 1) throw new RollBack("unknown_user");
         const ended = await endAllSessionsForUser(tx, targetUserId);
         const reset = await tx.execute(sql`
           UPDATE public.second_factors
           SET state = 'revoked',
               revoked_by_pass = CASE WHEN state = 'active' THEN ${passId}::uuid END
           WHERE user_id = ${targetUserId}::uuid AND state <> 'revoked'`);
+        const expiry = await tx.rows<{ expires_at: string }>(sql`
+          INSERT INTO public.second_step_enrolment_tokens
+            (user_id, token_hash, created_by_pass, created_at, expires_at)
+          VALUES (${targetUserId}::uuid, ${sha256(Buffer.from(enrolmentToken, "utf8"))},
+                  ${passId}::uuid, clock_timestamp(),
+                  clock_timestamp() + make_interval(secs => ${ENROLMENT_TOKEN_SECONDS}))
+          RETURNING to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+            AS expires_at`);
         await tx.execute(sql`
           DELETE FROM public.second_step_throttles WHERE key = ${`user:${targetUserId}`}`);
-        return { ok: true as const, value: { reset: reset > 0, ended } };
+        return { reset: reset > 0, ended, expiresAt: expiry[0]?.expires_at ?? "" };
+      },
+      // The user rows first, in ID order (the target's to end its sessions,
+      // the admin's as a promotion holds it), then the factor rows: the
+      // order promotion and the rest take (review item 4).
+      async (tx) => {
+        const ids = [...new Set([admin.user_id, targetUserId])].sort();
+        for (const id of ids) {
+          await (id === targetUserId
+            ? tx.rows(sql`SELECT 1 FROM public.users WHERE id = ${id}::uuid FOR NO KEY UPDATE`)
+            : tx.rows(sql`SELECT 1 FROM public.users WHERE id = ${id}::uuid FOR SHARE`));
+        }
       },
     );
-    if (!done.ok) return refused(done.code, done.message);
-    return done;
+    if (!("reset" in done)) return refused(done.code, done.message);
+    // Sent after the commit, outside any transaction (as invitations, D-068).
+    let delivered = true;
+    try {
+      await deliver(Object.freeze({ email, token: enrolmentToken, expiresAt: done.expiresAt }));
+    } catch {
+      delivered = false;
+    }
+    return { ok: true, value: { reset: done.reset, ended: done.ended, delivered } };
   } catch (error) {
-    if (error instanceof RollBack) return refused("unknown_user", "There is no such user.");
     return refusedFor(error, call);
   }
 }
