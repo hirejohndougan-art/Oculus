@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 12:06 CT — manual (John: "finish the 3 in progress and the security ones and stop") — S-018 to S-025 Security findings
+- Result: done
+- What changed: S-018 an address that signed in successfully in the last 30 days keeps its own counter, so strangers can't keep a person (the only system admin) out; re-entry has its own counter (migration 0016). S-019 public output by site only, through `public_record_snapshot` and a public reader role with no table privileges and its own connection check (migration 0017, D-080). S-020 publishing and edits refuse values from records the actor can't see, by (field, source) pairs and over published descendants, with locks below → record → above. S-021 identical clash replies. S-022 a database trigger mirrors who may grant roles (migration 0018). S-024 cookie duplicates by exact name. S-025 more active content types refused.
+- Decisions: D-080; amendments to D-058, D-068 (John), D-072, D-074, D-076
+- Review: two independent rounds (a hidden ancestor's value through editing an intermediate unit; SECURITY DEFINER functions widening the reader; a publish/edit race). The last race fix (ca063e3) has its pinned race test but no separate reviewer yet: filed as S-027.
+- Gate: PASS · tests_passing 3961 (was 3887) · npm audit clean
+- Next: stopped here at John's request. Next session: S-027 review, then Phase 2's remaining tasks (T-043, T-034d/e, T-040, T-041b, T-045 onward)
+
 ## 2026-11-24 10:39 CT — manual (John: "finish the 3 in progress and the security ones") — T-042 HTTP API: records, templates and identifier types; S-023
 - Result: done
 - What changed: `packages/api/src/staff-api.ts`: `GET /api/session`; records read, create, update and delete with ETag and If-Match; a dry-run `POST /api/records/check`; staff search under a statement timeout and a cap, filtered to the sites a person can see; templates and identifier types read and saved. Every request needs the `__Host-` session cookie of a full session (second step passed), a CSRF header on changes checked in constant time, D-058's origin, size and content-type rules, a per-session rate limit; missing, other-site and other-organization records answer byte-identically; logs carry only error class and SQLSTATE. `packages/service/src/definitions.ts`: definitions are system managers only (John); a save that can change a published record's public output lists those records and needs `confirmPublished`.
