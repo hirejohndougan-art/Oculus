@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-23 18:12 CT — manual (John: "keep going") — T-029 Change log and version history
+- Result: done
+- What changed: migration `0005_record_versions.sql`: `records.version` and an append-only `record_versions` table (full validated snapshot, actor, time and changed fields filled by the database, optional reason, the writing transaction). The database refuses a record write without its own version written in the same transaction (checked at COMMIT), reuse of a deleted ID, kind changes, backwards `updatedAt`, and any UPDATE/DELETE/TRUNCATE of versions. `catalog.ts` `insertRecord`/`updateRecord` (expected version) / `readStoredRecord`; `record-versions.ts` `readVersions`/`readVersion` re-validated with core. App-role GRANTs documented and tested with a non-owner role (no DELETE on records until T-032's tombstones).
+- Decisions: D-063
+- Review: three independent rounds (a deleted record re-created to wind history back; free kind changes; deletion not versioned; refusal codes); all fixed with tests.
+- Gate: PASS · tests_passing 3311 (was 3287) · npm audit clean
+- Next: T-052 backup and restore (fixing review findings), then T-030 compare and restore versions, T-031 edit-conflict protection
+
 ## 2026-11-23 17:31 CT — manual (John: "continue") — T-027 Schema: vocabularies and terms
 - Result: done
 - What changed: migration `0004_vocabularies.sql`: an organization's stored local and authority terms (keyed by vocabulary plus `termUriKey`, or label), and a staff-only index of which records use which terms with what it was built from. `packages/db/src/vocabularies.ts`: save/read terms, `refreshRecordTerms`/`clearRecordTerms` under the record lock (refused refreshes clear old usages), staff-only `termUsageCounts` that never shows text from records (stored copy or canonical URI only), paging, and `recordsWithStaleTerms`.
