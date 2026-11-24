@@ -21,6 +21,7 @@
     "db:migrate": "npm run db:migrate -w @oculus/db",
     "db:backup": "tsc -p packages/core/tsconfig.build.json && tsc -p packages/db/tsconfig.build.json && exec node packages/db/dist/backup-cli.js backup",
     "db:restore": "tsc -p packages/core/tsconfig.build.json && tsc -p packages/db/tsconfig.build.json && exec node packages/db/dist/backup-cli.js restore",
+    "db:cleanup": "tsc -p packages/core/tsconfig.build.json && tsc -p packages/db/tsconfig.build.json && exec node packages/db/dist/cleanup-cli.js",
     "audit": "npm audit --audit-level=high",
     "licenses": "node scripts/check-licenses.mjs",
     "baseline": "node scripts/check-baseline.mjs",

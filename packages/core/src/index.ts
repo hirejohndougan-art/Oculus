@@ -588,3 +588,22 @@ export {
   OTHER_SOURCE_KEY,
 } from "./sign-in-throttle.js";
 export type { ThrottleRule, ThrottleState, ThrottleDecision } from "./sign-in-throttle.js";
+export {
+  newSessionId,
+  isSessionId,
+  newSessionToken,
+  isSessionToken,
+  hashSessionToken,
+  csrfTokenFor,
+  checkCsrfToken,
+  validateSessionPolicy,
+  isRecentAuthenticationWindow,
+  clientLabel,
+  DEFAULT_SESSION_POLICY,
+  SESSION_POLICY_BOUNDS,
+  SECOND_STEP_SECONDS,
+  RECENT_AUTHENTICATION_SECONDS,
+  RECENT_AUTHENTICATION_BOUNDS,
+  MAX_CLIENT_LABEL_LENGTH,
+} from "./sessions.js";
+export type { SessionId, SessionPolicy } from "./sessions.js";

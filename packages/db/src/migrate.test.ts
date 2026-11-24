@@ -39,6 +39,7 @@ const ALL_TABLES = [
   "record_types",
   "record_versions",
   "records",
+  "sessions",
   "sign_in_throttles",
   "template_versions",
   "templates",
