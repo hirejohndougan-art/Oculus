@@ -54,3 +54,21 @@ export {
 export type { StaffApiOptions, ApiLogRecord } from "./staff-api.js";
 export { SessionRateLimiter, DEFAULT_RATE_LIMITS } from "./rate-limit.js";
 export type { RateBucket, RateLimits } from "./rate-limit.js";
+export { signInRoutes, isLoopback } from "./sign-in-api.js";
+export type { SignInApiOptions } from "./sign-in-api.js";
+export {
+  buildAdminServer,
+  clientAddressProblem,
+  isProduction,
+  CLIENT_ADDRESS_ENV,
+  DEFAULT_ADMIN_DIR,
+} from "./admin-server.js";
+export type { AdminServerOptions } from "./admin-server.js";
+export {
+  loadAdminFiles,
+  adminFileFor,
+  ADMIN_CSP,
+  ADMIN_SECURITY_HEADERS,
+  ADMIN_ORIGIN_ENV,
+} from "./admin-files.js";
+export type { AdminFile, AdminFiles } from "./admin-files.js";
