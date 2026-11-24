@@ -212,6 +212,39 @@ describe("term keys", () => {
     );
   });
 
+  it("keep the exact bytes stored keys were made with (pinned)", () => {
+    // Computed with main's keyOf before D-071 (packages/db's own copy of the
+    // rule, 2026-11-23): stored `term_key`s depend on these bytes, so any
+    // change to core's termIdentity or to the hashing must fail here and come
+    // with a migration (D-062, D-071).
+    const pinned: [unknown, string, string][] = [
+      [
+        { label: "Invented Street depot" },
+        "local\u0000label\u0000Invented Street depot",
+        "02106a487141bb3d348560d12ac4267b1193678d87cfa8070de798fe4d731950",
+      ],
+      [
+        { label: "Wood", vocabulary: "local" },
+        "local\u0000label\u0000Wood",
+        "bfd6032a7d8e49f8a41886c276bad305683bb5f81501e24107a75a4724c0f6c8",
+      ],
+      [
+        LCSH,
+        "lcsh\u0000uri\u0000//id.loc.gov/authorities/subjects/sh85110870",
+        "8c4c9a1e47e897c7c6cefcb41028d322a5212a08d7c9a15dae41e415cfa72b08",
+      ],
+      [
+        { label: "Chair", vocabulary: "nomenclature", uri: "https://NOMENCLATURE.info/nom/./1/" },
+        "nomenclature\u0000uri\u0000//nomenclature.info/nom/1",
+        "a713180cb7eaba14a4d9cbe682b49b858145adefabe8dbd28c76996bf007df0b",
+      ],
+    ];
+    for (const [term, identity, key] of pinned) {
+      expect(ok(termIdentity(term))).toBe(identity);
+      expect(keyOf(term)).toBe(key);
+    }
+  });
+
   it("are given only for terms core accepts", () => {
     expect(codes(termKey({ label: "Railroads", uri: LCSH.uri }))).toEqual(["vocabulary_missing"]);
     expect(codes(termKey({ label: " padded" }))).toEqual(["invalid_text"]);

@@ -69,7 +69,7 @@ describe("findLcTermsWithoutUri", () => {
     ]);
   });
 
-  it("skips terms the vocabulary rules refuse, and reads the rest", () => {
+  it("skips terms the vocabulary rules refuse, and a getter term (via the wrapper), and reads the rest", () => {
     const list: unknown[] = [
       {
         label: "Railroads",
@@ -80,8 +80,9 @@ describe("findLcTermsWithoutUri", () => {
       { label: "Parks", vocabulary: "lcsh" },
       "not a term",
     ];
-    // A getter term is one entry's problem (a hole refuses the whole list:
-    // see the organization tests).
+    // The wrapper (stored-terms.fixtures.ts) moves this slot getter onto the
+    // entry's `term`, so this is a getter term: one entry's problem. A getter
+    // slot or a hole refuses the whole list (stored-terms.attacks.test.ts).
     Object.defineProperty(list, 4, {
       get: () => ({ label: "x", vocabulary: "lcsh" }),
       enumerable: true,

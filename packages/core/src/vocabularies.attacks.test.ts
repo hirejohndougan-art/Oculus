@@ -149,7 +149,10 @@ describe("near-duplicate detection can't be overloaded", () => {
     expect(codeOf(findNearDuplicateTerms(huge))).toBe("too_many");
   });
 
-  it("refuses a hole, and skips a getter term without running it", () => {
+  // Through `findNearDuplicatesOf` (stored-terms.fixtures.ts), the getter on
+  // slot 3 becomes a getter on that entry's `term`: this exercises a getter
+  // term. A getter slot refuses the whole list (stored-terms.attacks.test.ts).
+  it("refuses a hole, and skips a getter term (via the wrapper) without running it", () => {
     // A hole says no organization, so it could be another organization's
     // entry: the whole list is refused (D-030, D-071), not filtered.
     // eslint-disable-next-line no-sparse-arrays -- the hole is the attack

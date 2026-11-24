@@ -6,7 +6,12 @@
  * (D-071). Most of their tests are about the comparison, not organizations,
  * so they call these wrappers with bare terms: each slot of an ordinary list
  * becomes an entry of `TEST_ORGANIZATION`, slot by slot, keeping holes as
- * holes and a getter slot as an entry whose `term` is that getter. Anything
+ * holes. A getter or hidden slot becomes an entry whose `term` has that
+ * slot's descriptor (a getter, or hidden), so the old getter and hidden-slot
+ * attacks in the term report tests now exercise a getter or hidden **term**
+ * of an entry, which is skipped as `not_plain_data`. A getter or hidden
+ * **slot** refuses the whole list; that is tested directly in
+ * `stored-terms.attacks.test.ts`, without this wrapper. Anything
  * that isn't an ordinary list is passed through unchanged, so the list checks
  * still see it. The organization rules are tested directly, without these.
  */
@@ -34,12 +39,12 @@ export function asOrganizationTerms(
   for (let i = 0; i < list.length; i += 1) {
     const slot = Object.getOwnPropertyDescriptor(list, i);
     if (slot === undefined) continue;
-    if ("value" in slot) {
+    if ("value" in slot && slot.enumerable === true) {
       out[i] = { organizationId, term: slot.value as unknown };
     } else {
       const entry: Record<string, unknown> = { organizationId };
-      // The slot's own descriptor, moved onto the entry's `term`.
-      Object.defineProperty(entry, "term", { ...slot, enumerable: true });
+      // The slot's own descriptor (a getter, or hidden), moved onto `term`.
+      Object.defineProperty(entry, "term", slot);
       out[i] = entry;
     }
   }

@@ -17,8 +17,10 @@
  *
  * As everywhere else (D-030), a set that mixes organizations is refused,
  * never filtered: an entry whose `organizationId` is missing, not an
- * organization ID, behind a getter or in a Proxy counts as another
- * organization's, at any position. As `validateIdentifierTypes` does since
+ * organization ID, behind a getter or hidden, and any entry that isn't a
+ * plain object (a Proxy, an array, a Date, a class instance; its prototype
+ * must be `Object.prototype` or null) counts as another organization's, at
+ * any position. As `validateIdentifierTypes` does since
  * S-009b, the set functions are also told which organization the caller
  * expects, and refuse any entry not of it **before anything else about the
  * list is read**, with one fixed-text `mixed_organizations` issue. So a
@@ -87,9 +89,11 @@ function identityOf(term: ControlledTerm): string {
 }
 
 /**
- * Check one stored term: exactly `organizationId`, `id` and `term`, as own
- * data properties (no getters, no Proxy), with the term checked by
- * `validateControlledTerm`. Returns a frozen copy. Never throws.
+ * Check one stored term: a plain object (prototype `Object.prototype` or
+ * null, not a Proxy) with exactly `organizationId`, `id` and `term`, as own
+ * enumerable data properties (no getters, setters or hidden properties),
+ * with the term checked by `validateControlledTerm`. Returns a frozen copy.
+ * Never throws.
  */
 export function validateStoredTerm(input: unknown): Validated<StoredTerm> {
   try {
@@ -163,7 +167,8 @@ export function validateStoredTerms(
  * public API): read a list of `OrganizationTerm` entries, all of
  * `organizationId`, into one result per entry. The organization check comes
  * first and reads nothing but each slot and its `organizationId`; any stray
- * refuses the whole list. Then each entry's `term` (an own data property;
+ * refuses the whole list; an entry must be a plain object (`strayEntry`).
+ * Then each entry's `term` (an own enumerable data property;
  * other properties, such as a stored term's `id`, are ignored) is checked
  * with `validateControlledTerm`, its issues' paths starting `[i, "term"]`. A
  * term that fails is that entry's problem only. Issues for a bad
@@ -226,43 +231,72 @@ function readList(input: unknown, max: number, what: string): Validated<readonly
   return { ok: true, value: input as readonly unknown[] };
 }
 
-/** A slot as a plain data property, or undefined (a hole, a getter). */
+/**
+ * A slot as a plain, enumerable data property, or undefined (a hole, a
+ * getter or setter, a hidden slot).
+ */
 function slotValue(list: readonly unknown[], i: number): unknown {
   const slot = Object.getOwnPropertyDescriptor(list, i);
-  return slot !== undefined && "value" in slot ? slot.value : undefined;
+  return slot !== undefined && "value" in slot && slot.enumerable === true ? slot.value : undefined;
+}
+
+/**
+ * True for a plain object: not a Proxy, and its prototype is
+ * `Object.prototype` or null (so no array, Date, Map or class instance).
+ * The Proxy test comes first, so no trap runs.
+ */
+function isPlainEntry(value: unknown): value is object {
+  if (typeof value !== "object" || value === null || types.isProxy(value)) return false;
+  const proto: unknown = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
 }
 
 /**
  * The `mixed_organizations` issue for the first entry that isn't
- * `organizationId`'s (a hole, a getter slot, a non-object, a Proxy, or a
- * missing, invalid or getter `organizationId` all count), or undefined.
- * Reads nothing but the slots and their `organizationId`.
+ * `organizationId`'s, or undefined. A hole, a getter or hidden slot,
+ * anything but a plain object (a Proxy, an array, a Date, a class
+ * instance), and a missing, invalid, getter or hidden `organizationId` all
+ * count. Reads nothing but the slots and their `organizationId`.
  */
 function strayEntry(list: readonly unknown[], organizationId: OrganizationId): Issue | undefined {
   for (let i = 0; i < list.length; i += 1) {
-    if (organizationIdOf(slotValue(list, i)) !== organizationId) {
+    const entry = slotValue(list, i);
+    const owner = isPlainEntry(entry) ? ownSlot(entry, "organizationId") : "missing";
+    if (
+      typeof owner !== "object" ||
+      owner.value !== organizationId ||
+      organizationIdOf(entry) !== organizationId
+    ) {
       return mixedOrganizationsIssue([i, "organizationId"], "These terms");
     }
   }
   return undefined;
 }
 
-/** An own data property, or a marker when it is missing or behind a getter. */
-function ownSlot(value: object, key: string): { value: unknown } | "missing" | "getter" {
+/**
+ * An own, enumerable data property, or a marker when it is missing, or
+ * behind a getter or setter or hidden (`not_plain`).
+ */
+function ownSlot(value: object, key: string): { value: unknown } | "missing" | "not_plain" {
   const slot = Object.getOwnPropertyDescriptor(value, key);
   if (slot === undefined) return "missing";
-  if (!("value" in slot)) return "getter";
+  if (!("value" in slot) || slot.enumerable !== true) return "not_plain";
   return { value: slot.value as unknown };
 }
 
 /** Entry `i`'s term, checked; its problems' paths start `[i, "term"]`. */
 function termOf(entry: unknown, i: number): Validated<ControlledTerm> {
-  // The organization check already refused anything that isn't a plain,
-  // readable object with a data `organizationId`.
+  // strayEntry already refused every entry that isn't a plain object (not a
+  // Proxy; prototype Object.prototype or null) with an enumerable data
+  // `organizationId` of the expected organization.
   const slot = ownSlot(entry as object, "term");
   if (slot === "missing") return refused([i, "term"], "missing", "This entry has no term.");
-  if (slot === "getter") {
-    return refused([i, "term"], "not_plain_data", "A term can't be behind a getter or setter.");
+  if (slot === "not_plain") {
+    return refused(
+      [i, "term"],
+      "not_plain_data",
+      "A term can't be behind a getter or setter, or hidden.",
+    );
   }
   const valid = validateControlledTerm(slot.value);
   if (valid.ok) return valid;
@@ -275,7 +309,7 @@ function termOf(entry: unknown, i: number): Validated<ControlledTerm> {
 }
 
 function readStored(input: unknown, at: readonly (string | number)[]): Validated<StoredTerm> {
-  if (typeof input !== "object" || input === null || Array.isArray(input) || types.isProxy(input)) {
+  if (!isPlainEntry(input)) {
     return refused(at, "not_an_object", "A stored term must be a plain object.");
   }
   const issues = new IssueList();
@@ -290,8 +324,12 @@ function readStored(input: unknown, at: readonly (string | number)[]): Validated
   }
   const read = (key: string): unknown => {
     const slot = ownSlot(input, key);
-    if (slot === "getter") {
-      issues.add([...at, key], "not_plain_data", "A stored term can't have getters or setters.");
+    if (slot === "not_plain") {
+      issues.add(
+        [...at, key],
+        "not_plain_data",
+        "A stored term can't have getters, setters or hidden properties.",
+      );
       return undefined;
     }
     return slot === "missing" ? undefined : slot.value;

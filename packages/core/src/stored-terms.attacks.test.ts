@@ -61,8 +61,23 @@ function strays(): [string, unknown][] {
     get: () => ARCHIVES,
     enumerable: true,
   });
+  const hiddenOrg = Object.defineProperty({ term: DEPOT }, "organizationId", {
+    value: ARCHIVES,
+    enumerable: false,
+  });
+  // Objects that aren't plain, though they hold the right organization.
+  const asArray = Object.assign([], entry(ARCHIVES, DEPOT));
+  const asDate = Object.assign(new Date(0), entry(ARCHIVES, DEPOT));
+  class Entry {
+    organizationId = ARCHIVES;
+    term = DEPOT;
+  }
   return [
     ["the library's entry", entry(LIBRARY, SECRET)],
+    ["a hidden organization", hiddenOrg],
+    ["an array holding an organization", asArray],
+    ["a Date holding an organization", asDate],
+    ["a class instance", new Entry()],
     ["an entry with no organization", { term: SECRET }],
     ["an entry with a bad organization", entry("not-an-org", SECRET)],
     ["an upper-case organization", entry(ARCHIVES.toUpperCase(), SECRET)],
@@ -101,6 +116,25 @@ describe("validateStoredTerm", () => {
     for (const input of [null, "x", [], new Proxy(stored(ARCHIVES, DEPOT), {})]) {
       expect(codes(validateStoredTerm(input))).toEqual(["not_an_object"]);
     }
+  });
+
+  it("takes only plain objects with enumerable properties (null prototypes too)", () => {
+    const bare = Object.assign(Object.create(null) as object, stored(ARCHIVES, DEPOT));
+    expect(validateStoredTerm(bare).ok).toBe(true);
+    class Stored {
+      organizationId = ARCHIVES;
+      id = crypto.randomUUID();
+      term = DEPOT;
+    }
+    expect(codes(validateStoredTerm(new Stored()))).toEqual(["not_an_object"]);
+    expect(codes(validateStoredTerm(Object.assign(new Date(0), stored(ARCHIVES, DEPOT))))).toEqual([
+      "not_an_object",
+    ]);
+    const hidden = Object.defineProperty(stored(ARCHIVES, DEPOT), "id", {
+      value: crypto.randomUUID(),
+      enumerable: false,
+    });
+    expect(codes(validateStoredTerm(hidden))).toContain("not_plain_data");
   });
 
   it("never runs a getter", () => {
@@ -235,6 +269,12 @@ describe("termIdentity", () => {
     // Composed and decomposed accents stay two terms (D-062).
     expect(id({ label: "Café" })).not.toBe(id({ label: "Café" }));
     expect(codes(termIdentity({ label: "" }))).toEqual(["invalid_text"]);
+    // Pinned: stored term keys are the SHA-256 of these exact strings (the
+    // hex values are pinned in packages/db's vocabularies.test.ts).
+    expect(id({ label: "Wood", vocabulary: "local" })).toBe("local\u0000label\u0000Wood");
+    expect(
+      id({ label: "Chair", vocabulary: "nomenclature", uri: "https://NOMENCLATURE.info/nom/./1/" }),
+    ).toBe("nomenclature\u0000uri\u0000//nomenclature.info/nom/1");
   });
 });
 
@@ -339,6 +379,22 @@ describe("findNearDuplicateTerms and findLcTermsWithoutUri, one organization at 
       [1, [["1.term", "not_plain_data"]]],
     ]);
     expect(ran).toBe(false);
+  });
+
+  it("refuse a hidden slot, skip a hidden term, and take null-prototype entries", () => {
+    for (const [fn, find] of finders) {
+      const list: unknown[] = [entry(ARCHIVES, DEPOT)];
+      Object.defineProperty(list, 1, { value: entry(ARCHIVES, DEPOTS), enumerable: false });
+      expect(codes(find(list, ARCHIVES)), fn).toEqual(["mixed_organizations"]);
+    }
+    const hiddenTerm = Object.defineProperty({ organizationId: ARCHIVES }, "term", {
+      value: DEPOT,
+      enumerable: false,
+    });
+    const bare = Object.assign(Object.create(null) as object, entry(ARCHIVES, DEPOTS));
+    const r = ok(findNearDuplicateTerms([entry(ARCHIVES, DEPOT), hiddenTerm, bare], ARCHIVES));
+    expect(r.skipped.map((x) => [x.index, x.issues[0]?.code])).toEqual([[1, "not_plain_data"]]);
+    expect(r.candidates.map((c) => [c.first, c.second])).toEqual([[0, 2]]);
   });
 
   it("need the organization the caller expects, and still check the list and options", () => {
