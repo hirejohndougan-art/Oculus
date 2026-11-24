@@ -63,6 +63,7 @@ export {
   validateRecordChange,
   readVersion,
   readVersions,
+  readVersionSummaries,
   compareVersions,
   DEFAULT_VERSION_LIST_LIMIT,
   MAX_VERSION_LIST_LIMIT,
@@ -72,6 +73,7 @@ export type {
   RecordAction,
   RecordChange,
   RecordVersion,
+  RecordVersionSummary,
   RecordVersions,
   VersionComparison,
 } from "./record-versions.js";

@@ -17,7 +17,15 @@ import {
   type RecordId,
   type UserId,
 } from "@oculus/core";
-import { insertTemplateVersion, readPublicRecord, sql } from "@oculus/db";
+import {
+  insertTemplateVersion,
+  openDatabase,
+  readPublicRecord,
+  sql,
+  type Database,
+  type Queryable,
+} from "@oculus/db";
+import { createService } from "@oculus/service";
 import type { FastifyInstance } from "fastify";
 import { OCULUS_COOKIES } from "./cookies.js";
 import { buildServer } from "./server.js";
@@ -108,7 +116,7 @@ interface Call {
   site?: string;
 }
 
-async function call(method: string, url: string, c: Call = {}) {
+async function call(method: string, url: string, c: Call = {}, server = app) {
   const token = c.as === undefined ? undefined : tokens[c.as];
   const headers: Record<string, string> = { ...c.headers };
   if (c.origin !== null) headers.origin = c.origin ?? SAME_ORIGIN.origin;
@@ -122,7 +130,7 @@ async function call(method: string, url: string, c: Call = {}) {
     payload = JSON.stringify(c.body);
     headers["content-type"] ??= "application/json";
   }
-  const res = await app.inject({
+  const res = await server.inject({
     method: method as "GET",
     url,
     headers,
@@ -1014,6 +1022,155 @@ describe("a publication and an edit racing over HTTP (pinned with a row lock)", 
       state: "published",
       title: "Invented raced object",
     });
+  });
+});
+
+describe("review fixes: what is read before and for a refusal (T-043 review B1, B2)", () => {
+  /** A server whose service records the text of every statement its transactions send. */
+  async function recording(options: Parameters<typeof createService>[1] = {}) {
+    const texts: string[] = [];
+    const db: Database = {
+      rows: (q) => w.db.rows(q),
+      execute: (q) => w.db.execute(q),
+      close: () => Promise.resolve(),
+      transaction: (work) =>
+        w.db.transaction((tx) => {
+          const seen: Queryable = {
+            rows: (q) => {
+              texts.push(q.text);
+              return tx.rows(q);
+            },
+            execute: (q) => {
+              texts.push(q.text);
+              return tx.execute(q);
+            },
+          };
+          return work(seen);
+        }),
+    };
+    const service = createService(db, options);
+    const server = await buildServer({
+      env: TEST_ENV,
+      routes: staffApiRoutes({ db: w.db, service, log: (r) => logged.push(r) }),
+    });
+    return { texts, server };
+  }
+  const readsVersions = (texts: readonly string[]) =>
+    texts.some((t) => t.includes("public.record_versions"));
+
+  it("a restore of a record the person can't see, or may not restore, never reads its versions", async () => {
+    const { texts, server } = await recording();
+    try {
+      const onA2 = await makeObject(w, w.a, w.a2, "Invented hidden restore");
+      await retitle(onA2.id, 1, "Invented hidden restore, renamed");
+      const inB = await makeObject(w, w.b, w.b1, "Invented other organization's restore");
+      const mine = await makeObject(w, w.a, w.a1, "Invented visible restore");
+      await retitle(mine.id, 1, "Invented visible restore, renamed");
+      const headers = { "if-match": '"v2"' };
+      for (const [as, id, status] of [
+        ["manager", onA2.id, 404],
+        ["cataloger", onA2.id, 404],
+        ["manager", inB.id, 404],
+        ["donor", mine.id, 404],
+        ["reader", mine.id, 403],
+        ["scanner", mine.id, 403],
+      ] as const) {
+        texts.length = 0;
+        const r = await call(
+          "POST",
+          `/api/records/${id}/versions/1/restore`,
+          { as, headers },
+          server,
+        );
+        expect([as, r.status]).toEqual([as, status]);
+        expect([as, readsVersions(texts)]).toEqual([as, false]);
+      }
+      // The control: an allowed restore does read the version.
+      texts.length = 0;
+      const allowed = await call(
+        "POST",
+        `/api/records/${mine.id}/versions/1/restore`,
+        { as: "cataloger", headers },
+        server,
+      );
+      expect(allowed.status).toBe(200);
+      expect(readsVersions(texts)).toBe(true);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("the version list reads no snapshot: it still answers when a stored snapshot is broken", async () => {
+    const { texts, server } = await recording();
+    try {
+      const target = await makeObject(w, w.a, w.a1, "Invented broken snapshot");
+      await retitle(target.id, 1, "Invented broken snapshot, renamed");
+      texts.length = 0;
+      const list = await call(
+        "GET",
+        `/api/records/${target.id}/versions`,
+        { as: "manager" },
+        server,
+      );
+      expect(list.status).toBe(200);
+      const versionReads = texts.filter((t) => t.includes("public.record_versions"));
+      expect(versionReads.length).toBeGreaterThan(0);
+      for (const t of versionReads) expect(t).not.toMatch(/\brecord\s*,/);
+      // Break version 1's snapshot as the owner (the append-only trigger
+      // off inside this transaction only, back on ALWAYS before COMMIT).
+      await w.db.transaction(async (q) => {
+        await q.execute(
+          sql`ALTER TABLE public.record_versions DISABLE TRIGGER zzzz_record_versions_append_only`,
+        );
+        await q.execute(sql`
+          UPDATE public.record_versions SET record = jsonb_set(record, '{title}', '7'::jsonb)
+          WHERE record_id = ${target.id}::uuid AND version = 1`);
+        await q.execute(
+          sql`ALTER TABLE public.record_versions ENABLE ALWAYS TRIGGER zzzz_record_versions_append_only`,
+        );
+      });
+      const after = await call("GET", `/api/records/${target.id}/versions`, { as: "manager" });
+      expect(after.status).toBe(200);
+      expect((after.json.versions as unknown[]).length).toBe(2);
+      // Reading the broken version itself is a server fault, as before.
+      const one = await call("GET", `/api/records/${target.id}/versions/1`, { as: "manager" });
+      expect([one.status, one.json]).toEqual([500, { error: "internal_error" }]);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("the approval queue's list is stopped by its statement_timeout (503)", async () => {
+    const slow = createService(w.db, { searchTimeoutMs: 300 });
+    const server = await buildServer({
+      env: TEST_ENV,
+      routes: staffApiRoutes({ db: w.db, service: slow, log: (r) => logged.push(r) }),
+    });
+    const blocker = openDatabase(w.testDb.url, { max: 1 });
+    let release: () => void = () => undefined;
+    try {
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let locked: () => void = () => undefined;
+      const isLocked = new Promise<void>((resolve) => {
+        locked = resolve;
+      });
+      const holding = blocker.transaction(async (q) => {
+        await q.execute(sql`LOCK TABLE public.records IN ACCESS EXCLUSIVE MODE`);
+        locked();
+        await held;
+      });
+      await isLocked;
+      const r = await call("GET", "/api/review-queue", { as: "manager" }, server);
+      release();
+      await holding;
+      expect([r.status, r.json]).toEqual([503, { error: "timeout" }]);
+    } finally {
+      release();
+      await blocker.close();
+      await server.close();
+    }
   });
 });
 

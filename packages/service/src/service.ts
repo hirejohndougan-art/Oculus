@@ -152,7 +152,7 @@ import {
   readStoredRecord,
   readTemplate,
   readVersion,
-  readVersions,
+  readVersionSummaries,
   compareVersions,
   grantsScopedTo,
   hasRecordsBelow,
@@ -170,7 +170,7 @@ import {
   type RecordDeletion,
   type RecordPlace,
   type RecordPosition,
-  type RecordAction,
+  type RecordVersionSummary,
   type RecordVersion,
   type SearchResults,
   type VersionComparison,
@@ -366,15 +366,7 @@ export interface ReadRecord {
  * One version in a record's history, without the record's content (T-043,
  * D-082): who, when, why, what changed (names only) and the action.
  */
-export interface VersionSummary {
-  readonly version: number;
-  readonly actor: string;
-  readonly recordedAt: string;
-  readonly changedFields: readonly string[];
-  readonly reason?: string;
-  readonly action: RecordAction;
-  readonly workflowState: WorkflowState;
-}
+export type VersionSummary = RecordVersionSummary;
 
 /** A page of a record's history, oldest first. */
 export interface VersionList {
@@ -555,19 +547,6 @@ function unreadableHistory(): ServiceRefusal {
     "unreadable_record",
     "A stored version no longer reads as a valid record; it needs repair.",
   );
-}
-
-/** A version without its content. */
-function versionSummary(v: RecordVersion): VersionSummary {
-  return Object.freeze({
-    version: v.version,
-    actor: v.actor,
-    recordedAt: v.recordedAt,
-    changedFields: v.changedFields,
-    ...(v.reason === undefined ? {} : { reason: v.reason }),
-    action: v.action,
-    workflowState: v.workflowState,
-  });
 }
 
 /**
@@ -2127,8 +2106,28 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         // so needs the arrangement lock before the row's (D-065).
         const seen = await readRecordPlace(tx, org, recordId);
         if (seen === undefined) return noSuchRecord();
+        // Before the old version is read (T-043 review B1): a record the
+        // person can't view is answered at once, as a missing one, without
+        // reading its version (whose size would show in the time taken) or
+        // taking any lock; one they may not restore reads no version either
+        // and is refused by the full check under the row lock below. This
+        // look locks no row; the full check under the lock stays as it is.
+        let mayLook = true;
+        if (!checker.access.systemManager) {
+          const look = await checker.allowsUnlocked(
+            recordId,
+            ["records.history"],
+            editPermissions(seen.kind),
+          );
+          if (look === undefined) return noSuchRecord();
+          if (!look.allowed) {
+            const viewing = await checker.allowsUnlocked(recordId, []);
+            if (!viewing?.allowed) return noSuchRecord();
+            mayLook = false;
+          }
+        }
         const wanted =
-          Number.isInteger(version) && version >= 1 && version < 2 ** 31 - 1
+          mayLook && Number.isInteger(version) && version >= 1 && version < 2 ** 31 - 1
             ? await readVersion(tx, org, recordId, version)
             : undefined;
         // A version without a home site keeps the record's (D-074).
@@ -2174,6 +2173,9 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           editPermissions(place.kind),
         );
         if (mayRestore) return mayRestore;
+        // Allowed now though the first look said not (a grant meanwhile):
+        // nothing was decided from the old version, so start again.
+        if (!mayLook) return retryRefusal();
         // Then the records above it (S-020), so what it inherits holds still.
         if (!checker.access.systemManager) {
           const above = await lockAbove(tx, org, [recordId]);
@@ -2351,15 +2353,13 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         }
         const allowed = await mayChange(tx, who, recordId, "share", ["records.history"]);
         if (!allowed.ok) return allowed;
-        const read = await readVersions(tx, who.organizationId, recordId, { after, limit });
+        // Summaries only (T-043 review B2): no snapshot is read or validated.
+        const read = await readVersionSummaries(tx, who.organizationId, recordId, {
+          after,
+          limit,
+        });
         if (!read.ok) return unreadableHistory();
-        return {
-          ok: true,
-          value: Object.freeze({
-            versions: Object.freeze(read.value.versions.map(versionSummary)),
-            truncated: read.value.truncated,
-          }),
-        };
+        return read;
       });
     },
 
@@ -2412,11 +2412,24 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         if (!access.ok) return access;
         if (!holdsAnywhere(access.value, "records.publish")) return notPermitted();
         const sites = await wholeSites(tx, org, access.value, "records.publish");
-        const listed = await recordsInState(tx, org, "ready_for_review", {
-          sites: sites as "all" | readonly SiteId[],
-          limit,
-          ...(after === undefined ? {} : { after }),
-        });
+        // As search (D-066, D-079): a statement_timeout for the list's own
+        // statement, so a slow one stops instead of holding a connection.
+        await tx.rows(
+          sql`SELECT set_config('statement_timeout', ${String(searchTimeoutMs)}, true)`,
+        );
+        let listed: Awaited<ReturnType<typeof recordsInState>>;
+        try {
+          listed = await recordsInState(tx, org, "ready_for_review", {
+            sites: sites as "all" | readonly SiteId[],
+            limit,
+            ...(after === undefined ? {} : { after }),
+          });
+        } catch (error) {
+          if (sqlState(error) === "57014") {
+            return refusal([], "timeout", "Listing the records took too long and was stopped.");
+          }
+          throw error;
+        }
         if (!listed.ok) return listed;
         const last = listed.value.records.at(-1);
         return {
