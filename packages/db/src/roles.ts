@@ -14,7 +14,9 @@
  * (0008's triggers), can't disable triggers, drop or alter anything (only
  * the owner can) and can't create tables in `public` (PostgreSQL 15 and
  * later give PUBLIC no CREATE there). It must never connect as the owner,
- * which can disable triggers.
+ * which can disable triggers. `grantWriterRole` only adds privileges: it
+ * never revokes what a role already holds, and `checkWriterConnection`
+ * refuses a role holding anything more.
  */
 import type { Queryable } from "./client.js";
 import { sql } from "./sql.js";
@@ -24,7 +26,10 @@ import { sql } from "./sql.js";
  * (D-067): what the data-access functions use, no more. `UPDATE` is there
  * also where only a row lock needs it (`SELECT … FOR SHARE` and the like
  * need UPDATE on the table): `organizations` (locked while an identifier
- * type is added) and `identifier_types` (locked by every save). Nothing
+ * type is added). UPDATE on `identifier_types` is a real write as well as a
+ * lock: `updateIdentifierType` changes a type's definition and uniqueness
+ * rule, so with direct SQL the writer can also loosen a rule (`all_time` to
+ * `none`). Nothing
  * deletes organizations, templates, record types, identifier types or terms,
  * and versions are only ever inserted.
  */
@@ -85,91 +90,181 @@ export async function grantWriterRole(db: Queryable, role: string): Promise<void
 /** What `checkWriterConnection` finds wrong with the connection's role. */
 export interface WriterRoleProblem {
   readonly code:
-    "superuser" | "owner" | "createrole" | "bypasses_row_security" | "missing_privilege";
+    | "superuser"
+    | "owner"
+    | "createrole"
+    | "bypasses_row_security"
+    | "replication_role"
+    | "server_access"
+    | "schema_create"
+    | "extra_privilege"
+    | "missing_privilege";
   readonly message: string;
 }
 
 /**
- * What is wrong with writing through this connection's role (D-067). It
- * must not be a superuser; must not be a member (even NOINHERIT, which can
- * still SET ROLE) of a role owning a table in `public`, the `public` schema
- * or the database (an owner can disable the triggers that guard versions,
- * deletion and the arrangement, or drop them with CASCADE); must not be
- * able to create roles; must not bypass row security; and must hold every
- * privilege `grantWriterRole` gives. Empty when the role is fit to be the
- * service's.
+ * Predefined roles that reach outside the database's own rules (files,
+ * programs, every table's data, maintenance of every table). `pg_maintain`
+ * exists from PostgreSQL 17; a name that doesn't exist matches nothing.
+ */
+const SERVER_ROLES = [
+  "pg_execute_server_program",
+  "pg_write_server_files",
+  "pg_read_server_files",
+  "pg_write_all_data",
+  "pg_maintain",
+];
+
+/** Every table privilege PostgreSQL has (MAINTAIN from 17, checked only there). */
+const TABLE_PRIVILEGES = [
+  "SELECT",
+  "INSERT",
+  "UPDATE",
+  "DELETE",
+  "TRUNCATE",
+  "REFERENCES",
+  "TRIGGER",
+];
+
+/**
+ * What is wrong with writing through this connection (D-067). Checked for
+ * both the role in effect (`current_user`) and the role that logged in
+ * (`session_user`), since a session that logged in as one role can `SET
+ * ROLE` back to it. Each must not:
+ * - be, or be a member (MEMBER, so NOINHERIT members who can `SET ROLE`
+ *   count) of, any role that is a superuser, can create roles or bypasses
+ *   row security;
+ * - be a member of a role owning a table or function in `public`, the
+ *   `public` schema or the database (an owner can disable the triggers that
+ *   guard versions, deletion and the arrangement, or drop them with CASCADE);
+ * - be able to `SET session_replication_role` (granted with `GRANT SET ON
+ *   PARAMETER` from PostgreSQL 15), which turns ordinary triggers off;
+ * - be a member of a predefined role reaching the server's files or
+ *   programs or every table (`SERVER_ROLES`);
+ * - be able to create objects in `public` (a database upgraded from
+ *   PostgreSQL 14 or earlier may still give PUBLIC CREATE there);
+ * - hold any table privilege in `public` beyond SELECT and
+ *   `WRITER_PRIVILEGES` (TRIGGER would let it add a trigger that runs after
+ *   the guards and rewrites what they checked; TRUNCATE, REFERENCES,
+ *   MAINTAIN or an extra write likewise), through any role it belongs to.
+ * And the role in effect must hold every privilege `grantWriterRole` gives.
+ * Empty when the connection is fit to be the service's.
  */
 export async function checkWriterConnection(db: Queryable): Promise<WriterRoleProblem[]> {
   const tables = Object.keys(WRITER_PRIVILEGES);
   const pairs = Object.entries(WRITER_PRIVILEGES).flatMap(([table, privileges]) =>
-    privileges.map((privilege) => [`public.${table}`, privilege] as const),
+    privileges.map((privilege) => [table, privilege] as const),
   );
-  const [row] = await db.rows<{
+  const rows = await db.rows<{
+    who: string;
     superuser: boolean;
     owner: boolean;
     createrole: boolean;
     bypass: boolean;
+    replication: boolean;
+    server: boolean;
+    create: boolean;
+    extra: string[] | null;
     privileges: boolean;
   }>(sql`
-    SELECT r.rolsuper AS superuser,
+    WITH who(name, current) AS (
+      VALUES (current_user::text, true), (session_user::text, false)
+    ), allowed(table_name, privilege) AS (
+      SELECT * FROM unnest(${pairs.map(([t]) => t)}::text[],
+                           ${pairs.map(([, privilege]) => privilege)}::text[])
+    ), privileges(privilege) AS (
+      SELECT unnest(${TABLE_PRIVILEGES}::text[])
+      UNION ALL
+      SELECT 'MAINTAIN' WHERE pg_catalog.current_setting('server_version_num')::integer >= 170000
+    )
+    SELECT w.name AS who,
+           EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
+                   WHERE r.rolsuper AND pg_catalog.pg_has_role(w.name, r.oid, 'MEMBER')) AS superuser,
            (EXISTS (SELECT 1 FROM pg_catalog.pg_class c
                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
                     WHERE n.nspname = 'public'
-                      AND pg_catalog.pg_has_role(current_user, c.relowner, 'MEMBER'))
+                      AND pg_catalog.pg_has_role(w.name, c.relowner, 'MEMBER'))
             OR EXISTS (SELECT 1 FROM pg_catalog.pg_proc p
                        JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
                        WHERE n.nspname = 'public'
-                         AND pg_catalog.pg_has_role(current_user, p.proowner, 'MEMBER'))
+                         AND pg_catalog.pg_has_role(w.name, p.proowner, 'MEMBER'))
             OR EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n
                        WHERE n.nspname = 'public'
-                         AND pg_catalog.pg_has_role(current_user, n.nspowner, 'MEMBER'))
+                         AND pg_catalog.pg_has_role(w.name, n.nspowner, 'MEMBER'))
             OR EXISTS (SELECT 1 FROM pg_catalog.pg_database d
                        WHERE d.datname = pg_catalog.current_database()
-                         AND pg_catalog.pg_has_role(current_user, d.datdba, 'MEMBER'))) AS owner,
-           r.rolcreaterole AS createrole,
-           r.rolbypassrls AS bypass,
-           -- One privilege per call: with a list, has_table_privilege is true
-           -- if any one of them is held.
-           (pg_catalog.has_schema_privilege('public', 'USAGE')
-            AND (SELECT pg_catalog.bool_and(pg_catalog.has_table_privilege(t, 'SELECT'))
-                 FROM pg_catalog.unnest(${tables.map((t) => `public.${t}`)}::text[]) AS t)
-            AND (SELECT pg_catalog.bool_and(pg_catalog.has_table_privilege(p.t, p.privilege))
-                 -- Multi-array unnest is FROM-clause syntax and can't be schema-qualified.
-                 FROM unnest(${pairs.map(([t]) => t)}::text[],
-                                        ${pairs.map(([, privilege]) => privilege)}::text[])
-                      AS p(t, privilege))) AS privileges
-    FROM pg_catalog.pg_roles r WHERE r.rolname = current_user`);
+                         AND pg_catalog.pg_has_role(w.name, d.datdba, 'MEMBER'))) AS owner,
+           EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
+                   WHERE r.rolcreaterole AND pg_catalog.pg_has_role(w.name, r.oid, 'MEMBER')) AS createrole,
+           EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
+                   WHERE r.rolbypassrls AND pg_catalog.pg_has_role(w.name, r.oid, 'MEMBER')) AS bypass,
+           pg_catalog.has_parameter_privilege(w.name, 'session_replication_role', 'SET') AS replication,
+           EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
+                   WHERE r.rolname = ANY(${SERVER_ROLES}::text[])
+                     AND pg_catalog.pg_has_role(w.name, r.oid, 'MEMBER')) AS server,
+           pg_catalog.has_schema_privilege(w.name, 'public', 'CREATE') AS "create",
+           (SELECT pg_catalog.array_agg(c.relname || ' ' || p.privilege ORDER BY c.relname, p.privilege)
+            FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            CROSS JOIN privileges p
+            WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+              AND p.privilege <> 'SELECT'
+              AND NOT EXISTS (SELECT 1 FROM allowed a
+                              WHERE a.table_name = c.relname AND a.privilege = p.privilege)
+              AND pg_catalog.has_table_privilege(w.name, c.oid, p.privilege)) AS extra,
+           (NOT w.current
+            OR (pg_catalog.has_schema_privilege(w.name, 'public', 'USAGE')
+                AND (SELECT pg_catalog.bool_and(pg_catalog.has_table_privilege(w.name, 'public.' || t, 'SELECT'))
+                     FROM unnest(${tables}::text[]) AS t)
+                AND (SELECT pg_catalog.bool_and(
+                              pg_catalog.has_table_privilege(w.name, 'public.' || a.table_name, a.privilege))
+                     FROM allowed a))) AS privileges
+    FROM who w`);
+  const any = (pick: (row: (typeof rows)[number]) => boolean): boolean =>
+    rows.length < 2 || rows.some(pick);
   const problems: WriterRoleProblem[] = [];
-  if (row?.superuser !== false) {
-    problems.push({
-      code: "superuser",
-      message: "The service connects as a superuser; give it its own login role.",
-    });
+  const add = (code: WriterRoleProblem["code"], message: string): void => {
+    problems.push({ code, message });
+  };
+  if (any((r) => r.superuser)) {
+    add("superuser", "The service's login or role is, or belongs to, a superuser.");
   }
-  if (row?.owner !== false) {
-    problems.push({
-      code: "owner",
-      message:
-        "The service's role owns (or is a member of the owner of) the tables, functions, schema or database, and could turn off the triggers that guard history; give it its own login role.",
-    });
+  if (any((r) => r.owner)) {
+    add(
+      "owner",
+      "The service's login or role owns (or belongs to the owner of) the tables, functions, schema or database, and could turn off the triggers that guard history; give it its own login role.",
+    );
   }
-  if (row?.createrole !== false) {
-    problems.push({
-      code: "createrole",
-      message: "The service's role can create roles; it shouldn't.",
-    });
+  if (any((r) => r.createrole)) {
+    add("createrole", "The service's login or role can create roles, or belongs to one that can.");
   }
-  if (row?.bypass !== false) {
-    problems.push({
-      code: "bypasses_row_security",
-      message: "The service's role bypasses row security; it shouldn't.",
-    });
+  if (any((r) => r.bypass)) {
+    add("bypasses_row_security", "The service's login or role bypasses row security.");
   }
-  if (row?.privileges !== true) {
-    problems.push({
-      code: "missing_privilege",
-      message: "The service's role lacks the writer's privileges (grantWriterRole).",
-    });
+  if (any((r) => r.replication)) {
+    add(
+      "replication_role",
+      "The service's login or role may SET session_replication_role, which turns the guarding triggers off.",
+    );
+  }
+  if (any((r) => r.server)) {
+    add(
+      "server_access",
+      "The service's login or role belongs to a predefined role that reaches the server's files, programs or every table.",
+    );
+  }
+  if (any((r) => r.create)) {
+    add("schema_create", "The service's login or role may create objects in schema public.");
+  }
+  const extra = [...new Set(rows.flatMap((r) => r.extra ?? []))];
+  if (rows.length < 2 || extra.length > 0) {
+    add(
+      "extra_privilege",
+      `The service's login or role holds table privileges beyond the writer's: ${extra.join(", ") || "unknown"}.`,
+    );
+  }
+  if (!rows.some((r) => r.privileges) || rows.some((r) => !r.privileges)) {
+    add("missing_privilege", "The service's role lacks the writer's privileges (grantWriterRole).");
   }
   return problems;
 }

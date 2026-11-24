@@ -16,6 +16,7 @@ import {
 import {
   WRITER_PRIVILEGES,
   allocateIdentifier,
+  checkWriterConnection,
   deleteRecord,
   grantWriterRole,
   insertIdentifierType,
@@ -97,9 +98,17 @@ async function ready(): Promise<void> {
     const testDb = await freshDatabase();
     await migrate({ connectionString: testDb.url });
     const suffix = newRecordId().slice(0, 8);
-    const roles = ["writer", "reader", "nobody", "member", "dbowner", "creator"].map(
-      (r) => `oculus_t032_${r}_${suffix}`,
-    );
+    const roles = [
+      "writer",
+      "reader",
+      "nobody",
+      "member",
+      "dbowner",
+      "creator",
+      "probe",
+      "bypasser",
+      "helper",
+    ].map((r) => `oculus_t032_${r}_${suffix}`);
     const [writerRole = "", readerRole = "", nobodyRole = ""] = roles;
     const server = openDatabase(testServerUrl(), { max: 1 });
     try {
@@ -393,7 +402,9 @@ describe("the writer role", () => {
     } finally {
       await server.close();
     }
-    expect(await problems(ownerMember)).toEqual(["owner"]);
+    expect(await problems(ownerMember)).toEqual(
+      expect.arrayContaining(["superuser", "owner", "createrole", "bypasses_row_security"]),
+    );
     expect(await problems(creator)).toEqual(["createrole"]);
     // The database's owner (and so a member of pg_database_owner, which owns
     // schema public).
@@ -414,7 +425,7 @@ describe("the writer role", () => {
     };
     await setOwner(databaseOwner);
     try {
-      expect(await problems(databaseOwner)).toEqual(["owner"]);
+      expect(await problems(databaseOwner)).toEqual(expect.arrayContaining(["owner"]));
     } finally {
       await setOwner(ownerRole);
     }
@@ -442,6 +453,127 @@ describe("the writer role", () => {
       }
     }
     expect(await service.checkConnection()).toEqual([]);
+  });
+
+  it("refuses a login that can defeat the triggers some other way", async () => {
+    await ready();
+    const [, , , , , creator = "", probe = "", bypasser = "", helper = ""] = s.roles;
+    /** Runs a statement with up to two role or object names, quoted by format('%I'). */
+    const run = async (on: Database, statement: string, ...names: string[]): Promise<void> => {
+      await on.transaction(async (q) => {
+        await q.rows(sql`SELECT set_config('oculus_test.statement', ${statement}, true),
+                                set_config('oculus_test.a', ${names[0] ?? ""}, true),
+                                set_config('oculus_test.b', ${names[1] ?? ""}, true)`);
+        await q.execute(sql`DO $$ BEGIN
+          EXECUTE format(current_setting('oculus_test.statement'),
+                         current_setting('oculus_test.a'), current_setting('oculus_test.b'));
+        END $$`);
+      });
+    };
+    const server = openDatabase(testServerUrl(), { max: 1 });
+    const pool = as(s.testDb.url, probe);
+    const probeCodes = async (): Promise<string[]> =>
+      (await createService(pool).checkConnection()).map((p) => p.code);
+    try {
+      await s.owner.transaction((q) => grantWriterRole(q, probe));
+      await run(server, "ALTER ROLE %I NOLOGIN BYPASSRLS", bypasser);
+      expect(await probeCodes()).toEqual([]);
+      const cases: [on: Database, grant: string, revoke: string, names: string[], code: string][] =
+        [
+          // 1. Membership in a role that can create roles or bypasses row security.
+          [server, "GRANT %I TO %I", "REVOKE %I FROM %I", [creator, probe], "createrole"],
+          [
+            server,
+            "GRANT %I TO %I",
+            "REVOKE %I FROM %I",
+            [bypasser, probe],
+            "bypasses_row_security",
+          ],
+          // 2. session_replication_role, grantable from PostgreSQL 15.
+          [
+            server,
+            "GRANT SET ON PARAMETER session_replication_role TO %I",
+            "REVOKE SET ON PARAMETER session_replication_role FROM %I",
+            [probe],
+            "replication_role",
+          ],
+          // 4. Predefined roles reaching files, programs or every table.
+          ...[
+            "pg_execute_server_program",
+            "pg_write_server_files",
+            "pg_read_server_files",
+            "pg_write_all_data",
+          ].map(
+            (role) =>
+              [server, "GRANT %I TO %I", "REVOKE %I FROM %I", [role, probe], "server_access"] as [
+                Database,
+                string,
+                string,
+                string[],
+                string,
+              ],
+          ),
+          // 5. CREATE in schema public.
+          [
+            s.owner,
+            "GRANT CREATE ON SCHEMA public TO %I",
+            "REVOKE CREATE ON SCHEMA public FROM %I",
+            [probe],
+            "schema_create",
+          ],
+          // 3. Any table privilege beyond the writer's, held directly…
+          ...[
+            "TRIGGER ON public.record_versions",
+            "TRUNCATE ON public.records",
+            "REFERENCES ON public.templates",
+            "DELETE ON public.templates",
+            "UPDATE ON public.record_versions",
+            "UPDATE ON public.record_identifiers",
+          ].map(
+            (what) =>
+              [
+                s.owner,
+                `GRANT ${what} TO %I`,
+                `REVOKE ${what} FROM %I`,
+                [probe],
+                "extra_privilege",
+              ] as [Database, string, string, string[], string],
+          ),
+        ];
+      for (const [on, grant, revoke, names, code] of cases) {
+        await run(on, grant, ...names);
+        try {
+          const found = await probeCodes();
+          expect({ grant, has: found.includes(code) }).toEqual({ grant, has: true });
+          if (code !== "server_access") expect({ grant, found }).toEqual({ grant, found: [code] });
+        } finally {
+          await run(on, revoke, ...names);
+        }
+        expect(await probeCodes()).toEqual([]);
+      }
+      // …or through a role it belongs to (TRIGGER via a NOLOGIN role).
+      await run(s.owner, "GRANT TRIGGER ON public.record_versions TO %I", helper);
+      await run(server, "GRANT %I TO %I", helper, probe);
+      try {
+        expect(await probeCodes()).toEqual(["extra_privilege"]);
+      } finally {
+        await run(server, "REVOKE %I FROM %I", helper, probe);
+        await run(s.owner, "REVOKE TRIGGER ON public.record_versions FROM %I", helper);
+      }
+      expect(await probeCodes()).toEqual([]);
+      // 5. A session that logged in as the owner and SET ROLE to the writer.
+      const writerRole = s.roles[0] ?? "";
+      const switched = await s.owner.transaction(async (q) => {
+        await q.rows(sql`SELECT set_config('role', ${writerRole}, true)`);
+        const [who] = await q.rows<{ name: string }>(sql`SELECT current_user AS name`);
+        expect(who?.name).toBe(writerRole);
+        return (await checkWriterConnection(q)).map((p) => p.code);
+      });
+      expect(switched).toEqual(expect.arrayContaining(["superuser", "owner"]));
+    } finally {
+      await pool.close();
+      await server.close();
+    }
   });
 
   it("the writer's grants cover every data-access write, and nothing it doesn't use", async () => {
