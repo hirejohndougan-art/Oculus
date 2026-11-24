@@ -36,8 +36,9 @@ CREATE TABLE public.password_resets (
   expires_at timestamptz NOT NULL,
   used_at timestamptz,
   revoked_at timestamptz,
-  -- Why it was revoked: a newer link replaced it, or its message couldn't be sent.
-  revoked_reason text CHECK (revoked_reason IN ('superseded', 'delivery_failed')),
+  -- Why it was revoked: a newer link replaced it, its message couldn't be
+  -- sent, or the account lost its last membership.
+  revoked_reason text CHECK (revoked_reason IN ('superseded', 'delivery_failed', 'no_membership')),
   CHECK (expires_at >= created_at + interval '5 minutes'
          AND expires_at <= created_at + interval '60 minutes'),
   CHECK ((revoked_at IS NULL) = (revoked_reason IS NULL)),
@@ -148,6 +149,30 @@ CREATE TRIGGER zzzz_password_resets_keep_identity BEFORE UPDATE ON public.passwo
   FOR EACH ROW EXECUTE FUNCTION public.catalog_keep_identity(
     'id', 'user_id', 'token_hash', 'requested_by', 'created_at', 'expires_at');
 
+-- An account left with no organization (and not a system admin) can't sign
+-- in, so its pending links are revoked, for good: inviting it back into an
+-- organization later must not bring an old link back to life (a link is
+-- otherwise only refused while the account has no membership). The user row
+-- is locked first, as every path that makes or ends links does.
+CREATE FUNCTION public.organization_members_end_resets() RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  PERFORM 1 FROM public.users WHERE id = OLD.user_id FOR NO KEY UPDATE;
+  IF NOT EXISTS (SELECT 1 FROM public.organization_members m WHERE m.user_id = OLD.user_id)
+     AND NOT EXISTS (SELECT 1 FROM public.users u WHERE u.id = OLD.user_id AND u.system_admin) THEN
+    UPDATE public.password_resets
+    SET revoked_at = clock_timestamp(), revoked_reason = 'no_membership'
+    WHERE user_id = OLD.user_id AND used_at IS NULL AND revoked_at IS NULL;
+  END IF;
+  RETURN NULL;
+END
+$$;
+
+CREATE TRIGGER organization_members_end_resets AFTER DELETE ON public.organization_members
+  FOR EACH ROW EXECUTE FUNCTION public.organization_members_end_resets();
+
 -- password_changed_at only moves forward, and never past the clock, for any
 -- writer: a link made before a password change can't be brought back by
 -- moving the change's time back (sessions_valid_after already only moves
@@ -182,3 +207,4 @@ ALTER TABLE public.password_resets ENABLE ALWAYS TRIGGER password_resets_check_n
 ALTER TABLE public.password_resets ENABLE ALWAYS TRIGGER password_resets_check_change;
 ALTER TABLE public.password_resets ENABLE ALWAYS TRIGGER zzzz_password_resets_keep_identity;
 ALTER TABLE public.users ENABLE ALWAYS TRIGGER users_password_changed_at;
+ALTER TABLE public.organization_members ENABLE ALWAYS TRIGGER organization_members_end_resets;

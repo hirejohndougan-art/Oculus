@@ -12,6 +12,9 @@
  *   storing the link, sending it) happens **after** the reply, in the
  *   background, so the reply and its timing are the same for every address
  *   (ASVS 5.0 6.3.8 applied to resets; OWASP Forgot Password cheat sheet).
+ *   The background work starts after a random 1–10 s wait and does dummy
+ *   work of the same shape for an address with no usable account, so it
+ *   doesn't show in the next request's timing either (review L1).
  * - **A link** is a 256-bit token in one spelling, stored only as SHA-256,
  *   lasting 30 minutes by default (5 to 60), one pending per account (a
  *   newer one revokes the older), committed before it is sent and sent
@@ -55,6 +58,7 @@ import {
   type UserId,
   type Validated,
 } from "@oculus/core";
+import { randomInt } from "node:crypto";
 import {
   DEFAULT_DELIVERY_TIMEOUT_MS,
   MAX_DELIVERY_TIMEOUT_MS,
@@ -112,7 +116,8 @@ export type PasswordResetDelivery = (
  * - `delivery_failed`: stored, not sent, and revoked;
  * - `delivery_failed_may_be_pending`: not sent, and the revocation failed
  *   twice (the link was shown to nobody and expires within the hour);
- * - `busy`: too many requests were being handled at once; nothing was done;
+ * - `busy`: too many requests were being handled at once; nothing was done
+ *   (also reported to `onError`, so the log shows it loudly);
  * - `database_unavailable`: the database failed before a link was stored.
  */
 export type ResetOutcome =
@@ -129,6 +134,12 @@ export interface ResetRequestOptions {
   readonly lifeSeconds?: number;
   /** How long `deliver` may take (default 30 s, at most 5 minutes). */
   readonly deliveryTimeoutMs?: number;
+  /**
+   * The background work starts after a random wait in this range, in
+   * milliseconds (default 1,000 to 10,000; 0 to 60,000 allowed): so it
+   * doesn't land on the next request (D-078, review L1). Tests pass 0.
+   */
+  readonly backgroundDelayMs?: { readonly min: number; readonly max: number };
   /** Called once, after the background work, with what became of it. A throw is ignored. */
   readonly onSettled?: (outcome: ResetOutcome) => void;
   /**
@@ -236,6 +247,7 @@ function notify<A>(hook: ((arg: A) => void) | undefined, arg: A): void {
 interface CheckedOptions {
   readonly life: number;
   readonly timeoutMs: number;
+  readonly delay: { readonly min: number; readonly max: number };
   readonly onSettled?: (outcome: ResetOutcome) => void;
   readonly onError?: (error: unknown) => void;
 }
@@ -245,8 +257,19 @@ function checkOptions(options: unknown, allowed: readonly string[]): CheckedOpti
   const timeoutMs = own(options, "deliveryTimeoutMs") ?? DEFAULT_DELIVERY_TIMEOUT_MS;
   const onSettled = own(options, "onSettled");
   const onError = own(options, "onError");
+  const delay = own(options, "backgroundDelayMs") ?? DEFAULT_BACKGROUND_DELAY_MS;
+  const delayMin = own(delay, "min");
+  const delayMax = own(delay, "max");
   if (
     (options !== undefined && !hasOnly(options, allowed)) ||
+    !hasOnly(delay, ["min", "max"]) ||
+    typeof delayMin !== "number" ||
+    typeof delayMax !== "number" ||
+    !Number.isInteger(delayMin) ||
+    !Number.isInteger(delayMax) ||
+    delayMin < 0 ||
+    delayMin > delayMax ||
+    delayMax > 60_000 ||
     !isResetLife(life) ||
     typeof timeoutMs !== "number" ||
     !Number.isInteger(timeoutMs) ||
@@ -256,18 +279,45 @@ function checkOptions(options: unknown, allowed: readonly string[]): CheckedOpti
     (onError !== undefined && typeof onError !== "function")
   ) {
     throw new TypeError(
-      `Reset options are ${allowed.join(", ")}: a life of 300 to 3,600 whole seconds, a delivery time limit of 1 to 300,000 ms, and functions.`,
+      `Reset options are ${allowed.join(", ")}: a life of 300 to 3,600 whole seconds, a delivery time limit of 1 to 300,000 ms, a background delay { min, max } within 0 to 60,000 ms, and functions.`,
     );
   }
   return {
     life,
     timeoutMs,
+    delay: { min: delayMin, max: delayMax },
     ...(onSettled === undefined ? {} : { onSettled: onSettled as (outcome: ResetOutcome) => void }),
     ...(onError === undefined ? {} : { onError: onError as (error: unknown) => void }),
   };
 }
 
 const ISO = 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"';
+
+/** The default wait before a request's background work: 1 to 10 seconds. */
+export const DEFAULT_BACKGROUND_DELAY_MS = Object.freeze({ min: 1_000, max: 10_000 });
+
+/** A user ID no account has (version 4 shape, all zero bits), for dummy work. */
+const NO_USER = "00000000-0000-4000-8000-000000000000";
+
+/**
+ * The statements `storeReset` runs, on an ID no account has: so a request
+ * for an address with no usable account does work of the same shape (a
+ * locking read of users, an UPDATE of password_resets) in the background
+ * as one for an account (review L1). Only the INSERT is missing.
+ */
+async function dummyStore(tx: Queryable): Promise<void> {
+  await tx.rows(sql`
+    SELECT public.password_reset_user_ok(id, clock_timestamp()) AS ok
+    FROM public.users WHERE id = ${NO_USER}::uuid FOR NO KEY UPDATE`);
+  await revokePending(tx, NO_USER);
+}
+
+async function revokePending(tx: Queryable, userId: string): Promise<void> {
+  await tx.execute(sql`
+    UPDATE public.password_resets
+    SET revoked_at = clock_timestamp(), revoked_reason = 'superseded'
+    WHERE user_id = ${userId}::uuid AND used_at IS NULL AND revoked_at IS NULL`);
+}
 
 /**
  * Stores a new pending link for `userId` in the caller's transaction, after
@@ -289,11 +339,12 @@ async function storeReset(
   const users = await tx.rows<{ ok: boolean }>(sql`
     SELECT public.password_reset_user_ok(id, clock_timestamp()) AS ok
     FROM public.users WHERE id = ${userId}::uuid FOR NO KEY UPDATE`);
-  if (users[0]?.ok !== true) return undefined;
-  await tx.execute(sql`
-    UPDATE public.password_resets
-    SET revoked_at = clock_timestamp(), revoked_reason = 'superseded'
-    WHERE user_id = ${userId}::uuid AND used_at IS NULL AND revoked_at IS NULL`);
+  if (users[0]?.ok !== true) {
+    // The same shape of work as a link being made (review L1).
+    await revokePending(tx, NO_USER);
+    return undefined;
+  }
+  await revokePending(tx, userId);
   const made = await tx.rows<{ id: string; expires_at: string }>(sql`
     INSERT INTO public.password_resets (id, user_id, token_hash, requested_by, created_at, expires_at)
     SELECT gen_random_uuid(), ${userId}::uuid, ${tokenHash}, ${requestedBy}::uuid,
@@ -371,6 +422,7 @@ export async function requestPasswordReset(
   const checked = checkOptions(options, [
     "lifeSeconds",
     "deliveryTimeoutMs",
+    "backgroundDelayMs",
     "onSettled",
     "onError",
   ]);
@@ -417,14 +469,24 @@ export async function requestPasswordReset(
   const email = normalizeEmail(typed);
   if (resetWork >= MAX_RESET_WORK) {
     queueMicrotask(() => {
+      // Loudly: a request was answered but dropped (review L4).
+      notify(
+        checked.onError,
+        new Error(
+          `Password reset work is full (${String(MAX_RESET_WORK)} at once); a request was answered but not worked on.`,
+        ),
+      );
       notify(checked.onSettled, "busy");
     });
     return RESET_REQUESTED;
   }
   resetWork += 1;
   void (async (): Promise<ResetOutcome> => {
-    // Let the reply go first.
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    // Let the reply go first, then wait a random while, so the work doesn't
+    // land on (and slow) the next request the same client sends (review L1).
+    const { min, max } = checked.delay;
+    const wait = min === max ? min : randomInt(min, max + 1);
+    await new Promise<void>((resolve) => setTimeout(resolve, wait));
     if (email === undefined) return "not_sent";
     return sendToAddress(db, email, deliver, checked);
   })()
@@ -455,7 +517,10 @@ async function sendToAddress(
       const found = await tx.rows<{ id: UserId }>(sql`
         SELECT id::text AS id FROM public.users WHERE email = ${email}`);
       const userId = found[0]?.id;
-      if (userId === undefined) return undefined;
+      if (userId === undefined) {
+        await dummyStore(tx);
+        return undefined;
+      }
       return storeReset(tx, userId, hashResetToken(token), null, options.life);
     });
   } catch (error) {
@@ -631,8 +696,9 @@ const BUSY_MESSAGE = "Too many passwords are being checked right now. Try again 
  * address or organization), in NFC. Then, in one transaction with the user
  * row locked: the link is consumed (only if still usable), the new hash and
  * `password_changed_at` are written, every session of the account ends
- * (`endAllSessionsForUser`) and the account's sign-in counter is cleared
- * (D-068). Nobody is signed in: the reply carries no session or token.
+ * (`endAllSessionsForUser`). After the commit the address's sign-in and
+ * reset counters are cleared (D-068). Nobody is signed in: the reply carries
+ * no session or token.
  *
  * `busy` if too many passwords are being hashed; `retry`, `timeout` or
  * `database_unavailable` for database failures (raw error to `onError`).
@@ -689,28 +755,47 @@ export async function completePasswordReset(
       if (error instanceof PasswordWorkBusyError) return refused("busy", BUSY_MESSAGE);
       throw error;
     }
-    return await inTransaction(db, async (tx): Promise<Validated<{ readonly reset: true }>> => {
-      // The user row first, as every path that makes, copies or ends
-      // sessions or links does, so a sign-in, a new request or another use
-      // of this link at the same moment waits or finds it settled.
-      await tx.rows(
-        sql`SELECT 1 FROM public.users WHERE id = ${reset.user_id}::uuid FOR NO KEY UPDATE`,
-      );
-      const claimed = await tx.rows<{ user_id: UserId }>(sql`
+    const done = await inTransaction(
+      db,
+      async (tx): Promise<Validated<{ readonly reset: true }>> => {
+        // The user row first, as every path that makes, copies or ends
+        // sessions or links does, so a sign-in, a new request or another use
+        // of this link at the same moment waits or finds it settled.
+        await tx.rows(
+          sql`SELECT 1 FROM public.users WHERE id = ${reset.user_id}::uuid FOR NO KEY UPDATE`,
+        );
+        const claimed = await tx.rows<{ user_id: UserId }>(sql`
         UPDATE public.password_resets r SET used_at = clock_timestamp()
         WHERE r.token_hash = ${tokenHash} AND r.id = ${reset.id}::uuid
           AND r.used_at IS NULL AND r.revoked_at IS NULL AND r.expires_at > clock_timestamp()
           AND public.password_reset_user_ok(r.user_id, r.created_at)
         RETURNING r.user_id::text AS user_id`);
-      if (claimed[0]?.user_id !== reset.user_id) return refused("invalid_reset", INVALID_RESET);
-      await tx.execute(sql`
+        if (claimed[0]?.user_id !== reset.user_id) return refused("invalid_reset", INVALID_RESET);
+        await tx.execute(sql`
         UPDATE public.users SET password_hash = ${hash}, password_changed_at = clock_timestamp()
         WHERE id = ${reset.user_id}::uuid`);
-      await endAllSessionsForUser(tx, reset.user_id);
-      await tx.execute(sql`
-        DELETE FROM public.sign_in_throttles WHERE key = ${throttleAccountKey(reset.email)}`);
-      return { ok: true, value: Object.freeze({ reset: true as const }) };
-    });
+        await endAllSessionsForUser(tx, reset.user_id);
+        return { ok: true, value: Object.freeze({ reset: true as const }) };
+      },
+    );
+    if (done.ok) {
+      // After the commit, in a statement of its own: signIn's success
+      // transaction deletes this counter row and then updates the user row,
+      // so clearing it inside the transaction above (user row first) could
+      // deadlock with a sign-in at the same moment (review L3). The sign-in
+      // and reset counters of the address are both cleared (D-068 asked a
+      // reset to clear the sign-in one; review L4 the reset one). The reset
+      // is done either way; a failure here only leaves a wait in place.
+      try {
+        await db.execute(sql`
+          DELETE FROM public.sign_in_throttles
+          WHERE key IN (${throttleAccountKey(reset.email)}, ${resetThrottleAccountKey(reset.email)})`);
+      } catch (error) {
+        if (!isDatabaseFailure(error)) throw error;
+        notify(call.onError, error);
+      }
+    }
+    return done;
   } catch (error) {
     if (resetGuardRefused(error)) return refused("invalid_reset", INVALID_RESET);
     const failure = failureFor(error, call);

@@ -18,7 +18,9 @@ import {
   newSessionToken,
   newUserId,
   resetThrottleAccountKey,
+  resetThrottleSourceKey,
   throttleAccountKey,
+  throttleSourceKey,
   type OrganizationId,
   type UserId,
   type Validated,
@@ -27,8 +29,10 @@ import {
   INVALID_CREDENTIALS,
   acceptInvitation,
   acceptInvitationForUser,
+  clearSignInThrottle,
   createFirstSystemAdmin,
   createInvitation,
+  deleteExpiredSignInThrottles,
   signIn,
   type InvitationMessage,
 } from "./accounts.js";
@@ -202,7 +206,7 @@ async function ask(
     options.conn ?? db,
     { email: address, source: options.from ?? source() },
     options.deliver ?? box.deliver,
-    { ...options.extra, onSettled: settle },
+    { backgroundDelayMs: NO_DELAY, ...options.extra, onSettled: settle },
   );
   const outcome = reply.ok ? await settled : undefined;
   return { reply, outcome, messages: box.messages };
@@ -320,6 +324,9 @@ async function ageLink(token: string, seconds: number, account = true): Promise<
   });
 }
 
+/** Tests start the background work at once (the default waits 1 to 10 s). */
+const NO_DELAY = { min: 0, max: 0 };
+
 const INVALID = { ok: false, issues: [{ path: [], code: "invalid_reset" }] };
 
 // ---------------------------------------------------------------------------
@@ -408,6 +415,7 @@ describe("asking for a link", () => {
           { email: address, source: source() },
           () => Promise.resolve(),
           {
+            backgroundDelayMs: NO_DELAY,
             onSettled: () => {
               settle();
             },
@@ -468,6 +476,55 @@ describe("asking for a link", () => {
     expect(eleventh.reply).toMatchObject({ code: "throttled" });
     expect(eleventh.outcome).toBeUndefined();
   });
+
+  it("starts the background work 1 to 10 s after the reply by default, and checks the range", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    let sentAt = 0;
+    let settle: () => void = () => undefined;
+    const settled = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    const start = performance.now();
+    const reply = await requestPasswordReset(
+      db,
+      { email: person.email, source: source() },
+      () => {
+        sentAt = performance.now();
+        return Promise.resolve();
+      },
+      {
+        onSettled: () => {
+          settle();
+        },
+      },
+    );
+    const repliedAt = performance.now();
+    expect(reply).toBe(RESET_REQUESTED);
+    await settled;
+    expect(sentAt - start).toBeGreaterThanOrEqual(1000);
+    expect(sentAt - repliedAt).toBeLessThan(15_000);
+    for (const backgroundDelayMs of [
+      { min: 5, max: 1 },
+      { min: -1, max: 0 },
+      { min: 0, max: 60_001 },
+      { min: 0 },
+      { min: 0, max: 1.5 },
+      { min: 0, max: 0, extra: 1 },
+    ]) {
+      await expect(
+        requestPasswordReset(
+          db,
+          { email: person.email, source: source() },
+          () => Promise.resolve(),
+          {
+            backgroundDelayMs: backgroundDelayMs as { min: number; max: number },
+          },
+        ),
+      ).rejects.toThrow(TypeError);
+    }
+  }, 30_000);
 
   it("refuses a malformed request before counting anything", async () => {
     await ready();
@@ -545,7 +602,11 @@ describe("asking for a link", () => {
         db,
         { email: person.email, source: source() },
         blocked,
-        { onSettled: (o) => outcomes.push(o), deliveryTimeoutMs: 60_000 },
+        {
+          onSettled: (o) => outcomes.push(o),
+          deliveryTimeoutMs: 60_000,
+          backgroundDelayMs: NO_DELAY,
+        },
       );
       expect(reply).toBe(RESET_REQUESTED);
       // Wait until this one is held in its delivery.
@@ -554,11 +615,14 @@ describe("asking for a link", () => {
     expect(releases).toHaveLength(MAX_RESET_WORK);
     await clearResetCounter(person.email);
     let busy: ResetOutcome | undefined;
+    const loud: unknown[] = [];
     const reply = await requestPasswordReset(
       db,
       { email: person.email, source: source() },
       blocked,
       {
+        backgroundDelayMs: NO_DELAY,
+        onError: (e) => loud.push(e),
         onSettled: (o) => {
           busy = o;
         },
@@ -567,6 +631,9 @@ describe("asking for a link", () => {
     expect(reply).toBe(RESET_REQUESTED);
     await sleep(20);
     expect(busy).toBe("busy");
+    expect(loud).toHaveLength(1);
+    expect(String(loud[0])).toMatch(/Password reset work is full/);
+    expect(String(loud[0])).not.toContain(person.email);
     expect(releases).toHaveLength(MAX_RESET_WORK);
     for (const release of releases) release();
     for (let wait = 0; outcomes.length < MAX_RESET_WORK && wait < 400; wait++) await sleep(25);
@@ -629,7 +696,8 @@ describe("using a link", () => {
     const after = await db.rows<{ moved: boolean; counter: number }>(sql`
       SELECT sessions_valid_after > ${before[0]?.after ?? ""}::timestamptz AS moved,
              (SELECT count(*)::int FROM public.sign_in_throttles
-              WHERE key = ${throttleAccountKey(person.email)}) AS counter
+              WHERE key IN (${throttleAccountKey(person.email)},
+                            ${resetThrottleAccountKey(person.email)})) AS counter
       FROM public.users WHERE id = ${person.userId}::uuid`);
     expect(after).toEqual([{ moved: true, counter: 0 }]);
     // The old password no longer signs in; the new one does (to the second
@@ -757,6 +825,79 @@ describe("using a link", () => {
         r: INVALID,
       });
     }
+  });
+
+  it("is revoked for good when the account loses its last membership, and kept while one is left", async () => {
+    await ready();
+    const org = await organization();
+    const second = await organization();
+    const person = await member(org);
+    const token = await linkFor(person.email);
+    await db.execute(sql`DELETE FROM public.organization_members
+      WHERE user_id = ${person.userId}::uuid`);
+    expect(await resetsOf(person.userId)).toEqual([
+      { used: false, revoked: "no_membership", requested_by: null },
+    ]);
+    // Invited back: the old link stays dead.
+    const box: InvitationMessage[] = [];
+    ok(
+      await createInvitation(
+        db,
+        { organizationId: second, email: person.email, invitedBy: admin },
+        (m) => {
+          box.push(m);
+          return Promise.resolve();
+        },
+      ),
+    );
+    ok(
+      await acceptInvitationForUser(db, {
+        token: box[0]?.token ?? "",
+        organizationId: second,
+        userId: person.userId,
+      }),
+    );
+    expect(await completePasswordReset(db, { token, password: NEW_PASSWORD })).toMatchObject(
+      INVALID,
+    );
+    // Losing one of two memberships leaves the link alone.
+    const again = await linkFor(person.email);
+    const box2: InvitationMessage[] = [];
+    ok(
+      await createInvitation(
+        db,
+        { organizationId: org, email: person.email, invitedBy: admin },
+        (m) => {
+          box2.push(m);
+          return Promise.resolve();
+        },
+      ),
+    );
+    ok(
+      await acceptInvitationForUser(db, {
+        token: box2[0]?.token ?? "",
+        organizationId: org,
+        userId: person.userId,
+      }),
+    );
+    await db.execute(sql`DELETE FROM public.organization_members
+      WHERE user_id = ${person.userId}::uuid AND organization_id = ${second}::uuid`);
+    ok(await completePasswordReset(db, { token: again, password: NEW_PASSWORD }));
+  });
+
+  it("can be asked for again at once after a system admin clears the address's counters", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    await clearResetCounter(person.email);
+    for (let i = 0; i < 3; i++) expect((await ask(person.email)).outcome).toBe("sent");
+    expect((await ask(person.email)).reply).toMatchObject({ code: "throttled" });
+    expect(
+      ok(await clearSignInThrottle(db, { email: person.email.toUpperCase(), by: admin })),
+    ).toEqual({
+      cleared: true,
+    });
+    expect((await ask(person.email)).outcome).toBe("sent");
   });
 
   it("changes only the account it was sent for", async () => {
@@ -1069,6 +1210,84 @@ describe("two connections at once", { timeout: 180_000 }, () => {
     } finally {
       await other.close();
     }
+  });
+
+  it("a use and a sign-in succeeding at the same moment never deadlock (ordered)", async () => {
+    await ready();
+    const deadlocks = async (): Promise<number> => {
+      await db.rows(sql`SELECT pg_stat_clear_snapshot()`);
+      const rows = await db.rows<{ n: string }>(sql`
+        SELECT deadlocks::text AS n FROM pg_stat_database WHERE datname = current_database()`);
+      return Number(rows[0]?.n ?? "0");
+    };
+    const a = openDatabase(testDb.url, { max: 2 });
+    const b = openDatabase(testDb.url, { max: 2 });
+    const start = await deadlocks();
+    try {
+      const org = await organization();
+      for (let round = 0; round < 3; round++) {
+        const person = await member(org);
+        const token = await linkFor(person.email);
+        // A wrong guess, so the sign-in's success deletes a counter row.
+        await signIn(db, {
+          email: person.email,
+          password: "a wrong invented guess",
+          source: source(),
+        });
+        // The sign-in's success transaction has deleted the address's counter
+        // and is about to update the user row when the use starts; the
+        // sign-in goes on once the use is waiting on a lock (or done).
+        let fired = false;
+        let use: Promise<Validated<{ readonly reset: true }>> | undefined;
+        const gate = async (query: Sql): Promise<void> => {
+          if (!fired && query.text.includes("SET last_sign_in_at = now()")) {
+            fired = true;
+            use = completePasswordReset(b, { token, password: `${NEW_PASSWORD} ${String(round)}` });
+            const state = { settled: false };
+            void use.then(() => {
+              state.settled = true;
+            });
+            for (let wait = 0; wait < 200 && !state.settled; wait++) {
+              const waiting = await db.rows(sql`
+                SELECT 1 FROM pg_stat_activity
+                WHERE datname = current_database() AND wait_event_type = 'Lock'`);
+              if (waiting.length > 0) break;
+              await sleep(25);
+            }
+          }
+        };
+        const wrap = (q: Queryable): Queryable => ({
+          rows: async <R extends Row = Row>(query: Sql): Promise<R[]> => {
+            await gate(query);
+            return q.rows<R>(query);
+          },
+          execute: async (query: Sql): Promise<number> => {
+            await gate(query);
+            return q.execute(query);
+          },
+        });
+        const pinned: Database = {
+          ...wrap(a),
+          transaction: <T>(work: (tx: Queryable) => Promise<T>): Promise<T> =>
+            a.transaction((tx) => work(wrap(tx))),
+          close: () => a.close(),
+        };
+        const signedIn = await signIn(pinned, {
+          email: person.email,
+          password: PASSWORD,
+          source: source(),
+        });
+        expect(fired).toBe(true);
+        expect(signedIn.ok).toBe(true);
+        expect(await use).toEqual({ ok: true, value: { reset: true } });
+      }
+    } finally {
+      // Statistics are written when a connection ends.
+      await a.close();
+      await b.close();
+    }
+    await sleep(500);
+    expect(await deadlocks()).toBe(start);
   });
 
   it("a sign-in whose password was checked just before a use commits gets no session (ordered)", async () => {
@@ -1389,6 +1608,36 @@ describe("the database's guards", () => {
 });
 
 describe("the cleanup", () => {
+  it("forgets each kind of counter by its own rule's reset time", async () => {
+    await ready();
+    const n = unique();
+    const keys = {
+      account: throttleAccountKey(`cleanup${String(n)}@example.org`),
+      source: throttleSourceKey(`10.39.249.${String(1 + (n % 250))}`),
+      resetAccount: resetThrottleAccountKey(`cleanup${String(n)}@example.org`),
+      resetSource: resetThrottleSourceKey(`10.39.249.${String(1 + (n % 250))}`),
+      resetAccountOld: resetThrottleAccountKey(`cleanup.old${String(n)}@example.org`),
+    };
+    const ages: Record<keyof typeof keys, number> = {
+      account: 2,
+      source: 2,
+      resetAccount: 2,
+      resetSource: 2,
+      resetAccountOld: 25,
+    };
+    for (const [name, key] of Object.entries(keys) as [keyof typeof keys, string][]) {
+      await db.execute(sql`
+        INSERT INTO public.sign_in_throttles (key, failures, last_failure_at)
+        VALUES (${key}, 1, clock_timestamp() - make_interval(hours => ${ages[name]}))`);
+    }
+    await deleteExpiredSignInThrottles(db);
+    const left = await db.rows<{ key: string }>(sql`
+      SELECT key FROM public.sign_in_throttles WHERE key = ANY(${Object.values(keys)}::text[])
+      ORDER BY key`);
+    // Account counters (sign-in and reset) last a day; address counters an hour.
+    expect(left.map((r) => r.key)).toEqual([keys.account, keys.resetAccount].sort());
+  });
+
   it("deletes links a day past their end and keeps newer ones", async () => {
     await ready();
     const org = await organization();

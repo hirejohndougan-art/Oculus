@@ -34,6 +34,8 @@ import {
   MAX_INVITATION_SECONDS,
   MIN_INVITATION_SECONDS,
   PasswordWorkBusyError,
+  RESET_ACCOUNT_THROTTLE,
+  RESET_SOURCE_THROTTLE,
   SOURCE_THROTTLE,
   checkNewPassword,
   dummyPasswordHash,
@@ -49,6 +51,7 @@ import {
   newUserId,
   normalizeEmail,
   passwordText,
+  resetThrottleAccountKey,
   throttleAccountKey,
   throttleAttempt,
   throttleSourceKey,
@@ -1096,7 +1099,8 @@ export async function signInChecked(
 /**
  * Clears the account counter for an address typed at sign-in, so a person
  * kept waiting by someone else's guessing can sign in at once. Only an
- * active system admin (`not_permitted`). The address counter is left.
+ * active system admin (`not_permitted`). The address counter is left. Also
+ * clears the address's reset-request counter (D-078).
  */
 export async function clearSignInThrottle(
   db: Database,
@@ -1114,21 +1118,31 @@ export async function clearSignInThrottle(
   }
   return inTransaction(db, async (tx) => {
     if (!(await isActiveSystemAdmin(tx, by))) return refused("not_permitted", NOT_PERMITTED);
+    // The reset counter too (D-078, review L4): someone asking for links in
+    // a person's name can't keep them from getting one.
     const n = await tx.execute(sql`
-      DELETE FROM public.sign_in_throttles WHERE key = ${throttleAccountKey(email)}`);
+      DELETE FROM public.sign_in_throttles
+      WHERE key IN (${throttleAccountKey(email)}, ${resetThrottleAccountKey(email)})`);
     return { ok: true, value: { cleared: n > 0 } };
   });
 }
 
 /**
- * Deletes counters that no longer matter: no failure for longer than the
- * longest reset time (24 hours), or none at all. For the cleanup command
+ * Deletes counters that no longer matter: none at all, or no failure (or
+ * reset request) for longer than their own rule's reset time: the account
+ * and reset-account counters 24 hours, the address counters 1 hour. For the cleanup command
  * any scheduler runs (T-037, D-035). Returns how many went.
  */
 export async function deleteExpiredSignInThrottles(db: Queryable): Promise<number> {
-  const hours = Math.max(ACCOUNT_THROTTLE.resetAfterSeconds, SOURCE_THROTTLE.resetAfterSeconds);
+  // Each kind of counter by its own rule's reset time (D-078, review L6), so
+  // a counter is never deleted while its rule still remembers it, whatever
+  // the rules become.
   return db.execute(sql`
     DELETE FROM public.sign_in_throttles
     WHERE failures = 0 OR last_failure_at IS NULL
-       OR last_failure_at < clock_timestamp() - make_interval(secs => ${hours})`);
+       OR last_failure_at < clock_timestamp() - make_interval(secs =>
+            CASE WHEN key LIKE 'reset:account:%' THEN ${RESET_ACCOUNT_THROTTLE.resetAfterSeconds}::int
+                 WHEN key LIKE 'reset:%' THEN ${RESET_SOURCE_THROTTLE.resetAfterSeconds}::int
+                 WHEN key LIKE 'account:%' THEN ${ACCOUNT_THROTTLE.resetAfterSeconds}::int
+                 ELSE ${SOURCE_THROTTLE.resetAfterSeconds}::int END)`);
 }
