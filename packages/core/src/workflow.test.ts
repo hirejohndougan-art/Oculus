@@ -50,6 +50,17 @@ describe("workflow states", () => {
     ]);
     expect(workflowActionLabel("withdraw")).toBe("Unpublish");
     expect(workflowActionLabel("publish")).toBe("Publish");
+    for (const bad of [
+      "toString",
+      "__proto__",
+      "constructor",
+      "archived",
+      null,
+      new String("draft"),
+    ]) {
+      expect(workflowStateLabel(bad)).toBe("Unknown state");
+      expect(workflowActionLabel(bad)).toBe("Unknown action");
+    }
   });
 
   it("are matched exactly", () => {

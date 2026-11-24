@@ -151,14 +151,17 @@ export function isPublicState(value: unknown): boolean {
   return value === "published";
 }
 
-/** The state's label for people ("Ready for review"). */
-export function workflowStateLabel(state: WorkflowState): string {
-  return LABELS[state];
+/** The state's label for people ("Ready for review"); "Unknown state" for anything that isn't a state. */
+export function workflowStateLabel(state: unknown): string {
+  return isWorkflowState(state) ? LABELS[state] : "Unknown state";
 }
 
-/** The action's label for a button ("Unpublish" for `withdraw`, as in DESIGN.md). */
-export function workflowActionLabel(action: WorkflowAction): string {
-  return ACTION_LABELS[action];
+/**
+ * The action's label for a button ("Unpublish" for `withdraw`, as in
+ * DESIGN.md); "Unknown action" for anything that isn't an action.
+ */
+export function workflowActionLabel(action: unknown): string {
+  return isWorkflowAction(action) ? ACTION_LABELS[action] : "Unknown action";
 }
 
 /**
