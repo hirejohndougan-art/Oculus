@@ -476,23 +476,31 @@ export async function publishCheckIssues(
   return effectivePublishIssues(effective.value, { accessions: s.accessions });
 }
 
+/** One value a record's public output takes from another record (S-020). */
+export interface PublicValueSource {
+  /** The field of the record whose value comes from `source`. */
+  readonly field: string;
+  readonly source: RecordId;
+}
+
 /**
- * The records whose values the record's public output would show besides
- * its own (S-020): every record a public value is inherited from (an
- * ancestor, or for a digital asset the record it represents or one of its
- * ancestors), and the record a digital asset represents, read in the
- * caller's transaction as `publishCheckIssues` reads them. Sorted by ID.
+ * What the record's public output would show from other records (S-020):
+ * for every public value it inherits, the field and the record it comes
+ * from (an ancestor, or for a digital asset the record it represents or one
+ * of that record's ancestors), and for a digital asset the record it
+ * represents (field `""`), read in the caller's transaction as
+ * `publishCheckIssues` reads them. Sorted by field, then source.
  * `undefined` if the record or what it depends on can't be read (then the
  * publish check refuses anyway). The service asks that the person may view
- * every one of them before publishing, or before an edit of a published
- * record adds one.
+ * every source before publishing, and before any write adds a (field,
+ * source) pair to a published record's output.
  */
 export async function publicValueSources(
   db: Queryable,
   organizationId: OrganizationId,
   recordId: RecordId,
   options: { readonly lock?: boolean } = {},
-): Promise<readonly RecordId[] | undefined> {
+): Promise<readonly PublicValueSource[] | undefined> {
   if (!isOrganizationId(organizationId) || !isRecordId(recordId)) return undefined;
   const snapshot = await readSnapshot(db, organizationId, recordId, options.lock === true);
   if (!snapshot.ok) return undefined;
@@ -504,16 +512,64 @@ export async function publicValueSources(
     identifiers: s.identifiers,
   });
   if (!effective.ok) return undefined;
-  const sources = new Set<RecordId>();
+  const pairs = new Map<string, PublicValueSource>();
+  const add = (field: string, source: RecordId): void => {
+    if (source !== recordId) pairs.set(`${field}\u0000${source}`, Object.freeze({ field, source }));
+  };
   for (const entry of effective.value.entries) {
-    if (!entry.own && entry.inTemplate && entry.visibility === "public") sources.add(entry.from.id);
+    if (!entry.own && entry.inTemplate && entry.visibility === "public") {
+      add(entry.key, entry.from.id);
+    }
   }
   const record = effective.value.record;
   if (record.kind === "digital_asset" && record.represents !== undefined) {
-    sources.add(record.represents);
+    add("", record.represents);
   }
-  sources.delete(recordId);
-  return [...sources].sort();
+  return [...pairs.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([, v]) => v);
+}
+
+/**
+ * The records whose public output can depend on the record (S-020): every
+ * record below it (units filed under it, at any depth) and every digital
+ * asset representing it or one of those, with whether each is published
+ * now. Read without locks, in the caller's transaction; the record itself
+ * is not listed.
+ */
+export async function recordDependents(
+  db: Queryable,
+  organizationId: OrganizationId,
+  recordId: RecordId,
+): Promise<readonly { readonly id: RecordId; readonly published: boolean }[]> {
+  if (!isOrganizationId(organizationId) || !isRecordId(recordId)) return [];
+  const rows = await db.rows<{ id: string; published: boolean }>(sql`
+    WITH RECURSIVE down(id) AS (
+      SELECT ${recordId}::uuid
+      UNION
+      SELECT r.id FROM public.records r
+      JOIN down ON r.organization_id = ${organizationId}::uuid
+               AND (r.parent_id = down.id OR r.represents_id = down.id)
+    )
+    SELECT r.id::text AS id, r.workflow_state = 'published' AS published
+    FROM public.records r
+    WHERE r.organization_id = ${organizationId}::uuid AND r.id IN (SELECT id FROM down)
+      AND r.id <> ${recordId}::uuid
+    ORDER BY r.id`);
+  return rows.map((r) => Object.freeze({ id: r.id as RecordId, published: r.published }));
+}
+
+/**
+ * The IDs of `ids` and every record above them (parents, represented
+ * records, their parents …), sorted; `undefined` past `MAX_CLOSURE_RECORDS`.
+ * Read without locks, in the caller's transaction (S-020).
+ */
+export async function recordClosureIds(
+  db: Queryable,
+  organizationId: OrganizationId,
+  ids: readonly RecordId[],
+): Promise<readonly RecordId[] | undefined> {
+  if (!isOrganizationId(organizationId) || !ids.every((id) => isRecordId(id))) return undefined;
+  const rows = await readRecordClosure(db, organizationId, ids);
+  return rows?.map((r) => r.id as RecordId).sort();
 }
 
 // ---------------------------------------------------------------------------

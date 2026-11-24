@@ -84,9 +84,11 @@ export {
   publishCheckIssues,
   readPublicRecord,
   publicValueSources,
+  recordDependents,
+  recordClosureIds,
   readWorkflowState,
 } from "./workflow.js";
-export type { PublicRecordOptions, WorkflowChangeResult } from "./workflow.js";
+export type { PublicRecordOptions, PublicValueSource, WorkflowChangeResult } from "./workflow.js";
 export type { RecordDeletion, RecordDeletionResult } from "./record-delete.js";
 export {
   grantWriterRole,

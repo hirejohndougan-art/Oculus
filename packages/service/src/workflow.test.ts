@@ -1000,20 +1000,152 @@ describe("publishing never puts out what the publisher can't see (S-020)", () =>
     ).record;
   }
 
-  /** Carol: a reviewer (who may publish) only below the given units. */
-  async function reviewerBelow(org: OrganizationId, ...units: RecordId[]): Promise<string> {
+  /** Someone holding `role` only below the given units. */
+  async function scopedBelow(
+    org: OrganizationId,
+    role: string,
+    name: string,
+    ...units: RecordId[]
+  ): Promise<string> {
     if (folks === undefined) throw new Error("not ready");
-    const carol = await folks.member(org, "Carol");
+    const person = await folks.member(org, name);
     for (const scope of units) {
-      await grant(service, folks.root, org, {
-        userId: carol,
-        role: "reviewer",
-        siteId: siteFor(org),
-        scope,
-      });
+      await grant(service, folks.root, org, { userId: person, role, siteId: siteFor(org), scope });
     }
-    return actorOf(carol);
+    return actorOf(person);
   }
+
+  /** Carol: a reviewer (who may publish) only below the given units. */
+  const reviewerBelow = (org: OrganizationId, ...units: RecordId[]) =>
+    scopedBelow(org, "reviewer", "Carol", ...units);
+
+  async function file(org: OrganizationId, parentId: RecordId): Promise<CatalogRecord> {
+    return (
+      await create(org, {
+        kind: "archival_unit",
+        level: "file",
+        parentId,
+        title: "Invented file",
+        templateKey: "pub-unit",
+        fields: { rights: { uri: INC } },
+      })
+    ).record;
+  }
+
+  /** The series's own provenance dropped by `actor`: the review's repro (S-020, second review). */
+  async function dropProvenance(org: OrganizationId, actor: string, series: CatalogRecord) {
+    const rest = Object.fromEntries(
+      Object.entries(series.fields).filter(([key]) => key !== "provenance"),
+    );
+    return service.updateRecord(
+      ctx(org, actor),
+      series.id,
+      { ...series, fields: rest },
+      { expectedVersion: 1 },
+    );
+  }
+
+  it("refuses a scoped reviewer dropping a draft series's value so a published file inherits a hidden fonds's (the review's repro)", async () => {
+    await ready();
+    const org = await organization();
+    const fonds = await unit(org, "Invented Fonds", undefined, "FONDS-SECRET");
+    const series = await unit(org, "Invented series", fonds.id, "Invented series provenance.");
+    const x = await file(org, series.id);
+    const dave = await scopedBelow(org, "reviewer", "Dave", series.id);
+    // Dave may publish the file: its only source is the series he sees.
+    ok(await service.publish(ctx(org, dave), x.id, { expectedVersion: 1 }));
+    expect((await publicText(org, x.id)).text).toContain("Invented series provenance.");
+    const dropped = await dropProvenance(org, dave, series);
+    expect(codes(dropped)).toEqual(["inherits_from_hidden"]);
+    expect(JSON.stringify(dropped)).not.toContain(fonds.id);
+    const out = await publicText(org, x.id);
+    expect(out.text).toContain("Invented series provenance.");
+    expect(out.text).not.toContain("FONDS-SECRET");
+    // Unrelated edits of the series still pass: a new title, a new value of its own.
+    ok(
+      await service.updateRecord(
+        ctx(org, dave),
+        series.id,
+        {
+          ...series,
+          title: "Invented series, renamed",
+          fields: { ...series.fields, provenance: "A new series provenance." },
+        },
+        { expectedVersion: 1 },
+      ),
+    );
+    expect((await publicText(org, x.id)).text).toContain("A new series provenance.");
+  });
+
+  it("refuses a scoped cataloger the same edit", async () => {
+    await ready();
+    const org = await organization();
+    const fonds = await unit(org, "Invented Fonds", undefined, "FONDS-SECRET");
+    const series = await unit(org, "Invented series", fonds.id, "Invented series provenance.");
+    const x = await file(org, series.id);
+    ok(await service.publish(ctx(org), x.id, { expectedVersion: 1 }));
+    const carl = await scopedBelow(org, "cataloger", "Carl", series.id);
+    expect(codes(await dropProvenance(org, carl, series))).toEqual(["inherits_from_hidden"]);
+    expect((await publicText(org, x.id)).text).not.toContain("FONDS-SECRET");
+    // Alice, who sees the fonds, may.
+    ok(await dropProvenance(org, ALICE, series));
+    expect((await publicText(org, x.id)).text).toContain("FONDS-SECRET");
+  });
+
+  it("compares (field, source) pairs: a hidden fonds already giving one field can't start giving another", async () => {
+    await ready();
+    const org = await organization();
+    ok(
+      await insertTemplateVersion(s.owner, {
+        key: "pub-unit-two",
+        organizationId: org,
+        label: "pub-unit-two",
+        appliesTo: ["archival_unit"],
+        fields: [
+          field("rights", "rights"),
+          field("provenance", "text", { inherited: true }),
+          field("history", "text", { inherited: true }),
+        ],
+      }),
+    );
+    const make = async (draft: Record<string, unknown>) => (await create(org, draft)).record;
+    const fonds = await make({
+      kind: "archival_unit",
+      level: "fonds",
+      title: "Invented Fonds",
+      templateKey: "pub-unit-two",
+      fields: { rights: { uri: INC }, provenance: "FONDS-SECRET", history: "Invented history." },
+    });
+    const series = await make({
+      kind: "archival_unit",
+      level: "series",
+      parentId: fonds.id,
+      title: "Invented series",
+      templateKey: "pub-unit-two",
+      fields: { rights: { uri: INC }, provenance: "Invented series provenance." },
+    });
+    const x = await make({
+      kind: "archival_unit",
+      level: "file",
+      parentId: series.id,
+      title: "Invented file",
+      templateKey: "pub-unit-two",
+      fields: { rights: { uri: INC } },
+    });
+    // Published by Alice: history from the fonds, provenance from the series.
+    ok(await service.publish(ctx(org), x.id, { expectedVersion: 1 }));
+    const dave = await scopedBelow(org, "reviewer", "Dave", series.id);
+    expect(codes(await dropProvenance(org, dave, series))).toEqual(["inherits_from_hidden"]);
+    // A change that keeps every pair passes.
+    ok(
+      await service.updateRecord(
+        ctx(org, dave),
+        series.id,
+        { ...series, title: "Invented series, renamed" },
+        { expectedVersion: 1 },
+      ),
+    );
+  });
 
   it("refuses a scoped reviewer publishing a unit that inherits public values from a unit above their scope", async () => {
     await ready();

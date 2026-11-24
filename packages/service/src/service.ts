@@ -122,6 +122,8 @@ import {
   lockRecord,
   publicValueSources,
   publishCheckIssues,
+  recordClosureIds,
+  recordDependents,
   readOrganization,
   readRecordIdentifiers,
   readRecordPlace,
@@ -145,6 +147,7 @@ import {
   type RecordVersion,
   type VersionConflict,
   type WriterRoleProblem,
+  type PublicValueSource,
 } from "@oculus/db";
 
 /**
@@ -960,6 +963,29 @@ function stillPublishable(found: readonly Issue[]): ServiceRefusal | undefined {
   };
 }
 
+/** The records `record` is filed under or represents (S-020). */
+function placeIds(record: CatalogRecord): RecordId[] {
+  if (record.kind === "archival_unit" && record.parentId !== undefined) return [record.parentId];
+  if (record.kind === "digital_asset" && record.represents !== undefined) {
+    return [record.represents];
+  }
+  return [];
+}
+
+/** A (field, source) pair as one comparable string (S-020). */
+function pairKey(pair: PublicValueSource): string {
+  return `${pair.field}\u0000${pair.source}`;
+}
+
+/** The refusal for a write that would put out values from records the actor can't see (S-020). */
+function inheritsFromHidden(): ServiceRefusal {
+  return refusal(
+    ["workflowState"],
+    "inherits_from_hidden",
+    "Some values a published record would show come from records you can't see, so this change can't be made here. Ask someone who can see the records it is filed under.",
+  );
+}
+
 /** Makes the service over `db`, a pool connected as the writer role. */
 export function createService(db: Database, options: ServiceOptions = {}): RecordService {
   const clock = options.now ?? (() => new Date());
@@ -1015,15 +1041,16 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
   }
 
   /**
-   * S-020: refused unless the actor may view every record whose values the
-   * record's public output shows besides its own (`publicValueSources`:
-   * ancestors and represented records a public value is inherited from,
-   * and the record a digital asset represents), or with `before`, every
-   * such record not already among `before`. Publishing must not put out
-   * what the publisher can't see. The sources are locked `FOR SHARE` in ID
-   * order and read again: if they changed meanwhile, the operation starts
-   * again (`retry`); otherwise none of them can change (or move to a site
-   * or unit the actor can't see) before COMMIT. Take `checker`'s
+   * S-020: refused unless the actor may view the source of every (field,
+   * source) pair the record's public output takes from other records
+   * (`publicValueSources`: public values inherited from ancestors and
+   * represented records, and the record a digital asset represents), or with
+   * `before`, of every pair not already among `before`. Publishing, or a
+   * write that changes a published record's output, must not put out what
+   * the actor can't see. The new pairs' sources are locked `FOR SHARE` in ID
+   * order and the pairs read again: if they changed meanwhile, the operation
+   * starts again (`retry`); otherwise none of the sources can change (or move
+   * to a site or unit the actor can't see) before COMMIT. Take `checker`'s
    * arrangement lock (if any) before the record's row lock, as callers do.
    */
   async function hiddenSourcesRefusal(
@@ -1031,23 +1058,68 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
     checker: RecordAccess,
     organizationId: OrganizationId,
     recordId: RecordId,
-    before: readonly RecordId[] = [],
+    before: readonly PublicValueSource[] = [],
   ): Promise<ServiceRefusal | undefined> {
-    const known = new Set(before);
-    const sources = await publicValueSources(tx, organizationId, recordId, { lock: true });
+    const known = new Set(before.map(pairKey));
+    const pairs = await publicValueSources(tx, organizationId, recordId, { lock: true });
     // Unreadable: the publish check, run with it, refuses the record anyway.
-    if (sources === undefined) return undefined;
-    const added = sources.filter((id) => !known.has(id));
+    if (pairs === undefined) return undefined;
+    const added = pairs.filter((p) => !known.has(pairKey(p)));
     if (added.length === 0) return undefined;
-    for (const id of added) await lockRecord(tx, organizationId, id, "share");
+    const sources = [...new Set(added.map((p) => p.source))].sort();
+    for (const id of sources) await lockRecord(tx, organizationId, id, "share");
     const again = await publicValueSources(tx, organizationId, recordId, { lock: true });
-    if (again?.join() !== sources.join()) return retryRefusal();
-    if ((await checker.hiddenAmong(added)).size === 0) return undefined;
-    return refusal(
-      ["workflowState"],
-      "inherits_from_hidden",
-      "Some values this record would show publicly come from records you can't see, so you can't make them public. Ask someone who can see the records it is filed under.",
-    );
+    if (again?.map(pairKey).join("\n") !== pairs.map(pairKey).join("\n")) return retryRefusal();
+    if ((await checker.hiddenAmong(sources)).size === 0) return undefined;
+    return inheritsFromHidden();
+  }
+
+  /**
+   * Before a write of `recordId` (an edit, a move, a restore) that can change
+   * what the published records below it, and scans of them, show (S-020):
+   * their (field, source) pairs now, to compare after the write with
+   * `dependentsRefusal`. `undefined` when nothing needs comparing: a system
+   * manager (who sees everything), no published dependents, or no record the
+   * actor can't see among those any new source could be (the record, every
+   * record above it now and after the write, and every record below it).
+   * `after` is the IDs the record will be filed under or represent.
+   */
+  async function watchDependents(
+    tx: Queryable,
+    checker: RecordAccess,
+    organizationId: OrganizationId,
+    recordId: RecordId,
+    after: readonly RecordId[],
+  ): Promise<ReadonlyMap<RecordId, readonly PublicValueSource[]> | undefined> {
+    if (checker.access.systemManager) return undefined;
+    const dependents = await recordDependents(tx, organizationId, recordId);
+    const published = dependents.filter((d) => d.published).map((d) => d.id);
+    if (published.length === 0) return undefined;
+    const above = await recordClosureIds(tx, organizationId, [recordId, ...after]);
+    // Too many to list: compare every published dependent.
+    if (above !== undefined) {
+      const hidden = await checker.hiddenAmong([...above, ...dependents.map((d) => d.id)]);
+      if (hidden.size === 0) return undefined;
+    }
+    const before = new Map<RecordId, readonly PublicValueSource[]>();
+    for (const id of published)
+      before.set(id, (await publicValueSources(tx, organizationId, id)) ?? []);
+    return before;
+  }
+
+  /** After the write: `hiddenSourcesRefusal` for every dependent `watchDependents` listed. */
+  async function dependentsRefusal(
+    tx: Queryable,
+    checker: RecordAccess,
+    organizationId: OrganizationId,
+    watched: ReadonlyMap<RecordId, readonly PublicValueSource[]> | undefined,
+  ): Promise<ServiceRefusal | undefined> {
+    if (watched === undefined) return undefined;
+    for (const [id, before] of watched) {
+      const refused = await hiddenSourcesRefusal(tx, checker, organizationId, id, before);
+      if (refused) return refused;
+    }
+    return undefined;
   }
 
   /** One of the four workflow actions (D-075), as the record's next version. */
@@ -1514,6 +1586,15 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         // permission where it leaves and where it goes.
         const moved = await moveIssues(tx, checker, recordId, before, record);
         if (moved) return moved;
+        // What the published records below it (and scans of them) show from
+        // other records now (S-020): the edit may change what they inherit.
+        const dependentsBefore = await watchDependents(
+          tx,
+          checker,
+          org,
+          recordId,
+          placeIds(record),
+        );
         if (record.templateKey === undefined) {
           return refusal(["templateKey"], "no_template_key", "Every record names its template.");
         }
@@ -1566,6 +1647,8 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           const hidden = await hiddenSourcesRefusal(tx, checker, org, recordId, sourcesBefore);
           if (hidden) return hidden;
         }
+        const below = await dependentsRefusal(tx, checker, org, dependentsBefore);
+        if (below) return below;
         return {
           ok: true,
           value: Object.freeze({
@@ -1678,6 +1761,13 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           return retryRefusal();
         }
         let hiddenLinks: ReadonlySet<RecordId> = new Set();
+        const dependentsBefore = await watchDependents(
+          tx,
+          checker,
+          org,
+          recordId,
+          old === undefined ? [] : placeIds(old),
+        );
         if (old !== undefined) {
           const moved = await moveIssues(tx, checker, recordId, place, old);
           if (moved) return moved;
@@ -1726,6 +1816,8 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           const hidden = await hiddenSourcesRefusal(tx, checker, org, recordId, sourcesBefore);
           if (hidden) return hidden;
         }
+        const below = await dependentsRefusal(tx, checker, org, dependentsBefore);
+        if (below) return below;
         return restored;
       });
     },
