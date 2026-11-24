@@ -605,3 +605,23 @@ export {
   OTHER_SOURCE_KEY,
 } from "./sign-in-throttle.js";
 export type { ThrottleRule, ThrottleState, ThrottleDecision } from "./sign-in-throttle.js";
+export {
+  WORKFLOW_STATES,
+  WORKFLOW_ACTIONS,
+  INITIAL_WORKFLOW_STATE,
+  isWorkflowState,
+  isWorkflowAction,
+  isPublicState,
+  workflowStateLabel,
+  workflowActionLabel,
+  changesPublicOutput,
+  workflowMoves,
+  workflowTransition,
+  applyWorkflowAction,
+} from "./workflow.js";
+export type {
+  WorkflowState,
+  WorkflowAction,
+  WorkflowMove,
+  WorkflowTransition,
+} from "./workflow.js";
