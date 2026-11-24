@@ -5,7 +5,7 @@ import { cleanup, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CSRF, ORG_A, ORG_B, PENDING, SITE_1, fakeServer, me, renderAt } from "../testing.fixtures";
-import { WRONG_CODE } from "./Code";
+import { CODE_AGAIN, WRONG_CODE } from "./Code";
 import { groupedKey } from "./SetUp";
 import { WRONG_PASSWORD } from "./SignIn";
 
@@ -182,6 +182,68 @@ describe("the code screen", () => {
     });
   });
 
+  it("asks for a fresh code when the first ran out while choosing, keeping the organization", async () => {
+    let calls = 0;
+    const sent = fakeServer({
+      "GET /api/sign-in/pending": [200, PENDING],
+      "POST /api/sign-in/code": () => {
+        calls += 1;
+        if (calls === 1) {
+          return [
+            409,
+            {
+              error: "choose_organization",
+              organizations: [
+                { organizationId: ORG_A, name: "Invented Archive" },
+                { organizationId: ORG_B, name: "Invented Library" },
+              ],
+            },
+          ];
+        }
+        return calls === 2
+          ? [422, { error: "invalid_code" }]
+          : [200, { session: { organizationId: ORG_B, csrfToken: "n".repeat(43) } }];
+      },
+      "GET /api/me": [200, ONE_SITE],
+    });
+    renderAt("/sign-in/code");
+    await userEvent.type(await screen.findByLabelText(/^6-digit code/), "123456");
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Continue" }).hasAttribute("disabled")).toBe(false);
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await userEvent.click(await screen.findByRole("radio", { name: "Invented Library" }));
+    await userEvent.click(screen.getByRole("button", { name: "Continue" }));
+    expect((await screen.findByRole("alert")).textContent).toBe(CODE_AGAIN);
+    const field = screen.getByLabelText(/^6-digit code/);
+    await userEvent.type(field, "654321");
+    await userEvent.click(screen.getByRole("button", { name: "Continue" }));
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Invented archive site" }),
+    ).toBeTruthy();
+    expect(sent.filter((s) => s.path === "/api/sign-in/code").at(-1)?.body).toEqual({
+      code: "654321",
+      organizationId: ORG_B,
+    });
+  });
+
+  it("stays when cancelling fails, and offers to try again", async () => {
+    let calls = 0;
+    fakeServer({
+      "GET /api/sign-in/pending": [200, PENDING],
+      "POST /api/sign-out": () => {
+        calls += 1;
+        return calls === 1 ? [503, { error: "unavailable" }] : [200, { signedOut: true }];
+      },
+    });
+    renderAt("/sign-in/code");
+    await userEvent.click(await screen.findByRole("button", { name: "Cancel and sign in again" }));
+    expect((await screen.findByRole("alert")).textContent).toMatch(/wasn't cancelled/);
+    expect(screen.getByRole("heading", { name: "Enter your code" })).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByRole("heading", { name: "Sign in" })).toBeTruthy();
+  });
+
   it("goes back to sign in after too many wrong codes", async () => {
     fakeServer({
       "GET /api/sign-in/pending": [200, PENDING],
@@ -249,6 +311,56 @@ describe("setting up two-step sign-in", () => {
     ).toBeTruthy();
     expect(screen.queryByText(CODES[0] ?? "")).toBeNull();
     expect(sent.find((s) => s.path === "/api/sign-in/set-up")?.headers["x-oculus-csrf"]).toBe(CSRF);
+  });
+
+  it("asks for a fresh code at set-up when the first ran out while choosing", async () => {
+    let calls = 0;
+    const sent = fakeServer({
+      "GET /api/sign-in/pending": [200, { ...PENDING, next: "set_up" }],
+      "POST /api/sign-in/set-up": [200, { secret: SECRET, otpauthUri: URI }],
+      "POST /api/sign-in/set-up/confirm": () => {
+        calls += 1;
+        if (calls === 1) {
+          return [
+            409,
+            {
+              error: "choose_organization",
+              organizations: [
+                { organizationId: ORG_A, name: "Invented Archive" },
+                { organizationId: ORG_B, name: "Invented Library" },
+              ],
+            },
+          ];
+        }
+        return calls === 2
+          ? [422, { error: "invalid_code" }]
+          : [
+              200,
+              {
+                session: { organizationId: ORG_B, csrfToken: "n".repeat(43) },
+                recoveryCodes: CODES,
+              },
+            ];
+      },
+    });
+    renderAt("/sign-in/set-up");
+    const start = await screen.findByRole("button", { name: "Start setting up" });
+    await waitFor(() => {
+      expect(start.hasAttribute("disabled")).toBe(false);
+    });
+    await userEvent.click(start);
+    await userEvent.type(await screen.findByLabelText(/^6-digit code from the app/), "123456");
+    await userEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    await userEvent.click(await screen.findByRole("radio", { name: "Invented Library" }));
+    await userEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    expect((await screen.findByRole("alert")).textContent).toBe(CODE_AGAIN);
+    await userEvent.type(screen.getByLabelText(/^6-digit code from the app/), "654321");
+    await userEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    expect(await screen.findByRole("list", { name: "Recovery codes" })).toBeTruthy();
+    expect(sent.filter((s) => s.path === "/api/sign-in/set-up/confirm").at(-1)?.body).toEqual({
+      code: "654321",
+      organizationId: ORG_B,
+    });
   });
 
   it("asks for the set-up code from the email after an administrator's reset", async () => {

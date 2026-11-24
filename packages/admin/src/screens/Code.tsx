@@ -15,6 +15,8 @@ import type { OrganizationChoice, PendingState } from "../types";
 import { usePendingSession } from "./pending";
 
 export const WRONG_CODE = "That code isn't right, or was used already. Try the next code.";
+export const CODE_AGAIN =
+  "That code has run out while you chose. Type the new code from your app; your choice of organization is kept.";
 
 export function Code() {
   const navigate = useNavigate();
@@ -25,6 +27,7 @@ export function Code() {
   const [organizations, setOrganizations] = useState<readonly OrganizationChoice[]>();
   const [organizationId, setOrganizationId] = useState<string>();
   const [problem, setProblem] = useState<string>();
+  const [cancelFailed, setCancelFailed] = useState(false);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -59,6 +62,12 @@ export function Code() {
         setProblem(problemText(error));
       } else if (error.code === "choose_organization") {
         setOrganizations((error.body.organizations ?? []) as OrganizationChoice[]);
+      } else if (error.code === "invalid_code" && organizations !== undefined) {
+        // The code timed out (or was used) while the organization was
+        // chosen: ask for a fresh one, keeping the choice.
+        setOrganizations(undefined);
+        setCode("");
+        setProblem(CODE_AGAIN);
       } else if (error.code === "invalid_code") {
         setProblem(WRONG_CODE);
       } else if (error.code === "use_recovery_code") {
@@ -88,10 +97,16 @@ export function Code() {
   }
 
   async function cancel() {
+    // Back to sign in only once the waiting session has really ended (or
+    // the server says there is none).
     try {
       await api("/api/sign-out", { body: {} });
-    } catch {
-      // Going back to the sign-in screen either way.
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 401)) {
+        setCancelFailed(true);
+        setProblem(`Your sign-in wasn't cancelled: ${problemText(error)}`);
+        return;
+      }
     }
     await navigate("/sign-in", { replace: true });
   }
@@ -148,6 +163,17 @@ export function Code() {
             {problem}
           </Note>
         )}
+        {cancelFailed ? (
+          <Button
+            variant="secondary"
+            onPress={() => {
+              setCancelFailed(false);
+              void cancel();
+            }}
+          >
+            Try again
+          </Button>
+        ) : null}
         <Button type="submit" isDisabled={busy || pending === undefined}>
           {busy ? "Checking…" : "Continue"}
         </Button>

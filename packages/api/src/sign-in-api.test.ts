@@ -227,6 +227,7 @@ describe("POST /api/sign-in", () => {
     const third = await post("/api/sign-in", body, { ip, server: limited });
     expect(third.statusCode).toBe(429);
     expect(third.body).toBe('{"error":"rate_limited"}');
+    expect(third.headers["retry-after"]).toBe("60");
   });
 
   it("refuses a foreign or missing Origin, a bad body and other content types", async () => {
@@ -702,6 +703,50 @@ describe("password reset (POST /api/password-reset, /complete)", () => {
       ).statusCode,
     ).toBe(403);
     expect((await post("/api/password-reset/complete", { token: "x" })).statusCode).toBe(400);
+  });
+});
+
+describe("the per-address brake on the other routes (review item 2)", () => {
+  /** Three requests from one address: the third is refused, with Retry-After. */
+  async function third(send: (ip: string) => Promise<LightMyRequestResponse>) {
+    const ip = address();
+    const first = await send(ip);
+    const second = await send(ip);
+    const last = await send(ip);
+    expect(last.statusCode).toBe(429);
+    expect(last.body).toBe('{"error":"rate_limited"}');
+    expect(last.headers["retry-after"]).toBe("60");
+    return [first, second];
+  }
+
+  it("limits sign-out and the waiting session's state per address", async () => {
+    const [a, b] = await third((ip) => post("/api/sign-out", {}, { ip, server: limited }));
+    expect(a?.statusCode).toBe(200);
+    expect(b?.statusCode).toBe(200);
+    const [c] = await third((ip) => get("/api/sign-in/pending", { ip, server: limited }));
+    expect(c?.statusCode).toBe(401);
+  });
+
+  it("limits GET /api/me, POST /api/organization and sign-out everywhere else before the session is looked up", async () => {
+    // No cookie at all: without the brake these would be 401 every time.
+    const [me] = await third((ip) => get("/api/me", { ip, server: limited }));
+    expect(me?.statusCode).toBe(401);
+    const [org] = await third((ip) =>
+      post("/api/organization", { organizationId: w.b }, { ip, server: limited }),
+    );
+    expect(org?.statusCode).toBe(401);
+    const [others] = await third((ip) => post("/api/sign-out/others", {}, { ip, server: limited }));
+    expect(others?.statusCode).toBe(401);
+  });
+
+  it("answers the per-session limit with Retry-After too", async () => {
+    const full = await signedIn(w.manager);
+    expect((await post("/api/sign-out/others", {}, { ...full, server: limited })).statusCode).toBe(
+      200,
+    );
+    const over = await post("/api/sign-out/others", {}, { ...full, server: limited });
+    expect(over.statusCode).toBe(429);
+    expect(over.headers["retry-after"]).toBe("60");
   });
 });
 

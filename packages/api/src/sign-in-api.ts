@@ -111,6 +111,37 @@ export interface SignInApiOptions {
 
 const WARNING_INTERVAL_MS = 10 * 60_000;
 
+/** The limiter's windows are a minute long, so a minute is always long enough to wait. */
+const RATE_LIMIT_RETRY_SECONDS = 60;
+
+/**
+ * Thrown inside a handler when a brake is used up; `guarded` turns it into
+ * `429 rate_limited` with `Retry-After`. (A thrown Refusal can't carry a
+ * header: an error reply drops everything the handler set, D-058.)
+ */
+class RateLimited extends Error {
+  readonly retryAfterSeconds = RATE_LIMIT_RETRY_SECONDS;
+  constructor() {
+    super("rate_limited");
+    this.name = "RateLimited";
+  }
+}
+
+/** Wraps a handler so a used-up brake answers 429 with `Retry-After`. */
+function guarded(
+  handler: (request: OculusRequest, reply: OculusReply) => Promise<unknown>,
+): (request: OculusRequest, reply: OculusReply) => Promise<unknown> {
+  return async (request, reply) => {
+    try {
+      return await handler(request, reply);
+    } catch (thrown) {
+      if (!(thrown instanceof RateLimited)) throw thrown;
+      reply.status(429).header("retry-after", String(thrown.retryAfterSeconds));
+      return { error: "rate_limited" };
+    }
+  };
+}
+
 function defaultLog(record: ApiLogRecord): void {
   try {
     process.stderr.write(`${JSON.stringify({ oculus: record })}\n`);
@@ -240,10 +271,13 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
     return ip;
   }
 
-  /** The per-address limit for posts made without a full session. */
+  /**
+   * The per-address limit: on every request made without a full session,
+   * and before the session lookup on the others.
+   */
   function limitAddress(source: string): void {
     if (!limiter.take(`address:${throttleSourceKey(source)}`, "credentials")) {
-      throw new Refusal(429, "rate_limited");
+      throw new RateLimited();
     }
   }
 
@@ -257,16 +291,20 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
     return token;
   }
 
-  /** The full session the cookie names, with the per-session limit. */
+  /**
+   * The full session the cookie names: the per-address limit first (before
+   * the database is asked), then the session, then the per-session limit.
+   */
   async function fullSessionOf(
     request: OculusRequest,
     post: boolean,
   ): Promise<{ token: string; session: FullSession }> {
+    limitAddress(sourceOf(request));
     const token = cookieToken(request, post);
     const resolved = await resolveSession(db, token, { onError: onError("resolveSession") });
     if (!resolved.ok) throw fixedAnswer(resolved.code);
     if (!limiter.take(resolved.session.sessionId, post ? "write" : "read")) {
-      throw new Refusal(429, "rate_limited");
+      throw new RateLimited();
     }
     return { token, session: resolved.session };
   }
@@ -290,7 +328,12 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
     return { session: sessionView(session, token) };
   }
 
-  /** Maps a refusal of the code or set-up steps; clears the cookie when the session has ended. */
+  /**
+   * Maps a refusal of the code or set-up steps to its reply. A session that
+   * has ended (`too_many_attempts`) keeps its cookie: an error reply drops
+   * every cookie the handler set (D-058), and the dead token is refused
+   * everywhere anyway.
+   */
   async function secondStepRefusal(
     reply: OculusReply,
     token: string,
@@ -303,7 +346,7 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
     throw fixedAnswer(refusal.code);
   }
 
-  return [
+  const routes: OculusRoute[] = [
     {
       method: "POST",
       path: "/api/sign-in",
@@ -357,6 +400,7 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
       method: "GET",
       path: "/api/sign-in/pending",
       handler: async (request) => {
+        limitAddress(sourceOf(request));
         const token = cookieToken(request, false);
         const state = await pendingSignInState(db, token, { onError: onError("pendingState") });
         if (!state.ok) throw fixedAnswer(state.code);
@@ -447,6 +491,7 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
       method: "POST",
       path: "/api/sign-out",
       handler: async (request, reply) => {
+        limitAddress(sourceOf(request));
         const token = request.cookies[OCULUS_COOKIES.session];
         // Without a session there is nothing to protect: just clear the cookie.
         if (token === undefined) {
@@ -568,4 +613,11 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
       },
     },
   ];
+  return routes.map((route) => {
+    const handler = route.handler;
+    return {
+      ...route,
+      handler: guarded(async (request, reply) => await handler(request, reply)),
+    };
+  });
 }

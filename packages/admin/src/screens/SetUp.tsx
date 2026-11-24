@@ -16,7 +16,7 @@ import { OrganizationPicker } from "../components/OrganizationPicker";
 import { QrCode } from "../components/QrCode";
 import { Button, Field, Note } from "../components/ui";
 import type { OrganizationChoice } from "../types";
-import { WRONG_CODE } from "./Code";
+import { CODE_AGAIN, WRONG_CODE } from "./Code";
 import { usePendingSession } from "./pending";
 import styles from "./SetUp.module.css";
 
@@ -53,6 +53,12 @@ export function SetUp() {
       );
     } else if (error.code === "already_set_up") {
       await navigate("/sign-in/code", { replace: true });
+    } else if (error.code === "invalid_code" && organizations !== undefined) {
+      // The code ran out while the organization was chosen: ask for a new
+      // one, keeping the choice.
+      setOrganizations(undefined);
+      setCode("");
+      setProblem(CODE_AGAIN);
     } else if (error.code === "invalid_code") {
       setProblem(WRONG_CODE);
     } else if (error.code === "choose_organization") {

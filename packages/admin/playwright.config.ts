@@ -1,7 +1,8 @@
 // End-to-end tests (D-073): the built admin served by Fastify against a
 // throwaway database (e2e/serve.mjs), driven by Playwright, with Siteimprove
 // Alfa's accessibility rules on every screen it passes. Run with
-// `npm run e2e` at the repository root (it builds first). Set
+// `npm run e2e` at the repository root (it builds first; e2e/run.mjs picks a
+// free port unless OCULUS_E2E_PORT is set). Set
 // OCULUS_E2E_BROWSER to a Chrome or Chromium binary to use it instead of
 // Playwright's own download.
 import { existsSync } from "node:fs";

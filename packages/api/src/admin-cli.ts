@@ -30,7 +30,14 @@ export async function runAdminCli(
     err("OCULUS_PORT must be a port number.");
     return 2;
   }
-  const db = openDatabase(url, { applicationName: "oculus-admin" });
+  let db: ReturnType<typeof openDatabase>;
+  try {
+    db = openDatabase(url, { applicationName: "oculus-admin" });
+  } catch {
+    // The parser's message can quote the URL, which may hold a password.
+    err(`${DATABASE_URL_VARIABLE} is not a usable postgresql:// URL (its value is not shown).`);
+    return 2;
+  }
   try {
     const app = await buildAdminServer({ db, env, logger: true });
     const close = (): void => {

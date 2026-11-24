@@ -13,6 +13,7 @@ import { FAKE_TEST_SECRET_KEY } from "../../db/src/second-factor.fixtures.js";
 import { freshDatabase, type TestDatabase } from "../../db/src/test-database.fixtures.js";
 import { migrate } from "@oculus/db";
 import { ADMIN_CSP, adminFileFor, loadAdminFiles, type AdminFiles } from "./admin-files.js";
+import { runAdminCli } from "./admin-cli.js";
 import { buildAdminServer, clientAddressProblem, isProduction } from "./admin-server.js";
 import { SECURITY_HEADERS } from "./headers.js";
 import type { ApiLogRecord } from "./staff-api.js";
@@ -147,6 +148,20 @@ describe("the startup checks", () => {
       log: () => undefined,
     });
     await started.close();
+  });
+
+  it("exits cleanly on a badly formed database URL, never showing it", async () => {
+    for (const url of [
+      "postgresql://someone:invented-pw@[bad",
+      "not a url invented-pw",
+      "mysql://x:invented-pw@h/d",
+    ]) {
+      const lines: string[] = [];
+      const code = await runAdminCli({ OCULUS_DATABASE_URL: url }, (line) => lines.push(line));
+      expect(code, url).toBe(2);
+      expect(lines.join("\n")).toMatch(/OCULUS_DATABASE_URL is not a usable/);
+      expect(lines.join("\n")).not.toContain("invented-pw");
+    }
   });
 
   it("refuses an admin origin outside OCULUS_ORIGINS", async () => {

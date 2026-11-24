@@ -145,6 +145,37 @@ describe("the frame", () => {
     );
   });
 
+  it("says a failed sign-out failed, stays, and signs out on Try again", async () => {
+    let calls = 0;
+    fakeServer({
+      "GET /api/me": [200, me([A1])],
+      "POST /api/sign-out": () => {
+        calls += 1;
+        return calls === 1 ? [503, { error: "unavailable" }] : [200, { signedOut: true }];
+      },
+    });
+    renderAt("/");
+    await userEvent.click(await screen.findByRole("button", { name: "Account: Ada Invented" }));
+    await userEvent.click(await screen.findByRole("menuitem", { name: "Sign out" }));
+    expect(await screen.findByText(/You are still signed in/)).toBeTruthy();
+    expect(screen.queryByText("You are signed out.")).toBeNull();
+    expect(screen.getByRole("heading", { level: 1, name: "Invented archive site" })).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByRole("heading", { name: "Sign in" })).toBeTruthy();
+    expect(screen.getByText("You are signed out.")).toBeTruthy();
+  });
+
+  it("treats a 401 from sign-out as signed out", async () => {
+    fakeServer({
+      "GET /api/me": [200, me([A1])],
+      "POST /api/sign-out": [401, { error: "unauthenticated" }],
+    });
+    renderAt("/");
+    await userEvent.click(await screen.findByRole("button", { name: "Account: Ada Invented" }));
+    await userEvent.click(await screen.findByRole("menuitem", { name: "Sign out" }));
+    expect(await screen.findByText("You are signed out.")).toBeTruthy();
+  });
+
   it("signs out everywhere else and says how many", async () => {
     fakeServer({
       "GET /api/me": [200, me([A1])],

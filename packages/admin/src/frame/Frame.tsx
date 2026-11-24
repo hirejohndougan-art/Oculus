@@ -16,7 +16,7 @@ import {
   Separator,
 } from "react-aria-components";
 import { ApiError, api, problemText, setCsrfToken } from "../api";
-import { Note } from "../components/ui";
+import { Button, Note } from "../components/ui";
 import type { Me, SiteChoice } from "../types";
 import styles from "./Frame.module.css";
 import { SiteSelector } from "./SiteSelector";
@@ -43,7 +43,11 @@ export function Frame() {
   const queries = useQueryClient();
   const { siteId } = useParams();
   const me = useMe();
-  const [status, setStatus] = useState<{ tone: "green" | "amber"; text: string }>();
+  const [status, setStatus] = useState<{
+    tone: "green" | "amber";
+    text: string;
+    retry?: () => void;
+  }>();
   const [switching, setSwitching] = useState(false);
 
   if (me.error instanceof ApiError && me.error.status === 401) {
@@ -65,11 +69,22 @@ export function Frame() {
   const person = me.data;
 
   async function signOut() {
+    // Signed out only when the server says so (or says there is no session
+    // any more); otherwise the session is still alive, so say so and offer
+    // to try again rather than pretend.
     try {
       await api("/api/sign-out", { body: {} });
-    } catch {
-      // Signed out on this screen either way; the server's limits end the session.
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 401)) {
+        setStatus({
+          tone: "amber",
+          text: `You are still signed in: ${problemText(error)}`,
+          retry: () => void signOut(),
+        });
+        return;
+      }
     }
+    setStatus(undefined);
     setCsrfToken(null);
     queries.clear();
     await navigate("/sign-in", {
@@ -167,6 +182,11 @@ export function Frame() {
         <main id="main" className={styles.content} tabIndex={-1}>
           <div aria-live="polite">
             {status === undefined ? null : <Note tone={status.tone}>{status.text}</Note>}
+            {status?.retry === undefined ? null : (
+              <Button variant="secondary" onPress={status.retry}>
+                Try again
+              </Button>
+            )}
           </div>
           <Outlet context={context} />
         </main>
