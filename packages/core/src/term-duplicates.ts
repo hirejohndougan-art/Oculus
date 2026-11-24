@@ -39,6 +39,11 @@
  * paired by `same_uri`. A group of terms sharing one key is reported as
  * pairs with one of its members, so n terms give n - 1 pairs, not n².
  *
+ * One organization at a time (D-019, D-071): every entry is an
+ * `OrganizationTerm` of the organization the caller names, or the whole list
+ * is refused (`mixed_organizations`, stored-terms.ts), since a pair's message
+ * names both labels.
+ *
  * Messy data doesn't stop the check: a term the vocabulary rules refuse, or
  * whose label is too long to compare once normalized (some characters expand
  * to many letters), is left out and listed in `skipped` with the reason.
@@ -62,8 +67,9 @@
  */
 import { type Issue, type Validated } from "./issues.js";
 import { IssueList, shown } from "./plain-data.js";
-import { types } from "node:util";
-import { termUriKey, validateControlledTerm, type ControlledTerm } from "./vocabularies.js";
+import { type OrganizationId } from "./organizations.js";
+import { readOrganizationTerms } from "./stored-terms.js";
+import { termUriKey, type ControlledTerm } from "./vocabularies.js";
 
 export const DUPLICATE_REASONS = [
   "same_uri",
@@ -397,41 +403,35 @@ function isLatinGreekCyrillic(c: number): boolean {
 }
 
 /**
- * List pairs of terms that may be duplicates. `input` is a list of terms in
- * the `controlled_term` shape. Each is checked with `validateControlledTerm`;
- * one that fails, or whose label is too long to compare, is left out and
- * listed in `skipped`, and the rest are still compared. Fails only when
- * `input` isn't a readable list or `options` is bad. Never changes the input
- * and never throws.
+ * List pairs of terms that may be duplicates. `input` is a list of one
+ * organization's terms, each an `OrganizationTerm` (`{ organizationId, term }`
+ * with the term in the `controlled_term` shape; a stored term or a term usage
+ * from the index will do, other properties are ignored), and `organizationId`
+ * is the organization the caller expects (D-071). An entry of another
+ * organization, or one that doesn't say which it belongs to, refuses the
+ * whole list (`mixed_organizations`) before any term is read, so no report
+ * pairs or names two organizations' labels. Each term is checked with
+ * `validateControlledTerm`; one that fails, or whose label is too long to
+ * compare, is left out and listed in `skipped` (paths `[index, "term", ...]`),
+ * and the rest are still compared. Fails only when `organizationId`, `input`
+ * or `options` is bad. Never changes the input and never throws.
  */
 export function findNearDuplicateTerms(
   input: unknown,
+  organizationId: OrganizationId,
   options: DuplicateOptions = {},
 ): Validated<DuplicateReport> {
   const issues = new IssueList();
   try {
     const max = readMax(options, issues);
-    if (
-      !Array.isArray(input) ||
-      types.isProxy(input) ||
-      Object.getPrototypeOf(input) !== Array.prototype
-    ) {
-      issues.add([], "not_a_list", "The terms must be an ordinary list.");
-    } else if (input.length > MAX_DUPLICATE_TERMS) {
-      issues.add(
-        [],
-        "too_many",
-        `At most ${String(MAX_DUPLICATE_TERMS)} terms can be compared at once.`,
-      );
+    const read = readOrganizationTerms(input, organizationId, MAX_DUPLICATE_TERMS, issues);
+    if (read === undefined || issues.count > 0) {
+      return { ok: false, issues: Object.freeze([...issues.items]) };
     }
-    if (issues.count > 0) return { ok: false, issues: Object.freeze([...issues.items]) };
-    const list = input as readonly unknown[];
     const terms: Prepared[] = [];
     const skipped: SkippedTerm[] = [];
     let tooLong = false;
-    const length = list.length;
-    const read: Validated<ControlledTerm>[] = [];
-    for (let i = 0; i < length; i += 1) read.push(readTerm(list, i));
+    const length = read.length;
     // Only pairs with a term that has no URI can pair by label. With none,
     // only same_uri applies, so the labels needn't be analysed at all.
     const byLabel = read.some((r) => r.ok && r.value.uri === undefined);
@@ -449,7 +449,7 @@ export function findNearDuplicateTerms(
             issues: result.ok
               ? Object.freeze([
                   Object.freeze({
-                    path: Object.freeze([i, "label"]),
+                    path: Object.freeze([i, "term", "label"]),
                     code: "too_long_to_compare",
                     message: `This label is too long to compare once its characters are unfolded (more than ${String(MAX_COMPARED_KEY_LENGTH)}).`,
                   }),
@@ -466,30 +466,6 @@ export function findNearDuplicateTerms(
     issues.add([], "unreadable", "The terms could not be read as plain data.");
     return { ok: false, issues: Object.freeze([...issues.items]) };
   }
-}
-
-/**
- * Read item `i` as its own value: a hole or getter is that item's problem
- * only. Also used by `term-uri-report.ts`; not part of the public API.
- */
-export function readTerm(list: readonly unknown[], i: number): Validated<ControlledTerm> {
-  const fail = (code: string, message: string): Validated<ControlledTerm> => ({
-    ok: false,
-    issues: Object.freeze([Object.freeze({ path: Object.freeze([i]), code, message })]),
-  });
-  const descriptor = Object.getOwnPropertyDescriptor(list, i);
-  if (descriptor === undefined) return fail("holes", "This place in the list is empty.");
-  if (!("value" in descriptor) || descriptor.enumerable !== true) {
-    return fail("not_plain_data", "List items can't be getters, setters or hidden.");
-  }
-  const result = validateControlledTerm(descriptor.value);
-  if (result.ok) return result;
-  return {
-    ok: false,
-    issues: Object.freeze(
-      result.issues.map((x) => Object.freeze({ ...x, path: Object.freeze([i, ...x.path]) })),
-    ),
-  };
 }
 
 function readMax(options: unknown, issues: IssueList): number {

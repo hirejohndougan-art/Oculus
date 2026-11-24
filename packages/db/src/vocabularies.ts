@@ -50,11 +50,17 @@
  * it usable; call them inside `Database.transaction` (outside one they
  * throw).
  *
- * Left to later tasks: an `organizationId` on stored terms in core itself
- * (T-019b2: here the row's organization is checked, and the term value is
- * core's `ControlledTerm`); renaming or merging a term in the records that
- * use it, and deleting stored terms (Data Cleaning); inherited values, which
- * are counted only on the record that holds them.
+ * Stored terms and usages say whose they are (T-019b2, D-071): a
+ * `StoredTerm` is core's `StoredTerm` (`organizationId`, `id`, `term`) plus
+ * its `termKey`, and every `TermUsage` and `RecordTerms` carries the
+ * organization too, so either can be handed straight to core's Data
+ * Cleaning functions (`findNearDuplicateTerms`, `findLcTermsWithoutUri`),
+ * which refuse a list mixing organizations. The term key is the SHA-256 of
+ * core's `termIdentity`, so core and the database share one rule.
+ *
+ * Left to later tasks: renaming or merging a term in the records that use
+ * it, and deleting stored terms (Data Cleaning); inherited values, which are
+ * counted only on the record that holds them.
  */
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -62,9 +68,11 @@ import {
   isOrganizationId,
   isRecordId,
   issue,
+  termIdentity,
   termUriKey,
   validateControlledTerm,
   type ControlledTerm,
+  type StoredTerm as CoreStoredTerm,
   type Issue,
   type OrganizationId,
   type RecordId,
@@ -74,17 +82,19 @@ import { readRecord, readTemplate } from "./catalog.js";
 import type { Queryable } from "./client.js";
 import { sql } from "./sql.js";
 
-/** A stored term of an organization. */
-export interface StoredTerm {
-  readonly organizationId: OrganizationId;
-  /** A random version 4 UUID, made when the term is first saved; never changes. */
-  readonly id: string;
-  readonly term: ControlledTerm;
+/**
+ * A stored term of an organization: core's `StoredTerm` (its organization, a
+ * random version 4 UUID made when it is first saved, which never changes,
+ * and the term) with its term key.
+ */
+export interface StoredTerm extends CoreStoredTerm {
   readonly termKey: string;
 }
 
 /** One term a record uses in one field, as the record holds it. */
 export interface TermUsage {
+  /** The record's organization, so usages can go to core's Data Cleaning checks. */
+  readonly organizationId: OrganizationId;
   readonly fieldKey: string;
   readonly termKey: string;
   readonly term: ControlledTerm;
@@ -92,6 +102,7 @@ export interface TermUsage {
 
 /** A record's usage index, as `refreshRecordTerms` built it. */
 export interface RecordTerms {
+  readonly organizationId: OrganizationId;
   readonly recordId: RecordId;
   readonly templateKey: string;
   readonly templateVersion: number;
@@ -244,14 +255,14 @@ function ownValue(value: unknown, key: string): unknown {
 // ---------------------------------------------------------------------------
 // Term keys
 
-/** The key of a term core already accepted (see the header). */
+/**
+ * The key of a term core already accepted (see the header): the SHA-256 of
+ * core's `termIdentity`, in hex.
+ */
 function keyOf(term: ControlledTerm): string {
-  const vocab = term.vocabulary ?? "local";
-  const text =
-    term.uri === undefined
-      ? `${vocab}\u0000label\u0000${term.label}`
-      : `${vocab}\u0000uri\u0000${termUriKey(term.uri)}`;
-  return createHash("sha256").update(text, "utf8").digest("hex");
+  const text = termIdentity(term);
+  if (!text.ok) throw new Error("keyOf takes a term core has already accepted.");
+  return createHash("sha256").update(text.value, "utf8").digest("hex");
 }
 
 /**
@@ -546,7 +557,14 @@ export async function refreshRecordTerms(
         const id = `${field.key}\u0000${key}`;
         if (seen.has(id)) return;
         seen.add(id);
-        usages.push(Object.freeze({ fieldKey: field.key, termKey: key, term: term.value }));
+        usages.push(
+          Object.freeze({
+            organizationId: org,
+            fieldKey: field.key,
+            termKey: key,
+            term: term.value,
+          }),
+        );
       });
     }
 
@@ -575,6 +593,7 @@ export async function refreshRecordTerms(
     return {
       ok: true,
       value: Object.freeze({
+        organizationId: org,
         recordId,
         templateKey,
         templateVersion: version,

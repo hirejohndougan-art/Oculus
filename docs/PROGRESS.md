@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 00:25 CT — manual (John: "start on phase 2, easiest wins first") — T-019, T-019b, T-019b2 Organization separation
+- Result: done
+- What changed: core `StoredTerm` with a required `organizationId` (`validateStoredTerm(s)`, plain objects only) and one `termIdentity` rule that db hashes for `term_key` (bytes unchanged, now pinned by a test). The near-duplicate and LC-without-URI reports take the expected organization and refuse mixed or unowned lists with fixed text. The D-019 items still to build are written into T-041 (sites table, sites by role, System settings access), T-045 (site selector), T-048 (Users page) and a new task T-048a (Admin: System settings).
+- Decisions: D-071
+- Review: one independent round (no leaks; key bytes fuzzed identical; planning gaps and test strength); all fixed.
+- Gate: PASS · tests_passing 3592 (was 3567) · npm audit clean
+- Next: T-037 sessions (fixing review findings), then T-044 and T-038
+
 ## 2026-11-24 00:19 CT — manual (John: "start on phase 2, easiest wins first") — S-015, S-016, T-012a follow-ups
 - Result: done
 - What changed: the writer check also refuses grant options on any database and schema public, any guard trigger that isn't ALWAYS, and any subscription, and no longer counts temporary objects as owned. `createInvitation` answers superseded, revoked or may-be-pending instead of a misleading ok; only connection-class failures become `database_unavailable` and everything else is rethrown. Template moves (`templateMoveChanges`) need confirmation for values that would change visibility, in `updateRecord` and in `restoreVersion` across templates; `nextIdentifier` can count numbers held in template fields.

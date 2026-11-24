@@ -3,11 +3,13 @@ import {
   DEFAULT_DUPLICATE_CANDIDATES,
   DUPLICATE_REASONS,
   boundedDistance,
-  findNearDuplicateTerms,
   termMatchKey,
   termWords,
   type DuplicateCandidate,
+  type DuplicateReport,
+  type Validated,
 } from "./index.js";
+import { findNearDuplicatesOf as findNearDuplicateTerms } from "./stored-terms.fixtures.js";
 import {
   boundedDistance as referenceDistance,
   findNearDuplicateTerms as referenceFind,
@@ -21,6 +23,23 @@ function find(terms: unknown[], maxCandidates?: number): readonly DuplicateCandi
   const r = findNearDuplicateTerms(terms, maxCandidates === undefined ? {} : { maxCandidates });
   if (!r.ok) throw new Error(JSON.stringify(r.issues));
   return r.value.candidates;
+}
+
+/**
+ * A report with each skipped issue's path as it was before entries named
+ * their organization (D-071): `[i, "term", ...]` back to `[i, ...]`, so it
+ * can be compared with the reference code's.
+ */
+function termPathsAsBefore(r: Validated<DuplicateReport>): Validated<DuplicateReport> {
+  if (!r.ok) return r;
+  const skipped = r.value.skipped.map((x) => ({
+    ...x,
+    issues: x.issues.map((i) => ({
+      ...i,
+      path: i.path[1] === "term" ? [i.path[0] ?? 0, ...i.path.slice(2)] : i.path,
+    })),
+  }));
+  return { ok: true, value: { ...r.value, skipped } };
 }
 
 const summary = (c: readonly DuplicateCandidate[]): [number, number, string][] =>
@@ -280,7 +299,7 @@ describe("findNearDuplicateTerms finds what the code before S-005a found", () =>
     const reasons = new Set<string>();
     for (let seed = 1; seed <= 40; seed += 1) {
       const terms = makeTerms(seed, seed % 4 === 0 ? 3000 : 400);
-      const now = findNearDuplicateTerms(terms, { maxCandidates: 10_000 });
+      const now = termPathsAsBefore(findNearDuplicateTerms(terms, { maxCandidates: 10_000 }));
       const before = referenceFind(terms, { maxCandidates: 10_000 });
       expect(now, `seed ${String(seed)}`).toEqual(before);
       if (now.ok) {
@@ -506,9 +525,9 @@ describe("findNearDuplicateTerms: results and limits", () => {
     expect(
       r.value.skipped.map((x) => [x.index, x.issues.map((i) => [i.path.join("."), i.code])]),
     ).toEqual([
-      [1, [["1.label", "invalid_text"]]],
-      [2, [["2.uri", "local_uri"]]],
-      [4, [["4", "not_an_object"]]],
+      [1, [["1.term.label", "invalid_text"]]],
+      [2, [["2.term.uri", "local_uri"]]],
+      [4, [["4.term", "not_an_object"]]],
     ]);
     expect(Object.isFrozen(r.value.skipped)).toBe(true);
     expect(r.value.truncated).toBe(false);

@@ -5,13 +5,13 @@ import {
   MAX_DUPLICATE_TERMS,
   MAX_PAIR_SET_TERMS,
   controlledTermChecker,
-  findNearDuplicateTerms,
   normalizeTermUri,
   validateControlledTerm,
   vocabulary,
   type CatalogRecord,
   type FieldDefinition,
 } from "./index.js";
+import { findNearDuplicatesOf as findNearDuplicateTerms } from "./stored-terms.fixtures.js";
 import { findNearDuplicateTerms as referenceFind } from "./term-duplicates.fixtures.js";
 import { cpuClock, hangGuard } from "./cpu-time.fixtures.js";
 
@@ -149,10 +149,18 @@ describe("near-duplicate detection can't be overloaded", () => {
     expect(codeOf(findNearDuplicateTerms(huge))).toBe("too_many");
   });
 
-  it("skips holes and getters in the list, and never runs a getter", () => {
-    let ran = false;
+  // Through `findNearDuplicatesOf` (stored-terms.fixtures.ts), the getter on
+  // slot 3 becomes a getter on that entry's `term`: this exercises a getter
+  // term. A getter slot refuses the whole list (stored-terms.attacks.test.ts).
+  it("refuses a hole, and skips a getter term (via the wrapper) without running it", () => {
+    // A hole says no organization, so it could be another organization's
+    // entry: the whole list is refused (D-030, D-071), not filtered.
     // eslint-disable-next-line no-sparse-arrays -- the hole is the attack
-    const list: unknown[] = [{ label: "Depot" }, , { label: "depot" }];
+    const holed: unknown[] = [{ label: "Depot" }, , { label: "depot" }];
+    const refused = findNearDuplicateTerms(holed);
+    expect(refused.ok ? [] : refused.issues.map((i) => i.code)).toEqual(["mixed_organizations"]);
+    let ran = false;
+    const list: unknown[] = [{ label: "Depot" }, { label: "x\u0000" }, { label: "depot" }];
     Object.defineProperty(list, 3, {
       get() {
         ran = true;
@@ -163,7 +171,7 @@ describe("near-duplicate detection can't be overloaded", () => {
     const r = findNearDuplicateTerms(list);
     if (!r.ok) throw new Error("expected ok");
     expect(r.value.skipped.map((x) => [x.index, x.issues[0]?.code])).toEqual([
-      [1, "holes"],
+      [1, "bad_characters"],
       [3, "not_plain_data"],
     ]);
     expect(r.value.candidates.map((c) => [c.first, c.second])).toEqual([[0, 2]]);

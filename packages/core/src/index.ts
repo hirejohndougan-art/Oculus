@@ -337,6 +337,14 @@ export type {
   NormalizedTermUri,
 } from "./vocabularies.js";
 export {
+  MAX_STORED_TERMS,
+  isStoredTermId,
+  termIdentity,
+  validateStoredTerm,
+  validateStoredTerms,
+} from "./stored-terms.js";
+export type { OrganizationTerm, StoredTerm } from "./stored-terms.js";
+export {
   DUPLICATE_REASONS,
   MAX_DUPLICATE_TERMS,
   MAX_PAIR_SET_TERMS,
