@@ -28,12 +28,16 @@
  *   keeps the tree within `MAX_ARRANGEMENT_DEPTH`; and, if the level changes
  *   back, that its children can still be filed under it;
  * - a represented record (digital assets) that still exists;
- * - unless `confirmMadePublic` is given, no restored value lands in a field
+ * - unless `confirmMadePublic` lists exactly these fields, no restored value lands in a field
  *   public today with a value other than the record's current one
  *   (`public_field_restored`): the field may have been staff-only when the
  *   value was stored and made public after it was removed, so the value was
  *   never confirmed for publishing.
- * Every problem is returned, not only the first.
+ * Every problem is returned, not only the first, with fixed messages (code
+ * and path kept): core's messages may quote old values, and a refusal must
+ * not reveal an old version. A restore that succeeds does reveal it, so the
+ * service layer requires the permission to read the record's history as
+ * well as to edit it (T-032, T-041).
  *
  * **Identifiers are not restored.** A version holds the record row only;
  * identifier sets live in their own tables (D-061), are not versioned, and
@@ -49,9 +53,9 @@
  * change between the checks and the write. Templates, types and other
  * records are not locked: a change committed in that instant can slip past
  * the template checks, as for any save until the service layer re-checks
- * inside its own transaction (T-032). When the parent or level changes, the
- * organization's arrangement lock (0006) is taken before the arrangement
- * checks and held to COMMIT, and the database's guard refuses any loop
+ * inside its own transaction (T-032). When the parent or level changes (decided
+ * up front from the version and the row), the organization's arrangement
+ * lock (0006) is taken before the record row's lock and held to COMMIT, and the database's guard refuses any loop
  * whoever writes. Read Committed only (`read_committed_required`). The
  * service layer must wrap a restore like any save (T-032: permissions,
  * `refreshRecordTerms`, T-034's publish re-check).
@@ -73,6 +77,7 @@ import {
   isRecordId,
   issue,
   makeIdentifierChecker,
+  isFieldKey,
   makeRecordLinkChecker,
   sameJson,
   type ArchivalLevel,
@@ -103,13 +108,18 @@ export interface RestoreOptions {
   /** The clock, for tests. Default: now. */
   readonly now?: Date;
   /**
-   * The person has seen and confirmed the `public_field_restored` list:
-   * restored values that land in fields public today and differ from what
-   * the record holds now (D-065). Without it, such a restore is refused
-   * with that list.
+   * The field keys of the `public_field_restored` list the person saw and
+   * confirmed: restored values that land in fields public today and differ
+   * from what the record holds now (D-065). The restore goes ahead only if
+   * this is exactly today's list (in any order); otherwise it is refused
+   * with today's list, so a list that changed since the person saw it is
+   * shown again.
    */
-  readonly confirmMadePublic?: boolean;
+  readonly confirmMadePublic?: readonly string[];
 }
+
+/** At most this many confirmed field keys (no template has more fields). */
+const MAX_CONFIRMED_FIELDS = 1000;
 
 const OPTION_KEYS: ReadonlySet<string> = new Set(["now", "confirmMadePublic"]);
 const CHANGE_KEYS: ReadonlySet<string> = new Set(["expectedVersion", "actor", "reason"]);
@@ -175,9 +185,19 @@ export async function restoreVersion(
     );
   }
   const confirm = ownValue(options, "confirmMadePublic");
-  if (confirm !== undefined && typeof confirm !== "boolean") {
-    return refused(["options", "confirmMadePublic"], "invalid_option", "This is true or false.");
+  if (
+    confirm !== undefined &&
+    (!Array.isArray(confirm) ||
+      confirm.length > MAX_CONFIRMED_FIELDS ||
+      !confirm.every((key) => isFieldKey(key)))
+  ) {
+    return refused(
+      ["options", "confirmMadePublic"],
+      "invalid_option",
+      "This is the list of field keys the person confirmed.",
+    );
   }
+  const confirmed: ReadonlySet<string> = new Set(confirm ?? []);
   const clock = ownValue(options, "now");
   if (clock !== undefined && !(clock instanceof Date)) {
     return refused(["options", "now"], "invalid_option", "The clock is a Date.");
@@ -217,9 +237,38 @@ export async function restoreVersion(
   const result = await inSavepoint(db, "restore", async (): Promise<RecordUpdateResult> => {
     // The arrangement lock below relies on each statement seeing what
     // committed while it waited (D-061, D-065): Read Committed only.
-    await db.execute(sql`SELECT public.identifier_require_read_committed()`);
-    // Locked first: the record and its identifiers (whose save takes the same
-    // lock) can't change between the checks and the write.
+    await db.execute(sql`SELECT public.arrangement_require_read_committed()`);
+    // Decided up front, from the version and the row as they are: if the
+    // restore files the unit elsewhere or changes its level, the
+    // organization's arrangement lock is taken BEFORE the record row's lock
+    // (D-065), and held to COMMIT (the database's guard takes the same lock).
+    const [seen] = await db.rows<{
+      version: number;
+      parent_id: string | null;
+      level: string | null;
+    }>(sql`
+      SELECT version, parent_id::text AS parent_id, level FROM public.records
+      WHERE organization_id = ${organizationId}::uuid AND id = ${recordId}::uuid`);
+    if (seen === undefined) {
+      return refused(["recordId"], "unknown_record", "The organization has no such record.");
+    }
+    if (seen.version !== expected) return conflictRefusal(expected, seen.version);
+    const old = await readVersion(db, organizationId, recordId, version);
+    if (old === undefined) {
+      return refused(["version"], "unknown_version", "The record has no such version.");
+    }
+    if (!old.ok) return { ok: false, issues: fixedMessages(old.issues, ["version"]) };
+    const was = old.value.record;
+    if (
+      was.kind === "archival_unit" &&
+      ((was.parentId ?? null) !== seen.parent_id || was.level !== seen.level)
+    ) {
+      await db.execute(sql`SELECT public.arrangement_lock(${organizationId}::uuid)`);
+    }
+    // Then the row: the record and its identifiers (whose save takes the same
+    // lock) can't change between the checks and the write. Its version is
+    // still the expected one only if nothing was written since `seen`, so the
+    // decision above still holds.
     const [locked] = await db.rows<{ version: number }>(sql`
       SELECT version FROM public.records
       WHERE organization_id = ${organizationId}::uuid AND id = ${recordId}::uuid
@@ -227,35 +276,19 @@ export async function restoreVersion(
     if (locked === undefined) {
       return refused(["recordId"], "unknown_record", "The organization has no such record.");
     }
-    if (locked.version !== expected) {
-      return refused(
-        ["expectedVersion"],
-        "version_conflict",
-        `The record was saved by someone else since version ${String(expected)}; it is now at version ${String(locked.version)}. Read it again.`,
-      );
-    }
+    if (locked.version !== expected) return conflictRefusal(expected, locked.version);
     const current = await readStoredRecord(db, organizationId, recordId);
     if (current === undefined) {
       return refused(["recordId"], "unknown_record", "The organization has no such record.");
     }
-    if (!current.ok) return current;
-    const old = await readVersion(db, organizationId, recordId, version);
-    if (old === undefined) {
-      return refused(["version"], "unknown_version", "The record has no such version.");
-    }
-    if (!old.ok) {
-      return {
-        ok: false,
-        issues: old.issues.map((i) => issue(["version", ...i.path], i.code, i.message)),
-      };
-    }
+    if (!current.ok) return { ok: false, issues: fixedMessages(current.issues, []) };
     const stored = current.value.record;
     const candidate = {
       ...old.value.record,
       updatedAt: later(stored.updatedAt, now.toISOString()),
     } as CatalogRecord;
     const compared = compareRecords(stored, candidate);
-    if (!compared.ok) return compared;
+    if (!compared.ok) return { ok: false, issues: fixedMessages(compared.issues, []) };
     if (compared.value.differences.length === 0) {
       return refused(
         ["version"],
@@ -263,17 +296,7 @@ export async function restoreVersion(
         `Version ${String(version)} is the same as the record is now; there is nothing to restore.`,
       );
     }
-    if (
-      candidate.kind === "archival_unit" &&
-      stored.kind === "archival_unit" &&
-      (candidate.parentId !== stored.parentId || candidate.level !== stored.level)
-    ) {
-      // One arrangement change per organization at a time, from here to
-      // COMMIT (the database's guard takes the same lock, 0006): two
-      // restores can't each file a unit under the other.
-      await db.execute(sql`SELECT public.arrangement_lock(${organizationId}::uuid)`);
-    }
-    const problems = await todaysChecks(db, candidate, stored, confirm === true);
+    const problems = await todaysChecks(db, candidate, stored, confirmed);
     if (problems.length > 0) return { ok: false, issues: problems };
     return updateRecord(db, candidate, {
       expectedVersion: expected,
@@ -292,6 +315,42 @@ export async function restoreVersion(
   const conflict = await versionConflict(db, organizationId, recordId, expected);
   return conflict === undefined ? result : { ...result, conflict };
 }
+
+function conflictRefusal(expected: number, now: number): RecordUpdateResult {
+  return refused(
+    ["expectedVersion"],
+    "version_conflict",
+    `The record was saved by someone else since version ${String(expected)}; it is now at version ${String(now)}. Read it again.`,
+  );
+}
+
+/**
+ * Issues from core's checks with their messages replaced by fixed text, code
+ * and path kept (D-065, as S-007 did for publicOutput): core's messages may
+ * quote values (`"X" is not a …`, an old number that doesn't fit a format),
+ * and a restore's refusal must not become a way to read old versions.
+ */
+function fixedMessages(list: readonly Issue[], prefix: readonly (string | number)[]): Issue[] {
+  return list.map((i) =>
+    issue([...prefix, ...i.path], i.code, FIXED_MESSAGES[i.code] ?? GENERIC_MESSAGE),
+  );
+}
+
+const GENERIC_MESSAGE =
+  "The old version's value here doesn't pass today's checks. Open the old version to see it, then fix it in the editor.";
+
+const FIXED_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
+  unknown_field: "This field is not in the template now.",
+  required: "This field is required now, and the old version has no value for it.",
+  identifier_not_held: "This field shows a number the record doesn't hold now.",
+  unknown_record: "The record this links to doesn't exist now.",
+  wrong_record_kind: "The record this links to is not of a kind this field allows now.",
+  not_canonical: "This rights statement is not written in today's accepted form.",
+  not_an_option: "This value is not one of the field's options now.",
+  wrong_template: "Today's template is not for this kind of record.",
+  unknown_record_type: "The record type this version used doesn't exist now.",
+  wrong_kind: "The record type is for another kind of record now.",
+});
 
 function isWholeVersion(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 && value < 2 ** 31 - 1;
@@ -342,7 +401,7 @@ async function todaysChecks(
   db: Queryable,
   candidate: CatalogRecord,
   stored: CatalogRecord,
-  confirmMadePublic: boolean,
+  confirmed: ReadonlySet<string>,
 ): Promise<Issue[]> {
   const org = candidate.organizationId;
   const problems: Issue[] = [];
@@ -367,9 +426,7 @@ async function todaysChecks(
       ),
     );
   } else if (!template.ok) {
-    problems.push(
-      ...template.issues.map((i) => issue(["templateKey", ...i.path], i.code, i.message)),
-    );
+    problems.push(...fixedMessages(template.issues, ["templateKey"]));
   } else {
     const types = await readIdentifierTypes(db, org);
     const identifier = types.ok ? makeIdentifierChecker(types.value, org) : types;
@@ -377,28 +434,36 @@ async function todaysChecks(
     if (!identifier.ok || !links.ok) {
       // Without the checkers the fields can't be checked; say why, and go on
       // with every other check.
-      if (!identifier.ok) problems.push(...identifier.issues);
-      if (!links.ok) problems.push(...links.issues);
+      if (!identifier.ok) problems.push(...fixedMessages(identifier.issues, ["identifierTypes"]));
+      if (!links.ok) problems.push(...fixedMessages(links.issues, []));
     } else {
       problems.push(
-        ...checkRecordAgainstTemplate(candidate, template.value.template, {
-          checkers: { identifier: identifier.value, record_link: links.value, place: links.value },
-          allowMissingInherited: candidate.kind === "archival_unit",
-        }),
+        ...fixedMessages(
+          checkRecordAgainstTemplate(candidate, template.value.template, {
+            checkers: {
+              identifier: identifier.value,
+              record_link: links.value,
+              place: links.value,
+            },
+            allowMissingInherited: candidate.kind === "archival_unit",
+          }),
+          [],
+        ),
       );
     }
-    if (!confirmMadePublic) {
-      problems.push(...publicValueIssues(candidate, stored, template.value.template));
-    }
+    const toConfirm = publicValueIssues(candidate, stored, template.value.template);
+    const keys = new Set(toConfirm.map((i) => String(i.path[1])));
+    const same = keys.size === confirmed.size && [...keys].every((key) => confirmed.has(key));
+    if (!same) problems.push(...toConfirm);
     const held = await readRecordIdentifiers(db, org, candidate.id);
     if (held === undefined) {
       problems.push(issue(["id"], "unknown_record", "The organization has no such record."));
     } else if (!held.ok) {
-      problems.push(
-        ...held.issues.map((i) => issue(["identifiers", ...i.path], i.code, i.message)),
-      );
+      problems.push(...fixedMessages(held.issues, ["identifiers"]));
     } else {
-      problems.push(...identifierFieldIssues(candidate, template.value.template, held.value));
+      problems.push(
+        ...fixedMessages(identifierFieldIssues(candidate, template.value.template, held.value), []),
+      );
     }
   }
 
@@ -414,11 +479,9 @@ async function todaysChecks(
         ),
       );
     } else if (!type.ok) {
-      problems.push(
-        ...type.issues.map((i) => issue(["recordTypeKey", ...i.path], i.code, i.message)),
-      );
+      problems.push(...fixedMessages(type.issues, ["recordTypeKey"]));
     } else {
-      problems.push(...checkRecordType(candidate, type.value.recordType));
+      problems.push(...fixedMessages(checkRecordType(candidate, type.value.recordType), []));
     }
   }
 
@@ -446,7 +509,9 @@ async function todaysChecks(
  * value was stored and made public since, after the value was removed, so
  * the made-public confirmation (D-031, T-005a) never covered it: restoring
  * it must not publish it silently. The simplest safe rule: every such value
- * is listed, and the restore waits for `confirmMadePublic`.
+ * is listed, and the restore waits for `confirmMadePublic` naming exactly
+ * those fields. The title isn't in the rule: it is always public (core's
+ * public views always carry it), so an old title was never staff-only.
  */
 function publicValueIssues(
   candidate: CatalogRecord,

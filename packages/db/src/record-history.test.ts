@@ -209,7 +209,7 @@ function restore(
   version: number,
   expected: number,
   reason?: string,
-  options: { confirmMadePublic?: boolean } = {},
+  options: { confirmMadePublic?: readonly string[] } = {},
   on: Database = db,
 ): Promise<RecordUpdateResult> {
   return on.transaction((q) =>
@@ -393,7 +393,7 @@ describe("restoreVersion (T-030)", () => {
       ["fields.rights", "public_field_restored"],
     ]);
     const restored = ok(
-      await restore(org, record.id, 1, 2, undefined, { confirmMadePublic: true }),
+      await restore(org, record.id, 1, 2, undefined, { confirmMadePublic: ["rights"] }),
     );
     expect(restored.version).toBe(3);
     expect(restored.actor).toBe(BOB);
@@ -764,7 +764,18 @@ describe("review fixes (D-065)", () => {
       ["fields.provenance", "public_field_restored"],
     ]);
     expect(await versionCount(org, record.id)).toBe(2);
-    ok(await restore(org, record.id, 1, 2, undefined, { confirmMadePublic: true }));
+    // A confirmation of another list is not this one's.
+    expect(
+      paths(await restore(org, record.id, 1, 2, undefined, { confirmMadePublic: ["note"] })),
+    ).toEqual([["fields.provenance", "public_field_restored"]]);
+    expect(
+      paths(
+        await restore(org, record.id, 1, 2, undefined, {
+          confirmMadePublic: ["provenance", "note"],
+        }),
+      ),
+    ).toEqual([["fields.provenance", "public_field_restored"]]);
+    ok(await restore(org, record.id, 1, 2, undefined, { confirmMadePublic: ["provenance"] }));
   });
 
   it("a conflict names what changed, never the values", async () => {
@@ -809,7 +820,7 @@ describe("review fixes (D-065)", () => {
       "unknown_property",
     ]);
     expect(
-      codes(await run({ expectedVersion: 2, actor: BOB }, { confirmMadePublic: "yes" })),
+      codes(await run({ expectedVersion: 2, actor: BOB }, { confirmMadePublic: true })),
     ).toEqual(["invalid_option"]);
     const repeatable = await tx(async (q) => {
       await q.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`);
@@ -817,5 +828,71 @@ describe("review fixes (D-065)", () => {
     });
     expect(codes(repeatable)).toEqual(["read_committed_required"]);
     expect(await versionCount(org, record.id)).toBe(2);
+  });
+});
+
+describe("second review (D-065)", () => {
+  it("a restore's refusal never quotes the old version's values", async () => {
+    await ready();
+    const org = await organization();
+    const record = await insert(
+      object(org, { number: { type: "secret_old_type", value: "SECRET-0042" } }),
+    );
+    ok(await save({ ...record, fields: { note: "Oak." }, updatedAt: LATER }, 1));
+    const result = await restore(org, record.id, 1, 2);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.issues.map((i) => i.code)).toContain("identifier_not_held");
+    const text = JSON.stringify(result.issues.map((i) => i.message));
+    expect(text).not.toContain("secret_old_type");
+    expect(text).not.toContain("SECRET-0042");
+  });
+
+  it("the database refuses moving a subtree where its units would sit deeper than 64", async () => {
+    await ready();
+    const org = await organization();
+    // A chain of 61 series, and a separate subtree of 10 levels.
+    let chain: RecordId | undefined;
+    for (let i = 0; i < 61; i += 1) chain = (await insert(unit(org, "series", chain))).id;
+    const top = await insert(unit(org, "series"));
+    let below: RecordId = top.id;
+    for (let i = 0; i < 9; i += 1) below = (await insert(unit(org, "series", below))).id;
+    if (chain === undefined) throw new Error("no chain");
+    await expect(
+      tx((q) =>
+        q.execute(sql`UPDATE public.records SET parent_id = ${chain}::uuid, version = version + 1
+                      WHERE organization_id = ${org}::uuid AND id = ${top.id}::uuid`),
+      ),
+    ).rejects.toMatchObject({ code: "23000", constraint: "records_arrangement_too_deep" });
+    // Through updateRecord, the same refusal comes back as an issue.
+    const moved = await save({ ...top, parentId: chain, updatedAt: LATER } as CatalogRecord, 1);
+    expect(paths(moved)).toEqual([["parentId", "too_deep"]]);
+  });
+
+  it("two updateRecord moves at the same moment can't form a loop", async () => {
+    await ready();
+    const org = await organization();
+    const a = await insert(unit(org, "series"));
+    const b = await insert(unit(org, "series"));
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let moved: () => void = () => undefined;
+    const aliceMoved = new Promise<void>((resolve) => (moved = resolve));
+    const alice = db.transaction(async (q) => {
+      const result = await updateRecord(
+        q,
+        { ...a, parentId: b.id, updatedAt: LATER },
+        { expectedVersion: 1, actor: ALICE },
+      );
+      moved();
+      await held;
+      return result;
+    });
+    await aliceMoved;
+    const bob = save({ ...b, parentId: a.id, updatedAt: LATER } as CatalogRecord, 1, BOB, other);
+    await Promise.race([someoneWaits(), bob]);
+    release();
+    ok(await alice);
+    expect(paths(await bob)).toEqual([["parentId", "loop"]]);
   });
 });

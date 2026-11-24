@@ -1,6 +1,7 @@
 -- The arrangement guard (T-030 review, D-065): no archival unit is ever filed
 -- inside itself, and no unit sits deeper than core's MAX_ARRANGEMENT_DEPTH
--- (64), whoever writes, even two writers at the same moment.
+-- (64), whoever writes, even two writers at the same moment. (Levels are
+-- the writer's check, below.)
 --
 -- Two transactions that each file one unit under the other (A under B, B
 -- under A) each see a tree without a loop, because neither sees the other's
@@ -17,10 +18,28 @@
 -- snapshot and miss what committed while it waited.
 --
 -- Checks back up core, never go beyond it (D-060): core's
--- validateArrangement refuses loops and units deeper than 64. Only the walk
--- up from the written unit is checked here; how deep its descendants then
--- sit, and whether its level fits its parent and children, are checked by
--- the writer (restoreVersion now, the service layer, T-032).
+-- validateArrangement refuses loops and units deeper than 64. Here, the walk
+-- up from the written unit refuses a loop and more than 63 ancestors, and
+-- when a unit's parent changes, a bounded walk down its own subtree refuses
+-- a move that would put any of its descendants deeper than 64. Whether
+-- levels fit (a unit under its parent, its children under it) is not
+-- checked here: the writer checks it (restoreVersion now, the service
+-- layer, T-032), after taking arrangement_lock.
+
+-- Read Committed only, with its own message (the code is the identifiers'
+-- OC061, which the data-access layer maps to read_committed_required).
+CREATE FUNCTION public.arrangement_require_read_committed() RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  IF current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION 'Arrangement writes must run in a Read Committed transaction, not %.',
+        current_setting('transaction_isolation')
+      USING ERRCODE = 'OC061';
+  END IF;
+END
+$$;
 
 -- One lock key per organization, in the two-int key space (classid 65 for
 -- D-065), which never meets the single-bigint keys of the identifier locks
@@ -30,7 +49,7 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
-  PERFORM public.identifier_require_read_committed();
+  PERFORM public.arrangement_require_read_committed();
   PERFORM pg_advisory_xact_lock(65, hashtext(organization_id::text));
 END
 $$;
@@ -42,6 +61,7 @@ AS $$
 DECLARE
   current_parent uuid;
   ancestors integer := 0;
+  room integer;
 BEGIN
   PERFORM public.arrangement_lock(NEW.organization_id);
   -- Up from the unit's parent, through rows as now committed (and this
@@ -64,6 +84,28 @@ BEGIN
     SELECT parent_id INTO current_parent FROM public.records
     WHERE organization_id = NEW.organization_id AND id = current_parent;
   END LOOP;
+  -- A moved unit takes its subtree with it: no descendant may then sit
+  -- deeper than 64. Walk down only as far as the room left below the unit,
+  -- stopping at the first unit past it. (A new row has no children yet.)
+  IF TG_OP = 'UPDATE' AND NEW.parent_id IS DISTINCT FROM OLD.parent_id THEN
+    room := 63 - ancestors;
+    IF EXISTS (
+      WITH RECURSIVE down(id, depth) AS (
+        SELECT r.id, 1 FROM public.records r
+        WHERE r.organization_id = NEW.organization_id AND r.parent_id = NEW.id
+        UNION ALL
+        SELECT r.id, down.depth + 1
+        FROM down JOIN public.records r
+          ON r.organization_id = NEW.organization_id AND r.parent_id = down.id
+        WHERE down.depth <= room
+      )
+      SELECT 1 FROM down WHERE depth > room
+    ) THEN
+      RAISE EXCEPTION 'Moved there, a unit inside this one would be more than 64 levels deep.'
+        USING ERRCODE = 'integrity_constraint_violation',
+              CONSTRAINT = 'records_arrangement_too_deep';
+    END IF;
+  END IF;
   RETURN NULL;
 END
 $$;
