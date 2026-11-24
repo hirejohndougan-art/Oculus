@@ -310,8 +310,8 @@ async function readSnapshot(
   const records = [...chain];
   for (const row of linkedRows) {
     if (chainIds.has(row.id as RecordId)) continue;
-    // A linked record that doesn't validate is passed on as it is: the link
-    // checker marks it unusable, as it does for any invalid record.
+    // A linked record that doesn't validate refuses the whole output
+    // (fails closed): one bad linked row hides every record that links to it.
     const valid = validateRecord(row);
     if (!valid.ok) return refused(["records"], "unreadable_record", CANT_CHECK);
     records.push(valid.value);
