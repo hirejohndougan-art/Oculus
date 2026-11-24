@@ -225,7 +225,8 @@ CREATE TRIGGER zzzz_sessions_keep_identity BEFORE UPDATE ON public.sessions
     'id', 'user_id', 'signed_in_at', 'created_at', 'idle_seconds', 'absolute_seconds',
     'client_label');
 
--- sessions_valid_after only moves forward, never past the clock; disabling
+-- sessions_valid_after only moves forward, and a writer can't move it past
+-- the clock (the trigger itself may, past a session stamped ahead); disabling
 -- an account or changing its system admin flag (a change of what it may
 -- reach) moves it to now (D-052, ASVS 5.0 7.4.2), so every session signed in
 -- until then is dead, including one copied at the same moment.
@@ -244,6 +245,13 @@ BEGIN
      OR NEW.system_admin IS DISTINCT FROM OLD.system_admin THEN
     NEW.sessions_valid_after := greatest(NEW.sessions_valid_after, clock_timestamp());
   END IF;
+  -- Whenever it moves, it moves past every session the user has, even one
+  -- stamped ahead of the clock (a server clock that stepped back after the
+  -- sign-in), so none of them can come back (second review, item 2).
+  IF NEW.sessions_valid_after > OLD.sessions_valid_after THEN
+    NEW.sessions_valid_after := greatest(NEW.sessions_valid_after,
+      (SELECT max(s.signed_in_at) FROM public.sessions s WHERE s.user_id = NEW.id));
+  END IF;
   RETURN NEW;
 END
 $$;
@@ -251,14 +259,14 @@ $$;
 CREATE TRIGGER users_sessions_valid_after BEFORE UPDATE ON public.users
   FOR EACH ROW EXECUTE FUNCTION public.users_sessions_valid_after();
 
--- Then the dead rows are deleted (the lookups refuse them anyway).
+-- Then every session of the user is deleted (the lookups refuse them
+-- anyway), whatever its stamp.
 CREATE FUNCTION public.users_end_sessions() RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
-  DELETE FROM public.sessions
-  WHERE user_id = NEW.id AND signed_in_at <= NEW.sessions_valid_after;
+  DELETE FROM public.sessions WHERE user_id = NEW.id;
   RETURN NULL;
 END
 $$;

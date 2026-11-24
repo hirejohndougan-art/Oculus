@@ -41,11 +41,17 @@
  * - **A person's own sessions:** `listSessions` (no tokens, no hashes, no
  *   addresses, only their own), `endOwnSession`, `endOtherSessions`.
  *   `endSession` is sign-out. `endUserSessions` is a system admin's, from
- *   their own session (D-052, ASVS 7.4.5); `endAllSessionsForUser` is for
- *   T-039's reset, inside its own transaction.
- * - **Database errors** never reach the caller as they are: they become a
- *   fixed `SessionFailure` (`retry`, `timeout`, `database_unavailable`,
- *   `internal_error`), and the raw error goes only to the `onError` option.
+ *   their own recently re-authenticated session (D-052, ASVS 7.4.5);
+ *   `endAllSessionsForUser` is for T-039's reset, inside its own
+ *   transaction.
+ * - **Database failures** (as client.ts's `isDatabaseFailure` judges them,
+ *   S-016) never reach the caller as they are: they become a fixed
+ *   `SessionFailure` (`retry`, `timeout`, `database_unavailable`), and the
+ *   raw error goes only to the `onError` option. Programming errors are
+ *   thrown. `internal_error` is for a statement that returned nothing.
+ * - **A sign-in can't outrun a password change or "end all"** (second
+ *   review, R1): the session is made only if the account still has the
+ *   password hash that was checked and the same `sessions_valid_after`.
  * - **Cleanup:** `runCleanup` (the `db:cleanup` command) deletes ended
  *   sessions and old sign-in counters.
  *
@@ -75,10 +81,11 @@ import {
 import {
   INVALID_CREDENTIALS,
   deleteExpiredSignInThrottles,
-  signIn,
+  signInChecked,
   type SignInFailure,
+  type VerifiedSignIn,
 } from "./accounts.js";
-import { ConnectionLostError, type Database, type Queryable } from "./client.js";
+import { isDatabaseFailure, type Database, type Queryable } from "./client.js";
 import { readSecondStepProof, spendSecondStepProof, type SecondStepProof } from "./second-step.js";
 import { sql } from "./sql.js";
 
@@ -256,30 +263,27 @@ function callOptions(options: unknown, extra: readonly string[] = []): SessionCa
 
 /**
  * A thrown error as the caller's answer: `NO_SESSION` for 0010's session
- * guards, a fixed `SessionFailure` for any other database error (the raw
- * error to `onError` only). Anything that isn't a database error (a bug, a
- * bad option) is thrown again.
+ * guards; for a database or connection failure as client.ts's
+ * `isDatabaseFailure` judges it (S-016), a fixed `SessionFailure` (the raw
+ * error to `onError` only): `retry` for class 40 (deadlock, serialization),
+ * `timeout` for a statement or lock timeout, `database_unavailable` for the
+ * rest. Anything else (a programming error, a permission error, a bad
+ * option) is thrown again, as everywhere else in this package. A lock
+ * timeout (55P03, which T-051's `lock_timeout` raises) is answered `timeout`
+ * too, though its class isn't one of S-016's.
  */
 function failureFor(error: unknown, options: SessionCallOptions): NoSession | SessionFailure {
   if (sessionGuardRefused(error)) return NO_SESSION;
   const state = sqlState(error);
-  if (state === undefined && !(error instanceof ConnectionLostError)) throw error;
+  if (state !== "55P03" && !isDatabaseFailure(error)) throw error;
   try {
     options.onError?.(error);
   } catch {
     // The log's own failure changes nothing.
   }
-  if (state === "40001" || state === "40P01" || state === "55P03") return FAILURES.retry;
-  if (state === "57014" || state === "25P03") return FAILURES.timeout;
-  if (
-    state === undefined ||
-    state.startsWith("08") ||
-    state.startsWith("53") ||
-    state.startsWith("57P")
-  ) {
-    return FAILURES.database_unavailable;
-  }
-  return FAILURES.internal_error;
+  if (state?.startsWith("40") === true) return FAILURES.retry;
+  if (state === "57014" || state === "55P03") return FAILURES.timeout;
+  return FAILURES.database_unavailable;
 }
 
 /** `failureFor` as a `Validated` refusal. */
@@ -454,11 +458,27 @@ export async function beginSession(
   const token = newSessionToken();
   const org = (organizationId as OrganizationId | undefined) ?? null;
   try {
-    const checked = await signIn(db, signInInput);
+    const out: { verified?: VerifiedSignIn } = {};
+    const checked = await signInChecked(db, signInInput, out);
     if (!checked.ok) return checked;
-    // The insert trigger holds the user row FOR SHARE and checks the account
-    // after any disable that was under way (review B1).
-    const rows = await db.rows<{ expires_at: string }>(sql`
+    const verified = out.verified;
+    if (verified === undefined) return FAILURES.internal_error;
+    // One transaction: the user row FOR SHARE (so a disable or "end all"
+    // under way finishes first), then the account must still have the hash
+    // the password matched and the same sessions_valid_after it had when the
+    // password was checked. A password change or "end all sessions" that
+    // committed after the check wins: the sign-in is refused (second
+    // review, R1). Not counted against the throttle: the password was right
+    // when checked.
+    const made = await inTransaction(db, async (tx) => {
+      const still = await tx.rows(sql`
+        SELECT 1 FROM public.users
+        WHERE id = ${checked.userId}::uuid AND disabled_at IS NULL
+          AND password_hash = ${verified.passwordHash}
+          AND sessions_valid_after = ${verified.sessionsValidAfter}::timestamptz
+        FOR SHARE`);
+      if (still.length !== 1) return undefined;
+      return tx.rows<{ expires_at: string }>(sql`
       INSERT INTO public.sessions
         (id, token_hash, user_id, organization_id, stage, signed_in_at, created_at,
          last_seen_at, rotated_at, password_at, idle_seconds, absolute_seconds, expires_at,
@@ -468,7 +488,9 @@ export async function beginSession(
              ${policy.idleSeconds}, ${policy.absoluteSeconds}, t + interval '10 minutes', ${label}
       FROM (SELECT clock_timestamp() AS t) c
       RETURNING to_char(expires_at AT TIME ZONE 'UTC', ${ISO}) AS expires_at`);
-    const expiresAt = rows[0]?.expires_at;
+    });
+    if (made === undefined) return INVALID_CREDENTIALS;
+    const expiresAt = made[0]?.expires_at;
     if (expiresAt === undefined) return FAILURES.internal_error;
     return {
       ok: true,
@@ -809,25 +831,39 @@ export async function reauthenticate(
       SELECT email FROM public.users WHERE id = ${current.session.userId}::uuid`);
     const email = users[0]?.email;
     if (email === undefined) return NO_SESSION;
-    const checked = await signIn(db, {
-      email,
-      password: own(input, "password") as string,
-      source: own(input, "source") as string,
-      organizationId: current.session.organizationId,
-    });
+    const out: { verified?: VerifiedSignIn } = {};
+    const checked = await signInChecked(
+      db,
+      {
+        email,
+        password: own(input, "password") as string,
+        source: own(input, "source") as string,
+        organizationId: current.session.organizationId,
+      },
+      out,
+    );
     if (!checked.ok) return checked;
-    if (checked.userId !== current.session.userId) return NO_SESSION;
+    const verified = out.verified;
+    if (checked.userId !== current.session.userId || verified === undefined) return NO_SESSION;
+    // Stamped only if the password checked is still the account's and no
+    // "end all" came in between: a password changed meanwhile wins (second
+    // review, R1).
     const rows = await db.rows<FullRow>(sql`
       UPDATE public.sessions s
       SET password_at = clock_timestamp(), last_seen_at = clock_timestamp(),
           token_hash = ${hashSessionToken(newToken)}, rotated_at = clock_timestamp()
       FROM public.users u
       WHERE s.token_hash = ${hash} AND s.id = ${current.session.sessionId}::uuid AND ${LIVE_FULL}
+        AND u.password_hash = ${verified.passwordHash}
+        AND u.sessions_valid_after = ${verified.sessionsValidAfter}::timestamptz
       RETURNING ${fullColumns(RECENT_AUTHENTICATION_SECONDS)}`);
     const row = rows[0];
-    return row === undefined
-      ? NO_SESSION
-      : { ok: true, token: newToken, session: fullSession(row) };
+    if (row !== undefined) return { ok: true, token: newToken, session: fullSession(row) };
+    // Either the session ended or the password changed under it.
+    const alive = await db.rows(sql`
+      SELECT 1 FROM public.sessions s JOIN public.users u ON u.id = s.user_id
+      WHERE s.token_hash = ${hash} AND ${LIVE_FULL}`);
+    return alive.length === 1 ? INVALID_CREDENTIALS : NO_SESSION;
   } catch (error) {
     return failureFor(error, call);
   }
@@ -989,17 +1025,33 @@ export async function endOtherSessions(
  */
 export async function endAllSessionsForUser(tx: Queryable, userId: UserId): Promise<number> {
   await tx.rows(sql`SELECT 1 FROM public.users WHERE id = ${userId}::uuid FOR NO KEY UPDATE`);
-  const ended = await tx.execute(sql`DELETE FROM public.sessions WHERE user_id = ${userId}::uuid`);
+  // Counted while the user row is locked, so no session is made meanwhile.
+  const counted = await tx.rows<{ n: number }>(sql`
+    SELECT count(*)::int AS n FROM public.sessions WHERE user_id = ${userId}::uuid`);
+  // The time first, while the sessions are still there, so the trigger
+  // moves it past any stamped ahead of the clock (second review, item 2);
+  // its AFTER trigger then deletes them all.
   await tx.execute(sql`
-    UPDATE public.users SET sessions_valid_after = clock_timestamp() WHERE id = ${userId}::uuid`);
-  return ended;
+    UPDATE public.users SET sessions_valid_after = greatest(sessions_valid_after, clock_timestamp())
+    WHERE id = ${userId}::uuid`);
+  // In case the time didn't move (already ahead of the clock).
+  await tx.execute(sql`DELETE FROM public.sessions WHERE user_id = ${userId}::uuid`);
+  return counted[0]?.n ?? 0;
 }
 
 /**
  * Ends every session of `userId` (ASVS 5.0 7.4.5), for a system admin
- * acting from their own full session (`adminToken`, checked here:
- * `no_session` or `not_permitted`). If it is their own account, their own
+ * acting from their own full session (`adminToken`), who must have entered
+ * their password in the last 10 minutes (`reauthentication_required`,
+ * D-052's rule for sensitive changes). If it is their own account, their own
  * session ends too. Returns how many ended.
+ *
+ * The admin's session is read, not locked or refreshed, so the only row
+ * lock taken is the target user row's, first (second review, item 1: a
+ * locked admin session row before the user row deadlocked with
+ * `endOtherSessions` and switching). The read is in the same transaction as
+ * the ending; an admin disabled or signed out at that moment can at worst
+ * finish this one request.
  */
 export async function endUserSessions(
   db: Database,
@@ -1009,12 +1061,24 @@ export async function endUserSessions(
 ): Promise<Validated<{ readonly ended: number }>> {
   const call = callOptions(options);
   if (!isUserId(userId)) return refused("invalid_request", "That isn't a user ID.");
+  const hash = tokenHash(adminToken);
+  if (hash === undefined) return refused(NO_SESSION.code, NO_SESSION.message);
   try {
     return await inTransaction(db, async (tx) => {
-      const admin = await resolveSession(tx, adminToken, call);
-      if (!admin.ok) return refused(admin.code, admin.message);
-      if (!admin.session.systemAdmin) {
-        return refused("not_permitted", "Only a system admin can do that.");
+      const admins = await tx.rows<{ system_admin: boolean; recent: boolean }>(sql`
+        SELECT u.system_admin,
+               s.password_at > clock_timestamp()
+                 - make_interval(secs => ${RECENT_AUTHENTICATION_SECONDS}) AS recent
+        FROM public.sessions s JOIN public.users u ON u.id = s.user_id
+        WHERE s.token_hash = ${hash} AND ${LIVE_FULL}`);
+      const admin = admins[0];
+      if (admin === undefined) return refused(NO_SESSION.code, NO_SESSION.message);
+      if (!admin.system_admin) return refused("not_permitted", "Only a system admin can do that.");
+      if (!admin.recent) {
+        return refused(
+          "reauthentication_required",
+          "Enter your password again to end someone's sessions.",
+        );
       }
       const ended = await endAllSessionsForUser(tx, userId);
       return { ok: true, value: { ended } };

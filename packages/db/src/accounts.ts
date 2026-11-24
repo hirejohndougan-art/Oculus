@@ -905,6 +905,7 @@ interface UserRow {
   disabled: boolean;
   organization_ids: OrganizationId[];
   organization_exists: boolean;
+  sessions_valid_after: string;
 }
 
 /**
@@ -925,6 +926,31 @@ interface UserRow {
  *    (the attempt is then not counted).
  */
 export async function signIn(db: Database, input: SignInRequest): Promise<SignInResult> {
+  return signInChecked(db, input);
+}
+
+/**
+ * What a successful `signInChecked` verified, read in the same statement as
+ * the user row: the stored password hash the password matched (the new one
+ * if it was re-hashed) and the account's `sessions_valid_after` (exact,
+ * as PostgreSQL text). Sessions (T-037, D-069) make a session only if both
+ * are unchanged when they insert it, so a password change or an "end all
+ * sessions" that commits between the check and the insert wins.
+ */
+export interface VerifiedSignIn {
+  readonly passwordHash: string;
+  readonly sessionsValidAfter: string;
+}
+
+/**
+ * `signIn`, also filling `out.verified` on success. For sessions.ts only;
+ * not exported from `@oculus/db`: the hash must never leave the package.
+ */
+export async function signInChecked(
+  db: Database,
+  input: SignInRequest,
+  out: { verified?: VerifiedSignIn } = {},
+): Promise<SignInResult> {
   if (!hasOnly(input, ["email", "password", "source", "organizationId"])) return INVALID_REQUEST;
   const typed = own(input, "email");
   const password = own(input, "password");
@@ -976,7 +1002,8 @@ export async function signIn(db: Database, input: SignInRequest): Promise<SignIn
            ARRAY(SELECT m.organization_id::text FROM public.organization_members m
                  WHERE m.user_id = u.id ORDER BY 1) AS organization_ids,
            EXISTS (SELECT 1 FROM public.organizations o
-                   WHERE o.id = ${organizationId ?? null}::uuid) AS organization_exists
+                   WHERE o.id = ${organizationId ?? null}::uuid) AS organization_exists,
+           u.sessions_valid_after::text AS sessions_valid_after
     FROM public.users u WHERE u.email = ${normalized ?? typed}`);
   const user = rows[0];
   let check: PasswordCheck;
@@ -1010,7 +1037,9 @@ export async function signIn(db: Database, input: SignInRequest): Promise<SignIn
       if (!(error instanceof PasswordWorkBusyError)) throw error;
     }
   }
+  let verifiedHash = user.password_hash;
   await inTransaction(db, async (tx) => {
+    verifiedHash = user.password_hash;
     await tx.execute(sql`DELETE FROM public.sign_in_throttles WHERE key = ${accountKey}`);
     await tx.execute(sql`
       UPDATE public.sign_in_throttles SET failures = greatest(failures - 1, 0)
@@ -1021,10 +1050,15 @@ export async function signIn(db: Database, input: SignInRequest): Promise<SignIn
     if (newHash !== undefined) {
       // Only if the hash is still the one checked, so a password changed
       // meanwhile is never put back.
-      await tx.execute(sql`
+      const rehashed = await tx.execute(sql`
         UPDATE public.users SET password_hash = ${newHash}
         WHERE id = ${user.id}::uuid AND password_hash = ${user.password_hash}`);
+      if (rehashed === 1) verifiedHash = newHash;
     }
+  });
+  out.verified = Object.freeze({
+    passwordHash: verifiedHash,
+    sessionsValidAfter: user.sessions_valid_after,
   });
   return {
     ok: true,

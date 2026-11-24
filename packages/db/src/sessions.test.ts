@@ -12,6 +12,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import {
   checkCsrfToken,
   csrfTokenFor,
+  hashPassword,
   hashSessionToken,
   newOrganizationId,
   newSessionId,
@@ -32,7 +33,7 @@ import {
 } from "./accounts.js";
 import { insertOrganization } from "./catalog.js";
 import { runCleanupCli } from "./cleanup-cli.js";
-import { openDatabase, type Database, type Queryable } from "./client.js";
+import { openDatabase, type Database, type Queryable, type Row } from "./client.js";
 import { migrate } from "./migrate.js";
 import { WRITER_PRIVILEGES, checkWriterConnection, grantWriterRole } from "./roles.js";
 import { SECOND_STEP_PROOF_MS, passedSecondStep } from "./second-step.js";
@@ -1049,10 +1050,18 @@ describe("database errors", () => {
       ["40P01", "retry"],
       ["08006", "database_unavailable"],
       ["53300", "database_unavailable"],
-      ["XX000", "internal_error"],
-      ["42501", "internal_error"],
+      ["57P01", "database_unavailable"],
+      ["XX000", "database_unavailable"],
+      ["55P03", "timeout"],
+      ["ENOENT", "database_unavailable"],
+      ["ECONNREFUSED", "database_unavailable"],
     ] as const) {
-      const error = Object.assign(new Error(`failed near ${token}`), { code });
+      // A server error, or a Node system error from the socket (with its
+      // syscall), as client.ts's isDatabaseFailure judges them (S-016).
+      const error = Object.assign(
+        new Error(`failed near ${token}`),
+        code.startsWith("E") ? { code, syscall: "connect" } : { code },
+      );
       const seen: unknown[] = [];
       const onError = (e: unknown) => seen.push(e);
       const conn = failing(error);
@@ -1087,6 +1096,16 @@ describe("database errors", () => {
       }),
     ).toMatchObject({ code: "timeout" });
     await expect(resolveSession(failing(new Error("a bug")), token)).rejects.toThrow("a bug");
+    // Programming and permission errors are thrown, not hidden (S-016).
+    for (const code of ["42501", "42P01", "22P02", "ERR_INVALID_ARG_TYPE"]) {
+      const error = Object.assign(new Error(code), { code });
+      await expect(resolveSession(failing(error), token)).rejects.toBe(error);
+      await expect(endOwnSession(failing(error), token, newSessionId())).rejects.toBe(error);
+    }
+    // pg's own code-less connection error counts as the database's failure.
+    expect(
+      await resolveSession(failing(new Error("Connection terminated unexpectedly")), token),
+    ).toMatchObject({ code: "database_unavailable" });
     await expect(
       resolveSession(conn, token, { onError: "no" } as unknown as { onError: () => void }),
     ).rejects.toThrow(TypeError);
@@ -1325,6 +1344,269 @@ describe(
     });
   },
 );
+
+describe(
+  "a sign-in can't outrun a password change or 'end all' (second review, R1)",
+  { timeout: 180_000 },
+  () => {
+    /**
+     * `base`, except that the first query whose text `match`es waits for
+     * `hook` (run on another connection, committed) before it runs: an
+     * ordering pinned down rather than left to timing.
+     */
+    function before(
+      base: Database,
+      match: (text: string) => boolean,
+      hook: () => Promise<void>,
+    ): Database {
+      let fired = false;
+      const gate = async (query: Sql): Promise<void> => {
+        if (!fired && match(query.text)) {
+          fired = true;
+          await hook();
+        }
+      };
+      const wrap = (q: Queryable): Queryable => ({
+        rows: async <R extends Row = Row>(query: Sql): Promise<R[]> => {
+          await gate(query);
+          return q.rows<R>(query);
+        },
+        execute: async (query: Sql): Promise<number> => {
+          await gate(query);
+          return q.execute(query);
+        },
+      });
+      return {
+        ...wrap(base),
+        transaction: <T>(work: (tx: Queryable) => Promise<T>): Promise<T> =>
+          base.transaction((tx) => work(wrap(tx))),
+        close: () => base.close(),
+      };
+    }
+
+    /** As T-039's reset will: end every session and set a new password, in one transaction. */
+    async function resetPassword(conn: Database, userId: UserId, password: string): Promise<void> {
+      const hash = await hashPassword(password);
+      await conn.transaction(async (tx) => {
+        await endAllSessionsForUser(tx, userId);
+        await tx.execute(sql`UPDATE public.users SET password_hash = ${hash},
+        password_changed_at = now() WHERE id = ${userId}::uuid`);
+      });
+    }
+
+    const atInsert = (text: string) =>
+      text.includes("sessions_valid_after =") && text.includes("FOR SHARE");
+
+    it("refuses the session when a reset, an 'end all' or a password change commits after the check", async () => {
+      await ready();
+      const other = openDatabase(testDb.url, { max: 2 });
+      try {
+        const org = await organization();
+        for (const change of ["reset", "end all", "password only"] as const) {
+          const person = await member(org);
+          const hook = async (): Promise<void> => {
+            if (change === "reset")
+              await resetPassword(other, person.userId, "a new invented passphrase");
+            else if (change === "end all")
+              await other.transaction((tx) =>
+                endAllSessionsForUser(tx, person.userId).then(() => undefined),
+              );
+            else
+              await other.execute(sql`UPDATE public.users
+              SET password_hash = ${await hashPassword("a new invented passphrase")}
+              WHERE id = ${person.userId}::uuid`);
+          };
+          const r = await beginSession(before(db, atInsert, hook), {
+            email: person.email,
+            password: PASSWORD,
+            source: source(),
+            organizationId: org,
+          });
+          expect({ change, r }).toEqual({ change, r: INVALID_CREDENTIALS });
+          expect({ change, rows: await rowsOf(person.userId) }).toEqual({ change, rows: [] });
+        }
+      } finally {
+        await other.close();
+      }
+    });
+
+    it("doesn't mark a session recently authenticated with a password changed meanwhile", async () => {
+      await ready();
+      const other = openDatabase(testDb.url, { max: 2 });
+      try {
+        const org = await organization();
+        const person = await member(org);
+        const s = await full(person, org);
+        await age(s.session.sessionId, 11 * 60);
+        const r = await reauthenticate(
+          before(
+            db,
+            (text) => text.includes("password_at = clock_timestamp()"),
+            async () => {
+              await other.execute(sql`UPDATE public.users
+              SET password_hash = ${await hashPassword("a new invented passphrase")}
+              WHERE id = ${person.userId}::uuid`);
+            },
+          ),
+          s.token,
+          { password: PASSWORD, source: source() },
+        );
+        expect(r).toBe(INVALID_CREDENTIALS);
+        expect(await resolveSession(db, s.token)).toMatchObject({
+          ok: true,
+          session: { recentlyAuthenticated: false },
+        });
+      } finally {
+        await other.close();
+      }
+    });
+
+    it("leaves no live session after a reset racing a sign-in (two connections, looped)", async () => {
+      await ready();
+      const other = openDatabase(testDb.url, { max: 4 });
+      try {
+        const org = await organization();
+        const person = await member(org);
+        let password = PASSWORD;
+        for (let round = 0; round < RACE_ROUNDS; round++) {
+          const next = `an invented passphrase for round ${String(round)}`;
+          const [started] = await Promise.all([
+            beginSession(other, {
+              email: person.email,
+              password,
+              source: source(),
+              organizationId: org,
+            }),
+            sleep((round * 41) % 400).then(() => resetPassword(db, person.userId, next)),
+          ]);
+          // Whichever order: no session from the old password is left alive.
+          if (started.ok) {
+            expect(await readPendingSession(db, started.token)).toBe(NO_SESSION);
+          }
+          expect({ round, live: await liveRowsOf(person.userId) }).toEqual({ round, live: 0 });
+          password = next;
+          await db.execute(sql`DELETE FROM public.sign_in_throttles
+          WHERE key = ${throttleAccountKey(person.email)}`);
+        }
+      } finally {
+        await other.close();
+      }
+    });
+  },
+);
+
+describe("locks and clocks (second review, items 1 and 2)", { timeout: 180_000 }, () => {
+  it("an admin ending their own sessions while another of theirs ends the rest never deadlocks", async () => {
+    await ready();
+    const deadlocks = async (): Promise<number> => {
+      await db.rows(sql`SELECT pg_stat_clear_snapshot()`);
+      const rows = await db.rows<{ n: string }>(sql`
+        SELECT deadlocks::text AS n FROM pg_stat_database WHERE datname = current_database()`);
+      return Number(rows[0]?.n ?? "0");
+    };
+    const org = await organization();
+    const orgB = await organization();
+    const a = openDatabase(testDb.url, { max: 2 });
+    const b = openDatabase(testDb.url, { max: 2 });
+    const start = await deadlocks();
+    try {
+      for (let round = 0; round < 20; round++) {
+        const first = await fastFull(admin, org);
+        const second = await fastFull(admin, org);
+        const third = await fastFull(admin, org);
+        const results = await Promise.all([
+          endUserSessions(a, first.token, admin),
+          endOtherSessions(b, second.token),
+          switchOrganization(b, third.token, orgB),
+        ]);
+        for (const r of results) {
+          expect(JSON.stringify(r)).not.toMatch(/retry|database_unavailable/);
+        }
+      }
+    } finally {
+      // Statistics are written when a connection ends.
+      await a.close();
+      await b.close();
+    }
+    await sleep(500);
+    expect(await deadlocks()).toBe(start);
+  });
+
+  it("asks an admin to enter their password again before ending someone's sessions", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const s = await full(person, org);
+    // Earlier tests ended the admin's sessions, which moved the admin's
+    // sessions_valid_after to then; put it back (as the owner, trigger off
+    // inside this transaction only) so aging the new session below
+    // doesn't put its sign-in before that time.
+    await db.transaction(async (q) => {
+      await q.execute(sql`ALTER TABLE public.users DISABLE TRIGGER users_sessions_valid_after`);
+      await q.execute(sql`UPDATE public.users SET sessions_valid_after = '-infinity'
+        WHERE id = ${admin}::uuid`);
+      await q.execute(
+        sql`ALTER TABLE public.users ENABLE ALWAYS TRIGGER users_sessions_valid_after`,
+      );
+    });
+    const adminSession = await full({ email: ADMIN_EMAIL }, org);
+    await age(adminSession.session.sessionId, 11 * 60);
+    expect(codesOf(await endUserSessions(db, adminSession.token, person.userId))).toEqual([
+      "reauthentication_required",
+    ]);
+    expect((await resolveSession(db, s.token)).ok).toBe(true);
+    const again = await reauthenticate(db, adminSession.token, {
+      password: ADMIN_PASSWORD,
+      source: source(),
+    });
+    if (!again.ok) throw new Error("not re-authenticated");
+    expect(ok(await endUserSessions(db, again.token, person.userId))).toEqual({ ended: 1 });
+  });
+
+  it("disabling, or ending all, kills a session stamped ahead of the clock, and re-enabling revives nothing", async () => {
+    await ready();
+    const org = await organization();
+    for (const how of ["disable", "end all"] as const) {
+      const person = await member(org);
+      const s = await full(person, org);
+      // As if the server's clock stepped back an hour after this sign-in.
+      // Such a session can't be used until the clock catches up (its
+      // last_seen_at is ahead), but then it would live again.
+      await age(s.session.sessionId, -3600);
+      const stamped = await db.rows<{ ahead: boolean }>(sql`
+        SELECT signed_in_at > clock_timestamp() + interval '50 minutes' AS ahead
+        FROM public.sessions WHERE id = ${s.session.sessionId}::uuid`);
+      expect(stamped).toEqual([{ ahead: true }]);
+      if (how === "disable") {
+        await db.execute(
+          sql`UPDATE public.users SET disabled_at = now() WHERE id = ${person.userId}::uuid`,
+        );
+        await db.execute(
+          sql`UPDATE public.users SET disabled_at = NULL WHERE id = ${person.userId}::uuid`,
+        );
+      } else {
+        await db.transaction((tx) => endAllSessionsForUser(tx, person.userId));
+      }
+      expect({ how, r: await resolveSession(db, s.token) }).toEqual({ how, r: NO_SESSION });
+      expect({ how, rows: await rowsOf(person.userId) }).toEqual({ how, rows: [] });
+      // Past the stamp, so even a copy of it that escaped could never live.
+      const after = await db.rows<{ past: boolean }>(sql`
+        SELECT sessions_valid_after > clock_timestamp() + interval '50 minutes' AS past
+        FROM public.users WHERE id = ${person.userId}::uuid`);
+      expect({ how, after }).toEqual({ how, after: [{ past: true }] });
+      // The price (D-069): until the clock passes that stamp, a new sign-in
+      // for this account makes no session.
+      expect(
+        await beginSession(db, {
+          email: person.email,
+          password: PASSWORD,
+          source: source(),
+          organizationId: org,
+        }),
+      ).toBe(INVALID_CREDENTIALS);
+    }
+  });
+});
 
 describe("every unusable token", () => {
   it("gets the same answer, in about the same time, whether unknown or known but unusable", async () => {
