@@ -284,7 +284,7 @@ The API:
   - D-066 (staff search): if this task (or T-042) exposes `searchRecords` over HTTP, its cost grows with the organization's size: `ts_rank` runs over every matching record on every page and the GIN index has no organization column (the T-028 review measured about 260–540 ms a page at 50,000 records). Set a `statement_timeout` on the search query (or the request) and/or cap the matches ranked, with a test that a slow search is stopped, and measure again. Staff only: never a public endpoint.
 
 Admin screens in the browser:
-- [ ] T-044 **Decision: how the React admin is built.** deps: T-011
+- [x] T-044 **Decision: how the React admin is built.** deps: T-011 Done: D-073 (John chose Siteimprove Alfa, self-hosted fonts and server-side field checks).
   - Choose how the admin is built and served in development: React with the already-pinned Vite 7 (D-006), routing, and how forms are generated from templates. Use the Phase 2 criteria, plus WCAG 2.1 AA support and DESIGN.md's tokens. Where it is served from in production waits on Q-1. Decision entry.
 - [ ] T-045 **Admin: sign-in and the screen frame.** deps: T-044, T-042 (risky)
   - The Login screen, the sidebar and the top bar from DESIGN.md, wired to sign-in, two-factor and sign-out, and accessible (WCAG 2.1 AA, keyboard and screen reader tested).

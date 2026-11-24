@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 00:42 CT — manual (John: "start on phase 2, easiest wins first") — T-044 How the admin is built; U-005 test timeouts
+- Result: done
+- What changed: D-073 picks the admin's stack (React 19 on Vite 7, React Router 8, TanStack Query 5, React Aria Components with the design tokens, an in-house template form renderer checked by a server dry-run endpoint, Vitest with Testing Library, Playwright end-to-end tests, Siteimprove Alfa for accessibility, self-hosted fonts with OFL-1.1 allowed for font files only). U-005: explicit timeouts for two load-sensitive test hooks.
+- Decisions: D-073 (three answers from John)
+- Review: n/a (decision); U-005 changes timeouts only
+- Gate: PASS · tests_passing 3592 · npm audit clean
+- Next: T-037 sessions (final review), T-041 roles and permissions (building)
+
 ## 2026-11-24 00:25 CT — manual (John: "start on phase 2, easiest wins first") — T-019, T-019b, T-019b2 Organization separation
 - Result: done
 - What changed: core `StoredTerm` with a required `organizationId` (`validateStoredTerm(s)`, plain objects only) and one `termIdentity` rule that db hashes for `term_key` (bytes unchanged, now pinned by a test). The near-duplicate and LC-without-URI reports take the expected organization and refuse mixed or unowned lists with fixed text. The D-019 items still to build are written into T-041 (sites table, sites by role, System settings access), T-045 (site selector), T-048 (Users page) and a new task T-048a (Admin: System settings).
