@@ -87,6 +87,7 @@ import {
   type VerifiedSignIn,
 } from "./accounts.js";
 import { isDatabaseFailure, type Database, type Queryable } from "./client.js";
+import { readSystemSettings } from "./permissions.js";
 import {
   readSecondStepProof,
   secondStepGuardRefused,
@@ -420,12 +421,40 @@ export interface SessionStart {
 
 /** Options for `beginSession`: the time limits a system manager chose (D-052). */
 export interface SessionOptions extends SessionCallOptions {
+  /**
+   * The time limits. Left out (as the HTTP layer will), they come from
+   * System settings as they are at sign-in (D-072), or the defaults when
+   * those were never changed or can't be read; reading them never refuses a
+   * sign-in.
+   */
   readonly policy?: SessionPolicy;
 }
 
-function policyFrom(options: unknown): SessionPolicy {
+/**
+ * The time limits a system manager chose in System settings (D-072:
+ * `sessionIdleMinutes`, `sessionAbsoluteMinutes`), or the defaults when
+ * they were never changed, can't be read or are out of bounds. Never throws:
+ * a sign-in is never refused because of the settings.
+ */
+async function policyFromSettings(db: Queryable): Promise<SessionPolicy> {
+  try {
+    const stored = await readSystemSettings(db);
+    if (!stored.ok) return DEFAULT_SESSION_POLICY;
+    const { sessionIdleMinutes, sessionAbsoluteMinutes } = stored.value.settings;
+    return (
+      validateSessionPolicy({
+        idleSeconds: sessionIdleMinutes * 60,
+        absoluteSeconds: sessionAbsoluteMinutes * 60,
+      }) ?? DEFAULT_SESSION_POLICY
+    );
+  } catch {
+    return DEFAULT_SESSION_POLICY;
+  }
+}
+
+function policyFrom(options: unknown): SessionPolicy | undefined {
   const given = own(options, "policy");
-  if (given === undefined) return DEFAULT_SESSION_POLICY;
+  if (given === undefined) return undefined;
   const policy = validateSessionPolicy(given);
   if (policy === undefined) {
     throw new TypeError(
@@ -476,6 +505,8 @@ export async function beginSession(
     if (!checked.ok) return checked;
     const verified = out.verified;
     if (verified === undefined) return FAILURES.internal_error;
+    // The caller's policy (tests), or System settings' as they are now.
+    const limits = policy ?? (await policyFromSettings(db));
     // One transaction: the user row FOR SHARE (so a disable or "end all"
     // under way finishes first), then the account must still have the hash
     // the password matched and the same sessions_valid_after it had when the
@@ -498,7 +529,7 @@ export async function beginSession(
          client_label)
       SELECT ${sessionId}::uuid, ${hashSessionToken(token)}, ${checked.userId}::uuid,
              ${org}::uuid, 'second_step', t, t, t, t, t,
-             ${policy.idleSeconds}, ${policy.absoluteSeconds}, t + interval '10 minutes', ${label}
+             ${limits.idleSeconds}, ${limits.absoluteSeconds}, t + interval '10 minutes', ${label}
       FROM (SELECT clock_timestamp() AS t) c
       RETURNING to_char(expires_at AT TIME ZONE 'UTC', ${ISO}) AS expires_at`);
     });
