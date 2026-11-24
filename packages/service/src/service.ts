@@ -982,6 +982,15 @@ function retryRefusal(): ServiceRefusal {
   return refusal([], "retry", "Other changes were being saved at the same moment. Try again.");
 }
 
+/**
+ * Whether a unit's parent is one the actor may not view (a system manager
+ * filed it across sites): its checks then answer as for a missing parent.
+ */
+async function parentHidden(checker: RecordAccess, record: CatalogRecord): Promise<boolean> {
+  if (record.kind !== "archival_unit" || record.parentId === undefined) return false;
+  return (await checker.hiddenAmong([record.parentId])).size > 0;
+}
+
 /** The links `after` adds that `before` (if any) doesn't hold. */
 function addedLinks(after: CatalogRecord, before?: CatalogRecord): RecordId[] {
   const kept = new Set(before === undefined ? [] : linkedIds(before));
@@ -1533,6 +1542,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
             messages: "own",
             identifierFields: false,
             hiddenLinks,
+            hiddenParent: await parentHidden(checker, record),
           });
           if (problems.length > 0) return { ok: false, issues: problems };
           if (before.templateKey !== record.templateKey) {
@@ -1667,9 +1677,11 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           return retryRefusal();
         }
         let hiddenLinks: ReadonlySet<RecordId> = new Set();
+        let hiddenParent = false;
         if (old !== undefined) {
           const moved = await moveIssues(tx, checker, recordId, place, old);
           if (moved) return moved;
+          hiddenParent = await parentHidden(checker, old);
           if (!checker.access.systemManager) {
             const current = await readStoredRecord(tx, org, recordId);
             hiddenLinks = await checker.hiddenAmong(
@@ -1692,6 +1704,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           {
             now: stamp,
             hiddenLinks,
+            ...(hiddenParent ? { hiddenParent: true } : {}),
             ...(confirm === undefined ? {} : { confirmMadePublic: confirm as readonly string[] }),
           },
         );
@@ -1891,6 +1904,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
             messages: "own",
             identifierFields: false,
             hiddenLinks,
+            hiddenParent: await parentHidden(allowed.checker, record),
           }),
         );
       });

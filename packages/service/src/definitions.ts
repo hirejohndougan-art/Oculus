@@ -26,8 +26,9 @@
  *      lists exactly those changes;
  *   4. **D-076:** the published records whose public output the change
  *      may alter at once are found in the database: for a template whose
- *      public shape changes (a key added or removed, or a key's visibility,
- *      inheritance, kind or repeatability changed, `publicShapeChanged`),
+ *      public shape changes (its record kinds, a key added or removed, or
+ *      anything in a field's definition but its label and help changed,
+ *      `publicShapeChanged`),
  *      every published record using it or below one (`publishedAmong`
  *      with `below`; inherited fields carry values down, D-013); for an
  *      identifier type made public (or a new public one adopting left-over
@@ -307,12 +308,17 @@ const TAG = /^[A-Za-z0-9_-]{32}$/;
 const WRONG_ORGANIZATION = "This names another organization than the one you are working in.";
 
 /**
+ * @internal Exported for its own test only (not from the package index):
+ * today only system managers save definitions, so through the service this
+ * check always passes; the test exercises its `records.publish` second line
+ * directly with other people's access.
+ *
  * D-076: the published records a change makes values public on. Every one
  * must be one the person may publish (`records.publish` where it is), else
  * `not_permitted` with no count; without `confirmPublished`, the refusal
  * lists them. `undefined` when the save may go on.
  */
-async function publishedGate(
+export async function publishedGate(
   tx: Queryable,
   who: Who,
   checker: RecordAccess,
@@ -373,23 +379,28 @@ async function publishedGate(
 }
 
 /**
- * Whether two versions of a template differ in anything that decides what
- * the public sites show of a record using it or below one: the set of keys,
- * or a key's visibility, inheritance, kind or repeatability.
+ * Whether two versions of a template differ in anything that can decide
+ * what the public sites show of a record using it or below one: the record
+ * kinds it applies to, the set of keys, or anything in a field's definition
+ * but its `label` and `help` (visibility, inheritance, kind, repeatability,
+ * `maxLength`, list options with their labels, vocabularies, identifier
+ * types, record kinds, standards, `required`). Public output drops an
+ * inherited value that fails the child's field definition, so a field that
+ * accepts more values can put a value that was never public on a published
+ * child (review B5): every such change counts.
  */
 export function publicShapeChanged(before: FieldTemplate, after: FieldTemplate): boolean {
-  const shape = (t: FieldTemplate): Map<string, string> =>
-    new Map(
-      t.fields.map((f) => [
-        f.key,
-        JSON.stringify([f.visibility, f.inherited, f.kind, f.repeatable]),
-      ]),
-    );
-  const a = shape(before);
-  const b = shape(after);
-  if (a.size !== b.size) return true;
-  for (const [key, value] of a) if (b.get(key) !== value) return true;
-  return false;
+  const shape = (t: FieldTemplate): string => {
+    const fields: Record<string, string> = {};
+    for (const f of t.fields) {
+      const rest: Record<string, unknown> = { ...f };
+      delete rest.label;
+      delete rest.help;
+      fields[f.key] = canonicalJson(rest);
+    }
+    return canonicalJson({ appliesTo: [...t.appliesTo].sort(), fields });
+  };
+  return shape(before) !== shape(after);
 }
 
 export function definitionOperations(run: Runner): DefinitionOperations {
@@ -535,8 +546,9 @@ export function definitionOperations(run: Runner): DefinitionOperations {
             .map((c) => ({ code: c.code, key: c.key, message: c.message }));
           // D-076: what the public sites show of a record depends on its own
           // template and, through inherited fields (D-013), on its ancestors'
-          // templates: a key added, removed, made public or staff, made or
-          // no longer inherited, or given another kind can change the public
+          // templates: a key added or removed, or any change to a field's
+          // definition but its label and help (public output drops an
+          // inherited value the child's field refuses), can change the public
           // output of every record using this template and of every record
           // below one (a new inherited public key shows an ancestor's value
           // on a published child; a removed "stopper" key lets a

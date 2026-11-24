@@ -12,11 +12,16 @@ import {
   csrfTokenFor,
   newRecordId,
   newSiteId,
+  type BuiltInRole,
   type OrganizationId,
+  type RecordId,
+  type SiteId,
   type UserId,
 } from "@oculus/core";
 import { openDatabase, sql } from "@oculus/db";
 import { createService } from "@oculus/service";
+import { RecordAccess } from "../../service/src/access.js";
+import { publishedGate } from "../../service/src/definitions.js";
 import type { FastifyInstance } from "fastify";
 import { OCULUS_COOKIES } from "./cookies.js";
 import { buildServer } from "./server.js";
@@ -585,6 +590,32 @@ describe("the dry-run check", () => {
     expect(ok1.json).toEqual({ issues: [] });
   });
 
+  it("a hidden parent's level never shows when a unit's level changes (missing, as a missing parent)", async () => {
+    // A system manager filed an A1 series under an A2 fonds (D-074 allows them).
+    const fondsA2 = await makeAs(w, w.a, w.a2, unit("fonds", "Fonds on A2"));
+    const series = await makeAs(w, w.a, w.a1, unit("series", "Series on A1", fondsA2));
+    const draft = unit("fonds", "Series on A1", fondsA2);
+    const check = await call("POST", "/api/records/check", {
+      as: "cataloger",
+      body: { record: draft, recordId: series },
+    });
+    expect(check.status).toBe(200);
+    expect(issueCodes(check)).toEqual(["missing_parent"]);
+    expect(check.res.body).not.toMatch(/filed under a fonds/);
+    const put = await call("PUT", `/api/records/${series}`, {
+      as: "cataloger",
+      headers: { "if-match": '"v1"' },
+      body: { record: draft },
+    });
+    expect([put.status, issueCodes(put)]).toEqual([422, ["missing_parent"]]);
+    // The system manager, who sees the parent, is told why.
+    const root = await call("POST", "/api/records/check", {
+      as: "root",
+      body: { record: draft, recordId: series },
+    });
+    expect(issueCodes(root)).toEqual(["wrong_level"]);
+  });
+
   it("is refused as the save would be: read-only may not check a new record", async () => {
     const r = await call("POST", "/api/records/check", {
       as: "reader",
@@ -917,6 +948,54 @@ describe("templates", () => {
     expect(label.status).toBe(200);
     expect(label.json.publishedRecords).toEqual([]);
   });
+  it("B5: a child field that accepts more values (maxLength, options, an option's label) counts the published child", async () => {
+    const root = { organizationId: w.a, actor: actorOf(w.root) };
+    const rightsField = textField("rights", { kind: "rights" });
+    const choice = (options: { value: string; label: string }[]) =>
+      textField("choice", { kind: "list", inherited: true, options });
+    const make = async (key: string, fields: unknown[]) =>
+      ok(
+        await w.service.saveTemplate(
+          root,
+          { key, label: key, appliesTo: ["archival_unit"], fields },
+          { expectedVersion: 0 },
+        ),
+      );
+    const a = { value: "a", label: "Ay" };
+    const b = { value: "b", label: "Bee" };
+    await make("t-b5-top", [rightsField, textField("note", { inherited: true }), choice([a, b])]);
+    const leafFields = [
+      rightsField,
+      textField("note", { inherited: true, maxLength: 10 }),
+      choice([a]),
+    ];
+    await make("t-b5-leaf", leafFields);
+    const top = await makeAs(w, w.a, w.a1, {
+      ...unit("fonds", "Unpublished top"),
+      templateKey: "t-b5-top",
+      fields: { ...rights, note: "An invented note longer than ten.", choice: "b" },
+    });
+    const leaf = await makeAs(w, w.a, w.a1, {
+      ...unit("series", "Published leaf", top),
+      templateKey: "t-b5-leaf",
+    });
+    await publishAs(w, w.a, leaf);
+    const variants = [
+      leafFields.map((f) => (f.key === "note" ? textField("note", { inherited: true }) : f)),
+      leafFields.map((f) => (f.key === "choice" ? choice([a, b]) : f)),
+      leafFields.map((f) => (f.key === "choice" ? choice([{ value: "a", label: "Aye" }]) : f)),
+    ];
+    for (const fields of variants) {
+      const r = await call("PUT", "/api/templates/t-b5-leaf", {
+        as: "root",
+        headers: { "if-match": '"v1"' },
+        body: { template: { label: "t-b5-leaf", appliesTo: ["archival_unit"], fields } },
+      });
+      expect(r.status).toBe(409);
+      expect(issueCodes(r).slice(0, 2)).toEqual(["publishes_records", "published_record_affected"]);
+      expect(JSON.stringify(r.json.issues)).toContain(leaf);
+    }
+  });
 });
 
 describe("identifier types", () => {
@@ -1034,6 +1113,43 @@ describe("identifier types", () => {
     expect(issueCodes(r).slice(0, 2)).toEqual(["publishes_records", "published_record_affected"]);
     expect(JSON.stringify(r.json.issues)).toContain(child);
     expect(JSON.stringify(r.json.issues)).not.toContain(holder);
+  });
+});
+
+describe("the D-076 gate's records.publish second line", () => {
+  // Only system managers save definitions today (John, 2026-11-24), so the
+  // service never reaches this with anyone else; it is checked directly.
+  it("lists for someone who may publish every record, refuses anyone else naming nothing", async () => {
+    const record = (await makeObject(w, w.a, w.a1, "Gate second line")).id as RecordId;
+    const run = (role: BuiltInRole, siteId: SiteId, confirmed: boolean) =>
+      w.db.transaction(async (tx) => {
+        const access = {
+          organizationId: w.a,
+          systemManager: false,
+          grants: [{ role, siteId, scope: null }],
+        };
+        const checker = new RecordAccess(tx, w.a, access);
+        await checker.settle();
+        return publishedGate(
+          tx,
+          { organizationId: w.a, actor: actorOf(w.manager) },
+          checker,
+          [record],
+          confirmed,
+        );
+      });
+    const listed = await run("reviewer", w.a1, false);
+    expect(listed?.ok).toBe(false);
+    expect(JSON.stringify(listed)).toContain(record);
+    expect(await run("reviewer", w.a1, true)).toBeUndefined();
+    for (const [role, site] of [
+      ["cataloger", w.a1],
+      ["reviewer", w.a2],
+    ] as const) {
+      const refused = await run(role, site, true);
+      expect(refused).toMatchObject({ ok: false, issues: [{ code: "not_permitted" }] });
+      expect(JSON.stringify(refused)).not.toContain(record);
+    }
   });
 });
 

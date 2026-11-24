@@ -109,12 +109,19 @@ export interface RestoreOptions {
    * restore would add are checked as links to records that don't exist.
    */
   readonly hiddenLinks?: ReadonlySet<RecordId>;
+  /** The version's parent is one the person may not view: checked as a missing one. */
+  readonly hiddenParent?: boolean;
 }
 
 /** At most this many confirmed field keys (no template has more fields). */
 const MAX_CONFIRMED_FIELDS = 1000;
 
-const OPTION_KEYS: ReadonlySet<string> = new Set(["now", "confirmMadePublic", "hiddenLinks"]);
+const OPTION_KEYS: ReadonlySet<string> = new Set([
+  "now",
+  "confirmMadePublic",
+  "hiddenLinks",
+  "hiddenParent",
+]);
 const CHANGE_KEYS: ReadonlySet<string> = new Set(["expectedVersion", "actor", "reason"]);
 
 function refused(path: readonly (string | number)[], code: string, message: string) {
@@ -174,7 +181,7 @@ export async function restoreVersion(
     return refused(
       ["options", extraOption],
       "unknown_property",
-      "The options are only now, confirmMadePublic and hiddenLinks.",
+      "The options are only now, confirmMadePublic, hiddenLinks and hiddenParent.",
     );
   }
   const confirm = ownValue(options, "confirmMadePublic");
@@ -194,6 +201,10 @@ export async function restoreVersion(
   const hidden = ownValue(options, "hiddenLinks");
   if (hidden !== undefined && !(hidden instanceof Set)) {
     return refused(["options", "hiddenLinks"], "invalid_option", "hiddenLinks is a set of IDs.");
+  }
+  const hiddenParent = ownValue(options, "hiddenParent");
+  if (hiddenParent !== undefined && typeof hiddenParent !== "boolean") {
+    return refused(["options", "hiddenParent"], "invalid_option", "hiddenParent is true or false.");
   }
   const clock = ownValue(options, "now");
   if (clock !== undefined && !(clock instanceof Date)) {
@@ -303,6 +314,7 @@ export async function restoreVersion(
       confirmedPublic: confirmed,
       identifierFields: true,
       ...(hidden === undefined ? {} : { hiddenLinks: hidden as ReadonlySet<RecordId> }),
+      ...(hiddenParent === true ? { hiddenParent: true } : {}),
     });
     if (problems.length > 0) return { ok: false, issues: problems };
     return updateRecord(db, candidate, {
