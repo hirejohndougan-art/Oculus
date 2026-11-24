@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 10:39 CT — manual (John: "finish the 3 in progress and the security ones") — T-042 HTTP API: records, templates and identifier types; S-023
+- Result: done
+- What changed: `packages/api/src/staff-api.ts`: `GET /api/session`; records read, create, update and delete with ETag and If-Match; a dry-run `POST /api/records/check`; staff search under a statement timeout and a cap, filtered to the sites a person can see; templates and identifier types read and saved. Every request needs the `__Host-` session cookie of a full session (second step passed), a CSRF header on changes checked in constant time, D-058's origin, size and content-type rules, a per-session rate limit; missing, other-site and other-organization records answer byte-identically; logs carry only error class and SQLSTATE. `packages/service/src/definitions.ts`: definitions are system managers only (John); a save that can change a published record's public output lists those records and needs `confirmPublished`.
+- Decisions: D-079; D-072 amendment (John: definitions are system managers only)
+- Review: three independent rounds (the dry-run check revealing other sites' parents; template and identifier-type changes reaching published records unlisted; hidden parents' and children's levels named in messages); all fixed with tests. Also a timing test in sessions.test.ts made steady under load. S-026 filed (publish check doesn't validate identifier formats; fails closed).
+- Gate: PASS · tests_passing 3887 (was 3843) · npm audit clean
+- Next: S-018 security batch (fixing review findings), then stop (John)
+
 ## 2026-11-24 10:00 CT — manual (John: "finish the 3 in progress and the security ones") — T-039 Password reset tokens
 - Result: done
 - What changed: migration `0015_password_resets.sql` and `packages/db/src/password-resets.ts`: a request gets the same reply for every address before any account-dependent work, which runs after a random 1–10 s wait (dummy work of the same shape for non-accounts); throttles per address typed, per client address and per IPv6 /48; 256-bit single-use links stored as SHA-256, 30 minutes, one pending per account, sent after commit with a time limit and withdrawn if sending fails; completing a reset sets the password, ends every session and signs nobody in; links die on password change, "end all", disabling or losing the last membership; no self-service reset for an account without an active second factor (code and trigger), admins can send one after re-entering their password; the second factor and its enrolment token stay required.
