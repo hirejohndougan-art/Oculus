@@ -348,6 +348,88 @@ export async function readVersions(
   };
 }
 
+/** One version without the record's content (`readVersionSummaries`). */
+export interface RecordVersionSummary {
+  readonly version: number;
+  readonly actor: string;
+  readonly recordedAt: string;
+  readonly changedFields: readonly string[];
+  readonly reason?: string;
+  readonly action: RecordAction;
+  readonly workflowState: WorkflowState;
+}
+
+/**
+ * As `readVersions`, but without the snapshots (T-043 review B2): only the
+ * small columns (number, actor, time, changed names, reason, action,
+ * state), never `record`, so a page costs the same however large the
+ * record is. The snapshots are not read or validated; each row's small
+ * columns are checked for shape, and a row that fails is `row_mismatch`.
+ */
+export async function readVersionSummaries(
+  db: Queryable,
+  organizationId: OrganizationId,
+  recordId: RecordId,
+  options: { after?: number; limit?: number } = {},
+): Promise<
+  Validated<{ readonly versions: readonly RecordVersionSummary[]; readonly truncated: boolean }>
+> {
+  const bad = checkIds<never>(organizationId, recordId);
+  if (bad) return bad;
+  const limit = options.limit ?? DEFAULT_VERSION_LIST_LIMIT;
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_VERSION_LIST_LIMIT) {
+    return refused(
+      ["limit"],
+      "invalid_limit",
+      `The limit is a whole number from 1 to ${String(MAX_VERSION_LIST_LIMIT)}.`,
+    );
+  }
+  const after = options.after ?? 0;
+  if (after !== 0 && !isVersionNumber(after)) {
+    return refused(["after"], "invalid_version", "A version is a whole number from 1.");
+  }
+  const rows = await db.rows<Omit<VersionRow, "record">>(sql`
+    SELECT version, actor, action, workflow_state,
+      to_char(recorded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS recorded_at,
+      changed_fields, reason
+    FROM public.record_versions
+    WHERE organization_id = ${organizationId}::uuid AND record_id = ${recordId}::uuid
+      AND version > ${after}::integer
+    ORDER BY version
+    LIMIT ${limit + 1}::integer`);
+  const versions: RecordVersionSummary[] = [];
+  for (const row of rows.slice(0, limit)) {
+    const changed = row.changed_fields;
+    if (
+      !Number.isInteger(row.version) ||
+      row.version < 1 ||
+      !isActorId(row.actor) ||
+      (row.reason !== null && !isReason(row.reason)) ||
+      !Array.isArray(changed) ||
+      !changed.every((name): name is string => typeof name === "string") ||
+      (row.action !== "save" && row.action !== "delete" && !isWorkflowAction(row.action)) ||
+      !isWorkflowState(row.workflow_state)
+    ) {
+      return refused([row.version], "row_mismatch", "The stored version doesn't match its row.");
+    }
+    versions.push(
+      Object.freeze({
+        version: row.version,
+        actor: row.actor,
+        recordedAt: row.recorded_at,
+        changedFields: Object.freeze([...changed]),
+        ...(row.reason === null ? {} : { reason: row.reason }),
+        action: row.action,
+        workflowState: row.workflow_state,
+      }),
+    );
+  }
+  return {
+    ok: true,
+    value: Object.freeze({ versions: Object.freeze(versions), truncated: rows.length > limit }),
+  };
+}
+
 /** Two versions of one record, compared (`compareVersions`). */
 export interface VersionComparison {
   readonly from: number;
