@@ -86,6 +86,7 @@ export {
   publicValueSources,
   recordDependents,
   recordClosureIds,
+  lockRecordsShared,
   readWorkflowState,
 } from "./workflow.js";
 export type { PublicRecordOptions, PublicValueSource, WorkflowChangeResult } from "./workflow.js";

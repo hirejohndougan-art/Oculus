@@ -39,6 +39,8 @@ import {
   sql,
   type Database,
   type Queryable,
+  type Row,
+  type Sql,
 } from "@oculus/db";
 import {
   freshDatabase,
@@ -1136,6 +1138,208 @@ describe("publishing never puts out what the publisher can't see (S-020)", () =>
     ok(await dropProvenance(org, ALICE, series));
     expect((await publicText(org, x.id)).text).toContain("FONDS-SECRET");
   });
+
+  /** A gate a test opens. */
+  function gate(): { promise: Promise<void>; open: () => void } {
+    let open: () => void = () => undefined;
+    const promise = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    return { promise, open };
+  }
+
+  /**
+   * A pool as the writer whose first transaction pauses after its first
+   * statement inserting a record version (the write), until `resume` opens.
+   */
+  function pausingWriter(): { db: Database; reached: Promise<void>; resume: () => void } {
+    const pool = as(s.testDb.url, s.roles[0] ?? "");
+    const reached = gate();
+    const resume = gate();
+    let paused = false;
+    const pauseAfter = async (text: string): Promise<void> => {
+      if (paused || !text.includes("INSERT INTO public.record_versions")) return;
+      paused = true;
+      reached.open();
+      await resume.promise;
+    };
+    const db: Database = {
+      rows: (q) => pool.rows(q),
+      execute: (q) => pool.execute(q),
+      close: () => pool.close(),
+      transaction: (work) =>
+        pool.transaction((tx) =>
+          work({
+            rows: async <R extends Row = Row>(q: Sql): Promise<R[]> => {
+              const out = await tx.rows<R>(q);
+              await pauseAfter(q.text);
+              return out;
+            },
+            execute: async (q) => {
+              const n = await tx.execute(q);
+              await pauseAfter(q.text);
+              return n;
+            },
+          }),
+        ),
+    };
+    return { db, reached: reached.promise, resume: resume.open };
+  }
+
+  const deadlocks = async (): Promise<number> => {
+    await s.owner.execute(sql`SELECT pg_stat_clear_snapshot()`);
+    const [row] = await s.owner.rows<{ n: string }>(sql`
+      SELECT deadlocks::text AS n FROM pg_catalog.pg_stat_database
+      WHERE datname = current_database()`);
+    return Number(row?.n ?? "0");
+  };
+
+  /**
+   * Fonds F (public provenance) on a second site, filed over by a system
+   * manager, > series S on this site, on a template that stops the value >
+   * file X. Bob manages this site only: he sees S and X, never F.
+   */
+  async function stoppedTree(org: OrganizationId) {
+    if (folks === undefined) throw new Error("not ready");
+    ok(
+      await insertTemplateVersion(s.owner, {
+        key: "pub-unit-stop",
+        organizationId: org,
+        label: "pub-unit-stop",
+        appliesTo: ["archival_unit"],
+        // provenance is not inherited here, so nothing comes down past it.
+        fields: [field("rights", "rights"), field("provenance", "text")],
+      }),
+    );
+    const root = actorOf(folks.root);
+    const other = await makeSite(service, folks.root, org);
+    const fonds = ok(
+      await service.createRecord(
+        { organizationId: org, actor: root, siteId: other },
+        {
+          kind: "archival_unit",
+          level: "fonds",
+          title: "Invented Fonds",
+          templateKey: "pub-unit",
+          fields: { rights: { uri: INC }, provenance: "FONDS-SECRET" },
+        },
+      ),
+    ).record;
+    const here = { organizationId: org, actor: root, siteId: siteFor(org) };
+    const series = ok(
+      await service.createRecord(here, {
+        kind: "archival_unit",
+        level: "series",
+        parentId: fonds.id,
+        title: "Invented series",
+        templateKey: "pub-unit-stop",
+        fields: { rights: { uri: INC } },
+      }),
+    ).record;
+    const x = ok(
+      await service.createRecord(here, {
+        kind: "archival_unit",
+        level: "file",
+        parentId: series.id,
+        title: "Invented file",
+        templateKey: "pub-unit",
+        fields: { rights: { uri: INC } },
+      }),
+    ).record;
+    const bobId = await folks.member(org, "BobOneSite");
+    await grant(service, folks.root, org, {
+      userId: bobId,
+      role: "site_manager",
+      siteId: siteFor(org),
+    });
+    return { fonds, series, x, bob: actorOf(bobId) };
+  }
+
+  it("serializes an edit that lets a hidden value down with a publication of the record below (the final review's race)", async () => {
+    await ready();
+    const org = await organization();
+    const { series, x, bob } = await stoppedTree(org);
+    const before = await deadlocks();
+    const t1 = pausingWriter();
+    try {
+      const editing = createService(t1.db, { now: () => NOW }).updateRecord(
+        ctx(org, bob),
+        series.id,
+        { ...series, templateKey: "pub-unit" },
+        { expectedVersion: 1 },
+      );
+      const first = await Promise.race([t1.reached.then(() => undefined), editing]);
+      if (first !== undefined) throw new Error(`the edit ended early: ${JSON.stringify(first)}`);
+      // T2: Bob publishes the file on another pool while the edit is paused after its write.
+      const publishing = service2.publish(ctx(org, bob), x.id, { expectedVersion: 1 });
+      const early = await Promise.race([
+        publishing.then(() => "settled"),
+        new Promise((r) => setTimeout(r, 1500)).then(() => "waiting"),
+      ]);
+      // It waits for the edit (the edit holds the file FOR SHARE).
+      expect(early).toBe("waiting");
+      t1.resume();
+      ok(await editing);
+      // Then it sees the fonds's value, which Bob can't see: refused.
+      expect(codes(await publishing)).toEqual(["inherits_from_hidden"]);
+    } finally {
+      t1.resume();
+      await t1.db.close();
+    }
+    expect(await stateOf(org, x.id)).toBe("draft");
+    expect((await publicText(org, x.id)).text).not.toContain("FONDS-SECRET");
+    expect(await deadlocks()).toBe(before);
+  });
+
+  it("keeps edits and publications of a record and its parents apart without deadlocks", async () => {
+    await ready();
+    const org = await organization();
+    // Alice and Bob manage the whole site (no scoped grants, so no
+    // arrangement lock orders them): only the row locks do.
+    let fonds = await unit(org, "Invented Fonds", undefined, "Invented fonds provenance.");
+    let series = await unit(org, "Invented series", fonds.id);
+    const before = await deadlocks();
+    for (let round = 0; round < 6; round++) {
+      const made = await create(org, {
+        kind: "archival_unit",
+        level: "file",
+        parentId: series.id,
+        title: "Invented file",
+        templateKey: "pub-unit",
+        fields: { rights: { uri: INC } },
+      });
+      const results = await Promise.all([
+        service.updateRecord(
+          ctx(org, BOB),
+          series.id,
+          { ...series, title: `Invented series ${String(round)}` },
+          { expectedVersion: round + 1 },
+        ),
+        service2.publish(ctx(org), made.record.id, { expectedVersion: 1 }),
+        service.updateRecord(
+          ctx(org),
+          fonds.id,
+          { ...fonds, title: `Invented Fonds ${String(round)}` },
+          { expectedVersion: round + 1 },
+        ),
+        service2.updateRecord(
+          ctx(org, BOB),
+          made.record.id,
+          { ...made.record, title: "Invented file, renamed" },
+          { expectedVersion: 1 },
+        ),
+      ]);
+      const [s1, , f1] = results;
+      // The series and fonds edits always go through; the file's publish
+      // and edit race on its version, so one may meet a version conflict.
+      series = ok(s1).record;
+      fonds = ok(f1).record;
+      for (const r of results.slice(1)) {
+        if (!r.ok) expect(codes(r)).toEqual(["version_conflict"]);
+      }
+    }
+    expect(await deadlocks()).toBe(before);
+  }, 60_000);
 
   it("compares (field, source) pairs: a hidden fonds already giving one field can't start giving another", async () => {
     await ready();

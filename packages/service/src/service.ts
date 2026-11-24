@@ -133,6 +133,7 @@ import {
   organizationSiteIds,
   publicValueSources,
   publishCheckIssues,
+  lockRecordsShared,
   recordClosureIds,
   recordDependents,
   searchRecords as searchStoredRecords,
@@ -1066,6 +1067,12 @@ function placeIds(record: CatalogRecord): RecordId[] {
   return [];
 }
 
+/**
+ * The most published records below an edited record whose public output an
+ * edit by anyone but a system manager compares before and after (S-020).
+ */
+const MAX_WATCHED_DEPENDENTS = 500;
+
 /** A (field, source) pair as one comparable string (S-020). */
 function pairKey(pair: PublicValueSource): string {
   return `${pair.field}\u0000${pair.source}`;
@@ -1139,17 +1146,38 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
   }
 
   /**
+   * S-020: locks every record above `ids` (their parents, represented
+   * records and so on up, `ids` included) `FOR SHARE`, in ID order, and reads
+   * the set again: if it changed meanwhile, the operation starts again
+   * (`retry`). Afterwards no record whose values can flow into theirs can
+   * change, move or be published or withdrawn before COMMIT, and an edit of
+   * one of them waits for this transaction (it takes `FOR NO KEY UPDATE`).
+   * Always taken upward: after the record's own row lock and the
+   * arrangement lock, never before them.
+   */
+  async function lockAbove(
+    tx: Queryable,
+    organizationId: OrganizationId,
+    ids: readonly RecordId[],
+  ): Promise<ServiceRefusal | undefined> {
+    const first = await recordClosureIds(tx, organizationId, ids);
+    // Too many to read: the publish check refuses such a record anyway.
+    if (first === undefined) return undefined;
+    await lockRecordsShared(tx, organizationId, first);
+    const again = await recordClosureIds(tx, organizationId, ids);
+    return again?.join() === first.join() ? undefined : retryRefusal();
+  }
+
+  /**
    * S-020: refused unless the actor may view the source of every (field,
    * source) pair the record's public output takes from other records
    * (`publicValueSources`: public values inherited from ancestors and
    * represented records, and the record a digital asset represents), or with
    * `before`, of every pair not already among `before`. Publishing, or a
    * write that changes a published record's output, must not put out what
-   * the actor can't see. The new pairs' sources are locked `FOR SHARE` in ID
-   * order and the pairs read again: if they changed meanwhile, the operation
-   * starts again (`retry`); otherwise none of the sources can change (or move
-   * to a site or unit the actor can't see) before COMMIT. Take `checker`'s
-   * arrangement lock (if any) before the record's row lock, as callers do.
+   * the actor can't see. The record's whole chain is locked first
+   * (`lockAbove`), so the pairs read stay true until COMMIT. A system manager
+   * sees every record and is never refused.
    */
   async function hiddenSourcesRefusal(
     tx: Queryable,
@@ -1158,29 +1186,60 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
     recordId: RecordId,
     before: readonly PublicValueSource[] = [],
   ): Promise<ServiceRefusal | undefined> {
+    if (checker.access.systemManager) return undefined;
+    const locked = await lockAbove(tx, organizationId, [recordId]);
+    if (locked) return locked;
     const known = new Set(before.map(pairKey));
     const pairs = await publicValueSources(tx, organizationId, recordId, { lock: true });
     // Unreadable: the publish check, run with it, refuses the record anyway.
     if (pairs === undefined) return undefined;
-    const added = pairs.filter((p) => !known.has(pairKey(p)));
-    if (added.length === 0) return undefined;
-    const sources = [...new Set(added.map((p) => p.source))].sort();
-    for (const id of sources) await lockRecord(tx, organizationId, id, "share");
-    const again = await publicValueSources(tx, organizationId, recordId, { lock: true });
-    if (again?.map(pairKey).join("\n") !== pairs.map(pairKey).join("\n")) return retryRefusal();
+    const sources = [
+      ...new Set(pairs.filter((p) => !known.has(pairKey(p))).map((p) => p.source)),
+    ].sort();
+    if (sources.length === 0) return undefined;
     if ((await checker.hiddenAmong(sources)).size === 0) return undefined;
     return inheritsFromHidden();
   }
 
   /**
-   * Before a write of `recordId` (an edit, a move, a restore) that can change
-   * what the published records below it, and scans of them, show (S-020):
-   * their (field, source) pairs now, to compare after the write with
-   * `dependentsRefusal`. `undefined` when nothing needs comparing: a system
-   * manager (who sees everything), no published dependents, or no record the
-   * actor can't see among those any new source could be (the record, every
-   * record above it now and after the write, and every record below it).
-   * `after` is the IDs the record will be filed under or represent.
+   * Before an edit or restore of `recordId` locks the record's row (S-020):
+   * locks every record below it and every scan of them `FOR SHARE`, so none
+   * can be published, withdrawn or changed until COMMIT (publishing one
+   * takes `FOR NO KEY UPDATE` on it, then locks its chain, this record
+   * included). Lower records first, then the record, then the records
+   * above it (`lockAbove`): the order every edit and publication follows.
+   * Not for a system manager, who sees every record. Returns what it locked.
+   */
+  async function lockBelow(
+    tx: Queryable,
+    checker: RecordAccess,
+    organizationId: OrganizationId,
+    recordId: RecordId,
+  ): Promise<ReadonlySet<RecordId> | undefined> {
+    if (checker.access.systemManager) return undefined;
+    const below = await recordDependents(tx, organizationId, recordId);
+    return new Set(
+      await lockRecordsShared(
+        tx,
+        organizationId,
+        below.map((d) => d.id),
+      ),
+    );
+  }
+
+  /**
+   * After the record's row lock, before the write (S-020): the published
+   * records below it and scans of them, with their (field, source) pairs
+   * now, to compare after the write with `dependentsRefusal`. The set is
+   * read again: a record moved below it since `lockBelow` (so not locked)
+   * starts the operation again (`retry`). Nothing to compare (`watched`
+   * undefined) for a system manager, with no published dependents, or with
+   * no record the actor can't see among those any new source could be (the
+   * record, every record above it now and after the write, and every record
+   * below it). More than `MAX_WATCHED_DEPENDENTS` published ones with a
+   * hidden record involved is refused (`too_many_published_below`): a
+   * system manager makes that change. `after` is the IDs the record will be
+   * filed under or represent.
    */
   async function watchDependents(
     tx: Queryable,
@@ -1188,21 +1247,38 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
     organizationId: OrganizationId,
     recordId: RecordId,
     after: readonly RecordId[],
-  ): Promise<ReadonlyMap<RecordId, readonly PublicValueSource[]> | undefined> {
-    if (checker.access.systemManager) return undefined;
+    lockedBelow: ReadonlySet<RecordId> | undefined,
+  ): Promise<
+    | {
+        readonly ok: true;
+        readonly watched: ReadonlyMap<RecordId, readonly PublicValueSource[]> | undefined;
+      }
+    | ServiceRefusal
+  > {
+    const none = { ok: true, watched: undefined } as const;
+    if (checker.access.systemManager) return none;
     const dependents = await recordDependents(tx, organizationId, recordId);
+    if (dependents.some((d) => !(lockedBelow?.has(d.id) ?? false))) return retryRefusal();
     const published = dependents.filter((d) => d.published).map((d) => d.id);
-    if (published.length === 0) return undefined;
+    if (published.length === 0) return none;
     const above = await recordClosureIds(tx, organizationId, [recordId, ...after]);
     // Too many to list: compare every published dependent.
     if (above !== undefined) {
       const hidden = await checker.hiddenAmong([...above, ...dependents.map((d) => d.id)]);
-      if (hidden.size === 0) return undefined;
+      if (hidden.size === 0) return none;
+    }
+    if (published.length > MAX_WATCHED_DEPENDENTS) {
+      return refusal(
+        [],
+        "too_many_published_below",
+        "Too many published records are below this record, and some of what they show comes from records you can't see; ask a system manager to make this change.",
+      );
     }
     const before = new Map<RecordId, readonly PublicValueSource[]>();
-    for (const id of published)
+    for (const id of published) {
       before.set(id, (await publicValueSources(tx, organizationId, id)) ?? []);
-    return before;
+    }
+    return { ok: true, watched: before };
   }
 
   /** After the write: `hiddenSourcesRefusal` for every dependent `watchDependents` listed. */
@@ -1598,6 +1674,8 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         const seen = await readRecordPlace(tx, org, recordId);
         if (seen === undefined) return noSuchRecord();
         if (movesInArrangement(seen, content)) await lockArrangement(tx, org);
+        // The records below it first, so none is published meanwhile (S-020).
+        const lockedBelow = await lockBelow(tx, checker, org, recordId);
         // Then the row, and its place as it stays until COMMIT: that is what
         // the permissions are checked against.
         const place = await lockedPlace(tx, org, recordId, "no_key_update");
@@ -1614,6 +1692,11 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           editPermissions(place.kind),
         );
         if (mayEdit) return mayEdit;
+        // Then the records above it (S-020), so what it inherits holds still.
+        if (!checker.access.systemManager) {
+          const above = await lockAbove(tx, org, [recordId]);
+          if (above) return above;
+        }
         if (content.kind !== undefined && content.kind !== place.kind) {
           return refusal(
             ["kind"],
@@ -1686,13 +1769,16 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         if (moved) return moved;
         // What the published records below it (and scans of them) show from
         // other records now (S-020): the edit may change what they inherit.
-        const dependentsBefore = await watchDependents(
+        const watch = await watchDependents(
           tx,
           checker,
           org,
           recordId,
           placeIds(record),
+          lockedBelow,
         );
+        if (!watch.ok) return watch;
+        const dependentsBefore = watch.watched;
         if (record.templateKey === undefined) {
           return refusal(["templateKey"], "no_template_key", "Every record names its template.");
         }
@@ -1841,6 +1927,8 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
             ? ({ ...stored, siteId: seen.siteId } as CatalogRecord)
             : stored;
         if (old !== undefined && movesInArrangement(seen, old)) await lockArrangement(tx, org);
+        // The records below it first, so none is published meanwhile (S-020).
+        const lockedBelow = await lockBelow(tx, checker, org, recordId);
         // Then the row, and the place it is checked at, as it stays until COMMIT.
         const place = await lockedPlace(tx, org, recordId, "no_key_update");
         if (place === undefined) return noSuchRecord();
@@ -1856,6 +1944,11 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           editPermissions(place.kind),
         );
         if (mayRestore) return mayRestore;
+        // Then the records above it (S-020), so what it inherits holds still.
+        if (!checker.access.systemManager) {
+          const above = await lockAbove(tx, org, [recordId]);
+          if (above) return above;
+        }
         // What a published record's public output shows from other records
         // now (S-020): a restore may add sources only the person can see.
         const sourcesBefore =
@@ -1869,13 +1962,16 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         }
         let hiddenLinks: ReadonlySet<RecordId> = new Set();
         let hiddenParent = false;
-        const dependentsBefore = await watchDependents(
+        const watch = await watchDependents(
           tx,
           checker,
           org,
           recordId,
           old === undefined ? [] : placeIds(old),
+          lockedBelow,
         );
+        if (!watch.ok) return watch;
+        const dependentsBefore = watch.watched;
         if (old !== undefined) {
           const moved = await moveIssues(tx, checker, recordId, place, old);
           if (moved) return moved;

@@ -572,6 +572,26 @@ export async function recordClosureIds(
   return rows?.map((r) => r.id as RecordId).sort();
 }
 
+/**
+ * Locks the organization's records `ids` `FOR SHARE`, in ID order, in one
+ * statement (S-020): none of them can then be changed, moved or have its
+ * state changed (which take `FOR NO KEY UPDATE`) before COMMIT. Returns the
+ * IDs it locked (those that exist).
+ */
+export async function lockRecordsShared(
+  db: Queryable,
+  organizationId: OrganizationId,
+  ids: readonly RecordId[],
+): Promise<readonly RecordId[]> {
+  if (ids.length === 0 || !isOrganizationId(organizationId)) return [];
+  const rows = await db.rows<{ id: string }>(sql`
+    SELECT id::text AS id FROM public.records
+    WHERE organization_id = ${organizationId}::uuid AND id = ANY(${[...ids]}::uuid[])
+    ORDER BY id
+    FOR SHARE`);
+  return rows.map((r) => r.id as RecordId);
+}
+
 // ---------------------------------------------------------------------------
 // The public output
 
