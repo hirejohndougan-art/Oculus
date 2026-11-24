@@ -33,7 +33,11 @@ CREATE TABLE public.users (
            AND display_name !~ '[[:cntrl:]]'),
   password_hash text NOT NULL
     CHECK (password_hash ~ '^\$scrypt\$ln=[0-9]{1,2},r=[0-9]{1,2},p=[0-9]{1,2}\$[A-Za-z0-9+/]{22}\$[A-Za-z0-9+/]{43}$'),
-  -- D-019: system admins manage every user and every organization.
+  -- D-019: system admins manage every user and every organization. Until
+  -- a supported way to make or remove system admins exists (T-041, T-048),
+  -- the bootstrap account is the only one (CHECK below) and the flag can't
+  -- change (zzzz_users_keep_identity), so even a writer with direct SQL
+  -- can't make itself one.
   system_admin boolean NOT NULL DEFAULT false,
   -- The install's first system admin, made without an invitation. At most
   -- one row ever (users_one_bootstrap).
@@ -46,7 +50,7 @@ CREATE TABLE public.users (
   -- A disabled user can't sign in (D-019: system admins deactivate).
   disabled_at timestamptz,
   CHECK (bootstrap <> (created_by_invitation IS NOT NULL)),
-  CHECK (NOT bootstrap OR system_admin)
+  CHECK (system_admin = bootstrap)
 );
 
 CREATE UNIQUE INDEX users_one_bootstrap ON public.users ((true)) WHERE bootstrap;
@@ -111,11 +115,16 @@ CREATE TABLE public.sign_in_throttles (
 -- The cleanup (deleteExpiredSignInThrottles) finds old counters by time.
 CREATE INDEX sign_in_throttles_last_failure ON public.sign_in_throttles (last_failure_at);
 
--- Identity never changes (as in 0002): a user's ID, an invitation's
--- organization, ID, address, token, inviter and times, a membership's keys.
+-- Identity never changes (as in 0002): a user's ID, sign-in address,
+-- system admin flag and origin; an invitation's organization, ID, address,
+-- token, inviter and times; a membership's keys. There is no supported way
+-- to change a sign-in address yet (D-052 asks for the password and second
+-- factor again when there is, which needs T-037 and T-038), so it is refused
+-- outright: an address can't drift from the invitations that made the
+-- account and its memberships.
 CREATE TRIGGER zzzz_users_keep_identity BEFORE UPDATE ON public.users
   FOR EACH ROW EXECUTE FUNCTION public.catalog_keep_identity(
-    'id', 'bootstrap', 'created_by_invitation', 'created_at');
+    'id', 'email', 'system_admin', 'bootstrap', 'created_by_invitation', 'created_at');
 CREATE TRIGGER zzzz_invitations_keep_identity BEFORE UPDATE ON public.invitations
   FOR EACH ROW EXECUTE FUNCTION public.catalog_keep_identity(
     'organization_id', 'id', 'email', 'token_hash', 'invited_by', 'created_at', 'expires_at');
@@ -187,3 +196,24 @@ $$;
 
 CREATE TRIGGER organization_members_check_invitation BEFORE INSERT ON public.organization_members
   FOR EACH ROW EXECUTE FUNCTION public.organization_members_check_invitation();
+
+-- Every guard trigger fires in replica mode too (D-067, 0008 part 4): a
+-- session that starts with session_replication_role = replica must not skip
+-- them.
+DO $$
+DECLARE
+  t record;
+BEGIN
+  FOR t IN
+    SELECT c.relname, tg.tgname
+    FROM pg_catalog.pg_trigger tg
+    JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND NOT tg.tgisinternal
+      AND c.relname IN ('users', 'invitations', 'organization_members', 'sign_in_throttles')
+    ORDER BY c.relname, tg.tgname
+  LOOP
+    EXECUTE format('ALTER TABLE public.%I ENABLE ALWAYS TRIGGER %I', t.relname, t.tgname);
+  END LOOP;
+END
+$$;

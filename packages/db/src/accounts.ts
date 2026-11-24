@@ -66,8 +66,7 @@ import { sql } from "./sql.js";
 
 /**
  * What the writer role needs on this module's tables, beyond SELECT on
- * every table (D-068). For T-032's `WRITER_PRIVILEGES` when the branches
- * meet. `UPDATE` on `sign_in_throttles` is also what `SELECT … FOR UPDATE`
+ * every table (D-068). Part of `WRITER_PRIVILEGES` (roles.ts, D-067). `UPDATE` on `sign_in_throttles` is also what `SELECT … FOR UPDATE`
  * needs. Nothing deletes users, invitations or memberships.
  */
 export const ACCOUNT_TABLE_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Object.freeze({

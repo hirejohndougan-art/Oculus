@@ -36,6 +36,7 @@ import {
 import { insertOrganization } from "./catalog.js";
 import { openDatabase, type Database, type Queryable } from "./client.js";
 import { migrate } from "./migrate.js";
+import { WRITER_PRIVILEGES, checkWriterConnection, grantWriterRole } from "./roles.js";
 import { sql, type Sql } from "./sql.js";
 import { freshDatabase, testServerUrl, type TestDatabase } from "./test-database.fixtures.js";
 
@@ -146,14 +147,23 @@ async function counterOf(
   return rows[0];
 }
 
-/** Makes an invitation look created 8 days ago (so it has expired), as the owner. */
+/**
+ * Makes an invitation look created 8 days ago (so it has expired), as the
+ * owner: the identity trigger is turned off inside this transaction only and
+ * turned back on ALWAYS before it commits, as main's tests do (D-067).
+ */
 async function expire(invitationId: InvitationId): Promise<void> {
   await db.transaction(async (q) => {
-    await q.execute(sql`SET LOCAL session_replication_role = replica`);
+    await q.execute(
+      sql`ALTER TABLE public.invitations DISABLE TRIGGER zzzz_invitations_keep_identity`,
+    );
     await q.execute(sql`
       UPDATE public.invitations
       SET created_at = created_at - interval '8 days', expires_at = expires_at - interval '8 days'
       WHERE id = ${invitationId}::uuid`);
+    await q.execute(
+      sql`ALTER TABLE public.invitations ENABLE ALWAYS TRIGGER zzzz_invitations_keep_identity`,
+    );
   });
 }
 
@@ -740,12 +750,10 @@ describe("signIn", () => {
     await ready();
     const org = await organization();
     const person = await member(org);
-    await db.transaction(async (q) => {
-      await q.execute(sql`SET LOCAL session_replication_role = replica`);
-      await q.execute(
-        sql`DELETE FROM public.organization_members WHERE user_id = ${person.userId}::uuid`,
-      );
-    });
+    // No trigger guards a membership's DELETE (removing people is T-048's).
+    await db.execute(
+      sql`DELETE FROM public.organization_members WHERE user_id = ${person.userId}::uuid`,
+    );
     expect(await signIn(db, { email: person.email, password: PASSWORD, source: source() })).toEqual(
       INVALID_CREDENTIALS,
     );
@@ -1071,6 +1079,63 @@ describe("the database's own guards", () => {
     ).rejects.toMatchObject({ constraint: "users_invitation_accepted" });
   });
 
+  it("never lets an UPDATE change a sign-in address or make anyone a system admin", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    for (const change of [
+      sql`UPDATE public.users SET email = 'taken.over@example.org' WHERE id = ${person.userId}::uuid`,
+      sql`UPDATE public.users SET system_admin = true WHERE id = ${person.userId}::uuid`,
+      sql`UPDATE public.users SET system_admin = false WHERE id = ${admin}::uuid`,
+      sql`UPDATE public.users SET bootstrap = true, system_admin = true WHERE id = ${person.userId}::uuid`,
+    ]) {
+      await expect(db.execute(change)).rejects.toMatchObject({ code: "23000" });
+    }
+    // Only the bootstrap account is a system admin, even on INSERT.
+    const inv = await invite(org, email());
+    await expect(
+      db.transaction(async (q) => {
+        const id = "5a1c2a9e-8b7d-4c6e-9a1b-2d3e4f5a6b7c";
+        await q.execute(sql`UPDATE public.invitations SET accepted_at = now(), accepted_by = ${id}::uuid
+          WHERE id = ${inv.invitationId}::uuid`);
+        await q.execute(sql`INSERT INTO public.users
+            (id, email, display_name, password_hash, system_admin, created_by_invitation)
+          VALUES (${id}::uuid, ${inv.email}, 'Direct', ${"$scrypt$ln=14,r=8,p=5$" + "A".repeat(22) + "$" + "A".repeat(43)},
+                  true, ${inv.invitationId}::uuid)`);
+      }),
+    ).rejects.toMatchObject({ code: "23514" });
+    expect(
+      (await signIn(db, { email: person.email, password: PASSWORD, source: source() })).ok,
+    ).toBe(true);
+  });
+
+  it("fires every guard trigger on the account tables in replica mode too", async () => {
+    await ready();
+    const rows = await db.rows<{ name: string; enabled: string }>(sql`
+      SELECT c.relname || '.' || t.tgname AS name, t.tgenabled::text AS enabled
+      FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+      WHERE NOT t.tgisinternal
+        AND c.relname IN ('users', 'invitations', 'organization_members', 'sign_in_throttles')
+      ORDER BY 1`);
+    expect(rows.map((r) => r.name)).toEqual([
+      "invitations.invitations_settle_once",
+      "invitations.zzzz_invitations_keep_identity",
+      "organization_members.organization_members_check_invitation",
+      "organization_members.zzzz_organization_members_keep_identity",
+      "users.users_check_invitation",
+      "users.zzzz_users_keep_identity",
+    ]);
+    for (const r of rows) expect(r).toEqual({ name: r.name, enabled: "A" });
+    const pending = await invite(await organization(), email());
+    await expect(
+      db.transaction(async (q) => {
+        await q.execute(sql`SET LOCAL session_replication_role = replica`);
+        await q.execute(sql`UPDATE public.invitations SET email = 'moved@example.org'
+          WHERE id = ${pending.invitationId}::uuid`);
+      }),
+    ).rejects.toMatchObject({ code: "23000" });
+  });
+
   it("refuses a membership without an accepted invitation of that organization", async () => {
     await ready();
     const orgA = await organization();
@@ -1117,7 +1182,7 @@ describe("the database's own guards", () => {
 });
 
 describe("the writer's grants (D-068)", () => {
-  it("are enough for every account function, and allow no deleting of accounts", async () => {
+  it("are in the writer's list, enough for every account function, and nothing beyond is allowed", async () => {
     await ready();
     const role = `oculus_test_t036_${unique().toString()}_${String(process.pid)}`;
     // Role names can't be parameters; the name is made here, then quoted by format().
@@ -1143,20 +1208,36 @@ describe("the writer's grants (D-068)", () => {
         await s.close();
       }
     });
-    const grants = [
-      "GRANT USAGE ON SCHEMA public TO %I",
-      "GRANT SELECT ON ALL TABLES IN SCHEMA public TO %I",
-      ...Object.entries(ACCOUNT_TABLE_PRIVILEGES).map(
-        ([table, privileges]) => `GRANT ${privileges.join(", ")} ON public.${table} TO %I`,
-      ),
-    ];
-    await db.transaction(async (q) => {
-      for (const g of grants) await run(g, q);
-    });
+    // Exactly the writer's grants (D-067), which now include D-068's.
+    await db.transaction((q) => grantWriterRole(q, role));
     const url = new URL((await setup)?.testDb.url ?? "");
     url.username = role;
     const writer = openDatabase(url.toString(), { max: 3 });
     try {
+      expect(await checkWriterConnection(writer)).toEqual([]);
+      for (const [table, privileges] of Object.entries(ACCOUNT_TABLE_PRIVILEGES)) {
+        expect(WRITER_PRIVILEGES[table]).toEqual(privileges);
+      }
+      // Anything beyond the list is refused.
+      for (const extra of [
+        "GRANT DELETE ON public.users TO %I",
+        "GRANT DELETE ON public.invitations TO %I",
+        "GRANT UPDATE ON public.organization_members TO %I",
+        "GRANT TRUNCATE ON public.sign_in_throttles TO %I",
+        "GRANT TRIGGER ON public.users TO %I",
+      ]) {
+        await db.transaction((q) => run(extra, q));
+        try {
+          expect((await checkWriterConnection(writer)).map((p) => p.code)).toEqual([
+            "extra_privilege",
+          ]);
+        } finally {
+          await db.transaction((q) =>
+            run(extra.replace("GRANT", "REVOKE").replace(" TO ", " FROM "), q),
+          );
+        }
+      }
+      expect(await checkWriterConnection(writer)).toEqual([]);
       const org = await organization();
       const address = email();
       const inv = ok(

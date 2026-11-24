@@ -18,6 +18,7 @@
  * never revokes what a role already holds, and `checkWriterConnection`
  * refuses a role holding anything more.
  */
+import { ACCOUNT_TABLE_PRIVILEGES } from "./accounts.js";
 import type { Queryable } from "./client.js";
 import { sql } from "./sql.js";
 
@@ -49,6 +50,11 @@ export const WRITER_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Ob
   terms: ["INSERT", "UPDATE"],
   record_term_index: ["INSERT", "UPDATE", "DELETE"],
   record_terms: ["INSERT", "DELETE"],
+  // Accounts (D-068): sign-in time and re-hash, accepting and revoking
+  // invitations, memberships, and the sign-in counters (UPDATE also for
+  // their `SELECT … FOR UPDATE`; DELETE when a sign-in succeeds and for the
+  // cleanup). Nothing deletes users, invitations or memberships.
+  ...ACCOUNT_TABLE_PRIVILEGES,
 });
 
 /**
