@@ -606,6 +606,7 @@ export {
   SOURCE_THROTTLE,
   KNOWN_SOURCE_THROTTLE,
   KNOWN_SOURCE_SECONDS,
+  MAX_KNOWN_SOURCES,
   OTHER_SOURCE_KEY,
 } from "./sign-in-throttle.js";
 export type {

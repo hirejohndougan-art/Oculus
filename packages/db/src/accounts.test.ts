@@ -1165,6 +1165,36 @@ describe("known addresses: strangers can't keep anyone out where they sign in (S
     expect(await knownRow(person.email, home)).toBeUndefined();
   });
 
+  it("keeps at most the 20 newest known addresses per account", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const key = throttleAccountKey(person.email);
+    const old = Array.from({ length: 25 }, () => source());
+    for (const [i, from] of old.entries()) {
+      await db.execute(sql`
+        INSERT INTO public.sign_in_known_sources (account_key, source_key, signed_in_at)
+        VALUES (${key}, ${throttleSourceKey(from)},
+                clock_timestamp() - make_interval(secs => ${100 - i}))`);
+    }
+    const newest = source();
+    expect(
+      await signIn(db, { email: person.email, password: PASSWORD, source: newest }),
+    ).toMatchObject({ ok: true });
+    const rows = await db.rows<{ source_key: string }>(sql`
+      SELECT source_key FROM public.sign_in_known_sources WHERE account_key = ${key}
+      ORDER BY signed_in_at DESC`);
+    expect(rows).toHaveLength(20);
+    expect(rows[0]?.source_key).toBe(throttleSourceKey(newest));
+    // The newest 19 of the old ones stay; the 6 oldest went.
+    expect(rows.slice(1).map((r) => r.source_key)).toEqual(
+      old
+        .slice(6)
+        .reverse()
+        .map((a) => throttleSourceKey(a)),
+    );
+  });
+
   it("never makes an unreadable client address known, and never from a wrong password", async () => {
     await ready();
     const org = await organization();

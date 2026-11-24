@@ -78,6 +78,13 @@ export const SOURCE_THROTTLE: ThrottleRule = Object.freeze({
  */
 export const KNOWN_SOURCE_SECONDS = 30 * 24 * 60 * 60;
 
+/**
+ * The most addresses kept known for one account (S-018 review): the newest
+ * by last right password. Someone with the password can't fill the table,
+ * and an old network drops out when a 21st is used.
+ */
+export const MAX_KNOWN_SOURCES = 20;
+
 /** A known address's own counter for the account: the account rule. */
 export const KNOWN_SOURCE_THROTTLE: ThrottleRule = ACCOUNT_THROTTLE;
 

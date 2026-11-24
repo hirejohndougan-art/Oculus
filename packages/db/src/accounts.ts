@@ -34,6 +34,7 @@ import {
   MAX_INVITATION_SECONDS,
   MIN_INVITATION_SECONDS,
   KNOWN_SOURCE_SECONDS,
+  MAX_KNOWN_SOURCES,
   OTHER_SOURCE_KEY,
   PasswordWorkBusyError,
   SOURCE_THROTTLE,
@@ -1136,6 +1137,15 @@ export async function signInChecked(
         VALUES (${accountKey}, ${sourceKey}, clock_timestamp())
         ON CONFLICT (account_key, source_key) DO UPDATE
         SET signed_in_at = excluded.signed_in_at, failures = 0, last_failure_at = NULL`);
+      // At most MAX_KNOWN_SOURCES per account, the newest (S-018 review).
+      await tx.execute(sql`
+        DELETE FROM public.sign_in_known_sources k
+        WHERE k.account_key = ${accountKey}
+          AND k.source_key NOT IN (
+            SELECT n.source_key FROM public.sign_in_known_sources n
+            WHERE n.account_key = ${accountKey}
+            ORDER BY n.signed_in_at DESC, n.source_key
+            LIMIT ${MAX_KNOWN_SOURCES})`);
     }
     await tx.execute(
       sql`UPDATE public.users SET last_sign_in_at = now() WHERE id = ${user.id}::uuid`,
