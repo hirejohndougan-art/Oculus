@@ -3,9 +3,9 @@ import {
   DEFAULT_TERMS_WITHOUT_URI,
   MAX_DUPLICATE_TERMS,
   MAX_TERMS_WITHOUT_URI,
-  findLcTermsWithoutUri,
   type TermsWithoutUriReport,
 } from "./index.js";
+import { findLcTermsWithoutUriOf as findLcTermsWithoutUri } from "./stored-terms.fixtures.js";
 
 const RAILROADS = "http://id.loc.gov/authorities/subjects/sh85110904";
 
@@ -80,9 +80,9 @@ describe("findLcTermsWithoutUri", () => {
       { label: "Parks", vocabulary: "lcsh" },
       "not a term",
     ];
-    // A hole and a getter are each one item's problem.
-    list.length = 6;
-    Object.defineProperty(list, 5, {
+    // A getter term is one entry's problem (a hole refuses the whole list:
+    // see the organization tests).
+    Object.defineProperty(list, 4, {
       get: () => ({ label: "x", vocabulary: "lcsh" }),
       enumerable: true,
     });
@@ -92,10 +92,9 @@ describe("findLcTermsWithoutUri", () => {
       [0, "not_canonical"],
       [1, "invalid_text"],
       [3, "not_an_object"],
-      [4, "holes"],
-      [5, "not_plain_data"],
+      [4, "not_plain_data"],
     ]);
-    expect(r.skipped[0]?.issues[0]?.path).toEqual([0, "uri"]);
+    expect(r.skipped[0]?.issues[0]?.path).toEqual([0, "term", "uri"]);
   });
 
   it("returns at most maxTerms groups, counts every term, and says it was cut short", () => {

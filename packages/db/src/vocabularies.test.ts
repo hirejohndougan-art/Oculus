@@ -4,12 +4,17 @@
 // records per term without reading records, follows a record's changes when
 // refreshed and shows when it is stale; and direct SQL can't move rows or
 // point across organizations (D-019, D-062).
+import { createHash } from "node:crypto";
 import { afterAll, describe, expect, it } from "vitest";
 import {
   STANDARD_PRESETS,
   createRecord,
+  findLcTermsWithoutUri,
   findNearDuplicateTerms,
   newOrganizationId,
+  termIdentity,
+  validateStoredTerm,
+  validateStoredTerms,
   templateFromPreset,
   validateControlledTerm,
   type JsonValue,
@@ -804,7 +809,9 @@ describe("labels that differ only invisibly", () => {
     const composed = { label: "Café" };
     const decomposed = { label: "Café" };
     expect(keyOf(composed)).not.toBe(keyOf(decomposed));
-    const report = ok(findNearDuplicateTerms([composed, decomposed]));
+    const org = newOrganizationId();
+    const entries = [composed, decomposed].map((term) => ({ organizationId: org, term }));
+    const report = ok(findNearDuplicateTerms(entries, org));
     expect(JSON.stringify(report)).toMatch(/same_label/);
   });
 });
@@ -840,6 +847,61 @@ describe("organization separation", () => {
       "Invented Street depot": 1,
       [LCSH.uri]: 1,
     });
+  });
+
+  it("hands out stored terms and usages that say whose they are (T-019b2)", async () => {
+    await ready();
+    const archives = await organization();
+    const library = await organization("Invented Public Library");
+    const saved = ok(await tx((q) => saveTerm(q, { organizationId: archives, term: DEPOT })));
+    ok(await tx((q) => saveTerm(q, { organizationId: library, term: WOOD })));
+    const mine = await record(archives, { subjects: [{ label: "invented street depots" }] });
+    const theirs = await record(library, {
+      subjects: [WOOD, { label: "wood", vocabulary: "local" }],
+    });
+    const built = ok(await refresh(archives, mine));
+    const other = ok(await refresh(library, theirs));
+    expect(built.organizationId).toBe(archives);
+    expect(built.usages.map((u) => u.organizationId)).toEqual([archives]);
+    expect(other.usages.map((u) => u.organizationId)).toEqual([library, library]);
+
+    // A stored term is core's StoredTerm plus its key, and the key is core's rule.
+    const { termKey: key, ...core } = saved;
+    expect(ok(validateStoredTerm(core))).toEqual(core);
+    expect(key).toBe(
+      createHash("sha256")
+        .update(ok(termIdentity(DEPOT)), "utf8")
+        .digest("hex"),
+    );
+    const list = ok(await readTerms(db, archives)).terms;
+    expect(
+      ok(
+        validateStoredTerms(
+          list.map((t) => ({ organizationId: t.organizationId, id: t.id, term: t.term })),
+          archives,
+        ),
+      ),
+    ).toHaveLength(1);
+    expect(ok(await readTerm(db, archives, saved.id)).organizationId).toBe(archives);
+
+    // One organization's stored terms and usages go straight to Data Cleaning.
+    const pool = [...list, ...built.usages];
+    const pairs = ok(findNearDuplicateTerms(pool, archives));
+    expect(pairs.candidates.map((c) => [c.first, c.second])).toEqual([[0, 1]]);
+    expect(ok(findLcTermsWithoutUri(pool, archives)).terms).toEqual([]);
+    // Mixed with the library's, or asked for by the other organization: refused.
+    const theirTerms = ok(await readTerms(db, library)).terms;
+    for (const mixed of [
+      [...pool, ...other.usages],
+      [...theirTerms, ...list],
+    ]) {
+      const r = findNearDuplicateTerms(mixed, archives);
+      expect(codes(r)).toEqual(["mixed_organizations"]);
+      expect(JSON.stringify(r)).not.toMatch(/Wood/);
+      expect(codes(findLcTermsWithoutUri(mixed, archives))).toEqual(["mixed_organizations"]);
+    }
+    expect(codes(findNearDuplicateTerms(other.usages, archives))).toEqual(["mixed_organizations"]);
+    expect(ok(findNearDuplicateTerms(other.usages, library)).candidates).toHaveLength(1);
   });
 
   it("refuses direct SQL that points at another organization's rows", async () => {

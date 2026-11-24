@@ -15,11 +15,17 @@
  * Like `findNearDuplicateTerms`, a term the vocabulary rules refuse is left
  * out and listed in `skipped`, and the rest are still read; terms from other
  * vocabularies, and terms that have a URI, are not listed. Never throws.
+ *
+ * One organization at a time (D-019, D-071): the entries are
+ * `OrganizationTerm`s of the organization the caller names, as for
+ * `findNearDuplicateTerms`, or the whole list is refused
+ * (`mixed_organizations`) before any term is read.
  */
 import { type Validated } from "./issues.js";
 import { IssueList } from "./plain-data.js";
-import { types } from "node:util";
-import { MAX_DUPLICATE_TERMS, readTerm, type SkippedTerm } from "./term-duplicates.js";
+import { type OrganizationId } from "./organizations.js";
+import { readOrganizationTerms } from "./stored-terms.js";
+import { MAX_DUPLICATE_TERMS, type SkippedTerm } from "./term-duplicates.js";
 import { type VocabularyCode } from "./vocabularies.js";
 
 /** The vocabularies this report covers, in the order it lists them. */
@@ -55,40 +61,33 @@ export const MAX_TERMS_WITHOUT_URI = 10_000;
 const LC_ORDER: ReadonlyMap<string, number> = new Map(LC_VOCABULARY_CODES.map((c, i) => [c, i]));
 
 /**
- * List the LCSH, LCNAF and LCGFT terms in `input` (a list of terms in the
- * `controlled_term` shape, at most `MAX_DUPLICATE_TERMS`) that have no URI.
- * Fails only when `input` isn't a readable list or `options` is bad.
+ * List the LCSH, LCNAF and LCGFT terms in `input` (a list of one
+ * organization's `OrganizationTerm`s, at most `MAX_DUPLICATE_TERMS`) that
+ * have no URI. `organizationId` is the organization the caller expects; an
+ * entry not of it refuses the list (`mixed_organizations`). Fails only when
+ * `organizationId`, `input` or `options` is bad.
  */
 export function findLcTermsWithoutUri(
   input: unknown,
+  organizationId: OrganizationId,
   options: TermsWithoutUriOptions = {},
 ): Validated<TermsWithoutUriReport> {
   const issues = new IssueList();
   try {
     const max = readMax(options, issues);
-    if (
-      !Array.isArray(input) ||
-      types.isProxy(input) ||
-      Object.getPrototypeOf(input) !== Array.prototype
-    ) {
-      issues.add([], "not_a_list", "The terms must be an ordinary list.");
-    } else if (input.length > MAX_DUPLICATE_TERMS) {
-      issues.add(
-        [],
-        "too_many",
-        `At most ${String(MAX_DUPLICATE_TERMS)} terms can be read at once.`,
-      );
+    const read = readOrganizationTerms(input, organizationId, MAX_DUPLICATE_TERMS, issues);
+    if (read === undefined || issues.count > 0) {
+      return { ok: false, issues: Object.freeze([...issues.items]) };
     }
-    if (issues.count > 0) return { ok: false, issues: Object.freeze([...issues.items]) };
-    const list = input as readonly unknown[];
-    const length = list.length;
+    const length = read.length;
     // One Map of labels per vocabulary: labels are compared exactly, and a
     // Map can't be fooled by a label such as "__proto__".
     const groups = new Map<LcVocabularyCode, Map<string, { first: number; indexes: number[] }>>();
     const counts = { lcsh: 0, lcnaf: 0, lcgft: 0 };
     const skipped: SkippedTerm[] = [];
     for (let i = 0; i < length; i += 1) {
-      const result = readTerm(list, i);
+      const result = read[i];
+      if (result === undefined) continue;
       if (!result.ok) {
         skipped.push(Object.freeze({ index: i, issues: result.issues }));
         continue;
