@@ -122,6 +122,9 @@ export function replyHeaderProblem(name: unknown, value: unknown): string | unde
  * can (D-058, S-025): refused until server-built public pages and XML feeds
  * (OAI-PMH, T-050) get their own decision (D-034). By essence, lower case:
  * - HTML, and `multipart/x-mixed-replace` (whose parts a browser renders);
+ * - MHTML and mail (`message/rfc822`, `multipart/related`,
+ *   `application/x-mimearchive`), HTML components (`text/x-component`),
+ *   Flash, and XSLT's older names (`text/x-xslt`, `application/x-xslt`);
  * - every XML type: `text/xml`, `application/xml`, their `-…` variants
  *   (`text/xml-external-parsed-entity`), and any `+xml` suffix (SVG, XHTML,
  *   XSLT, MathML, RSS, Atom …), since a browser renders XML with an XHTML,
@@ -132,6 +135,15 @@ export function replyHeaderProblem(name: unknown, value: unknown): string | unde
 const ACTIVE_TYPES: ReadonlySet<string> = new Set([
   "text/html",
   "multipart/x-mixed-replace",
+  // Web archives and mail a browser may open as a page (MHTML), HTML
+  // components, Flash, and XSLT under its older names (S-025 review).
+  "message/rfc822",
+  "multipart/related",
+  "application/x-mimearchive",
+  "text/x-component",
+  "application/x-shockwave-flash",
+  "text/x-xslt",
+  "application/x-xslt",
   "text/xsl",
   "application/ecmascript",
   "application/javascript",

@@ -783,6 +783,13 @@ describe("active content types (S-025)", () => {
     "text/javascript",
     "application/ecmascript",
     "multipart/x-mixed-replace",
+    "message/rfc822",
+    "multipart/related",
+    "application/x-mimearchive",
+    "text/x-component",
+    "application/x-shockwave-flash",
+    "text/x-xslt",
+    "application/x-xslt",
   ])("counts %s as active", (essence) => {
     expect(isActiveType(essence)).toBe(true);
     expect(contentTypeProblem(`${essence.trim()}; charset=utf-8`)).toMatch(/active content/);
