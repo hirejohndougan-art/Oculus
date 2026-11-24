@@ -1,7 +1,7 @@
 {
   "name": "@oculus/db",
   "version": "0.0.0",
-  "description": "Oculus database access: the pg driver, the sql tag and the migration runner. The only package that imports pg.",
+  "description": "Oculus database access: the pg driver, the sql tag, the migration runner and backup and restore. The only package that imports pg.",
   "license": "MIT",
   "private": true,
   "type": "module",
@@ -16,7 +16,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "db:migrate": "npm --prefix ../core run build && tsc -p tsconfig.build.json && node dist/migrate-cli.js"
+    "db:migrate": "npm --prefix ../core run build && tsc -p tsconfig.build.json && node dist/migrate-cli.js",
+    "db:backup": "npm --prefix ../core run build && tsc -p tsconfig.build.json && exec node dist/backup-cli.js backup",
+    "db:restore": "npm --prefix ../core run build && tsc -p tsconfig.build.json && exec node dist/backup-cli.js restore"
   },
   "devDependencies": {
     "@types/pg": "8.23.1"
