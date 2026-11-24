@@ -711,7 +711,8 @@ describe("the writer role", () => {
         await run(s.owner, "ALTER SUBSCRIPTION %I OWNER TO %I", subscription, probe);
         await run(server, "REVOKE CREATE ON DATABASE %I FROM %I", db, probe);
         await run(server, "REVOKE pg_create_subscription FROM %I", probe);
-        expect(await probeCodes()).toEqual(["owns_object"]);
+        // Any subscription in the database is refused too (S-015).
+        expect(await probeCodes()).toEqual(["owns_object", "subscription"]);
       } finally {
         await run(s.owner, "ALTER SUBSCRIPTION %I SET (slot_name = NONE)", subscription);
         await run(s.owner, "DROP SUBSCRIPTION %I", subscription);
@@ -764,6 +765,143 @@ describe("the writer role", () => {
         return (await checkWriterConnection(q)).map((p) => p.code);
       });
       expect(switched).toEqual(expect.arrayContaining(["superuser", "owner"]));
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("S-015: grant options on the database and schema, triggers not ALWAYS, subscriptions; temporary objects are fine", async () => {
+    await ready();
+    const probe = s.roles[6] ?? "";
+    const db = s.testDb.name;
+    const run = async (on: Database, statement: string, ...names: string[]): Promise<void> => {
+      await on.transaction(async (q) => {
+        await q.rows(sql`SELECT set_config('oculus_test.statement', ${statement}, true),
+                                set_config('oculus_test.a', ${names[0] ?? ""}, true),
+                                set_config('oculus_test.b', ${names[1] ?? ""}, true)`);
+        await q.execute(sql`DO $$ BEGIN
+          EXECUTE format(current_setting('oculus_test.statement'),
+                         current_setting('oculus_test.a'), current_setting('oculus_test.b'));
+        END $$`);
+      });
+    };
+    const probeCodes = async (): Promise<string[]> => {
+      const fresh = as(s.testDb.url, probe);
+      try {
+        return (await createService(fresh).checkConnection()).map((p) => p.code);
+      } finally {
+        await fresh.close();
+      }
+    };
+    const server = openDatabase(testServerUrl(), { max: 1 });
+    try {
+      await s.owner.transaction((q) => grantWriterRole(q, probe));
+      expect(await probeCodes()).toEqual([]);
+      // Grant options on the database and on schema public.
+      for (const [on, grant, revoke, names] of [
+        [
+          server,
+          "GRANT CONNECT ON DATABASE %I TO %I WITH GRANT OPTION",
+          "REVOKE CONNECT ON DATABASE %I FROM %I",
+          [db, probe],
+        ],
+        [
+          server,
+          "GRANT TEMPORARY ON DATABASE %I TO %I WITH GRANT OPTION",
+          "REVOKE TEMPORARY ON DATABASE %I FROM %I",
+          [db, probe],
+        ],
+        [
+          s.owner,
+          "GRANT USAGE ON SCHEMA public TO %I WITH GRANT OPTION",
+          "REVOKE GRANT OPTION FOR USAGE ON SCHEMA public FROM %I",
+          [probe],
+        ],
+      ] as const) {
+        await run(on, grant, ...names);
+        try {
+          const problems = await (async () => {
+            const fresh = as(s.testDb.url, probe);
+            try {
+              return await createService(fresh).checkConnection();
+            } finally {
+              await fresh.close();
+            }
+          })();
+          expect({ grant, found: problems.map((p) => p.code) }).toEqual({
+            grant,
+            found: ["extra_privilege"],
+          });
+          expect(problems[0]?.message).toMatch(/\(grant option\)/);
+        } finally {
+          await run(on, revoke, ...names);
+        }
+        expect({ revoke, found: await probeCodes() }).toEqual({ revoke, found: [] });
+      }
+      // Without the grant option, CONNECT and TEMPORARY to the role are fine.
+      await run(server, "GRANT CONNECT, TEMPORARY ON DATABASE %I TO %I", db, probe);
+      try {
+        expect(await probeCodes()).toEqual([]);
+      } finally {
+        await run(server, "REVOKE CONNECT, TEMPORARY ON DATABASE %I FROM %I", db, probe);
+      }
+      // Temporary objects of the writer's sessions are not "owned objects",
+      // in the session that made them or seen from another one.
+      const holder = as(s.testDb.url, probe);
+      try {
+        await holder.transaction(async (q) => {
+          await q.execute(sql`CREATE TEMPORARY TABLE scratch (n integer) ON COMMIT PRESERVE ROWS`);
+          await q.execute(sql`CREATE TEMPORARY SEQUENCE scratch_numbers`);
+          await q.execute(
+            sql`CREATE FUNCTION pg_temp.scratch_one() RETURNS integer LANGUAGE sql AS 'SELECT 1'`,
+          );
+        });
+        // The pool keeps that connection open, so its temporary objects stay.
+        const [held] = await s.owner.rows<{ n: number }>(sql`
+          SELECT count(*)::integer AS n FROM pg_catalog.pg_shdepend d
+          WHERE d.refobjid = ${probe}::regrole AND d.deptype = 'o'`);
+        expect(held?.n).toBe(3);
+        expect(await probeCodes()).toEqual([]);
+      } finally {
+        await holder.close();
+      }
+      // Any non-internal trigger on public's tables that isn't ALWAYS.
+      const trigger = "zzzz_records_delete_needs_version";
+      for (const state of ["ENABLE", "ENABLE REPLICA", "DISABLE"]) {
+        await run(s.owner, `ALTER TABLE public.records ${state} TRIGGER %I`, trigger);
+        try {
+          const problems = await service.checkConnection();
+          expect({ state, found: problems.map((p) => p.code) }).toEqual({
+            state,
+            found: ["trigger_not_always"],
+          });
+          expect(problems[0]?.message).toContain(`records.${trigger}`);
+          expect({ state, found: await probeCodes() }).toEqual({
+            state,
+            found: ["trigger_not_always"],
+          });
+        } finally {
+          await run(s.owner, "ALTER TABLE public.records ENABLE ALWAYS TRIGGER %I", trigger);
+        }
+      }
+      expect(await service.checkConnection()).toEqual([]);
+      // Any subscription in this database, even the owner's and disabled.
+      const subscription = `s015_${probe}`;
+      await run(
+        s.owner,
+        "CREATE SUBSCRIPTION %I CONNECTION 'dbname=oculus_s015_nowhere' PUBLICATION nothing WITH (connect = false)",
+        subscription,
+      );
+      try {
+        const problems = await service.checkConnection();
+        expect(problems.map((p) => p.code)).toEqual(["subscription"]);
+        expect(problems[0]?.message).toContain(subscription);
+        expect(await probeCodes()).toEqual(["subscription"]);
+      } finally {
+        await run(s.owner, "ALTER SUBSCRIPTION %I SET (slot_name = NONE)", subscription);
+        await run(s.owner, "DROP SUBSCRIPTION %I", subscription);
+      }
+      expect(await service.checkConnection()).toEqual([]);
     } finally {
       await server.close();
     }
