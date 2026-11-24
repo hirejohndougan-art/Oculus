@@ -178,6 +178,20 @@ const EXTRA_KEYS: Readonly<Record<RecordKind, readonly string[]>> = {
   event: [],
 };
 
+/**
+ * Every top-level property a record of each kind may have, as
+ * `validateRecord` allows them (S-028: `changesInheritance` classifies each,
+ * and its test fails when one is added here without being classified).
+ */
+export const RECORD_PROPERTIES: Readonly<Record<RecordKind, readonly string[]>> = Object.freeze(
+  Object.fromEntries(
+    (Object.keys(EXTRA_KEYS) as RecordKind[]).map((kind) => [
+      kind,
+      Object.freeze([...COMMON_KEYS, ...EXTRA_KEYS[kind]]),
+    ]),
+  ) as Record<RecordKind, readonly string[]>,
+);
+
 // ---------------------------------------------------------------------------
 
 /**

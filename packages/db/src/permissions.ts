@@ -21,7 +21,8 @@
  *   arrangement as it is now, so the caller takes the organization's
  *   arrangement lock first (D-065): no unit can move between the check and
  *   COMMIT. Intermediate digital assets are locked `FOR SHARE` so what they
- *   represent can't change either.
+ *   represent can't change either. `placesHolding` gives the same for many
+ *   records in one read (S-028).
  *
  * Nothing here checks who may call it: the service does (packages/service).
  */
@@ -46,6 +47,7 @@ import {
   type UserId,
   type Validated,
 } from "@oculus/core";
+import type { RecordPlace } from "./catalog.js";
 import type { Queryable } from "./client.js";
 import { sql } from "./sql.js";
 
@@ -241,6 +243,142 @@ export async function unitsHolding(
     )
     SELECT id::text AS id FROM up`);
   for (const row of rows) units.add(row.id as RecordId);
+  return units;
+}
+
+/** Where a record sits, and with `units`, the units holding it, from `placesHolding`. */
+export interface PlaceHolding {
+  readonly place: RecordPlace;
+  /** As `unitsHolding` gives them for the record's position; absent without `units`. */
+  readonly units?: ReadonlySet<RecordId>;
+}
+
+interface UpRow {
+  readonly id: string;
+  readonly version: number;
+  readonly kind: string;
+  readonly parent_id: string | null;
+  readonly level: string | null;
+  readonly represents_id: string | null;
+  readonly site_id: string | null;
+}
+
+/**
+ * For many records at once (S-028): each one's place, as `readRecordPlace`
+ * reads it, and with `units: true` the units holding it, exactly as
+ * `unitsHolding` gives them for that place (the record itself for a unit),
+ * taking the same `FOR SHARE` locks on the records a digital asset's chain
+ * passes through (in ID order, in one statement), unless `lock: false`
+ * (for a first look before any row lock, checked again under it). Records that don't
+ * exist in the organization (or IDs that aren't record IDs) are left out.
+ * One statement reads every record above them all (parents of units,
+ * represented records of digital assets); the rest is worked out in
+ * memory. With `units`, take the arrangement lock first, as for
+ * `unitsHolding`.
+ */
+export async function placesHolding(
+  db: Queryable,
+  organizationId: OrganizationId,
+  ids: readonly RecordId[],
+  options: { readonly units: boolean; readonly lock?: boolean },
+): Promise<ReadonlyMap<RecordId, PlaceHolding>> {
+  const found = new Map<RecordId, PlaceHolding>();
+  if (!isOrganizationId(organizationId)) return found;
+  const wanted = [...new Set(ids.filter((id) => isRecordId(id)))].sort();
+  if (wanted.length === 0) return found;
+  const rows = options.units
+    ? await db.rows<UpRow>(sql`
+        WITH RECURSIVE up(id, kind, parent_id, represents_id) AS (
+          SELECT r.id, r.kind, r.parent_id, r.represents_id FROM public.records r
+          WHERE r.organization_id = ${organizationId}::uuid AND r.id = ANY(${wanted}::uuid[])
+          UNION
+          SELECT r.id, r.kind, r.parent_id, r.represents_id FROM up
+          JOIN public.records r ON r.organization_id = ${organizationId}::uuid
+            AND r.id = CASE up.kind
+                         WHEN 'archival_unit' THEN up.parent_id
+                         WHEN 'digital_asset' THEN up.represents_id
+                       END
+        )
+        SELECT r.id::text AS id, r.version, r.kind, r.parent_id::text AS parent_id, r.level,
+               r.represents_id::text AS represents_id, r.site_id::text AS site_id
+        FROM public.records r
+        WHERE r.organization_id = ${organizationId}::uuid AND r.id IN (SELECT id FROM up)`)
+    : await db.rows<UpRow>(sql`
+        SELECT r.id::text AS id, r.version, r.kind, r.parent_id::text AS parent_id, r.level,
+               r.represents_id::text AS represents_id, r.site_id::text AS site_id
+        FROM public.records r
+        WHERE r.organization_id = ${organizationId}::uuid AND r.id = ANY(${wanted}::uuid[])`);
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const locks = new Set<RecordId>();
+  for (const id of wanted) {
+    const row = byId.get(id);
+    if (row === undefined) continue;
+    const place: RecordPlace = Object.freeze({
+      version: row.version,
+      kind: row.kind,
+      parentId: row.parent_id as RecordId | null,
+      level: row.level,
+      represents: row.represents_id as RecordId | null,
+      siteId: row.site_id as SiteId | null,
+    });
+    if (!options.units) {
+      found.set(id, Object.freeze({ place }));
+      continue;
+    }
+    const units = unitsFrom(byId, id, place, locks);
+    found.set(id, Object.freeze({ place, units }));
+  }
+  if (locks.size > 0 && options.lock !== false) {
+    await db.rows(sql`
+      SELECT id FROM public.records
+      WHERE organization_id = ${organizationId}::uuid AND id = ANY(${[...locks].sort()}::uuid[])
+      ORDER BY id
+      FOR SHARE`);
+  }
+  return found;
+}
+
+/**
+ * `unitsHolding` for a stored record at `place`, over rows already read
+ * (`placesHolding`), step for step; the records its digital asset loop
+ * would lock are added to `locks`.
+ */
+function unitsFrom(
+  byId: ReadonlyMap<string, UpRow>,
+  id: RecordId,
+  place: RecordPlace,
+  locks: Set<RecordId>,
+): ReadonlySet<RecordId> {
+  const units = new Set<RecordId>();
+  let start: RecordId | null | undefined;
+  if (place.kind === "archival_unit") {
+    units.add(id);
+    start = place.parentId;
+  } else if (place.kind === "digital_asset") {
+    let target = place.represents;
+    for (let hop = 0; hop < MAX_ASSET_HOPS && target != null && isRecordId(target); hop += 1) {
+      locks.add(target);
+      const row = byId.get(target);
+      if (row === undefined) return units;
+      if (row.kind === "archival_unit") break;
+      if (row.kind !== "digital_asset") return units;
+      target = row.represents_id as RecordId | null;
+    }
+    start = target;
+    if (start == null) return units;
+    if (byId.get(start)?.kind !== "archival_unit") return units;
+  } else {
+    return units;
+  }
+  if (start == null || !isRecordId(start)) return units;
+  // As unitsHolding's walk: units only, at most 70 rows.
+  let at: RecordId | null = start;
+  for (let depth = 1; at !== null && depth <= 70; depth += 1) {
+    const row = byId.get(at);
+    if (row?.kind !== "archival_unit") break;
+    units.add(at);
+    at = row.parent_id as RecordId | null;
+  }
   return units;
 }
 

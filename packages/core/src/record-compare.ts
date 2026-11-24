@@ -123,6 +123,47 @@ function differences(a: CatalogRecord, b: CatalogRecord): readonly RecordDiffere
   return Object.freeze(found);
 }
 
+/**
+ * The properties a change of which can't change what any record below the
+ * changed one inherits, nor where from (S-028). `effectiveRecord` (and so
+ * the publish check and `publicValueSources`) reads, of the records above
+ * a record: their `fields` (every key's presence and value: an empty value
+ * stops inheritance), `templateKey` (the template decides what is
+ * inherited, what stops it and the visibility), `parentId` and `level`
+ * (the chain, and whether it can be trusted), `represents` (a digital
+ * asset's represented record), and `kind` and `organizationId` (which never
+ * change). It reads `title` only into chain steps and staff messages, and
+ * never `recordTypeKey` (the template is always found from `templateKey`),
+ * `mediaType`, `agentType`, `coordinates` or `siteId`; links in other
+ * records' values are checked against the linked record's kind only. A
+ * change of home site (`siteId`) changes no (field, source) pair either,
+ * but it changes who can see the record, so it is not listed here: it
+ * counts as a change. Anything not listed, including any property added to
+ * records later, counts as a change.
+ */
+export const INHERITANCE_INERT_PROPERTIES: ReadonlySet<string> = new Set([
+  "title",
+  "recordTypeKey",
+  "mediaType",
+  "agentType",
+  "coordinates",
+]);
+
+/**
+ * Whether going from `before` to `after` (two copies of one record) can
+ * change what a record below it shows from other records (S-028): true
+ * unless every difference is in `INHERITANCE_INERT_PROPERTIES`. A pair
+ * that can't be compared (either invalid, or not the same record) counts as
+ * a change. The service skips the S-020 dependents check (its locks on
+ * every record below, and its comparison of every published one) only when
+ * this is false.
+ */
+export function changesInheritance(before: unknown, after: unknown): boolean {
+  const compared = compareRecords(before, after);
+  if (!compared.ok) return true;
+  return compared.value.differences.some((d) => !INHERITANCE_INERT_PROPERTIES.has(d.name));
+}
+
 /** True when two JSON values hold the same data (object key order aside). */
 export function sameJson(a: JsonValue, b: JsonValue): boolean {
   if (a === b) return true;

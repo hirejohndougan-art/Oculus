@@ -81,6 +81,7 @@ import {
   MAX_RECORD_CHARS,
   MAX_STRING_LENGTH,
   IssueList,
+  changesInheritance,
   compareRecords,
   droppedIdentifiers,
   holdsAnywhere,
@@ -1070,8 +1071,13 @@ function placeIds(record: CatalogRecord): RecordId[] {
 /**
  * The most published records below an edited record whose public output an
  * edit by anyone but a system manager compares before and after (S-020).
+ * Only edits that can change what they inherit are compared, so only those
+ * meet the cap (S-028).
  */
 const MAX_WATCHED_DEPENDENTS = 500;
+
+/** `watchDependents`'s answer when nothing below needs comparing (S-028). */
+const NOTHING_WATCHED = { ok: true, watched: undefined } as const;
 
 /** A (field, source) pair as one comparable string (S-020). */
 function pairKey(pair: PublicValueSource): string {
@@ -1202,13 +1208,56 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
   }
 
   /**
+   * S-028: whether an edit or restore of `recordId` must lock the records
+   * below it (`lockBelow`) and compare the published ones
+   * (`watchDependents`), decided before the record's row lock from a look
+   * that locks no row (so it can't take a lock out of the below, record,
+   * above order). False for a system manager; false when the look says the
+   * write will be refused anyway (no such record, not at the version the
+   * person saw, or the actor may not make it there: `all` and `any` as for
+   * `onRecord`, `allowsUnlocked`), since then nothing is written; otherwise
+   * whether going from the stored record to `after(stored)` changes
+   * inheritance (`changesInheritance`), or always with `always` (numbers
+   * saved with the edit). What it can't read (the stored record, or one
+   * saved since the look) counts as a change, so the locks are taken as
+   * before. Every answer holds only at that version: under the row lock the
+   * operation refuses another version (or starts again), works out whether
+   * it changes inheritance again, and starts again (`retry`) if it needs the
+   * locks and didn't take them.
+   */
+  async function belowAtStake(
+    tx: Queryable,
+    checker: RecordAccess,
+    organizationId: OrganizationId,
+    recordId: RecordId,
+    expectedVersion: number,
+    permissions: { readonly all: readonly Permission[]; readonly any: readonly Permission[] },
+    after: ((stored: CatalogRecord) => unknown) | undefined,
+    always = false,
+  ): Promise<boolean> {
+    if (checker.access.systemManager) return false;
+    const look = await checker.allowsUnlocked(recordId, permissions.all, permissions.any);
+    // Refused below either way: no such record, a version conflict (or a
+    // retry), or not permitted.
+    if (look?.version !== expectedVersion || !look.allowed) return false;
+    // Nothing to write (an unknown or unreadable version to restore).
+    if (after === undefined) return false;
+    if (always) return true;
+    const stored = await readStoredRecord(tx, organizationId, recordId);
+    if (stored === undefined || !stored.ok || stored.value.version !== look.version) return true;
+    return changesInheritance(stored.value.record, after(stored.value.record));
+  }
+
+  /**
    * Before an edit or restore of `recordId` locks the record's row (S-020):
    * locks every record below it and every scan of them `FOR SHARE`, so none
    * can be published, withdrawn or changed until COMMIT (publishing one
    * takes `FOR NO KEY UPDATE` on it, then locks its chain, this record
    * included). Lower records first, then the record, then the records
    * above it (`lockAbove`): the order every edit and publication follows.
-   * Not for a system manager, who sees every record. Returns what it locked.
+   * Not for a system manager, who sees every record, and (S-028) only when
+   * `belowAtStake` says the edit can go ahead and change what they inherit.
+   * Returns what it locked.
    */
   async function lockBelow(
     tx: Queryable,
@@ -1674,8 +1723,30 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         const seen = await readRecordPlace(tx, org, recordId);
         if (seen === undefined) return noSuchRecord();
         if (movesInArrangement(seen, content)) await lockArrangement(tx, org);
-        // The records below it first, so none is published meanwhile (S-020).
-        const lockedBelow = await lockBelow(tx, checker, org, recordId);
+        const identifiers = own(opts.value, "identifiers");
+        // The records below it first, so none is published meanwhile
+        // (S-020), when the edit may go ahead and can change what they
+        // inherit (S-028).
+        const atStake = await belowAtStake(
+          tx,
+          checker,
+          org,
+          recordId,
+          expected.value,
+          { all: [], any: editPermissions(seen.kind) },
+          (stored) => ({
+            fields: {},
+            ...(stored.siteId === undefined ? {} : { siteId: stored.siteId }),
+            ...content,
+            kind: stored.kind,
+            id: stored.id,
+            organizationId: org,
+            createdAt: stored.createdAt,
+            updatedAt: stored.updatedAt,
+          }),
+          identifiers !== undefined,
+        );
+        const lockedBelow = atStake ? await lockBelow(tx, checker, org, recordId) : undefined;
         // Then the row, and its place as it stays until COMMIT: that is what
         // the permissions are checked against.
         const place = await lockedPlace(tx, org, recordId, "no_key_update");
@@ -1768,21 +1839,21 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         const moved = await moveIssues(tx, checker, recordId, before, record);
         if (moved) return moved;
         // What the published records below it (and scans of them) show from
-        // other records now (S-020): the edit may change what they inherit.
-        const watch = await watchDependents(
-          tx,
-          checker,
-          org,
-          recordId,
-          placeIds(record),
-          lockedBelow,
-        );
+        // other records now (S-020), if the edit can change what they
+        // inherit (S-028): the same answer `belowAtStake` gave, now under
+        // the row lock (the record is still at the version it read).
+        const watching =
+          !checker.access.systemManager &&
+          (identifiers !== undefined || changesInheritance(before, record));
+        if (watching && lockedBelow === undefined) return retryRefusal();
+        const watch = watching
+          ? await watchDependents(tx, checker, org, recordId, placeIds(record), lockedBelow)
+          : NOTHING_WATCHED;
         if (!watch.ok) return watch;
         const dependentsBefore = watch.watched;
         if (record.templateKey === undefined) {
           return refusal(["templateKey"], "no_template_key", "Every record names its template.");
         }
-        const identifiers = own(opts.value, "identifiers");
         const compared = compareRecords(before, record);
         if (!compared.ok) return compared;
         if (compared.value.differences.length === 0 && identifiers === undefined) {
@@ -1927,8 +1998,27 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
             ? ({ ...stored, siteId: seen.siteId } as CatalogRecord)
             : stored;
         if (old !== undefined && movesInArrangement(seen, old)) await lockArrangement(tx, org);
-        // The records below it first, so none is published meanwhile (S-020).
-        const lockedBelow = await lockBelow(tx, checker, org, recordId);
+        // The records below it first, so none is published meanwhile
+        // (S-020), when the restore may go ahead and can change what they
+        // inherit (S-028). As the database's restore builds it: the old
+        // version, keeping the home site when it names none.
+        const restoredFrom = (current: CatalogRecord): unknown => ({
+          ...stored,
+          ...(stored?.siteId === undefined && current.siteId !== undefined
+            ? { siteId: current.siteId }
+            : {}),
+          updatedAt: current.updatedAt,
+        });
+        const atStake = await belowAtStake(
+          tx,
+          checker,
+          org,
+          recordId,
+          expected.value,
+          { all: ["records.history"], any: editPermissions(seen.kind) },
+          stored === undefined ? undefined : restoredFrom,
+        );
+        const lockedBelow = atStake ? await lockBelow(tx, checker, org, recordId) : undefined;
         // Then the row, and the place it is checked at, as it stays until COMMIT.
         const place = await lockedPlace(tx, org, recordId, "no_key_update");
         if (place === undefined) return noSuchRecord();
@@ -1962,14 +2052,27 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         }
         let hiddenLinks: ReadonlySet<RecordId> = new Set();
         let hiddenParent = false;
-        const watch = await watchDependents(
-          tx,
-          checker,
-          org,
-          recordId,
-          old === undefined ? [] : placeIds(old),
-          lockedBelow,
-        );
+        // The record as it stays until COMMIT (its row is locked).
+        const current =
+          old === undefined || checker.access.systemManager
+            ? undefined
+            : await readStoredRecord(tx, org, recordId);
+        // What the published records below it show from other records now
+        // (S-020), if the restore can change what they inherit (S-028): the
+        // same answer `belowAtStake` gave, now under the row lock. Not when
+        // the restore is refused anyway (another version than the person
+        // saw: the database's restore refuses it).
+        const watching =
+          old !== undefined &&
+          !checker.access.systemManager &&
+          place.version === expected.value &&
+          (current === undefined ||
+            !current.ok ||
+            changesInheritance(current.value.record, restoredFrom(current.value.record)));
+        if (watching && lockedBelow === undefined) return retryRefusal();
+        const watch = watching
+          ? await watchDependents(tx, checker, org, recordId, placeIds(old), lockedBelow)
+          : NOTHING_WATCHED;
         if (!watch.ok) return watch;
         const dependentsBefore = watch.watched;
         if (old !== undefined) {
@@ -1979,7 +2082,6 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           const below = await hiddenChildrenIssue(tx, checker, place, old, place.siteId);
           if (below) return below;
           if (!checker.access.systemManager) {
-            const current = await readStoredRecord(tx, org, recordId);
             hiddenLinks = await checker.hiddenAmong(
               addedLinks(old, current?.ok ? current.value.record : undefined),
             );
