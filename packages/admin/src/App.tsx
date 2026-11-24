@@ -17,7 +17,7 @@ import { RouterProvider as AriaRouterProvider } from "react-aria-components";
 import { ApiError } from "./api";
 import { Frame } from "./frame/Frame";
 import { Home } from "./frame/Home";
-import { SiteHome } from "./frame/SiteHome";
+import { SiteHome, SiteNewRecord, SiteRecord, SiteReview } from "./frame/SiteHome";
 import { Code } from "./screens/Code";
 import { ResetComplete } from "./screens/ResetComplete";
 import { ResetRequest } from "./screens/ResetRequest";
@@ -61,6 +61,9 @@ export const ROUTES: RouteObject[] = [
         children: [
           { index: true, element: <Home /> },
           { path: "sites/:siteId", element: <SiteHome /> },
+          { path: "sites/:siteId/review", element: <SiteReview /> },
+          { path: "sites/:siteId/records/new", element: <SiteNewRecord /> },
+          { path: "sites/:siteId/records/:recordId", element: <SiteRecord /> },
         ],
       },
     ],

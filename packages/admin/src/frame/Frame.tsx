@@ -5,7 +5,7 @@
  * sign-in sits inside it. A skip link jumps past the sidebar.
  */
 import { useState } from "react";
-import { Navigate, Outlet, useNavigate, useParams } from "react-router";
+import { NavLink, Navigate, Outlet, useNavigate, useParams } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   Button as AriaButton,
@@ -20,6 +20,8 @@ import { Button, Note } from "../components/ui";
 import type { Me, SiteChoice } from "../types";
 import styles from "./Frame.module.css";
 import { SiteSelector } from "./SiteSelector";
+import { forgetLists } from "../records/ItemList";
+import { useSiteAbilities } from "../records/queries";
 import { ME_KEY, useMe } from "./useMe";
 
 /** Up to two initials for the round account button. */
@@ -43,6 +45,11 @@ export function Frame() {
   const queries = useQueryClient();
   const { siteId } = useParams();
   const me = useMe();
+  const signedIn = me.data;
+  const here = signedIn?.sites.find(
+    (s) => s.siteId === siteId && s.organizationId === signedIn.organizationId,
+  );
+  const abilities = useSiteAbilities(here?.siteId);
   const [status, setStatus] = useState<{
     tone: "green" | "amber";
     text: string;
@@ -87,6 +94,7 @@ export function Frame() {
     setStatus(undefined);
     setCsrfToken(null);
     queries.clear();
+    forgetLists();
     await navigate("/sign-in", {
       replace: true,
       state: { notice: "You are signed out." },
@@ -147,6 +155,22 @@ export function Frame() {
             isDisabled={switching}
           />
         ) : null}
+        {here === undefined ? null : (
+          <ul className={styles.navList}>
+            <li>
+              <NavLink className={styles.navLink} to={`/sites/${here.siteId}`} end>
+                Item records
+              </NavLink>
+            </li>
+            {abilities.data?.review === true ? (
+              <li>
+                <NavLink className={styles.navLink} to={`/sites/${here.siteId}/review`}>
+                  Waiting for review
+                </NavLink>
+              </li>
+            ) : null}
+          </ul>
+        )}
       </nav>
       <div className={styles.body}>
         <header className={styles.topbar}>
