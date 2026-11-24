@@ -85,6 +85,8 @@ export interface World {
   stranger: UserId;
   /** Donor relations on A1: no catalog record permission (D-072). */
   donor: UserId;
+  /** Makes (or reuses, by name) an invented person and adds them to the organization. */
+  member: (organizationId: OrganizationId, name: string) => Promise<UserId>;
 }
 
 async function catalog(db: Database, org: OrganizationId): Promise<void> {
@@ -170,6 +172,7 @@ export async function makeWorld(
     other,
     stranger,
     donor,
+    member: (organizationId, name) => folks.member(organizationId, name),
   };
 }
 

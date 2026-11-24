@@ -3,7 +3,7 @@
  * (T-032, D-067), checking who may do what in the same transaction (T-041,
  * D-072). No HTTP here; `packages/api` wraps it (T-042).
  */
-export { createService } from "./service.js";
+export { createService, MAX_VERSION_PAGE } from "./service.js";
 export type {
   RecordService,
   ServiceContext,
@@ -18,6 +18,9 @@ export type {
   RestoreOptions,
   DeleteOptions,
   ReadRecord,
+  VersionSummary,
+  VersionList,
+  ReviewQueue,
   WorkflowOptions,
   WorkflowChange,
   PublicChange,

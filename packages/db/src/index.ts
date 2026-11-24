@@ -88,8 +88,15 @@ export {
   recordClosureIds,
   lockRecordsShared,
   readWorkflowState,
+  recordsInState,
+  MAX_STATE_LIST_LIMIT,
 } from "./workflow.js";
-export type { PublicRecordOptions, PublicValueSource, WorkflowChangeResult } from "./workflow.js";
+export type {
+  PublicRecordOptions,
+  PublicValueSource,
+  StateListEntry,
+  WorkflowChangeResult,
+} from "./workflow.js";
 export type { RecordDeletion, RecordDeletionResult } from "./record-delete.js";
 export {
   grantWriterRole,

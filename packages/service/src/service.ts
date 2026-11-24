@@ -69,6 +69,13 @@
  * through `definitions.ts` (`catalog.definitions`, and D-076's gate for
  * changes that make values public on published records).
  *
+ * **History and the approval queue** (T-043, D-082): `listVersions`,
+ * `readRecordVersion` and `compareRecordVersions` need `records.history`
+ * where the record is now (read-only people see no old versions, D-072),
+ * and answer a version the record doesn't have only after that check;
+ * `reviewQueue` lists records sent for review on the whole sites where the
+ * person may publish.
+ *
  * Not here yet: loans and accessions (no tables yet; when they are stored,
  * closing a loan by an accession happens here, from the register and loan
  * book read in the same transaction, never from ones a caller hands in,
@@ -101,6 +108,7 @@ import {
   type Issue,
   type JsonValue,
   type OrganizationId,
+  type Access,
   type Permission,
   type RecordId,
   type RecordIdentifiers,
@@ -144,10 +152,13 @@ import {
   readStoredRecord,
   readTemplate,
   readVersion,
+  readVersions,
+  compareVersions,
   grantsScopedTo,
   hasRecordsBelow,
   childrenOffSite,
   readWorkflowState,
+  recordsInState,
   recordCheckIssues,
   refreshRecordTerms,
   restoreVersion as restoreStoredVersion,
@@ -159,11 +170,14 @@ import {
   type RecordDeletion,
   type RecordPlace,
   type RecordPosition,
+  type RecordAction,
   type RecordVersion,
   type SearchResults,
+  type VersionComparison,
   type VersionConflict,
   type WriterRoleProblem,
   type PublicValueSource,
+  type StateListEntry,
   sql,
 } from "@oculus/db";
 
@@ -344,12 +358,80 @@ export interface RecordCheck {
 export interface ReadRecord {
   readonly record: CatalogRecord;
   readonly version: number;
+  /** Its workflow state (D-075, D-076), read under the same row lock. */
+  readonly state: WorkflowState;
 }
+
+/**
+ * One version in a record's history, without the record's content (T-043,
+ * D-082): who, when, why, what changed (names only) and the action.
+ */
+export interface VersionSummary {
+  readonly version: number;
+  readonly actor: string;
+  readonly recordedAt: string;
+  readonly changedFields: readonly string[];
+  readonly reason?: string;
+  readonly action: RecordAction;
+  readonly workflowState: WorkflowState;
+}
+
+/** A page of a record's history, oldest first. */
+export interface VersionList {
+  readonly versions: readonly VersionSummary[];
+  /** True when there are more: ask again with `after` the last version listed. */
+  readonly truncated: boolean;
+}
+
+/** A page of the approval queue: records sent for review (T-043, D-082). */
+export interface ReviewQueue {
+  readonly records: readonly StateListEntry[];
+  /** Present when there are more: pass it as `after` for the next page. */
+  readonly next?: RecordId;
+}
+
+/** At most this many versions in one page of `listVersions`. */
+export const MAX_VERSION_PAGE = 100;
 
 /** The service: every write of a record and its related rows, and who may make them. */
 export interface RecordService extends AdminOperations, DefinitionOperations {
   /** The record as stored, for someone who may view it (`records.view`). */
   readRecord(context: ServiceContext, recordId: RecordId): Promise<ServiceResult<ReadRecord>>;
+  /**
+   * The record's history, oldest first, without content (T-043, D-082):
+   * `records.view` and `records.history` where the record is now (D-072:
+   * read-only people don't see old versions). `options`: `after` (a
+   * version number) and `limit` (1 to `MAX_VERSION_PAGE`, default 50). A
+   * deleted record has no row to check a place at, so it is
+   * `unknown_record` here.
+   */
+  listVersions(
+    context: ServiceContext,
+    recordId: RecordId,
+    options?: unknown,
+  ): Promise<ServiceResult<VersionList>>;
+  /** One version with its whole content, with the same permissions as `listVersions`. */
+  readRecordVersion(
+    context: ServiceContext,
+    recordId: RecordId,
+    version: number,
+  ): Promise<ServiceResult<RecordVersion>>;
+  /** Two versions compared field by field (D-065), with the same permissions as `listVersions`. */
+  compareRecordVersions(
+    context: ServiceContext,
+    recordId: RecordId,
+    from: number,
+    to: number,
+  ): Promise<ServiceResult<VersionComparison>>;
+  /**
+   * The approval queue (T-043, D-082): records `ready_for_review` on the
+   * whole sites where the person may publish (`records.publish` granted for
+   * the whole catalog there; every record for a system manager), ordered by
+   * ID. `options`: `limit` (1 to 100, default 50) and `after` (the previous
+   * page's `next`). Someone who may publish nowhere is `not_permitted`.
+   * Scoped publish grants don't add records here yet (as search, D-079).
+   */
+  reviewQueue(context: ServiceContext, options?: unknown): Promise<ServiceResult<ReviewQueue>>;
   /** Makes a new record from `draft` (no ID: the service makes it), checked, with its version 1. */
   createRecord(
     context: ServiceContext,
@@ -452,6 +534,64 @@ function refusal(
   message: string,
 ): ServiceRefusal {
   return { ok: false, issues: [issue(path, code, message)] };
+}
+
+/** A version number (`min` and up, below 2^31 - 1). */
+function isWholeNumber(value: unknown, min: number): value is number {
+  return (
+    typeof value === "number" && Number.isInteger(value) && value >= min && value < 2 ** 31 - 1
+  );
+}
+
+/** A version the record doesn't have (asked only once the person may read its history). */
+function noSuchVersion(path: readonly (string | number)[]): ServiceRefusal {
+  return refusal(path, "unknown_version", "The record has no such version.");
+}
+
+/** A stored version that no longer reads as valid: a repair job, never the person's text. */
+function unreadableHistory(): ServiceRefusal {
+  return refusal(
+    ["recordId"],
+    "unreadable_record",
+    "A stored version no longer reads as a valid record; it needs repair.",
+  );
+}
+
+/** A version without its content. */
+function versionSummary(v: RecordVersion): VersionSummary {
+  return Object.freeze({
+    version: v.version,
+    actor: v.actor,
+    recordedAt: v.recordedAt,
+    changedFields: v.changedFields,
+    ...(v.reason === undefined ? {} : { reason: v.reason }),
+    action: v.action,
+    workflowState: v.workflowState,
+  });
+}
+
+/**
+ * The whole sites on which the person holds `permission` for every record
+ * (D-074, D-079): a system manager every record (`"all"`); anyone else the
+ * sites of their whole-catalog grants holding it (every site of the
+ * organization for a grant on every site, never records on no site).
+ * Scoped grants (a unit's subtree) don't count: filtering by subtree in the
+ * query is a later task, and filtering a page afterwards would show, by a
+ * short page, that hidden records matched.
+ */
+async function wholeSites(
+  tx: Queryable,
+  organizationId: OrganizationId,
+  access: Access,
+  permission: Permission,
+): Promise<"all" | readonly string[]> {
+  if (access.systemManager) return "all";
+  const holding = access.grants.filter(
+    (g) =>
+      g.scope === null && (ROLE_PERMISSIONS[g.role] as readonly Permission[]).includes(permission),
+  );
+  if (holding.some((g) => g.siteId === null)) return organizationSiteIds(tx, organizationId);
+  return [...new Set(holding.map((g) => g.siteId as string))];
 }
 
 /** Thrown inside a transaction to roll it back and return the refusal. */
@@ -2176,9 +2316,115 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
             "The stored record no longer reads as a valid record; it needs repair.",
           );
         }
+        // The row is locked FOR SHARE, so the state is the record's as read.
+        const state = await readWorkflowState(tx, who.organizationId, recordId);
+        if (state === undefined) return noSuchRecord();
         return {
           ok: true,
-          value: Object.freeze({ record: stored.value.record, version: stored.value.version }),
+          value: Object.freeze({
+            record: stored.value.record,
+            version: stored.value.version,
+            state: state.state,
+          }),
+        };
+      });
+    },
+
+    async listVersions(context, recordId, listOptions) {
+      return run("listVersions", context, async (tx, who): Promise<ServiceResult<VersionList>> => {
+        if (!isRecordId(recordId)) {
+          return refusal(["recordId"], "invalid_id", "A record ID is a lowercase version 4 UUID.");
+        }
+        const opts = readOptions(listOptions, ["after", "limit"]);
+        if (!opts.ok) return opts;
+        const after = own(opts.value, "after") ?? 0;
+        const limit = own(opts.value, "limit") ?? 50;
+        if (!isWholeNumber(after, 0)) {
+          return refusal(["after"], "invalid_version", "A version is a whole number from 1.");
+        }
+        if (!isWholeNumber(limit, 1) || limit > MAX_VERSION_PAGE) {
+          return refusal(
+            ["limit"],
+            "invalid_limit",
+            `The limit is a whole number from 1 to ${String(MAX_VERSION_PAGE)}.`,
+          );
+        }
+        const allowed = await mayChange(tx, who, recordId, "share", ["records.history"]);
+        if (!allowed.ok) return allowed;
+        const read = await readVersions(tx, who.organizationId, recordId, { after, limit });
+        if (!read.ok) return unreadableHistory();
+        return {
+          ok: true,
+          value: Object.freeze({
+            versions: Object.freeze(read.value.versions.map(versionSummary)),
+            truncated: read.value.truncated,
+          }),
+        };
+      });
+    },
+
+    async readRecordVersion(context, recordId, version) {
+      return run("readRecordVersion", context, async (tx, who) => {
+        if (!isRecordId(recordId)) {
+          return refusal(["recordId"], "invalid_id", "A record ID is a lowercase version 4 UUID.");
+        }
+        const allowed = await mayChange(tx, who, recordId, "share", ["records.history"]);
+        if (!allowed.ok) return allowed;
+        if (!isWholeNumber(version, 1)) return noSuchVersion(["version"]);
+        const read = await readVersion(tx, who.organizationId, recordId, version);
+        if (read === undefined) return noSuchVersion(["version"]);
+        if (!read.ok) return unreadableHistory();
+        return read;
+      });
+    },
+
+    async compareRecordVersions(context, recordId, from, to) {
+      return run("compareRecordVersions", context, async (tx, who) => {
+        if (!isRecordId(recordId)) {
+          return refusal(["recordId"], "invalid_id", "A record ID is a lowercase version 4 UUID.");
+        }
+        const allowed = await mayChange(tx, who, recordId, "share", ["records.history"]);
+        if (!allowed.ok) return allowed;
+        if (!isWholeNumber(from, 1)) return noSuchVersion(["from"]);
+        if (!isWholeNumber(to, 1)) return noSuchVersion(["to"]);
+        const compared = await compareVersions(tx, who.organizationId, recordId, from, to);
+        if (compared.ok) return compared;
+        const missing = compared.issues.find((i) => i.code === "unknown_version");
+        if (missing !== undefined) return noSuchVersion(missing.path);
+        return unreadableHistory();
+      });
+    },
+
+    async reviewQueue(context, queueOptions) {
+      return run("reviewQueue", context, async (tx, who): Promise<ServiceResult<ReviewQueue>> => {
+        const org = who.organizationId;
+        const opts = readOptions(queueOptions, ["limit", "after"]);
+        if (!opts.ok) return opts;
+        const limit = own(opts.value, "limit") ?? 50;
+        if (!isWholeNumber(limit, 1) || limit > 100) {
+          return refusal(["limit"], "invalid_limit", "The limit is a whole number from 1 to 100.");
+        }
+        const after = own(opts.value, "after");
+        if (after !== undefined && !isRecordId(after)) {
+          return refusal(["after"], "invalid_after", "after is the previous page's next.");
+        }
+        const access = await readAccess(tx, org, who.actor);
+        if (!access.ok) return access;
+        if (!holdsAnywhere(access.value, "records.publish")) return notPermitted();
+        const sites = await wholeSites(tx, org, access.value, "records.publish");
+        const listed = await recordsInState(tx, org, "ready_for_review", {
+          sites: sites as "all" | readonly SiteId[],
+          limit,
+          ...(after === undefined ? {} : { after }),
+        });
+        if (!listed.ok) return listed;
+        const last = listed.value.records.at(-1);
+        return {
+          ok: true,
+          value: Object.freeze({
+            records: listed.value.records,
+            ...(listed.value.truncated && last !== undefined ? { next: last.id } : {}),
+          }),
         };
       });
     },
@@ -2330,28 +2576,8 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         const access = await readAccess(tx, org, who.actor);
         if (!access.ok) return access;
         if (!holdsAnywhere(access.value, "records.view")) return notPermitted();
-        // Only whole sites the person sees every record of (D-074): a
-        // system manager every record; anyone else the sites of their
-        // whole-catalog view grants (every site of the organization for a
-        // grant on every site, never records on no site). Scoped grants
-        // (a unit's subtree) don't widen search yet (D-079): filtering by
-        // subtree in the query is a later task, and filtering the page
-        // afterwards would show, by a short page, that hidden records matched.
-        let sites: "all" | readonly string[];
-        if (access.value.systemManager) {
-          sites = "all";
-        } else {
-          const viewing = access.value.grants.filter(
-            (g) =>
-              g.scope === null &&
-              (ROLE_PERMISSIONS[g.role] as readonly Permission[]).includes("records.view"),
-          );
-          if (viewing.some((g) => g.siteId === null)) {
-            sites = await organizationSiteIds(tx, org);
-          } else {
-            sites = [...new Set(viewing.map((g) => g.siteId as string))];
-          }
-        }
+        // Only whole sites the person sees every record of (D-074, D-079).
+        const sites = await wholeSites(tx, org, access.value, "records.view");
         // D-066: a statement_timeout for the search's own statement, so a
         // costly query stops instead of holding a connection. SET LOCAL
         // ends with this transaction.

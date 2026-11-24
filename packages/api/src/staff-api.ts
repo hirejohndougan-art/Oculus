@@ -36,10 +36,24 @@
  * (`redactedError`: the error's class name and SQLSTATE or system code
  * only, never its message, `detail`, `where` or bound values, D-068).
  *
+ * History, restore and the workflow (T-043, D-082): a record's versions
+ * (a page of summaries, one version's content, two compared) for people
+ * holding `records.history` where the record is (read-only people see no
+ * old versions, D-072); restoring a version (`If-Match` the current
+ * version, the service's `restoreVersion` with its S-020/S-028 checks and
+ * lock order); and the four workflow moves of D-075/D-076 (`If-Match`,
+ * optional `reason`), each checked by the service: sending for review and
+ * back to draft need the edit permission, publishing and withdrawing
+ * `records.publish`; and the approval queue (records sent for review on
+ * the whole sites where the person may publish). Every one of them
+ * answers a record that doesn't
+ * exist, one on another site and another organization's alike (`404
+ * not_found`), and a version the record doesn't have the same way, but
+ * only once the person may read its history.
+ *
  * Not here: signing in, the second step, password reset and signing out
  * (T-045 adds those routes beside these, with `credentials: true` for the
- * 8 KiB limit, and writes the cookie through the reply's cookie writer);
- * history, restore, workflow and publishing (T-043).
+ * 8 KiB limit, and writes the cookie through the reply's cookie writer).
  */
 import {
   checkCsrfToken,
@@ -55,6 +69,7 @@ import {
   type RecordService,
   type ServiceContext,
   type ServiceRefusal,
+  type WorkflowOptions,
 } from "@oculus/service";
 import { OCULUS_COOKIES } from "./cookies.js";
 import { Refusal } from "./errors.js";
@@ -227,10 +242,39 @@ function queryNumber(request: OculusRequest, name: string, max: number): number 
   return n;
 }
 
+/**
+ * A version number from the path or the query: a whole number from 1, or
+ * 0 for anything else, which the service answers as a version the record
+ * doesn't have (only once the person may read its history, so a malformed
+ * number says nothing about a record they can't see).
+ */
+function versionNumber(text: string | undefined): number {
+  if (text === undefined || !/^[1-9][0-9]{0,9}$/.test(text)) return 0;
+  const n = Number(text);
+  return n < 2 ** 31 - 1 ? n : 0;
+}
+
+/** An optional body of a workflow move or a restore: only `allowed` keys. */
+function optionalBody(
+  request: OculusRequest,
+  allowed: readonly string[],
+  reply: OculusReply,
+):
+  | { readonly body: Readonly<Record<string, unknown>> }
+  | { readonly error: string; readonly issues: readonly Issue[] } {
+  if (request.body === undefined) return { body: {} };
+  const body = objectBody(request);
+  const extra = onlyKeys(body, allowed, reply);
+  return extra ?? { body };
+}
+
 // ---------------------------------------------------------------------------
 // Service answers as HTTP replies
 
 const MISSING_CODES: ReadonlySet<string> = new Set(["unknown_record", "invalid_id"]);
+/** A version the record doesn't have: the service asks only after the history permission. */
+const NO_VERSION_CODES: ReadonlySet<string> = new Set(["unknown_version", "invalid_version"]);
+const VERSION_PATHS: ReadonlySet<string> = new Set(["version", "from", "to"]);
 const SERVER_FAULTS: ReadonlySet<string> = new Set([
   "internal_error",
   "writer_role_refused",
@@ -259,6 +303,9 @@ function refused(result: ServiceRefusal, reply: OculusReply, log: (r: ApiLogReco
     issues.every(
       (i) =>
         (MISSING_CODES.has(i.code) && onPath(i, "recordId")) ||
+        (NO_VERSION_CODES.has(i.code) &&
+          i.path.length === 1 &&
+          VERSION_PATHS.has(String(i.path[0]))) ||
         (i.code === "unknown_template" && onPath(i, "key")),
     )
   ) {
@@ -369,6 +416,31 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
 
   const recordId = (request: OculusRequest): RecordId => request.params.id as RecordId;
 
+  /** One of D-075's moves: `If-Match` the version seen, an optional `{ reason }`. */
+  function workflowRoute(
+    path: string,
+    move: "submitForReview" | "returnToDraft" | "publish" | "withdraw",
+  ): OculusRoute {
+    return {
+      method: "POST",
+      path,
+      handler: signedIn("write", true, async (request, reply, { context }) => {
+        const expectedVersion = ifMatchVersion(request);
+        const read = optionalBody(request, ["reason"], reply);
+        if ("error" in read) return read;
+        const options: WorkflowOptions = {
+          expectedVersion,
+          ...(read.body.reason === undefined ? {} : { reason: read.body.reason as string }),
+        };
+        const result = await service[move](context, recordId(request), options);
+        return answer(result, reply, (value) => {
+          reply.header("etag", `"v${String(value.version)}"`);
+          return value;
+        });
+      }),
+    };
+  }
+
   return [
     {
       method: "GET",
@@ -394,7 +466,7 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
         const result = await service.readRecord(context, recordId(request));
         return answer(result, reply, (value) => {
           reply.header("etag", `"v${String(value.version)}"`);
-          return { record: value.record, version: value.version };
+          return { record: value.record, version: value.version, state: value.state };
         });
       }),
     },
@@ -499,6 +571,90 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
         return answer(result, reply, (value) => value);
       }),
     },
+    {
+      method: "GET",
+      path: "/api/records/:id/versions",
+      handler: signedIn("read", false, async (request, reply, { context }) => {
+        const limit = queryNumber(request, "limit", 100);
+        const after = queryNumber(request, "after", 2 ** 31 - 2);
+        const result = await service.listVersions(context, recordId(request), {
+          ...(limit === undefined ? {} : { limit }),
+          ...(after === undefined ? {} : { after }),
+        });
+        return answer(result, reply, (value) => ({
+          versions: value.versions,
+          next: value.truncated ? (value.versions.at(-1)?.version ?? null) : null,
+        }));
+      }),
+    },
+    {
+      method: "GET",
+      path: "/api/records/:id/versions/:version",
+      handler: signedIn("read", false, async (request, reply, { context }) => {
+        const result = await service.readRecordVersion(
+          context,
+          recordId(request),
+          versionNumber(request.params.version),
+        );
+        return answer(result, reply, (value) => ({ version: value }));
+      }),
+    },
+    {
+      method: "GET",
+      path: "/api/records/:id/compare",
+      handler: signedIn("read", false, async (request, reply, { context }) => {
+        const result = await service.compareRecordVersions(
+          context,
+          recordId(request),
+          versionNumber(queryText(request, "from")),
+          versionNumber(queryText(request, "to")),
+        );
+        return answer(result, reply, (value) => value);
+      }),
+    },
+    {
+      method: "POST",
+      path: "/api/records/:id/versions/:version/restore",
+      handler: signedIn("write", true, async (request, reply, { context }) => {
+        const expectedVersion = ifMatchVersion(request);
+        const read = optionalBody(request, ["reason", "confirmMadePublic"], reply);
+        if ("error" in read) return read;
+        const options: Record<string, unknown> = { expectedVersion };
+        for (const key of ["reason", "confirmMadePublic"]) {
+          if (read.body[key] !== undefined) options[key] = read.body[key];
+        }
+        const result = await service.restoreVersion(
+          context,
+          recordId(request),
+          versionNumber(request.params.version),
+          options as never,
+        );
+        return answer(result, reply, (value) => {
+          reply.header("etag", `"v${String(value.version)}"`);
+          return { record: value.record, version: value.version };
+        });
+      }),
+    },
+    {
+      method: "GET",
+      path: "/api/review-queue",
+      handler: signedIn("read", false, async (request, reply, { context }) => {
+        const limit = queryNumber(request, "limit", 100);
+        const after = queryText(request, "after");
+        const result = await service.reviewQueue(context, {
+          ...(limit === undefined ? {} : { limit }),
+          ...(after === undefined ? {} : { after }),
+        });
+        return answer(result, reply, (value) => ({
+          records: value.records,
+          next: value.next ?? null,
+        }));
+      }),
+    },
+    workflowRoute("/api/records/:id/submit-for-review", "submitForReview"),
+    workflowRoute("/api/records/:id/return-to-draft", "returnToDraft"),
+    workflowRoute("/api/records/:id/publish", "publish"),
+    workflowRoute("/api/records/:id/withdraw", "withdraw"),
     {
       method: "GET",
       path: "/api/templates",

@@ -145,6 +145,96 @@ export async function readWorkflowState(
   return Object.freeze({ state: row.workflow_state, version: row.version });
 }
 
+/** A record in a workflow state, as `recordsInState` lists it (staff only). */
+export interface StateListEntry {
+  readonly id: RecordId;
+  readonly kind: string;
+  readonly title: string;
+  readonly siteId: SiteId | null;
+  /** The record's version now: a move needs it as `expectedVersion`. */
+  readonly version: number;
+  readonly updatedAt: string;
+}
+
+export const MAX_STATE_LIST_LIMIT = 200;
+
+/**
+ * The organization's records in `state` (T-043's approval queue: records
+ * sent for review), ordered by ID, `limit` (1 to 200) at a time after the
+ * ID `after`, on the given home sites only (`"all"`: every record, records
+ * on no site included). Staff only: titles of unpublished records. The
+ * site filter is in the query, so neither the page nor its length says
+ * anything about records on other sites. `truncated`: there are more.
+ */
+export async function recordsInState(
+  db: Queryable,
+  organizationId: OrganizationId,
+  state: WorkflowState,
+  options: {
+    readonly sites: "all" | readonly SiteId[];
+    readonly after?: RecordId;
+    readonly limit: number;
+  },
+): Promise<
+  Validated<{ readonly records: readonly StateListEntry[]; readonly truncated: boolean }>
+> {
+  if (!isOrganizationId(organizationId)) {
+    return {
+      ok: false,
+      issues: [issue(["organizationId"], "invalid_organization", "Not an organization ID.")],
+    };
+  }
+  if (!isWorkflowState(state)) {
+    return { ok: false, issues: [issue(["state"], "invalid_state", "Not a workflow state.")] };
+  }
+  const { sites, after, limit } = options;
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_STATE_LIST_LIMIT) {
+    return { ok: false, issues: [issue(["limit"], "invalid_limit", "The limit is 1 to 200.")] };
+  }
+  if (after !== undefined && !isRecordId(after)) {
+    return { ok: false, issues: [issue(["after"], "invalid_id", "Not a record ID.")] };
+  }
+  if (sites !== "all" && !sites.every((site) => isSiteId(site))) {
+    return { ok: false, issues: [issue(["sites"], "invalid_sites", "Not a list of site IDs.")] };
+  }
+  const all = sites === "all";
+  const rows = await db.rows<{
+    id: RecordId;
+    kind: string;
+    title: string;
+    site_id: SiteId | null;
+    version: number;
+    updated_at: string;
+  }>(sql`
+    SELECT id::text AS id, kind, title, site_id::text AS site_id, version,
+           to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+    FROM public.records
+    WHERE organization_id = ${organizationId}::uuid
+      AND workflow_state = ${state}
+      AND (${all}::boolean OR site_id = ANY(${all ? [] : [...sites]}::uuid[]))
+      AND (${after ?? null}::uuid IS NULL OR id > ${after ?? null}::uuid)
+    ORDER BY id
+    LIMIT ${limit + 1}::integer`);
+  return {
+    ok: true,
+    value: Object.freeze({
+      records: Object.freeze(
+        rows.slice(0, limit).map((r) =>
+          Object.freeze({
+            id: r.id,
+            kind: r.kind,
+            title: r.title,
+            siteId: r.site_id,
+            version: r.version,
+            updatedAt: r.updated_at,
+          }),
+        ),
+      ),
+      truncated: rows.length > limit,
+    }),
+  };
+}
+
 /** What a change of state returns: the version it wrote, or why not. */
 export type WorkflowChangeResult =
   | { readonly ok: true; readonly value: RecordVersion }
