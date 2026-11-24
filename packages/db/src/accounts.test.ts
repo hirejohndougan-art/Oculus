@@ -811,40 +811,6 @@ describe("signIn", () => {
     expect(passwordWorkCount() - before).toBe(0);
     expect(await counterOf(throttleSourceKey(s))).toBeUndefined();
   });
-
-  it("re-hashes a password stored with old settings at the next sign-in", async () => {
-    await ready();
-    const org = await organization();
-    const person = await member(org);
-    const { scrypt } = await import("node:crypto");
-    const salt = Buffer.alloc(16, 3);
-    const key = await new Promise<Buffer>((resolve, reject) => {
-      scrypt(PASSWORD, salt, 32, { N: 2 ** 12, r: 8, p: 1 }, (e, k) => {
-        if (e) reject(e);
-        else resolve(k);
-      });
-    });
-    const b64 = (b: Buffer) => b.toString("base64").replace(/=+$/, "");
-    const old = `$scrypt$ln=12,r=8,p=1$${b64(salt)}$${b64(key)}`;
-    await db.execute(
-      sql`UPDATE public.users SET password_hash = ${old} WHERE id = ${person.userId}::uuid`,
-    );
-    expect(
-      await signIn(db, { email: person.email, password: PASSWORD, source: source() }),
-    ).toMatchObject({
-      ok: true,
-    });
-    const rows = await db.rows<{ h: string; signed: boolean }>(sql`
-      SELECT password_hash AS h, last_sign_in_at IS NOT NULL AS signed FROM public.users
-      WHERE id = ${person.userId}::uuid`);
-    expect(rows[0]?.h).toMatch(/^\$scrypt\$ln=14,r=8,p=5\$/);
-    expect(rows[0]?.signed).toBe(true);
-    expect(
-      await signIn(db, { email: person.email, password: PASSWORD, source: source() }),
-    ).toMatchObject({
-      ok: true,
-    });
-  });
 });
 
 describe("sign-in throttling", () => {
@@ -1084,14 +1050,18 @@ describe("sign-in throttling", () => {
 });
 
 describe("what the inviter can learn (D-068)", () => {
-  it("never gets the token, and an invitation that can't be sent isn't made", async () => {
+  it("never gets the token, and an invitation that can't be sent is withdrawn", async () => {
     await ready();
     const org = await organization();
     const address = email();
+    let token = "";
     const made = await createInvitation(
       db,
       { organizationId: org, email: address, invitedBy: admin },
-      () => Promise.reject(new Error("mail server down: secret detail")),
+      (m) => {
+        token = m.token;
+        return Promise.reject(new Error("mail server down: secret detail"));
+      },
     );
     expect(made).toEqual({
       ok: false,
@@ -1099,13 +1069,35 @@ describe("what the inviter can learn (D-068)", () => {
         {
           path: [],
           code: "delivery_failed",
-          message: "The invitation couldn't be sent, so it wasn't made. Try again later.",
+          message: "The invitation couldn't be sent, so it was withdrawn. Try again later.",
         },
       ],
     });
-    expect(await db.rows(sql`SELECT 1 FROM public.invitations WHERE email = ${address}`)).toEqual(
-      [],
+    expect(JSON.stringify(made)).not.toContain(token);
+    const rows = await db.rows<{ revoked: boolean; by: string }>(sql`
+      SELECT revoked_at IS NOT NULL AS revoked, revoked_by::text AS by
+      FROM public.invitations WHERE email = ${address}`);
+    expect(rows).toEqual([{ revoked: true, by: admin }]);
+    expect(
+      codes(
+        await acceptInvitation(db, {
+          token,
+          organizationId: org,
+          email: address,
+          displayName: "Invented Person",
+          password: PASSWORD,
+        }),
+      ),
+    ).toEqual(["invalid_invitation"]);
+    // A delivery that throws at once, not by rejecting, is the same.
+    const sync = await createInvitation(
+      db,
+      { organizationId: org, email: email(), invitedBy: admin },
+      () => {
+        throw new Error("boom");
+      },
     );
+    expect(codes(sync)).toEqual(["delivery_failed"]);
     await expect(
       createInvitation(
         db,
@@ -1113,6 +1105,182 @@ describe("what the inviter can learn (D-068)", () => {
         undefined as never,
       ),
     ).rejects.toThrow(TypeError);
+    for (const bad of [0, -1, 1.5, 300_001, "10"]) {
+      await expect(
+        createInvitation(
+          db,
+          { organizationId: org, email: address, invitedBy: admin },
+          () => Promise.resolve(),
+          {
+            deliveryTimeoutMs: bad as number,
+          },
+        ),
+      ).rejects.toThrow(TypeError);
+    }
+  });
+
+  it("sends after committing: a slow send holds no lock and no connection", async () => {
+    await ready();
+    const org = await organization();
+    const address = email();
+    const url = (await setup)?.testDb.url ?? "";
+    const single = openDatabase(url, { max: 1 });
+    try {
+      let release: () => void = () => undefined;
+      let called: () => void = () => undefined;
+      const sending = new Promise<void>((resolve) => {
+        called = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const slow = createInvitation(
+        single,
+        { organizationId: org, email: address, invitedBy: admin },
+        () => {
+          called();
+          return gate;
+        },
+      );
+      await sending;
+      // The pool's only connection is free, and the address's lock is free:
+      // another invitation for it goes through at once.
+      expect(await single.rows(sql`SELECT 1 AS one`)).toEqual([{ one: 1 }]);
+      const second = await inviteVia(db, { organizationId: org, email: address, invitedBy: admin });
+      expect(second.ok).toBe(true);
+      release();
+      expect((await slow).ok).toBe(true);
+      const pending = await db.rows(sql`
+        SELECT 1 FROM public.invitations WHERE organization_id = ${org}::uuid AND email = ${address}
+          AND accepted_at IS NULL AND revoked_at IS NULL`);
+      expect(pending).toHaveLength(1);
+    } finally {
+      await single.close();
+    }
+  });
+
+  it("withdraws an invitation whose send runs out of time, and tells the sender to stop", async () => {
+    await ready();
+    const org = await organization();
+    const address = email();
+    let aborted = false;
+    const started = Date.now();
+    const made = await createInvitation(
+      db,
+      { organizationId: org, email: address, invitedBy: admin },
+      (_m, signal) =>
+        new Promise<void>(() => {
+          signal.addEventListener("abort", () => {
+            aborted = true;
+          });
+        }),
+      { deliveryTimeoutMs: 100 },
+    );
+    expect(codes(made)).toEqual(["delivery_failed"]);
+    expect(aborted).toBe(true);
+    expect(Date.now() - started).toBeLessThan(5000);
+    const rows = await db.rows<{ revoked: boolean }>(sql`
+      SELECT revoked_at IS NOT NULL AS revoked FROM public.invitations WHERE email = ${address}`);
+    expect(rows).toEqual([{ revoked: true }]);
+  });
+
+  it("leaves an invitation that was accepted although its send seemed to fail", async () => {
+    await ready();
+    const org = await organization();
+    const address = email();
+    const made = await createInvitation(
+      db,
+      { organizationId: org, email: address, invitedBy: admin },
+      async (m) => {
+        // The message got through and the invitee was quick.
+        ok(
+          await acceptInvitation(db, {
+            token: m.token,
+            organizationId: m.organizationId,
+            email: m.email,
+            displayName: "Quick Invitee",
+            password: PASSWORD,
+          }),
+        );
+        throw new Error("the mail server answered late");
+      },
+    );
+    expect(made).toMatchObject({ ok: true, value: { email: address } });
+    expect((await signIn(db, { email: address, password: PASSWORD, source: source() })).ok).toBe(
+      true,
+    );
+  });
+
+  it("withdraws an unsent invitation even if its inviter was disabled meanwhile", async () => {
+    await ready();
+    const org = await organization();
+    const address = email();
+    try {
+      const made = await createInvitation(
+        db,
+        { organizationId: org, email: address, invitedBy: admin },
+        async () => {
+          await db.execute(
+            sql`UPDATE public.users SET disabled_at = now() WHERE id = ${admin}::uuid`,
+          );
+          throw new Error("not sent");
+        },
+      );
+      expect(codes(made)).toEqual(["delivery_failed"]);
+      const rows = await db.rows<{ revoked: boolean }>(sql`
+        SELECT revoked_at IS NOT NULL AS revoked FROM public.invitations WHERE email = ${address}`);
+      expect(rows).toEqual([{ revoked: true }]);
+    } finally {
+      await db.execute(sql`UPDATE public.users SET disabled_at = NULL WHERE id = ${admin}::uuid`);
+    }
+  });
+
+  it("answers not_permitted, not a database error, if the inviter loses the right just before the insert", async () => {
+    await ready();
+    const org = await organization();
+    // A test-only trigger, firing before invitations_check_new (name
+    // order), disables the inviter as the INSERT happens: the race the
+    // check before it can't see.
+    await db.execute(sql`CREATE FUNCTION public.t036_disable_inviter() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN UPDATE public.users SET disabled_at = now() WHERE id = NEW.invited_by; RETURN NEW; END $$`);
+    await db.execute(sql`CREATE TRIGGER aaaa_t036_disable_inviter BEFORE INSERT ON public.invitations
+      FOR EACH ROW EXECUTE FUNCTION public.t036_disable_inviter()`);
+    try {
+      const made = await createInvitation(
+        db,
+        { organizationId: org, email: email(), invitedBy: admin },
+        () => Promise.resolve(),
+      );
+      expect(made).toEqual({
+        ok: false,
+        issues: [{ path: [], code: "not_permitted", message: "Only a system admin can do that." }],
+      });
+    } finally {
+      await db.execute(sql`DROP TRIGGER aaaa_t036_disable_inviter ON public.invitations`);
+      await db.execute(sql`DROP FUNCTION public.t036_disable_inviter()`);
+      await db.execute(sql`UPDATE public.users SET disabled_at = NULL WHERE id = ${admin}::uuid`);
+    }
+  });
+
+  it("answers a database failure with a fixed refusal, never the database's message", async () => {
+    await ready();
+    const org = await organization();
+    await db.execute(sql`CREATE FUNCTION public.t036_fail() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'internal detail 1234' USING ERRCODE = 'XX000'; END $$`);
+    await db.execute(sql`CREATE TRIGGER aaaa_t036_fail BEFORE INSERT ON public.invitations
+      FOR EACH ROW EXECUTE FUNCTION public.t036_fail()`);
+    try {
+      const made = await createInvitation(
+        db,
+        { organizationId: org, email: email(), invitedBy: admin },
+        () => Promise.resolve(),
+      );
+      expect(codes(made)).toEqual(["database_unavailable"]);
+      expect(JSON.stringify(made)).not.toContain("1234");
+    } finally {
+      await db.execute(sql`DROP TRIGGER aaaa_t036_fail ON public.invitations`);
+      await db.execute(sql`DROP FUNCTION public.t036_fail()`);
+    }
   });
 
   it("gives an incomplete form the same answer whether or not the address has an account", async () => {
@@ -1253,48 +1421,66 @@ describe("passwords at sign-in", () => {
     }
   });
 
-  it("makes a wrong password for an old cheap hash cost today's hash too", async () => {
+  it("refuses a stored hash with other settings like an unknown user, at the same cost", async () => {
     await ready();
     const org = await organization();
     const person = await member(org);
     const { scrypt } = await import("node:crypto");
     const salt = Buffer.alloc(16, 5);
     const key = await new Promise<Buffer>((resolve, reject) => {
-      scrypt(PASSWORD, salt, 32, { N: 2 ** 10, r: 8, p: 1 }, (e, k) => {
+      scrypt(PASSWORD, salt, 32, { N: 2 ** 12, r: 8, p: 1 }, (e, k) => {
         if (e) reject(e);
         else resolve(k);
       });
     });
     const b64 = (b: Buffer) => b.toString("base64").replace(/=+$/, "");
-    await db.execute(sql`UPDATE public.users SET password_hash = ${`$scrypt$ln=10,r=8,p=1$${b64(salt)}$${b64(key)}`}
-      WHERE id = ${person.userId}::uuid`);
-    const before = passwordWorkCount();
-    expect(
-      await signIn(db, { email: person.email, password: "wrong guess", source: source() }),
-    ).toEqual(INVALID_CREDENTIALS);
-    expect(passwordWorkCount() - before).toBe(2);
+    const old = `$scrypt$ln=12,r=8,p=1$${b64(salt)}$${b64(key)}`;
+    // The database won't store it ...
+    await expect(
+      db.execute(
+        sql`UPDATE public.users SET password_hash = ${old} WHERE id = ${person.userId}::uuid`,
+      ),
+    ).rejects.toMatchObject({ code: "23514" });
+    // ... and if the CHECK were bypassed, core wouldn't run it.
+    const saved = await db.rows<{ h: string }>(sql`
+      SELECT password_hash AS h FROM public.users WHERE id = ${person.userId}::uuid`);
+    await db.execute(sql`ALTER TABLE public.users DROP CONSTRAINT users_password_hash_check`);
+    try {
+      await db.execute(
+        sql`UPDATE public.users SET password_hash = ${old} WHERE id = ${person.userId}::uuid`,
+      );
+      const before = passwordWorkCount();
+      const r = await signIn(db, { email: person.email, password: PASSWORD, source: source() });
+      expect(r).toEqual(INVALID_CREDENTIALS);
+      expect(passwordWorkCount() - before).toBe(1);
+    } finally {
+      await db.execute(sql`UPDATE public.users SET password_hash = ${saved[0]?.h ?? ""}
+        WHERE id = ${person.userId}::uuid`);
+      await db.execute(sql`ALTER TABLE public.users ADD CONSTRAINT users_password_hash_check
+        CHECK (public.password_hash_ok(password_hash))`);
+    }
   });
 
-  it("stores only hashes core will run: the database refuses costly or impossible settings", async () => {
+  it("stores only hashes with allowed settings: the database refuses every other", async () => {
     await ready();
     const org = await organization();
     const person = await member(org);
     const tail = "$" + "A".repeat(22) + "$" + "A".repeat(43);
     for (const settings of [
+      "ln=12,r=8,p=1",
       "ln=16,r=1,p=1",
-      "ln=16,r=8,p=5",
+      "ln=18,r=2,p=4",
       "ln=21,r=8,p=1",
-      "ln=9,r=8,p=1",
-      "ln=14,r=33,p=1",
-      "ln=14,r=8,p=17",
-      "ln=17,r=8,p=1",
+      "ln=13,r=8,p=5",
+      "ln=14,r=8,p=4",
+      "ln=14,r=9,p=5",
     ]) {
       await expect(
         db.execute(sql`UPDATE public.users SET password_hash = ${`$scrypt$${settings}${tail}`}
           WHERE id = ${person.userId}::uuid`),
       ).rejects.toMatchObject({ code: "23514" });
     }
-    for (const settings of ["ln=15,r=1,p=1", "ln=16,r=8,p=2", "ln=14,r=8,p=5"]) {
+    for (const settings of ["ln=14,r=8,p=5"]) {
       await db.execute(sql`UPDATE public.users SET password_hash = ${`$scrypt$${settings}${tail}`}
         WHERE id = ${person.userId}::uuid`);
     }

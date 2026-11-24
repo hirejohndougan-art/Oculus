@@ -13,7 +13,7 @@
  */
 export { sql, joinSql, isSql, Sql, MAX_PARAMETERS } from "./sql.js";
 export type { SqlScalar, SqlValue } from "./sql.js";
-export { openDatabase, typeParsers } from "./client.js";
+export { openDatabase, typeParsers, ConnectionLostError } from "./client.js";
 export type { Database, DatabaseOptions, Queryable, Row } from "./client.js";
 export {
   migrate,
@@ -135,6 +135,7 @@ export {
   clearSignInThrottle,
   deleteExpiredSignInThrottles,
   INVALID_CREDENTIALS,
+  DEFAULT_DELIVERY_TIMEOUT_MS,
   ACCOUNT_TABLE_PRIVILEGES,
 } from "./accounts.js";
 export type {
@@ -142,6 +143,7 @@ export type {
   InvitationRequest,
   InvitationMessage,
   InvitationDelivery,
+  InvitationOptions,
   CreatedInvitation,
   InvitationAcceptance,
   SignInRequest,

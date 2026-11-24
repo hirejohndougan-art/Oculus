@@ -20,24 +20,15 @@
 -- checks back them up for any writer.
 
 -- Whether a stored password hash is one core's verifyPassword will run:
--- the PHC shape, and the same bounds on its settings as core's
--- parseScryptHash (passwords.ts): ln 10–20, r 1–32, p 1–16, N < 2^(16·r)
--- (RFC 7914), memory 128·N·r at most 64 MiB, work N·r·p at most 2^21.
+-- the PHC shape with exactly the settings in core's ALLOWED_SCRYPT_SETTINGS
+-- (passwords.ts, D-068), today ln=14, r=8, p=5. A change of settings
+-- replaces this function in its own migration, allowing the previous
+-- settings until a planned re-hash.
 CREATE FUNCTION public.password_hash_ok(h text) RETURNS boolean
 LANGUAGE sql IMMUTABLE STRICT
 SET search_path = pg_catalog, pg_temp
 AS $$
-  SELECT CASE
-    WHEN h ~ '^\$scrypt\$ln=[1-9][0-9]?,r=[1-9][0-9]?,p=[1-9][0-9]?\$[A-Za-z0-9+/]{22}\$[A-Za-z0-9+/]{43}$' THEN (
-      SELECT ln BETWEEN 10 AND 20 AND r BETWEEN 1 AND 32 AND p BETWEEN 1 AND 16
-        AND ln < 16 * r
-        AND 128 * (2::bigint ^ ln) * r <= 64 * 1024 * 1024
-        AND (2::bigint ^ ln) * r * p <= 2::bigint ^ 21
-      FROM (SELECT substring(h FROM 'ln=([0-9]+)')::int AS ln,
-                   substring(h FROM 'r=([0-9]+)')::int AS r,
-                   substring(h FROM 'p=([0-9]+)')::int AS p) AS settings)
-    ELSE false
-  END
+  SELECT h ~ '^\$scrypt\$ln=14,r=8,p=5\$[A-Za-z0-9+/]{22}\$[A-Za-z0-9+/]{43}$'
 $$;
 
 -- One person's sign-in. The email is stored in lower case (core's
@@ -175,8 +166,10 @@ BEGIN
     RAISE EXCEPTION 'An invitation is accepted or revoked at the time it happens.'
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'invitations_settled_now';
   END IF;
-  -- Revoked only by an active system admin (until T-041).
-  IF NEW.revoked_at IS NOT NULL AND NOT EXISTS (
+  -- Revoked by an active system admin (until T-041), or by its own inviter
+  -- (createInvitation withdraws an invitation it couldn't send, even if the
+  -- inviter was disabled meanwhile).
+  IF NEW.revoked_at IS NOT NULL AND NEW.revoked_by IS DISTINCT FROM OLD.invited_by AND NOT EXISTS (
     SELECT 1 FROM public.users u
     WHERE u.id = NEW.revoked_by AND u.system_admin AND u.disabled_at IS NULL
   ) THEN

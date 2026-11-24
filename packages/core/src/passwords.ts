@@ -79,30 +79,41 @@ interface ScryptHash {
 const PHC_SCRYPT =
   /^\$scrypt\$ln=([1-9][0-9]?),r=([1-9][0-9]?),p=([1-9][0-9]?)\$([A-Za-z0-9+/]{22})\$([A-Za-z0-9+/]{43})$/;
 
-// Bounds on stored settings, so a damaged or planted row can't ask for
-// gigabytes of memory, seconds of work or settings scrypt refuses: ln 10–20,
-// r 1–32, p 1–16, N < 2^(16·r) (RFC 7914 §2), memory (128·N·r bytes) at most
-// 64 MiB, and work (N·r·p) at most 2^21, about 3 times today's.
-// The database's CHECK on users.password_hash says the same (0009).
-const MAX_SCRYPT_MEMORY = 64 * 1024 * 1024;
-/** The most work (N·r·p) a stored hash may ask for. */
-export const MAX_SCRYPT_WORK = 2 ** 21;
+/** One set of scrypt settings. */
+export interface ScryptSettings {
+  readonly ln: number;
+  readonly r: number;
+  readonly p: number;
+}
 
-function parseScryptHash(stored: unknown): ScryptHash | undefined {
+/**
+ * The only settings a stored hash may have (D-068): today's and, after a
+ * change of `SCRYPT_SETTINGS`, the previous ones until a planned forced
+ * re-hash or reset. A hash with any other settings (damaged, planted or
+ * just odd) is never run: it is checked like an unknown user's, against
+ * the dummy hash. So no stored row can make a check throw, cost seconds or
+ * take a time of its own. The database's CHECK (`password_hash_ok`, 0009)
+ * allows the same set.
+ */
+export const ALLOWED_SCRYPT_SETTINGS: readonly ScryptSettings[] = Object.freeze([SCRYPT_SETTINGS]);
+
+function sameSettings(a: ScryptSettings, b: ScryptSettings): boolean {
+  return a.ln === b.ln && a.r === b.r && a.p === b.p;
+}
+
+function parseScryptHash(
+  stored: unknown,
+  allowed: readonly ScryptSettings[] = ALLOWED_SCRYPT_SETTINGS,
+): ScryptHash | undefined {
   if (typeof stored !== "string") return undefined;
   const match = PHC_SCRYPT.exec(stored);
   if (match === null) return undefined;
-  const ln = Number(match[1]);
-  const r = Number(match[2]);
-  const p = Number(match[3]);
-  if (ln < 10 || ln > 20 || r > 32 || p > 16) return undefined;
-  if (ln >= 16 * r) return undefined;
-  if (128 * 2 ** ln * r > MAX_SCRYPT_MEMORY) return undefined;
-  if (2 ** ln * r * p > MAX_SCRYPT_WORK) return undefined;
+  const settings = { ln: Number(match[1]), r: Number(match[2]), p: Number(match[3]) };
+  if (!allowed.some((a) => sameSettings(a, settings))) return undefined;
   const salt = Buffer.from(match[4] ?? "", "base64");
   const hash = Buffer.from(match[5] ?? "", "base64");
   if (salt.length !== SALT_BYTES || hash.length !== KEY_BYTES) return undefined;
-  return { ln, r, p, salt, hash };
+  return { ...settings, salt, hash };
 }
 
 function formatScryptHash(h: ScryptHash): string {
@@ -116,10 +127,12 @@ export function isPasswordHash(stored: unknown): stored is string {
 }
 
 /** True if `stored` was made with other settings than today's (or can't be read). */
-export function passwordHashNeedsRehash(stored: unknown): boolean {
-  const h = parseScryptHash(stored);
-  if (h === undefined) return true;
-  return h.ln !== SCRYPT_SETTINGS.ln || h.r !== SCRYPT_SETTINGS.r || h.p !== SCRYPT_SETTINGS.p;
+export function passwordHashNeedsRehash(
+  stored: unknown,
+  allowed: readonly ScryptSettings[] = ALLOWED_SCRYPT_SETTINGS,
+): boolean {
+  const h = parseScryptHash(stored, allowed);
+  return h === undefined || !sameSettings(h, SCRYPT_SETTINGS);
 }
 
 // ---------------------------------------------------------------------------
@@ -253,15 +266,29 @@ const REFUSED: PasswordCheck = Object.freeze({ ok: false, needsRehash: false });
 
 /**
  * Checks `password` against `stored` (a PHC string, or `undefined` for a
- * user that doesn't exist). Always runs exactly one scrypt computation:
- * against the dummy hash when there is no usable stored hash or the
- * password is too long or not a string, which then never matches.
+ * user that doesn't exist). A failure always costs one scrypt run at
+ * today's settings: against the dummy hash when there is no usable stored
+ * hash (none, unreadable, or settings outside `ALLOWED_SCRYPT_SETTINGS`)
+ * or the password is too long or not well-formed text, which then never
+ * matches; padded with a dummy run after a cheaper allowed setting.
  */
-export async function verifyPassword(
+export function verifyPassword(
   password: unknown,
   stored: string | undefined,
 ): Promise<PasswordCheck> {
-  const parsed = parseScryptHash(stored);
+  return verifyPasswordAllowing(password, stored, ALLOWED_SCRYPT_SETTINGS);
+}
+
+/**
+ * `verifyPassword` with another allowed set: for tests of a settings change
+ * (core's own tests use it; not exported from the package).
+ */
+export async function verifyPasswordAllowing(
+  password: unknown,
+  stored: string | undefined,
+  allowed: readonly ScryptSettings[],
+): Promise<PasswordCheck> {
+  const parsed = parseScryptHash(stored, allowed);
   const text = passwordText(password);
   if (parsed === undefined || text === undefined || utf8Bytes(text).length > MAX_PASSWORD_BYTES) {
     await runDummy();
@@ -269,13 +296,12 @@ export async function verifyPassword(
   }
   const key = await runScrypt(utf8Bytes(text), parsed.salt, parsed.ln, parsed.r, parsed.p);
   if (!timingSafeEqual(key, parsed.hash)) {
-    // A hash cheaper than today's settings would fail faster than a current
-    // one: pad the failure to today's cost, so failures cost the same
-    // whatever a user's stored hash is.
+    // An older allowed setting that is cheaper than today's would fail
+    // faster than a current one: pad the failure to today's cost.
     if (scryptWork(parsed) < scryptWork(SCRYPT_SETTINGS)) await runDummy();
     return REFUSED;
   }
-  return { ok: true, needsRehash: passwordHashNeedsRehash(stored) };
+  return { ok: true, needsRehash: passwordHashNeedsRehash(stored, allowed) };
 }
 
 // ---------------------------------------------------------------------------
@@ -326,7 +352,12 @@ export function passwordContextWords(context: PasswordContext = {}): string[] {
   const words = new Set<string>(DEFAULT_CONTEXT_WORDS);
   const add = (text: unknown): void => {
     if (typeof text !== "string") return;
-    for (const word of text.toLowerCase().split(/[^\p{L}\p{N}]+/u)) {
+    // NFC like the password itself, and marks kept inside words, so
+    // "Ame\u0301lie" and "Am\u00e9lie" give the same word.
+    for (const word of text
+      .normalize("NFC")
+      .toLowerCase()
+      .split(/[^\p{L}\p{M}\p{N}]+/u)) {
       if (Array.from(word).length >= MIN_CONTEXT_WORD) words.add(word);
     }
   };

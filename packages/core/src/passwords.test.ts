@@ -3,10 +3,10 @@
 import { scrypt } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
+  ALLOWED_SCRYPT_SETTINGS,
   MAX_CONCURRENT_HASHES,
   MAX_PASSWORD_BYTES,
   MAX_QUEUED_HASHES,
-  MAX_SCRYPT_WORK,
   MIN_PASSWORD_LENGTH,
   PasswordWorkBusyError,
   SCRYPT_SETTINGS,
@@ -20,6 +20,7 @@ import {
   passwordText,
   passwordWorkCount,
   verifyPassword,
+  verifyPasswordAllowing,
 } from "./passwords.js";
 import { COMMON_PASSWORDS_TEXT } from "./common-passwords.js";
 
@@ -131,68 +132,89 @@ describe("hashPassword and verifyPassword", () => {
     expect((await verifyPassword("", await dummyPasswordHash())).ok).toBe(false);
   });
 
-  it("pads a failed check against a cheaper stored hash to today's cost", async () => {
+  // A settings change, simulated: the previous settings (ln=12, r=8, p=1)
+  // allowed beside today's, as ALLOWED_SCRYPT_SETTINGS would hold them until
+  // a planned re-hash (D-068).
+  const WITH_PREVIOUS = [SCRYPT_SETTINGS, { ln: 12, r: 8, p: 1 }] as const;
+
+  it("pads a failed check against an older, cheaper allowed setting to today's cost", async () => {
     await dummyPasswordHash();
     const old = await oldStyleHash("an older stored password", 12, 8, 1);
-    const current = await hashPassword("an older stored password");
     let before = passwordWorkCount();
-    expect((await verifyPassword("not the older password", old)).ok).toBe(false);
+    expect((await verifyPasswordAllowing("not the older password", old, WITH_PREVIOUS)).ok).toBe(
+      false,
+    );
     expect(passwordWorkCount() - before).toBe(2);
     before = passwordWorkCount();
-    expect((await verifyPassword("an older stored password", old)).ok).toBe(true);
-    expect(passwordWorkCount() - before).toBe(1);
-    const time = async (stored: string): Promise<number> => {
-      const runs: number[] = [];
-      for (let i = 0; i < 5; i++) {
-        const t = performance.now();
-        await verifyPassword("not the older password", stored);
-        runs.push(performance.now() - t);
-      }
-      return runs.sort((x, y) => x - y)[2] ?? 0;
-    };
-    const ratio = (await time(old)) / (await time(current));
-    expect(ratio).toBeGreaterThan(0.7);
-    expect(ratio).toBeLessThan(2);
-  }, 60_000);
-
-  it("says when a correct password's hash has old settings", async () => {
-    const old = await oldStyleHash("an older stored password", 12, 8, 1);
-    expect(isPasswordHash(old)).toBe(true);
-    expect(passwordHashNeedsRehash(old)).toBe(true);
-    expect(await verifyPassword("an older stored password", old)).toEqual({
+    expect(await verifyPasswordAllowing("an older stored password", old, WITH_PREVIOUS)).toEqual({
       ok: true,
       needsRehash: true,
     });
-    expect(await verifyPassword("not the older password", old)).toEqual({
+    expect(passwordWorkCount() - before).toBe(1);
+    expect(passwordHashNeedsRehash(old, WITH_PREVIOUS)).toBe(true);
+  });
+
+  it("refuses every stored setting outside the allowed set, at the cost of an unknown user", async () => {
+    await dummyPasswordHash();
+    expect(ALLOWED_SCRYPT_SETTINGS).toEqual([{ ln: 14, r: 8, p: 5 }]);
+    const old = await oldStyleHash("an older stored password", 12, 8, 1);
+    expect(isPasswordHash(old)).toBe(false);
+    expect(passwordHashNeedsRehash(old)).toBe(true);
+    // Not run at all, even with the right password: like an unknown user.
+    const before = passwordWorkCount();
+    expect(await verifyPassword("an older stored password", old)).toEqual({
       ok: false,
       needsRehash: false,
     });
-  });
-
-  it("refuses stored settings that would cost too much memory or time", async () => {
+    expect(passwordWorkCount() - before).toBe(1);
     const salt = "A".repeat(22);
     const key = "A".repeat(43);
     for (const settings of [
       "ln=21,r=8,p=1",
       "ln=9,r=8,p=1",
-      "ln=20,r=32,p=1",
-      "ln=14,r=8,p=17",
-      // N must be below 2^(16·r) (RFC 7914), or scrypt itself throws.
+      "ln=18,r=2,p=4",
       "ln=16,r=1,p=1",
-      // More work than MAX_SCRYPT_WORK (2^16·8·5 > 2^21), though memory is fine.
-      "ln=16,r=8,p=5",
+      "ln=14,r=8,p=4",
+      "ln=14,r=8,p=6",
+      "ln=13,r=8,p=5",
+      "ln=14,r=9,p=5",
     ]) {
       const stored = `$scrypt$${settings}$${salt}$${key}`;
       expect(isPasswordHash(stored)).toBe(false);
-      const before = passwordWorkCount();
+      const n = passwordWorkCount();
       expect((await verifyPassword("anything", stored)).ok).toBe(false);
-      expect(passwordWorkCount() - before).toBe(1);
+      expect(passwordWorkCount() - n).toBe(1);
     }
-    expect(isPasswordHash(`$scrypt$ln=15,r=1,p=1$${salt}$${key}`)).toBe(true);
-    expect(isPasswordHash(`$scrypt$ln=16,r=8,p=2$${salt}$${key}`)).toBe(true);
-    expect(MAX_SCRYPT_WORK).toBe(2 ** 21);
+    expect(isPasswordHash(`$scrypt$ln=14,r=8,p=5$${salt}$${key}`)).toBe(true);
     expect(isPasswordHash(`$argon2id$v=19$m=19456,t=2,p=1$${salt}$${key}`)).toBe(false);
   });
+
+  it("takes about the same time to fail for every kind of stored hash", async () => {
+    await dummyPasswordHash();
+    const current = await hashPassword("a stored password here");
+    const odd = await oldStyleHash("a stored password here", 11, 8, 1);
+    const previous = await oldStyleHash("a stored password here", 12, 8, 1);
+    const time = async (check: () => Promise<unknown>): Promise<number> => {
+      const runs: number[] = [];
+      for (let i = 0; i < 5; i++) {
+        const t = performance.now();
+        await check();
+        runs.push(performance.now() - t);
+      }
+      return runs.sort((x, y) => x - y)[2] ?? 0;
+    };
+    const base = await time(() => verifyPassword("wrong", current));
+    for (const other of [
+      () => verifyPassword("wrong", undefined),
+      () => verifyPassword("wrong", odd),
+      () => verifyPassword("a stored password here", odd),
+      () => verifyPasswordAllowing("wrong", previous, WITH_PREVIOUS),
+    ]) {
+      const ratio = (await time(other)) / base;
+      expect(ratio).toBeGreaterThan(0.6);
+      expect(ratio).toBeLessThan(1.8);
+    }
+  }, 60_000);
 
   it("refuses to hash what isn't a password", async () => {
     await expect(hashPassword("x".repeat(MAX_PASSWORD_BYTES + 1))).rejects.toThrow(RangeError);
@@ -274,6 +296,16 @@ describe("checkNewPassword", () => {
     // Words under 4 letters are not context words ("pat", "org").
     expect(passwordContextWords(context)).not.toContain("pat");
     expect(passwordContextWords(context)).not.toContain("org");
+  });
+
+  it("finds context words the same way whether accents are composed or not", () => {
+    const decomposed = { displayName: "Ame\u0301lie Example", email: "ame\u0301lie@example.org" };
+    const composed = { displayName: "Am\u00e9lie Example" };
+    expect(passwordContextWords(decomposed)).toContain("am\u00e9lie");
+    expect(codes(checkNewPassword("Am\u00e9lie!!2026", decomposed))).toEqual(["context_words"]);
+    expect(codes(checkNewPassword("Ame\u0301lie!!2026", composed))).toEqual(["context_words"]);
+    // Without the mark the word would have split into "ame" and "lie".
+    expect(passwordContextWords(decomposed)).not.toContain("ame");
   });
 
   it("refuses what isn't text, and never repeats the password in a message", () => {

@@ -250,11 +250,14 @@ export interface InvitationMessage {
 
 /**
  * Sends an invitation to its address (T-040 builds the email one; tests use
- * a double). Called inside the invitation's transaction, after it is
- * stored: if it throws, nothing is stored and the result is
- * `delivery_failed`. It must not show the token to the inviter.
+ * a double). Called after the invitation is committed, outside any
+ * transaction, with a time limit: `signal` aborts at the limit, and the
+ * sender should stop then. If it throws, rejects or runs out of time, the
+ * invitation is revoked and the result is `delivery_failed`. It must never
+ * show, log or keep the token anywhere but the message to the invitee
+ * (D-068).
  */
-export type InvitationDelivery = (message: InvitationMessage) => Promise<void>;
+export type InvitationDelivery = (message: InvitationMessage, signal: AbortSignal) => Promise<void>;
 
 /** Whether `userId` is an active system admin, read in `q`. */
 async function isActiveSystemAdmin(q: Queryable, userId: UserId): Promise<boolean> {
@@ -283,8 +286,19 @@ export async function createInvitation(
   db: Database,
   input: InvitationRequest,
   deliver: InvitationDelivery,
+  options: InvitationOptions = {},
 ): Promise<Validated<CreatedInvitation>> {
   if (typeof deliver !== "function") throw new TypeError("createInvitation needs a delivery.");
+  const timeoutMs = own(options, "deliveryTimeoutMs") ?? DEFAULT_DELIVERY_TIMEOUT_MS;
+  if (
+    !hasOnly(options, ["deliveryTimeoutMs"]) ||
+    typeof timeoutMs !== "number" ||
+    !Number.isInteger(timeoutMs) ||
+    timeoutMs < 1 ||
+    timeoutMs > MAX_DELIVERY_TIMEOUT_MS
+  ) {
+    throw new TypeError("deliveryTimeoutMs is a whole number of milliseconds, 1 to 300,000.");
+  }
   if (!hasOnly(input, ["organizationId", "email", "invitedBy", "expiresInSeconds"])) {
     return refused("invalid_request", "Give the organization, email, inviter and life only.");
   }
@@ -315,8 +329,11 @@ export async function createInvitation(
   }
   const token = newInvitationToken();
   const invitationId = newInvitationId();
+  // 1. Store it, pending, and commit: no lock or connection is held while
+  //    the message is sent.
+  let stored: Validated<CreatedInvitation & { readonly organizationName: string }>;
   try {
-    return await inTransaction(db, async (tx): Promise<Validated<CreatedInvitation>> => {
+    stored = await inTransaction(db, async (tx) => {
       // One at a time per organization and address, so a second invitation
       // waits and then revokes the first instead of failing the unique index.
       await tx.rows(sql`
@@ -351,25 +368,104 @@ export async function createInvitation(
         RETURNING to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS expires_at`);
       const expiresAt = rows[0]?.expires_at;
       if (expiresAt === undefined) throw new Error("The invitation was not stored.");
-      try {
-        await deliver({ email, organizationId, organizationName, token, expiresAt });
-      } catch {
-        throw new DeliveryFailed();
-      }
-      return { ok: true, value: { invitationId, organizationId, email, expiresAt } };
+      return {
+        ok: true,
+        value: { invitationId, organizationId, email, expiresAt, organizationName },
+      };
     });
   } catch (error) {
-    if (error instanceof DeliveryFailed) {
-      return refused(
-        "delivery_failed",
-        "The invitation couldn't be sent, so it wasn't made. Try again later.",
-      );
+    // The inviter was disabled or lost admin between the check and the
+    // INSERT: the database's own check refused it.
+    if (constraintOf(error) === "invitations_invited_by_admin") {
+      return refused("not_permitted", NOT_PERMITTED);
     }
-    throw error;
+    return databaseRefusal(error);
+  }
+  if (!stored.ok) return stored;
+  const { organizationName, ...created } = stored.value;
+
+  // 2. Send it, with a time limit. The token goes nowhere else.
+  const sent = await deliverWithin(
+    deliver,
+    { email, organizationId, organizationName, token, expiresAt: created.expiresAt },
+    timeoutMs,
+  );
+  if (sent) return { ok: true, value: created };
+
+  // 3. Not sent (or not known to be): revoke it, unless it was accepted
+  //    meanwhile, which means the message did get through.
+  try {
+    const revoked = await inTransaction(db, (tx) =>
+      tx.execute(sql`
+        UPDATE public.invitations SET revoked_at = now(), revoked_by = ${invitedBy}::uuid
+        WHERE organization_id = ${organizationId}::uuid AND id = ${invitationId}::uuid
+          AND accepted_at IS NULL AND revoked_at IS NULL`),
+    );
+    if (revoked === 0) {
+      const accepted = await db.rows(sql`
+        SELECT 1 FROM public.invitations
+        WHERE id = ${invitationId}::uuid AND accepted_at IS NOT NULL`);
+      if (accepted.length > 0) return { ok: true, value: created };
+    }
+  } catch {
+    // The link was never shown to anyone here; if it can't be revoked it
+    // still expires. Fall through to the same refusal.
+  }
+  return refused(
+    "delivery_failed",
+    "The invitation couldn't be sent, so it was withdrawn. Try again later.",
+  );
+}
+
+/** Options for `createInvitation`. */
+export interface InvitationOptions {
+  /** How long `deliver` may take before it is abandoned (default 30 s, at most 5 minutes). */
+  readonly deliveryTimeoutMs?: number;
+}
+
+/** Default time limit for sending an invitation. */
+export const DEFAULT_DELIVERY_TIMEOUT_MS = 30_000;
+const MAX_DELIVERY_TIMEOUT_MS = 300_000;
+
+/**
+ * Runs `deliver` with an AbortSignal that fires at the time limit. True
+ * only if it resolved in time; a throw, a rejection or the time limit is
+ * false. A late result is ignored.
+ */
+async function deliverWithin(
+  deliver: InvitationDelivery,
+  message: InvitationMessage,
+  timeoutMs: number,
+): Promise<boolean> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<false>((resolve) => {
+    timer = setTimeout(() => {
+      controller.abort(new Error("The invitation took too long to send."));
+      resolve(false);
+    }, timeoutMs);
+  });
+  try {
+    const sending = Promise.resolve()
+      .then(() => deliver(message, controller.signal))
+      .then(
+        () => true,
+        () => false,
+      );
+    return await Promise.race([sending, timedOut]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-class DeliveryFailed extends Error {}
+/** A database failure as a fixed refusal: never the database's own message. */
+function databaseRefusal<T>(error: unknown): Validated<T> {
+  if (sqlState(error) === undefined) throw error;
+  return refused(
+    "database_unavailable",
+    "The database couldn't do that just now. Try again in a moment.",
+  );
+}
 
 /**
  * Revokes a pending invitation of `organizationId` (`unknown_invitation` if

@@ -565,7 +565,7 @@ export {
   passwordWorkCount,
   checkNewPassword,
   passwordText,
-  MAX_SCRYPT_WORK,
+  ALLOWED_SCRYPT_SETTINGS,
   isCommonPassword,
   passwordContextWords,
   PasswordWorkBusyError,
@@ -577,7 +577,7 @@ export {
   MAX_QUEUED_HASHES,
   DEFAULT_CONTEXT_WORDS,
 } from "./passwords.js";
-export type { PasswordCheck, PasswordContext } from "./passwords.js";
+export type { PasswordCheck, PasswordContext, ScryptSettings } from "./passwords.js";
 export {
   throttleAttempt,
   throttleDelaySeconds,
