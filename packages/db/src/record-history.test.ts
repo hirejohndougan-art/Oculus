@@ -654,7 +654,7 @@ describe("restoreVersion: record types and represented records", () => {
       await q.execute(sql`DELETE FROM public.record_type_versions
                           WHERE organization_id = ${org}::uuid AND key = 'chair'`);
       await q.execute(
-        sql`ALTER TABLE public.record_type_versions ENABLE TRIGGER zzzz_record_type_versions_no_update`,
+        sql`ALTER TABLE public.record_type_versions ENABLE ALWAYS TRIGGER zzzz_record_type_versions_no_update`,
       );
       await q.execute(sql`DELETE FROM public.record_types
                           WHERE organization_id = ${org}::uuid AND key = 'chair'`);

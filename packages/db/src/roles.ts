@@ -94,8 +94,12 @@ export interface WriterRoleProblem {
     | "createrole"
     | "bypasses_row_security"
     | "replication"
+    | "replication_role"
+    | "role_setting"
     | "role_membership"
     | "owner"
+    | "owns_object"
+    | "object_privilege"
     | "extra_privilege"
     | "column_privilege"
     | "default_privilege"
@@ -105,6 +109,21 @@ export interface WriterRoleProblem {
     | "missing_privilege";
   readonly message: string;
 }
+
+/**
+ * Settings a deployment may give the writer with `ALTER ROLE … SET`: time
+ * limits and the name it shows. Any other setting on the writer's role (in
+ * this database or all) is refused; on all roles, only
+ * `session_replication_role` is.
+ */
+export const ALLOWED_ROLE_SETTINGS: readonly string[] = Object.freeze([
+  "lock_timeout",
+  "statement_timeout",
+  "idle_in_transaction_session_timeout",
+  "idle_session_timeout",
+  "transaction_timeout",
+  "application_name",
+]);
 
 /** At most this many items are named in a message; the rest are counted. */
 const LISTED = 5;
@@ -134,8 +153,13 @@ function listed(items: readonly string[]): string {
  *   sequences), no CREATE on the database or on `public`, and no SET or
  *   ALTER SYSTEM on any parameter (`session_replication_role = replica`
  *   turns ordinary triggers off).
- * GRANT OPTION on its own privileges is not refused: it can only hand them
- * on. And the role in effect must hold every privilege `grantWriterRole`
+ * It must also own nothing anywhere in this database or shared
+ * (`pg_shdepend`: subscriptions, large objects, servers, publications …),
+ * hold privileges on nothing but public's tables, schema public and
+ * databases, have no GRANT OPTION (it could hand its privileges on), and
+ * have no session settings but `ALLOWED_ROLE_SETTINGS` (nor may every role
+ * have `session_replication_role` set). This session must not be in
+ * replica mode. And the role in effect must hold every privilege `grantWriterRole`
  * gives. Empty when the connection is fit to be the service's. Run it at
  * startup and after every migration (new tables, new default privileges).
  */
@@ -158,6 +182,10 @@ export async function checkWriterConnection(db: Queryable): Promise<WriterRolePr
     database_create: boolean;
     schema_create: boolean;
     parameters: string[] | null;
+    replica: boolean;
+    settings: string[] | null;
+    owns: string[] | null;
+    objects: string[] | null;
     privileges: boolean;
   }>(sql`
     WITH who AS (
@@ -194,10 +222,11 @@ export async function checkWriterConnection(db: Queryable): Promise<WriterRolePr
            -- Table privileges granted to the role or to PUBLIC beyond the allowlist.
            (SELECT pg_catalog.array_agg(DISTINCT
                      t.relname || ' ' || (t.acl).privilege_type
-                     || CASE WHEN (t.acl).grantee = 0 THEN ' (PUBLIC)' ELSE '' END)
+                     || CASE WHEN (t.acl).grantee = 0 THEN ' (PUBLIC)' ELSE '' END
+                     || CASE WHEN (t.acl).is_grantable THEN ' (grant option)' ELSE '' END)
             FROM public_tables t
             WHERE (t.acl).grantee IN (w.oid, 0)
-              AND NOT ((t.acl).grantee = w.oid AND t.relkind <> 'S'
+              AND NOT ((t.acl).grantee = w.oid AND t.relkind <> 'S' AND NOT (t.acl).is_grantable
                        AND ((t.acl).privilege_type = 'SELECT'
                             OR EXISTS (SELECT 1 FROM allowed a
                                        WHERE a.table_name = t.relname
@@ -221,14 +250,53 @@ export async function checkWriterConnection(db: Queryable): Promise<WriterRolePr
                           pg_catalog.aclexplode(COALESCE(d.datacl, pg_catalog.acldefault('d', d.datdba))) AS x
                    WHERE d.datname = pg_catalog.current_database()
                      AND x.grantee IN (w.oid, 0) AND x.privilege_type = 'CREATE') AS database_create,
+           -- CREATE on any schema: triggers pin search_path, but owner
+           -- sessions (migrations, backups) use the default one.
            EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n,
                           pg_catalog.aclexplode(COALESCE(n.nspacl, pg_catalog.acldefault('n', n.nspowner))) AS x
-                   WHERE n.nspname = 'public'
-                     AND x.grantee IN (w.oid, 0) AND x.privilege_type = 'CREATE') AS schema_create,
+                   WHERE x.grantee IN (w.oid, 0) AND x.privilege_type = 'CREATE') AS schema_create,
            -- pg_parameter_acl exists from PostgreSQL 15, the oldest supported (D-049).
            (SELECT pg_catalog.array_agg(DISTINCT p.parname || ' ' || x.privilege_type)
             FROM pg_catalog.pg_parameter_acl p, pg_catalog.aclexplode(p.paracl) AS x
             WHERE x.grantee IN (w.oid, 0)) AS parameters,
+           -- This session must not be in replica mode, where ordinary
+           -- triggers and foreign keys don't fire.
+           pg_catalog.current_setting('session_replication_role') <> 'origin' AS replica,
+           -- Settings applied to new sessions of the role (or of every role)
+           -- in this database or in all.
+           (SELECT pg_catalog.array_agg(DISTINCT c.setting)
+            FROM pg_catalog.pg_db_role_setting d
+            CROSS JOIN LATERAL unnest(d.setconfig) AS c(setting)
+            WHERE d.setdatabase IN (0, (SELECT oid FROM pg_catalog.pg_database
+                                        WHERE datname = pg_catalog.current_database()))
+              AND ((d.setrole = w.oid
+                    AND pg_catalog.split_part(c.setting, '=', 1) <> ALL(${ALLOWED_ROLE_SETTINGS}::text[]))
+                   OR (d.setrole = 0
+                       AND pg_catalog.split_part(c.setting, '=', 1) = 'session_replication_role'))) AS settings,
+           -- Anything it owns, in this database or shared (subscriptions,
+           -- schemas, large objects, servers, publications, databases …).
+           (SELECT pg_catalog.array_agg(DISTINCT d.classid::pg_catalog.regclass::text || ' ' || d.objid::text)
+            FROM pg_catalog.pg_shdepend d
+            WHERE d.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass
+              AND d.refobjid = w.oid AND d.deptype = 'o'
+              AND d.dbid IN (0, (SELECT oid FROM pg_catalog.pg_database
+                                 WHERE datname = pg_catalog.current_database()))) AS owns,
+           -- Privileges on anything but public's tables (their columns are the
+           -- column check's), schema public and databases (pg_shdepend lists
+           -- non-default ACL entries only; parameters are listed here too).
+           (SELECT pg_catalog.array_agg(DISTINCT d.classid::pg_catalog.regclass::text || ' ' || d.objid::text)
+            FROM pg_catalog.pg_shdepend d
+            WHERE d.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass
+              AND d.refobjid = w.oid AND d.deptype = 'a'
+              AND d.dbid IN (0, (SELECT oid FROM pg_catalog.pg_database
+                                 WHERE datname = pg_catalog.current_database()))
+              AND NOT (d.classid = 'pg_catalog.pg_database'::pg_catalog.regclass)
+              AND NOT (d.classid = 'pg_catalog.pg_namespace'::pg_catalog.regclass
+                       AND d.objid = 'public'::pg_catalog.regnamespace::oid)
+              AND NOT (d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                       AND EXISTS (SELECT 1 FROM pg_catalog.pg_class c
+                                   WHERE c.oid = d.objid
+                                     AND c.relnamespace = 'public'::pg_catalog.regnamespace))) AS objects,
            (NOT w.current
             OR (pg_catalog.has_schema_privilege(w.oid, 'public', 'USAGE')
                 AND (SELECT pg_catalog.bool_and(pg_catalog.has_table_privilege(w.oid, 'public.' || t, 'SELECT'))
@@ -255,6 +323,16 @@ export async function checkWriterConnection(db: Queryable): Promise<WriterRolePr
   if (any((r) => r.replication)) {
     add("replication", "The service's login or role has the REPLICATION attribute.");
   }
+  if (rows.some((r) => r.replica)) {
+    add(
+      "replication_role",
+      "This session runs with session_replication_role other than origin, where the guarding triggers and foreign keys don't fire.",
+    );
+  }
+  const settings = all((r) => r.settings);
+  if (settings.length > 0) {
+    add("role_setting", `Settings applied to the service's sessions: ${listed(settings)}.`);
+  }
   if (any((r) => r.memberships > 0)) {
     add(
       "role_membership",
@@ -266,6 +344,13 @@ export async function checkWriterConnection(db: Queryable): Promise<WriterRolePr
       "owner",
       "The service's login or role owns the tables, functions, schema or database, and could turn off the triggers that guard history; give it its own login role.",
     );
+  }
+  const owns = all((r) => r.owns);
+  if (owns.length > 0)
+    add("owns_object", `Objects the service's login or role owns: ${listed(owns)}.`);
+  const objects = all((r) => r.objects);
+  if (objects.length > 0) {
+    add("object_privilege", `Privileges on objects besides public's tables: ${listed(objects)}.`);
   }
   const extra = all((r) => r.extra);
   if (unknown || extra.length > 0) {

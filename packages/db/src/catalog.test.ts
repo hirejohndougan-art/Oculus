@@ -418,7 +418,7 @@ describe("templates", () => {
         SET definition = jsonb_set(definition, '{fields,0,visibility}', '"everyone"')
         WHERE organization_id = ${org}::uuid`);
       await q.execute(
-        sql`ALTER TABLE public.template_versions ENABLE TRIGGER zzzz_template_versions_no_update`,
+        sql`ALTER TABLE public.template_versions ENABLE ALWAYS TRIGGER zzzz_template_versions_no_update`,
       );
     });
     expect((await readTemplate(db, org, "authority"))?.ok).toBe(false);

@@ -87,6 +87,12 @@ async function withRole(q: Queryable, statement: string, role: string): Promise<
   END $$`);
 }
 
+function urlAs(url: string, role: string): string {
+  const u = new URL(url);
+  u.username = role;
+  return u.toString();
+}
+
 function as(url: string, role: string): Database {
   const u = new URL(url);
   u.username = role;
@@ -108,6 +114,8 @@ async function ready(): Promise<void> {
       "probe",
       "bypasser",
       "helper",
+      "hostowner",
+      "hostwriter",
     ].map((r) => `oculus_t032_${r}_${suffix}`);
     const [writerRole = "", readerRole = "", nobodyRole = ""] = roles;
     const server = openDatabase(testServerUrl(), { max: 1 });
@@ -471,9 +479,16 @@ describe("the writer role", () => {
       });
     };
     const server = openDatabase(testServerUrl(), { max: 1 });
-    const pool = as(s.testDb.url, probe);
-    const probeCodes = async (): Promise<string[]> =>
-      (await createService(pool).checkConnection()).map((p) => p.code);
+    // A new connection each time: role and database settings apply to new
+    // sessions only.
+    const probeCodes = async (): Promise<string[]> => {
+      const fresh = as(s.testDb.url, probe);
+      try {
+        return (await createService(fresh).checkConnection()).map((p) => p.code);
+      } finally {
+        await fresh.close();
+      }
+    };
     try {
       await s.owner.transaction((q) => grantWriterRole(q, probe));
       // The helper holds TRIGGER: a member could SET ROLE to it (B1).
@@ -533,7 +548,7 @@ describe("the writer role", () => {
           "GRANT SET ON PARAMETER session_replication_role TO %I",
           "REVOKE SET ON PARAMETER session_replication_role FROM %I",
           [probe],
-          ["parameter_privilege"],
+          ["object_privilege", "parameter_privilege"],
         ],
         [
           server,
@@ -547,7 +562,7 @@ describe("the writer role", () => {
           "GRANT ALTER SYSTEM ON PARAMETER work_mem TO %I",
           "REVOKE ALTER SYSTEM ON PARAMETER work_mem FROM %I",
           [probe],
-          ["parameter_privilege"],
+          ["object_privilege", "parameter_privilege"],
         ],
         // CREATE on the database (B3) or on schema public, to the role or to PUBLIC.
         [
@@ -596,7 +611,7 @@ describe("the writer role", () => {
           "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT DELETE ON TABLES TO %I",
           "ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE DELETE ON TABLES FROM %I",
           [probe],
-          ["default_privilege"],
+          ["object_privilege", "default_privilege"],
         ],
         [
           s.owner,
@@ -604,6 +619,37 @@ describe("the writer role", () => {
           "ALTER DEFAULT PRIVILEGES REVOKE SELECT ON TABLES FROM PUBLIC",
           [],
           ["default_privilege"],
+        ],
+        // Privileges on objects besides public's tables (pg_shdepend).
+        [
+          s.owner,
+          "GRANT EXECUTE ON FUNCTION public.arrangement_lock(uuid) TO %I",
+          "REVOKE EXECUTE ON FUNCTION public.arrangement_lock(uuid) FROM %I",
+          [probe],
+          ["object_privilege"],
+        ],
+        // Settings for the role's new sessions (B2): replica mode is refused
+        // twice over (the setting, and the session it starts in).
+        [
+          server,
+          "ALTER ROLE %I SET session_replication_role = replica",
+          "ALTER ROLE %I RESET session_replication_role",
+          [probe],
+          ["replication_role", "role_setting"],
+        ],
+        [
+          server,
+          "ALTER ROLE %I IN DATABASE %I SET session_replication_role = replica",
+          "ALTER ROLE %I IN DATABASE %I RESET session_replication_role",
+          [probe, db],
+          ["replication_role", "role_setting"],
+        ],
+        [
+          server,
+          "ALTER ROLE %I IN DATABASE %I SET search_path = 'somewhere_else'",
+          "ALTER ROLE %I IN DATABASE %I RESET search_path",
+          [probe, db],
+          ["role_setting"],
         ],
       ];
       for (const [on, grant, revoke, names, codes] of cases) {
@@ -618,13 +664,92 @@ describe("the writer role", () => {
       // A revoke-only default (EXECUTE on functions kept for PUBLIC) is fine.
       await run(s.owner, "ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM %I", probe);
       expect(await probeCodes()).toEqual([]);
-      // GRANT OPTION on its own privileges is harmless: it can only hand them on.
+      // GRANT OPTION on its own privileges would let it hand them on: refused.
       await run(s.owner, "GRANT SELECT ON public.records TO %I WITH GRANT OPTION", probe);
       try {
-        expect(await probeCodes()).toEqual([]);
+        expect(await probeCodes()).toEqual(["extra_privilege"]);
       } finally {
         await run(s.owner, "REVOKE GRANT OPTION FOR SELECT ON public.records FROM %I", probe);
       }
+      // Time limits for the writer's sessions are allowed.
+      await run(server, "ALTER ROLE %I IN DATABASE %I SET lock_timeout = '5s'", probe, db);
+      try {
+        expect(await probeCodes()).toEqual([]);
+      } finally {
+        await run(server, "ALTER ROLE %I IN DATABASE %I RESET lock_timeout", probe, db);
+      }
+      // A schema it owns, and one it may use or create in.
+      await run(s.owner, "CREATE SCHEMA %I AUTHORIZATION %I", `t032_${probe}`, probe);
+      try {
+        expect(await probeCodes()).toEqual(["owns_object", "schema_create"]);
+      } finally {
+        await run(s.owner, "DROP SCHEMA %I", `t032_${probe}`);
+      }
+      await run(s.owner, "CREATE SCHEMA %I", `t032_${probe}`);
+      try {
+        await run(s.owner, "GRANT USAGE ON SCHEMA %I TO %I", `t032_${probe}`, probe);
+        expect(await probeCodes()).toEqual(["object_privilege"]);
+        await run(s.owner, "GRANT CREATE ON SCHEMA %I TO %I", `t032_${probe}`, probe);
+        expect(await probeCodes()).toEqual(["object_privilege", "schema_create"]);
+        await run(s.owner, "REVOKE ALL ON SCHEMA %I FROM %I", `t032_${probe}`, probe);
+        await run(s.owner, "GRANT CREATE ON SCHEMA %I TO PUBLIC", `t032_${probe}`);
+        expect(await probeCodes()).toEqual(["schema_create"]);
+      } finally {
+        await run(s.owner, "DROP SCHEMA %I", `t032_${probe}`);
+      }
+      expect(await probeCodes()).toEqual([]);
+      // B1: a subscription it owns (grants since revoked), even disabled.
+      const subscription = `t032_${probe}`;
+      await run(
+        s.owner,
+        "CREATE SUBSCRIPTION %I CONNECTION 'dbname=oculus_t032_nowhere' PUBLICATION nothing WITH (connect = false)",
+        subscription,
+      );
+      try {
+        await run(server, "GRANT pg_create_subscription TO %I", probe);
+        await run(server, "GRANT CREATE ON DATABASE %I TO %I", db, probe);
+        await run(s.owner, "ALTER SUBSCRIPTION %I OWNER TO %I", subscription, probe);
+        await run(server, "REVOKE CREATE ON DATABASE %I FROM %I", db, probe);
+        await run(server, "REVOKE pg_create_subscription FROM %I", probe);
+        expect(await probeCodes()).toEqual(["owns_object"]);
+      } finally {
+        await run(s.owner, "ALTER SUBSCRIPTION %I SET (slot_name = NONE)", subscription);
+        await run(s.owner, "DROP SUBSCRIPTION %I", subscription);
+      }
+      expect(await probeCodes()).toEqual([]);
+      // A whole database in replica mode, or every role in it (B2). Last,
+      // and reset at once: they apply to every new session of the database.
+      for (const [set, reset, names] of [
+        [
+          "ALTER DATABASE %I SET session_replication_role = replica",
+          "ALTER DATABASE %I RESET session_replication_role",
+          [db],
+        ],
+        [
+          "ALTER ROLE ALL IN DATABASE %I SET session_replication_role = replica",
+          "ALTER ROLE ALL IN DATABASE %I RESET session_replication_role",
+          [db],
+        ],
+      ] as const) {
+        await run(server, set, ...names);
+        try {
+          expect({ set, found: await probeCodes() }).toEqual({
+            set,
+            found: ["replication_role", "role_setting"],
+          });
+        } finally {
+          await run(server, reset, ...names);
+        }
+      }
+      expect(await probeCodes()).toEqual([]);
+      // This session in replica mode, set by hand.
+      const writerName = s.roles[0] ?? "";
+      const inReplica = await s.owner.transaction(async (q) => {
+        await q.rows(sql`SELECT set_config('session_replication_role', 'replica', true)`);
+        await q.rows(sql`SELECT set_config('role', ${writerName}, true)`);
+        return (await checkWriterConnection(q)).map((p) => p.code);
+      });
+      expect(inReplica).toContain("replication_role");
       // The owner's list is long; the message names five and counts the rest.
       const ownerProblems = await createService(s.owner).checkConnection();
       const extra = ownerProblems.find((p) => p.code === "extra_privilege")?.message ?? "";
@@ -640,7 +765,6 @@ describe("the writer role", () => {
       });
       expect(switched).toEqual(expect.arrayContaining(["superuser", "owner"]));
     } finally {
-      await pool.close();
       await server.close();
     }
   });
@@ -821,6 +945,84 @@ describe("the writer role", () => {
   });
 });
 
+describe("the guards fire in replica mode too", () => {
+  it("refuses a record write without a version, a version change and a deletion without a tombstone", async () => {
+    await ready();
+    const org = await organization();
+    const record = await create(org, objectDraft());
+    const where = sql`organization_id = ${org}::uuid AND id = ${record.id}::uuid`;
+    const inReplica = (statement: Sql) =>
+      refusal(
+        s.owner.transaction(async (q) => {
+          await q.rows(sql`SELECT set_config('session_replication_role', 'replica', true)`);
+          await q.execute(statement);
+        }),
+      );
+    expect(
+      await inReplica(
+        sql`UPDATE public.records SET title = 'Unversioned', version = version + 1 WHERE ${where}`,
+      ),
+    ).toEqual({ code: IDENTITY, constraint: "records_have_version" });
+    expect(
+      await inReplica(
+        sql`UPDATE public.record_versions SET reason = 'Rewritten.' WHERE organization_id = ${org}::uuid`,
+      ),
+    ).toEqual({ code: IDENTITY, constraint: "record_versions_append_only" });
+    expect(
+      await inReplica(
+        sql`UPDATE public.template_versions SET definition = definition WHERE organization_id = ${org}::uuid`,
+      ),
+    ).toEqual({ code: IDENTITY, constraint: "template_versions_append_only" });
+    expect(await inReplica(sql`DELETE FROM public.records WHERE ${where}`)).toEqual({
+      code: IDENTITY,
+      constraint: "records_delete_needs_version",
+    });
+    expect(ok(await readStoredRecord(s.owner, org, record.id)).version).toBe(1);
+    // Every trigger on public's tables is ALWAYS.
+    const notAlways = await s.owner.rows(sql`
+      SELECT c.relname, t.tgname FROM pg_catalog.pg_trigger t
+      JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public' AND NOT t.tgisinternal AND t.tgenabled <> 'A'`);
+    expect(notAlways).toEqual([]);
+  });
+});
+
+describe("a database owned by a plain role, as on shared hosting", () => {
+  it("migrates as that role, and a correct writer passes the check", async () => {
+    await ready();
+    const [hostOwner = "", hostWriter = ""] = s.roles.slice(9);
+    const hosted = await freshDatabase();
+    const server = openDatabase(testServerUrl(), { max: 1 });
+    try {
+      await server.transaction(async (q) => {
+        await q.rows(sql`SELECT set_config('oculus_test.db', ${hosted.name}, true),
+                                set_config('oculus_test.role', ${hostOwner}, true)`);
+        await q.execute(sql`DO $$ BEGIN
+          EXECUTE format('ALTER DATABASE %I OWNER TO %I', current_setting('oculus_test.db'),
+                         current_setting('oculus_test.role'));
+        END $$`);
+      });
+      await migrate({ connectionString: urlAs(hosted.url, hostOwner) });
+      const owner = openDatabase(urlAs(hosted.url, hostOwner), { max: 1 });
+      const writer = openDatabase(urlAs(hosted.url, hostWriter), { max: 1 });
+      try {
+        await owner.transaction((q) => grantWriterRole(q, hostWriter));
+        expect(await createService(writer).checkConnection()).toEqual([]);
+        expect((await createService(owner).checkConnection()).map((p) => p.code)).toContain(
+          "owner",
+        );
+      } finally {
+        await writer.close();
+        await owner.close();
+      }
+    } finally {
+      await server.close();
+      await hosted.drop();
+    }
+  });
+});
+
 describe("template and record type versions are append-only", () => {
   it("refuses UPDATE, DELETE and TRUNCATE by any role, the owner and a column grant included", async () => {
     await ready();
@@ -960,7 +1162,7 @@ describe("nothing follows a deletion version", () => {
     const [on] = await s.owner.rows<{ enabled: string }>(sql`
       SELECT tgenabled AS enabled FROM pg_catalog.pg_trigger
       WHERE tgname = 'zzzz_records_not_deleted'`);
-    expect(on?.enabled).toBe("O");
+    expect(on?.enabled).toBe("A");
   });
 });
 

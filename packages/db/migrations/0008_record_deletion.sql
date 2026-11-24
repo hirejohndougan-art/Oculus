@@ -268,3 +268,31 @@ CREATE TRIGGER zzzz_record_type_versions_no_update BEFORE UPDATE OR DELETE ON pu
   FOR EACH ROW EXECUTE FUNCTION public.definition_versions_append_only();
 CREATE TRIGGER zzzz_record_type_versions_no_truncate BEFORE TRUNCATE ON public.record_type_versions
   FOR EACH STATEMENT EXECUTE FUNCTION public.definition_versions_append_only();
+
+-- 4. Every guard trigger fires in replica mode too (fourth independent
+-- review). With session_replication_role = replica, ordinary (ORIGIN)
+-- triggers don't fire, so a session that starts in replica mode (a role or
+-- database setting, a subscription's apply worker) could write records
+-- without versions, rewrite history and skip the arrangement guard. ENABLE
+-- ALWAYS makes them fire whatever the setting. This covers every trigger
+-- the migrations have made on public tables so far (0002 to 0008); any later
+-- migration that adds a guard trigger must ENABLE ALWAYS it too. Foreign keys
+-- are internal triggers that replica mode still skips and that only a
+-- superuser could change, so the service also refuses to write in replica
+-- mode (checkWriterConnection, D-067).
+DO $$
+DECLARE
+  t record;
+BEGIN
+  FOR t IN
+    SELECT c.relname, tg.tgname
+    FROM pg_catalog.pg_trigger tg
+    JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND NOT tg.tgisinternal
+    ORDER BY c.relname, tg.tgname
+  LOOP
+    EXECUTE format('ALTER TABLE public.%I ENABLE ALWAYS TRIGGER %I', t.relname, t.tgname);
+  END LOOP;
+END
+$$;

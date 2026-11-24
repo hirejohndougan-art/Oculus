@@ -543,7 +543,7 @@ describe("a record and its version are written together", () => {
             // its events are pending); the transaction rolls back either way.
             await q.execute(sql`SET CONSTRAINTS ALL IMMEDIATE`);
             await q.execute(
-              sql`ALTER TABLE public.records ENABLE TRIGGER zzzz_records_version_step`,
+              sql`ALTER TABLE public.records ENABLE ALWAYS TRIGGER zzzz_records_version_step`,
             );
           }),
         ),
@@ -565,8 +565,12 @@ describe("a record and its version are written together", () => {
         UPDATE public.records SET title = ${record.title}, updated_at = ${T}::timestamptz,
                                   version = 1
         WHERE organization_id = ${org}::uuid AND id = ${record.id}::uuid`);
-      await q.execute(sql`ALTER TABLE public.records ENABLE TRIGGER zzzz_records_version_step`);
-      await q.execute(sql`ALTER TABLE public.records ENABLE TRIGGER zzzz_records_have_version`);
+      await q.execute(
+        sql`ALTER TABLE public.records ENABLE ALWAYS TRIGGER zzzz_records_version_step`,
+      );
+      await q.execute(
+        sql`ALTER TABLE public.records ENABLE ALWAYS TRIGGER zzzz_records_have_version`,
+      );
     });
     expect(
       codes(
@@ -661,7 +665,7 @@ describe("versions are append-only", () => {
         UPDATE public.record_versions SET record = jsonb_set(record, '{fields}', '{"Bad Key": 1}')
         WHERE organization_id = ${org}::uuid AND record_id = ${record.id}::uuid`);
       await q.execute(
-        sql`ALTER TABLE public.record_versions ENABLE TRIGGER zzzz_record_versions_append_only`,
+        sql`ALTER TABLE public.record_versions ENABLE ALWAYS TRIGGER zzzz_record_versions_append_only`,
       );
     });
     const read = await readVersions(db, org, record.id);
@@ -767,8 +771,12 @@ describe("versions are append-only", () => {
           UPDATE public.records SET title = ${record.title}, updated_at = ${T}::timestamptz,
                                     version = 1
           WHERE organization_id = ${org}::uuid AND id = ${record.id}::uuid`);
-        await q.execute(sql`ALTER TABLE public.records ENABLE TRIGGER zzzz_records_version_step`);
-        await q.execute(sql`ALTER TABLE public.records ENABLE TRIGGER zzzz_records_have_version`);
+        await q.execute(
+          sql`ALTER TABLE public.records ENABLE ALWAYS TRIGGER zzzz_records_version_step`,
+        );
+        await q.execute(
+          sql`ALTER TABLE public.records ENABLE ALWAYS TRIGGER zzzz_records_have_version`,
+        );
       });
       expect(
         await refusal(
