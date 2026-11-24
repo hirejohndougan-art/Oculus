@@ -11,7 +11,7 @@
 // the caller's, and the server settings go on pg_ctl's command line; nothing
 // is written into the data directory by this process.
 import { execFileSync, spawnSync } from "node:child_process";
-import { chownSync, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { chownSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -82,9 +82,12 @@ export function serverOptions(dir) {
 
 /**
  * Starts a throwaway server. Returns `{ url, dir, stop }`. Throws (after
- * cleaning up) if the server can't be started.
+ * cleaning up) if the server can't be started. With `password`, the server
+ * uses scram-sha-256 password authentication instead of trust, and the
+ * superuser `postgres` has that password (for tests of password handling,
+ * D-064); the URL doesn't include it.
  */
-export function startTestDatabase({ bin, log = console.log } = {}) {
+export function startTestDatabase({ bin, log = console.log, password } = {}) {
   const asRoot = typeof process.getuid === "function" && process.getuid() === 0;
   const runuser = asRoot ? findRunuser() : undefined;
   const dir = mkdtempSync(join(tmpdir(), "oculus-pg-"));
@@ -139,23 +142,35 @@ export function startTestDatabase({ bin, log = console.log } = {}) {
 
   try {
     const options = serverOptions(dir);
+    let owner;
     if (asRoot) {
       const uid = Number(execFileSync("id", ["-u", "postgres"], { encoding: "utf8" }).trim());
       const gid = Number(execFileSync("id", ["-g", "postgres"], { encoding: "utf8" }).trim());
       chownSync(dir, uid, gid);
+      owner = { uid, gid };
     }
-    run("initdb", [
-      "-D",
-      data,
-      "-U",
-      "postgres",
-      "-A",
-      "trust",
-      "-E",
-      "UTF8",
-      "--no-locale",
-      "--no-sync",
-    ]);
+    const auth = ["-A", "trust"];
+    const pwfile = join(dir, "pwfile");
+    if (password !== undefined) {
+      writeFileSync(pwfile, `${password}\n`, { mode: 0o600 });
+      if (owner) chownSync(pwfile, owner.uid, owner.gid);
+      auth.splice(0, 2, "-A", "scram-sha-256", `--pwfile=${pwfile}`);
+    }
+    try {
+      run("initdb", [
+        "-D",
+        data,
+        "-U",
+        "postgres",
+        ...auth,
+        "-E",
+        "UTF8",
+        "--no-locale",
+        "--no-sync",
+      ]);
+    } finally {
+      rmSync(pwfile, { force: true });
+    }
     started = true;
     run("pg_ctl", ["-D", data, "-l", logFile, "-o", options, "-w", "-t", "60", "start"]);
     log(`Started a throwaway PostgreSQL in ${dir} (socket only).`);

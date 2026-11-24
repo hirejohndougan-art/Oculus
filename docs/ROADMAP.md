@@ -65,8 +65,9 @@ The data model in TypeScript, written for any archive or museum rather than one 
   - `npm run gate` runs format, lint, typecheck, tests, build, `npm audit --audit-level=high` and a license check (MIT, BSD, ISC, Apache-2.0 or similarly permissive only).
   - `gate-baseline.json`, `.nvmrc` with the current Node LTS, and a GitHub Actions workflow that runs the gate on every push.
   - At least one real test, so the gate shows it is working.
-- [~] T-001a **Turn on GitHub security alerts.** (needs John) CodeQL default setup turned on by John (2026-11-23). Still open: confirm Dependabot alerts are on; the autopilot's GitHub app can't read either alert list (HTTP 403 "Resource not accessible by integration") until it is granted security-alert read permission.
+- [x] T-001a **Turn on GitHub security alerts.** (needs John) CodeQL default setup turned on by John (2026-11-23). Still open: confirm Dependabot alerts are on; the autopilot's GitHub app can't read either alert list (HTTP 403 "Resource not accessible by integration") until it is granted security-alert read permission.
   - Dependabot alerts are disabled on the repository and code scanning isn't reachable from the autopilot. John: enable Dependabot alerts and CodeQL default setup in the repo's Settings → Code security, so the security run can read them.
+  - Done (John, 2026-11-23): Dependabot alerts, malware alerts, security updates and grouped security updates on; CodeQL default setup on. The autopilot's GitHub connection can't read the alert lists (403), but Dependabot's security-update pull requests are visible: the upkeep run checks open Dependabot pull requests (`gh api "repos/hirejohndougan-art/Oculus/pulls?state=open"`, author `dependabot[bot]`), runs the gate on each, and records them; merging one follows the usual rules (gate passes, a major version gets its own decision entry).
 - [ ] T-001b **Revisit TypeScript 7 and Vite 8.**
   - Both majors were turned down in D-006 and the upkeep run of 2026-11-21 found the reasons still hold: typescript-eslint 8.73 supports only TypeScript `<6.1`, and Vite 8 still depends on MPL-2.0 `lightningcss`. Move when typescript-eslint supports TypeScript 7, or when Vite drops `lightningcss` as a required dependency; each move gets its own decision entry.
 - [x] U-001 **Direct tests for the shared helpers.** (upkeep)
@@ -235,7 +236,7 @@ Database:
 - [ ] T-028 **Staff search.** deps: T-025, T-026 (risky)
   - PostgreSQL full-text search over titles and text fields, and lookup by current or former identifier through the comparison key (§2 "old numbers stay searchable"), with ranking and accent-insensitive matching. This is staff search only. A public search (Phase 4) must index only published public views, and this index must never be used for it.
   - Built on branch `autopilot/T-028` (D-066): migration 0007 (`records.search_document`, a stored generated tsvector folded by the pure-SQL `search_fold`, GIN index) and `searchRecords` (text and identifier-key lookup, ranked, keyset pages, organization-scoped, staff only).
-- [ ] T-052 **Backup and restore tools.** deps: T-024 (risky)
+- [x] T-052 **Backup and restore tools.** deps: T-024 (risky) Done: D-064. `npm run backup` / `npm run restore`: pg_dump custom archive plus a manifest, restore only into a fresh database by a non-superuser role, checked afterwards. Five review rounds.
   - A script that backs up the database to a file and one that restores it into an empty database, with a test that restores a backup and finds every record and version. Backups are a command any scheduler can run (D-035); where the copies go is set up in T-051.
 
 Change log and versions:
@@ -306,7 +307,7 @@ Server and deployment:
   - Public Subjects pages (D-062): never call `termUsageCounts` or read `record_terms` from a public site. Their counts are staff-only (unpublished records and staff fields too); public counts come from T-034's count over `publicOutput` or the public views of published records (or the index built from them at publish time).
 - [ ] T-040 **Sending password reset email.** deps: T-039 (risky)
   - Deliver reset and invitation messages over SMTP (D-035), so any host's mail or a mail service works, with its credentials only in environment variables, and nothing about the account in the message beyond the link.
-- [ ] T-051 **Deploy and run.** deps: T-050, T-052 (needs John) (risky) John: SiteGround shared hosting (D-046); confirm with SiteGround support that an always-running Node process is allowed.
+- [ ] T-051 **Deploy and run.** deps: T-050, T-052 (needs John) (risky) John: SiteGround GoGeek (D-046): Node.js Projects are supported (start command in `package.json`, Site Tools for settings and logs, cron for scheduled jobs). Separate database users: yes (Site Tools › PostgreSQL Manager); no superuser. Still to check: the PostgreSQL version (`SELECT version();`, must be 15+; SiteGround manages it), a database owned by the restore user, and `pg_dump`/`pg_restore` in cron.
   - Production setup for any host meeting D-035, with SiteGround as the first: confirm with John that his plan allows a long-running Node process, then TLS, secrets from the environment, scheduled backups and an off-site copy (T-052), session and token cleanup as commands a scheduler or cron can run, and a written runbook for updates and restore (§9). Never deploy without John.
 
 - [ ] T-053 **Phase 2 review.** deps: T-020 to T-052

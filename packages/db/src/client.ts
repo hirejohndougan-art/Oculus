@@ -99,8 +99,39 @@ export const typeParsers = {
 /** Server settings for every session (the server's own text formats). */
 export const SESSION_OPTIONS = "-c TimeZone=UTC -c DateStyle=ISO,YMD -c IntervalStyle=iso_8601";
 
-export function clientConfig(connectionString: string): pg.ClientConfig {
-  return { connectionString, types: typeParsers, options: SESSION_OPTIONS };
+/**
+ * A connection given field by field rather than as a URL: what backup and
+ * restore use, so the driver connects to exactly what pg_dump and pg_restore
+ * are told (D-064). TLS options are Node's (`tls.connect`).
+ */
+export interface ConnectionSettings {
+  host: string;
+  port: number;
+  database: string;
+  user: string;
+  /** Absent: PGPASSWORD or the password file, as libpq does. */
+  password?: string;
+  ssl:
+    | false
+    | {
+        rejectUnauthorized: true;
+        ca?: string;
+        cert?: string;
+        key?: string;
+        /** Only for verify-ca: the chain is checked, the host name is not. */
+        checkServerIdentity?: () => undefined;
+      };
+  connectionTimeoutMillis?: number;
+}
+
+/** A connection URL (from the environment, never the repo) or settings. */
+export type ConnectionTarget = string | ConnectionSettings;
+
+export function clientConfig(target: ConnectionTarget): pg.ClientConfig {
+  const common = { types: typeParsers, options: SESSION_OPTIONS };
+  return typeof target === "string"
+    ? { connectionString: target, ...common }
+    : { ...target, ...common };
 }
 
 /**
@@ -175,7 +206,10 @@ export function openDatabase(connectionString: string, options: DatabaseOptions 
 /** A single dedicated connection, for the migration runner (it holds a session lock). */
 export interface Session extends Queryable {
   close(): Promise<void>;
-  /** Runs `BEGIN`, `COMMIT`, `ROLLBACK` or one of the runner's savepoint statements. */
+  /**
+   * Runs `BEGIN` (or the backup's read-only snapshot `BEGIN`), `COMMIT`,
+   * `ROLLBACK` or one of the runner's savepoint statements.
+   */
   control(statement: ControlStatement): Promise<void>;
   /** @internal Runs a whole migration file (several statements) with the simple protocol. */
   runScript(text: string): Promise<void>;
@@ -190,13 +224,14 @@ export interface Session extends Queryable {
 /** The fixed transaction-control statements a session may send. */
 export type ControlStatement =
   | "BEGIN"
+  | "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY"
   | "COMMIT"
   | "ROLLBACK"
   | "SAVEPOINT oculus_migration"
   | "ROLLBACK TO SAVEPOINT oculus_migration";
 
 export async function openSession(
-  connectionString: string,
+  connectionString: ConnectionTarget,
   applicationName = "oculus",
 ): Promise<Session> {
   const client = new pg.Client({
