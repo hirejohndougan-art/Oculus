@@ -1,6 +1,6 @@
 /**
  * Sites, role assignments, System settings, and what one person may do in
- * one organization, read under locks (T-041, D-072, migration 0011).
+ * one organization, read under locks (T-041, D-072, migration 0013).
  *
  * The rules are core's (`permissions.ts`); this module reads what they need
  * in the caller's transaction, so a check stays true until COMMIT:

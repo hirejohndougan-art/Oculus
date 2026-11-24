@@ -1017,7 +1017,7 @@ export async function lockArrangement(
   mode: "exclusive" | "shared" = "exclusive",
 ): Promise<void> {
   if (!isOrganizationId(organizationId)) throw new TypeError(BAD_ORGANIZATION);
-  // `shared` (0011): for checks that only read where records sit; they run
+  // `shared` (0013): for checks that only read where records sit; they run
   // side by side and wait for (and hold off) every exclusive holder, which
   // is every move.
   await db.execute(

@@ -1,8 +1,9 @@
 -- Sites, roles per organization and per site, collection-level grants, and
 -- System settings (T-041, D-072, D-025, D-036).
 --
--- Numbered 0011: 0010 is branch autopilot/T-037's (sessions). The runner
--- allows gaps, never two files with one number.
+-- Numbered 0013: it merges after 0010 (sessions, T-037) and 0012 (workflow
+-- states, T-034b/c), and the runner refuses a migration that sorts before
+-- one already applied. 0011 is unused.
 --
 -- Follows D-060: organization_id in every key and every foreign key between
 -- an organization's rows, identity fixed by catalog_keep_identity (zzzz_*),
