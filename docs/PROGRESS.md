@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-23 19:06 CT — manual (John: "continue") — T-030 Compare and restore versions; T-031 Edit-conflict protection
+- Result: done
+- What changed: `compareRecords` (core) and `compareVersions` (db); `restoreVersion` writes a new version equal to an old one only after today's template, rights, identifier, link, record-type and arrangement checks, with fixed-text refusals and an explicit list confirmation for values landing in fields public today; identifiers are never restored. `updateRecord` conflicts list the field names changed since the editor's version (no values). Migration `0006_arrangement_guard.sql`: a per-organization arrangement lock and a trigger refusing parent loops and depth over 64 (ancestors and moved subtrees) for any writer.
+- Decisions: D-065
+- Review: three independent rounds (concurrent restores forming a loop; old staff values restored into fields since made public; conflict results and refusal messages exposing old values; subtree depth; lock order); all fixed with tests, including two-connection races.
+- Gate: PASS · tests_passing 3342 (was 3311) · npm audit clean
+- Next: T-052 backup and restore (fourth round: allowlisted restore role, signals); T-032 service layer
+
 ## 2026-11-23 18:12 CT — manual (John: "keep going") — T-029 Change log and version history
 - Result: done
 - What changed: migration `0005_record_versions.sql`: `records.version` and an append-only `record_versions` table (full validated snapshot, actor, time and changed fields filled by the database, optional reason, the writing transaction). The database refuses a record write without its own version written in the same transaction (checked at COMMIT), reuse of a deleted ID, kind changes, backwards `updatedAt`, and any UPDATE/DELETE/TRUNCATE of versions. `catalog.ts` `insertRecord`/`updateRecord` (expected version) / `readStoredRecord`; `record-versions.ts` `readVersions`/`readVersion` re-validated with core. App-role GRANTs documented and tested with a non-owner role (no DELETE on records until T-032's tombstones).
