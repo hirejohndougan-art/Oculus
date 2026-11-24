@@ -114,6 +114,13 @@ afterAll(async () => {
       DROP ROLE IF EXISTS oculus_t052_sneaky;
       DROP ROLE IF EXISTS oculus_t052_files;
       DROP ROLE IF EXISTS oculus_t052_creator;
+      DROP ROLE IF EXISTS oculus_t052_signal;
+      DROP ROLE IF EXISTS oculus_t052_nested;
+      DROP ROLE IF EXISTS oculus_t052_admins;
+      DROP ROLE IF EXISTS oculus_t052_createdb;
+      DROP ROLE IF EXISTS oculus_t052_replicator;
+      DROP ROLE IF EXISTS oculus_t052_bypass;
+      DROP ROLE IF EXISTS oculus_t052_subscriber;
       DROP ROLE IF EXISTS oculus_t052_gone;
     EXCEPTION WHEN dependent_objects_still_exist THEN NULL; END $$`),
   ).catch(() => undefined);
@@ -778,7 +785,7 @@ describe("backup and restore", () => {
       allowSuperuser: true,
       log: (line) => logged.push(line),
     });
-    expect(logged.join("\n")).toContain("WARNING: restoring with superuser powers");
+    expect(logged.join("\n")).toContain("WARNING: restoring as a role that is not plain");
   }, 60_000);
 
   it("checks and restores the database libpq would reach, even when the query string names it", async () => {
@@ -1339,24 +1346,64 @@ async function targetOwnedBy(owner: string): Promise<{ testDb: TestDatabase; url
 }
 
 describe("who may restore", () => {
-  it("refuses roles with superuser powers through membership or CREATEROLE", async () => {
+  it("refuses every role but a plain one: attributes or any membership at all", async () => {
     const { file } = await sharedBackup();
-    await role("oculus_t052_sneaky", ["GRANT postgres TO oculus_t052_sneaky"]);
-    await role("oculus_t052_files", ["GRANT pg_execute_server_program TO oculus_t052_files"]);
-    await role("oculus_t052_creator", [], "LOGIN CREATEROLE");
-    const cases: [string, string][] = [
-      ["oculus_t052_sneaky", "oculus_t052_sneaky is a member of postgres"],
-      ["oculus_t052_files", "oculus_t052_files is a member of pg_execute_server_program"],
-      ["oculus_t052_creator", "oculus_t052_creator has CREATEROLE"],
+    await role("oculus_t052_admins", [], "NOLOGIN CREATEROLE");
+    const [subscription] = await pool(testServerUrl()).rows(
+      sql`SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'pg_create_subscription'`,
+    );
+    const cases: [string, string, string[], string][] = [
+      [
+        "oculus_t052_sneaky",
+        "LOGIN",
+        ["GRANT postgres TO oculus_t052_sneaky"],
+        "is a member of postgres",
+      ],
+      [
+        "oculus_t052_files",
+        "LOGIN",
+        ["GRANT pg_execute_server_program TO oculus_t052_files"],
+        "is a member of pg_execute_server_program",
+      ],
+      [
+        "oculus_t052_signal",
+        "LOGIN",
+        ["GRANT pg_signal_backend TO oculus_t052_signal"],
+        "is a member of pg_signal_backend",
+      ],
+      [
+        "oculus_t052_nested",
+        "LOGIN",
+        ["GRANT oculus_t052_admins TO oculus_t052_nested"],
+        "is a member of oculus_t052_admins",
+      ],
+      ["oculus_t052_creator", "LOGIN CREATEROLE", [], "has CREATEROLE"],
+      ["oculus_t052_createdb", "LOGIN CREATEDB", [], "has CREATEDB"],
+      ["oculus_t052_replicator", "LOGIN REPLICATION", [], "has REPLICATION"],
+      ["oculus_t052_bypass", "LOGIN BYPASSRLS", [], "has BYPASSRLS"],
     ];
-    for (const [name, reason] of cases) {
+    // PostgreSQL 16 and newer.
+    if (subscription !== undefined) {
+      cases.push([
+        "oculus_t052_subscriber",
+        "LOGIN",
+        ["GRANT pg_create_subscription TO oculus_t052_subscriber"],
+        "is a member of pg_create_subscription",
+      ]);
+    }
+    for (const [name, attributes, grants, reason] of cases) {
+      await role(name, grants, attributes);
       const target = await targetOwnedBy(name);
       const refused = await refusal(restore({ connectionString: target.url, file }));
       expect(refused.code, name).toBe("superuser");
       expect(refused.message).toContain(reason);
+      expect(refused.message).toContain("CREATE ROLE oculus_restore LOGIN");
       expect(await contentsOf(pool(target.testDb.url))).toEqual({});
     }
-  }, 60_000);
+    // A plain role that owns the database restores.
+    const plain = await emptyTarget();
+    await restore({ connectionString: plain.url, file });
+  }, 90_000);
 
   it("verifies grants made to the restoring role, which becomes the owner", async () => {
     await roles();
@@ -1409,52 +1456,98 @@ describe("who may restore", () => {
 });
 
 describe("passwords and TLS for the tools", () => {
-  it("pass a 2,000-character password in a private password file, never the service file", async () => {
-    const { testDb } = await populated();
-    const target = await emptyTarget();
-    const dir = await directory();
-    const temp = await directory();
-    const log = join(dir, "calls.log");
-    const bin = await wrappedTools(
-      (
-        tool,
-        real,
-      ) => `{ echo "== ${tool}"; echo "pgpassfile: $PGPASSFILE"; echo "pgpassword: \${PGPASSWORD:-none}"
-  echo "pgpass-mode: $(stat -c %a "$PGPASSFILE")"; grep -c '^password=' "$PGSERVICEFILE" | sed 's/^/service-password-lines: /'
-  echo "pgpass-length: $(wc -c < "$PGPASSFILE")"; } >> '${log}'
-exec '${real}' "$@"`,
-    );
-    const long = "p".repeat(1000) + ":\\" + "q".repeat(998);
-    const env = (url: string): Record<string, string | undefined> => ({
-      ...process.env,
-      PG_BIN: bin,
-      PGPASSWORD: "fake-other-password",
-      OCULUS_DATABASE_URL: url,
-    });
-    const lines: string[] = [];
-    const out = (l: string): void => {
-      lines.push(l);
+  it("authenticate with a 2,000-character password from a private password file (scram-sha-256)", async () => {
+    // A throwaway server of this test's own, with password authentication.
+    const helper = (await import(
+      join(
+        dirname(fileURLToPath(import.meta.url)),
+        "..",
+        "..",
+        "..",
+        "scripts",
+        "test-database.mjs",
+      )
+    )) as {
+      findPostgresBin: () => string | undefined;
+      startTestDatabase: (o: { bin: string; log: () => void; password: string }) => {
+        url: string;
+        stop: () => void;
+      };
     };
-    const file = join(dir, "long.oculus-backup");
-    const sourceUrl = as(testDb.url, "postgres", long);
-    expect(await runBackupCli([file], env(sourceUrl), out, out, { tempDir: temp })).toBe(0);
-    const targetUrl = as(target.url, RESTORER, long);
-    expect(
-      await runRestoreCli([file], env(targetUrl), out, out, { tempDir: temp }),
-      lines.join("\n"),
-    ).toBe(0);
-    const calls = await readFile(log, "utf8");
-    expect(calls).toContain("pgpass-mode: 600");
-    expect(calls).toContain("service-password-lines: 0");
-    expect(calls).toContain("pgpassword: none");
-    // *:*:*:*: + the password with ':' and '\' escaped + newline.
-    expect(calls).toContain(`pgpass-length: ${String(8 + long.length + 2 + 1)}`);
-    for (const line of calls.split("\n").filter((l) => l.startsWith("pgpassfile: "))) {
-      expect(existsSync(line.slice("pgpassfile: ".length))).toBe(false);
+    const serverBin = helper.findPostgresBin();
+    if (serverBin === undefined) throw new Error("No initdb and pg_ctl for a password server.");
+    const long = "p".repeat(1000) + ":\\" + "q".repeat(998);
+    const restorerPassword = "r".repeat(1500) + ":" + "s".repeat(499);
+    const server = helper.startTestDatabase({
+      bin: serverBin,
+      log: () => undefined,
+      password: long,
+    });
+    try {
+      const admin = as(server.url, "postgres", long);
+      const wrong = as(server.url, "postgres", "not-the-password");
+      await expect(openSession(wrong, "t052-wrong")).rejects.toThrow(
+        /password authentication failed/,
+      );
+      const setup = await openSession(admin, "t052-setup");
+      try {
+        await setup.runScript(`CREATE ROLE t052_restorer LOGIN PASSWORD '${restorerPassword}'`);
+        await setup.runScript("CREATE DATABASE t052_src TEMPLATE template0");
+        await setup.runScript("CREATE DATABASE t052_dst OWNER t052_restorer TEMPLATE template0");
+      } finally {
+        await setup.close();
+      }
+      const sourceUrl = new URL(admin);
+      sourceUrl.pathname = "/t052_src";
+      await migrate({ connectionString: sourceUrl.toString() });
+      const targetUrl = new URL(as(server.url, "t052_restorer", restorerPassword));
+      targetUrl.pathname = "/t052_dst";
+
+      const dir = await directory();
+      const temp = await directory();
+      const log = join(dir, "calls.log");
+      const bin = await wrappedTools(
+        (
+          tool,
+          real,
+        ) => `{ echo "== ${tool}"; echo "pgpassfile: $PGPASSFILE"; echo "pgpassword: \${PGPASSWORD:-none}"
+  echo "pgpass-mode: $(stat -c %a "$PGPASSFILE")"; grep -c '^password=' "$PGSERVICEFILE" | sed 's/^/service-password-lines: /'; } >> '${log}'
+exec '${real}' "$@"`,
+      );
+      const env = (url: string): Record<string, string | undefined> => ({
+        ...process.env,
+        PG_BIN: bin,
+        PGPASSWORD: "fake-other-password",
+        OCULUS_DATABASE_URL: url,
+      });
+      const lines: string[] = [];
+      const out = (l: string): void => {
+        lines.push(l);
+      };
+      const file = join(dir, "long.oculus-backup");
+      expect(
+        await runBackupCli([file], env(sourceUrl.toString()), out, out, { tempDir: temp }),
+        lines.join("\n"),
+      ).toBe(0);
+      expect(
+        await runRestoreCli([file], env(targetUrl.toString()), out, out, { tempDir: temp }),
+        lines.join("\n"),
+      ).toBe(0);
+      const calls = await readFile(log, "utf8");
+      expect(calls).toContain("== pg_dump");
+      expect(calls).toContain("== pg_restore");
+      expect(calls).toContain("pgpass-mode: 600");
+      expect(calls).toContain("service-password-lines: 0");
+      expect(calls).toContain("pgpassword: none");
+      for (const line of calls.split("\n").filter((l) => l.startsWith("pgpassfile: "))) {
+        expect(existsSync(line.slice("pgpassfile: ".length))).toBe(false);
+      }
+      expect(lines.join("\n")).not.toContain(long.slice(0, 50));
+      expect(await readdir(temp)).toEqual([]);
+    } finally {
+      server.stop();
     }
-    expect(lines.join("\n")).not.toContain(long.slice(0, 50));
-    expect(await readdir(temp)).toEqual([]);
-  }, 60_000);
+  }, 90_000);
 
   it("escape the password file and refuse service-file lines libpq can't read", () => {
     expect(passwordFileText("a:b\\c")).toBe("*:*:*:*:a\\:b\\\\c\n");
@@ -1500,8 +1593,9 @@ describe("a stop that comes late, and the archive", () => {
   }, 60_000);
 
   it("holds back the archive's end if it changed after it was checked", async () => {
-    const { file } = await sharedBackup();
+    const { file } = await bigBackup();
     const manifest = await readManifest(file);
+    expect(manifest.dump.bytes).toBeGreaterThan(2 * 1024 * 1024);
     const input = new PassThrough();
     let written = 0;
     input.on("data", (chunk: Buffer) => {
@@ -1674,4 +1768,152 @@ setInterval(() => {}, 1000);
     killParent();
     await until(() => !groupAlive(pgid), 15_000);
   }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// Third review (D-064): a stop during the check after COMMIT, the npm script
+// passing signals to node, settings after a restore, --no-privileges and
+// revocations.
+
+/** A backup of a database large enough that its archive spans several chunks and its check takes a while. */
+let big: Promise<{ file: string }> | undefined;
+function bigBackup(): Promise<{ file: string }> {
+  big ??= (async () => {
+    const source = await database();
+    await migrate({ connectionString: source.url });
+    const db = pool(source.url);
+    await db.execute(sql`CREATE TABLE public.t052_big (id int, v text)`);
+    await db.execute(sql`INSERT INTO public.t052_big
+      SELECT g, pg_catalog.md5(g::text) || pg_catalog.md5((g * 7)::text)
+      FROM pg_catalog.generate_series(1, 600000) AS g`);
+    const dir = await directory();
+    const file = join(dir, "big.oculus-backup");
+    await backup({ connectionString: source.url, file });
+    return { file };
+  })();
+  return big;
+}
+
+describe("a stop while the restored database is being checked", () => {
+  it("lets the check finish, ignoring the grace period, and exits 0 when it passes", async () => {
+    const script = await compiledCli();
+    const { file } = await bigBackup();
+    const target = await emptyTarget();
+    const run = command([script, "restore", file], {
+      ...process.env,
+      OCULUS_DATABASE_URL: target.url,
+      OCULUS_STOP_GRACE_MS: "50",
+    });
+    await until(() => run.output().includes("Checking the restored database"), 30_000);
+    run.child.kill("SIGTERM");
+    expect(await run.exited, run.output()).toBe(0);
+    expect(run.output()).toContain("finishing the check of the restored database");
+    expect(run.output()).toContain("Done: restored and checked");
+  }, 90_000);
+
+  it("exits 3, saying the database is restored but NOT checked, on a second signal", async () => {
+    const script = await compiledCli();
+    const { file } = await bigBackup();
+    const target = await emptyTarget();
+    const run = command([script, "restore", file], {
+      ...process.env,
+      OCULUS_DATABASE_URL: target.url,
+      OCULUS_STOP_GRACE_MS: "50",
+    });
+    await until(() => run.output().includes("Checking the restored database"), 30_000);
+    run.child.kill("SIGTERM");
+    await until(() => run.output().includes("finishing the check"));
+    run.child.kill("SIGINT");
+    expect(await run.exited, run.output()).toBe(3);
+    expect(run.output()).toContain("restored but NOT checked");
+  }, 90_000);
+});
+
+describe("the npm scripts", () => {
+  it("exec node, so a signal to what npm started reaches the command and leaves nothing", async () => {
+    const { testDb } = await populated();
+    const here = dirname(fileURLToPath(import.meta.url));
+    const dir = await directory();
+    const pidFile = join(await directory(), "dump.pid");
+    const bin = await wrappedTools(
+      (_tool, real) => `'${real}' "$@" || exit $?\necho $$ > '${pidFile}'\nsleep 60`,
+    );
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter(([key]) => !key.toLowerCase().startsWith("npm_")),
+    );
+    const npm = spawn("npm", ["run", "--silent", "db:backup", "--", join(dir, "x.oculus-backup")], {
+      cwd: join(here, ".."),
+      env: { ...env, OCULUS_DATABASE_URL: testDb.url, PG_BIN: bin },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    npm.stdout.on("data", (d: Buffer) => {
+      output += d.toString();
+    });
+    npm.stderr.on("data", (d: Buffer) => {
+      output += d.toString();
+    });
+    const exited = new Promise<number | null>((r) => {
+      npm.on("close", (code) => {
+        r(code);
+      });
+    });
+    await until(() => existsSync(pidFile), 110_000);
+    const tool = Number((await readFile(pidFile, "utf8")).trim());
+    // What npm started is node itself (exec), not a shell around it.
+    const children = execFileSync("ps", ["-o", "pid=,args=", "--ppid", String(npm.pid)], {
+      encoding: "utf8",
+    })
+      .trim()
+      .split("\n")
+      .map((l) => l.trim());
+    expect(children, output).toHaveLength(1);
+    const [pid, ...args] = (children[0] ?? "").split(/\s+/);
+    expect(args.join(" ")).toMatch(/^node dist\/backup-cli\.js backup /);
+    process.kill(Number(pid), "SIGTERM");
+    expect(await exited, output).not.toBe(0);
+    expect(output).toContain("Backup stopped (interrupted)");
+    await until(() => !alive(tool) && !alive(Number(pid)));
+    expect(await readdir(dir)).toEqual([]);
+  }, 180_000);
+});
+
+describe("privileges and settings after a restore", () => {
+  it("flags database settings that appear in the target", async () => {
+    const { file } = await sharedBackup();
+    const psql = join(await findTools(process.env, ["psql"]), "psql");
+    const bin = await wrappedTools(
+      (_tool, real) => `'${real}' "$@" || exit $?
+db=$('${psql}' "service=oculus_backup" -qAtc "SELECT pg_catalog.current_database()")
+'${psql}' "service=oculus_backup" -qc "ALTER DATABASE \\"$db\\" SET work_mem = '2MB'" >/dev/null`,
+    );
+    const target = await emptyTarget();
+    const refused = await refusal(
+      restore({ connectionString: target.url, file, env: { ...process.env, PG_BIN: bin } }),
+    );
+    expect(refused.code).toBe("verify_failed");
+    expect(refused.message).toContain("database or role-in-database settings");
+  }, 60_000);
+
+  it("keeps and checks revocations, and refuses --no-privileges when there are any", async () => {
+    const source = await database();
+    await migrate({ connectionString: source.url });
+    const db = pool(source.url);
+    await db.execute(sql`CREATE FUNCTION public.t052_f() RETURNS int LANGUAGE sql AS 'SELECT 1'`);
+    await db.execute(sql`REVOKE EXECUTE ON FUNCTION public.t052_f() FROM PUBLIC`);
+    const dir = await directory();
+    const file = join(dir, "revoked.oculus-backup");
+    const made = await backup({ connectionString: source.url, file });
+    expect(made.manifest.objects.revokes).toEqual([
+      "function public.t052_f(): EXECUTE not granted to PUBLIC",
+    ]);
+    const target = await emptyTarget();
+    const refused = await refusal(
+      restore({ connectionString: target.url, file, noPrivileges: true }),
+    );
+    expect(refused.code).toBe("privileges_needed");
+    expect(refused.message).toContain("public.t052_f()");
+    expect(await contentsOf(pool(target.url))).toEqual({});
+    await restore({ connectionString: target.url, file });
+  }, 60_000);
 });

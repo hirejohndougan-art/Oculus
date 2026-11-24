@@ -89,6 +89,7 @@ export class BackupError extends Error {
       | "bad_file"
       | "migrations_differ"
       | "superuser"
+      | "privileges_needed"
       | "target_not_empty"
       | "target_busy"
       | "restore_failed"
@@ -804,6 +805,11 @@ export interface RestoreOptions {
    * it had already committed, the restore is checked and reported as done.
    */
   signal?: AbortSignal;
+  /**
+   * Called once pg_restore has committed, before the check: from then on a
+   * stop can't undo the restore, and the check should be let finish.
+   */
+  onCommitted?: () => void;
   log?: (message: string) => void;
 }
 
@@ -853,48 +859,54 @@ export function compareMigrations(
 }
 
 /**
- * Roles whose membership gives a role superuser powers, or powers close to
- * them, beyond being a superuser itself or a member of one: running programs
- * and reading or writing files on the server as its operating-system user,
- * and the administrator roles managed services give in place of superuser.
- */
-export const POWERFUL_ROLES = [
-  "pg_execute_server_program",
-  "pg_write_server_files",
-  "pg_read_server_files",
-  "rds_superuser",
-  "cloudsqlsuperuser",
-  "azure_pg_admin",
-] as const;
-
-/**
  * Why the connected role may not restore without --allow-superuser, or an
- * empty list: the session's and the current role's own SUPERUSER and
- * CREATEROLE, and membership, direct or through other roles, of any
- * superuser role or any of POWERFUL_ROLES.
+ * empty list. An allowlist: the session role and the current role must be
+ * the same role, with no attribute beyond LOGIN and INHERIT / NOINHERIT (no
+ * SUPERUSER, CREATEROLE, CREATEDB, REPLICATION or BYPASSRLS), and a member of
+ * no other role at all, so nothing it could inherit or SET ROLE to (a
+ * superuser, pg_execute_server_program, pg_signal_backend, a managed
+ * service's administrator role, a NOLOGIN role with CREATEROLE...) can lend
+ * the backup's SQL more power. Membership counts in `pg_auth_members`
+ * directly: a role that is a member of nothing is a member of nothing
+ * indirectly either. (Owning the database, through pg_database_owner, is not
+ * a membership row.)
  */
-export async function superuserPowers(db: Queryable): Promise<string[]> {
-  const rows = await db.rows<{
-    role: string;
+export async function restoreRoleProblems(db: Queryable): Promise<string[]> {
+  const [row] = await db.rows<{
+    session: string;
+    current: string;
     superuser: boolean;
     createrole: boolean;
-    via: string[];
+    createdb: boolean;
+    replication: boolean;
+    bypassrls: boolean;
+    memberOf: string[];
   }>(sql`
-    SELECT me.rolname::pg_catalog.text AS role, me.rolsuper AS superuser, me.rolcreaterole AS createrole,
-           ARRAY(SELECT r.rolname::pg_catalog.text FROM pg_catalog.pg_roles r
-                 WHERE r.oid <> me.oid
-                   AND (r.rolsuper OR r.rolname::pg_catalog.text = ANY (${[...POWERFUL_ROLES]}::pg_catalog.text[]))
-                   AND pg_catalog.pg_has_role(me.oid, r.oid, 'MEMBER')
-                 ORDER BY 1)::pg_catalog.text[] AS via
-    FROM pg_catalog.pg_roles me
-    WHERE me.rolname IN (SESSION_USER, CURRENT_USER)
-    ORDER BY 1`);
+    SELECT s.rolname::pg_catalog.text AS session, c.rolname::pg_catalog.text AS current,
+           s.rolsuper OR c.rolsuper AS superuser,
+           s.rolcreaterole OR c.rolcreaterole AS createrole,
+           s.rolcreatedb OR c.rolcreatedb AS createdb,
+           s.rolreplication OR c.rolreplication AS replication,
+           s.rolbypassrls OR c.rolbypassrls AS bypassrls,
+           ARRAY(SELECT DISTINCT r.rolname::pg_catalog.text
+                 FROM pg_catalog.pg_auth_members m
+                 JOIN pg_catalog.pg_roles r ON r.oid = m.roleid
+                 WHERE m.member IN (s.oid, c.oid)
+                 ORDER BY 1)::pg_catalog.text[] AS "memberOf"
+    FROM pg_catalog.pg_roles s, pg_catalog.pg_roles c
+    WHERE s.rolname = SESSION_USER AND c.rolname = CURRENT_USER`);
+  if (row === undefined) return ["the connected role could not be read"];
   const reasons: string[] = [];
-  for (const row of rows) {
-    if (row.superuser) reasons.push(`${row.role} is a superuser`);
-    if (row.createrole) reasons.push(`${row.role} has CREATEROLE`);
-    for (const role of row.via) reasons.push(`${row.role} is a member of ${role}`);
+  const who = row.session;
+  if (row.session !== row.current) {
+    reasons.push(`the session role ${row.session} acts as ${row.current}`);
   }
+  if (row.superuser) reasons.push(`${who} is a superuser`);
+  if (row.createrole) reasons.push(`${who} has CREATEROLE`);
+  if (row.createdb) reasons.push(`${who} has CREATEDB`);
+  if (row.replication) reasons.push(`${who} has REPLICATION`);
+  if (row.bypassrls) reasons.push(`${who} has BYPASSRLS`);
+  for (const role of row.memberOf) reasons.push(`${who} is a member of ${role}`);
   return reasons;
 }
 
@@ -910,6 +922,12 @@ export async function restore(options: RestoreOptions): Promise<RestoreResult> {
     manifest.migrations,
     await readMigrations(options.migrationsDir ?? defaultMigrationsDir()),
   );
+  if (options.noPrivileges === true && manifest.objects.revokes.length > 0) {
+    throw new BackupError(
+      "privileges_needed",
+      `--no-privileges drops the backup's REVOKEs and default privileges as well as its GRANTs, which would leave these open: ${manifest.objects.revokes.join("; ")}. Create the roles the backup names and restore without --no-privileges.`,
+    );
+  }
   const bin = await findTools(env, ["pg_restore"]);
   const pgRestore = await toolVersion(bin, "pg_restore");
   checkSystemRoots(connection, "pg_restore", pgRestore.major);
@@ -943,16 +961,16 @@ export async function restore(options: RestoreOptions): Promise<RestoreResult> {
         `pg_restore ${String(pgRestore.major)} is older than PostgreSQL ${server.text}: set PG_BIN to the bin directory of PostgreSQL ${String(serverMajor)} or newer.`,
       );
     }
-    const powers = await superuserPowers(session);
-    if (powers.length > 0) {
+    const problems = await restoreRoleProblems(session);
+    if (problems.length > 0) {
       if (options.allowSuperuser !== true) {
         throw new BackupError(
           "superuser",
-          `The role in OCULUS_DATABASE_URL has superuser powers (${powers.join("; ")}), so everything in the backup would run with them. Restore as a plain role that owns the new empty database (CREATE DATABASE ... OWNER that_role TEMPLATE template0), or pass --allow-superuser if you must.`,
+          `The role in OCULUS_DATABASE_URL is not a plain role (${problems.join("; ")}), so the backup's SQL could run with more than a database owner's powers. Restore as a dedicated role with nothing else: CREATE ROLE oculus_restore LOGIN; CREATE DATABASE oculus OWNER oculus_restore TEMPLATE template0; then restore with that role in OCULUS_DATABASE_URL. (--allow-superuser overrides this, if you must.)`,
         );
       }
       log(
-        `WARNING: restoring with superuser powers (${powers.join("; ")}) because of --allow-superuser: everything in the backup runs with them. Only do this with a backup you made yourself.`,
+        `WARNING: restoring as a role that is not plain (${problems.join("; ")}) because of --allow-superuser: everything in the backup runs with its powers. Only do this with a backup you made yourself.`,
       );
     }
     // Hold the migration runner's lock, so db:migrate can't fill the target
@@ -996,7 +1014,9 @@ export async function restore(options: RestoreOptions): Promise<RestoreResult> {
     let stoppedAfterCommit = false;
     if (restored.code !== 0) {
       // pg_restore ended badly or was stopped. Its one transaction either
-      // committed or not: look before saying which.
+      // committed or not: wait for its server session to end, then look,
+      // before saying which.
+      await sessionEnded(session, "oculus-restore");
       const after = await contentsOf(session);
       if (Object.keys(after).length === 0) {
         if (stopped(signal)) {
@@ -1018,6 +1038,8 @@ export async function restore(options: RestoreOptions): Promise<RestoreResult> {
     }
     // pg_restore committed: the check runs to the end even if a stop is
     // asked for meanwhile, since it is what says whether the restore is good.
+    options.onCommitted?.();
+    log("Checking the restored database against the manifest...");
     await verify(session, manifest, options.noPrivileges === true);
     return { manifest, pending, stoppedAfterCommit };
   } finally {
@@ -1094,6 +1116,29 @@ export async function streamArchive(
   });
 }
 
+/**
+ * Waits (up to 60 s) until no session of this database with the given
+ * application_name is left, so a stopped pg_restore's transaction has ended
+ * on the server, one way or the other, before its outcome is read.
+ */
+async function sessionEnded(db: Queryable, applicationName: string): Promise<void> {
+  const deadline = Date.now() + 60_000;
+  for (;;) {
+    const rows = await db.rows(sql`
+      SELECT 1 FROM pg_catalog.pg_stat_activity
+      WHERE datname = pg_catalog.current_database() AND application_name = ${applicationName}
+        AND pid <> pg_catalog.pg_backend_pid()`);
+    if (rows.length === 0) return;
+    if (Date.now() > deadline) {
+      throw new BackupError(
+        "restore_failed",
+        "pg_restore ended, but its session on the server is still open after 60 seconds, so whether it committed is not known. Check the target database before using it.",
+      );
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+  }
+}
+
 /** Lines in one list and not the other, for a message. */
 function listDifference(kind: string, expected: string[], found: string[]): string[] {
   const have = new Set(found);
@@ -1137,8 +1182,16 @@ async function verify(
     sql`SELECT pg_catalog.quote_ident(CURRENT_USER::pg_catalog.text) AS grantee`,
   );
   const notMine = (line: string): boolean => grantee(line) !== (me?.grantee ?? "");
+  const [settings] = await db.rows<{ n: number }>(sql`
+    SELECT pg_catalog.count(*)::pg_catalog.int4 AS n FROM pg_catalog.pg_db_role_setting
+    WHERE setdatabase = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())`);
+  if ((settings?.n ?? 0) > 0) {
+    problems.push(
+      `the database has ${String(settings?.n)} database or role-in-database settings, which a restore never makes`,
+    );
+  }
   for (const kind of OBJECT_KINDS) {
-    if (kind === "grants" && noPrivileges) continue;
+    if ((kind === "grants" || kind === "revokes") && noPrivileges) continue;
     const expected =
       kind === "grants" ? manifest.objects.grants.filter(notMine) : manifest.objects[kind];
     const found = kind === "grants" ? objects.grants.filter(notMine) : objects[kind];

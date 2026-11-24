@@ -25,6 +25,8 @@ export interface CliOptions {
   signal?: AbortSignal;
   /** For tests: where the private temporary directories go. */
   tempDir?: string;
+  /** Restore only: called once pg_restore has committed. */
+  onCommitted?: () => void;
 }
 
 function databaseUrl(env: Record<string, string | undefined>, err: Line): string | undefined {
@@ -145,6 +147,7 @@ export async function runRestoreCli(
       env,
       allowSuperuser,
       noPrivileges,
+      ...(options.onCommitted === undefined ? {} : { onCommitted: options.onCommitted }),
       log: safe.out,
       ...(options.signal === undefined ? {} : { signal: options.signal }),
       ...(options.tempDir === undefined ? {} : { tempDir: options.tempDir }),
@@ -177,26 +180,56 @@ if (command !== undefined && import.meta.url === pathToFileURL(command).href) {
     console.error("Usage: node backup-cli.js backup|restore <file>");
     process.exitCode = 2;
   } else {
-    // A signal stops the tool and cleans up; a second one, or the grace
-    // period passing, exits at once. Exiting runs backup-cleanup.ts's
-    // synchronous handler: the tool's group is killed and every temporary
-    // file removed. (OCULUS_STOP_GRACE_MS shortens the grace, for tests.)
+    // Before pg_restore commits (and for a backup), a signal stops the tool
+    // and cleans up; a second one, or the grace period passing, exits at
+    // once. Exiting runs backup-cleanup.ts's synchronous handler: the tool's
+    // group is killed and every temporary file removed. Once pg_restore has
+    // committed, a stop can't undo the restore, so the check of the restored
+    // database is let finish (no grace period); a second signal then exits 3
+    // saying the database was restored but NOT checked.
+    // (OCULUS_STOP_GRACE_MS shortens the grace, for tests.)
     const grace = Number(process.env.OCULUS_STOP_GRACE_MS ?? "") || 30_000;
     const controller = new AbortController();
+    let committed = false;
+    let stopAsked = false;
+    let graceTimer: NodeJS.Timeout | undefined;
+    const finishing = (): void => {
+      console.error(
+        "pg_restore has already committed, so the restore can't be undone; finishing the check of the restored database before exiting. Signal again to exit without the check.",
+      );
+    };
     for (const name of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
       process.on(name, () => {
-        if (controller.signal.aborted) {
+        if (committed) {
+          if (stopAsked) {
+            console.error(
+              `Stopping at once (${name}): the backup was restored but NOT checked. Do not use the database until it is checked: drop it and restore again.`,
+            );
+            process.exit(3);
+          }
+          stopAsked = true;
+          finishing();
+          return;
+        }
+        if (stopAsked) {
           console.error(`Stopping at once (${name}).`);
           process.exit(1);
         }
+        stopAsked = true;
         console.error(`Stopping (${name})...`);
         controller.abort();
-        setTimeout(() => {
+        graceTimer = setTimeout(() => {
           console.error("Stopping took too long; exiting.");
           process.exit(1);
-        }, grace).unref();
+        }, grace);
+        graceTimer.unref();
       });
     }
+    const onCommitted = (): void => {
+      committed = true;
+      if (graceTimer !== undefined) clearTimeout(graceTimer);
+      if (stopAsked) finishing();
+    };
     const code = await run(
       rest,
       process.env,
@@ -206,7 +239,7 @@ if (command !== undefined && import.meta.url === pathToFileURL(command).href) {
       (line) => {
         console.error(line);
       },
-      { signal: controller.signal },
+      { signal: controller.signal, onCommitted },
     );
     process.exitCode = code;
   }

@@ -36,9 +36,23 @@ export interface ObjectSummaries {
    * `<kind> <name> to <grantee, quoted as an identifier>: <privilege>`.
    */
   grants: string[];
+  /**
+   * Privileges taken away from their defaults, which `--no-privileges` would
+   * silently give back: functions without EXECUTE for PUBLIC, types without
+   * USAGE for PUBLIC, the public schema without USAGE for PUBLIC, and every
+   * default-privileges entry.
+   */
+  revokes: string[];
 }
 
-export const OBJECT_KINDS = ["sequences", "functions", "triggers", "policies", "grants"] as const;
+export const OBJECT_KINDS = [
+  "sequences",
+  "functions",
+  "triggers",
+  "policies",
+  "grants",
+  "revokes",
+] as const;
 
 /** JavaScript's order (UTF-16 code units), which the manifest check uses too. */
 export function sorted(values: readonly string[]): string[] {
@@ -123,6 +137,27 @@ export async function objectSummaries(db: Queryable): Promise<ObjectSummaries> {
     FROM pg_catalog.pg_policy p JOIN pg_catalog.pg_class c ON c.oid = p.polrelid
     JOIN ns ON ns.oid = c.relnamespace
     UNION ALL
+    SELECT 'revokes', 'function ' || ns.nspname || '.' || p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || '): EXECUTE not granted to PUBLIC'
+    FROM pg_catalog.pg_proc p JOIN ns ON ns.oid = p.pronamespace
+    WHERE p.proacl IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM ext WHERE ext.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass AND ext.objid = p.oid)
+      AND NOT EXISTS (SELECT 1 FROM pg_catalog.aclexplode(p.proacl) AS x WHERE x.grantee = 0 AND x.privilege_type = 'EXECUTE')
+    UNION ALL
+    SELECT 'revokes', 'type ' || ns.nspname || '.' || t.typname || ': USAGE not granted to PUBLIC'
+    FROM pg_catalog.pg_type t JOIN ns ON ns.oid = t.typnamespace
+    WHERE t.typacl IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM pg_catalog.aclexplode(t.typacl) AS x WHERE x.grantee = 0 AND x.privilege_type = 'USAGE')
+    UNION ALL
+    SELECT 'revokes', 'schema public: USAGE not granted to PUBLIC'
+    FROM pg_catalog.pg_namespace n
+    WHERE n.nspname = 'public' AND n.nspacl IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM pg_catalog.aclexplode(n.nspacl) AS x WHERE x.grantee = 0 AND x.privilege_type = 'USAGE')
+    UNION ALL
+    SELECT 'revokes', 'default privileges for ' || pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(d.defaclrole)::pg_catalog.text)
+           || COALESCE(' in ' || (SELECT n.nspname FROM pg_catalog.pg_namespace n WHERE n.oid = d.defaclnamespace), '')
+           || ' on ' || d.defaclobjtype::pg_catalog.text || ': ' || COALESCE(d.defaclacl::pg_catalog.text, '')
+    FROM pg_catalog.pg_default_acl d
+    UNION ALL
     SELECT 'grants', a.kind || ' ' || a.name || ' to '
            || CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(a.grantee)::pg_catalog.text) END
            || ': ' || a.privilege_type || CASE WHEN a.is_grantable THEN ' with grant option' ELSE '' END
@@ -145,6 +180,7 @@ export async function objectSummaries(db: Queryable): Promise<ObjectSummaries> {
     triggers: [],
     policies: [],
     grants: [],
+    revokes: [],
   };
   for (const row of rows) {
     if ((OBJECT_KINDS as readonly string[]).includes(row.kind)) {
