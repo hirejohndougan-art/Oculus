@@ -1,0 +1,24 @@
+{
+  "name": "@oculus/service",
+  "version": "0.0.0",
+  "description": "Oculus service layer: the only writer of records and their related rows (T-032, D-067).",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@oculus/core": "0.0.0",
+    "@oculus/db": "0.0.0"
+  }
+}

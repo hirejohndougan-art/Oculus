@@ -50,10 +50,10 @@
  *
  * The record row is locked (`FOR NO KEY UPDATE`) before anything is read, so
  * neither the record nor its identifiers (whose save takes the same lock)
- * change between the checks and the write. Templates, types and other
- * records are not locked: a change committed in that instant can slip past
- * the template checks, as for any save until the service layer re-checks
- * inside its own transaction (T-032). When the parent or level changes (decided
+ * change between the checks and the write; the checks (`record-checks.ts`)
+ * lock the template's and record type's versions, the identifier types and
+ * the linked records until the transaction ends (T-032, D-067), so nothing
+ * they checked against can change before COMMIT. When the parent or level changes (decided
  * up front from the version and the row), the organization's arrangement
  * lock (0006) is taken before the record row's lock and held to COMMIT, and the database's guard refuses any loop
  * whoever writes. Read Committed only (`read_committed_required`). The
@@ -67,41 +67,29 @@
  * staff-only.
  */
 import {
-  MAX_ARRANGEMENT_DEPTH,
-  canFileUnder,
-  checkRecordAgainstTemplate,
-  checkRecordType,
   compareRecords,
-  identifierFieldIssues,
   isOrganizationId,
   isRecordId,
   issue,
-  makeIdentifierChecker,
   isFieldKey,
-  makeRecordLinkChecker,
-  sameJson,
-  type ArchivalLevel,
   type CatalogRecord,
-  type FieldTemplate,
-  type Issue,
   type OrganizationId,
   type RecordId,
 } from "@oculus/core";
 import {
   inSavepoint,
-  readRecordType,
-  readRecordsForChecks,
   readStoredRecord,
-  readTemplate,
   updateRecord,
   versionConflict,
   type RecordUpdate,
   type RecordUpdateResult,
 } from "./catalog.js";
 import type { Queryable } from "./client.js";
-import { readIdentifierTypes, readRecordIdentifiers } from "./identifiers.js";
+import { fixedMessages, recordCheckIssues } from "./record-checks.js";
 import { MAX_REASON_LENGTH, readVersion, validateRecordChange } from "./record-versions.js";
 import { sql } from "./sql.js";
+
+export { MAX_DESCENDANTS_WALKED } from "./record-checks.js";
 
 /** Options for `restoreVersion`. */
 export interface RestoreOptions {
@@ -296,7 +284,11 @@ export async function restoreVersion(
         `Version ${String(version)} is the same as the record is now; there is nothing to restore.`,
       );
     }
-    const problems = await todaysChecks(db, candidate, stored, confirmed);
+    const problems = await recordCheckIssues(db, candidate, stored, {
+      messages: "fixed",
+      confirmedPublic: confirmed,
+      identifierFields: true,
+    });
     if (problems.length > 0) return { ok: false, issues: problems };
     return updateRecord(db, candidate, {
       expectedVersion: expected,
@@ -323,34 +315,6 @@ function conflictRefusal(expected: number, now: number): RecordUpdateResult {
     `The record was saved by someone else since version ${String(expected)}; it is now at version ${String(now)}. Read it again.`,
   );
 }
-
-/**
- * Issues from core's checks with their messages replaced by fixed text, code
- * and path kept (D-065, as S-007 did for publicOutput): core's messages may
- * quote values (`"X" is not a …`, an old number that doesn't fit a format),
- * and a restore's refusal must not become a way to read old versions.
- */
-function fixedMessages(list: readonly Issue[], prefix: readonly (string | number)[]): Issue[] {
-  return list.map((i) =>
-    issue([...prefix, ...i.path], i.code, FIXED_MESSAGES[i.code] ?? GENERIC_MESSAGE),
-  );
-}
-
-const GENERIC_MESSAGE =
-  "The old version's value here doesn't pass today's checks. Open the old version to see it, then fix it in the editor.";
-
-const FIXED_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
-  unknown_field: "This field is not in the template now.",
-  required: "This field is required now, and the old version has no value for it.",
-  identifier_not_held: "This field shows a number the record doesn't hold now.",
-  unknown_record: "The record this links to doesn't exist now.",
-  wrong_record_kind: "The record this links to is not of a kind this field allows now.",
-  not_canonical: "This rights statement is not written in today's accepted form.",
-  not_an_option: "This value is not one of the field's options now.",
-  wrong_template: "Today's template is not for this kind of record.",
-  unknown_record_type: "The record type this version used doesn't exist now.",
-  wrong_kind: "The record type is for another kind of record now.",
-});
 
 function isWholeVersion(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 && value < 2 ** 31 - 1;
@@ -381,274 +345,4 @@ function ownValue(value: unknown, key: string): unknown {
 /** The later of two times in core's form. */
 function later(a: string, b: string): string {
   return Date.parse(a) >= Date.parse(b) ? a : b;
-}
-
-/** The IDs a record's fields link to (`record_link` and place `recordId` values). */
-function linkedIds(record: CatalogRecord): RecordId[] {
-  const ids = new Set<RecordId>();
-  for (const value of Object.values(record.fields)) {
-    for (const item of Array.isArray(value) ? value : [value]) {
-      if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
-      const id = (item as Readonly<Record<string, unknown>>).recordId;
-      if (isRecordId(id)) ids.add(id);
-    }
-  }
-  return [...ids];
-}
-
-/** Every problem the candidate has against today's rules; empty when it passes. */
-async function todaysChecks(
-  db: Queryable,
-  candidate: CatalogRecord,
-  stored: CatalogRecord,
-  confirmed: ReadonlySet<string>,
-): Promise<Issue[]> {
-  const org = candidate.organizationId;
-  const problems: Issue[] = [];
-
-  // The records it points at, as they are now (and itself, for self-links).
-  const parentId = candidate.kind === "archival_unit" ? candidate.parentId : undefined;
-  const represents = candidate.kind === "digital_asset" ? candidate.represents : undefined;
-  const wanted = new Set<RecordId>([candidate.id, ...linkedIds(candidate)]);
-  if (parentId !== undefined) wanted.add(parentId);
-  if (represents !== undefined) wanted.add(represents);
-  const others = await readRecordsForChecks(db, org, [...wanted]);
-  const found = new Map(others.map((r) => [r.id as string, r]));
-
-  // The template as it is now, with the organization's checkers.
-  const template = await readTemplate(db, org, candidate.templateKey ?? "");
-  if (template === undefined) {
-    problems.push(
-      issue(
-        ["templateKey"],
-        "unknown_template",
-        "The template this version used no longer exists.",
-      ),
-    );
-  } else if (!template.ok) {
-    problems.push(...fixedMessages(template.issues, ["templateKey"]));
-  } else {
-    const types = await readIdentifierTypes(db, org);
-    const identifier = types.ok ? makeIdentifierChecker(types.value, org) : types;
-    const links = makeRecordLinkChecker(others, org);
-    if (!identifier.ok || !links.ok) {
-      // Without the checkers the fields can't be checked; say why, and go on
-      // with every other check.
-      if (!identifier.ok) problems.push(...fixedMessages(identifier.issues, ["identifierTypes"]));
-      if (!links.ok) problems.push(...fixedMessages(links.issues, []));
-    } else {
-      problems.push(
-        ...fixedMessages(
-          checkRecordAgainstTemplate(candidate, template.value.template, {
-            checkers: {
-              identifier: identifier.value,
-              record_link: links.value,
-              place: links.value,
-            },
-            allowMissingInherited: candidate.kind === "archival_unit",
-          }),
-          [],
-        ),
-      );
-    }
-    const toConfirm = publicValueIssues(candidate, stored, template.value.template);
-    const keys = new Set(toConfirm.map((i) => String(i.path[1])));
-    const same = keys.size === confirmed.size && [...keys].every((key) => confirmed.has(key));
-    if (!same) problems.push(...toConfirm);
-    const held = await readRecordIdentifiers(db, org, candidate.id);
-    if (held === undefined) {
-      problems.push(issue(["id"], "unknown_record", "The organization has no such record."));
-    } else if (!held.ok) {
-      problems.push(...fixedMessages(held.issues, ["identifiers"]));
-    } else {
-      problems.push(
-        ...fixedMessages(identifierFieldIssues(candidate, template.value.template, held.value), []),
-      );
-    }
-  }
-
-  // Its record type as it is now.
-  if (candidate.recordTypeKey !== undefined) {
-    const type = await readRecordType(db, org, candidate.recordTypeKey);
-    if (type === undefined) {
-      problems.push(
-        issue(
-          ["recordTypeKey"],
-          "unknown_record_type",
-          "The record type this version used no longer exists.",
-        ),
-      );
-    } else if (!type.ok) {
-      problems.push(...fixedMessages(type.issues, ["recordTypeKey"]));
-    } else {
-      problems.push(...fixedMessages(checkRecordType(candidate, type.value.recordType), []));
-    }
-  }
-
-  // A represented record that still exists.
-  if (represents !== undefined && !found.has(represents)) {
-    problems.push(
-      issue(
-        ["represents"],
-        "unknown_record",
-        "The record this version represents no longer exists.",
-      ),
-    );
-  }
-
-  // The arrangement, when the parent or the level would change.
-  if (candidate.kind === "archival_unit" && stored.kind === "archival_unit") {
-    problems.push(...(await arrangementIssues(db, candidate, stored, found)));
-  }
-  return problems;
-}
-
-/**
- * Restored values that land in fields public today and differ from what the
- * record holds now (D-065). A field may have been staff-only when the old
- * value was stored and made public since, after the value was removed, so
- * the made-public confirmation (D-031, T-005a) never covered it: restoring
- * it must not publish it silently. The simplest safe rule: every such value
- * is listed, and the restore waits for `confirmMadePublic` naming exactly
- * those fields. The title isn't in the rule: it is always public (core's
- * public views always carry it), so an old title was never staff-only.
- */
-function publicValueIssues(
-  candidate: CatalogRecord,
-  stored: CatalogRecord,
-  template: FieldTemplate,
-): Issue[] {
-  const problems: Issue[] = [];
-  for (const field of template.fields) {
-    if (field.visibility !== "public" || !Object.hasOwn(candidate.fields, field.key)) continue;
-    const value = candidate.fields[field.key];
-    const now = Object.hasOwn(stored.fields, field.key) ? stored.fields[field.key] : undefined;
-    if (value === undefined || (now !== undefined && sameJson(value, now))) continue;
-    problems.push(
-      issue(
-        ["fields", field.key],
-        "public_field_restored",
-        `${field.label} is public now and restoring would change its value. Confirm that this value may be published (it may have been staff-only when it was stored).`,
-      ),
-    );
-  }
-  return problems;
-}
-
-/** At most this many descendants are walked to check the depth of a moved unit. */
-export const MAX_DESCENDANTS_WALKED = 100_000;
-
-function tooDeep(): Issue {
-  return issue(
-    ["parentId"],
-    "too_deep",
-    `Filed there, its tree would be more than ${String(MAX_ARRANGEMENT_DEPTH)} levels deep.`,
-  );
-}
-
-/** Problems filing the restored unit where the old version had it, as the tree is now. */
-async function arrangementIssues(
-  db: Queryable,
-  unit: CatalogRecord & { kind: "archival_unit" },
-  stored: CatalogRecord & { kind: "archival_unit" },
-  found: ReadonlyMap<string, Record<string, unknown>>,
-): Promise<Issue[]> {
-  const org = unit.organizationId;
-  const problems: Issue[] = [];
-  const parentChanged = unit.parentId !== stored.parentId;
-  if (unit.level !== stored.level) {
-    // Its children stay where they are: they must still fit under it.
-    const children = await db.rows<{ level: ArchivalLevel }>(sql`
-      SELECT DISTINCT level FROM public.records
-      WHERE organization_id = ${org}::uuid AND parent_id = ${unit.id}::uuid`);
-    for (const child of children) {
-      if (!canFileUnder(child.level, unit.level)) {
-        problems.push(
-          issue(
-            ["level"],
-            "wrong_level",
-            `This unit holds a ${child.level} now, which can't be filed under a ${unit.level}.`,
-          ),
-        );
-      }
-    }
-  }
-  if (unit.parentId === undefined || (!parentChanged && unit.level === stored.level)) {
-    return problems;
-  }
-  const parent = found.get(unit.parentId);
-  if (parent?.kind !== "archival_unit") {
-    problems.push(
-      issue(
-        ["parentId"],
-        "missing_parent",
-        "The unit this version was filed under no longer exists, or is no longer an archival unit.",
-      ),
-    );
-    return problems;
-  }
-  if (!canFileUnder(unit.level, parent.level as ArchivalLevel)) {
-    problems.push(
-      issue(
-        ["parentId"],
-        "wrong_level",
-        `A ${unit.level} can't be filed under a ${String(parent.level)}.`,
-      ),
-    );
-  }
-  if (!parentChanged) return problems;
-  // The new parent's ancestors, up to the top or the depth limit, stopping
-  // at the unit itself (a loop).
-  const up = await db.rows<{ id: string }>(sql`
-    WITH RECURSIVE up(id, parent_id, depth) AS (
-      SELECT id, parent_id, 1 FROM public.records
-      WHERE organization_id = ${org}::uuid AND id = ${unit.parentId}::uuid
-      UNION ALL
-      SELECT r.id, r.parent_id, up.depth + 1
-      FROM up JOIN public.records r ON r.organization_id = ${org}::uuid AND r.id = up.parent_id
-      WHERE up.depth <= ${MAX_ARRANGEMENT_DEPTH}::integer AND up.id <> ${unit.id}::uuid
-    )
-    SELECT id::text AS id FROM up`);
-  if (up.some((row) => row.id === unit.id)) {
-    problems.push(
-      issue(
-        ["parentId"],
-        "loop",
-        "The unit this version was filed under is now inside this unit, so it would be filed inside itself.",
-      ),
-    );
-    return problems;
-  }
-  // Whether its own descendants would then sit too deep: walk down only as
-  // far as the room left below it, and at most MAX_DESCENDANTS_WALKED rows
-  // (the walk stops as soon as one unit past the room is found).
-  const room = MAX_ARRANGEMENT_DEPTH - (up.length + 1);
-  if (room < 0) {
-    problems.push(tooDeep());
-    return problems;
-  }
-  const [below] = await db.rows<{ deeper: boolean | null; walked: number }>(sql`
-    WITH RECURSIVE down(id, depth) AS (
-      SELECT id, 1 FROM public.records
-      WHERE organization_id = ${org}::uuid AND parent_id = ${unit.id}::uuid
-      UNION ALL
-      SELECT r.id, down.depth + 1
-      FROM down JOIN public.records r ON r.organization_id = ${org}::uuid AND r.parent_id = down.id
-      WHERE down.depth <= ${room}::integer
-    ), walked AS (
-      SELECT depth FROM down LIMIT ${MAX_DESCENDANTS_WALKED + 1}::integer
-    )
-    SELECT bool_or(depth > ${room}::integer) AS deeper, count(*)::integer AS walked FROM walked`);
-  if (below?.deeper === true) {
-    problems.push(tooDeep());
-  } else if ((below?.walked ?? 0) > MAX_DESCENDANTS_WALKED) {
-    problems.push(
-      issue(
-        ["parentId"],
-        "too_many_descendants",
-        `This unit holds more than ${String(MAX_DESCENDANTS_WALKED)} units, too many to check here; move it back in the arrangement instead.`,
-      ),
-    );
-  }
-  return problems;
 }

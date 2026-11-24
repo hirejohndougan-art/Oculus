@@ -6,6 +6,7 @@ export default defineConfig({
     // Tests run before the build, so packages import each other's sources.
     alias: {
       "@oculus/core": fileURLToPath(new URL("./packages/core/src/index.ts", import.meta.url)),
+      "@oculus/db": fileURLToPath(new URL("./packages/db/src/index.ts", import.meta.url)),
     },
   },
   test: {

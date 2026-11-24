@@ -79,3 +79,23 @@ export function writeRecordDirectly(
     return touched;
   });
 }
+
+/**
+ * Deletes a record by direct SQL as any writer must since 0008 (T-032,
+ * D-067): its deletion version first (the row as it is, one past its
+ * version, by `system:direct_sql`), then the DELETE. Run in a transaction.
+ */
+export async function deleteRecordDirectly(
+  q: Queryable,
+  organizationId: string,
+  recordId: string,
+): Promise<number> {
+  await q.execute(sql`
+    INSERT INTO public.record_versions (organization_id, record_id, version, record, actor, action)
+    SELECT organization_id, id, version + 1, public.record_snapshot(r), 'system:direct_sql', 'delete'
+    FROM public.records r
+    WHERE organization_id = ${organizationId}::uuid AND id = ${recordId}::uuid`);
+  return q.execute(sql`
+    DELETE FROM public.records
+    WHERE organization_id = ${organizationId}::uuid AND id = ${recordId}::uuid`);
+}

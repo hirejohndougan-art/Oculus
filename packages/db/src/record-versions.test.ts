@@ -39,6 +39,7 @@ import {
 import { sql, type Sql } from "./sql.js";
 import {
   freshDatabase,
+  deleteRecordDirectly,
   storeDirectVersion,
   testServerUrl,
   type TestDatabase,
@@ -495,10 +496,9 @@ describe("a record and its version are written together", () => {
     await ready();
     const org = await organization();
     const record = await stored(org);
-    await db.execute(
-      sql`DELETE FROM public.records WHERE organization_id = ${org}::uuid AND id = ${record.id}::uuid`,
-    );
-    expect(await numbers(org, record.id)).toEqual([1]);
+    // Deleted with its deletion version, as every delete must be since 0008.
+    await tx((q) => deleteRecordDirectly(q, org, record.id));
+    expect(await numbers(org, record.id)).toEqual([1, 2]);
     expect(codes(await tx((q) => insertRecord(q, record, SYSTEM)))).toEqual(["id_used_before"]);
     expect(
       await refusal(
@@ -509,7 +509,7 @@ describe("a record and its version are written together", () => {
                   ${JSON.stringify(record.fields)}::jsonb, ${T}::timestamptz, ${T}::timestamptz)`),
       ),
     ).toEqual({ code: IDENTITY, constraint: "records_id_used_before" });
-    expect(await numbers(org, record.id)).toEqual([1]);
+    expect(await numbers(org, record.id)).toEqual([1, 2]);
     // A record that still exists is refused by the primary key, as before.
     const live = await stored(org);
     expect(await refusal(tx((q) => insertRecord(q, live, SYSTEM)))).toMatchObject({

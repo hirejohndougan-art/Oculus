@@ -465,9 +465,18 @@ const ID_USED_BEFORE =
  */
 function versionRefusal<T>(
   error: unknown,
-  write: "insert" | "update" | "restore",
+  write: "insert" | "update" | "restore" | "delete",
 ): Validated<T> | undefined {
   const state = sqlState(error);
+  if (state === FOREIGN_KEY && write === "delete") {
+    // A row pointing at the record (a unit filed under it, a scan of it, a
+    // number it holds) committed between the checks and the DELETE.
+    return refused(
+      ["recordId"],
+      "in_use",
+      "Something else points at this record now (a unit filed under it, a scan of it or a number it holds). Read it again.",
+    );
+  }
   if (state === NOT_READ_COMMITTED) {
     return refused(
       [],
@@ -533,11 +542,11 @@ const UPDATED_BEFORE = "updatedAt can't be earlier than the stored record's.";
  * (the record row and its version alike) is rolled back to the savepoint and
  * the caller's transaction stays usable. A deadlock or serialization failure
  * is returned as `retry`; any other error is thrown after the rollback.
- * @internal Also used by `restoreVersion` (savepoints nest).
+ * @internal Also used by `restoreVersion` and `deleteRecord` (savepoints nest).
  */
 export async function inSavepoint<T>(
   db: Queryable,
-  write: "insert" | "update" | "restore",
+  write: "insert" | "update" | "restore" | "delete",
   work: () => Promise<Validated<T>>,
 ): Promise<Validated<T>> {
   try {
@@ -937,4 +946,96 @@ function recordFromRow(row: RecordRow): Record<string, unknown> {
     record.coordinates = { lat: row.latitude, lng: row.longitude };
   }
   return record;
+}
+
+// ---------------------------------------------------------------------------
+// Locks for the service layer's writes (T-032, D-065, D-067)
+
+/** Where a record sits now, read without a lock: what decides whether a write needs the arrangement lock. */
+export interface RecordPlace {
+  readonly version: number;
+  readonly kind: string;
+  readonly parentId: RecordId | null;
+  readonly level: string | null;
+}
+
+/**
+ * The organization's record's version, kind, parent and level as now
+ * committed (no lock), or `undefined` if it has no such record. A writer
+ * reads this first to decide whether it must take `lockArrangement` before
+ * locking the row (D-065); `lockRecord` then confirms the version, so the
+ * decision still holds.
+ */
+export async function readRecordPlace(
+  db: Queryable,
+  organizationId: OrganizationId,
+  recordId: RecordId,
+): Promise<RecordPlace | undefined> {
+  if (!isOrganizationId(organizationId) || !isRecordId(recordId)) return undefined;
+  const [row] = await db.rows<{
+    version: number;
+    kind: string;
+    parent_id: string | null;
+    level: string | null;
+  }>(sql`
+    SELECT version, kind, parent_id::text AS parent_id, level FROM public.records
+    WHERE organization_id = ${organizationId}::uuid AND id = ${recordId}::uuid`);
+  if (row === undefined) return undefined;
+  return Object.freeze({
+    version: row.version,
+    kind: row.kind,
+    parentId: row.parent_id as RecordId | null,
+    level: row.level,
+  });
+}
+
+/**
+ * Takes the organization's arrangement lock (0006) until the transaction
+ * ends: before any check of a unit's parent or level, and before the row
+ * lock (D-065). Refused under any isolation level but Read Committed (the
+ * database raises OC061, thrown).
+ */
+export async function lockArrangement(
+  db: Queryable,
+  organizationId: OrganizationId,
+): Promise<void> {
+  if (!isOrganizationId(organizationId)) throw new TypeError(BAD_ORGANIZATION);
+  await db.execute(sql`SELECT public.arrangement_lock(${organizationId}::uuid)`);
+}
+
+/**
+ * Locks the organization's record row (`FOR NO KEY UPDATE`, as
+ * `updateRecord` and the identifier save do) until the transaction ends, and
+ * returns its version, or `undefined` if there is no such record.
+ */
+export async function lockRecord(
+  db: Queryable,
+  organizationId: OrganizationId,
+  recordId: RecordId,
+): Promise<number | undefined> {
+  if (!isOrganizationId(organizationId) || !isRecordId(recordId)) return undefined;
+  const [row] = await db.rows<{ version: number }>(sql`
+    SELECT version FROM public.records
+    WHERE organization_id = ${organizationId}::uuid AND id = ${recordId}::uuid
+    FOR NO KEY UPDATE`);
+  return row?.version;
+}
+
+/**
+ * Takes the lock on one template's or record type's versions (0008's
+ * `definition_lock`) until the transaction ends: shared for a save that
+ * checks against the current version (a new version waits for it), exclusive
+ * for writing a new version (the version tables' triggers take it too).
+ */
+export async function lockDefinition(
+  db: Queryable,
+  organizationId: OrganizationId,
+  kind: "template" | "record_type",
+  key: string,
+  exclusive = false,
+): Promise<void> {
+  if (!isOrganizationId(organizationId)) throw new TypeError(BAD_ORGANIZATION);
+  await db.execute(
+    sql`SELECT public.definition_lock(${organizationId}::uuid, ${kind}, ${key}, ${exclusive})`,
+  );
 }

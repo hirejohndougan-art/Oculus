@@ -30,7 +30,11 @@ import {
 } from "./identifiers.js";
 import { migrate } from "./migrate.js";
 import { sql, type Sql } from "./sql.js";
-import { freshDatabase, type TestDatabase } from "./test-database.fixtures.js";
+import {
+  deleteRecordDirectly,
+  freshDatabase,
+  type TestDatabase,
+} from "./test-database.fixtures.js";
 
 // ---------------------------------------------------------------------------
 // One migrated database for the file, set up lazily inside each test.
@@ -78,9 +82,11 @@ function tx<T>(work: (q: Queryable) => Promise<T>): Promise<T> {
   return db.transaction(work);
 }
 
-async function refusedBy(query: Sql): Promise<{ code: string; constraint?: string }> {
+async function refusedBy(
+  query: Sql | ((q: Queryable) => Promise<unknown>),
+): Promise<{ code: string; constraint?: string }> {
   try {
-    await tx((q) => q.execute(query));
+    await tx((q) => (typeof query === "function" ? query(q) : q.execute(query)));
   } catch (error) {
     const e = error as { code?: string; constraint?: string };
     return {
@@ -1363,11 +1369,10 @@ describe("organizations stay separate, even through direct SQL", () => {
         sql`DELETE FROM public.identifier_types WHERE organization_id = ${org}::uuid AND key = 'object_number'`,
       ),
     ).toMatchObject({ code: FOREIGN_KEY });
-    expect(
-      await refusedBy(
-        sql`DELETE FROM public.records WHERE organization_id = ${org}::uuid AND id = ${id}::uuid`,
-      ),
-    ).toMatchObject({ code: FOREIGN_KEY });
+    // With its deletion version (0008), so only the foreign key refuses it.
+    expect(await refusedBy((q) => deleteRecordDirectly(q, org, id))).toMatchObject({
+      code: FOREIGN_KEY,
+    });
     expect(
       await refusedBy(
         sql`DELETE FROM public.identifier_holdings WHERE organization_id = ${org}::uuid AND record_id = ${id}::uuid`,
