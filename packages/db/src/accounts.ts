@@ -62,7 +62,7 @@ import {
   type UserId,
   type Validated,
 } from "@oculus/core";
-import type { Database, Queryable } from "./client.js";
+import { isDatabaseFailure, type Database, type Queryable } from "./client.js";
 import { sql } from "./sql.js";
 
 /**
@@ -253,7 +253,8 @@ export interface InvitationMessage {
  * a double). Called after the invitation is committed, outside any
  * transaction, with a time limit: `signal` aborts at the limit, and the
  * sender should stop then. If it throws, rejects or runs out of time, the
- * invitation is revoked and the result is `delivery_failed`. It must never
+ * invitation is revoked and the result is `delivery_failed` (or
+ * `delivery_failed_may_be_pending` if it can't be revoked). It must never
  * show, log or keep the token anywhere but the message to the invitee
  * (D-068).
  */
@@ -281,6 +282,19 @@ const NOT_PERMITTED = "Only a system admin can do that.";
  * learn from `acceptInvitation` whether the address has an account (D-068).
  * Invitations for one organization and address are made one at a time (a
  * transaction-level advisory lock, classid 68).
+ *
+ * The result (D-068, S-016):
+ * - `ok` with the invitation: stored and sent, and still pending (or
+ *   accepted already). Its ID works with `revokeInvitation`.
+ * - `superseded`: sent, but a newer invitation to the same address was made
+ *   while this one was being sent and revoked it; only the newer one works,
+ *   so no (dead) ID is returned. `revoked`: an admin withdrew it meanwhile.
+ * - `delivery_failed`: not sent (or not known to be), so it was withdrawn.
+ * - `delivery_failed_may_be_pending`: not sent, and the withdrawal failed
+ *   twice: it may still work until it expires. Sending a new invitation
+ *   replaces it.
+ * - `database_unavailable`: the database or network failed before it was
+ *   stored. Programming errors are thrown, never answered as this.
  */
 export async function createInvitation(
   db: Database,
@@ -390,31 +404,91 @@ export async function createInvitation(
     { email, organizationId, organizationName, token, expiresAt: created.expiresAt },
     timeoutMs,
   );
-  if (sent) return { ok: true, value: created };
+  if (sent) {
+    // A newer invitation for the address may have revoked this one while it
+    // was being sent: its ID is dead, so say so (S-016). If that can't be
+    // read, it was stored and sent, which is the answer.
+    let state: "usable" | "superseded" | "revoked" = "usable";
+    try {
+      state = await stateAfterSend(db, organizationId, invitationId);
+    } catch (error) {
+      if (!isDatabaseFailure(error)) throw error;
+    }
+    if (state === "superseded") {
+      return refused(
+        "superseded",
+        "A newer invitation to this address replaced this one while it was being sent; only the newer one works.",
+      );
+    }
+    if (state === "revoked") {
+      return refused("revoked", "The invitation was withdrawn while it was being sent.");
+    }
+    return { ok: true, value: created };
+  }
 
   // 3. Not sent (or not known to be): revoke it, unless it was accepted
-  //    meanwhile, which means the message did get through.
-  try {
-    const revoked = await inTransaction(db, (tx) =>
-      tx.execute(sql`
-        UPDATE public.invitations SET revoked_at = now(), revoked_by = ${invitedBy}::uuid
-        WHERE organization_id = ${organizationId}::uuid AND id = ${invitationId}::uuid
-          AND accepted_at IS NULL AND revoked_at IS NULL`),
+  //    meanwhile, which means the message did get through. A failed revoke
+  //    is tried once more (S-016).
+  let revoked: number | undefined;
+  for (let attempt = 1; attempt <= 2 && revoked === undefined; attempt++) {
+    try {
+      revoked = await inTransaction(db, (tx) =>
+        tx.execute(sql`
+          UPDATE public.invitations SET revoked_at = now(), revoked_by = ${invitedBy}::uuid
+          WHERE organization_id = ${organizationId}::uuid AND id = ${invitationId}::uuid
+            AND accepted_at IS NULL AND revoked_at IS NULL`),
+      );
+    } catch (error) {
+      if (!isDatabaseFailure(error)) throw error;
+    }
+  }
+  if (revoked === undefined) {
+    // Not sent, and not withdrawn either: the link was never shown to anyone
+    // here, but it may still work until it expires.
+    return refused(
+      "delivery_failed_may_be_pending",
+      "The invitation couldn't be sent, and it couldn't be withdrawn either, so it may still be pending until it expires. Send a new one (which replaces it) or withdraw it from the pending invitations.",
     );
-    if (revoked === 0) {
+  }
+  if (revoked === 0) {
+    try {
       const accepted = await db.rows(sql`
         SELECT 1 FROM public.invitations
         WHERE id = ${invitationId}::uuid AND accepted_at IS NOT NULL`);
       if (accepted.length > 0) return { ok: true, value: created };
+    } catch (error) {
+      // Not pending any more either way (accepted or revoked meanwhile).
+      if (!isDatabaseFailure(error)) throw error;
     }
-  } catch {
-    // The link was never shown to anyone here; if it can't be revoked it
-    // still expires. Fall through to the same refusal.
   }
   return refused(
     "delivery_failed",
     "The invitation couldn't be sent, so it was withdrawn. Try again later.",
   );
+}
+
+/**
+ * An invitation's state once its message was sent: still usable (pending,
+ * or accepted already), `superseded` (revoked by a newer invitation for the
+ * same organization and address, which revokes and inserts in one
+ * transaction, so its `created_at` is this one's `revoked_at`), or
+ * `revoked` (withdrawn by an admin meanwhile).
+ */
+async function stateAfterSend(
+  db: Database,
+  organizationId: OrganizationId,
+  invitationId: InvitationId,
+): Promise<"usable" | "superseded" | "revoked"> {
+  const rows = await db.rows<{ revoked: boolean; superseded: boolean }>(sql`
+    SELECT i.revoked_at IS NOT NULL AS revoked,
+           EXISTS (SELECT 1 FROM public.invitations n
+                   WHERE n.organization_id = i.organization_id AND n.email = i.email
+                     AND n.id <> i.id AND n.created_at = i.revoked_at) AS superseded
+    FROM public.invitations i
+    WHERE i.organization_id = ${organizationId}::uuid AND i.id = ${invitationId}::uuid`);
+  const row = rows[0];
+  if (!row?.revoked) return "usable";
+  return row.superseded ? "superseded" : "revoked";
 }
 
 /** Options for `createInvitation`. */
@@ -458,9 +532,13 @@ async function deliverWithin(
   }
 }
 
-/** A database failure as a fixed refusal: never the database's own message. */
+/**
+ * A database or network failure as a fixed refusal, never the database's own
+ * message. Anything else (a programming error, Node's `ERR_*`) is rethrown
+ * (S-016).
+ */
 function databaseRefusal<T>(error: unknown): Validated<T> {
-  if (sqlState(error) === undefined) throw error;
+  if (!isDatabaseFailure(error)) throw error;
   return refused(
     "database_unavailable",
     "The database couldn't do that just now. Try again in a moment.",

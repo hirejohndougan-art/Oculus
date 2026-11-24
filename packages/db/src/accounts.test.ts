@@ -1149,13 +1149,159 @@ describe("what the inviter can learn (D-068)", () => {
       const second = await inviteVia(db, { organizationId: org, email: address, invitedBy: admin });
       expect(second.ok).toBe(true);
       release();
-      expect((await slow).ok).toBe(true);
+      // The first was revoked by the second while it was being sent: it is
+      // reported as superseded, not as a success with a dead ID (S-016).
+      expect(await slow).toEqual({
+        ok: false,
+        issues: [
+          {
+            path: [],
+            code: "superseded",
+            message:
+              "A newer invitation to this address replaced this one while it was being sent; only the newer one works.",
+          },
+        ],
+      });
       const pending = await db.rows(sql`
         SELECT 1 FROM public.invitations WHERE organization_id = ${org}::uuid AND email = ${address}
           AND accepted_at IS NULL AND revoked_at IS NULL`);
       expect(pending).toHaveLength(1);
     } finally {
       await single.close();
+    }
+  });
+
+  it("reports an invitation an admin withdrew while it was being sent as revoked (S-016)", async () => {
+    await ready();
+    const org = await organization();
+    const address = email();
+    const made = await createInvitation(
+      db,
+      { organizationId: org, email: address, invitedBy: admin },
+      async () => {
+        const [row] = await db.rows<{ id: InvitationId }>(sql`
+          SELECT id::text AS id FROM public.invitations
+          WHERE organization_id = ${org}::uuid AND email = ${address}`);
+        ok(
+          await revokeInvitation(db, {
+            organizationId: org,
+            invitationId: row?.id ?? ("" as InvitationId),
+            by: admin,
+          }),
+        );
+      },
+    );
+    expect(codes(made)).toEqual(["revoked"]);
+  });
+
+  it("retries a failed withdrawal once, and says the invitation may still be pending if that fails too (S-016)", async () => {
+    await ready();
+    const org = await organization();
+    /** The real pool, with every transaction after the first `pass` failing as `error`. */
+    const failingAfter = (pass: number, error: Error, failures = Infinity) => {
+      let calls = 0;
+      let failed = 0;
+      const wrapped: Database = {
+        ...db,
+        rows: db.rows.bind(db),
+        execute: db.execute.bind(db),
+        close: () => Promise.resolve(),
+        transaction: (work) => {
+          calls += 1;
+          if (calls > pass && failed < failures) {
+            failed += 1;
+            return Promise.reject(error);
+          }
+          return db.transaction(work);
+        },
+      };
+      return { wrapped, calls: () => calls };
+    };
+    const pendingFor = async (address: string): Promise<number> => {
+      const [row] = await db.rows<{ n: number }>(sql`
+        SELECT count(*)::integer AS n FROM public.invitations
+        WHERE organization_id = ${org}::uuid AND email = ${address}
+          AND accepted_at IS NULL AND revoked_at IS NULL`);
+      return row?.n ?? -1;
+    };
+    const notSent = () => Promise.reject(new Error("not sent"));
+    // Both withdrawals fail: a distinct answer, and the invitation is still pending.
+    const lost = Object.assign(new Error("terminating connection"), { code: "57P01" });
+    const twice = failingAfter(1, lost);
+    const first = email();
+    const made = await createInvitation(
+      twice.wrapped,
+      { organizationId: org, email: first, invitedBy: admin },
+      notSent,
+    );
+    expect(codes(made)).toEqual(["delivery_failed_may_be_pending"]);
+    expect(JSON.stringify(made)).not.toContain("terminating");
+    expect(twice.calls()).toBe(3);
+    expect(await pendingFor(first)).toBe(1);
+    // The first withdrawal fails, the retry works: withdrawn.
+    const once = failingAfter(1, lost, 1);
+    const second = email();
+    expect(
+      codes(
+        await createInvitation(
+          once.wrapped,
+          { organizationId: org, email: second, invitedBy: admin },
+          notSent,
+        ),
+      ),
+    ).toEqual(["delivery_failed"]);
+    expect(once.calls()).toBe(3);
+    expect(await pendingFor(second)).toBe(0);
+    // A programming error in the withdrawal is thrown, not answered.
+    const bug = Object.assign(new TypeError("bad argument"), { code: "ERR_INVALID_ARG_TYPE" });
+    await expect(
+      createInvitation(
+        failingAfter(1, bug).wrapped,
+        { organizationId: org, email: email(), invitedBy: admin },
+        notSent,
+      ),
+    ).rejects.toBe(bug);
+  });
+
+  it("answers only database and network failures as database_unavailable, and throws programming errors (S-016)", async () => {
+    await ready();
+    const org = await organization();
+    const failing = (error: Error): Database => ({
+      ...db,
+      rows: () => Promise.reject(error),
+      execute: () => Promise.reject(error),
+      close: () => Promise.resolve(),
+      transaction: () => Promise.reject(error),
+    });
+    const request = { organizationId: org, email: email(), invitedBy: admin };
+    const send = () => Promise.resolve();
+    for (const failure of [
+      Object.assign(new Error("the server's own text"), { code: "53300" }),
+      Object.assign(new Error("connect ECONNREFUSED"), {
+        code: "ECONNREFUSED",
+        syscall: "connect",
+      }),
+      new Error("Connection terminated unexpectedly"),
+    ]) {
+      const made = await createInvitation(failing(failure), request, send);
+      expect(codes(made)).toEqual(["database_unavailable"]);
+      expect(JSON.stringify(made)).not.toContain(failure.message);
+    }
+    for (const bug of [
+      Object.assign(new TypeError("bad argument"), { code: "ERR_INVALID_ARG_TYPE" }),
+      new TypeError("Queries must be made with the sql tag."),
+      new Error("something we did wrong"),
+    ]) {
+      await expect(createInvitation(failing(bug), request, send)).rejects.toBe(bug);
+    }
+    // A real network failure: no server behind the socket directory.
+    const nowhere = openDatabase("postgresql://nobody@localhost/nothing?host=%2Fnonexistent-s016");
+    try {
+      expect(codes(await createInvitation(nowhere, request, send))).toEqual([
+        "database_unavailable",
+      ]);
+    } finally {
+      await nowhere.close();
     }
   });
 

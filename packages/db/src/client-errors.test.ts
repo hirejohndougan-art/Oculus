@@ -2,10 +2,18 @@
 // query (D-068 review): no uncaught 'error' from the checked-out client, a
 // clean ConnectionLostError, and the pool throws the client away and keeps
 // working.
-import { afterAll, describe, expect, it } from "vitest";
-import { ConnectionLostError, openDatabase, type Database } from "./client.js";
+import pg from "pg";
+import { afterAll, describe, expect, it, vi } from "vitest";
+import {
+  ConnectionLostError,
+  createDatabase,
+  dropDatabase,
+  isDatabaseFailure,
+  openDatabase,
+  type Database,
+} from "./client.js";
 import { sql } from "./sql.js";
-import { freshDatabase, type TestDatabase } from "./test-database.fixtures.js";
+import { freshDatabase, testServerUrl, type TestDatabase } from "./test-database.fixtures.js";
 
 let testDb: TestDatabase | undefined;
 const pools: Database[] = [];
@@ -57,5 +65,76 @@ describe("a transaction's connection lost mid-way", () => {
     } finally {
       process.off("uncaughtException", record);
     }
+  });
+});
+
+describe("database failures and programming errors (S-016)", () => {
+  it("tells the database's and the network's failures from programming errors", async () => {
+    const coded = (code: string, extra: object = {}): Error =>
+      Object.assign(new Error("x"), { code, ...extra });
+    // The server's errors (SQLSTATE), a lost connection, socket errors, pg's own.
+    for (const failure of [
+      coded("57P01"),
+      coded("XX000"),
+      coded("40001"),
+      new ConnectionLostError(new Error("gone")),
+      coded("ECONNREFUSED", { syscall: "connect" }),
+      coded("ENOENT", { syscall: "connect" }),
+      coded("ECONNRESET", { syscall: "read" }),
+      new Error("Connection terminated unexpectedly"),
+      new Error("timeout exceeded when trying to connect"),
+    ]) {
+      expect({ failure: String(failure), is: isDatabaseFailure(failure) }).toEqual({
+        failure: String(failure),
+        is: true,
+      });
+    }
+    // Programming errors: Node's ERR_* codes, a socket-like code with no
+    // syscall, TypeErrors, plain errors, non-errors.
+    for (const other of [
+      coded("ERR_INVALID_ARG_TYPE"),
+      coded("ERR_TLS_CERT_ALTNAME_INVALID", { syscall: "connect" }),
+      coded("ECONNREFUSED"),
+      coded("not_a_code"),
+      new TypeError("Queries must be made with the sql tag."),
+      new TypeError("Connection terminated unexpectedly"),
+      new Error("Something else"),
+      "57P01",
+      undefined,
+      null,
+    ]) {
+      expect({ other: String(other), is: isDatabaseFailure(other) }).toEqual({
+        other: String(other),
+        is: false,
+      });
+    }
+    // A real one: a socket directory with no server in it.
+    const nowhere = openDatabase("postgresql://nobody@localhost/nothing?host=%2Fnonexistent-s016");
+    try {
+      const error = await nowhere.rows(sql`SELECT 1`).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      expect(isDatabaseFailure(error)).toBe(true);
+    } finally {
+      await nowhere.close();
+    }
+  });
+
+  it("createDatabase and dropDatabase listen for their connection's errors", async () => {
+    const counts: number[] = [];
+    const connect = vi.spyOn(pg.Client.prototype, "connect").mockImplementation(function (
+      this: pg.Client,
+    ) {
+      counts.push(this.listenerCount("error"));
+      throw Object.assign(new Error("refused"), { code: "57P03" });
+    });
+    try {
+      await expect(createDatabase(testServerUrl(), "s016_never_made")).rejects.toThrow("refused");
+      await expect(dropDatabase(testServerUrl(), "s016_never_made")).rejects.toThrow("refused");
+    } finally {
+      connect.mockRestore();
+    }
+    expect(counts).toEqual([1, 1]);
   });
 });
