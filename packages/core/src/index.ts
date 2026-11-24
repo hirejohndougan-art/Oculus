@@ -539,3 +539,50 @@ export type {
   AccessionRegisterInput,
 } from "./accessions.js";
 export type { PublishCheckOptions } from "./effective.js";
+export {
+  newUserId,
+  isUserId,
+  newInvitationId,
+  isInvitationId,
+  normalizeEmail,
+  validateDisplayName,
+  newInvitationToken,
+  isInvitationToken,
+  hashInvitationToken,
+  MAX_EMAIL_LENGTH,
+  MAX_DISPLAY_NAME_LENGTH,
+  DEFAULT_INVITATION_SECONDS,
+  MIN_INVITATION_SECONDS,
+  MAX_INVITATION_SECONDS,
+} from "./accounts.js";
+export type { UserId, InvitationId } from "./accounts.js";
+export {
+  hashPassword,
+  verifyPassword,
+  dummyPasswordHash,
+  isPasswordHash,
+  passwordHashNeedsRehash,
+  passwordWorkCount,
+  checkNewPassword,
+  isCommonPassword,
+  passwordContextWords,
+  PasswordWorkBusyError,
+  MIN_PASSWORD_LENGTH,
+  RECOMMENDED_PASSWORD_LENGTH,
+  MAX_PASSWORD_BYTES,
+  SCRYPT_SETTINGS,
+  MAX_CONCURRENT_HASHES,
+  MAX_QUEUED_HASHES,
+  DEFAULT_CONTEXT_WORDS,
+} from "./passwords.js";
+export type { PasswordCheck, PasswordContext } from "./passwords.js";
+export {
+  throttleAttempt,
+  throttleDelaySeconds,
+  throttleAccountKey,
+  throttleSourceKey,
+  ACCOUNT_THROTTLE,
+  SOURCE_THROTTLE,
+  OTHER_SOURCE_KEY,
+} from "./sign-in-throttle.js";
+export type { ThrottleRule, ThrottleState, ThrottleDecision } from "./sign-in-throttle.js";

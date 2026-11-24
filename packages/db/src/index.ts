@@ -104,3 +104,26 @@ export {
   MAX_SEARCH_LIMIT,
 } from "./search.js";
 export type { SearchHit, SearchResults, SearchOptions, MatchedBy } from "./search.js";
+export {
+  createFirstSystemAdmin,
+  createInvitation,
+  revokeInvitation,
+  acceptInvitation,
+  acceptInvitationForUser,
+  signIn,
+  clearSignInThrottle,
+  deleteExpiredSignInThrottles,
+  INVALID_CREDENTIALS,
+  ACCOUNT_TABLE_PRIVILEGES,
+} from "./accounts.js";
+export type {
+  FirstSystemAdmin,
+  InvitationRequest,
+  CreatedInvitation,
+  InvitationAcceptance,
+  SignInRequest,
+  SignInSuccess,
+  SignInFailure,
+  SignInResult,
+  Membership,
+} from "./accounts.js";
