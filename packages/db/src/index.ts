@@ -9,7 +9,8 @@
  * identifier tables and `vocabularies.ts` the stored terms and the index of
  * which records use them, all through core's validators; `search.ts` is
  * staff search (STAFF ONLY: never for a public site, D-066); `accounts.ts`
- * users, invitations and password sign-in (D-068).
+ * users, invitations and password sign-in (D-068); `sessions.ts` sessions
+ * (D-069; promotion past the second step is internal, for T-038 only).
  */
 export { sql, joinSql, isSql, Sql, MAX_PARAMETERS } from "./sql.js";
 export type { SqlScalar, SqlValue } from "./sql.js";
@@ -152,3 +153,35 @@ export type {
   SignInResult,
   Membership,
 } from "./accounts.js";
+export {
+  beginSession,
+  readPendingSession,
+  resolveSession,
+  rotateSession,
+  switchOrganization,
+  reauthenticate,
+  listSessions,
+  endSession,
+  endOwnSession,
+  endOtherSessions,
+  endUserSessions,
+  deleteExpiredSessions,
+  runCleanup,
+  NO_SESSION,
+  MAX_LISTED_SESSIONS,
+  SESSION_TABLE_PRIVILEGES,
+} from "./sessions.js";
+export type {
+  NoSession,
+  SessionFailure,
+  SessionCallOptions,
+  FullSession,
+  PendingSession,
+  IssuedSession,
+  SessionSummary,
+  SessionStart,
+  SessionOptions,
+  ResolveOptions,
+  PromotionRefusal,
+  CleanupResult,
+} from "./sessions.js";

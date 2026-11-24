@@ -18,7 +18,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "db:migrate": "npm --prefix ../core run build && tsc -p tsconfig.build.json && node dist/migrate-cli.js",
     "db:backup": "npm --prefix ../core run build && tsc -p tsconfig.build.json && exec node dist/backup-cli.js backup",
-    "db:restore": "npm --prefix ../core run build && tsc -p tsconfig.build.json && exec node dist/backup-cli.js restore"
+    "db:restore": "npm --prefix ../core run build && tsc -p tsconfig.build.json && exec node dist/backup-cli.js restore",
+    "db:cleanup": "npm --prefix ../core run build && tsc -p tsconfig.build.json && exec node dist/cleanup-cli.js"
   },
   "devDependencies": {
     "@types/pg": "8.23.1"

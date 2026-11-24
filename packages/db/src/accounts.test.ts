@@ -1533,7 +1533,11 @@ describe("inputs that never reach the database", () => {
           }),
         ),
       );
-      expect(made.filter((r) => r.ok)).toHaveLength(12);
+      // Each one is stored; one sent while a newer one was already being made comes back
+      // superseded (S-016), so every answer is ok or superseded and exactly one stays pending.
+      for (const r of made) {
+        if (!r.ok) expect(r.issues.map((i) => i.code)).toEqual(["superseded"]);
+      }
       const rows = await db.rows<{ pending: boolean }>(sql`
         SELECT accepted_at IS NULL AND revoked_at IS NULL AS pending FROM public.invitations
         WHERE organization_id = ${org}::uuid AND email = ${address}`);
@@ -1701,8 +1705,12 @@ describe("the database's own guards", () => {
       "invitations.invitations_settle_once",
       "invitations.zzzz_invitations_keep_identity",
       "organization_members.organization_members_check_invitation",
+      // 0010 (T-037): removing a membership or disabling an account ends sessions.
+      "organization_members.organization_members_end_sessions",
       "organization_members.zzzz_organization_members_keep_identity",
       "users.users_check_invitation",
+      "users.users_end_sessions",
+      "users.users_sessions_valid_after",
       "users.zzzz_users_keep_identity",
     ]);
     for (const r of rows) expect(r).toEqual({ name: r.name, enabled: "A" });

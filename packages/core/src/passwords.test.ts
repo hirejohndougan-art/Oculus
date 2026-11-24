@@ -196,12 +196,13 @@ describe("hashPassword and verifyPassword", () => {
     const previous = await oldStyleHash("a stored password here", 12, 8, 1);
     const time = async (check: () => Promise<unknown>): Promise<number> => {
       const runs: number[] = [];
-      for (let i = 0; i < 5; i++) {
+      for (let i = 0; i < 9; i++) {
         const t = performance.now();
         await check();
         runs.push(performance.now() - t);
       }
-      return runs.sort((x, y) => x - y)[2] ?? 0;
+      // Median of nine: five runs left the ratio at 0.57 on a busy two-core machine.
+      return runs.sort((x, y) => x - y)[4] ?? 0;
     };
     const base = await time(() => verifyPassword("wrong", current));
     for (const other of [
