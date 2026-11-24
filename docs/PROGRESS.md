@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 10:00 CT — manual (John: "finish the 3 in progress and the security ones") — T-039 Password reset tokens
+- Result: done
+- What changed: migration `0015_password_resets.sql` and `packages/db/src/password-resets.ts`: a request gets the same reply for every address before any account-dependent work, which runs after a random 1–10 s wait (dummy work of the same shape for non-accounts); throttles per address typed, per client address and per IPv6 /48; 256-bit single-use links stored as SHA-256, 30 minutes, one pending per account, sent after commit with a time limit and withdrawn if sending fails; completing a reset sets the password, ends every session and signs nobody in; links die on password change, "end all", disabling or losing the last membership; no self-service reset for an account without an active second factor (code and trigger), admins can send one after re-entering their password; the second factor and its enrolment token stay required.
+- Decisions: D-078
+- Review: three independent rounds (enumeration by the next request's latency; mailbox-only takeover of accounts without a factor; a lock-order deadlock with sign-in; the work cap filled by waiting requests); all fixed with tests.
+- Gate: PASS · tests_passing 3843 (was 3806) · npm audit clean
+- Next: T-042 API (small fix), S-018 security batch (fixing review findings)
+
 ## 2026-11-24 08:08 CT — manual (John: "continue on phase 2") — T-038 Two-step sign-in, required for all staff
 - Result: done
 - What changed: core `totp.ts` (RFC 6238, SHA-1, 6 digits, 30 s, ±1 step, no replay). Migration `0014_second_factors.sql` and `packages/db/src/second-factor.ts`: set-up at first sign-in from a waiting session, 10 single-use recovery codes stored hashed, the secret sealed with AES-256-GCM under a key from `OCULUS_SECRET_KEY` (HKDF; rotation with `OCULUS_SECRET_KEY_PREVIOUS`), throttling that can't lock anyone out (recovery codes always work; app codes wait at most 15 minutes; alerts recorded), promotion bound in the database to a pass that only someone holding the secret (an S/KEY-style hash chain) or a recovery code can make, re-entering the password needing a code too, admin reset with a one-time enrolment token required for every new set-up after it.

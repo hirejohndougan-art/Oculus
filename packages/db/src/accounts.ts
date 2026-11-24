@@ -34,6 +34,9 @@ import {
   MAX_INVITATION_SECONDS,
   MIN_INVITATION_SECONDS,
   PasswordWorkBusyError,
+  RESET_ACCOUNT_THROTTLE,
+  RESET_NETWORK_THROTTLE,
+  RESET_SOURCE_THROTTLE,
   SOURCE_THROTTLE,
   checkNewPassword,
   dummyPasswordHash,
@@ -49,6 +52,7 @@ import {
   newUserId,
   normalizeEmail,
   passwordText,
+  resetThrottleAccountKey,
   throttleAccountKey,
   throttleAttempt,
   throttleSourceKey,
@@ -58,6 +62,7 @@ import {
   type Issue,
   type OrganizationId,
   type PasswordCheck,
+  type ThrottleRule,
   type ThrottleState,
   type UserId,
   type Validated,
@@ -499,23 +504,26 @@ export interface InvitationOptions {
 
 /** Default time limit for sending an invitation. */
 export const DEFAULT_DELIVERY_TIMEOUT_MS = 30_000;
-const MAX_DELIVERY_TIMEOUT_MS = 300_000;
+/** The longest time limit a caller may give a delivery: 5 minutes. */
+export const MAX_DELIVERY_TIMEOUT_MS = 300_000;
 
 /**
  * Runs `deliver` with an AbortSignal that fires at the time limit. True
  * only if it resolved in time; a throw, a rejection or the time limit is
- * false. A late result is ignored.
+ * false. A late result is ignored, and what it threw or rejected with is
+ * dropped (it might hold the message, and with it the token). Also used by
+ * password-resets.ts; not exported from `@oculus/db`.
  */
-async function deliverWithin(
-  deliver: InvitationDelivery,
-  message: InvitationMessage,
+export async function deliverWithin<M>(
+  deliver: (message: M, signal: AbortSignal) => Promise<void>,
+  message: M,
   timeoutMs: number,
 ): Promise<boolean> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timedOut = new Promise<false>((resolve) => {
     timer = setTimeout(() => {
-      controller.abort(new Error("The invitation took too long to send."));
+      controller.abort(new Error("The message took too long to send."));
       resolve(false);
     }, timeoutMs);
   });
@@ -829,18 +837,39 @@ interface CounterRow {
   last_ms: number | null;
 }
 
+/** The rules for a pair of counters: one per address typed, one per client address. */
+export interface ThrottleRules {
+  readonly account: ThrottleRule;
+  readonly source: ThrottleRule;
+}
+
+const SIGN_IN_RULES: ThrottleRules = Object.freeze({
+  account: ACCOUNT_THROTTLE,
+  source: SOURCE_THROTTLE,
+});
+
 /**
  * Counts this attempt against both counters, or says how long to wait. One
  * short transaction with both rows locked (account key first; every caller
  * locks in key order), so attempts sent at once are counted one by one.
+ * Sign-in's rules unless others are given (password-resets.ts gives its own,
+ * with its own keys, and an `extra` counter per IPv6 /48). Not exported
+ * from `@oculus/db`.
  */
-async function takeAttempt(
+export async function takeAttempt(
   db: Database,
   accountKey: string,
   sourceKey: string,
+  rules: ThrottleRules = SIGN_IN_RULES,
+  extra: readonly { readonly key: string; readonly rule: ThrottleRule }[] = [],
 ): Promise<{ allowed: true } | { allowed: false; retryAfterSeconds: number }> {
+  const counters = [
+    { key: accountKey, rule: rules.account },
+    { key: sourceKey, rule: rules.source },
+    ...extra,
+  ];
   for (let attempt = 1; ; attempt++) {
-    const decided = await inTransaction(db, (tx) => decideAttempt(tx, accountKey, sourceKey));
+    const decided = await inTransaction(db, (tx) => decideAttempt(tx, counters));
     // A counter deleted by the cleanup between the INSERT and the lock: go again.
     if (decided !== "row_gone" || attempt >= 3) {
       return decided === "row_gone" ? { allowed: false, retryAfterSeconds: 1 } : decided;
@@ -850,43 +879,43 @@ async function takeAttempt(
 
 async function decideAttempt(
   tx: Queryable,
-  accountKey: string,
-  sourceKey: string,
+  counters: readonly { readonly key: string; readonly rule: ThrottleRule }[],
 ): Promise<{ allowed: true } | { allowed: false; retryAfterSeconds: number } | "row_gone"> {
-  {
-    await tx.execute(sql`
-      INSERT INTO public.sign_in_throttles (key) VALUES (${accountKey}), (${sourceKey})
-      ON CONFLICT (key) DO NOTHING`);
-    const rows = await tx.rows<CounterRow>(sql`
-      SELECT key, failures, (extract(epoch FROM last_failure_at) * 1000)::float8 AS last_ms
-      FROM public.sign_in_throttles WHERE key IN (${accountKey}, ${sourceKey})
-      ORDER BY key FOR UPDATE`);
-    if (rows.length !== 2) return "row_gone";
-    const clock = await tx.rows<{ now_ms: number }>(sql`
-      SELECT (extract(epoch FROM clock_timestamp()) * 1000)::float8 AS now_ms`);
-    const now = clock[0]?.now_ms;
-    if (now === undefined) throw new Error("The database gave no time.");
-    const state = (key: string): ThrottleState | undefined => {
-      const row = rows.find((r) => r.key === key);
-      return row === undefined ? undefined : { failures: row.failures, lastFailureAt: row.last_ms };
-    };
-    const account = throttleAttempt(ACCOUNT_THROTTLE, state(accountKey), now);
-    const source = throttleAttempt(SOURCE_THROTTLE, state(sourceKey), now);
-    if (!account.allowed || !source.allowed) {
-      const waits = [account, source].map((d) => (d.allowed ? 0 : d.retryAfterSeconds));
-      return { allowed: false, retryAfterSeconds: Math.max(...waits) };
-    }
-    for (const [key, next] of [
-      [accountKey, account.next],
-      [sourceKey, source.next],
-    ] as const) {
-      await tx.execute(sql`
-        UPDATE public.sign_in_throttles
-        SET failures = ${next.failures}, last_failure_at = to_timestamp(${next.lastFailureAt}::float8 / 1000)
-        WHERE key = ${key}`);
-    }
-    return { allowed: true };
+  const keys = counters.map((c) => c.key);
+  await tx.execute(sql`
+    INSERT INTO public.sign_in_throttles (key) SELECT unnest(${keys}::text[])
+    ON CONFLICT (key) DO NOTHING`);
+  // Locked in key order, as every caller does, so attempts sent at once are
+  // counted one by one and never deadlock.
+  const rows = await tx.rows<CounterRow>(sql`
+    SELECT key, failures, (extract(epoch FROM last_failure_at) * 1000)::float8 AS last_ms
+    FROM public.sign_in_throttles WHERE key = ANY(${keys}::text[])
+    ORDER BY key FOR UPDATE`);
+  if (rows.length !== new Set(keys).size) return "row_gone";
+  const clock = await tx.rows<{ now_ms: number }>(sql`
+    SELECT (extract(epoch FROM clock_timestamp()) * 1000)::float8 AS now_ms`);
+  const now = clock[0]?.now_ms;
+  if (now === undefined) throw new Error("The database gave no time.");
+  const state = (key: string): ThrottleState | undefined => {
+    const row = rows.find((r) => r.key === key);
+    return row === undefined ? undefined : { failures: row.failures, lastFailureAt: row.last_ms };
+  };
+  const decisions = counters.map((c) => ({
+    key: c.key,
+    d: throttleAttempt(c.rule, state(c.key), now),
+  }));
+  if (decisions.some((x) => !x.d.allowed)) {
+    const waits = decisions.map((x) => (x.d.allowed ? 0 : x.d.retryAfterSeconds));
+    return { allowed: false, retryAfterSeconds: Math.max(...waits) };
   }
+  for (const { key, d } of decisions) {
+    if (!d.allowed) continue;
+    await tx.execute(sql`
+      UPDATE public.sign_in_throttles
+      SET failures = ${d.next.failures}, last_failure_at = to_timestamp(${d.next.lastFailureAt}::float8 / 1000)
+      WHERE key = ${key}`);
+  }
+  return { allowed: true };
 }
 
 /** Takes back an attempt counted up front that was never checked (`busy`). */
@@ -1075,7 +1104,8 @@ export async function signInChecked(
 /**
  * Clears the account counter for an address typed at sign-in, so a person
  * kept waiting by someone else's guessing can sign in at once. Only an
- * active system admin (`not_permitted`). The address counter is left.
+ * active system admin (`not_permitted`). The address counter is left. Also
+ * clears the address's reset-request counter (D-078).
  */
 export async function clearSignInThrottle(
   db: Database,
@@ -1093,21 +1123,32 @@ export async function clearSignInThrottle(
   }
   return inTransaction(db, async (tx) => {
     if (!(await isActiveSystemAdmin(tx, by))) return refused("not_permitted", NOT_PERMITTED);
+    // The reset counter too (D-078, review L4): someone asking for links in
+    // a person's name can't keep them from getting one.
     const n = await tx.execute(sql`
-      DELETE FROM public.sign_in_throttles WHERE key = ${throttleAccountKey(email)}`);
+      DELETE FROM public.sign_in_throttles
+      WHERE key IN (${throttleAccountKey(email)}, ${resetThrottleAccountKey(email)})`);
     return { ok: true, value: { cleared: n > 0 } };
   });
 }
 
 /**
- * Deletes counters that no longer matter: no failure for longer than the
- * longest reset time (24 hours), or none at all. For the cleanup command
+ * Deletes counters that no longer matter: none at all, or no failure (or
+ * reset request) for longer than their own rule's reset time: the account
+ * and reset-account counters 24 hours, the address counters 1 hour. For the cleanup command
  * any scheduler runs (T-037, D-035). Returns how many went.
  */
 export async function deleteExpiredSignInThrottles(db: Queryable): Promise<number> {
-  const hours = Math.max(ACCOUNT_THROTTLE.resetAfterSeconds, SOURCE_THROTTLE.resetAfterSeconds);
+  // Each kind of counter by its own rule's reset time (D-078, review L6), so
+  // a counter is never deleted while its rule still remembers it, whatever
+  // the rules become.
   return db.execute(sql`
     DELETE FROM public.sign_in_throttles
     WHERE failures = 0 OR last_failure_at IS NULL
-       OR last_failure_at < clock_timestamp() - make_interval(secs => ${hours})`);
+       OR last_failure_at < clock_timestamp() - make_interval(secs =>
+            CASE WHEN key LIKE 'reset:account:%' THEN ${RESET_ACCOUNT_THROTTLE.resetAfterSeconds}::int
+                 WHEN key LIKE 'reset:%::/48' THEN ${RESET_NETWORK_THROTTLE.resetAfterSeconds}::int
+                 WHEN key LIKE 'reset:%' THEN ${RESET_SOURCE_THROTTLE.resetAfterSeconds}::int
+                 WHEN key LIKE 'account:%' THEN ${ACCOUNT_THROTTLE.resetAfterSeconds}::int
+                 ELSE ${SOURCE_THROTTLE.resetAfterSeconds}::int END)`);
 }

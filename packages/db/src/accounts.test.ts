@@ -1706,10 +1706,14 @@ describe("the database's own guards", () => {
       "invitations.zzzz_invitations_keep_identity",
       "organization_members.organization_members_check_invitation",
       // 0010 (T-037): removing a membership or disabling an account ends sessions.
+      // 0015 (T-039): losing the last membership revokes pending reset links.
+      "organization_members.organization_members_end_resets",
       "organization_members.organization_members_end_sessions",
       "organization_members.zzzz_organization_members_keep_identity",
       "users.users_check_invitation",
       "users.users_end_sessions",
+      // 0015 (T-039): the password change time only moves forward.
+      "users.users_password_changed_at",
       "users.users_sessions_valid_after",
       "users.zzzz_users_keep_identity",
     ]);
