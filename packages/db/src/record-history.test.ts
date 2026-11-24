@@ -16,13 +16,19 @@ import { openDatabase, type Database, type Queryable } from "./client.js";
 import {
   insertOrganization,
   insertRecord,
+  insertRecordTypeVersion,
   insertTemplateVersion,
   readStoredRecord,
   updateRecord,
   type RecordUpdateResult,
 } from "./catalog.js";
-import { insertIdentifierType } from "./identifiers.js";
+import {
+  insertIdentifierType,
+  readRecordIdentifiers,
+  saveRecordIdentifiers,
+} from "./identifiers.js";
 import { migrate } from "./migrate.js";
+import { restoreReason, restoreVersion } from "./record-restore.js";
 import { compareVersions, readVersion, readVersions } from "./record-versions.js";
 import { sql } from "./sql.js";
 import { freshDatabase, type TestDatabase } from "./test-database.fixtures.js";
@@ -30,6 +36,8 @@ import { freshDatabase, type TestDatabase } from "./test-database.fixtures.js";
 const T = "2026-11-20T16:05:00.000Z";
 const LATER = "2026-11-21T09:30:00.250Z";
 const LATEST = "2026-11-22T10:00:00.000Z";
+const NOW = new Date("2026-11-23T12:00:00.000Z");
+const AFTER_NOW = "2026-11-24T08:00:00.000Z";
 const ALICE = "user:3f1c2a9e-8b7d-4c6e-9a5b-1d2e3f4a5b6c";
 const BOB = "user:9b2e4c1a-7d3f-4e8a-b5c6-1a2b3c4d5e6f";
 const IN_COPYRIGHT = "http://rightsstatements.org/vocab/InC/1.0/";
@@ -116,6 +124,7 @@ async function organization(): Promise<OrganizationId> {
   for (const [key, kind] of [
     ["invented-unit", "archival_unit"],
     ["invented-agent", "agent"],
+    ["invented-asset", "digital_asset"],
   ] as const) {
     ok(
       await insertTemplateVersion(db, {
@@ -159,6 +168,26 @@ function object(org: OrganizationId, fields: Record<string, unknown> = {}): Cata
   );
 }
 
+function unit(
+  org: OrganizationId,
+  level: "fonds" | "series" | "collection" | "file" | "item",
+  parentId?: RecordId,
+): CatalogRecord {
+  return ok(
+    createRecord(
+      {
+        organizationId: org,
+        kind: "archival_unit",
+        level,
+        title: `An invented ${level}`,
+        templateKey: "invented-unit",
+        ...(parentId === undefined ? {} : { parentId }),
+      },
+      new Date(T),
+    ),
+  );
+}
+
 async function insert(record: CatalogRecord): Promise<CatalogRecord> {
   ok(await tx((q) => insertRecord(q, record, { actor: ALICE })));
   return record;
@@ -172,6 +201,25 @@ function save(
   on: Database = db,
 ): Promise<RecordUpdateResult> {
   return on.transaction((q) => updateRecord(q, next, { expectedVersion: expected, actor }));
+}
+
+function restore(
+  org: OrganizationId,
+  id: RecordId,
+  version: number,
+  expected: number,
+  reason?: string,
+): Promise<RecordUpdateResult> {
+  return tx((q) =>
+    restoreVersion(
+      q,
+      org,
+      id,
+      version,
+      { expectedVersion: expected, actor: BOB, ...(reason === undefined ? {} : { reason }) },
+      { now: NOW },
+    ),
+  );
 }
 
 async function versionCount(org: OrganizationId, id: RecordId): Promise<number> {
@@ -329,3 +377,299 @@ describe("edit conflicts (T-031)", () => {
     expect(backwards.ok || "conflict" in backwards).toBe(false);
   });
 });
+
+describe("restoreVersion (T-030)", () => {
+  it("writes a new version equal to the old one, keeping every version", async () => {
+    await ready();
+    const org = await organization();
+    const record = await insert(object(org, { rights: { uri: IN_COPYRIGHT } }));
+    ok(await save({ ...record, title: "Renamed", fields: { note: "Pine." }, updatedAt: LATER }, 1));
+    const restored = ok(await restore(org, record.id, 1, 2));
+    expect(restored.version).toBe(3);
+    expect(restored.actor).toBe(BOB);
+    expect(restored.reason).toBe("restored version 1");
+    expect(restored.changedFields).toEqual(["fields.note", "fields.rights", "title"]);
+    // The content is version 1's; updatedAt is the later of the stored one and now.
+    expect(restored.record).toEqual({ ...record, updatedAt: NOW.toISOString() });
+    expect(ok(await compareVersions(db, org, record.id, 1, 3)).differences).toEqual([]);
+    expect(ok(await readVersions(db, org, record.id)).versions.map((v) => v.version)).toEqual([
+      1, 2, 3,
+    ]);
+    const current = ok(await readStoredRecord(db, org, record.id));
+    expect(current.version).toBe(3);
+    expect(current.record.title).toBe("An invented chair");
+  });
+
+  it("keeps updatedAt when the stored one is later than now, and appends the person's reason", async () => {
+    await ready();
+    const org = await organization();
+    const record = await insert(object(org));
+    const future = "2099-01-01T00:00:00.000Z";
+    ok(await save({ ...record, title: "Renamed", updatedAt: future }, 1));
+    const restored = ok(await restore(org, record.id, 1, 2, "The rename was a mistake."));
+    expect(restored.record.updatedAt).toBe(future);
+    expect(restored.reason).toBe("restored version 1: The rename was a mistake.");
+    expect(restoreReason(4)).toBe("restored version 4");
+  });
+
+  it("refuses what has nothing to restore, a stale view, and unknown or foreign records", async () => {
+    await ready();
+    const org = await organization();
+    const record = await insert(object(org));
+    expect(codes(await restore(org, record.id, 1, 1))).toEqual(["no_changes"]);
+    ok(await save({ ...record, title: "Renamed", updatedAt: LATER }, 1));
+    ok(await save({ ...record, updatedAt: LATEST }, 2));
+    // Version 3 has version 1's content again.
+    expect(codes(await restore(org, record.id, 1, 3))).toEqual(["no_changes"]);
+    expect(codes(await restore(org, record.id, 9, 3))).toEqual(["unknown_version"]);
+    // A person looking at version 2 restores: someone saved since.
+    const stale = await restore(org, record.id, 2, 2);
+    expect(codes(stale)).toEqual(["version_conflict"]);
+    expect(stale.ok ? undefined : stale.conflict).toEqual({
+      expectedVersion: 2,
+      currentVersion: 3,
+      differences: [
+        { name: "title", change: "changed", before: "Renamed", after: "An invented chair" },
+      ],
+    });
+    const stranger = await organization();
+    expect(codes(await restore(stranger, record.id, 1, 3))).toEqual(["unknown_record"]);
+    expect(codes(await restore(org, newRecordId(), 1, 1))).toEqual(["unknown_record"]);
+    expect(codes(await restore(org, record.id, 0, 3))).toEqual(["invalid_version"]);
+    expect(codes(await restore(org, record.id, 1, 1.5))).toEqual(["invalid_version"]);
+    expect(
+      codes(
+        await tx((q) =>
+          restoreVersion(q, org, record.id, 2, { expectedVersion: 3, actor: "nobody" }),
+        ),
+      ),
+    ).toEqual(["invalid_actor"]);
+    expect(codes(await restore(org, record.id, 2, 3, "x".repeat(2000)))).toEqual([
+      "invalid_reason",
+    ]);
+    expect(await versionCount(org, record.id)).toBe(3);
+    await expect(
+      restoreVersion(db, org, record.id, 2, { expectedVersion: 3, actor: BOB }),
+    ).rejects.toThrow(/inside a transaction/);
+  });
+
+  it("checks the old content against today's template, reporting instead of saving", async () => {
+    await ready();
+    const org = await organization();
+    const record = await insert(object(org, { extra: "Kept then." }));
+    ok(await save({ ...record, fields: { note: "Now." }, updatedAt: LATER }, 1));
+    // The template changes: `extra` was never in it, and `maker` becomes required.
+    ok(
+      await insertTemplateVersion(
+        db,
+        objectTemplate(org, [field("maker", "text", { required: true })]),
+      ),
+    );
+    const result = await restore(org, record.id, 1, 2);
+    expect(result.ok ? [] : result.issues.map((i) => [i.path.join("."), i.code])).toEqual([
+      ["fields.extra", "unknown_field"],
+      ["fields.maker", "required"],
+    ]);
+    expect(await versionCount(org, record.id)).toBe(2);
+  });
+
+  it("runs the rights check: a statement no longer accepted is reported", async () => {
+    await ready();
+    const org = await organization();
+    // Stored before today's check (insertRecord checks the shape only): the
+    // https spelling is not the canonical URI.
+    const record = await insert(
+      object(org, { rights: { uri: "https://rightsstatements.org/vocab/InC/1.0/" } }),
+    );
+    ok(await save({ ...record, fields: { note: "Oak." }, updatedAt: LATER }, 1));
+    const result = await restore(org, record.id, 1, 2);
+    expect(result.ok ? [] : result.issues.map((i) => [i.path.join("."), i.code])).toEqual([
+      ["fields.rights.uri", "not_canonical"],
+    ]);
+  });
+
+  it("restores identifier fields only while the record still holds the number, and never touches its numbers", async () => {
+    await ready();
+    const org = await organization();
+    const record = await insert(object(org, { number: { type: "object_number", value: "INV-1" } }));
+    const numbers = (current: string, former: string[] = []) => ({
+      recordId: record.id,
+      organizationId: org,
+      current: [{ type: "object_number", value: current, primary: true }],
+      former: former.map((value) => ({ type: "object_number", value })),
+    });
+    ok(await tx((q) => saveRecordIdentifiers(q, numbers("INV-1"))));
+    // Renumbered: INV-1 retired, INV-2 shown.
+    ok(await tx((q) => saveRecordIdentifiers(q, numbers("INV-2", ["INV-1"]))));
+    ok(
+      await save(
+        {
+          ...record,
+          fields: { note: "Oak.", number: { type: "object_number", value: "INV-2" } },
+          updatedAt: LATER,
+        },
+        1,
+      ),
+    );
+    const before = ok(await readRecordIdentifiers(db, org, record.id));
+    const refused = await restore(org, record.id, 1, 2);
+    expect(refused.ok ? [] : refused.issues.map((i) => [i.path.join("."), i.code])).toEqual([
+      ["fields.number", "identifier_not_held"],
+    ]);
+    expect(ok(await readRecordIdentifiers(db, org, record.id))).toEqual(before);
+    // Once INV-1 is current again (through the identifier save), version 1 restores.
+    ok(await tx((q) => saveRecordIdentifiers(q, numbers("INV-1", ["INV-2"]))));
+    const after = ok(await readRecordIdentifiers(db, org, record.id));
+    ok(await restore(org, record.id, 1, 2));
+    expect(ok(await readRecordIdentifiers(db, org, record.id))).toEqual(after);
+  });
+
+  it("checks record links against the organization's records as they are now", async () => {
+    await ready();
+    const org = await organization();
+    const agent = await insert(
+      ok(
+        createRecord(
+          {
+            organizationId: org,
+            kind: "agent",
+            agentType: "person",
+            title: "An invented maker",
+            templateKey: "invented-agent",
+          },
+          new Date(T),
+        ),
+      ),
+    );
+    const stranger = await organization();
+    const foreign = await insert({ ...object(stranger), id: newRecordId() });
+    for (const target of [agent.id, foreign.id, newRecordId()]) {
+      const record = await insert(object(org, { creator: { recordId: target, label: "Maker" } }));
+      ok(await save({ ...record, fields: {}, updatedAt: LATER }, 1));
+      const result = await restore(org, record.id, 1, 2);
+      if (target === agent.id) {
+        ok(result);
+      } else {
+        // Another organization's record is "not found", like one that never existed.
+        expect(result.ok ? [] : result.issues.map((i) => [i.path.join("."), i.code])).toEqual([
+          ["fields.creator.recordId", "unknown_record"],
+        ]);
+      }
+    }
+  });
+
+  it("checks the arrangement: a parent that is gone, a loop, and children that no longer fit", async () => {
+    await ready();
+    const org = await organization();
+    // Gone: the series was filed under a fonds since deleted (by the owner).
+    const fonds = await insert(unit(org, "fonds"));
+    const series = await insert(unit(org, "series", fonds.id));
+    ok(await save({ ...withoutParent(series), updatedAt: LATER }, 1));
+    await tx((q) =>
+      q.execute(sql`DELETE FROM public.records WHERE organization_id = ${org}::uuid
+                    AND id = ${fonds.id}::uuid`),
+    );
+    expect(codes(await restore(org, series.id, 1, 2))).toEqual(["missing_parent"]);
+
+    // A loop: B was under A; then A was filed under B.
+    const a = await insert(unit(org, "series"));
+    const b = await insert(unit(org, "series", a.id));
+    ok(await save({ ...withoutParent(b), updatedAt: LATER }, 1));
+    ok(await save({ ...a, parentId: b.id, updatedAt: LATER } as CatalogRecord, 1));
+    expect(codes(await restore(org, b.id, 1, 2))).toEqual(["loop"]);
+
+    // A level that can't hold its children now: the file was an item once.
+    const item = await insert(unit(org, "item"));
+    ok(await save({ ...item, level: "file", updatedAt: LATER } as CatalogRecord, 1));
+    await insert(unit(org, "item", item.id));
+    const level = await restore(org, item.id, 1, 2);
+    expect(level.ok ? [] : level.issues.map((i) => [i.path.join("."), i.code])).toEqual([
+      ["level", "wrong_level"],
+    ]);
+
+    // And one that still fits restores.
+    const top = await insert(unit(org, "fonds"));
+    const filed = await insert(unit(org, "file", top.id));
+    ok(await save({ ...withoutParent(filed), updatedAt: LATER }, 1));
+    ok(await restore(org, filed.id, 1, 2));
+    expect(ok(await readStoredRecord(db, org, filed.id)).record).toMatchObject({
+      parentId: top.id,
+    });
+  });
+
+  it("refuses a parent that would make the tree too deep", async () => {
+    await ready();
+    const org = await organization();
+    // A chain of 63 series, and a series with one sub-series below it.
+    let parent: RecordId | undefined;
+    for (let i = 0; i < 63; i += 1) parent = (await insert(unit(org, "series", parent))).id;
+    const moved = await insert(unit(org, "series", parent));
+    await insert(unit(org, "series", moved.id));
+    ok(await save({ ...withoutParent(moved), updatedAt: LATER }, 1));
+    expect(codes(await restore(org, moved.id, 1, 2))).toEqual(["too_deep"]);
+  });
+});
+
+describe("restoreVersion: record types and represented records", () => {
+  it("checks the record type as it is now, and that a represented record still exists", async () => {
+    await ready();
+    const org = await organization();
+    ok(
+      await insertRecordTypeVersion(db, {
+        key: "chair",
+        organizationId: org,
+        label: "Chair",
+        kind: "object",
+        defaultTemplateKey: "invented-object",
+      }),
+    );
+    const typed = await insert({ ...object(org), recordTypeKey: "chair" });
+    ok(await save(withoutKey({ ...typed, updatedAt: LATER }, "recordTypeKey"), 1));
+    ok(await restore(org, typed.id, 1, 2));
+    ok(await save(withoutKey({ ...typed, updatedAt: AFTER_NOW }, "recordTypeKey"), 3));
+    // The type is removed by the owner (nothing points at it now).
+    await tx(async (q) => {
+      await q.execute(sql`DELETE FROM public.record_type_versions
+                          WHERE organization_id = ${org}::uuid AND key = 'chair'`);
+      await q.execute(sql`DELETE FROM public.record_types
+                          WHERE organization_id = ${org}::uuid AND key = 'chair'`);
+    });
+    expect(codes(await restore(org, typed.id, 1, 4))).toEqual(["unknown_record_type"]);
+
+    const shown = await insert(object(org));
+    const scan = await insert(
+      ok(
+        createRecord(
+          {
+            organizationId: org,
+            kind: "digital_asset",
+            mediaType: "image/tiff",
+            represents: shown.id,
+            title: "An invented scan",
+            templateKey: "invented-asset",
+          },
+          new Date(T),
+        ),
+      ),
+    );
+    ok(await save(withoutKey({ ...scan, updatedAt: LATER }, "represents"), 1));
+    await tx((q) =>
+      q.execute(sql`DELETE FROM public.records WHERE organization_id = ${org}::uuid
+                    AND id = ${shown.id}::uuid`),
+    );
+    const result = await restore(org, scan.id, 1, 2);
+    expect(result.ok ? [] : result.issues.map((i) => [i.path.join("."), i.code])).toEqual([
+      ["represents", "unknown_record"],
+    ]);
+  });
+});
+
+function withoutKey(record: CatalogRecord, key: string): CatalogRecord {
+  return Object.fromEntries(
+    Object.entries(record).filter(([name]) => name !== key),
+  ) as unknown as CatalogRecord;
+}
+
+function withoutParent(record: CatalogRecord): CatalogRecord {
+  return withoutKey(record, "parentId");
+}

@@ -2,7 +2,8 @@
  * @oculus/db: the only package that talks to PostgreSQL (D-050). Every query
  * is written with the `sql` tag; `migrate` applies `packages/db/migrations`;
  * `catalog.ts` reads and writes the catalog tables (every record write with
- * its version, `record-versions.ts`), `identifiers.ts` the
+ * its version, `record-versions.ts`; comparing and restoring versions,
+ * `record-restore.ts`), `identifiers.ts` the
  * identifier tables and `vocabularies.ts` the stored terms and the index of
  * which records use them, all through core's validators.
  */
@@ -58,6 +59,8 @@ export type {
   RecordVersions,
   VersionComparison,
 } from "./record-versions.js";
+export { restoreVersion, restoreReason } from "./record-restore.js";
+export type { RestoreOptions } from "./record-restore.js";
 export {
   readIdentifierTypes,
   insertIdentifierType,
