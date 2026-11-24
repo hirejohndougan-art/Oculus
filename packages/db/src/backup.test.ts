@@ -1,12 +1,16 @@
 // Backup and restore (D-064): a migrated database with organizations,
-// records, identifiers and terms is backed up and restored into a fresh empty
-// database, and every row of every table is found and identical. Refusals
-// (a target that is not empty, a damaged or edited file, a missing file,
-// migrations that don't match, a migration running) leave the target empty
-// and say why; the backup file is 0600; and the URL and its password are
+// records, identifiers, terms and other objects is backed up and restored by
+// a role that is not a superuser into a fresh empty database it owns, and
+// every row of every table is found and identical. Refusals (a target that is
+// not exactly as CREATE DATABASE made it, a damaged or edited file, a missing
+// file, migrations that don't match, a migration running, a superuser) leave
+// the target untouched and say why; the backup file is 0600; the driver and
+// the tools always reach the same database; a stop mid-backup or mid-restore
+// leaves no process, file or commit behind; and the URL and its password are
 // never printed, on a command line, or in the tools' environment.
-import { chmod, mkdtemp, readFile, rm, stat, writeFile, readdir } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -25,20 +29,23 @@ import {
   backup,
   BackupError,
   compareMigrations,
-  connectionParameters,
-  contentsOf,
   findTools,
   manifestAndTrailer,
   readManifest,
   restore,
-  serviceFileText,
-  tableSummaries,
-  toolEnvironment,
   toolMajor,
   TRAILER_BYTES,
+  WATCHDOG,
   type BackupManifest,
 } from "./backup.js";
-import { runBackupCli, runRestoreCli } from "./backup-cli.js";
+import { contentsOf, tableSummaries } from "./backup-catalog.js";
+import { filePath, hideSecrets, runBackupCli, runRestoreCli } from "./backup-cli.js";
+import {
+  ConnectionError,
+  resolveConnection,
+  serviceFileText,
+  toolEnvironment,
+} from "./backup-connection.js";
 import { openDatabase, openSession, type Database } from "./client.js";
 import { insertOrganization, insertRecord, insertTemplateVersion, readRecord } from "./catalog.js";
 import {
@@ -56,24 +63,35 @@ import {
   type MigrationFile,
 } from "./migrate.js";
 import { sql } from "./sql.js";
-import { freshDatabase, type TestDatabase } from "./test-database.fixtures.js";
+import { freshDatabase, testServerUrl, type TestDatabase } from "./test-database.fixtures.js";
 import { readTerms, refreshRecordTerms, saveTerm } from "./vocabularies.js";
 
 const T = "2026-11-20T16:05:00.000Z";
 /** An obviously fake password: the test server uses trust authentication and ignores it. */
 const FAKE_PASSWORD = "not-a-real-password-T052";
+/** Roles this file makes (cluster-wide, so fixed names; dropped afterwards). */
+const RESTORER = "oculus_t052_restorer";
+const READER = "oculus_t052_reader";
 
 // ---------------------------------------------------------------------------
-// Databases and files made by this file, removed afterwards.
+// Databases, roles and files made by this file, removed afterwards.
 
 const databases: TestDatabase[] = [];
 const directories: string[] = [];
 const pools: Database[] = [];
+const cleanups: (() => Promise<unknown>)[] = [];
 
 afterAll(async () => {
-  for (const pool of pools) await pool.close().catch(() => undefined);
+  for (const cleanup of cleanups) await cleanup().catch(() => undefined);
+  for (const db of pools) await db.close().catch(() => undefined);
   for (const db of databases) await db.drop().catch(() => undefined);
   for (const dir of directories) await rm(dir, { recursive: true, force: true });
+  await admin((s) =>
+    s.rows(sql`DO $$ BEGIN
+      DROP ROLE IF EXISTS oculus_t052_restorer;
+      DROP ROLE IF EXISTS oculus_t052_reader;
+    EXCEPTION WHEN dependent_objects_still_exist THEN NULL; END $$`),
+  ).catch(() => undefined);
 });
 
 async function database(): Promise<TestDatabase> {
@@ -89,7 +107,7 @@ function pool(url: string): Database {
 }
 
 async function directory(): Promise<string> {
-  const dir = await mkdtemp(join(tmpdir(), "oculus-backup-test-"));
+  const dir = await mkdtemp(join(tmpdir(), "oculus-t052-"));
   directories.push(dir);
   return dir;
 }
@@ -108,6 +126,75 @@ async function refusal(work: Promise<unknown>): Promise<BackupError> {
     throw error;
   }
   throw new Error("It was not refused.");
+}
+
+/** Runs `work` on one session to the test server's maintenance database. */
+async function admin<R>(
+  work: (s: Awaited<ReturnType<typeof openSession>>) => Promise<R>,
+): Promise<R> {
+  const session = await openSession(testServerUrl(), "t052-admin");
+  try {
+    return await work(session);
+  } finally {
+    await session.close();
+  }
+}
+
+/** Runs a statement naming a database (`%I`), which no parameter can do. */
+async function onDatabase(template: string, name: string): Promise<void> {
+  await admin(async (s) => {
+    await s.rows(sql`CREATE FUNCTION pg_temp.t052_exec(t text, d text) RETURNS void
+      LANGUAGE plpgsql AS $f$ BEGIN EXECUTE pg_catalog.format(t, d); END $f$`);
+    await s.rows(sql`SELECT pg_temp.t052_exec(${template}, ${name})`);
+  });
+}
+
+let rolesMade: Promise<void> | undefined;
+function roles(): Promise<void> {
+  rolesMade ??= admin(async (s) => {
+    await s.rows(sql`DO $$ BEGIN
+      CREATE ROLE oculus_t052_restorer LOGIN;
+    EXCEPTION WHEN duplicate_object THEN NULL; END $$`);
+    await s.rows(sql`DO $$ BEGIN
+      CREATE ROLE oculus_t052_reader NOLOGIN;
+    EXCEPTION WHEN duplicate_object THEN NULL; END $$`);
+  });
+  return rolesMade;
+}
+
+/** The URL as another user (the test server trusts its socket). */
+function as(url: string, user: string, password?: string): string {
+  const u = new URL(url);
+  u.username = user;
+  if (password !== undefined) u.password = password;
+  return u.toString();
+}
+
+/** A fresh empty database owned by the restoring role, and its URL as that role. */
+async function emptyTarget(): Promise<{ testDb: TestDatabase; url: string }> {
+  await roles();
+  const testDb = await database();
+  await onDatabase(`ALTER DATABASE %I OWNER TO ${RESTORER}`, testDb.name);
+  return { testDb, url: as(testDb.url, RESTORER) };
+}
+
+/** Waits for `check` to be true, up to `ms`. */
+async function until(check: () => Promise<boolean> | boolean, ms = 10_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (await check()) return;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  throw new Error("Timed out waiting.");
+}
+
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -220,7 +307,7 @@ async function everyRow(db: Database): Promise<Record<string, string[]>> {
     const rows = await db.rows<{ row: string }>(sql`
       SELECT r.row::pg_catalog.text AS row FROM pg_catalog.unnest(pg_catalog.xpath('/table/row/r/text()',
         pg_catalog.query_to_xml(pg_catalog.format(
-          'SELECT t::pg_catalog.text AS r FROM %I.%I AS t', ${schema ?? ""}::text, ${name ?? ""}::text),
+          'SELECT ROW(oculus_test_row.*)::pg_catalog.text AS r FROM %I.%I AS oculus_test_row', ${schema ?? ""}::text, ${name ?? ""}::text),
           false, false, ''))) AS r(row)`);
     out[table.name] = rows.map((r) => unescapeXml(r.row)).sort();
   }
@@ -247,38 +334,89 @@ async function copyOf(file: string, dir: string, name: string): Promise<string> 
   return copy;
 }
 
+/** Objects beyond rows: a sequence, a function, a trigger, row security, a policy, grants. */
+async function addObjects(url: string): Promise<void> {
+  await roles();
+  const db = pool(url);
+  for (const statement of [
+    sql`CREATE SEQUENCE public.t052_seq`,
+    sql`SELECT pg_catalog.nextval('public.t052_seq')`,
+    sql`CREATE FUNCTION public.t052_touch() RETURNS trigger LANGUAGE plpgsql
+        AS $f$ BEGIN RETURN NEW; END $f$`,
+    sql`CREATE TABLE public.t052_extra (id int PRIMARY KEY, oculus_backup_row text, t text)`,
+    sql`INSERT INTO public.t052_extra VALUES (1, 'a', 'x'), (2, NULL, 'y')`,
+    sql`CREATE TRIGGER t052_extra_touch BEFORE UPDATE ON public.t052_extra
+        FOR EACH ROW EXECUTE FUNCTION public.t052_touch()`,
+    sql`ALTER TABLE public.t052_extra ENABLE ROW LEVEL SECURITY`,
+    sql`CREATE POLICY t052_read ON public.t052_extra FOR SELECT TO oculus_t052_reader USING (id > 0)`,
+    sql`GRANT SELECT ON public.t052_extra TO oculus_t052_reader`,
+    sql`GRANT SELECT ON public.records TO oculus_t052_reader`,
+  ]) {
+    await db.execute(statement);
+  }
+}
+
 // One backup of one populated database, shared by the refusal tests.
-let shared: Promise<{ file: string; dir: string; sample: Sample; source: string }> | undefined;
-function sharedBackup(): Promise<{ file: string; dir: string; sample: Sample; source: string }> {
+interface Shared {
+  file: string;
+  dir: string;
+  sample: Sample;
+  source: TestDatabase;
+}
+let shared: Promise<Shared> | undefined;
+function sharedBackup(): Promise<Shared> {
   shared ??= (async () => {
     const { testDb, sample } = await populated();
+    await addObjects(testDb.url);
     const dir = await directory();
     const file = join(dir, "shared.oculus-backup");
     await backup({ connectionString: testDb.url, file });
-    return { file, dir, sample, source: testDb.url };
+    return { file, dir, sample, source: testDb };
   })();
   return shared;
+}
+
+/**
+ * A PG_BIN of wrappers around the real tools: `body(tool, real)` is the shell
+ * text that runs in place of each tool.
+ */
+async function wrappedTools(body: (tool: string, real: string) => string): Promise<string> {
+  const real = await findTools(process.env, ["pg_dump", "pg_restore"]);
+  const bin = await directory();
+  for (const tool of ["pg_dump", "pg_restore"]) {
+    // `--version` (asked before every run) goes straight to the real tool.
+    await writeFile(
+      join(bin, tool),
+      `#!/bin/sh\nif [ "$1" = --version ]; then exec '${join(real, tool)}' "$@"; fi\n${body(tool, join(real, tool))}\n`,
+    );
+    await chmod(join(bin, tool), 0o755);
+  }
+  return bin;
 }
 
 // ---------------------------------------------------------------------------
 
 describe("backup and restore", () => {
-  it("restores every row of every table identically into a fresh empty database", async () => {
+  it("restores every row and object identically, as a role that is not a superuser", async () => {
     const { testDb, sample } = await populated();
+    await addObjects(testDb.url);
     const dir = await directory();
+    const temp = await directory();
     const file = join(dir, "nightly.oculus-backup");
     const logged: string[] = [];
     const made = await backup({
       connectionString: testDb.url,
       file,
+      tempDir: temp,
       log: (line) => logged.push(line),
     });
     expect(made.file).toBe(file);
     expect(logged.join("\n")).toContain("Backing up PostgreSQL");
 
-    // The file: 0600, nothing else left in the directory.
+    // The file: 0600, nothing else left behind.
     expect((await stat(file)).mode & 0o777).toBe(0o600);
     expect(await readdir(dir)).toEqual(["nightly.oculus-backup"]);
+    expect(await readdir(temp)).toEqual([]);
 
     // The manifest describes the database.
     const manifest = await readManifest(file);
@@ -297,79 +435,174 @@ describe("backup and restore", () => {
       "public.record_identifiers": "12",
       "public.former_identifiers": "6",
       "public.terms": "2",
+      "public.t052_extra": "2",
     });
     expect(Number(counts["public.record_terms"])).toBeGreaterThan(0);
+    expect(manifest.objects.sequences).toContain("public.t052_seq");
+    expect(manifest.objects.functions.some((f) => f.startsWith("public.t052_touch() f "))).toBe(
+      true,
+    );
+    expect(
+      manifest.objects.triggers.some((t) => t.startsWith("public.t052_extra t052_extra_touch ")),
+    ).toBe(true);
+    expect(manifest.objects.policies).toContain("public.t052_extra row security on");
+    expect(
+      manifest.objects.policies.some((p) =>
+        p.startsWith("public.t052_extra policy t052_read r permissive to oculus_t052_reader "),
+      ),
+    ).toBe(true);
+    expect(manifest.objects.grants).toEqual(
+      expect.arrayContaining([
+        "relation public.records to oculus_t052_reader: SELECT",
+        "relation public.t052_extra to oculus_t052_reader: SELECT",
+        "schema public to PUBLIC: USAGE",
+      ]),
+    );
     expect(manifest.serverVersionNum).toBeGreaterThanOrEqual(150000);
     expect(toolMajor(manifest.pgDumpVersion)).toBeGreaterThanOrEqual(15);
-    expect(Date.parse(manifest.createdAt)).not.toBeNaN();
 
-    // Restore into a fresh, empty database.
-    const targetDb = await database();
-    const result = await restore({ connectionString: targetDb.url, file });
+    // Restore into a fresh database, as the role that owns it.
+    const target = await emptyTarget();
+    expect(await contentsOf(pool(target.url))).toEqual({});
+    const result = await restore({ connectionString: target.url, file, tempDir: temp });
     expect(result.pending).toEqual([]);
-    const target = pool(targetDb.url);
+    expect(await readdir(temp)).toEqual([]);
+    const restored = pool(target.url);
 
     // Every table, every row, identical.
     const before = await everyRow(source);
-    const after = await everyRow(target);
+    const after = await everyRow(restored);
     expect(Object.keys(after)).toEqual(Object.keys(before));
     expect(after).toEqual(before);
     expect(after["public.records"]).toHaveLength(6);
 
     // And through the data-access functions.
     for (const { org, id } of sample.records) {
-      expect(ok(await readRecord(target, org, id))).toEqual(ok(await readRecord(source, org, id)));
-      expect(ok(await readRecordIdentifiers(target, org, id))).toEqual(
+      expect(ok(await readRecord(restored, org, id))).toEqual(
+        ok(await readRecord(source, org, id)),
+      );
+      expect(ok(await readRecordIdentifiers(restored, org, id))).toEqual(
         ok(await readRecordIdentifiers(source, org, id)),
       );
     }
     for (const org of sample.orgs) {
-      expect(ok(await readTerms(target, org))).toEqual(ok(await readTerms(source, org)));
-      expect(ok(await readIdentifierTypes(target, org))).toEqual(
+      expect(ok(await readTerms(restored, org))).toEqual(ok(await readTerms(source, org)));
+      expect(ok(await readIdentifierTypes(restored, org))).toEqual(
         ok(await readIdentifierTypes(source, org)),
       );
       // The auto-number counter carries on where it was.
       const next = (db: Database): Promise<Validated<string>> =>
         db.transaction((q) => allocateIdentifier(q, org, "object_number"));
-      expect(ok(await next(target))).toBe(ok(await next(source)));
+      expect(ok(await next(restored))).toBe(ok(await next(source)));
     }
+    // The restored objects are owned by the restoring role.
+    const [owner] = await restored.rows<{ owner: string }>(
+      sql`SELECT pg_catalog.pg_get_userbyid(relowner)::text AS owner FROM pg_catalog.pg_class
+          WHERE oid = 'public.records'::pg_catalog.regclass`,
+    );
+    expect(owner?.owner).toBe(RESTORER);
 
-    // The restored database can be migrated (nothing to do) and backed up again.
-    expect((await migrate({ connectionString: targetDb.url })).applied).toEqual([]);
+    // The restored database migrates (nothing to do).
+    expect((await migrate({ connectionString: target.url })).applied).toEqual([]);
   }, 60_000);
 
   it("never overwrites: an existing backup file, or a database that is not empty", async () => {
     const { file, dir, source } = await sharedBackup();
     const before = await readFile(file);
-    const exists = await refusal(backup({ connectionString: source, file }));
+    const exists = await refusal(backup({ connectionString: source.url, file }));
     expect(exists.code).toBe("exists");
     expect(await readFile(file)).toEqual(before);
 
-    // The source itself is not empty.
-    const full = await refusal(restore({ connectionString: source, file }));
+    const full = await refusal(
+      restore({ connectionString: source.url, file, allowSuperuser: true }),
+    );
     expect(full.code).toBe("target_not_empty");
     expect(full.message).toMatch(/relations/);
-
-    // Nor is a database holding just one table, or one schema.
-    const oneTable = await database();
-    const db = pool(oneTable.url);
-    await db.execute(sql`CREATE TABLE public.something_else (id int)`);
-    expect((await refusal(restore({ connectionString: oneTable.url, file }))).code).toBe(
-      "target_not_empty",
-    );
-    expect(await everyRow(db)).toEqual({ "public.something_else": [] });
-    const oneSchema = await database();
-    await pool(oneSchema.url).execute(sql`CREATE SCHEMA elsewhere`);
-    const schema = await refusal(restore({ connectionString: oneSchema.url, file }));
-    expect(schema.code).toBe("target_not_empty");
-    expect(schema.message).toContain("1 schemas");
     expect(await readdir(dir)).toEqual(["shared.oculus-backup"]);
   }, 60_000);
 
+  // Each makes a fresh database differ from what CREATE DATABASE makes in one
+  // way pg_dump's archive could collide with or be changed by.
+  const notEmpty: [string, string[], string[]?][] = [
+    ["a table", ["CREATE TABLE public.something_else (id int)"]],
+    ["a schema", ["CREATE SCHEMA elsewhere"]],
+    ["default privileges", ["ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO PUBLIC"]],
+    ["a publication", ["CREATE PUBLICATION t052_pub"]],
+    ["the public schema's owner", [`ALTER SCHEMA public OWNER TO ${RESTORER}`]],
+    ["the public schema's privileges", ["GRANT CREATE ON SCHEMA public TO PUBLIC"]],
+    ["the public schema's comment", ["COMMENT ON SCHEMA public IS 'changed'"]],
+    ["no public schema", ["DROP SCHEMA public"]],
+    ["database settings", ["%DB ALTER DATABASE %I SET search_path = elsewhere"]],
+    [
+      "a role's settings in this database",
+      [`%DB ALTER ROLE ${READER} IN DATABASE %I SET work_mem = '1MB'`],
+    ],
+    [
+      "a subscription",
+      [
+        "CREATE SUBSCRIPTION t052_sub CONNECTION 'dbname=nowhere' PUBLICATION nothing WITH (connect = false)",
+      ],
+      ["ALTER SUBSCRIPTION t052_sub SET (slot_name = NONE)", "DROP SUBSCRIPTION t052_sub"],
+    ],
+    ["a foreign-data wrapper", ["CREATE FOREIGN DATA WRAPPER t052_fdw"]],
+    [
+      "a foreign server",
+      [
+        "CREATE FOREIGN DATA WRAPPER t052_fdw2",
+        "CREATE SERVER t052_srv FOREIGN DATA WRAPPER t052_fdw2",
+      ],
+    ],
+    ["a cast", ["CREATE CAST (uuid AS bytea) WITH INOUT"]],
+    ["a collation", ['CREATE COLLATION public.t052_c FROM "C"']],
+    [
+      "a text search configuration",
+      ["CREATE TEXT SEARCH CONFIGURATION public.t052_ts (COPY = pg_catalog.simple)"],
+    ],
+    [
+      "an operator",
+      ["CREATE OPERATOR public.=== (LEFTARG = int4, RIGHTARG = int4, FUNCTION = int4eq)"],
+    ],
+    ["a large object", ["SELECT pg_catalog.lo_create(0)"]],
+  ];
+
+  it.each(notEmpty)(
+    "refuses a target with %s, and leaves it as it was",
+    async (_what, statements, undo = []) => {
+      const { file } = await sharedBackup();
+      await roles();
+      const target = await database();
+      const db = pool(target.url);
+      // Statements are fixed test text; the database name goes through %I.
+      const run = async (text: string): Promise<void> => {
+        if (text.startsWith("%DB ")) {
+          await onDatabase(text.slice(4), target.name);
+          return;
+        }
+        const session = await openSession(target.url, "t052-setup");
+        try {
+          await session.runScript(text);
+        } finally {
+          await session.close();
+        }
+      };
+      for (const statement of statements) await run(statement);
+      cleanups.push(async () => {
+        for (const statement of undo) await run(statement);
+      });
+      const before = await everyRow(db);
+      const refused = await refusal(
+        restore({ connectionString: target.url, file, allowSuperuser: true }),
+      );
+      expect(refused.code).toBe("target_not_empty");
+      expect(await everyRow(db)).toEqual(before);
+      for (const statement of undo) await run(statement);
+    },
+    60_000,
+  );
+
   it("refuses a damaged, edited, truncated or missing file and leaves the target empty", async () => {
     const { file, dir } = await sharedBackup();
-    const target = await database();
-    const db = pool(target.url);
+    const target = await emptyTarget();
     const manifest = await readManifest(file);
     const attempt = (path: string): Promise<BackupError> =>
       refusal(restore({ connectionString: target.url, file: path }));
@@ -387,14 +620,13 @@ describe("backup and restore", () => {
     // One byte of the manifest changed (its hash no longer matches).
     const edited = await copyOf(file, dir, "edited");
     const editedBytes = await readFile(edited);
-    const text = editedBytes.toString("latin1");
-    const where = text.indexOf('"rows": "6"');
+    const where = editedBytes.toString("latin1").indexOf('"rows": "6"');
     expect(where).toBeGreaterThan(0);
     editedBytes.write('"rows": "7"', where, "latin1");
     await writeFile(edited, editedBytes);
     expect((await attempt(edited)).code).toBe("bad_file");
 
-    // Cut short, the trailer gone, or not a backup at all.
+    // Cut short, or not a backup at all.
     const truncated = await copyOf(file, dir, "truncated");
     await writeFile(truncated, (await readFile(file)).subarray(0, manifest.dump.bytes + 10));
     expect((await attempt(truncated)).code).toBe("bad_file");
@@ -402,8 +634,7 @@ describe("backup and restore", () => {
     await writeFile(notBackup, "hello\n");
     expect((await attempt(notBackup)).code).toBe("bad_file");
 
-    // A manifest rewritten consistently but describing other contents: the
-    // archive's SHA-256 no longer matches it.
+    // Rewritten consistently but describing another archive, or another shape.
     const otherSha = await copyOf(file, dir, "other-sha");
     await rewriteManifest(otherSha, (m) => {
       m.dump.sha256 = "0".repeat(64);
@@ -415,17 +646,13 @@ describe("backup and restore", () => {
     });
     expect((await attempt(badShape)).message).toContain("expected fields");
 
-    // A missing file.
-    const missing = await attempt(join(dir, "nothing-here"));
-    expect(missing.code).toBe("not_found");
-
-    // Nothing of any of these reached the target.
-    expect(await contentsOf(db)).toEqual({});
+    expect((await attempt(join(dir, "nothing-here"))).code).toBe("not_found");
+    expect(await contentsOf(pool(target.url))).toEqual({});
   }, 60_000);
 
   it("refuses a backup whose migrations don't match the code's, before restoring anything", async () => {
     const { file, dir } = await sharedBackup();
-    const target = await database();
+    const target = await emptyTarget();
     const edited = await copyOf(file, dir, "edited-migration");
     await rewriteManifest(edited, (m) => {
       const first = m.migrations[0];
@@ -437,36 +664,57 @@ describe("backup and restore", () => {
     expect(await contentsOf(pool(target.url))).toEqual({});
   }, 60_000);
 
-  it("checks the restored database against the manifest and says when it differs", async () => {
+  it("checks rows and objects after restoring and says what differs", async () => {
     const { file, dir } = await sharedBackup();
-    const target = await database();
-    // A manifest edited consistently (hash recomputed) to claim another row:
-    // the archive restores, and the check afterwards finds the difference.
-    const edited = await copyOf(file, dir, "edited-count");
-    await rewriteManifest(edited, (m) => {
-      const records = m.tables.find((t) => t.name === "public.records");
-      if (records) records.rows = "7";
-    });
-    const refused = await refusal(restore({ connectionString: target.url, file: edited }));
-    expect(refused.code).toBe("verify_failed");
-    expect(refused.message).toContain("public.records has 6 rows, not 7");
-    expect(refused.message).toContain("Do not use it");
-
-    const hashed = await copyOf(file, dir, "edited-hash");
-    await rewriteManifest(hashed, (m) => {
-      const terms = m.tables.find((t) => t.name === "public.terms");
-      if (terms) terms.rowsHash = "12345";
-    });
-    const other = await database();
-    const differs = await refusal(restore({ connectionString: other.url, file: hashed }));
-    expect(differs.code).toBe("verify_failed");
-    expect(differs.message).toContain("public.terms's rows differ");
+    const cases: [string, (m: BackupManifest) => void, string][] = [
+      [
+        "count",
+        (m) => {
+          const t = m.tables.find((x) => x.name === "public.records");
+          if (t) t.rows = "7";
+        },
+        "public.records has 6 rows, not 7",
+      ],
+      [
+        "hash",
+        (m) => {
+          const t = m.tables.find((x) => x.name === "public.terms");
+          if (t) t.rowsHash = "12345";
+        },
+        "public.terms's rows differ",
+      ],
+      [
+        "grant",
+        (m) => {
+          m.objects.grants = m.objects.grants.filter(
+            (g) => !g.startsWith("relation public.records"),
+          );
+        },
+        "grants not in the backup: relation public.records to oculus_t052_reader: SELECT",
+      ],
+      [
+        "sequence",
+        (m) => {
+          m.objects.sequences = [...m.objects.sequences, "public.zz_missing"].sort();
+        },
+        "sequences missing: public.zz_missing",
+      ],
+    ];
+    for (const [name, change, expected] of cases) {
+      const edited = await copyOf(file, dir, `edited-${name}`);
+      await rewriteManifest(edited, change);
+      const target = await emptyTarget();
+      const refused = await refusal(restore({ connectionString: target.url, file: edited }));
+      expect(refused.code).toBe("verify_failed");
+      expect(refused.message).toContain(expected);
+      expect(refused.message).toContain("Do not use it");
+    }
   }, 60_000);
 
   it("refuses while a migration holds the runner's lock on the target", async () => {
     const { file } = await sharedBackup();
-    const target = await database();
-    const holder = await openSession(target.url, "test-lock");
+    const target = await emptyTarget();
+    const holder = await openSession(target.testDb.url, "test-lock");
     try {
       await holder.rows(
         sql`SELECT pg_catalog.pg_advisory_lock(${String(MIGRATION_LOCK_KEY)}::pg_catalog.int8)`,
@@ -480,6 +728,43 @@ describe("backup and restore", () => {
     expect(await contentsOf(pool(target.url))).toEqual({});
   }, 60_000);
 
+  it("refuses to restore as a superuser unless allowed, and then warns", async () => {
+    const { file } = await sharedBackup();
+    const target = await database();
+    const refused = await refusal(restore({ connectionString: target.url, file }));
+    expect(refused.code).toBe("superuser");
+    expect(refused.message).toContain("OWNER");
+    expect(await contentsOf(pool(target.url))).toEqual({});
+    const logged: string[] = [];
+    await restore({
+      connectionString: target.url,
+      file,
+      allowSuperuser: true,
+      log: (line) => logged.push(line),
+    });
+    expect(logged.join("\n")).toContain("WARNING: restoring as a superuser");
+  }, 60_000);
+
+  it("checks and restores the database libpq would reach, even when the query string names it", async () => {
+    const { file, source } = await sharedBackup();
+    const empty = await database();
+    // The path names an empty database, the query string the full one:
+    // libpq (and so pg_restore) uses the query's, and so must the checks.
+    const url = new URL(empty.url);
+    url.searchParams.set("dbname", source.name);
+    const refused = await refusal(
+      restore({ connectionString: url.toString(), file, allowSuperuser: true }),
+    );
+    expect(refused.code).toBe("target_not_empty");
+    expect(await contentsOf(pool(empty.url))).toEqual({});
+    // Keywords the driver can't be given the same way are refused.
+    const hostaddr = new URL(empty.url);
+    hostaddr.searchParams.set("hostaddr", "127.0.0.1");
+    expect((await refusal(restore({ connectionString: hostaddr.toString(), file }))).code).toBe(
+      "bad_url",
+    );
+  }, 60_000);
+
   it("refuses to back up a database Oculus never migrated, leaving no file behind", async () => {
     const empty = await database();
     const dir = await directory();
@@ -489,43 +774,166 @@ describe("backup and restore", () => {
     expect(refused.code).toBe("not_oculus");
     expect(await readdir(dir)).toEqual([]);
   }, 60_000);
+
+  it("keeps its snapshot through idle and statement timeouts, and a lost session after pg_dump", async () => {
+    const { testDb } = await populated();
+    // The snapshot transaction sits idle while pg_dump starts (2 s here).
+    await onDatabase(
+      "ALTER DATABASE %I SET idle_in_transaction_session_timeout = '1s'",
+      testDb.name,
+    );
+    await onDatabase("ALTER DATABASE %I SET statement_timeout = '1s'", testDb.name);
+    const slow = await wrappedTools((_tool, real) => `sleep 2\nexec '${real}' "$@"`);
+    const dir = await directory();
+    const made = await backup({
+      connectionString: testDb.url,
+      file: join(dir, "slow.oculus-backup"),
+      env: { ...process.env, PG_BIN: slow },
+    });
+    expect(made.manifest.dump.bytes).toBeGreaterThan(0);
+
+    // pg_dump finishes, then the exporting session is ended: the backup stands.
+    const real = await findTools(process.env, ["psql"]);
+    const lost = await wrappedTools(
+      (_tool, tool) => `'${tool}' "$@" || exit $?
+'${join(real, "psql")}' "service=oculus_backup" -qAt -c "SELECT pg_catalog.pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE application_name = 'oculus-backup' AND pid <> pg_catalog.pg_backend_pid()" >/dev/null 2>&1
+exit 0`,
+    );
+    const again = await backup({
+      connectionString: testDb.url,
+      file: join(dir, "lost.oculus-backup"),
+      env: { ...process.env, PG_BIN: lost },
+    });
+    expect(again.manifest.tables.length).toBeGreaterThan(0);
+    const target = await emptyTarget();
+    await restore({ connectionString: target.url, file: join(dir, "lost.oculus-backup") });
+  }, 60_000);
 });
 
 // ---------------------------------------------------------------------------
 
-/**
- * A PG_BIN of wrappers that record each call's arguments, environment and
- * the service file's permissions, then run the real tool.
- */
-async function recordingTools(): Promise<{ bin: string; log: string }> {
-  const real = await findTools(process.env, ["pg_dump", "pg_restore"]);
-  const bin = await directory();
-  const log = join(bin, "calls.log");
-  for (const tool of ["pg_dump", "pg_restore"]) {
-    const script = [
-      "#!/bin/sh",
-      `{ echo "== ${tool}"; for a in "$@"; do echo "arg: $a"; done; env | sed 's/^/env: /';`,
-      `  if [ -n "$PGSERVICEFILE" ] && [ -f "$PGSERVICEFILE" ]; then echo "service-file-mode: $(stat -c %a "$PGSERVICEFILE")"; echo "service-file: $PGSERVICEFILE"; echo "service-dir-mode: $(stat -c %a "$(dirname "$PGSERVICEFILE")")"; fi; } >> '${log}'`,
-      `exec '${join(real, tool)}' "$@"`,
-      "",
-    ].join("\n");
-    await writeFile(join(bin, tool), script);
-    await chmod(join(bin, tool), 0o755);
-  }
-  return { bin, log };
-}
+describe("stopping a backup or restore", () => {
+  it("mid-backup: ends pg_dump and leaves no file, temporary file or process", async () => {
+    const { testDb } = await populated();
+    const dir = await directory();
+    const temp = await directory();
+    const pidFile = join(temp, "..", `t052-dump-pid-${String(process.pid)}`);
+    cleanups.push(() => rm(pidFile, { force: true }));
+    const bin = await wrappedTools(
+      (_tool, real) => `'${real}' "$@" || exit $?\necho $$ > '${pidFile}'\nsleep 30`,
+    );
+    const controller = new AbortController();
+    const running = backup({
+      connectionString: testDb.url,
+      file: join(dir, "stopped.oculus-backup"),
+      env: { ...process.env, PG_BIN: bin },
+      tempDir: temp,
+      signal: controller.signal,
+    });
+    await until(() => existsSync(pidFile));
+    const pid = Number((await readFile(pidFile, "utf8")).trim());
+    expect(alive(pid)).toBe(true);
+    controller.abort();
+    const refused = await refusal(running);
+    expect(refused.code).toBe("interrupted");
+    await until(() => !alive(pid));
+    expect(await readdir(dir)).toEqual([]);
+    expect(await readdir(temp)).toEqual([]);
+  }, 60_000);
+
+  it("mid-restore: ends pg_restore, whose transaction rolls back, and leaves nothing behind", async () => {
+    // A table whose check sleeps only in pg_restore's session, so the
+    // restore is slow inside its one transaction.
+    const source = await database();
+    await migrate({ connectionString: source.url });
+    const db = pool(source.url);
+    await db.execute(sql`CREATE FUNCTION public.t052_slow() RETURNS boolean LANGUAGE sql
+      AS $f$ SELECT pg_catalog.pg_sleep(CASE WHEN pg_catalog.current_setting('application_name') = 'oculus-restore' THEN 0.5 ELSE 0 END) IS NOT NULL $f$`);
+    await db.execute(sql`CREATE TABLE public.t052_slow_rows (id int CHECK (public.t052_slow()))`);
+    await db.execute(
+      sql`INSERT INTO public.t052_slow_rows SELECT g FROM pg_catalog.generate_series(1, 20) AS g`,
+    );
+    const dir = await directory();
+    const file = join(dir, "slow.oculus-backup");
+    await backup({ connectionString: source.url, file });
+
+    const target = await emptyTarget();
+    const temp = await directory();
+    const server = pool(testServerUrl());
+    const restoring = async (wait?: string): Promise<boolean> => {
+      const rows = await server.rows(sql`
+        SELECT 1 FROM pg_catalog.pg_stat_activity
+        WHERE datname = ${target.testDb.name} AND application_name = 'oculus-restore'
+          AND (${wait ?? null}::text IS NULL OR wait_event = ${wait ?? null}::text)`);
+      return rows.length > 0;
+    };
+    const controller = new AbortController();
+    const running = restore({
+      connectionString: target.url,
+      file,
+      tempDir: temp,
+      signal: controller.signal,
+    });
+    await until(() => restoring("PgSleep"));
+    controller.abort();
+    const refused = await refusal(running);
+    expect(refused.code).toBe("interrupted");
+    expect(refused.message).toContain("rolled back");
+    await until(async () => !(await restoring()));
+    expect(await contentsOf(pool(target.url))).toEqual({});
+    expect(await readdir(temp)).toEqual([]);
+  }, 60_000);
+
+  it("the watchdog ends the tool when the process that started it dies", async () => {
+    const dir = await directory();
+    const script = join(dir, "parent.mjs");
+    await writeFile(
+      script,
+      `import { spawn } from "node:child_process";
+const child = spawn("/bin/sh", ["-c", ${JSON.stringify(WATCHDOG)}, "oculus-tool", "/bin/sleep", "60"], {
+  detached: true, stdio: ["pipe", "ignore", "ignore"],
+});
+console.log(child.pid);
+setInterval(() => {}, 1000);
+`,
+    );
+    const parent = spawn(process.execPath, [script], { stdio: ["ignore", "pipe", "ignore"] });
+    const pgid = await new Promise<number>((resolvePid) => {
+      parent.stdout.once("data", (chunk: Buffer) => {
+        resolvePid(Number(chunk.toString().trim()));
+      });
+    });
+    const groupAlive = (): boolean => {
+      try {
+        process.kill(-pgid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    expect(groupAlive()).toBe(true);
+    parent.kill("SIGKILL");
+    await until(() => !groupAlive());
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
 
 describe("the db:backup and db:restore commands", () => {
   it("print nothing secret and never pass the URL on a command line or in the tools' environment", async () => {
     const { testDb } = await populated();
-    const targetDb = await database();
-    const withPassword = (url: string): string => {
-      const u = new URL(url);
-      u.password = FAKE_PASSWORD;
-      return u.toString();
-    };
-    const { bin, log } = await recordingTools();
+    const target = await emptyTarget();
     const dir = await directory();
+    const temp = await directory();
+    const log = join(dir, "calls.log");
+    const bin = await wrappedTools(
+      (
+        tool,
+        real,
+      ) => `{ echo "== ${tool}"; for a in "$@"; do echo "arg: $a"; done; env | sed 's/^/env: /'
+  if [ -n "$PGSERVICEFILE" ] && [ -f "$PGSERVICEFILE" ]; then echo "service-file-mode: $(stat -c %a "$PGSERVICEFILE")"; echo "service-file: $PGSERVICEFILE"; echo "service-dir-mode: $(stat -c %a "$(dirname "$PGSERVICEFILE")")"; fi; } >> '${log}'
+exec '${real}' "$@"`,
+    );
     const file = join(dir, "cli.oculus-backup");
     const lines: string[] = [];
     const out = (line: string): void => {
@@ -536,22 +944,43 @@ describe("the db:backup and db:restore commands", () => {
       PG_BIN: bin,
       OCULUS_DATABASE_URL: url,
       OCULUS_SECRET_KEY: "fake-key-for-the-test",
+      PGHOST: "/nonexistent",
+      PGDATABASE: "nonexistent",
     });
+    const options = { tempDir: temp };
 
-    const source = withPassword(testDb.url);
-    expect(await runBackupCli([file], envFor(source), out, out)).toBe(0);
+    const source = as(testDb.url, "postgres", FAKE_PASSWORD);
+    expect(await runBackupCli([file], envFor(source), out, out, options)).toBe(0);
     expect((await stat(file)).mode & 0o777).toBe(0o600);
-    const target = withPassword(targetDb.url);
-    expect(await runRestoreCli([file], envFor(target), out, out)).toBe(0);
+    const restoreUrl = as(target.url, RESTORER, FAKE_PASSWORD);
+    expect(await runRestoreCli([file], envFor(restoreUrl), out, out, options)).toBe(0);
     expect(lines.join("\n")).toMatch(/Done: restored and checked \d+ tables/);
 
     // Refusals print cleanly too.
-    expect(await runRestoreCli([file], envFor(target), out, out)).toBe(1);
+    expect(await runRestoreCli([file], envFor(restoreUrl), out, out, options)).toBe(1);
     expect(lines.at(-1)).toMatch(/^Restore refused \(target_not_empty\)/);
-    expect(await runBackupCli([file], envFor(source), out, out)).toBe(1);
+    expect(await runBackupCli([file], envFor(source), out, out, options)).toBe(1);
     expect(lines.at(-1)).toMatch(/^Backup refused \(exists\)/);
-    expect(await runRestoreCli([join(dir, "missing")], envFor(target), out, out)).toBe(1);
+    expect(await runRestoreCli([join(dir, "missing")], envFor(restoreUrl), out, out)).toBe(1);
     expect(lines.at(-1)).toMatch(/^Restore refused \(not_found\)/);
+    const superuserTarget = await database();
+    expect(
+      await runRestoreCli(
+        [file],
+        envFor(as(superuserTarget.url, "postgres", FAKE_PASSWORD)),
+        out,
+        out,
+      ),
+    ).toBe(1);
+    expect(lines.at(-1)).toMatch(/^Restore refused \(superuser\)/);
+    expect(
+      await runRestoreCli(
+        ["--allow-superuser", file],
+        envFor(as(superuserTarget.url, "postgres", FAKE_PASSWORD)),
+        out,
+        out,
+      ),
+    ).toBe(0);
     // A connection that fails names no password.
     const badHost = new URL(source);
     badHost.searchParams.set("host", join(dir, "no-server-here"));
@@ -560,7 +989,6 @@ describe("the db:backup and db:restore commands", () => {
 
     const printed = lines.join("\n");
     expect(printed).not.toContain(FAKE_PASSWORD);
-    expect(printed).not.toContain(source);
     expect(printed).not.toContain("postgresql://");
 
     const calls = await readFile(log, "utf8");
@@ -576,6 +1004,7 @@ describe("the db:backup and db:restore commands", () => {
     expect(args).toContain("arg: --exit-on-error");
     expect(env.join("\n")).not.toContain(FAKE_PASSWORD);
     expect(env.join("\n")).not.toContain("OCULUS_");
+    expect(env.join("\n")).not.toMatch(/env: PG(HOST|DATABASE)=/);
     expect(calls).not.toContain("fake-key-for-the-test");
     // The service file was private and is gone.
     expect(calls).toContain("service-file-mode: 600");
@@ -584,6 +1013,24 @@ describe("the db:backup and db:restore commands", () => {
     for (const line of calls.split("\n").filter((l) => l.startsWith("service-file: "))) {
       expect(existsSync(line.slice("service-file: ".length))).toBe(false);
     }
+    expect(await readdir(temp)).toEqual([]);
+  }, 60_000);
+
+  it("take a relative path from where npm was run", async () => {
+    const dir = await directory();
+    expect(filePath("nightly.oculus-backup", { INIT_CWD: dir })).toBe(
+      join(dir, "nightly.oculus-backup"),
+    );
+    expect(filePath("/abs/x", { INIT_CWD: dir })).toBe("/abs/x");
+    expect(filePath("x", {})).toBe(join(process.cwd(), "x"));
+    const { testDb } = await populated();
+    const lines: string[] = [];
+    const out = (line: string): void => {
+      lines.push(line);
+    };
+    const env = { ...process.env, OCULUS_DATABASE_URL: testDb.url, INIT_CWD: dir };
+    expect(await runBackupCli(["relative.oculus-backup"], env, out, out)).toBe(0);
+    expect(await readdir(dir)).toEqual(["relative.oculus-backup"]);
   }, 60_000);
 
   it("need a file argument and OCULUS_DATABASE_URL", async () => {
@@ -594,6 +1041,7 @@ describe("the db:backup and db:restore commands", () => {
     expect(await runBackupCli([], {}, out, out)).toBe(2);
     expect(await runBackupCli(["a", "b"], {}, out, out)).toBe(2);
     expect(await runRestoreCli(["--force"], {}, out, out)).toBe(2);
+    expect(await runRestoreCli(["--allow-superuser"], {}, out, out)).toBe(2);
     expect(await runBackupCli(["x"], {}, out, out)).toBe(2);
     expect(lines.at(-1)).toContain("OCULUS_DATABASE_URL is not set");
     expect(await runRestoreCli(["x"], { OCULUS_DATABASE_URL: " " }, out, out)).toBe(2);
@@ -602,63 +1050,148 @@ describe("the db:backup and db:restore commands", () => {
     expect(lines.at(-1)).toMatch(/^Backup refused \(bad_url\)/);
     expect(lines.join("\n")).not.toContain(FAKE_PASSWORD);
   });
+
+  it("hide the URL and a password, but don't mangle output over a short one", () => {
+    const seen: string[] = [];
+    const url = "postgresql://u:ab1@h/db";
+    const { out } = hideSecrets(
+      url,
+      (l) => seen.push(l),
+      () => undefined,
+    );
+    out(`Done: 1 table, 11 rows; ${url}`);
+    const long = hideSecrets(
+      `postgresql://u:${FAKE_PASSWORD}@h/db`,
+      (l) => seen.push(l),
+      () => undefined,
+    );
+    long.out(`password ${FAKE_PASSWORD} here`);
+    expect(seen).toEqual(["Done: 1 table, 11 rows; [hidden]", "password [hidden] here"]);
+  });
 });
 
 // ---------------------------------------------------------------------------
 
-describe("connection parameters for pg_dump and pg_restore", () => {
-  it("read the URL as libpq does, query keywords last", () => {
-    const params = connectionParameters(
-      "postgresql://some%40one:p%40ss%2Fword@db.example.invalid:5433/oculus%5Fmain?sslmode=require&host=%2Fvar%2Frun%2Fpostgresql&application_name=a+b",
+describe("the connection pg_dump, pg_restore and the driver share", () => {
+  const files: Record<string, string> = { "/ca.pem": "CA", "/c.pem": "CERT", "/k.pem": "KEY" };
+  const resolveWith = (url: string): ReturnType<typeof resolveConnection> =>
+    resolveConnection(url, (path) => {
+      const text = files[path];
+      if (text === undefined) throw new Error("no such file");
+      return text;
+    });
+
+  it("read the URL as libpq does, query keywords last, and give both the same", () => {
+    const c = resolveWith(
+      "postgresql://some%40one:p%40ss%2Fword@db.example.invalid:5433/oculus%5Fmain?dbname=other&application_name=a+b",
     );
-    expect(Object.fromEntries(params)).toEqual({
-      host: "/var/run/postgresql",
-      port: "5433",
+    expect(c.libpq).toEqual([
+      ["host", "db.example.invalid"],
+      ["port", "5433"],
+      ["dbname", "other"],
+      ["user", "some@one"],
+      ["password", "p@ss/word"],
+      ["sslmode", "verify-full"],
+      ["sslrootcert", "system"],
+    ]);
+    expect(c.node).toEqual({
+      host: "db.example.invalid",
+      port: 5433,
+      database: "other",
       user: "some@one",
       password: "p@ss/word",
-      dbname: "oculus_main",
-      sslmode: "require",
-      application_name: "a+b",
+      ssl: { rejectUnauthorized: true },
     });
-    expect(Object.fromEntries(connectionParameters("postgres://[::1]/x"))).toEqual({
-      host: "::1",
-      dbname: "x",
-    });
-    expect(serviceFileText(new Map([["host", "h"]]), "oculus-backup")).toBe(
-      "[oculus_backup]\nhost=h\nfallback_application_name=oculus-backup\n",
+    expect(c.needsSystemRoots).toBe(true);
+    const socket = resolveWith("postgresql://u@localhost/db?host=%2Fvar%2Frun%2Fpostgresql");
+    expect(socket.libpq).toEqual([
+      ["host", "/var/run/postgresql"],
+      ["port", "5432"],
+      ["dbname", "db"],
+      ["user", "u"],
+      ["sslmode", "disable"],
+    ]);
+    expect(socket.node).toMatchObject({ host: "/var/run/postgresql", ssl: false });
+    expect(serviceFileText([["host", "h"]], "oculus-backup")).toBe(
+      "[oculus_backup]\nhost=h\napplication_name=oculus-backup\n",
     );
   });
 
-  it("refuse what a service file can't hold, without showing any value", () => {
+  it("map sslmode so both check the server the same way", () => {
+    const mode = (url: string): string => resolveWith(url).sslmode;
+    for (const local of ["localhost", "127.0.0.1", "[::1]"]) {
+      for (const m of ["", "?sslmode=disable", "?sslmode=allow", "?sslmode=prefer"]) {
+        expect(mode(`postgresql://u@${local}/db${m}`)).toBe("disable");
+      }
+      expect(mode(`postgresql://u@${local}/db?sslmode=require`)).toBe("verify-full");
+    }
+    for (const m of ["", "?sslmode=prefer", "?sslmode=require", "?sslmode=verify-full"]) {
+      expect(mode(`postgresql://u@db.example.invalid/db${m}`)).toBe("verify-full");
+    }
+    const ca = resolveWith(
+      "postgresql://u@db.example.invalid/db?sslmode=verify-ca&sslrootcert=/ca.pem",
+    );
+    expect(ca.sslmode).toBe("verify-ca");
+    expect(ca.libpq).toContainEqual(["sslrootcert", "/ca.pem"]);
+    expect(ca.node.ssl).toMatchObject({ rejectUnauthorized: true, ca: "CA" });
+    expect(ca.node.ssl && typeof ca.node.ssl.checkServerIdentity).toBe("function");
+    expect(ca.needsSystemRoots).toBe(false);
+    const full = resolveWith(
+      "postgresql://u@db.example.invalid/db?sslrootcert=/ca.pem&sslcert=/c.pem&sslkey=/k.pem",
+    );
+    expect(full.node.ssl).toEqual({ rejectUnauthorized: true, ca: "CA", cert: "CERT", key: "KEY" });
+    expect(full.libpq).toContainEqual(["sslcert", "/c.pem"]);
+    for (const refused of [
+      "postgresql://u@db.example.invalid/db?sslmode=disable",
+      "postgresql://u@db.example.invalid/db?sslmode=allow",
+      "postgresql://u@db.example.invalid/db?sslmode=verify-ca",
+      "postgresql://u@db.example.invalid/db?sslmode=bogus",
+      "postgresql://u@db.example.invalid/db?sslcert=/c.pem",
+      "postgresql://u@db.example.invalid/db?sslrootcert=/missing.pem",
+    ]) {
+      expect(() => resolveWith(refused)).toThrow(ConnectionError);
+    }
+  });
+
+  it("refuse what both can't be given the same way, without showing any value", () => {
     const cases = [
       "not a url",
       "mysql://u@h/db",
       `postgresql://u:${FAKE_PASSWORD}@h/db?ssl=true`,
       `postgresql://u:${FAKE_PASSWORD}@h/db?service=other`,
+      `postgresql://u:${FAKE_PASSWORD}@h/db?hostaddr=10.0.0.1`,
+      `postgresql://u:${FAKE_PASSWORD}@h/db?options=-c%20search_path%3Dx`,
+      `postgresql://u:${FAKE_PASSWORD}@h/db?target_session_attrs=any`,
+      `postgresql://u:${FAKE_PASSWORD}@h1,h2/db`,
+      `postgresql://u:${FAKE_PASSWORD}@/db`,
+      `postgresql://u:${FAKE_PASSWORD}@h/`,
+      `postgresql://u:${FAKE_PASSWORD}@h:0/db`,
       `postgresql://u:${FAKE_PASSWORD}%0A@h/db`,
       `postgresql://u:%20${FAKE_PASSWORD}@h/db`,
-      `postgresql://u:${FAKE_PASSWORD}@h/db?options=%E0%A4%A`,
+      `postgresql://u:${FAKE_PASSWORD}@h/db?sslmode=%E0%A4%A`,
     ];
     for (const url of cases) {
       let error: unknown;
       try {
-        connectionParameters(url);
+        resolveWith(url);
       } catch (e) {
         error = e;
       }
-      expect(error).toBeInstanceOf(BackupError);
-      expect((error as BackupError).code).toBe("bad_url");
+      expect(error, url).toBeInstanceOf(ConnectionError);
       expect((error as Error).message).not.toContain(FAKE_PASSWORD);
       expect((error as Error).message).not.toContain(url);
     }
   });
 
-  it("give the tools the caller's environment without OCULUS_ variables or another service", () => {
+  it("give the tools the caller's environment without OCULUS_ or connection variables", () => {
     expect(
       toolEnvironment(
         {
           PATH: "/usr/bin",
           PGPASSFILE: "/home/x/.pgpass",
+          PGPASSWORD: "fake",
+          PGHOST: "elsewhere",
+          PGSSLMODE: "disable",
           PGSERVICE: "other",
           PGSERVICEFILE: "/etc/other",
           OCULUS_DATABASE_URL: "postgresql://u@h/db",
@@ -670,10 +1203,13 @@ describe("connection parameters for pg_dump and pg_restore", () => {
     ).toEqual({
       PATH: "/usr/bin",
       PGPASSFILE: "/home/x/.pgpass",
+      PGPASSWORD: "fake",
       PGSERVICEFILE: "/tmp/s/pg_service.conf",
     });
   });
+});
 
+describe("pieces", () => {
   it("read tool versions", () => {
     expect(toolMajor("pg_dump (PostgreSQL) 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)")).toBe(16);
     expect(toolMajor("pg_restore (PostgreSQL) 19.0")).toBe(19);
@@ -686,6 +1222,24 @@ describe("connection parameters for pg_dump and pg_restore", () => {
     const error = await refusal(findTools({ PG_BIN: empty }, ["pg_dump"]));
     expect(error.code).toBe("no_tools");
     expect(error.message).toContain(empty);
+  });
+
+  it("hash whole rows, whatever the columns are called", async () => {
+    const testDb = await database();
+    const db = pool(testDb.url);
+    await db.execute(sql`CREATE TABLE public.a (t text, x int)`);
+    await db.execute(sql`CREATE TABLE public.b (oculus_backup_row text, x int)`);
+    await db.execute(sql`INSERT INTO public.a VALUES ('same', 1)`);
+    await db.execute(sql`INSERT INTO public.b VALUES ('same', 1)`);
+    const first = await tableSummaries(db);
+    await db.execute(sql`UPDATE public.a SET x = 2`);
+    await db.execute(sql`UPDATE public.b SET x = 2`);
+    const second = await tableSummaries(db);
+    for (const name of ["public.a", "public.b"]) {
+      const before = first.find((t) => t.name === name);
+      const after = second.find((t) => t.name === name);
+      expect(after?.rowsHash, name).not.toBe(before?.rowsHash);
+    }
   });
 });
 
