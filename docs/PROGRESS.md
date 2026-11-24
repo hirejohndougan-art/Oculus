@@ -2,6 +2,36 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 00:42 CT — manual (John: "start on phase 2, easiest wins first") — T-044 How the admin is built; U-005 test timeouts
+- Result: done
+- What changed: D-073 picks the admin's stack (React 19 on Vite 7, React Router 8, TanStack Query 5, React Aria Components with the design tokens, an in-house template form renderer checked by a server dry-run endpoint, Vitest with Testing Library, Playwright end-to-end tests, Siteimprove Alfa for accessibility, self-hosted fonts with OFL-1.1 allowed for font files only). U-005: explicit timeouts for two load-sensitive test hooks.
+- Decisions: D-073 (three answers from John)
+- Review: n/a (decision); U-005 changes timeouts only
+- Gate: PASS · tests_passing 3592 · npm audit clean
+- Next: T-037 sessions (final review), T-041 roles and permissions (building)
+
+## 2026-11-24 00:25 CT — manual (John: "start on phase 2, easiest wins first") — T-019, T-019b, T-019b2 Organization separation
+- Result: done
+- What changed: core `StoredTerm` with a required `organizationId` (`validateStoredTerm(s)`, plain objects only) and one `termIdentity` rule that db hashes for `term_key` (bytes unchanged, now pinned by a test). The near-duplicate and LC-without-URI reports take the expected organization and refuse mixed or unowned lists with fixed text. The D-019 items still to build are written into T-041 (sites table, sites by role, System settings access), T-045 (site selector), T-048 (Users page) and a new task T-048a (Admin: System settings).
+- Decisions: D-071
+- Review: one independent round (no leaks; key bytes fuzzed identical; planning gaps and test strength); all fixed.
+- Gate: PASS · tests_passing 3592 (was 3567) · npm audit clean
+- Next: T-037 sessions (fixing review findings), then T-044 and T-038
+
+## 2026-11-24 00:19 CT — manual (John: "start on phase 2, easiest wins first") — S-015, S-016, T-012a follow-ups
+- Result: done
+- What changed: the writer check also refuses grant options on any database and schema public, any guard trigger that isn't ALWAYS, and any subscription, and no longer counts temporary objects as owned. `createInvitation` answers superseded, revoked or may-be-pending instead of a misleading ok; only connection-class failures become `database_unavailable` and everything else is rethrown. Template moves (`templateMoveChanges`) need confirmation for values that would change visibility, in `updateRecord` and in `restoreVersion` across templates; `nextIdentifier` can count numbers held in template fields.
+- Decisions: amendments to D-029, D-067, D-068
+- Review: one independent round (a restore across templates publishing a staff value without confirmation; missed network errors; programming errors hidden); all fixed with tests. Filed T-012b and U-005 as future features.
+- Gate: PASS · tests_passing 3567 (was 3554) · npm audit clean
+- Next: T-037 sessions and T-019b2 organization separation (fixing review findings)
+
+## 2026-11-23 23:13 CT — manual (John: "move them to future features") — Launch scope
+- Result: done
+- What changed: ROADMAP gains a "Future features (after launch)" section. Moved there: the loan rework (T-018a, T-018b, S-013), vocabulary URI checks (T-009a), the TypeScript 7 and Vite 8 revisit (T-001b), search follow-ups (S-014), custom roles (T-041a), the optional approval step (T-035) and review queue (T-049), site passwords (T-019d), Argon2id (U-004) and the templates and identifier types admin screen (T-047). T-043 and T-048 no longer wait on T-035 and T-041a.
+- Decisions: none (scope only)
+- Next: T-037 sessions (review), then T-038 two-step sign-in
+
 ## 2026-11-23 22:51 CT — manual (John: "continue") — T-036 User accounts and password sign-in
 - Result: done
 - What changed: migration `0009_users.sql`: install-wide users with per-organization memberships (D-019), invitations (256-bit tokens stored as SHA-256, single use, 1 hour to 14 days, bound to one organization and address, sent only to the invitee after commit with a time limit and withdrawn if sending fails), one bootstrap system admin, sign-in throttle counters per address and per client network. Core: scrypt passwords at one allowed setting (NFC, 8 to 1,024 bytes, a common-password list and context words refused), progressive waits up to 15 minutes with no permanent lockout. `signIn` gives the same reply and cost for every failure and requires the second step (T-038). `client.ts`: a lost connection inside a transaction fails cleanly instead of crashing the process.

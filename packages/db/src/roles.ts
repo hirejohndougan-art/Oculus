@@ -116,6 +116,8 @@ export interface WriterRoleProblem {
     | "database_create"
     | "schema_create"
     | "parameter_privilege"
+    | "trigger_not_always"
+    | "subscription"
     | "missing_privilege";
   readonly message: string;
 }
@@ -166,11 +168,15 @@ function listed(items: readonly string[]): string {
  * It must also own nothing anywhere in this database or shared
  * (`pg_shdepend`: subscriptions, large objects, servers, publications …),
  * hold privileges on nothing but public's tables, schema public and
- * databases, have no GRANT OPTION (it could hand its privileges on), and
- * have no session settings but `ALLOWED_ROLE_SETTINGS` (nor may every role
- * have `session_replication_role` set). This session must not be in
- * replica mode. And the role in effect must hold every privilege `grantWriterRole`
- * gives. Empty when the connection is fit to be the service's. Run it at
+ * databases, have no GRANT OPTION (on tables, any database or schema
+ * public: it could hand its privileges on), and have no session settings
+ * but `ALLOWED_ROLE_SETTINGS` (nor may every role have
+ * `session_replication_role` set). Temporary objects of its sessions are
+ * not counted as owned. This session must not be in replica mode, every
+ * non-internal trigger on public's tables must be ALWAYS
+ * (`trigger_not_always`), and the database must have no subscription
+ * (`subscription`). And the role in effect must hold every privilege
+ * `grantWriterRole` gives. Empty when the connection is fit to be the service's. Run it at
  * startup and after every migration (new tables, new default privileges).
  */
 export async function checkWriterConnection(db: Queryable): Promise<WriterRoleProblem[]> {
@@ -196,6 +202,8 @@ export async function checkWriterConnection(db: Queryable): Promise<WriterRolePr
     settings: string[] | null;
     owns: string[] | null;
     objects: string[] | null;
+    triggers: string[] | null;
+    subscriptions: string[] | null;
     privileges: boolean;
   }>(sql`
     WITH who AS (
@@ -240,7 +248,18 @@ export async function checkWriterConnection(db: Queryable): Promise<WriterRolePr
                        AND ((t.acl).privilege_type = 'SELECT'
                             OR EXISTS (SELECT 1 FROM allowed a
                                        WHERE a.table_name = t.relname
-                                         AND a.privilege = (t.acl).privilege_type)))) AS extra,
+                                         AND a.privilege = (t.acl).privilege_type))))
+           -- A grant option on any database or on schema public (S-015): it
+           -- could hand CONNECT, TEMPORARY or USAGE on to other roles. PUBLIC
+           -- can't hold grant options.
+           || ARRAY(SELECT 'database ' || d.datname || ' ' || x.privilege_type || ' (grant option)'
+                    FROM pg_catalog.pg_database d,
+                         pg_catalog.aclexplode(COALESCE(d.datacl, pg_catalog.acldefault('d', d.datdba))) AS x
+                    WHERE x.grantee = w.oid AND x.is_grantable)
+           || ARRAY(SELECT 'schema public ' || x.privilege_type || ' (grant option)'
+                    FROM pg_catalog.pg_namespace n,
+                         pg_catalog.aclexplode(COALESCE(n.nspacl, pg_catalog.acldefault('n', n.nspowner))) AS x
+                    WHERE n.nspname = 'public' AND x.grantee = w.oid AND x.is_grantable) AS extra,
            -- Any column privilege at all.
            (SELECT pg_catalog.array_agg(DISTINCT c.relname || '.' || a.attname || ' ' || x.privilege_type)
             FROM pg_catalog.pg_attribute a
@@ -285,12 +304,19 @@ export async function checkWriterConnection(db: Queryable): Promise<WriterRolePr
                        AND pg_catalog.split_part(c.setting, '=', 1) = 'session_replication_role'))) AS settings,
            -- Anything it owns, in this database or shared (subscriptions,
            -- schemas, large objects, servers, publications, databases …).
+           -- Temporary objects (pg_temp_N, pg_toast_temp_N, and the schemas
+           -- a crashed session left behind) are left out (S-015): a writer
+           -- session using a temporary table must not make startup fail, and
+           -- they are visible to their own session only and dropped with it.
            (SELECT pg_catalog.array_agg(DISTINCT d.classid::pg_catalog.regclass::text || ' ' || d.objid::text)
             FROM pg_catalog.pg_shdepend d
             WHERE d.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass
               AND d.refobjid = w.oid AND d.deptype = 'o'
               AND d.dbid IN (0, (SELECT oid FROM pg_catalog.pg_database
-                                 WHERE datname = pg_catalog.current_database()))) AS owns,
+                                 WHERE datname = pg_catalog.current_database()))
+              AND NOT (d.dbid <> 0
+                       AND COALESCE((pg_catalog.pg_identify_object(d.classid, d.objid, d.objsubid)).schema, '')
+                           OPERATOR(pg_catalog.~) '^pg_(toast_)?temp_[0-9]+$')) AS owns,
            -- Privileges on anything but public's tables (their columns are the
            -- column check's), schema public and databases (pg_shdepend lists
            -- non-default ACL entries only; parameters are listed here too).
@@ -307,6 +333,21 @@ export async function checkWriterConnection(db: Queryable): Promise<WriterRolePr
                        AND EXISTS (SELECT 1 FROM pg_catalog.pg_class c
                                    WHERE c.oid = d.objid
                                      AND c.relnamespace = 'public'::pg_catalog.regnamespace))) AS objects,
+           -- Every non-internal trigger on public's tables must fire ALWAYS
+           -- (D-067, S-015): ORIGIN, REPLICA or disabled ones don't guard
+           -- every session. Not per role, so the same on both rows.
+           (SELECT pg_catalog.array_agg(c.relname || '.' || t.tgname ORDER BY c.relname, t.tgname)
+            FROM pg_catalog.pg_trigger t
+            JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+            WHERE c.relnamespace = 'public'::pg_catalog.regnamespace
+              AND NOT t.tgisinternal AND t.tgenabled <> 'A') AS triggers,
+           -- Any subscription in this database, whoever owns it (S-015): its
+           -- apply worker runs in replica mode. Only the names are read
+           -- (subconninfo is not readable by PUBLIC).
+           (SELECT pg_catalog.array_agg(s.subname::text ORDER BY s.subname)
+            FROM pg_catalog.pg_subscription s
+            WHERE s.subdbid = (SELECT oid FROM pg_catalog.pg_database
+                               WHERE datname = pg_catalog.current_database())) AS subscriptions,
            (NOT w.current
             OR (pg_catalog.has_schema_privilege(w.oid, 'public', 'USAGE')
                 AND (SELECT pg_catalog.bool_and(pg_catalog.has_table_privilege(w.oid, 'public.' || t, 'SELECT'))
@@ -364,7 +405,21 @@ export async function checkWriterConnection(db: Queryable): Promise<WriterRolePr
   }
   const extra = all((r) => r.extra);
   if (unknown || extra.length > 0) {
-    add("extra_privilege", `Table privileges beyond the writer's: ${listed(extra)}.`);
+    add("extra_privilege", `Privileges beyond the writer's: ${listed(extra)}.`);
+  }
+  const triggers = all((r) => r.triggers);
+  if (triggers.length > 0) {
+    add(
+      "trigger_not_always",
+      `Triggers that don't fire in every session (ENABLE ALWAYS TRIGGER them): ${listed(triggers)}.`,
+    );
+  }
+  const subscriptions = all((r) => r.subscriptions);
+  if (subscriptions.length > 0) {
+    add(
+      "subscription",
+      `Subscriptions in this database, whose apply workers skip ordinary triggers: ${listed(subscriptions)}.`,
+    );
   }
   const columns = all((r) => r.columns);
   if (columns.length > 0) add("column_privilege", `Column privileges: ${listed(columns)}.`);

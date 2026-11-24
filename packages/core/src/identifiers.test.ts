@@ -609,6 +609,48 @@ describe("nextIdentifier", () => {
     expect(nextIdentifier(OBJECT_NO, all)).toEqual({ ok: true, value: "DHS-0013" });
   });
 
+  it("counts numbers held only in template identifier fields when records are given (T-012a)", () => {
+    const all = [set(a, [["object_number", "DHS-0007"]])];
+    const stored = (id: string, fields: Record<string, unknown>) => ({
+      kind: "object",
+      id,
+      title: "Invented postcard",
+      organizationId: ORG,
+      templateKey: "objects",
+      createdAt: T,
+      updatedAt: T,
+      fields,
+    });
+    const records = [
+      // One field value, one in a list, and another type's that doesn't count.
+      stored(a, { number: { type: "object_number", value: "DHS-0040" } }),
+      stored(b, {
+        numbers: [
+          { type: "object_number", value: "DHS-0019" },
+          { type: "box", value: "DHS-0099" },
+        ],
+      }),
+    ];
+    expect(nextIdentifier(OBJECT_NO, all)).toEqual({ ok: true, value: "DHS-0008" });
+    expect(nextIdentifier(OBJECT_NO, all, { records: records as never })).toEqual({
+      ok: true,
+      value: "DHS-0041",
+    });
+    expect(nextIdentifier(OBJECT_NO, all, { records: [] })).toEqual({
+      ok: true,
+      value: "DHS-0008",
+    });
+    // Another organization's record, an invalid one or a non-list is refused.
+    const other = { ...stored(b, {}), organizationId: newOrganizationId() };
+    expect(codes(nextIdentifier(OBJECT_NO, all, { records: [other] as never }))).toEqual([
+      "mixed_organizations",
+    ]);
+    expect(codes(nextIdentifier(OBJECT_NO, all, { records: [{ id: a }] as never }))).toEqual([
+      "invalid_record",
+    ]);
+    expect(codes(nextIdentifier(OBJECT_NO, all, { records: {} as never }))).toEqual(["not_a_list"]);
+  });
+
   it("prefix: reads numbers typed loosely or padded differently", () => {
     const all = [
       set(a, [["object_number", "dhs-21"]]),

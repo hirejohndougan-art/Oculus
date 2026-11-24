@@ -176,6 +176,67 @@ export class ConnectionLostError extends Error {
   }
 }
 
+/** pg's own errors for a connection that failed or ended (they carry no code). */
+const CONNECTION_FAILURES = new Set([
+  "Connection terminated",
+  "Connection terminated unexpectedly",
+  "Connection terminated due to connection timeout",
+  "timeout exceeded when trying to connect",
+  "timeout expired",
+  "Query read timeout",
+  "Client has encountered a connection error and is not queryable",
+  "The server does not support SSL connections",
+  "There was an error establishing an SSL connection",
+]);
+
+/**
+ * SQLSTATE classes that mean the database or the connection failed, not the
+ * query (S-016): 08 connection exception, 40 transaction rollback (deadlock,
+ * serialization), 53 insufficient resources, 57 operator intervention
+ * (shutdown, cancel, timeout), 58 system error, XX internal error. Others
+ * (42 syntax or permission, 22 data, 23 constraints …) are programming or
+ * data errors and are rethrown.
+ */
+const FAILURE_CLASSES = new Set(["08", "40", "53", "57", "58", "XX"]);
+
+/**
+ * Whether `error` is the database's or the network's failure (answered with
+ * a fixed refusal such as `database_unavailable`), rather than a programming
+ * error, which callers rethrow (S-016). True for:
+ * - an error the server sent whose SQLSTATE is in `FAILURE_CLASSES`;
+ * - `ConnectionLostError` (SQLSTATE 08006);
+ * - a Node system error from the socket or name lookup (`code` such as
+ *   `ECONNREFUSED`, `ENOENT` for a missing Unix socket or `EAI_AGAIN`, with
+ *   a `syscall`);
+ * - an `AggregateError` (Node's dual-stack connect tries each address) whose
+ *   `code` is such an `E…` code, or whose errors all are failures;
+ * - pg's own code-less connection errors (`CONNECTION_FAILURES`).
+ * False for everything else, including Node's `ERR_*` codes (an invalid
+ * argument, a TLS misconfiguration), TypeErrors and our own errors.
+ */
+export function isDatabaseFailure(error: unknown): boolean {
+  if (error instanceof ConnectionLostError) return true;
+  if (typeof error !== "object" || error === null) return false;
+  const { code, syscall } = error as { code?: unknown; syscall?: unknown };
+  const systemCode =
+    typeof code === "string" && /^E[A-Z0-9_]+$/.test(code) && !code.startsWith("ERR_");
+  if (error instanceof AggregateError) {
+    if (systemCode) return true;
+    const errors: unknown = error.errors;
+    return Array.isArray(errors) && errors.length > 0 && errors.every((e) => isDatabaseFailure(e));
+  }
+  if (typeof code === "string") {
+    if (/^[0-9A-Z]{5}$/.test(code) && FAILURE_CLASSES.has(code.slice(0, 2))) return true;
+    return systemCode && typeof syscall === "string";
+  }
+  return (
+    code === undefined &&
+    error instanceof Error &&
+    Object.getPrototypeOf(error) === Error.prototype &&
+    CONNECTION_FAILURES.has(error.message)
+  );
+}
+
 /** Opens a connection pool. The connection string comes from the environment, never the repo. */
 export function openDatabase(connectionString: string, options: DatabaseOptions = {}): Database {
   const pool = new pg.Pool({
@@ -322,6 +383,10 @@ function databaseIdentifier(name: string): string {
 export async function createDatabase(adminConnectionString: string, name: string): Promise<void> {
   const statement = `CREATE DATABASE ${databaseIdentifier(name)} TEMPLATE template0 ENCODING 'UTF8'`;
   const client = new pg.Client(clientConfig(adminConnectionString));
+  // Without a listener, the connection failing after connect (the server
+  // ending it) would be an uncaught 'error' that crashes the process; the
+  // query or end() rejects instead.
+  client.on("error", () => undefined);
   await client.connect();
   try {
     await client.query(statement);
@@ -334,6 +399,10 @@ export async function createDatabase(adminConnectionString: string, name: string
 export async function dropDatabase(adminConnectionString: string, name: string): Promise<void> {
   const statement = `DROP DATABASE IF EXISTS ${databaseIdentifier(name)} WITH (FORCE)`;
   const client = new pg.Client(clientConfig(adminConnectionString));
+  // Without a listener, the connection failing after connect (the server
+  // ending it) would be an uncaught 'error' that crashes the process; the
+  // query or end() rejects instead.
+  client.on("error", () => undefined);
   await client.connect();
   try {
     await client.query(statement);

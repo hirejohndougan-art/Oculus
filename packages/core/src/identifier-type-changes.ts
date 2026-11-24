@@ -49,8 +49,10 @@
  *   confirmation, and renaming onto a reserved key is refused.
  * - `made_staff`: `public` goes from true to false. A staff type is refused
  *   in public template fields (D-022), so `recordIds` are the records holding
- *   a value of it in a field public for their kind in some template (any
- *   field when `templates` isn't given); needs confirmation when there are.
+ *   a value of it in a field public in the template the record names (its
+ *   `templateKey`; for a record naming none, public for its kind in some
+ *   template; any field when `templates` isn't given or lacks the record's
+ *   template); needs confirmation when there are.
  * - `uniqueness_loosened`, auto-numbering removed: informational.
  *
  * `existing` holds what the type is used by: `identifierTypes` (the
@@ -442,8 +444,13 @@ interface Use {
   readonly identifierTypes: readonly IdentifierType[];
   readonly identifiers: readonly RecordIdentifiers[];
   readonly records: readonly CatalogRecord[];
-  /** Field keys that are public in some template, by record kind; undefined when unknown. */
+  /**
+   * Public identifier field keys in some template, by record kind, for
+   * records that name no template; undefined when templates weren't given.
+   */
   readonly publicKeys: ReadonlyMap<string, ReadonlySet<string>> | undefined;
+  /** Public identifier field keys by template key (T-012a); undefined when unknown. */
+  readonly publicKeysByTemplate: ReadonlyMap<string, ReadonlySet<string>> | undefined;
   /** The templates given, or undefined. */
   readonly templates: readonly FieldTemplate[] | undefined;
 }
@@ -555,6 +562,7 @@ function readUse(input: unknown, type: IdentifierType, listed = true): Validated
   const records = readList(own(input, "records"), "records", validateRecord, (r) => r.id);
   if (!records.ok) return records;
   let publicKeys: Map<string, Set<string>> | undefined;
+  let publicKeysByTemplate: Map<string, Set<string>> | undefined;
   let templateList: readonly FieldTemplate[] | undefined;
   const templatesInput = own(input, "templates");
   if (templatesInput !== undefined || Object.hasOwn(input, "templates")) {
@@ -562,9 +570,18 @@ function readUse(input: unknown, type: IdentifierType, listed = true): Validated
     if (!templates.ok) return templates;
     templateList = templates.value;
     publicKeys = new Map();
+    publicKeysByTemplate = new Map();
     for (const t of templates.value) {
+      // Every listed template gets an entry, so a template with no public
+      // identifier field is known to have none.
+      let mine = publicKeysByTemplate.get(t.key);
+      if (mine === undefined) {
+        mine = new Set();
+        publicKeysByTemplate.set(t.key, mine);
+      }
       for (const f of t.fields) {
         if (f.kind !== "identifier" || f.visibility !== "public") continue;
+        mine.add(f.key);
         for (const kind of t.appliesTo) {
           let keys = publicKeys.get(kind);
           if (keys === undefined) {
@@ -599,6 +616,7 @@ function readUse(input: unknown, type: IdentifierType, listed = true): Validated
       identifiers: identifiers.value,
       records: records.value,
       publicKeys,
+      publicKeysByTemplate,
       templates: templateList,
     },
   };
@@ -734,16 +752,28 @@ function holders(use: Use, key: string): Held {
 }
 
 /**
- * Records holding a value of the type in a template field that is public for
- * their kind in some template (records don't name their template yet,
- * T-012), or in any field when the templates weren't given. A staff type is
- * refused in public fields (D-022), so these stop passing the check.
+ * Records holding a value of the type in a template field that is public in
+ * the template the record names (its `templateKey`, T-012a, D-029), or in
+ * any field when the templates weren't given or don't include the record's.
+ * A record that names no template (stored before records did) is matched,
+ * as before, against the fields public for its kind in any template. A staff
+ * type is refused in public fields (D-022), so these stop passing the check.
  */
 function inPublicFields(use: Use, key: string): Held {
   const held = new Held();
   for (const record of use.records) {
-    const publicHere = use.publicKeys?.get(record.kind);
-    if (use.publicKeys !== undefined && publicHere === undefined) continue;
+    const templateKey = own(record, "templateKey");
+    const publicHere =
+      typeof templateKey === "string"
+        ? use.publicKeysByTemplate?.get(templateKey)
+        : use.publicKeys?.get(record.kind);
+    if (
+      typeof templateKey !== "string" &&
+      use.publicKeys !== undefined &&
+      publicHere === undefined
+    ) {
+      continue;
+    }
     for (const item of fieldIdentifiers(record)) {
       if (item.type === key && (publicHere === undefined || publicHere.has(item.field))) {
         held.add(record.id);

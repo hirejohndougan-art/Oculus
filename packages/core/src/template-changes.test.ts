@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   templateChanges,
+  templateMoveChanges,
   validateLegacyTemplate,
   validateTemplate,
   type TemplateChange,
@@ -166,11 +167,25 @@ describe("templateChanges", () => {
     expect(r.needsConfirmation).toBe(false);
   });
 
-  it("reports an added record kind, needing confirmation only with a public field", () => {
+  it("reports an added record kind, needing confirmation only with a public field and records that may come under it", () => {
     const pub = template(TITLE);
-    const r = run(pub, { ...pub, appliesTo: ["object", "digital_asset"] }, [record(A, {})]);
-    expect(summary(r.changes)).toEqual([["kind_added", "digital_asset", true]]);
+    const wider = { ...pub, appliesTo: ["object", "digital_asset"] };
+    // Records follow the template their templateKey names (D-029, T-012a):
+    // with this template's records given and none of the kind, no record of
+    // another template comes under it, so nothing needs confirming.
+    const r = run(pub, wider, [record(A, {})]);
+    expect(summary(r.changes)).toEqual([["kind_added", "digital_asset", false]]);
     expect(r.changes[0]?.recordCount).toBe(0);
+    // Unknown records, or a given record of that kind, still need confirmation.
+    expect(summary(run(pub, wider).changes)).toEqual([["kind_added", "digital_asset", true]]);
+    const asset = {
+      ...record(B, { summary: "x" }),
+      kind: "digital_asset",
+      mediaType: "image/tiff",
+    };
+    const withAsset = run(pub, wider, [record(A, {}), asset]);
+    expect(summary(withAsset.changes)).toEqual([["kind_added", "digital_asset", true]]);
+    expect(withAsset.changes[0]?.recordIds).toEqual([B]);
     const staff = template(field());
     expect(
       summary(run(staff, { ...staff, appliesTo: ["object", "event"] }, [record(A, {})]).changes),
@@ -292,5 +307,83 @@ describe("templateChanges", () => {
     expect(Object.isFrozen(r.changes)).toBe(true);
     expect(Object.isFrozen(r.changes[0])).toBe(true);
     expect(Object.isFrozen(r.changes[0]?.recordIds)).toBe(true);
+  });
+});
+
+describe("templateMoveChanges (T-012a)", () => {
+  const from = {
+    ...template(
+      field({ key: "note" }),
+      field({ key: "summary", label: "Summary", visibility: "public" }),
+      field({ key: "box", label: "Box" }),
+      field({ key: "size", label: "Size" }),
+    ),
+    key: "objects",
+  };
+  const to = {
+    ...template(
+      field({ key: "note", visibility: "public" }),
+      field({ key: "summary", label: "Summary" }),
+      field({ key: "size", label: "Size", kind: "long_text", inherited: true }),
+      field({ key: "secret", label: "Secret", visibility: "public" }),
+    ),
+    key: "postcards",
+  };
+  const before = {
+    ...record(A, { note: "x", summary: "y", box: "z", size: "s", secret: "left over" }),
+    templateKey: "objects",
+  };
+  const after = { ...before, templateKey: "postcards" };
+
+  it("lists what a held value becomes in the new template, and needs confirmation for what it publishes", () => {
+    const r = templateMoveChanges(before, after, from, to);
+    if (!r.ok) throw new Error(JSON.stringify(r.issues));
+    expect(r.value.changes.map((c) => [c.code, c.key, c.needsConfirmation])).toEqual([
+      ["left_over", "box", false],
+      ["made_public", "note", true],
+      // A left-over value under a key the new template publishes.
+      ["made_public", "secret", true],
+      ["kind_changed", "size", false],
+      ["now_inherited", "size", true],
+      ["made_staff", "summary", false],
+    ]);
+    expect(r.value.needsConfirmation).toBe(true);
+    expect(Object.isFrozen(r.value.changes)).toBe(true);
+    // Messages name keys, never values.
+    expect(JSON.stringify(r)).not.toMatch(/left over|"x"|"y"|"z"/);
+  });
+
+  it("leaves out values typed in during the move, and a keyless stored record is allowed", () => {
+    const r = templateMoveChanges(
+      { ...record(A, {}) },
+      { ...record(A, { note: "new" }), templateKey: "postcards" },
+      from,
+      to,
+    );
+    expect(r).toEqual({ ok: true, value: { changes: [], needsConfirmation: false } });
+  });
+
+  it("refuses one template, two records, records of other templates and other organizations", () => {
+    const codesOf = (r: { ok: boolean; issues?: readonly { code: string }[] }) =>
+      r.ok ? [] : (r.issues ?? []).map((i) => i.code);
+    expect(codesOf(templateMoveChanges(before, { ...before }, from, from))).toEqual([
+      "same_template",
+    ]);
+    expect(codesOf(templateMoveChanges(before, { ...after, id: B }, from, to))).toEqual([
+      "different_records",
+    ]);
+    expect(codesOf(templateMoveChanges({ ...before, templateKey: "x" }, after, from, to))).toEqual([
+      "record_not_for_template",
+    ]);
+    expect(codesOf(templateMoveChanges(before, before, from, to))).toEqual([
+      "record_not_for_template",
+    ]);
+    expect(
+      codesOf(
+        templateMoveChanges(before, after, from, { ...to, organizationId: newOrganizationId() }),
+      ),
+    ).toEqual(["mixed_organizations"]);
+    expect(codesOf(templateMoveChanges(before, { id: A }, from, to))).toEqual(["invalid_record"]);
+    expect(codesOf(templateMoveChanges(before, after, from, { key: "postcards" }))).not.toEqual([]);
   });
 });

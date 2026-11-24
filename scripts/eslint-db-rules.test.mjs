@@ -38,7 +38,8 @@ const OUTSIDE = "lint-probe/example.ts";
 const INSIDE = "packages/db/src/lint-probe.ts";
 const CLIENT = "packages/db/src/client.ts";
 
-describe("pg stays inside packages/db", () => {
+// Linting with type information is slow on a busy two-core machine; the first call can pass 5 s (U-005).
+describe("pg stays inside packages/db", { timeout: 60_000 }, () => {
   const imports = [
     'import pg from "pg";\nexport const a = pg;',
     'import type { Pool } from "pg";\nexport type A = Pool;',
@@ -107,7 +108,7 @@ describe("pg stays inside packages/db", () => {
   });
 });
 
-describe(".query() only in client.ts, and sql only as a tag", () => {
+describe(".query() only in client.ts, and sql only as a tag", { timeout: 60_000 }, () => {
   const queries =
     'declare const client: { query(s: string): void };\nclient.query("DROP TABLE t");\nclient["query"]("DROP TABLE t");';
 

@@ -195,12 +195,21 @@ export type {
   RecordTypeUse,
 } from "./record-type-changes.js";
 
-export { TEMPLATE_CHANGE_CODES, MAX_LISTED_RECORDS, templateChanges } from "./template-changes.js";
+export {
+  TEMPLATE_CHANGE_CODES,
+  TEMPLATE_MOVE_CODES,
+  MAX_LISTED_RECORDS,
+  templateChanges,
+  templateMoveChanges,
+} from "./template-changes.js";
 export type {
   TemplateChangeCode,
   TemplateChange,
   TemplateChangeOptions,
   TemplateChanges,
+  TemplateMoveCode,
+  TemplateMoveChange,
+  TemplateMoveChanges,
 } from "./template-changes.js";
 
 export {
@@ -327,6 +336,14 @@ export type {
   TermUriChange,
   NormalizedTermUri,
 } from "./vocabularies.js";
+export {
+  MAX_STORED_TERMS,
+  isStoredTermId,
+  termIdentity,
+  validateStoredTerm,
+  validateStoredTerms,
+} from "./stored-terms.js";
+export type { OrganizationTerm, StoredTerm } from "./stored-terms.js";
 export {
   DUPLICATE_REASONS,
   MAX_DUPLICATE_TERMS,

@@ -126,7 +126,8 @@ afterAll(async () => {
       DROP ROLE IF EXISTS oculus_t052_gone;
     EXCEPTION WHEN dependent_objects_still_exist THEN NULL; END $$`),
   ).catch(() => undefined);
-});
+  // Dropping dozens of throwaway databases takes over 10 s on a busy two-core machine (U-005).
+}, 120_000);
 
 async function database(): Promise<TestDatabase> {
   const db = await freshDatabase();

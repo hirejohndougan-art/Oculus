@@ -711,7 +711,8 @@ describe("the writer role", () => {
         await run(s.owner, "ALTER SUBSCRIPTION %I OWNER TO %I", subscription, probe);
         await run(server, "REVOKE CREATE ON DATABASE %I FROM %I", db, probe);
         await run(server, "REVOKE pg_create_subscription FROM %I", probe);
-        expect(await probeCodes()).toEqual(["owns_object"]);
+        // Any subscription in the database is refused too (S-015).
+        expect(await probeCodes()).toEqual(["owns_object", "subscription"]);
       } finally {
         await run(s.owner, "ALTER SUBSCRIPTION %I SET (slot_name = NONE)", subscription);
         await run(s.owner, "DROP SUBSCRIPTION %I", subscription);
@@ -764,6 +765,173 @@ describe("the writer role", () => {
         return (await checkWriterConnection(q)).map((p) => p.code);
       });
       expect(switched).toEqual(expect.arrayContaining(["superuser", "owner"]));
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("S-015: grant options on the database and schema, triggers not ALWAYS, subscriptions; temporary objects are fine", async () => {
+    await ready();
+    const probe = s.roles[6] ?? "";
+    const db = s.testDb.name;
+    const run = async (on: Database, statement: string, ...names: string[]): Promise<void> => {
+      await on.transaction(async (q) => {
+        await q.rows(sql`SELECT set_config('oculus_test.statement', ${statement}, true),
+                                set_config('oculus_test.a', ${names[0] ?? ""}, true),
+                                set_config('oculus_test.b', ${names[1] ?? ""}, true)`);
+        await q.execute(sql`DO $$ BEGIN
+          EXECUTE format(current_setting('oculus_test.statement'),
+                         current_setting('oculus_test.a'), current_setting('oculus_test.b'));
+        END $$`);
+      });
+    };
+    const probeCodes = async (): Promise<string[]> => {
+      const fresh = as(s.testDb.url, probe);
+      try {
+        return (await createService(fresh).checkConnection()).map((p) => p.code);
+      } finally {
+        await fresh.close();
+      }
+    };
+    const server = openDatabase(testServerUrl(), { max: 1 });
+    try {
+      await s.owner.transaction((q) => grantWriterRole(q, probe));
+      expect(await probeCodes()).toEqual([]);
+      // Grant options on the database and on schema public.
+      for (const [on, grant, revoke, names] of [
+        [
+          server,
+          "GRANT CONNECT ON DATABASE %I TO %I WITH GRANT OPTION",
+          "REVOKE CONNECT ON DATABASE %I FROM %I",
+          [db, probe],
+        ],
+        [
+          server,
+          "GRANT TEMPORARY ON DATABASE %I TO %I WITH GRANT OPTION",
+          "REVOKE TEMPORARY ON DATABASE %I FROM %I",
+          [db, probe],
+        ],
+        [
+          s.owner,
+          "GRANT USAGE ON SCHEMA public TO %I WITH GRANT OPTION",
+          "REVOKE GRANT OPTION FOR USAGE ON SCHEMA public FROM %I",
+          [probe],
+        ],
+      ] as const) {
+        await run(on, grant, ...names);
+        try {
+          const problems = await (async () => {
+            const fresh = as(s.testDb.url, probe);
+            try {
+              return await createService(fresh).checkConnection();
+            } finally {
+              await fresh.close();
+            }
+          })();
+          expect({ grant, found: problems.map((p) => p.code) }).toEqual({
+            grant,
+            found: ["extra_privilege"],
+          });
+          expect(problems[0]?.message).toMatch(/\(grant option\)/);
+        } finally {
+          await run(on, revoke, ...names);
+        }
+        expect({ revoke, found: await probeCodes() }).toEqual({ revoke, found: [] });
+      }
+      // A grant option on another database of the server is refused too.
+      const otherDb = await freshDatabase();
+      try {
+        await run(
+          server,
+          "GRANT CONNECT ON DATABASE %I TO %I WITH GRANT OPTION",
+          otherDb.name,
+          probe,
+        );
+        const problems = await (async () => {
+          const fresh = as(s.testDb.url, probe);
+          try {
+            return await createService(fresh).checkConnection();
+          } finally {
+            await fresh.close();
+          }
+        })();
+        expect(problems.map((p) => p.code)).toEqual(["extra_privilege"]);
+        expect(problems[0]?.message).toContain(`database ${otherDb.name} CONNECT (grant option)`);
+        await run(
+          server,
+          "REVOKE GRANT OPTION FOR CONNECT ON DATABASE %I FROM %I",
+          otherDb.name,
+          probe,
+        );
+        expect(await probeCodes()).toEqual([]);
+        await run(server, "REVOKE CONNECT ON DATABASE %I FROM %I", otherDb.name, probe);
+      } finally {
+        await otherDb.drop();
+      }
+      // Without the grant option, CONNECT and TEMPORARY to the role are fine.
+      await run(server, "GRANT CONNECT, TEMPORARY ON DATABASE %I TO %I", db, probe);
+      try {
+        expect(await probeCodes()).toEqual([]);
+      } finally {
+        await run(server, "REVOKE CONNECT, TEMPORARY ON DATABASE %I FROM %I", db, probe);
+      }
+      // Temporary objects of the writer's sessions are not "owned objects",
+      // in the session that made them or seen from another one.
+      const holder = as(s.testDb.url, probe);
+      try {
+        await holder.transaction(async (q) => {
+          await q.execute(sql`CREATE TEMPORARY TABLE scratch (n integer) ON COMMIT PRESERVE ROWS`);
+          await q.execute(sql`CREATE TEMPORARY SEQUENCE scratch_numbers`);
+          await q.execute(
+            sql`CREATE FUNCTION pg_temp.scratch_one() RETURNS integer LANGUAGE sql AS 'SELECT 1'`,
+          );
+        });
+        // The pool keeps that connection open, so its temporary objects stay.
+        const [held] = await s.owner.rows<{ n: number }>(sql`
+          SELECT count(*)::integer AS n FROM pg_catalog.pg_shdepend d
+          WHERE d.refobjid = ${probe}::regrole AND d.deptype = 'o'`);
+        expect(held?.n).toBe(3);
+        expect(await probeCodes()).toEqual([]);
+      } finally {
+        await holder.close();
+      }
+      // Any non-internal trigger on public's tables that isn't ALWAYS.
+      const trigger = "zzzz_records_delete_needs_version";
+      for (const state of ["ENABLE", "ENABLE REPLICA", "DISABLE"]) {
+        await run(s.owner, `ALTER TABLE public.records ${state} TRIGGER %I`, trigger);
+        try {
+          const problems = await service.checkConnection();
+          expect({ state, found: problems.map((p) => p.code) }).toEqual({
+            state,
+            found: ["trigger_not_always"],
+          });
+          expect(problems[0]?.message).toContain(`records.${trigger}`);
+          expect({ state, found: await probeCodes() }).toEqual({
+            state,
+            found: ["trigger_not_always"],
+          });
+        } finally {
+          await run(s.owner, "ALTER TABLE public.records ENABLE ALWAYS TRIGGER %I", trigger);
+        }
+      }
+      expect(await service.checkConnection()).toEqual([]);
+      // Any subscription in this database, even the owner's and disabled.
+      const subscription = `s015_${probe}`;
+      await run(
+        s.owner,
+        "CREATE SUBSCRIPTION %I CONNECTION 'dbname=oculus_s015_nowhere' PUBLICATION nothing WITH (connect = false)",
+        subscription,
+      );
+      try {
+        const problems = await service.checkConnection();
+        expect(problems.map((p) => p.code)).toEqual(["subscription"]);
+        expect(problems[0]?.message).toContain(subscription);
+        expect(await probeCodes()).toEqual(["subscription"]);
+      } finally {
+        await run(s.owner, "ALTER SUBSCRIPTION %I SET (slot_name = NONE)", subscription);
+        await run(s.owner, "DROP SUBSCRIPTION %I", subscription);
+      }
+      expect(await service.checkConnection()).toEqual([]);
     } finally {
       await server.close();
     }
@@ -1435,6 +1603,131 @@ describe("creating records", () => {
     expect(codes(await service.createRecord(ctx(org), unitDraft("file", chair.id)))).toEqual([
       "missing_parent",
     ]);
+  });
+});
+
+describe("moving a record to another template (T-012a)", () => {
+  it("refuses until the person confirms the stored staff values the new template publishes", async () => {
+    await ready();
+    const org = await organization();
+    ok(
+      await insertTemplateVersion(s.owner, {
+        key: "invented-public-object",
+        organizationId: org,
+        label: "Invented objects, published",
+        appliesTo: ["object"],
+        fields: [field("note", "text", { visibility: "public" }), field("extra", "text")],
+      }),
+    );
+    const record = await create(org, objectDraft({ note: "Staff only: invented." }));
+    const moved = draftOf(record, { templateKey: "invented-public-object" });
+    const refused = await service.updateRecord(ctx(org), record.id, moved, {
+      expectedVersion: 1,
+    });
+    expect(codes(refused)).toEqual(["made_public"]);
+    expect(refused.ok ? [] : refused.issues.map((i) => i.path)).toEqual([["fields", "note"]]);
+    expect(messages(refused)).not.toContain("Staff only");
+    expect(await versionCount(org, record.id)).toBe(1);
+    // A confirmation that isn't exactly the list is refused the same way.
+    for (const confirmTemplateMove of [[], ["note", "extra"], ["extra"]]) {
+      expect(
+        codes(
+          await service.updateRecord(ctx(org), record.id, moved, {
+            expectedVersion: 1,
+            confirmTemplateMove,
+          }),
+        ),
+      ).toEqual(["made_public"]);
+    }
+    expect(
+      codes(
+        await service.updateRecord(ctx(org), record.id, moved, {
+          expectedVersion: 1,
+          confirmTemplateMove: ["Not a key!"],
+        }),
+      ),
+    ).toEqual(["invalid_option"]);
+    const done = ok(
+      await service.updateRecord(ctx(org), record.id, moved, {
+        expectedVersion: 1,
+        confirmTemplateMove: ["note"],
+      }),
+    );
+    expect(done.record.templateKey).toBe("invented-public-object");
+    expect(done.version).toBe(2);
+    // Back to the staff template: nothing becomes public, nothing to confirm.
+    const back = ok(
+      await service.updateRecord(
+        ctx(org),
+        record.id,
+        draftOf(done.record, { templateKey: "invented-object" }),
+        { expectedVersion: 2 },
+      ),
+    );
+    expect(back.version).toBe(3);
+    // A value typed in during the move was never stored as staff.
+    const fresh = await create(org, { ...objectDraft(), fields: {} });
+    expect(
+      ok(
+        await service.updateRecord(
+          ctx(org),
+          fresh.id,
+          draftOf(fresh, {
+            templateKey: "invented-public-object",
+            fields: { note: "Typed in now." },
+          }),
+          { expectedVersion: 1 },
+        ),
+      ).version,
+    ).toBe(2);
+  });
+});
+
+describe("restoring a version under another template (T-012a review)", () => {
+  it("lists an unchanged staff value that lands in a public field, and restores once confirmed", async () => {
+    await ready();
+    const org = await organization();
+    const staffNote = {
+      key: "later-public",
+      organizationId: org,
+      label: "Invented objects, published later",
+      appliesTo: ["object"],
+      fields: [field("note", "text")],
+    };
+    ok(await insertTemplateVersion(s.owner, staffNote));
+    const record = await create(org, {
+      ...objectDraft({ note: "Staff only: invented." }),
+      templateKey: "later-public",
+    });
+    // v2: moved to invented-object, where note is staff too: nothing to confirm.
+    const moved = ok(
+      await service.updateRecord(
+        ctx(org),
+        record.id,
+        draftOf(record, { templateKey: "invented-object" }),
+        { expectedVersion: 1 },
+      ),
+    );
+    expect(moved.version).toBe(2);
+    // The old template now publishes note.
+    ok(
+      await insertTemplateVersion(s.owner, {
+        ...staffNote,
+        fields: [field("note", "text", { visibility: "public" })],
+      }),
+    );
+    const refused = await service.restoreVersion(ctx(org), record.id, 1, { expectedVersion: 2 });
+    expect(codes(refused)).toEqual(["public_field_restored"]);
+    expect(messages(refused)).not.toContain("Staff only");
+    expect(await versionCount(org, record.id)).toBe(2);
+    const restored = await service.restoreVersion(ctx(org), record.id, 1, {
+      expectedVersion: 2,
+      confirmMadePublic: ["note"],
+    });
+    expect(restored.ok).toBe(true);
+    expect(ok(await readStoredRecord(s.owner, org, record.id)).record.templateKey).toBe(
+      "later-public",
+    );
   });
 });
 
