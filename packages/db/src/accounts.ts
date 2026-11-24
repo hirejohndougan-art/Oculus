@@ -733,7 +733,8 @@ export async function signIn(db: Database, input: SignInRequest): Promise<SignIn
   // Made once per process, before anything differs between a known and an
   // unknown address, so the first unknown address doesn't pay for it.
   await dummyPasswordHash();
-  const accountKey = throttleAccountKey(typed);
+  const normalized = normalizeEmail(typed);
+  const accountKey = throttleAccountKey(normalized ?? typed);
   const sourceKey = throttleSourceKey(source);
   const attempt = await takeAttempt(db, accountKey, sourceKey);
   if (!attempt.allowed) {
@@ -744,13 +745,15 @@ export async function signIn(db: Database, input: SignInRequest): Promise<SignIn
       retryAfterSeconds: attempt.retryAfterSeconds,
     };
   }
-  // The same query whatever was typed; an address normalizeEmail refuses
-  // matches nothing (stored addresses are all normalized).
+  // The same query whatever was typed. An address normalizeEmail refuses is
+  // looked up as typed and matches nothing, since every stored address is
+  // normalized (so no Unicode case folding, such as the Kelvin sign to "k",
+  // can reach an account).
   const rows = await db.rows<UserRow>(sql`
     SELECT u.id::text AS id, u.password_hash, u.system_admin, u.disabled_at IS NOT NULL AS disabled,
            ARRAY(SELECT m.organization_id::text FROM public.organization_members m
                  WHERE m.user_id = u.id ORDER BY 1) AS organization_ids
-    FROM public.users u WHERE u.email = ${normalizeEmail(typed) ?? typed.toLowerCase()}`);
+    FROM public.users u WHERE u.email = ${normalized ?? typed}`);
   const user = rows[0];
   let check: PasswordCheck;
   try {

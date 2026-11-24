@@ -654,6 +654,25 @@ describe("signIn", () => {
     expect(JSON.stringify(INVALID_CREDENTIALS)).not.toMatch(/exist|unknown|wrong password/i);
   });
 
+  it("never reaches an account through Unicode case folding of the address", async () => {
+    await ready();
+    const org = await organization();
+    const address = `kat${String(unique())}@example.org`;
+    await member(org, address);
+    // U+212A KELVIN SIGN lower-cases to "k".
+    for (const typed of [`\u212A${address.slice(1)}`]) {
+      expect(typed.toLowerCase()).toBe(address);
+      expect(await signIn(db, { email: typed, password: PASSWORD, source: source() })).toEqual(
+        INVALID_CREDENTIALS,
+      );
+    }
+    expect(
+      await signIn(db, { email: address, password: PASSWORD, source: source() }),
+    ).toMatchObject({
+      ok: true,
+    });
+  });
+
   it("takes about as long for an unknown address as for a wrong password", async () => {
     await ready();
     const org = await organization();

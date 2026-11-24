@@ -28,7 +28,9 @@ const ALL_TABLES = [
   "identifier_counters",
   "identifier_holdings",
   "identifier_types",
+  "invitations",
   "oculus_migrations",
+  "organization_members",
   "organizations",
   "record_identifiers",
   "record_term_index",
@@ -37,9 +39,11 @@ const ALL_TABLES = [
   "record_types",
   "record_versions",
   "records",
+  "sign_in_throttles",
   "template_versions",
   "templates",
   "terms",
+  "users",
 ];
 
 const FIRST = readFileSync(join(defaultMigrationsDir(), "0001_migrations_table.sql"));

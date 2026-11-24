@@ -6,7 +6,8 @@
  * `record-restore.ts`), `identifiers.ts` the
  * identifier tables and `vocabularies.ts` the stored terms and the index of
  * which records use them, all through core's validators; `search.ts` is
- * staff search (STAFF ONLY: never for a public site, D-066).
+ * staff search (STAFF ONLY: never for a public site, D-066); `accounts.ts`
+ * users, invitations and password sign-in (D-068).
  */
 export { sql, joinSql, isSql, Sql, MAX_PARAMETERS } from "./sql.js";
 export type { SqlScalar, SqlValue } from "./sql.js";
