@@ -11,6 +11,8 @@ import {
   type Issue,
   type OrganizationId,
   type RecordId,
+  type SiteId,
+  type UserId,
   type Validated,
 } from "@oculus/core";
 import {
@@ -45,9 +47,12 @@ import {
   type TestDatabase,
 } from "../../db/src/test-database.fixtures.js";
 import { createService, type RecordService, type ServiceResult } from "./service.js";
+import { actorOf, grant, makeSite, people, type People } from "./people.fixtures.js";
 
-const ALICE = "user:3f1c2a9e-8b7d-4c6e-9a5b-1d2e3f4a5b6c";
-const BOB = "user:9b2e4c1a-7d3f-4e8a-b5c6-1a2b3c4d5e6f";
+// Two invented site managers, real accounts (T-041): set in ready().
+let ALICE = "";
+let BOB = "";
+let folks: People;
 const NOW = new Date("2026-11-23T12:00:00.000Z");
 const DENIED = "42501";
 const IDENTITY = "23000";
@@ -144,7 +149,23 @@ async function ready(): Promise<void> {
   s = await setup;
   service = createService(s.writer, { now: () => NOW });
   service2 = createService(s.writer2, { now: () => NOW });
+  people_ ??= (async () => {
+    const holding = newOrganizationId();
+    ok(await insertOrganization(s.owner, { id: holding, name: "Invented Holding Society" }));
+    const made = await people(s.owner, holding);
+    return {
+      folks: made,
+      alice: await made.member(holding, "Alice"),
+      bob: await made.member(holding, "Bob"),
+    };
+  })();
+  const p = await people_;
+  folks = p.folks;
+  ALICE = actorOf(p.alice);
+  BOB = actorOf(p.bob);
 }
+
+let people_: Promise<{ folks: People; alice: UserId; bob: UserId }> | undefined;
 
 afterAll(async () => {
   const done = await setup?.catch(() => undefined);
@@ -245,10 +266,26 @@ async function organization(): Promise<OrganizationId> {
       }),
     ),
   );
+  // Alice and Bob manage the organization's one site (T-041).
+  const site = await makeSite(service, folks.root, org);
+  for (const name of ["Alice", "Bob"]) {
+    const userId = await folks.member(org, name);
+    await grant(service, folks.root, org, { userId, role: "site_manager", siteId: site });
+  }
+  siteOf.set(org, site);
   return org;
 }
 
-const ctx = (organizationId: OrganizationId, actor = ALICE) => ({ organizationId, actor });
+/** Each organization's one site, where Alice and Bob work (D-074). */
+const siteOf = new Map<OrganizationId, SiteId>();
+
+/** The install's system manager, working in the organization's site: deletions' counts. */
+const systemCtx = (organizationId: OrganizationId) => ctx(organizationId, actorOf(folks.root));
+
+const ctx = (organizationId: OrganizationId, actor = ALICE) => {
+  const siteId = siteOf.get(organizationId);
+  return { organizationId, actor, ...(siteId === undefined ? {} : { siteId }) };
+};
 
 function objectDraft(fields: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -1033,7 +1070,9 @@ describe("the writer role", () => {
     const errors: unknown[] = [];
     const readOnly = createService(s.reader, { onError: (e) => errors.push(e) });
     const refused = await readOnly.createRecord(ctx(org), objectDraft());
-    expect(codes(refused)).toEqual(["not_permitted"]);
+    // T-041 renamed this code from not_permitted, which now means the
+    // person's own permissions; this one is the database role's grants.
+    expect(codes(refused)).toEqual(["writer_role_refused"]);
     expect(messages(refused)).not.toMatch(/permission denied|records|public\./);
     expect(errors).toHaveLength(1);
     expect(ok(await readStoredRecord(s.owner, org, record.id)).version).toBe(1);
@@ -2004,15 +2043,20 @@ describe("deleting records", () => {
     const org = await organization();
     const fonds = await create(org, unitDraft("fonds"));
     await create(org, unitDraft("series", fonds.id));
-    expect(codes(await service.deleteRecord(ctx(org), fonds.id, { expectedVersion: 1 }))).toEqual([
-      "has_children",
-    ]);
+    expect(
+      codes(await service.deleteRecord(systemCtx(org), fonds.id, { expectedVersion: 1 })),
+    ).toEqual(["has_children"]);
+    // Anyone but a system manager hears only that something needs it: what
+    // does may be on a site they can't see (D-074).
+    const inUse = await service.deleteRecord(ctx(org), fonds.id, { expectedVersion: 1 });
+    expect(codes(inUse)).toEqual(["in_use"]);
+    expect(messages(inUse)).not.toMatch(/\d/);
     const maker = await create(org, agentDraft);
     const linking = await create(
       org,
       objectDraft({ creator: { recordId: maker.id, label: "A maker" } }),
     );
-    const refused = await service.deleteRecord(ctx(org), maker.id, { expectedVersion: 1 });
+    const refused = await service.deleteRecord(systemCtx(org), maker.id, { expectedVersion: 1 });
     expect(codes(refused)).toEqual(["linked_from"]);
     expect(messages(refused)).not.toContain(linking.id);
     const chair = await create(org, objectDraft(), { identifiers: numbers("DHS-5") });
@@ -2023,13 +2067,16 @@ describe("deleting records", () => {
       templateKey: "invented-asset",
       represents: chair.id,
     });
+    expect(
+      codes(await service.deleteRecord(systemCtx(org), chair.id, { expectedVersion: 1 })),
+    ).toEqual(["represented", "holds_identifiers"]);
     expect(codes(await service.deleteRecord(ctx(org), chair.id, { expectedVersion: 1 }))).toEqual([
-      "represented",
+      "in_use",
       "holds_identifiers",
     ]);
-    expect(codes(await service.deleteRecord(ctx(org), linking.id, { expectedVersion: 5 }))).toEqual(
-      ["version_conflict"],
-    );
+    expect(
+      codes(await service.deleteRecord(systemCtx(org), linking.id, { expectedVersion: 5 })),
+    ).toEqual(["version_conflict"]);
     for (const id of [fonds.id, maker.id, chair.id, linking.id]) {
       expect(await rowExists(org, id)).toBe(true);
     }
@@ -2042,7 +2089,7 @@ describe("deleting records", () => {
         { expectedVersion: 1 },
       ),
     );
-    ok(await service.deleteRecord(ctx(org), maker.id, { expectedVersion: 1 }));
+    ok(await service.deleteRecord(systemCtx(org), maker.id, { expectedVersion: 1 }));
   });
 });
 
@@ -2065,7 +2112,7 @@ describe("deleting a place others point at", () => {
       }),
     );
     for (const target of [town, depot]) {
-      const refused = await service.deleteRecord(ctx(org), target.id, { expectedVersion: 1 });
+      const refused = await service.deleteRecord(systemCtx(org), target.id, { expectedVersion: 1 });
       expect(codes(refused)).toEqual(["linked_from"]);
       expect(await rowExists(org, target.id)).toBe(true);
     }
@@ -2078,7 +2125,7 @@ describe("deleting a place others point at", () => {
         { expectedVersion: 1 },
       ),
     );
-    ok(await service.deleteRecord(ctx(org), town.id, { expectedVersion: 1 }));
+    ok(await service.deleteRecord(systemCtx(org), town.id, { expectedVersion: 1 }));
     expect(await rowExists(org, listed.id)).toBe(true);
   });
 });
@@ -2143,7 +2190,7 @@ describe("two connections at once", () => {
       { expectedVersion: 1 },
     );
     await saved.promise;
-    const deleting = service.deleteRecord(ctx(org), maker.id, { expectedVersion: 1 });
+    const deleting = service.deleteRecord(systemCtx(org), maker.id, { expectedVersion: 1 });
     await someoneWaits();
     go.resolve();
     expect(ok(await saving).version).toBe(2);

@@ -10,6 +10,7 @@
 // invented (example.org is reserved for examples, RFC 2606).
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import {
+  DEFAULT_SESSION_POLICY,
   checkCsrfToken,
   csrfTokenFor,
   hashPassword,
@@ -35,6 +36,7 @@ import { insertOrganization } from "./catalog.js";
 import { runCleanupCli } from "./cleanup-cli.js";
 import { openDatabase, type Database, type Queryable, type Row } from "./client.js";
 import { migrate } from "./migrate.js";
+import { readSystemSettings, writeSystemSettings } from "./permissions.js";
 import { WRITER_PRIVILEGES, checkWriterConnection, grantWriterRole } from "./roles.js";
 import { SECOND_STEP_PROOF_MS, passedSecondStep } from "./second-step.js";
 import {
@@ -592,6 +594,46 @@ describe("full sessions", () => {
         { policy: { idleSeconds: 7200, absoluteSeconds: 3600 } },
       ),
     ).rejects.toThrow(TypeError);
+  });
+
+  it("take their limits from System settings, and defaults when those can't be read", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const limitsOf = async (sessionId: string) =>
+      (
+        await db.rows<{ idle: number; absolute: number }>(sql`
+          SELECT idle_seconds AS idle, absolute_seconds AS absolute FROM public.sessions
+          WHERE id = ${sessionId}::uuid`)
+      )[0];
+    const before = ok(await readSystemSettings(db));
+    try {
+      const changed = ok(
+        await writeSystemSettings(
+          db,
+          { sessionIdleMinutes: 30, sessionAbsoluteMinutes: 600 },
+          before.version,
+          admin,
+        ),
+      );
+      const p = await pending(person, org);
+      expect(await limitsOf(p.sessionId)).toEqual({ idle: 1800, absolute: 36_000 });
+      // A stored document core no longer accepts: the defaults, and the sign-in goes through.
+      await db.execute(sql`
+        UPDATE public.system_settings
+        SET settings = '{"sessionIdleMinutes": 1}'::jsonb, version = version + 1, changed_at = now()`);
+      const q = await pending(person, org);
+      expect(await limitsOf(q.sessionId)).toEqual({
+        idle: DEFAULT_SESSION_POLICY.idleSeconds,
+        absolute: DEFAULT_SESSION_POLICY.absoluteSeconds,
+      });
+      expect(changed.version).toBe(before.version + 1);
+    } finally {
+      const now = await db.rows<{ version: number }>(
+        sql`SELECT version FROM public.system_settings`,
+      );
+      ok(await writeSystemSettings(db, before.settings, now[0]?.version ?? 0, admin));
+    }
   });
 
   it("rotate to a new token and CSRF token, and the old token stops at once", async () => {

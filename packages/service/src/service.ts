@@ -37,6 +37,17 @@
  * now, so a server clock behind the stored time never gets an edit refused
  * (D-063).
  *
+ * **Who may do what** (T-041, D-072, `access.ts`): every operation reads
+ * the actor's access in its own transaction (their user row locked first,
+ * so a revocation is seen or waits) and checks core's permissions before it
+ * touches the record: viewing it, then the operation's own permission at
+ * the record's place in the arrangement, and, when a record moves (a unit's
+ * parent, an asset's represented record), the permission at both the place
+ * it leaves and the place it goes. Restore needs `records.history` as well
+ * as `records.edit` (D-065). A record the actor may not view is refused
+ * exactly as one that doesn't exist. Roles, sites and System settings are
+ * managed through `admin.ts`, also checked here.
+ *
  * **Workflow and publishing** (T-034b, D-075, D-076): `submitForReview`,
  * `returnToDraft`, `publish` and `withdraw` change a record's stored state
  * as its next version (who, when, why), under the record's row lock.
@@ -51,9 +62,7 @@
  * sees at once, so each asks `ServiceOptions.mayChangePublicOutput` first:
  * the hook T-041's `records.publish` permission plugs into.
  *
- * Not here yet: who may do what (T-041 checks permissions in front of these
- * calls; restore needs the permission to read history as well as to edit,
- * D-065), and loans and accessions (no tables yet; when they are stored,
+ * Not here yet: loans and accessions (no tables yet; when they are stored,
  * closing a loan by an accession happens here, from the register and loan
  * book read in the same transaction, never from ones a caller hands in,
  * D-067 for T-018a and S-013).
@@ -72,6 +81,7 @@ import {
   isOrganizationId,
   isPlainObject,
   isRecordId,
+  isSiteId,
   issue,
   newRecordId,
   readPlainData,
@@ -81,11 +91,24 @@ import {
   type Issue,
   type JsonValue,
   type OrganizationId,
+  type Permission,
   type RecordId,
   type RecordIdentifiers,
+  type SiteId,
   type WorkflowAction,
   type WorkflowState,
 } from "@oculus/core";
+import {
+  RecordAccess,
+  createPermissions,
+  publishPermission,
+  editPermissions,
+  noSuchRecord,
+  notPermitted,
+  readAccess,
+  type Refusal,
+} from "./access.js";
+import { adminOperations, type AdminOperations } from "./admin.js";
 import {
   changeWorkflowState,
   checkWriterConnection,
@@ -95,6 +118,7 @@ import {
   isActorId,
   lockArrangement,
   lockDefinition,
+  linkedIds,
   lockRecord,
   publishCheckIssues,
   readOrganization,
@@ -102,6 +126,9 @@ import {
   readRecordPlace,
   readStoredRecord,
   readTemplate,
+  readVersion,
+  grantsScopedTo,
+  hasRecordsBelow,
   readWorkflowState,
   recordCheckIssues,
   refreshRecordTerms,
@@ -112,6 +139,8 @@ import {
   type Database,
   type Queryable,
   type RecordDeletion,
+  type RecordPlace,
+  type RecordPosition,
   type RecordVersion,
   type VersionConflict,
   type WriterRoleProblem,
@@ -126,6 +155,21 @@ export interface ServiceContext {
   readonly organizationId: OrganizationId;
   /** The signed-in person, `user:<uuid v4>`, or a job, `system:<name>` (D-063). */
   readonly actor: string;
+  /**
+   * The site the person is working in (D-074): new records are made there.
+   * Optional (`null` or left out: no site), since a session doesn't carry it
+   * yet (T-045's site selector will); the service checks that the person has
+   * a role on it. Without one, only a system manager can make records (on no
+   * site).
+   */
+  readonly siteId?: SiteId | null;
+}
+
+/** The context as read: the organization, the actor and the working site. */
+interface Who {
+  readonly organizationId: OrganizationId;
+  readonly actor: string;
+  readonly siteId: SiteId | null;
 }
 
 /** A refusal: what is wrong, and for an edit conflict what changed since (names only, T-031). */
@@ -249,13 +293,14 @@ export interface ServiceOptions {
   readonly onError?: (error: unknown, operation: string) => void;
   /**
    * Who may change what the public sees (`PublicChange`), asked in the
-   * operation's transaction before the record is touched: `undefined` to
-   * allow, or the refusal to return (nothing is saved). **The default allows
-   * every actor**, as every other operation does until T-041's permissions
-   * are merged; T-041's merge replaces the default with its check of
-   * `records.publish` where the record is (answering a record the actor
-   * can't view as `unknown_record`, and otherwise `not_permitted`). Errors
-   * it throws fail the operation as `internal_error`.
+   * operation's transaction before the record is changed: `undefined` to
+   * allow, or the refusal to return (nothing is saved). The default is
+   * T-041's `publishPermission`: `records.publish` where the record is (its
+   * home site and units, D-072, D-074), a record that doesn't exist or that
+   * the actor can't view answered alike as `unknown_record`, otherwise
+   * `not_permitted`. A replacement must look the record up itself in
+   * `request.organizationId` and write nothing. Errors it throws fail the
+   * operation as `internal_error`.
    */
   readonly mayChangePublicOutput?: (
     tx: Queryable,
@@ -263,8 +308,16 @@ export interface ServiceOptions {
   ) => Promise<ServiceRefusal | undefined>;
 }
 
-/** The service: every write of a record and its related rows. */
-export interface RecordService {
+/** A record as read (staff view: every field). */
+export interface ReadRecord {
+  readonly record: CatalogRecord;
+  readonly version: number;
+}
+
+/** The service: every write of a record and its related rows, and who may make them. */
+export interface RecordService extends AdminOperations {
+  /** The record as stored, for someone who may view it (`records.view`). */
+  readRecord(context: ServiceContext, recordId: RecordId): Promise<ServiceResult<ReadRecord>>;
   /** Makes a new record from `draft` (no ID: the service makes it), checked, with its version 1. */
   createRecord(
     context: ServiceContext,
@@ -354,6 +407,7 @@ class Refused extends Error {
 /** The draft keys a person edits. */
 const CONTENT_KEYS: ReadonlySet<string> = new Set([
   "kind",
+  "siteId",
   "title",
   "templateKey",
   "recordTypeKey",
@@ -442,20 +496,19 @@ function keyBeyond(value: unknown, allowed: ReadonlySet<string>): string | undef
 
 const WRONG_ORGANIZATION = "This names another organization than the one you are working in.";
 
-/** The context, read safely: the organization and actor, or a refusal. */
-function readContext(
-  context: unknown,
-): ServiceResult<{ organizationId: OrganizationId; actor: string }> {
-  const extra = keyBeyond(context, new Set(["organizationId", "actor"]));
+/** The context, read safely: the organization, actor and working site, or a refusal. */
+function readContext(context: unknown): ServiceResult<Who> {
+  const extra = keyBeyond(context, new Set(["organizationId", "actor", "siteId"]));
   if (extra !== undefined) {
     return refusal(
       ["context", extra],
       "unknown_property",
-      "The context is organizationId and actor.",
+      "The context is organizationId, actor and siteId.",
     );
   }
   const organizationId = ownValue(context, "organizationId");
   const actor = ownValue(context, "actor");
+  const siteId = ownValue(context, "siteId") ?? null;
   if (!isOrganizationId(organizationId)) {
     return refusal(
       ["context", "organizationId"],
@@ -470,7 +523,14 @@ function readContext(
       "The actor is user:<uuid v4> or system:<name>.",
     );
   }
-  return { ok: true, value: { organizationId, actor } };
+  if (siteId !== null && !isSiteId(siteId)) {
+    return refusal(
+      ["context", "siteId"],
+      "invalid_site",
+      "The working site must be a lowercase version 4 UUID, or null.",
+    );
+  }
+  return { ok: true, value: { organizationId, actor, siteId } };
 }
 
 /** Options read safely: only `allowed` keys, own data properties. */
@@ -717,7 +777,7 @@ function cleanError(error: unknown): ServiceRefusal {
     case "42501":
       return refusal(
         [],
-        "not_permitted",
+        "writer_role_refused",
         "The service's database role may not make this change. Check its grants.",
       );
     case "57014":
@@ -727,12 +787,158 @@ function cleanError(error: unknown): ServiceRefusal {
   }
 }
 
-const RETRYABLE_STATES: ReadonlySet<string> = new Set([RETRY, SERIALIZATION]);
-
-/** The default `mayChangePublicOutput`: allows everyone, until T-041's merge (see there). */
-function allowEveryone(): Promise<undefined> {
-  return Promise.resolve(undefined);
+/** Where a record sits, for permissions: its home site, and its parent (a unit) or what it represents (an asset). */
+interface Placed {
+  readonly kind: string;
+  readonly parentId?: RecordId | null;
+  readonly represents?: RecordId | null;
+  readonly siteId?: SiteId | null;
 }
+
+function positionOf(record: Placed): RecordPosition {
+  return {
+    kind: record.kind,
+    parentId: record.kind === "archival_unit" ? (record.parentId ?? null) : null,
+    represents: record.kind === "digital_asset" ? (record.represents ?? null) : null,
+    siteId: record.siteId ?? null,
+  };
+}
+
+/**
+ * A record moving from `before`'s place to `after`'s (a unit's parent, an
+ * asset's represented record, its home site): the person needs the edit
+ * permission at the place it leaves and at the place it goes (T-041,
+ * D-074). Leaving a place they can't change is `not_permitted` (they can
+ * see the record, and so its parent); going to a place they can't see is
+ * refused as a missing parent or represented record would be, and to a
+ * site they have no role on as a site that doesn't exist.
+ */
+async function moveIssues(
+  tx: Queryable,
+  checker: RecordAccess,
+  recordId: RecordId,
+  before: Placed,
+  after: CatalogRecord,
+): Promise<Refusal | undefined> {
+  const from = positionOf(before);
+  const to = positionOf(after);
+  const siteChange = from.siteId !== to.siteId;
+  if (from.parentId === to.parentId && from.represents === to.represents && !siteChange) {
+    return undefined;
+  }
+  const permissions = editPermissions(after.kind);
+  if (siteChange && to.siteId != null && !(await checker.worksOn(to.siteId))) {
+    return unknownSite(["siteId"]);
+  }
+  if (await checker.intoPlace(from, permissions, true)) return notPermitted();
+  const into = await checker.intoPlace(to, permissions, true);
+  if (into) return into;
+  if (siteChange) {
+    const org = after.organizationId;
+    // Grants scoped to a unit on the site it leaves would follow it nowhere
+    // (D-074 review): refused, for everyone, until they are changed. Grants
+    // on every site still hold after the move.
+    if (
+      after.kind === "archival_unit" &&
+      from.siteId != null &&
+      (await grantsScopedTo(tx, org, recordId, { onSite: from.siteId })) > 0
+    ) {
+      return refusal(
+        ["siteId"],
+        "has_role_grants",
+        "Roles on its site are granted for this unit. Change those grants first.",
+      );
+    }
+    // Units filed under it and scans of it stay on its site: only a system
+    // manager leaves them behind (items belong to one site).
+    if (!checker.access.systemManager && (await hasRecordsBelow(tx, org, recordId))) {
+      return refusal(
+        ["siteId"],
+        "in_use_below",
+        "Units or scans below it stay on its site. A system manager can move them.",
+      );
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The refusals of a deletion that count what still needs the record (units
+ * filed under it, scans of it, links to it, role grants on it), for anyone
+ * but a system manager: those may be on sites the person can't see, so they
+ * become one fixed `in_use`, with no count and no kind (D-074).
+ */
+const HIDDEN_USES: ReadonlySet<string> = new Set([
+  "has_children",
+  "represented",
+  "linked_from",
+  "has_role_grants",
+]);
+
+function withoutHiddenUses<T extends { readonly ok: false; readonly issues: readonly Issue[] }>(
+  refused: T,
+): T {
+  if (!refused.issues.some((i) => HIDDEN_USES.has(i.code))) return refused;
+  return {
+    ...refused,
+    issues: [
+      issue(
+        ["recordId"],
+        "in_use",
+        "Other records or role grants still need this record. Remove those first.",
+      ),
+      ...refused.issues.filter((i) => !HIDDEN_USES.has(i.code)),
+    ],
+  };
+}
+
+/** A site the person has no role on, answered as one that doesn't exist. */
+function unknownSite(path: readonly (string | number)[]): ServiceRefusal {
+  return refusal(path, "unknown_site", "There is no such site.");
+}
+
+/**
+ * Whether writing `after` over a record now at `place` moves it in the
+ * arrangement: a unit's parent or level, or what a digital asset
+ * represents. Such a write takes the organization's arrangement lock
+ * (exclusive) before the record's row lock (D-065), so nobody whose
+ * permissions depend on where records sit (scoped grants, which hold the
+ * same lock while they check and write) sees it half done.
+ */
+function movesInArrangement(
+  place: RecordPlace,
+  draft: CatalogRecord | Readonly<Record<string, unknown>>,
+): boolean {
+  const after = draft as {
+    readonly parentId?: unknown;
+    readonly level?: unknown;
+    readonly represents?: unknown;
+    readonly siteId?: unknown;
+  };
+  // A draft or version without a home site keeps the record's (D-074); a
+  // change of home site is a move too (D-074 review: links checked by
+  // `hiddenAmong` must not see it half done).
+  const siteAfter = (after.siteId as SiteId | undefined) ?? place.siteId;
+  if (siteAfter !== place.siteId) return true;
+  if (place.kind === "archival_unit") {
+    return (after.parentId ?? null) !== place.parentId || (after.level ?? null) !== place.level;
+  }
+  if (place.kind === "digital_asset") return (after.represents ?? null) !== place.represents;
+  return false;
+}
+
+/** The refusal that runs the operation again from the start (`run`). */
+function retryRefusal(): ServiceRefusal {
+  return refusal([], "retry", "Other changes were being saved at the same moment. Try again.");
+}
+
+/** The links `after` adds that `before` (if any) doesn't hold. */
+function addedLinks(after: CatalogRecord, before?: CatalogRecord): RecordId[] {
+  const kept = new Set(before === undefined ? [] : linkedIds(before));
+  return linkedIds(after).filter((id) => !kept.has(id));
+}
+
+const RETRYABLE_STATES: ReadonlySet<string> = new Set([RETRY, SERIALIZATION]);
 
 /**
  * A write of a published record that would leave it failing the publish
@@ -761,7 +967,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
     throw new RangeError("attempts is a whole number from 1 to 10.");
   }
   const onError = options.onError;
-  const mayChangePublicOutput = options.mayChangePublicOutput ?? allowEveryone;
+  const mayChangePublicOutput = options.mayChangePublicOutput ?? publishPermission;
   if (typeof mayChangePublicOutput !== "function") {
     throw new TypeError("mayChangePublicOutput is a function.");
   }
@@ -821,10 +1027,15 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         if (!expected.ok) return expected;
         const reason = readReason(opts.value);
         if (!reason.ok) return reason;
-        // Publishing and withdrawing change what the public sees (D-075).
+        // Publishing and withdrawing change what the public sees (D-075):
+        // `records.publish` (mayChangePublicOutput). Sending for review and
+        // back to draft change the record: whoever may edit it (T-041).
         if (action === "publish" || action === "withdraw") {
           const denied = await publicChangeRefused(tx, who, recordId, action);
           if (denied) return denied;
+        } else {
+          const allowed = await mayChange(tx, who, recordId, "no_key_update", [], editPermissions);
+          if (!allowed.ok) return allowed;
         }
         const changed = await changeWorkflowState(tx, org, recordId, action, {
           expectedVersion: expected.value,
@@ -867,10 +1078,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
   async function run<T>(
     operation: string,
     context: unknown,
-    work: (
-      tx: Queryable,
-      who: { organizationId: OrganizationId; actor: string },
-    ) => Promise<ServiceResult<T>>,
+    work: (tx: Queryable, who: Who) => Promise<ServiceResult<T>>,
   ): Promise<ServiceResult<T>> {
     const who = readContext(context);
     if (!who.ok) return who;
@@ -984,6 +1192,68 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
     return refreshed.ok ? undefined : { ok: false, issues: refreshed.issues };
   }
 
+  /** The actor's access, as a `RecordAccess` for this transaction. */
+  async function accessFor(
+    tx: Queryable,
+    who: Who,
+    mode: "write" | "read" = "write",
+  ): Promise<ServiceResult<RecordAccess>> {
+    const access = await readAccess(tx, who.organizationId, who.actor);
+    if (!access.ok) return access;
+    const checker = new RecordAccess(tx, who.organizationId, access.value, mode);
+    // Before any record's place is read (D-065's lock order).
+    await checker.settle();
+    return { ok: true, value: checker };
+  }
+
+  /**
+   * Locks the record's row first, then reads its place: what is checked is
+   * where the record is and stays until COMMIT (nothing can move it while
+   * the row is locked). `undefined` if there is no such record.
+   */
+  async function lockedPlace(
+    tx: Queryable,
+    organizationId: OrganizationId,
+    recordId: RecordId,
+    mode: "no_key_update" | "update" | "share",
+  ): Promise<RecordPlace | undefined> {
+    if ((await lockRecord(tx, organizationId, recordId, mode)) === undefined) return undefined;
+    return readRecordPlace(tx, organizationId, recordId);
+  }
+
+  /**
+   * The actor's access, and the record's place read under its row lock
+   * (`lockedPlace`), refused unless the actor may view it and holds every
+   * one of `all` and any one of `any` there.
+   */
+  async function mayChange(
+    tx: Queryable,
+    who: Who,
+    recordId: RecordId,
+    rowLock: "no_key_update" | "update" | "share",
+    all: readonly Permission[],
+    any: (kind: string) => readonly Permission[] = () => [],
+  ): Promise<
+    { readonly ok: true; readonly place: RecordPlace; readonly checker: RecordAccess } | Refusal
+  > {
+    const allowed = await accessFor(tx, who, rowLock === "share" ? "read" : "write");
+    if (!allowed.ok) return allowed;
+    const place = await lockedPlace(tx, who.organizationId, recordId, rowLock);
+    if (place === undefined) return noSuchRecord();
+    const denied = await allowed.value.onRecord(
+      {
+        kind: place.kind,
+        id: recordId,
+        parentId: place.parentId,
+        represents: place.represents,
+        siteId: place.siteId,
+      },
+      all,
+      any(place.kind),
+    );
+    return denied ?? { ok: true, place, checker: allowed.value };
+  }
+
   return Object.freeze({
     async createRecord(context, draftInput, createOptions) {
       return run("createRecord", context, async (tx, who) => {
@@ -993,11 +1263,22 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         if (!reason.ok) return reason;
         const draft = readDraft(draftInput, who.organizationId, "create");
         if (!draft.ok) return draft;
+        // A new record joins the site the person is working in (D-074); a
+        // draft may name that site, never another.
+        const namedSite = own(draft.value, "siteId");
+        if (namedSite !== undefined && namedSite !== who.siteId) {
+          return refusal(
+            ["siteId"],
+            "wrong_site",
+            "A new record joins the site you are working in.",
+          );
+        }
         const stamp = now();
         if (!stamp.ok) return stamp;
         const valid = validateRecord({
           fields: {},
           ...contentOf(draft.value),
+          ...(who.siteId === null ? {} : { siteId: who.siteId }),
           id: newRecordId(),
           organizationId: who.organizationId,
           createdAt: stamp.value,
@@ -1005,16 +1286,33 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         });
         if (!valid.ok) return valid;
         const record = valid.value;
-        if (record.templateKey === undefined) {
-          return refusal(["templateKey"], "no_template_key", "Every record names its template.");
+        // Who may make it, where it goes (T-041), before any record is locked.
+        const allowed = await accessFor(tx, who);
+        if (!allowed.ok) return allowed;
+        // The working site must be one they have a role on (D-074): any
+        // other is answered as a site that doesn't exist.
+        if (who.siteId !== null && !(await allowed.value.worksOn(who.siteId))) {
+          return unknownSite(["context", "siteId"]);
         }
-        // The arrangement lock before any check of the parent (D-065).
+        // The arrangement lock before the parent is locked and checked (D-065).
         if (record.kind === "archival_unit" && record.parentId !== undefined) {
           await lockArrangement(tx, who.organizationId);
         }
+        const denied = await allowed.value.intoPlace(
+          positionOf(record),
+          createPermissions(record.kind),
+          false,
+        );
+        if (denied) return denied;
+        if (record.templateKey === undefined) {
+          return refusal(["templateKey"], "no_template_key", "Every record names its template.");
+        }
+        // Links to records the actor can't view: as links to none (D-072).
+        const hiddenLinks = await allowed.value.hiddenAmong(addedLinks(record));
         const problems = await recordCheckIssues(tx, record, undefined, {
           messages: "own",
           identifierFields: false,
+          hiddenLinks,
         });
         if (problems.length > 0) return { ok: false, issues: problems };
         const inserted = await insertRecord(tx, record, {
@@ -1071,12 +1369,32 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         }
         const content = contentOf(draft.value);
 
-        // Decide from the row as committed whether the arrangement lock is
-        // needed, and take it before the row's lock (D-065).
-        const place = await readRecordPlace(tx, org, recordId);
-        if (place === undefined) {
-          return refusal(["recordId"], "unknown_record", "The organization has no such record.");
-        }
+        const allowed = await accessFor(tx, who);
+        if (!allowed.ok) return allowed;
+        const checker = allowed.value;
+        // Decide from the row as committed whether the edit moves the record
+        // (a unit's parent or level, an asset's represented record), and if
+        // so take the arrangement lock before the row's lock (D-065). A
+        // person with scoped grants holds it already (RecordAccess).
+        const seen = await readRecordPlace(tx, org, recordId);
+        if (seen === undefined) return noSuchRecord();
+        if (movesInArrangement(seen, content)) await lockArrangement(tx, org);
+        // Then the row, and its place as it stays until COMMIT: that is what
+        // the permissions are checked against.
+        const place = await lockedPlace(tx, org, recordId, "no_key_update");
+        if (place === undefined) return noSuchRecord();
+        const mayEdit = await checker.onRecord(
+          {
+            kind: place.kind,
+            id: recordId,
+            parentId: place.parentId,
+            represents: place.represents,
+            siteId: place.siteId,
+          },
+          [],
+          editPermissions(place.kind),
+        );
+        if (mayEdit) return mayEdit;
         if (content.kind !== undefined && content.kind !== place.kind) {
           return refusal(
             ["kind"],
@@ -1084,17 +1402,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
             "A record's kind never changes; make a new record instead.",
           );
         }
-        if (
-          place.kind === "archival_unit" &&
-          ((content.parentId ?? null) !== place.parentId || content.level !== place.level)
-        ) {
-          await lockArrangement(tx, org);
-        }
-        const locked = await lockRecord(tx, org, recordId);
-        if (locked === undefined) {
-          return refusal(["recordId"], "unknown_record", "The organization has no such record.");
-        }
-        if (locked !== expected.value || place.version !== expected.value) {
+        if (place.version !== expected.value) {
           const conflict = await versionConflict(tx, org, recordId, expected.value);
           return {
             ok: false,
@@ -1102,12 +1410,15 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
               issue(
                 ["options", "expectedVersion"],
                 "version_conflict",
-                `The record was saved by someone else since version ${String(expected.value)}; it is now at version ${String(locked)}. Read it again.`,
+                `The record was saved by someone else since version ${String(expected.value)}; it is now at version ${String(place.version)}. Read it again.`,
               ),
             ],
             ...(conflict === undefined ? {} : { conflict }),
           };
         }
+        // Saved between the first look and the lock: the lock decision may
+        // be stale, so start again.
+        if (seen.version !== place.version) return retryRefusal();
         const stored = await readStoredRecord(tx, org, recordId);
         if (stored === undefined) {
           return refusal(["recordId"], "unknown_record", "The organization has no such record.");
@@ -1132,6 +1443,9 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         if (!stamp.ok) return stamp;
         const valid = validateRecord({
           fields: {},
+          // A draft that leaves out the home site keeps it (D-074): a record
+          // leaves its site only by naming another.
+          ...(before.siteId === undefined ? {} : { siteId: before.siteId }),
           ...content,
           kind: before.kind,
           id: before.id,
@@ -1141,6 +1455,10 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         });
         if (!valid.ok) return valid;
         const record = valid.value;
+        // Moving it (another parent, another represented record) needs the
+        // permission where it leaves and where it goes.
+        const moved = await moveIssues(tx, checker, recordId, before, record);
+        if (moved) return moved;
         if (record.templateKey === undefined) {
           return refusal(["templateKey"], "no_template_key", "Every record names its template.");
         }
@@ -1156,9 +1474,11 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         let version = stored.value.version;
         let saved = before;
         if (compared.value.differences.length > 0) {
+          const hiddenLinks = await checker.hiddenAmong(addedLinks(record, before));
           const problems = await recordCheckIssues(tx, record, before, {
             messages: "own",
             identifierFields: false,
+            hiddenLinks,
           });
           if (problems.length > 0) return { ok: false, issues: problems };
           if (before.templateKey !== record.templateKey) {
@@ -1208,11 +1528,14 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         if (!opts.ok) return opts;
         const confirmed = readConfirmDropped(opts.value);
         if (!confirmed.ok) return confirmed;
-        // The record first, as an update does: its identifier fields are
-        // checked against the new set below, and can't change meanwhile.
-        if ((await lockRecord(tx, org, recordId)) === undefined) {
-          return refusal(["recordId"], "unknown_record", "The organization has no such record.");
-        }
+        // The record's row first, as an update does: its place is checked
+        // as it stays until COMMIT, and its identifier fields are checked
+        // against the new set below and can't change meanwhile. Whoever may
+        // change the record may change its numbers: for a digital asset,
+        // that includes Scanners (media.attach), as when they make or edit
+        // one with its identifiers.
+        const allowed = await mayChange(tx, who, recordId, "no_key_update", [], editPermissions);
+        if (!allowed.ok) return allowed;
         const stored = await readStoredRecord(tx, org, recordId);
         if (!stored?.ok) {
           return refusal(
@@ -1249,6 +1572,57 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         if (!expected.ok) return expected;
         const reason = readReason(opts.value);
         if (!reason.ok) return reason;
+        // Restoring reveals the old version and writes it: history and edit
+        // (D-065), where the record is and wherever the old version puts it.
+        const allowed = await accessFor(tx, who);
+        if (!allowed.ok) return allowed;
+        const checker = allowed.value;
+        // A first look, to decide whether the restore moves the record and
+        // so needs the arrangement lock before the row's (D-065).
+        const seen = await readRecordPlace(tx, org, recordId);
+        if (seen === undefined) return noSuchRecord();
+        const wanted =
+          Number.isInteger(version) && version >= 1 && version < 2 ** 31 - 1
+            ? await readVersion(tx, org, recordId, version)
+            : undefined;
+        // A version without a home site keeps the record's (D-074).
+        const stored = wanted?.ok ? wanted.value.record : undefined;
+        const old =
+          stored !== undefined && stored.siteId === undefined && seen.siteId !== null
+            ? ({ ...stored, siteId: seen.siteId } as CatalogRecord)
+            : stored;
+        if (old !== undefined && movesInArrangement(seen, old)) await lockArrangement(tx, org);
+        // Then the row, and the place it is checked at, as it stays until COMMIT.
+        const place = await lockedPlace(tx, org, recordId, "no_key_update");
+        if (place === undefined) return noSuchRecord();
+        const mayRestore = await checker.onRecord(
+          {
+            kind: place.kind,
+            id: recordId,
+            parentId: place.parentId,
+            represents: place.represents,
+            siteId: place.siteId,
+          },
+          ["records.history"],
+          editPermissions(place.kind),
+        );
+        if (mayRestore) return mayRestore;
+        // Saved between the first look and the lock (and still at the
+        // version the person saw): the lock decision may be stale.
+        if (place.version === expected.value && seen.version !== place.version) {
+          return retryRefusal();
+        }
+        let hiddenLinks: ReadonlySet<RecordId> = new Set();
+        if (old !== undefined) {
+          const moved = await moveIssues(tx, checker, recordId, place, old);
+          if (moved) return moved;
+          if (!checker.access.systemManager) {
+            const current = await readStoredRecord(tx, org, recordId);
+            hiddenLinks = await checker.hiddenAmong(
+              addedLinks(old, current?.ok ? current.value.record : undefined),
+            );
+          }
+        }
         const stamp = clock();
         const confirm = own(opts.value, "confirmMadePublic");
         const restored = await restoreStoredVersion(
@@ -1263,6 +1637,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           },
           {
             now: stamp,
+            hiddenLinks,
             ...(confirm === undefined ? {} : { confirmMadePublic: confirm as readonly string[] }),
           },
         );
@@ -1297,14 +1672,47 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         if (!expected.ok) return expected;
         const reason = readReason(opts.value);
         if (!reason.ok) return reason;
-        return deleteStoredRecord(tx, who.organizationId, recordId, {
+        // The row first (FOR UPDATE, as the deletion itself takes it), then
+        // the check at its place as it stays until COMMIT.
+        const allowed = await mayChange(tx, who, recordId, "update", ["records.delete"]);
+        if (!allowed.ok) return allowed;
+        const deleted = await deleteStoredRecord(tx, who.organizationId, recordId, {
           expectedVersion: expected.value,
           actor: who.actor,
           ...(reason.value === undefined ? {} : { reason: reason.value }),
         });
+        if (deleted.ok || allowed.checker.access.systemManager) return deleted;
+        return withoutHiddenUses(deleted);
       });
     },
 
+    async readRecord(context, recordId) {
+      return run("readRecord", context, async (tx, who) => {
+        if (!isRecordId(recordId)) {
+          return refusal(["recordId"], "invalid_id", "A record ID is a lowercase version 4 UUID.");
+        }
+        // A read: the arrangement lock (for scoped grants) is shared, so
+        // reads run side by side but never see a move half done, and the
+        // row is locked FOR SHARE, so it stays where it was checked.
+        const allowed = await mayChange(tx, who, recordId, "share", []);
+        if (!allowed.ok) return allowed;
+        const stored = await readStoredRecord(tx, who.organizationId, recordId);
+        if (stored === undefined) return noSuchRecord();
+        if (!stored.ok) {
+          return refusal(
+            ["recordId"],
+            "unreadable_record",
+            "The stored record no longer reads as a valid record; it needs repair.",
+          );
+        }
+        return {
+          ok: true,
+          value: Object.freeze({ record: stored.value.record, version: stored.value.version }),
+        };
+      });
+    },
+
+    ...adminOperations(run),
     submitForReview: workflowAction("submit_for_review"),
     returnToDraft: workflowAction("return_to_draft"),
     publish: workflowAction("publish"),

@@ -11,7 +11,9 @@
  * which records use them, all through core's validators; `search.ts` is
  * staff search (STAFF ONLY: never for a public site, D-066); `accounts.ts`
  * users, invitations and password sign-in (D-068); `sessions.ts` sessions
- * (D-069; promotion past the second step is internal, for T-038 only).
+ * (D-069; promotion past the second step is internal, for T-038 only);
+ * `permissions.ts` sites, role assignments, System settings and a person's
+ * access, read under locks (D-072).
  */
 export { sql, joinSql, isSql, Sql, MAX_PARAMETERS } from "./sql.js";
 export type { SqlScalar, SqlValue } from "./sql.js";
@@ -161,6 +163,38 @@ export type {
   SignInResult,
   Membership,
 } from "./accounts.js";
+export {
+  PERMISSION_TABLE_PRIVILEGES,
+  loadAccess,
+  lockPersonForRoleChange,
+  lockPeopleForRoleChange,
+  unitsHolding,
+  sitesSharedInto,
+  insertSite,
+  readSite,
+  renameSite,
+  sitesForPerson,
+  insertRoleAssignment,
+  readRoleAssignment,
+  deleteRoleAssignment,
+  listRoleAssignments,
+  isAssignmentCursor,
+  MAX_ASSIGNMENT_PAGE,
+  DEFAULT_ASSIGNMENT_PAGE,
+  isMember,
+  grantsScopedTo,
+  hasRecordsBelow,
+  readSystemSettings,
+  writeSystemSettings,
+} from "./permissions.js";
+export type {
+  RecordPosition,
+  SiteChoice,
+  RoleAssignment,
+  RoleAssignmentPage,
+  NewRoleAssignment,
+  StoredSystemSettings,
+} from "./permissions.js";
 export {
   beginSession,
   readPendingSession,
