@@ -16,4 +16,8 @@ export type {
   IdentifierOptions,
   RestoreOptions,
   DeleteOptions,
+  WorkflowOptions,
+  WorkflowChange,
+  PublicChange,
+  PublicChangeRequest,
 } from "./service.js";
