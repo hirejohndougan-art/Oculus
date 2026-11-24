@@ -21,6 +21,7 @@
 import { ACCOUNT_TABLE_PRIVILEGES } from "./accounts.js";
 import { PERMISSION_TABLE_PRIVILEGES } from "./permissions.js";
 import type { Queryable } from "./client.js";
+import { SESSION_TABLE_PRIVILEGES } from "./sessions.js";
 import { sql } from "./sql.js";
 
 /**
@@ -61,6 +62,9 @@ export const WRITER_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Ob
   // DELETE, never changed in place; the one System settings row is made
   // once and then updated.
   ...PERMISSION_TABLE_PRIVILEGES,
+  // Sessions (D-069): made at sign-in and on a change of organization,
+  // refreshed, promoted and rotated, deleted at sign-out and by the cleanup.
+  ...SESSION_TABLE_PRIVILEGES,
 });
 
 /**

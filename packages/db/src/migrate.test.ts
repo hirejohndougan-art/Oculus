@@ -40,6 +40,7 @@ const ALL_TABLES = [
   "record_versions",
   "records",
   "role_assignments",
+  "sessions",
   "sign_in_throttles",
   "sites",
   "system_settings",

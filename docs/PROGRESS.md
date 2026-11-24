@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 02:11 CT — manual (John: "continue on phase 2") — T-037 Sessions
+- Result: done
+- What changed: migration `0010_sessions.sql` and `packages/db/src/sessions.ts`: hashed 256-bit tokens in one spelling, a 10-minute second-step stage that grants nothing until T-038 promotes it (no exported way to skip it), 4 h idle and 12 h absolute limits checked by the database, one organization per session, new tokens at promotion, switch, rotation and re-entering the password, a person's own session list, sign-out and "sign out everywhere else", admin sign-out of a user (re-entered password required), `users.sessions_valid_after` so disabling, resets and "end all" kill every older session, user-row-first locking, a derived CSRF token, `npm run db:cleanup`. Also two flaky tests fixed (concurrent invitations may now answer `superseded`; the password timing test uses a median of nine).
+- Decisions: D-069
+- Review: three independent rounds (revocation racing an organization switch; a sign-in finishing after a reset; lock order; error mapping); all fixed with tests.
+- Gate: PASS · tests_passing 3663 (was 3605) · npm audit clean
+- Next: T-038 two-step sign-in and T-039 password reset; T-041 and T-034b/c in progress (claimed in the roadmap so nightly runs skip them)
+
 ## 2026-11-24 00:39 CT — build — T-034a Workflow states in core
 - Result: done
 - What changed: T-034 split into T-034a to T-034e (parent `[~]`). New `packages/core/src/workflow.ts`: the four states (draft, ready for review, published, withdrawn; new records start as draft; only published is public), four actions (`submit_for_review`, `return_to_draft`, `publish`, `withdraw`) and the allowed moves (`workflowTransition`, `applyWorkflowAction`, `workflowMoves`); a published record leaves the public only by withdrawing; `changesPublicOutput` marks the two actions that need the publish permission. T-035 now carries the approval-step narrowing. Main moved during the run (T-044, U-005 by a manual session), so the work was rebased and the gate re-run.
