@@ -272,6 +272,8 @@ export type {
 
 export { checkRightsValue, makeIdentifierChecker } from "./field-checkers.js";
 export { makeRecordLinkChecker } from "./record-links.js";
+export { compareRecords, sameJson } from "./record-compare.js";
+export type { RecordChangeKind, RecordDifference, RecordComparison } from "./record-compare.js";
 export {
   DEFAULT_STALE_LINK_LABELS,
   MAX_STALE_LINK_LABELS,
