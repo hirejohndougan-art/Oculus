@@ -1576,6 +1576,83 @@ describe("creating records", () => {
   });
 });
 
+describe("moving a record to another template (T-012a)", () => {
+  it("refuses until the person confirms the stored staff values the new template publishes", async () => {
+    await ready();
+    const org = await organization();
+    ok(
+      await insertTemplateVersion(s.owner, {
+        key: "invented-public-object",
+        organizationId: org,
+        label: "Invented objects, published",
+        appliesTo: ["object"],
+        fields: [field("note", "text", { visibility: "public" }), field("extra", "text")],
+      }),
+    );
+    const record = await create(org, objectDraft({ note: "Staff only: invented." }));
+    const moved = draftOf(record, { templateKey: "invented-public-object" });
+    const refused = await service.updateRecord(ctx(org), record.id, moved, {
+      expectedVersion: 1,
+    });
+    expect(codes(refused)).toEqual(["made_public"]);
+    expect(refused.ok ? [] : refused.issues.map((i) => i.path)).toEqual([["fields", "note"]]);
+    expect(messages(refused)).not.toContain("Staff only");
+    expect(await versionCount(org, record.id)).toBe(1);
+    // A confirmation that isn't exactly the list is refused the same way.
+    for (const confirmTemplateMove of [[], ["note", "extra"], ["extra"]]) {
+      expect(
+        codes(
+          await service.updateRecord(ctx(org), record.id, moved, {
+            expectedVersion: 1,
+            confirmTemplateMove,
+          }),
+        ),
+      ).toEqual(["made_public"]);
+    }
+    expect(
+      codes(
+        await service.updateRecord(ctx(org), record.id, moved, {
+          expectedVersion: 1,
+          confirmTemplateMove: ["Not a key!"],
+        }),
+      ),
+    ).toEqual(["invalid_option"]);
+    const done = ok(
+      await service.updateRecord(ctx(org), record.id, moved, {
+        expectedVersion: 1,
+        confirmTemplateMove: ["note"],
+      }),
+    );
+    expect(done.record.templateKey).toBe("invented-public-object");
+    expect(done.version).toBe(2);
+    // Back to the staff template: nothing becomes public, nothing to confirm.
+    const back = ok(
+      await service.updateRecord(
+        ctx(org),
+        record.id,
+        draftOf(done.record, { templateKey: "invented-object" }),
+        { expectedVersion: 2 },
+      ),
+    );
+    expect(back.version).toBe(3);
+    // A value typed in during the move was never stored as staff.
+    const fresh = await create(org, { ...objectDraft(), fields: {} });
+    expect(
+      ok(
+        await service.updateRecord(
+          ctx(org),
+          fresh.id,
+          draftOf(fresh, {
+            templateKey: "invented-public-object",
+            fields: { note: "Typed in now." },
+          }),
+          { expectedVersion: 1 },
+        ),
+      ).version,
+    ).toBe(2);
+  });
+});
+
 describe("updating records", () => {
   it("writes the next version with updatedAt never going backwards, and refreshes the terms", async () => {
     await ready();

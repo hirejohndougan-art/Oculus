@@ -16,10 +16,13 @@
  * - `key_reused`: a new field uses a key the old template lacked, and records
  *   hold left-over values for it, which will now be read as the new field's.
  *   Without records, every new field is reported.
- * - `kind_added`: `appliesTo` gains a record kind. Records of that kind may
- *   hold values (stored under another template, possibly staff) under keys
- *   this template publishes. Needs confirmation when the template has any
- *   public field.
+ * - `kind_added`: `appliesTo` gains a record kind. A record's template is
+ *   the one its `templateKey` names (D-029), so this moves no record of
+ *   another template here; moving one is a record edit, compared with
+ *   `templateMoveChanges`. Needs confirmation when the template has a public
+ *   field and records weren't given, or some given records are of that kind
+ *   (keyless ones a lookup might put here, or this template's own that the
+ *   old `appliesTo` refused).
  * - `key_removed`: a field is gone; records keep its values as left-overs.
  * - `kind_changed`: stored values may no longer fit the field.
  * - `repeatable_changed`: stored lists or single values no longer fit; when
@@ -619,7 +622,9 @@ function finish(f: Found, usage: Usage | undefined): TemplateChange {
       needsConfirmation = f.nowInherited === true;
       break;
     case "kind_added":
-      needsConfirmation = f.hasPublic === true;
+      // Records are picked by templateKey (T-012a): only the given records
+      // of that kind, or unknown records, can come under this template.
+      needsConfirmation = f.hasPublic === true && affected;
       break;
     case "key_removed":
       needsConfirmation = affected || f.wasInherited === true;
@@ -673,7 +678,7 @@ function message(f: Found, count: number | undefined, several: number): string {
         count === undefined
           ? "Records weren't checked."
           : `${records(count)} of that kind were given.`
-      }${f.hasPublic === true ? " Their values under this template's public field keys, including ones stored as staff, would be published. Confirm first." : ""}`;
+      }${f.hasPublic === true && count !== 0 ? " Their values under this template's public field keys, including ones stored as staff, would be published. Confirm first." : ""}`;
     case "kind_changed":
       return `The field ${key} changes kind. ${held} Those values may no longer fit.`;
     case "repeatable_changed":
@@ -802,4 +807,201 @@ function readRecords(input: unknown): Validated<readonly CatalogRecord[]> {
     out.push(checked.value);
   }
   return { ok: true, value: out };
+}
+
+// ---------------------------------------------------------------------------
+// Moving one record to another template (T-012a, D-029)
+
+export const TEMPLATE_MOVE_CODES = [
+  "made_public",
+  "made_staff",
+  "left_over",
+  "kind_changed",
+  "now_inherited",
+] as const;
+export type TemplateMoveCode = (typeof TEMPLATE_MOVE_CODES)[number];
+
+/** One field key whose meaning changes for a record that moves to another template. */
+export interface TemplateMoveChange {
+  readonly code: TemplateMoveCode;
+  /** The field key. */
+  readonly key: string;
+  /** True when a person must confirm it before the record is saved. */
+  readonly needsConfirmation: boolean;
+  /** Plain English; names the key, never a stored value. */
+  readonly message: string;
+}
+
+export interface TemplateMoveChanges {
+  /** Every change, frozen, sorted by key, then in `TEMPLATE_MOVE_CODES` order. */
+  readonly changes: readonly TemplateMoveChange[];
+  /** True if any change needs confirmation. */
+  readonly needsConfirmation: boolean;
+}
+
+/**
+ * What changes for a record's values when it moves from `fromTemplate` to
+ * `toTemplate` (its `templateKey` changes), as `templateChanges` does for a
+ * template edit. `before` is the record as stored (following `fromTemplate`,
+ * or keyless), `after` the record about to be saved (naming `toTemplate`).
+ * Only keys both copies hold a value for are compared: a value typed in
+ * during the move was never stored under the old template. For each:
+ *
+ * - `made_public`: staff in the old template, or not a field there (a
+ *   left-over, which is staff), and public in the new one. Saving would
+ *   publish a value stored as staff. Always needs confirmation.
+ * - `now_inherited`: inherited in the new template and not in the old, so
+ *   lower levels (including ones using other templates) take the value.
+ *   Needs confirmation.
+ * - `left_over`: a field of the old template the new one lacks; the value
+ *   stays as a staff-only left-over.
+ * - `kind_changed`: both have the field with different kinds; the record
+ *   check against the new template says whether the value still fits.
+ * - `made_staff`: public in the old template, staff in the new.
+ *
+ * Refuses, with issues, two versions of one template (`same_template`; use
+ * `templateChanges`), a `before` and `after` that aren't one record
+ * (`different_records`), records naming other templates
+ * (`record_not_for_template`), and anything of another organization
+ * (`mixed_organizations`). Both templates are read with
+ * `validateLegacyTemplate` for the old side and `validateTemplate` for the
+ * new. Messages name keys only. Never throws.
+ */
+export function templateMoveChanges(
+  before: unknown,
+  after: unknown,
+  fromTemplate: unknown,
+  toTemplate: unknown,
+): Validated<TemplateMoveChanges> {
+  try {
+    return compareMove(before, after, fromTemplate, toTemplate);
+  } catch {
+    return {
+      ok: false,
+      issues: [issue([], "unreadable", "These templates or records could not be read.")],
+    };
+  }
+}
+
+function compareMove(
+  beforeInput: unknown,
+  afterInput: unknown,
+  fromInput: unknown,
+  toInput: unknown,
+): Validated<TemplateMoveChanges> {
+  const issues: Issue[] = [];
+  const from = validateLegacyTemplate(fromInput);
+  if (!from.ok) issues.push(...prefixed("fromTemplate", from.issues));
+  const to = validateTemplate(toInput);
+  if (!to.ok) issues.push(...prefixed("toTemplate", to.issues));
+  const before = validateRecord(beforeInput);
+  if (!before.ok)
+    issues.push(issue(["before"], "invalid_record", "The stored record is not valid."));
+  const after = validateRecord(afterInput);
+  if (!after.ok) issues.push(issue(["after"], "invalid_record", "The edited record is not valid."));
+  if (!from.ok || !to.ok || !before.ok || !after.ok) return { ok: false, issues };
+  const organizationId = to.value.organizationId;
+  if (
+    from.value.organizationId !== organizationId ||
+    before.value.organizationId !== organizationId ||
+    after.value.organizationId !== organizationId
+  ) {
+    return {
+      ok: false,
+      issues: [mixedOrganizationsIssue([], "These templates and records")],
+    };
+  }
+  if (from.value.key === to.value.key) {
+    return {
+      ok: false,
+      issues: [
+        issue(
+          ["toTemplate", "key"],
+          "same_template",
+          `Both are versions of ${shown(to.value.key)}; compare template versions with templateChanges.`,
+        ),
+      ],
+    };
+  }
+  if (before.value.id !== after.value.id) {
+    return {
+      ok: false,
+      issues: [issue(["after", "id"], "different_records", "These are two different records.")],
+    };
+  }
+  const beforeKey = own(before.value, "templateKey");
+  if (beforeKey !== undefined && beforeKey !== from.value.key) {
+    return {
+      ok: false,
+      issues: [
+        issue(
+          ["before", "templateKey"],
+          "record_not_for_template",
+          `The stored record doesn't follow ${shown(from.value.key)}.`,
+        ),
+      ],
+    };
+  }
+  if (own(after.value, "templateKey") !== to.value.key) {
+    return {
+      ok: false,
+      issues: [
+        issue(
+          ["after", "templateKey"],
+          "record_not_for_template",
+          `The edited record doesn't name ${shown(to.value.key)} as its template.`,
+        ),
+      ],
+    };
+  }
+  const oldFields = byKey(from.value);
+  const newFields = byKey(to.value);
+  const held = Object.keys(after.value.fields)
+    .filter(
+      (key) =>
+        after.value.fields[key] !== undefined &&
+        Object.hasOwn(before.value.fields, key) &&
+        before.value.fields[key] !== undefined,
+    )
+    .sort();
+  const changes: TemplateMoveChange[] = [];
+  const add = (code: TemplateMoveCode, key: string, needsConfirmation: boolean): void => {
+    changes.push(
+      Object.freeze({ code, key, needsConfirmation, message: moveMessage(code, shown(key)) }),
+    );
+  };
+  for (const key of held) {
+    const was = oldFields.get(key);
+    const now = newFields.get(key);
+    const wasPublic = was?.visibility === "public";
+    if (now?.visibility === "public" && !wasPublic) add("made_public", key, true);
+    if (was !== undefined && now === undefined) add("left_over", key, false);
+    if (was !== undefined && now !== undefined) {
+      if (was.kind !== now.kind) add("kind_changed", key, false);
+      if (wasPublic && now.visibility === "staff") add("made_staff", key, false);
+    }
+    if (now?.inherited === true && was?.inherited !== true) add("now_inherited", key, true);
+  }
+  return {
+    ok: true,
+    value: Object.freeze({
+      changes: Object.freeze(changes),
+      needsConfirmation: changes.some((c) => c.needsConfirmation),
+    }),
+  };
+}
+
+function moveMessage(code: TemplateMoveCode, key: string): string {
+  switch (code) {
+    case "made_public":
+      return `In the new template the field ${key} is public, but this record's value for it was stored as staff only. Saving publishes it. Confirm first.`;
+    case "now_inherited":
+      return `In the new template the field ${key} is inherited, so lower levels, including ones using other templates, take this record's value. Confirm first.`;
+    case "left_over":
+      return `The new template has no field ${key}; this record's value stays as a staff-only left-over.`;
+    case "kind_changed":
+      return `The field ${key} is of another kind in the new template; the value may no longer fit.`;
+    case "made_staff":
+      return `The field ${key} is staff only in the new template, so its value will no longer be published.`;
+  }
 }

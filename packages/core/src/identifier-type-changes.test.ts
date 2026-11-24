@@ -529,6 +529,56 @@ describe("identifierTypeChanges", () => {
     expect(summary(ok(identifierTypeChanges(pub, BOX)))).toEqual([["made_staff", true, []]]);
   });
 
+  it("making a type staff picks each record's template by its templateKey (T-012a)", () => {
+    const pub = { ...BOX, public: true };
+    const tpl = (key: string, visibility: string) => ({
+      key,
+      label: key,
+      organizationId: ORG,
+      appliesTo: ["object"],
+      fields: [
+        {
+          key: "number",
+          label: "Number",
+          kind: "identifier",
+          required: false,
+          repeatable: true,
+          visibility,
+          inherited: false,
+        },
+      ],
+    });
+    const value = { number: [{ type: "box", value: "12" }] };
+    const records = [
+      // Its own template's field is staff, though another template of its
+      // kind has it public: not affected.
+      { ...record(A, value), templateKey: "staff-objects" },
+      // Its own template's field is public: affected.
+      { ...record(B, value), templateKey: "public-objects" },
+      // Its template isn't among those given: counted, to be safe.
+      { ...record(C, value), templateKey: "unlisted" },
+    ];
+    const r = ok(
+      identifierTypeChanges(pub, BOX, {
+        identifierTypes: [ACCESSION, pub],
+        identifiers: [],
+        records,
+        templates: [tpl("staff-objects", "staff"), tpl("public-objects", "public")],
+      }),
+    );
+    expect(summary(r)).toEqual([["made_staff", true, [B, C]]]);
+    // With only staff templates given, only the unlisted template's record.
+    const staffOnly = ok(
+      identifierTypeChanges(pub, BOX, {
+        identifierTypes: [ACCESSION, pub],
+        identifiers: [],
+        records,
+        templates: [tpl("staff-objects", "staff"), tpl("public-objects", "staff")],
+      }),
+    );
+    expect(summary(staffOnly)).toEqual([["made_staff", true, [C]]]);
+  });
+
   it("without records, every change that could affect records needs confirmation", () => {
     const r = ok(
       identifierTypeChanges(BOX, {

@@ -70,6 +70,7 @@ import {
 } from "./plain-data.js";
 import { types } from "node:util";
 import { isRecordId, type RecordId } from "./record-id.js";
+import { validateRecord, type CatalogRecord } from "./records.js";
 import {
   isOrganizationId,
   mixedOrganizationsIssue,
@@ -1263,6 +1264,16 @@ function formatAutoNumber(auto: AutoNumbering, n: number, year: number): string 
  * numbering needs the `year` (the organization's own calendar year, which the
  * caller knows and this module doesn't) and restarts at 1 each year.
  *
+ * `options.records` (T-012a), when given, are catalog records whose template
+ * `identifier` fields' `{ type, value }` count as held numbers too. Every
+ * saved field value names one of the record's current identifiers (D-038),
+ * so for data saved through the service they add nothing; for records from
+ * elsewhere (an import, data stored before that rule) a number held only in
+ * a field is then never given out again. Any `{ type, value }` of the type
+ * in any field counts, since a record doesn't say which fields are
+ * identifier fields; counting too many only skips numbers. Each record is
+ * validated (`invalid_record`) and must be of the type's organization.
+ *
  * Fails, rather than guessing, when the type has no auto-numbering, the year
  * is missing, the numbers have run out, or the next number won't fit the
  * type's format (`DHS-####` after `DHS-9999`), or the records and the type
@@ -1271,13 +1282,15 @@ function formatAutoNumber(auto: AutoNumbering, n: number, year: number): string 
 export function nextIdentifier(
   typeInput: IdentifierType,
   allInput: readonly RecordIdentifiers[],
-  options: { readonly year?: number } = {},
+  options: { readonly year?: number; readonly records?: readonly CatalogRecord[] } = {},
 ): Validated<string> {
   const snap = snapshot(allInput, [typeInput]);
   if (!snap.ok) return snap;
   const { sets: all } = snap.value;
   const type = snap.value.types[0];
   if (type === undefined) return fail("unreadable", "The identifier type could not be read.");
+  const inFields = fieldNumbers(ownOption(options, "records"), type);
+  if (!inFields.ok) return inFields;
   const auto = type.autoNumber;
   if (auto === undefined) {
     return fail("no_auto_number", `${type.label} numbers are not given out automatically.`);
@@ -1325,6 +1338,7 @@ export function nextIdentifier(
     for (const item of set.current) consider(item.type, item.value);
     for (const item of set.former) consider(item.type, item.value);
   }
+  for (const value of inFields.value) consider(type.key, value);
   const next = highest + 1;
   if (next > MAX_AUTO_NUMBER) {
     return fail("numbers_exhausted", `${type.label} numbers have run out.`);
@@ -1337,6 +1351,62 @@ export function nextIdentifier(
     );
   }
   return { ok: true, value };
+}
+
+/** An own data property of `options`, never a getter's or an inherited one. */
+function ownOption(options: unknown, name: string): unknown {
+  if (typeof options !== "object" || options === null) return undefined;
+  const d = Object.getOwnPropertyDescriptor(options, name);
+  return d !== undefined && "value" in d ? (d.value as unknown) : undefined;
+}
+
+/**
+ * The values of `type` in the records' fields (`{ type, value }` items, one
+ * or in a list), for `nextIdentifier`'s `records` option. Every record is
+ * validated and must be of the type's organization.
+ */
+function fieldNumbers(input: unknown, type: IdentifierType): Validated<readonly string[]> {
+  if (input === undefined) return { ok: true, value: [] };
+  if (types.isProxy(input) || !Array.isArray(input)) {
+    return {
+      ok: false,
+      issues: [issue(["records"], "not_a_list", "The records must be given as a list.")],
+    };
+  }
+  const length = input.length;
+  if (length > MAX_IDENTIFIER_SETS) {
+    return fail(
+      "too_many_records",
+      `At most ${String(MAX_IDENTIFIER_SETS)} records can be looked through at once.`,
+    );
+  }
+  const values: string[] = [];
+  for (let i = 0; i < length; i += 1) {
+    const slot = Object.getOwnPropertyDescriptor(input, i);
+    const checked = validateRecord(slot !== undefined && "value" in slot ? slot.value : undefined);
+    if (!checked.ok) {
+      return {
+        ok: false,
+        issues: [
+          issue(["records", i], "invalid_record", `Record ${String(i)} is not a valid record.`),
+        ],
+      };
+    }
+    if (checked.value.organizationId !== type.organizationId) {
+      return { ok: false, issues: [MIXED()] };
+    }
+    for (const value of Object.values(checked.value.fields)) {
+      const list: readonly unknown[] = Array.isArray(value) ? value : [value];
+      for (const item of list) {
+        if (!isPlainObject(item)) continue;
+        if (Object.hasOwn(item, "type") && item.type === type.key) {
+          const v = Object.hasOwn(item, "value") ? item.value : undefined;
+          if (typeof v === "string") values.push(v);
+        }
+      }
+    }
+  }
+  return { ok: true, value: values };
 }
 
 // ---------------------------------------------------------------------------

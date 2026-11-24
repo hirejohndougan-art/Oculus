@@ -54,12 +54,14 @@ import {
   compareRecords,
   droppedIdentifiers,
   identifierFieldIssues,
+  isFieldKey,
   isOrganizationId,
   isPlainObject,
   isRecordId,
   issue,
   newRecordId,
   readPlainData,
+  templateMoveChanges,
   validateRecord,
   type CatalogRecord,
   type Issue,
@@ -149,6 +151,12 @@ export interface UpdateOptions {
   readonly identifiers?: unknown;
   /** The numbers the person confirmed may be dropped (`numbers_dropped`). */
   readonly confirmDropped?: readonly DroppedNumber[];
+  /**
+   * When the record moves to another template (its `templateKey` changes,
+   * T-012a): the field keys the person confirmed, exactly those of the
+   * `made_public` and `now_inherited` issues `templateMoveChanges` gave.
+   */
+  readonly confirmTemplateMove?: readonly string[];
   readonly reason?: string;
 }
 
@@ -383,6 +391,61 @@ function readOptions(options: unknown, allowed: readonly string[]): ServiceResul
     );
   }
   return plainCopy(options, IDENTIFIER_LIMITS, "options");
+}
+
+/** At most this many confirmed field keys (no template has more fields). */
+const MAX_CONFIRMED_KEYS = 1_000;
+
+function readConfirmTemplateMove(options: Plain): ServiceResult<ReadonlySet<string> | undefined> {
+  const confirm = own(options, "confirmTemplateMove");
+  if (confirm === undefined) return { ok: true, value: undefined };
+  if (
+    !Array.isArray(confirm) ||
+    confirm.length > MAX_CONFIRMED_KEYS ||
+    !confirm.every((key) => isFieldKey(key))
+  ) {
+    return refusal(
+      ["options", "confirmTemplateMove"],
+      "invalid_option",
+      "This is the list of field keys the person confirmed.",
+    );
+  }
+  return { ok: true, value: new Set(confirm) };
+}
+
+/**
+ * A record moving to another template (T-012a, D-029): what its stored
+ * values become under the new one (`templateMoveChanges`). Values stored as
+ * staff that the new template publishes, or makes inherited, are refused
+ * until `confirmTemplateMove` lists exactly those field keys. The new
+ * template is locked and read by `recordCheckIssues` already; the old one
+ * is locked here too, so neither changes before COMMIT.
+ */
+async function templateMoveIssues(
+  tx: Queryable,
+  before: CatalogRecord,
+  after: CatalogRecord,
+  confirmed: ReadonlySet<string> | undefined,
+): Promise<Issue[]> {
+  const org = after.organizationId;
+  const unreadable = [
+    issue(["templateKey"], "unknown_template", "The record's templates can't be read."),
+  ];
+  const toKey = after.templateKey ?? "";
+  // A stored record always names its template (0002: NOT NULL).
+  const fromKey = before.templateKey ?? "";
+  await lockDefinition(tx, org, "template", fromKey);
+  const [from, to] = [await readTemplate(tx, org, fromKey), await readTemplate(tx, org, toKey)];
+  if (!from?.ok || !to?.ok) return unreadable;
+  const changes = templateMoveChanges(before, after, from.value.template, to.value.template);
+  if (!changes.ok) return unreadable;
+  const needed = changes.value.changes.filter((c) => c.needsConfirmation);
+  if (needed.length === 0) return [];
+  const keys = new Set(needed.map((c) => c.key));
+  if (confirmed?.size === keys.size && [...keys].every((k) => confirmed.has(k))) {
+    return [];
+  }
+  return needed.map((c) => issue(["fields", c.key], c.code, c.message));
 }
 
 function readExpectedVersion(options: Plain): ServiceResult<number> {
@@ -781,6 +844,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           "expectedVersion",
           "identifiers",
           "confirmDropped",
+          "confirmTemplateMove",
           "reason",
         ]);
         if (!opts.ok) return opts;
@@ -790,6 +854,8 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         if (!reason.ok) return reason;
         const confirmed = readConfirmDropped(opts.value);
         if (!confirmed.ok) return confirmed;
+        const confirmedMove = readConfirmTemplateMove(opts.value);
+        if (!confirmedMove.ok) return confirmedMove;
         const draft = readDraft(draftInput, org, "update");
         if (!draft.ok) return draft;
         const namedId = own(draft.value, "id");
@@ -880,6 +946,10 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
             identifierFields: false,
           });
           if (problems.length > 0) return { ok: false, issues: problems };
+          if (before.templateKey !== record.templateKey) {
+            const moved = await templateMoveIssues(tx, before, record, confirmedMove.value);
+            if (moved.length > 0) return { ok: false, issues: moved };
+          }
           const updated = await updateStoredRecord(tx, record, {
             expectedVersion: expected.value,
             actor: who.actor,
