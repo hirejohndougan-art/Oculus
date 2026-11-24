@@ -18,17 +18,30 @@
 -- always changes the token, times only move forward and never past the
 -- database's clock, the organization never changes once set, and a disabled
 -- account or a removed membership ends its sessions.
+--
+-- Ending every session of a user is a time, not only a DELETE: a session
+-- whose sign-in (signed_in_at, which a switched copy keeps) is not after the
+-- user's sessions_valid_after is dead, even if a row made at the same moment
+-- by another transaction escaped the DELETE (independent review of
+-- fbb42c1, B1). Disabling an account and ending all its sessions move it
+-- forward; nothing moves it back, so re-enabling an account revives nothing.
+-- Making or copying a session takes the user row FOR SHARE, and every path
+-- that ends sessions for a user locks it first, so the two serialise.
 
--- Whether user u may hold a session (in organization o, if not NULL): an
--- active account, an organization that exists, and a membership of it or
--- system admin (D-019).
-CREATE FUNCTION public.session_access_ok(u uuid, o uuid) RETURNS boolean
+ALTER TABLE public.users
+  ADD COLUMN sessions_valid_after timestamptz NOT NULL DEFAULT '-infinity';
+
+-- Whether user u may hold a session signed in at `since` (in organization o,
+-- if not NULL): an active account, signed in after its sessions_valid_after,
+-- an organization that exists, and a membership of it or system admin
+-- (D-019).
+CREATE FUNCTION public.session_access_ok(u uuid, o uuid, since timestamptz) RETURNS boolean
 LANGUAGE sql STABLE
 SET search_path = pg_catalog, pg_temp
 AS $$
   SELECT EXISTS (
     SELECT 1 FROM public.users x
-    WHERE x.id = u AND x.disabled_at IS NULL
+    WHERE x.id = u AND x.disabled_at IS NULL AND x.sessions_valid_after < since
       AND (o IS NULL OR (
         EXISTS (SELECT 1 FROM public.organizations g WHERE g.id = o)
         AND (x.system_admin OR EXISTS (
@@ -52,7 +65,7 @@ CREATE TABLE public.sessions (
   -- When the token last changed (made, promoted or rotated).
   rotated_at timestamptz NOT NULL,
   -- When the password was last entered in this session: sign-in or re-entry
-  -- for a sensitive change (D-052).
+  -- for a sensitive change (D-052). Changes only with a new token.
   password_at timestamptz NOT NULL,
   second_step_at timestamptz,
   idle_seconds integer NOT NULL CHECK (idle_seconds BETWEEN 300 AND 43200),
@@ -77,7 +90,8 @@ CREATE TABLE public.sessions (
 -- A person's list of their own sessions, and ending them all.
 CREATE INDEX sessions_user ON public.sessions (user_id);
 
--- Whether a stored session is still usable at the database's clock.
+-- Whether a stored session is still within its time limits at the
+-- database's clock (session_access_ok decides the rest).
 CREATE FUNCTION public.session_live(s public.sessions) RETURNS boolean
 LANGUAGE sql STABLE
 SET search_path = pg_catalog, pg_temp
@@ -104,7 +118,11 @@ BEGIN
     RAISE EXCEPTION 'A new session is made now.'
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'sessions_new_now';
   END IF;
-  IF NOT public.session_access_ok(NEW.user_id, NEW.organization_id) THEN
+  -- Waits for any transaction disabling the account or ending its sessions,
+  -- and holds them off until this one commits; the check below then reads
+  -- the account as it is after them.
+  PERFORM 1 FROM public.users WHERE id = NEW.user_id FOR SHARE;
+  IF NOT public.session_access_ok(NEW.user_id, NEW.organization_id, NEW.signed_in_at) THEN
     RAISE EXCEPTION 'That account can''t hold a session there.'
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'sessions_access';
   END IF;
@@ -148,7 +166,7 @@ BEGIN
     RAISE EXCEPTION 'A session never goes back a stage.'
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'sessions_stage';
   END IF;
-  IF NOT public.session_access_ok(NEW.user_id, NEW.organization_id) THEN
+  IF NOT public.session_access_ok(NEW.user_id, NEW.organization_id, NEW.signed_in_at) THEN
     RAISE EXCEPTION 'That account can''t hold a session there.'
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'sessions_access';
   END IF;
@@ -185,8 +203,12 @@ BEGIN
     RAISE EXCEPTION 'Session times move forward, never past now.'
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'sessions_times';
   END IF;
-  IF NEW.password_at <> OLD.password_at AND NEW.stage <> 'full' THEN
-    RAISE EXCEPTION 'Only a full session records the password entered again.'
+  -- Re-entering the password always gives a new token (reauthenticate),
+  -- so a stolen token can't be marked recently authenticated without
+  -- also being replaced.
+  IF NEW.password_at <> OLD.password_at
+     AND (NEW.stage <> 'full' OR NEW.token_hash = OLD.token_hash) THEN
+    RAISE EXCEPTION 'Only a full session records the password entered again, with a new token.'
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'sessions_times';
   END IF;
   RETURN NEW;
@@ -203,30 +225,61 @@ CREATE TRIGGER zzzz_sessions_keep_identity BEFORE UPDATE ON public.sessions
     'id', 'user_id', 'signed_in_at', 'created_at', 'idle_seconds', 'absolute_seconds',
     'client_label');
 
--- A disabled account, or a change of its system admin flag (a change of
--- what it may reach), ends all of its sessions (D-052, ASVS 5.0 7.4.2).
+-- sessions_valid_after only moves forward, never past the clock; disabling
+-- an account or changing its system admin flag (a change of what it may
+-- reach) moves it to now (D-052, ASVS 5.0 7.4.2), so every session signed in
+-- until then is dead, including one copied at the same moment.
+CREATE FUNCTION public.users_sessions_valid_after() RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  IF NEW.sessions_valid_after < OLD.sessions_valid_after
+     OR (NEW.sessions_valid_after <> OLD.sessions_valid_after
+         AND NEW.sessions_valid_after > clock_timestamp()) THEN
+    RAISE EXCEPTION 'sessions_valid_after only moves forward, to no later than now.'
+      USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'users_sessions_valid_after';
+  END IF;
+  IF (NEW.disabled_at IS NOT NULL AND OLD.disabled_at IS NULL)
+     OR NEW.system_admin IS DISTINCT FROM OLD.system_admin THEN
+    NEW.sessions_valid_after := greatest(NEW.sessions_valid_after, clock_timestamp());
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER users_sessions_valid_after BEFORE UPDATE ON public.users
+  FOR EACH ROW EXECUTE FUNCTION public.users_sessions_valid_after();
+
+-- Then the dead rows are deleted (the lookups refuse them anyway).
 CREATE FUNCTION public.users_end_sessions() RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
-  DELETE FROM public.sessions WHERE user_id = NEW.id;
+  DELETE FROM public.sessions
+  WHERE user_id = NEW.id AND signed_in_at <= NEW.sessions_valid_after;
   RETURN NULL;
 END
 $$;
 
 CREATE TRIGGER users_end_sessions AFTER UPDATE ON public.users
   FOR EACH ROW
-  WHEN ((NEW.disabled_at IS NOT NULL AND OLD.disabled_at IS NULL)
-        OR NEW.system_admin IS DISTINCT FROM OLD.system_admin)
+  WHEN (NEW.sessions_valid_after > OLD.sessions_valid_after)
   EXECUTE FUNCTION public.users_end_sessions();
 
--- A removed membership ends the user's sessions in that organization.
+-- A removed membership ends the user's sessions in that organization. The
+-- user row is locked first, so a switch into that organization that is
+-- under way (it holds the row FOR SHARE) commits before this DELETE reads,
+-- and one that starts later sees the membership gone. Lookups check the
+-- membership too, so a left row would be dead; this keeps it from reviving
+-- if the person is invited back.
 CREATE FUNCTION public.organization_members_end_sessions() RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
+  PERFORM 1 FROM public.users WHERE id = OLD.user_id FOR NO KEY UPDATE;
   DELETE FROM public.sessions
   WHERE user_id = OLD.user_id AND organization_id = OLD.organization_id;
   RETURN NULL;
@@ -240,5 +293,6 @@ CREATE TRIGGER organization_members_end_sessions AFTER DELETE ON public.organiza
 ALTER TABLE public.sessions ENABLE ALWAYS TRIGGER sessions_check_new;
 ALTER TABLE public.sessions ENABLE ALWAYS TRIGGER sessions_check_change;
 ALTER TABLE public.sessions ENABLE ALWAYS TRIGGER zzzz_sessions_keep_identity;
+ALTER TABLE public.users ENABLE ALWAYS TRIGGER users_sessions_valid_after;
 ALTER TABLE public.users ENABLE ALWAYS TRIGGER users_end_sessions;
 ALTER TABLE public.organization_members ENABLE ALWAYS TRIGGER organization_members_end_sessions;

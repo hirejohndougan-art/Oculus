@@ -826,6 +826,7 @@ interface UserRow {
   system_admin: boolean;
   disabled: boolean;
   organization_ids: OrganizationId[];
+  organization_exists: boolean;
 }
 
 /**
@@ -838,7 +839,8 @@ interface UserRow {
  *    user's hash, or the dummy hash for an unknown address.
  * 4. `invalid_credentials`, the same reply, for a wrong password, an unknown
  *    address, a disabled account, an account with no organization, and one
- *    without access to `organizationId`.
+ *    without access to `organizationId` (for a system admin: one that
+ *    doesn't exist). The attempt stays counted.
  * 5. On success: the account counter is cleared, one is taken off the
  *    address counter, the sign-in time is stored, and an old-settings hash
  *    is replaced. `busy` if too many passwords are being checked at once
@@ -894,7 +896,9 @@ export async function signIn(db: Database, input: SignInRequest): Promise<SignIn
   const rows = await db.rows<UserRow>(sql`
     SELECT u.id::text AS id, u.password_hash, u.system_admin, u.disabled_at IS NOT NULL AS disabled,
            ARRAY(SELECT m.organization_id::text FROM public.organization_members m
-                 WHERE m.user_id = u.id ORDER BY 1) AS organization_ids
+                 WHERE m.user_id = u.id ORDER BY 1) AS organization_ids,
+           EXISTS (SELECT 1 FROM public.organizations o
+                   WHERE o.id = ${organizationId ?? null}::uuid) AS organization_exists
     FROM public.users u WHERE u.email = ${normalized ?? typed}`);
   const user = rows[0];
   let check: PasswordCheck;
@@ -912,7 +916,11 @@ export async function signIn(db: Database, input: SignInRequest): Promise<SignIn
     !user.disabled &&
     (organizationId === undefined
       ? user.system_admin || user.organization_ids.length > 0
-      : user.system_admin || user.organization_ids.includes(organizationId));
+      : // A system admin may enter any organization that exists (D-019); one
+        // that doesn't is a failed attempt like any other, so the counters
+        // keep it (T-037 review).
+        (user.system_admin && user.organization_exists) ||
+        user.organization_ids.includes(organizationId));
   if (!check.ok || user === undefined || !reachable) return INVALID_CREDENTIALS;
 
   let newHash: string | undefined;

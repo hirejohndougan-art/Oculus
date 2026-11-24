@@ -14,10 +14,13 @@
  * checked a TOTP or recovery code for that user. Until T-038 exists nothing
  * in the product calls it, so no session can become full: that is
  * deliberate (D-068: a full session must never be granted on the password
- * alone). Neither function is exported from `@oculus/db`'s index, and
- * `sessions.second-step.test.ts` fails if any source file other than
- * sessions.ts and the session tests imports this module. T-038 adds its
- * verifier to that list in the same change, with its own review.
+ * alone). Neither function is exported from `@oculus/db`'s index, and a
+ * test in `sessions.test.ts` fails if any source file (packages, scripts,
+ * tools) other than sessions.ts, this file and that test mentions this
+ * module, `passedSecondStep` or `promoteSession`. That test is a speed bump
+ * that catches accidents; code review is the real control (D-069). T-038
+ * adds its verifier to the test's list in the same change, with its own
+ * review.
  */
 import type { SessionId, UserId } from "@oculus/core";
 

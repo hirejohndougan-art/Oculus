@@ -173,6 +173,8 @@ export {
 } from "./sessions.js";
 export type {
   NoSession,
+  SessionFailure,
+  SessionCallOptions,
   FullSession,
   PendingSession,
   IssuedSession,

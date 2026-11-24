@@ -1560,6 +1560,7 @@ describe("the database's own guards", () => {
       "organization_members.zzzz_organization_members_keep_identity",
       "users.users_check_invitation",
       "users.users_end_sessions",
+      "users.users_sessions_valid_after",
       "users.zzzz_users_keep_identity",
     ]);
     for (const r of rows) expect(r).toEqual({ name: r.name, enabled: "A" });

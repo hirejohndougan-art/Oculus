@@ -116,7 +116,10 @@ describe("CSRF tokens", () => {
     const a = newSessionToken();
     const csrf = csrfTokenFor(a) ?? "";
     for (const v of [...variants(csrf), undefined, "", 7, { toString: () => csrf }]) {
-      expect(checkCsrfToken(a, v)).toBe(false);
+      // The unpadded standard-alphabet spelling is the token itself when it
+      // holds no "-" or "_" (review B2): only real other spellings count.
+      if (v === csrf) continue;
+      expect({ v, ok: checkCsrfToken(a, v) }).toEqual({ v, ok: false });
     }
     expect(checkCsrfToken(`${a}=`, csrf)).toBe(false);
     expect(checkCsrfToken(undefined, csrf)).toBe(false);

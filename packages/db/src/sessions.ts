@@ -14,29 +14,38 @@
  * - **Tokens** are 256-bit random, given out once, stored only as SHA-256,
  *   in one spelling (core's `isSessionToken`; anything else is refused
  *   before the database is asked). A new token at promotion, at a change of
- *   organization (a new session) and on `rotateSession` (T-019d's site
- *   unlocks and T-041's role changes call it). An old token stops working
- *   the moment the change commits.
+ *   organization (a new session), at re-entering the password and on
+ *   `rotateSession` (T-019d's site unlocks and T-041's role changes call
+ *   it). An old token stops working the moment the change commits.
  * - **Time limits in the query.** Every lookup has the database decide, by
  *   its own clock: `expires_at` (absolute, from the password) and
- *   `last_seen_at + idle_seconds`, and the account must be active with
- *   access to the session's organization (`session_access_ok`). An expired
- *   session is refused even if the cleanup never runs. Use refreshes
- *   `last_seen_at`.
+ *   `last_seen_at + idle_seconds`, and `session_access_ok`: the account is
+ *   active, the sign-in is after its `sessions_valid_after`, and it may work
+ *   in the session's organization. An expired session is refused even if
+ *   the cleanup never runs. Use refreshes `last_seen_at`.
  * - **One organization** per session (D-019). `switchOrganization` makes a
  *   new session for the other organization (same sign-in, same end) and
  *   ends the old one.
+ * - **Ending sessions can't race making them** (review B1). Making or
+ *   copying a session (`beginSession`'s insert, promotion, switching) holds
+ *   the user row FOR SHARE; every path that ends a user's sessions
+ *   (`endOtherSessions`, `endUserSessions`, `endAllSessionsForUser`,
+ *   disabling, removing a membership) locks it first. Ending all of them
+ *   also moves `users.sessions_valid_after` to now, so a copy made at the
+ *   same moment is dead even if a DELETE missed it, and re-enabling an
+ *   account revives nothing.
  * - **Re-entering the password** for a sensitive change: `reauthenticate`
- *   records the time, and `resolveSession` says whether it was recent
- *   (`recentlyAuthenticated`, 10 minutes by default). After T-038 it must
- *   also ask for the second step (D-052); T-038 extends it.
+ *   records the time and gives a new token, and `resolveSession` says
+ *   whether it was recent (`recentlyAuthenticated`, 10 minutes by default).
+ *   After T-038 it must also ask for the second step (D-052).
  * - **A person's own sessions:** `listSessions` (no tokens, no hashes, no
  *   addresses, only their own), `endOwnSession`, `endOtherSessions`.
- *   `endSession` is sign-out. `endUserSessions` is a system admin's (D-052,
- *   ASVS 7.4.5) and T-039's.
- * - **Ended by the database too:** disabling an account, changing its
- *   system admin flag, or removing a membership deletes the sessions
- *   (triggers in 0010); deleting a user or organization cascades.
+ *   `endSession` is sign-out. `endUserSessions` is a system admin's, from
+ *   their own session (D-052, ASVS 7.4.5); `endAllSessionsForUser` is for
+ *   T-039's reset, inside its own transaction.
+ * - **Database errors** never reach the caller as they are: they become a
+ *   fixed `SessionFailure` (`retry`, `timeout`, `database_unavailable`,
+ *   `internal_error`), and the raw error goes only to the `onError` option.
  * - **Cleanup:** `runCleanup` (the `db:cleanup` command) deletes ended
  *   sessions and old sign-in counters.
  *
@@ -69,7 +78,7 @@ import {
   signIn,
   type SignInFailure,
 } from "./accounts.js";
-import type { Database, Queryable } from "./client.js";
+import { ConnectionLostError, type Database, type Queryable } from "./client.js";
 import { readSecondStepProof, spendSecondStepProof, type SecondStepProof } from "./second-step.js";
 import { sql } from "./sql.js";
 
@@ -77,7 +86,8 @@ import { sql } from "./sql.js";
  * What the writer role needs on `sessions`, beyond SELECT (D-067, D-069):
  * INSERT (sign-in, switching), UPDATE (use, promotion, rotation, re-entry;
  * also what `SELECT … FOR UPDATE` needs) and DELETE (sign-out, ending, the
- * cleanup, and the triggers that end sessions on disable).
+ * cleanup, and the triggers that end sessions on disable). Locking a user
+ * row uses the writer's existing UPDATE on `users`.
  */
 export const SESSION_TABLE_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Object.freeze({
   sessions: Object.freeze(["INSERT", "UPDATE", "DELETE"]),
@@ -98,6 +108,46 @@ export const NO_SESSION: NoSession = Object.freeze({
   code: "no_session",
   message: "You are not signed in, or your session has ended. Sign in again.",
 });
+
+/** A database failure, as fixed text: never the database's own message. */
+export interface SessionFailure {
+  readonly ok: false;
+  readonly code: "retry" | "timeout" | "database_unavailable" | "internal_error";
+  readonly message: string;
+}
+
+const FAILURES: Readonly<Record<SessionFailure["code"], SessionFailure>> = Object.freeze({
+  retry: Object.freeze({
+    ok: false,
+    code: "retry",
+    message: "Other changes were happening at the same moment. Try again.",
+  }),
+  timeout: Object.freeze({
+    ok: false,
+    code: "timeout",
+    message: "That took too long and was stopped. Try again.",
+  }),
+  database_unavailable: Object.freeze({
+    ok: false,
+    code: "database_unavailable",
+    message: "The database couldn't be reached just now. Try again in a moment.",
+  }),
+  internal_error: Object.freeze({
+    ok: false,
+    code: "internal_error",
+    message: "Something went wrong with your session. Try again.",
+  }),
+});
+
+/** Options every session function takes. */
+export interface SessionCallOptions {
+  /**
+   * Gets a database error before it becomes a fixed `SessionFailure` (for
+   * the server's log). It must not log the token; none is passed to it. A
+   * throw from it is ignored.
+   */
+  readonly onError?: (error: unknown) => void;
+}
 
 /** A full session, as the caller acts on it. Never holds the token or its hash. */
 export interface FullSession {
@@ -184,11 +234,58 @@ function constraintOf(error: unknown): string | undefined {
  * answers `NO_SESSION`.
  */
 function sessionGuardRefused(error: unknown): boolean {
-  const constraint = constraintOf(error);
+  const state = sqlState(error);
   return (
-    (sqlState(error) === "23000" || sqlState(error) === "23514") &&
-    constraint?.startsWith("sessions_") === true
+    (state === "23000" || state === "23514") &&
+    constraintOf(error)?.startsWith("sessions_") === true
   );
+}
+
+/** The options as given, checked: only `onError`, a function if present. */
+function callOptions(options: unknown, extra: readonly string[] = []): SessionCallOptions {
+  if (options === undefined) return {};
+  const onError = own(options, "onError");
+  if (
+    !hasOnly(options, ["onError", ...extra]) ||
+    (onError !== undefined && typeof onError !== "function")
+  ) {
+    throw new TypeError("Session options take onError (a function) only, besides their own.");
+  }
+  return onError === undefined ? {} : { onError: onError as (error: unknown) => void };
+}
+
+/**
+ * A thrown error as the caller's answer: `NO_SESSION` for 0010's session
+ * guards, a fixed `SessionFailure` for any other database error (the raw
+ * error to `onError` only). Anything that isn't a database error (a bug, a
+ * bad option) is thrown again.
+ */
+function failureFor(error: unknown, options: SessionCallOptions): NoSession | SessionFailure {
+  if (sessionGuardRefused(error)) return NO_SESSION;
+  const state = sqlState(error);
+  if (state === undefined && !(error instanceof ConnectionLostError)) throw error;
+  try {
+    options.onError?.(error);
+  } catch {
+    // The log's own failure changes nothing.
+  }
+  if (state === "40001" || state === "40P01" || state === "55P03") return FAILURES.retry;
+  if (state === "57014" || state === "25P03") return FAILURES.timeout;
+  if (
+    state === undefined ||
+    state.startsWith("08") ||
+    state.startsWith("53") ||
+    state.startsWith("57P")
+  ) {
+    return FAILURES.database_unavailable;
+  }
+  return FAILURES.internal_error;
+}
+
+/** `failureFor` as a `Validated` refusal. */
+function refusedFor<T>(error: unknown, options: SessionCallOptions): Validated<T> {
+  const f = failureFor(error, options);
+  return refused(f.code, f.message);
 }
 
 const RETRYABLE = new Set(["40P01", "40001"]);
@@ -208,13 +305,30 @@ function tokenHash(token: unknown): Uint8Array | undefined {
   return isSessionToken(token) ? hashSessionToken(token) : undefined;
 }
 
+/**
+ * Locks the user row of the session `hash` names (`FOR SHARE` to make or
+ * copy a session, `FOR NO KEY UPDATE` to end some), before the session row
+ * is locked, and returns the user ID, or `undefined` if no such session.
+ * Every path takes the user row first, so they serialise without deadlock.
+ */
+async function lockUserOf(
+  tx: Queryable,
+  hash: Uint8Array,
+  mode: "share" | "update",
+): Promise<UserId | undefined> {
+  const found = await tx.rows<{ user_id: UserId }>(sql`
+    SELECT user_id::text AS user_id FROM public.sessions WHERE token_hash = ${hash}`);
+  const userId = found[0]?.user_id;
+  if (userId === undefined) return undefined;
+  await (mode === "share"
+    ? tx.rows(sql`SELECT 1 FROM public.users WHERE id = ${userId}::uuid FOR SHARE`)
+    : tx.rows(sql`SELECT 1 FROM public.users WHERE id = ${userId}::uuid FOR NO KEY UPDATE`));
+  return userId;
+}
+
 function recentWindow(options: unknown): number {
-  if (options === undefined) return RECENT_AUTHENTICATION_SECONDS;
   const seconds = own(options, "recentAuthenticationSeconds") ?? RECENT_AUTHENTICATION_SECONDS;
-  if (
-    !hasOnly(options, ["recentAuthenticationSeconds"]) ||
-    !isRecentAuthenticationWindow(seconds)
-  ) {
+  if (!isRecentAuthenticationWindow(seconds)) {
     throw new TypeError("recentAuthenticationSeconds is a whole number from 60 to 3,600.");
   }
   return seconds;
@@ -261,14 +375,12 @@ function fullColumns(recentSeconds: number) {
     s.password_at > clock_timestamp() - make_interval(secs => ${recentSeconds}) AS recent`;
 }
 
-/**
- * The conditions for a usable full session `s` of user `u`, decided by the
- * database's clock: the stage, both time limits, an active account and
- * access to the organization.
- */
-const LIVE_FULL = sql`
-  s.stage = 'full' AND u.id = s.user_id AND public.session_live(s)
-  AND public.session_access_ok(s.user_id, s.organization_id)`;
+/** Whether session `s` is usable (time limits and `session_access_ok`), by the database's clock. */
+const VALID = sql`public.session_live(s)
+  AND public.session_access_ok(s.user_id, s.organization_id, s.signed_in_at)`;
+
+/** The conditions for a usable full session `s` of user `u`. */
+const LIVE_FULL = sql`s.stage = 'full' AND u.id = s.user_id AND ${VALID}`;
 
 // ---------------------------------------------------------------------------
 // Signing in
@@ -279,19 +391,22 @@ export interface SessionStart {
   readonly password: string;
   /** The client address from the HTTP layer (D-058), for the throttle. */
   readonly source: string;
-  /** The organization to work in; if left out, chosen at promotion. */
+  /**
+   * The organization to work in; if left out, chosen at promotion. One the
+   * person can't enter (for a system admin: one that doesn't exist) is
+   * `invalid_credentials` and counts as a failed attempt.
+   */
   readonly organizationId?: OrganizationId;
   /** Shown in the person's list of sessions (core's `clientLabel` cleans it). */
   readonly clientLabel?: string;
 }
 
 /** Options for `beginSession`: the time limits a system manager chose (D-052). */
-export interface SessionOptions {
+export interface SessionOptions extends SessionCallOptions {
   readonly policy?: SessionPolicy;
 }
 
 function policyFrom(options: unknown): SessionPolicy {
-  if (!hasOnly(options, ["policy"])) throw new TypeError("beginSession's options are { policy }.");
   const given = own(options, "policy");
   if (given === undefined) return DEFAULT_SESSION_POLICY;
   const policy = validateSessionPolicy(given);
@@ -321,7 +436,8 @@ export async function beginSession(
   db: Database,
   input: SessionStart,
   options: SessionOptions = {},
-): Promise<IssuedSession<PendingSession> | SignInFailure> {
+): Promise<IssuedSession<PendingSession> | SignInFailure | SessionFailure> {
+  const call = callOptions(options, ["policy"]);
   const policy = policyFrom(options);
   if (!hasOnly(input, ["email", "password", "source", "organizationId", "clientLabel"])) {
     return INVALID_START;
@@ -334,12 +450,14 @@ export async function beginSession(
     source: own(input, "source") as string,
     ...(organizationId === undefined ? {} : { organizationId: organizationId as OrganizationId }),
   };
-  const checked = await signIn(db, signInInput);
-  if (!checked.ok) return checked;
   const sessionId = newSessionId();
   const token = newSessionToken();
   const org = (organizationId as OrganizationId | undefined) ?? null;
   try {
+    const checked = await signIn(db, signInInput);
+    if (!checked.ok) return checked;
+    // The insert trigger holds the user row FOR SHARE and checks the account
+    // after any disable that was under way (review B1).
     const rows = await db.rows<{ expires_at: string }>(sql`
       INSERT INTO public.sessions
         (id, token_hash, user_id, organization_id, stage, signed_in_at, created_at,
@@ -351,21 +469,16 @@ export async function beginSession(
       FROM (SELECT clock_timestamp() AS t) c
       RETURNING to_char(expires_at AT TIME ZONE 'UTC', ${ISO}) AS expires_at`);
     const expiresAt = rows[0]?.expires_at;
-    if (expiresAt === undefined) throw new Error("The session was not stored.");
+    if (expiresAt === undefined) return FAILURES.internal_error;
     return {
       ok: true,
       token,
-      session: Object.freeze({
-        sessionId,
-        userId: checked.userId,
-        organizationId: org,
-        expiresAt,
-      }),
+      session: Object.freeze({ sessionId, userId: checked.userId, organizationId: org, expiresAt }),
     };
   } catch (error) {
     // Disabled or removed between the password check and the insert.
     if (sessionGuardRefused(error)) return INVALID_CREDENTIALS;
-    throw error;
+    return failureFor(error, call) as SessionFailure;
   }
 }
 
@@ -377,31 +490,36 @@ export async function beginSession(
 export async function readPendingSession(
   db: Queryable,
   token: unknown,
-): Promise<{ readonly ok: true; readonly session: PendingSession } | NoSession> {
+  options: SessionCallOptions = {},
+): Promise<{ readonly ok: true; readonly session: PendingSession } | NoSession | SessionFailure> {
+  const call = callOptions(options);
   const hash = tokenHash(token);
   if (hash === undefined) return NO_SESSION;
-  const rows = await db.rows<{
-    id: SessionId;
-    user_id: UserId;
-    organization_id: OrganizationId | null;
-    expires_at: string;
-  }>(sql`
-    SELECT s.id::text AS id, s.user_id::text AS user_id, s.organization_id::text AS organization_id,
-           to_char(s.expires_at AT TIME ZONE 'UTC', ${ISO}) AS expires_at
-    FROM public.sessions s
-    WHERE s.token_hash = ${hash} AND s.stage = 'second_step' AND public.session_live(s)
-      AND public.session_access_ok(s.user_id, s.organization_id)`);
-  const row = rows[0];
-  if (row === undefined) return NO_SESSION;
-  return {
-    ok: true,
-    session: Object.freeze({
-      sessionId: row.id,
-      userId: row.user_id,
-      organizationId: row.organization_id,
-      expiresAt: row.expires_at,
-    }),
-  };
+  try {
+    const rows = await db.rows<{
+      id: SessionId;
+      user_id: UserId;
+      organization_id: OrganizationId | null;
+      expires_at: string;
+    }>(sql`
+      SELECT s.id::text AS id, s.user_id::text AS user_id, s.organization_id::text AS organization_id,
+             to_char(s.expires_at AT TIME ZONE 'UTC', ${ISO}) AS expires_at
+      FROM public.sessions s
+      WHERE s.token_hash = ${hash} AND s.stage = 'second_step' AND ${VALID}`);
+    const row = rows[0];
+    if (row === undefined) return NO_SESSION;
+    return {
+      ok: true,
+      session: Object.freeze({
+        sessionId: row.id,
+        userId: row.user_id,
+        organizationId: row.organization_id,
+        expiresAt: row.expires_at,
+      }),
+    };
+  } catch (error) {
+    return failureFor(error, call);
+  }
 }
 
 /** A refusal at promotion other than `NO_SESSION`. */
@@ -413,12 +531,24 @@ export type PromotionRefusal =
       /** The user's own organizations, sorted (shown after the second step passed). */
       readonly organizationIds: readonly OrganizationId[];
     }
+  | {
+      readonly ok: false;
+      /** A system admin with no memberships must name the organization. */
+      readonly code: "organization_required";
+      readonly message: string;
+    }
   | { readonly ok: false; readonly code: "not_permitted"; readonly message: string };
 
 const NOT_PERMITTED_HERE = Object.freeze({
   ok: false,
   code: "not_permitted",
   message: "You can't work in that organization.",
+} as const);
+
+const ORGANIZATION_REQUIRED = Object.freeze({
+  ok: false,
+  code: "organization_required",
+  message: "You aren't a member of any organization. Name the organization to work in.",
 } as const);
 
 /**
@@ -429,9 +559,10 @@ const NOT_PERMITTED_HERE = Object.freeze({
  *
  * The organization is the one chosen at the password; otherwise
  * `organizationId` here; otherwise the user's only membership; otherwise
- * `choose_organization` with their organizations (the proof is kept, so the
- * person can choose without a new code). An organization they can't work
- * in is `not_permitted`. The session then ends `absoluteSeconds` after the
+ * `choose_organization` with their organizations, or `organization_required`
+ * for a system admin with none (the proof is kept either way, so the person
+ * can choose without a new code). An organization they can't work in is
+ * `not_permitted`. The session then ends `absoluteSeconds` after the
  * password, not after promotion.
  */
 export async function promoteSession(
@@ -439,7 +570,9 @@ export async function promoteSession(
   token: unknown,
   proof: SecondStepProof,
   input: { readonly organizationId?: OrganizationId } = {},
-): Promise<IssuedSession<FullSession> | NoSession | PromotionRefusal> {
+  options: SessionCallOptions = {},
+): Promise<IssuedSession<FullSession> | NoSession | PromotionRefusal | SessionFailure> {
+  const call = callOptions(options);
   const hash = tokenHash(token);
   const record = readSecondStepProof(proof);
   if (hash === undefined || record === undefined) return NO_SESSION;
@@ -449,6 +582,7 @@ export async function promoteSession(
   const newToken = newSessionToken();
   try {
     return await inTransaction(db, async (tx) => {
+      if ((await lockUserOf(tx, hash, "share")) === undefined) return NO_SESSION;
       const rows = await tx.rows<{
         id: SessionId;
         user_id: UserId;
@@ -461,14 +595,11 @@ export async function promoteSession(
                ARRAY(SELECT m.organization_id::text FROM public.organization_members m
                      WHERE m.user_id = s.user_id ORDER BY 1) AS memberships
         FROM public.sessions s JOIN public.users u ON u.id = s.user_id
-        WHERE s.token_hash = ${hash} AND s.stage = 'second_step' AND public.session_live(s)
-          AND public.session_access_ok(s.user_id, s.organization_id)
+        WHERE s.token_hash = ${hash} AND s.stage = 'second_step' AND ${VALID}
         FOR UPDATE OF s`);
       const row = rows[0];
       // The proof must be for this session and this user.
-      if (row?.id !== record.sessionId || row.user_id !== record.userId) {
-        return NO_SESSION;
-      }
+      if (row?.id !== record.sessionId || row.user_id !== record.userId) return NO_SESSION;
       let organizationId: OrganizationId;
       if (row.organization_id !== null) {
         if (asked !== undefined && asked !== row.organization_id) return NOT_PERMITTED_HERE;
@@ -477,6 +608,8 @@ export async function promoteSession(
         organizationId = asked;
       } else if (row.memberships.length === 1 && row.memberships[0] !== undefined) {
         organizationId = row.memberships[0];
+      } else if (row.memberships.length === 0) {
+        return ORGANIZATION_REQUIRED;
       } else {
         return {
           ok: false,
@@ -486,7 +619,8 @@ export async function promoteSession(
         } as const;
       }
       const access = await tx.rows<{ ok: boolean }>(sql`
-        SELECT public.session_access_ok(${row.user_id}::uuid, ${organizationId}::uuid) AS ok`);
+        SELECT public.session_access_ok(s.user_id, ${organizationId}::uuid, s.signed_in_at) AS ok
+        FROM public.sessions s WHERE s.id = ${row.id}::uuid`);
       if (access[0]?.ok !== true) return NOT_PERMITTED_HERE;
       const promoted = await tx.rows<FullRow>(sql`
         UPDATE public.sessions s
@@ -504,8 +638,7 @@ export async function promoteSession(
       return { ok: true, token: newToken, session: fullSession(done) } as const;
     });
   } catch (error) {
-    if (sessionGuardRefused(error)) return NO_SESSION;
-    throw error;
+    return failureFor(error, call);
   }
 }
 
@@ -513,7 +646,7 @@ export async function promoteSession(
 // Using a session
 
 /** Options for `resolveSession`. */
-export interface ResolveOptions {
+export interface ResolveOptions extends SessionCallOptions {
   /** The window for `recentlyAuthenticated`: 60 to 3,600 seconds, 600 by default. */
   readonly recentAuthenticationSeconds?: number;
 }
@@ -521,16 +654,18 @@ export interface ResolveOptions {
 /**
  * The full session `token` names, refreshed (`last_seen_at`), or
  * `NO_SESSION`. One statement: the database checks the stage, the absolute
- * and idle limits by its own clock, that the account is active and that it
- * may still work in the session's organization. A session waiting for its
- * second step is `NO_SESSION` here. The caller checks the CSRF token
- * (core's `checkCsrfToken`) on every change.
+ * and idle limits by its own clock, that the account is active, that the
+ * sign-in is after its `sessions_valid_after`, and that it may still work
+ * in the session's organization. A session waiting for its second step is
+ * `NO_SESSION` here. The caller checks the CSRF token (core's
+ * `checkCsrfToken`) on every change.
  */
 export async function resolveSession(
   db: Queryable,
   token: unknown,
-  options?: ResolveOptions,
-): Promise<{ readonly ok: true; readonly session: FullSession } | NoSession> {
+  options: ResolveOptions = {},
+): Promise<{ readonly ok: true; readonly session: FullSession } | NoSession | SessionFailure> {
+  const call = callOptions(options, ["recentAuthenticationSeconds"]);
   const recent = recentWindow(options);
   const hash = tokenHash(token);
   if (hash === undefined) return NO_SESSION;
@@ -543,8 +678,7 @@ export async function resolveSession(
     const row = rows[0];
     return row === undefined ? NO_SESSION : { ok: true, session: fullSession(row) };
   } catch (error) {
-    if (sessionGuardRefused(error)) return NO_SESSION;
-    throw error;
+    return failureFor(error, call);
   }
 }
 
@@ -556,7 +690,9 @@ export async function resolveSession(
 export async function rotateSession(
   db: Queryable,
   token: unknown,
-): Promise<IssuedSession<FullSession> | NoSession> {
+  options: SessionCallOptions = {},
+): Promise<IssuedSession<FullSession> | NoSession | SessionFailure> {
+  const call = callOptions(options);
   const hash = tokenHash(token);
   if (hash === undefined) return NO_SESSION;
   const newToken = newSessionToken();
@@ -573,8 +709,7 @@ export async function rotateSession(
       ? NO_SESSION
       : { ok: true, token: newToken, session: fullSession(row) };
   } catch (error) {
-    if (sessionGuardRefused(error)) return NO_SESSION;
-    throw error;
+    return failureFor(error, call);
   }
 }
 
@@ -582,20 +717,24 @@ export async function rotateSession(
  * Moves to another organization (D-019): a new session, with a new token,
  * for the same sign-in (same absolute end; the password must be entered
  * again for a sensitive change there), and the old session ends, in one
- * transaction. An organization the person can't work in, or one that
- * doesn't exist, is the same `not_permitted`; the current one is
- * `same_organization`.
+ * transaction that holds the user row FOR SHARE, so ending the person's
+ * sessions at the same moment ends the new one too (review B1). An
+ * organization the person can't work in, or one that doesn't exist, is the
+ * same `not_permitted`; the current one is `same_organization`.
  */
 export async function switchOrganization(
   db: Database,
   token: unknown,
   organizationId: unknown,
+  options: SessionCallOptions = {},
 ): Promise<
   | IssuedSession<FullSession>
   | NoSession
   | typeof NOT_PERMITTED_HERE
   | { readonly ok: false; readonly code: "same_organization"; readonly message: string }
+  | SessionFailure
 > {
+  const call = callOptions(options);
   const hash = tokenHash(token);
   if (hash === undefined) return NO_SESSION;
   if (!isOrganizationId(organizationId)) return NOT_PERMITTED_HERE;
@@ -603,8 +742,10 @@ export async function switchOrganization(
   const newId = newSessionId();
   try {
     return await inTransaction(db, async (tx) => {
-      const rows = await tx.rows<{ id: SessionId; user_id: UserId; organization_id: string }>(sql`
-        SELECT s.id::text AS id, s.user_id::text AS user_id, s.organization_id::text AS organization_id
+      if ((await lockUserOf(tx, hash, "share")) === undefined) return NO_SESSION;
+      const rows = await tx.rows<{ id: SessionId; organization_id: string; access: boolean }>(sql`
+        SELECT s.id::text AS id, s.organization_id::text AS organization_id,
+               public.session_access_ok(s.user_id, ${organizationId}::uuid, s.signed_in_at) AS access
         FROM public.sessions s JOIN public.users u ON u.id = s.user_id
         WHERE s.token_hash = ${hash} AND ${LIVE_FULL}
         FOR UPDATE OF s`);
@@ -617,9 +758,7 @@ export async function switchOrganization(
           message: "You are already working in that organization.",
         } as const;
       }
-      const access = await tx.rows<{ ok: boolean }>(sql`
-        SELECT public.session_access_ok(${row.user_id}::uuid, ${organizationId}::uuid) AS ok`);
-      if (access[0]?.ok !== true) return NOT_PERMITTED_HERE;
+      if (!row.access) return NOT_PERMITTED_HERE;
       await tx.execute(sql`
         INSERT INTO public.sessions
           (id, token_hash, user_id, organization_id, stage, signed_in_at, created_at,
@@ -636,56 +775,61 @@ export async function switchOrganization(
         FROM public.sessions s JOIN public.users u ON u.id = s.user_id
         WHERE s.id = ${newId}::uuid`);
       const session = made[0];
-      if (session === undefined) throw new Error("The new session was not stored.");
+      if (session === undefined) return FAILURES.internal_error;
       return { ok: true, token: newToken, session: fullSession(session) } as const;
     });
   } catch (error) {
-    if (sessionGuardRefused(error)) return NO_SESSION;
-    throw error;
+    return failureFor(error, call);
   }
 }
 
 /**
  * Records that the person entered their password again in this session, for
- * a sensitive change (D-052, ASVS 5.0 7.5.1): the same check as sign-in,
- * with its throttle (`signIn`'s failures are passed on). Afterwards
- * `resolveSession` gives `recentlyAuthenticated: true` for the window
- * asked. **T-038 must extend this to ask for the second step as well.**
+ * a sensitive change (D-052, ASVS 5.0 7.5.1), and gives the session a **new
+ * token** (the old one stops). The same check as sign-in, with its throttle
+ * (`signIn`'s failures are passed on). Afterwards `resolveSession` gives
+ * `recentlyAuthenticated: true` for the window asked. **T-038 must extend
+ * this to ask for the second step as well.**
  */
 export async function reauthenticate(
   db: Database,
   token: unknown,
   input: { readonly password: string; readonly source: string },
-): Promise<{ readonly ok: true; readonly session: FullSession } | NoSession | SignInFailure> {
+  options: SessionCallOptions = {},
+): Promise<IssuedSession<FullSession> | NoSession | SignInFailure | SessionFailure> {
+  const call = callOptions(options);
   const hash = tokenHash(token);
   if (hash === undefined) return NO_SESSION;
   if (!hasOnly(input, ["password", "source"])) return NO_SESSION;
-  const current = await resolveSession(db, token);
-  if (!current.ok) return current;
-  const users = await db.rows<{ email: string }>(sql`
-    SELECT email FROM public.users WHERE id = ${current.session.userId}::uuid`);
-  const email = users[0]?.email;
-  if (email === undefined) return NO_SESSION;
-  const checked = await signIn(db, {
-    email,
-    password: own(input, "password") as string,
-    source: own(input, "source") as string,
-    organizationId: current.session.organizationId,
-  });
-  if (!checked.ok) return checked;
-  if (checked.userId !== current.session.userId) return NO_SESSION;
+  const newToken = newSessionToken();
   try {
+    const current = await resolveSession(db, token, call);
+    if (!current.ok) return current;
+    const users = await db.rows<{ email: string }>(sql`
+      SELECT email FROM public.users WHERE id = ${current.session.userId}::uuid`);
+    const email = users[0]?.email;
+    if (email === undefined) return NO_SESSION;
+    const checked = await signIn(db, {
+      email,
+      password: own(input, "password") as string,
+      source: own(input, "source") as string,
+      organizationId: current.session.organizationId,
+    });
+    if (!checked.ok) return checked;
+    if (checked.userId !== current.session.userId) return NO_SESSION;
     const rows = await db.rows<FullRow>(sql`
       UPDATE public.sessions s
-      SET password_at = clock_timestamp(), last_seen_at = clock_timestamp()
+      SET password_at = clock_timestamp(), last_seen_at = clock_timestamp(),
+          token_hash = ${hashSessionToken(newToken)}, rotated_at = clock_timestamp()
       FROM public.users u
       WHERE s.token_hash = ${hash} AND s.id = ${current.session.sessionId}::uuid AND ${LIVE_FULL}
       RETURNING ${fullColumns(RECENT_AUTHENTICATION_SECONDS)}`);
     const row = rows[0];
-    return row === undefined ? NO_SESSION : { ok: true, session: fullSession(row) };
+    return row === undefined
+      ? NO_SESSION
+      : { ok: true, token: newToken, session: fullSession(row) };
   } catch (error) {
-    if (sessionGuardRefused(error)) return NO_SESSION;
-    throw error;
+    return failureFor(error, call);
   }
 }
 
@@ -703,46 +847,54 @@ export const MAX_LISTED_SESSIONS = 200;
 export async function listSessions(
   db: Queryable,
   token: unknown,
-): Promise<{ readonly ok: true; readonly sessions: readonly SessionSummary[] } | NoSession> {
-  const current = await resolveSession(db, token);
-  if (!current.ok) return current;
-  const rows = await db.rows<{
-    id: SessionId;
-    organization_id: OrganizationId | null;
-    stage: "second_step" | "full";
-    signed_in_at: string;
-    last_seen_at: string;
-    ends_at: string;
-    client_label: string | null;
-  }>(sql`
-    SELECT s.id::text AS id, s.organization_id::text AS organization_id, s.stage,
-           to_char(s.signed_in_at AT TIME ZONE 'UTC', ${ISO}) AS signed_in_at,
-           to_char(s.last_seen_at AT TIME ZONE 'UTC', ${ISO}) AS last_seen_at,
-           to_char(CASE WHEN s.stage = 'full'
-                        THEN least(s.expires_at, s.last_seen_at + make_interval(secs => s.idle_seconds))
-                        ELSE s.expires_at END AT TIME ZONE 'UTC', ${ISO}) AS ends_at,
-           s.client_label
-    FROM public.sessions s
-    WHERE s.user_id = ${current.session.userId}::uuid AND public.session_live(s)
-    ORDER BY s.last_seen_at DESC, s.id
-    LIMIT ${MAX_LISTED_SESSIONS}`);
-  return {
-    ok: true,
-    sessions: Object.freeze(
-      rows.map((r) =>
-        Object.freeze({
-          sessionId: r.id,
-          organizationId: r.organization_id,
-          stage: r.stage,
-          signedInAt: r.signed_in_at,
-          lastSeenAt: r.last_seen_at,
-          endsAt: r.ends_at,
-          clientLabel: r.client_label,
-          current: r.id === current.session.sessionId,
-        }),
+  options: SessionCallOptions = {},
+): Promise<
+  { readonly ok: true; readonly sessions: readonly SessionSummary[] } | NoSession | SessionFailure
+> {
+  const call = callOptions(options);
+  try {
+    const current = await resolveSession(db, token, call);
+    if (!current.ok) return current;
+    const rows = await db.rows<{
+      id: SessionId;
+      organization_id: OrganizationId | null;
+      stage: "second_step" | "full";
+      signed_in_at: string;
+      last_seen_at: string;
+      ends_at: string;
+      client_label: string | null;
+    }>(sql`
+      SELECT s.id::text AS id, s.organization_id::text AS organization_id, s.stage,
+             to_char(s.signed_in_at AT TIME ZONE 'UTC', ${ISO}) AS signed_in_at,
+             to_char(s.last_seen_at AT TIME ZONE 'UTC', ${ISO}) AS last_seen_at,
+             to_char(CASE WHEN s.stage = 'full'
+                          THEN least(s.expires_at, s.last_seen_at + make_interval(secs => s.idle_seconds))
+                          ELSE s.expires_at END AT TIME ZONE 'UTC', ${ISO}) AS ends_at,
+             s.client_label
+      FROM public.sessions s
+      WHERE s.user_id = ${current.session.userId}::uuid AND ${VALID}
+      ORDER BY s.last_seen_at DESC, s.id
+      LIMIT ${MAX_LISTED_SESSIONS}`);
+    return {
+      ok: true,
+      sessions: Object.freeze(
+        rows.map((r) =>
+          Object.freeze({
+            sessionId: r.id,
+            organizationId: r.organization_id,
+            stage: r.stage,
+            signedInAt: r.signed_in_at,
+            lastSeenAt: r.last_seen_at,
+            endsAt: r.ends_at,
+            clientLabel: r.client_label,
+            current: r.id === current.session.sessionId,
+          }),
+        ),
       ),
-    ),
-  };
+    };
+  } catch (error) {
+    return failureFor(error, call);
+  }
 }
 
 /**
@@ -753,11 +905,17 @@ export async function listSessions(
 export async function endSession(
   db: Queryable,
   token: unknown,
-): Promise<{ readonly ended: boolean }> {
+  options: SessionCallOptions = {},
+): Promise<{ readonly ok: true; readonly ended: boolean } | SessionFailure> {
+  const call = callOptions(options);
   const hash = tokenHash(token);
-  if (hash === undefined) return { ended: false };
-  const n = await db.execute(sql`DELETE FROM public.sessions WHERE token_hash = ${hash}`);
-  return { ended: n > 0 };
+  if (hash === undefined) return { ok: true, ended: false };
+  try {
+    const n = await db.execute(sql`DELETE FROM public.sessions WHERE token_hash = ${hash}`);
+    return { ok: true, ended: n > 0 };
+  } catch (error) {
+    return failureFor(error, call) as SessionFailure;
+  }
 }
 
 /**
@@ -769,72 +927,116 @@ export async function endOwnSession(
   db: Queryable,
   token: unknown,
   sessionId: unknown,
+  options: SessionCallOptions = {},
 ): Promise<Validated<{ readonly ended: true }>> {
-  const current = await resolveSession(db, token);
-  if (!current.ok) return refused(NO_SESSION.code, NO_SESSION.message);
-  if (!isSessionId(sessionId)) {
-    return refused("unknown_session", "You have no session by that ID.");
+  const call = callOptions(options);
+  try {
+    const current = await resolveSession(db, token, call);
+    if (!current.ok) return refused(current.code, current.message);
+    if (!isSessionId(sessionId)) {
+      return refused("unknown_session", "You have no session by that ID.");
+    }
+    const n = await db.execute(sql`
+      DELETE FROM public.sessions
+      WHERE id = ${sessionId}::uuid AND user_id = ${current.session.userId}::uuid`);
+    return n === 1
+      ? { ok: true, value: { ended: true } }
+      : refused("unknown_session", "You have no session by that ID.");
+  } catch (error) {
+    return refusedFor(error, call);
   }
-  const n = await db.execute(sql`
-    DELETE FROM public.sessions
-    WHERE id = ${sessionId}::uuid AND user_id = ${current.session.userId}::uuid`);
-  return n === 1
-    ? { ok: true, value: { ended: true } }
-    : refused("unknown_session", "You have no session by that ID.");
 }
 
 /**
  * "Sign out everywhere else" (D-052, ASVS 5.0 7.4.3): ends every other
  * session of the signed-in person, in every organization and stage. Needs
- * a full session.
+ * a full session. The user row is locked first, so a session being copied
+ * to another organization at the same moment (from a stolen token, say) is
+ * either already committed and deleted here, or made after and finds its
+ * source gone (review B1).
  */
 export async function endOtherSessions(
-  db: Queryable,
+  db: Database,
   token: unknown,
-): Promise<{ readonly ok: true; readonly ended: number } | NoSession> {
-  const current = await resolveSession(db, token);
-  if (!current.ok) return current;
-  const ended = await db.execute(sql`
-    DELETE FROM public.sessions
-    WHERE user_id = ${current.session.userId}::uuid AND id <> ${current.session.sessionId}::uuid`);
-  return { ok: true, ended };
+  options: SessionCallOptions = {},
+): Promise<{ readonly ok: true; readonly ended: number } | NoSession | SessionFailure> {
+  const call = callOptions(options);
+  const hash = tokenHash(token);
+  if (hash === undefined) return NO_SESSION;
+  try {
+    return await inTransaction(db, async (tx) => {
+      if ((await lockUserOf(tx, hash, "update")) === undefined) return NO_SESSION;
+      const current = await resolveSession(tx, token, call);
+      if (!current.ok) return current;
+      const ended = await tx.execute(sql`
+        DELETE FROM public.sessions
+        WHERE user_id = ${current.session.userId}::uuid
+          AND id <> ${current.session.sessionId}::uuid`);
+      return { ok: true, ended } as const;
+    });
+  } catch (error) {
+    return failureFor(error, call);
+  }
 }
 
 /**
- * Ends every session of `userId` (ASVS 5.0 7.4.5): for a system admin
- * (`by`, from their own session; `not_permitted` otherwise), and for T-039's
- * password reset. Returns how many ended.
+ * Ends every session of `userId` at once, inside the caller's transaction:
+ * locks the user row, deletes the sessions, and moves
+ * `sessions_valid_after` to now, so any session signed in until now is dead
+ * even if made at this moment by another transaction. For T-039's password
+ * reset and `endUserSessions`; it checks no permission. Returns how many
+ * rows went. Not exported from `@oculus/db`.
+ */
+export async function endAllSessionsForUser(tx: Queryable, userId: UserId): Promise<number> {
+  await tx.rows(sql`SELECT 1 FROM public.users WHERE id = ${userId}::uuid FOR NO KEY UPDATE`);
+  const ended = await tx.execute(sql`DELETE FROM public.sessions WHERE user_id = ${userId}::uuid`);
+  await tx.execute(sql`
+    UPDATE public.users SET sessions_valid_after = clock_timestamp() WHERE id = ${userId}::uuid`);
+  return ended;
+}
+
+/**
+ * Ends every session of `userId` (ASVS 5.0 7.4.5), for a system admin
+ * acting from their own full session (`adminToken`, checked here:
+ * `no_session` or `not_permitted`). If it is their own account, their own
+ * session ends too. Returns how many ended.
  */
 export async function endUserSessions(
   db: Database,
-  input: { readonly userId: UserId; readonly by: UserId },
+  adminToken: unknown,
+  userId: unknown,
+  options: SessionCallOptions = {},
 ): Promise<Validated<{ readonly ended: number }>> {
-  const userId = own(input, "userId");
-  const by = own(input, "by");
-  if (!hasOnly(input, ["userId", "by"]) || !isUserId(userId) || !isUserId(by)) {
-    return refused("invalid_request", "Give the user ID and your own user ID only.");
+  const call = callOptions(options);
+  if (!isUserId(userId)) return refused("invalid_request", "That isn't a user ID.");
+  try {
+    return await inTransaction(db, async (tx) => {
+      const admin = await resolveSession(tx, adminToken, call);
+      if (!admin.ok) return refused(admin.code, admin.message);
+      if (!admin.session.systemAdmin) {
+        return refused("not_permitted", "Only a system admin can do that.");
+      }
+      const ended = await endAllSessionsForUser(tx, userId);
+      return { ok: true, value: { ended } };
+    });
+  } catch (error) {
+    return refusedFor(error, call);
   }
-  return inTransaction(db, async (tx) => {
-    const admins = await tx.rows<{ ok: boolean }>(sql`
-      SELECT system_admin AND disabled_at IS NULL AS ok FROM public.users WHERE id = ${by}::uuid`);
-    if (admins[0]?.ok !== true) return refused("not_permitted", "Only a system admin can do that.");
-    const ended = await tx.execute(
-      sql`DELETE FROM public.sessions WHERE user_id = ${userId}::uuid`,
-    );
-    return { ok: true, value: { ended } };
-  });
 }
 
 // ---------------------------------------------------------------------------
 // Cleanup
 
 /**
- * Deletes sessions that have ended: past their absolute end, or (full ones)
- * unused for longer than their idle limit. Returns how many went. Lookups
- * refuse them anyway; this only keeps the table small.
+ * Deletes sessions that have ended: past their absolute end, (full ones)
+ * unused for longer than their idle limit, or no longer allowed
+ * (`session_access_ok`: a disabled account, a sign-in before
+ * `sessions_valid_after`, a lost membership). Returns how many went.
+ * Lookups refuse them anyway; this only keeps the table small. Database
+ * errors are thrown (the command reports only their SQLSTATE).
  */
 export async function deleteExpiredSessions(db: Queryable): Promise<number> {
-  return db.execute(sql`DELETE FROM public.sessions s WHERE NOT public.session_live(s)`);
+  return db.execute(sql`DELETE FROM public.sessions s WHERE NOT (${VALID})`);
 }
 
 /** What `runCleanup` removed. */

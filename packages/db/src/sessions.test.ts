@@ -16,6 +16,7 @@ import {
   newOrganizationId,
   newSessionId,
   newSessionToken,
+  throttleAccountKey,
   type OrganizationId,
   type SessionId,
   type UserId,
@@ -40,6 +41,7 @@ import {
   SESSION_TABLE_PRIVILEGES,
   beginSession,
   deleteExpiredSessions,
+  endAllSessionsForUser,
   endOtherSessions,
   endOwnSession,
   endSession,
@@ -223,6 +225,47 @@ async function rowsOf(userId: UserId): Promise<{ id: string; stage: string }[]> 
   return db.rows(sql`SELECT id::text, stage FROM public.sessions WHERE user_id = ${userId}::uuid`);
 }
 
+/**
+ * A full session without a password check (no scrypt, so race loops stay
+ * fast): a waiting session inserted directly, as the owner, then promoted.
+ */
+async function fastFull(
+  userId: UserId,
+  organizationId: OrganizationId,
+): Promise<{ token: string; sessionId: SessionId }> {
+  const token = newSessionToken();
+  const id = newSessionId();
+  await db.execute(sql`
+    INSERT INTO public.sessions (id, token_hash, user_id, organization_id, stage, signed_in_at,
+      created_at, last_seen_at, rotated_at, password_at, idle_seconds, absolute_seconds, expires_at)
+    SELECT ${id}::uuid, ${hashSessionToken(token)}, ${userId}::uuid, ${organizationId}::uuid,
+      'second_step', t, t, t, t, t, 14400, 43200, t + interval '10 minutes'
+    FROM (SELECT clock_timestamp() AS t) c`);
+  const r = await promoteSession(db, token, passedSecondStep(id, userId));
+  if (!r.ok) throw new Error(JSON.stringify(r));
+  return { token: r.token, sessionId: id };
+}
+
+/** Sessions of `userId` the database would still accept. */
+async function liveRowsOf(userId: UserId): Promise<number> {
+  const rows = await db.rows<{ n: string }>(sql`
+    SELECT count(*) AS n FROM public.sessions s
+    WHERE user_id = ${userId}::uuid AND public.session_live(s)
+      AND public.session_access_ok(s.user_id, s.organization_id, s.signed_in_at)`);
+  return Number(rows[0]?.n ?? "0");
+}
+
+/** Ends all of a user's sessions as T-039's reset will, outside the races. */
+async function endAllDirect(userId: UserId): Promise<void> {
+  await db.transaction((tx) => endAllSessionsForUser(tx, userId));
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const RACE_ROUNDS = 30;
+
 function median(values: number[]): number {
   const s = [...values].sort((a, b) => a - b);
   return s[Math.floor(s.length / 2)] ?? 0;
@@ -283,7 +326,7 @@ describe("signing in gives only a session waiting for its second step", () => {
     expect(codesOf(await endOwnSession(db, p.token, p.sessionId))).toEqual(["no_session"]);
     expect(await rowsOf(person.userId)).toEqual([{ id: p.sessionId, stage: "second_step" }]);
     // Sign-out works in this stage.
-    expect(await endSession(db, p.token)).toEqual({ ended: true });
+    expect(await endSession(db, p.token)).toEqual({ ok: true, ended: true });
     expect(await readPendingSession(db, p.token)).toBe(NO_SESSION);
   });
 
@@ -410,36 +453,78 @@ describe("promotion needs a proof that only the second step makes", () => {
     ).toMatchObject({ ok: false, code: "not_permitted" });
   });
 
+  it("asks a system admin with no memberships to name the organization", async () => {
+    await ready();
+    const p = await pending({ email: ADMIN_EMAIL });
+    const proof = passedSecondStep(p.sessionId, admin);
+    expect(await promoteSession(db, p.token, proof)).toMatchObject({
+      ok: false,
+      code: "organization_required",
+    });
+    expect(
+      await promoteSession(db, p.token, proof, { organizationId: newOrganizationId() }),
+    ).toMatchObject({ ok: false, code: "not_permitted" });
+    const org = await organization();
+    expect(await promoteSession(db, p.token, proof, { organizationId: org })).toMatchObject({
+      ok: true,
+      session: { organizationId: org, systemAdmin: true },
+    });
+  });
+
+  it("counts a system admin's sign-in to an organization that doesn't exist as a failed attempt", async () => {
+    await ready();
+    const key = throttleAccountKey(ADMIN_EMAIL);
+    await db.execute(sql`DELETE FROM public.sign_in_throttles WHERE key = ${key}`);
+    expect(
+      await beginSession(db, {
+        email: ADMIN_EMAIL,
+        password: ADMIN_PASSWORD,
+        source: source(),
+        organizationId: newOrganizationId(),
+      }),
+    ).toBe(INVALID_CREDENTIALS);
+    const rows = await db.rows<{ failures: number }>(
+      sql`SELECT failures FROM public.sign_in_throttles WHERE key = ${key}`,
+    );
+    expect(rows[0]?.failures).toBe(1);
+  });
+
   it("is allowed only to sessions.ts and the session tests (the second step is T-038's)", async () => {
     const { readdirSync, readFileSync } = await import("node:fs");
     const { join } = await import("node:path");
-    const root = join(import.meta.dirname, "..", "..");
+    // A speed bump, not the control: code review is (D-069).
+    const repo = join(import.meta.dirname, "..", "..", "..");
     const allowed = new Set([
-      "db/src/sessions.ts",
-      "db/src/sessions.test.ts",
-      "db/src/second-step.ts",
+      "packages/db/src/sessions.ts",
+      "packages/db/src/sessions.test.ts",
+      "packages/db/src/second-step.ts",
     ]);
+    const dirs = [
+      ...readdirSync(join(repo, "packages")).map((pkg) => join("packages", pkg, "src")),
+      "scripts",
+      "tools",
+    ];
     const offenders: string[] = [];
-    for (const pkg of readdirSync(root)) {
-      const dir = join(root, pkg, "src");
+    let scanned = 0;
+    for (const dir of dirs) {
       let files: string[];
       try {
-        files = readdirSync(dir, { recursive: true }) as string[];
+        files = readdirSync(join(repo, dir), { recursive: true }) as string[];
       } catch {
         continue;
       }
       for (const file of files) {
-        if (!/\.(ts|mts|cts|js|mjs)$/.test(file)) continue;
-        const name = `${pkg}/src/${file}`;
-        const text = readFileSync(join(dir, file), "utf8");
-        if (
-          /second-step(\.js)?["']|passedSecondStep|promoteSession/.test(text) &&
-          !allowed.has(name)
-        ) {
+        if (file.split(/[\\/]/).includes("node_modules")) continue;
+        if (!/\.(ts|mts|cts|tsx|js|mjs|cjs|jsx|py)$/.test(file)) continue;
+        const name = join(dir, file).split("\\").join("/");
+        const text = readFileSync(join(repo, dir, file), "utf8");
+        scanned += 1;
+        if (/second-step|passedSecondStep|promoteSession/.test(text) && !allowed.has(name)) {
           offenders.push(name);
         }
       }
     }
+    expect(scanned).toBeGreaterThan(50);
     expect(offenders).toEqual([]);
     // Not part of the package's public surface either.
     const index = await import("./index.js");
@@ -544,7 +629,7 @@ describe("full sessions", () => {
     expect(forms.length).toBeGreaterThan(6);
     for (const form of forms) {
       expect({ form, r: await resolveSession(db, form) }).toEqual({ form, r: NO_SESSION });
-      expect(await endSession(db, form)).toEqual({ ended: false });
+      expect(await endSession(db, form)).toEqual({ ok: true, ended: false });
     }
     expect((await resolveSession(db, s.token)).ok).toBe(true);
   });
@@ -577,13 +662,25 @@ describe("full sessions", () => {
     });
     const again = await reauthenticate(db, s.token, { password: PASSWORD, source: from });
     expect(again).toMatchObject({ ok: true, session: { recentlyAuthenticated: true } });
+    if (!again.ok) throw new Error("not re-authenticated");
+    // A new token (ASVS session rotation on re-authentication); the old one is dead.
+    expect(again.token).not.toBe(s.token);
+    expect(await resolveSession(db, s.token)).toBe(NO_SESSION);
+    expect(await resolveSession(db, again.token)).toMatchObject({
+      session: { sessionId: s.session.sessionId, recentlyAuthenticated: true },
+    });
     // Wrong guesses count toward the sign-in wait (D-068): after 5, a wait.
     for (let i = 0; i < 5; i++) {
-      await reauthenticate(db, s.token, { password: `wrong ${String(i)}`, source: source() });
+      await reauthenticate(db, again.token, { password: `wrong ${String(i)}`, source: source() });
     }
     expect(
-      await reauthenticate(db, s.token, { password: PASSWORD, source: source() }),
+      await reauthenticate(db, again.token, { password: PASSWORD, source: source() }),
     ).toMatchObject({ ok: false, code: "throttled" });
+    // The database refuses a recent re-entry without a new token.
+    await expect(
+      db.execute(sql`UPDATE public.sessions SET password_at = clock_timestamp()
+        WHERE id = ${s.session.sessionId}::uuid`),
+    ).rejects.toMatchObject({ constraint: "sessions_times" });
   });
 });
 
@@ -638,9 +735,9 @@ describe("a person's own sessions", () => {
     expect((await resolveSession(db, mine.token)).ok).toBe(true);
     expect((await resolveSession(db, theirs.token)).ok).toBe(true);
     // Sign-out.
-    expect(await endSession(db, mine.token)).toEqual({ ended: true });
+    expect(await endSession(db, mine.token)).toEqual({ ok: true, ended: true });
     expect(await resolveSession(db, mine.token)).toBe(NO_SESSION);
-    expect(await endSession(db, mine.token)).toEqual({ ended: false });
+    expect(await endSession(db, mine.token)).toEqual({ ok: true, ended: false });
   });
 
   it("can all be ended by a system admin, and by nobody else", async () => {
@@ -649,14 +746,21 @@ describe("a person's own sessions", () => {
     const person = await member(org);
     const other = await member(org);
     const s = await full(person, org);
-    expect(codesOf(await endUserSessions(db, { userId: person.userId, by: other.userId }))).toEqual(
-      ["not_permitted"],
-    );
+    const notAdmin = await full(other, org);
+    expect(codesOf(await endUserSessions(db, notAdmin.token, person.userId))).toEqual([
+      "not_permitted",
+    ]);
+    // A user ID alone is not enough: it takes an admin's own live session.
+    expect(codesOf(await endUserSessions(db, newSessionToken(), person.userId))).toEqual([
+      "no_session",
+    ]);
     expect((await resolveSession(db, s.token)).ok).toBe(true);
-    expect(ok(await endUserSessions(db, { userId: person.userId, by: admin }))).toEqual({
+    const adminSession = await full({ email: ADMIN_EMAIL }, org);
+    expect(ok(await endUserSessions(db, adminSession.token, person.userId))).toEqual({
       ended: 1,
     });
     expect(await resolveSession(db, s.token)).toBe(NO_SESSION);
+    expect((await resolveSession(db, adminSession.token)).ok).toBe(true);
   });
 });
 
@@ -806,6 +910,36 @@ describe("accounts and memberships", () => {
     expect((await rowsOf(person.userId)).length).toBe(1);
     expect(await resolveSession(db, s.token)).toBe(NO_SESSION);
     expect(await listSessions(db, s.token)).toBe(NO_SESSION);
+    // Re-enabling revives nothing: the row is from before sessions_valid_after.
+    await db.execute(
+      sql`UPDATE public.users SET disabled_at = NULL WHERE id = ${person.userId}::uuid`,
+    );
+    expect((await rowsOf(person.userId)).length).toBe(1);
+    expect(await resolveSession(db, s.token)).toBe(NO_SESSION);
+    // The cleanup removes it, and a new sign-in works.
+    await runCleanup(db);
+    expect(await rowsOf(person.userId)).toEqual([]);
+    expect((await full(person, org)).session.userId).toBe(person.userId);
+  });
+
+  it("sessions_valid_after only moves forward and never past now, for any writer", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const s = await full(person, org);
+    await expect(
+      db.execute(sql`UPDATE public.users SET sessions_valid_after = clock_timestamp() + interval '1 day'
+        WHERE id = ${person.userId}::uuid`),
+    ).rejects.toMatchObject({ constraint: "users_sessions_valid_after" });
+    expect((await resolveSession(db, s.token)).ok).toBe(true);
+    await db.execute(sql`UPDATE public.users SET sessions_valid_after = clock_timestamp()
+      WHERE id = ${person.userId}::uuid`);
+    expect(await resolveSession(db, s.token)).toBe(NO_SESSION);
+    expect(await rowsOf(person.userId)).toEqual([]);
+    await expect(
+      db.execute(sql`UPDATE public.users SET sessions_valid_after = '-infinity'
+        WHERE id = ${person.userId}::uuid`),
+    ).rejects.toMatchObject({ constraint: "users_sessions_valid_after" });
   });
 
   it("removing a membership ends the sessions in that organization only", async () => {
@@ -894,6 +1028,303 @@ describe("two connections at once", () => {
     }
   });
 });
+
+describe("database errors", () => {
+  /** A connection whose every query fails with `error`. */
+  function failing(error: Error): Database {
+    const fail = () => Promise.reject(error);
+    return {
+      rows: fail,
+      execute: fail,
+      transaction: fail,
+      close: () => Promise.resolve(),
+    };
+  }
+
+  it("come back as fixed refusals, the raw error only to onError, never a token", async () => {
+    const token = newSessionToken();
+    for (const [code, expected] of [
+      ["57014", "timeout"],
+      ["40001", "retry"],
+      ["40P01", "retry"],
+      ["08006", "database_unavailable"],
+      ["53300", "database_unavailable"],
+      ["XX000", "internal_error"],
+      ["42501", "internal_error"],
+    ] as const) {
+      const error = Object.assign(new Error(`failed near ${token}`), { code });
+      const seen: unknown[] = [];
+      const onError = (e: unknown) => seen.push(e);
+      const conn = failing(error);
+      for (const r of [
+        await resolveSession(conn, token, { onError }),
+        await readPendingSession(conn, token, { onError }),
+        await rotateSession(conn, token, { onError }),
+        await listSessions(conn, token, { onError }),
+        await endSession(conn, token, { onError }),
+        await endOtherSessions(conn, token, { onError }),
+        await switchOrganization(conn, token, newOrganizationId(), { onError }),
+      ]) {
+        expect(r).toMatchObject({ ok: false, code: expected });
+        expect(JSON.stringify(r)).not.toContain(token);
+      }
+      expect(codesOf(await endOwnSession(conn, token, newSessionId(), { onError }))).toEqual([
+        expected,
+      ]);
+      expect(seen.length).toBeGreaterThanOrEqual(8);
+      expect(seen.every((e) => e === error)).toBe(true);
+    }
+  });
+
+  it("ignore a failing onError, and throw what isn't a database error", async () => {
+    const token = newSessionToken();
+    const conn = failing(Object.assign(new Error("x"), { code: "57014" }));
+    expect(
+      await resolveSession(conn, token, {
+        onError: () => {
+          throw new Error("log down");
+        },
+      }),
+    ).toMatchObject({ code: "timeout" });
+    await expect(resolveSession(failing(new Error("a bug")), token)).rejects.toThrow("a bug");
+    await expect(
+      resolveSession(conn, token, { onError: "no" } as unknown as { onError: () => void }),
+    ).rejects.toThrow(TypeError);
+  });
+});
+
+describe(
+  "ending sessions while they are being made (review B1, two connections, looped)",
+  { timeout: 120_000 },
+  () => {
+    it("sign out everywhere else ends a copy being switched at the same moment", async () => {
+      await ready();
+      const other = openDatabase(testDb.url, { max: 4 });
+      try {
+        const orgA = await organization();
+        const orgB = await organization();
+        const person = await member(orgA, orgB);
+        for (let round = 0; round < RACE_ROUNDS; round++) {
+          const caller = await fastFull(person.userId, orgA);
+          const thief = await fastFull(person.userId, orgA);
+          const [ended, moved] = await Promise.all([
+            endOtherSessions(db, caller.token),
+            switchOrganization(other, thief.token, orgB),
+          ]);
+          expect({ round, ok: ended.ok }).toEqual({ round, ok: true });
+          expect(await resolveSession(db, thief.token)).toBe(NO_SESSION);
+          if (moved.ok) expect(await resolveSession(db, moved.token)).toBe(NO_SESSION);
+          expect((await resolveSession(db, caller.token)).ok).toBe(true);
+          expect({ round, live: await liveRowsOf(person.userId) }).toEqual({ round, live: 1 });
+          await endSession(db, caller.token);
+        }
+      } finally {
+        await other.close();
+      }
+    });
+
+    it("sign out everywhere else ends a copy whose switch is provably mid-way (ordered, not left to timing)", async () => {
+      await ready();
+      const other = openDatabase(testDb.url, { max: 4 });
+      const holder = openDatabase(testDb.url, { max: 1 });
+      try {
+        const orgA = await organization();
+        const orgB = await organization();
+        const person = await member(orgA, orgB);
+        for (let round = 0; round < 10; round++) {
+          const caller = await fastFull(person.userId, orgA);
+          const thief = await fastFull(person.userId, orgA);
+          // A third connection holds the thief's session row, so the switch
+          // stops inside its transaction, at its row lock, after whatever it
+          // took before.
+          let release = (): void => undefined;
+          const gate = new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          let held = (): void => undefined;
+          const holding = new Promise<void>((resolve) => {
+            held = resolve;
+          });
+          const holderDone = holder.transaction(async (q) => {
+            await q.rows(sql`SELECT 1 FROM public.sessions
+            WHERE id = ${thief.sessionId}::uuid FOR UPDATE`);
+            held();
+            await gate;
+          });
+          await holding;
+          const moving = switchOrganization(other, thief.token, orgB);
+          await sleep(100);
+          const ending = endOtherSessions(db, caller.token);
+          await sleep(100);
+          release();
+          await holderDone;
+          const [moved, ended] = await Promise.all([moving, ending]);
+          expect({ round, ok: ended.ok }).toEqual({ round, ok: true });
+          if (moved.ok) expect(await resolveSession(db, moved.token)).toBe(NO_SESSION);
+          expect({ round, live: await liveRowsOf(person.userId) }).toEqual({ round, live: 1 });
+          expect((await resolveSession(db, caller.token)).ok).toBe(true);
+          await endSession(db, caller.token);
+        }
+      } finally {
+        await holder.close();
+        await other.close();
+      }
+    });
+
+    it("the caller's own switch at the same moment keeps the caller signed in", async () => {
+      await ready();
+      const other = openDatabase(testDb.url, { max: 4 });
+      try {
+        const orgA = await organization();
+        const orgB = await organization();
+        const person = await member(orgA, orgB);
+        for (let round = 0; round < RACE_ROUNDS; round++) {
+          const caller = await fastFull(person.userId, orgA);
+          const elsewhere = await fastFull(person.userId, orgA);
+          const [ended, moved] = await Promise.all([
+            endOtherSessions(db, caller.token),
+            switchOrganization(other, caller.token, orgB),
+          ]);
+          // Whichever ran first, the caller's own session survives, moved.
+          if (!moved.ok) throw new Error(`round ${String(round)}: ${JSON.stringify(moved)}`);
+          expect((await resolveSession(db, moved.token)).ok).toBe(true);
+          expect(await resolveSession(db, caller.token)).toBe(NO_SESSION);
+          if (ended.ok) {
+            // It ran first: the other session is gone.
+            expect(await resolveSession(db, elsewhere.token)).toBe(NO_SESSION);
+          } else {
+            // The switch ran first, so the old token was gone: nothing ended.
+            expect(ended).toBe(NO_SESSION);
+          }
+          await endAllDirect(person.userId);
+        }
+      } finally {
+        await other.close();
+      }
+    });
+
+    it("a system admin ending someone's sessions ends a copy being switched at the same moment", async () => {
+      await ready();
+      const other = openDatabase(testDb.url, { max: 4 });
+      try {
+        const orgA = await organization();
+        const orgB = await organization();
+        const person = await member(orgA, orgB);
+        const adminSession = await fastFull(admin, orgA);
+        for (let round = 0; round < RACE_ROUNDS; round++) {
+          const s = await fastFull(person.userId, orgA);
+          const [ended, moved] = await Promise.all([
+            endUserSessions(db, adminSession.token, person.userId),
+            switchOrganization(other, s.token, orgB),
+          ]);
+          expect({ round, ok: ended.ok }).toEqual({ round, ok: true });
+          if (moved.ok) expect(await resolveSession(db, moved.token)).toBe(NO_SESSION);
+          expect(await resolveSession(db, s.token)).toBe(NO_SESSION);
+          expect({ round, live: await liveRowsOf(person.userId) }).toEqual({ round, live: 0 });
+        }
+      } finally {
+        await other.close();
+      }
+    });
+
+    it("disabling an account ends a copy being switched, and re-enabling revives nothing", async () => {
+      await ready();
+      const other = openDatabase(testDb.url, { max: 4 });
+      try {
+        const orgA = await organization();
+        const orgB = await organization();
+        const person = await member(orgA, orgB);
+        for (let round = 0; round < RACE_ROUNDS; round++) {
+          const s = await fastFull(person.userId, orgA);
+          const [, moved] = await Promise.all([
+            sleep(round % 3).then(() =>
+              db.execute(
+                sql`UPDATE public.users SET disabled_at = now() WHERE id = ${person.userId}::uuid`,
+              ),
+            ),
+            switchOrganization(other, s.token, orgB),
+          ]);
+          await db.execute(
+            sql`UPDATE public.users SET disabled_at = NULL WHERE id = ${person.userId}::uuid`,
+          );
+          expect(await resolveSession(db, s.token)).toBe(NO_SESSION);
+          if (moved.ok) expect(await resolveSession(db, moved.token)).toBe(NO_SESSION);
+          expect({ round, rows: (await rowsOf(person.userId)).length }).toEqual({ round, rows: 0 });
+        }
+      } finally {
+        await other.close();
+      }
+    });
+
+    it("disabling an account during a sign-in leaves no session that re-enabling revives", async () => {
+      await ready();
+      const other = openDatabase(testDb.url, { max: 4 });
+      try {
+        const org = await organization();
+        const person = await member(org);
+        let made = 0;
+        for (let round = 0; round < RACE_ROUNDS; round++) {
+          // A sign-in refused because the account was disabled counts as a
+          // failure (D-068); start each round with no wait.
+          await db.execute(sql`DELETE FROM public.sign_in_throttles
+          WHERE key = ${throttleAccountKey(person.email)}`);
+          const [started] = await Promise.all([
+            beginSession(other, {
+              email: person.email,
+              password: PASSWORD,
+              source: source(),
+              organizationId: org,
+            }),
+            sleep((round * 37) % 300).then(() =>
+              db.execute(
+                sql`UPDATE public.users SET disabled_at = now() WHERE id = ${person.userId}::uuid`,
+              ),
+            ),
+          ]);
+          await db.execute(
+            sql`UPDATE public.users SET disabled_at = NULL WHERE id = ${person.userId}::uuid`,
+          );
+          if (started.ok) {
+            made += 1;
+            expect(await readPendingSession(db, started.token)).toBe(NO_SESSION);
+          } else {
+            expect(started).toBe(INVALID_CREDENTIALS);
+          }
+          expect({ round, rows: (await rowsOf(person.userId)).length }).toEqual({ round, rows: 0 });
+        }
+        // Both orders happened at least once, or the loop proved little.
+        expect(made).toBeGreaterThan(0);
+        expect(made).toBeLessThan(RACE_ROUNDS);
+      } finally {
+        await other.close();
+      }
+    });
+
+    it("removing a membership ends a copy being switched into that organization", async () => {
+      await ready();
+      const other = openDatabase(testDb.url, { max: 4 });
+      try {
+        for (let round = 0; round < 5; round++) {
+          const orgA = await organization();
+          const orgB = await organization();
+          const person = await member(orgA, orgB);
+          const s = await fastFull(person.userId, orgA);
+          const [, moved] = await Promise.all([
+            db.execute(sql`DELETE FROM public.organization_members
+            WHERE user_id = ${person.userId}::uuid AND organization_id = ${orgB}::uuid`),
+            switchOrganization(other, s.token, orgB),
+          ]);
+          if (moved.ok) expect(await resolveSession(db, moved.token)).toBe(NO_SESSION);
+          const left = await db.rows(sql`SELECT 1 FROM public.sessions
+          WHERE user_id = ${person.userId}::uuid AND organization_id = ${orgB}::uuid`);
+          expect({ round, left: left.length }).toEqual({ round, left: 0 });
+        }
+      } finally {
+        await other.close();
+      }
+    });
+  },
+);
 
 describe("every unusable token", () => {
   it("gets the same answer, in about the same time, whether unknown or known but unusable", async () => {
@@ -984,7 +1415,8 @@ describe("guards in replica mode and the writer role", () => {
       FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
       WHERE n.nspname = 'public' AND NOT t.tgisinternal
-        AND (c.relname = 'sessions' OR t.tgname LIKE '%end_sessions')
+        AND (c.relname = 'sessions' OR t.tgname LIKE '%end_sessions'
+             OR t.tgname = 'users_sessions_valid_after')
       ORDER BY 1`);
     expect(rows).toEqual([
       { name: "organization_members.organization_members_end_sessions", enabled: "A" },
@@ -992,6 +1424,7 @@ describe("guards in replica mode and the writer role", () => {
       { name: "sessions.sessions_check_new", enabled: "A" },
       { name: "sessions.zzzz_sessions_keep_identity", enabled: "A" },
       { name: "users.users_end_sessions", enabled: "A" },
+      { name: "users.users_sessions_valid_after", enabled: "A" },
     ]);
     const org = await organization();
     const second = await organization();
@@ -1070,19 +1503,22 @@ describe("guards in replica mode and the writer role", () => {
       if (!r.ok) throw new Error("not rotated");
       const moved = await switchOrganization(writer, r.token, orgB);
       if (!moved.ok) throw new Error("not switched");
-      expect(
-        await reauthenticate(writer, moved.token, { password: PASSWORD, source: source() }),
-      ).toMatchObject({ ok: true });
-      const list = await listSessions(writer, moved.token);
+      const re = await reauthenticate(writer, moved.token, {
+        password: PASSWORD,
+        source: source(),
+      });
+      if (!re.ok) throw new Error("not re-authenticated");
+      const list = await listSessions(writer, re.token);
       expect(list.ok && list.sessions.length).toBe(1);
       const second = await full(person, orgA, writer);
-      expect(await endOtherSessions(writer, moved.token)).toEqual({ ok: true, ended: 1 });
+      expect(await endOtherSessions(writer, re.token)).toEqual({ ok: true, ended: 1 });
       expect(await resolveSession(writer, second.token)).toBe(NO_SESSION);
-      expect(ok(await endUserSessions(writer, { userId: person.userId, by: admin }))).toEqual({
+      const adminSession = await full({ email: ADMIN_EMAIL }, orgA, writer);
+      expect(ok(await endUserSessions(writer, adminSession.token, person.userId))).toEqual({
         ended: 1,
       });
       const last = await full(person, orgA, writer);
-      expect(await endSession(writer, last.token)).toEqual({ ended: true });
+      expect(await endSession(writer, last.token)).toEqual({ ok: true, ended: true });
       await runCleanup(writer);
       // Disabling (as T-048 will, through the writer) ends sessions.
       const again = await full(person, orgA, writer);
