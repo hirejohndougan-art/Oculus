@@ -68,8 +68,10 @@ import {
   isOrganizationId,
   isPlainObject,
   isRecordId,
+  isSiteId,
   issue,
   newRecordId,
+  worksOnSite,
   readPlainData,
   templateMoveChanges,
   validateRecord,
@@ -80,6 +82,7 @@ import {
   type Permission,
   type RecordId,
   type RecordIdentifiers,
+  type SiteId,
 } from "@oculus/core";
 import {
   RecordAccess,
@@ -131,6 +134,21 @@ export interface ServiceContext {
   readonly organizationId: OrganizationId;
   /** The signed-in person, `user:<uuid v4>`, or a job, `system:<name>` (D-063). */
   readonly actor: string;
+  /**
+   * The site the person is working in (D-074): new records are made there.
+   * Optional (`null` or left out: no site), since a session doesn't carry it
+   * yet (T-045's site selector will); the service checks that the person has
+   * a role on it. Without one, only a system manager can make records (on no
+   * site).
+   */
+  readonly siteId?: SiteId | null;
+}
+
+/** The context as read: the organization, the actor and the working site. */
+interface Who {
+  readonly organizationId: OrganizationId;
+  readonly actor: string;
+  readonly siteId: SiteId | null;
 }
 
 /** A refusal: what is wrong, and for an edit conflict what changed since (names only, T-031). */
@@ -293,6 +311,7 @@ class Refused extends Error {
 /** The draft keys a person edits. */
 const CONTENT_KEYS: ReadonlySet<string> = new Set([
   "kind",
+  "siteId",
   "title",
   "templateKey",
   "recordTypeKey",
@@ -381,20 +400,19 @@ function keyBeyond(value: unknown, allowed: ReadonlySet<string>): string | undef
 
 const WRONG_ORGANIZATION = "This names another organization than the one you are working in.";
 
-/** The context, read safely: the organization and actor, or a refusal. */
-function readContext(
-  context: unknown,
-): ServiceResult<{ organizationId: OrganizationId; actor: string }> {
-  const extra = keyBeyond(context, new Set(["organizationId", "actor"]));
+/** The context, read safely: the organization, actor and working site, or a refusal. */
+function readContext(context: unknown): ServiceResult<Who> {
+  const extra = keyBeyond(context, new Set(["organizationId", "actor", "siteId"]));
   if (extra !== undefined) {
     return refusal(
       ["context", extra],
       "unknown_property",
-      "The context is organizationId and actor.",
+      "The context is organizationId, actor and siteId.",
     );
   }
   const organizationId = ownValue(context, "organizationId");
   const actor = ownValue(context, "actor");
+  const siteId = ownValue(context, "siteId") ?? null;
   if (!isOrganizationId(organizationId)) {
     return refusal(
       ["context", "organizationId"],
@@ -409,7 +427,14 @@ function readContext(
       "The actor is user:<uuid v4> or system:<name>.",
     );
   }
-  return { ok: true, value: { organizationId, actor } };
+  if (siteId !== null && !isSiteId(siteId)) {
+    return refusal(
+      ["context", "siteId"],
+      "invalid_site",
+      "The working site must be a lowercase version 4 UUID, or null.",
+    );
+  }
+  return { ok: true, value: { organizationId, actor, siteId } };
 }
 
 /** Options read safely: only `allowed` keys, own data properties. */
@@ -666,42 +691,57 @@ function cleanError(error: unknown): ServiceRefusal {
   }
 }
 
-/** Where a record sits, for permissions: its parent (a unit) or what it represents (an asset). */
-function positionOf(record: {
+/** Where a record sits, for permissions: its home site, and its parent (a unit) or what it represents (an asset). */
+interface Placed {
   readonly kind: string;
   readonly parentId?: RecordId | null;
   readonly represents?: RecordId | null;
-}): RecordPosition {
+  readonly siteId?: SiteId | null;
+}
+
+function positionOf(record: Placed): RecordPosition {
   return {
     kind: record.kind,
     parentId: record.kind === "archival_unit" ? (record.parentId ?? null) : null,
     represents: record.kind === "digital_asset" ? (record.represents ?? null) : null,
+    siteId: record.siteId ?? null,
   };
 }
 
 /**
  * A record moving from `before`'s place to `after`'s (a unit's parent, an
- * asset's represented record): the person needs the edit permission at the
- * place it leaves and at the place it goes (T-041). Leaving a place they
- * can't change is `not_permitted` (they can see the record, and so its
- * parent); going to a place they can't see is refused as a missing parent
- * or represented record would be.
+ * asset's represented record, its home site): the person needs the edit
+ * permission at the place it leaves and at the place it goes (T-041,
+ * D-074). Leaving a place they can't change is `not_permitted` (they can
+ * see the record, and so its parent); going to a place they can't see is
+ * refused as a missing parent or represented record would be, and to a
+ * site they have no role on as a site that doesn't exist.
  */
 async function moveIssues(
   checker: RecordAccess,
-  before: {
-    readonly kind: string;
-    readonly parentId?: RecordId | null;
-    readonly represents?: RecordId | null;
-  },
+  before: Placed,
   after: CatalogRecord,
 ): Promise<Refusal | undefined> {
   const from = positionOf(before);
   const to = positionOf(after);
-  if (from.parentId === to.parentId && from.represents === to.represents) return undefined;
+  if (
+    from.parentId === to.parentId &&
+    from.represents === to.represents &&
+    from.siteId === to.siteId
+  ) {
+    return undefined;
+  }
   const permissions = editPermissions(after.kind);
+  if (from.siteId !== to.siteId && to.siteId != null && !(await checker.worksOn(to.siteId))) {
+    return unknownSite(["siteId"]);
+  }
   if (await checker.intoPlace(from, permissions, true)) return notPermitted();
   return checker.intoPlace(to, permissions, true);
+}
+
+/** A site the person has no role on, answered as one that doesn't exist. */
+function unknownSite(path: readonly (string | number)[]): ServiceRefusal {
+  return refusal(path, "unknown_site", "There is no such site.");
 }
 
 /**
@@ -766,10 +806,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
   async function run<T>(
     operation: string,
     context: unknown,
-    work: (
-      tx: Queryable,
-      who: { organizationId: OrganizationId; actor: string },
-    ) => Promise<ServiceResult<T>>,
+    work: (tx: Queryable, who: Who) => Promise<ServiceResult<T>>,
   ): Promise<ServiceResult<T>> {
     const who = readContext(context);
     if (!who.ok) return who;
@@ -886,7 +923,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
   /** The actor's access, as a `RecordAccess` for this transaction. */
   async function accessFor(
     tx: Queryable,
-    who: { organizationId: OrganizationId; actor: string },
+    who: Who,
     mode: "write" | "read" = "write",
   ): Promise<ServiceResult<RecordAccess>> {
     const access = await readAccess(tx, who.organizationId, who.actor);
@@ -919,7 +956,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
    */
   async function mayChange(
     tx: Queryable,
-    who: { organizationId: OrganizationId; actor: string },
+    who: Who,
     recordId: RecordId,
     rowLock: "no_key_update" | "update" | "share",
     all: readonly Permission[],
@@ -930,7 +967,13 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
     const place = await lockedPlace(tx, who.organizationId, recordId, rowLock);
     if (place === undefined) return noSuchRecord();
     const denied = await allowed.value.onRecord(
-      { kind: place.kind, id: recordId, parentId: place.parentId, represents: place.represents },
+      {
+        kind: place.kind,
+        id: recordId,
+        parentId: place.parentId,
+        represents: place.represents,
+        siteId: place.siteId,
+      },
       all,
       any(place.kind),
     );
@@ -946,11 +989,22 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         if (!reason.ok) return reason;
         const draft = readDraft(draftInput, who.organizationId, "create");
         if (!draft.ok) return draft;
+        // A new record joins the site the person is working in (D-074); a
+        // draft may name that site, never another.
+        const namedSite = own(draft.value, "siteId");
+        if (namedSite !== undefined && namedSite !== who.siteId) {
+          return refusal(
+            ["siteId"],
+            "wrong_site",
+            "A new record joins the site you are working in.",
+          );
+        }
         const stamp = now();
         if (!stamp.ok) return stamp;
         const valid = validateRecord({
           fields: {},
           ...contentOf(draft.value),
+          ...(who.siteId === null ? {} : { siteId: who.siteId }),
           id: newRecordId(),
           organizationId: who.organizationId,
           createdAt: stamp.value,
@@ -961,6 +1015,15 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         // Who may make it, where it goes (T-041), before any record is locked.
         const allowed = await accessFor(tx, who);
         if (!allowed.ok) return allowed;
+        // The working site must be one they have a role on (D-074): any
+        // other is answered as a site that doesn't exist.
+        if (who.siteId !== null && !(await allowed.value.worksOn(who.siteId))) {
+          return unknownSite(["context", "siteId"]);
+        }
+        // The arrangement lock before the parent is locked and checked (D-065).
+        if (record.kind === "archival_unit" && record.parentId !== undefined) {
+          await lockArrangement(tx, who.organizationId);
+        }
         const denied = await allowed.value.intoPlace(
           positionOf(record),
           createPermissions(record.kind),
@@ -969,10 +1032,6 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         if (denied) return denied;
         if (record.templateKey === undefined) {
           return refusal(["templateKey"], "no_template_key", "Every record names its template.");
-        }
-        // The arrangement lock before any check of the parent (D-065).
-        if (record.kind === "archival_unit" && record.parentId !== undefined) {
-          await lockArrangement(tx, who.organizationId);
         }
         // Links to records the actor can't view: as links to none (D-072).
         const hiddenLinks = await allowed.value.hiddenAmong(addedLinks(record));
@@ -1056,6 +1115,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
             id: recordId,
             parentId: place.parentId,
             represents: place.represents,
+            siteId: place.siteId,
           },
           [],
           editPermissions(place.kind),
@@ -1101,6 +1161,9 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         if (!stamp.ok) return stamp;
         const valid = validateRecord({
           fields: {},
+          // A draft that leaves out the home site keeps it (D-074): a record
+          // leaves its site only by naming another.
+          ...(before.siteId === undefined ? {} : { siteId: before.siteId }),
           ...content,
           kind: before.kind,
           id: before.id,
@@ -1247,6 +1310,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
             id: recordId,
             parentId: place.parentId,
             represents: place.represents,
+            siteId: place.siteId,
           },
           ["records.history"],
           editPermissions(place.kind),
@@ -1261,7 +1325,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         if (old !== undefined) {
           const moved = await moveIssues(checker, place, old);
           if (moved) return moved;
-          if (checker.scoped) {
+          if (!checker.access.systemManager) {
             const current = await readStoredRecord(tx, org, recordId);
             hiddenLinks = await checker.hiddenAmong(
               addedLinks(old, current?.ok ? current.value.record : undefined),

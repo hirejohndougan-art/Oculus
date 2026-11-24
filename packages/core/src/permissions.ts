@@ -21,6 +21,14 @@
  * its sites is a permission in its catalog; site permissions
  * (`SITE_PERMISSIONS`) count only on that site.
  *
+ * **Items belong to a site** (D-074). Every catalog record has a home site
+ * (or none yet). A catalog permission granted on a site reaches only the
+ * records whose home site that is; one granted on every site reaches the
+ * records of every site of the organization. Records on no site are
+ * reached by no role: only system managers see them. A scope (below) then
+ * narrows within those. Sharing an item into a second site (T-041b) will
+ * add read-only reach there (`sharedInto`, empty until then).
+ *
  * **What a scoped grant covers.** A record is *in* a unit's subtree when it
  * is that unit or filed below it (`parentId`, all the way up), or when it is
  * a digital asset representing a record that is. Objects, agents, places
@@ -205,15 +213,27 @@ export interface Access {
   readonly grants: readonly RoleGrant[];
 }
 
+/** Where a catalog record is, for its permissions: its home site, and sites it is shared into. */
+interface RecordSite {
+  /** The record's home site (D-074), or `null` for none (system managers only). */
+  readonly site: SiteId | null;
+  /**
+   * Sites that accepted the record from its home site (T-041b): there it is
+   * viewable (`records.view` only), never changed. Empty until T-041b.
+   */
+  readonly sharedInto?: ReadonlySet<SiteId>;
+}
+
 /** What a permission is asked about. */
 export type PermissionTarget =
-  /** Something of the whole catalog: a record outside the arrangement, a new fonds. */
-  | { readonly on: "catalog" }
+  /** A record outside the arrangement, or a new fonds, at its home site. */
+  | ({ readonly on: "catalog" } & RecordSite)
   /**
-   * A record in the arrangement: `units` is every unit whose subtree holds
-   * it (`coveredBy`). An empty set is the same as `catalog`.
+   * A record in the arrangement, at its home site: `units` is every unit
+   * whose subtree holds it (`coveredBy`). An empty set is the same as
+   * `catalog`.
    */
-  | { readonly on: "units"; readonly units: ReadonlySet<RecordId> }
+  | ({ readonly on: "units"; readonly units: ReadonlySet<RecordId> } & RecordSite)
   /** One site. */
   | { readonly on: "site"; readonly siteId: SiteId }
   /** The organization as a whole (organization permissions), or the install (system ones). */
@@ -223,8 +243,10 @@ export type PermissionTarget =
  * Whether `access` holds `permission` for `target`. System permissions:
  * system managers only. Site permissions: a grant on that site or on every
  * site. Organization permissions: a whole-catalog grant on any site.
- * Catalog permissions: a whole-catalog grant, or a grant scoped to one of
- * `units`.
+ * Catalog permissions: a grant on the record's home site or on every site
+ * (never for a record on no site), for the whole catalog or scoped to one
+ * of `units`; `records.view` also from such a grant on a site the record is
+ * shared into.
  */
 export function permits(access: Access, permission: Permission, target: PermissionTarget): boolean {
   if (access.systemManager) return true;
@@ -243,7 +265,15 @@ export function permits(access: Access, permission: Permission, target: Permissi
       // Organization permissions.
       return target.on === "organization" && grant.scope === null;
     }
-    if (grant.scope === null) return target.on === "catalog" || target.on === "units";
+    if (target.on !== "catalog" && target.on !== "units") return false;
+    const onSite = (site: SiteId | null): boolean =>
+      site !== null && (grant.siteId === null || grant.siteId === site);
+    const reaches =
+      onSite(target.site) ||
+      (permission === "records.view" &&
+        [...(target.sharedInto ?? [])].some((shared) => onSite(shared)));
+    if (!reaches) return false;
+    if (grant.scope === null) return true;
     return target.on === "units" && target.units.has(grant.scope);
   });
 }
@@ -259,9 +289,26 @@ export function holdsAnywhere(access: Access, permission: Permission): boolean {
   );
 }
 
-/** Whether `access` holds `permission` for the whole catalog, not only part of it. */
-export function holdsForWholeCatalog(access: Access, permission: CatalogPermission): boolean {
-  return permits(access, permission, { on: "catalog" });
+/**
+ * Whether `access` holds `permission` for the whole catalog of `site` (the
+ * records whose home site it is), not only part of it.
+ */
+export function holdsForWholeCatalog(
+  access: Access,
+  permission: CatalogPermission,
+  site: SiteId,
+): boolean {
+  return permits(access, permission, { on: "catalog", site });
+}
+
+/**
+ * Whether the person may work in `site` at all: a system manager, or anyone
+ * holding a role on that site or on every site of its organization (the
+ * caller checks that the site is the organization's).
+ */
+export function worksOnSite(access: Access, site: SiteId): boolean {
+  if (access.systemManager) return true;
+  return access.grants.some((g) => g.siteId === null || g.siteId === site);
 }
 
 /**

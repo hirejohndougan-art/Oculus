@@ -19,19 +19,25 @@ import {
   issue,
   isUserId,
   permits,
+  worksOnSite,
   type Access,
   type OrganizationId,
   type Permission,
   type PermissionTarget,
   type RecordId,
+  type SiteId,
   type UserId,
 } from "@oculus/core";
 import {
   loadAccess,
   lockArrangement,
+  lockRecord,
   readRecordPlace,
+  readSite,
+  sitesSharedInto,
   unitsHolding,
   type Queryable,
+  type RecordPlace,
   type RecordPosition,
 } from "@oculus/db";
 
@@ -147,11 +153,34 @@ export class RecordAccess {
     this.locked = true;
   }
 
-  /** The target for a record at `position` (units only when scoped grants exist). */
+  /**
+   * The target for a record at `position`: its home site (D-074), the sites
+   * it is shared into (stored records only; none until T-041b), and the
+   * units holding it when the person has scoped grants.
+   */
   async target(position: RecordPosition): Promise<PermissionTarget> {
-    if (!hasScopedGrants(this.access)) return { on: "catalog" };
+    const site = position.siteId ?? null;
+    const sharedInto =
+      position.id === undefined
+        ? new Set<SiteId>()
+        : await sitesSharedInto(this.tx, this.organizationId, position.id);
+    if (!hasScopedGrants(this.access)) return { on: "catalog", site, sharedInto };
     await this.settle();
-    return { on: "units", units: await unitsHolding(this.tx, this.organizationId, position) };
+    return {
+      on: "units",
+      units: await unitsHolding(this.tx, this.organizationId, position),
+      site,
+      sharedInto,
+    };
+  }
+
+  /**
+   * Whether the site is one of the organization's and the person may work
+   * in it (a role on it or on every site, or a system manager).
+   */
+  async worksOn(siteId: SiteId): Promise<boolean> {
+    if (!worksOnSite(this.access, siteId)) return false;
+    return (await readSite(this.tx, this.organizationId, siteId)) !== undefined;
   }
 
   /** Whether any of `permissions` is held at `target`. */
@@ -162,7 +191,8 @@ export class RecordAccess {
   /**
    * For a stored record: `noSuchRecord` unless the actor may view it, then
    * `not_permitted` unless every one of `all` and any one of `any` (if
-   * given) is held there.
+   * given) is held there. Viewing through a share (T-041b) never lets
+   * anyone change the record: changes are asked at its home site only.
    */
   async onRecord(
     position: RecordPosition & { readonly id: RecordId },
@@ -176,74 +206,92 @@ export class RecordAccess {
     return undefined;
   }
 
+  /** Whether the actor may view the stored record now at `place`. */
+  private async views(id: RecordId, place: RecordPlace): Promise<boolean> {
+    const target = await this.target({
+      kind: place.kind,
+      id,
+      parentId: place.parentId,
+      represents: place.represents,
+      siteId: place.siteId,
+    });
+    return permits(this.access, "records.view", target);
+  }
+
   /**
    * Of `ids`, the records that exist and that the actor may not view (none
-   * for someone with no scoped grant who may view the whole catalog). A link
-   * to one of them is answered as a link to a record that doesn't exist.
+   * for a system manager). A link to one of them is answered as a link to a
+   * record that doesn't exist.
    */
   async hiddenAmong(ids: readonly RecordId[]): Promise<ReadonlySet<RecordId>> {
     const hidden = new Set<RecordId>();
-    if (ids.length === 0) return hidden;
-    if (!this.scoped && permits(this.access, "records.view", { on: "catalog" })) return hidden;
+    if (ids.length === 0 || this.access.systemManager) return hidden;
     for (const id of [...new Set(ids)].sort()) {
       const place = await readRecordPlace(this.tx, this.organizationId, id);
       if (place === undefined) continue;
-      const target = await this.target({
-        kind: place.kind,
-        id,
-        parentId: place.parentId,
-        represents: place.represents,
-      });
-      if (!permits(this.access, "records.view", target)) hidden.add(id);
+      if (!(await this.views(id, place))) hidden.add(id);
     }
     return hidden;
   }
 
   /**
    * For the place a record is put (a new record's, or where one moves to):
-   * the units above its parent, or those of what it represents, never the
-   * record itself. When the actor can't view that place, the refusal is the
-   * one for a parent or represented record that doesn't exist.
+   * its home site (`siteId`) and the units above its parent, or those of
+   * what it represents, never the record itself. The parent or represented
+   * record is locked `FOR SHARE` and must be one the actor may view;
+   * otherwise the refusal is the one for a parent or represented record that
+   * doesn't exist. Take the arrangement lock (if needed) before calling.
    */
   async intoPlace(
     position: RecordPosition,
     any: readonly Permission[],
     stored: boolean,
   ): Promise<Refusal | undefined> {
+    const placeId =
+      position.kind === "archival_unit"
+        ? (position.parentId ?? null)
+        : position.kind === "digital_asset"
+          ? (position.represents ?? null)
+          : null;
+    if (placeId !== null) {
+      const locked = await lockRecord(this.tx, this.organizationId, placeId, "share");
+      const place =
+        locked === undefined
+          ? undefined
+          : await readRecordPlace(this.tx, this.organizationId, placeId);
+      if (place === undefined || !(await this.views(placeId, place))) {
+        return position.kind === "archival_unit"
+          ? {
+              ok: false,
+              issues: [
+                issue(
+                  ["parentId"],
+                  "missing_parent",
+                  stored
+                    ? "The unit it would be filed under doesn't exist, or is not an archival unit."
+                    : "There is no archival unit with this ID in the organization.",
+                ),
+              ],
+            }
+          : {
+              ok: false,
+              issues: [
+                issue(
+                  ["represents"],
+                  "unknown_record",
+                  "The organization has no record with this ID.",
+                ),
+              ],
+            };
+      }
+    }
     const target = await this.target({
       kind: position.kind,
       parentId: position.parentId ?? null,
       represents: position.represents ?? null,
+      siteId: position.siteId ?? null,
     });
     if (this.allows(any, target)) return undefined;
-    const hasPlace =
-      (position.kind === "archival_unit" && position.parentId != null) ||
-      (position.kind === "digital_asset" && position.represents != null);
-    if (hasPlace && !permits(this.access, "records.view", target)) {
-      return position.kind === "archival_unit"
-        ? {
-            ok: false,
-            issues: [
-              issue(
-                ["parentId"],
-                "missing_parent",
-                stored
-                  ? "The unit it would be filed under doesn't exist, or is not an archival unit."
-                  : "There is no archival unit with this ID in the organization.",
-              ),
-            ],
-          }
-        : {
-            ok: false,
-            issues: [
-              issue(
-                ["represents"],
-                "unknown_record",
-                "The organization has no record with this ID.",
-              ),
-            ],
-          };
-    }
     return notPermitted();
   }
 }

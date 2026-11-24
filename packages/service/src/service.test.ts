@@ -11,6 +11,7 @@ import {
   type Issue,
   type OrganizationId,
   type RecordId,
+  type SiteId,
   type UserId,
   type Validated,
 } from "@oculus/core";
@@ -271,10 +272,17 @@ async function organization(): Promise<OrganizationId> {
     const userId = await folks.member(org, name);
     await grant(service, folks.root, org, { userId, role: "site_manager", siteId: site });
   }
+  siteOf.set(org, site);
   return org;
 }
 
-const ctx = (organizationId: OrganizationId, actor = ALICE) => ({ organizationId, actor });
+/** Each organization's one site, where Alice and Bob work (D-074). */
+const siteOf = new Map<OrganizationId, SiteId>();
+
+const ctx = (organizationId: OrganizationId, actor = ALICE) => {
+  const siteId = siteOf.get(organizationId);
+  return { organizationId, actor, ...(siteId === undefined ? {} : { siteId }) };
+};
 
 function objectDraft(fields: Record<string, unknown> = {}): Record<string, unknown> {
   return {

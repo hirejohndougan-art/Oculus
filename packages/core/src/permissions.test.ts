@@ -9,6 +9,7 @@ import {
   SITE_PERMISSIONS,
   SYSTEM_PERMISSIONS,
   hasScopedGrants,
+  worksOnSite,
   holdsAnywhere,
   holdsForWholeCatalog,
   isBuiltInRole,
@@ -117,14 +118,19 @@ describe("permits", () => {
       expect(permits(root, p, { on: "organization" })).toBe(true);
       expect(permits(access([g("site_manager", null)]), p, { on: "organization" })).toBe(false);
     }
-    expect(permits(root, "records.delete", { on: "catalog" })).toBe(true);
+    expect(permits(root, "records.delete", { on: "catalog", site: siteA })).toBe(true);
+    // Items on no site (D-074): system managers only.
+    expect(permits(root, "records.view", { on: "catalog", site: null })).toBe(true);
+    expect(
+      permits(access([g("site_manager", null)]), "records.view", { on: "catalog", site: null }),
+    ).toBe(false);
   });
 
   it("site permissions count only on that site, or with a grant on every site", () => {
     const one = access([g("site_manager", siteA)]);
     expect(permits(one, "site.people", { on: "site", siteId: siteA })).toBe(true);
     expect(permits(one, "site.people", { on: "site", siteId: siteB })).toBe(false);
-    expect(permits(one, "site.people", { on: "catalog" })).toBe(false);
+    expect(permits(one, "site.people", { on: "catalog", site: siteA })).toBe(false);
     const every = access([g("site_manager", null)]);
     expect(permits(every, "site.settings", { on: "site", siteId: siteB })).toBe(true);
     expect(
@@ -132,19 +138,52 @@ describe("permits", () => {
     ).toBe(false);
   });
 
-  it("catalog permissions from any site's grant cover the whole catalog; scoped ones only their units", () => {
+  it("catalog permissions reach the items of the grant's site (or every site); scoped ones only their units there", () => {
     const whole = access([g("cataloger", siteB)]);
-    expect(permits(whole, "records.edit", { on: "catalog" })).toBe(true);
-    expect(permits(whole, "records.edit", { on: "units", units: new Set([series]) })).toBe(true);
-    expect(permits(whole, "records.delete", { on: "catalog" })).toBe(false);
+    expect(permits(whole, "records.edit", { on: "catalog", site: siteB })).toBe(true);
+    expect(
+      permits(whole, "records.edit", { on: "units", units: new Set([series]), site: siteB }),
+    ).toBe(true);
+    expect(permits(whole, "records.delete", { on: "catalog", site: siteB })).toBe(false);
+    // Another site's items, and items on no site, are out of reach (D-074).
+    expect(permits(whole, "records.view", { on: "catalog", site: siteA })).toBe(false);
+    expect(permits(whole, "records.view", { on: "catalog", site: null })).toBe(false);
+    // Shared into the grant's site (T-041b): viewable there, never changed.
+    const shared = { on: "catalog", site: siteA, sharedInto: new Set([siteB]) } as const;
+    expect(permits(whole, "records.view", shared)).toBe(true);
+    expect(permits(whole, "records.edit", shared)).toBe(false);
+    const every = access([g("cataloger", null)]);
+    expect(permits(every, "records.edit", { on: "catalog", site: siteA })).toBe(true);
+    expect(permits(every, "records.edit", { on: "catalog", site: siteB })).toBe(true);
+    expect(permits(every, "records.edit", { on: "catalog", site: null })).toBe(false);
     const scoped = access([g("cataloger", siteA, fonds)]);
-    expect(permits(scoped, "records.edit", { on: "units", units: new Set([series, fonds]) })).toBe(
-      true,
+    expect(
+      permits(scoped, "records.edit", {
+        on: "units",
+        units: new Set([series, fonds]),
+        site: siteA,
+      }),
+    ).toBe(true);
+    expect(
+      permits(scoped, "records.edit", {
+        on: "units",
+        units: new Set([series, fonds]),
+        site: siteB,
+      }),
+    ).toBe(false);
+    expect(
+      permits(scoped, "records.edit", { on: "units", units: new Set([series]), site: siteA }),
+    ).toBe(false);
+    expect(permits(scoped, "records.edit", { on: "units", units: new Set(), site: siteA })).toBe(
+      false,
     );
-    expect(permits(scoped, "records.edit", { on: "units", units: new Set([series]) })).toBe(false);
-    expect(permits(scoped, "records.edit", { on: "units", units: new Set() })).toBe(false);
-    expect(permits(scoped, "records.edit", { on: "catalog" })).toBe(false);
-    expect(holdsForWholeCatalog(scoped, "records.view")).toBe(false);
+    expect(permits(scoped, "records.edit", { on: "catalog", site: siteA })).toBe(false);
+    expect(holdsForWholeCatalog(scoped, "records.view", siteA)).toBe(false);
+    expect(holdsForWholeCatalog(whole, "records.view", siteB)).toBe(true);
+    expect(worksOnSite(whole, siteB)).toBe(true);
+    expect(worksOnSite(whole, siteA)).toBe(false);
+    expect(worksOnSite(every, siteA)).toBe(true);
+    expect(worksOnSite(access([], true), siteA)).toBe(true);
     expect(holdsAnywhere(scoped, "records.edit")).toBe(true);
     expect(holdsAnywhere(scoped, "records.publish")).toBe(false);
     expect(hasScopedGrants(scoped)).toBe(true);
@@ -163,7 +202,7 @@ describe("permits", () => {
 
   it("a grant of an unknown role grants nothing", () => {
     const odd = access([{ role: "curator" as BuiltInRole, siteId: null, scope: null }]);
-    expect(permits(odd, "records.view", { on: "catalog" })).toBe(false);
+    expect(permits(odd, "records.view", { on: "catalog", site: siteA })).toBe(false);
     expect(holdsAnywhere(odd, "records.view")).toBe(false);
   });
 });

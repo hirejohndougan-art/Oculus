@@ -162,6 +162,22 @@ export interface RecordPosition {
   readonly id?: RecordId;
   readonly parentId?: RecordId | null;
   readonly represents?: RecordId | null;
+  /** Its home site (D-074): the record's own, or the site a new one is made in. */
+  readonly siteId?: SiteId | null;
+}
+
+/**
+ * The sites that accepted the record from its home site (D-074): there it
+ * is viewable, read-only. Sharing is T-041b's; until it stores accepted
+ * offers, no record is shared anywhere, so this is always empty. It is here
+ * so every permission check already asks.
+ */
+export function sitesSharedInto(
+  _db: Queryable,
+  _organizationId: OrganizationId,
+  _recordId: RecordId,
+): Promise<ReadonlySet<SiteId>> {
+  return Promise.resolve(new Set<SiteId>());
 }
 
 /**

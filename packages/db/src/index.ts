@@ -160,6 +160,7 @@ export {
   lockPersonForRoleChange,
   lockPeopleForRoleChange,
   unitsHolding,
+  sitesSharedInto,
   insertSite,
   readSite,
   renameSite,

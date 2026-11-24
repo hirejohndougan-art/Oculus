@@ -49,6 +49,7 @@ import {
   type Issue,
   type Organization,
   type OrganizationId,
+  type SiteId,
   type RecordChangeKind,
   type RecordId,
   type RecordType,
@@ -359,6 +360,7 @@ function checkKeyAndVersion<T>(
 interface RecordRow {
   id: string;
   organization_id: string;
+  site_id: string | null;
   kind: string;
   template_key: string;
   record_type_key: string | null;
@@ -653,11 +655,11 @@ export async function insertRecord(
     if (used !== undefined) return refused(["id"], "id_used_before", ID_USED_BEFORE);
     await db.execute(sql`
       INSERT INTO public.records (
-        id, organization_id, kind, template_key, record_type_key, title,
+        id, organization_id, site_id, kind, template_key, record_type_key, title,
         level, parent_id, media_type, represents_id, agent_type, latitude, longitude,
         fields, created_at, updated_at, version
       ) VALUES (
-        ${r.id}::uuid, ${r.organizationId}::uuid, ${r.kind}, ${r.templateKey},
+        ${r.id}::uuid, ${r.organizationId}::uuid, ${r.siteId ?? null}::uuid, ${r.kind}, ${r.templateKey},
         ${r.recordTypeKey ?? null}, ${r.title},
         ${c.level}, ${c.parentId}::uuid, ${c.mediaType}, ${c.represents}::uuid, ${c.agentType},
         ${c.lat}::double precision, ${c.lng}::double precision,
@@ -736,6 +738,7 @@ export async function updateRecord(
   const result = await inSavepoint(db, "update", async (): Promise<Validated<RecordVersion>> => {
     const [row] = await db.rows<{ version: number }>(sql`
       UPDATE public.records SET
+        site_id = ${r.siteId ?? null}::uuid,
         kind = ${r.kind}, template_key = ${r.templateKey}, record_type_key = ${r.recordTypeKey ?? null},
         title = ${r.title}, level = ${c.level}, parent_id = ${c.parentId}::uuid,
         media_type = ${c.mediaType}, represents_id = ${c.represents}::uuid,
@@ -881,7 +884,8 @@ export async function readStoredRecord(
     return refused(["id"], "invalid_id", "The record ID must be a lowercase version 4 UUID.");
   }
   const [row] = await db.rows<RecordRow & { version: number }>(sql`
-    SELECT id::text AS id, organization_id::text AS organization_id, kind, template_key,
+    SELECT id::text AS id, organization_id::text AS organization_id, site_id::text AS site_id,
+           kind, template_key,
            record_type_key, title, level, parent_id::text AS parent_id, media_type,
            represents_id::text AS represents_id, agent_type, latitude, longitude, fields,
            to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
@@ -911,7 +915,8 @@ export async function readRecordsForChecks(
 ): Promise<Record<string, unknown>[]> {
   if (ids.length === 0) return [];
   const rows = await db.rows<RecordRow>(sql`
-    SELECT id::text AS id, organization_id::text AS organization_id, kind, template_key,
+    SELECT id::text AS id, organization_id::text AS organization_id, site_id::text AS site_id,
+           kind, template_key,
            record_type_key, title, level, parent_id::text AS parent_id, media_type,
            represents_id::text AS represents_id, agent_type, latitude, longitude, fields,
            to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
@@ -936,6 +941,7 @@ function recordFromRow(row: RecordRow): Record<string, unknown> {
     updatedAt: row.updated_at,
     fields: row.fields,
   };
+  if (row.site_id !== null) record.siteId = row.site_id;
   if (row.record_type_key !== null) record.recordTypeKey = row.record_type_key;
   if (row.level !== null) record.level = row.level;
   if (row.parent_id !== null) record.parentId = row.parent_id;
@@ -959,6 +965,8 @@ export interface RecordPlace {
   readonly level: string | null;
   /** What a digital asset represents (T-041: where its permissions come from). */
   readonly represents: RecordId | null;
+  /** The record's home site (D-074), or `null` for none. */
+  readonly siteId: SiteId | null;
 }
 
 /**
@@ -980,9 +988,10 @@ export async function readRecordPlace(
     parent_id: string | null;
     level: string | null;
     represents_id: string | null;
+    site_id: string | null;
   }>(sql`
     SELECT version, kind, parent_id::text AS parent_id, level,
-           represents_id::text AS represents_id
+           represents_id::text AS represents_id, site_id::text AS site_id
     FROM public.records
     WHERE organization_id = ${organizationId}::uuid AND id = ${recordId}::uuid`);
   if (row === undefined) return undefined;
@@ -992,6 +1001,7 @@ export async function readRecordPlace(
     parentId: row.parent_id as RecordId | null,
     level: row.level,
     represents: row.represents_id as RecordId | null,
+    siteId: row.site_id as SiteId | null,
   });
 }
 

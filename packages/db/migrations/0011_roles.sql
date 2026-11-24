@@ -25,6 +25,44 @@ CREATE TABLE public.sites (
   PRIMARY KEY (organization_id, id)
 );
 
+-- Every catalog record has a home site (D-074): one site of its own
+-- organization (composite foreign key, so never another organization's), or
+-- none yet (NULL: only system managers see it). It can change: a move
+-- between sites, checked by the service like any move. Carried in every
+-- version through record_snapshot (below) like the record's other columns.
+ALTER TABLE public.records ADD COLUMN site_id uuid;
+ALTER TABLE public.records ADD CONSTRAINT records_home_site
+  FOREIGN KEY (organization_id, site_id) REFERENCES public.sites (organization_id, id);
+CREATE INDEX records_site ON public.records (organization_id, site_id)
+  WHERE site_id IS NOT NULL;
+
+-- 0005's snapshot with the home site (`siteId`, left out when NULL, so every
+-- version written before this migration still equals its row's snapshot).
+CREATE OR REPLACE FUNCTION public.record_snapshot(r public.records) RETURNS jsonb
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, pg_temp
+SET extra_float_digits = 1
+AS $$
+  SELECT jsonb_strip_nulls(jsonb_build_object(
+           'id', r.id::text,
+           'organizationId', r.organization_id::text,
+           'siteId', r.site_id::text,
+           'kind', r.kind,
+           'title', r.title,
+           'templateKey', r.template_key,
+           'recordTypeKey', r.record_type_key,
+           'level', r.level,
+           'parentId', r.parent_id::text,
+           'mediaType', r.media_type,
+           'represents', r.represents_id::text,
+           'agentType', r.agent_type,
+           'coordinates', CASE WHEN r.latitude IS NOT NULL OR r.longitude IS NOT NULL
+                            THEN jsonb_build_object('lat', r.latitude, 'lng', r.longitude) END,
+           'createdAt', to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+           'updatedAt', to_char(r.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')))
+         || jsonb_build_object('fields', r.fields)
+$$;
+
 -- One built-in role held by one member of an organization (D-036; custom
 -- roles are T-041a's, after launch). On one site, or on every site of the
 -- organization (site_id NULL); for the whole catalog, or for one archival

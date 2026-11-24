@@ -620,6 +620,7 @@ export {
   holdsAnywhere,
   holdsForWholeCatalog,
   hasScopedGrants,
+  worksOnSite,
 } from "./permissions.js";
 export type {
   CatalogPermission,
