@@ -173,11 +173,14 @@ export interface RecordPosition {
  * so every permission check already asks.
  */
 export function sitesSharedInto(
-  _db: Queryable,
-  _organizationId: OrganizationId,
-  _recordId: RecordId,
+  organizationId: OrganizationId,
+  recordId: RecordId,
 ): Promise<ReadonlySet<SiteId>> {
-  return Promise.resolve(new Set<SiteId>());
+  const none: ReadonlySet<SiteId> = new Set<SiteId>();
+  if (!isOrganizationId(organizationId) || !isRecordId(recordId)) return Promise.resolve(none);
+  // T-041b reads the record's accepted offers here (adding the caller's
+  // transaction as the first argument). No offer is stored yet.
+  return Promise.resolve(none);
 }
 
 /**

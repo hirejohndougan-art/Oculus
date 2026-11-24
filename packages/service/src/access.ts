@@ -163,7 +163,7 @@ export class RecordAccess {
     const sharedInto =
       position.id === undefined
         ? new Set<SiteId>()
-        : await sitesSharedInto(this.tx, this.organizationId, position.id);
+        : await sitesSharedInto(this.organizationId, position.id);
     if (!hasScopedGrants(this.access)) return { on: "catalog", site, sharedInto };
     await this.settle();
     return {
