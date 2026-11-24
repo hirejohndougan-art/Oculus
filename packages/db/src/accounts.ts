@@ -58,6 +58,7 @@ import {
   type Issue,
   type OrganizationId,
   type PasswordCheck,
+  type ThrottleRule,
   type ThrottleState,
   type UserId,
   type Validated,
@@ -499,23 +500,26 @@ export interface InvitationOptions {
 
 /** Default time limit for sending an invitation. */
 export const DEFAULT_DELIVERY_TIMEOUT_MS = 30_000;
-const MAX_DELIVERY_TIMEOUT_MS = 300_000;
+/** The longest time limit a caller may give a delivery: 5 minutes. */
+export const MAX_DELIVERY_TIMEOUT_MS = 300_000;
 
 /**
  * Runs `deliver` with an AbortSignal that fires at the time limit. True
  * only if it resolved in time; a throw, a rejection or the time limit is
- * false. A late result is ignored.
+ * false. A late result is ignored, and what it threw or rejected with is
+ * dropped (it might hold the message, and with it the token). Also used by
+ * password-resets.ts; not exported from `@oculus/db`.
  */
-async function deliverWithin(
-  deliver: InvitationDelivery,
-  message: InvitationMessage,
+export async function deliverWithin<M>(
+  deliver: (message: M, signal: AbortSignal) => Promise<void>,
+  message: M,
   timeoutMs: number,
 ): Promise<boolean> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timedOut = new Promise<false>((resolve) => {
     timer = setTimeout(() => {
-      controller.abort(new Error("The invitation took too long to send."));
+      controller.abort(new Error("The message took too long to send."));
       resolve(false);
     }, timeoutMs);
   });
@@ -829,18 +833,34 @@ interface CounterRow {
   last_ms: number | null;
 }
 
+/** The rules for a pair of counters: one per address typed, one per client address. */
+export interface ThrottleRules {
+  readonly account: ThrottleRule;
+  readonly source: ThrottleRule;
+}
+
+const SIGN_IN_RULES: ThrottleRules = Object.freeze({
+  account: ACCOUNT_THROTTLE,
+  source: SOURCE_THROTTLE,
+});
+
 /**
  * Counts this attempt against both counters, or says how long to wait. One
  * short transaction with both rows locked (account key first; every caller
  * locks in key order), so attempts sent at once are counted one by one.
+ * Sign-in's rules unless others are given (password-resets.ts gives its own,
+ * with its own keys). Not exported from `@oculus/db`.
  */
-async function takeAttempt(
+export async function takeAttempt(
   db: Database,
   accountKey: string,
   sourceKey: string,
+  rules: ThrottleRules = SIGN_IN_RULES,
 ): Promise<{ allowed: true } | { allowed: false; retryAfterSeconds: number }> {
   for (let attempt = 1; ; attempt++) {
-    const decided = await inTransaction(db, (tx) => decideAttempt(tx, accountKey, sourceKey));
+    const decided = await inTransaction(db, (tx) =>
+      decideAttempt(tx, accountKey, sourceKey, rules),
+    );
     // A counter deleted by the cleanup between the INSERT and the lock: go again.
     if (decided !== "row_gone" || attempt >= 3) {
       return decided === "row_gone" ? { allowed: false, retryAfterSeconds: 1 } : decided;
@@ -852,6 +872,7 @@ async function decideAttempt(
   tx: Queryable,
   accountKey: string,
   sourceKey: string,
+  rules: ThrottleRules,
 ): Promise<{ allowed: true } | { allowed: false; retryAfterSeconds: number } | "row_gone"> {
   {
     await tx.execute(sql`
@@ -870,8 +891,8 @@ async function decideAttempt(
       const row = rows.find((r) => r.key === key);
       return row === undefined ? undefined : { failures: row.failures, lastFailureAt: row.last_ms };
     };
-    const account = throttleAttempt(ACCOUNT_THROTTLE, state(accountKey), now);
-    const source = throttleAttempt(SOURCE_THROTTLE, state(sourceKey), now);
+    const account = throttleAttempt(rules.account, state(accountKey), now);
+    const source = throttleAttempt(rules.source, state(sourceKey), now);
     if (!account.allowed || !source.allowed) {
       const waits = [account, source].map((d) => (d.allowed ? 0 : d.retryAfterSeconds));
       return { allowed: false, retryAfterSeconds: Math.max(...waits) };

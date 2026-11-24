@@ -606,6 +606,18 @@ export {
 } from "./sign-in-throttle.js";
 export type { ThrottleRule, ThrottleState, ThrottleDecision } from "./sign-in-throttle.js";
 export {
+  newResetToken,
+  isResetToken,
+  hashResetToken,
+  isResetLife,
+  resetThrottleAccountKey,
+  resetThrottleSourceKey,
+  DEFAULT_RESET_SECONDS,
+  RESET_LIFE_BOUNDS,
+  RESET_ACCOUNT_THROTTLE,
+  RESET_SOURCE_THROTTLE,
+} from "./password-reset.js";
+export {
   WORKFLOW_STATES,
   WORKFLOW_ACTIONS,
   INITIAL_WORKFLOW_STATE,

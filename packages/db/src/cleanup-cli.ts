@@ -1,6 +1,7 @@
 /**
- * `npm run db:cleanup`: deletes ended sessions and sign-in counters no longer
- * needed (T-037, D-052, D-068, D-069) in the database named by
+ * `npm run db:cleanup`: deletes ended sessions, sign-in counters no longer
+ * needed and old password reset links (T-037, T-039, D-052, D-068, D-069,
+ * D-078) in the database named by
  * OCULUS_DATABASE_URL. Any scheduler can run it (D-035); hourly is plenty,
  * and lookups refuse ended sessions whether or not it runs. Connect as the
  * writer role. The URL is never printed, since it may hold a password.
@@ -27,7 +28,7 @@ export async function runCleanupCli(
   try {
     const done = await runCleanup(db);
     out(
-      `Done: ${String(done.sessions)} ended session(s) and ${String(done.signInThrottles)} old sign-in counter(s) deleted.`,
+      `Done: ${String(done.sessions)} ended session(s) and ${String(done.signInThrottles)} old sign-in counter(s) deleted, and ${String(done.passwordResets)} old reset link(s).`,
     );
     return 0;
   } catch (error) {

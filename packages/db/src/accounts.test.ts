@@ -1710,6 +1710,8 @@ describe("the database's own guards", () => {
       "organization_members.zzzz_organization_members_keep_identity",
       "users.users_check_invitation",
       "users.users_end_sessions",
+      // 0015 (T-039): the password change time only moves forward.
+      "users.users_password_changed_at",
       "users.users_sessions_valid_after",
       "users.zzzz_users_keep_identity",
     ]);

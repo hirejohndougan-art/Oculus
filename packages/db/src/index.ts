@@ -174,11 +174,30 @@ export {
   endOtherSessions,
   endUserSessions,
   deleteExpiredSessions,
+  deleteOldPasswordResets,
   runCleanup,
   NO_SESSION,
   MAX_LISTED_SESSIONS,
   SESSION_TABLE_PRIVILEGES,
 } from "./sessions.js";
+export {
+  requestPasswordReset,
+  sendPasswordReset,
+  completePasswordReset,
+  RESET_REQUESTED,
+  MAX_RESET_WORK,
+  PASSWORD_RESET_TABLE_PRIVILEGES,
+} from "./password-resets.js";
+export type {
+  PasswordResetMessage,
+  PasswordResetDelivery,
+  ResetOutcome,
+  ResetRequestOptions,
+  ResetRequest,
+  ResetRequestReply,
+  AdminResetOptions,
+  ResetCompletion,
+} from "./password-resets.js";
 export type {
   NoSession,
   SessionFailure,

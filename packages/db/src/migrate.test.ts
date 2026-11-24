@@ -32,6 +32,7 @@ const ALL_TABLES = [
   "oculus_migrations",
   "organization_members",
   "organizations",
+  "password_resets",
   "record_identifiers",
   "record_term_index",
   "record_terms",
