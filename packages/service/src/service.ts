@@ -141,6 +141,9 @@ import {
   lockRecord,
   organizationSiteIds,
   publicValueSources,
+  inheritedValues,
+  listRecords as listStoredRecords,
+  listRecordTypes as listStoredRecordTypes,
   publishCheckIssues,
   lockRecordsShared,
   recordClosureIds,
@@ -177,6 +180,9 @@ import {
   type VersionConflict,
   type WriterRoleProblem,
   type PublicValueSource,
+  type InheritedValue,
+  type RecordList,
+  type RecordTypeSummary,
   type StateListEntry,
   sql,
 } from "@oculus/db";
@@ -354,12 +360,64 @@ export interface RecordCheck {
   readonly issues: readonly Issue[];
 }
 
+/**
+ * What the person may do with a record where it is now (T-046, D-083): the
+ * admin shows only the actions these allow. Each answer is the same check
+ * the operation itself makes, read under the same row lock; the operation
+ * still decides when it runs.
+ */
+export interface RecordAbilities {
+  /** `records.edit` (or `media.attach` for a scan): save, send for review, back to draft. */
+  readonly edit: boolean;
+  /** `records.history`: the history panel, compare and restore (restore also needs `edit`). */
+  readonly history: boolean;
+  /** `records.publish`: publish and unpublish. */
+  readonly publish: boolean;
+  /** `records.delete`: site managers (and system managers) only. */
+  readonly delete: boolean;
+}
+
 /** A record as read (staff view: every field). */
 export interface ReadRecord {
   readonly record: CatalogRecord;
   readonly version: number;
   /** Its workflow state (D-075, D-076), read under the same row lock. */
   readonly state: WorkflowState;
+  /** What the person may do with it (T-046). */
+  readonly can: RecordAbilities;
+  /**
+   * The values it inherits now from the units above it (D-013), for fields
+   * without a value of its own; none when any unit above it is out of the
+   * person's sight or can't be read (T-046).
+   */
+  readonly inherited: readonly InheritedValue[];
+}
+
+/** What the person may do in the working site (T-046): which buttons the admin offers. */
+export interface SiteAbilities {
+  /** The record kinds they may make there (all six, only `digital_asset` for a Scanner, or none). */
+  readonly createKinds: readonly string[];
+  /** Whether they may publish anywhere, so the approval queue answers them. */
+  readonly review: boolean;
+}
+
+/** A page of the items list (T-046): records with their state, newest change first or by title. */
+export interface ItemList {
+  readonly records: readonly ItemListEntry[];
+  /** Present when there are more: pass it as `after` for the next page. */
+  readonly next?: string;
+}
+
+/** One record in the items list. */
+export interface ItemListEntry {
+  readonly recordId: RecordId;
+  readonly title: string;
+  readonly kind: string;
+  readonly recordTypeKey: string | null;
+  readonly siteId: string | null;
+  readonly state: string;
+  readonly version: number;
+  readonly updatedAt: string;
 }
 
 /**
@@ -522,6 +580,20 @@ export interface RecordService extends AdminOperations, DefinitionOperations {
     query: unknown,
     options?: unknown,
   ): Promise<ServiceResult<SearchResults>>;
+  /**
+   * The items list (T-046, D-083) of the working site: with `query`, staff
+   * search narrowed by the filters (best match first); without, every
+   * record of the site, last changed first or by title. Only records of
+   * whole sites the person may see every record of (as `searchRecords`),
+   * and of the working site when one is given. `options`: `query`,
+   * `state`, `recordType`, `sort` (`updated` or `title`, without a
+   * query), `after` (the previous page's `next`) and `limit` (1 to 100).
+   */
+  listItems(context: ServiceContext, options?: unknown): Promise<ServiceResult<ItemList>>;
+  /** The organization's record types (T-046), for anyone who may read templates. */
+  listRecordTypes(context: ServiceContext): Promise<ServiceResult<readonly RecordTypeSummary[]>>;
+  /** What the person may do in the working site (T-046): see `SiteAbilities`. */
+  siteAbilities(context: ServiceContext): Promise<ServiceResult<SiteAbilities>>;
   /** What is wrong with the connection's database role for writing (empty when fit). */
   checkConnection(): Promise<readonly WriterRoleProblem[]>;
 }
@@ -2319,12 +2391,41 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         // The row is locked FOR SHARE, so the state is the record's as read.
         const state = await readWorkflowState(tx, who.organizationId, recordId);
         if (state === undefined) return noSuchRecord();
+        // What the person may do here: the operations' own checks, at the
+        // place just checked (T-046). Changes count at the home site only.
+        const place = allowed.place;
+        const target = await allowed.checker.target({
+          kind: place.kind,
+          id: recordId,
+          parentId: place.parentId,
+          represents: place.represents,
+          siteId: place.siteId,
+        });
+        const can: RecordAbilities = Object.freeze({
+          edit: allowed.checker.allows(editPermissions(place.kind), target),
+          history: allowed.checker.allows(["records.history"], target),
+          publish: allowed.checker.allows(["records.publish"], target),
+          delete: allowed.checker.allows(["records.delete"], target),
+        });
+        const record = stored.value.record;
+        let inherited: readonly InheritedValue[] = [];
+        if (record.kind === "archival_unit" && record.parentId !== undefined) {
+          const found = await inheritedValues(tx, who.organizationId, recordId);
+          // Nothing from above when any unit above is out of sight (a system
+          // manager filed it across sites): its values, and even that it lets
+          // a value through, are not the person's to see.
+          if (found !== undefined && (await allowed.checker.hiddenAmong(found.chain)).size === 0) {
+            inherited = found.values;
+          }
+        }
         return {
           ok: true,
           value: Object.freeze({
-            record: stored.value.record,
+            record,
             version: stored.value.version,
             state: state.state,
+            can,
+            inherited,
           }),
         };
       });
@@ -2604,6 +2705,176 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           throw error;
         }
       });
+    },
+
+    async listItems(context, listOptions) {
+      return run("listItems", context, async (tx, who): Promise<ServiceResult<ItemList>> => {
+        const org = who.organizationId;
+        const opts = readOptions(listOptions, [
+          "query",
+          "state",
+          "recordType",
+          "sort",
+          "after",
+          "limit",
+        ]);
+        if (!opts.ok) return opts;
+        const query = own(opts.value, "query");
+        const state = own(opts.value, "state");
+        const recordType = own(opts.value, "recordType");
+        const sort = own(opts.value, "sort");
+        const after = own(opts.value, "after");
+        const limit = own(opts.value, "limit") ?? 50;
+        if (!isWholeNumber(limit, 1) || limit > 100) {
+          return refusal(["limit"], "invalid_limit", "The limit is a whole number from 1 to 100.");
+        }
+        if (after !== undefined && typeof after !== "string") {
+          return refusal(["after"], "invalid_after", "after is the previous page's next.");
+        }
+        if (query !== undefined && sort !== undefined) {
+          return refusal(["sort"], "invalid_sort", "Search results come best match first.");
+        }
+        const access = await readAccess(tx, org, who.actor);
+        if (!access.ok) return access;
+        if (!holdsAnywhere(access.value, "records.view")) return notPermitted();
+        // Only whole sites the person sees every record of (D-074, D-079),
+        // and of those only the working site when one is given.
+        const whole = await wholeSites(tx, org, access.value, "records.view");
+        let sites: "all" | readonly SiteId[];
+        if (who.siteId === null) {
+          sites = whole as "all" | readonly SiteId[];
+        } else {
+          const checker = new RecordAccess(tx, org, access.value, "read");
+          if (!(await checker.worksOn(who.siteId))) return unknownSite(["context", "siteId"]);
+          sites = whole === "all" || whole.includes(who.siteId) ? [who.siteId] : [];
+        }
+        const filters = {
+          ...(state === undefined ? {} : { state: state as WorkflowState }),
+          ...(recordType === undefined ? {} : { recordType: recordType as string }),
+        };
+        await tx.rows(
+          sql`SELECT set_config('statement_timeout', ${String(searchTimeoutMs)}, true)`,
+        );
+        try {
+          if (query !== undefined) {
+            const found = await searchStoredRecords(tx, org, query as string, {
+              limit,
+              ...(after === undefined ? {} : { after }),
+              sites,
+              ...filters,
+            });
+            if (!found.ok) return found;
+            return {
+              ok: true,
+              value: Object.freeze({
+                records: Object.freeze(
+                  found.value.hits.map((h) =>
+                    Object.freeze({
+                      recordId: h.recordId,
+                      title: h.title,
+                      kind: h.kind,
+                      recordTypeKey: h.recordTypeKey,
+                      siteId: h.siteId,
+                      state: h.state,
+                      version: h.version,
+                      updatedAt: h.updatedAt,
+                    }),
+                  ),
+                ),
+                ...(found.value.next === undefined ? {} : { next: found.value.next }),
+              }),
+            };
+          }
+          let offset = 0;
+          if (after !== undefined) {
+            if (!/^(0|[1-9][0-9]{0,4})$/.test(after)) {
+              return refusal(["after"], "invalid_after", "after is the previous page's next.");
+            }
+            offset = Number(after);
+          }
+          const listed: { ok: true; value: RecordList } | { ok: false; issues: readonly Issue[] } =
+            await listStoredRecords(tx, org, {
+              sites,
+              offset,
+              limit,
+              ...(sort === undefined ? {} : { sort: sort as "updated" | "title" }),
+              ...filters,
+            });
+          if (!listed.ok) return { ok: false, issues: listed.issues };
+          return {
+            ok: true,
+            value: Object.freeze({
+              records: listed.value.records,
+              ...(listed.value.next === undefined ? {} : { next: String(listed.value.next) }),
+            }),
+          };
+        } catch (error) {
+          if (sqlState(error) === "57014") {
+            return refusal(
+              ["query"],
+              "search_timeout",
+              "The list took too long and was stopped. Try more specific words or a filter.",
+            );
+          }
+          throw error;
+        }
+      });
+    },
+
+    async listRecordTypes(context) {
+      return run("listRecordTypes", context, async (tx, who) => {
+        const access = await readAccess(tx, who.organizationId, who.actor);
+        if (!access.ok) return access;
+        // As templates (D-079): anyone who may view records anywhere.
+        if (
+          !holdsAnywhere(access.value, "records.view") &&
+          !holdsAnywhere(access.value, "catalog.definitions")
+        ) {
+          return notPermitted();
+        }
+        return { ok: true, value: await listStoredRecordTypes(tx, who.organizationId) };
+      });
+    },
+
+    async siteAbilities(context) {
+      return run(
+        "siteAbilities",
+        context,
+        async (tx, who): Promise<ServiceResult<SiteAbilities>> => {
+          const access = await readAccess(tx, who.organizationId, who.actor);
+          if (!access.ok) return access;
+          const checker = new RecordAccess(tx, who.organizationId, access.value, "read");
+          if (who.siteId !== null && !(await checker.worksOn(who.siteId))) {
+            return unknownSite(["context", "siteId"]);
+          }
+          const site = who.siteId;
+          // Making a record needs the create permission somewhere on the
+          // working site (a scoped grant counts: its holder files under its
+          // unit); the save checks the place itself.
+          const onSite = (permission: Permission): boolean =>
+            access.value.systemManager ||
+            access.value.grants.some(
+              (g) =>
+                (g.siteId === null || g.siteId === site) &&
+                (ROLE_PERMISSIONS[g.role] as readonly Permission[]).includes(permission),
+            );
+          const kinds =
+            site === null && !access.value.systemManager
+              ? []
+              : onSite("records.create")
+                ? ["object", "archival_unit", "digital_asset", "agent", "place", "event"]
+                : onSite("media.attach")
+                  ? ["digital_asset"]
+                  : [];
+          return {
+            ok: true,
+            value: Object.freeze({
+              createKinds: Object.freeze(kinds),
+              review: holdsAnywhere(access.value, "records.publish"),
+            }),
+          };
+        },
+      );
     },
 
     ...adminOperations(run),

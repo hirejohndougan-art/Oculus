@@ -52,6 +52,11 @@
  * every record of, so a hit, a page's length or its cursor never says that
  * a record of another site matched.
  *
+ * **Filters** (T-046, D-083): `state` (a workflow state) and `recordType`
+ * (a record type key) narrow the search further, in the same SQL as
+ * `sites`, so a page's length and cursor say nothing about records outside
+ * them. Like `sites` they only narrow.
+ *
  * **Identifiers.** The whole query is also looked up as a number, by core's
  * `identifierKey` in `identifier_holdings` (current and former numbers of
  * every type, the same key uniqueness uses, D-009, D-061), so `dhs 0001`,
@@ -72,12 +77,15 @@ import {
   identifierKey,
   isOrganizationId,
   isRecordId,
+  isRecordTypeKey,
   isSiteId,
+  isWorkflowState,
   issue,
   type OrganizationId,
   type RecordId,
   type SiteId,
   type Validated,
+  type WorkflowState,
 } from "@oculus/core";
 import type { Queryable } from "./client.js";
 import { sql } from "./sql.js";
@@ -98,6 +106,14 @@ export interface SearchHit {
   readonly rank: number;
   /** `identifier` and/or `text`, in that order. */
   readonly matchedBy: readonly MatchedBy[];
+  /** The record's kind, record type (or null), home site (or null) and workflow state (T-046). */
+  readonly kind: string;
+  readonly recordTypeKey: string | null;
+  readonly siteId: string | null;
+  readonly state: string;
+  /** The record's version and when it last changed, for the items list. */
+  readonly version: number;
+  readonly updatedAt: string;
 }
 
 export interface SearchResults {
@@ -111,12 +127,16 @@ export interface SearchOptions {
   readonly after?: string;
   /** Only records whose home site is one of these; `"all"` (default) for every record. */
   readonly sites?: "all" | readonly string[];
+  /** Only records in this workflow state (T-046). */
+  readonly state?: WorkflowState;
+  /** Only records of this record type (its key, T-046). */
+  readonly recordType?: string;
 }
 
 /** The most sites one search may name. */
 const MAX_SEARCH_SITES = 1000;
 
-const OPTIONS: ReadonlySet<string> = new Set(["limit", "after", "sites"]);
+const OPTIONS: ReadonlySet<string> = new Set(["limit", "after", "sites", "state", "recordType"]);
 /** The rank is ts_rank times this, as a whole number. */
 const RANK_SCALE = 1_000_000;
 /** group (0 identifier, 1 text only) . rank key . record ID */
@@ -149,6 +169,8 @@ interface ReadOptions {
   limit: number;
   after: Cursor | null;
   sites: readonly SiteId[] | null;
+  state: WorkflowState | null;
+  recordType: string | null;
 }
 
 function readSites(value: unknown): Validated<readonly SiteId[] | null> {
@@ -167,8 +189,18 @@ function readSites(value: unknown): Validated<readonly SiteId[] | null> {
 }
 
 function readOptions(options: unknown): Validated<ReadOptions> {
-  if (options === undefined)
-    return { ok: true, value: { limit: DEFAULT_SEARCH_LIMIT, after: null, sites: null } };
+  if (options === undefined) {
+    return {
+      ok: true,
+      value: {
+        limit: DEFAULT_SEARCH_LIMIT,
+        after: null,
+        sites: null,
+        state: null,
+        recordType: null,
+      },
+    };
+  }
   if (typeof options !== "object" || options === null || Array.isArray(options)) {
     return refused(["options"], "invalid_options", "The options are an object.");
   }
@@ -183,17 +215,21 @@ function readOptions(options: unknown): Validated<ReadOptions> {
       return refused(
         [String(key)],
         "unknown_option",
-        "Only limit, after and sites can be given: staff search has no other scope.",
+        "Only limit, after, sites, state and recordType can be given: staff search has no other scope.",
       );
     }
   }
   let limitValue: unknown;
   let afterValue: unknown;
   let sitesValue: unknown;
+  let stateValue: unknown;
+  let typeValue: unknown;
   try {
     limitValue = ownValue(options, "limit");
     afterValue = ownValue(options, "after");
     sitesValue = ownValue(options, "sites");
+    stateValue = ownValue(options, "state");
+    typeValue = ownValue(options, "recordType");
   } catch {
     return refused(["options"], "invalid_options", "The options are an object.");
   }
@@ -212,8 +248,18 @@ function readOptions(options: unknown): Validated<ReadOptions> {
   }
   const sites = readSites(sitesValue);
   if (!sites.ok) return sites;
-  if (afterValue === undefined)
-    return { ok: true, value: { limit, after: null, sites: sites.value } };
+  if (stateValue !== undefined && !isWorkflowState(stateValue)) {
+    return refused(["state"], "invalid_state", "state is a workflow state.");
+  }
+  if (typeValue !== undefined && !isRecordTypeKey(typeValue)) {
+    return refused(["recordType"], "invalid_record_type", "recordType is a record type key.");
+  }
+  const filters = {
+    sites: sites.value,
+    state: stateValue ?? null,
+    recordType: typeValue ?? null,
+  };
+  if (afterValue === undefined) return { ok: true, value: { limit, after: null, ...filters } };
   const match = typeof afterValue === "string" ? CURSOR.exec(afterValue) : null;
   const id = match?.[3];
   if (!match || !isRecordId(id)) {
@@ -224,7 +270,7 @@ function readOptions(options: unknown): Validated<ReadOptions> {
     value: {
       limit,
       after: { group: Number(match[1]), rankKey: match[2] ?? "0", id },
-      sites: sites.value,
+      ...filters,
     },
   };
 }
@@ -232,6 +278,12 @@ function readOptions(options: unknown): Validated<ReadOptions> {
 interface HitRow {
   id: string;
   title: string;
+  kind: string;
+  record_type_key: string | null;
+  site_id: string | null;
+  workflow_state: string;
+  version: number;
+  updated_at: string;
   by_identifier: boolean;
   by_text: boolean;
   grp: number;
@@ -279,10 +331,13 @@ export async function searchRecords(
   if (text === "") return refused(["query"], "empty_query", "Type something to search for.");
   const key = identifierKey(text);
   const numberKey = key === "" ? null : key;
-  const { limit, after, sites } = read.value;
+  const { limit, after, sites, state, recordType } = read.value;
   const org = organizationId;
-  // Every record (null), or only those whose home site is listed.
-  const onSites = sql`(${sites === null}::boolean OR r.site_id = ANY(${sites ?? []}::uuid[]))`;
+  // Every record (null), or only those whose home site is listed; and the
+  // state and record type filters (T-046), all in the query (narrowing only).
+  const onSites = sql`(${sites === null}::boolean OR r.site_id = ANY(${sites ?? []}::uuid[]))
+    AND (${state}::text IS NULL OR r.workflow_state = ${state}::text)
+    AND (${recordType}::text IS NULL OR r.record_type_key = ${recordType}::text)`;
 
   const tsq = sql`websearch_to_tsquery('pg_catalog.simple'::regconfig, public.search_fold(${text}::text))`;
   const rows = await db.rows<HitRow>(sql`
@@ -298,7 +353,8 @@ export async function searchRecords(
         AND querytree(${tsq}) <> 'T'
         AND r.search_document @@ ${tsq}
     ), hits AS (
-      SELECT r.id, r.title,
+      SELECT r.id, r.title, r.kind, r.record_type_key, r.site_id, r.workflow_state,
+             r.version, r.updated_at,
              i.id IS NOT NULL AS by_identifier,
              t.id IS NOT NULL AS by_text,
              CASE WHEN i.id IS NOT NULL THEN 0 ELSE 1 END AS grp,
@@ -308,7 +364,10 @@ export async function searchRecords(
       LEFT JOIN by_identifier i ON i.id = m.id
       LEFT JOIN by_text t ON t.id = m.id
     )
-    SELECT id::text AS id, title, by_identifier, by_text, grp, rank_key::text AS rank_key
+    SELECT id::text AS id, title, kind, record_type_key, site_id::text AS site_id,
+           workflow_state, version,
+           to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at,
+           by_identifier, by_text, grp, rank_key::text AS rank_key
     FROM hits
     WHERE ${after?.group ?? null}::integer IS NULL
        OR grp > ${after?.group ?? null}::integer
@@ -330,6 +389,12 @@ export async function searchRecords(
       title: row.title,
       rank: Number(row.rank_key) / RANK_SCALE,
       matchedBy: Object.freeze(matchedBy),
+      kind: row.kind,
+      recordTypeKey: row.record_type_key,
+      siteId: row.site_id,
+      state: row.workflow_state,
+      version: row.version,
+      updatedAt: row.updated_at,
     });
   });
   const last = rows.length > limit ? rows[limit - 1] : undefined;
