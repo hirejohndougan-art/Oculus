@@ -16,10 +16,10 @@
  * **Where a role is granted** (a `RoleGrant`): for one site of an
  * organization, or for every site of it (`siteId: null`); and for the whole
  * catalog (`scope: null`) or for one archival unit and everything below it
- * (`scope`: a fonds, series, collection, file or item). The catalog belongs
- * to the organization (D-019), so a catalog permission granted on any of
- * its sites is a permission in its catalog; site permissions
- * (`SITE_PERMISSIONS`) count only on that site.
+ * (`scope`: a fonds, series, collection, file or item). Catalog
+ * permissions reach the records of the grant's site (below); organization
+ * permissions come from a whole-catalog grant on any of its sites; site
+ * permissions (`SITE_PERMISSIONS`) count only on that site.
  *
  * **Items belong to a site** (D-074). Every catalog record has a home site
  * (or none yet). A catalog permission granted on a site reaches only the
