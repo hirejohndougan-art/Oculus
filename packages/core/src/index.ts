@@ -564,6 +564,8 @@ export {
   passwordHashNeedsRehash,
   passwordWorkCount,
   checkNewPassword,
+  passwordText,
+  MAX_SCRYPT_WORK,
   isCommonPassword,
   passwordContextWords,
   PasswordWorkBusyError,

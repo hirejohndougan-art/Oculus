@@ -6,6 +6,7 @@ import {
   MAX_CONCURRENT_HASHES,
   MAX_PASSWORD_BYTES,
   MAX_QUEUED_HASHES,
+  MAX_SCRYPT_WORK,
   MIN_PASSWORD_LENGTH,
   PasswordWorkBusyError,
   SCRYPT_SETTINGS,
@@ -16,6 +17,7 @@ import {
   isPasswordHash,
   passwordContextWords,
   passwordHashNeedsRehash,
+  passwordText,
   passwordWorkCount,
   verifyPassword,
 } from "./passwords.js";
@@ -70,15 +72,36 @@ describe("hashPassword and verifyPassword", () => {
     }
   });
 
-  it("never normalizes Unicode: composed and decomposed forms are different passwords", async () => {
-    const composed = "café au lait at noon";
-    const decomposed = "café au lait at noon";
-    const stored = await hashPassword(composed);
-    expect((await verifyPassword(composed, stored)).ok).toBe(true);
-    expect((await verifyPassword(decomposed, stored)).ok).toBe(false);
+  it("treats composed and decomposed forms as the same password (NFC)", async () => {
+    const composed = "caf\u00e9 au lait at noon";
+    const decomposed = "cafe\u0301 au lait at noon";
+    for (const [made, typed] of [
+      [composed, decomposed],
+      [decomposed, composed],
+    ] as const) {
+      const stored = await hashPassword(made);
+      expect((await verifyPassword(typed, stored)).ok).toBe(true);
+    }
+    expect(passwordText(decomposed)).toBe(composed);
+    // NFC, not NFKC: a full-width letter stays a different password.
+    const stored = await hashPassword("plain ascii passphrase");
+    expect((await verifyPassword("plain ascii passphras\uff45", stored)).ok).toBe(false);
   });
 
-  it("runs exactly one scrypt computation for every check, usable or not", async () => {
+  it("refuses text with a lone surrogate", async () => {
+    await dummyPasswordHash();
+    const stored = await hashPassword("a password before the test");
+    for (const broken of ["half \ud800 pair", "\udc00 low first", "ends high \udbff"]) {
+      expect(passwordText(broken)).toBeUndefined();
+      await expect(hashPassword(broken)).rejects.toThrow(TypeError);
+      const before = passwordWorkCount();
+      expect((await verifyPassword(broken, stored)).ok).toBe(false);
+      expect(passwordWorkCount() - before).toBe(1);
+    }
+    expect(passwordText("an emoji \u{1F600} pair")).toBe("an emoji \u{1F600} pair");
+  });
+
+  it("runs one scrypt computation at today's cost for every check, usable or not", async () => {
     await dummyPasswordHash();
     const stored = await hashPassword("one two three four five");
     const cases: [unknown, string | undefined][] = [
@@ -108,6 +131,30 @@ describe("hashPassword and verifyPassword", () => {
     expect((await verifyPassword("", await dummyPasswordHash())).ok).toBe(false);
   });
 
+  it("pads a failed check against a cheaper stored hash to today's cost", async () => {
+    await dummyPasswordHash();
+    const old = await oldStyleHash("an older stored password", 12, 8, 1);
+    const current = await hashPassword("an older stored password");
+    let before = passwordWorkCount();
+    expect((await verifyPassword("not the older password", old)).ok).toBe(false);
+    expect(passwordWorkCount() - before).toBe(2);
+    before = passwordWorkCount();
+    expect((await verifyPassword("an older stored password", old)).ok).toBe(true);
+    expect(passwordWorkCount() - before).toBe(1);
+    const time = async (stored: string): Promise<number> => {
+      const runs: number[] = [];
+      for (let i = 0; i < 5; i++) {
+        const t = performance.now();
+        await verifyPassword("not the older password", stored);
+        runs.push(performance.now() - t);
+      }
+      return runs.sort((x, y) => x - y)[2] ?? 0;
+    };
+    const ratio = (await time(old)) / (await time(current));
+    expect(ratio).toBeGreaterThan(0.7);
+    expect(ratio).toBeLessThan(2);
+  }, 60_000);
+
   it("says when a correct password's hash has old settings", async () => {
     const old = await oldStyleHash("an older stored password", 12, 8, 1);
     expect(isPasswordHash(old)).toBe(true);
@@ -125,13 +172,25 @@ describe("hashPassword and verifyPassword", () => {
   it("refuses stored settings that would cost too much memory or time", async () => {
     const salt = "A".repeat(22);
     const key = "A".repeat(43);
-    for (const settings of ["ln=21,r=8,p=1", "ln=9,r=8,p=1", "ln=20,r=32,p=1", "ln=14,r=8,p=17"]) {
+    for (const settings of [
+      "ln=21,r=8,p=1",
+      "ln=9,r=8,p=1",
+      "ln=20,r=32,p=1",
+      "ln=14,r=8,p=17",
+      // N must be below 2^(16·r) (RFC 7914), or scrypt itself throws.
+      "ln=16,r=1,p=1",
+      // More work than MAX_SCRYPT_WORK (2^16·8·5 > 2^21), though memory is fine.
+      "ln=16,r=8,p=5",
+    ]) {
       const stored = `$scrypt$${settings}$${salt}$${key}`;
       expect(isPasswordHash(stored)).toBe(false);
       const before = passwordWorkCount();
       expect((await verifyPassword("anything", stored)).ok).toBe(false);
       expect(passwordWorkCount() - before).toBe(1);
     }
+    expect(isPasswordHash(`$scrypt$ln=15,r=1,p=1$${salt}$${key}`)).toBe(true);
+    expect(isPasswordHash(`$scrypt$ln=16,r=8,p=2$${salt}$${key}`)).toBe(true);
+    expect(MAX_SCRYPT_WORK).toBe(2 ** 21);
     expect(isPasswordHash(`$argon2id$v=19$m=19456,t=2,p=1$${salt}$${key}`)).toBe(false);
   });
 
@@ -173,9 +232,16 @@ describe("checkNewPassword", () => {
     expect(codes(checkNewPassword("é".repeat(513)))).toEqual(["too_long"]);
   });
 
-  it("returns the password exactly as given", () => {
+  it("returns the password as given apart from NFC, and measures the NFC form", () => {
     const r = checkNewPassword("  spaces kept at both ends  ");
     expect(r).toEqual({ ok: true, value: "  spaces kept at both ends  " });
+    expect(checkNewPassword("cafe\u0301 au lait at noon")).toEqual({
+      ok: true,
+      value: "caf\u00e9 au lait at noon",
+    });
+    // Eight code points decomposed, four once composed.
+    expect(codes(checkNewPassword("e\u0301".repeat(4)))).toEqual(["too_short"]);
+    expect(codes(checkNewPassword("broken \ud800 password"))).toEqual(["invalid_text"]);
   });
 
   it("refuses common passwords whatever their case", () => {

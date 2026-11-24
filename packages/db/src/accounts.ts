@@ -48,6 +48,7 @@ import {
   newInvitationToken,
   newUserId,
   normalizeEmail,
+  passwordText,
   throttleAccountKey,
   throttleAttempt,
   throttleSourceKey,
@@ -229,15 +230,31 @@ export interface InvitationRequest {
   readonly expiresInSeconds?: number;
 }
 
-/** A new invitation. `token` is shown once, for the link; only its hash is kept. */
+/** A new invitation, as the inviter sees it: never its token. */
 export interface CreatedInvitation {
   readonly invitationId: InvitationId;
   readonly organizationId: OrganizationId;
   readonly email: string;
-  readonly token: string;
   /** In core's form, `2026-11-30T17:05:00.000Z`. */
   readonly expiresAt: string;
 }
+
+/** What is handed to the delivery for the invitee: the only place the token goes. */
+export interface InvitationMessage {
+  readonly email: string;
+  readonly organizationId: OrganizationId;
+  readonly organizationName: string;
+  readonly token: string;
+  readonly expiresAt: string;
+}
+
+/**
+ * Sends an invitation to its address (T-040 builds the email one; tests use
+ * a double). Called inside the invitation's transaction, after it is
+ * stored: if it throws, nothing is stored and the result is
+ * `delivery_failed`. It must not show the token to the inviter.
+ */
+export type InvitationDelivery = (message: InvitationMessage) => Promise<void>;
 
 /** Whether `userId` is an active system admin, read in `q`. */
 async function isActiveSystemAdmin(q: Queryable, userId: UserId): Promise<boolean> {
@@ -255,11 +272,19 @@ const NOT_PERMITTED = "Only a system admin can do that.";
  * for the same organization and address is revoked, so only the newest
  * link works. The reply never says whether the address has an account in
  * another organization (D-019).
+ *
+ * **The token never reaches the inviter**: it goes only to `deliver`, for
+ * the invitee's mailbox. Otherwise an inviter could open their own link and
+ * learn from `acceptInvitation` whether the address has an account (D-068).
+ * Invitations for one organization and address are made one at a time (a
+ * transaction-level advisory lock, classid 68).
  */
 export async function createInvitation(
   db: Database,
   input: InvitationRequest,
+  deliver: InvitationDelivery,
 ): Promise<Validated<CreatedInvitation>> {
+  if (typeof deliver !== "function") throw new TypeError("createInvitation needs a delivery.");
   if (!hasOnly(input, ["organizationId", "email", "invitedBy", "expiresInSeconds"])) {
     return refused("invalid_request", "Give the organization, email, inviter and life only.");
   }
@@ -288,58 +313,63 @@ export async function createInvitation(
       ["expiresInSeconds"],
     );
   }
-  for (let attempt = 1; ; attempt++) {
-    const token = newInvitationToken();
-    const invitationId = newInvitationId();
-    try {
-      return await inTransaction(db, async (tx): Promise<Validated<CreatedInvitation>> => {
-        if (!(await isActiveSystemAdmin(tx, invitedBy)))
-          return refused("not_permitted", NOT_PERMITTED);
-        const org = await tx.rows(sql`
-          SELECT 1 FROM public.organizations WHERE id = ${organizationId}::uuid`);
-        if (org.length === 0) {
-          return refused("unknown_organization", "There is no such organization.", [
-            "organizationId",
-          ]);
-        }
-        const member = await tx.rows(sql`
-          SELECT 1 FROM public.organization_members m JOIN public.users u ON u.id = m.user_id
-          WHERE m.organization_id = ${organizationId}::uuid AND u.email = ${email}`);
-        if (member.length > 0) {
-          return refused("already_member", "That person is already in this organization.", [
-            "email",
-          ]);
-        }
-        await tx.execute(sql`
-          UPDATE public.invitations SET revoked_at = now(), revoked_by = ${invitedBy}::uuid
-          WHERE organization_id = ${organizationId}::uuid AND email = ${email}
-            AND accepted_at IS NULL AND revoked_at IS NULL`);
-        const rows = await tx.rows<{ expires_at: string }>(sql`
-          INSERT INTO public.invitations
-            (organization_id, id, email, token_hash, invited_by, created_at, expires_at)
-          VALUES (${organizationId}::uuid, ${invitationId}::uuid, ${email},
-                  ${hashInvitationToken(token)}, ${invitedBy}::uuid, now(),
-                  now() + make_interval(secs => ${life}))
-          RETURNING to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS expires_at`);
-        const expiresAt = rows[0]?.expires_at;
-        if (expiresAt === undefined) throw new Error("The invitation was not stored.");
-        return { ok: true, value: { invitationId, organizationId, email, token, expiresAt } };
-      });
-    } catch (error) {
-      // Two invitations for one address at once: the second waits on the
-      // first's pending row and then fails the unique index; run it again,
-      // and it revokes the first.
-      if (
-        attempt < 3 &&
-        sqlState(error) === "23505" &&
-        constraintOf(error) === "invitations_one_pending"
-      ) {
-        continue;
+  const token = newInvitationToken();
+  const invitationId = newInvitationId();
+  try {
+    return await inTransaction(db, async (tx): Promise<Validated<CreatedInvitation>> => {
+      // One at a time per organization and address, so a second invitation
+      // waits and then revokes the first instead of failing the unique index.
+      await tx.rows(sql`
+        SELECT pg_advisory_xact_lock(68, hashtext(${organizationId} || ' ' || ${email}))`);
+      if (!(await isActiveSystemAdmin(tx, invitedBy))) {
+        return refused("not_permitted", NOT_PERMITTED);
       }
-      throw error;
+      const org = await tx.rows<{ name: string }>(sql`
+        SELECT name FROM public.organizations WHERE id = ${organizationId}::uuid`);
+      const organizationName = org[0]?.name;
+      if (organizationName === undefined) {
+        return refused("unknown_organization", "There is no such organization.", [
+          "organizationId",
+        ]);
+      }
+      const member = await tx.rows(sql`
+        SELECT 1 FROM public.organization_members m JOIN public.users u ON u.id = m.user_id
+        WHERE m.organization_id = ${organizationId}::uuid AND u.email = ${email}`);
+      if (member.length > 0) {
+        return refused("already_member", "That person is already in this organization.", ["email"]);
+      }
+      await tx.execute(sql`
+        UPDATE public.invitations SET revoked_at = now(), revoked_by = ${invitedBy}::uuid
+        WHERE organization_id = ${organizationId}::uuid AND email = ${email}
+          AND accepted_at IS NULL AND revoked_at IS NULL`);
+      const rows = await tx.rows<{ expires_at: string }>(sql`
+        INSERT INTO public.invitations
+          (organization_id, id, email, token_hash, invited_by, created_at, expires_at)
+        VALUES (${organizationId}::uuid, ${invitationId}::uuid, ${email},
+                ${hashInvitationToken(token)}, ${invitedBy}::uuid, now(),
+                now() + make_interval(secs => ${life}))
+        RETURNING to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS expires_at`);
+      const expiresAt = rows[0]?.expires_at;
+      if (expiresAt === undefined) throw new Error("The invitation was not stored.");
+      try {
+        await deliver({ email, organizationId, organizationName, token, expiresAt });
+      } catch {
+        throw new DeliveryFailed();
+      }
+      return { ok: true, value: { invitationId, organizationId, email, expiresAt } };
+    });
+  } catch (error) {
+    if (error instanceof DeliveryFailed) {
+      return refused(
+        "delivery_failed",
+        "The invitation couldn't be sent, so it wasn't made. Try again later.",
+      );
     }
+    throw error;
   }
 }
+
+class DeliveryFailed extends Error {}
 
 /**
  * Revokes a pending invitation of `organizationId` (`unknown_invitation` if
@@ -421,10 +451,12 @@ export interface InvitationAcceptance {
 /**
  * Makes a new account from an invitation: the token, the organization and
  * the address must all be the invitation's, and it must be pending and
- * unexpired (else `invalid_invitation`, the same for every reason). If the
- * address already has an account, `account_exists`: sign in and use
- * `acceptInvitationForUser`. Then the name and the new password are
- * checked (`invalid_display_name`, core's password issues). The invitation
+ * unexpired (else `invalid_invitation`, the same for every reason). Then
+ * the name and the new password are checked (`invalid_display_name`,
+ * core's password issues), whatever the address. Only a complete, valid
+ * form learns that the address already has an account (`account_exists`:
+ * sign in and use `acceptInvitationForUser`); only the invitee has the
+ * token, since `createInvitation` gives it to the delivery alone. The invitation
  * is claimed, and the account and its membership written, in one
  * transaction; two acceptances of one token can't both succeed.
  */
@@ -447,13 +479,9 @@ export async function acceptInvitation(
   const tokenHash = hashInvitationToken(token);
   const found = await usableInvitation(db, tokenHash, organizationId, email);
   if (found === undefined) return refused("invalid_invitation", INVALID_INVITATION);
-  const exists = await db.rows(sql`SELECT 1 FROM public.users WHERE email = ${email}`);
-  if (exists.length > 0) {
-    return refused(
-      "account_exists",
-      "You already have an Oculus account. Sign in, then open the invitation link again.",
-    );
-  }
+  // The form is checked in full before anything about the address is read,
+  // so a bad name or password gives the same answer whether or not the
+  // address has an account (D-068).
   const displayName = validateDisplayName(own(input, "displayName"));
   const password = checkNewPassword(own(input, "password"), {
     email,
@@ -471,6 +499,13 @@ export async function acceptInvitation(
   if (!password.ok)
     issues.push(...password.issues.map((i) => ({ ...i, path: ["password", ...i.path] })));
   if (displayName === undefined || !password.ok) return refusedWith(issues);
+  const exists = await db.rows(sql`SELECT 1 FROM public.users WHERE email = ${email}`);
+  if (exists.length > 0) {
+    return refused(
+      "account_exists",
+      "You already have an Oculus account. Sign in, then open the invitation link again.",
+    );
+  }
   let hash: string;
   try {
     hash = await hashPassword(password.value);
@@ -725,13 +760,25 @@ export async function signIn(db: Database, input: SignInRequest): Promise<SignIn
     typeof password !== "string" ||
     password.length > MAX_TYPED_PASSWORD ||
     typeof source !== "string" ||
-    (organizationId !== undefined && !isOrganizationId(organizationId))
+    (organizationId !== undefined && !isOrganizationId(organizationId)) ||
+    // Text PostgreSQL can't store (NUL) or that isn't well-formed: refused
+    // before anything is read or counted. Neither says anything about an
+    // account, so it needs no hash to hide behind.
+    typed.includes("\u0000") ||
+    passwordText(typed) === undefined ||
+    passwordText(password) === undefined
   ) {
     return INVALID_REQUEST;
   }
   // Made once per process, before anything differs between a known and an
   // unknown address, so the first unknown address doesn't pay for it.
-  await dummyPasswordHash();
+  try {
+    await dummyPasswordHash();
+  } catch (error) {
+    if (error instanceof PasswordWorkBusyError)
+      return { ok: false, code: "busy", message: BUSY_MESSAGE };
+    throw error;
+  }
   const normalized = normalizeEmail(typed);
   const accountKey = throttleAccountKey(normalized ?? typed);
   const sourceKey = throttleSourceKey(source);

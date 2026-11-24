@@ -140,6 +140,8 @@ export {
 export type {
   FirstSystemAdmin,
   InvitationRequest,
+  InvitationMessage,
+  InvitationDelivery,
   CreatedInvitation,
   InvitationAcceptance,
   SignInRequest,

@@ -135,6 +135,16 @@ describe("throttleSourceKey", () => {
     expect(throttleSourceKey("0:0:0:0:0:ffff:192.0.2.1")).toBe("source:v4:192.0.2.1");
   });
 
+  it("shares one bucket for the edge cases D-068 lists for T-037 and T-045", () => {
+    const zero = "source:v6:0:0:0:0::/64";
+    expect(throttleSourceKey("::1")).toBe(zero);
+    expect(throttleSourceKey("::192.0.2.1")).toBe(zero);
+    expect(throttleSourceKey("::198.51.100.7")).toBe(zero);
+    const nat64 = "source:v6:64:ff9b:0:0::/64";
+    expect(throttleSourceKey("64:ff9b::192.0.2.1")).toBe(nat64);
+    expect(throttleSourceKey("64:ff9b::203.0.113.9")).toBe(nat64);
+  });
+
   it("puts anything it can't read in one shared counter", () => {
     for (const bad of [
       "",

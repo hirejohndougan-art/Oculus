@@ -19,6 +19,27 @@
 -- packages/core's accounts.ts, passwords.ts and sign-in-throttle.ts); these
 -- checks back them up for any writer.
 
+-- Whether a stored password hash is one core's verifyPassword will run:
+-- the PHC shape, and the same bounds on its settings as core's
+-- parseScryptHash (passwords.ts): ln 10–20, r 1–32, p 1–16, N < 2^(16·r)
+-- (RFC 7914), memory 128·N·r at most 64 MiB, work N·r·p at most 2^21.
+CREATE FUNCTION public.password_hash_ok(h text) RETURNS boolean
+LANGUAGE sql IMMUTABLE STRICT
+SET search_path = pg_catalog, pg_temp
+AS $$
+  SELECT CASE
+    WHEN h ~ '^\$scrypt\$ln=[1-9][0-9]?,r=[1-9][0-9]?,p=[1-9][0-9]?\$[A-Za-z0-9+/]{22}\$[A-Za-z0-9+/]{43}$' THEN (
+      SELECT ln BETWEEN 10 AND 20 AND r BETWEEN 1 AND 32 AND p BETWEEN 1 AND 16
+        AND ln < 16 * r
+        AND 128 * (2::bigint ^ ln) * r <= 64 * 1024 * 1024
+        AND (2::bigint ^ ln) * r * p <= 2::bigint ^ 21
+      FROM (SELECT substring(h FROM 'ln=([0-9]+)')::int AS ln,
+                   substring(h FROM 'r=([0-9]+)')::int AS r,
+                   substring(h FROM 'p=([0-9]+)')::int AS p) AS settings)
+    ELSE false
+  END
+$$;
+
 -- One person's sign-in. The email is stored in lower case (core's
 -- normalizeEmail) and is unique in the install. password_hash is a PHC
 -- string made by core's hashPassword (scrypt today; U-004 widens the check
@@ -32,7 +53,7 @@ CREATE TABLE public.users (
     CHECK (display_name <> '' AND length(display_name) <= 200 AND btrim(display_name) = display_name
            AND display_name !~ '[[:cntrl:]]'),
   password_hash text NOT NULL
-    CHECK (password_hash ~ '^\$scrypt\$ln=[0-9]{1,2},r=[0-9]{1,2},p=[0-9]{1,2}\$[A-Za-z0-9+/]{22}\$[A-Za-z0-9+/]{43}$'),
+    CHECK (public.password_hash_ok(password_hash)),
   -- D-019: system admins manage every user and every organization. Until
   -- a supported way to make or remove system admins exists (T-041, T-048),
   -- the bootstrap account is the only one (CHECK below) and the flag can't
@@ -76,7 +97,7 @@ CREATE TABLE public.invitations (
   revoked_at timestamptz,
   revoked_by uuid REFERENCES public.users (id),
   PRIMARY KEY (organization_id, id),
-  CHECK (expires_at > created_at AND expires_at <= created_at + interval '14 days'),
+  CHECK (expires_at >= created_at + interval '1 hour' AND expires_at <= created_at + interval '14 days'),
   CHECK ((accepted_at IS NULL) = (accepted_by IS NULL)),
   CHECK ((revoked_at IS NULL) = (revoked_by IS NULL)),
   CHECK (accepted_at IS NULL OR revoked_at IS NULL)
@@ -148,9 +169,55 @@ BEGIN
     RAISE EXCEPTION 'An expired invitation can''t be accepted.'
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'invitations_expired';
   END IF;
+  -- Settled now, by the clock: never back- or forward-dated.
+  IF (NEW.accepted_at IS NOT NULL AND NOT (NEW.accepted_at >= now() AND NEW.accepted_at <= clock_timestamp()))
+     OR (NEW.revoked_at IS NOT NULL AND NOT (NEW.revoked_at >= now() AND NEW.revoked_at <= clock_timestamp())) THEN
+    RAISE EXCEPTION 'An invitation is accepted or revoked at the time it happens.'
+      USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'invitations_settled_now';
+  END IF;
+  -- Revoked only by an active system admin (until T-041).
+  IF NEW.revoked_at IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM public.users u
+    WHERE u.id = NEW.revoked_by AND u.system_admin AND u.disabled_at IS NULL
+  ) THEN
+    RAISE EXCEPTION 'Only an active system admin revokes an invitation.'
+      USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'invitations_revoked_by_admin';
+  END IF;
   RETURN NEW;
 END
 $$;
+
+-- A new invitation is pending, made now, for 1 hour to 14 days (CHECK), by
+-- an active system admin (until T-041). So it can be accepted only later,
+-- by the UPDATE invitations_settle_once checks; no writer can insert one
+-- already accepted, back-dated or from someone who can't invite.
+CREATE FUNCTION public.invitations_check_new() RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  IF NEW.accepted_at IS NOT NULL OR NEW.accepted_by IS NOT NULL
+     OR NEW.revoked_at IS NOT NULL OR NEW.revoked_by IS NOT NULL THEN
+    RAISE EXCEPTION 'A new invitation is pending.'
+      USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'invitations_new_pending';
+  END IF;
+  IF NOT (NEW.created_at >= now() AND NEW.created_at <= clock_timestamp()) THEN
+    RAISE EXCEPTION 'A new invitation is made now.'
+      USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'invitations_new_now';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM public.users u
+    WHERE u.id = NEW.invited_by AND u.system_admin AND u.disabled_at IS NULL
+  ) THEN
+    RAISE EXCEPTION 'Only an active system admin invites.'
+      USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'invitations_invited_by_admin';
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER invitations_check_new BEFORE INSERT ON public.invitations
+  FOR EACH ROW EXECUTE FUNCTION public.invitations_check_new();
 
 CREATE TRIGGER invitations_settle_once BEFORE UPDATE ON public.invitations
   FOR EACH ROW EXECUTE FUNCTION public.invitations_settle_once();

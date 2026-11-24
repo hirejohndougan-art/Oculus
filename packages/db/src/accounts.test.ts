@@ -31,6 +31,8 @@ import {
   revokeInvitation,
   signIn,
   type CreatedInvitation,
+  type InvitationMessage,
+  type InvitationRequest,
   type SignInResult,
 } from "./accounts.js";
 import { insertOrganization } from "./catalog.js";
@@ -48,6 +50,8 @@ import { freshDatabase, testServerUrl, type TestDatabase } from "./test-database
 const ADMIN_EMAIL = "first.admin@example.org";
 const ADMIN_PASSWORD = "a first admin passphrase, invented";
 const PASSWORD = "an invented passphrase for tests";
+/** A well-formed stored hash of no password, for direct SQL. */
+const PLACEHOLDER_HASH = "$scrypt$ln=14,r=8,p=5$" + "A".repeat(22) + "$" + "A".repeat(43);
 
 let setup: Promise<{ testDb: TestDatabase; db: Database; admin: UserId }> | undefined;
 let db: Database;
@@ -109,8 +113,32 @@ async function organization(
   return id;
 }
 
-async function invite(organizationId: OrganizationId, address: string): Promise<CreatedInvitation> {
-  return ok(await createInvitation(db, { organizationId, email: address, invitedBy: admin }));
+type Sent = CreatedInvitation & { readonly token: string };
+
+/**
+ * createInvitation with a delivery double that keeps the message, as the
+ * invitee's mailbox would: the token comes from there, never from the
+ * function's result.
+ */
+async function inviteVia(conn: Database, input: InvitationRequest): Promise<Validated<Sent>> {
+  const box: InvitationMessage[] = [];
+  const made = await createInvitation(conn, input, (m) => {
+    box.push(m);
+    return Promise.resolve();
+  });
+  if (!made.ok) return made;
+  expect(made.value).not.toHaveProperty("token");
+  const message = box[0];
+  if (box.length !== 1 || message === undefined) throw new Error("not delivered once");
+  expect(message).toMatchObject({
+    email: made.value.email,
+    organizationId: made.value.organizationId,
+  });
+  return { ok: true, value: { ...made.value, token: message.token } };
+}
+
+async function invite(organizationId: OrganizationId, address: string): Promise<Sent> {
+  return ok(await inviteVia(db, { organizationId, email: address, invitedBy: admin }));
 }
 
 /** A new member of `organizationId`, through an invitation. */
@@ -416,7 +444,7 @@ describe("invitations", () => {
     await ready();
     const org = await organization();
     const someone = await member(org);
-    const r = await createInvitation(db, {
+    const r = await inviteVia(db, {
       organizationId: org,
       email: email(),
       invitedBy: someone.userId,
@@ -424,7 +452,7 @@ describe("invitations", () => {
     expect(codes(r)).toEqual(["not_permitted"]);
     expect(
       codes(
-        await createInvitation(db, {
+        await inviteVia(db, {
           organizationId: org,
           email: email(),
           invitedBy: newUserIdLike(),
@@ -433,7 +461,7 @@ describe("invitations", () => {
     ).toEqual(["not_permitted"]);
     expect(
       codes(
-        await createInvitation(db, {
+        await inviteVia(db, {
           organizationId: newOrganizationId(),
           email: email(),
           invitedBy: admin,
@@ -441,17 +469,15 @@ describe("invitations", () => {
       ),
     ).toEqual(["unknown_organization"]);
     expect(
-      codes(
-        await createInvitation(db, { organizationId: org, email: someone.email, invitedBy: admin }),
-      ),
+      codes(await inviteVia(db, { organizationId: org, email: someone.email, invitedBy: admin })),
     ).toEqual(["already_member"]);
     expect(
-      codes(await createInvitation(db, { organizationId: org, email: "nope", invitedBy: admin })),
+      codes(await inviteVia(db, { organizationId: org, email: "nope", invitedBy: admin })),
     ).toEqual(["invalid_email"]);
     for (const life of [0, 3599, 14 * 86400 + 1, 1.5, Number.NaN, "3600"]) {
       expect(
         codes(
-          await createInvitation(db, {
+          await inviteVia(db, {
             organizationId: org,
             email: email(),
             invitedBy: admin,
@@ -461,7 +487,7 @@ describe("invitations", () => {
       ).toEqual(["invalid_life"]);
     }
     const short = ok(
-      await createInvitation(db, {
+      await inviteVia(db, {
         organizationId: org,
         email: email(),
         invitedBy: admin,
@@ -473,9 +499,7 @@ describe("invitations", () => {
     await db.execute(sql`UPDATE public.users SET disabled_at = now() WHERE id = ${admin}::uuid`);
     try {
       expect(
-        codes(
-          await createInvitation(db, { organizationId: org, email: email(), invitedBy: admin }),
-        ),
+        codes(await inviteVia(db, { organizationId: org, email: email(), invitedBy: admin })),
       ).toEqual(["not_permitted"]);
     } finally {
       await db.execute(sql`UPDATE public.users SET disabled_at = NULL WHERE id = ${admin}::uuid`);
@@ -622,7 +646,7 @@ describe("invitations", () => {
     try {
       const made = await Promise.all(
         [db, other, db, other].map((conn) =>
-          createInvitation(conn, { organizationId: org, email: address, invitedBy: admin }),
+          inviteVia(conn, { organizationId: org, email: address, invitedBy: admin }),
         ),
       );
       expect(made.every((r) => r.ok)).toBe(true);
@@ -1059,6 +1083,229 @@ describe("sign-in throttling", () => {
   });
 });
 
+describe("what the inviter can learn (D-068)", () => {
+  it("never gets the token, and an invitation that can't be sent isn't made", async () => {
+    await ready();
+    const org = await organization();
+    const address = email();
+    const made = await createInvitation(
+      db,
+      { organizationId: org, email: address, invitedBy: admin },
+      () => Promise.reject(new Error("mail server down: secret detail")),
+    );
+    expect(made).toEqual({
+      ok: false,
+      issues: [
+        {
+          path: [],
+          code: "delivery_failed",
+          message: "The invitation couldn't be sent, so it wasn't made. Try again later.",
+        },
+      ],
+    });
+    expect(await db.rows(sql`SELECT 1 FROM public.invitations WHERE email = ${address}`)).toEqual(
+      [],
+    );
+    await expect(
+      createInvitation(
+        db,
+        { organizationId: org, email: address, invitedBy: admin },
+        undefined as never,
+      ),
+    ).rejects.toThrow(TypeError);
+  });
+
+  it("gives an incomplete form the same answer whether or not the address has an account", async () => {
+    await ready();
+    const orgA = await organization();
+    const orgB = await organization();
+    const existing = await member(orgA);
+    const fresh = email();
+    const invExisting = await invite(orgB, existing.email);
+    const invFresh = await invite(orgB, fresh);
+    for (const form of [
+      { displayName: "", password: PASSWORD },
+      { displayName: "Invented Person", password: "short" },
+      { displayName: "Invented Person", password: "password1" },
+      { displayName: " ", password: "x" },
+      { displayName: "Invented Person", password: "broken \ud800 text" },
+    ]) {
+      const a = await acceptInvitation(db, {
+        token: invExisting.token,
+        organizationId: orgB,
+        email: existing.email,
+        ...form,
+      });
+      const b = await acceptInvitation(db, {
+        token: invFresh.token,
+        organizationId: orgB,
+        email: fresh,
+        ...form,
+      });
+      expect(a.ok).toBe(false);
+      expect(a).toEqual(b);
+    }
+    // Both links still work for their invitees.
+    expect(
+      codes(
+        await acceptInvitation(db, {
+          token: invExisting.token,
+          organizationId: orgB,
+          email: existing.email,
+          displayName: "Invented Person",
+          password: PASSWORD,
+        }),
+      ),
+    ).toEqual(["account_exists"]);
+    expect(
+      (
+        await acceptInvitation(db, {
+          token: invFresh.token,
+          organizationId: orgB,
+          email: fresh,
+          displayName: "Invented Person",
+          password: PASSWORD,
+        })
+      ).ok,
+    ).toBe(true);
+  });
+});
+
+describe("inputs that never reach the database", () => {
+  it("refuses NUL and broken text at sign-in without counting or hashing", async () => {
+    await ready();
+    const s = source();
+    const before = passwordWorkCount();
+    for (const input of [
+      { email: "first.admin@example.org\u0000", password: ADMIN_PASSWORD, source: s },
+      { email: "\u0000", password: "x", source: s },
+      { email: "half\ud800@example.org", password: "x", source: s },
+      { email: ADMIN_EMAIL, password: "broken \udc00", source: s },
+    ]) {
+      expect(await signIn(db, input)).toMatchObject({ ok: false, code: "invalid_request" });
+    }
+    expect(passwordWorkCount() - before).toBe(0);
+    expect(await counterOf(throttleSourceKey(s))).toBeUndefined();
+    expect(await counterOf(throttleAccountKey(ADMIN_EMAIL))).toBeUndefined();
+    // NUL elsewhere is refused by the checks, never by PostgreSQL.
+    const org = await organization();
+    expect(
+      codes(
+        await inviteVia(db, {
+          organizationId: org,
+          email: "a\u0000@example.org",
+          invitedBy: admin,
+        }),
+      ),
+    ).toEqual(["invalid_email"]);
+    expect(ok(await clearSignInThrottle(db, { email: "a\u0000b", by: admin }))).toEqual({
+      cleared: false,
+    });
+  });
+
+  it("makes invitations for one address one at a time, on many connections at once", async () => {
+    await ready();
+    const org = await organization();
+    const address = email();
+    const url = (await setup)?.testDb.url ?? "";
+    const other = openDatabase(url, { max: 6 });
+    try {
+      const made = await Promise.all(
+        Array.from({ length: 12 }, (_, i) =>
+          inviteVia(i % 2 === 0 ? db : other, {
+            organizationId: org,
+            email: address,
+            invitedBy: admin,
+          }),
+        ),
+      );
+      expect(made.filter((r) => r.ok)).toHaveLength(12);
+      const rows = await db.rows<{ pending: boolean }>(sql`
+        SELECT accepted_at IS NULL AND revoked_at IS NULL AS pending FROM public.invitations
+        WHERE organization_id = ${org}::uuid AND email = ${address}`);
+      expect(rows).toHaveLength(12);
+      expect(rows.filter((r) => r.pending)).toHaveLength(1);
+    } finally {
+      await other.close();
+    }
+  });
+});
+
+describe("passwords at sign-in", () => {
+  it("accepts the composed and decomposed forms of one password", async () => {
+    await ready();
+    const org = await organization();
+    const address = email();
+    const inv = await invite(org, address);
+    ok(
+      await acceptInvitation(db, {
+        token: inv.token,
+        organizationId: org,
+        email: address,
+        displayName: "Invented Person",
+        password: "cafe\u0301 au lait at the bayou",
+      }),
+    );
+    for (const typed of ["cafe\u0301 au lait at the bayou", "caf\u00e9 au lait at the bayou"]) {
+      expect(await signIn(db, { email: address, password: typed, source: source() })).toMatchObject(
+        { ok: true },
+      );
+    }
+  });
+
+  it("makes a wrong password for an old cheap hash cost today's hash too", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const { scrypt } = await import("node:crypto");
+    const salt = Buffer.alloc(16, 5);
+    const key = await new Promise<Buffer>((resolve, reject) => {
+      scrypt(PASSWORD, salt, 32, { N: 2 ** 10, r: 8, p: 1 }, (e, k) => {
+        if (e) reject(e);
+        else resolve(k);
+      });
+    });
+    const b64 = (b: Buffer) => b.toString("base64").replace(/=+$/, "");
+    await db.execute(sql`UPDATE public.users SET password_hash = ${`$scrypt$ln=10,r=8,p=1$${b64(salt)}$${b64(key)}`}
+      WHERE id = ${person.userId}::uuid`);
+    const before = passwordWorkCount();
+    expect(
+      await signIn(db, { email: person.email, password: "wrong guess", source: source() }),
+    ).toEqual(INVALID_CREDENTIALS);
+    expect(passwordWorkCount() - before).toBe(2);
+  });
+
+  it("stores only hashes core will run: the database refuses costly or impossible settings", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const tail = "$" + "A".repeat(22) + "$" + "A".repeat(43);
+    for (const settings of [
+      "ln=16,r=1,p=1",
+      "ln=16,r=8,p=5",
+      "ln=21,r=8,p=1",
+      "ln=9,r=8,p=1",
+      "ln=14,r=33,p=1",
+      "ln=14,r=8,p=17",
+      "ln=17,r=8,p=1",
+    ]) {
+      await expect(
+        db.execute(sql`UPDATE public.users SET password_hash = ${`$scrypt$${settings}${tail}`}
+          WHERE id = ${person.userId}::uuid`),
+      ).rejects.toMatchObject({ code: "23514" });
+    }
+    for (const settings of ["ln=15,r=1,p=1", "ln=16,r=8,p=2", "ln=14,r=8,p=5"]) {
+      await db.execute(sql`UPDATE public.users SET password_hash = ${`$scrypt$${settings}${tail}`}
+        WHERE id = ${person.userId}::uuid`);
+    }
+    await expect(
+      db.execute(
+        sql`UPDATE public.users SET password_hash = 'plain text' WHERE id = ${person.userId}::uuid`,
+      ),
+    ).rejects.toMatchObject({ code: "23514" });
+  });
+});
+
 describe("the database's own guards", () => {
   it("refuses an account made without an accepted invitation for its address", async () => {
     await ready();
@@ -1118,6 +1365,7 @@ describe("the database's own guards", () => {
         AND c.relname IN ('users', 'invitations', 'organization_members', 'sign_in_throttles')
       ORDER BY 1`);
     expect(rows.map((r) => r.name)).toEqual([
+      "invitations.invitations_check_new",
       "invitations.invitations_settle_once",
       "invitations.zzzz_invitations_keep_identity",
       "organization_members.organization_members_check_invitation",
@@ -1134,6 +1382,42 @@ describe("the database's own guards", () => {
           WHERE id = ${pending.invitationId}::uuid`);
       }),
     ).rejects.toMatchObject({ code: "23000" });
+  });
+
+  it("checks invitations for accounts and memberships in replica mode too", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const pending = await invite(org, email());
+    const replica = (statement: Sql) =>
+      db.transaction(async (q) => {
+        await q.execute(sql`SET LOCAL session_replication_role = replica`);
+        await q.execute(statement);
+      });
+    // Foreign keys are skipped in replica mode; the triggers are not.
+    await expect(
+      replica(sql`INSERT INTO public.users (id, email, display_name, password_hash, created_by_invitation)
+        VALUES (gen_random_uuid(), 'replica@example.org', 'Replica', ${PLACEHOLDER_HASH},
+                gen_random_uuid())`),
+    ).rejects.toMatchObject({ constraint: "users_invitation_accepted" });
+    await expect(
+      replica(sql`INSERT INTO public.users (id, email, display_name, password_hash, created_by_invitation)
+        VALUES (gen_random_uuid(), ${pending.email}, 'Replica', ${PLACEHOLDER_HASH}, ${pending.invitationId}::uuid)`),
+    ).rejects.toMatchObject({ constraint: "users_invitation_accepted" });
+    const other = await organization();
+    await expect(
+      replica(sql`INSERT INTO public.organization_members (organization_id, user_id, invitation_id)
+        VALUES (${other}::uuid, ${person.userId}::uuid, gen_random_uuid())`),
+    ).rejects.toMatchObject({ constraint: "organization_members_invitation_accepted" });
+    await expect(
+      replica(sql`INSERT INTO public.organization_members (organization_id, user_id, invitation_id)
+        VALUES (${org}::uuid, ${person.userId}::uuid, ${pending.invitationId}::uuid)`),
+    ).rejects.toMatchObject({ constraint: "organization_members_invitation_accepted" });
+    await expect(
+      replica(sql`INSERT INTO public.invitations (organization_id, id, email, token_hash, invited_by, expires_at, accepted_at, accepted_by)
+        VALUES (${org}::uuid, gen_random_uuid(), 'replica@example.org', ${new Uint8Array(32).fill(4)},
+                ${admin}::uuid, now() + interval '1 day', now(), ${person.userId}::uuid)`),
+    ).rejects.toMatchObject({ constraint: "invitations_new_pending" });
   });
 
   it("refuses a membership without an accepted invitation of that organization", async () => {
@@ -1241,11 +1525,11 @@ describe("the writer's grants (D-068)", () => {
       const org = await organization();
       const address = email();
       const inv = ok(
-        await createInvitation(writer, { organizationId: org, email: address, invitedBy: admin }),
+        await inviteVia(writer, { organizationId: org, email: address, invitedBy: admin }),
       );
-      ok(await createInvitation(writer, { organizationId: org, email: address, invitedBy: admin }));
+      ok(await inviteVia(writer, { organizationId: org, email: address, invitedBy: admin }));
       const again = ok(
-        await createInvitation(writer, { organizationId: org, email: address, invitedBy: admin }),
+        await inviteVia(writer, { organizationId: org, email: address, invitedBy: admin }),
       );
       expect(inv.token).not.toBe(again.token);
       const made = ok(
@@ -1259,7 +1543,7 @@ describe("the writer's grants (D-068)", () => {
       );
       const other = await organization();
       const second = ok(
-        await createInvitation(writer, { organizationId: other, email: address, invitedBy: admin }),
+        await inviteVia(writer, { organizationId: other, email: address, invitedBy: admin }),
       );
       ok(
         await acceptInvitationForUser(writer, {
@@ -1269,7 +1553,7 @@ describe("the writer's grants (D-068)", () => {
         }),
       );
       const revocable = ok(
-        await createInvitation(writer, { organizationId: org, email: email(), invitedBy: admin }),
+        await inviteVia(writer, { organizationId: org, email: email(), invitedBy: admin }),
       );
       ok(
         await revokeInvitation(writer, {
@@ -1288,6 +1572,59 @@ describe("the writer's grants (D-068)", () => {
       });
       ok(await clearSignInThrottle(writer, { email: address, by: admin }));
       await deleteExpiredSignInThrottles(writer);
+
+      // The review's sequence: mint an account by inserting an invitation
+      // already accepted, back-dated or from someone who can't invite.
+      const forged = { org, address: email(), id: "6b1c2a9e-8b7d-4c6e-9a1b-2d3e4f5a6b7c" };
+      const tokenHash = new Uint8Array(32).fill(7);
+      const refusedAs = async (statement: Sql, constraint: string): Promise<void> => {
+        await expect(writer.execute(statement)).rejects.toMatchObject({ constraint });
+      };
+      await refusedAs(
+        sql`INSERT INTO public.invitations (organization_id, id, email, token_hash, invited_by, expires_at, accepted_at, accepted_by)
+          VALUES (${org}::uuid, gen_random_uuid(), ${forged.address}, ${tokenHash}, ${admin}::uuid,
+                  now() + interval '1 day', now(), ${forged.id}::uuid)`,
+        "invitations_new_pending",
+      );
+      await refusedAs(
+        sql`INSERT INTO public.invitations (organization_id, id, email, token_hash, invited_by, created_at, expires_at)
+          VALUES (${org}::uuid, gen_random_uuid(), ${forged.address}, ${tokenHash}, ${admin}::uuid,
+                  now() - interval '8 days', now() - interval '1 day')`,
+        "invitations_new_now",
+      );
+      await refusedAs(
+        sql`INSERT INTO public.invitations (organization_id, id, email, token_hash, invited_by, expires_at)
+          VALUES (${org}::uuid, gen_random_uuid(), ${forged.address}, ${tokenHash}, ${made.userId}::uuid,
+                  now() + interval '1 day')`,
+        "invitations_invited_by_admin",
+      );
+      const pending = ok(
+        await inviteVia(writer, { organizationId: org, email: email(), invitedBy: admin }),
+      );
+      await refusedAs(
+        sql`UPDATE public.invitations SET revoked_at = now(), revoked_by = ${made.userId}::uuid
+          WHERE id = ${pending.invitationId}::uuid`,
+        "invitations_revoked_by_admin",
+      );
+      await refusedAs(
+        sql`UPDATE public.invitations SET accepted_at = now() - interval '1 hour', accepted_by = ${forged.id}::uuid
+          WHERE id = ${pending.invitationId}::uuid`,
+        "invitations_settled_now",
+      );
+      // What remains (D-068): a pending invitation forged in an active
+      // admin's name, accepted by UPDATE now, then the account and its
+      // membership. The writer can mint an account only like this.
+      await writer.transaction(async (q) => {
+        const inv = "7c1c2a9e-8b7d-4c6e-9a1b-2d3e4f5a6b7c";
+        await q.execute(sql`INSERT INTO public.invitations (organization_id, id, email, token_hash, invited_by, expires_at)
+          VALUES (${org}::uuid, ${inv}::uuid, ${forged.address}, ${tokenHash}, ${admin}::uuid, now() + interval '1 day')`);
+        await q.execute(sql`UPDATE public.invitations SET accepted_at = clock_timestamp(), accepted_by = ${forged.id}::uuid
+          WHERE id = ${inv}::uuid`);
+        await q.execute(sql`INSERT INTO public.users (id, email, display_name, password_hash, created_by_invitation)
+          VALUES (${forged.id}::uuid, ${forged.address}, 'Forged', ${PLACEHOLDER_HASH}, ${inv}::uuid)`);
+        await q.execute(sql`INSERT INTO public.organization_members (organization_id, user_id, invitation_id)
+          VALUES (${org}::uuid, ${forged.id}::uuid, ${inv}::uuid)`);
+      });
       for (const statement of [
         sql`DELETE FROM public.users WHERE id = ${made.userId}::uuid`,
         sql`DELETE FROM public.invitations WHERE id = ${inv.invitationId}::uuid`,

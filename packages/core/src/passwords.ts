@@ -10,11 +10,13 @@
  * thrown, so a burst of sign-ins can't starve the server or grow memory
  * without bound. Hashes are compared with `timingSafeEqual`.
  *
- * `verifyPassword` always runs exactly one scrypt computation, whatever it
- * is given: a stored hash it can't read, or a password longer than
- * `MAX_PASSWORD_BYTES`, is checked against `dummyPasswordHash()` and then
- * refused. Sign-in uses the same dummy hash for an unknown user, so a wrong
- * user name costs the same as a wrong password (ASVS 5.0 6.3.8).
+ * Every failed `verifyPassword` costs at least one scrypt run at today's
+ * settings, whatever it is given: a stored hash it can't read, or a
+ * password longer than `MAX_PASSWORD_BYTES` or not well-formed, is checked
+ * against `dummyPasswordHash()` and then refused, and a wrong password for
+ * a hash with cheaper settings is padded with a dummy run. Sign-in uses the
+ * same dummy hash for an unknown user, so a wrong user name costs the same
+ * as a wrong password (ASVS 5.0 6.3.8).
  *
  * A stored hash whose settings differ from today's (`SCRYPT_SETTINGS`)
  * `needsRehash`: sign-in stores a new hash after a correct password. When
@@ -22,8 +24,10 @@
  *
  * **New passwords** (ASVS 5.0 6.2): at least `MIN_PASSWORD_LENGTH`
  * characters (15 recommended on the form), at most `MAX_PASSWORD_BYTES`
- * bytes of UTF-8, no composition rules, hashed exactly as received (no
- * trimming, case change or Unicode normalization). Refused: one of the
+ * bytes of UTF-8, no composition rules. Every password is put in Unicode
+ * NFC before it is measured, checked or hashed (D-068, replacing D-052's
+ * "no normalization"), and is otherwise used as typed (no trimming or case
+ * change); a lone surrogate is refused. Refused: one of the
  * bundled common passwords (`common-passwords.ts`), compared ignoring case,
  * and a password that is mostly context words ("oculus", the organization's
  * name, the person's name or email): with every context word of 4 or more
@@ -76,9 +80,13 @@ const PHC_SCRYPT =
   /^\$scrypt\$ln=([1-9][0-9]?),r=([1-9][0-9]?),p=([1-9][0-9]?)\$([A-Za-z0-9+/]{22})\$([A-Za-z0-9+/]{43})$/;
 
 // Bounds on stored settings, so a damaged or planted row can't ask for
-// gigabytes of memory or minutes of work: ln 10–20, r 1–32, p 1–16, and
-// memory (128·N·r bytes) at most 64 MiB.
+// gigabytes of memory, seconds of work or settings scrypt refuses: ln 10–20,
+// r 1–32, p 1–16, N < 2^(16·r) (RFC 7914 §2), memory (128·N·r bytes) at most
+// 64 MiB, and work (N·r·p) at most 2^21, about 3 times today's.
+// The database's CHECK on users.password_hash says the same (0009).
 const MAX_SCRYPT_MEMORY = 64 * 1024 * 1024;
+/** The most work (N·r·p) a stored hash may ask for. */
+export const MAX_SCRYPT_WORK = 2 ** 21;
 
 function parseScryptHash(stored: unknown): ScryptHash | undefined {
   if (typeof stored !== "string") return undefined;
@@ -88,7 +96,9 @@ function parseScryptHash(stored: unknown): ScryptHash | undefined {
   const r = Number(match[2]);
   const p = Number(match[3]);
   if (ln < 10 || ln > 20 || r > 32 || p > 16) return undefined;
+  if (ln >= 16 * r) return undefined;
   if (128 * 2 ** ln * r > MAX_SCRYPT_MEMORY) return undefined;
+  if (2 ** ln * r * p > MAX_SCRYPT_WORK) return undefined;
   const salt = Buffer.from(match[4] ?? "", "base64");
   const hash = Buffer.from(match[5] ?? "", "base64");
   if (salt.length !== SALT_BYTES || hash.length !== KEY_BYTES) return undefined;
@@ -171,14 +181,30 @@ function utf8Bytes(password: string): Buffer {
   return Buffer.from(password, "utf8");
 }
 
+// A lone surrogate: half of a UTF-16 pair with no other half.
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+/**
+ * The form a password is checked, measured and hashed in: Unicode NFC, so
+ * the same password typed on two keyboards (a precomposed "é" or "e" plus
+ * a combining accent) is the same password. `undefined` for what isn't
+ * well-formed text (not a string, or a lone surrogate, which has no UTF-8
+ * form and would otherwise be hashed as U+FFFD).
+ */
+export function passwordText(password: unknown): string | undefined {
+  if (typeof password !== "string" || LONE_SURROGATE.test(password)) return undefined;
+  return password.normalize("NFC");
+}
+
 /**
  * Hashes a new password with today's settings. The password must be a string
  * of at most `MAX_PASSWORD_BYTES` bytes (check it with `checkNewPassword`
  * first); anything else throws.
  */
 export async function hashPassword(password: string): Promise<string> {
-  if (typeof password !== "string") throw new TypeError("A password is a string.");
-  const bytes = utf8Bytes(password);
+  const text = passwordText(password);
+  if (text === undefined) throw new TypeError("A password is well-formed text.");
+  const bytes = utf8Bytes(text);
   if (bytes.length > MAX_PASSWORD_BYTES) {
     throw new RangeError(`A password is at most ${String(MAX_PASSWORD_BYTES)} bytes.`);
   }
@@ -203,6 +229,18 @@ export function dummyPasswordHash(): Promise<string> {
   return dummy;
 }
 
+function scryptWork(h: { readonly ln: number; readonly r: number; readonly p: number }): number {
+  return 2 ** h.ln * h.r * h.p;
+}
+
+/** One scrypt run at today's settings that can never match anything. */
+async function runDummy(): Promise<void> {
+  const fake = parseScryptHash(await dummyPasswordHash());
+  if (fake === undefined) throw new Error("The dummy password hash can't be read.");
+  // Hash something of a fixed size, so a long password costs no more.
+  await runScrypt(randomBytes(32), fake.salt, fake.ln, fake.r, fake.p);
+}
+
 /** What `verifyPassword` found. */
 export interface PasswordCheck {
   /** True only if the password matches a readable stored hash. */
@@ -224,16 +262,19 @@ export async function verifyPassword(
   stored: string | undefined,
 ): Promise<PasswordCheck> {
   const parsed = parseScryptHash(stored);
-  const usable = typeof password === "string" && utf8Bytes(password).length <= MAX_PASSWORD_BYTES;
-  if (parsed === undefined || !usable) {
-    const fake = parseScryptHash(await dummyPasswordHash());
-    if (fake === undefined) throw new Error("The dummy password hash can't be read.");
-    // Hash something of a fixed size, so a long password costs no more.
-    await runScrypt(randomBytes(32), fake.salt, fake.ln, fake.r, fake.p);
+  const text = passwordText(password);
+  if (parsed === undefined || text === undefined || utf8Bytes(text).length > MAX_PASSWORD_BYTES) {
+    await runDummy();
     return REFUSED;
   }
-  const key = await runScrypt(utf8Bytes(password), parsed.salt, parsed.ln, parsed.r, parsed.p);
-  if (!timingSafeEqual(key, parsed.hash)) return REFUSED;
+  const key = await runScrypt(utf8Bytes(text), parsed.salt, parsed.ln, parsed.r, parsed.p);
+  if (!timingSafeEqual(key, parsed.hash)) {
+    // A hash cheaper than today's settings would fail faster than a current
+    // one: pad the failure to today's cost, so failures cost the same
+    // whatever a user's stored hash is.
+    if (scryptWork(parsed) < scryptWork(SCRYPT_SETTINGS)) await runDummy();
+    return REFUSED;
+  }
   return { ok: true, needsRehash: passwordHashNeedsRehash(stored) };
 }
 
@@ -301,17 +342,22 @@ function characters(text: string): number {
 }
 
 /**
- * Checks a new password against D-052's rules. Returns the password exactly
- * as given (never trimmed or changed) or the issues: `not_text`,
+ * Checks a new password against D-052's rules, in its NFC form
+ * (`passwordText`). Returns that form (never trimmed or otherwise changed)
+ * or the issues: `not_text`, `invalid_text` (a lone surrogate),
  * `too_short`, `too_long`, `common_password`, `context_words`. The messages
  * never repeat the password.
  */
-export function checkNewPassword(
-  password: unknown,
-  context: PasswordContext = {},
-): Validated<string> {
-  if (typeof password !== "string") {
+export function checkNewPassword(input: unknown, context: PasswordContext = {}): Validated<string> {
+  if (typeof input !== "string") {
     return { ok: false, issues: [issue([], "not_text", "A password must be text.")] };
+  }
+  const password = passwordText(input);
+  if (password === undefined) {
+    return {
+      ok: false,
+      issues: [issue([], "invalid_text", "A password can't contain broken characters.")],
+    };
   }
   const issues: Issue[] = [];
   if (utf8Bytes(password).length > MAX_PASSWORD_BYTES) {
