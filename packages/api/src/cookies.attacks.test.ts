@@ -70,6 +70,16 @@ describe("reading cookies", () => {
     expect(cookieHeaderProblem(cookie)).toBeUndefined();
   });
 
+  it("trims only spaces and tabs: a name with a no-break space is another cookie", () => {
+    const header = `${SESSION}=a; \u00a0${SESSION}=b; ${SESSION}\u00a0=c`;
+    expect(cookieHeaderProblem(header)).toBeUndefined();
+    expect(readOculusCookie(header, SESSION)).toBe("a");
+    expect(readOculusCookie(`\u00a0${SESSION}=b`, SESSION)).toBeUndefined();
+    // Spaces and tabs around names and values are still ignored.
+    expect(readOculusCookie(`x=1;\t ${SESSION} \t= a\t`, SESSION)).toBe("a");
+    expect(cookieHeaderProblem(`${SESSION}=a;\t${SESSION} =b`)).toBeDefined();
+  });
+
   it("refuses duplicates split over two Cookie headers", () => {
     // Node joins repeated Cookie headers with "; " before Fastify sees them.
     expect(cookieHeaderProblem(`${SESSION}=a; ${SESSION}=b`)).toBeDefined();

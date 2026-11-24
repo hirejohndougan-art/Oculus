@@ -42,14 +42,23 @@ export type OculusCookieName = (typeof OCULUS_COOKIES)[keyof typeof OCULUS_COOKI
 const NAMES: ReadonlySet<string> = new Set(Object.values(OCULUS_COOKIES));
 const VALUE = /^[A-Za-z0-9_-]{1,512}$/;
 
+/**
+ * Strips spaces and tabs only (RFC 6265 §5.2's whitespace), never what
+ * `String.prototype.trim` also strips (U+00A0 and other Unicode spaces), so
+ * `\u00a0__Host-oculus_session` stays another name (S-024 review).
+ */
+function trimSpaceTab(text: string): string {
+  return text.replace(/^[ \t]+|[ \t]+$/g, "");
+}
+
 function cookiePairs(header: string | undefined): { name: string; value: string }[] {
   // Only a string is read: no array, boxed String or object with a toString.
   if (typeof header !== "string" || header === "") return [];
   return header.split(";").map((pair) => {
     const eq = pair.indexOf("=");
     return eq === -1
-      ? { name: pair.trim(), value: "" }
-      : { name: pair.slice(0, eq).trim(), value: pair.slice(eq + 1).trim() };
+      ? { name: trimSpaceTab(pair), value: "" }
+      : { name: trimSpaceTab(pair.slice(0, eq)), value: trimSpaceTab(pair.slice(eq + 1)) };
   });
 }
 
