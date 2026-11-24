@@ -28,9 +28,6 @@ The data model in TypeScript, written for any archive or museum rather than one 
 - [x] S-012 **Loan link reads use own properties.** (risky, from the T-018a review)
   - On main, validated loan copies inherit from `Object.prototype` and move links (`departureMoveId` and others) are read without an own-property check, so a polluted prototype can link a real departure and take an overdue loan in off the list. Read with `Object.hasOwn` or copy into null-prototype objects; attack test.
   - Done: `readTop` in storage.ts returns frozen prototype-free copies at every depth (storage, loans, condition checks); loans read item links through `ownLink`. Reviewed safe.
-- [ ] S-013 **Unlinked arrivals hide overdue loans.** (risky, from the T-018a review)
-  - On main, an agreed loan in whose items arrived without a link stays `agreed` past its end and isn't listed, and one with a returned linked item plus an unlinked arrival shows `returned`. Any placement of a loan's record around or after `beginOn` that isn't linked should make the loan `unknown` and overdue.
-  - Attempt 1 (branch `autopilot/S-012`, commit b623eb9, not merged): an `unlinked_arrival` rule. Review: still hideable (moving `beginOn` later, arrivals 31+ days early, first moves that are temporary or to external locations, changing a location's kind afterwards, decoy loans with open stays) and false positives (declined requests replaced by a new agreement, early return then borrowed again, renewals of records already here). Design it together with T-018a's redesign: decide "the loan is over" from where the record is during the loan period, with explicit ways to account for renewals and replaced requests.
 - [x] S-011c **A link to a deleted record refuses the whole output.** (from the S-011 review) Done (amendment to D-045): `publicOutput` drops a public `record_link` whose record the checker doesn't hold, exactly as an unpublished target (nothing in any form), and lists it in a new staff-only `staffWarnings` field as `link_target_missing` instead of refusing; every other template-check problem still refuses, and saving such a link is still `unknown_record`. A place naming a deleted place record was already left out (D-048).
   - A public `record_link` whose target no longer exists makes `templateCheck` refuse the record's public output (`unknown_record`) instead of leaving the link out. Fail closed, but one deleted authority blocks publishing every record pointing at it; decide whether to drop such links (as D-045 does for unpublished ones) with a staff warning.
 - [x] S-010 **Kept views publish without re-checks by default.** (risky, security run 2026-11-23) Done: `records` and `templateFor` are required for every view (`records_unknown`, `templates_unknown`); `currentTemplate` removed (D-054).
@@ -68,8 +65,6 @@ The data model in TypeScript, written for any archive or museum rather than one 
 - [x] T-001a **Turn on GitHub security alerts.** (needs John) CodeQL default setup turned on by John (2026-11-23). Still open: confirm Dependabot alerts are on; the autopilot's GitHub app can't read either alert list (HTTP 403 "Resource not accessible by integration") until it is granted security-alert read permission.
   - Dependabot alerts are disabled on the repository and code scanning isn't reachable from the autopilot. John: enable Dependabot alerts and CodeQL default setup in the repo's Settings → Code security, so the security run can read them.
   - Done (John, 2026-11-23): Dependabot alerts, malware alerts, security updates and grouped security updates on; CodeQL default setup on. The autopilot's GitHub connection can't read the alert lists (403), but Dependabot's security-update pull requests are visible: the upkeep run checks open Dependabot pull requests (`gh api "repos/hirejohndougan-art/Oculus/pulls?state=open"`, author `dependabot[bot]`), runs the gate on each, and records them; merging one follows the usual rules (gate passes, a major version gets its own decision entry).
-- [ ] T-001b **Revisit TypeScript 7 and Vite 8.**
-  - Both majors were turned down in D-006 and the upkeep run of 2026-11-21 found the reasons still hold: typescript-eslint 8.73 supports only TypeScript `<6.1`, and Vite 8 still depends on MPL-2.0 `lightningcss`. Move when typescript-eslint supports TypeScript 7, or when Vite drops `lightningcss` as a required dependency; each move gets its own decision entry.
 - [x] U-001 **Direct tests for the shared helpers.** (upkeep)
   - `readPlainData`, `textProblem`, `isPlainObject`, `IssueList`, the kind and level guards, `isLeapYear` and `patternMismatchMessage` had no tests of their own (`plain-data.test.ts`, `helpers.test.ts`).
 - [x] U-002 **Direct tests for the organization helpers.** (upkeep)
@@ -117,10 +112,6 @@ The data model in TypeScript, written for any archive or museum rather than one 
   - A vocabulary and term model (LCSH, LCNAF, LCGFT, Nomenclature 4.0, GNIS and local terms), stored as URIs plus labels.
   - Near-duplicate detection for local terms, to feed Data Cleaning.
   - No downloaded vocabulary data yet.
-- [~] T-009a **Vocabulary follow-ups.** deps: T-009
-  - Confirm the Nomenclature 4.0 and GNIS URI patterns from nomenclature.info and USGS once they can be reached, and tighten those checks.
-  - A Data Cleaning report of LC-vocabulary terms with no URI.
-  - Done: `findLcTermsWithoutUri`, the Data Cleaning report of LC terms with no URI. Still open: the Nomenclature 4.0 and GNIS URI forms (nomenclature.info and the USGS pages couldn't be read on 2026-11-23).
 - [x] T-010 **Dublin Core and JSON-LD output.** deps: T-006, T-007, T-008
   - Turn a published record into Dublin Core and JSON-LD.
   - Unpublished and staff-only fields never appear in the output. (risky)
@@ -159,9 +150,6 @@ The data model in TypeScript, written for any archive or museum rather than one 
 - [x] T-016a **Structured restrictions on accessions.** deps: T-016 (risky)
   - Restrictions are free text today and hold nothing back. Add structured ones (closed until a date; staff and researchers only, as in the Log an accession mockup) that hold records back like an unsigned deed.
   - Done: `accessRestriction` (`closed_until` with `until`, or `staff_and_researchers`) holds the record, units below, scans and links exactly as an unsigned deed does (`access_restricted`); `indexAccessions` requires the caller's `today` (organization's local day), kept as `heldAsOf`; `restrictionHoldsOn`; free-text restrictions stay notes (D-056). For T-034: build the register with the real local day at publish time, and re-publish when a `closed_until` date passes.
-- [!] T-018a **Loan follow-ups.** deps: T-018, T-016 attempts: 3
-  - Stuck (2026-11-23): built on branch `autopilot/T-018a` (pushed) with D-059, but three independent reviews each found ways to take an overdue loan off `overdueLoans` (D-044), all through a register of accessions handed in by the caller (old, same-day or tomorrow-dated registers, lender changes, early unlinked arrivals). New approach for the monthly review: accessions close loans only inside the service layer (T-032), which builds the register and the loan book itself in one save; core keeps the pure checks. Reusable from the branch: own-property reads in `checkNumber`/`checkLink`, valuation/insurance/authoriser fields, condition checks' `loanId` against the book, and the fit-check report (by `recordedAt`).
-  - A borrowed item that becomes the organization's (bought or given) needs a link from an accession to close its loan in. Link a condition check's `loanId` to the loan book and warn when a loan out goes without a recent fit check. Valuation, insurance and authoriser fields.
 - [x] T-013a **Record type edits checked against records.** deps: T-013
   - Editing a record type's kind or key, or deleting it, should list the records that use it first, as `templateChanges` does for templates; optionally a `recordTypes` input on `templateChanges`.
   - Done: `recordTypeChanges` and `recordTypeDeletion` (record-type-changes.ts, D-053) report `key_changed`, `key_adopts_records`, `kind_changed`, `type_deleted` and `unverified` (no `existing`) with record IDs, organization checked first; attack tests. The optional `recordTypes` input on `templateChanges` was left out (`recordTypeTemplateIssues` covers it).
@@ -220,8 +208,6 @@ Database:
   - Done (D-047); independent review: safe.
 - [ ] T-019b2 **Organizations on local term lists and rights settings.** deps: T-019b1, T-027 (risky)
   - When local vocabularies, stored authority terms (T-027) or per-organization rights settings become stored data, give each a required `organizationId` and refuse mixed or unowned sets, as D-030 does.
-- [ ] T-019d **Site passwords.** deps: T-019, T-023, T-037 (risky) As D-052: hashed like a user password, at least 15 characters, a version that ends unlocks when it changes, unlocks kept on the session, throttled per user per site and per site, never a permanent lockout.
-  - How a password-protected site (D-019) stores its password and rate-limits attempts; needs the Phase 2 password decision.
 - [ ] T-012a **Follow-ups from T-012 and T-005a.** deps: T-012, T-005a
   - `made_staff` and `templateChanges` pick records by `templateKey`; compare the two templates when a record moves to another template; `nextIdentifier` also counts numbers held in template identifier fields; remove the lookup-function path once every record has a key.
 - [x] T-025 **Schema: records, templates and record types.** deps: T-024, T-012, T-013, T-019 (risky)
@@ -236,7 +222,6 @@ Database:
 - [x] T-028 **Staff search.** deps: T-025, T-026 (risky) Done: D-066, migration 0007, two review rounds. Follow-ups in S-014.
   - PostgreSQL full-text search over titles and text fields, and lookup by current or former identifier through the comparison key (§2 "old numbers stay searchable"), with ranking and accent-insensitive matching (D-066: Latin, Greek and Cyrillic; Hebrew and Arabic vowel marks are kept, so vocalized and unvocalized text do not match). This is staff search only. A public search (Phase 4) must index only published public views, and this index must never be used for it.
   - Built on branch `autopilot/T-028` (D-066): migration 0007 (`records.search_document`, a stored generated tsvector folded by the pure-SQL `search_fold`, GIN index, `rebuild_search_documents()` for after a PostgreSQL major upgrade or a C library, ICU or locale change) and `searchRecords` (text and identifier-key lookup, ranked, keyset pages, organization-scoped, staff only). Review fixes: ranks ordered as numbers (paging skipped hits), OR'd exclusions documented and tested, cost and write-cost notes, rebuild procedure.
-- [ ] S-014 **Search rebuild and docs follow-ups.** deps: T-028 Small items from the second T-028 review: `rebuild_search_documents()` should refuse when anything besides `records_search` depends on `search_document` (it silently drops other indexes today); document running it with `SET lock_timeout` and `ANALYZE public.records` afterwards; correct the non-owner error wording (42501, "permission denied" or "must be owner"); a note on `or` precedence and spaced dashes (`chair - table`) as exclusions; add the `to_jsonb(OLD)` cost to the write-cost note; note that each rebuild uses one of the 1,600 column slots.
 - [x] T-052 **Backup and restore tools.** deps: T-024 (risky) Done: D-064. `npm run backup` / `npm run restore`: pg_dump custom archive plus a manifest, restore only into a fresh database by a non-superuser role, checked afterwards. Five review rounds.
   - A script that backs up the database to a file and one that restores it into an empty database, with a test that restores a backup and finds every record and version. Backups are a command any scheduler can run (D-035); where the copies go is set up in T-051.
 
@@ -260,7 +245,6 @@ The writer:
   - D-065: any write that sets or changes an archival unit's parent or level, inserts included, calls `arrangement_lock(org)` BEFORE running the arrangement checks (parent level, children's levels, depth), so the checks see a settled tree; the database's guard refuses loops and depth only, not levels.
   - D-065: `restoreVersion` needs the permission to read the record's history as well as to edit it (it reveals the old content). It is a save like any other: wrap it with the same permissions, `refreshRecordTerms` and, for published records, T-034's publish re-check. Set the record's `organizationId` from the session before `updateRecord` (it trusts the input's), and return a conflict's changed names only; values of other versions only through `compareVersions` with the history permission (T-041, T-043).
 - [ ] S-015 **Writer-check follow-ups.** deps: T-032 From the fifth T-032 review: refuse grant options on the database and schema public too (D-067 says none are allowed); leave temporary-table schemas out of `owns_object` so a writer session using a temp table doesn't make startup fail; have `checkConnection` refuse when any guard trigger is not ALWAYS (`tgenabled <> 'A'`); refuse any subscription in this database.
-- [ ] T-018b **Storage for accessions, loans and moves, through the service.** deps: T-032 (risky) Tables and service operations for accessions, loans and moves, so T-018a and S-013 can be rebuilt on the service as D-067 says: loans are closed only inside the service from data it reads in its own transaction. Deferred by John (2026-11-23): loans wait until after the Phase 2 sign-in and permissions work; then build this together with the T-018a and S-013 redesign in one branch.
 - [ ] T-034 **Workflow states and a real publish state.** deps: T-032, T-016, T-016a (risky)
   - Records get a stored state (draft, ready for review, published, withdrawn, as in the mockup), changed only through the service. Publishing runs `effectivePublishIssues` and the accession deed check at that moment. `publicOutput` gets `records` and `templateFor` loaded in the same read, never from a cache (D-054). `publicOutput` takes published IDs from the database instead of the caller's `published` list (replacing that part of D-016, with a decision entry and closing the last part of T-010a). Shape it so publishing can later be per site (Phase 5, "Show on these sites") without a schema rewrite.
   - Subjects counts (D-062): `termUsageCounts` in `packages/db` is staff-only (every field of every record, published or not) and has no public option. Public counts of records per term are computed from `publicOutput` or the public views of published records (or a separate index built from those at publish time, rebuilt when a record is published, withdrawn or re-published, or its template changes), never from `record_terms`, and show only stored labels or what the public output itself shows. That is this task's.
@@ -279,15 +263,11 @@ Logins and roles:
 - [ ] T-041 **Roles and collection-level permissions.** deps: T-036, T-032, T-019 (risky)
   - D-025 (John): system managers can do everything (sites, plugins, themes, users, System settings); site managers have full control of only their assigned sites and choose among installed plugins and themes. Below them, roles granted for the whole catalog or for chosen fonds or collections and the units below them. The service checks them on every read and write, and anything not granted is refused.
   - D-036 (John): roles are sets of permissions from a fixed list, and the service checks permissions, never role names. Built-in roles: cataloger, reviewer, read-only, Scanner (upload and attach scans only) and Donor relations (donors, accessions and deeds only). Only roles with the publish permission publish (reviewers and site managers by default; mockup Settings).
-- [ ] T-041a **Custom roles.** deps: T-041 (risky)
-  - D-036: system managers create, edit and delete roles from the permission list, each owned by one organization. No custom role can hold system-manager powers; built-in roles can't be deleted. Editing or deleting a role in use shows who is affected, deleting one in use needs those people moved, adding publish, donor-data or people permissions needs confirmation, and every change goes in the change log. Tests try to grant a system power through a custom role, use another organization's role, and keep a deleted role's access.
-- [ ] T-035 **Optional approval step.** deps: T-034, T-041 (risky)
-  - An organization setting that, when on, holds edits and publish requests as pending versions until a reviewer approves or rejects them, with both recorded in the change log. When it's off, saves go straight through as today.
 
 The API:
 - [ ] T-042 **HTTP API: records, templates and identifier types.** deps: T-022a, T-032, T-037, T-041 (risky)
   - JSON endpoints in their own package (`packages/api`) that wrap the service layer for reading, creating and updating records, templates and identifier types. Request size limits, input checked with the core validators, errors without stack traces, and a test for each endpoint with no session, the wrong role and the wrong collection. How it is deployed alongside the public sites waits on Q-1 (T-050).
-- [ ] T-043 **API: history, restore, approval and publishing.** deps: T-042, T-030, T-034, T-035 (risky)
+- [ ] T-043 **API: history, restore, approval and publishing.** deps: T-042, T-030, T-034 (risky)
   - Endpoints for versions, compare, restore, the change log, the approval queue and publish/unpublish, with the same permission tests as T-042.
   - D-066 (staff search): if this task (or T-042) exposes `searchRecords` over HTTP, its cost grows with the organization's size: `ts_rank` runs over every matching record on every page and the GIN index has no organization column (the T-028 review measured about 260–540 ms a page at 50,000 records). Set a `statement_timeout` on the search query (or the request) and/or cap the matches ranked, with a test that a slow search is stopped, and measure again. Staff only: never a public endpoint.
 
@@ -298,12 +278,8 @@ Admin screens in the browser:
   - The Login screen, the sidebar and the top bar from DESIGN.md, wired to sign-in, two-factor and sign-out, and accessible (WCAG 2.1 AA, keyboard and screen reader tested).
 - [ ] T-046 **Admin: item list and record editor.** deps: T-045, T-043 (risky)
   - The Item Records list and the Record editor (mockup Items, AdminRecord), with the form built from the record's template, ID numbers, the History tab with compare and restore, the edit-conflict message, and blocked actions that explain themselves ("Can't publish yet: choose a rights statement").
-- [ ] T-047 **Admin: templates and identifier types.** deps: T-046, T-005a (risky)
-  - Screens to edit field templates, record types and identifier types (Settings, ID numbers tab), which show T-005a's safe-change report and require confirmation before a staff field becomes public or records are affected.
-- [ ] T-048 **Admin: people, roles and the audit trail.** deps: T-045, T-041, T-041a, T-043 (risky)
+- [ ] T-048 **Admin: people, roles and the audit trail.** deps: T-045, T-041, T-043 (risky)
   - Settings › People & roles (invite, change role, grant collections, require two-factor) and the Audit trail on Audit & Reports, with search by person, record and date.
-- [ ] T-049 **Admin: review queue.** deps: T-046, T-035 (risky)
-  - A screen listing pending changes and records ready for review, with approve and reject, available to reviewers and admins only.
 
 Server and deployment:
 - [ ] T-050 **Server layout for the admin and the public sites.** deps: T-042 (risky)
@@ -318,12 +294,42 @@ Server and deployment:
 - [ ] T-053 **Phase 2 review.** deps: T-020 to T-052
   - Check Phase 2 against PLATFORM_PLAN.md §3 and the "one writer" principle, get an independent security review of the whole of Phase 2, and write the Phase 3 tasks (including M-001).
 
-- [ ] U-004 **Move password hashing to Argon2id.** deps: T-036
-  - When the `engines` floor reaches Node 24.7 (Node 22 support ends April 2027), switch new hashes to `crypto.argon2` (OWASP settings) with a decision entry; PHC strings move each user over at sign-in (D-052).
 
 ## Phase 3 — Media
 Tasks to be written when Phase 2 is done. Carried forward:
 - [ ] M-001 **Serve active file types safely.** (risky) From the T-002 review: a digital asset's media type can be `text/html`, `image/svg+xml`, `application/xhtml+xml` or a script type, which is legitimate for born-digital files. When media is served, never send the stored media type as-is for these. Serve them as downloads (`Content-Disposition: attachment`), from a separate origin from the public sites, with a sandboxing Content-Security-Policy and `X-Content-Type-Options: nosniff`, and test that an uploaded HTML or SVG file can't run script on a public site.
+
+
+## Future features (after launch)
+
+Moved here by John on 2026-11-23 so the first launch is smaller. Not counted in phase progress. Each keeps its notes; dependencies on launch tasks still apply.
+
+- [ ] S-013 **Unlinked arrivals hide overdue loans.** (risky, from the T-018a review)
+  - On main, an agreed loan in whose items arrived without a link stays `agreed` past its end and isn't listed, and one with a returned linked item plus an unlinked arrival shows `returned`. Any placement of a loan's record around or after `beginOn` that isn't linked should make the loan `unknown` and overdue.
+  - Attempt 1 (branch `autopilot/S-012`, commit b623eb9, not merged): an `unlinked_arrival` rule. Review: still hideable (moving `beginOn` later, arrivals 31+ days early, first moves that are temporary or to external locations, changing a location's kind afterwards, decoy loans with open stays) and false positives (declined requests replaced by a new agreement, early return then borrowed again, renewals of records already here). Design it together with T-018a's redesign: decide "the loan is over" from where the record is during the loan period, with explicit ways to account for renewals and replaced requests.
+- [ ] T-001b **Revisit TypeScript 7 and Vite 8.**
+  - Both majors were turned down in D-006 and the upkeep run of 2026-11-21 found the reasons still hold: typescript-eslint 8.73 supports only TypeScript `<6.1`, and Vite 8 still depends on MPL-2.0 `lightningcss`. Move when typescript-eslint supports TypeScript 7, or when Vite drops `lightningcss` as a required dependency; each move gets its own decision entry.
+- [~] T-009a **Vocabulary follow-ups.** deps: T-009
+  - Confirm the Nomenclature 4.0 and GNIS URI patterns from nomenclature.info and USGS once they can be reached, and tighten those checks.
+  - A Data Cleaning report of LC-vocabulary terms with no URI.
+  - Done: `findLcTermsWithoutUri`, the Data Cleaning report of LC terms with no URI. Still open: the Nomenclature 4.0 and GNIS URI forms (nomenclature.info and the USGS pages couldn't be read on 2026-11-23).
+- [!] T-018a **Loan follow-ups.** deps: T-018, T-016 attempts: 3
+  - Stuck (2026-11-23): built on branch `autopilot/T-018a` (pushed) with D-059, but three independent reviews each found ways to take an overdue loan off `overdueLoans` (D-044), all through a register of accessions handed in by the caller (old, same-day or tomorrow-dated registers, lender changes, early unlinked arrivals). New approach for the monthly review: accessions close loans only inside the service layer (T-032), which builds the register and the loan book itself in one save; core keeps the pure checks. Reusable from the branch: own-property reads in `checkNumber`/`checkLink`, valuation/insurance/authoriser fields, condition checks' `loanId` against the book, and the fit-check report (by `recordedAt`).
+  - A borrowed item that becomes the organization's (bought or given) needs a link from an accession to close its loan in. Link a condition check's `loanId` to the loan book and warn when a loan out goes without a recent fit check. Valuation, insurance and authoriser fields.
+- [ ] T-019d **Site passwords.** deps: T-019, T-023, T-037 (risky) As D-052: hashed like a user password, at least 15 characters, a version that ends unlocks when it changes, unlocks kept on the session, throttled per user per site and per site, never a permanent lockout.
+  - How a password-protected site (D-019) stores its password and rate-limits attempts; needs the Phase 2 password decision.
+- [ ] S-014 **Search rebuild and docs follow-ups.** deps: T-028 Small items from the second T-028 review: `rebuild_search_documents()` should refuse when anything besides `records_search` depends on `search_document` (it silently drops other indexes today); document running it with `SET lock_timeout` and `ANALYZE public.records` afterwards; correct the non-owner error wording (42501, "permission denied" or "must be owner"); a note on `or` precedence and spaced dashes (`chair - table`) as exclusions; add the `to_jsonb(OLD)` cost to the write-cost note; note that each rebuild uses one of the 1,600 column slots.
+- [ ] T-018b **Storage for accessions, loans and moves, through the service.** deps: T-032 (risky) Tables and service operations for accessions, loans and moves, so T-018a and S-013 can be rebuilt on the service as D-067 says: loans are closed only inside the service from data it reads in its own transaction. Deferred by John (2026-11-23): loans wait until after the Phase 2 sign-in and permissions work; then build this together with the T-018a and S-013 redesign in one branch.
+- [ ] T-041a **Custom roles.** deps: T-041 (risky)
+  - D-036: system managers create, edit and delete roles from the permission list, each owned by one organization. No custom role can hold system-manager powers; built-in roles can't be deleted. Editing or deleting a role in use shows who is affected, deleting one in use needs those people moved, adding publish, donor-data or people permissions needs confirmation, and every change goes in the change log. Tests try to grant a system power through a custom role, use another organization's role, and keep a deleted role's access.
+- [ ] T-035 **Optional approval step.** deps: T-034, T-041 (risky)
+  - An organization setting that, when on, holds edits and publish requests as pending versions until a reviewer approves or rejects them, with both recorded in the change log. When it's off, saves go straight through as today.
+- [ ] T-047 **Admin: templates and identifier types.** deps: T-046, T-005a (risky)
+  - Screens to edit field templates, record types and identifier types (Settings, ID numbers tab), which show T-005a's safe-change report and require confirmation before a staff field becomes public or records are affected.
+- [ ] T-049 **Admin: review queue.** deps: T-046, T-035 (risky)
+  - A screen listing pending changes and records ready for review, with approve and reject, available to reviewers and admins only.
+- [ ] U-004 **Move password hashing to Argon2id.** deps: T-036
+  - When the `engines` floor reaches Node 24.7 (Node 22 support ends April 2027), switch new hashes to `crypto.argon2` (OWASP settings) with a decision entry; PHC strings move each user over at sign-in (D-052).
 
 ## Phases 4–7
 Plugins and themes (D-025, John: system managers install them, site managers choose among the installed ones). Before any plugin system: - [ ] P-001 **Decision: what a plugin may do and how it's checked before install.** (risky) Plugins run code on the server, so this needs a security model (permissions, signing like the update packages in PLATFORM_PLAN §9, the D-002 license rule).

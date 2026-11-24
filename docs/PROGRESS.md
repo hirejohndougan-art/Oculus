@@ -2,6 +2,12 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-23 23:13 CT — manual (John: "move them to future features") — Launch scope
+- Result: done
+- What changed: ROADMAP gains a "Future features (after launch)" section. Moved there: the loan rework (T-018a, T-018b, S-013), vocabulary URI checks (T-009a), the TypeScript 7 and Vite 8 revisit (T-001b), search follow-ups (S-014), custom roles (T-041a), the optional approval step (T-035) and review queue (T-049), site passwords (T-019d), Argon2id (U-004) and the templates and identifier types admin screen (T-047). T-043 and T-048 no longer wait on T-035 and T-041a.
+- Decisions: none (scope only)
+- Next: T-037 sessions (review), then T-038 two-step sign-in
+
 ## 2026-11-23 22:51 CT — manual (John: "continue") — T-036 User accounts and password sign-in
 - Result: done
 - What changed: migration `0009_users.sql`: install-wide users with per-organization memberships (D-019), invitations (256-bit tokens stored as SHA-256, single use, 1 hour to 14 days, bound to one organization and address, sent only to the invitee after commit with a time limit and withdrawn if sending fails), one bootstrap system admin, sign-in throttle counters per address and per client network. Core: scrypt passwords at one allowed setting (NFC, 8 to 1,024 bytes, a common-password list and context words refused), progressive waits up to 15 minutes with no permanent lockout. `signIn` gives the same reply and cost for every failure and requires the second step (T-038). `client.ts`: a lost connection inside a transaction fails cleanly instead of crashing the process.
