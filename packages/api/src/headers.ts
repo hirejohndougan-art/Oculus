@@ -15,8 +15,10 @@
  *   so no handler can make an open redirect.
  * - Values are at most `MAX_HEADER_VALUE_LENGTH` characters; dates must be
  *   real dates; `Retry-After` at most a day; no `Vary: *`.
- * - `type()` refuses active content (HTML, SVG, XHTML) and any charset other
- *   than UTF-8, until server-built public pages get their own decision.
+ * - `type()` refuses active content (`isActiveType`: HTML, any XML type,
+ *   script types, XSL, `multipart/x-mixed-replace`) and any charset other
+ *   than UTF-8, until server-built public pages and feeds get their own
+ *   decision.
  * - Every reply, error replies and Node-level errors included, gets
  *   `SECURITY_HEADERS`: no MIME sniffing, no Referer, a Content-Security-Policy
  *   that loads nothing, can't be framed, posts no form and sets no base URL,
@@ -116,14 +118,46 @@ export function replyHeaderProblem(name: unknown, value: unknown): string | unde
 }
 
 /**
- * Media types a browser runs as a document with scripts (D-058): refused
- * until server-built public pages get their own decision (D-034).
+ * Media types a browser may run script from, or render as a document that
+ * can (D-058, S-025): refused until server-built public pages and XML feeds
+ * (OAI-PMH, T-050) get their own decision (D-034). By essence, lower case:
+ * - HTML, and `multipart/x-mixed-replace` (whose parts a browser renders);
+ * - every XML type: `text/xml`, `application/xml`, their `-…` variants
+ *   (`text/xml-external-parsed-entity`), and any `+xml` suffix (SVG, XHTML,
+ *   XSLT, MathML, RSS, Atom …), since a browser renders XML with an XHTML,
+ *   SVG or XSLT root as a document with script; and `text/xsl`;
+ * - the JavaScript MIME types of the WHATWG MIME Sniffing standard (§4.6),
+ *   which another page could load from Oculus's origin as a script.
  */
 const ACTIVE_TYPES: ReadonlySet<string> = new Set([
   "text/html",
-  "image/svg+xml",
-  "application/xhtml+xml",
+  "multipart/x-mixed-replace",
+  "text/xsl",
+  "application/ecmascript",
+  "application/javascript",
+  "application/x-ecmascript",
+  "application/x-javascript",
+  "text/ecmascript",
+  "text/javascript",
+  "text/javascript1.0",
+  "text/javascript1.1",
+  "text/javascript1.2",
+  "text/javascript1.3",
+  "text/javascript1.4",
+  "text/javascript1.5",
+  "text/jscript",
+  "text/livescript",
+  "text/x-ecmascript",
+  "text/x-javascript",
 ]);
+
+/** True for an essence (`type/subtype`) a browser may run script from (`ACTIVE_TYPES`). */
+export function isActiveType(essence: string): boolean {
+  const lower = essence.trim().toLowerCase();
+  if (ACTIVE_TYPES.has(lower)) return true;
+  const subtype = lower.slice(lower.indexOf("/") + 1);
+  return subtype === "xml" || subtype.startsWith("xml-") || subtype.endsWith("+xml");
+}
 
 /** Why a Content-Type may not be set with `type()`, or `undefined` when it may. */
 export function contentTypeProblem(value: unknown): string | undefined {
@@ -132,8 +166,8 @@ export function contentTypeProblem(value: unknown): string | undefined {
   }
   if (value.length > MAX_HEADER_VALUE_LENGTH) return "the content type is too long";
   const [essence = "", ...parameters] = value.split(";");
-  if (ACTIVE_TYPES.has(essence.trim().toLowerCase())) {
-    return "active content types (HTML, SVG, XHTML) are not allowed";
+  if (isActiveType(essence)) {
+    return "active content types (HTML, XML, scripts) are not allowed";
   }
   for (const parameter of parameters) {
     const [name = "", setting = ""] = parameter.trim().split("=");

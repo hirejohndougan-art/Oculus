@@ -7,7 +7,7 @@ import { Readable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { OCULUS_COOKIES } from "./cookies.js";
-import { SECURITY_HEADERS } from "./headers.js";
+import { SECURITY_HEADERS, contentTypeProblem, isActiveType } from "./headers.js";
 import {
   MAX_RESULT_ARRAY_LENGTH,
   MAX_RESULT_NODES,
@@ -516,6 +516,25 @@ describe("headers a handler writes", () => {
     ["TEXT/HTML with a charset", (r: OculusReply) => r.type("TEXT/HTML; charset=utf-8")],
     ["image/svg+xml", (r: OculusReply) => r.type("image/svg+xml")],
     ["application/xhtml+xml", (r: OculusReply) => r.type("application/xhtml+xml")],
+    // S-025: XML renders with script when its root is XHTML, SVG or XSLT.
+    ["text/xml", (r: OculusReply) => r.type("text/xml")],
+    [
+      "application/xml with a charset",
+      (r: OculusReply) => r.type("application/xml; charset=utf-8"),
+    ],
+    ["Text/XML in mixed case", (r: OculusReply) => r.type("Text/XML")],
+    ["XML as OAI-PMH sends it", (r: OculusReply) => r.type("text/xml; charset=UTF-8")],
+    ["an XSLT type", (r: OculusReply) => r.type("application/xslt+xml")],
+    ["an Atom feed", (r: OculusReply) => r.type("application/atom+xml")],
+    ["a vendor +xml type", (r: OculusReply) => r.type("application/vnd.example+XML")],
+    ["an XML entity type", (r: OculusReply) => r.type("text/xml-external-parsed-entity")],
+    ["text/xsl", (r: OculusReply) => r.type("text/xsl")],
+    ["text/javascript", (r: OculusReply) => r.type("text/javascript")],
+    ["application/x-javascript", (r: OculusReply) => r.type("application/x-javascript")],
+    [
+      "multipart/x-mixed-replace",
+      (r: OculusReply) => r.type("multipart/x-mixed-replace; boundary=x"),
+    ],
     ["a charset other than utf-8", (r: OculusReply) => r.type("text/plain; charset=utf-7")],
     ["a latin1 JSON charset", (r: OculusReply) => r.type("application/json; Charset=ISO-8859-1")],
     [
@@ -580,7 +599,8 @@ describe("headers a handler writes", () => {
       (r: OculusReply) => r.header("Retry-After", new Date(Date.now() + 3_600_000).toUTCString()),
     ],
     ["an ETag at the cap", (r: OculusReply) => r.header("ETag", `"${"a".repeat(1022)}"`)],
-    ["XML for OAI-PMH", (r: OculusReply) => r.type("text/xml; charset=UTF-8")],
+    // XML (OAI-PMH's text/xml included) is no longer allowed through type()
+    // (S-025); T-050 serves OAI-PMH through its own decision.
   ])("allows %s", async (_name, act) => {
     const built = await testServer({}, [
       get("/w", (_request, reply) => {
@@ -742,5 +762,43 @@ describe("route config", () => {
     expect(Object.isFrozen(config)).toBe(true);
     expect(Object.isFrozen(config.oculus)).toBe(true);
     expect(config.oculus).toEqual({ form: false, credentials: true });
+  });
+});
+
+describe("active content types (S-025)", () => {
+  it.each([
+    "text/html",
+    "text/xml",
+    "application/xml",
+    "TEXT/XML",
+    " application/xml ",
+    "image/svg+xml",
+    "application/xhtml+xml",
+    "application/xslt+xml",
+    "application/mathml+xml",
+    "application/rss+xml",
+    "application/vnd.example+xml",
+    "application/xml-dtd",
+    "text/xsl",
+    "text/javascript",
+    "application/ecmascript",
+    "multipart/x-mixed-replace",
+  ])("counts %s as active", (essence) => {
+    expect(isActiveType(essence)).toBe(true);
+    expect(contentTypeProblem(`${essence.trim()}; charset=utf-8`)).toMatch(/active content/);
+  });
+
+  it.each([
+    "application/json",
+    "application/ld+json",
+    "text/plain",
+    "text/csv",
+    "image/png",
+    "image/jpeg",
+    "application/pdf",
+    "application/octet-stream",
+  ])("leaves %s allowed", (essence) => {
+    expect(isActiveType(essence)).toBe(false);
+    expect(contentTypeProblem(essence)).toBeUndefined();
   });
 });
