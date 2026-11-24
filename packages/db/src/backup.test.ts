@@ -9,6 +9,7 @@
 // leaves no process, file or commit behind; and the URL and its password are
 // never printed, on a command line, or in the tools' environment.
 import {
+  execFileSync,
   spawn,
   type ChildProcessByStdio,
   type ChildProcessWithoutNullStreams,
@@ -212,13 +213,24 @@ async function until(check: () => Promise<boolean> | boolean, ms = 10_000): Prom
   throw new Error("Timed out waiting.");
 }
 
+/**
+ * Live processes (not zombies: an orphan's zombie may never be reaped in a
+ * sandbox whose init doesn't reap) as `pid pgid` pairs.
+ */
+function liveProcesses(): { pid: number; pgid: number }[] {
+  return execFileSync("ps", ["-eo", "pid=,pgid=,stat="], { encoding: "utf8" })
+    .split("\n")
+    .map((line) => line.trim().split(/\s+/))
+    .filter((f) => f.length === 3 && !(f[2] ?? "").startsWith("Z"))
+    .map((f) => ({ pid: Number(f[0]), pgid: Number(f[1]) }));
+}
+
 function alive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+  return liveProcesses().some((p) => p.pid === pid);
+}
+
+function groupAlive(pgid: number): boolean {
+  return liveProcesses().some((p) => p.pgid === pgid);
 }
 
 // ---------------------------------------------------------------------------
@@ -927,7 +939,7 @@ describe("stopping a backup or restore", () => {
     const script = join(dir, "parent.mjs");
     await writeFile(
       script,
-      `import { spawn, type ChildProcessByStdio, type ChildProcessWithoutNullStreams } from "node:child_process";
+      `import { spawn } from "node:child_process";
 const child = spawn("/bin/sh", ["-c", ${JSON.stringify(WATCHDOG)}, "oculus-tool", "/bin/sleep", "60"], {
   detached: true, stdio: ["pipe", "ignore", "ignore", "pipe"],
 });
@@ -935,23 +947,10 @@ console.log(child.pid);
 setInterval(() => {}, 1000);
 `,
     );
-    const parent = spawn(process.execPath, [script], { stdio: ["ignore", "pipe", "ignore"] });
-    const pgid = await new Promise<number>((resolvePid) => {
-      parent.stdout.once("data", (chunk: Buffer) => {
-        resolvePid(Number(chunk.toString().trim()));
-      });
-    });
-    const groupAlive = (): boolean => {
-      try {
-        process.kill(-pgid, 0);
-        return true;
-      } catch {
-        return false;
-      }
-    };
-    expect(groupAlive()).toBe(true);
-    parent.kill("SIGKILL");
-    await until(() => !groupAlive());
+    const pgid = await startParent(script);
+    expect(groupAlive(pgid)).toBe(true);
+    killParent();
+    await until(() => !groupAlive(pgid));
   }, 30_000);
 });
 
@@ -1548,6 +1547,33 @@ function compiledCli(): Promise<string> {
   return cli;
 }
 
+/** Starts a parent process that prints its watchdog's PID; returns that PID (the group). */
+let parents: ReturnType<typeof spawn>[] = [];
+async function startParent(script: string): Promise<number> {
+  const parent = spawn(process.execPath, [script], { stdio: ["ignore", "pipe", "pipe"] });
+  parents.push(parent);
+  let errors = "";
+  parent.stderr.on("data", (d: Buffer) => {
+    errors += d.toString();
+  });
+  return new Promise<number>((resolvePid, reject) => {
+    parent.stdout.once("data", (chunk: Buffer) => {
+      resolvePid(Number(chunk.toString().trim()));
+    });
+    parent.on("close", (code) => {
+      reject(
+        new Error(`The parent exited (${String(code)}) before starting the watchdog: ${errors}`),
+      );
+    });
+  });
+}
+
+/** SIGKILLs the most recent parent process. */
+function killParent(): void {
+  parents.at(-1)?.kill("SIGKILL");
+  parents = [];
+}
+
 /** Runs the compiled command; resolves with its exit code and output. */
 function command(
   args: string[],
@@ -1635,7 +1661,7 @@ describe("the command stopped twice, or forced to exit", () => {
     const script = join(dir, "parent.mjs");
     await writeFile(
       script,
-      `import { spawn, type ChildProcessByStdio, type ChildProcessWithoutNullStreams } from "node:child_process";
+      `import { spawn } from "node:child_process";
 const child = spawn("/bin/sh", ["-c", ${JSON.stringify(WATCHDOG)}, "oculus-tool", "/bin/sh", "-c", "trap '' TERM; sleep 60"], {
   detached: true, stdio: ["pipe", "ignore", "ignore", "pipe"],
 });
@@ -1643,22 +1669,9 @@ console.log(child.pid);
 setInterval(() => {}, 1000);
 `,
     );
-    const parent = spawn(process.execPath, [script], { stdio: ["ignore", "pipe", "ignore"] });
-    const pgid = await new Promise<number>((resolvePid) => {
-      parent.stdout.once("data", (chunk: Buffer) => {
-        resolvePid(Number(chunk.toString().trim()));
-      });
-    });
-    const groupAlive = (): boolean => {
-      try {
-        process.kill(-pgid, 0);
-        return true;
-      } catch {
-        return false;
-      }
-    };
+    const pgid = await startParent(script);
     await new Promise((r) => setTimeout(r, 200));
-    parent.kill("SIGKILL");
-    await until(() => !groupAlive(), 15_000);
+    killParent();
+    await until(() => !groupAlive(pgid), 15_000);
   }, 30_000);
 });
