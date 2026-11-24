@@ -28,6 +28,7 @@ import { migrate } from "./migrate.js";
 import { sql, type Sql } from "./sql.js";
 import {
   freshDatabase,
+  deleteRecordDirectly,
   storeDirectVersion,
   writeRecordDirectly,
   type TestDatabase,
@@ -87,9 +88,11 @@ function tx<T>(work: (q: Queryable) => Promise<T>): Promise<T> {
   return db.transaction(work);
 }
 
-async function refusedBy(query: Sql): Promise<{ code: string; constraint?: string }> {
+async function refusedBy(
+  query: Sql | ((q: Queryable) => Promise<unknown>),
+): Promise<{ code: string; constraint?: string }> {
   try {
-    await tx((q) => q.execute(query));
+    await tx((q) => (typeof query === "function" ? query(q) : q.execute(query)));
   } catch (error) {
     const e = error as { code?: string; constraint?: string };
     return {
@@ -463,12 +466,12 @@ describe("the usage index", () => {
     const org = await organization();
     const id = await record(org, { subjects: [DEPOT, LCSH] });
     ok(await refresh(org, id));
-    const where = sql`organization_id = ${org}::uuid AND id = ${id}::uuid`;
-    expect(await refusedBy(sql`DELETE FROM public.records WHERE ${where}`)).toMatchObject({
+    // With its deletion version (0008), so only the foreign key refuses it.
+    expect(await refusedBy((q) => deleteRecordDirectly(q, org, id))).toMatchObject({
       code: FOREIGN_KEY,
     });
     expect(ok(await tx((q) => clearRecordTerms(q, org, id)))).toBe(2);
-    await db.execute(sql`DELETE FROM public.records WHERE ${where}`);
+    await tx((q) => deleteRecordDirectly(q, org, id));
     expect(await countsByLabel(org)).toEqual({});
   });
 
@@ -705,8 +708,7 @@ describe("stale records", () => {
     const highest = [...broken].sort().at(-1) ?? "";
     let good = await record(org, { subjects: [LCSH] });
     while (good < highest) {
-      await db.execute(sql`DELETE FROM public.records
-                           WHERE organization_id = ${org}::uuid AND id = ${good}::uuid`);
+      await tx((q) => deleteRecordDirectly(q, org, good));
       good = await record(org, { subjects: [LCSH] });
     }
 
@@ -757,7 +759,7 @@ describe("concurrent changes", () => {
     // A clears the record's terms and deletes it.
     const remove = tx(async (q) => {
       const cleared = await clearRecordTerms(q, org, id);
-      await q.execute(sql`DELETE FROM public.records WHERE ${where}`);
+      await deleteRecordDirectly(q, org, id);
       return cleared;
     });
     // A is now waiting for B's lock on the record.

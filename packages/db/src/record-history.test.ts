@@ -31,7 +31,11 @@ import { migrate } from "./migrate.js";
 import { restoreReason, restoreVersion, type RestoreOptions } from "./record-restore.js";
 import { compareVersions, readVersion, readVersions } from "./record-versions.js";
 import { sql } from "./sql.js";
-import { freshDatabase, type TestDatabase } from "./test-database.fixtures.js";
+import {
+  deleteRecordDirectly,
+  freshDatabase,
+  type TestDatabase,
+} from "./test-database.fixtures.js";
 
 const T = "2026-11-20T16:05:00.000Z";
 const LATER = "2026-11-21T09:30:00.250Z";
@@ -574,10 +578,7 @@ describe("restoreVersion (T-030)", () => {
     const fonds = await insert(unit(org, "fonds"));
     const series = await insert(unit(org, "series", fonds.id));
     ok(await save({ ...withoutParent(series), updatedAt: LATER }, 1));
-    await tx((q) =>
-      q.execute(sql`DELETE FROM public.records WHERE organization_id = ${org}::uuid
-                    AND id = ${fonds.id}::uuid`),
-    );
+    await tx((q) => deleteRecordDirectly(q, org, fonds.id));
     expect(codes(await restore(org, series.id, 1, 2))).toEqual(["missing_parent"]);
 
     // A loop: B was under A; then A was filed under B.
@@ -644,10 +645,17 @@ describe("restoreVersion: record types and represented records", () => {
     ok(await save(withoutKey({ ...typed, updatedAt: LATER }, "recordTypeKey"), 1));
     ok(await restore(org, typed.id, 1, 2));
     ok(await save(withoutKey({ ...typed, updatedAt: AFTER_NOW }, "recordTypeKey"), 3));
-    // The type is removed by the owner (nothing points at it now).
+    // The type is removed by the owner (nothing points at it now), past the
+    // append-only trigger on its versions (0008).
     await tx(async (q) => {
+      await q.execute(
+        sql`ALTER TABLE public.record_type_versions DISABLE TRIGGER zzzz_record_type_versions_no_update`,
+      );
       await q.execute(sql`DELETE FROM public.record_type_versions
                           WHERE organization_id = ${org}::uuid AND key = 'chair'`);
+      await q.execute(
+        sql`ALTER TABLE public.record_type_versions ENABLE ALWAYS TRIGGER zzzz_record_type_versions_no_update`,
+      );
       await q.execute(sql`DELETE FROM public.record_types
                           WHERE organization_id = ${org}::uuid AND key = 'chair'`);
     });
@@ -670,10 +678,7 @@ describe("restoreVersion: record types and represented records", () => {
       ),
     );
     ok(await save(withoutKey({ ...scan, updatedAt: LATER }, "represents"), 1));
-    await tx((q) =>
-      q.execute(sql`DELETE FROM public.records WHERE organization_id = ${org}::uuid
-                    AND id = ${shown.id}::uuid`),
-    );
+    await tx((q) => deleteRecordDirectly(q, org, shown.id));
     const result = await restore(org, scan.id, 1, 2);
     expect(result.ok ? [] : result.issues.map((i) => [i.path.join("."), i.code])).toEqual([
       ["represents", "unknown_record"],

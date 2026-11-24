@@ -3,7 +3,9 @@
  * is written with the `sql` tag; `migrate` applies `packages/db/migrations`;
  * `catalog.ts` reads and writes the catalog tables (every record write with
  * its version, `record-versions.ts`; comparing and restoring versions,
- * `record-restore.ts`), `identifiers.ts` the
+ * `record-restore.ts`; today's checks before a write, `record-checks.ts`;
+ * deleting with a tombstone, `record-delete.ts`; the writer role's grants,
+ * `roles.ts`), `identifiers.ts` the
  * identifier tables and `vocabularies.ts` the stored terms and the index of
  * which records use them, all through core's validators; `search.ts` is
  * staff search (STAFF ONLY: never for a public site, D-066); `accounts.ts`
@@ -36,6 +38,11 @@ export {
   updateRecord,
   readRecord,
   readStoredRecord,
+  readRecordPlace,
+  lockArrangement,
+  lockRecord,
+  lockDefinition,
+  versionConflict,
 } from "./catalog.js";
 export type {
   StoredTemplate,
@@ -45,6 +52,7 @@ export type {
   RecordUpdateResult,
   VersionConflict,
   ChangedName,
+  RecordPlace,
 } from "./catalog.js";
 export {
   isActorId,
@@ -57,12 +65,24 @@ export {
   MAX_REASON_LENGTH,
 } from "./record-versions.js";
 export type {
+  RecordAction,
   RecordChange,
   RecordVersion,
   RecordVersions,
   VersionComparison,
 } from "./record-versions.js";
-export { restoreVersion, restoreReason } from "./record-restore.js";
+export { restoreVersion, restoreReason, MAX_DESCENDANTS_WALKED } from "./record-restore.js";
+export { recordCheckIssues, fixedMessages, linkedIds } from "./record-checks.js";
+export type { RecordCheckOptions } from "./record-checks.js";
+export { deleteRecord } from "./record-delete.js";
+export type { RecordDeletion, RecordDeletionResult } from "./record-delete.js";
+export {
+  grantWriterRole,
+  checkWriterConnection,
+  WRITER_GRANTS,
+  WRITER_PRIVILEGES,
+} from "./roles.js";
+export type { WriterRoleProblem } from "./roles.js";
 export type { RestoreOptions } from "./record-restore.js";
 export {
   readIdentifierTypes,

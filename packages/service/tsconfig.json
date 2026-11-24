@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // Wide enough to take in core's and db's sources for type checking; the
+    // build (tsconfig.build.json) narrows it to src.
+    "rootDir": "..",
+    "outDir": "dist",
+    // Type checking and lint read @oculus/core and @oculus/db from their
+    // sources, so they work before anything is built. The build reads their
+    // built types instead; they build first (workspaces build in name order).
+    "paths": {
+      "@oculus/core": ["../core/src/index.ts"],
+      "@oculus/db": ["../db/src/index.ts"]
+    }
+  },
+  "include": ["src"]
+}

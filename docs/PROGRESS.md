@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-23 21:40 CT — manual (John: "continue") — T-032 The service layer: one writer
+- Result: done
+- What changed: new `packages/service` (`createService`), the only writer of records, identifiers, term usages, versions and arrangement, one transaction per operation with locked checks, clean issues, retries on deadlocks. Migration `0008_record_deletion.sql`: deletion as a tombstone version, nothing after a delete, append-only template and record type versions, definition advisory locks, every guard trigger set to fire ALWAYS (also in replica mode). `roles.ts`: `grantWriterRole` with the minimum privileges and `checkWriterConnection`, an allowlist that refuses any membership, attribute, owned object, extra or column privilege, grant option, schema CREATE, parameter grant, role setting or replica-mode session.
+- Decisions: D-067
+- Review: five independent rounds (a version after a delete; roles that could switch off the triggers through membership, column grants, subscriptions or replica mode); all fixed with tests. Small follow-ups filed as S-015; loans storage as T-018b.
+- Gate: PASS · tests_passing 3465 (was 3426) · npm audit clean
+- Next: T-036 user accounts and password sign-in (in progress)
+
 ## 2026-11-23 20:14 CT — manual (John: "keep going") — T-028 Staff search
 - Result: done
 - What changed: migration `0007_staff_search.sql`: a stored, database-computed search document per record (title and text fields, folded for Latin, Greek and Cyrillic accents and case) with a GIN index, and `public.rebuild_search_documents()` for after a PostgreSQL or locale upgrade. `packages/db/src/search.ts` `searchRecords`: staff-only, one organization, current and former identifiers first, then ranked text hits, keyset paging with strictly validated cursors, a 500-character query limit.

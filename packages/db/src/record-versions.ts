@@ -66,7 +66,16 @@ export interface RecordVersion {
    */
   readonly changedFields: readonly string[];
   readonly reason?: string;
+  /**
+   * `save` for every write of the record, `delete` for its deletion (T-032,
+   * D-067): a deletion version holds the record as it was when deleted, is
+   * always the record's last, and its `changedFields` is empty.
+   */
+  readonly action: RecordAction;
 }
+
+/** What a version records: a write of the record, or its deletion. */
+export type RecordAction = "save" | "delete";
 
 export interface RecordVersions {
   /** Oldest first. */
@@ -165,9 +174,10 @@ interface VersionRow {
   recorded_at: string;
   changed_fields: unknown;
   reason: string | null;
+  action: string;
 }
 
-const VERSION_COLUMNS = sql`version, record, actor,
+const VERSION_COLUMNS = sql`version, record, actor, action,
   to_char(recorded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS recorded_at,
   changed_fields, reason`;
 
@@ -211,7 +221,8 @@ function versionFromRow(
     !isActorId(row.actor) ||
     (row.reason !== null && !isReason(row.reason)) ||
     !Array.isArray(changed) ||
-    !changed.every((name): name is string => typeof name === "string")
+    !changed.every((name): name is string => typeof name === "string") ||
+    (row.action !== "save" && row.action !== "delete")
   ) {
     return refused([], "row_mismatch", "The stored version doesn't match its row.");
   }
@@ -226,6 +237,7 @@ function versionFromRow(
       recordedAt: row.recorded_at,
       changedFields: Object.freeze([...changed]),
       ...(row.reason === null ? {} : { reason: row.reason }),
+      action: row.action,
     }),
   };
 }
