@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 04:07 CT — manual (John: "continue on phase 2") — T-041 Roles and collection-level permissions
+- Result: done
+- What changed: migration `0013_roles.sql`: `sites`, `role_assignments` (one built-in role per member, per site or every site, optionally scoped to an archival unit's subtree), `system_settings`, `records.site_id`. Core `permissions.ts` (fixed roles and permissions; system permissions only from `system_admin`) and `system-settings.ts`. Service checks every operation inside its own transaction (user row, then arrangement lock, then record row), roles reach only their site's records (D-074), no-site records only system managers, new records join the working site, moves between sites need both, same-site filing and scans, publishing needs `records.publish` through T-034's hook, grants and revokes by site managers below themselves, session limits read from System settings. Invisible and missing records answer identically everywhere.
+- Decisions: D-072 (John: only site managers delete; read-only users don't see old versions), D-074 amendment (accepted one-bit signals)
+- Review: three independent rounds (an asset slipping out of scope between check and write; grant/revoke deadlocks; link and scope existence oracles; a scope grant blocking another site's deletions; restores dropping the home site; cross-site filing); all fixed with tests.
+- Gate: PASS · tests_passing 3745 (was 3690) · npm audit clean. The password timing test now times each check right after its baseline, so load hits both.
+- Next: T-038 two-step sign-in (second review running), T-039 password reset (fixing review findings)
+
 ## 2026-11-24 03:27 CT — upkeep — Dependency update: typescript-eslint 8.74.0
 - Result: done
 - What changed: `npm outdated` showed one in-major update, typescript-eslint 8.73.0 → 8.74.0 (released 2026-11-23); bumped in package.json and the lockfile. TypeScript 7 and Vite 8 stay on T-001b (typescript-eslint still requires TypeScript `<6.1`; note added there).
