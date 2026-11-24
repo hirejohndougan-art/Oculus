@@ -96,6 +96,7 @@ export {
   grantPublicReaderRole,
   checkPublicReaderConnection,
   PUBLIC_READER_FUNCTIONS,
+  PUBLIC_READER_DEFINERS,
   WRITER_GRANTS,
   WRITER_PRIVILEGES,
 } from "./roles.js";

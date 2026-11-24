@@ -129,6 +129,7 @@ export interface WriterRoleProblem {
     | "parameter_privilege"
     | "trigger_not_always"
     | "subscription"
+    | "security_definer_function"
     | "missing_privilege";
   readonly message: string;
 }
@@ -210,6 +211,12 @@ interface RoleProfile {
   readonly functions: readonly string[];
   readonly noun: string;
   readonly grant: string;
+  /**
+   * When set, every SECURITY DEFINER function the role can execute (through
+   * PUBLIC or a grant, in any schema) must be in this list
+   * (`schema.name(argument types)`); others are `security_definer_function`.
+   */
+  readonly definers?: readonly string[];
 }
 
 async function checkRoleConnection(
@@ -241,6 +248,7 @@ async function checkRoleConnection(
     objects: string[] | null;
     triggers: string[] | null;
     subscriptions: string[] | null;
+    definers: string[] | null;
     privileges: boolean;
   }>(sql`
     WITH who AS (
@@ -385,6 +393,16 @@ async function checkRoleConnection(
             FROM pg_catalog.pg_subscription s
             WHERE s.subdbid = (SELECT oid FROM pg_catalog.pg_database
                                WHERE datname = pg_catalog.current_database())) AS subscriptions,
+           -- SECURITY DEFINER functions the role can run, beyond the allowed
+           -- ones (S-019 review): each runs with its owner's privileges.
+           (SELECT pg_catalog.array_agg(f.name ORDER BY f.name)
+            FROM (SELECT n.nspname || '.' || p.proname || '('
+                         || pg_catalog.oidvectortypes(p.proargtypes) || ')' AS name
+                  FROM pg_catalog.pg_proc p
+                  JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+                  WHERE p.prosecdef AND ${profile.definers !== undefined}::boolean
+                    AND pg_catalog.has_function_privilege(w.oid, p.oid, 'EXECUTE')) AS f
+            WHERE f.name <> ALL(${[...(profile.definers ?? [])]}::text[])) AS definers,
            (NOT w.current
             OR (pg_catalog.has_schema_privilege(w.oid, 'public', 'USAGE')
                 AND COALESCE((SELECT pg_catalog.bool_and(pg_catalog.has_table_privilege(w.oid, 'public.' || t, 'SELECT'))
@@ -461,6 +479,13 @@ async function checkRoleConnection(
       `Subscriptions in this database, whose apply workers skip ordinary triggers: ${listed(subscriptions)}.`,
     );
   }
+  const definers = all((r) => r.definers);
+  if (definers.length > 0) {
+    add(
+      "security_definer_function",
+      `Functions that run with their owner's privileges, which the ${noun} may call: ${listed(definers)}.`,
+    );
+  }
   const columns = all((r) => r.columns);
   if (columns.length > 0) add("column_privilege", `Column privileges: ${listed(columns)}.`);
   const defaults = all((r) => r.defaults);
@@ -498,6 +523,17 @@ export const PUBLIC_READER_FUNCTIONS: readonly string[] = Object.freeze([
 ]);
 
 /**
+ * The only SECURITY DEFINER functions the public reader may be able to run
+ * (`checkPublicReaderConnection`): its own read path, and 0014's
+ * `second_step_next_order` (PUBLIC may call it; doing so only skips
+ * numbers of an ordering sequence, D-077).
+ */
+export const PUBLIC_READER_DEFINERS: readonly string[] = Object.freeze([
+  ...PUBLIC_READER_FUNCTIONS,
+  "public.second_step_next_order()",
+]);
+
+/**
  * Gives `role` what the public sites need to read (S-019, D-080): USAGE on
  * schema `public`, and **no table privilege at all**. EXECUTE on
  * `PUBLIC_READER_FUNCTIONS` is PUBLIC's, as for every function (an explicit
@@ -526,7 +562,10 @@ export async function grantPublicReaderRole(db: Queryable, role: string): Promis
  * attributes, no memberships, owns nothing, no column or default
  * privileges, no CREATE, no parameters, no settings beyond
  * `ALLOWED_ROLE_SETTINGS`, not in replica mode). The role in effect must be
- * able to call `PUBLIC_READER_FUNCTIONS`. Empty when the connection is fit
+ * able to call `PUBLIC_READER_FUNCTIONS`, and must be able to call no
+ * SECURITY DEFINER function but `PUBLIC_READER_DEFINERS`, in any schema
+ * (`security_definer_function`): any other would let it read or write with
+ * its owner's privileges. Empty when the connection is fit
  * for the public sites; T-050/T-051 run it at startup and after every
  * migration, and refuse to serve when it reports anything.
  */
@@ -537,5 +576,6 @@ export async function checkPublicReaderConnection(db: Queryable): Promise<Writer
     functions: PUBLIC_READER_FUNCTIONS,
     noun: "public reader",
     grant: "grantPublicReaderRole",
+    definers: PUBLIC_READER_DEFINERS,
   });
 }

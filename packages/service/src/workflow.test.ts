@@ -949,6 +949,37 @@ describe("public reads by site, with a role that sees only public output (S-019)
     expect(out.text).not.toContain("Other Site");
   });
 
+  it("hands over link targets without their values or titles, and the output is unchanged", async () => {
+    await ready();
+    const org = await organization();
+    const maker = await create(org, {
+      kind: "agent",
+      agentType: "person",
+      title: "Invented Linked Maker",
+      templateKey: "pub-agent",
+      fields: { note: "AGENT-NOTE-NOT-NEEDED" },
+    });
+    const { record } = await create(
+      org,
+      objectDraft({ creator: { recordId: maker.record.id, label: "Invented maker label" } }),
+    );
+    ok(await service.publish(ctx(org), maker.record.id, { expectedVersion: 1 }));
+    ok(await service.publish(ctx(org), record.id, { expectedVersion: 1 }));
+    const [row] = await s.reader.rows<{ snapshot: unknown }>(sql`
+      SELECT public.public_record_snapshot(${org}::uuid, ${siteFor(org)}::uuid,
+                                           ${record.id}::uuid) AS snapshot`);
+    const raw = JSON.stringify(row?.snapshot);
+    expect(raw).toContain(maker.record.id);
+    expect(raw).not.toContain("AGENT-NOTE-NOT-NEEDED");
+    expect(raw).not.toContain("Invented Linked Maker");
+    // The record's own values (staff ones included, for core to sort) are there.
+    expect(raw).toContain("Kept in the back room.");
+    const out = await publicText(org, record.id);
+    expect(out.text).toContain(`${BASE}${maker.record.id}`);
+    expect(out.text).toContain("Invented maker label");
+    expect(out.text).not.toContain("back room");
+  });
+
   it("gives the public reader no table: it can't read staff data, accounts or sessions", async () => {
     await ready();
     const org = await organization();
@@ -970,6 +1001,20 @@ describe("public reads by site, with a role that sees only public output (S-019)
     // A role that can SELECT every table is refused as the public reader.
     const problems = await checkPublicReaderConnection(s.staffReader);
     expect(problems.map((p) => p.code)).toContain("extra_privilege");
+    // A SECURITY DEFINER function anyone may call is a way around the
+    // allowlist (S-019 review): refused until dropped.
+    await s.owner.execute(sql`
+      CREATE FUNCTION public.t_s019_definer() RETURNS integer
+      LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS 'SELECT 1'`);
+    try {
+      const found = await checkPublicReaderConnection(s.reader);
+      expect(found.map((p) => p.code)).toEqual(["security_definer_function"]);
+      expect(found[0]?.message).toContain("public.t_s019_definer()");
+      expect(found[0]?.message).not.toContain("public_record_snapshot");
+    } finally {
+      await s.owner.execute(sql`DROP FUNCTION public.t_s019_definer()`);
+    }
+    expect(await checkPublicReaderConnection(s.reader)).toEqual([]);
     // The writer is refused too: it can read and write tables.
     expect((await checkPublicReaderConnection(s.writer)).map((p) => p.code)).toContain(
       "extra_privilege",

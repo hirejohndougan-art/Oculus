@@ -29,9 +29,14 @@ $$;
 
 -- Everything the public output of record p_record on site p_site needs, as
 -- one jsonb value, or NULL unless the record is public on that site:
---   records          the record's ancestry and what it represents, and the
---                    records their values link to (with their ancestry), in
---                    the columns readRecordClosure reads, by ID
+--   records          the record's ancestry and what it represents (the
+--                    chain), and the records their values link to (with
+--                    their ancestry), in the columns readRecordClosure
+--                    reads, by ID. Rows outside the chain carry only what
+--                    core reads of them (kind, place in the tree, template,
+--                    state): their fields are {}, their title a fixed
+--                    placeholder and their coordinates empty, so no staff
+--                    value or unpublished title of a link target leaves.
 --   public           which of those are public on p_site
 --   templates        the current version of each of their templates
 --   identifierTypes  the organization's identifier types
@@ -84,7 +89,7 @@ AS $$
     WHERE n.id IS NOT NULL
   ),
   wanted AS (
-    SELECT r.* FROM public.records r
+    SELECT r.*, r.id IN (SELECT id FROM chain) AS in_chain FROM public.records r
     WHERE r.organization_id = p_org
       AND (r.id IN (SELECT id FROM chain) OR r.id IN (SELECT id FROM up))
   )
@@ -97,10 +102,14 @@ AS $$
         SELECT jsonb_agg(jsonb_build_object(
                  'id', w.id::text, 'organization_id', w.organization_id::text,
                  'site_id', w.site_id::text, 'kind', w.kind, 'template_key', w.template_key,
-                 'record_type_key', w.record_type_key, 'title', w.title, 'level', w.level,
+                 'record_type_key', w.record_type_key,
+                 'title', CASE WHEN w.in_chain THEN w.title ELSE 'Linked record' END,
+                 'level', w.level,
                  'parent_id', w.parent_id::text, 'media_type', w.media_type,
                  'represents_id', w.represents_id::text, 'agent_type', w.agent_type,
-                 'latitude', w.latitude, 'longitude', w.longitude, 'fields', w.fields,
+                 'latitude', CASE WHEN w.in_chain THEN w.latitude END,
+                 'longitude', CASE WHEN w.in_chain THEN w.longitude END,
+                 'fields', CASE WHEN w.in_chain THEN w.fields ELSE '{}'::jsonb END,
                  'created_at',
                  to_char(w.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
                  'updated_at',
@@ -108,8 +117,9 @@ AS $$
                ORDER BY w.id)
         FROM wanted w),
       'public', (
-        SELECT jsonb_agg(w.id::text ORDER BY w.id) FROM wanted w
-        WHERE public.record_public_on_site(w::public.records, p_site)),
+        SELECT jsonb_agg(r.id::text ORDER BY r.id) FROM public.records r
+        WHERE r.organization_id = p_org AND r.id IN (SELECT w.id FROM wanted w)
+          AND public.record_public_on_site(r, p_site)),
       'templates', (
         SELECT jsonb_agg(jsonb_build_object('key', t.key, 'version', t.version,
                                             'definition', t.definition) ORDER BY t.key)
