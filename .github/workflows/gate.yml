@@ -84,6 +84,8 @@ jobs:
           node-version-file: .nvmrc
           cache: npm
       - run: npm ci
+      # The browser for the end-to-end step (D-073, D-081).
+      - run: npx playwright install --with-deps chromium
       - run: npm run gate
 
   # The one check to require: passes only if every PostgreSQL version passed.

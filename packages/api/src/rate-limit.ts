@@ -12,8 +12,12 @@
  * ended windows are dropped first, then the oldest.
  */
 
-/** The kinds of request counted apart, each with its own limit per minute. */
-export type RateBucket = "read" | "write" | "check" | "search";
+/**
+ * The kinds of request counted apart, each with its own limit per minute.
+ * `credentials` counts sign-in, code, set-up and password-reset posts per
+ * client address (T-045, D-081), before the database's own throttles.
+ */
+export type RateBucket = "read" | "write" | "check" | "search" | "credentials";
 
 export type RateLimits = Readonly<Record<RateBucket, number>>;
 
@@ -23,6 +27,7 @@ export const DEFAULT_RATE_LIMITS: RateLimits = Object.freeze({
   write: 120,
   check: 600,
   search: 60,
+  credentials: 60,
 });
 
 const WINDOW_MS = 60_000;

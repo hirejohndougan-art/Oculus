@@ -53,6 +53,12 @@
  *    the router's own errors included, carries nosniff, no-referrer, a CSP
  *    that loads nothing and `Cache-Control: no-store`.
  *
+ * 10. The built admin (admin-files.ts, T-045, D-081), when `options.admin`
+ *    is given: `GET`/`HEAD` on the admin's own origin only, answered from
+ *    files read into memory at startup, with the admin's own CSP
+ *    (`ADMIN_SECURITY_HEADERS`) in place of the API's; every other reply
+ *    keeps `SECURITY_HEADERS`.
+ *
  * Adding another Fastify plugin, parser or error handler is its own decision
  * (D-051).
  */
@@ -69,6 +75,7 @@ import {
   bodyHeaderProblem,
   registerBodyParsers,
 } from "./body.js";
+import { ADMIN_SECURITY_HEADERS, adminFileFor, type AdminFiles } from "./admin-files.js";
 import { cookieHeaderProblem, replyCookieProblem } from "./cookies.js";
 import {
   Refusal,
@@ -129,6 +136,11 @@ export interface ServerOptions {
   readonly timeouts?: Partial<ServerTimeouts>;
   /** The application's routes (routes.ts); nothing else can add one. */
   readonly routes?: readonly OculusRoute[];
+  /**
+   * The built admin (admin-files.ts): served on `origin` only, which must be
+   * one of `OCULUS_ORIGINS`.
+   */
+  readonly admin?: { readonly origin: string; readonly files: AdminFiles };
 }
 
 function chooseTimeouts(overrides: Partial<ServerTimeouts> = {}): ServerTimeouts {
@@ -387,6 +399,18 @@ function safeLogCall(this: unknown, args: unknown[], method: (...args: unknown[]
   method.call(this, fields, message);
 }
 
+/** A request's host as `URL.host` writes it for `protocol` (default port dropped), or undefined. */
+function normalHost(protocol: string, host: unknown): string | undefined {
+  if (typeof host !== "string" || host === "") return undefined;
+  try {
+    const url = new URL(`${protocol}//${host}`);
+    if (url.username !== "" || url.password !== "" || url.pathname !== "/") return undefined;
+    return url.host;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Builds the configured Oculus server and waits until it is ready. */
 export async function buildServer(options: ServerOptions = {}): Promise<FastifyInstance> {
   const timeouts = chooseTimeouts(options.timeouts);
@@ -394,6 +418,14 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
   const trustProxy = trustedProxyFromEnv(env);
   const origins = originsFromEnv(env);
   const appRoutes = (options.routes ?? []).map(checkRoute);
+  const admin = options.admin;
+  if (admin !== undefined && !origins.has(admin.origin)) {
+    throw new Error("the admin's origin must be one of OCULUS_ORIGINS");
+  }
+  const adminHost = admin === undefined ? undefined : new URL(admin.origin).host;
+  const adminProtocol = admin === undefined ? undefined : new URL(admin.origin).protocol;
+  /** Replies that are admin files: they get the admin's headers in onSend. */
+  const adminReplies = new WeakSet<FastifyRequest>();
 
   const logger: FastifyServerOptions["logger"] =
     options.logger === undefined || options.logger === false
@@ -463,12 +495,13 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
     done(requestRefusal(request, origins));
   });
 
-  app.addHook("onSend", async (_request, reply, payload) => {
+  app.addHook("onSend", async (request, reply, payload) => {
     if (replyCookieProblem(reply, reply.getHeader("set-cookie")) !== undefined) {
       reply.removeHeader("set-cookie");
       throw new Error("a Set-Cookie header broke the cookie rules");
     }
-    for (const [name, value] of Object.entries(SECURITY_HEADERS)) void reply.header(name, value);
+    const headers = adminReplies.has(request) ? ADMIN_SECURITY_HEADERS : SECURITY_HEADERS;
+    for (const [name, value] of Object.entries(headers)) void reply.header(name, value);
     return payload;
   });
 
@@ -499,7 +532,23 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
   });
 
   app.setNotFoundHandler((request, reply) => {
-    const allowed = routes.allowedMethods(pathOf(request.raw.url ?? ""));
+    const path = pathOf(request.raw.url ?? "");
+    const allowed = routes.allowedMethods(path);
+    // The built admin: only on the admin's own origin, only GET and HEAD,
+    // only paths no route claims (rule 10).
+    if (
+      admin !== undefined &&
+      allowed.length === 0 &&
+      (request.method === "GET" || request.method === "HEAD") &&
+      `${request.protocol}:` === adminProtocol &&
+      normalHost(adminProtocol, request.host) === adminHost
+    ) {
+      const file = adminFileFor(admin.files, path);
+      if (file !== undefined) {
+        adminReplies.add(request);
+        return reply.code(200).type(file.type).send(file.body);
+      }
+    }
     const wrongMethod = allowed.length > 0 && !allowed.includes(request.method);
     if (wrongMethod) reply.header("allow", allowed.join(", "));
     return reply

@@ -35,9 +35,10 @@ Task marks: `[ ]` not started · `[~]` in progress or partly done · `[x]` done 
 3. Type check (`tsc --noEmit`, strict mode)
 4. The full test suite (Vitest)
 5. The build
-6. `npm audit --audit-level=high`: no high or critical advisories
-7. The license check: every dependency is MIT, BSD, ISC, Apache-2.0 or similarly permissive (see D-002)
-8. **Key metric `tests_passing`** is never below `gate-baseline.json`. After a passing merge, raise the floor to the new count.
+6. End-to-end tests: the built admin in a browser against a throwaway database, with Siteimprove Alfa's accessibility rules (Playwright; D-073, D-081)
+7. `npm audit --audit-level=high`: no high or critical advisories
+8. The license check: every dependency is MIT, BSD, ISC, Apache-2.0 or similarly permissive (see D-002), and every font file is listed with an allowed license (D-073)
+9. **Key metric `tests_passing`** is never below `gate-baseline.json`. After a passing merge, raise the floor to the new count.
 
 Until T-001 is merged there is no gate. T-001's run sets it up and must show it passing before it merges.
 

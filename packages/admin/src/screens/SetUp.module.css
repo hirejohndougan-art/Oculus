@@ -1,0 +1,64 @@
+.qr {
+  align-self: flex-start;
+  padding: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  line-height: 0;
+}
+.keyLabel {
+  margin: 0 0 6px;
+  font-size: 0.875rem;
+  color: var(--text-muted);
+}
+.key {
+  margin: 0;
+  font-size: 1.0625rem;
+  letter-spacing: 1px;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+}
+.codes {
+  margin: 0;
+  padding: 16px 16px 16px 40px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  display: grid;
+  gap: 6px;
+  font-size: 16px;
+}
+.check {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: var(--control-height);
+  font-size: var(--size-small);
+  cursor: pointer;
+}
+.check[data-focus-visible] {
+  outline: 3px solid var(--link);
+  outline-offset: 2px;
+}
+.box {
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--border-input);
+  border-radius: 3px;
+  flex: none;
+  background: var(--surface);
+}
+.check[data-selected] .box {
+  background: var(--ink);
+  border-color: var(--ink);
+}
+.check[data-selected] .box::after {
+  content: "";
+  display: block;
+  width: 5px;
+  height: 10px;
+  margin: 1px 0 0 5px;
+  border: solid #ffffff;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
