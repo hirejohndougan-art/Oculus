@@ -34,17 +34,30 @@ export {
   readRecord,
   readStoredRecord,
 } from "./catalog.js";
-export type { StoredTemplate, StoredRecordType, StoredRecord, RecordUpdate } from "./catalog.js";
+export type {
+  StoredTemplate,
+  StoredRecordType,
+  StoredRecord,
+  RecordUpdate,
+  RecordUpdateResult,
+  VersionConflict,
+} from "./catalog.js";
 export {
   isActorId,
   validateRecordChange,
   readVersion,
   readVersions,
+  compareVersions,
   DEFAULT_VERSION_LIST_LIMIT,
   MAX_VERSION_LIST_LIMIT,
   MAX_REASON_LENGTH,
 } from "./record-versions.js";
-export type { RecordChange, RecordVersion, RecordVersions } from "./record-versions.js";
+export type {
+  RecordChange,
+  RecordVersion,
+  RecordVersions,
+  VersionComparison,
+} from "./record-versions.js";
 export {
   readIdentifierTypes,
   insertIdentifierType,

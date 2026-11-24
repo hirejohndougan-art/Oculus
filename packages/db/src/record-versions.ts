@@ -25,12 +25,14 @@
  * so nothing here may reach public output (T-030, T-043 decide what is shown).
  */
 import {
+  compareRecords,
   isOrganizationId,
   isRecordId,
   issue,
   validateRecord,
   type CatalogRecord,
   type OrganizationId,
+  type RecordDifference,
   type RecordId,
   type Validated,
 } from "@oculus/core";
@@ -312,5 +314,64 @@ export async function readVersions(
   return {
     ok: true,
     value: Object.freeze({ versions: Object.freeze(versions), truncated: rows.length > limit }),
+  };
+}
+
+/** Two versions of one record, compared (`compareVersions`). */
+export interface VersionComparison {
+  readonly from: number;
+  readonly to: number;
+  /** What differs from `from` to `to`, sorted by name (`compareRecords`). */
+  readonly differences: readonly RecordDifference[];
+}
+
+/**
+ * Compares two stored versions of the organization's record, field by field
+ * (`compareRecords`, T-030): what differs from version `from` to version
+ * `to` (either may be the older). Both are read in one statement, so from
+ * one moment, and validated again. `unknown_version` if either isn't stored
+ * for this organization's record (another organization's record has no
+ * versions here). Staff-only, like the versions.
+ */
+export async function compareVersions(
+  db: Queryable,
+  organizationId: OrganizationId,
+  recordId: RecordId,
+  from: number,
+  to: number,
+): Promise<Validated<VersionComparison>> {
+  const bad = checkIds<VersionComparison>(organizationId, recordId);
+  if (bad) return bad;
+  for (const [name, value] of [
+    ["from", from],
+    ["to", to],
+  ] as const) {
+    if (!isVersionNumber(value)) {
+      return refused([name], "invalid_version", "A version is a whole number from 1.");
+    }
+  }
+  const rows = await db.rows<VersionRow>(sql`
+    SELECT ${VERSION_COLUMNS} FROM public.record_versions
+    WHERE organization_id = ${organizationId}::uuid AND record_id = ${recordId}::uuid
+      AND version IN (${from}::integer, ${to}::integer)`);
+  const read = (version: number, name: "from" | "to"): Validated<RecordVersion> => {
+    const row = rows.find((r) => r.version === version);
+    if (row === undefined) {
+      return refused([name], "unknown_version", "The record has no such version.");
+    }
+    const one = versionFromRow(organizationId, recordId, row);
+    return one.ok
+      ? one
+      : { ok: false, issues: one.issues.map((i) => issue([name, ...i.path], i.code, i.message)) };
+  };
+  const a = read(from, "from");
+  if (!a.ok) return a;
+  const b = read(to, "to");
+  if (!b.ok) return b;
+  const compared = compareRecords(a.value.record, b.value.record);
+  if (!compared.ok) return compared;
+  return {
+    ok: true,
+    value: Object.freeze({ from, to, differences: compared.value.differences }),
   };
 }

@@ -48,12 +48,14 @@ import {
   type Issue,
   type Organization,
   type OrganizationId,
+  type RecordDifference,
   type RecordId,
   type RecordType,
   type Validated,
 } from "@oculus/core";
 import type { Queryable } from "./client.js";
 import {
+  compareVersions,
   validateRecordChange,
   writeVersion,
   type RecordChange,
@@ -383,10 +385,41 @@ export interface RecordUpdate extends RecordChange {
   /**
    * The version the person's edit started from (`readStoredRecord`, or the
    * last version written). If the record has been written since, nothing is
-   * stored and the issue is `version_conflict` (T-031 adds what changed).
+   * stored and the issue is `version_conflict`, with what changed since in
+   * the result's `conflict` (T-031).
    */
   readonly expectedVersion: number;
 }
+
+/**
+ * Why an update was refused as `version_conflict` (T-031, D-065): the record
+ * was saved by someone else since the version the edit started from, and
+ * this is what they changed, so the editor can show it and the person can
+ * redo their edit on the record as it now is. Staff-only, like the versions.
+ */
+export interface VersionConflict {
+  /** The version the edit started from. */
+  readonly expectedVersion: number;
+  /** The record's version now. */
+  readonly currentVersion: number;
+  /**
+   * What differs from `expectedVersion` to `currentVersion`
+   * (`compareRecords`), sorted by name. Absent when it can't be worked out:
+   * the expected version is later than the current one (never stored), or a
+   * stored version no longer validates.
+   */
+  readonly differences?: readonly RecordDifference[];
+}
+
+/** What `updateRecord` returns: the new version, or the issues (and, for `version_conflict`, the conflict). */
+export type RecordUpdateResult =
+  | { readonly ok: true; readonly value: RecordVersion }
+  | {
+      readonly ok: false;
+      readonly issues: readonly Issue[];
+      /** Set when the refusal is `version_conflict` and the record still exists. */
+      readonly conflict?: VersionConflict;
+    };
 
 const DEADLOCK = "40P01";
 const SERIALIZATION = "40001";
@@ -451,8 +484,9 @@ const UPDATED_BEFORE = "updatedAt can't be earlier than the stored record's.";
  * (the record row and its version alike) is rolled back to the savepoint and
  * the caller's transaction stays usable. A deadlock or serialization failure
  * is returned as `retry`; any other error is thrown after the rollback.
+ * @internal Also used by `restoreVersion` (savepoints nest).
  */
-async function inSavepoint<T>(
+export async function inSavepoint<T>(
   db: Queryable,
   write: "insert" | "update",
   work: () => Promise<Validated<T>>,
@@ -588,7 +622,8 @@ export async function insertRecord(
  * here, and only here: callers check the record against the new template
  * first, as for any save. Refused, storing nothing:
  * `unknown_record`; `version_conflict` when the record is no longer at
- * `expectedVersion` (someone saved since: read it again); `retry` on a
+ * `expectedVersion` (someone saved since: read it again), with `conflict`
+ * saying what they changed (T-031, `VersionConflict`); `retry` on a
  * deadlock or serialization failure. Of two updates from the same version at
  * the same moment, the second waits for the first and is then refused with
  * `version_conflict`, so neither overwrites the other unseen.
@@ -600,7 +635,7 @@ export async function updateRecord(
   db: Queryable,
   input: unknown,
   update: RecordUpdate,
-): Promise<Validated<RecordVersion>> {
+): Promise<RecordUpdateResult> {
   const expected = ownValue(update, "expectedVersion");
   if (
     typeof expected !== "number" ||
@@ -634,7 +669,7 @@ export async function updateRecord(
     return refused(["templateKey"], "no_template_key", NO_TEMPLATE_KEY);
   }
   const c = columnsOf(r);
-  return inSavepoint(db, "update", async (): Promise<Validated<RecordVersion>> => {
+  const result = await inSavepoint(db, "update", async (): Promise<Validated<RecordVersion>> => {
     const [row] = await db.rows<{ version: number }>(sql`
       UPDATE public.records SET
         kind = ${r.kind}, template_key = ${r.templateKey}, record_type_key = ${r.recordTypeKey ?? null},
@@ -683,6 +718,39 @@ export async function updateRecord(
     }
     return { ok: true, value: await writeVersion(db, r, row.version, who.value) };
   });
+  if (result.ok || !result.issues.some((i) => i.code === "version_conflict")) return result;
+  const conflict = await versionConflict(db, r.organizationId, r.id, expected);
+  return conflict === undefined ? result : { ...result, conflict };
+}
+
+/**
+ * What changed in the organization's record since `expectedVersion`, the
+ * version an edit started from (T-031): read after the refusal, in the
+ * caller's transaction, so it shows the record as it is now (committed by
+ * others, or written earlier in this transaction). `undefined` if the record
+ * no longer exists.
+ * @internal Also used by `restoreVersion`.
+ */
+export async function versionConflict(
+  db: Queryable,
+  organizationId: OrganizationId,
+  recordId: RecordId,
+  expectedVersion: number,
+): Promise<VersionConflict | undefined> {
+  const [current] = await db.rows<{ version: number }>(sql`
+    SELECT version FROM public.records
+    WHERE organization_id = ${organizationId}::uuid AND id = ${recordId}::uuid`);
+  if (current === undefined) return undefined;
+  const base = { expectedVersion, currentVersion: current.version };
+  if (current.version <= expectedVersion) return Object.freeze(base);
+  const compared = await compareVersions(
+    db,
+    organizationId,
+    recordId,
+    expectedVersion,
+    current.version,
+  );
+  return Object.freeze(compared.ok ? { ...base, differences: compared.value.differences } : base);
 }
 
 /** An issue of the change (who and why), under `change` in the path. */
@@ -759,6 +827,29 @@ export async function readStoredRecord(
     return refused([], "row_mismatch", "The stored record doesn't match its row.");
   }
   return { ok: true, value: Object.freeze({ version: row.version, record: valid.value }) };
+}
+
+/**
+ * @internal The organization's records with these IDs, as the core values
+ * their rows hold, **not validated** (`makeRecordLinkChecker` marks an
+ * invalid one unusable). IDs it doesn't have (or another organization has)
+ * are left out. For `restoreVersion`'s checks.
+ */
+export async function readRecordsForChecks(
+  db: Queryable,
+  organizationId: OrganizationId,
+  ids: readonly RecordId[],
+): Promise<Record<string, unknown>[]> {
+  if (ids.length === 0) return [];
+  const rows = await db.rows<RecordRow>(sql`
+    SELECT id::text AS id, organization_id::text AS organization_id, kind, template_key,
+           record_type_key, title, level, parent_id::text AS parent_id, media_type,
+           represents_id::text AS represents_id, agent_type, latitude, longitude, fields,
+           to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+           to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+    FROM public.records
+    WHERE organization_id = ${organizationId}::uuid AND id = ANY(${[...ids]}::uuid[])`);
+  return rows.map(recordFromRow);
 }
 
 /**
