@@ -645,10 +645,17 @@ describe("restoreVersion: record types and represented records", () => {
     ok(await save(withoutKey({ ...typed, updatedAt: LATER }, "recordTypeKey"), 1));
     ok(await restore(org, typed.id, 1, 2));
     ok(await save(withoutKey({ ...typed, updatedAt: AFTER_NOW }, "recordTypeKey"), 3));
-    // The type is removed by the owner (nothing points at it now).
+    // The type is removed by the owner (nothing points at it now), past the
+    // append-only trigger on its versions (0008).
     await tx(async (q) => {
+      await q.execute(
+        sql`ALTER TABLE public.record_type_versions DISABLE TRIGGER zzzz_record_type_versions_no_update`,
+      );
       await q.execute(sql`DELETE FROM public.record_type_versions
                           WHERE organization_id = ${org}::uuid AND key = 'chair'`);
+      await q.execute(
+        sql`ALTER TABLE public.record_type_versions ENABLE TRIGGER zzzz_record_type_versions_no_update`,
+      );
       await q.execute(sql`DELETE FROM public.record_types
                           WHERE organization_id = ${org}::uuid AND key = 'chair'`);
     });

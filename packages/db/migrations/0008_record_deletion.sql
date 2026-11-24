@@ -242,3 +242,29 @@ CREATE TRIGGER aaaa_template_versions_lock BEFORE INSERT ON public.template_vers
   FOR EACH ROW EXECUTE FUNCTION public.template_versions_lock();
 CREATE TRIGGER aaaa_record_type_versions_lock BEFORE INSERT ON public.record_type_versions
   FOR EACH ROW EXECUTE FUNCTION public.record_type_versions_lock();
+
+-- 3. Template and record type versions are append-only, like record versions
+-- (third independent review: a role granted UPDATE on one column of
+-- template_versions rewrote stored history). Row triggers refuse UPDATE and
+-- DELETE and a statement trigger refuses TRUNCATE, for every role that can't
+-- disable triggers. Named to fire after zzzz_*_keep_identity, so a change of
+-- identity is still reported as such.
+CREATE FUNCTION public.definition_versions_append_only() RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  RAISE EXCEPTION 'Template and record type versions are never changed or removed.'
+    USING ERRCODE = 'integrity_constraint_violation',
+          CONSTRAINT = TG_TABLE_NAME || '_append_only';
+END
+$$;
+
+CREATE TRIGGER zzzz_template_versions_no_update BEFORE UPDATE OR DELETE ON public.template_versions
+  FOR EACH ROW EXECUTE FUNCTION public.definition_versions_append_only();
+CREATE TRIGGER zzzz_template_versions_no_truncate BEFORE TRUNCATE ON public.template_versions
+  FOR EACH STATEMENT EXECUTE FUNCTION public.definition_versions_append_only();
+CREATE TRIGGER zzzz_record_type_versions_no_update BEFORE UPDATE OR DELETE ON public.record_type_versions
+  FOR EACH ROW EXECUTE FUNCTION public.definition_versions_append_only();
+CREATE TRIGGER zzzz_record_type_versions_no_truncate BEFORE TRUNCATE ON public.record_type_versions
+  FOR EACH STATEMENT EXECUTE FUNCTION public.definition_versions_append_only();

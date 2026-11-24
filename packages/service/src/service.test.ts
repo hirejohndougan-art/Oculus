@@ -402,9 +402,9 @@ describe("the writer role", () => {
     } finally {
       await server.close();
     }
-    expect(await problems(ownerMember)).toEqual(
-      expect.arrayContaining(["superuser", "owner", "createrole", "bypasses_row_security"]),
-    );
+    // A member of the (superuser) owner: any membership is refused, and so
+    // is ownership through it.
+    expect(await problems(ownerMember)).toEqual(["role_membership", "owner"]);
     expect(await problems(creator)).toEqual(["createrole"]);
     // The database's owner (and so a member of pg_database_owner, which owns
     // schema public).
@@ -457,7 +457,7 @@ describe("the writer role", () => {
 
   it("refuses a login that can defeat the triggers some other way", async () => {
     await ready();
-    const [, , , , , creator = "", probe = "", bypasser = "", helper = ""] = s.roles;
+    const [, , , , , creator = "", probe = "", , helper = ""] = s.roles;
     /** Runs a statement with up to two role or object names, quoted by format('%I'). */
     const run = async (on: Database, statement: string, ...names: string[]): Promise<void> => {
       await on.transaction(async (q) => {
@@ -476,91 +476,160 @@ describe("the writer role", () => {
       (await createService(pool).checkConnection()).map((p) => p.code);
     try {
       await s.owner.transaction((q) => grantWriterRole(q, probe));
-      await run(server, "ALTER ROLE %I NOLOGIN BYPASSRLS", bypasser);
+      // The helper holds TRIGGER: a member could SET ROLE to it (B1).
+      await run(s.owner, "GRANT TRIGGER ON public.record_versions TO %I", helper);
       expect(await probeCodes()).toEqual([]);
-      const cases: [on: Database, grant: string, revoke: string, names: string[], code: string][] =
+      const [version] = await s.owner.rows<{ n: number }>(
+        sql`SELECT current_setting('server_version_num')::integer AS n`,
+      );
+      const pg16 = (version?.n ?? 0) >= 160000;
+      const db = s.testDb.name;
+      type Case = [on: Database, grant: string, revoke: string, names: string[], codes: string[]];
+      const membership = (role: string, options = ""): Case => [
+        server,
+        `GRANT %I TO %I${options}`,
+        "REVOKE %I FROM %I",
+        [role, probe],
+        ["role_membership"],
+      ];
+      const attribute = (on: string, off: string, codes: string[]): Case => [
+        server,
+        `ALTER ROLE %I ${on}`,
+        `ALTER ROLE %I ${off}`,
+        [probe],
+        codes,
+      ];
+      const onTable = (what: string, to = "%I"): Case => [
+        s.owner,
+        `GRANT ${what} TO ${to}`,
+        `REVOKE ${what} FROM ${to}`,
+        to === "%I" ? [probe] : [],
+        [what.includes("(") ? "column_privilege" : "extra_privilege"],
+      ];
+      const cases: Case[] = [
+        // Any membership at all, whatever it carries (B1, B3).
+        membership(creator),
+        membership(helper),
+        ...(pg16
+          ? [
+              membership(helper, " WITH INHERIT FALSE"),
+              membership(helper, " WITH ADMIN TRUE, INHERIT FALSE, SET FALSE"),
+              membership("pg_create_subscription"),
+            ]
+          : []),
+        membership("pg_signal_backend"),
+        membership("pg_write_server_files"),
+        membership("pg_execute_server_program"),
+        membership("pg_read_server_files"),
+        membership("pg_write_all_data"),
+        // Attributes.
+        attribute("SUPERUSER", "NOSUPERUSER", ["superuser", "owner"]),
+        attribute("CREATEROLE", "NOCREATEROLE", ["createrole"]),
+        attribute("BYPASSRLS", "NOBYPASSRLS", ["bypasses_row_security"]),
+        attribute("REPLICATION", "NOREPLICATION", ["replication"]),
+        // Parameters, to the role or to PUBLIC.
         [
-          // 1. Membership in a role that can create roles or bypasses row security.
-          [server, "GRANT %I TO %I", "REVOKE %I FROM %I", [creator, probe], "createrole"],
-          [
-            server,
-            "GRANT %I TO %I",
-            "REVOKE %I FROM %I",
-            [bypasser, probe],
-            "bypasses_row_security",
-          ],
-          // 2. session_replication_role, grantable from PostgreSQL 15.
-          [
-            server,
-            "GRANT SET ON PARAMETER session_replication_role TO %I",
-            "REVOKE SET ON PARAMETER session_replication_role FROM %I",
-            [probe],
-            "replication_role",
-          ],
-          // 4. Predefined roles reaching files, programs or every table.
-          ...[
-            "pg_execute_server_program",
-            "pg_write_server_files",
-            "pg_read_server_files",
-            "pg_write_all_data",
-          ].map(
-            (role) =>
-              [server, "GRANT %I TO %I", "REVOKE %I FROM %I", [role, probe], "server_access"] as [
-                Database,
-                string,
-                string,
-                string[],
-                string,
-              ],
-          ),
-          // 5. CREATE in schema public.
-          [
-            s.owner,
-            "GRANT CREATE ON SCHEMA public TO %I",
-            "REVOKE CREATE ON SCHEMA public FROM %I",
-            [probe],
-            "schema_create",
-          ],
-          // 3. Any table privilege beyond the writer's, held directly…
-          ...[
-            "TRIGGER ON public.record_versions",
-            "TRUNCATE ON public.records",
-            "REFERENCES ON public.templates",
-            "DELETE ON public.templates",
-            "UPDATE ON public.record_versions",
-            "UPDATE ON public.record_identifiers",
-          ].map(
-            (what) =>
-              [
-                s.owner,
-                `GRANT ${what} TO %I`,
-                `REVOKE ${what} FROM %I`,
-                [probe],
-                "extra_privilege",
-              ] as [Database, string, string, string[], string],
-          ),
-        ];
-      for (const [on, grant, revoke, names, code] of cases) {
+          server,
+          "GRANT SET ON PARAMETER session_replication_role TO %I",
+          "REVOKE SET ON PARAMETER session_replication_role FROM %I",
+          [probe],
+          ["parameter_privilege"],
+        ],
+        [
+          server,
+          "GRANT SET ON PARAMETER session_replication_role TO PUBLIC",
+          "REVOKE SET ON PARAMETER session_replication_role FROM PUBLIC",
+          [],
+          ["parameter_privilege"],
+        ],
+        [
+          server,
+          "GRANT ALTER SYSTEM ON PARAMETER work_mem TO %I",
+          "REVOKE ALTER SYSTEM ON PARAMETER work_mem FROM %I",
+          [probe],
+          ["parameter_privilege"],
+        ],
+        // CREATE on the database (B3) or on schema public, to the role or to PUBLIC.
+        [
+          server,
+          "GRANT CREATE ON DATABASE %I TO %I",
+          "REVOKE CREATE ON DATABASE %I FROM %I",
+          [db, probe],
+          ["database_create"],
+        ],
+        [
+          server,
+          "GRANT CREATE ON DATABASE %I TO PUBLIC",
+          "REVOKE CREATE ON DATABASE %I FROM PUBLIC",
+          [db],
+          ["database_create"],
+        ],
+        [
+          s.owner,
+          "GRANT CREATE ON SCHEMA public TO %I",
+          "REVOKE CREATE ON SCHEMA public FROM %I",
+          [probe],
+          ["schema_create"],
+        ],
+        [
+          s.owner,
+          "GRANT CREATE ON SCHEMA public TO PUBLIC",
+          "REVOKE CREATE ON SCHEMA public FROM PUBLIC",
+          [],
+          ["schema_create"],
+        ],
+        // Any table privilege beyond the writer's, to the role or to PUBLIC.
+        onTable("TRIGGER ON public.record_versions"),
+        onTable("TRUNCATE ON public.records"),
+        onTable("REFERENCES ON public.templates"),
+        onTable("DELETE ON public.templates"),
+        onTable("UPDATE ON public.record_versions"),
+        onTable("UPDATE ON public.record_identifiers"),
+        onTable("SELECT ON public.records", "PUBLIC"),
+        onTable("DELETE ON public.records", "PUBLIC"),
+        // Any column privilege (B2), to the role or to PUBLIC.
+        onTable("UPDATE (definition) ON public.template_versions"),
+        onTable("SELECT (title) ON public.records", "PUBLIC"),
+        // Default privileges on future objects.
+        [
+          s.owner,
+          "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT DELETE ON TABLES TO %I",
+          "ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE DELETE ON TABLES FROM %I",
+          [probe],
+          ["default_privilege"],
+        ],
+        [
+          s.owner,
+          "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO PUBLIC",
+          "ALTER DEFAULT PRIVILEGES REVOKE SELECT ON TABLES FROM PUBLIC",
+          [],
+          ["default_privilege"],
+        ],
+      ];
+      for (const [on, grant, revoke, names, codes] of cases) {
         await run(on, grant, ...names);
         try {
-          const found = await probeCodes();
-          expect({ grant, has: found.includes(code) }).toEqual({ grant, has: true });
-          if (code !== "server_access") expect({ grant, found }).toEqual({ grant, found: [code] });
+          expect({ grant, found: await probeCodes() }).toEqual({ grant, found: codes });
         } finally {
           await run(on, revoke, ...names);
         }
-        expect(await probeCodes()).toEqual([]);
+        expect({ revoke, found: await probeCodes() }).toEqual({ revoke, found: [] });
       }
-      // …or through a role it belongs to (TRIGGER via a NOLOGIN role).
-      await run(s.owner, "GRANT TRIGGER ON public.record_versions TO %I", helper);
-      await run(server, "GRANT %I TO %I", helper, probe);
-      try {
-        expect(await probeCodes()).toEqual(["extra_privilege"]);
-      } finally {
-        await run(server, "REVOKE %I FROM %I", helper, probe);
-        await run(s.owner, "REVOKE TRIGGER ON public.record_versions FROM %I", helper);
-      }
+      // A revoke-only default (EXECUTE on functions kept for PUBLIC) is fine.
+      await run(s.owner, "ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM %I", probe);
       expect(await probeCodes()).toEqual([]);
+      // GRANT OPTION on its own privileges is harmless: it can only hand them on.
+      await run(s.owner, "GRANT SELECT ON public.records TO %I WITH GRANT OPTION", probe);
+      try {
+        expect(await probeCodes()).toEqual([]);
+      } finally {
+        await run(s.owner, "REVOKE GRANT OPTION FOR SELECT ON public.records FROM %I", probe);
+      }
+      // The owner's list is long; the message names five and counts the rest.
+      const ownerProblems = await createService(s.owner).checkConnection();
+      const extra = ownerProblems.find((p) => p.code === "extra_privilege")?.message ?? "";
+      expect(extra).toMatch(/ and \d+ more\.$/);
+      expect(extra.length).toBeLessThan(400);
       // 5. A session that logged in as the owner and SET ROLE to the writer.
       const writerRole = s.roles[0] ?? "";
       const switched = await s.owner.transaction(async (q) => {
@@ -749,6 +818,59 @@ describe("the writer role", () => {
     expect(await refusal(s.owner.execute(sql`TRUNCATE public.records CASCADE`))).toMatchObject({
       code: IDENTITY,
     });
+  });
+});
+
+describe("template and record type versions are append-only", () => {
+  it("refuses UPDATE, DELETE and TRUNCATE by any role, the owner and a column grant included", async () => {
+    await ready();
+    const org = await organization();
+    const where = sql`organization_id = ${org}::uuid`;
+    for (const [table, statements] of [
+      [
+        "template_versions",
+        [
+          sql`UPDATE public.template_versions SET definition = definition WHERE ${where}`,
+          sql`DELETE FROM public.template_versions WHERE ${where} AND key = 'invented-unit'`,
+          sql`TRUNCATE public.template_versions CASCADE`,
+        ],
+      ],
+      [
+        "record_type_versions",
+        [
+          sql`UPDATE public.record_type_versions SET definition = definition WHERE ${where}`,
+          sql`DELETE FROM public.record_type_versions WHERE ${where}`,
+          sql`TRUNCATE public.record_type_versions`,
+        ],
+      ],
+    ] as const) {
+      for (const statement of statements) {
+        expect(await refusal(s.owner.execute(statement))).toEqual({
+          code: IDENTITY,
+          constraint: `${table}_append_only`,
+        });
+      }
+    }
+    // B2: a role given UPDATE on one column still can't rewrite history.
+    const writerRole = s.roles[0] ?? "";
+    await s.owner.transaction((q) =>
+      withRole(q, "GRANT UPDATE (definition) ON public.template_versions TO %I", writerRole),
+    );
+    try {
+      expect(
+        await refusal(
+          s.writer.execute(sql`
+            UPDATE public.template_versions
+            SET definition = jsonb_set(definition, '{label}', '"Rewritten"') WHERE ${where}`),
+        ),
+      ).toEqual({ code: IDENTITY, constraint: "template_versions_append_only" });
+      expect((await service.checkConnection()).map((p) => p.code)).toEqual(["column_privilege"]);
+    } finally {
+      await s.owner.transaction((q) =>
+        withRole(q, "REVOKE UPDATE (definition) ON public.template_versions FROM %I", writerRole),
+      );
+    }
+    expect(await service.checkConnection()).toEqual([]);
   });
 });
 

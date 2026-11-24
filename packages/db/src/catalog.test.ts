@@ -408,10 +408,19 @@ describe("templates", () => {
     const org = newOrganizationId();
     ok(await insertOrganization(db, { id: org, name: "Tampered" }));
     ok(await insertTemplateVersion(db, authorityTemplate(org)));
-    await db.execute(sql`
-      UPDATE public.template_versions
-      SET definition = jsonb_set(definition, '{fields,0,visibility}', '"everyone"')
-      WHERE organization_id = ${org}::uuid`);
+    // A hand edit by the owner, past the append-only trigger (0008).
+    await db.transaction(async (q) => {
+      await q.execute(
+        sql`ALTER TABLE public.template_versions DISABLE TRIGGER zzzz_template_versions_no_update`,
+      );
+      await q.execute(sql`
+        UPDATE public.template_versions
+        SET definition = jsonb_set(definition, '{fields,0,visibility}', '"everyone"')
+        WHERE organization_id = ${org}::uuid`);
+      await q.execute(
+        sql`ALTER TABLE public.template_versions ENABLE TRIGGER zzzz_template_versions_no_update`,
+      );
+    });
     expect((await readTemplate(db, org, "authority"))?.ok).toBe(false);
   });
 });
