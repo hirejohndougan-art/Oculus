@@ -45,16 +45,29 @@ describe("reading cookies", () => {
     expect(body.cookieNames).toEqual([SESSION]);
   });
 
+  it.each([`${SESSION}=a; ${SESSION}=b`, `${SESSION}=a;${SESSION}=a`])(
+    "refuses a request that sends an Oculus cookie twice: %s",
+    async (cookie) => {
+      const { res, calls } = await whoami(cookie);
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toEqual({ error: "duplicate_cookie" });
+      expect(calls.count).toBe(0);
+    },
+  );
+
+  // S-024: a sibling subdomain plants a case variant with Domain=parent (a
+  // browser checking the __Host- prefix case-sensitively allows it). It is
+  // another cookie: ignored, never read, and it blocks nothing.
   it.each([
-    `${SESSION}=a; ${SESSION}=b`,
-    `${SESSION}=a;${SESSION}=a`,
     `${SESSION}=a; __host-oculus_session=b`,
     `__HOST-OCULUS_SESSION=b; ${SESSION}=a`,
-  ])("refuses a request that sends an Oculus cookie twice: %s", async (cookie) => {
+    `__host-oculus_session=b; __Host-Oculus_Session=c; ${SESSION}=a; __host-oculus_session=d`,
+  ])("ignores a planted case variant and reads the real cookie: %s", async (cookie) => {
     const { res, calls } = await whoami(cookie);
-    expect(res.statusCode).toBe(400);
-    expect(res.json()).toEqual({ error: "duplicate_cookie" });
-    expect(calls.count).toBe(0);
+    expect(res.statusCode).toBe(200);
+    expect(res.json<{ session: unknown }>().session).toBe("a");
+    expect(calls.count).toBe(1);
+    expect(cookieHeaderProblem(cookie)).toBeUndefined();
   });
 
   it("refuses duplicates split over two Cookie headers", () => {

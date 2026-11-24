@@ -6,11 +6,16 @@
  *   `OCULUS_COOKIES` from the raw header (D-058: `@fastify/cookie` dropped,
  *   because its `setCookie` parses every cookie into `request.cookies` and
  *   its parser keeps the first of two copies).
- * - A request that sends any Oculus cookie name more than once (compared
- *   without regard to case, so `__host-oculus_session` counts) is refused
- *   with 400: a second copy can be planted by a sibling site or script, and
- *   picking either one would be a guess. The cost (D-058): whoever can plant
- *   such a copy can make the browser's requests fail until it is cleared.
+ * - A request that sends any Oculus cookie name more than once (the exact
+ *   name, as cookie names are compared) is refused with 400: a second copy
+ *   can be planted by a script on the same origin, and picking either one
+ *   would be a guess. The cost (D-058): whoever can plant such a copy can
+ *   make the browser's requests fail until it is cleared. A cookie whose
+ *   name only case-folds to an Oculus name (`__host-oculus_session`) is
+ *   another cookie: it is never read and never counted (S-024), because a
+ *   sibling subdomain can plant one (a browser that checks the `__Host-`
+ *   prefix case-sensitively lets `__host-` carry `Domain`) and would
+ *   otherwise block every request, sign-in included.
  * - `Max-Age` is at most 400 days, in the writer and in the check alike.
  * - Values are base64url text only (session tokens are random bytes); any
  *   other value reads as absent. Names, values and the Cookie header must be
@@ -35,7 +40,6 @@ export const OCULUS_COOKIES = {
 export type OculusCookieName = (typeof OCULUS_COOKIES)[keyof typeof OCULUS_COOKIES];
 
 const NAMES: ReadonlySet<string> = new Set(Object.values(OCULUS_COOKIES));
-const LOWERCASE_NAMES: ReadonlySet<string> = new Set([...NAMES].map((n) => n.toLowerCase()));
 const VALUE = /^[A-Za-z0-9_-]{1,512}$/;
 
 function cookiePairs(header: string | undefined): { name: string; value: string }[] {
@@ -49,15 +53,17 @@ function cookiePairs(header: string | undefined): { name: string; value: string 
   });
 }
 
-/** Refuses a Cookie header that names any Oculus cookie more than once. */
+/**
+ * Refuses a Cookie header that names any Oculus cookie more than once, by
+ * exact name: other cookies, case variants of Oculus names included, are
+ * ignored (S-024).
+ */
 export function cookieHeaderProblem(header: string | undefined): Refusal | undefined {
-  const counts = new Map<string, number>();
+  const seen = new Set<string>();
   for (const { name } of cookiePairs(header)) {
-    const lower = name.toLowerCase();
-    if (!LOWERCASE_NAMES.has(lower)) continue;
-    const count = (counts.get(lower) ?? 0) + 1;
-    if (count > 1) return new Refusal(400, "duplicate_cookie");
-    counts.set(lower, count);
+    if (!NAMES.has(name)) continue;
+    if (seen.has(name)) return new Refusal(400, "duplicate_cookie");
+    seen.add(name);
   }
   return undefined;
 }
