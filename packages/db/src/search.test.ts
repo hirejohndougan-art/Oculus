@@ -182,6 +182,17 @@ describe("words", () => {
     expect(await ids(org, "МОСКВА")).toEqual([greek.id]);
   });
 
+  it("keep Hebrew and Arabic vowel marks: vocalized and unvocalized text don't match", async () => {
+    await ready();
+    const org = await organization();
+    const hebrew = await record(org, "\u05e9\u05c1\u05b8\u05dc\u05d5\u05b9\u05dd"); // with niqqud
+    const arabic = await record(org, "\u0643\u064e\u062a\u064e\u0628\u064e"); // with harakat
+    expect(await ids(org, "\u05e9\u05c1\u05b8\u05dc\u05d5\u05b9\u05dd")).toEqual([hebrew.id]);
+    expect(await ids(org, "\u05e9\u05dc\u05d5\u05dd")).toEqual([]);
+    expect(await ids(org, "\u0643\u064e\u062a\u064e\u0628\u064e")).toEqual([arabic.id]);
+    expect(await ids(org, "\u0643\u062a\u0628")).toEqual([]);
+  });
+
   it("search every string in the fields, staff-only ones and nested values too", async () => {
     await ready();
     const org = await organization();
@@ -210,6 +221,35 @@ describe("words", () => {
     expect((await ids(org, "landing or tickets")).sort()).toEqual([a.id, c.id].sort());
     expect(await ids(org, "-bayou")).toEqual([]);
     expect(await ids(org, "!!! ...")).toEqual([]);
+  });
+
+  it("find nothing by text for a query a record with none of its words would match", async () => {
+    await ready();
+    const org = await organization();
+    const chair = await record(org, "Invented chair");
+    const table = await record(org, "Invented table");
+    const other = await record(org, "Invented lamp");
+    await numbers(org, other.id, ["CHAIR OR -TABLE"]);
+    // An exclusion that stands alone or is OR'd with words would match
+    // every record lacking the excluded word, so no text search is run:
+    // not even the chair is found by its word. The number lookup still runs.
+    for (const query of [
+      "-table",
+      "-chair -table",
+      "chair or -table",
+      '"invented chair" or -table',
+    ]) {
+      const result = await search(org, query, { limit: MAX_SEARCH_LIMIT });
+      expect(
+        result.hits.filter((h) => h.matchedBy.includes("text")),
+        query,
+      ).toEqual([]);
+    }
+    expect(await ids(org, "chair or -table")).toEqual([other.id]);
+    // An exclusion ANDed with a word, or beside OR'd words, is run as usual.
+    expect((await ids(org, "invented -table")).sort()).toEqual([chair.id, other.id].sort());
+    expect((await ids(org, "chair or lamp -table")).sort()).toEqual([chair.id, other.id].sort());
+    expect(await ids(org, "table")).toEqual([table.id]);
   });
 
   it("rank a title match above a field match", async () => {
@@ -336,6 +376,114 @@ describe("keeping the index in step", () => {
       await expect(tx((q) => q.execute(statement))).rejects.toMatchObject({ code: "428C9" });
     }
     expect(await ids(org, "forged")).toEqual([]);
+  });
+
+  it("rebuilds every stored document with rebuild_search_documents, without touching versions", async () => {
+    await ready();
+    const org = await organization();
+    const r = await record(org, "Invented weathervane");
+    const versionsBefore = await db.rows<{ n: string }>(
+      sql`SELECT count(*)::text AS n FROM public.record_versions`,
+    );
+    // A plain UPDATE to recompute the documents is refused: every record
+    // write needs a version of its own (D-063).
+    await expect(
+      tx((q) =>
+        q.execute(
+          sql`UPDATE public.records SET title = title WHERE organization_id = ${org}::uuid`,
+        ),
+      ),
+    ).rejects.toThrow();
+    // Only the table's owner can rebuild: a role with the app's grants is
+    // refused and nothing changes (the role is created and dropped by the
+    // rolled-back transaction).
+    await expect(
+      tx((q) =>
+        q.execute(sql`DO $$ BEGIN
+          CREATE ROLE oculus_test_t028_not_owner NOLOGIN;
+          GRANT USAGE ON SCHEMA public TO oculus_test_t028_not_owner;
+          GRANT SELECT, INSERT, UPDATE ON public.records TO oculus_test_t028_not_owner;
+          SET LOCAL ROLE oculus_test_t028_not_owner;
+          PERFORM public.rebuild_search_documents();
+        END $$`),
+      ),
+    ).rejects.toMatchObject({ code: "42501" });
+    // Stand-in for a server whose Unicode tables or locale changed: the fold
+    // now spells "w" as "v". Stored documents keep the old fold, so the
+    // folded query no longer meets them until they are rebuilt.
+    await db.execute(sql`ALTER FUNCTION public.search_fold(text) RENAME TO search_fold_saved`);
+    try {
+      await db.execute(sql`
+        CREATE FUNCTION public.search_fold(t text) RETURNS text
+        LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+        SET search_path = pg_catalog, pg_temp
+        AS $$ SELECT replace(lower(t), 'w', 'v') $$`);
+      expect(await ids(org, "weathervane")).toEqual([]);
+      await db.execute(sql`SELECT public.rebuild_search_documents()`);
+      expect(await ids(org, "weathervane")).toEqual([r.id]);
+      const [doc] = await db.rows<{ doc: string }>(
+        sql`SELECT search_document::text AS doc FROM public.records
+            WHERE organization_id = ${org}::uuid AND id = ${r.id}::uuid`,
+      );
+      expect(doc?.doc).toContain("veathervane");
+    } finally {
+      await db.execute(sql`DROP FUNCTION public.search_fold(text)`);
+      await db.execute(sql`ALTER FUNCTION public.search_fold_saved(text) RENAME TO search_fold`);
+      await db.execute(sql`SELECT public.rebuild_search_documents()`);
+    }
+    expect(await ids(org, "weathervane")).toEqual([r.id]);
+    // Same rows, same versions, same index; still not writable.
+    const [stored] = await db.rows<{ version: number; title: string }>(
+      sql`SELECT version, title FROM public.records
+          WHERE organization_id = ${org}::uuid AND id = ${r.id}::uuid`,
+    );
+    expect(stored).toEqual({ version: 1, title: "Invented weathervane" });
+    expect(
+      await db.rows<{ n: string }>(sql`SELECT count(*)::text AS n FROM public.record_versions`),
+    ).toEqual(versionsBefore);
+    expect(
+      await db.rows<{ def: string }>(
+        sql`SELECT indexdef AS def FROM pg_indexes WHERE indexname = 'records_search'`,
+      ),
+    ).toEqual([
+      { def: "CREATE INDEX records_search ON public.records USING gin (search_document)" },
+    ]);
+    await expect(
+      tx((q) =>
+        q.execute(sql`UPDATE public.records SET search_document = to_tsvector('simple', 'forged')
+                      WHERE organization_id = ${org}::uuid`),
+      ),
+    ).rejects.toMatchObject({ code: "428C9" });
+  });
+
+  it("stays under the 1 MB tsvector limit for the densest text known (hyphenated pairs)", async () => {
+    await ready();
+    const org = await organization();
+    // "X-Y" gives three words (X-Y, X and Y) for four characters: with
+    // distinct 4-byte letters, the most tsvector bytes per character found
+    // (D-066). 166 pairs fill the 1,000-unit title; 3 fields of 16,000
+    // pairs are well past the 100,000-character cap.
+    const pair = (n: number): string =>
+      String.fromCodePoint(0x20000 + ((2 * n) % 65_536), 0x2d) +
+      String.fromCodePoint(0x20000 + ((2 * n + 1) % 65_536));
+    const pairs = (from: number, count: number): string =>
+      Array.from({ length: count }, (_, i) => pair(from + i)).join(" ");
+    const fields: Record<string, JsonValue> = {};
+    for (let i = 0; i < 3; i += 1) fields[`text_${String(i)}`] = pairs(i * 16_000, 16_000);
+    const dense = await record(org, pairs(60_000, 166), fields);
+    // The part PostgreSQL limits to under 1 MB is the lexemes and their
+    // positions: the whole value less its 8-byte header and 4 bytes a word.
+    const [size] = await db.rows<{ data: number }>(
+      sql`SELECT (pg_column_size(search_document) - 8 - 4 * length(search_document))::integer AS data
+          FROM public.records WHERE organization_id = ${org}::uuid AND id = ${dense.id}::uuid`,
+    );
+    const data = size?.data ?? Infinity;
+    // About 765,000 bytes: roughly a quarter under the limit. Raising the
+    // 100,000-character cap must redo this (D-066).
+    expect(data).toBeGreaterThan(700_000);
+    expect(data).toBeLessThan(800_000);
+    expect(data).toBeLessThan(1_048_576);
+    expect(await ids(org, pair(0))).toEqual([dense.id]);
   });
 
   it("stores the largest record core allows, indexing its first 100,000 characters of field text", async () => {
@@ -515,6 +663,40 @@ describe("paging", () => {
     // Ranks never rise within the text group.
     const textRanks = all.hits.slice(1).map((h) => h.rank);
     expect([...textRanks].sort((x, y) => y - x)).toEqual(textRanks);
+  });
+
+  it("orders and pages by numeric rank when ranks have different numbers of digits", async () => {
+    await ready();
+    const org = await organization();
+    // Rank keys of about 150,000 (one word in the title), 60,000 (two words
+    // in a field) and 30,000 (one word in a field): sorted as text, the
+    // 6-digit best hit sorts after the 5-digit ones ("1..." < "3..." < "6...").
+    const title = await record(org, "Lamp");
+    const oneWord = await record(org, "Ledger", { brief_description: "lamp" });
+    const twoWords = await record(org, "Ledger two", { brief_description: "lamp zzz" });
+    const query = "lamp or zzz or yyy or www";
+    const all = await search(org, query, { limit: MAX_SEARCH_LIMIT });
+    const keys = all.hits.map((h) => String(Math.round(h.rank * 1_000_000)).length);
+    expect(new Set(keys).size).toBeGreaterThan(1);
+    const ranks = all.hits.map((h) => h.rank);
+    expect([...ranks].sort((x, y) => y - x)).toEqual(ranks);
+    expect(all.hits.map((h) => h.recordId)).toEqual([title.id, twoWords.id, oneWord.id]);
+    // A walk one hit at a time sees every hit exactly once, in rank order.
+    const walked: RecordId[] = [];
+    let after: string | undefined;
+    let pages = 0;
+    do {
+      const page = await search(
+        org,
+        query,
+        after === undefined ? { limit: 1 } : { limit: 1, after },
+      );
+      walked.push(...page.hits.map((h) => h.recordId));
+      after = page.next;
+      pages += 1;
+    } while (after !== undefined && pages < 10);
+    expect(walked).toEqual(all.hits.map((h) => h.recordId));
+    expect(new Set(walked).size).toBe(3);
   });
 
   it("uses the default limit", async () => {

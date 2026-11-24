@@ -1,7 +1,10 @@
 -- Staff search (T-028, D-066): full-text search over every record's title
--- and the text in its fields, accent-insensitive, ranked; lookup by a
--- current or former identifier goes through identifier_holdings_lookup
--- (0003) and needs nothing here.
+-- and the text in its fields, ranked, accent-insensitive for Latin, Greek
+-- and Cyrillic (Hebrew and Arabic vowel marks are kept); lookup by a current
+-- or former identifier goes through identifier_holdings_lookup (0003) and
+-- needs nothing here. public.rebuild_search_documents() rebuilds the stored
+-- documents after a PostgreSQL major upgrade or a C library, ICU or locale
+-- change (see it below).
 --
 -- ===========================================================================
 -- STAFF ONLY. This index holds EVERY record's title and EVERY text value of
@@ -20,16 +23,19 @@
 -- set by INSERT or UPDATE. Identifier saves need no upkeep: identifier
 -- lookup reads identifier_holdings, which the saves write.
 --
--- Accent-insensitive matching without the unaccent extension (which a host
+-- Accent-insensitive matching (Latin, Greek and Cyrillic; see 2. below)
+-- without the unaccent extension (which a host
 -- may not let us install, D-035): public.search_fold, pure SQL from the
 -- core server, folds the document and the query the same way:
 --   1. NFKD (compatibility decomposition): accented letters split into base
 --      letter + combining marks; full-width, ligature (ﬁ), superscript and
 --      other compatibility forms become their plain letters and digits;
 --   2. combining marks of the general diacritic blocks are removed
---      (U+0300-036F, 1AB0-1AFF, 1DC0-1DFF, 20D0-20FF, FE20-FE2F); marks
---      that are letters' vowels in other scripts (Devanagari, Arabic,
---      Hebrew) are kept;
+--      (U+0300-036F, 1AB0-1AFF, 1DC0-1DFF, 20D0-20FF, FE20-FE2F). Marks
+--      of other scripts are kept: Hebrew points and Arabic vowel marks
+--      (and Indic vowel signs), so vocalized and unvocalized Hebrew or
+--      Arabic text do NOT match each other. Accent-insensitive means
+--      Latin, Greek and Cyrillic here;
 --   3. letters NFKD doesn't split are spelled out (ß ẞ -> ss, Æ æ -> ae,
 --      Œ œ -> oe, Þ þ -> th, Ø ø -> o, Ł ł -> l, Đ đ Ð ð -> d, Ħ ħ -> h,
 --      Ŧ ŧ -> t, dotless ı -> i);
@@ -51,9 +57,11 @@
 -- skipped by PostgreSQL itself.
 --
 -- Changing search_fold or record_search_document later is a migration that
--- drops and re-adds the column (so every stored document is rebuilt with
--- the new rule): an edited function would leave old documents folded the
--- old way.
+-- replaces them and then calls public.rebuild_search_documents() (below), so
+-- every stored document is rebuilt with the new rule: an edited function
+-- alone would leave old documents folded the old way. The same call rebuilds
+-- the documents after a PostgreSQL major upgrade or a C library, ICU or
+-- locale change (see the function).
 
 DO $$
 BEGIN
@@ -97,10 +105,47 @@ AS $$
                             WITH ORDINALITY AS s(value, n)), 100000)), ''), 100000)), 'C')
 $$;
 
-ALTER TABLE public.records
-  ADD COLUMN search_document tsvector NOT NULL
-    GENERATED ALWAYS AS (public.record_search_document(title, fields)) STORED;
+-- Rebuilds every stored search document and the index, by dropping and
+-- re-adding the column: the only way to recompute a stored generated column
+-- without an UPDATE of every record (which the version triggers of 0005
+-- refuse, since every record write needs a version of its own, and which
+-- would be a false edit in every record's history). The table is rewritten
+-- under an ACCESS EXCLUSIVE lock, so no record can be read or written until
+-- it commits; record versions, record_versions and every other column are
+-- untouched, and no row trigger fires. Only the owner of public.records (the
+-- role migrations run as) can run it: it runs with the caller's rights, and
+-- for anyone else DROP INDEX fails ("must be owner") and nothing changes.
+-- EXECUTE is left to PUBLIC like the other functions here, since a REVOKE
+-- would stop a backup restoring with --no-privileges (D-064).
+--
+-- Run it, as that role, in a quiet moment:
+--   * after a PostgreSQL major upgrade by pg_upgrade (normalize() follows the
+--     server's Unicode tables, which a new major version may update);
+--   * after the operating system's C library, ICU or the database's locale
+--     changes (lower() of letters outside Latin, Greek and Cyrillic follows
+--     the locale);
+--   * in any later migration that changes search_fold or
+--     record_search_document (CREATE OR REPLACE, then call this; an edited
+--     IMMUTABLE function alone leaves old documents folded the old way).
+-- A restore from a backup (D-064) needs nothing: generated columns are not
+-- dumped, and are computed afresh as the rows are restored.
+--   psql "$OCULUS_DATABASE_URL" -c 'SELECT public.rebuild_search_documents()'
+-- This migration builds the column with it too, so there is one definition.
+CREATE FUNCTION public.rebuild_search_documents() RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  LOCK TABLE public.records IN ACCESS EXCLUSIVE MODE;
+  -- Searched with @@ and the organization in the same WHERE (searchRecords,
+  -- search.ts): the index is shared, the organization filter never optional.
+  DROP INDEX IF EXISTS public.records_search;
+  ALTER TABLE public.records DROP COLUMN IF EXISTS search_document;
+  ALTER TABLE public.records
+    ADD COLUMN search_document tsvector NOT NULL
+      GENERATED ALWAYS AS (public.record_search_document(title, fields)) STORED;
+  CREATE INDEX records_search ON public.records USING gin (search_document);
+END
+$$;
 
--- Searched with @@ and the organization in the same WHERE (searchRecords,
--- search.ts): the index is shared, the organization filter never optional.
-CREATE INDEX records_search ON public.records USING gin (search_document);
+SELECT public.rebuild_search_documents();

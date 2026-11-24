@@ -20,12 +20,28 @@
  * column, so the database keeps it in step with every record write, by any
  * writer; nothing here maintains it. It holds the title (weight A) and every
  * string in the fields (weight C), folded by `public.search_fold` (NFKD,
- * diacritics removed, ß/æ/œ/ø/ł… spelled out, lowercase), with the 'simple'
- * configuration: no stemming, no stop words. The query is folded by the same
- * SQL function and parsed by `websearch_to_tsquery` as a parameter, never
- * built into SQL text: quotes for phrases, `or`, `-` to exclude; anything
- * else is just words. A query that can only exclude (`-chair`) matches
- * nothing by text, rather than scanning every record.
+ * Latin, Greek and Cyrillic diacritics removed, ß/æ/œ/ø/ł… spelled out,
+ * lowercase), with the 'simple' configuration: no stemming, no stop words.
+ * Hebrew and Arabic vowel marks (and Indic vowel signs) are kept, so
+ * vocalized and unvocalized Hebrew or Arabic text do not match each other.
+ * The query is folded by the same SQL function and parsed by
+ * `websearch_to_tsquery` as a parameter, never built into SQL text: quotes
+ * for phrases, `or`, `-` to exclude; anything else is just words.
+ *
+ * A query that a record holding none of its words would match finds nothing
+ * by text (`querytree` is `T`): an exclusion alone (`-chair`, `-a -b`) and
+ * any exclusion OR'd with the rest (`chair or -table`, `"a b" or -c`), which
+ * would otherwise mean every record without the excluded word, unindexed.
+ * So `chair or -table` does not find the chair either. An exclusion ANDed
+ * with words (`chair -table`, `chair or lamp -table`) runs as usual. The
+ * identifier lookup runs for every query.
+ *
+ * **Cost.** `ts_rank` is computed for every matching record of the
+ * organization on every page (ranking can't use the index), and the GIN
+ * index has no organization column, so a common word costs in proportion to
+ * how many records hold it, across all organizations (about 260-540 ms at
+ * 50,000 records). Whatever exposes this over HTTP (T-043) must set a
+ * `statement_timeout` or cap the matches first (D-066).
  *
  * **Identifiers.** The whole query is also looked up as a number, by core's
  * `identifierKey` in `identifier_holdings` (current and former numbers of
@@ -250,7 +266,9 @@ export async function searchRecords(
        OR (grp = ${after?.group ?? null}::integer
            AND (rank_key < ${after?.rankKey ?? null}::bigint
                 OR (rank_key = ${after?.rankKey ?? null}::bigint AND id > ${after?.id ?? null}::uuid)))
-    ORDER BY grp, rank_key DESC, id
+    -- The hits' own columns, not the text output columns of the same names:
+    -- ordered as text, a rank with fewer digits would sort above a higher one.
+    ORDER BY hits.grp, hits.rank_key DESC, hits.id
     LIMIT ${limit + 1}::integer`);
 
   const hits = rows.slice(0, limit).map((row): SearchHit => {
