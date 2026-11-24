@@ -96,11 +96,11 @@ CREATE TABLE public.record_versions (
   -- fields.<key> for template fields, sorted. Never id, organizationId,
   -- createdAt or updatedAt.
   changed_fields text[] NOT NULL,
-  -- Why, if the person said: one trimmed line or paragraph, no control
-  -- characters but line breaks.
   -- The top-level transaction that wrote the row (set by the trigger), so the
   -- COMMIT check can tell this transaction's version from an older one.
   written_in xid8 NOT NULL,
+  -- Why, if the person said: one trimmed line or paragraph, no control
+  -- characters but line breaks.
   reason text CONSTRAINT record_versions_reason_format
     CHECK (reason <> '' AND length(reason) <= 2000 AND btrim(reason, E' \n') = reason
            AND reason !~ '[\x01-\x09\x0b-\x1f\x7f]'),

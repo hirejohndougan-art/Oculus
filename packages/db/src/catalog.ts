@@ -411,13 +411,19 @@ const ID_USED_BEFORE =
 
 /**
  * The version triggers' refusals (D-063) that a racing or out-of-step write
- * can meet, as clean issues; anything else is thrown.
+ * can meet, as clean issues; anything else is thrown. For an insert, a
+ * version number already taken means the ID has history (`id_used_before`);
+ * only an update can be out of step with its versions (`version_conflict`).
  */
-function versionRefusal<T>(error: unknown): Validated<T> | undefined {
+function versionRefusal<T>(error: unknown, write: "insert" | "update"): Validated<T> | undefined {
   if (sqlState(error) !== INTEGRITY) return undefined;
-  switch (constraintOf(error)) {
-    case "records_id_used_before":
-      return refused(["id"], "id_used_before", ID_USED_BEFORE);
+  const constraint = constraintOf(error);
+  if (write === "insert") {
+    return constraint === "records_id_used_before" || constraint === "record_versions_next_number"
+      ? refused(["id"], "id_used_before", ID_USED_BEFORE)
+      : undefined;
+  }
+  switch (constraint) {
     case "records_version_step":
     case "record_versions_next_number":
     case "record_versions_with_record_write":
@@ -448,6 +454,7 @@ const UPDATED_BEFORE = "updatedAt can't be earlier than the stored record's.";
  */
 async function inSavepoint<T>(
   db: Queryable,
+  write: "insert" | "update",
   work: () => Promise<Validated<T>>,
 ): Promise<Validated<T>> {
   try {
@@ -484,7 +491,7 @@ async function inSavepoint<T>(
         "Another change to this record ran at the same time. Roll back the transaction and try it again.",
       );
     }
-    const clean = versionRefusal<T>(error);
+    const clean = versionRefusal<T>(error, write);
     if (clean) return clean;
     throw error;
   }
@@ -542,7 +549,7 @@ export async function insertRecord(
     return refused(["templateKey"], "no_template_key", NO_TEMPLATE_KEY);
   }
   const c = columnsOf(r);
-  return inSavepoint(db, async (): Promise<Validated<CatalogRecord>> => {
+  return inSavepoint(db, "insert", async (): Promise<Validated<CatalogRecord>> => {
     // A deleted record's ID has history and is never used again (the
     // trigger refuses it too, records_id_used_before).
     const [used] = await db.rows(sql`
@@ -627,7 +634,7 @@ export async function updateRecord(
     return refused(["templateKey"], "no_template_key", NO_TEMPLATE_KEY);
   }
   const c = columnsOf(r);
-  return inSavepoint(db, async (): Promise<Validated<RecordVersion>> => {
+  return inSavepoint(db, "update", async (): Promise<Validated<RecordVersion>> => {
     const [row] = await db.rows<{ version: number }>(sql`
       UPDATE public.records SET
         kind = ${r.kind}, template_key = ${r.templateKey}, record_type_key = ${r.recordTypeKey ?? null},
@@ -665,7 +672,14 @@ export async function updateRecord(
         return refused(["createdAt"], "created_at_changed", "A record's createdAt never changes.");
       }
       if (current.kind !== r.kind) return refused(["kind"], "kind_changed", KIND_FIXED);
-      return refused(["updatedAt"], "updated_before", UPDATED_BEFORE);
+      if (!current.forward) return refused(["updatedAt"], "updated_before", UPDATED_BEFORE);
+      // Every condition holds now: the record changed between the two
+      // statements (a write that committed in between).
+      return refused(
+        ["expectedVersion"],
+        "version_conflict",
+        "The record changed while it was being saved. Read it again.",
+      );
     }
     return { ok: true, value: await writeVersion(db, r, row.version, who.value) };
   });

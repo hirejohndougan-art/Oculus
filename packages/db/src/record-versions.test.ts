@@ -476,10 +476,15 @@ describe("a record and its version are written together", () => {
       );
       await q.execute(sql`
         INSERT INTO public.record_versions
-          (organization_id, record_id, version, record, actor, recorded_at, changed_fields)
+          (organization_id, record_id, version, record, actor, recorded_at, changed_fields,
+           written_in)
         SELECT organization_id, id, version, public.record_snapshot(r), 'system:x',
-               '2000-01-01T00:00:00Z', '{forged}'
+               '2000-01-01T00:00:00Z', '{forged}', '1'::xid8
         FROM public.records r WHERE ${where}`);
+      const [mine] = await q.rows<{ ours: boolean }>(sql`
+        SELECT written_in = pg_current_xact_id() AS ours FROM public.record_versions
+        WHERE organization_id = ${org}::uuid AND record_id = ${record.id}::uuid AND version = 2`);
+      expect(mine?.ours).toBe(true);
     });
     const v2 = ok(await readVersion(db, org, record.id, 2));
     expect(v2.changedFields).toEqual(["title"]);
@@ -699,8 +704,9 @@ describe("versions are append-only", () => {
       for (const statement of [
         "GRANT USAGE ON SCHEMA public TO %I",
         "GRANT SELECT ON ALL TABLES IN SCHEMA public TO %I",
+        "GRANT INSERT, UPDATE ON public.records TO %I",
         `GRANT INSERT, UPDATE, DELETE ON public.organizations, public.templates,
-           public.record_types, public.records, public.identifier_types,
+           public.record_types, public.identifier_types,
            public.identifier_holdings, public.record_identifiers, public.former_identifiers,
            public.identifier_counters, public.terms, public.record_term_index,
            public.record_terms TO %I`,
@@ -740,30 +746,39 @@ describe("versions are append-only", () => {
       ]) {
         expect((await refusal(app.execute(statement))).code).toBe(DENIED);
       }
-      // The reviewer's sequence: delete the record (now at version 2) and
-      // insert it again with exactly version 1's content, in one transaction.
+      // Deleting a record isn't versioned yet (T-032 adds tombstones), so the
+      // app role can't delete records at all.
+      expect(
+        (
+          await refusal(
+            app.execute(sql`DELETE FROM public.records
+                            WHERE organization_id = ${org}::uuid AND id = ${record.id}::uuid`),
+          )
+        ).code,
+      ).toBe(DENIED);
+      // History ahead of the row (the owner wound it back to version 1 with
+      // every check off): the app role reproducing stored version 2 exactly,
+      // number and content, still needs a version of its own transaction
+      // (written_in); without that check this would commit.
+      await tx(async (q) => {
+        await q.execute(sql`ALTER TABLE public.records DISABLE TRIGGER zzzz_records_version_step`);
+        await q.execute(sql`ALTER TABLE public.records DISABLE TRIGGER zzzz_records_have_version`);
+        await q.execute(sql`
+          UPDATE public.records SET title = ${record.title}, updated_at = ${T}::timestamptz,
+                                    version = 1
+          WHERE organization_id = ${org}::uuid AND id = ${record.id}::uuid`);
+        await q.execute(sql`ALTER TABLE public.records ENABLE TRIGGER zzzz_records_version_step`);
+        await q.execute(sql`ALTER TABLE public.records ENABLE TRIGGER zzzz_records_have_version`);
+      });
       expect(
         await refusal(
-          app.transaction(async (q) => {
-            await q.execute(sql`DELETE FROM public.records
-                                WHERE organization_id = ${org}::uuid AND id = ${record.id}::uuid`);
-            await q.execute(sql`
-              INSERT INTO public.records (id, organization_id, kind, template_key, title, fields,
-                                          created_at, updated_at)
-              VALUES (${record.id}::uuid, ${org}::uuid, 'object', 'spectrum-object',
-                      ${record.title}, ${JSON.stringify(record.fields)}::jsonb,
-                      ${T}::timestamptz, ${T}::timestamptz)`);
-          }),
-        ),
-      ).toEqual({ code: IDENTITY, constraint: "records_id_used_before" });
-      // The follow-on: an update reproducing stored version 2's content.
-      expect(
-        await refusal(
-          app.execute(sql`UPDATE public.records SET version = version + 1
-                          WHERE organization_id = ${org}::uuid AND id = ${record.id}::uuid`),
+          app.execute(sql`
+            UPDATE public.records SET title = 'By the app', updated_at = ${LATER}::timestamptz,
+                                      version = version + 1
+            WHERE organization_id = ${org}::uuid AND id = ${record.id}::uuid`),
         ),
       ).toEqual({ code: IDENTITY, constraint: "records_have_version" });
-      expect(ok(await readStoredRecord(app, org, record.id)).version).toBe(2);
+      expect(ok(await readStoredRecord(app, org, record.id)).version).toBe(1);
       // And it can't write a record without its version either.
       expect(
         await refusal(
