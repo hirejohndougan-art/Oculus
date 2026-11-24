@@ -838,6 +838,36 @@ describe("the writer role", () => {
         }
         expect({ revoke, found: await probeCodes() }).toEqual({ revoke, found: [] });
       }
+      // A grant option on another database of the server is refused too.
+      const otherDb = await freshDatabase();
+      try {
+        await run(
+          server,
+          "GRANT CONNECT ON DATABASE %I TO %I WITH GRANT OPTION",
+          otherDb.name,
+          probe,
+        );
+        const problems = await (async () => {
+          const fresh = as(s.testDb.url, probe);
+          try {
+            return await createService(fresh).checkConnection();
+          } finally {
+            await fresh.close();
+          }
+        })();
+        expect(problems.map((p) => p.code)).toEqual(["extra_privilege"]);
+        expect(problems[0]?.message).toContain(`database ${otherDb.name} CONNECT (grant option)`);
+        await run(
+          server,
+          "REVOKE GRANT OPTION FOR CONNECT ON DATABASE %I FROM %I",
+          otherDb.name,
+          probe,
+        );
+        expect(await probeCodes()).toEqual([]);
+        await run(server, "REVOKE CONNECT ON DATABASE %I FROM %I", otherDb.name, probe);
+      } finally {
+        await otherDb.drop();
+      }
       // Without the grant option, CONNECT and TEMPORARY to the role are fine.
       await run(server, "GRANT CONNECT, TEMPORARY ON DATABASE %I TO %I", db, probe);
       try {
@@ -1650,6 +1680,54 @@ describe("moving a record to another template (T-012a)", () => {
         ),
       ).version,
     ).toBe(2);
+  });
+});
+
+describe("restoring a version under another template (T-012a review)", () => {
+  it("lists an unchanged staff value that lands in a public field, and restores once confirmed", async () => {
+    await ready();
+    const org = await organization();
+    const staffNote = {
+      key: "later-public",
+      organizationId: org,
+      label: "Invented objects, published later",
+      appliesTo: ["object"],
+      fields: [field("note", "text")],
+    };
+    ok(await insertTemplateVersion(s.owner, staffNote));
+    const record = await create(org, {
+      ...objectDraft({ note: "Staff only: invented." }),
+      templateKey: "later-public",
+    });
+    // v2: moved to invented-object, where note is staff too: nothing to confirm.
+    const moved = ok(
+      await service.updateRecord(
+        ctx(org),
+        record.id,
+        draftOf(record, { templateKey: "invented-object" }),
+        { expectedVersion: 1 },
+      ),
+    );
+    expect(moved.version).toBe(2);
+    // The old template now publishes note.
+    ok(
+      await insertTemplateVersion(s.owner, {
+        ...staffNote,
+        fields: [field("note", "text", { visibility: "public" })],
+      }),
+    );
+    const refused = await service.restoreVersion(ctx(org), record.id, 1, { expectedVersion: 2 });
+    expect(codes(refused)).toEqual(["public_field_restored"]);
+    expect(messages(refused)).not.toContain("Staff only");
+    expect(await versionCount(org, record.id)).toBe(2);
+    const restored = await service.restoreVersion(ctx(org), record.id, 1, {
+      expectedVersion: 2,
+      confirmMadePublic: ["note"],
+    });
+    expect(restored.ok).toBe(true);
+    expect(ok(await readStoredRecord(s.owner, org, record.id)).record.templateKey).toBe(
+      "later-public",
+    );
   });
 });
 

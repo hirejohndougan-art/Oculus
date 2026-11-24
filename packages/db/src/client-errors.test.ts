@@ -83,6 +83,18 @@ describe("database failures and programming errors (S-016)", () => {
       coded("ECONNRESET", { syscall: "read" }),
       new Error("Connection terminated unexpectedly"),
       new Error("timeout exceeded when trying to connect"),
+      coded("53300"),
+      coded("58P01"),
+      coded("08001"),
+      // A name lookup that failed for now (an underscore in the code).
+      coded("EAI_AGAIN", { syscall: "getaddrinfo" }),
+      // Node's dual-stack connect: an AggregateError with the code and no
+      // syscall, or one whose errors are all socket failures.
+      Object.assign(new AggregateError([], "connect failed"), { code: "ECONNREFUSED" }),
+      new AggregateError(
+        [coded("ECONNREFUSED", { syscall: "connect" }), coded("ETIMEDOUT", { syscall: "connect" })],
+        "connect failed",
+      ),
     ]) {
       expect({ failure: String(failure), is: isDatabaseFailure(failure) }).toEqual({
         failure: String(failure),
@@ -93,6 +105,20 @@ describe("database failures and programming errors (S-016)", () => {
     // syscall, TypeErrors, plain errors, non-errors.
     for (const other of [
       coded("ERR_INVALID_ARG_TYPE"),
+      coded("ERR_SOCKET_BAD_PORT", { syscall: "connect" }),
+      // Programming and data errors the server reports are not outages.
+      coded("42601"),
+      coded("42P01"),
+      coded("42501"),
+      coded("23505"),
+      coded("22012"),
+      coded("P0001"),
+      new AggregateError(
+        [coded("ECONNREFUSED", { syscall: "connect" }), new TypeError("x")],
+        "mixed",
+      ),
+      new AggregateError([], "empty"),
+      Object.assign(new AggregateError([], "bug"), { code: "ERR_INVALID_ARG_TYPE" }),
       coded("ERR_TLS_CERT_ALTNAME_INVALID", { syscall: "connect" }),
       coded("ECONNREFUSED"),
       coded("not_a_code"),

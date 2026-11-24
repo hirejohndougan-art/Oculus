@@ -272,11 +272,15 @@ function publicValueIssues(
   template: FieldTemplate,
 ): Issue[] {
   const problems: Issue[] = [];
+  const moved = candidate.templateKey !== stored.templateKey;
   for (const field of template.fields) {
     if (field.visibility !== "public" || !Object.hasOwn(candidate.fields, field.key)) continue;
     const value = candidate.fields[field.key];
     const now = Object.hasOwn(stored.fields, field.key) ? stored.fields[field.key] : undefined;
-    if (value === undefined || (now !== undefined && sameJson(value, now))) continue;
+    // Restoring a version under another template is a move (T-012a): a value
+    // unchanged from today's was stored under that template, where it may
+    // have been staff, so it is listed too.
+    if (value === undefined || (!moved && now !== undefined && sameJson(value, now))) continue;
     problems.push(
       issue(
         ["fields", field.key],

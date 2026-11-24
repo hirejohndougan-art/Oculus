@@ -190,13 +190,26 @@ const CONNECTION_FAILURES = new Set([
 ]);
 
 /**
+ * SQLSTATE classes that mean the database or the connection failed, not the
+ * query (S-016): 08 connection exception, 40 transaction rollback (deadlock,
+ * serialization), 53 insufficient resources, 57 operator intervention
+ * (shutdown, cancel, timeout), 58 system error, XX internal error. Others
+ * (42 syntax or permission, 22 data, 23 constraints …) are programming or
+ * data errors and are rethrown.
+ */
+const FAILURE_CLASSES = new Set(["08", "40", "53", "57", "58", "XX"]);
+
+/**
  * Whether `error` is the database's or the network's failure (answered with
  * a fixed refusal such as `database_unavailable`), rather than a programming
  * error, which callers rethrow (S-016). True for:
- * - an error the server sent, with a five-character SQLSTATE `code`;
+ * - an error the server sent whose SQLSTATE is in `FAILURE_CLASSES`;
  * - `ConnectionLostError` (SQLSTATE 08006);
- * - a Node system error from the socket (`code` such as `ECONNREFUSED` or
- *   `ENOENT` for a missing Unix socket, with a `syscall`);
+ * - a Node system error from the socket or name lookup (`code` such as
+ *   `ECONNREFUSED`, `ENOENT` for a missing Unix socket or `EAI_AGAIN`, with
+ *   a `syscall`);
+ * - an `AggregateError` (Node's dual-stack connect tries each address) whose
+ *   `code` is such an `E…` code, or whose errors all are failures;
  * - pg's own code-less connection errors (`CONNECTION_FAILURES`).
  * False for everything else, including Node's `ERR_*` codes (an invalid
  * argument, a TLS misconfiguration), TypeErrors and our own errors.
@@ -205,9 +218,16 @@ export function isDatabaseFailure(error: unknown): boolean {
   if (error instanceof ConnectionLostError) return true;
   if (typeof error !== "object" || error === null) return false;
   const { code, syscall } = error as { code?: unknown; syscall?: unknown };
+  const systemCode =
+    typeof code === "string" && /^E[A-Z0-9_]+$/.test(code) && !code.startsWith("ERR_");
+  if (error instanceof AggregateError) {
+    if (systemCode) return true;
+    const errors: unknown = error.errors;
+    return Array.isArray(errors) && errors.length > 0 && errors.every((e) => isDatabaseFailure(e));
+  }
   if (typeof code === "string") {
-    if (/^[0-9A-Z]{5}$/.test(code)) return true;
-    return /^E[A-Z0-9]+$/.test(code) && typeof syscall === "string";
+    if (/^[0-9A-Z]{5}$/.test(code) && FAILURE_CLASSES.has(code.slice(0, 2))) return true;
+    return systemCode && typeof syscall === "string";
   }
   return (
     code === undefined &&

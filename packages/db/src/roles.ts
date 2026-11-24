@@ -164,7 +164,7 @@ function listed(items: readonly string[]): string {
  * It must also own nothing anywhere in this database or shared
  * (`pg_shdepend`: subscriptions, large objects, servers, publications …),
  * hold privileges on nothing but public's tables, schema public and
- * databases, have no GRANT OPTION (on tables, the database or schema
+ * databases, have no GRANT OPTION (on tables, any database or schema
  * public: it could hand its privileges on), and have no session settings
  * but `ALLOWED_ROLE_SETTINGS` (nor may every role have
  * `session_replication_role` set). Temporary objects of its sessions are
@@ -245,14 +245,13 @@ export async function checkWriterConnection(db: Queryable): Promise<WriterRolePr
                             OR EXISTS (SELECT 1 FROM allowed a
                                        WHERE a.table_name = t.relname
                                          AND a.privilege = (t.acl).privilege_type))))
-           -- A grant option on the database or schema public (S-015): it
+           -- A grant option on any database or on schema public (S-015): it
            -- could hand CONNECT, TEMPORARY or USAGE on to other roles. PUBLIC
            -- can't hold grant options.
-           || ARRAY(SELECT 'database ' || x.privilege_type || ' (grant option)'
+           || ARRAY(SELECT 'database ' || d.datname || ' ' || x.privilege_type || ' (grant option)'
                     FROM pg_catalog.pg_database d,
                          pg_catalog.aclexplode(COALESCE(d.datacl, pg_catalog.acldefault('d', d.datdba))) AS x
-                    WHERE d.datname = pg_catalog.current_database()
-                      AND x.grantee = w.oid AND x.is_grantable)
+                    WHERE x.grantee = w.oid AND x.is_grantable)
            || ARRAY(SELECT 'schema public ' || x.privilege_type || ' (grant option)'
                     FROM pg_catalog.pg_namespace n,
                          pg_catalog.aclexplode(COALESCE(n.nspacl, pg_catalog.acldefault('n', n.nspowner))) AS x
