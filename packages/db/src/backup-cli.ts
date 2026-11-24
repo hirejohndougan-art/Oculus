@@ -172,6 +172,9 @@ export async function runRestoreCli(
   }
 }
 
+/** Signals this close to the first are the same stop (one Ctrl-C can arrive twice). */
+export const SAME_STOP_MS = 1000;
+
 const command = process.argv[1];
 if (command !== undefined && import.meta.url === pathToFileURL(command).href) {
   const [verb, ...rest] = process.argv.slice(2);
@@ -187,11 +190,18 @@ if (command !== undefined && import.meta.url === pathToFileURL(command).href) {
     // committed, a stop can't undo the restore, so the check of the restored
     // database is let finish (no grace period); a second signal then exits 3
     // saying the database was restored but NOT checked.
+    // One Ctrl-C can arrive as two signals a few milliseconds apart (the
+    // terminal's to the whole process group, and npm or a service manager
+    // passing its own on), so signals within SAME_STOP_MS of the first are the
+    // same stop; only a later one counts as a second. Once the command has
+    // finished, signals are ignored, so none can replace its exit code.
     // (OCULUS_STOP_GRACE_MS shortens the grace, for tests.)
     const grace = Number(process.env.OCULUS_STOP_GRACE_MS ?? "") || 30_000;
     const controller = new AbortController();
     let committed = false;
     let stopAsked = false;
+    let firstStopAt = 0;
+    let finished = false;
     let graceTimer: NodeJS.Timeout | undefined;
     const finishing = (): void => {
       console.error(
@@ -200,6 +210,9 @@ if (command !== undefined && import.meta.url === pathToFileURL(command).href) {
     };
     for (const name of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
       process.on(name, () => {
+        if (finished) return;
+        if (stopAsked && Date.now() - firstStopAt < SAME_STOP_MS) return;
+        if (!stopAsked) firstStopAt = Date.now();
         if (committed) {
           if (stopAsked) {
             console.error(
@@ -241,6 +254,7 @@ if (command !== undefined && import.meta.url === pathToFileURL(command).href) {
       },
       { signal: controller.signal, onCommitted },
     );
+    finished = true;
     process.exitCode = code;
   }
 }

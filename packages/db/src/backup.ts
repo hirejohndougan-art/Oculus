@@ -346,7 +346,7 @@ async function runTool(
 // The manifest and the file format.
 
 export const BACKUP_FORMAT = "oculus-backup";
-export const BACKUP_FORMAT_VERSION = 1;
+export const BACKUP_FORMAT_VERSION = 2;
 /** The last 16 bytes of every backup file. */
 export const TRAILER_MAGIC = "OCULUS-BACKUP-01";
 /** 8 bytes of manifest length, 32 of its SHA-256, 16 of magic. */
@@ -391,7 +391,9 @@ export function manifestProblem(value: unknown): string | undefined {
   ];
   if (value.format !== BACKUP_FORMAT) return "it is not an Oculus backup manifest";
   if (value.formatVersion !== BACKUP_FORMAT_VERSION) {
-    return `its format version is not ${String(BACKUP_FORMAT_VERSION)}`;
+    return typeof value.formatVersion === "number" && value.formatVersion < BACKUP_FORMAT_VERSION
+      ? `its format version is ${String(value.formatVersion)}, from an earlier version of Oculus; restore it with the version of Oculus that made it`
+      : `its format version is not ${String(BACKUP_FORMAT_VERSION)}`;
   }
   if (!exactKeys(value, keys)) return "it does not have exactly the expected fields";
   if (typeof value.createdAt !== "string" || Number.isNaN(Date.parse(value.createdAt))) {
@@ -907,7 +909,62 @@ export async function restoreRoleProblems(db: Queryable): Promise<string[]> {
   if (row.replication) reasons.push(`${who} has REPLICATION`);
   if (row.bypassrls) reasons.push(`${who} has BYPASSRLS`);
   for (const role of row.memberOf) reasons.push(`${who} is a member of ${role}`);
+  const granted = await db.rows<{ kind: string; n: number }>(sql`
+    WITH me AS (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = SESSION_USER),
+    sys AS (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname IN ('pg_catalog', 'information_schema')),
+    entries AS (
+      SELECT 'server parameters' AS kind, x.grantee
+      FROM pg_catalog.pg_parameter_acl p, pg_catalog.aclexplode(p.paracl) AS x
+      UNION ALL
+      SELECT 'tablespaces', x.grantee FROM pg_catalog.pg_tablespace t, pg_catalog.aclexplode(t.spcacl) AS x
+      WHERE x.grantee <> t.spcowner
+      UNION ALL
+      SELECT 'other databases', x.grantee FROM pg_catalog.pg_database d, pg_catalog.aclexplode(d.datacl) AS x
+      WHERE d.datname <> pg_catalog.current_database() AND x.grantee <> d.datdba
+      UNION ALL
+      SELECT 'system functions', x.grantee FROM pg_catalog.pg_proc p, pg_catalog.aclexplode(p.proacl) AS x
+      WHERE p.pronamespace IN (SELECT oid FROM sys) AND x.grantee <> p.proowner
+      UNION ALL
+      SELECT 'system tables and views', x.grantee FROM pg_catalog.pg_class c, pg_catalog.aclexplode(c.relacl) AS x
+      WHERE c.relnamespace IN (SELECT oid FROM sys) AND x.grantee <> c.relowner
+      UNION ALL
+      SELECT 'system types', x.grantee FROM pg_catalog.pg_type t, pg_catalog.aclexplode(t.typacl) AS x
+      WHERE t.typnamespace IN (SELECT oid FROM sys) AND x.grantee <> t.typowner
+      UNION ALL
+      SELECT 'system schemas', x.grantee FROM pg_catalog.pg_namespace n, pg_catalog.aclexplode(n.nspacl) AS x
+      WHERE n.oid IN (SELECT oid FROM sys) AND x.grantee <> n.nspowner
+      UNION ALL
+      SELECT 'languages', x.grantee FROM pg_catalog.pg_language l, pg_catalog.aclexplode(l.lanacl) AS x
+      WHERE x.grantee <> l.lanowner
+      UNION ALL
+      SELECT 'large objects', x.grantee FROM pg_catalog.pg_largeobject_metadata m, pg_catalog.aclexplode(m.lomacl) AS x
+      WHERE x.grantee <> m.lomowner
+      UNION ALL
+      SELECT 'foreign-data wrappers', x.grantee FROM pg_catalog.pg_foreign_data_wrapper w, pg_catalog.aclexplode(w.fdwacl) AS x
+      WHERE x.grantee <> w.fdwowner
+      UNION ALL
+      SELECT 'foreign servers', x.grantee FROM pg_catalog.pg_foreign_server f, pg_catalog.aclexplode(f.srvacl) AS x
+      WHERE x.grantee <> f.srvowner
+    )
+    SELECT kind, pg_catalog.count(*)::pg_catalog.int4 AS n FROM entries
+    WHERE grantee = (SELECT oid FROM me)
+    GROUP BY kind ORDER BY kind`);
+  for (const entry of granted) {
+    reasons.push(`${who} has privileges granted on ${entry.kind} (${String(entry.n)})`);
+  }
   return reasons;
+}
+
+/**
+ * The restoring role's own settings (ALTER ROLE ... SET, for every database
+ * and for each), as lines: a restore must not change them.
+ */
+async function roleSettings(db: Queryable): Promise<string[]> {
+  const rows = await db.rows<{ line: string }>(sql`
+    SELECT s.setdatabase::pg_catalog.text || ' ' || pg_catalog.array_to_string(s.setconfig, ',') AS line
+    FROM pg_catalog.pg_db_role_setting s
+    WHERE s.setrole = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = SESSION_USER)`);
+  return sorted(rows.map((r) => r.line));
 }
 
 /** Restores a backup into an empty database and checks the result against its manifest. */
@@ -966,7 +1023,7 @@ export async function restore(options: RestoreOptions): Promise<RestoreResult> {
       if (options.allowSuperuser !== true) {
         throw new BackupError(
           "superuser",
-          `The role in OCULUS_DATABASE_URL is not a plain role (${problems.join("; ")}), so the backup's SQL could run with more than a database owner's powers. Restore as a dedicated role with nothing else: CREATE ROLE oculus_restore LOGIN; CREATE DATABASE oculus OWNER oculus_restore TEMPLATE template0; then restore with that role in OCULUS_DATABASE_URL. (--allow-superuser overrides this, if you must.)`,
+          `The role in OCULUS_DATABASE_URL is not a plain role (${problems.join("; ")}), so the backup's SQL could run with more than a database owner's powers. Restore as a dedicated role that has nothing else, made by an administrator: CREATE ROLE oculus_restore LOGIN PASSWORD '...'; GRANT oculus_restore TO <your admin role>; CREATE DATABASE oculus OWNER oculus_restore TEMPLATE template0; then put oculus_restore in OCULUS_DATABASE_URL. (On PostgreSQL 16 and newer, and on managed hosts where the admin isn't a superuser, the admin must be a member of oculus_restore to make it a database's owner; that grant gives the admin oculus_restore's rights, not the other way round, so oculus_restore stays plain.) --allow-superuser overrides this check, if you must.`,
         );
       }
       log(
@@ -995,6 +1052,7 @@ export async function restore(options: RestoreOptions): Promise<RestoreResult> {
       );
     }
     if (stopped(signal)) throw interrupted("nothing was restored.");
+    const roleBefore = { problems, settings: await roleSettings(session) };
 
     log(`Restoring a backup of PostgreSQL ${manifest.serverVersion} made ${manifest.createdAt}...`);
     const restored = await runTool(
@@ -1040,7 +1098,7 @@ export async function restore(options: RestoreOptions): Promise<RestoreResult> {
     // asked for meanwhile, since it is what says whether the restore is good.
     options.onCommitted?.();
     log("Checking the restored database against the manifest...");
-    await verify(session, manifest, options.noPrivileges === true);
+    await verify(session, manifest, options.noPrivileges === true, roleBefore);
     return { manifest, pending, stoppedAfterCommit };
   } finally {
     await session?.close().catch(() => undefined);
@@ -1117,12 +1175,18 @@ export async function streamArchive(
 }
 
 /**
- * Waits (up to 60 s) until no session of this database with the given
+ * Waits (up to SESSION_WAIT_MS) until no session of this database with the given
  * application_name is left, so a stopped pg_restore's transaction has ended
  * on the server, one way or the other, before its outcome is read.
  */
+/**
+ * How long to wait for a stopped pg_restore's server session: less than the
+ * command's 30-second grace period, so the answer comes before a forced exit.
+ */
+export const SESSION_WAIT_MS = 20_000;
+
 async function sessionEnded(db: Queryable, applicationName: string): Promise<void> {
-  const deadline = Date.now() + 60_000;
+  const deadline = Date.now() + SESSION_WAIT_MS;
   for (;;) {
     const rows = await db.rows(sql`
       SELECT 1 FROM pg_catalog.pg_stat_activity
@@ -1132,7 +1196,7 @@ async function sessionEnded(db: Queryable, applicationName: string): Promise<voi
     if (Date.now() > deadline) {
       throw new BackupError(
         "restore_failed",
-        "pg_restore ended, but its session on the server is still open after 60 seconds, so whether it committed is not known. Check the target database before using it.",
+        `pg_restore ended, but its session on the server is still open after ${String(SESSION_WAIT_MS / 1000)} seconds, so whether it committed is not yet known. A session whose client was killed during a long statement ends, and rolls back, only when that statement finishes; nothing is committed unless pg_restore had reached its COMMIT. Watch pg_stat_activity for application_name 'oculus-restore' and check the target database before using it.`,
       );
     }
     await new Promise((resolveWait) => setTimeout(resolveWait, 50));
@@ -1158,8 +1222,21 @@ async function verify(
   db: Queryable,
   manifest: BackupManifest,
   noPrivileges: boolean,
+  roleBefore: { problems: string[]; settings: string[] },
 ): Promise<void> {
   const problems: string[] = [];
+  // The archive's SQL runs as the restoring role: it must not have changed
+  // that role's settings or given it anything (its password can't be seen;
+  // use a dedicated role).
+  const settingsAfter = await roleSettings(db);
+  if (settingsAfter.join("\n") !== roleBefore.settings.join("\n")) {
+    problems.push("the restoring role's own settings changed during the restore");
+  }
+  for (const reason of await restoreRoleProblems(db)) {
+    if (!roleBefore.problems.includes(reason)) {
+      problems.push(`the restoring role changed during the restore: ${reason}`);
+    }
+  }
   const migrations = (await appliedMigrations(db)) ?? [];
   const wanted = manifest.migrations.map((m) => `${m.name} ${m.sha256}`).join("\n");
   if (migrations.map((m) => `${m.name} ${m.sha256}`).join("\n") !== wanted) {

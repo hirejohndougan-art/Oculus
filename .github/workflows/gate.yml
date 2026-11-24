@@ -66,13 +66,13 @@ jobs:
           PG_MAJOR: ${{ matrix.postgres }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y postgresql-common
+          sudo apt-get install -y --no-install-recommends postgresql-common
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
           # The server package too: the password test starts its own
           # throwaway scram-sha-256 server with initdb and pg_ctl (D-064).
           # No cluster is created or started by the package.
           echo "create_main_cluster = false" | sudo tee -a /etc/postgresql-common/createcluster.conf
-          sudo apt-get install -y "postgresql-client-$PG_MAJOR" "postgresql-$PG_MAJOR"
+          sudo apt-get install -y --no-install-recommends "postgresql-client-$PG_MAJOR" "postgresql-$PG_MAJOR"
           echo "PG_BIN=/usr/lib/postgresql/$PG_MAJOR/bin" >> "$GITHUB_ENV"
           "/usr/lib/postgresql/$PG_MAJOR/bin/pg_dump" --version
           "/usr/lib/postgresql/$PG_MAJOR/bin/initdb" --version

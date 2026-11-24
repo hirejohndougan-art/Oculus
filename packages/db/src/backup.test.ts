@@ -58,7 +58,7 @@ import {
   type BackupManifest,
 } from "./backup.js";
 import { contentsOf, tableSummaries } from "./backup-catalog.js";
-import { filePath, hideSecrets, runBackupCli, runRestoreCli } from "./backup-cli.js";
+import { filePath, hideSecrets, runBackupCli, runRestoreCli, SAME_STOP_MS } from "./backup-cli.js";
 import {
   ConnectionError,
   MAX_SERVICE_LINE,
@@ -121,6 +121,8 @@ afterAll(async () => {
       DROP ROLE IF EXISTS oculus_t052_replicator;
       DROP ROLE IF EXISTS oculus_t052_bypass;
       DROP ROLE IF EXISTS oculus_t052_subscriber;
+      DROP ROLE IF EXISTS oculus_t052_reader2;
+      DROP ROLE IF EXISTS oculus_t052_param;
       DROP ROLE IF EXISTS oculus_t052_gone;
     EXCEPTION WHEN dependent_objects_still_exist THEN NULL; END $$`),
   ).catch(() => undefined);
@@ -1693,7 +1695,7 @@ function command(
 }
 
 describe("the command stopped twice, or forced to exit", () => {
-  it("leaves no tool, partial file or private file after a double Ctrl-C mid-backup", async () => {
+  it("leaves no tool, partial file or private file after a second Ctrl-C mid-backup", async () => {
     const script = await compiledCli();
     const { testDb } = await populated();
     const dir = await directory();
@@ -1715,6 +1717,8 @@ describe("the command stopped twice, or forced to exit", () => {
     run.child.kill("SIGINT");
     await until(() => run.output().includes("Stopping (SIGINT)"));
     expect(alive(pid)).toBe(true);
+    // A second Ctrl-C (more than SAME_STOP_MS after the first).
+    await new Promise((r) => setTimeout(r, SAME_STOP_MS + 200));
     run.child.kill("SIGINT");
     expect(await run.exited).toBe(1);
     expect(run.output()).toContain("Stopping at once");
@@ -1794,42 +1798,113 @@ function bigBackup(): Promise<{ file: string }> {
   return big;
 }
 
+/**
+ * A PG_BIN whose pg_restore, once the real one has committed, leaves a
+ * session holding an exclusive lock on public.oculus_migrations for 4 s, so
+ * the check that follows waits: a stop can be sent during the check for sure.
+ */
+async function slowCheckTools(): Promise<string> {
+  const psql = join(await findTools(process.env, ["psql"]), "psql");
+  return wrappedTools(
+    (_tool, real) => `'${real}' "$@" || exit $?
+'${psql}' "service=oculus_backup" -qAt -c "BEGIN" -c "LOCK TABLE public.oculus_migrations IN ACCESS EXCLUSIVE MODE" -c "SELECT pg_catalog.pg_sleep(4)" -c "COMMIT" >/dev/null 2>&1 &
+until [ "$('${psql}' "service=oculus_backup" -qAtc "SELECT pg_catalog.count(*) FROM pg_catalog.pg_locks WHERE relation = 'public.oculus_migrations'::pg_catalog.regclass AND mode = 'AccessExclusiveLock' AND granted")" = 1 ]; do sleep 0.05; done`,
+  );
+}
+
 describe("a stop while the restored database is being checked", () => {
-  it("lets the check finish, ignoring the grace period, and exits 0 when it passes", async () => {
+  const start = async (): Promise<ReturnType<typeof command>> => {
     const script = await compiledCli();
-    const { file } = await bigBackup();
+    const { file } = await sharedBackup();
     const target = await emptyTarget();
     const run = command([script, "restore", file], {
       ...process.env,
       OCULUS_DATABASE_URL: target.url,
       OCULUS_STOP_GRACE_MS: "50",
+      PG_BIN: await slowCheckTools(),
     });
     await until(() => run.output().includes("Checking the restored database"), 30_000);
+    return run;
+  };
+  const twice = async (run: ReturnType<typeof command>, gapMs: number): Promise<void> => {
+    run.child.kill("SIGTERM");
+    await new Promise((r) => setTimeout(r, gapMs));
+    run.child.kill("SIGINT");
+  };
+
+  it("lets the check finish, ignoring the grace period, and exits 0 when it passes", async () => {
+    const run = await start();
     run.child.kill("SIGTERM");
     expect(await run.exited, run.output()).toBe(0);
     expect(run.output()).toContain("finishing the check of the restored database");
     expect(run.output()).toContain("Done: restored and checked");
   }, 90_000);
 
-  it("exits 3, saying the database is restored but NOT checked, on a second signal", async () => {
-    const script = await compiledCli();
-    const { file } = await bigBackup();
-    const target = await emptyTarget();
-    const run = command([script, "restore", file], {
-      ...process.env,
-      OCULUS_DATABASE_URL: target.url,
-      OCULUS_STOP_GRACE_MS: "50",
-    });
-    await until(() => run.output().includes("Checking the restored database"), 30_000);
-    run.child.kill("SIGTERM");
-    await until(() => run.output().includes("finishing the check"));
-    run.child.kill("SIGINT");
+  it("takes two signals 2 ms apart (one Ctrl-C under npm) as one stop", async () => {
+    const run = await start();
+    await twice(run, 2);
+    expect(await run.exited, run.output()).toBe(0);
+    expect(run.output().split("finishing the check").length - 1).toBe(1);
+    expect(run.output()).not.toContain("NOT checked");
+    expect(run.output()).toContain("Done: restored and checked");
+  }, 90_000);
+
+  it("exits 3, saying the database is restored but NOT checked, on a signal 1.5 s after the first", async () => {
+    const run = await start();
+    await twice(run, 1500);
     expect(await run.exited, run.output()).toBe(3);
     expect(run.output()).toContain("restored but NOT checked");
   }, 90_000);
 });
 
 describe("the npm scripts", () => {
+  it("from the repository root, exec node, so SIGTERM to npm reaches it and leaves nothing", async () => {
+    const { testDb } = await populated();
+    const here = dirname(fileURLToPath(import.meta.url));
+    const root = join(here, "..", "..", "..");
+    const dir = await directory();
+    const pidFile = join(await directory(), "dump.pid");
+    const bin = await wrappedTools(
+      (_tool, real) => `'${real}' "$@" || exit $?\necho $$ > '${pidFile}'\nsleep 60`,
+    );
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter(([key]) => !key.toLowerCase().startsWith("npm_")),
+    );
+    const npm = spawn("npm", ["run", "--silent", "db:backup", "--", join(dir, "x.oculus-backup")], {
+      cwd: root,
+      env: { ...env, OCULUS_DATABASE_URL: testDb.url, PG_BIN: bin },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    const collect = (d: Buffer): void => {
+      output += d.toString();
+    };
+    npm.stdout.on("data", collect);
+    npm.stderr.on("data", collect);
+    const exited = new Promise<number | null>((r) => {
+      npm.on("close", (code) => {
+        r(code);
+      });
+    });
+    await until(() => existsSync(pidFile), 110_000);
+    const tool = Number((await readFile(pidFile, "utf8")).trim());
+    // npm's only child is node itself: one npm, its shell exec'd away.
+    const children = execFileSync("ps", ["-o", "pid=,args=", "--ppid", String(npm.pid)], {
+      encoding: "utf8",
+    })
+      .trim()
+      .split("\n")
+      .map((l) => l.trim());
+    expect(children, output).toHaveLength(1);
+    const [pid, ...args] = (children[0] ?? "").split(/\s+/);
+    expect(args.join(" ")).toMatch(/^node packages\/db\/dist\/backup-cli\.js backup /);
+    npm.kill("SIGTERM");
+    expect(await exited, output).not.toBe(0);
+    await until(() => !alive(tool) && !alive(Number(pid)));
+    expect(output).toContain("Backup stopped (interrupted)");
+    expect(await readdir(dir)).toEqual([]);
+  }, 180_000);
+
   it("exec node, so a signal to what npm started reaches the command and leaves nothing", async () => {
     const { testDb } = await populated();
     const here = dirname(fileURLToPath(import.meta.url));
@@ -1915,5 +1990,74 @@ db=$('${psql}' "service=oculus_backup" -qAtc "SELECT pg_catalog.current_database
     expect(refused.message).toContain("public.t052_f()");
     expect(await contentsOf(pool(target.url))).toEqual({});
     await restore({ connectionString: target.url, file });
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// Fourth review (D-064): privileges granted to the role itself, the role's
+// own settings, and the manifest's format version.
+
+describe("the restoring role's own privileges and settings", () => {
+  it("refuses a role with privileges on server parameters or system functions", async () => {
+    const { file } = await sharedBackup();
+    await role("oculus_t052_param", [
+      "GRANT ALTER SYSTEM ON PARAMETER archive_command TO oculus_t052_param",
+    ]);
+    cleanups.push(() =>
+      admin((s) =>
+        s.runScript("REVOKE ALTER SYSTEM ON PARAMETER archive_command FROM oculus_t052_param"),
+      ),
+    );
+    const param = await targetOwnedBy("oculus_t052_param");
+    const refused = await refusal(restore({ connectionString: param.url, file }));
+    expect(refused.code).toBe("superuser");
+    expect(refused.message).toContain("has privileges granted on server parameters");
+    expect(refused.message).toContain("GRANT oculus_restore TO <your admin role>");
+
+    await role("oculus_t052_reader2");
+    const reader = await targetOwnedBy("oculus_t052_reader2");
+    const setup = await openSession(reader.testDb.url, "t052-setup");
+    try {
+      await setup.runScript(
+        "GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) TO oculus_t052_reader2",
+      );
+    } finally {
+      await setup.close();
+    }
+    const functions = await refusal(restore({ connectionString: reader.url, file }));
+    expect(functions.code).toBe("superuser");
+    expect(functions.message).toContain("has privileges granted on system functions");
+  }, 60_000);
+
+  it("reports a restore that changed the restoring role's own settings", async () => {
+    const { file } = await sharedBackup();
+    const psql = join(await findTools(process.env, ["psql"]), "psql");
+    const bin = await wrappedTools(
+      (_tool, real) => `'${real}' "$@" || exit $?
+'${psql}' "service=oculus_backup" -qc "ALTER ROLE CURRENT_USER SET work_mem = '3MB'" >/dev/null`,
+    );
+    const target = await emptyTarget();
+    cleanups.push(() => admin((s) => s.runScript(`ALTER ROLE ${RESTORER} RESET ALL`)));
+    try {
+      const refused = await refusal(
+        restore({ connectionString: target.url, file, env: { ...process.env, PG_BIN: bin } }),
+      );
+      expect(refused.code).toBe("verify_failed");
+      expect(refused.message).toContain("the restoring role's own settings changed");
+    } finally {
+      await admin((s) => s.runScript(`ALTER ROLE ${RESTORER} RESET ALL`));
+    }
+  }, 60_000);
+
+  it("refuses a manifest of an earlier format, saying so", async () => {
+    const { file, dir } = await sharedBackup();
+    const old = await copyOf(file, dir, "format-1");
+    await rewriteManifest(old, (m) => {
+      (m as unknown as { formatVersion: number }).formatVersion = 1;
+    });
+    const target = await emptyTarget();
+    const refused = await refusal(restore({ connectionString: target.url, file: old }));
+    expect(refused.code).toBe("bad_file");
+    expect(refused.message).toContain("format version is 1, from an earlier version of Oculus");
   }, 60_000);
 });
