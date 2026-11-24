@@ -29,6 +29,7 @@ import {
 import {
   loadAccess,
   lockArrangement,
+  readRecordPlace,
   unitsHolding,
   type Queryable,
   type RecordPosition,
@@ -91,10 +92,11 @@ export async function readAccess(
   tx: Queryable,
   organizationId: OrganizationId,
   actor: string,
+  options: { readonly lock?: boolean } = {},
 ): Promise<{ readonly ok: true; readonly value: Access; readonly userId: UserId } | Refusal> {
   const userId = actorUser(actor);
   if (userId === undefined) return notPermitted();
-  const access = await loadAccess(tx, organizationId, userId);
+  const access = await loadAccess(tx, organizationId, userId, options);
   if (access === undefined || (!access.systemManager && access.grants.length === 0)) {
     return notPermitted();
   }
@@ -107,6 +109,13 @@ export async function readAccess(
  * question takes the organization's arrangement lock (before any record
  * row lock, as D-065 orders them), so no unit moves until COMMIT. Anyone
  * else is asked about the whole catalog only and takes no lock.
+ *
+ * The lock is exclusive for an operation that writes (`mode: "write"`), and
+ * shared for one that only reads (`"read"`): scoped reads then run side by
+ * side, while every move (which holds the lock exclusively, D-065 and
+ * service.ts) still waits for them, and they for it, so a read never sees
+ * a move half done. A write keeps it exclusive because it may move what it
+ * writes, and a shared lock can't safely be raised to an exclusive one.
  */
 export class RecordAccess {
   private locked = false;
@@ -115,7 +124,13 @@ export class RecordAccess {
     private readonly tx: Queryable,
     private readonly organizationId: OrganizationId,
     readonly access: Access,
+    private readonly mode: "write" | "read" = "write",
   ) {}
+
+  /** Whether the person's checks depend on where records sit (any scoped grant). */
+  get scoped(): boolean {
+    return hasScopedGrants(this.access);
+  }
 
   /**
    * Takes the arrangement lock now if the person has scoped grants, so
@@ -124,7 +139,11 @@ export class RecordAccess {
    */
   async settle(): Promise<void> {
     if (!hasScopedGrants(this.access) || this.locked) return;
-    await lockArrangement(this.tx, this.organizationId);
+    await lockArrangement(
+      this.tx,
+      this.organizationId,
+      this.mode === "read" ? "shared" : "exclusive",
+    );
     this.locked = true;
   }
 
@@ -155,6 +174,29 @@ export class RecordAccess {
     if (!all.every((p) => permits(this.access, p, target))) return notPermitted();
     if (any.length > 0 && !this.allows(any, target)) return notPermitted();
     return undefined;
+  }
+
+  /**
+   * Of `ids`, the records that exist and that the actor may not view (none
+   * for someone with no scoped grant who may view the whole catalog). A link
+   * to one of them is answered as a link to a record that doesn't exist.
+   */
+  async hiddenAmong(ids: readonly RecordId[]): Promise<ReadonlySet<RecordId>> {
+    const hidden = new Set<RecordId>();
+    if (ids.length === 0) return hidden;
+    if (!this.scoped && permits(this.access, "records.view", { on: "catalog" })) return hidden;
+    for (const id of [...new Set(ids)].sort()) {
+      const place = await readRecordPlace(this.tx, this.organizationId, id);
+      if (place === undefined) continue;
+      const target = await this.target({
+        kind: place.kind,
+        id,
+        parentId: place.parentId,
+        represents: place.represents,
+      });
+      if (!permits(this.access, "records.view", target)) hidden.add(id);
+    }
+    return hidden;
   }
 
   /**

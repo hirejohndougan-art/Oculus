@@ -79,12 +79,22 @@ export async function loadAccess(
   db: Queryable,
   organizationId: OrganizationId,
   userId: UserId,
+  options: { readonly lock?: boolean } = {},
 ): Promise<Access | undefined> {
   if (!isOrganizationId(organizationId) || !isUserId(userId)) return undefined;
-  const [user] = await db.rows<{ system_admin: boolean; active: boolean }>(sql`
-    SELECT system_admin, disabled_at IS NULL AS active FROM public.users
-    WHERE id = ${userId}::uuid
-    FOR SHARE`);
+  // `lock: false` reads without locking, for a first look that is read again
+  // under a lock before anything is changed (a role change locks the
+  // people's rows FOR NO KEY UPDATE itself, so it must not hold FOR SHARE on
+  // them first: two such changes would then deadlock on the upgrade).
+  const [user] =
+    options.lock === false
+      ? await db.rows<{ system_admin: boolean; active: boolean }>(sql`
+          SELECT system_admin, disabled_at IS NULL AS active FROM public.users
+          WHERE id = ${userId}::uuid`)
+      : await db.rows<{ system_admin: boolean; active: boolean }>(sql`
+          SELECT system_admin, disabled_at IS NULL AS active FROM public.users
+          WHERE id = ${userId}::uuid
+          FOR SHARE`);
   if (!user?.active) return undefined;
   const rows = await db.rows<{ role: string; site_id: string | null; scope: string | null }>(sql`
     SELECT a.role, a.site_id::text AS site_id, a.scope_record_id::text AS scope
@@ -120,10 +130,29 @@ export async function loadAccess(
  * ones read the new roles (module header). `false` if there is no such user.
  */
 export async function lockPersonForRoleChange(db: Queryable, userId: UserId): Promise<boolean> {
-  if (!isUserId(userId)) return false;
-  const rows = await db.rows(sql`
-    SELECT 1 FROM public.users WHERE id = ${userId}::uuid FOR NO KEY UPDATE`);
-  return rows.length > 0;
+  return lockPeopleForRoleChange(db, [userId]);
+}
+
+/**
+ * Locks several people's user rows `FOR NO KEY UPDATE`, one statement per
+ * row in ID order, so two role changes naming the same two people (A grants
+ * to B while B grants to A) wait for each other instead of deadlocking.
+ * Each person is locked once, however often named. `false` if any of them
+ * doesn't exist (the others stay locked until the transaction ends).
+ */
+export async function lockPeopleForRoleChange(
+  db: Queryable,
+  userIds: readonly UserId[],
+): Promise<boolean> {
+  if (!userIds.every((id) => isUserId(id))) return false;
+  const ordered = [...new Set(userIds)].sort();
+  let all = true;
+  for (const id of ordered) {
+    const rows = await db.rows(sql`
+      SELECT 1 FROM public.users WHERE id = ${id}::uuid FOR NO KEY UPDATE`);
+    if (rows.length === 0) all = false;
+  }
+  return all;
 }
 
 /** Where a record sits, as far as permissions go. */
@@ -418,26 +447,69 @@ export async function deleteRoleAssignment(
   return rows.length > 0;
 }
 
+/** The most role assignments one page holds, and the default. */
+export const MAX_ASSIGNMENT_PAGE = 1000;
+export const DEFAULT_ASSIGNMENT_PAGE = 200;
+
+/** A page of role assignments, and where the next one starts (`null`: none). */
+export interface RoleAssignmentPage {
+  readonly assignments: readonly RoleAssignment[];
+  readonly next: string | null;
+}
+
+/** The position after a row, as `next` gives it: granted_at to the microsecond, then the ID. */
+const CURSOR =
+  /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6})_([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/;
+
+/** Whether `value` is a cursor `listRoleAssignments` could have given. */
+export function isAssignmentCursor(value: unknown): value is string {
+  return typeof value === "string" && CURSOR.test(value);
+}
+
 /**
- * The organization's role assignments, all of them or (with `siteIds`)
- * those on these sites only, oldest first. At most 10 000.
+ * The organization's role assignments, oldest first, one page at a time:
+ * all of them, or (with `siteIds`) only those on these sites, never those
+ * on every site. `after` is the previous page's `next`; `limit` is 1 to
+ * `MAX_ASSIGNMENT_PAGE` (`DEFAULT_ASSIGNMENT_PAGE`). An invalid cursor or
+ * limit reads as an empty last page.
  */
 export async function listRoleAssignments(
   db: Queryable,
   organizationId: OrganizationId,
-  siteIds?: readonly SiteId[],
-): Promise<readonly RoleAssignment[]> {
-  if (!isOrganizationId(organizationId)) return [];
-  const sites = siteIds?.filter((s) => isSiteId(s)) ?? null;
-  const rows = await db.rows<AssignmentRow>(sql`
-    SELECT ${ASSIGNMENT_COLUMNS} FROM public.role_assignments
+  options: {
+    readonly siteIds?: readonly SiteId[];
+    readonly after?: string | null;
+    readonly limit?: number;
+  } = {},
+): Promise<RoleAssignmentPage> {
+  const empty: RoleAssignmentPage = Object.freeze({ assignments: Object.freeze([]), next: null });
+  if (!isOrganizationId(organizationId)) return empty;
+  const limit = options.limit ?? DEFAULT_ASSIGNMENT_PAGE;
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_ASSIGNMENT_PAGE) return empty;
+  const after = options.after ?? null;
+  const cursor = after === null ? null : CURSOR.exec(after);
+  if (after !== null && cursor === null) return empty;
+  const sites = options.siteIds?.filter((s) => isSiteId(s)) ?? null;
+  const rows = await db.rows<AssignmentRow & { position: string }>(sql`
+    SELECT ${ASSIGNMENT_COLUMNS},
+      to_char(granted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US') || '_' || id::text
+        AS position
+    FROM public.role_assignments
     WHERE organization_id = ${organizationId}::uuid
       AND (${sites === null}::boolean OR site_id = ANY (${sites ?? []}::uuid[]))
+      AND (${cursor === null}::boolean
+           OR (granted_at, id) > ((${cursor?.[1] ?? null}::timestamp AT TIME ZONE 'UTC'),
+                                  ${cursor?.[2] ?? null}::uuid))
     ORDER BY granted_at, id
-    LIMIT 10000`);
-  return Object.freeze(
-    rows.map(assignmentFromRow).filter((a): a is RoleAssignment => a !== undefined),
-  );
+    LIMIT ${limit + 1}`);
+  const page = rows.slice(0, limit);
+  const last = page[page.length - 1];
+  return Object.freeze({
+    assignments: Object.freeze(
+      page.map(assignmentFromRow).filter((a): a is RoleAssignment => a !== undefined),
+    ),
+    next: rows.length > limit && last !== undefined ? last.position : null,
+  });
 }
 
 /** Whether the person is a member of the organization. */

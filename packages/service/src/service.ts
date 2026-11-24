@@ -98,6 +98,7 @@ import {
   isActorId,
   lockArrangement,
   lockDefinition,
+  linkedIds,
   lockRecord,
   readOrganization,
   readRecordIdentifiers,
@@ -114,6 +115,7 @@ import {
   type Database,
   type Queryable,
   type RecordDeletion,
+  type RecordPlace,
   type RecordPosition,
   type RecordVersion,
   type VersionConflict,
@@ -702,6 +704,41 @@ async function moveIssues(
   return checker.intoPlace(to, permissions, true);
 }
 
+/**
+ * Whether writing `after` over a record now at `place` moves it in the
+ * arrangement: a unit's parent or level, or what a digital asset
+ * represents. Such a write takes the organization's arrangement lock
+ * (exclusive) before the record's row lock (D-065), so nobody whose
+ * permissions depend on where records sit (scoped grants, which hold the
+ * same lock while they check and write) sees it half done.
+ */
+function movesInArrangement(
+  place: RecordPlace,
+  draft: CatalogRecord | Readonly<Record<string, unknown>>,
+): boolean {
+  const after = draft as {
+    readonly parentId?: unknown;
+    readonly level?: unknown;
+    readonly represents?: unknown;
+  };
+  if (place.kind === "archival_unit") {
+    return (after.parentId ?? null) !== place.parentId || (after.level ?? null) !== place.level;
+  }
+  if (place.kind === "digital_asset") return (after.represents ?? null) !== place.represents;
+  return false;
+}
+
+/** The refusal that runs the operation again from the start (`run`). */
+function retryRefusal(): ServiceRefusal {
+  return refusal([], "retry", "Other changes were being saved at the same moment. Try again.");
+}
+
+/** The links `after` adds that `before` (if any) doesn't hold. */
+function addedLinks(after: CatalogRecord, before?: CatalogRecord): RecordId[] {
+  const kept = new Set(before === undefined ? [] : linkedIds(before));
+  return linkedIds(after).filter((id) => !kept.has(id));
+}
+
 const RETRYABLE_STATES: ReadonlySet<string> = new Set([RETRY, SERIALIZATION]);
 
 /** Makes the service over `db`, a pool connected as the writer role. */
@@ -850,33 +887,54 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
   async function accessFor(
     tx: Queryable,
     who: { organizationId: OrganizationId; actor: string },
+    mode: "write" | "read" = "write",
   ): Promise<ServiceResult<RecordAccess>> {
     const access = await readAccess(tx, who.organizationId, who.actor);
     if (!access.ok) return access;
-    const checker = new RecordAccess(tx, who.organizationId, access.value);
+    const checker = new RecordAccess(tx, who.organizationId, access.value, mode);
     // Before any record's place is read (D-065's lock order).
     await checker.settle();
     return { ok: true, value: checker };
   }
 
   /**
-   * Refused unless the actor may view the stored record and holds every one
-   * of `permissions` where it is (`[]`: viewing only).
+   * Locks the record's row first, then reads its place: what is checked is
+   * where the record is and stays until COMMIT (nothing can move it while
+   * the row is locked). `undefined` if there is no such record.
+   */
+  async function lockedPlace(
+    tx: Queryable,
+    organizationId: OrganizationId,
+    recordId: RecordId,
+    mode: "no_key_update" | "update" | "share",
+  ): Promise<RecordPlace | undefined> {
+    if ((await lockRecord(tx, organizationId, recordId, mode)) === undefined) return undefined;
+    return readRecordPlace(tx, organizationId, recordId);
+  }
+
+  /**
+   * The actor's access, and the record's place read under its row lock
+   * (`lockedPlace`), refused unless the actor may view it and holds every
+   * one of `all` and any one of `any` there.
    */
   async function mayChange(
     tx: Queryable,
     who: { organizationId: OrganizationId; actor: string },
     recordId: RecordId,
-    permissions: readonly Permission[],
-  ): Promise<Refusal | undefined> {
-    const allowed = await accessFor(tx, who);
+    rowLock: "no_key_update" | "update" | "share",
+    all: readonly Permission[],
+    any: (kind: string) => readonly Permission[] = () => [],
+  ): Promise<{ readonly ok: true; readonly place: RecordPlace } | Refusal> {
+    const allowed = await accessFor(tx, who, rowLock === "share" ? "read" : "write");
     if (!allowed.ok) return allowed;
-    const place = await readRecordPlace(tx, who.organizationId, recordId);
+    const place = await lockedPlace(tx, who.organizationId, recordId, rowLock);
     if (place === undefined) return noSuchRecord();
-    return allowed.value.onRecord(
+    const denied = await allowed.value.onRecord(
       { kind: place.kind, id: recordId, parentId: place.parentId, represents: place.represents },
-      permissions,
+      all,
+      any(place.kind),
     );
+    return denied ?? { ok: true, place };
   }
 
   return Object.freeze({
@@ -916,9 +974,12 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         if (record.kind === "archival_unit" && record.parentId !== undefined) {
           await lockArrangement(tx, who.organizationId);
         }
+        // Links to records the actor can't view: as links to none (D-072).
+        const hiddenLinks = await allowed.value.hiddenAmong(addedLinks(record));
         const problems = await recordCheckIssues(tx, record, undefined, {
           messages: "own",
           identifierFields: false,
+          hiddenLinks,
         });
         if (problems.length > 0) return { ok: false, issues: problems };
         const inserted = await insertRecord(tx, record, {
@@ -975,17 +1036,20 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         }
         const content = contentOf(draft.value);
 
-        // Decide from the row as committed whether the arrangement lock is
-        // needed, and take it before the row's lock (D-065).
         const allowed = await accessFor(tx, who);
         if (!allowed.ok) return allowed;
         const checker = allowed.value;
-        // A person with scoped grants holds the arrangement lock from here
-        // (RecordAccess), so the place read below can't change until COMMIT.
-        const place = await readRecordPlace(tx, org, recordId);
-        if (place === undefined) {
-          return refusal(["recordId"], "unknown_record", "The organization has no such record.");
-        }
+        // Decide from the row as committed whether the edit moves the record
+        // (a unit's parent or level, an asset's represented record), and if
+        // so take the arrangement lock before the row's lock (D-065). A
+        // person with scoped grants holds it already (RecordAccess).
+        const seen = await readRecordPlace(tx, org, recordId);
+        if (seen === undefined) return noSuchRecord();
+        if (movesInArrangement(seen, content)) await lockArrangement(tx, org);
+        // Then the row, and its place as it stays until COMMIT: that is what
+        // the permissions are checked against.
+        const place = await lockedPlace(tx, org, recordId, "no_key_update");
+        if (place === undefined) return noSuchRecord();
         const mayEdit = await checker.onRecord(
           {
             kind: place.kind,
@@ -1004,17 +1068,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
             "A record's kind never changes; make a new record instead.",
           );
         }
-        if (
-          place.kind === "archival_unit" &&
-          ((content.parentId ?? null) !== place.parentId || content.level !== place.level)
-        ) {
-          await lockArrangement(tx, org);
-        }
-        const locked = await lockRecord(tx, org, recordId);
-        if (locked === undefined) {
-          return refusal(["recordId"], "unknown_record", "The organization has no such record.");
-        }
-        if (locked !== expected.value || place.version !== expected.value) {
+        if (place.version !== expected.value) {
           const conflict = await versionConflict(tx, org, recordId, expected.value);
           return {
             ok: false,
@@ -1022,12 +1076,15 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
               issue(
                 ["options", "expectedVersion"],
                 "version_conflict",
-                `The record was saved by someone else since version ${String(expected.value)}; it is now at version ${String(locked)}. Read it again.`,
+                `The record was saved by someone else since version ${String(expected.value)}; it is now at version ${String(place.version)}. Read it again.`,
               ),
             ],
             ...(conflict === undefined ? {} : { conflict }),
           };
         }
+        // Saved between the first look and the lock: the lock decision may
+        // be stale, so start again.
+        if (seen.version !== place.version) return retryRefusal();
         const stored = await readStoredRecord(tx, org, recordId);
         if (stored === undefined) {
           return refusal(["recordId"], "unknown_record", "The organization has no such record.");
@@ -1072,9 +1129,11 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         let version = stored.value.version;
         let saved = before;
         if (compared.value.differences.length > 0) {
+          const hiddenLinks = await checker.hiddenAmong(addedLinks(record, before));
           const problems = await recordCheckIssues(tx, record, before, {
             messages: "own",
             identifierFields: false,
+            hiddenLinks,
           });
           if (problems.length > 0) return { ok: false, issues: problems };
           if (before.templateKey !== record.templateKey) {
@@ -1122,13 +1181,14 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         if (!opts.ok) return opts;
         const confirmed = readConfirmDropped(opts.value);
         if (!confirmed.ok) return confirmed;
-        const denied = await mayChange(tx, who, recordId, ["records.edit"]);
-        if (denied) return denied;
-        // The record first, as an update does: its identifier fields are
-        // checked against the new set below, and can't change meanwhile.
-        if ((await lockRecord(tx, org, recordId)) === undefined) {
-          return refusal(["recordId"], "unknown_record", "The organization has no such record.");
-        }
+        // The record's row first, as an update does: its place is checked
+        // as it stays until COMMIT, and its identifier fields are checked
+        // against the new set below and can't change meanwhile. Whoever may
+        // change the record may change its numbers: for a digital asset,
+        // that includes Scanners (media.attach), as when they make or edit
+        // one with its identifiers.
+        const allowed = await mayChange(tx, who, recordId, "no_key_update", [], editPermissions);
+        if (!allowed.ok) return allowed;
         const stored = await readStoredRecord(tx, org, recordId);
         if (!stored?.ok) {
           return refusal(
@@ -1167,9 +1227,21 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         // (D-065), where the record is and wherever the old version puts it.
         const allowed = await accessFor(tx, who);
         if (!allowed.ok) return allowed;
-        const place = await readRecordPlace(tx, org, recordId);
+        const checker = allowed.value;
+        // A first look, to decide whether the restore moves the record and
+        // so needs the arrangement lock before the row's (D-065).
+        const seen = await readRecordPlace(tx, org, recordId);
+        if (seen === undefined) return noSuchRecord();
+        const wanted =
+          Number.isInteger(version) && version >= 1 && version < 2 ** 31 - 1
+            ? await readVersion(tx, org, recordId, version)
+            : undefined;
+        const old = wanted?.ok ? wanted.value.record : undefined;
+        if (old !== undefined && movesInArrangement(seen, old)) await lockArrangement(tx, org);
+        // Then the row, and the place it is checked at, as it stays until COMMIT.
+        const place = await lockedPlace(tx, org, recordId, "no_key_update");
         if (place === undefined) return noSuchRecord();
-        const mayRestore = await allowed.value.onRecord(
+        const mayRestore = await checker.onRecord(
           {
             kind: place.kind,
             id: recordId,
@@ -1180,15 +1252,20 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           editPermissions(place.kind),
         );
         if (mayRestore) return mayRestore;
-        if (Number.isInteger(version) && version >= 1 && version < 2 ** 31 - 1) {
-          const old = await readVersion(tx, org, recordId, version);
-          if (old?.ok) {
-            const moved = await moveIssues(
-              allowed.value,
-              { kind: place.kind, parentId: place.parentId, represents: place.represents },
-              old.value.record,
+        // Saved between the first look and the lock (and still at the
+        // version the person saw): the lock decision may be stale.
+        if (place.version === expected.value && seen.version !== place.version) {
+          return retryRefusal();
+        }
+        let hiddenLinks: ReadonlySet<RecordId> = new Set();
+        if (old !== undefined) {
+          const moved = await moveIssues(checker, place, old);
+          if (moved) return moved;
+          if (checker.scoped) {
+            const current = await readStoredRecord(tx, org, recordId);
+            hiddenLinks = await checker.hiddenAmong(
+              addedLinks(old, current?.ok ? current.value.record : undefined),
             );
-            if (moved) return moved;
           }
         }
         const stamp = clock();
@@ -1205,6 +1282,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           },
           {
             now: stamp,
+            hiddenLinks,
             ...(confirm === undefined ? {} : { confirmMadePublic: confirm as readonly string[] }),
           },
         );
@@ -1226,8 +1304,10 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         if (!expected.ok) return expected;
         const reason = readReason(opts.value);
         if (!reason.ok) return reason;
-        const denied = await mayChange(tx, who, recordId, ["records.delete"]);
-        if (denied) return denied;
+        // The row first (FOR UPDATE, as the deletion itself takes it), then
+        // the check at its place as it stays until COMMIT.
+        const allowed = await mayChange(tx, who, recordId, "update", ["records.delete"]);
+        if (!allowed.ok) return allowed;
         return deleteStoredRecord(tx, who.organizationId, recordId, {
           expectedVersion: expected.value,
           actor: who.actor,
@@ -1241,8 +1321,11 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         if (!isRecordId(recordId)) {
           return refusal(["recordId"], "invalid_id", "A record ID is a lowercase version 4 UUID.");
         }
-        const denied = await mayChange(tx, who, recordId, []);
-        if (denied) return denied;
+        // A read: the arrangement lock (for scoped grants) is shared, so
+        // reads run side by side but never see a move half done, and the
+        // row is locked FOR SHARE, so it stays where it was checked.
+        const allowed = await mayChange(tx, who, recordId, "share", []);
+        if (!allowed.ok) return allowed;
         const stored = await readStoredRecord(tx, who.organizationId, recordId);
         if (stored === undefined) return noSuchRecord();
         if (!stored.ok) {

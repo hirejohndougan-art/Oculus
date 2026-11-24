@@ -132,6 +132,21 @@ $$;
 CREATE TRIGGER system_settings_version_step BEFORE INSERT OR UPDATE ON public.system_settings
   FOR EACH ROW EXECUTE FUNCTION public.system_settings_version_step();
 
+-- The organization's arrangement lock (0006) in shared mode: taken by a
+-- check that only reads where records sit (a scoped person's readRecord),
+-- so such checks run side by side, while a move (which takes
+-- arrangement_lock, exclusive, as do scoped writes) waits for them and they
+-- wait for it. The same key as arrangement_lock.
+CREATE FUNCTION public.arrangement_lock_shared(organization_id uuid) RETURNS void
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  PERFORM public.arrangement_require_read_committed();
+  PERFORM pg_advisory_xact_lock_shared(65, hashtext(organization_id::text));
+END
+$$;
+
 -- Identity never changes (0002's catalog_keep_identity): a site's
 -- organization, ID and creation; every column of a role assignment.
 CREATE TRIGGER zzzz_sites_keep_identity BEFORE UPDATE ON public.sites

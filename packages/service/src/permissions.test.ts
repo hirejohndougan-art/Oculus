@@ -153,6 +153,7 @@ async function catalogOrganization(name: string): Promise<OrganizationId> {
     ["t-object", "object"],
     ["t-unit", "archival_unit"],
     ["t-asset", "digital_asset"],
+    ["t-agent", "agent"],
   ] as const) {
     ok(
       await insertTemplateVersion(s.owner, {
@@ -160,7 +161,13 @@ async function catalogOrganization(name: string): Promise<OrganizationId> {
         organizationId: org,
         label: key,
         appliesTo: [kind],
-        fields: [field("note", "text")],
+        fields: [
+          field("note", "text"),
+          // A link to an agent (T-041 review: links to records the actor can't view).
+          ...(kind === "archival_unit"
+            ? [{ ...field("related", "record_link"), recordKinds: ["agent"] }]
+            : []),
+        ],
       }),
     );
   }
@@ -849,7 +856,7 @@ describe("organizations and sites stay apart", () => {
       ),
     ).toEqual(["unknown_person"]);
     // B's assignments are unknown in A, even to a system manager.
-    const theirs = ok(await service.listRoleAssignments(ctxOf(w.b, folks.root)));
+    const theirs = ok(await service.listRoleAssignments(ctxOf(w.b, folks.root))).assignments;
     const first = theirs[0];
     if (first === undefined) throw new Error("no assignment");
     expect(codes(await service.revokeRole(ctxOf(w.a, folks.root), first.id))).toEqual([
@@ -883,13 +890,22 @@ describe("organizations and sites stay apart", () => {
     });
     const unknown = await service.revokeRole(manager, newRecordId());
     expect(await service.revokeRole(manager, onA2)).toEqual(unknown);
-    const listed = ok(await service.listRoleAssignments(manager));
-    expect(listed.some((a) => a.id === onA2)).toBe(false);
-    expect(listed.every((a) => a.siteId === null || a.siteId === w.a1)).toBe(true);
+    // Listed: only what they manage, so neither A2's grants nor grants on
+    // every site (only system managers change those).
+    const everywhere = await grant(service, folks.root, w.a, {
+      userId: p,
+      role: "read_only",
+      siteId: null,
+    });
+    const listed = ok(await service.listRoleAssignments(manager)).assignments;
+    expect(listed.some((a) => a.id === onA2 || a.id === everywhere)).toBe(false);
+    expect(listed.length).toBeGreaterThan(0);
+    expect(listed.every((a) => a.siteId === w.a1)).toBe(true);
+    expect(await service.revokeRole(manager, everywhere)).toEqual(unknown);
     // The other site's manager role, too.
-    const managers = ok(await service.listRoleAssignments(ctxOf(w.a, folks.root))).filter(
-      (a) => a.role === "site_manager",
-    );
+    const managers = ok(
+      await service.listRoleAssignments(ctxOf(w.a, folks.root)),
+    ).assignments.filter((a) => a.role === "site_manager");
     for (const m of managers) {
       expect(await service.revokeRole(manager, m.id)).toEqual(unknown);
     }
@@ -1289,5 +1305,373 @@ describe("the database backs the rules up", () => {
     } finally {
       await server.close();
     }
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// T-041 review fixes.
+
+/** Holds row locks on a third connection until `release` is called. */
+function holdRows(statement: ReturnType<typeof sql>): {
+  held: Promise<void>;
+  release: () => void;
+  locked: Promise<void>;
+} {
+  const hold = gate();
+  const lockedGate = gate();
+  const held = s.owner.transaction(async (q) => {
+    await q.rows(statement);
+    lockedGate.open();
+    await hold.promise;
+  });
+  return { held, release: hold.open, locked: lockedGate.promise };
+}
+
+/** Fails if `promise` doesn't settle within `ms` (it is waiting on a lock it shouldn't). */
+async function within<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`still waiting after ${String(ms)} ms`));
+    }, ms);
+  });
+  try {
+    return await Promise.race([promise, late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const rowOf = (org: OrganizationId, id: RecordId) =>
+  sql`SELECT 1 FROM public.records WHERE organization_id = ${org}::uuid AND id = ${id}::uuid FOR UPDATE`;
+
+describe("a digital asset can't move between the check and the write", () => {
+  it("saveIdentifiers after the owner moved the scan out of the collection: refused, nothing written", async () => {
+    await ready();
+    const w = await world();
+    const p = await personWith(w, "ids-racer", [{ role: "cataloger", scope: w.f1.id }]);
+    // The owner's move of AX (X1 in F1 -> S2 in F2) is held at AX's row,
+    // after it took the arrangement lock.
+    const h = holdRows(rowOf(w.a, w.ax.id));
+    await h.locked;
+    const move = service2.updateRecord(
+      ctxOf(w.a, folks.root),
+      w.ax.id,
+      { ...w.ax, represents: w.s2.id },
+      { expectedVersion: 1 },
+    );
+    await waiting(1);
+    const save = service.saveIdentifiers(ctxOf(w.a, p), w.ax.id, {
+      current: [{ type: "object_number", value: "INV-RACE-1", primary: true }],
+      former: [],
+    });
+    await waiting(2);
+    h.release();
+    await h.held;
+    ok(await move);
+    const saved = await save;
+    expect(codes(saved)).toEqual(["unknown_record"]);
+    expect(saved).toEqual(
+      await service.saveIdentifiers(ctxOf(w.a, p), newRecordId(), { current: [], former: [] }),
+    );
+    const [held] = await s.owner.rows<{ n: number }>(sql`
+      SELECT count(*)::integer AS n FROM public.record_identifiers
+      WHERE organization_id = ${w.a}::uuid AND record_id = ${w.ax.id}::uuid`);
+    expect(held?.n).toBe(0);
+  }, 60_000);
+
+  it("restoreVersion can't bring a scan back out of a collection the actor can't see", async () => {
+    await ready();
+    const w = await world();
+    const p = await personWith(w, "restore-racer", [{ role: "cataloger", scope: w.f1.id }]);
+    const h = holdRows(rowOf(w.a, w.ax.id));
+    await h.locked;
+    // The owner moves AX to S2 (its version 2); held at AX's row.
+    const move = service2.updateRecord(
+      ctxOf(w.a, folks.root),
+      w.ax.id,
+      { ...w.ax, represents: w.s2.id },
+      { expectedVersion: 1 },
+    );
+    await waiting(1);
+    // The cataloger restores version 1 (AX under X1), as if at version 2.
+    const restore = service.restoreVersion(ctxOf(w.a, p), w.ax.id, 1, { expectedVersion: 2 });
+    await waiting(2);
+    h.release();
+    await h.held;
+    ok(await move);
+    expect(codes(await restore)).toEqual(["unknown_record"]);
+    const now = ok(await service.readRecord(ctxOf(w.a, folks.root), w.ax.id));
+    expect(now.version).toBe(2);
+    expect((now.record as { represents?: string }).represents).toBe(w.s2.id);
+  }, 60_000);
+
+  it("a scan's move waits for a scoped write in flight, which sees the scan where it was", async () => {
+    await ready();
+    const w = await world();
+    const p = await personWith(w, "first-racer", [{ role: "cataloger", scope: w.f1.id }]);
+    const h = holdRows(rowOf(w.a, w.ax.id));
+    await h.locked;
+    // The cataloger checks first (holding the arrangement lock), then waits for AX's row.
+    const save = service.saveIdentifiers(ctxOf(w.a, p), w.ax.id, {
+      current: [{ type: "object_number", value: "INV-RACE-2", primary: true }],
+      former: [],
+    });
+    await waiting(1);
+    const move = service2.updateRecord(
+      ctxOf(w.a, folks.root),
+      w.ax.id,
+      { ...w.ax, represents: w.s2.id },
+      { expectedVersion: 1 },
+    );
+    await waiting(2);
+    h.release();
+    await h.held;
+    ok(await save);
+    ok(await move);
+    expect(codes(await service.readRecord(ctxOf(w.a, p), w.ax.id))).toEqual(["unknown_record"]);
+  }, 60_000);
+});
+
+describe("role changes don't deadlock", () => {
+  it("A grants to B while B grants to A, and one person given two roles at once: no retry", async () => {
+    await ready();
+    const w = await world();
+    const errors: unknown[] = [];
+    const once1 = createService(s.writer, { attempts: 1, onError: (e) => errors.push(e) });
+    const once2 = createService(s.writer2, { attempts: 1, onError: (e) => errors.push(e) });
+    const m1 = await personWith(w, "manager-one", [{ role: "site_manager" }]);
+    const m2 = await personWith(w, "manager-two", [{ role: "site_manager" }]);
+    const both = sql`SELECT 1 FROM public.users WHERE id = ANY(${[m1, m2]}::uuid[]) FOR SHARE`;
+    for (const role of ["read_only", "reviewer"]) {
+      // Both grants pass their first look while a third connection holds
+      // both rows, so they meet at the locks.
+      const h = holdRows(both);
+      await h.locked;
+      const one = once1.grantRole(ctxOf(w.a, m1), {
+        userId: m2,
+        role,
+        siteId: w.a1,
+        scope: null,
+      });
+      const two = once2.grantRole(ctxOf(w.a, m2), {
+        userId: m1,
+        role,
+        siteId: w.a1,
+        scope: null,
+      });
+      await waiting(2);
+      h.release();
+      await h.held;
+      const results = await Promise.all([one, two]);
+      expect(results.map((r) => (r.ok ? "ok" : codes(r)[0]))).toEqual(["ok", "ok"]);
+    }
+    // A site manager giving themselves two roles at once.
+    const self = sql`SELECT 1 FROM public.users WHERE id = ${m1}::uuid FOR SHARE`;
+    const h = holdRows(self);
+    await h.locked;
+    const grants = ["cataloger", "scanner"].map((role, i) =>
+      (i === 0 ? once1 : once2).grantRole(ctxOf(w.a, m1), {
+        userId: m1,
+        role,
+        siteId: w.a1,
+        scope: null,
+      }),
+    );
+    await waiting(2);
+    h.release();
+    await h.held;
+    const results = await Promise.all(grants);
+    expect(results.map((r) => (r.ok ? "ok" : codes(r)[0]))).toEqual(["ok", "ok"]);
+    expect(errors).toEqual([]);
+  }, 60_000);
+
+  it("a role change locks no row of a person who isn't a member", async () => {
+    await ready();
+    const w = await world();
+    const h = holdRows(sql`SELECT 1 FROM public.users WHERE id = ${w.stranger}::uuid FOR SHARE`);
+    await h.locked;
+    try {
+      const refused = await within(
+        service.grantRole(ctxOf(w.a, w.byRole.site_manager), {
+          userId: w.stranger,
+          role: "read_only",
+          siteId: w.a1,
+          scope: null,
+        }),
+        10_000,
+      );
+      expect(codes(refused)).toEqual(["unknown_person"]);
+    } finally {
+      h.release();
+      await h.held;
+    }
+  }, 60_000);
+});
+
+describe("links to records the actor can't view", () => {
+  it("are answered exactly as links to records that don't exist; kept links still save", async () => {
+    await ready();
+    const w = await world();
+    const rootCtx = ctxOf(w.a, folks.root);
+    const agent = ok(
+      await service.createRecord(rootCtx, {
+        kind: "agent",
+        agentType: "person",
+        title: "Invented Maker",
+        templateKey: "t-agent",
+        fields: {},
+      }),
+    ).record;
+    const p = await personWith(w, "linker", [{ role: "cataloger", scope: w.f1.id }]);
+    const c = ctxOf(w.a, p);
+    const linked = (id: RecordId) => ({
+      ...unitDraft("file", "Invented linked file", w.s1.id),
+      fields: { related: { recordId: id, label: "Someone" } },
+    });
+    const nowhere = await service.createRecord(c, linked(newRecordId()));
+    expect(codes(nowhere)).toEqual(["unknown_record"]);
+    // The object (the wrong kind) and the agent (the right kind) alike.
+    const strip = (r: unknown) => JSON.stringify(r).replace(/[0-9a-f-]{36}/g, "ID");
+    expect(strip(await service.createRecord(c, linked(w.o.id)))).toBe(strip(nowhere));
+    expect(strip(await service.createRecord(c, linked(agent.id)))).toBe(strip(nowhere));
+    // A link the record already holds, kept through an edit, still saves.
+    const x1 = ok(
+      await service.updateRecord(
+        rootCtx,
+        w.x1.id,
+        { ...w.x1, fields: { related: { recordId: agent.id, label: "Someone" } } },
+        { expectedVersion: 1 },
+      ),
+    );
+    ok(
+      await service.updateRecord(
+        c,
+        w.x1.id,
+        { ...x1.record, title: "Edited, link kept" },
+        { expectedVersion: x1.version },
+      ),
+    );
+    // Someone who may view the whole catalog gets the real answers.
+    const viewer = await personWith(w, "viewer-linker", [
+      { role: "read_only" },
+      { role: "cataloger", scope: w.f1.id },
+    ]);
+    expect(codes(await service.createRecord(ctxOf(w.a, viewer), linked(w.o.id)))).toEqual([
+      "wrong_record_kind",
+    ]);
+    ok(await service.createRecord(ctxOf(w.a, viewer), linked(agent.id)));
+  }, 60_000);
+});
+
+describe("Scanners and identifiers", () => {
+  it("set numbers on digital assets only, through saveIdentifiers and saves alike", async () => {
+    await ready();
+    const w = await world();
+    const c = ctxOf(w.a, w.byRole.scanner);
+    const numbers = (value: string) => ({
+      current: [{ type: "object_number", value, primary: true }],
+      former: [],
+    });
+    ok(await service.saveIdentifiers(c, w.ax.id, numbers("INV-SCAN-1")));
+    const made = ok(
+      await service.createRecord(c, assetDraft(w.x1.id), { identifiers: numbers("INV-SCAN-2") }),
+    );
+    ok(
+      await service.updateRecord(c, made.record.id, made.record, {
+        expectedVersion: 1,
+        identifiers: {
+          current: [{ type: "object_number", value: "INV-SCAN-3", primary: true }],
+          former: [{ type: "object_number", value: "INV-SCAN-2" }],
+        },
+      }),
+    );
+    // Not on other kinds, by any route.
+    expect(codes(await service.saveIdentifiers(c, w.o.id, numbers("INV-SCAN-4")))).toEqual([
+      "not_permitted",
+    ]);
+    expect(codes(await service.saveIdentifiers(c, w.x1.id, numbers("INV-SCAN-5")))).toEqual([
+      "not_permitted",
+    ]);
+    expect(
+      codes(
+        await service.updateRecord(c, w.o.id, w.o, {
+          expectedVersion: 1,
+          identifiers: numbers("INV-SCAN-6"),
+        }),
+      ),
+    ).toEqual(["not_permitted"]);
+    expect(
+      codes(await service.createRecord(c, objectDraft(), { identifiers: numbers("INV-SCAN-7") })),
+    ).toEqual(["not_permitted"]);
+  }, 60_000);
+});
+
+describe("scoped reads", () => {
+  it("run side by side, but never see a move half done", async () => {
+    await ready();
+    const w = await world();
+    const p = await personWith(w, "reader", [{ role: "read_only", scope: w.f1.id }]);
+    const q = await personWith(w, "reader-two", [{ role: "cataloger", scope: w.f1.id }]);
+    // Reader one reads a scan of the scan AX: finding where it sits locks AX
+    // FOR SHARE after the (shared) arrangement lock, and is held there.
+    const ay = ok(await service.createRecord(ctxOf(w.a, folks.root), assetDraft(w.ax.id))).record;
+    const h = holdRows(rowOf(w.a, w.ax.id));
+    await h.locked;
+    const first = service.readRecord(ctxOf(w.a, p), ay.id);
+    await waiting(1);
+    try {
+      // Reader two (another scoped person) goes through meanwhile.
+      ok(await within(service2.readRecord(ctxOf(w.a, q), w.s1.id), 10_000));
+    } finally {
+      h.release();
+      await h.held;
+    }
+    ok(await first);
+    // A move held after taking the arrangement lock: a read waits for it,
+    // then sees the arrangement as moved.
+    const h2 = holdRows(rowOf(w.a, w.s1.id));
+    await h2.locked;
+    const move = service2.updateRecord(
+      ctxOf(w.a, folks.root),
+      w.s1.id,
+      { ...w.s1, parentId: w.f2.id },
+      { expectedVersion: 1 },
+    );
+    await waiting(1);
+    const read = service.readRecord(ctxOf(w.a, p), w.x1.id);
+    await waiting(2);
+    h2.release();
+    await h2.held;
+    ok(await move);
+    expect(codes(await read)).toEqual(["unknown_record"]);
+  }, 60_000);
+});
+
+describe("listing role assignments", () => {
+  it("pages through every assignment instead of stopping at a limit", async () => {
+    await ready();
+    const w = await world();
+    const c = ctxOf(w.a, folks.root);
+    const all = ok(await service.listRoleAssignments(c, { limit: 1000 }));
+    expect(all.next).toBeNull();
+    const seen: string[] = [];
+    let after: string | null = null;
+    for (let i = 0; i < 50; i += 1) {
+      const page: { assignments: readonly { id: string }[]; next: string | null } = ok(
+        await service.listRoleAssignments(c, { limit: 2, ...(after === null ? {} : { after }) }),
+      );
+      expect(page.assignments.length).toBeLessThanOrEqual(2);
+      seen.push(...page.assignments.map((a) => a.id));
+      after = page.next;
+      if (after === null) break;
+    }
+    expect(seen).toEqual(all.assignments.map((a) => a.id));
+    expect(seen.length).toBeGreaterThan(2);
+    expect(codes(await service.listRoleAssignments(c, { after: "nope" }))).toEqual([
+      "invalid_cursor",
+    ]);
+    expect(codes(await service.listRoleAssignments(c, { limit: 1001 }))).toEqual(["invalid_limit"]);
+    expect(codes(await service.listRoleAssignments(c, { extra: 1 }))).toEqual(["invalid_request"]);
   }, 60_000);
 });

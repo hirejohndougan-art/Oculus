@@ -1004,26 +1004,43 @@ export async function readRecordPlace(
 export async function lockArrangement(
   db: Queryable,
   organizationId: OrganizationId,
+  mode: "exclusive" | "shared" = "exclusive",
 ): Promise<void> {
   if (!isOrganizationId(organizationId)) throw new TypeError(BAD_ORGANIZATION);
-  await db.execute(sql`SELECT public.arrangement_lock(${organizationId}::uuid)`);
+  // `shared` (0011): for checks that only read where records sit; they run
+  // side by side and wait for (and hold off) every exclusive holder, which
+  // is every move.
+  await db.execute(
+    mode === "shared"
+      ? sql`SELECT public.arrangement_lock_shared(${organizationId}::uuid)`
+      : sql`SELECT public.arrangement_lock(${organizationId}::uuid)`,
+  );
 }
 
 /**
- * Locks the organization's record row (`FOR NO KEY UPDATE`, as
- * `updateRecord` and the identifier save do) until the transaction ends, and
- * returns its version, or `undefined` if there is no such record.
+ * Locks the organization's record row until the transaction ends, and
+ * returns its version, or `undefined` if there is no such record. `FOR NO
+ * KEY UPDATE` by default, as `updateRecord` and the identifier save do;
+ * `update` (`FOR UPDATE`) for a deletion, as `deleteRecord` takes; `share`
+ * (`FOR SHARE`) for a read that must see the row as it stays until COMMIT.
  */
 export async function lockRecord(
   db: Queryable,
   organizationId: OrganizationId,
   recordId: RecordId,
+  mode: "no_key_update" | "update" | "share" = "no_key_update",
 ): Promise<number | undefined> {
   if (!isOrganizationId(organizationId) || !isRecordId(recordId)) return undefined;
-  const [row] = await db.rows<{ version: number }>(sql`
+  const where = sql`
     SELECT version FROM public.records
-    WHERE organization_id = ${organizationId}::uuid AND id = ${recordId}::uuid
-    FOR NO KEY UPDATE`);
+    WHERE organization_id = ${organizationId}::uuid AND id = ${recordId}::uuid`;
+  const [row] = await db.rows<{ version: number }>(
+    mode === "update"
+      ? sql`${where} FOR UPDATE`
+      : mode === "share"
+        ? sql`${where} FOR SHARE`
+        : sql`${where} FOR NO KEY UPDATE`,
+  );
   return row?.version;
 }
 

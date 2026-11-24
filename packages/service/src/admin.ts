@@ -12,9 +12,13 @@
  *   organization's member and an unknown person get the same
  *   `unknown_person`. `siteId` and `scope` must be given, as `null` for
  *   every site or the whole catalog, so leaving one out never widens a
- *   grant. A revocation locks the person's user row first
- *   (`lockPersonForRoleChange`), so writes in flight that checked the role
- *   finish before it, and every write after it sees it.
+ *   grant. A role change first checks the actor and the person without
+ *   locks, then locks both user rows `FOR NO KEY UPDATE` in ID order
+ *   (`lockPeopleForRoleChange`; one row when they are the same person) and
+ *   checks again: writes in flight that checked the person's roles finish
+ *   before it, every write after it sees it, two changes naming the same
+ *   two people wait for each other instead of deadlocking, and nobody's row
+ *   is locked for a person who isn't a member.
  * - **Sites and System settings** are system managers' only (D-019):
  *   creating and renaming sites, and reading or changing System settings.
  *   Everyone else is refused before anything is read.
@@ -45,12 +49,15 @@ import {
   type UserId,
 } from "@oculus/core";
 import {
+  DEFAULT_ASSIGNMENT_PAGE,
+  MAX_ASSIGNMENT_PAGE,
   deleteRoleAssignment,
   insertRoleAssignment,
   insertSite,
+  isAssignmentCursor,
   isMember,
   listRoleAssignments,
-  lockPersonForRoleChange,
+  lockPeopleForRoleChange,
   readRecordPlace,
   readRoleAssignment,
   readSite,
@@ -60,6 +67,7 @@ import {
   writeSystemSettings,
   type Queryable,
   type RoleAssignment,
+  type RoleAssignmentPage,
   type SiteChoice,
   type StoredSystemSettings,
 } from "@oculus/db";
@@ -106,11 +114,16 @@ export interface AdminOperations {
     assignmentId: string,
   ): Promise<ServiceResult<{ readonly revoked: string }>>;
   /**
-   * The organization's role assignments the actor may manage: all for a
-   * system manager; for a site manager, those on their sites and those on
-   * every site.
+   * The organization's role assignments the actor may manage, oldest first,
+   * a page at a time: all for a system manager; for a site manager, those on
+   * the sites they manage (not those on every site, which only system
+   * managers change). `options.after` is the previous page's `next`;
+   * `options.limit` 1 to 1000 (default 200).
    */
-  listRoleAssignments(context: ServiceContext): Promise<ServiceResult<readonly RoleAssignment[]>>;
+  listRoleAssignments(
+    context: ServiceContext,
+    options?: unknown,
+  ): Promise<ServiceResult<RoleAssignmentPage>>;
   /** Makes a site (system managers): in `organizationId`, or the session's organization. */
   createSite(context: ServiceContext, request: unknown): Promise<ServiceResult<Site>>;
   /** Renames a site (system managers). */
@@ -251,9 +264,11 @@ export function adminOperations(run: Runner): AdminOperations {
         if (scope !== null && !isRecordId(scope)) {
           return refusal(["scope"], "invalid_id", "A record ID is a lowercase version 4 UUID.");
         }
-        const access = await readAccess(tx, org, who.actor);
-        if (!access.ok) return access;
-        if (!mayManage(access.value, role, siteId)) return notPermitted();
+        // A first look without locks: who the actor is and whether the
+        // person is a member, before any row is locked.
+        const first = await readAccess(tx, org, who.actor, { lock: false });
+        if (!first.ok) return first;
+        if (!mayManage(first.value, role, siteId)) return notPermitted();
         if (role === "site_manager" && scope !== null) {
           return refusal(
             ["scope"],
@@ -261,10 +276,18 @@ export function adminOperations(run: Runner): AdminOperations {
             "A site manager manages a whole site, never one collection.",
           );
         }
-        // The person's roles change one at a time (and after any write in
-        // flight that checked them).
-        const locked = await lockPersonForRoleChange(tx, userId);
-        if (!locked || !(await isMember(tx, org, userId))) {
+        if (!(await isMember(tx, org, userId))) {
+          return refusal(["userId"], "unknown_person", UNKNOWN_PERSON);
+        }
+        // Then both people's rows, in ID order, and the same checks again
+        // under the locks: the person's roles change one at a time (after
+        // any write in flight that checked them), and the actor's can't
+        // change before COMMIT.
+        await lockPeopleForRoleChange(tx, [first.userId, userId]);
+        const access = await readAccess(tx, org, who.actor);
+        if (!access.ok) return access;
+        if (!mayManage(access.value, role, siteId)) return notPermitted();
+        if (!(await isMember(tx, org, userId))) {
           return refusal(["userId"], "unknown_person", UNKNOWN_PERSON);
         }
         if (siteId !== null && (await readSite(tx, org, siteId)) === undefined) {
@@ -305,37 +328,70 @@ export function adminOperations(run: Runner): AdminOperations {
             "An assignment ID is a lowercase version 4 UUID.",
           );
         }
-        const access = await readAccess(tx, org, who.actor);
-        if (!access.ok) return access;
+        const first = await readAccess(tx, org, who.actor, { lock: false });
+        if (!first.ok) return first;
         const unknown = refusal<{ readonly revoked: string }>(
           ["assignmentId"],
           "unknown_assignment",
           UNKNOWN_ASSIGNMENT,
         );
-        const found = await readRoleAssignment(tx, org, assignmentId);
+        const seen = await readRoleAssignment(tx, org, assignmentId);
         // One the actor can't manage is answered as one that doesn't exist.
-        if (found === undefined || !mayManage(access.value, found.role, found.siteId)) {
+        if (seen === undefined || !mayManage(first.value, seen.role, seen.siteId)) {
           return unknown;
         }
-        await lockPersonForRoleChange(tx, found.userId);
+        // Both people's rows in ID order (grantRole), then the checks again.
+        await lockPeopleForRoleChange(tx, [first.userId, seen.userId]);
+        const access = await readAccess(tx, org, who.actor);
+        if (!access.ok) return access;
+        const found = await readRoleAssignment(tx, org, assignmentId);
+        if (found?.userId !== seen.userId || !mayManage(access.value, found.role, found.siteId)) {
+          return unknown;
+        }
         if (!(await deleteRoleAssignment(tx, org, assignmentId))) return unknown;
         return { ok: true, value: Object.freeze({ revoked: assignmentId }) };
       });
     },
 
-    async listRoleAssignments(context) {
+    async listRoleAssignments(context, options) {
       return run("listRoleAssignments", context, async (tx, who) => {
         const access = await readAccess(tx, who.organizationId, who.actor);
         if (!access.ok) return access;
         const sites = managedSites(access.value);
-        if (sites === "all") {
-          return { ok: true, value: await listRoleAssignments(tx, who.organizationId) };
+        if (sites !== "all" && sites.size === 0) return notPermitted();
+        if (options !== undefined && !hasOnly(options, ["after", "limit"])) {
+          return refusal(["options"], "invalid_request", "The options are after and limit.");
         }
-        if (sites.size === 0) return notPermitted();
-        const all = await listRoleAssignments(tx, who.organizationId);
+        const after = own(options, "after") ?? null;
+        if (after !== null && !isAssignmentCursor(after)) {
+          return refusal(
+            ["options", "after"],
+            "invalid_cursor",
+            "This is not where a page of role assignments ends.",
+          );
+        }
+        const limit = own(options, "limit") ?? DEFAULT_ASSIGNMENT_PAGE;
+        if (
+          typeof limit !== "number" ||
+          !Number.isInteger(limit) ||
+          limit < 1 ||
+          limit > MAX_ASSIGNMENT_PAGE
+        ) {
+          return refusal(
+            ["options", "limit"],
+            "invalid_limit",
+            `A page holds 1 to ${String(MAX_ASSIGNMENT_PAGE)} role assignments.`,
+          );
+        }
+        // A site manager sees the assignments on the sites they manage, and
+        // not those on every site: only system managers change those.
         return {
           ok: true,
-          value: Object.freeze(all.filter((a) => a.siteId === null || sites.has(a.siteId))),
+          value: await listRoleAssignments(tx, who.organizationId, {
+            ...(sites === "all" ? {} : { siteIds: [...sites] }),
+            after,
+            limit,
+          }),
         };
       });
     },
