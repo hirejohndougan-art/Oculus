@@ -159,7 +159,6 @@ export {
   resolveSession,
   rotateSession,
   switchOrganization,
-  reauthenticate,
   listSessions,
   endSession,
   endOwnSession,
@@ -185,3 +184,35 @@ export type {
   PromotionRefusal,
   CleanupResult,
 } from "./sessions.js";
+export {
+  completeSecondStep,
+  startEnrolment,
+  confirmEnrolment,
+  reauthenticate,
+  regenerateRecoveryCodes,
+  secondFactorStatus,
+  resetSecondFactor,
+  resealSecondFactorSecrets,
+  SecondStepDatabaseError,
+  SECOND_FACTOR_TABLE_PRIVILEGES,
+  DEFAULT_TOTP_ISSUER,
+  MAX_ENROLMENT_STARTS,
+} from "./second-factor.js";
+export type {
+  SecondStepRefusal,
+  SecondStepInput,
+  EnrolmentStart,
+  EnrolmentOptions,
+  EnrolmentDone,
+  ReauthenticationInput,
+  SecondFactorStatus,
+  ResealResult,
+} from "./second-factor.js";
+export {
+  loadSecretKeyring,
+  isSecretKeyring,
+  SecretKeyError,
+  SECRET_KEY_VARIABLE,
+  PREVIOUS_SECRET_KEYS_VARIABLE,
+} from "./secret-key.js";
+export type { SecretKeyring } from "./secret-key.js";

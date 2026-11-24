@@ -606,6 +606,30 @@ export {
 } from "./sign-in-throttle.js";
 export type { ThrottleRule, ThrottleState, ThrottleDecision } from "./sign-in-throttle.js";
 export {
+  hotp,
+  totpStep,
+  totpAt,
+  matchTotpStep,
+  normalizeTotpCode,
+  newTotpSecret,
+  encodeBase32,
+  decodeBase32,
+  otpauthUri,
+  newRecoveryCode,
+  formatRecoveryCode,
+  normalizeRecoveryCode,
+  isCanonicalRecoveryCode,
+  hashRecoveryCode,
+  TOTP_STEP_SECONDS,
+  TOTP_DIGITS,
+  TOTP_WINDOW_STEPS,
+  TOTP_SECRET_BYTES,
+  RECOVERY_CODE_COUNT,
+  SECOND_STEP_THROTTLE,
+  MAX_PENDING_CODE_FAILURES,
+} from "./totp.js";
+export type { OtpauthLabel } from "./totp.js";
+export {
   WORKFLOW_STATES,
   WORKFLOW_ACTIONS,
   INITIAL_WORKFLOW_STATE,

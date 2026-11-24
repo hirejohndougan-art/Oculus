@@ -36,7 +36,9 @@ import { runCleanupCli } from "./cleanup-cli.js";
 import { openDatabase, type Database, type Queryable, type Row } from "./client.js";
 import { migrate } from "./migrate.js";
 import { WRITER_PRIVILEGES, checkWriterConnection, grantWriterRole } from "./roles.js";
-import { SECOND_STEP_PROOF_MS, passedSecondStep } from "./second-step.js";
+import { reauthenticate as reauthenticateWithCode } from "./second-factor.js";
+import { giveTestFactor, testKeyring, type TestFactor } from "./second-factor.fixtures.js";
+import { SECOND_STEP_PROOF_MS, passedSecondStep, type SecondStepProof } from "./second-step.js";
 import {
   NO_SESSION,
   SESSION_TABLE_PRIVILEGES,
@@ -50,7 +52,6 @@ import {
   listSessions,
   promoteSession,
   readPendingSession,
-  reauthenticate,
   resolveSession,
   rotateSession,
   runCleanup,
@@ -72,6 +73,46 @@ let db: Database;
 let admin: UserId;
 let testDb: TestDatabase;
 const cleanups: (() => Promise<void>)[] = [];
+const keys = testKeyring();
+/** Each person's test factor (T-038): every promotion uses up one of its recovery codes. */
+const factors = new Map<UserId, TestFactor>();
+
+/**
+ * A proof of a passed second step for `sessionId` and `userId`, carrying an
+ * unused recovery code of that person (T-038): the database promotes only
+ * with a real pass (0014).
+ */
+function proofFor(sessionId: SessionId, userId: UserId): SecondStepProof {
+  const factor = factors.get(userId);
+  const code = factor?.codes.pop();
+  if (factor === undefined || code === undefined) throw new Error("no test recovery code left");
+  return passedSecondStep(sessionId, userId, {
+    method: "recovery",
+    factorId: factor.factorId,
+    code: code.replaceAll("-", ""),
+  });
+}
+
+/** A recovery code of the person whose session `token` names (or any well-formed one). */
+async function codeFor(token: string): Promise<string> {
+  const rows = await db.rows<{ user_id: UserId }>(sql`
+    SELECT user_id::text AS user_id FROM public.sessions WHERE token_hash = ${hashSessionToken(token)}`);
+  const userId = rows[0]?.user_id;
+  const code = userId === undefined ? undefined : factors.get(userId)?.codes.pop();
+  return code ?? "0000-0000-0000-0000-0000-0000";
+}
+
+/** Re-enters the password, with one of the person's recovery codes as the second step (T-038). */
+async function reauthenticate(
+  conn: Database,
+  token: string,
+  input: { password: string; source: string },
+): ReturnType<typeof reauthenticateWithCode> {
+  return reauthenticateWithCode(conn, keys, token, {
+    ...input,
+    recoveryCode: await codeFor(token),
+  });
+}
 
 async function ready(): Promise<void> {
   setup ??= (async () => {
@@ -83,7 +124,9 @@ async function ready(): Promise<void> {
       displayName: "Session Admin",
       password: ADMIN_PASSWORD,
     });
-    return { testDb: t, db: d, admin: ok(made).userId };
+    const adminId = ok(made).userId;
+    factors.set(adminId, await giveTestFactor(d, keys, adminId, 200));
+    return { testDb: t, db: d, admin: adminId };
   })();
   ({ db, admin, testDb } = await setup);
 }
@@ -158,6 +201,7 @@ async function member(
     }
   }
   if (userId === undefined) throw new Error("no user");
+  factors.set(userId, await giveTestFactor(db, keys, userId));
   return { userId, email: address };
 }
 
@@ -185,7 +229,7 @@ async function full(
   conn: Database = db,
 ): Promise<{ token: string; session: FullSession }> {
   const p = await pending(who, organizationId, conn);
-  const r = await promoteSession(conn, p.token, passedSecondStep(p.sessionId, p.userId));
+  const r = await promoteSession(conn, p.token, proofFor(p.sessionId, p.userId));
   if (!r.ok) throw new Error(JSON.stringify(r));
   return { token: r.token, session: r.session };
 }
@@ -242,7 +286,7 @@ async function fastFull(
     SELECT ${id}::uuid, ${hashSessionToken(token)}, ${userId}::uuid, ${organizationId}::uuid,
       'second_step', t, t, t, t, t, 14400, 43200, t + interval '10 minutes'
     FROM (SELECT clock_timestamp() AS t) c`);
-  const r = await promoteSession(db, token, passedSecondStep(id, userId));
+  const r = await promoteSession(db, token, proofFor(id, userId));
   if (!r.ok) throw new Error(JSON.stringify(r));
   return { token: r.token, sessionId: id };
 }
@@ -353,7 +397,7 @@ describe("signing in gives only a session waiting for its second step", () => {
     expect((await readPendingSession(db, p.token)).ok).toBe(true);
     await age(p.sessionId, 61);
     expect(await readPendingSession(db, p.token)).toBe(NO_SESSION);
-    expect(await promoteSession(db, p.token, passedSecondStep(p.sessionId, person.userId))).toBe(
+    expect(await promoteSession(db, p.token, proofFor(p.sessionId, person.userId))).toBe(
       NO_SESSION,
     );
     // The database refuses to revive or promote it as well.
@@ -381,16 +425,12 @@ describe("promotion needs a proof that only the second step makes", () => {
     const q = await pending(other, org);
     const fake = Object.freeze({ sessionId: p.sessionId, userId: person.userId });
     expect(await promoteSession(db, p.token, fake)).toBe(NO_SESSION);
-    expect(await promoteSession(db, p.token, passedSecondStep(q.sessionId, other.userId))).toBe(
+    expect(await promoteSession(db, p.token, proofFor(q.sessionId, other.userId))).toBe(NO_SESSION);
+    expect(await promoteSession(db, p.token, proofFor(p.sessionId, other.userId))).toBe(NO_SESSION);
+    expect(await promoteSession(db, q.token, proofFor(p.sessionId, person.userId))).toBe(
       NO_SESSION,
     );
-    expect(await promoteSession(db, p.token, passedSecondStep(p.sessionId, other.userId))).toBe(
-      NO_SESSION,
-    );
-    expect(await promoteSession(db, q.token, passedSecondStep(p.sessionId, person.userId))).toBe(
-      NO_SESSION,
-    );
-    const proof = passedSecondStep(p.sessionId, person.userId);
+    const proof = proofFor(p.sessionId, person.userId);
     const done = await promoteSession(db, p.token, proof);
     expect(done.ok).toBe(true);
     if (!done.ok) return;
@@ -404,7 +444,7 @@ describe("promotion needs a proof that only the second step makes", () => {
     });
     // Spent, and a full session can't be promoted again.
     expect(await promoteSession(db, done.token, proof)).toBe(NO_SESSION);
-    expect(await promoteSession(db, done.token, passedSecondStep(p.sessionId, person.userId))).toBe(
+    expect(await promoteSession(db, done.token, proofFor(p.sessionId, person.userId))).toBe(
       NO_SESSION,
     );
   });
@@ -416,7 +456,7 @@ describe("promotion needs a proof that only the second step makes", () => {
     const p = await pending(person, org);
     const start = performance.now();
     const clock = vi.spyOn(performance, "now").mockReturnValue(start);
-    const proof = passedSecondStep(p.sessionId, person.userId);
+    const proof = proofFor(p.sessionId, person.userId);
     clock.mockReturnValue(start + SECOND_STEP_PROOF_MS + 1);
     expect(await promoteSession(db, p.token, proof)).toBe(NO_SESSION);
     clock.mockReturnValue(start);
@@ -431,7 +471,7 @@ describe("promotion needs a proof that only the second step makes", () => {
     const stranger = await organization();
     const person = await member(orgA, orgB);
     const p = await pending(person);
-    const proof = passedSecondStep(p.sessionId, person.userId);
+    const proof = proofFor(p.sessionId, person.userId);
     const choose = await promoteSession(db, p.token, proof);
     expect(choose).toEqual({
       ok: false,
@@ -448,7 +488,7 @@ describe("promotion needs a proof that only the second step makes", () => {
     // The organization chosen at the password can't be swapped at promotion.
     const q = await pending(person, orgA);
     expect(
-      await promoteSession(db, q.token, passedSecondStep(q.sessionId, person.userId), {
+      await promoteSession(db, q.token, proofFor(q.sessionId, person.userId), {
         organizationId: orgB,
       }),
     ).toMatchObject({ ok: false, code: "not_permitted" });
@@ -457,7 +497,7 @@ describe("promotion needs a proof that only the second step makes", () => {
   it("asks a system admin with no memberships to name the organization", async () => {
     await ready();
     const p = await pending({ email: ADMIN_EMAIL });
-    const proof = passedSecondStep(p.sessionId, admin);
+    const proof = proofFor(p.sessionId, admin);
     expect(await promoteSession(db, p.token, proof)).toMatchObject({
       ok: false,
       code: "organization_required",
@@ -490,7 +530,7 @@ describe("promotion needs a proof that only the second step makes", () => {
     expect(rows[0]?.failures).toBe(1);
   });
 
-  it("is allowed only to sessions.ts and the session tests (the second step is T-038's)", async () => {
+  it("is allowed only to sessions.ts, the verifier (second-factor.ts) and their tests", async () => {
     const { readdirSync, readFileSync } = await import("node:fs");
     const { join } = await import("node:path");
     // A speed bump, not the control: code review is (D-069).
@@ -499,6 +539,9 @@ describe("promotion needs a proof that only the second step makes", () => {
       "packages/db/src/sessions.ts",
       "packages/db/src/sessions.test.ts",
       "packages/db/src/second-step.ts",
+      // T-038's verifier and its tests (D-077).
+      "packages/db/src/second-factor.ts",
+      "packages/db/src/second-factor.test.ts",
     ]);
     const dirs = [
       ...readdirSync(join(repo, "packages")).map((pkg) => join("packages", pkg, "src")),
@@ -577,11 +620,7 @@ describe("full sessions", () => {
       { policy: { idleSeconds: 300, absoluteSeconds: 3600 } },
     );
     if (!r.ok) throw new Error("not signed in");
-    const done = await promoteSession(
-      db,
-      r.token,
-      passedSecondStep(r.session.sessionId, person.userId),
-    );
+    const done = await promoteSession(db, r.token, proofFor(r.session.sessionId, person.userId));
     if (!done.ok) throw new Error("not promoted");
     await age(r.session.sessionId, 301);
     expect(await resolveSession(db, done.token)).toBe(NO_SESSION);
@@ -993,7 +1032,7 @@ describe("two connections at once", () => {
       const orgB = await organization();
       const person = await member(orgA, orgB);
       const p = await pending(person, orgA);
-      const proof = passedSecondStep(p.sessionId, person.userId);
+      const proof = proofFor(p.sessionId, person.userId);
       const promoted = await Promise.all([
         promoteSession(db, p.token, proof),
         promoteSession(other, p.token, proof),

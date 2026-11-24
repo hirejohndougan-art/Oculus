@@ -9,8 +9,9 @@
  *   code screen knows whose code to check), ended, and promoted, nothing
  *   else. `resolveSession` and everything that acts for a person refuse it.
  *   `promoteSession` makes it full, with a new token, and needs a proof
- *   that only T-038's verifier makes (`second-step.ts`). **Until T-038
- *   exists, no session can become full in the product.**
+ *   that only T-038's verifier (second-factor.ts) makes (`second-step.ts`),
+ *   and the database a pass for that session written in the same
+ *   transaction (0014, D-077).
  * - **Tokens** are 256-bit random, given out once, stored only as SHA-256,
  *   in one spelling (core's `isSessionToken`; anything else is refused
  *   before the database is asked). A new token at promotion, at a change of
@@ -37,7 +38,7 @@
  * - **Re-entering the password** for a sensitive change: `reauthenticate`
  *   records the time and gives a new token, and `resolveSession` says
  *   whether it was recent (`recentlyAuthenticated`, 10 minutes by default).
- *   After T-038 it must also ask for the second step (D-052).
+ *   It asks for the second step too (D-052), so it lives in second-factor.ts.
  * - **A person's own sessions:** `listSessions` (no tokens, no hashes, no
  *   addresses, only their own), `endOwnSession`, `endOtherSessions`.
  *   `endSession` is sign-out. `endUserSessions` is a system admin's, from
@@ -86,7 +87,13 @@ import {
   type VerifiedSignIn,
 } from "./accounts.js";
 import { isDatabaseFailure, type Database, type Queryable } from "./client.js";
-import { readSecondStepProof, spendSecondStepProof, type SecondStepProof } from "./second-step.js";
+import {
+  readSecondStepProof,
+  secondStepGuardRefused,
+  spendSecondStepProof,
+  writeSecondStepPass,
+  type SecondStepProof,
+} from "./second-step.js";
 import { sql } from "./sql.js";
 
 /**
@@ -123,7 +130,7 @@ export interface SessionFailure {
   readonly message: string;
 }
 
-const FAILURES: Readonly<Record<SessionFailure["code"], SessionFailure>> = Object.freeze({
+export const FAILURES: Readonly<Record<SessionFailure["code"], SessionFailure>> = Object.freeze({
   retry: Object.freeze({
     ok: false,
     code: "retry",
@@ -207,18 +214,18 @@ export interface SessionSummary {
 // ---------------------------------------------------------------------------
 // Small helpers
 
-function own(input: unknown, key: string): unknown {
+export function own(input: unknown, key: string): unknown {
   if (!isPlainObject(input)) return undefined;
   const d = Object.getOwnPropertyDescriptor(input, key);
   return d !== undefined && "value" in d ? (d.value as unknown) : undefined;
 }
 
-function hasOnly(input: unknown, keys: readonly string[]): boolean {
+export function hasOnly(input: unknown, keys: readonly string[]): boolean {
   if (!isPlainObject(input)) return false;
   return Reflect.ownKeys(input).every((k) => typeof k === "string" && keys.includes(k));
 }
 
-function refused<T>(code: string, message: string): Validated<T> {
+export function refused<T>(code: string, message: string): Validated<T> {
   return { ok: false, issues: [{ path: [], code, message }] };
 }
 
@@ -249,7 +256,7 @@ function sessionGuardRefused(error: unknown): boolean {
 }
 
 /** The options as given, checked: only `onError`, a function if present. */
-function callOptions(options: unknown, extra: readonly string[] = []): SessionCallOptions {
+export function callOptions(options: unknown, extra: readonly string[] = []): SessionCallOptions {
   if (options === undefined) return {};
   const onError = own(options, "onError");
   if (
@@ -272,7 +279,10 @@ function callOptions(options: unknown, extra: readonly string[] = []): SessionCa
  * timeout (55P03, which T-051's `lock_timeout` raises) is answered `timeout`
  * too, though its class isn't one of S-016's.
  */
-function failureFor(error: unknown, options: SessionCallOptions): NoSession | SessionFailure {
+export function failureFor(
+  error: unknown,
+  options: SessionCallOptions,
+): NoSession | SessionFailure {
   if (sessionGuardRefused(error)) return NO_SESSION;
   const state = sqlState(error);
   if (state !== "55P03" && !isDatabaseFailure(error)) throw error;
@@ -287,14 +297,17 @@ function failureFor(error: unknown, options: SessionCallOptions): NoSession | Se
 }
 
 /** `failureFor` as a `Validated` refusal. */
-function refusedFor<T>(error: unknown, options: SessionCallOptions): Validated<T> {
+export function refusedFor<T>(error: unknown, options: SessionCallOptions): Validated<T> {
   const f = failureFor(error, options);
   return refused(f.code, f.message);
 }
 
 const RETRYABLE = new Set(["40P01", "40001"]);
 
-async function inTransaction<T>(db: Database, work: (tx: Queryable) => Promise<T>): Promise<T> {
+export async function inTransaction<T>(
+  db: Database,
+  work: (tx: Queryable) => Promise<T>,
+): Promise<T> {
   for (let attempt = 1; ; attempt++) {
     try {
       return await db.transaction(work);
@@ -305,7 +318,7 @@ async function inTransaction<T>(db: Database, work: (tx: Queryable) => Promise<T
 }
 
 /** The hash of a token in canonical form, or `undefined` (never sent to the database). */
-function tokenHash(token: unknown): Uint8Array | undefined {
+export function tokenHash(token: unknown): Uint8Array | undefined {
   return isSessionToken(token) ? hashSessionToken(token) : undefined;
 }
 
@@ -315,7 +328,7 @@ function tokenHash(token: unknown): Uint8Array | undefined {
  * is locked, and returns the user ID, or `undefined` if no such session.
  * Every path takes the user row first, so they serialise without deadlock.
  */
-async function lockUserOf(
+export async function lockUserOf(
   tx: Queryable,
   hash: Uint8Array,
   mode: "share" | "update",
@@ -338,9 +351,9 @@ function recentWindow(options: unknown): number {
   return seconds;
 }
 
-const ISO = 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"';
+export const ISO = 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"';
 
-interface FullRow {
+export interface FullRow {
   id: SessionId;
   user_id: UserId;
   organization_id: OrganizationId;
@@ -352,7 +365,7 @@ interface FullRow {
   recent: boolean;
 }
 
-function fullSession(row: FullRow): FullSession {
+export function fullSession(row: FullRow): FullSession {
   return Object.freeze({
     sessionId: row.id,
     userId: row.user_id,
@@ -367,7 +380,7 @@ function fullSession(row: FullRow): FullSession {
 }
 
 /** The RETURNING list of a full session (`s` the session, `u` its user). */
-function fullColumns(recentSeconds: number) {
+export function fullColumns(recentSeconds: number) {
   return sql`
     s.id::text AS id, s.user_id::text AS user_id, s.organization_id::text AS organization_id,
     u.system_admin,
@@ -380,11 +393,11 @@ function fullColumns(recentSeconds: number) {
 }
 
 /** Whether session `s` is usable (time limits and `session_access_ok`), by the database's clock. */
-const VALID = sql`public.session_live(s)
+export const VALID = sql`public.session_live(s)
   AND public.session_access_ok(s.user_id, s.organization_id, s.signed_in_at)`;
 
 /** The conditions for a usable full session `s` of user `u`. */
-const LIVE_FULL = sql`s.stage = 'full' AND u.id = s.user_id AND ${VALID}`;
+export const LIVE_FULL = sql`s.stage = 'full' AND u.id = s.user_id AND ${VALID}`;
 
 // ---------------------------------------------------------------------------
 // Signing in
@@ -559,9 +572,22 @@ export type PromotionRefusal =
       readonly code: "organization_required";
       readonly message: string;
     }
-  | { readonly ok: false; readonly code: "not_permitted"; readonly message: string };
+  | { readonly ok: false; readonly code: "not_permitted"; readonly message: string }
+  | {
+      readonly ok: false;
+      /** The database refused the pass: the code was used meanwhile, or the race was lost. */
+      readonly code: "invalid_code";
+      readonly message: string;
+    };
 
-const NOT_PERMITTED_HERE = Object.freeze({
+/** The code was right when checked but the database refused its pass (used meanwhile). */
+export const CODE_REFUSED = Object.freeze({
+  ok: false,
+  code: "invalid_code",
+  message: "That code isn't right, or was used already. Try the next code.",
+} as const);
+
+export const NOT_PERMITTED_HERE = Object.freeze({
   ok: false,
   code: "not_permitted",
   message: "You can't work in that organization.",
@@ -644,10 +670,18 @@ export async function promoteSession(
         SELECT public.session_access_ok(s.user_id, ${organizationId}::uuid, s.signed_in_at) AS ok
         FROM public.sessions s WHERE s.id = ${row.id}::uuid`);
       if (access[0]?.ok !== true) return NOT_PERMITTED_HERE;
+      // The pass, in this transaction (0014): the database promotes only
+      // with it, and it moves the ratchet or uses the recovery code up.
+      const passId = await writeSecondStepPass(
+        tx,
+        { userId: row.user_id, sessionId: row.id, purpose: "sign_in" },
+        record.pass,
+      );
+      await record.afterPass?.(tx);
       const promoted = await tx.rows<FullRow>(sql`
         UPDATE public.sessions s
         SET stage = 'full', token_hash = ${hashSessionToken(newToken)},
-            organization_id = ${organizationId}::uuid,
+            organization_id = ${organizationId}::uuid, second_step_pass = ${passId}::uuid,
             second_step_at = clock_timestamp(), rotated_at = clock_timestamp(),
             last_seen_at = clock_timestamp(),
             expires_at = s.signed_in_at + make_interval(secs => s.absolute_seconds)
@@ -660,6 +694,9 @@ export async function promoteSession(
       return { ok: true, token: newToken, session: fullSession(done) } as const;
     });
   } catch (error) {
+    // The pass was refused: the code was used meanwhile (another
+    // connection), or the session or account changed. Nothing committed.
+    if (secondStepGuardRefused(error)) return CODE_REFUSED;
     return failureFor(error, call);
   }
 }
@@ -784,11 +821,11 @@ export async function switchOrganization(
       await tx.execute(sql`
         INSERT INTO public.sessions
           (id, token_hash, user_id, organization_id, stage, signed_in_at, created_at,
-           last_seen_at, rotated_at, password_at, second_step_at, idle_seconds,
+           last_seen_at, rotated_at, password_at, second_step_at, second_step_pass, idle_seconds,
            absolute_seconds, expires_at, client_label)
         SELECT ${newId}::uuid, ${hashSessionToken(newToken)}, o.user_id, ${organizationId}::uuid,
                'full', o.signed_in_at, c.t, c.t, c.t, o.signed_in_at, o.second_step_at,
-               o.idle_seconds, o.absolute_seconds, o.expires_at, o.client_label
+               o.second_step_pass, o.idle_seconds, o.absolute_seconds, o.expires_at, o.client_label
         FROM public.sessions o, (SELECT clock_timestamp() AS t) c
         WHERE o.id = ${row.id}::uuid`);
       await tx.execute(sql`DELETE FROM public.sessions WHERE id = ${row.id}::uuid`);
@@ -805,69 +842,8 @@ export async function switchOrganization(
   }
 }
 
-/**
- * Records that the person entered their password again in this session, for
- * a sensitive change (D-052, ASVS 5.0 7.5.1), and gives the session a **new
- * token** (the old one stops). The same check as sign-in, with its throttle
- * (`signIn`'s failures are passed on). Afterwards `resolveSession` gives
- * `recentlyAuthenticated: true` for the window asked. **T-038 must extend
- * this to ask for the second step as well.**
- */
-export async function reauthenticate(
-  db: Database,
-  token: unknown,
-  input: { readonly password: string; readonly source: string },
-  options: SessionCallOptions = {},
-): Promise<IssuedSession<FullSession> | NoSession | SignInFailure | SessionFailure> {
-  const call = callOptions(options);
-  const hash = tokenHash(token);
-  if (hash === undefined) return NO_SESSION;
-  if (!hasOnly(input, ["password", "source"])) return NO_SESSION;
-  const newToken = newSessionToken();
-  try {
-    const current = await resolveSession(db, token, call);
-    if (!current.ok) return current;
-    const users = await db.rows<{ email: string }>(sql`
-      SELECT email FROM public.users WHERE id = ${current.session.userId}::uuid`);
-    const email = users[0]?.email;
-    if (email === undefined) return NO_SESSION;
-    const out: { verified?: VerifiedSignIn } = {};
-    const checked = await signInChecked(
-      db,
-      {
-        email,
-        password: own(input, "password") as string,
-        source: own(input, "source") as string,
-        organizationId: current.session.organizationId,
-      },
-      out,
-    );
-    if (!checked.ok) return checked;
-    const verified = out.verified;
-    if (checked.userId !== current.session.userId || verified === undefined) return NO_SESSION;
-    // Stamped only if the password checked is still the account's and no
-    // "end all" came in between: a password changed meanwhile wins (second
-    // review, R1).
-    const rows = await db.rows<FullRow>(sql`
-      UPDATE public.sessions s
-      SET password_at = clock_timestamp(), last_seen_at = clock_timestamp(),
-          token_hash = ${hashSessionToken(newToken)}, rotated_at = clock_timestamp()
-      FROM public.users u
-      WHERE s.token_hash = ${hash} AND s.id = ${current.session.sessionId}::uuid AND ${LIVE_FULL}
-        AND u.password_hash = ${verified.passwordHash}
-        AND u.sessions_valid_after = ${verified.sessionsValidAfter}::timestamptz
-      RETURNING ${fullColumns(RECENT_AUTHENTICATION_SECONDS)}`);
-    const row = rows[0];
-    if (row !== undefined) return { ok: true, token: newToken, session: fullSession(row) };
-    // Either the session ended or the password changed under it.
-    const alive = await db.rows(sql`
-      SELECT 1 FROM public.sessions s JOIN public.users u ON u.id = s.user_id
-      WHERE s.token_hash = ${hash} AND ${LIVE_FULL}`);
-    return alive.length === 1 ? INVALID_CREDENTIALS : NO_SESSION;
-  } catch (error) {
-    return failureFor(error, call);
-  }
-}
+// Re-entering the password (`reauthenticate`) asks for the second step as
+// well (D-052), so it lives with the verifier in second-factor.ts.
 
 // ---------------------------------------------------------------------------
 // A person's own sessions
@@ -1107,6 +1083,8 @@ export async function deleteExpiredSessions(db: Queryable): Promise<number> {
 export interface CleanupResult {
   readonly sessions: number;
   readonly signInThrottles: number;
+  /** Wrong-code counters (T-038) a day old, and those of sessions that have ended. */
+  readonly secondStepThrottles: number;
 }
 
 /**
@@ -1117,5 +1095,12 @@ export interface CleanupResult {
 export async function runCleanup(db: Queryable): Promise<CleanupResult> {
   const sessions = await deleteExpiredSessions(db);
   const signInThrottles = await deleteExpiredSignInThrottles(db);
-  return Object.freeze({ sessions, signInThrottles });
+  // core's SECOND_STEP_THROTTLE forgets a counter after a day without a
+  // failure; a waiting session's counter is useless once the session is gone.
+  const secondStepThrottles = await db.execute(sql`
+    DELETE FROM public.second_step_throttles t
+    WHERE t.last_failure_at IS NULL OR t.last_failure_at < clock_timestamp() - interval '1 day'
+       OR (t.key LIKE 'session:%' AND NOT EXISTS (
+             SELECT 1 FROM public.sessions s WHERE 'session:' || s.id::text = t.key))`);
+  return Object.freeze({ sessions, signInThrottles, secondStepThrottles });
 }
