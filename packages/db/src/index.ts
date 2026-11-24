@@ -74,7 +74,12 @@ export { recordCheckIssues, fixedMessages, linkedIds } from "./record-checks.js"
 export type { RecordCheckOptions } from "./record-checks.js";
 export { deleteRecord } from "./record-delete.js";
 export type { RecordDeletion, RecordDeletionResult } from "./record-delete.js";
-export { grantWriterRole, checkWriterConnection, WRITER_GRANTS } from "./roles.js";
+export {
+  grantWriterRole,
+  checkWriterConnection,
+  WRITER_GRANTS,
+  WRITER_PRIVILEGES,
+} from "./roles.js";
 export type { WriterRoleProblem } from "./roles.js";
 export type { RestoreOptions } from "./record-restore.js";
 export {

@@ -1608,7 +1608,10 @@ describe("a stop that comes late, and the archive", () => {
     expect(refused.code).toBe("bad_file");
     // Everything before the last chunk may have gone; the last never does.
     expect(written).toBe(Math.floor((manifest.dump.bytes - 1) / (1024 * 1024)) * 1024 * 1024);
-  });
+    // As long as the test before it: if that one didn't run first, this one
+    // builds the 600,000-row backup itself, and under a full gate run that
+    // took longer than the default 5 seconds.
+  }, 60_000);
 });
 
 /** The command, compiled (types stripped) into a temporary directory, to run as a real process. */

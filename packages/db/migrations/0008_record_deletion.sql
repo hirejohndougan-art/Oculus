@@ -17,9 +17,10 @@
 --      deferred): a delete version can't be left in front of a live row;
 --    - a DELETE of a record row is refused unless this same transaction has
 --      stored its delete version (zzzz_records_delete_needs_version);
---    - so the delete version is always the record's last: no later version
---      can be written (no row carries its number) and the ID can't be used
---      again (records_id_used_before, 0005).
+--    - the delete version is always the record's last: no version of any
+--      kind is stored after one (record_versions_after_delete), the row can't
+--      be updated once its delete version is stored (records_deleted), and the
+--      ID can't be used again (records_id_used_before, 0005).
 --    The app's writer role gets DELETE on records only now (D-067 lists its
 --    GRANTs); every other role still has none.
 --
@@ -52,6 +53,15 @@ DECLARE
   row_version integer;
   fixed CONSTANT text[] := ARRAY['id', 'organizationId', 'createdAt', 'updatedAt', 'fields'];
 BEGIN
+  -- A deletion is always the record's last version: nothing, not even
+  -- another deletion, is stored after one.
+  IF EXISTS (SELECT 1 FROM public.record_versions
+             WHERE organization_id = NEW.organization_id AND record_id = NEW.record_id
+               AND action = 'delete') THEN
+    RAISE EXCEPTION 'Nothing is stored after a record''s deletion version.'
+      USING ERRCODE = 'integrity_constraint_violation',
+            CONSTRAINT = 'record_versions_after_delete';
+  END IF;
   row_version := CASE WHEN NEW.action = 'delete' THEN NEW.version - 1 ELSE NEW.version END;
   SELECT * INTO current_row FROM public.records
   WHERE organization_id = NEW.organization_id AND id = NEW.record_id
@@ -120,6 +130,27 @@ CREATE CONSTRAINT TRIGGER zzzz_record_versions_delete_done AFTER INSERT ON publi
   DEFERRABLE INITIALLY DEFERRED
   FOR EACH ROW WHEN (NEW.action = 'delete')
   EXECUTE FUNCTION public.record_versions_delete_done();
+
+-- A record whose deletion version is stored can't be written again before
+-- its DELETE (its row is about to go): the deletion holds the row as it was.
+CREATE FUNCTION public.records_not_deleted() RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM public.record_versions
+             WHERE organization_id = OLD.organization_id AND record_id = OLD.id
+               AND action = 'delete') THEN
+    RAISE EXCEPTION 'A record with a deletion version is never written again.'
+      USING ERRCODE = 'integrity_constraint_violation',
+            CONSTRAINT = 'records_deleted';
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER zzzz_records_not_deleted BEFORE UPDATE ON public.records
+  FOR EACH ROW EXECUTE FUNCTION public.records_not_deleted();
 
 -- A record row is deleted only after this transaction stored its delete
 -- version, one past the row's version (so it holds the row as deleted).

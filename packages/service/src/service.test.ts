@@ -14,6 +14,8 @@ import {
   type Validated,
 } from "@oculus/core";
 import {
+  WRITER_PRIVILEGES,
+  allocateIdentifier,
   deleteRecord,
   grantWriterRole,
   insertIdentifierType,
@@ -28,7 +30,9 @@ import {
   readVersion,
   readVersions,
   recordsUsingTerm,
+  saveTerm,
   sql,
+  updateIdentifierType,
   termKey,
   type Database,
   type Queryable,
@@ -93,7 +97,9 @@ async function ready(): Promise<void> {
     const testDb = await freshDatabase();
     await migrate({ connectionString: testDb.url });
     const suffix = newRecordId().slice(0, 8);
-    const roles = ["writer", "reader", "nobody"].map((r) => `oculus_t032_${r}_${suffix}`);
+    const roles = ["writer", "reader", "nobody", "member", "dbowner", "creator"].map(
+      (r) => `oculus_t032_${r}_${suffix}`,
+    );
     const [writerRole = "", readerRole = "", nobodyRole = ""] = roles;
     const server = openDatabase(testServerUrl(), { max: 1 });
     try {
@@ -182,6 +188,8 @@ async function organization(): Promise<OrganizationId> {
         field("number", "identifier"),
         field("creator", "record_link", { recordKinds: ["agent"] }),
         field("subjects", "controlled_term", { repeatable: true }),
+        field("found_at", "place"),
+        field("shown_at", "place", { repeatable: true }),
       ],
     }),
   );
@@ -189,6 +197,7 @@ async function organization(): Promise<OrganizationId> {
     ["invented-unit", "archival_unit"],
     ["invented-agent", "agent"],
     ["invented-asset", "digital_asset"],
+    ["invented-place", "place"],
   ] as const) {
     ok(
       await insertTemplateVersion(s.owner, {
@@ -352,6 +361,142 @@ describe("the writer role", () => {
     }
   });
 
+  it("refuses a role that is (or may become) an owner, can create roles, or lacks any grant", async () => {
+    await ready();
+    const [, , , ownerMember = "", databaseOwner = "", creator = ""] = s.roles;
+    const [ownerRow] = await s.owner.rows<{ name: string }>(sql`SELECT current_user AS name`);
+    const ownerRole = ownerRow?.name ?? "";
+    const problems = async (role: string): Promise<string[]> => {
+      const pool = as(s.testDb.url, role);
+      try {
+        return (await createService(pool).checkConnection()).map((p) => p.code);
+      } finally {
+        await pool.close();
+      }
+    };
+    await s.owner.transaction(async (q) => {
+      for (const role of [ownerMember, databaseOwner, creator]) await grantWriterRole(q, role);
+    });
+    // A NOINHERIT member of the owner can still SET ROLE to it.
+    const server = openDatabase(testServerUrl(), { max: 1 });
+    try {
+      await server.transaction(async (q) => {
+        await withRole(q, "ALTER ROLE %I NOINHERIT", ownerMember);
+        await q.rows(sql`SELECT set_config('oculus_test.owner', ${ownerRole}, true),
+                                set_config('oculus_test.role', ${ownerMember}, true)`);
+        await q.execute(sql`DO $$ BEGIN
+          EXECUTE format('GRANT %I TO %I', current_setting('oculus_test.owner'),
+                         current_setting('oculus_test.role'));
+        END $$`);
+        await withRole(q, "ALTER ROLE %I CREATEROLE", creator);
+      });
+    } finally {
+      await server.close();
+    }
+    expect(await problems(ownerMember)).toEqual(["owner"]);
+    expect(await problems(creator)).toEqual(["createrole"]);
+    // The database's owner (and so a member of pg_database_owner, which owns
+    // schema public).
+    const setOwner = async (role: string): Promise<void> => {
+      const admin = openDatabase(testServerUrl(), { max: 1 });
+      try {
+        await admin.transaction(async (q) => {
+          await q.rows(sql`SELECT set_config('oculus_test.db', ${s.testDb.name}, true),
+                                  set_config('oculus_test.role', ${role}, true)`);
+          await q.execute(sql`DO $$ BEGIN
+            EXECUTE format('ALTER DATABASE %I OWNER TO %I', current_setting('oculus_test.db'),
+                           current_setting('oculus_test.role'));
+          END $$`);
+        });
+      } finally {
+        await admin.close();
+      }
+    };
+    await setOwner(databaseOwner);
+    try {
+      expect(await problems(databaseOwner)).toEqual(["owner"]);
+    } finally {
+      await setOwner(ownerRole);
+    }
+    expect(await problems(databaseOwner)).toEqual([]);
+    // Each grant missing in turn.
+    const writerRole = s.roles[0] ?? "";
+    for (const [table, privileges] of Object.entries(WRITER_PRIVILEGES)) {
+      for (const privilege of [...privileges, "SELECT"]) {
+        const statement = (verb: string) =>
+          `${verb} ${privilege} ON public.${table} ${verb === "GRANT" ? "TO" : "FROM"} %I`;
+        await s.owner.transaction((q) => withRole(q, statement("REVOKE"), writerRole));
+        try {
+          expect({
+            table,
+            privilege,
+            codes: (await service.checkConnection()).map((p) => p.code),
+          }).toEqual({
+            table,
+            privilege,
+            codes: ["missing_privilege"],
+          });
+        } finally {
+          await s.owner.transaction((q) => withRole(q, statement("GRANT"), writerRole));
+        }
+      }
+    }
+    expect(await service.checkConnection()).toEqual([]);
+  });
+
+  it("the writer's grants cover every data-access write, and nothing it doesn't use", async () => {
+    await ready();
+    const org = await organization();
+    const w = s.writer;
+    // As the writer: a template and record type version, an identifier type
+    // added and edited, a number allocated, a term saved.
+    ok(
+      await insertTemplateVersion(w, {
+        key: "invented-object",
+        organizationId: org,
+        label: "Invented objects, by the writer",
+        appliesTo: ["object"],
+        fields: [field("note", "text")],
+      }),
+    );
+    ok(
+      await insertRecordTypeVersion(w, {
+        key: "chair",
+        organizationId: org,
+        label: "Chair, by the writer",
+        kind: "object",
+        defaultTemplateKey: "invented-object",
+      }),
+    );
+    const accession = {
+      organizationId: org,
+      key: "accession",
+      label: "Accession number",
+      uniqueness: "all_time",
+      autoNumber: { style: "prefix", prefix: "ACC-", digits: 4 },
+    };
+    ok(await w.transaction((q) => insertIdentifierType(q, accession)));
+    ok(await w.transaction((q) => updateIdentifierType(q, { ...accession, label: "Accessions" })));
+    expect(ok(await w.transaction((q) => allocateIdentifier(q, org, "accession")))).toBe(
+      "ACC-0001",
+    );
+    ok(await w.transaction((q) => saveTerm(q, { organizationId: org, term: RAILROADS })));
+    // What it no longer may do.
+    for (const statement of [
+      sql`DELETE FROM public.organizations WHERE id = ${org}::uuid`,
+      sql`UPDATE public.templates SET key = key WHERE organization_id = ${org}::uuid`,
+      sql`DELETE FROM public.templates WHERE organization_id = ${org}::uuid`,
+      sql`DELETE FROM public.record_types WHERE organization_id = ${org}::uuid`,
+      sql`DELETE FROM public.identifier_types WHERE organization_id = ${org}::uuid`,
+      sql`DELETE FROM public.identifier_counters WHERE organization_id = ${org}::uuid`,
+      sql`DELETE FROM public.terms WHERE organization_id = ${org}::uuid`,
+      sql`UPDATE public.record_identifiers SET position = position WHERE organization_id = ${org}::uuid`,
+      sql`UPDATE public.record_terms SET field_key = field_key WHERE organization_id = ${org}::uuid`,
+    ]) {
+      expect((await refusal(w.execute(statement))).code).toBe(DENIED);
+    }
+  });
+
   it("no role but the writer can write any table; nothing is granted to PUBLIC", async () => {
     await ready();
     const org = await organization();
@@ -461,7 +606,7 @@ describe("the writer role", () => {
             FROM public.records r WHERE ${where}`);
         }),
       ),
-    ).toEqual({ code: IDENTITY, constraint: "record_versions_next_number" });
+    ).toEqual({ code: IDENTITY, constraint: "records_deleted" });
     expect(await versionCount(org, record.id)).toBe(1);
     expect(await rowExists(org, record.id)).toBe(true);
     // The owner is refused too, unless it turns triggers off.
@@ -472,6 +617,96 @@ describe("the writer role", () => {
     expect(await refusal(s.owner.execute(sql`TRUNCATE public.records CASCADE`))).toMatchObject({
       code: IDENTITY,
     });
+  });
+});
+
+describe("nothing follows a deletion version", () => {
+  const tombstone = (where: Sql, version: Sql) => sql`
+    INSERT INTO public.record_versions (organization_id, record_id, version, record, actor, action)
+    SELECT organization_id, id, ${version}, public.record_snapshot(r), 'system:sneaky', 'delete'
+    FROM public.records r WHERE ${where}`;
+  const save = (where: Sql) => sql`
+    INSERT INTO public.record_versions (organization_id, record_id, version, record, actor)
+    SELECT organization_id, id, version, public.record_snapshot(r), 'system:sneaky'
+    FROM public.records r WHERE ${where}`;
+
+  it("refuses the writer's save-after-delete sequences, long and short", async () => {
+    await ready();
+    const org = await organization();
+    const record = await create(org, objectDraft());
+    const where = sql`organization_id = ${org}::uuid AND id = ${record.id}::uuid`;
+    // Long: delete v2, row to v2 then v3, save v3, delete v4, DELETE.
+    const long = await refusal(
+      s.writer.transaction(async (q) => {
+        await q.execute(tombstone(where, sql`version + 1`));
+        await q.execute(sql`UPDATE public.records SET version = version + 1 WHERE ${where}`);
+        await q.execute(
+          sql`UPDATE public.records SET title = 'Revived', version = version + 1 WHERE ${where}`,
+        );
+        await q.execute(save(where));
+        await q.execute(tombstone(where, sql`version + 1`));
+        await q.execute(sql`DELETE FROM public.records WHERE ${where}`);
+      }),
+    );
+    expect(long).toEqual({ code: IDENTITY, constraint: "records_deleted" });
+    // Short: delete v2, row to v2 with another title, delete v3, DELETE.
+    const short = await refusal(
+      s.writer.transaction(async (q) => {
+        await q.execute(tombstone(where, sql`version + 1`));
+        await q.execute(
+          sql`UPDATE public.records SET title = 'Changed', version = version + 1 WHERE ${where}`,
+        );
+        await q.execute(tombstone(where, sql`version + 1`));
+        await q.execute(sql`DELETE FROM public.records WHERE ${where}`);
+      }),
+    );
+    expect(short).toEqual({ code: IDENTITY, constraint: "records_deleted" });
+    expect((await readVersions(s.owner, org, record.id)).ok).toBe(true);
+    expect(await versionCount(org, record.id)).toBe(1);
+    expect(await rowExists(org, record.id)).toBe(true);
+  });
+
+  it("the version check alone refuses them too (the row trigger turned off by the owner)", async () => {
+    await ready();
+    const org = await organization();
+    const record = await create(org, objectDraft());
+    const where = sql`organization_id = ${org}::uuid AND id = ${record.id}::uuid`;
+    for (const sequence of [
+      // Long.
+      async (q: Queryable) => {
+        await q.execute(tombstone(where, sql`version + 1`));
+        await q.execute(sql`UPDATE public.records SET version = version + 1 WHERE ${where}`);
+        await q.execute(
+          sql`UPDATE public.records SET title = 'Revived', version = version + 1 WHERE ${where}`,
+        );
+        await q.execute(save(where));
+      },
+      // Short.
+      async (q: Queryable) => {
+        await q.execute(tombstone(where, sql`version + 1`));
+        await q.execute(
+          sql`UPDATE public.records SET title = 'Changed', version = version + 1 WHERE ${where}`,
+        );
+        await q.execute(tombstone(where, sql`version + 1`));
+      },
+    ]) {
+      expect(
+        await refusal(
+          s.owner.transaction(async (q) => {
+            await q.execute(
+              sql`ALTER TABLE public.records DISABLE TRIGGER zzzz_records_not_deleted`,
+            );
+            await sequence(q);
+          }),
+        ),
+      ).toEqual({ code: IDENTITY, constraint: "record_versions_after_delete" });
+    }
+    expect(await versionCount(org, record.id)).toBe(1);
+    // The trigger is back (the transactions rolled back).
+    const [on] = await s.owner.rows<{ enabled: string }>(sql`
+      SELECT tgenabled AS enabled FROM pg_catalog.pg_trigger
+      WHERE tgname = 'zzzz_records_not_deleted'`);
+    expect(on?.enabled).toBe("O");
   });
 });
 
@@ -1059,6 +1294,43 @@ describe("deleting records", () => {
       ),
     );
     ok(await service.deleteRecord(ctx(org), maker.id, { expectedVersion: 1 }));
+  });
+});
+
+describe("deleting a place others point at", () => {
+  it("refuses while a place value names it, single or in a list", async () => {
+    await ready();
+    const org = await organization();
+    const place = (title: string) =>
+      create(org, { kind: "place", title, templateKey: "invented-place" });
+    const town = await place("An invented town");
+    const depot = await place("An invented depot");
+    const single = await create(
+      org,
+      objectDraft({ found_at: { label: "Town", recordId: town.id } }),
+    );
+    const listed = await create(
+      org,
+      objectDraft({
+        shown_at: [{ label: "Nowhere" }, { label: "Depot", recordId: depot.id }],
+      }),
+    );
+    for (const target of [town, depot]) {
+      const refused = await service.deleteRecord(ctx(org), target.id, { expectedVersion: 1 });
+      expect(codes(refused)).toEqual(["linked_from"]);
+      expect(await rowExists(org, target.id)).toBe(true);
+    }
+    // A place named without a record doesn't hold anything back.
+    ok(
+      await service.updateRecord(
+        ctx(org),
+        single.id,
+        draftOf(single, { fields: { note: "Oak.", found_at: { label: "Town" } } }),
+        { expectedVersion: 1 },
+      ),
+    );
+    ok(await service.deleteRecord(ctx(org), town.id, { expectedVersion: 1 }));
+    expect(await rowExists(org, listed.id)).toBe(true);
   });
 });
 
