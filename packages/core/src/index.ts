@@ -31,6 +31,7 @@ export {
   MAX_FIELD_ENTRIES,
   MAX_RECORD_CHARS,
   MAX_KEY_LENGTH,
+  RECORD_PROPERTIES,
   validateRecord,
   createRecord,
   isRecordKind,
@@ -281,7 +282,12 @@ export type {
 
 export { checkRightsValue, makeIdentifierChecker } from "./field-checkers.js";
 export { makeRecordLinkChecker } from "./record-links.js";
-export { compareRecords, sameJson } from "./record-compare.js";
+export {
+  INHERITANCE_INERT_PROPERTIES,
+  changesInheritance,
+  compareRecords,
+  sameJson,
+} from "./record-compare.js";
 export type { RecordChangeKind, RecordDifference, RecordComparison } from "./record-compare.js";
 export {
   DEFAULT_STALE_LINK_LABELS,

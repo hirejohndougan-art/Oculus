@@ -32,6 +32,7 @@ import {
   loadAccess,
   lockArrangement,
   lockRecord,
+  placesHolding,
   readRecordPlace,
   readSite,
   sitesSharedInto,
@@ -219,6 +220,46 @@ export class RecordAccess {
   }
 
   /**
+   * S-028: for a first look before the record's row lock, whether
+   * `onRecord` would allow `all` and `any` on the record as it is now, and
+   * the version that look read, taking no row lock at all (the arrangement
+   * lock is taken as for any check, D-065). `undefined` for a record that
+   * doesn't exist. The answer holds only while the record stays at that
+   * version: check again under the row lock.
+   */
+  async allowsUnlocked(
+    id: RecordId,
+    all: readonly Permission[],
+    any: readonly Permission[] = [],
+  ): Promise<{ readonly allowed: boolean; readonly version: number } | undefined> {
+    const scoped = hasScopedGrants(this.access);
+    if (scoped) await this.settle();
+    const found = (
+      await placesHolding(this.tx, this.organizationId, [id], { units: scoped, lock: false })
+    ).get(id);
+    if (found === undefined) return undefined;
+    const target = await this.heldTarget(id, found.place, found.units);
+    const allowed =
+      permits(this.access, "records.view", target) &&
+      all.every((p) => permits(this.access, p, target)) &&
+      (any.length === 0 || this.allows(any, target));
+    return { allowed, version: found.place.version };
+  }
+
+  /** The target for a stored record at `place`, with the units `placesHolding` found. */
+  private async heldTarget(
+    id: RecordId,
+    place: RecordPlace,
+    units: ReadonlySet<RecordId> | undefined,
+  ): Promise<PermissionTarget> {
+    const site = place.siteId ?? null;
+    const sharedInto = await sitesSharedInto(this.organizationId, id);
+    return hasScopedGrants(this.access)
+      ? { on: "units", units: units ?? new Set(), site, sharedInto }
+      : { on: "catalog", site, sharedInto };
+  }
+
+  /**
    * Of `ids`, the records that exist and that the actor may not view (none
    * for a system manager). A link to one of them is answered as a link to a
    * record that doesn't exist.
@@ -226,10 +267,15 @@ export class RecordAccess {
   async hiddenAmong(ids: readonly RecordId[]): Promise<ReadonlySet<RecordId>> {
     const hidden = new Set<RecordId>();
     if (ids.length === 0 || this.access.systemManager) return hidden;
-    for (const id of [...new Set(ids)].sort()) {
-      const place = await readRecordPlace(this.tx, this.organizationId, id);
-      if (place === undefined) continue;
-      if (!(await this.views(id, place))) hidden.add(id);
+    // S-028: every place (and, for scoped grants, the units holding each)
+    // read at once, after the arrangement lock, with the answers reading
+    // them one by one (`views`) gives.
+    const scoped = hasScopedGrants(this.access);
+    if (scoped) await this.settle();
+    const found = await placesHolding(this.tx, this.organizationId, ids, { units: scoped });
+    for (const [id, { place, units }] of found) {
+      const target = await this.heldTarget(id, place, units);
+      if (!permits(this.access, "records.view", target)) hidden.add(id);
     }
     return hidden;
   }

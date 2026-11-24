@@ -188,6 +188,7 @@ export {
   lockPersonForRoleChange,
   lockPeopleForRoleChange,
   unitsHolding,
+  placesHolding,
   sitesSharedInto,
   insertSite,
   readSite,

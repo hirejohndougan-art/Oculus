@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 15:26 CT — manual (John: "continue building") — S-028 Make the S-020 dependents check cheap
+- Result: done
+- What changed: core `changesInheritance` names the properties that can't change what records below inherit (title, record type, media type, agent type, coordinates); edits that change only those skip the dependents check. `placesHolding` and `hiddenAmong` are set-based (one query). The 500-dependent cap applies only to edits that can change inheritance. `belowAtStake` and `RecordAccess.allowsUnlocked` decide before locking whether records below need locking; the answer is recomputed under the row lock and a mismatch retries. A title edit on a unit with 250 published below: 5,538 statements → 33.
+- Decisions: none
+- Review: one independent round, no blocking issue (concurrent publish/edit pinned on two pools, a version race, adversarial chains and loops, an 8-pool deadlock loop with zero deadlocks). Note carried to T-041b: keep `allowsUnlocked` in step with `onRecord`.
+- Gate: PASS · tests_passing 3971 (was 3961) · npm audit clean
+- Next: T-045 review fixes (in progress), then T-046 item list and record editor
+
 ## 2026-11-24 14:27 CT — manual (John: "continue building") — S-027 Review of the S-020 lock order
 - Result: done (review only)
 - What changed: nothing in code. An independent review of ca063e3 checked every edit and publish path against the below → record → above order, pinned seven race variants on two pools (all refused `inherits_from_hidden`), and ran 20 rounds of mixed concurrent operations without a deadlock. The one deadlock found (a system manager's invalid loop move against an edit below) is retried and refused. Cost on large fonds filed as S-028.
