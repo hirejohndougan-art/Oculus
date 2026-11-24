@@ -8,3 +8,7 @@ coverage/
 *.tsbuildinfo
 .env
 .env.*
+
+# Database backups (D-064): never committed.
+*.oculus-backup
+*.dump
