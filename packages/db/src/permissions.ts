@@ -580,6 +580,28 @@ export async function hasRecordsBelow(
   return rows.length > 0;
 }
 
+/**
+ * Up to 1,000 units filed directly under `unitId` whose home site isn't
+ * `siteId` (`null`: any child on a site at all): the only children a person
+ * who may edit the unit may not see (a system manager filed them there;
+ * a scoped grant covering the unit covers its subtree), for T-042's
+ * hidden-children check.
+ */
+export async function childrenOffSite(
+  db: Queryable,
+  organizationId: OrganizationId,
+  unitId: RecordId,
+  siteId: SiteId | null,
+): Promise<RecordId[]> {
+  if (!isOrganizationId(organizationId) || !isRecordId(unitId)) return [];
+  const rows = await db.rows<{ id: string }>(sql`
+    SELECT id::text AS id FROM public.records
+    WHERE organization_id = ${organizationId}::uuid AND parent_id = ${unitId}::uuid
+      AND site_id IS DISTINCT FROM ${siteId}::uuid
+    ORDER BY id LIMIT 1000`);
+  return rows.map((r) => r.id as RecordId);
+}
+
 // ---------------------------------------------------------------------------
 // System settings
 

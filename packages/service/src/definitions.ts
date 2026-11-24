@@ -691,6 +691,11 @@ export function definitionOperations(run: Runner): DefinitionOperations {
         }
         const old = types.value.find((t) => t.key === type.key);
         if (old === undefined || identifierTypeTag(old) !== expectedTag) return conflict;
+        // Called without `existing` on purpose: core then reports every
+        // change that could affect records as needing confirmation, and the
+        // D-076 list below is built from the database itself. With
+        // `existing`, a format removed or a rule loosened on a public type
+        // would list no records and slip through unconfirmed (third review).
         const compared = identifierTypeChanges(old, type);
         if (!compared.ok) return compared;
         const needed = compared.value.changes

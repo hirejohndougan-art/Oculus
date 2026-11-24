@@ -616,6 +616,47 @@ describe("the dry-run check", () => {
     expect(issueCodes(root)).toEqual(["wrong_level"]);
   });
 
+  it("hidden children never show their level or depth: one fixed in_use_below, whatever they are", async () => {
+    // Series on A1, each with one child unit a system manager filed on A2.
+    const replies = [];
+    for (const childLevel of ["file", "collection"]) {
+      const fonds = await makeAs(w, w.a, w.a1, unit("fonds", "Fonds on A1"));
+      const series = await makeAs(w, w.a, w.a1, unit("series", "Series on A1", fonds));
+      await makeAs(w, w.a, w.a2, unit(childLevel, "Hidden child on A2", series));
+      const r = await call("POST", "/api/records/check", {
+        as: "cataloger",
+        body: { record: unit("item", "Series on A1", fonds), recordId: series },
+      });
+      replies.push({ status: r.status, body: r.res.body });
+      const put = await call("PUT", `/api/records/${series}`, {
+        as: "cataloger",
+        headers: { "if-match": '"v1"' },
+        body: { record: unit("item", "Series on A1", fonds) },
+      });
+      expect([put.status, issueCodes(put)]).toEqual([422, ["in_use_below"]]);
+      expect(await versionOf(series)).toBe(1);
+    }
+    expect(replies[0]?.status).toBe(200);
+    expect(replies[0]?.body).toContain("in_use_below");
+    expect(replies[0]?.body).not.toMatch(/collection|holds a/);
+    expect(replies[1]).toEqual(replies[0]);
+    // Visible children are still named, so a person fixes what they can see.
+    const fonds = await makeAs(w, w.a, w.a1, unit("fonds", "Fonds with a visible child"));
+    const series = await makeAs(w, w.a, w.a1, unit("series", "Series", fonds));
+    await makeAs(w, w.a, w.a1, unit("file", "Visible file", series));
+    const visible = await call("POST", "/api/records/check", {
+      as: "cataloger",
+      body: { record: unit("item", "Series", fonds), recordId: series },
+    });
+    expect(issueCodes(visible)).toEqual(["wrong_level"]);
+    // And the system manager, who sees them all, is told why.
+    const root = await call("POST", "/api/records/check", {
+      as: "root",
+      body: { record: unit("item", "Series on A1", fonds), recordId: series },
+    });
+    expect(issueCodes(root)).toEqual(["wrong_level"]);
+  });
+
   it("is refused as the save would be: read-only may not check a new record", async () => {
     const r = await call("POST", "/api/records/check", {
       as: "reader",

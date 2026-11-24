@@ -141,6 +141,7 @@ import {
   readVersion,
   grantsScopedTo,
   hasRecordsBelow,
+  childrenOffSite,
   readWorkflowState,
   recordCheckIssues,
   refreshRecordTerms,
@@ -991,6 +992,40 @@ async function parentHidden(checker: RecordAccess, record: CatalogRecord): Promi
   return (await checker.hiddenAmong([record.parentId])).size > 0;
 }
 
+/**
+ * A unit whose level or parent changes while units filed under it are ones
+ * the actor may not view (a system manager filed them on another site):
+ * the arrangement checks would read their levels and depth and name them
+ * ("This unit holds a file now…"), so for anyone but a system manager the
+ * change is refused with one fixed `in_use_below`, no level, count or kind
+ * (third T-042 review; one of D-074's accepted one-bit signals, like
+ * `in_use_below` for a change of site).
+ */
+async function hiddenChildrenIssue(
+  tx: Queryable,
+  checker: RecordAccess,
+  before: { readonly kind: string; readonly level?: unknown; readonly parentId?: unknown },
+  after: CatalogRecord,
+  siteId: SiteId | null,
+): Promise<ServiceRefusal | undefined> {
+  if (after.kind !== "archival_unit" || checker.access.systemManager) return undefined;
+  if (
+    before.kind === "archival_unit" &&
+    (before.level ?? null) === after.level &&
+    (before.parentId ?? null) === (after.parentId ?? null)
+  ) {
+    return undefined;
+  }
+  const off = await childrenOffSite(tx, after.organizationId, after.id, siteId);
+  if (off.length === 0) return undefined;
+  if ((await checker.hiddenAmong(off)).size === 0) return undefined;
+  return refusal(
+    ["level"],
+    "in_use_below",
+    "Units below it are on sites you can't see, so only a system manager can change its level or move it.",
+  );
+}
+
 /** The links `after` adds that `before` (if any) doesn't hold. */
 function addedLinks(after: CatalogRecord, before?: CatalogRecord): RecordId[] {
   const kept = new Set(before === undefined ? [] : linkedIds(before));
@@ -1537,6 +1572,14 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         let version = stored.value.version;
         let saved = before;
         if (compared.value.differences.length > 0) {
+          const below = await hiddenChildrenIssue(
+            tx,
+            checker,
+            before,
+            record,
+            before.siteId ?? null,
+          );
+          if (below) return below;
           const hiddenLinks = await checker.hiddenAmong(addedLinks(record, before));
           const problems = await recordCheckIssues(tx, record, before, {
             messages: "own",
@@ -1682,6 +1725,8 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           const moved = await moveIssues(tx, checker, recordId, place, old);
           if (moved) return moved;
           hiddenParent = await parentHidden(checker, old);
+          const below = await hiddenChildrenIssue(tx, checker, place, old, place.siteId);
+          if (below) return below;
           if (!checker.access.systemManager) {
             const current = await readStoredRecord(tx, org, recordId);
             hiddenLinks = await checker.hiddenAmong(
@@ -1898,6 +1943,14 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
             issue(["templateKey"], "no_template_key", "Every record names its template."),
           ]);
         }
+        const below = await hiddenChildrenIssue(
+          tx,
+          allowed.checker,
+          before,
+          record,
+          before.siteId ?? null,
+        );
+        if (below) return found(below.issues);
         const hiddenLinks = await allowed.checker.hiddenAmong(addedLinks(record, before));
         return found(
           await recordCheckIssues(tx, record, before, {

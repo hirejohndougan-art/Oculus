@@ -195,6 +195,7 @@ export {
   isMember,
   grantsScopedTo,
   hasRecordsBelow,
+  childrenOffSite,
   readSystemSettings,
   writeSystemSettings,
 } from "./permissions.js";
