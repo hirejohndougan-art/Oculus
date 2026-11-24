@@ -5,9 +5,8 @@
  * directly in the database (as the owner) so no password hashing slows the
  * tests. Every name and address here is invented (example.org, RFC 2606).
  *
- * Full sessions are made as the database allows any writer to (D-069): a
- * waiting session inserted for a member, then moved to `full` with a new
- * token; the two-step check itself is T-038's and is not used here.
+ * Full sessions go through the real second step (D-077): a waiting
+ * session inserted for a member, then completed with a test recovery code.
  */
 import {
   hashSessionToken,
@@ -20,6 +19,7 @@ import {
   type Validated,
 } from "@oculus/core";
 import {
+  completeSecondStep,
   insertIdentifierType,
   insertOrganization,
   insertTemplateVersion,
@@ -31,6 +31,11 @@ import {
 import { createService, type RecordService, type ServiceResult } from "@oculus/service";
 import { actorOf, grant, makeSite, people } from "../../service/src/people.fixtures.js";
 import { freshDatabase, type TestDatabase } from "../../db/src/test-database.fixtures.js";
+import {
+  giveTestFactor,
+  testKeyring,
+  type TestFactor,
+} from "../../db/src/second-factor.fixtures.js";
 
 export const INC = "http://rightsstatements.org/vocab/InC/1.0/";
 
@@ -185,23 +190,37 @@ export async function pendingSession(
   return { token, sessionId: id };
 }
 
-/** A full session in `organizationId`. Returns its token. */
+const keys = testKeyring();
+const factors = new Map<UserId, TestFactor>();
+let sources = 0;
+
+/**
+ * A full session in `organizationId`, through the real second step (T-038,
+ * D-077): the person is given a test factor once (as the owner), then each
+ * session waits for its second step and is completed with one of their
+ * recovery codes. Returns its token.
+ */
 export async function fullSession(
   db: Database,
   userId: UserId,
   organizationId: OrganizationId,
 ): Promise<{ token: string; sessionId: string }> {
+  let factor = factors.get(userId);
+  if (factor === undefined) {
+    factor = await giveTestFactor(db, keys, userId, 20);
+    factors.set(userId, factor);
+  }
+  const code = factor.codes.pop();
+  if (code === undefined) throw new Error("out of test recovery codes");
   const waiting = await pendingSession(db, userId, organizationId);
-  const token = newSessionToken();
-  const changed = await db.execute(sql`
-    UPDATE public.sessions s
-    SET stage = 'full', token_hash = ${hashSessionToken(token)},
-        second_step_at = clock_timestamp(), rotated_at = clock_timestamp(),
-        last_seen_at = clock_timestamp(),
-        expires_at = s.signed_in_at + make_interval(secs => s.absolute_seconds)
-    WHERE s.id = ${waiting.sessionId}::uuid`);
-  if (changed !== 1) throw new Error("session not made full");
-  return { token, sessionId: waiting.sessionId };
+  sources += 1;
+  const done = await completeSecondStep(db, keys, waiting.token, {
+    recoveryCode: code,
+    // A private range (RFC 1918), one address per sign-in.
+    source: `10.42.${String(Math.floor(sources / 250))}.${String(1 + (sources % 250))}`,
+  });
+  if (!done.ok) throw new Error(JSON.stringify(done));
+  return { token: done.token, sessionId: done.session.sessionId };
 }
 
 /**
