@@ -1,0 +1,83 @@
+/* The sign-in screens' layout (mockup Login): a charcoal panel beside the form. */
+.page {
+  min-height: 100vh;
+  display: flex;
+  flex-wrap: wrap;
+  background: var(--frame-charcoal);
+}
+.picture {
+  flex: 1 1 520px;
+  min-height: 240px;
+  background: var(--frame-dark);
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+}
+.caption {
+  padding: 32px;
+  color: #ffffff;
+  /* 13px at the browser's default size; rem so it follows the reader's setting. */
+  font-size: 0.8125rem;
+}
+.skip {
+  position: absolute;
+  left: 8px;
+  top: -60px;
+  z-index: 10;
+  padding: 10px 14px;
+  background: var(--surface);
+  color: var(--link);
+  border-radius: var(--radius-control);
+}
+.skip:focus {
+  top: 8px;
+}
+.panel {
+  outline: none;
+  flex: 1 1 480px;
+  background: var(--bg-admin);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 32px;
+}
+.column {
+  width: 100%;
+  max-width: 420px;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+.brand {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.wordmark {
+  font: 700 34px var(--font-heading);
+  color: var(--ink);
+}
+.tagline {
+  font-size: var(--size-body);
+  color: var(--text-muted);
+}
+.title {
+  font-size: 24px;
+  font-weight: 700;
+}
+.intro {
+  margin: 0;
+  color: var(--text-muted);
+}
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}

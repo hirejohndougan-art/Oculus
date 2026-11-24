@@ -78,7 +78,16 @@ import { DEFAULT_RATE_LIMITS, SessionRateLimiter, type RateBucket } from "./rate
 
 /** A fixed-shape log record: never an error object, a token, a body or a query. */
 export interface ApiLogRecord {
-  readonly event: "service_error" | "session_error" | "refused_5xx";
+  readonly event:
+    | "service_error"
+    | "session_error"
+    | "refused_5xx"
+    // The sign-in routes (sign-in-api.ts, D-081) and the admin's startup (admin-server.ts).
+    | "sign_in_error"
+    | "client_address_warning"
+    | "reset_settled"
+    | "reset_link_produced"
+    | "startup_warning";
   readonly operation?: string;
   readonly code?: string;
   readonly name?: string;

@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 16:03 CT — manual (John: "continue building") — T-045 Admin: sign-in and the screen frame
+- Result: done
+- What changed: `packages/admin` (React 19, Vite, React Router, TanStack Query, React Aria; D-073): sign-in, the two-step code with a recovery-code option, organization choice, two-step set-up (QR, the key in groups, ten recovery codes shown once), forgot and reset password (token in the address fragment, removed at once), and the frame with the sidebar, site picker and top bar. `packages/api/src/sign-in-api.ts`: sign-in, pending, code, set-up, sign-out, sign-out elsewhere, organization switch, me, password reset. `admin-server.ts` serves the built admin from memory on the admin origin with its own strict CSP; `npm run admin` starts it. Gate: a keyboard-only Playwright end-to-end step with Siteimprove Alfa accessibility checks; font files checked against FONTS.json (OFL-1.1 for fonts only).
+- Decisions: D-081
+- Review: one independent round, no blocking issue. Fixed: sign-out said "signed out" when the server hadn't; some routes looked up sessions before the per-address limit (now limited first, with Retry-After); after choosing an organization an expired code left no field to retype it. S-029 filed (one deadlock-test failure under load, not reproduced).
+- Gate: PASS · tests_passing 4063 (was 3971) · npm audit clean
+- Next: T-043 (Chat A); Chats B and C per the project work board
+
 ## 2026-11-24 15:26 CT — manual (John: "continue building") — S-028 Make the S-020 dependents check cheap
 - Result: done
 - What changed: core `changesInheritance` names the properties that can't change what records below inherit (title, record type, media type, agent type, coordinates); edits that change only those skip the dependents check. `placesHolding` and `hiddenAmong` are set-based (one query). The 500-dependent cap applies only to edits that can change inheritance. `belowAtStake` and `RecordAccess.allowsUnlocked` decide before locking whether records below need locking; the answer is recomputed under the row lock and a mismatch retries. A title edit on a unit with 250 published below: 5,538 statements → 33.

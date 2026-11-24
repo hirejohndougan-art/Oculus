@@ -13,3 +13,7 @@ coverage/
 *.oculus-backup
 *.dump
 *.partial
+
+# Playwright output (D-073).
+test-results/
+playwright-report/
