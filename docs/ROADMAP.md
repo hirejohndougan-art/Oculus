@@ -235,7 +235,7 @@ Database:
   - Done (D-062): migration 0004 (stored local and authority terms per organization keyed by vocabulary and `termUriKey`/label; a staff-only index of which records use which terms, kept by the data-access layer) and `packages/db/src/vocabularies.ts` (terms, refresh/clear of a record's usages under the record lock, staff-only counts that never show record text, paging, a stale-index check). Public Subjects counts come from published public views (T-034/T-050). Three independent review rounds.
 - [ ] T-028 **Staff search.** deps: T-025, T-026 (risky)
   - PostgreSQL full-text search over titles and text fields, and lookup by current or former identifier through the comparison key (§2 "old numbers stay searchable"), with ranking and accent-insensitive matching. This is staff search only. A public search (Phase 4) must index only published public views, and this index must never be used for it.
-- [ ] T-052 **Backup and restore tools.** deps: T-024 (risky)
+- [x] T-052 **Backup and restore tools.** deps: T-024 (risky) Done: D-064. `npm run backup` / `npm run restore`: pg_dump custom archive plus a manifest, restore only into a fresh database by a non-superuser role, checked afterwards. Five review rounds.
   - A script that backs up the database to a file and one that restores it into an empty database, with a test that restores a backup and finds every record and version. Backups are a command any scheduler can run (D-035); where the copies go is set up in T-051.
 
 Change log and versions:

@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-23 19:33 CT — manual (John: "keep going") — T-052 Backup and restore tools
+- Result: done
+- What changed: `npm run backup` / `npm run restore` (`packages/db/src/backup*.ts`): one file holding pg_dump's custom archive plus a manifest (format 2: versions, counts, role settings), restored only into a database exactly as CREATE DATABASE made it, by a role that is not a superuser and has no direct grants beyond what the restore needs, then checked (row counts, schema, role settings). One stop per Ctrl-C, partial files removed, a 20 s wait for other sessions. CI installs the PGDG client and server so pg_dump matches the server.
+- Decisions: D-064
+- Review: five independent rounds (TLS downgrade, superuser bypass, restoring over a live database, signal handling, privileges granted straight to the restore role, partial files); all fixed with tests. One integration fix: a backup test updated for T-029's transactional `insertRecord`.
+- Gate: PASS · tests_passing 3406 (was 3342) · npm audit clean
+- Next: T-028 staff search (fixing review findings: ranking order), then T-032 service layer
+
 ## 2026-11-23 19:06 CT — manual (John: "continue") — T-030 Compare and restore versions; T-031 Edit-conflict protection
 - Result: done
 - What changed: `compareRecords` (core) and `compareVersions` (db); `restoreVersion` writes a new version equal to an old one only after today's template, rights, identifier, link, record-type and arrangement checks, with fixed-text refusals and an explicit list confirmation for values landing in fields public today; identifiers are never restored. `updateRecord` conflicts list the field names changed since the editor's version (no values). Migration `0006_arrangement_guard.sql`: a per-organization arrangement lock and a trigger refusing parent loops and depth over 64 (ancestors and moved subtrees) for any writer.
