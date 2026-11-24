@@ -82,6 +82,30 @@ export const RESET_SOURCE_THROTTLE: ThrottleRule = Object.freeze({
   resetAfterSeconds: 60 * 60,
 });
 
+/**
+ * Requests from one IPv6 /48 (a site's usual allocation, RFC 6177), beside
+ * the /64 counter: 30 free, then waits of 30 s, 1, 2 … minutes up to an
+ * hour, forgotten after an hour. So one site can't spread requests over its
+ * 65,536 /64s to flood the background work (second review, M1).
+ */
+export const RESET_NETWORK_THROTTLE: ThrottleRule = Object.freeze({
+  free: 30,
+  baseSeconds: 30,
+  maxSeconds: 60 * 60,
+  resetAfterSeconds: 60 * 60,
+});
+
+/**
+ * The /48 counter's key for a client address (`reset:source:v6:2001:db8:0::/48`),
+ * or `undefined` for anything but IPv6 (IPv4, IPv4 written as IPv6, and
+ * unreadable addresses have only the address counter).
+ */
+export function resetThrottleNetworkKey(address: unknown): string | undefined {
+  const key = throttleSourceKey(address);
+  const m = /^source:v6:([0-9a-f]+):([0-9a-f]+):([0-9a-f]+):[0-9a-f]+::\/64$/.exec(key);
+  return m === null ? undefined : `reset:source:v6:${m[1] ?? ""}:${m[2] ?? ""}:${m[3] ?? ""}::/48`;
+}
+
 /** The reset counter's key for an address typed: `reset:` and the sign-in key. */
 export function resetThrottleAccountKey(typed: string): string {
   return `reset:${throttleAccountKey(typed)}`;

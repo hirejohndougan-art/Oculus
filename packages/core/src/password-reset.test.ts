@@ -10,6 +10,7 @@ import {
   isResetToken,
   newResetToken,
   resetThrottleAccountKey,
+  resetThrottleNetworkKey,
   resetThrottleSourceKey,
 } from "./password-reset.js";
 import {
@@ -83,6 +84,16 @@ describe("reset throttles", () => {
     expect(resetThrottleSourceKey("192.0.2.7")).toBe(`reset:${throttleSourceKey("192.0.2.7")}`);
     expect(resetThrottleSourceKey("2001:db8::1")).toBe("reset:source:v6:2001:db8:0:0::/64");
     expect(resetThrottleSourceKey("not an address")).toBe("reset:source:other");
+  });
+
+  it("count IPv6 clients per /48 too, and nothing else per network", () => {
+    expect(resetThrottleNetworkKey("2001:db8:1:2:3:4:5:6")).toBe("reset:source:v6:2001:db8:1::/48");
+    expect(resetThrottleNetworkKey("2001:db8:1:ffff::1")).toBe("reset:source:v6:2001:db8:1::/48");
+    expect(resetThrottleNetworkKey("2001:db8::1")).toBe("reset:source:v6:2001:db8:0::/48");
+    expect(resetThrottleNetworkKey("2001:DB8:1::1%eth0")).toBe("reset:source:v6:2001:db8:1::/48");
+    for (const other of ["192.0.2.7", "::ffff:192.0.2.7", "not an address", 42, undefined]) {
+      expect(resetThrottleNetworkKey(other)).toBeUndefined();
+    }
   });
 
   it("let 3 requests for an address and 10 from a client through, then wait up to an hour", () => {

@@ -213,10 +213,11 @@ CREATE TRIGGER users_password_changed_at BEFORE UPDATE ON public.users
 
 -- Reset requests are throttled on counters of their own in the sign-in
 -- counters' table (core's password-reset.ts): the sign-in keys with
--- "reset:" in front, so asking for links never makes anyone wait to sign in.
+-- "reset:" in front, so asking for links never makes anyone wait to sign in,
+-- plus one per IPv6 /48 (reset:source:v6:…::/48) for resets only.
 ALTER TABLE public.sign_in_throttles DROP CONSTRAINT sign_in_throttles_key_check;
 ALTER TABLE public.sign_in_throttles ADD CONSTRAINT sign_in_throttles_key_check
-  CHECK (key ~ '^(reset:)?(account:[0-9a-f]{64}|source:v4:[0-9.]{7,15}|source:v6:[0-9a-f:]{7,39}::/64|source:other)$');
+  CHECK (key ~ '^((reset:)?(account:[0-9a-f]{64}|source:v4:[0-9.]{7,15}|source:v6:[0-9a-f:]{7,39}::/64|source:other)|reset:source:v6:[0-9a-f:]{5,29}::/48)$');
 
 -- Every guard trigger fires in replica mode too (D-067, 0008 part 4).
 ALTER TABLE public.password_resets ENABLE ALWAYS TRIGGER password_resets_check_new;

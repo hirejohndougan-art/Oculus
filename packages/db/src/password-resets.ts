@@ -38,6 +38,7 @@ import {
   DEFAULT_RESET_SECONDS,
   PasswordWorkBusyError,
   RESET_ACCOUNT_THROTTLE,
+  RESET_NETWORK_THROTTLE,
   RESET_SOURCE_THROTTLE,
   checkNewPassword,
   hashPassword,
@@ -52,6 +53,7 @@ import {
   normalizeEmail,
   passwordText,
   resetThrottleAccountKey,
+  resetThrottleNetworkKey,
   resetThrottleSourceKey,
   throttleAccountKey,
   type Issue,
@@ -396,9 +398,24 @@ async function deliverStored(
 // ---------------------------------------------------------------------------
 // Asking for a link
 
-/** Most reset requests worked on in the background at once; beyond, `busy`. */
+/**
+ * Most reset requests worked on (database and send) at once in a process.
+ * A slot is taken only when the work starts, after the random wait; work
+ * that finds them all taken waits again (`RESET_WORK_RETRIES` times, a
+ * random 0.5 to 2 s each) and is dropped as `busy` only after that (second
+ * review, M1).
+ */
 export const MAX_RESET_WORK = 32;
+/** Most requests waiting to start (their timers) at once; beyond, `busy` at once. */
+export const MAX_WAITING_RESETS = 10_000;
+/** How many times work that finds every slot taken waits again before it is dropped. */
+export const RESET_WORK_RETRIES = 5;
 let resetWork = 0;
+let resetWaiting = 0;
+
+function waitMs(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
 
 /**
  * Asks for a reset link for the address typed (the "Forgot your password?"
@@ -406,8 +423,9 @@ let resetWork = 0;
  * 1. The request's shape (`invalid_request`: not text, absurdly long, NUL,
  *    or not well-formed text). Says nothing about any account.
  * 2. The reset counters (`throttled`, with `retryAfterSeconds`): one per
- *    address typed (lower case, whether or not an account has it) and one
- *    per client address, counted now. Every request counts.
+ *    address typed (lower case, whether or not an account has it), one
+ *    per client address and, for IPv6, one per /48, counted now. Every
+ *    request counts.
  * 3. The reply, **`RESET_REQUESTED`, the same object for every address**,
  *    before anything about the account is read.
  * 4. Then, in the background: if an active account that can sign in has
@@ -447,6 +465,9 @@ export async function requestPasswordReset(
     return INVALID_RESET_REQUEST;
   }
   let attempt: Awaited<ReturnType<typeof takeAttempt>>;
+  // IPv6 clients are counted per /48 too, so one site's 65,536 /64s don't
+  // each get the free requests (second review, M1).
+  const network = resetThrottleNetworkKey(source);
   try {
     attempt = await takeAttempt(
       db,
@@ -456,6 +477,7 @@ export async function requestPasswordReset(
         account: RESET_ACCOUNT_THROTTLE,
         source: RESET_SOURCE_THROTTLE,
       },
+      network === undefined ? [] : [{ key: network, rule: RESET_NETWORK_THROTTLE }],
     );
   } catch (error) {
     const failure = failureFor(
@@ -475,37 +497,61 @@ export async function requestPasswordReset(
   }
   // Everything that depends on the account happens after the reply.
   const email = normalizeEmail(typed);
-  if (resetWork >= MAX_RESET_WORK) {
+  const dropped = (why: string): ResetOutcome => {
+    // Loudly: a request was answered but dropped (review L4).
+    notify(
+      checked.onError,
+      new Error(`Password reset work is full: ${why}; a request was answered but not worked on.`),
+    );
+    return "busy";
+  };
+  if (resetWaiting >= MAX_WAITING_RESETS) {
     queueMicrotask(() => {
-      // Loudly: a request was answered but dropped (review L4).
-      notify(
-        checked.onError,
-        new Error(
-          `Password reset work is full (${String(MAX_RESET_WORK)} at once); a request was answered but not worked on.`,
-        ),
-      );
-      notify(checked.onSettled, "busy");
+      notify(checked.onSettled, dropped(`${String(MAX_WAITING_RESETS)} requests waiting`));
     });
     return RESET_REQUESTED;
   }
-  resetWork += 1;
+  resetWaiting += 1;
   void (async (): Promise<ResetOutcome> => {
     // Let the reply go first, then wait a random while, so the work doesn't
     // land on (and slow) the next request the same client sends (review L1).
-    const { min, max } = checked.delay;
-    const wait = min === max ? min : randomInt(min, max + 1);
-    await new Promise<void>((resolve) => setTimeout(resolve, wait));
-    if (email === undefined) return "not_sent";
-    return sendToAddress(db, email, deliver, checked);
+    // Waiting holds no work slot (second review, M1).
+    let waiting = true;
+    try {
+      const { min, max } = checked.delay;
+      await waitMs(min === max ? min : randomInt(min, max + 1));
+      for (let retry = 0; resetWork >= MAX_RESET_WORK; retry++) {
+        if (retry >= RESET_WORK_RETRIES) {
+          return dropped(
+            `${String(MAX_RESET_WORK)} at work after ${String(RESET_WORK_RETRIES)} more waits`,
+          );
+        }
+        await waitMs(randomInt(500, 2001));
+      }
+      resetWaiting -= 1;
+      waiting = false;
+      resetWork += 1;
+    } finally {
+      if (waiting) resetWaiting -= 1;
+    }
+    try {
+      if (email === undefined) {
+        // The same shape of work as for an address with no account (review L1).
+        await inTransaction(db, dummyStore);
+        return "not_sent";
+      }
+      return await sendToAddress(db, email, deliver, checked);
+    } finally {
+      resetWork -= 1;
+    }
   })()
     .catch((error: unknown): ResetOutcome => {
-      // A programming error must not crash the process from the background;
-      // it goes to the log hook like a database error.
+      // A programming error or a database failure must not crash the process
+      // from the background; it goes to the log hook.
       notify(checked.onError, error);
       return "database_unavailable";
     })
     .then((outcome) => {
-      resetWork -= 1;
       notify(checked.onSettled, outcome);
     });
   return RESET_REQUESTED;

@@ -17,6 +17,7 @@ import {
   newSessionToken,
   newUserId,
   resetThrottleAccountKey,
+  resetThrottleNetworkKey,
   resetThrottleSourceKey,
   throttleAccountKey,
   throttleSourceKey,
@@ -623,61 +624,116 @@ describe("asking for a link", () => {
     expect(lives).toEqual([{ life: 300 }]);
   });
 
-  it("says busy to the log, and does nothing, when too many requests are being worked on", async () => {
+  it("work that finds every slot taken waits again, then goes ahead or is dropped loudly", async () => {
     await ready();
     const org = await organization();
     const person = await member(org);
-    const releases: (() => void)[] = [];
+    let releases: (() => void)[] = [];
     const outcomes: ResetOutcome[] = [];
     const blocked: PasswordResetDelivery = () =>
       new Promise<void>((resolve) => {
         releases.push(resolve);
       });
-    for (let i = 0; i < MAX_RESET_WORK; i++) {
-      await clearResetCounter(person.email);
-      const reply = await requestPasswordReset(
-        db,
-        { email: person.email, source: source() },
-        blocked,
-        {
-          onSettled: (o) => outcomes.push(o),
-          deliveryTimeoutMs: 60_000,
-          backgroundDelayMs: NO_DELAY,
-        },
-      );
-      expect(reply).toBe(RESET_REQUESTED);
-      // Wait until this one is held in its delivery.
-      for (let wait = 0; releases.length <= i && wait < 400; wait++) await sleep(25);
+    /** Fills every work slot with a request held in its delivery. */
+    async function fill(): Promise<void> {
+      releases = [];
+      for (let i = 0; i < MAX_RESET_WORK; i++) {
+        await clearResetCounter(person.email);
+        expect(
+          await requestPasswordReset(db, { email: person.email, source: source() }, blocked, {
+            onSettled: (o) => outcomes.push(o),
+            deliveryTimeoutMs: 60_000,
+            backgroundDelayMs: NO_DELAY,
+          }),
+        ).toBe(RESET_REQUESTED);
+        for (let wait = 0; releases.length <= i && wait < 400; wait++) await sleep(25);
+      }
+      expect(releases).toHaveLength(MAX_RESET_WORK);
     }
-    expect(releases).toHaveLength(MAX_RESET_WORK);
-    await clearResetCounter(person.email);
-    let busy: ResetOutcome | undefined;
-    const loud: unknown[] = [];
-    const reply = await requestPasswordReset(
-      db,
-      { email: person.email, source: source() },
-      blocked,
-      {
-        backgroundDelayMs: NO_DELAY,
-        onError: (e) => loud.push(e),
-        onSettled: (o) => {
-          busy = o;
-        },
-      },
-    );
-    expect(reply).toBe(RESET_REQUESTED);
-    await sleep(20);
-    expect(busy).toBe("busy");
-    expect(loud).toHaveLength(1);
-    expect(String(loud[0])).toMatch(/Password reset work is full/);
-    expect(String(loud[0])).not.toContain(person.email);
-    expect(releases).toHaveLength(MAX_RESET_WORK);
+    const one = async (): Promise<{ outcome: Promise<ResetOutcome>; loud: unknown[] }> => {
+      await clearResetCounter(person.email);
+      const loud: unknown[] = [];
+      let settle: (o: ResetOutcome) => void = () => undefined;
+      const outcome = new Promise<ResetOutcome>((resolve) => {
+        settle = resolve;
+      });
+      const box = mailbox();
+      expect(
+        await requestPasswordReset(db, { email: person.email, source: source() }, box.deliver, {
+          backgroundDelayMs: NO_DELAY,
+          onError: (e) => loud.push(e),
+          onSettled: settle,
+        }),
+      ).toBe(RESET_REQUESTED);
+      return { outcome, loud };
+    };
+    // Slots free up while it waits: it goes ahead.
+    await fill();
+    const later = await one();
+    await sleep(300);
     for (const release of releases) release();
-    for (let wait = 0; outcomes.length < MAX_RESET_WORK && wait < 400; wait++) await sleep(25);
-    expect(outcomes).toEqual(Array.from({ length: MAX_RESET_WORK }, () => "sent"));
-    // Each newer link replaced the one before: one is pending.
+    expect(await later.outcome).toBe("sent");
+    expect(later.loud).toEqual([]);
+    // They never free up: after its waits it is dropped, and the log hears.
+    await fill();
+    const dropped = await one();
+    expect(await dropped.outcome).toBe("busy");
+    expect(dropped.loud).toHaveLength(1);
+    expect(String(dropped.loud[0])).toMatch(/Password reset work is full/);
+    expect(String(dropped.loud[0])).not.toContain(person.email);
+    for (const release of releases) release();
+    for (let wait = 0; outcomes.length < 2 * MAX_RESET_WORK && wait < 400; wait++) await sleep(25);
+    expect(outcomes).toEqual(Array.from({ length: 2 * MAX_RESET_WORK }, () => "sent"));
     const pending = (await resetsOf(person.userId)).filter((r) => !r.used && r.revoked === null);
     expect(pending).toHaveLength(1);
+  }, 60_000);
+
+  it("requests still waiting to start hold no work slot, so they can't keep a member's link back", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const waiting: Promise<ResetOutcome>[] = [];
+    // More waiting requests than work slots, from many addresses.
+    for (let i = 0; i < MAX_RESET_WORK + 8; i++) {
+      let settle: (o: ResetOutcome) => void = () => undefined;
+      waiting.push(
+        new Promise<ResetOutcome>((resolve) => {
+          settle = resolve;
+        }),
+      );
+      expect(
+        await requestPasswordReset(
+          db,
+          { email: `waiting${String(unique())}@example.org`, source: source() },
+          () => Promise.resolve(),
+          { backgroundDelayMs: { min: 4000, max: 4000 }, onSettled: settle },
+        ),
+      ).toBe(RESET_REQUESTED);
+    }
+    const start = performance.now();
+    const r = await ask(person.email);
+    expect(r.outcome).toBe("sent");
+    expect(r.messages).toHaveLength(1);
+    expect(performance.now() - start).toBeLessThan(3000);
+    expect(await Promise.all(waiting)).toEqual(waiting.map(() => "not_sent"));
+  }, 30_000);
+
+  it("counts IPv6 clients per /48 as well as per /64", async () => {
+    await ready();
+    const site = `2001:db8:${(0x3900 + (unique() % 200)).toString(16)}`;
+    for (let i = 0; i < 30; i++) {
+      const r = await ask(`net${String(unique())}@example.org`, {
+        from: `${site}:${(i + 1).toString(16)}::7`,
+      });
+      expect(r.reply).toBe(RESET_REQUESTED);
+    }
+    // A 31st /64 of the same /48 waits; another /48 doesn't.
+    expect(
+      (await ask(`net${String(unique())}@example.org`, { from: `${site}:ff::7` })).reply,
+    ).toMatchObject({ code: "throttled" });
+    expect(
+      (await ask(`net${String(unique())}@example.org`, { from: "2001:db8:77ff:1::7" })).reply,
+    ).toBe(RESET_REQUESTED);
   });
 });
 
@@ -1731,6 +1787,8 @@ describe("the cleanup", () => {
       resetAccount: resetThrottleAccountKey(`cleanup${String(n)}@example.org`),
       resetSource: resetThrottleSourceKey(`10.39.249.${String(1 + (n % 250))}`),
       resetAccountOld: resetThrottleAccountKey(`cleanup.old${String(n)}@example.org`),
+      resetNetwork:
+        resetThrottleNetworkKey(`2001:db8:${(0x3a00 + (n % 200)).toString(16)}:1::1`) ?? "",
     };
     const ages: Record<keyof typeof keys, number> = {
       account: 2,
@@ -1738,6 +1796,7 @@ describe("the cleanup", () => {
       resetAccount: 2,
       resetSource: 2,
       resetAccountOld: 25,
+      resetNetwork: 2,
     };
     for (const [name, key] of Object.entries(keys) as [keyof typeof keys, string][]) {
       await db.execute(sql`
