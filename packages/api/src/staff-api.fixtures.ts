@@ -83,6 +83,20 @@ export interface World {
 }
 
 async function catalog(db: Database, org: OrganizationId): Promise<void> {
+  for (const [key, kind] of [
+    ["t-unit", "archival_unit"],
+    ["t-asset", "digital_asset"],
+  ] as const) {
+    ok(
+      await insertTemplateVersion(db, {
+        key,
+        organizationId: org,
+        label: key,
+        appliesTo: [kind],
+        fields: [field("rights", "rights")],
+      }),
+    );
+  }
   ok(
     await insertTemplateVersion(db, {
       key: "t-object",
@@ -238,6 +252,33 @@ export async function makeObject(
     ),
   );
   return { id: saved.record.id, version: saved.version };
+}
+
+/** Makes a record from `draft` on `siteId` as the system manager; returns its ID. */
+export async function makeAs(
+  world: World,
+  organizationId: OrganizationId,
+  siteId: SiteId,
+  draft: Record<string, unknown>,
+): Promise<string> {
+  const saved = ok(
+    await world.service.createRecord({ organizationId, actor: actorOf(world.root), siteId }, draft),
+  );
+  return saved.record.id;
+}
+
+/** Publishes a record (at version 1) as the system manager. */
+export async function publishAs(
+  world: World,
+  organizationId: OrganizationId,
+  recordId: string,
+  version = 1,
+): Promise<void> {
+  ok(
+    await world.service.publish({ organizationId, actor: actorOf(world.root) }, recordId as never, {
+      expectedVersion: version,
+    }),
+  );
 }
 
 export { actorOf };

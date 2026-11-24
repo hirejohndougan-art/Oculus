@@ -413,8 +413,10 @@ export interface RecordService extends AdminOperations, DefinitionOperations {
    * update of `recordId` with `draft` would meet in today's checks, with
    * nothing written. Refused as the save would be when the person may not
    * make or edit the record (a record they can't view as `unknown_record`).
-   * Not checked here: identifier numbers, moves between places and the
-   * publish check of a published record; the save checks those.
+   * A new parent, represented record or site goes through the save's own
+   * visibility and permission step first (out of sight = missing). Not
+   * checked here: identifier numbers and the publish check of a published
+   * record; the save checks those.
    */
   checkRecord(
     context: ServiceContext,
@@ -1869,6 +1871,15 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         });
         if (!valid.ok) return found(valid.issues);
         const record = valid.value;
+        // A new parent, represented record or home site: the same visibility
+        // and permission step the save takes (moveIssues), before any check
+        // reads the place, so a parent or record out of sight is answered
+        // exactly as a missing one (D-072, D-074), never checked for its level.
+        const moved = await moveIssues(tx, allowed.checker, recordId, before, record);
+        if (moved) {
+          if (moved.issues.every((i) => i.code === "not_permitted")) return moved;
+          return found(moved.issues);
+        }
         if (record.templateKey === undefined) {
           return found([
             issue(["templateKey"], "no_template_key", "Every record names its template."),

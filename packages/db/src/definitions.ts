@@ -137,27 +137,57 @@ export async function publishedAmong(
 }
 
 /**
- * The organization's published records holding a number of the identifier
- * type `typeKey`: as a current or former identifier (its holdings), or as
- * a `{ type, value }` in a template `identifier` field anywhere in
- * `fields`. Ordered by ID; `undefined` when there are more than
+ * The organization's published records that show, or would show, a number
+ * of the identifier type `typeKey`: those holding one (as a current or
+ * former identifier, or as a `{ type, value }` in a template `identifier`
+ * field anywhere in `fields`), and every published record below one of
+ * them (filed under it or representing it, any depth, through `parent_id`
+ * and `represents_id`), since an inherited identifier field carries the
+ * value down (D-013). Ordered by ID; `undefined` when there are more than
  * `MAX_AFFECTED_PUBLISHED`.
+ *
+ * With `lock`, every record in that set (published or not) is locked
+ * `FOR SHARE` until the transaction ends, before the states are read: a
+ * publication of any of them (which locks the record's row `FOR NO KEY
+ * UPDATE`) waits for COMMIT, or has committed and is counted. For a new
+ * type, which has no row a publication could wait on.
  */
 export async function publishedHoldingType(
   db: Queryable,
   organizationId: OrganizationId,
   typeKey: string,
+  options: { readonly lock?: boolean } = {},
 ): Promise<readonly RecordId[] | undefined> {
   if (!isOrganizationId(organizationId)) throw new TypeError(BAD_ORGANIZATION);
-  const rows = await db.rows<{ id: string }>(sql`
+  const tree = sql`
+    WITH RECURSIVE holders(id) AS (
+      SELECT h.record_id FROM public.identifier_holdings h
+      WHERE h.organization_id = ${organizationId}::uuid AND h.type_key = ${typeKey}
+      UNION
+      SELECT r.id FROM public.records r
+      WHERE r.organization_id = ${organizationId}::uuid
+        AND jsonb_path_exists(r.fields, '$.** ? (@.type == $k)',
+                              jsonb_build_object('k', ${typeKey}::text))
+    ), down(id) AS (
+      SELECT id FROM holders
+      UNION
+      SELECT r.id FROM down
+      JOIN public.records r
+        ON r.organization_id = ${organizationId}::uuid
+       AND (r.parent_id = down.id OR r.represents_id = down.id)
+    )`;
+  if (options.lock === true) {
+    await db.rows(sql`${tree}
+      SELECT r.id FROM public.records r
+      WHERE r.organization_id = ${organizationId}::uuid AND r.id IN (SELECT id FROM down)
+      ORDER BY r.id
+      FOR SHARE OF r`);
+  }
+  const rows = await db.rows<{ id: string }>(sql`${tree}
     SELECT r.id::text AS id FROM public.records r
     WHERE r.organization_id = ${organizationId}::uuid
       AND r.workflow_state = 'published'
-      AND (EXISTS (SELECT 1 FROM public.identifier_holdings h
-                   WHERE h.organization_id = r.organization_id AND h.record_id = r.id
-                     AND h.type_key = ${typeKey})
-           OR jsonb_path_exists(r.fields, '$.** ? (@.type == $k)',
-                                jsonb_build_object('k', ${typeKey}::text)))
+      AND r.id IN (SELECT id FROM down)
     ORDER BY r.id
     LIMIT ${MAX_AFFECTED_PUBLISHED + 1}::integer`);
   if (rows.length > MAX_AFFECTED_PUBLISHED) return undefined;

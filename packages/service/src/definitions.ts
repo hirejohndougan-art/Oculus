@@ -8,8 +8,8 @@
  *   never record data.
  * - **Saving** a new version of a template (`saveTemplate`) or a new or
  *   changed identifier type (`saveIdentifierType`) needs
- *   `catalog.definitions` (a whole-catalog grant on any site, D-072, or a
- *   system manager). Each save is one transaction:
+ *   `catalog.definitions`, which only system managers hold (John,
+ *   2026-11-24, D-072). Each save is one transaction:
  *   1. the definition is locked: a template's `definition_lock`
  *      exclusively (record saves and publishing take it shared), an
  *      identifier type's row `FOR UPDATE` (record, identifier and publish
@@ -24,9 +24,18 @@
  *      confirmation; the save is refused (`needs_confirmation`, one issue
  *      per change, its path `["confirm", code, key]`) until `confirm`
  *      lists exactly those changes;
- *   4. **D-076:** when the change makes a field or number public, the
- *      published records that would show it at once are found in the
- *      database (`publishedAmong`, `publishedHoldingType`), and the person
+ *   4. **D-076:** the published records whose public output the change
+ *      may alter at once are found in the database: for a template whose
+ *      public shape changes (a key added or removed, or a key's visibility,
+ *      inheritance, kind or repeatability changed, `publicShapeChanged`),
+ *      every published record using it or below one (`publishedAmong`
+ *      with `below`; inherited fields carry values down, D-013); for an
+ *      identifier type made public (or a new public one adopting left-over
+ *      numbers), every published record holding a number of it or below
+ *      one (`publishedHoldingType`, which for a new type also locks those
+ *      records `FOR SHARE` so a publication in the meantime waits or is
+ *      counted). A superset of the records whose output changes, never
+ *      fewer. The person
  *      must hold `records.publish` on every one of them (else
  *      `not_permitted`, with no count) and confirm them explicitly
  *      (`confirmPublished: true`); until then the save is refused with
@@ -35,11 +44,11 @@
  *      person may publish and so see);
  *   5. the new version is stored.
  *
- * Accepted signals (D-079): a change's message counts every record of the
- * organization it affects, on every site, because a template or identifier
- * type belongs to the whole organization (D-072 keeps `catalog.definitions`
- * organization-wide until John answers whether a site manager of one site
- * controls it). No ID of a record the person can't see is ever returned.
+ * A change's message counts every record of the organization it affects,
+ * on every site; only system managers, who see every record, save
+ * definitions, so this tells nobody anything hidden. The `records.publish`
+ * check of step 4 holds for system managers at once; it stays as a second
+ * line should definitions ever be granted to a role again.
  */
 import { createHash } from "node:crypto";
 import {
@@ -363,11 +372,24 @@ async function publishedGate(
   };
 }
 
-/** The codes of template changes that can put stored values on the public sites. */
-const PUBLISHING_TEMPLATE_CHANGES: ReadonlySet<string> = new Set(["made_public", "key_reused"]);
-
-function inheritedKeys(template: FieldTemplate): Set<string> {
-  return new Set(template.fields.filter((f) => f.inherited).map((f) => f.key));
+/**
+ * Whether two versions of a template differ in anything that decides what
+ * the public sites show of a record using it or below one: the set of keys,
+ * or a key's visibility, inheritance, kind or repeatability.
+ */
+export function publicShapeChanged(before: FieldTemplate, after: FieldTemplate): boolean {
+  const shape = (t: FieldTemplate): Map<string, string> =>
+    new Map(
+      t.fields.map((f) => [
+        f.key,
+        JSON.stringify([f.visibility, f.inherited, f.kind, f.repeatable]),
+      ]),
+    );
+  const a = shape(before);
+  const b = shape(after);
+  if (a.size !== b.size) return true;
+  for (const [key, value] of a) if (b.get(key) !== value) return true;
+  return false;
 }
 
 export function definitionOperations(run: Runner): DefinitionOperations {
@@ -511,29 +533,23 @@ export function definitionOperations(run: Runner): DefinitionOperations {
           needed = changes
             .filter((c) => c.needsConfirmation)
             .map((c) => ({ code: c.code, key: c.key, message: c.message }));
-          const publicNow = new Set(
-            template.fields.filter((f) => f.visibility === "public").map((f) => f.key),
-          );
-          const inherited = new Set([
-            ...inheritedKeys(current.value.template),
-            ...inheritedKeys(template),
-          ]);
-          // Values reach published records below these through inheritance
-          // (D-013), so a change to an inherited field counts for every
-          // published record at or below the template's records.
-          const touchesInherited = changes.some((c) => inherited.has(c.key));
-          if (touchesInherited) {
+          // D-076: what the public sites show of a record depends on its own
+          // template and, through inherited fields (D-013), on its ancestors'
+          // templates: a key added, removed, made public or staff, made or
+          // no longer inherited, or given another kind can change the public
+          // output of every record using this template and of every record
+          // below one (a new inherited public key shows an ancestor's value
+          // on a published child; a removed "stopper" key lets a
+          // grandparent's value through). core's change list doesn't report
+          // all of these (a new key no record holds is no change to it), so
+          // the shapes are compared here, and every published record at or
+          // below this template's records counts: a superset of those
+          // whose output changes, never fewer.
+          if (publicShapeChanged(current.value.template, template)) {
             const ids = records
               .map((r) => r.id)
               .filter((id): id is RecordId => typeof id === "string");
             affected = await publishedAmong(tx, org, ids, { below: true });
-          } else {
-            const direct = new Set<RecordId>();
-            for (const c of changes) {
-              if (!PUBLISHING_TEMPLATE_CHANGES.has(c.code) || !publicNow.has(c.key)) continue;
-              for (const id of c.recordIds) direct.add(id);
-            }
-            affected = await publishedAmong(tx, org, [...direct]);
           }
         }
         const gate = await publishedGate(tx, who, checker, affected, confirmPublished.value);
@@ -624,7 +640,9 @@ export function definitionOperations(run: Runner): DefinitionOperations {
           // A public new type adopts former numbers left under its key
           // (D-031): published records holding them would show them.
           const affected =
-            type.public === true ? await publishedHoldingType(tx, org, type.key) : [];
+            type.public === true
+              ? await publishedHoldingType(tx, org, type.key, { lock: true })
+              : [];
           const gate = await publishedGate(tx, who, checker, affected, confirmPublished.value);
           if (gate) return gate;
           const notConfirmedNew = unconfirmed(neededNew, confirm.value);

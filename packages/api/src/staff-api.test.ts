@@ -33,14 +33,51 @@ import {
   actorOf,
   ageSession,
   fullSession,
+  makeAs,
   makeObject,
   makeWorld,
   objectDraft,
   ok,
   pendingSession,
+  publishAs,
   type World,
 } from "./staff-api.fixtures.js";
 import { SAME_ORIGIN, TEST_ENV } from "./test-server.fixtures.js";
+
+const INC = "http://rightsstatements.org/vocab/InC/1.0/";
+const rights = { rights: { uri: INC } };
+const unit = (
+  level: string,
+  title: string,
+  parentId?: string,
+  extra: Record<string, unknown> = {},
+) => ({
+  kind: "archival_unit",
+  level,
+  title,
+  templateKey: "t-unit",
+  fields: { ...rights },
+  ...(parentId === undefined ? {} : { parentId }),
+  ...extra,
+});
+const asset = (represents: string, title = "An invented scan") => ({
+  kind: "digital_asset",
+  mediaType: "image/tiff",
+  represents,
+  title,
+  templateKey: "t-asset",
+  fields: { ...rights },
+});
+const textField = (key: string, extra: Record<string, unknown> = {}) => ({
+  key,
+  label: key,
+  kind: "text",
+  required: false,
+  repeatable: false,
+  visibility: "public",
+  inherited: false,
+  ...extra,
+});
 
 let w: World;
 let app: FastifyInstance;
@@ -511,6 +548,43 @@ describe("the dry-run check", () => {
     expect(await versionOf(target.id)).toBe(1);
   });
 
+  it("B1: a new parent or represented record out of sight is answered as a missing one, byte for byte", async () => {
+    // The cataloger of A1 edits A1 records; A2's are out of sight.
+    const fondsA1 = await makeAs(w, w.a, w.a1, unit("fonds", "Fonds on A1"));
+    const seriesA1 = await makeAs(w, w.a, w.a1, unit("series", "Series on A1", fondsA1));
+    const fondsA2 = await makeAs(w, w.a, w.a2, unit("fonds", "Fonds on A2"));
+    const seriesA2 = await makeAs(w, w.a, w.a2, unit("series", "Series on A2", fondsA2));
+    const objA1 = await makeObject(w, w.a, w.a1, "Object on A1");
+    const objA2 = await makeObject(w, w.a, w.a2, "Object on A2");
+    const scan = await makeAs(w, w.a, w.a1, asset(objA1.id));
+    const replies = async (draft: (target: string) => unknown, recordId: string) => {
+      const out = [];
+      // Missing, another site's unit at the same level, at another level, another site's object.
+      for (const target of [newRecordId(), fondsA2, seriesA2, objA2.id]) {
+        const r = await call("POST", "/api/records/check", {
+          as: "cataloger",
+          body: { record: draft(target), recordId },
+        });
+        out.push({ status: r.status, body: r.res.body });
+      }
+      return out;
+    };
+    const parents = await replies((t) => unit("series", "Series on A1", t), seriesA1);
+    expect(parents[0]?.status).toBe(200);
+    expect(parents[0]?.body).toContain("missing_parent");
+    for (const r of parents.slice(1)) expect(r).toEqual(parents[0]);
+    const scans = await replies((t) => asset(t), scan);
+    expect(scans[0]?.status).toBe(200);
+    expect(scans[0]?.body).toContain("unknown_record");
+    for (const r of scans.slice(1)) expect(r).toEqual(scans[0]);
+    // A visible parent still checks normally.
+    const ok1 = await call("POST", "/api/records/check", {
+      as: "cataloger",
+      body: { record: unit("series", "Series on A1", fondsA1), recordId: seriesA1 },
+    });
+    expect(ok1.json).toEqual({ issues: [] });
+  });
+
   it("is refused as the save would be: read-only may not check a new record", async () => {
     const r = await call("POST", "/api/records/check", {
       as: "reader",
@@ -623,7 +697,21 @@ describe("templates", () => {
     expect([read.status, read.json]).toEqual([404, { error: "not_found" }]);
   });
 
-  it("only catalog.definitions saves: a cataloger is refused", async () => {
+  it("only system managers save definitions (John, 2026-11-24): a site manager and a cataloger are refused", async () => {
+    for (const as of ["manager", "cataloger"]) {
+      const types = await call("PUT", "/api/identifier-types/site_number", {
+        as,
+        headers: { "if-none-match": "*" },
+        body: { identifierType: { label: "Site number", uniqueness: "none" } },
+      });
+      expect([as, types.status, types.json]).toEqual([as, 403, { error: "not_permitted" }]);
+      const one = await call("PUT", "/api/templates/t-object", {
+        as,
+        headers: { "if-match": '"v1"' },
+        body: { template: { label: "Object", appliesTo: ["object"], fields: OBJECT_FIELDS } },
+      });
+      expect([as, one.status, one.json]).toEqual([as, 403, { error: "not_permitted" }]);
+    }
     const r = await call("PUT", "/api/templates/t-cat", {
       as: "cataloger",
       headers: { "if-none-match": "*" },
@@ -634,37 +722,37 @@ describe("templates", () => {
 
   it("new (If-None-Match: *), then a new version (If-Match), with conflicts", async () => {
     const made = await call("PUT", "/api/templates/t-made", {
-      as: "manager",
+      as: "root",
       headers: { "if-none-match": "*" },
       body: { template: { label: "Made", appliesTo: ["object"], fields: OBJECT_FIELDS } },
     });
     expect([made.status, made.res.headers.etag]).toEqual([201, '"v1"']);
     const again = await call("PUT", "/api/templates/t-made", {
-      as: "manager",
+      as: "root",
       headers: { "if-none-match": "*" },
       body: { template: { label: "Made", appliesTo: ["object"], fields: OBJECT_FIELDS } },
     });
     expect([again.status, again.json.error]).toEqual([412, "version_conflict"]);
     const next = await call("PUT", "/api/templates/t-made", {
-      as: "manager",
+      as: "root",
       headers: { "if-match": '"v1"' },
       body: { template: { label: "Made again", appliesTo: ["object"], fields: OBJECT_FIELDS } },
     });
     expect([next.status, next.res.headers.etag]).toEqual([200, '"v2"']);
     const stale = await call("PUT", "/api/templates/t-made", {
-      as: "manager",
+      as: "root",
       headers: { "if-match": '"v1"' },
       body: { template: { label: "Stale", appliesTo: ["object"], fields: OBJECT_FIELDS } },
     });
     expect(stale.status).toBe(412);
     const wrongKey = await call("PUT", "/api/templates/t-made", {
-      as: "manager",
+      as: "root",
       headers: { "if-match": '"v2"' },
       body: { template: { key: "t-other", label: "X", appliesTo: ["object"], fields: [] } },
     });
     expect([wrongKey.status, issueCodes(wrongKey)]).toEqual([422, ["wrong_key"]]);
     const neither = await call("PUT", "/api/templates/t-made", {
-      as: "manager",
+      as: "root",
       body: { template: { label: "X", appliesTo: ["object"], fields: OBJECT_FIELDS } },
     });
     expect(neither.status).toBe(428);
@@ -705,7 +793,7 @@ describe("templates", () => {
 
     // The manager of A1 may publish there: told what would change, then confirms.
     const first = await call("PUT", `/api/templates/${tKey}`, {
-      as: "manager",
+      as: "root",
       headers: { "if-match": '"v1"' },
       body,
     });
@@ -714,7 +802,7 @@ describe("templates", () => {
     expect(issueCodes(first)).toEqual(["publishes_records", "published_record_affected"]);
     expect(JSON.stringify(first.json.issues)).toContain(published.record.id);
     const confirmedPublished = await call("PUT", `/api/templates/${tKey}`, {
-      as: "manager",
+      as: "root",
       headers: { "if-match": '"v1"' },
       body: { ...body, confirmPublished: true },
     });
@@ -724,7 +812,7 @@ describe("templates", () => {
       (confirmedPublished.json.issues ?? []) as { path: string[]; code: string }[]
     ).map((i) => ({ code: i.path[1], key: i.path[2] }));
     const saved = await call("PUT", `/api/templates/${tKey}`, {
-      as: "manager",
+      as: "root",
       headers: { "if-match": '"v1"' },
       body: { ...body, confirm, confirmPublished: true },
     });
@@ -733,43 +821,101 @@ describe("templates", () => {
     expect(saved.json.version).toBe(2);
   });
 
-  it("D-076: a published record the person may not publish refuses the save, naming nothing", async () => {
-    const tKey = "t-gate-two";
+  it("B2: a new public inherited key on a published child's template counts the child", async () => {
+    const root = { organizationId: w.a, actor: actorOf(w.root) };
     ok(
       await w.service.saveTemplate(
-        { organizationId: w.a, actor: actorOf(w.root) },
-        { key: tKey, label: "Gate two", appliesTo: ["object"], fields: OBJECT_FIELDS },
+        root,
+        {
+          key: "t-b2-fonds",
+          label: "Fonds",
+          appliesTo: ["archival_unit"],
+          fields: [
+            textField("rights", { kind: "rights" }),
+            textField("provenance", { inherited: true }),
+          ],
+        },
         { expectedVersion: 0 },
       ),
     );
-    // Published on site A2, where the manager of A1 has no role.
-    const ctxA2 = { organizationId: w.a, actor: actorOf(w.root), siteId: w.a2 };
-    const there = ok(
-      await w.service.createRecord(ctxA2 as never, {
-        ...objectDraft("Elsewhere"),
-        templateKey: tKey,
-      }),
+    const childFields = [textField("rights", { kind: "rights" })];
+    ok(
+      await w.service.saveTemplate(
+        root,
+        { key: "t-b2-series", label: "Series", appliesTo: ["archival_unit"], fields: childFields },
+        { expectedVersion: 0 },
+      ),
     );
-    ok(await w.service.publish(ctxA2 as never, there.record.id, { expectedVersion: 1 }));
-    const opened = OBJECT_FIELDS.map((f) =>
-      f.key === "secret" ? { ...f, visibility: "public" } : f,
-    );
-    const r = await call("PUT", `/api/templates/${tKey}`, {
-      as: "manager",
+    // The parent (unpublished) holds a provenance; the child is published.
+    const parent = await makeAs(w, w.a, w.a1, {
+      ...unit("fonds", "Unpublished fonds"),
+      templateKey: "t-b2-fonds",
+      fields: { ...rights, provenance: "Given by an invented donor." },
+    });
+    const child = await makeAs(w, w.a, w.a1, {
+      ...unit("series", "Published series", parent),
+      templateKey: "t-b2-series",
+    });
+    await publishAs(w, w.a, child);
+    const opened = [...childFields, textField("provenance", { inherited: true })];
+    const r = await call("PUT", "/api/templates/t-b2-series", {
+      as: "root",
+      headers: { "if-match": '"v1"' },
+      body: { template: { label: "Series", appliesTo: ["archival_unit"], fields: opened } },
+    });
+    expect(r.status).toBe(409);
+    expect(issueCodes(r).slice(0, 2)).toEqual(["publishes_records", "published_record_affected"]);
+    expect(JSON.stringify(r.json.issues)).toContain(child);
+  });
+
+  it("B3: removing a stopper key from an intermediate template counts the published leaf below", async () => {
+    const root = { organizationId: w.a, actor: actorOf(w.root) };
+    const rightsField = textField("rights", { kind: "rights" });
+    const make = async (key: string, fields: unknown[]) =>
+      ok(
+        await w.service.saveTemplate(
+          root,
+          { key, label: key, appliesTo: ["archival_unit"], fields },
+          { expectedVersion: 0 },
+        ),
+      );
+    await make("t-b3-top", [rightsField, textField("provenance", { inherited: true })]);
+    await make("t-b3-mid", [rightsField, textField("provenance", { visibility: "staff" })]);
+    await make("t-b3-leaf", [rightsField]);
+    const top = await makeAs(w, w.a, w.a1, {
+      ...unit("fonds", "Top"),
+      templateKey: "t-b3-top",
+      fields: { ...rights, provenance: "An invented provenance." },
+    });
+    const mid = await makeAs(w, w.a, w.a1, {
+      ...unit("series", "Middle", top),
+      templateKey: "t-b3-mid",
+    });
+    const leaf = await makeAs(w, w.a, w.a1, {
+      ...unit("file", "Leaf", mid),
+      templateKey: "t-b3-leaf",
+    });
+    await publishAs(w, w.a, leaf);
+    const r = await call("PUT", "/api/templates/t-b3-mid", {
+      as: "root",
       headers: { "if-match": '"v1"' },
       body: {
-        template: { label: "Gate two", appliesTo: ["object"], fields: opened },
-        confirmPublished: true,
-        confirm: [{ code: "made_public", key: "secret" }],
+        template: { label: "t-b3-mid", appliesTo: ["archival_unit"], fields: [rightsField] },
       },
     });
-    expect([r.status, r.json]).toEqual([403, { error: "not_permitted" }]);
-    expect(r.res.body).not.toContain(there.record.id);
-    const stored = await w.db.rows<{ n: number }>(
-      sql`SELECT max(version)::int AS n FROM public.template_versions
-          WHERE organization_id = ${w.a}::uuid AND key = ${tKey}`,
-    );
-    expect(stored[0]?.n).toBe(1);
+    expect(r.status).toBe(409);
+    expect(issueCodes(r).slice(0, 2)).toEqual(["publishes_records", "published_record_affected"]);
+    expect(JSON.stringify(r.json.issues)).toContain(leaf);
+    // A change that leaves the public shape alone (a label) asks nothing of published records.
+    const label = await call("PUT", "/api/templates/t-b3-leaf", {
+      as: "root",
+      headers: { "if-match": '"v1"' },
+      body: {
+        template: { label: "Leaf, renamed", appliesTo: ["archival_unit"], fields: [rightsField] },
+      },
+    });
+    expect(label.status).toBe(200);
+    expect(label.json.publishedRecords).toEqual([]);
   });
 });
 
@@ -781,7 +927,7 @@ describe("identifier types", () => {
     expect(listed.map((t) => t.type.key)).toEqual(["object_number"]);
 
     const made = await call("PUT", "/api/identifier-types/loan_number", {
-      as: "manager",
+      as: "root",
       headers: { "if-none-match": "*" },
       body: { identifierType: { label: "Loan number", uniqueness: "current" } },
     });
@@ -790,13 +936,13 @@ describe("identifier types", () => {
     expect(made.res.headers.etag).toBe(`"t-${tag}"`);
 
     const changed = await call("PUT", "/api/identifier-types/loan_number", {
-      as: "manager",
+      as: "root",
       headers: { "if-match": `"t-${tag}"` },
       body: { identifierType: { label: "Loan no.", uniqueness: "current" } },
     });
     expect(changed.status).toBe(200);
     const stale = await call("PUT", "/api/identifier-types/loan_number", {
-      as: "manager",
+      as: "root",
       headers: { "if-match": `"t-${tag}"` },
       body: { identifierType: { label: "Stale", uniqueness: "current" } },
     });
@@ -825,7 +971,7 @@ describe("identifier types", () => {
       }),
     );
     ok(await w.service.publish(ctx as never, made.record.id, { expectedVersion: 1 }));
-    const list = await call("GET", "/api/identifier-types", { as: "manager" });
+    const list = await call("GET", "/api/identifier-types", { as: "root" });
     const entry = (list.json.identifierTypes as { type: { key: string }; tag: string }[]).find(
       (t) => t.type.key === "object_number",
     );
@@ -833,14 +979,14 @@ describe("identifier types", () => {
       identifierType: { label: "Object number", uniqueness: "all_time", public: true },
     };
     const first = await call("PUT", "/api/identifier-types/object_number", {
-      as: "manager",
+      as: "root",
       headers: { "if-match": `"t-${entry?.tag ?? ""}"` },
       body,
     });
     expect(first.status).toBe(409);
     expect(issueCodes(first)).toEqual(["publishes_records", "published_record_affected"]);
     const second = await call("PUT", "/api/identifier-types/object_number", {
-      as: "manager",
+      as: "root",
       headers: { "if-match": `"t-${entry?.tag ?? ""}"` },
       body: { ...body, confirmPublished: true },
     });
@@ -850,12 +996,44 @@ describe("identifier types", () => {
       key: i.path[2],
     }));
     const saved = await call("PUT", "/api/identifier-types/object_number", {
-      as: "manager",
+      as: "root",
       headers: { "if-match": `"t-${entry?.tag ?? ""}"` },
       body: { ...body, confirm, confirmPublished: true },
     });
     expect(saved.status).toBe(200);
     expect(saved.json.publishedRecords).toEqual([made.record.id]);
+  });
+  it("B4: published records below a holder count when a number type goes public", async () => {
+    const ctx = { organizationId: w.a, actor: actorOf(w.root), siteId: w.a1 };
+    ok(
+      await w.service.saveIdentifierType(
+        { organizationId: w.a, actor: actorOf(w.root) },
+        { key: "box_number", label: "Box number", uniqueness: "current" },
+        { expectedTag: null },
+      ),
+    );
+    const holder = await makeAs(w, w.a, w.a1, unit("fonds", "Holder fonds"));
+    ok(
+      await w.service.saveIdentifiers(ctx as never, holder as never, {
+        current: [{ type: "box_number", value: "BOX-1", primary: true }],
+        former: [],
+      }),
+    );
+    const child = await makeAs(w, w.a, w.a1, unit("series", "Published child", holder));
+    await publishAs(w, w.a, child);
+    const list = await call("GET", "/api/identifier-types", { as: "root" });
+    const entry = (list.json.identifierTypes as { type: { key: string }; tag: string }[]).find(
+      (t) => t.type.key === "box_number",
+    );
+    const r = await call("PUT", "/api/identifier-types/box_number", {
+      as: "root",
+      headers: { "if-match": `"t-${entry?.tag ?? ""}"` },
+      body: { identifierType: { label: "Box number", uniqueness: "current", public: true } },
+    });
+    expect(r.status).toBe(409);
+    expect(issueCodes(r).slice(0, 2)).toEqual(["publishes_records", "published_record_affected"]);
+    expect(JSON.stringify(r.json.issues)).toContain(child);
+    expect(JSON.stringify(r.json.issues)).not.toContain(holder);
   });
 });
 
