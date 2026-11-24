@@ -4,7 +4,9 @@ import {
   ACCOUNT_THROTTLE,
   OTHER_SOURCE_KEY,
   SOURCE_THROTTLE,
+  decideSignInAttempt,
   throttleAccountKey,
+  throttleReauthKey,
   throttleAttempt,
   throttleDelaySeconds,
   throttleSourceKey,
@@ -165,7 +167,7 @@ describe("throttleSourceKey", () => {
 
   it("only makes keys the database's check accepts", () => {
     const check =
-      /^(account:[0-9a-f]{64}|source:v4:[0-9.]{7,15}|source:v6:[0-9a-f:]{7,39}::\/64|source:other)$/;
+      /^((reset:)?(account:[0-9a-f]{64}|source:v4:[0-9.]{7,15}|source:v6:[0-9a-f:]{7,39}::\/64|source:other)|reauth:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
     for (const a of [
       "192.0.2.1",
       "255.255.255.255",
@@ -179,5 +181,75 @@ describe("throttleSourceKey", () => {
       expect(throttleSourceKey(a)).toMatch(check);
     }
     expect(throttleAccountKey("x")).toMatch(check);
+    expect(throttleReauthKey("0B0E7F3C-1D2A-4B5C-8D6E-7F8091A2B3C4")).toMatch(check);
+  });
+});
+
+describe("decideSignInAttempt (S-018: strangers can't keep a person out at a known address)", () => {
+  const waiting: ThrottleState = { failures: 400, lastFailureAt: T0 };
+
+  it("keeps the account's wait for an address that isn't known, counting nothing", () => {
+    expect(
+      decideSignInAttempt(
+        { account: waiting, source: undefined, known: undefined, isKnown: false },
+        T0 + 60_000,
+      ),
+    ).toEqual({ allowed: false, retryAfterSeconds: 840 });
+  });
+
+  it("lets a known address through the account's wait, counting every counter", () => {
+    const d = decideSignInAttempt(
+      { account: waiting, source: undefined, known: undefined, isKnown: true },
+      T0 + 60_000,
+    );
+    expect(d).toEqual({
+      allowed: true,
+      account: { failures: 401, lastFailureAt: T0 + 60_000 },
+      source: { failures: 1, lastFailureAt: T0 + 60_000 },
+      known: { failures: 1, lastFailureAt: T0 + 60_000 },
+    });
+  });
+
+  it("gives a known address only the account rule's guesses, then its own wait", () => {
+    let known: ThrottleState | undefined;
+    let account: ThrottleState | undefined = waiting;
+    const tally: string[] = [];
+    for (let i = 0; i < 7; i++) {
+      const d = decideSignInAttempt({ account, source: undefined, known, isKnown: true }, T0 + 1);
+      tally.push(d.allowed ? "checked" : `wait ${String(d.retryAfterSeconds)}`);
+      if (d.allowed) ({ known, account } = d);
+    }
+    expect(tally).toEqual([...Array<string>(5).fill("checked"), "wait 1", "wait 1"]);
+  });
+
+  it("keeps the address counter for everyone, known or not", () => {
+    const busy: ThrottleState = { failures: 25, lastFailureAt: T0 };
+    expect(
+      decideSignInAttempt(
+        { account: undefined, source: busy, known: undefined, isKnown: true },
+        T0,
+      ),
+    ).toEqual({ allowed: false, retryAfterSeconds: 32 });
+  });
+
+  it("answers the shorter of the account's and the known address's waits", () => {
+    const d = decideSignInAttempt(
+      {
+        account: waiting,
+        source: undefined,
+        known: { failures: 6, lastFailureAt: T0 },
+        isKnown: true,
+      },
+      T0,
+    );
+    expect(d).toEqual({ allowed: false, retryAfterSeconds: 2 });
+  });
+});
+
+describe("throttleReauthKey", () => {
+  it("is per user and can't be an account or address key", () => {
+    const id = "0b0e7f3c-1d2a-4b5c-8d6e-7f8091a2b3c4";
+    expect(throttleReauthKey(id)).toBe(`reauth:${id}`);
+    expect(throttleReauthKey(id)).not.toBe(throttleAccountKey(`reauth:${id}`));
   });
 });

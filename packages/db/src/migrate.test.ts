@@ -47,6 +47,7 @@ const ALL_TABLES = [
   "second_step_recovery_codes",
   "second_step_throttles",
   "sessions",
+  "sign_in_known_sources",
   "sign_in_throttles",
   "sites",
   "system_settings",

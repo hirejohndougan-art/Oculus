@@ -1005,8 +1005,10 @@ export interface ReauthenticationInput {
  * Records that the person entered their password **and** passed the second
  * step again in this session, for a sensitive change (D-052, ASVS 5.0
  * 7.5.1), and gives the session a **new token** (the old one stops). The
- * password is checked as at sign-in (`signIn`'s throttle and failures are
- * passed on); only then the code, with its own counters (the person's, the
+ * password is checked as at sign-in (`signIn`'s replies), counted on the
+ * person's own re-entry counter and the address counter, never on the
+ * account counter anyone can push from the sign-in form (S-018); only then
+ * the code, with its own counters (the person's, the
  * session's: 5 wrong codes end it, the address's). The database records
  * the re-entry only with a pass for this session made in the same
  * transaction (0014). Afterwards `resolveSession` gives
@@ -1043,6 +1045,9 @@ export async function reauthenticate(
       db,
       { email, password: own(input, "password") as string, source, organizationId },
       out,
+      // Its own counter (S-018): strangers typing the address at sign-in
+      // can't keep a signed-in person from re-entering the password.
+      { reauthOf: userId },
     );
     if (!checkedPassword.ok) return checkedPassword;
     const verified = out.verified;

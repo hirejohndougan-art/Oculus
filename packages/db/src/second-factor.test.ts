@@ -20,6 +20,8 @@ import {
   newSessionId,
   newSessionToken,
   normalizeRecoveryCode,
+  throttleAccountKey,
+  throttleReauthKey,
   type OrganizationId,
   type SessionId,
   type UserId,
@@ -29,6 +31,7 @@ import {
   acceptInvitation,
   createFirstSystemAdmin,
   createInvitation,
+  signIn,
   type InvitationMessage,
 } from "./accounts.js";
 import { insertOrganization } from "./catalog.js";
@@ -1225,6 +1228,54 @@ describe("re-entering the password needs the second step", () => {
           token_hash = ${hashSessionToken(newSessionToken())}, rotated_at = clock_timestamp()
         WHERE id = ${s.sessionId}::uuid`),
     ).rejects.toMatchObject({ constraint: "sessions_reauth_pass" });
+  });
+});
+
+describe("re-entering the password has a counter strangers can't push (S-018)", () => {
+  it("lets a signed-in person re-enter while strangers keep the sign-in counter waiting", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const s = await full(person.userId, org);
+    // Strangers guess at the sign-in form until the account counter waits.
+    for (let i = 0; i < 6; i++) {
+      await signIn(db, { email: person.email, password: "stranger guess", source: source() });
+    }
+    expect(
+      await signIn(db, { email: person.email, password: PASSWORD, source: source() }),
+    ).toMatchObject({ code: "throttled" });
+    const counter = async (key: string): Promise<number | undefined> =>
+      (
+        await db.rows<{ failures: number }>(
+          sql`SELECT failures FROM public.sign_in_throttles WHERE key = ${key}`,
+        )
+      )[0]?.failures;
+    const before = await counter(throttleAccountKey(person.email));
+    // Re-entry in the person's own session is not held by that wait.
+    const r = await reauthenticate(db, keys, s.token, {
+      password: PASSWORD,
+      source: source(),
+      code: await freshCode(person.userId),
+    });
+    expect(r).toMatchObject({ ok: true, session: { recentlyAuthenticated: true } });
+    if (!r.ok) return;
+    // Wrong passwords at re-entry count on the person's own counter, not the account's.
+    for (let i = 0; i < 6; i++) {
+      await reauthenticate(db, keys, r.token, {
+        password: "a mistyped passphrase",
+        source: source(),
+        code: "000000",
+      });
+    }
+    expect(await counter(throttleReauthKey(person.userId))).toBe(5);
+    expect(await counter(throttleAccountKey(person.email))).toBe(before);
+    expect(
+      await reauthenticate(db, keys, r.token, {
+        password: PASSWORD,
+        source: source(),
+        code: await freshCode(person.userId),
+      }),
+    ).toMatchObject({ ok: false, code: "throttled" });
   });
 });
 

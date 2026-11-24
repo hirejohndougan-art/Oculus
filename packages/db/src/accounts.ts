@@ -33,9 +33,12 @@ import {
   DEFAULT_INVITATION_SECONDS,
   MAX_INVITATION_SECONDS,
   MIN_INVITATION_SECONDS,
+  KNOWN_SOURCE_SECONDS,
+  OTHER_SOURCE_KEY,
   PasswordWorkBusyError,
   SOURCE_THROTTLE,
   checkNewPassword,
+  decideSignInAttempt,
   dummyPasswordHash,
   hashInvitationToken,
   hashPassword,
@@ -50,7 +53,7 @@ import {
   normalizeEmail,
   passwordText,
   throttleAccountKey,
-  throttleAttempt,
+  throttleReauthKey,
   throttleSourceKey,
   validateDisplayName,
   verifyPassword,
@@ -75,6 +78,9 @@ export const ACCOUNT_TABLE_PRIVILEGES: Readonly<Record<string, readonly string[]
   invitations: Object.freeze(["INSERT", "UPDATE"]),
   organization_members: Object.freeze(["INSERT"]),
   sign_in_throttles: Object.freeze(["INSERT", "UPDATE", "DELETE"]),
+  // Known addresses (S-018): recorded at a right password, counted like the
+  // counters above, deleted by the cleanup.
+  sign_in_known_sources: Object.freeze(["INSERT", "UPDATE", "DELETE"]),
 });
 
 /** The longest a typed email may be before the request itself is refused. */
@@ -829,18 +835,28 @@ interface CounterRow {
   last_ms: number | null;
 }
 
+/** Which counters an attempt let through was counted on, to give it back (`busy`). */
+interface Counted {
+  readonly known: boolean;
+}
+
 /**
- * Counts this attempt against both counters, or says how long to wait. One
- * short transaction with both rows locked (account key first; every caller
- * locks in key order), so attempts sent at once are counted one by one.
+ * Counts this attempt against its counters, or says how long to wait. One
+ * short transaction with the rows locked (the two counters in key order,
+ * then the known address's row; every caller locks in that order), so
+ * attempts sent at once are counted one by one. `knownSources` says whether
+ * the address may be known for the account (sign-in; never re-entry, S-018).
  */
 async function takeAttempt(
   db: Database,
   accountKey: string,
   sourceKey: string,
-): Promise<{ allowed: true } | { allowed: false; retryAfterSeconds: number }> {
+  knownSources: boolean,
+): Promise<({ allowed: true } & Counted) | { allowed: false; retryAfterSeconds: number }> {
   for (let attempt = 1; ; attempt++) {
-    const decided = await inTransaction(db, (tx) => decideAttempt(tx, accountKey, sourceKey));
+    const decided = await inTransaction(db, (tx) =>
+      decideAttempt(tx, accountKey, sourceKey, knownSources && sourceKey !== OTHER_SOURCE_KEY),
+    );
     // A counter deleted by the cleanup between the INSERT and the lock: go again.
     if (decided !== "row_gone" || attempt >= 3) {
       return decided === "row_gone" ? { allowed: false, retryAfterSeconds: 1 } : decided;
@@ -848,11 +864,20 @@ async function takeAttempt(
   }
 }
 
+interface KnownRow {
+  failures: number;
+  last_ms: number | null;
+  recent: boolean;
+}
+
 async function decideAttempt(
   tx: Queryable,
   accountKey: string,
   sourceKey: string,
-): Promise<{ allowed: true } | { allowed: false; retryAfterSeconds: number } | "row_gone"> {
+  knownSources: boolean,
+): Promise<
+  ({ allowed: true } & Counted) | { allowed: false; retryAfterSeconds: number } | "row_gone"
+> {
   {
     await tx.execute(sql`
       INSERT INTO public.sign_in_throttles (key) VALUES (${accountKey}), (${sourceKey})
@@ -862,6 +887,19 @@ async function decideAttempt(
       FROM public.sign_in_throttles WHERE key IN (${accountKey}, ${sourceKey})
       ORDER BY key FOR UPDATE`);
     if (rows.length !== 2) return "row_gone";
+    // Known for the account if it signed in from here with the right
+    // password recently (S-018). Read the same way whether or not the
+    // address typed has an account.
+    const knownRows = knownSources
+      ? await tx.rows<KnownRow>(sql`
+          SELECT failures, (extract(epoch FROM last_failure_at) * 1000)::float8 AS last_ms,
+                 signed_in_at > clock_timestamp() - make_interval(secs => ${KNOWN_SOURCE_SECONDS})
+                   AS recent
+          FROM public.sign_in_known_sources
+          WHERE account_key = ${accountKey} AND source_key = ${sourceKey}
+          FOR UPDATE`)
+      : [];
+    const knownRow = knownRows[0]?.recent === true ? knownRows[0] : undefined;
     const clock = await tx.rows<{ now_ms: number }>(sql`
       SELECT (extract(epoch FROM clock_timestamp()) * 1000)::float8 AS now_ms`);
     const now = clock[0]?.now_ms;
@@ -870,31 +908,55 @@ async function decideAttempt(
       const row = rows.find((r) => r.key === key);
       return row === undefined ? undefined : { failures: row.failures, lastFailureAt: row.last_ms };
     };
-    const account = throttleAttempt(ACCOUNT_THROTTLE, state(accountKey), now);
-    const source = throttleAttempt(SOURCE_THROTTLE, state(sourceKey), now);
-    if (!account.allowed || !source.allowed) {
-      const waits = [account, source].map((d) => (d.allowed ? 0 : d.retryAfterSeconds));
-      return { allowed: false, retryAfterSeconds: Math.max(...waits) };
-    }
+    const decided = decideSignInAttempt(
+      {
+        account: state(accountKey),
+        source: state(sourceKey),
+        known:
+          knownRow === undefined
+            ? undefined
+            : { failures: knownRow.failures, lastFailureAt: knownRow.last_ms },
+        isKnown: knownRow !== undefined,
+      },
+      now,
+    );
+    if (!decided.allowed) return decided;
     for (const [key, next] of [
-      [accountKey, account.next],
-      [sourceKey, source.next],
+      [accountKey, decided.account],
+      [sourceKey, decided.source],
     ] as const) {
       await tx.execute(sql`
         UPDATE public.sign_in_throttles
         SET failures = ${next.failures}, last_failure_at = to_timestamp(${next.lastFailureAt}::float8 / 1000)
         WHERE key = ${key}`);
     }
-    return { allowed: true };
+    if (decided.known !== undefined) {
+      await tx.execute(sql`
+        UPDATE public.sign_in_known_sources
+        SET failures = ${decided.known.failures},
+            last_failure_at = to_timestamp(${decided.known.lastFailureAt}::float8 / 1000)
+        WHERE account_key = ${accountKey} AND source_key = ${sourceKey}`);
+    }
+    return { allowed: true, known: decided.known !== undefined };
   }
 }
 
 /** Takes back an attempt counted up front that was never checked (`busy`). */
-async function giveBackAttempt(db: Database, accountKey: string, sourceKey: string): Promise<void> {
+async function giveBackAttempt(
+  db: Database,
+  accountKey: string,
+  sourceKey: string,
+  counted: Counted,
+): Promise<void> {
   await inTransaction(db, async (tx) => {
     await tx.execute(sql`
       UPDATE public.sign_in_throttles SET failures = greatest(failures - 1, 0)
       WHERE key IN (${accountKey}, ${sourceKey})`);
+    if (counted.known) {
+      await tx.execute(sql`
+        UPDATE public.sign_in_known_sources SET failures = greatest(failures - 1, 0)
+        WHERE account_key = ${accountKey} AND source_key = ${sourceKey}`);
+    }
   });
 }
 
@@ -913,7 +975,11 @@ interface UserRow {
  * 6.3.8). In order:
  * 1. The request's shape (`invalid_request`: not text, or absurdly long).
  * 2. The throttle (`throttled`, with `retryAfterSeconds`): the account and
- *    address counters; the attempt is counted now.
+ *    address counters, where an address the account signed in from with
+ *    the right password in the last 30 days counts on its own counter for
+ *    the account instead of waiting for the account's (S-018: strangers
+ *    can't keep anyone out at their usual addresses); the attempt is
+ *    counted now.
  * 3. One query for the user by address, then exactly one scrypt run: the
  *    user's hash, or the dummy hash for an unknown address.
  * 4. `invalid_credentials`, the same reply, for a wrong password, an unknown
@@ -921,8 +987,9 @@ interface UserRow {
  *    without access to `organizationId` (for a system admin: one that
  *    doesn't exist). The attempt stays counted.
  * 5. On success: the account counter is cleared, one is taken off the
- *    address counter, the sign-in time is stored, and an old-settings hash
- *    is replaced. `busy` if too many passwords are being checked at once
+ *    address counter, the address becomes (or stays) known for the account
+ *    with its counter cleared, the sign-in time is stored, and an
+ *    old-settings hash is replaced. `busy` if too many passwords are being checked at once
  *    (the attempt is then not counted).
  */
 export async function signIn(db: Database, input: SignInRequest): Promise<SignInResult> {
@@ -943,13 +1010,26 @@ export interface VerifiedSignIn {
 }
 
 /**
- * `signIn`, also filling `out.verified` on success. For sessions.ts only;
- * not exported from `@oculus/db`: the hash must never leave the package.
+ * How `signInChecked` counts: at sign-in (the default), or for re-entering
+ * the password in a session of `reauthOf` (S-018), which counts on that
+ * person's own `reauth:` counter and the address counter, never on the
+ * account counter strangers push by typing the address, and neither uses
+ * nor records known addresses.
+ */
+export interface SignInCounting {
+  readonly reauthOf?: UserId;
+}
+
+/**
+ * `signIn`, also filling `out.verified` on success. For sessions.ts and
+ * second-factor.ts only; not exported from `@oculus/db`: the hash must
+ * never leave the package.
  */
 export async function signInChecked(
   db: Database,
   input: SignInRequest,
   out: { verified?: VerifiedSignIn } = {},
+  counting: SignInCounting = {},
 ): Promise<SignInResult> {
   if (!hasOnly(input, ["email", "password", "source", "organizationId"])) return INVALID_REQUEST;
   const typed = own(input, "email");
@@ -982,9 +1062,12 @@ export async function signInChecked(
     throw error;
   }
   const normalized = normalizeEmail(typed);
-  const accountKey = throttleAccountKey(normalized ?? typed);
+  const reauthOf = counting.reauthOf;
+  if (reauthOf !== undefined && !isUserId(reauthOf)) return INVALID_REQUEST;
+  const accountKey =
+    reauthOf === undefined ? throttleAccountKey(normalized ?? typed) : throttleReauthKey(reauthOf);
   const sourceKey = throttleSourceKey(source);
-  const attempt = await takeAttempt(db, accountKey, sourceKey);
+  const attempt = await takeAttempt(db, accountKey, sourceKey, reauthOf === undefined);
   if (!attempt.allowed) {
     return {
       ok: false,
@@ -1011,7 +1094,7 @@ export async function signInChecked(
     check = await verifyPassword(password, user?.password_hash);
   } catch (error) {
     if (error instanceof PasswordWorkBusyError) {
-      await giveBackAttempt(db, accountKey, sourceKey);
+      await giveBackAttempt(db, accountKey, sourceKey, attempt);
       return { ok: false, code: "busy", message: BUSY_MESSAGE };
     }
     throw error;
@@ -1027,6 +1110,8 @@ export async function signInChecked(
         (user.system_admin && user.organization_exists) ||
         user.organization_ids.includes(organizationId));
   if (!check.ok || user === undefined || !reachable) return INVALID_CREDENTIALS;
+  // Re-entry is for the session's own person only.
+  if (reauthOf !== undefined && user.id !== reauthOf) return INVALID_CREDENTIALS;
 
   let newHash: string | undefined;
   if (check.needsRehash) {
@@ -1044,6 +1129,14 @@ export async function signInChecked(
     await tx.execute(sql`
       UPDATE public.sign_in_throttles SET failures = greatest(failures - 1, 0)
       WHERE key = ${sourceKey}`);
+    if (reauthOf === undefined && sourceKey !== OTHER_SOURCE_KEY) {
+      // This address is now known for the account (S-018), its own counter cleared.
+      await tx.execute(sql`
+        INSERT INTO public.sign_in_known_sources (account_key, source_key, signed_in_at)
+        VALUES (${accountKey}, ${sourceKey}, clock_timestamp())
+        ON CONFLICT (account_key, source_key) DO UPDATE
+        SET signed_in_at = excluded.signed_in_at, failures = 0, last_failure_at = NULL`);
+    }
     await tx.execute(
       sql`UPDATE public.users SET last_sign_in_at = now() WHERE id = ${user.id}::uuid`,
     );
@@ -1101,13 +1194,19 @@ export async function clearSignInThrottle(
 
 /**
  * Deletes counters that no longer matter: no failure for longer than the
- * longest reset time (24 hours), or none at all. For the cleanup command
+ * longest reset time (24 hours), or none at all; and known addresses with
+ * no right password from there in 30 days (S-018). For the cleanup command
  * any scheduler runs (T-037, D-035). Returns how many went.
  */
 export async function deleteExpiredSignInThrottles(db: Queryable): Promise<number> {
   const hours = Math.max(ACCOUNT_THROTTLE.resetAfterSeconds, SOURCE_THROTTLE.resetAfterSeconds);
-  return db.execute(sql`
+  const counters = await db.execute(sql`
     DELETE FROM public.sign_in_throttles
     WHERE failures = 0 OR last_failure_at IS NULL
        OR last_failure_at < clock_timestamp() - make_interval(secs => ${hours})`);
+  // Addresses no longer known (S-018): no right password from there in 30 days.
+  const known = await db.execute(sql`
+    DELETE FROM public.sign_in_known_sources
+    WHERE signed_in_at < clock_timestamp() - make_interval(secs => ${KNOWN_SOURCE_SECONDS})`);
+  return counters + known;
 }

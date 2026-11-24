@@ -1049,6 +1049,154 @@ describe("sign-in throttling", () => {
   });
 });
 
+describe("known addresses: strangers can't keep anyone out where they sign in (S-018)", () => {
+  async function knownRow(
+    address: string,
+    from: string,
+  ): Promise<{ failures: number } | undefined> {
+    const rows = await db.rows<{ failures: number }>(sql`
+      SELECT failures FROM public.sign_in_known_sources
+      WHERE account_key = ${throttleAccountKey(address)} AND source_key = ${throttleSourceKey(from)}`);
+    return rows[0];
+  }
+
+  /** The account counter at its longest wait, just now, as a stranger guessing once per wait leaves it. */
+  async function heldByStranger(address: string): Promise<void> {
+    await signIn(db, { email: address, password: "stranger guess", source: source() });
+    await db.execute(sql`
+      UPDATE public.sign_in_throttles SET failures = 400, last_failure_at = clock_timestamp()
+      WHERE key = ${throttleAccountKey(address)}`);
+  }
+
+  it("lets the only system admin in from their own address however long a stranger keeps guessing", async () => {
+    await ready();
+    const home = source();
+    const key = throttleAccountKey(ADMIN_EMAIL);
+    try {
+      expect(
+        await signIn(db, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD, source: home }),
+      ).toMatchObject({ ok: true, systemAdmin: true });
+      // The attack: one wrong guess from elsewhere each time the wait ends.
+      for (let round = 0; round < 3; round++) {
+        await age(key, 900);
+        expect(
+          await signIn(db, { email: ADMIN_EMAIL, password: "stranger guess", source: source() }),
+        ).toEqual(INVALID_CREDENTIALS);
+        expect((await counterOf(key))?.failures).toBeGreaterThan(0);
+        await db.execute(
+          sql`UPDATE public.sign_in_throttles SET failures = 400 WHERE key = ${key}`,
+        );
+        // Anywhere new still waits (John, 2026-11-23: waits apply everywhere) …
+        expect(
+          await signIn(db, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD, source: source() }),
+        ).toMatchObject({ code: "throttled", retryAfterSeconds: 900 });
+        // … but the admin's own address gets the password checked.
+        expect(
+          await signIn(db, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD, source: home }),
+        ).toMatchObject({ ok: true, systemAdmin: true });
+        // The right password cleared the account counter.
+        expect(await counterOf(key)).toBeUndefined();
+        await signIn(db, { email: ADMIN_EMAIL, password: "stranger guess", source: source() });
+      }
+    } finally {
+      await db.execute(sql`DELETE FROM public.sign_in_throttles WHERE key = ${key}`);
+    }
+  });
+
+  it("gives a known address only the account rule's guesses during the account's wait", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const home = source();
+    expect(
+      await signIn(db, { email: person.email, password: PASSWORD, source: home }),
+    ).toMatchObject({ ok: true });
+    expect(await knownRow(person.email, home)).toEqual({ failures: 0 });
+    await heldByStranger(person.email);
+    const tally: string[] = [];
+    for (let i = 0; i < 7; i++) {
+      const r = await signIn(db, { email: person.email, password: "home guess", source: home });
+      tally.push(r.ok ? "ok" : r.code);
+    }
+    expect(tally).toEqual([
+      ...Array<string>(5).fill("invalid_credentials"),
+      "throttled",
+      "throttled",
+    ]);
+    expect(await knownRow(person.email, home)).toEqual({ failures: 5 });
+    // Every attempt checked was counted on the account counter too.
+    expect((await counterOf(throttleAccountKey(person.email)))?.failures).toBe(405);
+    // Even the right password waits now at home, and elsewhere.
+    expect(
+      await signIn(db, { email: person.email, password: PASSWORD, source: home }),
+    ).toMatchObject({ code: "throttled", retryAfterSeconds: 1 });
+  });
+
+  it("keeps the client address counter at a known address", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const home = source();
+    expect(
+      await signIn(db, { email: person.email, password: PASSWORD, source: home }),
+    ).toMatchObject({ ok: true });
+    for (let i = 0; i < 20; i++) {
+      await signIn(db, { email: email(), password: "spray guess", source: home });
+    }
+    expect(
+      await signIn(db, { email: person.email, password: PASSWORD, source: home }),
+    ).toMatchObject({ code: "throttled" });
+  }, 60_000);
+
+  it("forgets a known address 30 days after its last right password", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const home = source();
+    await signIn(db, { email: person.email, password: PASSWORD, source: home });
+    await db.execute(sql`
+      UPDATE public.sign_in_known_sources SET signed_in_at = signed_in_at - interval '30 days'
+      WHERE account_key = ${throttleAccountKey(person.email)}`);
+    await heldByStranger(person.email);
+    expect(
+      await signIn(db, { email: person.email, password: PASSWORD, source: home }),
+    ).toMatchObject({ code: "throttled" });
+    await deleteExpiredSignInThrottles(db);
+    expect(await knownRow(person.email, home)).toBeUndefined();
+  });
+
+  it("never makes an unreadable client address known, and never from a wrong password", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const from = source();
+    await signIn(db, { email: person.email, password: "wrong guess", source: from });
+    expect(await knownRow(person.email, from)).toBeUndefined();
+    expect(
+      await signIn(db, { email: person.email, password: PASSWORD, source: "not an address" }),
+    ).toMatchObject({ ok: true });
+    const rows = await db.rows(sql`
+      SELECT 1 FROM public.sign_in_known_sources
+      WHERE account_key = ${throttleAccountKey(person.email)}`);
+    expect(rows).toHaveLength(0);
+  });
+
+  it("answers a stranger the same for an address with known addresses as for one with none", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    await signIn(db, { email: person.email, password: PASSWORD, source: source() });
+    const nobody = email();
+    const run = async (address: string): Promise<SignInResult[]> => {
+      const out: SignInResult[] = [];
+      for (let i = 0; i < 7; i++)
+        out.push(await signIn(db, { email: address, password: "wrong guess", source: source() }));
+      return out;
+    };
+    expect(await run(person.email)).toEqual(await run(nobody));
+  });
+});
+
 describe("what the inviter can learn (D-068)", () => {
   it("never gets the token, and an invitation that can't be sent is withdrawn", async () => {
     await ready();

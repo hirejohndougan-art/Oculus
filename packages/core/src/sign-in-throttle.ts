@@ -26,6 +26,19 @@
  * So one account takes at most about 100 guesses a day from anywhere, and
  * one address about 100 a day across all accounts, before two-step sign-in
  * (T-038, required for everyone) is even reached.
+ *
+ * **Known addresses (S-018, D-068 amendment).** Anyone may type anyone's
+ * address, so the account counter alone let a stranger guessing once per
+ * wait keep a person (the install's only system admin included) waiting for
+ * ever. A client address (`throttleSourceKey`, never `OTHER_SOURCE_KEY`)
+ * from which the account signed in with the right password in the last
+ * `KNOWN_SOURCE_SECONDS` is *known* for it, and has a counter of its own
+ * for that account with the account rule. During an account wait an
+ * attempt from a known address is still let through, as long as its own
+ * counter and the address counter allow it (`decideSignInAttempt`); every
+ * attempt let through is counted on every counter that applies. So strangers
+ * elsewhere can't keep the person out at a known address, and a known
+ * address gets no more guesses than the account rule gives it.
  */
 import { createHash } from "node:crypto";
 import { isIPv4, isIPv6 } from "node:net";
@@ -57,6 +70,16 @@ export const SOURCE_THROTTLE: ThrottleRule = Object.freeze({
   maxSeconds: 15 * 60,
   resetAfterSeconds: 60 * 60,
 });
+
+/**
+ * How long after a right password an address stays known for the account
+ * (S-018): 30 days, so the person's usual networks stay known between
+ * visits; a new network waits like a stranger's until its first sign-in.
+ */
+export const KNOWN_SOURCE_SECONDS = 30 * 24 * 60 * 60;
+
+/** A known address's own counter for the account: the account rule. */
+export const KNOWN_SOURCE_THROTTLE: ThrottleRule = ACCOUNT_THROTTLE;
 
 /** A stored counter. */
 export interface ThrottleState {
@@ -101,6 +124,74 @@ export function throttleAttempt(
   return { allowed: true, next: { failures: failures + 1, lastFailureAt: now } };
 }
 
+/** The counters one sign-in attempt is decided on (S-018). */
+export interface SignInCounters {
+  readonly account: ThrottleState | undefined;
+  readonly source: ThrottleState | undefined;
+  /**
+   * The known address's own counter for the account, or undefined when the
+   * address isn't known for it (never signed in from there, or not within
+   * `KNOWN_SOURCE_SECONDS`).
+   */
+  readonly known: ThrottleState | undefined;
+  /** Whether the address is known for the account. */
+  readonly isKnown: boolean;
+}
+
+/** What `decideSignInAttempt` decided: the counters to store if allowed. */
+export type SignInAttemptDecision =
+  | {
+      readonly allowed: true;
+      readonly account: ThrottleState;
+      readonly source: ThrottleState;
+      /** The known address's counter to store, or undefined if not known. */
+      readonly known: ThrottleState | undefined;
+    }
+  | { readonly allowed: false; readonly retryAfterSeconds: number };
+
+/** The counter with one more failure at `now` (`throttleAttempt`'s reset rules). */
+function counted(rule: ThrottleRule, state: ThrottleState | undefined, now: number): ThrottleState {
+  const d = throttleAttempt(rule, state, now);
+  if (d.allowed) return d.next;
+  // Counted during its own wait (a known address let through): one more.
+  return { failures: (state?.failures ?? 0) + 1, lastFailureAt: now };
+}
+
+/**
+ * Whether a sign-in attempt at `now` may go ahead (S-018, D-068). The
+ * address counter always applies. The account counter applies too, except
+ * that from an address known for the account its own counter stands in for
+ * it: the attempt goes ahead if that counter allows it, even during the
+ * account's wait. An attempt let through is counted on the account and
+ * address counters (the account's even during its wait, since the password
+ * is then checked), and on the known address's counter when there is one.
+ * A refusal counts nothing, and its wait is the shortest that would let the
+ * attempt through.
+ */
+export function decideSignInAttempt(counters: SignInCounters, now: number): SignInAttemptDecision {
+  const source = throttleAttempt(SOURCE_THROTTLE, counters.source, now);
+  const account = throttleAttempt(ACCOUNT_THROTTLE, counters.account, now);
+  const known = counters.isKnown
+    ? throttleAttempt(KNOWN_SOURCE_THROTTLE, counters.known, now)
+    : undefined;
+  const ownWait = (d: ThrottleDecision | undefined): number =>
+    d === undefined ? Infinity : d.allowed ? 0 : d.retryAfterSeconds;
+  // The account side is passed if either the account or the known address allows it.
+  const accountSideWait = Math.min(ownWait(account), ownWait(known));
+  if (!source.allowed || accountSideWait > 0) {
+    return {
+      allowed: false,
+      retryAfterSeconds: Math.max(ownWait(source), accountSideWait),
+    };
+  }
+  return {
+    allowed: true,
+    account: counted(ACCOUNT_THROTTLE, counters.account, now),
+    source: source.next,
+    known: counters.isKnown ? counted(KNOWN_SOURCE_THROTTLE, counters.known, now) : undefined,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Keys
 
@@ -112,6 +203,17 @@ export function throttleAttempt(
  */
 export function throttleAccountKey(typed: string): string {
   return `account:${createHash("sha256").update(typed.toLowerCase(), "utf8").digest("hex")}`;
+}
+
+/**
+ * The counter for re-entering the password in a signed-in session
+ * (`reauthenticate`, S-018): `reauth:` and the user's ID. Separate from the
+ * account counter, which anyone can push by typing the person's address at
+ * sign-in, so strangers can't keep a signed-in person from a sensitive
+ * change; only someone holding one of the person's sessions moves it.
+ */
+export function throttleReauthKey(userId: string): string {
+  return `reauth:${userId.toLowerCase()}`;
 }
 
 /** The key for an address that can't be read: all such attempts share it. */

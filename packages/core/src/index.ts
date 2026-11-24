@@ -600,11 +600,21 @@ export {
   throttleDelaySeconds,
   throttleAccountKey,
   throttleSourceKey,
+  throttleReauthKey,
+  decideSignInAttempt,
   ACCOUNT_THROTTLE,
   SOURCE_THROTTLE,
+  KNOWN_SOURCE_THROTTLE,
+  KNOWN_SOURCE_SECONDS,
   OTHER_SOURCE_KEY,
 } from "./sign-in-throttle.js";
-export type { ThrottleRule, ThrottleState, ThrottleDecision } from "./sign-in-throttle.js";
+export type {
+  ThrottleRule,
+  ThrottleState,
+  ThrottleDecision,
+  SignInCounters,
+  SignInAttemptDecision,
+} from "./sign-in-throttle.js";
 export {
   hotp,
   totpStep,
