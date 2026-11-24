@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 02:41 CT — manual (John: "continue on phase 2") — T-034b, T-034c Stored workflow state; public output reads what is published
+- Result: done
+- What changed: migration `0012_workflow_states.sql`: `records.workflow_state` (D-075's four states), workflow actions as versions (history shows who published or withdrew, when and why), the database refusing any state change without a valid workflow version, a publish that also changes content, a record starting published, and deleting a published record. Service `submitForReview`, `returnToDraft`, `publish`, `withdraw` with the publish check in the same transaction; edits, restores and identifier saves of a published record must still pass it; a `mayChangePublicOutput` hook that T-041 fills with `records.publish`. `readPublicRecord` builds public output from one Repeatable Read snapshot; unpublished, missing and other organizations' records answer identically; unpublished links and places show nothing.
+- Decisions: D-076 (John: edits to published records go live with edit permission)
+- Review: one independent round, no blocking issues; notes recorded in D-076 and on T-042.
+- Gate: PASS · tests_passing 3690 (was 3663) · npm audit clean
+- Next: T-041 roles (finishing), T-038 two-step sign-in (building)
+
 ## 2026-11-24 02:11 CT — manual (John: "continue on phase 2") — T-037 Sessions
 - Result: done
 - What changed: migration `0010_sessions.sql` and `packages/db/src/sessions.ts`: hashed 256-bit tokens in one spelling, a 10-minute second-step stage that grants nothing until T-038 promotes it (no exported way to skip it), 4 h idle and 12 h absolute limits checked by the database, one organization per session, new tokens at promotion, switch, rotation and re-entering the password, a person's own session list, sign-out and "sign out everywhere else", admin sign-out of a user (re-entered password required), `users.sessions_valid_after` so disabling, resets and "end all" kill every older session, user-row-first locking, a derived CSRF token, `npm run db:cleanup`. Also two flaky tests fixed (concurrent invitations may now answer `superseded`; the password timing test uses a median of nine).

@@ -37,7 +37,7 @@ import {
 } from "../../db/src/test-database.fixtures.js";
 import { createService, type RecordService, type ServiceResult } from "./service.js";
 import { actorOf, grant, makeSite, people, type People } from "./people.fixtures.js";
-import { contextFromSession } from "./access.js";
+import { contextFromSession, publishPermission } from "./access.js";
 
 const NOW = new Date("2026-11-24T12:00:00.000Z");
 
@@ -1940,5 +1940,102 @@ describe("items belong to a site (D-074)", () => {
       failure = `${e.code ?? ""}:${e.constraint ?? ""}`;
     }
     expect(failure).toBe("23503:records_home_site");
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// T-034's workflow actions under T-041's permissions.
+
+describe("workflow actions need the actor's permissions (T-034, D-076)", () => {
+  it("publish and withdraw need records.publish; others' and missing records are unknown alike", async () => {
+    await ready();
+    const w = await world();
+    const nowhere = newRecordId();
+    const publish = (who: UserId, id: RecordId, site?: SiteId) =>
+      service.publish(ctxOf(w.a, who, site), id, { expectedVersion: 1 });
+    const withdraw = (who: UserId, id: RecordId) =>
+      service.withdraw(ctxOf(w.a, who), id, { expectedVersion: 1 });
+    // Can see it, can't publish: not permitted.
+    for (const role of ["cataloger", "read_only", "scanner"] as const) {
+      expect(codes(await publish(w.byRole[role], w.o.id))).toEqual(["not_permitted"]);
+      expect(codes(await withdraw(w.byRole[role], w.o.id))).toEqual(["not_permitted"]);
+    }
+    // Can't see it (no role on its site, or a role with no view): as missing.
+    const elsewhere = await personWith(w, "reviewer-a2", [{ role: "reviewer", siteId: w.a2 }]);
+    for (const who of [elsewhere, w.byRole.donor_relations]) {
+      const missing = await publish(who, nowhere, w.a2);
+      expect(codes(missing)).toEqual(["unknown_record"]);
+      expect(await publish(who, w.o.id, w.a2)).toEqual(missing);
+      expect(await withdraw(who, w.o.id)).toEqual(await withdraw(who, nowhere));
+    }
+    // A scoped reviewer: F1's units, not F2's.
+    const scoped = await personWith(w, "scoped-reviewer", [{ role: "reviewer", scope: w.f1.id }]);
+    expect(await publish(scoped, w.s2.id)).toEqual(await publish(scoped, nowhere));
+    // A reviewer on the record's site gets past the permission to the
+    // publish check itself (whatever it says of this invented record).
+    for (const who of [w.byRole.reviewer, w.byRole.site_manager, folks.root]) {
+      const result = await publish(who, w.s1.id);
+      expect(codes(result)).not.toContain("not_permitted");
+      expect(codes(result)).not.toContain("unknown_record");
+    }
+  }, 60_000);
+
+  it("sending for review and back to draft need the edit permission where the record is", async () => {
+    await ready();
+    const w = await world();
+    const nowhere = newRecordId();
+    const submit = (who: UserId, id: RecordId) =>
+      service.submitForReview(ctxOf(w.a, who), id, { expectedVersion: 1 });
+    expect(codes(await submit(w.byRole.read_only, w.o.id))).toEqual(["not_permitted"]);
+    expect(codes(await submit(w.byRole.scanner, w.o.id))).toEqual(["not_permitted"]);
+    expect(await submit(w.byRole.donor_relations, w.o.id)).toEqual(
+      await submit(w.byRole.donor_relations, nowhere),
+    );
+    const elsewhere = await personWith(w, "cataloger-a2", [{ role: "cataloger", siteId: w.a2 }]);
+    expect(await submit(elsewhere, w.o.id)).toEqual(await submit(elsewhere, nowhere));
+    // A Scanner sends a scan for review (it may change scans), a cataloger an object.
+    ok(await submit(w.byRole.scanner, w.ax.id));
+    ok(await submit(w.byRole.cataloger, w.o.id));
+    expect(
+      codes(
+        await service.returnToDraft(ctxOf(w.a, w.byRole.read_only), w.o.id, {
+          expectedVersion: 2,
+        }),
+      ),
+    ).toEqual(["not_permitted"]);
+    ok(await service.returnToDraft(ctxOf(w.a, w.byRole.cataloger), w.o.id, { expectedVersion: 2 }));
+  }, 60_000);
+
+  it("the default hook looks the record up itself, in the session's organization, and writes nothing", async () => {
+    await ready();
+    const w = await world();
+    const ask = (who: UserId, organizationId: OrganizationId, recordId: RecordId) =>
+      s.writer.transaction(async (q) => {
+        const answer = await publishPermission(q, {
+          organizationId,
+          actor: actorOf(who),
+          recordId,
+        });
+        const [row] = await q.rows<{ version: number; versions: number }>(sql`
+          SELECT r.version,
+                 (SELECT count(*)::integer FROM public.record_versions v
+                  WHERE v.organization_id = r.organization_id AND v.record_id = r.id) AS versions
+          FROM public.records r
+          WHERE r.organization_id = ${w.a}::uuid AND r.id = ${w.o.id}::uuid`);
+        return { answer, row };
+      });
+    const mine = await ask(w.byRole.reviewer, w.a, w.o.id);
+    expect(mine.answer).toBeUndefined();
+    expect(mine.row).toEqual({ version: 1, versions: 1 });
+    const missing = (await ask(w.byRole.reviewer, w.a, newRecordId())).answer;
+    expect(missing?.issues.map((i) => i.code)).toEqual(["unknown_record"]);
+    // The record named from another organization's session: unknown there.
+    const theirs = await ask(w.stranger, w.b, w.o.id);
+    expect(theirs.answer).toEqual(missing);
+    expect((await ask(folks.root, w.b, w.o.id)).answer).toEqual(missing);
+    expect((await ask(w.byRole.cataloger, w.a, w.o.id)).answer?.issues[0]?.code).toBe(
+      "not_permitted",
+    );
+    expect(mine.row).toEqual((await ask(w.byRole.cataloger, w.a, w.o.id)).row);
   }, 60_000);
 });

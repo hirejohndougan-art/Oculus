@@ -4,8 +4,9 @@
  * `catalog.ts` reads and writes the catalog tables (every record write with
  * its version, `record-versions.ts`; comparing and restoring versions,
  * `record-restore.ts`; today's checks before a write, `record-checks.ts`;
- * deleting with a tombstone, `record-delete.ts`; the writer role's grants,
- * `roles.ts`), `identifiers.ts` the
+ * deleting with a tombstone, `record-delete.ts`; workflow states, the
+ * publish check and the public output of published records, `workflow.ts`;
+ * the writer role's grants, `roles.ts`), `identifiers.ts` the
  * identifier tables and `vocabularies.ts` the stored terms and the index of
  * which records use them, all through core's validators; `search.ts` is
  * staff search (STAFF ONLY: never for a public site, D-066); `accounts.ts`
@@ -78,6 +79,13 @@ export { restoreVersion, restoreReason, MAX_DESCENDANTS_WALKED } from "./record-
 export { recordCheckIssues, fixedMessages, linkedIds } from "./record-checks.js";
 export type { RecordCheckOptions } from "./record-checks.js";
 export { deleteRecord } from "./record-delete.js";
+export {
+  changeWorkflowState,
+  publishCheckIssues,
+  readPublicRecord,
+  readWorkflowState,
+} from "./workflow.js";
+export type { PublicRecordOptions, WorkflowChangeResult } from "./workflow.js";
 export type { RecordDeletion, RecordDeletionResult } from "./record-delete.js";
 export {
   grantWriterRole,

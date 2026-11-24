@@ -145,8 +145,8 @@ export async function deleteRecord(
   const org = organizationId;
   const where = sql`organization_id = ${org}::uuid`;
   const result = await inSavepoint(db, "delete", async (): Promise<Validated<RecordDeletion>> => {
-    const [locked] = await db.rows<{ version: number }>(sql`
-      SELECT version FROM public.records
+    const [locked] = await db.rows<{ version: number; workflow_state: string }>(sql`
+      SELECT version, workflow_state FROM public.records
       WHERE ${where} AND id = ${recordId}::uuid
       FOR UPDATE`);
     if (locked === undefined) {
@@ -157,6 +157,15 @@ export async function deleteRecord(
         ["expectedVersion"],
         "version_conflict",
         `The record was saved by someone else since version ${String(expected)}; it is now at version ${String(locked.version)}. Read it again.`,
+      );
+    }
+    // A published record leaves the public only by being withdrawn (D-075,
+    // D-076); the database refuses its deletion version too.
+    if (locked.workflow_state === "published") {
+      return refused(
+        ["recordId"],
+        "published",
+        "This record is published. Unpublish it before deleting it.",
       );
     }
     const [uses] = await db.rows<{

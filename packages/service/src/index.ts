@@ -18,6 +18,10 @@ export type {
   RestoreOptions,
   DeleteOptions,
   ReadRecord,
+  WorkflowOptions,
+  WorkflowChange,
+  PublicChange,
+  PublicChangeRequest,
 } from "./service.js";
 export { contextFromSession, NOT_PERMITTED_MESSAGE } from "./access.js";
 export type { SessionLike } from "./access.js";

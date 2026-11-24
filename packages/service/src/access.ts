@@ -305,3 +305,44 @@ export function editPermissions(kind: string): readonly Permission[] {
 export function createPermissions(kind: string): readonly Permission[] {
   return kind === "digital_asset" ? ["records.create", "media.attach"] : ["records.create"];
 }
+
+/**
+ * The default `ServiceOptions.mayChangePublicOutput` (T-034, D-076): who may
+ * change what the public sees, by `records.publish` at the record's place
+ * (its home site and, for scoped grants, the units holding it). Asked
+ * before the operation has looked the record up, so it looks it up itself,
+ * in the session's organization only: a record that doesn't exist and one
+ * the actor may not view get exactly `unknown_record`; one they can see
+ * but not publish, `not_permitted`. It writes nothing. It takes the locks
+ * the operation takes next anyway, in the same order (the arrangement lock
+ * for scoped grants, then the record's row `FOR NO KEY UPDATE`), so the
+ * place it checked is the place until COMMIT.
+ */
+export async function publishPermission(
+  tx: Queryable,
+  request: {
+    readonly organizationId: OrganizationId;
+    readonly actor: string;
+    readonly recordId: RecordId;
+  },
+): Promise<Refusal | undefined> {
+  const access = await readAccess(tx, request.organizationId, request.actor);
+  if (!access.ok) return access;
+  const checker = new RecordAccess(tx, request.organizationId, access.value);
+  await checker.settle();
+  if ((await lockRecord(tx, request.organizationId, request.recordId)) === undefined) {
+    return noSuchRecord();
+  }
+  const place = await readRecordPlace(tx, request.organizationId, request.recordId);
+  if (place === undefined) return noSuchRecord();
+  return checker.onRecord(
+    {
+      kind: place.kind,
+      id: request.recordId,
+      parentId: place.parentId,
+      represents: place.represents,
+      siteId: place.siteId,
+    },
+    ["records.publish"],
+  );
+}
