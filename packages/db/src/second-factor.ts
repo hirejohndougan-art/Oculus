@@ -718,10 +718,16 @@ export async function startEnrolment(
   if (enrolmentToken !== undefined && typeof enrolmentToken !== "string") {
     throw new TypeError("enrolmentToken is text.");
   }
+  const presented =
+    typeof enrolmentToken === "string" && enrolmentToken.length <= 100 ? enrolmentToken : null;
   try {
     const pending = await readPendingSession(db, token, call);
     if (!pending.ok) return pending;
     const { sessionId, userId } = pending.session;
+    // Everything that can refuse comes before the chain's 20,000 hashes
+    // (second review, lower item 2), and again under the lock below.
+    const refusal = await enrolmentRefusal(db, userId, sessionId, presented);
+    if (refusal !== undefined) return refusal;
     const secret = newTotpSecret();
     try {
       const factorId = randomUUID();
@@ -733,22 +739,18 @@ export async function startEnrolment(
           SELECT email FROM public.users WHERE id = ${userId}::uuid FOR NO KEY UPDATE`);
         const email = users[0]?.email;
         if (email === undefined) return NO_SESSION;
-        const existing = await tx.rows<{ state: string; starts: number }>(sql`
-          SELECT (SELECT state FROM public.second_factors
-                  WHERE user_id = ${userId}::uuid AND state <> 'revoked') AS state,
-                 (SELECT count(*)::int FROM public.second_factors
-                  WHERE enrol_session_id = ${sessionId}::uuid) AS starts`);
-        if (existing[0]?.state === "active") return ALREADY_ENROLLED;
-        if ((existing[0]?.starts ?? 0) >= MAX_ENROLMENT_STARTS) return TOO_MANY_STARTS;
-        if (typeof enrolmentToken === "string" && enrolmentToken.length <= 100) {
-          // The trigger checks it against its hash and that it is unexpired;
-          // the factor's insert trigger then sees it used in this transaction.
+        const again = await enrolmentRefusal(tx, userId, sessionId, presented);
+        if (again !== undefined) return again;
+        const required = await tokenRequired(tx, userId);
+        if (required && presented !== null) {
+          // The trigger checks it against its hash, that it is the newest,
+          // unexpired, with nothing confirmed since; the factor's insert
+          // trigger then sees it presented in this transaction.
           await tx.execute(sql`
             UPDATE public.second_step_enrolment_tokens
-            SET used_at = clock_timestamp(), presented = ${enrolmentToken}
+            SET presented = ${presented}
             WHERE user_id = ${userId}::uuid
-              AND token_hash = sha256(convert_to(${enrolmentToken}, 'UTF8'))
-              AND used_at IS NULL AND expires_at > clock_timestamp()`);
+              AND token_hash = sha256(convert_to(${presented}, 'UTF8'))`);
         }
         await tx.execute(sql`
           UPDATE public.second_factors SET state = 'revoked'
@@ -776,6 +778,55 @@ export async function startEnrolment(
     if (secondStepGuardRefused(error)) return NO_SESSION;
     return failureFor(error, call);
   }
+}
+
+/** Whether the person must present an enrolment token (reset, nothing confirmed since). */
+async function tokenRequired(q: Queryable, userId: UserId): Promise<boolean> {
+  const rows = await q.rows<{ required: boolean }>(sql`
+    SELECT public.second_step_token_required(${userId}::uuid) AS required`);
+  return rows[0]?.required === true;
+}
+
+/**
+ * Why a set-up can't start, or `undefined`: a factor in use, too many starts
+ * in this waiting session, or (after a reset) no valid enrolment token:
+ * the person's newest, unexpired, nothing confirmed since. Presenting it is
+ * what the database checks; this read only spares the work.
+ */
+async function enrolmentRefusal(
+  q: Queryable,
+  userId: UserId,
+  sessionId: SessionId,
+  presented: string | null,
+): Promise<SecondStepRefusal | undefined> {
+  const rows = await q.rows<{
+    state: string | null;
+    starts: number;
+    required: boolean;
+    valid: boolean;
+  }>(sql`
+    SELECT (SELECT state FROM public.second_factors
+            WHERE user_id = ${userId}::uuid AND state <> 'revoked') AS state,
+           (SELECT count(*)::int FROM public.second_factors
+            WHERE enrol_session_id = ${sessionId}::uuid) AS starts,
+           public.second_step_token_required(${userId}::uuid) AS required,
+           EXISTS (
+             SELECT 1 FROM public.second_step_enrolment_tokens t
+             WHERE t.user_id = ${userId}::uuid
+               AND t.token_hash = sha256(convert_to(${presented ?? ""}, 'UTF8'))
+               AND t.expires_at > clock_timestamp()
+               AND NOT EXISTS (SELECT 1 FROM public.second_step_enrolment_tokens n
+                               WHERE n.user_id = t.user_id AND n.created_at > t.created_at)
+               AND NOT EXISTS (SELECT 1 FROM public.second_factors c
+                               WHERE c.user_id = t.user_id AND c.confirmed_at > t.created_at))
+             AS valid`);
+  const row = rows[0];
+  if (row?.state === "active") return ALREADY_ENROLLED;
+  if ((row?.starts ?? 0) >= MAX_ENROLMENT_STARTS) return TOO_MANY_STARTS;
+  if (row?.required === true && (presented === null || !row.valid)) {
+    return ENROLMENT_TOKEN_REQUIRED;
+  }
+  return undefined;
 }
 
 function constraintOf(error: unknown): string | undefined {
@@ -927,6 +978,19 @@ async function withPass<T>(
   }
 }
 
+/**
+ * Locks the session row before the pass locks the factor row: every path
+ * takes user rows, then session rows, then factor rows (second review,
+ * lower item 1: without it a re-entry held the factor row while a reset
+ * held the session row, a deadlock). Not the user row: that would also
+ * hold off a password change, which must win (T-037's R1).
+ */
+function lockSessionRow(sessionId: SessionId): (tx: Queryable) => Promise<void> {
+  return async (tx) => {
+    await tx.rows(sql`SELECT 1 FROM public.sessions WHERE id = ${sessionId}::uuid FOR UPDATE`);
+  };
+}
+
 /** What `reauthenticate` takes: the password, the client address, and the second step. */
 export interface ReauthenticationInput {
   readonly password: string;
@@ -1009,6 +1073,7 @@ export async function reauthenticate(
           if (row === undefined) throw new RollBack(undefined);
           return { ok: true, token: newToken, session: fullSession(row) } as const;
         },
+        lockSessionRow(sessionId),
       );
     } catch (error) {
       if (!(error instanceof RollBack)) throw error;
@@ -1070,6 +1135,7 @@ export async function regenerateRecoveryCodes(
         await storeRecoveryCodes(tx, userId, factor.id, recoveryCodes);
         return { ok: true, recoveryCodes: Object.freeze(recoveryCodes) } as const;
       },
+      lockSessionRow(sessionId),
     );
   } catch (error) {
     return failureFor(error, call);
@@ -1246,6 +1312,10 @@ export async function resetSecondFactor(
             ? tx.rows(sql`SELECT 1 FROM public.users WHERE id = ${id}::uuid FOR NO KEY UPDATE`)
             : tx.rows(sql`SELECT 1 FROM public.users WHERE id = ${id}::uuid FOR SHARE`));
         }
+        // Then the target's session rows (the admin's own among them when
+        // they reset themselves), before any factor row.
+        await tx.rows(sql`
+          SELECT 1 FROM public.sessions WHERE user_id = ${targetUserId}::uuid ORDER BY id FOR UPDATE`);
       },
     );
     if (!("reset" in done)) return refused(done.code, done.message);

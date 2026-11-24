@@ -63,12 +63,9 @@ CREATE TABLE public.second_factors (
   -- The last TOTP step accepted (-1: none yet). Codes for it or earlier
   -- steps are never accepted again (RFC 6238 §5.2).
   last_step bigint NOT NULL CHECK (last_step >= -1),
-  -- The session waiting for its second step that set this factor up.
+  -- The session waiting for its second step that set this factor up; only
+  -- a pass from that session can confirm it.
   enrol_session_id uuid NOT NULL,
-  -- Set by the trigger: this set-up came after a system admin's reset and
-  -- was allowed by a one-time enrolment token (or follows one in the same
-  -- waiting session).
-  token_authorized boolean NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL,
   confirmed_at timestamptz,
   confirmed_xact xid8,
@@ -183,24 +180,55 @@ CREATE TABLE public.second_step_alerts (
 
 CREATE INDEX second_step_alerts_user ON public.second_step_alerts (user_id, created_at);
 
--- One-time enrolment tokens: after a system admin's reset, setting up again
--- needs one, sent to the person's address (D-077), so the password alone
--- (which the writer role can set, D-068) isn't enough. 32 random bytes,
--- stored as SHA-256, made only with that admin_reset pass, used once.
+-- Enrolment tokens: every system admin's reset makes one, sent to the
+-- person's address (D-077). From then until a factor is confirmed, every
+-- start of a set-up must present the newest one, unexpired, in its own
+-- transaction, so the password alone (which the writer role can set,
+-- D-068) isn't enough. 32 random bytes, stored as SHA-256, made only with
+-- that admin_reset pass; usable for several starts until a factor is
+-- confirmed or it expires.
 CREATE TABLE public.second_step_enrolment_tokens (
   user_id uuid NOT NULL REFERENCES public.users (id) ON DELETE CASCADE,
   token_hash bytea PRIMARY KEY CHECK (octet_length(token_hash) = 32),
   created_by_pass uuid NOT NULL REFERENCES public.second_step_passes (id) ON DELETE CASCADE,
   created_at timestamptz NOT NULL,
   expires_at timestamptz NOT NULL,
+  -- First and latest presentation, and the latest one's transaction.
   used_at timestamptz,
-  used_xact xid8,
+  presented_at timestamptz,
+  presented_xact xid8,
   -- The token itself, only in the UPDATE that uses it; checked and cleared.
   presented text CHECK (presented IS NULL),
   CHECK (expires_at > created_at AND expires_at <= created_at + interval '7 days')
 );
 
 CREATE INDEX second_step_enrolment_tokens_user ON public.second_step_enrolment_tokens (user_id);
+
+-- Whether person u must present an enrolment token to set up: a system
+-- admin has reset them (every reset makes a token) and no factor has been
+-- confirmed since the latest one.
+CREATE FUNCTION public.second_step_token_required(u uuid) RETURNS boolean
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.second_step_enrolment_tokens t
+    WHERE t.user_id = u
+      AND NOT EXISTS (SELECT 1 FROM public.second_factors c
+                      WHERE c.user_id = u AND c.confirmed_at > t.created_at))
+$$;
+
+-- Whether person u's valid token was presented in this transaction (the
+-- presentation's own trigger checked it was the newest, unexpired, and no
+-- factor confirmed since).
+CREATE FUNCTION public.second_step_token_here(u uuid) RETURNS boolean
+LANGUAGE sql VOLATILE
+SET search_path = pg_catalog, pg_temp
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.second_step_enrolment_tokens t
+    WHERE t.user_id = u AND t.presented_xact = pg_current_xact_id() AND t.presented_at >= now())
+$$;
 
 -- ---------------------------------------------------------------------------
 -- The current TOTP step by the database's clock (30-second steps from the
@@ -249,27 +277,12 @@ BEGIN
     RAISE EXCEPTION 'A second factor is set up from that person''s session waiting for its second step.'
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'second_factors_new_session';
   END IF;
-  -- After a system admin's reset (a factor revoked with a pass, and none
-  -- confirmed since), a one-time enrolment token must have been used in
-  -- this transaction, or an earlier set-up in this same waiting session
-  -- was allowed by one (starting again).
-  NEW.token_authorized := false;
-  IF EXISTS (
-      SELECT 1 FROM public.second_factors r
-      WHERE r.user_id = NEW.user_id AND r.state = 'revoked' AND r.revoked_by_pass IS NOT NULL
-        AND NOT EXISTS (SELECT 1 FROM public.second_factors c
-                        WHERE c.user_id = NEW.user_id AND c.confirmed_at > r.revoked_at)) THEN
-    IF EXISTS (SELECT 1 FROM public.second_step_enrolment_tokens t
-               WHERE t.user_id = NEW.user_id AND t.used_xact = pg_current_xact_id()
-                 AND t.used_at >= now())
-       OR EXISTS (SELECT 1 FROM public.second_factors e
-                  WHERE e.user_id = NEW.user_id AND e.enrol_session_id = NEW.enrol_session_id
-                    AND e.token_authorized) THEN
-      NEW.token_authorized := true;
-    ELSE
-      RAISE EXCEPTION 'After a reset, setting up again needs the enrolment link sent to the person.'
-        USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'second_factors_new_token';
-    END IF;
+  -- After a system admin's reset, every start presents the token in its
+  -- own transaction (no exception for earlier starts: second review).
+  IF public.second_step_token_required(NEW.user_id)
+     AND NOT public.second_step_token_here(NEW.user_id) THEN
+    RAISE EXCEPTION 'After a reset, setting up again needs the enrolment link sent to the person.'
+      USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'second_factors_new_token';
   END IF;
   RETURN NEW;
 END
@@ -324,8 +337,7 @@ BEGIN
       RAISE EXCEPTION 'That code was used already, or is not for now.'
         USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'second_factors_step';
     END IF;
-  ELSIF NEW.chain_length IS DISTINCT FROM OLD.chain_length
-     OR NEW.token_authorized IS DISTINCT FROM OLD.token_authorized THEN
+  ELSIF NEW.chain_length IS DISTINCT FROM OLD.chain_length THEN
     RAISE EXCEPTION 'The second step''s ratchet moves only with its next link.'
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'second_factors_ratchet';
   END IF;
@@ -333,7 +345,16 @@ BEGIN
     IF OLD.state = 'pending' AND NEW.state = 'active' AND moved THEN
       NEW.confirmed_at := clock_timestamp();
       NEW.confirmed_xact := pg_current_xact_id();
-    ELSIF OLD.state = 'pending' AND NEW.state = 'revoked' AND NEW.revoked_by_pass IS NULL THEN
+    ELSIF OLD.state = 'pending' AND NEW.state = 'revoked' AND NEW.revoked_by_pass IS NULL
+          AND NOT moved
+          AND (NOT public.second_step_token_required(OLD.user_id)
+               OR public.second_step_token_here(OLD.user_id)
+               OR EXISTS (
+                 SELECT 1 FROM public.second_step_passes p
+                 WHERE p.purpose = 'admin_reset' AND p.target_user_id = OLD.user_id
+                   AND public.second_step_pass_here(p))) THEN
+      -- A set-up replaced: freely before any reset; after one only by a
+      -- start presenting the token, or by another reset.
       NEW.revoked_at := clock_timestamp();
     ELSIF OLD.state = 'active' AND NEW.state = 'revoked' AND NOT moved AND EXISTS (
         SELECT 1 FROM public.second_step_passes p JOIN public.users a ON a.id = p.user_id
@@ -418,7 +439,8 @@ BEGIN
   SELECT * INTO f FROM public.second_factors
   WHERE id = NEW.factor_id AND user_id = NEW.user_id FOR UPDATE;
   IF NOT FOUND OR f.state = 'revoked'
-     OR (f.state = 'pending' AND NOT (NEW.purpose = 'sign_in' AND NEW.method = 'totp')) THEN
+     OR (f.state = 'pending' AND NOT (NEW.purpose = 'sign_in' AND NEW.method = 'totp'
+                                      AND NEW.session_id = f.enrol_session_id)) THEN
     RAISE EXCEPTION 'That second factor can''t be used for that.'
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'second_step_passes_factor';
   END IF;
@@ -585,7 +607,8 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
-  IF NOT (NEW.used_at IS NULL AND NEW.used_xact IS NULL AND NEW.presented IS NULL) THEN
+  IF NOT (NEW.used_at IS NULL AND NEW.presented_at IS NULL AND NEW.presented_xact IS NULL
+          AND NEW.presented IS NULL) THEN
     RAISE EXCEPTION 'A new enrolment token is unused.'
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'second_step_enrolment_tokens_new';
   END IF;
@@ -606,22 +629,28 @@ CREATE TRIGGER second_step_enrolment_tokens_check_new BEFORE INSERT
   ON public.second_step_enrolment_tokens
   FOR EACH ROW EXECUTE FUNCTION public.second_step_enrolment_tokens_check_new();
 
--- Used once, by presenting it (checked against its hash, then cleared),
--- before it expires. Nothing else changes.
+-- Presented (checked against its hash, then cleared) only while it is the
+-- person's newest token, unexpired, with no factor confirmed since it was
+-- made; each presentation is stamped with its transaction. Nothing else
+-- changes.
 CREATE FUNCTION public.second_step_enrolment_tokens_check_change() RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
-  IF NOT (OLD.used_at IS NULL AND NEW.used_at IS NOT NULL
-          AND OLD.expires_at > clock_timestamp()
+  IF NOT (OLD.expires_at > clock_timestamp()
           AND (sha256(convert_to(NEW.presented, 'UTF8')) = OLD.token_hash) IS TRUE
-          AND NEW.expires_at = OLD.expires_at) THEN
-    RAISE EXCEPTION 'An enrolment token is used once, by presenting it, before it expires.'
+          AND NEW.expires_at = OLD.expires_at
+          AND NOT EXISTS (SELECT 1 FROM public.second_step_enrolment_tokens n
+                          WHERE n.user_id = OLD.user_id AND n.created_at > OLD.created_at)
+          AND NOT EXISTS (SELECT 1 FROM public.second_factors c
+                          WHERE c.user_id = OLD.user_id AND c.confirmed_at > OLD.created_at)) THEN
+    RAISE EXCEPTION 'An enrolment token is presented, before it expires, until a factor is confirmed.'
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'second_step_enrolment_tokens_use';
   END IF;
-  NEW.used_at := clock_timestamp();
-  NEW.used_xact := pg_current_xact_id();
+  NEW.used_at := coalesce(OLD.used_at, clock_timestamp());
+  NEW.presented_at := clock_timestamp();
+  NEW.presented_xact := pg_current_xact_id();
   NEW.presented := NULL;
   RETURN NEW;
 END

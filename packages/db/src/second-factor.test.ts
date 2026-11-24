@@ -32,7 +32,7 @@ import {
   type InvitationMessage,
 } from "./accounts.js";
 import { insertOrganization } from "./catalog.js";
-import { openDatabase, type Database, type Queryable } from "./client.js";
+import { openDatabase, type Database, type Queryable, type Row } from "./client.js";
 import { migrate } from "./migrate.js";
 import { WRITER_PRIVILEGES, checkWriterConnection, grantWriterRole } from "./roles.js";
 import {
@@ -837,6 +837,246 @@ describe("races on two connections", () => {
   });
 });
 
+describe("after a reset, only the emailed token lets anyone set up again (second review)", () => {
+  /** A fresh admin session (recent by its own sign-in) resets `userId`; returns the token sent. */
+  async function resetBy(userId: UserId, org: OrganizationId): Promise<string> {
+    const adminSession = await full(admin, org);
+    const sent: EnrolmentMessage[] = [];
+    ok(
+      await resetSecondFactor(
+        db,
+        keys,
+        adminSession.token,
+        userId,
+        { source: source(), recoveryCode: recovery(admin) },
+        deliverTo(sent),
+      ),
+    );
+    return sent[0]?.token ?? "";
+  }
+
+  it("even for someone with no factor in use", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org, { factor: false });
+    await resetBy(person.userId, org);
+    const p = await pending(person.userId, org);
+    expect(await startEnrolment(db, keys, p.token)).toMatchObject({
+      code: "enrolment_token_required",
+    });
+  });
+
+  it("refuses a start without it before any work, making no factor and counting no start", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const token = await resetBy(person.userId, org);
+    const p = await pending(person.userId, org);
+    for (let i = 0; i < 8; i++) {
+      expect(await startEnrolment(db, keys, p.token)).toMatchObject({
+        code: "enrolment_token_required",
+      });
+    }
+    const made = await db.rows(sql`SELECT 1 FROM public.second_factors
+      WHERE user_id = ${person.userId}::uuid AND state = 'pending'`);
+    expect(made).toHaveLength(0);
+    expect((await startEnrolment(db, keys, p.token, { enrolmentToken: token })).ok).toBe(true);
+  });
+
+  it("and a second reset replaces the first token", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const first = await resetBy(person.userId, org);
+    const second = await resetBy(person.userId, org);
+    const p = await pending(person.userId, org);
+    expect(await startEnrolment(db, keys, p.token, { enrolmentToken: first })).toMatchObject({
+      code: "enrolment_token_required",
+    });
+    expect((await startEnrolment(db, keys, p.token, { enrolmentToken: second })).ok).toBe(true);
+  });
+
+  it("refuses the writer role's re-enrolment by every route the review found (A, B, G)", async () => {
+    await ready();
+    const writer = await writerDatabase();
+    try {
+      const org = await organization();
+      const wrongToken = await import("node:crypto").then((c) => c.randomBytes(32));
+      /** The writer's own pending factor for `userId` from waiting session `sessionId`, with a chain of 2. */
+      const writersFactor = (userId: UserId, sessionId: SessionId, id: string, l0: Buffer) =>
+        sql`INSERT INTO public.second_factors (id, user_id, kind, state, secret_box,
+              ratchet_anchor, ratchet_generation, chain_length, last_step, enrol_session_id,
+              created_at)
+            VALUES (${id}::uuid, ${userId}::uuid, 'totp', 'pending', ${Buffer.alloc(60, 7)},
+              sha256(sha256(${l0})), 0, 2, -1, ${sessionId}::uuid, now())`;
+
+      // (A) The person starts with the token in S; the writer revokes that
+      // pending factor and puts its own in with enrol_session_id = S.
+      const victim = await member(org);
+      const token = await resetBy(victim.userId, org);
+      const s = await pending(victim.userId, org);
+      expect((await startEnrolment(db, keys, s.token, { enrolmentToken: token })).ok).toBe(true);
+      await expect(
+        writer.execute(sql`UPDATE public.second_factors SET state = 'revoked'
+          WHERE user_id = ${victim.userId}::uuid AND state = 'pending'`),
+      ).rejects.toMatchObject({ constraint: "second_factors_state" });
+      await expect(
+        writer.transaction(async (tx) => {
+          // Even inside one transaction with a revocation it can't make.
+          await tx.execute(writersFactor(victim.userId, s.sessionId, newSessionId(), wrongToken));
+        }),
+      ).rejects.toMatchObject({
+        constraint: matching(/^second_factors_/),
+      });
+      // Presenting a made-up token is refused by its hash.
+      await expect(
+        writer.execute(sql`UPDATE public.second_step_enrolment_tokens
+          SET presented = ${wrongToken.toString("base64url")}
+          WHERE user_id = ${victim.userId}::uuid`),
+      ).rejects.toMatchObject({ constraint: "second_step_enrolment_tokens_use" });
+
+      // (B) After a second reset, a waiting session the writer makes itself,
+      // or the old enrol session's ID: still no set-up without the token.
+      await resetBy(victim.userId, org);
+      const own = newSessionId();
+      await writer.execute(sql`
+        INSERT INTO public.sessions (id, token_hash, user_id, organization_id, stage, signed_in_at,
+          created_at, last_seen_at, rotated_at, password_at, idle_seconds, absolute_seconds,
+          expires_at)
+        SELECT ${own}::uuid, ${hashSessionToken(newSessionToken())}, ${victim.userId}::uuid,
+          ${org}::uuid, 'second_step', t, t, t, t, t, 14400, 43200, t + interval '10 minutes'
+        FROM (SELECT clock_timestamp() AS t) c`);
+      for (const session of [own, s.sessionId]) {
+        await expect(
+          writer.execute(writersFactor(victim.userId, session, newSessionId(), wrongToken)),
+        ).rejects.toMatchObject({
+          constraint: matching(/^second_factors_new_(token|session)$/),
+        });
+      }
+
+      // (G) An account that never set up: the writer can set one up (the
+      // password alone allows it, D-052), but after a reset evicts it, it
+      // can't come back, by its old session or a new one, and no column it
+      // can set changes that.
+      const fresh = await member(org, { factor: false });
+      const g = newSessionId();
+      await writer.execute(sql`
+        INSERT INTO public.sessions (id, token_hash, user_id, organization_id, stage, signed_in_at,
+          created_at, last_seen_at, rotated_at, password_at, idle_seconds, absolute_seconds,
+          expires_at)
+        SELECT ${g}::uuid, ${hashSessionToken(newSessionToken())}, ${fresh.userId}::uuid,
+          ${org}::uuid, 'second_step', t, t, t, t, t, 14400, 43200, t + interval '10 minutes'
+        FROM (SELECT clock_timestamp() AS t) c`);
+      const gFactor = newSessionId();
+      const l0 = Buffer.alloc(32, 9);
+      await writer.execute(writersFactor(fresh.userId, g, gFactor, l0));
+      // A pass for a pending factor only from the session that set it up.
+      const other = newSessionId();
+      await writer.execute(sql`
+        INSERT INTO public.sessions (id, token_hash, user_id, organization_id, stage, signed_in_at,
+          created_at, last_seen_at, rotated_at, password_at, idle_seconds, absolute_seconds,
+          expires_at)
+        SELECT ${other}::uuid, ${hashSessionToken(newSessionToken())}, ${fresh.userId}::uuid,
+          ${org}::uuid, 'second_step', t, t, t, t, t, 14400, 43200, t + interval '10 minutes'
+        FROM (SELECT clock_timestamp() AS t) c`);
+      await expect(
+        writer.execute(sql`INSERT INTO public.second_step_passes (id, user_id, factor_id,
+            session_id, purpose, method, step, created_at, created_xact, reveal)
+          VALUES (gen_random_uuid(), ${fresh.userId}::uuid, ${gFactor}::uuid, ${other}::uuid,
+            'sign_in', 'totp', public.totp_step_now(), now(), pg_current_xact_id(),
+            sha256(${l0}))`),
+      ).rejects.toMatchObject({ constraint: "second_step_passes_factor" });
+      // Activated by a moving UPDATE (its own chain link): allowed, as set-up is.
+      await writer.execute(sql`UPDATE public.second_factors
+        SET ratchet_anchor = sha256(${l0}), ratchet_generation = 1,
+            last_step = public.totp_step_now(), state = 'active'
+        WHERE id = ${gFactor}::uuid`);
+      await resetBy(fresh.userId, org);
+      const back = newSessionId();
+      await writer.execute(sql`
+        INSERT INTO public.sessions (id, token_hash, user_id, organization_id, stage, signed_in_at,
+          created_at, last_seen_at, rotated_at, password_at, idle_seconds, absolute_seconds,
+          expires_at)
+        SELECT ${back}::uuid, ${hashSessionToken(newSessionToken())}, ${fresh.userId}::uuid,
+          ${org}::uuid, 'second_step', t, t, t, t, t, 14400, 43200, t + interval '10 minutes'
+        FROM (SELECT clock_timestamp() AS t) c`);
+      for (const session of [back, g]) {
+        await expect(
+          writer.execute(writersFactor(fresh.userId, session, newSessionId(), l0)),
+        ).rejects.toMatchObject({
+          constraint: matching(/^second_factors_new_(token|session)$/),
+        });
+      }
+      // There is no column left that would let a later insert skip the token.
+      const columns = await db.rows<{ name: string }>(sql`
+        SELECT attname AS name FROM pg_attribute
+        WHERE attrelid = 'public.second_factors'::regclass AND attnum > 0 AND NOT attisdropped`);
+      expect(columns.map((c) => c.name)).not.toContain("token_authorized");
+    } finally {
+      await writer.close();
+    }
+  });
+});
+
+describe("re-entering the password can't deadlock with a reset (second review)", () => {
+  it("locks the session row before the factor row", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const s = await full(person.userId, org);
+    const adminSession = await full(admin, org);
+    const deadlocks = async () =>
+      Number(
+        (
+          await db.rows<{ n: string }>(sql`
+            SELECT deadlocks::text AS n FROM pg_stat_database WHERE datname = current_database()`)
+        )[0]?.n ?? "0",
+      );
+    const before = await deadlocks();
+    const reauthConn = openDatabase(testDb.url, { max: 2 });
+    const resetConn = openDatabase(testDb.url, { max: 2 });
+    try {
+      // The re-entry pauses just before its session UPDATE (after its pass),
+      // until the reset is waiting on a lock.
+      let resetting: Promise<unknown> | undefined;
+      const paused = pauseBefore(
+        reauthConn,
+        (text) => text.includes("reauth_pass ="),
+        async () => {
+          resetting = resetSecondFactor(
+            resetConn,
+            keys,
+            adminSession.token,
+            person.userId,
+            { source: source(), recoveryCode: recovery(admin) },
+            deliverTo([]),
+          );
+          for (let i = 0; i < 200; i++) {
+            const waiting = await db.rows(sql`
+              SELECT 1 FROM pg_stat_activity
+              WHERE datname = current_database() AND wait_event_type = 'Lock'`);
+            if (waiting.length > 0) break;
+            await new Promise((r) => setTimeout(r, 25));
+          }
+        },
+      );
+      const r = await reauthenticate(paused, keys, s.token, {
+        password: PASSWORD,
+        source: source(),
+        recoveryCode: recovery(person.userId),
+      });
+      expect(r.ok).toBe(true);
+      expect(ok((await resetting) as Validated<{ reset: boolean }>)).toMatchObject({
+        reset: true,
+      });
+    } finally {
+      await reauthConn.close();
+      await resetConn.close();
+    }
+    expect(await deadlocks()).toBe(before);
+  });
+});
+
 describe("a lost race isn't a wrong code", () => {
   it("gives back the attempt of a right code another connection used first", async () => {
     await ready();
@@ -1055,21 +1295,34 @@ describe("a system admin's reset", () => {
     ).toMatchObject({ code: "enrolment_token_required" });
     const start = await startEnrolment(db, keys, p.token, { enrolmentToken: message.token });
     expect(start.ok).toBe(true);
-    // Starting again in the same waiting session needs no second token.
-    const restart = await startEnrolment(db, keys, p.token);
-    if (!restart.ok) throw new Error(JSON.stringify(restart));
-    // Another waiting session can't use the token again, or start without it.
+    // Every start presents it, the same waiting session included.
+    expect(await startEnrolment(db, keys, p.token)).toMatchObject({
+      code: "enrolment_token_required",
+    });
+    expect((await startEnrolment(db, keys, p.token, { enrolmentToken: message.token })).ok).toBe(
+      true,
+    );
+    // It works from another waiting session too until a factor is confirmed,
+    // never without it.
     const q = await pending(person.userId, org);
-    for (const options of [{}, { enrolmentToken: message.token }]) {
-      expect(await startEnrolment(db, keys, q.token, options)).toMatchObject({
-        code: "enrolment_token_required",
-      });
-    }
-    const confirmed = await confirmEnrolment(db, keys, p.token, {
+    expect(await startEnrolment(db, keys, q.token)).toMatchObject({
+      code: "enrolment_token_required",
+    });
+    const restart = await startEnrolment(db, keys, q.token, { enrolmentToken: message.token });
+    if (!restart.ok) throw new Error(JSON.stringify(restart));
+    const confirmed = await confirmEnrolment(db, keys, q.token, {
       source: source(),
       code: await codeAt(decodeBase32(restart.secret) ?? new Uint8Array()),
     });
     expect(confirmed.ok).toBe(true);
+    // Once a factor is confirmed the token is spent.
+    const presented = await db
+      .execute(
+        sql`UPDATE public.second_step_enrolment_tokens SET presented = ${message.token}
+          WHERE user_id = ${person.userId}::uuid`,
+      )
+      .catch((e: unknown) => e);
+    expect(presented).toMatchObject({ constraint: "second_step_enrolment_tokens_use" });
     // The admin's own session is untouched.
     expect((await resolveSession(db, again.token)).ok).toBe(true);
     // The writer can't mint an enrolment token without a reset.
@@ -1160,6 +1413,75 @@ async function ageSession(sessionId: SessionId, seconds: number): Promise<void> 
       sql`ALTER TABLE public.sessions ENABLE ALWAYS TRIGGER zzzz_sessions_keep_identity`,
     );
   });
+}
+
+/** `base`, with `hook` awaited once before the first statement `match` picks. */
+function pauseBefore(
+  base: Database,
+  match: (text: string) => boolean,
+  hook: () => Promise<void>,
+): Database {
+  let fired = false;
+  const gate = async (query: Sql): Promise<void> => {
+    if (!fired && match(query.text)) {
+      fired = true;
+      await hook();
+    }
+  };
+  const wrap = (q: Queryable): Queryable => ({
+    rows: async <R extends Row = Row>(query: Sql): Promise<R[]> => {
+      await gate(query);
+      return q.rows<R>(query);
+    },
+    execute: async (query: Sql): Promise<number> => {
+      await gate(query);
+      return q.execute(query);
+    },
+  });
+  return {
+    ...wrap(base),
+    transaction: <T>(work: (tx: Queryable) => Promise<T>): Promise<T> =>
+      base.transaction((tx) => work(wrap(tx))),
+    close: () => base.close(),
+  };
+}
+
+/** A login role made by grantWriterRole, connected to the test database (dropped after the file). */
+async function writerDatabase(): Promise<Database> {
+  const role = `oculus_test_t038w_${unique().toString()}_${String(process.pid)}`;
+  const run = async (statement: string, q: Queryable): Promise<void> => {
+    await q.rows(sql`SELECT set_config('oculus_test.role', ${role}, true),
+                            set_config('oculus_test.statement', ${statement}, true)`);
+    await q.execute(sql`DO $$ BEGIN
+      EXECUTE format(current_setting('oculus_test.statement'), current_setting('oculus_test.role'));
+    END $$`);
+  };
+  const server = openDatabase(testServerUrl(), { max: 1 });
+  try {
+    await server.transaction((q) => run("CREATE ROLE %I LOGIN", q));
+  } finally {
+    await server.close();
+  }
+  cleanups.push(async () => {
+    const s = openDatabase(testServerUrl(), { max: 1 });
+    try {
+      await s.transaction((q) => run("DROP ROLE IF EXISTS %I", q));
+    } finally {
+      await s.close();
+    }
+  });
+  await db.transaction((q) => grantWriterRole(q, role));
+  const url = new URL(testDb.url);
+  url.username = role;
+  const writer = openDatabase(url.toString(), { max: 3 });
+  expect(await checkWriterConnection(writer)).toEqual([]);
+  return writer;
+}
+
+/** An asymmetric matcher typed as the string it stands for. */
+function matching(pattern: RegExp): string {
+  const matcher: unknown = expect.stringMatching(pattern);
+  return matcher as string;
 }
 
 function deliverTo(box: EnrolmentMessage[]): EnrolmentDelivery {
