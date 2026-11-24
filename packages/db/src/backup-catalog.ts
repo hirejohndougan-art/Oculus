@@ -31,7 +31,10 @@ export interface ObjectSummaries {
   triggers: string[];
   /** Tables with row security on or forced, and each policy. */
   policies: string[];
-  /** Privileges granted to anyone but an object's owner. */
+  /**
+   * Privileges granted to anyone but an object's owner:
+   * `<kind> <name> to <grantee, quoted as an identifier>: <privilege>`.
+   */
   grants: string[];
 }
 
@@ -112,7 +115,7 @@ export async function objectSummaries(db: Queryable): Promise<ObjectSummaries> {
     SELECT 'policies', ns.nspname || '.' || c.relname || ' policy ' || p.polname || ' ' || p.polcmd::pg_catalog.text
            || CASE WHEN p.polpermissive THEN ' permissive' ELSE ' restrictive' END || ' to '
            || (SELECT pg_catalog.string_agg(r.name, ',' ORDER BY r.name COLLATE "C")
-               FROM (SELECT CASE WHEN u = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(u)::pg_catalog.text END AS name
+               FROM (SELECT CASE WHEN u = 0 THEN 'PUBLIC' ELSE pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(u)::pg_catalog.text) END AS name
                      FROM pg_catalog.unnest(p.polroles) AS u) AS r) || ' '
            || pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
                 COALESCE(pg_catalog.pg_get_expr(p.polqual, p.polrelid), '') || ' / '
@@ -121,7 +124,7 @@ export async function objectSummaries(db: Queryable): Promise<ObjectSummaries> {
     JOIN ns ON ns.oid = c.relnamespace
     UNION ALL
     SELECT 'grants', a.kind || ' ' || a.name || ' to '
-           || CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(a.grantee)::pg_catalog.text END
+           || CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(a.grantee)::pg_catalog.text) END
            || ': ' || a.privilege_type || CASE WHEN a.is_grantable THEN ' with grant option' ELSE '' END
     FROM (
       SELECT 'relation' AS kind, ns.nspname || '.' || c.relname AS name, c.relowner AS owner, x.grantee, x.privilege_type, x.is_grantable
@@ -211,4 +214,11 @@ export async function contentsOf(db: Queryable): Promise<Record<string, number>>
           AND pg_catalog.obj_description(n.oid, 'pg_namespace') IS NOT DISTINCT FROM 'standard public schema'
         )) + (SELECT CASE WHEN pg_catalog.to_regnamespace('public') IS NULL THEN 1 ELSE 0 END)::pg_catalog.int4 AS public_schema_changes`);
   return Object.fromEntries(Object.entries(row ?? {}).filter(([, count]) => count > 0));
+}
+
+/** The grantee of a grant line (as `quote_ident` gives it). */
+export function grantee(line: string): string {
+  const at = line.lastIndexOf(" to ");
+  const end = line.indexOf(": ", at);
+  return at < 0 || end < 0 ? "" : line.slice(at + 4, end);
 }

@@ -1,9 +1,14 @@
 /**
- * `npm run db:backup -- <new file>` and `npm run db:restore -- [--allow-superuser] <file>`
+ * `npm run db:backup -- <new file>` and
+ * `npm run db:restore -- [--allow-superuser] [--no-privileges] <file>`
  * (D-064), for the database named by OCULUS_DATABASE_URL. The URL is never
  * printed or put on a command line. A relative path is taken from the
  * directory npm was run in (INIT_CWD), else the current one. SIGINT, SIGTERM
- * and SIGHUP stop the tool, remove every temporary file and exit 1.
+ * and SIGHUP stop the tool, remove every temporary file and exit 1; a second
+ * signal, or the stop taking longer than 30 seconds, exits at once, still
+ * killing the tool and removing the temporary files synchronously
+ * (backup-cleanup.ts). A restore that had already committed when the stop
+ * came is checked and reported, and exits 0 if it is good.
  * Exit codes: 0 done, 1 refused, failed or stopped, 2 usage. Any scheduler
  * (cron, a host's scheduler) can run them (D-035).
  */
@@ -119,12 +124,14 @@ export async function runRestoreCli(
   err: Line,
   options: CliOptions = {},
 ): Promise<number> {
+  const flags = new Set(["--allow-superuser", "--no-privileges"]);
   const allowSuperuser = args.includes("--allow-superuser");
-  const rest = args.filter((a) => a !== "--allow-superuser");
+  const noPrivileges = args.includes("--no-privileges");
+  const rest = args.filter((a) => !flags.has(a));
   const [arg] = rest;
   if (rest.length !== 1 || !usable(arg)) {
     err(
-      "Usage: npm run db:restore -- [--allow-superuser] <backup file>   (into the empty database in OCULUS_DATABASE_URL)",
+      "Usage: npm run db:restore -- [--allow-superuser] [--no-privileges] <backup file>   (into the empty database in OCULUS_DATABASE_URL)",
     );
     return 2;
   }
@@ -137,11 +144,17 @@ export async function runRestoreCli(
       file: filePath(arg, env),
       env,
       allowSuperuser,
+      noPrivileges,
       log: safe.out,
       ...(options.signal === undefined ? {} : { signal: options.signal }),
       ...(options.tempDir === undefined ? {} : { tempDir: options.tempDir }),
     });
     const rows = result.manifest.tables.reduce((sum, t) => sum + BigInt(t.rows), 0n);
+    if (result.stoppedAfterCommit) {
+      safe.err(
+        "The stop came after pg_restore had committed, so the restore was not undone; it was checked and is complete.",
+      );
+    }
     safe.out(
       `Done: restored and checked ${String(result.manifest.tables.length)} tables, ${String(rows)} rows, ${String(result.manifest.migrations.length)} migrations.`,
     );
@@ -164,16 +177,24 @@ if (command !== undefined && import.meta.url === pathToFileURL(command).href) {
     console.error("Usage: node backup-cli.js backup|restore <file>");
     process.exitCode = 2;
   } else {
-    // A signal stops the tool and cleans up; a second one, or 30 seconds
-    // without the clean-up finishing, exits at once (the tools' watchdog
-    // still ends them when this process is gone).
+    // A signal stops the tool and cleans up; a second one, or the grace
+    // period passing, exits at once. Exiting runs backup-cleanup.ts's
+    // synchronous handler: the tool's group is killed and every temporary
+    // file removed. (OCULUS_STOP_GRACE_MS shortens the grace, for tests.)
+    const grace = Number(process.env.OCULUS_STOP_GRACE_MS ?? "") || 30_000;
     const controller = new AbortController();
     for (const name of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
       process.on(name, () => {
-        if (controller.signal.aborted) process.exit(1);
+        if (controller.signal.aborted) {
+          console.error(`Stopping at once (${name}).`);
+          process.exit(1);
+        }
         console.error(`Stopping (${name})...`);
         controller.abort();
-        setTimeout(() => process.exit(1), 30_000).unref();
+        setTimeout(() => {
+          console.error("Stopping took too long; exiting.");
+          process.exit(1);
+        }, grace).unref();
       });
     }
     const code = await run(
@@ -187,6 +208,6 @@ if (command !== undefined && import.meta.url === pathToFileURL(command).href) {
       },
       { signal: controller.signal },
     );
-    process.exitCode = controller.signal.aborted ? 1 : code;
+    process.exitCode = code;
   }
 }

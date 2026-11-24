@@ -33,14 +33,17 @@
  * ends them and removes every temporary file.
  */
 import { execFile, spawn } from "node:child_process";
+import { once } from "node:events";
 import { createHash, randomBytes } from "node:crypto";
 import { constants as fsConstants, existsSync } from "node:fs";
 import { link, lstat, open, rm, unlink, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import type { Writable } from "node:stream";
 import { basename, dirname, join, resolve } from "node:path";
 import { openSession, type Queryable, type Session } from "./client.js";
 import {
   contentsOf,
+  grantee,
   objectSummaries,
   OBJECT_KINDS,
   sorted,
@@ -67,6 +70,7 @@ import {
   type MigrationFile,
 } from "./migrate.js";
 import { sql } from "./sql.js";
+import { trackGroup, trackPath } from "./backup-cleanup.js";
 
 export type { TableSummary, ObjectSummaries } from "./backup-catalog.js";
 
@@ -189,56 +193,77 @@ function checkSystemRoots(connection: ResolvedConnection, tool: string, major: n
 
 /**
  * The shell watchdog every tool runs under (`sh -c WATCHDOG oculus-tool
- * <tool> <args...>`). It starts the tool in the background, and a watcher
- * that reads the watchdog's stdin, a pipe from this process that is never
- * written: when this process dies, however it dies, the pipe closes, the read
- * ends and the watcher ends the tool (a pg_restore then rolls back). The
- * watchdog is its own process group's leader, so a signal to the group
- * reaches the tool too.
+ * <tool> <args...>`), in its own process group. Its file descriptors from
+ * this process: 0 is the lifeline, a pipe that is never written; 3 is the
+ * tool's input (the archive, for pg_restore; empty for pg_dump). It starts the
+ * tool in the background with fd 3 as its stdin, and a watcher that reads the
+ * lifeline: when this process dies, however it dies, the pipe closes, the read
+ * ends and the watcher sends the whole group SIGTERM, then SIGKILL 5 seconds
+ * later (so a tool that ignores SIGTERM, and anything it started, still ends;
+ * an unfinished pg_restore rolls back either way). The watchdog itself
+ * survives SIGTERM, SIGINT and SIGHUP (passing them to the tool) and waits for
+ * the tool, so this process sees the tool's real end; this process sends
+ * SIGKILL to the group if the tool outlives its grace period, and at once if
+ * the watchdog is killed. The arguments are never interpreted by the shell.
  */
 export const WATCHDOG = [
-  "exec 3<&0",
-  '"$@" 3<&- &',
+  "exec 4<&0",
+  '"$@" <&3 3<&- 4<&- &',
   "pid=$!",
-  '( while read -r _ <&3; do :; done; kill -TERM "$pid" 2>/dev/null ) &',
-  "watcher=$!",
   "exec 3<&-",
+  "( trap '' TERM INT HUP; while read -r _ <&4; do :; done; kill -TERM -$$ 2>/dev/null; sleep 5; kill -KILL -$$ 2>/dev/null ) &",
+  "watcher=$!",
+  "exec 4<&-",
+  `trap 'kill -TERM "$pid" 2>/dev/null' TERM INT HUP`,
   "status=0",
-  'wait "$pid" || status=$?',
-  'kill "$watcher" 2>/dev/null',
+  "while :; do",
+  '  wait "$pid"; status=$?',
+  '  kill -0 "$pid" 2>/dev/null || break',
+  "done",
+  'kill -KILL "$watcher" 2>/dev/null',
   'exit "$status"',
 ].join("\n");
+
+/** How long a tool has to end after SIGTERM before SIGKILL. */
+const KILL_GRACE_MS = 5000;
 
 interface ToolResult {
   code: number | null;
   stderr: string;
 }
 
+interface ToolIo {
+  /** Receives the tool's stdout (default: discarded). */
+  sink?: (chunk: Buffer) => Promise<void>;
+  /** Writes the tool's stdin; the stream is ended afterwards. */
+  feed?: (input: Writable) => Promise<void>;
+}
+
+/** Writes a chunk, waiting while the pipe is full. */
+export async function writeAll(stream: Writable, chunk: Buffer): Promise<void> {
+  if (!stream.write(chunk)) await once(stream, "drain");
+}
+
 /**
- * Runs a tool under the watchdog. Its stdout goes to `sink` (or nowhere).
- * Aborting `signal` sends SIGTERM to the tool's whole process group, and
- * SIGKILL 5 seconds later if it is still there.
+ * Runs a tool under the watchdog. Aborting `signal` sends SIGTERM to the
+ * tool's whole process group, and SIGKILL after a grace period. If the
+ * watchdog itself dies by a signal, the group is killed at once, so the
+ * tool can't keep the pipes open. While it runs, the group is registered for
+ * the synchronous clean-up on exit (backup-cleanup.ts).
  */
 async function runTool(
   cmd: string,
   args: string[],
   env: Record<string, string>,
   signal: AbortSignal | undefined,
-  sink?: (chunk: Buffer) => Promise<void>,
+  io: ToolIo = {},
 ): Promise<ToolResult> {
   const child = spawn("/bin/sh", ["-c", WATCHDOG, "oculus-tool", cmd, ...args], {
     env,
     detached: true,
-    stdio: ["pipe", sink === undefined ? "ignore" : "pipe", "pipe"],
+    stdio: ["pipe", io.sink === undefined ? "ignore" : "pipe", "pipe", "pipe"],
   });
-  const closed = new Promise<number | null>((resolvePromise) => {
-    child.on("error", () => {
-      resolvePromise(null);
-    });
-    child.on("close", (code) => {
-      resolvePromise(code);
-    });
-  });
+  const untrack = child.pid === undefined ? () => undefined : trackGroup(child.pid);
   let done = false;
   const killGroup = (sig: NodeJS.Signals): void => {
     if (done || child.pid === undefined) return;
@@ -248,35 +273,68 @@ async function runTool(
       // Already gone.
     }
   };
+  const closed = new Promise<number | null>((resolvePromise) => {
+    child.on("error", () => {
+      resolvePromise(null);
+    });
+    child.on("exit", (_code, sig) => {
+      // The watchdog was killed: end the tool now, so its pipes close.
+      if (sig !== null) killGroup("SIGKILL");
+    });
+    child.on("close", (code) => {
+      resolvePromise(code);
+    });
+  });
   let forceTimer: NodeJS.Timeout | undefined;
   const onAbort = (): void => {
     killGroup("SIGTERM");
     forceTimer = setTimeout(() => {
       killGroup("SIGKILL");
-    }, 5000);
+    }, KILL_GRACE_MS);
     forceTimer.unref();
   };
   if (signal?.aborted === true) onAbort();
   else signal?.addEventListener("abort", onAbort, { once: true });
   child.stdin?.on("error", () => undefined);
+  const input = child.stdio[3] as Writable | null;
+  input?.on("error", () => undefined);
   let stderr = "";
   child.stderr?.setEncoding("utf8");
   child.stderr?.on("data", (chunk: string) => {
     if (stderr.length < 64 * 1024) stderr += chunk;
   });
   try {
-    if (sink !== undefined && child.stdout !== null) {
+    const feeding = (async () => {
+      if (input === null) return;
+      try {
+        if (io.feed !== undefined) await io.feed(input);
+      } catch (error) {
+        if (error instanceof BackupError) {
+          killGroup("SIGKILL");
+          throw error;
+        }
+        // The tool stopped reading (it failed): its exit code says why.
+      } finally {
+        input.end();
+      }
+    })();
+    const reading = (async () => {
+      const { sink } = io;
+      if (sink === undefined || child.stdout === null) return;
       try {
         for await (const chunk of child.stdout as AsyncIterable<Buffer>) await sink(chunk);
       } catch (error) {
-        killGroup("SIGTERM");
-        await closed;
+        killGroup("SIGKILL");
         throw new BackupError("write_failed", `Could not write the backup (${errorCode(error)}).`);
       }
-    }
-    return { code: await closed, stderr };
+    })();
+    const outcomes = await Promise.allSettled([feeding, reading]);
+    const code = await closed;
+    for (const outcome of outcomes) if (outcome.status === "rejected") throw outcome.reason;
+    return { code, stderr };
   } finally {
     done = true;
+    untrack();
     signal?.removeEventListener("abort", onAbort);
     if (forceTimer !== undefined) clearTimeout(forceTimer);
     child.stdin?.destroy();
@@ -548,14 +606,17 @@ async function mustNotExist(path: string): Promise<void> {
   throw new BackupError("exists", `${path} already exists; a backup never overwrites a file.`);
 }
 
-async function syncDirectory(dir: string): Promise<void> {
-  const handle = await open(dir, fsConstants.O_RDONLY);
+/** Syncs a directory; returns false if it couldn't (some file systems can't). */
+async function syncDirectory(dir: string): Promise<boolean> {
+  let handle: FileHandle | undefined;
   try {
+    handle = await open(dir, fsConstants.O_RDONLY);
     await handle.sync();
+    return true;
   } catch {
-    // Some file systems can't sync a directory; the file itself is synced.
+    return false;
   } finally {
-    await handle.close();
+    await handle?.close().catch(() => undefined);
   }
 }
 
@@ -584,7 +645,11 @@ async function publish(temp: string, file: string, log: (message: string) => voi
       `Warning: the backup is complete at ${file}, but the temporary file ${temp} could not be removed (${errorCode(error)}); delete it.`,
     );
   }
-  await syncDirectory(dirname(file));
+  if (!(await syncDirectory(dirname(file)))) {
+    log(
+      `Warning: the backup is complete at ${file}, but its directory could not be synced to disk; a power cut in the next moments could lose the new name.`,
+    );
+  }
 }
 
 /** Writes a backup of the whole database to `file` (0600). */
@@ -602,7 +667,9 @@ export async function backup(options: BackupOptions): Promise<BackupResult> {
 
   const session = await connect(connection, "oculus-backup", "dump_failed");
   let space: Workspace | undefined;
+  // Hidden, and matched by .gitignore's `*.partial`.
   const temp = join(dirname(file), `.${basename(file)}.${randomBytes(6).toString("hex")}.partial`);
+  let untrackTemp: (() => void) | undefined;
   let handle: FileHandle | undefined;
   let published = false;
   try {
@@ -639,6 +706,7 @@ export async function backup(options: BackupOptions): Promise<BackupResult> {
     space = await workspace(connection, env, "oculus-backup", options.tempDir ?? tmpdir());
     try {
       handle = await open(temp, "wx", 0o600);
+      untrackTemp = trackPath(temp);
       await handle.chmod(0o600);
     } catch (error) {
       throw new BackupError(
@@ -661,10 +729,12 @@ export async function backup(options: BackupOptions): Promise<BackupResult> {
       ],
       space.env,
       signal,
-      async (chunk) => {
-        hash.update(chunk);
-        bytes += chunk.length;
-        await out.write(chunk);
+      {
+        sink: async (chunk) => {
+          hash.update(chunk);
+          bytes += chunk.length;
+          await out.write(chunk);
+        },
       },
     );
     if (stopped(signal)) throw interrupted("no backup was written.");
@@ -701,6 +771,7 @@ export async function backup(options: BackupOptions): Promise<BackupResult> {
   } finally {
     await handle?.close().catch(() => undefined);
     if (!published) await rm(temp, { force: true }).catch(() => undefined);
+    untrackTemp?.();
     await session.close().catch(() => undefined);
     await space?.remove();
   }
@@ -715,11 +786,23 @@ export interface RestoreOptions {
   file: string;
   /** Default: packages/db/migrations. */
   migrationsDir?: string;
-  /** Restore even as a superuser (not recommended: a backup's SQL then runs with every privilege). */
+  /**
+   * Restore even as a role with superuser powers (not recommended: a backup's
+   * SQL then runs with every privilege).
+   */
   allowSuperuser?: boolean;
+  /**
+   * Leave out the backup's GRANTs and REVOKEs (`pg_restore --no-privileges`),
+   * for a server where the roles they name don't exist, as after a disaster on
+   * another cluster. Grants are then not checked afterwards; set them up again.
+   */
+  noPrivileges?: boolean;
   env?: Record<string, string | undefined>;
   tempDir?: string;
-  /** Stops the restore: pg_restore is ended (its transaction rolls back) and nothing is left behind. */
+  /**
+   * Stops the restore: pg_restore is ended and its transaction rolls back. If
+   * it had already committed, the restore is checked and reported as done.
+   */
   signal?: AbortSignal;
   log?: (message: string) => void;
 }
@@ -728,6 +811,8 @@ export interface RestoreResult {
   manifest: BackupManifest;
   /** Migration files in the code that are newer than the backup: run db:migrate next. */
   pending: string[];
+  /** A stop was asked for after pg_restore had committed; the restore is complete and checked. */
+  stoppedAfterCommit: boolean;
 }
 
 /**
@@ -767,6 +852,52 @@ export function compareMigrations(
   return missing.map((file) => file.name);
 }
 
+/**
+ * Roles whose membership gives a role superuser powers, or powers close to
+ * them, beyond being a superuser itself or a member of one: running programs
+ * and reading or writing files on the server as its operating-system user,
+ * and the administrator roles managed services give in place of superuser.
+ */
+export const POWERFUL_ROLES = [
+  "pg_execute_server_program",
+  "pg_write_server_files",
+  "pg_read_server_files",
+  "rds_superuser",
+  "cloudsqlsuperuser",
+  "azure_pg_admin",
+] as const;
+
+/**
+ * Why the connected role may not restore without --allow-superuser, or an
+ * empty list: the session's and the current role's own SUPERUSER and
+ * CREATEROLE, and membership, direct or through other roles, of any
+ * superuser role or any of POWERFUL_ROLES.
+ */
+export async function superuserPowers(db: Queryable): Promise<string[]> {
+  const rows = await db.rows<{
+    role: string;
+    superuser: boolean;
+    createrole: boolean;
+    via: string[];
+  }>(sql`
+    SELECT me.rolname::pg_catalog.text AS role, me.rolsuper AS superuser, me.rolcreaterole AS createrole,
+           ARRAY(SELECT r.rolname::pg_catalog.text FROM pg_catalog.pg_roles r
+                 WHERE r.oid <> me.oid
+                   AND (r.rolsuper OR r.rolname::pg_catalog.text = ANY (${[...POWERFUL_ROLES]}::pg_catalog.text[]))
+                   AND pg_catalog.pg_has_role(me.oid, r.oid, 'MEMBER')
+                 ORDER BY 1)::pg_catalog.text[] AS via
+    FROM pg_catalog.pg_roles me
+    WHERE me.rolname IN (SESSION_USER, CURRENT_USER)
+    ORDER BY 1`);
+  const reasons: string[] = [];
+  for (const row of rows) {
+    if (row.superuser) reasons.push(`${row.role} is a superuser`);
+    if (row.createrole) reasons.push(`${row.role} has CREATEROLE`);
+    for (const role of row.via) reasons.push(`${row.role} is a member of ${role}`);
+  }
+  return reasons;
+}
+
 /** Restores a backup into an empty database and checks the result against its manifest. */
 export async function restore(options: RestoreOptions): Promise<RestoreResult> {
   const env = options.env ?? process.env;
@@ -789,16 +920,14 @@ export async function restore(options: RestoreOptions): Promise<RestoreResult> {
       `This backup was made by pg_dump ${String(dumpMajor)}; pg_restore ${String(pgRestore.major)} can't read it. Set PG_BIN to the bin directory of PostgreSQL ${String(dumpMajor)} or newer.`,
     );
   }
+  // The whole archive is read and checked first, so a damaged file is refused
+  // before the target is touched. It is then streamed to pg_restore's stdin:
+  // no copy of the data is ever written.
+  await checkArchive(file, manifest, signal);
 
   const space = await workspace(connection, env, "oculus-restore", options.tempDir ?? tmpdir());
   let session: Session | undefined;
   try {
-    // The archive is copied out and checked before the target is looked at,
-    // so the emptiness check comes right before pg_restore starts.
-    const archive = join(space.dir, "archive.dump");
-    await extractArchive(file, archive, manifest);
-    if (stopped(signal)) throw interrupted("nothing was restored.");
-
     session = await connect(connection, "oculus-restore-check", "restore_failed");
     // This session holds the migration lock while pg_restore runs; no role or
     // database timeout may end it.
@@ -814,18 +943,16 @@ export async function restore(options: RestoreOptions): Promise<RestoreResult> {
         `pg_restore ${String(pgRestore.major)} is older than PostgreSQL ${server.text}: set PG_BIN to the bin directory of PostgreSQL ${String(serverMajor)} or newer.`,
       );
     }
-    const [role] = await session.rows<{ superuser: boolean }>(
-      sql`SELECT pg_catalog.current_setting('is_superuser') = 'on' AS superuser`,
-    );
-    if (role?.superuser === true) {
+    const powers = await superuserPowers(session);
+    if (powers.length > 0) {
       if (options.allowSuperuser !== true) {
         throw new BackupError(
           "superuser",
-          "The role in OCULUS_DATABASE_URL is a superuser, so everything in the backup would run with every privilege. Restore as the role that owns the new empty database (CREATE DATABASE ... OWNER that_role TEMPLATE template0), or pass --allow-superuser if you must.",
+          `The role in OCULUS_DATABASE_URL has superuser powers (${powers.join("; ")}), so everything in the backup would run with them. Restore as a plain role that owns the new empty database (CREATE DATABASE ... OWNER that_role TEMPLATE template0), or pass --allow-superuser if you must.`,
         );
       }
       log(
-        "WARNING: restoring as a superuser (--allow-superuser): everything in the backup runs with every privilege. Only do this with a backup you made yourself.",
+        `WARNING: restoring with superuser powers (${powers.join("; ")}) because of --allow-superuser: everything in the backup runs with them. Only do this with a backup you made yourself.`,
       );
     }
     // Hold the migration runner's lock, so db:migrate can't fill the target
@@ -856,67 +983,115 @@ export async function restore(options: RestoreOptions): Promise<RestoreResult> {
       join(bin, "pg_restore"),
       [
         "--no-owner",
+        ...(options.noPrivileges === true ? ["--no-privileges"] : []),
         "--single-transaction",
         "--exit-on-error",
         "--no-password",
         `--dbname=service=${SERVICE_NAME}`,
-        archive,
       ],
       space.env,
       signal,
+      { feed: (input) => streamArchive(file, manifest, input, signal) },
     );
+    let stoppedAfterCommit = false;
     if (restored.code !== 0) {
-      if (stopped(signal)) {
-        throw interrupted("pg_restore was stopped and its transaction rolled back.");
+      // pg_restore ended badly or was stopped. Its one transaction either
+      // committed or not: look before saying which.
+      const after = await contentsOf(session);
+      if (Object.keys(after).length === 0) {
+        if (stopped(signal)) {
+          throw interrupted(
+            "pg_restore was stopped and its transaction rolled back; nothing was restored.",
+          );
+        }
+        throw new BackupError(
+          "restore_failed",
+          `pg_restore failed (exit ${String(restored.code)}); nothing was restored (it runs in one transaction): ${redact(restored.stderr, connection.secrets) || "no message"}`,
+        );
       }
-      throw new BackupError(
-        "restore_failed",
-        `pg_restore failed (exit ${String(restored.code)}); nothing was restored (it runs in one transaction): ${redact(restored.stderr, connection.secrets) || "no message"}`,
+      stoppedAfterCommit = stopped(signal);
+      log(
+        stoppedAfterCommit
+          ? "A stop was asked for after pg_restore had committed; checking the restored database."
+          : `pg_restore ended with exit ${String(restored.code)} after committing; checking the restored database.`,
       );
     }
-    // pg_restore committed: check the result even if a signal came meanwhile.
-    await verify(session, manifest);
-    return { manifest, pending };
+    // pg_restore committed: the check runs to the end even if a stop is
+    // asked for meanwhile, since it is what says whether the restore is good.
+    await verify(session, manifest, options.noPrivileges === true);
+    return { manifest, pending, stoppedAfterCommit };
   } finally {
     await session?.close().catch(() => undefined);
     await space.remove();
   }
 }
 
-/** Copies the archive out of the backup file, checking its size and SHA-256 against the manifest. */
-async function extractArchive(
+const CHUNK_BYTES = 1024 * 1024;
+
+/** Reads the archive's bytes in order, calling `each` per chunk; checks `signal` between chunks. */
+async function readArchive(
   file: string,
-  archive: string,
   manifest: BackupManifest,
+  signal: AbortSignal | undefined,
+  each: (chunk: Buffer, last: boolean) => Promise<void>,
 ): Promise<void> {
   const source = await open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
   try {
-    const target = await open(archive, "wx", 0o600);
-    try {
-      const hash = createHash("sha256");
-      const buffer = Buffer.alloc(1024 * 1024);
-      let position = 0;
-      while (position < manifest.dump.bytes) {
-        const want = Math.min(buffer.length, manifest.dump.bytes - position);
-        const { bytesRead } = await source.read(buffer, 0, want, position);
-        if (bytesRead === 0) break;
-        const chunk = buffer.subarray(0, bytesRead);
-        hash.update(chunk);
-        await target.write(chunk);
-        position += bytesRead;
-      }
-      if (position !== manifest.dump.bytes || hash.digest("hex") !== manifest.dump.sha256) {
-        throw new BackupError(
-          "bad_file",
-          `${file} is damaged: its archive does not match the SHA-256 in its manifest. Nothing was restored.`,
-        );
-      }
-    } finally {
-      await target.close();
+    let position = 0;
+    while (position < manifest.dump.bytes) {
+      if (stopped(signal)) throw interrupted("nothing was restored.");
+      const want = Math.min(CHUNK_BYTES, manifest.dump.bytes - position);
+      const buffer = Buffer.alloc(want);
+      const { bytesRead } = await source.read(buffer, 0, want, position);
+      if (bytesRead === 0) break;
+      position += bytesRead;
+      await each(buffer.subarray(0, bytesRead), position >= manifest.dump.bytes);
     }
+    if (position !== manifest.dump.bytes) throw damaged(file);
   } finally {
     await source.close();
   }
+}
+
+function damaged(file: string): BackupError {
+  return new BackupError(
+    "bad_file",
+    `${file} is damaged or changed: its archive does not match the SHA-256 in its manifest. Nothing was restored.`,
+  );
+}
+
+/** Checks the archive's size and SHA-256 against the manifest, writing nothing. */
+async function checkArchive(
+  file: string,
+  manifest: BackupManifest,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  const hash = createHash("sha256");
+  await readArchive(file, manifest, signal, (chunk) => {
+    hash.update(chunk);
+    return Promise.resolve();
+  });
+  if (hash.digest("hex") !== manifest.dump.sha256) throw damaged(file);
+}
+
+/**
+ * Streams the archive to pg_restore, hashing it again as it goes. The last
+ * chunk is held back until the whole archive's SHA-256 is known to match: if
+ * the file changed since it was checked, pg_restore never gets its end, so it
+ * can't reach COMMIT, and is killed.
+ */
+export async function streamArchive(
+  file: string,
+  manifest: BackupManifest,
+  input: Writable,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  const hash = createHash("sha256");
+  await readArchive(file, manifest, signal, async (chunk, last) => {
+    hash.update(chunk);
+    if (last && hash.digest("hex") !== manifest.dump.sha256) throw damaged(file);
+    await writeAll(input, chunk);
+  });
 }
 
 /** Lines in one list and not the other, for a message. */
@@ -929,8 +1104,16 @@ function listDifference(kind: string, expected: string[], found: string[]): stri
   return out;
 }
 
-/** Checks the restored database against the manifest. */
-async function verify(db: Queryable, manifest: BackupManifest): Promise<void> {
+/**
+ * Checks the restored database against the manifest. Grants to the restoring
+ * role are left out on both sides: with --no-owner it owns everything, and an
+ * owner's rights are not grants. With --no-privileges grants aren't compared.
+ */
+async function verify(
+  db: Queryable,
+  manifest: BackupManifest,
+  noPrivileges: boolean,
+): Promise<void> {
   const problems: string[] = [];
   const migrations = (await appliedMigrations(db)) ?? [];
   const wanted = manifest.migrations.map((m) => `${m.name} ${m.sha256}`).join("\n");
@@ -950,8 +1133,16 @@ async function verify(db: Queryable, manifest: BackupManifest): Promise<void> {
   }
   for (const name of tables.keys()) problems.push(`${name} is not in the backup`);
   const objects = await objectSummaries(db);
+  const [me] = await db.rows<{ grantee: string }>(
+    sql`SELECT pg_catalog.quote_ident(CURRENT_USER::pg_catalog.text) AS grantee`,
+  );
+  const notMine = (line: string): boolean => grantee(line) !== (me?.grantee ?? "");
   for (const kind of OBJECT_KINDS) {
-    problems.push(...listDifference(kind, manifest.objects[kind], objects[kind]));
+    if (kind === "grants" && noPrivileges) continue;
+    const expected =
+      kind === "grants" ? manifest.objects.grants.filter(notMine) : manifest.objects[kind];
+    const found = kind === "grants" ? objects.grants.filter(notMine) : objects[kind];
+    problems.push(...listDifference(kind, expected, found));
   }
   if (problems.length > 0) {
     throw new BackupError(

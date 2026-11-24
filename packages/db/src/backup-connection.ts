@@ -3,15 +3,16 @@
  * and to pg_dump / pg_restore (D-064).
  *
  * OCULUS_DATABASE_URL is parsed once, as libpq reads a URI. The result is
- * written two ways: a libpq service file (0600, in a private 0700 directory,
- * deleted afterwards) for the tools, and field-by-field settings for the
- * driver. Only keywords both can be given the same meaning are accepted, so
+ * written two ways: a libpq service file and, for a password, a libpq
+ * password file (both 0600, in a private 0700 directory, deleted afterwards)
+ * for the tools, and field-by-field settings for the driver. Only keywords both can be given the same meaning are accepted, so
  * the checks (on the driver's connection) and the restore (pg_restore's) can
  * never reach different databases. Nothing here ever puts the URL or a value
  * from it into an error message, a command line or the tools' environment.
  */
 import { readFileSync } from "node:fs";
 import { mkdtemp, open, rm } from "node:fs/promises";
+import { trackPath } from "./backup-cleanup.js";
 import { join } from "node:path";
 import type { ConnectionSettings } from "./client.js";
 
@@ -51,8 +52,10 @@ const SSL_MODES = new Set(["disable", "allow", "prefer", "require", "verify-ca",
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 
 export interface ResolvedConnection {
-  /** The service file's keywords and values, in order. */
+  /** The service file's keywords and values, in order (never the password). */
   libpq: [string, string][];
+  /** The password, for the tools' password file. */
+  password?: string;
   /** The same connection for the driver. */
   node: ConnectionSettings;
   /**
@@ -164,9 +167,10 @@ export function resolveConnection(
       `${URL_PROBLEM}: sslmode=${asked} to a host that is not this machine would send the password unencrypted; backups always use TLS there.`,
     );
   } else if (asked === "verify-ca") {
-    if (!given.has("sslrootcert")) {
+    const root = given.get("sslrootcert");
+    if (root === undefined || root === "system") {
       throw new ConnectionError(
-        `${URL_PROBLEM}: sslmode=verify-ca needs sslrootcert, the CA certificate to check the server against.`,
+        `${URL_PROBLEM}: sslmode=verify-ca needs sslrootcert naming a CA certificate file (libpq refuses verify-ca with the system's CAs).`,
       );
     }
     sslmode = "verify-ca";
@@ -179,7 +183,6 @@ export function resolveConnection(
     ["dbname", database],
     ["user", user],
   ];
-  if (password !== undefined) libpq.push(["password", password]);
   if (timeoutText !== undefined) libpq.push(["connect_timeout", timeoutText]);
   libpq.push(["sslmode", sslmode]);
 
@@ -222,9 +225,35 @@ export function resolveConnection(
     node.ssl = ssl;
   }
 
+  for (const [key, value] of libpq) {
+    if (Buffer.byteLength(`${key}=${value}`) > MAX_SERVICE_LINE) {
+      throw new ConnectionError(
+        `${URL_PROBLEM}: its ${key} is too long for a libpq service file (libpq refuses lines over about 1,000 bytes).`,
+      );
+    }
+  }
   const secrets = [connectionString];
   if (password !== undefined && password.length >= 4) secrets.push(password);
-  return { libpq, node, sslmode, needsSystemRoots, secrets };
+  return {
+    libpq,
+    node,
+    sslmode,
+    needsSystemRoots,
+    secrets,
+    ...(password === undefined ? {} : { password }),
+  };
+}
+
+/**
+ * The longest `key=value` line written to the service file: libpq refuses
+ * longer ones ("line too long in service file"; about 1,020 bytes in 16).
+ * The password, which may be longer, goes in the password file instead.
+ */
+export const MAX_SERVICE_LINE = 1000;
+
+/** A libpq password file matching any connection: `*:*:*:*:` and the escaped password. */
+export function passwordFileText(password: string): string {
+  return `*:*:*:*:${password.replaceAll("\\", "\\\\").replaceAll(":", "\\:")}\n`;
 }
 
 /** The name of the service in the temporary service file. */
@@ -244,24 +273,33 @@ const KEPT_PG_VARIABLES = new Set(["PGPASSWORD", "PGPASSFILE"]);
  * The environment pg_dump and pg_restore get: the caller's, without any
  * OCULUS_ variable (the URL and, later, the secret key) and without libpq
  * variables that could change where or how they connect (PGHOST, PGSSLMODE,
- * PGSERVICE, PGOPTIONS, ...), keeping PGPASSWORD and PGPASSFILE, which the
- * driver reads too. The service file says everything else.
+ * PGSERVICE, PGOPTIONS, ...). When the URL has a password it is in our own
+ * password file and every other PG variable goes; otherwise PGPASSWORD and
+ * PGPASSFILE stay, as the driver reads them too.
  */
 export function toolEnvironment(
   env: Record<string, string | undefined>,
   serviceFile: string,
+  passwordFile?: string,
 ): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(env)) {
     if (value === undefined || key.startsWith("OCULUS_")) continue;
-    if (key.startsWith("PG") && !KEPT_PG_VARIABLES.has(key)) continue;
+    if (key.startsWith("PG") && (passwordFile !== undefined || !KEPT_PG_VARIABLES.has(key))) {
+      continue;
+    }
     out[key] = value;
   }
   out.PGSERVICEFILE = serviceFile;
+  // The URL's password, never PGPASSWORD (libpq would prefer it to the file).
+  if (passwordFile !== undefined) out.PGPASSFILE = passwordFile;
   return out;
 }
 
-/** A private 0700 directory holding the 0600 service file, deleted by `remove`. */
+/**
+ * A private 0700 directory holding the 0600 service file (and password file),
+ * deleted by `remove`, or on exit if `remove` never runs (backup-cleanup.ts).
+ */
 export interface Workspace {
   dir: string;
   serviceFile: string;
@@ -276,17 +314,29 @@ export async function workspace(
   tempDir: string,
 ): Promise<Workspace> {
   const dir = await mkdtemp(join(tempDir, "oculus-backup-"));
-  const remove = (): Promise<void> => rm(dir, { recursive: true, force: true });
-  try {
-    const serviceFile = join(dir, "pg_service.conf");
-    const handle = await open(serviceFile, "wx", 0o600);
+  const untrack = trackPath(dir);
+  const remove = async (): Promise<void> => {
+    await rm(dir, { recursive: true, force: true });
+    untrack();
+  };
+  const write = async (path: string, text: string): Promise<void> => {
+    const handle = await open(path, "wx", 0o600);
     try {
       await handle.chmod(0o600);
-      await handle.writeFile(serviceFileText(connection.libpq, applicationName));
+      await handle.writeFile(text);
     } finally {
       await handle.close();
     }
-    return { dir, serviceFile, env: toolEnvironment(env, serviceFile), remove };
+  };
+  try {
+    const serviceFile = join(dir, "pg_service.conf");
+    await write(serviceFile, serviceFileText(connection.libpq, applicationName));
+    let passwordFile: string | undefined;
+    if (connection.password !== undefined) {
+      passwordFile = join(dir, "pgpass");
+      await write(passwordFile, passwordFileText(connection.password));
+    }
+    return { dir, serviceFile, env: toolEnvironment(env, serviceFile, passwordFile), remove };
   } catch (error) {
     await remove();
     throw error;
