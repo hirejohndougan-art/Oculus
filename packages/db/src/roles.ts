@@ -191,8 +191,34 @@ function listed(items: readonly string[]): string {
  * startup and after every migration (new tables, new default privileges).
  */
 export async function checkWriterConnection(db: Queryable): Promise<WriterRoleProblem[]> {
-  const tables = Object.keys(WRITER_PRIVILEGES);
-  const pairs = Object.entries(WRITER_PRIVILEGES).flatMap(([table, privileges]) =>
+  return checkRoleConnection(db, {
+    selectAll: true,
+    privileges: WRITER_PRIVILEGES,
+    functions: [],
+    noun: "writer",
+    grant: "grantWriterRole",
+  });
+}
+
+/** What a connection's role may hold, for `checkRoleConnection`. */
+interface RoleProfile {
+  /** SELECT on every table in `public` (the writer) or on none (the public reader). */
+  readonly selectAll: boolean;
+  /** Table privileges beyond SELECT, which the role must hold exactly. */
+  readonly privileges: Readonly<Record<string, readonly string[]>>;
+  /** Functions (with their argument types) the role must be able to EXECUTE. */
+  readonly functions: readonly string[];
+  readonly noun: string;
+  readonly grant: string;
+}
+
+async function checkRoleConnection(
+  db: Queryable,
+  profile: RoleProfile,
+): Promise<WriterRoleProblem[]> {
+  const { noun } = profile;
+  const tables = profile.selectAll ? Object.keys(profile.privileges) : [];
+  const pairs = Object.entries(profile.privileges).flatMap(([table, privileges]) =>
     privileges.map((privilege) => [table, privilege] as const),
   );
   const rows = await db.rows<{
@@ -256,7 +282,7 @@ export async function checkWriterConnection(db: Queryable): Promise<WriterRolePr
             FROM public_tables t
             WHERE (t.acl).grantee IN (w.oid, 0)
               AND NOT ((t.acl).grantee = w.oid AND t.relkind <> 'S' AND NOT (t.acl).is_grantable
-                       AND ((t.acl).privilege_type = 'SELECT'
+                       AND ((${profile.selectAll}::boolean AND (t.acl).privilege_type = 'SELECT')
                             OR EXISTS (SELECT 1 FROM allowed a
                                        WHERE a.table_name = t.relname
                                          AND a.privilege = (t.acl).privilege_type))))
@@ -361,11 +387,14 @@ export async function checkWriterConnection(db: Queryable): Promise<WriterRolePr
                                WHERE datname = pg_catalog.current_database())) AS subscriptions,
            (NOT w.current
             OR (pg_catalog.has_schema_privilege(w.oid, 'public', 'USAGE')
-                AND (SELECT pg_catalog.bool_and(pg_catalog.has_table_privilege(w.oid, 'public.' || t, 'SELECT'))
-                     FROM unnest(${tables}::text[]) AS t)
-                AND (SELECT pg_catalog.bool_and(
-                              pg_catalog.has_table_privilege(w.oid, 'public.' || a.table_name, a.privilege))
-                     FROM allowed a))) AS privileges
+                AND COALESCE((SELECT pg_catalog.bool_and(pg_catalog.has_table_privilege(w.oid, 'public.' || t, 'SELECT'))
+                              FROM unnest(${tables}::text[]) AS t), true)
+                AND COALESCE((SELECT pg_catalog.bool_and(
+                                       pg_catalog.has_table_privilege(w.oid, 'public.' || a.table_name, a.privilege))
+                              FROM allowed a), true)
+                AND COALESCE((SELECT pg_catalog.bool_and(
+                                       pg_catalog.has_function_privilege(w.oid, f, 'EXECUTE'))
+                              FROM unnest(${[...profile.functions]}::text[]) AS f), true))) AS privileges
     FROM who w`);
   const problems: WriterRoleProblem[] = [];
   const add = (code: WriterRoleProblem["code"], message: string): void => {
@@ -398,7 +427,7 @@ export async function checkWriterConnection(db: Queryable): Promise<WriterRolePr
   if (any((r) => r.memberships > 0)) {
     add(
       "role_membership",
-      "The service's login or role is a member of another role; the writer must be a plain role that belongs to none.",
+      `The service's login or role is a member of another role; the ${noun} must be a plain role that belongs to none.`,
     );
   }
   if (any((r) => r.owner)) {
@@ -416,7 +445,7 @@ export async function checkWriterConnection(db: Queryable): Promise<WriterRolePr
   }
   const extra = all((r) => r.extra);
   if (unknown || extra.length > 0) {
-    add("extra_privilege", `Privileges beyond the writer's: ${listed(extra)}.`);
+    add("extra_privilege", `Privileges beyond the ${noun}'s: ${listed(extra)}.`);
   }
   const triggers = all((r) => r.triggers);
   if (triggers.length > 0) {
@@ -449,7 +478,64 @@ export async function checkWriterConnection(db: Queryable): Promise<WriterRolePr
     add("parameter_privilege", `Privileges on server parameters: ${listed(parameters)}.`);
   }
   if (unknown || rows.some((r) => !r.privileges)) {
-    add("missing_privilege", "The service's role lacks the writer's privileges (grantWriterRole).");
+    add(
+      "missing_privilege",
+      `The service's role lacks the ${noun}'s privileges (${profile.grant}).`,
+    );
   }
   return problems;
+}
+
+// ---------------------------------------------------------------------------
+// The public reader (S-019, D-080)
+
+/**
+ * The functions the public sites read through, with their argument types:
+ * `public_record_snapshot` (0017), the only way `readPublicRecord` reads.
+ */
+export const PUBLIC_READER_FUNCTIONS: readonly string[] = Object.freeze([
+  "public.public_record_snapshot(uuid, uuid, uuid)",
+]);
+
+/**
+ * Gives `role` what the public sites need to read (S-019, D-080): USAGE on
+ * schema `public`, and **no table privilege at all**. EXECUTE on
+ * `PUBLIC_READER_FUNCTIONS` is PUBLIC's, as for every function (an explicit
+ * grant would be an object privilege the allowlist refuses, and a revoke
+ * from PUBLIC one a backup won't restore, D-064). So a public site's
+ * connection can read nothing but the output of records public on a site:
+ * no staff tables, accounts, sessions or second factors. Run as the owner,
+ * in a transaction. The role must exist and should hold nothing else:
+ * check it with `checkPublicReaderConnection`.
+ */
+export async function grantPublicReaderRole(db: Queryable, role: string): Promise<void> {
+  if (!ROLE_NAME.test(role)) {
+    throw new TypeError("A role name is lower case letters, digits and _, at most 63 characters.");
+  }
+  await db.rows(sql`SELECT set_config('oculus.grant_role', ${role}, true)`);
+  await db.execute(sql`DO $$ BEGIN
+    EXECUTE format('GRANT USAGE ON SCHEMA public TO %I', current_setting('oculus.grant_role'));
+  END $$`);
+}
+
+/**
+ * What is wrong with reading the public sites through this connection
+ * (S-019, D-080): `checkWriterConnection`'s allowlist with nothing allowed
+ * on any table, not even SELECT, so any table privilege (to the role or to
+ * PUBLIC) is `extra_privilege`; every other rule is the writer's (no
+ * attributes, no memberships, owns nothing, no column or default
+ * privileges, no CREATE, no parameters, no settings beyond
+ * `ALLOWED_ROLE_SETTINGS`, not in replica mode). The role in effect must be
+ * able to call `PUBLIC_READER_FUNCTIONS`. Empty when the connection is fit
+ * for the public sites; T-050/T-051 run it at startup and after every
+ * migration, and refuse to serve when it reports anything.
+ */
+export async function checkPublicReaderConnection(db: Queryable): Promise<WriterRoleProblem[]> {
+  return checkRoleConnection(db, {
+    selectAll: false,
+    privileges: {},
+    functions: PUBLIC_READER_FUNCTIONS,
+    noun: "public reader",
+    grant: "grantPublicReaderRole",
+  });
 }

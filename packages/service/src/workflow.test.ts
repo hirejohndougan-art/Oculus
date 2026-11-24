@@ -24,7 +24,9 @@ import {
 } from "@oculus/core";
 import {
   WRITER_PRIVILEGES,
+  checkPublicReaderConnection,
   checkWriterConnection,
+  grantPublicReaderRole,
   grantWriterRole,
   insertIdentifierType,
   insertOrganization,
@@ -72,6 +74,7 @@ interface Setup {
   writer: Database;
   writer2: Database;
   reader: Database;
+  staffReader: Database;
   roles: string[];
 }
 
@@ -99,8 +102,8 @@ async function ready(): Promise<void> {
     const testDb = await freshDatabase();
     await migrate({ connectionString: testDb.url });
     const suffix = newRecordId().slice(0, 8);
-    const roles = ["writer", "reader"].map((r) => `oculus_t034_${r}_${suffix}`);
-    const [writerRole = "", readerRole = ""] = roles;
+    const roles = ["writer", "reader", "staffreader"].map((r) => `oculus_t034_${r}_${suffix}`);
+    const [writerRole = "", readerRole = "", staffReaderRole = ""] = roles;
     const server = openDatabase(testServerUrl(), { max: 1 });
     try {
       for (const role of roles) {
@@ -112,8 +115,11 @@ async function ready(): Promise<void> {
     const owner = openDatabase(testDb.url, { max: 4 });
     await owner.transaction(async (q) => {
       await grantWriterRole(q, writerRole);
-      await withRole(q, "GRANT USAGE ON SCHEMA public TO %I", readerRole);
-      await withRole(q, "GRANT SELECT ON ALL TABLES IN SCHEMA public TO %I", readerRole);
+      // The public sites' role (S-019): no table privilege at all.
+      await grantPublicReaderRole(q, readerRole);
+      // What the public output used to need: SELECT on everything.
+      await withRole(q, "GRANT USAGE ON SCHEMA public TO %I", staffReaderRole);
+      await withRole(q, "GRANT SELECT ON ALL TABLES IN SCHEMA public TO %I", staffReaderRole);
     });
     return {
       testDb,
@@ -121,6 +127,7 @@ async function ready(): Promise<void> {
       writer: as(testDb.url, writerRole),
       writer2: as(testDb.url, writerRole),
       reader: as(testDb.url, readerRole),
+      staffReader: as(testDb.url, staffReaderRole),
       roles,
     };
   })();
@@ -150,7 +157,9 @@ let peopleReady: Promise<{ made: People; alice: UserId; bob: UserId }> | undefin
 afterAll(async () => {
   const done = await setup?.catch(() => undefined);
   if (!done) return;
-  for (const pool of [done.writer, done.writer2, done.reader, done.owner]) await pool.close();
+  for (const pool of [done.writer, done.writer2, done.reader, done.staffReader, done.owner]) {
+    await pool.close();
+  }
   await done.testDb.drop();
   const server = openDatabase(testServerUrl(), { max: 1 });
   try {
@@ -250,6 +259,12 @@ async function organization(): Promise<OrganizationId> {
 /** Each organization's one site, where Alice and Bob work (D-074). */
 const siteOf = new Map<OrganizationId, SiteId>();
 
+function siteFor(org: OrganizationId): SiteId {
+  const site = siteOf.get(org);
+  if (site === undefined) throw new Error("no site");
+  return site;
+}
+
 const ctx = (organizationId: OrganizationId, actor = ALICE) => {
   const siteId = siteOf.get(organizationId);
   return { organizationId, actor, ...(siteId === undefined ? {} : { siteId }) };
@@ -305,8 +320,13 @@ function unitMapping(org: OrganizationId): DublinCoreMapping {
   };
 }
 
-async function publicText(org: OrganizationId, id: RecordId, db: Database = s.reader) {
-  const out = await readPublicRecord(db, org, id, {
+async function publicText(
+  org: OrganizationId,
+  id: RecordId,
+  db: Database = s.reader,
+  site: SiteId | undefined = siteOf.get(org),
+) {
+  const out = await readPublicRecord(db, org, site ?? ("" as SiteId), id, {
     baseUrl: BASE,
     mappings: [mapping(org), unitMapping(org)],
   });
@@ -825,7 +845,7 @@ describe("public output reads what is published from the database (T-034c)", () 
         fields: OBJECT_FIELDS.map((f) => (f.key === "note" ? { ...f, visibility: "staff" } : f)),
       }),
     );
-    const out = await readPublicRecord(s.reader, org, record.id, {
+    const out = await readPublicRecord(s.reader, org, siteFor(org), record.id, {
       baseUrl: BASE,
       mappings: [mapping(org)],
     });
@@ -834,13 +854,126 @@ describe("public output reads what is published from the database (T-034c)", () 
     expect(JSON.stringify(out)).not.toContain("Tin and glass.");
   });
 
-  it("reads with a role that can only SELECT, and writes nothing", async () => {
+  it("reads with the public reader role, which can read no table, and writes nothing", async () => {
     await ready();
     const org = await organization();
     const { record } = await create(org, objectDraft());
     ok(await service.publish(ctx(org), record.id, { expectedVersion: 1 }));
     expect((await publicText(org, record.id, s.reader)).ok).toBe(true);
     expect(ok(await readVersions(s.owner, org, record.id)).versions).toHaveLength(2);
+    expect(await checkPublicReaderConnection(s.reader)).toEqual([]);
+  });
+});
+
+describe("public reads by site, with a role that sees only public output (S-019)", () => {
+  /** A second site of the organization, with Alice managing it too. */
+  async function secondSite(org: OrganizationId): Promise<SiteId> {
+    if (folks === undefined || alice === undefined) throw new Error("not ready");
+    const site = await makeSite(service, folks.root, org);
+    await grant(service, folks.root, org, { userId: alice, role: "site_manager", siteId: site });
+    return site;
+  }
+
+  it("serves a record only on its home site, answering every other site as a missing record", async () => {
+    await ready();
+    const org = await organization();
+    const other = await secondSite(org);
+    const { record } = await create(org, objectDraft());
+    ok(await service.publish(ctx(org), record.id, { expectedVersion: 1 }));
+    expect((await publicText(org, record.id)).ok).toBe(true);
+    const missing = await publicText(org, newRecordId());
+    expect(missing.issues.map((i) => i.code)).toEqual(["not_available"]);
+    // The attack: the same organization's other public site asks for it.
+    expect(await publicText(org, record.id, s.reader, other)).toEqual(missing);
+    // Another organization's site, and a site that doesn't exist, the same.
+    const elsewhere = await organization();
+    expect(await publicText(org, record.id, s.reader, siteOf.get(elsewhere))).toEqual(missing);
+    expect(await publicText(elsewhere, record.id, s.reader, siteOf.get(elsewhere))).toEqual(
+      missing,
+    );
+    expect(await publicText(org, record.id, s.reader, newRecordId() as unknown as SiteId)).toEqual(
+      missing,
+    );
+  });
+
+  it("never serves a record that is on no site", async () => {
+    await ready();
+    const org = await organization();
+    if (folks === undefined) throw new Error("not ready");
+    const root = { organizationId: org, actor: actorOf(folks.root) };
+    const saved = ok(await service.createRecord(root, objectDraft()));
+    expect(saved.record.siteId).toBeUndefined();
+    ok(await service.publish(root, saved.record.id, { expectedVersion: 1 }));
+    expect(await stateOf(org, saved.record.id)).toBe("published");
+    expect(codes(await publicText(org, saved.record.id))).toEqual(["not_available"]);
+  });
+
+  it("resolves links only to records public on the same site", async () => {
+    await ready();
+    const org = await organization();
+    const other = await secondSite(org);
+    const maker = ok(
+      await service.createRecord(
+        { organizationId: org, actor: ALICE, siteId: other },
+        {
+          kind: "agent",
+          agentType: "person",
+          title: "Invented Maker Of The Other Site",
+          templateKey: "pub-agent",
+        },
+      ),
+    );
+    ok(
+      await service.publish({ organizationId: org, actor: ALICE, siteId: other }, maker.record.id, {
+        expectedVersion: 1,
+      }),
+    );
+    // Public on the other site (past the site check: only the agent template has no mapping
+    // here) and not on this one …
+    expect(codes(await publicText(org, maker.record.id, s.reader, other))).toEqual(["no_mapping"]);
+    expect(codes(await publicText(org, maker.record.id))).toEqual(["not_available"]);
+    // … but a link to it from this site's record shows nothing here.
+    if (folks === undefined) throw new Error("not ready");
+    const linking = ok(
+      await service.createRecord(
+        { organizationId: org, actor: actorOf(folks.root), siteId: siteFor(org) },
+        objectDraft({
+          creator: { recordId: maker.record.id, label: "Invented Maker Of The Other Site" },
+        }),
+      ),
+    );
+    ok(await service.publish(ctx(org), linking.record.id, { expectedVersion: 1 }));
+    const out = await publicText(org, linking.record.id);
+    expect(out.ok).toBe(true);
+    expect(out.text).not.toContain(maker.record.id);
+    expect(out.text).not.toContain("Other Site");
+  });
+
+  it("gives the public reader no table: it can't read staff data, accounts or sessions", async () => {
+    await ready();
+    const org = await organization();
+    const { record } = await create(org, objectDraft());
+    ok(await service.publish(ctx(org), record.id, { expectedVersion: 1 }));
+    for (const query of [
+      sql`SELECT fields FROM public.records`,
+      sql`SELECT record FROM public.record_versions`,
+      sql`SELECT password_hash FROM public.users`,
+      sql`SELECT token_hash FROM public.sessions`,
+      sql`SELECT 1 FROM public.second_factors`,
+      sql`SELECT definition FROM public.template_versions`,
+      sql`SELECT 1 FROM public.identifier_holdings`,
+    ]) {
+      await expect(s.reader.rows(query)).rejects.toMatchObject({ code: "42501" });
+    }
+    // The staff values of a published record never reach it through the function either.
+    expect((await publicText(org, record.id)).text).not.toContain("back room");
+    // A role that can SELECT every table is refused as the public reader.
+    const problems = await checkPublicReaderConnection(s.staffReader);
+    expect(problems.map((p) => p.code)).toContain("extra_privilege");
+    // The writer is refused too: it can read and write tables.
+    expect((await checkPublicReaderConnection(s.writer)).map((p) => p.code)).toContain(
+      "extra_privilege",
+    );
   });
 });
 

@@ -165,7 +165,8 @@ export async function readTemplate(
   return storedTemplate(row.version, row.definition, organizationId, key);
 }
 
-function storedTemplate(
+/** A stored template row, checked (also for the public snapshot, S-019; not exported from `@oculus/db`). */
+export function storedTemplate(
   version: number,
   definition: unknown,
   organizationId: OrganizationId,
@@ -357,7 +358,7 @@ function checkKeyAndVersion<T>(
 // Records
 
 /** A row of `public.records` as `readRecord` selects it. */
-interface RecordRow {
+export interface RecordRow {
   id: string;
   organization_id: string;
   site_id: string | null;
@@ -987,8 +988,10 @@ export async function readRecordClosure(
 /**
  * The core record a row holds. Optional columns become properties only when
  * set, so `validateRecord` refuses a row whose columns don't fit its kind.
+ * Also for the public snapshot's rows (workflow.ts, S-019); not exported
+ * from `@oculus/db`.
  */
-function recordFromRow(row: RecordRow): Record<string, unknown> {
+export function recordFromRow(row: RecordRow): Record<string, unknown> {
   const record: Record<string, unknown> = {
     id: row.id,
     organizationId: row.organization_id,

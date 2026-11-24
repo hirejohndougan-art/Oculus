@@ -90,6 +90,9 @@ export type { RecordDeletion, RecordDeletionResult } from "./record-delete.js";
 export {
   grantWriterRole,
   checkWriterConnection,
+  grantPublicReaderRole,
+  checkPublicReaderConnection,
+  PUBLIC_READER_FUNCTIONS,
   WRITER_GRANTS,
   WRITER_PRIVILEGES,
 } from "./roles.js";

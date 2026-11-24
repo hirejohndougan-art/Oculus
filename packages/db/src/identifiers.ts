@@ -213,8 +213,12 @@ async function loadTypes(
   return checkTypes(rows, organizationId);
 }
 
-/** Stored type rows, validated as one list and checked against their rows. */
-function checkTypes(
+/**
+ * Stored type rows, validated as one list and checked against their rows.
+ * Also for the public snapshot's rows (workflow.ts, S-019); not exported
+ * from `@oculus/db`.
+ */
+export function checkTypes(
   rows: readonly { key: string; definition: unknown }[],
   organizationId: OrganizationId,
 ): Validated<readonly IdentifierType[]> {
@@ -346,14 +350,14 @@ export async function updateIdentifierType(
 // ---------------------------------------------------------------------------
 // A record's identifiers
 
-interface CurrentRow {
+export interface CurrentRow {
   type_key: string;
   value: string;
   key: string;
   is_primary: boolean;
 }
 
-interface FormerRow {
+export interface FormerRow {
   type_key: string;
   value: string;
   key: string;
@@ -617,9 +621,27 @@ export async function readRecordIdentifiers(
     FROM public.records
     WHERE organization_id = ${organizationId}::uuid AND id = ${recordId}::uuid`);
   if (row === undefined) return undefined;
-  const current = row.current ?? [];
-  const former = row.former ?? [];
-  const types = checkTypes(row.types ?? [], organizationId);
+  return recordIdentifiersFromRows(
+    organizationId,
+    recordId,
+    row.current ?? [],
+    row.former ?? [],
+    row.types ?? [],
+  );
+}
+
+/**
+ * `readRecordIdentifiers`' check of rows already read (its statement's, or
+ * the public snapshot's, S-019). Not exported from `@oculus/db`.
+ */
+export function recordIdentifiersFromRows(
+  organizationId: OrganizationId,
+  recordId: RecordId,
+  current: readonly CurrentRow[],
+  former: readonly FormerRow[],
+  typeRows: readonly { key: string; definition: unknown }[],
+): StoredRecordIdentifiers {
+  const types = checkTypes(typeRows, organizationId);
   if (!types.ok) return types;
   const stored = {
     recordId,

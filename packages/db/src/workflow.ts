@@ -20,15 +20,20 @@
  * published record (an edit, a restore, an identifier change), refusing the
  * write when it fails.
  *
- * `readPublicRecord` is the public output (D-016) of one record, for public
- * sites, APIs and OAI-PMH (T-050): the record and everything `publicOutput`
- * compares it with are read in one Repeatable Read, read-only transaction,
- * and the list of published records comes from the stored states in that
- * same snapshot, never from a caller (replacing D-016's `published` option
- * for every caller outside core). A record that isn't published, doesn't
- * exist or is another organization's gets one and the same answer
- * (`not_available`), and links to records that aren't published go out as
- * nothing at all (D-045).
+ * `readPublicRecord` is the public output (D-016) of one record on one
+ * public site, for public sites, APIs and OAI-PMH (T-050): the record and
+ * everything `publicOutput` compares it with are read in one Repeatable
+ * Read, read-only transaction, through the database function
+ * `public_record_snapshot` (0017, S-019, D-080), which answers only for a
+ * record public on that site (published, with the site as its home site)
+ * and needs no table privilege, so public sites connect with a role that
+ * can read no table. Which linked records count as public comes from the
+ * stored states and sites in that same snapshot, never from a caller
+ * (replacing D-016's `published` option for every caller outside core). A
+ * record that isn't public on the site, doesn't exist or is another
+ * organization's gets one and the same answer (`not_available`), and links
+ * to records that aren't public on the site go out as nothing at all
+ * (D-045).
  */
 import {
   applyWorkflowAction,
@@ -38,6 +43,7 @@ import {
   indexRecords,
   isOrganizationId,
   isRecordId,
+  isSiteId,
   isWorkflowAction,
   isWorkflowState,
   issue,
@@ -50,11 +56,13 @@ import {
   type DublinCoreMapping,
   type FieldValueChecker,
   type FieldTemplate,
+  type IdentifierType,
   type Issue,
   type OrganizationId,
   type PublicOutput,
   type RecordId,
   type RecordIdentifiers,
+  type SiteId,
   type Validated,
   type WorkflowAction,
   type WorkflowState,
@@ -64,12 +72,24 @@ import {
   readRecordClosure,
   readStoredRecord,
   readTemplate,
+  recordFromRow,
+  storedTemplate,
   versionConflict,
+  type RecordRow,
   type RecordUpdate,
+  type StoredTemplate,
   type VersionConflict,
 } from "./catalog.js";
 import type { Database, Queryable } from "./client.js";
-import { readIdentifierTypes, readRecordIdentifiers } from "./identifiers.js";
+import {
+  checkTypes,
+  readIdentifierTypes,
+  readRecordIdentifiers,
+  recordIdentifiersFromRows,
+  type CurrentRow,
+  type FormerRow,
+  type StoredRecordIdentifiers,
+} from "./identifiers.js";
 import { linkedIds } from "./record-checks.js";
 import { validateRecordChange, writeVersion, type RecordVersion } from "./record-versions.js";
 import { sql } from "./sql.js";
@@ -278,6 +298,55 @@ interface Snapshot {
 const CANT_CHECK = "The record and what it depends on can't be read for the publish check.";
 
 /**
+ * Where a snapshot's parts come from: the tables, in the caller's
+ * transaction (the publish check; `tableSource`), or one row of
+ * `public.public_record_snapshot` (the public output, S-019;
+ * `publicSource`). The snapshot is built the same way from either.
+ */
+interface SnapshotSource {
+  /** The records `ids` lead to through parents and represented records, by ID; undefined if too many. */
+  closure(ids: readonly RecordId[]): Promise<Record<string, unknown>[] | undefined>;
+  template(key: string): Promise<Validated<StoredTemplate> | undefined>;
+  types(): Promise<Validated<readonly IdentifierType[]>>;
+  identifiers(recordId: RecordId): Promise<StoredRecordIdentifiers | undefined>;
+  /** Of `ids`, those public now (published; on the public site, for the public output). */
+  published(ids: readonly RecordId[]): Promise<readonly RecordId[]>;
+}
+
+/** The tables, in the caller's transaction; with `lock`, definitions locked (shared) until COMMIT. */
+function tableSource(db: Queryable, org: OrganizationId, lock: boolean): SnapshotSource {
+  return {
+    closure: (ids) => readRecordClosure(db, org, ids),
+    template: async (key) => {
+      if (lock) {
+        await db.execute(
+          sql`SELECT public.definition_lock(${org}::uuid, 'template', ${key}, false)`,
+        );
+      }
+      return readTemplate(db, org, key);
+    },
+    types: async () => {
+      if (lock) {
+        await db.rows(sql`
+          SELECT 1 FROM public.identifier_types WHERE organization_id = ${org}::uuid
+          ORDER BY key COLLATE "C"
+          FOR SHARE`);
+      }
+      return readIdentifierTypes(db, org);
+    },
+    identifiers: (recordId) => readRecordIdentifiers(db, org, recordId),
+    published: async (ids) =>
+      (
+        await db.rows<{ id: string }>(sql`
+          SELECT id::text AS id FROM public.records
+          WHERE organization_id = ${org}::uuid AND workflow_state = 'published'
+            AND id = ANY(${[...ids]}::uuid[])
+          ORDER BY id`)
+      ).map((r) => r.id as RecordId),
+  };
+}
+
+/**
  * Reads, in the caller's transaction, everything the publish check and the
  * public output need for `recordId`: its ancestry and what it represents,
  * the records its values (its own and its ancestors') link to with their
@@ -292,7 +361,16 @@ async function readSnapshot(
   recordId: RecordId,
   lock: boolean,
 ): Promise<Validated<Snapshot>> {
-  const chainRows = await readRecordClosure(db, org, [recordId]);
+  return buildSnapshot(db, org, recordId, tableSource(db, org, lock));
+}
+
+async function buildSnapshot(
+  db: Queryable,
+  org: OrganizationId,
+  recordId: RecordId,
+  source: SnapshotSource,
+): Promise<Validated<Snapshot>> {
+  const chainRows = await source.closure([recordId]);
   if (chainRows === undefined) return refused([], "too_many_records", CANT_CHECK);
   if (!chainRows.some((r) => r.id === recordId)) {
     return refused(["recordId"], "unknown_record", NO_RECORD);
@@ -305,7 +383,7 @@ async function readSnapshot(
   }
   const chainIds = new Set(chain.map((r) => r.id));
   const linked = [...new Set(chain.flatMap(linkedIds))].filter((id) => !chainIds.has(id));
-  const linkedRows = await readRecordClosure(db, org, linked);
+  const linkedRows = await source.closure(linked);
   if (linkedRows === undefined) return refused([], "too_many_records", CANT_CHECK);
   const records = [...chain];
   for (const row of linkedRows) {
@@ -320,19 +398,10 @@ async function readSnapshot(
   const keys = [...new Set(records.map((r) => r.templateKey ?? ""))].sort();
   const templates = new Map<string, FieldTemplate>();
   for (const key of keys) {
-    if (lock) {
-      await db.execute(sql`SELECT public.definition_lock(${org}::uuid, 'template', ${key}, false)`);
-    }
-    const template = await readTemplate(db, org, key);
+    const template = await source.template(key);
     if (template?.ok) templates.set(key, template.value.template);
   }
-  if (lock) {
-    await db.rows(sql`
-      SELECT 1 FROM public.identifier_types WHERE organization_id = ${org}::uuid
-      ORDER BY key COLLATE "C"
-      FOR SHARE`);
-  }
-  const types = await readIdentifierTypes(db, org);
+  const types = await source.types();
   if (!types.ok) return refused(["identifierTypes"], "unreadable_types", CANT_CHECK);
   const identifier = makeIdentifierChecker(types.value, org);
   const links = makeRecordLinkChecker(records, org);
@@ -340,7 +409,7 @@ async function readSnapshot(
 
   const identifiers: RecordIdentifiers[] = [];
   for (const r of chain) {
-    const held = await readRecordIdentifiers(db, org, r.id);
+    const held = await source.identifiers(r.id);
     if (held === undefined) continue;
     if (!held.ok) return refused(["identifiers"], "unreadable_identifiers", CANT_CHECK);
     identifiers.push(held.value);
@@ -360,13 +429,6 @@ async function readSnapshot(
   });
   if (!register.ok) return refused(["accessions"], "unreadable_accessions", CANT_CHECK);
 
-  const ids = records.map((r) => r.id);
-  const publishedRows = await db.rows<{ id: string }>(sql`
-    SELECT id::text AS id FROM public.records
-    WHERE organization_id = ${org}::uuid AND workflow_state = 'published'
-      AND id = ANY(${ids}::uuid[])
-    ORDER BY id`);
-
   return {
     ok: true,
     value: {
@@ -375,7 +437,7 @@ async function readSnapshot(
       checkers: { identifier: identifier.value, record_link: links.value, place: links.value },
       identifiers,
       accessions: register.value,
-      published: publishedRows.map((r) => r.id as RecordId),
+      published: await source.published(records.map((r) => r.id)),
     },
   };
 }
@@ -434,26 +496,98 @@ const NOT_AVAILABLE: readonly Issue[] = Object.freeze([
   Object.freeze(issue([], "not_available", "This record is not available.")),
 ]);
 
+/** What `public.public_record_snapshot` returns (migration 0017, S-019). */
+interface PublicSnapshotRow {
+  readonly tooMany?: boolean;
+  readonly records?: readonly RecordRow[] | null;
+  readonly public?: readonly string[] | null;
+  readonly templates?: readonly { key: string; version: number; definition: unknown }[] | null;
+  readonly identifierTypes?: readonly { key: string; definition: unknown }[] | null;
+  readonly identifiers?:
+    | readonly {
+        recordId: string;
+        current: readonly CurrentRow[] | null;
+        former: readonly FormerRow[] | null;
+      }[]
+    | null;
+}
+
 /**
- * The public output (D-016) of the organization's record, if it is
- * published now (see the module header). Opens its own Repeatable Read,
- * read-only transaction on `db`, so the state, the records, the templates
- * and the identifiers all come from one moment. Any connection that can
- * read the tables will do; it writes nothing.
+ * A snapshot source over one row of `public_record_snapshot`: the records
+ * a public record's output depends on and nothing else (S-019). Closures
+ * are walked over those rows only, so nothing outside them can be reached.
+ */
+function publicSource(org: OrganizationId, row: PublicSnapshotRow): SnapshotSource {
+  const rows = new Map((row.records ?? []).map((r) => [r.id, r] as const));
+  const publicIds = new Set(row.public ?? []);
+  const templates = new Map((row.templates ?? []).map((t) => [t.key, t] as const));
+  const typeRows = row.identifierTypes ?? [];
+  const held = new Map((row.identifiers ?? []).map((i) => [i.recordId, i] as const));
+  return {
+    closure: (ids) => {
+      const seen = new Map<string, RecordRow>();
+      const todo: string[] = [...ids];
+      for (let id = todo.pop(); id !== undefined; id = todo.pop()) {
+        const r = rows.get(id);
+        if (r === undefined || seen.has(id)) continue;
+        seen.set(id, r);
+        for (const next of [r.parent_id, r.represents_id]) if (next !== null) todo.push(next);
+      }
+      return Promise.resolve(
+        [...seen.entries()].sort(([a], [b]) => (a < b ? -1 : 1)).map(([, r]) => recordFromRow(r)),
+      );
+    },
+    template: (key) => {
+      const t = templates.get(key);
+      return Promise.resolve(
+        t === undefined ? undefined : storedTemplate(t.version, t.definition, org, key),
+      );
+    },
+    types: () => Promise.resolve(checkTypes(typeRows, org)),
+    identifiers: (recordId) => {
+      const i = held.get(recordId);
+      return Promise.resolve(
+        i === undefined
+          ? undefined
+          : recordIdentifiersFromRows(org, recordId, i.current ?? [], i.former ?? [], typeRows),
+      );
+    },
+    published: (ids) => Promise.resolve(ids.filter((id) => publicIds.has(id))),
+  };
+}
+
+/**
+ * The public output (D-016) of the organization's record on one of its
+ * public sites (S-019), if it is public there now (see the module header):
+ * published, and its home site is `siteId` (records shared into a site
+ * come with T-041b, through the database's `record_public_on_site`).
+ * Records on no site are never public. Links and places resolve only to
+ * records public on the same site; anything else goes out as nothing
+ * (D-045, D-048).
+ *
+ * Everything is read through one call of the database function
+ * `public_record_snapshot` (SECURITY DEFINER, migration 0017) in a
+ * Repeatable Read, read-only transaction, so the state, the records, the
+ * templates and the identifiers all come from one moment, and the
+ * connection needs no table privilege at all: use a role made by
+ * `grantPublicReaderRole` and checked by `checkPublicReaderConnection`
+ * (roles.ts). It writes nothing.
  *
  * Refused with exactly `not_available` for a record that isn't published,
- * doesn't exist or belongs to another organization, so a public caller
- * can't tell them apart. Any other issue is staff only (D-016, S-007): a
- * public site shows the record as not available and never passes issues
- * (or `staffWarnings`) on.
+ * isn't the site's, doesn't exist or belongs to another organization, and
+ * for a site that isn't the organization's, so a public caller can't tell
+ * them apart. Any other issue is staff only (D-016, S-007): a public site
+ * shows the record as not available and never passes issues (or
+ * `staffWarnings`) on.
  */
 export async function readPublicRecord(
   db: Database,
   organizationId: OrganizationId,
+  siteId: SiteId,
   recordId: RecordId,
   options: PublicRecordOptions,
 ): Promise<Validated<PublicOutput>> {
-  if (!isOrganizationId(organizationId) || !isRecordId(recordId)) {
+  if (!isOrganizationId(organizationId) || !isSiteId(siteId) || !isRecordId(recordId)) {
     return { ok: false, issues: NOT_AVAILABLE };
   }
   const baseUrl = ownValue(options, "baseUrl");
@@ -464,17 +598,24 @@ export async function readPublicRecord(
   return db.transaction(async (tx) => {
     // One snapshot for every read below, and nothing written.
     await tx.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`);
-    const [state] = await tx.rows<{ workflow_state: string; template_key: string }>(sql`
-      SELECT workflow_state, template_key FROM public.records
-      WHERE organization_id = ${organizationId}::uuid AND id = ${recordId}::uuid`);
-    if (state?.workflow_state !== "published") {
-      return { ok: false, issues: NOT_AVAILABLE };
-    }
-    const snapshot = await readSnapshot(tx, organizationId, recordId, false);
+    const [found] = await tx.rows<{ snapshot: PublicSnapshotRow | null }>(sql`
+      SELECT public.public_record_snapshot(${organizationId}::uuid, ${siteId}::uuid,
+                                           ${recordId}::uuid) AS snapshot`);
+    const row = found?.snapshot ?? null;
+    if (row === null) return { ok: false, issues: NOT_AVAILABLE };
+    if (row.tooMany === true) return refused([], "too_many_records", CANT_CHECK);
+    const snapshot = await buildSnapshot(
+      tx,
+      organizationId,
+      recordId,
+      publicSource(organizationId, row),
+    );
     if (!snapshot.ok) return snapshot;
     const s = snapshot.value;
-    // The record itself is published (checked above, in this snapshot).
+    // The record itself is public on the site (checked by the function, in this snapshot).
     if (!s.published.includes(recordId)) return { ok: false, issues: NOT_AVAILABLE };
+    const record = s.records.find((r) => r.id === recordId);
+    if (record === undefined) return { ok: false, issues: NOT_AVAILABLE };
     const index = indexRecords(s.records);
     if (!index.ok) return refused(["records"], "unreadable_record", CANT_CHECK);
     const effective = effectiveRecord(recordId, index.value, s.templateFor, {
@@ -485,7 +626,7 @@ export async function readPublicRecord(
     const view = publicView(effective.value);
     if (view === undefined) return refused([], "unreadable_record", CANT_CHECK);
     const mapping = (mappings as readonly unknown[]).find(
-      (m) => ownValue(m, "template") === state.template_key,
+      (m) => ownValue(m, "template") === record.templateKey,
     );
     if (mapping === undefined) {
       return refused(
