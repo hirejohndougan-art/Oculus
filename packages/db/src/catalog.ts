@@ -34,6 +34,7 @@
  * a person the raw text.
  */
 import {
+  MAX_ARRANGEMENT_DEPTH,
   issue,
   isOrganizationId,
   isRecordId,
@@ -48,7 +49,7 @@ import {
   type Issue,
   type Organization,
   type OrganizationId,
-  type RecordDifference,
+  type RecordChangeKind,
   type RecordId,
   type RecordType,
   type Validated,
@@ -391,11 +392,25 @@ export interface RecordUpdate extends RecordChange {
   readonly expectedVersion: number;
 }
 
+/** One thing someone else changed: its name and how, never its values. */
+export interface ChangedName {
+  /** `title`, `parentId`, `fields.<key>` …, as `RecordVersion.changedFields` names it. */
+  readonly name: string;
+  readonly change: RecordChangeKind;
+}
+
 /**
  * Why an update was refused as `version_conflict` (T-031, D-065): the record
  * was saved by someone else since the version the edit started from, and
  * this is what they changed, so the editor can show it and the person can
- * redo their edit on the record as it now is. Staff-only, like the versions.
+ * redo their edit on the record as it now is.
+ *
+ * **Names only, never values.** Anyone who can submit an edit gets a
+ * conflict, including with a made-up `expectedVersion`, so it must not
+ * become a way to read old versions: the values of what changed (staff
+ * fields, values since removed) come only from an explicit
+ * `compareVersions` call, which the service layer (T-041, T-043) guards
+ * with the permission to read the record's history.
  */
 export interface VersionConflict {
   /** The version the edit started from. */
@@ -403,12 +418,12 @@ export interface VersionConflict {
   /** The record's version now. */
   readonly currentVersion: number;
   /**
-   * What differs from `expectedVersion` to `currentVersion`
-   * (`compareRecords`), sorted by name. Absent when it can't be worked out:
+   * What changed from `expectedVersion` to `currentVersion`, by name and
+   * kind of change, sorted by name. Absent when it can't be worked out:
    * the expected version is later than the current one (never stored), or a
    * stored version no longer validates.
    */
-  readonly differences?: readonly RecordDifference[];
+  readonly differences?: readonly ChangedName[];
 }
 
 /** What `updateRecord` returns: the new version, or the issues (and, for `version_conflict`, the conflict). */
@@ -448,9 +463,41 @@ const ID_USED_BEFORE =
  * version number already taken means the ID has history (`id_used_before`);
  * only an update can be out of step with its versions (`version_conflict`).
  */
-function versionRefusal<T>(error: unknown, write: "insert" | "update"): Validated<T> | undefined {
-  if (sqlState(error) !== INTEGRITY) return undefined;
+function versionRefusal<T>(
+  error: unknown,
+  write: "insert" | "update" | "restore",
+): Validated<T> | undefined {
+  const state = sqlState(error);
+  if (state === NOT_READ_COMMITTED) {
+    return refused(
+      [],
+      "read_committed_required",
+      "Record writes that change the arrangement must run in a Read Committed transaction.",
+    );
+  }
+  if (state === FOREIGN_KEY && write === "restore") {
+    // Something the restored version points at was deleted between the
+    // checks and the write.
+    return refused(
+      [],
+      "missing_reference",
+      "A record, template or record type this version points at was removed while it was being restored. Read it again.",
+    );
+  }
+  if (state !== INTEGRITY) return undefined;
   const constraint = constraintOf(error);
+  switch (constraint) {
+    case "records_arrangement_loop":
+      return refused(["parentId"], "loop", "An archival unit can't be filed inside itself.");
+    case "records_arrangement_too_deep":
+      return refused(
+        ["parentId"],
+        "too_deep",
+        `An archival unit can be at most ${String(MAX_ARRANGEMENT_DEPTH)} levels deep.`,
+      );
+    default:
+      break;
+  }
   if (write === "insert") {
     return constraint === "records_id_used_before" || constraint === "record_versions_next_number"
       ? refused(["id"], "id_used_before", ID_USED_BEFORE)
@@ -475,6 +522,8 @@ function versionRefusal<T>(error: unknown, write: "insert" | "update"): Validate
 }
 
 const INTEGRITY = "23000";
+const FOREIGN_KEY = "23503";
+const NOT_READ_COMMITTED = "OC061";
 const KIND_FIXED = "A record's kind never changes; make a new record instead.";
 const UPDATED_BEFORE = "updatedAt can't be earlier than the stored record's.";
 
@@ -488,7 +537,7 @@ const UPDATED_BEFORE = "updatedAt can't be earlier than the stored record's.";
  */
 export async function inSavepoint<T>(
   db: Queryable,
-  write: "insert" | "update",
+  write: "insert" | "update" | "restore",
   work: () => Promise<Validated<T>>,
 ): Promise<Validated<T>> {
   try {
@@ -630,6 +679,12 @@ export async function insertRecord(
  *
  * As for `insertRecord`, callers check the record against its template first
  * (T-032). Runs in a savepoint of the caller's transaction.
+ *
+ * **The organization is the input record's own `organizationId`**, trusted
+ * as given: this function can't know who is asking. The service layer
+ * (T-032) must set it from the signed-in session (D-019), never from the
+ * request, before calling, or a request naming another organization's
+ * record ID would edit, or learn the version history size of, that record.
  */
 export async function updateRecord(
   db: Queryable,
@@ -750,7 +805,12 @@ export async function versionConflict(
     expectedVersion,
     current.version,
   );
-  return Object.freeze(compared.ok ? { ...base, differences: compared.value.differences } : base);
+  if (!compared.ok) return Object.freeze(base);
+  // Names and kinds only, never values (VersionConflict).
+  const differences = compared.value.differences.map(({ name, change }) =>
+    Object.freeze({ name, change }),
+  );
+  return Object.freeze({ ...base, differences: Object.freeze(differences) });
 }
 
 /** An issue of the change (who and why), under `change` in the path. */

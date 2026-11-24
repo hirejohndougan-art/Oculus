@@ -27,7 +27,13 @@
  *   be filed under, isn't the record itself or one of its descendants, and
  *   keeps the tree within `MAX_ARRANGEMENT_DEPTH`; and, if the level changes
  *   back, that its children can still be filed under it;
- * - a represented record (digital assets) that still exists.
+ * - a represented record (digital assets) that still exists;
+ * - unless `confirmMadePublic` is given, no restored value lands in a field
+ *   public today with a value other than the record's current one
+ *   (`public_field_restored`): the field may have been staff-only when the
+ *   value was stored and made public after it was removed, so the value was
+ *   never confirmed for publishing.
+ * Every problem is returned, not only the first.
  *
  * **Identifiers are not restored.** A version holds the record row only;
  * identifier sets live in their own tables (D-061), are not versioned, and
@@ -42,8 +48,13 @@
  * neither the record nor its identifiers (whose save takes the same lock)
  * change between the checks and the write. Templates, types and other
  * records are not locked: a change committed in that instant can slip past
- * the checks, as for any save until the service layer re-checks inside its
- * own transaction (T-032).
+ * the template checks, as for any save until the service layer re-checks
+ * inside its own transaction (T-032). When the parent or level changes, the
+ * organization's arrangement lock (0006) is taken before the arrangement
+ * checks and held to COMMIT, and the database's guard refuses any loop
+ * whoever writes. Read Committed only (`read_committed_required`). The
+ * service layer must wrap a restore like any save (T-032: permissions,
+ * `refreshRecordTerms`, T-034's publish re-check).
  *
  * `updatedAt` becomes the later of the stored one and now (D-063: it never
  * goes backwards); `createdAt`, the ID, the organization and the kind never
@@ -63,8 +74,10 @@ import {
   issue,
   makeIdentifierChecker,
   makeRecordLinkChecker,
+  sameJson,
   type ArchivalLevel,
   type CatalogRecord,
+  type FieldTemplate,
   type Issue,
   type OrganizationId,
   type RecordId,
@@ -89,7 +102,17 @@ import { sql } from "./sql.js";
 export interface RestoreOptions {
   /** The clock, for tests. Default: now. */
   readonly now?: Date;
+  /**
+   * The person has seen and confirmed the `public_field_restored` list:
+   * restored values that land in fields public today and differ from what
+   * the record holds now (D-065). Without it, such a restore is refused
+   * with that list.
+   */
+  readonly confirmMadePublic?: boolean;
 }
+
+const OPTION_KEYS: ReadonlySet<string> = new Set(["now", "confirmMadePublic"]);
+const CHANGE_KEYS: ReadonlySet<string> = new Set(["expectedVersion", "actor", "reason"]);
 
 function refused(path: readonly (string | number)[], code: string, message: string) {
   return { ok: false as const, issues: [issue(path, code, message)] };
@@ -135,6 +158,30 @@ export async function restoreVersion(
   if (!isWholeVersion(version)) {
     return refused(["version"], "invalid_version", "A version is a whole number from 1.");
   }
+  const extraChange = keyBeyond(change, CHANGE_KEYS);
+  if (extraChange !== undefined) {
+    return refused(
+      ["change", extraChange],
+      "unknown_property",
+      "A restore names only expectedVersion, actor and reason.",
+    );
+  }
+  const extraOption = keyBeyond(options, OPTION_KEYS);
+  if (extraOption !== undefined) {
+    return refused(
+      ["options", extraOption],
+      "unknown_property",
+      "The options are only now and confirmMadePublic.",
+    );
+  }
+  const confirm = ownValue(options, "confirmMadePublic");
+  if (confirm !== undefined && typeof confirm !== "boolean") {
+    return refused(["options", "confirmMadePublic"], "invalid_option", "This is true or false.");
+  }
+  const clock = ownValue(options, "now");
+  if (clock !== undefined && !(clock instanceof Date)) {
+    return refused(["options", "now"], "invalid_option", "The clock is a Date.");
+  }
   const expected = ownValue(change, "expectedVersion");
   if (!isWholeVersion(expected)) {
     return refused(
@@ -162,12 +209,15 @@ export async function restoreVersion(
       `With "restored version N: " in front, the reason must still be at most ${String(MAX_REASON_LENGTH)} characters.`,
     );
   }
-  const now = options.now ?? new Date();
+  const now = clock ?? new Date();
   if (Number.isNaN(now.getTime())) {
     return refused(["now"], "invalid_time", "The clock gave an invalid time.");
   }
 
-  const result = await inSavepoint(db, "update", async (): Promise<RecordUpdateResult> => {
+  const result = await inSavepoint(db, "restore", async (): Promise<RecordUpdateResult> => {
+    // The arrangement lock below relies on each statement seeing what
+    // committed while it waited (D-061, D-065): Read Committed only.
+    await db.execute(sql`SELECT public.identifier_require_read_committed()`);
     // Locked first: the record and its identifiers (whose save takes the same
     // lock) can't change between the checks and the write.
     const [locked] = await db.rows<{ version: number }>(sql`
@@ -213,7 +263,17 @@ export async function restoreVersion(
         `Version ${String(version)} is the same as the record is now; there is nothing to restore.`,
       );
     }
-    const problems = await todaysChecks(db, candidate, stored);
+    if (
+      candidate.kind === "archival_unit" &&
+      stored.kind === "archival_unit" &&
+      (candidate.parentId !== stored.parentId || candidate.level !== stored.level)
+    ) {
+      // One arrangement change per organization at a time, from here to
+      // COMMIT (the database's guard takes the same lock, 0006): two
+      // restores can't each file a unit under the other.
+      await db.execute(sql`SELECT public.arrangement_lock(${organizationId}::uuid)`);
+    }
+    const problems = await todaysChecks(db, candidate, stored, confirm === true);
     if (problems.length > 0) return { ok: false, issues: problems };
     return updateRecord(db, candidate, {
       expectedVersion: expected,
@@ -235,6 +295,17 @@ export async function restoreVersion(
 
 function isWholeVersion(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 && value < 2 ** 31 - 1;
+}
+
+/** The first own key not in `allowed` (or one that can't be read), if any. */
+function keyBeyond(value: unknown, allowed: ReadonlySet<string>): string | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  try {
+    const key = Reflect.ownKeys(value).find((k) => typeof k !== "string" || !allowed.has(k));
+    return key === undefined ? undefined : String(key);
+  } catch {
+    return "(unreadable)";
+  }
 }
 
 /** An own data property, never through a getter or a proxy's trap. */
@@ -271,6 +342,7 @@ async function todaysChecks(
   db: Queryable,
   candidate: CatalogRecord,
   stored: CatalogRecord,
+  confirmMadePublic: boolean,
 ): Promise<Issue[]> {
   const org = candidate.organizationId;
   const problems: Issue[] = [];
@@ -300,17 +372,24 @@ async function todaysChecks(
     );
   } else {
     const types = await readIdentifierTypes(db, org);
-    if (!types.ok) return [...types.issues];
-    const identifier = makeIdentifierChecker(types.value, org);
-    if (!identifier.ok) return [...identifier.issues];
+    const identifier = types.ok ? makeIdentifierChecker(types.value, org) : types;
     const links = makeRecordLinkChecker(others, org);
-    if (!links.ok) return [...links.issues];
-    problems.push(
-      ...checkRecordAgainstTemplate(candidate, template.value.template, {
-        checkers: { identifier: identifier.value, record_link: links.value, place: links.value },
-        allowMissingInherited: candidate.kind === "archival_unit",
-      }),
-    );
+    if (!identifier.ok || !links.ok) {
+      // Without the checkers the fields can't be checked; say why, and go on
+      // with every other check.
+      if (!identifier.ok) problems.push(...identifier.issues);
+      if (!links.ok) problems.push(...links.issues);
+    } else {
+      problems.push(
+        ...checkRecordAgainstTemplate(candidate, template.value.template, {
+          checkers: { identifier: identifier.value, record_link: links.value, place: links.value },
+          allowMissingInherited: candidate.kind === "archival_unit",
+        }),
+      );
+    }
+    if (!confirmMadePublic) {
+      problems.push(...publicValueIssues(candidate, stored, template.value.template));
+    }
     const held = await readRecordIdentifiers(db, org, candidate.id);
     if (held === undefined) {
       problems.push(issue(["id"], "unknown_record", "The organization has no such record."));
@@ -359,6 +438,47 @@ async function todaysChecks(
     problems.push(...(await arrangementIssues(db, candidate, stored, found)));
   }
   return problems;
+}
+
+/**
+ * Restored values that land in fields public today and differ from what the
+ * record holds now (D-065). A field may have been staff-only when the old
+ * value was stored and made public since, after the value was removed, so
+ * the made-public confirmation (D-031, T-005a) never covered it: restoring
+ * it must not publish it silently. The simplest safe rule: every such value
+ * is listed, and the restore waits for `confirmMadePublic`.
+ */
+function publicValueIssues(
+  candidate: CatalogRecord,
+  stored: CatalogRecord,
+  template: FieldTemplate,
+): Issue[] {
+  const problems: Issue[] = [];
+  for (const field of template.fields) {
+    if (field.visibility !== "public" || !Object.hasOwn(candidate.fields, field.key)) continue;
+    const value = candidate.fields[field.key];
+    const now = Object.hasOwn(stored.fields, field.key) ? stored.fields[field.key] : undefined;
+    if (value === undefined || (now !== undefined && sameJson(value, now))) continue;
+    problems.push(
+      issue(
+        ["fields", field.key],
+        "public_field_restored",
+        `${field.label} is public now and restoring would change its value. Confirm that this value may be published (it may have been staff-only when it was stored).`,
+      ),
+    );
+  }
+  return problems;
+}
+
+/** At most this many descendants are walked to check the depth of a moved unit. */
+export const MAX_DESCENDANTS_WALKED = 100_000;
+
+function tooDeep(): Issue {
+  return issue(
+    ["parentId"],
+    "too_deep",
+    `Filed there, its tree would be more than ${String(MAX_ARRANGEMENT_DEPTH)} levels deep.`,
+  );
 }
 
 /** Problems filing the restored unit where the old version had it, as the tree is now. */
@@ -434,24 +554,34 @@ async function arrangementIssues(
     );
     return problems;
   }
-  // How far its own descendants go down, to the depth limit.
-  const [below] = await db.rows<{ height: number }>(sql`
+  // Whether its own descendants would then sit too deep: walk down only as
+  // far as the room left below it, and at most MAX_DESCENDANTS_WALKED rows
+  // (the walk stops as soon as one unit past the room is found).
+  const room = MAX_ARRANGEMENT_DEPTH - (up.length + 1);
+  if (room < 0) {
+    problems.push(tooDeep());
+    return problems;
+  }
+  const [below] = await db.rows<{ deeper: boolean | null; walked: number }>(sql`
     WITH RECURSIVE down(id, depth) AS (
       SELECT id, 1 FROM public.records
       WHERE organization_id = ${org}::uuid AND parent_id = ${unit.id}::uuid
       UNION ALL
       SELECT r.id, down.depth + 1
       FROM down JOIN public.records r ON r.organization_id = ${org}::uuid AND r.parent_id = down.id
-      WHERE down.depth <= ${MAX_ARRANGEMENT_DEPTH}::integer
+      WHERE down.depth <= ${room}::integer
+    ), walked AS (
+      SELECT depth FROM down LIMIT ${MAX_DESCENDANTS_WALKED + 1}::integer
     )
-    SELECT coalesce(max(depth), 0)::integer AS height FROM down`);
-  const deepest = up.length + 1 + (below?.height ?? 0);
-  if (deepest > MAX_ARRANGEMENT_DEPTH) {
+    SELECT bool_or(depth > ${room}::integer) AS deeper, count(*)::integer AS walked FROM walked`);
+  if (below?.deeper === true) {
+    problems.push(tooDeep());
+  } else if ((below?.walked ?? 0) > MAX_DESCENDANTS_WALKED) {
     problems.push(
       issue(
         ["parentId"],
-        "too_deep",
-        `Filed there, its tree would be ${String(deepest)} levels deep; the limit is ${String(MAX_ARRANGEMENT_DEPTH)}.`,
+        "too_many_descendants",
+        `This unit holds more than ${String(MAX_DESCENDANTS_WALKED)} units, too many to check here; move it back in the arrangement instead.`,
       ),
     );
   }

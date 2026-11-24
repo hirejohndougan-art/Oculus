@@ -28,7 +28,7 @@ import {
   saveRecordIdentifiers,
 } from "./identifiers.js";
 import { migrate } from "./migrate.js";
-import { restoreReason, restoreVersion } from "./record-restore.js";
+import { restoreReason, restoreVersion, type RestoreOptions } from "./record-restore.js";
 import { compareVersions, readVersion, readVersions } from "./record-versions.js";
 import { sql } from "./sql.js";
 import { freshDatabase, type TestDatabase } from "./test-database.fixtures.js";
@@ -209,17 +209,23 @@ function restore(
   version: number,
   expected: number,
   reason?: string,
+  options: { confirmMadePublic?: boolean } = {},
+  on: Database = db,
 ): Promise<RecordUpdateResult> {
-  return tx((q) =>
+  return on.transaction((q) =>
     restoreVersion(
       q,
       org,
       id,
       version,
       { expectedVersion: expected, actor: BOB, ...(reason === undefined ? {} : { reason }) },
-      { now: NOW },
+      { now: NOW, ...options },
     ),
   );
+}
+
+function paths(result: Validated<unknown>): string[][] {
+  return result.ok ? [] : result.issues.map((i) => [i.path.join("."), i.code]);
 }
 
 async function versionCount(org: OrganizationId, id: RecordId): Promise<number> {
@@ -300,9 +306,7 @@ describe("edit conflicts (T-031)", () => {
     expect(alice.ok ? undefined : alice.conflict).toEqual({
       expectedVersion: 1,
       currentVersion: 2,
-      differences: [
-        { name: "title", change: "changed", before: "An invented chair", after: "Bob's title" },
-      ],
+      differences: [{ name: "title", change: "changed" }],
     });
     // Nothing of Alice's was stored.
     expect(await versionCount(org, record.id)).toBe(2);
@@ -338,7 +342,7 @@ describe("edit conflicts (T-031)", () => {
     expect(alice.ok ? undefined : alice.conflict).toEqual({
       expectedVersion: 1,
       currentVersion: 2,
-      differences: [{ name: "fields.note", change: "changed", before: "Oak.", after: "Walnut." }],
+      differences: [{ name: "fields.note", change: "changed" }],
     });
     expect(await versionCount(org, record.id)).toBe(2);
   });
@@ -384,7 +388,13 @@ describe("restoreVersion (T-030)", () => {
     const org = await organization();
     const record = await insert(object(org, { rights: { uri: IN_COPYRIGHT } }));
     ok(await save({ ...record, title: "Renamed", fields: { note: "Pine." }, updatedAt: LATER }, 1));
-    const restored = ok(await restore(org, record.id, 1, 2));
+    // The rights statement would come back into a public field: confirmed first.
+    expect(paths(await restore(org, record.id, 1, 2))).toEqual([
+      ["fields.rights", "public_field_restored"],
+    ]);
+    const restored = ok(
+      await restore(org, record.id, 1, 2, undefined, { confirmMadePublic: true }),
+    );
     expect(restored.version).toBe(3);
     expect(restored.actor).toBe(BOB);
     expect(restored.reason).toBe("restored version 1");
@@ -428,9 +438,7 @@ describe("restoreVersion (T-030)", () => {
     expect(stale.ok ? undefined : stale.conflict).toEqual({
       expectedVersion: 2,
       currentVersion: 3,
-      differences: [
-        { name: "title", change: "changed", before: "Renamed", after: "An invented chair" },
-      ],
+      differences: [{ name: "title", change: "changed" }],
     });
     const stranger = await organization();
     expect(codes(await restore(stranger, record.id, 1, 3))).toEqual(["unknown_record"]);
@@ -485,6 +493,7 @@ describe("restoreVersion (T-030)", () => {
     const result = await restore(org, record.id, 1, 2);
     expect(result.ok ? [] : result.issues.map((i) => [i.path.join("."), i.code])).toEqual([
       ["fields.rights.uri", "not_canonical"],
+      ["fields.rights", "public_field_restored"],
     ]);
   });
 
@@ -600,13 +609,21 @@ describe("restoreVersion (T-030)", () => {
   it("refuses a parent that would make the tree too deep", async () => {
     await ready();
     const org = await organization();
-    // A chain of 63 series, and a series with one sub-series below it.
+    // A chain of 62 series, a series at depth 63 with one sub-series below
+    // it (64, the limit), moved to the top, where it gains a sub-sub-series.
     let parent: RecordId | undefined;
-    for (let i = 0; i < 63; i += 1) parent = (await insert(unit(org, "series", parent))).id;
+    for (let i = 0; i < 62; i += 1) parent = (await insert(unit(org, "series", parent))).id;
     const moved = await insert(unit(org, "series", parent));
-    await insert(unit(org, "series", moved.id));
+    const child = await insert(unit(org, "series", moved.id));
     ok(await save({ ...withoutParent(moved), updatedAt: LATER }, 1));
+    await insert(unit(org, "series", child.id));
     expect(codes(await restore(org, moved.id, 1, 2))).toEqual(["too_deep"]);
+    // The database refuses a 65th level whoever writes it.
+    const at63 = await insert(unit(org, "series", parent));
+    const at64 = await insert(unit(org, "series", at63.id));
+    expect(
+      codes(await tx((q) => insertRecord(q, unit(org, "series", at64.id), { actor: ALICE }))),
+    ).toEqual(["too_deep"]);
   });
 });
 
@@ -673,3 +690,132 @@ function withoutKey(record: CatalogRecord, key: string): CatalogRecord {
 function withoutParent(record: CatalogRecord): CatalogRecord {
   return withoutKey(record, "parentId");
 }
+
+describe("review fixes (D-065)", () => {
+  it("two restores at the same moment can't file two units under each other", async () => {
+    await ready();
+    const org = await organization();
+    const b = await insert(unit(org, "series"));
+    const a = await insert(unit(org, "series", b.id)); // a v1: under b
+    ok(await save({ ...withoutParent(a), updatedAt: LATER }, 1)); // a v2: top
+    ok(await save({ ...b, parentId: a.id, updatedAt: LATER } as CatalogRecord, 1)); // b v2: under a
+    ok(await save({ ...withoutParent(b), updatedAt: LATEST }, 2)); // b v3: top
+    // Alice restores a's version 1 (a under b) and holds her transaction open;
+    // Bob restores b's version 2 (b under a) on another connection.
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let restored: () => void = () => undefined;
+    const aliceRestored = new Promise<void>((resolve) => (restored = resolve));
+    const alice = db.transaction(async (q) => {
+      const result = await restoreVersion(
+        q,
+        org,
+        a.id,
+        1,
+        { expectedVersion: 2, actor: ALICE },
+        { now: NOW },
+      );
+      restored();
+      await held;
+      return result;
+    });
+    await aliceRestored;
+    const bob = restore(org, b.id, 2, 3, undefined, {}, other);
+    // Bob waits for Alice's arrangement lock (or, without it, finishes).
+    await Promise.race([someoneWaits(), bob]);
+    release();
+    ok(await alice);
+    expect(codes(await bob)).toEqual(["loop"]);
+    expect(ok(await readStoredRecord(db, org, b.id)).record).not.toHaveProperty("parentId");
+  });
+
+  it("the database refuses a loop from updateRecord or direct SQL", async () => {
+    await ready();
+    const org = await organization();
+    const a = await insert(unit(org, "series"));
+    const b = await insert(unit(org, "series", a.id));
+    const c = await insert(unit(org, "series", b.id));
+    const looped = await save({ ...a, parentId: c.id, updatedAt: LATER } as CatalogRecord, 1);
+    expect(paths(looped)).toEqual([["parentId", "loop"]]);
+    await expect(
+      tx((q) =>
+        q.execute(sql`UPDATE public.records SET parent_id = ${c.id}::uuid, version = version + 1
+                      WHERE organization_id = ${org}::uuid AND id = ${a.id}::uuid`),
+      ),
+    ).rejects.toMatchObject({ code: "23000", constraint: "records_arrangement_loop" });
+  });
+
+  it("asks before restoring a value into a field made public since it was removed", async () => {
+    await ready();
+    const org = await organization();
+    // `provenance` is staff-only; a donor's name is stored, then removed.
+    const staffOnly = objectTemplate(org, [field("provenance", "text")]);
+    ok(await insertTemplateVersion(db, staffOnly));
+    const record = await insert(object(org, { provenance: "From an invented donor." }));
+    ok(await save({ ...record, fields: { note: "Oak." }, updatedAt: LATER }, 1));
+    // The field is made public: no record holds a value, so nothing to confirm then.
+    ok(
+      await insertTemplateVersion(
+        db,
+        objectTemplate(org, [field("provenance", "text", { visibility: "public" })]),
+      ),
+    );
+    expect(paths(await restore(org, record.id, 1, 2))).toEqual([
+      ["fields.provenance", "public_field_restored"],
+    ]);
+    expect(await versionCount(org, record.id)).toBe(2);
+    ok(await restore(org, record.id, 1, 2, undefined, { confirmMadePublic: true }));
+  });
+
+  it("a conflict names what changed, never the values", async () => {
+    await ready();
+    const org = await organization();
+    const record = await insert(object(org, { note: "A secret staff note." }));
+    ok(
+      await save(
+        { ...record, title: "Another title", fields: { note: "Second secret." }, updatedAt: LATER },
+        1,
+        BOB,
+        other,
+      ),
+    );
+    const stale = await save({ ...record, updatedAt: LATER }, 1);
+    const conflict = stale.ok ? undefined : stale.conflict;
+    expect(conflict).toEqual({
+      expectedVersion: 1,
+      currentVersion: 2,
+      differences: [
+        { name: "fields.note", change: "changed" },
+        { name: "title", change: "changed" },
+      ],
+    });
+    const text = JSON.stringify(conflict);
+    for (const value of ["secret", "Another title", "invented chair"]) {
+      expect(text).not.toContain(value);
+    }
+  });
+
+  it("refuses unknown options and change keys, and any isolation but Read Committed", async () => {
+    await ready();
+    const org = await organization();
+    const record = await insert(object(org));
+    ok(await save({ ...record, title: "Renamed", updatedAt: LATER }, 1));
+    const run = (change: object, options: object) =>
+      tx((q) => restoreVersion(q, org, record.id, 1, change as never, options as RestoreOptions));
+    expect(codes(await run({ expectedVersion: 2, actor: BOB }, { confirm: true }))).toEqual([
+      "unknown_property",
+    ]);
+    expect(codes(await run({ expectedVersion: 2, actor: BOB, organizationId: org }, {}))).toEqual([
+      "unknown_property",
+    ]);
+    expect(
+      codes(await run({ expectedVersion: 2, actor: BOB }, { confirmMadePublic: "yes" })),
+    ).toEqual(["invalid_option"]);
+    const repeatable = await tx(async (q) => {
+      await q.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`);
+      return restoreVersion(q, org, record.id, 1, { expectedVersion: 2, actor: BOB });
+    });
+    expect(codes(repeatable)).toEqual(["read_committed_required"]);
+    expect(await versionCount(org, record.id)).toBe(2);
+  });
+});

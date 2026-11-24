@@ -42,6 +42,7 @@ export type {
   RecordUpdate,
   RecordUpdateResult,
   VersionConflict,
+  ChangedName,
 } from "./catalog.js";
 export {
   isActorId,
