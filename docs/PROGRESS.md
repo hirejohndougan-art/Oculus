@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-23 20:14 CT — manual (John: "keep going") — T-028 Staff search
+- Result: done
+- What changed: migration `0007_staff_search.sql`: a stored, database-computed search document per record (title and text fields, folded for Latin, Greek and Cyrillic accents and case) with a GIN index, and `public.rebuild_search_documents()` for after a PostgreSQL or locale upgrade. `packages/db/src/search.ts` `searchRecords`: staff-only, one organization, current and former identifiers first, then ranked text hits, keyset paging with strictly validated cursors, a 500-character query limit.
+- Decisions: D-066
+- Review: two independent rounds (ranks sorted as text so paging skipped hits; OR'd exclusions; cost and upgrade notes; Hebrew and Arabic wording); all fixed with tests. Small follow-ups filed as S-014.
+- Gate: PASS · tests_passing 3426 (was 3406) · npm audit clean
+- Next: T-032 service layer (in progress)
+
 ## 2026-11-23 19:33 CT — manual (John: "keep going") — T-052 Backup and restore tools
 - Result: done
 - What changed: `npm run backup` / `npm run restore` (`packages/db/src/backup*.ts`): one file holding pg_dump's custom archive plus a manifest (format 2: versions, counts, role settings), restored only into a database exactly as CREATE DATABASE made it, by a role that is not a superuser and has no direct grants beyond what the restore needs, then checked (row counts, schema, role settings). One stop per Ctrl-C, partial files removed, a 20 s wait for other sessions. CI installs the PGDG client and server so pg_dump matches the server.
