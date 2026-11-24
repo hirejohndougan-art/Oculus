@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 00:19 CT — manual (John: "start on phase 2, easiest wins first") — S-015, S-016, T-012a follow-ups
+- Result: done
+- What changed: the writer check also refuses grant options on any database and schema public, any guard trigger that isn't ALWAYS, and any subscription, and no longer counts temporary objects as owned. `createInvitation` answers superseded, revoked or may-be-pending instead of a misleading ok; only connection-class failures become `database_unavailable` and everything else is rethrown. Template moves (`templateMoveChanges`) need confirmation for values that would change visibility, in `updateRecord` and in `restoreVersion` across templates; `nextIdentifier` can count numbers held in template fields.
+- Decisions: amendments to D-029, D-067, D-068
+- Review: one independent round (a restore across templates publishing a staff value without confirmation; missed network errors; programming errors hidden); all fixed with tests. Filed T-012b and U-005 as future features.
+- Gate: PASS · tests_passing 3567 (was 3554) · npm audit clean
+- Next: T-037 sessions and T-019b2 organization separation (fixing review findings)
+
 ## 2026-11-23 23:13 CT — manual (John: "move them to future features") — Launch scope
 - Result: done
 - What changed: ROADMAP gains a "Future features (after launch)" section. Moved there: the loan rework (T-018a, T-018b, S-013), vocabulary URI checks (T-009a), the TypeScript 7 and Vite 8 revisit (T-001b), search follow-ups (S-014), custom roles (T-041a), the optional approval step (T-035) and review queue (T-049), site passwords (T-019d), Argon2id (U-004) and the templates and identifier types admin screen (T-047). T-043 and T-048 no longer wait on T-035 and T-041a.
