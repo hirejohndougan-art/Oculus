@@ -957,6 +957,8 @@ export interface RecordPlace {
   readonly kind: string;
   readonly parentId: RecordId | null;
   readonly level: string | null;
+  /** What a digital asset represents (T-041: where its permissions come from). */
+  readonly represents: RecordId | null;
 }
 
 /**
@@ -977,8 +979,11 @@ export async function readRecordPlace(
     kind: string;
     parent_id: string | null;
     level: string | null;
+    represents_id: string | null;
   }>(sql`
-    SELECT version, kind, parent_id::text AS parent_id, level FROM public.records
+    SELECT version, kind, parent_id::text AS parent_id, level,
+           represents_id::text AS represents_id
+    FROM public.records
     WHERE organization_id = ${organizationId}::uuid AND id = ${recordId}::uuid`);
   if (row === undefined) return undefined;
   return Object.freeze({
@@ -986,6 +991,7 @@ export async function readRecordPlace(
     kind: row.kind,
     parentId: row.parent_id as RecordId | null,
     level: row.level,
+    represents: row.represents_id as RecordId | null,
   });
 }
 

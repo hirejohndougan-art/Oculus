@@ -11,6 +11,7 @@ import {
   type Issue,
   type OrganizationId,
   type RecordId,
+  type UserId,
   type Validated,
 } from "@oculus/core";
 import {
@@ -45,9 +46,12 @@ import {
   type TestDatabase,
 } from "../../db/src/test-database.fixtures.js";
 import { createService, type RecordService, type ServiceResult } from "./service.js";
+import { actorOf, grant, makeSite, people, type People } from "./people.fixtures.js";
 
-const ALICE = "user:3f1c2a9e-8b7d-4c6e-9a5b-1d2e3f4a5b6c";
-const BOB = "user:9b2e4c1a-7d3f-4e8a-b5c6-1a2b3c4d5e6f";
+// Two invented site managers, real accounts (T-041): set in ready().
+let ALICE = "";
+let BOB = "";
+let folks: People;
 const NOW = new Date("2026-11-23T12:00:00.000Z");
 const DENIED = "42501";
 const IDENTITY = "23000";
@@ -144,7 +148,23 @@ async function ready(): Promise<void> {
   s = await setup;
   service = createService(s.writer, { now: () => NOW });
   service2 = createService(s.writer2, { now: () => NOW });
+  people_ ??= (async () => {
+    const holding = newOrganizationId();
+    ok(await insertOrganization(s.owner, { id: holding, name: "Invented Holding Society" }));
+    const made = await people(s.owner, holding);
+    return {
+      folks: made,
+      alice: await made.member(holding, "Alice"),
+      bob: await made.member(holding, "Bob"),
+    };
+  })();
+  const p = await people_;
+  folks = p.folks;
+  ALICE = actorOf(p.alice);
+  BOB = actorOf(p.bob);
 }
+
+let people_: Promise<{ folks: People; alice: UserId; bob: UserId }> | undefined;
 
 afterAll(async () => {
   const done = await setup?.catch(() => undefined);
@@ -245,6 +265,12 @@ async function organization(): Promise<OrganizationId> {
       }),
     ),
   );
+  // Alice and Bob manage the organization's one site (T-041).
+  const site = await makeSite(service, folks.root, org);
+  for (const name of ["Alice", "Bob"]) {
+    const userId = await folks.member(org, name);
+    await grant(service, folks.root, org, { userId, role: "site_manager", siteId: site });
+  }
   return org;
 }
 
@@ -1033,7 +1059,9 @@ describe("the writer role", () => {
     const errors: unknown[] = [];
     const readOnly = createService(s.reader, { onError: (e) => errors.push(e) });
     const refused = await readOnly.createRecord(ctx(org), objectDraft());
-    expect(codes(refused)).toEqual(["not_permitted"]);
+    // T-041 renamed this code from not_permitted, which now means the
+    // person's own permissions; this one is the database role's grants.
+    expect(codes(refused)).toEqual(["writer_role_refused"]);
     expect(messages(refused)).not.toMatch(/permission denied|records|public\./);
     expect(errors).toHaveLength(1);
     expect(ok(await readStoredRecord(s.owner, org, record.id)).version).toBe(1);

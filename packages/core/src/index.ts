@@ -605,3 +605,37 @@ export {
   OTHER_SOURCE_KEY,
 } from "./sign-in-throttle.js";
 export type { ThrottleRule, ThrottleState, ThrottleDecision } from "./sign-in-throttle.js";
+export {
+  CATALOG_PERMISSIONS,
+  ORGANIZATION_PERMISSIONS,
+  SITE_PERMISSIONS,
+  SYSTEM_PERMISSIONS,
+  BUILT_IN_ROLES,
+  ROLE_LABELS,
+  ROLE_PERMISSIONS,
+  WHOLE_CATALOG_ROLES,
+  isBuiltInRole,
+  isPermission,
+  permits,
+  holdsAnywhere,
+  holdsForWholeCatalog,
+  hasScopedGrants,
+} from "./permissions.js";
+export type {
+  CatalogPermission,
+  OrganizationPermission,
+  SitePermission,
+  SystemPermission,
+  RolePermission,
+  Permission,
+  BuiltInRole,
+  RoleGrant,
+  Access,
+  PermissionTarget,
+} from "./permissions.js";
+export {
+  DEFAULT_SYSTEM_SETTINGS,
+  SYSTEM_SETTING_BOUNDS,
+  validateSystemSettings,
+} from "./system-settings.js";
+export type { SystemSettings } from "./system-settings.js";

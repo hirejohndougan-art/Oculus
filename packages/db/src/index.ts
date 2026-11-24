@@ -9,7 +9,9 @@
  * identifier tables and `vocabularies.ts` the stored terms and the index of
  * which records use them, all through core's validators; `search.ts` is
  * staff search (STAFF ONLY: never for a public site, D-066); `accounts.ts`
- * users, invitations and password sign-in (D-068).
+ * users, invitations and password sign-in (D-068); `permissions.ts` sites,
+ * role assignments, System settings and a person's access, read under locks
+ * (D-072).
  */
 export { sql, joinSql, isSql, Sql, MAX_PARAMETERS } from "./sql.js";
 export type { SqlScalar, SqlValue } from "./sql.js";
@@ -152,3 +154,28 @@ export type {
   SignInResult,
   Membership,
 } from "./accounts.js";
+export {
+  PERMISSION_TABLE_PRIVILEGES,
+  loadAccess,
+  lockPersonForRoleChange,
+  unitsHolding,
+  insertSite,
+  readSite,
+  renameSite,
+  sitesForPerson,
+  insertRoleAssignment,
+  readRoleAssignment,
+  deleteRoleAssignment,
+  listRoleAssignments,
+  isMember,
+  grantsScopedTo,
+  readSystemSettings,
+  writeSystemSettings,
+} from "./permissions.js";
+export type {
+  RecordPosition,
+  SiteChoice,
+  RoleAssignment,
+  NewRoleAssignment,
+  StoredSystemSettings,
+} from "./permissions.js";
