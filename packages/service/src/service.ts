@@ -127,6 +127,8 @@ import {
   readStoredRecord,
   readTemplate,
   readVersion,
+  grantsScopedTo,
+  hasRecordsBelow,
   readWorkflowState,
   recordCheckIssues,
   refreshRecordTerms,
@@ -812,25 +814,82 @@ function positionOf(record: Placed): RecordPosition {
  * site they have no role on as a site that doesn't exist.
  */
 async function moveIssues(
+  tx: Queryable,
   checker: RecordAccess,
+  recordId: RecordId,
   before: Placed,
   after: CatalogRecord,
 ): Promise<Refusal | undefined> {
   const from = positionOf(before);
   const to = positionOf(after);
-  if (
-    from.parentId === to.parentId &&
-    from.represents === to.represents &&
-    from.siteId === to.siteId
-  ) {
+  const siteChange = from.siteId !== to.siteId;
+  if (from.parentId === to.parentId && from.represents === to.represents && !siteChange) {
     return undefined;
   }
   const permissions = editPermissions(after.kind);
-  if (from.siteId !== to.siteId && to.siteId != null && !(await checker.worksOn(to.siteId))) {
+  if (siteChange && to.siteId != null && !(await checker.worksOn(to.siteId))) {
     return unknownSite(["siteId"]);
   }
   if (await checker.intoPlace(from, permissions, true)) return notPermitted();
-  return checker.intoPlace(to, permissions, true);
+  const into = await checker.intoPlace(to, permissions, true);
+  if (into) return into;
+  if (siteChange) {
+    const org = after.organizationId;
+    // Grants scoped to a unit on the site it leaves would follow it nowhere
+    // (D-074 review): refused, for everyone, until they are changed. Grants
+    // on every site still hold after the move.
+    if (
+      after.kind === "archival_unit" &&
+      from.siteId != null &&
+      (await grantsScopedTo(tx, org, recordId, { onSite: from.siteId })) > 0
+    ) {
+      return refusal(
+        ["siteId"],
+        "has_role_grants",
+        "Roles on its site are granted for this unit. Change those grants first.",
+      );
+    }
+    // Units filed under it and scans of it stay on its site: only a system
+    // manager leaves them behind (items belong to one site).
+    if (!checker.access.systemManager && (await hasRecordsBelow(tx, org, recordId))) {
+      return refusal(
+        ["siteId"],
+        "in_use_below",
+        "Units or scans below it stay on its site. A system manager can move them.",
+      );
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The refusals of a deletion that count what still needs the record (units
+ * filed under it, scans of it, links to it, role grants on it), for anyone
+ * but a system manager: those may be on sites the person can't see, so they
+ * become one fixed `in_use`, with no count and no kind (D-074).
+ */
+const HIDDEN_USES: ReadonlySet<string> = new Set([
+  "has_children",
+  "represented",
+  "linked_from",
+  "has_role_grants",
+]);
+
+function withoutHiddenUses<T extends { readonly ok: false; readonly issues: readonly Issue[] }>(
+  refused: T,
+): T {
+  if (!refused.issues.some((i) => HIDDEN_USES.has(i.code))) return refused;
+  return {
+    ...refused,
+    issues: [
+      issue(
+        ["recordId"],
+        "in_use",
+        "Other records or role grants still need this record. Remove those first.",
+      ),
+      ...refused.issues.filter((i) => !HIDDEN_USES.has(i.code)),
+    ],
+  };
 }
 
 /** A site the person has no role on, answered as one that doesn't exist. */
@@ -854,7 +913,13 @@ function movesInArrangement(
     readonly parentId?: unknown;
     readonly level?: unknown;
     readonly represents?: unknown;
+    readonly siteId?: unknown;
   };
+  // A draft or version without a home site keeps the record's (D-074); a
+  // change of home site is a move too (D-074 review: links checked by
+  // `hiddenAmong` must not see it half done).
+  const siteAfter = (after.siteId as SiteId | undefined) ?? place.siteId;
+  if (siteAfter !== place.siteId) return true;
   if (place.kind === "archival_unit") {
     return (after.parentId ?? null) !== place.parentId || (after.level ?? null) !== place.level;
   }
@@ -1168,7 +1233,9 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
     rowLock: "no_key_update" | "update" | "share",
     all: readonly Permission[],
     any: (kind: string) => readonly Permission[] = () => [],
-  ): Promise<{ readonly ok: true; readonly place: RecordPlace } | Refusal> {
+  ): Promise<
+    { readonly ok: true; readonly place: RecordPlace; readonly checker: RecordAccess } | Refusal
+  > {
     const allowed = await accessFor(tx, who, rowLock === "share" ? "read" : "write");
     if (!allowed.ok) return allowed;
     const place = await lockedPlace(tx, who.organizationId, recordId, rowLock);
@@ -1184,7 +1251,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
       all,
       any(place.kind),
     );
-    return denied ?? { ok: true, place };
+    return denied ?? { ok: true, place, checker: allowed.value };
   }
 
   return Object.freeze({
@@ -1390,7 +1457,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         const record = valid.value;
         // Moving it (another parent, another represented record) needs the
         // permission where it leaves and where it goes.
-        const moved = await moveIssues(checker, before, record);
+        const moved = await moveIssues(tx, checker, recordId, before, record);
         if (moved) return moved;
         if (record.templateKey === undefined) {
           return refusal(["templateKey"], "no_template_key", "Every record names its template.");
@@ -1518,7 +1585,12 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           Number.isInteger(version) && version >= 1 && version < 2 ** 31 - 1
             ? await readVersion(tx, org, recordId, version)
             : undefined;
-        const old = wanted?.ok ? wanted.value.record : undefined;
+        // A version without a home site keeps the record's (D-074).
+        const stored = wanted?.ok ? wanted.value.record : undefined;
+        const old =
+          stored !== undefined && stored.siteId === undefined && seen.siteId !== null
+            ? ({ ...stored, siteId: seen.siteId } as CatalogRecord)
+            : stored;
         if (old !== undefined && movesInArrangement(seen, old)) await lockArrangement(tx, org);
         // Then the row, and the place it is checked at, as it stays until COMMIT.
         const place = await lockedPlace(tx, org, recordId, "no_key_update");
@@ -1542,7 +1614,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         }
         let hiddenLinks: ReadonlySet<RecordId> = new Set();
         if (old !== undefined) {
-          const moved = await moveIssues(checker, place, old);
+          const moved = await moveIssues(tx, checker, recordId, place, old);
           if (moved) return moved;
           if (!checker.access.systemManager) {
             const current = await readStoredRecord(tx, org, recordId);
@@ -1604,11 +1676,13 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         // the check at its place as it stays until COMMIT.
         const allowed = await mayChange(tx, who, recordId, "update", ["records.delete"]);
         if (!allowed.ok) return allowed;
-        return deleteStoredRecord(tx, who.organizationId, recordId, {
+        const deleted = await deleteStoredRecord(tx, who.organizationId, recordId, {
           expectedVersion: expected.value,
           actor: who.actor,
           ...(reason.value === undefined ? {} : { reason: reason.value }),
         });
+        if (deleted.ok || allowed.checker.access.systemManager) return deleted;
+        return withoutHiddenUses(deleted);
       });
     },
 

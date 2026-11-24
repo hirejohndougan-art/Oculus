@@ -279,6 +279,9 @@ async function organization(): Promise<OrganizationId> {
 /** Each organization's one site, where Alice and Bob work (D-074). */
 const siteOf = new Map<OrganizationId, SiteId>();
 
+/** The install's system manager, working in the organization's site: deletions' counts. */
+const systemCtx = (organizationId: OrganizationId) => ctx(organizationId, actorOf(folks.root));
+
 const ctx = (organizationId: OrganizationId, actor = ALICE) => {
   const siteId = siteOf.get(organizationId);
   return { organizationId, actor, ...(siteId === undefined ? {} : { siteId }) };
@@ -2040,15 +2043,20 @@ describe("deleting records", () => {
     const org = await organization();
     const fonds = await create(org, unitDraft("fonds"));
     await create(org, unitDraft("series", fonds.id));
-    expect(codes(await service.deleteRecord(ctx(org), fonds.id, { expectedVersion: 1 }))).toEqual([
-      "has_children",
-    ]);
+    expect(
+      codes(await service.deleteRecord(systemCtx(org), fonds.id, { expectedVersion: 1 })),
+    ).toEqual(["has_children"]);
+    // Anyone but a system manager hears only that something needs it: what
+    // does may be on a site they can't see (D-074).
+    const inUse = await service.deleteRecord(ctx(org), fonds.id, { expectedVersion: 1 });
+    expect(codes(inUse)).toEqual(["in_use"]);
+    expect(messages(inUse)).not.toMatch(/\d/);
     const maker = await create(org, agentDraft);
     const linking = await create(
       org,
       objectDraft({ creator: { recordId: maker.id, label: "A maker" } }),
     );
-    const refused = await service.deleteRecord(ctx(org), maker.id, { expectedVersion: 1 });
+    const refused = await service.deleteRecord(systemCtx(org), maker.id, { expectedVersion: 1 });
     expect(codes(refused)).toEqual(["linked_from"]);
     expect(messages(refused)).not.toContain(linking.id);
     const chair = await create(org, objectDraft(), { identifiers: numbers("DHS-5") });
@@ -2059,13 +2067,16 @@ describe("deleting records", () => {
       templateKey: "invented-asset",
       represents: chair.id,
     });
+    expect(
+      codes(await service.deleteRecord(systemCtx(org), chair.id, { expectedVersion: 1 })),
+    ).toEqual(["represented", "holds_identifiers"]);
     expect(codes(await service.deleteRecord(ctx(org), chair.id, { expectedVersion: 1 }))).toEqual([
-      "represented",
+      "in_use",
       "holds_identifiers",
     ]);
-    expect(codes(await service.deleteRecord(ctx(org), linking.id, { expectedVersion: 5 }))).toEqual(
-      ["version_conflict"],
-    );
+    expect(
+      codes(await service.deleteRecord(systemCtx(org), linking.id, { expectedVersion: 5 })),
+    ).toEqual(["version_conflict"]);
     for (const id of [fonds.id, maker.id, chair.id, linking.id]) {
       expect(await rowExists(org, id)).toBe(true);
     }
@@ -2078,7 +2089,7 @@ describe("deleting records", () => {
         { expectedVersion: 1 },
       ),
     );
-    ok(await service.deleteRecord(ctx(org), maker.id, { expectedVersion: 1 }));
+    ok(await service.deleteRecord(systemCtx(org), maker.id, { expectedVersion: 1 }));
   });
 });
 
@@ -2101,7 +2112,7 @@ describe("deleting a place others point at", () => {
       }),
     );
     for (const target of [town, depot]) {
-      const refused = await service.deleteRecord(ctx(org), target.id, { expectedVersion: 1 });
+      const refused = await service.deleteRecord(systemCtx(org), target.id, { expectedVersion: 1 });
       expect(codes(refused)).toEqual(["linked_from"]);
       expect(await rowExists(org, target.id)).toBe(true);
     }
@@ -2114,7 +2125,7 @@ describe("deleting a place others point at", () => {
         { expectedVersion: 1 },
       ),
     );
-    ok(await service.deleteRecord(ctx(org), town.id, { expectedVersion: 1 }));
+    ok(await service.deleteRecord(systemCtx(org), town.id, { expectedVersion: 1 }));
     expect(await rowExists(org, listed.id)).toBe(true);
   });
 });
@@ -2179,7 +2190,7 @@ describe("two connections at once", () => {
       { expectedVersion: 1 },
     );
     await saved.promise;
-    const deleting = service.deleteRecord(ctx(org), maker.id, { expectedVersion: 1 });
+    const deleting = service.deleteRecord(systemCtx(org), maker.id, { expectedVersion: 1 });
     await someoneWaits();
     go.resolve();
     expect(ok(await saving).version).toBe(2);

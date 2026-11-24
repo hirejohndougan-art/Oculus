@@ -58,6 +58,7 @@ import {
   isMember,
   listRoleAssignments,
   lockPeopleForRoleChange,
+  lockRecord,
   readRecordPlace,
   readRoleAssignment,
   readSite,
@@ -71,7 +72,7 @@ import {
   type SiteChoice,
   type StoredSystemSettings,
 } from "@oculus/db";
-import { actorUser, notPermitted, readAccess } from "./access.js";
+import { RecordAccess, actorUser, notPermitted, readAccess } from "./access.js";
 import type { ServiceContext, ServiceResult } from "./service.js";
 
 /** Runs one operation in its transaction (service.ts's `run`). */
@@ -294,9 +295,37 @@ export function adminOperations(run: Runner): AdminOperations {
           return refusal(["siteId"], "unknown_site", UNKNOWN_SITE);
         }
         if (scope !== null) {
-          const place = await readRecordPlace(tx, org, scope);
-          if (place === undefined) {
-            return refusal(["scope"], "unknown_record", "The organization has no such record.");
+          // The unit must be on the grant's site (any site of the
+          // organization for a grant on every site), for everyone, and one
+          // the actor may view. Anything else is answered exactly as a unit
+          // that doesn't exist, before its kind is looked at, so the answer
+          // says nothing about records the actor can't see (D-074 review).
+          // The arrangement lock (for scoped grants) and then the unit's
+          // row FOR SHARE hold its site and place until COMMIT.
+          const unknownScope = refusal<RoleAssignment>(
+            ["scope"],
+            "unknown_record",
+            "The organization has no such record.",
+          );
+          const checker = new RecordAccess(tx, org, access.value);
+          await checker.settle();
+          const locked = await lockRecord(tx, org, scope, "share");
+          const place = locked === undefined ? undefined : await readRecordPlace(tx, org, scope);
+          if (place === undefined) return unknownScope;
+          const onSite = siteId === null ? place.siteId !== null : place.siteId === siteId;
+          if (!onSite) return unknownScope;
+          if (!access.value.systemManager) {
+            const hidden = await checker.onRecord(
+              {
+                kind: place.kind,
+                id: scope,
+                parentId: place.parentId,
+                represents: place.represents,
+                siteId: place.siteId,
+              },
+              [],
+            );
+            if (hidden) return unknownScope;
           }
           if (place.kind !== "archival_unit") {
             return refusal(
@@ -389,6 +418,12 @@ export function adminOperations(run: Runner): AdminOperations {
           ok: true,
           value: await listRoleAssignments(tx, who.organizationId, {
             ...(sites === "all" ? {} : { siteIds: [...sites] }),
+            // Only what they may revoke (mayManage): a site manager, even on
+            // every site, manages neither site managers nor grants on every
+            // site.
+            ...(access.value.systemManager
+              ? {}
+              : { siteSpecificOnly: true, exceptRole: "site_manager" as const }),
             after,
             limit,
           }),

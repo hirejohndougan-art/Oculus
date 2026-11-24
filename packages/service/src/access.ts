@@ -284,6 +284,24 @@ export class RecordAccess {
               ],
             };
       }
+      // Items belong to one site (D-074): a unit is filed under a unit of
+      // its own home site, a scan represents a record of its own site, so
+      // nothing (inherited values, a scan's place) reaches across sites. Only
+      // system managers file across sites.
+      if (!this.access.systemManager && place.siteId !== (position.siteId ?? null)) {
+        return {
+          ok: false,
+          issues: [
+            issue(
+              position.kind === "archival_unit" ? ["parentId"] : ["represents"],
+              "other_site",
+              position.kind === "archival_unit"
+                ? "A unit is filed under a unit of its own site."
+                : "A scan represents a record of its own site.",
+            ),
+          ],
+        };
+      }
     }
     const target = await this.target({
       kind: position.kind,

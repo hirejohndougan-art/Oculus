@@ -183,6 +183,7 @@ export {
   DEFAULT_ASSIGNMENT_PAGE,
   isMember,
   grantsScopedTo,
+  hasRecordsBelow,
   readSystemSettings,
   writeSystemSettings,
 } from "./permissions.js";

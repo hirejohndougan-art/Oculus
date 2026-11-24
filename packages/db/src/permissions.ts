@@ -497,6 +497,10 @@ export async function listRoleAssignments(
   organizationId: OrganizationId,
   options: {
     readonly siteIds?: readonly SiteId[];
+    /** Leave out grants on every site (`site_id` NULL). */
+    readonly siteSpecificOnly?: boolean;
+    /** Leave out grants of this role. */
+    readonly exceptRole?: BuiltInRole;
     readonly after?: string | null;
     readonly limit?: number;
   } = {},
@@ -516,6 +520,8 @@ export async function listRoleAssignments(
     FROM public.role_assignments
     WHERE organization_id = ${organizationId}::uuid
       AND (${sites === null}::boolean OR site_id = ANY (${sites ?? []}::uuid[]))
+      AND (${options.siteSpecificOnly !== true}::boolean OR site_id IS NOT NULL)
+      AND (${options.exceptRole ?? null}::text IS NULL OR role <> ${options.exceptRole ?? null}::text)
       AND (${cursor === null}::boolean
            OR (granted_at, id) > ((${cursor?.[1] ?? null}::timestamp AT TIME ZONE 'UTC'),
                                   ${cursor?.[2] ?? null}::uuid))
@@ -549,11 +555,29 @@ export async function grantsScopedTo(
   db: Queryable,
   organizationId: OrganizationId,
   recordId: RecordId,
+  options: { readonly onSite?: SiteId } = {},
 ): Promise<number> {
+  const site = options.onSite ?? null;
   const [row] = await db.rows<{ n: number }>(sql`
     SELECT count(*)::integer AS n FROM public.role_assignments
-    WHERE organization_id = ${organizationId}::uuid AND scope_record_id = ${recordId}::uuid`);
+    WHERE organization_id = ${organizationId}::uuid AND scope_record_id = ${recordId}::uuid
+      AND (${site === null}::boolean OR site_id = ${site}::uuid)`);
   return row?.n ?? 0;
+}
+
+/** Whether any unit is filed under the record, or any digital asset represents it. */
+export async function hasRecordsBelow(
+  db: Queryable,
+  organizationId: OrganizationId,
+  recordId: RecordId,
+): Promise<boolean> {
+  if (!isOrganizationId(organizationId) || !isRecordId(recordId)) return false;
+  const rows = await db.rows(sql`
+    SELECT 1 FROM public.records
+    WHERE organization_id = ${organizationId}::uuid
+      AND (parent_id = ${recordId}::uuid OR represents_id = ${recordId}::uuid)
+    LIMIT 1`);
+  return rows.length > 0;
 }
 
 // ---------------------------------------------------------------------------

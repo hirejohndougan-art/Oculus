@@ -1728,26 +1728,22 @@ describe("items belong to a site (D-074)", () => {
     const everywhere = await personWith(w, "every-site", [{ role: "read_only", siteId: null }]);
     ok(await service.readRecord(ctxOf(w.a, everywhere), onA2.id));
     ok(await service.readRecord(ctxOf(w.a, everywhere), w.o.id));
-    // A scoped grant narrows within its site: F1's units on A1 only.
+    // A scoped grant narrows within its site: F3's units on A2, nothing else there.
+    const f3 = ok(
+      await service.createRecord(rootIn(w.a2), unitDraft("fonds", "Invented Fonds Three")),
+    ).record;
+    const s3 = ok(
+      await service.createRecord(rootIn(w.a2), unitDraft("series", "Invented Series Three", f3.id)),
+    ).record;
     const scoped = await personWith(w, "scoped-a2", [
-      { role: "cataloger", scope: w.f1.id, siteId: w.a2 },
+      { role: "cataloger", scope: f3.id, siteId: w.a2 },
     ]);
-    expect(codes(await service.readRecord(ctxOf(w.a, scoped, w.a2), w.s1.id))).toEqual([
-      "unknown_record",
-    ]);
-    const s1OnA2 = ok(await service.readRecord(rootIn(w.a1), w.s1.id));
-    ok(
-      await service.updateRecord(
-        rootIn(w.a1),
-        w.s1.id,
-        { ...s1OnA2.record, siteId: w.a2 },
-        { expectedVersion: s1OnA2.version },
-      ),
-    );
-    ok(await service.readRecord(ctxOf(w.a, scoped, w.a2), w.s1.id));
-    expect(codes(await service.readRecord(ctxOf(w.a, scoped, w.a2), w.x1.id))).toEqual([
-      "unknown_record",
-    ]);
+    ok(await service.readRecord(ctxOf(w.a, scoped, w.a2), s3.id));
+    for (const id of [onA2.id, w.s1.id]) {
+      expect(codes(await service.readRecord(ctxOf(w.a, scoped, w.a2), id))).toEqual([
+        "unknown_record",
+      ]);
+    }
   }, 120_000);
 
   it("someone on two sites works in each; new items join the site they're made in", async () => {
@@ -2037,5 +2033,238 @@ describe("workflow actions need the actor's permissions (T-034, D-076)", () => {
       "not_permitted",
     );
     expect(mine.row).toEqual((await ask(w.byRole.cataloger, w.a, w.o.id)).row);
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// Second T-041 review.
+
+describe("grants scoped to units of their own site (second review)", () => {
+  it("a scope on another site, on no site or out of sight is answered as a missing unit, before its kind", async () => {
+    await ready();
+    const w = await world();
+    const rootIn = (site: SiteId | null) => ctxOf(w.a, folks.root, site);
+    const fondsA2 = ok(
+      await service.createRecord(rootIn(w.a2), unitDraft("fonds", "Invented A2")),
+    ).record;
+    const objectA2 = ok(await service.createRecord(rootIn(w.a2), objectDraft())).record;
+    const loose = ok(
+      await service.createRecord(rootIn(null), unitDraft("fonds", "Invented loose")),
+    ).record;
+    const p = await folks.member(w.a, `scopee2-${newRecordId().slice(0, 6)}`);
+    const req = (scope: RecordId, siteId: SiteId | null = w.a1) => ({
+      userId: p,
+      role: "read_only",
+      siteId,
+      scope,
+    });
+    const manager = ctxOf(w.a, w.byRole.site_manager);
+    const missing = await service.grantRole(manager, req(newRecordId()));
+    expect(codes(missing)).toEqual(["unknown_record"]);
+    for (const scope of [fondsA2.id, objectA2.id, loose.id]) {
+      expect(await service.grantRole(manager, req(scope))).toEqual(missing);
+      // The same for a system manager: the unit must be on the grant's site.
+      expect(await service.grantRole(rootIn(w.a1), req(scope))).toEqual(missing);
+    }
+    // A grant on every site takes a unit of any site, never one on no site.
+    expect(await service.grantRole(rootIn(w.a1), req(loose.id, null))).toEqual(missing);
+    ok(await service.grantRole(rootIn(w.a1), req(fondsA2.id, null)));
+    // On its own site, it is granted; an object there is still not a unit.
+    ok(await service.grantRole(rootIn(w.a1), req(fondsA2.id, w.a2)));
+    expect(codes(await service.grantRole(manager, req(w.o.id)))).toEqual(["not_a_unit"]);
+    // A2's manager can now see (and revoke) what blocks deleting their fonds.
+    const a2Manager = await personWith(w, "a2-manager", [{ role: "site_manager", siteId: w.a2 }]);
+    const theirs = ok(await service.listRoleAssignments(ctxOf(w.a, a2Manager, w.a2))).assignments;
+    expect(theirs.some((a) => a.scope === fondsA2.id && a.siteId === w.a2)).toBe(true);
+  }, 60_000);
+
+  it("a unit with grants on its site doesn't move to another site until they change", async () => {
+    await ready();
+    const w = await world();
+    const rootCtx = ctxOf(w.a, folks.root);
+    const unit = ok(
+      await service.createRecord(rootCtx, unitDraft("fonds", "Invented Mover")),
+    ).record;
+    const p = await folks.member(w.a, `mover-${newRecordId().slice(0, 6)}`);
+    const onA1 = await grant(service, folks.root, w.a, {
+      userId: p,
+      role: "read_only",
+      siteId: w.a1,
+      scope: unit.id,
+    });
+    await grant(service, folks.root, w.a, {
+      userId: p,
+      role: "read_only",
+      siteId: null,
+      scope: unit.id,
+    });
+    const move = () =>
+      service.updateRecord(rootCtx, unit.id, { ...unit, siteId: w.a2 }, { expectedVersion: 1 });
+    expect(codes(await move())).toEqual(["has_role_grants"]);
+    ok(await service.revokeRole(rootCtx, onA1));
+    // A grant on every site still holds after the move.
+    ok(await move());
+    ok(await service.readRecord(ctxOf(w.a, p, w.a2), unit.id));
+  }, 60_000);
+});
+
+describe("restoring a version from before the record had a site", () => {
+  it("keeps the record's home site", async () => {
+    await ready();
+    const w = await world();
+    const rootNoSite = ctxOf(w.a, folks.root, null);
+    const r = ok(
+      await service.createRecord(rootNoSite, objectDraft("Invented old lantern")),
+    ).record;
+    const placed = ok(
+      await service.updateRecord(rootNoSite, r.id, { ...r, siteId: w.a1 }, { expectedVersion: 1 }),
+    );
+    const edited = ok(
+      await service.updateRecord(
+        ctxOf(w.a, w.byRole.cataloger),
+        r.id,
+        { ...placed.record, title: "Edited" },
+        { expectedVersion: 2 },
+      ),
+    );
+    expect(edited.version).toBe(3);
+    // A cataloger of A1 restores version 1 (no site): it stays on A1.
+    ok(
+      await service.restoreVersion(ctxOf(w.a, w.byRole.cataloger), r.id, 1, { expectedVersion: 3 }),
+    );
+    const now = ok(await service.readRecord(ctxOf(w.a, w.byRole.cataloger), r.id));
+    expect(now.record.siteId).toBe(w.a1);
+    expect(now.record.title).toBe("Invented old lantern");
+  }, 60_000);
+});
+
+describe("items stay on one site (second review)", () => {
+  it("filing under or scanning another site's record: only system managers; deletion blockers say nothing more", async () => {
+    await ready();
+    const w = await world();
+    const rootA2 = ctxOf(w.a, folks.root, w.a2);
+    const fondsA2 = ok(
+      await service.createRecord(rootA2, unitDraft("fonds", "Invented A2 Fonds")),
+    ).record;
+    const two = await personWith(w, "two-site-filer", [
+      { role: "cataloger", siteId: w.a1 },
+      { role: "cataloger", siteId: w.a2 },
+    ]);
+    const inA1 = ctxOf(w.a, two, w.a1);
+    expect(
+      codes(await service.createRecord(inA1, unitDraft("series", "Invented", fondsA2.id))),
+    ).toEqual(["other_site"]);
+    expect(codes(await service.createRecord(inA1, assetDraft(fondsA2.id)))).toEqual(["other_site"]);
+    // Moving a series of A1 under A2's fonds, or to A2 while under F1: refused too.
+    const s1 = ok(await service.readRecord(inA1, w.s1.id));
+    expect(
+      codes(
+        await service.updateRecord(
+          inA1,
+          w.s1.id,
+          { ...s1.record, parentId: fondsA2.id },
+          { expectedVersion: s1.version },
+        ),
+      ),
+    ).toEqual(["other_site"]);
+    const x1 = ok(await service.readRecord(inA1, w.x1.id));
+    // X1 has a scan (AX): leaving it behind is a system manager's call.
+    expect(
+      codes(
+        await service.updateRecord(
+          inA1,
+          w.x1.id,
+          { ...x1.record, siteId: w.a2 },
+          { expectedVersion: x1.version },
+        ),
+      ),
+    ).toEqual(["other_site"]);
+    const lone = ok(await service.createRecord(inA1, objectDraft())).record;
+    const scan = ok(await service.createRecord(inA1, assetDraft(lone.id))).record;
+    expect(
+      codes(
+        await service.updateRecord(
+          inA1,
+          lone.id,
+          { ...lone, siteId: w.a2 },
+          { expectedVersion: 1 },
+        ),
+      ),
+    ).toEqual(["in_use_below"]);
+    expect(scan.siteId).toBe(w.a1);
+    // A system manager may file across sites.
+    const across = ok(
+      await service.createRecord(
+        ctxOf(w.a, folks.root),
+        unitDraft("series", "Invented across", fondsA2.id),
+      ),
+    ).record;
+    // A2's manager can't delete their fonds: they hear only "in use", not
+    // that a unit of another site is filed under it.
+    const a2Manager = await personWith(w, "a2-deleter", [{ role: "site_manager", siteId: w.a2 }]);
+    const refused = await service.deleteRecord(ctxOf(w.a, a2Manager, w.a2), fondsA2.id, {
+      expectedVersion: 1,
+    });
+    expect(codes(refused)).toEqual(["in_use"]);
+    expect(text(refused)).not.toMatch(/\d|archival|unit/);
+    expect(codes(await service.deleteRecord(rootA2, fondsA2.id, { expectedVersion: 1 }))).toEqual([
+      "has_children",
+    ]);
+    expect(across.siteId).toBe(w.a1);
+  }, 60_000);
+
+  it("a site manager on every site lists only the grants they may revoke", async () => {
+    await ready();
+    const w = await world();
+    const everywhere = await personWith(w, "every-site-lister", [
+      { role: "site_manager", siteId: null },
+    ]);
+    const p = await folks.member(w.a, `listed-${newRecordId().slice(0, 6)}`);
+    const onEvery = await grant(service, folks.root, w.a, {
+      userId: p,
+      role: "read_only",
+      siteId: null,
+    });
+    const onA2 = await grant(service, folks.root, w.a, {
+      userId: p,
+      role: "read_only",
+      siteId: w.a2,
+    });
+    const listed = ok(await service.listRoleAssignments(ctxOf(w.a, everywhere))).assignments;
+    expect(listed.some((a) => a.id === onA2)).toBe(true);
+    expect(listed.some((a) => a.id === onEvery)).toBe(false);
+    expect(listed.every((a) => a.role !== "site_manager" && a.siteId !== null)).toBe(true);
+    // Everything listed is revocable by them.
+    for (const a of listed.slice(0, 3)) {
+      ok(await service.revokeRole(ctxOf(w.a, everywhere), a.id));
+    }
+  }, 60_000);
+
+  it("a move to another site holds off a scoped check of links until it commits", async () => {
+    await ready();
+    const w = await world();
+    const p = await personWith(w, "link-racer", [{ role: "cataloger", scope: w.f1.id }]);
+    const c = ctxOf(w.a, p);
+    // X1 is visible to the cataloger (in F1 on A1), but not an agent: a
+    // link to it is the wrong kind while visible, unknown once it moves.
+    const linked = {
+      ...unitDraft("file", "Invented racing link", w.s1.id),
+      fields: { related: { recordId: w.x1.id, label: "X" } },
+    };
+    const h = holdRows(rowOf(w.a, w.x1.id));
+    await h.locked;
+    const move = service2.updateRecord(
+      ctxOf(w.a, folks.root),
+      w.x1.id,
+      { ...w.x1, siteId: w.a2 },
+      { expectedVersion: 1 },
+    );
+    await waiting(1);
+    const create = service.createRecord(c, linked);
+    await waiting(2);
+    h.release();
+    await h.held;
+    ok(await move);
+    expect(codes(await create)).toEqual(["unknown_record"]);
   }, 60_000);
 });

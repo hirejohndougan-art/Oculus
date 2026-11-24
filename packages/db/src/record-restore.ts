@@ -280,8 +280,13 @@ export async function restoreVersion(
     }
     if (!current.ok) return { ok: false, issues: fixedMessages(current.issues, []) };
     const stored = current.value.record;
+    // A version written before the record had a home site keeps the one it
+    // has now (D-074): an absent siteId means "unchanged", never "no site".
     const candidate = {
       ...old.value.record,
+      ...(old.value.record.siteId === undefined && stored.siteId !== undefined
+        ? { siteId: stored.siteId }
+        : {}),
       updatedAt: later(stored.updatedAt, now.toISOString()),
     } as CatalogRecord;
     const compared = compareRecords(stored, candidate);
