@@ -37,12 +37,26 @@
  * now, so a server clock behind the stored time never gets an edit refused
  * (D-063).
  *
+ * **Workflow and publishing** (T-034b, D-075, D-076): `submitForReview`,
+ * `returnToDraft`, `publish` and `withdraw` change a record's stored state
+ * as its next version (who, when, why), under the record's row lock.
+ * `publish` runs core's publish check in the same transaction, on the
+ * record and everything it depends on as they are now (`publishCheckIssues`),
+ * and is refused if it fails. A published record stays publishable: an
+ * edit, a restore or an identifier change of a published record runs the
+ * same check after writing and is refused (nothing saved) if it would fail.
+ * A published record must be withdrawn before it is deleted. Publishing,
+ * withdrawing, and confirming that values may become public on a published
+ * record (`confirmTemplateMove`, `confirmMadePublic`) change what the public
+ * sees at once, so each asks `ServiceOptions.mayChangePublicOutput` first:
+ * the hook T-041's `records.publish` permission plugs into.
+ *
  * Not here yet: who may do what (T-041 checks permissions in front of these
  * calls; restore needs the permission to read history as well as to edit,
- * D-065), workflow and publishing (T-034), and loans and accessions (no
- * tables yet; when they are stored, closing a loan by an accession happens
- * here, from the register and loan book read in the same transaction, never
- * from ones a caller hands in, D-067 for T-018a and S-013).
+ * D-065), and loans and accessions (no tables yet; when they are stored,
+ * closing a loan by an accession happens here, from the register and loan
+ * book read in the same transaction, never from ones a caller hands in,
+ * D-067 for T-018a and S-013).
  */
 import {
   MAX_FIELD_DEPTH,
@@ -69,20 +83,26 @@ import {
   type OrganizationId,
   type RecordId,
   type RecordIdentifiers,
+  type WorkflowAction,
+  type WorkflowState,
 } from "@oculus/core";
 import {
+  changeWorkflowState,
   checkWriterConnection,
   deleteRecord as deleteStoredRecord,
+  fixedMessages,
   insertRecord,
   isActorId,
   lockArrangement,
   lockDefinition,
   lockRecord,
+  publishCheckIssues,
   readOrganization,
   readRecordIdentifiers,
   readRecordPlace,
   readStoredRecord,
   readTemplate,
+  readWorkflowState,
   recordCheckIssues,
   refreshRecordTerms,
   restoreVersion as restoreStoredVersion,
@@ -179,6 +199,39 @@ export interface DeleteOptions {
   readonly reason?: string;
 }
 
+export interface WorkflowOptions {
+  /** The version the person was looking at (a change of state is the record's next version). */
+  readonly expectedVersion: number;
+  /** Why, for the change log (optional). */
+  readonly reason?: string;
+}
+
+/** A change of a record's workflow state, as stored. */
+export interface WorkflowChange {
+  readonly state: WorkflowState;
+  /** The version the change was stored as: pass it as `expectedVersion` next. */
+  readonly version: number;
+  readonly actor: string;
+  /** The database's clock at the change. */
+  readonly recordedAt: string;
+}
+
+/**
+ * What changes the public output at once, and so needs the publish
+ * permission (D-036, D-076): publishing, withdrawing, and confirming that
+ * values of a published record may become public (a template move's
+ * `confirmTemplateMove`, a restore's `confirmMadePublic`).
+ */
+export type PublicChange = "publish" | "withdraw" | "confirm_made_public";
+
+/** What `mayChangePublicOutput` is asked. */
+export interface PublicChangeRequest {
+  readonly organizationId: OrganizationId;
+  readonly actor: string;
+  readonly recordId: RecordId;
+  readonly change: PublicChange;
+}
+
 /** How the service runs. */
 export interface ServiceOptions {
   /** The clock (for tests). Default: now. */
@@ -194,6 +247,20 @@ export interface ServiceOptions {
    * person. Errors thrown by it are ignored.
    */
   readonly onError?: (error: unknown, operation: string) => void;
+  /**
+   * Who may change what the public sees (`PublicChange`), asked in the
+   * operation's transaction before the record is touched: `undefined` to
+   * allow, or the refusal to return (nothing is saved). **The default allows
+   * every actor**, as every other operation does until T-041's permissions
+   * are merged; T-041's merge replaces the default with its check of
+   * `records.publish` where the record is (answering a record the actor
+   * can't view as `unknown_record`, and otherwise `not_permitted`). Errors
+   * it throws fail the operation as `internal_error`.
+   */
+  readonly mayChangePublicOutput?: (
+    tx: Queryable,
+    request: PublicChangeRequest,
+  ) => Promise<ServiceRefusal | undefined>;
 }
 
 /** The service: every write of a record and its related rows. */
@@ -236,6 +303,33 @@ export interface RecordService {
     recordId: RecordId,
     options: DeleteOptions,
   ): Promise<ServiceResult<RecordDeletion>>;
+  /** Sends a draft (or withdrawn) record for review (D-075). */
+  submitForReview(
+    context: ServiceContext,
+    recordId: RecordId,
+    options: WorkflowOptions,
+  ): Promise<ServiceResult<WorkflowChange>>;
+  /** Returns a record in review (or withdrawn) to draft (D-075). */
+  returnToDraft(
+    context: ServiceContext,
+    recordId: RecordId,
+    options: WorkflowOptions,
+  ): Promise<ServiceResult<WorkflowChange>>;
+  /**
+   * Publishes a draft, ready or withdrawn record, after core's publish check
+   * on it as it is now; needs `mayChangePublicOutput` (D-076).
+   */
+  publish(
+    context: ServiceContext,
+    recordId: RecordId,
+    options: WorkflowOptions,
+  ): Promise<ServiceResult<WorkflowChange>>;
+  /** Takes a published record off the public sites ("Unpublish"); needs `mayChangePublicOutput`. */
+  withdraw(
+    context: ServiceContext,
+    recordId: RecordId,
+    options: WorkflowOptions,
+  ): Promise<ServiceResult<WorkflowChange>>;
   /** What is wrong with the connection's database role for writing (empty when fit). */
   checkConnection(): Promise<readonly WriterRoleProblem[]>;
 }
@@ -635,6 +729,30 @@ function cleanError(error: unknown): ServiceRefusal {
 
 const RETRYABLE_STATES: ReadonlySet<string> = new Set([RETRY, SERIALIZATION]);
 
+/** The default `mayChangePublicOutput`: allows everyone, until T-041's merge (see there). */
+function allowEveryone(): Promise<undefined> {
+  return Promise.resolve(undefined);
+}
+
+/**
+ * A write of a published record that would leave it failing the publish
+ * check: refused, with the check's issues after an explanation.
+ */
+function stillPublishable(found: readonly Issue[]): ServiceRefusal | undefined {
+  if (found.length === 0) return undefined;
+  return {
+    ok: false,
+    issues: [
+      issue(
+        ["workflowState"],
+        "published_record_check",
+        "This record is published, and after this change it could no longer be published. Fix what is listed, or unpublish it first.",
+      ),
+      ...found,
+    ],
+  };
+}
+
 /** Makes the service over `db`, a pool connected as the writer role. */
 export function createService(db: Database, options: ServiceOptions = {}): RecordService {
   const clock = options.now ?? (() => new Date());
@@ -643,6 +761,95 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
     throw new RangeError("attempts is a whole number from 1 to 10.");
   }
   const onError = options.onError;
+  const mayChangePublicOutput = options.mayChangePublicOutput ?? allowEveryone;
+  if (typeof mayChangePublicOutput !== "function") {
+    throw new TypeError("mayChangePublicOutput is a function.");
+  }
+
+  /** The hook's answer for one change; `undefined` allows it. */
+  async function publicChangeRefused(
+    tx: Queryable,
+    who: { organizationId: OrganizationId; actor: string },
+    recordId: RecordId,
+    change: PublicChange,
+  ): Promise<ServiceRefusal | undefined> {
+    const answer = await mayChangePublicOutput(tx, {
+      organizationId: who.organizationId,
+      actor: who.actor,
+      recordId,
+      change,
+    });
+    if (answer === undefined) return undefined;
+    // Read as untrusted: a hook is the deployment's code.
+    const given: unknown = answer;
+    const issues = ownValue(given, "issues");
+    if (ownValue(given, "ok") === false && Array.isArray(issues) && issues.length > 0) {
+      return answer;
+    }
+    // Anything else from the hook is a refusal too (fail closed).
+    return refusal([], "not_permitted", "You don't have permission to do this.");
+  }
+
+  /**
+   * After a write of a record in this transaction: if it is published, it
+   * must still pass the publish check (D-076), with the templates and types
+   * it read locked until COMMIT.
+   */
+  async function publishedStillPasses(
+    tx: Queryable,
+    organizationId: OrganizationId,
+    recordId: RecordId,
+    messages: "own" | "fixed",
+  ): Promise<ServiceRefusal | undefined> {
+    const state = await readWorkflowState(tx, organizationId, recordId);
+    if (state?.state !== "published") return undefined;
+    const found = await publishCheckIssues(tx, organizationId, recordId, { lock: true });
+    return stillPublishable(messages === "own" ? found : fixedMessages(found, []));
+  }
+
+  /** One of the four workflow actions (D-075), as the record's next version. */
+  function workflowAction(action: WorkflowAction) {
+    return (context: unknown, recordId: RecordId, workflowOptions: unknown) =>
+      run(action, context, async (tx, who): Promise<ServiceResult<WorkflowChange>> => {
+        const org = who.organizationId;
+        if (!isRecordId(recordId)) {
+          return refusal(["recordId"], "invalid_id", "A record ID is a lowercase version 4 UUID.");
+        }
+        const opts = readOptions(workflowOptions, ["expectedVersion", "reason"]);
+        if (!opts.ok) return opts;
+        const expected = readExpectedVersion(opts.value);
+        if (!expected.ok) return expected;
+        const reason = readReason(opts.value);
+        if (!reason.ok) return reason;
+        // Publishing and withdrawing change what the public sees (D-075).
+        if (action === "publish" || action === "withdraw") {
+          const denied = await publicChangeRefused(tx, who, recordId, action);
+          if (denied) return denied;
+        }
+        const changed = await changeWorkflowState(tx, org, recordId, action, {
+          expectedVersion: expected.value,
+          actor: who.actor,
+          ...(reason.value === undefined ? {} : { reason: reason.value }),
+        });
+        if (!changed.ok) return changed;
+        if (action === "publish") {
+          // On the record as it is now, under its row lock (taken above);
+          // a refusal rolls the change of state back.
+          const found = await publishCheckIssues(tx, org, recordId, { lock: true });
+          if (found.length > 0) return { ok: false, issues: found };
+        }
+        const version = changed.value;
+        return {
+          ok: true,
+          value: Object.freeze({
+            state: version.workflowState,
+            version: version.version,
+            actor: version.actor,
+            recordedAt: version.recordedAt,
+          }),
+        };
+      });
+  }
 
   /** The current time in core's form, whole milliseconds. */
   function now(): ServiceResult<string> {
@@ -913,6 +1120,14 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           );
         }
         const before = stored.value.record;
+        // Confirming that a published record's values may become public
+        // changes the public output at once (D-076).
+        // (The row is locked, so its state holds.)
+        const state = await readWorkflowState(tx, org, recordId);
+        if (state?.state === "published" && (confirmedMove.value?.size ?? 0) > 0) {
+          const denied = await publicChangeRefused(tx, who, recordId, "confirm_made_public");
+          if (denied) return denied;
+        }
         const stamp = now();
         if (!stamp.ok) return stamp;
         const valid = validateRecord({
@@ -970,6 +1185,8 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         if (fieldProblems.length > 0) return { ok: false, issues: fieldProblems };
         const terms = await refreshTerms(tx, org, recordId);
         if (terms) return terms;
+        const unpublishable = await publishedStillPasses(tx, org, recordId, "own");
+        if (unpublishable) return unpublishable;
         return {
           ok: true,
           value: Object.freeze({
@@ -1010,6 +1227,8 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         if (!saved.ok) return saved;
         const fieldProblems = await identifierFieldProblems(tx, stored.value.record);
         if (fieldProblems.length > 0) return { ok: false, issues: fieldProblems };
+        const unpublishable = await publishedStillPasses(tx, org, recordId, "own");
+        if (unpublishable) return unpublishable;
         return saved;
       });
     },
@@ -1048,8 +1267,21 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           },
         );
         if (!restored.ok) return restored;
+        // The row is locked now (the restore wrote it), so its state holds.
+        const state = await readWorkflowState(tx, org, recordId);
+        if (
+          state?.state === "published" &&
+          Array.isArray(confirm) &&
+          (confirm as readonly unknown[]).length > 0
+        ) {
+          const denied = await publicChangeRefused(tx, who, recordId, "confirm_made_public");
+          if (denied) return denied;
+        }
         const terms = await refreshTerms(tx, org, recordId);
         if (terms) return terms;
+        // Fixed messages: a restore's refusal must not quote old values (D-065).
+        const unpublishable = await publishedStillPasses(tx, org, recordId, "fixed");
+        if (unpublishable) return unpublishable;
         return restored;
       });
     },
@@ -1072,6 +1304,11 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         });
       });
     },
+
+    submitForReview: workflowAction("submit_for_review"),
+    returnToDraft: workflowAction("return_to_draft"),
+    publish: workflowAction("publish"),
+    withdraw: workflowAction("withdraw"),
 
     async checkConnection() {
       return Object.freeze(await checkWriterConnection(db));

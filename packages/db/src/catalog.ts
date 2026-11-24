@@ -375,7 +375,10 @@ interface RecordRow {
   updated_at: string;
 }
 
-/** A record as stored now: the validated record and its version number. */
+/**
+ * A record as stored now: the validated record and its version number. Its
+ * workflow state is read with `readWorkflowState` (`workflow.ts`).
+ */
 export interface StoredRecord {
   readonly version: number;
   readonly record: CatalogRecord;
@@ -465,7 +468,7 @@ const ID_USED_BEFORE =
  */
 function versionRefusal<T>(
   error: unknown,
-  write: "insert" | "update" | "restore" | "delete",
+  write: "insert" | "update" | "restore" | "delete" | "workflow",
 ): Validated<T> | undefined {
   const state = sqlState(error);
   if (state === FOREIGN_KEY && write === "delete") {
@@ -525,6 +528,18 @@ function versionRefusal<T>(
       return refused(["kind"], "kind_changed", KIND_FIXED);
     case "records_updated_at_backwards":
       return refused(["updatedAt"], "updated_before", UPDATED_BEFORE);
+    case "record_versions_workflow_move":
+      return refused(
+        ["workflowState"],
+        "workflow_move",
+        "The record's workflow state can't change this way. Read it again.",
+      );
+    case "record_versions_delete_published":
+      return refused(
+        ["recordId"],
+        "published",
+        "This record is published. Unpublish it before deleting it.",
+      );
     default:
       return undefined;
   }
@@ -546,7 +561,7 @@ const UPDATED_BEFORE = "updatedAt can't be earlier than the stored record's.";
  */
 export async function inSavepoint<T>(
   db: Queryable,
-  write: "insert" | "update" | "restore" | "delete",
+  write: "insert" | "update" | "restore" | "delete" | "workflow",
   work: () => Promise<Validated<T>>,
 ): Promise<Validated<T>> {
   try {
@@ -918,6 +933,48 @@ export async function readRecordsForChecks(
            to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
     FROM public.records
     WHERE organization_id = ${organizationId}::uuid AND id = ANY(${[...ids]}::uuid[])`);
+  return rows.map(recordFromRow);
+}
+
+/** At most this many records are read for one record's publish check or public output. */
+export const MAX_CLOSURE_RECORDS = 10_000;
+
+/**
+ * @internal The organization's records with these IDs and everything above
+ * them: each one's parent (an archival unit's) and represented record (a
+ * digital asset's), and theirs, and so on, as the core values their rows
+ * hold, **not validated**. One statement, so from one moment. IDs it doesn't
+ * have (or another organization has) are left out. `undefined` when there
+ * are more than `MAX_CLOSURE_RECORDS`. For the publish check and the public
+ * output (D-076), which need a record's ancestry, what it represents and
+ * the records it links to with theirs, never the whole catalog.
+ */
+export async function readRecordClosure(
+  db: Queryable,
+  organizationId: OrganizationId,
+  ids: readonly RecordId[],
+): Promise<Record<string, unknown>[] | undefined> {
+  if (ids.length === 0) return [];
+  const rows = await db.rows<RecordRow>(sql`
+    WITH RECURSIVE up(id) AS (
+      SELECT unnest(${[...ids]}::uuid[])
+      UNION
+      SELECT next.id
+      FROM up
+      JOIN public.records r ON r.organization_id = ${organizationId}::uuid AND r.id = up.id
+      CROSS JOIN LATERAL unnest(ARRAY[r.parent_id, r.represents_id]) AS next(id)
+      WHERE next.id IS NOT NULL
+    )
+    SELECT r.id::text AS id, r.organization_id::text AS organization_id, r.kind, r.template_key,
+           r.record_type_key, r.title, r.level, r.parent_id::text AS parent_id, r.media_type,
+           r.represents_id::text AS represents_id, r.agent_type, r.latitude, r.longitude, r.fields,
+           to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
+           to_char(r.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
+    FROM public.records r
+    WHERE r.organization_id = ${organizationId}::uuid AND r.id IN (SELECT id FROM up)
+    ORDER BY r.id
+    LIMIT ${MAX_CLOSURE_RECORDS + 1}`);
+  if (rows.length > MAX_CLOSURE_RECORDS) return undefined;
   return rows.map(recordFromRow);
 }
 

@@ -28,6 +28,8 @@ import {
   compareRecords,
   isOrganizationId,
   isRecordId,
+  isWorkflowAction,
+  isWorkflowState,
   issue,
   validateRecord,
   type CatalogRecord,
@@ -35,6 +37,8 @@ import {
   type RecordDifference,
   type RecordId,
   type Validated,
+  type WorkflowAction,
+  type WorkflowState,
 } from "@oculus/core";
 import type { Queryable } from "./client.js";
 import { sql } from "./sql.js";
@@ -69,13 +73,23 @@ export interface RecordVersion {
   /**
    * `save` for every write of the record, `delete` for its deletion (T-032,
    * D-067): a deletion version holds the record as it was when deleted, is
-   * always the record's last, and its `changedFields` is empty.
+   * always the record's last, and its `changedFields` is empty. One of the
+   * four workflow actions (`publish`, `withdraw`, `submit_for_review`,
+   * `return_to_draft`, D-075, D-076) for a change of state: the record is
+   * the same as in the version before, and `changedFields` is
+   * `["workflowState"]`.
    */
   readonly action: RecordAction;
+  /**
+   * The record's workflow state once this version was written (D-076),
+   * filled in by the database from the record row. Only workflow actions
+   * change it.
+   */
+  readonly workflowState: WorkflowState;
 }
 
-/** What a version records: a write of the record, or its deletion. */
-export type RecordAction = "save" | "delete";
+/** What a version records: a write of the record, its deletion, or a change of its workflow state. */
+export type RecordAction = "save" | "delete" | WorkflowAction;
 
 export interface RecordVersions {
   /** Oldest first. */
@@ -175,9 +189,10 @@ interface VersionRow {
   changed_fields: unknown;
   reason: string | null;
   action: string;
+  workflow_state: string;
 }
 
-const VERSION_COLUMNS = sql`version, record, actor, action,
+const VERSION_COLUMNS = sql`version, record, actor, action, workflow_state,
   to_char(recorded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS recorded_at,
   changed_fields, reason`;
 
@@ -192,11 +207,13 @@ export async function writeVersion(
   record: CatalogRecord,
   version: number,
   change: RecordChange,
+  action: "save" | WorkflowAction = "save",
 ): Promise<RecordVersion> {
   const [row] = await db.rows<VersionRow>(sql`
-    INSERT INTO public.record_versions (organization_id, record_id, version, record, actor, reason)
+    INSERT INTO public.record_versions (organization_id, record_id, version, record, actor, reason,
+                                        action)
     VALUES (${record.organizationId}::uuid, ${record.id}::uuid, ${version}::integer,
-            ${JSON.stringify(record)}::jsonb, ${change.actor}, ${change.reason ?? null})
+            ${JSON.stringify(record)}::jsonb, ${change.actor}, ${change.reason ?? null}, ${action})
     RETURNING ${VERSION_COLUMNS}`);
   if (row === undefined) throw new Error("The record version was not stored.");
   const stored = versionFromRow(record.organizationId, record.id, row);
@@ -222,7 +239,8 @@ function versionFromRow(
     (row.reason !== null && !isReason(row.reason)) ||
     !Array.isArray(changed) ||
     !changed.every((name): name is string => typeof name === "string") ||
-    (row.action !== "save" && row.action !== "delete")
+    (row.action !== "save" && row.action !== "delete" && !isWorkflowAction(row.action)) ||
+    !isWorkflowState(row.workflow_state)
   ) {
     return refused([], "row_mismatch", "The stored version doesn't match its row.");
   }
@@ -238,6 +256,7 @@ function versionFromRow(
       changedFields: Object.freeze([...changed]),
       ...(row.reason === null ? {} : { reason: row.reason }),
       action: row.action,
+      workflowState: row.workflow_state,
     }),
   };
 }
