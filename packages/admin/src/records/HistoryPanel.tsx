@@ -13,7 +13,7 @@ import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { ApiError, api, problemText } from "../api";
 import { Button, Note } from "../components/ui";
-import { Choice, ConfirmDialog } from "./controls";
+import { Choice, ConfirmPanel } from "./controls";
 import {
   ACTION_LABELS,
   issuesIn,
@@ -153,6 +153,45 @@ export function HistoryPanel(props: Props) {
           {problem}
         </Note>
       )}
+      <ConfirmPanel
+        key={restore?.step ?? "closed"}
+        isOpen={restore !== undefined}
+        title={
+          restore?.step === "public"
+            ? "Public values would change"
+            : `Restore version ${String(restore?.version ?? "")}?`
+        }
+        confirmLabel={
+          restore?.step === "public" ? "Restore and confirm these values" : "Restore this version"
+        }
+        busy={busy}
+        onCancel={() => {
+          setRestore(undefined);
+        }}
+        onConfirm={() => {
+          if (restore === undefined) return;
+          void doRestore(restore.version, restore.step === "public" ? restore.keys : undefined);
+        }}
+      >
+        {restore?.step === "public" ? (
+          <>
+            <p>
+              Restoring would change these fields, which are public now. Their old values may have
+              been staff-only when they were saved. Confirm that they may be shown on public sites:
+            </p>
+            <ul>
+              {restore.keys.map((k) => (
+                <li key={k}>{label(`fields.${k}`)}</li>
+              ))}
+            </ul>
+          </>
+        ) : (
+          <p>
+            The record goes back to how it was in version {String(restore?.version ?? "")}, saved as
+            a new version. Its ID numbers and status stay as they are.
+          </p>
+        )}
+      </ConfirmPanel>
       {versions.isPending ? (
         <p role="status">Loading the history…</p>
       ) : versions.isError ? (
@@ -272,45 +311,6 @@ export function HistoryPanel(props: Props) {
           )}
         </div>
       )}
-
-      <ConfirmDialog
-        isOpen={restore !== undefined}
-        title={
-          restore?.step === "public"
-            ? "Public values would change"
-            : `Restore version ${String(restore?.version ?? "")}?`
-        }
-        confirmLabel={
-          restore?.step === "public" ? "Restore and confirm these values" : "Restore this version"
-        }
-        busy={busy}
-        onCancel={() => {
-          setRestore(undefined);
-        }}
-        onConfirm={() => {
-          if (restore === undefined) return;
-          void doRestore(restore.version, restore.step === "public" ? restore.keys : undefined);
-        }}
-      >
-        {restore?.step === "public" ? (
-          <>
-            <p>
-              Restoring would change these fields, which are public now. Their old values may have
-              been staff-only when they were saved. Confirm that they may be shown on public sites:
-            </p>
-            <ul>
-              {restore.keys.map((k) => (
-                <li key={k}>{label(`fields.${k}`)}</li>
-              ))}
-            </ul>
-          </>
-        ) : (
-          <p>
-            The record goes back to how it was in version {String(restore?.version ?? "")}, saved as
-            a new version. Its ID numbers and status stay as they are.
-          </p>
-        )}
-      </ConfirmDialog>
     </section>
   );
 }

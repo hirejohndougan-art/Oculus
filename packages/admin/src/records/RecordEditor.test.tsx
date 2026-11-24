@@ -267,7 +267,7 @@ describe("workflow and delete", () => {
     const { router } = renderAt(PATH);
     await opened();
     await userEvent.click(screen.getByRole("button", { name: "Delete this record" }));
-    const dialog = await screen.findByRole("alertdialog", { name: "Delete this record?" });
+    const dialog = await screen.findByRole("region", { name: "Delete this record?" });
     await userEvent.click(within(dialog).getByRole("button", { name: "Delete the record" }));
     await waitFor(() => {
       expect(router.state.location.pathname).toBe(`/sites/${SITE_1}`);
@@ -346,9 +346,9 @@ describe("the history panel", () => {
     renderAt(PATH);
     await opened();
     await userEvent.click(await screen.findByRole("button", { name: "Restore version 1" }));
-    const ask = await screen.findByRole("alertdialog", { name: "Restore version 1?" });
+    const ask = await screen.findByRole("region", { name: "Restore version 1?" });
     await userEvent.click(within(ask).getByRole("button", { name: "Restore this version" }));
-    const again = await screen.findByRole("alertdialog", { name: "Public values would change" });
+    const again = await screen.findByRole("region", { name: "Public values would change" });
     expect(within(again).getByRole("listitem").textContent).toBe("Note");
     await userEvent.click(
       within(again).getByRole("button", { name: "Restore and confirm these values" }),
@@ -374,15 +374,20 @@ describe("leaving and creating", () => {
     await opened();
     await userEvent.type(screen.getByLabelText(/^Shelf/), "Unsaved");
     await userEvent.click(backLink());
-    const dialog = await screen.findByRole("alertdialog", { name: "Leave without saving?" });
+    const dialog = await screen.findByRole("region", { name: "Leave without saving?" });
+    // Focus moves to the question, so it is announced.
+    expect(document.activeElement).toBe(dialog);
     await userEvent.click(within(dialog).getByRole("button", { name: "Stay on this record" }));
     expect(router.state.location.pathname).toBe(PATH);
     expect(screen.getByLabelText<HTMLInputElement>(/^Shelf/).value).toBe("Unsaved");
     await userEvent.click(backLink());
     await userEvent.click(
-      within(await screen.findByRole("alertdialog")).getByRole("button", {
-        name: "Leave and discard my changes",
-      }),
+      within(await screen.findByRole("region", { name: "Leave without saving?" })).getByRole(
+        "button",
+        {
+          name: "Leave and discard my changes",
+        },
+      ),
     );
     await waitFor(() => {
       expect(router.state.location.pathname).toBe(`/sites/${SITE_1}`);

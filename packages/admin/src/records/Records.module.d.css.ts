@@ -3,9 +3,9 @@ declare const styles: {
   readonly actions: string;
   readonly amber: string;
   readonly blue: string;
+  readonly confirm: string;
   readonly danger: string;
   readonly details: string;
-  readonly dialog: string;
   readonly empty: string;
   readonly entry: string;
   readonly fieldset: string;
@@ -21,9 +21,7 @@ declare const styles: {
   readonly legend: string;
   readonly listbox: string;
   readonly meta: string;
-  readonly modal: string;
   readonly option: string;
-  readonly overlay: string;
   readonly pageTitle: string;
   readonly pager: string;
   readonly pair: string;

@@ -25,7 +25,7 @@ import { useBlocker, useLocation, useNavigate } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { ApiError, api, problemText } from "../api";
 import { Button, Note, TextLink } from "../components/ui";
-import { Choice, ConfirmDialog, StatePill, TextInput } from "./controls";
+import { Choice, ConfirmPanel, StatePill, TextInput } from "./controls";
 import { FieldInput } from "./FieldInput";
 import { HistoryPanel } from "./HistoryPanel";
 import {
@@ -549,6 +549,21 @@ function Editor(props: EditorProps) {
         )}
       </div>
 
+      <ConfirmPanel
+        isOpen={blocker.state === "blocked"}
+        title="Leave without saving?"
+        confirmLabel="Leave and discard my changes"
+        cancelLabel="Stay on this record"
+        danger
+        onCancel={() => {
+          blocker.reset?.();
+        }}
+        onConfirm={() => {
+          blocker.proceed?.();
+        }}
+      >
+        <p>You have changes to this record that are not saved.</p>
+      </ConfirmPanel>
       {conflict === undefined ? null : (
         <div className={styles.panel} role="alert">
           <Note tone="amber">
@@ -807,6 +822,22 @@ function Editor(props: EditorProps) {
               ) : null}
             </div>
           ) : null}
+          <ConfirmPanel
+            isOpen={askDelete}
+            title="Delete this record?"
+            confirmLabel="Delete the record"
+            danger
+            busy={busy}
+            onCancel={() => {
+              setAskDelete(false);
+            }}
+            onConfirm={() => void remove()}
+          >
+            <p>
+              It disappears from the catalog. Its history is kept, but only a system manager can see
+              it.
+            </p>
+          </ConfirmPanel>
         </form>
 
         {reply !== undefined && can.history ? (
@@ -830,38 +861,6 @@ function Editor(props: EditorProps) {
           />
         ) : null}
       </div>
-
-      <ConfirmDialog
-        isOpen={askDelete}
-        title="Delete this record?"
-        confirmLabel="Delete the record"
-        danger
-        busy={busy}
-        onCancel={() => {
-          setAskDelete(false);
-        }}
-        onConfirm={() => void remove()}
-      >
-        <p>
-          It disappears from the catalog. Its history is kept, but only a system manager can see it.
-        </p>
-      </ConfirmDialog>
-
-      <ConfirmDialog
-        isOpen={blocker.state === "blocked"}
-        title="Leave without saving?"
-        confirmLabel="Leave and discard my changes"
-        cancelLabel="Stay on this record"
-        danger
-        onCancel={() => {
-          blocker.reset?.();
-        }}
-        onConfirm={() => {
-          blocker.proceed?.();
-        }}
-      >
-        <p>You have changes to this record that are not saved.</p>
-      </ConfirmDialog>
     </>
   );
 }

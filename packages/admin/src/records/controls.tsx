@@ -4,18 +4,14 @@
  * problems beside it, a labelled pick list, a status pill and a confirming
  * dialog. Every value is rendered as text by React, never as HTML.
  */
-import type { ReactNode } from "react";
+import { useEffect, useId, useRef, type ReactNode } from "react";
 import {
   Button as AriaButton,
-  Dialog,
   FieldError,
-  Heading,
   Input,
   Label,
   ListBox,
   ListBoxItem,
-  Modal,
-  ModalOverlay,
   Popover,
   Select,
   SelectValue,
@@ -147,10 +143,13 @@ export function StatePill(props: { readonly state: string }) {
 }
 
 /**
- * A dialog asking before something that can't be taken back lightly. Focus
- * moves into it and stays there until it closes; Escape cancels.
+ * A confirmation shown in the page, before something that can't be taken
+ * back lightly. Focus moves to it when it opens (its heading is announced);
+ * Tab reaches its buttons; Escape cancels. Not a modal: the rest of the page
+ * stays as it is (a modal's overlay and focus trap hide the page's own
+ * landmarks and skip link).
  */
-export function ConfirmDialog(props: {
+export function ConfirmPanel(props: {
   readonly isOpen: boolean;
   readonly title: string;
   readonly children: ReactNode;
@@ -161,39 +160,39 @@ export function ConfirmDialog(props: {
   readonly onConfirm: () => void;
   readonly onCancel: () => void;
 }) {
+  const id = useId();
+  const ref = useRef<HTMLElement>(null);
+  const { isOpen } = props;
+  useEffect(() => {
+    if (isOpen) ref.current?.focus();
+  }, [isOpen]);
+  if (!isOpen) return null;
   return (
-    <ModalOverlay
-      className={styles.overlay}
-      isOpen={props.isOpen}
-      isDismissable
-      onOpenChange={(open) => {
-        if (!open) props.onCancel();
+    <section
+      ref={ref}
+      tabIndex={-1}
+      className={styles.confirm}
+      aria-labelledby={id}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") props.onCancel();
       }}
     >
-      <Modal className={styles.modal}>
-        <Dialog role="alertdialog" className={styles.dialog}>
-          <Heading slot="title" className={styles.sectionTitle}>
-            {props.title}
-          </Heading>
-          {props.children}
-          <div className={styles.actions}>
-            <AriaButton
-              className={`${ui.button} ${props.danger === true ? styles.danger : ui.primary}`}
-              isDisabled={props.busy ?? false}
-              onPress={props.onConfirm}
-            >
-              {props.confirmLabel}
-            </AriaButton>
-            <AriaButton
-              className={`${ui.button} ${ui.secondary}`}
-              onPress={props.onCancel}
-              autoFocus
-            >
-              {props.cancelLabel ?? "Cancel"}
-            </AriaButton>
-          </div>
-        </Dialog>
-      </Modal>
-    </ModalOverlay>
+      <h2 id={id} className={styles.sectionTitle}>
+        {props.title}
+      </h2>
+      {props.children}
+      <div className={styles.actions}>
+        <AriaButton
+          className={`${ui.button} ${props.danger === true ? styles.danger : ui.primary}`}
+          isDisabled={props.busy ?? false}
+          onPress={props.onConfirm}
+        >
+          {props.confirmLabel}
+        </AriaButton>
+        <AriaButton className={`${ui.button} ${ui.secondary}`} onPress={props.onCancel}>
+          {props.cancelLabel ?? "Cancel"}
+        </AriaButton>
+      </div>
+    </section>
   );
 }
