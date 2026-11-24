@@ -24,7 +24,7 @@ import { issue, isPlainObject, type Validated } from "./issues.js";
 import { FORBIDDEN_KEYS, IssueList, readPlainData, shown, type JsonValue } from "./plain-data.js";
 import { types } from "node:util";
 import { isRecordId, newRecordId, type RecordId } from "./record-id.js";
-import { isOrganizationId, type OrganizationId } from "./organizations.js";
+import { isOrganizationId, isSiteId, type OrganizationId, type SiteId } from "./organizations.js";
 
 export const RECORD_KINDS = [
   "object",
@@ -53,6 +53,12 @@ interface RecordBase {
    * and the units a record is filed under or represents belong to the same one.
    */
   readonly organizationId: OrganizationId;
+  /**
+   * The record's home site (D-074): one site of its organization, whose
+   * people see and change it. Left out for a record on no site yet, which
+   * only system managers see. It can change (a move between sites).
+   */
+  readonly siteId?: SiteId;
   readonly title: string;
   /** ISO 8601 UTC timestamp, e.g. `2026-11-20T16:05:00.000Z`. */
   readonly createdAt: string;
@@ -154,6 +160,7 @@ const MEDIA_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]
 const COMMON_KEYS = [
   "id",
   "organizationId",
+  "siteId",
   "kind",
   "title",
   "templateKey",
@@ -226,6 +233,9 @@ function check(input: unknown): Validated<CatalogRecord> {
       "invalid_organization",
       "Every record belongs to one organization: organizationId must be an organization ID.",
     );
+  }
+  if (record.siteId !== undefined && !isSiteId(record.siteId)) {
+    issues.add(["siteId"], "invalid_site", "The home site must be a site ID.");
   }
   checkTitle(record.title, issues);
   if (record.templateKey !== undefined && !isTemplateKey(record.templateKey)) {

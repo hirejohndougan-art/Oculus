@@ -18,6 +18,8 @@ import {
   type Issue,
   type OrganizationId,
   type RecordId,
+  type SiteId,
+  type UserId,
   type Validated,
 } from "@oculus/core";
 import {
@@ -47,9 +49,15 @@ import {
   type RecordService,
   type ServiceResult,
 } from "./service.js";
+import { actorOf, grant, makeSite, people, type People } from "./people.fixtures.js";
 
-const ALICE = "user:3f1c2a9e-8b7d-4c6e-9a5b-1d2e3f4a5b6c";
-const BOB = "user:9b2e4c1a-7d3f-4e8a-b5c6-1a2b3c4d5e6f";
+// Alice and Bob are invented people who manage each test organization's
+// one site (T-041: every operation checks the actor's roles).
+let ALICE = "";
+let BOB = "";
+let folks: People | undefined;
+let alice: UserId | undefined;
+let bob: UserId | undefined;
 const NOW = new Date("2026-11-24T12:00:00.000Z");
 const INC = "http://rightsstatements.org/vocab/InC/1.0/";
 const BASE = "https://archive.example.org/records/";
@@ -119,7 +127,25 @@ async function ready(): Promise<void> {
   s = await setup;
   service = createService(s.writer, { now: () => NOW });
   service2 = createService(s.writer2, { now: () => NOW });
+  peopleReady ??= (async () => {
+    const holding = newOrganizationId();
+    ok(await insertOrganization(s.owner, { id: holding, name: "Invented Holding Society" }));
+    const made = await people(s.owner, holding);
+    return {
+      made,
+      alice: await made.member(holding, "Alice"),
+      bob: await made.member(holding, "Bob"),
+    };
+  })();
+  const p = await peopleReady;
+  folks = p.made;
+  alice = p.alice;
+  bob = p.bob;
+  ALICE = actorOf(alice);
+  BOB = actorOf(bob);
 }
+
+let peopleReady: Promise<{ made: People; alice: UserId; bob: UserId }> | undefined;
 
 afterAll(async () => {
   const done = await setup?.catch(() => undefined);
@@ -211,10 +237,23 @@ async function organization(): Promise<OrganizationId> {
       }),
     ),
   );
+  if (folks === undefined || alice === undefined || bob === undefined) throw new Error("not ready");
+  const site = await makeSite(service, folks.root, org);
+  for (const userId of [alice, bob]) {
+    await folks.member(org, userId === alice ? "Alice" : "Bob");
+    await grant(service, folks.root, org, { userId, role: "site_manager", siteId: site });
+  }
+  siteOf.set(org, site);
   return org;
 }
 
-const ctx = (organizationId: OrganizationId, actor = ALICE) => ({ organizationId, actor });
+/** Each organization's one site, where Alice and Bob work (D-074). */
+const siteOf = new Map<OrganizationId, SiteId>();
+
+const ctx = (organizationId: OrganizationId, actor = ALICE) => {
+  const siteId = siteOf.get(organizationId);
+  return { organizationId, actor, ...(siteId === undefined ? {} : { siteId }) };
+};
 
 function objectDraft(changes: Record<string, unknown> = {}): Record<string, unknown> {
   // A change to undefined leaves the field out.

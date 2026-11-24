@@ -16,6 +16,7 @@
  */
 import pg from "pg";
 import { isSql, type Sql } from "./sql.js";
+import { resolveConnection } from "./backup-connection.js";
 
 /** A row as `pg` returns it. */
 export type Row = object;
@@ -127,11 +128,19 @@ export interface ConnectionSettings {
 /** A connection URL (from the environment, never the repo) or settings. */
 export type ConnectionTarget = string | ConnectionSettings;
 
+/**
+ * The driver's settings for a target. A URL is never handed to the driver as
+ * `connectionString`: node-pg would connect without TLS when it has no
+ * `sslmode`, and without checking the certificate for `no-verify` or libpq's
+ * `require`, and would take keywords such as `options`. Every URL (migrations,
+ * cleanup, the app, as well as backups) goes through `resolveConnection`, so
+ * one rule holds everywhere (D-064, S-017): a socket or this machine may skip
+ * TLS; any other host always gets a verified certificate.
+ */
 export function clientConfig(target: ConnectionTarget): pg.ClientConfig {
   const common = { types: typeParsers, options: SESSION_OPTIONS };
-  return typeof target === "string"
-    ? { connectionString: target, ...common }
-    : { ...target, ...common };
+  const settings = typeof target === "string" ? resolveConnection(target).node : target;
+  return { ...settings, ...common };
 }
 
 /**
@@ -416,5 +425,8 @@ export function withDatabaseName(connectionString: string, name: string): string
   databaseIdentifier(name);
   const url = new URL(connectionString);
   url.pathname = `/${name}`;
+  // A `dbname` in the query would win over the path (libpq's rule, which
+  // resolveConnection follows), so it is dropped.
+  url.searchParams.delete("dbname");
   return url.toString();
 }

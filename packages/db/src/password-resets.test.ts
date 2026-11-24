@@ -14,7 +14,6 @@ import {
   hashSessionToken,
   newOrganizationId,
   newResetToken,
-  newSessionId,
   newSessionToken,
   newUserId,
   resetThrottleAccountKey,
@@ -62,6 +61,8 @@ import {
   runCleanup,
 } from "./sessions.js";
 import { sql, type Sql } from "./sql.js";
+import { giveTestFactor, testKeyring, type TestFactor } from "./second-factor.fixtures.js";
+import { completeSecondStep, resetSecondFactor, startEnrolment } from "./second-factor.js";
 import { freshDatabase, testServerUrl, type TestDatabase } from "./test-database.fixtures.js";
 
 // ---------------------------------------------------------------------------
@@ -73,6 +74,9 @@ const PASSWORD = "an invented passphrase for tests";
 const NEW_PASSWORD = "a different invented passphrase";
 
 let setup: Promise<{ testDb: TestDatabase; db: Database; admin: UserId }> | undefined;
+const keys = testKeyring();
+/** Each person's test factor (T-038); every full session uses up one recovery code. */
+const factors = new Map<UserId, TestFactor>();
 let db: Database;
 let admin: UserId;
 let testDb: TestDatabase;
@@ -88,7 +92,9 @@ async function ready(): Promise<void> {
       displayName: "Reset Admin",
       password: ADMIN_PASSWORD,
     });
-    return { testDb: t, db: d, admin: ok(made).userId };
+    const adminId = ok(made).userId;
+    factors.set(adminId, await giveTestFactor(d, keys, adminId));
+    return { testDb: t, db: d, admin: adminId };
   })();
   ({ db, admin, testDb } = await setup);
 }
@@ -144,9 +150,13 @@ async function organization(): Promise<OrganizationId> {
   return id;
 }
 
-/** A new person in `organizationId`. */
+/**
+ * A new person in `organizationId`, with a second factor in use (T-038),
+ * unless `withFactor` is false (they never set it up).
+ */
 async function member(
   organizationId: OrganizationId,
+  { withFactor = true }: { withFactor?: boolean } = {},
 ): Promise<{ userId: UserId; email: string; organizationId: OrganizationId }> {
   const address = email();
   const box: InvitationMessage[] = [];
@@ -165,6 +175,7 @@ async function member(
       password: PASSWORD,
     }),
   ).userId;
+  if (withFactor) factors.set(userId, await giveTestFactor(db, keys, userId));
   return { userId, email: address, organizationId };
 }
 
@@ -232,31 +243,57 @@ async function clearSignInCounter(address: string): Promise<void> {
 }
 
 /**
- * A full session made directly by the owner (its insert check off inside
- * this transaction only, back on ALWAYS before it commits, D-067): these
- * tests need sessions to exist, not the second step, which is T-038's.
- * `passwordAgo` dates the password entry back (for re-authentication).
+ * A full session through a real sign-in and a real second step (T-038): the
+ * password, then one of the person's test recovery codes, which
+ * `completeSecondStep` checks and the database binds to a pass (0014).
+ * `passwordAgo` then dates the sign-in back, as the owner (the change guards
+ * off inside that transaction only, back on ALWAYS before it commits), so
+ * the password wasn't entered recently.
  */
 async function fullSession(
   userId: UserId,
   organizationId: OrganizationId,
   passwordAgo = 0,
+  password?: string,
 ): Promise<string> {
-  const token = newSessionToken();
-  await db.transaction(async (q) => {
-    await q.execute(sql`ALTER TABLE public.sessions DISABLE TRIGGER sessions_check_new`);
-    await q.execute(sql`
-      INSERT INTO public.sessions (id, token_hash, user_id, organization_id, stage, signed_in_at,
-        created_at, last_seen_at, rotated_at, password_at, second_step_at, idle_seconds,
-        absolute_seconds, expires_at)
-      SELECT ${newSessionId()}::uuid, ${hashSessionToken(token)}, ${userId}::uuid,
-        ${organizationId}::uuid, 'full', t - make_interval(secs => ${passwordAgo}), t, t, t,
-        t - make_interval(secs => ${passwordAgo}), t, 14400, 43200,
-        t - make_interval(secs => ${passwordAgo}) + interval '12 hours'
-      FROM (SELECT clock_timestamp() AS t) c`);
-    await q.execute(sql`ALTER TABLE public.sessions ENABLE ALWAYS TRIGGER sessions_check_new`);
+  const users = await db.rows<{ email: string }>(sql`
+    SELECT email FROM public.users WHERE id = ${userId}::uuid`);
+  const address = users[0]?.email ?? "";
+  const started = await beginSession(db, {
+    email: address,
+    password: password ?? (address === ADMIN_EMAIL ? ADMIN_PASSWORD : PASSWORD),
+    source: source(),
+    organizationId,
   });
-  return token;
+  if (!started.ok) throw new Error(JSON.stringify(started));
+  const code = factors.get(userId)?.codes.pop();
+  if (code === undefined) throw new Error("no test recovery code left");
+  const r = await completeSecondStep(db, keys, started.token, {
+    recoveryCode: code,
+    source: source(),
+  });
+  if (!r.ok) throw new Error(JSON.stringify(r));
+  if (passwordAgo > 0) {
+    await db.transaction(async (q) => {
+      await q.execute(sql`ALTER TABLE public.sessions DISABLE TRIGGER sessions_check_change`);
+      await q.execute(sql`ALTER TABLE public.sessions DISABLE TRIGGER zzzz_sessions_keep_identity`);
+      await q.execute(sql`
+        UPDATE public.sessions SET
+          signed_in_at = signed_in_at - make_interval(secs => ${passwordAgo}),
+          created_at = created_at - make_interval(secs => ${passwordAgo}),
+          rotated_at = rotated_at - make_interval(secs => ${passwordAgo}),
+          password_at = password_at - make_interval(secs => ${passwordAgo}),
+          second_step_at = second_step_at - make_interval(secs => ${passwordAgo}),
+          expires_at = expires_at - make_interval(secs => ${passwordAgo}),
+          last_seen_at = last_seen_at - make_interval(secs => ${passwordAgo})
+        WHERE token_hash = ${hashSessionToken(r.token)}`);
+      await q.execute(sql`ALTER TABLE public.sessions ENABLE ALWAYS TRIGGER sessions_check_change`);
+      await q.execute(
+        sql`ALTER TABLE public.sessions ENABLE ALWAYS TRIGGER zzzz_sessions_keep_identity`,
+      );
+    });
+  }
+  return r.token;
 }
 
 /** A session waiting for its second step, through a real sign-in. */
@@ -1024,6 +1061,83 @@ describe("delivery and secrecy", () => {
       SELECT string_agg(row_to_json(r)::text, ' ') AS text FROM public.password_resets r
       WHERE user_id = ${person.userId}::uuid`);
     for (const t of tokens) expect(stored[0]?.text).not.toContain(t);
+  });
+});
+
+describe("accounts without a second factor in use (review L7)", () => {
+  it("get the same reply but no link from the sign-in page; a system admin can still send one", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org, { withFactor: false });
+    const r = await ask(person.email);
+    expect(r.reply).toBe(RESET_REQUESTED);
+    expect(r.outcome).toBe("needs_admin");
+    expect(r.messages).toEqual([]);
+    expect(await resetsOf(person.userId)).toEqual([]);
+    // The database refuses such a link from any writer too.
+    await expect(
+      db.execute(sql`
+        INSERT INTO public.password_resets (id, user_id, token_hash, created_at, expires_at)
+        SELECT gen_random_uuid(), ${person.userId}::uuid, ${hashResetToken(newResetToken())}, t,
+               t + interval '10 minutes' FROM (SELECT clock_timestamp() AS t) c`),
+    ).rejects.toMatchObject({ constraint: "password_resets_needs_factor" });
+    const session = await fullSession(admin, org);
+    const box = mailbox();
+    ok(await sendPasswordReset(db, session, person.userId, box.deliver));
+    ok(
+      await completePasswordReset(db, {
+        token: box.messages[0]?.token ?? "",
+        password: NEW_PASSWORD,
+      }),
+    );
+  });
+
+  it("after a system admin resets someone's two-step sign-in: old links die, new ones need an admin, and a reset keeps the enrolment token required", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const before = await linkFor(person.email);
+    const adminSession = await fullSession(admin, org);
+    const adminCode = factors.get(admin)?.codes.pop() ?? "";
+    const enrolment: string[] = [];
+    ok(
+      await resetSecondFactor(
+        db,
+        keys,
+        adminSession,
+        person.userId,
+        { recoveryCode: adminCode, source: source() },
+        (m) => {
+          enrolment.push(m.token);
+          return Promise.resolve();
+        },
+      ),
+    );
+    // The link sent before the reset died with the account's sessions.
+    expect(
+      await completePasswordReset(db, { token: before, password: NEW_PASSWORD }),
+    ).toMatchObject(INVALID);
+    await clearResetCounter(person.email);
+    expect((await ask(person.email)).outcome).toBe("needs_admin");
+    // An admin's link works, and the new password still leads only to set-up
+    // with the emailed enrolment token.
+    const box = mailbox();
+    ok(await sendPasswordReset(db, await fullSession(admin, org), person.userId, box.deliver));
+    ok(
+      await completePasswordReset(db, {
+        token: box.messages[0]?.token ?? "",
+        password: NEW_PASSWORD,
+      }),
+    );
+    const required = await db.rows<{ required: boolean }>(sql`
+      SELECT public.second_step_token_required(${person.userId}::uuid) AS required`);
+    expect(required).toEqual([{ required: true }]);
+    const waiting = await pendingSession(person, NEW_PASSWORD);
+    expect(await startEnrolment(db, keys, waiting)).toMatchObject({
+      ok: false,
+      code: "enrolment_token_required",
+    });
+    expect(enrolment).toHaveLength(1);
   });
 });
 

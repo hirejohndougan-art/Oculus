@@ -18,7 +18,10 @@
  * - `holds_identifiers`: it holds current or former numbers. Numbers are
  *   removed through the identifier save first, where dropping one is shown
  *   and confirmed (D-061: a number gone from every record is free again, also
- *   under `all_time`).
+ *   under `all_time`);
+ * - `has_role_grants`: roles are granted for this unit's subtree (D-072);
+ *   those grants are changed first (granting one locks the unit `FOR KEY
+ *   SHARE` through its foreign key, so it waits for or blocks a deletion).
  * Its term usages are removed in the same savepoint (`clearRecordTerms`).
  *
  * **Locking.** The record row is locked `FOR UPDATE` first. Every save that
@@ -170,6 +173,7 @@ export async function deleteRecord(
       scans: number;
       numbers: number;
       linkers: number;
+      grants: number;
     }>(sql`
       SELECT
         (SELECT count(*)::integer FROM public.records
@@ -181,7 +185,9 @@ export async function deleteRecord(
         (SELECT count(*)::integer FROM public.records r
          WHERE r.organization_id = ${org}::uuid AND r.id <> ${recordId}::uuid
            AND jsonb_path_exists(r.fields, '$.** ? (@.recordId == $id)',
-                                 jsonb_build_object('id', ${recordId}::text))) AS linkers`);
+                                 jsonb_build_object('id', ${recordId}::text))) AS linkers,
+        (SELECT count(*)::integer FROM public.role_assignments
+         WHERE ${where} AND scope_record_id = ${recordId}::uuid) AS grants`);
     const problems: Issue[] = [];
     if ((uses?.children ?? 0) > 0) {
       problems.push(
@@ -216,6 +222,15 @@ export async function deleteRecord(
           ["recordId"],
           "holds_identifiers",
           "This record holds identifiers (current or former). Remove them through the identifier save first.",
+        ),
+      );
+    }
+    if ((uses?.grants ?? 0) > 0) {
+      problems.push(
+        issue(
+          ["recordId"],
+          "has_role_grants",
+          "Roles are granted for this unit and what is below it. Change those grants first.",
         ),
       );
     }

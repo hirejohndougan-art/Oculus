@@ -7,7 +7,8 @@
  * writer role. The URL is never printed, since it may hold a password.
  */
 import { pathToFileURL } from "node:url";
-import { openDatabase } from "./client.js";
+import { ConnectionError } from "./backup-connection.js";
+import { openDatabase, type Database } from "./client.js";
 import { DATABASE_URL_VARIABLE } from "./migrate-cli.js";
 import { runCleanup } from "./sessions.js";
 
@@ -24,11 +25,21 @@ export async function runCleanupCli(
     );
     return 2;
   }
-  const db = openDatabase(connectionString, { max: 1, applicationName: "oculus-cleanup" });
+  let db: Database;
+  try {
+    db = openDatabase(connectionString, { max: 1, applicationName: "oculus-cleanup" });
+  } catch (error) {
+    // A URL refused before connecting (S-017): its message never shows a value.
+    if (error instanceof ConnectionError) {
+      err(`Cleanup refused (${error.code}): ${error.message}`);
+      return 2;
+    }
+    throw error;
+  }
   try {
     const done = await runCleanup(db);
     out(
-      `Done: ${String(done.sessions)} ended session(s) and ${String(done.signInThrottles)} old sign-in counter(s) deleted, and ${String(done.passwordResets)} old reset link(s).`,
+      `Done: ${String(done.sessions)} ended session(s) and ${String(done.signInThrottles)} old sign-in counter(s) deleted; ${String(done.secondStepThrottles)} old wrong-code counter(s) deleted; ${String(done.passwordResets)} old reset link(s) deleted.`,
     );
     return 0;
   } catch (error) {

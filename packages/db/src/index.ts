@@ -11,7 +11,9 @@
  * which records use them, all through core's validators; `search.ts` is
  * staff search (STAFF ONLY: never for a public site, D-066); `accounts.ts`
  * users, invitations and password sign-in (D-068); `sessions.ts` sessions
- * (D-069; promotion past the second step is internal, for T-038 only).
+ * (D-069; promotion past the second step is internal, for T-038 only);
+ * `permissions.ts` sites, role assignments, System settings and a person's
+ * access, read under locks (D-072).
  */
 export { sql, joinSql, isSql, Sql, MAX_PARAMETERS } from "./sql.js";
 export type { SqlScalar, SqlValue } from "./sql.js";
@@ -162,12 +164,43 @@ export type {
   Membership,
 } from "./accounts.js";
 export {
+  PERMISSION_TABLE_PRIVILEGES,
+  loadAccess,
+  lockPersonForRoleChange,
+  lockPeopleForRoleChange,
+  unitsHolding,
+  sitesSharedInto,
+  insertSite,
+  readSite,
+  renameSite,
+  sitesForPerson,
+  insertRoleAssignment,
+  readRoleAssignment,
+  deleteRoleAssignment,
+  listRoleAssignments,
+  isAssignmentCursor,
+  MAX_ASSIGNMENT_PAGE,
+  DEFAULT_ASSIGNMENT_PAGE,
+  isMember,
+  grantsScopedTo,
+  hasRecordsBelow,
+  readSystemSettings,
+  writeSystemSettings,
+} from "./permissions.js";
+export type {
+  RecordPosition,
+  SiteChoice,
+  RoleAssignment,
+  RoleAssignmentPage,
+  NewRoleAssignment,
+  StoredSystemSettings,
+} from "./permissions.js";
+export {
   beginSession,
   readPendingSession,
   resolveSession,
   rotateSession,
   switchOrganization,
-  reauthenticate,
   listSessions,
   endSession,
   endOwnSession,
@@ -212,3 +245,39 @@ export type {
   PromotionRefusal,
   CleanupResult,
 } from "./sessions.js";
+export {
+  completeSecondStep,
+  startEnrolment,
+  confirmEnrolment,
+  reauthenticate,
+  regenerateRecoveryCodes,
+  secondFactorStatus,
+  resetSecondFactor,
+  resealSecondFactorSecrets,
+  SecondStepDatabaseError,
+  SECOND_FACTOR_TABLE_PRIVILEGES,
+  DEFAULT_TOTP_ISSUER,
+  MAX_ENROLMENT_STARTS,
+  TOTP_CHAIN_LENGTH,
+  ENROLMENT_TOKEN_SECONDS,
+} from "./second-factor.js";
+export type {
+  SecondStepRefusal,
+  SecondStepInput,
+  EnrolmentStart,
+  EnrolmentOptions,
+  EnrolmentDone,
+  ReauthenticationInput,
+  SecondFactorStatus,
+  ResealResult,
+  EnrolmentMessage,
+  EnrolmentDelivery,
+} from "./second-factor.js";
+export {
+  loadSecretKeyring,
+  isSecretKeyring,
+  SecretKeyError,
+  SECRET_KEY_VARIABLE,
+  PREVIOUS_SECRET_KEYS_VARIABLE,
+} from "./secret-key.js";
+export type { SecretKeyring } from "./secret-key.js";

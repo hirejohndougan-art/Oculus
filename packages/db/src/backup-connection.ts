@@ -1,6 +1,8 @@
 /**
  * The one connection backup and restore use, given identically to the driver
- * and to pg_dump / pg_restore (D-064).
+ * and to pg_dump / pg_restore (D-064). Since S-017 every other URL-based
+ * connection (migrations, cleanup, the app's pool) is resolved here too, so
+ * the same TLS rule and the same accepted keywords hold everywhere.
  *
  * OCULUS_DATABASE_URL is parsed once, as libpq reads a URI. The result is
  * written two ways: a libpq service file and, for a password, a libpq
@@ -127,7 +129,7 @@ export function resolveConnection(
     if (!ACCEPTED.has(key)) {
       const shown = /^[a-z_]{1,40}$/.test(key) ? `"${key}"` : "a parameter";
       throw new ConnectionError(
-        `${URL_PROBLEM}: ${shown} in its query string is not accepted for backups (accepted: ${[...ACCEPTED].join(", ")}).`,
+        `${URL_PROBLEM}: ${shown} in its query string is not accepted (accepted: ${[...ACCEPTED].join(", ")}).`,
       );
     }
     set(key, eq < 0 ? "" : decode(part.slice(eq + 1)));
@@ -164,7 +166,7 @@ export function resolveConnection(
     sslmode = "disable";
   } else if (asked === "disable" || asked === "allow") {
     throw new ConnectionError(
-      `${URL_PROBLEM}: sslmode=${asked} to a host that is not this machine would send the password unencrypted; backups always use TLS there.`,
+      `${URL_PROBLEM}: sslmode=${asked} to a host that is not this machine would send the password unencrypted; Oculus always uses TLS there.`,
     );
   } else if (asked === "verify-ca") {
     const root = given.get("sslrootcert");

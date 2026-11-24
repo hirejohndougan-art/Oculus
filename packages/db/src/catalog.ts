@@ -49,6 +49,7 @@ import {
   type Issue,
   type Organization,
   type OrganizationId,
+  type SiteId,
   type RecordChangeKind,
   type RecordId,
   type RecordType,
@@ -359,6 +360,7 @@ function checkKeyAndVersion<T>(
 interface RecordRow {
   id: string;
   organization_id: string;
+  site_id: string | null;
   kind: string;
   template_key: string;
   record_type_key: string | null;
@@ -668,11 +670,11 @@ export async function insertRecord(
     if (used !== undefined) return refused(["id"], "id_used_before", ID_USED_BEFORE);
     await db.execute(sql`
       INSERT INTO public.records (
-        id, organization_id, kind, template_key, record_type_key, title,
+        id, organization_id, site_id, kind, template_key, record_type_key, title,
         level, parent_id, media_type, represents_id, agent_type, latitude, longitude,
         fields, created_at, updated_at, version
       ) VALUES (
-        ${r.id}::uuid, ${r.organizationId}::uuid, ${r.kind}, ${r.templateKey},
+        ${r.id}::uuid, ${r.organizationId}::uuid, ${r.siteId ?? null}::uuid, ${r.kind}, ${r.templateKey},
         ${r.recordTypeKey ?? null}, ${r.title},
         ${c.level}, ${c.parentId}::uuid, ${c.mediaType}, ${c.represents}::uuid, ${c.agentType},
         ${c.lat}::double precision, ${c.lng}::double precision,
@@ -751,6 +753,7 @@ export async function updateRecord(
   const result = await inSavepoint(db, "update", async (): Promise<Validated<RecordVersion>> => {
     const [row] = await db.rows<{ version: number }>(sql`
       UPDATE public.records SET
+        site_id = ${r.siteId ?? null}::uuid,
         kind = ${r.kind}, template_key = ${r.templateKey}, record_type_key = ${r.recordTypeKey ?? null},
         title = ${r.title}, level = ${c.level}, parent_id = ${c.parentId}::uuid,
         media_type = ${c.mediaType}, represents_id = ${c.represents}::uuid,
@@ -896,7 +899,8 @@ export async function readStoredRecord(
     return refused(["id"], "invalid_id", "The record ID must be a lowercase version 4 UUID.");
   }
   const [row] = await db.rows<RecordRow & { version: number }>(sql`
-    SELECT id::text AS id, organization_id::text AS organization_id, kind, template_key,
+    SELECT id::text AS id, organization_id::text AS organization_id, site_id::text AS site_id,
+           kind, template_key,
            record_type_key, title, level, parent_id::text AS parent_id, media_type,
            represents_id::text AS represents_id, agent_type, latitude, longitude, fields,
            to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
@@ -926,7 +930,8 @@ export async function readRecordsForChecks(
 ): Promise<Record<string, unknown>[]> {
   if (ids.length === 0) return [];
   const rows = await db.rows<RecordRow>(sql`
-    SELECT id::text AS id, organization_id::text AS organization_id, kind, template_key,
+    SELECT id::text AS id, organization_id::text AS organization_id, site_id::text AS site_id,
+           kind, template_key,
            record_type_key, title, level, parent_id::text AS parent_id, media_type,
            represents_id::text AS represents_id, agent_type, latitude, longitude, fields,
            to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
@@ -965,7 +970,8 @@ export async function readRecordClosure(
       CROSS JOIN LATERAL unnest(ARRAY[r.parent_id, r.represents_id]) AS next(id)
       WHERE next.id IS NOT NULL
     )
-    SELECT r.id::text AS id, r.organization_id::text AS organization_id, r.kind, r.template_key,
+    SELECT r.id::text AS id, r.organization_id::text AS organization_id,
+           r.site_id::text AS site_id, r.kind, r.template_key,
            r.record_type_key, r.title, r.level, r.parent_id::text AS parent_id, r.media_type,
            r.represents_id::text AS represents_id, r.agent_type, r.latitude, r.longitude, r.fields,
            to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at,
@@ -993,6 +999,7 @@ function recordFromRow(row: RecordRow): Record<string, unknown> {
     updatedAt: row.updated_at,
     fields: row.fields,
   };
+  if (row.site_id !== null) record.siteId = row.site_id;
   if (row.record_type_key !== null) record.recordTypeKey = row.record_type_key;
   if (row.level !== null) record.level = row.level;
   if (row.parent_id !== null) record.parentId = row.parent_id;
@@ -1014,6 +1021,10 @@ export interface RecordPlace {
   readonly kind: string;
   readonly parentId: RecordId | null;
   readonly level: string | null;
+  /** What a digital asset represents (T-041: where its permissions come from). */
+  readonly represents: RecordId | null;
+  /** The record's home site (D-074), or `null` for none. */
+  readonly siteId: SiteId | null;
 }
 
 /**
@@ -1034,8 +1045,12 @@ export async function readRecordPlace(
     kind: string;
     parent_id: string | null;
     level: string | null;
+    represents_id: string | null;
+    site_id: string | null;
   }>(sql`
-    SELECT version, kind, parent_id::text AS parent_id, level FROM public.records
+    SELECT version, kind, parent_id::text AS parent_id, level,
+           represents_id::text AS represents_id, site_id::text AS site_id
+    FROM public.records
     WHERE organization_id = ${organizationId}::uuid AND id = ${recordId}::uuid`);
   if (row === undefined) return undefined;
   return Object.freeze({
@@ -1043,6 +1058,8 @@ export async function readRecordPlace(
     kind: row.kind,
     parentId: row.parent_id as RecordId | null,
     level: row.level,
+    represents: row.represents_id as RecordId | null,
+    siteId: row.site_id as SiteId | null,
   });
 }
 
@@ -1055,26 +1072,43 @@ export async function readRecordPlace(
 export async function lockArrangement(
   db: Queryable,
   organizationId: OrganizationId,
+  mode: "exclusive" | "shared" = "exclusive",
 ): Promise<void> {
   if (!isOrganizationId(organizationId)) throw new TypeError(BAD_ORGANIZATION);
-  await db.execute(sql`SELECT public.arrangement_lock(${organizationId}::uuid)`);
+  // `shared` (0013): for checks that only read where records sit; they run
+  // side by side and wait for (and hold off) every exclusive holder, which
+  // is every move.
+  await db.execute(
+    mode === "shared"
+      ? sql`SELECT public.arrangement_lock_shared(${organizationId}::uuid)`
+      : sql`SELECT public.arrangement_lock(${organizationId}::uuid)`,
+  );
 }
 
 /**
- * Locks the organization's record row (`FOR NO KEY UPDATE`, as
- * `updateRecord` and the identifier save do) until the transaction ends, and
- * returns its version, or `undefined` if there is no such record.
+ * Locks the organization's record row until the transaction ends, and
+ * returns its version, or `undefined` if there is no such record. `FOR NO
+ * KEY UPDATE` by default, as `updateRecord` and the identifier save do;
+ * `update` (`FOR UPDATE`) for a deletion, as `deleteRecord` takes; `share`
+ * (`FOR SHARE`) for a read that must see the row as it stays until COMMIT.
  */
 export async function lockRecord(
   db: Queryable,
   organizationId: OrganizationId,
   recordId: RecordId,
+  mode: "no_key_update" | "update" | "share" = "no_key_update",
 ): Promise<number | undefined> {
   if (!isOrganizationId(organizationId) || !isRecordId(recordId)) return undefined;
-  const [row] = await db.rows<{ version: number }>(sql`
+  const where = sql`
     SELECT version FROM public.records
-    WHERE organization_id = ${organizationId}::uuid AND id = ${recordId}::uuid
-    FOR NO KEY UPDATE`);
+    WHERE organization_id = ${organizationId}::uuid AND id = ${recordId}::uuid`;
+  const [row] = await db.rows<{ version: number }>(
+    mode === "update"
+      ? sql`${where} FOR UPDATE`
+      : mode === "share"
+        ? sql`${where} FOR SHARE`
+        : sql`${where} FOR NO KEY UPDATE`,
+  );
   return row?.version;
 }
 

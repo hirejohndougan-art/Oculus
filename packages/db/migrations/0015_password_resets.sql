@@ -1,7 +1,7 @@
 -- Password reset tokens (T-039, D-052, D-068, D-069, D-078).
 --
--- Numbered 0015: main holds 0012, branch autopilot/T-041 holds 0013 and
--- branch autopilot/T-038 holds 0014. The runner allows gaps, never two files
+-- Numbered 0015, after T-041's 0013 and T-038's 0014 (whose second_factors
+-- table this uses). The runner allows gaps, never two files
 -- with one number.
 --
 -- A reset is a single-use link sent to the account's own address. Only the
@@ -23,7 +23,8 @@
 -- a token can't be reused, revived, extended or moved to another user, can't
 -- be used after it expired, and a new one can only be pending, made now, for
 -- an active account that can sign in, asked by the person (requested_by
--- NULL) or by an active system admin.
+-- NULL, only for an account with a second factor in use) or by an active
+-- system admin.
 
 CREATE TABLE public.password_resets (
   id uuid PRIMARY KEY
@@ -67,6 +68,17 @@ AS $$
         SELECT 1 FROM public.organization_members m WHERE m.user_id = u)))
 $$;
 
+-- Whether user u has a second factor in use (0014, T-038). A link the person
+-- asks for themselves needs one: otherwise a mailbox alone would give a new
+-- password and then the setting up of a new authenticator (D-078, review
+-- L7). A system admin's link doesn't (they decide).
+CREATE FUNCTION public.password_reset_has_factor(u uuid) RETURNS boolean
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+  SELECT EXISTS (SELECT 1 FROM public.second_factors f WHERE f.user_id = u AND f.state = 'active')
+$$;
+
 -- A new link: pending, made now (by the clock: never back- or
 -- forward-dated), for an account that can use it, asked by the person or by
 -- an active system admin. The user row is held FOR SHARE first, so a disable
@@ -88,6 +100,10 @@ BEGIN
   IF NOT public.password_reset_user_ok(NEW.user_id, NEW.created_at) THEN
     RAISE EXCEPTION 'That account can''t be sent a reset link.'
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'password_resets_user';
+  END IF;
+  IF NEW.requested_by IS NULL AND NOT public.password_reset_has_factor(NEW.user_id) THEN
+    RAISE EXCEPTION 'An account with no second factor in use gets a reset link only from a system admin.'
+      USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'password_resets_needs_factor';
   END IF;
   IF NEW.requested_by IS NOT NULL AND NOT EXISTS (
     SELECT 1 FROM public.users a

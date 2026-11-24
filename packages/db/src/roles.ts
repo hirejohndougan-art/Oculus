@@ -19,8 +19,10 @@
  * refuses a role holding anything more.
  */
 import { ACCOUNT_TABLE_PRIVILEGES } from "./accounts.js";
+import { PERMISSION_TABLE_PRIVILEGES } from "./permissions.js";
 import type { Queryable } from "./client.js";
 import { PASSWORD_RESET_TABLE_PRIVILEGES } from "./password-resets.js";
+import { SECOND_FACTOR_TABLE_PRIVILEGES } from "./second-factor.js";
 import { SESSION_TABLE_PRIVILEGES } from "./sessions.js";
 import { sql } from "./sql.js";
 
@@ -57,12 +59,21 @@ export const WRITER_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Ob
   // their `SELECT … FOR UPDATE`; DELETE when a sign-in succeeds and for the
   // cleanup). Nothing deletes users, invitations or memberships.
   ...ACCOUNT_TABLE_PRIVILEGES,
+  // Sites, role assignments and System settings (D-072): sites are made and
+  // renamed, never deleted; a role is granted by INSERT and revoked by
+  // DELETE, never changed in place; the one System settings row is made
+  // once and then updated.
+  ...PERMISSION_TABLE_PRIVILEGES,
   // Sessions (D-069): made at sign-in and on a change of organization,
   // refreshed, promoted and rotated, deleted at sign-out and by the cleanup.
   ...SESSION_TABLE_PRIVILEGES,
   // Password reset links (D-078): made, used and revoked, deleted by the
   // cleanup. Their counters are in sign_in_throttles (above).
   ...PASSWORD_RESET_TABLE_PRIVILEGES,
+  // Two-step sign-in (D-077): factors set up, moved and reset; passes and
+  // recovery codes written (codes also used and superseded); the wrong-code
+  // counters. Nothing deletes a factor, a pass or a recovery code.
+  ...SECOND_FACTOR_TABLE_PRIVILEGES,
 });
 
 /**

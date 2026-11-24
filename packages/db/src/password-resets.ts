@@ -113,6 +113,10 @@ export type PasswordResetDelivery = (
  * - `sent`: a link was stored and sent;
  * - `not_sent`: no account there can use one (none, disabled, no
  *   organization, or a malformed address);
+ * - `needs_admin`: the account has no second factor in use (never set up,
+ *   or reset by a system admin), so no link is sent: a mailbox alone must
+ *   not lead to a new password *and* a new authenticator. A system admin can
+ *   still `sendPasswordReset` (D-078, review L7);
  * - `delivery_failed`: stored, not sent, and revoked;
  * - `delivery_failed_may_be_pending`: not sent, and the revocation failed
  *   twice (the link was shown to nobody and expires within the hour);
@@ -123,6 +127,7 @@ export type PasswordResetDelivery = (
 export type ResetOutcome =
   | "sent"
   | "not_sent"
+  | "needs_admin"
   | "delivery_failed"
   | "delivery_failed_may_be_pending"
   | "busy"
@@ -327,7 +332,9 @@ async function revokePending(tx: Queryable, userId: string): Promise<void> {
  * the new one is made by the database's clock, so it is after any password
  * change or "end all" that committed before the lock. Returns its expiry,
  * or `undefined` if the account can't be sent one (no such account,
- * disabled, can't sign in, or changed meanwhile).
+ * disabled, can't sign in, or changed meanwhile), or `"needs_admin"` for a
+ * link the person asked for (`requestedBy` null) when the account has no
+ * second factor in use (D-078, review L7; the insert trigger refuses it too).
  */
 async function storeReset(
   tx: Queryable,
@@ -335,14 +342,15 @@ async function storeReset(
   tokenHash: Uint8Array,
   requestedBy: UserId | null,
   life: number,
-): Promise<{ resetId: string; expiresAt: string } | undefined> {
-  const users = await tx.rows<{ ok: boolean }>(sql`
-    SELECT public.password_reset_user_ok(id, clock_timestamp()) AS ok
+): Promise<{ resetId: string; expiresAt: string } | "needs_admin" | undefined> {
+  const users = await tx.rows<{ ok: boolean; factor: boolean }>(sql`
+    SELECT public.password_reset_user_ok(id, clock_timestamp()) AS ok,
+           public.password_reset_has_factor(id) AS factor
     FROM public.users WHERE id = ${userId}::uuid FOR NO KEY UPDATE`);
-  if (users[0]?.ok !== true) {
+  if (users[0]?.ok !== true || (requestedBy === null && !users[0].factor)) {
     // The same shape of work as a link being made (review L1).
     await revokePending(tx, NO_USER);
-    return undefined;
+    return users[0]?.ok === true ? "needs_admin" : undefined;
   }
   await revokePending(tx, userId);
   const made = await tx.rows<{ id: string; expires_at: string }>(sql`
@@ -511,7 +519,7 @@ async function sendToAddress(
   options: CheckedOptions,
 ): Promise<ResetOutcome> {
   const token = newResetToken();
-  let stored: { resetId: string; expiresAt: string } | undefined;
+  let stored: { resetId: string; expiresAt: string } | "needs_admin" | undefined;
   try {
     stored = await inTransaction(db, async (tx) => {
       const found = await tx.rows<{ id: UserId }>(sql`
@@ -530,6 +538,7 @@ async function sendToAddress(
     return "database_unavailable";
   }
   if (stored === undefined) return "not_sent";
+  if (stored === "needs_admin") return "needs_admin";
   return deliverStored(
     db,
     stored.resetId,
@@ -618,7 +627,7 @@ export async function sendPasswordReset(
           admin.userId,
           checked.life,
         );
-        if (made === undefined) {
+        if (made === undefined || made === "needs_admin") {
           return refused("account_changed", "That account changed just now. Try again.");
         }
         return { ok: true, value: { ...made, email: user.email } };

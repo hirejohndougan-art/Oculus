@@ -194,24 +194,28 @@ describe("hashPassword and verifyPassword", () => {
     const current = await hashPassword("a stored password here");
     const odd = await oldStyleHash("a stored password here", 11, 8, 1);
     const previous = await oldStyleHash("a stored password here", 12, 8, 1);
-    const time = async (check: () => Promise<unknown>): Promise<number> => {
-      const runs: number[] = [];
+    // Each sample times the baseline and the other check back to back, so a burst of load
+    // from other work on the machine hits both; the median of the per-pair ratios is compared.
+    // (Timing them in separate blocks failed on a busy two-core machine: 0.57 and 1.99.)
+    const ratioTo = async (check: () => Promise<unknown>): Promise<number> => {
+      const ratios: number[] = [];
       for (let i = 0; i < 9; i++) {
-        const t = performance.now();
+        const t0 = performance.now();
+        await verifyPassword("wrong", current);
+        const t1 = performance.now();
         await check();
-        runs.push(performance.now() - t);
+        const t2 = performance.now();
+        ratios.push((t2 - t1) / (t1 - t0));
       }
-      // Median of nine: five runs left the ratio at 0.57 on a busy two-core machine.
-      return runs.sort((x, y) => x - y)[4] ?? 0;
+      return ratios.sort((x, y) => x - y)[4] ?? 0;
     };
-    const base = await time(() => verifyPassword("wrong", current));
     for (const other of [
       () => verifyPassword("wrong", undefined),
       () => verifyPassword("wrong", odd),
       () => verifyPassword("a stored password here", odd),
       () => verifyPasswordAllowing("wrong", previous, WITH_PREVIOUS),
     ]) {
-      const ratio = (await time(other)) / base;
+      const ratio = await ratioTo(other);
       expect(ratio).toBeGreaterThan(0.6);
       expect(ratio).toBeLessThan(1.8);
     }

@@ -618,6 +618,65 @@ export {
   RESET_SOURCE_THROTTLE,
 } from "./password-reset.js";
 export {
+  hotp,
+  totpStep,
+  totpAt,
+  matchTotpStep,
+  normalizeTotpCode,
+  newTotpSecret,
+  encodeBase32,
+  decodeBase32,
+  otpauthUri,
+  newRecoveryCode,
+  formatRecoveryCode,
+  normalizeRecoveryCode,
+  isCanonicalRecoveryCode,
+  hashRecoveryCode,
+  TOTP_STEP_SECONDS,
+  TOTP_DIGITS,
+  TOTP_WINDOW_STEPS,
+  TOTP_SECRET_BYTES,
+  RECOVERY_CODE_COUNT,
+  SECOND_STEP_THROTTLE,
+  MAX_PENDING_CODE_FAILURES,
+} from "./totp.js";
+export type { OtpauthLabel } from "./totp.js";
+export {
+  CATALOG_PERMISSIONS,
+  ORGANIZATION_PERMISSIONS,
+  SITE_PERMISSIONS,
+  SYSTEM_PERMISSIONS,
+  BUILT_IN_ROLES,
+  ROLE_LABELS,
+  ROLE_PERMISSIONS,
+  WHOLE_CATALOG_ROLES,
+  isBuiltInRole,
+  isPermission,
+  permits,
+  holdsAnywhere,
+  holdsForWholeCatalog,
+  hasScopedGrants,
+  worksOnSite,
+} from "./permissions.js";
+export type {
+  CatalogPermission,
+  OrganizationPermission,
+  SitePermission,
+  SystemPermission,
+  RolePermission,
+  Permission,
+  BuiltInRole,
+  RoleGrant,
+  Access,
+  PermissionTarget,
+} from "./permissions.js";
+export {
+  DEFAULT_SYSTEM_SETTINGS,
+  SYSTEM_SETTING_BOUNDS,
+  validateSystemSettings,
+} from "./system-settings.js";
+export type { SystemSettings } from "./system-settings.js";
+export {
   WORKFLOW_STATES,
   WORKFLOW_ACTIONS,
   INITIAL_WORKFLOW_STATE,

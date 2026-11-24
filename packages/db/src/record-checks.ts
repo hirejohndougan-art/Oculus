@@ -65,6 +65,12 @@ export interface RecordCheckOptions {
    * the record's identifiers in the same transaction.
    */
   readonly identifierFields: boolean;
+  /**
+   * Records the person may not view (T-041, D-072): a link to one of them is
+   * checked as a link to a record that doesn't exist (`unknown_record`), so
+   * the answer never shows whether it exists or what kind it is.
+   */
+  readonly hiddenLinks?: ReadonlySet<RecordId>;
 }
 
 /**
@@ -169,7 +175,13 @@ export async function recordCheckIssues(
       FOR SHARE`);
     const types = await readIdentifierTypes(db, org);
     const identifier = types.ok ? makeIdentifierChecker(types.value, org) : types;
-    const links = makeRecordLinkChecker(others, org);
+    const hidden = options.hiddenLinks;
+    const links = makeRecordLinkChecker(
+      hidden === undefined || hidden.size === 0
+        ? others
+        : others.filter((r) => !hidden.has(r.id as RecordId)),
+      org,
+    );
     if (!identifier.ok || !links.ok) {
       // Without the checkers the fields can't be checked; say why, and go on
       // with every other check.

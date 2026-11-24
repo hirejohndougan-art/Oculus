@@ -2,6 +2,40 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 08:08 CT — manual (John: "continue on phase 2") — T-038 Two-step sign-in, required for all staff
+- Result: done
+- What changed: core `totp.ts` (RFC 6238, SHA-1, 6 digits, 30 s, ±1 step, no replay). Migration `0014_second_factors.sql` and `packages/db/src/second-factor.ts`: set-up at first sign-in from a waiting session, 10 single-use recovery codes stored hashed, the secret sealed with AES-256-GCM under a key from `OCULUS_SECRET_KEY` (HKDF; rotation with `OCULUS_SECRET_KEY_PREVIOUS`), throttling that can't lock anyone out (recovery codes always work; app codes wait at most 15 minutes; alerts recorded), promotion bound in the database to a pass that only someone holding the secret (an S/KEY-style hash chain) or a recovery code can make, re-entering the password needing a code too, admin reset with a one-time enrolment token required for every new set-up after it.
+- Decisions: D-077
+- Review: three independent rounds (lockout by a password holder; a chosen ratchet anchor; re-enrolment after a reset without the token; lock order; a cascading delete and clock order dropping the token requirement); all fixed with tests.
+- Gate: PASS · tests_passing 3806 (was 3745) · npm audit clean
+- Next: T-039 password reset (final piece), T-042 API (fixing review findings)
+
+## 2026-11-24 05:51 CT — security — S-017 Migrations, cleanup and the app pool connected without verified TLS
+- Result: done (findings; most serious fixed)
+- Security: `npm audit` 0 vulnerabilities. Secret scan of the whole tree and every commit since the last security run (`8b3d556..944e16b`, 282 commits; keys, tokens, private keys, JWTs, `.env`, URL credentials, emails, phone numbers): nothing; only obvious fakes in tests. All commit authors are `noreply@anthropic.com`. No private data about real people. Dependabot and code-scanning alerts: 403 (not reachable); no open Dependabot pull requests. Code review of every commit in the range by three independent reviewers (HTTP layer and sign-in; service, roles and workflow; public boundary and database layer), two findings confirmed with tests: **medium** S-017 (fixed here); **medium** S-018 anyone can keep the only system admin throttled indefinitely (confirmed); **medium** S-019 `readPublicRecord` ignores sites and needs a role that can read staff data; **low** S-020 to S-025 (inherited values published past the publisher's scope, identifier existence oracle across sites, no database guard on who grants roles, `catalog.definitions` unenforced and organization-wide, case-folded duplicate-cookie denial of service, XML not treated as active content). All added to ROADMAP as `(risky)` at the top of Phase 2. Nothing private reaches `publicOutput`; the `sql` tag, cross-organization filters, sessions, CSRF, invitations and backup file handling held up.
+- What changed: `clientConfig` no longer hands `OCULUS_DATABASE_URL` to node-pg (which used no TLS to a remote host without `sslmode`, and no certificate check for `no-verify` or libpq-compatible `require`); every URL goes through backup's `resolveConnection`, so a remote host always gets a verified certificate. `db:cleanup` reports a refused URL as `bad_url` (exit 2) without its value; `withDatabaseName` drops a query `dbname`. Attack tests in `client-tls.attacks.test.ts` (all fail without the fix), including a fake server refusing TLS that never receives the startup message or password. Commits fa86cba, 39ffeb6. Behaviour change for operators: the URL must name user, host and database and use only the listed keywords (README, D-064).
+- Decisions: D-064 amendment
+- Review: one independent review of the diff: safe; its points (a query `dbname` overriding `withDatabaseName`, docs naming the backup-only rule) fixed; the downgrade test binds 127.0.0.2, which macOS lacks by default (Linux and CI fine).
+- Sources: PostgreSQL 16 libpq SSL support (sslmode table); pg-connection-string 2.x README; OWASP ASVS 4.0.3 V2.2.1, V4.1, V9.2.2.
+- Gate: PASS · tests_passing 3755 (was 3745) · npm audit clean
+- Next: S-018 admin lockout (coordinate with the manual session's T-038/T-039), then S-019 before T-050; build order otherwise unchanged
+
+## 2026-11-24 04:07 CT — manual (John: "continue on phase 2") — T-041 Roles and collection-level permissions
+- Result: done
+- What changed: migration `0013_roles.sql`: `sites`, `role_assignments` (one built-in role per member, per site or every site, optionally scoped to an archival unit's subtree), `system_settings`, `records.site_id`. Core `permissions.ts` (fixed roles and permissions; system permissions only from `system_admin`) and `system-settings.ts`. Service checks every operation inside its own transaction (user row, then arrangement lock, then record row), roles reach only their site's records (D-074), no-site records only system managers, new records join the working site, moves between sites need both, same-site filing and scans, publishing needs `records.publish` through T-034's hook, grants and revokes by site managers below themselves, session limits read from System settings. Invisible and missing records answer identically everywhere.
+- Decisions: D-072 (John: only site managers delete; read-only users don't see old versions), D-074 amendment (accepted one-bit signals)
+- Review: three independent rounds (an asset slipping out of scope between check and write; grant/revoke deadlocks; link and scope existence oracles; a scope grant blocking another site's deletions; restores dropping the home site; cross-site filing); all fixed with tests.
+- Gate: PASS · tests_passing 3745 (was 3690) · npm audit clean. The password timing test now times each check right after its baseline, so load hits both.
+- Next: T-038 two-step sign-in (second review running), T-039 password reset (fixing review findings)
+
+## 2026-11-24 03:27 CT — upkeep — Dependency update: typescript-eslint 8.74.0
+- Result: done
+- What changed: `npm outdated` showed one in-major update, typescript-eslint 8.73.0 → 8.74.0 (released 2026-11-23); bumped in package.json and the lockfile. TypeScript 7 and Vite 8 stay on T-001b (typescript-eslint still requires TypeScript `<6.1`; note added there).
+- Decisions: none
+- Review: n/a (dev dependency bump within a major)
+- Gate: PASS · tests_passing 3690 (was 3690) · npm audit clean
+- Next: T-041 roles and T-038 two-step sign-in (claimed by the manual session); otherwise the next unclaimed build task
+
 ## 2026-11-24 02:41 CT — manual (John: "continue on phase 2") — T-034b, T-034c Stored workflow state; public output reads what is published
 - Result: done
 - What changed: migration `0012_workflow_states.sql`: `records.workflow_state` (D-075's four states), workflow actions as versions (history shows who published or withdrew, when and why), the database refusing any state change without a valid workflow version, a publish that also changes content, a record starting published, and deleting a published record. Service `submitForReview`, `returnToDraft`, `publish`, `withdraw` with the publish check in the same transaction; edits, restores and identifier saves of a published record must still pass it; a `mayChangePublicOutput` hook that T-041 fills with `records.publish`. `readPublicRecord` builds public output from one Repeatable Read snapshot; unpublished, missing and other organizations' records answer identically; unpublished links and places show nothing.
