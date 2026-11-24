@@ -5,7 +5,8 @@
  * its version, `record-versions.ts`; comparing and restoring versions,
  * `record-restore.ts`), `identifiers.ts` the
  * identifier tables and `vocabularies.ts` the stored terms and the index of
- * which records use them, all through core's validators.
+ * which records use them, all through core's validators; `search.ts` is
+ * staff search (STAFF ONLY: never for a public site, D-066).
  */
 export { sql, joinSql, isSql, Sql, MAX_PARAMETERS } from "./sql.js";
 export type { SqlScalar, SqlValue } from "./sql.js";
@@ -96,3 +97,10 @@ export type {
   TermUsers,
   StaleRecords,
 } from "./vocabularies.js";
+export {
+  searchRecords,
+  MAX_SEARCH_QUERY_LENGTH,
+  DEFAULT_SEARCH_LIMIT,
+  MAX_SEARCH_LIMIT,
+} from "./search.js";
+export type { SearchHit, SearchResults, SearchOptions, MatchedBy } from "./search.js";
