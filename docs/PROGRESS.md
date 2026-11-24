@@ -2,6 +2,13 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 14:27 CT — manual (John: "continue building") — S-027 Review of the S-020 lock order
+- Result: done (review only)
+- What changed: nothing in code. An independent review of ca063e3 checked every edit and publish path against the below → record → above order, pinned seven race variants on two pools (all refused `inherits_from_hidden`), and ran 20 rounds of mixed concurrent operations without a deadlock. The one deadlock found (a system manager's invalid loop move against an edit below) is retried and refused. Cost on large fonds filed as S-028.
+- Decisions: none
+- Gate: PASS · tests_passing 3961 · npm audit clean (reviewer's run on main)
+- Next: T-045 admin sign-in and frame (building)
+
 ## 2026-11-24 12:06 CT — manual (John: "finish the 3 in progress and the security ones and stop") — S-018 to S-025 Security findings
 - Result: done
 - What changed: S-018 an address that signed in successfully in the last 30 days keeps its own counter, so strangers can't keep a person (the only system admin) out; re-entry has its own counter (migration 0016). S-019 public output by site only, through `public_record_snapshot` and a public reader role with no table privileges and its own connection check (migration 0017, D-080). S-020 publishing and edits refuse values from records the actor can't see, by (field, source) pairs and over published descendants, with locks below → record → above. S-021 identical clash replies. S-022 a database trigger mirrors who may grant roles (migration 0018). S-024 cookie duplicates by exact name. S-025 more active content types refused.
