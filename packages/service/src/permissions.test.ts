@@ -6,6 +6,7 @@
 // database's own guards. Every person, site and record here is invented.
 import { afterAll, describe, expect, it } from "vitest";
 import {
+  ROLE_PERMISSIONS,
   newOrganizationId,
   newRecordId,
   newSiteId,
@@ -1347,6 +1348,8 @@ describe("the database backs the rules up", () => {
       WHERE NOT t.tgisinternal AND c.relname IN ('sites', 'role_assignments', 'system_settings')
       ORDER BY 1, 2`);
     expect(rows.map((r) => `${r.relname}.${r.tgname}`)).toEqual([
+      // 0018 (S-022): who may grant.
+      "role_assignments.role_assignments_check_grant",
       "role_assignments.role_assignments_check_new",
       "role_assignments.zzzz_role_assignments_keep_identity",
       "sites.zzzz_sites_keep_identity",
@@ -1361,6 +1364,9 @@ describe("the database backs the rules up", () => {
         sql`UPDATE public.sites SET id = ${newSiteId()}::uuid WHERE organization_id = ${w.a}::uuid AND id = ${w.a1}::uuid`,
         sql`INSERT INTO public.role_assignments (organization_id, id, user_id, role, scope_record_id, granted_by)
             VALUES (${w.a}::uuid, ${newRecordId()}::uuid, ${w.none}::uuid, 'cataloger', ${w.o.id}::uuid, ${folks.root}::uuid)`,
+        // S-022: a grant recorded as made by a cataloger.
+        sql`INSERT INTO public.role_assignments (organization_id, id, user_id, role, site_id, granted_by)
+            VALUES (${w.a}::uuid, ${newRecordId()}::uuid, ${w.none}::uuid, 'cataloger', ${w.a1}::uuid, ${w.byRole.cataloger}::uuid)`,
       ]) {
         let code = "not refused";
         try {
@@ -1415,6 +1421,82 @@ async function within<T>(promise: Promise<T>, ms: number): Promise<T> {
 
 const rowOf = (org: OrganizationId, id: RecordId) =>
   sql`SELECT 1 FROM public.records WHERE organization_id = ${org}::uuid AND id = ${id}::uuid FOR UPDATE`;
+
+describe("the database backs up who may grant a role (S-022)", () => {
+  it("refuses, for any writer, a grant by someone who may not make it, or scoped to another site's unit", async () => {
+    await ready();
+    const w = await world();
+    const refusedAs = async (values: {
+      by: string;
+      role?: string;
+      site?: string | null;
+      scope?: string | null;
+    }) => {
+      try {
+        await s.writer.execute(sql`
+          INSERT INTO public.role_assignments
+            (organization_id, id, user_id, role, site_id, scope_record_id, granted_by)
+          VALUES (${w.a}::uuid, ${newRecordId()}::uuid, ${w.none}::uuid,
+                  ${values.role ?? "read_only"}, ${values.site === undefined ? w.a1 : values.site}::uuid,
+                  ${values.scope ?? null}::uuid, ${values.by}::uuid)`);
+      } catch (error) {
+        const e = error as { code?: string; constraint?: string };
+        return `${e.code ?? ""}:${e.constraint ?? ""}`;
+      }
+      // Leave nothing behind for the next case.
+      await s.owner.execute(sql`
+        DELETE FROM public.role_assignments
+        WHERE organization_id = ${w.a}::uuid AND user_id = ${w.none}::uuid`);
+      return "allowed";
+    };
+    const byGrant = "23000:role_assignments_granted_by";
+    const manager = w.byRole.site_manager;
+    // The attack: a writer records a grant "by" people who can't make it.
+    expect(await refusedAs({ by: w.byRole.cataloger })).toBe(byGrant);
+    expect(await refusedAs({ by: w.byRole.reviewer })).toBe(byGrant);
+    expect(await refusedAs({ by: w.none })).toBe(byGrant);
+    expect(await refusedAs({ by: w.stranger })).toBe(byGrant);
+    // A1's site manager: not on A2, not every site, not a site manager.
+    expect(await refusedAs({ by: manager, site: w.a2 })).toBe(byGrant);
+    expect(await refusedAs({ by: manager, site: null })).toBe(byGrant);
+    expect(await refusedAs({ by: manager, role: "site_manager" })).toBe(byGrant);
+    // A site manager scoped to a unit is no site manager (the table refuses
+    // that grant anyway), and one on every site may grant on A2.
+    const everywhere = await personWith(w, "every-site-manager", [
+      { role: "site_manager", siteId: null },
+    ]);
+    expect(await refusedAs({ by: everywhere, site: w.a2 })).toBe("allowed");
+    expect(await refusedAs({ by: everywhere, role: "site_manager" })).toBe(byGrant);
+    // What may be granted, is.
+    expect(await refusedAs({ by: manager })).toBe("allowed");
+    expect(await refusedAs({ by: manager, scope: w.f1.id })).toBe("allowed");
+    expect(await refusedAs({ by: folks.root, role: "site_manager", site: null })).toBe("allowed");
+    // A unit of another site, for anyone, even a system manager.
+    expect(await refusedAs({ by: folks.root, site: w.a2, scope: w.f1.id })).toBe(
+      "23000:role_assignments_scope_site",
+    );
+    expect(await refusedAs({ by: manager, scope: w.f1.id, site: w.a1 })).toBe("allowed");
+    // A disabled site manager grants nothing.
+    const gone = await personWith(w, "disabled-manager", [{ role: "site_manager" }]);
+    expect(await refusedAs({ by: gone })).toBe("allowed");
+    await s.owner.execute(
+      sql`UPDATE public.users SET disabled_at = clock_timestamp() WHERE id = ${gone}::uuid`,
+    );
+    expect(await refusedAs({ by: gone })).toBe(byGrant);
+    // Fires in replica mode too.
+    const [row] = await s.owner.rows<{ n: number }>(sql`
+      SELECT count(*)::integer AS n FROM pg_catalog.pg_trigger
+      WHERE tgname = 'role_assignments_check_grant' AND tgenabled = 'A'`);
+    expect(row?.n).toBe(1);
+  }, 60_000);
+
+  it("knows the same roles hold site.people as core does", () => {
+    const holders = Object.entries(ROLE_PERMISSIONS)
+      .filter(([, permissions]) => (permissions as readonly string[]).includes("site.people"))
+      .map(([role]) => role);
+    expect(holders).toEqual(["site_manager"]);
+  });
+});
 
 describe("a digital asset can't move between the check and the write", () => {
   it("saveIdentifiers after the owner moved the scan out of the collection: refused, nothing written", async () => {
