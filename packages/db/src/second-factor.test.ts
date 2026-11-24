@@ -883,6 +883,51 @@ describe("after a reset, only the emailed token lets anyone set up again (second
     expect((await startEnrolment(db, keys, p.token, { enrolmentToken: token })).ok).toBe(true);
   });
 
+  it("isn't lifted by deleting the reset's pass", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    await resetBy(person.userId, org);
+    const required = async () =>
+      (
+        await db.rows<{ r: boolean }>(sql`
+          SELECT public.second_step_token_required(${person.userId}::uuid) AS r`)
+      )[0]?.r;
+    expect(await required()).toBe(true);
+    // As the owner (the writer has no DELETE): the pass goes, the token stays.
+    await db.execute(sql`DELETE FROM public.second_step_passes
+      WHERE purpose = 'admin_reset' AND target_user_id = ${person.userId}::uuid`);
+    expect(await required()).toBe(true);
+    const p = await pending(person.userId, org);
+    expect(await startEnrolment(db, keys, p.token)).toMatchObject({
+      code: "enrolment_token_required",
+    });
+  });
+
+  it("isn't lifted by a clock that stepped back (order, not time)", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    // The factor was confirmed while the clock was an hour ahead; then the
+    // clock stepped back and an admin reset the person.
+    await db.transaction(async (q) => {
+      await q.execute(
+        sql`ALTER TABLE public.second_factors DISABLE TRIGGER second_factors_check_change`,
+      );
+      await q.execute(sql`UPDATE public.second_factors SET confirmed_at = now() + interval '1 hour'
+        WHERE user_id = ${person.userId}::uuid AND state = 'active'`);
+      await q.execute(
+        sql`ALTER TABLE public.second_factors ENABLE ALWAYS TRIGGER second_factors_check_change`,
+      );
+    });
+    const token = await resetBy(person.userId, org);
+    const p = await pending(person.userId, org);
+    expect(await startEnrolment(db, keys, p.token)).toMatchObject({
+      code: "enrolment_token_required",
+    });
+    expect((await startEnrolment(db, keys, p.token, { enrolmentToken: token })).ok).toBe(true);
+  });
+
   it("and a second reset replaces the first token", async () => {
     await ready();
     const org = await organization();
@@ -1092,11 +1137,16 @@ describe("a lost race isn't a wrong code", () => {
       // is held until both are waiting on it.
       let release: () => void = () => undefined;
       const held = new Promise<void>((r) => (release = r));
+      let locked: () => void = () => undefined;
+      const taken = new Promise<void>((r) => (locked = r));
       const holding = holder.transaction(async (tx) => {
         await tx.rows(sql`SELECT 1 FROM public.second_factors
           WHERE user_id = ${person.userId}::uuid AND state = 'active' FOR UPDATE`);
+        locked();
         await held;
       });
+      // The holder has the row before either racer starts.
+      await taken;
       const racing = Promise.all([
         completeSecondStep(db, keys, a.token, { source: source(), code }),
         completeSecondStep(other, keys, b.token, { source: source(), code }),

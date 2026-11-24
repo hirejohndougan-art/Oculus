@@ -68,6 +68,9 @@ CREATE TABLE public.second_factors (
   enrol_session_id uuid NOT NULL,
   created_at timestamptz NOT NULL,
   confirmed_at timestamptz,
+  -- When it was confirmed, in second_step_order (below): compared with
+  -- enrolment tokens' order, never by the clock.
+  confirmed_order bigint,
   confirmed_xact xid8,
   revoked_at timestamptz,
   -- The system admin's second step that reset it (NULL for a set-up
@@ -190,8 +193,15 @@ CREATE INDEX second_step_alerts_user ON public.second_step_alerts (user_id, crea
 CREATE TABLE public.second_step_enrolment_tokens (
   user_id uuid NOT NULL REFERENCES public.users (id) ON DELETE CASCADE,
   token_hash bytea PRIMARY KEY CHECK (octet_length(token_hash) = 32),
-  created_by_pass uuid NOT NULL REFERENCES public.second_step_passes (id) ON DELETE CASCADE,
+  -- The system admin's admin_reset pass that made it. Checked by the insert
+  -- trigger; no foreign key, so deleting that pass (or, by cascade, that
+  -- admin's account) can't take the token, and so the requirement, away.
+  created_by_pass uuid NOT NULL,
   created_at timestamptz NOT NULL,
+  -- Its place in second_step_order: "newest" and "confirmed since" are
+  -- decided by this, never by the clock (a clock stepping back can't drop
+  -- the requirement), and pg_dump keeps the sequence.
+  order_no bigint NOT NULL,
   expires_at timestamptz NOT NULL,
   -- First and latest presentation, and the latest one's transaction.
   used_at timestamptz,
@@ -204,6 +214,19 @@ CREATE TABLE public.second_step_enrolment_tokens (
 
 CREATE INDEX second_step_enrolment_tokens_user ON public.second_step_enrolment_tokens (user_id);
 
+-- One increasing order for enrolment tokens and confirmations, taken only
+-- by the triggers through this function (it runs as the owner, so the
+-- writer role needs no privilege on the sequence; calling it directly only
+-- skips numbers).
+CREATE SEQUENCE public.second_step_order AS bigint;
+
+CREATE FUNCTION public.second_step_next_order() RETURNS bigint
+LANGUAGE sql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+  SELECT nextval('public.second_step_order'::regclass)
+$$;
+
 -- Whether person u must present an enrolment token to set up: a system
 -- admin has reset them (every reset makes a token) and no factor has been
 -- confirmed since the latest one.
@@ -215,7 +238,7 @@ AS $$
     SELECT 1 FROM public.second_step_enrolment_tokens t
     WHERE t.user_id = u
       AND NOT EXISTS (SELECT 1 FROM public.second_factors c
-                      WHERE c.user_id = u AND c.confirmed_at > t.created_at))
+                      WHERE c.user_id = u AND c.confirmed_order > t.order_no))
 $$;
 
 -- Whether person u's valid token was presented in this transaction (the
@@ -263,6 +286,7 @@ AS $$
 BEGIN
   IF NOT (NEW.state = 'pending' AND NEW.ratchet_generation = 0 AND NEW.last_step = -1
           AND NEW.confirmed_at IS NULL AND NEW.confirmed_xact IS NULL
+          AND NEW.confirmed_order IS NULL
           AND NEW.revoked_at IS NULL AND NEW.revoked_by_pass IS NULL) THEN
     RAISE EXCEPTION 'A new second factor starts pending, with its ratchet at the start.'
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'second_factors_new';
@@ -320,6 +344,7 @@ BEGIN
   END IF;
   IF NEW.confirmed_at IS DISTINCT FROM OLD.confirmed_at
      OR NEW.confirmed_xact IS DISTINCT FROM OLD.confirmed_xact
+     OR NEW.confirmed_order IS DISTINCT FROM OLD.confirmed_order
      OR NEW.revoked_at IS DISTINCT FROM OLD.revoked_at THEN
     RAISE EXCEPTION 'A second factor''s confirmation and revocation are stamped by the database.'
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'second_factors_stamps';
@@ -345,6 +370,7 @@ BEGIN
     IF OLD.state = 'pending' AND NEW.state = 'active' AND moved THEN
       NEW.confirmed_at := clock_timestamp();
       NEW.confirmed_xact := pg_current_xact_id();
+      NEW.confirmed_order := public.second_step_next_order();
     ELSIF OLD.state = 'pending' AND NEW.state = 'revoked' AND NEW.revoked_by_pass IS NULL
           AND NOT moved
           AND (NOT public.second_step_token_required(OLD.user_id)
@@ -613,6 +639,7 @@ BEGIN
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'second_step_enrolment_tokens_new';
   END IF;
   NEW.created_at := clock_timestamp();
+  NEW.order_no := public.second_step_next_order();
   IF NOT EXISTS (
       SELECT 1 FROM public.second_step_passes p JOIN public.users a ON a.id = p.user_id
       WHERE p.id = NEW.created_by_pass AND p.purpose = 'admin_reset'
@@ -642,9 +669,9 @@ BEGIN
           AND (sha256(convert_to(NEW.presented, 'UTF8')) = OLD.token_hash) IS TRUE
           AND NEW.expires_at = OLD.expires_at
           AND NOT EXISTS (SELECT 1 FROM public.second_step_enrolment_tokens n
-                          WHERE n.user_id = OLD.user_id AND n.created_at > OLD.created_at)
+                          WHERE n.user_id = OLD.user_id AND n.order_no > OLD.order_no)
           AND NOT EXISTS (SELECT 1 FROM public.second_factors c
-                          WHERE c.user_id = OLD.user_id AND c.confirmed_at > OLD.created_at)) THEN
+                          WHERE c.user_id = OLD.user_id AND c.confirmed_order > OLD.order_no)) THEN
     RAISE EXCEPTION 'An enrolment token is presented, before it expires, until a factor is confirmed.'
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'second_step_enrolment_tokens_use';
   END IF;
@@ -663,7 +690,7 @@ CREATE TRIGGER second_step_enrolment_tokens_check_change BEFORE UPDATE
 CREATE TRIGGER zzzz_second_step_enrolment_tokens_keep_identity BEFORE UPDATE
   ON public.second_step_enrolment_tokens
   FOR EACH ROW EXECUTE FUNCTION public.catalog_keep_identity(
-    'user_id', 'token_hash', 'created_by_pass', 'created_at');
+    'user_id', 'token_hash', 'created_by_pass', 'created_at', 'order_no');
 
 -- ---------------------------------------------------------------------------
 -- Sessions: promotion, the switch copy and re-entering the password are tied

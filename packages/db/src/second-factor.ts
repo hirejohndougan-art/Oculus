@@ -690,7 +690,7 @@ export interface EnrolmentStart {
 export interface EnrolmentOptions extends SessionCallOptions {
   /** Shown in the app as the issuer (no `:`): "Oculus" by default. */
   readonly issuer?: string;
-  /** After a system admin's reset: the one-time token from the link sent to the person. */
+  /** After a system admin's reset: the token from the link sent to the person, on every start until a factor is confirmed. */
   readonly enrolmentToken?: string;
 }
 
@@ -701,8 +701,10 @@ export interface EnrolmentOptions extends SessionCallOptions {
  * once as base32 text and an `otpauth://` link. Starting again replaces an
  * unconfirmed one (at most `MAX_ENROLMENT_STARTS` per waiting session).
  * Refuses with `already_enrolled` if a factor is in use, and with
- * `enrolment_token_required` after a system admin's reset unless the
- * one-time token sent to the person is given (once per waiting session).
+ * `enrolment_token_required` after a system admin's reset unless the token
+ * sent to the person is given: **on every start**, until a factor is
+ * confirmed or the token expires (the newest token only). Every refusal is
+ * decided by one read before the chain is computed.
  */
 export async function startEnrolment(
   db: Database,
@@ -816,9 +818,9 @@ async function enrolmentRefusal(
                AND t.token_hash = sha256(convert_to(${presented ?? ""}, 'UTF8'))
                AND t.expires_at > clock_timestamp()
                AND NOT EXISTS (SELECT 1 FROM public.second_step_enrolment_tokens n
-                               WHERE n.user_id = t.user_id AND n.created_at > t.created_at)
+                               WHERE n.user_id = t.user_id AND n.order_no > t.order_no)
                AND NOT EXISTS (SELECT 1 FROM public.second_factors c
-                               WHERE c.user_id = t.user_id AND c.confirmed_at > t.created_at))
+                               WHERE c.user_id = t.user_id AND c.confirmed_order > t.order_no))
              AS valid`);
   const row = rows[0];
   if (row?.state === "active") return ALREADY_ENROLLED;
