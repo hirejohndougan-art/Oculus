@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 00:39 CT — build — T-034a Workflow states in core
+- Result: done
+- What changed: T-034 split into T-034a to T-034e (parent `[~]`). New `packages/core/src/workflow.ts`: the four states (draft, ready for review, published, withdrawn; new records start as draft; only published is public), four actions (`submit_for_review`, `return_to_draft`, `publish`, `withdraw`) and the allowed moves (`workflowTransition`, `applyWorkflowAction`, `workflowMoves`); a published record leaves the public only by withdrawing; `changesPublicOutput` marks the two actions that need the publish permission. T-035 now carries the approval-step narrowing. Main moved during the run (T-044, U-005 by a manual session), so the work was rebased and the gate re-run.
+- Decisions: D-075 (numbered past D-072, which the manual session's log skips, to avoid a collision)
+- Review: one independent round, safe; two minor points fixed (labels for non-states, the T-035 note).
+- Gate: PASS · tests_passing 3605 (was 3592) · npm audit clean
+- Next: T-034b stored state and the workflow actions in the service (build order); the manual session is on T-037 and T-041
+
 ## 2026-11-24 00:42 CT — manual (John: "start on phase 2, easiest wins first") — T-044 How the admin is built; U-005 test timeouts
 - Result: done
 - What changed: D-073 picks the admin's stack (React 19 on Vite 7, React Router 8, TanStack Query 5, React Aria Components with the design tokens, an in-house template form renderer checked by a server dry-run endpoint, Vitest with Testing Library, Playwright end-to-end tests, Siteimprove Alfa for accessibility, self-hosted fonts with OFL-1.1 allowed for font files only). U-005: explicit timeouts for two load-sensitive test hooks.
