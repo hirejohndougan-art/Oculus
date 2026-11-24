@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-23 22:51 CT — manual (John: "continue") — T-036 User accounts and password sign-in
+- Result: done
+- What changed: migration `0009_users.sql`: install-wide users with per-organization memberships (D-019), invitations (256-bit tokens stored as SHA-256, single use, 1 hour to 14 days, bound to one organization and address, sent only to the invitee after commit with a time limit and withdrawn if sending fails), one bootstrap system admin, sign-in throttle counters per address and per client network. Core: scrypt passwords at one allowed setting (NFC, 8 to 1,024 bytes, a common-password list and context words refused), progressive waits up to 15 minutes with no permanent lockout. `signIn` gives the same reply and cost for every failure and requires the second step (T-038). `client.ts`: a lost connection inside a transaction fails cleanly instead of crashing the process.
+- Decisions: D-068
+- Review: three independent rounds (the inviter learning whether an address has an account; timing for non-current hashes; the writer minting accounts with ready-made invitations; email sent inside the transaction; a process crash on a lost connection); all fixed with tests. Small follow-ups filed as S-016.
+- Gate: PASS · tests_passing 3554 (was 3465) · npm audit clean
+- Next: T-037 sessions
+
 ## 2026-11-23 21:40 CT — manual (John: "continue") — T-032 The service layer: one writer
 - Result: done
 - What changed: new `packages/service` (`createService`), the only writer of records, identifiers, term usages, versions and arrangement, one transaction per operation with locked checks, clean issues, retries on deadlocks. Migration `0008_record_deletion.sql`: deletion as a tombstone version, nothing after a delete, append-only template and record type versions, definition advisory locks, every guard trigger set to fire ALWAYS (also in replica mode). `roles.ts`: `grantWriterRole` with the minimum privileges and `checkWriterConnection`, an allowlist that refuses any membership, attribute, owned object, extra or column privilege, grant option, schema CREATE, parameter grant, role setting or replica-mode session.
