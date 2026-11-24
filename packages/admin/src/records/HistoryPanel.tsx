@@ -42,6 +42,22 @@ interface Props {
   readonly onRestored: (version: number) => void;
 }
 
+/** The record's own properties as people call them. */
+const PROPERTY_LABELS: Readonly<Record<string, string>> = {
+  title: "Title",
+  kind: "Kind",
+  siteId: "Site",
+  templateKey: "Template",
+  recordTypeKey: "Record type",
+  workflowState: "Status",
+  level: "Level",
+  parentId: "Filed under",
+  mediaType: "File type",
+  represents: "Scan of",
+  agentType: "Person, family or organization",
+  coordinates: "Map position",
+};
+
 type Restore =
   | { readonly step: "ask"; readonly version: number }
   | { readonly step: "public"; readonly version: number; readonly keys: readonly string[] };
@@ -63,7 +79,7 @@ export function HistoryPanel(props: Props) {
 
   const label = (name: string) => {
     const key = name.startsWith("fields.") ? name.slice(7) : undefined;
-    if (key === undefined) return name === "workflowState" ? "Status" : name;
+    if (key === undefined) return PROPERTY_LABELS[name] ?? name;
     return props.template?.fields.find((f) => f.key === key)?.label ?? key;
   };
   const who = (actor: string) => (actor === `user:${props.userId}` ? "You" : "Someone else");
@@ -269,8 +285,20 @@ export function HistoryPanel(props: Props) {
       {list.length < 2 ? null : (
         <div className={styles.panel}>
           <h3 className={styles.sectionTitle}>Compare two versions</h3>
-          <Choice label="From version" value={from} onChange={setFrom} options={options} />
-          <Choice label="To version" value={to} onChange={setTo} options={options} />
+          <Choice
+            label="From version"
+            placeholder="Choose a version"
+            value={from}
+            onChange={setFrom}
+            options={options}
+          />
+          <Choice
+            label="To version"
+            placeholder="Choose a version"
+            value={to}
+            onChange={setTo}
+            options={options}
+          />
           <div>
             <Button
               variant="secondary"

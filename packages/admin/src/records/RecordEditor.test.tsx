@@ -407,6 +407,16 @@ describe("leaving and creating", () => {
     expect(sent.some((s) => s.path.includes("not-an-id"))).toBe(false);
   });
 
+  it("starts a record of a kind with no record type on the kind's template", async () => {
+    server([200, recordReply()], { "GET /api/record-types": [200, { recordTypes: [] }] });
+    renderAt(`/sites/${SITE_1}/records/new`);
+    await userEvent.click(await screen.findByRole("button", { name: /Kind of record/ }));
+    await userEvent.click(await screen.findByRole("option", { name: "Object" }));
+    await userEvent.click(screen.getByRole("button", { name: "Start cataloging" }));
+    expect(await screen.findByRole("heading", { level: 1, name: "New record" })).toBeTruthy();
+    expect(screen.getByLabelText(/^Note \(required\)/)).toBeTruthy();
+  });
+
   it("makes a new record in the working site and opens it", async () => {
     const NEW_ID = "33333333-3333-4333-8333-333333333333";
     const sent = server([200, recordReply()], {

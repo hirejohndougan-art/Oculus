@@ -7,8 +7,10 @@
  */
 import { useState } from "react";
 import { useLocation } from "react-router";
+import { Link as AriaLink } from "react-aria-components";
 import { problemText } from "../api";
 import { Button, Note, TextLink } from "../components/ui";
+import ui from "../components/ui.module.css";
 import { Choice, StatePill, TextInput } from "./controls";
 import { KIND_LABELS, STATE_LABELS, recordPath, whenText } from "./model";
 import { useItems, useRecordTypes, useSiteAbilities, type ListParams } from "./queries";
@@ -69,7 +71,12 @@ export function ItemList(props: { readonly siteId: string; readonly siteName: st
         </div>
         {canCreate ? (
           <div className={styles.actions}>
-            <TextLink href={`/sites/${siteId}/records/new`}>+ Catalog an item</TextLink>
+            <AriaLink
+              className={`${ui.button} ${ui.primary}`}
+              href={`/sites/${siteId}/records/new`}
+            >
+              + Catalog an item
+            </AriaLink>
           </div>
         ) : null}
       </div>

@@ -164,7 +164,8 @@ export function NewRecordScreen(props: { readonly siteId: string; readonly userI
     kindTemplates.find((t) => t.key === templateKey) ??
     kindTemplates.find(
       (t) => t.key === kindTypes.find((x) => x.key === typeKey)?.defaultTemplateKey,
-    );
+    ) ??
+    kindTemplates[0];
 
   return (
     <>

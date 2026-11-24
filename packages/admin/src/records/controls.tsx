@@ -85,6 +85,7 @@ export function Choice(props: {
   readonly errors?: readonly string[] | undefined;
   readonly isDisabled?: boolean;
   readonly isRequired?: boolean;
+  readonly placeholder?: string;
   readonly className?: string | undefined;
 }) {
   const invalid = props.errors !== undefined && props.errors.length > 0;
@@ -101,6 +102,7 @@ export function Choice(props: {
       isRequired={props.isRequired ?? false}
       isInvalid={invalid}
       validationBehavior="aria"
+      placeholder={props.placeholder ?? "Choose one"}
     >
       <Label className={ui.label}>{props.label}</Label>
       <AriaButton className={styles.selectButton}>
