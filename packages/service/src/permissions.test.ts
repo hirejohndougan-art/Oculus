@@ -950,6 +950,70 @@ describe("organizations and sites stay apart", () => {
   }, 60_000);
 });
 
+describe("a number held on a site the person can't see (S-021)", () => {
+  it("answers byte for byte as a number held by a record they can see", async () => {
+    await ready();
+    const w = await world();
+    // A cataloger who works only on site A2 (A1's records are invisible to them).
+    const other = await personWith(w, "a2-cataloger", [{ role: "cataloger", siteId: w.a2 }]);
+    const onA2 = ctxOf(w.a, other, w.a2);
+    const tag = newRecordId().slice(0, 6);
+    const numbers = (value: string, former: string[] = []) => ({
+      current: [{ type: "object_number", value, primary: true }],
+      former: former.map((value) => ({ type: "object_number", value })),
+    });
+    const hiddenNumber = `INV-H-${tag}`;
+    const seenNumber = `INV-S-${tag}`;
+    // On A1, which they can't see: a record holding one number now and one formerly.
+    const rootOnA1 = ctxOf(w.a, folks.root, w.a1);
+    ok(
+      await service.createRecord(rootOnA1, objectDraft("Invented Hidden Holder"), {
+        identifiers: numbers(`${hiddenNumber}-now`, [`${hiddenNumber}-was`]),
+      }),
+    );
+    // On A2, which they see: the same arrangement.
+    ok(
+      await service.createRecord(onA2, objectDraft("Invented Visible Holder"), {
+        identifiers: numbers(`${seenNumber}-now`, [`${seenNumber}-was`]),
+      }),
+    );
+    const anyRecord = ok(await service.createRecord(onA2, objectDraft("Invented Renumbered")));
+    for (const suffix of ["-now", "-was"]) {
+      const hidden = await service.createRecord(onA2, objectDraft(), {
+        identifiers: numbers(`${hiddenNumber}${suffix}`),
+      });
+      const seen = await service.createRecord(onA2, objectDraft(), {
+        identifiers: numbers(`${seenNumber}${suffix}`),
+      });
+      expect(codes(hidden)).toEqual(["not_unique"]);
+      // Identical but for the number typed: no record ID, kind, title or site.
+      expect(JSON.stringify(hidden).replaceAll(hiddenNumber, "N")).toBe(
+        JSON.stringify(seen).replaceAll(seenNumber, "N"),
+      );
+      const savedHidden = await service.saveIdentifiers(
+        onA2,
+        anyRecord.record.id,
+        numbers(`${hiddenNumber}${suffix}`),
+      );
+      const savedSeen = await service.saveIdentifiers(
+        onA2,
+        anyRecord.record.id,
+        numbers(`${seenNumber}${suffix}`),
+      );
+      expect(codes(savedHidden)).toEqual(["not_unique"]);
+      expect(JSON.stringify(savedHidden).replaceAll(hiddenNumber, "N")).toBe(
+        JSON.stringify(savedSeen).replaceAll(seenNumber, "N"),
+      );
+      for (const reply of [hidden, savedHidden]) {
+        const text = JSON.stringify(reply);
+        expect(text).not.toContain("Hidden Holder");
+        expect(text).not.toContain(w.a1);
+        expect(text).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-/);
+      }
+    }
+  }, 60_000);
+});
+
 describe("role changes take effect at once", () => {
   it("revoked, the next write is refused; granted again, it goes through; changed, the new role rules", async () => {
     await ready();
