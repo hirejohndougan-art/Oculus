@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 03:27 CT — upkeep — Dependency update: typescript-eslint 8.74.0
+- Result: done
+- What changed: `npm outdated` showed one in-major update, typescript-eslint 8.73.0 → 8.74.0 (released 2026-11-23); bumped in package.json and the lockfile. TypeScript 7 and Vite 8 stay on T-001b (typescript-eslint still requires TypeScript `<6.1`; note added there).
+- Decisions: none
+- Review: n/a (dev dependency bump within a major)
+- Gate: PASS · tests_passing 3690 (was 3690) · npm audit clean
+- Next: T-041 roles and T-038 two-step sign-in (claimed by the manual session); otherwise the next unclaimed build task
+
 ## 2026-11-24 02:41 CT — manual (John: "continue on phase 2") — T-034b, T-034c Stored workflow state; public output reads what is published
 - Result: done
 - What changed: migration `0012_workflow_states.sql`: `records.workflow_state` (D-075's four states), workflow actions as versions (history shows who published or withdrew, when and why), the database refusing any state change without a valid workflow version, a publish that also changes content, a record starting published, and deleting a published record. Service `submitForReview`, `returnToDraft`, `publish`, `withdraw` with the publish check in the same transaction; edits, restores and identifier saves of a published record must still pass it; a `mayChangePublicOutput` hook that T-041 fills with `records.publish`. `readPublicRecord` builds public output from one Repeatable Read snapshot; unpublished, missing and other organizations' records answer identically; unpublished links and places show nothing.
