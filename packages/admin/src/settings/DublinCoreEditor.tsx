@@ -183,7 +183,7 @@ export function DublinCoreScreen() {
   const { key = "" } = useParams();
   const known = TEMPLATE_KEY.test(key);
   // Kept here: the form is made again for each version, so its own state goes.
-  const [saved, setSaved] = useState<{ version: number; shownOn: number }>();
+  const [saved, setSaved] = useState<{ key: string; version: number; shownOn: number }>();
   const template = useQuery({
     queryKey: ["system-template", me.organizationId, key],
     queryFn: () => api<TemplateReply>(`/api/templates/${key}`),
@@ -221,8 +221,10 @@ export function DublinCoreScreen() {
       templateKey={key}
       template={template.data}
       stored={mapping.data}
-      justSaved={saved?.version === mapping.data.version ? saved : undefined}
-      onSaved={setSaved}
+      justSaved={saved?.key === key && saved.version === mapping.data.version ? saved : undefined}
+      onSaved={(done) => {
+        setSaved({ key, ...done });
+      }}
     />
   );
 }

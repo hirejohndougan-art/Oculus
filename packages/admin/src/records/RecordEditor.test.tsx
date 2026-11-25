@@ -282,7 +282,7 @@ describe("workflow and delete", () => {
     await userEvent.click(screen.getByRole("button", { name: "Publish" }));
     expect(
       await screen.findByText(
-        "Published, but no public site shows it yet: its template has no Dublin Core mapping.",
+        "Published, but no public site shows it yet: its template has no Dublin Core mapping that fits it.",
       ),
     ).toBeTruthy();
   });
@@ -291,7 +291,11 @@ describe("workflow and delete", () => {
     server([200, recordReply({ can: ALL })], {
       "GET /api/templates/t-object/dublin-core": [
         200,
-        { key: "t-object", version: 1, mapping: {} },
+        {
+          key: "t-object",
+          version: 1,
+          mapping: { entries: [{ field: "note", term: "description" }] },
+        },
       ],
     });
     renderAt(PATH);
@@ -310,6 +314,24 @@ describe("workflow and delete", () => {
     renderAt(PATH);
     await opened();
     expect(screen.queryByText(/no Dublin Core mapping/)).toBeNull();
+  });
+
+  it("warns too when the mapping names a field that is now staff only", async () => {
+    server([200, recordReply({ state: "published", can: ALL })], {
+      "GET /api/templates/t-object/dublin-core": [
+        200,
+        {
+          key: "t-object",
+          version: 4,
+          mapping: { entries: [{ field: "shelf", term: "spatial" }] },
+        },
+      ],
+    });
+    renderAt(PATH);
+    await opened();
+    expect(
+      await screen.findByText(/This record is published, but no public site shows it yet/),
+    ).toBeTruthy();
   });
 
   it("tells the people who can see it that a published record isn't shown without a mapping", async () => {

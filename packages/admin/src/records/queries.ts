@@ -44,27 +44,59 @@ export function useTemplates(siteId: string) {
   });
 }
 
+/** A template's stored Dublin Core mapping as the server sends it (T-050b, D-096). */
+export interface StoredMappingReply {
+  readonly version: number;
+  readonly mapping: unknown;
+}
+
 /**
- * Whether a template has a stored Dublin Core mapping (T-050e, D-096): a
- * published record whose template has none isn't shown on any public site.
- * Keyed by organization, like the templates; the mapping screen refreshes it.
+ * A template's stored Dublin Core mapping (T-050e, D-096), for the record
+ * editor's note: a published record isn't shown on any public site when
+ * its template has no mapping, or one that no longer fits it. Keyed by
+ * organization, like the templates; the mapping and template screens
+ * refresh it.
  */
-export function useHasDublinCoreMapping(siteId: string, templateKey: string | undefined) {
+export function useDublinCoreMapping(siteId: string, templateKey: string | undefined) {
   const organizationId = useMe().data?.organizationId;
   return useQuery({
     queryKey: ["dublin-core-status", organizationId, templateKey],
-    queryFn: async () =>
-      (
-        await api<{ version: number }>(`/api/templates/${templateKey ?? ""}/dublin-core`, {
-          site: siteId,
-        })
-      ).version > 0,
+    queryFn: () =>
+      api<StoredMappingReply>(`/api/templates/${templateKey ?? ""}/dublin-core`, { site: siteId }),
     staleTime: 60_000,
     enabled:
       organizationId !== undefined &&
       templateKey !== undefined &&
       /^[a-z][a-z0-9_-]{0,63}$/.test(templateKey),
   });
+}
+
+/**
+ * Whether public output can use the mapping with this template: one is
+ * stored, and every entry names a public field of the template (D-096:
+ * public output refuses a mapping that no longer fits, such as a mapped
+ * field since made staff only). The server's own check is the one that
+ * counts; this only decides whether the editor warns.
+ */
+export function mappingFits(
+  reply: StoredMappingReply,
+  template: { readonly fields: readonly { readonly key: string; readonly visibility: string }[] },
+): boolean {
+  if (reply.version <= 0) return false;
+  const mapping = reply.mapping;
+  if (typeof mapping !== "object" || mapping === null) return false;
+  const entries = (mapping as { entries?: unknown }).entries;
+  if (!Array.isArray(entries)) return false;
+  const publicKeys = new Set(
+    template.fields.filter((f) => f.visibility === "public").map((f) => f.key),
+  );
+  return (entries as unknown[]).every(
+    (e) =>
+      typeof e === "object" &&
+      e !== null &&
+      typeof (e as { field?: unknown }).field === "string" &&
+      publicKeys.has((e as { field: string }).field),
+  );
 }
 
 export function useRecordTypes(siteId: string) {

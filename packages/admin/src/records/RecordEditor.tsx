@@ -49,8 +49,9 @@ import {
   type WorkflowMove,
 } from "./model";
 import {
+  mappingFits,
   recordKey,
-  useHasDublinCoreMapping,
+  useDublinCoreMapping,
   useRecord,
   useRecordTypes,
   useSiteAbilities,
@@ -65,7 +66,7 @@ interface Status {
 
 /** After publishing a record whose template has no Dublin Core mapping (D-096). */
 const PUBLISHED_UNSHOWN =
-  "Published, but no public site shows it yet: its template has no Dublin Core mapping.";
+  "Published, but no public site shows it yet: its template has no Dublin Core mapping that fits it.";
 
 const MOVE_DONE: Readonly<Record<WorkflowMove, string>> = {
   "submit-for-review": "Sent for review.",
@@ -299,9 +300,13 @@ function Editor(props: EditorProps) {
 
   const can = reply?.can ?? { edit: true, history: false, publish: false, delete: false };
   const state = reply?.state ?? "draft";
-  // A published record whose template has no mapping isn't on any public site (T-050e).
-  const hasMapping = useHasDublinCoreMapping(siteId, reply?.record.templateKey);
-  const unmapped = hasMapping.data === false;
+  // A published record whose template has no mapping, or one that no
+  // longer fits it, isn't on any public site (T-050e, D-096).
+  const mappingReply = useDublinCoreMapping(siteId, reply?.record.templateKey);
+  const unmapped =
+    mappingReply.data !== undefined &&
+    template !== undefined &&
+    !mappingFits(mappingReply.data, template);
   const dirty = !sameDraft(draft, start, template);
   const readOnly = !can.edit;
   const fieldKeys = useMemo(() => new Set((template?.fields ?? []).map((f) => f.key)), [template]);
@@ -555,9 +560,9 @@ function Editor(props: EditorProps) {
       {unmapped && (state === "published" || can.publish) ? (
         <Note tone="amber">
           {state === "published"
-            ? "This record is published, but no public site shows it yet: its template has no Dublin Core mapping."
-            : "If you publish this record, no public site will show it yet: its template has no Dublin Core mapping."}{" "}
-          A system manager adds one under Settings, Templates.
+            ? "This record is published, but no public site shows it yet: its template has no Dublin Core mapping that fits it."
+            : "If you publish this record, no public site will show it yet: its template has no Dublin Core mapping that fits it."}{" "}
+          Someone who may change templates can fix this under Settings, Templates.
         </Note>
       ) : null}
 

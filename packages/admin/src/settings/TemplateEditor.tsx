@@ -243,6 +243,8 @@ function TemplateForm(props: {
       // The record editor's copy of the templates is out of date too.
       await queries.invalidateQueries({ queryKey: templatesKey(organizationId) });
       await queries.invalidateQueries({ queryKey: ["templates", organizationId] });
+      // So does the record editor's check of the template's Dublin Core mapping.
+      await queries.invalidateQueries({ queryKey: ["dublin-core-status", organizationId] });
       props.onSaved?.(reply.version);
       queries.setQueryData(["system-template", organizationId, reply.key], reply);
       if (stored === undefined) {
