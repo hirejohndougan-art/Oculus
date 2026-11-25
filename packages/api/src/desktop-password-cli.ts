@@ -1,5 +1,5 @@
 /**
- * `npm run desktop:password` (S-034a, D-097; on Windows
+ * `npm run desktop:password` (S-034a, D-099; on Windows
  * `node packages\api\dist\desktop-password-cli.js`): sets a new password
  * for an account on this computer's Oculus, for when there is no email to
  * send a "forgot your password" link.
