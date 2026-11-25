@@ -2,15 +2,6 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
-## 2026-11-25 17:45 CT — manual (Chat AB) — T-018b with T-018a and S-013: loans stored and settled through the service
-
-- Result: done (built locally; not pushed or merged: John asked this chat not to push)
-- What changed: core loans.ts (D-118: items settled only by a linked end move or an explicit, recorded way; where the record is now decides; status and item rules once agreed; valuation, insurance, authoriser), migration 0053 (loans, loan_records, loan_versions, condition_checks), db loans.ts, service loans.ts (listLoans, readLoan, loanHistory, saveLoan, recordLoanMove, overdueLoans, unexplainedLoanMoves, recordConditionCheck, conditionHistory), record deletion refuses `on_loan`, `loan_agent`, `has_condition_checks`.
-- Decisions: D-118 (amends D-044)
-- Review: first independent review: two must-fix holes (cancelling skipped the record check; the check looked only at where the record is now) and minor ones; all fixed (history-based check, cancelled final, lender frozen once moved, move-log due dates keep loans out overdue, leaks closed). Second review: no way to drop a loan without a recorded act, but the cross-checks were beatable and blocked ordinary work for good (five must-fix); redesigned: unexplained arrivals are reported (`unexplainedArrivals`), never problems, and only explicit, recorded markers settle an item; kept needs Donor relations; a loan move can't hurt another loan; history visibility from the stored JSON. Third review: one must-fix (a loan out item with no due date in the move log could leave the list by moving the end date; now listed until a dated extension is recorded) and minor ones, all fixed or recorded in D-118 (second venue doesn't block closing; renewals need edit on the continued loan; kept checked for Donor relations only when set; history skips deleted records; record places read once per request).
-- Gate: PASS · tests_passing 5248 (was 5207 on main when branched) · npm audit clean. Baseline not raised: not merged (raise it at merge).
-- Next: T-076 (loans admin, with extensions and loan-out renewals), filed here
-
 ## 2026-11-25 15:00 CT — manual (Chat A) — T-053 Phase 2 review
 
 - **Done:** two independent reviewers looked across all of Phase 2: one at security (sign-in, sessions, roles and scoping, the HTTP layer, the public side, secrets and operations), one at data integrity and operations (schema and migrations, the service as the only writer, the record lifecycle, files, setup, backup, updates, the desktop, the gate). **Nothing blocking in either**: no route, list or count leaks another organization's or site's catalog data, and nothing reachable loses or corrupts data.
