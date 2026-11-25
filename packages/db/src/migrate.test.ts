@@ -59,6 +59,7 @@ const ALL_TABLES = [
   "sites",
   "stored_file_events",
   "stored_files",
+  "system_events",
   "system_settings",
   "template_versions",
   "templates",

@@ -80,6 +80,7 @@ import {
   staffApiRoutes,
   type ApiLogRecord,
 } from "./staff-api.js";
+import { updateChangeLog } from "./update-change-log.js";
 import { updateManagerFromEnv, type UpdateManager } from "./update-manager.js";
 
 export { isProduction };
@@ -335,6 +336,8 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
       ? null
       : (options.updates ??
         updateManagerFromEnv(env, {
+          // Installs and rollbacks in the change log (T-060a).
+          changeLog: updateChangeLog(options.db, "admin"),
           ...(options.requestRestart === undefined
             ? {}
             : { requestRestart: options.requestRestart }),

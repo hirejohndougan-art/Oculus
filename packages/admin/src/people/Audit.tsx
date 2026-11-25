@@ -1,7 +1,8 @@
 /**
  * The audit trail (T-048): the organization's change log, newest first,
  * as far as the person may see it (the server filters, D-084), filtered by
- * person, record and dates, a page at a time.
+ * person, record and dates, a page at a time. System managers also see
+ * installs and rollbacks of Oculus itself (T-060a).
  */
 import { useState, type SubmitEvent } from "react";
 import { useInfiniteQuery } from "@tanstack/react-query";
@@ -60,7 +61,17 @@ const EVENTS: Readonly<Record<string, string>> = {
   sessions_ended: "Signed out everywhere:",
 };
 
+const SYSTEM_EVENTS: Readonly<Record<string, string>> = {
+  update_installed: "Installed Oculus",
+  update_rolled_back: "Went back to Oculus",
+};
+
 function what(entry: AuditEntry, sites: ReadonlyMap<string, string>): string {
+  if (entry.type === "system") {
+    const label = Object.hasOwn(SYSTEM_EVENTS, entry.kind) ? SYSTEM_EVENTS[entry.kind] : undefined;
+    const before = entry.fromVersion ?? "a development build";
+    return `${label ?? entry.kind} ${entry.version} (from ${before})`;
+  }
   if (entry.type === "record") {
     const title = entry.title ?? "a record";
     const version = `version ${String(entry.version)}`;
@@ -202,9 +213,13 @@ export function Audit() {
                 <td>{when(e.at)}</td>
                 <td>
                   {e.actorName ??
-                    (e.actor.startsWith("system:")
-                      ? "Oculus"
-                      : "Someone outside this organization")}
+                    (e.actor === "command_line"
+                      ? "The server's command line"
+                      : e.type === "system"
+                        ? "A former system manager"
+                        : e.actor.startsWith("system:")
+                          ? "Oculus"
+                          : "Someone outside this organization")}
                 </td>
                 <td>{what(e, sites)}</td>
                 <td className={styles.muted}>

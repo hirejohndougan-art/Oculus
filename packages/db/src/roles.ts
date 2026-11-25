@@ -19,6 +19,7 @@
  * refuses a role holding anything more.
  */
 import { SHARE_TABLE_PRIVILEGES } from "./shares.js";
+import { SYSTEM_EVENT_TABLE_PRIVILEGES } from "./system-events.js";
 import { ACCOUNT_TABLE_PRIVILEGES } from "./accounts.js";
 import { PEOPLE_TABLE_PRIVILEGES } from "./people.js";
 import { PERMISSION_TABLE_PRIVILEGES } from "./permissions.js";
@@ -90,6 +91,8 @@ export const WRITER_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Ob
   // Shares between sites (T-041b, D-094): offered, then moved along their
   // life; never deleted by the writer (rows go with their record).
   ...SHARE_TABLE_PRIVILEGES,
+  // Installs and rollbacks in the change log (T-060a): append-only.
+  ...SYSTEM_EVENT_TABLE_PRIVILEGES,
 });
 
 /**

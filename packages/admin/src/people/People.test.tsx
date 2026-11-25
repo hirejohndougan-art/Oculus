@@ -386,4 +386,47 @@ describe("the audit trail", () => {
       expect(sent.some((s) => s.path.startsWith(`/api/audit?person=${PERSON}`))).toBe(true);
     });
   });
+
+  it("shows installs and rollbacks of Oculus, from the admin and the command line", async () => {
+    fakeServer({
+      "GET /api/me": [200, { ...me([A1]), systemAdmin: true }],
+      "GET /api/people": [200, { people: [person()], truncated: false, rights: SYSTEM }],
+      "GET /api/audit?limit=1": [200, { entries: [], next: null }],
+      "GET /api/audit?limit=50": [
+        200,
+        {
+          entries: [
+            {
+              type: "system",
+              at: "2026-11-25T10:00:00.000Z",
+              actor: "command_line",
+              actorName: null,
+              eventId: GRANT,
+              kind: "update_installed",
+              version: "1.3.0",
+              fromVersion: null,
+            },
+            {
+              type: "system",
+              at: "2026-11-24T10:00:00.000Z",
+              actor: "user:x",
+              actorName: "Root Invented",
+              eventId: PERSON,
+              kind: "update_rolled_back",
+              version: "1.1.0",
+              fromVersion: "1.2.0",
+            },
+          ],
+          next: null,
+        },
+      ],
+    });
+    renderAt("/audit");
+    expect(
+      await screen.findByText("Installed Oculus 1.3.0 (from a development build)"),
+    ).toBeTruthy();
+    expect(screen.getByText("The server's command line")).toBeTruthy();
+    expect(screen.getByText("Went back to Oculus 1.1.0 (from 1.2.0)")).toBeTruthy();
+    expect(screen.getByText("Root Invented")).toBeTruthy();
+  });
 });

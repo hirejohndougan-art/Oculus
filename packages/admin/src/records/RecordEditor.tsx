@@ -29,6 +29,7 @@ import { Choice, ConfirmPanel, StatePill, TextInput } from "./controls";
 import { FieldInput } from "./FieldInput";
 import { FilesPanel } from "./FilesPanel";
 import { HistoryPanel } from "./HistoryPanel";
+import { SharingPanel } from "../shares/SharingPanel";
 import {
   AGENT_TYPES,
   KIND_LABELS,
@@ -879,6 +880,15 @@ function Editor(props: EditorProps) {
             recordId={reply.record.id}
             version={reply.version}
             canUpload={can.edit}
+          />
+        ) : null}
+
+        {reply !== undefined && can.edit ? (
+          <SharingPanel
+            key={reply.record.id}
+            siteId={siteId}
+            recordId={reply.record.id}
+            published={state === "published"}
           />
         ) : null}
 
