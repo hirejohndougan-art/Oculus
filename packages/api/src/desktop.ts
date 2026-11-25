@@ -100,6 +100,8 @@ export interface DesktopSettings {
   databaseUrl?: string;
   /** The owner's address: migrations and the start-up checks use it (T-057). */
   ownerDatabaseUrl?: string;
+  /** Back up before applying new migrations (default true; S-034b). */
+  backupBeforeUpdate?: boolean;
   port?: number;
 }
 
@@ -147,6 +149,14 @@ export function readDesktopSettings(folder: string): DesktopSettings {
         );
       }
       settings[key] = entry;
+    } else if (key === "backupBeforeUpdate") {
+      if (typeof entry !== "boolean") {
+        throw new DesktopError(
+          "settings_invalid",
+          `"backupBeforeUpdate" in ${file} must be true or false.`,
+        );
+      }
+      settings.backupBeforeUpdate = entry;
     } else if (key === "port") {
       if (typeof entry !== "number" || !Number.isInteger(entry) || entry < 1024 || entry > 65_535) {
         throw new DesktopError(

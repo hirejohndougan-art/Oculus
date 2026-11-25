@@ -13,6 +13,7 @@ import { rmSync } from "node:fs";
 
 const paths = new Set<string>();
 const groups = new Set<number>();
+const processes = new Set<number>();
 let installed = false;
 
 /** Kills every registered tool group and removes every registered path, synchronously. */
@@ -25,6 +26,14 @@ export function cleanUpNow(): void {
     }
   }
   groups.clear();
+  for (const pid of processes) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  }
+  processes.clear();
   for (const path of paths) {
     try {
       rmSync(path, { recursive: true, force: true });
@@ -56,5 +65,14 @@ export function trackGroup(pgid: number): () => void {
   groups.add(pgid);
   return () => {
     groups.delete(pgid);
+  };
+}
+
+/** Registers a tool run directly (no process group, as on Windows) to kill on exit. */
+export function trackProcess(pid: number): () => void {
+  install();
+  processes.add(pid);
+  return () => {
+    processes.delete(pid);
   };
 }

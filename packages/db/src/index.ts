@@ -415,3 +415,5 @@ export {
 export type { Share, ShareState, SharedItemView } from "./shares.js";
 export { runSetupCli, terminalAsk } from "./setup-cli.js";
 export type { Ask } from "./setup-cli.js";
+export { backup, BackupError } from "./backup.js";
+export type { BackupOptions, BackupResult } from "./backup.js";

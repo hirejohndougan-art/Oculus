@@ -2,13 +2,21 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
-## 2026-11-24 23:20 CT — Chat B — T-041c Shares: storage and the service (part of T-041b)
+## 2026-11-25 01:55 CT — Chat B — T-041c Shares: storage and the service (part of T-041b)
 - Result: done (T-041b continues as T-041d to T-041f)
 - What changed: migration 0024 (`record_shares`), `packages/db/src/shares.ts`, `publishedRecordView` (workflow.ts), `packages/service/src/shares.ts`: offer a published item to another site (any organization's), accept, decline, remove (the second site's manager), withdraw (home), lists, and a read-only view for the second site that is what the public could see, never through the record's own checks.
 - Decisions: D-094
 - Review: three independent rounds (the third found no leak). Fixed: the view copied raw values (links, rights notes, non-public numbers) and showed unpublished items; it then skipped public output's gates (home site, publish check, one snapshot); lock order; withdraw vs delete; moves onto the second site; concurrent offers; locking another organization's shares; trigger gaps; hidden shares filling lists; view errors thrown instead of refused. Left as S-036.
 - Gate: see the merge commit
 - Next: T-041d (shares over HTTP), then T-041e.
+
+## 2026-11-25 01:00 CT — manual (Chat D) — S-034a and S-034b Desktop follow-ups, parts one and two
+- Result: done (S-034 stays open for its other items)
+- What changed: S-034a: `exec.cmd` at the root and in packages/db (npm's `exec node …` scripts start under cmd.exe), `npm run desktop:password` (the ordinary reset with the console as the mailbox), launcher exit code 4 for "already starting/busy". S-034b: a `direct` tool runner for pg_dump/pg_restore where there's no `sh` (Windows; the POSIX watchdog unchanged), tools found in `%ProgramFiles%\\PostgreSQL\\<major>\\bin`, and the desktop backs up before every update that changes the database (fails closed; Ctrl+C stops it cleanly).
+- Decisions: D-099, D-102
+- Review: one independent round each. S-034a: busy also exits 4; wording. S-034b: nothing blocking; fail closed when the change list can't be read, signal handling for the pre-update backup, reasons on every failure. Filed: a rare restore hang at a chunk boundary (both runners, pre-existing) and pruning old backups (S-034 items 12, 13).
+- Gate: PASS · tests_passing 4591 (was 4580) · npm audit clean
+- Next: T-034e (Chat D, in review)
 
 ## 2026-11-24 22:45 CT — manual (Chat F) — T-060 Updates from an uploaded package
 - Result: done
