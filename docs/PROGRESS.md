@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 03:33 CT — manual (Chat A) — T-062 Sign out after a period of no use (John, Q-8)
+- Result: done
+- What changed: idle limit 30 minutes by default; `resolveSession(..., { activity: false })` for background reads; `isActivity` counts only same-origin uses; `idleSeconds` and a session marker in `/api/session` and `/api/me`; admin `idle/` (IdleTimer, IdleGuard, cross-tab channel with per-tab ids and session markers, an unsaved-changes registry); the update screen's status poll is a background read.
+- Decisions: D-098
+- Review: one independent round. Fixed: a never-settling sign-out request left the screen up (now cleared first); cross-site navigations counted as use; manual sign-out not reaching other tabs; a stale tab signing out an active one; header consistency; client counting of 4xx uses; focus fallback and announcements; no guessed limit.
+- Gate: PASS · tests_passing 4780 (was 4724) · npm audit clean
+- Next: M-002 (no automatic deletion), M-003 (thumbnail limits, WebP)
+
 ## 2026-11-25 02:35 CT — manual (Chat C) — T-050c OAI-PMH, and S-038 Cached public Subjects counts
 - Result: done (both)
 - What changed: T-050c: `packages/api/src/oai-pmh.ts` (`GET /oai` on public hosts, the six verbs, oai_dc only), `packages/db/src/oai.ts` (lists and datestamps on the staff connection), `oaiPmhReply` in file-replies.ts (the only way `text/xml` goes out), `ReadSlots` shared by the public routes, an `oai` rate bucket. S-038: `packages/api/src/public-subjects.ts` (background counts, `GET /subjects`), `GET /api/sites/:id/public-subjects`, `publicTermCountsForStaff`, a `terms` option and `publicOutputMarker` (public-terms.ts), `onClose` on `buildServer`, `countsDb` on `buildAdminServer`.
