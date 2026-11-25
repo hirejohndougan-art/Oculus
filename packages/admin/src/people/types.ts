@@ -48,6 +48,12 @@ export interface PersonDetail {
     readonly enrolledAt: string | null;
     readonly recentAlerts: number;
     readonly lastAlertAt: string | null;
+    /** The newest alerts (D-085): when, how many wrong codes, what became of the email. */
+    readonly alerts?: readonly {
+      readonly at: string;
+      readonly failures: number;
+      readonly notice: "emailed" | "covered" | "pending";
+    }[];
   };
 }
 

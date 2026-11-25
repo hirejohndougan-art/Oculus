@@ -93,11 +93,17 @@ export interface ApiLogRecord {
     | "sign_in_error"
     | "client_address_warning"
     | "reset_settled"
-    | "reset_link_produced"
-    // The people routes in development (admin-server.ts, T-048).
-    | "invitation_produced"
-    | "set_up_link_produced"
-    | "startup_warning";
+    | "startup_warning"
+    // The mail outbox and senders (mail-outbox.ts, mail.ts, D-085): the
+    // message kind as `operation`, an error class or reason as `code`.
+    | "mail_sent"
+    | "mail_retry"
+    | "mail_failed"
+    | "mail_refused"
+    | "mail_dropped"
+    | "mail_dev"
+    // The two-step alert notices (alert-notices.ts): people notified, as `code`.
+    | "alert_notices";
   readonly operation?: string;
   readonly code?: string;
   readonly name?: string;

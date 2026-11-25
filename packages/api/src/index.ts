@@ -72,3 +72,35 @@ export {
   ADMIN_ORIGIN_ENV,
 } from "./admin-files.js";
 export type { AdminFile, AdminFiles } from "./admin-files.js";
+export {
+  createMailer,
+  devTransport,
+  mailerFromEnv,
+  smtpConfigFromEnv,
+  smtpTransport,
+  MailConfigError,
+  MAIL_ENV,
+} from "./mail.js";
+export type {
+  Mailer,
+  MailerOptions,
+  MailerFromEnvOptions,
+  SmtpConfig,
+  DevTransportOptions,
+} from "./mail.js";
+export { createOutbox, classifyMailError, MailRefusedError } from "./mail-outbox.js";
+export type { MailOutbox, MailTransport, MailErrorClass, OutboxOptions } from "./mail-outbox.js";
+export {
+  renderPasswordReset,
+  renderTwoStepSetup,
+  renderInvitation,
+  renderPasswordChanged,
+  renderSecondStepAlert,
+  escapeHtml,
+  checkHeaderValue,
+  checkAdminOrigin,
+  MailContentError,
+} from "./mail-messages.js";
+export type { MailKind, RenderedMail } from "./mail-messages.js";
+export { startAlertNotices } from "./alert-notices.js";
+export type { AlertNoticeRunner, AlertNoticeRunnerOptions } from "./alert-notices.js";
