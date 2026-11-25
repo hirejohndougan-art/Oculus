@@ -55,6 +55,7 @@ beforeAll(async () => {
   await first.install("0.1.0", "release-cli", undefined, {
     requireRunningFromCurrent: false,
     fallbackUrl: "postgresql://owner@db.example.org/invented",
+    fallbackWriterRole: "oculus_writer",
   });
   manager = new UpdateManager({
     home,
