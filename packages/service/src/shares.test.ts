@@ -26,12 +26,14 @@ import {
   insertTemplateVersion,
   migrate,
   openDatabase,
+  sharesIntoSite,
   sql,
   type Database,
   type Queryable,
 } from "@oculus/db";
 import {
   freshDatabase,
+  storeDirectVersion,
   testServerUrl,
   type TestDatabase,
 } from "../../db/src/test-database.fixtures.js";
@@ -827,6 +829,54 @@ describe("second review", () => {
       SELECT count(*)::int AS n FROM public.record_shares WHERE id = ${share.id}::uuid`);
     expect(row?.n).toBe(1);
     // Left out in the query itself (before its limit), not after.
+    expect(await sharesIntoSite(s.owner, w.dhs, w.d1, "offered")).toEqual([]);
     expect(ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1))).toEqual([]);
+  });
+
+  it("stops showing an accepted item once it is on no site", async () => {
+    await ready();
+    const w = await world();
+    const share = await offer(w, { org: w.dhs, site: w.d1 });
+    ok(await service.acceptShare(at(w.dhs, w.dhsManager), share.id));
+    await s.owner.transaction(async (q) => {
+      await q.execute(sql`UPDATE public.records SET site_id = NULL, version = version + 1
+        WHERE organization_id = ${w.lib}::uuid AND id = ${w.item.id}::uuid`);
+      await storeDirectVersion(q, w.lib, w.item.id);
+    });
+    expect(codes(await service.readSharedItem(at(w.dhs, w.dhsReader), share.id))).toEqual([
+      "unknown_share",
+    ]);
+  });
+
+  it("answers a failure while building the view as a clean refusal, logged", async () => {
+    await ready();
+    const w = await world();
+    const share = await offer(w, { org: w.dhs, site: w.d1 });
+    ok(await service.acceptShare(at(w.dhs, w.dhsManager), share.id));
+    const failure = new Error("connection to 10.0.0.5 lost while reading");
+    const flaky: Database = {
+      rows: (q) => s.writer.rows(q),
+      execute: (q) => s.writer.execute(q),
+      close: () => Promise.resolve(),
+      transaction: (work) =>
+        s.writer.transaction((tx) =>
+          work({
+            rows: (q) => tx.rows(q),
+            execute: (q) =>
+              q.text.includes("REPEATABLE READ") ? Promise.reject(failure) : tx.execute(q),
+          }),
+        ),
+    };
+    const errors: unknown[] = [];
+    const failing = createService(flaky, { onError: (e) => errors.push(e) });
+    for (const result of [
+      await failing.readSharedItem(at(w.dhs, w.dhsReader), share.id),
+      await failing.listSharedItems(at(w.dhs, w.dhsReader), w.d1),
+      await failing.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1),
+    ]) {
+      expect(codes(result)).toEqual(["internal_error"]);
+      expect(JSON.stringify(result)).not.toContain("10.0.0.5");
+    }
+    expect(errors).toEqual([failure, failure, failure]);
   });
 });

@@ -154,7 +154,13 @@ function seesSite(access: Access, site: SiteId): boolean {
   return holdsForWholeCatalog(access, "records.view", site);
 }
 
-export function shareOperations(db: Database, run: Runner): ShareOperations {
+/** Runs work with transactions of its own under the runner's error handling (service.ts). */
+export type Outside = <T>(
+  operation: string,
+  work: () => Promise<ServiceResult<T>>,
+) => Promise<ServiceResult<T>>;
+
+export function shareOperations(db: Database, run: Runner, outside: Outside): ShareOperations {
   /**
    * The home side's check for a record: the person may edit it at its home
    * site (`onRecord`, which answers a record they can't see as
@@ -358,7 +364,9 @@ export function shareOperations(db: Database, run: Runner): ShareOperations {
         ];
         return { ok: true, value: shares };
       });
-      return checked.ok ? { ok: true, value: await incoming(checked.value) } : checked;
+      if (!checked.ok) return checked;
+      const shares = checked.value;
+      return outside("sharesIntoSite", async () => ({ ok: true, value: await incoming(shares) }));
     },
 
     async sharesOfRecord(context, recordId) {
@@ -384,8 +392,11 @@ export function shareOperations(db: Database, run: Runner): ShareOperations {
         return { ok: true, value: share };
       });
       if (!checked.ok) return checked;
-      const [view] = await incoming([checked.value]);
-      return view === undefined ? UNKNOWN_SHARE() : { ok: true, value: view };
+      const share = checked.value;
+      return outside("readSharedItem", async () => {
+        const [view] = await incoming([share]);
+        return view === undefined ? UNKNOWN_SHARE() : { ok: true, value: view };
+      });
     },
 
     async listSharedItems(context, siteId) {
@@ -404,7 +415,9 @@ export function shareOperations(db: Database, run: Runner): ShareOperations {
           value: await storedSharesIntoSite(tx, who.organizationId, siteId, "accepted"),
         };
       });
-      return checked.ok ? { ok: true, value: await incoming(checked.value) } : checked;
+      if (!checked.ok) return checked;
+      const shares = checked.value;
+      return outside("listSharedItems", async () => ({ ok: true, value: await incoming(shares) }));
     },
   };
 }

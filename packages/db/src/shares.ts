@@ -216,7 +216,10 @@ export async function moveShare(
  * Offers and accepted items are asked for separately, so a flood of offers
  * never pushes accepted items out of a list. A share into what is now the
  * record's own home site (it was moved there since), or whose record isn't
- * published on a home site, is left out before the limit.
+ * published on a home site, is left out before the limit One whose public
+ * output is refused for another reason (the publish check, in
+ * `sharedItemViews`) is left out only after it, so such shares can still
+ * take places in a page (S-036).
  */
 export async function sharesIntoSite(
   tx: Queryable,
