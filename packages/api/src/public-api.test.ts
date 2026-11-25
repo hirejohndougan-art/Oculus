@@ -130,7 +130,6 @@ beforeAll(async () => {
   dir = mkdtempSync(join(tmpdir(), "oculus-t050d-"));
   writeFileSync(join(dir, "index.html"), "<!doctype html><title>Oculus</title>");
   mkdirSync(join(dir, "assets"));
-  // Uploaded files (M-002, D-086): a throwaway folder of this file's own.
   filesDir = mkdtempSync(join(tmpdir(), "oculus-t050d-files-"));
   app = await buildAdminServer({
     db: w.db,
