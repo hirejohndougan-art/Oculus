@@ -46,7 +46,11 @@ export function holdsLines(report: AccessHoldsReport): string[] {
       `Couldn't be checked or changed (an error, above): ${n(report.failed, "record", "records")}.`,
     );
   }
-  if (report.more) lines.push("There were more than one pass takes: run it again.");
+  if (report.unknownDay > 0) {
+    lines.push(
+      `Left alone, because their time zone is no longer known (a system manager picks a current one): ${n(report.unknownDay, "organization", "organizations")}.`,
+    );
+  }
   return lines;
 }
 
@@ -79,12 +83,12 @@ export async function runHoldsCli(
       apply: !dryRun,
       onError: (error) => {
         errors += 1;
-        // Only the SQLSTATE: a database message can quote a value.
+        // Only a code (a SQLSTATE or a refusal's): a database message can quote a value.
         const code =
           typeof error === "object" && error !== null && "code" in error
             ? String(error.code)
             : "unknown";
-        io.err(`An error (${code}) while checking a record; it was left as it was.`);
+        io.err(`A record couldn't be checked or changed (${code}); it was left as it was.`);
       },
     });
     for (const line of holdsLines(report)) io.out(line);

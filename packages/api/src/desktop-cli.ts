@@ -516,8 +516,15 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
           `Access restrictions: ${String(holds.published)} record(s) published again, ${String(holds.withdrawn)} withdrawn (see each record's history).`,
         );
       }
-      if (holds.failed > 0 || holds.more) {
-        out("Some access restrictions couldn't be checked; they'll be checked at the next start.");
+      if (holds.failed > 0) {
+        out(
+          `${String(holds.failed)} record(s) couldn't be checked for access restrictions; they'll be checked at the next start.`,
+        );
+      }
+      if (holds.unknownDay > 0) {
+        out(
+          "Access restrictions weren't checked: your organization's time zone is no longer known. Pick it again in System settings.",
+        );
       }
     } catch {
       out("Access restrictions couldn't be checked; they'll be checked at the next start.");

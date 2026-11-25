@@ -12,15 +12,15 @@
  *   an accession holds it back (`deed_not_signed`, `access_restricted`) is
  *   withdrawn, as its next version, by `ACCESS_HOLDS_ACTOR` with a fixed
  *   reason that names no donor, accession, restriction or date.
- * - **Publish again.** A withdrawn record whose newest change of state is
- *   this pass's own withdrawal is published again, by the same actor, once
+ * - **Publish again.** A withdrawn record whose newest version (of any
+ *   kind) is this pass's own withdrawal is published again, by the same actor, once
  *   the publish check passes on the organization's day: a `closed_until`
  *   date has passed, a deed was signed or the accession let it go. Still
  *   held: it stays withdrawn. Refused for any other reason (a number that no
  *   longer fits, a rights value): it stays withdrawn and is counted as
- *   `blocked`, for staff to look at. A record anyone withdrew, published,
- *   sent for review or returned to draft since is never touched: people's
- *   decisions win.
+ *   `blocked`, for staff to look at. A record anyone has changed since in
+ *   any way (edited, moved, withdrawn, sent for review) is never touched:
+ *   it is a person's to publish (D-075).
  *
  * Each record is changed in a transaction of its own, under its row lock
  * (as an edit takes it) and then the organization's holds lock (shared, as
@@ -38,6 +38,7 @@ import { type OrganizationId, type RecordId } from "@oculus/core";
 import {
   changeWorkflowState,
   lockRecordState,
+  organizationDay,
   organizationIds,
   publishCheckIssues,
   publishedPerhapsHeld,
@@ -67,8 +68,8 @@ export interface AccessHoldsOptions {
   readonly organizationId?: OrganizationId;
   /** Tries per record on a deadlock or serialization failure (default 3). */
   readonly attempts?: number;
-  /** Most candidates of each kind per organization (tests; 1 to `MAX_HOLD_CANDIDATES`). */
-  readonly limit?: number;
+  /** Candidates read per page (tests; 1 to `MAX_HOLD_CANDIDATES`); every page is read. */
+  readonly pageSize?: number;
   /** Told of an unexpected error (never thrown); the record counts as `failed`. */
   readonly onError?: (error: unknown) => void;
 }
@@ -83,10 +84,14 @@ export interface AccessHoldsReport {
   readonly stillHeld: number;
   /** Records this pass had withdrawn, no longer held, that the publish check refuses for another reason. */
   readonly blocked: number;
-  /** Records that couldn't be checked or changed (an error; told to `onError`). */
+  /** Records that couldn't be checked or changed (told to `onError`). */
   readonly failed: number;
-  /** True when an organization had more candidates than one pass reads: run it again. */
-  readonly more: boolean;
+  /**
+   * Organizations left alone because their stored time zone is no longer
+   * known (D-103): their day can't be told, so nothing of theirs is changed
+   * until a system manager picks a current zone.
+   */
+  readonly unknownDay: number;
 }
 
 type Outcome = "withdrawn" | "published" | "still_held" | "blocked" | "skipped" | "failed";
@@ -103,11 +108,20 @@ function sqlState(error: unknown): string | undefined {
   return typeof code === "string" ? code : undefined;
 }
 
-async function withdrawIfHeld(
+/** A refusal of the change of state, as an error for `onError` (codes only). */
+class Refusal extends Error {
+  constructor(readonly code: string) {
+    super(`refused: ${code}`);
+  }
+}
+
+type Step = (
   tx: Queryable,
   org: OrganizationId,
   id: RecordId,
-): Promise<{ outcome: Outcome; keep: boolean }> {
+) => Promise<{ outcome: Outcome; keep: boolean }>;
+
+const withdrawIfHeld: Step = async (tx, org, id) => {
   const state = await lockRecordState(tx, org, id);
   if (state?.state !== "published") return { outcome: "skipped", keep: false };
   const issues = await publishCheckIssues(tx, org, id, { lock: true });
@@ -117,16 +131,13 @@ async function withdrawIfHeld(
     actor: ACCESS_HOLDS_ACTOR,
     reason: HOLD_WITHDRAW_REASON,
   });
-  return changed.ok ? { outcome: "withdrawn", keep: true } : { outcome: "failed", keep: false };
-}
+  if (!changed.ok) throw new Refusal(changed.issues[0]?.code ?? "refused");
+  return { outcome: "withdrawn", keep: true };
+};
 
-async function publishIfFree(
-  tx: Queryable,
-  org: OrganizationId,
-  id: RecordId,
-): Promise<{ outcome: Outcome; keep: boolean }> {
+const publishIfFree: Step = async (tx, org, id) => {
   const state = await lockRecordState(tx, org, id);
-  if (state?.state !== "withdrawn" || state.lastMoveActor !== ACCESS_HOLDS_ACTOR) {
+  if (state?.state !== "withdrawn" || state.lastWithdrawnBy !== ACCESS_HOLDS_ACTOR) {
     return { outcome: "skipped", keep: false };
   }
   const changed = await changeWorkflowState(tx, org, id, "publish", {
@@ -134,7 +145,7 @@ async function publishIfFree(
     actor: ACCESS_HOLDS_ACTOR,
     reason: HOLD_PUBLISH_REASON,
   });
-  if (!changed.ok) return { outcome: "failed", keep: false };
+  if (!changed.ok) throw new Refusal(changed.issues[0]?.code ?? "refused");
   // On the record as it is now, published, as the service's publish checks
   // it; any issue rolls the change back.
   const issues = await publishCheckIssues(tx, org, id, { lock: true });
@@ -143,7 +154,7 @@ async function publishIfFree(
     outcome: issues.some((i) => HOLD_CODES.has(i.code)) ? "still_held" : "blocked",
     keep: false,
   };
-}
+};
 
 /**
  * One pass over every organization (or one): withdraws published records an
@@ -157,9 +168,9 @@ export async function applyAccessHolds(
 ): Promise<AccessHoldsReport> {
   const apply = options.apply;
   const attempts = Math.max(1, Math.trunc(options.attempts ?? 3));
-  const limit = Math.max(
+  const pageSize = Math.max(
     1,
-    Math.min(Math.trunc(options.limit ?? MAX_HOLD_CANDIDATES), MAX_HOLD_CANDIDATES),
+    Math.min(Math.trunc(options.pageSize ?? MAX_HOLD_CANDIDATES), MAX_HOLD_CANDIDATES),
   );
   const counts: Record<Outcome, number> = {
     withdrawn: 0,
@@ -169,13 +180,9 @@ export async function applyAccessHolds(
     skipped: 0,
     failed: 0,
   };
-  let more = false;
+  let unknownDay = 0;
 
-  const one = async (
-    org: OrganizationId,
-    id: RecordId,
-    step: typeof withdrawIfHeld,
-  ): Promise<Outcome> => {
+  const one = async (org: OrganizationId, id: RecordId, step: Step): Promise<Outcome> => {
     for (let attempt = 1; ; attempt++) {
       try {
         return await db.transaction(async (tx) => {
@@ -200,13 +207,34 @@ export async function applyAccessHolds(
   const orgs =
     options.organizationId === undefined ? await organizationIds(db) : [options.organizationId];
   for (const org of orgs) {
+    const today = await organizationDay(db, org);
+    // An unknown day holds every closed_until restriction (D-103): acting on
+    // it would withdraw records whose restriction ended long ago.
+    if (today === undefined) {
+      unknownDay += 1;
+      continue;
+    }
     // Publish again first: a record withdrawn now isn't looked at again in
-    // the same pass (it would only be still held).
-    const free = await withdrawnBy(db, org, ACCESS_HOLDS_ACTOR, limit + 1);
-    const held = await publishedPerhapsHeld(db, org, limit + 1);
-    if (free.length > limit || held.length > limit) more = true;
-    for (const id of free.slice(0, limit)) counts[await one(org, id, publishIfFree)] += 1;
-    for (const id of held.slice(0, limit)) counts[await one(org, id, withdrawIfHeld)] += 1;
+    // the same pass. Every page is read (by ID, after the last), so no
+    // record waits behind others that never change.
+    for (let after: RecordId | undefined; ;) {
+      const page = await withdrawnBy(db, org, ACCESS_HOLDS_ACTOR, {
+        limit: pageSize,
+        ...(after === undefined ? {} : { after }),
+      });
+      for (const id of page) counts[await one(org, id, publishIfFree)] += 1;
+      if (page.length < pageSize) break;
+      after = page.at(-1);
+    }
+    for (let after: RecordId | undefined; ;) {
+      const page = await publishedPerhapsHeld(db, org, today, {
+        limit: pageSize,
+        ...(after === undefined ? {} : { after }),
+      });
+      for (const id of page) counts[await one(org, id, withdrawIfHeld)] += 1;
+      if (page.length < pageSize) break;
+      after = page.at(-1);
+    }
   }
   return Object.freeze({
     dryRun: !apply,
@@ -215,6 +243,6 @@ export async function applyAccessHolds(
     stillHeld: counts.still_held,
     blocked: counts.blocked,
     failed: counts.failed,
-    more,
+    unknownDay,
   });
 }

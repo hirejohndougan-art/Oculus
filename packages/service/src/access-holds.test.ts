@@ -407,7 +407,7 @@ describe("the access-holds pass (T-034f)", () => {
     expect(await stateOf(w, w.fonds.id)).toBe("ready_for_review");
   });
 
-  it("leaves a record withdrawn when the publish check refuses it for another reason", async () => {
+  it("counts a record it can't change as failed, says why in a code, and leaves it withdrawn", async () => {
     await ready();
     const w = await world();
     const made = ok(
@@ -417,16 +417,22 @@ describe("the access-holds pass (T-034f)", () => {
       ),
     );
     expect(await pass(w)).toMatchObject({ withdrawn: 1 });
-    // While withdrawn, someone takes its rights statement away.
-    const vase = ok(await service.readRecord(root(w), w.vase.id));
-    ok(
-      await service.updateRecord(
-        root(w),
-        w.vase.id,
-        { ...vase.record, fields: { description: "A vase." } },
-        { expectedVersion: vase.version },
-      ),
-    );
+    // While withdrawn, its stored row is changed outside any version (a
+    // repair by hand): the change of state refuses to write from it.
+    await s.owner.transaction(async (q) => {
+      for (const t of ["zzzz_records_version_step", "zzzz_records_have_version"]) {
+        await q.rows(sql`SELECT set_config('oculus_test.trigger', ${t}, true)`);
+        await q.execute(sql`DO $$ BEGIN
+          EXECUTE format('ALTER TABLE public.records DISABLE TRIGGER %I',
+                         current_setting('oculus_test.trigger'));
+        END $$`);
+      }
+      await q.execute(sql`UPDATE public.records SET fields = fields - 'rights'
+                          WHERE organization_id = ${w.org}::uuid AND id = ${w.vase.id}::uuid`);
+      // Put back as the migrations made them.
+      await q.execute(sql`ALTER TABLE public.records ENABLE TRIGGER zzzz_records_version_step`);
+      await q.execute(sql`ALTER TABLE public.records ENABLE TRIGGER zzzz_records_have_version`);
+    });
     ok(
       await service.updateAccession(
         donors(w),
@@ -438,7 +444,15 @@ describe("the access-holds pass (T-034f)", () => {
         { expectedVersion: 1 },
       ),
     );
-    expect(await pass(w)).toMatchObject({ published: 0, blocked: 1, failed: 0 });
+    const told: unknown[] = [];
+    const result = await applyAccessHolds(s.writer, {
+      apply: true,
+      organizationId: w.org,
+      onError: (e) => told.push(e),
+    });
+    expect(result).toMatchObject({ published: 0, failed: 1 });
+    expect(told).toHaveLength(1);
+    expect((told[0] as { code?: unknown }).code).toMatch(/^[a-z_]+$/);
     expect(await stateOf(w, w.vase.id)).toBe("withdrawn");
     expect(await isPublic(w, w.vase.id)).toBe(false);
   });
@@ -456,16 +470,70 @@ describe("the access-holds pass (T-034f)", () => {
     expect(await stateOf(b, b.fonds.id)).toBe("withdrawn");
   });
 
-  it("says there were more than one pass takes", async () => {
+  it("reads every page, so no record waits behind others that never change", async () => {
     await ready();
     const w = await world();
     ok(await service.createAccession(donors(w), accessionInput(w)));
-    const capped = await applyAccessHolds(s.writer, {
+    const paged = await applyAccessHolds(s.writer, {
       apply: true,
       organizationId: w.org,
-      limit: 1,
+      pageSize: 1,
     });
-    expect(capped).toMatchObject({ withdrawn: 1, more: true });
-    expect(await pass(w)).toMatchObject({ withdrawn: 1, more: false });
+    expect(paged).toMatchObject({ withdrawn: 2, failed: 0 });
+    expect(await stateOf(w, w.item.id)).toBe("withdrawn");
+  });
+
+  it("publishes nothing a person edited after the pass withdrew it", async () => {
+    await ready();
+    const w = await world();
+    const made = ok(
+      await service.createAccession(
+        donors(w),
+        accessionInput(w, { records: [{ recordId: w.vase.id, label: "Vase" }] }),
+      ),
+    );
+    expect(await pass(w)).toMatchObject({ withdrawn: 1 });
+    const vase = ok(await service.readRecord(root(w), w.vase.id));
+    ok(
+      await service.updateRecord(
+        root(w),
+        w.vase.id,
+        { ...vase.record, fields: { ...vase.record.fields, description: "A vase, edited." } },
+        { expectedVersion: vase.version },
+      ),
+    );
+    ok(
+      await service.updateAccession(
+        donors(w),
+        made.accession.id,
+        accessionInput(w, {
+          deedStatus: "signed",
+          records: [{ recordId: w.vase.id, label: "Vase" }],
+        }),
+        { expectedVersion: 1 },
+      ),
+    );
+    expect(await pass(w)).toMatchObject({ published: 0, withdrawn: 0, blocked: 0 });
+    expect(await stateOf(w, w.vase.id)).toBe("withdrawn");
+  });
+
+  it("leaves an organization alone while its time zone is no longer known", async () => {
+    await ready();
+    const w = await world();
+    ok(await service.createAccession(donors(w), accessionInput(w)));
+    // A zone PostgreSQL no longer knows (as after an OS time zone update):
+    // stored past the trigger, as only an owner could.
+    await s.owner.transaction(async (q) => {
+      await q.execute(
+        sql`ALTER TABLE public.organizations DISABLE TRIGGER organizations_check_time_zone`,
+      );
+      await q.execute(sql`UPDATE public.organizations SET time_zone = 'America/Nowhere_Invented'
+                          WHERE id = ${w.org}::uuid`);
+      await q.execute(
+        sql`ALTER TABLE public.organizations ENABLE ALWAYS TRIGGER organizations_check_time_zone`,
+      );
+    });
+    expect(await pass(w)).toMatchObject({ withdrawn: 0, unknownDay: 1 });
+    expect(await stateOf(w, w.fonds.id)).toBe("published");
   });
 });

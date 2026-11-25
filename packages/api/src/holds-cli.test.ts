@@ -43,7 +43,7 @@ describe("npm run holds (T-034f)", () => {
       stillHeld: 0,
       blocked: 0,
       failed: 0,
-      more: false,
+      unknownDay: 0,
     };
     expect(holdsLines(report)).toEqual([
       "Access holds checked.",
@@ -56,13 +56,13 @@ describe("npm run holds (T-034f)", () => {
       stillHeld: 3,
       blocked: 1,
       failed: 1,
-      more: true,
+      unknownDay: 1,
     });
     expect(dry[0]).toBe("Dry run: nothing was changed.");
     expect(dry[1]).toContain("Would withdraw");
     expect(dry.join("\n")).toContain("Still held back, left withdrawn: 3 records.");
     expect(dry.join("\n")).toContain("another reason");
     expect(dry.join("\n")).toContain("Couldn't be checked or changed");
-    expect(dry.at(-1)).toContain("run it again");
+    expect(dry.at(-1)).toContain("time zone is no longer known");
   });
 });

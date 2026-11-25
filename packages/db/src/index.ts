@@ -564,6 +564,7 @@ export {
 export {
   MAX_HOLD_CANDIDATES,
   lockRecordState,
+  organizationDay,
   organizationIds,
   publishedPerhapsHeld,
   withdrawnBy,
