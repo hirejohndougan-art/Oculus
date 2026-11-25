@@ -1,7 +1,10 @@
 // M-001 (D-089) in a real browser: a stored HTML or SVG file that carries
 // script can't run it, whether a page on another origin (a public site)
 // frames, embeds or links it, or someone opens it directly; and an SVG
-// stored under a raster type is never rendered as SVG. The file server here
+// stored under a raster type is never rendered as SVG. Framing and embedding
+// are stopped by several of the file headers together (frame-ancestors,
+// CORP, the sandbox, the download type); the unit tests check each header,
+// and opening a file directly shows the download rule on its own. The file server here
 // is Oculus's own (`buildServer` with `fileReply` routes), on its own port.
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -35,7 +38,7 @@ let close: (() => Promise<void>) | undefined;
 let publicSite: Server | undefined;
 let publicBase = "";
 let publicPage = "";
-const fetched = new Set<string>();
+const fetched = new Map<string, number>();
 
 test.beforeAll(async () => {
   const placeholder = "http://127.0.0.1:1";
@@ -52,7 +55,7 @@ test.beforeAll(async () => {
       method: "GET" as const,
       path,
       handler: () => {
-        fetched.add(path);
+        fetched.set(path, (fetched.get(path) ?? 0) + 1);
         const bytes = Buffer.from(file.bytes);
         return fileReply({
           body: bytes,
@@ -105,8 +108,10 @@ test("a public page can't run a stored file's script by framing or embedding it"
   await page.goto(`${publicBase}/`);
   await page.waitForTimeout(2000);
   expect(await page.evaluate(() => (window as unknown as { control?: true }).control)).toBe(true);
-  // Every file was really fetched (not blocked before reaching Oculus).
+  // Every file was really requested from Oculus, by several of the tags
+  // (not blocked before reaching it).
   expect(fetched.size).toBe(Object.keys(FILES).length);
+  for (const count of fetched.values()) expect(count).toBeGreaterThanOrEqual(2);
   expect(await page.evaluate(() => (window as unknown as { ran: number }).ran)).toBe(0);
   expect(await page.title()).toBe("Public site");
 });

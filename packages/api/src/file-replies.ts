@@ -24,11 +24,16 @@
  * - **The length** is fixed: `size` must match the bytes given, and a
  *   stream that runs long or short is cut off with an error, so a reply can
  *   never send more than its Content-Length says.
+ * - **Streams** are read only when the reply goes out (`sendFileStream`),
+ *   outside the handler timeout, through `pipeline`, so a storage error, a
+ *   wrong length or a client that goes away closes the source; HEAD reads
+ *   nothing; a reply that is never sent is destroyed (`discardFileReply`).
  *
  * Where files are served from (an origin of their own, apart from the public
  * sites) is T-050's; ranges and caching are M-003's or later.
  */
-import { Readable, Transform, type TransformCallback } from "node:stream";
+import type { ServerResponse } from "node:http";
+import { Readable, Transform, pipeline, type TransformCallback } from "node:stream";
 
 /**
  * The only types a file may be shown as in the browser (essences, lower
@@ -123,14 +128,25 @@ export function mayShowInline(mediaType: unknown): boolean {
 export function safeFileName(name: unknown): string {
   const text = typeof name === "string" ? name.normalize("NFC") : "";
   let cleaned = text
+    .replace(/\s+/gu, " ")
     .replace(/[\p{Cc}\p{Cf}\p{Co}\p{Cs}\p{Zl}\p{Zp}]/gu, "")
     .replace(/[/\\"*:<>?|]/g, "_")
-    .replace(/\s+/gu, " ")
     .replace(/^[\s.]+/u, "")
     .replace(/[\s.]+$/u, "");
   const chars = Array.from(cleaned);
-  if (chars.length > MAX_FILE_NAME_LENGTH) cleaned = chars.slice(0, MAX_FILE_NAME_LENGTH).join("");
-  cleaned = cleaned.replace(/[\s.]+$/u, "");
+  if (chars.length > MAX_FILE_NAME_LENGTH) {
+    // Keep a short extension (`.tiff`, `.html`) and cut the stem instead.
+    const dot = cleaned.lastIndexOf(".");
+    const extension = dot > 0 ? Array.from(cleaned.slice(dot)) : [];
+    const keep = extension.length > 1 && extension.length <= 16 ? extension : [];
+    cleaned =
+      chars
+        .slice(0, MAX_FILE_NAME_LENGTH - keep.length)
+        .join("")
+        .replace(/[\s.]+$/u, "") + keep.join("");
+  }
+  // Windows device names (CON, nul.txt, COM1 …) can't be saved as they are.
+  if (/^(?:con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\.|$)/iu.test(cleaned)) cleaned = `_${cleaned}`;
   return cleaned === "" ? "file" : cleaned;
 }
 
@@ -145,12 +161,16 @@ function extValue(text: string): string {
 /** `attachment` or `inline`, with the name as an ASCII fallback and as `filename*` (RFC 6266 §4.3). */
 export function contentDisposition(disposition: "inline" | "attachment", name: unknown): string {
   const safe = safeFileName(name);
-  const ascii = safe.replace(/[^A-Za-z0-9 ._()+,=@[\]{}~!#$&^-]/g, "_");
+  const ascii = safe.replace(/[^A-Za-z0-9 ._()+,=@[\]{}~!#$&^-]/gu, "_");
   return `${disposition}; filename="${ascii}"; filename*=UTF-8''${extValue(safe)}`;
 }
 
+function ignore(): void {
+  // The stream's errors are handled where it is piped (sendFileStream).
+}
+
 /** Cuts a stream off with an error if it gives more or fewer than `size` bytes. */
-class ExactLength extends Transform {
+export class ExactLength extends Transform {
   private seen = 0;
   constructor(private readonly size: number) {
     super();
@@ -192,9 +212,11 @@ export function fileReply(input: FileReplyInput): FileReply {
     if (body.byteLength !== size) throw new Error("the file's bytes don't match its size");
     sent = Buffer.from(body.buffer, body.byteOffset, body.byteLength);
   } else if (body instanceof Readable) {
-    const exact = new ExactLength(size);
-    body.once("error", (error) => exact.destroy(error));
-    sent = body.pipe(exact);
+    // Not read yet: the server pipes it (`sendFileStream`) only once the
+    // reply goes out, and destroys it if it never does. Until then an error
+    // from storage must not become an uncaught exception.
+    body.on("error", ignore);
+    sent = body;
   } else {
     throw new Error("a file's body must be bytes or a readable stream");
   }
@@ -207,4 +229,44 @@ export function fileReply(input: FileReplyInput): FileReply {
   const reply: FileReply = Object.freeze({ headers, body: sent });
   made.add(reply);
   return reply;
+}
+
+/**
+ * Sends a streamed file reply on the raw response (server.ts, after
+ * `reply.hijack()`): the status, `headers` and the stream through
+ * `ExactLength`, with `pipeline`, so an error anywhere, a stream of the wrong
+ * length or the client going away destroys the source and the response
+ * together (no open file left behind, never more than Content-Length sent).
+ * A HEAD request gets the headers and nothing is read. Calls `failed` once
+ * if the transfer breaks. Hijacked, the reply is outside the handler
+ * timeout, so a long download isn't cut at 30 seconds.
+ */
+export function sendFileStream(
+  response: ServerResponse,
+  method: string,
+  headers: Readonly<Record<string, string>>,
+  file: FileReply,
+  failed: () => void,
+): void {
+  const source = file.body;
+  if (!(source instanceof Readable)) throw new Error("sendFileStream sends streams only");
+  response.writeHead(200, headers);
+  if (method === "HEAD") {
+    source.destroy();
+    response.end();
+    return;
+  }
+  const size = Number(file.headers["content-length"]);
+  pipeline(source, new ExactLength(size), response, (error) => {
+    if (error) {
+      source.destroy();
+      response.destroy();
+      failed();
+    }
+  });
+}
+
+/** Lets go of a file reply that will never be sent (the request ended first). */
+export function discardFileReply(file: FileReply): void {
+  if (file.body instanceof Readable) file.body.destroy();
 }

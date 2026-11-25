@@ -90,7 +90,13 @@ import {
   summarizeThrown,
   type ThrownSummary,
 } from "./errors.js";
-import { FILE_SECURITY_HEADERS, isFileReply, type FileReply } from "./file-replies.js";
+import {
+  FILE_SECURITY_HEADERS,
+  discardFileReply,
+  isFileReply,
+  sendFileStream,
+  type FileReply,
+} from "./file-replies.js";
 import { SECURITY_HEADERS } from "./headers.js";
 import { failsOriginCheck, originsFromEnv } from "./origin.js";
 import { RouteTable, pathOf, pathProblem } from "./paths.js";
@@ -243,6 +249,9 @@ function logLateFailure(request: FastifyRequest, fresh: Refusal, thrown: unknown
   }
 }
 
+/** Requests answered with a file (M-001, D-089): they get `FILE_SECURITY_HEADERS` in onSend. */
+const fileReplies = new WeakSet<FastifyRequest>();
+
 /**
  * Registers one application route (already checked and copied by
  * `checkRoute`). Whatever the handler throws or rejects with is caught here
@@ -254,9 +263,6 @@ function logLateFailure(request: FastifyRequest, fresh: Refusal, thrown: unknown
  * result or failure is never handed to Fastify (which would log the request
  * URL, query string included, and the error object).
  */
-/** Requests answered with a file (M-001, D-089): they get `FILE_SECURITY_HEADERS` in onSend. */
-const fileReplies = new WeakSet<FastifyRequest>();
-
 function addRoute(app: FastifyInstance, route: OculusRoute): void {
   const credentials = route.credentials === true;
   const handler = route.handler;
@@ -307,13 +313,30 @@ function addRoute(app: FastifyInstance, route: OculusRoute): void {
         response.removeListener("close", stop);
       }
       // Timed out (the 503 is already sent) or the client has gone.
-      if (ended()) return undefined;
+      if (ended()) {
+        if (file !== undefined) discardFileReply(file);
+        return undefined;
+      }
       if (file !== undefined) {
         // A file (file-replies.ts): exactly its own headers, whatever the
-        // handler set, always a 200, and the file headers in onSend.
+        // handler set, always a 200, with the file headers.
         for (const name of Object.keys(reply.getHeaders())) reply.removeHeader(name);
-        fileReplies.add(request);
-        return reply.code(200).headers(file.headers).send(file.body);
+        if (file.body instanceof Uint8Array) {
+          fileReplies.add(request);
+          return reply.code(200).headers(file.headers).send(file.body);
+        }
+        // A stream: sent on the raw response, outside the handler timeout.
+        void reply.hijack();
+        sendFileStream(
+          reply.raw,
+          request.method,
+          { ...file.headers, ...FILE_SECURITY_HEADERS },
+          file,
+          () => {
+            request.log.warn({ failure: { code: "file_stream_failed" } }, "file reply cut off");
+          },
+        );
+        return undefined;
       }
       return reply.send(body);
     },
