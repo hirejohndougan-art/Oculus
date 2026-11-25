@@ -293,6 +293,8 @@ export {
   deleteExpiredSessions,
   deleteOldPasswordResets,
   runCleanup,
+  WRONG_CODE_MEMORY_SECONDS,
+  UNEXPLAINED_TOLD_AFTER_SECONDS,
   NO_SESSION,
   MAX_LISTED_SESSIONS,
   SESSION_TABLE_PRIVILEGES,
@@ -346,7 +348,6 @@ export {
   MAX_ENROLMENT_STARTS,
   TOTP_CHAIN_LENGTH,
   ENROLMENT_TOKEN_SECONDS,
-  WRONG_CODE_MEMORY_SECONDS,
 } from "./second-factor.js";
 export type {
   SecondStepRefusal,

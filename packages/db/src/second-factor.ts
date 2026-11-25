@@ -115,6 +115,7 @@ import {
   type PromotionRefusal,
   type SessionCallOptions,
   type SessionFailure,
+  WRONG_CODE_MEMORY_SECONDS,
 } from "./sessions.js";
 import { sql } from "./sql.js";
 
@@ -440,12 +441,6 @@ interface Counted {
   /** Whether this attempt added one to it (TOTP codes only). */
   readonly wrongCounted: boolean;
 }
-
-/**
- * How long wrong TOTP codes that no right code in their session explained
- * are kept for an alert (S-045): 30 days without a new one.
- */
-export const WRONG_CODE_MEMORY_SECONDS = 30 * 24 * 60 * 60;
 
 function wrongKeyOf(userId: UserId): string {
   return `wrong:${userId}`;

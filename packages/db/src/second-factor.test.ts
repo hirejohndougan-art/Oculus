@@ -808,27 +808,45 @@ describe("wrong codes no right code explained raise an alert (S-045)", () => {
     expect(await alertsOf(person.userId)).toEqual([]);
   });
 
-  it("forgets them after 30 days without another, and the cleanup keeps them until then", async () => {
+  it("the cleanup tells the codes of a sign-in that never finished, an hour on, without waiting for the next", async () => {
     await ready();
     const org = await organization();
     const person = await member(org);
-    const other = await member(org);
-    for (const who of [person, other]) {
+    const recent = await member(org);
+    for (const who of [person, recent]) {
       const a = await pending(who.userId, org);
-      await completeSecondStep(db, keys, a.token, {
-        source: source(),
-        code: await wrongFor(who.userId),
-      });
+      for (let i = 0; i < 3; i++) {
+        await completeSecondStep(db, keys, a.token, {
+          source: source(),
+          code: await wrongFor(who.userId),
+        });
+      }
     }
-    // A week on, the cleanup keeps both (an ordinary counter goes after a day).
-    await later(person.userId, 24 * 7);
-    await later(other.userId, 24 * 31);
+    // The person's 3 are two hours old, a week old for their wait counter
+    // too; the other's are minutes old and could still be explained.
+    await later(person.userId, 2);
+    const done = await runCleanup(db);
+    expect(done.secondStepAlerts).toBeGreaterThanOrEqual(1);
+    expect(await alertsOf(person.userId)).toEqual([3]);
+    expect(await unexplained(person.userId)).toBe(0);
+    expect(await alertsOf(recent.userId)).toEqual([]);
+    expect(await unexplained(recent.userId)).toBe(3);
+    // Told once: neither a second cleanup nor the next sign-in tells them again.
     await runCleanup(db);
-    expect(await unexplained(person.userId)).toBe(1);
-    expect(await unexplained(other.userId)).toBe(0);
-    expect(await counters(person.userId)).toBe(0);
-    // 31 days on, the person's is forgotten even before a cleanup.
-    await later(person.userId, 24 * 24);
+    await full(person.userId, org);
+    expect(await alertsOf(person.userId)).toEqual([3]);
+  });
+
+  it("forgets them after 30 days without another if no cleanup ran", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const a = await pending(person.userId, org);
+    await completeSecondStep(db, keys, a.token, {
+      source: source(),
+      code: await wrongFor(person.userId),
+    });
+    await later(person.userId, 24 * 31);
     await full(person.userId, org);
     expect(await alertsOf(person.userId)).toEqual([]);
   });
