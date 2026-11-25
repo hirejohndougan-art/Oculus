@@ -373,3 +373,10 @@ export type {
   AuditEntry,
   AuditPage,
 } from "./people.js";
+export {
+  STARTER_TEMPLATE_FIELDS,
+  STARTER_TEMPLATE_KEY,
+  isEmptyInstall,
+  setUpFirstInstall,
+} from "./first-setup.js";
+export type { FirstInstall, FirstInstallResult } from "./first-setup.js";
