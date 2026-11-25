@@ -159,6 +159,8 @@ export {
   MAX_AFFECTED_PUBLISHED,
 } from "./definitions.js";
 export type { TemplateSummary } from "./definitions.js";
+export { readDublinCoreMapping, writeDublinCoreMapping } from "./dublin-core-mappings.js";
+export type { StoredDublinCoreMapping } from "./dublin-core-mappings.js";
 export {
   searchRecords,
   MAX_SEARCH_QUERY_LENGTH,

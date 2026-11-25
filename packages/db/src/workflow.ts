@@ -740,9 +740,11 @@ export interface PublicRecordOptions {
   /**
    * The organization's Dublin Core mappings; the one for the record's
    * template is used. Configuration, not record data: `publicOutput` checks
-   * it against the template and the organization (D-047).
+   * it against the template and the organization (D-047). Left out: the
+   * template's stored mapping (T-050b, D-094), read in the same snapshot
+   * through `public_dublin_core_mapping`, which the public reader may call.
    */
-  readonly mappings: readonly DublinCoreMapping[];
+  readonly mappings?: readonly DublinCoreMapping[];
 }
 
 /** The answer for a record that isn't published, doesn't exist or is another organization's. */
@@ -846,8 +848,8 @@ export async function readPublicRecord(
   }
   const baseUrl = ownValue(options, "baseUrl");
   const mappings = ownValue(options, "mappings");
-  if (typeof baseUrl !== "string" || !Array.isArray(mappings)) {
-    return refused([], "invalid_options", "Give { baseUrl, mappings }.");
+  if (typeof baseUrl !== "string" || (mappings !== undefined && !Array.isArray(mappings))) {
+    return refused([], "invalid_options", "Give { baseUrl, mappings? }.");
   }
   return db.transaction(async (tx) => {
     // One snapshot for every read below, and nothing written.
@@ -879,9 +881,19 @@ export async function readPublicRecord(
     if (!effective.ok) return refused([], "unreadable_record", CANT_CHECK);
     const view = publicView(effective.value);
     if (view === undefined) return refused([], "unreadable_record", CANT_CHECK);
-    const mapping = (mappings as readonly unknown[]).find(
-      (m) => ownValue(m, "template") === record.templateKey,
-    );
+    let mapping: unknown;
+    if (mappings === undefined) {
+      // The stored one, from the same snapshot (Repeatable Read, above).
+      const [stored] = await tx.rows<{ mapping: unknown }>(sql`
+        SELECT public.public_dublin_core_mapping(${organizationId}::uuid, ${siteId}::uuid,
+                                                 ${recordId}::uuid) AS mapping`);
+      mapping = stored?.mapping ?? undefined;
+      if (mapping === null) mapping = undefined;
+    } else {
+      mapping = (mappings as readonly unknown[]).find(
+        (m) => ownValue(m, "template") === record.templateKey,
+      );
+    }
     if (mapping === undefined) {
       return refused(
         ["mappings"],
