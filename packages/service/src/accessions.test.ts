@@ -342,6 +342,55 @@ describe("accessions through the service (T-018c)", () => {
     expect(history).toEqual({ n: 2, who: w.donorStaff });
   });
 
+  it("never gives an all-time number to a second accession, even after the first gave it up", async () => {
+    await ready();
+    const w = await world();
+    const first = ok(await service.createAccession(ctx(w, w.donorStaff), accessionInput(w)));
+    ok(
+      await service.updateAccession(
+        ctx(w, w.donorStaff),
+        first.accession.id,
+        accessionInput(w, { number: { type: "accession_number", value: "2026.900" } }),
+        { expectedVersion: 1 },
+      ),
+    );
+    const reuse = await service.createAccession(
+      ctx(w, w.donorStaff),
+      accessionInput(w, { records: [{ recordId: w.vase.id, label: "Vase" }] }),
+    );
+    expect(codes(reuse)).toEqual(["duplicate_number"]);
+    // The accession that had it may take it back.
+    ok(
+      await service.updateAccession(ctx(w, w.donorStaff), first.accession.id, accessionInput(w), {
+        expectedVersion: 2,
+      }),
+    );
+  });
+
+  it("names only records of sites where the person works with donors", async () => {
+    await ready();
+    const w = await world();
+    const other = await makeSite(service, w.root, w.org, `Invented other site ${String(count)}`);
+    const elsewhere = ok(
+      await service.createRecord(
+        { organizationId: w.org, actor: actorOf(w.root), siteId: other },
+        { kind: "object", title: "Invented elsewhere jar", templateKey: "t-object", fields: {} },
+      ),
+    ).record;
+    const refused = await service.createAccession(
+      ctx(w, w.donorStaff),
+      accessionInput(w, { records: [{ recordId: elsewhere.id, label: "Jar" }] }),
+    );
+    expect(codes(refused)).toEqual(["not_permitted"]);
+    // A system manager may.
+    ok(
+      await service.createAccession(
+        ctx(w, w.root),
+        accessionInput(w, { records: [{ recordId: elsewhere.id, label: "Jar" }] }),
+      ),
+    );
+  });
+
   it("refuses an input with an ID, an organization or a key it doesn't take", async () => {
     await ready();
     const w = await world();

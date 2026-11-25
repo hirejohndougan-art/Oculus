@@ -427,3 +427,18 @@ export async function publishedBelow(
     LIMIT 10001`);
   return Object.freeze(rows.map((r) => r.id as RecordId));
 }
+
+/** Whether another accession than `accessionId` has ever had `numberKey` (all_time types). */
+export async function numberUsedBefore(
+  db: Queryable,
+  organizationId: OrganizationId,
+  numberKey: string,
+  accessionId: string,
+): Promise<boolean> {
+  const [row] = await db.rows<{ used: boolean }>(sql`
+    SELECT EXISTS (SELECT 1 FROM public.accession_numbers
+                   WHERE organization_id = ${organizationId}::uuid
+                     AND number_key = ${numberKey}
+                     AND accession_id <> ${accessionId}::uuid) AS used`);
+  return row?.used === true;
+}

@@ -431,7 +431,9 @@ async function checkRoleConnection(
                          || pg_catalog.oidvectortypes(p.proargtypes) || ')' AS name
                   FROM pg_catalog.pg_proc p
                   JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+                  -- A trigger function can't be called by itself (T-018c).
                   WHERE p.prosecdef AND ${profile.definers !== undefined}::boolean
+                    AND p.prorettype <> 'pg_catalog.trigger'::pg_catalog.regtype
                     AND pg_catalog.has_function_privilege(w.oid, p.oid, 'EXECUTE')) AS f
             WHERE f.name <> ALL(${[...(profile.definers ?? [])]}::text[])) AS definers,
            (NOT w.current

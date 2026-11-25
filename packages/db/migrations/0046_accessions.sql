@@ -23,7 +23,8 @@
 -- keys to records: a record an accession names can't be deleted.
 --
 -- accession_versions: every definition saved, with who and when, written by
--- a trigger (insert only), so the history can't be skipped.
+-- a trigger (insert only), so the history can't be skipped; and
+-- accession_numbers, every number each accession has had.
 --
 -- donor_contacts: one DonorContact per agent record (core's
 -- validateDonorContact), versioned the same way; the writer may DELETE one.
@@ -76,6 +77,17 @@ CREATE TABLE public.accession_versions (
   saved_by uuid NOT NULL REFERENCES public.users (id),
   saved_at timestamptz NOT NULL,
   PRIMARY KEY (organization_id, accession_id, version),
+  FOREIGN KEY (organization_id, accession_id) REFERENCES public.accessions (organization_id, id)
+);
+
+-- Every number an accession has had (its number_key), so an identifier
+-- type with all_time uniqueness never gives a number to a second accession
+-- (the service checks; written by the trigger below, insert only).
+CREATE TABLE public.accession_numbers (
+  organization_id uuid NOT NULL,
+  number_key text NOT NULL,
+  accession_id uuid NOT NULL,
+  PRIMARY KEY (organization_id, number_key, accession_id),
   FOREIGN KEY (organization_id, accession_id) REFERENCES public.accessions (organization_id, id)
 );
 
@@ -137,6 +149,9 @@ BEGIN
   INSERT INTO public.accession_records (organization_id, accession_id, record_id)
   SELECT DISTINCT NEW.organization_id, NEW.id, (link.value ->> 'recordId')::uuid
   FROM jsonb_array_elements(NEW.definition -> 'records') AS link(value);
+  INSERT INTO public.accession_numbers (organization_id, number_key, accession_id)
+  VALUES (NEW.organization_id, NEW.number_key, NEW.id)
+  ON CONFLICT DO NOTHING;
   INSERT INTO public.accession_versions
     (organization_id, accession_id, version, definition, saved_by, saved_at)
   VALUES (NEW.organization_id, NEW.id, NEW.version, NEW.definition, NEW.updated_by,

@@ -29,6 +29,7 @@
  */
 import {
   accessionHoldsOn,
+  holdsForWholeCatalog,
   identifierKey,
   indexAccessions,
   isRecordId,
@@ -47,12 +48,15 @@ import {
   MAX_ACCESSION_PAGE,
   deleteDonorContact,
   insertAccession,
+  lockRecord,
   listAccessions,
+  numberUsedBefore,
   publishedBelow,
   readAccession,
   readAccessionRecords,
   readDonorContact,
   readIdentifierTypes,
+  readRecordPlace,
   saveDonorContact,
   sql,
   updateAccession,
@@ -188,11 +192,62 @@ export function accessionOperations(run: Runner): AccessionOperations {
     tx: Queryable,
     who: { organizationId: Accession["organizationId"]; actor: string },
     permission: RolePermission,
-  ): Promise<{ ok: true; userId: string } | Refusal> {
+  ): Promise<{ ok: true; userId: string; access: Access } | Refusal> {
     const access = await readAccess(tx, who.organizationId, who.actor);
     if (!access.ok) return access;
     if (!holdsDonorPermission(access.value, permission)) return NOT_PERMITTED();
-    return { ok: true, userId: access.userId };
+    return { ok: true, userId: access.userId, access: access.value };
+  }
+
+  /**
+   * Whether the person may name each of `ids` in an accession: the record's
+   * home site is one where they hold `donors.edit` for the whole catalog
+   * (a record on no site: system managers only, as for every catalog
+   * permission). Accessions belong to the organization, but naming a record
+   * holds it back from that site's public, so it takes a role there (D-114).
+   */
+  async function mayName(
+    tx: Queryable,
+    org: Accession["organizationId"],
+    access: Access,
+    ids: readonly RecordId[],
+  ): Promise<Refusal | undefined> {
+    if (access.systemManager) return undefined;
+    for (const id of ids) {
+      const place = await readRecordPlace(tx, org, id);
+      // A record that doesn't exist is core's to report (unknown_record).
+      if (place === undefined) continue;
+      if (place.siteId === null || !holdsForWholeCatalog(access, "donors.edit", place.siteId)) {
+        return refusal(
+          ["records"],
+          "not_permitted",
+          "An accession can name only records of sites where you work with donors and accessions.",
+        );
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Of `ids`, those on sites where the person works with donors
+   * (`donors.edit`, the same rule as naming them): the records below a
+   * named one may be on another site.
+   */
+  async function visible(
+    tx: Queryable,
+    org: Accession["organizationId"],
+    access: Access,
+    ids: readonly RecordId[],
+  ): Promise<readonly RecordId[]> {
+    if (access.systemManager) return ids;
+    const out: RecordId[] = [];
+    for (const id of ids) {
+      const place = await readRecordPlace(tx, org, id);
+      if (place?.siteId != null && holdsForWholeCatalog(access, "donors.edit", place.siteId)) {
+        out.push(id);
+      }
+    }
+    return Object.freeze(out);
   }
 
   async function today(tx: Queryable, org: Accession["organizationId"]): Promise<string> {
@@ -200,6 +255,36 @@ export function accessionOperations(run: Runner): AccessionOperations {
       sql`SELECT public.organization_local_day(${org}::uuid) AS today`,
     );
     return row?.today ?? "";
+  }
+
+  /**
+   * Locks every record `candidate` names (and `before`, the stored version's)
+   * `FOR NO KEY UPDATE`, in ID order: a publish of one of them, or of a
+   * record below one, holds `FOR SHARE` on it until it commits, so the
+   * two never pass each other (D-114): either the publish committed first
+   * and `nowHeld` sees it, or it waits and its check sees this accession.
+   */
+  async function lockNamed(
+    tx: Queryable,
+    org: Accession["organizationId"],
+    candidate: unknown,
+    before?: unknown,
+  ): Promise<readonly RecordId[]> {
+    const ids = new Set<string>();
+    for (const value of [candidate, before]) {
+      const source = own(own(value, "sourceAgent"), "recordId");
+      if (isRecordId(source)) ids.add(source);
+      const links = own(value, "records");
+      if (Array.isArray(links)) {
+        for (const link of links as unknown[]) {
+          const id = own(link, "recordId");
+          if (isRecordId(id)) ids.add(id);
+        }
+      }
+    }
+    const sorted = [...ids].sort() as RecordId[];
+    for (const id of sorted) await lockRecord(tx, org, id, "no_key_update");
+    return sorted;
   }
 
   /** Core's whole check of one accession, against the records it names and the types, read now. */
@@ -270,9 +355,23 @@ export function accessionOperations(run: Runner): AccessionOperations {
     tx: Queryable,
     org: Accession["organizationId"],
     accession: Accession,
+    access: Access,
     save: (numberKey: string) => ReturnType<typeof insertAccession>,
   ): Promise<ServiceResult<SavedAccession>> {
     const numberKey = `${accession.number.type}:${identifierKey(accession.number.value)}`;
+    // A type numbering for all time never gives a number to a second accession.
+    const types = await readIdentifierTypes(tx, org);
+    const type = types.ok ? types.value.find((t) => t.key === accession.number.type) : undefined;
+    if (
+      type?.uniqueness === "all_time" &&
+      (await numberUsedBefore(tx, org, numberKey, accession.id))
+    ) {
+      return refusal(
+        ["number", "value"],
+        "duplicate_number",
+        "Another accession has had this number. Numbers of this type are never used twice.",
+      );
+    }
     const saved = await save(numberKey);
     if (!saved.ok) {
       if (saved.code === "duplicate_number") {
@@ -295,11 +394,17 @@ export function accessionOperations(run: Runner): AccessionOperations {
         "The accession was saved by someone else since you opened it. Read it again.",
       );
     }
-    const nowHeld = accessionHoldsOn(accession, (await today(tx, org)) || "9999-12-31")
-      ? await publishedBelow(
+    // An unknown day ("") holds every closed_until restriction: never a guess.
+    const nowHeld = accessionHoldsOn(accession, await today(tx, org))
+      ? await visible(
           tx,
           org,
-          accession.records.map((l) => l.recordId),
+          access,
+          await publishedBelow(
+            tx,
+            org,
+            accession.records.map((l) => l.recordId),
+          ),
         )
       : [];
     return {
@@ -360,9 +465,12 @@ export function accessionOperations(run: Runner): AccessionOperations {
         if (!may.ok) return may;
         const candidate = candidateOf(input, newAccessionId(), who.organizationId);
         if (!candidate.ok) return candidate;
+        const named = await lockNamed(tx, who.organizationId, candidate.value);
+        const naming = await mayName(tx, who.organizationId, may.access, named);
+        if (naming) return naming;
         const checked = await checkAccession(tx, who.organizationId, candidate.value);
         if (!checked.ok) return checked;
-        return saveAndReply(tx, who.organizationId, checked.value, (key) =>
+        return saveAndReply(tx, who.organizationId, checked.value, may.access, (key) =>
           insertAccession(tx, checked.value, key, may.userId),
         );
       });
@@ -379,9 +487,12 @@ export function accessionOperations(run: Runner): AccessionOperations {
         if (row === undefined) return UNKNOWN_ACCESSION();
         const candidate = candidateOf(input, id, who.organizationId);
         if (!candidate.ok) return candidate;
+        const named = await lockNamed(tx, who.organizationId, candidate.value, row.definition);
+        const naming = await mayName(tx, who.organizationId, may.access, named);
+        if (naming) return naming;
         const checked = await checkAccession(tx, who.organizationId, candidate.value);
         if (!checked.ok) return checked;
-        return saveAndReply(tx, who.organizationId, checked.value, (key) =>
+        return saveAndReply(tx, who.organizationId, checked.value, may.access, (key) =>
           updateAccession(tx, checked.value, key, may.userId, expected),
         );
       });

@@ -24,6 +24,7 @@ import { freshDatabase, type TestDatabase } from "./test-database.fixtures.js";
 
 /** Every table the real migrations create, in name order. */
 const ALL_TABLES = [
+  "accession_numbers",
   "accession_records",
   "accession_versions",
   "accessions",
