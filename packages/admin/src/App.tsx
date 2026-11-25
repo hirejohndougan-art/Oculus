@@ -44,6 +44,7 @@ import { PeopleList } from "./people/PeopleList";
 import { Person } from "./people/Person";
 import { Roles } from "./people/Roles";
 import { Updates } from "./settings/Updates";
+import { FileCleanup } from "./settings/FileCleanup";
 import { Code } from "./screens/Code";
 import { SettingsLayout, SignInSettings, SitesSettings } from "./settings/Settings";
 import { DublinCoreScreen } from "./settings/DublinCoreEditor";
@@ -169,6 +170,8 @@ export const ROUTES: RouteObject[] = [
               { path: "sign-in", element: <SignInSettings /> },
               // Software updates (T-060).
               { path: "updates", element: <Updates /> },
+              // Clean up removed files (S-052).
+              { path: "files", element: <FileCleanup /> },
             ],
           },
         ],

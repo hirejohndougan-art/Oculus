@@ -39,6 +39,8 @@ export const STORED_FILE_TABLE_PRIVILEGES: Readonly<Record<string, readonly stri
     file_store_binding: Object.freeze(["INSERT"]),
     // The folder's lease, a new epoch at each start, hour and purge (0039).
     file_store_epochs: Object.freeze(["INSERT"]),
+    // The purge's two steps, append-only (0042, S-052).
+    file_purge_steps: Object.freeze(["INSERT"]),
   });
 
 /** One file attached to a digital asset. */
@@ -297,121 +299,228 @@ export async function findStoredFileById(
 export const STORED_FILE_EVENT_KINDS = ["placing", "attached", "removed"] as const;
 export type StoredFileEventKind = (typeof STORED_FILE_EVENT_KINDS)[number];
 
-/** Logs an attach or a removal (the database stamps the time). */
+/**
+ * Logs an attach or a removal (the database stamps the time). A removal
+ * also keeps the stored copy's modification time as the file system gave
+ * it (`copyMtimeNs`, nanoseconds; S-052): the purge takes the copy only
+ * while its time is still that one.
+ */
 export async function insertStoredFileEvent(
   tx: Queryable,
   organizationId: OrganizationId,
   kind: StoredFileEventKind,
   file: Pick<StoredFile, "id" | "recordId" | "sha256" | "size">,
   actor: string,
+  copyMtimeNs?: bigint,
 ): Promise<void> {
   checkOrganization(organizationId);
   if (!(STORED_FILE_EVENT_KINDS as readonly string[]).includes(kind)) {
     throw new TypeError("Not an event kind.");
   }
   if (!isActorId(actor)) throw new TypeError("Not an actor.");
+  if (copyMtimeNs !== undefined && (kind !== "removed" || copyMtimeNs < 0n)) {
+    throw new TypeError("Only a removal keeps the copy's time.");
+  }
+  const mtime = copyMtimeNs === undefined ? null : copyMtimeNs.toString();
   await tx.execute(sql`
     INSERT INTO public.stored_file_events (organization_id, id, kind, file_id, record_id, sha256,
-      byte_size, actor)
+      byte_size, actor, copy_mtime_ns)
     VALUES (${organizationId}::uuid, gen_random_uuid(), ${kind}, ${file.id}::uuid,
-      ${file.recordId}::uuid, ${file.sha256}, ${file.size}::bigint, ${actor})`);
+      ${file.recordId}::uuid, ${file.sha256}, ${file.size}::bigint, ${actor}, ${mtime}::bigint)`);
 }
 
-/** How long a removed file's bytes stay on disk before the purge may take them. */
+/** How long a removed file's bytes stay before the purge may move them to the trash (7 days). */
 export const REMOVED_FILE_GRACE_SECONDS = 7 * 24 * 3600;
-/** How long a copy placed by an attach that never committed stays before the purge may take it. */
-export const PLACING_GRACE_SECONDS = 24 * 3600;
+/** How long a copy stays in the trash before the purge may delete it (24 hours). */
+export const TRASH_GRACE_SECONDS = 24 * 3600;
 
-/** One content the purge would delete, with what this database last did with it. */
+/**
+ * A content the purge may move to the trash (step 1), by the database's
+ * side of the rules; the file system's side is the service's.
+ */
 export interface PurgeCandidate {
   readonly sha256: string;
   readonly size: number;
-  readonly lastEvent: "removed" | "placing";
-  readonly lastEventAt: string;
+  /** The removal the purge acts on: this database's newest event for the content. */
+  readonly removalId: string;
+  readonly removedAt: string;
+  /** The copy's modification time logged with that removal (nanoseconds). */
+  readonly copyMtimeNs: bigint;
 }
 
 /**
- * The contents among `hashes` the operator's purge may delete (D-086,
- * fourth review), **denying by default**. Events before `since` (the last
- * `files:adopt`) count as if they didn't exist. A content qualifies only if
- * no row names it and either
- * - this database's newest event for it is a removal older than
- *   `REMOVED_FILE_GRACE_SECONDS` (so no placing or attach came after it); or
- * - its newest event is a placing (an attach that never committed) older
- *   than `PLACING_GRACE_SECONDS`, and no removal of it happened within the
- *   last `REMOVED_FILE_GRACE_SECONDS` (a failed attach never shortens a
- *   removal's grace).
- * Everything else, content with no event here included, is kept.
+ * The organization's contents the purge may move to the trash (S-052,
+ * D-086), **denying by default**: no row names the content; this
+ * database's newest event for it (counting only events since `since`, the
+ * last `files:adopt`) is a removal that logged the copy's time, at least
+ * `REMOVED_FILE_GRACE_SECONDS` old by the database's clock; and it isn't
+ * in the trash already (its newest purge step after that removal isn't
+ * `trashed`). Copies an attach placed but never committed, and content
+ * this database has no removal of, are kept. `only` limits it to some
+ * contents (a re-check inside a transaction).
  */
 export async function purgeCandidates(
   db: Queryable,
   organizationId: OrganizationId,
-  hashes: readonly string[],
   since: string | null,
+  only?: readonly string[],
 ): Promise<readonly PurgeCandidate[]> {
   checkOrganization(organizationId);
-  const wanted = hashes.filter((h) => isSha256Hex(h));
-  if (wanted.length === 0) return [];
+  const wanted = only === undefined ? null : only.filter((h) => isSha256Hex(h));
+  if (wanted?.length === 0) return [];
   const rows = await db.rows<{
     sha256: string;
-    kind: string;
-    at: string;
     size: number;
-    old: boolean;
-    recent_removal: boolean;
+    removal_id: string;
+    removed_at: string;
+    copy_mtime_ns: string;
   }>(sql`
-    SELECT h.sha256, last.kind, last.byte_size::float8 AS size,
-      to_char(last.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS at,
-      last.occurred_at < clock_timestamp() - make_interval(secs =>
-        CASE last.kind WHEN 'removed' THEN ${REMOVED_FILE_GRACE_SECONDS}::integer
-                       ELSE ${PLACING_GRACE_SECONDS}::integer END) AS old,
-      EXISTS (SELECT 1 FROM public.stored_file_events r
-              WHERE r.organization_id = ${organizationId}::uuid AND r.sha256 = h.sha256
-                AND r.kind = 'removed'
-                AND (${since}::timestamptz IS NULL OR r.occurred_at >= ${since}::timestamptz)
-                AND r.occurred_at >= clock_timestamp()
-                  - make_interval(secs => ${REMOVED_FILE_GRACE_SECONDS}::integer)) AS recent_removal
-    FROM unnest(${wanted}::text[]) AS h(sha256)
-    JOIN LATERAL (
-      SELECT e.kind, e.occurred_at, e.byte_size FROM public.stored_file_events e
-      WHERE e.organization_id = ${organizationId}::uuid AND e.sha256 = h.sha256
+    WITH last AS (
+      SELECT DISTINCT ON (e.sha256) e.sha256, e.id, e.kind, e.byte_size, e.occurred_at,
+        e.copy_mtime_ns
+      FROM public.stored_file_events e
+      WHERE e.organization_id = ${organizationId}::uuid
+        AND (${wanted}::text[] IS NULL OR e.sha256 = ANY(${wanted}::text[]))
         AND (${since}::timestamptz IS NULL OR e.occurred_at >= ${since}::timestamptz)
-      ORDER BY e.occurred_at DESC, e.id DESC
-      LIMIT 1
-    ) last ON true
-    WHERE NOT EXISTS (SELECT 1 FROM public.stored_files f
-                      WHERE f.organization_id = ${organizationId}::uuid AND f.sha256 = h.sha256)
-    ORDER BY h.sha256`);
-  const out: PurgeCandidate[] = [];
-  for (const row of rows) {
-    if (!row.old) continue;
-    if (row.kind === "removed") {
-      out.push(
-        Object.freeze({
-          sha256: row.sha256,
-          size: row.size,
-          lastEvent: "removed",
-          lastEventAt: row.at,
-        }),
-      );
-    } else if (row.kind === "placing" && !row.recent_removal) {
-      out.push(
-        Object.freeze({
-          sha256: row.sha256,
-          size: row.size,
-          lastEvent: "placing",
-          lastEventAt: row.at,
-        }),
-      );
-    }
+      ORDER BY e.sha256, e.occurred_at DESC, e.id DESC
+    )
+    SELECT l.sha256, l.byte_size::float8 AS size, l.id::text AS removal_id,
+      to_char(l.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS removed_at,
+      l.copy_mtime_ns::text AS copy_mtime_ns
+    FROM last l
+    WHERE l.kind = 'removed' AND l.copy_mtime_ns IS NOT NULL
+      AND l.occurred_at <= clock_timestamp()
+        - make_interval(secs => ${REMOVED_FILE_GRACE_SECONDS}::integer)
+      AND NOT EXISTS (SELECT 1 FROM public.stored_files f
+                      WHERE f.organization_id = ${organizationId}::uuid AND f.sha256 = l.sha256)
+      AND NOT EXISTS (
+        SELECT 1 FROM (
+          SELECT p.kind FROM public.file_purge_steps p
+          WHERE p.organization_id = ${organizationId}::uuid AND p.sha256 = l.sha256
+            AND p.removal_id = l.id
+          ORDER BY p.occurred_at DESC, p.id DESC LIMIT 1) newest
+        WHERE newest.kind IN ('trashed', 'deleted'))
+    ORDER BY l.sha256`);
+  return Object.freeze(
+    rows.map((r) =>
+      Object.freeze({
+        sha256: r.sha256,
+        size: r.size,
+        removalId: r.removal_id,
+        removedAt: r.removed_at,
+        copyMtimeNs: BigInt(r.copy_mtime_ns),
+      }),
+    ),
+  );
+}
+
+/** A content in the trash, as this database's newest purge step for it says. */
+export interface TrashedContent {
+  readonly sha256: string;
+  readonly size: number;
+  readonly removalId: string;
+  readonly copyMtimeNs: bigint;
+  readonly trashedAt: string;
+  /** At least `TRASH_GRACE_SECONDS` in the trash by the database's clock. */
+  readonly dayOld: boolean;
+  /**
+   * The removal is still this database's newest event for the content (no
+   * placing or attach since) and no row names it.
+   */
+  readonly stillRemoved: boolean;
+}
+
+/** The organization's contents whose newest purge step is `trashed` (`only`: some of them). */
+export async function trashedContents(
+  db: Queryable,
+  organizationId: OrganizationId,
+  only?: readonly string[],
+): Promise<readonly TrashedContent[]> {
+  checkOrganization(organizationId);
+  const wanted = only === undefined ? null : only.filter((h) => isSha256Hex(h));
+  if (wanted?.length === 0) return [];
+  const rows = await db.rows<{
+    sha256: string;
+    size: number;
+    removal_id: string;
+    copy_mtime_ns: string;
+    trashed_at: string;
+    day_old: boolean;
+    still_removed: boolean;
+  }>(sql`
+    WITH newest AS (
+      SELECT DISTINCT ON (p.sha256) p.sha256, p.kind, p.byte_size, p.removal_id,
+        p.copy_mtime_ns, p.occurred_at
+      FROM public.file_purge_steps p
+      WHERE p.organization_id = ${organizationId}::uuid
+        AND (${wanted}::text[] IS NULL OR p.sha256 = ANY(${wanted}::text[]))
+      ORDER BY p.sha256, p.occurred_at DESC, p.id DESC
+    )
+    SELECT n.sha256, n.byte_size::float8 AS size, n.removal_id::text AS removal_id,
+      n.copy_mtime_ns::text AS copy_mtime_ns,
+      to_char(n.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS trashed_at,
+      n.occurred_at <= clock_timestamp() - make_interval(secs => ${TRASH_GRACE_SECONDS}::integer)
+        AS day_old,
+      (NOT EXISTS (SELECT 1 FROM public.stored_files f
+                   WHERE f.organization_id = ${organizationId}::uuid AND f.sha256 = n.sha256)
+       AND (SELECT e.id FROM public.stored_file_events e
+            WHERE e.organization_id = ${organizationId}::uuid AND e.sha256 = n.sha256
+            ORDER BY e.occurred_at DESC, e.id DESC LIMIT 1) = n.removal_id) AS still_removed
+    FROM newest n
+    WHERE n.kind = 'trashed'
+    ORDER BY n.sha256`);
+  return Object.freeze(
+    rows.map((r) =>
+      Object.freeze({
+        sha256: r.sha256,
+        size: r.size,
+        removalId: r.removal_id,
+        copyMtimeNs: BigInt(r.copy_mtime_ns),
+        trashedAt: r.trashed_at,
+        dayOld: r.day_old,
+        stillRemoved: r.still_removed,
+      }),
+    ),
+  );
+}
+
+/** One of the purge's steps for a content (the database stamps the time). */
+export async function insertFilePurgeStep(
+  tx: Queryable,
+  organizationId: OrganizationId,
+  step: {
+    readonly kind: "trashed" | "deleted" | "restored";
+    readonly sha256: string;
+    readonly size: number;
+    readonly removalId: string;
+    readonly copyMtimeNs: bigint;
+    readonly epoch: string;
+    readonly actor: string;
+  },
+): Promise<void> {
+  checkOrganization(organizationId);
+  if (
+    !["trashed", "deleted", "restored"].includes(step.kind) ||
+    !isSha256Hex(step.sha256) ||
+    !isRecordId(step.removalId) ||
+    !isRecordId(step.epoch) ||
+    step.copyMtimeNs < 0n ||
+    !isActorId(step.actor)
+  ) {
+    throw new TypeError("Not a purge step.");
   }
-  return Object.freeze(out);
+  await tx.execute(sql`
+    INSERT INTO public.file_purge_steps (organization_id, id, kind, sha256, byte_size, removal_id,
+      copy_mtime_ns, epoch, actor)
+    VALUES (${organizationId}::uuid, gen_random_uuid(), ${step.kind}, ${step.sha256},
+      ${step.size}::bigint, ${step.removalId}::uuid, ${step.copyMtimeNs.toString()}::bigint,
+      ${step.epoch}::uuid, ${step.actor})`);
 }
 
 /** The folder's lease as this database holds it: the newest epoch, and the last adopt's time. */
 export interface FileStoreLease {
   readonly epoch: string;
-  readonly kind: "bind" | "renew" | "adopt";
+  readonly kind: "bind" | "renew" | "adopt" | "purge";
   readonly madeAt: string;
   /** The last `files:adopt` (events before it are unknown to the purge), or null. */
   readonly since: string | null;
@@ -434,7 +543,7 @@ export async function readFileStoreLease(db: Queryable): Promise<FileStoreLease 
     LIMIT 1`);
   const row = rows[0];
   if (row === undefined) return undefined;
-  if (row.kind !== "bind" && row.kind !== "renew" && row.kind !== "adopt") {
+  if (row.kind !== "bind" && row.kind !== "renew" && row.kind !== "adopt" && row.kind !== "purge") {
     throw new Error("A file store epoch doesn't read as one.");
   }
   return Object.freeze({ epoch: row.epoch, kind: row.kind, madeAt: row.made_at, since: row.since });
@@ -453,7 +562,7 @@ export async function lockFileStoreLease(tx: Queryable): Promise<void> {
 export async function insertFileStoreEpoch(
   tx: Queryable,
   epoch: string,
-  kind: "bind" | "renew" | "adopt",
+  kind: "bind" | "renew" | "adopt" | "purge",
   databaseIdentity: string,
 ): Promise<void> {
   if (!isRecordId(epoch)) throw new TypeError("Not an epoch.");

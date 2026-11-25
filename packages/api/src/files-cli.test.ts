@@ -1,7 +1,8 @@
-// The operator's file command (M-002, D-086): `files:adopt` refuses while
-// the folder is busy and deletes nothing; there is no purge in this version
-// (fifth review). Over a fresh database and a throwaway files folder; no
-// URL or path is printed.
+// The operator's file commands (M-002, D-086): `files:purge` runs a step of
+// the purge (S-052) or, with --dry-run, says what one would do and changes
+// nothing; `files:adopt` refuses while the folder is busy and deletes
+// nothing. Over a fresh database and a throwaway files folder; no URL or
+// path is printed.
 import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -56,13 +57,29 @@ describe("files-cli", () => {
     expect(await missing).toBe(2);
   });
 
-  it("has no purge: it says so and touches nothing", async () => {
+  it("purges by the admin's rules: a dry run changes nothing, a step takes the lease", async () => {
     const before = readFileSync(join(dir, STORE_MARKER), "utf8");
-    const r = run(["purge", "--yes"]);
-    expect(await r.done).toBe(2);
-    expect(r.lines.join("\n")).toMatch(/no purge in this version.*keep using disk space/);
-    expect(r.lines.join("\n")).not.toContain(dir);
+    expect(await run(["purge", "--yes"]).done).toBe(2);
+    const dry = run(["purge", "--dry-run"]);
+    expect(await dry.done).toBe(0);
+    expect(dry.lines).toContain("Dry run: nothing was changed.");
+    expect(dry.lines.join("\n")).toMatch(/Would move to the trash: 0 files \(0 bytes\)/);
+    expect(dry.lines.join("\n")).not.toContain(dir);
     expect(readFileSync(join(dir, STORE_MARKER), "utf8")).toBe(before);
+    const step = run(["purge"]);
+    expect(await step.done).toBe(0);
+    expect(step.lines).toContain("One purge step done.");
+    // The lease moved on: the step took it.
+    expect(readFileSync(join(dir, STORE_MARKER), "utf8")).not.toBe(before);
+    // A folder whose lease isn't this database's: refused, and said why.
+    const marker = join(dir, STORE_MARKER);
+    const kept = readFileSync(marker, "utf8");
+    const [storeId, database] = kept.split("\n");
+    writeFileSync(marker, `${storeId ?? ""}\n${database ?? ""}\n${newRecordId()}\n`);
+    const refused = run(["purge"]);
+    expect(await refused.done).toBe(1);
+    expect(refused.lines.join("\n")).toMatch(/lease isn't this database's/);
+    writeFileSync(marker, kept);
   });
 
   it("refuses adopt while the folder is busy, then adopts and deletes nothing", async () => {

@@ -300,9 +300,6 @@ describe("the safety and limits added after review", () => {
     await store.discard(got.file);
     expect(await store.organizations()).toContain(other);
     expect(await store.contents(other)).toEqual([sha(body)]);
-    await store.trash(other, sha(body));
-    expect(await store.contents(other)).toEqual([]);
-    expect(await store.emptyTrash(other)).toBe(1);
     rmSync(join(dir, other), { recursive: true, force: true });
   });
 });
@@ -485,15 +482,65 @@ describe("the second review's changes", () => {
     await store.discard(done.file);
     const listed = await store.listContents(other);
     expect(listed).toEqual({ hashes: [done.file.sha256], skipped: 0 });
-    await store.trash(other, done.file.sha256);
+    const hash = done.file.sha256;
+    // The purge's two steps (S-052): only while the copy's time is the one given.
+    const stamp = await store.copyStamp(other, hash);
+    if (stamp === undefined) throw new Error("no stamp");
+    expect(stamp.size).toBe(done.file.size);
+    expect(await store.trashContent(other, hash, stamp.mtimeNs + 1n)).toBe("changed");
+    expect(await store.contents(other)).toEqual([hash]);
+    await store.writeThumbnail(other, hash, "small", "none");
+    expect(await store.trashContent(other, hash, stamp.mtimeNs)).toBe("trashed");
     expect(await store.contents(other)).toEqual([]);
-    expect(await store.emptyTrash(other)).toBe(1);
-    expect(tree().filter((p) => p.includes(other))).toEqual([]);
-    // Something that isn't a regular file at a content path is counted, never removed.
+    expect(await store.readThumbnail(other, hash, "small")).toBeUndefined();
+    const [entry] = await store.trashEntries(other);
+    expect(entry).toMatchObject({ sha256: hash, size: done.file.size, mtimeNs: stamp.mtimeNs });
+    expect(Number.isFinite(entry?.markedMs)).toBe(true);
+    expect(readdirSync(join(dir, other, "trash", hash)).sort()).toEqual([
+      "content",
+      "marked",
+      "thumbnail-small-v1.none",
+    ]);
+    expect(await store.trashContent(other, hash, stamp.mtimeNs)).toBe("missing");
+    // Put back: the same bytes, the same time.
+    expect(await store.restoreFromTrash(other, hash)).toBe("restored");
+    expect((await store.copyStamp(other, hash))?.mtimeNs).toBe(stamp.mtimeNs);
+    expect(existsSync(join(dir, other, "trash", hash))).toBe(false);
+    expect(await store.restoreFromTrash(other, hash)).toBe("none");
+    // Trashed again, then deleted only with the right time.
+    expect(await store.trashContent(other, hash, stamp.mtimeNs)).toBe("trashed");
+    expect(await store.deleteTrashed(other, hash, stamp.mtimeNs - 1n)).toBe("changed");
+    expect(await store.deleteTrashed(other, hash, stamp.mtimeNs)).toBe("deleted");
+    expect(await store.deleteTrashed(other, hash, stamp.mtimeNs)).toBe("missing");
+    expect(await store.trashEntries(other)).toEqual([]);
+    expect(tree().filter((p) => p.includes(other) && !p.includes("incoming"))).toEqual([]);
+    // Something that isn't a regular file at a content path is counted, never moved.
     mkdirSync(join(dir, other, "sha256", "ef", "ef".repeat(32)), { recursive: true });
     expect(await store.listContents(other)).toEqual({ hashes: [], skipped: 1 });
-    await store.trash(other, "ef".repeat(32));
+    expect(await store.copyStamp(other, "ef".repeat(32))).toBeUndefined();
+    expect(await store.trashContent(other, "ef".repeat(32), 0n)).toBe("changed");
     expect(existsSync(join(dir, other, "sha256", "ef", "ef".repeat(32)))).toBe(true);
+    rmSync(join(dir, other), { recursive: true, force: true });
+  });
+
+  it("puts a trashed copy back for an upload, or drops it when the same content is stored again", async () => {
+    const other = newOrganizationId();
+    const body = randomBytes(300);
+    const first = await store.receive(other, chunksOf(body));
+    if (!first.ok) throw new Error(first.code);
+    await store.place(first.file);
+    await store.discard(first.file);
+    const stamp = await store.copyStamp(other, sha(body));
+    if (stamp === undefined) throw new Error("no stamp");
+    expect(await store.trashContent(other, sha(body), stamp.mtimeNs)).toBe("trashed");
+    // An upload placed the same bytes again meanwhile: the trashed copy goes.
+    const again = await store.receive(other, chunksOf(body));
+    if (!again.ok) throw new Error(again.code);
+    expect(await store.place(again.file)).toBe("stored");
+    await store.discard(again.file);
+    expect(await store.restoreFromTrash(other, sha(body))).toBe("already_stored");
+    expect(readFileSync(store.pathFor(other, sha(body))).equals(body)).toBe(true);
+    expect(existsSync(join(dir, other, "trash", sha(body)))).toBe(false);
     rmSync(join(dir, other), { recursive: true, force: true });
   });
 });

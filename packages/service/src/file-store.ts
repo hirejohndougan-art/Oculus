@@ -45,12 +45,17 @@
  * **Nothing automatic deletes a stored copy** (D-086, fourth review). The
  * automatic sweep (the service's `sweepFiles`) only removes temporary
  * uploads (`staleIncoming`: older than an upload may run, by the file
- * system's own clock, never one this process is still writing) and empties
- * the trash an earlier purge left. In this version nothing purges (D-086,
- * fifth review); `trash`, `emptyTrash` and `listContents` stay for the safe
- * purge to come (S-043), which will also rely on `touch`: every attach sets
- * the stored copy's times to now by the file system's own clock, so its
- * age shows its last use in any database.
+ * system's own clock, never one this process is still writing). Every
+ * attach sets the stored copy's times to now by the file system's own clock
+ * (`touch`), so its time shows its last use in any database.
+ *
+ * **The purge's trash** (S-052, D-086): the service's purge moves a copy
+ * whose time is still the one logged with its removal into
+ * `<organization>/trash/<sha256>/content` by one rename (`trashContent`,
+ * step 1), with its thumbnails beside it and a `marked` file whose time is
+ * the file system's at that moment; a later run deletes it from there
+ * (`deleteTrashed`, step 2) only if its time is still the same. An upload of
+ * the same content puts it back first (`restoreFromTrash`).
  */
 import { createHash, randomBytes } from "node:crypto";
 import { constants, createReadStream, openSync, rmSync } from "node:fs";
@@ -63,6 +68,7 @@ import {
   readdir,
   rename,
   rm,
+  rmdir,
   stat,
   statfs,
   writeFile,
@@ -110,6 +116,23 @@ export interface ReceivedFile {
   readonly size: number;
   /** The first bytes (at most `SNIFF_BYTES`), for sniffing the media type. */
   readonly head: Uint8Array;
+}
+
+/** A stored copy's time and size (`copyStamp`). */
+export interface CopyStamp {
+  readonly mtimeNs: bigint;
+  readonly mtimeMs: number;
+  readonly size: number;
+}
+
+/** One content in an organization's trash (`trashEntries`). */
+export interface TrashEntry {
+  readonly sha256: string;
+  readonly size: number;
+  /** The trashed copy's time (a rename keeps it). */
+  readonly mtimeNs: bigint;
+  /** When it was moved there, by the file system's clock (its `marked` file); NaN if unmarked. */
+  readonly markedMs: number;
 }
 
 export type ReceiveRefusal = "file_too_large" | "empty_file" | "quota_exceeded" | "disk_full";
@@ -247,11 +270,6 @@ export interface FileStore {
     size: string,
     jpeg: Uint8Array | "none" | "timeout",
   ): Promise<void>;
-  /**
-   * Moves a content's cached thumbnails (every size and version) aside, for
-   * `emptyTrash` to delete (the sweep, M-003).
-   */
-  trashThumbnails(organizationId: OrganizationId, sha256: string): Promise<void>;
   /** The organizations with a folder here. */
   organizations(): Promise<readonly OrganizationId[]>;
   /** The contents stored for an organization (their hashes). */
@@ -261,12 +279,49 @@ export interface FileStore {
     organizationId: OrganizationId,
   ): Promise<{ readonly hashes: readonly string[]; readonly skipped: number }>;
   /**
-   * Moves a stored copy and its cached thumbnails (M-003) aside (call under
-   * the organization's file lock); `emptyTrash` deletes them.
+   * The stored copy's modification time (nanoseconds and milliseconds, by
+   * the file system) and size, when it is a plain copy of ours (every
+   * folder on the way checked); `undefined` otherwise.
    */
-  trash(organizationId: OrganizationId, sha256: string): Promise<void>;
-  /** Deletes what `trash` moved aside; returns how many. */
-  emptyTrash(organizationId: OrganizationId): Promise<number>;
+  copyStamp(organizationId: OrganizationId, sha256: string): Promise<CopyStamp | undefined>;
+  /** "Now" by the file system's own clock (a file written just now in the organization's folder). */
+  fileSystemNow(organizationId: OrganizationId): Promise<number>;
+  /**
+   * The purge's step 1 (call under the organization's file lock): moves the
+   * copy into `trash/<sha256>/content` by one rename, its thumbnails beside
+   * it, with a `marked` file stamped by the file system's clock, only if
+   * the copy's time is still `mtimeNs`. `changed` (nothing moved) when it
+   * isn't, or the copy isn't a plain one of ours; `missing` when none is there.
+   */
+  trashContent(
+    organizationId: OrganizationId,
+    sha256: string,
+    mtimeNs: bigint,
+  ): Promise<"trashed" | "changed" | "missing">;
+  /** What is in the organization's trash: each content with its copy's time and its mark's. */
+  trashEntries(organizationId: OrganizationId): Promise<readonly TrashEntry[]>;
+  /**
+   * Puts a trashed copy back at its content path (call under the
+   * organization's file lock; an upload of the content and a purge that
+   * finds it in use do): `restored`; `already_stored` when the same
+   * content is there already (the trashed copy then goes); `none` when
+   * nothing of it is in the trash. Its thumbnails are deleted (made again).
+   */
+  restoreFromTrash(
+    organizationId: OrganizationId,
+    sha256: string,
+  ): Promise<"restored" | "already_stored" | "none">;
+  /**
+   * The purge's step 2 (under the organization's file lock): deletes a
+   * trashed copy, its thumbnails and its mark, only if the copy's time is
+   * still `mtimeNs`; `changed` (nothing deleted) otherwise; `missing` when
+   * it isn't in the trash.
+   */
+  deleteTrashed(
+    organizationId: OrganizationId,
+    sha256: string,
+    mtimeNs: bigint,
+  ): Promise<"deleted" | "changed" | "missing">;
   /** Deletes temporary files older than `maxAgeMs`; returns how many. */
   staleIncoming(maxAgeMs: number, organizations?: readonly string[]): Promise<number>;
 }
@@ -557,6 +612,59 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
     }
   }
 
+  /** A plain file of ours with one link: its time and size (nanoseconds too). */
+  async function stampOf(path: string): Promise<CopyStamp | undefined> {
+    const info = await lstat(path, { bigint: true }).catch(() => undefined);
+    if (
+      info === undefined ||
+      !info.isFile() ||
+      info.nlink !== 1n ||
+      !safeOwnership({ uid: Number(info.uid), mode: Number(info.mode) })
+    ) {
+      return undefined;
+    }
+    return Object.freeze({
+      mtimeNs: info.mtimeNs,
+      mtimeMs: Number(info.mtimeNs / 1000n) / 1000,
+      size: Number(info.size),
+    });
+  }
+
+  /** Moves a content's cached thumbnails (every size and version) into its trash folder. */
+  async function moveThumbnails(
+    organizationId: OrganizationId,
+    sha256: string,
+    bin: string,
+  ): Promise<void> {
+    const thumbnails = await existingFolder(organizationId, "thumbnails");
+    if (thumbnails === undefined) return;
+    for (const size of await readdir(thumbnails, { withFileTypes: true })) {
+      if (!size.isDirectory() || !THUMBNAIL_SIZE.test(size.name)) continue;
+      const folder = await existingFolder(
+        organizationId,
+        "thumbnails",
+        size.name,
+        sha256.slice(0, 2),
+      );
+      if (folder === undefined) continue;
+      for (const entry of await readdir(folder, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.startsWith(`${sha256}.`)) continue;
+        const kind = entry.name.slice(sha256.length + 1);
+        if (!/^[a-z0-9.]{1,16}$/.test(kind)) continue;
+        await rename(join(folder, entry.name), join(bin, `thumbnail-${size.name}-${kind}`));
+      }
+    }
+  }
+
+  /** Deletes the regular files left in a content's trash folder, then the folder. */
+  async function emptyBin(bin: string): Promise<void> {
+    for (const entry of await readdir(bin, { withFileTypes: true })) {
+      if (entry.isFile()) await rm(join(bin, entry.name), { force: true });
+    }
+    await rmdir(bin).catch(() => undefined);
+    await syncDirectory(join(bin, "..")).catch(() => undefined);
+  }
+
   const store: FileStore = {
     maxFileBytes,
     maxOrganizationBytes,
@@ -786,7 +894,7 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
         }
         // A rename replaces whatever is at the name (a planted link
         // included) in one step. Nothing else is deleted here: only the
-        // sweep deletes (trash, then emptyTrash); a JPEG beside a ".none" wins.
+        // purge deletes (trashContent, then deleteTrashed); a JPEG beside a ".none" wins.
         const name =
           jpeg === "none" || jpeg === "timeout" ? `${sha256}.v1.${jpeg}` : `${sha256}.v1.jpg`;
         await rename(temporaryPath, join(folder, name));
@@ -1004,51 +1112,133 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       return { hashes: hashes.sort(), skipped };
     },
 
-    async trash(organizationId, sha256) {
-      const target = pathFor(organizationId, sha256);
-      const info = await lstat(target).catch(() => undefined);
-      if (info?.isFile() !== true) return;
-      const bin = await safeFolder(organizationId, "trash");
-      await rename(target, join(bin, `${sha256}.${randomBytes(8).toString("hex")}`));
+    async copyStamp(organizationId, sha256) {
+      const folder = await existingFolder(organizationId, "sha256", sha256.slice(0, 2));
+      if (folder === undefined) return undefined;
+      return stampOf(pathFor(organizationId, sha256));
     },
 
-    async trashThumbnails(organizationId, sha256) {
-      if (!isSha256Hex(sha256)) throw new TypeError("Not a SHA-256.");
-      const thumbnails = await existingFolder(organizationId, "thumbnails");
-      if (thumbnails === undefined) return;
-      for (const size of await readdir(thumbnails, { withFileTypes: true })) {
-        if (!size.isDirectory() || !THUMBNAIL_SIZE.test(size.name)) continue;
-        const folder = await existingFolder(
-          organizationId,
-          "thumbnails",
-          size.name,
-          sha256.slice(0, 2),
-        );
-        if (folder === undefined) continue;
-        for (const entry of await readdir(folder, { withFileTypes: true })) {
-          if (!entry.isFile() || !entry.name.startsWith(`${sha256}.`)) continue;
-          const bin = await safeFolder(organizationId, "trash");
-          await rename(
-            join(folder, entry.name),
-            join(bin, `${sha256}.${randomBytes(8).toString("hex")}`),
-          );
+    async fileSystemNow(organizationId) {
+      return fileSystemNow(await safeFolder(organizationId, "incoming"));
+    },
+
+    async trashContent(organizationId, sha256, mtimeNs) {
+      const target = pathFor(organizationId, sha256);
+      const folder = await existingFolder(organizationId, "sha256", sha256.slice(0, 2));
+      if (folder === undefined) return "missing";
+      if ((await lstat(target).catch(() => undefined)) === undefined) return "missing";
+      const stamp = await stampOf(target);
+      if (stamp?.mtimeNs !== mtimeNs) return "changed";
+      await safeFolder(organizationId, "trash");
+      const bin = join(organizationDir(organizationId), "trash", sha256);
+      // A folder of its own, made now. One left from an interrupted step
+      // without a copy in it is emptied first; one holding a copy means
+      // something is wrong, and nothing is moved.
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await mkdir(bin, { mode: 0o700 });
+          break;
+        } catch (error) {
+          const left = await existingFolder(organizationId, "trash", sha256);
+          const holds = await lstat(join(bin, "content")).catch(() => undefined);
+          if (
+            attempt > 0 ||
+            (error as { code?: unknown }).code !== "EEXIST" ||
+            left === undefined ||
+            holds !== undefined
+          ) {
+            return "changed";
+          }
+          await emptyBin(left);
         }
       }
+      if ((await existingFolder(organizationId, "trash", sha256)) === undefined) return "changed";
+      try {
+        // The mark first: its time is the file system's at this moment.
+        await writeFile(join(bin, "marked"), "", { mode: 0o600, flag: "wx" });
+        // One rename, in the same files folder: the copy is either here or there.
+        await rename(target, join(bin, "content"));
+      } catch (error) {
+        if ((await lstat(join(bin, "content")).catch(() => undefined)) === undefined) {
+          await emptyBin(bin);
+        }
+        throw error;
+      }
+      await moveThumbnails(organizationId, sha256, bin);
+      await syncDirectory(bin);
+      await syncDirectory(folder);
+      return "trashed";
     },
 
-    async emptyTrash(organizationId) {
-      const bin = join(organizationDir(organizationId), "trash");
-      const folder = await lstat(bin).catch(() => undefined);
-      if (folder?.isDirectory() !== true) return 0;
-      let removed = 0;
-      for (const entry of await readdir(bin, { withFileTypes: true })) {
-        if (!entry.isFile()) continue;
-        await rm(join(bin, entry.name), { force: true });
-        removed++;
+    async trashEntries(organizationId) {
+      const base = await existingFolder(organizationId, "trash");
+      if (base === undefined) return [];
+      const out: TrashEntry[] = [];
+      for (const entry of await readdir(base, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !isSha256Hex(entry.name)) continue;
+        const bin = await existingFolder(organizationId, "trash", entry.name);
+        if (bin === undefined) continue;
+        const stamp = await stampOf(join(bin, "content"));
+        if (stamp === undefined) continue;
+        const mark = await lstat(join(bin, "marked")).catch(() => undefined);
+        out.push(
+          Object.freeze({
+            sha256: entry.name,
+            size: stamp.size,
+            mtimeNs: stamp.mtimeNs,
+            markedMs: mark?.isFile() === true ? mark.mtimeMs : Number.NaN,
+          }),
+        );
       }
-      await syncDirectory(bin).catch(() => undefined);
-      await syncDirectory(join(organizationDir(organizationId), "sha256")).catch(() => undefined);
-      return removed;
+      return out.sort((a, b) => (a.sha256 < b.sha256 ? -1 : 1));
+    },
+
+    async restoreFromTrash(organizationId, sha256) {
+      if (!isSha256Hex(sha256)) throw new TypeError("Not a SHA-256.");
+      const bin = await existingFolder(organizationId, "trash", sha256);
+      if (bin === undefined) return "none";
+      const trashed = join(bin, "content");
+      const target = pathFor(organizationId, sha256);
+      let answer: "restored" | "already_stored" | "none" = "none";
+      if (await plainFile(trashed)) {
+        const folder = await safeFolder(organizationId, "sha256", sha256.slice(0, 2));
+        const there = await lstat(target).catch(() => undefined);
+        if (there === undefined) {
+          // Back by one rename; its time is kept (the attach then touches it).
+          await rename(trashed, target);
+          await syncDirectory(folder);
+          answer = "restored";
+        } else if (
+          there.isFile() &&
+          there.nlink === 1 &&
+          safeOwnership(there) &&
+          (await hashFile(target)) === sha256
+        ) {
+          // The same content is stored already: the trashed copy isn't needed.
+          await rm(trashed, { force: true });
+          answer = "already_stored";
+        } else {
+          // Something else at the content path: replaced in one step, as `place` would.
+          await rename(trashed, target);
+          await syncDirectory(folder);
+          answer = "restored";
+        }
+      }
+      await emptyBin(bin);
+      return answer;
+    },
+
+    async deleteTrashed(organizationId, sha256, mtimeNs) {
+      if (!isSha256Hex(sha256)) throw new TypeError("Not a SHA-256.");
+      const bin = await existingFolder(organizationId, "trash", sha256);
+      if (bin === undefined) return "missing";
+      const trashed = join(bin, "content");
+      if ((await lstat(trashed).catch(() => undefined)) === undefined) return "missing";
+      const stamp = await stampOf(trashed);
+      if (stamp?.mtimeNs !== mtimeNs) return "changed";
+      await rm(trashed, { force: true });
+      await emptyBin(bin);
+      return "deleted";
     },
 
     async staleIncoming(maxAgeMs, organizations) {

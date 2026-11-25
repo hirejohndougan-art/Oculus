@@ -33,8 +33,11 @@
  *   (default 500) or `OCULUS_FILES_TOTAL_MAX_MIB` (per organization,
  *   default 20480) or the free-space floor `OCULUS_FILES_MIN_FREE_MIB`
  *   (default: 5% of the disk or 2 GiB, whichever is smaller) aren't whole
- *   numbers in range. Stale temporary files and copies no row names are
- *   swept at startup and every 15 minutes.
+ *   numbers in range, or `OCULUS_FILES_AUTO_PURGE` is anything but `on` or
+ *   `off`. Stale temporary files are swept at startup and every 15
+ *   minutes. Removed files are purged only by a system manager's button or
+ *   `npm run files:purge`, unless `OCULUS_FILES_AUTO_PURGE=on` (default
+ *   off), which runs one purge step a day (S-052).
  *
  * It warns loudly (a `startup_warning` log record) when the database
  * server's `log_parameter_max_length_on_error` is above 0, since pg's
@@ -56,6 +59,7 @@ import {
   type PasswordResetDelivery,
 } from "@oculus/db";
 import {
+  AUTOMATIC_PURGE_EVERY_MS,
   createService,
   createThumbnailRenderer,
   FILE_LEASE_RENEW_MS,
@@ -92,6 +96,19 @@ export const FILES_DIR_ENV = "OCULUS_FILES_DIR";
 export const FILE_MAX_ENV = "OCULUS_FILE_MAX_MIB";
 export const FILES_TOTAL_MAX_ENV = "OCULUS_FILES_TOTAL_MAX_MIB";
 export const FILES_MIN_FREE_ENV = "OCULUS_FILES_MIN_FREE_MIB";
+/** `on` runs one purge step a day (S-052); default `off`: nothing purges on a timer. */
+export const FILES_AUTO_PURGE_ENV = "OCULUS_FILES_AUTO_PURGE";
+
+/**
+ * Whether the automatic purge is turned on: only `on` turns it on; unset,
+ * empty or `off` leaves it off; anything else refuses to start.
+ */
+export function automaticPurgeFromEnv(env: Readonly<Record<string, string | undefined>>): boolean {
+  const value = env[FILES_AUTO_PURGE_ENV]?.trim() ?? "";
+  if (value === "" || value === "off") return false;
+  if (value === "on") return true;
+  throw new Error(`refusing to start: ${FILES_AUTO_PURGE_ENV} must be on or off.`);
+}
 
 /** Why the files folder was refused, as the startup error says it (never the path). */
 const FILE_STORE_PROBLEMS: Readonly<Record<FileStoreProblem, string>> = {
@@ -454,6 +471,7 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
       );
     }
   };
+  const automaticPurge = automaticPurgeFromEnv(env);
   const key = await serverKey(options.db);
   const claim = await prepared(() => files.claimServer(key));
   if (!claim.ok) {
@@ -515,11 +533,25 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   timer.unref();
   const lease = setInterval(() => void renew(), FILE_LEASE_EVERY_MS);
   lease.unref();
+  // The purge on a timer only when turned on (S-052; default off).
+  const purge = async (): Promise<void> => {
+    try {
+      const purged = await service.purgeFiles({ apply: true });
+      if (!purged.ok) log({ event: "startup_warning", code: `files_purge_${purged.problem}` });
+    } catch (error) {
+      log({ event: "service_error", operation: "purgeFiles", ...redactedError(error) });
+    }
+  };
+  const purgeTimer = automaticPurge
+    ? setInterval(() => void purge(), AUTOMATIC_PURGE_EVERY_MS)
+    : undefined;
+  purgeTimer?.unref();
   // Started once the server is built, so a start that fails counts nothing.
   publicSubjects?.start();
   app.server.once("close", () => {
     clearInterval(timer);
     clearInterval(lease);
+    if (purgeTimer !== undefined) clearInterval(purgeTimer);
     claim.release();
     void thumbnails?.close();
   });

@@ -55,7 +55,6 @@ import {
   readFileStoreLease,
   lockFileStoreLease,
   insertFileStoreEpoch,
-  type PurgeCandidate,
   readFileStoreBinding,
   insertStoredFile,
   listStoredFiles,
@@ -72,6 +71,13 @@ import {
 import { editPermissions, notPermitted, type RecordAccess, type Refusal } from "./access.js";
 import type { Runner } from "./admin.js";
 import type { FileStore, ReceivedFile, StoreMarker } from "./file-store.js";
+import {
+  restoreAllTrash,
+  runFilePurge,
+  type PurgeOptions,
+  type PurgeProblem,
+  type PurgeResult,
+} from "./file-purge.js";
 import {
   THUMBNAIL_BOXES,
   THUMBNAIL_LIMITS,
@@ -180,16 +186,7 @@ export interface ThumbnailOptions {
   readonly cacheOnly?: boolean;
 }
 
-/** One content the purge would delete. */
-export interface PurgeEntry extends PurgeCandidate {
-  readonly organizationId: string;
-}
-
-/**
- * Why the purge was refused. Only `not_available` for now: purging is off
- * until it can be made safe (D-086, fifth review; S-043).
- */
-export type PurgeProblem = "not_available";
+export type { PurgeProblem };
 
 /** Why the files folder can't be used with this database (`bindFileStore`). */
 export type FileStoreProblem = "no_store" | "other_install" | "marker_missing" | "not_empty";
@@ -210,8 +207,8 @@ export interface FileOperations {
   ): Promise<ServiceResult<AttachedFile>>;
   /**
    * Removes one file from an asset: the same rule as attaching (the edit
-   * permission where the asset is, `If-Match`). The copy on disk stays:
-   * nothing in this version deletes a stored copy (D-086).
+   * permission where the asset is, `If-Match`). The copy on disk stays;
+   * the removal logs its time, and only the purge may free it later (S-052).
    */
   removeFile(
     context: ServiceContext,
@@ -221,8 +218,8 @@ export interface FileOperations {
   ): Promise<ServiceResult<{ readonly removed: true }>>;
   /**
    * A job, not a person's operation (no context): removes temporary files
-   * older than `incomingMaxAgeMs` in this database's organizations, and
-   * empties their trash; never a stored copy. Run at startup and on a timer.
+   * older than `incomingMaxAgeMs` in this database's organizations; never a
+   * stored copy, and never the purge's trash. Run at startup and on a timer.
    */
   sweepFiles(incomingMaxAgeMs: number): Promise<FileSweep>;
   /**
@@ -268,19 +265,13 @@ export interface FileOperations {
    */
   renewFileLease(): Promise<boolean>;
   /**
-   * The operator's purge: not available in this version (D-086, fifth
-   * review). A copy of the database whose epoch still matched the marker
-   * could purge content production had attached again since, so removed
-   * files keep their space until a later version adds a safe purge (S-043).
-   * Always refused with `not_available`; nothing is read or changed.
+   * The purge of removed files (S-052, file-purge.ts): one step of it under
+   * the folder's lease, or with `apply: false` a dry run that changes
+   * nothing. Not a person's operation: the caller checks who may (system
+   * managers, with a recent sign-in, from the admin; the operator on the
+   * command line).
    */
-  purgeFiles(options: { readonly apply: boolean; readonly only?: readonly string[] }): Promise<
-    | {
-        readonly ok: true;
-        readonly value: { readonly candidates: readonly PurgeEntry[]; readonly deleted: number };
-      }
-    | { readonly ok: false; readonly problem: PurgeProblem }
-  >;
+  purgeFiles(options: PurgeOptions): Promise<PurgeResult>;
   /**
    * `npm run files:adopt`: makes this database the folder's own again after
    * a restore or a copy: a new epoch, this database's identity in the
@@ -523,6 +514,9 @@ export function fileOperations(
         epoch: randomUUID(),
       });
     }
+    // Neither side may purge now: whatever a purge put in the trash goes
+    // back (S-052).
+    await restoreAllTrash(db, store).catch(() => undefined);
     return false;
   }
 
@@ -596,7 +590,7 @@ export function fileOperations(
               who.actor,
             );
             // A copy already there shows its last use in its own times (by
-            // the file system's clock): a later purge relies on it (S-043).
+            // the file system's clock): the purge relies on it (S-052).
             await store.touch(who.organizationId, received.sha256);
             return { ok: true, value: true };
           },
@@ -630,6 +624,8 @@ export function fileOperations(
             const refused = await attachable(tx, who, recordId, options.expectedVersion);
             if (refused) return refused;
             await lockOrganizationFiles(tx, who.organizationId);
+            // A copy the purge moved to the trash comes back first (S-052).
+            await store.restoreFromTrash(who.organizationId, received.sha256);
             const existing = await findStoredFile(
               tx,
               who.organizationId,
@@ -699,8 +695,17 @@ export function fileOperations(
           if (!(await deleteStoredFile(tx, who.organizationId, recordId, fileId))) {
             return refusal(["fileId"], "unknown_file", "The record has no such file.");
           }
-          // Logged; the log also keeps the bytes for REMOVED_FILE_GRACE_SECONDS.
-          await insertStoredFileEvent(tx, who.organizationId, "removed", file, who.actor);
+          // Logged, with the copy's own time (S-052): the purge takes the
+          // copy only while its time is still this one.
+          const stamp = await store?.copyStamp(who.organizationId, file.sha256);
+          await insertStoredFileEvent(
+            tx,
+            who.organizationId,
+            "removed",
+            file,
+            who.actor,
+            stamp?.mtimeNs,
+          );
           return { ok: true, value: Object.freeze({ removed: true as const }) };
         },
       );
@@ -776,9 +781,8 @@ export function fileOperations(
       if (bound === undefined || bound !== (await readFileStoreBinding(db))) {
         return { ...none, unbound: true };
       }
-      // Never a stored copy: only temporary uploads, and the trash a purge
-      // left (a purge stopped between moving copies aside and deleting them),
-      // in this database's organizations' folders only.
+      // Never a stored copy and never the purge's trash: only temporary
+      // uploads, in this database's organizations' folders only.
       const onDisk = await store.organizations();
       const known = await existingOrganizations(db, onDisk);
       const ours = onDisk.filter((id) => known.has(id));
@@ -789,20 +793,18 @@ export function fileOperations(
       } catch {
         failed++;
       }
-      let contents = 0;
-      for (const organizationId of ours) {
-        try {
-          contents += await store.emptyTrash(organizationId);
-        } catch {
-          failed++;
-        }
-      }
-      return Object.freeze({ incoming, contents, skipped: 0, unknown: 0, failed, unbound: false });
+      return Object.freeze({
+        incoming,
+        contents: 0,
+        skipped: 0,
+        unknown: 0,
+        failed,
+        unbound: false,
+      });
     },
 
-    purgeFiles() {
-      // Off until S-043 (see the interface): refused before anything is read.
-      return Promise.resolve({ ok: false, problem: "not_available" });
+    async purgeFiles(options) {
+      return runFilePurge(db, store, options);
     },
 
     async adoptFileStore() {

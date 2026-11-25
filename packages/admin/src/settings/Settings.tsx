@@ -121,6 +121,11 @@ export function SettingsLayout() {
               Updates
             </NavLink>
           </li>
+          <li>
+            <NavLink className={styles.tab} to="/settings/files">
+              Removed files
+            </NavLink>
+          </li>
         </ul>
       </nav>
       <Outlet context={context} />

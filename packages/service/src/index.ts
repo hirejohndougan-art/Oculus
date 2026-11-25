@@ -49,6 +49,8 @@ export {
   STORE_MARKER,
 } from "./file-store.js";
 export type {
+  CopyStamp,
+  TrashEntry,
   FileStore,
   FileStoreOptions,
   ReceivedFile,
@@ -82,10 +84,18 @@ export type {
   FileOperations,
   FileStoreProblem,
   FileSweep,
-  PurgeEntry,
-  PurgeProblem,
   RemoveFileOptions,
 } from "./files.js";
+export {
+  AUTOMATIC_PURGE_EVERY_MS,
+  PURGE_ACTOR,
+  PURGE_LEASE_MS,
+  type PurgeOptions,
+  type PurgeProblem,
+  type PurgeReport,
+  type PurgeResult,
+  type PurgeTotals,
+} from "./file-purge.js";
 export type {
   PeopleOperations,
   PeopleContext,

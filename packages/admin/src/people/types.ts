@@ -106,6 +106,9 @@ export type AuditEntry =
       readonly kind: string;
       readonly version: string;
       readonly fromVersion: string | null;
+      /** A purge step's files and bytes (S-052); absent or null for an update. */
+      readonly files?: number | null;
+      readonly bytes?: number | null;
     };
 
 export interface AuditPage {

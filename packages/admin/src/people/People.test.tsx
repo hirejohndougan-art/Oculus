@@ -387,7 +387,7 @@ describe("the audit trail", () => {
     });
   });
 
-  it("shows installs and rollbacks of Oculus, from the admin and the command line", async () => {
+  it("shows installs and rollbacks of Oculus and purge steps, from the admin and the command line", async () => {
     fakeServer({
       "GET /api/me": [200, { ...me([A1]), systemAdmin: true }],
       "GET /api/people": [200, { people: [person()], truncated: false, rights: SYSTEM }],
@@ -416,6 +416,18 @@ describe("the audit trail", () => {
               version: "1.1.0",
               fromVersion: "1.2.0",
             },
+            {
+              type: "system",
+              at: "2026-11-23T10:00:00.000Z",
+              actor: "user:x",
+              actorName: "Root Invented",
+              eventId: "00000000-0000-4000-8000-0000000000f1",
+              kind: "files_trashed",
+              version: "",
+              fromVersion: null,
+              files: 3,
+              bytes: 3 * 1024 * 1024,
+            },
           ],
           next: null,
         },
@@ -427,6 +439,8 @@ describe("the audit trail", () => {
     ).toBeTruthy();
     expect(screen.getByText("The server's command line")).toBeTruthy();
     expect(screen.getByText("Went back to Oculus 1.1.0 (from 1.2.0)")).toBeTruthy();
-    expect(screen.getByText("Root Invented")).toBeTruthy();
+    // A purge step (S-052).
+    expect(screen.getByText("Moved removed files to the trash: 3 files (3.0 MB)")).toBeTruthy();
+    expect(screen.getAllByText("Root Invented")).toHaveLength(2);
   });
 });
