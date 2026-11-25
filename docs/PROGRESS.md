@@ -2,6 +2,21 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 22:15 CT — Chat B — S-030 Regression tests for restore's retry path
+- Result: done
+- What changed: four tests that save a record from another session just before a restore takes its row lock: retry after the attempts with nothing written, success on the next attempt, a conflict when it keeps moving, and 503 `retry` over HTTP followed by a restore that goes through. Checked that they fail without the retry check.
+- Decisions: none
+- Review: n/a (not risky; tests only)
+- Gate: PASS · tests_passing 4376 (was 4372) · npm audit clean
+- Next: the next job in the work board's pool.
+## 2026-11-24 21:20 CT — Chat B — M-001 Serve active file types safely
+- Result: done
+- What changed: `fileReply` (packages/api/src/file-replies.ts) is the only way a handler sends a file's bytes: plain images, audio and video may be shown as their bare type, everything else (HTML, SVG, XML, scripts, PDF, unknown) downloads as `application/octet-stream`; every file reply has nosniff, a sandboxing CSP, same-origin CORP and nothing the handler set; safe RFC 6266/8187 names; streams opened only when sent, outside the handler timeout, within a 2-hour deadline, closed on errors, wrong lengths, hang-ups and shutdown; HEAD opens nothing. HTTP attack tests and a Chromium test that a page on another origin can't run an HTML, SVG or XHTML file's script.
+- Decisions: D-089
+- Review: three independent rounds plus a short fourth look. Fixed: a storage error or an object-mode stream could crash the server, downloads were cut at 30 s, sources leaked on abort, wrong lengths and failed handlers, HEAD read whole files, a missing file dropped the connection, failures were logged as hang-ups, shutdown could be held, name details. Left as S-035 (download limits per client).
+- Gate: PASS · tests_passing 4372 (was 4344) · npm audit clean
+- Next: the next job in the work board's pool (S-026).
+
 ## 2026-11-24 22:40 CT — manual (Chat D) — T-056 Desktop launcher
 - Result: done
 - What changed: `npm run desktop` and `scripts/start-oculus.cmd` run the admin on 127.0.0.1 in an Edge or Chrome app window with its own profile, stopping when the window closes; settings, a 0600 secret key and a single-instance lock in the per-user settings folder; `extraRoutes` on `buildAdminServer`; docs/DESKTOP.md (Windows guide). John chose to stay inside D-002 (no Electron, no bundled PostgreSQL). Smoke-tested with a real Chrome under Xvfb: sign-in screen in the window, server stopped on close.
