@@ -108,6 +108,8 @@ export type {
   StateListEntry,
   WorkflowChangeResult,
 } from "./workflow.js";
+export { publicTermCounts, MAX_PUBLIC_COUNT_RECORDS } from "./public-terms.js";
+export type { PublicTermCount, PublicTermCountOptions, PublicTermCounts } from "./public-terms.js";
 export type { RecordDeletion, RecordDeletionResult } from "./record-delete.js";
 export {
   grantWriterRole,
@@ -166,6 +168,7 @@ export {
   MAX_AFFECTED_PUBLISHED,
 } from "./definitions.js";
 export type { TemplateSummary } from "./definitions.js";
+export { readRecordsForChecks } from "./catalog.js";
 export {
   publishedUsingTemplate,
   readDublinCoreMapping,

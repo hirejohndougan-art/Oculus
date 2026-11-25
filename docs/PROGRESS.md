@@ -2,6 +2,30 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 02:40 CT — manual (Chat E) — T-034d Public subject counts
+- Result: done
+- What changed: `publicTermCounts` (packages/db/src/public-terms.ts) counts, for one site, the controlled terms each public record shows in its own public output (one Repeatable Read snapshot; records the output refuses count for nothing), on the server's staff connection; only labels, URIs and counts come out; at most 10,000 records and a time limit. `readPublicRecord`'s work is shared as `publicRecordIn` (stored mappings included). Never from `record_terms`. Follow-up S-038 (a cached public Subjects page).
+- Decisions: D-095
+- Review: two independent rounds. Round 1 (fixed): the first design gave the public reader a function listing every published record (migration 0023, now gone), which would have handed out the IDs of held-back records whose snapshots carry staff values; a records count that included held-back records; vocabulary keys and term hashes in the result; no time limit. Round 2 (fixed): terms told apart by what the public sees; a hard time ceiling; tests for held-back records and stored mappings. Caching left to S-038.
+- Gate: PASS · tests_passing 4624 (was 4618) · npm audit clean
+- Next: S-038 (after T-050d), or the next free job on the board
+
+## 2026-11-25 03:10 CT — manual (Chat C) — S-033 Identifier type edits list the records a new format drops
+- Result: done
+- What changed: `saveIdentifierType` lists the published records a new format takes off public sites and needs `confirmDropped` naming exactly them; `droppedFromPublic` in the reply; `PUT /api/identifier-types/:key` passes `confirmDropped` (409 `drops_published_records`); `readRecordsForChecks` exported from `@oculus/db`.
+- Decisions: D-091 amendment
+- Review: one independent round, nothing blocking; fixed an undercounting message, a confirmation that could skip the list (now tied to the exact IDs), and per-record reads under the type's lock.
+- Gate: PASS (T-050d and S-033 merged together) · tests_passing 4618 (was 4611) · npm audit clean
+- Next: T-050c (OAI-PMH)
+
+## 2026-11-25 02:00 CT — manual (Chat C) — T-050d Public record reads
+- Result: done
+- What changed: `packages/api/src/public-api.ts` (`GET /records/:id` on public hosts, mounted by `buildAdminServer` when public sites are configured); a `public` rate bucket.
+- Decisions: D-100
+- Review: one independent round, nothing blocking; fixed the public pool filling under many slow reads (a cap on reads at once, IPv6 counted by /64), the log line, and D-100's wording; S-037 filed (time limits on the reader pool).
+- Gate: PASS (T-050d and S-033 merged together) · tests_passing 4618 (was 4611) · npm audit clean
+- Next: T-050c (OAI-PMH) or T-050e
+
 ## 2026-11-25 01:55 CT — Chat B — T-041c Shares: storage and the service (part of T-041b)
 - Result: done (T-041b continues as T-041d to T-041f)
 - What changed: migration 0024 (`record_shares`), `packages/db/src/shares.ts`, `publishedRecordView` (workflow.ts), `packages/service/src/shares.ts`: offer a published item to another site (any organization's), accept, decline, remove (the second site's manager), withdraw (home), lists, and a read-only view for the second site that is what the public could see, never through the record's own checks.
