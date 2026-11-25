@@ -60,6 +60,9 @@ async function withRole(q: Queryable, statement: string, role: string): Promise<
   END $$`);
 }
 
+// The admin server needs a files folder (D-086); one of this file's own.
+const filesDir = mkdtempSync(join(tmpdir(), "oculus-t050c-files-"));
+
 function envFor(extra: Record<string, string> = {}): Record<string, string> {
   return {
     NODE_ENV: "development",
@@ -67,6 +70,7 @@ function envFor(extra: Record<string, string> = {}): Record<string, string> {
     OCULUS_ADMIN_ORIGIN: ADMIN,
     OCULUS_SECRET_KEY: FAKE_TEST_SECRET_KEY,
     OCULUS_PUBLIC_SITES: `${PUBLIC}=${w.a1}`,
+    OCULUS_FILES_DIR: filesDir,
     ...extra,
   };
 }
@@ -170,6 +174,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await app.close();
   rmSync(dir, { recursive: true, force: true });
+  rmSync(filesDir, { recursive: true, force: true });
   await reader.close();
   await w.db.close();
   await w.testDb.drop();

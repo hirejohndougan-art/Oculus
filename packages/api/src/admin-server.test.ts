@@ -3,8 +3,17 @@
 // production or the development one there (D-085), an admin origin outside
 // OCULUS_ORIGINS), and the built admin served on the
 // admin's origin only, with its own CSP while the API keeps its own.
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { openDatabase, type Database } from "@oculus/db";
@@ -12,6 +21,7 @@ import type { FastifyInstance } from "fastify";
 import { FAKE_TEST_SECRET_KEY } from "../../db/src/second-factor.fixtures.js";
 import { freshDatabase, type TestDatabase } from "../../db/src/test-database.fixtures.js";
 import { migrate } from "@oculus/db";
+import { STORE_MARKER } from "@oculus/service";
 import { ADMIN_CSP, adminFileFor, loadAdminFiles, type AdminFiles } from "./admin-files.js";
 import { runAdminCli } from "./admin-cli.js";
 import { buildAdminServer, clientAddressProblem, isProduction } from "./admin-server.js";
@@ -23,11 +33,15 @@ let db: Database;
 let dir: string;
 let files: AdminFiles;
 
+/** The files folder every server here uses (M-002, D-086). */
+const filesDir = mkdtempSync(join(tmpdir(), "oculus-admin-files-"));
+
 const DEV = {
   NODE_ENV: "development",
   OCULUS_ORIGINS: "http://localhost,http://127.0.0.1:3001",
   OCULUS_ADMIN_ORIGIN: "http://localhost",
   OCULUS_SECRET_KEY: FAKE_TEST_SECRET_KEY,
+  OCULUS_FILES_DIR: filesDir,
 };
 
 beforeAll(async () => {
@@ -46,6 +60,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   rmSync(dir, { recursive: true, force: true });
+  rmSync(filesDir, { recursive: true, force: true });
   await db.close();
   await testDb.drop();
 });
@@ -113,6 +128,77 @@ describe("the startup checks", () => {
     expect(clientAddressProblem({ OCULUS_CLIENT_ADDRESS: "direct" })).toBeUndefined();
     expect(clientAddressProblem({ OCULUS_CLIENT_ADDRESS: "yes" })).toMatch(/only be "direct"/);
     expect(clientAddressProblem({ NODE_ENV: "development" })).toBeUndefined();
+  });
+
+  it("refuses to start when another server on this computer uses the files folder with another database", async () => {
+    // A first start binds the folder (and notes this server).
+    const first = await buildAdminServer({ db, env: DEV, adminFiles: files });
+    await first.close();
+    // A live server of another database: a stand-in entry for the parent
+    // process, which is alive.
+    const servers = join(filesDir, ".oculus-servers");
+    const host = hostname()
+      .replace(/[^A-Za-z0-9.-]/g, "_")
+      .slice(0, 100);
+    const theirs = join(servers, `${host}-${String(process.ppid)}-0123456789abcdef`);
+    writeFileSync(theirs, "another%7Cdatabase\n");
+    const marker = join(filesDir, STORE_MARKER);
+    const before = readFileSync(marker, "utf8");
+    const beforeTime = statSync(marker).mtimeMs;
+    try {
+      await expect(buildAdminServer({ db, env: DEV, adminFiles: files })).rejects.toThrow(
+        /another Oculus server on this computer uses this folder with another database/,
+      );
+      // Refused before it changed anything: not the marker, not the lease.
+      expect(readFileSync(marker, "utf8")).toBe(before);
+      expect(statSync(marker).mtimeMs).toBe(beforeTime);
+      // Nor does it bind an empty folder it is refused.
+      const empty = mkdtempSync(join(tmpdir(), "oculus-admin-claim-"));
+      mkdirSync(join(empty, ".oculus-servers"), { mode: 0o700 });
+      writeFileSync(
+        join(empty, ".oculus-servers", `${host}-${String(process.ppid)}-0123456789abcdef`),
+        "another%7Cdatabase\n",
+      );
+      await expect(
+        buildAdminServer({ db, env: { ...DEV, OCULUS_FILES_DIR: empty }, adminFiles: files }),
+      ).rejects.toThrow(/another Oculus server/);
+      expect(existsSync(join(empty, STORE_MARKER))).toBe(false);
+      rmSync(empty, { recursive: true, force: true });
+    } finally {
+      rmSync(theirs, { force: true });
+    }
+    // Two servers of this one database: fine.
+    const one = await buildAdminServer({ db, env: DEV, adminFiles: files });
+    const two = await buildAdminServer({ db, env: DEV, adminFiles: files });
+    await one.close();
+    await two.close();
+  }, 30_000);
+
+  it("refuses to start without a usable files folder or with bad caps, never showing them", async () => {
+    for (const value of [undefined, "", "relative/files", join(filesDir, "missing")]) {
+      const failure = await buildAdminServer({
+        db,
+        env: { ...DEV, OCULUS_FILES_DIR: value },
+        adminFiles: files,
+      }).catch((error: unknown) => error);
+      expect(String(failure)).toMatch(/OCULUS_FILES_DIR/);
+      if (value !== undefined && value !== "") expect(String(failure)).not.toContain(value);
+    }
+    const plainFile = join(mkdtempSync(join(tmpdir(), "oculus-admin-plain-")), "not-a-folder");
+    writeFileSync(plainFile, "x");
+    await expect(
+      buildAdminServer({ db, env: { ...DEV, OCULUS_FILES_DIR: plainFile }, adminFiles: files }),
+    ).rejects.toThrow(/OCULUS_FILES_DIR/);
+    for (const [name, value] of [
+      ["OCULUS_FILE_MAX_MIB", "0"],
+      ["OCULUS_FILE_MAX_MIB", "1.5"],
+      ["OCULUS_FILES_TOTAL_MAX_MIB", "99999999"],
+      ["OCULUS_FILES_TOTAL_MAX_MIB", "-3"],
+    ] as const) {
+      await expect(
+        buildAdminServer({ db, env: { ...DEV, [name]: value }, adminFiles: files }),
+      ).rejects.toThrow(new RegExp(name));
+    }
   });
 
   it("refuses to start without a usable secret key, never showing it", async () => {

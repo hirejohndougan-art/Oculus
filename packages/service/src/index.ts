@@ -38,6 +38,54 @@ export type {
 export { contextFromSession, NOT_PERMITTED_MESSAGE } from "./access.js";
 export type { SessionLike } from "./access.js";
 export type { AdminOperations, MyAccess, RoleRequest } from "./admin.js";
+export { ADOPT_QUIET_MS, FILE_LEASE_RENEW_MS } from "./files.js";
+export {
+  openFileStore,
+  DEFAULT_MAX_FILE_BYTES,
+  DEFAULT_MAX_ORGANIZATION_BYTES,
+  MAX_CAP_BYTES,
+  DEFAULT_MIN_FREE_BYTES,
+  DEFAULT_MIN_FREE_FRACTION,
+  STORE_MARKER,
+} from "./file-store.js";
+export type {
+  FileStore,
+  FileStoreOptions,
+  ReceivedFile,
+  ReceiveOptions,
+  ReceiveRefusal,
+  ReceiveResult,
+  StoreMarker,
+} from "./file-store.js";
+export { MAX_THUMBNAIL_SOURCE_BYTES, VIEW_HEADER_BYTES } from "./files.js";
+export {
+  THUMBNAIL_BOXES,
+  THUMBNAIL_LIMITS,
+  THUMBNAIL_TYPES,
+  VIEW_LIMITS,
+  VIEW_TYPES,
+  imageDimensions,
+  type ThumbnailSize,
+} from "./thumbnail-worker.js";
+export {
+  createThumbnailRenderer,
+  type RenderResult,
+  type ThumbnailRenderer,
+  type ThumbnailRendererOptions,
+} from "./thumbnails.js";
+export type {
+  FileContent,
+  FileUse,
+  AttachCheck,
+  AttachOptions,
+  AttachedFile,
+  FileOperations,
+  FileStoreProblem,
+  FileSweep,
+  PurgeEntry,
+  PurgeProblem,
+  RemoveFileOptions,
+} from "./files.js";
 export type {
   PeopleOperations,
   PeopleContext,

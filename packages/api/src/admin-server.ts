@@ -27,7 +27,14 @@
  * - `OCULUS_PUBLIC_SITES` is wrong (public-sites.ts), names a site that
  *   doesn't exist, or is set without a public reader connection
  *   (`publicDb`); or that connection, whenever one is given, could read more
- *   than the public read path (`checkPublicReaderConnection`, D-080).
+ *   than the public read path (`checkPublicReaderConnection`, D-080);
+ * - `OCULUS_FILES_DIR` (M-002, D-086) is missing, not an absolute path, or
+ *   not an existing writable directory, or the caps `OCULUS_FILE_MAX_MIB`
+ *   (default 500) or `OCULUS_FILES_TOTAL_MAX_MIB` (per organization,
+ *   default 20480) or the free-space floor `OCULUS_FILES_MIN_FREE_MIB`
+ *   (default: 5% of the disk or 2 GiB, whichever is smaller) aren't whole
+ *   numbers in range. Stale temporary files and copies no row names are
+ *   swept at startup and every 15 minutes.
  *
  * It warns loudly (a `startup_warning` log record) when the database
  * server's `log_parameter_max_length_on_error` is above 0, since pg's
@@ -40,6 +47,7 @@
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import {
+  databaseIdentity,
   loadSecretKeyring,
   sql,
   type Database,
@@ -47,7 +55,14 @@ import {
   type InvitationDelivery,
   type PasswordResetDelivery,
 } from "@oculus/db";
-import { createService } from "@oculus/service";
+import {
+  createService,
+  createThumbnailRenderer,
+  FILE_LEASE_RENEW_MS,
+  openFileStore,
+  type FileStore,
+  type FileStoreProblem,
+} from "@oculus/service";
 import type { FastifyInstance } from "fastify";
 import { ADMIN_ORIGIN_ENV, loadAdminFiles, type AdminFiles } from "./admin-files.js";
 import { originsFromEnv } from "./origin.js";
@@ -59,15 +74,111 @@ import { PUBLIC_POOL_SIZE, publicApiRoutes, ReadSlots } from "./public-api.js";
 import { PublicSubjects, publicSubjectsRoutes } from "./public-subjects.js";
 import { PUBLIC_DATABASE_URL_ENV, checkPublicSites, publicSitesFromEnv } from "./public-sites.js";
 import type { OculusRoute } from "./routes.js";
-import { buildServer, type ServerOptions } from "./server.js";
+import { UPLOAD_TIMEOUTS, buildServer, type ServerOptions } from "./server.js";
 import { signInRoutes, type SignInApiOptions } from "./sign-in-api.js";
-import { serviceErrorLogger, staffApiRoutes, type ApiLogRecord } from "./staff-api.js";
+import {
+  redactedError,
+  serviceErrorLogger,
+  staffApiRoutes,
+  type ApiLogRecord,
+} from "./staff-api.js";
 import { updateChangeLog } from "./update-change-log.js";
 import { updateManagerFromEnv, type UpdateManager } from "./update-manager.js";
 
 export { isProduction };
 
 export const CLIENT_ADDRESS_ENV = "OCULUS_CLIENT_ADDRESS";
+export const FILES_DIR_ENV = "OCULUS_FILES_DIR";
+export const FILE_MAX_ENV = "OCULUS_FILE_MAX_MIB";
+export const FILES_TOTAL_MAX_ENV = "OCULUS_FILES_TOTAL_MAX_MIB";
+export const FILES_MIN_FREE_ENV = "OCULUS_FILES_MIN_FREE_MIB";
+
+/** Why the files folder was refused, as the startup error says it (never the path). */
+const FILE_STORE_PROBLEMS: Readonly<Record<FileStoreProblem, string>> = {
+  no_store: "no files folder is configured.",
+  other_install:
+    "the folder belongs to another Oculus install (its .oculus-store-id names another database). Give this install a folder of its own.",
+  marker_missing:
+    "this database has used a files folder before, and this folder has no .oculus-store-id. Set OCULUS_FILES_DIR to the folder this database used (restore that folder from backup if it was lost).",
+  not_empty:
+    "the folder isn't empty and has no .oculus-store-id. Give Oculus an empty folder of its own.",
+};
+
+/** Temporary upload files older than this are swept: twice an upload's whole limit. */
+export const INCOMING_MAX_AGE_MS = 2 * UPLOAD_TIMEOUTS.request;
+/** How often the folder's lease moves on (D-086: at most this long until a shared folder shows). */
+export const FILE_LEASE_EVERY_MS = FILE_LEASE_RENEW_MS;
+
+/**
+ * What a server uses the files folder for: the database's identity, its
+ * name and the server's port, so two servers of one database agree and two
+ * databases never do. Read before the folder is bound, so nothing in it
+ * depends on the binding.
+ */
+async function serverKey(db: Database): Promise<string> {
+  const rows = await db.rows<{ name: string; port: number | null }>(
+    sql`SELECT current_database() AS name, inet_server_port() AS port`,
+  );
+  const identity = await databaseIdentity(db);
+  return encodeURIComponent(`${identity}|${rows[0]?.name ?? "-"}|${String(rows[0]?.port ?? "-")}`);
+}
+
+/** How often the file sweep runs (and once at startup). */
+export const FILE_SWEEP_EVERY_MS = 15 * 60_000;
+
+/** A cap in MiB from the environment, as bytes; throws naming the variable, never the value. */
+function mibFromEnv(
+  env: Readonly<Record<string, string | undefined>>,
+  name: string,
+): number | undefined {
+  const text = env[name];
+  if (text === undefined || text.trim() === "") return undefined;
+  if (!/^[1-9][0-9]{0,6}$/.test(text.trim())) {
+    throw new Error(`refusing to start: ${name} must be a whole number of MiB from 1 to 1048576.`);
+  }
+  const mib = Number(text.trim());
+  if (mib > 1_048_576) {
+    throw new Error(`refusing to start: ${name} must be a whole number of MiB from 1 to 1048576.`);
+  }
+  return mib * 1024 * 1024;
+}
+
+/**
+ * The file store from `OCULUS_FILES_DIR` and the two caps (D-086). Refuses
+ * (throws) without the folder: uploads are part of the admin.
+ */
+export async function fileStoreFromEnv(
+  env: Readonly<Record<string, string | undefined>>,
+): Promise<FileStore> {
+  const dir = env[FILES_DIR_ENV];
+  if (dir === undefined || dir.trim() === "") {
+    throw new Error(`refusing to start: ${FILES_DIR_ENV} must name the folder files are kept in.`);
+  }
+  const maxFileBytes = mibFromEnv(env, FILE_MAX_ENV);
+  const maxOrganizationBytes = mibFromEnv(env, FILES_TOTAL_MAX_ENV);
+  const minFree = env[FILES_MIN_FREE_ENV];
+  let minFreeBytes: number | undefined;
+  if (minFree !== undefined && minFree.trim() !== "") {
+    if (!/^(0|[1-9][0-9]{0,6})$/.test(minFree.trim())) {
+      throw new Error(`refusing to start: ${FILES_MIN_FREE_ENV} must be a whole number of MiB.`);
+    }
+    minFreeBytes = Number(minFree.trim()) * 1024 * 1024;
+  }
+  try {
+    return await openFileStore({
+      dir,
+      ...(maxFileBytes === undefined ? {} : { maxFileBytes }),
+      ...(maxOrganizationBytes === undefined ? {} : { maxOrganizationBytes }),
+      ...(minFreeBytes === undefined ? {} : { minFreeBytes }),
+    });
+  } catch (error) {
+    // openFileStore's messages name no path.
+    throw new Error(
+      `refusing to start: ${FILES_DIR_ENV}: ${error instanceof Error ? error.message : "unusable"}`,
+      { cause: error },
+    );
+  }
+}
 
 /** Where the admin build is, from this file (dist or src, both two levels under the repo's packages). */
 export const DEFAULT_ADMIN_DIR = join(
@@ -120,6 +231,11 @@ export interface AdminServerOptions {
   readonly logger?: ServerOptions["logger"];
   /** Routes of the program that starts the server (the desktop launcher's instance check, D-088). */
   readonly extraRoutes?: readonly OculusRoute[];
+  /**
+   * Server-side thumbnails (M-003, D-097): off by default and until T-072
+   * makes them safe; `GET .../thumbnail` then answers `422 no_thumbnail`.
+   */
+  readonly thumbnails?: boolean;
   /** Passed on to the sign-in routes (tests). */
   readonly signIn?: Pick<SignInApiOptions, "rateLimits" | "clock" | "resetOptions">;
   /**
@@ -268,12 +384,23 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
           oaiStamps: oaiEmail !== undefined,
         });
 
-  const service = createService(options.db, { onError: serviceErrorLogger(log) });
+  const files = await fileStoreFromEnv(env);
+  // Thumbnails (M-003, D-097) are off until T-072: no renderer, so no
+  // worker is ever started. Turned on, one worker, stopped with the server.
+  const thumbnailsOn = options.thumbnails === true;
+  const thumbnails = thumbnailsOn ? createThumbnailRenderer() : undefined;
+  const service = createService(options.db, {
+    onError: serviceErrorLogger(log),
+    files,
+    thumbnailsEnabled: thumbnailsOn,
+    ...(thumbnails === undefined ? {} : { thumbnails }),
+  });
   const routes = [
     ...staffApiRoutes({
       db: options.db,
       service,
       log,
+      files,
       people: {
         keys,
         deliverReset,
@@ -311,14 +438,90 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     ...(publicSubjects === undefined ? [] : publicSubjectsRoutes({ subjects: publicSubjects })),
     ...(options.extraRoutes ?? []),
   ];
-  const app = await buildServer({
-    env,
-    routes,
-    ...(options.logger === undefined ? {} : { logger: options.logger }),
-    ...(admin === undefined ? {} : { admin }),
-    ...(publicSubjects === undefined ? {} : { onClose: () => publicSubjects.stop() }),
-  });
+  // The files folder (D-086). First this server's note in it, so a second
+  // server with another database is refused before it changes anything
+  // there (not the marker, not the lease); then the folder must be this
+  // install's (review B1).
+  const prepared = async <T>(step: () => Promise<T>): Promise<T> => {
+    try {
+      return await step();
+    } catch (error) {
+      // A file system error's message holds the path: only its code is shown.
+      const code = (error as { code?: unknown }).code;
+      throw new Error(
+        `refusing to start: ${FILES_DIR_ENV}: the folder couldn't be prepared (${typeof code === "string" && /^[A-Z][A-Z0-9_]{1,30}$/.test(code) ? code : "error"}).`,
+        { cause: error },
+      );
+    }
+  };
+  const key = await serverKey(options.db);
+  const claim = await prepared(() => files.claimServer(key));
+  if (!claim.ok) {
+    throw new Error(
+      `refusing to start: ${FILES_DIR_ENV}: another Oculus server on this computer uses this folder with another database. Give each database a folder of its own.`,
+    );
+  }
+  let bound: Awaited<ReturnType<typeof service.bindFileStore>>;
+  try {
+    bound = await prepared(() => service.bindFileStore());
+  } catch (error) {
+    claim.release();
+    throw error;
+  }
+  if (!bound.ok) {
+    claim.release();
+    throw new Error(`refusing to start: ${FILES_DIR_ENV}: ${FILE_STORE_PROBLEMS[bound.problem]}`);
+  }
+  if (bound.warning === "files_shared_or_restored") {
+    // Another database uses this folder, or this one was restored or
+    // copied: it starts, and an operator runs `files:adopt` once sure.
+    log({ event: "startup_warning", code: "files_shared_or_restored" });
+  }
+  const renew = async (): Promise<void> => {
+    try {
+      if (!(await service.renewFileLease())) {
+        log({ event: "startup_warning", code: "files_shared_or_restored" });
+      }
+    } catch (error) {
+      log({ event: "service_error", operation: "renewFileLease", ...redactedError(error) });
+    }
+  };
+  const sweep = async (): Promise<void> => {
+    try {
+      const swept = await service.sweepFiles(INCOMING_MAX_AGE_MS);
+      if (swept.failed > 0)
+        log({ event: "service_error", operation: "sweepFiles", code: "partial" });
+    } catch (error) {
+      log({ event: "service_error", operation: "sweepFiles", ...redactedError(error) });
+    }
+  };
+  await sweep();
+  let app: FastifyInstance;
+  try {
+    app = await buildServer({
+      env,
+      routes,
+      ...(options.logger === undefined ? {} : { logger: options.logger }),
+      ...(admin === undefined ? {} : { admin }),
+      ...(publicSubjects === undefined ? {} : { onClose: () => publicSubjects.stop() }),
+    });
+  } catch (error) {
+    claim.release();
+    throw error;
+  }
   // Started once the server is built, so a start that fails counts nothing.
   publicSubjects?.start();
+  const timer = setInterval(() => void sweep(), FILE_SWEEP_EVERY_MS);
+  timer.unref();
+  const lease = setInterval(() => void renew(), FILE_LEASE_EVERY_MS);
+  lease.unref();
+  // Started once the server is built, so a start that fails counts nothing.
+  publicSubjects?.start();
+  app.server.once("close", () => {
+    clearInterval(timer);
+    clearInterval(lease);
+    claim.release();
+    void thumbnails?.close();
+  });
   return app;
 }

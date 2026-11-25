@@ -13,12 +13,14 @@ import { openDatabase, sql } from "@oculus/db";
 export interface Seed {
   readonly email: string;
   readonly editorEmail: string;
+  readonly scannerEmail: string;
   /** The system manager (T-048a's System settings). */
   readonly rootEmail: string;
   readonly organizationName: string;
   readonly password: string;
   readonly siteName: string;
   readonly recordTitle: string;
+  readonly assetTitle: string;
   /** T-062's idle sign-out test's own person. */
   readonly idleEmail: string;
   /** The throwaway database (T-062's test ages its session there). */
@@ -107,9 +109,15 @@ export async function signInAndSetUp(
 
   await expect(page.getByRole("heading", { name: "Set up two-step sign-in" })).toBeVisible();
   if (check) await accessible(page, "Set up two-step sign-in");
-  await page.getByRole("button", { name: "Start setting up" }).press("Enter");
-
-  await expect(page.getByRole("img", { name: /QR code/ })).toBeVisible();
+  // "Start setting up" stays disabled until the waiting sign-in's state has
+  // loaded (SetUp.tsx); a key pressed before then does nothing. One press,
+  // once it is enabled. The set-up step hashes and seals the key, so the
+  // code gets time on a loaded machine.
+  const qr = page.getByRole("img", { name: /QR code/ });
+  const start = page.getByRole("button", { name: "Start setting up" });
+  await expect(start).toBeEnabled();
+  await start.press("Enter");
+  await expect(qr).toBeVisible({ timeout: 15_000 });
   if (check) await accessible(page, "Scan the code");
   const key = (await page.locator("code").first().textContent()) ?? "";
   const secret = decodeBase32(key.replace(/\s+/g, ""));

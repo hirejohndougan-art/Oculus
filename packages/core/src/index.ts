@@ -735,3 +735,11 @@ export {
   MAX_CLIENT_LABEL_LENGTH,
 } from "./sessions.js";
 export type { SessionId, SessionPolicy } from "./sessions.js";
+export {
+  sniffMediaType,
+  cleanFileName,
+  isSha256Hex,
+  isClaimedMediaType,
+  SNIFF_BYTES,
+  MAX_FILE_NAME_LENGTH,
+} from "./files.js";

@@ -293,6 +293,8 @@ export {
   deleteExpiredSessions,
   deleteOldPasswordResets,
   runCleanup,
+  WRONG_CODE_MEMORY_SECONDS,
+  UNEXPLAINED_TOLD_AFTER_SECONDS,
   NO_SESSION,
   MAX_LISTED_SESSIONS,
   SESSION_TABLE_PRIVILEGES,
@@ -374,6 +376,38 @@ export {
   MAX_ORGANIZATION_CHOICES,
 } from "./sign-in-screens.js";
 export type { PendingSignInState, OrganizationChoice, SignedInPerson } from "./sign-in-screens.js";
+export {
+  STORED_FILE_TABLE_PRIVILEGES,
+  MAX_FILES_PER_LIST,
+  findStoredFile,
+  insertStoredFile,
+  listStoredFiles,
+  storedFileById,
+  lockOrganizationFiles,
+  organizationFileBytes,
+  organizationHasContent,
+  deleteStoredFile,
+  namedContents,
+  findStoredFileById,
+  insertStoredFileEvent,
+  purgeCandidates,
+  readFileStoreLease,
+  lockFileStoreLease,
+  insertFileStoreEpoch,
+  databaseIdentity,
+  PLACING_GRACE_SECONDS,
+  existingOrganizations,
+  readFileStoreBinding,
+  insertFileStoreBinding,
+  REMOVED_FILE_GRACE_SECONDS,
+} from "./stored-files.js";
+export type {
+  NewStoredFile,
+  StoredFile,
+  StoredFileEventKind,
+  PurgeCandidate,
+  FileStoreLease,
+} from "./stored-files.js";
 export {
   sendSecondStepAlertNotices,
   ALERT_NOTICE_TABLE_PRIVILEGES,

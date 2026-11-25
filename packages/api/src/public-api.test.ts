@@ -42,6 +42,7 @@ let reader: Database;
 let readerRole: string;
 let app: FastifyInstance;
 let dir: string;
+let filesDir: string;
 let published: string;
 let draft: string;
 let otherSite: string;
@@ -136,6 +137,7 @@ beforeAll(async () => {
   dir = mkdtempSync(join(tmpdir(), "oculus-t050d-"));
   writeFileSync(join(dir, "index.html"), "<!doctype html><title>Oculus</title>");
   mkdirSync(join(dir, "assets"));
+  filesDir = mkdtempSync(join(tmpdir(), "oculus-t050d-files-"));
   app = await buildAdminServer({
     db: w.db,
     publicDb: reader,
@@ -145,6 +147,7 @@ beforeAll(async () => {
       OCULUS_ADMIN_ORIGIN: ADMIN,
       OCULUS_SECRET_KEY: FAKE_TEST_SECRET_KEY,
       OCULUS_PUBLIC_SITES: `${PUBLIC}=${w.a1}`,
+      OCULUS_FILES_DIR: filesDir,
     },
     adminFiles: loadAdminFiles(dir),
     log: () => undefined,
@@ -154,6 +157,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await app.close();
   rmSync(dir, { recursive: true, force: true });
+  rmSync(filesDir, { recursive: true, force: true });
   await reader.close();
   await w.db.close();
   await w.testDb.drop();

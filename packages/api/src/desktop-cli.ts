@@ -501,8 +501,13 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
 
     const port = await choosePort(wantedPort);
     const origin = `http://127.0.0.1:${String(port)}`;
+    // Uploaded files (M-002, D-086): OCULUS_FILES_DIR if set, else a folder
+    // of their own in the settings folder, readable by the person only.
+    const filesDir = env.OCULUS_FILES_DIR ?? join(folder, "files");
+    if (env.OCULUS_FILES_DIR === undefined) mkdirSync(filesDir, { recursive: true, mode: 0o700 });
     const serverEnv: Record<string, string | undefined> = {
       ...env,
+      OCULUS_FILES_DIR: filesDir,
       NODE_ENV: "development",
       [ORIGINS_ENV]: origin,
       [ADMIN_ORIGIN_ENV]: origin,
