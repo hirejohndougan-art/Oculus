@@ -10,7 +10,7 @@ import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { openDatabase } from "./client.js";
 import { DATABASE_URL_VARIABLE } from "./migrate-cli.js";
-import { grantWriterRole } from "./roles.js";
+import { grantWriterRole, identityGrantHint } from "./roles.js";
 
 export async function runGrantCli(
   args: readonly string[],
@@ -36,8 +36,10 @@ export async function runGrantCli(
     return 2;
   }
   try {
-    await db.transaction((tx) => grantWriterRole(tx, role));
+    const granted = await db.transaction((tx) => grantWriterRole(tx, role));
     out(`Done: the writer's privileges granted to ${role}.`);
+    // Not a failure: the purge of removed files waits for it (S-052).
+    if (!granted.identityReadable) out(identityGrantHint(role));
     return 0;
   } catch (error) {
     const code = (error as { code?: unknown }).code;

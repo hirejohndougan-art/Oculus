@@ -29,7 +29,9 @@ import {
   createDatabase,
   databaseBeforeSetup,
   dropDatabase,
+  grantIdentityRead,
   grantWriterRole,
+  identityGrantHint,
   migrate,
   openDatabase,
   runSetupCli,
@@ -248,6 +250,23 @@ export async function runDesktopDatabase(options: DesktopDatabaseOptions): Promi
     } finally {
       await owner.close();
     }
+    // The purge of removed files needs the writer to read the cluster's
+    // system identifier (S-052): granted as the administrator, in Oculus's
+    // database; if it can't be, one line, and setup goes on.
+    const adminHere = openDatabase(
+      adminPassword === ""
+        ? addressFor(adminBase, adminUser, names.database)
+        : withPassword(addressFor(adminBase, adminUser, names.database), adminPassword),
+      { applicationName: "oculus-desktop-database", max: 1 },
+    );
+    try {
+      const readable = await adminHere
+        .transaction((tx) => grantIdentityRead(tx, names.writer))
+        .catch(() => false);
+      if (!readable) out(identityGrantHint(names.writer));
+    } finally {
+      await adminHere.close();
+    }
 
     const target = pgpassTarget(ownerAddress);
     added = addPgpassEntries(pgpassFile, [
@@ -306,6 +325,8 @@ async function firstSetup(
     out,
     err,
     finished,
+    // The writer got its grant above; the owner doesn't need one.
+    { identityGrant: false },
   );
   out("");
   out(

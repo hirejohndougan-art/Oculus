@@ -140,6 +140,8 @@ export type {
 export type { RecordDeletion, RecordDeletionResult } from "./record-delete.js";
 export {
   grantWriterRole,
+  grantIdentityRead,
+  identityGrantHint,
   checkWriterConnection,
   grantPublicReaderRole,
   checkPublicReaderConnection,

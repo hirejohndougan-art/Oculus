@@ -14,6 +14,10 @@
  * input), never taken from the environment or the command line. Nothing
  * printed shows the URL or the password.
  *
+ * After migrating it lets the connected role read the cluster's system
+ * identifier (`grantIdentityRead`, for the purge of removed files, S-052)
+ * when it is allowed to; if not, it says so in one line and goes on.
+ *
  * Exit codes: 0 done, 1 refused or failed, 2 usage.
  */
 import { createInterface, type Interface } from "node:readline";
@@ -25,6 +29,8 @@ import { redact, secretsOf } from "./backup-connection.js";
 import { databaseBeforeSetup, isEmptyInstall, setUpFirstInstall } from "./first-setup.js";
 import { migrate, MigrationError } from "./migrate.js";
 import { DATABASE_URL_VARIABLE } from "./migrate-cli.js";
+import { grantIdentityRead, identityGrantHint } from "./roles.js";
+import { sql } from "./sql.js";
 
 type Line = (line: string) => void;
 
@@ -54,6 +60,12 @@ export async function runSetupCli(
   rawErr: Line,
   /** Called once every question is answered (the terminal lets go of the keyboard). */
   finished?: () => void,
+  /**
+   * Whether to let the connected role read the cluster's system identifier
+   * (default true; S-052): `npm run desktop:database` grants it to its
+   * writer itself, as the administrator, and runs this as the owner.
+   */
+  setupOptions: { readonly identityGrant?: boolean } = {},
 ): Promise<number> {
   const url = env[DATABASE_URL_VARIABLE];
   if (url === undefined || url.trim() === "") {
@@ -106,6 +118,17 @@ export async function runSetupCli(
         err(`Setup stopped: the database could not be prepared: ${messageOf(error)}`);
       }
       return 1;
+    }
+    // The purge of removed files needs the cluster's system identifier
+    // (S-052): granted to this role when it may; otherwise one line, and on.
+    if (setupOptions.identityGrant !== false) {
+      const readable = await grantIdentityRead(db).catch(() => false);
+      if (!readable) {
+        const [who] = await db
+          .rows<{ name: string }>(sql`SELECT current_user::text AS name`)
+          .catch(() => []);
+        out(identityGrantHint(who?.name ?? "<the server's role>"));
+      }
     }
     if (!(await isEmptyInstall(db))) {
       err(
