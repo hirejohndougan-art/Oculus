@@ -611,7 +611,12 @@ describe("invitations", () => {
 });
 
 describe("the audit trail", () => {
-  interface Entry { type: string; recordId?: string; kind?: string; siteId?: string | null }
+  interface Entry {
+    type: string;
+    recordId?: string;
+    kind?: string;
+    siteId?: string | null;
+  }
   async function trail(as: string, query = "") {
     const r = await call("GET", `/api/audit${query}`, { as });
     return { ...r, entries: (r.json.entries ?? []) as Entry[] };

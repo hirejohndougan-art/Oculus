@@ -190,7 +190,10 @@ export function mayManage(access: Access, role: BuiltInRole, siteId: SiteId | nu
   return permits(access, "site.people", { on: "site", siteId });
 }
 
-interface Who { readonly organizationId: OrganizationId; readonly actor: string }
+interface Who {
+  readonly organizationId: OrganizationId;
+  readonly actor: string;
+}
 
 /** Grants a role in the caller's transaction (`grantRole`'s rules; the people service adds its log). */
 export async function grantRoleIn(
