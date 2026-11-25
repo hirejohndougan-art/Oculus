@@ -312,6 +312,29 @@ describe("npm run desktop", () => {
       await running(right);
       right.stop();
       expect(await right.done).toBe(0);
+
+      // Once that set-up is revoked, nothing usable is sealed: a new key is fine.
+      const owner2 = openDatabase(database.url, { max: 1 });
+      try {
+        // As the owner, past the guard (as giveTestFactor does), within one transaction.
+        await owner2.transaction(async (q) => {
+          await q.execute(
+            sql`ALTER TABLE public.second_factors DISABLE TRIGGER second_factors_check_change`,
+          );
+          await q.execute(
+            sql`UPDATE public.second_factors SET state = 'revoked', revoked_at = now()`,
+          );
+          await q.execute(
+            sql`ALTER TABLE public.second_factors ENABLE ALWAYS TRIGGER second_factors_check_change`,
+          );
+        });
+      } finally {
+        await owner2.close();
+      }
+      const fresh = start({ env: { OCULUS_DATABASE_URL: database.url } });
+      await running(fresh);
+      fresh.stop();
+      expect(await fresh.done).toBe(0);
     } finally {
       await database.drop();
     }

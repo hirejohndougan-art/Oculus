@@ -481,9 +481,41 @@ function createWhole(file: string, contents: LockContents): boolean {
     return true;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
-    throw error;
+    // No hard links here (FAT, exFAT, some network shares): create it
+    // exclusively and write it, accepting a moment when it's half written.
+    const fdLock = openExclusive(file);
+    if (fdLock === undefined) return false;
+    try {
+      writeSync(fdLock, JSON.stringify(contents));
+    } finally {
+      closeSync(fdLock);
+    }
+    return true;
   } finally {
     rmSync(temporary, { force: true });
+  }
+}
+
+function openExclusive(file: string): number | undefined {
+  try {
+    return openSync(file, "wx", 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return undefined;
+    throw error;
+  }
+}
+
+/** Windows may hold a just-written file briefly (antivirus, indexer): retry a rename a few times. */
+function renameRetrying(from: string, to: string): void {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      renameSync(from, to);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (attempt >= 5 || (code !== "EPERM" && code !== "EACCES" && code !== "EBUSY")) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50 * (attempt + 1));
+    }
   }
 }
 
@@ -496,7 +528,11 @@ function replaceWhole(file: string, contents: LockContents): void {
   } finally {
     closeSync(fd);
   }
-  renameSync(temporary, file);
+  try {
+    renameRetrying(temporary, file);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
 }
 
 /**
@@ -515,7 +551,9 @@ function moveAside(file: string, stale: LockContents | undefined): void {
   }
   try {
     const moved = readLockFile(aside);
-    if (moved !== undefined && stale !== undefined && moved.token !== stale.token) {
+    // A valid lock that isn't the one judged stale (or any valid lock, when
+    // the stale one couldn't be read) goes back.
+    if (moved !== undefined && moved.token !== stale?.token) {
       try {
         linkSync(aside, file);
       } catch {

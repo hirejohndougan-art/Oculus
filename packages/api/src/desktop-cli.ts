@@ -150,7 +150,11 @@ function passwordOf(url: string): string[] {
   return found;
 }
 
-/** The fingerprints of the keys the database's two-step set-ups are sealed with (D-077). */
+/**
+ * The fingerprints of the keys the database's live two-step set-ups are
+ * sealed with (D-077). Revoked ones never open again and are never resealed,
+ * so they don't count.
+ */
 async function sealingKeyIds(db: Database): Promise<string[]> {
   const [table] = await db.rows<{ present: boolean }>(
     sql`SELECT to_regclass('public.second_factors') IS NOT NULL AS present`,
@@ -158,7 +162,8 @@ async function sealingKeyIds(db: Database): Promise<string[]> {
   if (table?.present !== true) return [];
   const rows = await db.rows<{ id: string }>(sql`
     SELECT DISTINCT encode(substring(secret_box FROM 2 FOR 8), 'hex') AS id
-    FROM public.second_factors`);
+    FROM public.second_factors
+    WHERE state <> 'revoked'`);
   return rows.map((r) => r.id);
 }
 

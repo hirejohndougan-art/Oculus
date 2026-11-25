@@ -37,6 +37,8 @@ Task T-057 will do this part for you with one command. Until then, it takes four
 
    Never put the password in this file; Oculus refuses to start if you do.
 
+In Notepad, choose **Save as type: All files** for both files, or Windows saves them as `pgpass.conf.txt` and `desktop.json.txt` and nothing finds them.
+
 ## Get Oculus and set it up, once
 
 In a Command Prompt:
@@ -66,7 +68,7 @@ Double-click `scripts\start-oculus.cmd` in the Oculus folder. To make a desktop 
 ## Keep these safe
 
 - **Your database.** `npm run db:backup -- <file>` makes a backup (see the README).
-- **The secret key** in `%APPDATA%\Oculus\secret-key`, made the first time Oculus starts. Two-step sign-in depends on it, and database backups don't include it. Copy it somewhere safe, like a USB drive kept with your backups. If it's lost, everyone has to set up two-step sign-in again. Once anyone has set up two-step sign-in, Oculus refuses to start without the key rather than make a new one: put it back from your backup.
+- **The secret key** in `%APPDATA%\Oculus\secret-key`, made the first time Oculus starts. Two-step sign-in depends on it, and database backups don't include it. Copy it somewhere safe, like a USB drive kept with your backups. Once anyone has set up two-step sign-in, Oculus refuses to start without that key rather than make a new one that would lock everyone out: put it back from your backup. If it's truly lost, ask for help before doing anything else.
 - **Your password and recovery codes.** Until email is set up there's no password reset, and the recovery codes Oculus shows at your first sign-in are the only way in if you lose your phone. Keep both somewhere safe.
 
 ## Updating
@@ -86,4 +88,4 @@ Everything is optional. In `desktop.json`:
 - `"databaseUrl"`: the database (or set `OCULUS_DATABASE_URL`, which wins).
 - `"port"`: the port Oculus uses on this computer (default 4780; another free one if that's taken).
 
-Other settings: `OCULUS_DESKTOP_HOME` moves the settings folder, `OCULUS_DESKTOP_BROWSER` names the browser to open, and `OCULUS_SECRET_KEY` replaces the key file.
+Other settings: `OCULUS_DESKTOP_HOME` moves the settings folder (only to a folder no one else on the computer can open, since the secret key lives there), `OCULUS_DESKTOP_BROWSER` names the browser to open, and `OCULUS_SECRET_KEY` replaces the key file.
