@@ -199,10 +199,18 @@ export class SlowReads {
     }
     return found.strikes;
   }
-  /** A read at the larger limit came back in time: still slow, no strikes. */
-  answered(key: string): void {
+  /**
+   * A read at the larger limit came back in time: no strikes. One that came
+   * back within the normal limit (`quick`) is no longer known slow at all,
+   * so a short slow spell doesn't mark records for a day.
+   */
+  answered(key: string, quick = false): void {
     const found = this.mark(key);
     if (found === undefined) return;
+    if (quick) {
+      this.marks.delete(key);
+      return;
+    }
     found.strikes = 0;
     delete found.struckAt;
   }
@@ -255,6 +263,15 @@ export function readLimit(
     timeLimitMs: limit,
     budgetMs: Math.max(slowReads.budgetMs, Math.min(limit, PUBLIC_READ_BUDGET_MS)),
   };
+}
+
+/**
+ * Whether a read ran out of time on its own (S-043b): a statement or a gap
+ * past its limit (SQLSTATE 57014, `TimeLimitError` included), never the
+ * pool's wait for a connection, which says nothing about the record.
+ */
+export function ownTimeout(thrown: unknown): boolean {
+  return isDatabaseTimeout(thrown) && (thrown as { code?: unknown }).code === "57014";
 }
 
 /** What is left of `budgetMs` since `started`; none left is a time limit (S-043b). */
@@ -350,6 +367,7 @@ export function publicApiRoutes(options: PublicApiOptions): OculusRoute[] {
         const limit = readLimit(options.timeLimitMs, slow ? slowReads : undefined);
         // Both reads below share one budget, so the request ends inside the server's reply time.
         const started = Date.now();
+        const quickMs = readLimit(options.timeLimitMs, undefined).timeLimitMs;
         try {
           result = await readPublicRecord(options.db, site.organizationId, site.siteId, id, {
             baseUrl: `${site.origin}/records/`,
@@ -370,12 +388,12 @@ export function publicApiRoutes(options: PublicApiOptions): OculusRoute[] {
               },
             );
           }
-          if (slow) slowReads.answered(key);
+          if (slow) slowReads.answered(key, Date.now() - started <= quickMs);
         } catch (error) {
           if (isDatabaseTimeout(error)) {
             // A time limit ran out (S-037): busy, as when every slot is taken,
             // and the record is read with the larger limit next time (S-043b).
-            slowReads.timedOut(key);
+            if (ownTimeout(error)) slowReads.timedOut(key);
             log({ event: "service_error", operation, name: "timeout" });
             throw new Refusal(503, "busy");
           }

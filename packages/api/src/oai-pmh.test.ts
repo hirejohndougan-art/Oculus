@@ -1243,7 +1243,7 @@ describe("a record always slower than the public read limit (S-043b)", () => {
     }
   });
 
-  it("a record that is only slow is read with the larger limit next time, and answers", async () => {
+  it("a record caught in a slow moment is read with the larger limit next time, answers, and is forgotten once quick", async () => {
     const sites = await checkPublicSites(w.db, reader, [{ origin: PUBLIC, siteId: w.a1 }]);
     let failing = true;
     const { db, limits } = slowFor(
@@ -1280,7 +1280,8 @@ describe("a record always slower than the public read limit (S-043b)", () => {
       const second = await get();
       expect(second.statusCode).toBe(200);
       expect(second.json<{ id: string }>().id).toBe(`${PUBLIC}/records/${published}`);
-      // Known slow, shared with OAI-PMH: GetRecord reads it at the larger limit too.
+      // It answered within the normal limit, so it is no longer known slow:
+      // GetRecord (sharing the memory) reads it at the normal limit again.
       const one = await oai(
         `verb=GetRecord&metadataPrefix=oai_dc&identifier=${PREFIX}${published}`,
         "127.0.0.1",
@@ -1288,9 +1289,8 @@ describe("a record always slower than the public read limit (S-043b)", () => {
       );
       expect(one.statusCode).toBe(200);
       expect(errorCode(one.body)).toBeUndefined();
-      expect(limits.map((l) => l.statement)).toEqual(["200ms", "1s", "1s"]);
-      // Answered in time: no strikes held against it.
-      expect(slowReads.strikes(slowKey(firstOf(sites), published))).toBe(0);
+      expect(limits.map((l) => l.statement)).toEqual(["200ms", "1s", "200ms"]);
+      expect(slowReads.isSlow(slowKey(firstOf(sites), published))).toBe(false);
     } finally {
       await server.close();
     }

@@ -52,6 +52,7 @@ import {
   oaiRepository,
   oaiStoredStamp,
   readPublicRecord,
+  TimeLimitError,
   type Database,
   type OaiCandidate,
 } from "@oculus/db";
@@ -62,6 +63,7 @@ import {
   clientKey,
   originOf,
   publicPoolOptions,
+  ownTimeout,
   ReadSlots,
   readLimit,
   slowKey,
@@ -87,6 +89,13 @@ export const OAI_MAX_SCAN = 200;
 export const OAI_PAGE_TIME_LIMIT_MS = 15_000;
 /** The longest one list read may take (the page's first; later ones get what is left). */
 const LIST_READ_LIMIT_MS = 30_000;
+/**
+ * The real time a list request's reads may take in all (S-043b): the list
+ * reads and the record reads, so a page ends (with a token, or `503 busy`
+ * when nothing was read) inside the server's 30 s reply time
+ * (`SERVER_TIMEOUTS.handler`), never cut off by it.
+ */
+export const OAI_REQUEST_BUDGET_MS = 25_000;
 
 /**
  * A list leaves out a record whose list reads at the larger limit (S-043b)
@@ -448,27 +457,36 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
     options.slowReads ?? new SlowReads(options.clock === undefined ? {} : { clock: options.clock });
   /** The whole time a record known to be slow may take to read (S-043b). */
   const slowBudgetMs = readLimit(options.timeLimitMs, slowReads).budgetMs;
+  /** A read within this was quick again: no longer known slow (S-043b). */
+  const normalLimitMs = readLimit(options.timeLimitMs, undefined).timeLimitMs;
 
   /**
    * The public output of a record public on the site, or undefined. A
    * record known to be slow is read with the larger limit (S-043b); a read
    * that runs out of time is remembered (`SlowReads`) and thrown on.
    */
-  async function publicRecord(site: PublicSite, id: string) {
+  async function publicRecord(site: PublicSite, id: string, capMs?: number) {
     if (!isRecordId(id)) return undefined;
     const key = slowKey(site, id);
     const slow = slowReads.isSlow(key);
+    const limit = readLimit(options.timeLimitMs, slow ? slowReads : undefined);
+    // Never past what is left of the request (S-043b); nothing left is busy,
+    // and not the record's doing, so it isn't remembered.
+    const budgetMs = Math.min(limit.budgetMs, Math.floor(capMs ?? limit.budgetMs));
+    if (budgetMs < 1) throw new TimeLimitError();
+    const started = Date.now();
     let result: Awaited<ReturnType<typeof readPublicRecord>>;
     try {
       result = await readPublicRecord(options.publicDb, site.organizationId, site.siteId, id, {
         baseUrl: `${site.origin}/records/`,
-        ...readLimit(options.timeLimitMs, slow ? slowReads : undefined),
+        timeLimitMs: limit.timeLimitMs,
+        budgetMs,
       });
     } catch (thrown) {
-      if (isDatabaseTimeout(thrown)) slowReads.timedOut(key);
+      if (ownTimeout(thrown)) slowReads.timedOut(key);
       throw thrown;
     }
-    if (slow) slowReads.answered(key);
+    if (slow) slowReads.answered(key, Date.now() - started <= normalLimitMs);
     return result.ok ? result.value : undefined;
   }
 
@@ -607,6 +625,8 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
     let outOfTime = false;
     // On the routes' clock (S-043a), as the brake and responseDate are.
     const deadline = clock() + pageTimeLimitMs;
+    // In real time, as the server's reply time is (S-043b).
+    const requestEnd = Date.now() + OAI_REQUEST_BUDGET_MS;
     while (shown.length < OAI_PAGE_SIZE && scanned < OAI_MAX_SCAN && !exhausted && !outOfTime) {
       const want = Math.min(OAI_PAGE_SIZE - shown.length + 5, OAI_MAX_SCAN - scanned);
       // The page's time bounds each list read too (S-051): checked before the
@@ -620,7 +640,14 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
           ...cursor.window,
           ...(after === undefined ? {} : { after }),
           limit: want,
-          timeLimitMs: scanned === 0 ? LIST_READ_LIMIT_MS : Math.min(LIST_READ_LIMIT_MS, left),
+          timeLimitMs: Math.max(
+            1,
+            Math.min(
+              scanned === 0 ? LIST_READ_LIMIT_MS : Math.min(LIST_READ_LIMIT_MS, left),
+              // At least a slow record's whole budget is kept for the reads after it.
+              Math.floor(requestEnd - Date.now() - slowBudgetMs),
+            ),
+          ),
         });
       } catch (thrown) {
         // Past the page's first, a list read that runs out of time ends the
@@ -651,6 +678,13 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
         }
         const key = slowKey(site, candidate.id);
         const wasSlow = slowReads.isSlow(key);
+        // What is left of the request: a read gets at most that (S-043b).
+        const capMs = requestEnd - Date.now();
+        if (scanned > 0 && (capMs < 1 || (wasSlow && capMs < slowBudgetMs))) {
+          exhausted = false;
+          outOfTime = true;
+          break;
+        }
         if (scanned > 0 && wasSlow && deadline - clock() < slowBudgetMs) {
           // Known to be slow (S-043b): read only with its whole larger limit
           // left, so the page's first read next time if not.
@@ -660,14 +694,15 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
         }
         let output: Awaited<ReturnType<typeof publicRecord>>;
         try {
-          output = await publicRecord(site, candidate.id);
+          output = await publicRecord(site, candidate.id, capMs);
         } catch (thrown) {
           if (!isDatabaseTimeout(thrown)) throw thrown;
           // A strike only for the record's own slowness: a statement or gap
           // past the larger limit, never the pool's wait for a connection.
           if (
             wasSlow &&
-            (thrown as { code?: unknown }).code === "57014" &&
+            capMs >= slowBudgetMs &&
+            ownTimeout(thrown) &&
             slowReads.strike(key) >= OAI_SKIP_AFTER_STRIKES
           ) {
             // Too slow even at the larger limit, again (S-043b): left out,

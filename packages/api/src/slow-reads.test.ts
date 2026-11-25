@@ -38,8 +38,12 @@ describe("SlowReads (S-043b)", () => {
     slow.answered("r");
     expect([slow.isSlow("r"), slow.strikes("r")]).toEqual([true, 0]);
     expect(slow.strike("r")).toBe(1);
+    // Answered within the normal limit: not known slow any more.
+    slow.answered("r", true);
+    expect([slow.isSlow("r"), slow.strikes("r")]).toEqual([false, 0]);
     // Answering a record never seen remembers nothing.
     slow.answered("other");
+    slow.answered("other", true);
     expect(slow.isSlow("other")).toBe(false);
   });
 
