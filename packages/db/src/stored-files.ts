@@ -1,6 +1,6 @@
 /**
  * Stored files (M-002, D-086): the rows saying which digital asset holds
- * which content (`public.stored_files`, migration 0032). The bytes are on
+ * which content (`public.stored_files`, migration 0038). The bytes are on
  * disk, named by organization and SHA-256 only (service `file-store.ts`);
  * nothing here touches the file system.
  *
@@ -33,11 +33,11 @@ import { sql } from "./sql.js";
 export const STORED_FILE_TABLE_PRIVILEGES: Readonly<Record<string, readonly string[]>> =
   Object.freeze({
     stored_files: Object.freeze(["INSERT", "DELETE"]),
-    // Every attach and removal, append-only (0033).
+    // Every attach and removal, append-only (0039).
     stored_file_events: Object.freeze(["INSERT"]),
-    // The files folder's install ID, made once (0033).
+    // The files folder's install ID, made once (0039).
     file_store_binding: Object.freeze(["INSERT"]),
-    // The folder's lease, a new epoch at each start, hour and purge (0033).
+    // The folder's lease, a new epoch at each start, hour and purge (0039).
     file_store_epochs: Object.freeze(["INSERT"]),
   });
 
@@ -218,7 +218,7 @@ export async function listStoredFiles(
  * Inserts one stored file row. The caller (the service) has checked the
  * person, the asset and the organization's total under
  * `lockOrganizationFiles`; the database checks the asset is a digital asset
- * and that one content has one size (0032).
+ * and that one content has one size (0038).
  */
 export async function insertStoredFile(tx: Queryable, file: NewStoredFile): Promise<StoredFile> {
   checkOrganization(file.organizationId);
