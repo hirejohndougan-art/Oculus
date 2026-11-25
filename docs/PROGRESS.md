@@ -2,14 +2,6 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
-## 2026-11-25 17:05 CT — Chat AA — T-059a EAD reader, writer and mappings in core
-- Result: done (built locally, not pushed or merged: John's instruction)
-- What changed: Chat H's `autopilot/T-059a` with main merged in (042115e); review fixes b2cd8e6 and be01a4b (`xml-tree.ts` counts attributes and namespace declarations as saxes reads them; `ead-read.ts` keeps staff-only parts inside staff-only notes, refuses a link address that needed cleaning, checks Oculus's own EAD3 history whole, reports list and chronology attributes, counts a prefixed `audience`); new `ead.review2.test.ts`.
-- Decisions: D-110 (Chat H's, amended)
-- Review: two independent reviews. First: no leak; two should-fix (data loss in staff-only notes, attribute limits after the tag was built) and six minor, all fixed. Second (fixes only): safe; two should-fix (a test that didn't test, history still not checked whole) and three minor, fixed.
-- Gate: PASS · tests_passing 5331 (was 5312 on the first run of this branch) · npm audit clean
-- Next: T-059b (EAD exports), on top of this branch.
-
 ## 2026-11-25 15:00 CT — manual (Chat A) — T-053 Phase 2 review
 
 - **Done:** two independent reviewers looked across all of Phase 2: one at security (sign-in, sessions, roles and scoping, the HTTP layer, the public side, secrets and operations), one at data integrity and operations (schema and migrations, the service as the only writer, the record lifecycle, files, setup, backup, updates, the desktop, the gate). **Nothing blocking in either**: no route, list or count leaks another organization's or site's catalog data, and nothing reachable loses or corrupts data.
