@@ -82,7 +82,7 @@ export async function runSetupCli(
     try {
       before = await databaseBeforeSetup(db);
     } catch (error) {
-      err(`Setup stopped: could not reach the database: ${messageOf(error)}`);
+      err(`Setup stopped: could not check the database: ${messageOf(error)}`);
       return 1;
     }
     if (before === "set_up") {
@@ -184,14 +184,17 @@ function messageOf(error: unknown): string {
  * Questions on the terminal (or standard input). The prompt is made at the
  * first question, after migrating, so Ctrl+C still stops a migration; it
  * keeps no history (Up can't recall the first password), and on a terminal
- * a line typed before its question is thrown away rather than taken as the
- * answer, and secret answers are not echoed. Ctrl+C at a question ends the
+ * anything typed before a question (during migration, or a half-typed
+ * line between questions) is thrown away rather than taken as the answer,
+ * and secret answers are not echoed. Ctrl+C at a question ends the
  * input, so the command stops with nothing saved.
  */
 export function terminalAsk(): { ask: Ask; close: () => void } {
   const tty = process.stdin.isTTY;
   let muted = false;
   let rl: Interface | undefined;
+  let settled: Promise<void> = Promise.resolve();
+  let settling = false;
   const lines: string[] = [];
   const waiting: ((line: string | undefined) => void)[] = [];
   let ended = false;
@@ -201,10 +204,17 @@ export function terminalAsk(): { ask: Ask; close: () => void } {
       done();
     },
   });
+  /** On a terminal, throws away a half-typed line (Ctrl+E, then Ctrl+U). */
+  const clearLine = (r: Interface): void => {
+    if (!tty) return;
+    r.write(null, { ctrl: true, name: "e" });
+    r.write(null, { ctrl: true, name: "u" });
+  };
   const open = (): Interface => {
     if (rl !== undefined) return rl;
     const made = createInterface({ input: process.stdin, output, terminal: tty, historySize: 0 });
     made.on("line", (line) => {
+      if (settling) return; // typed before the first question (during migration)
       const next = waiting.shift();
       if (next !== undefined) next(line);
       else if (!tty) lines.push(line); // piped answers arrive before their questions
@@ -216,11 +226,27 @@ export function terminalAsk(): { ask: Ask; close: () => void } {
       ended = true;
       for (const next of waiting.splice(0)) next(undefined);
     });
+    if (tty) {
+      // Keys pressed while migrating were held by the terminal and arrive
+      // now: let them in, unseen, and drop them before the first question.
+      settling = true;
+      muted = true;
+      settled = new Promise((resolve) => {
+        setTimeout(() => {
+          made.setPrompt("");
+          clearLine(made);
+          settling = false;
+          muted = false;
+          resolve();
+        }, 200);
+      });
+    }
     rl = made;
     return made;
   };
-  const ask: Ask = (question, { secret }) => {
+  const ask: Ask = async (question, { secret }) => {
     const r = open();
+    await settled;
     return new Promise((resolve) => {
       const finish = (line: string | undefined): void => {
         if (muted) process.stdout.write("\n");
@@ -237,6 +263,11 @@ export function terminalAsk(): { ask: Ask; close: () => void } {
         finish(undefined);
         return;
       }
+      // A half-typed line between questions is not an answer: drop it unseen.
+      muted = true;
+      r.setPrompt("");
+      clearLine(r);
+      muted = false;
       if (secret && tty) {
         process.stdout.write(question);
         muted = true;

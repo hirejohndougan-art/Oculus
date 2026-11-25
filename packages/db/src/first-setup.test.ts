@@ -5,6 +5,9 @@
 // runs race; bad answers save nothing; the command never prints the
 // password or the URL's password. Every name, address and password is
 // invented (example.org is reserved for examples, RFC 2606).
+import { copyFileSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { newOrganizationId, validateTemplate, type Validated } from "@oculus/core";
 import { createFirstSystemAdmin, signIn } from "./accounts.js";
@@ -13,6 +16,7 @@ import { openDatabase, type Database } from "./client.js";
 import {
   STARTER_TEMPLATE_FIELDS,
   STARTER_TEMPLATE_KEY,
+  databaseBeforeSetup,
   isEmptyInstall,
   setUpFirstInstall,
   type FirstInstall,
@@ -188,6 +192,14 @@ describe("setUpFirstInstall", () => {
 
   it("refuses unknown keys, getters and non-objects", async () => {
     const { db } = await migrated();
+    const throwingRead = new Proxy(
+      { ...INPUT },
+      {
+        getOwnPropertyDescriptor() {
+          throw new Error("trap");
+        },
+      },
+    );
     const throwing = new Proxy(
       { ...INPUT },
       {
@@ -204,6 +216,7 @@ describe("setUpFirstInstall", () => {
       new Map(),
       Object.assign(Object.create({ inherited: 1 }) as object, INPUT),
       throwing,
+      throwingRead,
       { ...INPUT, systemAdmin: false },
     ]) {
       expect(await setUpFirstInstall(db, bad)).toMatchObject({
@@ -290,8 +303,6 @@ describe("npm run setup", () => {
       expect(again.code).toBe(1);
       expect(again.out).toContain("already set up");
       expect(again.asked).toEqual([]);
-      // It refused before migrating: nothing was even checked for migration.
-      expect(again.out).not.toMatch(/migrat/i);
     } finally {
       await testDb.drop();
     }
@@ -357,6 +368,74 @@ describe("npm run setup", () => {
       }
     } finally {
       await testDb.drop();
+    }
+  });
+
+  it("refuses a set-up database with a pending migration without applying it", async () => {
+    const { db, url } = await migrated();
+    ok(await setUpFirstInstall(db, INPUT));
+    // Pretend the newest migration is still to come.
+    const [last] = await db.rows<{ name: string }>(
+      sql`SELECT name FROM public.oculus_migrations ORDER BY name DESC LIMIT 1`,
+    );
+    await db.execute(sql`DELETE FROM public.oculus_migrations WHERE name = ${last?.name ?? ""}`);
+    const run = await runCli({ OCULUS_DATABASE_URL: url }, typed);
+    expect(run.code).toBe(1);
+    expect(run.out).toContain("already set up");
+    const [still] = await db.rows<{ n: number }>(
+      sql`SELECT count(*)::int AS n FROM public.oculus_migrations WHERE name = ${last?.name ?? ""}`,
+    );
+    expect(still?.n).toBe(0);
+  });
+
+  it("sets up a partly migrated Oculus database", async () => {
+    const testDb = await freshDatabase();
+    // Only the first three migrations, as if a run had stopped there.
+    const partial = mkdtempSync(join(tmpdir(), "oculus-setup-"));
+    try {
+      const all = join(import.meta.dirname, "..", "migrations");
+      for (const name of readdirSync(all).sort().slice(0, 3)) {
+        copyFileSync(join(all, name), join(partial, name));
+      }
+      await migrate({ connectionString: testDb.url, dir: partial });
+      const run = await runCli({ OCULUS_DATABASE_URL: testDb.url }, typed);
+      expect(run.code).toBe(0);
+    } finally {
+      rmSync(partial, { recursive: true, force: true });
+      await testDb.drop();
+    }
+  });
+
+  it("classifies databases that aren't Oculus's, and changes none of them", async () => {
+    const cases = [
+      [sql`CREATE SCHEMA app`, sql`CREATE TABLE app.things (id int)`],
+      [sql`CREATE VIEW public.v AS SELECT 1 AS one`],
+      [sql`CREATE SEQUENCE public.s`],
+      [sql`CREATE FUNCTION public.f() RETURNS int LANGUAGE sql AS 'SELECT 1'`],
+      [sql`CREATE TYPE public.records AS ENUM ('a')`],
+      // Oculus's bookkeeping, with someone else's users table that predates 0009.
+      [
+        sql`CREATE TABLE public.oculus_migrations (name text PRIMARY KEY)`,
+        sql`CREATE TABLE public.users (id int)`,
+      ],
+    ];
+    for (const statements of cases) {
+      const testDb = await freshDatabase();
+      const db = openDatabase(testDb.url, { max: 1 });
+      try {
+        for (const statement of statements) await db.execute(statement);
+        expect(await databaseBeforeSetup(db)).toBe("other");
+        const run = await runCli({ OCULUS_DATABASE_URL: testDb.url }, typed);
+        expect(run.code).toBe(1);
+        expect(run.asked).toEqual([]);
+        const [row] = await db.rows<{ organizations: boolean }>(
+          sql`SELECT to_regclass('public.organizations') IS NOT NULL AS organizations`,
+        );
+        expect(row?.organizations).toBe(false);
+      } finally {
+        await db.close();
+        await testDb.drop();
+      }
     }
   });
 

@@ -124,22 +124,57 @@ function own(input: object, key: string): unknown {
 const KEYS = ["email", "displayName", "password", "organizationName", "siteName"] as const;
 
 /**
- * What a database is before setup migrates it: `"empty"` (no tables at all,
- * or Oculus's tables with no users and no organizations), `"set_up"`
- * (Oculus's, with people or organizations) or `"other"` (tables, but not
- * Oculus's). Setup migrates only an `"empty"` one, so it never changes a
- * database it then refuses.
+ * What a database is before setup migrates it: `"empty"`, `"set_up"` (Oculus's,
+ * with people or organizations) or `"other"` (something that isn't an
+ * empty or partly migrated Oculus database). Setup migrates only an
+ * `"empty"` one, so it never changes a database it then refuses.
+ *
+ * Without Oculus's migration table, a database is empty only if no schema
+ * outside PostgreSQL's own holds a table, view, sequence or other relation,
+ * and `public` holds no functions or types of its own. With it, a database
+ * is not Oculus's if it has relations outside `public`, or if `users` or
+ * `organizations` exist before the migration that makes them was applied.
  */
 export async function databaseBeforeSetup(db: Database): Promise<"empty" | "set_up" | "other"> {
-  const [row] = await db.rows<{ tables: number; oculus: boolean; users: boolean; orgs: boolean }>(
-    sql`
-    SELECT (SELECT count(*)::int FROM pg_catalog.pg_tables WHERE schemaname = 'public') AS tables,
-           to_regclass('public.oculus_migrations') IS NOT NULL AS oculus,
-           to_regclass('public.users') IS NOT NULL AS users,
-           to_regclass('public.organizations') IS NOT NULL AS orgs`,
+  const [row] = await db.rows<{
+    elsewhere: number;
+    in_public: number;
+    routines: number;
+    types: number;
+    oculus: boolean;
+    users: boolean;
+    orgs: boolean;
+  }>(sql`
+    SELECT
+      (SELECT count(*)::int FROM pg_catalog.pg_class c
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname NOT IN ('public', 'pg_catalog', 'information_schema', 'pg_toast')
+          AND n.nspname NOT LIKE 'pg\_temp\_%' AND n.nspname NOT LIKE 'pg\_toast\_temp\_%'
+          AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')) AS elsewhere,
+      (SELECT count(*)::int FROM pg_catalog.pg_class c
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')) AS in_public,
+      (SELECT count(*)::int FROM pg_catalog.pg_proc p
+         JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'public') AS routines,
+      (SELECT count(*)::int FROM pg_catalog.pg_type t
+         JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+        WHERE n.nspname = 'public' AND t.typrelid = 0 AND t.typelem = 0) AS types,
+      to_regclass('public.oculus_migrations') IS NOT NULL AS oculus,
+      to_regclass('public.users') IS NOT NULL AS users,
+      to_regclass('public.organizations') IS NOT NULL AS orgs`);
+  if (row === undefined) return "other";
+  if (row.elsewhere > 0) return "other";
+  if (!row.oculus) {
+    return row.in_public === 0 && row.routines === 0 && row.types === 0 ? "empty" : "other";
+  }
+  const applied = new Set(
+    (await db.rows<{ name: string }>(sql`SELECT name FROM public.oculus_migrations`)).map(
+      (r) => r.name,
+    ),
   );
-  if (row === undefined || row.tables === 0) return "empty";
-  if (!row.oculus) return "other";
+  if (row.orgs && !applied.has("0002_catalog.sql")) return "other";
+  if (row.users && !applied.has("0009_users.sql")) return "other";
   if (row.users && (await db.rows(sql`SELECT 1 FROM public.users LIMIT 1`)).length > 0) {
     return "set_up";
   }
@@ -163,19 +198,28 @@ export async function setUpFirstInstall(
   db: Database,
   input: unknown,
 ): Promise<Validated<FirstInstallResult>> {
-  let plain: boolean;
+  // Each answer is read once, into a plain copy; any trap or getter that
+  // throws on the way is a malformed request, not an exception.
+  let answers: Record<(typeof KEYS)[number], unknown>;
   try {
-    plain =
-      isPlainObject(input) &&
-      Reflect.ownKeys(input).every((k) => (KEYS as readonly PropertyKey[]).includes(k));
+    if (
+      !isPlainObject(input) ||
+      !Reflect.ownKeys(input).every((k) => (KEYS as readonly PropertyKey[]).includes(k))
+    ) {
+      return refused("invalid_request", `Give ${KEYS.join(", ")} only.`);
+    }
+    answers = {
+      email: own(input, "email"),
+      displayName: own(input, "displayName"),
+      password: own(input, "password"),
+      organizationName: own(input, "organizationName"),
+      siteName: own(input, "siteName"),
+    };
   } catch {
-    plain = false; // a Proxy whose traps throw
-  }
-  if (!plain || typeof input !== "object" || input === null) {
     return refused("invalid_request", `Give ${KEYS.join(", ")} only.`);
   }
   const issues: Issue[] = [];
-  const email = normalizeEmail(own(input, "email"));
+  const email = normalizeEmail(answers.email);
   if (email === undefined) {
     issues.push({
       path: ["email"],
@@ -183,7 +227,7 @@ export async function setUpFirstInstall(
       message: "That isn't an email address Oculus accepts.",
     });
   }
-  const displayName = validateDisplayName(own(input, "displayName"));
+  const displayName = validateDisplayName(answers.displayName);
   if (displayName === undefined) {
     issues.push({
       path: ["displayName"],
@@ -191,7 +235,7 @@ export async function setUpFirstInstall(
       message: "A name is 1–200 characters, with no line breaks or spaces at either end.",
     });
   }
-  const password = checkNewPassword(own(input, "password"), {
+  const password = checkNewPassword(answers.password, {
     ...(email === undefined ? {} : { email }),
     ...(displayName === undefined ? {} : { displayName }),
   });
@@ -200,7 +244,7 @@ export async function setUpFirstInstall(
   }
   const organization = validateOrganization({
     id: newOrganizationId(),
-    name: own(input, "organizationName"),
+    name: answers.organizationName,
   });
   if (!organization.ok) {
     issues.push(
@@ -209,7 +253,7 @@ export async function setUpFirstInstall(
   }
   const site = organization.ok
     ? validateSite(
-        { id: newSiteId(), organizationId: organization.value.id, name: own(input, "siteName") },
+        { id: newSiteId(), organizationId: organization.value.id, name: answers.siteName },
         [organization.value],
       )
     : undefined;
