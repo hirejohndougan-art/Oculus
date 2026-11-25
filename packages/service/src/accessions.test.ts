@@ -426,11 +426,19 @@ describe("accessions through the service (T-018c)", () => {
     const held = new Promise<void>((resolve) => {
       release = resolve;
     });
-    // A publish check holding the holds lock shared until it commits.
+    let locked: () => void = () => undefined;
+    const holding = new Promise<void>((resolve) => {
+      locked = resolve;
+    });
+    // A publish check holding the holds lock shared until it commits; the
+    // save starts only once it holds it (under load, the save could
+    // otherwise take the lock first).
     const publishing = s.owner.transaction(async (q) => {
       await lockAccessionHolds(q, w.org, "shared");
+      locked();
       await held;
     });
+    await holding;
     let saved = false;
     const saving = service.createAccession(ctx(w, w.donorStaff), accessionInput(w)).then((r) => {
       saved = true;
