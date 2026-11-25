@@ -201,8 +201,6 @@ try {
     JSON.stringify({
       email,
       editorEmail,
-      rootEmail: "root@example.org",
-      organizationName: "Invented Historical Society",
       password: PASSWORD,
       siteName: "Invented Archive",
       recordTitle,
