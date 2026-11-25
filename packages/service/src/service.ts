@@ -104,6 +104,11 @@ import {
   readPlainData,
   templateMoveChanges,
   validateRecord,
+  findingAidFromUnits,
+  writeEad,
+  type EadExportField,
+  type EadExportUnit,
+  type EadVersion,
   type CatalogRecord,
   type Issue,
   type JsonValue,
@@ -162,6 +167,9 @@ import {
   readRecordPlace,
   readStoredRecord,
   readTemplate,
+  readIdentifierTypes,
+  findingAidUnitIds,
+  MAX_STAFF_FINDING_AID_UNITS,
   readVersion,
   readVersionSummaries,
   compareVersions,
@@ -428,6 +436,18 @@ export interface RecordAbilities {
 }
 
 /** A record as read (staff view: every field). */
+/** An EAD export (T-059b): the file and what was left out of it. */
+export interface FindingAidFile {
+  readonly xml: string;
+  /** A download name: the top unit's ID and the version, `….xml`. */
+  readonly fileName: string;
+  readonly version: EadVersion;
+  /** How many units the file holds. */
+  readonly units: number;
+  /** Values left out (field keys and labels only) and units out of the person's sight. */
+  readonly notices: readonly Issue[];
+}
+
 export interface ReadRecord {
   readonly record: CatalogRecord;
   readonly version: number;
@@ -505,6 +525,21 @@ export interface RecordService
     StorageOperations {
   /** The record as stored, for someone who may view it (`records.view`). */
   readRecord(context: ServiceContext, recordId: RecordId): Promise<ServiceResult<ReadRecord>>;
+  /**
+   * An EAD file (T-059b, D-107, D-120) of an archival unit and the units
+   * below it on its site, for someone who may view it (`records.view`).
+   * Units below that they may not view are left out with everything under
+   * them. Staff-only values go in, each marked `audience="internal"`, and
+   * the file's header says so; numbers of identifier types that aren't
+   * public too. `options.version`: `ead2002` (the default, TARO's) or `ead3`.
+   * Refused for a record that isn't an archival unit (`not_archival_unit`)
+   * and past `MAX_STAFF_FINDING_AID_UNITS` units (`too_many_units`).
+   */
+  exportFindingAid(
+    context: ServiceContext,
+    recordId: RecordId,
+    options?: { readonly version?: unknown },
+  ): Promise<ServiceResult<FindingAidFile>>;
   /**
    * The record's history, oldest first, without content (T-043, D-082):
    * `records.view` and `records.history` where the record is now (D-072:
@@ -2567,6 +2602,131 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           }),
         };
       });
+    },
+
+    async exportFindingAid(context, recordId, exportOptions) {
+      return run(
+        "exportFindingAid",
+        context,
+        async (tx, who): Promise<ServiceResult<FindingAidFile>> => {
+          if (!isRecordId(recordId)) {
+            return refusal(
+              ["recordId"],
+              "invalid_id",
+              "A record ID is a lowercase version 4 UUID.",
+            );
+          }
+          const asked: unknown = isPlainObject(exportOptions) ? exportOptions.version : undefined;
+          if (asked !== undefined && asked !== "ead2002" && asked !== "ead3") {
+            return refusal(
+              ["version"],
+              "invalid_ead_version",
+              'The version is "ead2002" or "ead3".',
+            );
+          }
+          const version: EadVersion = asked ?? "ead2002";
+          const allowed = await mayChange(tx, who, recordId, "share", []);
+          if (!allowed.ok) return allowed;
+          if (allowed.place.kind !== "archival_unit") {
+            return refusal(
+              ["recordId"],
+              "not_archival_unit",
+              "Only an archival unit (a fonds, series, collection, file or item) can be exported as EAD.",
+            );
+          }
+          const rows = await findingAidUnitIds(tx, who.organizationId, recordId);
+          if (rows.length > MAX_STAFF_FINDING_AID_UNITS) {
+            return refusal(
+              ["recordId"],
+              "too_many_units",
+              `A finding aid holds at most ${String(MAX_STAFF_FINDING_AID_UNITS)} units; export a unit lower down.`,
+            );
+          }
+          const types = await readIdentifierTypes(tx, who.organizationId);
+          const publicTypes = new Set(
+            types.ok ? types.value.filter((t) => t.public === true).map((t) => t.key) : [],
+          );
+          const templates = new Map<string, Awaited<ReturnType<typeof readTemplate>>>();
+          const units: EadExportUnit[] = [];
+          const notices: Issue[] = [];
+          const seen = new Set<string>();
+          for (const row of rows) {
+            // Below a unit left out, nothing is placed (findingAidFromUnits).
+            if (row.parentId !== undefined && !seen.has(row.parentId)) continue;
+            const stored = await readStoredRecord(tx, who.organizationId, row.id);
+            if (stored?.ok !== true || stored.value.record.kind !== "archival_unit") continue;
+            const record = stored.value.record;
+            if (row.id !== recordId) {
+              const target = await allowed.checker.target({
+                kind: record.kind,
+                id: record.id,
+                parentId: record.parentId ?? null,
+                represents: null,
+                siteId: record.siteId ?? null,
+              });
+              if (!allowed.checker.allows(["records.view"], target)) {
+                notices.push(
+                  issue(
+                    [],
+                    "unit_not_visible",
+                    "A unit you may not view was left out, with everything below it.",
+                  ),
+                );
+                continue;
+              }
+            }
+            const key = record.templateKey ?? "";
+            if (!templates.has(key))
+              templates.set(key, await readTemplate(tx, who.organizationId, key));
+            const template = templates.get(key);
+            const defs = new Map(
+              template?.ok === true ? template.value.template.fields.map((d) => [d.key, d]) : [],
+            );
+            const fields: EadExportField[] = [];
+            for (const [fieldKey, value] of Object.entries(record.fields)) {
+              const def = defs.get(fieldKey);
+              // A value its template no longer has is staff-only, as everywhere (effective.ts).
+              fields.push({
+                key: fieldKey,
+                label: def?.label ?? fieldKey,
+                kind: def?.kind ?? "text",
+                value,
+                staffOnly: def?.visibility !== "public",
+                ...(def?.options === undefined ? {} : { options: def.options }),
+              });
+            }
+            seen.add(record.id);
+            units.push({
+              id: record.id,
+              ...(row.id === recordId || record.parentId === undefined
+                ? {}
+                : { parentId: record.parentId }),
+              level: record.level,
+              title: record.title,
+              fields,
+            });
+          }
+          const made = findingAidFromUnits(recordId, units, {
+            audience: "staff",
+            publicIdentifierTypes: publicTypes,
+          });
+          if (!made.ok) return made;
+          const time = now();
+          if (!time.ok) return time;
+          const written = writeEad(made.value.findingAid, { version, generatedAt: time.value });
+          if (!written.ok) return written;
+          return {
+            ok: true,
+            value: Object.freeze({
+              xml: written.value.xml,
+              fileName: `${recordId}-${version}.xml`,
+              version,
+              units: units.length,
+              notices: [...notices, ...made.value.notices, ...written.value.warnings],
+            }),
+          };
+        },
+      );
     },
 
     async listVersions(context, recordId, listOptions) {

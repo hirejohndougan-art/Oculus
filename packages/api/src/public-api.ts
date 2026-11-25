@@ -36,16 +36,18 @@
  * `PUBLIC_POOL_WAIT_MS` for a connection (`publicPoolOptions`); either
  * running out is `503 busy` too.
  */
-import { isRecordId } from "@oculus/core";
+import { isRecordId, writeEad } from "@oculus/core";
 import {
   isDatabaseTimeout,
   MAX_PUBLIC_READ_TIME_LIMIT_MS,
+  readPublicFindingAid,
   readPublicRecord,
   readSharedPublicRecord,
   type Database,
   type SharedHome,
 } from "@oculus/db";
 import { Refusal } from "./errors.js";
+import { fileReply } from "./file-replies.js";
 import type { PublicSite } from "./public-sites.js";
 import { DEFAULT_RATE_LIMITS, SessionRateLimiter, type RateBucket } from "./rate-limit.js";
 import type { OculusRequest, OculusRoute } from "./routes.js";
@@ -183,7 +185,73 @@ export function publicApiRoutes(options: PublicApiOptions): OculusRoute[] {
     options.sites.find((s) => s.siteId === home.siteId && s.organizationId === home.organizationId)
       ?.origin;
 
+  // One public EAD export at a time per process (T-059b): each reads up to
+  // MAX_PUBLIC_FINDING_AID_UNITS records, so they never take every slot.
+  const eadSlots = new ReadSlots(1);
+
   return [
+    {
+      // A finding aid's "Download EAD" (T-059b, D-107, D-120): the archival
+      // unit and the published units below it, only what this site shows
+      // (readPublicFindingAid, through the public reader). `?version=ead3`
+      // for EAD3; EAD 2002 otherwise. Everything a visitor could tell apart
+      // answers 404 as an unknown record does; a download, never rendered.
+      method: "GET",
+      path: "/records/:id/ead",
+      handler: async (request) => {
+        const origin = originOf(request);
+        const site = origin === undefined ? undefined : byOrigin.get(origin);
+        if (site === undefined) throw NOT_FOUND();
+        if (!limiter.take(clientKey(request.ip), "public")) {
+          throw new Refusal(429, "rate_limited");
+        }
+        const id = request.params.id ?? "";
+        if (!isRecordId(id)) throw NOT_FOUND();
+        const asked = request.query.version;
+        if (asked !== undefined && asked !== "ead2002" && asked !== "ead3") throw NOT_FOUND();
+        const version = asked ?? "ead2002";
+        if (!eadSlots.take()) throw new Refusal(503, "busy");
+        if (!slots.take()) {
+          eadSlots.give();
+          throw new Refusal(503, "busy");
+        }
+        let read: Awaited<ReturnType<typeof readPublicFindingAid>>;
+        try {
+          read = await readPublicFindingAid(options.db, site.organizationId, site.siteId, id, {
+            baseUrl: `${site.origin}/records/`,
+            ...(options.timeLimitMs === undefined ? {} : { timeLimitMs: options.timeLimitMs }),
+          });
+        } catch (error) {
+          if (isDatabaseTimeout(error)) {
+            log({ event: "service_error", operation: "readPublicFindingAid", name: "timeout" });
+            throw new Refusal(503, "busy");
+          }
+          log({
+            event: "service_error",
+            operation: "readPublicFindingAid",
+            name: error instanceof Error ? error.constructor.name.slice(0, 40) : "unknown",
+          });
+          throw new Refusal(503, "unavailable");
+        } finally {
+          slots.give();
+          eadSlots.give();
+        }
+        if (!read.ok) throw NOT_FOUND();
+        const written = writeEad(read.value.findingAid, {
+          version,
+          generatedAt: new Date(options.clock?.() ?? Date.now()).toISOString(),
+        });
+        if (!written.ok) throw NOT_FOUND();
+        const bytes = new TextEncoder().encode(written.value.xml);
+        return fileReply({
+          body: bytes,
+          size: bytes.byteLength,
+          mediaType: "application/xml",
+          fileName: `${id}-${version}.xml`,
+          disposition: "attachment",
+        });
+      },
+    },
     {
       method: "GET",
       path: "/records/:id",

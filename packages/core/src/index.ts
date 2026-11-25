@@ -804,3 +804,12 @@ export type { EadNotice, EadLevelChange, EadReadReport, EadRead } from "./ead-re
 
 export { writeEad } from "./ead-write.js";
 export type { EadWriteOptions, EadWritten } from "./ead-write.js";
+
+export { MAX_EXPORT_UNITS, findingAidFromUnits } from "./ead-export.js";
+export type {
+  EadAudience,
+  EadExport,
+  EadExportField,
+  EadExportOptions,
+  EadExportUnit,
+} from "./ead-export.js";

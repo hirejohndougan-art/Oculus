@@ -1139,6 +1139,29 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
       }),
     },
     {
+      // An EAD file of an archival unit and the units below it (T-059b,
+      // D-120): `?version=ead2002` (default) or `ead3`. A download
+      // (fileReply: application/octet-stream, attachment, nosniff, the
+      // sandboxing CSP), never rendered as XML in the admin's origin.
+      method: "GET",
+      path: "/api/records/:id/ead",
+      handler: signedIn("read", false, async (request, reply, { context }) => {
+        const version = queryText(request, "version");
+        const result = await service.exportFindingAid(context, recordId(request), {
+          ...(version === undefined ? {} : { version }),
+        });
+        if (!result.ok) return refused(result, reply, log);
+        const bytes = new TextEncoder().encode(result.value.xml);
+        return fileReply({
+          body: bytes,
+          size: bytes.byteLength,
+          mediaType: "application/xml",
+          fileName: result.value.fileName,
+          disposition: "attachment",
+        });
+      }),
+    },
+    {
       method: "GET",
       path: "/api/records/:id/versions",
       handler: signedIn("read", false, async (request, reply, { context }) => {

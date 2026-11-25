@@ -560,3 +560,11 @@ export {
   readOrganizationTimeZone,
   writeOrganizationTimeZone,
 } from "./organization-time-zone.js";
+
+export {
+  MAX_PUBLIC_FINDING_AID_UNITS,
+  MAX_STAFF_FINDING_AID_UNITS,
+  findingAidUnitIds,
+  readPublicFindingAid,
+} from "./finding-aids.js";
+export type { FindingAidUnitRow, PublicFindingAidOptions } from "./finding-aids.js";

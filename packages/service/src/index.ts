@@ -18,6 +18,7 @@ export type {
   RestoreOptions,
   DeleteOptions,
   ReadRecord,
+  FindingAidFile,
   VersionSummary,
   VersionList,
   ReviewQueue,

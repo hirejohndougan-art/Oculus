@@ -28,6 +28,7 @@ import { ApiError, api, problemText } from "../api";
 import { Button, Note, TextLink } from "../components/ui";
 import { Choice, ConfirmPanel, StatePill, TextInput } from "./controls";
 import { FieldInput } from "./FieldInput";
+import { EadPanel } from "./EadPanel";
 import { FilesPanel } from "./FilesPanel";
 import { HistoryPanel } from "./HistoryPanel";
 import { SharingPanel } from "../shares/SharingPanel";
@@ -897,6 +898,8 @@ function Editor(props: EditorProps) {
             canUpload={can.edit}
           />
         ) : null}
+
+        {reply?.record.kind === "archival_unit" ? <EadPanel recordId={reply.record.id} /> : null}
 
         {reply !== undefined && can.history ? (
           <HistoryPanel
