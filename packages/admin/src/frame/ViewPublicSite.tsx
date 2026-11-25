@@ -6,7 +6,14 @@
  * goes with it: no query, no fragment, `rel="noopener noreferrer"` (no
  * `window.opener`, no Referer). A site with no public address shows the
  * button disabled with the reason, rather than hiding it.
+ *
+ * On the desktop (T-071) the launcher opens public sites itself
+ * (`desktopOpen`): a click asks it to open the site in the default browser
+ * (it opens its own address for that site, never one sent from here), and
+ * follows the ordinary link if it can't.
  */
+import type { MouseEvent } from "react";
+import { api } from "../api";
 import styles from "./Frame.module.css";
 
 /** The site's public home address (`<origin>/`), or undefined when the value isn't a bare http(s) origin. */
@@ -30,6 +37,8 @@ export function ViewPublicSite(props: {
   readonly publicOrigin: string | null | undefined;
   /** Sidebar (dark) or a settings row (light). */
   readonly place: "sidebar" | "settings";
+  /** The desktop launcher opens public sites in the default browser (T-071). */
+  readonly desktopOpen?: boolean;
 }) {
   const address = publicHomeAddress(props.publicOrigin);
   const className = props.place === "sidebar" ? styles.publicLink : styles.publicLinkLight;
@@ -54,9 +63,18 @@ export function ViewPublicSite(props: {
       </span>
     );
   }
+  function click(event: MouseEvent<HTMLAnchorElement>) {
+    if (props.desktopOpen !== true || address === undefined) return;
+    event.preventDefault();
+    const fallback = address;
+    api("/api/desktop/public-site", { body: { siteId: props.siteId } }).catch(() => {
+      window.open(fallback, "_blank", "noopener,noreferrer");
+    });
+  }
   return (
     <a
       className={className}
+      onClick={click}
       href={address}
       target="_blank"
       rel="noopener noreferrer"

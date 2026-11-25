@@ -74,6 +74,31 @@ describe("the frame", () => {
     expect(link.getAttribute("href")).not.toContain("f".repeat(43));
   });
 
+  it("on the desktop, asks the launcher to open the site in the default browser (T-071)", async () => {
+    const open = vi.fn();
+    vi.stubGlobal("open", open);
+    const sent = fakeServer({
+      "GET /api/me": [
+        200,
+        {
+          ...me([{ ...A1, publicOrigin: "http://localhost:4781" } as typeof A1]),
+          opensPublicSites: "desktop",
+        },
+      ],
+      "POST /api/desktop/public-site": [200, { opened: true }],
+    });
+    renderAt("/");
+    const nav = await screen.findByRole("navigation", { name: "Oculus" });
+    const link = await within(nav).findByRole("link", { name: /^View public site/ });
+    await userEvent.click(link);
+    await waitFor(() => {
+      expect(sent.some((s) => s.path === "/api/desktop/public-site")).toBe(true);
+    });
+    const request = sent.find((s) => s.path === "/api/desktop/public-site");
+    expect(request?.body).toEqual({ siteId: SITE_1 });
+    expect(open).not.toHaveBeenCalled();
+  });
+
   it("shows the button disabled, with the reason, when the site has no public address", async () => {
     fakeServer({ "GET /api/me": [200, me([A1])] });
     renderAt("/");

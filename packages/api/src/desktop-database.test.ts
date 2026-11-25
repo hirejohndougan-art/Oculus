@@ -10,11 +10,12 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { checkWriterConnection, openDatabase, sql } from "@oculus/db";
+import { checkPublicReaderConnection, checkWriterConnection, openDatabase, sql } from "@oculus/db";
 import { runDesktop } from "./desktop-cli.js";
 import { runDesktopDatabase } from "./desktop-database-cli.js";
 import {
@@ -137,7 +138,27 @@ describe("npm run desktop:database, then npm run desktop", () => {
     database: `t057_${tag}`,
     owner: `t057_${tag}_owner`,
     writer: `t057_${tag}_app`,
+    reader: `t057_${tag}_public`,
   });
+
+  /** A GET to 127.0.0.1:<port> as a browser at http://localhost:<port> sends it. */
+  function getAs(port: string, path: string): Promise<{ status: number; body: string }> {
+    return new Promise((resolve, reject) => {
+      const request = httpRequest(
+        { host: "127.0.0.1", port: Number(port), path, headers: { host: `localhost:${port}` } },
+        (response) => {
+          let body = "";
+          response.setEncoding("utf8");
+          response.on("data", (chunk: string) => (body += chunk));
+          response.on("end", () => {
+            resolve({ status: response.statusCode ?? 0, body });
+          });
+        },
+      );
+      request.on("error", reject);
+      request.end();
+    });
+  }
 
   function answers(list: (string | undefined)[]) {
     const asked: string[] = [];
@@ -183,9 +204,10 @@ describe("npm run desktop:database, then npm run desktop", () => {
     >;
     expect(settings.databaseUrl).toContain(`${n.writer}@`);
     expect(settings.ownerDatabaseUrl).toContain(`${n.owner}@`);
+    expect(settings.publicDatabaseUrl).toContain(`${n.reader}@`);
     expect(JSON.stringify(settings)).not.toMatch(/:[^/@]+@/); // no passwords
     const pgpass = readFileSync(join(folder, "pgpass"), "utf8");
-    expect(pgpass.split("\n").filter((l) => l.includes(n.database))).toHaveLength(2);
+    expect(pgpass.split("\n").filter((l) => l.includes(n.database))).toHaveLength(3);
     expect(pgpass).not.toContain(ADMIN_PASSWORD);
     const printed = lines.join("\n");
     expect(printed).not.toContain(ADMIN_PASSWORD);
@@ -209,6 +231,16 @@ describe("npm run desktop:database, then npm run desktop", () => {
       expect(count?.n).toBe("1");
     } finally {
       await writer.close();
+    }
+    // The public reader (T-071, D-080): can read no table, passes the public check.
+    const readerUrl = new URL(settings.publicDatabaseUrl ?? "");
+    readerUrl.password = passwordFor(n.reader);
+    const reader = openDatabase(readerUrl.href, { max: 1 });
+    try {
+      expect(await checkPublicReaderConnection(reader)).toEqual([]);
+      await expect(reader.rows(sql`SELECT 1 FROM public.users LIMIT 1`)).rejects.toThrow();
+    } finally {
+      await reader.close();
     }
 
     // As after an update whose migration adds a table: the writer lacks a
@@ -265,6 +297,20 @@ describe("npm run desktop:database, then npm run desktop", () => {
     });
     expect(reply.status).toBe(200);
     expect(((await reply.json()) as { next?: string }).next).toBe("set_up");
+    // The site's public side (T-071): its own port on 127.0.0.1, as localhost.
+    const line = out.find((l) => l.startsWith('Public site "Invented Archive": ')) ?? "";
+    const publicAddress = line.slice('Public site "Invented Archive": '.length);
+    expect(publicAddress).toMatch(/^http:\/\/localhost:\d+\/$/);
+    const port = new URL(publicAddress).port;
+    const home = await getAs(port, "/");
+    expect(home.status).toBe(200);
+    expect(home.body).toContain("<h1>Invented Archive</h1>");
+    // The staff API isn't there (D-090), and the port is kept for next time.
+    expect((await getAs(port, "/api/me")).status).toBe(404);
+    const kept = JSON.parse(readFileSync(join(folder, "desktop.json"), "utf8")) as {
+      publicPorts?: Record<string, number>;
+    };
+    expect(Object.values(kept.publicPorts ?? {})).toEqual([Number(port)]);
     stop();
     expect(await run).toBe(0);
     // The grant was put back before serving.
@@ -336,7 +382,12 @@ describe("npm run desktop:database, then npm run desktop", () => {
 
   it("removes what it made, pgpass lines included, when making the database fails", async () => {
     // An upper-case writer name is refused by grantWriterRole after both roles and the database exist.
-    const n = { database: "t057_undo", owner: "t057_undo_owner", writer: "T057_Undo_App" };
+    const n = {
+      database: "t057_undo",
+      owner: "t057_undo_owner",
+      writer: "T057_Undo_App",
+      reader: "t057_undo_public",
+    };
     writeFileSync(join(folder, "pgpass"), "keep:me:please:x:y\n", { mode: 0o600 });
     const lines: string[] = [];
     const code = await runDesktopDatabase({
@@ -356,11 +407,82 @@ describe("npm run desktop:database, then npm run desktop", () => {
     try {
       const left = await admin.rows(sql`
         SELECT 1 FROM pg_database WHERE datname = ${n.database}
-        UNION ALL SELECT 1 FROM pg_roles WHERE rolname IN (${n.owner}, ${n.writer})`);
+        UNION ALL SELECT 1 FROM pg_roles WHERE rolname IN (${n.owner}, ${n.writer}, ${n.reader})`);
       expect(left).toEqual([]);
     } finally {
       await admin.close();
     }
+  });
+
+  it("adds the public reader to a database an earlier version made (T-071)", async () => {
+    const n = names("older");
+    const made = await runDesktopDatabase({
+      env: env(),
+      ask: answers([ADMIN_PASSWORD, ACCOUNT_PASSWORD, ACCOUNT_PASSWORD]).ask,
+      out: () => undefined,
+      err: () => undefined,
+      names: n,
+    });
+    expect(made).toBe(0);
+    // As an earlier version left it: no reader role, no publicDatabaseUrl.
+    const file = join(folder, "desktop.json");
+    const settings = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    delete settings.publicDatabaseUrl;
+    writeFileSync(file, JSON.stringify(settings));
+    const pgpassFile = join(folder, "pgpass");
+    const kept = readFileSync(pgpassFile, "utf8")
+      .split("\n")
+      .filter((l) => !l.includes(":t057_older_public:"))
+      .join("\n");
+    writeFileSync(pgpassFile, kept, { mode: 0o600 });
+    process.env.PGPASSFILE = join(folder, "pgpass");
+    const owner = openDatabase(String(settings.ownerDatabaseUrl), { max: 1 });
+    try {
+      await owner.execute(sql`REVOKE USAGE ON SCHEMA public FROM t057_older_public`);
+    } finally {
+      await owner.close();
+    }
+    const adminUrl = new URL(server.url);
+    adminUrl.password = encodeURIComponent(ADMIN_PASSWORD);
+    const admin = openDatabase(adminUrl.href, { max: 1 });
+    try {
+      await admin.execute(sql`DROP ROLE t057_older_public`);
+    } finally {
+      await admin.close();
+    }
+
+    const lines: string[] = [];
+    const again = answers([ADMIN_PASSWORD]);
+    const code = await runDesktopDatabase({
+      env: env(),
+      ask: again.ask,
+      out: (l) => lines.push(l),
+      err: (l) => lines.push(`ERR ${l}`),
+      names: n,
+    });
+    expect(lines.join("\n")).not.toContain("ERR");
+    expect(code).toBe(0);
+    expect(again.asked).toHaveLength(1);
+    const after = JSON.parse(readFileSync(file, "utf8")) as Record<string, string>;
+    expect(after.publicDatabaseUrl).toContain(`${n.reader}@`);
+    const reader = openDatabase(after.publicDatabaseUrl ?? "", { max: 1 });
+    try {
+      expect(await checkPublicReaderConnection(reader)).toEqual([]);
+    } finally {
+      await reader.close();
+    }
+    // Once there, a further run has nothing to do.
+    const none = answers([]);
+    expect(
+      await runDesktopDatabase({
+        env: env(),
+        ask: none.ask,
+        out: () => undefined,
+        err: () => undefined,
+        names: n,
+      }),
+    ).toBe(0);
+    expect(none.asked).toEqual([]);
   });
 
   it("changes nothing when the postgres password is wrong", async () => {

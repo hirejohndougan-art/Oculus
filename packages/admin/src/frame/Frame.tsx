@@ -174,6 +174,7 @@ export function Frame() {
             siteName={here.siteName}
             publicOrigin={here.publicOrigin}
             place="sidebar"
+            desktopOpen={person.opensPublicSites === "desktop"}
           />
         )}
         {here === undefined ? null : (

@@ -91,6 +91,11 @@ export interface SignInApiOptions {
    */
   readonly publicOrigins?: ReadonlyMap<string, string>;
   /**
+   * The desktop launcher opens public sites in the default browser (T-071):
+   * `GET /api/me` then says `opensPublicSites: "desktop"`.
+   */
+  readonly desktopOpensPublicSites?: boolean;
+  /**
    * Sends a password reset link (T-040 makes the email; D-078's rules:
    * honour the signal, never log or keep the token). Required: the startup
    * (admin-server.ts) refuses to start in production without one.
@@ -620,6 +625,9 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
             named?.organizationName ?? (organization?.ok === true ? organization.value.name : ""),
           // Each site's public address, or null (T-070, D-109): only the
           // sites listMySites gives this person, only origins checked at startup.
+          ...(options.desktopOpensPublicSites === true
+            ? { opensPublicSites: "desktop" as const }
+            : {}),
           sites: sites.value.map((site) => ({
             ...site,
             publicOrigin:

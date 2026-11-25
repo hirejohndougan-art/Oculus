@@ -125,6 +125,11 @@ export interface AdminServerOptions {
   readonly logger?: ServerOptions["logger"];
   /** Routes of the program that starts the server (the desktop launcher's instance check, D-088). */
   readonly extraRoutes?: readonly OculusRoute[];
+  /**
+   * The desktop launcher opens public sites itself (T-071, D-109), through
+   * its own `extraRoutes`; the admin is told so in `GET /api/me`.
+   */
+  readonly desktopOpensPublicSites?: boolean;
   /** Passed on to the sign-in routes (tests). */
   readonly signIn?: Pick<SignInApiOptions, "rateLimits" | "clock" | "resetOptions">;
   /**
@@ -286,6 +291,7 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
       warnSharedAddress: production,
       // The "View public site" button (T-070, D-109): checked origins only.
       publicOrigins: publicOriginsBySite(publicSites),
+      ...(options.desktopOpensPublicSites === true ? { desktopOpensPublicSites: true } : {}),
       ...options.signIn,
     }),
     ...(publicDb === undefined || publicSites.length === 0

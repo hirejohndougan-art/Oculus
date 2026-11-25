@@ -25,12 +25,25 @@ That makes an `Oculus` folder wherever the Command Prompt was (usually your user
 Double-click `scripts\start-oculus.cmd` in the Oculus folder. To make a desktop icon, right-click it and choose **Show more options › Send to › Desktop (create shortcut)**.
 
 - The first time, and after each update, it installs and builds Oculus first (a few minutes).
-- **The very first time** it then sets up Oculus's database (T-057). It asks for the `postgres` password you chose when installing PostgreSQL (used once, never saved), then your organization's name, the first site's name, and your name, email and the password you'll sign in with. It makes two accounts in PostgreSQL just for Oculus, with long random passwords kept in `%APPDATA%\postgresql\pgpass.conf`, and writes `%APPDATA%\Oculus\desktop.json`. If making the database goes wrong, it removes what it made, so you can simply try again. If a setup answer goes wrong (say the two passwords don't match), the database is kept and the next double-click asks the setup questions again.
+- **The very first time** it then sets up Oculus's database (T-057). It asks for the `postgres` password you chose when installing PostgreSQL (used once, never saved), then your organization's name, the first site's name, and your name, email and the password you'll sign in with. It makes three accounts in PostgreSQL just for Oculus (one of them can only read what the public may see, for the public sites), with long random passwords kept in `%APPDATA%\postgresql\pgpass.conf`, and writes `%APPDATA%\Oculus\desktop.json`. If making the database goes wrong, it removes what it made, so you can simply try again. If a setup answer goes wrong (say the two passwords don't match), the database is kept and the next double-click asks the setup questions again.
 - Oculus opens in its own window at the sign-in screen. At your first sign-in you set up two-step sign-in with an authenticator app on your phone.
 - **Closing the Oculus window stops Oculus.** The black window behind it is Oculus running; leave it open while you work.
 - Starting it again while it's open just opens another window.
 - If closing the window ever leaves the black window running, click it and press Ctrl+C to stop Oculus.
 - On a Mac, quit the Oculus window with Cmd+Q; closing it isn't enough.
+
+## Your public sites
+
+Oculus also shows each site's public side, the pages visitors will see, on this computer only (T-071).
+
+- When Oculus starts, the black window lists each one, for example `Public site "Digital archive": http://localhost:4781/`.
+- In Oculus, the **View public site** button under the site name opens it in your usual web browser.
+- Each site keeps its own address (`localhost` and a number) from one start to the next, so you can bookmark it.
+- It shows exactly what a visitor would see: nothing that isn't published, and you aren't signed in there. Until the real public pages are built, it's a page with the site's name that says "This public site is being built".
+- Nobody else can open it: like the rest of Oculus, it answers only this computer.
+- A site you add while Oculus is running gets its public address the next time you start Oculus.
+
+**If you set up Oculus before the public sites came** (the black window says "The public sites aren't set up on this computer yet"): close Oculus, then in a Command Prompt in the Oculus folder run `node packages\api\dist\desktop-database-cli.js` (`npm run desktop:database` on a Mac or Linux). It asks for the `postgres` password once more and adds the read-only account. Then start Oculus as usual.
 
 ## Keep these safe
 
@@ -52,7 +65,7 @@ In a Command Prompt in the Oculus folder, run `node packages\api\dist\desktop-pa
 
 - **No email unless you set it up.** Oculus can send email through any mail account's SMTP settings (the `OCULUS_SMTP_…` settings in the README, D-085). Without them, "Forgot your password?" and invitations send nothing (see "If you forget your password" above).
 - **One computer.** Other people can't reach it. That needs the server version (T-051).
-- **No public website yet.** That's a later phase.
+- **Not the finished public website yet.** Each site's public address works on this computer (above), but the real public pages are a later phase.
 
 ## Settings
 
@@ -61,6 +74,8 @@ Everything is optional. In `desktop.json`:
 - `"databaseUrl"`: the database account Oculus works as (or set `OCULUS_DATABASE_URL`, which wins and is then used for everything).
 - `"ownerDatabaseUrl"`: the account that owns the database, used only to update it and check it at start (or `OCULUS_DATABASE_OWNER_URL`).
 - `"backupBeforeUpdate"`: `false` to skip the backup before an update changes the database (not recommended).
+- `"publicDatabaseUrl"`: the read-only account the public sites use (or `OCULUS_PUBLIC_DATABASE_URL`).
 - `"port"`: the port Oculus uses on this computer (default 4780; another free one if that's taken).
+- `"publicPorts"`: each site's public port, by site ID. Oculus fills this in itself (from 4781 up) and keeps it; change a number only if another program needs that port.
 
 Other settings: `OCULUS_DESKTOP_HOME` moves the settings folder (only to a folder no one else on the computer can open, since the secret key lives there), `OCULUS_DESKTOP_BROWSER` names the browser to open, and `OCULUS_SECRET_KEY` replaces the key file.
