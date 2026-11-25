@@ -178,12 +178,13 @@ describe("identifierTypeChanges", () => {
       ...(parentId === undefined ? {} : { parentId }),
     });
     const records = [
-      // A holds a misfit in a field; B is below A; C below B; D is below A
-      // but unpublished; E holds a misfit only in its identifiers; F fits.
+      // A holds a misfit in a field; B and C below it only inherit it (they
+      // stay public without it); D holds one but is unpublished; E holds one
+      // only in its identifiers; F fits.
       unit(A, { number: { type: "accession", value: "DHS-0001" } }),
       unit(B, {}, A),
       unit(C, {}, B),
-      unit(D, {}, A),
+      unit(D, { number: { type: "accession", value: "DHS-0004" } }, A),
       unit(E, {}),
       unit(F, { number: { type: "accession", value: "DHS-00006" } }),
     ];
@@ -194,10 +195,10 @@ describe("identifierTypeChanges", () => {
     const r = ok(identifierTypeChanges(pub, { ...pub, pattern: "DHS-#####" }, existing));
     const change = r.changes[0];
     expect(change?.code).toBe("format_changed");
-    expect(change?.recordIds).toEqual([E, A]);
-    expect(change?.publishedRecordIds).toEqual([A, C]);
-    expect(change?.publishedRecordCount).toBe(2);
-    expect(change?.message).toContain("2 published records would show as not available");
+    expect(change?.recordIds).toEqual([E, A, D]);
+    expect(change?.publishedRecordIds).toEqual([A]);
+    expect(change?.publishedRecordCount).toBe(1);
+    expect(change?.message).toContain("1 published record would show as not available");
     expect(change?.message).not.toContain("DHS-0001");
     expect(Object.isFrozen(change?.publishedRecordIds)).toBe(true);
 

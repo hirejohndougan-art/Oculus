@@ -653,6 +653,82 @@ describe("a number that no longer fits a changed format (S-026, D-091)", () => {
     expect(await stateOf(org, id)).toBe("published");
   }, 60_000);
 
+  it("a record that only inherits a misfit number stays public, without it", async () => {
+    await ready();
+    const org = await organization();
+    ok(
+      await insertTemplateVersion(s.owner, {
+        key: "pub-unit-num",
+        organizationId: org,
+        label: "pub-unit-num",
+        appliesTo: ["archival_unit"],
+        fields: [field("rights", "rights"), field("number", "identifier", { inherited: true })],
+      }),
+    );
+    const fonds = ok(
+      await service.createRecord(
+        ctx(org),
+        {
+          kind: "archival_unit",
+          level: "fonds",
+          title: "An invented fonds",
+          templateKey: "pub-unit-num",
+          fields: { rights: { uri: INC }, number: shown("INV-3") },
+        },
+        { identifiers: numbers("INV-3") },
+      ),
+    ).record;
+    const series = (
+      await create(org, {
+        kind: "archival_unit",
+        level: "series",
+        parentId: fonds.id,
+        title: "An invented series",
+        templateKey: "pub-unit-num",
+        fields: { rights: { uri: INC } },
+      })
+    ).record;
+    ok(await service.publish(ctx(org), fonds.id, { expectedVersion: 1 }));
+    ok(await service.publish(ctx(org), series.id, { expectedVersion: 1 }));
+    const read = (id: RecordId) =>
+      readPublicRecord(s.reader, org, siteFor(org), id, {
+        baseUrl: BASE,
+        mappings: [
+          {
+            organizationId: org,
+            template: "pub-unit-num",
+            entries: [
+              { field: "rights", term: "rights" },
+              { field: "number", term: "identifier" },
+            ],
+          },
+        ],
+      });
+    const before = await read(series.id);
+    expect(before.ok && JSON.stringify(before.value.dublinCore)).toContain("INV-3");
+    ok(
+      await s.owner.transaction((q) =>
+        updateIdentifierType(q, {
+          organizationId: org,
+          key: "object_number",
+          label: "Object number",
+          uniqueness: "all_time",
+          public: true,
+          pattern: "DPL#{1,9}",
+        }),
+      ),
+    );
+    // The fonds, which shows it, is held back; the series leaves it out.
+    expect((await read(fonds.id)).ok).toBe(false);
+    expect(
+      (await s.owner.transaction((q) => publishCheckIssues(q, org, fonds.id))).map((i) => i.code),
+    ).toEqual(["format_mismatch"]);
+    const after = await read(series.id);
+    expect(after.ok).toBe(true);
+    expect(after.ok && JSON.stringify(after.value.dublinCore)).not.toContain("INV-3");
+    expect(await s.owner.transaction((q) => publishCheckIssues(q, org, series.id))).toEqual([]);
+  }, 60_000);
+
   it("a stranded number in no public field doesn't hold the record back", async () => {
     await ready();
     const org = await organization();

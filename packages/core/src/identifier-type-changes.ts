@@ -37,8 +37,8 @@
  *   is given (S-026, D-091), `publishedRecordIds` are the published records
  *   public sites would show as not available until the values are fixed:
  *   those holding a misfit in a public field (any field, without
- *   `templates`), and published records below them or representing them,
- *   which may inherit it. The message gives their count.
+ *   `templates`). Records that only inherit one stay public without it. The
+ *   message gives their count.
  * - `uniqueness_tightened`: `none` → `current` or `all_time`, or `current` →
  *   `all_time`; `recordIds` are the records whose values (compared with
  *   `identifierKey`, former ones too under `all_time`) clash with another
@@ -666,7 +666,7 @@ function readPublished(input: object): Validated<ReadonlySet<RecordId> | undefin
   if (list.length > MAX_RECORD_SET) {
     return fail(
       ["existing", "published"],
-      "too_many",
+      "too_many_records",
       `At most ${String(MAX_RECORD_SET)} can be checked at once.`,
     );
   }
@@ -884,9 +884,10 @@ function misfits(use: Use, key: string, source: string): Held {
  * The published records a new format takes off public sites (S-026, D-091):
  * those holding a value of the type the format refuses in a field public in
  * their template (any field, without templates, as `inPublicFields` reads
- * them), and the published records below them or representing them (or
- * anything below those), which may inherit the value. A record's own
- * identifiers outside its fields are never shown, so they don't count.
+ * them). Records that only inherit such a value stay on public sites without
+ * it (`effectiveRecord` leaves out an inherited value its checkers refuse,
+ * D-013), and a record's own identifiers outside its fields are never shown,
+ * so neither counts.
  */
 function publishedMisfits(use: Use, key: string, source: string): Held {
   const out = new Held();
@@ -894,9 +895,8 @@ function publishedMisfits(use: Use, key: string, source: string): Held {
   const parsed = parseIdentifierPattern(source);
   if (published === undefined || !parsed.ok) return out;
   const pattern = parsed.value;
-  const reached = new Set<RecordId>();
-  const queue: RecordId[] = [];
   for (const record of use.records) {
+    if (!published.has(record.id)) continue;
     const publicHere = publicFieldKeys(use, record);
     if (publicHere === null) continue;
     for (const item of fieldIdentifiers(record)) {
@@ -905,32 +905,11 @@ function publishedMisfits(use: Use, key: string, source: string): Held {
         (publicHere === undefined || publicHere.has(item.field)) &&
         !matchesIdentifierPattern(pattern, item.value)
       ) {
-        reached.add(record.id);
-        queue.push(record.id);
+        out.add(record.id);
         break;
       }
     }
   }
-  // Records below (parentId) or representing (represents) each record.
-  const below = new Map<RecordId, RecordId[]>();
-  for (const record of use.records) {
-    for (const up of [own(record, "parentId"), own(record, "represents")]) {
-      if (!isRecordId(up)) continue;
-      const list = below.get(up);
-      if (list === undefined) below.set(up, [record.id]);
-      else list.push(record.id);
-    }
-  }
-  // The queue grows while it is walked; for-of reads its length each step.
-  for (const id of queue) {
-    for (const next of below.get(id) ?? []) {
-      if (reached.has(next)) continue;
-      reached.add(next);
-      queue.push(next);
-    }
-  }
-  for (const record of use.records)
-    if (reached.has(record.id) && published.has(record.id)) out.add(record.id);
   return out;
 }
 
