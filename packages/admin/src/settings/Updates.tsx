@@ -62,11 +62,15 @@ export interface UpdateStatus {
   readonly variables?: readonly string[];
 }
 
-/** The update status; polled every second while a step runs. */
+/**
+ * The update status; polled every second while a step runs. Read as
+ * background (T-062, D-098): the polling isn't the person doing anything,
+ * so it never holds off the idle sign-out.
+ */
 export function useUpdateStatus() {
   return useQuery({
     queryKey: UPDATE_KEY,
-    queryFn: () => api<UpdateStatus>("/api/system/update"),
+    queryFn: () => api<UpdateStatus>("/api/system/update", { background: true }),
     refetchInterval: (query) => (query.state.data?.job?.state === "running" ? 1000 : false),
   });
 }
