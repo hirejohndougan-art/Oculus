@@ -225,10 +225,7 @@ describe("the API on the admin's host only", () => {
             "x-forwarded-proto": "https",
           },
         });
-        expect([url, page.headers["strict-transport-security"]]).toEqual([
-          url,
-          "max-age=31536000",
-        ]);
+        expect([url, page.headers["strict-transport-security"]]).toEqual([url, "max-age=31536000"]);
       }
       // Without a trusted proxy the request is plain http: no HSTS.
       const direct = await on("admin.example.org", "GET", "/api/thing");
