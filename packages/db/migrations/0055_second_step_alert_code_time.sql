@@ -1,6 +1,6 @@
 -- When the wrong two-step codes an alert tells were typed (S-054c, D-077
--- amended). Numbered 0053, above the numbers other open branches reserved
--- (0050 to 0052).
+-- amended). Numbered 0055, above the numbers other branches reserved
+-- (0050 to 0054).
 --
 -- An alert row's created_at is when it was written, which can be well after
 -- the codes it tells: the cleanup command tells unexplained codes an hour or
