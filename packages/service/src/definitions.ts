@@ -65,6 +65,8 @@ import {
   templateChanges,
   validateIdentifierType,
   validateNewIdentifierType,
+  RIGHTS_FIELD_KEY,
+  RIGHTS_REQUIRED_KINDS,
   validateDublinCoreMapping,
   validateTemplate,
   type Access,
@@ -84,6 +86,7 @@ import {
   lockIdentifierType,
   publishedAmong,
   publishedHoldingType,
+  publishedUsingTemplate,
   readIdentifierTypes,
   readRecordPlace,
   readRecordsUsingTemplate,
@@ -699,6 +702,25 @@ export function definitionOperations(run: Runner): DefinitionOperations {
           template.value.template,
         );
         if (!valid.ok) return valid;
+        // Public output refuses a mapping that leaves out the rights for the
+        // kinds published only with them (core's `rights_not_mapped`), so
+        // saving one would take every such published record off the public
+        // sites at once: refused here with the same rule.
+        const needsRights = template.value.template.appliesTo.some((k) =>
+          (RIGHTS_REQUIRED_KINDS as readonly string[]).includes(k),
+        );
+        if (
+          needsRights &&
+          !valid.value.entries.some(
+            (e) => e.field === RIGHTS_FIELD_KEY && (e.term === "rights" || e.term === "license"),
+          )
+        ) {
+          return refusal(
+            ["entries"],
+            "rights_not_mapped",
+            `The mapping must map the ${RIGHTS_FIELD_KEY} field to rights or license: this template's records can't be published without their rights.`,
+          );
+        }
         const stored = await readStoredMapping(tx, org, key, { lock: true });
         const storedVersion = stored?.version ?? 0;
         if (storedVersion !== expected) {
@@ -715,15 +737,8 @@ export function definitionOperations(run: Runner): DefinitionOperations {
         // template, at once. Any change counts; an identical save doesn't.
         let affected: readonly RecordId[] | undefined = [];
         if (canonicalJson(stored?.mapping ?? null) !== canonicalJson(valid.value)) {
-          const records = await readRecordsUsingTemplate(tx, org, key, MAX_TEMPLATE_RECORDS);
-          affected =
-            records === undefined
-              ? undefined
-              : await publishedAmong(
-                  tx,
-                  org,
-                  records.map((r) => r.id).filter((id): id is RecordId => typeof id === "string"),
-                );
+          // IDs only, under the lock (record saves and publishing wait).
+          affected = await publishedUsingTemplate(tx, org, key);
         }
         const gate = await publishedGate(tx, who, checker, affected, confirmPublished.value);
         if (gate) return gate;

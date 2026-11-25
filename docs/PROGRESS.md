@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 00:40 CT — manual (Chat C) — T-050b Stored Dublin Core mappings
+- Result: done (the old T-050b split into T-050b, T-050d and T-050e)
+- What changed: migration 0025 (`dublin_core_mappings`, `public_dublin_core_mapping`); `packages/db/src/dublin-core-mappings.ts`; `readPublicRecord` uses the stored mapping when none is passed; service `readDublinCoreMapping`/`saveDublinCoreMapping`; `GET`/`PUT /api/templates/:key/dublin-core`.
+- Decisions: D-096
+- Review: one independent round, nothing blocking; fixed a mapping without rights taking records offline, the full record read under the lock, the version check passable by direct SQL, and two stale comments.
+- Gate: see the merge commit · npm audit clean
+- Next: T-050d (public record reads)
+
 ## 2026-11-24 22:20 CT — manual (Chat C) — T-050a Hosts for the admin and the public sites
 - Result: done (T-050 split into T-050a to T-050c)
 - What changed: server rule 12, `/api` on the admin's host only; `OCULUS_ADMIN_ORIGIN` required in production; `OCULUS_PUBLIC_SITES` and the public reader pool (`OCULUS_PUBLIC_DATABASE_URL`, `publicDb`) checked at startup. New `packages/api/src/public-sites.ts`.

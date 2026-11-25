@@ -821,10 +821,11 @@ function publicSource(org: OrganizationId, row: PublicSnapshotRow): SnapshotSour
  * records public on the same site; anything else goes out as nothing
  * (D-045, D-048).
  *
- * Everything is read through one call of the database function
- * `public_record_snapshot` (SECURITY DEFINER, migration 0017) in a
+ * Everything is read through the database functions
+ * `public_record_snapshot` (SECURITY DEFINER, migration 0017) and, when no
+ * `mappings` are given, `public_dublin_core_mapping` (0025, D-096), in one
  * Repeatable Read, read-only transaction, so the state, the records, the
- * templates and the identifiers all come from one moment, and the
+ * templates, the identifiers and the mapping all come from one moment, and the
  * connection needs no table privilege at all: use a role made by
  * `grantPublicReaderRole` and checked by `checkPublicReaderConnection`
  * (roles.ts). It writes nothing.

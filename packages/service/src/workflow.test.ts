@@ -1835,6 +1835,9 @@ describe("stored Dublin Core mappings (T-050b, D-096)", () => {
     const save = (m: unknown, expectedVersion: number, key = "pub-object") =>
       service.saveDublinCoreMapping(rootCtx(org), key, m, { expectedVersion });
     expect((await save(withSecret, 0)).ok).toBe(false);
+    // Without the rights, published objects would drop off the public sites.
+    const noRights = { ...mapping(org), entries: mapping(org).entries.slice(1) };
+    expect(codes(await save(noRights, 0))).toEqual(["rights_not_mapped"]);
     expect(codes(await save(mapping(other), 0))).toEqual(["wrong_organization"]);
     expect(codes(await save({ ...mapping(org), template: "pub-unit" }, 0))).toEqual(["wrong_key"]);
     expect(
@@ -1844,6 +1847,13 @@ describe("stored Dublin Core mappings (T-050b, D-096)", () => {
     ok(await save(mapping(org), 0));
     expect(codes(await save(mapping(org), 0))).toEqual(["version_conflict"]);
     expect(codes(await save(mapping(org), 5))).toEqual(["version_conflict"]);
+    // Even by direct SQL, a change is the next version.
+    expect(
+      await refusal(
+        s.writer.execute(sql`UPDATE public.dublin_core_mappings SET mapping = mapping
+          WHERE organization_id = ${org}::uuid`),
+      ),
+    ).toEqual({ code: "23000", constraint: "dublin_core_mappings_next_version" });
     // Another organization's template of the same key is untouched.
     expect(ok(await service.readDublinCoreMapping(ctx(other), "pub-object")).version).toBe(0);
   });

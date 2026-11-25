@@ -34,6 +34,25 @@ CREATE TRIGGER zzzz_dublin_core_mappings_keep_identity BEFORE UPDATE ON public.d
 ALTER TABLE public.dublin_core_mappings
   ENABLE ALWAYS TRIGGER zzzz_dublin_core_mappings_keep_identity;
 
+-- Every change is the next version, so an edit's version check can't miss
+-- one (even by direct SQL as the writer).
+CREATE FUNCTION public.dublin_core_mappings_next_version() RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  IF NEW.version IS DISTINCT FROM OLD.version + 1 THEN
+    RAISE EXCEPTION 'A mapping change is the next version.'
+      USING ERRCODE = 'integrity_constraint_violation',
+            CONSTRAINT = 'dublin_core_mappings_next_version';
+  END IF;
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER dublin_core_mappings_next_version BEFORE UPDATE ON public.dublin_core_mappings
+  FOR EACH ROW EXECUTE FUNCTION public.dublin_core_mappings_next_version();
+ALTER TABLE public.dublin_core_mappings ENABLE ALWAYS TRIGGER dublin_core_mappings_next_version;
+
 -- The stored mapping of record p_record's template, or NULL unless the
 -- record is public on site p_site (record_public_on_site, 0017) or its
 -- template has no stored mapping.

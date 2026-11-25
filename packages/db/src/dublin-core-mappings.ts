@@ -23,7 +23,9 @@ import {
   type UserId,
   type Validated,
 } from "@oculus/core";
+import type { RecordId } from "@oculus/core";
 import type { Queryable } from "./client.js";
+import { MAX_AFFECTED_PUBLISHED } from "./definitions.js";
 import { sql } from "./sql.js";
 
 /** A template's stored mapping: its JSON as stored, and the version an edit starts from. */
@@ -99,4 +101,25 @@ export async function writeDublinCoreMapping(
     );
   }
   return { ok: true, value: Object.freeze({ version: row.version }) };
+}
+
+/**
+ * The organization's published records using the template, by ID, as a
+ * mapping change shows values on them at once (D-076); `undefined` past
+ * `MAX_AFFECTED_PUBLISHED`. Reads IDs only.
+ */
+export async function publishedUsingTemplate(
+  db: Queryable,
+  organizationId: OrganizationId,
+  templateKey: string,
+): Promise<readonly RecordId[] | undefined> {
+  if (!isOrganizationId(organizationId) || !isTemplateKey(templateKey)) return [];
+  const rows = await db.rows<{ id: string }>(sql`
+    SELECT id::text AS id FROM public.records
+    WHERE organization_id = ${organizationId}::uuid AND template_key = ${templateKey}
+      AND workflow_state = 'published'
+    ORDER BY id
+    LIMIT ${MAX_AFFECTED_PUBLISHED + 1}::integer`);
+  if (rows.length > MAX_AFFECTED_PUBLISHED) return undefined;
+  return Object.freeze(rows.map((r) => r.id as RecordId));
 }
