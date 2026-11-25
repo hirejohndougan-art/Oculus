@@ -66,6 +66,7 @@ import {
 } from "@oculus/core";
 import {
   INVALID_CREDENTIALS,
+  markKnownSource,
   signInChecked,
   type SignInFailure,
   type VerifiedSignIn,
@@ -670,6 +671,8 @@ export async function completeSecondStep(
     ) {
       await clearCodeAttempts(db, checked);
     }
+    // Only a whole sign-in makes the address known (S-044).
+    if (done.ok) await markKnownSource(db, userId, source);
     return done;
   } catch (error) {
     return failureFor(error, call);
@@ -906,6 +909,7 @@ export async function confirmEnrolment(
       return done;
     }
     await clearCodeAttempts(db, checked);
+    await markKnownSource(db, userId, source);
     return { ...done, recoveryCodes: Object.freeze(recoveryCodes) };
   } catch (error) {
     return failureFor(error, call);
