@@ -10,9 +10,9 @@
  * - `sharesIntoSite` and `sharesOfRecord` list shares, newest first, at most
  *   `MAX_SHARE_PAGE`.
  * - `sharedItemView` builds what a second site may see of an accepted item:
- *   its title, kind and workflow state, the fields its template makes
- *   public (never staff-only fields, ID numbers or history), and the names
- *   of its home site and organization.
+ *   exactly what the public is shown of it (`publishedRecordView`), only
+ *   while it is published, with the names of its home site and
+ *   organization.
  */
 import {
   isOrganizationId,
@@ -26,9 +26,9 @@ import {
   type SiteId,
   type UserId,
 } from "@oculus/core";
-import { readStoredRecord, readTemplate } from "./catalog.js";
 import type { Queryable } from "./client.js";
 import { sql } from "./sql.js";
+import { publishedRecordView } from "./workflow.js";
 
 /** The writer's privileges on the shares (roles.ts): never DELETE (rows go with their record). */
 export const SHARE_TABLE_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Object.freeze({
@@ -99,7 +99,11 @@ export function isShareId(value: unknown): value is string {
   );
 }
 
-/** A new offer. The caller has checked who may offer it and that the site exists. */
+/**
+ * A new offer, or `undefined` when the record already has a live share into
+ * that site (two offers at once: the second gets nothing). The caller has
+ * checked who may offer it and that the site exists.
+ */
 export async function insertShare(
   tx: Queryable,
   share: {
@@ -110,31 +114,58 @@ export async function insertShare(
     readonly targetSiteId: SiteId;
     readonly offeredBy: UserId;
   },
-): Promise<Share> {
+): Promise<Share | undefined> {
   const [row] = await tx.rows<ShareRow>(sql`
     INSERT INTO public.record_shares
       (id, organization_id, record_id, target_organization_id, target_site_id, offered_by)
     VALUES (${share.id}::uuid, ${share.organizationId}::uuid, ${share.recordId}::uuid,
             ${share.targetOrganizationId}::uuid, ${share.targetSiteId}::uuid,
             ${share.offeredBy}::uuid)
+    ON CONFLICT (organization_id, record_id, target_organization_id, target_site_id)
+      WHERE state IN ('offered', 'accepted') DO NOTHING
     RETURNING ${COLUMNS}`);
-  if (row === undefined) throw new Error("insertShare: no row");
-  return toShare(row);
-}
-
-/** The share, locked `FOR UPDATE` until COMMIT, or `undefined`. */
-export async function lockShare(tx: Queryable, id: unknown): Promise<Share | undefined> {
-  if (!isShareId(id)) return undefined;
-  const [row] = await tx.rows<ShareRow>(sql`
-    SELECT ${COLUMNS} FROM public.record_shares WHERE id = ${id}::uuid FOR UPDATE`);
   return row === undefined ? undefined : toShare(row);
 }
 
-/** The share as it is now, without a lock, or `undefined`. */
-export async function readShare(tx: Queryable, id: unknown): Promise<Share | undefined> {
-  if (!isShareId(id)) return undefined;
-  const [row] = await tx.rows<ShareRow>(sql`
-    SELECT ${COLUMNS} FROM public.record_shares WHERE id = ${id}::uuid`);
+/**
+ * The share, locked `FOR UPDATE` until COMMIT, or `undefined`: only a share
+ * whose home organization (`side: "home"`) or second site's organization
+ * (`"target"`) is `organizationId`, so no other organization's session can
+ * lock (or time) a share it has nothing to do with.
+ */
+export async function lockShare(
+  tx: Queryable,
+  id: unknown,
+  side: "home" | "target",
+  organizationId: OrganizationId,
+): Promise<Share | undefined> {
+  if (!isShareId(id) || !isOrganizationId(organizationId)) return undefined;
+  const [row] = await tx.rows<ShareRow>(
+    side === "home"
+      ? sql`SELECT ${COLUMNS} FROM public.record_shares
+            WHERE id = ${id}::uuid AND organization_id = ${organizationId}::uuid FOR UPDATE`
+      : sql`SELECT ${COLUMNS} FROM public.record_shares
+            WHERE id = ${id}::uuid AND target_organization_id = ${organizationId}::uuid
+            FOR UPDATE`,
+  );
+  return row === undefined ? undefined : toShare(row);
+}
+
+/** The share as it is now, without a lock, under the same rule as `lockShare`. */
+export async function readShare(
+  tx: Queryable,
+  id: unknown,
+  side: "home" | "target",
+  organizationId: OrganizationId,
+): Promise<Share | undefined> {
+  if (!isShareId(id) || !isOrganizationId(organizationId)) return undefined;
+  const [row] = await tx.rows<ShareRow>(
+    side === "home"
+      ? sql`SELECT ${COLUMNS} FROM public.record_shares
+            WHERE id = ${id}::uuid AND organization_id = ${organizationId}::uuid`
+      : sql`SELECT ${COLUMNS} FROM public.record_shares
+            WHERE id = ${id}::uuid AND target_organization_id = ${organizationId}::uuid`,
+  );
   return row === undefined ? undefined : toShare(row);
 }
 
@@ -180,22 +211,31 @@ export async function moveShare(
   return toShare(row);
 }
 
-/** Shares into a site in `states`, newest first. */
+/**
+ * Shares into a site in one state, newest first, at most `MAX_SHARE_PAGE`.
+ * Offers and accepted items are asked for separately, so a flood of offers
+ * never pushes accepted items out of a list. A share into what is now the
+ * record's own home site (it was moved there since) is left out.
+ */
 export async function sharesIntoSite(
   tx: Queryable,
   targetOrganizationId: OrganizationId,
   targetSiteId: SiteId,
-  states: readonly ShareState[],
+  state: ShareState,
 ): Promise<readonly Share[]> {
   if (!isOrganizationId(targetOrganizationId) || !isSiteId(targetSiteId)) return [];
-  const wanted = states.filter((s) => (SHARE_STATES as readonly string[]).includes(s));
-  if (wanted.length === 0) return [];
+  if (!(SHARE_STATES as readonly string[]).includes(state)) return [];
   const rows = await tx.rows<ShareRow>(sql`
-    SELECT ${COLUMNS} FROM public.record_shares
-    WHERE target_organization_id = ${targetOrganizationId}::uuid
-      AND target_site_id = ${targetSiteId}::uuid
-      AND state = ANY(${wanted}::text[])
-    ORDER BY offered_at DESC, id
+    SELECT ${COLUMNS} FROM public.record_shares sh
+    WHERE sh.target_organization_id = ${targetOrganizationId}::uuid
+      AND sh.target_site_id = ${targetSiteId}::uuid
+      AND sh.state = ${state}
+      AND NOT EXISTS (
+        SELECT 1 FROM public.records r
+        WHERE r.organization_id = sh.organization_id AND r.id = sh.record_id
+          AND sh.organization_id = sh.target_organization_id
+          AND r.site_id = sh.target_site_id)
+    ORDER BY sh.offered_at DESC, sh.id
     LIMIT ${MAX_SHARE_PAGE}`);
   return rows.map(toShare);
 }
@@ -215,58 +255,45 @@ export async function sharesOfRecord(
   return rows.map(toShare);
 }
 
-/** What a second site sees of a shared item (D-094). */
+/** What a second site sees of a shared item (D-094): what the public is shown. */
 export interface SharedItemView {
   readonly title: string;
   readonly kind: CatalogRecord["kind"];
-  readonly published: boolean;
-  /** Only the fields the item's template makes public, by key. */
+  /** The public values, own and inherited (`publishedRecordView`), by field key. */
   readonly fields: Readonly<Record<string, FieldValue>>;
   readonly homeSite: string | null;
   readonly homeOrganization: string;
 }
 
 /**
- * The view of a shared item as it is now (module header), or `undefined`
- * when the record is gone. Fields whose template field isn't `public`, and
- * every field when the template can't be read, are left out.
+ * The view of a shared item as the public sees it now, or `undefined` when
+ * the record is gone, isn't published (only published items are shown on a
+ * second site), or now sits on the second site itself.
  */
 export async function sharedItemView(
   tx: Queryable,
-  organizationId: OrganizationId,
-  recordId: RecordId,
+  share: Share,
 ): Promise<SharedItemView | undefined> {
-  const stored = await readStoredRecord(tx, organizationId, recordId);
-  if (!stored?.ok) return undefined;
-  const record = stored.value.record;
-  const fields: Record<string, FieldValue> = {};
-  const templateKey = record.templateKey;
-  const template =
-    templateKey === undefined ? undefined : await readTemplate(tx, organizationId, templateKey);
-  if (template?.ok) {
-    const recordFields = record.fields;
-    for (const field of template.value.template.fields) {
-      if (field.visibility !== "public") continue;
-      const own = Object.getOwnPropertyDescriptor(recordFields, field.key);
-      if (own !== undefined && "value" in own) fields[field.key] = own.value as FieldValue;
-    }
-  }
   const [names] = await tx.rows<{
     organization: string;
     site: string | null;
-    state: string;
+    site_id: string | null;
   }>(sql`
-    SELECT o.name AS organization, s.name AS site, r.workflow_state AS state
+    SELECT o.name AS organization, s.name AS site, r.site_id::text AS site_id
     FROM public.records r
     JOIN public.organizations o ON o.id = r.organization_id
     LEFT JOIN public.sites s ON s.organization_id = r.organization_id AND s.id = r.site_id
-    WHERE r.organization_id = ${organizationId}::uuid AND r.id = ${recordId}::uuid`);
+    WHERE r.organization_id = ${share.organizationId}::uuid AND r.id = ${share.recordId}::uuid`);
   if (names === undefined) return undefined;
+  if (share.organizationId === share.targetOrganizationId && names.site_id === share.targetSiteId) {
+    return undefined;
+  }
+  const view = await publishedRecordView(tx, share.organizationId, share.recordId);
+  if (view === undefined) return undefined;
   return Object.freeze({
-    title: record.title,
-    kind: record.kind,
-    published: names.state === "published",
-    fields: Object.freeze(fields),
+    title: view.title,
+    kind: view.kind,
+    fields: view.fields,
     homeSite: names.site,
     homeOrganization: names.organization,
   });

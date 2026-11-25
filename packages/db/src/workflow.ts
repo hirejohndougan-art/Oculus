@@ -51,6 +51,7 @@ import {
   makeRecordLinkChecker,
   publicOutput,
   publicView,
+  type PublicRecord,
   validateRecord,
   type CatalogRecord,
   type DublinCoreMapping,
@@ -564,6 +565,37 @@ export async function publishCheckIssues(
     );
   }
   return effectivePublishIssues(effective.value, { accessions: s.accessions });
+}
+
+/**
+ * What the public is shown of a published record now (T-041c, D-094), read
+ * in the caller's transaction from the staff tables as `publishCheckIssues`
+ * reads them: `publicView` of its effective record, so inherited public
+ * values are in, and staff-only fields, `record_link` values, rights notes,
+ * place record IDs, identifiers of types that aren't public (or no longer
+ * held) and values that no longer fit their field are out. `undefined` for
+ * a record that isn't published or can't be read.
+ */
+export async function publishedRecordView(
+  db: Queryable,
+  organizationId: OrganizationId,
+  recordId: RecordId,
+): Promise<PublicRecord | undefined> {
+  if (!isOrganizationId(organizationId) || !isRecordId(recordId)) return undefined;
+  if ((await readWorkflowState(db, organizationId, recordId))?.state !== "published") {
+    return undefined;
+  }
+  const snapshot = await readSnapshot(db, organizationId, recordId, false);
+  if (!snapshot.ok) return undefined;
+  const s = snapshot.value;
+  const index = indexRecords(s.records);
+  if (!index.ok) return undefined;
+  const effective = effectiveRecord(recordId, index.value, s.templateFor, {
+    checkers: s.checkers,
+    identifiers: s.identifiers,
+  });
+  if (!effective.ok) return undefined;
+  return publicView(effective.value);
 }
 
 /** One value a record's public output takes from another record (S-020). */

@@ -115,18 +115,28 @@ function codes(result: { ok: boolean; issues?: readonly Issue[] }): string[] {
 const shape = (result: { ok: boolean; issues?: readonly Issue[] }) => JSON.stringify(result);
 
 const STAFF_NOTE = "Invented shelf 4, box 2: staff only";
+const RIGHTS_NOTE = "Invented note: the donor asked us to keep this private";
+const LINK_LABEL = "Invented private donor name";
+const SECRETS = [STAFF_NOTE, RIGHTS_NOTE, LINK_LABEL];
+const leaks = (value: unknown) => SECRETS.filter((x) => JSON.stringify(value).includes(x));
 
 async function catalogOrganization(name: string): Promise<OrganizationId> {
   const org = newOrganizationId();
   ok(await insertOrganization(s.owner, { id: org, name }));
-  const field = (key: string, visibility: "public" | "staff") => ({
+  const field = (
+    key: string,
+    visibility: "public" | "staff",
+    kind = "text",
+    extra: Record<string, unknown> = {},
+  ) => ({
     key,
     label: key,
-    kind: "text",
+    kind,
     required: false,
     repeatable: false,
     visibility,
     inherited: false,
+    ...extra,
   });
   ok(
     await insertTemplateVersion(s.owner, {
@@ -134,7 +144,22 @@ async function catalogOrganization(name: string): Promise<OrganizationId> {
       organizationId: org,
       label: "Objects",
       appliesTo: ["object"],
-      fields: [field("description", "public"), field("shelf", "staff")],
+      fields: [
+        field("description", "public"),
+        field("shelf", "staff"),
+        field("rights", "public", "rights"),
+        // A public link: the public never sees it, not even its label (D-045).
+        field("related", "public", "record_link"),
+      ],
+    }),
+  );
+  ok(
+    await insertTemplateVersion(s.owner, {
+      key: "t-unit",
+      organizationId: org,
+      label: "Units",
+      appliesTo: ["archival_unit"],
+      fields: [field("rights", "public", "rights")],
     }),
   );
   return org;
@@ -179,6 +204,12 @@ async function world(): Promise<World> {
   const dhsManager = await person(dhs, "dhs-manager", "site_manager", d1);
   const dhsCataloger = await person(dhs, "dhs-cataloger", "cataloger", d1);
   const dhsReader = await person(dhs, "dhs-reader", "read_only", d1);
+  const linked = ok(
+    await service.createRecord(
+      { organizationId: lib, actor: actorOf(libCataloger), siteId: l1 },
+      { kind: "object", title: LINK_LABEL, templateKey: "t-object", fields: {} },
+    ),
+  ).record;
   const item = ok(
     await service.createRecord(
       { organizationId: lib, actor: actorOf(libCataloger), siteId: l1 },
@@ -186,10 +217,21 @@ async function world(): Promise<World> {
         kind: "object",
         title: "Invented depot lantern",
         templateKey: "t-object",
-        fields: { description: "A tin lantern.", shelf: STAFF_NOTE },
+        fields: {
+          description: "A tin lantern.",
+          shelf: STAFF_NOTE,
+          rights: { uri: "http://rightsstatements.org/vocab/InC/1.0/", note: RIGHTS_NOTE },
+          related: { recordId: linked.id, label: LINK_LABEL },
+        },
       },
     ),
   ).record;
+  // Published by the system manager (only published items are shared).
+  ok(
+    await service.publish({ organizationId: lib, actor: actorOf(root), siteId: l1 }, item.id, {
+      expectedVersion: 1,
+    }),
+  );
   return {
     lib,
     dhs,
@@ -318,6 +360,19 @@ describe("deciding and ending", () => {
       expect(shape(r)).toBe(shape(await service.acceptShare(ctx, newRecordId())));
       expect(codes(r)).toEqual(["unknown_share"]);
     }
+    for (const ctx of [at(w.dhs, w.dhsCataloger), at(w.lib, w.l2Manager)]) {
+      const acts = [
+        (c: typeof ctx, id: unknown) => service.declineShare(c, id),
+        (c: typeof ctx, id: unknown) => service.removeShare(c, id),
+        (c: typeof ctx, id: unknown) => service.readSharedItem(c, id),
+      ];
+      for (const act of acts) {
+        const r = await act(ctx, share.id);
+        expect(codes(r)).toEqual(["unknown_share"]);
+        expect(shape(r)).toBe(shape(await act(ctx, newRecordId())));
+        expect(shape(r)).toBe(shape(await act(ctx, "not an id")));
+      }
+    }
     const accepted = ok(await service.acceptShare(at(w.dhs, w.dhsManager), share.id));
     expect(accepted.state).toBe("accepted");
     expect(codes(await service.declineShare(at(w.dhs, w.dhsManager), share.id))).toEqual([
@@ -370,6 +425,10 @@ describe("deciding and ending", () => {
     ]);
     expect(withdraw.ok).toBe(true);
     if (!accept.ok) expect(codes(accept)).toEqual(["share_not_open"]);
+    const [state] = await s.owner.rows<{ state: string }>(
+      sql`SELECT state FROM public.record_shares WHERE id = ${next.id}::uuid`,
+    );
+    expect(state?.state).toBe("withdrawn");
   });
 });
 
@@ -385,21 +444,25 @@ describe("what the second site sees", () => {
     // The manager sees the offer, with the same view.
     const offers = ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1));
     expect(offers.map((x) => x.id)).toEqual([share.id]);
+    expect(leaks(offers)).toEqual([]);
     ok(await service.acceptShare(at(w.dhs, w.dhsManager), share.id));
     for (const userId of [w.dhsReader, w.dhsCataloger, w.dhsManager]) {
       const seen = ok(await service.readSharedItem(at(w.dhs, userId), share.id));
       expect(seen.item).toEqual({
         title: "Invented depot lantern",
         kind: "object",
-        published: false,
-        fields: { description: "A tin lantern." },
+        // What the public sees: no staff field, no link, no rights note.
+        fields: {
+          description: "A tin lantern.",
+          rights: { uri: "http://rightsstatements.org/vocab/InC/1.0/" },
+        },
         homeSite: "Invented library site " + String(count),
         homeOrganization: "Invented Library " + String(count),
       });
-      expect(JSON.stringify(seen)).not.toContain(STAFF_NOTE);
+      expect(leaks(seen)).toEqual([]);
       const list = ok(await service.listSharedItems(at(w.dhs, userId), w.d1));
       expect(list.map((x) => x.id)).toEqual([share.id]);
-      expect(JSON.stringify(list)).not.toContain(STAFF_NOTE);
+      expect(leaks(list)).toEqual([]);
     }
     // An edit at home shows on the second site.
     const now = ok(await service.readRecord(at(w.lib, w.libCataloger), w.item.id));
@@ -443,9 +506,17 @@ describe("what the second site sees", () => {
     });
     expect(codes(onward)).toEqual(["unknown_record"]);
     expect(codes(await service.withdrawShare(ctx, share.id))).toEqual(["unknown_share"]);
-    // The item list of the second site doesn't hold it.
+    // It is listed only among the items shared with the second site.
     const shared = ok(await service.listSharedItems(ctx, w.l2));
     expect(shared.map((x) => x.recordId)).toEqual([w.item.id]);
+    // Another organization's manager of an accepting site can't read it the ordinary way either.
+    const other = await offer(w, { org: w.dhs, site: w.d1 });
+    ok(await service.acceptShare(at(w.dhs, w.dhsManager), other.id));
+    const fromDhs = await service.readRecord(at(w.dhs, w.dhsManager, w.d1), w.item.id);
+    expect(fromDhs.ok).toBe(false);
+    expect(shape(fromDhs)).toBe(
+      shape(await service.readRecord(at(w.dhs, w.dhsManager, w.d1), newRecordId())),
+    );
   });
 
   it("keeps another organization's sites and shares out of reach", async () => {
@@ -489,12 +560,15 @@ describe("what the second site sees", () => {
     const w = await world();
     const share = await offer(w, { org: w.dhs, site: w.d1 });
     ok(await service.acceptShare(at(w.dhs, w.dhsManager), share.id));
-    const now = ok(await service.readRecord(at(w.lib, folks.root, w.l1), w.item.id));
-    ok(
-      await service.deleteRecord(at(w.lib, folks.root, w.l1), w.item.id, {
-        expectedVersion: now.version,
-      }),
-    );
+    const rootAt = at(w.lib, folks.root, w.l1);
+    const before = ok(await service.readRecord(rootAt, w.item.id));
+    ok(await service.withdraw(rootAt, w.item.id, { expectedVersion: before.version }));
+    // Withdrawn from publication: the second site shows it no more.
+    expect(codes(await service.readSharedItem(at(w.dhs, w.dhsReader), share.id))).toEqual([
+      "unknown_share",
+    ]);
+    const now = ok(await service.readRecord(rootAt, w.item.id));
+    ok(await service.deleteRecord(rootAt, w.item.id, { expectedVersion: now.version }));
     expect(codes(await service.readSharedItem(at(w.dhs, w.dhsReader), share.id))).toEqual([
       "unknown_share",
     ]);
@@ -538,5 +612,146 @@ describe("the database backs the shares up", () => {
     await expect(
       s.writer.execute(sql`DELETE FROM public.record_shares WHERE id = ${share.id}::uuid`),
     ).rejects.toMatchObject({ code: "42501" });
+  });
+});
+
+describe("second review", () => {
+  it("offers only published items", async () => {
+    await ready();
+    const w = await world();
+    const draft = ok(
+      await service.createRecord(at(w.lib, w.libCataloger, w.l1), {
+        kind: "object",
+        title: "Invented unpublished lantern",
+        templateKey: "t-object",
+        fields: { shelf: STAFF_NOTE },
+      }),
+    ).record;
+    const r = await service.offerRecord(at(w.lib, w.libCataloger), {
+      recordId: draft.id,
+      targetOrganizationId: w.dhs,
+      targetSiteId: w.d1,
+    });
+    expect(codes(r)).toEqual(["not_published"]);
+  });
+
+  it("answers two offers at once to one site with one share and already_shared", async () => {
+    await ready();
+    const w = await world();
+    const request = { recordId: w.item.id, targetOrganizationId: w.dhs, targetSiteId: w.d1 };
+    const results = await Promise.all([
+      service.offerRecord(at(w.lib, w.libCataloger), request),
+      service.offerRecord(at(w.lib, w.libCataloger), request),
+      service.offerRecord(at(w.lib, w.libCataloger), request),
+    ]);
+    expect(results.filter((r) => r.ok)).toHaveLength(1);
+    expect(results.filter((r) => !r.ok).flatMap((r) => codes(r))).toEqual([
+      "already_shared",
+      "already_shared",
+    ]);
+  });
+
+  it("stops showing an item moved onto the site it was shared into", async () => {
+    await ready();
+    const w = await world();
+    const share = await offer(w, { org: w.lib, site: w.l2 });
+    ok(await service.acceptShare(at(w.lib, w.l2Manager), share.id));
+    expect(ok(await service.listSharedItems(at(w.lib, w.l2Manager), w.l2))).toHaveLength(1);
+    const rootAt = at(w.lib, folks.root, w.l1);
+    const now = ok(await service.readRecord(rootAt, w.item.id));
+    ok(
+      await service.updateRecord(
+        rootAt,
+        w.item.id,
+        { ...now.record, siteId: w.l2 },
+        { expectedVersion: now.version },
+      ),
+    );
+    expect(ok(await service.listSharedItems(at(w.lib, w.l2Manager), w.l2))).toEqual([]);
+    expect(codes(await service.readSharedItem(at(w.lib, w.l2Manager), share.id))).toEqual([
+      "unknown_share",
+    ]);
+  });
+
+  it("lets a person scoped to part of the home site offer only what they may edit, without deadlocks", async () => {
+    await ready();
+    const w = await world();
+    const rootAt = at(w.lib, folks.root, w.l1);
+    const make = async (draft: Record<string, unknown>) => {
+      const made = ok(await service.createRecord(rootAt, draft)).record;
+      ok(await service.publish(rootAt, made.id, { expectedVersion: 1 }));
+      return made;
+    };
+    const rights = { uri: "http://rightsstatements.org/vocab/NoC-US/1.0/" };
+    const fonds = await make({
+      kind: "archival_unit",
+      level: "fonds",
+      title: "Invented fonds",
+      templateKey: "t-unit",
+      fields: { rights },
+    });
+    const file = await make({
+      kind: "archival_unit",
+      level: "file",
+      title: "Invented file",
+      parentId: fonds.id,
+      templateKey: "t-unit",
+      fields: { rights },
+    });
+    const scoped = await folks.member(w.lib, `scoped-${String(count)}`);
+    await grant(service, folks.root, w.lib, {
+      userId: scoped,
+      role: "cataloger",
+      siteId: w.l1,
+      scope: fonds.id,
+    });
+    const ctx = at(w.lib, scoped, w.l1);
+    const to = { targetOrganizationId: w.dhs, targetSiteId: w.d1 };
+    // Outside the scope: as missing.
+    expect(codes(await service.offerRecord(ctx, { recordId: w.item.id, ...to }))).toEqual([
+      "unknown_record",
+    ]);
+    // Inside it, while the fonds is being edited at the same moment: both go through.
+    const now = ok(await service.readRecord(rootAt, fonds.id));
+    const [offered, edited] = await Promise.all([
+      service.offerRecord(ctx, { recordId: file.id, ...to }),
+      service.updateRecord(
+        rootAt,
+        fonds.id,
+        { ...now.record, title: "Invented fonds, renamed" },
+        { expectedVersion: now.version },
+      ),
+    ]);
+    expect(offered.ok).toBe(true);
+    expect(edited.ok).toBe(true);
+    // The scoped person can't see what is shared into the site (not the whole catalog).
+    expect(codes(await service.listSharedItems(ctx, w.l1))).toEqual(["not_permitted"]);
+  });
+
+  it("refuses a decision made by withdrawing, and times that aren't now", async () => {
+    await ready();
+    const w = await world();
+    const share = await offer(w, { org: w.dhs, site: w.d1 });
+    await expect(
+      s.writer.execute(sql`UPDATE public.record_shares
+        SET state = 'withdrawn', ended_by = ${w.libCataloger}::uuid, ended_at = clock_timestamp(),
+            decided_by = ${w.dhsManager}::uuid, decided_at = clock_timestamp()
+        WHERE id = ${share.id}::uuid`),
+    ).rejects.toMatchObject({ constraint: "record_shares_identity" });
+    await expect(
+      s.writer.execute(sql`UPDATE public.record_shares
+        SET state = 'accepted', decided_by = ${w.dhsManager}::uuid,
+            decided_at = now() - interval '1 day'
+        WHERE id = ${share.id}::uuid`),
+    ).rejects.toMatchObject({ constraint: "record_shares_now" });
+    // The checks hold in replica mode too (ENABLE ALWAYS).
+    await expect(
+      s.owner.transaction(async (q) => {
+        await q.execute(sql`SET LOCAL session_replication_role = replica`);
+        await q.execute(sql`UPDATE public.record_shares SET state = 'removed',
+          ended_by = ${w.dhsManager}::uuid, ended_at = clock_timestamp()
+          WHERE id = ${share.id}::uuid`);
+      }),
+    ).rejects.toMatchObject({ constraint: "record_shares_life" });
   });
 });

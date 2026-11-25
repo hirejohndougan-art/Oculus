@@ -1,8 +1,8 @@
 /**
  * Sharing items between sites through the service (T-041b, D-074, D-094).
  *
- * - **Offering** (`offerRecord`): someone who may edit the record at its
- *   home site (`records.edit`, or `media.attach` for a digital asset, as
+ * - **Offering** (`offerRecord`): a **published** item only; someone who
+ *   may edit the record at its home site (`records.edit`, or `media.attach` for a digital asset, as
  *   editing it needs) offers it to another site, of their own organization
  *   or another one, named by its organization and site IDs (a site's manager
  *   passes them on: Oculus lists no other organization's sites). Never to
@@ -18,10 +18,11 @@
  *   (`sharesOfRecord`).
  * - **Seeing an accepted item** (`readSharedItem`, `listSharedItems`):
  *   anyone with `records.view` for the whole of the second site's catalog
- *   (or a system manager) sees `SharedItemView`: the title, kind, whether it
- *   is published, the fields its template makes public, and the names of
- *   its home site and organization. Never staff-only fields, ID numbers,
- *   history, rights settings or people (D-019). The item is never changed
+ *   (or a system manager) sees `SharedItemView`: exactly what the public is
+ *   shown of it (`publishedRecordView`: no staff-only fields, links, rights
+ *   notes or non-public ID numbers), only while it is published and not on
+ *   the second site itself, with the names of its home site and
+ *   organization. Never history, rights settings or people (D-019). The item is never changed
  *   from the second site, and a share never widens `onRecord`: the record's
  *   own permission checks don't read shares (`sitesSharedInto` stays empty,
  *   D-094), so the S-028 equivalence of `allowsUnlocked` and `onRecord`
@@ -47,13 +48,13 @@ import {
 } from "@oculus/core";
 import {
   insertShare,
-  liveShare,
   lockRecord,
   lockShare,
   moveShare,
   readRecordPlace,
   readShare,
   readSite,
+  readWorkflowState,
   sharedItemView,
   sharesIntoSite as storedSharesIntoSite,
   sharesOfRecord as storedSharesOfRecord,
@@ -63,7 +64,13 @@ import {
   type SharedItemView,
 } from "@oculus/db";
 import { randomUUID } from "node:crypto";
-import { RecordAccess, editPermissions, noSuchRecord, readAccess } from "./access.js";
+import {
+  NOT_PERMITTED_MESSAGE,
+  RecordAccess,
+  editPermissions,
+  noSuchRecord,
+  readAccess,
+} from "./access.js";
 import { hasOnly, own, type Runner } from "./admin.js";
 import type { ServiceContext, ServiceRefusal, ServiceResult } from "./service.js";
 
@@ -119,8 +126,7 @@ const UNKNOWN_SHARE = (): Refusal =>
   refusal(["shareId"], "unknown_share", "There is no such share here.");
 const UNKNOWN_SITE = (): Refusal =>
   refusal(["targetSiteId"], "unknown_site", "There is no such site to offer it to.");
-const NOT_PERMITTED = (): Refusal =>
-  refusal([], "not_permitted", "You don't have permission to do that.");
+const NOT_PERMITTED = (): Refusal => refusal([], "not_permitted", NOT_PERMITTED_MESSAGE);
 
 function summary(share: Share): ShareSummary {
   return Object.freeze({
@@ -149,22 +155,26 @@ export function shareOperations(run: Runner): ShareOperations {
   /**
    * The home side's check for a record: the person may edit it at its home
    * site (`onRecord`, which answers a record they can't see as
-   * `unknown_record`). Takes the record's row lock (`FOR KEY SHARE` is
-   * enough to keep it from being deleted or moved away underneath; the
-   * edit rights are checked on the place read under it).
+   * `unknown_record`). Takes the arrangement lock (scoped grants only),
+   * then the record's row `FOR SHARE`, so it is neither deleted nor moved
+   * meanwhile; the edit rights are checked on the place read under it.
    */
   async function mayShareRecord(
     tx: Queryable,
     who: { organizationId: OrganizationId; actor: string },
     access: Access,
     recordId: RecordId,
+    mode: "write" | "read",
   ): Promise<Refusal | undefined> {
+    // The arrangement lock first (when the person's grants are scoped), then
+    // the record's row: D-065's order, as every write takes them.
+    const checker = new RecordAccess(tx, who.organizationId, access, mode);
+    await checker.settle();
     if ((await lockRecord(tx, who.organizationId, recordId, "share")) === undefined) {
       return noSuchRecord();
     }
     const place = await readRecordPlace(tx, who.organizationId, recordId);
     if (place === undefined) return noSuchRecord();
-    const checker = new RecordAccess(tx, who.organizationId, access, "write");
     return checker.onRecord(
       {
         kind: place.kind,
@@ -180,7 +190,7 @@ export function shareOperations(run: Runner): ShareOperations {
 
   /** The second side's view of an incoming share, or `undefined` if its record is gone. */
   async function incoming(tx: Queryable, share: Share): Promise<IncomingShare | undefined> {
-    const item = await sharedItemView(tx, share.organizationId, share.recordId);
+    const item = await sharedItemView(tx, share);
     return item === undefined ? undefined : Object.freeze({ ...summary(share), item });
   }
 
@@ -195,11 +205,8 @@ export function shareOperations(run: Runner): ShareOperations {
   ): Promise<{ ok: true; share: Share; userId: UserId } | Refusal> {
     const access = await readAccess(tx, who.organizationId, who.actor, { lock: true });
     if (!access.ok) return UNKNOWN_SHARE();
-    const share = await lockShare(tx, shareId);
-    if (
-      share?.targetOrganizationId !== who.organizationId ||
-      !managesSite(access.value, share.targetSiteId)
-    ) {
+    const share = await lockShare(tx, shareId, "target", who.organizationId);
+    if (share === undefined || !managesSite(access.value, share.targetSiteId)) {
       return UNKNOWN_SHARE();
     }
     return { ok: true, share, userId: access.userId };
@@ -246,10 +253,19 @@ export function shareOperations(run: Runner): ShareOperations {
         }
         const access = await readAccess(tx, who.organizationId, who.actor, { lock: true });
         if (!access.ok) return access;
-        const allowed = await mayShareRecord(tx, who, access.value, recordId);
+        const allowed = await mayShareRecord(tx, who, access.value, recordId, "write");
         if (allowed) return allowed;
         const place = await readRecordPlace(tx, who.organizationId, recordId);
         if (place === undefined) return noSuchRecord();
+        // Only what is already public goes to another site (D-094): an
+        // offer never shows an unpublished item to anyone new.
+        if ((await readWorkflowState(tx, who.organizationId, recordId))?.state !== "published") {
+          return refusal(
+            ["recordId"],
+            "not_published",
+            "Only a published item can be offered to another site.",
+          );
+        }
         // The site, of any organization: it must exist, and not be home.
         const site = await readSite(tx, targetOrganizationId, targetSiteId);
         if (
@@ -257,21 +273,6 @@ export function shareOperations(run: Runner): ShareOperations {
           (targetOrganizationId === who.organizationId && place.siteId === targetSiteId)
         ) {
           return UNKNOWN_SITE();
-        }
-        if (
-          (await liveShare(
-            tx,
-            who.organizationId,
-            recordId,
-            targetOrganizationId,
-            targetSiteId,
-          )) !== undefined
-        ) {
-          return refusal(
-            ["targetSiteId"],
-            "already_shared",
-            "It is already offered to or shown on that site.",
-          );
         }
         const share = await insertShare(tx, {
           id: randomUUID(),
@@ -281,6 +282,14 @@ export function shareOperations(run: Runner): ShareOperations {
           targetSiteId,
           offeredBy: access.userId,
         });
+        // A live share there already (perhaps made a moment ago by another offer).
+        if (share === undefined) {
+          return refusal(
+            ["targetSiteId"],
+            "already_shared",
+            "It is already offered to or shown on that site.",
+          );
+        }
         return { ok: true, value: summary(share) };
       });
     },
@@ -293,13 +302,16 @@ export function shareOperations(run: Runner): ShareOperations {
       return run("withdrawShare", context, async (tx, who) => {
         const access = await readAccess(tx, who.organizationId, who.actor, { lock: true });
         if (!access.ok) return UNKNOWN_SHARE();
-        const share = await lockShare(tx, shareId);
-        if (share?.organizationId !== who.organizationId) {
-          return UNKNOWN_SHARE();
-        }
+        // The record first, then the share (the order a deletion takes them).
+        const seen = await readShare(tx, shareId, "home", who.organizationId);
+        if (seen === undefined) return UNKNOWN_SHARE();
         // Only someone who may share the record may withdraw it; anyone else
         // learns nothing about the share (or the record).
-        if (await mayShareRecord(tx, who, access.value, share.recordId)) return UNKNOWN_SHARE();
+        if (await mayShareRecord(tx, who, access.value, seen.recordId, "write")) {
+          return UNKNOWN_SHARE();
+        }
+        const share = await lockShare(tx, seen.id, "home", who.organizationId);
+        if (share === undefined) return UNKNOWN_SHARE();
         if (share.state !== "offered" && share.state !== "accepted") {
           return refusal(
             ["shareId"],
@@ -325,10 +337,10 @@ export function shareOperations(run: Runner): ShareOperations {
         ) {
           return NOT_PERMITTED();
         }
-        const shares = await storedSharesIntoSite(tx, who.organizationId, siteId, [
-          "offered",
-          "accepted",
-        ]);
+        const shares = [
+          ...(await storedSharesIntoSite(tx, who.organizationId, siteId, "offered")),
+          ...(await storedSharesIntoSite(tx, who.organizationId, siteId, "accepted")),
+        ];
         const out: IncomingShare[] = [];
         for (const share of shares) {
           const view = await incoming(tx, share);
@@ -343,7 +355,7 @@ export function shareOperations(run: Runner): ShareOperations {
         if (!isRecordId(recordId)) return noSuchRecord();
         const access = await readAccess(tx, who.organizationId, who.actor);
         if (!access.ok) return access;
-        const allowed = await mayShareRecord(tx, who, access.value, recordId);
+        const allowed = await mayShareRecord(tx, who, access.value, recordId, "read");
         if (allowed) return allowed;
         const shares = await storedSharesOfRecord(tx, who.organizationId, recordId);
         return { ok: true, value: Object.freeze(shares.map(summary)) };
@@ -354,12 +366,8 @@ export function shareOperations(run: Runner): ShareOperations {
       return run("readSharedItem", context, async (tx, who) => {
         const access = await readAccess(tx, who.organizationId, who.actor);
         if (!access.ok) return UNKNOWN_SHARE();
-        const share = await readShare(tx, shareId);
-        if (
-          share?.state !== "accepted" ||
-          share.targetOrganizationId !== who.organizationId ||
-          !seesSite(access.value, share.targetSiteId)
-        ) {
+        const share = await readShare(tx, shareId, "target", who.organizationId);
+        if (share?.state !== "accepted" || !seesSite(access.value, share.targetSiteId)) {
           return UNKNOWN_SHARE();
         }
         const view = await incoming(tx, share);
@@ -378,7 +386,7 @@ export function shareOperations(run: Runner): ShareOperations {
         ) {
           return NOT_PERMITTED();
         }
-        const shares = await storedSharesIntoSite(tx, who.organizationId, siteId, ["accepted"]);
+        const shares = await storedSharesIntoSite(tx, who.organizationId, siteId, "accepted");
         const out: IncomingShare[] = [];
         for (const share of shares) {
           const view = await incoming(tx, share);

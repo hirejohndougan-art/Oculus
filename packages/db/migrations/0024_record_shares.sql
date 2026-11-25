@@ -12,8 +12,11 @@
 -- key, so it is always a real site of that organization.
 --
 -- The database checks the shape and the life: the identity columns never
--- change, a state moves only along the arrows above with who and when, and
--- a record is never offered to its own home site. Who may offer, decide
+-- change, a state moves only along the arrows above with who and when
+-- (stamped at the moment of the change), a decision is made only by
+-- accepting or declining, and a record is never offered to its own home
+-- site (read under the record's key-share lock). A share into a site the
+-- record was moved to later is left out by every reader (shares.ts). Who may offer, decide
 -- and end a share is the service's (shares.ts). Rows go when their record
 -- is deleted (ON DELETE CASCADE): a deleted record is shown nowhere. The
 -- writer has SELECT, INSERT and UPDATE (roles.ts), never DELETE.
@@ -77,8 +80,13 @@ BEGIN
       RAISE EXCEPTION 'A share starts as an offer.'
         USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'record_shares_life';
     END IF;
+    IF NEW.offered_at < now() OR NEW.offered_at > clock_timestamp() THEN
+      RAISE EXCEPTION 'An offer is stamped when it is made.'
+        USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'record_shares_now';
+    END IF;
+    -- Locked, so a move of the record can't slip past this check.
     SELECT r.site_id INTO home FROM public.records r
-      WHERE r.organization_id = NEW.organization_id AND r.id = NEW.record_id;
+      WHERE r.organization_id = NEW.organization_id AND r.id = NEW.record_id FOR KEY SHARE;
     IF NEW.target_organization_id = NEW.organization_id AND home IS NOT DISTINCT FROM NEW.target_site_id
     THEN
       RAISE EXCEPTION 'A record is not offered to its own home site.'
@@ -102,13 +110,23 @@ BEGIN
     RAISE EXCEPTION 'That change of a share is not allowed.'
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'record_shares_life';
   END IF;
-  -- A decision, once made, stays as it was.
-  IF OLD.state = 'accepted'
+  -- A decision is made only by accepting or declining, and then stays as it
+  -- was: withdrawing an offer or ending an item never sets or changes one.
+  IF NEW.state IN ('withdrawn', 'removed')
      AND (NEW.decided_by IS DISTINCT FROM OLD.decided_by
           OR NEW.decided_at IS DISTINCT FROM OLD.decided_at)
   THEN
     RAISE EXCEPTION 'A share''s decision never changes.'
       USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'record_shares_identity';
+  END IF;
+  -- Each new time is the moment of the change.
+  IF (NEW.decided_at IS DISTINCT FROM OLD.decided_at
+      AND (NEW.decided_at < now() OR NEW.decided_at > clock_timestamp()))
+     OR (NEW.ended_at IS DISTINCT FROM OLD.ended_at
+         AND (NEW.ended_at < now() OR NEW.ended_at > clock_timestamp()))
+  THEN
+    RAISE EXCEPTION 'A decision or an end is stamped when it is made.'
+      USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'record_shares_now';
   END IF;
   RETURN NEW;
 END

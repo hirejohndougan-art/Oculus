@@ -91,6 +91,7 @@ export {
   recordClosureIds,
   lockRecordsShared,
   readWorkflowState,
+  publishedRecordView,
   recordsInState,
   MAX_STATE_LIST_LIMIT,
 } from "./workflow.js";
