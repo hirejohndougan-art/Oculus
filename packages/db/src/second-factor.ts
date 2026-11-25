@@ -1437,7 +1437,8 @@ export async function resetSecondFactor(
         // in key order: codes typed against the factor just revoked, mostly
         // the person's own from a lost or broken device, are not told later
         // as someone else's. Codes an hour old were already told by the
-        // cleanup.
+        // cleanup when it runs hourly (D-077's S-054a amendment accepts the
+        // rest).
         await tx.execute(sql`
           DELETE FROM public.second_step_throttles WHERE key = ${`user:${targetUserId}`}`);
         await tx.execute(sql`
