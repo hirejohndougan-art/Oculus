@@ -295,6 +295,10 @@ try {
     },
     adminDir: join(import.meta.dirname, "..", "dist"),
     log: () => undefined,
+    // Every spec signs in from 127.0.0.1 within the same minute or so; with
+    // ten specs the per-address credentials brake (60 a minute, D-081)
+    // would refuse the last ones. The brake has its own unit tests.
+    signIn: { rateLimits: { credentials: 1000 } },
   });
   await app.listen({ host: "127.0.0.1", port });
   writeFileSync(
