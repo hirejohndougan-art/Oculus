@@ -86,7 +86,11 @@ export interface PublicTermCountOptions {
   readonly fields?: readonly string[];
 }
 
-function refused<T>(path: readonly (string | number)[], code: string, message: string): Validated<T> {
+function refused<T>(
+  path: readonly (string | number)[],
+  code: string,
+  message: string,
+): Validated<T> {
   return { ok: false, issues: [issue(path, code, message)] };
 }
 
@@ -216,10 +220,7 @@ export async function publicTermCounts(
       });
     });
     counts.sort(
-      (a, b) =>
-        b.records - a.records ||
-        compare(a.label, b.label) ||
-        compare(a.termKey, b.termKey),
+      (a, b) => b.records - a.records || compare(a.label, b.label) || compare(a.termKey, b.termKey),
     );
     return {
       ok: true as const,
@@ -262,4 +263,3 @@ function keyOf(term: ControlledTerm): string | undefined {
   const text = termIdentity(term);
   return text.ok ? createHash("sha256").update(text.value, "utf8").digest("hex") : undefined;
 }
-

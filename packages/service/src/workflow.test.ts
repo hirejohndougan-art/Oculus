@@ -808,11 +808,8 @@ describe("public subject counts come from public output only (T-034d, D-095)", (
       hidden: term("Secret staff term"),
     });
     const b = await item("An invented net", {
-      subject: [
-        term("Lighthouses—Texas", LIGHT.replace("http:", "https:")),
-        term("Fishing"),
-        term("Fishing"),
-      ],
+      // The same heading under another label: one term (its URI), counted once.
+      subject: [term("Lighthouses—Texas", LIGHT), term("Fishing")],
     });
     const draft = await item("An invented draft", {
       subject: [term("Fishing"), term("Unpublished term")],
