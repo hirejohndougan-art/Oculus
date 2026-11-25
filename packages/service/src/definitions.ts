@@ -968,7 +968,7 @@ export function definitionOperations(run: Runner): DefinitionOperations {
         // The confirmation is tied to the list: exactly these records,
         // as read now. A confirmation sent before seeing them, or before a
         // record was published meanwhile, asks again.
-        const listed = new Set(Array.isArray(confirmDropped) ? (confirmDropped) : []);
+        const listed = new Set(Array.isArray(confirmDropped) ? confirmDropped : []);
         if (
           dropped.length > 0 &&
           (listed.size !== dropped.length || !dropped.every((id) => listed.has(id)))
