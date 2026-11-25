@@ -6,7 +6,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Result: done (T-041b continues as T-041d to T-041f)
 - What changed: migration 0024 (`record_shares`), `packages/db/src/shares.ts`, `publishedRecordView` (workflow.ts), `packages/service/src/shares.ts`: offer a published item to another site (any organization's), accept, decline, remove (the second site's manager), withdraw (home), lists, and a read-only view for the second site that is what the public could see, never through the record's own checks.
 - Decisions: D-094
-- Review: three independent rounds. Fixed: the view copied raw values (links, rights notes, non-public numbers) and showed unpublished items; it then skipped public output's gates (home site, publish check, one snapshot); lock order; withdraw vs delete; moves onto the second site; concurrent offers; locking another organization's shares; trigger gaps; hidden shares filling lists. Left as S-036.
+- Review: three independent rounds (the third found no leak). Fixed: the view copied raw values (links, rights notes, non-public numbers) and showed unpublished items; it then skipped public output's gates (home site, publish check, one snapshot); lock order; withdraw vs delete; moves onto the second site; concurrent offers; locking another organization's shares; trigger gaps; hidden shares filling lists; view errors thrown instead of refused. Left as S-036.
 - Gate: see the merge commit
 - Next: T-041d (shares over HTTP), then T-041e.
 ## 2026-11-25 00:15 CT — manual (Chat D) — T-057 Desktop database helper
