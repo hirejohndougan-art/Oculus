@@ -328,6 +328,37 @@ describe("installing", () => {
     expect(await readlink(join(home, "current"))).toBe(join("releases", "0.1.0"));
   });
 
+  it("refuses database changes from the release command unless the writer role is named (S-062)", async () => {
+    const m = new UpdateManager({
+      home,
+      keys: key.trusted,
+      runScript,
+      runningRoot: join(home, "current"),
+    });
+    await upload(m, testPackage(key, "0.2.0", ["0001_start.sql", "0002_more.sql"]));
+    const owner = {
+      requireRunningFromCurrent: false,
+      fallbackUrl: "postgresql://owner@db.invented.example/invented",
+    };
+    await expect(m.install("0.2.0", "release-cli", () => undefined, owner)).rejects.toMatchObject({
+      code: "migrations_need_writer_role",
+    });
+    for (const bad of ["Oculus_Writer", "oculus writer", "pg_monitor", "public"]) {
+      await expect(
+        m.install("0.2.0", "release-cli", () => undefined, { ...owner, fallbackWriterRole: bad }),
+      ).rejects.toMatchObject({ code: "invalid_writer_role" });
+    }
+    // Nothing ran: no backup, no migration, no switch.
+    expect(calls).toEqual([]);
+    expect(await readlink(join(home, "current"))).toBe(join("releases", "0.1.0"));
+    await m.install("0.2.0", "release-cli", () => undefined, {
+      ...owner,
+      fallbackWriterRole: "oculus_writer",
+    });
+    expect(calls.at(-1)?.args).toEqual(["oculus_writer"]);
+    expect(await readlink(join(home, "current"))).toBe(join("releases", "0.2.0"));
+  });
+
   it("keeps a failed step's output in the updates folder, not in the reply", async () => {
     const m = manager();
     await upload(m, testPackage(key, "0.2.0", ["0001_start.sql", "0002_more.sql"]));
