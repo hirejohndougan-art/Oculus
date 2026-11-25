@@ -55,17 +55,17 @@ async function withRole(q: Queryable, statement: string, role: string): Promise<
   END $$`);
 }
 
-/** Uploaded files (M-002, D-086): a throwaway folder of this file's own. */
-const filesDir = mkdtempSync(join(tmpdir(), "oculus-oai-files-"));
+// The admin server needs a files folder (D-086); one of this file's own.
+const filesDir = mkdtempSync(join(tmpdir(), "oculus-t050c-files-"));
 
 function envFor(extra: Record<string, string> = {}): Record<string, string> {
   return {
     NODE_ENV: "development",
-    OCULUS_FILES_DIR: filesDir,
     OCULUS_ORIGINS: `${ADMIN},${PUBLIC}`,
     OCULUS_ADMIN_ORIGIN: ADMIN,
     OCULUS_SECRET_KEY: FAKE_TEST_SECRET_KEY,
     OCULUS_PUBLIC_SITES: `${PUBLIC}=${w.a1}`,
+    OCULUS_FILES_DIR: filesDir,
     ...extra,
   };
 }
