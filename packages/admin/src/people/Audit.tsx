@@ -108,9 +108,7 @@ function definitionText(
     entry.name ??
     (entry.subject === "site" && entry.key !== null ? sites.get(entry.key) : undefined) ??
     entry.key;
-  return name === null || name === undefined
-    ? `${verb} ${subject}`
-    : `${verb} ${subject} “${name}”`;
+  return name === null ? `${verb} ${subject}` : `${verb} ${subject} “${name}”`;
 }
 
 function what(entry: AuditEntry, sites: ReadonlyMap<string, string>): string {

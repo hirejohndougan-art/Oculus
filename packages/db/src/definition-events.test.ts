@@ -159,7 +159,7 @@ describe("definition_events", () => {
       }),
     );
     const terms = await events("term");
-    expect(terms.map((r) => [r.action, r.subject_key, r.after["label"]])).toEqual([
+    expect(terms.map((r) => [r.action, r.subject_key, r.after.label])).toEqual([
       ["created", term.value.id, "Invented quilts"],
       ["changed", term.value.id, "Invented bed quilts"],
     ]);

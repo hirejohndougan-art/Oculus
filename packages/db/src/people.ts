@@ -758,13 +758,13 @@ function auditEntryOf(r: AuditRow): AuditEntry | undefined {
         ...base,
         eventId: r.event_id ?? "",
         subject: (r.kind ?? "term") as DefinitionSubject,
-        key: text(detail["key"]),
+        key: text(detail.key),
         action: r.action === "created" ? ("created" as const) : ("changed" as const),
         name: r.title,
         changes:
           r.action === "created"
             ? Object.freeze([] as string[])
-            : changedProperties(detail["before"], detail["after"]),
+            : changedProperties(detail.before, detail.after),
       });
     case "file":
       return Object.freeze({
@@ -774,7 +774,7 @@ function auditEntryOf(r: AuditRow): AuditEntry | undefined {
         kind: r.kind === "removed" ? ("removed" as const) : ("attached" as const),
         recordId: r.record_id ?? "",
         title: r.title,
-        fileId: text(detail["fileId"]) ?? "",
+        fileId: text(detail.fileId) ?? "",
         bytes: r.byte_count ?? 0,
       });
     case "move":
@@ -784,8 +784,8 @@ function auditEntryOf(r: AuditRow): AuditEntry | undefined {
         eventId: r.event_id ?? "",
         recordId: r.record_id ?? "",
         title: r.title,
-        locationId: text(detail["locationId"]) ?? "",
-        locationName: text(detail["locationName"]),
+        locationId: text(detail.locationId) ?? "",
+        locationName: text(detail.locationName),
       });
     case "accession":
       return Object.freeze({
@@ -793,7 +793,7 @@ function auditEntryOf(r: AuditRow): AuditEntry | undefined {
         ...base,
         accessionId: r.event_id ?? "",
         version: r.version ?? 0,
-        number: text(detail["number"]),
+        number: text(detail.number),
       });
     case "share":
       return Object.freeze({

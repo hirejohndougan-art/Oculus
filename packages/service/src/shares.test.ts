@@ -420,9 +420,11 @@ describe("deciding and ending", () => {
     ok(await service.acceptShare(at(w.dhs, w.dhsManager), share.id));
     ok(await service.removeShare(at(w.dhs, w.dhsManager), share.id));
     const steps = async (org: OrganizationId, records: "all" | SiteId[]) =>
-      (await readAuditTrail(s.owner, org, { records, people: "all" }, { limit: 100 })).entries
-        .filter((e) => e.type === "share")
-        .map((e) => (e.type === "share" ? [e.kind, e.actor, e.title, e.targetSiteId] : []));
+      (
+        await readAuditTrail(s.owner, org, { records, people: "all" }, { limit: 100 })
+      ).entries.flatMap((e) =>
+        e.type === "share" ? [[e.kind, e.actor, e.title, e.targetSiteId]] : [],
+      );
     const expected = (title: string | null) => [
       ["removed", actorOf(w.dhsManager), title, w.d1],
       ["accepted", actorOf(w.dhsManager), title, w.d1],
