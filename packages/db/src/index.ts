@@ -346,6 +346,7 @@ export {
   MAX_ENROLMENT_STARTS,
   TOTP_CHAIN_LENGTH,
   ENROLMENT_TOKEN_SECONDS,
+  WRONG_CODE_MEMORY_SECONDS,
 } from "./second-factor.js";
 export type {
   SecondStepRefusal,
