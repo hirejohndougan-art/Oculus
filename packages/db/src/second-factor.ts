@@ -635,8 +635,12 @@ async function clearCodeAttempts(db: Queryable, counted: Counted): Promise<void>
   // First, in one statement, so no alert can come between reading the share
   // and taking it off: the session's and the person's unexplained rows,
   // locked in key order (`session:` sorts before `wrong:`).
+  // Best effort: the sign-in may already have gone through, and must not be
+  // lost to a busy counter (review); a share left behind is told later.
   if (counted.signInSessionKey !== undefined) {
-    await db.execute(sql`
+    await db
+      .execute(
+        sql`
       WITH locked AS (
         SELECT key, unexplained, told_round FROM public.second_step_throttles
         WHERE key IN (${counted.signInSessionKey}, ${counted.wrongKey})
@@ -651,7 +655,9 @@ async function clearCodeAttempts(db: Queryable, counted: Counted): Promise<void>
       SET failures = CASE WHEN t.key = ${counted.wrongKey}
                           THEN greatest(t.failures - (SELECT n FROM mine), 0) ELSE t.failures END,
           unexplained = 0
-      FROM locked WHERE t.key = locked.key`);
+      FROM locked WHERE t.key = locked.key`,
+      )
+      .catch(() => undefined);
   }
   // Each statement locks its rows in key order first (S-054a), as
   // takeCodeAttempt does: a scan in the table's own order could lock
@@ -706,7 +712,22 @@ async function countWrongCode(
   const sessionKey = counted.signInSessionKey;
   if (!counted.countIfWrong || sessionKey === undefined) return;
   const wrongKey = counted.wrongKey;
-  await inTransaction(db, async (tx) => {
+  // Again if the cleanup deleted the new row in between (review), as takeCodeAttempt does.
+  for (let round = 1; round <= 3; round++) {
+    const done = await countWrongCodeOnce(db, who, sessionKey, wrongKey, factorId);
+    if (done) return;
+  }
+}
+
+/** One try of countWrongCode: false when the `wrong:` row went before it was locked. */
+async function countWrongCodeOnce(
+  db: Database,
+  who: Who,
+  sessionKey: string,
+  wrongKey: string,
+  factorId: string,
+): Promise<boolean> {
+  return inTransaction(db, async (tx) => {
     await tx.execute(sql`
       INSERT INTO public.second_step_throttles (key) VALUES (${wrongKey}) ON CONFLICT (key) DO NOTHING`);
     const rows = await tx.rows<{
@@ -723,7 +744,7 @@ async function countWrongCode(
       ORDER BY key FOR UPDATE`);
     const wrong = rows.find((r) => r.key === wrongKey);
     const ownRow = rows.find((r) => r.key === sessionKey);
-    if (wrong === undefined) return;
+    if (wrong === undefined) return false;
     // Only the factor, not the session: the guesser ends their own session
     // (signing out, or a code past its cap) while a code is being checked,
     // and the code must still be counted (S-054b review).
@@ -731,7 +752,7 @@ async function countWrongCode(
       SELECT 1 FROM public.second_factors f
       WHERE f.id = ${factorId}::uuid AND f.user_id = ${who.userId}::uuid
         AND f.state <> 'revoked'`);
-    if (live.length === 0) return;
+    if (live.length === 0) return true;
     // A counter forgotten after 30 days starts again, in a new round.
     const round = BigInt(wrong.told_round) + (wrong.fresh ? 0n : 1n);
     const before = wrong.fresh ? wrong.failures : 0;
@@ -749,6 +770,7 @@ async function countWrongCode(
         SET unexplained = ${share + 1}, told_round = ${String(round)}::bigint
         WHERE key = ${sessionKey}`);
     }
+    return true;
   });
 }
 
@@ -757,24 +779,30 @@ async function endSessionById(db: Queryable, sessionId: SessionId): Promise<void
   await db.execute(sql`DELETE FROM public.sessions WHERE id = ${sessionId}::uuid`);
 }
 
-/** After a wrong code (already counted): `invalid_code`, or the session ends. */
+/**
+ * After a wrong code (already counted for the waits): it goes on the
+ * unexplained counter, then `invalid_code`, or the session ends.
+ */
 async function wrongCode(
   db: Database,
   who: Who,
   counted: Counted,
   factorId: string,
 ): Promise<SecondStepRefusal> {
-  // The session's end first, so a count that fails can't keep it open.
-  const ended = who.sessionId !== undefined && counted.sessionFailures >= MAX_PENDING_CODE_FAILURES;
-  if (ended && who.sessionId !== undefined) await endSessionById(db, who.sessionId);
-  // Tried once more if it fails (S-054b review): the code was checked, so a
-  // count lost to a passing timeout would be a guess never told.
+  const ending = counted.sessionFailures >= MAX_PENDING_CODE_FAILURES ? who.sessionId : undefined;
   try {
-    await countWrongCode(db, who, counted, factorId);
-  } catch {
-    await countWrongCode(db, who, counted, factorId);
+    // Tried once more if it fails (S-054b review): the code was checked, so
+    // a count lost to a passing timeout would be a guess never told (S-054d).
+    try {
+      await countWrongCode(db, who, counted, factorId);
+    } catch {
+      await countWrongCode(db, who, counted, factorId);
+    }
+  } finally {
+    // The session ends whether or not the count went through.
+    if (ending !== undefined) await endSessionById(db, ending);
   }
-  return ended ? TOO_MANY : INVALID_CODE;
+  return ending !== undefined ? TOO_MANY : INVALID_CODE;
 }
 
 /**
