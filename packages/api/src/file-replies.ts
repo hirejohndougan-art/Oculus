@@ -242,6 +242,44 @@ export function fileReply(input: FileReplyInput): FileReply {
   return reply;
 }
 
+/** The start every OAI-PMH reply has: the XML declaration, then OAI-PMH's root element. */
+export const OAI_PMH_PROLOGUE =
+  '<?xml version="1.0" encoding="UTF-8"?>\n<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/"';
+
+/** The biggest OAI-PMH reply (16 MiB; a page of records is far smaller). */
+export const MAX_OAI_PMH_REPLY = 16 * 2 ** 20;
+
+/**
+ * An OAI-PMH 2.0 reply (T-050c, D-105): the protocol requires `text/xml`,
+ * which D-058 and S-025 refuse as active content everywhere else. Only
+ * the OAI-PMH writer (oai-pmh.ts) calls this, and the document must:
+ * start with `OAI_PMH_PROLOGUE` (so its root is OAI-PMH's namespace, never
+ * XHTML, SVG or XSLT), hold no other processing instruction (no
+ * `<?xml-stylesheet?>`) and no `<!` at all (no DOCTYPE, entity, CDATA or
+ * comment), and end with the root's end tag. It goes out as `text/xml;
+ * charset=utf-8`, inline, with the file replies' headers (nosniff, the
+ * sandboxing CSP that loads nothing, same-origin CORP) like any file reply,
+ * and nothing the handler set.
+ */
+export function oaiPmhReply(xml: string): FileReply {
+  if (typeof xml !== "string" || !xml.startsWith(OAI_PMH_PROLOGUE)) {
+    throw new Error("an OAI-PMH reply must start with its prologue");
+  }
+  const rest = xml.slice(OAI_PMH_PROLOGUE.length);
+  if (rest.includes("<?") || rest.includes("<!") || !/<\/OAI-PMH>\n?$/.test(rest)) {
+    throw new Error("an OAI-PMH reply holds no processing instruction or declaration");
+  }
+  const bytes = Buffer.from(xml, "utf8");
+  if (bytes.byteLength > MAX_OAI_PMH_REPLY) throw new Error("the OAI-PMH reply is too large");
+  const headers = Object.freeze({
+    "content-type": "text/xml; charset=utf-8",
+    "content-length": String(bytes.byteLength),
+  });
+  const reply: FileReply = Object.freeze({ headers, body: bytes });
+  made.add(reply);
+  return reply;
+}
+
 /** Why a streamed file reply stopped: `client` (the client went away) isn't a fault. */
 export type FileStreamEnd = "done" | "client" | "storage" | "length" | "deadline" | "closing";
 
