@@ -117,7 +117,10 @@ describe("the Shared with this site screen", () => {
     );
     expect(screen.getByText(new RegExp(`${SITE_1}.*${ORG_A}`))).toBeTruthy();
     await userEvent.click(screen.getByRole("button", { name: "Accept Invented lantern" }));
-    expect(await screen.findByText(/^Accepted\./)).toBeTruthy();
+    const done = await screen.findByText(/^Accepted\./);
+    // The result is announced and focused: the pressed button's row is gone.
+    expect(done.closest("[aria-live]")).toBeTruthy();
+    expect(document.activeElement?.contains(done)).toBe(true);
     const post = sent.find((s) => s.path === `/api/shares/${SHARE_1}/accept`);
     expect(post?.method).toBe("POST");
     expect(post?.headers["x-oculus-site"]).toBe(SITE_1);
@@ -148,7 +151,45 @@ describe("the Shared with this site screen", () => {
     expect(await screen.findByText(/^Removed\./)).toBeTruthy();
     expect(sent.some((s) => s.path === `/api/shares/${SHARE_2}/remove`)).toBe(true);
     await userEvent.click(screen.getByRole("button", { name: "Decline Invented lantern" }));
-    expect(await screen.findByText(/isn't open any more/)).toBeTruthy();
+    expect(await screen.findByText(/That offer isn't open any more/)).toBeTruthy();
+  });
+
+  it("sends one move however fast it is pressed, and says a removed item had ended", async () => {
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const sent = siteServer({
+      [OFFERS]: [200, { shares: [incoming(SHARE_1, "offered", "Invented lantern")] }],
+      [`POST /api/shares/${SHARE_1}/accept`]: [200, { share: { id: SHARE_1, state: "accepted" } }],
+    });
+    const fetcher = vi.mocked(fetch);
+    const real = fetcher.getMockImplementation();
+    fetcher.mockImplementation(async (input, init) => {
+      if (typeof input === "string" && input.endsWith("/accept")) await held;
+      return real === undefined ? new Response("{}") : real(input, init);
+    });
+    renderAt(SHARED);
+    const accept = await screen.findByRole("button", { name: "Accept Invented lantern" });
+    await userEvent.click(accept);
+    await userEvent.click(accept);
+    release();
+    expect(await screen.findByText(/^Accepted\./)).toBeTruthy();
+    expect(sent.filter((s) => s.path.endsWith("/accept"))).toHaveLength(1);
+    cleanup();
+    vi.unstubAllGlobals();
+    siteServer({
+      [OFFERS]: [200, { shares: [incoming(SHARE_2, "accepted", "Invented kettle")] }],
+      [`POST /api/shares/${SHARE_2}/remove`]: [422, { error: "invalid", issues: [] }],
+    });
+    renderAt(SHARED);
+    await userEvent.click(await screen.findByRole("button", { name: "Remove Invented kettle" }));
+    await userEvent.click(
+      within(await screen.findByRole("region", { name: /^Remove this item/ })).getByRole("button", {
+        name: "Remove",
+      }),
+    );
+    expect(await screen.findByText(/That item isn't shared with this site any more/)).toBeTruthy();
   });
 
   it("shows other people the accepted items, and says when they may not see them", async () => {
@@ -200,6 +241,18 @@ describe("a shared item", () => {
     expect(sent.some((s) => s.path.includes("not-an-id"))).toBe(false);
   });
 
+  it("isn't shown under a site it wasn't shared with", async () => {
+    siteServer({
+      [`GET /api/shares/${SHARE_2}`]: [
+        200,
+        { share: { ...incoming(SHARE_2, "accepted", "Invented kettle"), targetSiteId: SITE_2 } },
+      ],
+    });
+    renderAt(`${SHARED}/${SHARE_2}`);
+    expect(await screen.findByText(/isn't shared with this site any more/)).toBeTruthy();
+    expect(screen.queryByText("Invented kettle")).toBeNull();
+  });
+
   it("names fields readably", () => {
     expect(fieldLabel("date_made")).toBe("Date made");
     expect(fieldLabel("dateMade")).toBe("Date made");
@@ -236,19 +289,21 @@ describe("sharing on a record's screen", () => {
 
   async function panel() {
     return within(
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- the panel is a section
       (await screen.findByRole("heading", { name: "Sharing with other sites" })).closest(
         "section",
-      ) as HTMLElement,
+      )!,
     );
   }
 
   it("lists where it is shared, by ID for another organization, and withdraws after asking", async () => {
+    let withdrawn = false;
     const sent = recordServer("published", {
-      [`GET ${API}/shares`]: [
+      [`GET ${API}/shares`]: () => [
         200,
         {
           shares: [
-            mine,
+            withdrawn ? { ...mine, state: "withdrawn" } : mine,
             {
               ...mine,
               id: SHARE_2,
@@ -259,20 +314,30 @@ describe("sharing on a record's screen", () => {
           ],
         },
       ],
-      [`POST /api/shares/${SHARE_1}/withdraw`]: [200, { share: { ...mine, state: "withdrawn" } }],
+      [`POST /api/shares/${SHARE_1}/withdraw`]: () => {
+        withdrawn = true;
+        return [200, { share: { ...mine, state: "withdrawn" } }];
+      },
     });
     renderAt(PATH);
     const p = await panel();
     expect(
-      await p.findByText(new RegExp(`another organization \\(site ID ${B_SITE}`)),
+      await p.findByText(new RegExp(`another organization \\(site ID ${B_SITE}`), {
+        selector: "span",
+      }),
     ).toBeTruthy();
     expect(p.getByText(/Earlier shares \(1\)/)).toBeTruthy();
-    await userEvent.click(p.getByRole("button", { name: "Withdraw" }));
+    await userEvent.click(
+      p.getByRole("button", { name: new RegExp(`^Withdraw from .*${B_SITE}`) }),
+    );
     const dialog = await screen.findByRole("region", { name: "Stop sharing with that site?" });
     expect(sent.some((s) => s.path.endsWith("/withdraw"))).toBe(false);
     await userEvent.click(within(dialog).getByRole("button", { name: "Withdraw" }));
     expect(await p.findByText(/^Withdrawn\./)).toBeTruthy();
     expect(sent.find((s) => s.path === `/api/shares/${SHARE_1}/withdraw`)?.method).toBe("POST");
+    // The list is read again: the share is under earlier shares now.
+    expect(p.getByText("It isn't offered or shared to any other site.")).toBeTruthy();
+    expect(p.getByText(/Earlier shares \(2\)/)).toBeTruthy();
   });
 
   it("offers a published record by the other site's IDs, checking them first", async () => {
@@ -281,15 +346,10 @@ describe("sharing on a record's screen", () => {
       [`GET ${API}/shares`]: [200, { shares: [] }],
       [`POST ${API}/shares`]: () => {
         offered += 1;
-        return offered === 1
+        const code = ["", "already_shared", "unknown_site", "not_published"][offered - 1];
+        return code === ""
           ? [201, { share: { ...mine, state: "offered" } }]
-          : [
-              422,
-              {
-                error: "invalid",
-                issues: [{ path: [], code: "already_shared", message: "x" }],
-              },
-            ];
+          : [422, { error: "invalid", issues: [{ path: [], code, message: "x" }] }];
       },
     });
     renderAt(PATH);
@@ -311,6 +371,10 @@ describe("sharing on a record's screen", () => {
     await userEvent.type(p.getByLabelText("Site ID"), B_SITE);
     await userEvent.click(p.getByRole("button", { name: "Offer this record" }));
     expect(await p.findByText(/already offered or shared to that site/)).toBeTruthy();
+    for (const said of [/no such site under that organization/, /Publish it first/]) {
+      await userEvent.click(p.getByRole("button", { name: "Offer this record" }));
+      expect(await p.findByText(said)).toBeTruthy();
+    }
   });
 
   it("offers nothing while unpublished, and isn't shown to people who can't edit", async () => {

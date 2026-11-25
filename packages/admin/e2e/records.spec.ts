@@ -130,14 +130,13 @@ test("find a record, edit it, meet a conflict, publish, read its history and res
   const row = page.getByRole("row", { name: new RegExp(recordTitle) });
   await expect(row.getByText("Published")).toBeVisible();
 
-  // Items shared with the site (T-041e): none yet.
+  // Items shared with the site (T-041e): none yet, and the editor (who sees
+  // the whole site) may see them.
   await press(page, "Shared with this site", "link");
   await expect(
     page.getByRole("heading", { level: 1, name: "Shared with this site" }),
   ).toBeVisible();
-  await expect(
-    page.getByText(/Nothing is shared with this site yet|Only people who can see/),
-  ).toBeVisible();
+  await expect(page.getByText("Nothing is shared with this site yet.")).toBeVisible();
   await accessible(page, "Shared with this site");
 
   expect(errors).toEqual([]);

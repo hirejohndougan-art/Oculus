@@ -7,7 +7,7 @@
  * pages show, with its home site and organization named. The server decides
  * who sees what; a 403 is said in words.
  */
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { ApiError, problemText } from "../api";
 import { Button, Note, TextLink } from "../components/ui";
@@ -23,6 +23,18 @@ import {
   useSharedItems,
   type ShareMove,
 } from "./queries";
+
+/** A record kind in words; only the admin's own labels, never a prototype key. */
+function kindText(kind: string): string {
+  return Object.hasOwn(KIND_LABELS, kind) ? (KIND_LABELS[kind] ?? kind) : kind;
+}
+
+const ENDED: Readonly<Record<ShareMove, string>> = {
+  accept: "That offer isn't open any more: its home site may have withdrawn it.",
+  decline: "That offer isn't open any more: its home site may have withdrawn it.",
+  remove: "That item isn't shared with this site any more: its home site may have withdrawn it.",
+  withdraw: "That share had already ended.",
+};
 
 const DONE: Readonly<Record<ShareMove, string>> = {
   accept: "Accepted. The item is now listed under Shared with this site.",
@@ -66,7 +78,7 @@ function SharedTable(props: {
                     <TextLink href={href}>{share.item.title}</TextLink>
                   )}
                 </td>
-                <td>{KIND_LABELS[share.item.kind] ?? share.item.kind}</td>
+                <td>{kindText(share.item.kind)}</td>
                 <td>{homeText(share.item)}</td>
                 <td>{whenText(share.offeredAt)}</td>
                 {props.actions === undefined ? null : (
@@ -95,25 +107,37 @@ export function SharedWithSite(props: {
   const [busy, setBusy] = useState(false);
   const [removing, setRemoving] = useState<IncomingShare>();
 
+  // A ref, not only state: a second press before the re-render must not send twice.
+  const moving = useRef(false);
+  const statusRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    // The pressed button's row or the confirmation is gone: focus the result.
+    if (status !== undefined) statusRef.current?.focus();
+  }, [status]);
+
   async function move(share: IncomingShare, how: ShareMove) {
+    if (moving.current) return;
+    moving.current = true;
     setBusy(true);
-    setStatus(undefined);
+    let result: { tone: "green" | "amber"; text: string };
     try {
       await moveShare(props.siteId, share.id, how);
-      setStatus({ tone: "green", text: DONE[how] });
+      result = { tone: "green", text: DONE[how] };
     } catch (error) {
-      setStatus({
+      result = {
         tone: "amber",
         text:
           error instanceof ApiError && (error.status === 404 || error.status === 422)
-            ? "That offer isn't open any more: its home site may have withdrawn it."
+            ? ENDED[how]
             : problemText(error),
-      });
-    } finally {
-      setBusy(false);
-      setRemoving(undefined);
-      await refreshShares(queries, props.siteId);
+      };
     }
+    // Buttons stay disabled until the lists show the move.
+    await refreshShares(queries, props.siteId);
+    setRemoving(undefined);
+    setStatus(result);
+    setBusy(false);
+    moving.current = false;
   }
 
   const loadFailed = (error: unknown, retry: () => void) => (
@@ -233,11 +257,9 @@ export function SharedWithSite(props: {
           what its public pages show, read-only.
         </p>
       </div>
-      {status === undefined ? null : (
-        <Note tone={status.tone} alert={status.tone === "amber"}>
-          {status.text}
-        </Note>
-      )}
+      <div ref={statusRef} tabIndex={-1} aria-live="polite" aria-atomic="true">
+        {status === undefined ? null : <Note tone={status.tone}>{status.text}</Note>}
+      </div>
       <ConfirmPanel
         key={removing?.id ?? "closed"}
         isOpen={removing !== undefined}
@@ -257,7 +279,7 @@ export function SharedWithSite(props: {
           they would offer it again.
         </p>
       </ConfirmPanel>
-      <div aria-live="polite">{body}</div>
+      <div aria-busy={offers.isFetching || items.isFetching}>{body}</div>
     </>
   );
 }
@@ -284,6 +306,18 @@ export function SharedItemScreen(props: { readonly siteId: string; readonly shar
       </>
     );
   }
+  // A share accepted into another of the person's sites isn't this site's.
+  if (share.data.targetSiteId !== props.siteId || share.data.state !== "accepted") {
+    return (
+      <>
+        <h1 className={styles.pageTitle}>Shared item not found</h1>
+        <Note tone="amber">
+          There is no such shared item, or it isn't shared with this site any more.
+        </Note>
+        {back}
+      </>
+    );
+  }
   const item = share.data.item;
   const fields = Object.entries(item.fields).filter(([, v]) => valueText(v) !== "");
   return (
@@ -291,7 +325,7 @@ export function SharedItemScreen(props: { readonly siteId: string; readonly shar
       <div>
         <h1 className={styles.pageTitle}>{item.title}</h1>
         <p className={styles.lead}>
-          {KIND_LABELS[item.kind] ?? item.kind} shared by {homeText(item)}.
+          {kindText(item.kind)} shared by {homeText(item)}.
         </p>
       </div>
       <Note tone="blue">

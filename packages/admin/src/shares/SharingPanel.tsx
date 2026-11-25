@@ -7,7 +7,7 @@
  * organization are named; another organization's are shown by ID only,
  * since Oculus lists no other organization's sites.
  */
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { ApiError, api, problemText } from "../api";
 import { Button, Field, Note } from "../components/ui";
@@ -16,7 +16,7 @@ import { ConfirmPanel } from "../records/controls";
 import { issuesIn, whenText } from "../records/model";
 import styles from "../records/Records.module.css";
 import { SHARE_STATE_LABELS, cleanId, isId, isLive, type ShareSummary } from "./model";
-import { moveShare, recordSharesKey, refreshShares, useRecordShares } from "./queries";
+import { moveShare, refreshShares, useRecordShares } from "./queries";
 
 const OFFER_PROBLEMS: Readonly<Record<string, string>> = {
   unknown_site:
@@ -39,6 +39,12 @@ export function SharingPanel(props: {
   const [status, setStatus] = useState<{ tone: "green" | "amber"; text: string }>();
   const [busy, setBusy] = useState(false);
   const [withdrawing, setWithdrawing] = useState<ShareSummary>();
+  // A ref, not only state: a second press before the re-render must not send twice.
+  const sending = useRef(false);
+  const statusRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (status !== undefined) statusRef.current?.focus();
+  }, [status]);
 
   const where = (share: ShareSummary) => {
     const ours = me?.sites.find(
@@ -58,9 +64,11 @@ export function SharingPanel(props: {
       found.organization = "Paste the organization ID the other site's manager gave you.";
     if (!isId(site)) found.site = "Paste the site ID the other site's manager gave you.";
     setErrors(found);
-    setStatus(undefined);
     if (found.organization !== undefined || found.site !== undefined) return;
+    if (sending.current) return;
+    sending.current = true;
     setBusy(true);
+    let result: { tone: "green" | "amber"; text: string };
     try {
       await api(`/api/records/${encodeURIComponent(props.recordId)}/shares`, {
         method: "POST",
@@ -69,44 +77,52 @@ export function SharingPanel(props: {
       });
       setOrganizationId("");
       setSiteId("");
-      setStatus({
+      result = {
         tone: "green",
         text: "Offered. The other site's manager can now accept or decline it.",
-      });
-      await queries.invalidateQueries({ queryKey: recordSharesKey(props.recordId) });
+      };
+      await refreshShares(queries, site, props.recordId);
     } catch (error) {
       const code =
         error instanceof ApiError && error.status === 422
           ? issuesIn(error.body)[0]?.code
           : undefined;
-      setStatus({
+      result = {
         tone: "amber",
-        text: (code === undefined ? undefined : OFFER_PROBLEMS[code]) ?? problemText(error),
-      });
-    } finally {
-      setBusy(false);
+        text:
+          (code !== undefined && Object.hasOwn(OFFER_PROBLEMS, code)
+            ? OFFER_PROBLEMS[code]
+            : undefined) ?? problemText(error),
+      };
     }
+    setStatus(result);
+    setBusy(false);
+    sending.current = false;
   }
 
   async function withdraw(share: ShareSummary) {
+    if (sending.current) return;
+    sending.current = true;
     setBusy(true);
-    setStatus(undefined);
+    let result: { tone: "green" | "amber"; text: string };
     try {
       await moveShare(props.siteId, share.id, "withdraw");
-      setStatus({ tone: "green", text: "Withdrawn. That site no longer shows this record." });
+      result = { tone: "green", text: "Withdrawn. That site no longer shows this record." };
     } catch (error) {
-      setStatus({
+      result = {
         tone: "amber",
         text:
           error instanceof ApiError && error.status === 422
             ? "That share had already ended."
             : problemText(error),
-      });
-    } finally {
-      setBusy(false);
-      setWithdrawing(undefined);
-      await refreshShares(queries, props.siteId, props.recordId);
+      };
     }
+    // The record's list here, and the other site's lists if they are cached.
+    await refreshShares(queries, share.targetSiteId, props.recordId);
+    setWithdrawing(undefined);
+    setStatus(result);
+    setBusy(false);
+    sending.current = false;
   }
 
   const list = shares.data ?? [];
@@ -123,11 +139,9 @@ export function SharingPanel(props: {
         manager accepts. It sees only what the public site shows: never staff-only fields, notes or
         history.
       </p>
-      {status === undefined ? null : (
-        <Note tone={status.tone} alert={status.tone === "amber"}>
-          {status.text}
-        </Note>
-      )}
+      <div ref={statusRef} tabIndex={-1} aria-live="polite" aria-atomic="true">
+        {status === undefined ? null : <Note tone={status.tone}>{status.text}</Note>}
+      </div>
       <ConfirmPanel
         key={withdrawing?.id ?? "closed"}
         isOpen={withdrawing !== undefined}
@@ -171,7 +185,7 @@ export function SharingPanel(props: {
                     setWithdrawing(share);
                   }}
                 >
-                  Withdraw
+                  Withdraw from {where(share)}
                 </Button>
               </span>
             </li>

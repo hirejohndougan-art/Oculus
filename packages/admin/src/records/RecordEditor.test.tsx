@@ -46,6 +46,8 @@ function server(record: Route, routes: Record<string, Route> = {}) {
     "GET /api/records?limit=25": [200, { records: [], next: null }],
     [`GET ${API}`]: record,
     [`GET ${API}/versions?limit=100`]: [200, VERSIONS_REPLY],
+    // The sharing panel's list (T-041e; tested in shares/Shares.test.tsx).
+    [`GET ${API}/shares`]: [200, { shares: [] }],
     "POST /api/records/check": [200, { issues: [] }],
     ...routes,
   });
