@@ -276,7 +276,12 @@ describe("seeing people", () => {
     type Seen = Record<string, unknown> & { userId: string };
     const asManager = (await call("GET", "/api/people", { as: "manager" })).json.people as Seen[];
     const lone = asManager.find((p) => p.userId === newcomer);
-    expect(lone).toEqual({ userId: newcomer, displayName: "Invented Newcomer", roles: [], nameOnly: true });
+    expect(lone).toEqual({
+      userId: newcomer,
+      displayName: "Invented Newcomer",
+      roles: [],
+      nameOnly: true,
+    });
     const withRole = asManager.find((p) => p.userId === w.cataloger);
     expect(typeof withRole?.email).toBe("string");
     expect(withRole?.nameOnly).toBeUndefined();
@@ -497,6 +502,92 @@ describe("granting and revoking roles (D-072)", () => {
     });
     expect(more.status).toBe(201);
     expect(await grantCount(lone)).toBe(2);
+  });
+});
+
+describe("who a site manager sees, and may grant to (T-064 review)", () => {
+  const body = (role: string, siteId: string | null = w.a1, scope: string | null = null) => ({
+    role,
+    siteId,
+    scope,
+  });
+
+  it("a manager of every site doesn't see, and can't grant to, someone whose only role is on every site", async () => {
+    const boss = await w.member(w.a, "Boss");
+    const target = await w.member(w.a, "Target");
+    expect(
+      (
+        await call("POST", `/api/people/${boss}/roles`, {
+          as: "root",
+          body: body("site_manager", null),
+        })
+      ).status,
+    ).toBe(201);
+    expect(
+      (
+        await call("POST", `/api/people/${target}/roles`, {
+          as: "root",
+          body: body("read_only", null),
+        })
+      ).status,
+    ).toBe(201);
+    tokens.boss = (await fullSession(w.db, boss, w.a)).token;
+
+    const listed = (await call("GET", "/api/people", { as: "boss" })).json.people as {
+      userId: string;
+    }[];
+    expect(listed.map((p) => p.userId)).not.toContain(target);
+    const missing = await call("GET", `/api/people/${MADE_UP}`, { as: "boss" });
+    expect(shape(await call("GET", `/api/people/${target}`, { as: "boss" }))).toEqual(
+      shape(missing),
+    );
+    const refused = await call("POST", `/api/people/${target}/roles`, {
+      as: "boss",
+      body: body("reviewer"),
+    });
+    const refusedMissing = await call("POST", `/api/people/${MADE_UP}/roles`, {
+      as: "boss",
+      body: body("reviewer"),
+    });
+    expect(refused.status).toBe(404);
+    expect(shape(refused)).toEqual(shape(refusedMissing));
+    expect(await grantCount(target)).toBe(1);
+    // Someone with a role on one of the sites is seen in full and can be given more.
+    const onSite = (await call("GET", `/api/people/${helper}`, { as: "boss" })).json.person as {
+      email?: string;
+    };
+    expect(typeof onSite.email).toBe("string");
+  });
+
+  it("a member whose only role is site manager on the manager's site is seen in full and can be granted to", async () => {
+    const peer = await w.member(w.a, "Peer");
+    expect(
+      (await call("POST", `/api/people/${peer}/roles`, { as: "root", body: body("site_manager") }))
+        .status,
+    ).toBe(201);
+    const seen = (await call("GET", `/api/people/${peer}`, { as: "manager" })).json.person as {
+      email?: string;
+      nameOnly?: boolean;
+    };
+    expect(typeof seen.email).toBe("string");
+    expect(seen.nameOnly).toBeUndefined();
+    const more = await call("POST", `/api/people/${peer}/roles`, {
+      as: "manager",
+      body: body("reviewer"),
+    });
+    expect(more.status).toBe(201);
+  });
+
+  it("a role-less target is a missing person before its scope or its role is looked at", async () => {
+    const lone = await w.member(w.a, "Solo");
+    const missingPerson = shape(
+      await call("POST", `/api/people/${MADE_UP}/roles`, { as: "manager", body: body("reviewer") }),
+    );
+    for (const b of [body("reviewer", w.a1, MADE_UP), body("reviewer", w.a1, a1Record)]) {
+      const r = await call("POST", `/api/people/${lone}/roles`, { as: "manager", body: b });
+      expect(shape(r)).toEqual(missingPerson);
+    }
+    expect(await grantCount(lone)).toBe(0);
   });
 });
 

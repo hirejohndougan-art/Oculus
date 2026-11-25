@@ -98,7 +98,15 @@ import {
   sql,
 } from "@oculus/db";
 import { actorUser, notPermitted, readAccess } from "./access.js";
-import { grantRoleIn, hasOnly, managedSites, own, revokeRoleIn, type Runner } from "./admin.js";
+import {
+  grantRoleIn,
+  hasOnly,
+  holdsRoleOn,
+  managedSites,
+  own,
+  revokeRoleIn,
+  type Runner,
+} from "./admin.js";
 import type { ServiceContext, ServiceResult } from "./service.js";
 
 /** The context of a change to a person: also the acting session's token (never stored or logged). */
@@ -333,20 +341,22 @@ function summary(
 
 /**
  * The member if the viewer may see them (a system manager: any member; a
- * site manager: one with a role on a site they manage, or with no role).
+ * site manager: one with a role on a site they manage, or with no role), and
+ * whether they hold no role at all, decided from the same read of their
+ * grants (T-064 review: never from a second read that can differ).
  */
 async function visibleMember(
   tx: Queryable,
   organizationId: OrganizationId,
   viewer: Viewer,
   userId: unknown,
-): Promise<Member | undefined> {
+): Promise<(Member & { readonly roleless: boolean }) | undefined> {
   if (!isUserId(userId)) return undefined;
   const member = await readMember(tx, organizationId, userId);
   if (member === undefined || viewer.system) return member;
   const all = await memberGrants(tx, organizationId, userId);
-  if (all.length === 0) return member;
-  return all.some((g) => g.siteId !== null && viewer.sites.includes(g.siteId)) ? member : undefined;
+  if (all.length === 0) return { ...member, roleless: true };
+  return holdsRoleOn(all, new Set(viewer.sites)) ? { ...member, roleless: false } : undefined;
 }
 
 /** `undefined` if the acting session entered password and second step in the last 10 minutes. */
@@ -507,11 +517,9 @@ export function peopleOperations(
           ids,
           v.system ? {} : { siteIds: v.sites, exceptRole: "site_manager" },
         );
-        // Who holds no role at all (T-064): one more query, for site managers only.
-        const any = v.system ? grants : await membersGrants(tx, who.organizationId, ids);
+        // Who holds no role at all comes from the listing's own statement (T-064).
         for (const member of listed.members) {
-          const roleless = (any.get(member.userId) ?? []).length === 0;
-          people.push(summary(member, grants.get(member.userId) ?? [], v, roleless));
+          people.push(summary(member, grants.get(member.userId) ?? [], v, member.roleless));
         }
         return {
           ok: true,
@@ -533,8 +541,7 @@ export function peopleOperations(
         const member = await visibleMember(tx, who.organizationId, v, userId);
         if (member === undefined) return unknownPerson();
         const roles = await grantsFor(tx, who.organizationId, v, member.userId);
-        const roleless =
-          !v.system && (await memberGrants(tx, who.organizationId, member.userId)).length === 0;
+        const roleless = !v.system && member.roleless;
         const shown = summary(member, roles, v, roleless);
         return {
           ok: true,

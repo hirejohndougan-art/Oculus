@@ -204,11 +204,25 @@ interface Who {
 }
 
 /**
+ * Whether a site manager sees a member with their details (D-084, T-064):
+ * the member holds a role on one of the sites the manager manages (`managed`,
+ * from `managedSites`; "all" meaning every site of the organization). A role
+ * on every site (`siteId` null) is no site's, so it doesn't count. The one
+ * rule for the people list, a person's page and a grant's target.
+ */
+export function holdsRoleOn(
+  grants: readonly { readonly siteId: SiteId | null }[],
+  managed: "all" | ReadonlySet<SiteId>,
+): boolean {
+  return grants.some((g) => g.siteId !== null && (managed === "all" || managed.has(g.siteId)));
+}
+
+/**
  * Whether the actor may already see the member as a grant's target (John,
- * Q-10, T-064): a system manager anyone; a site manager only someone holding
- * a role on a site they manage (on every site, for one managing every site).
- * Anyone else, the role-less included, answers as a missing person: a site
- * manager can't make someone visible by giving them a small role.
+ * Q-10, T-064): a system manager anyone; a site manager only someone
+ * `holdsRoleOn` a site they manage. Anyone else, the role-less included,
+ * answers as a missing person: a site manager can't make someone visible by
+ * giving them a small role.
  */
 async function seenBy(
   tx: Queryable,
@@ -217,10 +231,7 @@ async function seenBy(
   userId: UserId,
 ): Promise<boolean> {
   if (access.systemManager) return true;
-  const managed = managedSites(access);
-  return (await memberGrants(tx, org, userId)).some((g) =>
-    managed === "all" ? true : g.siteId !== null && managed.has(g.siteId),
-  );
+  return holdsRoleOn(await memberGrants(tx, org, userId), managedSites(access));
 }
 
 /** Grants a role in the caller's transaction (`grantRole`'s rules; the people service adds its log). */
