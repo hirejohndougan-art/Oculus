@@ -292,6 +292,8 @@ export {
   deleteExpiredSessions,
   deleteOldPasswordResets,
   runCleanup,
+  WRONG_CODE_MEMORY_SECONDS,
+  UNEXPLAINED_TOLD_AFTER_SECONDS,
   NO_SESSION,
   MAX_LISTED_SESSIONS,
   SESSION_TABLE_PRIVILEGES,

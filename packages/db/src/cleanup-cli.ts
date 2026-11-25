@@ -39,7 +39,7 @@ export async function runCleanupCli(
   try {
     const done = await runCleanup(db);
     out(
-      `Done: ${String(done.sessions)} ended session(s) and ${String(done.signInThrottles)} old sign-in counter(s) deleted; ${String(done.secondStepThrottles)} old wrong-code counter(s) deleted; ${String(done.passwordResets)} old reset link(s) deleted.`,
+      `Done: ${String(done.sessions)} ended session(s) and ${String(done.signInThrottles)} old sign-in counter(s) deleted; ${String(done.secondStepThrottles)} old wrong-code counter(s) deleted; ${String(done.secondStepAlerts)} alert(s) written for wrong codes in sign-ins that never finished; ${String(done.passwordResets)} old reset link(s) deleted.`,
     );
     return 0;
   } catch (error) {
