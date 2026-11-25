@@ -810,7 +810,21 @@ export async function effectiveEntries(
   });
   if (!effective.ok) return undefined;
   const view = publicView(effective.value);
-  const shown = new Map((view?.entries ?? []).map((e) => [e.key, JSON.stringify(e.value)]));
+  // The public view holds values as core publishes them: a number without its
+  // type, a place without its record ID, a rights statement without its note
+  // (effective.ts). Compare in that form, keys sorted; any other difference
+  // (a place name that may not show, a list item left out) reads as staff.
+  const canonical = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (typeof value !== "object" || value === null) return value;
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([k]) => k !== "type" && k !== "recordId" && k !== "note")
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([k, v]) => [k, canonical(v)]);
+    return Object.fromEntries(entries);
+  };
+  const same = (value: unknown): string => JSON.stringify(canonical(value));
+  const shown = new Map((view?.entries ?? []).map((e) => [e.key, same(e.value)]));
   return Object.freeze(
     effective.value.entries.map((entry) =>
       Object.freeze({
@@ -821,7 +835,7 @@ export async function effectiveEntries(
         visibility:
           entry.inTemplate &&
           entry.visibility === "public" &&
-          shown.get(entry.key) === JSON.stringify(entry.value)
+          shown.get(entry.key) === same(entry.value)
             ? "public"
             : "staff",
       }),

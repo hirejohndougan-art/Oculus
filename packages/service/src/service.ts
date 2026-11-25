@@ -2697,7 +2697,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
             const fields: EadExportField[] = [];
             // Each value as core's effective record and public view see it
             // (effective.ts): staff-only unless the public view of this unit
-            // holds it as it is. Over-marking is safe; under-marking never.
+            // holds it as core publishes it. Over-marking is safe; under-marking never.
             // The top unit's inherited values too, only from units the person
             // may view: visibleInherited locks the chain (FOR SHARE) and checks
             // it first, so the entries read next come from that same chain.

@@ -10,6 +10,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { newRecordId, newSiteId, readEad, type RecordId } from "@oculus/core";
 import {
   grantPublicReaderRole,
+  insertIdentifierType,
   insertTemplateVersion,
   openDatabase,
   readPublicFindingAid,
@@ -493,5 +494,102 @@ describe("a place value the public view leaves out (T-059b fourth review, D-048)
     expect(a.accessPoints.some((p) => p.label.includes("PRIVATE"))).toBe(false);
     const notes = a.notes.filter((n) => n.paragraphs.some((p) => p.includes("PRIVATE DONOR")));
     for (const n of notes) expect(n.internal).toBe(true);
+  }, 60_000);
+});
+
+describe("ordinary public values stay public in a staff file (T-059b fifth review)", () => {
+  it("writes a public number as unitid, a linked place as geogname, and only a rights note as staff-only", async () => {
+    ok(
+      await w.db.transaction((q) =>
+        insertIdentifierType(q, {
+          organizationId: w.a,
+          key: "call_number",
+          label: "Call number",
+          uniqueness: "all_time",
+          public: true,
+        }),
+      ),
+    );
+    ok(
+      await insertTemplateVersion(w.db, {
+        key: "t-pl2",
+        organizationId: w.a,
+        label: "pl",
+        appliesTo: ["place"],
+        fields: [field("rights", "rights")],
+      }),
+    );
+    ok(
+      await insertTemplateVersion(w.db, {
+        key: "t-u",
+        organizationId: w.a,
+        label: "u",
+        appliesTo: ["archival_unit"],
+        fields: [
+          field("reference_code", "identifier", { label: "Reference code" }),
+          field("places", "place", { label: "Places", repeatable: true }),
+          field("rights", "rights"),
+        ],
+      }),
+    );
+    const root = { organizationId: w.a, actor: actorOf(w.root), siteId: w.a1 };
+    const place = ok(
+      await w.service.createRecord(root, {
+        kind: "place",
+        title: "Invented PLACE",
+        templateKey: "t-pl2",
+        fields: { rights: { uri: INC } },
+      }),
+    ).record.id;
+    const u = ok(
+      await w.service.createRecord(root, {
+        kind: "archival_unit",
+        level: "fonds",
+        title: "Invented U",
+        templateKey: "t-u",
+        fields: { rights: { uri: INC } },
+      }),
+    ).record.id;
+    ok(
+      await w.service.saveIdentifiers(root as never, u as never, {
+        current: [{ type: "call_number", value: "MS-0001", primary: true }],
+        former: [],
+      }),
+    );
+    const cur = ok(await w.service.readRecord({ organizationId: w.a, actor: actorOf(w.root) }, u));
+    ok(
+      await w.service.updateRecord(
+        root,
+        u,
+        {
+          kind: "archival_unit",
+          level: "fonds",
+          title: "Invented U",
+          templateKey: "t-u",
+          fields: {
+            reference_code: { type: "call_number", value: "MS-0001" },
+            places: [{ label: "Linked PLACE", recordId: place }, { label: "Plain PLACE" }],
+            rights: { uri: INC, note: "STAFF rights note" },
+          },
+        },
+        { expectedVersion: cur.version },
+      ),
+    );
+    const got = ok(
+      await w.service.exportFindingAid(
+        { organizationId: w.a, actor: actorOf(w.cataloger), siteId: w.a1 },
+        u,
+        {},
+      ),
+    );
+    const read = readEad(got.xml);
+    if (!read.ok) throw new Error(JSON.stringify(read.issues));
+    const a = read.value.findingAid.archdesc;
+    expect(a.identifiers).toEqual(["MS-0001"]);
+    expect(read.value.findingAid.header.id).toBe("MS-0001");
+    expect(a.accessPoints.map((p) => p.label).sort()).toEqual(["Linked PLACE", "Plain PLACE"]);
+    const rights = a.notes.filter((n) => n.kind === "userestrict");
+    expect(rights.find((n) => n.paragraphs.includes("STAFF rights note"))?.internal).toBe(true);
+    expect(rights.find((n) => n.paragraphs.includes(INC))?.internal).toBe(false);
   }, 60_000);
 });
