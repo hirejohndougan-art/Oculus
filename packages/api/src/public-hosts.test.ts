@@ -1,4 +1,4 @@
-// The server's hosts (T-050a, D-089): with an admin origin, `/api` answers on
+// The server's hosts (T-050a, D-090): with an admin origin, `/api` answers on
 // the admin's host only (any other host gets the unknown path's 404, before
 // any route, cookie or session is looked at); in production the admin's
 // origin is required; `OCULUS_PUBLIC_SITES` is checked against the install's

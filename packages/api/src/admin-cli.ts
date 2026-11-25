@@ -3,7 +3,7 @@
  * (admin-server.ts) for the database named by `OCULUS_DATABASE_URL`, on
  * `OCULUS_HOST` (default 127.0.0.1) and `OCULUS_PORT` (default 3000), with
  * the public sites' reader connection from `OCULUS_PUBLIC_DATABASE_URL`
- * when it is set (T-050a, D-089). The
+ * when it is set (T-050a, D-090). The
  * URL, the secret key and every other value stay out of the output; a
  * refusal to start prints only its reason and exits 1.
  *

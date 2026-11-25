@@ -58,7 +58,7 @@
  *    files read into memory at startup, with the admin's own CSP
  *    (`ADMIN_SECURITY_HEADERS`) in place of the API's; every other reply
  *    keeps `SECURITY_HEADERS`.
- * 11. Hosts (T-050a, D-089), when `options.admin` is given: every `/api`
+ * 12. Hosts (T-050a, D-090), when `options.admin` is given: every `/api`
  *    path is answered only on the admin's own origin; on any other host (a
  *    public site's, an unlisted one) it is `404 not_found`, the reply an
  *    unknown path gets, before any route or cookie is looked at. So a public
@@ -405,7 +405,7 @@ function safeLogCall(this: unknown, args: unknown[], method: (...args: unknown[]
   method.call(this, fields, message);
 }
 
-/** `/api` and everything under it: the staff and sign-in routes (rule 11). */
+/** `/api` and everything under it: the staff and sign-in routes (rule 12). */
 export function isApiPath(path: string): boolean {
   return path === "/api" || path.startsWith("/api/");
 }
@@ -501,7 +501,7 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
     routes.add(route.method, route.url);
   });
 
-  // Rule 3 first: nothing else looks at a refused path. Then rule 11: with
+  // Rule 3 first: nothing else looks at a refused path. Then rule 12: with
   // an admin origin, `/api` is the admin host's only.
   app.addHook("onRequest", (request, _reply, done) => {
     const refusal = requestRefusal(request, origins);

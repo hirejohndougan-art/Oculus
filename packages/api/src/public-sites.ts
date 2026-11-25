@@ -1,6 +1,6 @@
 /**
  * Which host serves which public site, and the connection public sites read
- * through (T-050a, D-089, D-034, D-080).
+ * through (T-050a, D-090, D-034, D-080).
  *
  * `OCULUS_PUBLIC_SITES` maps each public site's origin to its site ID,
  * comma-separated: `https://archive.example.org=<site id>,…`. Each origin

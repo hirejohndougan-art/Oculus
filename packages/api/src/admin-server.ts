@@ -18,7 +18,7 @@
  *   sender). In development, the default only logs that a link was made,
  *   never the token or the address (D-068's secrecy rule);
  * - `OCULUS_ADMIN_ORIGIN` is set but isn't one of `OCULUS_ORIGINS`, or the
- *   admin build can't be read; in production, it isn't set (T-050a, D-089:
+ *   admin build can't be read; in production, it isn't set (T-050a, D-090:
  *   the staff API is then answered on the admin's host only);
  * - `OCULUS_PUBLIC_SITES` is wrong (public-sites.ts), names a site that
  *   doesn't exist, or is set without a public reader connection
@@ -173,7 +173,7 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   const adminOrigin = env[ADMIN_ORIGIN_ENV];
   if (production && (adminOrigin === undefined || adminOrigin === "")) {
     throw new Error(
-      `refusing to start: ${ADMIN_ORIGIN_ENV} must name the admin's own origin in production, so the staff API answers on that host only (D-052, D-089).`,
+      `refusing to start: ${ADMIN_ORIGIN_ENV} must name the admin's own origin in production, so the staff API answers on that host only (D-052, D-090).`,
     );
   }
   // Public hosts and their reader (T-050a): checked now, so a wrong
