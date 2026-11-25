@@ -10,6 +10,14 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Gate: PASS · tests_passing 4390 (was 4376) · npm audit clean
 - Next: S-034 (desktop follow-ups), or the job pool
 
+## 2026-11-24 22:20 CT — manual (Chat C) — T-050a Hosts for the admin and the public sites
+- Result: done (T-050 split into T-050a to T-050c)
+- What changed: server rule 12, `/api` on the admin's host only; `OCULUS_ADMIN_ORIGIN` required in production; `OCULUS_PUBLIC_SITES` and the public reader pool (`OCULUS_PUBLIC_DATABASE_URL`, `publicDb`) checked at startup. New `packages/api/src/public-sites.ts`.
+- Decisions: D-090
+- Review: one independent round, nothing blocking; fixed the admin's hostname on another port passing as a public site, a site ID held by two organizations, a reader of another database, and shutdown closing only one pool; added an https-behind-proxy test.
+- Gate: PASS · tests_passing 4391 (was 4376) · npm audit clean. Main then moved by roadmap text only (4 lines); merged, with the format and lint checks re-run. A first run timed out once in `second-factor.test.ts` › "locks user rows before factor rows" under load (passes alone 3 of 3; this change doesn't touch the database package), like S-029.
+- Next: S-026 (T-050b needs stored Dublin Core mappings first)
+
 ## 2026-11-24 22:15 CT — Chat B — S-030 Regression tests for restore's retry path
 - Result: done
 - What changed: four tests that save a record from another session just before a restore takes its row lock: retry after the attempts with nothing written, success on the next attempt, a conflict when it keeps moving, and 503 `retry` over HTTP followed by a restore that goes through. Checked that they fail without the retry check.
