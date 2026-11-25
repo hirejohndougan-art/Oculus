@@ -34,13 +34,13 @@ Double-click `scripts\start-oculus.cmd` in the Oculus folder. To make a desktop 
 
 ## Keep these safe
 
-- **Your database.** On a Mac or Linux, `npm run db:backup -- <file>` makes a checked backup (see the README). **On Windows that command doesn't work yet** (S-034). Until it does, use pgAdmin, which comes with PostgreSQL: right-click the `oculus` database, choose **Backup…**, pick the **Custom** format and a file name, and keep the file somewhere safe (a USB drive or cloud folder) with a copy of the secret key below.
+- **Your database.** Oculus backs it up by itself before every update that changes it, into `%APPDATA%\Oculus\backups`. To make a backup any time, in a Command Prompt in the Oculus folder: `npm run db:backup -- C:\path\to\my.oculus-backup` with `set OCULUS_DATABASE_URL=postgresql://oculus_owner@localhost:5432/oculus` first. Copy backups somewhere safe (a USB drive or cloud folder) with a copy of the secret key below.
 - **The secret key** in `%APPDATA%\Oculus\secret-key`, made the first time Oculus starts. Two-step sign-in depends on it, and database backups don't include it. Copy it somewhere safe, like a USB drive kept with your backups. Once anyone has set up two-step sign-in, Oculus refuses to start without that key rather than make a new one that would lock everyone out: put it back from your backup. If it's truly lost, ask for help before doing anything else.
 - **Your password and recovery codes.** Without email the password reset is the command in "If you forget your password" below, and the recovery codes Oculus shows at your first sign-in are the only way in if you lose your phone. Keep both somewhere safe.
 
 ## Updating
 
-Close Oculus first. Then, in the Oculus folder, `git pull`, and double-click `start-oculus.cmd` as usual (it needs the internet for a minute to fetch updates). It rebuilds Oculus and updates the database by itself.
+Close Oculus first. Then, in the Oculus folder, `git pull`, and double-click `start-oculus.cmd` as usual (it needs the internet for a minute to fetch updates). If the update changes the database, Oculus backs it up first and says where the backup is. If it can't make the backup, it changes nothing and says why. It rebuilds Oculus and updates the database by itself.
 
 ## If you forget your password
 
@@ -58,6 +58,7 @@ Everything is optional. In `desktop.json`:
 
 - `"databaseUrl"`: the database account Oculus works as (or set `OCULUS_DATABASE_URL`, which wins and is then used for everything).
 - `"ownerDatabaseUrl"`: the account that owns the database, used only to update it and check it at start (or `OCULUS_DATABASE_OWNER_URL`).
+- `"backupBeforeUpdate"`: `false` to skip the backup before an update changes the database (not recommended).
 - `"port"`: the port Oculus uses on this computer (default 4780; another free one if that's taken).
 
 Other settings: `OCULUS_DESKTOP_HOME` moves the settings folder (only to a folder no one else on the computer can open, since the secret key lives there), `OCULUS_DESKTOP_BROWSER` names the browser to open, and `OCULUS_SECRET_KEY` replaces the key file.

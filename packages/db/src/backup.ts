@@ -35,7 +35,7 @@
 import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
 import { createHash, randomBytes } from "node:crypto";
-import { constants as fsConstants, existsSync } from "node:fs";
+import { constants as fsConstants, existsSync, readdirSync } from "node:fs";
 import { link, lstat, open, rm, unlink, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import type { Writable } from "node:stream";
@@ -70,7 +70,7 @@ import {
   type MigrationFile,
 } from "./migrate.js";
 import { sql } from "./sql.js";
-import { trackGroup, trackPath } from "./backup-cleanup.js";
+import { trackGroup, trackPath, trackProcess } from "./backup-cleanup.js";
 
 export type { TableSummary, ObjectSummaries } from "./backup-catalog.js";
 
@@ -130,12 +130,45 @@ function errorCode(error: unknown): string {
 // ---------------------------------------------------------------------------
 // Finding and running pg_dump and pg_restore.
 
-/** The directory holding `tools`, from PG_BIN or `pg_config --bindir`. */
+/** A tool's file name: `pg_dump.exe` on Windows (S-034b, D-100). */
+export function executable(tool: string, platform: NodeJS.Platform = process.platform): string {
+  return platform === "win32" ? `${tool}.exe` : tool;
+}
+
+/**
+ * The bin folders of PostgreSQL installed by the EDB installer on Windows
+ * (`%ProgramFiles%\\PostgreSQL\\<major>\\bin`), newest major first: it puts
+ * none of them on PATH, so `pg_config` isn't found there.
+ */
+export function windowsInstallBins(env: Record<string, string | undefined>): string[] {
+  const roots = [env.ProgramFiles, env["ProgramFiles(x86)"], env.ProgramW6432].filter(
+    (r): r is string => r !== undefined && r !== "",
+  );
+  const found: { dir: string; major: number }[] = [];
+  for (const root of new Set(roots)) {
+    const base = join(root, "PostgreSQL");
+    let names: string[];
+    try {
+      names = readdirSync(base);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      if (/^\d+(\.\d+)?$/.test(name))
+        found.push({ dir: join(base, name, "bin"), major: Number(name) });
+    }
+  }
+  return found.sort((a, b) => b.major - a.major).map((f) => f.dir);
+}
+
+/** The directory holding `tools`, from PG_BIN or `pg_config --bindir` (or, on Windows, the usual install folders). */
 export async function findTools(
   env: Record<string, string | undefined>,
   tools: readonly string[],
+  platform: NodeJS.Platform = process.platform,
 ): Promise<string> {
-  const usable = (dir: string): boolean => tools.every((tool) => existsSync(join(dir, tool)));
+  const usable = (dir: string): boolean =>
+    tools.every((tool) => existsSync(join(dir, executable(tool, platform))));
   const wanted = tools.join(" and ");
   const fromEnv = env.PG_BIN;
   if (fromEnv !== undefined && fromEnv !== "") {
@@ -146,7 +179,11 @@ export async function findTools(
     const dir = (await run("pg_config", ["--bindir"], toolPathEnvironment(env))).trim();
     if (usable(dir)) return dir;
   } catch {
-    // Not installed: reported below.
+    // Not on PATH: the Windows install folders, then the error below.
+  }
+  if (platform === "win32") {
+    const dir = windowsInstallBins(env).find(usable);
+    if (dir !== undefined) return dir;
   }
   throw new BackupError(
     "no_tools",
@@ -155,7 +192,17 @@ export async function findTools(
 }
 
 function toolPathEnvironment(env: Record<string, string | undefined>): Record<string, string> {
-  return { PATH: env.PATH ?? "/usr/bin:/bin", LANG: "C", LC_ALL: "C" };
+  const out: Record<string, string> = {
+    PATH: env.PATH ?? env.Path ?? "/usr/bin:/bin",
+    LANG: "C",
+    LC_ALL: "C",
+  };
+  // Windows programs need SystemRoot to start (its DLLs are found through it).
+  for (const key of ["SystemRoot", "SYSTEMROOT", "windir"]) {
+    const value = env[key];
+    if (value !== undefined) out[key] = value;
+  }
+  return out;
 }
 
 function run(cmd: string, args: string[], env: Record<string, string>): Promise<string> {
@@ -174,7 +221,9 @@ export function toolMajor(versionText: string): number | undefined {
 }
 
 async function toolVersion(bin: string, tool: string): Promise<{ text: string; major: number }> {
-  const text = (await run(join(bin, tool), ["--version"], toolPathEnvironment(process.env))).trim();
+  const text = (
+    await run(join(bin, executable(tool)), ["--version"], toolPathEnvironment(process.env))
+  ).trim();
   const major = toolMajor(text);
   if (major === undefined) {
     throw new BackupError("no_tools", `Could not read the version of ${join(bin, tool)}.`);
@@ -252,13 +301,30 @@ export async function writeAll(stream: Writable, chunk: Buffer): Promise<void> {
  * tool can't keep the pipes open. While it runs, the group is registered for
  * the synchronous clean-up on exit (backup-cleanup.ts).
  */
+/**
+ * How tools are run: under the POSIX watchdog (above), or directly, where
+ * there is no `sh` or process group (Windows; S-034b, D-100). Run directly,
+ * a tool's input is its stdin, stopping it terminates it (Windows has no
+ * SIGTERM; an unfinished pg_restore rolls back, its one transaction never
+ * committed), and if this process is killed outright the tool may run on
+ * until it ends by itself: its server session then finishes or rolls back,
+ * as for a lost connection.
+ */
+export type ToolRunner = "watchdog" | "direct";
+
+export function defaultToolRunner(platform: NodeJS.Platform = process.platform): ToolRunner {
+  return platform === "win32" ? "direct" : "watchdog";
+}
+
 async function runTool(
   cmd: string,
   args: string[],
   env: Record<string, string>,
   signal: AbortSignal | undefined,
   io: ToolIo = {},
+  runner: ToolRunner = defaultToolRunner(),
 ): Promise<ToolResult> {
+  if (runner === "direct") return runToolDirect(cmd, args, env, signal, io);
   const child = spawn("/bin/sh", ["-c", WATCHDOG, "oculus-tool", cmd, ...args], {
     env,
     detached: true,
@@ -339,6 +405,95 @@ async function runTool(
     signal?.removeEventListener("abort", onAbort);
     if (forceTimer !== undefined) clearTimeout(forceTimer);
     child.stdin?.destroy();
+  }
+}
+
+/** Runs a tool directly (no shell, no process group): see `ToolRunner`. */
+async function runToolDirect(
+  cmd: string,
+  args: string[],
+  env: Record<string, string>,
+  signal: AbortSignal | undefined,
+  io: ToolIo,
+): Promise<ToolResult> {
+  const child = spawn(cmd, args, {
+    env,
+    windowsHide: true,
+    stdio: [
+      io.feed === undefined ? "ignore" : "pipe",
+      io.sink === undefined ? "ignore" : "pipe",
+      "pipe",
+    ],
+  });
+  const untrack = child.pid === undefined ? () => undefined : trackProcess(child.pid);
+  let done = false;
+  const kill = (sig: NodeJS.Signals): void => {
+    if (done) return;
+    try {
+      child.kill(sig);
+    } catch {
+      // Already gone.
+    }
+  };
+  const closed = new Promise<number | null>((resolvePromise) => {
+    child.on("error", () => {
+      resolvePromise(null);
+    });
+    child.on("close", (code) => {
+      resolvePromise(code);
+    });
+  });
+  let forceTimer: NodeJS.Timeout | undefined;
+  const onAbort = (): void => {
+    kill("SIGTERM");
+    forceTimer = setTimeout(() => {
+      kill("SIGKILL");
+    }, KILL_GRACE_MS);
+    forceTimer.unref();
+  };
+  if (signal?.aborted === true) onAbort();
+  else signal?.addEventListener("abort", onAbort, { once: true });
+  const input = child.stdin;
+  input?.on("error", () => undefined);
+  let stderr = "";
+  child.stderr?.setEncoding("utf8");
+  child.stderr?.on("data", (chunk: string) => {
+    if (stderr.length < 64 * 1024) stderr += chunk;
+  });
+  try {
+    const feeding = (async () => {
+      if (input === null || io.feed === undefined) return;
+      try {
+        await io.feed(input);
+      } catch (error) {
+        if (error instanceof BackupError) {
+          kill("SIGKILL");
+          throw error;
+        }
+        // The tool stopped reading (it failed): its exit code says why.
+      } finally {
+        input.end();
+      }
+    })();
+    const reading = (async () => {
+      const { sink } = io;
+      if (sink === undefined || child.stdout === null) return;
+      try {
+        for await (const chunk of child.stdout as AsyncIterable<Buffer>) await sink(chunk);
+      } catch (error) {
+        kill("SIGKILL");
+        throw new BackupError("write_failed", `Could not write the backup (${errorCode(error)}).`);
+      }
+    })();
+    const outcomes = await Promise.allSettled([feeding, reading]);
+    const code = await closed;
+    for (const outcome of outcomes) if (outcome.status === "rejected") throw outcome.reason;
+    return { code, stderr };
+  } finally {
+    done = true;
+    untrack();
+    signal?.removeEventListener("abort", onAbort);
+    if (forceTimer !== undefined) clearTimeout(forceTimer);
   }
 }
 
@@ -591,6 +746,8 @@ export interface BackupOptions {
   /** Stops the backup: the tool is ended and nothing is left behind. */
   signal?: AbortSignal;
   log?: (message: string) => void;
+  /** How pg_dump runs (default: `direct` on Windows, `watchdog` elsewhere; tests choose). */
+  toolRunner?: ToolRunner;
 }
 
 export interface BackupResult {
@@ -723,7 +880,7 @@ export async function backup(options: BackupOptions): Promise<BackupResult> {
     let bytes = 0;
     const out = handle;
     const result = await runTool(
-      join(bin, "pg_dump"),
+      join(bin, executable("pg_dump")),
       [
         "--format=custom",
         "--no-password",
@@ -739,6 +896,7 @@ export async function backup(options: BackupOptions): Promise<BackupResult> {
           await out.write(chunk);
         },
       },
+      options.toolRunner,
     );
     if (stopped(signal)) throw interrupted("no backup was written.");
     if (result.code !== 0 || bytes === 0) {
@@ -800,6 +958,8 @@ export interface RestoreOptions {
    * another cluster. Grants are then not checked afterwards; set them up again.
    */
   noPrivileges?: boolean;
+  /** How pg_restore runs (default: `direct` on Windows, `watchdog` elsewhere; tests choose). */
+  toolRunner?: ToolRunner;
   env?: Record<string, string | undefined>;
   tempDir?: string;
   /**
@@ -1056,7 +1216,7 @@ export async function restore(options: RestoreOptions): Promise<RestoreResult> {
 
     log(`Restoring a backup of PostgreSQL ${manifest.serverVersion} made ${manifest.createdAt}...`);
     const restored = await runTool(
-      join(bin, "pg_restore"),
+      join(bin, executable("pg_restore")),
       [
         "--no-owner",
         ...(options.noPrivileges === true ? ["--no-privileges"] : []),
@@ -1068,6 +1228,7 @@ export async function restore(options: RestoreOptions): Promise<RestoreResult> {
       space.env,
       signal,
       { feed: (input) => streamArchive(file, manifest, input, signal) },
+      options.toolRunner,
     );
     let stoppedAfterCommit = false;
     if (restored.code !== 0) {

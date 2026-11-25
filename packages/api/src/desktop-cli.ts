@@ -26,11 +26,18 @@
  * 4 another start is still starting or busy (nothing done; a message to read).
  */
 import { spawn as nodeSpawn } from "node:child_process";
+import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+  backup,
+  BackupError,
   checkWriterConnection,
+  defaultMigrationsDir,
+  pendingMigrations,
+  readMigrations,
+  type AppliedMigration,
   databaseBeforeSetup,
   grantWriterRole,
   migrate,
@@ -172,6 +179,48 @@ async function sealingKeyIds(db: Database): Promise<string[]> {
   return rows.map((r) => r.id);
 }
 
+/**
+ * If the code has migrations the database hasn't (an update), backs the
+ * database up first into the settings folder's `backups` (S-034b, D-100),
+ * so an update can be undone with `db:restore`. Returns false, having said
+ * why, if the backup couldn't be made: nothing is migrated then.
+ */
+async function backupBeforeUpdate(
+  db: Database,
+  connectionString: string,
+  folder: string,
+  env: Env,
+  out: Line,
+  err: Line,
+): Promise<boolean> {
+  let pending: number;
+  try {
+    const applied = await db.rows<AppliedMigration>(
+      sql`SELECT name, sha256 FROM public.oculus_migrations ORDER BY name`,
+    );
+    pending = pendingMigrations(await readMigrations(defaultMigrationsDir()), applied).length;
+  } catch {
+    // migrate() reports what's wrong with the migrations itself.
+    return true;
+  }
+  if (pending === 0) return true;
+  const dir = join(folder, "backups");
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const file = join(dir, `before-update-${stamp}.oculus-backup`);
+  out(`This update changes Oculus's database (${String(pending)} change(s)). Backing it up first…`);
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    await backup({ connectionString, file, env: { ...env } });
+  } catch (error) {
+    err(
+      `Couldn't back up the database before updating it${error instanceof BackupError ? `: ${error.message}` : "."} Nothing was changed. To update without a backup, add "backupBeforeUpdate": false to desktop.json.`,
+    );
+    return false;
+  }
+  out(`Backup saved: ${file}`);
+  return true;
+}
+
 /** Whether two connections reach the same database on the same running server. */
 async function sameDatabase(a: Database, b: Database): Promise<boolean> {
   const where = sql`SELECT current_database() AS d, pg_postmaster_start_time()::text AS t,
@@ -222,6 +271,7 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
   let url: string;
   let ownerUrl: string | undefined;
   let ownerFromSettings: boolean;
+  let backupFirst: boolean;
   let wantedPort: number;
   try {
     folder = settingsFolder(platform, env, options.home ?? homedir());
@@ -240,6 +290,7 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
     ownerFromSettings = ownerUrl !== undefined && ownerUrl === settings.ownerDatabaseUrl;
     secrets.push(...passwordOf(url), ...(ownerUrl === undefined ? [] : passwordOf(ownerUrl)));
     wantedPort = settings.port ?? DEFAULT_DESKTOP_PORT;
+    backupFirst = settings.backupBeforeUpdate !== false;
     const fromEnv = env.OCULUS_PORT;
     if (fromEnv !== undefined && fromEnv !== "") {
       const port = Number(fromEnv);
@@ -379,6 +430,10 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
         return 1;
       }
       throw error;
+    }
+    if (backupFirst) {
+      const made = await backupBeforeUpdate(checker, ownerUrl ?? url, folder, env, out, err);
+      if (!made) return 1;
     }
     try {
       const result = await migrate({ connectionString: ownerUrl ?? url, log: out });

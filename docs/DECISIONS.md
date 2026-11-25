@@ -1294,3 +1294,14 @@ Builds T-057 on D-088 (the launcher), D-067 (one writer, `grantWriterRole`, `che
 
 **Rejected:** rewriting the npm scripts without `exec` (D-064's signal tests pin `exec`, and schedulers call node directly anyway); a reset that also removes two-step sign-in (that's an admin's reset, T-038, never a self-service one); writing the new hash with SQL directly (it would skip ending sessions, the counters and the password rules).
 
+## D-100 — Backups on Windows (tools run directly, found in the installer's folders) and a backup before every desktop update (2026-11-25, Chat D, S-034b)
+D-064 runs pg_dump and pg_restore under a POSIX `sh` watchdog in their own process group, so backups and restores failed on Windows (D-099's note).
+
+- **Two ways to run a tool** (`ToolRunner` in backup.ts): `watchdog` (D-064, unchanged, the default everywhere but Windows) and `direct` (the default on Windows): the tool is spawned with no shell, its input is its stdin, stopping it terminates it (an unfinished pg_restore's one transaction never commits, so it rolls back), and it's registered for the exit clean-up by its PID (`trackProcess`). What `direct` gives up: if this process is killed outright, the tool may run on until it ends by itself; its server session then finishes or rolls back, as for a lost connection. `backup` and `restore` take `toolRunner` so the tests run the `direct` path on Linux too (round trip, stop mid-backup, stop mid-restore).
+- **Finding the tools on Windows:** `.exe` names, and when `PG_BIN` isn't set and `pg_config` isn't on PATH (the EDB installer adds neither), `%ProgramFiles%\\PostgreSQL\\<major>\\bin`, newest major first. `SystemRoot` is passed to `--version`'s minimal environment, which Windows programs need to start.
+- **A backup before every desktop update:** when the code has migrations the database hasn't, the launcher backs up (as the owner) into the settings folder's `backups` (0700) before migrating, and if the backup fails, migrates nothing and says why. `"backupBeforeUpdate": false` in `desktop.json` turns it off.
+
+**Rejected:** PowerShell or a job object as a Windows watchdog (more moving parts than the risk warrants for one person's desktop; a job object needs native code); asking before each update instead of backing up (the person would usually just press Enter); skipping the backup when the tools are missing (an update could then lose data with no way back).
+
+**Sources:** Node.js `child_process` documentation (`spawn`, `subprocess.kill` on Windows: TerminateProcess, signals not delivered); EDB's Windows installer layout (`C:\\Program Files\\PostgreSQL\\<major>\\bin`).
+
