@@ -7,7 +7,7 @@
 // guards, and the writer grants D-068 lists. Every person, address and
 // password is invented (example.org is reserved for examples, RFC 2606).
 import { createHash } from "node:crypto";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   newInvitationToken,
   newOrganizationId,
@@ -74,6 +74,11 @@ async function ready(): Promise<void> {
   })();
   ({ db, admin } = await setup);
 }
+
+// Warm the setup before the first test, under the suite's longer hook limit
+// (U-008). A failure stays in `setup`, so with no database each test still
+// fails on its own when it calls ready().
+beforeAll(() => ready().catch(() => undefined));
 
 afterAll(async () => {
   const done = await setup?.catch(() => undefined);

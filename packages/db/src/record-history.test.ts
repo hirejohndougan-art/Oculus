@@ -1,7 +1,7 @@
 // Comparing and restoring record versions (record-versions.ts compareVersions,
 // record-restore.ts, T-030) and edit-conflict protection (updateRecord's
 // conflict, T-031), D-065. Conflicts are tested with two connections.
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   createRecord,
   newOrganizationId,
@@ -66,6 +66,11 @@ async function ready(): Promise<void> {
   })();
   ({ db, other } = await setup);
 }
+
+// Warm the setup before the first test, under the suite's longer hook limit
+// (U-008). A failure stays in `setup`, so with no database each test still
+// fails on its own when it calls ready().
+beforeAll(() => ready().catch(() => undefined));
 
 afterAll(async () => {
   const done = await setup?.catch(() => undefined);

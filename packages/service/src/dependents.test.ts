@@ -6,7 +6,7 @@
 // only to edits that can change what a published record below shows; and
 // the below-locks are taken only once an unlocked look says the edit is
 // allowed, at the version the person saw, and changes inheritance.
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   newOrganizationId,
   newRecordId,
@@ -85,6 +85,11 @@ async function ready(): Promise<void> {
   s = await setup;
   service = createService(s.writer, { now: () => NOW });
 }
+
+// Warm the setup before the first test, under the suite's longer hook limit
+// (U-008). A failure stays in `setup`, so with no database each test still
+// fails on its own when it calls ready().
+beforeAll(() => ready().catch(() => undefined));
 
 function as(url: string, role: string): Database {
   const u = new URL(url);

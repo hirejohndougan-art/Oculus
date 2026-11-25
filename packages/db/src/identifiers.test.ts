@@ -4,7 +4,7 @@
 // organization only, also when two saves race; auto-numbering never gives a
 // number out twice; and direct SQL can't move rows, forge a rule or point
 // across organizations (D-019, D-061).
-import { afterAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   STANDARD_PRESETS,
   createRecord,
@@ -57,6 +57,11 @@ async function ready(): Promise<void> {
   })();
   db = (await setup).db;
 }
+
+// Warm the setup before the first test, under the suite's longer hook limit
+// (U-008). A failure stays in `setup`, so with no database each test still
+// fails on its own when it calls ready().
+beforeAll(() => ready().catch(() => undefined));
 
 afterAll(async () => {
   const done = await setup?.catch(() => undefined);
