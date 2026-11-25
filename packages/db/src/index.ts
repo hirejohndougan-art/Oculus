@@ -503,6 +503,17 @@ export {
 } from "./accessions.js";
 export type { SaveOutcome, StoredAccession, StoredDonorContact } from "./accessions.js";
 export {
+  STORAGE_TABLE_PRIVILEGES,
+  storageNow,
+  insertStorageMove,
+  lockStorage,
+  readStorage,
+  saveStorageLevels,
+  saveStorageLocation,
+  storageUses,
+} from "./storage.js";
+export type { StorageSaveOutcome, StoredDefinition, StoredStorage } from "./storage.js";
+export {
   SYSTEM_EVENT_KINDS,
   SYSTEM_EVENT_TABLE_PRIVILEGES,
   insertSystemEvent,
