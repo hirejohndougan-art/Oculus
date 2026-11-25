@@ -51,7 +51,6 @@ import {
   findStoredFileById,
   insertFileStoreBinding,
   insertStoredFileEvent,
-  purgeCandidates,
   databaseIdentity,
   readFileStoreLease,
   lockFileStoreLease,
@@ -178,8 +177,11 @@ export interface PurgeEntry extends PurgeCandidate {
   readonly organizationId: string;
 }
 
-/** Why the purge was refused. */
-export type PurgeProblem = "no_store" | "not_bound" | "lease_mismatch";
+/**
+ * Why the purge was refused. Only `not_available` for now: purging is off
+ * until it can be made safe (D-086, fifth review; S-043).
+ */
+export type PurgeProblem = "not_available";
 
 /** Why the files folder can't be used with this database (`bindFileStore`). */
 export type FileStoreProblem = "no_store" | "other_install" | "marker_missing" | "not_empty";
@@ -200,8 +202,8 @@ export interface FileOperations {
   ): Promise<ServiceResult<AttachedFile>>;
   /**
    * Removes one file from an asset: the same rule as attaching (the edit
-   * permission where the asset is, `If-Match`). The copy on disk goes at
-   * the next sweep, once no row names its content.
+   * permission where the asset is, `If-Match`). The copy on disk stays:
+   * nothing in this version deletes a stored copy (D-086).
    */
   removeFile(
     context: ServiceContext,
@@ -211,8 +213,8 @@ export interface FileOperations {
   ): Promise<ServiceResult<{ readonly removed: true }>>;
   /**
    * A job, not a person's operation (no context): removes temporary files
-   * older than `incomingMaxAgeMs` and, for each organization under its file
-   * lock, the stored copies no row names. Run at startup and on a timer.
+   * older than `incomingMaxAgeMs` in this database's organizations, and
+   * empties their trash; never a stored copy. Run at startup and on a timer.
    */
   sweepFiles(incomingMaxAgeMs: number): Promise<FileSweep>;
   /**
@@ -258,11 +260,11 @@ export interface FileOperations {
    */
   renewFileLease(): Promise<boolean>;
   /**
-   * The operator's purge (`npm run files:purge`; D-086): the copies this
-   * database may delete (see `purgeCandidates`), and with `apply` deletes
-   * them (only those listed in `only`, `<organization>/<sha256>`, when
-   * given). Refused unless the folder is this install's and its lease
-   * epoch is this database's (which then moves on).
+   * The operator's purge: not available in this version (D-086, fifth
+   * review). A copy of the database whose epoch still matched the marker
+   * could purge content production had attached again since, so removed
+   * files keep their space until a later version adds a safe purge (S-043).
+   * Always refused with `not_available`; nothing is read or changed.
    */
   purgeFiles(options: { readonly apply: boolean; readonly only?: readonly string[] }): Promise<
     | {
@@ -275,8 +277,9 @@ export interface FileOperations {
    * `npm run files:adopt`: makes this database the folder's own again after
    * a restore or a copy: a new epoch, this database's identity in the
    * marker, and a `since` before which every file event counts as unknown
-   * to the purge. Refused while the marker has changed within the last hour
-   * (another database still uses the folder).
+   * to a later purge. Deletes nothing and enables nothing that deletes.
+   * Refused while the marker has changed within `ADOPT_QUIET_MS` (another
+   * database still uses the folder).
    */
   adoptFileStore(): Promise<
     | { readonly ok: true }
@@ -310,8 +313,14 @@ function refusal(path: (string | number)[], code: string, message: string): Serv
 
 const NO_STORE = refusal(["files"], "files_unavailable", "Files can't be stored on this server.");
 
-/** How long the marker must have stood still before `adoptFileStore`: an hour (D-086). */
-export const ADOPT_QUIET_MS = 60 * 60_000;
+/** How often a running server moves the folder's lease on: hourly (D-086). */
+export const FILE_LEASE_RENEW_MS = 60 * 60_000;
+
+/**
+ * How long the marker must have stood still before `adoptFileStore`: three
+ * renewals, so a server still using the folder has surely shown itself.
+ */
+export const ADOPT_QUIET_MS = 3 * FILE_LEASE_RENEW_MS;
 
 /** A marker, waiting briefly while another server is writing one (its temporary file exists). */
 async function markerSettled(store: FileStore): Promise<StoreMarker | undefined> {
@@ -469,7 +478,7 @@ export function fileOperations(
    * database's current one, a new epoch is committed here and then put in
    * the marker; `true`. Otherwise (another database uses the folder, or
    * this one was restored or copied) nothing here changes, the marker gets
-   * an epoch no database holds, so neither side can purge until an
+   * an epoch no database holds, so neither side's lease matches until an
    * operator runs `files:adopt`, and `false`. A mismatch is looked at again
    * twice a second apart first: another server of this database may be
    * between its commit and its rename.
@@ -577,6 +586,9 @@ export function fileOperations(
               { id: fileId, recordId, sha256: received.sha256, size: received.size },
               who.actor,
             );
+            // A copy already there shows its last use in its own times (by
+            // the file system's clock): a later purge relies on it (S-043).
+            await store.touch(who.organizationId, received.sha256);
             return { ok: true, value: true };
           },
         );
@@ -616,7 +628,9 @@ export function fileOperations(
               received.sha256,
             );
             if (existing !== undefined) {
-              // The copy on disk was placed when that row was made.
+              // The copy on disk was placed when that row was made; touched,
+              // as every attach touches it.
+              await store.touch(who.organizationId, received.sha256);
               return { ok: true, value: Object.freeze({ file: existing, created: false }) };
             }
             if (!(await organizationHasContent(tx, who.organizationId, received.sha256))) {
@@ -639,6 +653,7 @@ export function fileOperations(
             await insertStoredFileEvent(tx, who.organizationId, "attached", file, who.actor);
             // Last, still under the file lock: the bytes at their content path.
             await store.place(received);
+            await store.touch(who.organizationId, received.sha256);
             return { ok: true, value: Object.freeze({ file, created: true }) };
           },
         );
@@ -713,7 +728,14 @@ export function fileOperations(
         // database between its two steps, a crash between them (the marker
         // names this database), or another install's folder.
         held = await waitFor(() => readFileStoreBinding(db));
-        if (held === undefined && marker.database === identity && marker.epoch !== undefined) {
+        // Only with a readable system identifier: `-:<oid>` alone could be
+        // another cluster's database with the same OID (fifth review).
+        if (
+          held === undefined &&
+          !identity.startsWith("-:") &&
+          marker.database === identity &&
+          marker.epoch !== undefined
+        ) {
           held = await firstBinding(marker.storeId, marker.epoch, identity);
         }
       }
@@ -769,56 +791,9 @@ export function fileOperations(
       return Object.freeze({ incoming, contents, skipped: 0, unknown: 0, failed, unbound: false });
     },
 
-    async purgeFiles(purgeOptions) {
-      if (store === undefined) return { ok: false, problem: "no_store" };
-      const held = await readFileStoreBinding(db);
-      const marker = await store.readMarker().catch(() => undefined);
-      if (held === undefined || marker?.storeId !== held)
-        return { ok: false, problem: "not_bound" };
-      store.bind(held);
-      // The lease first: refused unless the folder's epoch is this
-      // database's, which then moves on (here, then in the marker).
-      if (!(await renewLease())) return { ok: false, problem: "lease_mismatch" };
-      const lease = await readFileStoreLease(db);
-      const only = purgeOptions.only === undefined ? undefined : new Set(purgeOptions.only);
-      const onDisk = await store.organizations();
-      const known = await existingOrganizations(db, onDisk);
-      const found: PurgeEntry[] = [];
-      let deleted = 0;
-      for (const organizationId of onDisk) {
-        if (!known.has(organizationId)) continue;
-        // Decided under the organization's file lock, moved aside there in
-        // one rename each, deleted after the lock is released.
-        const listed = await db.transaction(async (tx) => {
-          await lockOrganizationFiles(tx, organizationId);
-          const contents = await store.listContents(organizationId);
-          const here: PurgeEntry[] = [];
-          for (let i = 0; i < contents.hashes.length; i += 1000) {
-            const batch = contents.hashes.slice(i, i + 1000);
-            for (const c of await purgeCandidates(
-              tx,
-              organizationId,
-              batch,
-              lease?.since ?? null,
-            )) {
-              here.push(Object.freeze({ organizationId, ...c }));
-            }
-          }
-          if (purgeOptions.apply) {
-            for (const entry of here) {
-              if (only !== undefined && !only.has(`${organizationId}/${entry.sha256}`)) continue;
-              await store.trash(organizationId, entry.sha256);
-              // Its thumbnails (M-003) go with its bytes, by the same
-              // decision and only then: never from what the folder holds.
-              await store.trashThumbnails(organizationId, entry.sha256);
-            }
-          }
-          return here;
-        });
-        found.push(...listed);
-        if (purgeOptions.apply) deleted += await store.emptyTrash(organizationId);
-      }
-      return { ok: true, value: Object.freeze({ candidates: Object.freeze(found), deleted }) };
+    purgeFiles() {
+      // Off until S-043 (see the interface): refused before anything is read.
+      return Promise.resolve({ ok: false, problem: "not_available" });
     },
 
     async adoptFileStore() {

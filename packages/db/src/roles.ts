@@ -548,6 +548,8 @@ export const PUBLIC_READER_FUNCTIONS: readonly string[] = Object.freeze([
   "public.public_dublin_core_mapping(uuid, uuid, uuid)",
   // T-034e (D-103): an organization's local day, for the accession register.
   "public.organization_local_day(uuid)",
+  // T-041f (D-111): where an item shared into a public site lives.
+  "public.shared_record_home(uuid, uuid, uuid)",
 ]);
 
 /**

@@ -840,7 +840,22 @@ export interface PublicRecordOptions {
    * through `public_dublin_core_mapping`, which the public reader may call.
    */
   readonly mappings?: readonly DublinCoreMapping[];
+  /**
+   * The `statement_timeout` (milliseconds) each of the read's statements
+   * runs under (S-037), so one slow snapshot can't hold a public reader
+   * connection as long as it takes: past it the read throws (SQLSTATE
+   * 57014, `isDatabaseTimeout`). A read is three statements that can take
+   * time (the snapshot, the organization's local day and the mapping), so
+   * its database work is about three times this at most. Default `PUBLIC_READ_TIME_LIMIT_MS`; a whole number
+   * from 1 to `MAX_PUBLIC_READ_TIME_LIMIT_MS`.
+   */
+  readonly timeLimitMs?: number;
 }
+
+/** `readPublicRecord`'s default time limit per statement (S-037). */
+export const PUBLIC_READ_TIME_LIMIT_MS = 5_000;
+/** The largest time limit `readPublicRecord` takes. */
+export const MAX_PUBLIC_READ_TIME_LIMIT_MS = 60_000;
 
 /** The answer for a record that isn't published, doesn't exist or is another organization's. */
 const NOT_AVAILABLE: readonly Issue[] = Object.freeze([
@@ -944,12 +959,31 @@ export async function readPublicRecord(
   }
   const baseUrl = ownValue(options, "baseUrl");
   const mappings = ownValue(options, "mappings");
+  const givenLimit = ownValue(options, "timeLimitMs");
+  const timeLimitMs = givenLimit === undefined ? PUBLIC_READ_TIME_LIMIT_MS : givenLimit;
   if (typeof baseUrl !== "string" || (mappings !== undefined && !Array.isArray(mappings))) {
-    return refused([], "invalid_options", "Give { baseUrl, mappings? }.");
+    return refused([], "invalid_options", "Give { baseUrl, mappings?, timeLimitMs? }.");
+  }
+  if (
+    typeof timeLimitMs !== "number" ||
+    !Number.isInteger(timeLimitMs) ||
+    timeLimitMs < 1 ||
+    timeLimitMs > MAX_PUBLIC_READ_TIME_LIMIT_MS
+  ) {
+    return refused(
+      ["timeLimitMs"],
+      "invalid_options",
+      `timeLimitMs must be a whole number from 1 to ${String(MAX_PUBLIC_READ_TIME_LIMIT_MS)}.`,
+    );
   }
   return db.transaction(async (tx) => {
     // One snapshot for every read below, and nothing written.
     await tx.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`);
+    // S-037: each statement below may take at most this long (local to the
+    // transaction, so the pooled connection keeps its own setting after).
+    await tx.execute(
+      sql`SELECT pg_catalog.set_config('statement_timeout', ${String(timeLimitMs)}, true)`,
+    );
     const read = await publicRecordIn(
       tx,
       organizationId,
@@ -959,6 +993,114 @@ export async function readPublicRecord(
       mappings as readonly unknown[] | undefined,
     );
     return read.ok ? { ok: true, value: read.value.output } : read;
+  });
+}
+
+/** Where a shared item lives (T-041f, D-111): its home organization and site, by ID and name. */
+export interface SharedHome {
+  readonly organizationId: OrganizationId;
+  readonly siteId: SiteId;
+  readonly organizationName: string;
+  readonly siteName: string;
+}
+
+/** A shared item's public output on a second site, and where it comes from. */
+export interface SharedPublicRecord {
+  readonly output: PublicOutput;
+  readonly home: SharedHome;
+}
+
+/** How a public site asks for a shared item's output (`readSharedPublicRecord`). */
+export interface SharedPublicRecordOptions {
+  /**
+   * The URL the item's home site publishes records under, ending in `/`:
+   * the item's own URL and its links are its home site's (one identity per
+   * record, D-111). Called once, with the home organization and site.
+   */
+  readonly baseUrlFor: (home: SharedHome) => string;
+  /** As `PublicRecordOptions.timeLimitMs` (S-037): each statement's time limit. */
+  readonly timeLimitMs?: number;
+}
+
+/**
+ * The public output (D-016) of a record accepted into one of the
+ * organization's sites from another site, possibly another organization's
+ * (D-074, D-094; T-041f, D-111): exactly what the record's home site
+ * shows the public (`readPublicRecord` for the home organization and site,
+ * its stored mapping included), with the home site and organization named.
+ * Only while the share is accepted, the record is public on its home site,
+ * and it isn't already the site's own item (`shared_record_home`, 0036);
+ * otherwise exactly `not_available`, as `readPublicRecord` answers, so a
+ * public caller can't tell a shared item that ended from one never shared.
+ *
+ * Read in one Repeatable Read, read-only transaction (the share and the
+ * output from one moment), through SECURITY DEFINER functions only, so the
+ * public reader (D-080) needs no table privilege. It writes nothing.
+ */
+export async function readSharedPublicRecord(
+  db: Database,
+  organizationId: OrganizationId,
+  siteId: SiteId,
+  recordId: RecordId,
+  options: SharedPublicRecordOptions,
+): Promise<Validated<SharedPublicRecord>> {
+  if (!isOrganizationId(organizationId) || !isSiteId(siteId) || !isRecordId(recordId)) {
+    return { ok: false, issues: NOT_AVAILABLE };
+  }
+  const baseUrlFor = ownValue(options, "baseUrlFor");
+  const givenLimit = ownValue(options, "timeLimitMs");
+  const timeLimitMs = givenLimit === undefined ? PUBLIC_READ_TIME_LIMIT_MS : givenLimit;
+  if (typeof baseUrlFor !== "function") {
+    return refused([], "invalid_options", "Give { baseUrlFor, timeLimitMs? }.");
+  }
+  if (
+    typeof timeLimitMs !== "number" ||
+    !Number.isInteger(timeLimitMs) ||
+    timeLimitMs < 1 ||
+    timeLimitMs > MAX_PUBLIC_READ_TIME_LIMIT_MS
+  ) {
+    return refused(
+      ["timeLimitMs"],
+      "invalid_options",
+      `timeLimitMs must be a whole number from 1 to ${String(MAX_PUBLIC_READ_TIME_LIMIT_MS)}.`,
+    );
+  }
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`);
+    // S-037: each statement may take at most this long, as readPublicRecord's.
+    await tx.execute(
+      sql`SELECT pg_catalog.set_config('statement_timeout', ${String(timeLimitMs)}, true)`,
+    );
+    const [found] = await tx.rows<{ home: Record<string, unknown> | null }>(sql`
+      SELECT public.shared_record_home(${organizationId}::uuid, ${siteId}::uuid,
+                                       ${recordId}::uuid) AS home`);
+    const raw = found?.home ?? null;
+    if (raw === null) return { ok: false, issues: NOT_AVAILABLE };
+    const homeOrg = raw.organizationId;
+    const homeSite = raw.siteId;
+    const orgName = raw.organizationName;
+    const siteName = raw.siteName;
+    if (
+      !isOrganizationId(homeOrg) ||
+      !isSiteId(homeSite) ||
+      typeof orgName !== "string" ||
+      typeof siteName !== "string"
+    ) {
+      return { ok: false, issues: NOT_AVAILABLE };
+    }
+    const home: SharedHome = Object.freeze({
+      organizationId: homeOrg,
+      siteId: homeSite,
+      organizationName: orgName,
+      siteName,
+    });
+    const baseUrl: unknown = (baseUrlFor as (h: SharedHome) => unknown)(home);
+    if (typeof baseUrl !== "string") {
+      return refused([], "invalid_options", "baseUrlFor must give a URL.");
+    }
+    const read = await publicRecordIn(tx, homeOrg, homeSite, recordId, baseUrl, undefined);
+    if (!read.ok) return read;
+    return { ok: true, value: Object.freeze({ output: read.value.output, home }) };
   });
 }
 

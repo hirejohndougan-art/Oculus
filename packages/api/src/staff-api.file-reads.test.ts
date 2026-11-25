@@ -14,7 +14,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -626,7 +625,7 @@ describe("thumbnails", () => {
     rmSync(cFolder);
   });
 
-  it("goes with its bytes: only the operator's purge removes them, with the copy", async () => {
+  it("are never deleted on their own: not by removal, the sweep or a purge (none ships yet)", async () => {
     const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented removable photograph"));
     const body = makeJpeg(90, 60);
     const id = await add(asset, body, "removable.jpg");
@@ -636,20 +635,12 @@ describe("thumbnails", () => {
     ).toBe(200);
     const thumb = (size: string) =>
       join(filesDir, w.a, "thumbnails", size, sha(body).slice(0, 2), `${sha(body)}.v1.jpg`);
-    expect(existsSync(thumb("small"))).toBe(true);
     const removed = await send(`/api/records/${asset}/files/${id}`, {
       as: "cataloger",
       method: "DELETE",
       headers: { "if-match": '"v1"' },
     });
     expect(removed.status).toBe(200);
-    // Removing deletes nothing on disk, nor does the automatic sweep.
-    expect(existsSync(thumb("small"))).toBe(true);
-    const sweeper = createService(w.db, { files: store });
-    expect(await sweeper.purgeFiles({ apply: false })).toMatchObject({ ok: true });
-    expect(await sweeper.sweepFiles(3600_000)).toMatchObject({ unbound: false, failed: 0 });
-    expect(existsSync(thumb("small"))).toBe(true);
-    expect(existsSync(store.pathFor(w.a, sha(body)))).toBe(true);
     // Eight days later (moved back as the owner, the append-only trigger off
     // inside this transaction only and back on ALWAYS).
     await w.db.transaction(async (q) => {
@@ -663,25 +654,16 @@ describe("thumbnails", () => {
         sql`ALTER TABLE public.stored_file_events ENABLE ALWAYS TRIGGER stored_file_events_append_only`,
       );
     });
-    // The sweep still never touches the copy or its thumbnails.
+    const sweeper = createService(w.db, { files: store });
     expect(await sweeper.sweepFiles(0)).toMatchObject({ unbound: false, failed: 0 });
+    expect(await sweeper.purgeFiles({ apply: true })).toEqual({
+      ok: false,
+      problem: "not_available",
+    });
+    // The copy and both thumbnails are all still there.
+    expect(existsSync(store.pathFor(w.a, sha(body)))).toBe(true);
     expect(existsSync(thumb("small"))).toBe(true);
-    // The purge deletes the copy and, by the same decision, its thumbnails.
-    const done = await sweeper.purgeFiles({ apply: true, only: [`${w.a}/${sha(body)}`] });
-    if (!done.ok) throw new Error(done.problem);
-    expect(done.value.deleted).toBeGreaterThanOrEqual(1);
-    // Nothing left in the trash either.
-    expect(existsSync(join(filesDir, w.a, "trash"))).toBe(true);
-    expect(readdirSync(join(filesDir, w.a, "trash"))).toEqual([]);
-    expect(existsSync(store.pathFor(w.a, sha(body)))).toBe(false);
-    expect(existsSync(thumb("small"))).toBe(false);
-    expect(existsSync(thumb("medium"))).toBe(false);
-    // Thumbnails of content rows still name stay.
-    expect(
-      existsSync(
-        join(filesDir, w.a, "thumbnails", "small", sha(JPEG).slice(0, 2), `${sha(JPEG)}.v1.jpg`),
-      ),
-    ).toBe(true);
+    expect(existsSync(thumb("medium"))).toBe(true);
   });
 });
 

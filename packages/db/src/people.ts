@@ -103,8 +103,9 @@ export const MAX_MEMBERS = 2000;
 /**
  * The organization's members, by name, at most `MAX_MEMBERS` (`truncated`
  * when there are more). With `visibleTo`, only those holding a role on one
- * of these sites or no role at all in the organization (a site manager's
- * view, D-074: people who work only on other sites are not shown).
+ * of these sites or on every site for the whole catalog (S-042), or no role at all in the
+ * organization (a site manager's view, D-074: people who work only on other
+ * sites are not shown).
  */
 export async function listMembers(
   db: Queryable,
@@ -120,7 +121,10 @@ export async function listMembers(
       AND (${sites === null}::boolean
            OR EXISTS (SELECT 1 FROM public.role_assignments g
                       WHERE g.organization_id = m.organization_id AND g.user_id = m.user_id
-                        AND g.site_id = ANY (${sites ?? []}::uuid[]))
+                        AND (g.site_id = ANY (${sites ?? []}::uuid[])
+                             -- A role on every site includes the viewer's (S-042).
+                             OR (g.site_id IS NULL AND g.scope_record_id IS NULL
+                                 AND cardinality(${sites ?? []}::uuid[]) > 0)))
            OR NOT EXISTS (SELECT 1 FROM public.role_assignments g
                           WHERE g.organization_id = m.organization_id AND g.user_id = m.user_id))
     ORDER BY lower(u.display_name), u.id

@@ -20,7 +20,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { newOrganizationId } from "@oculus/core";
 import { STORE_MARKER, openFileStore, type FileStore } from "./file-store.js";
@@ -356,29 +356,76 @@ describe("the second review's changes", () => {
   it("lets servers of one database share the folder and refuses a second database's", async () => {
     const fresh = mkdtempSync(join(tmpdir(), "oculus-store-servers-"));
     const own = await openFileStore({ dir: fresh });
-    const first = await own.claimServer("install|7001:16384|oculus|5432");
-    expect(first.ok).toBe(true);
-    // The same database (this process stands in for a second server of it).
-    const same = await own.claimServer("install|7001:16384|oculus|5432");
-    expect(same.ok).toBe(true);
-    // Another live server with another database: a stand-in entry for the
-    // parent process, which is alive.
     const folder = join(fresh, ".oculus-servers");
+    const notes = (): string[] => readdirSync(folder).sort();
+    const first = await own.claimServer("7001:16384|oculus|5432");
+    expect(first.ok).toBe(true);
+    expect(notes()).toHaveLength(1);
+    // The same database (this process stands in for a second server of it).
+    const same = await own.claimServer("7001:16384|oculus|5432");
+    expect(same.ok).toBe(true);
+    expect(notes()).toHaveLength(2);
+    // Another database in this very process: refused, and its note gone.
+    expect((await own.claimServer("7001:20000|copy|5432")).ok).toBe(false);
+    expect(notes()).toHaveLength(2);
+    if (same.ok) same.release();
+    // Another live server with another database: a stand-in note for the
+    // parent process, which is alive. Refused, and nothing of ours is left.
     const host = hostname()
       .replace(/[^A-Za-z0-9.-]/g, "_")
       .slice(0, 100);
-    writeFileSync(
-      join(folder, `${host}-${String(process.ppid)}`),
-      "install|7001:20000|copy|5432\n",
-    );
-    expect((await own.claimServer("install|7001:16384|oculus|5432")).ok).toBe(false);
-    // A server that has gone doesn't count.
-    rmSync(join(folder, `${host}-${String(process.ppid)}`));
-    writeFileSync(join(folder, `${host}-999999999`), "install|7001:20000|copy|5432\n");
-    expect((await own.claimServer("install|7001:16384|oculus|5432")).ok).toBe(true);
-    expect(existsSync(join(folder, `${host}-999999999`))).toBe(false);
+    const theirs = join(folder, `${host}-${String(process.ppid)}-0123456789abcdef`);
+    writeFileSync(theirs, "7001:20000|copy|5432\n");
+    const before = notes();
+    expect((await own.claimServer("7001:16384|oculus|5432")).ok).toBe(false);
+    expect(notes()).toEqual(before);
+    // A note being written (its temporary name) is not read as one.
+    rmSync(theirs);
+    writeFileSync(join(folder, `.${host}-${String(process.ppid)}-0123456789abcdef.tmp`), "");
+    const meanwhile = await own.claimServer("7001:16384|oculus|5432");
+    expect(meanwhile.ok).toBe(true);
+    if (meanwhile.ok) meanwhile.release();
+    rmSync(join(folder, `.${host}-${String(process.ppid)}-0123456789abcdef.tmp`));
+    // A server that has gone doesn't count, nor a note of this process's
+    // PID that this process doesn't hold (left by an earlier process).
+    const gone = join(folder, `${host}-999999999-0123456789abcdef`);
+    const earlier = join(folder, `${host}-${String(process.pid)}-fedcba9876543210`);
+    writeFileSync(gone, "7001:20000|copy|5432\n");
+    writeFileSync(earlier, "7001:20000|copy|5432\n");
+    const later = await own.claimServer("7001:16384|oculus|5432");
+    expect(later.ok).toBe(true);
+    expect(existsSync(gone)).toBe(false);
+    expect(existsSync(earlier)).toBe(false);
+    if (later.ok) later.release();
     if (first.ok) first.release();
+    expect(notes()).toEqual([]);
     expect(await own.isEmpty()).toBe(true);
+    rmSync(fresh, { recursive: true, force: true });
+  });
+
+  it("touches a stored copy by the file system's clock, and only a plain copy of its own", async () => {
+    const fresh = mkdtempSync(join(tmpdir(), "oculus-store-touch-"));
+    const own = await openFileStore({ dir: fresh });
+    const org = newOrganizationId();
+    const got = await own.receive(org, chunksOf(Buffer.from("touched")));
+    if (!got.ok) throw new Error(got.code);
+    await own.place(got.file);
+    const path = own.pathFor(org, got.file.sha256);
+    const past = new Date(Date.now() - 30 * 86_400_000);
+    utimesSync(path, past, past);
+    expect(await own.touch(org, got.file.sha256)).toBe(true);
+    expect(Date.now() - statSync(path).mtimeMs).toBeLessThan(60_000);
+    // None there.
+    expect(await own.touch(org, "0".repeat(64))).toBe(false);
+    // A link where the copy should be is never followed.
+    const target = join(fresh, "elsewhere");
+    writeFileSync(target, "x");
+    utimesSync(target, past, past);
+    const linked = "a".repeat(64);
+    mkdirSync(dirname(own.pathFor(org, linked)), { recursive: true });
+    symlinkSync(target, own.pathFor(org, linked));
+    expect(await own.touch(org, linked)).toBe(false);
+    expect(Date.now() - lstatSync(target).mtimeMs).toBeGreaterThan(86_400_000);
     rmSync(fresh, { recursive: true, force: true });
   });
 

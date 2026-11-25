@@ -46,11 +46,11 @@
  * automatic sweep (the service's `sweepFiles`) only removes temporary
  * uploads (`staleIncoming`: older than an upload may run, by the file
  * system's own clock, never one this process is still writing) and empties
- * the trash a stopped purge left. Only the operator's purge
- * (`npm run files:purge`) moves copies into the trash (`trash`, under the
- * organization's file lock) and deletes them (`emptyTrash`, after it);
- * `listContents` gives it regular files only (anything else at a content
- * path is counted and left alone).
+ * the trash an earlier purge left. In this version nothing purges (D-086,
+ * fifth review); `trash`, `emptyTrash` and `listContents` stay for the safe
+ * purge to come (S-043), which will also rely on `touch`: every attach sets
+ * the stored copy's times to now by the file system's own clock, so its
+ * age shows its last use in any database.
  */
 import { createHash, randomBytes } from "node:crypto";
 import { constants, createReadStream, openSync, rmSync } from "node:fs";
@@ -174,10 +174,13 @@ export interface FileStore {
   /** Milliseconds since the marker last changed, by the file system's own clock. */
   markerAge(): Promise<number | undefined>;
   /**
-   * Notes this server as using the folder for `key` (the install, the
-   * database and where it lives) until `release` or the process ends.
-   * Refused when another live server on this machine uses it for another
-   * key: two databases must never share one folder (D-086).
+   * Notes this server as using the folder for `key` (the database and where
+   * it lives) until `release` or the process ends. The note is made first,
+   * whole, under a name no other server uses, and the others are read
+   * after: of two servers starting at once with different keys, at least
+   * one sees the other, and is refused (often both are). Refused when
+   * another live server on this machine uses the folder for another key:
+   * two databases must never share one folder (D-086).
    */
   claimServer(
     key: string,
@@ -188,6 +191,12 @@ export interface FileStore {
   bind(storeId: string): void;
   /** The install ID the store was bound to, if it has been. */
   readonly boundTo: () => string | undefined;
+  /**
+   * Sets a stored copy's access and modification times to now by the file system's
+   * own clock (every attach calls it): `false` when there is no plain copy
+   * of our own there (`place` replaces anything else).
+   */
+  touch(organizationId: OrganizationId, sha256: string): Promise<boolean>;
   /** Puts the received bytes at their content path (see the module header). */
   place(file: ReceivedFile): Promise<"stored" | "already_stored">;
   /** Removes the temporary file and releases its share; safe to call more than once. */
@@ -490,6 +499,8 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
   let pendingSpace = 0;
   /** Temporary files this process is writing (never swept). */
   const active = new Set<string>();
+  /** The `.oculus-servers` notes this process holds (`claimServer`). */
+  const claimed = new Set<string>();
   let boundTo: string | undefined;
 
   async function lowOnSpace(extra: number): Promise<boolean> {
@@ -610,44 +621,95 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       const host = hostname()
         .replace(/[^A-Za-z0-9.-]/g, "_")
         .slice(0, 100);
-      for (const entry of await readdir(folder, { withFileTypes: true })) {
-        const match = /^(.+)-([0-9]{1,10})$/.exec(entry.name);
-        if (!entry.isFile() || match?.[1] !== host) continue;
-        const pid = Number(match[2]);
-        const path = join(folder, entry.name);
-        let alive = pid !== process.pid;
-        if (alive) {
-          try {
-            process.kill(pid, 0);
-          } catch (error) {
-            alive = (error as { code?: unknown }).code === "EPERM";
-          }
-        }
-        if (!alive) {
-          // A server that has gone (or this process, starting again).
-          await rm(path, { force: true });
-          continue;
-        }
-        const theirs = (await readFile(path, "utf8").catch(() => "")).trim();
-        if (theirs !== key) return { ok: false };
+      // Made first, whole: written under a temporary name, then linked (or
+      // renamed) to a name of its own, so no one reads it half written.
+      const name = `${host}-${String(process.pid)}-${randomBytes(8).toString("hex")}`;
+      const mine = join(folder, name);
+      const temp = join(folder, `.${name}.tmp`);
+      await writeFile(temp, `${key}\n`, { mode: 0o600, flag: "wx" });
+      try {
+        await link(temp, mine);
+      } catch (error) {
+        if (!NO_LINKS.has(String((error as { code?: unknown }).code))) throw error;
+        await rename(temp, mine);
+      } finally {
+        await rm(temp, { force: true });
       }
-      const mine = join(folder, `${host}-${String(process.pid)}`);
-      await writeFile(mine, `${key}\n`, { mode: 0o600 });
       const release = (): void => {
+        claimed.delete(name);
         try {
           rmSync(mine, { force: true });
         } catch {
           // Gone already.
         }
       };
+      claimed.add(name);
       process.once("exit", release);
-      return {
-        ok: true,
-        release: () => {
-          process.removeListener("exit", release);
-          release();
-        },
+      const done = (): void => {
+        process.removeListener("exit", release);
+        release();
       };
+      // Then the others.
+      try {
+        for (const entry of await readdir(folder, { withFileTypes: true })) {
+          if (entry.name === name) continue;
+          const match = /^(.+)-([0-9]{1,10})-[0-9a-f]{16}$/.exec(entry.name);
+          if (!entry.isFile() || match?.[1] !== host) continue;
+          const pid = Number(match[2]);
+          const path = join(folder, entry.name);
+          let alive: boolean;
+          if (pid === process.pid) {
+            // This process's own notes are the ones it holds; any other is
+            // left from a process that had this PID before.
+            alive = claimed.has(entry.name);
+          } else {
+            alive = true;
+            try {
+              process.kill(pid, 0);
+            } catch (error) {
+              alive = (error as { code?: unknown }).code === "EPERM";
+            }
+          }
+          if (!alive) {
+            await rm(path, { force: true });
+            continue;
+          }
+          const theirs = (await readFile(path, "utf8").catch(() => undefined))?.trim();
+          // A note gone meanwhile was released; any other key refuses.
+          if (theirs !== undefined && theirs !== key) {
+            done();
+            return { ok: false };
+          }
+        }
+      } catch (error) {
+        done();
+        throw error;
+      }
+      return { ok: true, release: done };
+    },
+
+    async touch(organizationId, sha256) {
+      const path = pathFor(organizationId, sha256);
+      // Every folder on the way checked, as for `place`.
+      await safeFolder(organizationId, "sha256", sha256.slice(0, 2));
+      let handle: Awaited<ReturnType<typeof open>>;
+      try {
+        handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      } catch (error) {
+        const code = (error as { code?: unknown }).code;
+        // None there, or a link where a copy should be (`place` replaces it).
+        if (code === "ENOENT" || code === "ELOOP" || code === "ENOTDIR") return false;
+        throw error;
+      }
+      try {
+        const info = await handle.stat();
+        if (!info.isFile() || info.nlink !== 1 || !safeOwnership(info)) return false;
+        const now = (await fileSystemNow(await safeFolder(organizationId, "incoming"))) / 1000;
+        await handle.utimes(now, now);
+        return true;
+      } finally {
+        await handle.close();
+      }
     },
 
     async markerInProgress() {

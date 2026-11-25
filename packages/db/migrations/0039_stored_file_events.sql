@@ -31,10 +31,11 @@ CREATE TABLE public.file_store_binding (
 --             transaction before the copy is placed);
 --   attached  the attach committed;
 --   removed   the file was removed from its asset.
--- Nothing automatic ever deletes a stored copy (fourth review). The
--- operator's purge (npm run files:purge) reads this log to free the space
--- of content this database removed at least seven days ago, or of a copy
--- an attach placed but never committed, and nothing else.
+-- Nothing automatic ever deletes a stored copy (fourth review), and this
+-- version has no purge (fifth review). A later, safe purge (S-043) reads
+-- this log to free the space of content this database removed at least
+-- seven days ago, or of a copy an attach placed but never committed, and
+-- nothing else.
 CREATE TABLE public.stored_file_events (
   organization_id uuid NOT NULL REFERENCES public.organizations (id),
   id uuid NOT NULL CONSTRAINT stored_file_events_id_v4

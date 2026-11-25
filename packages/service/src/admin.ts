@@ -220,15 +220,23 @@ interface Who {
 /**
  * Whether a site manager sees a member with their details (D-084, T-064):
  * the member holds a role on one of the sites the manager manages (`managed`,
- * from `managedSites`; "all" meaning every site of the organization). A role
- * on every site (`siteId` null) is no site's, so it doesn't count. The one
- * rule for the people list, a person's page and a grant's target.
+ * from `managedSites`; "all" meaning every site of the organization), or a
+ * whole-catalog role on every site (`siteId` and `scope` null), which
+ * includes the manager's own (John, 2026-11-25; S-042). A role on every site
+ * scoped to one unit is that unit's site's only, so it counts only as that.
+ * The one rule for the people list, a person's page and a grant's target;
+ * `listMembers` asks the same in SQL. No managed site: no one.
  */
 export function holdsRoleOn(
-  grants: readonly { readonly siteId: SiteId | null }[],
+  grants: readonly { readonly siteId: SiteId | null; readonly scope?: string | null }[],
   managed: "all" | ReadonlySet<SiteId>,
 ): boolean {
-  return grants.some((g) => g.siteId !== null && (managed === "all" || managed.has(g.siteId)));
+  if (managed !== "all" && managed.size === 0) return false;
+  return grants.some((g) =>
+    g.siteId === null
+      ? g.scope === null || g.scope === undefined
+      : managed === "all" || managed.has(g.siteId),
+  );
 }
 
 /**

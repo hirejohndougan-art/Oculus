@@ -49,7 +49,6 @@ import { join } from "node:path";
 import {
   databaseIdentity,
   loadSecretKeyring,
-  readFileStoreBinding,
   sql,
   type Database,
   type EnrolmentDelivery,
@@ -59,6 +58,7 @@ import {
 import {
   createService,
   createThumbnailRenderer,
+  FILE_LEASE_RENEW_MS,
   openFileStore,
   type FileStore,
   type FileStoreProblem,
@@ -70,7 +70,7 @@ import { isProduction } from "./environment.js";
 import { mailerFromEnv, type Mailer } from "./mail.js";
 import { trustedProxyFromEnv } from "./proxy.js";
 import { OAI_ADMIN_EMAIL_ENV, oaiAdminEmail, oaiPmhRoutes } from "./oai-pmh.js";
-import { publicApiRoutes, ReadSlots } from "./public-api.js";
+import { PUBLIC_POOL_SIZE, publicApiRoutes, ReadSlots } from "./public-api.js";
 import { PublicSubjects, publicSubjectsRoutes } from "./public-subjects.js";
 import { PUBLIC_DATABASE_URL_ENV, checkPublicSites, publicSitesFromEnv } from "./public-sites.js";
 import type { OculusRoute } from "./routes.js";
@@ -107,22 +107,20 @@ const FILE_STORE_PROBLEMS: Readonly<Record<FileStoreProblem, string>> = {
 /** Temporary upload files older than this are swept: twice an upload's whole limit. */
 export const INCOMING_MAX_AGE_MS = 2 * UPLOAD_TIMEOUTS.request;
 /** How often the folder's lease moves on (D-086: at most this long until a shared folder shows). */
-export const FILE_LEASE_EVERY_MS = 60 * 60_000;
+export const FILE_LEASE_EVERY_MS = FILE_LEASE_RENEW_MS;
 
 /**
- * What a server uses the files folder for: the install, the database's
- * identity, its name and the server's port, so two servers of one database
- * agree and two databases never do.
+ * What a server uses the files folder for: the database's identity, its
+ * name and the server's port, so two servers of one database agree and two
+ * databases never do. Read before the folder is bound, so nothing in it
+ * depends on the binding.
  */
 async function serverKey(db: Database): Promise<string> {
   const rows = await db.rows<{ name: string; port: number | null }>(
     sql`SELECT current_database() AS name, inet_server_port() AS port`,
   );
-  const binding = await readFileStoreBinding(db);
   const identity = await databaseIdentity(db);
-  return encodeURIComponent(
-    `${binding ?? "-"}|${identity}|${rows[0]?.name ?? "-"}|${String(rows[0]?.port ?? "-")}`,
-  );
+  return encodeURIComponent(`${identity}|${rows[0]?.name ?? "-"}|${String(rows[0]?.port ?? "-")}`);
 }
 
 /** How often the file sweep runs (and once at startup). */
@@ -319,7 +317,7 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   const publicSites =
     publicDb === undefined ? [] : await checkPublicSites(options.db, publicDb, publicHosts);
   // One count of the public pool's connections for every public route (D-100, D-105).
-  const publicSlots = new ReadSlots(4);
+  const publicSlots = new ReadSlots(PUBLIC_POOL_SIZE);
   const oaiEmail = oaiAdminEmail(env[OAI_ADMIN_EMAIL_ENV]);
 
   let admin: ServerOptions["admin"];
@@ -419,35 +417,44 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     ...(publicSubjects === undefined ? [] : publicSubjectsRoutes({ subjects: publicSubjects })),
     ...(options.extraRoutes ?? []),
   ];
-  // Stale temporary files and copies no row names (D-086): now, then on a
-  // timer that stops with the server.
-  // The files folder must be this install's (D-086, review B1).
-  let bound: Awaited<ReturnType<typeof service.bindFileStore>>;
-  try {
-    bound = await service.bindFileStore();
-  } catch (error) {
-    // A file system error's message holds the path: only its code is shown.
-    const code = (error as { code?: unknown }).code;
-    throw new Error(
-      `refusing to start: ${FILES_DIR_ENV}: the folder couldn't be prepared (${typeof code === "string" && /^[A-Z][A-Z0-9_]{1,30}$/.test(code) ? code : "error"}).`,
-      { cause: error },
-    );
-  }
-  if (!bound.ok) {
-    throw new Error(`refusing to start: ${FILES_DIR_ENV}: ${FILE_STORE_PROBLEMS[bound.problem]}`);
-  }
-  if (bound.warning === "files_shared_or_restored") {
-    // Another database uses this folder, or this one was restored or
-    // copied: it starts, but nothing can be purged until `files:adopt`.
-    log({ event: "startup_warning", code: "files_shared_or_restored" });
-  }
-  // Two databases must never share one folder: refused if another live
-  // server on this machine uses it for another database (D-086).
-  const claim = await files.claimServer(await serverKey(options.db));
+  // The files folder (D-086). First this server's note in it, so a second
+  // server with another database is refused before it changes anything
+  // there (not the marker, not the lease); then the folder must be this
+  // install's (review B1).
+  const prepared = async <T>(step: () => Promise<T>): Promise<T> => {
+    try {
+      return await step();
+    } catch (error) {
+      // A file system error's message holds the path: only its code is shown.
+      const code = (error as { code?: unknown }).code;
+      throw new Error(
+        `refusing to start: ${FILES_DIR_ENV}: the folder couldn't be prepared (${typeof code === "string" && /^[A-Z][A-Z0-9_]{1,30}$/.test(code) ? code : "error"}).`,
+        { cause: error },
+      );
+    }
+  };
+  const key = await serverKey(options.db);
+  const claim = await prepared(() => files.claimServer(key));
   if (!claim.ok) {
     throw new Error(
       `refusing to start: ${FILES_DIR_ENV}: another Oculus server on this computer uses this folder with another database. Give each database a folder of its own.`,
     );
+  }
+  let bound: Awaited<ReturnType<typeof service.bindFileStore>>;
+  try {
+    bound = await prepared(() => service.bindFileStore());
+  } catch (error) {
+    claim.release();
+    throw error;
+  }
+  if (!bound.ok) {
+    claim.release();
+    throw new Error(`refusing to start: ${FILES_DIR_ENV}: ${FILE_STORE_PROBLEMS[bound.problem]}`);
+  }
+  if (bound.warning === "files_shared_or_restored") {
+    // Another database uses this folder, or this one was restored or
+    // copied: it starts, and an operator runs `files:adopt` once sure.
+    log({ event: "startup_warning", code: "files_shared_or_restored" });
   }
   const renew = async (): Promise<void> => {
     try {

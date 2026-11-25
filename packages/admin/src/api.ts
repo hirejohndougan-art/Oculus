@@ -14,6 +14,13 @@
  *   `ifNoneMatch` sends `If-None-Match: *` for a first version.
  * - A reply `{ "error": code, ... }` becomes an `ApiError` carrying the
  *   status, the code and the rest of the body; nothing is retried here.
+ * - `background` marks a read the person didn't ask for (polling, checking
+ *   the session is still alive) with `X-Oculus-Background: 1`, so it isn't a
+ *   use of the session and never holds off the idle limit (T-062, D-098).
+ *   Every other request whose reply shows the server counted it (`countedUse`:
+ *   a success, or a refusal made after the session was looked up) is a use:
+ *   its send time goes to `onSessionUse` listeners (the idle timer), which
+ *   is never later than the moment the server counted it.
  */
 
 export class ApiError extends Error {
@@ -52,6 +59,45 @@ export interface RequestOptions {
   /** The working site (D-079's `X-Oculus-Site`), for the staff API. */
   readonly site?: string;
   readonly signal?: AbortSignal;
+  /** A read that isn't a use of the session (GET only; T-062, D-098). */
+  readonly background?: boolean;
+  /**
+   * The CSRF token to send instead of the current one: signing out after
+   * the screen has already forgotten the session (T-062).
+   */
+  readonly csrfToken?: string;
+}
+
+/**
+ * Whether a reply shows that the server looked the session up with a use
+ * (T-062, D-098): every success, and every refusal but those made before
+ * the session was read or meaning there is none (401; a CSRF or Origin
+ * refusal; a malformed request, `400 bad_request`; a rate limit, which the
+ * sign-in routes apply before the session; a server failure). Erring
+ * towards "not counted" only makes this tab's timer end sooner than the
+ * server's, never later.
+ */
+export function countedUse(status: number, code: string | undefined): boolean {
+  if (status >= 200 && status < 300) return true;
+  if (status < 400 || status >= 500) return false;
+  if (status === 401 || status === 429) return false;
+  if (status === 403 && (code === "csrf_failed" || code === "cross_origin")) return false;
+  if (status === 400 && code === "bad_request") return false;
+  return true;
+}
+
+type UseListener = (sentAt: number) => void;
+const useListeners = new Set<UseListener>();
+
+/**
+ * Calls `listener` with the send time (`Date.now()`) of every request that
+ * counted as a use of the session. Returns the way to stop.
+ */
+export function onSessionUse(listener: UseListener): () => void {
+  useListeners.add(listener);
+  return () => {
+    useListeners.delete(listener);
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -74,10 +120,17 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
   const method = options.method ?? (options.body === undefined ? "GET" : "POST");
   const headers: Record<string, string> = { accept: "application/json" };
   if (options.body !== undefined) headers["content-type"] = "application/json";
-  if (method !== "GET" && csrfToken !== undefined) headers["x-oculus-csrf"] = csrfToken;
+  const csrf = options.csrfToken ?? csrfToken;
+  if (method !== "GET" && csrf !== undefined) headers["x-oculus-csrf"] = csrf;
   if (options.ifMatch !== undefined) headers["if-match"] = `"v${String(options.ifMatch)}"`;
   if (options.ifNoneMatch === true) headers["if-none-match"] = "*";
   if (options.site !== undefined) headers["x-oculus-site"] = options.site;
+  const background = options.background === true;
+  if (background) {
+    if (method !== "GET") throw new Error("only a read can be background");
+    headers["x-oculus-background"] = "1";
+  }
+  const sentAt = Date.now();
   let response: Response;
   try {
     response = await fetch(path, {
@@ -101,11 +154,12 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
       body = null;
     }
   }
-  if (!response.ok) {
-    const record = isRecord(body) ? body : {};
-    const code = typeof record.error === "string" ? record.error : "unexpected_reply";
-    throw new ApiError(response.status, code, record);
+  const record = isRecord(body) ? body : {};
+  const code = typeof record.error === "string" ? record.error : undefined;
+  if (!background && countedUse(response.status, code)) {
+    for (const listener of [...useListeners]) listener(sentAt);
   }
+  if (!response.ok) throw new ApiError(response.status, code ?? "unexpected_reply", record);
   rememberCsrf(body);
   return body as T;
 }

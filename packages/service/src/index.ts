@@ -38,7 +38,7 @@ export type {
 export { contextFromSession, NOT_PERMITTED_MESSAGE } from "./access.js";
 export type { SessionLike } from "./access.js";
 export type { AdminOperations, MyAccess, RoleRequest } from "./admin.js";
-export { ADOPT_QUIET_MS } from "./files.js";
+export { ADOPT_QUIET_MS, FILE_LEASE_RENEW_MS } from "./files.js";
 export {
   openFileStore,
   DEFAULT_MAX_FILE_BYTES,
