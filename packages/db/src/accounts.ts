@@ -1225,12 +1225,11 @@ export async function signInChecked(
     await tx.execute(sql`
       UPDATE public.sign_in_throttles SET failures = greatest(failures - 1, 0)
       WHERE key = ${sourceKey}`);
-    // The address becomes known only once the second step passes
-    // (`markKnownSource`, S-044): a right password alone could otherwise
-    // push the person's real addresses out of the newest MAX_KNOWN_SOURCES.
-    await tx.execute(
-      sql`UPDATE public.users SET last_sign_in_at = now() WHERE id = ${user.id}::uuid`,
-    );
+    // The address becomes known, and "last sign-in" is stamped, only once
+    // the second step passes (`markSignedIn`, S-044, S-053): a right
+    // password alone could otherwise push the person's real addresses out
+    // of the newest MAX_KNOWN_SOURCES, and show admins a sign-in that
+    // failed at the code.
     if (newHash !== undefined) {
       // Only if the hash is still the one checked, so a password changed
       // meanwhile is never put back.
@@ -1251,6 +1250,28 @@ export async function signInChecked(
     organizationIds: Object.freeze([...user.organization_ids]),
     secondStep: "required",
   };
+}
+
+/**
+ * Records a whole sign-in, after `completeSecondStep` or `confirmEnrolment`
+ * promoted the session: stamps the person's `last_sign_in_at` (S-053; never
+ * at the password alone, so admins don't see a "last sign-in" for an attempt
+ * that failed at the code) and makes `source` known (`markKnownSource`).
+ * The stamp is a statement of its own after the promotion committed, not in
+ * the promotion's transaction, which holds the user row `FOR SHARE` (two
+ * promotions upgrading it at once would deadlock). Never throws, like
+ * `markKnownSource`: a failure only leaves the stamp at the previous sign-in
+ * and must not turn a finished sign-in into an error whose new token is lost.
+ */
+export async function markSignedIn(db: Database, userId: string, source: string): Promise<void> {
+  try {
+    await db.execute(
+      sql`UPDATE public.users SET last_sign_in_at = clock_timestamp() WHERE id = ${userId}::uuid`,
+    );
+  } catch {
+    // Best effort, as above.
+  }
+  await markKnownSource(db, userId, source);
 }
 
 /**

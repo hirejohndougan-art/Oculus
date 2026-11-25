@@ -1530,6 +1530,116 @@ describe("only a whole sign-in makes an address known (S-044)", () => {
   });
 });
 
+describe('"last sign-in" is stamped only by a whole sign-in (S-053)', () => {
+  async function lastSignIn(userId: UserId): Promise<string | null> {
+    const rows = await db.rows<{ at: string | null }>(sql`
+      SELECT last_sign_in_at::text AS at FROM public.users WHERE id = ${userId}::uuid`);
+    return rows[0]?.at ?? null;
+  }
+
+  it("the right password and a wrong code leave it alone; the right code stamps it", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const from = source();
+    const begun = await beginSession(db, {
+      email: person.email,
+      password: PASSWORD,
+      source: from,
+      organizationId: org,
+    });
+    if (!begun.ok) throw new Error("no sign-in");
+    expect(await lastSignIn(person.userId)).toBeNull();
+    const right = await freshCode(person.userId);
+    const wrong = String((Number(right) + 1) % 1_000_000).padStart(6, "0");
+    expect(
+      await completeSecondStep(db, keys, begun.token, { source: from, code: wrong }),
+    ).toMatchObject({ code: "invalid_code" });
+    expect(await lastSignIn(person.userId)).toBeNull();
+    expect(
+      await completeSecondStep(db, keys, begun.token, { source: from, code: right }),
+    ).toMatchObject({ ok: true });
+    const stamped = await lastSignIn(person.userId);
+    expect(stamped).not.toBeNull();
+    // Someone with only the password, later, from elsewhere: no new stamp.
+    for (let i = 0; i < 3; i++) {
+      expect(
+        await signIn(db, { email: person.email, password: PASSWORD, source: source() }),
+      ).toMatchObject({ ok: true });
+    }
+    expect(await lastSignIn(person.userId)).toBe(stamped);
+  });
+
+  it("is stamped when setting up at first sign-in finishes, not before", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org, { factor: false });
+    const from = source();
+    const begun = await beginSession(db, {
+      email: person.email,
+      password: PASSWORD,
+      source: from,
+      organizationId: org,
+    });
+    if (!begun.ok) throw new Error("no sign-in");
+    const start = await startEnrolment(db, keys, begun.token, { issuer: "Invented Society" });
+    if (!start.ok) throw new Error(JSON.stringify(start));
+    const secret = decodeBase32(start.secret);
+    if (secret === undefined) throw new Error("not base32");
+    const right = await codeAt(secret);
+    const wrong = String((Number(right) + 1) % 1_000_000).padStart(6, "0");
+    expect(
+      await confirmEnrolment(db, keys, begun.token, { source: from, code: wrong }),
+    ).toMatchObject({ code: "invalid_code" });
+    expect(await lastSignIn(person.userId)).toBeNull();
+    expect(
+      await confirmEnrolment(db, keys, begun.token, { source: from, code: right }),
+    ).toMatchObject({ ok: true });
+    expect(await lastSignIn(person.userId)).not.toBeNull();
+  });
+
+  it("a promotion refused for the organization stamps nothing until it goes through", async () => {
+    await ready();
+    const one = await organization();
+    const two = await organization();
+    const person = await member(one);
+    // A second membership, so the person must choose.
+    const box: InvitationMessage[] = [];
+    ok(
+      await createInvitation(
+        db,
+        { organizationId: two, email: person.email, invitedBy: admin },
+        (m) => {
+          box.push(m);
+          return Promise.resolve();
+        },
+      ),
+    );
+    const { acceptInvitationForUser } = await import("./accounts.js");
+    ok(
+      await acceptInvitationForUser(db, {
+        token: box[0]?.token ?? "",
+        organizationId: two,
+        userId: person.userId,
+      }),
+    );
+    const p = await pending(person.userId, null);
+    const code = recovery(person.userId);
+    expect(
+      await completeSecondStep(db, keys, p.token, { source: source(), recoveryCode: code }),
+    ).toMatchObject({ code: "choose_organization" });
+    expect(await lastSignIn(person.userId)).toBeNull();
+    expect(
+      await completeSecondStep(db, keys, p.token, {
+        source: source(),
+        recoveryCode: code,
+        organizationId: two,
+      }),
+    ).toMatchObject({ ok: true });
+    expect(await lastSignIn(person.userId)).not.toBeNull();
+  });
+});
+
 describe("re-entering the password has a counter strangers can't push (S-018)", () => {
   it("lets a signed-in person re-enter while strangers keep the sign-in counter waiting", async () => {
     await ready();
