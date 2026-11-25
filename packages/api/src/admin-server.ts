@@ -55,6 +55,7 @@ import { isProduction } from "./environment.js";
 import { mailerFromEnv, type Mailer } from "./mail.js";
 import { trustedProxyFromEnv } from "./proxy.js";
 import { PUBLIC_DATABASE_URL_ENV, checkPublicSites, publicSitesFromEnv } from "./public-sites.js";
+import type { OculusRoute } from "./routes.js";
 import { buildServer, type ServerOptions } from "./server.js";
 import { signInRoutes, type SignInApiOptions } from "./sign-in-api.js";
 import { serviceErrorLogger, staffApiRoutes, type ApiLogRecord } from "./staff-api.js";
@@ -106,6 +107,8 @@ export interface AdminServerOptions {
   readonly log?: (record: ApiLogRecord) => void;
   /** Fastify's request log (method and path only, D-058). */
   readonly logger?: ServerOptions["logger"];
+  /** Routes of the program that starts the server (the desktop launcher's instance check, D-088). */
+  readonly extraRoutes?: readonly OculusRoute[];
   /** Passed on to the sign-in routes (tests). */
   readonly signIn?: Pick<SignInApiOptions, "rateLimits" | "clock" | "resetOptions">;
 }
@@ -226,6 +229,7 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
       warnSharedAddress: production,
       ...options.signIn,
     }),
+    ...(options.extraRoutes ?? []),
   ];
   return buildServer({
     env,
