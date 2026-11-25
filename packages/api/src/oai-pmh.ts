@@ -35,10 +35,11 @@
  *
  * A record whose public read ran out of time is remembered as slow
  * (`SlowReads`, shared with `GET /records/:id`; S-043b) and read with the
- * larger `SLOW_READ_TIME_LIMIT_MS` from then on: a list page reads it only
- * with that whole limit left (else it is the next page's first read). One
- * that runs out of time even then, `OAI_SKIP_AFTER_STRIKES` times in a row,
- * is left out of the list (as a held-back record is: no header, nothing of
+ * larger `SLOW_READ_TIME_LIMIT_MS` (in `SLOW_READ_BUDGET_MS` all told) from
+ * then on: a list page reads it only with that whole budget left (else it
+ * is the next page's first read). One whose list reads run out of time even
+ * then, `OAI_SKIP_AFTER_STRIKES` times at least `SLOW_READ_STRIKE_GAP_MS`
+ * apart with no read answering in between, is left out of the list (as a held-back record is: no header, nothing of
  * it leaves) and logged for staff as `oai_record_skipped` with its ID, so
  * a harvest goes on past it instead of stopping there for good. GetRecord
  * never skips: it answers `503 busy`.
@@ -88,9 +89,10 @@ export const OAI_PAGE_TIME_LIMIT_MS = 15_000;
 const LIST_READ_LIMIT_MS = 30_000;
 
 /**
- * A list leaves out a record whose read at the larger limit (S-043b) ran
- * out of time this many times in a row: each was a separate page, so a
- * database that is only briefly slow doesn't drop a record from a harvest.
+ * A list leaves out a record whose list reads at the larger limit (S-043b)
+ * ran out of time this many times, at least `SLOW_READ_STRIKE_GAP_MS` apart
+ * and with none answering between, so a database that is only briefly slow
+ * doesn't drop a record from a harvest.
  */
 export const OAI_SKIP_AFTER_STRIKES = 2;
 
@@ -444,8 +446,8 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
 
   const slowReads =
     options.slowReads ?? new SlowReads(options.clock === undefined ? {} : { clock: options.clock });
-  /** The larger limit a record known to be slow is read with (S-043b). */
-  const slowLimitMs = readLimit(options.timeLimitMs, slowReads).timeLimitMs ?? 0;
+  /** The whole time a record known to be slow may take to read (S-043b). */
+  const slowBudgetMs = readLimit(options.timeLimitMs, slowReads).budgetMs;
 
   /**
    * The public output of a record public on the site, or undefined. A
@@ -463,7 +465,7 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
         ...readLimit(options.timeLimitMs, slow ? slowReads : undefined),
       });
     } catch (thrown) {
-      if (isDatabaseTimeout(thrown)) slowReads.timedOut(key, slow);
+      if (isDatabaseTimeout(thrown)) slowReads.timedOut(key);
       throw thrown;
     }
     if (slow) slowReads.answered(key);
@@ -648,7 +650,8 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
           continue;
         }
         const key = slowKey(site, candidate.id);
-        if (scanned > 0 && slowReads.isSlow(key) && deadline - clock() < slowLimitMs) {
+        const wasSlow = slowReads.isSlow(key);
+        if (scanned > 0 && wasSlow && deadline - clock() < slowBudgetMs) {
           // Known to be slow (S-043b): read only with its whole larger limit
           // left, so the page's first read next time if not.
           exhausted = false;
@@ -660,7 +663,13 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
           output = await publicRecord(site, candidate.id);
         } catch (thrown) {
           if (!isDatabaseTimeout(thrown)) throw thrown;
-          if (slowReads.strikes(key) >= OAI_SKIP_AFTER_STRIKES) {
+          // A strike only for the record's own slowness: a statement or gap
+          // past the larger limit, never the pool's wait for a connection.
+          if (
+            wasSlow &&
+            (thrown as { code?: unknown }).code === "57014" &&
+            slowReads.strike(key) >= OAI_SKIP_AFTER_STRIKES
+          ) {
             // Too slow even at the larger limit, again (S-043b): left out,
             // as a held-back record is, and logged for staff; the token
             // moves past it so the harvest goes on.

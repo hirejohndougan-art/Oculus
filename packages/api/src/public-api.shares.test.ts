@@ -462,4 +462,61 @@ describe("items shared into a public site", () => {
     });
     expect(fine.ok).toBe(true);
   });
+
+  it("a whole-read budget lowers the last statements' limit to what is left, then refuses (S-043b)", async () => {
+    const item = await makeObject(w, w.a, w.a1, "An invented budgeted lantern");
+    await publishAs(w, w.a, item.id);
+    let now = 0;
+    let jumpTo: number | undefined;
+    const seen: string[] = [];
+    const watched: Database = {
+      ...reader,
+      transaction: (work) =>
+        reader.transaction((tx) =>
+          work({
+            rows: async <R extends object>(query: Parameters<Queryable["rows"]>[0]) => {
+              const [setting] = await tx.rows<{ v: string }>(
+                sql`SELECT pg_catalog.current_setting('statement_timeout') AS v`,
+              );
+              seen.push(setting?.v ?? "");
+              const result = await tx.rows<R>(query);
+              // After the first statement, time moves on to `jumpTo`.
+              if (jumpTo !== undefined) now = jumpTo;
+              return result;
+            },
+            execute: (query) => tx.execute(query),
+          }),
+        ),
+    };
+    const read = () =>
+      readPublicRecord(watched, w.a, w.a1, item.id as never, {
+        baseUrl: `${PUBLIC}/records/`,
+        timeLimitMs: 200,
+        budgetMs: 1_000,
+        clock: () => now,
+      });
+    // 50 ms left of the budget after the first statement: the rest run under 50 ms.
+    jumpTo = 950;
+    const fine = await read();
+    expect(fine.ok).toBe(true);
+    expect(seen[0]).toBe("200ms");
+    expect(seen.slice(1).every((v) => v === "50ms")).toBe(true);
+    expect(seen.length).toBeGreaterThan(1);
+    // Nothing left: refused before the next statement.
+    now = 0;
+    jumpTo = 1_000;
+    const thrown = await read().then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(thrown).toBeInstanceOf(TimeLimitError);
+    // A budget it couldn't use is refused, as a bad time limit is.
+    for (const bad of [0, 1.5, 120_001]) {
+      const refused = await readPublicRecord(reader, w.a, w.a1, item.id as never, {
+        baseUrl: `${PUBLIC}/records/`,
+        budgetMs: bad,
+      });
+      expect(refused).toMatchObject({ ok: false, issues: [{ code: "invalid_options" }] });
+    }
+  });
 });

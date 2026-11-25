@@ -42,8 +42,10 @@
 import { isRecordId } from "@oculus/core";
 import {
   isDatabaseTimeout,
+  MAX_PUBLIC_READ_BUDGET_MS,
   MAX_PUBLIC_READ_TIME_LIMIT_MS,
   PUBLIC_READ_TIME_LIMIT_MS,
+  TimeLimitError,
   readPublicRecord,
   readSharedPublicRecord,
   type Database,
@@ -107,32 +109,53 @@ export interface PublicApiOptions {
 }
 
 /** The time limit a record known to be slow is read with (S-043b), per statement and gap. */
-export const SLOW_READ_TIME_LIMIT_MS = 15_000;
+export const SLOW_READ_TIME_LIMIT_MS = 10_000;
+/**
+ * The whole time a known-slow record's read may take (S-043b): with the
+ * staff connection's reads around it, it stays inside the server's 30 s
+ * reply time (`SERVER_TIMEOUTS.handler`), so a slow read ends as `busy`, never cut off.
+ */
+export const SLOW_READ_BUDGET_MS = 18_000;
+/** The whole time any other public request's reads may take (S-043b). */
+export const PUBLIC_READ_BUDGET_MS = 15_000;
 /** How long a record stays known as slow after its last read that ran out of time. */
 export const SLOW_READ_MEMORY_MS = 24 * 60 * 60 * 1000;
 /** The most records remembered as slow; the longest unseen is forgotten first. */
 export const SLOW_READ_MAX_RECORDS = 1_000;
+/** Strikes against a record count at most this often (S-043b), so one slow spell is one strike. */
+export const SLOW_READ_STRIKE_GAP_MS = 5 * 60_000;
 
 /**
  * The records whose public reads ran out of time (S-043b), in this
- * process's memory. A record whose read at the normal limit timed out is
- * read with `limitMs` from then on (a larger limit for single reads, the
- * record's own); `strikes` counts its reads at that larger limit that ran
- * out of time in a row, which the OAI-PMH lists use to step past a record
- * that is always too slow rather than stop every harvest at it. Forgotten
- * `SLOW_READ_MEMORY_MS` after its last timeout, or on restart; only a
- * record's site and ID are kept, never anything a visitor sent.
+ * process's memory. A record whose read timed out is read with the larger
+ * `limitMs` (and `budgetMs`) from then on: a larger limit for single
+ * reads, the record's own. `strike` counts the OAI-PMH lists' reads at
+ * that larger limit that ran out of time, at most one per
+ * `SLOW_READ_STRIKE_GAP_MS`, so the lists step past a record that is
+ * always too slow and not one caught in a short slow spell; a read at the
+ * larger limit that answers clears them. Forgotten `SLOW_READ_MEMORY_MS`
+ * after its last timeout, or on restart; only a record's site and ID are
+ * kept, never anything a visitor sent.
  */
 export class SlowReads {
   readonly limitMs: number;
+  readonly budgetMs: number;
   private readonly clock: () => number;
-  private readonly marks = new Map<string, { strikes: number; at: number }>();
-  constructor(options: { limitMs?: number; clock?: () => number } = {}) {
+  private readonly marks = new Map<string, { strikes: number; at: number; struckAt?: number }>();
+  constructor(options: { limitMs?: number; budgetMs?: number; clock?: () => number } = {}) {
     this.limitMs = options.limitMs ?? SLOW_READ_TIME_LIMIT_MS;
     checkTimeLimit(this.limitMs);
+    this.budgetMs = options.budgetMs ?? Math.max(SLOW_READ_BUDGET_MS, this.limitMs);
+    if (
+      !Number.isInteger(this.budgetMs) ||
+      this.budgetMs < this.limitMs ||
+      this.budgetMs > MAX_PUBLIC_READ_BUDGET_MS
+    ) {
+      throw new RangeError("budgetMs must be a whole number from limitMs to 120000");
+    }
     this.clock = options.clock ?? Date.now;
   }
-  private mark(key: string): { strikes: number; at: number } | undefined {
+  private mark(key: string): { strikes: number; at: number; struckAt?: number } | undefined {
     const found = this.marks.get(key);
     if (found !== undefined && this.clock() - found.at > SLOW_READ_MEMORY_MS) {
       this.marks.delete(key);
@@ -140,31 +163,48 @@ export class SlowReads {
     }
     return found;
   }
-  /** Whether the record's last read ran out of time (and isn't forgotten yet). */
+  /** Whether the record's read ran out of time (and isn't forgotten yet). */
   isSlow(key: string): boolean {
     return this.mark(key) !== undefined;
   }
-  /** The larger limit's timeouts in a row so far (0 when none, or not known slow). */
+  /** The strikes against it so far (0 when none, or not known slow). */
   strikes(key: string): number {
     return this.mark(key)?.strikes ?? 0;
   }
-  /** A read ran out of time: at the larger limit (`slow`) it counts a strike. Gives the strikes. */
-  timedOut(key: string, slow: boolean): number {
-    const strikes = (this.mark(key)?.strikes ?? 0) + (slow ? 1 : 0);
+  /** A read of the record ran out of time: known slow from now on. */
+  timedOut(key: string): void {
+    const found = this.mark(key) ?? { strikes: 0, at: 0 };
+    found.at = this.clock();
     // Re-inserted, so the Map's order is least recently timed out first.
     this.marks.delete(key);
-    this.marks.set(key, { strikes, at: this.clock() });
+    this.marks.set(key, found);
     while (this.marks.size > SLOW_READ_MAX_RECORDS) {
       const oldest = this.marks.keys().next().value;
       if (oldest === undefined) break;
       this.marks.delete(oldest);
     }
-    return strikes;
+  }
+  /**
+   * A list's read at the larger limit ran out of time (after `timedOut`):
+   * a strike, unless the last came less than `SLOW_READ_STRIKE_GAP_MS` ago.
+   * Gives the strikes.
+   */
+  strike(key: string): number {
+    const found = this.mark(key);
+    if (found === undefined) return 0;
+    const now = this.clock();
+    if (found.struckAt === undefined || now - found.struckAt >= SLOW_READ_STRIKE_GAP_MS) {
+      found.strikes += 1;
+      found.struckAt = now;
+    }
+    return found.strikes;
   }
   /** A read at the larger limit came back in time: still slow, no strikes. */
   answered(key: string): void {
     const found = this.mark(key);
-    if (found !== undefined) found.strikes = 0;
+    if (found === undefined) return;
+    found.strikes = 0;
+    delete found.struckAt;
   }
 }
 
@@ -197,16 +237,31 @@ export class ReadSlots {
 }
 
 /**
- * A read's `timeLimitMs` option: the routes' own (or `readPublicRecord`'s
- * default), or for a record known to be slow `slowReads`'s larger limit
- * (never below the routes' own).
+ * A read's `timeLimitMs` and `budgetMs` (S-043b): the routes' own limit
+ * (or `readPublicRecord`'s default) with at most `PUBLIC_READ_BUDGET_MS` in
+ * all, or for a record known to be slow `slowReads`'s larger limit (never
+ * below the routes' own) and its budget.
  */
 export function readLimit(
   timeLimitMs: number | undefined,
   slowReads: SlowReads | undefined,
-): { timeLimitMs?: number } {
-  if (slowReads === undefined) return timeLimitMs === undefined ? {} : { timeLimitMs };
-  return { timeLimitMs: Math.max(slowReads.limitMs, timeLimitMs ?? PUBLIC_READ_TIME_LIMIT_MS) };
+): { timeLimitMs: number; budgetMs: number } {
+  const own = timeLimitMs ?? PUBLIC_READ_TIME_LIMIT_MS;
+  if (slowReads === undefined) {
+    return { timeLimitMs: own, budgetMs: Math.min(3 * own, PUBLIC_READ_BUDGET_MS) };
+  }
+  const limit = Math.max(slowReads.limitMs, own);
+  return {
+    timeLimitMs: limit,
+    budgetMs: Math.max(slowReads.budgetMs, Math.min(limit, PUBLIC_READ_BUDGET_MS)),
+  };
+}
+
+/** What is left of `budgetMs` since `started`; none left is a time limit (S-043b). */
+function leftOf(budgetMs: number, started: number): number {
+  const left = budgetMs - (Date.now() - started);
+  if (left < 1) throw new TimeLimitError();
+  return Math.floor(left);
 }
 
 /** Refuses at build time a time limit `readPublicRecord` would refuse on every read. */
@@ -293,6 +348,8 @@ export function publicApiRoutes(options: PublicApiOptions): OculusRoute[] {
         const key = slowKey(site, id);
         const slow = slowReads.isSlow(key);
         const limit = readLimit(options.timeLimitMs, slow ? slowReads : undefined);
+        // Both reads below share one budget, so the request ends inside the server's reply time.
+        const started = Date.now();
         try {
           result = await readPublicRecord(options.db, site.organizationId, site.siteId, id, {
             baseUrl: `${site.origin}/records/`,
@@ -308,7 +365,8 @@ export function publicApiRoutes(options: PublicApiOptions): OculusRoute[] {
               id,
               {
                 baseUrlFor: (home) => `${homeOrigin(home) ?? site.origin}/records/`,
-                ...limit,
+                timeLimitMs: limit.timeLimitMs,
+                budgetMs: leftOf(limit.budgetMs, started),
               },
             );
           }
@@ -317,7 +375,7 @@ export function publicApiRoutes(options: PublicApiOptions): OculusRoute[] {
           if (isDatabaseTimeout(error)) {
             // A time limit ran out (S-037): busy, as when every slot is taken,
             // and the record is read with the larger limit next time (S-043b).
-            slowReads.timedOut(key, slow);
+            slowReads.timedOut(key);
             log({ event: "service_error", operation, name: "timeout" });
             throw new Refusal(503, "busy");
           }

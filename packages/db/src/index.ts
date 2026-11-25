@@ -105,6 +105,7 @@ export {
   readSharedPublicRecord,
   PUBLIC_READ_TIME_LIMIT_MS,
   MAX_PUBLIC_READ_TIME_LIMIT_MS,
+  MAX_PUBLIC_READ_BUDGET_MS,
   publicValueSources,
   inheritedValues,
   recordDependents,

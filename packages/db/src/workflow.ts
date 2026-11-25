@@ -862,9 +862,20 @@ export interface PublicRecordOptions {
    * from 1 to `MAX_PUBLIC_READ_TIME_LIMIT_MS`.
    */
   readonly timeLimitMs?: number;
+  /**
+   * The whole read's time (S-043b): its statements and the gaps between
+   * them together, so a read fits inside the server's reply time whatever
+   * its per-statement limit. A statement that would outlast it runs under
+   * what is left; with nothing left, `TimeLimitError`. A whole number from
+   * 1 to `MAX_PUBLIC_READ_BUDGET_MS`; left out, only the per-statement limits bound it.
+   */
+  readonly budgetMs?: number;
   /** @internal The clock the gaps between statements are measured on (tests); `Date.now`. */
   readonly clock?: () => number;
 }
+
+/** The largest whole-read time `readPublicRecord` takes (S-043b). */
+export const MAX_PUBLIC_READ_BUDGET_MS = 120_000;
 
 /**
  * How much longer than a public read's limit the server lets its
@@ -884,11 +895,29 @@ export const IDLE_MARGIN_MS = 1_000;
 function gapBounded(
   tx: Queryable,
   limitMs: number,
+  budgetMs: number | undefined,
   clock: () => number,
 ): { readonly q: Queryable; check(): void } {
   let last = clock();
+  const end = budgetMs === undefined ? undefined : last + budgetMs;
+  // The statement_timeout in force: lowered to what is left of the budget.
+  let statementLimit = limitMs;
   const check = (): void => {
-    if (clock() - last > limitMs) throw new TimeLimitError();
+    const now = clock();
+    if (now - last > limitMs || (end !== undefined && now >= end)) throw new TimeLimitError();
+  };
+  /** Checks the gap and the budget, and lowers the statement limit to what is left. */
+  const before = async (): Promise<void> => {
+    check();
+    if (end === undefined) return;
+    const left = end - clock();
+    if (left < statementLimit) {
+      statementLimit = Math.max(1, Math.floor(left));
+      await tx.execute(
+        sql`SELECT pg_catalog.set_config('statement_timeout', ${String(statementLimit)}, true)`,
+      );
+      check();
+    }
   };
   const done = <T>(result: T): T => {
     last = clock();
@@ -897,16 +926,28 @@ function gapBounded(
   return {
     q: {
       rows: async (query) => {
-        check();
+        await before();
         return done(await tx.rows(query));
       },
       execute: async (query) => {
-        check();
+        await before();
         return done(await tx.execute(query));
       },
     },
     check,
   };
+}
+
+/** A read's `budgetMs` (S-043b), checked: undefined when left out. */
+function budgetOf(options: object): number | undefined | false {
+  const given = ownValue(options, "budgetMs");
+  if (given === undefined) return undefined;
+  return typeof given === "number" &&
+    Number.isInteger(given) &&
+    given >= 1 &&
+    given <= MAX_PUBLIC_READ_BUDGET_MS
+    ? given
+    : false;
 }
 
 /** The settings each public read's transaction starts with (S-037, S-043b), local to it. */
@@ -1039,6 +1080,14 @@ export async function readPublicRecord(
   const givenLimit = ownValue(options, "timeLimitMs");
   const timeLimitMs = givenLimit === undefined ? PUBLIC_READ_TIME_LIMIT_MS : givenLimit;
   const clock = clockOf(options);
+  const budgetMs = budgetOf(options);
+  if (budgetMs === false) {
+    return refused(
+      ["budgetMs"],
+      "invalid_options",
+      `budgetMs must be a whole number from 1 to ${String(MAX_PUBLIC_READ_BUDGET_MS)}.`,
+    );
+  }
   if (typeof baseUrl !== "string" || (mappings !== undefined && !Array.isArray(mappings))) {
     return refused([], "invalid_options", "Give { baseUrl, mappings?, timeLimitMs? }.");
   }
@@ -1060,7 +1109,7 @@ export async function readPublicRecord(
     // S-037: each statement below may take at most this long, and S-043b:
     // so may the JS work between them.
     await limitPublicRead(tx, timeLimitMs);
-    const timed = gapBounded(tx, timeLimitMs, clock);
+    const timed = gapBounded(tx, timeLimitMs, budgetMs, clock);
     const read = await publicRecordIn(
       timed.q,
       organizationId,
@@ -1099,6 +1148,8 @@ export interface SharedPublicRecordOptions {
   readonly baseUrlFor: (home: SharedHome) => string;
   /** As `PublicRecordOptions.timeLimitMs` (S-037, S-043b): each statement's and each gap's time limit. */
   readonly timeLimitMs?: number;
+  /** As `PublicRecordOptions.budgetMs` (S-043b). */
+  readonly budgetMs?: number;
   /** @internal As `PublicRecordOptions.clock`. */
   readonly clock?: () => number;
 }
@@ -1132,6 +1183,14 @@ export async function readSharedPublicRecord(
   const givenLimit = ownValue(options, "timeLimitMs");
   const timeLimitMs = givenLimit === undefined ? PUBLIC_READ_TIME_LIMIT_MS : givenLimit;
   const clock = clockOf(options);
+  const budgetMs = budgetOf(options);
+  if (budgetMs === false) {
+    return refused(
+      ["budgetMs"],
+      "invalid_options",
+      `budgetMs must be a whole number from 1 to ${String(MAX_PUBLIC_READ_BUDGET_MS)}.`,
+    );
+  }
   if (typeof baseUrlFor !== "function") {
     return refused([], "invalid_options", "Give { baseUrlFor, timeLimitMs? }.");
   }
@@ -1151,7 +1210,7 @@ export async function readSharedPublicRecord(
     await tx.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`);
     // S-037, S-043b: as readPublicRecord's.
     await limitPublicRead(tx, timeLimitMs);
-    const timed = gapBounded(tx, timeLimitMs, clock);
+    const timed = gapBounded(tx, timeLimitMs, budgetMs, clock);
     const [found] = await timed.q.rows<{ home: Record<string, unknown> | null }>(sql`
       SELECT public.shared_record_home(${organizationId}::uuid, ${siteId}::uuid,
                                        ${recordId}::uuid) AS home`);

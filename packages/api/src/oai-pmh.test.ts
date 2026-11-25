@@ -35,7 +35,13 @@ import {
   oaiPmhRoutes,
   oaiPoolOptions,
 } from "./oai-pmh.js";
-import { publicApiRoutes, ReadSlots, slowKey, SlowReads } from "./public-api.js";
+import {
+  publicApiRoutes,
+  ReadSlots,
+  SLOW_READ_STRIKE_GAP_MS,
+  slowKey,
+  SlowReads,
+} from "./public-api.js";
 import { PublicSubjects } from "./public-subjects.js";
 import { checkPublicSites, type PublicSite } from "./public-sites.js";
 import { buildServer } from "./server.js";
@@ -1118,7 +1124,10 @@ describe("a record always slower than the public read limit (S-043b)", () => {
       () => true,
     );
     const logged: { event: string; code?: string }[] = [];
-    const slowReads = new SlowReads({ limitMs: 1_000 });
+    // Each request comes a strike's gap after the one before, so every
+    // timeout at the larger limit can count.
+    let now = 0;
+    const slowReads = new SlowReads({ limitMs: 1_000, clock: () => now });
     const server = await buildServer({
       env: { OCULUS_ORIGINS: PUBLIC },
       routes: oaiPmhRoutes({
@@ -1138,6 +1147,7 @@ describe("a record always slower than the public read limit (S-043b)", () => {
       let busy = 0;
       for (let requests = 0; requests < 40; requests++) {
         const reply = await oai(query, "127.0.0.1", server);
+        now += SLOW_READ_STRIKE_GAP_MS;
         if (reply.statusCode === 503) {
           // A harvester retries the same request after Retry-After.
           expect([reply.headers["retry-after"], reply.json()]).toEqual(["5", { error: "busy" }]);
@@ -1152,7 +1162,7 @@ describe("a record always slower than the public read limit (S-043b)", () => {
         query = `verb=ListIdentifiers&resumptionToken=${token}`;
       }
       // Busy once or twice (first at the normal limit if it began a page,
-      // then at the larger), then stepped past; every other record is there once.
+      // then at the larger: one strike), then stepped past at the second; every other record is there once.
       expect(busy).toBeGreaterThanOrEqual(1);
       expect(busy).toBeLessThanOrEqual(2);
       expect(new Set(seen).size).toBe(seen.length);
@@ -1183,6 +1193,51 @@ describe("a record always slower than the public read limit (S-043b)", () => {
       );
       expect([one.statusCode, one.json()]).toEqual([503, { error: "busy" }]);
       expect(limits.at(-1)).toEqual({ statement: "1s", idle: "2s" });
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("one slow spell is one strike: a record isn't left out while its timeouts come close together", async () => {
+    const sites = await checkPublicSites(w.db, reader, [{ origin: PUBLIC, siteId: w.a1 }]);
+    const target = more[0] ?? "";
+    const { db } = slowFor(
+      () => target,
+      () => true,
+    );
+    const logged: { event: string }[] = [];
+    const slowReads = new SlowReads({ limitMs: 1_000, clock: () => 0 });
+    const server = await buildServer({
+      env: { OCULUS_ORIGINS: PUBLIC },
+      routes: oaiPmhRoutes({
+        db: w.db,
+        publicDb: db,
+        sites,
+        adminEmail: EMAIL,
+        rateLimits: { oai: 10_000 },
+        timeLimitMs: 200,
+        slowReads,
+        log: (r) => logged.push(r),
+      }),
+    });
+    try {
+      let query = "verb=ListIdentifiers&metadataPrefix=oai_dc";
+      let busy = 0;
+      for (let requests = 0; requests < 12; requests++) {
+        const reply = await oai(query, "127.0.0.1", server);
+        if (reply.statusCode === 503) {
+          busy += 1;
+          continue;
+        }
+        expect(identifiers(reply.body)).not.toContain(`${PREFIX}${target}`);
+        const token = tokenIn(reply.body);
+        if (token === undefined) break;
+        query = `verb=ListIdentifiers&resumptionToken=${token}`;
+      }
+      // Stuck at the record, busy, but never stepped past within one spell.
+      expect(busy).toBeGreaterThan(5);
+      expect(slowReads.strikes(slowKey(firstOf(sites), target))).toBe(1);
+      expect(logged.filter((r) => r.event === "oai_record_skipped")).toEqual([]);
     } finally {
       await server.close();
     }
@@ -1250,7 +1305,7 @@ describe("a record always slower than the public read limit (S-043b)", () => {
     );
     // Known slow already; its larger limit (1 s) is more than a page (500 ms) has.
     const slowReads = new SlowReads({ limitMs: 1_000 });
-    slowReads.timedOut(slowKey(firstOf(sites), target), false);
+    slowReads.timedOut(slowKey(firstOf(sites), target));
     const server = await buildServer({
       env: { OCULUS_ORIGINS: PUBLIC },
       routes: oaiPmhRoutes({
