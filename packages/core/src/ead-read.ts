@@ -105,6 +105,32 @@ const RENDER_ONLY: ReadonlySet<string> = new Set([
   "quote",
   "part",
 ]);
+/** Elements whose staff-only mark the model keeps (`internal`), or passes to the units inside. */
+const CARRIES_AUDIENCE: ReadonlySet<string> = new Set([
+  "eadheader",
+  "control",
+  "archdesc",
+  "dsc",
+  ...C_NAMES,
+  ...EAD_NOTE_KINDS,
+]);
+/** Elements that can sit inside a paragraph but read as separate text. */
+const BLOCK_LIKE: ReadonlySet<string> = new Set([
+  "list",
+  "chronlist",
+  "table",
+  "blockquote",
+  "note",
+  "address",
+  "item",
+  "defitem",
+  "chronitem",
+  "event",
+  "head",
+  "p",
+]);
+/** XML's NMTOKEN: what codes and sources must be. */
+const CODE = /^[\p{L}\p{N}._:-]+$/u;
 const XML_NAMESPACE = "http://www.w3.org/XML/1998/namespace";
 const XSI_NAMESPACE = "http://www.w3.org/2001/XMLSchema-instance";
 
@@ -163,10 +189,20 @@ class Reader {
     const found = new Map<string, string>();
     for (const a of el.attributes) {
       const key = this.attrKey(a.name, a.ns);
+      if (key === "audience") {
+        const value = normalizeEadText(a.value).toLowerCase();
+        if (value !== "internal" && value !== "external") {
+          this.warn(
+            `${path}/@audience`,
+            "audience_unknown",
+            `The audience ${shown(a.value)} isn't "internal" or "external", so it was treated as staff-only.`,
+          );
+        }
+      }
       if (known.includes(key)) {
-        const value = normalizeEadText(a.value);
+        const value = this.clean(a.value, `${path}/@${key}`);
         if (value !== "") found.set(key, value);
-      } else if (!ignored.includes(key)) {
+      } else if (!ignored.includes(key) && key !== "audience") {
         this.skip(
           `${path}/@${key}`,
           "unmapped_attribute",
@@ -208,6 +244,16 @@ class Reader {
         );
         continue;
       }
+      // Staff-only text is never read as public. Units and notes carry the
+      // mark into the model; anything else marked staff-only is left out.
+      if (this.staffOnly === 0 && !CARRIES_AUDIENCE.has(child.name) && this.internal(child)) {
+        this.warn(
+          childPath,
+          "internal_left_out",
+          `${shown(child.name)} is marked staff-only (audience="internal") and can't be kept as staff-only here, so it was left out.`,
+        );
+        continue;
+      }
       out.push({ el: child, path: childPath });
     }
     return out;
@@ -217,11 +263,42 @@ class Reader {
     this.skip(path, "unmapped_element", `The element ${shown(el.name)} in ${where} isn't kept.`);
   }
 
-  /** True if `audience="internal"` (staff-only). Reads only the attribute. */
+  /**
+   * True if `el` is staff-only: any `audience` other than "external" (in any
+   * case), so a misspelt "Internal " is never read as public.
+   */
   internal(el: XmlElement): boolean {
     return el.attributes.some(
-      (a) => a.ns === "" && a.name === "audience" && normalizeEadText(a.value) === "internal",
+      (a) =>
+        a.ns === "" &&
+        a.name === "audience" &&
+        normalizeEadText(a.value).toLowerCase() !== "external",
     );
+  }
+
+  /** A normal date form: kept only without spaces, as the schemas need. */
+  normal(value: string | undefined, path: Path): string | undefined {
+    if (value === undefined || !/\s/.test(value)) return value;
+    this.warn(
+      path,
+      "normal_left_out",
+      `The normal date ${shown(value)} has spaces, so it was left out; the date's text was kept.`,
+    );
+    return undefined;
+  }
+
+  /**
+   * A code (language, country, source): kept only if it is one token with no
+   * spaces, as the schemas need; otherwise left out and reported.
+   */
+  code(value: string | undefined, path: Path): string | undefined {
+    if (value === undefined || CODE.test(value)) return value;
+    this.warn(
+      path,
+      "code_left_out",
+      `${shown(value)} isn't a code (it has spaces or symbols), so it was left out.`,
+    );
+    return undefined;
   }
 
   /**
@@ -272,7 +349,7 @@ class Reader {
       }
       const n = (counts.get(child.name) ?? 0) + 1;
       counts.set(child.name, n);
-      const childPath = `${path}/${child.name}[${String(n)}]`;
+      const childPath = `${path}/${this.isEad(child) ? child.name : `{${child.ns}}${child.name}`}[${String(n)}]`;
       if (this.isEad(child) && except.has(child.name)) continue;
       if (this.staffOnly === 0 && this.internal(child)) {
         this.warn(
@@ -295,7 +372,10 @@ class Reader {
       } else if (!RENDER_ONLY.has(child.name)) {
         this.skip(childPath, "markup_flattened", `${shown(child.name)} was kept as plain text.`);
       }
-      parts.push(" ", this.inline(child, childPath), " ");
+      // Inline markup joins its text to the words around it ("Smith<emph>son</emph>'s");
+      // only block-like elements inside a paragraph start a new word.
+      const gap = BLOCK_LIKE.has(child.name) ? " " : "";
+      parts.push(gap, this.inline(child, childPath), gap);
     }
     return parts.join("");
   }
@@ -334,17 +414,19 @@ class Reader {
   // -------------------------------------------------------------------------
   // The header.
 
-  header(el: XmlElement | undefined, path: Path): EadHeader {
+  header(el: XmlElement | undefined, path: Path, rootInternal: boolean): EadHeader {
     const h: { -readonly [K in keyof EadHeader]?: EadHeader[K] } = {};
     const notes: string[] = [];
     if (el === undefined) {
       this.warn(path, "no_header", "The file has no header (eadheader or control).");
       return { notes };
     }
-    this.attrs(el, path, [], ["audience"]);
+    this.attrs(el, path, [], []);
     let agencyName: string | undefined;
+    let sawId = false;
     for (const { el: child, path: p } of this.children(el, path)) {
-      if (child.name === "eadid" || child.name === "recordid") {
+      if ((child.name === "eadid" || child.name === "recordid") && !sawId) {
+        sawId = true;
         const a = this.attrs(
           child,
           p,
@@ -352,32 +434,56 @@ class Reader {
         );
         const id = this.textOf(child, p);
         if (id !== undefined) h.id = id;
-        const country = a.get("countrycode");
+        const country = this.code(a.get("countrycode"), `${p}/@countrycode`);
         if (country !== undefined) h.countryCode = country;
-        const agency = a.get("mainagencycode");
+        const agency = this.code(a.get("mainagencycode"), `${p}/@mainagencycode`);
         if (agency !== undefined) h.agencyCode = agency;
       } else if (child.name === "filedesc") {
         this.filedesc(child, p, h, notes);
       } else if (child.name === "maintenanceagency" && this.version === "ead3") {
         const a = this.attrs(child, p, ["countrycode"]);
-        const country = a.get("countrycode");
+        const country = this.code(a.get("countrycode"), `${p}/@countrycode`);
         if (country !== undefined) h.countryCode = country;
         for (const { el: m, path: mp } of this.children(child, p)) {
-          if (m.name === "agencycode") {
+          if (m.name === "agencycode" && h.agencyCode === undefined) {
             this.attrs(m, mp, []);
-            const code = this.textOf(m, mp);
+            const code = this.code(this.textOf(m, mp), mp);
             if (code !== undefined) h.agencyCode = code;
           } else if (m.name === "agencyname" && agencyName === undefined) {
             this.attrs(m, mp, []);
             agencyName = this.textOf(m, mp);
           } else this.unknown(mp, m, "maintenanceagency");
         }
+      } else if (this.version === "ead3" && this.ownBookkeeping(child)) {
+        // Oculus's own maintenance status and history, written afresh on every export.
       } else {
         this.unknown(p, child, shown(el.name));
       }
     }
+    if (h.id === undefined)
+      this.warn(path, "no_id", "The file has no identifier (eadid or recordid).");
+    if (h.title === undefined)
+      this.warn(path, "no_file_title", "The file has no title (titleproper).");
+    // A staff-only header (the EAD Cookbook marks it so): its notes stay out.
+    if (rootInternal || this.internal(el)) {
+      this.warn(
+        path,
+        "internal_left_out",
+        "The header is marked staff-only (audience=\"internal\"), so its titles, notes, author and publisher were left out; only its identifier was kept.",
+      );
+      notes.length = 0;
+      delete h.title;
+      delete h.subtitle;
+      delete h.author;
+      delete h.publisher;
+    }
     // EAD3 needs an agency name; Oculus writes the publisher (or the code) there.
-    if (agencyName !== undefined && agencyName !== h.publisher && agencyName !== h.agencyCode) {
+    if (
+      agencyName !== undefined &&
+      agencyName !== h.publisher &&
+      agencyName !== h.agencyCode &&
+      !(agencyName === "Unknown" && h.publisher === undefined && h.agencyCode === undefined)
+    ) {
       this.skip(
         `${path}/maintenanceagency[1]/agencyname[1]`,
         "unmapped_element",
@@ -385,6 +491,39 @@ class Reader {
       );
     }
     return { ...h, notes };
+  }
+
+  /**
+   * True (and nothing reported) for what every Oculus EAD3 export writes:
+   * `maintenancestatus value="new"` and a history whose events were all
+   * made by Oculus. Anyone else's history is reported like any other element.
+   */
+  private ownBookkeeping(el: XmlElement): boolean {
+    const value = (e: XmlElement): string | undefined =>
+      e.attributes.find((a) => a.ns === "" && a.name === "value")?.value;
+    const kids = (e: XmlElement): XmlElement[] =>
+      e.children.filter((c): c is XmlElement => typeof c !== "string");
+    if (el.name === "maintenancestatus") {
+      return el.attributes.length === 1 && value(el) === "new" && kids(el).length === 0;
+    }
+    if (el.name !== "maintenancehistory" || el.attributes.length > 0) return false;
+    const events = kids(el);
+    const own = events.every((ev) => {
+      if (ev.name !== "maintenanceevent" || ev.attributes.length > 0) return false;
+      const parts = kids(ev);
+      const by = (name: string): XmlElement | undefined => parts.find((k) => k.name === name);
+      const agent = by("agent");
+      return (
+        parts.length === 4 &&
+        value(by("eventtype") ?? ev) === "created" &&
+        value(by("agenttype") ?? ev) === "machine" &&
+        by("eventdatetime") !== undefined &&
+        agent?.children.length === 1 &&
+        typeof agent.children[0] === "string" &&
+        agent.children[0].trim() === "Oculus"
+      );
+    });
+    return events.length > 0 && own;
   }
 
   private filedesc(
@@ -457,6 +596,8 @@ class Reader {
     path: Path,
     depth: number,
     parent: ArchivalLevel | undefined,
+    /** True when what holds the unit (a staff-only ead or dsc) makes it staff-only. */
+    heldInternal = false,
   ): EadUnit | undefined {
     this.units += 1;
     if (this.units > MAX_EAD_UNITS) {
@@ -473,8 +614,15 @@ class Reader {
       };
       return undefined;
     }
-    const a = this.attrs(el, path, ["level", "otherlevel", "audience"]);
+    const a = this.attrs(el, path, ["level", "otherlevel"]);
     const given = a.get("level");
+    if (a.has("otherlevel") && given !== "otherlevel") {
+      this.skip(
+        `${path}/@otherlevel`,
+        "unmapped_attribute",
+        `The otherlevel ${shown(a.get("otherlevel"))} isn't used, because the level is ${shown(given ?? "")}.`,
+      );
+    }
     const fallback: ArchivalLevel = depth === 1 ? "collection" : "file";
     const mapped = levelFromEad(given, a.get("otherlevel"), fallback);
     if (mapped.changed) {
@@ -493,7 +641,7 @@ class Reader {
 
     const u = {
       level: mapped.level,
-      internal: a.get("audience") === "internal",
+      internal: heldInternal || this.internal(el),
       identifiers: [] as string[],
       dates: [] as EadDate[],
       extents: [] as EadExtent[],
@@ -524,9 +672,11 @@ class Reader {
           this.controlaccess(child, p, u.accessPoints);
         } else if (name === "dsc" && depth === 1) {
           this.attrs(child, p, [], []);
+          // A staff-only dsc makes every component in it staff-only.
+          const dscInternal = this.staffOnly === 0 && this.internal(child);
           for (const { el: c, path: cp } of this.children(child, p)) {
             if (C_NAMES.has(c.name)) {
-              const unit = this.unit(c, cp, depth + 1, mapped.level);
+              const unit = this.unit(c, cp, depth + 1, mapped.level, dscInternal);
               if (unit !== undefined) u.children.push(unit);
             } else this.unknown(cp, c, "dsc");
           }
@@ -731,7 +881,7 @@ class Reader {
       }
     }
     const text = this.textOf(el, path);
-    const normal = a.get("normal");
+    const normal = this.normal(a.get("normal"), `${path}/@normal`);
     if (text === undefined) {
       if (normal === undefined) return undefined;
       this.warn(
@@ -775,7 +925,7 @@ class Reader {
       if (d.name === "datesingle") {
         const da = this.attrs(d, p, ["standarddate"]);
         const text = this.textOf(d, p);
-        const std = da.get("standarddate");
+        const std = this.normal(da.get("standarddate"), `${p}/@standarddate`);
         const t = text ?? std;
         if (t === undefined) return;
         const date: { text: string; normal?: string; type?: "inclusive" | "bulk" } = { text: t };
@@ -796,9 +946,12 @@ class Reader {
           const v: { text?: string; std?: string } = {};
           const text = this.textOf(end, ep);
           if (text !== undefined) v.text = text;
-          const std = ea.get("standarddate");
+          const std = this.normal(ea.get("standarddate"), `${ep}/@standarddate`);
           if (std !== undefined) v.std = std;
-          if (end.name === "fromdate") from = v;
+          const taken = end.name === "fromdate" ? from : to;
+          if (taken.text !== undefined || taken.std !== undefined) {
+            this.unknown(ep, end, `daterange (a second ${end.name})`);
+          } else if (end.name === "fromdate") from = v;
           else to = v;
         }
         const f = from.text ?? from.std ?? "";
@@ -894,7 +1047,9 @@ class Reader {
       if ((k.name === "quantity" || k.name === "unittype") && this.publicOnly(k, p)) {
         this.attrs(k, p, []);
         const text = this.textOf(k, p);
-        if (k.name === "quantity") quantity = text;
+        if ((k.name === "quantity" ? quantity : unit) !== undefined) {
+          this.unknown(p, k, `physdescstructured (a second ${k.name})`);
+        } else if (k.name === "quantity") quantity = text;
         else unit = text;
       } else if (k.name !== "quantity" && k.name !== "unittype")
         this.unknown(p, k, "physdescstructured");
@@ -965,7 +1120,7 @@ class Reader {
     };
     const identifier = a.get(v3 ? "identifier" : "authfilenumber");
     if (identifier !== undefined) n.identifier = identifier;
-    const source = a.get("source");
+    const source = this.code(a.get("source"), `${path}/@source`);
     if (source !== undefined) n.source = source;
     const role = a.get(v3 ? "relator" : "role");
     if (role !== undefined) n.role = role;
@@ -977,9 +1132,9 @@ class Reader {
     const read = (l: XmlElement, p: Path): void => {
       if (!this.publicOnly(l, p)) return;
       const a = this.attrs(l, p, ["langcode"]);
-      const label = this.textOf(l, p) ?? a.get("langcode");
+      const code = this.code(a.get("langcode"), `${p}/@langcode`);
+      const label = this.textOf(l, p) ?? code;
       if (label === undefined) return;
-      const code = a.get("langcode");
       languages.push(code === undefined ? { label } : { label, code });
     };
     const loose = el.children
@@ -1026,6 +1181,18 @@ class Reader {
         );
         url = a.get("xlink:href") ?? a.get("href");
         label = a.get("xlink:title") ?? a.get("title");
+        for (const [both, plain] of [
+          ["xlink:href", "href"],
+          ["xlink:title", "title"],
+        ] as const) {
+          if (a.has(both) && a.has(plain)) {
+            this.skip(
+              `${p}/@${plain}`,
+              "unmapped_attribute",
+              `${shown(plain)} isn't kept: ${shown(both)} is used instead.`,
+            );
+          }
+        }
       }
       for (const { el: k, path: kp } of this.children(d, p)) this.unknown(kp, k, shown(d.name));
       if (url === undefined) {
@@ -1191,7 +1358,7 @@ class Reader {
         };
         const identifier = a.get(v3 ? "identifier" : "authfilenumber");
         if (identifier !== undefined) term.identifier = identifier;
-        const source = a.get("source");
+        const source = this.code(a.get("source"), `${p}/@source`);
         if (source !== undefined) term.source = source;
         out.push(term);
       } else this.unknown(p, k, "controlaccess");
@@ -1252,7 +1419,9 @@ export function readEad(input: string | Uint8Array): Validated<EadRead> {
   const r = new Reader(found.version, found.ns);
 
   try {
-    r.attrs(root, "/ead", [], ["xsi:schemaLocation", "audience"]);
+    r.attrs(root, "/ead", [], ["xsi:schemaLocation"]);
+    // A staff-only ead makes the whole finding aid staff-only.
+    const rootInternal = r.internal(root);
     let headerEl: XmlElement | undefined;
     let headerPath = "/ead/eadheader[1]";
     let archdesc: { el: XmlElement; path: Path } | undefined;
@@ -1267,8 +1436,8 @@ export function readEad(input: string | Uint8Array): Validated<EadRead> {
     }
     if (archdesc === undefined)
       return refuse("no_archdesc", "The file has no archdesc, so there is nothing to read.");
-    const header = r.header(headerEl, headerPath);
-    const unit = r.unit(archdesc.el, archdesc.path, 1, undefined);
+    const header = r.header(headerEl, headerPath, rootInternal);
+    const unit = r.unit(archdesc.el, archdesc.path, 1, undefined, rootInternal);
     if (r.fatal !== undefined) return refuse(r.fatal.code, r.fatal.message);
     if (unit === undefined) return refuse("no_archdesc", "The archdesc couldn't be read.");
     return {

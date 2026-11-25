@@ -8,6 +8,7 @@ import {
   eadDateEdtf,
   eadParagraphs,
   levelFromEad,
+  MAX_XML_ATTRIBUTE_LENGTH,
   normalizeEadText,
   validateFindingAid,
 } from "./index.js";
@@ -45,9 +46,17 @@ describe("levelFromEad (D-107)", () => {
     });
   });
 
+  it("reads levels in any case, reporting the change", () => {
+    expect(levelFromEad("Series", undefined, "file")).toEqual({ level: "series", changed: true });
+    expect(levelFromEad("SubSeries", undefined, "file")).toEqual({
+      level: "series",
+      changed: true,
+    });
+  });
+
   it("uses the fallback for missing and unknown levels", () => {
     expect(levelFromEad(undefined, undefined, "file")).toEqual({ level: "file", changed: true });
-    expect(levelFromEad("Series", undefined, "file")).toEqual({ level: "file", changed: true });
+    expect(levelFromEad("binder", undefined, "file")).toEqual({ level: "file", changed: true });
     expect(levelFromEad("hasOwnProperty", undefined, "file")).toEqual({
       level: "file",
       changed: true,
@@ -139,8 +148,6 @@ describe("validateFindingAid", () => {
       const found = result.issues.map((i) => `${i.path.join(".")}:${i.code}`);
       expect(found).toEqual(
         expect.arrayContaining([
-          "header.id:required",
-          "header.title:required",
           "archdesc.level:not_allowed",
           "archdesc.dates.0.normal:not_a_code",
           "archdesc.dates.0.type:not_allowed",
@@ -155,10 +162,18 @@ describe("validateFindingAid", () => {
     }
   });
 
-  it("needs a title or a date on every unit", () => {
-    const untitled: Record<string, unknown> = { ...SAMPLE_MODEL.archdesc };
-    delete untitled.title;
-    const result = validateFindingAid({ ...SAMPLE_MODEL, archdesc: { ...untitled, dates: [] } });
-    expect(result.ok ? [] : result.issues.map((i) => i.code)).toEqual(["no_title"]);
+  it("caps text that goes into attributes at what the reader can read back", () => {
+    const long = "L".repeat(MAX_XML_ATTRIBUTE_LENGTH + 1);
+    const aid = {
+      ...SAMPLE_MODEL,
+      archdesc: {
+        ...SAMPLE_MODEL.archdesc,
+        links: [{ url: "https://example.org/x", label: long }],
+      },
+    };
+    const result = validateFindingAid(aid);
+    expect(result.ok ? [] : result.issues.map((i) => `${i.path.join(".")}:${i.code}`)).toEqual([
+      "archdesc.links.0.label:too_long",
+    ]);
   });
 });

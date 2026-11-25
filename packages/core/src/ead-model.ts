@@ -19,6 +19,7 @@ import { issue, type Validated } from "./issues.js";
 import { IssueList, readPlainData, shown, textProblem } from "./plain-data.js";
 import { ARCHIVAL_LEVELS, type ArchivalLevel } from "./records.js";
 import { webUrlProblem } from "./templates.js";
+import { MAX_XML_ATTRIBUTE_LENGTH } from "./xml-tree.js";
 
 export const EAD_VERSIONS = ["ead2002", "ead3"] as const;
 export type EadVersion = (typeof EAD_VERSIONS)[number];
@@ -126,7 +127,10 @@ export interface EadLanguage {
 }
 
 export interface EadContainer {
-  /** Box, folder and so on: EAD 2002 `@type`, EAD3 `@localtype`. */
+  /**
+   * Box, folder and so on: EAD 2002 `@type`, EAD3 `@localtype`. EAD 2002
+   * needs one word, so an EAD 2002 export leaves out a type with spaces.
+   */
   readonly type?: string;
   readonly value: string;
 }
@@ -230,7 +234,7 @@ export function levelFromEad(
     const own = (ARCHIVAL_LEVELS as readonly string[]).includes(named);
     return { level: own ? (named as ArchivalLevel) : "collection", changed: true };
   }
-  const mapped = level === undefined ? undefined : LEVEL_FROM_EAD.get(level);
+  const mapped = level === undefined ? undefined : LEVEL_FROM_EAD.get(level.toLowerCase());
   if (mapped === undefined) return { level: fallback, changed: true };
   return { level: mapped, changed: mapped !== level };
 }
@@ -410,9 +414,21 @@ class Checker {
     }
   }
 
+  /** Text that goes into an attribute, which the reader caps at MAX_XML_ATTRIBUTE_LENGTH. */
+  attr(value: unknown, path: (string | number)[], required: boolean): void {
+    this.text(value, path, required);
+    if (typeof value === "string" && value.length > MAX_XML_ATTRIBUTE_LENGTH) {
+      this.issues.add(
+        path,
+        "too_long",
+        `Is longer than ${String(MAX_XML_ATTRIBUTE_LENGTH)} characters, the most an attribute can hold.`,
+      );
+    }
+  }
+
   token(value: unknown, path: (string | number)[]): void {
     if (value === undefined) return;
-    this.text(value, path, false);
+    this.attr(value, path, false);
     if (typeof value === "string" && value !== "" && !NMTOKEN.test(value)) {
       this.issues.add(path, "not_a_code", `${shown(value)} must be a code with no spaces.`);
     }
@@ -504,7 +520,7 @@ class Checker {
       const d = this.object(v, at, new Set(["text", "normal", "type"]));
       if (d === undefined) return;
       this.text(d.text, [...at, "text"], true);
-      this.text(d.normal, [...at, "normal"], false);
+      this.attr(d.normal, [...at, "normal"], false);
       if (typeof d.normal === "string" && /\s/.test(d.normal)) {
         this.issues.add([...at, "normal"], "not_a_code", "A normal date form has no spaces.");
       }
@@ -530,16 +546,16 @@ class Checker {
       if (n === undefined) return;
       this.oneOf(n.element, EAD_NAME_ELEMENTS, [...at, "element"], true);
       this.text(n.label, [...at, "label"], true);
-      this.text(n.identifier, [...at, "identifier"], false);
+      this.attr(n.identifier, [...at, "identifier"], false);
       this.token(n.source, [...at, "source"]);
-      this.text(n.role, [...at, "role"], false);
+      this.attr(n.role, [...at, "role"], false);
     });
     this.list(u.accessPoints, [...path, "accessPoints"], (v, at) => {
       const n = this.object(v, at, new Set(["element", "label", "identifier", "source"]));
       if (n === undefined) return;
       this.oneOf(n.element, EAD_ACCESS_ELEMENTS, [...at, "element"], true);
       this.text(n.label, [...at, "label"], true);
-      this.text(n.identifier, [...at, "identifier"], false);
+      this.attr(n.identifier, [...at, "identifier"], false);
       this.token(n.source, [...at, "source"]);
     });
     this.list(u.languages, [...path, "languages"], (v, at) => {
@@ -551,7 +567,7 @@ class Checker {
     this.list(u.containers, [...path, "containers"], (v, at) => {
       const c = this.object(v, at, new Set(["type", "value"]));
       if (c === undefined) return;
-      this.token(c.type, [...at, "type"]);
+      this.attr(c.type, [...at, "type"], false);
       this.text(c.value, [...at, "value"], true);
     });
     this.list(u.links, [...path, "links"], (v, at) => {
@@ -563,7 +579,7 @@ class Checker {
         if (problem !== undefined)
           this.issues.add([...at, "url"], "bad_url", `The link ${problem}.`);
       }
-      this.text(l.label, [...at, "label"], false);
+      this.attr(l.label, [...at, "label"], false);
     });
     this.list(u.notes, [...path, "notes"], (v, at) => {
       const n = this.object(v, at, new Set(["kind", "head", "paragraphs", "internal"]));
@@ -579,9 +595,6 @@ class Checker {
         this.issues.add([...at, "paragraphs"], "empty", "A note needs at least one paragraph.");
       }
     });
-    if (u.title === undefined && (!Array.isArray(u.dates) || u.dates.length === 0)) {
-      this.issues.add(path, "no_title", "A unit needs a title or a date.");
-    }
     this.list(u.children, [...path, "children"], (c, at) => {
       this.unit(c, at, depth + 1);
     });
@@ -617,8 +630,8 @@ export function validateFindingAid(input: unknown): Validated<FindingAid> {
   if (top !== undefined) {
     const h = c.object(top.header, ["header"], HEADER_KEYS);
     if (h !== undefined) {
-      c.text(h.id, ["header", "id"], true);
-      c.text(h.title, ["header", "title"], true);
+      c.text(h.id, ["header", "id"], false);
+      c.text(h.title, ["header", "title"], false);
       c.text(h.subtitle, ["header", "subtitle"], false);
       c.text(h.author, ["header", "author"], false);
       c.text(h.publisher, ["header", "publisher"], false);
@@ -632,4 +645,38 @@ export function validateFindingAid(input: unknown): Validated<FindingAid> {
   }
   if (c.issues.count > 0) return { ok: false, issues: c.issues.items };
   return { ok: true, value: copied as FindingAid };
+}
+
+// ---------------------------------------------------------------------------
+// Walking the tree.
+
+export interface EadUnitInTree {
+  readonly unit: EadUnit;
+  /** Indexes from the top: [] for archdesc, [0, 2] for its first child's third child. */
+  readonly path: readonly number[];
+  /**
+   * True if the unit or any unit above it is staff-only. Exporters and the
+   * importer go by this, never by the unit's own `internal` alone.
+   */
+  readonly internal: boolean;
+}
+
+/** Every unit, top down, with whether it is staff-only once its ancestors count. */
+export function eadUnits(aid: FindingAid): EadUnitInTree[] {
+  const out: EadUnitInTree[] = [];
+  const stack: { unit: EadUnit; path: number[]; above: boolean }[] = [
+    { unit: aid.archdesc, path: [], above: false },
+  ];
+  while (stack.length > 0) {
+    const next = stack.pop();
+    if (next === undefined) break;
+    const internal = next.above || next.unit.internal;
+    out.push({ unit: next.unit, path: next.path, internal });
+    for (let i = next.unit.children.length - 1; i >= 0; i -= 1) {
+      const child = next.unit.children[i];
+      if (child !== undefined)
+        stack.push({ unit: child, path: [...next.path, i], above: internal });
+    }
+  }
+  return out;
 }

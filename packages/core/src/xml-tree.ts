@@ -32,6 +32,11 @@ export const MAX_XML_ELEMENTS = 500_000;
 export const MAX_XML_ATTRIBUTES = 64;
 /** The longest attribute value. */
 export const MAX_XML_ATTRIBUTE_LENGTH = 10_000;
+/**
+ * Attributes in the whole file. Each one costs far more memory than its
+ * bytes, so a file of empty attributes could otherwise exhaust memory.
+ */
+export const MAX_XML_TOTAL_ATTRIBUTES = 1_000_000;
 
 export interface XmlAttribute {
   /** Local name, without a prefix. */
@@ -166,6 +171,7 @@ export function parseXml(input: string | Uint8Array): Validated<XmlElement> {
   const stack: Building[] = [];
   let root: XmlElement | undefined;
   let elements = 0;
+  let attributeCount = 0;
   let problem: { code: string; message: string } | undefined;
   const stop = (code: string, message: string): never => {
     problem = { code, message };
@@ -176,7 +182,8 @@ export function parseXml(input: string | Uint8Array): Validated<XmlElement> {
     stop("not_well_formed", `The file isn't well-formed XML: ${err.message}`);
   });
   parser.on("doctype", (doctype: string) => {
-    if (doctype.includes("[")) {
+    // Quoted public and system identifiers may hold a "[" of their own.
+    if (doctype.replace(/"[^"]*"|'[^']*'/g, "").includes("[")) {
       stop(
         "doctype_subset",
         "The file declares its own entities or DTD rules (a DOCTYPE with [ ... ]). That isn't allowed: remove the internal DTD subset and try again.",
@@ -195,6 +202,13 @@ export function parseXml(input: string | Uint8Array): Validated<XmlElement> {
     for (const attr of Object.values(tag.attributes)) {
       // Namespace declarations are how names are read, not data.
       if (attr.prefix === "xmlns" || attr.name === "xmlns") continue;
+      attributeCount += 1;
+      if (attributeCount > MAX_XML_TOTAL_ATTRIBUTES) {
+        stop(
+          "too_many_attributes",
+          `The file has more than ${String(MAX_XML_TOTAL_ATTRIBUTES)} attributes.`,
+        );
+      }
       if (attributes.length >= MAX_XML_ATTRIBUTES) {
         stop(
           "too_many_attributes",

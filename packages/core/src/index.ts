@@ -742,6 +742,7 @@ export {
   MAX_XML_ELEMENTS,
   MAX_XML_ATTRIBUTES,
   MAX_XML_ATTRIBUTE_LENGTH,
+  MAX_XML_TOTAL_ATTRIBUTES,
   parseXml,
 } from "./xml-tree.js";
 export type { XmlAttribute, XmlElement } from "./xml-tree.js";
@@ -761,6 +762,7 @@ export {
   eadParagraphs,
   levelFromEad,
   eadDateEdtf,
+  eadUnits,
   validateFindingAid,
 } from "./ead-model.js";
 export type {
@@ -782,6 +784,7 @@ export type {
   LevelFromEad,
   EadDacsMapping,
   EadDateEdtf,
+  EadUnitInTree,
 } from "./ead-model.js";
 
 export { MAX_EAD_NOTICES, readEad } from "./ead-read.js";

@@ -46,6 +46,24 @@ export interface EadWritten {
 }
 
 const XSI = "http://www.w3.org/2001/XMLSchema-instance";
+/** ISO 3166-1 alpha-2, as the EAD 2002 schema's country list. */
+const COUNTRY = /^[A-Z]{2}$/;
+/** ISO 15511 (ISIL), as the EAD 2002 schema's `data.repositorycode` pattern. */
+const AGENCY = /^(?:[A-Z]{2}|[a-zA-Z]|[a-zA-Z]{3,4})-[a-zA-Z0-9:/-]{1,11}$/;
+/** ISO 639-2b: three lowercase letters. */
+const LANGUAGE = /^[a-z]{3}$/;
+const NMTOKEN = /^[\p{L}\p{N}._:-]+$/u;
+const DID_PARTS = [
+  "identifiers",
+  "dates",
+  "extents",
+  "creators",
+  "languages",
+  "containers",
+  "physicalLocations",
+  "abstracts",
+  "links",
+] as const;
 const DATE_TIME =
   /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2}))?$/;
 
@@ -100,6 +118,27 @@ class Writer {
     readonly options: EadWriteOptions,
   ) {}
 
+  /**
+   * A code as EAD 2002 needs it (ISO 3166 country, ISO 15511 agency, ISO
+   * 639-2b language, one-word type). EAD3 takes any token, so it is kept
+   * there; for EAD 2002 a code that doesn't fit is left out with a warning.
+   */
+  code2002(
+    value: string | undefined,
+    pattern: RegExp,
+    path: (string | number)[],
+  ): string | undefined {
+    if (value === undefined || this.v3 || pattern.test(value)) return value;
+    this.warnings.push(
+      issue(
+        path,
+        "code_left_out",
+        `EAD 2002 can't hold ${JSON.stringify(value)} here, so it was left out.`,
+      ),
+    );
+    return undefined;
+  }
+
   get v3(): boolean {
     return this.version === "ead3";
   }
@@ -149,11 +188,12 @@ class Writer {
     const title = h.title ?? "";
     x.open(this.v3 ? "control" : "eadheader");
     if (this.v3) x.leaf("recordid", id);
-    else
+    else {
       x.leaf("eadid", id, [
-        ["countrycode", h.countryCode],
-        ["mainagencycode", h.agencyCode],
+        ["countrycode", this.code2002(h.countryCode, COUNTRY, ["header", "countryCode"])],
+        ["mainagencycode", this.code2002(h.agencyCode, AGENCY, ["header", "agencyCode"])],
       ]);
+    }
     x.open("filedesc");
     x.open("titlestmt");
     x.leaf("titleproper", title);
@@ -221,6 +261,14 @@ class Writer {
   did(u: EadUnit, path: (string | number)[]): void {
     const { x } = this;
     x.open("did");
+    // Both schemas need something in a did; an empty title reads back as no title.
+    if (
+      DID_PARTS.every((k) => u[k].length === 0) &&
+      u.title === undefined &&
+      u.repository === undefined
+    ) {
+      x.leaf("unittitle", "");
+    }
     for (const id of u.identifiers) x.leaf("unitid", id);
     if (u.title !== undefined) x.leaf("unittitle", u.title);
     for (const [i, d] of u.dates.entries()) {
@@ -272,7 +320,10 @@ class Writer {
     }
     if (u.languages.length > 0) {
       x.open("langmaterial");
-      for (const l of u.languages) x.leaf("language", l.label, [["langcode", l.code]]);
+      for (const [i, l] of u.languages.entries()) {
+        const code = this.code2002(l.code, LANGUAGE, [...path, "languages", i, "code"]);
+        x.leaf("language", l.label, [["langcode", code]]);
+      }
       x.close("langmaterial");
     }
     if (u.repository !== undefined) {
@@ -280,8 +331,13 @@ class Writer {
       this.term("corpname", u.repository, []);
       x.close("repository");
     }
-    for (const c of u.containers)
-      x.leaf("container", c.value, [[this.v3 ? "localtype" : "type", c.type]]);
+    for (const [i, c] of u.containers.entries())
+      x.leaf("container", c.value, [
+        [
+          this.v3 ? "localtype" : "type",
+          this.code2002(c.type, NMTOKEN, [...path, "containers", i, "type"]),
+        ],
+      ]);
     for (const p of u.physicalLocations) x.leaf("physloc", p);
     for (const a of u.abstracts) x.leaf("abstract", a);
     for (const l of u.links) {

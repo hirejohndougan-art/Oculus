@@ -63,12 +63,8 @@ describe("EAD round trips", () => {
       if (!result.ok) throw new Error("unreadable");
       expect(result.value.report.levelChanges).toEqual([]);
       expect(result.value.report.warnings.filter((w) => w.code !== "date_not_edtf")).toEqual([]);
-      // Only EAD3's maintenance bookkeeping, which every export writes afresh.
-      expect(result.value.report.unmapped.map((n) => n.path)).toEqual(
-        version === "ead3"
-          ? ["/ead/control[1]/maintenancestatus[1]", "/ead/control[1]/maintenancehistory[1]"]
-          : [],
-      );
+      // Not even EAD3's maintenance bookkeeping, which every export writes afresh.
+      expect(result.value.report.unmapped).toEqual([]);
     }
   });
 });
