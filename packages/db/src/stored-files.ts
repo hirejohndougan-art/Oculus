@@ -37,6 +37,8 @@ export const STORED_FILE_TABLE_PRIVILEGES: Readonly<Record<string, readonly stri
     stored_file_events: Object.freeze(["INSERT"]),
     // The files folder's install ID, made once (0026).
     file_store_binding: Object.freeze(["INSERT"]),
+    // The folder's lease, a new epoch at each start, hour and purge (0026).
+    file_store_epochs: Object.freeze(["INSERT"]),
   });
 
 /** One file attached to a digital asset. */
@@ -295,63 +297,149 @@ export async function insertStoredFileEvent(
       ${file.recordId}::uuid, ${file.sha256}, ${file.size}::bigint, ${actor})`);
 }
 
-/** How long a removed file's bytes stay on disk before the sweep may take them. */
+/** How long a removed file's bytes stay on disk before the purge may take them. */
 export const REMOVED_FILE_GRACE_SECONDS = 7 * 24 * 3600;
-/** How long a copy placed by an attach that never committed stays before the sweep may take it. */
+/** How long a copy placed by an attach that never committed stays before the purge may take it. */
 export const PLACING_GRACE_SECONDS = 24 * 3600;
 
+/** One content the purge would delete, with what this database last did with it. */
+export interface PurgeCandidate {
+  readonly sha256: string;
+  readonly size: number;
+  readonly lastEvent: "removed" | "placing";
+  readonly lastEventAt: string;
+}
+
 /**
- * What the sweep may do with these contents, **denying by default** (D-086,
- * third review): `deletable` holds only contents no row names whose latest
- * event in this database is a removal older than `removedGrace` or a
- * placing older than `placingGrace` (by the database's clock); `unknown`
- * holds contents no row names and this database has no event for at all
- * (another install's, or files attached after this database was copied):
- * they are kept, only counted. Everything else is kept.
+ * The contents among `hashes` the operator's purge may delete (D-086,
+ * fourth review), **denying by default**. Events before `since` (the last
+ * `files:adopt`) count as if they didn't exist. A content qualifies only if
+ * no row names it and either
+ * - this database's newest event for it is a removal older than
+ *   `REMOVED_FILE_GRACE_SECONDS` (so no placing or attach came after it); or
+ * - its newest event is a placing (an attach that never committed) older
+ *   than `PLACING_GRACE_SECONDS`, and no removal of it happened within the
+ *   last `REMOVED_FILE_GRACE_SECONDS` (a failed attach never shortens a
+ *   removal's grace).
+ * Everything else, content with no event here included, is kept.
  */
-export async function sweepableContents(
+export async function purgeCandidates(
   db: Queryable,
   organizationId: OrganizationId,
   hashes: readonly string[],
-  grace: { readonly removed?: number; readonly placing?: number } = {},
-): Promise<{ readonly deletable: ReadonlySet<string>; readonly unknown: ReadonlySet<string> }> {
+  since: string | null,
+): Promise<readonly PurgeCandidate[]> {
   checkOrganization(organizationId);
-  const removedGrace = grace.removed ?? REMOVED_FILE_GRACE_SECONDS;
-  const placingGrace = grace.placing ?? PLACING_GRACE_SECONDS;
-  for (const g of [removedGrace, placingGrace]) {
-    if (!Number.isInteger(g) || g < 0) throw new TypeError("Not a grace.");
-  }
   const wanted = hashes.filter((h) => isSha256Hex(h));
-  if (wanted.length === 0) return { deletable: new Set(), unknown: new Set() };
+  if (wanted.length === 0) return [];
   const rows = await db.rows<{
     sha256: string;
-    named: boolean;
-    kind: string | null;
+    kind: string;
+    at: string;
+    size: number;
     old: boolean;
+    recent_removal: boolean;
   }>(sql`
-    SELECT h.sha256,
-      EXISTS (SELECT 1 FROM public.stored_files f
-              WHERE f.organization_id = ${organizationId}::uuid AND f.sha256 = h.sha256) AS named,
-      last.kind,
-      coalesce(last.occurred_at < clock_timestamp() - make_interval(secs =>
-        CASE last.kind WHEN 'removed' THEN ${removedGrace}::integer
-                       ELSE ${placingGrace}::integer END), false) AS old
+    SELECT h.sha256, last.kind, last.byte_size::float8 AS size,
+      to_char(last.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS at,
+      last.occurred_at < clock_timestamp() - make_interval(secs =>
+        CASE last.kind WHEN 'removed' THEN ${REMOVED_FILE_GRACE_SECONDS}::integer
+                       ELSE ${PLACING_GRACE_SECONDS}::integer END) AS old,
+      EXISTS (SELECT 1 FROM public.stored_file_events r
+              WHERE r.organization_id = ${organizationId}::uuid AND r.sha256 = h.sha256
+                AND r.kind = 'removed'
+                AND (${since}::timestamptz IS NULL OR r.occurred_at >= ${since}::timestamptz)
+                AND r.occurred_at >= clock_timestamp()
+                  - make_interval(secs => ${REMOVED_FILE_GRACE_SECONDS}::integer)) AS recent_removal
     FROM unnest(${wanted}::text[]) AS h(sha256)
-    LEFT JOIN LATERAL (
-      SELECT e.kind, e.occurred_at FROM public.stored_file_events e
+    JOIN LATERAL (
+      SELECT e.kind, e.occurred_at, e.byte_size FROM public.stored_file_events e
       WHERE e.organization_id = ${organizationId}::uuid AND e.sha256 = h.sha256
+        AND (${since}::timestamptz IS NULL OR e.occurred_at >= ${since}::timestamptz)
       ORDER BY e.occurred_at DESC, e.id DESC
       LIMIT 1
-    ) last ON true`);
-  const deletable = new Set<string>();
-  const unknown = new Set<string>();
+    ) last ON true
+    WHERE NOT EXISTS (SELECT 1 FROM public.stored_files f
+                      WHERE f.organization_id = ${organizationId}::uuid AND f.sha256 = h.sha256)
+    ORDER BY h.sha256`);
+  const out: PurgeCandidate[] = [];
   for (const row of rows) {
-    if (row.named) continue;
-    if (row.kind === null) unknown.add(row.sha256);
-    else if ((row.kind === "removed" || row.kind === "placing") && row.old)
-      deletable.add(row.sha256);
+    if (!row.old) continue;
+    if (row.kind === "removed") {
+      out.push(
+        Object.freeze({
+          sha256: row.sha256,
+          size: row.size,
+          lastEvent: "removed",
+          lastEventAt: row.at,
+        }),
+      );
+    } else if (row.kind === "placing" && !row.recent_removal) {
+      out.push(
+        Object.freeze({
+          sha256: row.sha256,
+          size: row.size,
+          lastEvent: "placing",
+          lastEventAt: row.at,
+        }),
+      );
+    }
   }
-  return { deletable, unknown };
+  return Object.freeze(out);
+}
+
+/** The folder's lease as this database holds it: the newest epoch, and the last adopt's time. */
+export interface FileStoreLease {
+  readonly epoch: string;
+  readonly kind: "bind" | "renew" | "adopt";
+  readonly madeAt: string;
+  /** The last `files:adopt` (events before it are unknown to the purge), or null. */
+  readonly since: string | null;
+}
+
+/** The current epoch, or undefined before the folder is first bound. */
+export async function readFileStoreLease(db: Queryable): Promise<FileStoreLease | undefined> {
+  const rows = await db.rows<{
+    epoch: string;
+    kind: string;
+    made_at: string;
+    since: string | null;
+  }>(sql`
+    SELECT e.epoch::text AS epoch, e.kind,
+      to_char(e.made_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS made_at,
+      (SELECT to_char(max(a.made_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+       FROM public.file_store_epochs a WHERE a.kind = 'adopt') AS since
+    FROM public.file_store_epochs e
+    ORDER BY e.made_at DESC, e.epoch DESC
+    LIMIT 1`);
+  const row = rows[0];
+  if (row === undefined) return undefined;
+  if (row.kind !== "bind" && row.kind !== "renew" && row.kind !== "adopt") {
+    throw new Error("A file store epoch doesn't read as one.");
+  }
+  return Object.freeze({ epoch: row.epoch, kind: row.kind, madeAt: row.made_at, since: row.since });
+}
+
+/**
+ * Takes the lease's lock until the transaction ends (advisory, classid 70,
+ * one key for the whole install), so two starts, renewals or purges of one
+ * database never move the epoch past each other.
+ */
+export async function lockFileStoreLease(tx: Queryable): Promise<void> {
+  await tx.rows(sql`SELECT pg_advisory_xact_lock(70, 0)`);
+}
+
+/** Records a new epoch (the database stamps the time). */
+export async function insertFileStoreEpoch(
+  tx: Queryable,
+  epoch: string,
+  kind: "bind" | "renew" | "adopt",
+  databaseIdentity: string,
+): Promise<void> {
+  if (!isRecordId(epoch)) throw new TypeError("Not an epoch.");
+  await tx.execute(sql`
+    INSERT INTO public.file_store_epochs (epoch, kind, database_identity)
+    VALUES (${epoch}::uuid, ${kind}, ${databaseIdentity})`);
 }
 
 /**

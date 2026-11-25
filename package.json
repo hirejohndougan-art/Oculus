@@ -29,6 +29,8 @@
     "gate": "node scripts/gate.mjs",
     "admin": "node packages/api/dist/admin-cli.js",
     "desktop": "node packages/api/dist/desktop-cli.js",
+    "files:purge": "node packages/api/dist/files-cli.js purge",
+    "files:adopt": "node packages/api/dist/files-cli.js adopt",
     "desktop:database": "node packages/api/dist/desktop-database-cli.js",
     "desktop:password": "node packages/api/dist/desktop-password-cli.js",
     "release": "node packages/api/dist/release-cli.js",

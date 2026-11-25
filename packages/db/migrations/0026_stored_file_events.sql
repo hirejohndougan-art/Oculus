@@ -31,12 +31,10 @@ CREATE TABLE public.file_store_binding (
 --             transaction before the copy is placed);
 --   attached  the attach committed;
 --   removed   the file was removed from its asset.
--- The sweep deletes only what this database itself decided to give up
--- (deny by default, third review): a copy no row names whose latest event
--- here is a removal older than seven days, or a placing older than a day
--- (an attach that failed after placing its copy). A copy this database has
--- no event for is kept: a restored or cloned database never deletes files
--- it didn't remove itself.
+-- Nothing automatic ever deletes a stored copy (fourth review). The
+-- operator's purge (npm run files:purge) reads this log to free the space
+-- of content this database removed at least seven days ago, or of a copy
+-- an attach placed but never committed, and nothing else.
 CREATE TABLE public.stored_file_events (
   organization_id uuid NOT NULL REFERENCES public.organizations (id),
   id uuid NOT NULL CONSTRAINT stored_file_events_id_v4
@@ -100,3 +98,44 @@ ALTER TABLE public.stored_file_events ENABLE ALWAYS TRIGGER stored_file_events_a
 ALTER TABLE public.stored_file_events ENABLE ALWAYS TRIGGER stored_file_events_no_truncate;
 ALTER TABLE public.file_store_binding ENABLE ALWAYS TRIGGER file_store_binding_append_only;
 ALTER TABLE public.file_store_binding ENABLE ALWAYS TRIGGER file_store_binding_no_truncate;
+
+-- The files folder's lease (fourth review): an epoch, a random ID that the
+-- marker file in the folder and this table must share. The admin server
+-- moves it to a new value at every start and every hour, and the purge at
+-- every run (here first, then in the marker); a second database using the
+-- same folder (a copy, a restored dump, a clone) then finds the two apart at
+-- its next start or purge and is refused the purge. The latest row is the
+-- current epoch. An adopt row (npm run files:adopt) also records `since`:
+-- the purge treats every file event older than it as unknown.
+CREATE TABLE public.file_store_epochs (
+  epoch uuid PRIMARY KEY CONSTRAINT file_store_epochs_epoch_v4
+    CHECK (epoch::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'),
+  kind text NOT NULL CONSTRAINT file_store_epochs_kind CHECK (kind IN ('bind', 'renew', 'adopt')),
+  database_identity text NOT NULL CONSTRAINT file_store_epochs_identity_format
+    CHECK (database_identity ~ '^[0-9A-Za-z_.:-]{1,100}$'),
+  -- The database's clock, never the caller's.
+  made_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE INDEX file_store_epochs_made_at ON public.file_store_epochs (made_at);
+
+CREATE FUNCTION public.file_store_epochs_stamp() RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  NEW.made_at := clock_timestamp();
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER file_store_epochs_stamp BEFORE INSERT ON public.file_store_epochs
+  FOR EACH ROW EXECUTE FUNCTION public.file_store_epochs_stamp();
+CREATE TRIGGER file_store_epochs_append_only BEFORE UPDATE OR DELETE ON public.file_store_epochs
+  FOR EACH ROW EXECUTE FUNCTION public.stored_files_append_only();
+CREATE TRIGGER file_store_epochs_no_truncate BEFORE TRUNCATE ON public.file_store_epochs
+  FOR EACH STATEMENT EXECUTE FUNCTION public.stored_files_append_only();
+
+ALTER TABLE public.file_store_epochs ENABLE ALWAYS TRIGGER file_store_epochs_stamp;
+ALTER TABLE public.file_store_epochs ENABLE ALWAYS TRIGGER file_store_epochs_append_only;
+ALTER TABLE public.file_store_epochs ENABLE ALWAYS TRIGGER file_store_epochs_no_truncate;

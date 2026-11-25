@@ -47,7 +47,9 @@
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import {
+  databaseIdentity,
   loadSecretKeyring,
+  readFileStoreBinding,
   sql,
   type Database,
   type EnrolmentDelivery,
@@ -99,6 +101,25 @@ const FILE_STORE_PROBLEMS: Readonly<Record<FileStoreProblem, string>> = {
 
 /** Temporary upload files older than this are swept: twice an upload's whole limit. */
 export const INCOMING_MAX_AGE_MS = 2 * UPLOAD_TIMEOUTS.request;
+/** How often the folder's lease moves on (D-086: at most this long until a shared folder shows). */
+export const FILE_LEASE_EVERY_MS = 60 * 60_000;
+
+/**
+ * What a server uses the files folder for: the install, the database's
+ * identity, its name and the server's port, so two servers of one database
+ * agree and two databases never do.
+ */
+async function serverKey(db: Database): Promise<string> {
+  const rows = await db.rows<{ name: string; port: number | null }>(
+    sql`SELECT current_database() AS name, inet_server_port() AS port`,
+  );
+  const binding = await readFileStoreBinding(db);
+  const identity = await databaseIdentity(db);
+  return encodeURIComponent(
+    `${binding ?? "-"}|${identity}|${rows[0]?.name ?? "-"}|${String(rows[0]?.port ?? "-")}`,
+  );
+}
+
 /** How often the file sweep runs (and once at startup). */
 export const FILE_SWEEP_EVERY_MS = 15 * 60_000;
 
@@ -366,21 +387,34 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
       { cause: error },
     );
   }
-  if (bound.ok && bound.warning === "database_changed") {
-    // A restored or copied database on this folder: it starts, but it
-    // never sweeps until an operator says this is the database now (D-086).
-    log({ event: "startup_warning", code: "files_database_changed" });
-  }
   if (!bound.ok) {
     throw new Error(`refusing to start: ${FILES_DIR_ENV}: ${FILE_STORE_PROBLEMS[bound.problem]}`);
   }
+  if (bound.warning === "files_shared_or_restored") {
+    // Another database uses this folder, or this one was restored or
+    // copied: it starts, but nothing can be purged until `files:adopt`.
+    log({ event: "startup_warning", code: "files_shared_or_restored" });
+  }
+  // Two databases must never share one folder: refused if another live
+  // server on this machine uses it for another database (D-086).
+  const claim = await files.claimServer(await serverKey(options.db));
+  if (!claim.ok) {
+    throw new Error(
+      `refusing to start: ${FILES_DIR_ENV}: another Oculus server on this computer uses this folder with another database. Give each database a folder of its own.`,
+    );
+  }
+  const renew = async (): Promise<void> => {
+    try {
+      if (!(await service.renewFileLease())) {
+        log({ event: "startup_warning", code: "files_shared_or_restored" });
+      }
+    } catch (error) {
+      log({ event: "service_error", operation: "renewFileLease", ...redactedError(error) });
+    }
+  };
   const sweep = async (): Promise<void> => {
     try {
       const swept = await service.sweepFiles(INCOMING_MAX_AGE_MS);
-      if (swept.skipped > 0) log({ event: "startup_warning", code: "files_sweep_skipped" });
-      if (swept.halted !== undefined) {
-        log({ event: "startup_warning", code: `files_sweep_${swept.halted}` });
-      }
       if (swept.failed > 0)
         log({ event: "service_error", operation: "sweepFiles", code: "partial" });
     } catch (error) {
@@ -388,16 +422,26 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     }
   };
   await sweep();
-  const app = await buildServer({
-    env,
-    routes,
-    ...(options.logger === undefined ? {} : { logger: options.logger }),
-    ...(admin === undefined ? {} : { admin }),
-  });
+  let app: FastifyInstance;
+  try {
+    app = await buildServer({
+      env,
+      routes,
+      ...(options.logger === undefined ? {} : { logger: options.logger }),
+      ...(admin === undefined ? {} : { admin }),
+    });
+  } catch (error) {
+    claim.release();
+    throw error;
+  }
   const timer = setInterval(() => void sweep(), FILE_SWEEP_EVERY_MS);
   timer.unref();
+  const lease = setInterval(() => void renew(), FILE_LEASE_EVERY_MS);
+  lease.unref();
   app.server.once("close", () => {
     clearInterval(timer);
+    clearInterval(lease);
+    claim.release();
   });
   return app;
 }

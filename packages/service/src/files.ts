@@ -43,8 +43,12 @@ import {
   findStoredFileById,
   insertFileStoreBinding,
   insertStoredFileEvent,
-  sweepableContents,
+  purgeCandidates,
   databaseIdentity,
+  readFileStoreLease,
+  lockFileStoreLease,
+  insertFileStoreEpoch,
+  type PurgeCandidate,
   readFileStoreBinding,
   insertStoredFile,
   listStoredFiles,
@@ -116,6 +120,14 @@ export interface FileSweep {
   readonly halted?: "marker_changed" | "database_changed";
 }
 
+/** One content the purge would delete. */
+export interface PurgeEntry extends PurgeCandidate {
+  readonly organizationId: string;
+}
+
+/** Why the purge was refused. */
+export type PurgeProblem = "no_store" | "not_bound" | "lease_mismatch";
+
 /** Why the files folder can't be used with this database (`bindFileStore`). */
 export type FileStoreProblem = "no_store" | "other_install" | "marker_missing" | "not_empty";
 
@@ -159,8 +171,42 @@ export interface FileOperations {
    * succeeds the sweep deletes nothing.
    */
   bindFileStore(): Promise<
-    | { readonly ok: true; readonly warning?: "database_changed" }
+    | { readonly ok: true; readonly warning?: "files_shared_or_restored" }
     | { readonly ok: false; readonly problem: FileStoreProblem }
+  >;
+  /**
+   * Moves the folder's lease on (the admin server calls it every hour):
+   * `false` when the folder's epoch isn't this database's any more, which
+   * also leaves the marker naming an epoch no database holds.
+   */
+  renewFileLease(): Promise<boolean>;
+  /**
+   * The operator's purge (`npm run files:purge`; D-086): the copies this
+   * database may delete (see `purgeCandidates`), and with `apply` deletes
+   * them (only those listed in `only`, `<organization>/<sha256>`, when
+   * given). Refused unless the folder is this install's and its lease
+   * epoch is this database's (which then moves on).
+   */
+  purgeFiles(options: { readonly apply: boolean; readonly only?: readonly string[] }): Promise<
+    | {
+        readonly ok: true;
+        readonly value: { readonly candidates: readonly PurgeEntry[]; readonly deleted: number };
+      }
+    | { readonly ok: false; readonly problem: PurgeProblem }
+  >;
+  /**
+   * `npm run files:adopt`: makes this database the folder's own again after
+   * a restore or a copy: a new epoch, this database's identity in the
+   * marker, and a `since` before which every file event counts as unknown
+   * to the purge. Refused while the marker has changed within the last hour
+   * (another database still uses the folder).
+   */
+  adoptFileStore(): Promise<
+    | { readonly ok: true }
+    | {
+        readonly ok: false;
+        readonly problem: "no_store" | "marker_missing" | "other_install" | "epoch_moving";
+      }
   >;
   /** The asset's files (name, size, sniffed type, who and when). */
   listFiles(
@@ -186,6 +232,9 @@ function refusal(path: (string | number)[], code: string, message: string): Serv
 }
 
 const NO_STORE = refusal(["files"], "files_unavailable", "Files can't be stored on this server.");
+
+/** How long the marker must have stood still before `adoptFileStore`: an hour (D-086). */
+export const ADOPT_QUIET_MS = 60 * 60_000;
 
 /** A marker, waiting briefly while another server is writing one (its temporary file exists). */
 async function markerSettled(store: FileStore): Promise<StoreMarker | undefined> {
@@ -270,6 +319,62 @@ export function fileOperations(
       };
     }
     return allowed;
+  }
+
+  /** The binding row and the first epoch, together. */
+  async function firstBinding(storeId: string, epoch: string, identity: string): Promise<string> {
+    return db.transaction(async (tx) => {
+      await lockFileStoreLease(tx);
+      const held = await insertFileStoreBinding(tx, storeId);
+      if (held === storeId && (await readFileStoreLease(tx)) === undefined) {
+        await insertFileStoreEpoch(tx, epoch, "bind", identity);
+      }
+      return held;
+    });
+  }
+
+  /**
+   * The lease (D-086, fourth review): if the marker's epoch is this
+   * database's current one, a new epoch is committed here and then put in
+   * the marker; `true`. Otherwise (another database uses the folder, or
+   * this one was restored or copied) nothing here changes, the marker gets
+   * an epoch no database holds, so neither side can purge until an
+   * operator runs `files:adopt`, and `false`. A mismatch is looked at again
+   * twice a second apart first: another server of this database may be
+   * between its commit and its rename.
+   */
+  async function renewLease(): Promise<boolean> {
+    if (store === undefined) return false;
+    const bound = store.boundTo();
+    if (bound === undefined) return false;
+    const identity = await databaseIdentity(db);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const epoch = randomUUID();
+      const renewed = await db.transaction(async (tx) => {
+        await lockFileStoreLease(tx);
+        const marker = await store.readMarker().catch(() => undefined);
+        const lease = await readFileStoreLease(tx);
+        if (marker?.storeId !== bound || lease === undefined || marker.epoch !== lease.epoch) {
+          return false;
+        }
+        await insertFileStoreEpoch(tx, epoch, "renew", identity);
+        return true;
+      });
+      if (renewed) {
+        await store.replaceMarker({ storeId: bound, database: identity, epoch });
+        return true;
+      }
+      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    const marker = await store.readMarker().catch(() => undefined);
+    if (marker?.storeId === bound) {
+      await store.replaceMarker({
+        storeId: bound,
+        database: marker.database ?? identity,
+        epoch: randomUUID(),
+      });
+    }
+    return false;
   }
 
   function diskFull(): ServiceRefusal {
@@ -453,50 +558,46 @@ export function fileOperations(
       let marker = await markerSettled(store);
       if (held === undefined && marker === undefined) {
         // This database has never used a files folder: an empty one gets a
-        // new install ID, marker first (so a crash leaves a marker this
-        // database can still adopt, below), then the row.
+        // new install ID and a first epoch, marker first (so a crash leaves
+        // a marker this database can still adopt, below), then the rows.
         if (!(await store.isEmpty())) return { ok: false, problem: "not_empty" };
-        const storeId = randomUUID();
+        const fresh = { storeId: randomUUID(), database: identity, epoch: randomUUID() };
         let wrote = false;
         try {
-          await store.writeMarker(storeId, identity);
+          await store.writeMarker(fresh);
           wrote = true;
         } catch {
           // Another server of this database (or another install) wrote one
           // first: decided below from what it wrote.
         }
         if (wrote) {
-          held = await insertFileStoreBinding(db, storeId);
-          marker = { storeId, database: identity };
+          held = await firstBinding(fresh.storeId, fresh.epoch, identity);
+          marker = fresh;
         } else {
           marker = await markerSettled(store);
         }
       }
       if (held === undefined && marker !== undefined) {
-        // A marker without this database's row: either another server of
-        // this database is between its two steps, or a crash came between
-        // them (the marker names this database's identity, nothing else
-        // ever does), or it is another install's.
+        // A marker without this database's row: another server of this
+        // database between its two steps, a crash between them (the marker
+        // names this database), or another install's folder.
         held = await waitFor(() => readFileStoreBinding(db));
-        if (held === undefined && marker.database === identity) {
-          held = await insertFileStoreBinding(db, marker.storeId);
+        if (held === undefined && marker.database === identity && marker.epoch !== undefined) {
+          held = await firstBinding(marker.storeId, marker.epoch, identity);
         }
       }
       if (held === undefined) return { ok: false, problem: "other_install" };
       if (marker === undefined) return { ok: false, problem: "marker_missing" };
       if (marker.storeId !== held) return { ok: false, problem: "other_install" };
       store.bind(held);
-      if (marker.database === undefined) {
-        // An operator removed the database line to let this database sweep
-        // again (after a restore): it is recorded now.
-        await store.recordDatabase(held, identity);
-        return { ok: true };
-      }
-      // A restored or copied database: bound (uploads work), but its sweep
-      // stays off until an operator says this is the database now.
-      return marker.database === identity
-        ? { ok: true }
-        : { ok: true, warning: "database_changed" };
+      // The lease: a new epoch now, if the folder's still matches ours.
+      const renewed = await renewLease();
+      return renewed ? { ok: true } : { ok: true, warning: "files_shared_or_restored" };
+    },
+
+    async renewFileLease() {
+      if (store?.boundTo() === undefined) return false;
+      return renewLease();
     },
 
     async sweepFiles(incomingMaxAgeMs) {
@@ -509,19 +610,13 @@ export function fileOperations(
         unbound: false,
       };
       if (store === undefined) return none;
-      // Not yet checked against this database: the folder may be another
-      // install's, so nothing outside our own uploads is touched.
       const bound = store.boundTo();
       if (bound === undefined || bound !== (await readFileStoreBinding(db))) {
         return { ...none, unbound: true };
       }
-      // The marker again, every time, and the database's identity in it.
-      const marker = await store.readMarker().catch(() => undefined);
-      if (marker?.storeId !== bound) return { ...none, halted: "marker_changed" };
-      if (marker.database !== (await databaseIdentity(db))) {
-        return { ...none, halted: "database_changed" };
-      }
-      // Only organizations of this database: any other folder is left alone.
+      // Never a stored copy: only temporary uploads, and the trash a purge
+      // left (a purge stopped between moving copies aside and deleting them),
+      // in this database's organizations' folders only.
       const onDisk = await store.organizations();
       const known = await existingOrganizations(db, onDisk);
       const ours = onDisk.filter((id) => known.has(id));
@@ -533,35 +628,84 @@ export function fileOperations(
         failed++;
       }
       let contents = 0;
-      let skipped = 0;
-      let unknown = 0;
       for (const organizationId of ours) {
         try {
-          // Decided under the organization's file lock (an attach placing a
-          // copy holds it until its row is committed), and moved aside there
-          // in one cheap rename each; deleted after the lock is released.
-          // Deny by default: only what this database itself gave up.
-          const counts = await db.transaction(async (tx) => {
-            await lockOrganizationFiles(tx, organizationId);
-            const listed = await store.listContents(organizationId);
-            let unknownHere = 0;
-            for (let i = 0; i < listed.hashes.length; i += 1000) {
-              const batch = listed.hashes.slice(i, i + 1000);
-              const decided = await sweepableContents(tx, organizationId, batch);
-              unknownHere += decided.unknown.size;
-              for (const sha256 of decided.deletable) await store.trash(organizationId, sha256);
-            }
-            return { skipped: listed.skipped, unknown: unknownHere };
-          });
-          skipped += counts.skipped;
-          unknown += counts.unknown;
           contents += await store.emptyTrash(organizationId);
         } catch {
-          // One organization's trouble doesn't stop the others.
           failed++;
         }
       }
-      return Object.freeze({ incoming, contents, skipped, unknown, failed, unbound: false });
+      return Object.freeze({ incoming, contents, skipped: 0, unknown: 0, failed, unbound: false });
+    },
+
+    async purgeFiles(purgeOptions) {
+      if (store === undefined) return { ok: false, problem: "no_store" };
+      const held = await readFileStoreBinding(db);
+      const marker = await store.readMarker().catch(() => undefined);
+      if (held === undefined || marker?.storeId !== held)
+        return { ok: false, problem: "not_bound" };
+      store.bind(held);
+      // The lease first: refused unless the folder's epoch is this
+      // database's, which then moves on (here, then in the marker).
+      if (!(await renewLease())) return { ok: false, problem: "lease_mismatch" };
+      const lease = await readFileStoreLease(db);
+      const only = purgeOptions.only === undefined ? undefined : new Set(purgeOptions.only);
+      const onDisk = await store.organizations();
+      const known = await existingOrganizations(db, onDisk);
+      const found: PurgeEntry[] = [];
+      let deleted = 0;
+      for (const organizationId of onDisk) {
+        if (!known.has(organizationId)) continue;
+        // Decided under the organization's file lock, moved aside there in
+        // one rename each, deleted after the lock is released.
+        const listed = await db.transaction(async (tx) => {
+          await lockOrganizationFiles(tx, organizationId);
+          const contents = await store.listContents(organizationId);
+          const here: PurgeEntry[] = [];
+          for (let i = 0; i < contents.hashes.length; i += 1000) {
+            const batch = contents.hashes.slice(i, i + 1000);
+            for (const c of await purgeCandidates(
+              tx,
+              organizationId,
+              batch,
+              lease?.since ?? null,
+            )) {
+              here.push(Object.freeze({ organizationId, ...c }));
+            }
+          }
+          if (purgeOptions.apply) {
+            for (const entry of here) {
+              if (only !== undefined && !only.has(`${organizationId}/${entry.sha256}`)) continue;
+              await store.trash(organizationId, entry.sha256);
+            }
+          }
+          return here;
+        });
+        found.push(...listed);
+        if (purgeOptions.apply) deleted += await store.emptyTrash(organizationId);
+      }
+      return { ok: true, value: Object.freeze({ candidates: Object.freeze(found), deleted }) };
+    },
+
+    async adoptFileStore() {
+      if (store === undefined) return { ok: false, problem: "no_store" };
+      const held = await readFileStoreBinding(db);
+      const marker = await store.readMarker().catch(() => undefined);
+      if (marker === undefined) return { ok: false, problem: "marker_missing" };
+      if (held === undefined || marker.storeId !== held)
+        return { ok: false, problem: "other_install" };
+      // Another database still moving the epoch: not now.
+      const age = await store.markerAge();
+      if (age === undefined || age < ADOPT_QUIET_MS) return { ok: false, problem: "epoch_moving" };
+      const identity = await databaseIdentity(db);
+      const epoch = randomUUID();
+      await db.transaction(async (tx) => {
+        await lockFileStoreLease(tx);
+        await insertFileStoreEpoch(tx, epoch, "adopt", identity);
+      });
+      await store.replaceMarker({ storeId: held, database: identity, epoch });
+      store.bind(held);
+      return { ok: true };
     },
 
     async listFiles(context, recordId) {

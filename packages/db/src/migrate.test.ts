@@ -26,6 +26,7 @@ import { freshDatabase, type TestDatabase } from "./test-database.fixtures.js";
 const ALL_TABLES = [
   "dublin_core_mappings",
   "file_store_binding",
+  "file_store_epochs",
   "former_identifiers",
   "identifier_counters",
   "identifier_holdings",
