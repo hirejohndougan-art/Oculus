@@ -97,6 +97,9 @@ export interface EadExport {
   readonly notices: readonly Issue[];
 }
 
+/** The longest export file, in characters (a finding aid stays one download). */
+export const MAX_EAD_EXPORT_CHARS = 32 * 2 ** 20;
+
 /** The most units one export holds (a finding aid stays one download). */
 export const MAX_EXPORT_UNITS = 5_000;
 
@@ -170,6 +173,12 @@ function token(value: unknown): string | undefined {
   return text === undefined || /\s/.test(text) ? undefined : text;
 }
 
+/** A vocabulary code EAD's `@source` can hold (an NMTOKEN), or undefined. */
+function sourceCode(value: unknown): string | undefined {
+  const text = token(value);
+  return text !== undefined && /^[\p{L}\p{N}._:-]+$/u.test(text) ? text : undefined;
+}
+
 /** Each value of a field (one, or each of a repeatable list). */
 function each(value: FieldValue): FieldValue[] {
   if (Array.isArray(value)) return value as FieldValue[];
@@ -203,6 +212,21 @@ function textOf(field: EadExportField, value: FieldValue): string | undefined {
     case "record_link":
       return undefined;
   }
+}
+
+/**
+ * A value's text, even when it doesn't fit its field's kind (a value left
+ * from an older template): the first of its label, value, URL or URI.
+ */
+function anyText(field: EadExportField, value: FieldValue): string | undefined {
+  const text = textOf(field, value);
+  if (text !== undefined || field.kind === "record_link") return text;
+  if (typeof value === "string") return line(value);
+  for (const key of ["label", "value", "url", "uri"]) {
+    const found = line(prop(value, key));
+    if (found !== undefined) return found;
+  }
+  return undefined;
 }
 
 /**
@@ -350,7 +374,7 @@ function mapField(
   unitId: RecordId,
 ): void {
   if (field.staffOnly && !staff) throw new StaffInPublic();
-  const values = each(field.value);
+  let values = each(field.value);
   if (values.length === 0) return;
   const head = line(field.label) ?? field.key;
 
@@ -359,7 +383,7 @@ function mapField(
     const texts =
       field.kind === "long_text"
         ? values.flatMap((v) => paragraphs(v))
-        : values.map((v) => textOf(field, v)).filter((t): t is string => t !== undefined);
+        : values.map((v) => anyText(field, v)).filter((t): t is string => t !== undefined);
     if (field.kind === "rights") {
       for (const v of values) {
         const note = line(prop(v, "note"));
@@ -368,6 +392,21 @@ function mapField(
     }
     if (texts.length > 0) b.notes.push({ kind, head, paragraphs: texts, internal: true });
   };
+
+  // A number whose identifier type isn't public is staff-only, whatever field
+  // shows it (D-022): in a staff file it goes in a note of its own, marked.
+  if (field.kind === "identifier" && staff) {
+    const hidden = values.filter((v) => {
+      const type = prop(v, "type");
+      return !(typeof type === "string" && options.publicIdentifierTypes?.has(type) === true);
+    });
+    const texts = hidden
+      .map((v) => line(prop(v, "value")))
+      .filter((t): t is string => t !== undefined);
+    if (texts.length > 0) b.notes.push({ kind: "odd", head, paragraphs: texts, internal: true });
+    values = values.filter((v) => !hidden.includes(v));
+    if (values.length === 0) return;
+  }
 
   if (field.kind === "record_link") {
     // Never written: a record link's label may be copied from a private record (D-045).
@@ -397,13 +436,7 @@ function mapField(
       if (field.kind === "identifier") {
         for (const v of values) {
           const value = line(prop(v, "value"));
-          if (value === undefined) continue;
-          const type = prop(v, "type");
-          const publicType =
-            !staff ||
-            (typeof type === "string" && options.publicIdentifierTypes?.has(type) === true);
-          if (publicType) b.identifiers.push(value);
-          else b.notes.push({ kind: "odd", head, paragraphs: [value], internal: true });
+          if (value !== undefined) b.identifiers.push(value);
         }
         return;
       }
@@ -443,7 +476,7 @@ function mapField(
         const label = textOf(field, v);
         if (label === undefined) continue;
         const identifier = token(prop(v, "uri"));
-        const source = token(prop(v, "vocabulary"));
+        const source = sourceCode(prop(v, "vocabulary"));
         b.creators.push({
           element: "name",
           label,
@@ -471,7 +504,7 @@ function mapField(
           const label = textOf(field, v);
           if (label === undefined) continue;
           const identifier = token(prop(v, "uri"));
-          const source = token(prop(v, "vocabulary"));
+          const source = sourceCode(prop(v, "vocabulary"));
           b.accessPoints.push({
             element: field.key === "places" || field.kind === "place" ? "geogname" : "subject",
             label,
@@ -504,7 +537,7 @@ function mapField(
   const texts =
     field.kind === "long_text"
       ? values.flatMap((v) => paragraphs(v))
-      : values.map((v) => textOf(field, v)).filter((t): t is string => t !== undefined);
+      : values.map((v) => anyText(field, v)).filter((t): t is string => t !== undefined);
   if (texts.length === 0) return;
   const headed = noteKind === undefined || SHARED_NOTE_KINDS.has(kind);
   b.notes.push(

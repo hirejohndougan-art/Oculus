@@ -68,19 +68,22 @@ async function unit(
   site = w.a1,
 ): Promise<void> {
   const made = ok(
-    await w.service.createRecord({ organizationId: w.a, actor: actorOf(w.root), siteId: site }, {
-      kind: "archival_unit",
-      level,
-      title: `Invented ${name}`,
-      templateKey: "t-dacs",
-      ...(parent === undefined ? {} : { parentId: ids[parent] }),
-      fields: {
-        scope_and_content: `Public scope of ${name}.`,
-        appraisal: `STAFF appraisal of ${name}.`,
-        date: "1920/1935",
-        rights: { uri: INC },
+    await w.service.createRecord(
+      { organizationId: w.a, actor: actorOf(w.root), siteId: site },
+      {
+        kind: "archival_unit",
+        level,
+        title: `Invented ${name}`,
+        templateKey: "t-dacs",
+        ...(parent === undefined ? {} : { parentId: ids[parent] }),
+        fields: {
+          scope_and_content: `Public scope of ${name}.`,
+          appraisal: `STAFF appraisal of ${name}.`,
+          date: "1920/1935",
+          rights: { uri: INC },
+        },
       },
-    }),
+    ),
   );
   ids[name] = made.record.id;
   if (publish) await publishAs(w, w.a, made.record.id);
@@ -175,10 +178,13 @@ afterAll(async () => {
   }
 });
 
-const get = (host: string, url: string, token?: string) =>
+let clients = 0;
+const get = (host: string, url: string, token?: string, ip?: string) =>
   app.inject({
     method: "GET",
     url,
+    // A fresh client address each time unless given: EAD exports are braked per address.
+    remoteAddress: ip ?? `10.0.${String(Math.floor(++clients / 250))}.${String(clients % 250)}`,
     headers: {
       host,
       ...(token === undefined ? {} : { cookie: `${OCULUS_COOKIES.session}=${token}` }),
@@ -284,5 +290,17 @@ describe("GET /api/records/:id/ead for staff", () => {
       tokens.cataloger,
     );
     expect([400, 422]).toContain(bad.statusCode);
+  });
+});
+
+describe("public EAD exports are braked", () => {
+  it("allows a few a minute per client address, then 429", async () => {
+    const codes: number[] = [];
+    for (let i = 0; i < 7; i += 1) {
+      codes.push(
+        (await get("127.0.0.1", `/records/${id("file")}/ead`, undefined, "10.9.9.9")).statusCode,
+      );
+    }
+    expect(codes).toEqual([200, 200, 200, 200, 200, 200, 429]);
   });
 });

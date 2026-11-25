@@ -245,3 +245,60 @@ describe("export files read back", () => {
     });
   }
 });
+
+describe("review fixes (T-059b)", () => {
+  it("marks a number of a type that isn't public staff-only in any identifier field", () => {
+    const aid = made(
+      findingAidFromUnits(
+        ROOT,
+        units([
+          f("other_numbers", "identifier", [
+            { type: "secret_type", value: "PRIV-123" },
+            { type: "accession", value: "PUB-1" },
+          ]),
+        ]),
+        { audience: "staff", publicIdentifierTypes: new Set(["accession"]) },
+      ),
+    );
+    const notes = aid.archdesc.notes.filter((n) => n.paragraphs.includes("PRIV-123"));
+    expect(notes).toEqual([
+      { kind: "odd", head: "other_numbers", paragraphs: ["PRIV-123"], internal: true },
+    ]);
+    expect(aid.archdesc.notes).toContainEqual({
+      kind: "odd",
+      head: "other_numbers",
+      paragraphs: ["PUB-1"],
+      internal: false,
+    });
+  });
+
+  it("drops a vocabulary that isn't a code instead of failing the file", () => {
+    const aid = made(
+      findingAidFromUnits(
+        ROOT,
+        units([f("subjects", "controlled_term", [{ label: "Bayous", vocabulary: "lc/sh" }])]),
+        { audience: "public" },
+      ),
+    );
+    const point = aid.archdesc.accessPoints.find((p) => p.label === "Bayous");
+    expect(point?.source).toBeUndefined();
+  });
+
+  it("keeps the text of a value that no longer fits its field's kind", () => {
+    const aid = made(
+      findingAidFromUnits(
+        ROOT,
+        units([f("old_link", "text", { url: "https://example.org/x" }, true)]),
+        {
+          audience: "staff",
+        },
+      ),
+    );
+    expect(aid.archdesc.notes).toContainEqual({
+      kind: "odd",
+      head: "old_link",
+      paragraphs: ["https://example.org/x"],
+      internal: true,
+    });
+  });
+});

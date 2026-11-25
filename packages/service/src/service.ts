@@ -105,6 +105,7 @@ import {
   templateMoveChanges,
   validateRecord,
   findingAidFromUnits,
+  MAX_EAD_EXPORT_CHARS,
   writeEad,
   type EadExportField,
   type EadExportUnit,
@@ -2654,7 +2655,16 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
             // Below a unit left out, nothing is placed (findingAidFromUnits).
             if (row.parentId !== undefined && !seen.has(row.parentId)) continue;
             const stored = await readStoredRecord(tx, who.organizationId, row.id);
-            if (stored?.ok !== true || stored.value.record.kind !== "archival_unit") continue;
+            if (stored?.ok !== true || stored.value.record.kind !== "archival_unit") {
+              notices.push(
+                issue(
+                  [],
+                  "unit_unreadable",
+                  "A unit that can't be read as stored was left out, with everything below it; it needs repair.",
+                ),
+              );
+              continue;
+            }
             const record = stored.value.record;
             if (row.id !== recordId) {
               const target = await allowed.checker.target({
@@ -2683,7 +2693,16 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
               template?.ok === true ? template.value.template.fields.map((d) => [d.key, d]) : [],
             );
             const fields: EadExportField[] = [];
-            for (const [fieldKey, value] of Object.entries(record.fields)) {
+            // The top unit's inherited values too (the person's view, as the
+            // record screen shows them): nothing in the file carries them.
+            const own = Object.entries(record.fields);
+            const inherited =
+              row.id === recordId && record.parentId !== undefined
+                ? (await visibleInherited(tx, who.organizationId, recordId, allowed.checker))
+                    .filter((v) => !Object.prototype.hasOwnProperty.call(record.fields, v.key))
+                    .map((v): [string, JsonValue] => [v.key, v.value as JsonValue])
+                : [];
+            for (const [fieldKey, value] of [...own, ...inherited]) {
               const def = defs.get(fieldKey);
               // A value its template no longer has is staff-only, as everywhere (effective.ts).
               fields.push({
@@ -2715,6 +2734,13 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           if (!time.ok) return time;
           const written = writeEad(made.value.findingAid, { version, generatedAt: time.value });
           if (!written.ok) return written;
+          if (written.value.xml.length > MAX_EAD_EXPORT_CHARS) {
+            return refusal(
+              ["recordId"],
+              "too_large",
+              "This finding aid is too big for one file; export a unit lower down.",
+            );
+          }
           return {
             ok: true,
             value: Object.freeze({

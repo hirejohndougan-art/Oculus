@@ -36,7 +36,7 @@
  * `PUBLIC_POOL_WAIT_MS` for a connection (`publicPoolOptions`); either
  * running out is `503 busy` too.
  */
-import { isRecordId, writeEad } from "@oculus/core";
+import { isRecordId, MAX_EAD_EXPORT_CHARS, writeEad } from "@oculus/core";
 import {
   isDatabaseTimeout,
   MAX_PUBLIC_READ_TIME_LIMIT_MS,
@@ -202,7 +202,7 @@ export function publicApiRoutes(options: PublicApiOptions): OculusRoute[] {
         const origin = originOf(request);
         const site = origin === undefined ? undefined : byOrigin.get(origin);
         if (site === undefined) throw NOT_FOUND();
-        if (!limiter.take(clientKey(request.ip), "public")) {
+        if (!limiter.take(clientKey(request.ip), "ead")) {
           throw new Refusal(429, "rate_limited");
         }
         const id = request.params.id ?? "";
@@ -215,12 +215,30 @@ export function publicApiRoutes(options: PublicApiOptions): OculusRoute[] {
           eadSlots.give();
           throw new Refusal(503, "busy");
         }
-        let read: Awaited<ReturnType<typeof readPublicFindingAid>>;
+        let xml: string | undefined;
+        let timedOut: boolean;
         try {
-          read = await readPublicFindingAid(options.db, site.organizationId, site.siteId, id, {
-            baseUrl: `${site.origin}/records/`,
-            ...(options.timeLimitMs === undefined ? {} : { timeLimitMs: options.timeLimitMs }),
-          });
+          const read = await readPublicFindingAid(
+            options.db,
+            site.organizationId,
+            site.siteId,
+            id,
+            {
+              baseUrl: `${site.origin}/records/`,
+              ...(options.timeLimitMs === undefined ? {} : { timeLimitMs: options.timeLimitMs }),
+            },
+          );
+          timedOut = !read.ok && read.issues.some((i) => i.code === "timeout");
+          // Written while the slots are still held, so they bound this work too.
+          const written = read.ok
+            ? writeEad(read.value.findingAid, {
+                version,
+                generatedAt: new Date(options.clock?.() ?? Date.now()).toISOString(),
+              })
+            : undefined;
+          if (written?.ok === true && written.value.xml.length <= MAX_EAD_EXPORT_CHARS) {
+            xml = written.value.xml;
+          }
         } catch (error) {
           if (isDatabaseTimeout(error)) {
             log({ event: "service_error", operation: "readPublicFindingAid", name: "timeout" });
@@ -236,13 +254,9 @@ export function publicApiRoutes(options: PublicApiOptions): OculusRoute[] {
           slots.give();
           eadSlots.give();
         }
-        if (!read.ok) throw NOT_FOUND();
-        const written = writeEad(read.value.findingAid, {
-          version,
-          generatedAt: new Date(options.clock?.() ?? Date.now()).toISOString(),
-        });
-        if (!written.ok) throw NOT_FOUND();
-        const bytes = new TextEncoder().encode(written.value.xml);
+        if (timedOut) throw new Refusal(503, "busy");
+        if (xml === undefined) throw NOT_FOUND();
+        const bytes = new TextEncoder().encode(xml);
         return fileReply({
           body: bytes,
           size: bytes.byteLength,

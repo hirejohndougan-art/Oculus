@@ -41,7 +41,7 @@ import {
 export const MAX_PUBLIC_FINDING_AID_UNITS = 1_000;
 
 /** The most units a staff finding aid holds. */
-export const MAX_STAFF_FINDING_AID_UNITS = 5_000;
+export const MAX_STAFF_FINDING_AID_UNITS = 2_000;
 
 const NOT_AVAILABLE: readonly Issue[] = Object.freeze([
   Object.freeze({ path: [], code: "not_available", message: "No such public finding aid." }),
@@ -52,7 +52,14 @@ export interface PublicFindingAidOptions {
   readonly baseUrl: string;
   /** Each statement's time limit (S-037); `PUBLIC_READ_TIME_LIMIT_MS` by default. */
   readonly timeLimitMs?: number;
+  /** The whole read's time limit, in milliseconds (`PUBLIC_FINDING_AID_DEADLINE_MS` by default). */
+  readonly deadlineMs?: number;
+  /** The clock (tests). */
+  readonly clock?: () => number;
 }
+
+/** How long one public finding aid may take to read, in all (T-059b review). */
+export const PUBLIC_FINDING_AID_DEADLINE_MS = 20_000;
 
 interface UnitRow {
   readonly id: string;
@@ -117,10 +124,22 @@ export async function readPublicFindingAid(
     }
     const rows = Array.isArray(listed.units) ? listed.units : [];
     const units: EadExportUnit[] = [];
+    const clock = options.clock ?? Date.now;
+    const until = clock() + (options.deadlineMs ?? PUBLIC_FINDING_AID_DEADLINE_MS);
+    // Units read and kept: nothing below a unit left out is read at all.
+    const kept = new Set<string>();
     for (const row of rows) {
+      if (clock() > until) {
+        return {
+          ok: false,
+          issues: [
+            { path: [], code: "timeout", message: "The finding aid took too long to read." },
+          ],
+        };
+      }
       if (!isRecordId(row.id) || !isLevel(row.level)) continue;
       const parentId = row.id === rootId ? undefined : row.parentId;
-      if (parentId !== undefined && (parentId === null || !isRecordId(parentId))) continue;
+      if (parentId !== undefined && (parentId === null || !kept.has(parentId))) continue;
       // Exactly the read a public record page makes, in this snapshot.
       const read = await publicRecordIn(
         tx,
@@ -138,8 +157,9 @@ export async function readPublicFindingAid(
       const defs = new Map(template.fields.map((d) => [d.key, d]));
       const fields: EadExportField[] = [];
       for (const entry of view.entries) {
-        // Own values only: the tree carries what a unit inherits.
-        if (!entry.own) continue;
+        // Own values only, but the top unit's inherited ones too: the tree
+        // carries what the units below inherit, and nothing carries the top's.
+        if (!entry.own && row.id !== rootId) continue;
         const def = defs.get(entry.key);
         if (def?.visibility !== "public") continue;
         fields.push({
@@ -151,9 +171,10 @@ export async function readPublicFindingAid(
           ...(def.options === undefined ? {} : { options: def.options }),
         });
       }
+      kept.add(row.id);
       units.push({
         id: row.id,
-        ...(parentId === undefined ? {} : { parentId }),
+        ...(parentId === undefined ? {} : { parentId: parentId as RecordId }),
         level: row.level,
         title: view.title,
         fields,

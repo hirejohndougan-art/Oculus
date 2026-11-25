@@ -564,6 +564,7 @@ export {
 export {
   MAX_PUBLIC_FINDING_AID_UNITS,
   MAX_STAFF_FINDING_AID_UNITS,
+  PUBLIC_FINDING_AID_DEADLINE_MS,
   findingAidUnitIds,
   readPublicFindingAid,
 } from "./finding-aids.js";
