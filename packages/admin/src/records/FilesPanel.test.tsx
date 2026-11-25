@@ -9,7 +9,7 @@ import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SITE_1, fakeServer } from "../testing.fixtures";
-import { FilesPanel, sizeText } from "./FilesPanel";
+import { FilesPanel, SCAN_POLL_MS, SCAN_RETRY_POLL_MS, scanPollMs, sizeText } from "./FilesPanel";
 import { viewErrorText } from "./FileViewer";
 import { RECORD_ID } from "./records.fixtures";
 
@@ -299,4 +299,118 @@ describe("the files panel", () => {
     const call = sent.find((s) => s.method === "DELETE");
     expect(call?.headers).toMatchObject({ "if-match": '"v4"', "x-oculus-site": SITE_1 });
   });
+});
+
+describe("virus scans (S-040)", () => {
+  const scanned = (scan: string, over: Partial<typeof PHOTO> = {}) => ({ ...PHOTO, ...over, scan });
+
+  it("shows each file's scan as a pill, and offers only clean files", async () => {
+    const files = [
+      scanned("clean", { id: "71111111-1111-4111-8111-111111111111", name: "clean.jpg" }),
+      scanned("pending", { id: "72222222-2222-4222-8222-222222222222", name: "waiting.jpg" }),
+      scanned("failed", { id: "73333333-3333-4333-8333-333333333333", name: "unscannable.jpg" }),
+      scanned("infected", { id: "74444444-4444-4444-8444-444444444444", name: "bad.jpg" }),
+    ];
+    fakeServer({ [LIST]: [200, { files, maxFileBytes: 1000 }] });
+    show(false);
+    const table = await screen.findByRole("table", { name: "Files on this record" });
+    expect(within(table).getByRole("columnheader", { name: "Virus scan" })).toBeTruthy();
+    for (const label of ["Clean", "Scanning…", "Scan failed", "Infected (quarantined)"]) {
+      expect(within(table).getByText(label)).toBeTruthy();
+    }
+    expect(within(table).getByRole("link", { name: "Download clean.jpg" })).toBeTruthy();
+    expect(within(table).getByRole("button", { name: "Preview clean.jpg" })).toBeTruthy();
+    for (const name of ["waiting.jpg", "unscannable.jpg", "bad.jpg"]) {
+      expect(within(table).queryByRole("link", { name: `Download ${name}` }), name).toBeNull();
+      expect(within(table).queryByRole("button", { name: `Preview ${name}` }), name).toBeNull();
+    }
+    expect(within(table).getByText("Quarantined: can't be downloaded")).toBeTruthy();
+    expect(within(table).getByText("Download once the scan is done")).toBeTruthy();
+    expect(screen.getByText(/A virus was found in one file\. It is quarantined/)).toBeTruthy();
+    expect(screen.queryByText(/have not been scanned for viruses/)).toBeNull();
+  });
+
+  it("says plainly when files were not scanned, and still offers them", async () => {
+    fakeServer({ [LIST]: [200, { files: [scanned("not_scanned")], maxFileBytes: 1000 }] });
+    show(false);
+    expect(await screen.findByText(/have not been scanned for viruses/)).toBeTruthy();
+    const table = screen.getByRole("table", { name: "Files on this record" });
+    expect(within(table).getByText("Not scanned")).toBeTruthy();
+    expect(within(table).getByRole("link", { name: "Download photo.jpg" })).toBeTruthy();
+  });
+
+  it("offers files from before scanning was turned on, and says why they aren't scanned yet", async () => {
+    fakeServer({
+      [LIST]: [200, { files: [scanned("not_yet_scanned")], maxFileBytes: 1000 }],
+    });
+    show(false);
+    expect(await screen.findByText(/added before virus scanning was turned on/)).toBeTruthy();
+    const table = screen.getByRole("table", { name: "Files on this record" });
+    expect(within(table).getByText("Not yet scanned")).toBeTruthy();
+    expect(within(table).getByRole("link", { name: "Download photo.jpg" })).toBeTruthy();
+    expect(within(table).getByRole("button", { name: "Preview photo.jpg" })).toBeTruthy();
+  });
+
+  it("offers files too large to scan, and says they weren't scanned (M1)", async () => {
+    fakeServer({
+      [LIST]: [200, { files: [scanned("too_large_to_scan")], maxFileBytes: 1000 }],
+    });
+    show(false);
+    expect(await screen.findByText(/larger than the virus scanner accepts/)).toBeTruthy();
+    const table = screen.getByRole("table", { name: "Files on this record" });
+    expect(within(table).getByText("Too large to scan")).toBeTruthy();
+    expect(within(table).getByRole("link", { name: "Download photo.jpg" })).toBeTruthy();
+  });
+
+  it("says that uploading an unscanned file again holds every copy (M3)", async () => {
+    fakeServer({ [LIST]: [200, { files: [scanned("not_yet_scanned")], maxFileBytes: 1000 }] });
+    show(false);
+    expect(await screen.findByText(/every copy of it waits for that scan/)).toBeTruthy();
+  });
+
+  it("says plainly when the server or the scanner refuses a file's size", async () => {
+    fakeServer({ [LIST]: [200, { files: [], maxFileBytes: 1000 }] });
+    let n = 0;
+    fakeXhr(() => {
+      n += 1;
+      return [413, { error: n === 1 ? "too_large_to_scan" : "file_too_large" }];
+    });
+    show();
+    await screen.findByText("No files yet.");
+    const input = document.querySelector<HTMLInputElement>('input[type="file"]');
+    if (input === null) throw new Error("no file input");
+    await userEvent.upload(input, [file("scan.tif", 10), file("other.tif", 10)]);
+    expect(await screen.findByText("It is larger than the virus scanner accepts.")).toBeTruthy();
+    expect(await screen.findByText("It is larger than this server takes.")).toBeTruthy();
+  });
+
+  it("keeps asking while a scan is due: often for a new upload, slowly for a retry", () => {
+    const f = (scan: string, scanQueued: boolean) =>
+      ({ ...PHOTO, scan, scanQueued }) as Parameters<typeof scanPollMs>[0][number];
+    expect(scanPollMs([f("pending", true)])).toBe(SCAN_POLL_MS);
+    expect(scanPollMs([f("failed", true)])).toBe(SCAN_RETRY_POLL_MS);
+    expect(scanPollMs([f("not_yet_scanned", true)])).toBe(SCAN_RETRY_POLL_MS);
+    // A failed scan not tried again by itself (too large) isn't waited for.
+    expect(scanPollMs([f("failed", false), f("clean", false)])).toBeUndefined();
+    expect(scanPollMs([f("infected", false), f("not_scanned", false)])).toBeUndefined();
+  });
+
+  it("reads the list again in the background while a file is being scanned", async () => {
+    let reads = 0;
+    const sent = fakeServer({
+      [LIST]: () => {
+        reads += 1;
+        return [200, { files: [scanned(reads < 2 ? "pending" : "clean")], maxFileBytes: 1000 }];
+      },
+    });
+    show(false);
+    expect(await screen.findByText("Scanning…")).toBeTruthy();
+    expect(await screen.findByText("Clean", {}, { timeout: 8000 })).toBeTruthy();
+    const lists = sent.filter((s) => s.path === `/api/records/${RECORD_ID}/files`);
+    expect(lists[0]?.headers["x-oculus-background"]).toBeUndefined();
+    expect(lists[1]?.headers["x-oculus-background"]).toBe("1");
+    // Clean: no more polling.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(sent.filter((s) => s.path === `/api/records/${RECORD_ID}/files`)).toHaveLength(2);
+  }, 12_000);
 });

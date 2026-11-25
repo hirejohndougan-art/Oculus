@@ -71,6 +71,16 @@
  * the service (`422 no_thumbnail` when none can be made). A file the asset
  * doesn't have is the same `404 not_found` as a missing record. No byte
  * ranges (fileReply sends whole files).
+ * Virus scanning (S-040, D-113): each listed file carries its content's
+ * `scan` (`pending`, `clean`, `infected`, `failed`, `not_scanned`). With a
+ * scanner set up only clean files are read: `409 scan_pending` and `409
+ * scan_failed` otherwise, files stored before scanning was turned on are
+ * read until their first scan (`not_yet_scanned`); an infected file is `423
+ * quarantined`, scanner or not. While scanning is on an upload larger than
+ * the scanner takes is `413 too_large_to_scan`. System managers read `GET /api/system/file-scans` (on or off, and
+ * the organization's counts) and queue every clean and failed file again
+ * with `POST /api/system/file-scans/rescan` (recent sign-in; `409
+ * scanning_off` without a scanner).
  * System settings (T-048a, D-087): `POST /api/sites` and `PUT
  * /api/sites/:id` make and rename a site (in the session's organization, or
  * the `organizationId` given), and `GET`/`PUT /api/system-settings` read and
@@ -480,6 +490,14 @@ function fileRefusal(result: ServiceRefusal): Refusal | undefined {
   // A file the asset doesn't have: the same reply as a missing record.
   if (codes.has("unknown_file")) return new Refusal(404, "not_found");
   if (codes.has("not_viewable")) return new Refusal(422, "not_viewable");
+  // Virus scanning (S-040, D-113): only clean files are read while a
+  // scanner is set up; an infected one is never read.
+  if (codes.has("quarantined")) return new Refusal(423, "quarantined");
+  if (codes.has("scan_pending")) return new Refusal(409, "scan_pending");
+  if (codes.has("scan_failed")) return new Refusal(409, "scan_failed");
+  if (codes.has("scanning_off")) return new Refusal(409, "scanning_off");
+  // Larger than the scanner takes: it could never be scanned, so never kept.
+  if (codes.has("too_large_to_scan")) return new Refusal(413, "too_large_to_scan");
   if (codes.has("no_thumbnail")) return new Refusal(422, "no_thumbnail");
   if (codes.has("busy")) return new Refusal(503, "busy");
   if (codes.has("not_cached")) return new Refusal(405, "method_not_allowed");
@@ -799,9 +817,12 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
           if (fixed !== undefined) throw fixed;
           return refused(check, reply, log);
         }
+        // The smaller cap while scanning is on: the scanner's (S-040).
+        const cap = check.value.maxFileBytes;
         const received = await files.receive(context.organizationId, upload.chunks(), {
           signal: request.signal,
           usedBytes: check.value.usedBytes,
+          maxBytes: cap,
         });
         if (!received.ok) {
           switch (received.code) {
@@ -812,7 +833,10 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
             case "disk_full":
               throw new Refusal(507, "disk_full");
             default:
-              throw new Refusal(413, "payload_too_large");
+              // Past the scanner's limit (below the store's own): said so.
+              throw cap < files.maxFileBytes
+                ? new Refusal(413, "too_large_to_scan")
+                : new Refusal(413, "payload_too_large");
           }
         }
         const result = await service.attachFile(context, id, received.file, {
@@ -909,7 +933,8 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
         return answer(result, reply, (value) => ({
           files: value,
           // So the admin can refuse a file that's too large before sending it.
-          maxFileBytes: files?.maxFileBytes ?? null,
+          // While scanning is on, no more than the scanner takes (S-040).
+          maxFileBytes: service.fileUploadLimit() ?? null,
         }));
       }),
     },
@@ -1420,6 +1445,34 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
         const status = options.publicSubjects?.statusFor(context.organizationId, siteId);
         if (status === undefined) throw new Refusal(404, "not_found");
         return status;
+      }),
+    },
+    // Virus scanning (S-040, D-113): whether a scanner is set up and the
+    // organization's files by scan state; and scanning them all again (after
+    // the scanner's signatures were updated), which needs a recent sign-in.
+    // System managers only (the service refuses everyone else).
+    {
+      method: "GET",
+      path: "/api/system/file-scans",
+      handler: signedIn("read", false, async (_request, reply, { context }) => {
+        const result = await service.fileScanStatus(context);
+        return answer(result, reply, (value) => value);
+      }),
+    },
+    {
+      method: "POST",
+      path: "/api/system/file-scans/rescan",
+      handler: signedIn("write", true, async (request, reply, { session, context }) => {
+        const body = objectBody(request);
+        const extra = onlyKeys(body, [], reply);
+        if (extra) return extra;
+        recentSignIn(session);
+        const result = await service.rescanFiles(context);
+        if (!result.ok) {
+          const fixed = fileRefusal(result);
+          if (fixed !== undefined) throw fixed;
+        }
+        return answer(result, reply, (value) => value);
       }),
     },
     {

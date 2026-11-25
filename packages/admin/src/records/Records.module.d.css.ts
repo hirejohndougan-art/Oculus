@@ -32,6 +32,7 @@ declare const styles: {
   readonly pill: string;
   readonly popover: string;
   readonly progress: string;
+  readonly red: string;
   readonly search: string;
   readonly searchField: string;
   readonly sectionTitle: string;

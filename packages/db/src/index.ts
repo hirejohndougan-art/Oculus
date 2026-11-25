@@ -376,6 +376,29 @@ export {
 } from "./sign-in-screens.js";
 export type { PendingSignInState, OrganizationChoice, SignedInPerson } from "./sign-in-screens.js";
 export {
+  FILE_SCAN_TABLE_PRIVILEGES,
+  SCAN_FAILURES,
+  SCAN_STATES,
+  claimDueScan,
+  isScanSignature,
+  queueScan,
+  queueUnscanned,
+  recordScanResult,
+  rescanContents,
+  scanCounts,
+  scanState,
+  scanStates,
+} from "./file-scans.js";
+export type {
+  ClaimedScan,
+  RecordedScan,
+  ScanCounts,
+  ScanFailure,
+  ScanResult,
+  ScanState,
+  StoredScan,
+} from "./file-scans.js";
+export {
   STORED_FILE_TABLE_PRIVILEGES,
   MAX_FILES_PER_LIST,
   findStoredFile,

@@ -97,6 +97,10 @@
   background: var(--pill-amber-bg);
   color: var(--pill-amber-text);
 }
+.red {
+  background: var(--pill-red-bg);
+  color: var(--pill-red-text);
+}
 .empty {
   padding: 28px;
   background: var(--surface);

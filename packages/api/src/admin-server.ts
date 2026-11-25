@@ -34,7 +34,12 @@
  *   default 20480) or the free-space floor `OCULUS_FILES_MIN_FREE_MIB`
  *   (default: 5% of the disk or 2 GiB, whichever is smaller) aren't whole
  *   numbers in range. Stale temporary files and copies no row names are
- *   swept at startup and every 15 minutes.
+ *   swept at startup and every 15 minutes;
+ * - the virus scanner's settings (`OCULUS_CLAMD_*`, file-scanning.ts,
+ *   S-040, D-113) are malformed. None set is fine: files are then
+ *   `not_scanned` and served as before; in production that is logged as a
+ *   `startup_warning` (`files_not_scanned`), and a scanner set up but not
+ *   answering as `clamd_unreachable` (it is tried again by the queue).
  *
  * It warns loudly (a `startup_warning` log record) when the database
  * server's `log_parameter_max_length_on_error` is above 0, since pg's
@@ -56,15 +61,18 @@ import {
   type PasswordResetDelivery,
 } from "@oculus/db";
 import {
+  clamdScanner,
   createService,
   createThumbnailRenderer,
   FILE_LEASE_RENEW_MS,
+  pingClamd,
   openFileStore,
   type FileStore,
   type FileStoreProblem,
 } from "@oculus/service";
 import type { FastifyInstance } from "fastify";
 import { ADMIN_ORIGIN_ENV, loadAdminFiles, type AdminFiles } from "./admin-files.js";
+import { scannerFromEnv } from "./file-scanning.js";
 import { originsFromEnv } from "./origin.js";
 import { isProduction } from "./environment.js";
 import { mailerFromEnv, type Mailer } from "./mail.js";
@@ -122,6 +130,9 @@ async function serverKey(db: Database): Promise<string> {
   const identity = await databaseIdentity(db);
   return encodeURIComponent(`${identity}|${rows[0]?.name ?? "-"}|${String(rows[0]?.port ?? "-")}`);
 }
+
+/** How often the scan queue looks for due scans (and once at startup; uploads kick it too). */
+export const FILE_SCAN_EVERY_MS = 60_000;
 
 /** How often the file sweep runs (and once at startup). */
 export const FILE_SWEEP_EVERY_MS = 15 * 60_000;
@@ -391,6 +402,16 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
         });
 
   const files = await fileStoreFromEnv(env);
+  // Virus scanning (S-040, D-113): only with clamd set up.
+  const scanning = scannerFromEnv(env);
+  if (scanning === undefined && production) {
+    log({ event: "startup_warning", code: "files_not_scanned" });
+  }
+  // Uploads over the scanner's limit are refused while scanning is on
+  // (S-040 review S1): the file cap is then really the scanner's.
+  if (scanning !== undefined && files.maxFileBytes > scanning.clamd.streamMaxBytes) {
+    log({ event: "startup_warning", code: "file_cap_over_scan_limit" });
+  }
   // Thumbnails (M-003, D-097) are off until T-072: no renderer, so no
   // worker is ever started. Turned on, one worker, stopped with the server.
   const thumbnailsOn = options.thumbnails === true;
@@ -400,6 +421,12 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     files,
     thumbnailsEnabled: thumbnailsOn,
     ...(thumbnails === undefined ? {} : { thumbnails }),
+    ...(scanning === undefined
+      ? {}
+      : {
+          scanner: clamdScanner(scanning.clamd),
+          scanQueue: { concurrency: scanning.concurrency },
+        }),
   });
   const routes = [
     ...staffApiRoutes({
@@ -502,6 +529,13 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     }
   };
   await sweep();
+  const scan = async (): Promise<void> => {
+    try {
+      await service.scanQueuedFiles();
+    } catch (error) {
+      log({ event: "service_error", operation: "scanQueuedFiles", ...redactedError(error) });
+    }
+  };
   let app: FastifyInstance;
   try {
     app = await buildServer({
@@ -509,7 +543,12 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
       routes,
       ...(options.logger === undefined ? {} : { logger: options.logger }),
       ...(admin === undefined ? {} : { admin }),
-      ...(publicSubjects === undefined ? {} : { onClose: () => publicSubjects.stop() }),
+      // Stopped before the server's close finishes: the public counts and
+      // the scans running now (S-040 review L5).
+      onClose: async () => {
+        await publicSubjects?.stop();
+        await service.stopFileScans();
+      },
     });
   } catch (error) {
     claim.release();
@@ -521,11 +560,25 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   timer.unref();
   const lease = setInterval(() => void renew(), FILE_LEASE_EVERY_MS);
   lease.unref();
+  // The scan queue (S-040): what is due now, then every minute. A scanner
+  // that doesn't answer is logged; its scans fail and are tried again.
+  let scans: ReturnType<typeof setInterval> | undefined;
+  if (scanning !== undefined) {
+    void pingClamd({ ...scanning.clamd, timeoutMs: Math.min(scanning.clamd.timeoutMs, 5000) })
+      .then((answered) => {
+        if (!answered) log({ event: "startup_warning", code: "clamd_unreachable" });
+      })
+      .catch(() => undefined);
+    void scan();
+    scans = setInterval(() => void scan(), FILE_SCAN_EVERY_MS);
+    scans.unref();
+  }
   // Started once the server is built, so a start that fails counts nothing.
   publicSubjects?.start();
   app.server.once("close", () => {
     clearInterval(timer);
     clearInterval(lease);
+    if (scans !== undefined) clearInterval(scans);
     claim.release();
     void thumbnails?.close();
   });

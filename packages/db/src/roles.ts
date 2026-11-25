@@ -29,6 +29,7 @@ import { SECOND_FACTOR_TABLE_PRIVILEGES } from "./second-factor.js";
 import { ALERT_NOTICE_TABLE_PRIVILEGES } from "./alert-notices.js";
 import { SESSION_TABLE_PRIVILEGES } from "./sessions.js";
 import { STORED_FILE_TABLE_PRIVILEGES } from "./stored-files.js";
+import { FILE_SCAN_TABLE_PRIVILEGES } from "./file-scans.js";
 import { sql } from "./sql.js";
 
 /**
@@ -84,6 +85,9 @@ export const WRITER_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Ob
   // Stored files (M-002, D-086): attached by INSERT; rows never change and
   // nothing deletes them yet.
   ...STORED_FILE_TABLE_PRIVILEGES,
+  // Virus scan results (S-040, D-113): queued, then moved along; never
+  // deleted, and an infected content never changed back (0041's guard).
+  ...FILE_SCAN_TABLE_PRIVILEGES,
   // The change log of people and roles (T-048, D-084): insert only.
   ...PEOPLE_TABLE_PRIVILEGES,
   // Two-step alert notices (D-085): one row per alert, only ever added.

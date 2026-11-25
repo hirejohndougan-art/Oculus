@@ -8,6 +8,8 @@
  *   (TemplateEditor.tsx).
  * - **Sign-in rules:** how long a session may sit unused and how long it
  *   lasts at most (`/api/system-settings`, with the version it started from).
+ * - **Virus scanning:** whether uploads are scanned, and scanning every
+ *   file again (FileScans.tsx, S-040).
  *
  * The server decides who may (system managers only) and needs a recent
  * sign-in for every change; these screens only hide themselves from anyone
@@ -114,6 +116,11 @@ export function SettingsLayout() {
           <li>
             <NavLink className={styles.tab} to="/settings/sign-in">
               Sign-in rules
+            </NavLink>
+          </li>
+          <li>
+            <NavLink className={styles.tab} to="/settings/files">
+              Virus scanning
             </NavLink>
           </li>
           <li>
