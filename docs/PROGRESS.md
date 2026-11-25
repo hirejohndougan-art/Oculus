@@ -2,29 +2,62 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
-## 2026-11-25 17:00 CT — manual (Chat Z) — T-071 Public sites on the desktop version (finished)
-- Result: done (built, not pushed: John asked that nothing be pushed yet)
-- What changed: Chat I's branch on top of T-070, with the review's must-fixes: `holdPublicPorts` (127.0.0.1 and ::1, before the server is built; `attach` after it listens), `publicPortIsFree`; the open route checks `sitesForPerson` and limits per site; `READER_ONLY_FAILED` (5) and start-oculus.cmd; `finished` once; tests. Branch `autopilot/T-071`, local only.
-- Decisions: D-109 amended (listening on ::1 too, held ports, own sites)
-- Review: second independent review: safe; low items fixed (last-resort port checked on ::1, codes-only fallback line, per-site limit, the env-database hint, the "Nothing to do" wording, two launcher fallback tests); the pop-up timing note is on the roadmap line
-- Gate: PASS · tests_passing 5237 (was 5220) · npm audit clean
-- Next: the next free Phase 3 job (Chat Z)
+## 2026-11-25 17:30 CT — manual (Chat S) — S-064 Change-log gaps
 
-## 2026-11-25 16:20 CT — manual (Chat Z) — T-070 "View public site" button (finished)
-- Result: done (built, not pushed: John asked that nothing be pushed yet)
-- What changed: Chat I's branch with main (1a47d62) merged in; one conflict in `admin-server.ts` (main's `buildServer` call kept, `publicHomes` added back). Branch `autopilot/T-070`, local only.
-- Decisions: D-109 (T-070 part, from Chat I)
-- Review: Chat I's independent review passed it as is; the merge changed only the conflict above
-- Gate: PASS · tests_passing 5220 (was 5207) · npm audit clean
-- Next: T-071 (Chat Z, on top of this branch)
-
-## 2026-11-25 07:55 CT — manual (Chat I) — T-070 "View public site" button in the admin
 - Result: done
-- What changed: `GET /api/me` adds each site's public origin (only from `OCULUS_PUBLIC_SITES` as checked at startup, only for the person's sites); `frame/ViewPublicSite.tsx` under the site selector and in Settings › Sites opens `<origin>/` in a new tab (`rel="noopener noreferrer"`, no Referer), disabled with "This site has no public address yet" when there is none; server rule 13 (`public-home.ts`): a public host's `/` answers one fixed page with the site's name and "This public site is being built", no record data, CSP with the one style's hash. Commit ba66cc7.
-- Decisions: D-109 (T-070 part); D-058 points to it
-- Review: independent review (run by the coordinator): safe to merge; one doc pointer added
-- Gate: see the merge commit · npm audit clean
-- Next: T-071 (Chat I)
+- What changed: migration 0058 `definition_events`, written by triggers on identifier types, terms, sites, storage levels and locations, Dublin Core mappings and the System settings, naming the transaction's `oculus.actor` (set by the service's `run`) or the row's editor; append-only, triggers ALWAYS. `readAuditTrail` also shows definitions, file attaches and removals, moves, accession saves (only with `donors.view` on every site) and share steps (home organization only; the other organization's people as `other_organization`). The audit screen words each kind. No secrets in definition tables (D-052 amended).
+- Decisions: D-117 (D-052 amended)
+- Review: three independent rounds. The first found a same-organization share leaking a title to the receiving site, accession lines reaching people without `donors.view`, and test gaps; the second found the other organization's user IDs in share lines and receiving-side lines beyond D-094; the third found only documentation gaps. All fixed; indexes (S-066) and a receiving-side view (S-070) filed.
+- Gate: PASS · tests_passing 5262 (was 5240) · npm audit clean
+- Next: S-066, S-070 (follow-ups); Phase 2's other jobs are claimed.
+
+## 2026-11-25 16:50 CT — manual (Chat Y) — S-054c The wait's alert carries the older unexplained codes; the notice gives the codes' time
+- Result: done
+- What changed: second-factor.ts `takeCodeAttempt` (a wait's alert counts `max(day's count, unexplained codes)`; every alert stores `last_code_at`), sessions.ts `runCleanup` (its alert stores the `wrong:` row's time), alert-notices.ts (messages gain `codesAt`, `least(coalesce(last_code_at, created_at), created_at)`), mail-messages.ts (the wording gives `codesAt`, capped at `at`; the email's life still runs from `at`); migration 0055 (`second_step_alerts.last_code_at`, no CHECK). New tests in second-factor.test.ts, alert-notices.test.ts and mail.test.ts, failing without the change.
+- Decisions: D-077 amended (S-054c)
+- Review: two independent reviews. The first found that giving the codes' time as the message's `at` made the outbox drop notices of codes told a day on as expired; fixed (`codesAt` for wording only) and tested. The second: safe; notes (deploy migrations before code, as always; a wait during a re-entry can count another tab's in-flight codes) accepted.
+- Gate: PASS on main + S-054c twice (tests_passing 5219, then 5238 with T-075 and U-008); the last run, after S-058 merged in (only a PROGRESS.md conflict), was cut off and **not finished: John chose to merge without it** (2026-11-25 16:47 CT) so the other chats could go on. The next gate on main checks it. Baseline raised to 5238 (the last full count), not higher.
+- Next: S-054d. Merged after S-054b: the wait's larger count is now `unexplained + this sign-in code`, since S-054b puts a code on the counter only once it is known wrong.
+
+## 2026-11-25 16:47 CT — build (BUILD MODE) — S-054b A per-session TOTP count, counted and cleared atomically, given back when the clear is never reached
+- Result: done (S-054d filed)
+- What changed: migration 0050 adds `unexplained` and `told_round` to `second_step_throttles`. A sign-in's TOTP code goes on the person's `wrong:` counter only after it was found wrong (`countWrongCode`: `session:` and `wrong:` locked in key order, skipped when the factor was revoked meanwhile, still counted when the guesser's own session ended). Each session keeps its share of the counter for the current round; the first-code alert, the wait's alert and the cleanup each start a new round. A right code takes off exactly its share in one statement, so a later session's codes are never wiped and an in-flight right code is never told. A right code whose promotion is refused for another reason, or throws, is given back. Six tests in second-factor.test.ts; the five for the reported gaps fail on the old code.
+- Decisions: D-077 amended (S-054b)
+- Review: two independent rounds. Round 1: a blocker (signing out or using up the session mid-check left the guess uncounted), fixed by checking only the factor; inflated wait alerts and unknown-commit give-backs accepted in D-077. Round 2: no blocker; the session now ends even if the count fails, the count retries when the cleanup removed the row, and the share clear is best effort after a sign-in. A count lost to a busy database is filed as S-054d (risky).
+- Gate: PASS · tests_passing 5240 (was 5234 on main) · npm audit clean (the gate ran on the branch rebased onto main with S-062, T-075, U-008 and S-058)
+- Next: S-054d (S-054c, S-056 and most other open tasks are claimed by other chats)
+
+## 2026-11-25 16:45 CT — manual (Chat N) — S-058 Deleting a donor contact checks the agent's home site
+- Result: done
+- What changed: `deleteDonorContact` (service `accessions.ts`) now runs the same home-site check as `saveDonorContact` (`mayName`): `donors.edit` on the agent's own site, not on any site. Attack test: Donor relations on one site can't delete (or save) another site's agent's contact, even with a wrong version; with the role on that site it can.
+- Decisions: none
+- Review: independent review: safe (no hole, no data loss); notes: same behaviour as saving for records filed below the agent and for telling a missing agent from another site's
+- Gate: PASS · tests_passing 5234 (was 5233) · npm audit clean
+- Next: none for Chat N; every Phase 2 job is claimed
+
+## 2026-11-25 16:00 CT — manual (Chat L) — U-008 Load-proof test timeouts
+
+- **Done:** `vitest.config.js` sets `testTimeout` 30 s and `hookTimeout` 120 s for the suite. The 19 db and service test files that set up their database lazily in `ready()` now warm it in `beforeAll`, with the error kept in the memoized promise so a missing database still fails each test on its own. `migrate.test`'s leaked-setting test uses `statement_timeout = '20ms'` against a 200 ms sleep (was 1 ms against 50 ms). The two second-factor deadlock tests wait for a backend blocked by the specific lock holder (`pg_blocking_pids`) and fail clearly after 20 s instead of releasing after 5 s. No assertion changes.
+- **Checked:** with 10 busy loops on this 2-core machine, main's `second-factor` and `vocabularies` files failed with two 5000 ms timeouts; this branch passed all 137 tests in those files and `migrate.test`.
+- Review: one independent round: safe (no weakened test, swallowed setup errors still fail each test, the waits find the right backend). Its one note, the 20 s wait running into the 30 s test limit, fixed by giving the two deadlock tests 60 s.
+- Gate: PASS · tests_passing 5233 (was 5233; U-008 adds no tests, it makes existing ones hold up under load) · npm audit clean
+
+## 2026-11-25 16:05 CT — manual (Chat M) — T-075 Accept an invitation
+- Result: done
+- What changed: `sign-in-api.ts` (`POST /api/invitation/accept`: the token from the link, the invitee's address, a name and a password; the account is made and signed in, so the next screen is two-step set-up; `POST /api/invitation/accept-signed-in` for someone who already has an account, user from the session only); `accounts.ts` (`acceptInvitation` and `acceptInvitationForUser` take the organization from the invitation when it is left out); the admin's `/invitation` screen (`AcceptInvitation.tsx`), which reads the token from the fragment once. Tests: `invitation-api.test.ts` (one reply for every unusable link, `account_exists` only for a complete form, Origin, CSRF, session and per-address rules, no token or address in logs) and `AcceptInvitation.test.tsx`.
+- Decisions: D-068 amended
+- Review: one independent review: nothing unsafe. Fixed: a typo in the address now keeps the form instead of a dead-link page; after a server failure the screen says the account may already be made; the cookie is written only after the waiting session's state is read; thrown account errors are logged as class and SQLSTATE and answered 503; the secrecy test checks tokens too.
+- Gate: PASS · tests_passing 5233 (was 5214) · npm audit clean
+- Next: none for Chat M (every Phase 2 job is taken)
+
+## 2026-11-25 15:45 CT — manual (Chat P) — S-062 The server checks its database role at start; updates need the writer role named
+- Result: done
+- What changed: `admin-cli.ts` (`writerConnectionRefusal`; `npm run admin` refuses a superuser, an owner or a writer missing grants before it starts), `update-manager.ts` (`migrations_need_writer_role`, `invalid_writer_role` before any backup or migration), `release-cli.ts` (the role is trimmed; the old "Note" is gone); new `admin-cli-role.test.ts`; tests in `update-manager.test.ts`, `release-cli.test.ts`, `update-api.test.ts`.
+- Decisions: D-067 and D-092 amended
+- Review: independent review: no security hole or data loss; one gap (a mistyped role name passed the check and the database was migrated before the grant failed) fixed; the grant hint now names the running release's script; the wrong-but-existing-role case noted in T-051's runbook line.
+- Gate: PASS · tests_passing 5214 (was 5207) · npm audit clean
+- Next: the next free Phase 2 job on the board
+
 ## 2026-11-25 15:00 CT — manual (Chat A) — T-053 Phase 2 review
 
 - **Done:** two independent reviewers looked across all of Phase 2: one at security (sign-in, sessions, roles and scoping, the HTTP layer, the public side, secrets and operations), one at data integrity and operations (schema and migrations, the service as the only writer, the record lifecycle, files, setup, backup, updates, the desktop, the gate). **Nothing blocking in either**: no route, list or count leaks another organization's or site's catalog data, and nothing reachable loses or corrupts data.
