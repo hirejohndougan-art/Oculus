@@ -59,12 +59,15 @@ import {
   listRoleAssignments,
   lockPeopleForRoleChange,
   lockRecord,
+  memberGrants,
   readRecordPlace,
   readRoleAssignment,
   readSite,
+  readOrganizationTimeZone,
   readSystemSettings as readStoredSettings,
   renameSite as renameStoredSite,
   sitesForPerson,
+  writeOrganizationTimeZone,
   writeSystemSettings,
   type Queryable,
   type RoleAssignment,
@@ -144,6 +147,18 @@ export interface AdminOperations {
     settings: unknown,
     options: unknown,
   ): Promise<ServiceResult<StoredSystemSettings>>;
+  /**
+   * The session's organization's time zone and its local day (T-034e,
+   * D-103): anyone with access to the organization may read it.
+   */
+  readOrganizationTimeZone(
+    context: ServiceContext,
+  ): Promise<ServiceResult<{ timeZone: string; today: string }>>;
+  /** Sets the session's organization's time zone (system managers, D-072). */
+  changeOrganizationTimeZone(
+    context: ServiceContext,
+    timeZone: unknown,
+  ): Promise<ServiceResult<{ timeZone: string; today: string }>>;
 }
 
 function refusal<T>(path: (string | number)[], code: string, message: string): ServiceResult<T> {
@@ -202,6 +217,37 @@ interface Who {
   readonly actor: string;
 }
 
+/**
+ * Whether a site manager sees a member with their details (D-084, T-064):
+ * the member holds a role on one of the sites the manager manages (`managed`,
+ * from `managedSites`; "all" meaning every site of the organization). A role
+ * on every site (`siteId` null) is no site's, so it doesn't count. The one
+ * rule for the people list, a person's page and a grant's target.
+ */
+export function holdsRoleOn(
+  grants: readonly { readonly siteId: SiteId | null }[],
+  managed: "all" | ReadonlySet<SiteId>,
+): boolean {
+  return grants.some((g) => g.siteId !== null && (managed === "all" || managed.has(g.siteId)));
+}
+
+/**
+ * Whether the actor may already see the member as a grant's target (John,
+ * Q-10, T-064): a system manager anyone; a site manager only someone
+ * `holdsRoleOn` a site they manage. Anyone else, the role-less included,
+ * answers as a missing person: a site manager can't make someone visible by
+ * giving them a small role.
+ */
+async function seenBy(
+  tx: Queryable,
+  org: OrganizationId,
+  access: Access,
+  userId: UserId,
+): Promise<boolean> {
+  if (access.systemManager) return true;
+  return holdsRoleOn(await memberGrants(tx, org, userId), managedSites(access));
+}
+
 /** Grants a role in the caller's transaction (`grantRole`'s rules; the people service adds its log). */
 export async function grantRoleIn(
   tx: Queryable,
@@ -251,7 +297,7 @@ export async function grantRoleIn(
       "A site manager manages a whole site, never one collection.",
     );
   }
-  if (!(await isMember(tx, org, userId))) {
+  if (!(await isMember(tx, org, userId)) || !(await seenBy(tx, org, first.value, userId))) {
     return refusal(["userId"], "unknown_person", UNKNOWN_PERSON);
   }
   // Then both people's rows, in ID order, and the same checks again
@@ -262,7 +308,7 @@ export async function grantRoleIn(
   const access = await readAccess(tx, org, who.actor);
   if (!access.ok) return access;
   if (!mayManage(access.value, role, siteId)) return notPermitted();
-  if (!(await isMember(tx, org, userId))) {
+  if (!(await isMember(tx, org, userId)) || !(await seenBy(tx, org, access.value, userId))) {
     return refusal(["userId"], "unknown_person", UNKNOWN_PERSON);
   }
   if (siteId !== null && (await readSite(tx, org, siteId)) === undefined) {
@@ -527,6 +573,24 @@ export function adminOperations(run: Runner): AdminOperations {
           );
         }
         return writeSystemSettings(tx, settings, expected, allowed.value);
+      });
+    },
+
+    async readOrganizationTimeZone(context) {
+      return run("readOrganizationTimeZone", context, async (tx, who) => {
+        const access = await readAccess(tx, who.organizationId, who.actor);
+        if (!access.ok) return access;
+        const found = await readOrganizationTimeZone(tx, who.organizationId);
+        if (found === undefined) return notPermitted();
+        return { ok: true, value: found };
+      });
+    },
+
+    async changeOrganizationTimeZone(context, timeZone) {
+      return run("changeOrganizationTimeZone", context, async (tx, who) => {
+        const allowed = await systemManager(tx, who);
+        if (!allowed.ok) return allowed;
+        return writeOrganizationTimeZone(tx, who.organizationId, timeZone, allowed.value);
       });
     },
   };

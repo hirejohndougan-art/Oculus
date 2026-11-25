@@ -77,6 +77,8 @@
  * change the sign-in rules (`If-None-Match: *` for the first change, else
  * `If-Match: "v<N>"`). The service lets only system managers do any of it;
  * the changes also need a recent sign-in (`403 reauthentication_required`).
+ * `GET`/`PUT /api/organization/time-zone` read the organization's time
+ * zone and local day, and set it (system managers, recent sign-in; T-034e).
  * An unknown site is `404 not_found`.
  *
  * Dublin Core mappings (T-050b, D-096): `GET`/`PUT
@@ -284,16 +286,21 @@ export function onlyKeys(
 const VERSION_TAG = /^"v([1-9][0-9]{0,9})"$/;
 const TYPE_TAG = /^"t-([A-Za-z0-9_-]{32})"$/;
 
+/** The service takes versions below 2^31 - 1; a bigger tag is malformed here, not refused there (S-032). */
+const inVersionRange = (text: string): boolean => {
+  const n = Number(text);
+  return Number.isSafeInteger(n) && n < 2 ** 31 - 1;
+};
+
 /** `If-Match: "v<N>"`: the version an edit started from (428 without, 400 malformed). */
 function ifMatchVersion(request: OculusRequest): number {
   const value = request.headers["if-match"];
   if (value === undefined) throw new Refusal(428, "precondition_required");
   const match = VERSION_TAG.exec(value);
-  const n = Number(match?.[1]);
-  if (match === null || !Number.isSafeInteger(n) || n >= 2 ** 31 - 1) {
+  if (match?.[1] === undefined || !inVersionRange(match[1])) {
     throw new Refusal(400, "bad_if_match");
   }
-  return n;
+  return Number(match[1]);
 }
 
 /**
@@ -312,6 +319,9 @@ function newOrMatch(request: OculusRequest, pattern: RegExp): { readonly tag: st
   }
   const found = pattern.exec(match ?? "");
   if (found?.[1] === undefined) throw new Refusal(400, "bad_if_match");
+  if (pattern === VERSION_TAG && !inVersionRange(found[1])) {
+    throw new Refusal(400, "bad_if_match");
+  }
   return { tag: found[1] };
 }
 
@@ -1320,6 +1330,27 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
           reply.header("etag", `"v${String(value.version)}"`);
           return value;
         });
+      }),
+    },
+    {
+      // T-034e (D-103): the organization's time zone and its local day.
+      method: "GET",
+      path: "/api/organization/time-zone",
+      handler: signedIn("read", false, async (_request, reply, { context }) => {
+        const result = await service.readOrganizationTimeZone(context);
+        return answer(result, reply, (value) => value);
+      }),
+    },
+    {
+      method: "PUT",
+      path: "/api/organization/time-zone",
+      handler: signedIn("write", true, async (request, reply, { session, context }) => {
+        const body = objectBody(request);
+        const extra = onlyKeys(body, ["timeZone"], reply);
+        if (extra) return extra;
+        recentSignIn(session);
+        const result = await service.changeOrganizationTimeZone(context, body.timeZone);
+        return answer(result, reply, (value) => value);
       }),
     },
   ];
