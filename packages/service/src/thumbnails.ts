@@ -1,5 +1,5 @@
 /**
- * The thumbnail renderer (M-003, D-095): one worker thread
+ * The thumbnail renderer (M-003, D-097): one worker thread
  * (thumbnail-worker.ts) that decodes and scales one image at a time.
  *
  * - **One job at a time, a short queue.** At most `maxQueued` jobs wait;

@@ -96,7 +96,10 @@ export function ensureSettingsFolder(folder: string): void {
 }
 
 export interface DesktopSettings {
+  /** The writer's address: the server connects with it (D-067). */
   databaseUrl?: string;
+  /** The owner's address: migrations and the start-up checks use it (T-057). */
+  ownerDatabaseUrl?: string;
   port?: number;
 }
 
@@ -130,20 +133,20 @@ export function readDesktopSettings(folder: string): DesktopSettings {
   }
   const settings: DesktopSettings = {};
   for (const [key, entry] of Object.entries(value)) {
-    if (key === "databaseUrl") {
+    if (key === "databaseUrl" || key === "ownerDatabaseUrl") {
       if (typeof entry !== "string" || !/^postgres(ql)?:\/\//.test(entry)) {
         throw new DesktopError(
           "settings_invalid",
-          `"databaseUrl" in ${file} must be a postgresql:// address.`,
+          `"${key}" in ${file} must be a postgresql:// address.`,
         );
       }
       if (urlHasPassword(entry)) {
         throw new DesktopError(
           "password_in_settings",
-          `"databaseUrl" in ${file} holds a password. Take it out and put it in your pgpass file instead (on Windows %APPDATA%\\postgresql\\pgpass.conf, elsewhere ~/.pgpass).`,
+          `"${key}" in ${file} holds a password. Take it out and put it in your pgpass file instead (on Windows %APPDATA%\\postgresql\\pgpass.conf, elsewhere ~/.pgpass).`,
         );
       }
-      settings.databaseUrl = entry;
+      settings[key] = entry;
     } else if (key === "port") {
       if (typeof entry !== "number" || !Number.isInteger(entry) || entry < 1024 || entry > 65_535) {
         throw new DesktopError(
@@ -162,6 +165,27 @@ export function readDesktopSettings(folder: string): DesktopSettings {
   return settings;
 }
 
+/**
+ * Adds settings to `desktop.json` (made 0600 if missing), keeping the ones
+ * already there, through a temporary file renamed into place.
+ */
+export function writeDesktopSettings(folder: string, settings: DesktopSettings): void {
+  const file = join(folder, SETTINGS_FILE);
+  const merged = { ...readDesktopSettings(folder), ...settings };
+  const temporary = `${file}.${randomBytes(6).toString("hex")}.tmp`;
+  const fd = openSync(temporary, "wx", 0o600);
+  try {
+    writeSync(fd, `${JSON.stringify(merged, null, 2)}\n`);
+  } finally {
+    closeSync(fd);
+  }
+  try {
+    renameSync(temporary, file);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+}
+
 /** The database: `OCULUS_DATABASE_URL` first, then `desktop.json`. */
 export function chooseDatabaseUrl(env: Env, settings: DesktopSettings, folder: string): string {
   const fromEnv = env.OCULUS_DATABASE_URL;
@@ -171,11 +195,10 @@ export function chooseDatabaseUrl(env: Env, settings: DesktopSettings, folder: s
     "no_database",
     [
       "Oculus doesn't know which database to use yet.",
-      "1. Install PostgreSQL 15 or newer (https://www.postgresql.org/download/) and make an empty database for Oculus.",
-      `2. Put its address in ${join(folder, SETTINGS_FILE)}, for example`,
-      '   { "databaseUrl": "postgresql://oculus@localhost:5432/oculus" }',
-      "   with the password in your pgpass file, not in that file.",
-      "3. Run `npm run setup` once (on Windows, `node packages\\db\\dist\\setup-cli.js` after `npm run build`), then `npm run desktop` again.",
+      "1. Install PostgreSQL 15 or newer (https://www.postgresql.org/download/).",
+      "2. Run `npm run desktop:database` (on Windows, double-click scripts\\start-oculus.cmd, which runs it the first time). It makes Oculus's database and asks the first-time setup questions.",
+      `   (Or name an existing database in ${join(folder, SETTINGS_FILE)} as "databaseUrl", with its password in your pgpass file.)`,
+      "3. Then `npm run desktop` again.",
     ].join("\n"),
   );
 }

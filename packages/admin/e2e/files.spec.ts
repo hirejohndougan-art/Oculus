@@ -3,7 +3,7 @@
 // a Scanner signs in, opens the site's invented photograph record, adds an
 // image through the file chooser opened with Enter, watches it go up and
 // sees it listed with the type Oculus found in its bytes. Then (M-003,
-// D-095) its thumbnail appears, the preview opens and closes by keyboard,
+// D-097) its thumbnail appears, the preview opens and closes by keyboard,
 // and the download link saves the same bytes. Siteimprove Alfa's rules run
 // at each step; no CSP refusal or script error may happen.
 // With OCULUS_E2E_SHOTS set, screenshots are saved in that folder.

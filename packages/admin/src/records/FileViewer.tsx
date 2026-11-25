@@ -1,5 +1,5 @@
 /**
- * A simple image viewer (M-003, D-095): one of a record's images at a time,
+ * A simple image viewer (M-003, D-097): one of a record's images at a time,
  * shown with `<img>` from the API's inline view (never `<object>`,
  * `<embed>` or a frame), with Previous, Next and Close. It opens in the
  * page, not as a modal (D-083's rule for confirmations): the focus moves

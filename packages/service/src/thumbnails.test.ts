@@ -1,4 +1,4 @@
-// Thumbnails (M-003, D-095): reading sizes from headers as the format
+// Thumbnails (M-003, D-097): reading sizes from headers as the format
 // named, the limits, decoding JPEG, PNG and GIF and refusing everything
 // else, decompression bombs refused before or at the inflate ceiling, the
 // scaling, and the worker's queue, time limit and closing. Every image is

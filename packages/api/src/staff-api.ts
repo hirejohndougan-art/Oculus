@@ -62,7 +62,7 @@
  * counted as it streams), after the session, CSRF, `If-Match` and the
  * asset's edit permission are checked and before a byte is read; `GET
  * /api/records/:id/files` lists an asset's files.
- * Reading files (M-003, D-095), for anyone who may view the asset, only
+ * Reading files (M-003, D-097), for anyone who may view the asset, only
  * through `fileReply` (D-089): `GET /api/records/:id/files/:fileId/content`
  * downloads any file, always as `application/octet-stream` and an
  * attachment; `.../view` shows a JPEG, PNG, GIF or WebP inline (by its
@@ -678,7 +678,7 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
       }),
     },
     {
-      // Download one file (M-003, D-095): whatever it is, an attachment
+      // Download one file (M-003, D-097): whatever it is, an attachment
       // sent as application/octet-stream (fileReply), named by RFC 6266.
       method: "GET",
       path: "/api/records/:id/files/:fileId/content",

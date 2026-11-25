@@ -7,7 +7,7 @@
  * can also remove a file (asked first, in the page). Names are shown as
  * text only.
  *
- * Viewing and downloading (M-003, D-095): every file has a Download link
+ * Viewing and downloading (M-003, D-097): every file has a Download link
  * (the server always sends it as an attachment); JPEG, PNG and GIF files
  * show a thumbnail the server made, and those and WebP open in a simple
  * viewer (FileViewer.tsx). Which files are images is decided by the type

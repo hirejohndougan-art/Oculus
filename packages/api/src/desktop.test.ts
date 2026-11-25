@@ -180,7 +180,7 @@ describe("chooseDatabaseUrl", () => {
       expect.unreachable();
     } catch (error) {
       expect((error as DesktopError).code).toBe("no_database");
-      expect((error as DesktopError).message).toContain("npm run setup");
+      expect((error as DesktopError).message).toContain("npm run desktop:database");
       expect((error as DesktopError).message).toContain(join(folder, "desktop.json"));
     }
   });

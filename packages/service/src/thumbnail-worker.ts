@@ -1,5 +1,5 @@
 /**
- * Image decoding for thumbnails (M-003, D-095), run in a worker thread
+ * Image decoding for thumbnails (M-003, D-097), run in a worker thread
  * (thumbnails.ts) so a slow or hostile image never stalls the server.
  *
  * - **The format is told, never guessed.** Each decoder is called only for

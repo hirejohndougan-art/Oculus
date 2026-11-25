@@ -20,7 +20,7 @@
  *   The same content attached to the same asset again is the row already
  *   there (`created: false`).
  * - `listFiles` needs `records.view` where the asset is, like reading it.
- * - Reading a file (M-003, D-095): `fileContent` (its bytes, to download,
+ * - Reading a file (M-003, D-097): `fileContent` (its bytes, to download,
  *   or to view when the sniffed type is a plain image of a size a browser
  *   can show) and `fileThumbnail` (a JPEG made here, cached on disk) need
  *   the same `records.view`. A file the asset doesn't have (another

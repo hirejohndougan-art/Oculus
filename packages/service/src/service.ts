@@ -363,7 +363,7 @@ export interface ServiceOptions {
    */
   readonly files?: FileStore;
   /**
-   * Makes thumbnails (M-003, D-095, `createThumbnailRenderer`); whoever
+   * Makes thumbnails (M-003, D-097, `createThumbnailRenderer`); whoever
    * passes one closes it. Default: one made when first needed, whose idle
    * worker never keeps the process alive.
    */
