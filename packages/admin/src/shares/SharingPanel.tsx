@@ -16,7 +16,9 @@ import { ConfirmPanel } from "../records/controls";
 import { issuesIn, whenText } from "../records/model";
 import styles from "../records/Records.module.css";
 import { SHARE_STATE_LABELS, cleanId, isId, isLive, type ShareSummary } from "./model";
-import { moveShare, refreshShares, useRecordShares } from "./queries";
+import { moveShare, nextRecordSharesPage, refreshShares, useRecordShares } from "./queries";
+import { useMorePages } from "./paging";
+import { ShowMore } from "./ShowMore";
 
 const OFFER_PROBLEMS: Readonly<Record<string, string>> = {
   unknown_site:
@@ -125,7 +127,10 @@ export function SharingPanel(props: {
     sending.current = false;
   }
 
-  const list = shares.data ?? [];
+  const pages = useMorePages(shares.data, shares.dataUpdatedAt, (before) =>
+    nextRecordSharesPage(props.siteId, props.recordId, before),
+  );
+  const list = pages.rows;
   const live = list.filter((s) => isLive(s.state));
   const ended = list.filter((s) => !isLive(s.state));
 
@@ -168,7 +173,11 @@ export function SharingPanel(props: {
           The sharing list couldn't be loaded. {problemText(shares.error)}
         </Note>
       ) : live.length === 0 ? (
-        <p>It isn't offered or shared to any other site.</p>
+        <p>
+          {pages.next === null
+            ? "It isn't offered or shared to any other site."
+            : "None of the shares shown so far are open. Show more to see older ones."}
+        </p>
       ) : (
         <ul className={styles.versions} aria-label="Sites it is offered or shared to">
           {live.map((share) => (
@@ -194,7 +203,10 @@ export function SharingPanel(props: {
       )}
       {ended.length === 0 ? null : (
         <details className={styles.details}>
-          <summary>Earlier shares ({String(ended.length)})</summary>
+          <summary>
+            Earlier shares ({String(ended.length)}
+            {pages.next === null ? "" : " shown so far"})
+          </summary>
           <ul>
             {ended.map((share) => (
               <li key={share.id}>
@@ -207,6 +219,7 @@ export function SharingPanel(props: {
           </ul>
         </details>
       )}
+      <ShowMore pages={pages} what="shares" />
       {props.published ? (
         <form
           className={styles.fieldset}

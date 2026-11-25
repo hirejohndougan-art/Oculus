@@ -1240,48 +1240,43 @@ describe("only a whole sign-in makes an address known (S-044)", () => {
     return rows.map((r) => r.source_key);
   }
 
-  // 27 password checks: about 5 s on a 2-core machine, past Vitest's default limit.
-  it(
-    "someone with only the password can't push the person's own address out and keep them waiting",
-    { timeout: 30_000 },
-    async () => {
-      await ready();
-      const org = await organization();
-      const person = await member(org);
-      const home = source();
-      // The person signs in from home: password, then their code.
+  it("someone with only the password can't push the person's own address out and keep them waiting", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const home = source();
+    // The person signs in from home: password, then their code.
+    expect(
+      await signIn(db, { email: person.email, password: PASSWORD, source: home }),
+    ).toMatchObject({ ok: true });
+    expect(await knownSources(person.email)).toEqual([]);
+    const p = await pending(person.userId, org);
+    expect(
+      await completeSecondStep(db, keys, p.token, {
+        source: home,
+        recoveryCode: recovery(person.userId),
+      }),
+    ).toMatchObject({ ok: true });
+    expect(await knownSources(person.email)).toEqual([throttleSourceKey(home)]);
+    // The attack: the right password from 25 fresh addresses, never the code …
+    for (let i = 0; i < 25; i++) {
       expect(
-        await signIn(db, { email: person.email, password: PASSWORD, source: home }),
+        await signIn(db, { email: person.email, password: PASSWORD, source: source() }),
       ).toMatchObject({ ok: true });
-      expect(await knownSources(person.email)).toEqual([]);
-      const p = await pending(person.userId, org);
-      expect(
-        await completeSecondStep(db, keys, p.token, {
-          source: home,
-          recoveryCode: recovery(person.userId),
-        }),
-      ).toMatchObject({ ok: true });
-      expect(await knownSources(person.email)).toEqual([throttleSourceKey(home)]);
-      // The attack: the right password from 25 fresh addresses, never the code …
-      for (let i = 0; i < 25; i++) {
-        expect(
-          await signIn(db, { email: person.email, password: PASSWORD, source: source() }),
-        ).toMatchObject({ ok: true });
-      }
-      // … then one wrong guess per wait keeps the account counter waiting.
-      await signIn(db, { email: person.email, password: "attacker guess", source: source() });
-      await db.execute(sql`
+    }
+    // … then one wrong guess per wait keeps the account counter waiting.
+    await signIn(db, { email: person.email, password: "attacker guess", source: source() });
+    await db.execute(sql`
       UPDATE public.sign_in_throttles SET failures = 400, last_failure_at = clock_timestamp()
       WHERE key = ${throttleAccountKey(person.email)}`);
-      // Home is still known, and the person still gets in from there.
-      expect(await knownSources(person.email)).toEqual([throttleSourceKey(home)]);
-      expect(
-        await signIn(db, { email: person.email, password: PASSWORD, source: home }),
-      ).toMatchObject({ ok: true });
-      await db.execute(sql`
+    // Home is still known, and the person still gets in from there.
+    expect(await knownSources(person.email)).toEqual([throttleSourceKey(home)]);
+    expect(
+      await signIn(db, { email: person.email, password: PASSWORD, source: home }),
+    ).toMatchObject({ ok: true });
+    await db.execute(sql`
       DELETE FROM public.sign_in_throttles WHERE key = ${throttleAccountKey(person.email)}`);
-    },
-  );
+  }, 30_000);
 
   it("a wrong code, or setting up at first sign-in, counts the same way", async () => {
     await ready();

@@ -12,7 +12,10 @@ import { newRecordId, newSiteId } from "@oculus/core";
 import {
   grantPublicReaderRole,
   insertTemplateVersion,
+  isDatabaseTimeout,
   listPublishedForOai,
+  oaiRepository,
+  oaiStoredStamp,
   openDatabase,
   sql,
   type Database,
@@ -822,6 +825,155 @@ describe("oaiPmhReply", () => {
       expect(first.json()).toEqual({ error: "busy" });
     } finally {
       await routes.close();
+    }
+  });
+});
+
+describe("the staff connection's time limits and the page clock (S-043a)", () => {
+  /**
+   * Holds `table` in ACCESS EXCLUSIVE mode from another connection, letting
+   * go by itself after `giveUpMs` so a missing time limit fails the test
+   * (an unbounded read just waits that long and succeeds) instead of hanging it.
+   */
+  async function hold(table: "sites" | "oai_datestamps", giveUpMs = 4_000) {
+    const owner = openDatabase(w.testDb.url, { max: 1 });
+    let release: () => void = () => undefined;
+    let locked: () => void = () => undefined;
+    const holding = new Promise<void>((resolve) => {
+      locked = resolve;
+    });
+    const held = owner.transaction(async (q) => {
+      await q.execute(
+        table === "sites"
+          ? sql`LOCK TABLE public.sites IN ACCESS EXCLUSIVE MODE`
+          : sql`LOCK TABLE public.oai_datestamps IN ACCESS EXCLUSIVE MODE`,
+      );
+      locked();
+      await new Promise<void>((resolve) => {
+        release = resolve;
+        setTimeout(resolve, giveUpMs);
+      });
+    });
+    await holding;
+    return {
+      async end() {
+        release();
+        await held;
+        await owner.close();
+      },
+    };
+  }
+
+  async function limitedServer(
+    logged: unknown[],
+    extra: { clock?: () => number; pageTimeLimitMs?: number } = {},
+  ) {
+    const sites = await checkPublicSites(w.db, reader, [{ origin: PUBLIC, siteId: w.a1 }]);
+    return buildServer({
+      env: { OCULUS_ORIGINS: PUBLIC },
+      routes: oaiPmhRoutes({
+        db: w.db,
+        publicDb: reader,
+        sites,
+        adminEmail: EMAIL,
+        rateLimits: { oai: 10_000 },
+        timeLimitMs: 200,
+        log: (r) => logged.push(r),
+        ...extra,
+      }),
+    });
+  }
+
+  it("Identify with the staff database stalled is 503 busy within the time limit", async () => {
+    const logged: unknown[] = [];
+    const server = await limitedServer(logged);
+    const lock = await hold("sites");
+    try {
+      const started = Date.now();
+      const reply = await oai("verb=Identify", "127.0.0.1", server);
+      expect(Date.now() - started).toBeLessThan(3_000);
+      expect([reply.statusCode, reply.headers["retry-after"], reply.json()]).toEqual([
+        503,
+        "5",
+        { error: "busy" },
+      ]);
+      expect(logged).toEqual([{ event: "service_error", operation: "oaiPmh", name: "timeout" }]);
+    } finally {
+      await lock.end();
+    }
+    try {
+      // The slots were given back: the same request works once the lock is gone.
+      const again = await oai("verb=Identify", "127.0.0.1", server);
+      expect(again.statusCode).toBe(200);
+      expect(again.body).toContain("<Identify>");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("GetRecord with the stored datestamps stalled is 503 busy within the time limit", async () => {
+    const logged: unknown[] = [];
+    const server = await limitedServer(logged);
+    const query = `verb=GetRecord&metadataPrefix=oai_dc&identifier=${PREFIX}${published}`;
+    const lock = await hold("oai_datestamps");
+    try {
+      const started = Date.now();
+      const reply = await oai(query, "127.0.0.1", server);
+      expect(Date.now() - started).toBeLessThan(3_000);
+      expect([reply.statusCode, reply.json()]).toEqual([503, { error: "busy" }]);
+      expect(logged).toEqual([{ event: "service_error", operation: "oaiPmh", name: "timeout" }]);
+    } finally {
+      await lock.end();
+    }
+    try {
+      const again = await oai(query, "127.0.0.1", server);
+      expect(again.statusCode).toBe(200);
+      expect(again.body).toContain("<metadata>");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("the staff reads take only time limits they can use, and time out as timeouts", async () => {
+    for (const bad of [0, -1, 1.5, 60_001, Number.NaN]) {
+      await expect(oaiRepository(w.db, w.a, w.a1, { timeLimitMs: bad })).rejects.toThrow(
+        RangeError,
+      );
+    }
+    const lock = await hold("oai_datestamps");
+    try {
+      const thrown = await oaiStoredStamp(w.db, w.a, w.a1, published, { timeLimitMs: 100 }).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      expect(isDatabaseTimeout(thrown)).toBe(true);
+    } finally {
+      await lock.end();
+    }
+    expect((await oaiStoredStamp(w.db, w.a, w.a1, published))?.deleted).toBe(false);
+  });
+
+  it("a list page's reading time runs on the routes' clock", async () => {
+    // A stopped clock: however long the reads take, the page is never out of time.
+    const stopped = await limitedServer([], { clock: () => 5_000_000, pageTimeLimitMs: 1 });
+    try {
+      const reply = await oai("verb=ListIdentifiers&metadataPrefix=oai_dc", "127.0.0.1", stopped);
+      expect(identifiers(reply.body)).toHaveLength(OAI_PAGE_SIZE);
+    } finally {
+      await stopped.close();
+    }
+    // A clock that jumps a minute at every look: out of time after the first read.
+    let now = 5_000_000;
+    const racing = await limitedServer([], {
+      clock: () => (now += 60_000),
+      pageTimeLimitMs: 120_000,
+    });
+    try {
+      const reply = await oai("verb=ListIdentifiers&metadataPrefix=oai_dc", "127.0.0.1", racing);
+      expect(identifiers(reply.body).length).toBeLessThanOrEqual(2);
+      expect(tokenIn(reply.body)).toBeDefined();
+    } finally {
+      await racing.close();
     }
   });
 });

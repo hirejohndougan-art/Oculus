@@ -12,7 +12,14 @@ import type { FastifyInstance } from "fastify";
 import { OCULUS_COOKIES } from "./cookies.js";
 import { buildServer } from "./server.js";
 import { CSRF_HEADER, serviceErrorLogger, staffApiRoutes, type ApiLogRecord } from "./staff-api.js";
-import { fullSession, makeObject, makeWorld, publishAs, type World } from "./staff-api.fixtures.js";
+import {
+  actorOf,
+  fullSession,
+  makeObject,
+  makeWorld,
+  publishAs,
+  type World,
+} from "./staff-api.fixtures.js";
 import { grant } from "../../service/src/people.fixtures.js";
 import { SAME_ORIGIN, TEST_ENV } from "./test-server.fixtures.js";
 
@@ -23,6 +30,21 @@ const tokens: Record<string, string> = {};
 
 beforeAll(async () => {
   w = await makeWorld({ onError: serviceErrorLogger((r) => logged.push(r)) });
+  // What the public pages publish (D-096); a shared item shows only these (S-036a).
+  for (const org of [w.a, w.b]) {
+    const saved = await w.service.saveDublinCoreMapping(
+      { organizationId: org, actor: actorOf(w.root) },
+      "t-object",
+      {
+        entries: [
+          { field: "rights", term: "rights" },
+          { field: "note", term: "description" },
+        ],
+      },
+      { expectedVersion: 0 },
+    );
+    if (!saved.ok) throw new Error(JSON.stringify(saved.issues));
+  }
   app = await buildServer({
     env: TEST_ENV,
     routes: staffApiRoutes({ db: w.db, service: w.service, log: (r) => logged.push(r) }),
@@ -247,5 +269,44 @@ describe("sharing over HTTP", () => {
     const r = await call("POST", `/api/records/${draft.id}/shares`, { as: "cataloger", body });
     expect(r.status).toBe(422);
     expect((r.json.issues as { code: string }[]).map((i) => i.code)).toEqual(["not_published"]);
+  });
+
+  it("pages the lists by ?before and ?state, and refuses a bad page (S-036a)", async () => {
+    const a = await offerToB(await publishedItem("Invented paged lantern A"));
+    const b = await offerToB(await publishedItem("Invented paged lantern B"));
+    const ids = (r: Awaited<ReturnType<typeof call>>) =>
+      (r.json.shares as { id: string }[]).map((x) => x.id);
+    const offered = await call("GET", `/api/sites/${w.b1}/share-offers?state=offered`, {
+      as: "bManager",
+    });
+    expect(offered.status).toBe(200);
+    const all = ids(offered);
+    expect(all.indexOf(b)).toBeLessThan(all.indexOf(a));
+    const after = await call("GET", `/api/sites/${w.b1}/share-offers?state=offered&before=${b}`, {
+      as: "bManager",
+    });
+    expect(ids(after)).toContain(a);
+    expect(ids(after)).not.toContain(b);
+    for (const url of [
+      `/api/sites/${w.b1}/share-offers?state=declined`,
+      `/api/sites/${w.b1}/shared-items?state=accepted`,
+    ]) {
+      const r = await call("GET", url, { as: "bManager" });
+      // shared-items has no state: the parameter is ignored there, so only the first is refused.
+      if (url.includes("share-offers")) {
+        expect(r.status).toBe(422);
+      } else {
+        expect(r.status).toBe(200);
+      }
+    }
+    expect(offered.json.next).toEqual({ offered: null, accepted: null });
+    const noState = await call("GET", `/api/sites/${w.b1}/share-offers?before=${a}`, {
+      as: "bManager",
+    });
+    expect(noState.status).toBe(422);
+    const twice = await call("GET", `/api/sites/${w.b1}/share-offers?before=${a}&before=${b}`, {
+      as: "bManager",
+    });
+    expect(twice.status).toBe(400);
   });
 });
