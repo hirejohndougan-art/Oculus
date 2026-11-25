@@ -25,6 +25,8 @@ import { lstat, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { realpathSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { openDatabase, type Database } from "@oculus/db";
+import { updateChangeLog } from "./update-change-log.js";
 import { UpdateManager, UpdateRefusal, UPDATE_KEYS_ENV } from "./update-manager.js";
 import {
   MANIFEST_NAME,
@@ -353,35 +355,56 @@ export async function runReleaseCli(
         const dir = named.get("dir");
         if (file === undefined || positional.length !== 1 || dir === undefined) break;
         const home = at(dir);
+        if (env.OCULUS_DATABASE_URL === undefined || env.OCULUS_DATABASE_URL === "") {
+          err("OCULUS_DATABASE_URL must name the database, connected as the owner of its tables.");
+          return 2;
+        }
+        // The change log (T-060a): the install is written there once made,
+        // as made on the server's command line.
+        let db: Database | undefined;
+        try {
+          db = openDatabase(env.OCULUS_DATABASE_URL, { applicationName: "oculus-release" });
+        } catch {
+          db = undefined;
+        }
+        // Changed by the log callback, so kept in an object the compiler doesn't narrow.
+        const changeLog = { failed: false };
         const manager = new UpdateManager({
           home,
           keys: trusted(),
           runningRoot: join(home, "current"),
           backups: env.OCULUS_UPDATE_BACKUP !== "skip",
+          ...(db === undefined ? {} : { changeLog: updateChangeLog(db, "command_line") }),
+          log: (event) => {
+            if (event === "update_change_log_failed") changeLog.failed = true;
+          },
         });
-        const version = await manager.verifyInto(at(file));
-        out(`Verified Oculus ${version}.`);
-        if (env.OCULUS_DATABASE_URL === undefined || env.OCULUS_DATABASE_URL === "") {
-          err("OCULUS_DATABASE_URL must name the database, connected as the owner of its tables.");
-          return 2;
-        }
-        const role = env.OCULUS_UPDATE_WRITER_ROLE;
-        await manager.install(
-          version,
-          "release-cli",
-          (step) => {
-            out(`- ${step}`);
-          },
-          {
-            requireRunningFromCurrent: false,
-            fallbackUrl: env.OCULUS_UPDATE_MIGRATE_DATABASE_URL ?? env.OCULUS_DATABASE_URL,
-            ...(role === undefined || role === "" ? {} : { fallbackWriterRole: role }),
-          },
-        );
-        if (role === undefined || role === "") {
-          out(
-            "Note: OCULUS_UPDATE_WRITER_ROLE isn't set, so no role was given rights to new tables.",
+        try {
+          const version = await manager.verifyInto(at(file));
+          out(`Verified Oculus ${version}.`);
+          const role = env.OCULUS_UPDATE_WRITER_ROLE;
+          await manager.install(
+            version,
+            "release-cli",
+            (step) => {
+              out(`- ${step}`);
+            },
+            {
+              requireRunningFromCurrent: false,
+              fallbackUrl: env.OCULUS_UPDATE_MIGRATE_DATABASE_URL ?? env.OCULUS_DATABASE_URL,
+              ...(role === undefined || role === "" ? {} : { fallbackWriterRole: role }),
+            },
           );
+          if (role === undefined || role === "") {
+            out(
+              "Note: OCULUS_UPDATE_WRITER_ROLE isn't set, so no role was given rights to new tables.",
+            );
+          }
+        } finally {
+          await db?.close();
+        }
+        if (db === undefined || changeLog.failed) {
+          out("Note: the install couldn't be written into the change log (the audit trail).");
         }
         out(
           `Installed. Start command: node ${join(home, "current", "packages", "api", "dist", "admin-cli.js")}`,

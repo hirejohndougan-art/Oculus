@@ -14,6 +14,7 @@ import {
   UpdateManager,
   UpdateRefusal,
   updateManagerFromEnv,
+  type HistoryEntry,
   type RunScript,
 } from "./update-manager.js";
 import { tempDir, testKey, testPackage, writeTemp, type TestKey } from "./update.fixtures.js";
@@ -459,6 +460,64 @@ describe("rolling back", () => {
     m.startRollback("0.0.1", "user-1");
     await m.idle();
     expect((await m.status()).job).toMatchObject({ error: "no_rollback" });
+  });
+});
+
+describe("the change log (T-060a)", () => {
+  beforeEach(async () => {
+    await firstInstall("0.1.0");
+  });
+
+  it("is written once each switch is made, never for a failed install", async () => {
+    const written: HistoryEntry[] = [];
+    const m = manager({
+      changeLog: (entry) => {
+        written.push(entry);
+        return Promise.resolve();
+      },
+    });
+    fail = "migrate-cli.js";
+    await upload(m, testPackage(key, "0.2.0", ["0001_start.sql", "0002_more.sql"]));
+    m.startInstall("0.2.0", "user-1");
+    await m.idle();
+    expect((await m.status()).job).toMatchObject({ state: "failed" });
+    expect(written).toEqual([]);
+    fail = undefined;
+    m.startInstall("0.2.0", "user-1");
+    await m.idle();
+    await upload(m, testPackage(key, "0.3.0", ["0001_start.sql", "0002_more.sql"]));
+    m.startInstall("0.3.0", "user-1");
+    await m.idle();
+    m.startRollback("0.2.0", "user-2");
+    await m.idle();
+    expect(written.map(({ kind, version, from, by }) => ({ kind, version, from, by }))).toEqual([
+      { kind: "install", version: "0.2.0", from: "0.1.0", by: "user-1" },
+      { kind: "install", version: "0.3.0", from: "0.2.0", by: "user-1" },
+      { kind: "rollback", version: "0.2.0", from: "0.3.0", by: "user-2" },
+    ]);
+  });
+
+  it("only logs a failure or a database that doesn't answer: the switch stands", async () => {
+    const events: string[] = [];
+    const m = manager({
+      changeLog: () => Promise.reject(new Error("invented")),
+      log: (event) => events.push(event),
+    });
+    await upload(m, testPackage(key, "0.2.0"));
+    m.startInstall("0.2.0", "user-1");
+    await m.idle();
+    expect((await m.status()).job).toMatchObject({ kind: "install", state: "done" });
+    expect(await readlink(join(home, "current"))).toBe(join("releases", "0.2.0"));
+    expect(events).toContain("update_change_log_failed");
+    const slow = manager({
+      changeLog: () => new Promise<void>(() => undefined),
+      changeLogTimeoutMs: 50,
+      log: (event) => events.push(event),
+    });
+    slow.startRollback("0.1.0", "user-1");
+    await slow.idle();
+    expect((await slow.status()).job).toMatchObject({ kind: "rollback", state: "done" });
+    expect(events.filter((e) => e === "update_change_log_failed")).toHaveLength(2);
   });
 });
 
