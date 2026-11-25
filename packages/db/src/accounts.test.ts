@@ -28,6 +28,7 @@ import {
   createFirstSystemAdmin,
   createInvitation,
   deleteExpiredSignInThrottles,
+  markKnownSource,
   revokeInvitation,
   signIn,
   type CreatedInvitation,
@@ -1075,6 +1076,20 @@ describe("sign-in throttling", () => {
 });
 
 describe("known addresses: strangers can't keep anyone out where they sign in (S-018)", () => {
+  /**
+   * A sign-in that also passed its second step (S-044: only then is the
+   * address known); the code itself is tested in second-factor.test.ts.
+   */
+  async function signInWhole(input: {
+    email: string;
+    password: string;
+    source: string;
+  }): Promise<SignInResult> {
+    const r = await signIn(db, input);
+    if (r.ok) await markKnownSource(db, r.userId, input.source);
+    return r;
+  }
+
   async function knownRow(
     address: string,
     from: string,
@@ -1099,7 +1114,7 @@ describe("known addresses: strangers can't keep anyone out where they sign in (S
     const key = throttleAccountKey(ADMIN_EMAIL);
     try {
       expect(
-        await signIn(db, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD, source: home }),
+        await signInWhole({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD, source: home }),
       ).toMatchObject({ ok: true, systemAdmin: true });
       // The attack: one wrong guess from elsewhere each time the wait ends.
       for (let round = 0; round < 3; round++) {
@@ -1136,6 +1151,11 @@ describe("known addresses: strangers can't keep anyone out where they sign in (S
     expect(
       await signIn(db, { email: person.email, password: PASSWORD, source: home }),
     ).toMatchObject({ ok: true });
+    // The right password alone doesn't make the address known (S-044).
+    expect(await knownRow(person.email, home)).toBeUndefined();
+    expect(
+      await signInWhole({ email: person.email, password: PASSWORD, source: home }),
+    ).toMatchObject({ ok: true });
     expect(await knownRow(person.email, home)).toEqual({ failures: 0 });
     await heldByStranger(person.email);
     const tally: string[] = [];
@@ -1163,7 +1183,7 @@ describe("known addresses: strangers can't keep anyone out where they sign in (S
     const person = await member(org);
     const home = source();
     expect(
-      await signIn(db, { email: person.email, password: PASSWORD, source: home }),
+      await signInWhole({ email: person.email, password: PASSWORD, source: home }),
     ).toMatchObject({ ok: true });
     for (let i = 0; i < 20; i++) {
       await signIn(db, { email: email(), password: "spray guess", source: home });
@@ -1178,7 +1198,7 @@ describe("known addresses: strangers can't keep anyone out where they sign in (S
     const org = await organization();
     const person = await member(org);
     const home = source();
-    await signIn(db, { email: person.email, password: PASSWORD, source: home });
+    await signInWhole({ email: person.email, password: PASSWORD, source: home });
     await db.execute(sql`
       UPDATE public.sign_in_known_sources SET signed_in_at = signed_in_at - interval '30 days'
       WHERE account_key = ${throttleAccountKey(person.email)}`);
@@ -1204,7 +1224,7 @@ describe("known addresses: strangers can't keep anyone out where they sign in (S
     }
     const newest = source();
     expect(
-      await signIn(db, { email: person.email, password: PASSWORD, source: newest }),
+      await signInWhole({ email: person.email, password: PASSWORD, source: newest }),
     ).toMatchObject({ ok: true });
     const rows = await db.rows<{ source_key: string }>(sql`
       SELECT source_key FROM public.sign_in_known_sources WHERE account_key = ${key}
@@ -1228,7 +1248,7 @@ describe("known addresses: strangers can't keep anyone out where they sign in (S
     await signIn(db, { email: person.email, password: "wrong guess", source: from });
     expect(await knownRow(person.email, from)).toBeUndefined();
     expect(
-      await signIn(db, { email: person.email, password: PASSWORD, source: "not an address" }),
+      await signInWhole({ email: person.email, password: PASSWORD, source: "not an address" }),
     ).toMatchObject({ ok: true });
     const rows = await db.rows(sql`
       SELECT 1 FROM public.sign_in_known_sources
@@ -1240,7 +1260,7 @@ describe("known addresses: strangers can't keep anyone out where they sign in (S
     await ready();
     const org = await organization();
     const person = await member(org);
-    await signIn(db, { email: person.email, password: PASSWORD, source: source() });
+    await signInWhole({ email: person.email, password: PASSWORD, source: source() });
     const nobody = email();
     const run = async (address: string): Promise<SignInResult[]> => {
       const out: SignInResult[] = [];
