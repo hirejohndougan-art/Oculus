@@ -560,3 +560,11 @@ export {
   readOrganizationTimeZone,
   writeOrganizationTimeZone,
 } from "./organization-time-zone.js";
+// T-034f (D-120): candidates for the access-holds pass.
+export {
+  MAX_HOLD_CANDIDATES,
+  lockRecordState,
+  organizationIds,
+  publishedPerhapsHeld,
+  withdrawnBy,
+} from "./access-holds.js";

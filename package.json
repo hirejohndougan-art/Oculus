@@ -31,6 +31,7 @@
     "desktop": "node packages/api/dist/desktop-cli.js",
     "files:adopt": "node packages/api/dist/files-cli.js adopt",
     "files:purge": "node packages/api/dist/files-cli.js purge",
+    "holds": "node packages/api/dist/holds-cli.js",
     "desktop:database": "node packages/api/dist/desktop-database-cli.js",
     "desktop:password": "node packages/api/dist/desktop-password-cli.js",
     "release": "node packages/api/dist/release-cli.js",

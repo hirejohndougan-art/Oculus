@@ -144,3 +144,11 @@ export type {
   SavedAccession,
 } from "./accessions.js";
 export type { RecordStorage, StorageOperations, StorageView } from "./storage.js";
+// T-034f (D-120): the access-holds pass.
+export {
+  ACCESS_HOLDS_ACTOR,
+  HOLD_PUBLISH_REASON,
+  HOLD_WITHDRAW_REASON,
+  applyAccessHolds,
+} from "./access-holds.js";
+export type { AccessHoldsOptions, AccessHoldsReport } from "./access-holds.js";

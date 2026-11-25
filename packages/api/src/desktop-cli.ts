@@ -7,12 +7,15 @@
  *    Oculus's;
  * 2. applies any new migrations, so updating Oculus is `git pull`,
  *    `npm run build`, then start it again;
- * 3. starts the admin's server on 127.0.0.1 only, at port 4780 (or the
+ * 3. runs the access-holds pass (T-034f, D-120): records whose access
+ *    restriction ended are published again, records an accession now holds
+ *    back are withdrawn (a failure is said and doesn't stop the start);
+ * 4. starts the admin's server on 127.0.0.1 only, at port 4780 (or the
  *    settings' `port`, or a free one if that's taken), as a development
  *    server: one person, one address, and, without the OCULUS_SMTP_…
  *    settings (D-085), password-reset and invitation messages only noted
  *    in the log;
- * 4. opens it in an Edge or Chrome app window with Oculus's own profile, and
+ * 5. opens it in an Edge or Chrome app window with Oculus's own profile, and
  *    stops the server when that window closes (or on Ctrl+C).
  *
  * One launcher runs at a time (desktop.ts's lock, checked against the
@@ -48,6 +51,7 @@ import {
   sql,
   type Database,
 } from "@oculus/db";
+import { applyAccessHolds } from "@oculus/service";
 import type { FastifyInstance } from "fastify";
 import { ADMIN_ORIGIN_ENV } from "./admin-files.js";
 import { buildAdminServer } from "./admin-server.js";
@@ -502,6 +506,21 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
           : "Couldn't update the database.",
       );
       return 1;
+    }
+
+    // Access restrictions that ended (or began) since the last start (T-034f).
+    try {
+      const holds = await applyAccessHolds(db, { apply: true });
+      if (holds.withdrawn + holds.published > 0) {
+        out(
+          `Access restrictions: ${String(holds.published)} record(s) published again, ${String(holds.withdrawn)} withdrawn (see each record's history).`,
+        );
+      }
+      if (holds.failed > 0 || holds.more) {
+        out("Some access restrictions couldn't be checked; they'll be checked at the next start.");
+      }
+    } catch {
+      out("Access restrictions couldn't be checked; they'll be checked at the next start.");
     }
 
     const port = await choosePort(wantedPort);
