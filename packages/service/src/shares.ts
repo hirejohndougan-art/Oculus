@@ -434,14 +434,14 @@ export function shareOperations(db: Database, run: Runner, outside: Outside): Sh
             return refusal(
               ["targetSiteId"],
               "too_many_offers",
-              `That site already has ${MAX_OPEN_OFFERS} open offers from your organization. Wait for it to answer some, or withdraw some.`,
+              `That site already has ${String(MAX_OPEN_OFFERS)} open offers from your organization. Wait for it to answer some, or withdraw some.`,
             );
           }
           if (state === SHARE_COOLDOWN_STATE) {
             return refusal(
               ["targetSiteId"],
               "declined_recently",
-              `That site declined this item in the last ${DECLINE_COOLDOWN_DAYS} days. It can be offered again after that.`,
+              `That site declined this item in the last ${String(DECLINE_COOLDOWN_DAYS)} days. It can be offered again after that.`,
             );
           }
           // The record deleted a moment ago (the insert check reads it).

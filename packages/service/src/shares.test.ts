@@ -1382,7 +1382,7 @@ describe("share limits and endings (S-036b)", () => {
     await s.owner.transaction(async (q) => {
       await q.execute(sql`ALTER TABLE public.record_shares DISABLE TRIGGER record_shares_check`);
       await q.execute(sql`UPDATE public.record_shares
-        SET decided_at = now() - make_interval(days => ${DECLINE_COOLDOWN_DAYS} + 1)
+        SET decided_at = now() - make_interval(days => ${String(DECLINE_COOLDOWN_DAYS)} + 1)
         WHERE id = ${first.id}::uuid`);
       await q.execute(
         sql`ALTER TABLE public.record_shares ENABLE ALWAYS TRIGGER record_shares_check`,
@@ -1398,7 +1398,7 @@ describe("share limits and endings (S-036b)", () => {
     const ids: string[] = [];
     const fillers: CatalogRecord[] = [];
     for (let n = 0; n < MAX_OPEN_OFFERS - 1; n++) {
-      const r = await anotherItem(w, `Invented filler ${n}`);
+      const r = await anotherItem(w, `Invented filler ${String(n)}`);
       fillers.push(r);
       const id = newRecordId();
       await s.writer.execute(sql`INSERT INTO public.record_shares
@@ -1506,7 +1506,9 @@ describe("share limits and endings (S-036b)", () => {
       new URL("../../db/migrations/0043_share_limits_and_endings.sql", import.meta.url),
       "utf8",
     );
-    expect(text).toContain(`IF open_offers >= ${MAX_OPEN_OFFERS} THEN`);
-    expect(text).toContain(`d.decided_at > now() - interval '${DECLINE_COOLDOWN_DAYS} days'`);
+    expect(text).toContain(`IF open_offers >= ${String(MAX_OPEN_OFFERS)} THEN`);
+    expect(text).toContain(
+      `d.decided_at > now() - interval '${String(DECLINE_COOLDOWN_DAYS)} days'`,
+    );
   });
 });
