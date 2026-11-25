@@ -97,6 +97,8 @@
  * shown at once on published records answers `409 confirmation_required`
  * until `confirmPublished`).
  *
+ * Accessions and donor contacts (T-073): `accessions-api.ts`.
+ *
  * Not here: signing in, the second step, password reset and signing out
  * (T-045 adds those routes beside these, with `credentials: true` for the
  * 8 KiB limit, and writes the cookie through the reply's cookie writer).
@@ -129,6 +131,7 @@ import type { OculusReply, OculusRequest, OculusRoute } from "./routes.js";
 import { peopleApiRoutes, type PeopleApiOptions } from "./people-api.js";
 import { updateApiRoutes, type UpdateApiOptions } from "./update-api.js";
 import { filesPurgeApiRoutes } from "./files-purge-api.js";
+import { accessionsApiRoutes } from "./accessions-api.js";
 import type { PublicSubjects } from "./public-subjects.js";
 import { DEFAULT_RATE_LIMITS, SessionRateLimiter, type RateBucket } from "./rate-limit.js";
 
@@ -345,7 +348,7 @@ export function onlyKeys(
   };
 }
 
-const VERSION_TAG = /^"v([1-9][0-9]{0,9})"$/;
+export const VERSION_TAG = /^"v([1-9][0-9]{0,9})"$/;
 const TYPE_TAG = /^"t-([A-Za-z0-9_-]{32})"$/;
 
 /** The service takes versions below 2^31 - 1; a bigger tag is malformed here, not refused there (S-032). */
@@ -355,7 +358,7 @@ const inVersionRange = (text: string): boolean => {
 };
 
 /** `If-Match: "v<N>"`: the version an edit started from (428 without, 400 malformed). */
-function ifMatchVersion(request: OculusRequest): number {
+export function ifMatchVersion(request: OculusRequest): number {
   const value = request.headers["if-match"];
   if (value === undefined) throw new Refusal(428, "precondition_required");
   const match = VERSION_TAG.exec(value);
@@ -370,7 +373,7 @@ function ifMatchVersion(request: OculusRequest): number {
  * `If-Match` with its tag; exactly one of them (428 without, 400 both or
  * malformed).
  */
-function newOrMatch(request: OculusRequest, pattern: RegExp): { readonly tag: string } | "new" {
+export function newOrMatch(request: OculusRequest, pattern: RegExp): { readonly tag: string } | "new" {
   const match = request.headers["if-match"];
   const none = request.headers["if-none-match"];
   if (match === undefined && none === undefined) throw new Refusal(428, "precondition_required");
@@ -1230,6 +1233,8 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
       : updateApiRoutes(options.updates, { service, log, signedIn })),
     // Clean up removed files (S-052): only where files are stored.
     ...(files === undefined ? [] : filesPurgeApiRoutes({ service, log, signedIn })),
+    // Accessions and donor contacts (T-073).
+    ...accessionsApiRoutes({ service, log, signedIn }),
     {
       method: "GET",
       path: "/api/templates",
