@@ -849,7 +849,7 @@ export async function versionConflict(
     Object.freeze({ name, change }),
   );
   // The numbers aren't part of the record's content (S-061): compare the two
-  // versions' snapshots, like the content. A version from before 0050 has
+  // versions' snapshots, like the content. A version from before 0057 has
   // none: then the versions between name the types they changed.
   const numbers = await db.rows<{ name: string }>(sql`
     WITH ends AS (
