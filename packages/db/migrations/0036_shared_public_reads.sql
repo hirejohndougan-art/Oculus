@@ -17,8 +17,9 @@
 --   - the record isn't already the second site's own item (moved onto it,
 --     D-094): then it is read as the site's own, or not at all;
 --   - the ID is unambiguous: no record of p_site itself has it (published
---     or not), and exactly one shared record does. Record IDs are random and made by Oculus, so
---     two organizations holding the same one takes a restore or an import
+--     or not), and exactly one accepted share whose record is public at
+--     home has it. Record IDs are random and made by Oculus, so two
+--     organizations holding the same one takes a restore or an import
 --     collision; then nothing is shown rather than one of them at random.
 -- Otherwise NULL, the same NULL for a record that doesn't exist, isn't
 -- shared, is another site's, and for a site that isn't p_org's.
