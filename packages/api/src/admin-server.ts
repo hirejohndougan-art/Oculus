@@ -49,7 +49,12 @@ import {
   type InvitationDelivery,
   type PasswordResetDelivery,
 } from "@oculus/db";
-import { createService, openFileStore, type FileStore } from "@oculus/service";
+import {
+  createService,
+  createThumbnailRenderer,
+  openFileStore,
+  type FileStore,
+} from "@oculus/service";
 import type { FastifyInstance } from "fastify";
 import { ADMIN_ORIGIN_ENV, loadAdminFiles, type AdminFiles } from "./admin-files.js";
 import { isProduction } from "./environment.js";
@@ -251,7 +256,13 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   }
 
   const files = await fileStoreFromEnv(env);
-  const service = createService(options.db, { onError: serviceErrorLogger(log), files });
+  // Thumbnails (M-003, D-095): one worker, stopped with the server.
+  const thumbnails = createThumbnailRenderer();
+  const service = createService(options.db, {
+    onError: serviceErrorLogger(log),
+    files,
+    thumbnails,
+  });
   const routes = [
     ...staffApiRoutes({
       db: options.db,
@@ -298,6 +309,7 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   timer.unref();
   app.server.once("close", () => {
     clearInterval(timer);
+    void thumbnails.close();
   });
   return app;
 }

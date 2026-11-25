@@ -168,6 +168,26 @@ export async function findStoredFile(
   return row === undefined ? undefined : fromRow(row);
 }
 
+/**
+ * STAFF ONLY: one file of the asset by its ID (M-003), `undefined` when the
+ * asset has no such file (a malformed ID included).
+ */
+export async function storedFileById(
+  db: Queryable,
+  organizationId: OrganizationId,
+  recordId: RecordId,
+  fileId: string,
+): Promise<StoredFile | undefined> {
+  checkOrganization(organizationId);
+  if (!isRecordId(recordId) || !isRecordId(fileId)) return undefined;
+  const rows = await db.rows<FileRow>(sql`
+    SELECT ${COLUMNS} FROM public.stored_files f
+    WHERE f.organization_id = ${organizationId}::uuid AND f.record_id = ${recordId}::uuid
+      AND f.id = ${fileId}::uuid`);
+  const row = rows[0];
+  return row === undefined ? undefined : fromRow(row);
+}
+
 /** The most files one asset lists. */
 export const MAX_FILES_PER_LIST = 1000;
 

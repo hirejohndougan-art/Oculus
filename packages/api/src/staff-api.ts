@@ -61,7 +61,16 @@
  * bytes to the file store (an upload route: its own type list, the cap
  * counted as it streams), after the session, CSRF, `If-Match` and the
  * asset's edit permission are checked and before a byte is read; `GET
- * /api/records/:id/files` lists an asset's files. Never the bytes (M-003).
+ * /api/records/:id/files` lists an asset's files.
+ * Reading files (M-003, D-095), for anyone who may view the asset, only
+ * through `fileReply` (D-089): `GET /api/records/:id/files/:fileId/content`
+ * downloads any file, always as `application/octet-stream` and an
+ * attachment; `.../view` shows a JPEG, PNG, GIF or WebP inline (by its
+ * sniffed type, never its name or claimed type; `422 not_viewable`
+ * otherwise); `.../thumbnail?size=small|medium` a JPEG thumbnail made by
+ * the service (`422 no_thumbnail` when none can be made). A file the asset
+ * doesn't have is the same `404 not_found` as a missing record. No byte
+ * ranges (fileReply sends whole files).
  * System settings (T-048a, D-087): `POST /api/sites` and `PUT
  * /api/sites/:id` make and rename a site (in the session's organization, or
  * the `organizationId` given), and `GET`/`PUT /api/system-settings` read and
@@ -95,6 +104,7 @@ import {
 } from "@oculus/service";
 import { OCULUS_COOKIES } from "./cookies.js";
 import { Refusal } from "./errors.js";
+import { fileReply } from "./file-replies.js";
 import type { OculusReply, OculusRequest, OculusRoute } from "./routes.js";
 import { peopleApiRoutes, type PeopleApiOptions } from "./people-api.js";
 import { DEFAULT_RATE_LIMITS, SessionRateLimiter, type RateBucket } from "./rate-limit.js";
@@ -364,6 +374,11 @@ function claimedType(request: OculusRequest, contentType: string): string | unde
 /** The file codes of the service, as HTTP refusals; `undefined` for anything else. */
 function fileRefusal(result: ServiceRefusal): Refusal | undefined {
   const codes = new Set(result.issues.map((i) => i.code));
+  // A file the asset doesn't have: the same reply as a missing record.
+  if (codes.has("unknown_file")) return new Refusal(404, "not_found");
+  if (codes.has("not_viewable")) return new Refusal(422, "not_viewable");
+  if (codes.has("no_thumbnail")) return new Refusal(422, "no_thumbnail");
+  if (codes.has("busy")) return new Refusal(503, "busy");
   if (codes.has("files_unavailable")) return new Refusal(503, "files_unavailable");
   if (codes.has("file_too_large")) return new Refusal(413, "payload_too_large");
   if (codes.has("quota_exceeded")) return new Refusal(413, "quota_exceeded");
@@ -549,6 +564,36 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
     };
   }
 
+  /** Download or view one file (M-003): the service checks, fileReply sends. */
+  async function readFileRoute(
+    request: OculusRequest,
+    reply: OculusReply,
+    context: ServiceContext,
+    use: "download" | "view",
+  ): Promise<unknown> {
+    const result = await service.fileContent(
+      context,
+      recordId(request),
+      request.params.fileId ?? "",
+      use,
+    );
+    if (!result.ok) {
+      const fixed = fileRefusal(result);
+      if (fixed !== undefined) throw fixed;
+      return refused(result, reply, log);
+    }
+    const { file, open } = result.value;
+    return fileReply({
+      body: open,
+      size: file.size,
+      // The sniffed type (D-086); fileReply sends a download as
+      // application/octet-stream whatever it is.
+      mediaType: file.mediaType,
+      fileName: file.name,
+      disposition: use === "view" ? "inline" : "attachment",
+    });
+  }
+
   const files = options.files;
   // The route's own streaming cap is the store's per-file cap (D-086).
   const uploadLimit = files?.maxFileBytes ?? 1;
@@ -633,8 +678,54 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
       }),
     },
     {
+      // Download one file (M-003, D-095): whatever it is, an attachment
+      // sent as application/octet-stream (fileReply), named by RFC 6266.
+      method: "GET",
+      path: "/api/records/:id/files/:fileId/content",
+      handler: signedIn("read", false, (request, reply, { context }) =>
+        readFileRoute(request, reply, context, "download"),
+      ),
+    },
+    {
+      // Show one file inline (M-003): a JPEG, PNG, GIF or WebP by its
+      // sniffed type only, with fileReply's sandboxing CSP and nosniff.
+      method: "GET",
+      path: "/api/records/:id/files/:fileId/view",
+      handler: signedIn("read", false, (request, reply, { context }) =>
+        readFileRoute(request, reply, context, "view"),
+      ),
+    },
+    {
+      // A thumbnail of one image (M-003): a JPEG made by the service.
+      method: "GET",
+      path: "/api/records/:id/files/:fileId/thumbnail",
+      handler: signedIn("read", false, async (request, reply, { context }) => {
+        const size = queryText(request, "size") ?? "small";
+        if (size !== "small" && size !== "medium") throw new Refusal(400, "bad_query");
+        const result = await service.fileThumbnail(
+          context,
+          recordId(request),
+          request.params.fileId ?? "",
+          size,
+        );
+        if (!result.ok) {
+          const fixed = fileRefusal(result);
+          if (fixed !== undefined) throw fixed;
+          return refused(result, reply, log);
+        }
+        const jpeg = result.value.jpeg;
+        return fileReply({
+          body: jpeg,
+          size: jpeg.byteLength,
+          mediaType: "image/jpeg",
+          fileName: "thumbnail.jpg",
+          disposition: "inline",
+        });
+      }),
+    },
+    {
       // The asset's files: name, size, sniffed type, who and when. Never
-      // the bytes (viewing and download are M-003's).
+      // the bytes (the routes above send those).
       method: "GET",
       path: "/api/records/:id/files",
       handler: signedIn("read", false, async (request, reply, { context }) => {

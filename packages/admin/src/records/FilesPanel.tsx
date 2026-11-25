@@ -3,17 +3,23 @@
  * size, the type Oculus found in the bytes, when) and, for people who may
  * edit the asset, an upload control: several files at once, one after
  * another, each with a progress bar and a Cancel button. A file larger than
- * the server takes is refused here before it is sent. Viewing and
- * downloading come later (M-003); nothing here shows a file's content.
- * People who may edit can also remove a file (asked first, in the page).
- * Names are shown as text only.
+ * the server takes is refused here before it is sent. People who may edit
+ * can also remove a file (asked first, in the page). Names are shown as
+ * text only.
+ *
+ * Viewing and downloading (M-003, D-095): every file has a Download link
+ * (the server always sends it as an attachment); JPEG, PNG and GIF files
+ * show a thumbnail the server made, and those and WebP open in a simple
+ * viewer (FileViewer.tsx). Which files are images is decided by the type
+ * the server sniffed from the bytes, never by the name.
  */
 import { useRef, useState } from "react";
-import { FileTrigger } from "react-aria-components";
+import { Button as AriaButton, FileTrigger } from "react-aria-components";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, api, problemText, uploadFile } from "../api";
 import { Button, Note } from "../components/ui";
 import { ConfirmPanel } from "./controls";
+import { FileViewer, fileUrl } from "./FileViewer";
 import { whenText } from "./model";
 import styles from "./Records.module.css";
 
@@ -38,6 +44,12 @@ interface Upload {
   status: "waiting" | "sending" | "done" | "failed" | "cancelled";
   message?: string;
 }
+
+/** Types the viewer shows (the server's own list, D-086) and those with thumbnails. */
+const VIEWABLE = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+const THUMBNAILED = new Set(["image/jpeg", "image/png", "image/gif"]);
+
+const previewId = (fileId: string) => `preview-${fileId}`;
 
 export const filesKey = (recordId: string) => ["record", recordId, "files"] as const;
 
@@ -101,6 +113,9 @@ export function FilesPanel(props: Props) {
   const [removing, setRemoving] = useState<StoredFileEntry>();
   const [removeBusy, setRemoveBusy] = useState(false);
   const [notice, setNotice] = useState<{ tone: "amber" | "green"; text: string }>();
+  const [viewing, setViewing] = useState<number>();
+  const openedFrom = useRef<string | undefined>(undefined);
+  const [noThumbnail, setNoThumbnail] = useState<ReadonlySet<string>>(new Set());
   const cancel = useRef<AbortController | undefined>(undefined);
   const nextKey = useRef(1);
   const cancelAll = useRef(false);
@@ -193,6 +208,7 @@ export function FilesPanel(props: Props) {
   }
 
   const files = list.data?.files ?? [];
+  const images = files.filter((f) => VIEWABLE.has(f.mediaType));
   const done = uploads.filter((u) => u.status === "done").length;
 
   return (
@@ -287,6 +303,22 @@ export function FilesPanel(props: Props) {
       <p role="status" className={styles.meta}>
         {busy ? "Uploading…" : done > 0 ? `${String(done)} added.` : ""}
       </p>
+      <FileViewer
+        recordId={recordId}
+        images={images}
+        index={viewing}
+        onIndex={setViewing}
+        onClose={() => {
+          const opener = openedFrom.current;
+          setViewing(undefined);
+          // The focus goes back to the preview button that opened it.
+          if (opener !== undefined) {
+            requestAnimationFrame(() => {
+              document.getElementById(previewId(opener))?.focus();
+            });
+          }
+        }}
+      />
       {list.isPending ? (
         <p role="status">Loading the files…</p>
       ) : list.isError ? (
@@ -301,34 +333,72 @@ export function FilesPanel(props: Props) {
             <caption>Files on this record</caption>
             <thead>
               <tr>
+                <th scope="col">Preview</th>
                 <th scope="col">Name</th>
                 <th scope="col">Size</th>
                 <th scope="col">Type</th>
                 <th scope="col">Added</th>
-                {props.canUpload ? <th scope="col">Actions</th> : null}
+                <th scope="col">Actions</th>
               </tr>
             </thead>
             <tbody>
               {files.map((f) => (
                 <tr key={f.id}>
+                  <td>
+                    {VIEWABLE.has(f.mediaType) ? (
+                      <AriaButton
+                        className={styles.thumbButton}
+                        id={previewId(f.id)}
+                        aria-label={`Preview ${f.name}`}
+                        onPress={() => {
+                          openedFrom.current = f.id;
+                          setViewing(images.indexOf(f));
+                        }}
+                      >
+                        {THUMBNAILED.has(f.mediaType) && !noThumbnail.has(f.id) ? (
+                          <img
+                            className={styles.thumb}
+                            src={`${fileUrl(recordId, f.id, "thumbnail")}?size=small`}
+                            alt=""
+                            onError={() => {
+                              setNoThumbnail((all) => new Set([...all, f.id]));
+                            }}
+                          />
+                        ) : (
+                          <span className={styles.thumbPlaceholder}>View</span>
+                        )}
+                      </AriaButton>
+                    ) : (
+                      <span className={styles.meta}>None</span>
+                    )}
+                  </td>
                   <td>{f.name}</td>
                   <td>{sizeText(f.size)}</td>
                   <td>{f.mediaType}</td>
                   <td>{whenText(f.createdAt)}</td>
-                  {props.canUpload ? (
-                    <td>
-                      <Button
-                        variant="link"
-                        isDisabled={busy || removeBusy}
-                        onPress={() => {
-                          setNotice(undefined);
-                          setRemoving(f);
-                        }}
+                  <td>
+                    <div className={styles.fileActions}>
+                      <a
+                        className={styles.downloadLink}
+                        href={fileUrl(recordId, f.id, "content")}
+                        download
                       >
-                        Remove {f.name}
-                      </Button>
-                    </td>
-                  ) : null}
+                        Download {f.name}
+                      </a>
+                      {props.canUpload ? (
+                        <Button
+                          variant="link"
+                          isDisabled={busy || removeBusy}
+                          onPress={() => {
+                            setNotice(undefined);
+                            setRemoving(f);
+                          }}
+                        >
+                          Remove {f.name}
+                        </Button>
+                      ) : null}
+                    </div>
+                  </td>
                 </tr>
               ))}
             </tbody>

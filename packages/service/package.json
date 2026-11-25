@@ -19,6 +19,9 @@
   },
   "dependencies": {
     "@oculus/core": "0.0.0",
-    "@oculus/db": "0.0.0"
+    "@oculus/db": "0.0.0",
+    "jpeg-js": "^0.4.4",
+    "omggif": "^1.0.10",
+    "pngjs": "^7.0.0"
   }
 }

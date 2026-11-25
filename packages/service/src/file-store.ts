@@ -40,9 +40,10 @@
  * no row names, under the organization's file lock).
  */
 import { createHash, randomBytes } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, createReadStream, openSync } from "node:fs";
 import { link, lstat, mkdir, open, readdir, rename, rm, stat, statfs } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
+import type { Readable } from "node:stream";
 import { SNIFF_BYTES, isOrganizationId, isSha256Hex, type OrganizationId } from "@oculus/core";
 
 /** Bytes in a mebibyte. */
@@ -119,11 +120,56 @@ export interface FileStore {
   discard(file: ReceivedFile): Promise<void>;
   /** Where the content is stored (for reading in M-003 and in tests). */
   pathFor(organizationId: OrganizationId, sha256: string): string;
+  /**
+   * A stored copy, checked before anything is read (M-003): every folder on
+   * the way a real directory of ours, the file a regular file of ours with
+   * one link and exactly `size` bytes. Returns a function that opens a
+   * stream of it (`O_NOFOLLOW`), or `undefined` when the copy is missing
+   * or isn't what it should be.
+   */
+  openContent(
+    organizationId: OrganizationId,
+    sha256: string,
+    size: number,
+  ): Promise<(() => Readable) | undefined>;
+  /**
+   * Up to `maxBytes` of a stored copy from its start, checked as
+   * `openContent` checks it; `undefined` when it is missing or isn't right.
+   */
+  readContent(
+    organizationId: OrganizationId,
+    sha256: string,
+    size: number,
+    maxBytes: number,
+  ): Promise<Uint8Array | undefined>;
+  /**
+   * A cached thumbnail (M-003): its JPEG bytes, `"none"` when an earlier
+   * attempt found it can't be made, or `undefined` when nothing is cached.
+   * Kept per organization beside the copies (`thumbnails/<size>/<2
+   * hex>/<sha256>.v1.jpg` or `.v1.none`), checked as the copies are.
+   */
+  readThumbnail(
+    organizationId: OrganizationId,
+    sha256: string,
+    size: string,
+  ): Promise<Uint8Array | "none" | undefined>;
+  /** Caches a thumbnail (or `"none"`): written to a temporary file, then renamed into place. */
+  writeThumbnail(
+    organizationId: OrganizationId,
+    sha256: string,
+    size: string,
+    jpeg: Uint8Array | "none",
+  ): Promise<void>;
+  /** The contents an organization has cached thumbnails of (their hashes), for the sweep. */
+  thumbnailContents(organizationId: OrganizationId): Promise<readonly string[]>;
   /** The organizations with a folder here. */
   organizations(): Promise<readonly OrganizationId[]>;
   /** The contents stored for an organization (their hashes). */
   contents(organizationId: OrganizationId): Promise<readonly string[]>;
-  /** Deletes a stored copy (call under the organization's file lock, once no row names it). */
+  /**
+   * Deletes a stored copy and its cached thumbnails (call under the
+   * organization's file lock, once no row names it).
+   */
   removeContent(organizationId: OrganizationId, sha256: string): Promise<void>;
   /** Deletes temporary files older than `maxAgeMs`; returns how many. */
   staleIncoming(maxAgeMs: number): Promise<number>;
@@ -257,6 +303,79 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
     return join(organizationDir(organizationId), "sha256", sha256.slice(0, 2), sha256);
   }
 
+  /** The sizes thumbnails are cached for: a fixed word each, never a client's text. */
+  const THUMBNAIL_SIZE = /^[a-z]{1,16}$/;
+
+  function thumbnailParts(organizationId: OrganizationId, sha256: string, size: string): string[] {
+    organizationDir(organizationId);
+    if (!isSha256Hex(sha256)) throw new TypeError("Not a SHA-256.");
+    if (!THUMBNAIL_SIZE.test(size)) throw new TypeError("Not a thumbnail size.");
+    return [organizationId, "thumbnails", size, sha256.slice(0, 2)];
+  }
+
+  /**
+   * Checks each folder from the root down without making any: a real
+   * directory, never a link, ours and writable by us alone. False when one
+   * is missing or isn't.
+   */
+  async function existingFolder(...parts: string[]): Promise<string | undefined> {
+    let path = root;
+    for (const part of parts) {
+      path = join(path, part);
+      const folder = await lstat(path).catch(() => undefined);
+      if (folder === undefined || !folder.isDirectory() || !safeOwnership(folder)) {
+        return undefined;
+      }
+    }
+    return path;
+  }
+
+  /** A regular file of ours with one link (and `size` bytes, when given), never a link. */
+  async function plainFile(path: string, size?: number): Promise<boolean> {
+    const info = await lstat(path).catch(() => undefined);
+    return (
+      info !== undefined &&
+      info.isFile() &&
+      info.nlink === 1 &&
+      safeOwnership(info) &&
+      (size === undefined || info.size === size)
+    );
+  }
+
+  /** The stored copy's path once it has been checked, else `undefined`. */
+  async function checkedContent(
+    organizationId: OrganizationId,
+    sha256: string,
+    size: number,
+  ): Promise<string | undefined> {
+    const target = pathFor(organizationId, sha256);
+    const folder = await existingFolder(organizationId, "sha256", sha256.slice(0, 2));
+    if (folder === undefined) return undefined;
+    return (await plainFile(target, size)) ? target : undefined;
+  }
+
+  /** Reads at most `maxBytes` from the start of a file, opened without following a link. */
+  async function readStart(path: string, maxBytes: number): Promise<Uint8Array> {
+    const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const info = await handle.stat();
+      if (!info.isFile()) throw new Error("Not a plain file.");
+      const buffer = Buffer.alloc(Math.min(maxBytes, info.size));
+      let filled = 0;
+      while (filled < buffer.length) {
+        const { bytesRead } = await handle.read(buffer, filled, buffer.length - filled, filled);
+        if (bytesRead === 0) break;
+        filled += bytesRead;
+      }
+      return buffer.subarray(0, filled);
+    } finally {
+      await handle.close();
+    }
+  }
+
+  /** The largest cached thumbnail read back (a sanity bound; they are far smaller). */
+  const MAX_THUMBNAIL_BYTES = 4 * MIB;
+
   /**
    * Makes (if needed) and checks each folder from the root down: a real
    * directory, never a link, ours and writable by us alone.
@@ -288,6 +407,93 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
     maxOrganizationBytes,
     pathFor,
     lowOnSpace,
+
+    async openContent(organizationId, sha256, size) {
+      const path = await checkedContent(organizationId, sha256, size);
+      if (path === undefined) return undefined;
+      // Opened only when the reply goes out (file-replies.ts); O_NOFOLLOW
+      // again at that moment, and the reply's exact length checks the rest.
+      return () => {
+        const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+        return createReadStream("", { fd, autoClose: true });
+      };
+    },
+
+    async readContent(organizationId, sha256, size, maxBytes) {
+      const path = await checkedContent(organizationId, sha256, size);
+      if (path === undefined) return undefined;
+      return readStart(path, maxBytes).catch(() => undefined);
+    },
+
+    async readThumbnail(organizationId, sha256, size) {
+      const parts = thumbnailParts(organizationId, sha256, size);
+      const folder = await existingFolder(...parts);
+      if (folder === undefined) return undefined;
+      const jpeg = join(folder, `${sha256}.v1.jpg`);
+      if (await plainFile(jpeg)) {
+        const bytes = await readStart(jpeg, MAX_THUMBNAIL_BYTES + 1).catch(() => undefined);
+        // A JPEG of a sane size, or nothing (it is made again).
+        if (
+          bytes !== undefined &&
+          bytes.length >= 4 &&
+          bytes.length <= MAX_THUMBNAIL_BYTES &&
+          bytes[0] === 0xff &&
+          bytes[1] === 0xd8
+        ) {
+          return bytes;
+        }
+        return undefined;
+      }
+      return (await plainFile(join(folder, `${sha256}.v1.none`), 0)) ? "none" : undefined;
+    },
+
+    async writeThumbnail(organizationId, sha256, size, jpeg) {
+      const parts = thumbnailParts(organizationId, sha256, size);
+      const incoming = await safeFolder(organizationId, "incoming");
+      const folder = await safeFolder(...parts);
+      const temporaryPath = join(incoming, `${randomBytes(16).toString("hex")}.part`);
+      const handle = await open(
+        temporaryPath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        0o600,
+      );
+      let placed = false;
+      try {
+        try {
+          if (jpeg !== "none") await writeAll(handle, jpeg);
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+        // A rename replaces whatever is at the name (a planted link
+        // included) in one step. Nothing else is deleted here: only the
+        // sweep deletes (removeContent); a JPEG beside a ".none" wins.
+        const name = jpeg === "none" ? `${sha256}.v1.none` : `${sha256}.v1.jpg`;
+        await rename(temporaryPath, join(folder, name));
+        placed = true;
+      } finally {
+        if (!placed) await rm(temporaryPath, { force: true });
+      }
+    },
+
+    async thumbnailContents(organizationId) {
+      const base = join(organizationDir(organizationId), "thumbnails");
+      const top = await lstat(base).catch(() => undefined);
+      if (top?.isDirectory() !== true) return [];
+      const out = new Set<string>();
+      for (const size of await readdir(base, { withFileTypes: true })) {
+        if (!size.isDirectory() || !THUMBNAIL_SIZE.test(size.name)) continue;
+        for (const prefix of await readdir(join(base, size.name), { withFileTypes: true })) {
+          if (!prefix.isDirectory() || !/^[0-9a-f]{2}$/.test(prefix.name)) continue;
+          const folder = join(base, size.name, prefix.name);
+          for (const entry of await readdir(folder, { withFileTypes: true })) {
+            const sha256 = entry.name.slice(0, 64);
+            if (isSha256Hex(sha256) && sha256.startsWith(prefix.name)) out.add(sha256);
+          }
+        }
+      }
+      return [...out].sort();
+    },
 
     async receive(organizationId, chunks, options = {}): Promise<ReceiveResult> {
       const { signal } = options;
@@ -462,6 +668,23 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       await syncDirectory(
         join(organizationDir(organizationId), "sha256", sha256.slice(0, 2)),
       ).catch(() => undefined);
+      // Its cached thumbnails, every size and every version.
+      const thumbnails = await existingFolder(organizationId, "thumbnails");
+      if (thumbnails === undefined) return;
+      for (const size of await readdir(thumbnails, { withFileTypes: true })) {
+        if (!size.isDirectory() || !THUMBNAIL_SIZE.test(size.name)) continue;
+        const folder = await existingFolder(
+          organizationId,
+          "thumbnails",
+          size.name,
+          sha256.slice(0, 2),
+        );
+        if (folder === undefined) continue;
+        const entries = await readdir(folder).catch(() => [] as string[]);
+        for (const entry of entries) {
+          if (entry.startsWith(`${sha256}.`)) await rm(join(folder, entry), { force: true });
+        }
+      }
     },
 
     async staleIncoming(maxAgeMs) {

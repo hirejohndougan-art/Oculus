@@ -129,6 +129,7 @@ import {
 import { adminOperations, type AdminOperations } from "./admin.js";
 import { definitionOperations, type DefinitionOperations } from "./definitions.js";
 import type { FileStore } from "./file-store.js";
+import type { ThumbnailRenderer } from "./thumbnails.js";
 import { fileOperations, type FileOperations } from "./files.js";
 import { peopleOperations, type PeopleOperations } from "./people.js";
 import {
@@ -361,6 +362,12 @@ export interface ServiceOptions {
    * files is refused as `files_unavailable`; listing still works.
    */
   readonly files?: FileStore;
+  /**
+   * Makes thumbnails (M-003, D-095, `createThumbnailRenderer`); whoever
+   * passes one closes it. Default: one made when first needed, whose idle
+   * worker never keeps the process alive.
+   */
+  readonly thumbnails?: ThumbnailRenderer;
 }
 
 /** What `checkRecord` returns: core's issues for the draft as it would be saved now. */
@@ -2934,6 +2941,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         mayChange(tx, { ...who, siteId: null }, recordId, rowLock, all, any),
       options.files,
       clock,
+      options.thumbnails,
     ),
     submitForReview: workflowAction("submit_for_review"),
     returnToDraft: workflowAction("return_to_draft"),

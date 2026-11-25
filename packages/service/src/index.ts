@@ -54,7 +54,25 @@ export type {
   ReceiveRefusal,
   ReceiveResult,
 } from "./file-store.js";
+export { MAX_THUMBNAIL_SOURCE_BYTES, VIEW_HEADER_BYTES } from "./files.js";
+export {
+  THUMBNAIL_BOXES,
+  THUMBNAIL_LIMITS,
+  THUMBNAIL_TYPES,
+  VIEW_LIMITS,
+  VIEW_TYPES,
+  imageDimensions,
+  type ThumbnailSize,
+} from "./thumbnail-worker.js";
+export {
+  createThumbnailRenderer,
+  type RenderResult,
+  type ThumbnailRenderer,
+  type ThumbnailRendererOptions,
+} from "./thumbnails.js";
 export type {
+  FileContent,
+  FileUse,
   AttachCheck,
   AttachOptions,
   AttachedFile,

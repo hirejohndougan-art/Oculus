@@ -336,6 +336,7 @@ export {
   findStoredFile,
   insertStoredFile,
   listStoredFiles,
+  storedFileById,
   lockOrganizationFiles,
   organizationFileBytes,
   organizationHasContent,

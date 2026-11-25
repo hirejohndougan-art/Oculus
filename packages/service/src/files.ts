@@ -20,12 +20,20 @@
  *   The same content attached to the same asset again is the row already
  *   there (`created: false`).
  * - `listFiles` needs `records.view` where the asset is, like reading it.
+ * - Reading a file (M-003, D-095): `fileContent` (its bytes, to download,
+ *   or to view when the sniffed type is a plain image of a size a browser
+ *   can show) and `fileThumbnail` (a JPEG made here, cached on disk) need
+ *   the same `records.view`. A file the asset doesn't have (another
+ *   asset's, another organization's, a malformed ID) is `unknown_file`,
+ *   which the API answers exactly as a missing record. Only the sniffed
+ *   type decides anything; the claimed type and the name never do.
  *
  * Attaching a file doesn't change the asset's record or its version: the
  * files are their own rows (0022). `If-Match` only makes sure the person
  * attached to the asset as they last saw it.
  */
 import { randomUUID } from "node:crypto";
+import type { Readable } from "node:stream";
 import {
   cleanFileName,
   isClaimedMediaType,
@@ -45,6 +53,7 @@ import {
   lockOrganizationFiles,
   organizationFileBytes,
   organizationHasContent,
+  storedFileById,
   versionConflict,
   type Database,
   type Queryable,
@@ -54,6 +63,17 @@ import {
 import { editPermissions, type RecordAccess, type Refusal } from "./access.js";
 import type { Runner } from "./admin.js";
 import type { FileStore, ReceivedFile } from "./file-store.js";
+import {
+  THUMBNAIL_BOXES,
+  THUMBNAIL_LIMITS,
+  THUMBNAIL_TYPES,
+  VIEW_LIMITS,
+  VIEW_TYPES,
+  imageDimensions,
+  withinLimits,
+  type ThumbnailSize,
+} from "./thumbnail-worker.js";
+import { createThumbnailRenderer, type ThumbnailRenderer } from "./thumbnails.js";
 import type { ServiceContext, ServiceRefusal, ServiceResult } from "./service.js";
 
 export interface AttachCheck {
@@ -90,6 +110,21 @@ export interface FileSweep {
   readonly contents: number;
 }
 
+/** Why a file is read: to download it (any type), or to show it in the browser. */
+export type FileUse = "download" | "view";
+
+export interface FileContent {
+  readonly file: StoredFile;
+  /** Opens a stream of the stored copy (called only when the reply goes out). */
+  readonly open: () => Readable;
+}
+
+/** The largest file a thumbnail is made from (100 MiB): it is read whole into memory. */
+export const MAX_THUMBNAIL_SOURCE_BYTES = 100 * 1024 * 1024;
+
+/** How much of a file's start is read to find an image's size before showing it (1 MiB). */
+export const VIEW_HEADER_BYTES = 1024 * 1024;
+
 export interface FileOperations {
   /** Asked before an upload is read; see the module header. */
   mayAttachFile(
@@ -121,6 +156,29 @@ export interface FileOperations {
    * lock, the stored copies no row names. Run at startup and on a timer.
    */
   sweepFiles(incomingMaxAgeMs: number): Promise<FileSweep>;
+  /**
+   * One file's bytes (M-003): to download, for anyone who may view the
+   * asset; to view, only a JPEG, PNG, GIF or WebP (sniffed) whose header
+   * gives a size within `VIEW_LIMITS` (else `not_viewable`).
+   */
+  fileContent(
+    context: ServiceContext,
+    recordId: RecordId,
+    fileId: string,
+    use: FileUse,
+  ): Promise<ServiceResult<FileContent>>;
+  /**
+   * A thumbnail of one file (M-003): JPEG bytes fitting the size's box,
+   * from the cache or made now. `no_thumbnail` for a file it can't or won't
+   * be made of (not a JPEG, PNG or GIF, too large, broken, a bomb); `busy`
+   * when too many are being made.
+   */
+  fileThumbnail(
+    context: ServiceContext,
+    recordId: RecordId,
+    fileId: string,
+    size: ThumbnailSize,
+  ): Promise<ServiceResult<{ readonly jpeg: Uint8Array }>>;
   /** The asset's files (name, size, sniffed type, who and when). */
   listFiles(
     context: ServiceContext,
@@ -152,7 +210,39 @@ export function fileOperations(
   mayChange: PlaceCheck,
   store: FileStore | undefined,
   clock: () => Date,
+  thumbnails?: ThumbnailRenderer,
 ): FileOperations {
+  let renderer = thumbnails;
+  /** Thumbnails being made now, by organization, content and size: asked twice, made once. */
+  const making = new Map<string, Promise<ServiceResult<{ readonly jpeg: Uint8Array }>>>();
+
+  /** The file as the person may read it: the asset visible to them, the file its own. */
+  async function readable(
+    context: ServiceContext,
+    operation: string,
+    recordId: RecordId,
+    fileId: string,
+  ): Promise<
+    ServiceResult<{ readonly file: StoredFile; readonly organizationId: OrganizationId }>
+  > {
+    return run(operation, context, async (tx, who) => {
+      if (!isRecordId(recordId)) {
+        return refusal(["recordId"], "invalid_id", "A record ID is a lowercase version 4 UUID.");
+      }
+      const allowed = await mayChange(tx, who, recordId, "share", []);
+      if (!allowed.ok) return allowed;
+      const file = await storedFileById(tx, who.organizationId, recordId, fileId);
+      if (file === undefined) {
+        return refusal(["fileId"], "unknown_file", "The record has no such file.");
+      }
+      return { ok: true, value: { file, organizationId: who.organizationId } };
+    });
+  }
+
+  const missingCopy = (): ServiceRefusal =>
+    refusal(["files"], "internal_error", "The file's stored copy can't be read.");
+  const noThumbnail = (): ServiceRefusal =>
+    refusal(["fileId"], "no_thumbnail", "No thumbnail can be made of this file.");
   /**
    * The asset as the person may attach to it, under its row lock: visible,
    * editable by them, a digital asset, at the version they saw.
@@ -330,7 +420,14 @@ export function fileOperations(
         // from under a row about to name it.
         contents += await db.transaction(async (tx) => {
           await lockOrganizationFiles(tx, organizationId);
-          const onDisk = await store.contents(organizationId);
+          // Copies and cached thumbnails (M-003) alike: a thumbnail of
+          // content no row names goes too.
+          const onDisk = [
+            ...new Set([
+              ...(await store.contents(organizationId)),
+              ...(await store.thumbnailContents(organizationId)),
+            ]),
+          ].sort();
           let removed = 0;
           for (let i = 0; i < onDisk.length; i += 1000) {
             const batch = onDisk.slice(i, i + 1000);
@@ -345,6 +442,96 @@ export function fileOperations(
         });
       }
       return Object.freeze({ incoming, contents });
+    },
+
+    async fileContent(context, recordId, fileId, use) {
+      if (store === undefined) return NO_STORE;
+      // Checked as data too: a caller in plain JavaScript could send anything.
+      if (!(["download", "view"] as unknown[]).includes(use)) {
+        return refusal(["use"], "invalid_use", "A file is read to download or to view.");
+      }
+      const found = await readable(context, "fileContent", recordId, fileId);
+      if (!found.ok) return found;
+      const { file, organizationId } = found.value;
+      if (use === "view") {
+        // Only the sniffed type decides (D-086), and the header's size must
+        // be one a browser can show without a decompression bomb.
+        if (!VIEW_TYPES.has(file.mediaType)) {
+          return refusal(["fileId"], "not_viewable", "This file can only be downloaded.");
+        }
+        const head = await store.readContent(
+          organizationId,
+          file.sha256,
+          file.size,
+          VIEW_HEADER_BYTES,
+        );
+        if (head === undefined) return missingCopy();
+        if (!withinLimits(imageDimensions(file.mediaType, head), VIEW_LIMITS)) {
+          return refusal(["fileId"], "not_viewable", "This file can only be downloaded.");
+        }
+      }
+      const open = await store.openContent(organizationId, file.sha256, file.size);
+      if (open === undefined) return missingCopy();
+      return { ok: true, value: Object.freeze({ file, open }) };
+    },
+
+    async fileThumbnail(context, recordId, fileId, size) {
+      if (store === undefined) return NO_STORE;
+      const box = Object.hasOwn(THUMBNAIL_BOXES, size) ? THUMBNAIL_BOXES[size] : undefined;
+      if (box === undefined) {
+        return refusal(["size"], "invalid_size", "A thumbnail is small or medium.");
+      }
+      const found = await readable(context, "fileThumbnail", recordId, fileId);
+      if (!found.ok) return found;
+      const { file, organizationId } = found.value;
+      if (!THUMBNAIL_TYPES.has(file.mediaType) || file.size > MAX_THUMBNAIL_SOURCE_BYTES) {
+        return noThumbnail();
+      }
+      // Cached per organization and content: never another organization's.
+      const key = `${organizationId}/${file.sha256}/${size}`;
+      const already = making.get(key);
+      if (already !== undefined) return already;
+      const made = (async (): Promise<ServiceResult<{ readonly jpeg: Uint8Array }>> => {
+        // The cache is a help, never a need: trouble with it is a miss.
+        const remember = (jpeg: Uint8Array | "none"): Promise<void> =>
+          store.writeThumbnail(organizationId, file.sha256, size, jpeg).catch(() => undefined);
+        const cached = await store
+          .readThumbnail(organizationId, file.sha256, size)
+          .catch(() => undefined);
+        if (cached === "none") return noThumbnail();
+        if (cached !== undefined) return { ok: true, value: { jpeg: cached } };
+        const bytes = await store.readContent(
+          organizationId,
+          file.sha256,
+          file.size,
+          MAX_THUMBNAIL_SOURCE_BYTES,
+        );
+        if (bytes?.length !== file.size) return missingCopy();
+        // The header first, here: a bomb is refused before any decoder runs.
+        if (!withinLimits(imageDimensions(file.mediaType, bytes), THUMBNAIL_LIMITS)) {
+          await remember("none");
+          return noThumbnail();
+        }
+        renderer ??= createThumbnailRenderer();
+        const result = await renderer.render(file.mediaType, bytes, box);
+        if (!result.ok) {
+          if (result.code === "busy") {
+            return refusal(["files"], "busy", "Too many thumbnails are being made. Try again.");
+          }
+          // Refused by the decoder or out of memory: remembered, so it isn't
+          // tried again. A timeout may be the server's load: not remembered.
+          if (result.code === "refused") await remember("none");
+          return noThumbnail();
+        }
+        await remember(result.jpeg);
+        return { ok: true, value: { jpeg: result.jpeg } };
+      })();
+      making.set(key, made);
+      try {
+        return await made;
+      } finally {
+        making.delete(key);
+      }
     },
 
     async listFiles(context, recordId) {
