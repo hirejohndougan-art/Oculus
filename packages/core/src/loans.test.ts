@@ -270,8 +270,9 @@ describe("loan states and the move log", () => {
   });
 
   it("phases: agreed before anything moves, returned when everything is back", () => {
-    // The map is home now (the print is at the borrower's: D-118 would flag it unlinked).
-    const agreed = loanOut({ items: [{ recordId: map }] });
+    // A record never sent anywhere (the print and the map have loan_out moves
+    // this loan doesn't name: D-118 would flag them unlinked).
+    const agreed = loanOut({ items: [{ recordId: newRecordId() }] });
     expect(ok(loanState(book([agreed]), agreed.id)).phase).toBe("agreed");
     const back = loanOut({
       items: [{ recordId: map, loanOutMoveId: mapOut.id, returnMoveId: mapBack.id }],
@@ -677,8 +678,12 @@ describe("review fixes", () => {
     const raced = book([stolen, genuine]);
     expect(ok(loanProblems(raced)).map((p) => p.loanId)).toEqual([stolen.id, genuine.id]);
     const late = ok(overdueLoans(raced, "2026-11-23"));
-    expect(late.map((s) => [s.loan.number, s.phase])).toEqual([["LO-2026-001", "unknown"]]);
-    expect(late[0]?.problems.map((p) => p.code)).toEqual(["move_reused"]);
+    // D-118: the decoy is listed too (its item is out, due back by the move log).
+    expect(late.map((s) => s.phase)).toEqual(["unknown", "unknown"]);
+    expect(late.map((s) => s.loan.id)).toContain(genuine.id);
+    expect(late.find((s) => s.loan.id === genuine.id)?.problems.map((p) => p.code)).toEqual([
+      "move_reused",
+    ]);
     expect(ok(loanState(raced, stolen.id)).phase).toBe("unknown");
   });
 

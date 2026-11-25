@@ -149,7 +149,14 @@ export interface LoanOperations {
     loanId: unknown,
     move: unknown,
     options: { readonly expectedVersion: unknown },
-  ): Promise<ServiceResult<{ readonly move: StorageMove; readonly loan: LoanView }>>;
+  ): Promise<
+    ServiceResult<{
+      readonly move: StorageMove;
+      readonly loan: LoanView;
+      /** For a `loan_out`: the item had no recent check saying it can travel. A warning only. */
+      readonly fitWarning: FitToMove | null;
+    }>
+  >;
   overdueLoans(context: unknown): Promise<ServiceResult<readonly LoanState[]>>;
   unexplainedLoanMoves(context: unknown): Promise<ServiceResult<UnexplainedLoanMoves>>;
   recordConditionCheck(context: unknown, check: unknown): Promise<ServiceResult<ConditionCheck>>;
@@ -240,7 +247,11 @@ function ownIssues(issues: readonly Issue[]): Refusal {
     ok: false,
     issues: issues.map((i) =>
       i.path[0] === "otherLoans"
-        ? issue(["otherLoans"], i.code, "This edit would give another loan a problem.")
+        ? issue(
+            ["otherLoans"],
+            "affects_other_loan",
+            "This edit would give another loan a problem.",
+          )
         : i,
     ),
   };
@@ -513,6 +524,15 @@ export function loanOperations(run: Runner): LoanOperations {
         );
         if (!found.ok) return found;
         const versions = await readLoanHistory(tx, who.organizationId, found.loan.id);
+        // Every version's records, not only today's (review fix): an earlier
+        // version may name a record or lender the person may not see.
+        const named = versions.flatMap((v) => {
+          const checked = validateLoan(v.definition, b.now);
+          return checked.ok ? recordsOf(checked.value) : [];
+        });
+        if (!(await mayAll(tx, who.organizationId, may.access, named, "records.view"))) {
+          return UNKNOWN_LOAN();
+        }
         return {
           ok: true,
           value: Object.freeze(
@@ -687,7 +707,19 @@ export function loanOperations(run: Runner): LoanOperations {
         if (!written.ok) return UNKNOWN_RECORD(["move", "recordId"]);
         const saved = await save(tx, book.value, next, may.userId, expected);
         if (!saved.ok) return saved;
-        return { ok: true, value: Object.freeze({ move: made.value, loan: saved.value }) };
+        let fitWarning: FitToMove | null = null;
+        if (reason === "loan_out") {
+          const checks = await conditionLogOf(tx, who.organizationId);
+          const fit =
+            checks === undefined
+              ? undefined
+              : fitToMove(checks, recordId, { on: made.value.movedOn });
+          if (fit?.ok && !fit.value.fit) fitWarning = fit.value;
+        }
+        return {
+          ok: true,
+          value: Object.freeze({ move: made.value, loan: saved.value, fitWarning }),
+        };
       });
     },
 
@@ -787,7 +819,11 @@ export function loanOperations(run: Runner): LoanOperations {
         const loanId = own(input, "loanId");
         if (loanId !== undefined) {
           const loan = isLoanId(loanId) ? loanById(b.book, loanId) : undefined;
-          if (!loan?.items.some((i) => i.recordId === recordId)) {
+          // Only a loan the person may see (review fix: no yes/no oracle).
+          const seen =
+            loan !== undefined &&
+            (await mayAll(tx, who.organizationId, may.access, recordsOf(loan), "records.view"));
+          if (!seen || !loan.items.some((i) => i.recordId === recordId)) {
             return refusal(
               ["loanId"],
               "unknown_loan",

@@ -623,7 +623,7 @@ describe("condition checks (T-018a: checks against the stored loans, fit-to-move
         reason: "placement",
       }),
     );
-    ok(
+    const sent = ok(
       await service.recordLoanMove(
         ctx(w, w.cataloger),
         out.loan.id,
@@ -631,6 +631,7 @@ describe("condition checks (T-018a: checks against the stored loans, fit-to-move
         { expectedVersion: 1 },
       ),
     );
+    expect(sent.fitWarning).toBeNull();
     const after = ok(await service.readLoan(ctx(w, w.reader), out.loan.id));
     expect(after.fitWarnings).toEqual([]);
     expect(after.state.items[0]?.dueBack).toBe("2026-10-31");

@@ -77,7 +77,6 @@ import {
   whereabouts,
   type MoveId,
   type MoveLog,
-  type StorageLocation,
   type StorageMove,
 } from "./storage.js";
 
@@ -783,11 +782,15 @@ export function overdueLoans(book: LoanBook, today: unknown): Validated<readonly
     return refused([], "invalid_date", "Today must be a day written YYYY-MM-DD.");
   const found: LoanState[] = [];
   for (const entry of data.byId.values()) {
-    if (entry.loan.endOn >= today) continue;
     const state = stateOf(data, entry);
+    // A loan out item due back by the move log before today is late even if
+    // the loan's end date was moved later without recording it (review fix).
+    const dueLate = state.items.some((i) => i.out && i.dueBack !== null && i.dueBack < today);
+    if (entry.loan.endOn >= today && !dueLate) continue;
     // D-118: an agreed loan is over only when every item is settled, by a
     // linked end move or an explicit, recorded way; dates alone never do it.
     if (
+      dueLate ||
       state.phase === "unknown" ||
       (entry.loan.status === "agreed" && state.unsettled.length > 0)
     ) {
@@ -1224,86 +1227,6 @@ function buildBook(
     }
   }
 
-  // Where the record is now (D-118, S-013): a loan's record found back in our
-  // care (or at the borrower's) that no open loan explains makes the loan
-  // unknown, whatever the dates say.
-  const agreedOrClosed = (l: Loan): boolean => l.status === "agreed" || l.status === "closed";
-  const coveredIn = new Set<RecordId>();
-  const coveredOut = new Set<string>();
-  for (const r of raw) {
-    if (!agreedOrClosed(r.loan) || r.effectiveStart === undefined) continue;
-    const by = settledOf(r);
-    if (r.loan.direction === "in") {
-      if (by === null || by === "kept" || by === "renewed") coveredIn.add(r.recordId);
-    } else if (by === null) {
-      coveredOut.add(`${r.recordId} ${r.loan.agentId}`);
-    }
-  }
-  const nowAt = new Map<RecordId, StorageLocation | null>();
-  const currentPlace = (recordId: RecordId): StorageLocation | null => {
-    if (nowAt.has(recordId)) return nowAt.get(recordId) ?? null;
-    const where = whereabouts(log, recordId);
-    const place = where.ok && where.value !== null ? where.value.current : null;
-    nowAt.set(recordId, place);
-    return place;
-  };
-  for (const r of raw) {
-    if (!agreedOrClosed(r.loan)) continue;
-    const by = settledOf(r);
-    const place = currentPlace(r.recordId);
-    if (r.loan.direction === "in") {
-      if (place === null || place.kind === "external" || coveredIn.has(r.recordId)) continue;
-      if (by === null && !r.startNamed && r.continues === null) {
-        flag(
-          r.loan.id,
-          ["items", r.j],
-          "unlinked_arrival",
-          "This record is in our care, but its arrival isn't linked to this loan (or any open loan in). Link the placement that housed it.",
-        );
-      } else if (by === "not_received") {
-        flag(
-          r.loan.id,
-          ["items", r.j, "notReceived"],
-          "received_after_all",
-          "This record is marked as never received, but it is in our care and no open loan in explains it.",
-        );
-      } else if (by === "departed") {
-        flag(
-          r.loan.id,
-          ["items", r.j, "departureMoveId"],
-          "back_again_unlinked",
-          "This record went back to the lender but is in our care again, and no open loan in explains it. Record the new loan in, linking its arrival.",
-        );
-      }
-    } else {
-      const atAgent =
-        place !== null && place.kind === "external" && place.agentId === r.loan.agentId;
-      if (!atAgent || coveredOut.has(`${r.recordId} ${r.loan.agentId}`)) continue;
-      if (by === null && !r.startNamed) {
-        flag(
-          r.loan.id,
-          ["items", r.j],
-          "unlinked_loan_out",
-          "This record is at the borrower's, but no loan_out move is linked to this loan (or any open loan out). Link the move that sent it.",
-        );
-      } else if (by === "not_sent") {
-        flag(
-          r.loan.id,
-          ["items", r.j, "notSent"],
-          "sent_after_all",
-          "This record is marked as never sent, but it is at the borrower's and no open loan out explains it.",
-        );
-      } else if (by === "returned") {
-        flag(
-          r.loan.id,
-          ["items", r.j, "returnMoveId"],
-          "out_again_unlinked",
-          "This record came back but is at the borrower's again, and no open loan out explains it.",
-        );
-      }
-    }
-  }
-
   // A `loan_out` move is explained when a loan item names it, or when it
   // extends one: the same record to the same place, after the named
   // `loan_out` and before that item's return.
@@ -1326,6 +1249,99 @@ function buildBook(
     list.push(m);
     strayByRecord.set(m.recordId, list);
   }
+  // Unexplained arrivals and sendings (D-118, S-013), from the record's
+  // whole history, never its dates: a move that brought a borrowed record
+  // into our care (its first move, or the first after it was at an outside
+  // place, other than a return) that no loan in names as an arrival; a
+  // `loan_out` no loan out names or extends (above). Each makes every loan
+  // of the record that says it isn't owing (never started, marked never
+  // received or sent, gone back or returned) unknown: a record here (or at
+  // the borrower's) with no loan explaining it can't be on a loan that
+  // looks finished. A record kept for good is ours, so its later moves are
+  // not arrivals. Requested and declined loans owe nothing and aren't
+  // checked; agreed, closed and cancelled ones are.
+  const keptRecords = new Set<RecordId>();
+  for (const r of raw) if (settledOf(r) === "kept") keptRecords.add(r.recordId);
+  const strayArrivals = new Set<RecordId>();
+  for (const r of raw) {
+    if (r.loan.direction !== "in" || strayArrivals.has(r.recordId) || keptRecords.has(r.recordId)) {
+      continue;
+    }
+    let outside = true;
+    for (const m of r.moves) {
+      const place = logLocation(log, m.locationId);
+      const external = place?.kind === "external";
+      if (!external && outside && m.reason !== "return" && !named.has(m.id)) {
+        strayArrivals.add(r.recordId);
+        break;
+      }
+      outside = external;
+    }
+  }
+  const straySent = new Set<string>();
+  for (const m of unexplainedOut) {
+    const place = logLocation(log, m.locationId);
+    if (place?.kind === "external" && place.agentId !== undefined) {
+      straySent.add(`${m.recordId} ${place.agentId}`);
+    }
+  }
+  const checked = (l: Loan): boolean =>
+    l.status === "agreed" || l.status === "closed" || l.status === "cancelled";
+  for (const r of raw) {
+    if (!checked(r.loan)) continue;
+    const by = settledOf(r);
+    const unstarted = by === null && !r.startNamed && r.continues === null;
+    if (r.loan.direction === "in") {
+      if (!strayArrivals.has(r.recordId)) continue;
+      if (unstarted) {
+        flag(
+          r.loan.id,
+          ["items", r.j],
+          "unlinked_arrival",
+          "This record came into our care in a move no loan in names as its arrival. Link the placement that housed it.",
+        );
+      } else if (by === "not_received") {
+        flag(
+          r.loan.id,
+          ["items", r.j, "notReceived"],
+          "received_after_all",
+          "This record is marked as never received, but it came into our care in a move no loan in names as its arrival.",
+        );
+      } else if (by === "departed") {
+        flag(
+          r.loan.id,
+          ["items", r.j, "departureMoveId"],
+          "back_again_unlinked",
+          "This record came into our care in a move no loan in names as its arrival. Record the loan in it came on, linking that arrival.",
+        );
+      }
+    } else {
+      if (!straySent.has(`${r.recordId} ${r.loan.agentId}`)) continue;
+      if (unstarted) {
+        flag(
+          r.loan.id,
+          ["items", r.j],
+          "unlinked_loan_out",
+          "This record went to the borrower in a loan_out no loan out names. Link the move that sent it.",
+        );
+      } else if (by === "not_sent") {
+        flag(
+          r.loan.id,
+          ["items", r.j, "notSent"],
+          "sent_after_all",
+          "This record is marked as never sent, but it went to the borrower in a loan_out no loan out names.",
+        );
+      } else if (by === "returned") {
+        flag(
+          r.loan.id,
+          ["items", r.j, "returnMoveId"],
+          "out_again_unlinked",
+          "This record went to the borrower again in a loan_out no loan out names.",
+        );
+      }
+    }
+  }
+
   for (const r of raw) {
     if (r.loan.status !== "closed") continue;
     // A closed loan has every item settled (D-118): nothing is owed on it.
@@ -1466,9 +1482,44 @@ function keptCopy(options: unknown): ReadonlyMap<string, ReadonlySet<string>> | 
  */
 function statusTurns(before: Entry, next: Loan): Issue[] {
   const was = before.loan.status;
-  if (was !== "agreed" && was !== "closed") return [];
   const found: Issue[] = [];
   const nextItems: readonly (LoanInItem | LoanOutItem)[] = next.items;
+  // The lender or borrower never changes once anything moved (review fix):
+  // a departure is checked against the lender, so a new one could be any.
+  if (next.agentId !== before.loan.agentId && before.items.some((i) => i.begun)) {
+    found.push(
+      issue(
+        ["agentId"],
+        "agent_changed",
+        "Items have moved on this loan, so its lender or borrower stays. Record a new loan.",
+      ),
+    );
+  }
+  // Cancelled is final (review fix): a cancelled loan keeps its status,
+  // items and markers, so cancelling can't be a way round the rules below.
+  if (was === "cancelled") {
+    if (next.status !== "cancelled") {
+      found.push(
+        issue(
+          ["status"],
+          "status_change_refused",
+          "A cancelled loan stays cancelled. Record a new loan.",
+        ),
+      );
+    }
+    const flagKey = next.direction === "out" ? "notSent" : "notReceived";
+    for (const item of before.loan.items) {
+      const now = nextItems.find((i) => i.recordId === item.recordId);
+      if (now === undefined || (ownFlag(item, flagKey) && !ownFlag(now, flagKey))) {
+        found.push(
+          issue(["items"], "item_removed", `A cancelled loan keeps its items as they were.`),
+        );
+        break;
+      }
+    }
+    return found;
+  }
+  if (was !== "agreed" && was !== "closed") return found;
   for (const item of before.loan.items) {
     if (!nextItems.some((i) => i.recordId === item.recordId)) {
       found.push(

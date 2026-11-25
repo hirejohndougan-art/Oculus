@@ -592,3 +592,78 @@ afterEach(() => {
   // Nothing global is left behind by the prototype test.
   expect(Object.prototype.hasOwnProperty.call(Object.prototype, "notReceived")).toBe(false);
 });
+
+describe("review fixes (D-118's first review)", () => {
+  const urn = newRecordId();
+  const arrival = move(urn, shelf.id, "2026-06-03", "placement");
+
+  it("cancelling can't hide an unlinked arrival, and a cancelled loan stays cancelled", () => {
+    const loan = loanIn([{ recordId: urn }]);
+    const b = ok(indexLoans(log([]), [loan]));
+    const moved = ok(reindexLoans(b, log([arrival])));
+    const cancel = {
+      ...loan,
+      status: "cancelled" as const,
+      items: [{ recordId: urn, notReceived: true as const }],
+    };
+    expect(codes(withLoan(moved, cancel))).toEqual(["received_after_all"]);
+    // Cancelled while nothing had come: fine, and final.
+    const cancelled = ok(withLoan(b, cancel));
+    for (const status of ["requested", "agreed", "declined"] as const) {
+      expect(codes(withLoan(cancelled, { ...cancel, status }))).toContain("status_change_refused");
+    }
+    expect(codes(withLoan(cancelled, { ...cancel, items: [{ recordId: urn }] }))).toEqual([
+      "item_removed",
+    ]);
+    // It came after all: the cancelled loan is unknown, and overdue.
+    const later = ok(reindexLoans(cancelled, log([arrival])));
+    expect(ok(loanState(later, loan.id)).phase).toBe("unknown");
+    expect(overdueIds(later)).toEqual([loan.id]);
+  });
+
+  it("an unlinked arrival counts even after the record went somewhere outside", () => {
+    const away = move(urn, otherLenderPlace.id, "2026-07-01", "conservation", {
+      expectedReturnOn: "2026-12-31",
+    });
+    const loan = loanIn([{ recordId: urn, notReceived: true }]);
+    expect(problemCodes(indexLoans(log([arrival, away]), [loan]))).toEqual(["received_after_all"]);
+  });
+
+  it("a long-open loan doesn't explain a later unlinked arrival", () => {
+    const first = loanIn([{ recordId: urn, arrivalMoveId: arrival.id }], { number: "LI-OLD" });
+    const gone = move(urn, lenderPlace.id, "2026-07-01", "departure");
+    const again = move(urn, shelf.id, "2026-08-01", "placement");
+    const second = loanIn([{ recordId: urn, notReceived: true }], { beginOn: "2026-08-01" });
+    const b = ok(indexLoans(log([arrival, gone, again]), [first, second]));
+    expect(ok(loanState(b, second.id)).problems.map((p) => p.code)).toEqual(["received_after_all"]);
+  });
+
+  it("a loan_out moved on elsewhere still counts against notSent", () => {
+    const print = newRecordId();
+    const home = move(print, shelf.id, "2026-01-10", "placement");
+    const out = move(print, borrowerPlace.id, "2026-06-05", "loan_out", {
+      expectedReturnOn: "2026-10-31",
+    });
+    const fixed = move(print, otherLenderPlace.id, "2026-06-06", "correction");
+    const loan = loanOut([{ recordId: print, notSent: true }]);
+    expect(problemCodes(indexLoans(log([home, out, fixed]), [loan]))).toEqual(["sent_after_all"]);
+  });
+
+  it("the lender stays once anything moved", () => {
+    const loan = loanIn([{ recordId: urn, arrivalMoveId: arrival.id }]);
+    const b = ok(indexLoans(log([arrival]), [loan]));
+    expect(codes(withLoan(b, { ...loan, agentId: OTHER_LENDER }))).toEqual(["agent_changed"]);
+  });
+
+  it("a loan out's end date moved later without the move log stays overdue", () => {
+    const print = newRecordId();
+    const home = move(print, shelf.id, "2026-01-10", "placement");
+    const out = move(print, borrowerPlace.id, "2026-06-05", "loan_out", {
+      expectedReturnOn: "2026-10-31",
+    });
+    const loan = loanOut([{ recordId: print, loanOutMoveId: out.id }], { endOn: "2099-12-31" });
+    const b = ok(indexLoans(log([home, out]), [loan]));
+    expect(overdueIds(b)).toEqual([loan.id]);
+    expect(ok(loanState(b, loan.id)).items[0]?.dueMatchesLoan).toBe(false);
+  });
+});
