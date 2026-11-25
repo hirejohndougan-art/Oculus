@@ -325,7 +325,7 @@ Admin screens in the browser:
   - Settings › People & roles (invite, change role, grant collections, require two-factor) and the Audit trail on Audit & Reports, with search by person, record and date.
   - From the T-041 review (D-072): admin operations (granting and revoking roles, creating and renaming sites, changing System settings) require recent re-authentication, as T-037's `endUserSessions` does.
   - From D-019, handed over by T-019: the install-wide Users page for system managers covering every site: invite, set a role per site or no access, make someone a system manager, reset passwords and two-step sign-in, deactivate.
-- [ ] T-048a **Admin: System settings.** deps: T-045, T-041 (risky)
+- [~] T-048a **Admin: System settings.** deps: T-045, T-041 (risky) In progress (Chat C, 2026-11-24): branch `autopilot/T-048a`. Nightly runs: skip this task.
   - From D-019 and D-025, handed over by T-019 (its own task because T-048 is people, roles and the audit trail): the System settings screen for the whole install, system managers only (T-041): sites (create, rename, which organization), sign-in and security rules, site password protection (with T-019d), email, backups and updates. Separate from each site's own Site settings.
 
 Server and deployment:
