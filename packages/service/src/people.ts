@@ -911,7 +911,7 @@ export function peopleOperations(
             value: await readAuditTrail(
               tx,
               who.organizationId,
-              { records, people },
+              { records, people, system: v.system },
               {
                 ...(person === undefined ? {} : { actorId: person }),
                 ...(record === undefined ? {} : { recordId: record }),

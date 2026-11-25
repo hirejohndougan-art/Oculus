@@ -416,6 +416,12 @@ export {
   sharesOfRecord,
 } from "./shares.js";
 export type { Share, ShareState, SharedItemView } from "./shares.js";
+export {
+  SYSTEM_EVENT_KINDS,
+  SYSTEM_EVENT_TABLE_PRIVILEGES,
+  insertSystemEvent,
+} from "./system-events.js";
+export type { NewSystemEvent, SystemEventKind } from "./system-events.js";
 export { runSetupCli, terminalAsk } from "./setup-cli.js";
 export type { Ask } from "./setup-cli.js";
 export { backup, BackupError } from "./backup.js";

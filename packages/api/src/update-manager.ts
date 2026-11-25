@@ -81,6 +81,9 @@ export const UPDATE_WRITER_ROLE_ENV = "OCULUS_UPDATE_WRITER_ROLE";
 export const UPLOAD_PART_BYTES = 512 * 1024;
 /** An upload untouched this long is dropped. */
 const UPLOAD_IDLE_MS = 60 * 60 * 1000;
+/** How long the change log's row may take after a switch (T-060a). */
+export const CHANGE_LOG_TIMEOUT_MS = 15_000;
+
 /** Releases kept besides the current one, the rollback target and the waiting one. */
 const KEEP_RELEASES = 3;
 const STEP_TIMEOUT_MS = 20 * 60 * 1000;
@@ -195,6 +198,14 @@ export interface UpdateManagerOptions {
   readonly maxPackageBytes?: number;
   /** For logs: called with a fixed event and code, never a path or a secret. */
   readonly log?: (event: string, fields: Readonly<Record<string, string>>) => void;
+  /**
+   * Writes an install or rollback into the change log (T-060a, D-104), once
+   * the switch is made. A failure can't undo the switch, so it is logged
+   * (`update_change_log_failed`), never reported as the job's failure.
+   */
+  readonly changeLog?: (entry: HistoryEntry) => Promise<void>;
+  /** How long the change log's row may take (default `CHANGE_LOG_TIMEOUT_MS`; tests). */
+  readonly changeLogTimeoutMs?: number;
 }
 
 /** A Node child process with the server's environment, its output kept (capped) for the log. */
@@ -327,6 +338,8 @@ export class UpdateManager {
   private readonly runScript: RunScript;
   private readonly clock: () => number;
   private readonly requestRestart: (() => void) | undefined;
+  private readonly changeLog: ((entry: HistoryEntry) => Promise<void>) | undefined;
+  private readonly changeLogTimeoutMs: number;
   readonly maxPackageBytes: number;
   private readonly log: (event: string, fields: Readonly<Record<string, string>>) => void;
   private upload: Upload | undefined;
@@ -346,6 +359,8 @@ export class UpdateManager {
     this.runScript = options.runScript ?? defaultRunScript;
     this.clock = options.clock ?? Date.now;
     this.requestRestart = options.requestRestart;
+    this.changeLog = options.changeLog;
+    this.changeLogTimeoutMs = options.changeLogTimeoutMs ?? CHANGE_LOG_TIMEOUT_MS;
     this.maxPackageBytes = options.maxPackageBytes ?? DEFAULT_ZIP_LIMITS.maxFileBytes;
     this.log =
       options.log ??
@@ -913,10 +928,8 @@ export class UpdateManager {
       step("switching");
       await this.swapCurrent(version);
       this.swapped = true;
-      const history = [
-        ...state.history,
-        { kind: "install" as const, version, from, at: this.now(), by },
-      ];
+      const entry = { kind: "install" as const, version, from, at: this.now(), by };
+      const history = [...state.history, entry];
       const next = { pending: null, history: history.slice(-HISTORY_LIMIT) };
       this.log("update_installed", { version, from: from ?? "development" });
       // The switch is made: what follows can't undo it, so a failure is logged, not reported.
@@ -926,6 +939,8 @@ export class UpdateManager {
       } catch {
         this.log("update_bookkeeping_failed", { version });
       }
+      // After the folder's own record, so a slow database never leaves it behind.
+      await this.logChange(entry);
     } finally {
       await unlock();
     }
@@ -951,18 +966,39 @@ export class UpdateManager {
       step("switching");
       await this.swapCurrent(version);
       this.swapped = true;
-      const history = [
-        ...state.history,
-        { kind: "rollback" as const, version, from, at: this.now(), by },
-      ];
+      const entry = { kind: "rollback" as const, version, from, at: this.now(), by };
+      const history = [...state.history, entry];
       try {
         await this.writeState({ ...state, history: history.slice(-HISTORY_LIMIT) });
       } catch {
         this.log("update_bookkeeping_failed", { version });
       }
+      await this.logChange(entry);
       this.log("update_rolled_back", { version, from: from ?? "development" });
     } finally {
       await unlock();
+    }
+  }
+
+  /** The change log's row for a switch just made (T-060a); a failure is only logged. */
+  private async logChange(entry: HistoryEntry): Promise<void> {
+    if (this.changeLog === undefined) return;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      // A database that doesn't answer mustn't hold up a switch already made.
+      await Promise.race([
+        this.changeLog(entry),
+        new Promise<never>((_, fail) => {
+          timer = setTimeout(() => {
+            fail(new Error("timeout"));
+          }, this.changeLogTimeoutMs);
+          timer.unref();
+        }),
+      ]);
+    } catch {
+      this.log("update_change_log_failed", { version: entry.version });
+    } finally {
+      clearTimeout(timer);
     }
   }
 

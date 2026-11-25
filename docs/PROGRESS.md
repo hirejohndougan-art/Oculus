@@ -9,6 +9,13 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Review: one independent round, nothing blocking; fixed: a role on every site scoped to one unit no longer counts, and a viewer with no managed site sees no one (matching the SQL); unit tests for the rule.
 - Gate: PASS
 - Next: nothing claimed
+## 2026-11-25 04:30 CT — Chat B — T-041d, T-041e, T-060a, T-063
+- Result: done (T-041b continues as T-041f, sharing on the public sites)
+- What changed: T-041d, shares over HTTP (`staff-api.ts`: a record's shares and offering it, a share's view and its four moves, a site's offers and shared items; an unknown share answers the same 404 as another organization's). T-041e, shares in the admin (`packages/admin/src/shares/`: a record's Sharing panel, each site's Shared with this site screen, a read-only view). T-060a, installs and rollbacks in the change log (migration 0030 `system_events`, written after each switch, shown to system managers only). T-063, the approval queue for reviewers who cover part of a site (John's Q-7: `recordsInState` walks scoped grants' subtrees in SQL).
+- Decisions: D-094 (HTTP and admin bullets), D-104, D-082 amended
+- Review: independent rounds for T-041d (tests and docs claimed more than they checked; fixed), T-041e (double submits, silent results, focus, a share under the wrong site; fixed) and T-060a (a possible hang after a command-line install, the change log before state.json; fixed). T-063 is tested equal to core's `permits` for every record, with a negative control.
+- Gate: PASS · tests_passing 4695 (was 4666) · npm audit clean
+- Next: every job in the pool is taken; Chat B stops.
 
 ## 2026-11-25 02:45 CT — manual (Chat G) — T-050e Dublin Core mappings in the admin and in setup
 - Result: done

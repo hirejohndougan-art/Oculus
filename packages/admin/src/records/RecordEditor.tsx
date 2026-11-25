@@ -28,6 +28,7 @@ import { Button, Note, TextLink } from "../components/ui";
 import { Choice, ConfirmPanel, StatePill, TextInput } from "./controls";
 import { FieldInput } from "./FieldInput";
 import { HistoryPanel } from "./HistoryPanel";
+import { SharingPanel } from "../shares/SharingPanel";
 import {
   AGENT_TYPES,
   KIND_LABELS,
@@ -871,6 +872,15 @@ function Editor(props: EditorProps) {
             </p>
           </ConfirmPanel>
         </form>
+
+        {reply !== undefined && can.edit ? (
+          <SharingPanel
+            key={reply.record.id}
+            siteId={siteId}
+            recordId={reply.record.id}
+            published={state === "published"}
+          />
+        ) : null}
 
         {reply !== undefined && can.history ? (
           <HistoryPanel
