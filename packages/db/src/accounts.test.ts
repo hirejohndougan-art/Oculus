@@ -82,6 +82,22 @@ afterAll(async () => {
   for (const cleanup of cleanups) await cleanup();
 });
 
+/**
+ * Disables the bootstrap system admin as the owner, past 0020's guard
+ * (T-048, D-084: the last active system admin can't be disabled, and the
+ * bootstrap account is the only system admin there can be), with the guard
+ * off inside this transaction only and back on ALWAYS before it commits
+ * (D-067). The tests that use it check older guards for a disabled admin,
+ * a state the product can no longer reach.
+ */
+async function disableLastAdmin(id: string): Promise<void> {
+  await db.transaction(async (q) => {
+    await q.execute(sql`ALTER TABLE public.users DISABLE TRIGGER users_last_system_admin`);
+    await q.execute(sql`UPDATE public.users SET disabled_at = now() WHERE id = ${id}::uuid`);
+    await q.execute(sql`ALTER TABLE public.users ENABLE ALWAYS TRIGGER users_last_system_admin`);
+  });
+}
+
 function ok<T>(result: Validated<T>): T {
   if (!result.ok) throw new Error(JSON.stringify(result.issues));
   return result.value;
@@ -496,7 +512,7 @@ describe("invitations", () => {
     );
     expect(short.token).toHaveLength(43);
     // A disabled admin can't invite.
-    await db.execute(sql`UPDATE public.users SET disabled_at = now() WHERE id = ${admin}::uuid`);
+    await disableLastAdmin(admin);
     try {
       expect(
         codes(await inviteVia(db, { organizationId: org, email: email(), invitedBy: admin })),
@@ -1544,9 +1560,7 @@ describe("what the inviter can learn (D-068)", () => {
         db,
         { organizationId: org, email: address, invitedBy: admin },
         async () => {
-          await db.execute(
-            sql`UPDATE public.users SET disabled_at = now() WHERE id = ${admin}::uuid`,
-          );
+          await disableLastAdmin(admin);
           throw new Error("not sent");
         },
       );
@@ -1569,6 +1583,8 @@ describe("what the inviter can learn (D-068)", () => {
       BEGIN UPDATE public.users SET disabled_at = now() WHERE id = NEW.invited_by; RETURN NEW; END $$`);
     await db.execute(sql`CREATE TRIGGER aaaa_t036_disable_inviter BEFORE INSERT ON public.invitations
       FOR EACH ROW EXECUTE FUNCTION public.t036_disable_inviter()`);
+    // 0020's guard would refuse disabling the only system admin (D-084).
+    await db.execute(sql`ALTER TABLE public.users DISABLE TRIGGER users_last_system_admin`);
     try {
       const made = await createInvitation(
         db,
@@ -1582,6 +1598,7 @@ describe("what the inviter can learn (D-068)", () => {
     } finally {
       await db.execute(sql`DROP TRIGGER aaaa_t036_disable_inviter ON public.invitations`);
       await db.execute(sql`DROP FUNCTION public.t036_disable_inviter()`);
+      await db.execute(sql`ALTER TABLE public.users ENABLE ALWAYS TRIGGER users_last_system_admin`);
       await db.execute(sql`UPDATE public.users SET disabled_at = NULL WHERE id = ${admin}::uuid`);
     }
   });
@@ -1890,6 +1907,8 @@ describe("the database's own guards", () => {
       "organization_members.zzzz_organization_members_keep_identity",
       "users.users_check_invitation",
       "users.users_end_sessions",
+      // 0020 (T-048): the last active system admin can't be disabled.
+      "users.users_last_system_admin",
       // 0015 (T-039): the password change time only moves forward.
       "users.users_password_changed_at",
       "users.users_sessions_valid_after",

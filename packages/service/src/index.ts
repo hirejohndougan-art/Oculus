@@ -46,3 +46,12 @@ export {
 } from "./file-store.js";
 export type { FileStore, FileStoreOptions, ReceivedFile, ReceiveResult } from "./file-store.js";
 export type { AttachCheck, AttachOptions, AttachedFile, FileOperations } from "./files.js";
+export type {
+  PeopleOperations,
+  PeopleContext,
+  PeopleList,
+  PeopleRights,
+  PersonDetail,
+  PersonSummary,
+  RoleCatalogEntry,
+} from "./people.js";

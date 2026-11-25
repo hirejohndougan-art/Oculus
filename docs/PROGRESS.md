@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 19:57 CT — manual (Chat A) — T-048 Admin: people, roles and the audit trail
+- Result: done
+- What changed: service `people.ts`, db `people.ts`, migration 0020 (`people_events`, append-only; the last-active-system-manager trigger), `people-api.ts` routes, `POST /api/reauthenticate`, and admin screens for people, a person, invitations, roles (built-in, read-only) and the audit trail. Role and account changes need the password and code entered in the last 10 minutes.
+- Decisions: D-084
+- Review: one independent round, no blocking issue. Fixed: impossible cursor and date values (422), the audit trail's timeout and rate bucket, one query for members' roles, logging of failed or superseded sends, membership re-checked inside the acting transaction, D-084 accuracy. Q-8 to Q-11 asked of John.
+- Gate: PASS · tests_passing 4193 (was 4141) · npm audit clean
+- Next: T-040 (finishing), M-002 (building); helper chats take the job pool on the project work board
+
 ## 2026-11-24 18:25 CT — manual (Chat A) — T-046 Admin: item list and record editor
 - Result: done
 - What changed: admin item list and approval queue; a record editor built from the template (inherited values, checks beside fields, If-Match conflicts named, workflow buttons per `can`, history view/compare/restore, delete, new records, leave guard). API: `GET /api/records`, `GET /api/working-site`, `GET /api/record-types`; `can` and `inherited` on record reads. `endSession` clears the CSRF token, query cache and list memory whenever a session ends or begins. e2e walks the whole flow by keyboard with Alfa.

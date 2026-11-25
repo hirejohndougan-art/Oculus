@@ -79,6 +79,11 @@ Keyboard (no mouse at all):
       cancels it.
 - [ ] History: each "View version", "Restore version" and the Compare selects
       are reached in order; the comparison table has a caption and headers.
+- [ ] People, a person's page, Invite, Roles and the Audit trail (T-048): the
+      sidebar's Administration links open with Enter; each "…" button opens
+      its confirmation in the page and moves focus to it; Cancel and the
+      confirm button are reached next by Tab; the re-entry form ("Confirm
+      it's you") opens in place when a change asks for it.
 - [ ] Nothing traps focus; nothing moves focus unexpectedly while typing.
 
 Screen reader:

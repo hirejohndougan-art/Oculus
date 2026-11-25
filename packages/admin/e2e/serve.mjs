@@ -119,6 +119,32 @@ try {
       scope: null,
     }),
   );
+  // A third invented member for T-048's people test (people.spec.ts), so
+  // resetting their two-step sign-in leaves the others' tests alone.
+  const helperEmail = "helper@example.org";
+  must(
+    await createInvitation(db, { organizationId, email: helperEmail, invitedBy: root }, (m) => {
+      box.push(m);
+      return Promise.resolve();
+    }),
+  );
+  const helper = must(
+    await acceptInvitation(db, {
+      token: box[2].token,
+      organizationId,
+      email: helperEmail,
+      displayName: "Ben Invented",
+      password: PASSWORD,
+    }),
+  ).userId;
+  must(
+    await service.grantRole(actor, {
+      userId: helper,
+      role: "cataloger",
+      siteId: site.id,
+      scope: null,
+    }),
+  );
   // A scanner on the site (attaches files to digital assets, M-002).
   const scannerEmail = "scanner@example.org";
   must(
@@ -129,7 +155,7 @@ try {
   );
   const scanner = must(
     await acceptInvitation(db, {
-      token: box[2].token,
+      token: box[3].token,
       organizationId,
       email: scannerEmail,
       displayName: "Lin Invented",
@@ -235,6 +261,10 @@ try {
       siteName: "Invented Archive",
       recordTitle,
       assetTitle,
+      // T-048's people screens: the system manager signs in too.
+      rootEmail: "root@example.org",
+      organizationName: "Invented Historical Society",
+      helperName: "Ben Invented",
     }),
   );
 } catch (error) {

@@ -130,6 +130,7 @@ import { adminOperations, type AdminOperations } from "./admin.js";
 import { definitionOperations, type DefinitionOperations } from "./definitions.js";
 import type { FileStore } from "./file-store.js";
 import { fileOperations, type FileOperations } from "./files.js";
+import { peopleOperations, type PeopleOperations } from "./people.js";
 import {
   changeWorkflowState,
   checkWriterConnection,
@@ -451,7 +452,8 @@ export interface ReviewQueue {
 export const MAX_VERSION_PAGE = 100;
 
 /** The service: every write of a record and its related rows, and who may make them. */
-export interface RecordService extends AdminOperations, DefinitionOperations, FileOperations {
+export interface RecordService
+  extends AdminOperations, DefinitionOperations, PeopleOperations, FileOperations {
   /** The record as stored, for someone who may view it (`records.view`). */
   readRecord(context: ServiceContext, recordId: RecordId): Promise<ServiceResult<ReadRecord>>;
   /**
@@ -2924,6 +2926,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
 
     ...adminOperations(run),
     ...definitionOperations(run),
+    ...peopleOperations(db, run, onError, searchTimeoutMs),
     ...fileOperations(
       run,
       (tx, who, recordId, rowLock, all, any) =>

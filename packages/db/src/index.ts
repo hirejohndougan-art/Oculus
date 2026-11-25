@@ -339,3 +339,35 @@ export {
   organizationHasContent,
 } from "./stored-files.js";
 export type { NewStoredFile, StoredFile } from "./stored-files.js";
+export {
+  actingSession,
+  listMembers,
+  readMember,
+  memberGrants,
+  membersGrants,
+  memberSessions,
+  memberSecondStep,
+  setAccountDisabled,
+  databaseNow,
+  invitationMadeSince,
+  insertPeopleEvent,
+  readAuditTrail,
+  isAuditCursor,
+  PEOPLE_EVENT_KINDS,
+  PEOPLE_TABLE_PRIVILEGES,
+  MAX_MEMBERS,
+  MAX_AUDIT_PAGE,
+  DEFAULT_AUDIT_PAGE,
+} from "./people.js";
+export type {
+  Member,
+  MemberGrant,
+  MemberSession,
+  MemberSecondStep,
+  NewPeopleEvent,
+  PeopleEventKind,
+  AuditFilter,
+  AuditScope,
+  AuditEntry,
+  AuditPage,
+} from "./people.js";
