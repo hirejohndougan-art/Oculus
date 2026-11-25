@@ -165,6 +165,8 @@ export interface ServerOptions {
    * one of `OCULUS_ORIGINS`.
    */
   readonly admin?: { readonly origin: string; readonly files: AdminFiles };
+  /** Called once when the server closes, after requests have ended (background work, S-038). */
+  readonly onClose?: () => Promise<void>;
 }
 
 function chooseTimeouts(overrides: Partial<ServerTimeouts> = {}): ServerTimeouts {
@@ -666,6 +668,13 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
   addRoute(app, health, timeouts.download, downloads, downloadsClosed);
   for (const route of appRoutes) {
     addRoute(app, route, timeouts.download, downloads, downloadsClosed);
+  }
+
+  const onClose = options.onClose;
+  if (onClose !== undefined) {
+    app.addHook("onClose", async () => {
+      await onClose();
+    });
   }
 
   await app.ready();

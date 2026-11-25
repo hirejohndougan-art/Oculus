@@ -62,7 +62,7 @@ export function clientKey(ip: string): string {
 }
 
 /** The request's origin as `URL.origin` writes it, or undefined. */
-function originOf(request: OculusRequest): string | undefined {
+export function originOf(request: OculusRequest): string | undefined {
   try {
     const url = new URL(`${request.protocol}://${request.host}`);
     if (url.username !== "" || url.password !== "" || url.pathname !== "/") return undefined;

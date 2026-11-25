@@ -55,6 +55,7 @@ import { isProduction } from "./environment.js";
 import { mailerFromEnv, type Mailer } from "./mail.js";
 import { trustedProxyFromEnv } from "./proxy.js";
 import { publicApiRoutes } from "./public-api.js";
+import { PublicSubjects, publicSubjectsRoutes } from "./public-subjects.js";
 import { PUBLIC_DATABASE_URL_ENV, checkPublicSites, publicSitesFromEnv } from "./public-sites.js";
 import type { OculusRoute } from "./routes.js";
 import { buildServer, type ServerOptions } from "./server.js";
@@ -84,6 +85,12 @@ export interface AdminServerOptions {
    * any. Never used for anything else.
    */
   readonly publicDb?: Database;
+  /**
+   * A small pool of its own on the staff role (S-038): the public Subjects
+   * counts are worked out on it in the background. Left out, `/subjects`
+   * isn't served.
+   */
+  readonly countsDb?: Database;
   /** Defaults to `process.env`. */
   readonly env?: Readonly<Record<string, string | undefined>>;
   /**
@@ -234,6 +241,13 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
           },
         }));
 
+  // Public Subjects counts (S-038, D-106): counted in the background on their
+  // own pool, served from memory, stopped when the server closes.
+  const publicSubjects =
+    options.countsDb === undefined || publicSites.length === 0
+      ? undefined
+      : new PublicSubjects({ db: options.countsDb, sites: publicSites, log });
+
   const service = createService(options.db, { onError: serviceErrorLogger(log) });
   const routes = [
     ...staffApiRoutes({
@@ -248,6 +262,7 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
         ...(deliverEnrolment === undefined ? {} : { deliverEnrolment }),
       },
       ...(updates === null ? {} : { updates: { manager: updates } }),
+      ...(publicSubjects === undefined ? {} : { publicSubjects }),
     }),
     ...signInRoutes({
       db: options.db,
@@ -262,12 +277,17 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     ...(publicDb === undefined || publicSites.length === 0
       ? []
       : publicApiRoutes({ db: publicDb, sites: publicSites, log })),
+    ...(publicSubjects === undefined ? [] : publicSubjectsRoutes({ subjects: publicSubjects })),
     ...(options.extraRoutes ?? []),
   ];
-  return buildServer({
+  const app = await buildServer({
     env,
     routes,
     ...(options.logger === undefined ? {} : { logger: options.logger }),
     ...(admin === undefined ? {} : { admin }),
+    ...(publicSubjects === undefined ? {} : { onClose: () => publicSubjects.stop() }),
   });
+  // Started once the server is built, so a start that fails counts nothing.
+  publicSubjects?.start();
+  return app;
 }
