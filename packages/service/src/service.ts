@@ -1072,13 +1072,12 @@ function sameIdentifiers(a: RecordIdentifiers, b: RecordIdentifiers): boolean {
     a.former.length === b.former.length &&
     a.current.every((x, i) => {
       const y = b.current[i];
-      return y !== undefined && x.type === y.type && x.value === y.value && x.primary === y.primary;
+      return x.type === y?.type && x.value === y.value && x.primary === y.primary;
     }) &&
     a.former.every((x, i) => {
       const y = b.former[i];
       return (
-        y !== undefined &&
-        x.type === y.type &&
+        x.type === y?.type &&
         x.value === y.value &&
         x.retiredAt === y.retiredAt &&
         x.note === y.note

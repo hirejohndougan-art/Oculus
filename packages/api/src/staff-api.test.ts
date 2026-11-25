@@ -1106,7 +1106,8 @@ describe("identifier types", () => {
         { expectedVersion: 1 },
       ),
     );
-    ok(await w.service.publish(ctx as never, made.record.id, { expectedVersion: 1 }));
+    // The number is the record's version 2 (S-061).
+    ok(await w.service.publish(ctx as never, made.record.id, { expectedVersion: 2 }));
     const list = await call("GET", "/api/identifier-types", { as: "root" });
     const entry = (list.json.identifierTypes as { type: { key: string }; tag: string }[]).find(
       (t) => t.type.key === "object_number",
