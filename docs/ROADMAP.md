@@ -11,10 +11,10 @@ These are never picked by a run. The weekly report repeats each question until J
 - [x] Q-3 Should the Society's other websites move to Oculus eventually? John: no (D-032).
 - [x] Q-4 Roles: the mockup shows "Scanner" and "Donor relations" roles that the plan doesn't have. Should Phase 2 add them? John: yes, and system managers can create custom roles (D-036).
 - [x] Q-5 OCR: common OCR engines ship trained models. Does D-004 (no AI in the product) rule them out, or is classical OCR allowed? John: allow it for OCR, locally run and permissively licensed (D-033).
-- [ ] Q-6 When a record moves to another site (or under a unit someone else covers), may the staff who can now see it read all its old versions, including the previous site's staff-only notes? Today: yes (D-082). The alternative hides versions from before the move.
-- [ ] Q-7 Should a reviewer whose grant covers only part of a site (one unit) get an approval queue for that part? Today their queue is empty; only whole-site reviewers see items.
-- [ ] Q-8 Should the admin sign people out after a period of no use, and clear the screen (e.g. 30 minutes)?
-- [ ] Q-9 Until more system managers can be made, the first admin account can't be disabled from the app (the last-system-manager guard). Acceptable?
+- [x] Q-6 When a record moves to another site (or under a unit someone else covers), may the staff who can now see it read all its old versions, including the previous site's staff-only notes? Today: yes (D-082). The alternative hides versions from before the move. John (2026-11-24): yes, keep it (they may read all old versions).
+- [x] Q-7 Should a reviewer whose grant covers only part of a site (one unit) get an approval queue for that part? Today their queue is empty; only whole-site reviewers see items. John (2026-11-24): yes. To build (Chat A's queue work).
+- [x] Q-8 Should the admin sign people out after a period of no use, and clear the screen (e.g. 30 minutes)? John (2026-11-24): yes. To build.
+- [x] Q-9 Until more system managers can be made, the first admin account can't be disabled from the app (the last-system-manager guard). Acceptable? John (2026-11-24): disabling it must need a second system manager to go through a confirming step. To build once more system managers can be made.
 - [ ] Q-10 Site managers see the name and email of every member with no role yet, and can make anyone in the organization visible by giving them a small role on their site. Keep, or hide role-less people's emails and only allow grants to people they can already see?
 - [ ] Q-11 Should inviting someone require re-entering the password and code, like role changes do?
 

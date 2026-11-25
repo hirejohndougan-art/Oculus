@@ -38,6 +38,7 @@ const stop = async () => {
   } finally {
     database.stop();
     rmSync(seedFile, { force: true });
+    rmSync(`${seedFile}.root-recovery.json`, { force: true });
     process.exit(0);
   }
 };

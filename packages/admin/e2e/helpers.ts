@@ -2,7 +2,7 @@
 // Siteimprove Alfa's rules on the page as it is, signing in a person who has
 // not set up two-step sign-in yet, and collecting script errors and CSP
 // refusals.
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { Audit, Outcome } from "@siteimprove/alfa-act";
 import { Playwright } from "@siteimprove/alfa-playwright";
 import rules from "@siteimprove/alfa-rules";
@@ -124,4 +124,49 @@ export async function signInAndSetUp(
   await page.getByRole("checkbox", { name: /I have saved these codes/ }).focus();
   await page.keyboard.press("Space");
   await page.getByRole("button", { name: "Continue to Oculus" }).press("Enter");
+}
+
+/**
+ * The first admin's unused recovery codes, kept beside the seed by the test
+ * that set up its two-step sign-in (people.spec.ts), so a later test can
+ * sign the same account in (there is only one system manager, D-019).
+ */
+function rootCodesFile(): string {
+  const file = process.env.OCULUS_E2E_SEED;
+  if (file === undefined) throw new Error("OCULUS_E2E_SEED is not set");
+  return `${file}.root-recovery.json`;
+}
+
+export function saveRootRecoveryCodes(codes: readonly string[]): void {
+  writeFileSync(rootCodesFile(), JSON.stringify(codes));
+}
+
+/**
+ * Signs in the first admin: with a saved recovery code if its two-step
+ * sign-in is set up already, else by setting it up. Chooses the
+ * organization when asked (a system manager with no membership).
+ */
+export async function signInRoot(page: Page): Promise<void> {
+  const { rootEmail, password, organizationName } = seed();
+  const file = rootCodesFile();
+  const codes = existsSync(file) ? (JSON.parse(readFileSync(file, "utf8")) as string[]) : [];
+  const code = codes.shift();
+  if (code === undefined) {
+    await signInAndSetUp(page, rootEmail, password, false, organizationName);
+    return;
+  }
+  saveRootRecoveryCodes(codes);
+  await page.goto("/");
+  await expect(page.getByRole("heading", { level: 1, name: "Sign in" })).toBeVisible();
+  await page.getByLabel("Email").fill(rootEmail);
+  await page.getByLabel("Password").fill(password);
+  await page.keyboard.press("Enter");
+  await page.getByRole("button", { name: "Use a recovery code instead" }).click();
+  await page.getByLabel("Recovery code").fill(code);
+  await page.getByRole("button", { name: "Continue" }).click();
+  const choice = page.getByRole("radio", { name: organizationName });
+  await choice.waitFor();
+  await choice.focus();
+  await page.keyboard.press("Space");
+  await page.getByRole("button", { name: "Continue" }).click();
 }

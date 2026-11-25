@@ -10,6 +10,7 @@ import { Audit, Outcome } from "@siteimprove/alfa-act";
 import { Playwright } from "@siteimprove/alfa-playwright";
 import rules from "@siteimprove/alfa-rules";
 import { expect, test, type Locator, type Page } from "@playwright/test";
+import { saveRootRecoveryCodes } from "./helpers";
 import { decodeBase32, totpAt } from "@oculus/core";
 
 interface Seed {
@@ -108,6 +109,8 @@ test("a system manager invites, grants a role, resets two-step sign-in and reads
   const codes = page.getByRole("list", { name: "Recovery codes" }).getByRole("listitem");
   await expect(codes).toHaveCount(10);
   const recovery = (await codes.allTextContents()).map((t) => t.trim());
+  // The unused ones, for settings.spec.ts (the same, only system manager).
+  saveRootRecoveryCodes(recovery.slice(1));
   await press(page.getByText("I have saved these codes somewhere safe"), "Space");
   await press(page.getByRole("button", { name: "Continue to Oculus" }));
 

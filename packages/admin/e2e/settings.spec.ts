@@ -4,7 +4,7 @@
 // template's fields, and the sign-in rules. Siteimprove Alfa's rules run on
 // each screen; no CSP refusal or script error may happen on the way.
 import { expect, test, type Page } from "@playwright/test";
-import { accessible, collectErrors, seed, signInAndSetUp } from "./helpers";
+import { accessible, collectErrors, seed, signInRoot } from "./helpers";
 
 async function press(page: Page, name: string, role: "button" | "link" = "button") {
   const control = page.getByRole(role, { name, exact: true });
@@ -16,9 +16,9 @@ async function press(page: Page, name: string, role: "button" | "link" = "button
 test("a system manager adds a site and reads the templates and the sign-in rules", async ({
   page,
 }) => {
-  const { rootEmail, password, siteName, organizationName } = seed();
+  const { siteName } = seed();
   const errors = collectErrors(page);
-  await signInAndSetUp(page, rootEmail, password, false, organizationName);
+  await signInRoot(page);
   await expect(page.getByRole("heading", { level: 1, name: siteName })).toBeVisible();
 
   // Sites.
