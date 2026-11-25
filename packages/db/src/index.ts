@@ -385,3 +385,18 @@ export {
   setUpFirstInstall,
 } from "./first-setup.js";
 export type { FirstInstall, FirstInstallResult } from "./first-setup.js";
+export {
+  SHARE_STATES,
+  SHARE_TABLE_PRIVILEGES,
+  MAX_SHARE_PAGE,
+  insertShare,
+  isShareId,
+  liveShare,
+  lockShare,
+  moveShare,
+  readShare,
+  sharedItemView,
+  sharesIntoSite,
+  sharesOfRecord,
+} from "./shares.js";
+export type { Share, ShareState, SharedItemView } from "./shares.js";

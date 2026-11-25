@@ -47,3 +47,4 @@ export type {
   PersonSummary,
   RoleCatalogEntry,
 } from "./people.js";
+export type { IncomingShare, ShareOperations, ShareSummary } from "./shares.js";

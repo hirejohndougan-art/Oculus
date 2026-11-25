@@ -129,6 +129,7 @@ import {
 import { adminOperations, type AdminOperations } from "./admin.js";
 import { definitionOperations, type DefinitionOperations } from "./definitions.js";
 import { peopleOperations, type PeopleOperations } from "./people.js";
+import { shareOperations, type ShareOperations } from "./shares.js";
 import {
   changeWorkflowState,
   checkWriterConnection,
@@ -445,7 +446,8 @@ export interface ReviewQueue {
 export const MAX_VERSION_PAGE = 100;
 
 /** The service: every write of a record and its related rows, and who may make them. */
-export interface RecordService extends AdminOperations, DefinitionOperations, PeopleOperations {
+export interface RecordService
+  extends AdminOperations, DefinitionOperations, PeopleOperations, ShareOperations {
   /** The record as stored, for someone who may view it (`records.view`). */
   readRecord(context: ServiceContext, recordId: RecordId): Promise<ServiceResult<ReadRecord>>;
   /**
@@ -2919,6 +2921,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
     ...adminOperations(run),
     ...definitionOperations(run),
     ...peopleOperations(db, run, onError, searchTimeoutMs),
+    ...shareOperations(run),
     submitForReview: workflowAction("submit_for_review"),
     returnToDraft: workflowAction("return_to_draft"),
     publish: workflowAction("publish"),
