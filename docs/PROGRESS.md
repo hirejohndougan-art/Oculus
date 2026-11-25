@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 04:30 CT — Chat B — T-041d, T-041e, T-060a, T-063
+- Result: done (T-041b continues as T-041f, sharing on the public sites)
+- What changed: T-041d, shares over HTTP (`staff-api.ts`: a record's shares and offering it, a share's view and its four moves, a site's offers and shared items; an unknown share answers the same 404 as another organization's). T-041e, shares in the admin (`packages/admin/src/shares/`: a record's Sharing panel, each site's Shared with this site screen, a read-only view). T-060a, installs and rollbacks in the change log (migration 0030 `system_events`, written after each switch, shown to system managers only). T-063, the approval queue for reviewers who cover part of a site (John's Q-7: `recordsInState` walks scoped grants' subtrees in SQL).
+- Decisions: D-094 (HTTP and admin bullets), D-104, D-082 amended
+- Review: independent rounds for T-041d (tests and docs claimed more than they checked; fixed), T-041e (double submits, silent results, focus, a share under the wrong site; fixed) and T-060a (a possible hang after a command-line install, the change log before state.json; fixed). T-063 is tested equal to core's `permits` for every record, with a negative control.
+- Gate: see the merge commit
+- Next: S-038 or another free job.
+
 ## 2026-11-25 02:40 CT — manual (Chat E) — T-034d Public subject counts
 - Result: done
 - What changed: `publicTermCounts` (packages/db/src/public-terms.ts) counts, for one site, the controlled terms each public record shows in its own public output (one Repeatable Read snapshot; records the output refuses count for nothing), on the server's staff connection; only labels, URIs and counts come out; at most 10,000 records and a time limit. `readPublicRecord`'s work is shared as `publicRecordIn` (stored mappings included). Never from `record_terms`. Follow-up S-038 (a cached public Subjects page).
