@@ -25,7 +25,7 @@
  * seconds by default), so a slow or locked staff database can't hold an
  * OAI-PMH slot for long. A statement that runs out of time throws an
  * `isDatabaseTimeout` error, which the routes answer `503 busy`. Not yet
- * bounded (S-044): the wait for a free staff connection, and a server or
+ * bounded (S-051): the wait for a free staff connection, and a server or
  * network that stops answering altogether.
  */
 import { isOrganizationId, isRecordId, isSiteId } from "@oculus/core";
