@@ -432,6 +432,13 @@ describe("npm run desktop", () => {
     expect(run.lines.join("\n")).toContain("different databases");
   });
 
+  it("answers 3 (finish the setup questions) only for desktop.json's own owner address", async () => {
+    const run = start({
+      env: { OCULUS_DATABASE_URL: empty.url, OCULUS_DATABASE_OWNER_URL: empty.url },
+    });
+    expect(await run.done).toBe(1);
+  });
+
   it("says how to start when no database is named", async () => {
     const run = start({ env: { OCULUS_DATABASE_URL: undefined } });
     expect(await run.done).toBe(2);

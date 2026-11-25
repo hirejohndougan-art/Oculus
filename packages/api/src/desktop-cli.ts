@@ -220,6 +220,7 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
   let folder: string;
   let url: string;
   let ownerUrl: string | undefined;
+  let ownerFromSettings: boolean;
   let wantedPort: number;
   try {
     folder = settingsFolder(platform, env, options.home ?? homedir());
@@ -235,6 +236,7 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
         : fromEnvUrl !== undefined && fromEnvUrl.trim() !== ""
           ? undefined
           : settings.ownerDatabaseUrl;
+    ownerFromSettings = ownerUrl !== undefined && ownerUrl === settings.ownerDatabaseUrl;
     secrets.push(...passwordOf(url), ...(ownerUrl === undefined ? [] : passwordOf(ownerUrl)));
     wantedPort = settings.port ?? DEFAULT_DESKTOP_PORT;
     const fromEnv = env.OCULUS_PORT;
@@ -337,7 +339,7 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
       return 1;
     }
     if (state === "empty") {
-      if (ownerUrl !== undefined) {
+      if (ownerFromSettings) {
         // Made by `npm run desktop:database`, but its setup questions weren't finished.
         err(
           "Oculus's database is made, but the first-time setup wasn't finished. Run `npm run desktop:database` again to finish it (on Windows, start-oculus.cmd does this by itself).",
@@ -391,11 +393,15 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
         // need them, D-067) and checked again.
         const refuse = (problems: readonly { code: string }[]): number => {
           err(
-            `The app's database account has more power than Oculus allows (${problems.map((p) => p.code).join(", ")}). It must be the plain role made for Oculus (D-067).`,
+            `The app's database account isn't the plain writer Oculus needs (${problems.map((p) => p.code).join(", ")}). It must be the role made for Oculus (D-067).`,
           );
           return 1;
         };
-        const before = await checkWriterConnection(server);
+        // Before granting, only extra power counts: a privilege a new
+        // migration's table still lacks is exactly what the grant adds.
+        const before = (await checkWriterConnection(server)).filter(
+          (p) => p.code !== "missing_privilege",
+        );
         if (before.length > 0) return refuse(before);
         await owner.transaction(async (tx) => {
           await grantWriterRole(tx, await writerRoleName(server));

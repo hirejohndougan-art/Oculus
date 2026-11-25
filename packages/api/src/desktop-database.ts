@@ -25,6 +25,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -94,7 +95,9 @@ export function pgpassLines(entries: readonly PgpassEntry[]): string[] {
  * renamed over it, so a crash never leaves it half written, and existing
  * lines are kept byte for byte (whatever their encoding).
  */
-function rewritePgpass(file: string, bytes: Buffer): void {
+function rewritePgpass(path: string, bytes: Buffer): void {
+  // A linked pgpass file (dotfiles) is rewritten where it really is, keeping the link.
+  const file = existsSync(path) ? realpathSync(path) : path;
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
   if (existsSync(file) && process.platform !== "win32" && (statSync(file).mode & 0o077) !== 0) {
     chmodSync(file, 0o600);

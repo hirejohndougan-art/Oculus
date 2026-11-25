@@ -211,6 +211,25 @@ describe("npm run desktop:database, then npm run desktop", () => {
       await writer.close();
     }
 
+    // As after an update whose migration adds a table: the writer lacks a
+    // privilege the launcher must grant, not refuse (missing_privilege).
+    const ownerUrl = new URL(settings.ownerDatabaseUrl ?? "");
+    ownerUrl.password = passwordFor(n.owner);
+    const owner = openDatabase(ownerUrl.href, { max: 1 });
+    try {
+      await owner.execute(sql`REVOKE INSERT ON public.records FROM t057_ok_app`);
+      const writerCheck = openDatabase(writerUrl.href, { max: 1 });
+      try {
+        expect((await checkWriterConnection(writerCheck)).map((p) => p.code)).toContain(
+          "missing_privilege",
+        );
+      } finally {
+        await writerCheck.close();
+      }
+    } finally {
+      await owner.close();
+    }
+
     // The launcher reads desktop.json and pgpass, and serves as the writer.
     const adminDir = join(folder, "admin-build");
     rmSync(adminDir, { recursive: true, force: true });
@@ -248,6 +267,13 @@ describe("npm run desktop:database, then npm run desktop", () => {
     expect(((await reply.json()) as { next?: string }).next).toBe("set_up");
     stop();
     expect(await run).toBe(0);
+    // The grant was put back before serving.
+    const writerAfter = openDatabase(writerUrl.href, { max: 1 });
+    try {
+      expect(await checkWriterConnection(writerAfter)).toEqual([]);
+    } finally {
+      await writerAfter.close();
+    }
   });
 
   it("keeps the database when a setup answer goes wrong, and finishes the questions on the next run", async () => {
