@@ -6,8 +6,8 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Result: done (built, not pushed: John asked that nothing be pushed yet); screens split off as T-041g, people-managing roles as S-067
 - What changed: migration 0057 (`custom_roles`, `custom_role_events`, a known-role trigger on `role_assignments`); core `CustomRole`, `validateCustomRole`, `grantPermissions`; db `custom-roles.ts`, `loadAccess` reads custom permissions; service `custom-roles.ts` and custom roles in `roleCatalog` and `grantRole`; staff API `/api/custom-roles`. Branch `autopilot/T-041a`, local only, from main 69c020e.
 - Decisions: D-121
-- Review: see the branch's last commit
-- Gate: see the branch's last commit · npm audit clean
+- Review: independent review: no hole; fixed its findings (lock order, a late grant answered retry, moves to a publishing role confirmed, an append-only log, the version step, counts); known limits in D-121
+- Gate: PASS · tests_passing 5240 (was 5233) · npm audit clean
 - Next: the next free Phase 3 job (Chat Z)
 
 ## 2026-11-25 16:05 CT — manual (Chat M) — T-075 Accept an invitation
