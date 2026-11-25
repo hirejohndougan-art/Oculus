@@ -560,6 +560,9 @@ export function peopleOperations(
         const viewer = await viewerOf(tx, who);
         if (!viewer.ok) return viewer;
         if (!viewer.value.system) return notPermitted();
+        // John, Q-11 (T-065): like role and account changes.
+        const stale = await notRecent<UserId>(tx, context, who);
+        if (stale) return stale;
         return { ok: true, value: viewer.value.userId };
       });
       if (!allowed.ok) return allowed;
