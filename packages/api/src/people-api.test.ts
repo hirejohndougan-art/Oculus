@@ -602,6 +602,45 @@ describe("invitations", () => {
     expect(Object.keys(elsewhere.json).sort()).toEqual(Object.keys(fresh.json).sort());
   });
 
+  it("needs the password and code entered in the last 10 minutes (John, Q-11)", async () => {
+    const s = await fullSession(w.db, w.root, w.a);
+    await staleReauth(w.db, s.sessionId, 11 * 60);
+    tokens.staleInviter = s.token;
+    const before = invitations.length;
+    const beforeEvents = await events("invited");
+    const stale = await call("POST", "/api/invitations", {
+      as: "staleInviter",
+      body: { email: "too.late@example.org" },
+    });
+    expect([stale.status, stale.json.error]).toEqual([403, "reauthentication_required"]);
+    expect(invitations).toHaveLength(before);
+    expect(await events("invited")).toBe(beforeEvents);
+    const [made] = await w.db.rows<{ n: number }>(
+      sql`SELECT count(*)::int AS n FROM public.invitations WHERE email = 'too.late@example.org'`,
+    );
+    expect(made?.n).toBe(0);
+
+    // Entered just now (a new full sign-in): the same invitation goes out.
+    tokens.freshInviter = (await fullSession(w.db, w.root, w.a)).token;
+    const fresh = await call("POST", "/api/invitations", {
+      as: "freshInviter",
+      body: { email: "too.late@example.org" },
+    });
+    expect(fresh.status).toBe(201);
+    expect(invitations).toHaveLength(before + 1);
+  });
+
+  it("asks a site manager for nothing more: still refused as not permitted, never asked to sign in again", async () => {
+    const s = await fullSession(w.db, w.manager, w.a);
+    await staleReauth(w.db, s.sessionId, 11 * 60);
+    tokens.staleInviteManager = s.token;
+    const r = await call("POST", "/api/invitations", {
+      as: "staleInviteManager",
+      body: { email: "someone.else@example.org" },
+    });
+    expect([r.status, r.json.error]).toEqual([403, "not_permitted"]);
+  });
+
   it("refuses a malformed address and bad lives", async () => {
     expect(
       (await call("POST", "/api/invitations", { as: "root", body: { email: "not an address" } }))
