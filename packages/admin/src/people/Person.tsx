@@ -89,18 +89,28 @@ export function Person() {
     <>
       <div>
         <h1 className={frame.pageTitle}>{person.displayName}</h1>
-        <p className={frame.lead}>
-          {person.email}
-          {person.disabled ? (
-            <span className={`${styles.pill} ${styles.pillRed}`}> Disabled</span>
-          ) : null}
-          {person.systemAdmin === true ? (
-            <span className={styles.pill}> System manager</span>
-          ) : null}
-        </p>
-        <p className={styles.muted}>
-          Member since {when(person.addedAt)}. Last signed in {when(person.lastSignInAt)}.
-        </p>
+        {person.nameOnly === true ? (
+          <p className={frame.lead}>
+            No role yet. A system manager gives a person their first role; after that you can see
+            their details and manage their roles on your sites.
+          </p>
+        ) : (
+          <>
+            <p className={frame.lead}>
+              {person.email}
+              {person.disabled === true ? (
+                <span className={`${styles.pill} ${styles.pillRed}`}> Disabled</span>
+              ) : null}
+              {person.systemAdmin === true ? (
+                <span className={styles.pill}> System manager</span>
+              ) : null}
+            </p>
+            <p className={styles.muted}>
+              Member since {when(person.addedAt ?? null)}. Last signed in{" "}
+              {when(person.lastSignInAt ?? null)}.
+            </p>
+          </>
+        )}
       </div>
       <div aria-live="polite">
         {status === undefined ? null : <Note tone={status.tone}>{status.text}</Note>}
@@ -153,7 +163,9 @@ export function Person() {
             ))}
           </ul>
         )}
-        {grantable.length > 0 && grantSites.length + (rights.manageAccounts ? 1 : 0) > 0 ? (
+        {person.nameOnly !== true &&
+        grantable.length > 0 &&
+        grantSites.length + (rights.manageAccounts ? 1 : 0) > 0 ? (
           <form
             className={styles.form}
             aria-label="Give a role"
