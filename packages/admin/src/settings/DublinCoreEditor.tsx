@@ -366,7 +366,7 @@ function MappingForm(props: {
         {noPublicFields ? (
           <p className={records.meta}>
             {hasMapping
-              ? "This template has no public fields left. Remove the mapped fields and save, or make a field public in the template again."
+              ? "This template has no public fields left. Remove the mapped fields and save, or make a field public in the template again. If its records need their rights to be published, make the rights field public again: a mapping without it can't be saved."
               : "This template has no public fields yet. Make a field public in the template first."}
           </p>
         ) : null}
@@ -505,7 +505,8 @@ function MappingForm(props: {
             save.reset();
           }}
         >
-          <p>
+          {/* A status, so a new number on a second ask is announced too (S-039 review). */}
+          <p role="status">
             This change shows at once on {(asked?.publishedRecords ?? 0).toLocaleString()} published{" "}
             {asked?.publishedRecords === 1 ? "record" : "records"} using this template.
           </p>

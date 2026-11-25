@@ -187,6 +187,7 @@ import {
   type RecordTypeSummary,
   type StateListEntry,
   sql,
+  MAX_AFFECTED_PUBLISHED,
 } from "@oculus/db";
 
 /**
@@ -1318,6 +1319,16 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
     throw new RangeError("attempts is a whole number from 1 to 10.");
   }
   const onError = options.onError;
+  if (
+    options.maxListedPublished !== undefined &&
+    (!Number.isInteger(options.maxListedPublished) ||
+      options.maxListedPublished < 1 ||
+      options.maxListedPublished > MAX_AFFECTED_PUBLISHED)
+  ) {
+    throw new RangeError(
+      `maxListedPublished is a whole number from 1 to ${String(MAX_AFFECTED_PUBLISHED)}.`,
+    );
+  }
   const searchTimeoutMs = options.searchTimeoutMs ?? 5_000;
   if (!Number.isInteger(searchTimeoutMs) || searchTimeoutMs < 1 || searchTimeoutMs > 30_000) {
     throw new RangeError("searchTimeoutMs is a whole number from 1 to 30,000.");

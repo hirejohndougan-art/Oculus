@@ -239,12 +239,44 @@ describe("a change on more published records than can be listed (S-039)", () => 
       for (const bad of ["3", -1, 1.5, null]) {
         expect((await put({ mapping, confirmPublishedCount: bad })).status).toBe(422);
       }
-      const saved = await put({ mapping, confirmPublishedCount: count });
+      // A record published after the ask makes the count out of date: asked again, with the new one.
+      const late = await makeObject(w, w.a, w.a1, "An invented late cup");
+      await publishAs(w, w.a, late.id);
+      const stale = await put({ mapping, confirmPublishedCount: count });
+      expect(stale.status).toBe(409);
+      expect((stale.json.issues as { path: unknown[] }[])[1]?.path).toEqual([
+        "publishedRecordCount",
+        count + 1,
+      ]);
+      const saved = await put({ mapping, confirmPublishedCount: count + 1 });
       expect(saved.status).toBe(200);
-      expect(saved.json.publishedRecordCount).toBe(count);
+      expect(saved.json.publishedRecordCount).toBe(count + 1);
       expect(saved.json.publishedRecords).toEqual([]);
     } finally {
       await small.close();
+    }
+  });
+
+  it("below the limit, a count is no confirmation: confirmPublished still is", async () => {
+    const read = await call("GET", URL_OBJECT, "root");
+    const tag = `"v${String(read.json.version)}"`;
+    const mapping = { entries: [MAPPING.entries[0]] };
+    const asked = await call(
+      "PUT",
+      URL_OBJECT,
+      "root",
+      { mapping, confirmPublishedCount: 1 },
+      {
+        "if-match": tag,
+      },
+    );
+    expect(asked.status).toBe(409);
+    expect(codes(asked)).toContain("published_record_affected");
+  });
+
+  it("refuses a list limit outside 1 to 10,000 when the service is made", () => {
+    for (const bad of [0, -1, 1.5, 10_001]) {
+      expect(() => createService(w.db, { maxListedPublished: bad })).toThrow(RangeError);
     }
   });
 });
