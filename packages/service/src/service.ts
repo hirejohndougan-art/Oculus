@@ -377,10 +377,14 @@ export interface ServiceOptions {
    * Thumbnails made at once and per organization a minute (defaults
    * `THUMBNAILS_AT_ONCE`, `THUMBNAILS_PER_MINUTE`); tests change them.
    */
-  readonly thumbnailLimits?: { readonly atOnce?: number; readonly perMinute?: number };
+  readonly thumbnailLimits?: {
+    readonly atOnce?: number;
+    readonly perMinute?: number;
+    readonly inARow?: number;
+  };
   /**
-   * Whether thumbnails are made at all (default `THUMBNAILS_ENABLED`, off
-   * until T-072, D-097). Only tests of the code kept for T-072 turn it on.
+   * Whether thumbnails are made at all (default `THUMBNAILS_ENABLED`, on
+   * since T-072, D-097); tests turn it off.
    */
   readonly thumbnailsEnabled?: boolean;
   /**

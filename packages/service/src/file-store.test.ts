@@ -2,10 +2,13 @@
 // the content hash only, the per-file cap mid-stream with nothing left
 // behind, a client that goes away, the checksum, placing over an existing
 // copy (kept when it is the same, replaced when damaged or a link), and the
-// refusals when opening. Every byte is invented.
+// refusals when opening (and opening a copy for the thumbnail decoder,
+// T-072). Every byte is invented.
+import { spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
   existsSync,
   linkSync,
   lstatSync,
@@ -14,16 +17,37 @@ import {
   utimesSync,
   mkdtempSync,
   readFileSync,
+  readSync,
   readdirSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { newOrganizationId } from "@oculus/core";
 import { STORE_MARKER, openFileStore, type FileStore } from "./file-store.js";
+
+/**
+ * `lstat` as the store calls it, passed through, but able to run something
+ * right after a check (review 3: a FIFO renamed over a copy between the
+ * check and the open).
+ */
+const race = vi.hoisted(() => ({ after: undefined as ((path: string) => void) | undefined }));
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const real = await importOriginal<typeof import("node:fs/promises")>();
+  const lstat = async (path: string, ...rest: unknown[]): Promise<unknown> => {
+    const info = await (real.lstat as (p: string, ...r: unknown[]) => Promise<unknown>)(
+      path,
+      ...rest,
+    );
+    race.after?.(path);
+    return info;
+  };
+  return { ...real, lstat };
+});
 
 let dir: string;
 let store: FileStore;
@@ -427,6 +451,77 @@ describe("the second review's changes", () => {
     expect(await own.touch(org, linked)).toBe(false);
     expect(Date.now() - lstatSync(target).mtimeMs).toBeGreaterThan(86_400_000);
     rmSync(fresh, { recursive: true, force: true });
+  });
+
+  it("opens a stored copy as a descriptor for the decoder process, and only a plain copy of its own (T-072)", async () => {
+    const fresh = mkdtempSync(join(tmpdir(), "oculus-store-fd-"));
+    const own = await openFileStore({ dir: fresh });
+    const org = newOrganizationId();
+    const body = Buffer.from("invented stored bytes");
+    const got = await own.receive(org, chunksOf(body));
+    if (!got.ok) throw new Error(got.code);
+    await own.place(got.file);
+    const fd = await own.openContentDescriptor(org, got.file.sha256, body.length);
+    if (fd === undefined) throw new Error("not opened");
+    const back = Buffer.alloc(body.length);
+    expect(readSync(fd, back, 0, back.length, 0)).toBe(body.length);
+    expect(back.equals(body)).toBe(true);
+    closeSync(fd);
+    // The wrong size, none there, or a link where the copy should be: nothing opened.
+    expect(await own.openContentDescriptor(org, got.file.sha256, body.length + 1)).toBeUndefined();
+    expect(await own.openContentDescriptor(org, "0".repeat(64), 1)).toBeUndefined();
+    const target = join(fresh, "elsewhere");
+    writeFileSync(target, body);
+    const linked = "b".repeat(64);
+    mkdirSync(dirname(own.pathFor(org, linked)), { recursive: true });
+    symlinkSync(target, own.pathFor(org, linked));
+    expect(await own.openContentDescriptor(org, linked, body.length)).toBeUndefined();
+    rmSync(fresh, { recursive: true, force: true });
+  });
+
+  it("never hangs on a FIFO renamed over a copy after its check, downloading or decoding (review 3)", async () => {
+    const fresh = mkdtempSync(join(tmpdir(), "oculus-store-race-"));
+    const own = await openFileStore({ dir: fresh });
+    const org = newOrganizationId();
+    const body = Buffer.from("invented bytes about to be swapped");
+    const got = await own.receive(org, chunksOf(body));
+    if (!got.ok) throw new Error(got.code);
+    await own.place(got.file);
+    const copy = own.pathFor(org, got.file.sha256);
+    const fifo = join(fresh, "a-fifo");
+    if (spawnSync("mkfifo", [fifo]).status !== 0) {
+      rmSync(fresh, { recursive: true, force: true });
+      return;
+    }
+    // Right after the copy's own check, a FIFO takes its place.
+    const swapAfterCheck = (): void => {
+      race.after = (path) => {
+        if (path !== copy) return;
+        race.after = undefined;
+        renameSync(fifo, copy);
+      };
+    };
+    try {
+      swapAfterCheck();
+      let at = Date.now();
+      expect(await own.openContentDescriptor(org, got.file.sha256, body.length)).toBeUndefined();
+      expect(Date.now() - at).toBeLessThan(2000);
+      // The swap did happen, between the check and the open.
+      expect(race.after).toBeUndefined();
+      // The same for a download: the check passes, the open finds the FIFO and refuses it.
+      renameSync(copy, fifo);
+      writeFileSync(copy, body, { mode: 0o600 });
+      swapAfterCheck();
+      const opener = await own.openContent(org, got.file.sha256, body.length);
+      expect(opener).toBeDefined();
+      expect(race.after).toBeUndefined();
+      at = Date.now();
+      expect(() => opener?.()).toThrow();
+      expect(Date.now() - at).toBeLessThan(2000);
+    } finally {
+      race.after = undefined;
+      rmSync(fresh, { recursive: true, force: true });
+    }
   });
 
   it("holds declared lengths against the free-space floor, so uploads starting together can't overshoot", async () => {

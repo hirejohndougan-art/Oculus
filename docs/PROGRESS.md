@@ -2,6 +2,13 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 14:30 CT — manual (Chat A) — T-072 Safe server-side thumbnails
+
+- **Done:** thumbnails are back on (D-097). Every decode runs in its own child process with an in-child watchdog that kills it past a 352 MiB growth cap (also on its deadline, and when its parent is gone), plus the parent's sampler as a second layer. The server only reads a 64 KiB header; strict JPEG segment lengths, sampling factors up to 4, VP8L and VP8L-compressed ALPH planned per group and every prefix code checked complete, segment, chunk and frame count caps. Failed spawns, descriptor exhaustion and outside kills are all handled. WebP originals are untouched; thumbnails are JPEG.
+- **Reviews:** four independent reviews; the last found nothing blocking, and every finding was fixed.
+- **Filed:** T-074 (thumbnails for large photos; jpeg-js stops near 6 MP), S-057 (a libwebp build without CVE-2023-4863).
+- Gate: see below.
+
 ## 2026-11-25 13:30 CT — manual (Chat A) — S-040 Scan uploaded files for viruses
 
 - **Done:** each upload is scanned by a separately installed ClamAV daemon over its socket (own INSTREAM client, no dependency, no linking; D-113, migration 0048, written as 0041 and renumbered after main's 0047). While scanning is on, only clean files are served: pending and failed answer 409, infected 423 and are quarantined for good. Files stored before scanning was on stay served until their first scan; files too large to scan are shown as such. With no scanner (the desktop trial) files are "not scanned" and served, with a notice. Rescans keep clean files served; uploads over the scanner's limit are refused with 413.

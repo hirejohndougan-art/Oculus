@@ -86,13 +86,16 @@ import {
 import type { Runner } from "./admin.js";
 import type { FileScanQueue, ScanPass } from "./file-scans.js";
 import type { FileStore, ReceivedFile, StoreMarker } from "./file-store.js";
+import { closeSync } from "node:fs";
 import {
   THUMBNAIL_BOXES,
   THUMBNAIL_LIMITS,
   THUMBNAIL_TYPES,
   VIEW_LIMITS,
   VIEW_TYPES,
-  planDecode,
+  THUMBNAIL_HEADER_BYTES,
+  THUMBNAIL_SOURCE_MAX_BYTES,
+  precheckThumbnail,
   viewDimensions,
   withinLimits,
   type ThumbnailSize,
@@ -218,8 +221,8 @@ export interface FileContent {
   readonly open: () => Readable;
 }
 
-/** The largest file a thumbnail is made from (100 MiB): it is read whole into memory. */
-export const MAX_THUMBNAIL_SOURCE_BYTES = 100 * 1024 * 1024;
+/** The largest file a thumbnail is made from (100 MiB): the decoder process reads it whole. */
+export const MAX_THUMBNAIL_SOURCE_BYTES = THUMBNAIL_SOURCE_MAX_BYTES;
 
 /** How much of a file's start is read to find an image's size before showing it (1 MiB). */
 export const VIEW_HEADER_BYTES = 1024 * 1024;
@@ -228,12 +231,12 @@ export const VIEW_HEADER_BYTES = 1024 * 1024;
 export const VIEW_GIF_BYTES = 16 * 1024 * 1024;
 
 /**
- * Server-side thumbnails are off (D-097): three ways around the decode
- * memory budget were found, and they come back with T-072 ("Safe
- * server-side thumbnails"). While off, `fileThumbnail` answers
- * `no_thumbnail` for every file and no worker is ever started.
+ * Server-side thumbnails are on (T-072, D-097): every decode runs in a
+ * child process with a hard memory cap (thumbnails.ts). Turned off,
+ * `fileThumbnail` answers `no_thumbnail` for every file and no decoder
+ * process is ever started.
  */
-export const THUMBNAILS_ENABLED = false;
+export const THUMBNAILS_ENABLED = true;
 
 /** How long a thumbnail that took too long is left before it is tried again (24 hours). */
 export const THUMBNAIL_RETRY_MS = 24 * 3600 * 1000;
@@ -243,6 +246,14 @@ export const THUMBNAILS_AT_ONCE = 2;
 
 /** Thumbnails an organization may have made (not from the cache) per minute. */
 export const THUMBNAILS_PER_MINUTE = 6;
+
+/**
+ * Thumbnails one organization may have made in a row while another was
+ * turned away for want of a slot (review 2 of T-072: round the
+ * organizations), and how long such a turning away counts.
+ */
+export const THUMBNAILS_IN_A_ROW = 3;
+const WAITING_MS = 30_000;
 
 export interface ThumbnailOptions {
   /** Only from the cache (HEAD): `not_cached` when nothing is cached. */
@@ -449,7 +460,11 @@ export function fileOperations(
   store: FileStore | undefined,
   clock: () => Date,
   thumbnails?: ThumbnailRenderer,
-  thumbnailLimits: { readonly atOnce?: number; readonly perMinute?: number } = {},
+  thumbnailLimits: {
+    readonly atOnce?: number;
+    readonly perMinute?: number;
+    readonly inARow?: number;
+  } = {},
   thumbnailsEnabled: boolean = THUMBNAILS_ENABLED,
   scans?: FileScanQueue,
 ): FileOperations {
@@ -476,6 +491,11 @@ export function fileOperations(
   /** Thumbnails being made now (all organizations), and the organizations making one. */
   let makingNow = 0;
   const makingFor = new Set<string>();
+  /** Organizations turned away for want of a slot, and when; the one served last, and how often. */
+  const waiting = new Map<string, number>();
+  let streakFor: string | undefined;
+  let streak = 0;
+  const inARow = thumbnailLimits.inARow ?? THUMBNAILS_IN_A_ROW;
   /** Each organization's thumbnails made in the current minute (a fixed window). */
   const budgets = new Map<string, { minute: number; used: number }>();
   const takeBudget = (organizationId: string): boolean => {
@@ -1021,7 +1041,7 @@ export function fileOperations(
           gif ? VIEW_GIF_BYTES : VIEW_HEADER_BYTES,
         );
         if (head === undefined) return missingCopy();
-        if (!withinLimits(viewDimensions(file.mediaType, head), VIEW_LIMITS)) {
+        if (!withinLimits(viewDimensions(file.mediaType, head, file.size), VIEW_LIMITS)) {
           return refusal(["fileId"], "not_viewable", "This file can only be downloaded.");
         }
       }
@@ -1039,8 +1059,8 @@ export function fileOperations(
       const found = await readable(context, "fileThumbnail", recordId, fileId);
       if (!found.ok) return found;
       const { file, organizationId } = found.value;
-      // Off until T-072 (D-097): every file, after the same checks as any
-      // read (so a hidden file is still the same 404), has no thumbnail, and
+      // Turned off (D-097): every file, after the same checks as any read
+      // (so a hidden file is still the same 404), has no thumbnail, and
       // nothing is read, cached or decoded.
       if (!thumbnailsEnabled) return noThumbnail();
       if (!THUMBNAIL_TYPES.has(file.mediaType) || file.size > MAX_THUMBNAIL_SOURCE_BYTES) {
@@ -1065,8 +1085,26 @@ export function fileOperations(
       // A slot and the organization's budget before a byte is read (review
       // B3 and item 1): a few at once, a few a minute, then 503 busy.
       // One at a time per organization, so one can't fill every slot (review).
-      if (makingNow >= atOnce || makingFor.has(organizationId) || !takeBudget(organizationId)) {
+      // And round the organizations (review 2): one that has had
+      // THUMBNAILS_IN_A_ROW in a row waits while another was turned away
+      // for want of a slot in the last WAITING_MS.
+      const now = clock().getTime();
+      for (const [org, at] of waiting) if (now - at > WAITING_MS) waiting.delete(org);
+      const othersWaiting = [...waiting.keys()].some((org) => org !== organizationId);
+      const ownTurnUsed = streakFor === organizationId && streak >= inARow && othersWaiting;
+      if (makingFor.has(organizationId)) return busy();
+      if (makingNow >= atOnce || ownTurnUsed) {
+        if (waiting.size > 10_000) waiting.clear();
+        waiting.set(organizationId, now);
         return busy();
+      }
+      if (!takeBudget(organizationId)) return busy();
+      waiting.delete(organizationId);
+      if (streakFor === organizationId) {
+        streak++;
+      } else {
+        streakFor = organizationId;
+        streak = 1;
       }
       makingNow++;
       makingFor.add(organizationId);
@@ -1078,23 +1116,34 @@ export function fileOperations(
         await store.writeThumbnail(organizationId, file.sha256, size, what).catch(() => undefined);
       };
       const made = (async (): Promise<ServiceResult<{ readonly jpeg: Uint8Array }>> => {
-        const bytes = await store.readContent(
+        // Only the header is read here (review of T-072, B2: walking a whole
+        // file on the server's event loop is a bomb of its own); the
+        // decoder process walks, plans and decodes the file itself.
+        const head = await store.readContent(
           organizationId,
           file.sha256,
           file.size,
-          MAX_THUMBNAIL_SOURCE_BYTES,
+          THUMBNAIL_HEADER_BYTES,
         );
-        if (bytes?.length !== file.size) return missingCopy();
-        // The header, its structure and the memory budget first, here: a
-        // bomb is refused before any decoder runs.
+        if (head === undefined) return missingCopy();
         try {
-          planDecode(file.mediaType, bytes, THUMBNAIL_LIMITS);
+          precheckThumbnail(file.mediaType, head, THUMBNAIL_LIMITS);
         } catch {
           await remember("none");
           return noThumbnail();
         }
+        const fd = await store.openContentDescriptor(organizationId, file.sha256, file.size);
+        if (fd === undefined) return missingCopy();
         renderer ??= createThumbnailRenderer();
-        const result = await renderer.render(file.mediaType, bytes, box);
+        let result: Awaited<ReturnType<ThumbnailRenderer["render"]>>;
+        try {
+          result = await renderer.render(file.mediaType, { fd }, box);
+        } catch {
+          result = { ok: false, code: "failed" };
+        } finally {
+          // Closed whatever happened (review 2, B1).
+          closeSync(fd);
+        }
         if (result.ok) {
           await remember(result.jpeg);
           return { ok: true, value: { jpeg: result.jpeg } };
@@ -1103,23 +1152,33 @@ export function fileOperations(
           case "busy":
             return busy();
           case "refused":
-            // The decoder's own refusal: the same every time, so remembered.
+          case "killed":
+            // The decoder's own refusal, or a decode killed past the memory
+            // cap (T-072): the same every time, so remembered and never
+            // tried again.
             await remember("none");
             return noThumbnail();
           case "timeout":
+          case "lost":
             // Remembered for a while (THUMBNAIL_RETRY_MS), so it can't keep
-            // the worker busy by being asked for again and again.
+            // the decoder busy by being asked for again and again; a kill
+            // nothing confirmed as the memory cap is treated so too (review 2).
             await remember("timeout");
             return noThumbnail();
           default:
             // Out of memory or a crash: says nothing about the file.
             return refusal(["files"], "internal_error", "The thumbnail couldn't be made.");
         }
-      })();
+      })().catch(
+        // Anything thrown on the way (the cache, the copy): a plain 500, never a stuck slot.
+        (): ServiceResult<{ readonly jpeg: Uint8Array }> =>
+          refusal(["files"], "internal_error", "The thumbnail couldn't be made."),
+      );
       making.set(key, made);
       try {
         return await made;
       } finally {
+        // Released whatever happened (review 2, B1).
         making.delete(key);
         makingNow--;
         makingFor.delete(organizationId);
