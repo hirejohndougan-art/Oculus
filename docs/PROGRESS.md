@@ -2,6 +2,22 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 00:15 CT — manual (Chat D) — T-057 Desktop database helper
+- Result: done
+- What changed: `npm run desktop:database` makes `oculus_owner`, `oculus_app` and the `oculus` database on the person's own PostgreSQL with the `postgres` password typed once (SCRAM verifiers, never plain passwords), keeps the passwords only in pgpass, writes `desktop.json` and runs setup; resumes an unfinished setup; undoes a failed creation. The launcher migrates as the owner, grants and checks the writer, and serves as the writer. `start-oculus.cmd` runs the helper the first time. `@oculus/db` exports `createDatabase`, `dropDatabase`, `runSetupCli`, `terminalAsk`.
+- Decisions: D-093
+- Review: two independent rounds; fixed the stuck unfinished setup, leftover pgpass lines, a non-UTF-8 pgpass being damaged, query keys overriding the new addresses, and the pre-grant check that would have refused a correct writer after an update. Left as S-034 (9, 10).
+- Gate: PASS · tests_passing TBD · npm audit clean
+- Next: S-034 (desktop follow-ups), or the job pool
+
+## 2026-11-24 21:20 CT — Chat B — M-001 Serve active file types safely
+- Result: done
+- What changed: `fileReply` (packages/api/src/file-replies.ts) is the only way a handler sends a file's bytes: plain images, audio and video may be shown as their bare type, everything else (HTML, SVG, XML, scripts, PDF, unknown) downloads as `application/octet-stream`; every file reply has nosniff, a sandboxing CSP, same-origin CORP and nothing the handler set; safe RFC 6266/8187 names; streams opened only when sent, outside the handler timeout, within a 2-hour deadline, closed on errors, wrong lengths, hang-ups and shutdown; HEAD opens nothing. HTTP attack tests and a Chromium test that a page on another origin can't run an HTML, SVG or XHTML file's script.
+- Decisions: D-089
+- Review: three independent rounds plus a short fourth look. Fixed: a storage error or an object-mode stream could crash the server, downloads were cut at 30 s, sources leaked on abort, wrong lengths and failed handlers, HEAD read whole files, a missing file dropped the connection, failures were logged as hang-ups, shutdown could be held, name details. Left as S-035 (download limits per client).
+- Gate: PASS · tests_passing 4372 (was 4344) · npm audit clean
+- Next: the next job in the work board's pool (S-026).
+
 ## 2026-11-24 22:40 CT — manual (Chat D) — T-056 Desktop launcher
 - Result: done
 - What changed: `npm run desktop` and `scripts/start-oculus.cmd` run the admin on 127.0.0.1 in an Edge or Chrome app window with its own profile, stopping when the window closes; settings, a 0600 secret key and a single-instance lock in the per-user settings folder; `extraRoutes` on `buildAdminServer`; docs/DESKTOP.md (Windows guide). John chose to stay inside D-002 (no Electron, no bundled PostgreSQL). Smoke-tested with a real Chrome under Xvfb: sign-in screen in the window, server stopped on close.
