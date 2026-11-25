@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 16:10 CT — manual (Chat Y) — S-054c The wait's alert carries the older unexplained codes; the notice gives the codes' time
+- Result: done
+- What changed: second-factor.ts `takeCodeAttempt` (a wait's alert counts `max(day's count, unexplained codes)`; every alert stores `last_code_at`), sessions.ts `runCleanup` (its alert stores the `wrong:` row's time), alert-notices.ts (messages gain `codesAt`, `least(coalesce(last_code_at, created_at), created_at)`), mail-messages.ts (the wording gives `codesAt`, capped at `at`; the email's life still runs from `at`); migration 0055 (`second_step_alerts.last_code_at`, no CHECK). New tests in second-factor.test.ts, alert-notices.test.ts and mail.test.ts, failing without the change.
+- Decisions: D-077 amended (S-054c)
+- Review: two independent reviews. The first found that giving the codes' time as the message's `at` made the outbox drop notices of codes told a day on as expired; fixed (`codesAt` for wording only) and tested. The second: safe; notes (deploy migrations before code, as always; a wait during a re-entry can count another tab's in-flight codes) accepted.
+- Gate: see the baseline commit · npm audit clean
+- Next: the build run's S-054b (keep both sides in `takeCodeAttempt`)
+
 ## 2026-11-25 15:45 CT — manual (Chat P) — S-062 The server checks its database role at start; updates need the writer role named
 - Result: done
 - What changed: `admin-cli.ts` (`writerConnectionRefusal`; `npm run admin` refuses a superuser, an owner or a writer missing grants before it starts), `update-manager.ts` (`migrations_need_writer_role`, `invalid_writer_role` before any backup or migration), `release-cli.ts` (the role is trimmed; the old "Note" is gone); new `admin-cli-role.test.ts`; tests in `update-manager.test.ts`, `release-cli.test.ts`, `update-api.test.ts`.
