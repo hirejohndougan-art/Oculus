@@ -28,6 +28,8 @@ import {
   createFirstSystemAdmin,
   createInvitation,
   deleteExpiredSignInThrottles,
+  failureClass,
+  markKnownSource,
   revokeInvitation,
   signIn,
   type CreatedInvitation,
@@ -665,7 +667,16 @@ describe("invitations", () => {
           inviteVia(conn, { organizationId: org, email: address, invitedBy: admin }),
         ),
       );
-      expect(made.every((r) => r.ok)).toBe(true);
+      // Each is stored; one sent while a newer one was made answers
+      // `superseded` (it was delivered, then revoked by the newer one), so
+      // every answer is `ok` or that, at least one is `ok`, and exactly one
+      // invitation stays pending.
+      const codes = made.map((r) => (r.ok ? "ok" : r.issues.map((i) => i.code).join(",")));
+      expect(
+        codes.every((c) => c === "ok" || c === "superseded"),
+        codes.join(" "),
+      ).toBe(true);
+      expect(codes).toContain("ok");
       const pending = await db.rows(sql`
         SELECT 1 FROM public.invitations WHERE organization_id = ${org}::uuid AND email = ${address}
           AND accepted_at IS NULL AND revoked_at IS NULL`);
@@ -1066,6 +1077,20 @@ describe("sign-in throttling", () => {
 });
 
 describe("known addresses: strangers can't keep anyone out where they sign in (S-018)", () => {
+  /**
+   * A sign-in that also passed its second step (S-044: only then is the
+   * address known); the code itself is tested in second-factor.test.ts.
+   */
+  async function signInWhole(input: {
+    email: string;
+    password: string;
+    source: string;
+  }): Promise<SignInResult> {
+    const r = await signIn(db, input);
+    if (r.ok) await markKnownSource(db, r.userId, input.source);
+    return r;
+  }
+
   async function knownRow(
     address: string,
     from: string,
@@ -1090,7 +1115,7 @@ describe("known addresses: strangers can't keep anyone out where they sign in (S
     const key = throttleAccountKey(ADMIN_EMAIL);
     try {
       expect(
-        await signIn(db, { email: ADMIN_EMAIL, password: ADMIN_PASSWORD, source: home }),
+        await signInWhole({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD, source: home }),
       ).toMatchObject({ ok: true, systemAdmin: true });
       // The attack: one wrong guess from elsewhere each time the wait ends.
       for (let round = 0; round < 3; round++) {
@@ -1127,6 +1152,11 @@ describe("known addresses: strangers can't keep anyone out where they sign in (S
     expect(
       await signIn(db, { email: person.email, password: PASSWORD, source: home }),
     ).toMatchObject({ ok: true });
+    // The right password alone doesn't make the address known (S-044).
+    expect(await knownRow(person.email, home)).toBeUndefined();
+    expect(
+      await signInWhole({ email: person.email, password: PASSWORD, source: home }),
+    ).toMatchObject({ ok: true });
     expect(await knownRow(person.email, home)).toEqual({ failures: 0 });
     await heldByStranger(person.email);
     const tally: string[] = [];
@@ -1154,7 +1184,7 @@ describe("known addresses: strangers can't keep anyone out where they sign in (S
     const person = await member(org);
     const home = source();
     expect(
-      await signIn(db, { email: person.email, password: PASSWORD, source: home }),
+      await signInWhole({ email: person.email, password: PASSWORD, source: home }),
     ).toMatchObject({ ok: true });
     for (let i = 0; i < 20; i++) {
       await signIn(db, { email: email(), password: "spray guess", source: home });
@@ -1169,7 +1199,7 @@ describe("known addresses: strangers can't keep anyone out where they sign in (S
     const org = await organization();
     const person = await member(org);
     const home = source();
-    await signIn(db, { email: person.email, password: PASSWORD, source: home });
+    await signInWhole({ email: person.email, password: PASSWORD, source: home });
     await db.execute(sql`
       UPDATE public.sign_in_known_sources SET signed_in_at = signed_in_at - interval '30 days'
       WHERE account_key = ${throttleAccountKey(person.email)}`);
@@ -1195,7 +1225,7 @@ describe("known addresses: strangers can't keep anyone out where they sign in (S
     }
     const newest = source();
     expect(
-      await signIn(db, { email: person.email, password: PASSWORD, source: newest }),
+      await signInWhole({ email: person.email, password: PASSWORD, source: newest }),
     ).toMatchObject({ ok: true });
     const rows = await db.rows<{ source_key: string }>(sql`
       SELECT source_key FROM public.sign_in_known_sources WHERE account_key = ${key}
@@ -1219,7 +1249,7 @@ describe("known addresses: strangers can't keep anyone out where they sign in (S
     await signIn(db, { email: person.email, password: "wrong guess", source: from });
     expect(await knownRow(person.email, from)).toBeUndefined();
     expect(
-      await signIn(db, { email: person.email, password: PASSWORD, source: "not an address" }),
+      await signInWhole({ email: person.email, password: PASSWORD, source: "not an address" }),
     ).toMatchObject({ ok: true });
     const rows = await db.rows(sql`
       SELECT 1 FROM public.sign_in_known_sources
@@ -1231,7 +1261,7 @@ describe("known addresses: strangers can't keep anyone out where they sign in (S
     await ready();
     const org = await organization();
     const person = await member(org);
-    await signIn(db, { email: person.email, password: PASSWORD, source: source() });
+    await signInWhole({ email: person.email, password: PASSWORD, source: source() });
     const nobody = email();
     const run = async (address: string): Promise<SignInResult[]> => {
       const out: SignInResult[] = [];
@@ -2183,4 +2213,19 @@ describe("the writer's grants (D-068)", () => {
       });
     }
   }, 60_000);
+});
+
+describe("failureClass (S-050)", () => {
+  it("names a failure by its SQLSTATE or error name, never its message", () => {
+    expect(failureClass(Object.assign(new Error("secret 203.0.113.9"), { code: "57P01" }))).toBe(
+      "SQLSTATE 57P01",
+    );
+    expect(failureClass(new TypeError("person@example.org"))).toBe("TypeError");
+    expect(failureClass({ code: "ECONNREFUSED", name: "Error" })).toBe("ECONNREFUSED");
+    expect(failureClass({ code: "EPERM", name: "Error" })).toBe("EPERM");
+    expect(failureClass({ code: "40001" })).toBe("SQLSTATE 40001");
+    expect(failureClass({ name: "has spaces and 203.0.113.9" })).toBe("unknown");
+    expect(failureClass(null)).toBe("unknown");
+    expect(failureClass("text")).toBe("unknown");
+  });
 });

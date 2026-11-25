@@ -16,13 +16,19 @@ import { ConfirmPanel } from "../records/controls";
 import { issuesIn, whenText } from "../records/model";
 import styles from "../records/Records.module.css";
 import { SHARE_STATE_LABELS, cleanId, isId, isLive, type ShareSummary } from "./model";
-import { moveShare, refreshShares, useRecordShares } from "./queries";
+import { moveShare, nextRecordSharesPage, refreshShares, useRecordShares } from "./queries";
+import { useMorePages } from "./paging";
+import { ShowMore } from "./ShowMore";
 
 const OFFER_PROBLEMS: Readonly<Record<string, string>> = {
   unknown_site:
     "There is no such site under that organization, or it is this record's own site. Check both IDs with the other site's manager.",
   already_shared: "This record is already offered or shared to that site.",
   not_published: "Only a published record can be offered. Publish it first.",
+  too_many_offers:
+    "That site already has 100 offers from your organization waiting for an answer. Ask its manager to answer some, or withdraw some from their records.",
+  declined_recently:
+    "That site declined this record in the last 30 days. You can offer it again after that.",
 };
 
 export function SharingPanel(props: {
@@ -83,10 +89,14 @@ export function SharingPanel(props: {
       };
       await refreshShares(queries, site, props.recordId);
     } catch (error) {
+      // The record is on screen, so a 404 here is the site: no such site
+      // under that organization, or this record's own (S-050).
       const code =
         error instanceof ApiError && error.status === 422
           ? issuesIn(error.body)[0]?.code
-          : undefined;
+          : error instanceof ApiError && error.status === 404
+            ? "unknown_site"
+            : undefined;
       result = {
         tone: "amber",
         text:
@@ -125,7 +135,10 @@ export function SharingPanel(props: {
     sending.current = false;
   }
 
-  const list = shares.data ?? [];
+  const pages = useMorePages(shares.data, shares.dataUpdatedAt, (before) =>
+    nextRecordSharesPage(props.siteId, props.recordId, before),
+  );
+  const list = pages.rows;
   const live = list.filter((s) => isLive(s.state));
   const ended = list.filter((s) => !isLive(s.state));
 
@@ -168,7 +181,11 @@ export function SharingPanel(props: {
           The sharing list couldn't be loaded. {problemText(shares.error)}
         </Note>
       ) : live.length === 0 ? (
-        <p>It isn't offered or shared to any other site.</p>
+        <p>
+          {pages.next === null
+            ? "It isn't offered or shared to any other site."
+            : "None of the shares shown so far are open. Show more to see older ones."}
+        </p>
       ) : (
         <ul className={styles.versions} aria-label="Sites it is offered or shared to">
           {live.map((share) => (
@@ -194,7 +211,10 @@ export function SharingPanel(props: {
       )}
       {ended.length === 0 ? null : (
         <details className={styles.details}>
-          <summary>Earlier shares ({String(ended.length)})</summary>
+          <summary>
+            Earlier shares ({String(ended.length)}
+            {pages.next === null ? "" : " shown so far"})
+          </summary>
           <ul>
             {ended.map((share) => (
               <li key={share.id}>
@@ -207,6 +227,7 @@ export function SharingPanel(props: {
           </ul>
         </details>
       )}
+      <ShowMore pages={pages} what="shares" />
       {props.published ? (
         <form
           className={styles.fieldset}

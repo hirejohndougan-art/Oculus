@@ -85,8 +85,8 @@ export const ACCOUNT_TABLE_PRIVILEGES: Readonly<Record<string, readonly string[]
   invitations: Object.freeze(["INSERT", "UPDATE"]),
   organization_members: Object.freeze(["INSERT"]),
   sign_in_throttles: Object.freeze(["INSERT", "UPDATE", "DELETE"]),
-  // Known addresses (S-018): recorded at a right password, counted like the
-  // counters above, deleted by the cleanup.
+  // Known addresses (S-018): recorded after a whole sign-in (S-044), counted
+  // like the counters above, deleted by the cleanup.
   sign_in_known_sources: Object.freeze(["INSERT", "UPDATE", "DELETE"]),
 });
 
@@ -934,7 +934,8 @@ interface Counted {
 /**
  * Counts this attempt against its counters, or says how long to wait. One
  * short transaction with the rows locked (the two counters in key order,
- * then the known address's row; every caller locks in that order), so
+ * then the known address's row; `markKnown` locks known rows only, so no
+ * cycle), so
  * attempts sent at once are counted one by one. `knownSources` says whether
  * the address may be known for the account (sign-in; never re-entry, S-018).
  */
@@ -983,8 +984,8 @@ async function decideSignInAttemptRows(
       FROM public.sign_in_throttles WHERE key IN (${accountKey}, ${sourceKey})
       ORDER BY key FOR UPDATE`);
     if (rows.length !== 2) return "row_gone";
-    // Known for the account if it signed in from here with the right
-    // password recently (S-018). Read the same way whether or not the
+    // Known for the account if a whole sign-in (password and second step,
+    // S-044) came from here recently (S-018). Read the same way whether or not the
     // address typed has an account.
     const knownRows = knownSources
       ? await tx.rows<KnownRow>(sql`
@@ -1071,8 +1072,8 @@ interface UserRow {
  * 6.3.8). In order:
  * 1. The request's shape (`invalid_request`: not text, or absurdly long).
  * 2. The throttle (`throttled`, with `retryAfterSeconds`): the account and
- *    address counters, where an address the account signed in from with
- *    the right password in the last 30 days counts on its own counter for
+ *    address counters, where an address the account completed a sign-in
+ *    from (S-044: after the second step) in the last 30 days counts on its own counter for
  *    the account instead of waiting for the account's (S-018: strangers
  *    can't keep anyone out at their usual addresses); the attempt is
  *    counted now.
@@ -1083,9 +1084,8 @@ interface UserRow {
  *    without access to `organizationId` (for a system admin: one that
  *    doesn't exist). The attempt stays counted.
  * 5. On success: the account counter is cleared, one is taken off the
- *    address counter, the address becomes (or stays) known for the account
- *    with its counter cleared, the sign-in time is stored, and an
- *    old-settings hash is replaced. `busy` if too many passwords are being checked at once
+ *    address counter, and an old-settings hash is replaced. The sign-in
+ *    time is stored only once the second step passes (`markSignedIn`, S-053). `busy` if too many passwords are being checked at once
  *    (the attempt is then not counted).
  */
 export async function signIn(db: Database, input: SignInRequest): Promise<SignInResult> {
@@ -1225,26 +1225,11 @@ export async function signInChecked(
     await tx.execute(sql`
       UPDATE public.sign_in_throttles SET failures = greatest(failures - 1, 0)
       WHERE key = ${sourceKey}`);
-    if (reauthOf === undefined && sourceKey !== OTHER_SOURCE_KEY) {
-      // This address is now known for the account (S-018), its own counter cleared.
-      await tx.execute(sql`
-        INSERT INTO public.sign_in_known_sources (account_key, source_key, signed_in_at)
-        VALUES (${accountKey}, ${sourceKey}, clock_timestamp())
-        ON CONFLICT (account_key, source_key) DO UPDATE
-        SET signed_in_at = excluded.signed_in_at, failures = 0, last_failure_at = NULL`);
-      // At most MAX_KNOWN_SOURCES per account, the newest (S-018 review).
-      await tx.execute(sql`
-        DELETE FROM public.sign_in_known_sources k
-        WHERE k.account_key = ${accountKey}
-          AND k.source_key NOT IN (
-            SELECT n.source_key FROM public.sign_in_known_sources n
-            WHERE n.account_key = ${accountKey}
-            ORDER BY n.signed_in_at DESC, n.source_key
-            LIMIT ${MAX_KNOWN_SOURCES})`);
-    }
-    await tx.execute(
-      sql`UPDATE public.users SET last_sign_in_at = now() WHERE id = ${user.id}::uuid`,
-    );
+    // The address becomes known, and "last sign-in" is stamped, only once
+    // the second step passes (`markSignedIn`, S-044, S-053): a right
+    // password alone could otherwise push the person's real addresses out
+    // of the newest MAX_KNOWN_SOURCES, and show admins a sign-in that
+    // failed at the code.
     if (newHash !== undefined) {
       // Only if the hash is still the one checked, so a password changed
       // meanwhile is never put back.
@@ -1265,6 +1250,92 @@ export async function signInChecked(
     organizationIds: Object.freeze([...user.organization_ids]),
     secondStep: "required",
   };
+}
+
+/**
+ * Records a whole sign-in, after `completeSecondStep` or `confirmEnrolment`
+ * promoted the session: stamps the person's `last_sign_in_at` (S-053; never
+ * at the password alone, so admins don't see a "last sign-in" for an attempt
+ * that failed at the code) and makes `source` known (`markKnownSource`).
+ * The stamp is a statement of its own after the promotion committed, not in
+ * the promotion's transaction, which holds the user row `FOR SHARE` (two
+ * promotions upgrading it at once would deadlock). Never throws, like
+ * `markKnownSource`: a failure only leaves the stamp at the previous sign-in
+ * and must not turn a finished sign-in into an error whose new token is lost.
+ */
+export async function markSignedIn(db: Database, userId: string, source: string): Promise<void> {
+  try {
+    await db.execute(
+      sql`UPDATE public.users SET last_sign_in_at = clock_timestamp() WHERE id = ${userId}::uuid`,
+    );
+  } catch (error) {
+    // Best effort, as above, but said like `markKnownSource`'s (S-050): only
+    // the failure's class, never the person.
+    process.emitWarning(`Couldn't stamp a sign-in's time (${failureClass(error)}).`, {
+      code: "OCULUS_LAST_SIGN_IN",
+    });
+  }
+  await markKnownSource(db, userId, source);
+}
+
+/**
+ * Marks `source` as known for the person's account (S-018) once their sign-in
+ * has passed its second step, never on the password alone (S-044): someone
+ * who has only the password could otherwise sign in from MAX_KNOWN_SOURCES
+ * fresh addresses, push the person's real ones out, and keep them waiting
+ * behind the account counter with one wrong guess per wait. The newest
+ * MAX_KNOWN_SOURCES addresses are kept. Called after the session was
+ * promoted, so it never throws: a failure here only leaves the address
+ * unknown (it waits like a stranger's during an account wait) and must not
+ * turn a finished sign-in into an error whose new token is lost.
+ */
+export async function markKnownSource(db: Database, userId: string, source: string): Promise<void> {
+  const sourceKey = throttleSourceKey(source);
+  if (sourceKey === OTHER_SOURCE_KEY) return;
+  try {
+    await markKnown(db, userId, sourceKey);
+  } catch (error) {
+    // Best effort, as above, but said (S-050): only the failure's class (a
+    // PostgreSQL SQLSTATE or the error's name), never the address or person.
+    process.emitWarning(`Couldn't mark a sign-in address as known (${failureClass(error)}).`, {
+      code: "OCULUS_KNOWN_SOURCE",
+    });
+  }
+}
+
+/** A failure's class for a log line: a five-character SQLSTATE, or the error's name. */
+export function failureClass(error: unknown): string {
+  const code = (error as { code?: unknown } | null)?.code;
+  // An SQLSTATE: five digits or capitals with at least one digit (Node's
+  // EPERM, EPIPE … are errno names, logged as such).
+  if (typeof code === "string" && /^(?=.*[0-9])[0-9A-Z]{5}$/.test(code)) return `SQLSTATE ${code}`;
+  if (typeof code === "string" && /^E[A-Z]{2,15}$/.test(code)) return code;
+  const name = (error as { name?: unknown } | null)?.name;
+  return typeof name === "string" && /^[A-Za-z]{1,40}$/.test(name) ? name : "unknown";
+}
+
+async function markKnown(db: Database, userId: string, sourceKey: string): Promise<void> {
+  await inTransaction(db, async (tx) => {
+    const rows = await tx.rows<{ email: string }>(sql`
+      SELECT email FROM public.users WHERE id = ${userId}::uuid`);
+    const email = rows[0]?.email;
+    if (email === undefined) return;
+    const accountKey = throttleAccountKey(email);
+    await tx.execute(sql`
+      INSERT INTO public.sign_in_known_sources (account_key, source_key, signed_in_at)
+      VALUES (${accountKey}, ${sourceKey}, clock_timestamp())
+      ON CONFLICT (account_key, source_key) DO UPDATE
+      SET signed_in_at = excluded.signed_in_at, failures = 0, last_failure_at = NULL`);
+    // At most MAX_KNOWN_SOURCES per account, the newest (S-018 review).
+    await tx.execute(sql`
+      DELETE FROM public.sign_in_known_sources k
+      WHERE k.account_key = ${accountKey}
+        AND k.source_key NOT IN (
+          SELECT n.source_key FROM public.sign_in_known_sources n
+          WHERE n.account_key = ${accountKey}
+          ORDER BY n.signed_in_at DESC, n.source_key
+          LIMIT ${MAX_KNOWN_SOURCES})`);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1305,7 +1376,7 @@ export async function clearSignInThrottle(
  * Deletes counters that no longer matter: none at all, or no failure (or
  * reset request) for longer than their own rule's reset time: the account,
  * re-entry and reset-account counters 24 hours, the address counters 1 hour;
- * and known addresses with no right password from there in 30 days (S-018).
+ * and known addresses with no whole sign-in from there in 30 days (S-018).
  * For the cleanup command any scheduler runs (T-037, D-035). Returns how
  * many went.
  */
@@ -1323,7 +1394,7 @@ export async function deleteExpiredSignInThrottles(db: Queryable): Promise<numbe
                  WHEN key LIKE 'account:%' THEN ${ACCOUNT_THROTTLE.resetAfterSeconds}::int
                  WHEN key LIKE 'reauth:%' THEN ${ACCOUNT_THROTTLE.resetAfterSeconds}::int
                  ELSE ${SOURCE_THROTTLE.resetAfterSeconds}::int END)`);
-  // Addresses no longer known (S-018): no right password from there in 30 days.
+  // Addresses no longer known (S-018): no whole sign-in from there in 30 days.
   const known = await db.execute(sql`
     DELETE FROM public.sign_in_known_sources
     WHERE signed_in_at < clock_timestamp() - make_interval(secs => ${KNOWN_SOURCE_SECONDS})`);

@@ -174,8 +174,19 @@ export interface FullSession {
   readonly signedInAt: string;
   /** The absolute end. */
   readonly expiresAt: string;
-  /** When it ends if not used again (refreshed by this lookup). */
+  /** When it ends if not used again (refreshed by this lookup, unless it was background). */
   readonly idleExpiresAt: string;
+  /**
+   * How long it may sit unused, in seconds: the limit it was made with
+   * (D-069), which the admin's own idle timer follows (T-062, D-098).
+   */
+  readonly idleSeconds: number;
+  /**
+   * Seconds until the idle end by the database's clock, as of this lookup
+   * (whole seconds, rounded down): so the admin can set its timer by the
+   * server without comparing clocks (T-062, D-098).
+   */
+  readonly idleSecondsLeft: number;
   /** When the password was last entered in this session. */
   readonly passwordAt: string;
   /** Whether that was within the window asked for (10 minutes by default). */
@@ -363,6 +374,8 @@ export interface FullRow {
   signed_in_at: string;
   expires_at: string;
   idle_expires_at: string;
+  idle_seconds: number;
+  idle_left: number;
   password_at: string;
   recent: boolean;
 }
@@ -376,6 +389,8 @@ export function fullSession(row: FullRow): FullSession {
     signedInAt: row.signed_in_at,
     expiresAt: row.expires_at,
     idleExpiresAt: row.idle_expires_at,
+    idleSeconds: row.idle_seconds,
+    idleSecondsLeft: row.idle_left,
     passwordAt: row.password_at,
     recentlyAuthenticated: row.recent,
   });
@@ -390,6 +405,10 @@ export function fullColumns(recentSeconds: number) {
     to_char(s.expires_at AT TIME ZONE 'UTC', ${ISO}) AS expires_at,
     to_char(least(s.expires_at, s.last_seen_at + make_interval(secs => s.idle_seconds))
             AT TIME ZONE 'UTC', ${ISO}) AS idle_expires_at,
+    s.idle_seconds,
+    greatest(0, floor(extract(epoch FROM
+      least(s.expires_at, s.last_seen_at + make_interval(secs => s.idle_seconds))
+      - clock_timestamp())))::integer AS idle_left,
     to_char(s.password_at AT TIME ZONE 'UTC', ${ISO}) AS password_at,
     s.password_at > clock_timestamp() - make_interval(secs => ${recentSeconds}) AS recent`;
 }
@@ -740,11 +759,20 @@ export async function promoteSession(
 export interface ResolveOptions extends SessionCallOptions {
   /** The window for `recentlyAuthenticated`: 60 to 3,600 seconds, 600 by default. */
   readonly recentAuthenticationSeconds?: number;
+  /**
+   * Whether this lookup is a use of the session (T-062, D-098): `true` (the
+   * default) moves `last_seen_at` to now; `false`, for a request the admin
+   * marks as background (polling, a check of whether the session is still
+   * alive), checks every limit the same way but leaves `last_seen_at` alone,
+   * so background requests never keep an unattended session going. It can
+   * only make a session end sooner, never later.
+   */
+  readonly activity?: boolean;
 }
 
 /**
- * The full session `token` names, refreshed (`last_seen_at`), or
- * `NO_SESSION`. One statement: the database checks the stage, the absolute
+ * The full session `token` names, refreshed (`last_seen_at`; not for a
+ * background lookup, `activity: false`), or `NO_SESSION`. One statement: the database checks the stage, the absolute
  * and idle limits by its own clock, that the account is active, that the
  * sign-in is after its `sessions_valid_after`, and that it may still work
  * in the session's organization. A session waiting for its second step is
@@ -756,16 +784,25 @@ export async function resolveSession(
   token: unknown,
   options: ResolveOptions = {},
 ): Promise<{ readonly ok: true; readonly session: FullSession } | NoSession | SessionFailure> {
-  const call = callOptions(options, ["recentAuthenticationSeconds"]);
+  const call = callOptions(options, ["recentAuthenticationSeconds", "activity"]);
   const recent = recentWindow(options);
+  const activity = own(options, "activity") ?? true;
+  if (typeof activity !== "boolean") throw new TypeError("activity is true or false.");
   const hash = tokenHash(token);
   if (hash === undefined) return NO_SESSION;
   try {
-    const rows = await db.rows<FullRow>(sql`
+    // The same conditions either way; a background lookup only reads, so
+    // the idle limit keeps counting from the last real use.
+    const rows = activity
+      ? await db.rows<FullRow>(sql`
       UPDATE public.sessions s SET last_seen_at = clock_timestamp()
       FROM public.users u
       WHERE s.token_hash = ${hash} AND ${LIVE_FULL}
-      RETURNING ${fullColumns(recent)}`);
+      RETURNING ${fullColumns(recent)}`)
+      : await db.rows<FullRow>(sql`
+      SELECT ${fullColumns(recent)}
+      FROM public.sessions s JOIN public.users u ON u.id = s.user_id
+      WHERE s.token_hash = ${hash} AND ${LIVE_FULL}`);
     const row = rows[0];
     return row === undefined ? NO_SESSION : { ok: true, session: fullSession(row) };
   } catch (error) {
@@ -1175,9 +1212,23 @@ export interface CleanupResult {
   readonly sessions: number;
   readonly signInThrottles: number;
   readonly passwordResets: number;
-  /** Wrong-code counters (T-038) a day old, and those of sessions that have ended. */
+  /** Wrong-code counters (T-038) a day old (unexplained ones, S-045: 30 days), and those of sessions that have ended. */
   readonly secondStepThrottles: number;
+  /** Alerts written for unexplained wrong codes an hour old (S-045). */
+  readonly secondStepAlerts: number;
 }
+
+/**
+ * How long wrong TOTP codes that no right code in their session explained
+ * are kept (S-045, D-077): 30 days without a new code.
+ */
+export const WRONG_CODE_MEMORY_SECONDS = 30 * 24 * 60 * 60;
+
+/**
+ * Unexplained wrong codes this old are told by the cleanup command (S-045):
+ * a waiting session lives 10 minutes, so no right code can explain them now.
+ */
+export const UNEXPLAINED_TOLD_AFTER_SECONDS = 60 * 60;
 
 /**
  * The cleanup command's work (`npm run db:cleanup`, D-035: any scheduler can
@@ -1190,11 +1241,48 @@ export async function runCleanup(db: Queryable): Promise<CleanupResult> {
   const signInThrottles = await deleteExpiredSignInThrottles(db);
   // core's SECOND_STEP_THROTTLE forgets a counter after a day without a
   // failure; a waiting session's counter is useless once the session is gone.
+  // A person's unexplained wrong codes (`wrong:`, S-045) an hour old can't
+  // be explained any more (a waiting session lives 10 minutes): they are told
+  // now, as an alert, and taken off; the row itself is kept 30 days.
+  const told = await db.rows<{ n: number }>(sql`
+    WITH old AS (
+      SELECT key, failures FROM public.second_step_throttles
+      WHERE key LIKE 'wrong:%' AND failures > 0
+        AND last_failure_at < clock_timestamp() - make_interval(secs => ${UNEXPLAINED_TOLD_AFTER_SECONDS})
+      ORDER BY key FOR UPDATE
+    ), cleared AS (
+      UPDATE public.second_step_throttles t SET failures = 0
+      FROM old WHERE t.key = old.key RETURNING old.key, old.failures
+    ), alerted AS (
+      INSERT INTO public.second_step_alerts (id, user_id, failures)
+      SELECT gen_random_uuid(), u.id, c.failures
+      FROM cleared c JOIN public.users u ON 'wrong:' || u.id::text = c.key
+      RETURNING 1
+    )
+    SELECT count(*)::int AS n FROM alerted`);
+  const secondStepAlerts = told[0]?.n ?? 0;
+  // Locked in key order first (S-054a), as a code attempt locks its
+  // counters: a delete in the table's own order could hold `wrong:` while
+  // waiting on the same person's `user:`, which an attempt holds while
+  // waiting on `wrong:`.
   const secondStepThrottles = await db.execute(sql`
-    DELETE FROM public.second_step_throttles t
-    WHERE t.last_failure_at IS NULL OR t.last_failure_at < clock_timestamp() - interval '1 day'
-       OR (t.key LIKE 'session:%' AND NOT EXISTS (
-             SELECT 1 FROM public.sessions s WHERE 'session:' || s.id::text = t.key))`);
+    WITH gone AS (
+      SELECT t.key FROM public.second_step_throttles t
+      WHERE t.last_failure_at IS NULL
+         OR (t.key NOT LIKE 'wrong:%' AND t.last_failure_at < clock_timestamp() - interval '1 day')
+         OR (t.key LIKE 'wrong:%'
+             AND t.last_failure_at < clock_timestamp() - make_interval(secs => ${WRONG_CODE_MEMORY_SECONDS}))
+         OR (t.key LIKE 'session:%' AND NOT EXISTS (
+               SELECT 1 FROM public.sessions s WHERE 'session:' || s.id::text = t.key))
+      ORDER BY t.key FOR UPDATE OF t
+    )
+    DELETE FROM public.second_step_throttles t USING gone WHERE t.key = gone.key`);
   const passwordResets = await deleteOldPasswordResets(db);
-  return Object.freeze({ sessions, signInThrottles, secondStepThrottles, passwordResets });
+  return Object.freeze({
+    sessions,
+    signInThrottles,
+    secondStepThrottles,
+    secondStepAlerts,
+    passwordResets,
+  });
 }

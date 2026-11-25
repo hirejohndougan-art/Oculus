@@ -1,12 +1,16 @@
 /**
  * Sharing items between sites in the admin (T-041e, D-094): the shapes the
  * share routes answer with, and plain words for them. A shared item's view
- * is what its home organization's public site shows, never more; its fields
- * come by key only (the other organization's template isn't ours to read),
- * so their names are made readable here.
+ * is what its home organization's public site shows, never more: the fields
+ * its home Dublin Core mapping publishes, with its home template's labels
+ * (S-036a). Lists come a page at a time (`SHARE_PAGE`).
  */
 
-export type ShareState = "offered" | "accepted" | "declined" | "withdrawn" | "removed";
+/** The most shares one list page holds (the server's `MAX_SHARE_PAGE`). */
+export const SHARE_PAGE = 50;
+
+export type ShareState =
+  "offered" | "accepted" | "declined" | "withdrawn" | "removed" | "deleted" | "moved";
 
 export const SHARE_STATE_LABELS: Readonly<Record<ShareState, string>> = {
   offered: "Offered, waiting for an answer",
@@ -14,6 +18,8 @@ export const SHARE_STATE_LABELS: Readonly<Record<ShareState, string>> = {
   declined: "Declined",
   withdrawn: "Withdrawn",
   removed: "Removed by the other site",
+  deleted: "Ended: the item was deleted",
+  moved: "Ended: the item moved to that site",
 };
 
 export interface ShareSummary {
@@ -31,12 +37,27 @@ export interface SharedItemView {
   readonly title: string;
   readonly kind: string;
   readonly fields: Readonly<Record<string, unknown>>;
+  /** Each field's label in its home template. */
+  readonly labels?: Readonly<Record<string, string>>;
   readonly homeSite: string | null;
   readonly homeOrganization: string;
 }
 
 export interface IncomingShare extends ShareSummary {
-  readonly item: SharedItemView;
+  /** `null` (in the site manager's list only) while the public can't see the item. */
+  readonly item: SharedItemView | null;
+}
+
+/** A shared item's title, or words for one the public can't see right now. */
+export function itemTitle(share: IncomingShare): string {
+  return share.item?.title ?? "An item not shown to the public right now";
+}
+
+/** A field's name: its home template's label, else made readable from its key. */
+export function viewLabel(item: SharedItemView, key: string): string {
+  const label =
+    item.labels !== undefined && Object.hasOwn(item.labels, key) ? item.labels[key] : undefined;
+  return typeof label === "string" && label !== "" ? label : fieldLabel(key);
 }
 
 /** A share that can still be ended: offered or accepted. */

@@ -45,6 +45,12 @@ export interface DatabaseOptions {
   applicationName?: string;
   /** Give up connecting after this long (default: the URL's `connect_timeout`, else never). */
   connectionTimeoutMillis?: number;
+  /**
+   * Give up on a query the server doesn't answer within this long (pg's
+   * `query_timeout`, S-051). Set it above every `statement_timeout` the pool's
+   * work uses, so it only fires when the server or network has stopped.
+   */
+  queryTimeoutMillis?: number;
 }
 
 const OID = {
@@ -257,6 +263,11 @@ export function openDatabase(connectionString: string, options: DatabaseOptions 
     ...(options.connectionTimeoutMillis === undefined
       ? {}
       : { connectionTimeoutMillis: options.connectionTimeoutMillis }),
+    // The client gives up on a server or network that stops answering
+    // (S-051); `statement_timeout` only bounds a server that still does.
+    ...(options.queryTimeoutMillis === undefined
+      ? {}
+      : { query_timeout: options.queryTimeoutMillis }),
   });
   // An idle connection that fails (a server restart) is dropped by the pool;
   // without a listener the error would crash the process.
@@ -308,6 +319,33 @@ export function openDatabase(connectionString: string, options: DatabaseOptions 
       await pool.end();
     },
   };
+}
+
+/**
+ * pg-pool's error for a wait past `connectionTimeoutMillis` for a pooled
+ * connection while every one is in use. Not its "Connection terminated due
+ * to connection timeout", which means opening a new connection took too
+ * long (an unreachable server): that is an outage, not load.
+ */
+const CONNECTION_WAITS = new Set(["timeout exceeded when trying to connect"]);
+
+/**
+ * Whether `error` means a time limit ran out (S-037), not that the database
+ * failed: a statement cancelled by `statement_timeout` (SQLSTATE 57014,
+ * query_canceled), or no pooled connection free within the pool's
+ * `connectionTimeoutMillis`. Public reads answer these `503 busy`. Every such error is also
+ * an `isDatabaseFailure`.
+ */
+export function isDatabaseTimeout(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const { code } = error as { code?: unknown };
+  if (code === "57014") return true;
+  return (
+    code === undefined &&
+    error instanceof Error &&
+    Object.getPrototypeOf(error) === Error.prototype &&
+    CONNECTION_WAITS.has(error.message)
+  );
 }
 
 /** A single dedicated connection, for the migration runner (it holds a session lock). */

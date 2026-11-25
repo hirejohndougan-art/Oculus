@@ -8,16 +8,23 @@ import { Playwright } from "@siteimprove/alfa-playwright";
 import rules from "@siteimprove/alfa-rules";
 import { expect, type Page } from "@playwright/test";
 import { decodeBase32, totpAt } from "@oculus/core";
+import { openDatabase, sql } from "@oculus/db";
 
 export interface Seed {
   readonly email: string;
   readonly editorEmail: string;
+  readonly scannerEmail: string;
   /** The system manager (T-048a's System settings). */
   readonly rootEmail: string;
   readonly organizationName: string;
   readonly password: string;
   readonly siteName: string;
   readonly recordTitle: string;
+  readonly assetTitle: string;
+  /** T-062's idle sign-out test's own person. */
+  readonly idleEmail: string;
+  /** The throwaway database (T-062's test ages its session there). */
+  readonly databaseUrl: string;
 }
 
 export function seed(): Seed {
@@ -102,9 +109,15 @@ export async function signInAndSetUp(
 
   await expect(page.getByRole("heading", { name: "Set up two-step sign-in" })).toBeVisible();
   if (check) await accessible(page, "Set up two-step sign-in");
-  await page.getByRole("button", { name: "Start setting up" }).press("Enter");
-
-  await expect(page.getByRole("img", { name: /QR code/ })).toBeVisible();
+  // "Start setting up" stays disabled until the waiting sign-in's state has
+  // loaded (SetUp.tsx); a key pressed before then does nothing. One press,
+  // once it is enabled. The set-up step hashes and seals the key, so the
+  // code gets time on a loaded machine.
+  const qr = page.getByRole("img", { name: /QR code/ });
+  const start = page.getByRole("button", { name: "Start setting up" });
+  await expect(start).toBeEnabled();
+  await start.press("Enter");
+  await expect(qr).toBeVisible({ timeout: 15_000 });
   if (check) await accessible(page, "Scan the code");
   const key = (await page.locator("code").first().textContent()) ?? "";
   const secret = decodeBase32(key.replace(/\s+/g, ""));
@@ -169,4 +182,36 @@ export async function signInRoot(page: Page): Promise<void> {
   await choice.focus();
   await page.keyboard.press("Space");
   await page.getByRole("button", { name: "Continue" }).click();
+}
+
+/**
+ * Moves every session of the person with `email` back by `seconds`, as the
+ * database's owner, with the session change triggers off inside this one
+ * transaction (as the unit tests' `ageSession`, D-067): the server-side half
+ * of T-062's fake clock, so the server sees the session as unused that long.
+ */
+export async function ageSessionsOf(email: string, seconds: number): Promise<void> {
+  const db = openDatabase(seed().databaseUrl, { max: 1 });
+  try {
+    await db.transaction(async (q) => {
+      await q.execute(sql`ALTER TABLE public.sessions DISABLE TRIGGER sessions_check_change`);
+      await q.execute(sql`ALTER TABLE public.sessions DISABLE TRIGGER zzzz_sessions_keep_identity`);
+      await q.execute(sql`
+        UPDATE public.sessions s SET
+          signed_in_at = s.signed_in_at - make_interval(secs => ${seconds}),
+          created_at = s.created_at - make_interval(secs => ${seconds}),
+          rotated_at = s.rotated_at - make_interval(secs => ${seconds}),
+          password_at = s.password_at - make_interval(secs => ${seconds}),
+          second_step_at = s.second_step_at - make_interval(secs => ${seconds}),
+          expires_at = s.expires_at - make_interval(secs => ${seconds}),
+          last_seen_at = s.last_seen_at - make_interval(secs => ${seconds})
+        WHERE s.user_id = (SELECT u.id FROM public.users u WHERE u.email = ${email})`);
+      await q.execute(sql`ALTER TABLE public.sessions ENABLE ALWAYS TRIGGER sessions_check_change`);
+      await q.execute(
+        sql`ALTER TABLE public.sessions ENABLE ALWAYS TRIGGER zzzz_sessions_keep_identity`,
+      );
+    });
+  } finally {
+    await db.close();
+  }
 }

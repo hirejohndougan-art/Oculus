@@ -9,6 +9,7 @@
 // second site read or change the record through the ordinary operations.
 // Every person, site and record here is invented.
 import { afterAll, describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import {
   newOrganizationId,
   newRecordId,
@@ -24,6 +25,9 @@ import {
   grantWriterRole,
   insertOrganization,
   insertTemplateVersion,
+  DECLINE_COOLDOWN_DAYS,
+  MAX_OPEN_OFFERS,
+  MAX_SHARE_PAGE,
   migrate,
   openDatabase,
   sharesIntoSite,
@@ -192,6 +196,28 @@ async function world(): Promise<World> {
   const lib = await catalogOrganization(`Invented Library ${tag}`);
   const dhs = await catalogOrganization(`Invented Historical Society ${tag}`);
   const root = folks.root;
+  // What the public pages publish (D-096); a shared item shows only these (S-036a).
+  for (const org of [lib, dhs]) {
+    for (const [template, entries] of [
+      [
+        "t-object",
+        [
+          { field: "description", term: "description" },
+          { field: "rights", term: "rights" },
+        ],
+      ],
+      ["t-unit", [{ field: "rights", term: "rights" }]],
+    ] as const) {
+      ok(
+        await service.saveDublinCoreMapping(
+          { organizationId: org, actor: actorOf(root) },
+          template,
+          { entries },
+          { expectedVersion: 0 },
+        ),
+      );
+    }
+  }
   const l1 = await makeSite(service, root, lib, `Invented library site ${tag}`);
   const l2 = await makeSite(service, root, lib, `Invented branch site ${tag}`);
   const d1 = await makeSite(service, root, dhs, `Invented society site ${tag}`);
@@ -277,7 +303,7 @@ describe("offering an item", () => {
       targetOrganizationId: w.dhs,
       targetSiteId: w.d1,
     });
-    const listed = ok(await service.sharesOfRecord(at(w.lib, w.libCataloger), w.item.id));
+    const listed = ok(await service.sharesOfRecord(at(w.lib, w.libCataloger), w.item.id)).shares;
     expect(listed.map((x) => x.id)).toEqual([share.id]);
   });
 
@@ -444,7 +470,7 @@ describe("what the second site sees", () => {
       "unknown_share",
     ]);
     // The manager sees the offer, with the same view.
-    const offers = ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1));
+    const offers = ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1)).shares;
     expect(offers.map((x) => x.id)).toEqual([share.id]);
     expect(leaks(offers)).toEqual([]);
     ok(await service.acceptShare(at(w.dhs, w.dhsManager), share.id));
@@ -458,11 +484,12 @@ describe("what the second site sees", () => {
           description: "A tin lantern.",
           rights: { uri: "http://rightsstatements.org/vocab/InC/1.0/" },
         },
+        labels: { description: "description", rights: "rights" },
         homeSite: "Invented library site " + String(count),
         homeOrganization: "Invented Library " + String(count),
       });
       expect(leaks(seen)).toEqual([]);
-      const list = ok(await service.listSharedItems(at(w.dhs, userId), w.d1));
+      const list = ok(await service.listSharedItems(at(w.dhs, userId), w.d1)).shares;
       expect(list.map((x) => x.id)).toEqual([share.id]);
       expect(leaks(list)).toEqual([]);
     }
@@ -476,7 +503,7 @@ describe("what the second site sees", () => {
         { expectedVersion: now.version },
       ),
     );
-    expect(ok(await service.readSharedItem(at(w.dhs, w.dhsReader), share.id)).item.title).toBe(
+    expect(ok(await service.readSharedItem(at(w.dhs, w.dhsReader), share.id)).item?.title).toBe(
       "Invented depot lantern, restored",
     );
   });
@@ -509,7 +536,7 @@ describe("what the second site sees", () => {
     expect(codes(onward)).toEqual(["unknown_record"]);
     expect(codes(await service.withdrawShare(ctx, share.id))).toEqual(["unknown_share"]);
     // It is listed only among the items shared with the second site.
-    const shared = ok(await service.listSharedItems(ctx, w.l2));
+    const shared = ok(await service.listSharedItems(ctx, w.l2)).shares;
     expect(shared.map((x) => x.recordId)).toEqual([w.item.id]);
     // Another organization's manager of an accepting site can't read it the ordinary way either.
     const other = await offer(w, { org: w.dhs, site: w.d1 });
@@ -542,7 +569,7 @@ describe("what the second site sees", () => {
       "unknown_share",
     ]);
     // The home side's list doesn't name anyone of the Society.
-    const listed = ok(await service.sharesOfRecord(at(w.lib, w.libCataloger), w.item.id));
+    const listed = ok(await service.sharesOfRecord(at(w.lib, w.libCataloger), w.item.id)).shares;
     expect(Object.keys(listed[0] ?? {}).sort()).toEqual(
       [
         "decidedAt",
@@ -574,7 +601,7 @@ describe("what the second site sees", () => {
     expect(codes(await service.readSharedItem(at(w.dhs, w.dhsReader), share.id))).toEqual([
       "unknown_share",
     ]);
-    expect(ok(await service.listSharedItems(at(w.dhs, w.dhsReader), w.d1))).toEqual([]);
+    expect(ok(await service.listSharedItems(at(w.dhs, w.dhsReader), w.d1)).shares).toEqual([]);
   });
 });
 
@@ -658,7 +685,7 @@ describe("second review", () => {
     const w = await world();
     const share = await offer(w, { org: w.lib, site: w.l2 });
     ok(await service.acceptShare(at(w.lib, w.l2Manager), share.id));
-    expect(ok(await service.listSharedItems(at(w.lib, w.l2Manager), w.l2))).toHaveLength(1);
+    expect(ok(await service.listSharedItems(at(w.lib, w.l2Manager), w.l2)).shares).toHaveLength(1);
     const rootAt = at(w.lib, folks.root, w.l1);
     const now = ok(await service.readRecord(rootAt, w.item.id));
     ok(
@@ -669,7 +696,7 @@ describe("second review", () => {
         { expectedVersion: now.version },
       ),
     );
-    expect(ok(await service.listSharedItems(at(w.lib, w.l2Manager), w.l2))).toEqual([]);
+    expect(ok(await service.listSharedItems(at(w.lib, w.l2Manager), w.l2)).shares).toEqual([]);
     expect(codes(await service.readSharedItem(at(w.lib, w.l2Manager), share.id))).toEqual([
       "unknown_share",
     ]);
@@ -783,7 +810,7 @@ describe("second review", () => {
     // longer fits the field after a template change) is shown no more.
     const share = await offer(w, { org: w.dhs, site: w.d1 });
     ok(await service.acceptShare(at(w.dhs, w.dhsManager), share.id));
-    expect(ok(await service.listSharedItems(at(w.dhs, w.dhsReader), w.d1))).toHaveLength(1);
+    expect(ok(await service.listSharedItems(at(w.dhs, w.dhsReader), w.d1)).shares).toHaveLength(1);
     ok(
       await insertTemplateVersion(s.owner, {
         key: "t-object",
@@ -812,7 +839,7 @@ describe("second review", () => {
         ],
       }),
     );
-    expect(ok(await service.listSharedItems(at(w.dhs, w.dhsReader), w.d1))).toEqual([]);
+    expect(ok(await service.listSharedItems(at(w.dhs, w.dhsReader), w.d1)).shares).toEqual([]);
     expect(codes(await service.readSharedItem(at(w.dhs, w.dhsReader), share.id))).toEqual([
       "unknown_share",
     ]);
@@ -830,7 +857,7 @@ describe("second review", () => {
     expect(row?.n).toBe(1);
     // Left out in the query itself (before its limit), not after.
     expect(await sharesIntoSite(s.owner, w.dhs, w.d1, "offered")).toEqual([]);
-    expect(ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1))).toEqual([]);
+    expect(ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1)).shares).toEqual([]);
   });
 
   it("stops showing an accepted item once it is on no site", async () => {
@@ -878,5 +905,610 @@ describe("second review", () => {
       expect(JSON.stringify(result)).not.toContain("10.0.0.5");
     }
     expect(errors).toEqual([failure, failure, failure]);
+  });
+});
+
+describe("share lists and views (S-036a)", () => {
+  /** A published object made by the library's cataloger on L1. */
+  async function publishedItem(w: World, title: string, templateKey = "t-object") {
+    const made = ok(
+      await service.createRecord(at(w.lib, w.libCataloger, w.l1), {
+        kind: "object",
+        title,
+        templateKey,
+        fields: {
+          description: "An invented description.",
+          rights: { uri: "http://rightsstatements.org/vocab/InC/1.0/" },
+        },
+      }),
+    ).record;
+    ok(
+      await service.publish(
+        { organizationId: w.lib, actor: actorOf(folks.root), siteId: w.l1 },
+        made.id,
+        {
+          expectedVersion: 1,
+        },
+      ),
+    );
+    return made;
+  }
+
+  /** `recordId` offered to D1 by the library's cataloger. */
+  async function offerToD1(w: World, recordId: string) {
+    return ok(
+      await service.offerRecord(at(w.lib, w.libCataloger, w.l1), {
+        recordId,
+        targetOrganizationId: w.dhs,
+        targetSiteId: w.d1,
+      }),
+    );
+  }
+
+  it("pages each list newest first, by the last share's ID, and refuses a bad page", async () => {
+    await ready();
+    const w = await world();
+    const shares = [await offerToD1(w, w.item.id)];
+    for (const n of [1, 2]) {
+      const item = await publishedItem(w, `Invented paged lantern ${String(n)}`);
+      shares.push(await offerToD1(w, item.id));
+    }
+    const newestFirst = [...shares].reverse().map((x) => x.id);
+    const manager = at(w.dhs, w.dhsManager);
+    const first = ok(await service.sharesIntoSite(manager, w.d1)).shares;
+    expect(first.map((x) => x.id)).toEqual(newestFirst);
+    const after = ok(
+      await service.sharesIntoSite(manager, w.d1, { state: "offered", before: newestFirst[0] }),
+    ).shares;
+    expect(after.map((x) => x.id)).toEqual(newestFirst.slice(1));
+    const last = ok(
+      await service.sharesIntoSite(manager, w.d1, { state: "offered", before: newestFirst[2] }),
+    ).shares;
+    expect(last).toEqual([]);
+    // An accepted item's page doesn't see the offers, and no one else's share is a cursor.
+    expect(ok(await service.sharesIntoSite(manager, w.d1, { state: "accepted" })).shares).toEqual(
+      [],
+    );
+    for (const before of [newRecordId(), "not-an-id"]) {
+      expect(
+        ok(await service.sharesIntoSite(manager, w.d1, { state: "offered", before })).shares,
+      ).toEqual([]);
+    }
+    // A record's own list pages the same way.
+    const home = at(w.lib, w.libCataloger, w.l1);
+    const own = ok(await service.sharesOfRecord(home, w.item.id)).shares;
+    expect(own.map((x) => x.id)).toEqual([shares[0]?.id]);
+    expect(
+      ok(await service.sharesOfRecord(home, w.item.id, { before: shares[0]?.id })).shares,
+    ).toEqual([]);
+    for (const bad of [{ state: "declined" }, { before: 7 }, { other: 1 }]) {
+      expect(codes(await service.sharesIntoSite(manager, w.d1, bad))).toEqual(["invalid_request"]);
+    }
+    expect(codes(await service.sharesOfRecord(home, w.item.id, { state: "offered" }))).toEqual([
+      "invalid_request",
+    ]);
+  });
+
+  it("gives a page of at most MAX_SHARE_PAGE and an exact next, even when it leaves some out", async () => {
+    await ready();
+    const w = await world();
+    // A template with no stored mapping: its items' offers can't be shown (nothing to decide on).
+    ok(
+      await insertTemplateVersion(s.owner, {
+        key: "t-unmapped",
+        organizationId: w.lib,
+        label: "Unmapped objects",
+        appliesTo: ["object"],
+        fields: [
+          {
+            key: "rights",
+            label: "Rights",
+            kind: "rights",
+            required: false,
+            repeatable: false,
+            visibility: "public",
+            inherited: false,
+          },
+        ],
+      }),
+    );
+    const shown: string[] = [];
+    const all: string[] = [];
+    for (let n = 0; n < MAX_SHARE_PAGE + 2; n++) {
+      // Two of the newest page's offers can't be shown.
+      const unmapped = n === MAX_SHARE_PAGE - 1 || n === MAX_SHARE_PAGE - 10;
+      const made = unmapped
+        ? ok(
+            await service.createRecord(at(w.lib, w.libCataloger, w.l1), {
+              kind: "object",
+              title: `Invented unmapped lantern ${String(n)}`,
+              templateKey: "t-unmapped",
+              fields: { rights: { uri: "http://rightsstatements.org/vocab/InC/1.0/" } },
+            }),
+          ).record
+        : undefined;
+      if (made !== undefined) {
+        ok(
+          await service.publish(
+            { organizationId: w.lib, actor: actorOf(folks.root), siteId: w.l1 },
+            made.id,
+            { expectedVersion: 1 },
+          ),
+        );
+      }
+      const id = made?.id ?? (await publishedItem(w, `Invented many lantern ${String(n)}`)).id;
+      const share = await offerToD1(w, id);
+      all.push(share.id);
+      if (!unmapped) shown.push(share.id);
+    }
+    const manager = at(w.dhs, w.dhsManager);
+    const page1 = ok(await service.sharesIntoSite(manager, w.d1, { state: "offered" }));
+    // A full page was read; two of it weren't shown, and the next page still follows it.
+    expect(page1.shares).toHaveLength(MAX_SHARE_PAGE - 2);
+    expect(page1.next.offered).toBe([...all].reverse()[MAX_SHARE_PAGE - 1]);
+    expect(page1.next.accepted).toBeNull();
+    const page2 = ok(
+      await service.sharesIntoSite(manager, w.d1, {
+        state: "offered",
+        before: page1.next.offered,
+      }),
+    );
+    expect(page2.next.offered).toBeNull();
+    expect([...page1.shares, ...page2.shares].map((x) => x.id)).toEqual([...shown].reverse());
+  }, 180_000);
+
+  it("never takes another list's share as a cursor, and needs a state with a cursor", async () => {
+    await ready();
+    const w = await world();
+    const intoD1 = await offerToD1(w, w.item.id);
+    // A share of the same record into another site of the home organization.
+    const intoL2 = ok(
+      await service.offerRecord(at(w.lib, w.libCataloger, w.l1), {
+        recordId: w.item.id,
+        targetOrganizationId: w.lib,
+        targetSiteId: w.l2,
+      }),
+    );
+    const other = await publishedItem(w, "Invented other lantern");
+    const otherShare = await offerToD1(w, other.id);
+    const manager = at(w.dhs, w.dhsManager);
+    // L2's share, and an accepted-list cursor for the offered list, give empty pages.
+    for (const before of [intoL2.id]) {
+      expect(
+        ok(await service.sharesIntoSite(manager, w.d1, { state: "offered", before })).shares,
+      ).toEqual([]);
+    }
+    // A cursor share that was decided since still marks where its page ended.
+    ok(await service.acceptShare(manager, otherShare.id));
+    expect(
+      ok(
+        await service.sharesIntoSite(manager, w.d1, { state: "offered", before: otherShare.id }),
+      ).shares.map((x) => x.id),
+    ).toEqual([intoD1.id]);
+    // Another record's share isn't a cursor for this record's list.
+    const home = at(w.lib, w.libCataloger, w.l1);
+    expect(
+      ok(await service.sharesOfRecord(home, w.item.id, { before: otherShare.id })).shares,
+    ).toEqual([]);
+    expect(ok(await service.sharesOfRecord(home, w.item.id)).shares.map((x) => x.id)).toEqual([
+      intoL2.id,
+      intoD1.id,
+    ]);
+    // A cursor without a state on a site's list is refused.
+    expect(codes(await service.sharesIntoSite(manager, w.d1, { before: intoD1.id }))).toEqual([
+      "invalid_request",
+    ]);
+  });
+
+  it("shows the manager, and only the manager, an accepted item the public can't see now, to remove it", async () => {
+    await ready();
+    const w = await world();
+    const share = await offerToD1(w, w.item.id);
+    ok(await service.acceptShare(at(w.dhs, w.dhsManager), share.id));
+    const rootAt = { organizationId: w.lib, actor: actorOf(folks.root), siteId: w.l1 };
+    const now = ok(await service.readRecord(rootAt, w.item.id));
+    ok(await service.withdraw(rootAt, w.item.id, { expectedVersion: now.version }));
+    const managed = ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1)).shares;
+    expect(managed.map((x) => [x.id, x.state, x.item])).toEqual([[share.id, "accepted", null]]);
+    // Nobody else sees it, and its view isn't readable.
+    for (const userId of [w.dhsReader, w.dhsCataloger, w.dhsManager]) {
+      expect(ok(await service.listSharedItems(at(w.dhs, userId), w.d1)).shares).toEqual([]);
+      expect(codes(await service.readSharedItem(at(w.dhs, userId), share.id))).toEqual([
+        "unknown_share",
+      ]);
+    }
+    // The manager can remove it.
+    expect(ok(await service.removeShare(at(w.dhs, w.dhsManager), share.id)).state).toBe("removed");
+    expect(ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1)).shares).toEqual([]);
+  });
+
+  it("shows only the fields the home mapping publishes, named by the home template's labels", async () => {
+    await ready();
+    const w = await world();
+    // A new version of the home template with labels of its own.
+    const field = (key: string, label: string, visibility: "public" | "staff", kind = "text") => ({
+      key,
+      label,
+      kind,
+      required: false,
+      repeatable: false,
+      visibility,
+      inherited: false,
+    });
+    ok(
+      await insertTemplateVersion(s.owner, {
+        key: "t-labelled",
+        organizationId: w.lib,
+        label: "Labelled objects",
+        appliesTo: ["object"],
+        fields: [
+          field("description", "What it is", "public"),
+          field("maker", "Who made it", "public"),
+          field("rights", "Rights", "public", "rights"),
+        ],
+      }),
+    );
+    ok(
+      await service.saveDublinCoreMapping(
+        { organizationId: w.lib, actor: actorOf(folks.root) },
+        "t-labelled",
+        // "maker" is public but not published by the mapping.
+        {
+          entries: [
+            { field: "description", term: "description" },
+            { field: "rights", term: "rights" },
+          ],
+        },
+        { expectedVersion: 0 },
+      ),
+    );
+    const made = ok(
+      await service.createRecord(at(w.lib, w.libCataloger, w.l1), {
+        kind: "object",
+        title: "Invented labelled lantern",
+        templateKey: "t-labelled",
+        fields: {
+          description: "A tin lantern.",
+          maker: "An invented tinsmith",
+          rights: { uri: "http://rightsstatements.org/vocab/InC/1.0/" },
+        },
+      }),
+    ).record;
+    ok(
+      await service.publish(
+        { organizationId: w.lib, actor: actorOf(folks.root), siteId: w.l1 },
+        made.id,
+        {
+          expectedVersion: 1,
+        },
+      ),
+    );
+    const share = await offerToD1(w, made.id);
+    ok(await service.acceptShare(at(w.dhs, w.dhsManager), share.id));
+    const seen = ok(await service.readSharedItem(at(w.dhs, w.dhsReader), share.id));
+    expect(seen.item?.fields).toEqual({
+      description: "A tin lantern.",
+      rights: { uri: "http://rightsstatements.org/vocab/InC/1.0/" },
+    });
+    expect(seen.item?.labels).toEqual({ description: "What it is", rights: "Rights" });
+    expect(JSON.stringify(seen)).not.toContain("tinsmith");
+  });
+
+  it("hides an accepted item whose home template has no stored mapping, as the public sites do", async () => {
+    await ready();
+    const w = await world();
+    ok(
+      await insertTemplateVersion(s.owner, {
+        key: "t-unmapped",
+        organizationId: w.lib,
+        label: "Unmapped objects",
+        appliesTo: ["object"],
+        fields: [
+          {
+            key: "rights",
+            label: "Rights",
+            kind: "rights",
+            required: false,
+            repeatable: false,
+            visibility: "public",
+            inherited: false,
+          },
+        ],
+      }),
+    );
+    const made = ok(
+      await service.createRecord(at(w.lib, w.libCataloger, w.l1), {
+        kind: "object",
+        title: "Invented unmapped lantern",
+        templateKey: "t-unmapped",
+        fields: { rights: { uri: "http://rightsstatements.org/vocab/InC/1.0/" } },
+      }),
+    ).record;
+    ok(
+      await service.publish(
+        { organizationId: w.lib, actor: actorOf(folks.root), siteId: w.l1 },
+        made.id,
+        {
+          expectedVersion: 1,
+        },
+      ),
+    );
+    const share = await offerToD1(w, made.id);
+    // An offer the public can't see isn't listed at all (nothing to decide on).
+    expect(ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1)).shares).toEqual([]);
+    ok(await service.acceptShare(at(w.dhs, w.dhsManager), share.id));
+    expect(
+      ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1)).shares.map((x) => x.item),
+    ).toEqual([null]);
+    expect(ok(await service.listSharedItems(at(w.dhs, w.dhsReader), w.d1)).shares).toEqual([]);
+  });
+});
+
+describe("share limits and endings (S-036b)", () => {
+  interface Row {
+    state: string;
+    decided_by: string | null;
+    decided_at: string | null;
+    ended_by: string | null;
+    ended_at: string | null;
+  }
+  const stored = async (id: string): Promise<Row | undefined> =>
+    (
+      await s.owner.rows<Row>(sql`
+        SELECT state, decided_by::text AS decided_by, decided_at::text AS decided_at,
+               ended_by::text AS ended_by, ended_at::text AS ended_at
+        FROM public.record_shares WHERE id = ${id}::uuid`)
+    )[0];
+
+  /** A published item of the Library's L1, besides the world's own. */
+  async function anotherItem(w: World, title: string): Promise<CatalogRecord> {
+    const made = ok(
+      await service.createRecord(at(w.lib, w.libCataloger, w.l1), {
+        kind: "object",
+        title,
+        templateKey: "t-object",
+        fields: {
+          description: "Invented.",
+          rights: { uri: "http://rightsstatements.org/vocab/InC/1.0/" },
+        },
+      }),
+    ).record;
+    ok(await service.publish(at(w.lib, folks.root, w.l1), made.id, { expectedVersion: 1 }));
+    return made;
+  }
+
+  it("keeps the second site's decisions when the home side deletes the item", async () => {
+    await ready();
+    const w = await world();
+    const accepted = await offer(w, { org: w.dhs, site: w.d1 });
+    ok(await service.acceptShare(at(w.dhs, w.dhsManager), accepted.id));
+    const declined = await offer(w, { org: w.lib, site: w.l2 });
+    ok(await service.declineShare(at(w.lib, w.l2Manager), declined.id));
+    const rootAt = at(w.lib, folks.root, w.l1);
+    const before = ok(await service.readRecord(rootAt, w.item.id));
+    ok(await service.withdraw(rootAt, w.item.id, { expectedVersion: before.version }));
+    const now = ok(await service.readRecord(rootAt, w.item.id));
+    ok(await service.deleteRecord(rootAt, w.item.id, { expectedVersion: now.version }));
+    // The accepted share ends as deleted, its decision kept; the declined one stays.
+    const a = await stored(accepted.id);
+    expect(a).toMatchObject({ state: "deleted", decided_by: w.dhsManager, ended_by: null });
+    expect(a?.ended_at).not.toBeNull();
+    expect(await stored(declined.id)).toMatchObject({
+      state: "declined",
+      decided_by: w.l2Manager,
+    });
+    // Still shown nowhere.
+    expect(codes(await service.readSharedItem(at(w.dhs, w.dhsManager), accepted.id))).toEqual([
+      "unknown_share",
+    ]);
+    expect(ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1)).shares).toEqual([]);
+    expect(codes(await service.removeShare(at(w.dhs, w.dhsManager), accepted.id))).toEqual([
+      "share_not_open",
+    ]);
+  });
+
+  it("ends a share when its item moves onto the second site, and doesn't bring it back", async () => {
+    await ready();
+    const w = await world();
+    const share = await offer(w, { org: w.lib, site: w.l2 });
+    ok(await service.acceptShare(at(w.lib, w.l2Manager), share.id));
+    // An offer elsewhere is untouched by the move.
+    const other = await offer(w, { org: w.dhs, site: w.d1 });
+    const rootAt = at(w.lib, folks.root, w.l1);
+    const move = async (siteId: SiteId) => {
+      const now = ok(await service.readRecord(rootAt, w.item.id));
+      ok(
+        await service.updateRecord(
+          rootAt,
+          w.item.id,
+          { ...now.record, siteId },
+          { expectedVersion: now.version },
+        ),
+      );
+    };
+    await move(w.l2);
+    expect(await stored(share.id)).toMatchObject({
+      state: "moved",
+      decided_by: w.l2Manager,
+      ended_by: null,
+    });
+    expect((await stored(other.id))?.state).toBe("offered");
+    // Back home: the old share stays ended, and L2 shows nothing.
+    await move(w.l1);
+    expect((await stored(share.id))?.state).toBe("moved");
+    expect(ok(await service.listSharedItems(at(w.lib, w.l2Manager), w.l2)).shares).toEqual([]);
+    const listed = ok(await service.sharesOfRecord(rootAt, w.item.id)).shares;
+    expect(listed.find((x) => x.id === share.id)?.state).toBe("moved");
+    // It can be offered anew.
+    const again = await offer(w, { org: w.lib, site: w.l2 });
+    expect(again.state).toBe("offered");
+  });
+
+  it("refuses moves to deleted or moved that didn't happen", async () => {
+    await ready();
+    const w = await world();
+    const share = await offer(w, { org: w.lib, site: w.l2 });
+    for (const state of ["deleted", "moved"]) {
+      await expect(
+        s.writer.execute(sql`UPDATE public.record_shares
+          SET state = ${state}, ended_at = clock_timestamp() WHERE id = ${share.id}::uuid`),
+      ).rejects.toMatchObject({ constraint: "record_shares_life" });
+    }
+    // An offer of a record that doesn't exist.
+    await expect(
+      s.writer.execute(sql`INSERT INTO public.record_shares
+            (id, organization_id, record_id, target_organization_id, target_site_id, offered_by)
+          VALUES (${newRecordId()}::uuid, ${w.lib}::uuid, ${newRecordId()}::uuid, ${w.dhs}::uuid,
+                  ${w.d1}::uuid, ${w.libCataloger}::uuid)`),
+    ).rejects.toMatchObject({ constraint: "record_shares_record" });
+  });
+
+  it("refuses offering a record again soon after the site declined it", async () => {
+    await ready();
+    const w = await world();
+    const first = await offer(w, { org: w.dhs, site: w.d1 });
+    ok(await service.declineShare(at(w.dhs, w.dhsManager), first.id));
+    const again = await service.offerRecord(at(w.lib, w.libCataloger, w.l1), {
+      recordId: w.item.id,
+      targetOrganizationId: w.dhs,
+      targetSiteId: w.d1,
+    });
+    expect(codes(again)).toEqual(["declined_recently"]);
+    // Another site may still be offered it, and a withdrawn offer doesn't count.
+    const l2 = await offer(w, { org: w.lib, site: w.l2 });
+    ok(await service.withdrawShare(at(w.lib, w.libCataloger, w.l1), l2.id));
+    expect((await offer(w, { org: w.lib, site: w.l2 })).state).toBe("offered");
+    // Once the wait is over (the decline set back by hand), it can be offered again.
+    await s.owner.transaction(async (q) => {
+      await q.execute(sql`ALTER TABLE public.record_shares DISABLE TRIGGER record_shares_check`);
+      await q.execute(sql`UPDATE public.record_shares
+        SET decided_at = now() - make_interval(days => ${String(DECLINE_COOLDOWN_DAYS)} + 1)
+        WHERE id = ${first.id}::uuid`);
+      await q.execute(
+        sql`ALTER TABLE public.record_shares ENABLE ALWAYS TRIGGER record_shares_check`,
+      );
+    });
+    expect((await offer(w, { org: w.dhs, site: w.d1 })).state).toBe("offered");
+  });
+
+  it("limits the open offers one organization has into one site", async () => {
+    await ready();
+    const w = await world();
+    // MAX_OPEN_OFFERS - 1 offers stored directly (the limit is the database's).
+    const ids: string[] = [];
+    const fillers: CatalogRecord[] = [];
+    for (let n = 0; n < MAX_OPEN_OFFERS - 1; n++) {
+      const r = await anotherItem(w, `Invented filler ${String(n)}`);
+      fillers.push(r);
+      const id = newRecordId();
+      await s.writer.execute(sql`INSERT INTO public.record_shares
+            (id, organization_id, record_id, target_organization_id, target_site_id, offered_by)
+          VALUES (${id}::uuid, ${w.lib}::uuid, ${r.id}::uuid, ${w.dhs}::uuid, ${w.d1}::uuid,
+                  ${w.libCataloger}::uuid)`);
+      ids.push(id);
+    }
+    // Two offers at the same moment for the last place: exactly one gets it.
+    const a = await anotherItem(w, "Invented lamp A");
+    const b = await anotherItem(w, "Invented lamp B");
+    const both = await Promise.all(
+      [a, b].map((r) =>
+        service.offerRecord(at(w.lib, w.libCataloger, w.l1), {
+          recordId: r.id,
+          targetOrganizationId: w.dhs,
+          targetSiteId: w.d1,
+        }),
+      ),
+    );
+    expect(both.map((r) => (r.ok ? "ok" : codes(r)[0])).sort()).toEqual(["ok", "too_many_offers"]);
+    // The world's own item is refused too, until the site answers one.
+    const offerItem = () =>
+      service.offerRecord(at(w.lib, w.libCataloger, w.l1), {
+        recordId: w.item.id,
+        targetOrganizationId: w.dhs,
+        targetSiteId: w.d1,
+      });
+    expect(codes(await offerItem())).toEqual(["too_many_offers"]);
+    // Other sites, and other organizations' offers into D1, aren't counted.
+    expect((await offer(w, { org: w.lib, site: w.l2 })).state).toBe("offered");
+    // An offer whose item the home side unpublished since no longer takes a
+    // place (the second site can't see or answer it).
+    const rootAt = at(w.lib, folks.root, w.l1);
+    const first = fillers[0];
+    if (first === undefined) throw new Error("no filler");
+    const now = ok(await service.readRecord(rootAt, first.id));
+    ok(await service.withdraw(rootAt, first.id, { expectedVersion: now.version }));
+    expect((await offerItem()).ok).toBe(true);
+    // Full again; answering one frees a place.
+    const c = await anotherItem(w, "Invented lamp C");
+    const offerItemAgain = () =>
+      service.offerRecord(at(w.lib, w.libCataloger, w.l1), {
+        recordId: c.id,
+        targetOrganizationId: w.dhs,
+        targetSiteId: w.d1,
+      });
+    expect(codes(await offerItemAgain())).toEqual(["too_many_offers"]);
+    await s.writer.execute(sql`UPDATE public.record_shares
+        SET state = 'accepted', decided_by = ${w.dhsManager}::uuid, decided_at = clock_timestamp()
+        WHERE id = ${ids[1] ?? ""}::uuid`);
+    expect((await offerItemAgain()).ok).toBe(true);
+  }, 120_000);
+
+  it("ends offers not yet answered too, when the item is moved or deleted", async () => {
+    await ready();
+    const w = await world();
+    const toL2 = await offer(w, { org: w.lib, site: w.l2 });
+    const toD1 = await offer(w, { org: w.dhs, site: w.d1 });
+    const rootAt = at(w.lib, folks.root, w.l1);
+    let now = ok(await service.readRecord(rootAt, w.item.id));
+    ok(
+      await service.updateRecord(
+        rootAt,
+        w.item.id,
+        { ...now.record, siteId: w.l2 },
+        { expectedVersion: now.version },
+      ),
+    );
+    expect(await stored(toL2.id)).toMatchObject({ state: "moved", decided_by: null });
+    expect(codes(await service.acceptShare(at(w.lib, w.l2Manager), toL2.id))).toEqual([
+      "share_not_open",
+    ]);
+    now = ok(await service.readRecord(rootAt, w.item.id));
+    ok(
+      await service.withdraw(at(w.lib, folks.root, w.l2), w.item.id, {
+        expectedVersion: now.version,
+      }),
+    );
+    now = ok(await service.readRecord(rootAt, w.item.id));
+    ok(
+      await service.deleteRecord(at(w.lib, folks.root, w.l2), w.item.id, {
+        expectedVersion: now.version,
+      }),
+    );
+    expect(await stored(toD1.id)).toMatchObject({ state: "deleted", decided_by: null });
+  });
+
+  it("refuses an offer made outside Read Committed (the limit's count needs it)", async () => {
+    await ready();
+    const w = await world();
+    await expect(
+      s.writer.transaction(async (q) => {
+        await q.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`);
+        await q.execute(sql`INSERT INTO public.record_shares
+            (id, organization_id, record_id, target_organization_id, target_site_id, offered_by)
+          VALUES (${newRecordId()}::uuid, ${w.lib}::uuid, ${w.item.id}::uuid, ${w.dhs}::uuid,
+                  ${w.d1}::uuid, ${w.libCataloger}::uuid)`);
+      }),
+    ).rejects.toMatchObject({ code: "OC061" });
+  });
+
+  it("keeps the limits in shares.ts and the migration the same", () => {
+    const text = readFileSync(
+      new URL("../../db/migrations/0043_share_limits_and_endings.sql", import.meta.url),
+      "utf8",
+    );
+    expect(text).toContain(`IF open_offers >= ${String(MAX_OPEN_OFFERS)} THEN`);
+    expect(text).toContain(
+      `d.decided_at > now() - interval '${String(DECLINE_COOLDOWN_DAYS)} days'`,
+    );
   });
 });

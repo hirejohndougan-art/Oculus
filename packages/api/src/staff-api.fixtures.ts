@@ -181,6 +181,8 @@ export async function pendingSession(
   db: Database,
   userId: UserId,
   organizationId: OrganizationId,
+  /** The session's idle limit (T-062's tests): 4 hours unless given. */
+  idleSeconds = 14400,
 ): Promise<{ token: string; sessionId: string }> {
   const token = newSessionToken();
   const id = newSessionId();
@@ -188,7 +190,7 @@ export async function pendingSession(
     INSERT INTO public.sessions (id, token_hash, user_id, organization_id, stage, signed_in_at,
       created_at, last_seen_at, rotated_at, password_at, idle_seconds, absolute_seconds, expires_at)
     SELECT ${id}::uuid, ${hashSessionToken(token)}, ${userId}::uuid, ${organizationId}::uuid,
-      'second_step', t, t, t, t, t, 14400, 43200, t + interval '10 minutes'
+      'second_step', t, t, t, t, t, ${idleSeconds}, 43200, t + interval '10 minutes'
     FROM (SELECT clock_timestamp() AS t) c`);
   return { token, sessionId: id };
 }
@@ -207,6 +209,7 @@ export async function fullSession(
   db: Database,
   userId: UserId,
   organizationId: OrganizationId,
+  idleSeconds?: number,
 ): Promise<{ token: string; sessionId: string }> {
   let factor = factors.get(userId);
   if (factor === undefined) {
@@ -215,7 +218,7 @@ export async function fullSession(
   }
   const code = factor.codes.pop();
   if (code === undefined) throw new Error("out of test recovery codes");
-  const waiting = await pendingSession(db, userId, organizationId);
+  const waiting = await pendingSession(db, userId, organizationId, idleSeconds);
   sources += 1;
   const done = await completeSecondStep(db, keys, waiting.token, {
     recoveryCode: code,

@@ -12,7 +12,10 @@ import { newRecordId, newSiteId } from "@oculus/core";
 import {
   grantPublicReaderRole,
   insertTemplateVersion,
+  isDatabaseTimeout,
   listPublishedForOai,
+  oaiRepository,
+  oaiStoredStamp,
   openDatabase,
   sql,
   type Database,
@@ -24,8 +27,15 @@ import { FAKE_TEST_SECRET_KEY } from "../../db/src/second-factor.fixtures.js";
 import { loadAdminFiles } from "./admin-files.js";
 import { buildAdminServer } from "./admin-server.js";
 import { OAI_PMH_PROLOGUE, isFileReply, oaiPmhReply } from "./file-replies.js";
-import { OAI_PAGE_SIZE, oaiAdminEmail, oaiPmhRoutes } from "./oai-pmh.js";
+import {
+  OAI_MAX_SLOTS,
+  OAI_PAGE_SIZE,
+  oaiAdminEmail,
+  oaiPmhRoutes,
+  oaiPoolOptions,
+} from "./oai-pmh.js";
 import { ReadSlots } from "./public-api.js";
+import { PublicSubjects } from "./public-subjects.js";
 import { checkPublicSites } from "./public-sites.js";
 import { buildServer } from "./server.js";
 import { actorOf, makeObject, makeWorld, ok, publishAs, type World } from "./staff-api.fixtures.js";
@@ -45,6 +55,7 @@ let draft: string;
 let otherSite: string;
 let otherOrg: string;
 let unmapped: string;
+let stamps: PublicSubjects;
 const more: string[] = [];
 
 async function withRole(q: Queryable, statement: string, role: string): Promise<void> {
@@ -55,6 +66,9 @@ async function withRole(q: Queryable, statement: string, role: string): Promise<
   END $$`);
 }
 
+// The admin server needs a files folder (D-086); one of this file's own.
+const filesDir = mkdtempSync(join(tmpdir(), "oculus-t050c-files-"));
+
 function envFor(extra: Record<string, string> = {}): Record<string, string> {
   return {
     NODE_ENV: "development",
@@ -62,6 +76,7 @@ function envFor(extra: Record<string, string> = {}): Record<string, string> {
     OCULUS_ADMIN_ORIGIN: ADMIN,
     OCULUS_SECRET_KEY: FAKE_TEST_SECRET_KEY,
     OCULUS_PUBLIC_SITES: `${PUBLIC}=${w.a1}`,
+    OCULUS_FILES_DIR: filesDir,
     ...extra,
   };
 }
@@ -157,11 +172,15 @@ beforeAll(async () => {
       rateLimits: { oai: 10_000 },
     }),
   });
+  // The background pass that stores the datestamps (S-041), as admin-server runs it.
+  stamps = new PublicSubjects({ db: w.db, sites, oaiStamps: true, minGapMs: 0 });
+  await stamps.check();
 }, 240_000);
 
 afterAll(async () => {
   await app.close();
   rmSync(dir, { recursive: true, force: true });
+  rmSync(filesDir, { recursive: true, force: true });
   await reader.close();
   await w.db.close();
   await w.testDb.drop();
@@ -200,7 +219,7 @@ describe("GET /oai on a public host", () => {
     expect(reply.body).toContain('<request verb="Identify">http://127.0.0.1/oai</request>');
     expect(reply.body).toContain("<repositoryName>Invented archive site</repositoryName>");
     expect(reply.body).toContain(`<adminEmail>${EMAIL}</adminEmail>`);
-    expect(reply.body).toContain("<deletedRecord>no</deletedRecord>");
+    expect(reply.body).toContain("<deletedRecord>transient</deletedRecord>");
     expect(reply.body).toContain("<granularity>YYYY-MM-DDThh:mm:ssZ</granularity>");
     expect(reply.body).toMatch(
       /<earliestDatestamp>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ<\/earliestDatestamp>/,
@@ -419,9 +438,21 @@ describe("GET /oai on a public host", () => {
   });
 
   it("buildAdminServer mounts it with OCULUS_OAI_ADMIN_EMAIL only, and refuses a malformed one", async () => {
+    // Without the background counts' pool the lists would stay empty: refused.
+    await expect(
+      buildAdminServer({
+        db: w.db,
+        publicDb: reader,
+        env: envFor({ OCULUS_OAI_ADMIN_EMAIL: EMAIL }),
+        adminFiles: loadAdminFiles(dir),
+        log: () => undefined,
+      }),
+    ).rejects.toThrow(/countsDb/);
+    const counts = openDatabase(w.testDb.url, { max: 1 });
     const mounted = await buildAdminServer({
       db: w.db,
       publicDb: reader,
+      countsDb: counts,
       env: envFor({ OCULUS_OAI_ADMIN_EMAIL: EMAIL }),
       adminFiles: loadAdminFiles(dir),
       log: () => undefined,
@@ -435,6 +466,7 @@ describe("GET /oai on a public host", () => {
       expect((await oai("verb=Identify", "localhost", mounted)).statusCode).toBe(404);
     } finally {
       await mounted.close();
+      await counts.close();
     }
     const plain = await buildAdminServer({
       db: w.db,
@@ -527,6 +559,176 @@ describe("GET /oai on a public host", () => {
   });
 });
 
+describe("stored datestamps (S-041, D-108)", () => {
+  const storedStamps = async () =>
+    new Map(
+      (
+        await w.db.rows<{ id: string; stamp: string; deleted: boolean }>(sql`
+          SELECT record_id::text AS id, stamp::text AS stamp, deleted FROM public.oai_datestamps
+          WHERE organization_id = ${w.a}::uuid AND site_id = ${w.a1}::uuid`)
+      ).map((r) => [r.id, r]),
+    );
+
+  it("stores a row only for records the site showed", async () => {
+    const rows = await storedStamps();
+    expect(rows.has(published)).toBe(true);
+    for (const id of [draft, unmapped, otherSite, otherOrg]) expect(rows.has(id)).toBe(false);
+  });
+
+  it("a pass after a change that doesn't alter a record's oai_dc keeps its datestamp", async () => {
+    const before = await storedStamps();
+    await makeObject(w, w.a, w.a1, "An invented draft that changes nothing public");
+    await stamps.check();
+    const after = await storedStamps();
+    expect(after.get(published)?.stamp).toBe(before.get(published)?.stamp);
+  });
+
+  it("a change to what the public sees moves every affected record's datestamp", async () => {
+    const before = await storedStamps();
+    // The template's mapping no longer shows the note: every object's oai_dc changes.
+    ok(
+      await w.service.saveDublinCoreMapping(
+        { organizationId: w.a, actor: actorOf(w.root) },
+        "t-object",
+        { entries: [{ field: "rights", term: "rights" }] },
+        { expectedVersion: 2, confirmPublished: true },
+      ),
+    );
+    await stamps.check();
+    const after = await storedStamps();
+    expect(after.get(published)?.stamp).not.toBe(before.get(published)?.stamp);
+  });
+
+  it("a record that stops being shown gets a deleted header, in lists and GetRecord", async () => {
+    const gone = more[0] ?? "";
+    ok(
+      await w.service.withdraw({ organizationId: w.a, actor: actorOf(w.root) }, gone as never, {
+        expectedVersion: 2,
+      }),
+    );
+    await stamps.check();
+    const get = await oai(`verb=GetRecord&metadataPrefix=oai_dc&identifier=${PREFIX}${gone}`);
+    expect(get.body).toContain(
+      `<header status="deleted"><identifier>${PREFIX}${gone}</identifier>`,
+    );
+    expect(get.body).not.toContain("<metadata>");
+    let all = "";
+    let reply = await oai("verb=ListRecords&metadataPrefix=oai_dc");
+    all += reply.body;
+    let token = tokenIn(reply.body);
+    while (token !== undefined) {
+      reply = await oai(`verb=ListRecords&resumptionToken=${token}`);
+      all += reply.body;
+      token = tokenIn(reply.body);
+    }
+    expect(all).toContain(`<header status="deleted"><identifier>${PREFIX}${gone}</identifier>`);
+    // A record never shown is still unknown, never "deleted".
+    const never = await oai(`verb=GetRecord&metadataPrefix=oai_dc&identifier=${PREFIX}${draft}`);
+    expect(errorCode(never.body)).toBe("idDoesNotExist");
+    // Marked records are still known to ListMetadataFormats, and a `from`
+    // after the mark leaves it out.
+    const formats = await oai(`verb=ListMetadataFormats&identifier=${PREFIX}${gone}`);
+    expect(errorCode(formats.body)).toBeUndefined();
+    const later = await oai("verb=ListIdentifiers&metadataPrefix=oai_dc&from=2999-01-01");
+    expect(errorCode(later.body)).toBe("noRecordsMatch");
+  });
+
+  it("a record shown again loses its mark and gets a later datestamp", async () => {
+    const back = more[0] ?? "";
+    const before = (await storedStamps()).get(back);
+    expect(before?.deleted).toBe(true);
+    await publishAs(w, w.a, back, 3);
+    await stamps.check();
+    const after = (await storedStamps()).get(back);
+    expect(after?.deleted).toBe(false);
+    expect(Date.parse(after?.stamp ?? "")).toBeGreaterThan(Date.parse(before?.stamp ?? ""));
+    const get = await oai(`verb=GetRecord&metadataPrefix=oai_dc&identifier=${PREFIX}${back}`);
+    expect(get.body).toContain("<metadata>");
+    expect(get.body).not.toContain('status="deleted"');
+  });
+
+  it("a record no longer shown is skipped until the pass marks it, and one restored first keeps its datestamp (S-047)", async () => {
+    const quiet = more[1] ?? "";
+    const before = (await storedStamps()).get(quiet);
+    ok(
+      await w.service.withdraw({ organizationId: w.a, actor: actorOf(w.root) }, quiet as never, {
+        expectedVersion: 2,
+      }),
+    );
+    // No pass yet: skipped, never a deleted header at its old datestamp.
+    const listAll = async () => {
+      let all = "";
+      let reply = await oai("verb=ListIdentifiers&metadataPrefix=oai_dc");
+      all += reply.body;
+      let token = tokenIn(reply.body);
+      while (token !== undefined) {
+        reply = await oai(`verb=ListIdentifiers&resumptionToken=${token}`);
+        all += reply.body;
+        token = tokenIn(reply.body);
+      }
+      return all;
+    };
+    expect(await listAll()).not.toContain(quiet);
+    const get = await oai(`verb=GetRecord&metadataPrefix=oai_dc&identifier=${PREFIX}${quiet}`);
+    expect(errorCode(get.body)).toBe("idDoesNotExist");
+    // Restored before the next pass: shown again, same oai_dc, same datestamp,
+    // and no harvester was ever told it was deleted.
+    await publishAs(w, w.a, quiet, 3);
+    await stamps.check();
+    const after = (await storedStamps()).get(quiet);
+    expect(after).toEqual(before);
+    expect(await listAll()).toContain(`<identifier>${PREFIX}${quiet}</identifier>`);
+  });
+
+  it("before a site's first pass, GetRecord gives the site's lower bound, never a staff save time (S-046)", async () => {
+    const second = "http://127.0.0.1:8081";
+    const sites = await checkPublicSites(w.db, reader, [{ origin: second, siteId: w.a2 }]);
+    const fresh = await buildServer({
+      env: { OCULUS_ORIGINS: second },
+      routes: oaiPmhRoutes({
+        db: w.db,
+        publicDb: reader,
+        sites,
+        adminEmail: EMAIL,
+        rateLimits: { oai: 10_000 },
+      }),
+    });
+    try {
+      const identify = await oai("verb=Identify", "127.0.0.1:8081", fresh);
+      const earliest = /<earliestDatestamp>([^<]+)</.exec(identify.body)?.[1];
+      const get = await oai(
+        `verb=GetRecord&metadataPrefix=oai_dc&identifier=oai:127.0.0.1:${otherSite}`,
+        "127.0.0.1:8081",
+        fresh,
+      );
+      expect(get.body).toContain("<metadata>");
+      expect(earliest).toBeDefined();
+      expect(get.body).toContain(`<datestamp>${earliest ?? ""}</datestamp>`);
+      // Its lists are empty until the pass.
+      const list = await oai("verb=ListIdentifiers&metadataPrefix=oai_dc", "127.0.0.1:8081", fresh);
+      expect(errorCode(list.body)).toBe("noRecordsMatch");
+    } finally {
+      await fresh.close();
+    }
+  });
+
+  it("list reads take a bounded time limit, and OAI-PMH's own pool waits a bounded time (S-051)", async () => {
+    await expect(
+      listPublishedForOai(w.db, w.a, w.a1, { limit: 5, timeLimitMs: 0 }),
+    ).rejects.toThrow(TypeError);
+    await expect(
+      listPublishedForOai(w.db, w.a, w.a1, { limit: 5, timeLimitMs: 600_000 }),
+    ).rejects.toThrow(TypeError);
+    expect(
+      (await listPublishedForOai(w.db, w.a, w.a1, { limit: 5, timeLimitMs: 2000 })).length,
+    ).toBe(5);
+    const pool = oaiPoolOptions();
+    expect(pool.max).toBe(OAI_MAX_SLOTS);
+    expect(pool.connectionTimeoutMillis).toBeGreaterThan(0);
+    expect(pool.queryTimeoutMillis).toBeGreaterThan(60_000);
+  });
+});
+
 describe("oaiPmhReply", () => {
   const good = `${OAI_PMH_PROLOGUE}>\n<responseDate>2026-11-25T00:00:00Z</responseDate>\n</OAI-PMH>\n`;
 
@@ -545,6 +747,320 @@ describe("oaiPmhReply", () => {
       good.replace(/<\/OAI-PMH>\n$/, ""),
     ]) {
       expect(() => oaiPmhReply(bad)).toThrow();
+    }
+  });
+
+  it("a GetRecord stalled past its time limit is 503 busy with Retry-After (S-037)", async () => {
+    const sites = await checkPublicSites(w.db, reader, [{ origin: PUBLIC, siteId: w.a1 }]);
+    const logged: unknown[] = [];
+    const limited = await buildServer({
+      env: { OCULUS_ORIGINS: PUBLIC },
+      routes: oaiPmhRoutes({
+        db: w.db,
+        publicDb: reader,
+        sites,
+        adminEmail: EMAIL,
+        rateLimits: { oai: 10_000 },
+        timeLimitMs: 200,
+        log: (r) => logged.push(r),
+      }),
+    });
+    // Something holds the records table, so a public snapshot would wait as long as it is held.
+    const owner = openDatabase(w.testDb.url, { max: 1 });
+    let release: () => void = () => undefined;
+    let locked: () => void = () => undefined;
+    const holding = new Promise<void>((resolve) => {
+      locked = resolve;
+    });
+    const held = owner.transaction(async (q) => {
+      await q.execute(sql`LOCK TABLE public.records IN ACCESS EXCLUSIVE MODE`);
+      locked();
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    });
+    const query = `verb=GetRecord&metadataPrefix=oai_dc&identifier=${PREFIX}${published}`;
+    try {
+      await holding;
+      const reply = await oai(query, "127.0.0.1", limited);
+      expect(reply.statusCode).toBe(503);
+      expect(reply.headers["retry-after"]).toBe("5");
+      expect(reply.json()).toEqual({ error: "busy" });
+      expect(logged).toEqual([{ event: "service_error", operation: "oaiPmh", name: "timeout" }]);
+    } finally {
+      release();
+      await held;
+      await owner.close();
+    }
+    try {
+      // The slots were given back and the lock is gone: the same request works.
+      const again = await oai(query, "127.0.0.1", limited);
+      expect(again.statusCode).toBe(200);
+      expect(errorCode(again.body)).toBeUndefined();
+    } finally {
+      await limited.close();
+    }
+  });
+
+  it("a list page out of reading time ends early with a token, and the list is still whole (S-037)", async () => {
+    const sites = await checkPublicSites(w.db, reader, [{ origin: PUBLIC, siteId: w.a1 }]);
+    const hurried = await buildServer({
+      env: { OCULUS_ORIGINS: PUBLIC },
+      routes: oaiPmhRoutes({
+        db: w.db,
+        publicDb: reader,
+        sites,
+        adminEmail: EMAIL,
+        rateLimits: { oai: 10_000 },
+        pageTimeLimitMs: 1,
+      }),
+    });
+    try {
+      const seen: string[] = [];
+      let reply = await oai("verb=ListIdentifiers&metadataPrefix=oai_dc", "127.0.0.1", hurried);
+      // A short page (at least one record is read per page, so the list moves on).
+      expect(identifiers(reply.body).length).toBeLessThan(2);
+      expect(tokenIn(reply.body)).toBeDefined();
+      seen.push(...identifiers(reply.body));
+      let token = tokenIn(reply.body);
+      let pages = 1;
+      while (token !== undefined) {
+        reply = await oai(`verb=ListIdentifiers&resumptionToken=${token}`, "127.0.0.1", hurried);
+        expect(errorCode(reply.body)).toBeUndefined();
+        seen.push(...identifiers(reply.body));
+        token = tokenIn(reply.body);
+        pages += 1;
+        expect(pages).toBeLessThan(100);
+      }
+      expect(pages).toBeGreaterThan(2);
+      expect(new Set(seen).size).toBe(seen.length);
+      expect(seen.sort()).toEqual([published, ...more].map((id) => `${PREFIX}${id}`).sort());
+    } finally {
+      await hurried.close();
+    }
+  });
+
+  it("refuses time limits it couldn't use when the routes are built (S-037)", () => {
+    const base = { db: w.db, publicDb: reader, sites: [], adminEmail: EMAIL };
+    for (const bad of [0, -1, 1.5, 60_001, Number.NaN]) {
+      expect(() => oaiPmhRoutes({ ...base, timeLimitMs: bad })).toThrow(RangeError);
+    }
+    for (const bad of [0, 1.5, 120_001]) {
+      expect(() => oaiPmhRoutes({ ...base, pageTimeLimitMs: bad })).toThrow(RangeError);
+    }
+    expect(() => oaiPmhRoutes({ ...base, timeLimitMs: 200, pageTimeLimitMs: 1 })).not.toThrow();
+  });
+
+  it("a read that runs out of time mid-page ends the page before it; the list stays whole (S-037)", async () => {
+    const sites = await checkPublicSites(w.db, reader, [{ origin: PUBLIC, siteId: w.a1 }]);
+    // The public reader, but its 3rd and 30th reads are cancelled by the time limit.
+    let reads = 0;
+    const flaky: Database = {
+      ...reader,
+      transaction: (work) => {
+        reads += 1;
+        if (reads === 3 || reads === 30) {
+          return Promise.reject(
+            Object.assign(new Error("canceling statement due to statement timeout"), {
+              code: "57014",
+            }),
+          );
+        }
+        return reader.transaction(work);
+      },
+    };
+    const logged: unknown[] = [];
+    const routes = await buildServer({
+      env: { OCULUS_ORIGINS: PUBLIC },
+      routes: oaiPmhRoutes({
+        db: w.db,
+        publicDb: flaky,
+        sites,
+        adminEmail: EMAIL,
+        rateLimits: { oai: 10_000 },
+        log: (r) => logged.push(r),
+      }),
+    });
+    try {
+      const seen: string[] = [];
+      let reply = await oai("verb=ListIdentifiers&metadataPrefix=oai_dc", "127.0.0.1", routes);
+      // Two reads, then the third timed out: the page ends with a token.
+      expect(reply.statusCode).toBe(200);
+      expect(identifiers(reply.body).length).toBeLessThanOrEqual(2);
+      expect(tokenIn(reply.body)).toBeDefined();
+      seen.push(...identifiers(reply.body));
+      let token = tokenIn(reply.body);
+      let pages = 1;
+      while (token !== undefined) {
+        reply = await oai(`verb=ListIdentifiers&resumptionToken=${token}`, "127.0.0.1", routes);
+        expect(reply.statusCode).toBe(200);
+        expect(errorCode(reply.body)).toBeUndefined();
+        seen.push(...identifiers(reply.body));
+        token = tokenIn(reply.body);
+        pages += 1;
+        expect(pages).toBeLessThan(10);
+      }
+      expect(pages).toBeGreaterThan(2);
+      expect(new Set(seen).size).toBe(seen.length);
+      expect(seen.sort()).toEqual([published, ...more].map((id) => `${PREFIX}${id}`).sort());
+      // Handled inside the page: nothing was a failure.
+      expect(logged).toEqual([]);
+      // A page whose first read runs out of time is the request's 503 busy.
+      reads = 29;
+      const first = await oai("verb=ListIdentifiers&metadataPrefix=oai_dc", "127.0.0.1", routes);
+      expect(first.statusCode).toBe(503);
+      expect(first.json()).toEqual({ error: "busy" });
+    } finally {
+      await routes.close();
+    }
+  });
+});
+
+describe("the staff connection's time limits and the page clock (S-043a)", () => {
+  /**
+   * Holds `table` in ACCESS EXCLUSIVE mode from another connection, letting
+   * go by itself after `giveUpMs` so a missing time limit fails the test
+   * (an unbounded read just waits that long and succeeds) instead of hanging it.
+   */
+  async function hold(table: "sites" | "oai_datestamps", giveUpMs = 4_000) {
+    const owner = openDatabase(w.testDb.url, { max: 1 });
+    let release: () => void = () => undefined;
+    let locked: () => void = () => undefined;
+    const holding = new Promise<void>((resolve) => {
+      locked = resolve;
+    });
+    const held = owner.transaction(async (q) => {
+      await q.execute(
+        table === "sites"
+          ? sql`LOCK TABLE public.sites IN ACCESS EXCLUSIVE MODE`
+          : sql`LOCK TABLE public.oai_datestamps IN ACCESS EXCLUSIVE MODE`,
+      );
+      locked();
+      await new Promise<void>((resolve) => {
+        release = resolve;
+        setTimeout(resolve, giveUpMs);
+      });
+    });
+    await holding;
+    return {
+      async end() {
+        release();
+        await held;
+        await owner.close();
+      },
+    };
+  }
+
+  async function limitedServer(
+    logged: unknown[],
+    extra: { clock?: () => number; pageTimeLimitMs?: number } = {},
+  ) {
+    const sites = await checkPublicSites(w.db, reader, [{ origin: PUBLIC, siteId: w.a1 }]);
+    return buildServer({
+      env: { OCULUS_ORIGINS: PUBLIC },
+      routes: oaiPmhRoutes({
+        db: w.db,
+        publicDb: reader,
+        sites,
+        adminEmail: EMAIL,
+        rateLimits: { oai: 10_000 },
+        timeLimitMs: 200,
+        log: (r) => logged.push(r),
+        ...extra,
+      }),
+    });
+  }
+
+  it("Identify with the staff database stalled is 503 busy within the time limit", async () => {
+    const logged: unknown[] = [];
+    const server = await limitedServer(logged);
+    const lock = await hold("sites");
+    try {
+      const started = Date.now();
+      const reply = await oai("verb=Identify", "127.0.0.1", server);
+      expect(Date.now() - started).toBeLessThan(3_000);
+      expect([reply.statusCode, reply.headers["retry-after"], reply.json()]).toEqual([
+        503,
+        "5",
+        { error: "busy" },
+      ]);
+      expect(logged).toEqual([{ event: "service_error", operation: "oaiPmh", name: "timeout" }]);
+    } finally {
+      await lock.end();
+    }
+    try {
+      // The slots were given back: the same request works once the lock is gone.
+      const again = await oai("verb=Identify", "127.0.0.1", server);
+      expect(again.statusCode).toBe(200);
+      expect(again.body).toContain("<Identify>");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("GetRecord with the stored datestamps stalled is 503 busy within the time limit", async () => {
+    const logged: unknown[] = [];
+    const server = await limitedServer(logged);
+    const query = `verb=GetRecord&metadataPrefix=oai_dc&identifier=${PREFIX}${published}`;
+    const lock = await hold("oai_datestamps");
+    try {
+      const started = Date.now();
+      const reply = await oai(query, "127.0.0.1", server);
+      expect(Date.now() - started).toBeLessThan(3_000);
+      expect([reply.statusCode, reply.json()]).toEqual([503, { error: "busy" }]);
+      expect(logged).toEqual([{ event: "service_error", operation: "oaiPmh", name: "timeout" }]);
+    } finally {
+      await lock.end();
+    }
+    try {
+      const again = await oai(query, "127.0.0.1", server);
+      expect(again.statusCode).toBe(200);
+      expect(again.body).toContain("<metadata>");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("the staff reads take only time limits they can use, and time out as timeouts", async () => {
+    for (const bad of [0, -1, 1.5, 60_001, Number.NaN]) {
+      await expect(oaiRepository(w.db, w.a, w.a1, { timeLimitMs: bad })).rejects.toThrow(
+        RangeError,
+      );
+    }
+    const lock = await hold("oai_datestamps");
+    try {
+      const thrown = await oaiStoredStamp(w.db, w.a, w.a1, published, { timeLimitMs: 100 }).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      expect(isDatabaseTimeout(thrown)).toBe(true);
+    } finally {
+      await lock.end();
+    }
+    expect((await oaiStoredStamp(w.db, w.a, w.a1, published))?.deleted).toBe(false);
+  });
+
+  it("a list page's reading time runs on the routes' clock", async () => {
+    // A stopped clock: however long the reads take, the page is never out of time.
+    const stopped = await limitedServer([], { clock: () => 5_000_000, pageTimeLimitMs: 1 });
+    try {
+      const reply = await oai("verb=ListIdentifiers&metadataPrefix=oai_dc", "127.0.0.1", stopped);
+      expect(identifiers(reply.body)).toHaveLength(OAI_PAGE_SIZE);
+    } finally {
+      await stopped.close();
+    }
+    // A clock that jumps a minute at every look: out of time after the first read.
+    let now = 5_000_000;
+    const racing = await limitedServer([], {
+      clock: () => (now += 60_000),
+      pageTimeLimitMs: 120_000,
+    });
+    try {
+      const reply = await oai("verb=ListIdentifiers&metadataPrefix=oai_dc", "127.0.0.1", racing);
+      expect(identifiers(reply.body).length).toBeLessThanOrEqual(2);
+      expect(tokenIn(reply.body)).toBeDefined();
+    } finally {
+      await racing.close();
     }
   });
 });

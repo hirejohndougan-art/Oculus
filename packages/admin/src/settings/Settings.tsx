@@ -8,6 +8,8 @@
  *   (TemplateEditor.tsx).
  * - **Sign-in rules:** how long a session may sit unused and how long it
  *   lasts at most (`/api/system-settings`, with the version it started from).
+ * - **Virus scanning:** whether uploads are scanned, and scanning every
+ *   file again (FileScans.tsx, S-040).
  *
  * The server decides who may (system managers only) and needs a recent
  * sign-in for every change; these screens only hide themselves from anyone
@@ -117,8 +119,18 @@ export function SettingsLayout() {
             </NavLink>
           </li>
           <li>
+            <NavLink className={styles.tab} to="/settings/files">
+              Virus scanning
+            </NavLink>
+          </li>
+          <li>
             <NavLink className={styles.tab} to="/settings/updates">
               Updates
+            </NavLink>
+          </li>
+          <li>
+            <NavLink className={styles.tab} to="/settings/removed-files">
+              Removed files
             </NavLink>
           </li>
         </ul>
@@ -446,7 +458,7 @@ function SignInForm(props: {
             value={idle}
             onChange={setIdle}
             isRequired
-            help="5 to 720 minutes. No longer than the limit beside it."
+            help="5 to 720 minutes (30 by default). A warning shows a minute before. No longer than the limit beside it."
           />
           <TextInput
             label="Sign out after this many minutes in all"

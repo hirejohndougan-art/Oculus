@@ -97,6 +97,10 @@
   background: var(--pill-amber-bg);
   color: var(--pill-amber-text);
 }
+.red {
+  background: var(--pill-red-bg);
+  color: var(--pill-red-text);
+}
 .empty {
   padding: 28px;
   background: var(--surface);
@@ -324,4 +328,130 @@
   background: var(--pill-red-text);
   color: #ffffff;
   border: 0;
+}
+/* A digital asset's files (M-002): uploads in progress, then the list. */
+.uploads {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.upload {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(120px, 240px) auto auto;
+  align-items: center;
+  gap: 12px;
+}
+.uploadName {
+  overflow-wrap: anywhere;
+}
+/* DESIGN.md's bar: --bar-fill on --bar-track. */
+.progress {
+  width: 100%;
+  height: 10px;
+  appearance: none;
+  border: 0;
+  border-radius: 5px;
+  background: var(--bar-track);
+  color: var(--bar-fill);
+}
+.progress::-webkit-progress-bar {
+  background: var(--bar-track);
+  border-radius: 5px;
+}
+.progress::-webkit-progress-value {
+  background: var(--bar-fill);
+  border-radius: 5px;
+}
+.progress::-moz-progress-bar {
+  background: var(--bar-fill);
+  border-radius: 5px;
+}
+/* Viewing and downloading files (M-003): thumbnails, the actions and the viewer. */
+.thumbButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 88px;
+  height: 66px;
+  padding: 0;
+  background: var(--placeholder-fill);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  cursor: pointer;
+  overflow: hidden;
+}
+.thumbButton[data-focus-visible] {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+.thumb {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+}
+.thumbPlaceholder {
+  font: 600 var(--size-caption) var(--font-body);
+  color: var(--placeholder-text);
+}
+.fileActions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 16px;
+}
+.downloadLink {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  font: var(--size-small) var(--font-body);
+  color: var(--link);
+  text-decoration: underline;
+}
+.downloadLink:hover {
+  color: var(--link-hover);
+}
+.viewerDialog {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px;
+  background: var(--surface);
+  border: 2px solid var(--frame-charcoal);
+  border-radius: var(--radius-card);
+}
+.viewerDialog:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+.viewerHeader {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px 16px;
+  overflow-wrap: anywhere;
+}
+.viewerStage {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 200px;
+  background: var(--surface-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+}
+.viewerImage {
+  display: block;
+  max-width: 100%;
+  max-height: 70vh;
+  object-fit: contain;
+}
+.viewerControls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 14px;
 }

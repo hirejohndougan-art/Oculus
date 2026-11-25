@@ -94,7 +94,11 @@ test("a system manager invites, grants a role, resets two-step sign-in and reads
   await typeInto(page.getByLabel("Email"), rootEmail);
   await typeInto(page.getByLabel("Password"), password);
   await press(page.getByRole("button", { name: "Sign in" }));
-  await press(page.getByRole("button", { name: "Start setting up" }));
+  // The button is disabled until the waiting sign-in's state has loaded; a
+  // press before then is lost (seen in the gate).
+  const start = page.getByRole("button", { name: "Start setting up" });
+  await expect(start).toBeEnabled();
+  await press(start);
   const key = (await page.locator("code").first().textContent()) ?? "";
   const secret = decodeBase32(key.replace(/\s+/g, ""));
   if (secret === undefined) throw new Error("the key on the page isn't base32");

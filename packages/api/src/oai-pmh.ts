@@ -23,26 +23,30 @@
  * (in arguments) or dropped (in stored names).
  *
  * Choices (D-105): identifiers `oai:<host>:<record ID>`; datestamps to the
- * second; `deletedRecord` `no`; no sets; GET only (rule 5 needs an `Origin`
+ * second, stored (S-041, D-108); `deletedRecord` `transient`; no sets; GET only (rule 5 needs an `Origin`
  * on POST); sealed resumption tokens of 25 records; each client address
  * may make `DEFAULT_RATE_LIMITS.oai` requests a minute (429 with
  * `Retry-After`), and a request holds one of the public pool's slots for
  * its whole page, OAI-PMH at most `OAI_MAX_SLOTS` of them (503 `busy` with
- * `Retry-After` when none is free).
+ * `Retry-After` when none is free). A read past its time limit (each
+ * public read's `statement_timeout`, the public pool's wait for a
+ * connection; S-037; the staff connection's statements, S-043a) is the same
+ * `503 busy`. A list page's reading time runs on the routes' `clock`.
  */
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { isRecordId } from "@oculus/core";
 import {
+  isDatabaseTimeout,
   listPublishedForOai,
-  oaiDatestamp,
   oaiRepository,
+  oaiStoredStamp,
   readPublicRecord,
   type Database,
   type OaiCandidate,
 } from "@oculus/db";
 import { Refusal } from "./errors.js";
 import { oaiPmhReply, OAI_PMH_PROLOGUE } from "./file-replies.js";
-import { clientKey, originOf, ReadSlots } from "./public-api.js";
+import { checkTimeLimit, clientKey, originOf, publicPoolOptions, ReadSlots } from "./public-api.js";
 import type { PublicSite } from "./public-sites.js";
 import { DEFAULT_RATE_LIMITS, SessionRateLimiter, type RateBucket } from "./rate-limit.js";
 import type { OculusRequest, OculusReply, OculusRoute } from "./routes.js";
@@ -55,8 +59,32 @@ export const OAI_ADMIN_EMAIL_ENV = "OCULUS_OAI_ADMIN_EMAIL";
 export const OAI_PAGE_SIZE = 25;
 /** The most listed records one request reads, shown or held back. */
 export const OAI_MAX_SCAN = 200;
+/**
+ * How long one list page may spend reading records (S-037). Past it the page
+ * ends with what it has and a resumption token, so a slow database can't keep
+ * a harvest in a slot for `OAI_MAX_SCAN` reads; at least one is always read.
+ */
+export const OAI_PAGE_TIME_LIMIT_MS = 15_000;
+/** The longest one list read may take (the page's first; later ones get what is left). */
+const LIST_READ_LIMIT_MS = 30_000;
+
 /** The most of the public pool's slots OAI-PMH holds at once. */
 export const OAI_MAX_SLOTS = 2;
+
+/**
+ * The options for OAI-PMH's own pool on the staff role (S-051): one
+ * connection per OAI slot, a bounded wait for one (then `503 busy`, as the
+ * public pool), and the client-side query limit, so a request holding an
+ * OAI slot and a shared public slot never waits without end.
+ */
+export function oaiPoolOptions(): {
+  applicationName: string;
+  max: number;
+  connectionTimeoutMillis: number;
+  queryTimeoutMillis: number;
+} {
+  return { ...publicPoolOptions(OAI_MAX_SLOTS), applicationName: "oculus-oai" };
+}
 
 const OAI_NS = "http://www.openarchives.org/OAI/2.0/";
 const OAI_SCHEMA = "http://www.openarchives.org/OAI/2.0/OAI-PMH.xsd";
@@ -77,6 +105,14 @@ export interface OaiPmhOptions {
   readonly clock?: () => number;
   /** The public pool's slots, shared with `GET /records/:id`. */
   readonly slots?: ReadSlots;
+  /**
+   * Each read's statement time limit (S-037): every record read through the
+   * public reader, and the staff connection's one-record reads and
+   * Identify's (S-043a). Their defaults (5 s) when left out.
+   */
+  readonly timeLimitMs?: number;
+  /** A list page's reading time (S-037); `OAI_PAGE_TIME_LIMIT_MS` when left out. */
+  readonly pageTimeLimitMs?: number;
 }
 
 /** An address fit for `adminEmail`, or undefined: plain, short, nothing XML must escape. */
@@ -367,6 +403,11 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
   const slots = options.slots ?? new ReadSlots(4);
   // OAI-PMH may hold at most two of the shared slots, so harvests (each
   // up to OAI_MAX_SCAN reads) never leave `GET /records/:id` without one.
+  checkTimeLimit(options.timeLimitMs);
+  const pageTimeLimitMs = options.pageTimeLimitMs ?? OAI_PAGE_TIME_LIMIT_MS;
+  if (!Number.isInteger(pageTimeLimitMs) || pageTimeLimitMs < 1 || pageTimeLimitMs > 120_000) {
+    throw new RangeError("pageTimeLimitMs must be a whole number from 1 to 120000");
+  }
   const oaiSlots = new ReadSlots(Math.max(1, Math.min(OAI_MAX_SLOTS, slots.size - 1)));
   const tokens = new TokenSeal();
   const adminEmail = oaiAdminEmail(options.adminEmail);
@@ -378,12 +419,28 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
     if (!isRecordId(id)) return undefined;
     const result = await readPublicRecord(options.publicDb, site.organizationId, site.siteId, id, {
       baseUrl: `${site.origin}/records/`,
+      ...(options.timeLimitMs === undefined ? {} : { timeLimitMs: options.timeLimitMs }),
     });
     return result.ok ? result.value : undefined;
   }
 
-  function header(host: string, id: string, stamp: string): string {
-    return `<header>${element("identifier", identifierFor(host, id))}${element("datestamp", secondsOf(stamp))}</header>`;
+  function header(host: string, id: string, stamp: string, deleted = false): string {
+    return `<header${deleted ? ' status="deleted"' : ""}>${element("identifier", identifierFor(host, id))}${element("datestamp", secondsOf(stamp))}</header>`;
+  }
+
+  /** The staff reads' time limit (S-043a), as the public reads'. */
+  const staffRead = options.timeLimitMs === undefined ? {} : { timeLimitMs: options.timeLimitMs };
+
+  /** A record the pass has marked as no longer shown on the site, or undefined (S-041). */
+  async function tombstone(site: PublicSite, id: string): Promise<string | undefined> {
+    const stored = await oaiStoredStamp(
+      options.db,
+      site.organizationId,
+      site.siteId,
+      id,
+      staffRead,
+    );
+    return stored?.deleted === true ? stored.stamp : undefined;
   }
 
   function metadata(oaiDcXml: string): string {
@@ -396,7 +453,7 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
   }
 
   async function identify(site: PublicSite, baseUrl: string): Promise<string> {
-    const repository = await oaiRepository(options.db, site.organizationId, site.siteId);
+    const repository = await oaiRepository(options.db, site.organizationId, site.siteId, staffRead);
     if (repository === undefined) throw new Error("the public site is gone");
     return [
       "<Identify>",
@@ -405,7 +462,7 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
       element("protocolVersion", "2.0"),
       element("adminEmail", email),
       element("earliestDatestamp", secondsOf(repository.earliest)),
-      element("deletedRecord", "no"),
+      element("deletedRecord", "transient"),
       element("granularity", "YYYY-MM-DDThh:mm:ssZ"),
       "</Identify>",
     ].join("\n");
@@ -427,10 +484,45 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
     const { identifier, metadataPrefix } = args;
     if (identifier === undefined || metadataPrefix === undefined) return fail("badArgument", false);
     const id = recordIdOf(host, identifier);
-    const output = id === undefined ? undefined : await publicRecord(site, id);
-    if (id === undefined || output === undefined) return fail("idDoesNotExist");
+    if (id === undefined) return fail("idDoesNotExist");
+    const output = await publicRecord(site, id);
+    // A record the site has shown has a stored datestamp (S-041); one it
+    // never showed has none and is unknown, never "deleted".
+    const stored = await oaiStoredStamp(
+      options.db,
+      site.organizationId,
+      site.siteId,
+      id,
+      staffRead,
+    );
+    if (output === undefined) {
+      // Not shown now: a deleted header once the pass has marked it (with a
+      // datestamp of its own); until then, or for a record the site never
+      // showed, unknown (as the lists skip it).
+      if (stored?.deleted !== true) return fail("idDoesNotExist");
+      if (metadataPrefix !== OAI_DC_PREFIX) return fail("cannotDisseminateFormat");
+      return [
+        "<GetRecord>",
+        "<record>",
+        header(host, id, stored.stamp, true),
+        "</record>",
+        "</GetRecord>",
+      ].join("\n");
+    }
     if (metadataPrefix !== OAI_DC_PREFIX) return fail("cannotDisseminateFormat");
-    const stamp = await oaiDatestamp(options.db, site.organizationId, site.siteId, id);
+    // Before the site's first background pass there is no stored datestamp:
+    // the site's lower bound stands in, never a time computed from record
+    // versions, which would tell a harvester when staff saved (S-046).
+    let stamp = stored?.stamp;
+    if (stamp === undefined) {
+      const repository = await oaiRepository(
+        options.db,
+        site.organizationId,
+        site.siteId,
+        staffRead,
+      );
+      stamp = repository?.earliest;
+    }
     if (stamp === undefined) return fail("idDoesNotExist");
     return [
       "<GetRecord>",
@@ -464,22 +556,73 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
     let after = cursor.after;
     let scanned = 0;
     let exhausted = false;
-    while (shown.length < OAI_PAGE_SIZE && scanned < OAI_MAX_SCAN && !exhausted) {
+    let outOfTime = false;
+    // On the routes' clock (S-043a), as the brake and responseDate are.
+    const deadline = clock() + pageTimeLimitMs;
+    while (shown.length < OAI_PAGE_SIZE && scanned < OAI_MAX_SCAN && !exhausted && !outOfTime) {
       const want = Math.min(OAI_PAGE_SIZE - shown.length + 5, OAI_MAX_SCAN - scanned);
-      const candidates = await listPublishedForOai(options.db, site.organizationId, site.siteId, {
-        ...cursor.window,
-        ...(after === undefined ? {} : { after }),
-        limit: want,
-      });
+      // The page's time bounds each list read too (S-051): checked before the
+      // call, and the call gets only what is left (the first, the full limit).
+      const left = deadline - clock();
+      // (A break leaves `exhausted` false, so the page ends with a token.)
+      if (scanned > 0 && left < 1) break;
+      let candidates: OaiCandidate[];
+      try {
+        candidates = await listPublishedForOai(options.db, site.organizationId, site.siteId, {
+          ...cursor.window,
+          ...(after === undefined ? {} : { after }),
+          limit: want,
+          timeLimitMs: scanned === 0 ? LIST_READ_LIMIT_MS : Math.min(LIST_READ_LIMIT_MS, left),
+        });
+      } catch (thrown) {
+        // Past the page's first, a list read that runs out of time ends the
+        // page here; the token resumes after the last record shown.
+        if (scanned === 0 || !isDatabaseTimeout(thrown)) throw thrown;
+        break;
+      }
       if (candidates.length < want) exhausted = true;
       for (const candidate of candidates) {
         if (shown.length >= OAI_PAGE_SIZE) {
           exhausted = false;
           break;
         }
+        if (scanned > 0 && clock() >= deadline) {
+          // Out of time (S-037): this candidate and the rest come on the next page.
+          exhausted = false;
+          outOfTime = true;
+          break;
+        }
+        if (candidate.deleted === true) {
+          // Stopped being shown (S-041): a deleted header, in both lists
+          // (OAI-PMH §2.5.1); nothing to read.
+          scanned += 1;
+          after = candidate;
+          const gone = header(host, candidate.id, candidate.stamp, true);
+          shown.push(verb === "ListIdentifiers" ? gone : `<record>\n${gone}\n</record>`);
+          continue;
+        }
+        let output: Awaited<ReturnType<typeof publicRecord>>;
+        try {
+          output = await publicRecord(site, candidate.id);
+        } catch (thrown) {
+          // A read past the page's first that ran out of time (S-037): the
+          // page ends before this candidate, which is read first next time,
+          // so one slow read is retried instead of failing the page. The
+          // page's first read timing out is the request's 503 busy.
+          if (scanned === 0 || !isDatabaseTimeout(thrown)) throw thrown;
+          exhausted = false;
+          outOfTime = true;
+          break;
+        }
+        // Only now: `after` (the token's place) moves past this candidate.
         scanned += 1;
         after = candidate;
-        const output = await publicRecord(site, candidate.id);
+        // Shown when the pass last ran, not now: skipped until the next pass
+        // marks it deleted with a datestamp of its own. A deleted header here,
+        // at the old datestamp, would make a harvester drop a record that
+        // comes back before that pass for good (review of S-047). Only records
+        // the site has shown have rows (S-041), so a run of skipped ones tells
+        // nothing about records that were never public.
         if (output === undefined) continue;
         shown.push(
           verb === "ListIdentifiers"
@@ -520,7 +663,11 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
         const identifier = args.identifier;
         if (identifier !== undefined) {
           const id = recordIdOf(host, identifier);
-          if (id === undefined || (await publicRecord(site, id)) === undefined) {
+          if (
+            id === undefined ||
+            ((await publicRecord(site, id)) === undefined &&
+              (await tombstone(site, id)) === undefined)
+          ) {
             return fail("idDoesNotExist");
           }
         }
@@ -575,6 +722,12 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
           echoed = { verb, ...args };
           body = await answer(site, host, verb, args, baseUrl);
         } catch (thrown) {
+          if (isDatabaseTimeout(thrown)) {
+            // A time limit ran out (S-037): busy, as when no slot is free.
+            log({ event: "service_error", operation: "oaiPmh", name: "timeout" });
+            reply.status(503).header("retry-after", "5");
+            return { error: "busy" };
+          }
           if (!(thrown instanceof OaiFailure)) {
             log({
               event: "service_error",

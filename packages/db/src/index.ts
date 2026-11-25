@@ -21,6 +21,7 @@ export {
   openDatabase,
   typeParsers,
   ConnectionLostError,
+  isDatabaseTimeout,
   createDatabase,
   dropDatabase,
 } from "./client.js";
@@ -87,12 +88,22 @@ export { restoreVersion, restoreReason, MAX_DESCENDANTS_WALKED } from "./record-
 export { recordCheckIssues, fixedMessages, linkedIds } from "./record-checks.js";
 export type { RecordCheckOptions } from "./record-checks.js";
 export { deleteRecord } from "./record-delete.js";
-export { listPublishedForOai, oaiDatestamp, oaiRepository, MAX_OAI_CANDIDATES } from "./oai.js";
-export type { OaiCandidate, OaiListOptions } from "./oai.js";
+export {
+  listPublishedForOai,
+  oaiRepository,
+  oaiStoredStamp,
+  writeOaiStamps,
+  MAX_OAI_CANDIDATES,
+  OAI_READ_TIME_LIMIT_MS,
+} from "./oai.js";
+export type { OaiCandidate, OaiListOptions, OaiReadOptions } from "./oai.js";
 export {
   changeWorkflowState,
   publishCheckIssues,
   readPublicRecord,
+  readSharedPublicRecord,
+  PUBLIC_READ_TIME_LIMIT_MS,
+  MAX_PUBLIC_READ_TIME_LIMIT_MS,
   publicValueSources,
   inheritedValues,
   recordDependents,
@@ -106,6 +117,9 @@ export {
 export type {
   InheritedValue,
   PublicRecordOptions,
+  SharedHome,
+  SharedPublicRecord,
+  SharedPublicRecordOptions,
   PublicValueSource,
   StateListEntry,
   WorkflowChangeResult,
@@ -125,6 +139,9 @@ export type {
 export type { RecordDeletion, RecordDeletionResult } from "./record-delete.js";
 export {
   grantWriterRole,
+  grantIdentityRead,
+  identityGrantHint,
+  reservedRoleName,
   checkWriterConnection,
   grantPublicReaderRole,
   checkPublicReaderConnection,
@@ -278,6 +295,8 @@ export {
   deleteExpiredSessions,
   deleteOldPasswordResets,
   runCleanup,
+  WRONG_CODE_MEMORY_SECONDS,
+  UNEXPLAINED_TOLD_AFTER_SECONDS,
   NO_SESSION,
   MAX_LISTED_SESSIONS,
   SESSION_TABLE_PRIVILEGES,
@@ -360,6 +379,66 @@ export {
 } from "./sign-in-screens.js";
 export type { PendingSignInState, OrganizationChoice, SignedInPerson } from "./sign-in-screens.js";
 export {
+  FILE_SCAN_TABLE_PRIVILEGES,
+  SCAN_FAILURES,
+  SCAN_STATES,
+  claimDueScan,
+  isScanSignature,
+  queueScan,
+  queueUnscanned,
+  recordScanResult,
+  rescanContents,
+  scanCounts,
+  scanState,
+  scanStates,
+} from "./file-scans.js";
+export type {
+  ClaimedScan,
+  RecordedScan,
+  ScanCounts,
+  ScanFailure,
+  ScanResult,
+  ScanState,
+  StoredScan,
+} from "./file-scans.js";
+export {
+  STORED_FILE_TABLE_PRIVILEGES,
+  MAX_FILES_PER_LIST,
+  findStoredFile,
+  insertStoredFile,
+  listStoredFiles,
+  storedFileById,
+  lockOrganizationFiles,
+  organizationFileBytes,
+  organizationHasContent,
+  deleteStoredFile,
+  namedContents,
+  findStoredFileById,
+  insertStoredFileEvent,
+  purgeCandidates,
+  readFileStoreLease,
+  lockFileStoreLease,
+  insertFileStoreEpoch,
+  databaseIdentity,
+  identityKnown,
+  currentFingerprint,
+  TRASH_GRACE_SECONDS,
+  trashedContents,
+  insertFilePurgeStep,
+  existingOrganizations,
+  readFileStoreBinding,
+  insertFileStoreBinding,
+  REMOVED_FILE_GRACE_SECONDS,
+} from "./stored-files.js";
+export type {
+  NewStoredFile,
+  StoredFile,
+  StoredFileEventKind,
+  PurgeCandidate,
+  TrashedContent,
+  FileStoreLease,
+} from "./stored-files.js";
+export {
   sendSecondStepAlertNotices,
   ALERT_NOTICE_TABLE_PRIVILEGES,
   ALERT_NOTICE_WINDOW_SECONDS,
@@ -418,6 +497,11 @@ export {
   SHARE_STATES,
   SHARE_TABLE_PRIVILEGES,
   MAX_SHARE_PAGE,
+  MAX_OPEN_OFFERS,
+  DECLINE_COOLDOWN_DAYS,
+  SHARE_OFFER_LIMIT_STATE,
+  SHARE_COOLDOWN_STATE,
+  SHARE_CHANGED,
   insertShare,
   isShareId,
   liveShare,
@@ -428,13 +512,44 @@ export {
   sharesIntoSite,
   sharesOfRecord,
 } from "./shares.js";
-export type { Share, ShareState, SharedItemView } from "./shares.js";
+export type { Share, SharePageOptions, ShareState, SharedItemView } from "./shares.js";
+export {
+  ACCESSION_TABLE_PRIVILEGES,
+  MAX_ACCESSION_PAGE,
+  accessionUses,
+  accessionsProducing,
+  deleteDonorContact,
+  insertAccession,
+  listAccessions,
+  lockAccessionHolds,
+  sitesBelow,
+  numberUsedBefore,
+  readAccession,
+  readAccessionHolds,
+  readAccessionRecords,
+  publishedBelow,
+  readDonorContact,
+  saveDonorContact,
+  updateAccession,
+} from "./accessions.js";
+export type { SaveOutcome, StoredAccession, StoredDonorContact } from "./accessions.js";
+export {
+  STORAGE_TABLE_PRIVILEGES,
+  storageNow,
+  insertStorageMove,
+  lockStorage,
+  readStorage,
+  saveStorageLevels,
+  saveStorageLocation,
+  storageUses,
+} from "./storage.js";
+export type { StorageSaveOutcome, StoredDefinition, StoredStorage } from "./storage.js";
 export {
   SYSTEM_EVENT_KINDS,
   SYSTEM_EVENT_TABLE_PRIVILEGES,
   insertSystemEvent,
 } from "./system-events.js";
-export type { NewSystemEvent, SystemEventKind } from "./system-events.js";
+export type { NewFilePurgeEvent, NewSystemEvent, SystemEventKind } from "./system-events.js";
 export { runSetupCli, terminalAsk } from "./setup-cli.js";
 export type { Ask } from "./setup-cli.js";
 export { backup, BackupError } from "./backup.js";

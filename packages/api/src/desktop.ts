@@ -35,7 +35,7 @@ import {
   writeSync,
 } from "node:fs";
 import { createServer } from "node:net";
-import { join } from "node:path";
+import { join, win32 } from "node:path";
 import { loadSecretKeyring, SECRET_KEY_VARIABLE } from "@oculus/db";
 
 export type Env = Readonly<Record<string, string | undefined>>;
@@ -88,6 +88,24 @@ export function settingsFolder(platform: NodeJS.Platform, env: Env, home: string
   if (platform === "darwin") return join(home, "Library", "Application Support", "Oculus");
   const xdg = env.XDG_CONFIG_HOME;
   return join(xdg?.startsWith("/") === true ? xdg : join(home, ".config"), "oculus");
+}
+
+/**
+ * A warning for Windows, where the secret key's permission check is
+ * skipped (S-050): a settings folder given by OCULUS_DESKTOP_HOME outside
+ * this person's %APPDATA% may be open to other people on the computer.
+ * `undefined` when there is nothing to warn about.
+ */
+export function windowsSettingsWarning(platform: NodeJS.Platform, env: Env): string | undefined {
+  if (platform !== "win32") return undefined;
+  const given = env[DESKTOP_HOME_VARIABLE];
+  if (given === undefined || given.trim() === "") return undefined;
+  const appData = env.APPDATA;
+  if (appData !== undefined && appData.trim() !== "") {
+    const inside = win32.relative(win32.resolve(appData), win32.resolve(given));
+    if (!inside.startsWith("..") && !win32.isAbsolute(inside)) return undefined;
+  }
+  return `${DESKTOP_HOME_VARIABLE} puts Oculus's settings and secret key in ${given}, outside your own AppData folder. On Windows Oculus can't check who else can open it: make sure only you can, or leave ${DESKTOP_HOME_VARIABLE} unset.`;
 }
 
 /** Makes the settings folder if it's missing, readable only by its owner. */

@@ -6,7 +6,15 @@
  *   editing it needs) offers it to another site, of their own organization
  *   or another one, named by its organization and site IDs (a site's manager
  *   passes them on: Oculus lists no other organization's sites). Never to
- *   the record's own home site; one live offer per record and site.
+ *   the record's own home site; one live offer per record and site. Limits
+ *   (S-036b, checked by the database): at most `MAX_OPEN_OFFERS` open offers
+ *   from one organization into one site (`too_many_offers`), and none of a
+ *   record to a site that declined it in the last `DECLINE_COOLDOWN_DAYS`
+ *   (`declined_recently`).
+ * - **Endings the database makes** (S-036b): deleting the record at home
+ *   ends its live shares as `deleted`, and moving it onto the second site
+ *   as `moved`; both keep the decision, and the shares outlive the record,
+ *   so the second organization keeps its record of what it decided.
  * - **Deciding** (`acceptShare`, `declineShare`): the second site's manager
  *   (`site.settings` there, or a system manager), in a session of the second
  *   site's organization.
@@ -15,7 +23,12 @@
  *   manager removes an accepted item (`removeShare`).
  * - **Lists**: a site's offers and accepted items for its manager
  *   (`sharesIntoSite`), a record's shares for whoever may edit it
- *   (`sharesOfRecord`).
+ *   (`sharesOfRecord`). Each is paged (S-036a): at most `MAX_SHARE_PAGE` a
+ *   page, newest first, the next page asked for with `{ before }`, the last
+ *   share's ID (and, for a site's list, `{ state }`, `offered` or
+ *   `accepted`). The manager's list also holds accepted items the public
+ *   can't see right now, with `item: null` (`hidden`), so they can be
+ *   removed; nobody else is shown those.
  * - **Seeing an accepted item** (`readSharedItem`, `listSharedItems`):
  *   anyone with `records.view` for the whole of the second site's catalog
  *   (or a system manager) sees `SharedItemView`: what the public is shown
@@ -49,7 +62,9 @@ import {
   type UserId,
 } from "@oculus/core";
 import {
+  DECLINE_COOLDOWN_DAYS,
   insertShare,
+  liveShare,
   lockRecord,
   lockShare,
   moveShare,
@@ -58,6 +73,11 @@ import {
   readSite,
   readWorkflowState,
   sharedItemViews,
+  SHARE_CHANGED,
+  MAX_SHARE_PAGE,
+  MAX_OPEN_OFFERS,
+  SHARE_COOLDOWN_STATE,
+  SHARE_OFFER_LIMIT_STATE,
   sharesIntoSite as storedSharesIntoSite,
   sharesOfRecord as storedSharesOfRecord,
   type Database,
@@ -89,9 +109,40 @@ export interface ShareSummary {
   readonly endedAt: string | null;
 }
 
-/** An offer or accepted item, as the second site's manager sees it. */
+/** An offer or accepted item, as the second site's people see it. */
 export interface IncomingShare extends ShareSummary {
-  readonly item: SharedItemView;
+  /**
+   * What the public is shown of it, or `null` (only in the site manager's
+   * own list, S-036a) while the public can't see it at all: unpublished,
+   * refused by the publish check, or without a stored Dublin Core mapping.
+   * Nothing else is said about why.
+   */
+  readonly item: SharedItemView | null;
+}
+
+/**
+ * One page of a share list (S-036a), and where the next one starts: `next`
+ * is the `before` to ask with (the last share the page read, shown or not),
+ * or `null` when this page wasn't full. A page can show fewer shares than
+ * `MAX_SHARE_PAGE` and still have a `next`: shares the person may not be
+ * shown are read and left out.
+ */
+export interface SharePage<T> {
+  readonly shares: readonly T[];
+  readonly next: string | null;
+}
+
+/** A site manager's page: offers and accepted items, each with its own `next`. */
+export interface SiteSharesPage {
+  readonly shares: readonly IncomingShare[];
+  readonly next: { readonly offered: string | null; readonly accepted: string | null };
+}
+
+/** A page of a share list (S-036a): `before`, a page's `next`. */
+export interface SharePageRequest {
+  readonly before?: unknown;
+  /** For a site's list: only this state's page (`offered` or `accepted`); both when left out. */
+  readonly state?: unknown;
 }
 
 export interface ShareOperations {
@@ -104,19 +155,22 @@ export interface ShareOperations {
   sharesIntoSite(
     context: ServiceContext,
     siteId: unknown,
-  ): Promise<ServiceResult<readonly IncomingShare[]>>;
+    page?: SharePageRequest,
+  ): Promise<ServiceResult<SiteSharesPage>>;
   /** The record's shares (every state), for whoever may edit it. */
   sharesOfRecord(
     context: ServiceContext,
     recordId: unknown,
-  ): Promise<ServiceResult<readonly ShareSummary[]>>;
+    page?: SharePageRequest,
+  ): Promise<ServiceResult<SharePage<ShareSummary>>>;
   /** An item accepted into the site, as the site's people may see it. */
   readSharedItem(context: ServiceContext, shareId: unknown): Promise<ServiceResult<IncomingShare>>;
   /** The items accepted into the site. */
   listSharedItems(
     context: ServiceContext,
     siteId: unknown,
-  ): Promise<ServiceResult<readonly IncomingShare[]>>;
+    page?: SharePageRequest,
+  ): Promise<ServiceResult<SharePage<IncomingShare>>>;
 }
 
 type Refusal = ServiceRefusal;
@@ -130,6 +184,19 @@ const UNKNOWN_SHARE = (): Refusal =>
 const UNKNOWN_SITE = (): Refusal =>
   refusal(["targetSiteId"], "unknown_site", "There is no such site to offer it to.");
 const NOT_PERMITTED = (): Refusal => refusal([], "not_permitted", NOT_PERMITTED_MESSAGE);
+const ALREADY_SHARED = (): Refusal =>
+  refusal(["targetSiteId"], "already_shared", "It is already offered to or shown on that site.");
+
+/** A thrown database error's SQLSTATE, if it has one. */
+function sqlStateOf(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  try {
+    const code = (error as { code?: unknown }).code;
+    return typeof code === "string" ? code : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 function summary(share: Share): ShareSummary {
   return Object.freeze({
@@ -202,15 +269,57 @@ export function shareOperations(db: Database, run: Runner, outside: Outside): Sh
    * snapshot of their own: `sharedItemViews`), in order; a share whose item
    * the public can't see now is left out.
    */
-  async function incoming(shares: readonly Share[]): Promise<readonly IncomingShare[]> {
+  /**
+   * The shares with their views. Offers and accepted items the public can't
+   * see are left out, unless `keepHidden` (the site manager's own list,
+   * S-036a), which keeps accepted ones with `item: null`.
+   */
+  async function incoming(
+    shares: readonly Share[],
+    keepHidden = false,
+  ): Promise<readonly IncomingShare[]> {
     const views = await sharedItemViews(db, shares);
     const out: IncomingShare[] = [];
     for (const share of shares) {
       const item = views.get(share.id);
+      // Ended or moved onto the site since it was listed: not shown at all.
+      if (item === SHARE_CHANGED) continue;
       if (item !== undefined) out.push(Object.freeze({ ...summary(share), item }));
+      else if (keepHidden && share.state === "accepted") {
+        out.push(Object.freeze({ ...summary(share), item: null }));
+      }
     }
     return Object.freeze(out);
   }
+
+  /** The `before` of the page after `page` (its last share), or null if `page` wasn't full. */
+  function nextOf(page: readonly Share[]): string | null {
+    return page.length >= MAX_SHARE_PAGE ? (page.at(-1)?.id ?? null) : null;
+  }
+
+  /** A page request's parts, or undefined when it isn't one. */
+  function pageOf(
+    page: unknown,
+    allowState: boolean,
+  ): { before?: unknown; state?: "offered" | "accepted" } | undefined {
+    if (page === undefined) return {};
+    if (!hasOnly(page, allowState ? ["before", "state"] : ["before"])) return undefined;
+    const before = own(page, "before");
+    const state = own(page, "state");
+    if (before !== undefined && typeof before !== "string") return undefined;
+    if (state !== undefined && state !== "offered" && state !== "accepted") return undefined;
+    return {
+      ...(before === undefined ? {} : { before }),
+      ...(state === undefined ? {} : { state }),
+    };
+  }
+
+  const BAD_PAGE = () =>
+    refusal(
+      ["page"],
+      "invalid_request",
+      "A page is { before } (a share ID) and, for a site's list, { state }.",
+    );
 
   /**
    * A share the second site acts on: locked, of the session's organization's
@@ -295,22 +404,57 @@ export function shareOperations(db: Database, run: Runner, outside: Outside): Sh
         ) {
           return UNKNOWN_SITE();
         }
-        const share = await insertShare(tx, {
-          id: randomUUID(),
-          organizationId: who.organizationId,
-          recordId,
-          targetOrganizationId,
-          targetSiteId,
-          offeredBy: access.userId,
-        });
-        // A live share there already (perhaps made a moment ago by another offer).
-        if (share === undefined) {
-          return refusal(
-            ["targetSiteId"],
-            "already_shared",
-            "It is already offered to or shown on that site.",
-          );
+        // A live share there already: said before the limits are counted.
+        if (
+          (await liveShare(
+            tx,
+            who.organizationId,
+            recordId,
+            targetOrganizationId,
+            targetSiteId,
+          )) !== undefined
+        ) {
+          return ALREADY_SHARED();
         }
+        let share: Share | undefined;
+        try {
+          share = await insertShare(tx, {
+            id: randomUUID(),
+            organizationId: who.organizationId,
+            recordId,
+            targetOrganizationId,
+            targetSiteId,
+            offeredBy: access.userId,
+          });
+        } catch (error) {
+          // The database's limits (0043, S-036b); the transaction is rolled
+          // back with the refusal, and nothing more runs in it.
+          const state = sqlStateOf(error);
+          if (state === SHARE_OFFER_LIMIT_STATE) {
+            return refusal(
+              ["targetSiteId"],
+              "too_many_offers",
+              `That site already has ${String(MAX_OPEN_OFFERS)} open offers from your organization. Wait for it to answer some, or withdraw some.`,
+            );
+          }
+          if (state === SHARE_COOLDOWN_STATE) {
+            return refusal(
+              ["targetSiteId"],
+              "declined_recently",
+              `That site declined this item in the last ${String(DECLINE_COOLDOWN_DAYS)} days. It can be offered again after that.`,
+            );
+          }
+          // The record deleted a moment ago (the insert check reads it).
+          if (
+            state === "23503" &&
+            (error as { constraint?: unknown }).constraint === "record_shares_record"
+          ) {
+            return noSuchRecord();
+          }
+          throw error;
+        }
+        // A live share there already (perhaps made a moment ago by another offer).
+        if (share === undefined) return ALREADY_SHARED();
         return { ok: true, value: summary(share) };
       });
     },
@@ -347,7 +491,7 @@ export function shareOperations(db: Database, run: Runner, outside: Outside): Sh
       });
     },
 
-    async sharesIntoSite(context, siteId) {
+    async sharesIntoSite(context, siteId, page) {
       const checked = await run("sharesIntoSite", context, async (tx, who) => {
         const access = await readAccess(tx, who.organizationId, who.actor);
         if (!access.ok) return access;
@@ -358,26 +502,55 @@ export function shareOperations(db: Database, run: Runner, outside: Outside): Sh
         ) {
           return NOT_PERMITTED();
         }
-        const shares = [
-          ...(await storedSharesIntoSite(tx, who.organizationId, siteId, "offered")),
-          ...(await storedSharesIntoSite(tx, who.organizationId, siteId, "accepted")),
-        ];
-        return { ok: true, value: shares };
+        const wanted = pageOf(page, true);
+        // A cursor belongs to one state's list: `before` needs `state`.
+        if (wanted === undefined || (wanted.before !== undefined && wanted.state === undefined)) {
+          return BAD_PAGE();
+        }
+        const states =
+          wanted.state === undefined ? (["offered", "accepted"] as const) : [wanted.state];
+        const read: Partial<Record<"offered" | "accepted", readonly Share[]>> = {};
+        for (const state of states) {
+          read[state] = await storedSharesIntoSite(tx, who.organizationId, siteId, state, {
+            before: wanted.before,
+            includeHidden: state === "accepted",
+          });
+        }
+        return { ok: true, value: read };
       });
       if (!checked.ok) return checked;
-      const shares = checked.value;
-      return outside("sharesIntoSite", async () => ({ ok: true, value: await incoming(shares) }));
+      const read = checked.value;
+      return outside("sharesIntoSite", async () => ({
+        ok: true,
+        value: Object.freeze({
+          shares: await incoming([...(read.offered ?? []), ...(read.accepted ?? [])], true),
+          next: Object.freeze({
+            offered: nextOf(read.offered ?? []),
+            accepted: nextOf(read.accepted ?? []),
+          }),
+        }),
+      }));
     },
 
-    async sharesOfRecord(context, recordId) {
+    async sharesOfRecord(context, recordId, page) {
       return run("sharesOfRecord", context, async (tx, who) => {
         if (!isRecordId(recordId)) return noSuchRecord();
         const access = await readAccess(tx, who.organizationId, who.actor);
         if (!access.ok) return access;
         const allowed = await mayShareRecord(tx, who, access.value, recordId, "read");
         if (allowed) return allowed;
-        const shares = await storedSharesOfRecord(tx, who.organizationId, recordId);
-        return { ok: true, value: Object.freeze(shares.map(summary)) };
+        const wanted = pageOf(page, false);
+        if (wanted === undefined) return BAD_PAGE();
+        const shares = await storedSharesOfRecord(tx, who.organizationId, recordId, {
+          before: wanted.before,
+        });
+        return {
+          ok: true,
+          value: Object.freeze({
+            shares: Object.freeze(shares.map(summary)),
+            next: nextOf(shares),
+          }),
+        };
       });
     },
 
@@ -399,7 +572,7 @@ export function shareOperations(db: Database, run: Runner, outside: Outside): Sh
       });
     },
 
-    async listSharedItems(context, siteId) {
+    async listSharedItems(context, siteId, page) {
       const checked = await run("listSharedItems", context, async (tx, who) => {
         const access = await readAccess(tx, who.organizationId, who.actor);
         if (!access.ok) return access;
@@ -410,14 +583,21 @@ export function shareOperations(db: Database, run: Runner, outside: Outside): Sh
         ) {
           return NOT_PERMITTED();
         }
+        const wanted = pageOf(page, false);
+        if (wanted === undefined) return BAD_PAGE();
         return {
           ok: true,
-          value: await storedSharesIntoSite(tx, who.organizationId, siteId, "accepted"),
+          value: await storedSharesIntoSite(tx, who.organizationId, siteId, "accepted", {
+            before: wanted.before,
+          }),
         };
       });
       if (!checked.ok) return checked;
       const shares = checked.value;
-      return outside("listSharedItems", async () => ({ ok: true, value: await incoming(shares) }));
+      return outside("listSharedItems", async () => ({
+        ok: true,
+        value: Object.freeze({ shares: await incoming(shares), next: nextOf(shares) }),
+      }));
     },
   };
 }
