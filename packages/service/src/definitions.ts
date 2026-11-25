@@ -65,6 +65,9 @@ import {
   templateChanges,
   validateIdentifierType,
   validateNewIdentifierType,
+  RIGHTS_FIELD_KEY,
+  RIGHTS_REQUIRED_KINDS,
+  validateDublinCoreMapping,
   validateTemplate,
   type Access,
   type FieldTemplate,
@@ -83,15 +86,18 @@ import {
   lockIdentifierType,
   publishedAmong,
   publishedHoldingType,
+  publishedUsingTemplate,
   readIdentifierTypes,
   readRecordPlace,
   readRecordsUsingTemplate,
+  readDublinCoreMapping as readStoredMapping,
   readTemplate as readStoredTemplate,
   updateIdentifierType,
+  writeDublinCoreMapping,
   type Queryable,
   type TemplateSummary,
 } from "@oculus/db";
-import { RecordAccess, notPermitted, readAccess } from "./access.js";
+import { RecordAccess, actorUser, notPermitted, readAccess } from "./access.js";
 import type { Runner } from "./admin.js";
 import type { ServiceContext, ServiceResult } from "./service.js";
 
@@ -122,6 +128,18 @@ export interface SavedIdentifierType extends TaggedIdentifierType {
   readonly publishedRecords: readonly RecordId[];
 }
 
+/** A template's Dublin Core mapping as read (T-050b, D-096): version 0 and `null` when none is stored. */
+export interface DublinCoreMappingVersion {
+  readonly key: string;
+  readonly version: number;
+  readonly mapping: unknown;
+}
+
+/** A saved mapping, with the published records it changed at once (D-076). */
+export interface SavedDublinCoreMapping extends DublinCoreMappingVersion {
+  readonly publishedRecords: readonly RecordId[];
+}
+
 export interface DefinitionOperations {
   /** The organization's templates at their current versions. */
   listTemplates(context: ServiceContext): Promise<ServiceResult<readonly TemplateVersion[]>>;
@@ -141,6 +159,24 @@ export interface DefinitionOperations {
     template: unknown,
     options: unknown,
   ): Promise<ServiceResult<SavedTemplate>>;
+  /** A template's stored Dublin Core mapping (T-050b, D-096), for anyone who may read templates. */
+  readDublinCoreMapping(
+    context: ServiceContext,
+    key: string,
+  ): Promise<ServiceResult<DublinCoreMappingVersion>>;
+  /**
+   * Stores a template's Dublin Core mapping (those who may change
+   * definitions, D-072), checked against the template's current version,
+   * from `expectedVersion` (0 when none is stored). A change that shows
+   * values at once on published records using the template needs
+   * `confirmPublished` (D-076).
+   */
+  saveDublinCoreMapping(
+    context: ServiceContext,
+    key: string,
+    mapping: unknown,
+    options: unknown,
+  ): Promise<ServiceResult<SavedDublinCoreMapping>>;
   /** The organization's identifier types, each with its tag. */
   listIdentifierTypes(
     context: ServiceContext,
@@ -576,6 +612,144 @@ export function definitionOperations(run: Runner): DefinitionOperations {
             key: template.key,
             version: saved.value.version,
             template: saved.value.template,
+            publishedRecords: Object.freeze([...(affected ?? [])]),
+          }),
+        };
+      });
+    },
+
+    async readDublinCoreMapping(context, key) {
+      return run("readDublinCoreMapping", context, async (tx, who) => {
+        const access = await readerAccess(tx, who);
+        if (!access.ok) return access;
+        const unknown = refusal<DublinCoreMappingVersion>(
+          ["key"],
+          "unknown_template",
+          "The organization has no such template.",
+        );
+        if (!isTemplateKey(key)) return unknown;
+        const template = await readStoredTemplate(tx, who.organizationId, key);
+        if (template === undefined) return unknown;
+        const stored = await readStoredMapping(tx, who.organizationId, key);
+        return {
+          ok: true,
+          value: Object.freeze({
+            key,
+            version: stored?.version ?? 0,
+            mapping: stored?.mapping ?? null,
+          }),
+        };
+      });
+    },
+
+    async saveDublinCoreMapping(context, key, mappingInput, saveOptions) {
+      return run("saveDublinCoreMapping", context, async (tx, who) => {
+        const org = who.organizationId;
+        const access = await writerAccess(tx, who);
+        if (!access.ok) return access;
+        const changedBy = actorUser(who.actor);
+        if (changedBy === undefined) return notPermitted();
+        const opts = readOptions(saveOptions, ["expectedVersion", "confirmPublished"]);
+        if (!opts.ok) return opts;
+        const expected = opts.value.expectedVersion;
+        if (
+          typeof expected !== "number" ||
+          !Number.isInteger(expected) ||
+          expected < 0 ||
+          expected >= 2 ** 31 - 1
+        ) {
+          return refusal(
+            ["options", "expectedVersion"],
+            "invalid_version",
+            "Name the version the edit started from: 0 when the template has no mapping yet.",
+          );
+        }
+        const confirmPublished = readConfirmPublished(opts.value);
+        if (!confirmPublished.ok) return confirmPublished;
+        const unknown = refusal<SavedDublinCoreMapping>(
+          ["key"],
+          "unknown_template",
+          "The organization has no such template.",
+        );
+        if (!isTemplateKey(key)) return unknown;
+        const copied = plainObject(mappingInput, "mapping");
+        if (!copied.ok) return copied;
+        const named = copied.value.organizationId;
+        if (named !== undefined && named !== org) {
+          return refusal(["organizationId"], "wrong_organization", WRONG_ORGANIZATION);
+        }
+        const namedTemplate = copied.value.template;
+        if (namedTemplate !== undefined && namedTemplate !== key) {
+          return refusal(["template"], "wrong_key", "The mapping's template is the address's.");
+        }
+        // The arrangement lock first (scoped grants), then the template's,
+        // exclusively: the order record saves and template saves take them
+        // in (D-065, D-067), so the template can't change under the check.
+        const checker = new RecordAccess(tx, org, access.value);
+        await checker.settle();
+        await lockDefinition(tx, org, "template", key, true);
+        const template = await readStoredTemplate(tx, org, key);
+        if (template === undefined) return unknown;
+        if (!template.ok) {
+          return refusal(
+            ["key"],
+            "unreadable_template",
+            "The stored template no longer reads as a template; it needs repair.",
+          );
+        }
+        const valid = validateDublinCoreMapping(
+          { ...copied.value, template: key, organizationId: org },
+          template.value.template,
+        );
+        if (!valid.ok) return valid;
+        // Public output refuses a mapping that leaves out the rights for the
+        // kinds published only with them (core's `rights_not_mapped`), so
+        // saving one would take every such published record off the public
+        // sites at once: refused here with the same rule.
+        const needsRights = template.value.template.appliesTo.some((k) =>
+          (RIGHTS_REQUIRED_KINDS as readonly string[]).includes(k),
+        );
+        if (
+          needsRights &&
+          !valid.value.entries.some(
+            (e) => e.field === RIGHTS_FIELD_KEY && (e.term === "rights" || e.term === "license"),
+          )
+        ) {
+          return refusal(
+            ["entries"],
+            "rights_not_mapped",
+            `The mapping must map the ${RIGHTS_FIELD_KEY} field to rights or license: this template's records can't be published without their rights.`,
+          );
+        }
+        const stored = await readStoredMapping(tx, org, key, { lock: true });
+        const storedVersion = stored?.version ?? 0;
+        if (storedVersion !== expected) {
+          return refusal(
+            ["options", "expectedVersion"],
+            "version_conflict",
+            storedVersion === 0
+              ? "This template has no mapping yet; save it as a new one (version 0)."
+              : `The mapping was changed by someone else; it is now at version ${String(storedVersion)}. Read it again.`,
+          );
+        }
+        // D-076: the mapping decides which public values go out as Dublin
+        // Core (and in JSON-LD) for every published record using this
+        // template, at once. Any change counts; an identical save doesn't.
+        let affected: readonly RecordId[] | undefined = [];
+        if (canonicalJson(stored?.mapping ?? null) !== canonicalJson(valid.value)) {
+          // IDs only, under the lock (record saves and publishing wait).
+          affected = await publishedUsingTemplate(tx, org, key);
+        }
+        const gate = await publishedGate(tx, who, checker, affected, confirmPublished.value);
+        if (gate) return gate;
+        const saved = await writeDublinCoreMapping(tx, valid.value, expected, changedBy);
+        if (!saved.ok) return saved;
+        return {
+          ok: true,
+          value: Object.freeze({
+            key,
+            version: saved.value.version,
+            mapping: valid.value,
             publishedRecords: Object.freeze([...(affected ?? [])]),
           }),
         };

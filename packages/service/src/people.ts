@@ -49,6 +49,7 @@ import {
   isUserId,
   issue,
   newRecordId,
+  permits,
   type Access,
   type BuiltInRole,
   type OrganizationId,
@@ -203,6 +204,17 @@ export interface PeopleOperations {
   ): Promise<ServiceResult<{ readonly ended: number }>>;
   /** The organization's change log, newest first, as far as the viewer may see (module header). */
   auditTrail(context: ServiceContext, filter: unknown): Promise<ServiceResult<AuditPage>>;
+  /**
+   * Software updates (T-060, D-092): system managers only, checked as for
+   * System settings (`system.settings`). With `{ fresh: true }`, also the
+   * password and second step entered in the last 10 minutes, as for
+   * changes to people: installing or rolling back runs new code on the
+   * server. Returns the acting person's ID for the install history.
+   */
+  authorizeSystemUpdate(
+    context: PeopleContext,
+    options: { readonly fresh: boolean },
+  ): Promise<ServiceResult<{ readonly userId: UserId }>>;
 }
 
 /** A thrown error's SQLSTATE (own data property only), if any. */
@@ -782,6 +794,21 @@ export function peopleOperations(
         kind: "sessions_ended",
       });
       return { ok: true, value: Object.freeze({ ended: ended.value.ended }) };
+    },
+
+    async authorizeSystemUpdate(context, options) {
+      return run("authorizeSystemUpdate", context, async (tx, who) => {
+        const access = await readAccess(tx, who.organizationId, who.actor);
+        if (!access.ok) return access;
+        if (!permits(access.value, "system.settings", { on: "organization" })) {
+          return notPermitted();
+        }
+        if (options.fresh) {
+          const stale = await notRecent<{ readonly userId: UserId }>(tx, context, who);
+          if (stale) return stale;
+        }
+        return { ok: true, value: Object.freeze({ userId: access.userId }) };
+      });
     },
 
     async auditTrail(context, filter) {

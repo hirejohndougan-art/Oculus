@@ -166,6 +166,12 @@ export {
 } from "./definitions.js";
 export type { TemplateSummary } from "./definitions.js";
 export {
+  publishedUsingTemplate,
+  readDublinCoreMapping,
+  writeDublinCoreMapping,
+} from "./dublin-core-mappings.js";
+export type { StoredDublinCoreMapping } from "./dublin-core-mappings.js";
+export {
   searchRecords,
   MAX_SEARCH_QUERY_LENGTH,
   DEFAULT_SEARCH_LIMIT,
@@ -393,3 +399,5 @@ export {
 export type { FirstInstall, FirstInstallResult } from "./first-setup.js";
 export { runSetupCli, terminalAsk } from "./setup-cli.js";
 export type { Ask } from "./setup-cli.js";
+export { backup, BackupError } from "./backup.js";
+export type { BackupOptions, BackupResult } from "./backup.js";

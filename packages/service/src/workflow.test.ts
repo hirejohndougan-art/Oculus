@@ -1916,3 +1916,167 @@ describe("the database refuses every other change of state, for every writer", (
     expect(WRITER_PRIVILEGES.record_versions).toEqual(["INSERT"]);
   });
 });
+
+describe("stored Dublin Core mappings (T-050b, D-096)", () => {
+  const rootCtx = (org: OrganizationId) => ({
+    ...ctx(org),
+    actor: actorOf(folks?.root ?? ("" as UserId)),
+  });
+
+  async function storedPublic(org: OrganizationId, id: RecordId, site = siteOf.get(org)) {
+    return readPublicRecord(s.reader, org, site ?? ("" as SiteId), id, { baseUrl: BASE });
+  }
+
+  async function readerMapping(org: OrganizationId, site: SiteId, id: RecordId) {
+    const [row] = await s.reader.rows<{ m: unknown }>(sql`
+      SELECT public.public_dublin_core_mapping(${org}::uuid, ${site}::uuid, ${id}::uuid) AS m`);
+    return row?.m ?? null;
+  }
+
+  it("is saved by a system manager, read back, and used for public output when none is passed", async () => {
+    await ready();
+    const org = await organization();
+    const { record } = await create(org, objectDraft());
+    ok(await service.publish(ctx(org), record.id, { expectedVersion: 1 }));
+    // No stored mapping: the record isn't shown (and nothing private goes out).
+    const before = await storedPublic(org, record.id);
+    expect(before.ok).toBe(false);
+    expect(JSON.stringify(before)).not.toContain("Kept in the back room.");
+    expect(ok(await service.readDublinCoreMapping(ctx(org), "pub-object"))).toEqual({
+      key: "pub-object",
+      version: 0,
+      mapping: null,
+    });
+
+    // Definitions are system managers' (D-072): a site manager is refused.
+    expect(
+      codes(
+        await service.saveDublinCoreMapping(ctx(org), "pub-object", mapping(org), {
+          expectedVersion: 0,
+          confirmPublished: true,
+        }),
+      ),
+    ).toEqual(["not_permitted"]);
+
+    // The record is published, so the first mapping shows values at once (D-076).
+    const asked = await service.saveDublinCoreMapping(rootCtx(org), "pub-object", mapping(org), {
+      expectedVersion: 0,
+    });
+    expect(codes(asked)).toContain("publishes_records");
+    expect(codes(asked)).toContain("published_record_affected");
+    const saved = ok(
+      await service.saveDublinCoreMapping(rootCtx(org), "pub-object", mapping(org), {
+        expectedVersion: 0,
+        confirmPublished: true,
+      }),
+    );
+    expect(saved.version).toBe(1);
+    expect(saved.publishedRecords).toEqual([record.id]);
+    expect(ok(await service.readDublinCoreMapping(ctx(org), "pub-object")).version).toBe(1);
+
+    const out = ok(await storedPublic(org, record.id));
+    expect(JSON.stringify(out.dublinCore)).toContain("Tin and glass.");
+    expect(JSON.stringify(out)).not.toContain("Kept in the back room.");
+    // The same output as with the mapping passed in.
+    expect(out.jsonLdText).toBe(
+      ok(
+        await readPublicRecord(s.reader, org, siteFor(org), record.id, {
+          baseUrl: BASE,
+          mappings: [mapping(org)],
+        }),
+      ).jsonLdText,
+    );
+
+    // Saving the same mapping again needs no confirmation.
+    expect(
+      ok(
+        await service.saveDublinCoreMapping(rootCtx(org), "pub-object", mapping(org), {
+          expectedVersion: 1,
+        }),
+      ).version,
+    ).toBe(2);
+  });
+
+  it("refuses a staff field, another organization, another template, a stale version and an unknown template", async () => {
+    await ready();
+    const org = await organization();
+    const other = await organization();
+    const withSecret = {
+      ...mapping(org),
+      entries: [...mapping(org).entries, { field: "secret", term: "abstract" }],
+    };
+    const save = (m: unknown, expectedVersion: number, key = "pub-object") =>
+      service.saveDublinCoreMapping(rootCtx(org), key, m, { expectedVersion });
+    expect((await save(withSecret, 0)).ok).toBe(false);
+    // Without the rights, published objects would drop off the public sites.
+    const noRights = { ...mapping(org), entries: mapping(org).entries.slice(1) };
+    expect(codes(await save(noRights, 0))).toEqual(["rights_not_mapped"]);
+    expect(codes(await save(mapping(other), 0))).toEqual(["wrong_organization"]);
+    expect(codes(await save({ ...mapping(org), template: "pub-unit" }, 0))).toEqual(["wrong_key"]);
+    expect(
+      codes(await save({ ...mapping(org), template: "no-such-template" }, 0, "no-such-template")),
+    ).toEqual(["unknown_template"]);
+    expect(codes(await save(mapping(org), 0, "../x"))).toEqual(["unknown_template"]);
+    ok(await save(mapping(org), 0));
+    expect(codes(await save(mapping(org), 0))).toEqual(["version_conflict"]);
+    expect(codes(await save(mapping(org), 5))).toEqual(["version_conflict"]);
+    // Even by direct SQL, a change is the next version.
+    expect(
+      await refusal(
+        s.writer.execute(sql`UPDATE public.dublin_core_mappings SET mapping = mapping
+          WHERE organization_id = ${org}::uuid`),
+      ),
+    ).toEqual({ code: "23000", constraint: "dublin_core_mappings_next_version" });
+    // Another organization's template of the same key is untouched.
+    expect(ok(await service.readDublinCoreMapping(ctx(other), "pub-object")).version).toBe(0);
+  });
+
+  it("a template change that makes a mapped field staff only stops public output, failing closed", async () => {
+    await ready();
+    const org = await organization();
+    const { record } = await create(org, objectDraft());
+    ok(
+      await service.saveDublinCoreMapping(rootCtx(org), "pub-object", mapping(org), {
+        expectedVersion: 0,
+      }),
+    );
+    ok(await service.publish(ctx(org), record.id, { expectedVersion: 1 }));
+    expect((await storedPublic(org, record.id)).ok).toBe(true);
+    ok(
+      await insertTemplateVersion(s.owner, {
+        key: "pub-object",
+        organizationId: org,
+        label: "pub-object",
+        appliesTo: ["object"],
+        fields: OBJECT_FIELDS.map((f) => (f.key === "note" ? { ...f, visibility: "staff" } : f)),
+      }),
+    );
+    const out = await storedPublic(org, record.id);
+    expect(out.ok).toBe(false);
+    expect(JSON.stringify(out)).not.toContain("Tin and glass.");
+  });
+
+  it("the public reader gets a mapping only for a record public on the site asked about", async () => {
+    await ready();
+    const org = await organization();
+    const { record } = await create(org, objectDraft());
+    ok(
+      await service.saveDublinCoreMapping(rootCtx(org), "pub-object", mapping(org), {
+        expectedVersion: 0,
+      }),
+    );
+    const site = siteFor(org);
+    expect(await readerMapping(org, site, record.id)).toBeNull();
+    ok(await service.publish(ctx(org), record.id, { expectedVersion: 1 }));
+    expect(await readerMapping(org, site, record.id)).toMatchObject({ template: "pub-object" });
+    const otherOrg = await organization();
+    expect(await readerMapping(org, siteFor(otherOrg), record.id)).toBeNull();
+    expect(await readerMapping(otherOrg, site, record.id)).toBeNull();
+    // Still no table at all for the reader.
+    const denied = await s.reader
+      .rows(sql`SELECT mapping FROM public.dublin_core_mappings`)
+      .catch((error: unknown) => (error as { code?: string }).code);
+    expect(denied).toBe("42501");
+    expect(await checkPublicReaderConnection(s.reader)).toEqual([]);
+  });
+});

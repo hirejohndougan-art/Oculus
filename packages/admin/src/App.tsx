@@ -36,6 +36,7 @@ import { Invite } from "./people/Invite";
 import { PeopleList } from "./people/PeopleList";
 import { Person } from "./people/Person";
 import { Roles } from "./people/Roles";
+import { Updates } from "./settings/Updates";
 import { Code } from "./screens/Code";
 import { SettingsLayout, SignInSettings, SitesSettings } from "./settings/Settings";
 import { TemplateList, TemplateScreen } from "./settings/TemplateEditor";
@@ -154,6 +155,8 @@ export const ROUTES: RouteObject[] = [
               { path: "templates/:key", element: <TemplateScreen /> },
               { path: "new-template", element: <TemplateScreen isNew /> },
               { path: "sign-in", element: <SignInSettings /> },
+              // Software updates (T-060).
+              { path: "updates", element: <Updates /> },
             ],
           },
         ],

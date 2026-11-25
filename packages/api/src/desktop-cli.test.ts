@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 // The launcher against real throwaway databases (D-049): it refuses what it
 // should, serves the admin on 127.0.0.1, opens and closes its window, and
 // never prints the database password or the secret key.
@@ -242,6 +243,29 @@ describe("npm run desktop", () => {
     expect(await first.done).toBe(0);
   });
 
+  it("answers 4 (a message to read) when another start is still starting", async () => {
+    const other = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
+      stdio: "ignore",
+    });
+    try {
+      writeFileSync(
+        join(folder, "desktop.lock"),
+        JSON.stringify({
+          pid: other.pid,
+          token: "t".repeat(43),
+          database: "x",
+          started: Date.now(),
+        }),
+      );
+      const run = start();
+      expect(await run.done).toBe(4);
+      expect(run.lines.join("\n")).toContain("already starting");
+    } finally {
+      other.kill();
+      await new Promise((resolve) => other.once("exit", resolve));
+    }
+  });
+
   it("starts normally over a stale lock whose PID lives but whose address is dead", async () => {
     writeFileSync(
       join(folder, "desktop.lock"),
@@ -350,7 +374,14 @@ describe("npm run desktop", () => {
     try {
       const run = start({ env: { OCULUS_DATABASE_URL: database.url } });
       await running(run);
-      expect(run.lines.join("\n")).toContain("Updated the database (1 change(s)).");
+      const said = run.lines.join("\n");
+      expect(said).toContain("Backing it up first");
+      expect(said).toContain("Updated the database (1 change(s)).");
+      // The backup came first, in the settings folder, before the change.
+      expect(said.indexOf("Backup saved")).toBeLessThan(said.indexOf("Updated the database"));
+      const saved = readdirSync(join(folder, "backups"));
+      expect(saved).toHaveLength(1);
+      expect(saved[0]).toMatch(/^before-update-.*\.oculus-backup$/);
       run.stop();
       expect(await run.done).toBe(0);
       const db = openDatabase(database.url, { max: 1 });
@@ -423,6 +454,30 @@ describe("npm run desktop", () => {
       expect(tables).toEqual([{ t: null }]);
     } finally {
       await other.drop();
+    }
+  });
+
+  it("updates nothing when the backup before an update can't be made", async () => {
+    const all = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "db", "migrations");
+    const older = join(folder, "older-migrations");
+    mkdirSync(older);
+    const files = readdirSync(all).sort();
+    for (const file of files.slice(0, -1)) cpSync(join(all, file), join(older, file));
+    const { database } = await setUpDatabase(older);
+    try {
+      const run = start({
+        env: { OCULUS_DATABASE_URL: database.url, PG_BIN: join(folder, "no-tools-here") },
+      });
+      expect(await run.done).toBe(1);
+      expect(run.lines.join("\n")).toContain("Nothing was changed");
+      const db = openDatabase(database.url, { max: 1 });
+      const rows = await db.rows<{ name: string }>(
+        sql`SELECT name FROM public.oculus_migrations ORDER BY name DESC LIMIT 1`,
+      );
+      await db.close();
+      expect(rows[0]?.name).toBe(files.at(-2));
+    } finally {
+      await database.drop();
     }
   });
 

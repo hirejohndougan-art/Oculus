@@ -116,6 +116,11 @@ export function SettingsLayout() {
               Sign-in rules
             </NavLink>
           </li>
+          <li>
+            <NavLink className={styles.tab} to="/settings/updates">
+              Updates
+            </NavLink>
+          </li>
         </ul>
       </nav>
       <Outlet context={context} />
