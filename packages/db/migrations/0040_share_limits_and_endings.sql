@@ -20,8 +20,8 @@
 --    an offer is made (the insert check reads it).
 -- 3. Limits on offers, checked when one is made, under a lock per offering
 --    organization and second site so two offers at once can't both pass:
---    at most 100 open offers (`offered`) from one organization into one
---    site (SQLSTATE OC071), and no offer of a record to a site that declined
+--    at most 100 open offers (`offered`, of a record published on a site
+--    now) from one organization into one site (SQLSTATE OC071), and no offer of a record to a site that declined
 --    it in the last 30 days (OC072). The numbers are `MAX_OPEN_OFFERS` and
 --    `DECLINE_COOLDOWN_DAYS` in shares.ts (a test checks they match).
 -- 4. The site lists' index in their order (`offered_at DESC, id DESC`,
@@ -87,7 +87,7 @@ SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
   home uuid;
-  found boolean;
+  record_exists boolean;
   open_offers bigint;
 BEGIN
   IF TG_OP = 'INSERT' THEN
@@ -101,9 +101,9 @@ BEGIN
     END IF;
     -- FOR SHARE (which a move's FOR NO KEY UPDATE and a deletion wait for),
     -- so a move or deletion of the record can't slip past this check.
-    SELECT r.site_id, true INTO home, found FROM public.records r
+    SELECT r.site_id, true INTO home, record_exists FROM public.records r
       WHERE r.organization_id = NEW.organization_id AND r.id = NEW.record_id FOR SHARE;
-    IF found IS NOT TRUE THEN
+    IF record_exists IS NOT TRUE THEN
       RAISE EXCEPTION 'Only an existing record is offered.'
         USING ERRCODE = 'foreign_key_violation', CONSTRAINT = 'record_shares_record';
     END IF;
@@ -111,6 +111,15 @@ BEGIN
     THEN
       RAISE EXCEPTION 'A record is not offered to its own home site.'
         USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'record_shares_not_home';
+    END IF;
+    -- The count below is exact only in Read Committed, where each statement
+    -- sees what committed before it (after the lock): a Repeatable Read
+    -- snapshot taken before the lock would miss an offer made meanwhile. The
+    -- server always writes in Read Committed; anything else is refused, as
+    -- for identifiers (OC061, 0003).
+    IF pg_catalog.current_setting('transaction_isolation') <> 'read committed' THEN
+      RAISE EXCEPTION 'An offer must be made in a Read Committed transaction.'
+        USING ERRCODE = 'OC061';
     END IF;
     -- One offer at a time per offering organization and second site, so the
     -- count below can't be passed by two offers at once. A transaction-level
@@ -128,10 +137,15 @@ BEGIN
       RAISE EXCEPTION 'That site declined this record in the last 30 days.'
         USING ERRCODE = 'OC072', CONSTRAINT = 'record_shares_cooldown';
     END IF;
+    -- Only offers the second site can see and answer count: their record is
+    -- published on a site now. One the home side unpublished since (which
+    -- the second site's list leaves out) never fills the site's places.
     SELECT count(*) INTO open_offers FROM public.record_shares o
+      JOIN public.records r ON r.organization_id = o.organization_id AND r.id = o.record_id
       WHERE o.target_organization_id = NEW.target_organization_id
         AND o.target_site_id = NEW.target_site_id
-        AND o.organization_id = NEW.organization_id AND o.state = 'offered';
+        AND o.organization_id = NEW.organization_id AND o.state = 'offered'
+        AND r.workflow_state = 'published' AND r.site_id IS NOT NULL;
     IF open_offers >= 100 THEN
       RAISE EXCEPTION 'Too many open offers into that site.'
         USING ERRCODE = 'OC071', CONSTRAINT = 'record_shares_offer_limit';

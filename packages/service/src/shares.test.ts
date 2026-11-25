@@ -1384,67 +1384,122 @@ describe("share limits and endings (S-036b)", () => {
       await q.execute(sql`UPDATE public.record_shares
         SET decided_at = now() - make_interval(days => ${DECLINE_COOLDOWN_DAYS} + 1)
         WHERE id = ${first.id}::uuid`);
-      await q.execute(sql`ALTER TABLE public.record_shares ENABLE ALWAYS TRIGGER record_shares_check`);
+      await q.execute(
+        sql`ALTER TABLE public.record_shares ENABLE ALWAYS TRIGGER record_shares_check`,
+      );
     });
     expect((await offer(w, { org: w.dhs, site: w.d1 })).state).toBe("offered");
   });
 
-  it(
-    "limits the open offers one organization has into one site",
-    async () => {
-      await ready();
-      const w = await world();
-      // MAX_OPEN_OFFERS - 1 offers stored directly (the limit is the database's).
-      const ids: string[] = [];
-      for (let n = 0; n < MAX_OPEN_OFFERS - 1; n++) {
-        const r = ok(
-          await service.createRecord(at(w.lib, w.libCataloger, w.l1), {
-            kind: "object",
-            title: `Invented filler ${n}`,
-            templateKey: "t-object",
-            fields: {},
-          }),
-        ).record;
-        const id = newRecordId();
-        await s.writer.execute(sql`INSERT INTO public.record_shares
+  it("limits the open offers one organization has into one site", async () => {
+    await ready();
+    const w = await world();
+    // MAX_OPEN_OFFERS - 1 offers stored directly (the limit is the database's).
+    const ids: string[] = [];
+    const fillers: CatalogRecord[] = [];
+    for (let n = 0; n < MAX_OPEN_OFFERS - 1; n++) {
+      const r = await anotherItem(w, `Invented filler ${n}`);
+      fillers.push(r);
+      const id = newRecordId();
+      await s.writer.execute(sql`INSERT INTO public.record_shares
             (id, organization_id, record_id, target_organization_id, target_site_id, offered_by)
           VALUES (${id}::uuid, ${w.lib}::uuid, ${r.id}::uuid, ${w.dhs}::uuid, ${w.d1}::uuid,
                   ${w.libCataloger}::uuid)`);
-        ids.push(id);
-      }
-      // Two offers at the same moment for the last place: exactly one gets it.
-      const a = await anotherItem(w, "Invented lamp A");
-      const b = await anotherItem(w, "Invented lamp B");
-      const both = await Promise.all(
-        [a, b].map((r) =>
-          service.offerRecord(at(w.lib, w.libCataloger, w.l1), {
-            recordId: r.id,
-            targetOrganizationId: w.dhs,
-            targetSiteId: w.d1,
-          }),
-        ),
-      );
-      expect(both.map((r) => (r.ok ? "ok" : codes(r)[0])).sort()).toEqual([
-        "ok",
-        "too_many_offers",
-      ]);
-      // The world's own item is refused too, until the site answers one.
-      const offerItem = () =>
+      ids.push(id);
+    }
+    // Two offers at the same moment for the last place: exactly one gets it.
+    const a = await anotherItem(w, "Invented lamp A");
+    const b = await anotherItem(w, "Invented lamp B");
+    const both = await Promise.all(
+      [a, b].map((r) =>
         service.offerRecord(at(w.lib, w.libCataloger, w.l1), {
-          recordId: w.item.id,
+          recordId: r.id,
           targetOrganizationId: w.dhs,
           targetSiteId: w.d1,
-        });
-      expect(codes(await offerItem())).toEqual(["too_many_offers"]);
-      // Other sites, and other organizations' offers into D1, aren't counted.
-      expect((await offer(w, { org: w.lib, site: w.l2 })).state).toBe("offered");
-      await s.writer.execute(sql`UPDATE public.record_shares
+        }),
+      ),
+    );
+    expect(both.map((r) => (r.ok ? "ok" : codes(r)[0])).sort()).toEqual(["ok", "too_many_offers"]);
+    // The world's own item is refused too, until the site answers one.
+    const offerItem = () =>
+      service.offerRecord(at(w.lib, w.libCataloger, w.l1), {
+        recordId: w.item.id,
+        targetOrganizationId: w.dhs,
+        targetSiteId: w.d1,
+      });
+    expect(codes(await offerItem())).toEqual(["too_many_offers"]);
+    // Other sites, and other organizations' offers into D1, aren't counted.
+    expect((await offer(w, { org: w.lib, site: w.l2 })).state).toBe("offered");
+    // An offer whose item the home side unpublished since no longer takes a
+    // place (the second site can't see or answer it).
+    const rootAt = at(w.lib, folks.root, w.l1);
+    const first = fillers[0];
+    if (first === undefined) throw new Error("no filler");
+    const now = ok(await service.readRecord(rootAt, first.id));
+    ok(await service.withdraw(rootAt, first.id, { expectedVersion: now.version }));
+    expect((await offerItem()).ok).toBe(true);
+    // Full again; answering one frees a place.
+    const c = await anotherItem(w, "Invented lamp C");
+    const offerItemAgain = () =>
+      service.offerRecord(at(w.lib, w.libCataloger, w.l1), {
+        recordId: c.id,
+        targetOrganizationId: w.dhs,
+        targetSiteId: w.d1,
+      });
+    expect(codes(await offerItemAgain())).toEqual(["too_many_offers"]);
+    await s.writer.execute(sql`UPDATE public.record_shares
         SET state = 'accepted', decided_by = ${w.dhsManager}::uuid, decided_at = clock_timestamp()
-        WHERE id = ${ids[0] ?? ""}::uuid`);
-      expect((await offerItem()).ok).toBe(true);
-    },
-    120_000,
-  );
+        WHERE id = ${ids[1] ?? ""}::uuid`);
+    expect((await offerItemAgain()).ok).toBe(true);
+  }, 120_000);
+
+  it("ends offers not yet answered too, when the item is moved or deleted", async () => {
+    await ready();
+    const w = await world();
+    const toL2 = await offer(w, { org: w.lib, site: w.l2 });
+    const toD1 = await offer(w, { org: w.dhs, site: w.d1 });
+    const rootAt = at(w.lib, folks.root, w.l1);
+    let now = ok(await service.readRecord(rootAt, w.item.id));
+    ok(
+      await service.updateRecord(
+        rootAt,
+        w.item.id,
+        { ...now.record, siteId: w.l2 },
+        { expectedVersion: now.version },
+      ),
+    );
+    expect(await stored(toL2.id)).toMatchObject({ state: "moved", decided_by: null });
+    expect(codes(await service.acceptShare(at(w.lib, w.l2Manager), toL2.id))).toEqual([
+      "share_not_open",
+    ]);
+    now = ok(await service.readRecord(rootAt, w.item.id));
+    ok(
+      await service.withdraw(at(w.lib, folks.root, w.l2), w.item.id, {
+        expectedVersion: now.version,
+      }),
+    );
+    now = ok(await service.readRecord(rootAt, w.item.id));
+    ok(
+      await service.deleteRecord(at(w.lib, folks.root, w.l2), w.item.id, {
+        expectedVersion: now.version,
+      }),
+    );
+    expect(await stored(toD1.id)).toMatchObject({ state: "deleted", decided_by: null });
+  });
+
+  it("refuses an offer made outside Read Committed (the limit's count needs it)", async () => {
+    await ready();
+    const w = await world();
+    await expect(
+      s.writer.transaction(async (q) => {
+        await q.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`);
+        await q.execute(sql`INSERT INTO public.record_shares
+            (id, organization_id, record_id, target_organization_id, target_site_id, offered_by)
+          VALUES (${newRecordId()}::uuid, ${w.lib}::uuid, ${w.item.id}::uuid, ${w.dhs}::uuid,
+                  ${w.d1}::uuid, ${w.libCataloger}::uuid)`);
+      }),
+    ).rejects.toMatchObject({ code: "OC061" });
+  });
 
   it("keeps the limits in shares.ts and the migration the same", () => {
     const text = readFileSync(

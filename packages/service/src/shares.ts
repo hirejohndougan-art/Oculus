@@ -406,8 +406,13 @@ export function shareOperations(db: Database, run: Runner, outside: Outside): Sh
         }
         // A live share there already: said before the limits are counted.
         if (
-          (await liveShare(tx, who.organizationId, recordId, targetOrganizationId, targetSiteId)) !==
-          undefined
+          (await liveShare(
+            tx,
+            who.organizationId,
+            recordId,
+            targetOrganizationId,
+            targetSiteId,
+          )) !== undefined
         ) {
           return ALREADY_SHARED();
         }
@@ -429,7 +434,7 @@ export function shareOperations(db: Database, run: Runner, outside: Outside): Sh
             return refusal(
               ["targetSiteId"],
               "too_many_offers",
-              `That site already has ${MAX_OPEN_OFFERS} open offers from your organization. Wait for it to answer some first.`,
+              `That site already has ${MAX_OPEN_OFFERS} open offers from your organization. Wait for it to answer some, or withdraw some.`,
             );
           }
           if (state === SHARE_COOLDOWN_STATE) {
@@ -438,6 +443,13 @@ export function shareOperations(db: Database, run: Runner, outside: Outside): Sh
               "declined_recently",
               `That site declined this item in the last ${DECLINE_COOLDOWN_DAYS} days. It can be offered again after that.`,
             );
+          }
+          // The record deleted a moment ago (the insert check reads it).
+          if (
+            state === "23503" &&
+            (error as { constraint?: unknown }).constraint === "record_shares_record"
+          ) {
+            return noSuchRecord();
           }
           throw error;
         }

@@ -10,13 +10,7 @@
 export const SHARE_PAGE = 50;
 
 export type ShareState =
-  | "offered"
-  | "accepted"
-  | "declined"
-  | "withdrawn"
-  | "removed"
-  | "deleted"
-  | "moved";
+  "offered" | "accepted" | "declined" | "withdrawn" | "removed" | "deleted" | "moved";
 
 export const SHARE_STATE_LABELS: Readonly<Record<ShareState, string>> = {
   offered: "Offered, waiting for an answer",
