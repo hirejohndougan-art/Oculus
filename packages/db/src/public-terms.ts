@@ -27,11 +27,11 @@
  * never holds a vocabulary key, a term key, an ID or a count of records
  * held back.
  *
- * Terms are told apart by core's `termIdentity` (vocabulary and
- * `termUriKey`, or vocabulary and exact label), as the staff index tells
- * them apart, so an http and an https copy of one address count as one
- * term. Each count shows the label and URI the most counted records show
- * (ties to the lowest in code unit order).
+ * Terms are told apart by what the public sees: a term with a URI by
+ * `termUriKey(uri)` (so an http and an https copy of one address count as
+ * one term), any other by its exact label. The vocabulary is never read,
+ * since public output never shows it. Each count shows the label and URI the
+ * most counted records show (ties to the lowest in code unit order).
  *
  * The work grows with the records on the site (one snapshot each), so a
  * public site must cache the answer, never work it out per request. At most
@@ -39,17 +39,14 @@
  * `timeLimitMs` (default 30 seconds): either refuses the whole count
  * (`too_many_records`, `too_slow`), never a part. Issues are for staff.
  */
-import { createHash } from "node:crypto";
 import {
   isFieldKey,
   isOrganizationId,
   isRecordId,
   isSiteId,
   issue,
-  termIdentity,
-  validateControlledTerm,
+  termUriKey,
   validateDublinCoreMapping,
-  type ControlledTerm,
   type FieldValue,
   type OrganizationId,
   type RecordId,
@@ -208,7 +205,16 @@ async function countIn(
   return db.transaction(async (tx) => {
     // One snapshot for every read below, and nothing written.
     await tx.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`);
-    await tx.execute(sql`SELECT set_config('statement_timeout', ${String(timeLimitMs)}, true)`);
+    const remaining = async (): Promise<boolean> => {
+      const left = deadline - Date.now();
+      if (left < 1) return false;
+      // Each statement may take only what is left, so the limit is a ceiling.
+      await tx.execute(
+        sql`SELECT pg_catalog.set_config('statement_timeout', ${String(left)}, true)`,
+      );
+      return true;
+    };
+    if (!(await remaining())) return tooSlow();
     const rows = await tx.rows<{ id: string }>(sql`
       SELECT r.id::text AS id FROM public.records r
       WHERE r.organization_id = ${organizationId}::uuid
@@ -230,7 +236,7 @@ async function countIn(
     const tallies = new Map<string, Tally>();
     let counted = 0;
     for (const id of ids) {
-      if (Date.now() > deadline) return tooSlow();
+      if (!(await remaining())) return tooSlow();
       const one = await publicRecordIn(tx, organizationId, siteId, id, baseUrl, mappings);
       // What the public output refuses shows nothing, so it counts for nothing.
       if (!one.ok) continue;
@@ -242,13 +248,13 @@ async function countIn(
       const termFields = new Set(
         template.fields.filter((f) => f.kind === "controlled_term").map((f) => f.key),
       );
-      const seen = new Map<string, ControlledTerm>();
+      const seen = new Map<string, ShownTerm>();
       for (const entry of view.entries) {
         if (!termFields.has(entry.key) || !shownFields.has(entry.key)) continue;
         if (fields !== undefined && !fields.has(entry.key)) continue;
         for (const term of termsOf(entry.value)) {
           const key = keyOf(term);
-          if (key !== undefined && !seen.has(key)) seen.set(key, term);
+          if (!seen.has(key)) seen.set(key, term);
         }
       }
       for (const [key, term] of seen) {
@@ -295,18 +301,41 @@ function mostShown(shown: ReadonlyMap<string, number>): string {
   return best;
 }
 
-/** The terms a shown value holds: one term, or each term of a list; anything else, none. */
-function termsOf(value: FieldValue): ControlledTerm[] {
+/** A term as public output shows it: its label, and its URI if it has one. */
+interface ShownTerm {
+  readonly label: string;
+  readonly uri?: string;
+}
+
+/**
+ * The terms a shown value holds, as public output shows them (label and URI,
+ * D-016): one term, or each term of a list. A value with no label shows no
+ * term. The vocabulary is never read: public output doesn't show it.
+ */
+function termsOf(value: FieldValue): ShownTerm[] {
   const items: readonly unknown[] = Array.isArray(value) ? value : [value];
-  const out: ControlledTerm[] = [];
+  const out: ShownTerm[] = [];
   for (const item of items) {
-    const term = validateControlledTerm(item);
-    if (term.ok) out.push(term.value);
+    const label = own(item, "label");
+    const uri = own(item, "uri");
+    if (typeof label !== "string" || label === "") continue;
+    out.push(typeof uri === "string" && uri !== "" ? { label, uri } : { label });
   }
   return out;
 }
 
-function keyOf(term: ControlledTerm): string | undefined {
-  const text = termIdentity(term);
-  return text.ok ? createHash("sha256").update(text.value, "utf8").digest("hex") : undefined;
+/**
+ * Which term a shown term is, by what the public sees: its URI as
+ * `termUriKey` compares URIs (so http and https copies of one address are
+ * one term), or its exact label when it has no URI.
+ */
+function keyOf(term: ShownTerm): string {
+  if (term.uri === undefined) return `label\u0000${term.label}`;
+  let key: string;
+  try {
+    key = termUriKey(term.uri);
+  } catch {
+    key = term.uri;
+  }
+  return `uri\u0000${key}`;
 }

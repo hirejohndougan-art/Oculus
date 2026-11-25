@@ -764,6 +764,7 @@ describe("public subject counts come from public output only (T-034d, D-095)", (
     field("rights", "rights"),
     field("subject", "controlled_term", { repeatable: true }),
     field("hidden", "controlled_term", { visibility: "staff" }),
+    field("number", "identifier"),
   ];
   const unitFields = [
     field("rights", "rights"),
@@ -920,6 +921,58 @@ describe("public subject counts come from public output only (T-034d, D-095)", (
         }),
       ),
     ).toEqual(["invalid_fields"]);
+  }, 60_000);
+
+  it("a record the public output holds back counts for nothing; vocabularies aren't told apart", async () => {
+    const { org } = await world();
+    const held = ok(
+      await service.createRecord(
+        ctx(org),
+        {
+          kind: "object",
+          title: "An invented held-back thing",
+          templateKey: "pub-subj",
+          fields: {
+            rights: { uri: INC },
+            subject: [term("Held back term"), { label: "Fishing", vocabulary: "gnis" }],
+            number: { type: "object_number", value: "INV-9" },
+          },
+        },
+        {
+          identifiers: {
+            current: [{ type: "object_number", value: "INV-9", primary: true }],
+            former: [],
+          },
+        },
+      ),
+    );
+    ok(await service.publish(ctx(org), held.record.id, { expectedVersion: 1 }));
+    const count = () =>
+      publicTermCounts(s.writer, org, siteFor(org), { baseUrl: BASE, mappings: mappings(org) });
+    const before = ok(await count());
+    expect(before.recordsCounted).toBe(5);
+    // "Fishing" under another vocabulary is the same term to the public: one row.
+    expect(before.counts.filter((c) => c.label === "Fishing")).toEqual([
+      { label: "Fishing", records: 3 },
+    ]);
+    expect(JSON.stringify(before)).toContain("Held back term");
+    // A new format the number doesn't fit holds the record back (D-091).
+    ok(
+      await s.owner.transaction((q) =>
+        updateIdentifierType(q, {
+          organizationId: org,
+          key: "object_number",
+          label: "Object number",
+          uniqueness: "all_time",
+          public: true,
+          pattern: "DPL#{1,9}",
+        }),
+      ),
+    );
+    const after = ok(await count());
+    expect(after.recordsCounted).toBe(4);
+    expect(JSON.stringify(after)).not.toContain("Held back term");
+    expect(after.counts.find((c) => c.label === "Fishing")?.records).toBe(2);
   }, 60_000);
 
   it("needs the staff connection, and stops when it takes too long", async () => {
