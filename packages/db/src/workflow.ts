@@ -16,6 +16,10 @@
  * transaction, never handed in (D-054): the record's ancestry and
  * represented records, the records its values link to, the templates of all
  * of them, the organization's identifier types and the record's identifiers.
+ * It also runs the public output's template check on the public values
+ * (`publicTemplateIssues`, S-026, D-091), so a record `readPublicRecord`
+ * would refuse, such as one showing a number that no longer fits its
+ * type's changed format, fails the publish check too.
  * The service runs it before publishing and after every write of a
  * published record (an edit, a restore, an identifier change), refusing the
  * write when it fails.
@@ -50,6 +54,7 @@ import {
   makeIdentifierChecker,
   makeRecordLinkChecker,
   publicOutput,
+  publicTemplateIssues,
   publicView,
   type PublicRecord,
   validateRecord,
@@ -564,7 +569,12 @@ export async function publishCheckIssues(
       issue(i.path, i.code, "The record or a record above it can't be read for publishing."),
     );
   }
-  return effectivePublishIssues(effective.value, { accessions: s.accessions });
+  const blocked = effectivePublishIssues(effective.value, { accessions: s.accessions });
+  // The public output's own template check, with the same checkers, so a
+  // record it would refuse (a number that no longer fits a changed format:
+  // S-026, D-091) fails here too, after every other reason.
+  const template = publicTemplateIssues(effective.value, s.checkers);
+  return template.length === 0 ? blocked : Object.freeze([...blocked, ...template]);
 }
 
 /**
