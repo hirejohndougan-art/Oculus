@@ -4,9 +4,11 @@
  *
  * - **The format is told, never guessed.** Each decoder is called only for
  *   the type Oculus sniffed when the file was stored (D-086), and only for
- *   JPEG (jpeg-js, BSD-3-Clause), PNG (pngjs, MIT) and GIF (omggif, MIT).
- *   The bytes must start with that format's signature; nothing is
- *   auto-detected. WebP and every other type get no thumbnail.
+ *   JPEG (jpeg-js, BSD-3-Clause), PNG (pngjs, MIT), GIF (omggif, MIT) and
+ *   WebP (@jsquash/webp, Apache-2.0: libwebp's decoder, BSD-3-Clause,
+ *   built to WebAssembly; loaded from its own file, never fetched). The
+ *   bytes must start with that format's signature; nothing is
+ *   auto-detected. Every other type gets no thumbnail.
  * - **Decompression bombs are refused before decoding.** The dimensions are
  *   read from the header first (`imageDimensions`): more than
  *   `THUMBNAIL_LIMITS.maxPixels` pixels or a side longer than `maxSide` is
@@ -15,7 +17,10 @@
  *   (`zlib.inflateSync`'s `maxOutputLength`), interlaced or not, before
  *   pngjs sees it (pngjs inflates an interlaced image without any ceiling).
  *   JPEG's own limits (`maxResolutionInMP`, `maxMemoryUsageInMB`) are set as
- *   a second line; a GIF's first frame must lie inside its screen. The
+ *   a second line; a GIF's first frame must lie inside its screen. A WebP's
+ *   RIFF size must not claim more than the file holds, and an animated
+ *   WebP is refused (libwebp's still-image decoder checks that the frame
+ *   matches the canvas before it allocates). The
  *   worker itself runs with a heap limit and a time limit (thumbnails.ts).
  * - The output is always a baseline JPEG, transparency flattened onto
  *   white, scaled down (never up) to fit a square box.
@@ -23,7 +28,10 @@
  * This file has no relative imports, so the worker can be started from the
  * build or, in tests, from the source with Node's type stripping.
  */
+import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { parentPort, workerData } from "node:worker_threads";
 import { inflateSync } from "node:zlib";
 
@@ -32,6 +40,7 @@ export const THUMBNAIL_TYPES: ReadonlySet<string> = new Set([
   "image/jpeg",
   "image/png",
   "image/gif",
+  "image/webp",
 ]);
 
 /** The formats the admin may show inline (D-086's binding allow-list). */
@@ -292,9 +301,90 @@ function checkPng(bytes: Uint8Array, width: number, height: number): void {
   }
 }
 
+/** libwebp's decoder (@jsquash/webp), loaded once per worker from its own files. */
+type WebpDecode = (data: ArrayBuffer) => Promise<{
+  readonly width: number;
+  readonly height: number;
+  readonly data: Uint8ClampedArray;
+}>;
+let webpDecoder: Promise<WebpDecode> | undefined;
+/** Node's WebAssembly (the project's type library has no DOM types). */
+const wasm = (
+  globalThis as unknown as { WebAssembly: { compile(bytes: Uint8Array): Promise<object> } }
+).WebAssembly;
+
+function loadWebp(): Promise<WebpDecode> {
+  webpDecoder ??= (async () => {
+    const folder = dirname(load.resolve("@jsquash/webp/package.json"));
+    const module = (await import(pathToFileURL(join(folder, "decode.js")).href)) as {
+      init(wasm: object): Promise<void>;
+      default: WebpDecode;
+    };
+    // The WebAssembly is compiled from the package's own file: nothing is fetched.
+    await module.init(await wasm.compile(readFileSync(join(folder, "codec/dec/webp_dec.wasm"))));
+    return module.default;
+  })();
+  return webpDecoder;
+}
+
+/**
+ * Checks a WebP's container before libwebp reads it, and returns the bytes
+ * the RIFF size names: a size claiming more than the file holds is refused,
+ * as is an animated WebP (the VP8X animation flag).
+ */
+function checkWebp(bytes: Uint8Array): Uint8Array {
+  const riffSize =
+    (bytes[4] ?? 0) +
+    (bytes[5] ?? 0) * 256 +
+    (bytes[6] ?? 0) * 65_536 +
+    (bytes[7] ?? 0) * 16_777_216;
+  if (riffSize < 12 || riffSize + 8 > bytes.length) throw new ImageRefused("webp_riff");
+  if (ascii(bytes, 12, "VP8X") && ((bytes[20] ?? 0) & 0x02) !== 0) {
+    throw new ImageRefused("webp_animated");
+  }
+  return bytes.subarray(0, riffSize + 8);
+}
+
+/** Decodes a WebP within the limits (asynchronous: the decoder is WebAssembly). */
+async function decodeWebp(bytes: Uint8Array, limits: ImageLimits): Promise<Rgba> {
+  const size = imageDimensions("image/webp", bytes);
+  if (size === undefined) throw new ImageRefused("header");
+  if (!withinLimits(size, limits)) throw new ImageRefused("too_large");
+  const body = checkWebp(bytes);
+  let image: Awaited<ReturnType<WebpDecode>>;
+  try {
+    const decode = await loadWebp();
+    // A copy the decoder may keep: never the caller's buffer.
+    image = await decode(body.slice().buffer);
+  } catch {
+    throw new ImageRefused("decode");
+  }
+  if (image.width !== size.width || image.height !== size.height) {
+    throw new ImageRefused("webp_header");
+  }
+  return {
+    width: image.width,
+    height: image.height,
+    data: new Uint8Array(image.data.buffer, image.data.byteOffset, image.data.byteLength),
+  };
+}
+
+/**
+ * Decodes an image of the format named to RGBA pixels, within the limits.
+ * JPEG, PNG and GIF are decoded at once; WebP is asynchronous.
+ */
+export async function decodeAny(
+  format: string,
+  bytes: Uint8Array,
+  limits: ImageLimits,
+): Promise<Rgba> {
+  return format === "image/webp" ? decodeWebp(bytes, limits) : decodeImage(format, bytes, limits);
+}
+
 /** Decodes an image of the format named to RGBA pixels, within the limits. */
 export function decodeImage(format: string, bytes: Uint8Array, limits: ImageLimits): Rgba {
-  if (!THUMBNAIL_TYPES.has(format)) throw new ImageRefused("format");
+  // WebP goes through decodeAny (asynchronous).
+  if (!THUMBNAIL_TYPES.has(format) || format === "image/webp") throw new ImageRefused("format");
   const size = imageDimensions(format, bytes);
   if (size === undefined) throw new ImageRefused("header");
   if (!withinLimits(size, limits)) throw new ImageRefused("too_large");
@@ -436,8 +526,12 @@ export function scaleDown(image: Rgba, box: number): Rgba {
 }
 
 /** The thumbnail of an image as JPEG bytes; throws `ImageRefused` for one it won't make. */
-export function renderThumbnail(format: string, bytes: Uint8Array, box: number): Uint8Array {
-  const image = flatten(decodeImage(format, bytes, THUMBNAIL_LIMITS));
+export async function renderThumbnail(
+  format: string,
+  bytes: Uint8Array,
+  box: number,
+): Promise<Uint8Array> {
+  const image = flatten(await decodeAny(format, bytes, THUMBNAIL_LIMITS));
   const small = scaleDown(image, box);
   return jpeg.encode(small, QUALITY).data;
 }
@@ -450,8 +544,17 @@ export interface ThumbnailJob {
   readonly box: number;
 }
 export type ThumbnailAnswer =
-  | { readonly id: number; readonly ok: true; readonly jpeg: Uint8Array }
-  | { readonly id: number; readonly ok: false; readonly code: string };
+  | {
+      readonly id: number;
+      readonly ok: true;
+      readonly jpeg: Uint8Array;
+      /** Start a new worker after this one: WebAssembly memory grown for a large WebP never shrinks. */
+      readonly recycle: boolean;
+    }
+  | { readonly id: number; readonly ok: false; readonly code: string; readonly recycle: boolean };
+
+/** A WebP above this many pixels leaves its worker to be replaced (its WebAssembly memory stays grown). */
+export const WEBP_RECYCLE_PIXELS = 4_000_000;
 
 /** Marks the worker started by thumbnails.ts (and only it). */
 export const WORKER_MARK = "oculus-thumbnail-worker";
@@ -459,16 +562,22 @@ export const WORKER_MARK = "oculus-thumbnail-worker";
 const port = parentPort;
 if (port !== null && (workerData as { mark?: unknown } | null)?.mark === WORKER_MARK) {
   port.on("message", (job: ThumbnailJob) => {
-    let answer: ThumbnailAnswer;
-    try {
-      answer = { id: job.id, ok: true, jpeg: renderThumbnail(job.format, job.bytes, job.box) };
-    } catch (error) {
-      answer = {
-        id: job.id,
-        ok: false,
-        code: error instanceof ImageRefused ? error.message : "decode",
-      };
-    }
-    port.postMessage(answer);
+    void (async () => {
+      const size = job.format === "image/webp" ? imageDimensions(job.format, job.bytes) : undefined;
+      const recycle = size !== undefined && size.width * size.height > WEBP_RECYCLE_PIXELS;
+      let answer: ThumbnailAnswer;
+      try {
+        const jpegBytes = await renderThumbnail(job.format, job.bytes, job.box);
+        answer = { id: job.id, ok: true, jpeg: jpegBytes, recycle };
+      } catch (error) {
+        answer = {
+          id: job.id,
+          ok: false,
+          code: error instanceof ImageRefused ? error.message : "decode",
+          recycle,
+        };
+      }
+      port.postMessage(answer);
+    })();
   });
 }

@@ -8,6 +8,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import {
   THUMBNAIL_LIMITS,
   VIEW_LIMITS,
+  decodeAny,
   decodeImage,
   fitInBox,
   imageDimensions,
@@ -25,6 +26,8 @@ import {
   makePng,
   pngBombs,
   pngOf,
+  makeWebp,
+  webpAttacks,
   webpHeader,
 } from "./images.fixtures.js";
 
@@ -162,6 +165,87 @@ describe("decoding", () => {
   });
 });
 
+describe("WebP", () => {
+  it("decodes lossy, lossless and alpha WebP, told the format", async () => {
+    const lossy = await makeWebp(120, 80);
+    const lossless = await makeWebp(33, 21, { lossless: true });
+    const alpha = await makeWebp(40, 30, { alpha: true });
+    expect(lossy.subarray(12, 16).toString()).toBe("VP8 ");
+    expect(lossless.subarray(12, 16).toString()).toBe("VP8L");
+    expect(alpha.subarray(12, 16).toString()).toBe("VP8X");
+    for (const [bytes, width, height] of [
+      [lossy, 120, 80],
+      [lossless, 33, 21],
+      [alpha, 40, 30],
+    ] as const) {
+      expect(imageDimensions("image/webp", bytes)).toEqual({ width, height });
+      const image = await decodeAny("image/webp", bytes, THUMBNAIL_LIMITS);
+      expect({ width: image.width, height: image.height }).toEqual({ width, height });
+      expect(image.data.length).toBe(width * height * 4);
+    }
+    // Lossless keeps the exact pixels: the first is the gradient's start.
+    const exact = await decodeAny("image/webp", lossless, THUMBNAIL_LIMITS);
+    expect([...exact.data.subarray(0, 4)]).toEqual([0, 0, 96, 255]);
+    // Alpha survives decoding (the right edge is transparent) and becomes white in the thumbnail.
+    const withAlpha = await decodeAny("image/webp", alpha, THUMBNAIL_LIMITS);
+    expect(withAlpha.data[(10 * 40 + 39) * 4 + 3]).toBeLessThan(20);
+    const thumb = decodeJpeg(await renderThumbnail("image/webp", alpha, 160));
+    expect({ width: thumb.width, height: thumb.height }).toEqual({ width: 40, height: 30 });
+    expect(thumb.data[(10 * 40 + 39) * 4]).toBeGreaterThan(230);
+    // Never decoded as another format, nor another format as WebP.
+    expect(() => decodeImage("image/webp", lossy, THUMBNAIL_LIMITS)).toThrow("format");
+    await expect(decodeAny("image/webp", makePng(8, 8), THUMBNAIL_LIMITS)).rejects.toThrow(
+      "header",
+    );
+    await expect(decodeAny("image/png", lossy, THUMBNAIL_LIMITS)).rejects.toThrow();
+  });
+
+  it("refuses size bombs, a lying RIFF size, a frame bigger than its canvas and animation", async () => {
+    const attacks = await webpAttacks();
+    for (const [name, bytes, code] of [
+      ["16,384² lossless header", attacks.hugeLossless, "too_large"],
+      ["16,384² canvas", attacks.hugeCanvas, "too_large"],
+      ["RIFF size past the file", attacks.lyingRiff, "webp_riff"],
+      ["animated", attacks.animated, "webp_animated"],
+    ] as const) {
+      const before = process.memoryUsage().arrayBuffers;
+      await expect(decodeAny("image/webp", bytes, THUMBNAIL_LIMITS), name).rejects.toThrow(code);
+      expect(process.memoryUsage().arrayBuffers - before, name).toBeLessThan(32 * 1024 * 1024);
+    }
+    // A 2,000 × 2,000 frame under a 16 × 16 canvas: libwebp refuses the
+    // mismatch before allocating the frame (16 MB of pixels).
+    const before = process.memoryUsage().arrayBuffers;
+    await expect(decodeAny("image/webp", attacks.smallCanvas, THUMBNAIL_LIMITS)).rejects.toThrow(
+      /decode|webp_header/,
+    );
+    expect(process.memoryUsage().arrayBuffers - before).toBeLessThan(8 * 1024 * 1024);
+  });
+
+  it(
+    "renders WebP thumbnails in the worker and refuses the attacks there",
+    { timeout: 60_000 },
+    async () => {
+      const renderer = createThumbnailRenderer();
+      renderers.push(renderer);
+      const ok = await renderer.render("image/webp", await makeWebp(640, 480), 160);
+      expect(ok.ok).toBe(true);
+      if (ok.ok) expect(decodeJpeg(ok.jpeg)).toMatchObject({ width: 160, height: 120 });
+      // Over 4 megapixels: rendered, then the worker (its WebAssembly memory
+      // grown) is replaced, and the next job still works.
+      const large = await renderer.render("image/webp", await makeWebp(2100, 2000), 160);
+      expect(large.ok).toBe(true);
+      expect((await renderer.render("image/webp", await makeWebp(50, 50), 160)).ok).toBe(true);
+      const attacks = await webpAttacks();
+      for (const bytes of Object.values(attacks)) {
+        expect(await renderer.render("image/webp", bytes, 160)).toEqual({
+          ok: false,
+          code: "refused",
+        });
+      }
+    },
+  );
+});
+
 describe("scaling", () => {
   it("fits the box and never scales up", () => {
     expect(fitInBox(4000, 3000, 160)).toEqual({ width: 160, height: 120 });
@@ -170,8 +254,8 @@ describe("scaling", () => {
     expect(fitInBox(10_000, 1, 160)).toEqual({ width: 160, height: 1 });
   });
 
-  it("renders a JPEG thumbnail, transparency on white", () => {
-    const thumb = decodeJpeg(renderThumbnail("image/png", makePng(640, 320, true), 160));
+  it("renders a JPEG thumbnail, transparency on white", async () => {
+    const thumb = decodeJpeg(await renderThumbnail("image/png", makePng(640, 320, true), 160));
     expect({ width: thumb.width, height: thumb.height }).toEqual({ width: 160, height: 80 });
     // The right edge was fully transparent: near white.
     const i = (40 * 160 + 159) * 4;

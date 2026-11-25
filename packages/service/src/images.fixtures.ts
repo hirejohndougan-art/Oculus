@@ -1,7 +1,10 @@
 // Invented test images for thumbnails and views (M-003): real JPEG, PNG and
 // GIF files made here, a WebP header, and decompression bombs. Every pixel
 // is generated; nothing comes from a real collection.
+import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { createDeflate, deflateSync } from "node:zlib";
 
 const load = createRequire(import.meta.url);
@@ -217,4 +220,98 @@ export function gifFrameOutside(): Buffer {
   out.writeUInt16LE(60_000, at + 5);
   out.writeUInt16LE(60_000, at + 7);
   return out;
+}
+
+/** libwebp's encoder (@jsquash/webp), for making test WebPs only. */
+let webpEncoder:
+  | Promise<
+      (
+        image: { data: Uint8ClampedArray; width: number; height: number },
+        options: { quality?: number; lossless?: number },
+      ) => Promise<ArrayBuffer>
+    >
+  | undefined;
+
+function encoder() {
+  webpEncoder ??= (async () => {
+    const folder = dirname(load.resolve("@jsquash/webp/package.json"));
+    const module = (await import(pathToFileURL(join(folder, "encode.js")).href)) as {
+      init(wasm: object): Promise<void>;
+      default: (
+        image: { data: Uint8ClampedArray; width: number; height: number },
+        options: { quality?: number; lossless?: number },
+      ) => Promise<ArrayBuffer>;
+    };
+    const wasm = (
+      globalThis as unknown as { WebAssembly: { compile(b: Uint8Array): Promise<object> } }
+    ).WebAssembly;
+    await module.init(await wasm.compile(readFileSync(join(folder, "codec/enc/webp_enc.wasm"))));
+    return module.default;
+  })();
+  return webpEncoder;
+}
+
+/** A real WebP: lossy (VP8, or VP8X with an alpha chunk) or lossless (VP8L). */
+export async function makeWebp(
+  width: number,
+  height: number,
+  options: { lossless?: boolean; alpha?: boolean } = {},
+): Promise<Buffer> {
+  const encode = await encoder();
+  const data = new Uint8ClampedArray(gradient(width, height, options.alpha === true));
+  const bytes = await encode(
+    { data, width, height },
+    options.lossless === true ? { lossless: 1 } : { quality: 75 },
+  );
+  return Buffer.from(bytes);
+}
+
+function riff(chunks: Buffer[]): Buffer {
+  const body = Buffer.concat([Buffer.from("WEBP"), ...chunks]);
+  return Buffer.concat([Buffer.from("RIFF"), u32le(body.length), body]);
+}
+
+function riffChunk(type: string, data: Buffer): Buffer {
+  const pad = data.length % 2 === 1 ? Buffer.alloc(1) : Buffer.alloc(0);
+  return Buffer.concat([Buffer.from(type, "latin1"), u32le(data.length), data, pad]);
+}
+
+/** A VP8X chunk: flags and a canvas size. */
+function vp8x(flags: number, width: number, height: number): Buffer {
+  const data = Buffer.alloc(10);
+  data[0] = flags;
+  data.writeUIntLE(width - 1, 4, 3);
+  data.writeUIntLE(height - 1, 7, 3);
+  return riffChunk("VP8X", data);
+}
+
+/** The chunks after "WEBP" in a WebP file. */
+function chunksOf(webp: Buffer): Buffer {
+  return webp.subarray(12);
+}
+
+/**
+ * WebP attacks: `hugeLossless` and `hugeCanvas` claim 16,384 × 16,384 pixels
+ * in a few bytes; `smallCanvas` puts a 2,000 × 2,000 frame under a 16 × 16
+ * canvas; `lyingRiff` claims more bytes than the file holds; `animated` sets
+ * the animation flag.
+ */
+export async function webpAttacks(): Promise<{
+  hugeLossless: Buffer;
+  hugeCanvas: Buffer;
+  smallCanvas: Buffer;
+  lyingRiff: Buffer;
+  animated: Buffer;
+}> {
+  const small = await makeWebp(16, 16);
+  const big = await makeWebp(2000, 2000);
+  const lyingRiff = Buffer.from(small);
+  lyingRiff.writeUInt32LE(small.length * 1000, 4);
+  return {
+    hugeLossless: webpHeader(16_384, 16_384),
+    hugeCanvas: riff([vp8x(0, 16_384, 16_384), chunksOf(small)]),
+    smallCanvas: riff([vp8x(0, 16, 16), chunksOf(big)]),
+    lyingRiff,
+    animated: riff([vp8x(0x02, 16, 16), chunksOf(small)]),
+  };
 }

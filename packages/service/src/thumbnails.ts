@@ -91,6 +91,8 @@ export function createThumbnailRenderer(options: ThumbnailRendererOptions = {}):
     w.stderr.resume();
     w.on("message", (answer: ThumbnailAnswer) => {
       if (running?.pending.job.id !== answer.id) return;
+      // A large WebP grew the worker's WebAssembly memory for good: replace it.
+      if (answer.recycle) stopWorker();
       finish(answer.ok ? { ok: true, jpeg: answer.jpeg } : { ok: false, code: "refused" });
     });
     // Out of memory, a crash or an exit: this job is refused, the next gets a new worker.

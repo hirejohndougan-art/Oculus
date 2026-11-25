@@ -8,9 +8,9 @@
  * text only.
  *
  * Viewing and downloading (M-003, D-097): every file has a Download link
- * (the server always sends it as an attachment); JPEG, PNG and GIF files
- * show a thumbnail the server made, and those and WebP open in a simple
- * viewer (FileViewer.tsx). Which files are images is decided by the type
+ * (the server always sends it as an attachment); JPEG, PNG, GIF and WebP
+ * files show a thumbnail the server made (a "View" placeholder when it
+ * can't make one) and open in a simple viewer (FileViewer.tsx). Which files are images is decided by the type
  * the server sniffed from the bytes, never by the name.
  */
 import { useRef, useState } from "react";
@@ -45,9 +45,8 @@ interface Upload {
   message?: string;
 }
 
-/** Types the viewer shows (the server's own list, D-086) and those with thumbnails. */
+/** Types the viewer shows and the server makes thumbnails of (D-086, D-097). */
 const VIEWABLE = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
-const THUMBNAILED = new Set(["image/jpeg", "image/png", "image/gif"]);
 
 const previewId = (fileId: string) => `preview-${fileId}`;
 
@@ -359,7 +358,7 @@ export function FilesPanel(props: Props) {
                           setViewing(images.indexOf(f));
                         }}
                       >
-                        {THUMBNAILED.has(f.mediaType) && !noThumbnail.has(f.id) ? (
+                        {!noThumbnail.has(f.id) ? (
                           <img
                             className={styles.thumb}
                             src={`${fileUrl(recordId, f.id, "thumbnail")}?size=small`}

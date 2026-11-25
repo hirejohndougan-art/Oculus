@@ -63,6 +63,8 @@ import {
   makeJpeg,
   makePng,
   pngBombs,
+  makeWebp,
+  webpAttacks,
   webpHeader,
 } from "../../service/src/images.fixtures.js";
 
@@ -167,7 +169,8 @@ const sha = (b: Buffer) => createHash("sha256").update(b).digest("hex");
 const JPEG = makeJpeg(640, 480);
 const PNG = makePng(300, 600);
 const GIF = makeGif(40, 30);
-const WEBP = webpHeader(800, 600);
+/** A real lossy WebP (made in beforeAll). */
+let WEBP: Buffer;
 const ACTIVE: Record<string, Buffer> = {
   html: Buffer.from("<!doctype html><title>invented</title><script>alert(1)</script>"),
   svg: Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'),
@@ -225,6 +228,7 @@ beforeAll(async () => {
   fileIds.jpeg = await add(ids.a1, JPEG, "depot photograph.jpg");
   fileIds.png = await add(ids.a1, PNG, "map.png");
   fileIds.gif = await add(ids.a1, GIF, "banner.gif");
+  WEBP = await makeWebp(800, 600);
   fileIds.webp = await add(ids.a1, WEBP, "sky.webp");
   for (const [kind, bytes] of Object.entries(ACTIVE)) {
     // Each claims to be a PNG and is named like one: neither counts.
@@ -443,12 +447,13 @@ describe("viewing inline", () => {
 });
 
 describe("thumbnails", () => {
-  it("makes JPEG thumbnails of JPEG, PNG and GIF that fit the size asked", async () => {
+  it("makes JPEG thumbnails of JPEG, PNG, GIF and WebP that fit the size asked", async () => {
     for (const [kind, size, box] of [
       ["jpeg", "small", { width: 160, height: 120 }],
       ["jpeg", "medium", { width: 480, height: 360 }],
       ["png", "small", { width: 80, height: 160 }],
       ["gif", "medium", { width: 40, height: 30 }],
+      ["webp", "medium", { width: 480, height: 360 }],
     ] as const) {
       const r = await send(
         `${fileUrl(ids.a1 ?? "", fileIds[kind] ?? "", "thumbnail")}?size=${size}`,
@@ -488,8 +493,8 @@ describe("thumbnails", () => {
     expect(statSync(join(filesDir, w.a, "thumbnails")).mode & 0o777).toBe(0o700);
   });
 
-  it("makes none of WebP, active types or anything else", async () => {
-    for (const kind of ["webp", ...Object.keys(ACTIVE)]) {
+  it("makes none of active types or anything else", async () => {
+    for (const kind of Object.keys(ACTIVE)) {
       const r = await send(fileUrl(ids.a1 ?? "", fileIds[kind] ?? "", "thumbnail"), {
         as: "reader",
       });
@@ -501,6 +506,7 @@ describe("thumbnails", () => {
   it("refuses decompression bombs without a memory blow-up, and remembers them", async () => {
     const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented bomb"));
     const bombs = await pngBombs(512);
+    const webp = await webpAttacks();
     const added: [string, string][] = [];
     for (const [name, bytes] of [
       ["huge.png", bombs.huge],
@@ -508,6 +514,11 @@ describe("thumbnails", () => {
       ["interlaced.png", bombs.interlaced],
       ["huge.jpg", hugeJpeg()],
       ["huge.gif", hugeGif()],
+      ["huge-lossless.webp", webp.hugeLossless],
+      ["huge-canvas.webp", webp.hugeCanvas],
+      ["small-canvas.webp", webp.smallCanvas],
+      ["lying-riff.webp", webp.lyingRiff],
+      ["animated.webp", webp.animated],
     ] as const) {
       added.push([name, await add(asset, bytes, name)]);
     }

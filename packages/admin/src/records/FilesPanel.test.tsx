@@ -110,6 +110,19 @@ const PAGE = {
 };
 
 describe("viewing and downloading (M-003)", () => {
+  it("shows a placeholder when the server makes no thumbnail", async () => {
+    fakeServer({ [LIST]: [200, { files: [SKY], maxFileBytes: 1000 }] });
+    show(false);
+    const button = await screen.findByRole("button", { name: "Preview sky.webp" });
+    const img = button.querySelector("img");
+    if (img === null) throw new Error("no thumbnail");
+    img.dispatchEvent(new Event("error"));
+    await waitFor(() => {
+      expect(button.querySelector("img")).toBeNull();
+    });
+    expect(within(button).getByText("View")).toBeTruthy();
+  });
+
   it("offers a download for every file and a preview only for images, by sniffed type", async () => {
     // An HTML file named like an image is still not an image.
     const liar = { ...PAGE, name: "picture.png" };
@@ -124,8 +137,11 @@ describe("viewing and downloading (M-003)", () => {
     expect(within(table).getByRole("button", { name: "Preview photo.jpg" })).toBeTruthy();
     expect(within(table).getByRole("button", { name: "Preview sky.webp" })).toBeTruthy();
     expect(within(table).queryByRole("button", { name: "Preview picture.png" })).toBeNull();
-    // WebP has no thumbnail: a placeholder, no image request.
-    expect(document.querySelectorAll("img")).toHaveLength(1);
+    // Both images (WebP included) show the server's thumbnail; the HTML file none.
+    expect([...document.querySelectorAll("img")].map((i) => i.getAttribute("src"))).toEqual([
+      `/api/records/${RECORD_ID}/files/${PHOTO.id}/thumbnail?size=small`,
+      `/api/records/${RECORD_ID}/files/${SKY.id}/thumbnail?size=small`,
+    ]);
     expect(document.querySelector("object, embed, iframe")).toBeNull();
   });
 
