@@ -7,7 +7,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - What changed: Chat I's branch on top of T-070, with the review's must-fixes: `holdPublicPorts` (127.0.0.1 and ::1, before the server is built; `attach` after it listens), `publicPortIsFree`; the open route checks `sitesForPerson` and limits per site; `READER_ONLY_FAILED` (5) and start-oculus.cmd; `finished` once; tests. Branch `autopilot/T-071`, local only.
 - Decisions: D-109 amended (listening on ::1 too, held ports, own sites)
 - Review: second independent review: safe; low items fixed (last-resort port checked on ::1, codes-only fallback line, per-site limit, the env-database hint, the "Nothing to do" wording, two launcher fallback tests); the pop-up timing note is on the roadmap line
-- Gate: see the branch's last commit · npm audit clean
+- Gate: PASS · tests_passing 5237 (was 5220) · npm audit clean
 - Next: the next free Phase 3 job (Chat Z)
 
 ## 2026-11-25 16:20 CT — manual (Chat Z) — T-070 "View public site" button (finished)
