@@ -692,29 +692,25 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
         const source = sourceOf(request);
         const body = textBody(request, ["token", "email", "displayName", "password"]);
         limitAddress(source);
+        const { token, email, displayName, password } = body;
         if (
-          body.token === undefined ||
-          body.email === undefined ||
-          body.displayName === undefined ||
-          body.password === undefined
+          token === undefined ||
+          email === undefined ||
+          displayName === undefined ||
+          password === undefined
         ) {
           throw new Refusal(400, "bad_body");
         }
         const accepted = await redacted("acceptInvitation", () =>
-          acceptInvitation(db, {
-            token: body.token,
-            email: body.email,
-            displayName: body.displayName,
-            password: body.password,
-          }),
+          acceptInvitation(db, { token, email, displayName, password }),
         );
         if (!accepted.ok) return invitationRefusal(reply, accepted.issues);
         const label = clientLabel(request.headers["user-agent"]);
         const started = await beginSession(
           db,
           {
-            email: body.email,
-            password: body.password,
+            email,
+            password,
             source,
             organizationId: accepted.value.organizationId,
             ...(label === undefined ? {} : { clientLabel: label }),
@@ -758,9 +754,10 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
       handler: async (request, reply) => {
         const { session } = await fullSessionOf(request, true);
         const body = textBody(request, ["token"]);
-        if (body.token === undefined) throw new Refusal(400, "bad_body");
+        const token = body.token;
+        if (token === undefined) throw new Refusal(400, "bad_body");
         const accepted = await redacted("acceptInvitationForUser", () =>
-          acceptInvitationForUser(db, { token: body.token, userId: session.userId }),
+          acceptInvitationForUser(db, { token, userId: session.userId }),
         );
         if (!accepted.ok) return invitationRefusal(reply, accepted.issues);
         const named = await readOrganization(db, accepted.value.organizationId);
