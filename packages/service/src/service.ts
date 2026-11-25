@@ -355,6 +355,12 @@ export interface ServiceOptions {
    * `search_timeout`. Default 5,000; 1 to 30,000.
    */
   readonly searchTimeoutMs?: number;
+  /**
+   * The most published records a Dublin Core mapping change lists one by
+   * one; past it, the change is confirmed by its count (S-039). Default
+   * `MAX_AFFECTED_PUBLISHED`; tests set it low.
+   */
+  readonly maxListedPublished?: number;
 }
 
 /** What `checkRecord` returns: core's issues for the draft as it would be saved now. */
@@ -2964,7 +2970,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
     },
 
     ...adminOperations(run),
-    ...definitionOperations(run),
+    ...definitionOperations(run, { maxListedPublished: options.maxListedPublished }),
     ...peopleOperations(db, run, onError, searchTimeoutMs),
     ...shareOperations(db, run, outside),
     submitForReview: workflowAction("submit_for_review"),
