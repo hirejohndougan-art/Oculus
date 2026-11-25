@@ -844,9 +844,9 @@ export interface PublicRecordOptions {
    * The `statement_timeout` (milliseconds) each of the read's statements
    * runs under (S-037), so one slow snapshot can't hold a public reader
    * connection as long as it takes: past it the read throws (SQLSTATE
-   * 57014, `isDatabaseTimeout`). A read is two statements that can take
-   * time (the snapshot and the mapping), so it holds its connection about
-   * twice this at most. Default `PUBLIC_READ_TIME_LIMIT_MS`; a whole number
+   * 57014, `isDatabaseTimeout`). A read is three statements that can take
+   * time (the snapshot, the organization's local day and the mapping), so
+   * its database work is about three times this at most. Default `PUBLIC_READ_TIME_LIMIT_MS`; a whole number
    * from 1 to `MAX_PUBLIC_READ_TIME_LIMIT_MS`.
    */
   readonly timeLimitMs?: number;

@@ -648,4 +648,68 @@ describe("oaiPmhReply", () => {
     }
     expect(() => oaiPmhRoutes({ ...base, timeLimitMs: 200, pageTimeLimitMs: 1 })).not.toThrow();
   });
+
+  it("a read that runs out of time mid-page ends the page before it; the list stays whole (S-037)", async () => {
+    const sites = await checkPublicSites(w.db, reader, [{ origin: PUBLIC, siteId: w.a1 }]);
+    // The public reader, but its 3rd and 30th reads are cancelled by the time limit.
+    let reads = 0;
+    const flaky: Database = {
+      ...reader,
+      transaction: (work) => {
+        reads += 1;
+        if (reads === 3 || reads === 30) {
+          return Promise.reject(
+            Object.assign(new Error("canceling statement due to statement timeout"), {
+              code: "57014",
+            }),
+          );
+        }
+        return reader.transaction(work);
+      },
+    };
+    const logged: unknown[] = [];
+    const routes = await buildServer({
+      env: { OCULUS_ORIGINS: PUBLIC },
+      routes: oaiPmhRoutes({
+        db: w.db,
+        publicDb: flaky,
+        sites,
+        adminEmail: EMAIL,
+        rateLimits: { oai: 10_000 },
+        log: (r) => logged.push(r),
+      }),
+    });
+    try {
+      const seen: string[] = [];
+      let reply = await oai("verb=ListIdentifiers&metadataPrefix=oai_dc", "127.0.0.1", routes);
+      // Two reads, then the third timed out: the page ends with a token.
+      expect(reply.statusCode).toBe(200);
+      expect(identifiers(reply.body).length).toBeLessThanOrEqual(2);
+      expect(tokenIn(reply.body)).toBeDefined();
+      seen.push(...identifiers(reply.body));
+      let token = tokenIn(reply.body);
+      let pages = 1;
+      while (token !== undefined) {
+        reply = await oai(`verb=ListIdentifiers&resumptionToken=${token}`, "127.0.0.1", routes);
+        expect(reply.statusCode).toBe(200);
+        expect(errorCode(reply.body)).toBeUndefined();
+        seen.push(...identifiers(reply.body));
+        token = tokenIn(reply.body);
+        pages += 1;
+        expect(pages).toBeLessThan(10);
+      }
+      expect(pages).toBeGreaterThan(2);
+      expect(new Set(seen).size).toBe(seen.length);
+      expect(seen.sort()).toEqual([published, ...more].map((id) => `${PREFIX}${id}`).sort());
+      // Handled inside the page: nothing was a failure.
+      expect(logged).toEqual([]);
+      // A page whose first read runs out of time is the request's 503 busy.
+      reads = 29;
+      const first = await oai("verb=ListIdentifiers&metadataPrefix=oai_dc", "127.0.0.1", routes);
+      expect(first.statusCode).toBe(503);
+      expect(first.json()).toEqual({ error: "busy" });
+    } finally {
+      await routes.close();
+    }
+  });
 });

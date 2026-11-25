@@ -504,9 +504,22 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
           outOfTime = true;
           break;
         }
+        let output: Awaited<ReturnType<typeof publicRecord>>;
+        try {
+          output = await publicRecord(site, candidate.id);
+        } catch (thrown) {
+          // A read past the page's first that ran out of time (S-037): the
+          // page ends before this candidate, which is read first next time,
+          // so one slow read is retried instead of failing the page. The
+          // page's first read timing out is the request's 503 busy.
+          if (scanned === 0 || !isDatabaseTimeout(thrown)) throw thrown;
+          exhausted = false;
+          outOfTime = true;
+          break;
+        }
+        // Only now: `after` (the token's place) moves past this candidate.
         scanned += 1;
         after = candidate;
-        const output = await publicRecord(site, candidate.id);
         if (output === undefined) continue;
         shown.push(
           verb === "ListIdentifiers"
