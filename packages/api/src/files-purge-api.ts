@@ -12,6 +12,10 @@
  *   `{ available: false, problem }`.
  * - `POST /api/system/files/cleanup` `{}`: runs one step under the folder's
  *   lease, with the system manager as the change log's actor.
+ * - `POST /api/system/files/cleanup/accept-identity` `{}`: after a
+ *   pg_upgrade or a move (`identity_changed`), makes the marker name this
+ *   database, while the folder's epoch is still its own; a recent sign-in,
+ *   and the change log.
  */
 import type { UserId } from "@oculus/core";
 import type { PeopleContext, RecordService, ServiceContext } from "@oculus/service";
@@ -77,6 +81,21 @@ export function filesPurgeApiRoutes(shared: Shared): OculusRoute[] {
         // The folder can't be purged by this database: a fixed code, no detail.
         if (!result.ok) throw new Refusal(409, result.problem);
         return { available: true, ...result.value };
+      }),
+    },
+    {
+      method: "POST",
+      path: "/api/system/files/cleanup/accept-identity",
+      handler: signedIn("write", true, async (request, reply, { context }) => {
+        const who = await allowed(request, reply, context, true);
+        if ("refusal" in who) return who.refusal;
+        if (request.body !== undefined) {
+          const extra = onlyKeys(objectBody(request), [], reply);
+          if (extra !== undefined) return extra;
+        }
+        const result = await service.acceptFileStoreIdentity(who.userId);
+        if (!result.ok) throw new Refusal(409, result.problem);
+        return { accepted: true, changed: result.changed };
       }),
     },
   ];

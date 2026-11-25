@@ -702,7 +702,7 @@ export async function readAuditTrail(
       -- for system managers (scope.system).
       SELECT 'system', s.occurred_at, 's' || s.id::text,
              CASE WHEN s.actor_id IS NOT NULL THEN 'user:' || s.actor_id::text
-                  WHEN s.source = 'timer' THEN 'timer' ELSE 'command_line' END,
+                  WHEN s.source IN ('timer', 'lease') THEN s.source ELSE 'command_line' END,
              NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
              s.id::text, s.kind, NULL, NULL, NULL, NULL, NULL, s.version, s.from_version,
              s.file_count, s.byte_count

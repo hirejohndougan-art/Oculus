@@ -40,6 +40,10 @@ const PROBLEMS: Readonly<Record<string, string>> = {
   other_install: "The files folder belongs to another Oculus install, so nothing is cleaned up.",
   lease_mismatch:
     "Another database is using the files folder, or this database was restored or copied. Nothing is cleaned up until someone on the server runs npm run files:adopt.",
+  identity_changed:
+    "The files folder names another database. If this database was upgraded or moved to another server, accept it as the folder's owner below; if it is a copy of the database that uses the folder, leave it.",
+  identity_unknown:
+    "Oculus can't read this database server's identity, so a copy restored elsewhere couldn't be told apart, and nothing is cleaned up. Ask whoever runs the database to let Oculus's role read it (EXECUTE on pg_control_system()).",
   mtime_unreliable:
     "The disk the files folder is on doesn't keep file times exactly enough to tell whether a file was used again, so nothing is cleaned up on it.",
 };
@@ -62,6 +66,7 @@ export function FileCleanup() {
   const [busy, setBusy] = useState(false);
   const [problem, setProblem] = useState<string>();
   const [done, setDone] = useState<CleanupStatus>();
+  const [accepted, setAccepted] = useState(false);
   const status = useQuery({
     queryKey: CLEANUP_KEY,
     queryFn: () => api<CleanupStatus>("/api/system/files/cleanup"),
@@ -120,6 +125,30 @@ export function FileCleanup() {
     }
   }
 
+  async function accept() {
+    setBusy(true);
+    setProblem(undefined);
+    try {
+      await reauth.run(async () => {
+        try {
+          await api("/api/system/files/cleanup/accept-identity", { body: {} });
+          setAccepted(true);
+        } catch (error) {
+          if (error instanceof ApiError && error.code === "reauthentication_required") throw error;
+          setProblem(
+            error instanceof ApiError && Object.hasOwn(PROBLEMS, error.code)
+              ? PROBLEMS[error.code]
+              : problemText(error),
+          );
+        } finally {
+          await queries.invalidateQueries({ queryKey: CLEANUP_KEY });
+        }
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const nothingToDo =
     (s.trashed?.files ?? 0) === 0 &&
     (s.deleted?.files ?? 0) === 0 &&
@@ -154,10 +183,20 @@ export function FileCleanup() {
 
       {reauth.form}
 
+      {accepted ? <Note tone="green">This database is now the files folder's owner.</Note> : null}
       {!s.available ? (
-        <Note tone="amber">
-          {PROBLEMS[s.problem ?? ""] ?? "Removed files can't be cleaned up."}
-        </Note>
+        <>
+          <Note tone="amber">
+            {PROBLEMS[s.problem ?? ""] ?? "Removed files can't be cleaned up."}
+          </Note>
+          {s.problem === "identity_changed" ? (
+            <div className={styles.actions}>
+              <Button variant="dark" isDisabled={busy} onPress={() => void accept()}>
+                Accept this database as the owner
+              </Button>
+            </div>
+          ) : null}
+        </>
       ) : (
         <section className={styles.panel} aria-labelledby="cleanup-waiting">
           <h2 id="cleanup-waiting" className={styles.panelTitle}>

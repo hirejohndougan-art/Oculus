@@ -393,6 +393,7 @@ export {
   lockFileStoreLease,
   insertFileStoreEpoch,
   databaseIdentity,
+  identityKnown,
   TRASH_GRACE_SECONDS,
   trashedContents,
   insertFilePurgeStep,

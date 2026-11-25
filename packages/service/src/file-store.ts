@@ -108,6 +108,8 @@ export interface FileStoreOptions {
   readonly minFreeBytes?: number;
   /** The free space on the disk (tests). Default: `statfs`. */
   readonly freeSpace?: (dir: string) => Promise<{ free: number; total: number }>;
+  /** How often a held lease lock's time moves on (tests). Default 20 seconds. */
+  readonly leaseLockBeatMs?: number;
 }
 
 /** A received file: what the service needs, and nothing that names a path. */
@@ -117,6 +119,23 @@ export interface ReceivedFile {
   readonly size: number;
   /** The first bytes (at most `SNIFF_BYTES`), for sniffing the media type. */
   readonly head: Uint8Array;
+}
+
+/** What `inspect` found at a content path, for `place` to check again under the lock. */
+export interface PlaceCheck {
+  readonly mtimeNs: bigint;
+  readonly size: number;
+  readonly ino: bigint;
+  /** A plain copy of ours with one link holding exactly the received content. */
+  readonly same: boolean;
+}
+
+/** `withLeaseLock` waited its whole time and another holder still has the lock. */
+export class LeaseLockBusy extends Error {
+  constructor() {
+    super("The files folder's lease lock is held.");
+    this.name = "LeaseLockBusy";
+  }
 }
 
 /** A stored copy's time and size (`copyStamp`). */
@@ -149,6 +168,10 @@ export const LEASE_LOCK = ".oculus-lease.lock";
 const LEASE_LOCK_STALE_MS = 2 * 60_000;
 /** How long `withLeaseLock` waits for another holder (15 seconds). */
 const LEASE_LOCK_WAIT_MS = 15_000;
+/** How often a held lease lock's time is moved on (20 seconds). */
+const LEASE_LOCK_BEAT_MS = 20_000;
+/** A lease lock this far in the future by the file system's clock is stale (5 seconds). */
+const LEASE_LOCK_FUTURE_MS = 5_000;
 
 export type ReceiveRefusal = "file_too_large" | "empty_file" | "quota_exceeded" | "disk_full";
 
@@ -230,13 +253,30 @@ export interface FileStore {
   /** The install ID the store was bound to, if it has been. */
   readonly boundTo: () => string | undefined;
   /**
-   * Sets a stored copy's access and modification times to now by the file system's
-   * own clock (every attach calls it): `false` when there is no plain copy
-   * of our own there (`place` replaces anything else).
+   * Sets a stored copy's access and modification times to now by the file
+   * system's own clock (every attach calls it): `missing` when there is no
+   * plain copy of our own there (`place` replaces anything else);
+   * `unchanged` when the file system wouldn't change its time (then the
+   * purge must never take the content: the caller records so).
    */
-  touch(organizationId: OrganizationId, sha256: string): Promise<boolean>;
-  /** Puts the received bytes at their content path (see the module header). */
-  place(file: ReceivedFile): Promise<"stored" | "already_stored">;
+  touch(
+    organizationId: OrganizationId,
+    sha256: string,
+  ): Promise<"touched" | "missing" | "unchanged">;
+  /**
+   * What is at a received file's content path now, hashed (call it before
+   * taking the organization's file lock, so nothing is hashed under it):
+   * `place` then trusts that verdict only if the copy's size, time and inode
+   * are still the same.
+   */
+  inspect(file: ReceivedFile): Promise<PlaceCheck | undefined>;
+  /**
+   * Puts the received bytes at their content path (see the module header).
+   * With `prior` (from `inspect`), nothing is hashed: a copy there that
+   * still matches it is kept if it was the same content, and anything else
+   * is replaced by the received bytes. Without, the copy there is hashed.
+   */
+  place(file: ReceivedFile, prior?: PlaceCheck): Promise<"stored" | "already_stored">;
   /** Removes the temporary file and releases its share; safe to call more than once. */
   discard(file: ReceivedFile): Promise<void>;
   /** Where the content is stored (for reading in M-003 and in tests). */
@@ -312,10 +352,10 @@ export interface FileStore {
    * Runs `work` holding the folder's lease lock: a lock file beside the
    * marker, made `O_EXCL` (Node has no `flock`), so a purge step, a lease
    * renewal, a bind or an adopt of any database using the folder never
-   * runs inside another's. A holder that is gone (on this host, a process
-   * that no longer exists; anywhere, a lock older than two minutes by the
-   * file system's clock) is taken over; otherwise it waits up to 15
-   * seconds, then throws.
+   * runs inside another's. Its time moves on every 20 seconds while held.
+   * A holder that is gone (`lockIsStale`) is taken over by renaming its
+   * lock aside and checking it was that one; otherwise it waits up to 15
+   * seconds, then throws `LeaseLockBusy`.
    */
   withLeaseLock<T>(work: () => Promise<T>): Promise<T>;
   /**
@@ -698,6 +738,51 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
     await syncDirectory(join(bin, "..")).catch(() => undefined);
   }
 
+  /** This host's name as lease locks write it. */
+  const lockHost = hostname()
+    .replace(/[^A-Za-z0-9.-]/g, "_")
+    .slice(0, 100);
+  /** The nonces of the lease locks this process holds now. */
+  const heldNonces = new Set<string>();
+
+  /** A lease lock's text, holder and time, or `undefined` if it is gone. */
+  async function readLock(
+    path: string,
+  ): Promise<
+    { text: string; host: string; pid: number; nonce: string; mtimeMs: number } | undefined
+  > {
+    const info = await lstat(path).catch(() => undefined);
+    if (info === undefined) return undefined;
+    if (!info.isFile()) throw new Error("The files folder's lease lock isn't a plain file.");
+    const text = await readFile(path, "utf8").catch(() => undefined);
+    if (text === undefined) return undefined;
+    const [host = "", pidText = "", nonce = ""] = text.split("\n");
+    return { text, host, pid: Number(pidText), nonce, mtimeMs: info.mtimeMs };
+  }
+
+  /**
+   * A lease lock whose holder is gone: on this host, a process that no
+   * longer exists, or this process when the nonce isn't one it holds (an
+   * earlier instance with the same PID, as after a container restart);
+   * anywhere, a lock older than two minutes or in the future by the file
+   * system's clock (its holder beats every 20 seconds).
+   */
+  async function lockIsStale(seen: { host: string; pid: number; nonce: string; mtimeMs: number }) {
+    if (seen.host === lockHost && Number.isSafeInteger(seen.pid) && seen.pid > 0) {
+      if (seen.pid === process.pid) {
+        if (!heldNonces.has(seen.nonce)) return true;
+      } else {
+        try {
+          process.kill(seen.pid, 0);
+        } catch (error) {
+          if ((error as { code?: unknown }).code !== "EPERM") return true;
+        }
+      }
+    }
+    const now = await fileSystemNow(root);
+    return now - seen.mtimeMs > LEASE_LOCK_STALE_MS || seen.mtimeMs - now > LEASE_LOCK_FUTURE_MS;
+  }
+
   const store: FileStore = {
     maxFileBytes,
     maxOrganizationBytes,
@@ -839,25 +924,23 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       } catch (error) {
         const code = (error as { code?: unknown }).code;
         // None there, or a link where a copy should be (`place` replaces it).
-        if (code === "ENOENT" || code === "ELOOP" || code === "ENOTDIR") return false;
+        if (code === "ENOENT" || code === "ELOOP" || code === "ENOTDIR") return "missing";
         throw error;
       }
       try {
         const info = await handle.stat();
-        if (!info.isFile() || info.nlink !== 1 || !safeOwnership(info)) return false;
+        if (!info.isFile() || info.nlink !== 1 || !safeOwnership(info)) return "missing";
         const before = (await handle.stat({ bigint: true })).mtimeNs;
-        const now = (await fileSystemNow(await safeFolder(organizationId, "incoming"))) / 1000;
-        await handle.utimes(now, now);
+        const nowMs = await fileSystemNow(await safeFolder(organizationId, "incoming"));
+        await handle.utimes(nowMs / 1000, nowMs / 1000);
         // The purge relies on every touch changing the time (S-052): if it
-        // came out the same (a coarse clock), two seconds later instead.
+        // came out the same, the later of now and a millisecond after it.
         if ((await handle.stat({ bigint: true })).mtimeNs === before) {
-          const later = Number(before / 1_000_000n) / 1000 + 2;
+          const later = Math.max(nowMs, Number(before / 1_000_000n) + 1) / 1000;
           await handle.utimes(later, later);
-          if ((await handle.stat({ bigint: true })).mtimeNs === before) {
-            throw new Error("The file system didn't change a stored copy's time.");
-          }
+          if ((await handle.stat({ bigint: true })).mtimeNs === before) return "unchanged";
         }
-        return true;
+        return "touched";
       } finally {
         await handle.close();
       }
@@ -1061,7 +1144,22 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       }
     },
 
-    async place(file) {
+    async inspect(file) {
+      const target = pathFor(file.organizationId, file.sha256);
+      const folder = await existingFolder(file.organizationId, "sha256", file.sha256.slice(0, 2));
+      if (folder === undefined) return undefined;
+      const info = await lstat(target, { bigint: true }).catch(() => undefined);
+      if (info === undefined) return undefined;
+      const plain =
+        info.isFile() &&
+        info.nlink === 1n &&
+        safeOwnership({ uid: Number(info.uid), mode: Number(info.mode) }) &&
+        Number(info.size) === file.size;
+      const same = plain && (await hashFile(target).catch(() => "")) === file.sha256;
+      return Object.freeze({ mtimeNs: info.mtimeNs, size: Number(info.size), ino: info.ino, same });
+    },
+
+    async place(file, prior) {
       const path = temporary.get(file);
       if (path === undefined) throw new Error("Not a file this store received.");
       const target = pathFor(file.organizationId, file.sha256);
@@ -1093,15 +1191,24 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
           return "stored";
         }
       }
-      // Already there: keep it only if it is surely the same content.
-      const existing = await lstat(target);
-      if (
+      // Already there: keep it only if it is surely the same content. With
+      // `prior`, by the hash taken before the lock (S-052 second review: no
+      // hashing under it), if the copy is still the one hashed.
+      const existing = await lstat(target, { bigint: true });
+      const plain =
         existing.isFile() &&
-        existing.nlink === 1 &&
-        safeOwnership(existing) &&
-        existing.size === file.size &&
-        (await hashFile(target)) === file.sha256
-      ) {
+        existing.nlink === 1n &&
+        safeOwnership({ uid: Number(existing.uid), mode: Number(existing.mode) }) &&
+        Number(existing.size) === file.size;
+      const same =
+        prior === undefined
+          ? plain && (await hashFile(target)) === file.sha256
+          : plain &&
+            prior.same &&
+            prior.mtimeNs === existing.mtimeNs &&
+            prior.ino === existing.ino &&
+            prior.size === file.size;
+      if (same) {
         await settle();
         return "already_stored";
       }
@@ -1188,10 +1295,8 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
 
     async withLeaseLock(work) {
       const path = join(root, LEASE_LOCK);
-      const host = hostname()
-        .replace(/[^A-Za-z0-9.-]/g, "_")
-        .slice(0, 100);
-      const mine = `${host}\n${String(process.pid)}\n${randomBytes(8).toString("hex")}\n`;
+      const nonce = randomBytes(12).toString("hex");
+      const mine = `${lockHost}\n${String(process.pid)}\n${nonce}\n`;
       const waitUntil = Date.now() + LEASE_LOCK_WAIT_MS;
       for (;;) {
         try {
@@ -1200,37 +1305,60 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
         } catch (error) {
           if ((error as { code?: unknown }).code !== "EEXIST") throw error;
         }
-        const info = await lstat(path).catch(() => undefined);
-        if (info !== undefined && !info.isFile()) {
-          throw new Error("The files folder's lease lock isn't a plain file.");
-        }
-        if (info !== undefined) {
-          const [theirHost = "", pidText = ""] = (
-            await readFile(path, "utf8").catch(() => "")
-          ).split("\n");
-          const pid = Number(pidText);
-          let gone = false;
-          if (theirHost === host && Number.isSafeInteger(pid) && pid > 0 && pid !== process.pid) {
-            try {
-              process.kill(pid, 0);
-            } catch (error) {
-              gone = (error as { code?: unknown }).code !== "EPERM";
+        const seen = await readLock(path);
+        if (seen !== undefined && (await lockIsStale(seen))) {
+          // Taken over by renaming the stale lock aside and checking it is the
+          // one judged stale (two takers can't both get it, review L1).
+          const aside = `${path}.${randomBytes(8).toString("hex")}`;
+          const moved = await rename(path, aside).then(
+            () => true,
+            () => false,
+          );
+          if (moved) {
+            const what = await readFile(aside, "utf8").catch(() => undefined);
+            if (what !== seen.text) {
+              // A live holder's lock was moved: put back, unless another came.
+              await link(aside, path).catch(() => undefined);
             }
+            await rm(aside, { force: true });
           }
-          if (gone || (await fileSystemNow(root)) - info.mtimeMs > LEASE_LOCK_STALE_MS) {
-            await rm(path, { force: true });
-            continue;
-          }
+          continue;
         }
-        if (Date.now() > waitUntil) throw new Error("The files folder's lease lock is held.");
+        if (Date.now() > waitUntil) throw new LeaseLockBusy();
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
+      heldNonces.add(nonce);
+      // A heartbeat while the work runs, so a long step never looks stale (L2).
+      const beat = setInterval(() => {
+        void readFile(path, "utf8")
+          .then(async (text) => {
+            if (text === mine) {
+              const now = (await fileSystemNow(root)) / 1000;
+              await utimes(path, now, now);
+            }
+          })
+          .catch(() => undefined);
+      }, options.leaseLockBeatMs ?? LEASE_LOCK_BEAT_MS);
+      beat.unref();
       try {
         return await work();
       } finally {
-        // Only our own: a holder taken over as stale must not remove the next one's.
+        clearInterval(beat);
+        heldNonces.delete(nonce);
+        // Only our own, by the same rename-and-check.
         if ((await readFile(path, "utf8").catch(() => undefined)) === mine) {
-          await rm(path, { force: true });
+          const aside = `${path}.${randomBytes(8).toString("hex")}`;
+          if (
+            await rename(path, aside).then(
+              () => true,
+              () => false,
+            )
+          ) {
+            if ((await readFile(aside, "utf8").catch(() => undefined)) !== mine) {
+              await link(aside, path).catch(() => undefined);
+            }
+            await rm(aside, { force: true });
+          }
         }
       }
     },
@@ -1330,9 +1458,12 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
           there.isFile() &&
           there.nlink === 1 &&
           safeOwnership(there) &&
-          (await hashFile(target)) === sha256
+          there.size === (await lstat(trashed)).size
         ) {
-          // The same content is stored already: the trashed copy isn't needed.
+          // A plain copy of ours of the right size is stored already (an
+          // upload placed it, its bytes checked as they came in): the
+          // trashed copy isn't needed. Nothing is hashed here, under the
+          // locks (S-052 second review).
           await rm(trashed, { force: true });
           answer = "already_stored";
         } else {

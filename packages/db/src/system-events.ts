@@ -24,6 +24,7 @@ export const SYSTEM_EVENT_KINDS = Object.freeze([
   "files_trashed",
   "files_deleted",
   "files_restored",
+  "files_identity_accepted",
 ] as const);
 export type SystemEventKind = (typeof SYSTEM_EVENT_KINDS)[number];
 
@@ -43,11 +44,15 @@ export interface NewSystemEvent {
 export interface NewFilePurgeEvent {
   /** The system manager, or `null` for the command line or the automatic run. */
   readonly actorId: UserId | null;
-  readonly kind: "files_trashed" | "files_deleted" | "files_restored";
+  readonly kind: "files_trashed" | "files_deleted" | "files_restored" | "files_identity_accepted";
   readonly files: number;
   readonly bytes: number;
-  /** `timer` for the daily automatic run (then `actorId` is null); left out otherwise. */
-  readonly source?: "timer";
+  /**
+   * `timer` for the daily automatic run, `lease` for trash put back when the
+   * lease was found moved (then `actorId` is null); left out otherwise.
+   * Only on the purge's own kinds.
+   */
+  readonly source?: "timer" | "lease";
 }
 
 /** Appends one row, stamped now by the database. */
@@ -75,7 +80,9 @@ export async function insertSystemEvent(
     !SYSTEM_EVENT_KINDS.includes(event.kind) ||
     // Checked as data too: a caller in plain JavaScript could send anything.
     ((event.source as unknown) !== undefined &&
-      ((event.source as unknown) !== "timer" || event.actorId !== null)) ||
+      (!["timer", "lease"].includes(event.source as unknown as string) ||
+        event.actorId !== null ||
+        event.kind === "files_identity_accepted")) ||
     !Number.isSafeInteger(event.files) ||
     event.files < 0 ||
     !Number.isSafeInteger(event.bytes) ||

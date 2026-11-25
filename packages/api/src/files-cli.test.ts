@@ -82,6 +82,27 @@ describe("files-cli", () => {
     writeFileSync(marker, kept);
   });
 
+  it("accepts this database's identity only while the folder's epoch is its own", async () => {
+    const marker = join(dir, STORE_MARKER);
+    const kept = readFileSync(marker, "utf8");
+    const [storeId, database, epoch] = kept.split("\n");
+    const oid = (database ?? "").split(":")[1] ?? "";
+    writeFileSync(marker, `${storeId ?? ""}\n987654321:${oid}\n${epoch ?? ""}\n`);
+    const refused = run(["purge", "--dry-run"]);
+    expect(await refused.done).toBe(1);
+    expect(refused.lines.join("\n")).toMatch(/files:accept-identity/);
+    const accepted = run(["accept-identity"]);
+    expect(await accepted.done).toBe(0);
+    expect(accepted.lines).toContain(
+      "The files folder now names this database. Nothing was deleted.",
+    );
+    expect(readFileSync(marker, "utf8").split("\n")[1]).toBe(database);
+    // Not while the epoch is another's.
+    writeFileSync(marker, `${storeId ?? ""}\n987654321:${oid}\n${newRecordId()}\n`);
+    expect(await run(["accept-identity"]).done).toBe(1);
+    writeFileSync(marker, kept);
+  });
+
   it("prints what is stuck in the trash and a step stopped early", () => {
     const none = { files: 0, bytes: 0 };
     const lines = purgeLines({

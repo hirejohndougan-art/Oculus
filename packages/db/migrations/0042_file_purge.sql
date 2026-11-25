@@ -12,6 +12,10 @@
 ALTER TABLE public.stored_file_events ADD COLUMN copy_mtime_ns bigint;
 ALTER TABLE public.stored_file_events ADD CONSTRAINT stored_file_events_copy_mtime
   CHECK (copy_mtime_ns IS NULL OR (kind = 'removed' AND copy_mtime_ns >= 0));
+-- An attach whose touch couldn't change the copy's time (a file system that
+-- ignores it): the purge can't tell that copy's later use, so it never
+-- takes that content.
+ALTER TABLE public.stored_file_events ADD COLUMN touch_failed boolean NOT NULL DEFAULT false;
 
 -- 2. The purge takes the folder's lease as a start or a renewal does: a new
 --    epoch, here first, then in the marker. Its rows say so.
@@ -98,12 +102,16 @@ ALTER TABLE public.system_events ADD COLUMN byte_count bigint
 ALTER TABLE public.system_events DROP CONSTRAINT system_events_kind_known;
 ALTER TABLE public.system_events ADD CONSTRAINT system_events_kind_known
   CHECK (kind IN ('update_installed', 'update_rolled_back',
-                  'files_trashed', 'files_deleted', 'files_restored'));
+                  'files_trashed', 'files_deleted', 'files_restored',
+                  'files_identity_accepted'));
 ALTER TABLE public.system_events ALTER COLUMN version DROP NOT NULL;
--- Who ran a purge with no person: NULL for the command line, 'timer' for
--- the daily run (OCULUS_FILES_AUTO_PURGE=on).
+-- Who changed files with no person: NULL for the command line, 'timer' for
+-- the daily run (OCULUS_FILES_AUTO_PURGE=on), 'lease' for the trash put back
+-- when the folder's lease was found moved. Only on the purge's kinds.
 ALTER TABLE public.system_events ADD COLUMN source text
-  CONSTRAINT system_events_source_known CHECK (source IS NULL OR (source = 'timer' AND actor_id IS NULL));
+  CONSTRAINT system_events_source_known CHECK (source IS NULL
+    OR (source IN ('timer', 'lease') AND actor_id IS NULL
+        AND kind IN ('files_trashed', 'files_deleted', 'files_restored')));
 ALTER TABLE public.system_events ADD CONSTRAINT system_events_shape
   CHECK (CASE WHEN kind IN ('update_installed', 'update_rolled_back')
               THEN version IS NOT NULL AND file_count IS NULL AND byte_count IS NULL

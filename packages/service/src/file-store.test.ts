@@ -410,10 +410,10 @@ describe("the second review's changes", () => {
     const path = own.pathFor(org, got.file.sha256);
     const past = new Date(Date.now() - 30 * 86_400_000);
     utimesSync(path, past, past);
-    expect(await own.touch(org, got.file.sha256)).toBe(true);
+    expect(await own.touch(org, got.file.sha256)).toBe("touched");
     expect(Date.now() - statSync(path).mtimeMs).toBeLessThan(60_000);
     // None there.
-    expect(await own.touch(org, "0".repeat(64))).toBe(false);
+    expect(await own.touch(org, "0".repeat(64))).toBe("missing");
     // A link where the copy should be is never followed.
     const target = join(fresh, "elsewhere");
     writeFileSync(target, "x");
@@ -421,7 +421,7 @@ describe("the second review's changes", () => {
     const linked = "a".repeat(64);
     mkdirSync(dirname(own.pathFor(org, linked)), { recursive: true });
     symlinkSync(target, own.pathFor(org, linked));
-    expect(await own.touch(org, linked)).toBe(false);
+    expect(await own.touch(org, linked)).toBe("missing");
     expect(Date.now() - lstatSync(target).mtimeMs).toBeGreaterThan(86_400_000);
     rmSync(fresh, { recursive: true, force: true });
   });
@@ -558,7 +558,7 @@ describe("the S-052 review's store changes", () => {
     const time = () => lstatSync(store.pathFor(other, sha(body)), { bigint: true }).mtimeNs;
     let before = time();
     for (let i = 0; i < 5; i++) {
-      expect(await store.touch(other, sha(body))).toBe(true);
+      expect(await store.touch(other, sha(body))).toBe("touched");
       expect(time()).not.toBe(before);
       before = time();
     }
@@ -627,6 +627,82 @@ describe("the S-052 review's store changes", () => {
     expect(await store.restoreFromTrash(other, sha(body))).toBe("none");
     expect(readFileSync(trashed).equals(body)).toBe(true);
     expect(existsSync(store.pathFor(other, sha(body)))).toBe(false);
+    rmSync(join(dir, other), { recursive: true, force: true });
+  });
+});
+
+describe("the S-052 second review's store changes", () => {
+  const host = () => hostname().replace(/[^A-Za-z0-9.-]/g, "_");
+
+  it("L1: two takers of a stale lock never hold it at once", async () => {
+    const lock = join(dir, LEASE_LOCK);
+    for (let round = 0; round < 5; round++) {
+      writeFileSync(lock, `${host()}\n999999999\nstale\n`);
+      let inside = 0;
+      let most = 0;
+      const work = async () => {
+        inside++;
+        most = Math.max(most, inside);
+        await new Promise((r) => setTimeout(r, 20));
+        inside--;
+      };
+      await Promise.all([store.withLeaseLock(work), store.withLeaseLock(work)]);
+      expect(most).toBe(1);
+      expect(existsSync(lock)).toBe(false);
+      expect(readdirSync(dir).filter((n) => n.startsWith(`${LEASE_LOCK}.`))).toEqual([]);
+    }
+  });
+
+  it("L3: a lock with this PID but a nonce it doesn't hold, or a time in the future, is stale", async () => {
+    const lock = join(dir, LEASE_LOCK);
+    writeFileSync(lock, `${host()}\n${String(process.pid)}\nnot-mine\n`);
+    expect(await store.withLeaseLock(() => Promise.resolve("taken"))).toBe("taken");
+    writeFileSync(lock, "another-host\n12\nabcd\n");
+    const future = new Date(Date.now() + 3600_000);
+    utimesSync(lock, future, future);
+    expect(await store.withLeaseLock(() => Promise.resolve("taken"))).toBe("taken");
+    expect(existsSync(lock)).toBe(false);
+  });
+
+  it("L2: a held lock's time moves on while the work runs, and a release only removes its own", async () => {
+    const beating = await openFileStore({ dir, leaseLockBeatMs: 30 });
+    const lock = join(dir, LEASE_LOCK);
+    await beating.withLeaseLock(async () => {
+      const old = new Date(Date.now() - 10 * 60_000);
+      utimesSync(lock, old, old);
+      await new Promise((r) => setTimeout(r, 200));
+      expect(Date.now() - statSync(lock).mtimeMs).toBeLessThan(60_000);
+      // Someone else's lock in its place by the end: left alone.
+      writeFileSync(lock, "another-host\n12\ntheirs\n");
+    });
+    expect(readFileSync(lock, "utf8")).toBe("another-host\n12\ntheirs\n");
+    rmSync(lock);
+  });
+
+  it("L2: place trusts the hash taken before the lock only while the copy is the one hashed", async () => {
+    const other = newOrganizationId();
+    const body = randomBytes(90);
+    const first = await store.receive(other, chunksOf(body));
+    if (!first.ok) throw new Error(first.code);
+    await store.place(first.file);
+    await store.discard(first.file);
+    const again = await store.receive(other, chunksOf(body));
+    if (!again.ok) throw new Error(again.code);
+    const prior = await store.inspect(again.file);
+    expect(prior?.same).toBe(true);
+    expect(await store.place(again.file, prior)).toBe("already_stored");
+    await store.discard(again.file);
+    // The copy changed after it was hashed (same size, other bytes): replaced.
+    const third = await store.receive(other, chunksOf(body));
+    if (!third.ok) throw new Error(third.code);
+    const seen = await store.inspect(third.file);
+    const path = store.pathFor(other, sha(body));
+    writeFileSync(path, randomBytes(90));
+    const later = new Date(Date.now() + 5000);
+    utimesSync(path, later, later);
+    expect(await store.place(third.file, seen)).toBe("stored");
+    expect(readFileSync(path).equals(body)).toBe(true);
+    await store.discard(third.file);
     rmSync(join(dir, other), { recursive: true, force: true });
   });
 });

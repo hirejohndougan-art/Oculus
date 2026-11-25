@@ -48,9 +48,11 @@ export {
   DEFAULT_MIN_FREE_FRACTION,
   STORE_MARKER,
   LEASE_LOCK,
+  LeaseLockBusy,
 } from "./file-store.js";
 export type {
   CopyStamp,
+  PlaceCheck,
   TrashEntry,
   FileStore,
   FileStoreOptions,
@@ -84,6 +86,7 @@ export type {
   AttachedFile,
   FileOperations,
   FileStoreProblem,
+  FileStoreWarning,
   FileSweep,
   RemoveFileOptions,
 } from "./files.js";

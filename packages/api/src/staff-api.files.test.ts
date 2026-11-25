@@ -1016,7 +1016,7 @@ describe("the files folder belongs to one install", () => {
       const blind: Database = {
         rows: (q) =>
           Sql.parts(q).join("").includes("pg_control_system")
-            ? Promise.reject(new Error("permission denied"))
+            ? Promise.reject(Object.assign(new Error("permission denied"), { code: "42501" }))
             : db.rows(q),
         execute: (q) => db.execute(q),
         transaction: (work) => db.transaction(work),
@@ -1155,7 +1155,7 @@ describe("a second database on the folder never deletes production's files (four
     }
   }, 120_000);
 
-  it("R1b: a copy taken right after production's renewal is refused at once, and production's next renewal sees it", async () => {
+  it("R1b: a copy taken right after production's renewal holds nothing and writes nothing, and production keeps its lease", async () => {
     const work = mkdtempSync(join(tmpdir(), "oculus-files-r1b-"));
     const name = `oculus_test_r1b_${randomBytes(6).toString("hex")}`;
     let copy: Database | undefined;
@@ -1171,17 +1171,19 @@ describe("a second database on the folder never deletes production's files (four
       copy = openDatabase(await restoreInto(join(work, "a.dump"), name), { max: 3 });
       const copyService = createService(copy, { files: store });
       // A dump restored is another database (its identity, in the marker,
-      // differs): even with the folder's very epoch it is refused at once
-      // (S-052 review B1a), and the lease is poisoned.
+      // differs): even with the folder's very epoch it holds nothing, and
+      // writes nothing (S-052 reviews), so production keeps its lease.
+      const before = readFileSync(join(filesDir, STORE_MARKER), "utf8");
       expect(await copyService.bindFileStore()).toEqual({
         ok: true,
-        warning: "files_shared_or_restored",
+        warning: "files_identity_changed",
       });
-      // Production's next hourly renewal finds the folder isn't its own either.
-      expect(await createService(w.db, { files: store }).renewFileLease()).toBe(false);
+      expect(readFileSync(join(filesDir, STORE_MARKER), "utf8")).toBe(before);
+      expect(await createService(w.db, { files: store }).renewFileLease()).toBe(true);
       await removeVia(copy, asset, xId);
       await backdate(copy, { fileId: xId }, "8 days");
       expect(await copyService.sweepFiles(0)).toMatchObject({ failed: 0 });
+      // Production renewed, so the copy's epoch is behind too now.
       expect(await copyService.purgeFiles({ apply: true })).toEqual({
         ok: false,
         problem: "lease_mismatch",

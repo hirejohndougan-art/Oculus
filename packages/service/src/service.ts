@@ -3017,6 +3017,9 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
       options.thumbnails,
       options.thumbnailLimits,
       options.thumbnailsEnabled,
+      (code) => {
+        onError?.(Object.assign(new Error(code), { code }), "files");
+      },
     ),
     ...shareOperations(db, run, outside),
     submitForReview: workflowAction("submit_for_review"),

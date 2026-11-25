@@ -39,7 +39,7 @@ export const STORED_FILE_TABLE_PRIVILEGES: Readonly<Record<string, readonly stri
     file_store_binding: Object.freeze(["INSERT"]),
     // The folder's lease, a new epoch at each start, hour and purge (0039).
     file_store_epochs: Object.freeze(["INSERT"]),
-    // The purge's two steps, append-only (0042, S-052).
+    // The purge's two steps, append-only (S-052's migration).
     file_purge_steps: Object.freeze(["INSERT"]),
   });
 
@@ -312,6 +312,8 @@ export async function insertStoredFileEvent(
   file: Pick<StoredFile, "id" | "recordId" | "sha256" | "size">,
   actor: string,
   copyMtimeNs?: bigint,
+  /** The attach's touch couldn't change the copy's time: the purge never takes the content. */
+  touchFailed = false,
 ): Promise<void> {
   checkOrganization(organizationId);
   if (!(STORED_FILE_EVENT_KINDS as readonly string[]).includes(kind)) {
@@ -324,9 +326,10 @@ export async function insertStoredFileEvent(
   const mtime = copyMtimeNs === undefined ? null : copyMtimeNs.toString();
   await tx.execute(sql`
     INSERT INTO public.stored_file_events (organization_id, id, kind, file_id, record_id, sha256,
-      byte_size, actor, copy_mtime_ns)
+      byte_size, actor, copy_mtime_ns, touch_failed)
     VALUES (${organizationId}::uuid, gen_random_uuid(), ${kind}, ${file.id}::uuid,
-      ${file.recordId}::uuid, ${file.sha256}, ${file.size}::bigint, ${actor}, ${mtime}::bigint)`);
+      ${file.recordId}::uuid, ${file.sha256}, ${file.size}::bigint, ${actor}, ${mtime}::bigint,
+      ${touchFailed}::boolean)`);
 }
 
 /** How long a removed file's bytes stay before the purge may move them to the trash (7 days). */
@@ -351,11 +354,12 @@ export interface PurgeCandidate {
 /**
  * The organization's contents the purge may move to the trash (S-052,
  * D-086), **denying by default**: nothing keeps the content (the one list
- * of what does is the database's `stored_content_kept`, 0042: today a
+ * of what does is the database's `stored_content_kept` (S-052's migration): today a
  * stored_files row; S-040's quarantine adds one line there); this
  * database's newest event for it (counting only events since `since`, the
  * last `files:adopt`) is a removal that logged the copy's time, at least
- * `REMOVED_FILE_GRACE_SECONDS` old by the database's clock; and it isn't
+ * `REMOVED_FILE_GRACE_SECONDS` old by the database's clock; no attach of it
+ * ever failed to change the copy's time (`touch_failed`); and it isn't
  * in the trash already (its newest purge step after that removal isn't
  * `trashed`). Copies an attach placed but never committed, and content
  * this database has no removal of, are kept. `only` limits it to some
@@ -394,6 +398,10 @@ export async function purgeCandidates(
       AND l.occurred_at <= clock_timestamp()
         - make_interval(secs => ${REMOVED_FILE_GRACE_SECONDS}::integer)
       AND NOT public.stored_content_kept(${organizationId}::uuid, l.sha256)
+      -- An attach couldn't change this copy's time: never taken.
+      AND NOT EXISTS (SELECT 1 FROM public.stored_file_events t
+                      WHERE t.organization_id = ${organizationId}::uuid AND t.sha256 = l.sha256
+                        AND t.touch_failed)
       AND NOT EXISTS (
         SELECT 1 FROM (
           SELECT p.kind FROM public.file_purge_steps p
@@ -581,15 +589,30 @@ export async function insertFileStoreEpoch(
 export async function databaseIdentity(db: Queryable): Promise<string> {
   const rows = await db.rows<{ oid: string }>(sql`
     SELECT oid::text AS oid FROM pg_catalog.pg_database WHERE datname = current_database()`);
+  const oid = rows[0]?.oid;
+  if (oid === undefined) throw new Error("This database's OID can't be read.");
   let system = "-";
   try {
     const control = await db.rows<{ id: string }>(sql`
       SELECT system_identifier::text AS id FROM pg_catalog.pg_control_system()`);
     system = control[0]?.id ?? "-";
-  } catch {
-    // Not readable by this role: the OID alone.
+  } catch (error) {
+    // Only "not allowed" (42501) means this role can't read it; any other
+    // error (a timeout, a lost connection) is thrown, never taken as an
+    // identity (S-052 second review).
+    const code = Object.getOwnPropertyDescriptor(error, "code")?.value as unknown;
+    if (code !== "42501") throw error;
   }
-  return `${system}:${rows[0]?.oid ?? "-"}`;
+  return `${system}:${oid}`;
+}
+
+/**
+ * Whether an identity tells databases apart: one read without the cluster's
+ * system identifier (`-:<oid>`) doesn't, since the first database of every
+ * fresh cluster gets the same OID. The purge never runs on one.
+ */
+export function identityKnown(identity: string): boolean {
+  return !identity.startsWith("-:");
 }
 
 /** Which of these organization IDs exist in this database. */

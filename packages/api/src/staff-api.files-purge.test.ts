@@ -11,7 +11,7 @@
 // the admin's routes (system managers, a recent sign-in, the change log);
 // and the timer off unless turned on. Every person, record and file is
 // invented.
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
   existsSync,
@@ -24,7 +24,7 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { csrfTokenFor, type OrganizationId, type UserId } from "@oculus/core";
@@ -35,6 +35,7 @@ import {
   readAuditTrail,
   readFileStoreLease,
   sql,
+  Sql,
   type Database,
 } from "@oculus/db";
 import {
@@ -620,28 +621,247 @@ describe("the review's fixes (S-052 review)", () => {
   });
 });
 
-describe("Clean up removed files in the admin", () => {
-  async function call(method: "GET" | "POST", as: string, body?: unknown) {
-    const token = tokens[as] ?? "";
-    const headers: Record<string, string> = {
-      origin: SAME_ORIGIN.origin,
-      cookie: `${OCULUS_COOKIES.session}=${token}`,
+describe("the second review's fixes (S-052)", () => {
+  const markerText = () => readFileSync(join(dir, STORE_MARKER), "utf8");
+  const markerLines = () => markerText().split("\n");
+
+  /** `w.db`, but `pg_control_system()` fails with `code` (42501: not allowed). */
+  function failingControl(code: string): Database {
+    return {
+      rows: (q) =>
+        Sql.parts(q).join("").includes("pg_control_system")
+          ? Promise.reject(Object.assign(new Error("invented failure"), { code }))
+          : w.db.rows(q),
+      execute: (q) => w.db.execute(q),
+      transaction: (work) => w.db.transaction(work),
+      close: () => Promise.resolve(),
     };
-    if (method !== "GET") headers[CSRF_HEADER] = csrfTokenFor(token) ?? "";
-    let payload: string | undefined;
-    if (body !== undefined) {
-      payload = JSON.stringify(body);
-      headers["content-type"] = "application/json";
-    }
-    const res = await app.inject({
-      method,
-      url: "/api/system/files/cleanup",
-      headers,
-      ...(payload === undefined ? {} : { payload }),
-    });
-    return { status: res.statusCode, json: JSON.parse(res.body) as Record<string, unknown> };
   }
 
+  it("R2-B1: an identity without the cluster's system identifier never purges, and a renewal never holds by it", async () => {
+    const { body } = await removedLongAgo();
+    const blind = failingControl("42501");
+    expect((await databaseIdentity(blind)).startsWith("-:")).toBe(true);
+    const unknown = createService(blind, { files: store });
+    const before = markerText();
+    for (const apply of [false, true]) {
+      expect(await unknown.purgeFiles({ apply })).toEqual({
+        ok: false,
+        problem: "identity_unknown",
+      });
+    }
+    expect(markerText()).toBe(before);
+    expect(has(body)).toBe(true);
+    // Its renewal finds the marker naming the full identity: it holds nothing.
+    expect(await unknown.bindFileStore()).toEqual({
+      ok: true,
+      warning: "files_identity_changed",
+    });
+    expect(markerText()).toBe(before);
+    await drain();
+  });
+
+  it("R2-B2: a transient error reading the identity is thrown, never taken as a mismatch", async () => {
+    const timedOut = failingControl("57014");
+    await expect(databaseIdentity(timedOut)).rejects.toThrow("invented failure");
+    const before = markerText();
+    await expect(createService(timedOut, { files: store }).renewFileLease()).rejects.toThrow();
+    await expect(
+      createService(timedOut, { files: store }).purgeFiles({ apply: false }),
+    ).rejects.toThrow();
+    // An adopt (past its quiet wait) never writes `-:` after a failed read.
+    const quiet = new Date(Date.now() - ADOPT_QUIET_MS - 60_000);
+    utimesSync(join(dir, STORE_MARKER), quiet, quiet);
+    await expect(createService(timedOut, { files: store }).adoptFileStore()).rejects.toThrow();
+    expect(markerText()).toBe(before);
+    expect(await service.renewFileLease()).toBe(true);
+  });
+
+  it("R2-B2: after a pg_upgrade the lease isn't poisoned: the purge says identity_changed until a system manager accepts it", async () => {
+    const { body } = await removedLongAgo();
+    // As a pg_upgrade would: a new system identifier, the epoch still ours.
+    const [storeId = "", database = "", epoch = ""] = markerLines();
+    const oid = database.split(":")[1] ?? "";
+    writeFileSync(join(dir, STORE_MARKER), `${storeId}\n1234567890123456789:${oid}\n${epoch}\n`);
+    const changed = markerText();
+    expect(await service.renewFileLease()).toBe(true);
+    expect(await service.bindFileStore()).toEqual({
+      ok: true,
+      warning: "files_identity_changed",
+    });
+    for (const apply of [false, true]) {
+      expect(await service.purgeFiles({ apply })).toEqual({
+        ok: false,
+        problem: "identity_changed",
+      });
+    }
+    // Nothing was written: not by the renewal, the bind or the dry run.
+    expect(markerText()).toBe(changed);
+    expect((await call("GET", "root")).json).toEqual({
+      available: false,
+      problem: "identity_changed",
+    });
+    // Accepting needs a recent sign-in, then rewrites the marker at once.
+    expect(
+      (await callPath("POST", "/api/system/files/cleanup/accept-identity", "stale", {})).status,
+    ).toBe(403);
+    expect(
+      (await callPath("POST", "/api/system/files/cleanup/accept-identity", "manager", {})).status,
+    ).toBe(403);
+    const accepted = await callPath(
+      "POST",
+      "/api/system/files/cleanup/accept-identity",
+      "root",
+      {},
+    );
+    expect(accepted).toEqual({ status: 200, json: { accepted: true, changed: true } });
+    expect(markerLines()[1]).toBe(await databaseIdentity(w.db));
+    const log = await w.db.rows<{ actor_id: string }>(sql`
+      SELECT actor_id::text AS actor_id FROM public.system_events
+      WHERE kind = 'files_identity_accepted'`);
+    expect(log).toEqual([{ actor_id: w.root }]);
+    expect(await service.acceptFileStoreIdentity()).toEqual({ ok: true, changed: false });
+    expect((await purge()).trashed.files).toBe(1);
+    expect(has(body)).toBe(false);
+    await drain();
+  });
+
+  it("R2-B2: a poisoned marker is never poisoned again, so an adopt can find it quiet with servers running", async () => {
+    const [storeId = "", database = ""] = markerLines();
+    writeFileSync(join(dir, STORE_MARKER), `${storeId}\n${database}\n${randomUUID()}\n`);
+    expect(await service.renewFileLease()).toBe(false);
+    const poisoned = markerText();
+    expect(poisoned.split("\n")[1]?.startsWith("poisoned:")).toBe(true);
+    const old = new Date(Date.now() - 4 * 3600_000);
+    utimesSync(join(dir, STORE_MARKER), old, old);
+    // The next renewals, a bind and dry and real purges write nothing.
+    expect(await service.renewFileLease()).toBe(false);
+    expect((await service.bindFileStore()).ok).toBe(true);
+    expect(await service.purgeFiles({ apply: false })).toEqual({
+      ok: false,
+      problem: "lease_mismatch",
+    });
+    expect(await service.purgeFiles({ apply: true })).toEqual({
+      ok: false,
+      problem: "lease_mismatch",
+    });
+    expect(markerText()).toBe(poisoned);
+    expect(Date.now() - statSync(join(dir, STORE_MARKER)).mtimeMs).toBeGreaterThan(3 * 3600_000);
+    // So the adopt goes through without stopping this server.
+    expect(await service.adoptFileStore()).toEqual({ ok: true });
+    await ageEpochsOf(w.db, 30);
+    expect(await service.renewFileLease()).toBe(true);
+  }, 30_000);
+
+  it("a copy whose time can't be changed still attaches, is never purged, and is logged as a warning", async () => {
+    const warned: string[] = [];
+    const stuckClock: FileStore = { ...store, touch: () => Promise.resolve("unchanged" as const) };
+    const careless = createService(w.db, {
+      files: stuckClock,
+      onError: (error) => warned.push(String((error as { code?: unknown }).code)),
+    });
+    const body = bytes();
+    const fileId = await attach(body, asset, careless);
+    expect(warned).toContain("copy_time_unchanged");
+    const flagged = await w.db.rows<{ n: number }>(sql`
+      SELECT count(*)::int AS n FROM public.stored_file_events
+      WHERE sha256 = ${sha(body)} AND touch_failed`);
+    expect(flagged[0]?.n).toBeGreaterThan(0);
+    ageCopy(body, 10);
+    await remove(fileId);
+    await ageEvents(w.db, body, 8);
+    expect((await purge()).trashed.files).toBe(0);
+    expect(has(body)).toBe(true);
+  });
+
+  it("writes files_restored rows for an upload's restore and for trash put back when the lease moved", async () => {
+    const one = await removedLongAgo();
+    expect((await purge()).trashed.files).toBe(1);
+    await attach(one.body);
+    const byUpload = await w.db.rows<{ actor_id: string | null; source: string | null }>(sql`
+      SELECT actor_id::text AS actor_id, source FROM public.system_events
+      WHERE kind = 'files_restored' ORDER BY occurred_at DESC LIMIT 1`);
+    expect(byUpload).toEqual([{ actor_id: w.root, source: null }]);
+    const two = await removedLongAgo();
+    expect((await purge()).trashed.files).toBe(1);
+    const [storeId = "", database = ""] = markerLines();
+    writeFileSync(join(dir, STORE_MARKER), `${storeId}\n${database}\n${randomUUID()}\n`);
+    expect(await service.renewFileLease()).toBe(false);
+    expect(has(two.body)).toBe(true);
+    const byLease = await w.db.rows<{ actor_id: string | null; source: string | null }>(sql`
+      SELECT actor_id::text AS actor_id, source FROM public.system_events
+      WHERE kind = 'files_restored' ORDER BY occurred_at DESC LIMIT 1`);
+    expect(byLease).toEqual([{ actor_id: null, source: "lease" }]);
+    const past = new Date(Date.now() - ADOPT_QUIET_MS - 60_000);
+    utimesSync(join(dir, STORE_MARKER), past, past);
+    expect(await service.adoptFileStore()).toEqual({ ok: true });
+    await ageEpochsOf(w.db, 30);
+    await drain();
+  }, 30_000);
+
+  it("allows source = 'timer' or 'lease' only on the purge's kinds", async () => {
+    await expect(
+      w.db.execute(sql`
+        INSERT INTO public.system_events (id, kind, version, source)
+        VALUES (${randomUUID()}::uuid, 'update_installed', '1.0.0', 'timer')`),
+    ).rejects.toThrow(/system_events_source_known/);
+  });
+
+  it("L3: starting while another server holds the lease lock is a warning, not a refusal", async () => {
+    const lock = join(dir, LEASE_LOCK);
+    writeFileSync(
+      lock,
+      `${hostname().replace(/[^A-Za-z0-9.-]/g, "_")}\n${String(process.ppid)}\nlive\n`,
+    );
+    try {
+      expect(await service.bindFileStore()).toEqual({ ok: true, warning: "files_lease_busy" });
+    } finally {
+      rmSync(lock, { force: true });
+    }
+    expect(await service.renewFileLease()).toBe(true);
+  }, 30_000);
+});
+
+/** Moves a database's lease epochs back (their order kept), as the owner. */
+async function ageEpochsOf(db: Database, days: number): Promise<void> {
+  await db.transaction(async (q) => {
+    await q.execute(
+      sql`ALTER TABLE public.file_store_epochs DISABLE TRIGGER file_store_epochs_append_only`,
+    );
+    await q.execute(sql`
+      UPDATE public.file_store_epochs SET made_at = made_at - make_interval(days => ${days})`);
+    await q.execute(
+      sql`ALTER TABLE public.file_store_epochs ENABLE ALWAYS TRIGGER file_store_epochs_append_only`,
+    );
+  });
+}
+
+/** A request to a purge route, as `as`. */
+async function callPath(method: "GET" | "POST", url: string, as: string, body?: unknown) {
+  const token = tokens[as] ?? "";
+  const headers: Record<string, string> = {
+    origin: SAME_ORIGIN.origin,
+    cookie: `${OCULUS_COOKIES.session}=${token}`,
+  };
+  if (method !== "GET") headers[CSRF_HEADER] = csrfTokenFor(token) ?? "";
+  let payload: string | undefined;
+  if (body !== undefined) {
+    payload = JSON.stringify(body);
+    headers["content-type"] = "application/json";
+  }
+  const res = await app.inject({
+    method,
+    url,
+    headers,
+    ...(payload === undefined ? {} : { payload }),
+  });
+  return { status: res.statusCode, json: JSON.parse(res.body) as Record<string, unknown> };
+}
+
+const call = (method: "GET" | "POST", as: string, body?: unknown) =>
+  callPath(method, "/api/system/files/cleanup", as, body);
+
+describe("Clean up removed files in the admin", () => {
   it("is for system managers; a step needs a recent sign-in and goes to the change log", async () => {
     const { body } = await removedLongAgo();
     expect((await call("GET", "manager")).status).toBe(403);
@@ -811,10 +1031,12 @@ describe("another database on the folder (fifth review RV1, RV2; review B1; R1b'
       expect((await readFileStoreLease(copy.db))?.epoch).toBe(
         readFileSync(join(dir, STORE_MARKER), "utf8").split("\n")[2],
       );
-      // Starting, it finds the marker names another database: not its lease.
+      // Starting, it finds the marker names another database: not its
+      // lease, and it writes nothing to the marker.
+      const marker = readFileSync(join(dir, STORE_MARKER), "utf8");
       expect(await copy.s.bindFileStore()).toEqual({
         ok: true,
-        warning: "files_shared_or_restored",
+        warning: "files_identity_changed",
       });
       // The copy removes X, and by its clocks X is old.
       await remove(fileId, copy.s);
@@ -822,35 +1044,36 @@ describe("another database on the folder (fifth review RV1, RV2; review B1; R1b'
       for (const apply of [false, true]) {
         expect(await copy.s.purgeFiles({ apply })).toEqual({
           ok: false,
-          problem: "lease_mismatch",
+          problem: "identity_changed",
         });
       }
+      expect(readFileSync(join(dir, STORE_MARKER), "utf8")).toBe(marker);
       expect(await store.trashEntries(w.a)).toEqual([]);
       expect(has(body)).toBe(true);
-      // A day on, still nothing; production finds the lease poisoned too.
+      // Production starts again and still holds its lease.
+      expect(await service.bindFileStore()).toEqual({ ok: true });
       expect((await copy.s.purgeFiles({ apply: true })).ok).toBe(false);
-      expect(await service.bindFileStore()).toEqual({
-        ok: true,
-        warning: "files_shared_or_restored",
-      });
       expect(has(body)).toBe(true);
     });
   }, 120_000);
 
-  it("a logical restore that matched the folder's epoch is refused even in the middle of a purge's checks, and the trash goes back", async () => {
-    await withCopy("b1mid", async (step) => {
-      // Production trashed Y in a step; then a dump is restored and asked to purge.
+  it("a dry run in a logical copy writes nothing: not the marker, not the trash, and production keeps its lease", async () => {
+    await withCopy("b1dry", async (step) => {
+      // Production trashed Y in a step; then a dump is restored and asked.
       const { body } = await removedLongAgo();
       expect((await purge()).trashed.files).toBe(1);
       await step();
       const copy = await step();
-      expect(await copy.s.purgeFiles({ apply: false })).toEqual({
-        ok: false,
-        problem: "lease_mismatch",
-      });
-      // Refusing poisoned the lease and put the trash back.
-      expect(has(body)).toBe(true);
-      expect(await service.renewFileLease()).toBe(false);
+      const marker = readFileSync(join(dir, STORE_MARKER), "utf8");
+      for (const apply of [false, true]) {
+        expect(await copy.s.purgeFiles({ apply })).toEqual({
+          ok: false,
+          problem: "identity_changed",
+        });
+      }
+      expect(readFileSync(join(dir, STORE_MARKER), "utf8")).toBe(marker);
+      expect(existsSync(join(trashOf(body), "content"))).toBe(true);
+      expect(await service.renewFileLease()).toBe(true);
     });
   }, 120_000);
 

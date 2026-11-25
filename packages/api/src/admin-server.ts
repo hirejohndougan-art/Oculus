@@ -491,10 +491,12 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     claim.release();
     throw new Error(`refusing to start: ${FILES_DIR_ENV}: ${FILE_STORE_PROBLEMS[bound.problem]}`);
   }
-  if (bound.warning === "files_shared_or_restored") {
-    // Another database uses this folder, or this one was restored or
-    // copied: it starts, and an operator runs `files:adopt` once sure.
-    log({ event: "startup_warning", code: "files_shared_or_restored" });
+  if (bound.warning !== undefined) {
+    // Another database uses this folder, or this one was restored, copied
+    // or upgraded, or its identity can't be read, or the lease lock was
+    // busy: it starts; the purge refuses until an operator adopts or a
+    // system manager accepts the identity (D-086).
+    log({ event: "startup_warning", code: bound.warning });
   }
   const renew = async (): Promise<void> => {
     try {

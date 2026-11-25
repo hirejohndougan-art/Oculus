@@ -18,10 +18,14 @@
  * lease: holding the folder's lease lock (a lock file beside the marker,
  * `withLeaseLock`) and the database's lease lock (advisory class 70), the
  * marker must name this install (`file_store_binding`), the database's
- * current epoch **and this database's identity** (a pg_dump or logical
- * restore has another: refused, and the lease is poisoned and the trash put
- * back, as a renewal would); a new epoch is committed here, then put in the
- * marker. Every step after that takes the same two locks, then the
+ * current epoch **and this database's identity**: a pg_dump or logical
+ * restore has another, and so does this database after a pg_upgrade or a
+ * move, so the run is refused (`identity_changed`, writing nothing) until a
+ * system manager accepts the identity (`acceptFileStoreIdentity`) or an
+ * adopt. An identity read without the cluster's system identifier
+ * (`-:<oid>`) tells nothing (every fresh cluster's first database has the
+ * same OID): refused (`identity_unknown`). A new epoch is committed here,
+ * then put in the marker. Every step after that takes the same two locks, then the
  * organization's file lock (class 69, the one every attach takes), and
  * checks the lease again, and that the run's time (`PURGE_LEASE_MS`, by the
  * process's monotonic clock) isn't up. A start, an hourly renewal or
@@ -54,6 +58,7 @@ import {
   TRASH_GRACE_SECONDS,
   databaseIdentity,
   existingOrganizations,
+  identityKnown,
   insertFilePurgeStep,
   insertFileStoreEpoch,
   insertSystemEvent,
@@ -90,12 +95,20 @@ export type PurgeProblem =
   | "not_bound"
   /** The folder's marker names another install. */
   | "other_install"
-  /**
-   * The folder's epoch isn't this database's, or the marker names another
-   * database (a dump or logical restore of this one): another database
-   * uses the folder, or this one was restored or copied.
-   */
+  /** The folder's epoch isn't this database's: another database uses it, or this one was restored. */
   | "lease_mismatch"
+  /**
+   * The epoch is this database's but the marker names another database's
+   * identity: a dump or logical restore of the one that wrote it, or this
+   * database after a pg_upgrade or a move. Accept the identity or adopt.
+   */
+  | "identity_changed"
+  /**
+   * This role can't read the cluster's system identifier, so this database
+   * can't be told from a restore of it into a fresh cluster: a superuser
+   * grants it `EXECUTE` on `pg_catalog.pg_control_system()`.
+   */
+  | "identity_unknown"
   /** The file system doesn't keep modification times exactly enough to compare copies by them. */
   | "mtime_unreliable";
 
@@ -174,12 +187,6 @@ export async function runFilePurge(
   db: Database,
   store: FileStore | undefined,
   options: PurgeOptions,
-  /**
-   * Called when the marker holds this database's epoch but names another
-   * database (a dump or logical restore of this one): the caller poisons
-   * the lease and puts the trash back (`renewFileLease` does both).
-   */
-  onIdentityMismatch?: () => Promise<void>,
 ): Promise<PurgeResult> {
   if (store === undefined) return { ok: false, problem: "no_store" };
   const files: FileStore = store;
@@ -202,6 +209,9 @@ export async function runFilePurge(
   const monotonic = options.monotonic ?? (() => performance.now());
   const leaseMs = options.leaseMs ?? PURGE_LEASE_MS;
   const identity = await databaseIdentity(db);
+  // Without the cluster's system identifier this database can't be told
+  // from a restore into a fresh cluster (both `-:16385`): never.
+  if (!identityKnown(identity)) return { ok: false, problem: "identity_unknown" };
 
   /**
    * Whether the marker is this run's lease: this install, `epoch`, and this
@@ -216,14 +226,18 @@ export async function runFilePurge(
   const epoch = randomUUID();
   const taken = await files.withLeaseLock(async () => {
     const answer = await db.transaction(
-      async (tx): Promise<PurgeProblem | "identity" | { since: string | null }> => {
+      async (tx): Promise<PurgeProblem | { since: string | null }> => {
         await lockFileStoreLease(tx);
         if ((await readFileStoreBinding(tx)) !== bound) return "not_bound";
-        const marker = await files.readMarker().catch(() => undefined);
+        const marker = await files.readMarker();
         if (marker?.storeId !== bound) return "other_install";
         const lease = await readFileStoreLease(tx);
         if (lease === undefined || marker.epoch !== lease.epoch) return "lease_mismatch";
-        if (!holds(marker, lease.epoch)) return "identity";
+        // The epoch is ours but the marker names another database: a dump or
+        // logical restore of the one that wrote it, or this one after a
+        // pg_upgrade. Refused, and nothing is written (a dry run included),
+        // until a system manager accepts the identity or an adopt.
+        if (!holds(marker, lease.epoch)) return "identity_changed";
         if (apply) await insertFileStoreEpoch(tx, epoch, "purge", identity);
         return { since: lease.since };
       },
@@ -233,10 +247,6 @@ export async function runFilePurge(
     }
     return answer;
   });
-  if (taken === "identity") {
-    await onIdentityMismatch?.();
-    return { ok: false, problem: "lease_mismatch" };
-  }
   if (typeof taken === "string") return { ok: false, problem: taken };
   const deadline = monotonic() + leaseMs;
   const since = taken.since;
@@ -256,7 +266,7 @@ export async function runFilePurge(
         await lockFileStoreLease(tx);
         await lockOrganizationFiles(tx, organizationId);
         if (monotonic() >= deadline) throw new LeaseEnded("lease_expired");
-        const marker = await files.readMarker().catch(() => undefined);
+        const marker = await files.readMarker();
         const lease = await readFileStoreLease(tx);
         if (!holds(marker, epoch) || lease?.epoch !== epoch) throw new LeaseEnded("lease_lost");
         return work(tx);
@@ -479,7 +489,17 @@ export async function restoreAllTrash(db: Database, store: FileStore): Promise<n
     for (const entry of await store.trashEntries(organizationId)) {
       const back = await db.transaction(async (tx) => {
         await lockOrganizationFiles(tx, organizationId);
-        return store.restoreFromTrash(organizationId, entry.sha256);
+        const answer = await store.restoreFromTrash(organizationId, entry.sha256);
+        if (answer !== "none") {
+          await insertSystemEvent(tx, {
+            actorId: null,
+            kind: "files_restored",
+            files: 1,
+            bytes: entry.size,
+            source: "lease",
+          });
+        }
+        return answer;
       });
       if (back !== "none") restored++;
     }
