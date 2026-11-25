@@ -7,7 +7,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - **Done:** `vitest.config.js` sets `testTimeout` 30 s and `hookTimeout` 120 s for the suite. The 19 db and service test files that set up their database lazily in `ready()` now warm it in `beforeAll`, with the error kept in the memoized promise so a missing database still fails each test on its own. `migrate.test`'s leaked-setting test uses `statement_timeout = '20ms'` against a 200 ms sleep (was 1 ms against 50 ms). The two second-factor deadlock tests wait for a backend blocked by the specific lock holder (`pg_blocking_pids`) and fail clearly after 20 s instead of releasing after 5 s. No assertion changes.
 - **Checked:** with 10 busy loops on this 2-core machine, main's `second-factor` and `vocabularies` files failed with two 5000 ms timeouts; this branch passed all 137 tests in those files and `migrate.test`.
 - Review: one independent round: safe (no weakened test, swallowed setup errors still fail each test, the waits find the right backend). Its one note, the 20 s wait running into the 30 s test limit, fixed by giving the two deadlock tests 60 s.
-- Gate: GATE_PLACEHOLDER
+- Gate: PASS · tests_passing 5233 (was 5233; U-008 adds no tests, it makes existing ones hold up under load) · npm audit clean
 
 ## 2026-11-25 16:05 CT — manual (Chat M) — T-075 Accept an invitation
 - Result: done
