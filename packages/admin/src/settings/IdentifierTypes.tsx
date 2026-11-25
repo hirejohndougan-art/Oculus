@@ -229,12 +229,13 @@ function TypeForm(props: {
   const [draft, setDraft] = useState<TypeDraft>(() =>
     stored === undefined ? newTypeDraft(organizationId) : typeDraft(stored.type),
   );
-  const [asked, setAsked] = useState<TypeConfirmation>();
+  const [asked, setAsked] = useState<TypeConfirmation & { listChanged?: boolean }>();
   const [edited, setEdited] = useState(false);
   const saved = props.justSaved === true && !edited;
   const dropped = props.dropped ?? [];
   const key = props.typeKey ?? newKey.trim();
   const leaving = useRef(false);
+  const sentKey = useRef("");
 
   // Leaving with unsaved changes: ask in the app; the browser asks on reload.
   const blocker = useBlocker(
@@ -277,17 +278,31 @@ function TypeForm(props: {
       }),
     onSuccess: async (reply) => {
       setAsked(undefined);
-      // The record editor's copy of the types is out of date too.
+      // Saved: nothing left to warn about (a save that changed nothing keeps the tag).
+      setEdited(false);
       props.onSaved?.(reply.tag, reply.droppedFromPublic ?? []);
       await queries.invalidateQueries({ queryKey: typesKey(organizationId) });
       if (stored === undefined) {
         leaving.current = true;
-        await navigate(`/settings/identifier-types/${key}`, { replace: true });
+        // The key that was sent, never one typed while the request ran.
+        await navigate(`/settings/identifier-types/${sentKey.current}`, { replace: true });
       }
     },
     onError: (error, sent) => {
-      if (!(error instanceof ApiError && error.code === "confirmation_required")) return;
-      setAsked(mergedConfirmation(sent, typeConfirmationOf(issuesOf(error.body))));
+      if (!(error instanceof ApiError && error.code === "confirmation_required")) {
+        // Any other answer ends the confirmation: the error note says what happened.
+        setAsked(undefined);
+        return;
+      }
+      const next = typeConfirmationOf(issuesOf(error.body));
+      const merged = mergedConfirmation(sent, next);
+      // Asked again only because the published records changed meanwhile: say so.
+      const changed =
+        sent !== undefined &&
+        next.dropped.length > 0 &&
+        (next.dropped.length !== sent.dropped.length ||
+          next.dropped.some((id) => !sent.dropped.includes(id)));
+      setAsked(changed ? { ...merged, listChanged: true } : merged);
     },
   });
 
@@ -309,6 +324,7 @@ function TypeForm(props: {
   function submit(event: SubmitEvent) {
     event.preventDefault();
     if (!keyOk) return;
+    sentKey.current = key;
     save.mutate(undefined);
   }
 
@@ -331,6 +347,7 @@ function TypeForm(props: {
             <TextInput
               label="Key"
               value={newKey}
+              isReadOnly={save.isPending}
               onChange={(v) => {
                 setNewKey(v);
                 change({});
@@ -517,9 +534,12 @@ function TypeForm(props: {
             ) : null}
             {asked !== undefined && asked.dropped.length > 0 ? (
               <li>
+                {asked.listChanged === true
+                  ? "The list of published records this takes off has changed since you last looked (a record was published or changed meanwhile). "
+                  : ""}
                 {asked.dropped.length === 1
-                  ? "1 published record's number doesn't fit the new format: public sites would show it as not available until the number is fixed."
-                  : `${String(asked.dropped.length)} published records' numbers don't fit the new format: public sites would show them as not available until their numbers are fixed.`}
+                  ? "Now: 1 published record would show as not available on public sites until its number is fixed."
+                  : `Now: ${String(asked.dropped.length)} published records would show as not available on public sites until their numbers are fixed.`}
               </li>
             ) : null}
           </ul>

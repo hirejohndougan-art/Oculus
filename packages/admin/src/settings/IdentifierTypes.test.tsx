@@ -51,7 +51,6 @@ const ACCESSION = {
     uniqueness: "all_time",
     autoNumber: { style: "year", separator: ".", digits: 3 },
     public: true,
-    futureSetting: { kept: true },
   },
   tag: TAG,
 };
@@ -72,10 +71,11 @@ function server(extra: Record<string, Reply | Handler> = {}): Sent[] {
 
 describe("the form model", () => {
   it("keeps what the screen doesn't edit, and drops numbering and public when switched off", () => {
+    // A setting a later version may add travels back as it came.
+    expect(typeFromDraft(typeDraft({ ...ACCESSION.type, later: 1 })).later).toBe(1);
     const draft = typeDraft(ACCESSION.type);
     expect(typeFromDraft(draft)).toEqual({
       organizationId: ORG_A,
-      futureSetting: { kept: true },
       label: "Accession <b>number</b>",
       pattern: "####.###",
       uniqueness: "all_time",
@@ -85,7 +85,6 @@ describe("the form model", () => {
     const off = typeFromDraft({ ...draft, numbering: "none", isPublic: false, pattern: " " });
     expect(off).toEqual({
       organizationId: ORG_A,
-      futureSetting: { kept: true },
       label: "Accession <b>number</b>",
       uniqueness: "all_time",
     });
@@ -214,7 +213,7 @@ describe("Settings › ID numbers", () => {
     expect(
       await screen.findByText("2 records hold numbers of Box label that don't fit the new format."),
     ).toBeTruthy();
-    expect(screen.getByText(/1 published record's number doesn't fit the new format/)).toBeTruthy();
+    expect(screen.getByText(/Now: 1 published record would show as not available/)).toBeTruthy();
     expect(sent.filter((s) => s.method === "PUT").length).toBe(1);
     await user.click(screen.getByRole("button", { name: "Save with these changes" }));
     await waitFor(() => {
@@ -260,6 +259,42 @@ describe("Settings › ID numbers", () => {
       (sent.find((s) => s.method === "PUT")?.body as { identifierType: { public?: boolean } })
         .identifierType.public,
     ).toBe(true);
+  });
+
+  it("a confirmed save that then fails closes the confirmation and says why", async () => {
+    let calls = 0;
+    const sent = server({
+      "PUT /api/identifier-types/box": () => {
+        calls += 1;
+        return calls === 1
+          ? [
+              409,
+              {
+                error: "confirmation_required",
+                issues: [
+                  {
+                    path: ["confirm", "made_public", "box"],
+                    code: "needs_confirmation",
+                    message: "Numbers of Box label would be shown on public sites.",
+                  },
+                ],
+              },
+            ]
+          : [412, { error: "version_conflict" }];
+      },
+    });
+    const user = userEvent.setup();
+    renderAt("/settings/identifier-types/box");
+    await user.click(
+      await screen.findByRole("checkbox", {
+        name: "Numbers of this type may be shown on public sites",
+      }),
+    );
+    await user.click(screen.getByRole("button", { name: "Save ID number type" }));
+    await user.click(await screen.findByRole("button", { name: "Save with these changes" }));
+    expect(await screen.findByText(/Someone else changed this ID number type/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Save with these changes" })).toBeNull();
+    expect(sent.filter((s) => s.method === "PUT").length).toBe(2);
   });
 
   it("an edit made on an old copy says so", async () => {

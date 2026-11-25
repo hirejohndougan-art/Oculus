@@ -6,8 +6,9 @@
  * uniqueness rule, how new numbers are made and whether numbers may be
  * published. Everything else the stored type holds (its organization, any
  * setting a later version adds) is sent back as it came, so the
- * organization travels too and a save made after switching organization
- * in another tab is refused (`wrong_organization`).
+ * organization travels too: a save of a type read before switching
+ * organization in another tab is refused (`wrong_organization`); a list
+ * read after the switch is the new organization's, as the session is.
  *
  * The server checks everything (core's `validateIdentifierType`, the
  * change report of T-005a, D-076 and S-033's confirmations); nothing here
