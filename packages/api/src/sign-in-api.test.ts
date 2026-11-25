@@ -152,6 +152,11 @@ beforeAll(async () => {
       },
       log: (record) => logged.push(record),
       rateLimits,
+      // T-070: a1's public address; a2's ID under the other organization's key never matches.
+      publicOrigins: new Map([
+        [`${w.a}/${w.a1}`, "https://archive.example.org"],
+        [`${w.b}/${w.a2}`, "https://wrong.example.org"],
+      ]),
       resetOptions: { backgroundDelayMs: { min: 0, max: 0 } },
     }),
   ];
@@ -548,6 +553,28 @@ describe("GET /api/me and POST /api/organization", () => {
     expect(me.organizationName).toBe("Invented Archive");
     expect(me.sites.map((s) => s.siteId)).toEqual([w.a1]);
     expect(me.csrfToken).toBe(full.csrf);
+  });
+
+  it("gives each site's public address, or null, for the sites the person can work in (T-070)", async () => {
+    const cataloger = await signedIn(w.cataloger);
+    const mine = (await get("/api/me", { cookie: cataloger.cookie })).json<{
+      sites: { siteId: string; publicOrigin: string | null }[];
+    }>();
+    expect(mine.sites.map((s) => [s.siteId, s.publicOrigin])).toEqual([
+      [w.a1, "https://archive.example.org"],
+    ]);
+    const root = await signedIn(w.root, w.a);
+    const all = (await get("/api/me", { cookie: root.cookie })).json<{
+      sites: { siteId: string; publicOrigin: string | null }[];
+    }>();
+    const byId = new Map(all.sites.map((s) => [s.siteId, s.publicOrigin]));
+    expect([byId.get(w.a1), byId.get(w.a2), byId.get(w.b1)]).toEqual([
+      "https://archive.example.org",
+      null,
+      null,
+    ]);
+    // Nothing of the session goes into the address.
+    expect(JSON.stringify(all.sites)).not.toContain(root.cookie);
   });
 
   it("refuses no session and a waiting one alike", async () => {

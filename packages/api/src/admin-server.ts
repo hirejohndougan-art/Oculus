@@ -57,7 +57,12 @@ import { trustedProxyFromEnv } from "./proxy.js";
 import { OAI_ADMIN_EMAIL_ENV, oaiAdminEmail, oaiPmhRoutes } from "./oai-pmh.js";
 import { publicApiRoutes, ReadSlots } from "./public-api.js";
 import { PublicSubjects, publicSubjectsRoutes } from "./public-subjects.js";
-import { PUBLIC_DATABASE_URL_ENV, checkPublicSites, publicSitesFromEnv } from "./public-sites.js";
+import {
+  PUBLIC_DATABASE_URL_ENV,
+  checkPublicSites,
+  publicOriginsBySite,
+  publicSitesFromEnv,
+} from "./public-sites.js";
 import type { OculusRoute } from "./routes.js";
 import { buildServer, type ServerOptions } from "./server.js";
 import { signInRoutes, type SignInApiOptions } from "./sign-in-api.js";
@@ -279,6 +284,8 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
       ...(mailer === undefined ? {} : { deliverPasswordChanged: mailer.deliverPasswordChanged }),
       log,
       warnSharedAddress: production,
+      // The "View public site" button (T-070, D-109): checked origins only.
+      publicOrigins: publicOriginsBySite(publicSites),
       ...options.signIn,
     }),
     ...(publicDb === undefined || publicSites.length === 0
@@ -303,6 +310,11 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     routes,
     ...(options.logger === undefined ? {} : { logger: options.logger }),
     ...(admin === undefined ? {} : { admin }),
+    // The public home pages until Phase 4 (D-109).
+    publicHomes: publicSites.map((site) => ({
+      origin: site.origin,
+      siteName: site.siteName ?? "",
+    })),
     ...(publicSubjects === undefined ? {} : { onClose: () => publicSubjects.stop() }),
   });
   // Started once the server is built, so a start that fails counts nothing.

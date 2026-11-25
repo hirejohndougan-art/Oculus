@@ -279,3 +279,71 @@
 .navGroup > .selectorLabel {
   padding: 0 10px;
 }
+
+/* "View public site" (T-070): under the site selector, and in Settings › Sites. */
+.publicLink,
+.publicLinkLight {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--control-height);
+  padding: 0 12px;
+  border-radius: var(--radius-control);
+  font: 600 var(--size-small) var(--font-body);
+  text-decoration: none;
+}
+.publicLink {
+  margin: 0 10px;
+  color: #ffffff;
+  border: 1px solid var(--border-input);
+  background: transparent;
+}
+.publicLink:hover {
+  color: #ffffff;
+  background: var(--nav-active);
+}
+.publicLink:focus-visible {
+  outline: 3px solid #ffffff;
+  outline-offset: 2px;
+}
+.publicLinkLight {
+  color: var(--link);
+  border: 1px solid var(--border-input);
+  background: var(--surface);
+}
+.publicLinkLight:hover {
+  color: var(--link-hover);
+  background: var(--fill-soft);
+}
+.publicLinkLight:focus-visible {
+  outline: 3px solid var(--link);
+  outline-offset: 2px;
+}
+.publicDisabled {
+  cursor: not-allowed;
+  opacity: 1;
+}
+.publicNone,
+.publicNoneLight {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+.publicNone .publicDisabled {
+  color: var(--nav-text-muted);
+  border-style: dashed;
+}
+.publicNoneLight .publicDisabled {
+  color: var(--text-muted);
+  border-style: dashed;
+}
+.publicReason {
+  font-size: var(--size-caption);
+}
+.publicNone .publicReason {
+  padding: 0 10px;
+  color: var(--nav-text-muted);
+}
+.publicNoneLight .publicReason {
+  color: var(--text-muted);
+}

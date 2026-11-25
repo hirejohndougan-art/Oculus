@@ -23,6 +23,7 @@ import { Button, Note } from "../components/ui";
 import ui from "../components/ui.module.css";
 import type { FrameContext } from "../frame/Frame";
 import { ME_KEY } from "../frame/useMe";
+import { ViewPublicSite } from "../frame/ViewPublicSite";
 import { TextInput } from "../records/controls";
 import records from "../records/Records.module.css";
 import type { Me, SiteChoice } from "../types";
@@ -224,6 +225,14 @@ function SiteRow(props: { readonly site: SiteChoice }) {
       </td>
       <td>{site.organizationName}</td>
       <td>
+        <ViewPublicSite
+          siteId={site.siteId}
+          siteName={site.siteName}
+          publicOrigin={site.publicOrigin}
+          place="settings"
+        />
+      </td>
+      <td>
         {editing ? null : (
           <RowButton
             label={`Rename ${site.siteName}`}
@@ -287,6 +296,7 @@ export function SitesSettings() {
                 <tr>
                   <th scope="col">Site</th>
                   <th scope="col">Organization</th>
+                  <th scope="col">Public site</th>
                   <th scope="col">
                     <span className="visually-hidden">Actions</span>
                   </th>

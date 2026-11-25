@@ -75,6 +75,12 @@
  *    streamed file is sent on the hijacked response, outside the handler
  *    timeout but within `timeouts.download`, and closing the server stops it.
  *
+ * 13. The public home (public-home.ts, T-070, D-109), when
+ *    `options.publicHomes` is given: `GET`/`HEAD` of `/` on a listed public
+ *    origin only (never the admin's host) answers that site's fixed page,
+ *    made at startup, with `PUBLIC_HOME_SECURITY_HEADERS`. It is the only
+ *    HTML the server builds; handlers still can't send HTML (rule 9).
+ *
  * Adding another Fastify plugin, parser or error handler is its own decision
  * (D-051).
  */
@@ -108,6 +114,7 @@ import {
   type FileReply,
 } from "./file-replies.js";
 import { SECURITY_HEADERS } from "./headers.js";
+import { PUBLIC_HOME_SECURITY_HEADERS, publicHomePages, type PublicHome } from "./public-home.js";
 import { failsOriginCheck, originsFromEnv } from "./origin.js";
 import { RouteTable, pathOf, pathProblem } from "./paths.js";
 import { trustedProxyFromEnv } from "./proxy.js";
@@ -167,6 +174,11 @@ export interface ServerOptions {
    * one of `OCULUS_ORIGINS`.
    */
   readonly admin?: { readonly origin: string; readonly files: AdminFiles };
+  /**
+   * The public hosts' home pages until Phase 4 (public-home.ts, D-109): each
+   * origin must be one of `OCULUS_ORIGINS` and not on the admin's host.
+   */
+  readonly publicHomes?: readonly PublicHome[];
   /** Called once when the server closes, after requests have ended (background work, S-038). */
   readonly onClose?: () => Promise<void>;
 }
@@ -493,6 +505,13 @@ function normalHost(protocol: string, host: unknown): string | undefined {
   }
 }
 
+/** A request's origin as `URL.origin` writes it (default port dropped), or undefined. */
+function requestOrigin(protocol: string, host: unknown): string | undefined {
+  if (protocol !== "http" && protocol !== "https") return undefined;
+  const normal = normalHost(`${protocol}:`, host);
+  return normal === undefined ? undefined : new URL(`${protocol}://${normal}`).origin;
+}
+
 /** Builds the configured Oculus server and waits until it is ready. */
 export async function buildServer(options: ServerOptions = {}): Promise<FastifyInstance> {
   const timeouts = chooseTimeouts(options.timeouts);
@@ -508,6 +527,19 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
   const adminProtocol = admin === undefined ? undefined : new URL(admin.origin).protocol;
   /** Replies that are admin files: they get the admin's headers in onSend. */
   const adminReplies = new WeakSet<FastifyRequest>();
+  const adminHostname = admin === undefined ? undefined : new URL(admin.origin).hostname;
+  for (const home of options.publicHomes ?? []) {
+    if (!origins.has(home.origin)) {
+      throw new Error("a public home's origin must be one of OCULUS_ORIGINS");
+    }
+    // Hostnames, as public-sites.ts compares them: cookies ignore scheme and port.
+    if (adminHostname !== undefined && new URL(home.origin).hostname === adminHostname) {
+      throw new Error("a public home can't be on the admin's host");
+    }
+  }
+  const homePages = publicHomePages(options.publicHomes ?? []);
+  /** Replies that are a public home page: they get its headers in onSend. */
+  const homeReplies = new WeakSet<FastifyRequest>();
 
   const logger: FastifyServerOptions["logger"] =
     options.logger === undefined || options.logger === false
@@ -598,9 +630,11 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
     }
     const headers = adminReplies.has(request)
       ? ADMIN_SECURITY_HEADERS
-      : fileReplies.has(request)
-        ? FILE_SECURITY_HEADERS
-        : SECURITY_HEADERS;
+      : homeReplies.has(request)
+        ? PUBLIC_HOME_SECURITY_HEADERS
+        : fileReplies.has(request)
+          ? FILE_SECURITY_HEADERS
+          : SECURITY_HEADERS;
     for (const [name, value] of Object.entries(headers)) void reply.header(name, value);
     return payload;
   });
@@ -625,6 +659,7 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
       // Nothing the handler set (headers, cookies, Location) goes out with an error.
       for (const name of Object.keys(reply.getHeaders())) reply.removeHeader(name);
       fileReplies.delete(request);
+      homeReplies.delete(request);
       return reply.code(statusCode).type("application/json; charset=utf-8").send(body);
     } catch {
       sendFallback(reply);
@@ -648,6 +683,20 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
       if (file !== undefined) {
         adminReplies.add(request);
         return reply.code(200).type(file.type).send(file.body);
+      }
+    }
+    // A public host's home page (rule 13): `/` only, GET and HEAD only.
+    if (
+      homePages.size > 0 &&
+      path === "/" &&
+      allowed.length === 0 &&
+      (request.method === "GET" || request.method === "HEAD")
+    ) {
+      const origin = requestOrigin(request.protocol, request.host);
+      const page = origin === undefined ? undefined : homePages.get(origin);
+      if (page !== undefined) {
+        homeReplies.add(request);
+        return reply.code(200).type("text/html; charset=utf-8").send(page);
       }
     }
     const wrongMethod = allowed.length > 0 && !allowed.includes(request.method);

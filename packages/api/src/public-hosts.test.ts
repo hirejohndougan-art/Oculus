@@ -350,4 +350,28 @@ describe("startup", () => {
       await app.close();
     }
   });
+
+  it("serves each public host's home page with the site's name (T-070, D-109)", async () => {
+    const app = await start(
+      { ...ENV, OCULUS_PUBLIC_SITES: `${ARCHIVE}=${site}`, OCULUS_TRUSTED_PROXY: "loopback" },
+      reader,
+    );
+    try {
+      const via = (host: string) =>
+        app.inject({
+          method: "GET",
+          url: "/",
+          remoteAddress: "127.0.0.1",
+          headers: { host: "127.0.0.1", "x-forwarded-host": host, "x-forwarded-proto": "https" },
+        });
+      const home = await via("archive.example.org");
+      expect(home.statusCode).toBe(200);
+      expect(home.body).toContain("<h1>Invented archive site</h1>");
+      // www. isn't listed here, and the admin's host keeps the admin.
+      expect((await via("www.archive.example.org")).statusCode).toBe(404);
+      expect((await via("admin.example.org")).body).toContain("<title>Oculus</title>");
+    } finally {
+      await app.close();
+    }
+  });
 });

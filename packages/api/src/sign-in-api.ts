@@ -72,6 +72,7 @@ import {
 import type { RecordService } from "@oculus/service";
 import { OCULUS_COOKIES } from "./cookies.js";
 import { Refusal } from "./errors.js";
+import { publicOriginKey } from "./public-sites.js";
 import { DEFAULT_RATE_LIMITS, SessionRateLimiter, type RateBucket } from "./rate-limit.js";
 import type { OculusReply, OculusRequest, OculusRoute } from "./routes.js";
 import { CSRF_HEADER, redactedError, type ApiLogRecord } from "./staff-api.js";
@@ -83,6 +84,12 @@ export interface SignInApiOptions {
   readonly keys: SecretKeyring;
   /** For `listMySites` (the site selector, D-072). */
   readonly service: RecordService;
+  /**
+   * Each public site's address, by `publicOriginKey` (public-sites.ts): `GET
+   * /api/me` gives it with each site the person can work in, for the "View
+   * public site" button (T-070, D-109). Absent: every site has none.
+   */
+  readonly publicOrigins?: ReadonlyMap<string, string>;
   /**
    * Sends a password reset link (T-040 makes the email; D-078's rules:
    * honour the signal, never log or keep the token). Required: the startup
@@ -256,6 +263,7 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
     throw new TypeError("deliverPasswordChanged is a function.");
   }
   const log = options.log ?? defaultLog;
+  const publicOrigins = options.publicOrigins ?? new Map<string, string>();
   const clock = options.clock ?? Date.now;
   const limiter = new SessionRateLimiter({ ...DEFAULT_RATE_LIMITS, ...options.rateLimits }, clock);
   const onError = (operation: string) => (error: unknown) => {
@@ -610,7 +618,13 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
           },
           organizationName:
             named?.organizationName ?? (organization?.ok === true ? organization.value.name : ""),
-          sites: sites.value,
+          // Each site's public address, or null (T-070, D-109): only the
+          // sites listMySites gives this person, only origins checked at startup.
+          sites: sites.value.map((site) => ({
+            ...site,
+            publicOrigin:
+              publicOrigins.get(publicOriginKey(site.organizationId, site.siteId)) ?? null,
+          })),
         };
       },
     },

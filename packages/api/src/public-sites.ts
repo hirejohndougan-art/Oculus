@@ -39,6 +39,8 @@ export interface PublicSiteHost {
 /** A public host with its site's organization, ready for `readPublicRecord`. */
 export interface PublicSite extends PublicSiteHost {
   readonly organizationId: OrganizationId;
+  /** The site's name at startup (the public home page, D-109). */
+  readonly siteName?: string;
 }
 
 /**
@@ -124,8 +126,8 @@ export async function checkPublicSites(
   }
   const out: PublicSite[] = [];
   for (const host of hosts) {
-    const rows = await writer.rows<{ organization_id: string }>(sql`
-      SELECT organization_id::text AS organization_id FROM public.sites
+    const rows = await writer.rows<{ organization_id: string; name: string }>(sql`
+      SELECT organization_id::text AS organization_id, name FROM public.sites
       WHERE id = ${host.siteId}::uuid LIMIT 2`);
     const row = rows[0];
     if (row === undefined) {
@@ -137,7 +139,32 @@ export async function checkPublicSites(
         `${PUBLIC_SITES_ENV}: site ${host.siteId} exists in more than one organization; it can't be served until that is resolved`,
       );
     }
-    out.push(Object.freeze({ ...host, organizationId: row.organization_id as OrganizationId }));
+    out.push(
+      Object.freeze({
+        ...host,
+        organizationId: row.organization_id as OrganizationId,
+        siteName: row.name,
+      }),
+    );
   }
   return Object.freeze(out);
+}
+
+/**
+ * Each site's public address for the admin's "View public site" button
+ * (T-070, D-109), keyed by `publicOriginKey`: the first origin listed for
+ * the site. Only origins the server checked at startup are in it.
+ */
+export function publicOriginsBySite(sites: readonly PublicSite[]): ReadonlyMap<string, string> {
+  const out = new Map<string, string>();
+  for (const site of sites) {
+    const key = publicOriginKey(site.organizationId, site.siteId);
+    if (!out.has(key)) out.set(key, site.origin);
+  }
+  return out;
+}
+
+/** The key of `publicOriginsBySite`: a site ID is unique only within its organization (D-060). */
+export function publicOriginKey(organizationId: string, siteId: string): string {
+  return `${organizationId}/${siteId}`;
 }

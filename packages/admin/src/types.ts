@@ -5,6 +5,11 @@ export interface SiteChoice {
   readonly organizationName: string;
   readonly siteId: string;
   readonly siteName: string;
+  /**
+   * The site's public address (`OCULUS_PUBLIC_SITES`, checked at startup),
+   * or null when it has none (T-070, D-109).
+   */
+  readonly publicOrigin?: string | null;
 }
 
 export interface Me {

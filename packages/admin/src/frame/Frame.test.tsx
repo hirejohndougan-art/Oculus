@@ -59,6 +59,31 @@ describe("the frame", () => {
     );
   });
 
+  it("opens the site's public home in a new tab, with nothing of the session (T-070)", async () => {
+    fakeServer({
+      "GET /api/me": [200, me([{ ...A1, publicOrigin: "http://localhost:4781" } as typeof A1])],
+    });
+    renderAt("/");
+    const nav = await screen.findByRole("navigation", { name: "Oculus" });
+    const link = await within(nav).findByRole("link", { name: /^View public site/ });
+    expect(link.textContent).toBe("View public site (opens in a new tab)");
+    expect(link.getAttribute("href")).toBe("http://localhost:4781/");
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toBe("noopener noreferrer");
+    expect(link.getAttribute("referrerpolicy")).toBe("no-referrer");
+    expect(link.getAttribute("href")).not.toContain("f".repeat(43));
+  });
+
+  it("shows the button disabled, with the reason, when the site has no public address", async () => {
+    fakeServer({ "GET /api/me": [200, me([A1])] });
+    renderAt("/");
+    const nav = await screen.findByRole("navigation", { name: "Oculus" });
+    const button = await within(nav).findByRole("button", { name: "View public site" });
+    expect((button as HTMLButtonElement).disabled).toBe(true);
+    expect(within(nav).getByText("This site has no public address yet")).toBeTruthy();
+    expect(within(nav).queryByRole("link", { name: /View public site/ })).toBeNull();
+  });
+
   it("tells the person when someone typed wrong two-step codes for their account (D-085)", async () => {
     fakeServer({
       "GET /api/me": [

@@ -23,6 +23,7 @@ import { AdminNav } from "../people/AdminNav";
 import type { Me, SiteChoice } from "../types";
 import styles from "./Frame.module.css";
 import { SiteSelector } from "./SiteSelector";
+import { ViewPublicSite } from "./ViewPublicSite";
 import { useSiteAbilities } from "../records/queries";
 import { ME_KEY, useMe } from "./useMe";
 
@@ -167,6 +168,14 @@ export function Frame() {
             isDisabled={switching}
           />
         ) : null}
+        {here === undefined ? null : (
+          <ViewPublicSite
+            siteId={here.siteId}
+            siteName={here.siteName}
+            publicOrigin={here.publicOrigin}
+            place="sidebar"
+          />
+        )}
         {here === undefined ? null : (
           <ul className={styles.navList}>
             <li>

@@ -25,6 +25,12 @@ declare const styles: {
   readonly pageTitle: string;
   readonly placeholder: string;
   readonly popover: string;
+  readonly publicDisabled: string;
+  readonly publicLink: string;
+  readonly publicLinkLight: string;
+  readonly publicNone: string;
+  readonly publicNoneLight: string;
+  readonly publicReason: string;
   readonly section: string;
   readonly sectionHeader: string;
   readonly selector: string;

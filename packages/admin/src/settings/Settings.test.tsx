@@ -139,6 +139,28 @@ describe("sites", () => {
     expect(within(table).getByRole("cell", { name: "Invented library site" })).toBeTruthy();
   });
 
+  it("each site's row opens its public site, or says it has no public address yet (T-070)", async () => {
+    server(
+      {},
+      {
+        ...admin,
+        sites: [{ ...SITES[0], publicOrigin: "https://archive.example.org" }, SITES[1], SITES[2]],
+      },
+    );
+    renderAt("/settings/sites");
+    const link = await screen.findByRole("link", {
+      name: "View the public site of Invented archive site (opens in a new tab)",
+    });
+    expect(link.getAttribute("href")).toBe("https://archive.example.org/");
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")).toBe("noopener noreferrer");
+    const none = screen.getByRole("button", {
+      name: "View the public site of Invented second site",
+    });
+    expect((none as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getAllByText("This site has no public address yet")).toHaveLength(2);
+  });
+
   it("adds a site to the chosen organization, with the CSRF token, and lists it", async () => {
     let added = false;
     const sent = server({
