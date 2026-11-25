@@ -76,7 +76,7 @@ export interface EadReadReport {
   /** Values that were changed or left out: bad links, cleaned text, dates that aren't EDTF. */
   readonly warnings: readonly EadNotice[];
   readonly levelChanges: readonly EadLevelChange[];
-  /** Notices past the cap of `MAX_EAD_NOTICES` per list, counted but not listed. */
+  /** Notices and level changes past the cap of `MAX_EAD_NOTICES` per list, counted but not listed. */
   readonly omitted: number;
 }
 
@@ -85,7 +85,7 @@ export interface EadRead {
   readonly report: EadReadReport;
 }
 
-/** The most notices listed in each of `unmapped` and `warnings`. */
+/** The most entries listed in each of `unmapped`, `warnings` and `levelChanges`. */
 export const MAX_EAD_NOTICES = 2000;
 
 const C_NAMES: ReadonlySet<string> = new Set([
@@ -480,7 +480,8 @@ class Reader {
     if (mapped.changed) {
       const from =
         given === "otherlevel" ? `otherlevel:${a.get("otherlevel") ?? ""}` : (given ?? "");
-      this.levelChanges.push({ path, from, to: mapped.level });
+      if (this.levelChanges.length >= MAX_EAD_NOTICES) this.omitted += 1;
+      else this.levelChanges.push({ path, from, to: mapped.level });
     }
     if (parent !== undefined && !canFileUnder(mapped.level, parent)) {
       this.warn(
