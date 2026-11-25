@@ -21,6 +21,7 @@ import {
   PasswordWorkBusyError,
   checkNewPassword,
   hashPassword,
+  isPlainObject,
   newOrganizationId,
   newSiteId,
   newUserId,
@@ -66,10 +67,12 @@ const dc = (element: string) => [
   { standard: "dcterms", element, uri: `http://purl.org/dc/terms/${element}` },
 ];
 
+/** Visibility is always given: like core, no field is public by default. */
 function field(
   key: string,
   label: string,
   kind: FieldDefinition["kind"],
+  visibility: FieldDefinition["visibility"],
   extra: Partial<FieldDefinition> = {},
 ): FieldDefinition {
   return {
@@ -78,9 +81,9 @@ function field(
     kind,
     required: false,
     repeatable: false,
-    visibility: "public",
     inherited: false,
     ...extra,
+    visibility,
   };
 }
 
@@ -90,19 +93,19 @@ function field(
  * staff-only fields that never leave the staff catalog.
  */
 export const STARTER_TEMPLATE_FIELDS: readonly FieldDefinition[] = Object.freeze([
-  field("description", "Description", "long_text", { standards: dc("description") }),
-  field("date", "Date", "date", {
+  field("description", "Description", "long_text", "public", { standards: dc("description") }),
+  field("date", "Date", "date", "public", {
     help: "An exact or approximate date, such as 1909, 1909~ or 1900/1910.",
     standards: dc("date"),
   }),
-  field("creator", "Creator", "text", { repeatable: true, standards: dc("creator") }),
-  field("subject", "Subject", "text", { repeatable: true, standards: dc("subject") }),
-  field("rights", "Rights statement", "rights", {
+  field("creator", "Creator", "text", "public", { repeatable: true, standards: dc("creator") }),
+  field("subject", "Subject", "text", "public", { repeatable: true, standards: dc("subject") }),
+  field("rights", "Rights statement", "rights", "public", {
     help: "A rightsstatements.org or Creative Commons address.",
     standards: dc("rights"),
   }),
-  field("location", "Shelf location", "text", { visibility: "staff" }),
-  field("staff_notes", "Staff notes", "long_text", { visibility: "staff" }),
+  field("location", "Shelf location", "text", "staff"),
+  field("staff_notes", "Staff notes", "long_text", "staff"),
 ]);
 
 function refused<T>(code: string, message: string, path: (string | number)[] = []): Validated<T> {
@@ -120,6 +123,32 @@ function own(input: object, key: string): unknown {
 
 const KEYS = ["email", "displayName", "password", "organizationName", "siteName"] as const;
 
+/**
+ * What a database is before setup migrates it: `"empty"` (no tables at all,
+ * or Oculus's tables with no users and no organizations), `"set_up"`
+ * (Oculus's, with people or organizations) or `"other"` (tables, but not
+ * Oculus's). Setup migrates only an `"empty"` one, so it never changes a
+ * database it then refuses.
+ */
+export async function databaseBeforeSetup(db: Database): Promise<"empty" | "set_up" | "other"> {
+  const [row] = await db.rows<{ tables: number; oculus: boolean; users: boolean; orgs: boolean }>(
+    sql`
+    SELECT (SELECT count(*)::int FROM pg_catalog.pg_tables WHERE schemaname = 'public') AS tables,
+           to_regclass('public.oculus_migrations') IS NOT NULL AS oculus,
+           to_regclass('public.users') IS NOT NULL AS users,
+           to_regclass('public.organizations') IS NOT NULL AS orgs`,
+  );
+  if (row === undefined || row.tables === 0) return "empty";
+  if (!row.oculus) return "other";
+  if (row.users && (await db.rows(sql`SELECT 1 FROM public.users LIMIT 1`)).length > 0) {
+    return "set_up";
+  }
+  if (row.orgs && (await db.rows(sql`SELECT 1 FROM public.organizations LIMIT 1`)).length > 0) {
+    return "set_up";
+  }
+  return "empty";
+}
+
 /** Whether the database has no users and no organizations. */
 export async function isEmptyInstall(db: Database): Promise<boolean> {
   const rows = await db.rows(sql`
@@ -134,12 +163,15 @@ export async function setUpFirstInstall(
   db: Database,
   input: unknown,
 ): Promise<Validated<FirstInstallResult>> {
-  if (
-    typeof input !== "object" ||
-    input === null ||
-    Array.isArray(input) ||
-    Reflect.ownKeys(input).some((k) => !(KEYS as readonly PropertyKey[]).includes(k))
-  ) {
+  let plain: boolean;
+  try {
+    plain =
+      isPlainObject(input) &&
+      Reflect.ownKeys(input).every((k) => (KEYS as readonly PropertyKey[]).includes(k));
+  } catch {
+    plain = false; // a Proxy whose traps throw
+  }
+  if (!plain || typeof input !== "object" || input === null) {
     return refused("invalid_request", `Give ${KEYS.join(", ")} only.`);
   }
   const issues: Issue[] = [];

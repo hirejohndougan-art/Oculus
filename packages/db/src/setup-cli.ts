@@ -16,12 +16,13 @@
  *
  * Exit codes: 0 done, 1 refused or failed, 2 usage.
  */
-import { createInterface } from "node:readline";
+import { createInterface, type Interface } from "node:readline";
+import { normalizeEmail } from "@oculus/core";
 import { Writable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { openDatabase, type Database } from "./client.js";
 import { redact, secretsOf } from "./backup-connection.js";
-import { isEmptyInstall, setUpFirstInstall } from "./first-setup.js";
+import { databaseBeforeSetup, isEmptyInstall, setUpFirstInstall } from "./first-setup.js";
 import { migrate, MigrationError } from "./migrate.js";
 import { DATABASE_URL_VARIABLE } from "./migrate-cli.js";
 
@@ -51,6 +52,8 @@ export async function runSetupCli(
   ask: Ask,
   rawOut: Line,
   rawErr: Line,
+  /** Called once every question is answered (the terminal lets go of the keyboard). */
+  finished?: () => void,
 ): Promise<number> {
   const url = env[DATABASE_URL_VARIABLE];
   if (url === undefined || url.trim() === "") {
@@ -66,16 +69,6 @@ export async function runSetupCli(
   const err: Line = (line) => {
     rawErr(redact(line, secrets));
   };
-  try {
-    await migrate({ connectionString: url, log: out });
-  } catch (error) {
-    if (error instanceof MigrationError) {
-      err(`Setup stopped: the database could not be prepared (${error.code}): ${error.message}`);
-    } else {
-      err(`Setup stopped: the database could not be prepared: ${messageOf(error)}`);
-    }
-    return 1;
-  }
   let db: Database;
   try {
     db = openDatabase(url, { applicationName: "oculus-setup", max: 1 });
@@ -84,6 +77,36 @@ export async function runSetupCli(
     return 2;
   }
   try {
+    // Checked before migrating, so setup never changes a database it refuses.
+    let before: "empty" | "set_up" | "other";
+    try {
+      before = await databaseBeforeSetup(db);
+    } catch (error) {
+      err(`Setup stopped: could not reach the database: ${messageOf(error)}`);
+      return 1;
+    }
+    if (before === "set_up") {
+      err(
+        "Setup refused: this database is already set up (it has people or organizations). Setup only runs once, on an empty database. Sign in instead.",
+      );
+      return 1;
+    }
+    if (before === "other") {
+      err(
+        "Setup refused: this database already has tables that aren't Oculus's. Make a new, empty database for Oculus and point OCULUS_DATABASE_URL at it.",
+      );
+      return 1;
+    }
+    try {
+      await migrate({ connectionString: url, log: out });
+    } catch (error) {
+      if (error instanceof MigrationError) {
+        err(`Setup stopped: the database could not be prepared (${error.code}): ${error.message}`);
+      } else {
+        err(`Setup stopped: the database could not be prepared: ${messageOf(error)}`);
+      }
+      return 1;
+    }
     if (!(await isEmptyInstall(db))) {
       err(
         "Setup refused: this database is already set up (it has people or organizations). Setup only runs once, on an empty database. Sign in instead.",
@@ -115,6 +138,7 @@ export async function runSetupCli(
       err("Setup stopped: the two passwords were different. Nothing was saved; run it again.");
       return 1;
     }
+    finished?.();
     const result = await setUpFirstInstall(db, { ...answers, password });
     if (!result.ok) {
       const already = result.issues.some((i) => i.code === "already_set_up");
@@ -128,10 +152,12 @@ export async function runSetupCli(
     out("");
     out(`Done. Oculus is set up for ${answers.organizationName ?? ""}.`);
     out(`- Site: ${answers.siteName ?? ""}`);
-    out(`- System admin: ${answers.displayName ?? ""} (${answers.email ?? ""})`);
+    out(
+      `- System admin: ${answers.displayName ?? ""} (${normalizeEmail(answers.email) ?? answers.email ?? ""})`,
+    );
     out(`- A starter template, "Item", that you can change later.`);
     out(
-      "Next: run `npm run build` and `npm run admin`, then sign in. At your first sign-in you set up two-step sign-in with an authenticator app.",
+      "Next: start the admin as packages/admin/README.md describes (`npm run build`, then `npm run admin` with OCULUS_DATABASE_URL, OCULUS_ORIGINS, OCULUS_ADMIN_ORIGIN and OCULUS_SECRET_KEY set), then sign in. At your first sign-in you set up two-step sign-in with an authenticator app.",
     );
     return 0;
   } catch (error) {
@@ -155,33 +181,46 @@ function messageOf(error: unknown): string {
 }
 
 /**
- * Questions on the terminal (or standard input). Secret answers are not
- * echoed when standard input is a terminal.
+ * Questions on the terminal (or standard input). The prompt is made at the
+ * first question, after migrating, so Ctrl+C still stops a migration; it
+ * keeps no history (Up can't recall the first password), and on a terminal
+ * a line typed before its question is thrown away rather than taken as the
+ * answer, and secret answers are not echoed. Ctrl+C at a question ends the
+ * input, so the command stops with nothing saved.
  */
 export function terminalAsk(): { ask: Ask; close: () => void } {
+  const tty = process.stdin.isTTY;
   let muted = false;
+  let rl: Interface | undefined;
+  const lines: string[] = [];
+  const waiting: ((line: string | undefined) => void)[] = [];
+  let ended = false;
   const output = new Writable({
     write(chunk: Buffer | string, _encoding, done) {
       if (!muted) process.stdout.write(chunk);
       done();
     },
   });
-  const rl = createInterface({ input: process.stdin, output, terminal: process.stdin.isTTY });
-  const lines: string[] = [];
-  const waiting: ((line: string | undefined) => void)[] = [];
-  let ended = false;
-  rl.on("line", (line) => {
-    const next = waiting.shift();
-    if (next === undefined) lines.push(line);
-    else next(line);
-  });
-  rl.on("close", () => {
-    ended = true;
-    for (const next of waiting.splice(0)) next(undefined);
-  });
+  const open = (): Interface => {
+    if (rl !== undefined) return rl;
+    const made = createInterface({ input: process.stdin, output, terminal: tty, historySize: 0 });
+    made.on("line", (line) => {
+      const next = waiting.shift();
+      if (next !== undefined) next(line);
+      else if (!tty) lines.push(line); // piped answers arrive before their questions
+    });
+    made.on("SIGINT", () => {
+      made.close();
+    });
+    made.on("close", () => {
+      ended = true;
+      for (const next of waiting.splice(0)) next(undefined);
+    });
+    rl = made;
+    return made;
+  };
   const ask: Ask = (question, { secret }) => {
-    process.stdout.write(question);
-    muted = secret && process.stdin.isTTY;
+    const r = open();
     return new Promise((resolve) => {
       const finish = (line: string | undefined): void => {
         if (muted) process.stdout.write("\n");
@@ -189,15 +228,30 @@ export function terminalAsk(): { ask: Ask; close: () => void } {
         resolve(line);
       };
       const ready = lines.shift();
-      if (ready !== undefined) finish(ready);
-      else if (ended) finish(undefined);
-      else waiting.push(finish);
+      if (ready !== undefined) {
+        process.stdout.write(`${question}\n`);
+        finish(ready);
+        return;
+      }
+      if (ended) {
+        finish(undefined);
+        return;
+      }
+      if (secret && tty) {
+        process.stdout.write(question);
+        muted = true;
+        r.setPrompt("");
+      } else {
+        r.setPrompt(question);
+      }
+      waiting.push(finish);
+      r.prompt();
     });
   };
   return {
     ask,
     close: () => {
-      rl.close();
+      rl?.close();
     },
   };
 }
@@ -214,6 +268,7 @@ if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.a
       (line) => {
         console.error(line);
       },
+      terminal.close,
     );
   } finally {
     terminal.close();

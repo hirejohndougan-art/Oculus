@@ -188,7 +188,24 @@ describe("setUpFirstInstall", () => {
 
   it("refuses unknown keys, getters and non-objects", async () => {
     const { db } = await migrated();
-    for (const bad of [null, "text", [], { ...INPUT, systemAdmin: false }]) {
+    const throwing = new Proxy(
+      { ...INPUT },
+      {
+        ownKeys() {
+          throw new Error("trap");
+        },
+      },
+    );
+    for (const bad of [
+      null,
+      "text",
+      [],
+      new Date(),
+      new Map(),
+      Object.assign(Object.create({ inherited: 1 }) as object, INPUT),
+      throwing,
+      { ...INPUT, systemAdmin: false },
+    ]) {
       expect(await setUpFirstInstall(db, bad)).toMatchObject({
         ok: false,
         issues: [{ code: "invalid_request" }],
@@ -273,6 +290,8 @@ describe("npm run setup", () => {
       expect(again.code).toBe(1);
       expect(again.out).toContain("already set up");
       expect(again.asked).toEqual([]);
+      // It refused before migrating: nothing was even checked for migration.
+      expect(again.out).not.toMatch(/migrat/i);
     } finally {
       await testDb.drop();
     }
@@ -317,6 +336,28 @@ describe("npm run setup", () => {
     const ended = await runCli({ OCULUS_DATABASE_URL: url }, typed.slice(0, 2));
     expect(ended.code).toBe(2);
     expect(await counts(db)).toEqual({ users: 0, organizations: 0, sites: 0, templates: 0 });
+  });
+
+  it("refuses a database with someone else's tables, without adding Oculus's", async () => {
+    const testDb = await freshDatabase();
+    try {
+      const db = openDatabase(testDb.url, { max: 1 });
+      try {
+        await db.execute(sql`CREATE TABLE public.not_oculus (id int)`);
+        const run = await runCli({ OCULUS_DATABASE_URL: testDb.url }, typed);
+        expect(run.code).toBe(1);
+        expect(run.out).toContain("aren't Oculus's");
+        expect(run.asked).toEqual([]);
+        const [row] = await db.rows<{ there: boolean }>(
+          sql`SELECT to_regclass('public.oculus_migrations') IS NOT NULL AS there`,
+        );
+        expect(row?.there).toBe(false);
+      } finally {
+        await db.close();
+      }
+    } finally {
+      await testDb.drop();
+    }
   });
 
   it("needs the database URL and never prints its password", async () => {
