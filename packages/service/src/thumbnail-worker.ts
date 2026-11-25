@@ -1,6 +1,7 @@
 /**
- * Image decoding for thumbnails (M-003, D-097), run in a worker thread
- * (thumbnails.ts) so a slow or hostile image never stalls the server.
+ * Image decoding for thumbnails (M-003, T-072, D-097), run in a decoder
+ * process of its own (thumbnails.ts) so a slow or hostile image never
+ * stalls the server, and memory a plan misses is held by a hard cap.
  *
  * - **The format is told, never guessed.** Each decoder is called only for
  *   the type Oculus sniffed when the file was stored (D-086), and only for
@@ -9,30 +10,29 @@
  *   built to WebAssembly; loaded from its own file, never fetched). The
  *   bytes must start with that format's signature; nothing is
  *   auto-detected. Every other type gets no thumbnail.
- * - **Decompression bombs are refused before decoding.** The dimensions are
- *   read from the header first (`imageDimensions`): more than
- *   `THUMBNAIL_LIMITS.maxPixels` pixels or a side longer than `maxSide` is
- *   refused without allocating anything. A PNG's compressed data is
- *   inflated with a ceiling of exactly the bytes its header allows
- *   (`zlib.inflateSync`'s `maxOutputLength`), interlaced or not, before
- *   pngjs sees it (pngjs inflates an interlaced image without any ceiling).
- *   JPEG's own limits (`maxResolutionInMP`, `maxMemoryUsageInMB`) are set as
- *   a second line; a GIF's first frame must lie inside its screen. A WebP's
- *   RIFF size must not claim more than the file holds, and an animated
- *   WebP is refused (libwebp's still-image decoder checks that the frame
- *   matches the canvas before it allocates). The
- *   worker itself runs with a heap limit and a time limit (thumbnails.ts).
+ * - **Every decode is planned first** (`planDecode`): the file walked
+ *   strictly as its decoder reads it, its size within `THUMBNAIL_LIMITS`,
+ *   and what decoding it costs within `DECODE_BUDGET_BYTES`. A JPEG is
+ *   rebuilt from its walk, every segment exactly as long as what jpeg-js
+ *   reads of it, before jpeg-js sees it; a PNG's image data is inflated
+ *   with a ceiling of exactly what its header allows; a VP8L stream (a
+ *   lossless WebP, or a compressed alpha channel) is read as far as its
+ *   prefix-code groups, so their tables are counted at libwebp's largest.
+ * - **The plan is not the last guard.** The decoder process is killed when
+ *   its resident memory grows past `DECODE_MEMORY_CAP_BYTES`, or when it
+ *   takes too long (thumbnails.ts).
  * - The output is always a baseline JPEG, transparency flattened onto
- *   white, scaled down (never up) to fit a square box.
+ *   white, scaled down (never up) to fit a square box. Originals (WebP
+ *   included) are never changed.
  *
- * This file has no relative imports, so the worker can be started from the
- * build or, in tests, from the source with Node's type stripping.
+ * This file has no relative imports, so the decoder process can be
+ * started from the build or, in tests, from the source with Node's type
+ * stripping.
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { parentPort, workerData } from "node:worker_threads";
 import { inflateSync } from "node:zlib";
 
 /** The formats Oculus makes thumbnails of (sniffed types, D-086). */
@@ -126,11 +126,27 @@ const ascii = (b: Uint8Array, i: number, text: string): boolean =>
 
 const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 
-/** What the strict JPEG walk found: the one frame's size and components. */
+/** One component of a JPEG frame, as its frame header gives it. */
+interface JpegComponent {
+  readonly id: number;
+  /** Horizontal and vertical sampling factors (1 to 4). */
+  readonly h: number;
+  readonly v: number;
+}
+
+/** What the strict JPEG walk found: the one frame, and the file rebuilt from what was walked. */
 interface JpegLayout {
   readonly width: number;
   readonly height: number;
-  readonly components: number;
+  readonly components: readonly JpegComponent[];
+  /**
+   * The file as jpeg-js is given it (T-072): SOI, every DQT, DHT, DRI, SOF
+   * and SOS segment exactly as walked (each scan's entropy-coded data
+   * copied), an Adobe APP14 marker normalised to the 12 bytes jpeg-js
+   * reads, then EOI. Comments and other APPn segments are dropped. Only
+   * with `whole` and `rebuild`.
+   */
+  readonly canonical?: Uint8Array;
 }
 
 /** Markers allowed as segments (with a length) before and between scans. */
@@ -143,24 +159,119 @@ const JPEG_SEGMENTS = new Set([
 ]);
 /** The frame types jpeg-js decodes: baseline, extended, progressive. */
 const JPEG_FRAMES = new Set([0xc0, 0xc1, 0xc2]);
+/** The largest sampling factor JPEG allows (ITU T.81 B.2.2); jpeg-js takes up to 15. */
+const JPEG_MAX_SAMPLING = 4;
 
 /**
- * Walks a JPEG's markers strictly, as its decoder reads them (review B2a:
- * jpeg-js reads `FF 00` where a marker should be as a no-op, where a looser
- * walk read a segment length, so a fake frame header hidden in a comment
- * could be planned while another frame was decoded): SOI, then only DHT,
- * DQT, DRI, APPn, COM and exactly one SOF0, SOF1 or SOF2 before the first
- * SOS; `FF 00`, fill bytes, restart markers and every other marker where a
- * marker belongs are refused. With `whole`, the scans are walked too (their
- * entropy-coded data skipped by its `FF 00` stuffing and RST markers): a
- * second frame header, or anything but those segments, SOS and EOI, is
- * refused, and the file must reach EOI. Without it, the walk ends at the
- * first SOS (the inline view's check of a file's start).
+ * Checks a segment's length against exactly what jpeg-js reads of it
+ * (T-072: jpeg-js steps past SOF, SOS, DRI, DHT and DQT by what it
+ * parsed, not by the length, so slack inside one could hide a second
+ * frame header from a walk that trusts the length). Returns the frame of a
+ * SOF; throws `ImageRefused` otherwise.
  */
-function walkJpeg(b: Uint8Array, whole: boolean): JpegLayout {
+function checkJpegSegment(
+  b: Uint8Array,
+  marker: number,
+  at: number,
+  length: number,
+  frame: JpegLayout | undefined,
+): JpegLayout | undefined {
+  const data = at + 4;
+  const end = at + 2 + length;
+  if (JPEG_FRAMES.has(marker)) {
+    // SOF: precision, height, width, Nc, then 3 bytes a component.
+    const count = b[data + 5] ?? 0;
+    if (length !== 8 + 3 * count || count < 1 || count > 4) throw new ImageRefused("jpeg_segment");
+    if (b[data] !== 8) throw new ImageRefused("jpeg_precision");
+    const components: JpegComponent[] = [];
+    for (let k = 0; k < count; k++) {
+      const c = data + 6 + 3 * k;
+      const id = b[c] ?? 0;
+      const h = (b[c + 1] ?? 0) >> 4;
+      const v = (b[c + 1] ?? 0) & 0x0f;
+      if (h < 1 || v < 1 || h > JPEG_MAX_SAMPLING || v > JPEG_MAX_SAMPLING) {
+        throw new ImageRefused("jpeg_sampling");
+      }
+      if ((b[c + 2] ?? 0) > 3 || components.some((o) => o.id === id)) {
+        throw new ImageRefused("jpeg_segment");
+      }
+      components.push({ id, h, v });
+    }
+    return { height: u16be(b, data + 1), width: u16be(b, data + 3), components };
+  }
+  switch (marker) {
+    case 0xda: {
+      // SOS: Ns, 2 bytes a component, then Ss, Se, Ah/Al.
+      const count = b[data] ?? 0;
+      if (length !== 6 + 2 * count || count < 1 || count > 4) {
+        throw new ImageRefused("jpeg_segment");
+      }
+      const seen = new Set<number>();
+      for (let k = 0; k < count; k++) {
+        const id = b[data + 1 + 2 * k] ?? 0;
+        if (seen.has(id) || frame?.components.some((c) => c.id === id) !== true) {
+          throw new ImageRefused("jpeg_segment");
+        }
+        seen.add(id);
+      }
+      return frame;
+    }
+    case 0xdd:
+      if (length !== 4) throw new ImageRefused("jpeg_segment");
+      return frame;
+    case 0xc4: {
+      // DHT: tables of class/id, 16 counts and their values, filling it exactly.
+      let i = data;
+      while (i < end) {
+        const spec = b[i] ?? 0;
+        if (spec >> 4 > 1 || (spec & 0x0f) > 3 || i + 17 > end) {
+          throw new ImageRefused("jpeg_segment");
+        }
+        let sum = 0;
+        for (let k = 1; k <= 16; k++) sum += b[i + k] ?? 0;
+        if (sum > 256) throw new ImageRefused("jpeg_segment");
+        i += 17 + sum;
+      }
+      if (i !== end || length < 2 + 17) throw new ImageRefused("jpeg_segment");
+      return frame;
+    }
+    case 0xdb: {
+      // DQT: whole tables of 1 + 64 or 1 + 128 bytes, filling it exactly.
+      let i = data;
+      while (i < end) {
+        const spec = b[i] ?? 0;
+        if (spec >> 4 > 1 || (spec & 0x0f) > 3) throw new ImageRefused("jpeg_segment");
+        i += 1 + 64 * ((spec >> 4) + 1);
+      }
+      if (i !== end || length < 2 + 65) throw new ImageRefused("jpeg_segment");
+      return frame;
+    }
+    default:
+      // APPn and COM: skipped by their length, as jpeg-js does.
+      return frame;
+  }
+}
+
+/**
+ * Walks a JPEG's markers strictly, as its decoder reads them: SOI, then
+ * only DHT, DQT, DRI, APPn, COM and exactly one SOF0, SOF1 or SOF2 before
+ * the first SOS; `FF 00`, fill bytes, restart markers and every other
+ * marker where a marker belongs are refused (review B2a), and every SOF,
+ * SOS, DRI, DHT and DQT must be exactly as long as what jpeg-js reads of it
+ * (T-072). With `whole`, the scans are walked too (their entropy-coded
+ * data skipped by its `FF 00` stuffing and RST markers): a second frame
+ * header, or anything but those segments, SOS and EOI, is refused, the
+ * file must reach EOI, and the file is rebuilt from what was walked
+ * (`canonical`, with `rebuild`: only the decoder needs the copy), so
+ * jpeg-js reads exactly the segments checked here. Without `whole`, the
+ * walk ends at the first SOS (the inline view's check).
+ */
+function walkJpeg(b: Uint8Array, whole: boolean, rebuild = false): JpegLayout {
   if (b[0] !== 0xff || b[1] !== 0xd8) throw new ImageRefused("header");
   let frame: JpegLayout | undefined;
   let scanned = false;
+  const kept: Uint8Array[] = [b.subarray(0, 2)];
+  let adobe: Uint8Array | undefined;
   let i = 2;
   for (;;) {
     if (i + 2 > b.length) throw new ImageRefused("jpeg_truncated");
@@ -168,7 +279,16 @@ function walkJpeg(b: Uint8Array, whole: boolean): JpegLayout {
     const marker = b[i + 1] ?? 0;
     if (marker === 0xd9) {
       if (!scanned || frame === undefined) throw new ImageRefused("jpeg_truncated");
-      return frame;
+      if (!rebuild) return frame;
+      if (adobe !== undefined) kept.splice(1, 0, adobe);
+      kept.push(b.subarray(i, i + 2));
+      const canonical = new Uint8Array(kept.reduce((n, part) => n + part.length, 0));
+      let at = 0;
+      for (const part of kept) {
+        canonical.set(part, at);
+        at += part.length;
+      }
+      return { ...frame, canonical };
     }
     if (!JPEG_FRAMES.has(marker) && marker !== 0xda && !JPEG_SEGMENTS.has(marker)) {
       // FF 00, fill bytes, RST, TEM, DNL and every other marker.
@@ -178,31 +298,35 @@ function walkJpeg(b: Uint8Array, whole: boolean): JpegLayout {
     const length = u16be(b, i + 2);
     const end = i + 2 + length;
     if (length < 2 || end > b.length) throw new ImageRefused("jpeg_truncated");
-    if (JPEG_FRAMES.has(marker)) {
-      if (frame !== undefined || scanned) throw new ImageRefused("jpeg_second_frame");
-      if (length < 8) throw new ImageRefused("jpeg_marker");
-      frame = { height: u16be(b, i + 5), width: u16be(b, i + 7), components: b[i + 9] ?? 0 };
-    } else if (marker === 0xda) {
-      if (frame === undefined) throw new ImageRefused("jpeg_marker");
+    if (JPEG_FRAMES.has(marker) && (frame !== undefined || scanned)) {
+      throw new ImageRefused("jpeg_second_frame");
+    }
+    if (marker === 0xda && frame === undefined) throw new ImageRefused("jpeg_marker");
+    frame = checkJpegSegment(b, marker, i, length, frame);
+    if (marker === 0xee && length >= 2 + 12 && ascii(b, i + 4, "Adobe\0")) {
+      // jpeg-js reads the first 12 bytes of an Adobe APP14 (the last one wins).
+      adobe = new Uint8Array([0xff, 0xee, 0x00, 0x0e, ...b.subarray(i + 4, i + 16)]);
+    }
+    if (marker === 0xda) {
       scanned = true;
-      if (!whole) return frame;
+      if (!whole) return frame ?? { width: 0, height: 0, components: [] };
       // The entropy-coded data: up to the next marker that isn't stuffing or RST.
       let j = end;
       for (;;) {
-        if (j + 1 >= b.length) throw new ImageRefused("jpeg_truncated");
-        if (b[j] === 0xff) {
-          const next = b[j + 1] ?? 0;
-          if (next === 0x00 || (next >= 0xd0 && next <= 0xd7)) {
-            j += 2;
-            continue;
-          }
-          break;
+        j = b.indexOf(0xff, j);
+        if (j < 0 || j + 1 >= b.length) throw new ImageRefused("jpeg_truncated");
+        const next = b[j + 1] ?? 0;
+        if (next === 0x00 || (next >= 0xd0 && next <= 0xd7)) {
+          j += 2;
+          continue;
         }
-        j++;
+        break;
       }
+      kept.push(b.subarray(i, j));
       i = j;
       continue;
     }
+    if (marker < 0xe0) kept.push(b.subarray(i, end));
     i = end;
   }
 }
@@ -424,6 +548,15 @@ function checkPngData(layout: PngLayout): void {
   }
 }
 
+/** A WebP's ALPH chunk, as the walk found it. */
+interface WebpAlpha {
+  /** 0: raw alpha values; 1: compressed as a headerless VP8L image stream. */
+  readonly compression: number;
+  /** Where the compressed stream starts (after the 1-byte header) and ends. */
+  readonly start: number;
+  readonly end: number;
+}
+
 /** The chunks of a WebP file, walked strictly. */
 interface WebpLayout {
   readonly width: number;
@@ -431,6 +564,10 @@ interface WebpLayout {
   readonly lossless: boolean;
   /** The bytes the RIFF size names. */
   readonly body: Uint8Array;
+  /** The VP8 or VP8L frame's data, within `body`. */
+  readonly frameStart: number;
+  readonly frameEnd: number;
+  readonly alpha?: WebpAlpha;
 }
 
 /** Width and height from a VP8 or VP8L chunk's own data. */
@@ -446,7 +583,10 @@ function webpFrameSize(
     }
     return { width: u16le(b, at + 6) & 0x3fff, height: u16le(b, at + 8) & 0x3fff };
   }
-  if (length < 5 || b[at] !== 0x2f) throw new ImageRefused("webp_frame");
+  // VP8L: the signature, then 14 + 14 bits of size, the alpha hint and a version of 0.
+  if (length < 5 || b[at] !== 0x2f || (b[at + 4] ?? 0) >> 5 !== 0) {
+    throw new ImageRefused("webp_frame");
+  }
   const b1 = b[at + 1] ?? 0;
   const b2 = b[at + 2] ?? 0;
   const b3 = b[at + 3] ?? 0;
@@ -460,10 +600,12 @@ function webpFrameSize(
 /**
  * Walks a WebP's RIFF container strictly: the RIFF size within the file
  * (only those bytes are decoded); a simple file (one VP8 or VP8L chunk) or
- * an extended one (VP8X first, then optionally ICCP and ALPH, then exactly
- * one VP8 or VP8L chunk, then metadata); no animation (the VP8X flag, ANIM
- * or ANMF chunks); every chunk within the RIFF size; the frame's own size
- * equal to the VP8X canvas. The size used for the limits is the frame's.
+ * an extended one (VP8X first, then at most one ICCP and, for a VP8 frame
+ * only, at most one ALPH, then exactly one VP8 or VP8L chunk, then
+ * metadata); no animation (the VP8X flag, ANIM or ANMF chunks); every chunk
+ * within the RIFF size; the frame's own size equal to the VP8X canvas. The
+ * size used for the limits is the frame's. An ALPH chunk's header must be
+ * one libwebp accepts (T-072: its compression is planned for).
  */
 function walkWebp(bytes: Uint8Array): WebpLayout {
   if (!ascii(bytes, 0, "RIFF") || !ascii(bytes, 8, "WEBP")) throw new ImageRefused("header");
@@ -475,7 +617,10 @@ function walkWebp(bytes: Uint8Array): WebpLayout {
   if (riffSize < 12 || riffSize + 8 > bytes.length) throw new ImageRefused("webp_riff");
   const body = bytes.subarray(0, riffSize + 8);
   let canvas: { width: number; height: number } | undefined;
-  let frame: { width: number; height: number; lossless: boolean } | undefined;
+  let frame:
+    { width: number; height: number; lossless: boolean; start: number; end: number } | undefined;
+  let alpha: WebpAlpha | undefined;
+  let iccp = false;
   let i = 12;
   let first = true;
   while (i < body.length) {
@@ -497,9 +642,27 @@ function walkWebp(bytes: Uint8Array): WebpLayout {
     } else if (type === "VP8 " || type === "VP8L") {
       if (frame !== undefined) throw new ImageRefused("webp_second_frame");
       if (!first && canvas === undefined) throw new ImageRefused("webp_chunk");
-      frame = { ...webpFrameSize(type, body, i + 8, length), lossless: type === "VP8L" };
-    } else if (type === "ALPH" || type === "ICCP") {
-      if (canvas === undefined || frame !== undefined) throw new ImageRefused("webp_chunk");
+      // libwebp ignores ALPH for a lossless frame (its alpha is its own): refused.
+      if (type === "VP8L" && alpha !== undefined) throw new ImageRefused("webp_chunk");
+      frame = {
+        ...webpFrameSize(type, body, i + 8, length),
+        lossless: type === "VP8L",
+        start: i + 8,
+        end: i + 8 + length,
+      };
+    } else if (type === "ALPH") {
+      if (canvas === undefined || frame !== undefined || alpha !== undefined || length < 1) {
+        throw new ImageRefused("webp_chunk");
+      }
+      // Reserved (2 bits, zero), pre-processing (at most 1), filtering, compression (0 or 1).
+      const header = body[i + 8] ?? 0;
+      if (header >> 6 !== 0 || ((header >> 4) & 3) > 1 || (header & 3) > 1) {
+        throw new ImageRefused("webp_alpha");
+      }
+      alpha = { compression: header & 3, start: i + 9, end: i + 8 + length };
+    } else if (type === "ICCP") {
+      if (canvas === undefined || frame !== undefined || iccp) throw new ImageRefused("webp_chunk");
+      iccp = true;
     } else if (first) {
       throw new ImageRefused("webp_chunk");
     }
@@ -510,16 +673,357 @@ function walkWebp(bytes: Uint8Array): WebpLayout {
   if (canvas !== undefined && (canvas.width !== frame.width || canvas.height !== frame.height)) {
     throw new ImageRefused("webp_canvas");
   }
-  return { width: frame.width, height: frame.height, lossless: frame.lossless, body };
+  return {
+    width: frame.width,
+    height: frame.height,
+    lossless: frame.lossless,
+    body,
+    frameStart: frame.start,
+    frameEnd: frame.end,
+    ...(alpha === undefined ? {} : { alpha }),
+  };
+}
+
+/**
+ * libwebp's largest table for one prefix-code group, by colour-cache bits
+ * (`kTableSize` in `src/dec/vp8l_dec.c`, libwebp main, read 2026-11-25:
+ * 630 × 3 + 410 entries for red, blue, alpha and distance, plus green's,
+ * which grows with the cache), in 4-byte `HuffmanCode` entries.
+ */
+const VP8L_TABLE_ENTRIES = [654, 656, 658, 662, 670, 686, 718, 782, 912, 1168, 1680, 2704].map(
+  (green) => 630 * 3 + 410 + green,
+);
+/** A group's `HTreeGroup` (five table pointers, flags, a 64-entry packed table), rounded up. */
+const VP8L_GROUP_STRUCT_BYTES = 640;
+
+/** What one VP8L prefix-code group can cost libwebp, at most, for these cache bits. */
+export function vp8lGroupBytes(cacheBits: number): number {
+  return (
+    (VP8L_TABLE_ENTRIES[cacheBits] ?? VP8L_TABLE_ENTRIES[11] ?? 0) * 4 + VP8L_GROUP_STRUCT_BYTES
+  );
+}
+
+/** Reads a VP8L bitstream, least significant bit first; past its end is a refusal. */
+class Vp8lBits {
+  private pos = 0;
+  private readonly b: Uint8Array;
+  private readonly start: number;
+  private readonly end: number;
+  // No parameter properties: this file runs under Node's type stripping.
+  constructor(b: Uint8Array, start: number, end: number) {
+    this.b = b;
+    this.start = start;
+    this.end = end;
+  }
+  read(n: number): number {
+    let value = 0;
+    let got = 0;
+    while (got < n) {
+      const at = this.start + (this.pos >>> 3);
+      if (at >= this.end) throw new ImageRefused("webp_lossless");
+      const bit = this.pos & 7;
+      const take = Math.min(8 - bit, n - got);
+      value |= (((this.b[at] ?? 0) >>> bit) & ((1 << take) - 1)) << got;
+      got += take;
+      this.pos += take;
+    }
+    return value >>> 0;
+  }
+}
+
+/** A canonical prefix code for reading (one symbol: no bits). */
+interface Vp8lCode {
+  readonly single: number;
+  readonly count: Int32Array;
+  readonly symbols: Int32Array;
+}
+
+/** The code for these lengths: complete, or a single symbol, as libwebp accepts. */
+function vp8lCode(lengths: Uint8Array): Vp8lCode {
+  const count = new Int32Array(16);
+  let used = 0;
+  let last = -1;
+  for (let s = 0; s < lengths.length; s++) {
+    const len = lengths[s] ?? 0;
+    if (len > 0) {
+      count[len] = (count[len] ?? 0) + 1;
+      used++;
+      last = s;
+    }
+  }
+  if (used === 0) throw new ImageRefused("webp_lossless");
+  if (used === 1) return { single: last, count, symbols: new Int32Array(0) };
+  let left = 1;
+  for (let len = 1; len < 16; len++) {
+    left = 2 * left - (count[len] ?? 0);
+    if (left < 0) throw new ImageRefused("webp_lossless");
+  }
+  if (left !== 0) throw new ImageRefused("webp_lossless");
+  const offsets = new Int32Array(16);
+  for (let len = 1; len < 15; len++) offsets[len + 1] = (offsets[len] ?? 0) + (count[len] ?? 0);
+  // Symbols by length, then by value: the canonical order.
+  const symbols = new Int32Array(used);
+  for (let s = 0; s < lengths.length; s++) {
+    const len = lengths[s] ?? 0;
+    if (len === 0) continue;
+    const at = offsets[len] ?? 0;
+    symbols[at] = s;
+    offsets[len] = at + 1;
+  }
+  return { single: -1, count, symbols };
+}
+
+function vp8lSymbol(br: Vp8lBits, code: Vp8lCode): number {
+  if (code.single >= 0) return code.single;
+  let value = 0;
+  let first = 0;
+  let index = 0;
+  for (let len = 1; len < 16; len++) {
+    value |= br.read(1);
+    const n = code.count[len] ?? 0;
+    if (value - first < n) return code.symbols[index + value - first] ?? 0;
+    index += n;
+    first = (first + n) << 1;
+    value <<= 1;
+  }
+  throw new ImageRefused("webp_lossless");
+}
+
+const CODE_LENGTH_ORDER = [17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+/** One prefix code over an alphabet (RFC 9649 §3.7.2.1). */
+function vp8lReadCode(br: Vp8lBits, alphabet: number): Vp8lCode {
+  const lengths = new Uint8Array(alphabet);
+  if (br.read(1) === 1) {
+    // A simple code: one or two symbols.
+    const two = br.read(1) === 1;
+    const first = br.read(br.read(1) === 1 ? 8 : 1);
+    if (first < alphabet) lengths[first] = 1;
+    if (two) {
+      const second = br.read(8);
+      if (second < alphabet) lengths[second] = 1;
+    }
+    return vp8lCode(lengths);
+  }
+  const lengthLengths = new Uint8Array(19);
+  const n = 4 + br.read(4);
+  for (let k = 0; k < n; k++) lengthLengths[CODE_LENGTH_ORDER[k] ?? 0] = br.read(3);
+  const lengthCode = vp8lCode(lengthLengths);
+  let max = alphabet;
+  if (br.read(1) === 1) {
+    max = 2 + br.read(2 + 2 * br.read(3));
+    if (max > alphabet) throw new ImageRefused("webp_lossless");
+  }
+  let symbol = 0;
+  let previous = 8;
+  while (symbol < alphabet) {
+    if (max-- === 0) break;
+    const len = vp8lSymbol(br, lengthCode);
+    if (len < 16) {
+      lengths[symbol++] = len;
+      if (len !== 0) previous = len;
+      continue;
+    }
+    const slot = len - 16;
+    const repeat = br.read([2, 3, 7][slot] ?? 0) + ([3, 3, 11][slot] ?? 0);
+    if (symbol + repeat > alphabet) throw new ImageRefused("webp_lossless");
+    lengths.fill(len === 16 ? previous : 0, symbol, symbol + repeat);
+    symbol += repeat;
+  }
+  return vp8lCode(lengths);
+}
+
+/** An LZ77 length or distance from its prefix symbol (RFC 9649 §3.6.2.2). */
+function vp8lPrefixValue(br: Vp8lBits, symbol: number): number {
+  if (symbol < 4) return symbol + 1;
+  const extra = (symbol - 2) >> 1;
+  return ((2 + (symbol & 1)) << extra) + br.read(extra) + 1;
+}
+
+/**
+ * The distance map for distance codes 1 to 120 (RFC 9649 figure 20), as
+ * (x, y) offset pairs: the distance is x + y × width, at least 1.
+ */
+// prettier-ignore
+const VP8L_DISTANCE_MAP = [
+  0, 1, 1, 0, 1, 1, -1, 1, 0, 2, 2, 0, 1, 2,
+  -1, 2, 2, 1, -2, 1, 2, 2, -2, 2, 0, 3, 3, 0,
+  1, 3, -1, 3, 3, 1, -3, 1, 2, 3, -2, 3, 3, 2,
+  -3, 2, 0, 4, 4, 0, 1, 4, -1, 4, 4, 1, -4, 1,
+  3, 3, -3, 3, 2, 4, -2, 4, 4, 2, -4, 2, 0, 5,
+  3, 4, -3, 4, 4, 3, -4, 3, 5, 0, 1, 5, -1, 5,
+  5, 1, -5, 1, 2, 5, -2, 5, 5, 2, -5, 2, 4, 4,
+  -4, 4, 3, 5, -3, 5, 5, 3, -5, 3, 0, 6, 6, 0,
+  1, 6, -1, 6, 6, 1, -6, 1, 2, 6, -2, 6, 6, 2,
+  -6, 2, 4, 5, -4, 5, 5, 4, -5, 4, 3, 6, -3, 6,
+  6, 3, -6, 3, 0, 7, 7, 0, 1, 7, -1, 7, 5, 5,
+  -5, 5, 7, 1, -7, 1, 4, 6, -4, 6, 6, 4, -6, 4,
+  2, 7, -2, 7, 7, 2, -7, 2, 3, 7, -3, 7, 7, 3,
+  -7, 3, 5, 6, -5, 6, 6, 5, -6, 5, 8, 0, 4, 7,
+  -4, 7, 7, 4, -7, 4, 8, 1, 8, 2, 6, 6, -6, 6,
+  8, 3, 5, 7, -5, 7, 7, 5, -7, 5, 8, 4, 6, 7,
+  -6, 7, 7, 6, -7, 6, 8, 5, 7, 7, -7, 7, 8, 6,
+  8, 7,
+];
+
+/** A sub-image of `width` × `height` pixels: one group of codes, its own colour cache. */
+function vp8lSubImage(br: Vp8lBits, width: number, height: number): Uint32Array {
+  const cacheBits = vp8lCacheBits(br);
+  const cacheSize = cacheBits > 0 ? 1 << cacheBits : 0;
+  const [green, red, blue, alphaCode, distance] = [256 + 24 + cacheSize, 256, 256, 256, 40].map(
+    (size) => vp8lReadCode(br, size),
+  ) as [Vp8lCode, Vp8lCode, Vp8lCode, Vp8lCode, Vp8lCode];
+  const total = width * height;
+  const pixels = new Uint32Array(total);
+  const cache = cacheSize > 0 ? new Uint32Array(cacheSize) : undefined;
+  const shift = 32 - cacheBits;
+  const insert = (px: number): void => {
+    if (cache !== undefined) cache[Math.imul(px, 0x1e35a7bd) >>> shift] = px;
+  };
+  let pos = 0;
+  while (pos < total) {
+    const g = vp8lSymbol(br, green);
+    if (g < 256) {
+      const r = vp8lSymbol(br, red);
+      const b = vp8lSymbol(br, blue);
+      const a = vp8lSymbol(br, alphaCode);
+      const px = ((a << 24) | (r << 16) | (g << 8) | b) >>> 0;
+      pixels[pos++] = px;
+      insert(px);
+    } else if (g < 256 + 24) {
+      const length = vp8lPrefixValue(br, g - 256);
+      const code = vp8lPrefixValue(br, vp8lSymbol(br, distance));
+      let dist: number;
+      if (code > 120) {
+        dist = code - 120;
+      } else {
+        const dx = VP8L_DISTANCE_MAP[2 * (code - 1)] ?? 0;
+        const dy = VP8L_DISTANCE_MAP[2 * (code - 1) + 1] ?? 0;
+        dist = Math.max(1, dx + dy * width);
+      }
+      if (dist > pos || length > total - pos) throw new ImageRefused("webp_lossless");
+      for (let k = 0; k < length; k++) {
+        const px = pixels[pos - dist] ?? 0;
+        pixels[pos++] = px;
+        insert(px);
+      }
+    } else {
+      if (cache === undefined) throw new ImageRefused("webp_lossless");
+      const px = cache[g - 280] ?? 0;
+      pixels[pos++] = px;
+      insert(px);
+    }
+  }
+  return pixels;
+}
+
+function vp8lCacheBits(br: Vp8lBits): number {
+  if (br.read(1) === 0) return 0;
+  const bits = br.read(4);
+  if (bits < 1 || bits > 11) throw new ImageRefused("webp_lossless");
+  return bits;
+}
+
+/** What a VP8L image stream's prefix codes will cost libwebp (T-072). */
+interface Vp8lCost {
+  /** Prefix-code groups of the main image: the largest in its entropy image, plus one. */
+  readonly groups: number;
+  /** The main image's colour-cache bits (0 for none). */
+  readonly cacheBits: number;
+  /** Pixels of the transforms' and entropy image's sub-images, all together. */
+  readonly subPixels: number;
+  /** Sub-images read (each has one group of its own). */
+  readonly subImages: number;
+}
+
+/**
+ * Reads a VP8L image stream (RFC 9649) as far as libwebp allocates its
+ * prefix-code tables (T-072, review finding 2): every transform (each
+ * sub-image decoded, so the stream is followed exactly), the colour-cache
+ * bits, and the entropy image, whose largest group index says how many
+ * groups libwebp makes. Nothing of the main image's own pixels is read.
+ * `start` is the stream after VP8L's 5-byte header, or an ALPH chunk's
+ * compressed data (which has none). Throws `ImageRefused` for a stream
+ * that isn't valid as far as it is read.
+ */
+function vp8lCost(
+  b: Uint8Array,
+  start: number,
+  end: number,
+  width: number,
+  height: number,
+): Vp8lCost {
+  const br = new Vp8lBits(b, start, end);
+  let xsize = width;
+  let subPixels = 0;
+  let subImages = 0;
+  let seen = 0;
+  const sub = (w: number, h: number): Uint32Array => {
+    subPixels += w * h;
+    subImages++;
+    return vp8lSubImage(br, w, h);
+  };
+  const scaled = (size: number, bits: number): number => (size + (1 << bits) - 1) >> bits;
+  while (br.read(1) === 1) {
+    const type = br.read(2);
+    if ((seen & (1 << type)) !== 0) throw new ImageRefused("webp_lossless");
+    seen |= 1 << type;
+    if (type === 0 || type === 1) {
+      const bits = br.read(3) + 2;
+      sub(scaled(xsize, bits), scaled(height, bits));
+    } else if (type === 3) {
+      const colours = br.read(8) + 1;
+      sub(colours, 1);
+      xsize = scaled(xsize, colours > 16 ? 0 : colours > 4 ? 1 : colours > 2 ? 2 : 3);
+    }
+  }
+  const cacheBits = vp8lCacheBits(br);
+  let groups = 1;
+  if (br.read(1) === 1) {
+    const bits = br.read(3) + 2;
+    const entropy = sub(scaled(xsize, bits), scaled(height, bits));
+    let largest = 0;
+    for (const px of entropy) largest = Math.max(largest, (px >> 8) & 0xffff);
+    groups = largest + 1;
+  }
+  return { groups, cacheBits, subPixels, subImages };
+}
+
+/** What libwebp's prefix-code tables and sub-images cost for one VP8L stream, at most. */
+function vp8lTableBytes(cost: Vp8lCost): number {
+  return (
+    cost.groups * vp8lGroupBytes(cost.cacheBits) +
+    cost.subImages * vp8lGroupBytes(11) +
+    cost.subPixels * 4
+  );
 }
 
 /**
  * The most memory one decode may take, input and every copy included
  * (review B2: `resourceLimits` bounds only the JavaScript heap, and pixel
  * buffers live outside it): 320 MiB. Each format's cost per pixel below
- * was measured (thumbnails.test.ts, peak RSS) and rounded up.
+ * was measured (thumbnails.test.ts, peak RSS) and rounded up. The plan is
+ * the first guard; the decoder process's hard cap (`DECODE_MEMORY_CAP_BYTES`)
+ * is the one that holds whatever a plan misses (T-072).
  */
 export const DECODE_BUDGET_BYTES = 320 * 1024 * 1024;
+
+/**
+ * The hard cap on a decoder process's resident memory growth (T-072): its
+ * resident size never grows past its size after start-up by more than
+ * this (thumbnails.ts). Above the budget, so a planned decode is never
+ * killed; far below what would trouble a small server.
+ */
+export const DECODE_MEMORY_CAP_BYTES = 384 * 1024 * 1024;
+
+/**
+ * How far below the cap the decoder process is killed: what a decode can
+ * add between two samples (measured for the review's repros on a loaded
+ * two-core machine: 1 to 11 MiB past the trigger at 10 ms), with room to
+ * spare, so the peak stays within the cap. The trigger (352 MiB) is still
+ * above the budget, so a planned decode is never killed.
+ */
+export const KILL_HEADROOM_BYTES = 32 * 1024 * 1024;
 
 /** What decoding and scaling an image costs at most, in bytes (see `DECODE_BUDGET_BYTES`). */
 export interface DecodePlan {
@@ -531,24 +1035,59 @@ export interface DecodePlan {
 /** The headroom on every plan (measured peaks vary by some 10% between runs). */
 const PLAN_MARGIN = 1.1;
 
-/** What libwebp's tables for one VP8L prefix-code group cost (measured: about 6 KiB). */
-export const VP8L_GROUP_BYTES = 6656;
+/**
+ * What one of jpeg-js's coefficient blocks costs: an `Int32Array(64)` of
+ * its own, so 256 bytes of data and some 450 of V8's bookkeeping (measured:
+ * 670–770 bytes a block, rows included).
+ */
+export const JPEG_BLOCK_BYTES = 720;
 
 /** Scaling after decoding: flattening in place, then halving (⅓ more at most). */
 const SCALE_BYTES_PER_PIXEL = 4 * (4 / 3);
 
 /**
- * Checks an image's header as the format named (never guessed), strictly
- * for PNG and WebP, against the limits and the memory budget, and returns
- * what decoding it will cost; throws `ImageRefused` otherwise. Cheap: no
- * pixel is decoded, so the server runs it before queueing a job too.
+ * What jpeg-js allocates for a frame, beyond its RGBA output (T-072):
+ * coefficient blocks for whole MCUs (`prepareComponents`: rounded up to
+ * the largest sampling factors, so a thin image with large factors costs
+ * far more than its pixels), each component's sample lines, and the
+ * interleaved samples (`getData`).
  */
-export function planDecode(format: string, bytes: Uint8Array, limits: ImageLimits): DecodePlan {
+function jpegFrameBytes(layout: JpegLayout): number {
+  const { width, height, components } = layout;
+  const maxH = Math.max(...components.map((c) => c.h));
+  const maxV = Math.max(...components.map((c) => c.v));
+  const mcusX = Math.ceil(width / 8 / maxH);
+  const mcusY = Math.ceil(height / 8 / maxV);
+  let bytes = width * height * components.length;
+  for (const c of components) {
+    bytes += mcusX * c.h * mcusY * c.v * JPEG_BLOCK_BYTES;
+    const lineBlocks = Math.ceil((Math.ceil(width / 8) * c.h) / maxH);
+    const columnBlocks = Math.ceil((Math.ceil(height / 8) * c.v) / maxV);
+    bytes += lineBlocks * 8 * columnBlocks * 8;
+  }
+  return bytes;
+}
+
+/**
+ * Checks an image's header as the format named (never guessed), strictly
+ * for JPEG, PNG and WebP, against the limits and the memory budget, and
+ * returns what decoding it will cost; throws `ImageRefused` otherwise.
+ * With `deep` false (the server's check before queueing), a VP8L stream's
+ * prefix codes aren't read (that decodes its sub-images), so the plan is a
+ * lower bound there; the decoder process plans again with `deep`.
+ */
+export function planDecode(
+  format: string,
+  bytes: Uint8Array,
+  limits: ImageLimits,
+  deep = true,
+): DecodePlan {
   if (!THUMBNAIL_TYPES.has(format)) throw new ImageRefused("format");
   let width: number;
   let height: number;
   let perPixel: number;
   let extra = 0;
+  let check: (() => number) | undefined;
   if (format === "image/png") {
     const layout = walkPng(bytes);
     ({ width, height } = layout);
@@ -561,24 +1100,32 @@ export function planDecode(format: string, bytes: Uint8Array, limits: ImageLimit
   } else if (format === "image/webp") {
     const layout = walkWebp(bytes);
     ({ width, height } = layout);
-    // libwebp's output in WebAssembly memory, its copy out, scaling; and
-    // for lossless, its ARGB working buffer and its prefix-code groups
-    // (review B2b): a group's tables cost about 6 KiB, and a file of a few
-    // hundred kilobytes can give every 4 × 4 block a group of its own, so
-    // the plan counts the most groups the size allows.
+    // libwebp's output in WebAssembly memory, its copy out, scaling; for
+    // lossless, its ARGB working buffer; and a VP8L stream's prefix-code
+    // tables (T-072): every group at libwebp's largest table for its
+    // colour-cache bits (about 12–20 KB), for the groups its entropy image
+    // names, read from the stream itself.
     perPixel = 4 + 4 + (layout.lossless ? 4 : 0) + SCALE_BYTES_PER_PIXEL;
-    extra =
-      2 * bytes.length +
-      (layout.lossless ? Math.ceil(width / 4) * Math.ceil(height / 4) * VP8L_GROUP_BYTES : 0);
+    extra = 2 * bytes.length;
+    const alpha = layout.alpha;
+    if (alpha !== undefined) {
+      // The alpha plane; a compressed one also a 32-bit working buffer (T-072, finding 3).
+      extra += width * height * (alpha.compression === 1 ? 5 : 1);
+    }
+    const { body } = layout;
+    if (layout.lossless) {
+      check = () =>
+        vp8lTableBytes(vp8lCost(body, layout.frameStart + 5, layout.frameEnd, width, height));
+    } else if (alpha?.compression === 1) {
+      check = () => vp8lTableBytes(vp8lCost(body, alpha.start, alpha.end, width, height));
+    }
   } else if (format === "image/jpeg") {
     const layout = walkJpeg(bytes, true);
-    const components = layout.components;
-    if (components < 1 || components > 4) throw new ImageRefused("jpeg_marker");
     ({ width, height } = layout);
-    // jpeg-js: its coefficient blocks and sample planes per component, then
-    // RGBA (measured in the worker: up to 39 bytes a pixel at its peak for
-    // three components, so about 7.8 megapixels fit the budget).
-    perPixel = components * 11 + 4 + SCALE_BYTES_PER_PIXEL;
+    // jpeg-js's copy of the input, ours rebuilt from the walk, its blocks,
+    // lines and samples (whole MCUs), then RGBA and scaling.
+    extra = 2 * bytes.length + (withinLimits(layout, limits) ? jpegFrameBytes(layout) : 0);
+    perPixel = 4 + SCALE_BYTES_PER_PIXEL;
   } else {
     const size = imageDimensions(format, bytes);
     if (size === undefined) throw new ImageRefused("header");
@@ -587,8 +1134,12 @@ export function planDecode(format: string, bytes: Uint8Array, limits: ImageLimit
     perPixel = 1 + 4 + SCALE_BYTES_PER_PIXEL;
   }
   if (!withinLimits({ width, height }, limits)) throw new ImageRefused("too_large");
-  // A tenth more than the estimate: the measured peaks vary from run to run.
-  const cost = Math.ceil((width * height * perPixel + extra + bytes.length) * PLAN_MARGIN);
+  const plan = (): number =>
+    Math.ceil((width * height * perPixel + extra + bytes.length) * PLAN_MARGIN);
+  // The cheap estimate first: past the budget, nothing more is read.
+  if (plan() > DECODE_BUDGET_BYTES) throw new ImageRefused("too_large");
+  if (deep && check !== undefined) extra += check();
+  const cost = plan();
   if (cost > DECODE_BUDGET_BYTES) throw new ImageRefused("too_large");
   return { width, height, bytes: cost };
 }
@@ -705,6 +1256,15 @@ function transient(error: unknown): boolean {
 }
 
 /**
+ * How a decode is checked first. `planned` (always, but in the tests of
+ * the decoder process's memory cap): the plan, its walks and the budget.
+ * `unplanned`: the decoder is given the bytes as they are, so a test can
+ * show the hard cap holding what a plan would have missed. Nothing outside
+ * the tests asks for it.
+ */
+export type DecodeCheck = "planned" | "unplanned";
+
+/**
  * Decodes an image of the format named to RGBA pixels, within the limits
  * and the memory budget (`planDecode` first). Throws `ImageRefused` for an
  * image it won't decode (the same every time), anything else for a
@@ -714,41 +1274,52 @@ export async function decodeAny(
   format: string,
   bytes: Uint8Array,
   limits: ImageLimits,
+  check: DecodeCheck = "planned",
 ): Promise<Rgba> {
-  const plan = planDecode(format, bytes, limits);
-  if (format === "image/webp") {
-    const layout = walkWebp(bytes);
-    let image: Awaited<ReturnType<WebpDecode>>;
-    // The decoder failing to load says nothing about the file.
-    const decode = await loadWebp().catch((error: unknown) => {
-      throw new Unavailable(error);
-    });
-    try {
-      // A copy of its own (a Buffer's slice would share its pool): never the caller's buffer.
-      image = await decode(Uint8Array.from(layout.body).buffer);
-    } catch (error) {
-      if (transient(error)) throw error;
-      throw new ImageRefused("decode");
-    }
-    if (image.width !== plan.width || image.height !== plan.height) {
-      throw new ImageRefused("webp_header");
-    }
-    return {
-      width: image.width,
-      height: image.height,
-      data: new Uint8Array(image.data.buffer, image.data.byteOffset, image.data.byteLength),
-    };
+  if (format !== "image/webp") return decodeImage(format, bytes, limits, check);
+  const plan = check === "planned" ? planDecode(format, bytes, limits) : undefined;
+  const body = check === "planned" ? walkWebp(bytes).body : bytes;
+  let image: Awaited<ReturnType<WebpDecode>>;
+  // The decoder failing to load says nothing about the file.
+  const decode = await loadWebp().catch((error: unknown) => {
+    throw new Unavailable(error);
+  });
+  try {
+    // A copy of its own (a Buffer's slice would share its pool): never the caller's buffer.
+    image = await decode(Uint8Array.from(body).buffer);
+  } catch (error) {
+    if (transient(error)) throw error;
+    throw new ImageRefused("decode");
   }
-  return decodeImage(format, bytes, limits);
+  if (plan !== undefined && (image.width !== plan.width || image.height !== plan.height)) {
+    throw new ImageRefused("webp_header");
+  }
+  return {
+    width: image.width,
+    height: image.height,
+    data: new Uint8Array(image.data.buffer, image.data.byteOffset, image.data.byteLength),
+  };
 }
 
 /** Decodes a JPEG, PNG or GIF (WebP: `decodeAny`) within the limits and the budget. */
-export function decodeImage(format: string, bytes: Uint8Array, limits: ImageLimits): Rgba {
+export function decodeImage(
+  format: string,
+  bytes: Uint8Array,
+  limits: ImageLimits,
+  check: DecodeCheck = "planned",
+): Rgba {
   if (format === "image/webp") throw new ImageRefused("format");
-  const size = planDecode(format, bytes, limits);
+  const size = check === "planned" ? planDecode(format, bytes, limits) : undefined;
+  const same = (width: number, height: number): boolean =>
+    size === undefined || (width === size.width && height === size.height);
   try {
     if (format === "image/jpeg") {
-      const image = jpeg.decode(bytes, {
+      // jpeg-js reads the file rebuilt from the strict walk (T-072): only
+      // the segments walked, each exactly as long as what it reads.
+      const canonical = check === "planned" ? walkJpeg(bytes, true, true).canonical : undefined;
+      if (check === "planned" && canonical === undefined) throw new ImageRefused("jpeg_marker");
+      const input = canonical ?? bytes;
+      const image = jpeg.decode(input, {
         useTArray: true,
         formatAsRGBA: true,
         tolerantDecoding: false,
@@ -756,25 +1327,21 @@ export function decodeImage(format: string, bytes: Uint8Array, limits: ImageLimi
         maxMemoryUsageInMB: Math.ceil(DECODE_BUDGET_BYTES / (1024 * 1024)),
       });
       // The size decoded must be the size planned (review B2a).
-      if (image.width !== size.width || image.height !== size.height) {
-        throw new ImageRefused("jpeg_header");
-      }
+      if (!same(image.width, image.height)) throw new ImageRefused("jpeg_header");
       return { width: image.width, height: image.height, data: image.data };
     }
     if (format === "image/png") {
       // One header (walkPng refused a second), so pngjs decodes this size.
-      checkPngData(walkPng(bytes));
+      if (check === "planned") checkPngData(walkPng(bytes));
       const image = pngjs.PNG.sync.read(
         Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
         { checkCRC: true },
       );
-      if (image.width !== size.width || image.height !== size.height) {
-        throw new ImageRefused("png_header");
-      }
+      if (!same(image.width, image.height)) throw new ImageRefused("png_header");
       return { width: image.width, height: image.height, data: image.data };
     }
     const reader = new omggif.GifReader(bytes);
-    if (reader.width !== size.width || reader.height !== size.height || reader.numFrames() < 1) {
+    if (!same(reader.width, reader.height) || reader.numFrames() < 1) {
       throw new ImageRefused("gif_header");
     }
     // The first frame, which must lie inside the screen.
@@ -893,63 +1460,119 @@ export async function renderThumbnail(
   format: string,
   bytes: Uint8Array,
   box: number,
+  check: DecodeCheck = "planned",
 ): Promise<Uint8Array> {
-  const image = flatten(await decodeAny(format, bytes, THUMBNAIL_LIMITS));
+  const image = flatten(await decodeAny(format, bytes, THUMBNAIL_LIMITS, check));
   const small = scaleDown(image, box);
   return jpeg.encode(small, QUALITY).data;
 }
 
-/** A job sent to the worker, and its answer. */
+/** A job sent to the decoder process, and its answer. */
 export interface ThumbnailJob {
   readonly id: number;
   readonly format: string;
   readonly bytes: Uint8Array;
   readonly box: number;
+  /** Tests of the memory cap only (`DecodeCheck`). */
+  readonly check?: DecodeCheck;
 }
 export type ThumbnailAnswer =
-  | {
-      readonly id: number;
-      readonly ok: true;
-      readonly jpeg: Uint8Array;
-      /** Start a new worker after this one: WebAssembly memory grown for a large WebP never shrinks. */
-      readonly recycle: boolean;
-    }
-  | { readonly id: number; readonly ok: false; readonly code: string; readonly recycle: boolean };
+  | { readonly id: number; readonly ok: true; readonly jpeg: Uint8Array }
+  | { readonly id: number; readonly ok: false; readonly code: string };
 
 /** The code of a failure that says nothing about the file (never remembered). */
 export const TRANSIENT = "transient";
 
-/** Marks the worker started by thumbnails.ts (and only it). */
-export const WORKER_MARK = "oculus-thumbnail-worker";
+/** The argument that marks a decoder process started by thumbnails.ts (and only it). */
+export const WORKER_MARK = "oculus-thumbnail-decoder";
 
-const port = parentPort;
-if (port !== null && (workerData as { mark?: unknown } | null)?.mark === WORKER_MARK) {
-  // Ready once the WebP decoder is compiled (a failure there shows in a job).
-  void loadWebp()
-    .catch(() => undefined)
-    .then(() => {
-      port.postMessage({ ready: true });
+/** A process's resident size and its peak since last reset, from Linux's /proc (bytes). */
+export function procMemory(pid: number | "self"): { rss: number; peak: number } | undefined {
+  try {
+    const status = readFileSync(`/proc/${String(pid)}/status`, "latin1");
+    const field = (key: string): number => {
+      const match = new RegExp(`^${key}:\\s*(\\d+) kB`, "m").exec(status);
+      return match === null ? Number.NaN : Number(match[1]) * 1024;
+    };
+    const rss = field("VmRSS");
+    const peak = field("VmHWM");
+    return Number.isFinite(rss) && Number.isFinite(peak) ? { rss, peak } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Resets this process's peak resident size to its current size (Linux; else nothing). */
+function resetPeak(): void {
+  try {
+    writeFileSync("/proc/self/clear_refs", "5");
+  } catch {
+    // Not Linux, or not allowed: the peak then counts from the start.
+  }
+}
+
+/**
+ * Where the memory cap is held when the parent can't read this process's
+ * size (no /proc): a thread of this process samples its resident size
+ * every 5 ms and kills the whole process past the limit. The decode runs
+ * on the main thread, so only another thread can watch it.
+ */
+const WATCHDOG = `
+const { workerData } = require("node:worker_threads");
+const limit = workerData.limit;
+setInterval(() => {
+  if (process.memoryUsage.rss() > limit) process.kill(process.pid, "SIGKILL");
+}, 5);
+`;
+
+/**
+ * The decoder process (T-072): started by thumbnails.ts with this file,
+ * `WORKER_MARK` and the cap for its own watchdog (0 when the parent
+ * samples it), with heap flags and a clean environment. It loads the
+ * decoders, warms them up, resets its peak and says it is ready; then it
+ * answers one job at a time over IPC. Its parent kills it past the memory
+ * cap or the time limit, and replaces it after every answer but a clean
+ * one. If its parent goes, it goes.
+ */
+async function serve(send: (message: unknown) => void, watchdogCap: number): Promise<void> {
+  process.on("disconnect", () => process.exit(0));
+  // Warm-up: every decoder loaded and run once, so the baseline holds them.
+  await loadWebp().catch(() => undefined);
+  const tiny = jpeg.encode({ width: 8, height: 8, data: new Uint8Array(256) }, QUALITY).data;
+  await renderThumbnail("image/jpeg", tiny, 160).catch(() => undefined);
+  if (watchdogCap > 0) {
+    const { Worker } = await import("node:worker_threads");
+    const watchdog = new Worker(WATCHDOG, {
+      eval: true,
+      workerData: { limit: process.memoryUsage.rss() + watchdogCap },
     });
-  port.on("message", (job: ThumbnailJob) => {
+    watchdog.unref();
+    await new Promise((resolve) => watchdog.once("online", resolve));
+  }
+  resetPeak();
+  process.on("message", (job: ThumbnailJob) => {
     void (async () => {
-      // Every WebP decode leaves its worker to be replaced (review B2b): its
-      // WebAssembly memory grows for the decode and never shrinks.
-      const recycle = job.format === "image/webp";
+      resetPeak();
       let answer: ThumbnailAnswer;
       try {
-        const jpegBytes = await renderThumbnail(job.format, job.bytes, job.box);
-        answer = { id: job.id, ok: true, jpeg: jpegBytes, recycle };
+        const bytes = new Uint8Array(job.bytes.buffer, job.bytes.byteOffset, job.bytes.byteLength);
+        const jpegBytes = await renderThumbnail(job.format, bytes, job.box, job.check);
+        answer = { id: job.id, ok: true, jpeg: jpegBytes };
       } catch (error) {
+        // A refusal is the same every time; anything else (memory) may pass.
         answer = {
           id: job.id,
           ok: false,
-          // A refusal is the same every time; anything else (memory) may pass.
           code: error instanceof ImageRefused ? error.message : TRANSIENT,
-          // After a failure that isn't a refusal, start afresh.
-          recycle: recycle || !(error instanceof ImageRefused),
         };
       }
-      port.postMessage(answer);
+      send(answer);
     })();
   });
+  send({ ready: true });
+}
+
+if (process.argv[2] === WORKER_MARK && typeof process.send === "function") {
+  const send = process.send.bind(process);
+  void serve((message) => send(message), Number(process.argv[3] ?? 0) || 0);
 }

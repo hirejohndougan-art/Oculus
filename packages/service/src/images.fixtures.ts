@@ -371,27 +371,44 @@ export async function webpAttacks(): Promise<{
 
 /** Writes bits least significant first, as VP8L reads them. */
 class BitWriter {
-  private readonly bytes: number[] = [];
+  private bytes = new Uint8Array(1 << 16);
+  private length = 0;
   private value = 0;
   private count = 0;
+  /** Bits written so far. */
+  get bits(): number {
+    return this.length * 8 + this.count;
+  }
+  /** Up to 24 bits of `value`, least significant first. */
   write(value: number, bits: number): void {
-    for (let k = 0; k < bits; k++) {
-      this.value |= ((value >>> k) & 1) << this.count;
-      this.count++;
-      if (this.count === 8) {
-        this.bytes.push(this.value);
-        this.value = 0;
-        this.count = 0;
+    this.value |= (value & ((1 << bits) - 1)) << this.count;
+    this.count += bits;
+    while (this.count >= 8) {
+      if (this.length === this.bytes.length) {
+        const grown = new Uint8Array(this.bytes.length * 2);
+        grown.set(this.bytes);
+        this.bytes = grown;
       }
+      this.bytes[this.length++] = this.value & 0xff;
+      this.value >>>= 8;
+      this.count -= 8;
     }
   }
   /** A prefix code's bits, first bit of the code first. */
   writeCode(code: number, length: number): void {
-    for (let k = length - 1; k >= 0; k--) this.write((code >>> k) & 1, 1);
+    let reversed = 0;
+    for (let k = 0; k < length; k++) reversed |= ((code >>> k) & 1) << (length - 1 - k);
+    this.write(reversed, length);
+  }
+  /** Another writer's bits, appended. */
+  append(other: BitWriter): void {
+    const { bytes, length, value, count } = other;
+    for (let i = 0; i < length; i++) this.write(bytes[i] ?? 0, 8);
+    if (count > 0) this.write(value, count);
   }
   finish(): Buffer {
-    if (this.count > 0) this.bytes.push(this.value);
-    return Buffer.from(this.bytes);
+    const out = Buffer.from(this.bytes.subarray(0, this.length));
+    return this.count > 0 ? Buffer.concat([out, Buffer.from([this.value & 0xff])]) : out;
   }
 }
 
@@ -457,10 +474,28 @@ export function vp8lManyGroups(width: number, height: number): Buffer {
   return Buffer.concat([Buffer.from("RIFF"), u32le(4 + chunk.length), Buffer.from("WEBP"), chunk]);
 }
 
-/** A JPEG SOF0 segment claiming `width` × `height`, three components. */
-function sof0(width: number, height: number): Buffer {
+/** A JPEG SOF0 segment claiming `width` × `height`, three components (luma sampled `luma`). */
+function sof0(width: number, height: number, luma = 0x22): Buffer {
   const b = Buffer.from([
-    0xff, 0xc0, 0x00, 0x11, 0x08, 0, 0, 0, 0, 0x03, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1,
+    0xff,
+    0xc0,
+    0x00,
+    0x11,
+    0x08,
+    0,
+    0,
+    0,
+    0,
+    0x03,
+    1,
+    luma,
+    0,
+    2,
+    0x11,
+    1,
+    3,
+    0x11,
+    1,
   ]);
   b.writeUInt16BE(height, 5);
   b.writeUInt16BE(width, 7);
@@ -510,4 +545,325 @@ export function noisePng(width: number, height: number, depth: 8 | 16 = 8): Buff
     raw[i] = x >>> 24;
   }
   return pngOf(width, height, deflateSync(raw, { level: 1 }), { depth, colorType: 6 });
+}
+
+// ---------------------------------------------------------------------------
+// The third review's repros (T-072), built here: no binary fixtures.
+
+/**
+ * A JPEG of `width` × `height` whose every 8 × 8 block is flat grey (DC
+ * difference 0, end of block), with the jpeg-js encoder's standard tables:
+ * any size in a few hundred kilobytes, and quick to make.
+ */
+export function flatJpeg(width: number, height: number): Buffer {
+  const model = makeJpeg(16, 16);
+  const parts: Buffer[] = [model.subarray(0, 2)];
+  let i = 2;
+  for (;;) {
+    const marker = model[i + 1] ?? 0;
+    const length = model.readUInt16BE(i + 2);
+    const segment = Buffer.from(model.subarray(i, i + 2 + length));
+    if (marker === 0xc0) {
+      segment.writeUInt16BE(height, 5);
+      segment.writeUInt16BE(width, 7);
+    }
+    parts.push(segment);
+    i += 2 + length;
+    if (marker === 0xda) break;
+  }
+  // Per MCU (three components, 1 × 1): luma DC 0 "00", EOB "1010";
+  // chroma DC 0 "00", EOB "00", twice. 14 bits, never eight ones in a row.
+  const mcus = Math.ceil(width / 8) * Math.ceil(height / 8);
+  const bits = "001010" + "0000" + "0000";
+  const out = Buffer.alloc(Math.ceil((mcus * bits.length) / 8) + 1);
+  let bit = 0;
+  for (let m = 0; m < mcus; m++) {
+    for (const c of bits) {
+      if (c === "1") out[bit >> 3] = (out[bit >> 3] ?? 0) | (0x80 >> (bit & 7));
+      bit++;
+    }
+  }
+  // Pad the last byte with ones, as encoders do.
+  while ((bit & 7) !== 0) {
+    out[bit >> 3] = (out[bit >> 3] ?? 0) | (0x80 >> (bit & 7));
+    bit++;
+  }
+  parts.push(out.subarray(0, bit >> 3), Buffer.from([0xff, 0xd9]));
+  return Buffer.concat(parts);
+}
+
+/** The segments of a JPEG up to its first SOS: [marker, start, end] each. */
+function jpegSegments(b: Buffer): [number, number, number][] {
+  const out: [number, number, number][] = [];
+  let i = 2;
+  for (;;) {
+    const marker = b[i + 1] ?? 0;
+    const end = i + 2 + b.readUInt16BE(i + 2);
+    out.push([marker, i, end]);
+    if (marker === 0xda) return out;
+    i = end;
+  }
+}
+
+/**
+ * Repro A (review 3): a DRI whose length is 4 + N, its slack holding a
+ * 3,800² SOF0 and then `FF FE` and a comment length covering the next
+ * segment, a real 16 × 16 SOF0; then 3,800²'s entropy data. jpeg-js steps
+ * past the DRI by the 4 bytes it reads, so it decodes the hidden frame; a
+ * walk trusting the length sees only the 16 × 16 one.
+ */
+export function jpegDriSlack(size = 3800): Buffer {
+  const real = flatJpeg(size, size);
+  const sof = jpegSegments(real).find(([marker]) => marker === 0xc0);
+  if (sof === undefined) throw new Error("no frame header");
+  const [, at, end] = sof;
+  const small = sof0(16, 16);
+  const slack = Buffer.concat([
+    real.subarray(at, end),
+    Buffer.from([0xff, 0xfe, 0x00, 2 + small.length]),
+  ]);
+  const dri = Buffer.concat([Buffer.from([0xff, 0xdd, 0x00, 0x00, 0x00, 0x00]), slack]);
+  dri.writeUInt16BE(4 + slack.length, 2);
+  return Buffer.concat([real.subarray(0, at), dri, small, real.subarray(end)]);
+}
+
+/**
+ * Repro B (review 3): a 16 × 16 JPEG whose SOF0 length is 19 bytes longer
+ * than its three components need, the slack holding a 5,000² SOF0, which
+ * jpeg-js parses (and allocates for) as a second frame.
+ */
+export function jpegSofSlack(): Buffer {
+  const real = makeJpeg(16, 16);
+  const sof = jpegSegments(real).find(([marker]) => marker === 0xc0);
+  if (sof === undefined) throw new Error("no frame header");
+  const [, at, end] = sof;
+  const hidden = sof0(5000, 5000, 0x11);
+  const grown = Buffer.concat([real.subarray(at, end), hidden]);
+  grown.writeUInt16BE(end - at - 2 + hidden.length, 2);
+  return Buffer.concat([real.subarray(0, at), grown, real.subarray(end)]);
+}
+
+/** Canonical prefix codes for code lengths (VP8L assigns them as deflate does). */
+function canonicalCodes(lengths: Uint8Array): Int32Array {
+  const count = new Int32Array(16);
+  for (const len of lengths) if (len > 0) count[len] = (count[len] ?? 0) + 1;
+  const next = new Int32Array(16);
+  let code = 0;
+  for (let len = 1; len < 16; len++) {
+    code = (code + (count[len - 1] ?? 0)) << 1;
+    next[len] = code;
+  }
+  // Each length's codes in order of symbol.
+  return Int32Array.from(lengths, (len) => {
+    if (len === 0) return 0;
+    const value = next[len] ?? 0;
+    next[len] = value + 1;
+    return value;
+  });
+}
+
+/** A prefix code ready for writing symbols (one symbol: no bits). */
+interface WriteCode {
+  readonly lengths: Uint8Array;
+  readonly codes: Int32Array;
+  readonly single: boolean;
+}
+
+function writeCodeOf(lengths: Uint8Array): WriteCode {
+  const used = lengths.filter((len) => len > 0).length;
+  return { lengths, codes: canonicalCodes(lengths), single: used === 1 };
+}
+
+function writeSymbol(w: BitWriter, code: WriteCode, symbol: number): void {
+  if (!code.single) w.writeCode(code.codes[symbol] ?? 0, code.lengths[symbol] ?? 0);
+}
+
+const CODE_LENGTH_ORDER = [17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+/**
+ * Writes a normal prefix code with these code lengths (RFC 9649 §3.7.2.1.2):
+ * runs as repeat codes 16, 17 and 18, the code-length code complete and at
+ * most 7 bits a length. Lengths must form a complete code (or one symbol).
+ */
+function writeNormalCode(w: BitWriter, lengths: Uint8Array): WriteCode {
+  const tokens: [number, number, number][] = [];
+  for (let i = 0; i < lengths.length;) {
+    const v = lengths[i] ?? 0;
+    let run = 1;
+    while (i + run < lengths.length && lengths[i + run] === v) run++;
+    i += run;
+    let left = run;
+    if (v === 0) {
+      while (left >= 11) {
+        const take = Math.min(138, left);
+        tokens.push([18, 7, take - 11]);
+        left -= take;
+      }
+      if (left >= 3) {
+        tokens.push([17, 3, left - 3]);
+        left = 0;
+      }
+    } else {
+      tokens.push([v, 0, 0]);
+      left--;
+      while (left >= 3) {
+        const take = Math.min(6, left);
+        tokens.push([16, 2, take - 3]);
+        left -= take;
+      }
+    }
+    for (; left > 0; left--) tokens.push([v, 0, 0]);
+  }
+  // The code-length code: the commonest token 1 bit, the rest a complete
+  // code of the other half at the smallest depth.
+  const freq = new Map<number, number>();
+  for (const [t] of tokens) freq.set(t, (freq.get(t) ?? 0) + 1);
+  const ranked = [...freq.keys()].sort((a, b) => (freq.get(b) ?? 0) - (freq.get(a) ?? 0));
+  const clLengths = new Uint8Array(19);
+  const [commonest = 0, ...rest] = ranked;
+  clLengths[commonest] = 1;
+  // m leaves under the other half: 2^d − m at depth d, the rest at d + 1.
+  const d = Math.ceil(Math.log2(Math.max(1, rest.length)));
+  const shallow = 2 ** d - rest.length;
+  rest.forEach((t, k) => {
+    clLengths[t] = k < shallow ? d : d + 1;
+  });
+  w.write(0, 1); // normal
+  let last = 3;
+  CODE_LENGTH_ORDER.forEach((t, k) => {
+    if (clLengths[t] !== 0) last = Math.max(last, k);
+  });
+  w.write(last + 1 - 4, 4);
+  for (let k = 0; k <= last; k++) w.write(clLengths[CODE_LENGTH_ORDER[k] ?? 0] ?? 0, 3);
+  w.write(0, 1); // every symbol of the alphabet
+  const clCode = writeCodeOf(clLengths);
+  for (const [t, bits, extra] of tokens) {
+    writeSymbol(w, clCode, t);
+    if (bits > 0) w.write(extra, bits);
+  }
+  return writeCodeOf(lengths);
+}
+
+/** A one-symbol simple code for any symbol below 256. */
+function oneSymbolOf(w: BitWriter, symbol: number): WriteCode {
+  w.write(1, 1); // simple
+  w.write(0, 1); // one symbol
+  if (symbol < 2) {
+    w.write(0, 1);
+    w.write(symbol, 1);
+  } else {
+    w.write(1, 1);
+    w.write(symbol, 8);
+  }
+  const lengths = new Uint8Array(symbol + 1);
+  lengths[symbol] = 1;
+  return writeCodeOf(lengths);
+}
+
+/** An LZ77 length or distance as its prefix symbol and extra bits (RFC 9649 §3.6.2.2). */
+function lz77Prefix(value: number): { symbol: number; bits: number; extra: number } {
+  if (value <= 4) return { symbol: value - 1, bits: 0, extra: 0 };
+  const v = value - 1;
+  const high = 31 - Math.clz32(v);
+  const second = (v >> (high - 1)) & 1;
+  return { symbol: 2 * high + second, bits: high - 1, extra: v & ((1 << (high - 1)) - 1) };
+}
+
+/**
+ * Green code lengths for a colour cache of `cacheBits` (alphabet 280 + 2^bits)
+ * that makes libwebp's table about as large as it gets: 2,304 symbols of
+ * 15 bits (18 second-level tables of 128 entries), and literal 0 and the
+ * longest length prefix short. Needs `cacheBits` of 11.
+ */
+function bigGreenLengths(cacheBits: number): Uint8Array {
+  const alphabet = 280 + (1 << cacheBits);
+  const lengths = new Uint8Array(alphabet);
+  const short: [number, number][] = [
+    [0, 1],
+    [279, 2],
+    [1, 3],
+    [2, 5],
+    [3, 6],
+    [4, 7],
+  ];
+  for (const [symbol, len] of short) lengths[symbol] = len;
+  let long = 0;
+  for (let s = 5; s < alphabet && long < 18 * 128; s++) {
+    if (s === 279) continue;
+    lengths[s] = 15;
+    long++;
+  }
+  if (long !== 18 * 128) throw new Error("alphabet too small");
+  return lengths;
+}
+
+/**
+ * A VP8L image stream of `width` × `height` (after the 5-byte header, so
+ * also an ALPH chunk's compressed data): no transforms, a colour cache of
+ * `cacheBits`, a prefix-code group for every 4 × 4 block, each group with a
+ * large green code (`bigGreenLengths`), then all pixels black: one literal
+ * and copies of the pixel before.
+ */
+function vp8lBigTablesStream(width: number, height: number, cacheBits: number): BitWriter {
+  const w = new BitWriter();
+  w.write(0, 1); // no transform
+  w.write(1, 1); // a colour cache
+  w.write(cacheBits, 4);
+  w.write(1, 1); // meta prefix codes
+  w.write(0, 3); // prefix bits 2: 4 × 4 blocks
+  const groups = Math.ceil(width / 4) * Math.ceil(height / 4);
+  w.write(0, 1); // the entropy image has no colour cache
+  eightBitLiterals(w, 256 + 24);
+  eightBitLiterals(w, 256);
+  oneSymbol(w, 0);
+  oneSymbol(w, 0);
+  oneSymbol(w, 0);
+  for (let g = 0; g < groups; g++) {
+    w.writeCode(g & 0xff, 8);
+    w.writeCode(g >> 8, 8);
+  }
+  // One group's codes, written once and repeated.
+  const group = new BitWriter();
+  const green = writeNormalCode(group, bigGreenLengths(cacheBits));
+  for (let c = 0; c < 3; c++) oneSymbolOf(group, 0); // red, blue, alpha: 0
+  oneSymbolOf(group, 1); // distance prefix 1: distance code 2, the pixel to the left
+  for (let g = 0; g < groups; g++) w.append(group);
+  // Pixels: one black literal, then copies of up to 4,096.
+  writeSymbol(w, green, 0);
+  let left = width * height - 1;
+  while (left > 0) {
+    const length = Math.min(4096, left);
+    const { symbol, bits, extra } = lz77Prefix(length);
+    writeSymbol(w, green, 256 + symbol);
+    if (bits > 0) w.write(extra, bits);
+    left -= length;
+  }
+  return w;
+}
+
+/**
+ * Repro C (review 3): a lossless WebP of `size`² (780² by default) with a
+ * group for every 4 × 4 block (38,025), colour-cache bits 11 and full
+ * green codes, so each group's tables cost some 15 KB, not 6.5. It decodes.
+ */
+export function vp8lBigTables(size = 780, cacheBits = 11): Buffer {
+  const w = new BitWriter();
+  w.write(0x2f, 8);
+  w.write(size - 1, 14);
+  w.write(size - 1, 14);
+  w.write(0, 1);
+  w.write(0, 3);
+  w.append(vp8lBigTablesStream(size, size, cacheBits));
+  return riff([riffChunk("VP8L", w.finish())]);
+}
+
+/**
+ * Repro D (review 3): a lossy WebP of `size`² (1,000² by default) whose
+ * ALPH chunk is compressed as VP8L with repro C's shape (a group per 4 × 4
+ * block, cache bits 11): planned before as if it were plain lossy.
+ */
+export async function alphBigTables(size = 1000): Promise<Buffer> {
+  const lossy = await makeWebp(size, size);
+  const alpha = Buffer.concat([Buffer.from([0x01]), vp8lBigTablesStream(size, size, 11).finish()]);
+  return riff([vp8x(0x10, size, size), riffChunk("ALPH", alpha), chunksOf(lossy)]);
 }

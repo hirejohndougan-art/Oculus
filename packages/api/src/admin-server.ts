@@ -232,8 +232,8 @@ export interface AdminServerOptions {
   /** Routes of the program that starts the server (the desktop launcher's instance check, D-088). */
   readonly extraRoutes?: readonly OculusRoute[];
   /**
-   * Server-side thumbnails (M-003, D-097): off by default and until T-072
-   * makes them safe; `GET .../thumbnail` then answers `422 no_thumbnail`.
+   * Server-side thumbnails (M-003, T-072, D-097): on by default; `false`
+   * turns them off, and `GET .../thumbnail` then answers `422 no_thumbnail`.
    */
   readonly thumbnails?: boolean;
   /** Passed on to the sign-in routes (tests). */
@@ -385,9 +385,9 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
         });
 
   const files = await fileStoreFromEnv(env);
-  // Thumbnails (M-003, D-097) are off until T-072: no renderer, so no
-  // worker is ever started. Turned on, one worker, stopped with the server.
-  const thumbnailsOn = options.thumbnails === true;
+  // Thumbnails (M-003, T-072, D-097): one renderer (a decoder child
+  // process at a time), stopped with the server. Turned off, none is made.
+  const thumbnailsOn = options.thumbnails !== false;
   const thumbnails = thumbnailsOn ? createThumbnailRenderer() : undefined;
   const service = createService(options.db, {
     onError: serviceErrorLogger(log),

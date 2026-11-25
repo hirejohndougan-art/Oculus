@@ -111,16 +111,37 @@ const PAGE = {
 };
 
 describe("viewing and downloading (M-003)", () => {
-  it("shows each image's format as a placeholder and asks the server for no thumbnail (T-072)", async () => {
-    const sent = fakeServer({ [LIST]: [200, { files: [SKY, PHOTO], maxFileBytes: 1000 }] });
-    show(false);
-    const sky = await screen.findByRole("button", { name: "Preview sky.webp" });
-    expect(within(sky).getByText("WebP")).toBeTruthy();
-    expect(
-      within(screen.getByRole("button", { name: "Preview photo.jpg" })).getByText("JPEG"),
-    ).toBeTruthy();
-    expect(document.querySelectorAll("img")).toHaveLength(0);
-    expect(sent.some((r) => r.path.includes("/thumbnail"))).toBe(false);
+  it("shows a placeholder when the server makes no thumbnail, and tries again when it was busy", async () => {
+    const thumb = `/api/records/${RECORD_ID}/files/${SKY.id}/thumbnail?size=small`;
+    const photoThumb = `/api/records/${RECORD_ID}/files/${PHOTO.id}/thumbnail?size=small`;
+    fakeServer({
+      [LIST]: [200, { files: [SKY, PHOTO], maxFileBytes: 1000 }],
+      [`HEAD ${thumb}`]: [422, { error: "no_thumbnail" }],
+      [`HEAD ${photoThumb}`]: [405, { error: "method_not_allowed" }],
+    });
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      show(false);
+      const button = await screen.findByRole("button", { name: "Preview sky.webp" });
+      const img = button.querySelector("img");
+      if (img === null) throw new Error("no thumbnail");
+      expect(img.getAttribute("loading")).toBe("lazy");
+      img.dispatchEvent(new Event("error"));
+      await waitFor(() => {
+        expect(button.querySelector("img")).toBeNull();
+      });
+      // The placeholder names the format (the server refused it, or killed its decode).
+      expect(within(button).getByText("WebP")).toBeTruthy();
+      // Busy (not cached yet): the same thumbnail is asked for again later.
+      const photo = screen.getByRole("button", { name: "Preview photo.jpg" });
+      photo.querySelector("img")?.dispatchEvent(new Event("error"));
+      await vi.advanceTimersByTimeAsync(4500);
+      await waitFor(() => {
+        expect(photo.querySelector("img")?.getAttribute("src")).toBe(`${photoThumb}&attempt=1`);
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("says why an image can't be shown, by its status", async () => {
@@ -155,8 +176,11 @@ describe("viewing and downloading (M-003)", () => {
     expect(within(table).getByRole("button", { name: "Preview photo.jpg" })).toBeTruthy();
     expect(within(table).getByRole("button", { name: "Preview sky.webp" })).toBeTruthy();
     expect(within(table).queryByRole("button", { name: "Preview picture.png" })).toBeNull();
-    // No thumbnails (off until T-072): no image at all in the list.
-    expect(document.querySelectorAll("img")).toHaveLength(0);
+    // Both images (WebP included) show the server's thumbnail; the HTML file none.
+    expect([...document.querySelectorAll("img")].map((i) => i.getAttribute("src"))).toEqual([
+      `/api/records/${RECORD_ID}/files/${PHOTO.id}/thumbnail?size=small`,
+      `/api/records/${RECORD_ID}/files/${SKY.id}/thumbnail?size=small`,
+    ]);
     expect(document.querySelector("object, embed, iframe")).toBeNull();
   });
 
@@ -201,8 +225,11 @@ describe("the files panel", () => {
     expect(within(table).getByText(FILE.name)).toBeTruthy();
     expect(within(table).getByText("2.0 KB")).toBeTruthy();
     expect(within(table).getByText("image/png")).toBeTruthy();
-    // The name is never markup: no image in the list at all.
-    expect(document.querySelectorAll("img")).toHaveLength(0);
+    // M-003: the name is never markup; the only image is the server's thumbnail.
+    const images = [...document.querySelectorAll("img")];
+    expect(images.map((i) => i.getAttribute("src"))).toEqual([
+      `/api/records/${RECORD_ID}/files/${FILE.id}/thumbnail?size=small`,
+    ]);
     expect(screen.queryByRole("button", { name: "Add files" })).toBeNull();
     // Read-only people still download.
     expect(within(table).getByRole("link", { name: `Download ${FILE.name}` })).toBeTruthy();

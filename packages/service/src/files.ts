@@ -159,12 +159,12 @@ export const VIEW_HEADER_BYTES = 1024 * 1024;
 export const VIEW_GIF_BYTES = 16 * 1024 * 1024;
 
 /**
- * Server-side thumbnails are off (D-097): three ways around the decode
- * memory budget were found, and they come back with T-072 ("Safe
- * server-side thumbnails"). While off, `fileThumbnail` answers
- * `no_thumbnail` for every file and no worker is ever started.
+ * Server-side thumbnails are on (T-072, D-097): every decode runs in a
+ * child process with a hard memory cap (thumbnails.ts). Turned off,
+ * `fileThumbnail` answers `no_thumbnail` for every file and no decoder
+ * process is ever started.
  */
-export const THUMBNAILS_ENABLED = false;
+export const THUMBNAILS_ENABLED = true;
 
 /** How long a thumbnail that took too long is left before it is tried again (24 hours). */
 export const THUMBNAIL_RETRY_MS = 24 * 3600 * 1000;
@@ -872,8 +872,8 @@ export function fileOperations(
       const found = await readable(context, "fileThumbnail", recordId, fileId);
       if (!found.ok) return found;
       const { file, organizationId } = found.value;
-      // Off until T-072 (D-097): every file, after the same checks as any
-      // read (so a hidden file is still the same 404), has no thumbnail, and
+      // Turned off (D-097): every file, after the same checks as any read
+      // (so a hidden file is still the same 404), has no thumbnail, and
       // nothing is read, cached or decoded.
       if (!thumbnailsEnabled) return noThumbnail();
       if (!THUMBNAIL_TYPES.has(file.mediaType) || file.size > MAX_THUMBNAIL_SOURCE_BYTES) {
@@ -919,9 +919,10 @@ export function fileOperations(
         );
         if (bytes?.length !== file.size) return missingCopy();
         // The header, its structure and the memory budget first, here: a
-        // bomb is refused before any decoder runs.
+        // bomb is refused before any decoder runs. (A VP8L stream's prefix
+        // codes are read by the decoder process, which plans again.)
         try {
-          planDecode(file.mediaType, bytes, THUMBNAIL_LIMITS);
+          planDecode(file.mediaType, bytes, THUMBNAIL_LIMITS, false);
         } catch {
           await remember("none");
           return noThumbnail();
@@ -936,7 +937,10 @@ export function fileOperations(
           case "busy":
             return busy();
           case "refused":
-            // The decoder's own refusal: the same every time, so remembered.
+          case "killed":
+            // The decoder's own refusal, or a decode killed past the memory
+            // cap (T-072): the same every time, so remembered and never
+            // tried again.
             await remember("none");
             return noThumbnail();
           case "timeout":

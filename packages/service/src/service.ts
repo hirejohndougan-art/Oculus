@@ -376,8 +376,8 @@ export interface ServiceOptions {
    */
   readonly thumbnailLimits?: { readonly atOnce?: number; readonly perMinute?: number };
   /**
-   * Whether thumbnails are made at all (default `THUMBNAILS_ENABLED`, off
-   * until T-072, D-097). Only tests of the code kept for T-072 turn it on.
+   * Whether thumbnails are made at all (default `THUMBNAILS_ENABLED`, on
+   * since T-072, D-097); tests turn it off.
    */
   readonly thumbnailsEnabled?: boolean;
   /**

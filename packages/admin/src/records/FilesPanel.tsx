@@ -9,12 +9,13 @@
  *
  * Viewing and downloading (M-003, D-097): every file has a Download link
  * (the server always sends it as an attachment); JPEG, PNG, GIF and WebP
- * files show a placeholder naming their format (server-side thumbnails are
- * off until T-072, D-097) and open in a simple viewer (FileViewer.tsx),
- * where the browser shows the image itself. Which files are images is decided by the type
- * the server sniffed from the bytes, never by the name.
+ * files show a thumbnail the server made (T-072; a placeholder naming
+ * their format when it makes none, as for a file it refused) and open in a
+ * simple viewer (FileViewer.tsx), where the browser shows the image
+ * itself. Which files are images is decided by the type the server sniffed
+ * from the bytes, never by the name.
  */
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button as AriaButton, FileTrigger } from "react-aria-components";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, api, problemText, uploadFile } from "../api";
@@ -51,13 +52,62 @@ const VIEWABLE = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"])
 
 const previewId = (fileId: string) => `preview-${fileId}`;
 
-/** The placeholder's label: the image's format (server-side thumbnails are off until T-072). */
+/** The placeholder's label: the image's format. */
 const FORMAT_LABELS: Readonly<Record<string, string>> = {
   "image/jpeg": "JPEG",
   "image/png": "PNG",
   "image/gif": "GIF",
   "image/webp": "WebP",
 };
+
+/**
+ * A thumbnail, loaded lazily (only when it scrolls into view). When it
+ * fails, a HEAD request asks why: 422 means the server makes none (it
+ * refused the image, or its decode passed the memory cap: a placeholder
+ * naming the format from then on); anything else (busy, a fault) is tried
+ * again a little later, twice at most.
+ */
+function Thumbnail(props: { readonly url: string; readonly label: string }) {
+  const [attempt, setAttempt] = useState(0);
+  const [none, setNone] = useState(false);
+  const live = useRef(true);
+  useEffect(() => {
+    live.current = true;
+    return () => {
+      live.current = false;
+    };
+  }, []);
+  if (none) return <span className={styles.thumbPlaceholder}>{props.label}</span>;
+  return (
+    <img
+      className={styles.thumb}
+      loading="lazy"
+      src={attempt === 0 ? props.url : `${props.url}&attempt=${String(attempt)}`}
+      alt=""
+      onError={() => {
+        void (async () => {
+          let status = 0;
+          try {
+            status = (await fetch(props.url, { method: "HEAD" })).status;
+          } catch {
+            // Offline: tried again below.
+          }
+          if (!live.current) return;
+          if (status === 422 || status === 404 || attempt >= 2) {
+            setNone(true);
+            return;
+          }
+          setTimeout(
+            () => {
+              if (live.current) setAttempt((a) => a + 1);
+            },
+            4000 * (attempt + 1),
+          );
+        })();
+      }}
+    />
+  );
+}
 
 export const filesKey = (recordId: string) => ["record", recordId, "files"] as const;
 
@@ -364,9 +414,10 @@ export function FilesPanel(props: Props) {
                           setViewing(images.indexOf(f));
                         }}
                       >
-                        <span className={styles.thumbPlaceholder}>
-                          {FORMAT_LABELS[f.mediaType] ?? "View"}
-                        </span>
+                        <Thumbnail
+                          url={`${fileUrl(recordId, f.id, "thumbnail")}?size=small`}
+                          label={FORMAT_LABELS[f.mediaType] ?? "View"}
+                        />
                       </AriaButton>
                     ) : (
                       <span className={styles.meta}>None</span>
