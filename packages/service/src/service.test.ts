@@ -1427,7 +1427,9 @@ describe("the context: organization and actor come from the session", () => {
       const update = await service.updateRecord(ctx(mine), id, objectDraft({ note: "Mine now." }), {
         expectedVersion: 1,
       });
-      const renumber = await service.saveIdentifiers(ctx(mine), id, numbers("DHS-1"));
+      const renumber = await service.saveIdentifiers(ctx(mine), id, numbers("DHS-1"), {
+        expectedVersion: 1,
+      });
       const restore = await service.restoreVersion(ctx(mine), id, 1, { expectedVersion: 1 });
       const remove = await service.deleteRecord(ctx(mine), id, { expectedVersion: 1 });
       for (const result of [update, renumber, restore, remove]) {
@@ -1504,24 +1506,40 @@ describe("the context: organization and actor come from the session", () => {
     const record = await create(mine, objectDraft());
     expect(
       codes(
-        await service.saveIdentifiers(ctx(mine), record.id, {
-          ...numbers("DHS-1"),
-          organizationId: theirs,
-        }),
+        await service.saveIdentifiers(
+          ctx(mine),
+          record.id,
+          {
+            ...numbers("DHS-1"),
+            organizationId: theirs,
+          },
+          { expectedVersion: 1 },
+        ),
       ),
     ).toEqual(["wrong_organization"]);
     expect(
       codes(
-        await service.saveIdentifiers(ctx(mine), record.id, {
-          ...numbers("DHS-1"),
-          recordId: newRecordId(),
-        }),
+        await service.saveIdentifiers(
+          ctx(mine),
+          record.id,
+          {
+            ...numbers("DHS-1"),
+            recordId: newRecordId(),
+          },
+          { expectedVersion: 1 },
+        ),
       ),
     ).toEqual(["wrong_record"]);
     // Two organizations may hold the same number under all_time.
     const their = await create(theirs, objectDraft());
-    ok(await service.saveIdentifiers(ctx(mine), record.id, numbers("DHS-1")));
-    ok(await service.saveIdentifiers(ctx(theirs), their.id, numbers("DHS-1")));
+    ok(
+      await service.saveIdentifiers(ctx(mine), record.id, numbers("DHS-1"), { expectedVersion: 1 }),
+    );
+    ok(
+      await service.saveIdentifiers(ctx(theirs), their.id, numbers("DHS-1"), {
+        expectedVersion: 1,
+      }),
+    );
   });
 });
 
@@ -2005,10 +2023,13 @@ describe("updating records", () => {
       }),
     );
     // Dropping DHS-1 for good needs the person to confirm it.
-    const dropped = await service.saveIdentifiers(ctx(org), record.id, numbers("DHS-2"));
+    const dropped = await service.saveIdentifiers(ctx(org), record.id, numbers("DHS-2"), {
+      expectedVersion: 2,
+    });
     expect(codes(dropped)).toEqual(["numbers_dropped"]);
     ok(
       await service.saveIdentifiers(ctx(org), record.id, numbers("DHS-2"), {
+        expectedVersion: 2,
         confirmDropped: [{ type: "object_number", value: "DHS-1" }],
       }),
     );
@@ -2019,9 +2040,7 @@ describe("updating records", () => {
           ctx(org),
           record.id,
           { current: [], former: [] },
-          {
-            confirmDropped: [{ type: "object_number", value: "DHS-2" }],
-          },
+          { expectedVersion: 3, confirmDropped: [{ type: "object_number", value: "DHS-2" }] },
         ),
       ),
     ).toEqual(["identifier_not_held"]);
@@ -2032,6 +2051,109 @@ describe("updating records", () => {
 });
 
 describe("restoring through the service", () => {
+  it("changing only the numbers is the record's next version: History shows it and a stale save is refused (S-061)", async () => {
+    await ready();
+    const org = await organization();
+    const record = await create(org, objectDraft(), { identifiers: numbers("DHS-1", "DHS-2") });
+    // Version 1 holds the numbers it was made with.
+    let history = ok(await readVersions(s.owner, org, record.id)).versions;
+    expect(history[0]?.changedFields).toContain("identifiers.object_number");
+    // Alice makes DHS-2 the main number, changing nothing else.
+    const alice = ok(
+      await service.updateRecord(ctx(org), record.id, draftOf(record), {
+        expectedVersion: 1,
+        identifiers: numbers("DHS-2", "DHS-1"),
+        reason: "Main number corrected.",
+      }),
+    );
+    expect(alice).toMatchObject({ version: 2, changed: true });
+    // Bob, who also read version 1, can't put the old numbers back unseen.
+    const bob = await service.updateRecord(ctx(org, BOB), record.id, draftOf(record), {
+      expectedVersion: 1,
+      identifiers: numbers("DHS-1", "DHS-2", "DHS-3"),
+    });
+    expect(codes(bob)).toEqual(["version_conflict"]);
+    expect(bob.ok ? undefined : bob.conflict?.differences).toEqual([
+      { name: "identifiers.object_number", change: "changed" },
+    ]);
+    const stale = await service.saveIdentifiers(ctx(org, BOB), record.id, numbers("DHS-1"), {
+      expectedVersion: 1,
+      confirmDropped: [{ type: "object_number", value: "DHS-2" }],
+    });
+    expect(codes(stale)).toEqual(["version_conflict"]);
+    expect(ok(await readRecordIdentifiers(s.owner, org, record.id)).current).toEqual(
+      numbers("DHS-2", "DHS-1").current,
+    );
+    history = ok(await readVersions(s.owner, org, record.id)).versions;
+    expect(history.map((v) => [v.version, v.actor, v.changedFields, v.reason])).toEqual([
+      [1, history[0]?.actor, history[0]?.changedFields, undefined],
+      [2, history[0]?.actor, ["identifiers.object_number"], "Main number corrected."],
+    ]);
+    // The same numbers again: nothing changes, nothing is written.
+    expect(
+      ok(
+        await service.updateRecord(ctx(org), record.id, draftOf(record), {
+          expectedVersion: 2,
+          identifiers: numbers("DHS-2", "DHS-1"),
+        }),
+      ),
+    ).toMatchObject({ version: 2, changed: false });
+    expect(
+      ok(
+        await service.saveIdentifiers(ctx(org), record.id, numbers("DHS-2", "DHS-1"), {
+          expectedVersion: 2,
+        }),
+      ),
+    ).toMatchObject({ version: 2, changed: false });
+    expect(await versionCount(org, record.id)).toBe(2);
+    // Bob, from version 2, adds a former number: version 3, by him.
+    const former = ok(
+      await service.saveIdentifiers(
+        ctx(org, BOB),
+        record.id,
+        {
+          current: numbers("DHS-2", "DHS-1").current,
+          former: [{ type: "object_number", value: "OLD-7", note: "Before 1990." }],
+        },
+        { expectedVersion: 2, reason: "Old number found." },
+      ),
+    );
+    expect(former).toMatchObject({ version: 3, changed: true });
+    expect(former.identifiers.former).toEqual([
+      { type: "object_number", value: "OLD-7", note: "Before 1990." },
+    ]);
+    history = ok(await readVersions(s.owner, org, record.id)).versions;
+    expect(history[2]).toMatchObject({
+      version: 3,
+      actor: BOB,
+      reason: "Old number found.",
+      changedFields: ["identifiers.object_number"],
+    });
+    expect((history[2]?.record.updatedAt ?? "") >= record.updatedAt).toBe(true);
+    // An edit that leaves the numbers alone doesn't name them.
+    const renamed = ok(
+      await service.updateRecord(ctx(org), record.id, draftOf(record, { title: "Renamed" }), {
+        expectedVersion: 3,
+      }),
+    );
+    expect(renamed.version).toBe(4);
+    history = ok(await readVersions(s.owner, org, record.id)).versions;
+    expect(history[3]?.changedFields).toEqual(["title"]);
+    // The snapshot is the database's: what the tables hold.
+    const [row] = await s.owner.rows<{ identifiers: unknown }>(sql`
+      SELECT identifiers FROM public.record_versions
+      WHERE organization_id = ${org}::uuid AND record_id = ${record.id}::uuid AND version = 4`);
+    expect(row?.identifiers).toEqual({
+      object_number: {
+        current: [
+          { value: "DHS-2", primary: true },
+          { value: "DHS-1", primary: false },
+        ],
+        former: [{ value: "OLD-7", note: "Before 1990." }],
+      },
+    });
+  });
+
   it("restores an old version as the next one and refreshes the terms", async () => {
     await ready();
     const org = await organization();

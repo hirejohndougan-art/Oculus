@@ -1096,10 +1096,15 @@ describe("identifier types", () => {
     const ctx = { organizationId: w.a, actor: actorOf(w.root), siteId: w.a1 };
     const made = ok(await w.service.createRecord(ctx as never, objectDraft("Numbered")));
     ok(
-      await w.service.saveIdentifiers(ctx as never, made.record.id, {
-        current: [{ type: "object_number", value: "INV-0001", primary: true }],
-        former: [],
-      }),
+      await w.service.saveIdentifiers(
+        ctx as never,
+        made.record.id,
+        {
+          current: [{ type: "object_number", value: "INV-0001", primary: true }],
+          former: [],
+        },
+        { expectedVersion: 1 },
+      ),
     );
     ok(await w.service.publish(ctx as never, made.record.id, { expectedVersion: 1 }));
     const list = await call("GET", "/api/identifier-types", { as: "root" });
@@ -1145,10 +1150,15 @@ describe("identifier types", () => {
     );
     const holder = await makeAs(w, w.a, w.a1, unit("fonds", "Holder fonds"));
     ok(
-      await w.service.saveIdentifiers(ctx as never, holder as never, {
-        current: [{ type: "box_number", value: "BOX-1", primary: true }],
-        former: [],
-      }),
+      await w.service.saveIdentifiers(
+        ctx as never,
+        holder as never,
+        {
+          current: [{ type: "box_number", value: "BOX-1", primary: true }],
+          former: [],
+        },
+        { expectedVersion: 1 },
+      ),
     );
     const child = await makeAs(w, w.a, w.a1, unit("series", "Published child", holder));
     await publishAs(w, w.a, child);

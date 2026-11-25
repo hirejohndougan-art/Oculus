@@ -406,6 +406,8 @@ describe("the history panel", () => {
     expect(items[0]?.textContent).toContain("Version 3 (current): Sent for review");
     expect(items[2]?.textContent).toContain("You");
     expect(items[0]?.textContent).toContain("Someone else");
+    // A change of numbers is named by its identifier type (S-061).
+    expect(items[1]?.textContent).toContain("Changed: Note, ID numbers (object_number)");
     await userEvent.click(screen.getByRole("button", { name: "View version 1" }));
     expect(await screen.findByText("<b>Old</b>")).toBeTruthy();
     expect(container.querySelector("b")).toBeNull();

@@ -392,12 +392,17 @@ describe("every role against every operation", () => {
         "renumber",
         async (_, c) => {
           const r = await fresh();
-          return service.saveIdentifiers(c, r.id, {
-            current: [
-              { type: "object_number", value: `INV-${newRecordId().slice(0, 6)}`, primary: true },
-            ],
-            former: [],
-          });
+          return service.saveIdentifiers(
+            c,
+            r.id,
+            {
+              current: [
+                { type: "object_number", value: `INV-${newRecordId().slice(0, 6)}`, primary: true },
+              ],
+              former: [],
+            },
+            { expectedVersion: 1 },
+          );
         },
         ["ok", "ok", "ok", NP, NP, UR, "ok", NP],
       ],
@@ -592,8 +597,15 @@ describe("collection-level permissions", () => {
       expect(await service.restoreVersion(c, r.id, 1, { expectedVersion: 1 })).toEqual(
         await service.restoreVersion(c, nowhere, 1, { expectedVersion: 1 }),
       );
-      expect(await service.saveIdentifiers(c, r.id, { current: [], former: [] })).toEqual(
-        await service.saveIdentifiers(c, nowhere, { current: [], former: [] }),
+      expect(
+        await service.saveIdentifiers(c, r.id, { current: [], former: [] }, { expectedVersion: 1 }),
+      ).toEqual(
+        await service.saveIdentifiers(
+          c,
+          nowhere,
+          { current: [], former: [] },
+          { expectedVersion: 1 },
+        ),
       );
     }
     // Filing under, or scanning, a record outside: as if it didn't exist.
@@ -1118,11 +1130,13 @@ describe("a number held on a site the person can't see (S-021)", () => {
         onA2,
         anyRecord.record.id,
         numbers(`${hiddenNumber}${suffix}`),
+        { expectedVersion: 1 },
       );
       const savedSeen = await service.saveIdentifiers(
         onA2,
         anyRecord.record.id,
         numbers(`${seenNumber}${suffix}`),
+        { expectedVersion: 1 },
       );
       expect(codes(savedHidden)).toEqual(["not_unique"]);
       expect(JSON.stringify(savedHidden).replaceAll(hiddenNumber, "N")).toBe(
@@ -1637,10 +1651,15 @@ describe("a digital asset can't move between the check and the write", () => {
       { expectedVersion: 1 },
     );
     await waiting(1);
-    const save = service.saveIdentifiers(ctxOf(w.a, p), w.ax.id, {
-      current: [{ type: "object_number", value: "INV-RACE-1", primary: true }],
-      former: [],
-    });
+    const save = service.saveIdentifiers(
+      ctxOf(w.a, p),
+      w.ax.id,
+      {
+        current: [{ type: "object_number", value: "INV-RACE-1", primary: true }],
+        former: [],
+      },
+      { expectedVersion: 1 },
+    );
     await waiting(2);
     h.release();
     await h.held;
@@ -1648,7 +1667,12 @@ describe("a digital asset can't move between the check and the write", () => {
     const saved = await save;
     expect(codes(saved)).toEqual(["unknown_record"]);
     expect(saved).toEqual(
-      await service.saveIdentifiers(ctxOf(w.a, p), newRecordId(), { current: [], former: [] }),
+      await service.saveIdentifiers(
+        ctxOf(w.a, p),
+        newRecordId(),
+        { current: [], former: [] },
+        { expectedVersion: 1 },
+      ),
     );
     const [held] = await s.owner.rows<{ n: number }>(sql`
       SELECT count(*)::integer AS n FROM public.record_identifiers
@@ -1689,21 +1713,28 @@ describe("a digital asset can't move between the check and the write", () => {
     const h = holdRows(rowOf(w.a, w.ax.id));
     await h.locked;
     // The cataloger checks first (holding the arrangement lock), then waits for AX's row.
-    const save = service.saveIdentifiers(ctxOf(w.a, p), w.ax.id, {
-      current: [{ type: "object_number", value: "INV-RACE-2", primary: true }],
-      former: [],
-    });
+    const save = service.saveIdentifiers(
+      ctxOf(w.a, p),
+      w.ax.id,
+      {
+        current: [{ type: "object_number", value: "INV-RACE-2", primary: true }],
+        former: [],
+      },
+      { expectedVersion: 1 },
+    );
     await waiting(1);
+    // The new numbers are the record's version 2 (S-061), so the move,
+    // which waits for that save, starts from it.
     const move = service2.updateRecord(
       ctxOf(w.a, folks.root),
       w.ax.id,
       { ...w.ax, represents: w.s2.id },
-      { expectedVersion: 1 },
+      { expectedVersion: 2 },
     );
     await waiting(2);
     h.release();
     await h.held;
-    ok(await save);
+    expect(ok(await save).version).toBe(2);
     ok(await move);
     expect(codes(await service.readRecord(ctxOf(w.a, p), w.ax.id))).toEqual(["unknown_record"]);
   }, 60_000);
@@ -1849,7 +1880,7 @@ describe("Scanners and identifiers", () => {
       current: [{ type: "object_number", value, primary: true }],
       former: [],
     });
-    ok(await service.saveIdentifiers(c, w.ax.id, numbers("INV-SCAN-1")));
+    ok(await service.saveIdentifiers(c, w.ax.id, numbers("INV-SCAN-1"), { expectedVersion: 1 }));
     const made = ok(
       await service.createRecord(c, assetDraft(w.x1.id), { identifiers: numbers("INV-SCAN-2") }),
     );
@@ -1863,12 +1894,16 @@ describe("Scanners and identifiers", () => {
       }),
     );
     // Not on other kinds, by any route.
-    expect(codes(await service.saveIdentifiers(c, w.o.id, numbers("INV-SCAN-4")))).toEqual([
-      "not_permitted",
-    ]);
-    expect(codes(await service.saveIdentifiers(c, w.x1.id, numbers("INV-SCAN-5")))).toEqual([
-      "not_permitted",
-    ]);
+    expect(
+      codes(
+        await service.saveIdentifiers(c, w.o.id, numbers("INV-SCAN-4"), { expectedVersion: 1 }),
+      ),
+    ).toEqual(["not_permitted"]);
+    expect(
+      codes(
+        await service.saveIdentifiers(c, w.x1.id, numbers("INV-SCAN-5"), { expectedVersion: 1 }),
+      ),
+    ).toEqual(["not_permitted"]);
     expect(
       codes(
         await service.updateRecord(c, w.o.id, w.o, {
@@ -1980,8 +2015,20 @@ describe("items belong to a site (D-074)", () => {
       expect(await service.deleteRecord(c, onA2.id, { expectedVersion: 1 })).toEqual(
         await service.deleteRecord(c, nowhere, { expectedVersion: 1 }),
       );
-      expect(await service.saveIdentifiers(c, onA2.id, { current: [], former: [] })).toEqual(
-        await service.saveIdentifiers(c, nowhere, { current: [], former: [] }),
+      expect(
+        await service.saveIdentifiers(
+          c,
+          onA2.id,
+          { current: [], former: [] },
+          { expectedVersion: 1 },
+        ),
+      ).toEqual(
+        await service.saveIdentifiers(
+          c,
+          nowhere,
+          { current: [], former: [] },
+          { expectedVersion: 1 },
+        ),
       );
       expect(await service.restoreVersion(c, onA2.id, 1, { expectedVersion: 1 })).toEqual(
         await service.restoreVersion(c, nowhere, 1, { expectedVersion: 1 }),

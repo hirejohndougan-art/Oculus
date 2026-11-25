@@ -78,6 +78,8 @@ export function HistoryPanel(props: Props) {
   const [busy, setBusy] = useState(false);
 
   const label = (name: string) => {
+    // A change of numbers (S-061): `identifiers.<type key>`.
+    if (name.startsWith("identifiers.")) return `ID numbers (${name.slice(12)})`;
     const key = name.startsWith("fields.") ? name.slice(7) : undefined;
     if (key === undefined) return PROPERTY_LABELS[name] ?? name;
     return props.template?.fields.find((f) => f.key === key)?.label ?? key;

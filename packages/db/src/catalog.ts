@@ -425,7 +425,8 @@ export interface VersionConflict {
   readonly currentVersion: number;
   /**
    * What changed from `expectedVersion` to `currentVersion`, by name and
-   * kind of change, sorted by name. Absent when it can't be worked out:
+   * kind of change, sorted by name: `identifiers.<type>` (as `changed`) for
+   * identifier types whose numbers changed (S-061). Absent when it can't be worked out:
    * the expected version is later than the current one (never stored), or a
    * stored version no longer validates.
    */
@@ -643,12 +644,15 @@ const NO_TEMPLATE_KEY = "Every stored record names its template (templateKey).";
  * the primary key; a deleted record's ID (one with history) is refused as
  * `id_used_before`, since it is never used again. Runs in a savepoint of the caller's transaction (outside
  * one it throws); a database error is thrown after the savepoint is rolled
- * back, so no row and no version stays.
+ * back, so no row and no version stays. `beforeVersion`, if given, runs
+ * after the row is written and before its version (inside the savepoint):
+ * a refusal from it stores nothing.
  */
 export async function insertRecord(
   db: Queryable,
   input: unknown,
   change: RecordChange,
+  beforeVersion?: () => Promise<Validated<unknown>>,
 ): Promise<Validated<CatalogRecord>> {
   const who = validateRecordChange(change);
   if (!who.ok) return { ok: false, issues: who.issues.map(underChange) };
@@ -682,6 +686,12 @@ export async function insertRecord(
         ${JSON.stringify(r.fields)}::jsonb, ${r.createdAt}::timestamptz, ${r.updatedAt}::timestamptz,
         1
       )`);
+    // What else belongs to version 1 and needs the row first (the record's
+    // identifiers, S-061): written before the version, which snapshots them.
+    if (beforeVersion !== undefined) {
+      const before = await beforeVersion();
+      if (!before.ok) return before;
+    }
     await writeVersion(db, r, 1, who.value);
     return valid;
   });
@@ -835,9 +845,19 @@ export async function versionConflict(
   );
   if (!compared.ok) return Object.freeze(base);
   // Names and kinds only, never values (VersionConflict).
-  const differences = compared.value.differences.map(({ name, change }) =>
+  const differences: ChangedName[] = compared.value.differences.map(({ name, change }) =>
     Object.freeze({ name, change }),
   );
+  // The numbers aren't part of the record's content: the versions between
+  // name the identifier types they changed (S-061).
+  const numbers = await db.rows<{ name: string }>(sql`
+    SELECT DISTINCT n AS name
+    FROM public.record_versions, unnest(changed_fields) AS n
+    WHERE organization_id = ${organizationId}::uuid AND record_id = ${recordId}::uuid
+      AND version > ${expectedVersion}::integer AND version <= ${current.version}::integer
+      AND n LIKE 'identifiers.%'`);
+  for (const { name } of numbers) differences.push(Object.freeze({ name, change: "changed" }));
+  differences.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   return Object.freeze({ ...base, differences: Object.freeze(differences) });
 }
 

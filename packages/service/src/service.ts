@@ -275,8 +275,21 @@ export interface UpdateOptions {
 }
 
 export interface IdentifierOptions {
+  /** The version the edit started from (S-061, as `UpdateOptions`). */
+  readonly expectedVersion: number;
   /** The numbers the person confirmed may be dropped (`numbers_dropped`). */
   readonly confirmDropped?: readonly DroppedNumber[];
+  /** Why, for the change log (optional). */
+  readonly reason?: string;
+}
+
+/** A record's identifiers after `saveIdentifiers`, and its version then. */
+export interface SavedIdentifiers {
+  readonly identifiers: RecordIdentifiers;
+  /** The record's version: the next one when the numbers changed (S-061). */
+  readonly version: number;
+  /** False when the set was the same, so no version was written. */
+  readonly changed: boolean;
 }
 
 export interface RestoreOptions {
@@ -558,13 +571,18 @@ export interface RecordService
     draft: unknown,
     options: UpdateOptions,
   ): Promise<ServiceResult<SavedRecord>>;
-  /** Replaces the record's identifiers (`current`, `former`), checked against its identifier fields. */
+  /**
+   * Replaces the record's identifiers (`current`, `former`), checked against
+   * its identifier fields. The record must still be at `expectedVersion`
+   * (`version_conflict` otherwise, as for an update); a change is written as
+   * its next version (S-061), so History shows it.
+   */
   saveIdentifiers(
     context: ServiceContext,
     recordId: RecordId,
     identifiers: unknown,
-    options?: IdentifierOptions,
-  ): Promise<ServiceResult<RecordIdentifiers>>;
+    options: IdentifierOptions,
+  ): Promise<ServiceResult<SavedIdentifiers>>;
   /** Restores an old version as the record's next one (D-065), with its term usages. */
   restoreVersion(
     context: ServiceContext,
@@ -1039,6 +1057,34 @@ function readIdentifierDraft(
     );
   }
   return { ok: true, value: { ...copy, organizationId, recordId } };
+}
+
+/** A saved identifier set, and whether it differs from the one before. */
+interface IdentifierSave {
+  readonly set: RecordIdentifiers;
+  readonly changed: boolean;
+}
+
+/** The same numbers, in the same order, with the same flags, dates and notes. */
+function sameIdentifiers(a: RecordIdentifiers, b: RecordIdentifiers): boolean {
+  return (
+    a.current.length === b.current.length &&
+    a.former.length === b.former.length &&
+    a.current.every((x, i) => {
+      const y = b.current[i];
+      return y !== undefined && x.type === y.type && x.value === y.value && x.primary === y.primary;
+    }) &&
+    a.former.every((x, i) => {
+      const y = b.former[i];
+      return (
+        y !== undefined &&
+        x.type === y.type &&
+        x.value === y.value &&
+        x.retiredAt === y.retiredAt &&
+        x.note === y.note
+      );
+    })
+  );
 }
 
 function underIdentifiers(i: Issue): Issue {
@@ -1821,7 +1867,8 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
 
   /**
    * Saves a record's identifier set in the transaction, refusing numbers
-   * dropped from every record unless confirmed (D-061).
+   * dropped from every record unless confirmed (D-061), and says whether it
+   * changed (S-061: a change is written as the record's next version).
    */
   async function saveIdentifierSet(
     tx: Queryable,
@@ -1829,7 +1876,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
     recordId: RecordId,
     input: unknown,
     confirmed: ReadonlySet<string>,
-  ): Promise<ServiceResult<RecordIdentifiers>> {
+  ): Promise<ServiceResult<IdentifierSave>> {
     const draft = readIdentifierDraft(input, organizationId, recordId);
     if (!draft.ok) return draft;
     const before = await readRecordIdentifiers(tx, organizationId, recordId);
@@ -1856,7 +1903,10 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         ),
       };
     }
-    return saved;
+    return {
+      ok: true,
+      value: { set: saved.value, changed: !sameIdentifiers(before.value, saved.value) },
+    };
   }
 
   /** The terms index for the record, in the same transaction (D-062). */
@@ -1992,22 +2042,21 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           hiddenLinks,
         });
         if (problems.length > 0) return { ok: false, issues: problems };
-        const inserted = await insertRecord(tx, record, {
-          actor: who.actor,
-          ...(reason.value === undefined ? {} : { reason: reason.value }),
-        });
-        if (!inserted.ok) return inserted;
         const identifiers = own(opts.value, "identifiers");
-        if (identifiers !== undefined) {
-          const saved = await saveIdentifierSet(
-            tx,
-            who.organizationId,
-            record.id,
-            identifiers,
-            new Set(),
-          );
-          if (!saved.ok) return saved;
-        }
+        // Its identifiers are saved before version 1 is written, so the
+        // version holds them (S-061).
+        const inserted = await insertRecord(
+          tx,
+          record,
+          {
+            actor: who.actor,
+            ...(reason.value === undefined ? {} : { reason: reason.value }),
+          },
+          identifiers === undefined
+            ? undefined
+            : () => saveIdentifierSet(tx, who.organizationId, record.id, identifiers, new Set()),
+        );
+        if (!inserted.ok) return inserted;
         const fieldProblems = await identifierFieldProblems(tx, record);
         if (fieldProblems.length > 0) return { ok: false, issues: fieldProblems };
         const terms = await refreshTerms(tx, who.organizationId, record.id);
@@ -2195,9 +2244,8 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
             value: Object.freeze({ record: before, version: stored.value.version, changed: false }),
           };
         }
-        let version = stored.value.version;
-        let saved = before;
-        if (compared.value.differences.length > 0) {
+        const contentChanged = compared.value.differences.length > 0;
+        if (contentChanged) {
           const below = await hiddenChildrenIssue(
             tx,
             checker,
@@ -2218,6 +2266,22 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
             const moved = await templateMoveIssues(tx, before, record, confirmedMove.value);
             if (moved.length > 0) return { ok: false, issues: moved };
           }
+        }
+        // The identifiers first, then the version, which holds them (S-061):
+        // changing only the numbers is a change too, written as the record's
+        // next version, so History shows it and a stale save is refused.
+        let identifiersChanged = false;
+        if (identifiers !== undefined) {
+          // The template's versions can't change before COMMIT (the checks
+          // above took this lock when the record itself changed).
+          await lockDefinition(tx, org, "template", record.templateKey ?? "");
+          const set = await saveIdentifierSet(tx, org, recordId, identifiers, confirmed.value);
+          if (!set.ok) return set;
+          identifiersChanged = set.value.changed;
+        }
+        let version = stored.value.version;
+        let saved = before;
+        if (contentChanged || identifiersChanged) {
           const updated = await updateStoredRecord(tx, record, {
             expectedVersion: expected.value,
             actor: who.actor,
@@ -2226,13 +2290,6 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           if (!updated.ok) return updated;
           version = updated.value.version;
           saved = record;
-        }
-        if (identifiers !== undefined) {
-          // The template's versions can't change before COMMIT (the checks
-          // above took this lock when the record itself changed).
-          await lockDefinition(tx, org, "template", saved.templateKey ?? "");
-          const set = await saveIdentifierSet(tx, org, recordId, identifiers, confirmed.value);
-          if (!set.ok) return set;
         }
         const fieldProblems = await identifierFieldProblems(tx, saved);
         if (fieldProblems.length > 0) return { ok: false, issues: fieldProblems };
@@ -2251,7 +2308,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           value: Object.freeze({
             record: saved,
             version,
-            changed: compared.value.differences.length > 0,
+            changed: contentChanged || identifiersChanged,
           }),
         };
       });
@@ -2263,8 +2320,16 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         if (!isRecordId(recordId)) {
           return refusal(["recordId"], "invalid_id", "A record ID is a lowercase version 4 UUID.");
         }
-        const opts = readOptions(identifierOptions, ["confirmDropped"]);
+        const opts = readOptions(identifierOptions, [
+          "expectedVersion",
+          "confirmDropped",
+          "reason",
+        ]);
         if (!opts.ok) return opts;
+        const expected = readExpectedVersion(opts.value);
+        if (!expected.ok) return expected;
+        const reason = readReason(opts.value);
+        if (!reason.ok) return reason;
         const confirmed = readConfirmDropped(opts.value);
         if (!confirmed.ok) return confirmed;
         // The record's row first, as an update does: its place is checked
@@ -2283,6 +2348,22 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
             "The stored record no longer reads as a valid record; it needs repair.",
           );
         }
+        // Saved from a stale copy: refused, as an update is (S-061), so an
+        // old set of numbers can't silently replace a newer one.
+        if (stored.value.version !== expected.value) {
+          const conflict = await versionConflict(tx, org, recordId, expected.value);
+          return {
+            ok: false,
+            issues: [
+              issue(
+                ["options", "expectedVersion"],
+                "version_conflict",
+                `The record was saved by someone else since version ${String(expected.value)}; it is now at version ${String(stored.value.version)}. Read it again.`,
+              ),
+            ],
+            ...(conflict === undefined ? {} : { conflict }),
+          };
+        }
         // Its template's versions can't change before COMMIT (0008).
         await lockDefinition(tx, org, "template", stored.value.record.templateKey ?? "");
         const saved = await saveIdentifierSet(tx, org, recordId, identifiers, confirmed.value);
@@ -2291,7 +2372,39 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         if (fieldProblems.length > 0) return { ok: false, issues: fieldProblems };
         const unpublishable = await publishedStillPasses(tx, org, recordId, "own");
         if (unpublishable) return unpublishable;
-        return saved;
+        if (!saved.value.changed) {
+          return {
+            ok: true,
+            value: Object.freeze<SavedIdentifiers>({
+              identifiers: saved.value.set,
+              version: stored.value.version,
+              changed: false,
+            }),
+          };
+        }
+        // A change of numbers is the record's next version, holding them
+        // (S-061): History shows who changed them and when.
+        const stamp = now();
+        if (!stamp.ok) return stamp;
+        const record = stored.value.record;
+        const updated = await updateStoredRecord(
+          tx,
+          { ...record, updatedAt: later(record.updatedAt, stamp.value) },
+          {
+            expectedVersion: expected.value,
+            actor: who.actor,
+            ...(reason.value === undefined ? {} : { reason: reason.value }),
+          },
+        );
+        if (!updated.ok) return updated;
+        return {
+          ok: true,
+          value: Object.freeze<SavedIdentifiers>({
+            identifiers: saved.value.set,
+            version: updated.value.version,
+            changed: true,
+          }),
+        };
       });
     },
 

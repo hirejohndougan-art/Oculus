@@ -144,7 +144,7 @@ export const VERSIONS_REPLY = {
       version: 2,
       actor: "user:00000000-0000-4000-8000-0000000000ee",
       recordedAt: "2026-11-24T10:30:00.000Z",
-      changedFields: ["fields.note"],
+      changedFields: ["fields.note", "identifiers.object_number"],
       action: "save",
       workflowState: "draft",
     },

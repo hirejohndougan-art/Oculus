@@ -15,6 +15,7 @@ export type {
   CreateOptions,
   UpdateOptions,
   IdentifierOptions,
+  SavedIdentifiers,
   RestoreOptions,
   DeleteOptions,
   ReadRecord,
