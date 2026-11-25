@@ -21,7 +21,7 @@
  *   does. Losing it loses every two-step sign-in set-up (D-077), so it must
  *   be backed up with the database backups.
  */
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   closeSync,
   existsSync,
@@ -48,6 +48,7 @@ export class DesktopError extends Error {
       | "password_in_settings"
       | "no_database"
       | "secret_key_exposed"
+      | "secret_key_missing"
       | "secret_key_invalid",
     message: string,
   ) {
@@ -185,11 +186,19 @@ export function loadOrCreateSecretKey(
   folder: string,
   env: Env,
   platform: NodeJS.Platform,
+  /** False when the database already holds two-step set-ups sealed with a key (D-077). */
+  mayCreate = true,
 ): { key: string; created: boolean } {
   const fromEnv = env[SECRET_KEY_VARIABLE];
   if (fromEnv !== undefined && fromEnv !== "") return { key: fromEnv, created: false };
   const file = join(folder, KEY_FILE);
   let created = false;
+  if (!existsSync(file) && !mayCreate) {
+    throw new DesktopError(
+      "secret_key_missing",
+      `${file} is missing, but people have already set up two-step sign-in with this database's key. Put the key back from your backup (or set OCULUS_SECRET_KEY). A new key would lock everyone out of two-step sign-in.`,
+    );
+  }
   if (!existsSync(file)) {
     const key = randomBytes(32).toString("base64url");
     // "wx": never overwrite a key another launcher has just written.
@@ -222,6 +231,24 @@ export function loadOrCreateSecretKey(
   return { key, created };
 }
 
+/**
+ * The app window's profile folder: on Windows under %LOCALAPPDATA% (browser
+ * profiles and caches don't belong in the roaming folder), elsewhere in the
+ * settings folder.
+ */
+export function windowProfileFolder(platform: NodeJS.Platform, env: Env, folder: string): string {
+  const local = env.LOCALAPPDATA;
+  if (
+    platform === "win32" &&
+    env[DESKTOP_HOME_VARIABLE] === undefined &&
+    local !== undefined &&
+    local !== ""
+  ) {
+    return join(local, "Oculus", "window");
+  }
+  return join(folder, "window");
+}
+
 /** Where installed Chromium-family browsers usually are, best first. */
 export function browserCandidates(platform: NodeJS.Platform, env: Env): string[] {
   if (platform === "win32") {
@@ -245,8 +272,6 @@ export function browserCandidates(platform: NodeJS.Platform, env: Env): string[]
     "/usr/bin/google-chrome",
     "/usr/bin/google-chrome-stable",
     "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/snap/bin/chromium",
   ];
 }
 
@@ -274,8 +299,10 @@ export function appWindowArgs(url: string, profileFolder: string): string[] {
     "--no-first-run",
     "--no-default-browser-check",
     "--disable-extensions",
-    // Nothing should keep the window's browser running once it's closed.
+    // Nothing should keep the window's browser running once it's closed,
+    // and nothing in it (passwords included) syncs to a browser account.
     "--disable-background-mode",
+    "--disable-sync",
     "--window-size=1280,860",
   ];
 }
@@ -315,14 +342,34 @@ export async function choosePort(wanted: number): Promise<number> {
   return (await portIsFree(wanted)) ? wanted : anyFreePort();
 }
 
-export interface RunningLauncher {
+/**
+ * The launcher lock (`desktop.lock`): taken with `O_EXCL` before anything
+ * else, so two starts can't both run. It holds the launcher's PID, a random
+ * token, the database it serves and, once the server listens, its address.
+ * A second start trusts it only if the address answers `/desktop/instance`
+ * with the token's hash (so a reused PID or another program on that port
+ * isn't mistaken for Oculus), or, before an address is written, if the PID
+ * lives and the lock is under ten minutes old (a start still building or
+ * migrating). Anything else is a stale lock, removed and taken again.
+ */
+export interface LockContents {
   pid: number;
-  url: string;
+  token: string;
+  database: string;
+  started: number;
+  url?: string;
 }
 
 const LOCK_FILE = "desktop.lock";
+export const STARTING_LOCK_MS = 10 * 60_000;
+export const INSTANCE_PATH = "/desktop/instance";
 
-function alive(pid: number): boolean {
+/** The hash `/desktop/instance` answers with; the token itself never leaves the lock file. */
+export function instanceHash(token: string): string {
+  return createHash("sha256").update(`oculus-desktop-instance:${token}`).digest("hex");
+}
+
+export function pidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
@@ -331,49 +378,141 @@ function alive(pid: number): boolean {
   }
 }
 
-/**
- * Another launcher still running for this settings folder, if any. A lock
- * left by a launcher that has stopped (its process is gone) is ignored. The
- * URL is only ever an `http://127.0.0.1:<port>/` address.
- */
-export function runningLauncher(folder: string): RunningLauncher | undefined {
-  const file = join(folder, LOCK_FILE);
-  if (!existsSync(file)) return undefined;
+/** Reads a lock, or `undefined` if it's missing or not a lock. */
+export function readLock(folder: string): LockContents | undefined {
   try {
-    const value = JSON.parse(readFileSync(file, "utf8")) as Partial<RunningLauncher>;
+    const value = JSON.parse(
+      readFileSync(join(folder, LOCK_FILE), "utf8"),
+    ) as Partial<LockContents>;
     if (
-      typeof value.pid === "number" &&
-      Number.isInteger(value.pid) &&
-      value.pid > 0 &&
-      value.pid !== process.pid &&
-      typeof value.url === "string" &&
-      /^http:\/\/127\.0\.0\.1:\d{2,5}\/$/.test(value.url) &&
-      alive(value.pid)
+      typeof value.pid !== "number" ||
+      !Number.isInteger(value.pid) ||
+      value.pid <= 0 ||
+      typeof value.token !== "string" ||
+      !/^[A-Za-z0-9_-]{32,}$/.test(value.token) ||
+      typeof value.database !== "string" ||
+      typeof value.started !== "number" ||
+      (value.url !== undefined &&
+        (typeof value.url !== "string" || !/^http:\/\/127\.0\.0\.1:\d{2,5}\/$/.test(value.url)))
     ) {
-      return { pid: value.pid, url: value.url };
+      return undefined;
     }
+    return {
+      pid: value.pid,
+      token: value.token,
+      database: value.database,
+      started: value.started,
+      ...(value.url === undefined ? {} : { url: value.url }),
+    };
   } catch {
-    // An unreadable lock is a stale one.
+    return undefined;
   }
-  return undefined;
 }
 
-/** Writes this launcher's lock (readable only by its owner); returns the function that removes it. */
-export function takeLock(folder: string, url: string): () => void {
-  const file = join(folder, LOCK_FILE);
-  rmSync(file, { force: true });
-  const fd = openSync(file, "wx", 0o600);
+/** Whether the server at `url` is the launcher that wrote `lock`. */
+export async function instanceAnswers(lock: LockContents): Promise<boolean> {
+  if (lock.url === undefined) return false;
   try {
-    writeSync(fd, JSON.stringify({ pid: process.pid, url }));
+    const reply = await fetch(new URL(INSTANCE_PATH, lock.url), {
+      signal: AbortSignal.timeout(2000),
+      redirect: "error",
+    });
+    if (!reply.ok) return false;
+    const body = (await reply.json()) as { instance?: unknown };
+    return body.instance === instanceHash(lock.token);
+  } catch {
+    return false;
+  }
+}
+
+export type LockOutcome =
+  | { kind: "taken"; lock: LockContents; setUrl: (url: string) => void; release: () => void }
+  | { kind: "running"; lock: LockContents & { url: string } }
+  | { kind: "starting" };
+
+function writeNew(file: string, contents: LockContents): boolean {
+  let fd: number;
+  try {
+    fd = openSync(file, "wx", 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+  try {
+    writeSync(fd, JSON.stringify(contents));
   } finally {
     closeSync(fd);
   }
-  return () => {
-    try {
-      const value = JSON.parse(readFileSync(file, "utf8")) as Partial<RunningLauncher>;
-      if (value.pid === process.pid) rmSync(file, { force: true });
-    } catch {
-      // Already gone.
-    }
+  return true;
+}
+
+/** Takes the lock, or says which launcher already has it. */
+export async function takeLock(
+  folder: string,
+  database: string,
+  now: () => number = Date.now,
+): Promise<LockOutcome> {
+  const file = join(folder, LOCK_FILE);
+  const mine: LockContents = {
+    pid: process.pid,
+    token: randomBytes(32).toString("base64url"),
+    database,
+    started: now(),
   };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (writeNew(file, mine)) {
+      const owned = (): boolean => readLock(folder)?.token === mine.token;
+      return {
+        kind: "taken",
+        lock: mine,
+        setUrl: (url) => {
+          if (!owned()) return;
+          mine.url = url;
+          const fd = openSync(file, "w", 0o600);
+          try {
+            writeSync(fd, JSON.stringify(mine));
+          } finally {
+            closeSync(fd);
+          }
+        },
+        release: () => {
+          try {
+            if (owned()) rmSync(file, { force: true });
+          } catch {
+            // Already gone.
+          }
+        },
+      };
+    }
+    const held = readLock(folder);
+    if (held?.url !== undefined && (await instanceAnswers(held))) {
+      return { kind: "running", lock: { ...held, url: held.url } };
+    }
+    if (
+      held !== undefined &&
+      held.url === undefined &&
+      held.pid !== process.pid &&
+      pidAlive(held.pid) &&
+      now() - held.started < STARTING_LOCK_MS
+    ) {
+      return { kind: "starting" };
+    }
+    // Stale: its launcher is gone, or something else answers on its port.
+    rmSync(file, { force: true });
+  }
+  return { kind: "starting" };
+}
+
+/** A short, password-free name for a database address, for messages and the lock. */
+export function databaseLabel(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const name = decodeURIComponent(parsed.pathname.replace(/^\//, "")) || "(default)";
+    const socket = parsed.searchParams.get("host");
+    if (socket?.startsWith("/") === true) return `${name} on a local socket`;
+    const host = socket ?? (parsed.hostname === "" ? "localhost" : parsed.hostname);
+    return `${name} on ${host}${parsed.port === "" ? "" : `:${parsed.port}`}`;
+  } catch {
+    return "(unreadable address)";
+  }
 }

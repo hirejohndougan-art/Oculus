@@ -2,7 +2,7 @@
 rem Starts Oculus on this computer in its own window (T-056, D-088).
 rem Double-click this file, or make a desktop shortcut to it. Closing the
 rem Oculus window stops it. The first time, and after each update
-rem (git pull), it builds Oculus first, which takes a minute or two.
+rem (git pull), it installs and builds Oculus first, which takes a few minutes.
 setlocal
 cd /d "%~dp0.."
 if not exist "node_modules" (
@@ -18,7 +18,8 @@ if defined HEAD if not "%HEAD%"=="%BUILT%" goto build
 goto run
 
 :build
-echo Building Oculus...
+echo Updating what Oculus needs and building it...
+call npm ci || goto failed
 call npm run build || goto failed
 if defined HEAD (echo %HEAD%)>"packages\api\dist\.built-from"
 

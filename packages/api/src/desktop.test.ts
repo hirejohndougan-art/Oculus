@@ -8,6 +8,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { createServer as createHttpServer } from "node:http";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,11 +23,17 @@ import {
   ensureSettingsFolder,
   findAppBrowser,
   loadOrCreateSecretKey,
+  anyFreePort,
+  databaseLabel,
+  instanceAnswers,
+  instanceHash,
   readDesktopSettings,
-  runningLauncher,
+  readLock,
   settingsFolder,
+  STARTING_LOCK_MS,
   takeLock,
   urlHasPassword,
+  windowProfileFolder,
 } from "./desktop.js";
 
 let folder: string;
@@ -269,46 +276,147 @@ describe("choosePort", () => {
 });
 
 describe("the launcher lock", () => {
-  it("is found while another launcher's process lives, and ignored after", async () => {
+  const lockFile = () => join(folder, "desktop.lock");
+  const write = (value: object) => {
+    writeFileSync(lockFile(), JSON.stringify(value));
+  };
+  const token = "t".repeat(43);
+
+  it("is taken once; a second start while the first is still starting is told so", async () => {
+    const first = await takeLock(folder, "oculus on localhost");
+    expect(first.kind).toBe("taken");
+    if (process.platform !== "win32") expect(statSync(lockFile()).mode & 0o777).toBe(0o600);
+    // Another process holding a fresh lock with no address yet: starting.
     const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
       stdio: "ignore",
     });
     try {
-      const pid = child.pid ?? 0;
-      writeFileSync(
-        join(folder, "desktop.lock"),
-        JSON.stringify({ pid, url: "http://127.0.0.1:4780/" }),
-      );
-      expect(runningLauncher(folder)).toEqual({ pid, url: "http://127.0.0.1:4780/" });
+      write({ pid: child.pid, token, database: "x", started: Date.now() });
+      expect((await takeLock(folder, "x")).kind).toBe("starting");
+      // The same lock, but older than a start can take: stale.
+      write({ pid: child.pid, token, database: "x", started: Date.now() - STARTING_LOCK_MS - 1 });
+      expect((await takeLock(folder, "x")).kind).toBe("taken");
     } finally {
       child.kill();
       await new Promise((resolve) => child.once("exit", resolve));
     }
-    expect(runningLauncher(folder)).toBeUndefined();
   });
 
-  it("ignores its own lock, garbage, and any address but 127.0.0.1", () => {
-    const release = takeLock(folder, "http://127.0.0.1:4780/");
-    expect(runningLauncher(folder)).toBeUndefined();
-    release();
-    expect(existsSync(join(folder, "desktop.lock"))).toBe(false);
-    for (const text of [
-      "{",
-      "[]",
-      JSON.stringify({ pid: process.ppid, url: "http://evil.example/" }),
-    ]) {
-      writeFileSync(join(folder, "desktop.lock"), text);
-      expect(runningLauncher(folder), text).toBeUndefined();
+  it("treats a lock whose process lives but whose address doesn't answer as stale (a reused PID)", async () => {
+    // PID 1 always lives (or answers EPERM); nothing listens on the address.
+    const port = await anyFreePort();
+    write({
+      pid: 1,
+      token,
+      database: "x",
+      started: Date.now(),
+      url: `http://127.0.0.1:${String(port)}/`,
+    });
+    const outcome = await takeLock(folder, "x");
+    expect(outcome.kind).toBe("taken");
+  });
+
+  it("treats a program on the lock's port that doesn't know the token as stale", async () => {
+    const impostor = createHttpServer((_request, reply) => {
+      reply.setHeader("content-type", "application/json");
+      reply.end(JSON.stringify({ instance: instanceHash("some-other-token-".repeat(3)) }));
+    });
+    const port = await new Promise<number>((resolve) => {
+      impostor.listen(0, "127.0.0.1", () => {
+        const address = impostor.address();
+        resolve(typeof address === "object" && address !== null ? address.port : 0);
+      });
+    });
+    try {
+      const url = `http://127.0.0.1:${String(port)}/`;
+      write({ pid: 1, token, database: "x", started: Date.now(), url });
+      expect(await instanceAnswers({ pid: 1, token, database: "x", started: 0, url })).toBe(false);
+      expect((await takeLock(folder, "x")).kind).toBe("taken");
+    } finally {
+      await new Promise((resolve) => impostor.close(resolve));
     }
   });
 
-  it("removes only its own lock", () => {
-    const release = takeLock(folder, "http://127.0.0.1:4780/");
-    writeFileSync(
-      join(folder, "desktop.lock"),
-      JSON.stringify({ pid: process.ppid, url: "http://127.0.0.1:1/" }),
+  it("finds a running launcher only by its token's hash", async () => {
+    const answering = createHttpServer((request, reply) => {
+      reply.setHeader("content-type", "application/json");
+      reply.end(
+        JSON.stringify(
+          request.url === "/desktop/instance" ? { instance: instanceHash(token) } : {},
+        ),
+      );
+    });
+    const port = await new Promise<number>((resolve) => {
+      answering.listen(0, "127.0.0.1", () => {
+        const address = answering.address();
+        resolve(typeof address === "object" && address !== null ? address.port : 0);
+      });
+    });
+    try {
+      const url = `http://127.0.0.1:${String(port)}/`;
+      write({ pid: 1, token, database: "x", started: Date.now(), url });
+      expect(await takeLock(folder, "x")).toEqual({
+        kind: "running",
+        lock: { pid: 1, token, database: "x", started: expect.any(Number) as number, url },
+      });
+    } finally {
+      await new Promise((resolve) => answering.close(resolve));
+    }
+  });
+
+  it("ignores garbage and any address but 127.0.0.1", async () => {
+    for (const text of [
+      "{",
+      "[]",
+      JSON.stringify({ pid: 1, token, database: "x", started: 0, url: "http://evil.example/" }),
+      JSON.stringify({ pid: 1, token: "short", database: "x", started: 0 }),
+    ]) {
+      writeFileSync(lockFile(), text);
+      expect(readLock(folder), text).toBeUndefined();
+    }
+    expect((await takeLock(folder, "x")).kind).toBe("taken");
+  });
+
+  it("records the address, and releases only its own lock", async () => {
+    const outcome = await takeLock(folder, "x");
+    if (outcome.kind !== "taken") throw new Error(outcome.kind);
+    outcome.setUrl("http://127.0.0.1:4780/");
+    expect(readLock(folder)?.url).toBe("http://127.0.0.1:4780/");
+    write({ pid: 1, token, database: "x", started: 0 });
+    outcome.release();
+    expect(existsSync(lockFile())).toBe(true);
+    outcome.setUrl("http://127.0.0.1:1/");
+    expect(readLock(folder)?.token).toBe(token);
+  });
+});
+
+describe("databaseLabel", () => {
+  it("names the database and host, never the password", () => {
+    expect(databaseLabel("postgresql://o:Invented-pw-9@db.example:5433/oculus")).toBe(
+      "oculus on db.example:5433",
     );
-    release();
-    expect(existsSync(join(folder, "desktop.lock"))).toBe(true);
+    expect(databaseLabel("postgresql://o@localhost/oculus?host=%2Ftmp%2Fs")).toBe(
+      "oculus on a local socket",
+    );
+  });
+});
+
+describe("windowProfileFolder", () => {
+  it("puts the window's profile in LOCALAPPDATA on Windows", () => {
+    expect(windowProfileFolder("win32", { LOCALAPPDATA: "C:\\L" }, "C:\\R\\Oculus")).toBe(
+      join("C:\\L", "Oculus", "window"),
+    );
+    expect(windowProfileFolder("linux", {}, "/h/.config/oculus")).toBe("/h/.config/oculus/window");
+  });
+});
+
+describe("loadOrCreateSecretKey with two-step set-ups in the database", () => {
+  it("refuses to make a new key, which would lock everyone out", () => {
+    expect(codeOf(() => loadOrCreateSecretKey(folder, {}, "linux", false))).toBe(
+      "secret_key_missing",
+    );
+    expect(existsSync(join(folder, "secret-key"))).toBe(false);
+    loadOrCreateSecretKey(folder, {}, "linux", true);
+    expect(loadOrCreateSecretKey(folder, {}, "linux", false).created).toBe(false);
   });
 });

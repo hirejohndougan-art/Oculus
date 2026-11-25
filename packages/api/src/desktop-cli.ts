@@ -14,9 +14,11 @@
  * 4. opens it in an Edge or Chrome app window with Oculus's own profile, and
  *    stops the server when that window closes (or on Ctrl+C).
  *
- * Starting it again while it runs opens another window on the running
- * server instead of a second server. Nothing printed shows the database
- * URL's password or the secret key.
+ * One launcher runs at a time (desktop.ts's lock, checked against the
+ * running server's `/desktop/instance` answer): starting it again opens
+ * another window on the running server. Whatever fails after the server
+ * listens, the window, the server, the pool and the lock are closed.
+ * Nothing printed shows the database URL's password or the secret key.
  *
  * Exit codes: 0 stopped normally, 1 refused or failed, 2 usage.
  */
@@ -30,8 +32,10 @@ import {
   MigrationError,
   openDatabase,
   SECRET_KEY_VARIABLE,
+  sql,
   type Database,
 } from "@oculus/db";
+import type { FastifyInstance } from "fastify";
 import { ADMIN_ORIGIN_ENV } from "./admin-files.js";
 import { buildAdminServer } from "./admin-server.js";
 import {
@@ -40,14 +44,17 @@ import {
   choosePort,
   DEFAULT_DESKTOP_PORT,
   DesktopError,
+  databaseLabel,
   ensureSettingsFolder,
   findAppBrowser,
+  INSTANCE_PATH,
+  instanceHash,
   loadOrCreateSecretKey,
   readDesktopSettings,
-  runningLauncher,
   settingsFolder,
   takeLock,
   urlHasPassword,
+  windowProfileFolder,
   type Env,
 } from "./desktop.js";
 import { ORIGINS_ENV } from "./origin.js";
@@ -100,12 +107,12 @@ function defaultOpenDefault(url: string): void {
 
 function defaultStopRequested(): Promise<void> {
   return new Promise((resolve) => {
-    process.once("SIGINT", () => {
-      resolve();
-    });
-    process.once("SIGTERM", () => {
-      resolve();
-    });
+    // SIGHUP: the console window was closed; SIGBREAK: Ctrl+Break on Windows.
+    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"] as const) {
+      process.on(signal, () => {
+        resolve();
+      });
+    }
   });
 }
 
@@ -119,13 +126,31 @@ function scrub(line: string, secrets: readonly string[]): string {
 }
 
 function passwordOf(url: string): string[] {
+  const found: string[] = [];
   try {
     const parsed = new URL(url);
-    const found = [parsed.password, parsed.searchParams.get("password") ?? ""];
-    return found.flatMap((p) => (p === "" ? [] : [p, decodeURIComponent(p)]));
+    for (const p of [parsed.password, parsed.searchParams.get("password") ?? ""]) {
+      if (p === "") continue;
+      found.push(p);
+      try {
+        found.push(decodeURIComponent(p));
+      } catch {
+        // A malformed escape: the raw form is enough.
+      }
+    }
   } catch {
-    return [];
+    // Not a URL: openDatabase refuses it before anything prints it.
   }
+  return found;
+}
+
+/** Whether the database holds two-step set-ups (sealed with some key). */
+async function hasSecondFactors(db: Database): Promise<boolean> {
+  const [table] = await db.rows<{ present: boolean }>(
+    sql`SELECT to_regclass('public.second_factors') IS NOT NULL AS present`,
+  );
+  if (table?.present !== true) return false;
+  return (await db.rows(sql`SELECT 1 FROM public.second_factors LIMIT 1`)).length > 0;
 }
 
 /** Runs the launcher; resolves with the exit code once Oculus has stopped. */
@@ -134,7 +159,8 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
   const env = options.env;
   const openWindow = options.openWindow ?? defaultOpenWindow;
   const openDefault = options.openDefault ?? defaultOpenDefault;
-  let secrets: string[] = [];
+  const findBrowser = options.findBrowser ?? (() => findAppBrowser(platform, env));
+  const secrets: string[] = [];
   const out: Line = (line) => {
     options.out(scrub(line, secrets));
   };
@@ -144,37 +170,15 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
 
   let folder: string;
   let url: string;
-  let key: string;
   let wantedPort: number;
   try {
     folder = settingsFolder(platform, env, options.home ?? homedir());
     ensureSettingsFolder(folder);
-    const already = runningLauncher(folder);
-    if (already !== undefined) {
-      out(`Oculus is already running at ${already.url}. Opening another window on it.`);
-      const browser = (options.findBrowser ?? (() => findAppBrowser(platform, env)))();
-      if (browser === undefined) openDefault(already.url);
-      else {
-        const window = openWindow(browser, appWindowArgs(already.url, join(folder, "window")));
-        window.once("error", () => {
-          openDefault(already.url);
-        });
-      }
-      return 0;
-    }
     const settings = readDesktopSettings(folder);
     url = chooseDatabaseUrl(env, settings, folder);
-    secrets = passwordOf(url);
-    const secretKey = loadOrCreateSecretKey(folder, env, platform);
-    key = secretKey.key;
-    secrets.push(key);
-    if (secretKey.created) {
-      out(
-        `Made Oculus's secret key in ${join(folder, "secret-key")}. Back it up along with your database backups: without it, everyone has to set up two-step sign-in again.`,
-      );
-    }
-    const fromEnv = env.OCULUS_PORT;
+    secrets.push(...passwordOf(url));
     wantedPort = settings.port ?? DEFAULT_DESKTOP_PORT;
+    const fromEnv = env.OCULUS_PORT;
     if (fromEnv !== undefined && fromEnv !== "") {
       const port = Number(fromEnv);
       if (!Number.isInteger(port) || port < 1024 || port > 65_535) {
@@ -190,22 +194,65 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
     }
     throw error;
   }
-  if (urlHasPassword(url)) {
-    out("Note: the database address holds a password. Your pgpass file is a safer place for it.");
-  }
+  const profile = windowProfileFolder(platform, env, folder);
+  const database = databaseLabel(url);
 
-  let db: Database;
+  // One launcher at a time, before anything slow.
+  let lock: Awaited<ReturnType<typeof takeLock>>;
   try {
-    db = openDatabase(url, { applicationName: "oculus-desktop", max: 10 });
+    lock = await takeLock(folder, database);
   } catch {
-    err("The database address is not a usable postgresql:// URL (its value is not shown).");
-    return 2;
+    err(`Can't write the lock file in ${folder}. Check that you can change that folder.`);
+    return 1;
   }
-  let stopping = false;
+  if (lock.kind === "starting") {
+    out("Oculus is already starting. Its window opens when it's ready.");
+    return 0;
+  }
+  if (lock.kind === "running") {
+    if (lock.lock.database !== database) {
+      err(
+        `Oculus is already running with another database (${lock.lock.database}). Close its window first.`,
+      );
+      return 1;
+    }
+    out(`Oculus is already running at ${lock.lock.url}. Opening another window on it.`);
+    const browser = findBrowser();
+    const address = lock.lock.url;
+    if (browser === undefined) openDefault(address);
+    else {
+      try {
+        openWindow(browser, appWindowArgs(address, profile)).once("error", () => {
+          openDefault(address);
+        });
+      } catch {
+        openDefault(address);
+      }
+    }
+    return 0;
+  }
+  const { setUrl, release } = lock;
+  const token = lock.lock.token;
+
+  let db: Database | undefined;
+  let app: FastifyInstance | undefined;
+  let window: WindowProcess | undefined;
   try {
+    out(`Using the database ${database}.`);
+    if (urlHasPassword(url)) {
+      out("Note: the database address holds a password. Your pgpass file is a safer place for it.");
+    }
+    try {
+      db = openDatabase(url, { applicationName: "oculus-desktop", max: 10 });
+    } catch {
+      err("The database address is not a usable postgresql:// URL (its value is not shown).");
+      return 2;
+    }
     let state: "empty" | "set_up" | "other";
+    let enrolled: boolean;
     try {
       state = await databaseBeforeSetup(db);
+      enrolled = state === "set_up" && (await hasSecondFactors(db));
     } catch {
       err(
         "Can't reach the database. Check that PostgreSQL is running and that the address and pgpass password are right.",
@@ -221,6 +268,23 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
     if (state === "other") {
       err("This database isn't an Oculus database. Point Oculus at its own database.");
       return 1;
+    }
+    let key: string;
+    try {
+      const secretKey = loadOrCreateSecretKey(folder, env, platform, !enrolled);
+      key = secretKey.key;
+      secrets.push(key);
+      if (secretKey.created) {
+        out(
+          `Made Oculus's secret key in ${join(folder, "secret-key")}. Back it up along with your database backups: without it, everyone has to set up two-step sign-in again.`,
+        );
+      }
+    } catch (error) {
+      if (error instanceof DesktopError) {
+        err(error.message);
+        return 1;
+      }
+      throw error;
     }
     try {
       const result = await migrate({ connectionString: url, log: out });
@@ -247,30 +311,27 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
       OCULUS_TRUSTED_PROXY: undefined,
       OCULUS_CLIENT_ADDRESS: undefined,
     };
-    const app = await buildAdminServer({
+    const hash = instanceHash(token);
+    app = await buildAdminServer({
       db,
       env: serverEnv,
+      extraRoutes: [{ method: "GET", path: INSTANCE_PATH, handler: () => ({ instance: hash }) }],
       ...(options.adminDir === undefined ? {} : { adminDir: options.adminDir }),
     });
-    try {
-      await app.listen({ host: "127.0.0.1", port });
-    } catch (error) {
-      await app.close();
-      throw error;
-    }
+    await app.listen({ host: "127.0.0.1", port });
     const address = `${origin}/`;
-    const releaseLock = takeLock(folder, address);
-    try {
-      out(`Oculus is running at ${address}`);
-      const stop = options.stopRequested?.() ?? defaultStopRequested();
-      const browser = (options.findBrowser ?? (() => findAppBrowser(platform, env)))();
-      let windowClosed: Promise<"closed" | "handed_off" | "failed"> | undefined;
-      let window: WindowProcess | undefined;
-      if (browser !== undefined) {
-        const started = Date.now();
-        const handOffMs = options.handOffMs ?? 3000;
-        window = openWindow(browser, appWindowArgs(address, join(folder, "window")));
-        const opened = window;
+    setUrl(address);
+    out(`Oculus is running at ${address}`);
+
+    const stop = options.stopRequested?.() ?? defaultStopRequested();
+    const browser = findBrowser();
+    let windowClosed: Promise<"closed" | "handed_off" | "failed"> | undefined;
+    if (browser !== undefined) {
+      const started = Date.now();
+      const handOffMs = options.handOffMs ?? 3000;
+      try {
+        const opened = openWindow(browser, appWindowArgs(address, profile));
+        window = opened;
         windowClosed = new Promise((resolve) => {
           opened.once("exit", () => {
             resolve(Date.now() - started < handOffMs ? "handed_off" : "closed");
@@ -279,36 +340,50 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
             resolve("failed");
           });
         });
-        out("Close the Oculus window to stop it.");
+      } catch {
+        windowClosed = Promise.resolve("failed");
       }
-      let outcome: "closed" | "handed_off" | "failed" | "stop" | "no_window" = "no_window";
-      if (windowClosed === undefined) openDefault(address);
-      else outcome = await Promise.race([windowClosed, stop.then(() => "stop" as const)]);
-      if (outcome === "failed") {
-        out("Couldn't open the app window; opening your browser instead.");
-        openDefault(address);
-      } else if (outcome === "handed_off") {
-        out("The window opened in a browser that was already running.");
-      }
-      if (outcome !== "closed" && outcome !== "stop") {
-        out(`Open ${address} in your browser. Press Ctrl+C here to stop Oculus.`);
-        await stop;
-        outcome = "stop";
-      }
-      stopping = true;
-      if (outcome === "stop") window?.kill();
-      out("Stopping Oculus…");
-      await app.close();
-      return 0;
-    } finally {
-      releaseLock();
+      out(
+        platform === "darwin"
+          ? "Quit the Oculus window (Cmd+Q) to stop it."
+          : "Close the Oculus window to stop it.",
+      );
     }
+    let outcome: "closed" | "handed_off" | "failed" | "stop" | "no_window" = "no_window";
+    if (windowClosed === undefined) openDefault(address);
+    else outcome = await Promise.race([windowClosed, stop.then(() => "stop" as const)]);
+    if (outcome === "failed") {
+      out("Couldn't open the app window; opening your browser instead.");
+      window = undefined;
+      openDefault(address);
+    } else if (outcome === "handed_off") {
+      out("The window opened in a browser that was already running.");
+    }
+    if (outcome !== "closed" && outcome !== "stop") {
+      out(`Open ${address} in your browser. Press Ctrl+C here to stop Oculus.`);
+      await stop;
+      outcome = "stop";
+    }
+    if (outcome === "closed") window = undefined;
+    out("Stopping Oculus…");
+    return 0;
   } catch (error) {
-    if (stopping) throw error;
     err(`Oculus did not start: ${error instanceof Error ? error.message : "unknown error"}`);
     return 1;
   } finally {
-    await db.close();
+    // Whatever happened, nothing is left running: the window, the server,
+    // the pool and the lock.
+    try {
+      window?.kill();
+    } catch {
+      // Already gone.
+    }
+    try {
+      await app?.close();
+    } finally {
+      await db?.close();
+      release();
+    }
   }
 }
 

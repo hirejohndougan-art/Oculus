@@ -55,16 +55,18 @@ npm run setup
 
 Double-click `scripts\start-oculus.cmd` in the Oculus folder. To make a desktop icon, right-click it and choose **Show more options › Send to › Desktop (create shortcut)**.
 
-- The first time, and after each update, it builds Oculus first (a minute or two).
+- The first time, and after each update, it installs and builds Oculus first (a few minutes).
 - Oculus opens in its own window at the sign-in screen. At your first sign-in you set up two-step sign-in with an authenticator app on your phone.
 - **Closing the Oculus window stops Oculus.** The black window behind it is Oculus running; leave it open while you work.
 - Starting it again while it's open just opens another window.
 - If closing the window ever leaves the black window running, click it and press Ctrl+C to stop Oculus.
+- On a Mac, quit the Oculus window with Cmd+Q; closing it isn't enough.
 
 ## Keep these safe
 
 - **Your database.** `npm run db:backup -- <file>` makes a backup (see the README).
-- **The secret key** in `%APPDATA%\Oculus\secret-key`, made the first time Oculus starts. Two-step sign-in depends on it, and database backups don't include it. Copy it somewhere safe, like a USB drive kept with your backups. If it's lost, everyone has to set up two-step sign-in again.
+- **The secret key** in `%APPDATA%\Oculus\secret-key`, made the first time Oculus starts. Two-step sign-in depends on it, and database backups don't include it. Copy it somewhere safe, like a USB drive kept with your backups. If it's lost, everyone has to set up two-step sign-in again. Once anyone has set up two-step sign-in, Oculus refuses to start without the key rather than make a new one: put it back from your backup.
+- **Your password and recovery codes.** Until email is set up there's no password reset, and the recovery codes Oculus shows at your first sign-in are the only way in if you lose your phone. Keep both somewhere safe.
 
 ## Updating
 
@@ -72,7 +74,7 @@ In the Oculus folder: `git pull`, then double-click `start-oculus.cmd` as usual.
 
 ## What the desktop version doesn't do yet
 
-- **No email.** "Forgot your password?" and invitations don't send anything until email is set up (T-040).
+- **No email.** "Forgot your password?" and invitations don't send anything until email is set up (T-040), so don't forget your password.
 - **One computer.** Other people can't reach it. That needs the server version (T-051).
 - **No public website yet.** That's a later phase.
 

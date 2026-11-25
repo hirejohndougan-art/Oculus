@@ -1,14 +1,26 @@
 // The launcher against real throwaway databases (D-049): it refuses what it
 // should, serves the admin on 127.0.0.1, opens and closes its window, and
 // never prints the database password or the secret key.
-import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { request } from "node:http";
+import type { UserId } from "@oculus/core";
 import { migrate, openDatabase, setUpFirstInstall, sql } from "@oculus/db";
+import { giveTestFactor, testKeyring } from "../../db/src/second-factor.fixtures.js";
 import { freshDatabase, type TestDatabase } from "../../db/src/test-database.fixtures.js";
 import { runDesktop, type DesktopOptions, type WindowProcess } from "./desktop-cli.js";
 
@@ -19,11 +31,11 @@ let empty: TestDatabase;
 let folder: string;
 let adminDir: string;
 
-beforeAll(async () => {
-  setUp = await freshDatabase();
-  empty = await freshDatabase();
-  await migrate({ connectionString: setUp.url });
-  const db = openDatabase(setUp.url, { max: 1 });
+/** A database set up as `npm run setup` leaves it (migrations from `dir` if given). */
+async function setUpDatabase(dir?: string): Promise<{ database: TestDatabase; userId: UserId }> {
+  const database = await freshDatabase();
+  await migrate({ connectionString: database.url, ...(dir === undefined ? {} : { dir }) });
+  const db = openDatabase(database.url, { max: 1 });
   try {
     const result = await setUpFirstInstall(db, {
       email: "root@example.org",
@@ -32,10 +44,16 @@ beforeAll(async () => {
       organizationName: "Invented Historical Society",
       siteName: "Invented Archive",
     });
-    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("setup failed");
+    return { database, userId: result.value.userId };
   } finally {
     await db.close();
   }
+}
+
+beforeAll(async () => {
+  setUp = (await setUpDatabase()).database;
+  empty = await freshDatabase();
 }, 120_000);
 
 afterAll(async () => {
@@ -138,10 +156,13 @@ describe("npm run desktop", () => {
     expect(await health.json()).toEqual({ status: "ok" });
     const page = await fetch(url);
     expect(await page.text()).toContain("Invented admin");
-    expect(JSON.parse(readFileSync(join(folder, "desktop.lock"), "utf8"))).toEqual({
-      pid: process.pid,
-      url,
-    });
+    const lock = JSON.parse(readFileSync(join(folder, "desktop.lock"), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    expect(lock.pid).toBe(process.pid);
+    expect(lock.url).toBe(url);
+    expect(lock.token).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(existsSync(join(folder, "secret-key"))).toBe(true);
 
     window.close();
@@ -150,16 +171,39 @@ describe("npm run desktop", () => {
     expect(existsSync(join(folder, "desktop.lock"))).toBe(false);
   });
 
-  it("answers only the origin it serves (a rebinding page's writes are refused)", async () => {
+  it("refuses another site's writes and a rebinding host's (Origin check, D-088)", async () => {
     const run = start();
     const url = await running(run);
-    const reply = await fetch(new URL("/api/sign-in", url), {
-      method: "POST",
-      headers: { "content-type": "application/json", origin: "http://evil.example" },
-      body: "{}",
+    const port = new URL(url).port;
+    const post = (headers: Record<string, string>) =>
+      new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const req = request(
+          { host: "127.0.0.1", port, path: "/api/sign-in", method: "POST", headers },
+          (reply) => {
+            let body = "";
+            reply.on("data", (chunk: Buffer) => (body += chunk.toString()));
+            reply.on("end", () => {
+              resolve({ status: reply.statusCode ?? 0, body });
+            });
+          },
+        );
+        req.on("error", reject);
+        req.end("{}");
+      });
+    const json = { "content-type": "application/json" };
+    const other = await post({ ...json, origin: "http://evil.example" });
+    expect(other.status).toBe(403);
+    expect(other.body).toContain("cross_origin");
+    const rebound = await post({
+      ...json,
+      host: `evil.example:${port}`,
+      origin: `http://evil.example:${port}`,
     });
-    expect(reply.status).toBeGreaterThanOrEqual(400);
-    expect(reply.status).toBeLessThan(500);
+    expect(rebound.status).toBe(403);
+    expect(rebound.body).toContain("cross_origin");
+    // The page's own origin gets past the check (to the body check).
+    const own = await post({ ...json, origin: `http://127.0.0.1:${port}` });
+    expect(own.body).not.toContain("cross_origin");
     run.windows[0]?.close();
     expect(await run.done).toBe(0);
   });
@@ -173,21 +217,109 @@ describe("npm run desktop", () => {
   });
 
   it("opens another window on the running server instead of starting a second", async () => {
-    // Another launcher's process (a stand-in that lives), holding the lock.
-    const other = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
-      stdio: "ignore",
+    const first = start();
+    const url = await running(first);
+    const second = start();
+    expect(await second.done).toBe(0);
+    expect(second.windows[0]?.args).toContain(`--app=${url}`);
+    expect(second.lines.some((l) => l.startsWith("Oculus is running at"))).toBe(false);
+    first.stop();
+    expect(await first.done).toBe(0);
+  });
+
+  it("refuses to open the running server's window for a different database", async () => {
+    const first = start();
+    await running(first);
+    const second = start({ env: { OCULUS_DATABASE_URL: empty.url } });
+    expect(await second.done).toBe(1);
+    expect(second.lines.join("\n")).toContain("another database");
+    first.stop();
+    expect(await first.done).toBe(0);
+  });
+
+  it("starts normally over a stale lock whose PID lives but whose address is dead", async () => {
+    writeFileSync(
+      join(folder, "desktop.lock"),
+      JSON.stringify({
+        pid: 1,
+        token: "t".repeat(43),
+        database: "oculus on localhost",
+        started: Date.now(),
+        url: "http://127.0.0.1:1/",
+      }),
+    );
+    const run = start();
+    await running(run);
+    run.stop();
+    expect(await run.done).toBe(0);
+    expect(existsSync(join(folder, "desktop.lock"))).toBe(false);
+  });
+
+  it("stops the server and leaves nothing running when something fails after it listens", async () => {
+    const run = start({
+      findBrowser: () => undefined,
+      openDefault: () => {
+        throw new Error("no default browser");
+      },
     });
+    const url = await running(run);
+    expect(await run.done).toBe(1);
+    await expect(fetch(new URL("/health", url))).rejects.toThrow();
+    expect(existsSync(join(folder, "desktop.lock"))).toBe(false);
+  });
+
+  it("falls back to the default browser when the window can't be started", async () => {
+    const run = start({
+      openWindow: () => {
+        throw new Error("spawn EINVAL");
+      },
+    });
+    const url = await running(run);
+    expect(await until(() => run.defaults[0])).toBe(url);
+    run.stop();
+    expect(await run.done).toBe(0);
+  });
+
+  it("refuses to make a new secret key when people have set up two-step sign-in", async () => {
+    const { database, userId } = await setUpDatabase();
     try {
-      const url = "http://127.0.0.1:4999/";
-      writeFileSync(join(folder, "desktop.lock"), JSON.stringify({ pid: other.pid, url }));
-      const second = start();
-      expect(await second.done).toBe(0);
-      expect(second.windows[0]?.args).toContain(`--app=${url}`);
-      expect(second.lines.some((l) => l.startsWith("Oculus is running at"))).toBe(false);
+      const owner = openDatabase(database.url, { max: 1 });
+      try {
+        await giveTestFactor(owner, testKeyring(), userId, 1, 10);
+      } finally {
+        await owner.close();
+      }
+      const run = start({ env: { OCULUS_DATABASE_URL: database.url } });
+      expect(await run.done).toBe(1);
+      expect(run.lines.join("\n")).toContain("backup");
       expect(existsSync(join(folder, "secret-key"))).toBe(false);
+      expect(run.lines.some((l) => l.startsWith("Oculus is running"))).toBe(false);
     } finally {
-      other.kill();
-      await new Promise((resolve) => other.once("exit", resolve));
+      await database.drop();
+    }
+  });
+
+  it("applies migrations the database doesn't have yet", async () => {
+    const all = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "db", "migrations");
+    const older = join(folder, "older-migrations");
+    mkdirSync(older);
+    const files = readdirSync(all).sort();
+    for (const file of files.slice(0, -1)) cpSync(join(all, file), join(older, file));
+    const { database } = await setUpDatabase(older);
+    try {
+      const run = start({ env: { OCULUS_DATABASE_URL: database.url } });
+      await running(run);
+      expect(run.lines.join("\n")).toContain("Updated the database (1 change(s)).");
+      run.stop();
+      expect(await run.done).toBe(0);
+      const db = openDatabase(database.url, { max: 1 });
+      const rows = await db.rows<{ name: string }>(
+        sql`SELECT name FROM public.oculus_migrations ORDER BY name DESC LIMIT 1`,
+      );
+      await db.close();
+      expect(rows[0]?.name).toBe(files.at(-1));
+    } finally {
+      await database.drop();
     }
   });
 
