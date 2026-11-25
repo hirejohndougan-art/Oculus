@@ -4,7 +4,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
 ## 2026-11-25 00:40 CT — manual (Chat C) — T-050b Stored Dublin Core mappings
 - Result: done (the old T-050b split into T-050b, T-050d and T-050e)
-- What changed: migration 0025 (`dublin_core_mappings`, `public_dublin_core_mapping`); `packages/db/src/dublin-core-mappings.ts`; `readPublicRecord` uses the stored mapping when none is passed; service `readDublinCoreMapping`/`saveDublinCoreMapping`; `GET`/`PUT /api/templates/:key/dublin-core`.
+- What changed: migration 0022 (`dublin_core_mappings`, `public_dublin_core_mapping`); `packages/db/src/dublin-core-mappings.ts`; `readPublicRecord` uses the stored mapping when none is passed; service `readDublinCoreMapping`/`saveDublinCoreMapping`; `GET`/`PUT /api/templates/:key/dublin-core`.
 - Decisions: D-096
 - Review: one independent round, nothing blocking; fixed a mapping without rights taking records offline, the full record read under the lock, the version check passable by direct SQL, and two stale comments.
 - Gate: see the merge commit · npm audit clean

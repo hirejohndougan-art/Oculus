@@ -1,5 +1,6 @@
--- Stored Dublin Core mappings (T-050b, D-096). Numbered 0025: 0022 is
--- M-002's, 0023 T-034d's and 0024 T-041c's (reserved on the work board).
+-- Stored Dublin Core mappings (T-050b, D-096). Numbered 0022, the next
+-- above main when it merged (the work board's rule): the numbers reserved
+-- for M-002, T-034d and T-041c move above it.
 --
 -- D-012 keeps a template's Dublin Core mapping beside the template, not
 -- inside it: `{ template, organizationId, entries: [{ field, term }] }`, the

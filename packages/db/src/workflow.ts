@@ -823,7 +823,7 @@ function publicSource(org: OrganizationId, row: PublicSnapshotRow): SnapshotSour
  *
  * Everything is read through the database functions
  * `public_record_snapshot` (SECURITY DEFINER, migration 0017) and, when no
- * `mappings` are given, `public_dublin_core_mapping` (0025, D-096), in one
+ * `mappings` are given, `public_dublin_core_mapping` (0022, D-096), in one
  * Repeatable Read, read-only transaction, so the state, the records, the
  * templates, the identifiers and the mapping all come from one moment, and the
  * connection needs no table privilege at all: use a role made by

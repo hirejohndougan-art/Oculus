@@ -528,7 +528,7 @@ async function checkRoleConnection(
 
 /**
  * The functions the public sites read through, with their argument types:
- * `public_record_snapshot` (0017) and `public_dublin_core_mapping` (0025,
+ * `public_record_snapshot` (0017) and `public_dublin_core_mapping` (0022,
  * D-096), the only ways `readPublicRecord` reads.
  */
 export const PUBLIC_READER_FUNCTIONS: readonly string[] = Object.freeze([
