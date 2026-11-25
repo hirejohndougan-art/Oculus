@@ -91,6 +91,8 @@ import {
   readRecordPlace,
   readRecordsUsingTemplate,
   readDublinCoreMapping as readStoredMapping,
+  readRecordIdentifiers,
+  readRecordsForChecks,
   readTemplate as readStoredTemplate,
   updateIdentifierType,
   writeDublinCoreMapping,
@@ -126,6 +128,11 @@ export interface SavedTemplate extends TemplateVersion {
 /** A saved identifier type, with the published records it changed at once (D-076). */
 export interface SavedIdentifierType extends TaggedIdentifierType {
   readonly publishedRecords: readonly RecordId[];
+  /**
+   * Published records a new format took off the public sites (S-033,
+   * D-091): their public number no longer fits it. Confirmed before saving.
+   */
+  readonly droppedFromPublic?: readonly RecordId[];
 }
 
 /** A template's Dublin Core mapping as read (T-050b, D-096): version 0 and `null` when none is stored. */
@@ -872,15 +879,75 @@ export function definitionOperations(run: Runner): DefinitionOperations {
         // would list no records and slip through unconfirmed (third review).
         const compared = identifierTypeChanges(old, type);
         if (!compared.ok) return compared;
+        // S-033 (D-091): a new format takes the published records whose
+        // public number no longer fits it off the public sites. Which ones
+        // is found from the published holders only (read under the type's
+        // lock, which publishing waits on), and listed in the confirmation;
+        // the confirmations themselves still come from the call above.
+        let dropped: readonly RecordId[] = [];
+        let formatMessage: string | undefined;
+        if (compared.value.changes.some((c) => c.code === "format_changed")) {
+          const holders = await publishedHoldingType(tx, org, type.key);
+          if (holders === undefined) {
+            return refusal(
+              [],
+              "too_many_records",
+              "Too many published records hold this type to check a new format here.",
+            );
+          }
+          if (holders.length > 0) {
+            const records = await readRecordsForChecks(tx, org, holders);
+            const identifiers = [];
+            for (const id of holders) {
+              const set = await readRecordIdentifiers(tx, org, id);
+              if (set?.ok === true) identifiers.push(set.value);
+            }
+            const templates = (await listStoredTemplates(tx, org)).map((t) => t.template);
+            const withUse = identifierTypeChanges(old, type, {
+              identifierTypes: types.value,
+              identifiers,
+              records,
+              templates,
+              published: holders,
+            });
+            // Fails closed: a list that can't be made refuses the save.
+            if (!withUse.ok) return withUse;
+            const formatChange = withUse.value.changes.find((c) => c.code === "format_changed");
+            dropped = formatChange?.publishedRecordIds ?? [];
+            if (dropped.length > 0) formatMessage = formatChange?.message;
+          }
+        }
         const needed = compared.value.changes
           .filter((c) => c.needsConfirmation)
-          .map((c) => ({ code: c.code, key: c.type, message: c.message }));
+          .map((c) => ({
+            code: c.code,
+            key: c.type,
+            message:
+              c.code === "format_changed" && formatMessage !== undefined
+                ? formatMessage
+                : c.message,
+          }));
         const madePublic = compared.value.changes.some((c) => c.code === "made_public");
         const affected = madePublic ? await publishedHoldingType(tx, org, type.key) : [];
+        // Listed with whichever confirmation is asked first, so the person
+        // sees what the save takes off the public sites before any of it.
+        const droppedIssues = dropped.map((id) =>
+          issue(
+            ["droppedFromPublic", id],
+            "published_record_dropped",
+            "This published record's number doesn't fit the new format; public sites would show it as not available.",
+          ),
+        );
         const gate = await publishedGate(tx, who, checker, affected, confirmPublished.value);
-        if (gate) return gate;
+        if (gate) {
+          return gate.ok || !gate.issues.some((i) => i.code === "publishes_records")
+            ? gate
+            : { ok: false, issues: [...gate.issues, ...droppedIssues] };
+        }
         const notConfirmed = unconfirmed(needed, confirm.value);
-        if (notConfirmed.length > 0) return { ok: false, issues: notConfirmed };
+        if (notConfirmed.length > 0) {
+          return { ok: false, issues: [...notConfirmed, ...droppedIssues] };
+        }
         const saved = await updateIdentifierType(tx, type);
         if (!saved.ok) return saved;
         return {
@@ -889,6 +956,7 @@ export function definitionOperations(run: Runner): DefinitionOperations {
             type: saved.value,
             tag: identifierTypeTag(saved.value),
             publishedRecords: Object.freeze([...(affected ?? [])]),
+            droppedFromPublic: Object.freeze([...dropped]),
           }),
         };
       });

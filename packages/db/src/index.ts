@@ -165,6 +165,7 @@ export {
   MAX_AFFECTED_PUBLISHED,
 } from "./definitions.js";
 export type { TemplateSummary } from "./definitions.js";
+export { readRecordsForChecks } from "./catalog.js";
 export {
   publishedUsingTemplate,
   readDublinCoreMapping,
