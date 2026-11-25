@@ -6,7 +6,7 @@
 import { cpSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   STANDARD_PRESETS,
   createRecord,
@@ -67,6 +67,11 @@ async function ready(): Promise<void> {
   })();
   db = (await setup).db;
 }
+
+// Warm the setup before the first test, under the suite's longer hook limit
+// (U-008). A failure stays in `setup`, so with no database each test still
+// fails on its own when it calls ready().
+beforeAll(() => ready().catch(() => undefined));
 
 afterAll(async () => {
   for (const cleanup of cleanups.reverse()) await cleanup().catch(() => undefined);

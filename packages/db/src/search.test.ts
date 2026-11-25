@@ -3,7 +3,7 @@
 // former numbers through the identifier key, the index following every
 // record write, organizations kept apart, hostile and oversized queries, and
 // paging. All data is invented.
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   STANDARD_PRESETS,
   createRecord,
@@ -52,6 +52,11 @@ async function ready(): Promise<void> {
   })();
   db = (await setup).db;
 }
+
+// Warm the setup before the first test, under the suite's longer hook limit
+// (U-008). A failure stays in `setup`, so with no database each test still
+// fails on its own when it calls ready().
+beforeAll(() => ready().catch(() => undefined));
 
 afterAll(async () => {
   const done = await setup?.catch(() => undefined);
