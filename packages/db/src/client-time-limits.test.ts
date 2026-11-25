@@ -50,9 +50,9 @@ describe("openDatabase's time limits (S-063)", () => {
     });
     expect(inside).toBe("250ms");
     expect(await setting(db, "statement_timeout")).toBe("2min");
-    // Left out: the server's own default.
+    // Left out: not sent, so the server's own setting stays.
     const plain = pool({ max: 1 });
-    expect(await setting(plain, "lock_timeout")).toBe("0");
+    expect(await setting(plain, "lock_timeout")).not.toBe("1500ms");
   });
 
   it("ends a lock wait with 55P03 and a long statement with 57014", async () => {

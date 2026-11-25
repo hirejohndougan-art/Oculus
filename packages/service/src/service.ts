@@ -176,6 +176,7 @@ import {
   saveRecordIdentifiers,
   updateRecord as updateStoredRecord,
   versionConflict,
+  isDatabaseTimeout,
   type Database,
   type Queryable,
   type RecordDeletion,
@@ -1064,11 +1065,19 @@ function sqlState(error: unknown): string | undefined {
   }
 }
 
+/** The database was busy (S-063): a lock or a connection wasn't free in time. */
+function busyRefusal(): ServiceRefusal {
+  return refusal([], "timeout", "The database was busy and nothing was done. Try again.");
+}
+
 /**
  * A thrown error as a clean refusal: fixed text by SQLSTATE class, never the
  * error's own message (which names tables, constraints and values).
  */
 function cleanError(error: unknown): ServiceRefusal {
+  // No free pooled connection within the staff pool's wait (S-063): busy,
+  // nothing was saved, try again.
+  if (isDatabaseTimeout(error) && sqlState(error) === undefined) return busyRefusal();
   const state = sqlState(error);
   switch (state) {
     case RETRY:
@@ -1104,10 +1113,10 @@ function cleanError(error: unknown): ServiceRefusal {
         "The service's database role may not make this change. Check its grants.",
       );
     case "57014":
-    // A lock wait past the staff pool's `lock_timeout` (S-063).
-    // falls through
-    case "55P03":
       return refusal([], "timeout", "The change took too long and was stopped. Nothing was saved.");
+    // A lock wait past the staff pool's `lock_timeout` (S-063).
+    case "55P03":
+      return busyRefusal();
     default:
       return refusal([], "internal_error", "Something went wrong; nothing was saved.");
   }

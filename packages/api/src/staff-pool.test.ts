@@ -1,8 +1,8 @@
 // The staff pool's time limits (S-063): the options both the admin's server
 // and the desktop launcher open the writer pool with, their effect on a real
 // connection, and how a limit that runs out is answered over HTTP: 503
-// `timeout` for a lock wait or a long statement, 503 `busy` for no free
-// connection, and still a plain 500 for anything that only looks like one.
+// `timeout` for a lock wait, a long statement or no free connection, and
+// still a plain 500 for anything that only looks like one.
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { openDatabase, sql, type Database } from "@oculus/db";
@@ -122,7 +122,7 @@ describe("a time limit that runs out, over HTTP (S-063)", () => {
     expect(res).toEqual({ status: 503, body: '{"error":"timeout"}' });
   });
 
-  it("no free connection within the pool's wait is 503 busy", async () => {
+  it("no free connection within the pool's wait is 503 timeout", async () => {
     const staff = pool({ max: 1, connectionTimeoutMillis: 100 });
     let release: (() => void) | undefined;
     const released = new Promise<void>((resolve) => {
@@ -139,7 +139,7 @@ describe("a time limit that runs out, over HTTP (S-063)", () => {
     await isTaken;
     try {
       const res = await answerFor(() => staff.rows(sql`SELECT 1`));
-      expect(res).toEqual({ status: 503, body: '{"error":"busy"}' });
+      expect(res).toEqual({ status: 503, body: '{"error":"timeout"}' });
     } finally {
       release?.();
       await holding;

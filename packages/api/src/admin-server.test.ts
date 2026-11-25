@@ -452,20 +452,21 @@ describe("the background jobs (S-063)", () => {
     await db.execute(sql`DELETE FROM public.sign_in_throttles WHERE key = ${KEY}`);
   }, 30_000);
 
-  it("runs neither with housekeeping: false", async () => {
-    await seed();
+  it("doesn't send two-step alert notices through the development sender", async () => {
+    // A notice "sent" there would tell no one and hold the next one back a day.
+    const logged: ApiLogRecord[] = [];
     const app = await buildAdminServer({
       db,
       env: DEV,
       adminFiles: files,
-      housekeeping: false,
+      log: (r) => logged.push(r),
+      housekeeping: { cleanupFirstAfterMs: 60_000, noticesEveryMs: 10 },
     });
     try {
-      await sleep(300);
-      expect(await seeded()).toBe(true);
+      await sleep(200);
     } finally {
       await app.close();
-      await db.execute(sql`DELETE FROM public.sign_in_throttles WHERE key = ${KEY}`);
     }
+    expect(logged.filter((r) => r.event === "alert_notices" || r.event === "mail_dev")).toEqual([]);
   }, 30_000);
 });

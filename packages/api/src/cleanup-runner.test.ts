@@ -154,3 +154,26 @@ describe("startCleanup (S-063)", () => {
     await runner.stop();
   });
 });
+
+describe("startCleanup's timings (S-063)", () => {
+  it("refuses an interval that would run it back to back", () => {
+    for (const bad of [0, -1, 1.5, 9, Number.NaN, 2_147_483_648]) {
+      expect(() =>
+        startCleanup({
+          db,
+          log: () => undefined,
+          clean: () => Promise.resolve(EMPTY),
+          intervalMs: bad,
+        }),
+      ).toThrow(RangeError);
+      expect(() =>
+        startCleanup({
+          db,
+          log: () => undefined,
+          clean: () => Promise.resolve(EMPTY),
+          firstAfterMs: bad,
+        }),
+      ).toThrow(RangeError);
+    }
+  });
+});

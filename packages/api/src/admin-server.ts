@@ -48,8 +48,8 @@
  * Once built, it also runs the background jobs every install needs (S-063),
  * stopped when the server closes: the cleanup of ended sessions, old
  * counters and reset links (cleanup-runner.ts, hourly) and the two-step
- * alert notices (alert-notices.ts, every minute, through the mailer; none
- * without one). `housekeeping: false` turns both off (tests). The desktop
+ * alert notices (alert-notices.ts, every minute, through the mailer; only
+ * when SMTP is set up, since the development sender tells no one). `housekeeping: false` turns both off (tests). The desktop
  * launcher and `npm run admin` both start the server here, so both run them.
  *
  * It warns loudly (a `startup_warning` log record) when the database
@@ -89,7 +89,7 @@ import { startCleanup } from "./cleanup-runner.js";
 import { scannerFromEnv } from "./file-scanning.js";
 import { originsFromEnv } from "./origin.js";
 import { isProduction } from "./environment.js";
-import { mailerFromEnv, type Mailer } from "./mail.js";
+import { MAIL_ENV, mailerFromEnv, type Mailer } from "./mail.js";
 import { trustedProxyFromEnv } from "./proxy.js";
 import { OAI_ADMIN_EMAIL_ENV, oaiAdminEmail, oaiPmhRoutes } from "./oai-pmh.js";
 import { PUBLIC_POOL_SIZE, publicApiRoutes, ReadSlots } from "./public-api.js";
@@ -355,7 +355,8 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   // refusal leaves nothing running.
   let deliverReset = options.deliverReset;
   let mailer: Mailer | undefined;
-  // Made here, so closed here once the server has closed (S-063).
+  // Made here, so closed by the server's close (S-063). A start refused
+  // after this leaves it idle: its outbox has nothing queued and no timer.
   let ownMailer: Mailer | undefined;
   if (deliverReset === undefined) {
     if (options.mailer === undefined) {
@@ -663,8 +664,11 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
       ...(times.cleanupEveryMs === undefined ? {} : { intervalMs: times.cleanupEveryMs }),
     });
     // "Someone is guessing your two-step codes" (D-077, D-085), every minute,
-    // through the mailer's notice lane; with no mailer (tests) there is none.
-    if (mailer !== undefined) {
+    // through the mailer's notice lane. Only with a real sender (SMTP): the
+    // development sender tells no one, and a notice it "sent" would hold
+    // that person's next one back a day, so the alerts wait until email is
+    // set up (S-063 review). With no mailer (tests) there is none either.
+    if (mailer !== undefined && (env[MAIL_ENV.host]?.trim() ?? "") !== "") {
       const outbox = mailer.outbox;
       notices = startAlertNotices({
         db: options.db,

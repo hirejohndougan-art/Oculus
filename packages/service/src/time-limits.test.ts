@@ -16,11 +16,23 @@ function failingWith(code: string): Database {
   return { rows: fail, execute: fail, transaction: fail, close: () => Promise.resolve() };
 }
 
+/** pg-pool's own error when no connection came free within its wait. */
+function poolFull(): Database {
+  const fail = (): Promise<never> =>
+    Promise.reject(new Error("timeout exceeded when trying to connect"));
+  return { rows: fail, execute: fail, transaction: fail, close: () => Promise.resolve() };
+}
+
 describe("time limits in the service (S-063)", () => {
-  it("answers a lock timeout and a statement timeout as a clean timeout refusal", async () => {
-    for (const code of ["55P03", "57014"]) {
+  it("answers a lock timeout, a full pool and a statement timeout as a clean timeout refusal", async () => {
+    const cases: [string, string][] = [
+      ["55P03", "The database was busy and nothing was done. Try again."],
+      ["pool", "The database was busy and nothing was done. Try again."],
+      ["57014", "The change took too long and was stopped. Nothing was saved."],
+    ];
+    for (const [code, message] of cases) {
       const seen: unknown[] = [];
-      const service = createService(failingWith(code), {
+      const service = createService(code === "pool" ? poolFull() : failingWith(code), {
         onError: (error) => {
           seen.push(error);
         },
@@ -35,7 +47,7 @@ describe("time limits in the service (S-063)", () => {
           {
             path: [],
             code: "timeout",
-            message: "The change took too long and was stopped. Nothing was saved.",
+            message,
           },
         ],
       });

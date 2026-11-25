@@ -86,7 +86,7 @@ import {
   type SignInFailure,
   type VerifiedSignIn,
 } from "./accounts.js";
-import { isDatabaseFailure, type Database, type Queryable } from "./client.js";
+import { isDatabaseFailure, isDatabaseTimeout, type Database, type Queryable } from "./client.js";
 import { readSystemSettings } from "./permissions.js";
 import {
   readSecondStepProof,
@@ -305,7 +305,9 @@ export function failureFor(
     // The log's own failure changes nothing.
   }
   if (state?.startsWith("40") === true) return FAILURES.retry;
-  if (state === "57014" || state === "55P03") return FAILURES.timeout;
+  // A wait for a free pooled connection past the pool's limit (S-063) is
+  // load, like a statement or lock timeout, not an outage.
+  if (state === "57014" || state === "55P03" || isDatabaseTimeout(error)) return FAILURES.timeout;
   return FAILURES.database_unavailable;
 }
 

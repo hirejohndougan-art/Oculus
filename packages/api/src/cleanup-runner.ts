@@ -45,6 +45,15 @@ export function startCleanup(options: CleanupRunnerOptions): CleanupRunner {
   const clean = options.clean ?? runCleanup;
   const intervalMs = options.intervalMs ?? CLEANUP_EVERY_MS;
   const firstAfterMs = options.firstAfterMs ?? CLEANUP_FIRST_AFTER_MS;
+  // A zero or odd interval would run it back to back against the database.
+  for (const [name, value] of [
+    ["intervalMs", intervalMs],
+    ["firstAfterMs", firstAfterMs],
+  ] as const) {
+    if (!Number.isInteger(value) || value < 10 || value > 2_147_483_647) {
+      throw new RangeError(`${name} must be a whole number of milliseconds from 10 to 2147483647.`);
+    }
+  }
   let running: Promise<void> | undefined;
   let stopped = false;
   const record = (r: ApiLogRecord): void => {

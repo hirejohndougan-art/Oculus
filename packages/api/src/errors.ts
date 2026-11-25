@@ -5,7 +5,7 @@
  * code. Nothing from the error itself reaches the client: no message, no
  * stack trace, no Fastify error code, no part of the request body. Server
  * errors (5xx) are logged on the server; the client sees only
- * `internal_error` or `unavailable`, or `busy` or `timeout` (503) when a
+ * `internal_error` or `unavailable`, or `timeout` (503) when a
  * database time limit ran out (S-063).
  *
  * Whatever a handler throws is replaced by a fresh Refusal before Fastify
@@ -106,10 +106,10 @@ export function rebuildThrown(thrown: unknown): Refusal {
 const POOL_WAIT_MESSAGE = "timeout exceeded when trying to connect";
 
 /**
- * A database time limit that ran out (S-063), as `503`: `busy` when no
- * pooled connection came free in time, `timeout` when the server stopped a
- * statement (57014, `statement_timeout`) or a lock wait (55P03,
- * `lock_timeout`). These are load, not faults: the request can be tried
+ * A database time limit that ran out (S-063), as `503 timeout`: no pooled
+ * connection came free in time, or the server stopped a statement (57014,
+ * `statement_timeout`) or a lock wait (55P03, `lock_timeout`), as the
+ * service's `timeout` refusal is answered. These are load, not faults: the request can be tried
  * again. `undefined` for anything else. Own data properties only, as
  * everywhere in this file.
  */
@@ -121,7 +121,7 @@ function timeLimitRefusal(thrown: object): Refusal | undefined {
     plainErrorShape(thrown) &&
     ownData(thrown, "message") === POOL_WAIT_MESSAGE
   ) {
-    return new Refusal(503, "busy");
+    return new Refusal(503, "timeout");
   }
   return undefined;
 }

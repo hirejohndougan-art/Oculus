@@ -18,16 +18,21 @@
  * - the client gives up on a server that stops answering after
  *   `STAFF_QUERY_TIMEOUT_MS`, above the statement limit (client.ts).
  *
- * Each of these is answered `503` (`busy` or `timeout`), never a stack or a
- * hang. The limits are sent when each connection opens, so they hold on any
- * install whatever the role's settings; a role or server setting can't
- * loosen them for these connections.
+ * The first three are answered `503 timeout` (the service, the session
+ * lookups and the HTTP layer all agree), never a stack or a hang; the
+ * idle-transaction end and the client's own limit are failures of a stuck
+ * transaction or a dead server, answered as such. The limits are sent when
+ * each connection opens, so they hold on any install whatever the role's or
+ * server's settings, in both directions: a role set to a shorter
+ * `statement_timeout` gets these instead. A connection pooler in front of
+ * PostgreSQL (PgBouncer) must pass these startup parameters on (or list them
+ * in `ignore_startup_parameters`, which drops the limits).
  */
 import type { DatabaseOptions } from "@oculus/db";
 
 /** Connections in the staff pool. */
 export const STAFF_POOL_SIZE = 10;
-/** Longest wait for a free connection, then `503 busy`. */
+/** Longest wait for a free connection, then `503 timeout`. */
 export const STAFF_POOL_WAIT_MS = 10_000;
 /** Longest wait for a lock, then `503 timeout`. Under the 30 s handler limit (server.ts). */
 export const STAFF_LOCK_TIMEOUT_MS = 10_000;

@@ -31,7 +31,7 @@ Double-click `scripts\start-oculus.cmd` in the Oculus folder. To make a desktop 
 - Starting it again while it's open just opens another window.
 - If closing the window ever leaves the black window running, click it and press Ctrl+C to stop Oculus.
 - On a Mac, quit the Oculus window with Cmd+Q; closing it isn't enough.
-- While it runs, Oculus tidies up by itself: every hour it deletes ended sign-ins and old reset links, and it sends the "someone is guessing your two-step codes" notices (to the black window, unless email is set up). There's nothing to schedule (S-063).
+- While it runs, Oculus tidies up by itself: every hour (starting five minutes after it opens) it deletes ended sign-ins and old reset links. There's nothing to schedule (S-063). The "someone is guessing your two-step codes" emails go out only once email is set up (see below); until then they wait.
 
 ## Keep these safe
 
