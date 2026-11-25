@@ -514,8 +514,11 @@ describe("uploads: what is stored", () => {
       name: null,
     });
     expect(raw.json).toEqual({ error: "bad_file_name" });
-    // Everything stored is under the folder, named by organization and hash.
-    for (const path of filesUnder(filesDir).filter((p) => p !== STORE_MARKER)) {
+    // Everything stored is under the folder, named by organization and hash
+    // (beside the marker and the lease lock's generations, S-052).
+    for (const path of filesUnder(filesDir).filter(
+      (p) => p !== STORE_MARKER && !p.startsWith(".oculus-lease."),
+    )) {
       expect(path).toMatch(/^[0-9a-f-]{36}\/sha256\/[0-9a-f]{2}\/[0-9a-f]{64}$/);
     }
     expect(existsSync(join(filesDir, "..", "passwd"))).toBe(false);

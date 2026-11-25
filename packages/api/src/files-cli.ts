@@ -9,10 +9,6 @@
  *   trash; files in the trash for a day are deleted. `-- --dry-run` says
  *   what a step would do and changes nothing. Every step that changes
  *   something goes to the change log.
- * - `npm run files:accept-identity`: after a pg_upgrade, while the folder's
- *   lease is still this database's and its catalog is the one that took it
- *   (else `use_adopt`), makes the marker name this database's new identity
- *   (an adopt-kind epoch; the change log says so).
  * - `npm run files:adopt`: after restoring or copying a database, makes it
  *   the folder's own again: a new lease epoch, and a time before which no
  *   file event will count for a later purge. It deletes nothing and enables
@@ -50,9 +46,7 @@ const PURGE_PROBLEMS: Readonly<Record<string, string>> = {
   lease_mismatch:
     "the files folder's lease isn't this database's: another database uses the folder, or this one was restored or copied. Nothing is purged until npm run files:adopt.",
   identity_changed:
-    "the files folder's marker names another database's identity: this database was upgraded in place (pg_upgrade), moved by dump and restore, or is a copy of the one that uses the folder. After a pg_upgrade, run npm run files:accept-identity (or use System settings, Removed files); after a dump and restore, npm run files:adopt.",
-  use_adopt:
-    "this database's catalog isn't the one that last held the folder (a dump and restore, or a copy), so only an adopt can make the folder its own: npm run files:adopt.",
+    "the files folder's marker names another database's identity: this database was upgraded (pg_upgrade) or moved, or it is a copy of the one that uses the folder. If this is the folder's own database, stop every other Oculus that uses the folder and run npm run files:adopt (it waits for three quiet hours); files removed before then are kept.",
   identity_unknown:
     "this database's role can't read the cluster's system identifier, so a restore of it elsewhere couldn't be told apart. Have a superuser grant it EXECUTE on pg_catalog.pg_control_system().",
   mtime_unreliable:
@@ -106,8 +100,8 @@ export async function runFilesCli(
   io: FilesCliIo,
 ): Promise<number> {
   const [command, ...rest] = args;
-  if (command !== "adopt" && command !== "purge" && command !== "accept-identity") {
-    io.err("Use: files-cli purge [--dry-run] | files-cli adopt | files-cli accept-identity");
+  if (command !== "adopt" && command !== "purge") {
+    io.err("Use: files-cli purge [--dry-run] | files-cli adopt");
     return 2;
   }
   const dryRun = command === "purge" && rest.length === 1 && rest[0] === "--dry-run";
@@ -159,19 +153,6 @@ export async function runFilesCli(
         return 1;
       }
       for (const line of purgeLines(purged.value)) io.out(line);
-      return 0;
-    }
-    if (command === "accept-identity") {
-      const accepted = await service.acceptFileStoreIdentity();
-      if (!accepted.ok) {
-        io.err(`Not accepted: ${PURGE_PROBLEMS[accepted.problem] ?? accepted.problem}`);
-        return 1;
-      }
-      io.out(
-        accepted.changed
-          ? "The files folder now names this database. Nothing was deleted."
-          : "The files folder already names this database.",
-      );
       return 0;
     }
     const adopted = await service.adoptFileStore();

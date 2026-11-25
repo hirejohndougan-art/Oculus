@@ -7,7 +7,7 @@
 // connecting role may, and a role that may not changes nothing and fails
 // nothing. Over a fresh database whose own pg_catalog is changed (function
 // privileges are per database), a throwaway role and a throwaway folder.
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -22,7 +22,7 @@ import {
   type Database,
   type Queryable,
 } from "@oculus/db";
-import { createService, openFileStore } from "@oculus/service";
+import { ADOPT_QUIET_MS, STORE_MARKER, createService, openFileStore } from "@oculus/service";
 import {
   freshDatabase,
   testServerUrl,
@@ -123,11 +123,20 @@ describe("the writer can read the cluster's identity after its grant (S-052)", (
       const identity = await databaseIdentity(writer);
       expect(identity.startsWith("-:")).toBe(false);
       expect(identity).toBe(await databaseIdentity(db));
-      // The marker still names `-:` from the blind bind: accepted, then it purges.
+      // The marker still names `-:` from the blind bind: an identity
+      // change, so the purge refuses until an adopt (after its quiet hours).
       const sighted = createService(writer, { files: store });
-      expect((await sighted.bindFileStore()).ok).toBe(true);
-      const accepted = await sighted.acceptFileStoreIdentity();
-      expect(accepted.ok).toBe(true);
+      expect(await sighted.bindFileStore()).toEqual({
+        ok: true,
+        warning: "files_identity_changed",
+      });
+      expect(await sighted.purgeFiles({ apply: false })).toEqual({
+        ok: false,
+        problem: "identity_changed",
+      });
+      const quiet = new Date(Date.now() - ADOPT_QUIET_MS - 60_000);
+      utimesSync(join(dir, STORE_MARKER), quiet, quiet);
+      expect(await sighted.adoptFileStore()).toEqual({ ok: true });
       const purged = await sighted.purgeFiles({ apply: false });
       expect(purged.ok).toBe(true);
       expect((await sighted.purgeFiles({ apply: true })).ok).toBe(true);

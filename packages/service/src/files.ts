@@ -56,7 +56,6 @@ import {
   insertSystemEvent,
   databaseIdentity,
   identityKnown,
-  currentFingerprint,
   readFileStoreLease,
   lockFileStoreLease,
   insertFileStoreEpoch,
@@ -391,32 +390,6 @@ export interface FileOperations {
     | {
         readonly ok: false;
         readonly problem: "no_store" | "marker_missing" | "other_install" | "epoch_moving";
-      }
-  >;
-  /**
-   * Accepts this database's identity as the folder's (S-052 second and
-   * third reviews): after a pg_upgrade the cluster's system identifier
-   * changes while the folder's epoch is still this database's, and the
-   * purge refuses (`identity_changed`) until this. Only while the epoch is
-   * ours, and only while this database's catalog fingerprint (the OIDs of
-   * its file tables and of the database, which a pg_upgrade keeps and a
-   * dump and restore doesn't) is the one on its newest epoch row: a logical
-   * copy, or a move by dump and restore, is refused with `use_adopt`. It
-   * writes an `adopt` epoch (so removals before it count as unknown to the
-   * purge) and the change log (`actorId`: the system manager, or none for
-   * the command line).
-   */
-  acceptFileStoreIdentity(actorId?: UserId): Promise<
-    | { readonly ok: true; readonly changed: boolean }
-    | {
-        readonly ok: false;
-        readonly problem:
-          | "no_store"
-          | "not_bound"
-          | "other_install"
-          | "lease_mismatch"
-          | "identity_unknown"
-          | "use_adopt";
       }
   >;
   /** The asset's files (name, size, sniffed type, who and when, and each one's virus scan). */
@@ -1143,9 +1116,9 @@ export function fileOperations(
       if (marker === undefined) return { ok: false, problem: "marker_missing" };
       if (held === undefined || marker.storeId !== held)
         return { ok: false, problem: "other_install" };
-      // Another database still moving the epoch: not now. (After a
-      // pg_upgrade, while the epoch is still ours, accepting the identity is
-      // the way that needs no wait: `acceptFileStoreIdentity`.)
+      // Another database still moving the epoch: not now. This is also the
+      // only way on after a pg_upgrade or any other identity change (S-052
+      // fourth review: no accepting without the wait).
       const age = await store.markerAge();
       if (age === undefined || age < ADOPT_QUIET_MS) return { ok: false, problem: "epoch_moving" };
       const identity = await databaseIdentity(db);
@@ -1159,54 +1132,6 @@ export function fileOperations(
       });
       store.bind(held);
       return { ok: true };
-    },
-
-    async acceptFileStoreIdentity(actorId) {
-      if (store === undefined) return { ok: false, problem: "no_store" };
-      const bound = await readFileStoreBinding(db);
-      if (bound === undefined) return { ok: false, problem: "not_bound" };
-      const identity = await databaseIdentity(db);
-      if (!identityKnown(identity)) return { ok: false, problem: "identity_unknown" };
-      const epoch = randomUUID();
-      return store.withLeaseLock(async () => {
-        const answer = await db.transaction(
-          async (
-            tx,
-          ): Promise<"other_install" | "lease_mismatch" | "use_adopt" | "same" | "accepted"> => {
-            await lockFileStoreLease(tx);
-            const marker = await store.readMarker();
-            if (marker?.storeId !== bound) return "other_install";
-            const lease = await readFileStoreLease(tx);
-            if (lease === undefined || marker.epoch !== lease.epoch) return "lease_mismatch";
-            if (marker.database === identity) return "same";
-            // Only the system identifier may have changed (a pg_upgrade): the
-            // catalog must be the one that took the newest epoch. A dump
-            // restored anywhere has new OIDs (S-052 third review, R3-B1).
-            if (
-              lease.fingerprint === null ||
-              lease.fingerprint !== (await currentFingerprint(tx))
-            ) {
-              return "use_adopt";
-            }
-            await insertFileStoreEpoch(tx, epoch, "adopt", identity);
-            await insertSystemEvent(tx, {
-              actorId: actorId ?? null,
-              kind: "files_identity_accepted",
-              files: 0,
-              bytes: 0,
-            });
-            return "accepted";
-          },
-        );
-        if (answer === "other_install" || answer === "lease_mismatch" || answer === "use_adopt") {
-          return { ok: false as const, problem: answer };
-        }
-        if (answer === "accepted") {
-          await store.replaceMarker({ storeId: bound, database: identity, epoch });
-        }
-        store.bind(bound);
-        return { ok: true as const, changed: answer === "accepted" };
-      });
     },
 
     async fileContent(context, recordId, fileId, use) {

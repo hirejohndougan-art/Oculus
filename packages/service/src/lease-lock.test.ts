@@ -1,12 +1,18 @@
-// The files folder's lease lock (S-052, D-086; third review R3-M1): worker
-// processes take it over and over, some crashing while they hold it, and an
-// O_EXCL "holder" file inside the lock catches any two holders at once:
-// there must be none. Also the heartbeat stopping after the longest hold,
-// and the host key. Each worker runs lease-lock.ts as it is (Node strips
-// its types), in a throwaway folder; the worker script is written to a
-// folder of its own.
-import { spawn } from "node:child_process";
+// The files folder's lease lock (S-052, D-086; fourth review R4-M1/M2):
+// generations, judged stale by time alone for holders on another host or
+// container. Eight worker processes take it over and over, each with a host
+// key of its own (as if each were on another machine, so no PID is ever
+// checked), some crashing while they hold it; an O_EXCL "holder" file,
+// made only while `held()` is true, catches any two holders at once: there
+// must be none. A holder stopped (SIGSTOP) for longer than the stale time
+// resumes to find `held()` false and does nothing. In one process: a live
+// PID on this host is never stale, however old its lock; the heartbeat
+// stops after the longest hold; the host key. Each worker runs
+// lease-lock.ts as it is (Node strips its types), in a throwaway folder; the
+// worker script is written to a folder of its own.
+import { spawn, type ChildProcess } from "node:child_process";
 import {
+  existsSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -19,21 +25,42 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { LEASE_LOCK, hostKey, leaseLock } from "./lease-lock.js";
+import { LEASE_LOCK, LeaseLockBusy, hostKey, leaseGenerations, leaseLock } from "./lease-lock.js";
 
 const LEASE_LOCK_TS = fileURLToPath(new URL("./lease-lock.ts", import.meta.url));
+/** A lock on another host is stale after this long here (the default is two minutes). */
+const STALE_MS = 1500;
 
 const WORKER = `
 import { appendFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-const [, , modulePath, dir, roundsText, crashText] = process.argv;
+import { randomBytes } from "node:crypto";
+const [, , modulePath, dir, mode, roundsText, crashText, staleText] = process.argv;
 const { leaseLock } = await import(modulePath);
-const lock = leaseLock({ root: dir, beatMs: 50 });
+const lock = leaseLock({
+  root: dir,
+  beatMs: 100,
+  staleMs: Number(staleText),
+  waitMs: 60000,
+  // Another host or container: its PID means nothing to the others.
+  hostKey: "elsewhere-" + randomBytes(6).toString("hex"),
+});
 const holder = join(dir, "holder");
 const rounds = Number(roundsText);
 const crashAt = Number(crashText);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 for (let i = 0; i < rounds; i++) {
-  await lock.withLock(async () => {
+  await lock.withLock(async (held) => {
+    if (mode === "pause") {
+      writeFileSync(join(dir, "paused-ready"), "");
+      // Stopped from outside meanwhile, for longer than the stale time.
+      await sleep(4000);
+      const still = await held();
+      writeFileSync(join(dir, "paused-held"), String(still));
+      if (!still) return;
+    } else if (!(await held())) {
+      return;
+    }
     try {
       writeFileSync(holder, String(process.pid), { flag: "wx" });
     } catch {
@@ -41,9 +68,9 @@ for (let i = 0; i < rounds; i++) {
       return;
     }
     appendFileSync(join(dir, "holds.log"), process.pid + "\\n");
-    await new Promise((r) => setTimeout(r, Math.floor(Math.random() * 4)));
+    await sleep(Math.floor(Math.random() * 4));
     unlinkSync(holder);
-    // A crash while holding the lock: it is never released.
+    // A crash while holding the lock: never released.
     if (i === crashAt) process.exit(9);
   });
 }
@@ -63,23 +90,28 @@ afterAll(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-function worker(rounds: number, crashAt: number): Promise<number> {
+function start(mode: "normal" | "pause", rounds: number, crashAt: number): ChildProcess {
+  return spawn(
+    process.execPath,
+    [
+      "--experimental-strip-types",
+      "--no-warnings",
+      join(scripts, "worker.mjs"),
+      pathToFileURL(LEASE_LOCK_TS).href,
+      dir,
+      mode,
+      String(rounds),
+      String(crashAt),
+      String(STALE_MS),
+    ],
+    { stdio: ["ignore", "ignore", "pipe"] },
+  );
+}
+
+function exited(child: ChildProcess): Promise<number | null> {
   return new Promise((resolve, reject) => {
-    const child = spawn(
-      process.execPath,
-      [
-        "--experimental-strip-types",
-        "--no-warnings",
-        join(scripts, "worker.mjs"),
-        pathToFileURL(LEASE_LOCK_TS).href,
-        dir,
-        String(rounds),
-        String(crashAt),
-      ],
-      { stdio: ["ignore", "ignore", "pipe"] },
-    );
     let errors = "";
-    child.stderr.on("data", (chunk: Buffer) => (errors += chunk.toString()));
+    child.stderr?.on("data", (chunk: Buffer) => (errors += chunk.toString()));
     child.on("error", reject);
     child.on("exit", (code) => {
       if (code !== 0 && code !== 9) reject(new Error(`worker ${String(code)}: ${errors}`));
@@ -88,14 +120,15 @@ function worker(rounds: number, crashAt: number): Promise<number> {
   });
 }
 
-describe("the lease lock across processes (R3-M1)", () => {
-  it("never has two holders, with workers crashing while they hold it", async () => {
-    if (hostKey() === undefined) return; // A crashed holder is then only stale after two minutes.
-    const rounds = 12;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+describe("the lease lock across processes on other hosts (R4-M1/M2)", () => {
+  it("never has two holders among eight contenders, with holders crashing, judged by time alone", async () => {
+    const rounds = 10;
     let expected = 0;
-    for (let wave = 0; wave < 4; wave++) {
-      const crashes = [3, -1, 7, -1, 1, -1];
-      const codes = await Promise.all(crashes.map((at) => worker(rounds, at)));
+    for (let wave = 0; wave < 3; wave++) {
+      const crashes = [2, -1, -1, 6, -1, -1, -1, -1];
+      const codes = await Promise.all(crashes.map((at) => exited(start("normal", rounds, at))));
       crashes.forEach((at, i) => {
         expected += at === -1 ? rounds : at + 1;
         expect(codes[i]).toBe(at === -1 ? 0 : 9);
@@ -104,27 +137,59 @@ describe("the lease lock across processes (R3-M1)", () => {
     expect(readdirSync(dir).filter((n) => n.startsWith("overlap-"))).toEqual([]);
     const holds = readFileSync(join(dir, "holds.log"), "utf8").trim().split("\n");
     expect(holds).toHaveLength(expected);
+  }, 240_000);
+
+  it("a holder stopped past the stale time resumes to find held() false, and does nothing", async () => {
+    const paused = start("pause", 1, -1);
+    const done = exited(paused);
+    for (let i = 0; i < 1000 && !existsSync(join(dir, "paused-ready")); i++) await sleep(10);
+    paused.kill("SIGSTOP");
+    // The others take it over once its lock is stale (by time: another host).
+    const others = await Promise.all(
+      Array.from({ length: 7 }, () => exited(start("normal", 3, -1))),
+    );
+    expect(others.every((code) => code === 0)).toBe(true);
+    paused.kill("SIGCONT");
+    expect(await done).toBe(0);
+    expect(readFileSync(join(dir, "paused-held"), "utf8")).toBe("false");
+    expect(readdirSync(dir).filter((n) => n.startsWith("overlap-"))).toEqual([]);
   }, 120_000);
 });
 
 describe("the lease lock in one process", () => {
+  it("never judges a live PID on this host stale, however old its lock", async () => {
+    const key = hostKey();
+    if (key === undefined) return;
+    const own = mkdtempSync(join(tmpdir(), "oculus-lease-live-"));
+    const path = join(own, `${LEASE_LOCK}.1`);
+    writeFileSync(path, `${key}\n${String(process.ppid)}\nlive\n`);
+    const old = new Date(Date.now() - 60 * 60_000);
+    utimesSync(path, old, old);
+    const lock = leaseLock({ root: own, waitMs: 300 });
+    await expect(lock.withLock(() => Promise.resolve(1))).rejects.toBeInstanceOf(LeaseLockBusy);
+    expect(await leaseGenerations(own)).toEqual([1]);
+    rmSync(own, { recursive: true, force: true });
+  });
+
   it("stops moving a lock's time on after the longest hold", async () => {
     const own = mkdtempSync(join(tmpdir(), "oculus-lease-hold-"));
     const lock = leaseLock({ root: own, beatMs: 20, maxHoldMs: 100 });
     await lock.withLock(async (held) => {
       expect(await held()).toBe(true);
-      await new Promise((r) => setTimeout(r, 250));
+      await sleep(250);
+      const path = join(own, `${LEASE_LOCK}.1`);
       const old = new Date(Date.now() - 60_000);
-      utimesSync(join(own, LEASE_LOCK), old, old);
-      await new Promise((r) => setTimeout(r, 150));
+      utimesSync(path, old, old);
+      await sleep(150);
       // No longer moved on: a holder past its time looks stale to others.
-      expect(Date.now() - statSync(join(own, LEASE_LOCK)).mtimeMs).toBeGreaterThan(50_000);
+      expect(Date.now() - statSync(path).mtimeMs).toBeGreaterThan(50_000);
     });
     rmSync(own, { recursive: true, force: true });
   });
 
-  it("names this host by its name, boot and PID namespace", () => {
+  it("names this host by its name, boot and PID namespace on Linux, by its name elsewhere", () => {
     const key = hostKey();
     if (key !== undefined) expect(key.split("|")).toHaveLength(3);
+    if (process.platform !== "linux") expect(key?.endsWith("|-|-")).toBe(true);
   });
 });

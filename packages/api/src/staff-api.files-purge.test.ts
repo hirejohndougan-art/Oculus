@@ -24,14 +24,13 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs";
-import { hostname, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { csrfTokenFor, type OrganizationId, type UserId } from "@oculus/core";
 import {
   openDatabase,
   purgeCandidates,
-  currentFingerprint,
   databaseIdentity,
   readAuditTrail,
   readFileStoreLease,
@@ -44,6 +43,8 @@ import {
   ADOPT_QUIET_MS,
   AUTOMATIC_PURGE_EVERY_MS,
   LEASE_LOCK,
+  hostKey,
+  leaseGenerations,
   STORE_MARKER,
   createService,
   openFileStore,
@@ -567,7 +568,11 @@ describe("the review's fixes (S-052 review)", () => {
     const { body } = await removedLongAgo();
     let renewal: Promise<boolean> | undefined;
     const events: string[] = [];
-    const lockPath = join(dir, LEASE_LOCK);
+    const currentLock = async (): Promise<string> =>
+      readFileSync(
+        join(dir, `${LEASE_LOCK}.${String((await leaseGenerations(dir))[0] ?? 0)}`),
+        "utf8",
+      );
     const result = await service.purgeFiles({
       apply: true,
       beforeContent: async () => {
@@ -578,7 +583,7 @@ describe("the review's fixes (S-052 review)", () => {
             return r;
           });
           await new Promise((r) => setTimeout(r, 300));
-          expect(existsSync(lockPath)).toBe(true);
+          expect(await currentLock()).not.toBe("released\n");
           events.push("step");
         });
         await renewal;
@@ -589,7 +594,7 @@ describe("the review's fixes (S-052 review)", () => {
     // The renewal moved the lease after the step's lock: the run stopped there.
     expect(result.ok && result.value.stopped).toBe("lease_lost");
     expect(has(body)).toBe(true);
-    expect(existsSync(lockPath)).toBe(false);
+    expect(await currentLock()).toBe("released\n");
     await drain();
   });
 });
@@ -650,58 +655,57 @@ describe("the second review's fixes (S-052)", () => {
     expect(await service.renewFileLease()).toBe(true);
   });
 
-  it("R2-B2: after a pg_upgrade the lease isn't poisoned: the purge says identity_changed until a system manager accepts it", async () => {
+  it("R4: after a pg_upgrade (the identity read changes) the purge refuses and writes nothing, and only an adopt goes on", async () => {
     const { body } = await removedLongAgo();
-    // As a pg_upgrade would: a new system identifier, the epoch still ours.
-    const [storeId = "", database = "", epoch = ""] = markerLines();
-    const oid = database.split(":")[1] ?? "";
-    writeFileSync(join(dir, STORE_MARKER), `${storeId}\n1234567890123456789:${oid}\n${epoch}\n`);
-    const changed = markerText();
-    expect(await service.renewFileLease()).toBe(true);
-    expect(await service.bindFileStore()).toEqual({
-      ok: true,
-      warning: "files_identity_changed",
-    });
+    const real = await databaseIdentity(w.db);
+    // The identity read as pg_upgrade would leave it: a new system
+    // identifier, the same database and tables.
+    const upgraded: Database = {
+      rows: (q) =>
+        Sql.parts(q).join("").includes("pg_control_system")
+          ? Promise.resolve([{ id: "1111111111111111111" }] as never)
+          : w.db.rows(q),
+      execute: (q) => w.db.execute(q),
+      transaction: (work) => w.db.transaction(work),
+      close: () => Promise.resolve(),
+    };
+    const after = createService(upgraded, { files: store });
+    const before = markerText();
+    expect(await after.bindFileStore()).toEqual({ ok: true, warning: "files_identity_changed" });
+    expect(await after.renewFileLease()).toBe(true);
     for (const apply of [false, true]) {
-      expect(await service.purgeFiles({ apply })).toEqual({
+      expect(await after.purgeFiles({ apply })).toEqual({
         ok: false,
         problem: "identity_changed",
       });
     }
-    // Nothing was written: not by the renewal, the bind or the dry run.
-    expect(markerText()).toBe(changed);
-    expect((await call("GET", "root")).json).toEqual({
-      available: false,
+    // Nothing was written: not by the bind, the renewal or either purge.
+    expect(markerText()).toBe(before);
+    expect(has(body)).toBe(true);
+    // No way round the wait: accepting is gone (fourth review), here and over HTTP.
+    expect("acceptFileStoreIdentity" in after).toBe(false);
+    expect(
+      (await callPath("POST", "/api/system/files/cleanup/accept-identity", "root", {})).status,
+    ).toBe(404);
+    expect(await after.adoptFileStore()).toEqual({ ok: false, problem: "epoch_moving" });
+    const quiet = new Date(Date.now() - ADOPT_QUIET_MS - 60_000);
+    utimesSync(join(dir, STORE_MARKER), quiet, quiet);
+    expect(await after.adoptFileStore()).toEqual({ ok: true });
+    expect(markerLines()[1]).toBe(`1111111111111111111:${real.split(":")[1] ?? ""}`);
+    expect((await readFileStoreLease(w.db))?.kind).toBe("adopt");
+    // Adopted: it purges again, but removals from before the adopt are kept.
+    const run = await after.purgeFiles({ apply: true });
+    expect(run.ok && run.value.trashed.files).toBe(0);
+    expect(has(body)).toBe(true);
+    // And back to the real identity, the same way.
+    expect(await service.purgeFiles({ apply: false })).toEqual({
+      ok: false,
       problem: "identity_changed",
     });
-    // Accepting needs a recent sign-in, then rewrites the marker at once.
-    expect(
-      (await callPath("POST", "/api/system/files/cleanup/accept-identity", "stale", {})).status,
-    ).toBe(403);
-    expect(
-      (await callPath("POST", "/api/system/files/cleanup/accept-identity", "manager", {})).status,
-    ).toBe(403);
-    const accepted = await callPath(
-      "POST",
-      "/api/system/files/cleanup/accept-identity",
-      "root",
-      {},
-    );
-    expect(accepted).toEqual({ status: 200, json: { accepted: true, changed: true } });
-    expect(markerLines()[1]).toBe(await databaseIdentity(w.db));
-    const log = await w.db.rows<{ actor_id: string }>(sql`
-      SELECT actor_id::text AS actor_id FROM public.system_events
-      WHERE kind = 'files_identity_accepted'`);
-    expect(log).toEqual([{ actor_id: w.root }]);
-    expect(await service.acceptFileStoreIdentity()).toEqual({ ok: true, changed: false });
-    // Accepting is an adopt-kind epoch (third review): removals before it
-    // count as unknown, so X stays.
-    expect((await readFileStoreLease(w.db))?.kind).toBe("adopt");
-    expect((await purge()).trashed.files).toBe(0);
-    expect(has(body)).toBe(true);
-    // (Moved back in time, as these tests move everything else back.)
+    utimesSync(join(dir, STORE_MARKER), quiet, quiet);
+    expect(await service.adoptFileStore()).toEqual({ ok: true });
+    expect(markerLines()[1]).toBe(real);
     await ageEpochsOf(w.db, 30);
-    expect((await purge()).trashed.files).toBe(1);
     await drain();
   });
 
@@ -718,31 +722,6 @@ describe("the second review's fixes (S-052)", () => {
     });
     expect(has(body)).toBe(true);
     await drain();
-  });
-
-  it("R3: after a pg_upgrade (only the system identifier differs) accepting is allowed, by the catalog fingerprint", async () => {
-    const real = await databaseIdentity(w.db);
-    // The identity read as pg_upgrade would leave it: a new system
-    // identifier, the same database and tables.
-    const upgraded: Database = {
-      rows: (q) =>
-        Sql.parts(q).join("").includes("pg_control_system")
-          ? Promise.resolve([{ id: "1111111111111111111" }] as never)
-          : w.db.rows(q),
-      execute: (q) => w.db.execute(q),
-      transaction: (work) => w.db.transaction(work),
-      close: () => Promise.resolve(),
-    };
-    const after = createService(upgraded, { files: store });
-    expect(await after.bindFileStore()).toEqual({ ok: true, warning: "files_identity_changed" });
-    expect((await readFileStoreLease(w.db))?.fingerprint).toBe(await currentFingerprint(w.db));
-    expect(await after.acceptFileStoreIdentity()).toEqual({ ok: true, changed: true });
-    expect(markerLines()[1]).toBe(`1111111111111111111:${real.split(":")[1] ?? ""}`);
-    expect((await readFileStoreLease(w.db))?.kind).toBe("adopt");
-    // And back, as this test database really is.
-    expect(await service.acceptFileStoreIdentity()).toEqual({ ok: true, changed: true });
-    expect(markerLines()[1]).toBe(real);
-    await ageEpochsOf(w.db, 30);
   });
 
   it("R2-B2: a poisoned marker is never poisoned again, so an adopt can find it quiet with servers running", async () => {
@@ -827,15 +806,13 @@ describe("the second review's fixes (S-052)", () => {
   });
 
   it("L3: starting while another server holds the lease lock is a warning, not a refusal", async () => {
-    const lock = join(dir, LEASE_LOCK);
-    writeFileSync(
-      lock,
-      `${hostname().replace(/[^A-Za-z0-9.-]/g, "_")}\n${String(process.ppid)}\nlive\n`,
-    );
+    // The next generation, held by a live process on this host (the parent).
+    const lock = join(dir, `${LEASE_LOCK}.${String(((await leaseGenerations(dir))[0] ?? 0) + 1)}`);
+    writeFileSync(lock, `${hostKey() ?? "-"}\n${String(process.ppid)}\nlive\n`);
     try {
       expect(await service.bindFileStore()).toEqual({ ok: true, warning: "files_lease_busy" });
     } finally {
-      rmSync(lock, { force: true });
+      writeFileSync(lock, "released\n");
     }
     expect(await service.renewFileLease()).toBe(true);
   }, 30_000);
@@ -1209,26 +1186,20 @@ describe("another database on the folder (fifth review RV1, RV2; review B1; R1b'
     });
   }, 120_000);
 
-  it("R3-B1: a logical copy can't accept the folder: refused with use_adopt, and it never purges", async () => {
-    await withCopy("r3b1", async (step) => {
+  it("R3-B1/R4-B1: a logical copy holding the folder's epoch can neither accept nor purge; only an adopt could make it the owner", async () => {
+    await withCopy("r4b1", async (step) => {
       const body = bytes();
       const fileId = await attach(body);
       ageCopy(body, 20);
       await step();
       const copy = await step();
-      // The dump carried production's epoch rows with production's
-      // fingerprint; the copy's own catalog has new OIDs.
-      const carried = (await readFileStoreLease(copy.db))?.fingerprint;
-      expect(carried).toBe(await currentFingerprint(w.db));
-      expect(await currentFingerprint(copy.db)).not.toBe(carried);
       expect(await copy.s.bindFileStore()).toEqual({
         ok: true,
         warning: "files_identity_changed",
       });
       const marker = readFileSync(join(dir, STORE_MARKER), "utf8");
-      expect(await copy.s.acceptFileStoreIdentity()).toEqual({ ok: false, problem: "use_adopt" });
-      expect(readFileSync(join(dir, STORE_MARKER), "utf8")).toBe(marker);
-      // The reviewer's steps after accept: remove X, purge twice a day apart.
+      expect("acceptFileStoreIdentity" in copy.s).toBe(false);
+      // The reviewer's steps: remove X, purge twice a day apart.
       await remove(fileId, copy.s);
       await ageEvents(copy.db, body, 9);
       for (const apply of [false, true, true]) {
@@ -1237,10 +1208,13 @@ describe("another database on the folder (fifth review RV1, RV2; review B1; R1b'
           problem: "identity_changed",
         });
       }
+      expect(readFileSync(join(dir, STORE_MARKER), "utf8")).toBe(marker);
       expect(has(body)).toBe(true);
       expect(await store.trashEntries(w.a)).toEqual([]);
-      // Production keeps its lease.
+      // Adopting waits for three quiet hours, which production's renewals
+      // never leave while it runs.
       expect(await service.renewFileLease()).toBe(true);
+      expect(await copy.s.adoptFileStore()).toEqual({ ok: false, problem: "epoch_moving" });
     });
   }, 120_000);
 

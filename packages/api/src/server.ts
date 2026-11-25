@@ -767,7 +767,8 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
     const timer = setTimeout(() => {
       if (raw.complete) return;
       if (!reply.raw.headersSent) clientError({ code: "ERR_HTTP_REQUEST_TIMEOUT" }, socket);
-      else socket.destroy();
+      // (`inject`'s stand-in socket has no destroy, as uploadLimits notes.)
+      else if (typeof socket.destroy === "function") socket.destroy();
     }, timeouts.request);
     timer.unref();
     const clear = (): void => {

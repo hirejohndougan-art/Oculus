@@ -78,9 +78,9 @@ import { hostname } from "node:os";
 import { isAbsolute, join } from "node:path";
 import type { Readable } from "node:stream";
 import { SNIFF_BYTES, isOrganizationId, isSha256Hex, type OrganizationId } from "@oculus/core";
-import { LEASE_GATE, LEASE_LOCK, LeaseLockBusy, hostKey, leaseLock } from "./lease-lock.js";
+import { LEASE_LOCK, LeaseLockBusy, hostKey, leaseGenerations, leaseLock } from "./lease-lock.js";
 
-export { LEASE_GATE, LEASE_LOCK, LeaseLockBusy };
+export { LEASE_LOCK, LeaseLockBusy, leaseGenerations };
 
 /** Bytes in a mebibyte. */
 const MIB = 1024 * 1024;
@@ -943,7 +943,7 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
     async isEmpty() {
       return (
         (await readdir(root)).filter(
-          (name) => name !== SERVERS_FOLDER && name !== LEASE_LOCK && name !== LEASE_GATE,
+          (name) => name !== SERVERS_FOLDER && !name.startsWith(".oculus-lease."),
         ).length === 0
       );
     },

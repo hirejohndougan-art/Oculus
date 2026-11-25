@@ -27,9 +27,10 @@ ALTER TABLE public.file_store_epochs ADD CONSTRAINT file_store_epochs_kind
 --    OIDs of file_store_epochs, stored_file_events and stored_files and of
 --    the database, stamped by the database whatever the INSERT says. A
 --    pg_upgrade keeps them (only the cluster's system identifier changes);
---    a pg_dump and restore gives new ones. Accepting a changed identity is
---    allowed only while the fingerprint is the one on the newest epoch row,
---    so a logical copy can never accept the folder (S-052 third review).
+--    a pg_dump and restore usually gives new ones, though not always (a
+--    restore into a fresh cluster made the same way can repeat them). It is
+--    kept for people to read; nothing depends on it for safety (S-052
+--    fourth review: there is no accepting of a changed identity).
 CREATE FUNCTION public.file_store_fingerprint() RETURNS text
 LANGUAGE sql STABLE
 SET search_path = pg_catalog, pg_temp
@@ -139,8 +140,7 @@ ALTER TABLE public.system_events ADD COLUMN byte_count bigint
 ALTER TABLE public.system_events DROP CONSTRAINT system_events_kind_known;
 ALTER TABLE public.system_events ADD CONSTRAINT system_events_kind_known
   CHECK (kind IN ('update_installed', 'update_rolled_back',
-                  'files_trashed', 'files_deleted', 'files_restored',
-                  'files_identity_accepted'));
+                  'files_trashed', 'files_deleted', 'files_restored'));
 ALTER TABLE public.system_events ALTER COLUMN version DROP NOT NULL;
 -- Who changed files with no person: NULL for the command line, 'timer' for
 -- the daily run (OCULUS_FILES_AUTO_PURGE=on), 'lease' for the trash put back

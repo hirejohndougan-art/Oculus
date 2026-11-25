@@ -24,7 +24,6 @@ export const SYSTEM_EVENT_KINDS = Object.freeze([
   "files_trashed",
   "files_deleted",
   "files_restored",
-  "files_identity_accepted",
 ] as const);
 export type SystemEventKind = (typeof SYSTEM_EVENT_KINDS)[number];
 
@@ -44,7 +43,7 @@ export interface NewSystemEvent {
 export interface NewFilePurgeEvent {
   /** The system manager, or `null` for the command line or the automatic run. */
   readonly actorId: UserId | null;
-  readonly kind: "files_trashed" | "files_deleted" | "files_restored" | "files_identity_accepted";
+  readonly kind: "files_trashed" | "files_deleted" | "files_restored";
   readonly files: number;
   readonly bytes: number;
   /**
@@ -81,8 +80,7 @@ export async function insertSystemEvent(
     // Checked as data too: a caller in plain JavaScript could send anything.
     ((event.source as unknown) !== undefined &&
       (!["timer", "lease"].includes(event.source as unknown as string) ||
-        event.actorId !== null ||
-        event.kind === "files_identity_accepted")) ||
+        event.actorId !== null)) ||
     !Number.isSafeInteger(event.files) ||
     event.files < 0 ||
     !Number.isSafeInteger(event.bytes) ||

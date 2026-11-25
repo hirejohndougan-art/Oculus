@@ -28,7 +28,13 @@ import { hostname, tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { newOrganizationId } from "@oculus/core";
-import { LEASE_LOCK, STORE_MARKER, openFileStore, type FileStore } from "./file-store.js";
+import {
+  LEASE_LOCK,
+  STORE_MARKER,
+  leaseGenerations,
+  openFileStore,
+  type FileStore,
+} from "./file-store.js";
 import { hostKey } from "./lease-lock.js";
 
 /**
@@ -675,7 +681,6 @@ describe("the S-052 review's store changes", () => {
   });
 
   it("takes the lease lock one at a time, and takes over a lock its holder left", async () => {
-    const lock = join(dir, LEASE_LOCK);
     const order: string[] = [];
     let release: () => void = () => undefined;
     const held = new Promise<void>((r) => {
@@ -697,23 +702,24 @@ describe("the S-052 review's store changes", () => {
     expect(await second).toBe(7);
     await first;
     expect(order).toEqual(["first in", "first out", "second"]);
-    expect(existsSync(lock)).toBe(false);
+    // Released: its generation says so.
+    expect(readFileSync(await current(dir), "utf8")).toBe("released\n");
     // A lock left by a process on this host that is gone.
-    writeFileSync(lock, `${hostKey() ?? "-"}\n999999999\nabcd\n`);
+    writeFileSync(await next(dir), `${hostKey() ?? "-"}\n999999999\nabcd\n`);
     expect(await store.withLeaseLock(() => Promise.resolve("taken"))).toBe("taken");
     // A lock from elsewhere, older than two minutes by the file system's clock.
-    writeFileSync(lock, "another-host\n12\nabcd\n");
+    const elsewhere = await next(dir);
+    writeFileSync(elsewhere, "another-host\n12\nabcd\n");
     const old = new Date(Date.now() - 5 * 60_000);
-    utimesSync(lock, old, old);
+    utimesSync(elsewhere, old, old);
     expect(await store.withLeaseLock(() => Promise.resolve("taken"))).toBe("taken");
-    expect(existsSync(lock)).toBe(false);
-    // Nor is the lock counted as the folder's content.
-    writeFileSync(lock, "another-host\n12\nabcd\n");
+    // A holder deletes only the generations below its own.
+    expect((await leaseGenerations(dir)).length).toBe(1);
+    // Nor are lock files counted as the folder's content.
     const empty = mkdtempSync(join(tmpdir(), "oculus-store-lock-"));
-    writeFileSync(join(empty, LEASE_LOCK), "x");
+    writeFileSync(join(empty, `${LEASE_LOCK}.1`), "x");
     expect(await (await openFileStore({ dir: empty })).isEmpty()).toBe(true);
     rmSync(empty, { recursive: true, force: true });
-    rmSync(lock, { force: true });
   });
 
   it("reports a trashed copy with a second link as stuck and never deletes or moves it", async () => {
@@ -742,9 +748,8 @@ describe("the S-052 review's store changes", () => {
 
 describe("the S-052 second review's store changes", () => {
   it("L1: two takers of a stale lock never hold it at once", async () => {
-    const lock = join(dir, LEASE_LOCK);
     for (let round = 0; round < 5; round++) {
-      writeFileSync(lock, `${hostKey() ?? "-"}\n999999999\nstale\n`);
+      writeFileSync(await next(dir), `${hostKey() ?? "-"}\n999999999\nstale\n`);
       let inside = 0;
       let most = 0;
       const work = async () => {
@@ -755,35 +760,35 @@ describe("the S-052 second review's store changes", () => {
       };
       await Promise.all([store.withLeaseLock(work), store.withLeaseLock(work)]);
       expect(most).toBe(1);
-      expect(existsSync(lock)).toBe(false);
-      expect(readdirSync(dir).filter((n) => n.startsWith(`${LEASE_LOCK}.`))).toEqual([]);
+      expect(readFileSync(await current(dir), "utf8")).toBe("released\n");
     }
   });
 
-  it("L3: a lock with this PID but a nonce it doesn't hold, or a time in the future, is stale", async () => {
-    const lock = join(dir, LEASE_LOCK);
-    writeFileSync(lock, `${hostKey() ?? "-"}\n${String(process.pid)}\nnot-mine\n`);
+  it("L3: a lock with this PID but a nonce it doesn't hold, or a time in the future, is stale; a live PID here never is", async () => {
+    writeFileSync(await next(dir), `${hostKey() ?? "-"}\n${String(process.pid)}\nnot-mine\n`);
     expect(await store.withLeaseLock(() => Promise.resolve("taken"))).toBe("taken");
-    writeFileSync(lock, "another-host\n12\nabcd\n");
-    const future = new Date(Date.now() + 3600_000);
-    utimesSync(lock, future, future);
+    const future = await next(dir);
+    writeFileSync(future, "another-host\n12\nabcd\n");
+    const later = new Date(Date.now() + 3600_000);
+    utimesSync(future, later, later);
     expect(await store.withLeaseLock(() => Promise.resolve("taken"))).toBe("taken");
-    expect(existsSync(lock)).toBe(false);
   });
 
-  it("L2: a held lock's time moves on while the work runs, and a release only removes its own", async () => {
+  it("L2: a held lock's time moves on while the work runs, and a release leaves a later generation alone", async () => {
     const beating = await openFileStore({ dir, leaseLockBeatMs: 30 });
-    const lock = join(dir, LEASE_LOCK);
-    await beating.withLeaseLock(async () => {
+    await beating.withLeaseLock(async (held) => {
+      const mine = await current(dir);
       const old = new Date(Date.now() - 10 * 60_000);
-      utimesSync(lock, old, old);
+      utimesSync(mine, old, old);
       await new Promise((r) => setTimeout(r, 200));
-      expect(Date.now() - statSync(lock).mtimeMs).toBeLessThan(60_000);
-      // Someone else's lock in its place by the end: left alone.
-      writeFileSync(lock, "another-host\n12\ntheirs\n");
+      expect(Date.now() - statSync(mine).mtimeMs).toBeLessThan(60_000);
+      // Someone took a later generation meanwhile: no longer held.
+      writeFileSync(await next(dir), "another-host\n12\ntheirs\n");
+      expect(await held()).toBe(false);
     });
-    expect(readFileSync(lock, "utf8")).toBe("another-host\n12\ntheirs\n");
-    rmSync(lock);
+    expect(readFileSync(await current(dir), "utf8")).toBe("another-host\n12\ntheirs\n");
+    // (Released for the next tests, as its holder would.)
+    writeFileSync(await current(dir), "released\n");
   });
 
   it("L2: place trusts the hash taken before the lock only while the copy is the one hashed", async () => {
@@ -813,3 +818,13 @@ describe("the S-052 second review's store changes", () => {
     rmSync(join(dir, other), { recursive: true, force: true });
   });
 });
+
+/** The current lease lock generation's path. */
+async function current(root: string): Promise<string> {
+  return join(root, `${LEASE_LOCK}.${String((await leaseGenerations(root))[0] ?? 0)}`);
+}
+
+/** The next lease lock generation's path (as a taker would make it). */
+async function next(root: string): Promise<string> {
+  return join(root, `${LEASE_LOCK}.${String(((await leaseGenerations(root))[0] ?? 0) + 1)}`);
+}

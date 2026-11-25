@@ -110,43 +110,12 @@ describe("Clean up removed files", () => {
     expect(await screen.findByText(/doesn't keep file times exactly enough/)).toBeTruthy();
   });
 
-  it("offers to accept this database after an upgrade, asking for the password and a code again", async () => {
-    const user = userEvent.setup();
-    let accepts = 0;
-    const sent = server(
-      { available: false, problem: "identity_changed" },
-      {
-        "POST /api/system/files/cleanup/accept-identity": () => {
-          accepts++;
-          return accepts === 1
-            ? [403, { error: "reauthentication_required" }]
-            : [200, { accepted: true, changed: true }];
-        },
-        "POST /api/reauthenticate": [200, { ok: true }],
-      },
-    );
+  it("after a database change says to adopt on the server, and offers no shortcut", async () => {
+    server({ available: false, problem: "identity_changed" });
     renderAt("/settings/removed-files");
-    expect(await screen.findByText(/The files folder names another database/)).toBeTruthy();
-    await user.click(screen.getByRole("button", { name: "Accept this database as the owner" }));
-    await user.type(await screen.findByLabelText("Your password"), "invented password");
-    await user.type(screen.getByLabelText("Code from your app, or a recovery code"), "123456");
-    await user.click(screen.getByRole("button", { name: "Confirm and continue" }));
-    expect(await screen.findByText("This database is now the files folder's owner.")).toBeTruthy();
-    expect(sent.filter((s) => s.path === "/api/system/files/cleanup/accept-identity")).toHaveLength(
-      2,
-    );
-  });
-
-  it("says to adopt when this database can't simply be accepted", async () => {
-    server(
-      { available: false, problem: "identity_changed" },
-      { "POST /api/system/files/cleanup/accept-identity": [409, { error: "use_adopt" }] },
-    );
-    renderAt("/settings/removed-files");
-    await userEvent.click(
-      await screen.findByRole("button", { name: "Accept this database as the owner" }),
-    );
-    expect(await screen.findByText(/can't simply be accepted/)).toBeTruthy();
+    expect(await screen.findByText(/runs npm run files:adopt/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Accept/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Run a clean-up step" })).toBeNull();
   });
 
   it("has nothing to run when nothing is waiting", async () => {

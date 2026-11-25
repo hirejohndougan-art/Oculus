@@ -20,12 +20,11 @@
  * marker must name this install (`file_store_binding`), the database's
  * current epoch **and this database's identity**: a pg_dump or logical
  * restore has another, and so does this database after a pg_upgrade or a
- * move, so the run is refused (`identity_changed`, writing nothing) until a
- * system manager accepts the identity (`acceptFileStoreIdentity`) or an
- * adopt. An identity read without the cluster's system identifier
- * (`-:<oid>`) tells nothing (every fresh cluster's first database has the
- * same OID): refused (`identity_unknown`). A new epoch is committed here,
- * then put in the marker. Every step after that takes the same two locks, then the
+ * move, so the run is refused (`identity_changed`, writing nothing) until an
+ * operator adopts the folder (`npm run files:adopt`, after three quiet
+ * hours; removals before it are then unknown to the purge). An identity
+ * read without the cluster's system identifier (`-:<oid>`) tells nothing:
+ * refused (`identity_unknown`). A new epoch is committed here, then put in the marker. Every step after that takes the same two locks, then the
  * organization's file lock (class 69, the one every attach takes), and
  * checks the lease again, and that the run's time (`PURGE_LEASE_MS`, by the
  * process's monotonic clock) isn't up. A start, an hourly renewal or
@@ -100,8 +99,7 @@ export type PurgeProblem =
   /**
    * The epoch is this database's but the marker names another database's
    * identity: a dump or logical restore of the one that wrote it, or this
-   * database after a pg_upgrade (accept the identity) or a dump-and-restore
-   * move (adopt).
+   * database after a pg_upgrade or a move. Only an adopt goes on from here.
    */
   | "identity_changed"
   /**

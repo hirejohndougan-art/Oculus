@@ -82,7 +82,7 @@ describe("files-cli", () => {
     writeFileSync(marker, kept);
   });
 
-  it("accepts this database's identity only while the folder's epoch is its own", async () => {
+  it("after an identity change says to adopt, and has no way round the wait (R4-B1)", async () => {
     const marker = join(dir, STORE_MARKER);
     const kept = readFileSync(marker, "utf8");
     const [storeId, database, epoch] = kept.split("\n");
@@ -90,16 +90,12 @@ describe("files-cli", () => {
     writeFileSync(marker, `${storeId ?? ""}\n987654321:${oid}\n${epoch ?? ""}\n`);
     const refused = run(["purge", "--dry-run"]);
     expect(await refused.done).toBe(1);
-    expect(refused.lines.join("\n")).toMatch(/files:accept-identity/);
-    const accepted = run(["accept-identity"]);
-    expect(await accepted.done).toBe(0);
-    expect(accepted.lines).toContain(
-      "The files folder now names this database. Nothing was deleted.",
+    expect(refused.lines.join("\n")).toMatch(/npm run files:adopt/);
+    expect(refused.lines.join("\n")).not.toMatch(/accept/);
+    expect(readFileSync(marker, "utf8")).toBe(
+      `${storeId ?? ""}\n987654321:${oid}\n${epoch ?? ""}\n`,
     );
-    expect(readFileSync(marker, "utf8").split("\n")[1]).toBe(database);
-    // Not while the epoch is another's.
-    writeFileSync(marker, `${storeId ?? ""}\n987654321:${oid}\n${newRecordId()}\n`);
-    expect(await run(["accept-identity"]).done).toBe(1);
+    expect(await run(["accept-identity"]).done).toBe(2);
     writeFileSync(marker, kept);
   });
 

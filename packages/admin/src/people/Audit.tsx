@@ -73,16 +73,7 @@ const FILE_EVENTS: Readonly<Record<string, string>> = {
   files_restored: "Put files back from the trash:",
 };
 
-/** File events with no count to show. */
-const FILE_NOTES: Readonly<Record<string, string>> = {
-  files_identity_accepted:
-    "Accepted this database as the files folder's owner after a database change",
-};
-
 function what(entry: AuditEntry, sites: ReadonlyMap<string, string>): string {
-  if (entry.type === "system" && Object.hasOwn(FILE_NOTES, entry.kind)) {
-    return FILE_NOTES[entry.kind] ?? entry.kind;
-  }
   if (entry.type === "system" && Object.hasOwn(FILE_EVENTS, entry.kind)) {
     const n = entry.files ?? 0;
     const mb = ((entry.bytes ?? 0) / (1024 * 1024)).toFixed(1);
