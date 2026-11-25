@@ -215,9 +215,3 @@ All are on the writer role, and none touches catalog data. The lint rule (driver
 
 **Tests**
 - Unloaded, `vocabularies` paging and both second-factor deadlock tests pass (0.1–1.3 s). Their failures are timeouts (M4), not logic.
-
-## Scratch cleanup
-- The throwaway PostgreSQL (PID 17736, under `/tmp/t053b-tmp/oculus-pg-*`) was stopped by PID. Its launcher's SIGTERM didn't stop it, so it was killed directly; no `t053b` process is left.
-- `/tmp/t053b-work` (the scratch repo copy, PoC scripts and migrations) and `/tmp/t053b-tmp` were deleted.
-- Nothing in the review worktree (`git status` is clean), `/home/claude/oculus`, other worktrees or any files folder was changed.
-- Nothing was committed.
