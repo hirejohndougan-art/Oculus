@@ -100,8 +100,8 @@ export const WRITER_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Ob
   ...STORAGE_TABLE_PRIVILEGES,
   // The change log of people and roles (T-048, D-084): insert only.
   ...PEOPLE_TABLE_PRIVILEGES,
-  // Custom roles (T-041a, D-120): made, changed and deleted (only while
-  // nobody holds one, 0056's guard); their change log insert only.
+  // Custom roles (T-041a, D-121): made, changed and deleted (only while
+  // nobody holds one, 0057's guard); their change log insert only.
   ...CUSTOM_ROLE_TABLE_PRIVILEGES,
   // Two-step alert notices (D-085): one row per alert, only ever added.
   ...ALERT_NOTICE_TABLE_PRIVILEGES,

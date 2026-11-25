@@ -1,5 +1,5 @@
 /**
- * Custom roles in the database (T-041a, D-036, D-120; migration 0056).
+ * Custom roles in the database (T-041a, D-036, D-121; migration 0057).
  *
  * A custom role is one organization's named set of permissions (core's
  * `CustomRole`, checked by `validateCustomRole` before anything is

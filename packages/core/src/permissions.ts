@@ -3,7 +3,7 @@
  *
  * **The service checks permissions, never role names** (D-036). A role is a
  * named set of permissions from the fixed list below: a built-in role
- * (`ROLE_PERMISSIONS`) or an organization's custom role (T-041a, D-120:
+ * (`ROLE_PERMISSIONS`) or an organization's custom role (T-041a, D-121:
  * `CustomRole`, made by system managers from `CUSTOM_ROLE_PERMISSIONS`
  * only). A grant carries the permissions its role held when it was read
  * (`RoleGrant.permissions`), so built-in and custom roles are checked
@@ -350,7 +350,7 @@ export function hasScopedGrants(access: Access): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Custom roles (T-041a, D-036, D-120)
+// Custom roles (T-041a, D-036, D-121)
 
 /**
  * The permissions a custom role may hold: every catalog permission and the

@@ -1,4 +1,4 @@
--- Custom roles (T-041a, D-036, D-120; core: permissions.ts).
+-- Custom roles (T-041a, D-036, D-121; core: permissions.ts).
 --
 -- custom_roles: one row per role a system manager made for one organization:
 -- its key (lower case letters and underscores, never a built-in role's

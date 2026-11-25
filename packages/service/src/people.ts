@@ -569,7 +569,7 @@ export function peopleOperations(
         const v = viewer.value;
         if (!v.system && v.sites.length === 0) return notPermitted();
         // The organization's custom roles follow the built-in ones (T-041a,
-        // D-120): anyone who may grant roles may grant them, as they hold
+        // D-121): anyone who may grant roles may grant them, as they hold
         // nothing beyond a site manager's.
         const custom = await listCustomRoles(tx, who.organizationId);
         return {

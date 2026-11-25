@@ -1400,7 +1400,7 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
         });
       }),
     },
-    // Custom roles (T-041a, D-036, D-120): system managers only (the
+    // Custom roles (T-041a, D-036, D-121): system managers only (the
     // service refuses everyone else), with a recent sign-in for changes.
     {
       method: "GET",

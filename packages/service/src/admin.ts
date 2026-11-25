@@ -287,7 +287,7 @@ export async function grantRoleIn(
     return refusal(["userId"], "invalid_id", "A person's ID is a lowercase version 4 UUID.");
   }
   // A built-in role, or one of the organization's custom roles (T-041a,
-  // D-120): looked up below, once the actor is known, so nobody learns
+  // D-121): looked up below, once the actor is known, so nobody learns
   // another organization's role names (each organization's are its own).
   if (!isBuiltInRole(role) && !isCustomRoleKey(role)) {
     return refusal(

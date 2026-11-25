@@ -4,8 +4,8 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
 ## 2026-11-25 19:00 CT — manual (Chat Z) — T-041a Custom roles
 - Result: done (built, not pushed: John asked that nothing be pushed yet); screens split off as T-041g, people-managing roles as S-067
-- What changed: migration 0056 (`custom_roles`, `custom_role_events`, a known-role trigger on `role_assignments`); core `CustomRole`, `validateCustomRole`, `grantPermissions`; db `custom-roles.ts`, `loadAccess` reads custom permissions; service `custom-roles.ts` and custom roles in `roleCatalog` and `grantRole`; staff API `/api/custom-roles`. Branch `autopilot/T-041a`, local only, from main 69c020e.
-- Decisions: D-120
+- What changed: migration 0057 (`custom_roles`, `custom_role_events`, a known-role trigger on `role_assignments`); core `CustomRole`, `validateCustomRole`, `grantPermissions`; db `custom-roles.ts`, `loadAccess` reads custom permissions; service `custom-roles.ts` and custom roles in `roleCatalog` and `grantRole`; staff API `/api/custom-roles`. Branch `autopilot/T-041a`, local only, from main 69c020e.
+- Decisions: D-121
 - Review: see the branch's last commit
 - Gate: see the branch's last commit · npm audit clean
 - Next: the next free Phase 3 job (Chat Z)

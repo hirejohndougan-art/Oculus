@@ -100,7 +100,7 @@ export async function loadAccess(
           WHERE id = ${userId}::uuid
           FOR SHARE`);
   if (!user?.active) return undefined;
-  // A custom role's permissions are read with its grant (T-041a, D-120): a
+  // A custom role's permissions are read with its grant (T-041a, D-121): a
   // change to the role locks its holders' rows first, so this read and that
   // change don't overlap.
   const rows = await db.rows<{

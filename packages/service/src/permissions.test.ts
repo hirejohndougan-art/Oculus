@@ -1434,7 +1434,7 @@ describe("the database backs the rules up", () => {
     expect(await insert({ user: w.none, role: "site_manager", scope: w.f1.id })).toBe(
       "23514:role_assignments_site_manager_whole",
     );
-    // A role neither built in nor the organization's own (T-041a, 0056's trigger).
+    // A role neither built in nor the organization's own (T-041a, 0057's trigger).
     expect(await insert({ user: w.none, role: "curator" })).toBe(
       "23000:role_assignments_known_role",
     );
@@ -1476,7 +1476,7 @@ describe("the database backs the rules up", () => {
       // 0018 (S-022): who may grant.
       "role_assignments.role_assignments_check_grant",
       "role_assignments.role_assignments_check_new",
-      // 0056 (T-041a): a built-in role or the organization's own.
+      // 0057 (T-041a): a built-in role or the organization's own.
       "role_assignments.role_assignments_check_role",
       "role_assignments.zzzz_role_assignments_keep_identity",
       "sites.zzzz_sites_keep_identity",

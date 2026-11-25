@@ -1,4 +1,4 @@
-// Custom roles (T-041a, D-036, D-120): system managers make, change and
+// Custom roles (T-041a, D-036, D-121): system managers make, change and
 // delete an organization's roles from the permission list; nobody else
 // may. A custom role can't hold a system power or manage people; another
 // organization's role can't be granted; sensitive permissions and people
