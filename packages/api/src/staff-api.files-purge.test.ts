@@ -43,6 +43,7 @@ import {
   ADOPT_QUIET_MS,
   AUTOMATIC_PURGE_EVERY_MS,
   LEASE_LOCK,
+  LeaseLockBusy,
   hostKey,
   leaseGenerations,
   STORE_MARKER,
@@ -709,11 +710,36 @@ describe("the second review's fixes (S-052)", () => {
     await drain();
   });
 
-  it("L3: a step whose lease lock isn't its own any more right before the rename stops, moving nothing", async () => {
-    const { body } = await removedLongAgo();
-    const taken: FileStore = {
+  it("L-e: nothing writes the marker or an epoch once its lease lock isn't held (paused past it)", async () => {
+    const lost: FileStore = {
       ...store,
       withLeaseLock: (work) => store.withLeaseLock(() => work(() => Promise.resolve(false))),
+    };
+    const careless = createService(w.db, { files: lost });
+    const marker = markerText();
+    const epoch = (await readFileStoreLease(w.db))?.epoch;
+    expect(await careless.purgeFiles({ apply: true })).toEqual({
+      ok: false,
+      problem: "lease_busy",
+    });
+    await expect(careless.renewFileLease()).rejects.toBeInstanceOf(LeaseLockBusy);
+    // Adopt looks at the marker's quiet time again inside the lock too.
+    const quiet = new Date(Date.now() - ADOPT_QUIET_MS - 60_000);
+    utimesSync(join(dir, STORE_MARKER), quiet, quiet);
+    expect(await careless.adoptFileStore()).toEqual({ ok: false, problem: "epoch_moving" });
+    expect(markerText()).toBe(marker);
+    expect((await readFileStoreLease(w.db))?.epoch).toBe(epoch);
+    expect(await service.renewFileLease()).toBe(true);
+  });
+
+  it("L3: a step whose lease lock isn't its own any more right before the rename stops, moving nothing", async () => {
+    const { body } = await removedLongAgo();
+    // Held while the run takes the lease (its two checks), lost by the step.
+    let checks = 0;
+    const taken: FileStore = {
+      ...store,
+      withLeaseLock: (work) =>
+        store.withLeaseLock((held) => work(async () => checks++ < 2 && (await held()))),
     };
     const result = await createService(w.db, { files: taken }).purgeFiles({ apply: true });
     expect(result.ok && result.value).toMatchObject({

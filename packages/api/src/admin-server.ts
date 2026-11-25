@@ -527,8 +527,8 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   if (bound.warning !== undefined) {
     // Another database uses this folder, or this one was restored, copied
     // or upgraded, or its identity can't be read, or the lease lock was
-    // busy: it starts; the purge refuses until an operator adopts or a
-    // system manager accepts the identity (D-086).
+    // busy: it starts; the purge refuses until an operator adopts the
+    // folder (or, when busy, the renewal tried again within a minute).
     log({ event: "startup_warning", code: bound.warning });
   }
   const renew = async (): Promise<void> => {

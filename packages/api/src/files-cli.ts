@@ -49,6 +49,8 @@ const PURGE_PROBLEMS: Readonly<Record<string, string>> = {
     "the files folder's marker names another database's identity: this database was upgraded (pg_upgrade) or moved, or it is a copy of the one that uses the folder. If this is the folder's own database, stop every other Oculus that uses the folder and run npm run files:adopt (it waits for three quiet hours); files removed before then are kept.",
   identity_unknown:
     "this database's role can't read the cluster's system identifier, so a restore of it elsewhere couldn't be told apart. Have a superuser grant it EXECUTE on pg_catalog.pg_control_system().",
+  lease_busy:
+    "another purge, renewal or adopt of the files folder is running. Try again in a minute.",
   mtime_unreliable:
     "the files folder's file system doesn't keep file times exactly enough to tell whether a copy was used since it was removed. Nothing is purged on it.",
 };

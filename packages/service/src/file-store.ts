@@ -943,7 +943,12 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
     async isEmpty() {
       return (
         (await readdir(root)).filter(
-          (name) => name !== SERVERS_FOLDER && !name.startsWith(".oculus-lease."),
+          // The servers' notes, the lease lock's files and the file system
+          // clock's probes (a crash can leave one; a lock holder tidies them).
+          (name) =>
+            name !== SERVERS_FOLDER &&
+            !name.startsWith(".oculus-lease.") &&
+            !/^\.(now|mtime)-[0-9a-f]{16}$/.test(name),
         ).length === 0
       );
     },

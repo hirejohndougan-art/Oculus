@@ -70,7 +70,7 @@ import {
   type Database,
   type Queryable,
 } from "@oculus/db";
-import type { FileStore, StoreMarker } from "./file-store.js";
+import { LeaseLockBusy, type FileStore, type StoreMarker } from "./file-store.js";
 
 /** How long one run may hold the lease (10 minutes); the rest waits for the next run. */
 export const PURGE_LEASE_MS = 10 * 60_000;
@@ -108,6 +108,8 @@ export type PurgeProblem =
    * grants it `EXECUTE` on `pg_catalog.pg_control_system()`.
    */
   | "identity_unknown"
+  /** Another purge, renewal or adopt held the folder's lease lock: try again shortly. */
+  | "lease_busy"
   /** The file system doesn't keep modification times exactly enough to compare copies by them. */
   | "mtime_unreliable";
 
@@ -223,29 +225,38 @@ export async function runFilePurge(
   // The lease: checked, and for a real run taken (a new epoch), under the
   // folder's lease lock so no other database's renewal comes in between.
   const epoch = randomUUID();
-  const taken = await files.withLeaseLock(async () => {
-    const answer = await db.transaction(
-      async (tx): Promise<PurgeProblem | { since: string | null }> => {
-        await lockFileStoreLease(tx);
-        if ((await readFileStoreBinding(tx)) !== bound) return "not_bound";
-        const marker = await files.readMarker();
-        if (marker?.storeId !== bound) return "other_install";
-        const lease = await readFileStoreLease(tx);
-        if (lease === undefined || marker.epoch !== lease.epoch) return "lease_mismatch";
-        // The epoch is ours but the marker names another database: a dump or
-        // logical restore of the one that wrote it, or this one after a
-        // pg_upgrade. Refused, and nothing is written (a dry run included),
-        // until a system manager accepts the identity or an adopt.
-        if (!holds(marker, lease.epoch)) return "identity_changed";
-        if (apply) await insertFileStoreEpoch(tx, epoch, "purge", identity);
-        return { since: lease.since };
-      },
-    );
-    if (apply && typeof answer !== "string") {
-      await files.replaceMarker({ storeId: bound, database: identity, epoch });
-    }
-    return answer;
-  });
+  const taken = await files
+    .withLeaseLock(async (held) => {
+      if (!(await held())) return "lease_busy" as const;
+      const answer = await db.transaction(
+        async (tx): Promise<PurgeProblem | { since: string | null }> => {
+          await lockFileStoreLease(tx);
+          if ((await readFileStoreBinding(tx)) !== bound) return "not_bound";
+          const marker = await files.readMarker();
+          if (marker?.storeId !== bound) return "other_install";
+          const lease = await readFileStoreLease(tx);
+          if (lease === undefined || marker.epoch !== lease.epoch) return "lease_mismatch";
+          // The epoch is ours but the marker names another database: a dump or
+          // logical restore of the one that wrote it, or this one after a
+          // pg_upgrade or a move. Refused, and nothing is written (a dry run
+          // included), until an operator adopts the folder.
+          if (!holds(marker, lease.epoch)) return "identity_changed";
+          if (apply) await insertFileStoreEpoch(tx, epoch, "purge", identity);
+          return { since: lease.since };
+        },
+      );
+      if (apply && typeof answer !== "string") {
+        // (Committed, but not held any more: the marker is left; the next
+        // renewal finds the two apart, the safe way.)
+        if (!(await held())) return "lease_busy" as const;
+        await files.replaceMarker({ storeId: bound, database: identity, epoch });
+      }
+      return answer;
+    })
+    .catch((error: unknown) => {
+      if (error instanceof LeaseLockBusy) return "lease_busy" as const;
+      throw error;
+    });
   if (typeof taken === "string") return { ok: false, problem: taken };
   const deadline = monotonic() + leaseMs;
   const since = taken.since;

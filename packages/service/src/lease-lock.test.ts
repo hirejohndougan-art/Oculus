@@ -1,7 +1,7 @@
 // The files folder's lease lock (S-052, D-086; fourth review R4-M1/M2):
-// generations, judged stale by time alone for holders on another host or
+// generations, judged stale by time alone for holders in another
 // container. Eight worker processes take it over and over, each with a host
-// key of its own (as if each were on another machine, so no PID is ever
+// key of its own (as if each were in another container, so no PID is ever
 // checked), some crashing while they hold it; an O_EXCL "holder" file,
 // made only while `held()` is true, catches any two holders at once: there
 // must be none. A holder stopped (SIGSTOP) for longer than the stale time
@@ -28,7 +28,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { LEASE_LOCK, LeaseLockBusy, hostKey, leaseGenerations, leaseLock } from "./lease-lock.js";
 
 const LEASE_LOCK_TS = fileURLToPath(new URL("./lease-lock.ts", import.meta.url));
-/** A lock on another host is stale after this long here (the default is two minutes). */
+/** A lock in another container is stale after this long here (the default is two minutes). */
 const STALE_MS = 1500;
 
 const WORKER = `
@@ -122,7 +122,7 @@ function exited(child: ChildProcess): Promise<number | null> {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-describe("the lease lock across processes on other hosts (R4-M1/M2)", () => {
+describe("the lease lock across processes in other containers (R4-M1/M2)", () => {
   it("never has two holders among eight contenders, with holders crashing, judged by time alone", async () => {
     const rounds = 10;
     let expected = 0;
@@ -144,7 +144,7 @@ describe("the lease lock across processes on other hosts (R4-M1/M2)", () => {
     const done = exited(paused);
     for (let i = 0; i < 1000 && !existsSync(join(dir, "paused-ready")); i++) await sleep(10);
     paused.kill("SIGSTOP");
-    // The others take it over once its lock is stale (by time: another host).
+    // The others take it over once its lock is stale (by time: another container).
     const others = await Promise.all(
       Array.from({ length: 7 }, () => exited(start("normal", 3, -1))),
     );
@@ -168,6 +168,67 @@ describe("the lease lock in one process", () => {
     const lock = leaseLock({ root: own, waitMs: 300 });
     await expect(lock.withLock(() => Promise.resolve(1))).rejects.toBeInstanceOf(LeaseLockBusy);
     expect(await leaseGenerations(own)).toEqual([1]);
+    rmSync(own, { recursive: true, force: true });
+  });
+
+  it("M1: held() turns false once its own file is half the stale time old (a holder that wasn't moving it on)", async () => {
+    const own = mkdtempSync(join(tmpdir(), "oculus-lease-fresh-"));
+    const lock = leaseLock({ root: own, staleMs: 400, beatMs: 100_000 });
+    await lock.withLock(async (held) => {
+      expect(await held()).toBe(true);
+      await sleep(300);
+      expect(await held()).toBe(false);
+    });
+    rmSync(own, { recursive: true, force: true });
+  });
+
+  it("writes the start time and thread with the PID, and keeps its nonces on globalThis (L-b, L-c)", async () => {
+    const own = mkdtempSync(join(tmpdir(), "oculus-lease-text-"));
+    const nonces = (globalThis as Record<symbol, unknown>)[
+      Symbol.for("oculus.leaseLock.heldNonces")
+    ] as Set<string>;
+    await leaseLock({ root: own }).withLock(async () => {
+      const [, pid, nonce, started, thread] = readFileSync(
+        join(own, `${LEASE_LOCK}.1`),
+        "utf8",
+      ).split("\n");
+      expect(pid).toBe(String(process.pid));
+      expect(nonces.has(nonce ?? "")).toBe(true);
+      expect(thread).toBe("0");
+      if (process.platform === "linux") expect(started).toMatch(/^[0-9]+$/);
+      await Promise.resolve();
+    });
+    rmSync(own, { recursive: true, force: true });
+  });
+
+  it("L-b: a live PID on this host whose start time isn't the lock's is a reused PID: stale", async () => {
+    const key = hostKey();
+    if (key === undefined || process.platform !== "linux") return;
+    const own = mkdtempSync(join(tmpdir(), "oculus-lease-reused-"));
+    writeFileSync(join(own, `${LEASE_LOCK}.1`), `${key}\n${String(process.ppid)}\nold\n1\n0\n`);
+    expect(
+      await leaseLock({ root: own, waitMs: 300 }).withLock(() => Promise.resolve("taken")),
+    ).toBe("taken");
+    rmSync(own, { recursive: true, force: true });
+  });
+
+  it("L-a, L-d: a holder tidies old temporary files and clock probes by the file system's clock", async () => {
+    const own = mkdtempSync(join(tmpdir(), "oculus-lease-tidy-"));
+    const old = new Date(Date.now() - 10 * 60_000);
+    const leftovers = [
+      ".oculus-lease.tmp-0123456789abcdef",
+      ".now-0123456789abcdef",
+      ".mtime-0123456789abcdef",
+    ];
+    for (const name of leftovers) {
+      writeFileSync(join(own, name), "");
+      utimesSync(join(own, name), old, old);
+    }
+    writeFileSync(join(own, ".now-fedcba9876543210"), "");
+    await leaseLock({ root: own }).withLock(() => Promise.resolve());
+    for (const name of leftovers) expect(existsSync(join(own, name))).toBe(false);
+    // A fresh probe (another process's, in use) stays.
+    expect(existsSync(join(own, ".now-fedcba9876543210"))).toBe(true);
     rmSync(own, { recursive: true, force: true });
   });
 

@@ -14,10 +14,15 @@
  *   (below) is taken over by making generation `n + 1`. Of any number of
  *   takers exactly one makes it; the rest see it and wait. Nothing is
  *   deleted or renamed for this to hold;
- * - `held()` is true only while no higher generation exists and the
- *   holder's own file still holds its text. A holder that was paused past
- *   the stale time and resumes finds `held()` false (the caller checks it
- *   right before each rename or unlink) and does nothing;
+ * - `held()` is true only while no higher generation exists, the holder's
+ *   own file still holds its text, and that file's time (which the holder
+ *   moves on) is less than half the stale time old by the file system's
+ *   clock. A holder that was paused past that and resumes finds `held()`
+ *   false (the caller checks it right before each rename, unlink or marker
+ *   write) and does nothing. **What remains:** a pause exactly between a
+ *   `held()` that answered true and the rename or unlink after it can't be
+ *   fenced on a file system; the holder then acts once after its lease ran
+ *   out (one rename or unlink, each of which re-checks its own conditions);
  * - older generations are deleted lazily, only by a holder, only below its
  *   own. A taker that read the folder before such a clean-up can make a
  *   generation below the current one; it checks it made the highest, and if
@@ -26,15 +31,22 @@
  * **Gone.** A generation is judged from one open of it (`O_NOFOLLOW`),
  * `fstat` and a read through the same handle. On this host, the same
  * hostname, boot and PID namespace (`hostKey`), its PID is authoritative:
- * while that process lives the lock is never stale, whatever its age; a
- * PID that no longer exists, or this process with a nonce it doesn't hold,
- * is gone. Anything else (another host or container, or no host key) is
- * stale once its time, which the holder moves on every 20 seconds for at
- * most 10 minutes, is more than two minutes from the file system's now,
- * either way.
+ * while that process lives (and, where `/proc` gives it, started when the
+ * lock says) the lock is never stale, whatever its age; a PID that no
+ * longer exists or started at another time, or this process's own thread
+ * with a nonce it doesn't hold, is gone. Anything else (another container,
+ * or no host key) is stale once its time, which the holder moves on every
+ * 20 seconds for at most 10 minutes, is more than two minutes from the file
+ * system's now, either way.
+ *
+ * **Scope.** It needs one kernel, or a local file system that every
+ * process using the folder sees coherently (links, `O_EXCL` and times as
+ * one machine sees them). A files folder shared across machines (a network
+ * file system) is out of scope, as it is for the servers' notes.
  */
 import { randomBytes } from "node:crypto";
 import { constants, readFileSync, readlinkSync } from "node:fs";
+import { threadId } from "node:worker_threads";
 import { link, lstat, open, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join } from "node:path";
@@ -53,6 +65,8 @@ const MAX_HOLD_MS = 10 * 60_000;
 
 const GENERATION = /^\.oculus-lease\.lock\.([1-9][0-9]{0,15})$/;
 const TEMPORARY = /^\.oculus-lease\.tmp-[0-9a-f]{16}$/;
+/** The file system clock's probes (here and in file-store.ts). */
+const PROBE = /^\.(now|mtime)-[0-9a-f]{16}$/;
 
 /** The lock was held by someone else for the whole wait. */
 export class LeaseLockBusy extends Error {
@@ -62,8 +76,28 @@ export class LeaseLockBusy extends Error {
   }
 }
 
-/** The nonces of the locks this process holds now (whatever store took them). */
-const heldNonces = new Set<string>();
+/**
+ * The nonces of the locks this thread holds now, whatever store or copy of
+ * this module took them (kept on `globalThis`, so two copies of the module
+ * in one process agree).
+ */
+const NONCES = Symbol.for("oculus.leaseLock.heldNonces");
+const heldNonces: Set<string> = ((globalThis as Record<symbol, unknown>)[NONCES] ??=
+  new Set<string>()) as Set<string>;
+
+/** When a process started (`/proc/<pid>/stat` field 22), where it can be read. */
+function startTime(pid: number): string | undefined {
+  try {
+    const stat = readFileSync(`/proc/${String(pid)}/stat`, "utf8");
+    // The command name (field 2) may hold spaces and parentheses: fields
+    // are counted after its last ")".
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    const value = fields[19];
+    return value !== undefined && /^[0-9]{1,20}$/.test(value) ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 let cachedHostKey: string | null | undefined;
 
@@ -98,14 +132,20 @@ export function hostKey(): string | undefined {
   return cachedHostKey ?? undefined;
 }
 
-/** Whether a process with this PID exists here (EPERM: it does, as someone else). */
-function alive(pid: number): boolean {
+/**
+ * Whether the process the lock names is still running here: one with this
+ * PID exists (EPERM: as someone else) and, when both are known, started when
+ * the lock says (a PID used again by another process is not it).
+ */
+function alive(pid: number, started: string): boolean {
   try {
     process.kill(pid, 0);
-    return true;
   } catch (error) {
-    return (error as { code?: unknown }).code === "EPERM";
+    if ((error as { code?: unknown }).code !== "EPERM") return false;
   }
+  // Compared only when the lock gave one (`-` or nothing: not known).
+  const now = /^[0-9]{1,20}$/.test(started) ? startTime(pid) : undefined;
+  return now === undefined || now === started;
 }
 
 export interface LeaseLockOptions {
@@ -115,11 +155,11 @@ export interface LeaseLockOptions {
   readonly beatMs?: number;
   /** The longest a holder keeps it fresh (default 10 minutes). */
   readonly maxHoldMs?: number;
-  /** When a lock on another host is stale (tests; default 2 minutes). */
+  /** When a lock in another container is stale (tests; default 2 minutes). */
   readonly staleMs?: number;
   /** How long a taker waits (tests; default 15 seconds). */
   readonly waitMs?: number;
-  /** This holder's host key (tests: another host or container); default `hostKey()`. */
+  /** This holder's host key (tests: another container); default `hostKey()`. */
   readonly hostKey?: string | null;
 }
 
@@ -182,17 +222,39 @@ export function leaseLock(options: LeaseLockOptions): LeaseLock {
     const seen = await inspect(n);
     if (seen === undefined) return true;
     if (seen.text.startsWith("released\n")) return true;
-    const [key = "", pidText = "", nonce = ""] = seen.text.split("\n");
+    const [key = "", pidText = "", nonce = "", started = "-", thread = ""] = seen.text.split("\n");
     const pid = Number(pidText);
     if (ourKey !== undefined && key === ourKey && Number.isSafeInteger(pid) && pid > 0) {
-      // On this host the PID decides, whatever the file's age.
-      return pid === process.pid ? !heldNonces.has(nonce) : !alive(pid);
+      // On this host the PID decides, whatever the file's age. This
+      // process's own thread knows its nonces; another thread of it is
+      // taken as live while the process is.
+      // (A lock with no thread line is taken as written by the main thread.)
+      if (
+        pid === process.pid &&
+        (thread === String(threadId) || (thread === "" && threadId === 0))
+      ) {
+        return !heldNonces.has(nonce);
+      }
+      return !alive(pid, started);
     }
     return Math.abs((await fileSystemNow()) - seen.mtimeMs) > staleMs;
   }
 
-  /** Makes generation `n` holding `text`, whole, or answers `false` if it exists. */
+  /**
+   * Makes generation `n` holding `text`, whole, or answers `false` if it
+   * exists (another's). Tried again if the temporary file went meanwhile.
+   */
   async function make(n: number, text: string): Promise<boolean> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await makeOnce(n, text);
+      } catch (error) {
+        if ((error as { code?: unknown }).code !== "ENOENT" || attempt >= 2) throw error;
+      }
+    }
+  }
+
+  async function makeOnce(n: number, text: string): Promise<boolean> {
     const temporary = join(root, `.oculus-lease.tmp-${randomBytes(8).toString("hex")}`);
     await writeFile(temporary, text, { mode: 0o600, flag: "wx" });
     try {
@@ -200,7 +262,9 @@ export function leaseLock(options: LeaseLockOptions): LeaseLock {
       return true;
     } catch (error) {
       const code = (error as { code?: unknown }).code;
-      if (code === "EEXIST") return false;
+      // Already there: ours if it holds our text (a link whose answer was
+      // lost and retried), another's otherwise.
+      if (code === "EEXIST") return (await inspect(n).catch(() => undefined))?.text === text;
       if (code !== "EPERM" && code !== "ENOTSUP" && code !== "EOPNOTSUPP" && code !== "ENOSYS") {
         throw error;
       }
@@ -221,7 +285,10 @@ export function leaseLock(options: LeaseLockOptions): LeaseLock {
   return {
     async withLock(work) {
       const nonce = randomBytes(12).toString("hex");
-      const mine = `${ourKey ?? "-"}\n${String(process.pid)}\n${nonce}\n`;
+      // Host, PID, nonce, the process's start time and the thread.
+      const mine = `${ourKey ?? "-"}\n${String(process.pid)}\n${nonce}\n${
+        startTime(process.pid) ?? "-"
+      }\n${String(threadId)}\n`;
       const until = Date.now() + (options.waitMs ?? WAIT_MS);
       // Known as held before it exists, so this process never judges its own
       // fresh lock stale.
@@ -247,18 +314,28 @@ export function leaseLock(options: LeaseLockOptions): LeaseLock {
         heldNonces.delete(nonce);
         throw error;
       }
-      const held = async (): Promise<boolean> =>
+      /** The current generation, and still this holder's text. */
+      const ownsTop = async (): Promise<boolean> =>
         (await leaseGenerations(root))[0] === generation &&
         (await inspect(generation))?.text === mine;
-      // Older generations, only below this one, and this holder's leftovers.
+      /** And fresh: moved on less than half the stale time ago (a resumed holder isn't). */
+      const held = async (): Promise<boolean> => {
+        if ((await leaseGenerations(root))[0] !== generation) return false;
+        const seen = await inspect(generation);
+        if (seen?.text !== mine) return false;
+        return (await fileSystemNow()) - seen.mtimeMs < staleMs / 2;
+      };
+      // Older generations, only below this one; and temporary and probe
+      // files left by crashed processes, by the file system's clock.
       try {
+        const now = await fileSystemNow();
         for (const name of await readdir(root)) {
           const match = GENERATION.exec(name);
           if (match?.[1] !== undefined && Number(match[1]) < generation) {
             await rm(join(root, name), { force: true });
-          } else if (TEMPORARY.test(name)) {
+          } else if (TEMPORARY.test(name) || PROBE.test(name)) {
             const info = await lstat(join(root, name)).catch(() => undefined);
-            if (info !== undefined && Date.now() - info.mtimeMs > staleMs) {
+            if (info?.isFile() === true && now - info.mtimeMs > staleMs) {
               await rm(join(root, name), { force: true });
             }
           }
@@ -272,7 +349,7 @@ export function leaseLock(options: LeaseLockOptions): LeaseLock {
           clearInterval(beat);
           return;
         }
-        void held()
+        void ownsTop()
           .then(async (still) => {
             if (!still) return;
             const now = (await fileSystemNow()) / 1000;
@@ -288,7 +365,7 @@ export function leaseLock(options: LeaseLockOptions): LeaseLock {
         // Released by saying so in its own file, only while it is still the
         // current generation and its own: a later taker makes the next one.
         try {
-          if (await held()) {
+          if (await ownsTop()) {
             await writeFile(nameOf(generation), "released\n", { mode: 0o600 });
           }
         } catch {

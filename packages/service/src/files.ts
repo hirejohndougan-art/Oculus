@@ -282,7 +282,7 @@ export type { PurgeProblem };
  * database moved its lease, or this one was restored or copied
  * (`files_shared_or_restored`); the epoch is ours but the marker names
  * another identity (`files_identity_changed`: a pg_upgrade, a move, or a
- * logical copy: accept or adopt); this role can't read the cluster's
+ * logical copy: only an adopt goes on); this role can't read the cluster's
  * identity (`files_identity_unknown`: the purge never runs); or another
  * server held the lease lock (`files_lease_busy`: the hourly renewal tries
  * again).
@@ -720,7 +720,9 @@ export function fileOperations(
     const identity = await databaseIdentity(db);
     for (let attempt = 0; attempt < 3; attempt++) {
       const epoch = randomUUID();
-      const renewed = await store.withLeaseLock(async () => {
+      const renewed = await store.withLeaseLock(async (held) => {
+        // Still this holder's (not paused past it) before anything is written.
+        if (!(await held())) throw new LeaseLockBusy();
         const moved = await db.transaction(async (tx) => {
           await lockFileStoreLease(tx);
           const marker = await store.readMarker();
@@ -731,21 +733,25 @@ export function fileOperations(
           // The epoch is ours but the marker names another identity (this
           // database after a pg_upgrade or a dump-and-restore, or a copy of the
           // one that uses the folder): nothing is written, so a copy that
-          // starts takes nothing from the folder's owner, until a system
-          // manager accepts the identity (S-052 second review).
+          // starts takes nothing from the folder's owner, until an operator
+          // adopts the folder (S-052 second and fourth reviews).
           if (marker.database !== identity) return "identity_changed" as const;
           await insertFileStoreEpoch(tx, epoch, "renew", identity);
           return "moved" as const;
         });
         if (moved === undefined || moved === "identity_changed") return moved;
+        // (Committed, but not held any more: the marker is left as it is,
+        // and the next renewal finds the two apart, the safe way.)
+        if (!(await held())) throw new LeaseLockBusy();
         await store.replaceMarker({ storeId: bound, database: identity, epoch });
         return identityKnown(identity) ? ("held" as const) : ("identity_unknown" as const);
       });
       if (renewed !== undefined) return renewed;
       if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 1000));
     }
-    await store.withLeaseLock(async () => {
+    await store.withLeaseLock(async (held) => {
       const marker = await store.readMarker();
+      if (!(await held())) throw new LeaseLockBusy();
       if (marker?.storeId === bound && marker.database?.startsWith(POISONED) !== true) {
         await store.replaceMarker({
           storeId: bound,
@@ -1118,18 +1124,25 @@ export function fileOperations(
         return { ok: false, problem: "other_install" };
       // Another database still moving the epoch: not now. This is also the
       // only way on after a pg_upgrade or any other identity change (S-052
-      // fourth review: no accepting without the wait).
+      // fourth review): the marker must have stood still for three hours.
       const age = await store.markerAge();
       if (age === undefined || age < ADOPT_QUIET_MS) return { ok: false, problem: "epoch_moving" };
       const identity = await databaseIdentity(db);
       const epoch = randomUUID();
-      await store.withLeaseLock(async () => {
+      const adopted = await store.withLeaseLock(async (stillHeld) => {
+        // Looked at again inside the lock: nothing may have moved the marker
+        // since (fifth review).
+        const quiet = await store.markerAge();
+        if (quiet === undefined || quiet < ADOPT_QUIET_MS || !(await stillHeld())) return false;
         await db.transaction(async (tx) => {
           await lockFileStoreLease(tx);
           await insertFileStoreEpoch(tx, epoch, "adopt", identity);
         });
+        if (!(await stillHeld())) return false;
         await store.replaceMarker({ storeId: held, database: identity, epoch });
+        return true;
       });
+      if (!adopted) return { ok: false, problem: "epoch_moving" };
       store.bind(held);
       return { ok: true };
     },

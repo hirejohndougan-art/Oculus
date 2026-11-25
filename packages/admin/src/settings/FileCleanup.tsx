@@ -44,6 +44,7 @@ const PROBLEMS: Readonly<Record<string, string>> = {
     "The files folder names another database. If this database server was upgraded (pg_upgrade) or moved, someone on the server stops every other Oculus using the folder and runs npm run files:adopt (it waits for three quiet hours); files removed before then are kept. If it is a copy of the database that uses the folder, leave it.",
   identity_unknown:
     "Oculus can't read this database server's identity, so a copy restored elsewhere couldn't be told apart, and nothing is cleaned up. Ask whoever runs the database to let Oculus's role read it (EXECUTE on pg_control_system()).",
+  lease_busy: "Something else is working on the files folder right now. Try again in a minute.",
   mtime_unreliable:
     "The disk the files folder is on doesn't keep file times exactly enough to tell whether a file was used again, so nothing is cleaned up on it.",
 };

@@ -718,6 +718,9 @@ describe("the S-052 review's store changes", () => {
     // Nor are lock files counted as the folder's content.
     const empty = mkdtempSync(join(tmpdir(), "oculus-store-lock-"));
     writeFileSync(join(empty, `${LEASE_LOCK}.1`), "x");
+    // Nor a clock probe a crash left (L-d).
+    writeFileSync(join(empty, ".now-0123456789abcdef"), "");
+    writeFileSync(join(empty, ".mtime-0123456789abcdef"), "");
     expect(await (await openFileStore({ dir: empty })).isEmpty()).toBe(true);
     rmSync(empty, { recursive: true, force: true });
   });
