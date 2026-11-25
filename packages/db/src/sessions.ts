@@ -16,8 +16,9 @@
  *   in one spelling (core's `isSessionToken`; anything else is refused
  *   before the database is asked). A new token at promotion, at a change of
  *   organization (a new session), at re-entering the password and on
- *   `rotateSession` (T-019d's site unlocks and T-041's role changes call
- *   it). An old token stops working the moment the change commits.
+ *   `rotateSession` (T-019d's site unlocks will call it; role changes don't
+ *   need it, D-069's S-060a amendment). An old token stops working the
+ *   moment the change commits.
  * - **Time limits in the query.** Every lookup has the database decide, by
  *   its own clock: `expires_at` (absolute, from the password) and
  *   `last_seen_at + idle_seconds`, and `session_access_ok`: the account is
@@ -811,9 +812,11 @@ export async function resolveSession(
 }
 
 /**
- * Gives a full session a new token (ASVS 5.0 7.2.4): for any change of what
- * it may do (T-019d's site unlocks, T-041's role changes). The old token
- * stops working at once.
+ * Gives a full session a new token (ASVS 5.0 7.2.4) when the session itself
+ * gains something (T-019d's site unlocks). The old token stops working at
+ * once. Role changes don't call it (D-069's S-060a amendment): roles are
+ * read from the database by every operation, never kept in the session, and
+ * a new token for another person's session could only sign them out.
  */
 export async function rotateSession(
   db: Queryable,
