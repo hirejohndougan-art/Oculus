@@ -9,11 +9,12 @@
  *
  * Viewing and downloading (M-003, D-097): every file has a Download link
  * (the server always sends it as an attachment); JPEG, PNG, GIF and WebP
- * files show a thumbnail the server made (a "View" placeholder when it
- * can't make one) and open in a simple viewer (FileViewer.tsx). Which files are images is decided by the type
+ * files show a placeholder naming their format (server-side thumbnails are
+ * off until T-072, D-097) and open in a simple viewer (FileViewer.tsx),
+ * where the browser shows the image itself. Which files are images is decided by the type
  * the server sniffed from the bytes, never by the name.
  */
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { Button as AriaButton, FileTrigger } from "react-aria-components";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, api, problemText, uploadFile } from "../api";
@@ -50,53 +51,13 @@ const VIEWABLE = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"])
 
 const previewId = (fileId: string) => `preview-${fileId}`;
 
-/**
- * A thumbnail, loaded lazily (only when it scrolls into view). When it
- * fails, a HEAD request asks why: 422 means the server makes none (a
- * placeholder from then on); anything else (busy, a fault) is tried again
- * a little later, twice at most.
- */
-function Thumbnail(props: { readonly url: string }) {
-  const [attempt, setAttempt] = useState(0);
-  const [none, setNone] = useState(false);
-  const live = useRef(true);
-  useEffect(() => {
-    live.current = true;
-    return () => {
-      live.current = false;
-    };
-  }, []);
-  if (none) return <span className={styles.thumbPlaceholder}>View</span>;
-  return (
-    <img
-      className={styles.thumb}
-      loading="lazy"
-      src={attempt === 0 ? props.url : `${props.url}&attempt=${String(attempt)}`}
-      alt=""
-      onError={() => {
-        void (async () => {
-          let status = 0;
-          try {
-            status = (await fetch(props.url, { method: "HEAD" })).status;
-          } catch {
-            // Offline: tried again below.
-          }
-          if (!live.current) return;
-          if (status === 422 || status === 404 || attempt >= 2) {
-            setNone(true);
-            return;
-          }
-          setTimeout(
-            () => {
-              if (live.current) setAttempt((a) => a + 1);
-            },
-            4000 * (attempt + 1),
-          );
-        })();
-      }}
-    />
-  );
-}
+/** The placeholder's label: the image's format (server-side thumbnails are off until T-072). */
+const FORMAT_LABELS: Readonly<Record<string, string>> = {
+  "image/jpeg": "JPEG",
+  "image/png": "PNG",
+  "image/gif": "GIF",
+  "image/webp": "WebP",
+};
 
 export const filesKey = (recordId: string) => ["record", recordId, "files"] as const;
 
@@ -403,7 +364,9 @@ export function FilesPanel(props: Props) {
                           setViewing(images.indexOf(f));
                         }}
                       >
-                        <Thumbnail url={`${fileUrl(recordId, f.id, "thumbnail")}?size=small`} />
+                        <span className={styles.thumbPlaceholder}>
+                          {FORMAT_LABELS[f.mediaType] ?? "View"}
+                        </span>
                       </AriaButton>
                     ) : (
                       <span className={styles.meta}>None</span>

@@ -376,6 +376,11 @@ export interface ServiceOptions {
    */
   readonly thumbnailLimits?: { readonly atOnce?: number; readonly perMinute?: number };
   /**
+   * Whether thumbnails are made at all (default `THUMBNAILS_ENABLED`, off
+   * until T-072, D-097). Only tests of the code kept for T-072 turn it on.
+   */
+  readonly thumbnailsEnabled?: boolean;
+  /**
    * The most published records a Dublin Core mapping change lists one by
    * one; past it, the change is confirmed by its count (S-039). Default
    * `MAX_AFFECTED_PUBLISHED`; tests set it low.
@@ -3011,6 +3016,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
       clock,
       options.thumbnails,
       options.thumbnailLimits,
+      options.thumbnailsEnabled,
     ),
     ...shareOperations(db, run, outside),
     submitForReview: workflowAction("submit_for_review"),

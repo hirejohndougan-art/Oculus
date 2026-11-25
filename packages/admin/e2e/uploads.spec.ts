@@ -3,7 +3,8 @@
 // a Scanner signs in, opens the site's invented photograph record, adds an
 // image through the file chooser opened with Enter, watches it go up and
 // sees it listed with the type Oculus found in its bytes. Then (M-003,
-// D-097) its thumbnail appears, the preview opens and closes by keyboard,
+// D-097) its preview button appears (a placeholder naming its format:
+// server-side thumbnails are off until T-072), the preview opens and closes by keyboard,
 // and the download link saves the same bytes. Siteimprove Alfa's rules run
 // at each step; no CSP refusal or script error may happen.
 // With OCULUS_E2E_SHOTS set, screenshots are saved in that folder.
@@ -116,7 +117,7 @@ test("a Scanner adds an image to a digital asset by keyboard", async ({ page }) 
   await accessible(page, "Asset with a file");
   await shot(page, "02-asset-with-file");
 
-  // M-003: a second, larger image, then its thumbnail, the viewer and a download.
+  // M-003: a second, larger image, then its preview button, the viewer and a download.
   const second = page.waitForResponse(
     (r) => /\/api\/records\/[0-9a-f-]{36}\/files$/.test(r.url()) && r.request().method() === "POST",
   );
@@ -129,11 +130,11 @@ test("a Scanner adds an image to a digital asset by keyboard", async ({ page }) 
   expect((await second).status()).toBe(201);
   const preview = files.getByRole("button", { name: "Preview harbour view.png" });
   await expect(preview).toBeVisible();
-  const thumbnail = preview.locator("img");
-  await expect(thumbnail).toHaveJSProperty("complete", true);
-  expect(await thumbnail.evaluate((img: HTMLImageElement) => img.naturalWidth)).toBe(160);
-  await accessible(page, "Asset with thumbnails");
-  await shot(page, "03-thumbnails");
+  await expect(preview).toContainText("PNG");
+  // No thumbnail is asked for (T-072).
+  expect(await files.locator("table img").count()).toBe(0);
+  await accessible(page, "Asset with image placeholders");
+  await shot(page, "03-placeholders");
 
   // The viewer opens from the keyboard, moves to the next image and closes with Escape.
   await preview.focus();
@@ -153,7 +154,7 @@ test("a Scanner adds an image to a digital asset by keyboard", async ({ page }) 
   ).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(files.getByRole("region", { name: /^Preview of/ })).toHaveCount(0);
-  // The focus goes to the thumbnail of the image shown last.
+  // The focus goes to the preview button of the image shown last.
   await expect(files.getByRole("button", { name: "Preview depot photograph.png" })).toBeFocused();
 
   // The download link saves the file's own bytes under its name.

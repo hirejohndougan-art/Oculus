@@ -158,6 +158,14 @@ export const VIEW_HEADER_BYTES = 1024 * 1024;
 /** The largest GIF shown inline (16 MiB): read whole to find every frame's extent. */
 export const VIEW_GIF_BYTES = 16 * 1024 * 1024;
 
+/**
+ * Server-side thumbnails are off (D-097): three ways around the decode
+ * memory budget were found, and they come back with T-072 ("Safe
+ * server-side thumbnails"). While off, `fileThumbnail` answers
+ * `no_thumbnail` for every file and no worker is ever started.
+ */
+export const THUMBNAILS_ENABLED = false;
+
 /** How long a thumbnail that took too long is left before it is tried again (24 hours). */
 export const THUMBNAIL_RETRY_MS = 24 * 3600 * 1000;
 
@@ -350,6 +358,7 @@ export function fileOperations(
   clock: () => Date,
   thumbnails?: ThumbnailRenderer,
   thumbnailLimits: { readonly atOnce?: number; readonly perMinute?: number } = {},
+  thumbnailsEnabled: boolean = THUMBNAILS_ENABLED,
 ): FileOperations {
   const atOnce = thumbnailLimits.atOnce ?? THUMBNAILS_AT_ONCE;
   const perMinute = thumbnailLimits.perMinute ?? THUMBNAILS_PER_MINUTE;
@@ -863,6 +872,10 @@ export function fileOperations(
       const found = await readable(context, "fileThumbnail", recordId, fileId);
       if (!found.ok) return found;
       const { file, organizationId } = found.value;
+      // Off until T-072 (D-097): every file, after the same checks as any
+      // read (so a hidden file is still the same 404), has no thumbnail, and
+      // nothing is read, cached or decoded.
+      if (!thumbnailsEnabled) return noThumbnail();
       if (!THUMBNAIL_TYPES.has(file.mediaType) || file.size > MAX_THUMBNAIL_SOURCE_BYTES) {
         return noThumbnail();
       }
