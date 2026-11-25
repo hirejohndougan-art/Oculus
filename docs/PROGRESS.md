@@ -6,7 +6,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
 - **Done:** S-046: no datestamp is computed from record versions any more (`oaiDatestamp` removed); a record with no stored row answers GetRecord at the site's lower bound. S-047: since S-041 only records a site has shown have rows, so a run of skipped ones says nothing about never-public records; a record no longer shown is skipped (GetRecord `idDoesNotExist`) until the next pass marks it deleted, so one restored in between is never reported deleted (review fix). S-051: list reads take a per-call `timeLimitMs` bounded by the page, no `lock_timeout`; OAI-PMH has its own 2-connection pool (`oaiPoolOptions`) with a bounded wait, and the public and OAI pools give up client-side after 90 s (`queryTimeoutMillis`). D-108 amended.
 - Reviewed by an independent reviewer; the one blocking finding (deleted headers for unmarked rows) fixed and tested.
-- Gate: TBD
+- Gate: PASS (tests_passing 4993, 10 e2e specs; baseline raised from 4990).
 
 ## 2026-11-25 09:55 CT — build (BUILD MODE) — S-045 Four wrong codes a day never raise an alert
 - Result: done (the `last_sign_in_at` half split off as S-053)
