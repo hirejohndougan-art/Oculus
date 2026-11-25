@@ -7,7 +7,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - What changed: migration 0036 adds `public.shared_record_home` (SECURITY DEFINER, in `PUBLIC_READER_FUNCTIONS`); `readSharedPublicRecord` in workflow.ts reads an accepted item's home public output in one Repeatable Read snapshot; `GET /records/:id` falls back to it and adds `sharedFrom`. `record_public_on_site` is unchanged, so OAI-PMH and subject counts don't list shared items.
 - Decisions: D-111
 - Review: two independent rounds, nothing blocking in either; fixed an ambiguous-ID case (`LIMIT 1` with no order, and a site's own record sharing an ID with a shared one), documented the migration order, the two reads and their cost, and added tests (exact equality with the home output, a moved item reading as the site's own, an accepted item without a stored mapping, and two ID clashes made by direct SQL).
-- Gate: PASS · tests_passing TBD (was 4734) · npm audit clean
+- Gate: PASS · tests_passing 4756 (was 4734) · npm audit clean
 - Next: the next free job on the board
 
 ## 2026-11-25 03:00 CT — manual (Chat D) — S-042 Site managers see members whose role is on every site
