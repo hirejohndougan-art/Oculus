@@ -16,6 +16,7 @@
  */
 import { useEffect, useRef, useState, type SubmitEvent } from "react";
 import { useBlocker, useNavigate, useOutletContext, useParams } from "react-router";
+import { isSessionEnding, useUnsavedChanges } from "../idle/unsaved";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CheckboxButton, CheckboxField } from "react-aria-components";
 import { ApiError, api } from "../api";
@@ -210,8 +211,13 @@ function TemplateForm(props: {
   // Leaving with unsaved changes: ask in the app; the browser asks on reload.
   const blocker = useBlocker(
     ({ currentLocation, nextLocation }) =>
-      edited && !leaving.current && currentLocation.pathname !== nextLocation.pathname,
+      edited &&
+      !leaving.current &&
+      !isSessionEnding() &&
+      currentLocation.pathname !== nextLocation.pathname,
   );
+  // The idle warning says these changes will be lost (T-062, D-098).
+  useUnsavedChanges(edited);
   useEffect(() => {
     if (!edited) return undefined;
     const warn = (event: BeforeUnloadEvent) => {

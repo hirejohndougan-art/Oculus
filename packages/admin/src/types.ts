@@ -16,6 +16,10 @@ export interface Me {
   readonly email: string;
   readonly expiresAt: string;
   readonly idleExpiresAt: string;
+  /** How long the session may sit unused, in seconds (T-062, D-098). */
+  readonly idleSeconds?: number;
+  /** A short non-secret name for the session, for the tabs' messages (T-062, D-098). */
+  readonly sessionMarker?: string;
   readonly csrfToken: string | null;
   readonly sites: readonly SiteChoice[];
   /** Wrong two-step codes for this account in the last 30 days (D-077, D-085). */

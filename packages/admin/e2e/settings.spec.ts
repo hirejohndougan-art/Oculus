@@ -53,7 +53,7 @@ test("a system manager adds a site and reads the templates and the sign-in rules
 
   // The sign-in rules.
   await press(page, "Sign-in rules", "link");
-  await expect(page.getByLabel("Sign out after this many minutes unused")).toHaveValue("240");
+  await expect(page.getByLabel("Sign out after this many minutes unused")).toHaveValue("30");
   await accessible(page, "System settings: Sign-in rules");
 
   expect(errors).toEqual([]);

@@ -77,6 +77,7 @@
  * (T-045 adds those routes beside these, with `credentials: true` for the
  * 8 KiB limit, and writes the cookie through the reply's cookie writer).
  */
+import { createHash } from "node:crypto";
 import {
   checkCsrfToken,
   csrfTokenFor,
@@ -152,6 +153,50 @@ export interface StaffApiOptions {
 export const CSRF_HEADER = "x-oculus-csrf";
 /** The header naming the working site. */
 export const SITE_HEADER = "x-oculus-site";
+/**
+ * The header that marks a read as background (T-062, D-098): `1` on a GET
+ * the admin sends without the person doing anything (polling, a check of
+ * whether the session is still alive). Such a read is served as usual but
+ * isn't a use of the session, so it never holds off the idle limit. Only
+ * `1` is accepted; on a change it is refused, because a change is always a
+ * use. Sending it can only make a session end sooner, so it needs no proof.
+ */
+export const BACKGROUND_HEADER = "x-oculus-background";
+
+/**
+ * Whether the request counts as a use of the session (T-062, D-098):
+ * `false` for a GET marked with `X-Oculus-Background: 1`, and `false` for
+ * one the browser says came from another site (`Sec-Fetch-Site` other than
+ * `same-origin` or `none`), so a cross-site top-level navigation that
+ * carries the `SameSite=Lax` cookie can't keep a session going. Without
+ * `Sec-Fetch-Site` (older browsers, other clients) a request counts. The
+ * header with any value but `1`, or on a change, is `400 bad_request`.
+ */
+export function isActivity(request: OculusRequest): boolean {
+  const value = request.headers[BACKGROUND_HEADER];
+  const read = request.method === "GET" || request.method === "HEAD";
+  if (value !== undefined && (value !== "1" || !read)) {
+    throw new Refusal(400, "bad_request");
+  }
+  if (value !== undefined) return false;
+  const site = request.headers["sec-fetch-site"];
+  return site === undefined || site === "same-origin" || site === "none";
+}
+
+/**
+ * A short, non-secret name for a session that the admin's tabs put on their
+ * messages to each other (T-062, D-098), so a tab ignores another session's
+ * news: the first 16 base64url characters of a SHA-256 of the session's ID
+ * with a fixed label. The ID is random (UUIDv4) and is not the token, so
+ * this gives nothing that signs in; it changes with every new session
+ * (sign-in, switching organization).
+ */
+export function sessionMarker(sessionId: string): string {
+  return createHash("sha256")
+    .update(`oculus-idle-marker:${sessionId}`)
+    .digest("base64url")
+    .slice(0, 16);
+}
 
 const SYSTEM_CODE = /^E[A-Z0-9_]{1,40}$/;
 const SQLSTATE = /^[0-9A-Z]{5}$/;
@@ -448,7 +493,9 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
       if (unsafe && !checkCsrfToken(token, request.headers[CSRF_HEADER])) {
         throw new Refusal(403, "csrf_failed");
       }
+      const activity = isActivity(request);
       const resolved = await resolveSession(db, token, {
+        activity,
         onError: (error) => {
           log({ event: "session_error", ...redactedError(error) });
         },
@@ -521,6 +568,12 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
           systemAdmin: session.systemAdmin,
           expiresAt: session.expiresAt,
           idleExpiresAt: session.idleExpiresAt,
+          // The limit the admin's idle timer follows (T-062, D-098). The
+          // timer asks here with a use when the person is active, and with
+          // X-Oculus-Background: 1 to see whether the session still lives.
+          idleSeconds: session.idleSeconds,
+          idleSecondsLeft: session.idleSecondsLeft,
+          sessionMarker: sessionMarker(session.sessionId),
           recentlyAuthenticated: session.recentlyAuthenticated,
           // Derived from the cookie's token (D-069): the admin sends it back
           // in X-Oculus-CSRF on every change. Readable by this origin only.

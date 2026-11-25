@@ -82,6 +82,19 @@ describe("the Updates screen", () => {
     expect(screen.getByText(/a development build/)).toBeTruthy();
   });
 
+  it("reads the status as background, so its polling never holds off the idle sign-out (T-062)", async () => {
+    const sent = server({
+      configured: false,
+      runningVersion: null,
+      variables: ["OCULUS_UPDATE_DIR", "OCULUS_UPDATE_KEYS"],
+    });
+    renderAt("/settings/updates");
+    await screen.findByText(/Updates aren't set up on this server yet/);
+    const reads = sent.filter((s) => s.path === "/api/system/update");
+    expect(reads.length).toBeGreaterThan(0);
+    for (const read of reads) expect(read.headers["x-oculus-background"]).toBe("1");
+  });
+
   it("is a tab of System settings, which people who aren't system managers don't see", async () => {
     fakeServer({
       "GET /api/me": [200, me([A1])],
