@@ -424,9 +424,21 @@ describe("GET /oai on a public host", () => {
   });
 
   it("buildAdminServer mounts it with OCULUS_OAI_ADMIN_EMAIL only, and refuses a malformed one", async () => {
+    // Without the background counts' pool the lists would stay empty: refused.
+    await expect(
+      buildAdminServer({
+        db: w.db,
+        publicDb: reader,
+        env: envFor({ OCULUS_OAI_ADMIN_EMAIL: EMAIL }),
+        adminFiles: loadAdminFiles(dir),
+        log: () => undefined,
+      }),
+    ).rejects.toThrow(/countsDb/);
+    const counts = openDatabase(w.testDb.url, { max: 1 });
     const mounted = await buildAdminServer({
       db: w.db,
       publicDb: reader,
+      countsDb: counts,
       env: envFor({ OCULUS_OAI_ADMIN_EMAIL: EMAIL }),
       adminFiles: loadAdminFiles(dir),
       log: () => undefined,
@@ -440,6 +452,7 @@ describe("GET /oai on a public host", () => {
       expect((await oai("verb=Identify", "localhost", mounted)).statusCode).toBe(404);
     } finally {
       await mounted.close();
+      await counts.close();
     }
     const plain = await buildAdminServer({
       db: w.db,
@@ -598,6 +611,26 @@ describe("stored datestamps (S-041, D-108)", () => {
     // A record never shown is still unknown, never "deleted".
     const never = await oai(`verb=GetRecord&metadataPrefix=oai_dc&identifier=${PREFIX}${draft}`);
     expect(errorCode(never.body)).toBe("idDoesNotExist");
+    // Marked records are still known to ListMetadataFormats, and a `from`
+    // after the mark leaves it out.
+    const formats = await oai(`verb=ListMetadataFormats&identifier=${PREFIX}${gone}`);
+    expect(errorCode(formats.body)).toBeUndefined();
+    const later = await oai("verb=ListIdentifiers&metadataPrefix=oai_dc&from=2999-01-01");
+    expect(errorCode(later.body)).toBe("noRecordsMatch");
+  });
+
+  it("a record shown again loses its mark and gets a later datestamp", async () => {
+    const back = more[0] ?? "";
+    const before = (await storedStamps()).get(back);
+    expect(before?.deleted).toBe(true);
+    await publishAs(w, w.a, back, 3);
+    await stamps.check();
+    const after = (await storedStamps()).get(back);
+    expect(after?.deleted).toBe(false);
+    expect(Date.parse(after?.stamp ?? "")).toBeGreaterThan(Date.parse(before?.stamp ?? ""));
+    const get = await oai(`verb=GetRecord&metadataPrefix=oai_dc&identifier=${PREFIX}${back}`);
+    expect(get.body).toContain("<metadata>");
+    expect(get.body).not.toContain('status="deleted"');
   });
 });
 

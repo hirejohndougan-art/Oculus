@@ -93,6 +93,10 @@ export interface PublicSubjectsStatus {
   readonly counting: boolean;
   /** Whether a public host shows the counts now (false: none yet, or too far out of date). */
   readonly shown: boolean;
+  /** When OAI-PMH's datestamps were last brought up to date (null: never, or OAI-PMH off). */
+  readonly oaiStampedAt: string | null;
+  /** The last datestamp write that failed, if it came after the last that worked. */
+  readonly oaiProblem: { readonly code: string; readonly at: string } | null;
 }
 
 interface Good extends PublicSubjectsResult {
@@ -111,6 +115,9 @@ interface SiteState {
   /** When a change the counts served don't reflect was first seen. */
   changedSince?: number | undefined;
   problem?: { code: string; at: number } | undefined;
+  /** When the OAI-PMH datestamps were last written (S-041), and the last write that failed. */
+  oaiStamped?: number | undefined;
+  oaiProblem?: { code: string; at: number } | undefined;
   /** The marker the last refused count was tried at: not tried again at it until maxAgeMs. */
   refusedAt?: string | undefined;
   counting: boolean;
@@ -279,7 +286,18 @@ export class PublicSubjects {
       if (this.options.oaiStamps === true) {
         // From the same snapshot the counts came from: a record whose
         // oai_dc changed gets a new datestamp, one no longer shown is marked.
-        await writeOaiStamps(this.options.db, organizationId, siteId, result.value.fingerprints);
+        // A failed write is its own problem: the counts are still kept.
+        try {
+          await writeOaiStamps(this.options.db, organizationId, siteId, result.value.fingerprints);
+          state.oaiStamped = done;
+        } catch (error) {
+          state.oaiProblem = { code: "unavailable", at: this.clock() };
+          this.log({
+            event: "service_error",
+            operation: "oaiStamps",
+            name: error instanceof Error ? error.constructor.name.slice(0, 40) : "unknown",
+          });
+        }
       }
       const counts = result.value.counts;
       // The same public result keeps its asOf: a recount after staff work
@@ -341,6 +359,17 @@ export class PublicSubjects {
       lastProblem: problem,
       counting: state.counting,
       shown: this.forOrigin(state.site.origin) !== null,
+      // OAI-PMH's datestamps come from these counts (S-041): a site that
+      // can't be counted (too many records, too slow) keeps old ones.
+      oaiStampedAt:
+        this.options.oaiStamps === true && state.oaiStamped !== undefined
+          ? second(state.oaiStamped)
+          : null,
+      oaiProblem:
+        state.oaiProblem !== undefined &&
+        (state.oaiStamped === undefined || state.oaiProblem.at >= state.oaiStamped)
+          ? { code: state.oaiProblem.code, at: second(state.oaiProblem.at) }
+          : null,
     };
   }
 }

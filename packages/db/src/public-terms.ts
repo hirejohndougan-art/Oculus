@@ -419,7 +419,7 @@ function keyOf(term: ShownTerm): string {
  * A marker that changes whenever something a site's public output reads may
  * have changed in the organization (S-038): a record's version (every edit,
  * publish and withdraw writes one), its identifiers (saved without a new
- * version), a stored mapping, a template version, an identifier type.
+ * version), vocabulary terms (a label shown in stored values' place), a stored mapping, a template version, an identifier type.
  * Compared, never shown. Counts and versions catch every insert and delete;
  * the row versions (`xmin`) catch every update, whatever its `now()` (a
  * transaction's start, so a timestamp can go backwards). Its cost grows with
@@ -461,7 +461,9 @@ async function markerIn(tx: Queryable, org: OrganizationId): Promise<string> {
       (SELECT count(*)::text || ':' || coalesce(sum(xmin::text::numeric), 0)::text
          FROM public.record_identifiers WHERE organization_id = ${org}::uuid),
       (SELECT count(*)::text || ':' || coalesce(sum(xmin::text::numeric), 0)::text
-         FROM public.former_identifiers WHERE organization_id = ${org}::uuid)
+         FROM public.former_identifiers WHERE organization_id = ${org}::uuid),
+      (SELECT count(*)::text || ':' || coalesce(sum(xmin::text::numeric), 0)::text
+         FROM public.terms WHERE organization_id = ${org}::uuid)
     ) AS marker`);
   return row?.marker ?? "";
 }

@@ -452,10 +452,18 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
     if (metadataPrefix !== OAI_DC_PREFIX) return fail("cannotDisseminateFormat");
     // The stored datestamp; before the site's first background pass, the computed one.
     const stored = await oaiStoredStamp(options.db, site.organizationId, site.siteId, id);
-    const stamp =
-      stored !== undefined && !stored.deleted
-        ? stored.stamp
-        : await oaiDatestamp(options.db, site.organizationId, site.siteId, id);
+    // A record back since the last pass keeps the later of its mark and its
+    // computed datestamp, so it never goes backwards (review of S-041).
+    let stamp: string | undefined;
+    if (stored !== undefined && !stored.deleted) {
+      stamp = stored.stamp;
+    } else {
+      const computed = await oaiDatestamp(options.db, site.organizationId, site.siteId, id);
+      stamp =
+        stored === undefined || computed === undefined || computed > stored.stamp
+          ? computed
+          : stored.stamp;
+    }
     if (stamp === undefined) return fail("idDoesNotExist");
     return [
       "<GetRecord>",

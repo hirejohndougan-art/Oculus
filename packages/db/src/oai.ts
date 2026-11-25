@@ -20,7 +20,7 @@
  * record) or to vocabulary labels; D-105 says so.
  */
 import { isOrganizationId, isRecordId, isSiteId } from "@oculus/core";
-import type { Queryable } from "./client.js";
+import type { Database, Queryable } from "./client.js";
 import { sql, type Sql } from "./sql.js";
 
 /** The most candidates one call returns. */
@@ -82,7 +82,7 @@ function bad(): never {
  * on malformed arguments (the routes check theirs first).
  */
 export async function listPublishedForOai(
-  db: Queryable,
+  db: Database,
   organizationId: string,
   siteId: string,
   options: OaiListOptions,
@@ -93,7 +93,27 @@ export async function listPublishedForOai(
   if (after !== undefined && (!isRecordId(after.id) || !isStamp(after.stamp))) bad();
   if (from !== undefined && !isStamp(from)) bad();
   if (before !== undefined && !isStamp(before)) bad();
-  const rows = await db.rows<{ id: string; stamp: string; deleted: boolean }>(sql`
+  return db.transaction(async (tx) => {
+    // Wait for a datestamp write in progress to commit (SHARE conflicts with
+    // its ROW EXCLUSIVE): its rows carry a time from before they could be
+    // seen, so a list that ran meanwhile, with a later responseDate, would
+    // miss them for good (review of S-041). Bounded, never a hang.
+    await tx.execute(
+      sql`SELECT pg_catalog.set_config('lock_timeout', '30000', true),
+                 pg_catalog.set_config('statement_timeout', '30000', true)`,
+    );
+    await tx.execute(sql`LOCK TABLE public.oai_datestamps IN SHARE MODE`);
+    return listIn(tx, organizationId, siteId, options);
+  });
+}
+
+async function listIn(
+  tx: Queryable,
+  organizationId: string,
+  siteId: string,
+  { after, from, before, limit }: OaiListOptions,
+): Promise<OaiCandidate[]> {
+  const rows = await tx.rows<{ id: string; stamp: string; deleted: boolean }>(sql`
     SELECT d.record_id::text AS id, d.deleted,
            to_char(d.stamp AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS stamp
     FROM public.oai_datestamps d
@@ -120,7 +140,7 @@ export async function listPublishedForOai(
  * so the time is the write's own. Returns how many rows moved.
  */
 export async function writeOaiStamps(
-  db: Queryable,
+  db: Database,
   organizationId: string,
   siteId: string,
   shown: ReadonlyMap<string, string>,
@@ -133,8 +153,36 @@ export async function writeOaiStamps(
     ids.push(id);
     prints.push(print);
   }
-  const [row] = await db.rows<{ moved: string }>(sql`
-    WITH now_ms(at) AS (SELECT date_trunc('milliseconds', clock_timestamp())),
+  return db.transaction(async (tx) => {
+    // Bounded (a migration's lock can't hang the pass), and one writer per
+    // site at a time across server processes, so two can't deadlock.
+    await tx.execute(
+      sql`SELECT pg_catalog.set_config('lock_timeout', '30000', true),
+                 pg_catalog.set_config('statement_timeout', '60000', true)`,
+    );
+    await tx.execute(
+      sql`SELECT pg_catalog.pg_advisory_xact_lock(hashtextextended(${`oai:${siteId}`}, 0))`,
+    );
+    return writeIn(tx, organizationId, siteId, ids, prints);
+  });
+}
+
+async function writeIn(
+  tx: Queryable,
+  organizationId: string,
+  siteId: string,
+  ids: readonly string[],
+  prints: readonly string[],
+): Promise<number> {
+  const [row] = await tx.rows<{ moved: string }>(sql`
+    -- Never earlier than the site's latest datestamp, so a clock stepping
+    -- back can't give a change a datestamp harvesters have already passed.
+    WITH now_ms(at) AS (
+      SELECT greatest(
+        date_trunc('milliseconds', clock_timestamp()),
+        (SELECT max(d.stamp) + interval '1 millisecond' FROM public.oai_datestamps d
+          WHERE d.organization_id = ${organizationId}::uuid AND d.site_id = ${siteId}::uuid))
+    ),
     incoming(record_id, fingerprint) AS (
       SELECT * FROM unnest(${ids}::uuid[], ${prints}::text[])
     ),
