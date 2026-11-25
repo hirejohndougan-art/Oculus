@@ -2,6 +2,62 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 01:55 CT — Chat B — T-041c Shares: storage and the service (part of T-041b)
+- Result: done (T-041b continues as T-041d to T-041f)
+- What changed: migration 0024 (`record_shares`), `packages/db/src/shares.ts`, `publishedRecordView` (workflow.ts), `packages/service/src/shares.ts`: offer a published item to another site (any organization's), accept, decline, remove (the second site's manager), withdraw (home), lists, and a read-only view for the second site that is what the public could see, never through the record's own checks.
+- Decisions: D-094
+- Review: three independent rounds (the third found no leak). Fixed: the view copied raw values (links, rights notes, non-public numbers) and showed unpublished items; it then skipped public output's gates (home site, publish check, one snapshot); lock order; withdraw vs delete; moves onto the second site; concurrent offers; locking another organization's shares; trigger gaps; hidden shares filling lists; view errors thrown instead of refused. Left as S-036.
+- Gate: PASS · tests_passing 4611 (was 4591) · npm audit clean
+- Next: T-041d (shares over HTTP), then T-041e.
+
+## 2026-11-25 01:00 CT — manual (Chat D) — S-034a and S-034b Desktop follow-ups, parts one and two
+- Result: done (S-034 stays open for its other items)
+- What changed: S-034a: `exec.cmd` at the root and in packages/db (npm's `exec node …` scripts start under cmd.exe), `npm run desktop:password` (the ordinary reset with the console as the mailbox), launcher exit code 4 for "already starting/busy". S-034b: a `direct` tool runner for pg_dump/pg_restore where there's no `sh` (Windows; the POSIX watchdog unchanged), tools found in `%ProgramFiles%\\PostgreSQL\\<major>\\bin`, and the desktop backs up before every update that changes the database (fails closed; Ctrl+C stops it cleanly).
+- Decisions: D-099, D-102
+- Review: one independent round each. S-034a: busy also exits 4; wording. S-034b: nothing blocking; fail closed when the change list can't be read, signal handling for the pre-update backup, reasons on every failure. Filed: a rare restore hang at a chunk boundary (both runners, pre-existing) and pruning old backups (S-034 items 12, 13).
+- Gate: PASS · tests_passing 4591 (was 4580) · npm audit clean
+- Next: T-034e (Chat D, in review)
+
+## 2026-11-24 22:45 CT — manual (Chat F) — T-060 Updates from an uploaded package
+- Result: done
+- What changed: a strict ZIP reader and writer, signed packages (Ed25519 over a manifest of every file's SHA-256), `npm run release` (keygen, pack, verify, first install), an updates folder with releases, `current`, backups and history, staff API routes under `/api/system/update` (system managers; install and rollback need a fresh entry), and the admin's Updates screen with chunked upload and progress. Tried end to end in the sandbox: a 6.5 MB, 4,003-file package of this build installed into an empty folder, migrated a fresh database and started from `current`.
+- Decisions: D-092
+- Review: one independent round. Two blocking findings fixed: migrations ran with the app's writer URL (now an owner URL given only to the backup, migrate and new grant steps, which re-grants the writer after migrating; without it, database-changing updates are refused from the admin) and the release scripts did nothing when the updates folder's path held a link (now started by real paths). Also fixed: an atomic lock file removed only by its holder, one part written at a time, the screen retrying parts when rate-limited, failed steps' output kept in `logs/`, leftovers and old backups removed, no local extra fields, the writer's entry limit, bookkeeping after the switch no longer reported as a failure.
+- Gate: PASS (full gate, end-to-end included, after the review fixes) · tests_passing 4580 (was 4420) · npm audit clean
+- Next: T-060a filed (the change log); T-051 notes added for SiteGround. Renumbered twice: T-056/D-088 went to the desktop launcher and T-058 to IIIF while this was built.
+
+## 2026-11-25 00:40 CT — manual (Chat C) — T-050b Stored Dublin Core mappings
+- Result: done (the old T-050b split into T-050b, T-050d and T-050e)
+- What changed: migration 0022 (`dublin_core_mappings`, `public_dublin_core_mapping`); `packages/db/src/dublin-core-mappings.ts`; `readPublicRecord` uses the stored mapping when none is passed; service `readDublinCoreMapping`/`saveDublinCoreMapping`; `GET`/`PUT /api/templates/:key/dublin-core`.
+- Decisions: D-096
+- Review: one independent round, nothing blocking; fixed a mapping without rights taking records offline, the full record read under the lock, the version check passable by direct SQL, and two stale comments.
+- Gate: PASS · tests_passing 4420 (was 4411) · npm audit clean. Migration renumbered 0022 at merge (main stopped at 0021).
+- Next: T-050d (public record reads)
+
+## 2026-11-25 00:35 CT — manual (Chat E) — S-026 Publish check for ID number formats
+- Result: done
+- What changed: the publish check (`publishCheckIssues`) runs the public output's own template check (`publicTemplateIssues`, new in core), so a public ID number that no longer fits its type's changed format fails it (`format_mismatch`, fixed text) instead of the record passing and quietly dropping off the public sites; `identifierTypeChanges` takes `existing.published` and lists on `format_changed` the published records that would show as not available. Tests in core and against the database (publish check, public output, the fix path, inherited numbers). Follow-up S-033 (the service-side confirmation).
+- Decisions: D-091
+- Review: one independent round. Fixed: records that only inherit a misfit number were listed as going offline (they stay public without it; now tested against `readPublicRecord`); an error code; D-091 now says the publish check applies every template-check refusal. The missing service confirmation is S-033.
+- Gate: PASS · tests_passing 4411 (was 4405) · npm audit clean
+- Next: T-034d (public subject counts, Chat E)
+
+## 2026-11-25 00:15 CT — manual (Chat D) — T-057 Desktop database helper
+- Result: done
+- What changed: `npm run desktop:database` makes `oculus_owner`, `oculus_app` and the `oculus` database on the person's own PostgreSQL with the `postgres` password typed once (SCRAM verifiers, never plain passwords), keeps the passwords only in pgpass, writes `desktop.json` and runs setup; resumes an unfinished setup; undoes a failed creation. The launcher migrates as the owner, grants and checks the writer, and serves as the writer. `start-oculus.cmd` runs the helper the first time. `@oculus/db` exports `createDatabase`, `dropDatabase`, `runSetupCli`, `terminalAsk`.
+- Decisions: D-093
+- Review: two independent rounds; fixed the stuck unfinished setup, leftover pgpass lines, a non-UTF-8 pgpass being damaged, query keys overriding the new addresses, and the pre-grant check that would have refused a correct writer after an update. Left as S-034 (9, 10).
+- Gate: PASS · tests_passing 4405 (was 4391) · npm audit clean
+- Next: S-034 (desktop follow-ups), or the job pool
+
+## 2026-11-24 22:20 CT — manual (Chat C) — T-050a Hosts for the admin and the public sites
+- Result: done (T-050 split into T-050a to T-050c)
+- What changed: server rule 12, `/api` on the admin's host only; `OCULUS_ADMIN_ORIGIN` required in production; `OCULUS_PUBLIC_SITES` and the public reader pool (`OCULUS_PUBLIC_DATABASE_URL`, `publicDb`) checked at startup. New `packages/api/src/public-sites.ts`.
+- Decisions: D-090
+- Review: one independent round, nothing blocking; fixed the admin's hostname on another port passing as a public site, a site ID held by two organizations, a reader of another database, and shutdown closing only one pool; added an https-behind-proxy test.
+- Gate: PASS · tests_passing 4391 (was 4376) · npm audit clean. Main then moved by roadmap text only (4 lines); merged, with the format and lint checks re-run. A first run timed out once in `second-factor.test.ts` › "locks user rows before factor rows" under load (passes alone 3 of 3; this change doesn't touch the database package), like S-029.
+- Next: S-026 (T-050b needs stored Dublin Core mappings first)
+
 ## 2026-11-24 22:15 CT — Chat B — S-030 Regression tests for restore's retry path
 - Result: done
 - What changed: four tests that save a record from another session just before a restore takes its row lock: retry after the attempts with nothing written, success on the next attempt, a conflict when it keeps moving, and 503 `retry` over HTTP followed by a restore that goes through. Checked that they fail without the retry check.

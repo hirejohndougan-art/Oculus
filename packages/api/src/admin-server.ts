@@ -22,7 +22,12 @@
  *   the address (D-068's secrecy rule). A `mailer` or `deliverReset` passed
  *   in is used as it is;
  * - `OCULUS_ADMIN_ORIGIN` is set but isn't one of `OCULUS_ORIGINS`, or the
- *   admin build can't be read.
+ *   admin build can't be read; in production, it isn't set (T-050a, D-090:
+ *   the staff API is then answered on the admin's host only);
+ * - `OCULUS_PUBLIC_SITES` is wrong (public-sites.ts), names a site that
+ *   doesn't exist, or is set without a public reader connection
+ *   (`publicDb`); or that connection, whenever one is given, could read more
+ *   than the public read path (`checkPublicReaderConnection`, D-080).
  *
  * It warns loudly (a `startup_warning` log record) when the database
  * server's `log_parameter_max_length_on_error` is above 0, since pg's
@@ -45,13 +50,16 @@ import {
 import { createService } from "@oculus/service";
 import type { FastifyInstance } from "fastify";
 import { ADMIN_ORIGIN_ENV, loadAdminFiles, type AdminFiles } from "./admin-files.js";
+import { originsFromEnv } from "./origin.js";
 import { isProduction } from "./environment.js";
 import { mailerFromEnv, type Mailer } from "./mail.js";
 import { trustedProxyFromEnv } from "./proxy.js";
+import { PUBLIC_DATABASE_URL_ENV, checkPublicSites, publicSitesFromEnv } from "./public-sites.js";
 import type { OculusRoute } from "./routes.js";
 import { buildServer, type ServerOptions } from "./server.js";
 import { signInRoutes, type SignInApiOptions } from "./sign-in-api.js";
 import { serviceErrorLogger, staffApiRoutes, type ApiLogRecord } from "./staff-api.js";
+import { updateManagerFromEnv, type UpdateManager } from "./update-manager.js";
 
 export { isProduction };
 
@@ -69,6 +77,12 @@ export const DEFAULT_ADMIN_DIR = join(
 export interface AdminServerOptions {
   /** The writer's pool (D-067). */
   readonly db: Database;
+  /**
+   * The public sites' pool, connected as a public reader role (D-080,
+   * T-050a): checked at startup; required when `OCULUS_PUBLIC_SITES` lists
+   * any. Never used for anything else.
+   */
+  readonly publicDb?: Database;
   /** Defaults to `process.env`. */
   readonly env?: Readonly<Record<string, string | undefined>>;
   /**
@@ -98,6 +112,14 @@ export interface AdminServerOptions {
   readonly extraRoutes?: readonly OculusRoute[];
   /** Passed on to the sign-in routes (tests). */
   readonly signIn?: Pick<SignInApiOptions, "rateLimits" | "clock" | "resetOptions">;
+  /**
+   * Software updates (T-060, D-092). Default: built from `OCULUS_UPDATE_DIR`
+   * and the other `OCULUS_UPDATE_*` variables (none set: the screen says how
+   * to set it up). `null` turns the routes off (tests).
+   */
+  readonly updates?: UpdateManager | null;
+  /** Asked for after an install or rollback when `OCULUS_UPDATE_RESTART=exit` (admin-cli.ts). */
+  readonly requestRestart?: () => void;
 }
 
 /** The default log: one JSON line on standard error. */
@@ -156,6 +178,23 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   const deliverEnrolment = options.deliverEnrolment ?? mailer?.deliverEnrolment;
 
   const adminOrigin = env[ADMIN_ORIGIN_ENV];
+  if (production && (adminOrigin === undefined || adminOrigin === "")) {
+    throw new Error(
+      `refusing to start: ${ADMIN_ORIGIN_ENV} must name the admin's own origin in production, so the staff API answers on that host only (D-052, D-090).`,
+    );
+  }
+  // Public hosts and their reader (T-050a): checked now, so a wrong
+  // connection or site never serves a request. T-050b's public routes use them.
+  const publicHosts = publicSitesFromEnv(env, originsFromEnv(env), adminOrigin);
+  if (publicHosts.length > 0 && options.publicDb === undefined) {
+    throw new Error(
+      `refusing to start: OCULUS_PUBLIC_SITES lists public sites but ${PUBLIC_DATABASE_URL_ENV} gives no public reader connection (D-080).`,
+    );
+  }
+  if (options.publicDb !== undefined) {
+    await checkPublicSites(options.db, options.publicDb, publicHosts);
+  }
+
   let admin: ServerOptions["admin"];
   if (adminOrigin !== undefined && adminOrigin !== "") {
     admin = {
@@ -175,6 +214,24 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     log({ event: "startup_warning", code: "database_unreadable" });
   }
 
+  // D-092: a malformed update setting stops the start, naming the variable only.
+  const updates =
+    options.updates === null
+      ? null
+      : (options.updates ??
+        updateManagerFromEnv(env, {
+          ...(options.requestRestart === undefined
+            ? {}
+            : { requestRestart: options.requestRestart }),
+          log: (event, fields) => {
+            log({
+              event: "update_event",
+              operation: event,
+              ...(fields.version === undefined ? {} : { code: fields.version }),
+            });
+          },
+        }));
+
   const service = createService(options.db, { onError: serviceErrorLogger(log) });
   const routes = [
     ...staffApiRoutes({
@@ -188,6 +245,7 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
         ...(deliverInvitation === undefined ? {} : { deliverInvitation }),
         ...(deliverEnrolment === undefined ? {} : { deliverEnrolment }),
       },
+      ...(updates === null ? {} : { updates: { manager: updates } }),
     }),
     ...signInRoutes({
       db: options.db,

@@ -21,14 +21,24 @@
  * listens, the window, the server, the pool and the lock are closed.
  * Nothing printed shows the database URL's password or the secret key.
  *
- * Exit codes: 0 stopped normally, 1 refused or failed, 2 usage.
+ * Exit codes: 0 stopped normally, 1 refused or failed, 2 usage, 3 the
+ * database `npm run desktop:database` made still needs its setup questions,
+ * 4 another start is still starting or busy (nothing done; a message to read).
  */
 import { spawn as nodeSpawn } from "node:child_process";
+import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+  backup,
+  checkWriterConnection,
+  defaultMigrationsDir,
+  pendingMigrations,
+  readMigrations,
+  type AppliedMigration,
   databaseBeforeSetup,
+  grantWriterRole,
   migrate,
   MigrationError,
   openDatabase,
@@ -168,6 +178,90 @@ async function sealingKeyIds(db: Database): Promise<string[]> {
   return rows.map((r) => r.id);
 }
 
+/**
+ * If the code has migrations the database hasn't (an update), backs the
+ * database up first into the settings folder's `backups` (S-034b, D-102),
+ * so an update can be undone with `db:restore`. Returns false, having said
+ * why, if the backup couldn't be made: nothing is migrated then.
+ */
+async function backupBeforeUpdate(
+  db: Database,
+  connectionString: string,
+  folder: string,
+  env: Env,
+  out: Line,
+  err: Line,
+): Promise<boolean> {
+  let applied: AppliedMigration[];
+  try {
+    applied = await db.rows<AppliedMigration>(
+      sql`SELECT name, sha256 FROM public.oculus_migrations ORDER BY name`,
+    );
+  } catch {
+    // Fail closed: without the list, an update might run with no backup.
+    err("Couldn't read the database's list of changes, so nothing was changed. Try again.");
+    return false;
+  }
+  let pending: number;
+  try {
+    pending = pendingMigrations(await readMigrations(defaultMigrationsDir()), applied).length;
+  } catch {
+    // migrate() refuses the same way, before changing anything, and says why.
+    return true;
+  }
+  if (pending === 0) return true;
+  const dir = join(folder, "backups");
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const file = join(dir, `before-update-${stamp}.oculus-backup`);
+  out(`This update changes Oculus's database (${String(pending)} change(s)). Backing it up first…`);
+  // Ctrl+C or closing the console stops the backup cleanly (no partial file,
+  // no private folder left behind); nothing is migrated then.
+  const stop = new AbortController();
+  const signals = ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"] as const;
+  const onSignal = (): void => {
+    stop.abort();
+  };
+  for (const signal of signals) process.on(signal, onSignal);
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    await backup({
+      connectionString,
+      file,
+      env: { ...env },
+      signal: stop.signal,
+      log: (line) => {
+        if (/warn|could not|couldn't/i.test(line)) out(line);
+      },
+    });
+  } catch (error) {
+    const reason = error instanceof Error && error.message !== "" ? `: ${error.message}` : ".";
+    err(
+      `Couldn't back up the database before updating it${reason} Nothing was changed. To update without a backup, add "backupBeforeUpdate": false to desktop.json (or, if the PostgreSQL tools are somewhere unusual, set PG_BIN to their folder).`,
+    );
+    return false;
+  } finally {
+    for (const signal of signals) process.off(signal, onSignal);
+  }
+  out(`Backup saved: ${file}`);
+  return true;
+}
+
+/** Whether two connections reach the same database on the same running server. */
+async function sameDatabase(a: Database, b: Database): Promise<boolean> {
+  const where = sql`SELECT current_database() AS d, pg_postmaster_start_time()::text AS t,
+                           current_setting('port') AS p`;
+  const [x] = await a.rows<{ d: string; t: string; p: string }>(where);
+  const [y] = await b.rows<{ d: string; t: string; p: string }>(where);
+  return x !== undefined && x.d === y?.d && x.t === y.t && x.p === y.p;
+}
+
+/** The writer connection's role name. */
+async function writerRoleName(db: Database): Promise<string> {
+  const [row] = await db.rows<{ name: string }>(sql`SELECT current_user AS name`);
+  if (row === undefined) throw new Error("no role");
+  return row.name;
+}
+
 /** The fingerprints of the key in use and any previous keys still accepted. */
 function knownKeyIds(key: string, env: Env): Set<string> {
   const ids = new Set([loadSecretKeyring({ [SECRET_KEY_VARIABLE]: key }).currentKeyId]);
@@ -200,14 +294,28 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
 
   let folder: string;
   let url: string;
+  let ownerUrl: string | undefined;
+  let ownerFromSettings: boolean;
+  let backupFirst: boolean;
   let wantedPort: number;
   try {
     folder = settingsFolder(platform, env, options.home ?? homedir());
     ensureSettingsFolder(folder);
     const settings = readDesktopSettings(folder);
     url = chooseDatabaseUrl(env, settings, folder);
-    secrets.push(...passwordOf(url));
+    // The owner's address goes with the settings' writer address only: an
+    // OCULUS_DATABASE_URL given by hand is used for everything, as before.
+    const fromEnvUrl = env.OCULUS_DATABASE_URL;
+    ownerUrl =
+      env.OCULUS_DATABASE_OWNER_URL !== undefined && env.OCULUS_DATABASE_OWNER_URL !== ""
+        ? env.OCULUS_DATABASE_OWNER_URL
+        : fromEnvUrl !== undefined && fromEnvUrl.trim() !== ""
+          ? undefined
+          : settings.ownerDatabaseUrl;
+    ownerFromSettings = ownerUrl !== undefined && ownerUrl === settings.ownerDatabaseUrl;
+    secrets.push(...passwordOf(url), ...(ownerUrl === undefined ? [] : passwordOf(ownerUrl)));
     wantedPort = settings.port ?? DEFAULT_DESKTOP_PORT;
+    backupFirst = settings.backupBeforeUpdate !== false;
     const fromEnv = env.OCULUS_PORT;
     if (fromEnv !== undefined && fromEnv !== "") {
       const port = Number(fromEnv);
@@ -237,13 +345,13 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
   }
   if (lock.kind === "starting") {
     out("Oculus is already starting. Its window opens when it's ready.");
-    return 0;
+    return 4;
   }
   if (lock.kind === "busy") {
     out(
       "Oculus is already running but busy right now. Try again in a minute, or use its open window.",
     );
-    return 0;
+    return 4;
   }
   if (lock.kind === "running") {
     if (lock.lock.database !== database) {
@@ -271,6 +379,7 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
   const token = lock.lock.token;
 
   let db: Database | undefined;
+  let ownerDb: Database | undefined;
   let app: FastifyInstance | undefined;
   let window: WindowProcess | undefined;
   try {
@@ -280,15 +389,26 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
     }
     try {
       db = openDatabase(url, { applicationName: "oculus-desktop", max: 10 });
+      if (ownerUrl !== undefined) {
+        ownerDb = openDatabase(ownerUrl, { applicationName: "oculus-desktop-owner", max: 1 });
+      }
     } catch {
       err("The database address is not a usable postgresql:// URL (its value is not shown).");
       return 2;
     }
+    // The owner (when there is one) checks and migrates; the server connects as the writer.
+    const checker = ownerDb ?? db;
     let state: "empty" | "set_up" | "other";
     let sealedWith: string[] = [];
     try {
-      state = await databaseBeforeSetup(db);
-      if (state === "set_up") sealedWith = await sealingKeyIds(db);
+      if (ownerDb !== undefined && !(await sameDatabase(ownerDb, db))) {
+        err(
+          "The owner's and the app's database addresses in desktop.json point at different databases. Fix desktop.json.",
+        );
+        return 1;
+      }
+      state = await databaseBeforeSetup(checker);
+      if (state === "set_up") sealedWith = await sealingKeyIds(checker);
     } catch {
       err(
         "Can't reach the database. Check that PostgreSQL is running and that the address and pgpass password are right.",
@@ -296,6 +416,13 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
       return 1;
     }
     if (state === "empty") {
+      if (ownerFromSettings) {
+        // Made by `npm run desktop:database`, but its setup questions weren't finished.
+        err(
+          "Oculus's database is made, but the first-time setup wasn't finished. Run `npm run desktop:database` again to finish it (on Windows, start-oculus.cmd does this by itself).",
+        );
+        return 3;
+      }
       err(
         "This database hasn't been set up yet. Run `npm run setup` once (on Windows, `node packages\\db\\dist\\setup-cli.js`), with OCULUS_DATABASE_URL set to the same database, then start Oculus again.",
       );
@@ -329,10 +456,39 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
       }
       throw error;
     }
+    if (backupFirst) {
+      const made = await backupBeforeUpdate(checker, ownerUrl ?? url, folder, env, out, err);
+      if (!made) return 1;
+    }
     try {
-      const result = await migrate({ connectionString: url, log: out });
+      const result = await migrate({ connectionString: ownerUrl ?? url, log: out });
       if (result.applied.length > 0) {
         out(`Updated the database (${String(result.applied.length)} change(s)).`);
+      }
+      if (ownerDb !== undefined) {
+        const owner = ownerDb;
+        const server = db;
+        // Checked before granting, so a role that isn't a plain writer (a
+        // hand-edited desktop.json naming another account) is never given
+        // the writer's grants; then granted (new tables from new migrations
+        // need them, D-067) and checked again.
+        const refuse = (problems: readonly { code: string }[]): number => {
+          err(
+            `The app's database account isn't the plain writer Oculus needs (${problems.map((p) => p.code).join(", ")}). It must be the role made for Oculus (D-067).`,
+          );
+          return 1;
+        };
+        // Before granting, only extra power counts: a privilege a new
+        // migration's table still lacks is exactly what the grant adds.
+        const before = (await checkWriterConnection(server)).filter(
+          (p) => p.code !== "missing_privilege",
+        );
+        if (before.length > 0) return refuse(before);
+        await owner.transaction(async (tx) => {
+          await grantWriterRole(tx, await writerRoleName(server));
+        });
+        const after = await checkWriterConnection(server);
+        if (after.length > 0) return refuse(after);
       }
     } catch (error) {
       err(
@@ -448,6 +604,7 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
     }
     try {
       await db?.close();
+      await ownerDb?.close();
     } catch {
       // As above.
     }

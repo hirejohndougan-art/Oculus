@@ -17,7 +17,13 @@
  */
 export { sql, joinSql, isSql, Sql, MAX_PARAMETERS } from "./sql.js";
 export type { SqlScalar, SqlValue } from "./sql.js";
-export { openDatabase, typeParsers, ConnectionLostError } from "./client.js";
+export {
+  openDatabase,
+  typeParsers,
+  ConnectionLostError,
+  createDatabase,
+  dropDatabase,
+} from "./client.js";
 export type { Database, DatabaseOptions, Queryable, Row } from "./client.js";
 export {
   migrate,
@@ -160,6 +166,12 @@ export {
   MAX_AFFECTED_PUBLISHED,
 } from "./definitions.js";
 export type { TemplateSummary } from "./definitions.js";
+export {
+  publishedUsingTemplate,
+  readDublinCoreMapping,
+  writeDublinCoreMapping,
+} from "./dublin-core-mappings.js";
+export type { StoredDublinCoreMapping } from "./dublin-core-mappings.js";
 export {
   searchRecords,
   MAX_SEARCH_QUERY_LENGTH,
@@ -401,3 +413,7 @@ export {
   sharesOfRecord,
 } from "./shares.js";
 export type { Share, ShareState, SharedItemView } from "./shares.js";
+export { runSetupCli, terminalAsk } from "./setup-cli.js";
+export type { Ask } from "./setup-cli.js";
+export { backup, BackupError } from "./backup.js";
+export type { BackupOptions, BackupResult } from "./backup.js";

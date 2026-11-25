@@ -16,6 +16,10 @@
  * transaction, never handed in (D-054): the record's ancestry and
  * represented records, the records its values link to, the templates of all
  * of them, the organization's identifier types and the record's identifiers.
+ * It also runs the public output's template check on the public values
+ * (`publicTemplateIssues`, S-026, D-091), so a record `readPublicRecord`
+ * would refuse, such as one showing a number that no longer fits its
+ * type's changed format, fails the publish check too.
  * The service runs it before publishing and after every write of a
  * published record (an edit, a restore, an identifier change), refusing the
  * write when it fails.
@@ -50,6 +54,7 @@ import {
   makeIdentifierChecker,
   makeRecordLinkChecker,
   publicOutput,
+  publicTemplateIssues,
   publicView,
   type PublicRecord,
   validateRecord,
@@ -564,7 +569,12 @@ export async function publishCheckIssues(
       issue(i.path, i.code, "The record or a record above it can't be read for publishing."),
     );
   }
-  return effectivePublishIssues(effective.value, { accessions: s.accessions });
+  const blocked = effectivePublishIssues(effective.value, { accessions: s.accessions });
+  // The public output's own template check, with the same checkers, so a
+  // record it would refuse (a number that no longer fits a changed format:
+  // S-026, D-091) fails here too, after every other reason.
+  const template = publicTemplateIssues(effective.value, s.checkers);
+  return template.length === 0 ? blocked : Object.freeze([...blocked, ...template]);
 }
 
 /**
@@ -780,9 +790,11 @@ export interface PublicRecordOptions {
   /**
    * The organization's Dublin Core mappings; the one for the record's
    * template is used. Configuration, not record data: `publicOutput` checks
-   * it against the template and the organization (D-047).
+   * it against the template and the organization (D-047). Left out: the
+   * template's stored mapping (T-050b, D-096), read in the same snapshot
+   * through `public_dublin_core_mapping`, which the public reader may call.
    */
-  readonly mappings: readonly DublinCoreMapping[];
+  readonly mappings?: readonly DublinCoreMapping[];
 }
 
 /** The answer for a record that isn't published, doesn't exist or is another organization's. */
@@ -859,10 +871,11 @@ function publicSource(org: OrganizationId, row: PublicSnapshotRow): SnapshotSour
  * records public on the same site; anything else goes out as nothing
  * (D-045, D-048).
  *
- * Everything is read through one call of the database function
- * `public_record_snapshot` (SECURITY DEFINER, migration 0017) in a
+ * Everything is read through the database functions
+ * `public_record_snapshot` (SECURITY DEFINER, migration 0017) and, when no
+ * `mappings` are given, `public_dublin_core_mapping` (0022, D-096), in one
  * Repeatable Read, read-only transaction, so the state, the records, the
- * templates and the identifiers all come from one moment, and the
+ * templates, the identifiers and the mapping all come from one moment, and the
  * connection needs no table privilege at all: use a role made by
  * `grantPublicReaderRole` and checked by `checkPublicReaderConnection`
  * (roles.ts). It writes nothing.
@@ -886,8 +899,8 @@ export async function readPublicRecord(
   }
   const baseUrl = ownValue(options, "baseUrl");
   const mappings = ownValue(options, "mappings");
-  if (typeof baseUrl !== "string" || !Array.isArray(mappings)) {
-    return refused([], "invalid_options", "Give { baseUrl, mappings }.");
+  if (typeof baseUrl !== "string" || (mappings !== undefined && !Array.isArray(mappings))) {
+    return refused([], "invalid_options", "Give { baseUrl, mappings? }.");
   }
   return db.transaction(async (tx) => {
     // One snapshot for every read below, and nothing written.
@@ -919,9 +932,19 @@ export async function readPublicRecord(
     if (!effective.ok) return refused([], "unreadable_record", CANT_CHECK);
     const view = publicView(effective.value);
     if (view === undefined) return refused([], "unreadable_record", CANT_CHECK);
-    const mapping = (mappings as readonly unknown[]).find(
-      (m) => ownValue(m, "template") === record.templateKey,
-    );
+    let mapping: unknown;
+    if (mappings === undefined) {
+      // The stored one, from the same snapshot (Repeatable Read, above).
+      const [stored] = await tx.rows<{ mapping: unknown }>(sql`
+        SELECT public.public_dublin_core_mapping(${organizationId}::uuid, ${siteId}::uuid,
+                                                 ${recordId}::uuid) AS mapping`);
+      mapping = stored?.mapping ?? undefined;
+      if (mapping === null) mapping = undefined;
+    } else {
+      mapping = (mappings as readonly unknown[]).find(
+        (m) => ownValue(m, "template") === record.templateKey,
+      );
+    }
     if (mapping === undefined) {
       return refused(
         ["mappings"],

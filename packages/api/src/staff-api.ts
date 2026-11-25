@@ -65,6 +65,12 @@
  * the changes also need a recent sign-in (`403 reauthentication_required`).
  * An unknown site is `404 not_found`.
  *
+ * Dublin Core mappings (T-050b, D-096): `GET`/`PUT
+ * /api/templates/:key/dublin-core`, a template's stored mapping
+ * (`If-None-Match: *` for the first, `If-Match: "v<N>"` after; a change
+ * shown at once on published records answers `409 confirmation_required`
+ * until `confirmPublished`).
+ *
  * Not here: signing in, the second step, password reset and signing out
  * (T-045 adds those routes beside these, with `credentials: true` for the
  * 8 KiB limit, and writes the cookie through the reply's cookie writer).
@@ -89,6 +95,7 @@ import { OCULUS_COOKIES } from "./cookies.js";
 import { Refusal } from "./errors.js";
 import type { OculusReply, OculusRequest, OculusRoute } from "./routes.js";
 import { peopleApiRoutes, type PeopleApiOptions } from "./people-api.js";
+import { updateApiRoutes, type UpdateApiOptions } from "./update-api.js";
 import { DEFAULT_RATE_LIMITS, SessionRateLimiter, type RateBucket } from "./rate-limit.js";
 
 /** A fixed-shape log record: never an error object, a token, a body or a query. */
@@ -111,7 +118,9 @@ export interface ApiLogRecord {
     | "mail_dropped"
     | "mail_dev"
     // The two-step alert notices (alert-notices.ts): people notified, as `code`.
-    | "alert_notices";
+    | "alert_notices"
+    // Software updates (T-060): the step in `operation`, a version in `code`.
+    | "update_event";
   readonly operation?: string;
   readonly code?: string;
   readonly name?: string;
@@ -130,6 +139,8 @@ export interface StaffApiOptions {
   readonly clock?: () => number;
   /** People, roles and the audit trail (T-048, people-api.ts); left out, those routes aren't served. */
   readonly people?: PeopleApiOptions;
+  /** Software updates (T-060, update-api.ts); left out, those routes aren't served. */
+  readonly updates?: UpdateApiOptions;
 }
 
 /** The header carrying the CSRF token on every change. */
@@ -760,6 +771,9 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
     ...(options.people === undefined
       ? []
       : peopleApiRoutes(options.people, { service, log, signedIn })),
+    ...(options.updates === undefined
+      ? []
+      : updateApiRoutes(options.updates, { service, log, signedIn })),
     {
       method: "GET",
       path: "/api/templates",
@@ -807,6 +821,46 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
           {
             expectedVersion: precondition === "new" ? 0 : Number(precondition.tag),
             ...(body.confirm === undefined ? {} : { confirm: body.confirm }),
+            ...(body.confirmPublished === undefined
+              ? {}
+              : { confirmPublished: body.confirmPublished }),
+          },
+        );
+        return answer(result, reply, (value) => {
+          if (precondition === "new") reply.status(201);
+          reply.header("etag", `"v${String(value.version)}"`);
+          return value;
+        });
+      }),
+    },
+    // A template's Dublin Core mapping (T-050b, D-096, D-012): read by anyone
+    // who may read templates; saved by those who may change definitions,
+    // with D-076's published-records confirmation.
+    {
+      method: "GET",
+      path: "/api/templates/:key/dublin-core",
+      handler: signedIn("read", false, async (request, reply, { context }) => {
+        const result = await service.readDublinCoreMapping(context, request.params.key ?? "");
+        return answer(result, reply, (value) => {
+          if (value.version > 0) reply.header("etag", `"v${String(value.version)}"`);
+          return value;
+        });
+      }),
+    },
+    {
+      method: "PUT",
+      path: "/api/templates/:key/dublin-core",
+      handler: signedIn("write", true, async (request, reply, { context }) => {
+        const precondition = newOrMatch(request, VERSION_TAG);
+        const body = objectBody(request);
+        const extra = onlyKeys(body, ["mapping", "confirmPublished"], reply);
+        if (extra) return extra;
+        const result = await service.saveDublinCoreMapping(
+          context,
+          request.params.key ?? "",
+          body.mapping,
+          {
+            expectedVersion: precondition === "new" ? 0 : Number(precondition.tag),
             ...(body.confirmPublished === undefined
               ? {}
               : { confirmPublished: body.confirmPublished }),

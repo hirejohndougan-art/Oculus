@@ -1,7 +1,9 @@
 /**
  * `npm run admin` (after `npm run build`): starts the admin's server
  * (admin-server.ts) for the database named by `OCULUS_DATABASE_URL`, on
- * `OCULUS_HOST` (default 127.0.0.1) and `OCULUS_PORT` (default 3000). The
+ * `OCULUS_HOST` (default 127.0.0.1) and `OCULUS_PORT` (default 3000), with
+ * the public sites' reader connection from `OCULUS_PUBLIC_DATABASE_URL`
+ * when it is set (T-050a, D-090). The
  * URL, the secret key and every other value stay out of the output; a
  * refusal to start prints only its reason and exits 1.
  *
@@ -12,11 +14,13 @@
  * (alert-notices.ts). The notices, the mailer's outbox and the server are
  * closed on SIGINT and SIGTERM.
  */
+import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { openDatabase } from "@oculus/db";
 import { buildAdminServer, defaultLog } from "./admin-server.js";
 import { startAlertNotices, type AlertNoticeRunner } from "./alert-notices.js";
 import { mailerFromEnv, type Mailer } from "./mail.js";
+import { PUBLIC_DATABASE_URL_ENV } from "./public-sites.js";
 
 const DATABASE_URL_VARIABLE = "OCULUS_DATABASE_URL";
 
@@ -43,11 +47,47 @@ export async function runAdminCli(
     err(`${DATABASE_URL_VARIABLE} is not a usable postgresql:// URL (its value is not shown).`);
     return 2;
   }
+  const publicUrl = env[PUBLIC_DATABASE_URL_ENV];
+  let publicDb: ReturnType<typeof openDatabase> | undefined;
+  if (publicUrl !== undefined && publicUrl.trim() !== "") {
+    try {
+      publicDb = openDatabase(publicUrl, { applicationName: "oculus-public", max: 4 });
+    } catch {
+      await db.close();
+      err(`${PUBLIC_DATABASE_URL_ENV} is not a usable postgresql:// URL (its value is not shown).`);
+      return 2;
+    }
+  }
+  const closePools = async (): Promise<void> => {
+    // Both, whatever happens to either.
+    await Promise.allSettled([db.close(), publicDb?.close()]);
+  };
   let mailer: Mailer | undefined;
   let notices: AlertNoticeRunner | undefined;
   try {
     mailer = mailerFromEnv(env, { log: defaultLog });
-    const app = await buildAdminServer({ db, env, logger: true, mailer, log: defaultLog });
+    // After an update with OCULUS_UPDATE_RESTART=exit (T-060, D-092): stop
+    // cleanly so the host's process manager starts the new version.
+    let restarting = false;
+    const restart = (): void => {
+      if (restarting) return;
+      restarting = true;
+      void app
+        .close()
+        .then(() => notices?.stop())
+        .then(() => mailer?.close())
+        .then(closePools)
+        .finally(() => process.exit(0));
+    };
+    const app = await buildAdminServer({
+      db,
+      env,
+      logger: true,
+      mailer,
+      log: defaultLog,
+      requestRestart: restart,
+      ...(publicDb === undefined ? {} : { publicDb }),
+    });
     // "Someone is guessing your two-step codes" (D-077, D-085), every minute.
     const outbox = mailer.outbox;
     notices = startAlertNotices({
@@ -61,7 +101,7 @@ export async function runAdminCli(
         .close()
         .then(() => notices?.stop())
         .then(() => mailer?.close())
-        .then(() => db.close());
+        .then(closePools);
     };
     process.once("SIGINT", close);
     process.once("SIGTERM", close);
@@ -70,14 +110,19 @@ export async function runAdminCli(
   } catch (error) {
     await notices?.stop();
     await mailer?.close();
-    await db.close();
+    await closePools();
     // Startup refusals name the variable and the reason, never a value.
     err(`Oculus did not start: ${error instanceof Error ? error.message : "unknown error"}`);
     return 1;
   }
 }
 
-if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Through a link too: the host starts `<updates folder>/current/…` (T-060), and
+// Node gives this module its real path.
+if (
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href
+) {
   const code = await runAdminCli(process.env, (line) => {
     console.error(line);
   });
