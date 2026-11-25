@@ -22,7 +22,7 @@ import {
   type Queryable,
 } from "@oculus/db";
 import type { FastifyInstance } from "fastify";
-import { testServerUrl } from "../../db/src/test-database.fixtures.js";
+import { storeDirectVersion, testServerUrl } from "../../db/src/test-database.fixtures.js";
 import { FAKE_TEST_SECRET_KEY } from "../../db/src/second-factor.fixtures.js";
 import { loadAdminFiles } from "./admin-files.js";
 import { buildAdminServer } from "./admin-server.js";
@@ -245,13 +245,10 @@ describe("items shared into a public site", () => {
     );
     const reply = await get("127.0.0.1", `/records/${item.id}`);
     expect(reply.body).not.toContain("sharedFrom");
-    if (reply.statusCode === 200) {
-      // Read as A1's own record now.
-      expect(Object.keys(reply.json<object>()).sort()).toEqual(["dublinCore", "id", "jsonLd"]);
-      expect(reply.json<{ id: string }>().id).toBe(`${PUBLIC}/records/${item.id}`);
-    } else {
-      expect([reply.statusCode, reply.body]).toEqual([404, await unknownBody()]);
-    }
+    // Moving keeps it published, so A1 now shows it as its own record.
+    expect(reply.statusCode).toBe(200);
+    expect(Object.keys(reply.json<object>()).sort()).toEqual(["dublinCore", "id", "jsonLd"]);
+    expect(reply.json<{ id: string }>().id).toBe(`${PUBLIC}/records/${item.id}`);
     const direct = await readSharedPublicRecord(reader, w.a, w.a1, item.id as never, {
       baseUrlFor: () => `${PUBLIC}/records/`,
     });
@@ -297,6 +294,76 @@ describe("items shared into a public site", () => {
     ok(await w.service.acceptShare(as(w.a, w.a1), share.id));
     const reply = await get("127.0.0.1", `/records/${made.record.id}`);
     expect([reply.statusCode, reply.body]).toEqual([404, await unknownBody()]);
+    // It is shared and accepted: the refusal is the mapping's, at home and here alike.
+    const here = await readSharedPublicRecord(reader, w.a, w.a1, made.record.id, {
+      baseUrlFor: () => `${PUBLIC}/records/`,
+    });
+    expect(here.ok ? [] : here.issues.map((i) => i.code)).toEqual(["no_mapping"]);
+    const home = await readPublicRecord(reader, w.b, w.b1, made.record.id, {
+      baseUrl: `${PUBLIC}/records/`,
+    });
+    expect(home.ok ? [] : home.issues.map((i) => i.code)).toEqual(["no_mapping"]);
+  });
+
+  /**
+   * Gives `recordId` (any organization's) to a new draft in the library (B1),
+   * copied from a fresh library record: an ID clash, which only a restore or
+   * an import could make. Then publishes it and shares it into A1, accepted.
+   */
+  async function libraryCopyWithId(recordId: string): Promise<void> {
+    const source = await makeObject(w, w.b, w.b1, "An invented clashing library lantern");
+    // Every stored column but the generated ones, with the new ID.
+    await w.db.transaction(async (q) => {
+      await q.rows(sql`SELECT set_config('oculus_test.org', ${w.b}, true),
+                              set_config('oculus_test.from', ${source.id}, true),
+                              set_config('oculus_test.to', ${recordId}, true)`);
+      await q.execute(sql`DO $$
+        DECLARE cols text; vals text;
+        BEGIN
+          SELECT string_agg(quote_ident(column_name), ', ' ORDER BY ordinal_position),
+                 string_agg(CASE WHEN column_name = 'id' THEN '$1::uuid'
+                                 ELSE quote_ident(column_name) END, ', ' ORDER BY ordinal_position)
+            INTO cols, vals
+            FROM information_schema.columns
+           WHERE table_schema = 'public' AND table_name = 'records' AND is_generated = 'NEVER';
+          EXECUTE format('INSERT INTO public.records (%s) SELECT %s FROM public.records
+                          WHERE organization_id = $2::uuid AND id = $3::uuid', cols, vals)
+            USING current_setting('oculus_test.to'), current_setting('oculus_test.org'),
+                  current_setting('oculus_test.from');
+        END $$`);
+      await storeDirectVersion(q, w.b, recordId);
+    });
+    await publishAs(w, w.b, recordId);
+    const share = ok(
+      await w.service.offerRecord(as(w.b, w.b1), {
+        recordId,
+        targetOrganizationId: w.a,
+        targetSiteId: w.a1,
+      }),
+    );
+    ok(await w.service.acceptShare(as(w.a, w.a1), share.id));
+  }
+
+  it("a shared item never stands in for the site's own record with the same ID", async () => {
+    // A1's own draft: not public, and its ID must never show another record.
+    const own = await makeObject(w, w.a, w.a1, "An invented A1 draft lantern");
+    await libraryCopyWithId(own.id);
+    const reply = await get("127.0.0.1", `/records/${own.id}`);
+    expect([reply.statusCode, reply.body]).toEqual([404, await unknownBody()]);
+    const direct = await readSharedPublicRecord(reader, w.a, w.a1, own.id as never, {
+      baseUrlFor: () => `${PUBLIC}/records/`,
+    });
+    expect(direct.ok ? [] : direct.issues.map((i) => i.code)).toEqual(["not_available"]);
+  });
+
+  it("two shared records with one ID show neither", async () => {
+    const item = await sharedIntoA1(w.a, w.a2, "An invented A2 lantern that will clash");
+    expect((await get("127.0.0.1", `/records/${item.id}`)).statusCode).toBe(200);
+    await libraryCopyWithId(item.id);
+    const reply = await get("127.0.0.1", `/records/${item.id}`);
+    expect([reply.statusCode, reply.body]).toEqual([404, await unknownBody()]);
+    // Each still reads on its own home host (A2 here).
+    expect((await get("[::1]", `/records/${item.id}`)).statusCode).toBe(200);
   });
 
   it("answers not_available, the same for every case, from the database read itself", async () => {
