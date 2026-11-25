@@ -15,12 +15,14 @@ import { createHash, randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
   existsSync,
+  linkSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
   statSync,
   utimesSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -29,6 +31,7 @@ import { csrfTokenFor, type OrganizationId, type UserId } from "@oculus/core";
 import {
   openDatabase,
   purgeCandidates,
+  databaseIdentity,
   readAuditTrail,
   readFileStoreLease,
   sql,
@@ -36,6 +39,8 @@ import {
 } from "@oculus/db";
 import {
   ADOPT_QUIET_MS,
+  AUTOMATIC_PURGE_EVERY_MS,
+  LEASE_LOCK,
   STORE_MARKER,
   createService,
   openFileStore,
@@ -427,6 +432,194 @@ describe("the purge's steps", () => {
   });
 });
 
+describe("the review's fixes (S-052 review)", () => {
+  /** A file's bytes as a download reads them. */
+  async function download(fileId: string): Promise<Buffer | undefined> {
+    const read = await service.fileContent(ctx(), asset as never, fileId, "download");
+    if (!read.ok) return undefined;
+    const parts: Buffer[] = [];
+    for await (const chunk of read.value.open()) parts.push(chunk as Buffer);
+    return Buffer.concat(parts);
+  }
+
+  it("B2: uploading the same file again puts back a copy that went missing", async () => {
+    const body = bytes();
+    const fileId = await attach(body);
+    rmSync(copyOf(body));
+    expect(await download(fileId)).toBeUndefined();
+    // The same bytes to the same asset: the row is there, and now the copy too.
+    expect(await attach(body)).toBe(fileId);
+    expect((await download(fileId))?.equals(body)).toBe(true);
+    expect(Date.now() - statSync(copyOf(body)).mtimeMs).toBeLessThan(60_000);
+  });
+
+  it("refuses to purge where the file system doesn't keep exact times", async () => {
+    const { body } = await removedLongAgo();
+    const coarse: FileStore = { ...store, mtimeSelfTest: () => Promise.resolve(false) };
+    const careless = createService(w.db, { files: coarse });
+    for (const apply of [false, true]) {
+      expect(await careless.purgeFiles({ apply })).toEqual({
+        ok: false,
+        problem: "mtime_unreliable",
+      });
+    }
+    expect(has(body)).toBe(true);
+    // This one does.
+    expect(await store.mtimeSelfTest()).toBe(true);
+    await drain();
+  });
+
+  it("leaves a trash entry that isn't a plain copy alone, and reports it as stuck", async () => {
+    const { body } = await removedLongAgo();
+    expect((await purge()).trashed.files).toBe(1);
+    // A second hard link to the trashed copy: not Oculus's alone any more.
+    const extra = join(dir, "someone-elses-link");
+    linkSync(join(trashOf(body), "content"), extra);
+    await ageSteps(w.db, body, 25);
+    ageMark(body, 25);
+    const dry = await purge(false);
+    expect(dry.stuck).toEqual({ files: 1, bytes: body.length });
+    expect(dry.deleted.files).toBe(0);
+    const run = await purge();
+    expect(run).toMatchObject({
+      stuck: { files: 1 },
+      deleted: { files: 0 },
+      restored: { files: 0 },
+    });
+    expect(readFileSync(join(trashOf(body), "content")).equals(body)).toBe(true);
+    const newest = await w.db.rows<{ kind: string }>(sql`
+      SELECT kind FROM public.file_purge_steps WHERE sha256 = ${sha(body)}
+      ORDER BY occurred_at DESC LIMIT 1`);
+    expect(newest[0]?.kind).toBe("trashed");
+    // Once someone removes the extra link, the next step goes on.
+    rmSync(extra);
+    expect((await purge()).deleted.files).toBe(1);
+    await drain();
+  });
+
+  it("removes a file whose copy's time is before 1970, logs no time for it, and never purges it", async () => {
+    const body = bytes();
+    const fileId = await attach(body);
+    // A Date: Node reads a negative number of seconds as "now".
+    utimesSync(copyOf(body), new Date(-86_400_000), new Date(-86_400_000));
+    await remove(fileId);
+    const logged = await w.db.rows<{ t: string | null }>(sql`
+      SELECT copy_mtime_ns::text AS t FROM public.stored_file_events
+      WHERE sha256 = ${sha(body)} AND kind = 'removed'`);
+    expect(logged).toEqual([{ t: null }]);
+    await ageEvents(w.db, body, 30);
+    expect((await purge()).trashed.files).toBe(0);
+    expect(has(body)).toBe(true);
+  });
+
+  it("keeps whatever the one list of keepers names (stored_content_kept: S-040's quarantine goes there)", async () => {
+    const { body } = await removedLongAgo();
+    // As S-040's migration would: one more line in the function (here, an
+    // invented table standing in for its quarantine).
+    await w.db.execute(sql`CREATE TABLE public.test_quarantine (sha256 text PRIMARY KEY)`);
+    await w.db.execute(sql`INSERT INTO public.test_quarantine VALUES (${sha(body)})`);
+    await w.db.execute(sql`
+      CREATE OR REPLACE FUNCTION public.stored_content_kept(organization uuid, content text)
+      RETURNS boolean LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $$
+        SELECT EXISTS (SELECT 1 FROM public.stored_files f
+                       WHERE f.organization_id = organization AND f.sha256 = content)
+            OR EXISTS (SELECT 1 FROM public.test_quarantine q WHERE q.sha256 = content)
+      $$`);
+    try {
+      expect((await purge(false)).trashed.files).toBe(0);
+      expect((await purge()).trashed.files).toBe(0);
+      expect(has(body)).toBe(true);
+    } finally {
+      await w.db.execute(sql`
+        CREATE OR REPLACE FUNCTION public.stored_content_kept(organization uuid, content text)
+        RETURNS boolean LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $$
+          SELECT EXISTS (SELECT 1 FROM public.stored_files f
+                         WHERE f.organization_id = organization AND f.sha256 = content)
+        $$`);
+      await w.db.execute(sql`DROP TABLE public.test_quarantine`);
+    }
+    await drain();
+  });
+
+  it("writes the change log per step, and calls the daily run the timer", async () => {
+    const one = await removedLongAgo();
+    const two = await removedLongAgo();
+    const started = (await w.db.rows<{ t: string }>(sql`SELECT clock_timestamp()::text AS t`))[0]
+      ?.t;
+    let steps = 0;
+    const result = await service.purgeFiles({
+      apply: true,
+      via: "timer",
+      beforeContent: async () => {
+        steps++;
+        // Before the second step, the first is already in the change log.
+        if (steps === 2) {
+          const so = await w.db.rows<{ n: number }>(sql`
+            SELECT count(*)::int AS n FROM public.system_events
+            WHERE occurred_at >= ${started ?? null}::timestamptz`);
+          expect(so[0]?.n).toBe(1);
+        }
+      },
+    });
+    expect(result.ok && result.value.trashed.files).toBe(2);
+    const log = await w.db.rows<{
+      source: string | null;
+      actor_id: string | null;
+      bytes: string;
+    }>(sql`
+      SELECT source, actor_id::text AS actor_id, byte_count::text AS bytes FROM public.system_events
+      WHERE occurred_at >= ${started ?? null}::timestamptz ORDER BY occurred_at`);
+    expect(log).toHaveLength(2);
+    expect(log.every((r) => r.source === "timer" && r.actor_id === null)).toBe(true);
+    expect(log.map((r) => Number(r.bytes)).sort()).toEqual(
+      [one.body.length, two.body.length].sort(),
+    );
+    const trail = await readAuditTrail(
+      w.db,
+      w.a,
+      { records: [], people: [], system: true },
+      { from: started ?? "" },
+    );
+    expect(trail.entries.map((e) => e.actor)).toEqual(["timer", "timer"]);
+    const actors = await w.db.rows<{ actor: string }>(sql`
+      SELECT DISTINCT actor FROM public.file_purge_steps WHERE occurred_at >= ${started ?? null}::timestamptz`);
+    expect(actors).toEqual([{ actor: "system:files-purge-timer" }]);
+    // A day and an hour between runs, so a step 2 due in a day is never just missed.
+    expect(AUTOMATIC_PURGE_EVERY_MS).toBe(25 * 3600_000);
+    await drain();
+  });
+
+  it("a renewal waits for a purge step holding the folder's lease lock, so no lease moves inside one", async () => {
+    const { body } = await removedLongAgo();
+    let renewal: Promise<boolean> | undefined;
+    const events: string[] = [];
+    const lockPath = join(dir, LEASE_LOCK);
+    const result = await service.purgeFiles({
+      apply: true,
+      beforeContent: async () => {
+        // Hold the lock as a step would, start a renewal, then let go.
+        await store.withLeaseLock(async () => {
+          renewal = service.renewFileLease().then((r) => {
+            events.push("renewed");
+            return r;
+          });
+          await new Promise((r) => setTimeout(r, 300));
+          expect(existsSync(lockPath)).toBe(true);
+          events.push("step");
+        });
+        await renewal;
+      },
+    });
+    expect(await renewal).toBe(true);
+    expect(events).toEqual(["step", "renewed"]);
+    // The renewal moved the lease after the step's lock: the run stopped there.
+    expect(result.ok && result.value.stopped).toBe("lease_lost");
+    expect(has(body)).toBe(true);
+    expect(existsSync(lockPath)).toBe(false);
+    await drain();
+  });
+});
+
 describe("Clean up removed files in the admin", () => {
   async function call(method: "GET" | "POST", as: string, body?: unknown) {
     const token = tokens[as] ?? "";
@@ -486,7 +679,7 @@ describe("Clean up removed files in the admin", () => {
   });
 });
 
-describe("another database on the folder (fifth review RV1, RV2; R1b's window)", () => {
+describe("another database on the folder (fifth review RV1, RV2; review B1; R1b's window)", () => {
   async function dumpTo(file: string): Promise<void> {
     const bin = await findTools(process.env, ["pg_dump", "pg_restore"]);
     const result = spawnSync(
@@ -530,6 +723,8 @@ describe("another database on the folder (fifth review RV1, RV2; R1b's window)",
     utimesSync(join(dir, STORE_MARKER), past, past);
     const adopted = await service.adoptFileStore();
     if (!adopted.ok) throw new Error(adopted.problem);
+    // The adopt's time moved back with the events later tests move back.
+    await ageEpochs(w.db, 30);
     await drain();
   }
 
@@ -562,22 +757,37 @@ describe("another database on the folder (fifth review RV1, RV2; R1b's window)",
     }
   }
 
-  it("RV1: a dump taken since the last renewal never purges what production attached again afterwards", async () => {
+  /**
+   * Makes the marker name the copy's identity, as a physical clone of the
+   * cluster (a file-level copy) would: it keeps the original's identity, so
+   * the marker can't tell it apart. pg_dump/pg_restore can't make one.
+   */
+  async function asPhysicalClone(copy: Database): Promise<void> {
+    const [storeId = "", , epoch = ""] = readFileSync(join(dir, STORE_MARKER), "utf8").split("\n");
+    writeFileSync(
+      join(dir, STORE_MARKER),
+      `${storeId}\n${await databaseIdentity(copy)}\n${epoch}\n`,
+    );
+  }
+
+  it("RV1: a clone with the folder's epoch never purges what production attached again after it was taken", async () => {
     await withCopy("rv1", async (step) => {
       // Production removed X long ago (its copy last used 20 days ago).
       const { body } = await removedLongAgo({ copyDays: 20, dbDays: 9 });
-      // The dump, while its epoch still matches the folder's.
+      // The clone, while its epoch still matches the folder's.
       await step();
-      // Production attaches X again, then stops (no renewal after the dump).
+      // Production attaches X again, then stops (no renewal after the clone).
       // Its attach was 8 days ago by the file system's clock.
       await attach(body);
       ageCopy(body, 8);
-      // The copy starts on the folder: its epoch matches, so it holds the lease.
+      // The clone starts on the folder: its epoch matches, and as a physical
+      // clone its identity does too, so it holds the lease.
       const copy = await step();
+      await asPhysicalClone(copy.db);
       expect(await copy.s.bindFileStore()).toEqual({ ok: true });
-      // By the database alone the copy would take X (no row there names it).
+      // By the database alone the clone would take X (no row there names it).
       expect((await purgeCandidates(copy.db, w.a, null)).map((c) => c.sha256)).toContain(sha(body));
-      // But X's copy was used after the copy's removal: kept, dry run or not.
+      // But X's copy was used after the clone's removal: kept, dry run or not.
       const dry = await copy.s.purgeFiles({ apply: false });
       expect(dry.ok && dry.value.trashed.files).toBe(0);
       const run = await copy.s.purgeFiles({ apply: true });
@@ -587,51 +797,71 @@ describe("another database on the folder (fifth review RV1, RV2; R1b's window)",
     });
   }, 120_000);
 
-  it("RV2: a backup taken while production was stopped: what the copy trashes goes back when production starts, and is never deleted", async () => {
+  it("RV2 and review B1: a logical restore of a backup taken while production was stopped holds the folder's epoch but not its identity: refused, dry run included, and nothing is trashed", async () => {
     await withCopy("rv2", async (step) => {
+      // The review's repro. Production attaches X; its copy was last used
+      // 20 days ago.
       const body = bytes();
       const fileId = await attach(body);
       ageCopy(body, 20);
-      // Production is stopped; a base backup is taken.
+      // Production stops; a dump is taken and restored as a copy whose epoch
+      // matches the folder's.
       await step();
-      // The copy starts first and holds the lease. In the copy, X is removed
-      // and, by its clocks, old: it goes to the copy's trash.
       const copy = await step();
-      expect(await copy.s.bindFileStore()).toEqual({ ok: true });
+      expect((await readFileStoreLease(copy.db))?.epoch).toBe(
+        readFileSync(join(dir, STORE_MARKER), "utf8").split("\n")[2],
+      );
+      // Starting, it finds the marker names another database: not its lease.
+      expect(await copy.s.bindFileStore()).toEqual({
+        ok: true,
+        warning: "files_shared_or_restored",
+      });
+      // The copy removes X, and by its clocks X is old.
       await remove(fileId, copy.s);
       await ageEvents(copy.db, body, 9);
-      const run = await copy.s.purgeFiles({ apply: true });
-      expect(run.ok && run.value.trashed.files).toBe(1);
-      expect(existsSync(copyOf(body))).toBe(false);
-      // Production starts: the lease isn't its own, so neither side may
-      // purge, and the trash goes back.
+      for (const apply of [false, true]) {
+        expect(await copy.s.purgeFiles({ apply })).toEqual({
+          ok: false,
+          problem: "lease_mismatch",
+        });
+      }
+      expect(await store.trashEntries(w.a)).toEqual([]);
+      expect(has(body)).toBe(true);
+      // A day on, still nothing; production finds the lease poisoned too.
+      expect((await copy.s.purgeFiles({ apply: true })).ok).toBe(false);
       expect(await service.bindFileStore()).toEqual({
         ok: true,
         warning: "files_shared_or_restored",
       });
       expect(has(body)).toBe(true);
-      expect(existsSync(trashOf(body))).toBe(false);
-      // A day later the copy can't delete anything: its lease is gone.
-      await ageSteps(copy.db, body, 25);
-      expect(await copy.s.purgeFiles({ apply: true })).toEqual({
-        ok: false,
-        problem: "lease_mismatch",
-      });
-      expect(await service.purgeFiles({ apply: true })).toEqual({
-        ok: false,
-        problem: "lease_mismatch",
-      });
-      expect(has(body)).toBe(true);
     });
   }, 120_000);
 
-  it("R1b's window: a clone with the folder's very epoch may trash, but production's next renewal puts it back", async () => {
+  it("a logical restore that matched the folder's epoch is refused even in the middle of a purge's checks, and the trash goes back", async () => {
+    await withCopy("b1mid", async (step) => {
+      // Production trashed Y in a step; then a dump is restored and asked to purge.
+      const { body } = await removedLongAgo();
+      expect((await purge()).trashed.files).toBe(1);
+      await step();
+      const copy = await step();
+      expect(await copy.s.purgeFiles({ apply: false })).toEqual({
+        ok: false,
+        problem: "lease_mismatch",
+      });
+      // Refusing poisoned the lease and put the trash back.
+      expect(has(body)).toBe(true);
+      expect(await service.renewFileLease()).toBe(false);
+    });
+  }, 120_000);
+
+  it("R1b's window: a physical clone with the folder's very epoch may trash, but production's next renewal puts it back", async () => {
     await withCopy("r1bw", async (step) => {
       const body = bytes();
       const fileId = await attach(body);
       ageCopy(body, 20);
       await step();
       const clone = await step();
+      await asPhysicalClone(clone.db);
       expect(await clone.s.bindFileStore()).toEqual({ ok: true });
       await remove(fileId, clone.s);
       await ageEvents(clone.db, body, 9);
@@ -643,6 +873,33 @@ describe("another database on the folder (fifth review RV1, RV2; R1b's window)",
       await ageSteps(clone.db, body, 25);
       expect((await clone.s.purgeFiles({ apply: true })).ok).toBe(false);
       expect(has(body)).toBe(true);
+    });
+  }, 120_000);
+
+  it("documents the limit (D-086): a physical clone run while production stays stopped for over a day can delete what the clone removed", async () => {
+    await withCopy("limit", async (step) => {
+      const body = bytes();
+      const fileId = await attach(body);
+      ageCopy(body, 20);
+      await step();
+      const clone = await step();
+      await asPhysicalClone(clone.db);
+      expect(await clone.s.bindFileStore()).toEqual({ ok: true });
+      await remove(fileId, clone.s);
+      await ageEvents(clone.db, body, 9);
+      expect((await clone.s.purgeFiles({ apply: true })).ok).toBe(true);
+      expect(await clone.s.renewFileLease()).toBe(true);
+      await ageSteps(clone.db, body, 25);
+      ageMark(body, 25);
+      const second = await clone.s.purgeFiles({ apply: true });
+      expect(second.ok && second.value.deleted.files).toBe(1);
+      // Production, started again, still names X, and its copy is gone:
+      // the clone is indistinguishable from production, so this is the one
+      // case the purge can't refuse. D-086, DESKTOP.md and the README say so.
+      const rows = await w.db.rows<{ n: number }>(sql`
+        SELECT count(*)::int AS n FROM public.stored_files WHERE sha256 = ${sha(body)}`);
+      expect(rows[0]?.n).toBe(1);
+      expect(existsSync(copyOf(body))).toBe(false);
     });
   }, 120_000);
 });

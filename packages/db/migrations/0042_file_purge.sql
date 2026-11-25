@@ -72,9 +72,25 @@ ALTER TABLE public.file_purge_steps ENABLE ALWAYS TRIGGER file_purge_steps_stamp
 ALTER TABLE public.file_purge_steps ENABLE ALWAYS TRIGGER file_purge_steps_append_only;
 ALTER TABLE public.file_purge_steps ENABLE ALWAYS TRIGGER file_purge_steps_no_truncate;
 
--- 4. The change log (system_events, 0030): each purge run that changed
---    something adds one row per kind, with how many contents and bytes. A
---    purge has no version, so the version is required for updates only.
+-- 4. Whether anything still keeps a content: the one list the purge asks
+--    (its candidates, and every check again inside a step). A content named
+--    here is never moved or deleted. Today only stored_files names a
+--    content; a table added later that names one by (organization_id,
+--    sha256) and must keep it (S-040's file_scans quarantine, for one) adds
+--    one `OR EXISTS (...)` line here, in its own migration
+--    (CREATE OR REPLACE).
+CREATE FUNCTION public.stored_content_kept(organization uuid, content text) RETURNS boolean
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+  SELECT EXISTS (SELECT 1 FROM public.stored_files f
+                 WHERE f.organization_id = organization AND f.sha256 = content)
+$$;
+
+-- 5. The change log (system_events, 0030): each step of the purge (one
+--    content moved to the trash, deleted or put back) adds one row, in the
+--    step's own transaction, with its count (1) and bytes. A purge has no
+--    version, so the version is required for updates only.
 ALTER TABLE public.system_events ADD COLUMN file_count integer
   CONSTRAINT system_events_file_count_range CHECK (file_count IS NULL OR file_count >= 0);
 ALTER TABLE public.system_events ADD COLUMN byte_count bigint
@@ -84,6 +100,10 @@ ALTER TABLE public.system_events ADD CONSTRAINT system_events_kind_known
   CHECK (kind IN ('update_installed', 'update_rolled_back',
                   'files_trashed', 'files_deleted', 'files_restored'));
 ALTER TABLE public.system_events ALTER COLUMN version DROP NOT NULL;
+-- Who ran a purge with no person: NULL for the command line, 'timer' for
+-- the daily run (OCULUS_FILES_AUTO_PURGE=on).
+ALTER TABLE public.system_events ADD COLUMN source text
+  CONSTRAINT system_events_source_known CHECK (source IS NULL OR (source = 'timer' AND actor_id IS NULL));
 ALTER TABLE public.system_events ADD CONSTRAINT system_events_shape
   CHECK (CASE WHEN kind IN ('update_installed', 'update_rolled_back')
               THEN version IS NOT NULL AND file_count IS NULL AND byte_count IS NULL

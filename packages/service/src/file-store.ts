@@ -57,7 +57,7 @@
  * (`deleteTrashed`, step 2) only if its time is still the same. An upload of
  * the same content puts it back first (`restoreFromTrash`).
  */
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomInt } from "node:crypto";
 import { constants, createReadStream, openSync, rmSync } from "node:fs";
 import {
   link,
@@ -71,6 +71,7 @@ import {
   rmdir,
   stat,
   statfs,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { hostname } from "node:os";
@@ -129,11 +130,25 @@ export interface CopyStamp {
 export interface TrashEntry {
   readonly sha256: string;
   readonly size: number;
-  /** The trashed copy's time (a rename keeps it). */
+  /** The trashed copy's time (a rename keeps it); 0 when stuck. */
   readonly mtimeNs: bigint;
   /** When it was moved there, by the file system's clock (its `marked` file); NaN if unmarked. */
   readonly markedMs: number;
+  /**
+   * The trashed copy isn't a plain file of ours with one link (a second
+   * hard link, another owner, a group- or world-writable mode, a link):
+   * the purge never deletes, restores or records it, and reports it for a
+   * person to look at.
+   */
+  readonly stuck: boolean;
 }
+
+/** The lock file the lease's steps take, beside the marker (`withLeaseLock`). */
+export const LEASE_LOCK = ".oculus-lease.lock";
+/** A lease lock older than this by the file system's clock is a crashed holder's (2 minutes). */
+const LEASE_LOCK_STALE_MS = 2 * 60_000;
+/** How long `withLeaseLock` waits for another holder (15 seconds). */
+const LEASE_LOCK_WAIT_MS = 15_000;
 
 export type ReceiveRefusal = "file_too_large" | "empty_file" | "quota_exceeded" | "disk_full";
 
@@ -287,6 +302,23 @@ export interface FileStore {
   /** "Now" by the file system's own clock (a file written just now in the organization's folder). */
   fileSystemNow(organizationId: OrganizationId): Promise<number>;
   /**
+   * Whether this file system keeps a modification time as it is set, to the
+   * microsecond: a probe file is given a chosen sub-second time and read
+   * back. The purge compares copies' times exactly, so it refuses to run
+   * without this (S-052).
+   */
+  mtimeSelfTest(): Promise<boolean>;
+  /**
+   * Runs `work` holding the folder's lease lock: a lock file beside the
+   * marker, made `O_EXCL` (Node has no `flock`), so a purge step, a lease
+   * renewal, a bind or an adopt of any database using the folder never
+   * runs inside another's. A holder that is gone (on this host, a process
+   * that no longer exists; anywhere, a lock older than two minutes by the
+   * file system's clock) is taken over; otherwise it waits up to 15
+   * seconds, then throws.
+   */
+  withLeaseLock<T>(work: () => Promise<T>): Promise<T>;
+  /**
    * The purge's step 1 (call under the organization's file lock): moves the
    * copy into `trash/<sha256>/content` by one rename, its thumbnails beside
    * it, with a `marked` file stamped by the file system's clock, only if
@@ -305,7 +337,8 @@ export interface FileStore {
    * organization's file lock; an upload of the content and a purge that
    * finds it in use do): `restored`; `already_stored` when the same
    * content is there already (the trashed copy then goes); `none` when
-   * nothing of it is in the trash. Its thumbnails are deleted (made again).
+   * nothing of it is in the trash, or it is stuck (`TrashEntry.stuck`: then
+   * nothing is touched). Its thumbnails are deleted (made again).
    */
   restoreFromTrash(
     organizationId: OrganizationId,
@@ -812,8 +845,18 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       try {
         const info = await handle.stat();
         if (!info.isFile() || info.nlink !== 1 || !safeOwnership(info)) return false;
+        const before = (await handle.stat({ bigint: true })).mtimeNs;
         const now = (await fileSystemNow(await safeFolder(organizationId, "incoming"))) / 1000;
         await handle.utimes(now, now);
+        // The purge relies on every touch changing the time (S-052): if it
+        // came out the same (a coarse clock), two seconds later instead.
+        if ((await handle.stat({ bigint: true })).mtimeNs === before) {
+          const later = Number(before / 1_000_000n) / 1000 + 2;
+          await handle.utimes(later, later);
+          if ((await handle.stat({ bigint: true })).mtimeNs === before) {
+            throw new Error("The file system didn't change a stored copy's time.");
+          }
+        }
         return true;
       } finally {
         await handle.close();
@@ -826,7 +869,10 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
     },
 
     async isEmpty() {
-      return (await readdir(root)).filter((name) => name !== SERVERS_FOLDER).length === 0;
+      return (
+        (await readdir(root)).filter((name) => name !== SERVERS_FOLDER && name !== LEASE_LOCK)
+          .length === 0
+      );
     },
 
     async openContent(organizationId, sha256, size) {
@@ -1122,6 +1168,73 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       return fileSystemNow(await safeFolder(organizationId, "incoming"));
     },
 
+    async mtimeSelfTest() {
+      const probe = join(root, `.mtime-${randomBytes(8).toString("hex")}`);
+      await writeFile(probe, "", { mode: 0o600, flag: "wx" });
+      try {
+        const whole = 1_600_000_000 + randomInt(0, 100_000_000);
+        const micros = randomInt(1, 1_000_000);
+        const seconds = whole + micros / 1e6;
+        await utimes(probe, seconds, seconds);
+        const got = (await lstat(probe, { bigint: true })).mtimeNs;
+        const want = BigInt(whole) * 1_000_000_000n + BigInt(micros) * 1000n;
+        // To within two microseconds: Node passes the time as a double of
+        // seconds, which holds microseconds and truncates the rest.
+        return (got > want ? got - want : want - got) <= 2000n;
+      } finally {
+        await rm(probe, { force: true });
+      }
+    },
+
+    async withLeaseLock(work) {
+      const path = join(root, LEASE_LOCK);
+      const host = hostname()
+        .replace(/[^A-Za-z0-9.-]/g, "_")
+        .slice(0, 100);
+      const mine = `${host}\n${String(process.pid)}\n${randomBytes(8).toString("hex")}\n`;
+      const waitUntil = Date.now() + LEASE_LOCK_WAIT_MS;
+      for (;;) {
+        try {
+          await writeFile(path, mine, { mode: 0o600, flag: "wx" });
+          break;
+        } catch (error) {
+          if ((error as { code?: unknown }).code !== "EEXIST") throw error;
+        }
+        const info = await lstat(path).catch(() => undefined);
+        if (info !== undefined && !info.isFile()) {
+          throw new Error("The files folder's lease lock isn't a plain file.");
+        }
+        if (info !== undefined) {
+          const [theirHost = "", pidText = ""] = (
+            await readFile(path, "utf8").catch(() => "")
+          ).split("\n");
+          const pid = Number(pidText);
+          let gone = false;
+          if (theirHost === host && Number.isSafeInteger(pid) && pid > 0 && pid !== process.pid) {
+            try {
+              process.kill(pid, 0);
+            } catch (error) {
+              gone = (error as { code?: unknown }).code !== "EPERM";
+            }
+          }
+          if (gone || (await fileSystemNow(root)) - info.mtimeMs > LEASE_LOCK_STALE_MS) {
+            await rm(path, { force: true });
+            continue;
+          }
+        }
+        if (Date.now() > waitUntil) throw new Error("The files folder's lease lock is held.");
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      try {
+        return await work();
+      } finally {
+        // Only our own: a holder taken over as stale must not remove the next one's.
+        if ((await readFile(path, "utf8").catch(() => undefined)) === mine) {
+          await rm(path, { force: true });
+        }
+      }
+    },
+
     async trashContent(organizationId, sha256, mtimeNs) {
       const target = pathFor(organizationId, sha256);
       const folder = await existingFolder(organizationId, "sha256", sha256.slice(0, 2));
@@ -1178,15 +1291,17 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
         if (!entry.isDirectory() || !isSha256Hex(entry.name)) continue;
         const bin = await existingFolder(organizationId, "trash", entry.name);
         if (bin === undefined) continue;
+        const content = await lstat(join(bin, "content")).catch(() => undefined);
+        if (content === undefined) continue;
         const stamp = await stampOf(join(bin, "content"));
-        if (stamp === undefined) continue;
         const mark = await lstat(join(bin, "marked")).catch(() => undefined);
         out.push(
           Object.freeze({
             sha256: entry.name,
-            size: stamp.size,
-            mtimeNs: stamp.mtimeNs,
+            size: stamp?.size ?? content.size,
+            mtimeNs: stamp?.mtimeNs ?? 0n,
             markedMs: mark?.isFile() === true ? mark.mtimeMs : Number.NaN,
+            stuck: stamp === undefined,
           }),
         );
       }
@@ -1200,7 +1315,10 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       const trashed = join(bin, "content");
       const target = pathFor(organizationId, sha256);
       let answer: "restored" | "already_stored" | "none" = "none";
-      if (await plainFile(trashed)) {
+      const there = await lstat(trashed).catch(() => undefined);
+      // Stuck (not a plain copy of ours): left exactly as it is, for a person.
+      if (there !== undefined && !(await plainFile(trashed))) return "none";
+      if (there !== undefined) {
         const folder = await safeFolder(organizationId, "sha256", sha256.slice(0, 2));
         const there = await lstat(target).catch(() => undefined);
         if (there === undefined) {

@@ -11,7 +11,7 @@ import { migrate, openDatabase, type Database } from "@oculus/db";
 import { ADOPT_QUIET_MS, STORE_MARKER, createService, openFileStore } from "@oculus/service";
 import { newRecordId } from "@oculus/core";
 import { freshDatabase, type TestDatabase } from "../../db/src/test-database.fixtures.js";
-import { runFilesCli } from "./files-cli.js";
+import { purgeLines, runFilesCli } from "./files-cli.js";
 
 let testDb: TestDatabase;
 let db: Database;
@@ -80,6 +80,21 @@ describe("files-cli", () => {
     expect(await refused.done).toBe(1);
     expect(refused.lines.join("\n")).toMatch(/lease isn't this database's/);
     writeFileSync(marker, kept);
+  });
+
+  it("prints what is stuck in the trash and a step stopped early", () => {
+    const none = { files: 0, bytes: 0 };
+    const lines = purgeLines({
+      dryRun: false,
+      trashed: none,
+      deleted: none,
+      restored: none,
+      waiting: none,
+      stuck: { files: 2, bytes: 3 * 1024 * 1024 },
+      stopped: "lease_lost",
+    });
+    expect(lines.join("\n")).toMatch(/Stuck in the trash, left alone .*: 2 files \(3\.0 MiB\)/);
+    expect(lines.join("\n")).toMatch(/lease moved/);
   });
 
   it("refuses adopt while the folder is busy, then adopts and deletes nothing", async () => {

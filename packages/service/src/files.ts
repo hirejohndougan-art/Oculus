@@ -490,30 +490,42 @@ export function fileOperations(
     const identity = await databaseIdentity(db);
     for (let attempt = 0; attempt < 3; attempt++) {
       const epoch = randomUUID();
-      const renewed = await db.transaction(async (tx) => {
-        await lockFileStoreLease(tx);
-        const marker = await store.readMarker().catch(() => undefined);
-        const lease = await readFileStoreLease(tx);
-        if (marker?.storeId !== bound || lease === undefined || marker.epoch !== lease.epoch) {
-          return false;
+      // Under the folder's lease lock: no other database's step or renewal
+      // runs between the check and the new marker.
+      const renewed = await store.withLeaseLock(async () => {
+        const moved = await db.transaction(async (tx) => {
+          await lockFileStoreLease(tx);
+          const marker = await store.readMarker().catch(() => undefined);
+          const lease = await readFileStoreLease(tx);
+          if (marker?.storeId !== bound || lease === undefined || marker.epoch !== lease.epoch) {
+            return false;
+          }
+          // The epoch matches but the marker names another database: a dump
+          // or logical restore of the one that wrote it (review B1a). Not
+          // this database's lease; an adopt makes it so.
+          if (marker.database !== identity) return "identity" as const;
+          await insertFileStoreEpoch(tx, epoch, "renew", identity);
+          return true;
+        });
+        if (moved === true) {
+          await store.replaceMarker({ storeId: bound, database: identity, epoch });
         }
-        await insertFileStoreEpoch(tx, epoch, "renew", identity);
-        return true;
+        return moved;
       });
-      if (renewed) {
-        await store.replaceMarker({ storeId: bound, database: identity, epoch });
-        return true;
-      }
+      if (renewed === true) return true;
+      if (renewed === "identity") break;
       if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 1000));
     }
-    const marker = await store.readMarker().catch(() => undefined);
-    if (marker?.storeId === bound) {
-      await store.replaceMarker({
-        storeId: bound,
-        database: marker.database ?? identity,
-        epoch: randomUUID(),
-      });
-    }
+    await store.withLeaseLock(async () => {
+      const marker = await store.readMarker().catch(() => undefined);
+      if (marker?.storeId === bound) {
+        await store.replaceMarker({
+          storeId: bound,
+          database: marker.database ?? identity,
+          epoch: randomUUID(),
+        });
+      }
+    });
     // Neither side may purge now: whatever a purge put in the trash goes
     // back (S-052).
     await restoreAllTrash(db, store).catch(() => undefined);
@@ -634,8 +646,13 @@ export function fileOperations(
             );
             if (existing !== undefined) {
               // The copy on disk was placed when that row was made; touched,
-              // as every attach touches it.
-              await store.touch(who.organizationId, received.sha256);
+              // as every attach touches it. If it is missing (or isn't a
+              // plain copy of ours), the bytes just received put it back
+              // (review B2).
+              if (!(await store.touch(who.organizationId, received.sha256))) {
+                await store.place(received);
+                await store.touch(who.organizationId, received.sha256);
+              }
               return { ok: true, value: Object.freeze({ file: existing, created: false }) };
             }
             if (!(await organizationHasContent(tx, who.organizationId, received.sha256))) {
@@ -697,15 +714,11 @@ export function fileOperations(
           }
           // Logged, with the copy's own time (S-052): the purge takes the
           // copy only while its time is still this one.
+          // A time before 1970 is logged as none: the removal still works,
+          // and that copy is never purged.
           const stamp = await store?.copyStamp(who.organizationId, file.sha256);
-          await insertStoredFileEvent(
-            tx,
-            who.organizationId,
-            "removed",
-            file,
-            who.actor,
-            stamp?.mtimeNs,
-          );
+          const mtime = stamp !== undefined && stamp.mtimeNs >= 0n ? stamp.mtimeNs : undefined;
+          await insertStoredFileEvent(tx, who.organizationId, "removed", file, who.actor, mtime);
           return { ok: true, value: Object.freeze({ removed: true as const }) };
         },
       );
@@ -804,7 +817,11 @@ export function fileOperations(
     },
 
     async purgeFiles(options) {
-      return runFilePurge(db, store, options);
+      // A copy of this database with the folder's epoch: poisoned, and the
+      // trash put back, as a renewal would (review B1a).
+      return runFilePurge(db, store, options, async () => {
+        await renewLease();
+      });
     },
 
     async adoptFileStore() {
@@ -819,11 +836,13 @@ export function fileOperations(
       if (age === undefined || age < ADOPT_QUIET_MS) return { ok: false, problem: "epoch_moving" };
       const identity = await databaseIdentity(db);
       const epoch = randomUUID();
-      await db.transaction(async (tx) => {
-        await lockFileStoreLease(tx);
-        await insertFileStoreEpoch(tx, epoch, "adopt", identity);
+      await store.withLeaseLock(async () => {
+        await db.transaction(async (tx) => {
+          await lockFileStoreLease(tx);
+          await insertFileStoreEpoch(tx, epoch, "adopt", identity);
+        });
+        await store.replaceMarker({ storeId: held, database: identity, epoch });
       });
-      await store.replaceMarker({ storeId: held, database: identity, epoch });
       store.bind(held);
       return { ok: true };
     },

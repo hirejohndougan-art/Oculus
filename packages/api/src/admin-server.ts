@@ -37,7 +37,8 @@
  *   `off`. Stale temporary files are swept at startup and every 15
  *   minutes. Removed files are purged only by a system manager's button or
  *   `npm run files:purge`, unless `OCULUS_FILES_AUTO_PURGE=on` (default
- *   off), which runs one purge step a day (S-052).
+ *   off), which runs one purge step every 25 hours (S-052: a day and an
+ *   hour, so a second step due a day after the first is never just missed).
  *
  * It warns loudly (a `startup_warning` log record) when the database
  * server's `log_parameter_max_length_on_error` is above 0, since pg's
@@ -96,7 +97,7 @@ export const FILES_DIR_ENV = "OCULUS_FILES_DIR";
 export const FILE_MAX_ENV = "OCULUS_FILE_MAX_MIB";
 export const FILES_TOTAL_MAX_ENV = "OCULUS_FILES_TOTAL_MAX_MIB";
 export const FILES_MIN_FREE_ENV = "OCULUS_FILES_MIN_FREE_MIB";
-/** `on` runs one purge step a day (S-052); default `off`: nothing purges on a timer. */
+/** `on` runs one purge step every 25 hours (S-052); default `off`: nothing purges on a timer. */
 export const FILES_AUTO_PURGE_ENV = "OCULUS_FILES_AUTO_PURGE";
 
 /**
@@ -536,7 +537,7 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   // The purge on a timer only when turned on (S-052; default off).
   const purge = async (): Promise<void> => {
     try {
-      const purged = await service.purgeFiles({ apply: true });
+      const purged = await service.purgeFiles({ apply: true, via: "timer" });
       if (!purged.ok) log({ event: "startup_warning", code: `files_purge_${purged.problem}` });
     } catch (error) {
       log({ event: "service_error", operation: "purgeFiles", ...redactedError(error) });

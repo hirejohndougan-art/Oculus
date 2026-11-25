@@ -99,6 +99,17 @@ describe("Clean up removed files", () => {
     expect(screen.queryByRole("button", { name: "Run a clean-up step" })).toBeNull();
   });
 
+  it("shows what is stuck in the trash, and says when the disk can't be cleaned up", async () => {
+    server({ ...STATUS, stuck: { files: 1, bytes: 5 * 1024 * 1024 } });
+    renderAt("/settings/files");
+    expect(await screen.findByText(/Stuck in the trash/)).toBeTruthy();
+    expect(screen.getByText("1 file (5.0 MB)")).toBeTruthy();
+    cleanup();
+    server({ available: false, problem: "mtime_unreliable" });
+    renderAt("/settings/files");
+    expect(await screen.findByText(/doesn't keep file times exactly enough/)).toBeTruthy();
+  });
+
   it("has nothing to run when nothing is waiting", async () => {
     server({ ...STATUS, trashed: none, deleted: none });
     renderAt("/settings/files");

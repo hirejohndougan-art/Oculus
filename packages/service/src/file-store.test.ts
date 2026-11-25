@@ -23,7 +23,7 @@ import { hostname, tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { newOrganizationId } from "@oculus/core";
-import { STORE_MARKER, openFileStore, type FileStore } from "./file-store.js";
+import { LEASE_LOCK, STORE_MARKER, openFileStore, type FileStore } from "./file-store.js";
 
 let dir: string;
 let store: FileStore;
@@ -541,6 +541,92 @@ describe("the second review's changes", () => {
     expect(await store.restoreFromTrash(other, sha(body))).toBe("already_stored");
     expect(readFileSync(store.pathFor(other, sha(body))).equals(body)).toBe(true);
     expect(existsSync(join(dir, other, "trash", sha(body)))).toBe(false);
+    rmSync(join(dir, other), { recursive: true, force: true });
+  });
+});
+
+describe("the S-052 review's store changes", () => {
+  it("keeps sub-second times (the purge's self-test), and every touch changes a copy's time", async () => {
+    expect(await store.mtimeSelfTest()).toBe(true);
+    expect(readdirSync(dir).filter((n) => n.startsWith(".mtime-"))).toEqual([]);
+    const other = newOrganizationId();
+    const body = randomBytes(64);
+    const got = await store.receive(other, chunksOf(body));
+    if (!got.ok) throw new Error(got.code);
+    await store.place(got.file);
+    await store.discard(got.file);
+    const time = () => lstatSync(store.pathFor(other, sha(body)), { bigint: true }).mtimeNs;
+    let before = time();
+    for (let i = 0; i < 5; i++) {
+      expect(await store.touch(other, sha(body))).toBe(true);
+      expect(time()).not.toBe(before);
+      before = time();
+    }
+    rmSync(join(dir, other), { recursive: true, force: true });
+  });
+
+  it("takes the lease lock one at a time, and takes over a lock its holder left", async () => {
+    const lock = join(dir, LEASE_LOCK);
+    const order: string[] = [];
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    const first = store.withLeaseLock(async () => {
+      order.push("first in");
+      await held;
+      order.push("first out");
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    const second = store.withLeaseLock(() => {
+      order.push("second");
+      return Promise.resolve(7);
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    expect(order).toEqual(["first in"]);
+    release();
+    expect(await second).toBe(7);
+    await first;
+    expect(order).toEqual(["first in", "first out", "second"]);
+    expect(existsSync(lock)).toBe(false);
+    // A lock left by a process on this host that is gone.
+    writeFileSync(lock, `${hostname().replace(/[^A-Za-z0-9.-]/g, "_")}\n999999999\nabcd\n`);
+    expect(await store.withLeaseLock(() => Promise.resolve("taken"))).toBe("taken");
+    // A lock from elsewhere, older than two minutes by the file system's clock.
+    writeFileSync(lock, "another-host\n12\nabcd\n");
+    const old = new Date(Date.now() - 5 * 60_000);
+    utimesSync(lock, old, old);
+    expect(await store.withLeaseLock(() => Promise.resolve("taken"))).toBe("taken");
+    expect(existsSync(lock)).toBe(false);
+    // Nor is the lock counted as the folder's content.
+    writeFileSync(lock, "another-host\n12\nabcd\n");
+    const empty = mkdtempSync(join(tmpdir(), "oculus-store-lock-"));
+    writeFileSync(join(empty, LEASE_LOCK), "x");
+    expect(await (await openFileStore({ dir: empty })).isEmpty()).toBe(true);
+    rmSync(empty, { recursive: true, force: true });
+    rmSync(lock, { force: true });
+  });
+
+  it("reports a trashed copy with a second link as stuck and never deletes or moves it", async () => {
+    const other = newOrganizationId();
+    const body = randomBytes(80);
+    const got = await store.receive(other, chunksOf(body));
+    if (!got.ok) throw new Error(got.code);
+    await store.place(got.file);
+    await store.discard(got.file);
+    const stamp = await store.copyStamp(other, sha(body));
+    if (stamp === undefined) throw new Error("no stamp");
+    expect(await store.trashContent(other, sha(body), stamp.mtimeNs)).toBe("trashed");
+    const trashed = join(dir, other, "trash", sha(body), "content");
+    const extra = join(dir, other, "kept-elsewhere");
+    linkSync(trashed, extra);
+    expect(await store.trashEntries(other)).toEqual([
+      expect.objectContaining({ sha256: sha(body), stuck: true, size: body.length }),
+    ]);
+    expect(await store.deleteTrashed(other, sha(body), stamp.mtimeNs)).toBe("changed");
+    expect(await store.restoreFromTrash(other, sha(body))).toBe("none");
+    expect(readFileSync(trashed).equals(body)).toBe(true);
+    expect(existsSync(store.pathFor(other, sha(body)))).toBe(false);
     rmSync(join(dir, other), { recursive: true, force: true });
   });
 });

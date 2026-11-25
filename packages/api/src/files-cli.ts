@@ -45,6 +45,8 @@ const PURGE_PROBLEMS: Readonly<Record<string, string>> = {
   other_install: "the files folder belongs to another Oculus install.",
   lease_mismatch:
     "the files folder's lease isn't this database's: another database uses the folder, or this one was restored or copied. Nothing is purged until npm run files:adopt.",
+  mtime_unreliable:
+    "the files folder's file system doesn't keep file times exactly enough to tell whether a copy was used since it was removed. Nothing is purged on it.",
 };
 
 function size(bytes: number): string {
@@ -72,6 +74,11 @@ export function purgeLines(report: PurgeReport): string[] {
     `${report.dryRun ? "Would put back" : "Put back"} from the trash: ${count(report.restored)}.`,
     `Waiting in the trash for a later step: ${count(report.waiting)}.`,
   ];
+  if (report.stuck.files > 0) {
+    lines.push(
+      `Stuck in the trash, left alone (not a plain copy of Oculus's own; look at them): ${count(report.stuck)}.`,
+    );
+  }
   if (report.stopped !== undefined) {
     lines.push(
       report.stopped === "lease_expired"

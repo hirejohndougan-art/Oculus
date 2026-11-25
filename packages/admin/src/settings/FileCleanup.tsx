@@ -30,6 +30,7 @@ export interface CleanupStatus {
   readonly deleted?: Totals;
   readonly restored?: Totals;
   readonly waiting?: Totals;
+  readonly stuck?: Totals;
   readonly stopped?: "lease_expired" | "lease_lost";
 }
 
@@ -39,6 +40,8 @@ const PROBLEMS: Readonly<Record<string, string>> = {
   other_install: "The files folder belongs to another Oculus install, so nothing is cleaned up.",
   lease_mismatch:
     "Another database is using the files folder, or this database was restored or copied. Nothing is cleaned up until someone on the server runs npm run files:adopt.",
+  mtime_unreliable:
+    "The disk the files folder is on doesn't keep file times exactly enough to tell whether a file was used again, so nothing is cleaned up on it.",
 };
 
 function size(bytes: number): string {
@@ -128,9 +131,9 @@ export function FileCleanup() {
         {title}
         <p>
           When a file is removed from a record, its copy stays on the server's disk. Cleaning up
-          frees that space in two steps, never for a file still in use: a file removed at least 7
-          days ago goes to the trash, and a later step at least a day after that deletes it. An
-          upload of the same file brings it back from the trash.
+          frees that space in two steps, never for a file used since it was removed: a file removed
+          at least 7 days ago goes to the trash, and a later step at least a day after that deletes
+          it. An upload of the same file brings it back from the trash.
         </p>
       </div>
 
@@ -167,6 +170,12 @@ export function FileCleanup() {
             <dd>{files(s.deleted)}</dd>
             <dt>In the trash, waiting for their day</dt>
             <dd>{files(s.waiting)}</dd>
+            {(s.stuck?.files ?? 0) === 0 ? null : (
+              <>
+                <dt>Stuck in the trash (left alone: ask someone to look at the server)</dt>
+                <dd>{files(s.stuck)}</dd>
+              </>
+            )}
             {(s.restored?.files ?? 0) === 0 ? null : (
               <>
                 <dt>To put back from the trash (in use again)</dt>

@@ -47,6 +47,7 @@ export {
   DEFAULT_MIN_FREE_BYTES,
   DEFAULT_MIN_FREE_FRACTION,
   STORE_MARKER,
+  LEASE_LOCK,
 } from "./file-store.js";
 export type {
   CopyStamp,

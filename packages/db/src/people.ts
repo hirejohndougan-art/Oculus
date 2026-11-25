@@ -553,7 +553,10 @@ export type AuditEntry =
   | {
       readonly type: "system";
       readonly at: string;
-      /** `user:<id>`, or `command_line` for the release command on the server. */
+      /**
+       * `user:<id>`, `command_line` for a command on the server, or `timer`
+       * for the daily purge (S-052).
+       */
       readonly actor: string;
       readonly actorName: string | null;
       readonly eventId: string;
@@ -698,7 +701,8 @@ export async function readAuditTrail(
       -- Changes to the server itself (T-060a): no organization's, so only
       -- for system managers (scope.system).
       SELECT 'system', s.occurred_at, 's' || s.id::text,
-             CASE WHEN s.actor_id IS NULL THEN 'command_line' ELSE 'user:' || s.actor_id::text END,
+             CASE WHEN s.actor_id IS NOT NULL THEN 'user:' || s.actor_id::text
+                  WHEN s.source = 'timer' THEN 'timer' ELSE 'command_line' END,
              NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
              s.id::text, s.kind, NULL, NULL, NULL, NULL, NULL, s.version, s.from_version,
              s.file_count, s.byte_count

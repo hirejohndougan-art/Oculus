@@ -46,6 +46,8 @@ export interface NewFilePurgeEvent {
   readonly kind: "files_trashed" | "files_deleted" | "files_restored";
   readonly files: number;
   readonly bytes: number;
+  /** `timer` for the daily automatic run (then `actorId` is null); left out otherwise. */
+  readonly source?: "timer";
 }
 
 /** Appends one row, stamped now by the database. */
@@ -71,6 +73,9 @@ export async function insertSystemEvent(
   }
   if (
     !SYSTEM_EVENT_KINDS.includes(event.kind) ||
+    // Checked as data too: a caller in plain JavaScript could send anything.
+    ((event.source as unknown) !== undefined &&
+      ((event.source as unknown) !== "timer" || event.actorId !== null)) ||
     !Number.isSafeInteger(event.files) ||
     event.files < 0 ||
     !Number.isSafeInteger(event.bytes) ||
@@ -79,7 +84,7 @@ export async function insertSystemEvent(
     throw new TypeError("insertSystemEvent: a malformed event.");
   }
   await tx.execute(sql`
-    INSERT INTO public.system_events (id, actor_id, kind, file_count, byte_count)
+    INSERT INTO public.system_events (id, actor_id, kind, file_count, byte_count, source)
     VALUES (${randomUUID()}::uuid, ${event.actorId}::uuid, ${event.kind}, ${event.files}::integer,
-            ${event.bytes}::bigint)`);
+            ${event.bytes}::bigint, ${event.source ?? null}::text)`);
 }

@@ -350,7 +350,9 @@ export interface PurgeCandidate {
 
 /**
  * The organization's contents the purge may move to the trash (S-052,
- * D-086), **denying by default**: no row names the content; this
+ * D-086), **denying by default**: nothing keeps the content (the one list
+ * of what does is the database's `stored_content_kept`, 0042: today a
+ * stored_files row; S-040's quarantine adds one line there); this
  * database's newest event for it (counting only events since `since`, the
  * last `files:adopt`) is a removal that logged the copy's time, at least
  * `REMOVED_FILE_GRACE_SECONDS` old by the database's clock; and it isn't
@@ -391,8 +393,7 @@ export async function purgeCandidates(
     WHERE l.kind = 'removed' AND l.copy_mtime_ns IS NOT NULL
       AND l.occurred_at <= clock_timestamp()
         - make_interval(secs => ${REMOVED_FILE_GRACE_SECONDS}::integer)
-      AND NOT EXISTS (SELECT 1 FROM public.stored_files f
-                      WHERE f.organization_id = ${organizationId}::uuid AND f.sha256 = l.sha256)
+      AND NOT public.stored_content_kept(${organizationId}::uuid, l.sha256)
       AND NOT EXISTS (
         SELECT 1 FROM (
           SELECT p.kind FROM public.file_purge_steps p
@@ -425,7 +426,7 @@ export interface TrashedContent {
   readonly dayOld: boolean;
   /**
    * The removal is still this database's newest event for the content (no
-   * placing or attach since) and no row names it.
+   * placing or attach since) and nothing keeps it (`stored_content_kept`).
    */
   readonly stillRemoved: boolean;
 }
@@ -461,8 +462,7 @@ export async function trashedContents(
       to_char(n.occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS trashed_at,
       n.occurred_at <= clock_timestamp() - make_interval(secs => ${TRASH_GRACE_SECONDS}::integer)
         AS day_old,
-      (NOT EXISTS (SELECT 1 FROM public.stored_files f
-                   WHERE f.organization_id = ${organizationId}::uuid AND f.sha256 = n.sha256)
+      (NOT public.stored_content_kept(${organizationId}::uuid, n.sha256)
        AND (SELECT e.id FROM public.stored_file_events e
             WHERE e.organization_id = ${organizationId}::uuid AND e.sha256 = n.sha256
             ORDER BY e.occurred_at DESC, e.id DESC LIMIT 1) = n.removal_id) AS still_removed

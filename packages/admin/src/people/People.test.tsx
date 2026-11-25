@@ -419,8 +419,8 @@ describe("the audit trail", () => {
             {
               type: "system",
               at: "2026-11-23T10:00:00.000Z",
-              actor: "user:x",
-              actorName: "Root Invented",
+              actor: "timer",
+              actorName: null,
               eventId: "00000000-0000-4000-8000-0000000000f1",
               kind: "files_trashed",
               version: "",
@@ -441,6 +441,7 @@ describe("the audit trail", () => {
     expect(screen.getByText("Went back to Oculus 1.1.0 (from 1.2.0)")).toBeTruthy();
     // A purge step (S-052).
     expect(screen.getByText("Moved removed files to the trash: 3 files (3.0 MB)")).toBeTruthy();
-    expect(screen.getAllByText("Root Invented")).toHaveLength(2);
+    expect(screen.getByText("Root Invented")).toBeTruthy();
+    expect(screen.getByText("Oculus's daily clean-up")).toBeTruthy();
   });
 });

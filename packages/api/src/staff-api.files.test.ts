@@ -1155,7 +1155,7 @@ describe("a second database on the folder never deletes production's files (four
     }
   }, 120_000);
 
-  it("R1b: a clone taken right after production's renewal is caught at production's next renewal", async () => {
+  it("R1b: a copy taken right after production's renewal is refused at once, and production's next renewal sees it", async () => {
     const work = mkdtempSync(join(tmpdir(), "oculus-files-r1b-"));
     const name = `oculus_test_r1b_${randomBytes(6).toString("hex")}`;
     let copy: Database | undefined;
@@ -1170,8 +1170,14 @@ describe("a second database on the folder never deletes production's files (four
       await dumpTo(w.testDb.url, join(work, "a.dump"));
       copy = openDatabase(await restoreInto(join(work, "a.dump"), name), { max: 3 });
       const copyService = createService(copy, { files: store });
-      expect(await copyService.bindFileStore()).toEqual({ ok: true });
-      // Production's next hourly renewal finds the folder moved on without it.
+      // A dump restored is another database (its identity, in the marker,
+      // differs): even with the folder's very epoch it is refused at once
+      // (S-052 review B1a), and the lease is poisoned.
+      expect(await copyService.bindFileStore()).toEqual({
+        ok: true,
+        warning: "files_shared_or_restored",
+      });
+      // Production's next hourly renewal finds the folder isn't its own either.
       expect(await createService(w.db, { files: store }).renewFileLease()).toBe(false);
       await removeVia(copy, asset, xId);
       await backdate(copy, { fileId: xId }, "8 days");

@@ -227,11 +227,13 @@ export function Audit() {
                   {e.actorName ??
                     (e.actor === "command_line"
                       ? "The server's command line"
-                      : e.type === "system"
-                        ? "A former system manager"
-                        : e.actor.startsWith("system:")
-                          ? "Oculus"
-                          : "Someone outside this organization")}
+                      : e.actor === "timer"
+                        ? "Oculus's daily clean-up"
+                        : e.type === "system"
+                          ? "A former system manager"
+                          : e.actor.startsWith("system:")
+                            ? "Oculus"
+                            : "Someone outside this organization")}
                 </td>
                 <td>{what(e, sites)}</td>
                 <td className={styles.muted}>
