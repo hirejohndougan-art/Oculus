@@ -2,7 +2,7 @@
  * Reading finding aids for EAD exports (T-059b, D-120).
  *
  * - `readPublicFindingAid`: a public host's "Download EAD". Through the
- *   public reader only: `public_finding_aid_units` (0066) names the units
+ *   public reader only: `public_finding_aid_units` (0067) names the units
  *   below the top unit that are public on the site (reached only through
  *   such units), then each unit is read exactly as `readPublicRecord` reads
  *   one record (`publicRecordIn`, in the same Repeatable Read snapshot), and
@@ -37,7 +37,7 @@ import {
   publicRecordIn,
 } from "./workflow.js";
 
-/** The most units a public finding aid holds (0066 stops counting past it). */
+/** The most units a public finding aid holds (0067 stops counting past it). */
 export const MAX_PUBLIC_FINDING_AID_UNITS = 1_000;
 
 /** The most units a staff finding aid holds. */
