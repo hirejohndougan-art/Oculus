@@ -13,6 +13,7 @@ import {
   grantPublicReaderRole,
   insertTemplateVersion,
   openDatabase,
+  readPublicRecord,
   sql,
   type Database,
   type Queryable,
@@ -22,7 +23,13 @@ import { testServerUrl } from "../../db/src/test-database.fixtures.js";
 import { FAKE_TEST_SECRET_KEY } from "../../db/src/second-factor.fixtures.js";
 import { loadAdminFiles } from "./admin-files.js";
 import { buildAdminServer } from "./admin-server.js";
-import { clientKey, publicApiRoutes } from "./public-api.js";
+import {
+  clientKey,
+  PUBLIC_POOL_SIZE,
+  PUBLIC_POOL_WAIT_MS,
+  publicApiRoutes,
+  publicPoolOptions,
+} from "./public-api.js";
 import { checkPublicSites } from "./public-sites.js";
 import { buildServer } from "./server.js";
 import { actorOf, makeObject, makeWorld, ok, publishAs, type World } from "./staff-api.fixtures.js";
@@ -257,5 +264,140 @@ describe("GET /records/:id on a public host", () => {
     expect(clientKey("2001:db8::1")).toBe("2001:db8:0:0::/64");
     expect(clientKey("2001:0db8:0001:0002::5")).toBe("2001:db8:1:2::/64");
     expect(clientKey("::1")).toBe("0:0:0:0::/64");
+  });
+
+  it("a read stalled past its time limit is 503 busy, and the connection keeps its own setting (S-037)", async () => {
+    const sites = await checkPublicSites(w.db, reader, [{ origin: PUBLIC, siteId: w.a1 }]);
+    const logged: unknown[] = [];
+    const limited = await buildServer({
+      env: { OCULUS_ORIGINS: PUBLIC },
+      routes: publicApiRoutes({
+        db: reader,
+        sites,
+        timeLimitMs: 200,
+        log: (r) => logged.push(r),
+      }),
+    });
+    // The attack's effect: something holds the records table, so a public
+    // snapshot would wait for as long as it is held.
+    const owner = openDatabase(w.testDb.url, { max: 1 });
+    let release: () => void = () => undefined;
+    let locked: () => void = () => undefined;
+    const holding = new Promise<void>((resolve) => {
+      locked = resolve;
+    });
+    const held = owner.transaction(async (q) => {
+      await q.execute(sql`LOCK TABLE public.records IN ACCESS EXCLUSIVE MODE`);
+      locked();
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    });
+    try {
+      await holding;
+      const started = Date.now();
+      const stalled = await get("127.0.0.1", `/records/${published}`, limited);
+      expect(stalled.statusCode).toBe(503);
+      expect(stalled.json()).toEqual({ error: "busy" });
+      expect(Date.now() - started).toBeLessThan(5_000);
+      expect(logged).toEqual([
+        { event: "service_error", operation: "readPublicRecord", name: "timeout" },
+      ]);
+    } finally {
+      release();
+      await held;
+      await owner.close();
+    }
+    try {
+      // The lock is gone: the same read works, on the same pooled connections.
+      expect((await get("127.0.0.1", `/records/${published}`, limited)).statusCode).toBe(200);
+      // The limit was the transaction's own: the pool's connections keep the role's setting.
+      const settings = await Promise.all(
+        [0, 1].map(() =>
+          reader.rows<{ t: string }>(sql`SELECT current_setting('statement_timeout') AS t`),
+        ),
+      );
+      for (const [row] of settings) expect(row?.t).toBe("0");
+    } finally {
+      await limited.close();
+    }
+  });
+
+  it("a read that can't get a connection in time is 503 busy (S-037)", async () => {
+    const url = new URL(w.testDb.url);
+    url.username = readerRole;
+    const small = openDatabase(url.toString(), { max: 1, connectionTimeoutMillis: 100 });
+    const sites = await checkPublicSites(w.db, small, [{ origin: PUBLIC, siteId: w.a1 }]);
+    // More slots than connections, so a read waits on the pool itself.
+    const waiting = await buildServer({
+      env: { OCULUS_ORIGINS: PUBLIC },
+      routes: publicApiRoutes({ db: small, sites, maxConcurrent: 2 }),
+    });
+    let release: () => void = () => undefined;
+    let taken: () => void = () => undefined;
+    const holding = new Promise<void>((resolve) => {
+      taken = resolve;
+    });
+    const held = small.transaction(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+          taken();
+        }),
+    );
+    try {
+      await holding;
+      const reply = await get("127.0.0.1", `/records/${published}`, waiting);
+      expect(reply.statusCode).toBe(503);
+      expect(reply.json()).toEqual({ error: "busy" });
+    } finally {
+      release();
+      await held;
+    }
+    try {
+      expect((await get("127.0.0.1", `/records/${published}`, waiting)).statusCode).toBe(200);
+    } finally {
+      await waiting.close();
+      await small.close();
+    }
+  });
+
+  it("the public pool's options wait a bounded time for a connection (S-037)", () => {
+    expect(publicPoolOptions()).toEqual({
+      applicationName: "oculus-public",
+      max: PUBLIC_POOL_SIZE,
+      connectionTimeoutMillis: PUBLIC_POOL_WAIT_MS,
+    });
+    expect(PUBLIC_POOL_WAIT_MS).toBeGreaterThan(0);
+    expect(PUBLIC_POOL_WAIT_MS).toBeLessThanOrEqual(10_000);
+  });
+
+  it("readPublicRecord takes only a whole-number time limit within bounds (S-037)", async () => {
+    const read = (timeLimitMs: unknown) =>
+      readPublicRecord(
+        reader,
+        w.a,
+        w.a1,
+        published as never,
+        {
+          baseUrl: `${PUBLIC}/records/`,
+          timeLimitMs,
+        } as never,
+      );
+    for (const bad of [0, -1, 1.5, 60_001, Number.NaN, "200", null]) {
+      const result = await read(bad);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.issues.map((i) => i.code)).toEqual(["invalid_options"]);
+    }
+    for (const good of [1_000, 60_000, undefined]) expect((await read(good)).ok).toBe(true);
+  });
+
+  it("the routes refuse a time limit every read would refuse (S-037)", () => {
+    for (const bad of [0, -1, 1.5, 60_001, Number.NaN]) {
+      expect(() => publicApiRoutes({ db: reader, sites: [], timeLimitMs: bad })).toThrow(
+        RangeError,
+      );
+    }
+    expect(() => publicApiRoutes({ db: reader, sites: [], timeLimitMs: 60_000 })).not.toThrow();
   });
 });
