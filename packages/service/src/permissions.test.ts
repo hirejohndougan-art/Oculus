@@ -1475,7 +1475,10 @@ describe("the database backs the rules up", () => {
       "role_assignments.role_assignments_check_grant",
       "role_assignments.role_assignments_check_new",
       "role_assignments.zzzz_role_assignments_keep_identity",
+      // 0051 (S-064): definitions in the change log.
+      "sites.definition_events_log",
       "sites.zzzz_sites_keep_identity",
+      "system_settings.definition_events_log",
       "system_settings.system_settings_version_step",
     ]);
     expect(rows.every((r) => r.tgenabled === "A")).toBe(true);
