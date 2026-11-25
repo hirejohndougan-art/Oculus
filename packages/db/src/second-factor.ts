@@ -481,7 +481,9 @@ type Attempt =
  * sessions that no right code explained: someone with the password tried
  * codes and gave up, which the person's counter, cleared by their next right
  * code and forgotten after a day, would never show. An alert takes those
- * codes off the unexplained counter, so each is told once.
+ * codes off the unexplained counter, so each is told once. Each alert keeps
+ * when the newest code it tells was typed (`last_code_at`, S-054c), for the
+ * notice.
  */
 async function takeCodeAttempt(db: Database, who: Who, input: CodeInput): Promise<Attempt> {
   const keys = keysFor(who, input);
@@ -509,12 +511,15 @@ async function takeCodeAttempt(db: Database, who: Who, input: CodeInput): Promis
       let wait = 0;
       let sessionFailures = 0;
       let unexplained = 0;
+      // When the newest of those codes was typed (S-054c), before this one.
+      let unexplainedAt: number | null = null;
       for (const row of rows) {
         if (row.key === wrongKey) {
           // Forgotten after WRONG_CODE_MEMORY_SECONDS without a new one.
           const fresh =
             row.last_ms !== null && now - row.last_ms < WRONG_CODE_MEMORY_SECONDS * 1000;
           unexplained = fresh ? row.failures : 0;
+          unexplainedAt = fresh ? row.last_ms : null;
           continue;
         }
         if (row.key.startsWith("session:")) {
@@ -541,6 +546,8 @@ async function takeCodeAttempt(db: Database, who: Who, input: CodeInput): Promis
       const mine = Math.min(counted, sent + (wrongCounted ? 1 : 0));
       const fromOthers = counted - mine;
       let alertFailures: number | undefined;
+      // The newest code the alert tells, for the notice (S-054c).
+      let alertCodeAt: number | null = null;
       let waitAlert = false;
       for (const { key, next } of decisions) {
         if (typeof next === "number") {
@@ -555,7 +562,14 @@ async function takeCodeAttempt(db: Database, who: Who, input: CodeInput): Promis
             WHERE key = ${key}`);
           const over = next.next.failures - SECOND_STEP_THROTTLE.free;
           if (key.startsWith("user:") && over >= 0 && over % 10 === 0) {
-            alertFailures = next.next.failures;
+            // The wait takes every unexplained code off the counter below,
+            // so its count is never less than they are (S-054c): codes
+            // another session left that the day's count doesn't have (a
+            // full session's right code cleared it, or a day forgot it)
+            // are told here, not dropped. The two can overlap, so the larger
+            // is told, never the sum: no code is counted twice.
+            alertFailures = Math.max(next.next.failures, counted);
+            alertCodeAt = now;
             waitAlert = true;
           }
         }
@@ -563,11 +577,15 @@ async function takeCodeAttempt(db: Database, who: Who, input: CodeInput): Promis
       // A session's first code finding other sessions' unexplained wrong codes (S-045).
       if (alertFailures === undefined && sessionFailures <= 1 && fromOthers > 0) {
         alertFailures = fromOthers;
+        // A first code: none of this session's own codes is on the counter
+        // yet, so its time is the newest of the others' codes.
+        alertCodeAt = unexplainedAt;
       }
       if (alertFailures !== undefined) {
         await tx.execute(sql`
-          INSERT INTO public.second_step_alerts (id, user_id, failures)
-          VALUES (${randomUUID()}::uuid, ${who.userId}::uuid, ${alertFailures})`);
+          INSERT INTO public.second_step_alerts (id, user_id, failures, last_code_at)
+          VALUES (${randomUUID()}::uuid, ${who.userId}::uuid, ${alertFailures},
+                  to_timestamp(${alertCodeAt}::float8 / 1000))`);
       }
       // Told now (or nothing to tell): only this session's own codes stay
       // unexplained, and none after a wait's alert, whose count has them.

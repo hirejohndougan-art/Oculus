@@ -283,6 +283,48 @@ describe("sendSecondStepAlertNotices", () => {
     expect(box.messages).toEqual([]);
   });
 
+  it("gives when the codes were typed, not when the alert was written (S-054c)", async () => {
+    await ready();
+    await drain();
+    const p = await person();
+    const q = await person();
+    // Codes typed three hours before the alert (told by the cleanup, say).
+    await db.execute(sql`
+      INSERT INTO public.second_step_alerts (id, user_id, failures, created_at, last_code_at)
+      VALUES (gen_random_uuid(), ${p.userId}::uuid, 2, clock_timestamp(),
+              clock_timestamp() - interval '3 hours')`);
+    // A time after the alert's (a clock stepped back) is never given.
+    await db.execute(sql`
+      INSERT INTO public.second_step_alerts (id, user_id, failures, created_at, last_code_at)
+      VALUES (gen_random_uuid(), ${q.userId}::uuid, 1, clock_timestamp() - interval '1 hour',
+              clock_timestamp() + interval '1 hour')`);
+    const times = await db.rows<{ user_id: string; code: string; created: string }>(sql`
+      SELECT user_id::text AS user_id,
+             to_char(last_code_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS code,
+             to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created
+      FROM public.second_step_alerts WHERE user_id IN (${p.userId}::uuid, ${q.userId}::uuid)`);
+    const of = (u: UserId) => times.find((t) => t.user_id === u);
+    const box = inbox();
+    await sendSecondStepAlertNotices(db, box.deliver);
+    const toPerson = (email: string) =>
+      box.messages.find((m) => m.to === "person" && m.email === email);
+    expect(toPerson(p.email)).toMatchObject({ failures: 2, at: of(p.userId)?.code });
+    expect(toPerson(q.email)).toMatchObject({ failures: 1, at: of(q.userId)?.created });
+    expect(of(p.userId)?.code).not.toBe(of(p.userId)?.created);
+    // An alert written before the time was kept gives when it was written.
+    const r = await person();
+    await alert(r.userId, 3);
+    const created = await db.rows<{ at: string }>(sql`
+      SELECT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS at
+      FROM public.second_step_alerts WHERE user_id = ${r.userId}::uuid`);
+    const later = inbox();
+    await sendSecondStepAlertNotices(db, later.deliver);
+    expect(later.messages.find((m) => m.to === "person")).toMatchObject({
+      failures: 3,
+      at: created[0]?.at,
+    });
+  });
+
   it("checks its options", async () => {
     await ready();
     await expect(

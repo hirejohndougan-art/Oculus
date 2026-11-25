@@ -54,7 +54,10 @@ export interface AlertedPerson {
   readonly email: string;
   /** The wrong codes counted when the alert was recorded. */
   readonly failures: number;
-  /** When it was recorded (core's ISO form). */
+  /**
+   * When the newest wrong code it tells was typed (core's ISO form; S-054c),
+   * or, for alerts written before that was kept, when it was recorded.
+   */
   readonly at: string;
 }
 
@@ -147,7 +150,10 @@ export async function sendSecondStepAlertNotices(
       await tx.rows(sql`SELECT pg_advisory_xact_lock(85, 0)`);
       const pending = await tx.rows<PendingAlert>(sql`
         SELECT a.id::text AS id, a.user_id::text AS user_id, a.failures,
-               to_char(a.created_at AT TIME ZONE 'UTC', ${ISO}) AS at,
+               -- When the newest code was typed (S-054c); older rows have
+               -- no such time, and a clock stepped back can't put it later.
+               to_char(least(coalesce(a.last_code_at, a.created_at), a.created_at)
+                         AT TIME ZONE 'UTC', ${ISO}) AS at,
                a.created_at > clock_timestamp() - make_interval(secs => ${window}) AS young
         FROM public.second_step_alerts a
         WHERE NOT EXISTS (SELECT 1 FROM public.second_step_alert_notices n WHERE n.alert_id = a.id)

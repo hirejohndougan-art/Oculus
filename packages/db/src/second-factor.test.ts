@@ -861,6 +861,106 @@ describe("wrong codes no right code explained raise an alert (S-045)", () => {
     expect(await unexplained(old.userId)).toBe(0);
   });
 
+  /** How many hours before now each alert's newest code was typed (S-054c), oldest alert first. */
+  async function codeAgesOf(userId: UserId): Promise<(number | null)[]> {
+    return (
+      await db.rows<{ hours: number | null }>(sql`
+        SELECT (extract(epoch FROM clock_timestamp() - last_code_at) / 3600)::float8 AS hours
+        FROM public.second_step_alerts WHERE user_id = ${userId}::uuid
+        ORDER BY created_at, id`)
+    ).map((x) => (x.hours === null ? null : Math.round(x.hours)));
+  }
+
+  it("the wait's alert carries the unexplained codes its day's count doesn't have (S-054c)", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    // Four codes today (one short of a wait), and six other unexplained codes
+    // the day's count doesn't have (left, say, before a full session's right
+    // code cleared the person's counter, with no cleanup run since).
+    await db.execute(sql`
+      INSERT INTO public.second_step_throttles (key, failures, last_failure_at)
+      VALUES (${`user:${person.userId}`}, 4, clock_timestamp() - interval '10 minutes'),
+             (${`wrong:${person.userId}`}, 6, clock_timestamp() - interval '20 minutes')`);
+    const a = await pending(person.userId, org);
+    expect(
+      await completeSecondStep(db, keys, a.token, {
+        source: source(),
+        code: await wrongFor(person.userId),
+      }),
+    ).toMatchObject({ code: "invalid_code" });
+    // The 5th of the day starts the wait. Its alert used to say 5 and take
+    // all 7 unexplained codes off the counter, so 2 were never told.
+    expect(await alertsOf(person.userId)).toEqual([7]);
+    expect(await unexplained(person.userId)).toBe(0);
+    // Nothing is told twice: not by the cleanup, nor by the next sign-in.
+    await later(person.userId, 2);
+    await runCleanup(db);
+    expect(await alertsOf(person.userId)).toEqual([7]);
+  });
+
+  it("the wait's alert says the day's count when that is the larger (S-054c)", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    // A full session's wrong re-entry codes count for the day, not as unexplained.
+    const s = await full(person.userId, org);
+    for (let i = 0; i < 4; i++) {
+      await reauthenticate(db, keys, s.token, {
+        password: PASSWORD,
+        source: source(),
+        code: await wrongFor(person.userId),
+      });
+    }
+    expect(await unexplained(person.userId)).toBe(0);
+    const a = await pending(person.userId, org);
+    await completeSecondStep(db, keys, a.token, {
+      source: source(),
+      code: await wrongFor(person.userId),
+    });
+    expect(await alertsOf(person.userId)).toEqual([5]);
+    expect(await unexplained(person.userId)).toBe(0);
+  });
+
+  it("each alert keeps when its newest code was typed, which the notice gives (S-054c)", async () => {
+    await ready();
+    const org = await organization();
+    const told = await member(org);
+    const cleaned = await member(org);
+    const waited = await member(org);
+    // A sign-in's first code tells codes another session left a day before:
+    // the alert is written now, but the codes are from then.
+    const a = await pending(told.userId, org);
+    for (let i = 0; i < 2; i++) {
+      await completeSecondStep(db, keys, a.token, {
+        source: source(),
+        code: await wrongFor(told.userId),
+      });
+    }
+    await later(told.userId, 25);
+    await full(told.userId, org);
+    expect(await alertsOf(told.userId)).toEqual([2]);
+    expect(await codeAgesOf(told.userId)).toEqual([25]);
+    // The cleanup tells codes three hours old: their time, not the cleanup's.
+    const b = await pending(cleaned.userId, org);
+    await completeSecondStep(db, keys, b.token, {
+      source: source(),
+      code: await wrongFor(cleaned.userId),
+    });
+    await later(cleaned.userId, 3);
+    await runCleanup(db);
+    expect(await alertsOf(cleaned.userId)).toEqual([1]);
+    expect(await codeAgesOf(cleaned.userId)).toEqual([3]);
+    // A wait's alert is about the code that started it: now.
+    const c = await pending(waited.userId, org);
+    const wrong = await wrongFor(waited.userId);
+    for (let i = 0; i < 5; i++) {
+      await completeSecondStep(db, keys, c.token, { source: source(), code: wrong });
+    }
+    expect(await alertsOf(waited.userId)).toEqual([5]);
+    expect(await codeAgesOf(waited.userId)).toEqual([0]);
+  });
+
   it("doesn't count a signed-in person's re-entry codes, which come after a whole sign-in", async () => {
     await ready();
     const org = await organization();
