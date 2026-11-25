@@ -524,11 +524,9 @@ async function buildSnapshot(
     identifierTypes: types.value,
     today,
   });
+  // An empty day (the stored zone no longer known to PostgreSQL) makes
+  // indexAccessions refuse (invalid_today), so this refuses: never a guess.
   if (!register.ok) return refused(["accessions"], "unreadable_accessions", CANT_CHECK);
-  // The register must be the one for that day (D-056's freshness rule).
-  if (register.value.heldAsOf !== today) {
-    return refused(["accessions"], "unreadable_accessions", CANT_CHECK);
-  }
 
   return {
     ok: true,

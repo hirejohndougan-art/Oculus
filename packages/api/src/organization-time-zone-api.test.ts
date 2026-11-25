@@ -42,12 +42,17 @@ afterAll(async () => {
   await w.testDb.drop();
 });
 
-async function call(method: "GET" | "PUT", as: string | undefined, body?: unknown) {
+async function call(
+  method: "GET" | "PUT",
+  as: string | undefined,
+  body?: unknown,
+  { csrf = true }: { csrf?: boolean } = {},
+) {
   const token = as === undefined ? undefined : tokens[as];
   const headers: Record<string, string> = { origin: SAME_ORIGIN.origin };
   if (token !== undefined) {
     headers.cookie = `${OCULUS_COOKIES.session}=${token}`;
-    if (method !== "GET") headers[CSRF_HEADER] = csrfTokenFor(token) ?? "";
+    if (method !== "GET" && csrf) headers[CSRF_HEADER] = csrfTokenFor(token) ?? "";
   }
   let payload: string | undefined;
   if (body !== undefined) {
@@ -91,6 +96,8 @@ describe("the organization's time zone", () => {
       const refused = await call("PUT", who, { timeZone: "America/Chicago" });
       expect([who, refused.status]).toEqual([who, 403]);
     }
+    const noCsrf = await call("PUT", "root", { timeZone: "America/Chicago" }, { csrf: false });
+    expect(noCsrf.status).toBe(403);
     const stale = await call("PUT", "stale", { timeZone: "America/Chicago" });
     expect([stale.status, stale.json]).toEqual([403, { error: "reauthentication_required" }]);
     expect(await zoneOf(w.a)).toBe("UTC");
@@ -105,9 +112,11 @@ describe("the organization's time zone", () => {
 
   it("refuses an unknown zone and anything but { timeZone }", async () => {
     const before = await zoneOf(w.a);
-    const unknown = await call("PUT", "root", { timeZone: "Mars/Olympus_Mons" });
-    expect(unknown.status).toBe(422);
-    expect(codes(unknown)).toContain("unknown_time_zone");
+    for (const timeZone of ["Mars/Olympus_Mons", "localtime", "US/Central"]) {
+      const unknown = await call("PUT", "root", { timeZone });
+      expect([timeZone, unknown.status]).toEqual([timeZone, 422]);
+      expect(codes(unknown)).toContain("unknown_time_zone");
+    }
     const extra = await call("PUT", "root", { timeZone: "UTC", organizationId: w.b });
     expect(extra.status).toBe(422);
     expect(codes(extra)).toContain("unknown_property");
@@ -115,7 +124,7 @@ describe("the organization's time zone", () => {
     expect(await zoneOf(w.b)).toBe("UTC");
   });
 
-  it("another organization's member can't change this one", async () => {
+  it("a member of another organization who isn't a system manager is refused", async () => {
     const before = await zoneOf(w.a);
     const other = await call("PUT", "stranger", { timeZone: "Europe/London" });
     expect(other.status).toBe(403);

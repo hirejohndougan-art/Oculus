@@ -6,14 +6,22 @@
 -- day early). The publish check and the public output build the accession
 -- register with the day organization_local_day gives.
 --
--- time_zone is an IANA name PostgreSQL knows (checked against
+-- time_zone is 'UTC' or a canonical IANA Area/Location name (America/Chicago,
+-- Europe/London...), and one PostgreSQL knows (checked against
 -- pg_timezone_names on every insert and change, so a misspelt zone can't be
--- stored and quietly fall back to something else). 'UTC' for existing
--- organizations until a system manager sets theirs.
+-- stored and quietly fall back to something else). Names like 'localtime'
+-- (the server's own zone), 'posixrules', 'US/Central' or 'EST5EDT' are
+-- refused: the first is exactly what D-103 rules out, and the legacy ones
+-- can vanish when the operating system's time zone data changes. 'UTC' for
+-- existing organizations until a system manager sets theirs. Who changed it
+-- and when are kept, since the zone decides the day restrictions end.
 
 ALTER TABLE public.organizations
   ADD COLUMN time_zone text NOT NULL DEFAULT 'UTC'
-    CHECK (length(time_zone) BETWEEN 1 AND 64 AND time_zone ~ '^[A-Za-z0-9_+./-]+$');
+    CHECK (length(time_zone) <= 64 AND time_zone ~
+      '^(UTC|(Africa|America|Antarctica|Arctic|Asia|Atlantic|Australia|Europe|Indian|Pacific)/[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)?)$'),
+  ADD COLUMN time_zone_changed_by uuid REFERENCES public.users (id),
+  ADD COLUMN time_zone_changed_at timestamptz;
 
 CREATE FUNCTION public.organizations_check_time_zone() RETURNS trigger
 LANGUAGE plpgsql
@@ -37,17 +45,25 @@ CREATE TRIGGER organizations_check_time_zone
 ALTER TABLE public.organizations ENABLE ALWAYS TRIGGER organizations_check_time_zone;
 
 -- The organization's calendar day now (the transaction's start, so one
--- transaction sees one day), as YYYY-MM-DD. For the public reader too
--- (D-080), which can read no table: it learns only a date, and the same
--- date for an unknown organization as for one in UTC, so it can't tell
--- which organizations exist.
+-- transaction sees one day), as YYYY-MM-DD; NULL if its stored zone is one
+-- PostgreSQL no longer knows (time zone data changed under it), so the
+-- publish check and the public output refuse rather than guess or throw.
+-- For the public reader too (D-080), which can read no table: it learns
+-- only a date. An unknown organization gets the UTC day; an organization
+-- outside UTC can thus show, to someone who already holds its ID, that it
+-- exists and roughly its offset, during the hours its day differs from
+-- UTC's. That is all, and a public site's own pages say more.
 CREATE FUNCTION public.organization_local_day(p_org uuid)
 RETURNS text
-LANGUAGE sql STABLE SECURITY DEFINER
+LANGUAGE plpgsql STABLE SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $$
-  SELECT to_char(
-    (now() AT TIME ZONE coalesce(
-      (SELECT o.time_zone FROM public.organizations o WHERE o.id = p_org), 'UTC'))::date,
-    'YYYY-MM-DD')
+DECLARE
+  zone text := coalesce(
+    (SELECT o.time_zone FROM public.organizations o WHERE o.id = p_org), 'UTC');
+BEGIN
+  RETURN to_char((now() AT TIME ZONE zone)::date, 'YYYY-MM-DD');
+EXCEPTION WHEN invalid_parameter_value THEN
+  RETURN NULL;
+END
 $$;

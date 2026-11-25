@@ -5,33 +5,35 @@
  * the accession register (D-056). Setting it is a System settings change:
  * the service lets only system managers make it (D-072).
  */
-import type { OrganizationId, Validated } from "@oculus/core";
+import type { OrganizationId, UserId, Validated } from "@oculus/core";
 import type { Queryable } from "./client.js";
 import { sql } from "./sql.js";
 
 const UNKNOWN_ZONE =
-  "Choose a time zone from the list, such as America/Chicago (IANA names, as PostgreSQL knows them).";
+  "Choose a time zone such as America/Chicago or Europe/London (an IANA Area/Location name), or UTC.";
 
-/** Whether `value` has the shape of a zone name; the database decides whether it exists. */
+/** `UTC` or a canonical IANA Area/Location name, as migration 0029's CHECK allows. */
+const ZONE_NAME =
+  /^(UTC|(Africa|America|Antarctica|Arctic|Asia|Atlantic|Australia|Europe|Indian|Pacific)\/[A-Za-z0-9_+-]+(\/[A-Za-z0-9_+-]+)?)$/;
+
+/** Whether `value` has the shape of an allowed zone name; the database decides whether it exists. */
 export function looksLikeTimeZone(value: unknown): value is string {
-  return (
-    typeof value === "string" &&
-    value.length >= 1 &&
-    value.length <= 64 &&
-    /^[A-Za-z0-9_+./-]+$/.test(value) &&
-    !value.includes("..")
-  );
+  return typeof value === "string" && value.length <= 64 && ZONE_NAME.test(value);
 }
 
-/** The organization's time zone and its local day now; `undefined` for an unknown organization. */
+/**
+ * The organization's time zone and its local day now; `undefined` for an
+ * unknown organization. `today` is empty if the stored zone is no longer
+ * known to PostgreSQL (the publish check then refuses).
+ */
 export async function readOrganizationTimeZone(
   db: Queryable,
   organizationId: OrganizationId,
 ): Promise<{ timeZone: string; today: string } | undefined> {
-  const [row] = await db.rows<{ time_zone: string; today: string }>(sql`
+  const [row] = await db.rows<{ time_zone: string; today: string | null }>(sql`
     SELECT time_zone, public.organization_local_day(id) AS today
     FROM public.organizations WHERE id = ${organizationId}::uuid`);
-  return row === undefined ? undefined : { timeZone: row.time_zone, today: row.today };
+  return row === undefined ? undefined : { timeZone: row.time_zone, today: row.today ?? "" };
 }
 
 /**
@@ -42,6 +44,7 @@ export async function writeOrganizationTimeZone(
   db: Queryable,
   organizationId: OrganizationId,
   timeZone: unknown,
+  changedBy: UserId,
 ): Promise<Validated<{ timeZone: string; today: string }>> {
   const refuse = (): Validated<{ timeZone: string; today: string }> => ({
     ok: false,
@@ -53,7 +56,9 @@ export async function writeOrganizationTimeZone(
   );
   if (known.length === 0) return refuse();
   const changed = await db.execute(sql`
-    UPDATE public.organizations SET time_zone = ${timeZone}
+    UPDATE public.organizations
+    SET time_zone = ${timeZone}, time_zone_changed_by = ${changedBy}::uuid,
+        time_zone_changed_at = now()
     WHERE id = ${organizationId}::uuid`);
   if (changed !== 1) {
     return {

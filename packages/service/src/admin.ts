@@ -558,7 +558,7 @@ export function adminOperations(run: Runner): AdminOperations {
       return run("changeOrganizationTimeZone", context, async (tx, who) => {
         const allowed = await systemManager(tx, who);
         if (!allowed.ok) return allowed;
-        return writeOrganizationTimeZone(tx, who.organizationId, timeZone);
+        return writeOrganizationTimeZone(tx, who.organizationId, timeZone, allowed.value);
       });
     },
   };
