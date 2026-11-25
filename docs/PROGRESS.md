@@ -9,6 +9,14 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Review: two independent reviews. The first found that giving the codes' time as the message's `at` made the outbox drop notices of codes told a day on as expired; fixed (`codesAt` for wording only) and tested. The second: safe; notes (deploy migrations before code, as always; a wait during a re-entry can count another tab's in-flight codes) accepted.
 - Gate: see the baseline commit · npm audit clean
 - Next: the build run's S-054b (keep both sides in `takeCodeAttempt`)
+## 2026-11-25 16:45 CT — manual (Chat N) — S-058 Deleting a donor contact checks the agent's home site
+- Result: done
+- What changed: `deleteDonorContact` (service `accessions.ts`) now runs the same home-site check as `saveDonorContact` (`mayName`): `donors.edit` on the agent's own site, not on any site. Attack test: Donor relations on one site can't delete (or save) another site's agent's contact, even with a wrong version; with the role on that site it can.
+- Decisions: none
+- Review: independent review: safe (no hole, no data loss); notes: same behaviour as saving for records filed below the agent and for telling a missing agent from another site's
+- Gate: PASS · tests_passing 5234 (was 5233) · npm audit clean
+- Next: none for Chat N; every Phase 2 job is claimed
+
 ## 2026-11-25 16:00 CT — manual (Chat L) — U-008 Load-proof test timeouts
 
 - **Done:** `vitest.config.js` sets `testTimeout` 30 s and `hookTimeout` 120 s for the suite. The 19 db and service test files that set up their database lazily in `ready()` now warm it in `beforeAll`, with the error kept in the memoized promise so a missing database still fails each test on its own. `migrate.test`'s leaked-setting test uses `statement_timeout = '20ms'` against a 200 ms sleep (was 1 ms against 50 ms). The two second-factor deadlock tests wait for a backend blocked by the specific lock holder (`pg_blocking_pids`) and fail clearly after 20 s instead of releasing after 5 s. No assertion changes.
