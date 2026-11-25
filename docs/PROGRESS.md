@@ -10,6 +10,14 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Gate: TBD
 - Next: S-041 (stored OAI-PMH datestamps) is filed.
 
+## 2026-11-25 02:45 CT — manual (Chat G) — T-050e Dublin Core mappings in the admin and in setup
+- Result: done
+- What changed: new screen Settings › Templates › Dublin Core (`packages/admin/src/settings/DublinCoreEditor.tsx`, linked from each template) saving through `GET`/`PUT /api/templates/:key/dublin-core` with If-None-Match/If-Match and D-076's confirmation; `npm run setup` stores the starter template's mapping (public fields as their `dcterms` standards, rights included) in its transaction; the record editor says when the template has no mapping that fits it, so no public site shows the record. Unit tests for the screen, the record editor's note and setup; the settings e2e visits the new screen with Alfa's rules.
+- Decisions: none new (D-096 amended)
+- Review: one independent round, nothing blocking. Fixed: the warning missed a mapping naming a field since made staff only; "Saved." could show for another template; the note named only system managers; D-096's "left for later" line. Filed S-039 (a first mapping for over 10,000 published records; saving an empty mapping).
+- Gate: see the merge commit · npm audit clean
+- Next: the job pool (T-034e is the first free job)
+
 ## 2026-11-25 03:30 CT — manual (Chat D) — T-034e, T-064, T-065, S-032, S-029
 - Result: done (merged together)
 - What changed: **T-034e** each organization's time zone (migration 0029) and its own calendar day in the publish check and public output, through `organization_local_day`; `GET`/`PUT /api/organization/time-zone`. **T-064** (John, Q-10) site managers see role-less members by name only and grant only to people holding a role on their sites. **T-065** (John, Q-11) inviting needs a recent sign-in. **S-032** a too-large `If-Match` version is 400. **S-029** the deadlock test not reproduced in 270+ rounds under load; notes in the roadmap.

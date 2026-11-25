@@ -35,6 +35,7 @@ import { Roles } from "./people/Roles";
 import { Updates } from "./settings/Updates";
 import { Code } from "./screens/Code";
 import { SettingsLayout, SignInSettings, SitesSettings } from "./settings/Settings";
+import { DublinCoreScreen } from "./settings/DublinCoreEditor";
 import { TemplateList, TemplateScreen } from "./settings/TemplateEditor";
 import { ResetComplete } from "./screens/ResetComplete";
 import { ResetRequest } from "./screens/ResetRequest";
@@ -139,6 +140,7 @@ export const ROUTES: RouteObject[] = [
               { path: "sites", element: <SitesSettings /> },
               { path: "templates", element: <TemplateList /> },
               { path: "templates/:key", element: <TemplateScreen /> },
+              { path: "templates/:key/dublin-core", element: <DublinCoreScreen /> },
               { path: "new-template", element: <TemplateScreen isNew /> },
               { path: "sign-in", element: <SignInSettings /> },
               // Software updates (T-060).
