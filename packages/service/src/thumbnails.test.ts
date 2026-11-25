@@ -28,6 +28,8 @@ import {
   precheckThumbnail,
   decodeAny,
   decodeImage,
+  decodeJpegDc,
+  JPEG_DC_SCALE,
   gifExtent,
   planDecode,
   viewDimensions,
@@ -40,6 +42,7 @@ import {
 import { DESCRIPTOR_PAUSE_MS, createThumbnailRenderer } from "./thumbnails.js";
 import {
   alphBigTables,
+  blockJpeg,
   decodeJpeg,
   flatJpeg,
   gifFrameOutside,
@@ -368,7 +371,8 @@ describe("strict walks and the memory budget (review B1, B2)", () => {
     expect(planDecode("image/png", rgba8, THUMBNAIL_LIMITS).bytes).toBeLessThan(
       DECODE_BUDGET_BYTES,
     );
-    // A 7,000² JPEG header (49 MP, within the old pixel limit) is over the budget.
+    // A 7,000² JPEG header (49 MP, within the pixel limit) is over the budget
+    // decoded whole; since T-074a it is planned at 1/8 from its DC terms.
     const jpeg7000 = Buffer.from(makeJpeg(8, 8));
     for (let i = 2; i + 9 < jpeg7000.length;) {
       const marker = jpeg7000[i + 1] ?? 0;
@@ -379,7 +383,9 @@ describe("strict walks and the memory budget (review B1, B2)", () => {
       }
       i += 2 + jpeg7000.readUInt16BE(i + 2);
     }
-    expect(() => planDecode("image/jpeg", jpeg7000, THUMBNAIL_LIMITS)).toThrow("too_large");
+    const scaled = planDecode("image/jpeg", jpeg7000, THUMBNAIL_LIMITS);
+    expect(scaled).toMatchObject({ width: 7000, height: 7000, scale: JPEG_DC_SCALE });
+    expect(scaled.bytes).toBeLessThanOrEqual(DECODE_BUDGET_BYTES);
   });
 
   it("walks JPEG markers as jpeg-js reads them, for thumbnails and the view (review B2a)", () => {
@@ -578,6 +584,221 @@ describe("scaling", () => {
     const i = (40 * 160 + 159) * 4;
     expect(thumb.data[i]).toBeGreaterThan(230);
     expect(thumb.data[i + 1]).toBeGreaterThan(230);
+  });
+});
+
+/** A level per component and block that changes across the image (T-074a). */
+const levels = (k: number, bx: number, by: number): number => (k * 70 + bx * 13 + by * 29) % 256;
+
+/** The byte offset of the first segment with this marker (before the first scan's data). */
+function segmentAt(b: Buffer, marker: number, nth = 0): number {
+  let seen = 0;
+  for (let i = 2; i + 4 <= b.length;) {
+    if (b[i + 1] === marker && seen++ === nth) return i;
+    if (b[i + 1] === 0xda) {
+      // Skip the scan's data to the next marker.
+      let j = i + 2 + b.readUInt16BE(i + 2);
+      while (!(
+        b[j] === 0xff &&
+        b[j + 1] !== 0 &&
+        ((b[j + 1] ?? 0) < 0xd0 || (b[j + 1] ?? 0) > 0xd7)
+      )) {
+        j++;
+      }
+      i = j;
+      continue;
+    }
+    i += 2 + b.readUInt16BE(i + 2);
+  }
+  throw new Error("no such segment");
+}
+
+describe("large JPEGs from their DC terms, at 1/8 (T-074a)", () => {
+  it("reads every block's level as jpeg-js does: baseline, progressive, subsampled, restarts, grey, CMYK", () => {
+    const variants: [string, Parameters<typeof blockJpeg>[3]][] = [
+      ["baseline 4:4:4", {}],
+      [
+        "baseline 4:2:0",
+        {
+          sampling: [
+            [2, 2],
+            [1, 1],
+            [1, 1],
+          ],
+        },
+      ],
+      ["baseline, one scan per component, restarts", { interleaved: false, restart: 2 }],
+      ["progressive", { progressive: true }],
+      [
+        "progressive 4:2:2, successive approximation, restarts",
+        {
+          progressive: true,
+          successive: 2,
+          sampling: [
+            [2, 1],
+            [1, 1],
+            [1, 1],
+          ],
+          restart: 3,
+        },
+      ],
+      [
+        "progressive, one DC scan per component",
+        { progressive: true, successive: 1, interleaved: false },
+      ],
+      ["grey", { sampling: [[1, 1]] }],
+      ["grey with sampling 2 × 2", { sampling: [[2, 2]] }],
+      [
+        "Adobe CMYK",
+        {
+          sampling: [
+            [1, 1],
+            [1, 1],
+            [1, 1],
+            [1, 1],
+          ],
+          adobe: 0,
+        },
+      ],
+      [
+        "Adobe YCCK",
+        {
+          sampling: [
+            [1, 1],
+            [1, 1],
+            [1, 1],
+            [1, 1],
+          ],
+          adobe: 2,
+        },
+      ],
+      ["a quantizer of 3", { q0: 3 }],
+    ];
+    for (const [name, options] of variants) {
+      const bytes = blockJpeg(45, 37, levels, options);
+      const whole = decodeJpeg(bytes);
+      const small = decodeJpegDc(bytes);
+      expect({ width: small.width, height: small.height }, name).toEqual({ width: 6, height: 5 });
+      let worst = 0;
+      for (let y = 0; y < small.height; y++) {
+        for (let x = 0; x < small.width; x++) {
+          // Each block is flat, so any pixel inside it is its level.
+          const wx = Math.min(whole.width - 1, 8 * x + 3);
+          const wy = Math.min(whole.height - 1, 8 * y + 3);
+          for (let c = 0; c < 4; c++) {
+            const a = whole.data[(wy * whole.width + wx) * 4 + c] ?? 0;
+            const b = small.data[(y * small.width + x) * 4 + c] ?? 0;
+            worst = Math.max(worst, Math.abs(a - b));
+          }
+        }
+      }
+      expect(worst, name).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it("gives each block's average for a real photograph-like JPEG", () => {
+    const bytes = makeJpeg(200, 120);
+    const whole = decodeJpeg(bytes);
+    const small = decodeJpegDc(bytes);
+    expect({ width: small.width, height: small.height }).toEqual({ width: 25, height: 15 });
+    let total = 0;
+    let count = 0;
+    for (let y = 0; y < small.height; y++) {
+      for (let x = 0; x < small.width; x++) {
+        for (let c = 0; c < 3; c++) {
+          let sum = 0;
+          for (let yy = 8 * y; yy < 8 * y + 8; yy++) {
+            for (let xx = 8 * x; xx < 8 * x + 8; xx++) {
+              sum += whole.data[(yy * whole.width + xx) * 4 + c] ?? 0;
+            }
+          }
+          total += Math.abs(sum / 64 - (small.data[(y * small.width + x) * 4 + c] ?? 0));
+          count++;
+        }
+      }
+    }
+    expect(total / count).toBeLessThan(2);
+  });
+
+  it("plans a JPEG too large to decode whole at 1/8, and decodes small ones whole as before", () => {
+    const big = blockJpeg(7000, 5000, levels, {
+      sampling: [
+        [2, 2],
+        [1, 1],
+        [1, 1],
+      ],
+    });
+    const plan = planDecode("image/jpeg", big, THUMBNAIL_LIMITS);
+    expect(plan).toMatchObject({ width: 7000, height: 5000, scale: JPEG_DC_SCALE });
+    expect(plan.bytes).toBeLessThanOrEqual(DECODE_BUDGET_BYTES);
+    const image = decodeImage("image/jpeg", big, THUMBNAIL_LIMITS);
+    expect({ width: image.width, height: image.height }).toEqual({ width: 875, height: 625 });
+    // Within the budget whole: no scaling, jpeg-js as before.
+    expect(planDecode("image/jpeg", makeJpeg(600, 400), THUMBNAIL_LIMITS).scale).toBeUndefined();
+    expect(planDecode("image/jpeg", flatJpeg(2480, 2480), THUMBNAIL_LIMITS).scale).toBeUndefined();
+    // The pixel limits still hold first: 65,000² is refused, scaled or not.
+    expect(() => planDecode("image/jpeg", hugeJpeg(), THUMBNAIL_LIMITS)).toThrow("too_large");
+  });
+
+  it("renders a 480-pixel thumbnail of a 7,000² photograph", async () => {
+    const thumb = decodeJpeg(await renderThumbnail("image/jpeg", flatJpeg(7000, 7000), 480));
+    expect({ width: thumb.width, height: thumb.height }).toEqual({ width: 480, height: 480 });
+  });
+
+  it("refuses broken tables, codes and data rather than guessing", () => {
+    const make = (options: Parameters<typeof blockJpeg>[3] = {}, level = levels): Buffer =>
+      blockJpeg(4000, 4000, level, options);
+    const refused = (name: string, bytes: Buffer, code: string): void => {
+      expect(planDecode("image/jpeg", bytes, THUMBNAIL_LIMITS).scale, name).toBe(JPEG_DC_SCALE);
+      expect(() => decodeImage("image/jpeg", bytes, THUMBNAIL_LIMITS), name).toThrow(code);
+    };
+    // More codes of one length than it holds (3 one-bit codes).
+    const oversubscribed = make();
+    const dht = segmentAt(oversubscribed, 0xc4);
+    oversubscribed[dht + 5] = 3;
+    oversubscribed[dht + 6] = 0;
+    oversubscribed[dht + 7] = 3;
+    refused("an over-full Huffman table", oversubscribed, "jpeg_huffman");
+    // Category 0's code now means category 12, past what 8-bit samples allow.
+    const category = make({}, () => 128);
+    category[segmentAt(category, 0xc4) + 5 + 16] = 12;
+    refused("a DC category of 12", category, "jpeg_data");
+    // The AC code now means "15 zeros, then a 1-bit value": the run passes the block's end.
+    const pastEnd = make({}, () => 128);
+    pastEnd[segmentAt(pastEnd, 0xc4, 1) + 5 + 16] = 0xf1;
+    refused("an AC run past the 63rd coefficient", pastEnd, "jpeg_data");
+    // A scan naming a DC table never defined.
+    const noTable = make();
+    noTable[segmentAt(noTable, 0xda) + 6] = 0x10;
+    refused("an undefined table", noTable, "jpeg_table");
+    // A progressive DC scan that claims AC coefficients too.
+    const mixed = make({ progressive: true });
+    mixed[segmentAt(mixed, 0xda) + 5 + 2 * 3 + 1] = 5;
+    refused("a progressive DC scan with Se 5", mixed, "jpeg_scan");
+    // Restart markers every 2 MCUs, the DRI saying 3: a marker inside an interval.
+    const wrongDri = make({ restart: 2 });
+    wrongDri[segmentAt(wrongDri, 0xdd) + 5] = 3;
+    refused("a restart marker inside an interval", wrongDri, "jpeg_data");
+    // The data cut short: the scan's last half gone.
+    const whole = make({ sampling: [[1, 1]] });
+    const sos = segmentAt(whole, 0xda);
+    let at = sos + 10 + Math.floor((whole.length - sos) / 2);
+    while (whole[at - 1] === 0xff) at--;
+    const cut = Buffer.concat([whole.subarray(0, at), Buffer.from([0xff, 0xd9])]);
+    refused("data that runs out", cut, "jpeg_data");
+    // Four components with no Adobe marker (jpeg-js refuses them too).
+    refused(
+      "CMYK without an Adobe marker",
+      make({
+        sampling: [
+          [1, 1],
+          [1, 1],
+          [1, 1],
+          [1, 1],
+        ],
+      }),
+      "jpeg_header",
+    );
   });
 });
 
@@ -1119,6 +1340,22 @@ describe("peak memory of the largest images accepted (review B2, T-072)", () => 
     async () => {
       const cases: [string, string, () => Promise<Buffer> | Buffer][] = [
         ["JPEG 2,480² (4:4:4)", "image/jpeg", () => flatJpeg(2480, 2480)],
+        // Decoded at 1/8 from their DC terms (T-074a).
+        ["JPEG 7,000² (4:4:4, at 1/8)", "image/jpeg", () => flatJpeg(7000, 7000)],
+        [
+          "JPEG 8,000 × 6,000 progressive 4:2:0 (at 1/8)",
+          "image/jpeg",
+          () =>
+            blockJpeg(8000, 6000, levels, {
+              progressive: true,
+              successive: 1,
+              sampling: [
+                [2, 2],
+                [1, 1],
+                [1, 1],
+              ],
+            }),
+        ],
         ["PNG RGBA16 2,660² (noise)", "image/png", () => noisePng(2660, 2660, 16)],
         ["PNG RGBA8 3,700² (noise)", "image/png", () => noisePng(3700, 3700)],
         ["GIF 5,240²", "image/gif", () => makeGif(5240, 5240)],

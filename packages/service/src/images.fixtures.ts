@@ -994,3 +994,223 @@ export function vp8lIncompleteCode(size = 64): Buffer {
   }
   return riff([riffChunk("VP8L", w.finish())]);
 }
+
+/** Options for `blockJpeg` (T-074a). */
+export interface BlockJpegOptions {
+  /** Sampling factors per component (1, 3 or 4 components); `[[1, 1], [1, 1], [1, 1]]` by default. */
+  readonly sampling?: readonly (readonly [number, number])[];
+  /** Progressive: a DC scan of all components, then an AC scan of each, every block an EOB. */
+  readonly progressive?: boolean;
+  /** Progressive only: the first DC scan drops this many low bits, and refinement scans add them back. */
+  readonly successive?: number;
+  /** Restart interval in MCUs (0: none). */
+  readonly restart?: number;
+  /** Adds an Adobe APP14 with this transform flag (needed for four components). */
+  readonly adobe?: number;
+  /** The DC quantizer of every table (1 to 255); 8 by default, so a level is DC + 128. */
+  readonly q0?: number;
+  /** Interleaved DC scans (several components at once) or one scan per component; interleaved by default. */
+  readonly interleaved?: boolean;
+}
+
+/**
+ * A JPEG whose every block is flat (DC only, then EOB), its level chosen
+ * per component and block by `level` (0 to 255): real, standard Huffman
+ * tables (ITU T.81 K.3 for DC), baseline or progressive, any sampling,
+ * restart markers, so jpeg-js decodes it to the same flat blocks the DC
+ * decoder reads (T-074a). Invented pixels only.
+ */
+export function blockJpeg(
+  width: number,
+  height: number,
+  level: (component: number, bx: number, by: number) => number,
+  options: BlockJpegOptions = {},
+): Buffer {
+  const sampling = options.sampling ?? [
+    [1, 1],
+    [1, 1],
+    [1, 1],
+  ];
+  const q0 = options.q0 ?? 8;
+  const al = options.progressive ? (options.successive ?? 0) : 0;
+  const restart = options.restart ?? 0;
+  const maxH = Math.max(...sampling.map(([h]) => h));
+  const maxV = Math.max(...sampling.map(([, v]) => v));
+  const mcusX = Math.ceil(width / (8 * maxH));
+  const mcusY = Math.ceil(height / (8 * maxV));
+  const seg = (marker: number, body: number[] | Buffer): Buffer => {
+    const out = Buffer.alloc(4 + body.length);
+    out[0] = 0xff;
+    out[1] = marker;
+    out.writeUInt16BE(2 + body.length, 2);
+    Buffer.from(body).copy(out, 4);
+    return out;
+  };
+  const parts: Buffer[] = [Buffer.from([0xff, 0xd8])];
+  if (options.adobe !== undefined) {
+    parts.push(
+      seg(0xee, [0x41, 0x64, 0x6f, 0x62, 0x65, 0x00, 0x64, 0x00, 0x00, 0x00, 0x00, options.adobe]),
+    );
+  }
+  parts.push(seg(0xdb, [0x00, q0, ...Array.from({ length: 63 }, () => 1)]));
+  // DC: the standard luminance table (K.3); AC: one code, "0" = 0x00 (EOB, or EOBRUN 1).
+  const dcCounts = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
+  const dcValues = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+  parts.push(seg(0xc4, [0x00, ...dcCounts, ...dcValues]));
+  parts.push(seg(0xc4, [0x10, 1, ...Array.from({ length: 15 }, () => 0), 0x00]));
+  if (restart > 0) parts.push(seg(0xdd, [restart >> 8, restart & 0xff]));
+  const ids = sampling.map((_, k) => k + 1);
+  parts.push(
+    seg(options.progressive ? 0xc2 : 0xc0, [
+      8,
+      height >> 8,
+      height & 0xff,
+      width >> 8,
+      width & 0xff,
+      sampling.length,
+      ...sampling.flatMap(([h, v], k) => [ids[k] ?? 0, (h << 4) | v, 0]),
+    ]),
+  );
+  // DC codes from K.3: category → [code, length].
+  const dcCode: [number, number][] = [];
+  {
+    let code = 0;
+    let k = 0;
+    for (let l = 1; l <= 16; l++) {
+      for (let n = 0; n < (dcCounts[l - 1] ?? 0); n++) dcCode[dcValues[k++] ?? 0] = [code++, l];
+      code <<= 1;
+    }
+  }
+  const writer = (): {
+    put: (value: number, length: number) => void;
+    align: () => void;
+    out: number[];
+  } => {
+    const out: number[] = [];
+    let acc = 0;
+    let n = 0;
+    const flush = (): void => {
+      out.push(acc);
+      if (acc === 0xff) out.push(0x00);
+      acc = 0;
+      n = 0;
+    };
+    return {
+      out,
+      put(value, length) {
+        for (let k = length - 1; k >= 0; k--) {
+          acc = (acc << 1) | ((value >> k) & 1);
+          if (++n === 8) flush();
+        }
+      },
+      align() {
+        while (n !== 0) {
+          acc = (acc << 1) | 1;
+          if (++n === 8) flush();
+        }
+      },
+    };
+  };
+  const blocksOf = (k: number): [number, number] => {
+    const [h, v] = sampling[k] ?? [1, 1];
+    return [
+      Math.ceil(Math.ceil((width * h) / maxH) / 8),
+      Math.ceil(Math.ceil((height * v) / maxV) / 8),
+    ];
+  };
+  const value = (k: number, bx: number, by: number): number =>
+    Math.round(((Math.max(0, Math.min(255, level(k, bx, by))) - 128) * 8) / q0);
+  const scanOf = (
+    comps: readonly number[],
+    each: (w: ReturnType<typeof writer>, k: number, bx: number, by: number, pred: number[]) => void,
+    header: number[],
+  ): void => {
+    const w = writer();
+    const pred = comps.map(() => 0);
+    const single = comps.length === 1;
+    const first = comps[0] ?? 0;
+    const [bw, bh] = blocksOf(first);
+    const total = single ? bw * bh : mcusX * mcusY;
+    let rst = 0;
+    for (let m = 0; m < total; m++) {
+      if (restart > 0 && m > 0 && m % restart === 0) {
+        w.align();
+        w.out.push(0xff, 0xd0 + (rst++ % 8));
+        pred.fill(0);
+      }
+      if (single) {
+        each(w, first, m % bw, Math.floor(m / bw), pred);
+        continue;
+      }
+      const mx = m % mcusX;
+      const my = Math.floor(m / mcusX);
+      comps.forEach((k, slot) => {
+        const [h, v] = sampling[k] ?? [1, 1];
+        for (let y = 0; y < v; y++) {
+          for (let x = 0; x < h; x++) {
+            const p = [pred[slot] ?? 0];
+            each(w, k, mx * h + x, my * v + y, p);
+            pred[slot] = p[0] ?? 0;
+          }
+        }
+      });
+    }
+    w.align();
+    parts.push(seg(0xda, header), Buffer.from(w.out));
+  };
+  const dcDiff = (w: ReturnType<typeof writer>, diff: number): void => {
+    const s = diff === 0 ? 0 : Math.floor(Math.log2(Math.abs(diff))) + 1;
+    const [code, length] = dcCode[s] ?? [0, 0];
+    w.put(code, length);
+    if (s > 0) w.put(diff < 0 ? diff - 1 + (1 << s) : diff, s);
+  };
+  const dcScans = options.interleaved === false ? ids.map((_, k) => [k]) : [ids.map((_, k) => k)];
+  for (const comps of dcScans) {
+    scanOf(
+      comps,
+      (w, k, bx, by, pred) => {
+        const dc = value(k, bx, by) >> al;
+        dcDiff(w, dc - (pred[0] ?? 0));
+        pred[0] = dc;
+        if (!options.progressive) w.put(0, 1); // EOB
+      },
+      [
+        comps.length,
+        ...comps.flatMap((k) => [ids[k] ?? 0, 0x00]),
+        0,
+        options.progressive ? 0 : 63,
+        al,
+      ],
+    );
+  }
+  if (options.progressive) {
+    for (let bit = al - 1; bit >= 0; bit--) {
+      for (const comps of dcScans) {
+        scanOf(
+          comps,
+          (w, k, bx, by) => {
+            w.put((value(k, bx, by) >> bit) & 1, 1);
+          },
+          [
+            comps.length,
+            ...comps.flatMap((k) => [ids[k] ?? 0, 0x00]),
+            0,
+            0,
+            ((bit + 1) << 4) | bit,
+          ],
+        );
+      }
+    }
+    for (let k = 0; k < ids.length; k++) {
+      scanOf(
+        [k],
+        (w) => {
+          w.put(0, 1); // EOBRUN of 1
+        },
+        [1, ids[k] ?? 0, 0x00, 1, 63, 0],
+      );
+    }
+  }
+  parts.push(Buffer.from([0xff, 0xd9]));
+  return Buffer.concat(parts);
+}

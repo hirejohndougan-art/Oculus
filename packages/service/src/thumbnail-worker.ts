@@ -21,6 +21,10 @@
  * - **The plan is not the last guard.** The decoder process is killed when
  *   its resident memory grows past `DECODE_MEMORY_CAP_BYTES`, or when it
  *   takes too long (thumbnails.ts).
+ * - **Large JPEGs are decoded at 1/8** (T-074a, `decodeJpegDc`): one too
+ *   large for the budget decoded whole is read for its DC terms only (a
+ *   block's average), our own strict reader of the rebuilt file, so camera
+ *   photographs and scans up to `THUMBNAIL_LIMITS` get thumbnails.
  * - The output is always a baseline JPEG, transparency flattened onto
  *   white, scaled down (never up) to fit a square box. Originals (WebP
  *   included) are never changed.
@@ -1124,6 +1128,12 @@ export interface DecodePlan {
   readonly width: number;
   readonly height: number;
   readonly bytes: number;
+  /**
+   * `JPEG_DC_SCALE` when a JPEG too large to decode whole is decoded at
+   * 1/8 of each side from its DC terms (T-074a); the image decoded is then
+   * `ceil(width / 8)` × `ceil(height / 8)`.
+   */
+  readonly scale?: number;
 }
 
 /** The headroom on every plan (measured peaks vary by some 10% between runs). */
@@ -1160,6 +1170,442 @@ function jpegFrameBytes(layout: JpegLayout): number {
     bytes += lineBlocks * 8 * columnBlocks * 8;
   }
   return bytes;
+}
+
+/**
+ * Large JPEGs at an eighth of their size (T-074a, D-097). jpeg-js keeps
+ * every coefficient of every block, so the budget admits only about 6
+ * megapixels. A block's DC coefficient alone is its average (ITU T.81
+ * A.3.3: the inverse DCT of a block with only its DC term is DC/8 at every
+ * sample), so decoding only the DC terms gives the image at 1/8 of each
+ * side, libjpeg's smallest DCT scaling, at 4 bytes a block: a 50-megapixel
+ * photograph needs some 10 MB instead of several GB. Baseline and extended
+ * (SOF0, SOF1) scans are read in full, every AC coefficient decoded and
+ * dropped; progressive (SOF2) DC scans are read and AC scans skipped
+ * unread (a DC scan always comes before a component's AC scans, T.81
+ * G.1.1.1.1). The reading is strict: a broken table, a code that isn't in
+ * its table, a coefficient past the block's end, a marker inside an
+ * interval or data that runs out is refused, never guessed. Colours follow
+ * jpeg-js's own conversion, so a thumbnail looks the same either way.
+ */
+export const JPEG_DC_SCALE = 8;
+
+/** A Huffman table for reading (ITU T.81 F.2.2.3 and C: `maxcode`, `valptr`, `mincode`). */
+interface DcHuffman {
+  readonly maxcode: Int32Array;
+  readonly valptr: Int32Array;
+  readonly mincode: Int32Array;
+  readonly values: Uint8Array;
+}
+
+/** A frame component as the DC decoder needs it. */
+interface DcComponent {
+  readonly id: number;
+  readonly h: number;
+  readonly v: number;
+  readonly tq: number;
+  /** Blocks a line and a column, rounded up to whole MCUs (what interleaved scans cover). */
+  readonly paddedW: number;
+  readonly paddedH: number;
+  /** Blocks a line and a column of the component's own samples (what a scan of it alone covers). */
+  readonly blocksW: number;
+  readonly blocksH: number;
+  /** DC coefficients, `paddedW` × `paddedH`, before dequantization. */
+  readonly dc: Int32Array;
+  /** The DC quantizer, taken at the first scan that holds the component. */
+  q0: number;
+  pred: number;
+}
+
+/** A refusal while reading the entropy-coded data (a fixed code). */
+function dcRefuse(code: string): never {
+  throw new ImageRefused(code);
+}
+
+/** Builds a Huffman table from its 16 counts and values; refuses one whose codes don't fit. */
+function dcHuffman(counts: Uint8Array, values: Uint8Array): DcHuffman {
+  const maxcode = new Int32Array(18).fill(-1);
+  const valptr = new Int32Array(17);
+  const mincode = new Int32Array(17);
+  let code = 0;
+  let k = 0;
+  for (let l = 1; l <= 16; l++) {
+    const n = counts[l - 1] ?? 0;
+    valptr[l] = k;
+    mincode[l] = code;
+    code += n;
+    k += n;
+    if (n > 0) maxcode[l] = code - 1;
+    // libjpeg's check (jdhuff.c): the all-ones code is never used, and
+    // more codes than a length holds is a broken table.
+    if (code >= 1 << l && n > 0) dcRefuse("jpeg_huffman");
+    code <<= 1;
+  }
+  maxcode[17] = 0x7fffffff;
+  return { maxcode, valptr, mincode, values };
+}
+
+/**
+ * Decodes the DC terms of a JPEG that `walkJpeg` rebuilt (`canonical`:
+ * only SOI, DQT, DHT, DRI, the frame, scans with their data, a normalised
+ * Adobe APP14 and EOI) to RGBA at 1/8 of each side, rounded up. Throws
+ * `ImageRefused` for anything it won't read.
+ */
+export function decodeJpegDc(b: Uint8Array): { width: number; height: number; data: Uint8Array } {
+  const quant: (number | undefined)[] = [];
+  const dcTables: (DcHuffman | undefined)[] = [];
+  const acTables: (DcHuffman | undefined)[] = [];
+  let restart = 0;
+  let adobe: number | undefined;
+  let progressive = false;
+  let width = 0;
+  let height = 0;
+  let maxH = 1;
+  let maxV = 1;
+  let mcusX = 0;
+  let mcusY = 0;
+  let components: DcComponent[] | undefined;
+  let i = 2;
+  for (;;) {
+    if (i + 2 > b.length || b[i] !== 0xff) dcRefuse("jpeg_marker");
+    const marker = b[i + 1] ?? 0;
+    if (marker === 0xd9) break;
+    if (i + 4 > b.length) dcRefuse("jpeg_truncated");
+    const length = u16be(b, i + 2);
+    const data = i + 4;
+    const end = i + 2 + length;
+    if (length < 2 || end > b.length) dcRefuse("jpeg_truncated");
+    if (marker === 0xdb) {
+      for (let j = data; j < end;) {
+        const spec = b[j] ?? 0;
+        // Only the DC quantizer (zig-zag index 0, the same in natural order) is used.
+        quant[spec & 0x0f] = spec >> 4 === 0 ? (b[j + 1] ?? 0) : u16be(b, j + 1);
+        j += 1 + 64 * ((spec >> 4) + 1);
+      }
+    } else if (marker === 0xc4) {
+      for (let j = data; j < end;) {
+        const spec = b[j] ?? 0;
+        const counts = b.subarray(j + 1, j + 17);
+        let sum = 0;
+        for (const n of counts) sum += n;
+        const table = dcHuffman(counts, b.subarray(j + 17, j + 17 + sum));
+        if (spec >> 4 === 0) dcTables[spec & 0x0f] = table;
+        else acTables[spec & 0x0f] = table;
+        j += 17 + sum;
+      }
+    } else if (marker === 0xdd) {
+      restart = u16be(b, data);
+    } else if (marker === 0xee) {
+      // The normalised Adobe APP14: its transform flag (jpeg-js's `transformCode`).
+      if (length >= 14) adobe = b[data + 11] ?? 0;
+    } else if (JPEG_FRAMES.has(marker)) {
+      progressive = marker === 0xc2;
+      height = u16be(b, data + 1);
+      width = u16be(b, data + 3);
+      const count = b[data + 5] ?? 0;
+      // Two components (no colour model jpeg-js reads) is refused, as jpeg-js does.
+      if (count === 2 || width < 1 || height < 1) dcRefuse("jpeg_header");
+      const raw: { id: number; h: number; v: number; tq: number }[] = [];
+      for (let k = 0; k < count; k++) {
+        const c = data + 6 + 3 * k;
+        raw.push({
+          id: b[c] ?? 0,
+          h: (b[c + 1] ?? 0) >> 4,
+          v: (b[c + 1] ?? 0) & 0x0f,
+          tq: b[c + 2] ?? 0,
+        });
+      }
+      maxH = Math.max(...raw.map((c) => c.h));
+      maxV = Math.max(...raw.map((c) => c.v));
+      mcusX = Math.ceil(width / (8 * maxH));
+      mcusY = Math.ceil(height / (8 * maxV));
+      components = raw.map((c) => ({
+        ...c,
+        paddedW: mcusX * c.h,
+        paddedH: mcusY * c.v,
+        blocksW: Math.ceil(Math.ceil((width * c.h) / maxH) / 8),
+        blocksH: Math.ceil(Math.ceil((height * c.v) / maxV) / 8),
+        dc: new Int32Array(mcusX * c.h * mcusY * c.v),
+        q0: -1,
+        pred: 0,
+      }));
+    } else if (marker === 0xda) {
+      if (components === undefined) dcRefuse("jpeg_marker");
+      const count = b[data] ?? 0;
+      const scan: {
+        c: DcComponent;
+        dcTable: DcHuffman | undefined;
+        acTable: DcHuffman | undefined;
+      }[] = [];
+      for (let k = 0; k < count; k++) {
+        const id = b[data + 1 + 2 * k] ?? 0;
+        const tables = b[data + 2 + 2 * k] ?? 0;
+        const c = components.find((o) => o.id === id);
+        if (c === undefined) dcRefuse("jpeg_scan");
+        scan.push({ c, dcTable: dcTables[tables >> 4], acTable: acTables[tables & 0x0f] });
+      }
+      const ss = b[data + 1 + 2 * count] ?? 0;
+      const se = b[data + 2 + 2 * count] ?? 0;
+      const ah = (b[data + 3 + 2 * count] ?? 0) >> 4;
+      const al = (b[data + 3 + 2 * count] ?? 0) & 0x0f;
+      // The entropy-coded data runs to the next marker that isn't stuffing or RST.
+      let stop = end;
+      for (;;) {
+        stop = b.indexOf(0xff, stop);
+        if (stop < 0 || stop + 1 >= b.length) dcRefuse("jpeg_truncated");
+        const next = b[stop + 1] ?? 0;
+        if (next === 0x00 || (next >= 0xd0 && next <= 0xd7)) {
+          stop += 2;
+          continue;
+        }
+        break;
+      }
+      const mode = progressive
+        ? ss === 0
+          ? se === 0 && al <= 13 && (ah === 0 || ah === al + 1)
+            ? ah === 0
+              ? "dc_first"
+              : "dc_refine"
+            : dcRefuse("jpeg_scan")
+          : "skip"
+        : ss === 0 && se === 63 && ah === 0 && al === 0
+          ? "sequential"
+          : dcRefuse("jpeg_scan");
+      if (mode !== "skip") {
+        for (const s of scan) {
+          if (s.c.q0 < 0) {
+            const q = quant[s.c.tq];
+            if (q === undefined) dcRefuse("jpeg_table");
+            s.c.q0 = q;
+          }
+          if (mode !== "dc_refine" && s.dcTable === undefined) dcRefuse("jpeg_table");
+          if (mode === "sequential" && s.acTable === undefined) dcRefuse("jpeg_table");
+        }
+        dcScan(b, end, stop, scan, mode, al, restart, mcusX, mcusY);
+      }
+      i = stop;
+      continue;
+    }
+    i = end;
+  }
+  if (components === undefined) dcRefuse("jpeg_marker");
+  return dcPixels(components, width, height, maxH, maxV, adobe);
+}
+
+/** Reads one scan's DC terms (and, for a sequential scan, steps over its AC terms). */
+function dcScan(
+  b: Uint8Array,
+  start: number,
+  stop: number,
+  scan: readonly {
+    c: DcComponent;
+    dcTable: DcHuffman | undefined;
+    acTable: DcHuffman | undefined;
+  }[],
+  mode: "sequential" | "dc_first" | "dc_refine",
+  al: number,
+  restart: number,
+  mcusX: number,
+  mcusY: number,
+): void {
+  let pos = start;
+  let byte = 0;
+  let left = 0;
+  const bit = (): number => {
+    if (left === 0) {
+      if (pos >= stop) dcRefuse("jpeg_data");
+      byte = b[pos] ?? 0;
+      if (byte === 0xff) {
+        // Only stuffing inside an interval: a marker here is a broken file.
+        if (b[pos + 1] !== 0x00) dcRefuse("jpeg_data");
+        pos += 2;
+      } else {
+        pos++;
+      }
+      left = 8;
+    }
+    left--;
+    return (byte >> left) & 1;
+  };
+  const bits = (n: number): number => {
+    let v = 0;
+    for (let k = 0; k < n; k++) v = (v << 1) | bit();
+    return v;
+  };
+  const symbol = (t: DcHuffman): number => {
+    let code = bit();
+    let l = 1;
+    while (code > (t.maxcode[l] ?? -1)) {
+      if (++l > 16) dcRefuse("jpeg_data");
+      code = (code << 1) | bit();
+    }
+    const at = (t.valptr[l] ?? 0) + code - (t.mincode[l] ?? 0);
+    if (at >= t.values.length) dcRefuse("jpeg_data");
+    return t.values[at] ?? 0;
+  };
+  const diff = (t: DcHuffman | undefined): number => {
+    const s = symbol(t ?? dcRefuse("jpeg_table"));
+    // Difference categories run to 11 for 8-bit samples (T.81 F.1.2.1.1).
+    if (s > 11) dcRefuse("jpeg_data");
+    if (s === 0) return 0;
+    const v = bits(s);
+    return v < 1 << (s - 1) ? v - (1 << s) + 1 : v;
+  };
+  const block = (
+    s: { c: DcComponent; dcTable: DcHuffman | undefined; acTable: DcHuffman | undefined },
+    at: number,
+  ): void => {
+    const c = s.c;
+    if (mode === "dc_refine") {
+      if (bit() === 1) c.dc[at] = (c.dc[at] ?? 0) | (1 << al);
+      return;
+    }
+    c.pred += diff(s.dcTable);
+    c.dc[at] = mode === "dc_first" ? c.pred * (1 << al) : c.pred;
+    if (mode !== "sequential") return;
+    const ac = s.acTable ?? dcRefuse("jpeg_table");
+    for (let k = 1; k < 64;) {
+      const rs = symbol(ac);
+      const run = rs >> 4;
+      const size = rs & 0x0f;
+      if (size === 0) {
+        if (run !== 15) break; // EOB
+        k += 16; // ZRL
+        continue;
+      }
+      // AC magnitudes run to 10 bits for 8-bit samples (T.81 F.1.2.2.1).
+      if (size > 10) dcRefuse("jpeg_data");
+      k += run;
+      if (k > 63) dcRefuse("jpeg_data");
+      bits(size);
+      k++;
+    }
+  };
+  // A scan of one component covers that component's own blocks, one an
+  // MCU; a scan of several covers whole MCUs (T.81 A.2).
+  const single = scan.length === 1;
+  const first = scan[0];
+  if (first === undefined) return;
+  const total = single ? first.c.blocksW * first.c.blocksH : mcusX * mcusY;
+  for (const s of scan) s.c.pred = 0;
+  for (let m = 0; m < total; m++) {
+    if (restart > 0 && m > 0 && m % restart === 0) {
+      // Byte-aligned, then a restart marker; predictions start again.
+      left = 0;
+      const next = b[pos + 1] ?? 0;
+      if (b[pos] !== 0xff || next < 0xd0 || next > 0xd7) dcRefuse("jpeg_data");
+      pos += 2;
+      for (const s of scan) s.c.pred = 0;
+    }
+    if (single) {
+      const row = Math.floor(m / first.c.blocksW);
+      block(first, row * first.c.paddedW + (m % first.c.blocksW));
+      continue;
+    }
+    const mx = m % mcusX;
+    const my = Math.floor(m / mcusX);
+    for (const s of scan) {
+      for (let y = 0; y < s.c.v; y++) {
+        for (let x = 0; x < s.c.h; x++) {
+          block(s, (my * s.c.v + y) * s.c.paddedW + mx * s.c.h + x);
+        }
+      }
+    }
+  }
+}
+
+const clamp8 = (v: number): number => (v < 0 ? 0 : v > 255 ? 255 : Math.round(v));
+
+/**
+ * The image at 1/8, RGBA: each output pixel is one luma block (the DC
+ * term dequantized: DC × Q0 / 8 + 128); a subsampled component's block
+ * covers several. Colours as jpeg-js converts them: one component grey;
+ * three YCbCr; four CMYK (inverted, as Adobe writes it) only with an Adobe
+ * marker, YCCK when its transform flag is set.
+ */
+function dcPixels(
+  components: readonly DcComponent[],
+  width: number,
+  height: number,
+  maxH: number,
+  maxV: number,
+  adobe: number | undefined,
+): { width: number; height: number; data: Uint8Array } {
+  if (components.length === 4 && adobe === undefined) dcRefuse("jpeg_header");
+  const outW = Math.ceil(width / JPEG_DC_SCALE);
+  const outH = Math.ceil(height / JPEG_DC_SCALE);
+  const out = new Uint8Array(outW * outH * 4);
+  const sample = new Float64Array(4);
+  for (let y = 0; y < outH; y++) {
+    for (let x = 0; x < outW; x++) {
+      for (let k = 0; k < components.length; k++) {
+        const c = components[k];
+        if (c === undefined) continue;
+        const bx = Math.floor((x * c.h) / maxH);
+        const by = Math.floor((y * c.v) / maxV);
+        const q0 = c.q0 < 0 ? 0 : c.q0;
+        sample[k] = clamp8(((c.dc[by * c.paddedW + bx] ?? 0) * q0) / 8 + 128);
+      }
+      const o = (y * outW + x) * 4;
+      const s0 = sample[0] ?? 0;
+      const s1 = sample[1] ?? 0;
+      const s2 = sample[2] ?? 0;
+      if (components.length === 1) {
+        out[o] = s0;
+        out[o + 1] = s0;
+        out[o + 2] = s0;
+      } else if (components.length === 3) {
+        out[o] = clamp8(s0 + 1.402 * (s2 - 128));
+        out[o + 1] = clamp8(s0 - 0.3441363 * (s1 - 128) - 0.71413636 * (s2 - 128));
+        out[o + 2] = clamp8(s0 + 1.772 * (s1 - 128));
+      } else {
+        const k4 = sample[3] ?? 0;
+        let cc: number;
+        let mm: number;
+        let yy: number;
+        if (adobe === 0) {
+          cc = 255 - s0;
+          mm = 255 - s1;
+          yy = 255 - s2;
+        } else {
+          cc = clamp8(s0 + 1.402 * (s2 - 128));
+          mm = clamp8(s0 - 0.3441363 * (s1 - 128) - 0.71413636 * (s2 - 128));
+          yy = clamp8(s0 + 1.772 * (s1 - 128));
+        }
+        const kk = 255 - k4;
+        out[o] = 255 - clamp8(cc * (1 - kk / 255) + kk);
+        out[o + 1] = 255 - clamp8(mm * (1 - kk / 255) + kk);
+        out[o + 2] = 255 - clamp8(yy * (1 - kk / 255) + kk);
+      }
+      out[o + 3] = 255;
+    }
+  }
+  return { width: outW, height: outH, data: out };
+}
+
+/**
+ * What a DC decode costs beyond the buffers counted below (T-074a):
+ * measured in the decoder process at 14–26 MiB (V8's own heap growth while
+ * it runs, the Huffman tables, the thumbnail's encoding) for 7,000² and
+ * 8,000 × 6,000 images, rounded up to 40 MiB.
+ */
+const JPEG_DC_FIXED_BYTES = 40 * 1024 * 1024;
+
+/**
+ * What decoding a JPEG's DC terms costs (T-074a): a 4-byte term per block
+ * of every component (whole MCUs), then the RGBA image at 1/8 and its
+ * scaling, and the fixed part; the inputs are counted by the caller.
+ */
+function jpegDcBytes(layout: JpegLayout): number {
+  const { width, height, components } = layout;
+  const maxH = Math.max(...components.map((c) => c.h));
+  const maxV = Math.max(...components.map((c) => c.v));
+  const mcusX = Math.ceil(width / 8 / maxH);
+  const mcusY = Math.ceil(height / 8 / maxV);
+  let bytes = JPEG_DC_FIXED_BYTES;
+  for (const c of components) bytes += mcusX * c.h * mcusY * c.v * 4;
+  const pixels = Math.ceil(width / JPEG_DC_SCALE) * Math.ceil(height / JPEG_DC_SCALE);
+  return bytes + pixels * (4 + SCALE_BYTES_PER_PIXEL);
 }
 
 /** How much of a file's start the server reads before handing it to the decoder process (64 KiB). */
@@ -1205,6 +1651,7 @@ export function planDecode(format: string, bytes: Uint8Array, limits: ImageLimit
   let perPixel: number;
   let extra = 0;
   let check: (() => number) | undefined;
+  let jpegLayout: JpegLayout | undefined;
   if (format === "image/png") {
     const layout = walkPng(bytes);
     ({ width, height } = layout);
@@ -1254,6 +1701,7 @@ export function planDecode(format: string, bytes: Uint8Array, limits: ImageLimit
     }
   } else if (format === "image/jpeg") {
     const layout = walkJpeg(bytes, true);
+    jpegLayout = layout;
     ({ width, height } = layout);
     // jpeg-js's copy of the input, ours rebuilt from the walk, its blocks,
     // lines and samples (whole MCUs), then RGBA and scaling.
@@ -1272,7 +1720,17 @@ export function planDecode(format: string, bytes: Uint8Array, limits: ImageLimit
   const plan = (): number =>
     Math.ceil((width * height * perPixel + extra + bytes.length) * PLAN_MARGIN);
   // The cheap estimate first: past the budget, nothing more is read.
-  if (plan() > DECODE_BUDGET_BYTES) throw new ImageRefused("too_large");
+  if (plan() > DECODE_BUDGET_BYTES) {
+    // A JPEG too large to decode whole is decoded from its DC terms, at
+    // 1/8 (T-074a): the input, its rebuilt copy and the DC decode.
+    if (jpegLayout !== undefined && jpegLayout.components.length !== 2) {
+      const scaled = Math.ceil((3 * bytes.length + jpegDcBytes(jpegLayout)) * PLAN_MARGIN);
+      if (scaled <= DECODE_BUDGET_BYTES) {
+        return { width, height, bytes: scaled, scale: JPEG_DC_SCALE };
+      }
+    }
+    throw new ImageRefused("too_large");
+  }
   if (check !== undefined) extra += check();
   const cost = plan();
   if (cost > DECODE_BUDGET_BYTES) throw new ImageRefused("too_large");
@@ -1491,6 +1949,17 @@ export function decodeImage(
       // the segments walked, each exactly as long as what it reads.
       const canonical = check === "planned" ? walkJpeg(bytes, true, true).canonical : undefined;
       if (check === "planned" && canonical === undefined) throw new ImageRefused("jpeg_marker");
+      if (size?.scale === JPEG_DC_SCALE && canonical !== undefined) {
+        // Too large to decode whole: its DC terms, at 1/8 (T-074a).
+        const small = decodeJpegDc(canonical);
+        if (
+          small.width !== Math.ceil(size.width / JPEG_DC_SCALE) ||
+          small.height !== Math.ceil(size.height / JPEG_DC_SCALE)
+        ) {
+          throw new ImageRefused("jpeg_header");
+        }
+        return small;
+      }
       const input = canonical ?? bytes;
       const image = jpeg.decode(input, {
         useTArray: true,
