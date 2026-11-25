@@ -3,7 +3,8 @@
  * change (D-019, D-025, D-072).
  *
  * Today they hold the sign-in rules that exist: how long a session lasts
- * (D-052's 4 hours idle and 12 hours absolute by default, within the bounds
+ * (30 minutes idle, John's answer to Q-8 in T-062 and D-098, and D-052's 12
+ * hours absolute by default, within the bounds
  * D-069 lets a session be made with: idle 5 minutes to 12 hours, absolute 1
  * to 24 hours, idle no longer than absolute). Sites are System settings too,
  * kept in their own table. Email, backups, updates and site passwords join
@@ -21,7 +22,7 @@ export interface SystemSettings {
 }
 
 export const DEFAULT_SYSTEM_SETTINGS: SystemSettings = Object.freeze({
-  sessionIdleMinutes: 240,
+  sessionIdleMinutes: 30,
   sessionAbsoluteMinutes: 720,
 });
 

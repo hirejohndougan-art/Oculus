@@ -26,6 +26,8 @@ import { SiteSelector } from "./SiteSelector";
 import { ViewPublicSite } from "./ViewPublicSite";
 import { useSiteAbilities } from "../records/queries";
 import { ME_KEY, useMe } from "./useMe";
+import { IdleGuard } from "../idle/IdleGuard";
+import { announceSignedOut, isSessionMarker } from "../idle/channel";
 
 /** Up to two initials for the round account button. */
 export function initials(name: string): string {
@@ -101,6 +103,8 @@ export function Frame() {
       }
     }
     setStatus(undefined);
+    // Every other tab of this session clears its screen too (T-062, D-098).
+    announceSignedOut(person.sessionMarker, "manual");
     endSession(queries);
     await navigate("/sign-in", {
       replace: true,
@@ -268,6 +272,18 @@ export function Frame() {
           <Outlet context={context} />
         </main>
       </div>
+      {/* Signing out after a period of no use (T-062, D-098). Without the
+          session's own limit and marker there is no timer: the server's
+          limit still holds, and nothing on screen guesses at it. */}
+      {Number.isInteger(person.idleSeconds) &&
+      (person.idleSeconds ?? 0) >= 120 &&
+      isSessionMarker(person.sessionMarker) ? (
+        <IdleGuard
+          key={person.sessionMarker}
+          idleSeconds={person.idleSeconds ?? 0}
+          marker={person.sessionMarker}
+        />
+      ) : null}
     </div>
   );
 }

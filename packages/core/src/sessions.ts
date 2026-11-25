@@ -19,7 +19,7 @@
  * `checkCsrfToken` compares in constant time. Together with the HTTP
  * layer's Origin check (D-058) this is D-052's CSRF protection.
  *
- * **Time limits** (D-052): 4 hours idle and 12 hours absolute by default.
+ * **Time limits** (D-052): 30 minutes idle (T-062, D-098) and 12 hours absolute by default.
  * A system manager may change them within `SESSION_POLICY_BOUNDS`. A session
  * waiting for its second step lasts `SECOND_STEP_SECONDS` (10 minutes) and
  * grants nothing else.
@@ -103,9 +103,12 @@ export interface SessionPolicy {
   readonly absoluteSeconds: number;
 }
 
-/** D-052 (John, 2026-11-23): 4 hours idle, 12 hours absolute. */
+/**
+ * 30 minutes idle (John, Q-8, 2026-11-24; T-062, D-098, replacing D-052's 4
+ * hours) and 12 hours absolute (D-052).
+ */
 export const DEFAULT_SESSION_POLICY: SessionPolicy = Object.freeze({
-  idleSeconds: 4 * 60 * 60,
+  idleSeconds: 30 * 60,
   absoluteSeconds: 12 * 60 * 60,
 });
 
