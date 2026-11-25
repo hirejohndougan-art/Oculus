@@ -50,8 +50,12 @@ function isStamp(value: unknown): value is string {
 function stamped(organizationId: string, siteId: string): Sql {
   return sql`
     SELECT r.id,
-           greatest(coalesce(v.recorded_at, r.updated_at),
-                    coalesce(m.changed_at, '-infinity'::timestamptz)) AS stamp
+           -- Whole milliseconds, as the token carries it: changed_at has
+           -- microseconds, and a finer stamp than the token's would resume
+           -- before the page it ended (D-105).
+           date_trunc('milliseconds',
+                      greatest(coalesce(v.recorded_at, r.updated_at),
+                               coalesce(m.changed_at, '-infinity'::timestamptz))) AS stamp
     FROM public.records r
     LEFT JOIN public.record_versions v
       ON v.organization_id = r.organization_id AND v.record_id = r.id AND v.version = r.version
@@ -117,19 +121,23 @@ export async function oaiDatestamp(
   return row?.stamp;
 }
 
-/** What Identify says of the site: its name, and the earliest datestamp (or none). */
+/**
+ * What Identify says of the site: its name, and a lower bound for every
+ * datestamp (when the site was made, to the second). Not the earliest
+ * record's stamp: that record may be one public output holds back (D-105).
+ * Every record on the site was put there by a version written after then.
+ */
 export async function oaiRepository(
   db: Queryable,
   organizationId: string,
   siteId: string,
-): Promise<{ name: string; earliest: string | undefined } | undefined> {
+): Promise<{ name: string; earliest: string } | undefined> {
   if (!isOrganizationId(organizationId) || !isSiteId(siteId)) return undefined;
-  const [row] = await db.rows<{ name: string; earliest: string | null }>(sql`
+  const [row] = await db.rows<{ name: string; earliest: string }>(sql`
     SELECT s.name,
-           (SELECT to_char(min(c.stamp) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
-            FROM (${stamped(organizationId, siteId)}) c) AS earliest
+           to_char(date_trunc('second', s.created_at) AT TIME ZONE 'UTC',
+                   'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS earliest
     FROM public.sites s
     WHERE s.organization_id = ${organizationId}::uuid AND s.id = ${siteId}::uuid`);
-  if (row === undefined) return undefined;
-  return { name: row.name, earliest: row.earliest ?? undefined };
+  return row === undefined ? undefined : { name: row.name, earliest: row.earliest };
 }

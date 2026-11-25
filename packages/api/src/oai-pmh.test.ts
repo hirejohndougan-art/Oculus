@@ -308,6 +308,28 @@ describe("GET /oai on a public host", () => {
     expect(identifiers(next.body).length).toBeGreaterThan(0);
   });
 
+  it("seals its resumption tokens: no record ID or datestamp in them, and a changed one is refused", async () => {
+    const reply = await oai("verb=ListIdentifiers&metadataPrefix=oai_dc");
+    const token = tokenIn(reply.body) ?? "";
+    const raw = Buffer.from(token, "base64url").toString("latin1");
+    for (const id of [published, draft, unmapped, ...more]) expect(raw).not.toContain(id);
+    expect(raw).not.toMatch(/\d{4}-\d\d-\d\dT/);
+    const flipped = `${token.slice(0, 20)}${token[20] === "A" ? "B" : "A"}${token.slice(21)}`;
+    const refused = await oai(`verb=ListIdentifiers&resumptionToken=${flipped}`);
+    expect(errorCode(refused.body)).toBe("badResumptionToken");
+  });
+
+  it("a far-future until is no bound at all", async () => {
+    for (const until of ["9999-12-31", "9999-12-31T23:59:59Z"]) {
+      const reply = await oai(`verb=ListIdentifiers&metadataPrefix=oai_dc&until=${until}`);
+      expect([until, reply.statusCode, identifiers(reply.body).length]).toEqual([
+        until,
+        200,
+        OAI_PAGE_SIZE,
+      ]);
+    }
+  });
+
   it("answers bad requests with OAI-PMH's errors, echoing arguments only when allowed", async () => {
     const cases: [string, string, boolean][] = [
       ["", "badVerb", false],
@@ -425,6 +447,34 @@ describe("GET /oai on a public host", () => {
     expect(oaiAdminEmail(undefined)).toBeUndefined();
     expect(oaiAdminEmail(EMAIL)).toBe(EMAIL);
     expect(() => oaiAdminEmail("two@example.org,three@example.org")).toThrow();
+  });
+
+  it("pages each record once after a mapping saved later gives them all one datestamp", async () => {
+    ok(
+      await w.service.saveDublinCoreMapping(
+        { organizationId: w.a, actor: actorOf(w.root) },
+        "t-object",
+        {
+          entries: [
+            { field: "rights", term: "rights" },
+            { field: "note", term: "description" },
+          ],
+        },
+        { expectedVersion: 1 },
+      ),
+    );
+    const seen: string[] = [];
+    let reply = await oai("verb=ListIdentifiers&metadataPrefix=oai_dc");
+    seen.push(...identifiers(reply.body));
+    let token = tokenIn(reply.body);
+    for (let pages = 1; token !== undefined; pages++) {
+      expect(pages).toBeLessThan(5);
+      reply = await oai(`verb=ListIdentifiers&resumptionToken=${token}`);
+      seen.push(...identifiers(reply.body));
+      token = tokenIn(reply.body);
+    }
+    expect(new Set(seen).size).toBe(seen.length);
+    expect(seen.sort()).toEqual([published, ...more].map((id) => `${PREFIX}${id}`).sort());
   });
 
   it("brakes a client per minute and refuses at once when the public pool is busy", async () => {

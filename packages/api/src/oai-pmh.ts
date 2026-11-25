@@ -24,11 +24,13 @@
  *
  * Choices (D-105): identifiers `oai:<host>:<record ID>`; datestamps to the
  * second; `deletedRecord` `no`; no sets; GET only (rule 5 needs an `Origin`
- * on POST); stateless resumption tokens of 25 records; each client address
+ * on POST); sealed resumption tokens of 25 records; each client address
  * may make `DEFAULT_RATE_LIMITS.oai` requests a minute (429 with
  * `Retry-After`), and a request holds one of the public pool's slots for
- * its whole page (503 `busy` with `Retry-After` when none is free).
+ * its whole page, OAI-PMH at most `OAI_MAX_SLOTS` of them (503 `busy` with
+ * `Retry-After` when none is free).
  */
+import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { isRecordId } from "@oculus/core";
 import {
   listPublishedForOai,
@@ -53,14 +55,14 @@ export const OAI_ADMIN_EMAIL_ENV = "OCULUS_OAI_ADMIN_EMAIL";
 export const OAI_PAGE_SIZE = 25;
 /** The most listed records one request reads, shown or held back. */
 export const OAI_MAX_SCAN = 200;
+/** The most of the public pool's slots OAI-PMH holds at once. */
+export const OAI_MAX_SLOTS = 2;
 
 const OAI_NS = "http://www.openarchives.org/OAI/2.0/";
 const OAI_SCHEMA = "http://www.openarchives.org/OAI/2.0/OAI-PMH.xsd";
 const OAI_DC_PREFIX = "oai_dc";
 const OAI_DC_SCHEMA = "http://www.openarchives.org/OAI/2.0/oai_dc.xsd";
 const OAI_DC_NAMESPACE = "http://www.openarchives.org/OAI/2.0/oai_dc/";
-/** A lower bound for every datestamp when the site has no records yet. */
-const NO_RECORDS_EARLIEST = "1970-01-01T00:00:00Z";
 
 export interface OaiPmhOptions {
   /** The public reader's pool (D-080): every record shown is read through it. */
@@ -105,6 +107,11 @@ function escape(text: string): string {
     .replace(/\r/g, "&#13;");
 }
 
+/** An attribute value: also tabs and line ends, which parsers would turn into spaces. */
+function attribute(text: string): string {
+  return escape(text).replace(/\t/g, "&#9;").replace(/\n/g, "&#10;");
+}
+
 function element(name: string, text: string): string {
   return `<${name}>${escape(text)}</${name}>`;
 }
@@ -145,7 +152,7 @@ function documentOf(
     request === undefined
       ? ""
       : Object.entries(request)
-          .map(([name, value]) => ` ${name}="${escape(value)}"`)
+          .map(([name, value]) => ` ${name}="${attribute(value)}"`)
           .join("");
   return [
     `${OAI_PMH_PROLOGUE} xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="${OAI_NS} ${OAI_SCHEMA}">`,
@@ -216,6 +223,9 @@ interface Window {
   readonly before?: string;
 }
 
+/** The last instant a stamp can name (9999-12-31T23:59:59.999Z). */
+const LATEST = Date.parse("9999-12-31T23:59:59.999Z");
+
 const DAY = /^(\d{4})-(\d{2})-(\d{2})$/;
 const SECOND = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z$/;
 
@@ -238,7 +248,9 @@ function windowOf(from: string | undefined, until: string | undefined): Window {
   }
   if (f !== undefined && u !== undefined && f.day !== u.day) return fail("badArgument");
   if (f !== undefined && u !== undefined && f.at > u.at) return fail("badArgument");
-  const before = u === undefined ? undefined : u.at + (u.day ? 86_400_000 : 1000);
+  const end = u === undefined ? undefined : u.at + (u.day ? 86_400_000 : 1000);
+  // Past year 9999 (until=9999-12-31) there is no bound to give.
+  const before = end === undefined || end > LATEST ? undefined : end;
   return {
     ...(f === undefined ? {} : { from: new Date(f.at).toISOString() }),
     ...(before === undefined ? {} : { before: new Date(before).toISOString() }),
@@ -254,46 +266,65 @@ interface Cursor {
 
 const STAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
-function tokenOf(cursor: Cursor): string {
-  const plain = [
-    cursor.window.from ?? "",
-    cursor.window.before ?? "",
-    cursor.after.stamp,
-    cursor.after.id,
-  ];
-  return Buffer.from(JSON.stringify(plain), "utf8").toString("base64url");
-}
+/**
+ * Tokens are sealed (AES-256-GCM under a key made when the routes are),
+ * since the last record a page scanned may be one public output holds back:
+ * its ID and datestamp must not leave (D-105). A token from before a restart
+ * is `badResumptionToken`, and the harvest starts again.
+ */
+class TokenSeal {
+  private readonly key = randomBytes(32);
 
-function cursorOf(token: string): Cursor {
-  if (!/^[A-Za-z0-9_-]{1,400}$/.test(token)) return fail("badResumptionToken");
-  const bytes = Buffer.from(token, "base64url");
-  if (bytes.toString("base64url") !== token) return fail("badResumptionToken");
-  let plain: unknown;
-  try {
-    plain = JSON.parse(bytes.toString("utf8"));
-  } catch {
-    return fail("badResumptionToken");
+  seal(cursor: Cursor): string {
+    const plain = [
+      cursor.window.from ?? "",
+      cursor.window.before ?? "",
+      cursor.after.stamp,
+      cursor.after.id,
+    ];
+    const nonce = randomBytes(12);
+    const cipher = createCipheriv("aes-256-gcm", this.key, nonce);
+    const body = Buffer.concat([cipher.update(JSON.stringify(plain), "utf8"), cipher.final()]);
+    return Buffer.concat([nonce, body, cipher.getAuthTag()]).toString("base64url");
   }
-  if (!Array.isArray(plain) || plain.length !== 4 || !plain.every((p) => typeof p === "string")) {
-    return fail("badResumptionToken");
+
+  open(token: string): Cursor {
+    if (!/^[A-Za-z0-9_-]{40,400}$/.test(token)) return fail("badResumptionToken");
+    const bytes = Buffer.from(token, "base64url");
+    if (bytes.toString("base64url") !== token || bytes.length < 29) {
+      return fail("badResumptionToken");
+    }
+    let plain: unknown;
+    try {
+      const decipher = createDecipheriv("aes-256-gcm", this.key, bytes.subarray(0, 12));
+      decipher.setAuthTag(bytes.subarray(bytes.length - 16));
+      const text = Buffer.concat([
+        decipher.update(bytes.subarray(12, bytes.length - 16)),
+        decipher.final(),
+      ]).toString("utf8");
+      plain = JSON.parse(text);
+    } catch {
+      return fail("badResumptionToken");
+    }
+    if (!Array.isArray(plain) || plain.length !== 4 || !plain.every((p) => typeof p === "string")) {
+      return fail("badResumptionToken");
+    }
+    const [from, before, stamp, id] = plain as [string, string, string, string];
+    const stampOk = (value: string): boolean =>
+      STAMP.test(value) && new Date(value).toISOString() === value;
+    if (
+      (from !== "" && !stampOk(from)) ||
+      (before !== "" && !stampOk(before)) ||
+      !stampOk(stamp) ||
+      !isRecordId(id)
+    ) {
+      return fail("badResumptionToken");
+    }
+    return {
+      window: { ...(from === "" ? {} : { from }), ...(before === "" ? {} : { before }) },
+      after: { stamp, id },
+    };
   }
-  const [from, before, stamp, id] = plain as [string, string, string, string];
-  const stampOk = (value: string): boolean =>
-    STAMP.test(value) &&
-    !Number.isNaN(Date.parse(value)) &&
-    new Date(value).toISOString() === value;
-  if (
-    (from !== "" && !stampOk(from)) ||
-    (before !== "" && !stampOk(before)) ||
-    !stampOk(stamp) ||
-    !isRecordId(id)
-  ) {
-    return fail("badResumptionToken");
-  }
-  return {
-    window: { ...(from === "" ? {} : { from }), ...(before === "" ? {} : { before }) },
-    after: { stamp, id },
-  };
 }
 
 // ---------------------------------------------------------------- routes
@@ -323,6 +354,10 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
   const log = options.log ?? (() => undefined);
   const clock = options.clock ?? Date.now;
   const slots = options.slots ?? new ReadSlots(4);
+  // OAI-PMH may hold at most two of the shared slots, so harvests (each
+  // up to OAI_MAX_SCAN reads) never leave `GET /records/:id` without one.
+  const oaiSlots = new ReadSlots(Math.min(OAI_MAX_SLOTS, slots.size));
+  const tokens = new TokenSeal();
   const adminEmail = oaiAdminEmail(options.adminEmail);
   if (adminEmail === undefined) throw new Error("oaiPmhRoutes needs an admin email");
   const email: string = adminEmail;
@@ -358,10 +393,7 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
       element("baseURL", baseUrl),
       element("protocolVersion", "2.0"),
       element("adminEmail", email),
-      element(
-        "earliestDatestamp",
-        repository.earliest === undefined ? NO_RECORDS_EARLIEST : secondsOf(repository.earliest),
-      ),
+      element("earliestDatestamp", secondsOf(repository.earliest)),
       element("deletedRecord", "no"),
       element("granularity", "YYYY-MM-DDThh:mm:ssZ"),
       "</Identify>",
@@ -410,7 +442,7 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
     if (token !== undefined) {
       // resumptionToken is exclusive (OAI-PMH §3.5).
       if (Object.keys(args).length !== 1) return fail("badArgument", false);
-      cursor = cursorOf(token);
+      cursor = tokens.open(token);
     } else {
       if (args.metadataPrefix === undefined) return fail("badArgument", false);
       if (args.metadataPrefix !== OAI_DC_PREFIX) return fail("cannotDisseminateFormat");
@@ -445,10 +477,12 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
         );
       }
     }
-    if (shown.length === 0 && exhausted) return fail("noRecordsMatch");
+    // A fresh list with nothing to show is noRecordsMatch; a resumed one
+    // whose rest is all held back just ends (§3.5), with the empty token below.
+    if (shown.length === 0 && exhausted && token === undefined) return fail("noRecordsMatch");
     let resumption = "";
     if (!exhausted && after !== undefined) {
-      resumption = element("resumptionToken", tokenOf({ window: cursor.window, after }));
+      resumption = element("resumptionToken", tokens.seal({ window: cursor.window, after }));
     } else if (token !== undefined) {
       // The last page of a list that was resumed ends with an empty token.
       resumption = "<resumptionToken/>";
@@ -504,7 +538,14 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
           reply.status(429).header("retry-after", "60");
           return { error: "rate_limited" };
         }
+        // A busy refusal has already spent this request's rate token, as a
+        // harvester retrying after Retry-After should.
+        if (!oaiSlots.take()) {
+          reply.status(503).header("retry-after", "5");
+          return { error: "busy" };
+        }
         if (!slots.take()) {
+          oaiSlots.give();
           reply.status(503).header("retry-after", "5");
           return { error: "busy" };
         }
@@ -530,6 +571,7 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
           body = `<error code="${thrown.code}">${escape(ERROR_TEXT[thrown.code])}</error>`;
         } finally {
           slots.give();
+          oaiSlots.give();
         }
         return oaiPmhReply(documentOf(responseDate, baseUrl, echoed, body));
       },
