@@ -85,6 +85,36 @@ try {
       scope: null,
     }),
   );
+  // A second invented member for T-048's people test (people.spec.ts),
+  // so resetting their two-step sign-in leaves the volunteer's sign-in test alone.
+  const helperEmail = "helper@example.org";
+  must(
+    await createInvitation(
+      db,
+      { organizationId, email: helperEmail, invitedBy: root },
+      (message) => {
+        box.push(message);
+        return Promise.resolve();
+      },
+    ),
+  );
+  const helper = must(
+    await acceptInvitation(db, {
+      token: box[1].token,
+      organizationId,
+      email: helperEmail,
+      displayName: "Ben Invented",
+      password: PASSWORD,
+    }),
+  ).userId;
+  must(
+    await service.grantRole(actor, {
+      userId: helper,
+      role: "cataloger",
+      siteId: site.id,
+      scope: null,
+    }),
+  );
   const origin = `http://localhost:${String(port)}`;
   app = await buildAdminServer({
     db,
@@ -101,7 +131,15 @@ try {
   await app.listen({ host: "127.0.0.1", port });
   writeFileSync(
     seedFile,
-    JSON.stringify({ email, password: PASSWORD, siteName: "Invented Archive" }),
+    JSON.stringify({
+      email,
+      password: PASSWORD,
+      siteName: "Invented Archive",
+      // T-048's people screens: the system manager signs in too.
+      rootEmail: "root@example.org",
+      organizationName: "Invented Historical Society",
+      helperName: "Ben Invented",
+    }),
   );
 } catch (error) {
   console.error(error);

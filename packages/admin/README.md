@@ -57,6 +57,11 @@ Keyboard (no mouse at all):
 - [ ] Frame: the site selector opens with Enter or Space or Alt+Down, arrows
       move, Enter chooses, Escape closes and returns focus to it. The account
       button opens its menu with Enter; arrows move; Escape closes.
+- [ ] People, a person's page, Invite, Roles and the Audit trail (T-048): the
+      sidebar's Administration links open with Enter; each "…" button opens
+      its confirmation in the page and moves focus to it; Cancel and the
+      confirm button are reached next by Tab; the re-entry form ("Confirm
+      it's you") opens in place when a change asks for it.
 - [ ] Nothing traps focus; nothing moves focus unexpectedly while typing.
 
 Screen reader:

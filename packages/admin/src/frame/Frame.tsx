@@ -17,6 +17,7 @@ import {
 } from "react-aria-components";
 import { ApiError, api, problemText, setCsrfToken } from "../api";
 import { Button, Note } from "../components/ui";
+import { AdminNav } from "../people/AdminNav";
 import type { Me, SiteChoice } from "../types";
 import styles from "./Frame.module.css";
 import { SiteSelector } from "./SiteSelector";
@@ -147,6 +148,7 @@ export function Frame() {
             isDisabled={switching}
           />
         ) : null}
+        <AdminNav />
       </nav>
       <div className={styles.body}>
         <header className={styles.topbar}>

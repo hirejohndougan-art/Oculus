@@ -18,6 +18,11 @@ import { ApiError } from "./api";
 import { Frame } from "./frame/Frame";
 import { Home } from "./frame/Home";
 import { SiteHome } from "./frame/SiteHome";
+import { Audit } from "./people/Audit";
+import { Invite } from "./people/Invite";
+import { PeopleList } from "./people/PeopleList";
+import { Person } from "./people/Person";
+import { Roles } from "./people/Roles";
 import { Code } from "./screens/Code";
 import { ResetComplete } from "./screens/ResetComplete";
 import { ResetRequest } from "./screens/ResetRequest";
@@ -61,6 +66,12 @@ export const ROUTES: RouteObject[] = [
         children: [
           { index: true, element: <Home /> },
           { path: "sites/:siteId", element: <SiteHome /> },
+          // People, roles and the audit trail (T-048).
+          { path: "people", element: <PeopleList /> },
+          { path: "people/invite", element: <Invite /> },
+          { path: "people/:userId", element: <Person /> },
+          { path: "roles", element: <Roles /> },
+          { path: "audit", element: <Audit /> },
         ],
       },
     ],
