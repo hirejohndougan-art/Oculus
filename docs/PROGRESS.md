@@ -10,6 +10,14 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Gate: PASS · tests_passing TBD (was 4729) · npm audit clean
 - Next: S-037
 
+
+## 2026-11-25 03:00 CT — manual (Chat D) — S-042 Site managers see members whose role is on every site
+- Result: done
+- What changed: John (2026-11-25): a role on every site includes the site manager's own, so such a member is seen in full and may be given more roles there. `holdsRoleOn` (packages/service/src/admin.ts) and `listMembers` (packages/db/src/people.ts) count every-site grants; members with no role stay name-only.
+- Decisions: D-084 amended
+- Review: one independent round, nothing blocking; fixed: a role on every site scoped to one unit no longer counts, and a viewer with no managed site sees no one (matching the SQL); unit tests for the rule.
+- Gate: PASS · tests_passing 4734 (was 4729) · npm audit clean · licences all permissive (the e2e step, disturbed by a stopped earlier run, passed on its own: 8 of 8; main then moved by roadmap claims only)
+- Next: nothing claimed
 ## 2026-11-25 04:45 CT — upkeep — U-006 Main's gate fails in a clean checkout
 - Result: gate fix
 - What changed: CI's gate on main had failed at lint on every push since M-001 (`files.spec.ts` imports `@oculus/api`, resolved to an unbuilt `dist`); `packages/admin/tsconfig.json` now maps `@oculus/api`, `db` and `service` to their sources (c3f0f46). Also in-major updates: @types/node 26.6.10, @types/react 19.3.2, react-router 8.5.3. TypeScript 7 / Vite 8 rechecked, still blocked (T-001b). Filed U-007 (the gate should start with no `dist`).

@@ -512,7 +512,7 @@ describe("who a site manager sees, and may grant to (T-064 review)", () => {
     scope,
   });
 
-  it("a manager of every site doesn't see, and can't grant to, someone whose only role is on every site", async () => {
+  it("a member whose only role is on every site is seen in full and can be granted to, by every site manager (John, S-042)", async () => {
     const boss = await w.member(w.a, "Boss");
     const target = await w.member(w.a, "Target");
     expect(
@@ -533,30 +533,40 @@ describe("who a site manager sees, and may grant to (T-064 review)", () => {
     ).toBe(201);
     tokens.boss = (await fullSession(w.db, boss, w.a)).token;
 
-    const listed = (await call("GET", "/api/people", { as: "boss" })).json.people as {
-      userId: string;
-    }[];
-    expect(listed.map((p) => p.userId)).not.toContain(target);
-    const missing = await call("GET", `/api/people/${MADE_UP}`, { as: "boss" });
-    expect(shape(await call("GET", `/api/people/${target}`, { as: "boss" }))).toEqual(
-      shape(missing),
-    );
-    const refused = await call("POST", `/api/people/${target}/roles`, {
-      as: "boss",
+    for (const as of ["boss", "manager"]) {
+      const listed = (await call("GET", "/api/people", { as })).json.people as {
+        userId: string;
+        email?: string;
+        nameOnly?: boolean;
+      }[];
+      const seen = listed.find((p) => p.userId === target);
+      expect([as, typeof seen?.email, seen?.nameOnly]).toEqual([as, "string", undefined]);
+      const one = (await call("GET", `/api/people/${target}`, { as })).json.person as {
+        email?: string;
+        addedAt?: string;
+      };
+      expect([as, typeof one.email, typeof one.addedAt]).toEqual([as, "string", "string"]);
+    }
+    const more = await call("POST", `/api/people/${target}/roles`, {
+      as: "manager",
       body: body("reviewer"),
     });
-    const refusedMissing = await call("POST", `/api/people/${MADE_UP}/roles`, {
-      as: "boss",
-      body: body("reviewer"),
-    });
-    expect(refused.status).toBe(404);
-    expect(shape(refused)).toEqual(shape(refusedMissing));
-    expect(await grantCount(target)).toBe(1);
-    // Someone with a role on one of the sites is seen in full and can be given more.
-    const onSite = (await call("GET", `/api/people/${helper}`, { as: "boss" })).json.person as {
-      email?: string;
+    expect(more.status).toBe(201);
+    expect(await grantCount(target)).toBe(2);
+    // The every-site role itself stays out of a site manager's view (D-072).
+    const roles = (await call("GET", `/api/people/${target}`, { as: "manager" })).json.person as {
+      roles: { siteId: string | null }[];
     };
-    expect(typeof onSite.email).toBe("string");
+    expect(roles.roles.every((g) => g.siteId === w.a1)).toBe(true);
+    // Someone with no role at all is still name-only (Q-10 kept).
+    const lone = await w.member(w.a, "Alone");
+    const loneSeen = (await call("GET", `/api/people/${lone}`, { as: "boss" })).json.person;
+    expect(loneSeen).toEqual({
+      userId: lone,
+      displayName: "Invented Alone",
+      roles: [],
+      nameOnly: true,
+    });
   });
 
   it("a member whose only role is site manager on the manager's site is seen in full and can be granted to", async () => {
