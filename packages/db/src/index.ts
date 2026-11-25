@@ -97,6 +97,7 @@ export {
   recordClosureIds,
   lockRecordsShared,
   readWorkflowState,
+  publishedRecordView,
   recordsInState,
   MAX_STATE_LIST_LIMIT,
 } from "./workflow.js";
@@ -399,5 +400,22 @@ export {
   setUpFirstInstall,
 } from "./first-setup.js";
 export type { FirstInstall, FirstInstallResult } from "./first-setup.js";
+export {
+  SHARE_STATES,
+  SHARE_TABLE_PRIVILEGES,
+  MAX_SHARE_PAGE,
+  insertShare,
+  isShareId,
+  liveShare,
+  lockShare,
+  moveShare,
+  readShare,
+  sharedItemViews,
+  sharesIntoSite,
+  sharesOfRecord,
+} from "./shares.js";
+export type { Share, ShareState, SharedItemView } from "./shares.js";
 export { runSetupCli, terminalAsk } from "./setup-cli.js";
 export type { Ask } from "./setup-cli.js";
+export { backup, BackupError } from "./backup.js";
+export type { BackupOptions, BackupResult } from "./backup.js";

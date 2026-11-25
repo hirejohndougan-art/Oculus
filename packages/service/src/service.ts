@@ -129,6 +129,7 @@ import {
 import { adminOperations, type AdminOperations } from "./admin.js";
 import { definitionOperations, type DefinitionOperations } from "./definitions.js";
 import { peopleOperations, type PeopleOperations } from "./people.js";
+import { shareOperations, type ShareOperations } from "./shares.js";
 import {
   changeWorkflowState,
   checkWriterConnection,
@@ -445,7 +446,8 @@ export interface ReviewQueue {
 export const MAX_VERSION_PAGE = 100;
 
 /** The service: every write of a record and its related rows, and who may make them. */
-export interface RecordService extends AdminOperations, DefinitionOperations, PeopleOperations {
+export interface RecordService
+  extends AdminOperations, DefinitionOperations, PeopleOperations, ShareOperations {
   /** The record as stored, for someone who may view it (`records.view`). */
   readRecord(context: ServiceContext, recordId: RecordId): Promise<ServiceResult<ReadRecord>>;
   /**
@@ -1690,6 +1692,32 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
   }
 
   /**
+   * Runs `work` that opens transactions of its own (a read in a snapshot of
+   * its own, `sharedItemViews`) with `run`'s handling: deadlocks and
+   * serialization failures run it again, and any other error is logged with
+   * `onError` and answered as a clean refusal, never thrown.
+   */
+  async function outside<T>(
+    operation: string,
+    work: () => Promise<ServiceResult<T>>,
+  ): Promise<ServiceResult<T>> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await work();
+      } catch (error) {
+        const state = sqlState(error);
+        if (state !== undefined && RETRYABLE_STATES.has(state) && attempt < attempts) continue;
+        try {
+          onError?.(error, operation);
+        } catch {
+          // The log's own failure changes nothing.
+        }
+        return cleanError(error);
+      }
+    }
+  }
+
+  /**
    * After a record and its identifiers are written: every identifier field
    * shows a number the record now holds (D-038).
    */
@@ -2919,6 +2947,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
     ...adminOperations(run),
     ...definitionOperations(run),
     ...peopleOperations(db, run, onError, searchTimeoutMs),
+    ...shareOperations(db, run, outside),
     submitForReview: workflowAction("submit_for_review"),
     returnToDraft: workflowAction("return_to_draft"),
     publish: workflowAction("publish"),
