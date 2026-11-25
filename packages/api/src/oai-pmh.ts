@@ -45,7 +45,7 @@ import {
 } from "@oculus/db";
 import { Refusal } from "./errors.js";
 import { oaiPmhReply, OAI_PMH_PROLOGUE } from "./file-replies.js";
-import { clientKey, originOf, ReadSlots } from "./public-api.js";
+import { checkTimeLimit, clientKey, originOf, ReadSlots } from "./public-api.js";
 import type { PublicSite } from "./public-sites.js";
 import { DEFAULT_RATE_LIMITS, SessionRateLimiter, type RateBucket } from "./rate-limit.js";
 import type { OculusRequest, OculusReply, OculusRoute } from "./routes.js";
@@ -58,6 +58,12 @@ export const OAI_ADMIN_EMAIL_ENV = "OCULUS_OAI_ADMIN_EMAIL";
 export const OAI_PAGE_SIZE = 25;
 /** The most listed records one request reads, shown or held back. */
 export const OAI_MAX_SCAN = 200;
+/**
+ * How long one list page may spend reading records (S-037). Past it the page
+ * ends with what it has and a resumption token, so a slow database can't keep
+ * a harvest in a slot for `OAI_MAX_SCAN` reads; at least one is always read.
+ */
+export const OAI_PAGE_TIME_LIMIT_MS = 15_000;
 /** The most of the public pool's slots OAI-PMH holds at once. */
 export const OAI_MAX_SLOTS = 2;
 
@@ -82,6 +88,8 @@ export interface OaiPmhOptions {
   readonly slots?: ReadSlots;
   /** Each record read's statement time limit (S-037); `readPublicRecord`'s default when left out. */
   readonly timeLimitMs?: number;
+  /** A list page's reading time (S-037); `OAI_PAGE_TIME_LIMIT_MS` when left out. */
+  readonly pageTimeLimitMs?: number;
 }
 
 /** An address fit for `adminEmail`, or undefined: plain, short, nothing XML must escape. */
@@ -372,6 +380,11 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
   const slots = options.slots ?? new ReadSlots(4);
   // OAI-PMH may hold at most two of the shared slots, so harvests (each
   // up to OAI_MAX_SCAN reads) never leave `GET /records/:id` without one.
+  checkTimeLimit(options.timeLimitMs);
+  const pageTimeLimitMs = options.pageTimeLimitMs ?? OAI_PAGE_TIME_LIMIT_MS;
+  if (!Number.isInteger(pageTimeLimitMs) || pageTimeLimitMs < 1 || pageTimeLimitMs > 120_000) {
+    throw new RangeError("pageTimeLimitMs must be a whole number from 1 to 120000");
+  }
   const oaiSlots = new ReadSlots(Math.max(1, Math.min(OAI_MAX_SLOTS, slots.size - 1)));
   const tokens = new TokenSeal();
   const adminEmail = oaiAdminEmail(options.adminEmail);
@@ -470,7 +483,9 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
     let after = cursor.after;
     let scanned = 0;
     let exhausted = false;
-    while (shown.length < OAI_PAGE_SIZE && scanned < OAI_MAX_SCAN && !exhausted) {
+    let outOfTime = false;
+    const deadline = Date.now() + pageTimeLimitMs;
+    while (shown.length < OAI_PAGE_SIZE && scanned < OAI_MAX_SCAN && !exhausted && !outOfTime) {
       const want = Math.min(OAI_PAGE_SIZE - shown.length + 5, OAI_MAX_SCAN - scanned);
       const candidates = await listPublishedForOai(options.db, site.organizationId, site.siteId, {
         ...cursor.window,
@@ -481,6 +496,12 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
       for (const candidate of candidates) {
         if (shown.length >= OAI_PAGE_SIZE) {
           exhausted = false;
+          break;
+        }
+        if (scanned > 0 && Date.now() >= deadline) {
+          // Out of time (S-037): this candidate and the rest come on the next page.
+          exhausted = false;
+          outOfTime = true;
           break;
         }
         scanned += 1;

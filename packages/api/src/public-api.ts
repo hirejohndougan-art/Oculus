@@ -28,12 +28,20 @@
  * running out is `503 busy` too.
  */
 import { isRecordId } from "@oculus/core";
-import { isDatabaseTimeout, readPublicRecord, type Database } from "@oculus/db";
+import {
+  isDatabaseTimeout,
+  MAX_PUBLIC_READ_TIME_LIMIT_MS,
+  readPublicRecord,
+  type Database,
+} from "@oculus/db";
 import { Refusal } from "./errors.js";
 import type { PublicSite } from "./public-sites.js";
 import { DEFAULT_RATE_LIMITS, SessionRateLimiter, type RateBucket } from "./rate-limit.js";
 import type { OculusRequest, OculusRoute } from "./routes.js";
 import type { ApiLogRecord } from "./staff-api.js";
+
+/** The public reader pool's connections, and so the public routes' read slots. */
+export const PUBLIC_POOL_SIZE = 4;
 
 /** How long the public reader pool waits for a connection, in milliseconds (S-037). */
 export const PUBLIC_POOL_WAIT_MS = 5_000;
@@ -43,7 +51,7 @@ export const PUBLIC_POOL_WAIT_MS = 5_000;
  * `max` connections, at most `PUBLIC_POOL_WAIT_MS` waiting for one. A
  * route's `maxConcurrent` (or its `ReadSlots`) must not exceed `max`.
  */
-export function publicPoolOptions(max = 4): {
+export function publicPoolOptions(max = PUBLIC_POOL_SIZE): {
   applicationName: string;
   max: number;
   connectionTimeoutMillis: number;
@@ -90,6 +98,20 @@ export class ReadSlots {
   }
 }
 
+/** Refuses at build time a time limit `readPublicRecord` would refuse on every read. */
+export function checkTimeLimit(timeLimitMs: number | undefined): void {
+  if (timeLimitMs === undefined) return;
+  if (
+    !Number.isInteger(timeLimitMs) ||
+    timeLimitMs < 1 ||
+    timeLimitMs > MAX_PUBLIC_READ_TIME_LIMIT_MS
+  ) {
+    throw new RangeError(
+      `timeLimitMs must be a whole number from 1 to ${String(MAX_PUBLIC_READ_TIME_LIMIT_MS)}`,
+    );
+  }
+}
+
 /** The key a client is braked by: an IPv4 address, or an IPv6 address's /64. */
 export function clientKey(ip: string): string {
   if (!ip.includes(":")) return ip;
@@ -129,7 +151,8 @@ export function publicApiRoutes(options: PublicApiOptions): OculusRoute[] {
     options.clock,
   );
   const log = options.log ?? (() => undefined);
-  const slots = options.slots ?? new ReadSlots(options.maxConcurrent ?? 4);
+  const slots = options.slots ?? new ReadSlots(options.maxConcurrent ?? PUBLIC_POOL_SIZE);
+  checkTimeLimit(options.timeLimitMs);
 
   return [
     {

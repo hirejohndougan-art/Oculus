@@ -310,18 +310,19 @@ export function openDatabase(connectionString: string, options: DatabaseOptions 
   };
 }
 
-/** pg's own errors for a connection not had within `connectionTimeoutMillis` (pg-pool). */
-const CONNECTION_WAITS = new Set([
-  "timeout exceeded when trying to connect",
-  "Connection terminated due to connection timeout",
-]);
+/**
+ * pg-pool's error for a wait past `connectionTimeoutMillis` for a pooled
+ * connection while every one is in use. Not its "Connection terminated due
+ * to connection timeout", which means opening a new connection took too
+ * long (an unreachable server): that is an outage, not load.
+ */
+const CONNECTION_WAITS = new Set(["timeout exceeded when trying to connect"]);
 
 /**
  * Whether `error` means a time limit ran out (S-037), not that the database
  * failed: a statement cancelled by `statement_timeout` (SQLSTATE 57014,
- * query_canceled), or no connection within the pool's
- * `connectionTimeoutMillis`, whether waiting for a pooled one or opening a
- * new one. Public reads answer these `503 busy`. Every such error is also
+ * query_canceled), or no pooled connection free within the pool's
+ * `connectionTimeoutMillis`. Public reads answer these `503 busy`. Every such error is also
  * an `isDatabaseFailure`.
  */
 export function isDatabaseTimeout(error: unknown): boolean {

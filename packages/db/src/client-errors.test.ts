@@ -172,8 +172,9 @@ describe("isDatabaseTimeout (S-037)", () => {
       isDatabaseTimeout(Object.assign(new Error("canceling statement"), { code: "57014" })),
     ).toBe(true);
     expect(isDatabaseTimeout(new Error("timeout exceeded when trying to connect"))).toBe(true);
+    // Opening a new connection too slowly is an outage, not load.
     expect(isDatabaseTimeout(new Error("Connection terminated due to connection timeout"))).toBe(
-      true,
+      false,
     );
     // Other failures are failures, not timeouts.
     expect(isDatabaseTimeout(Object.assign(new Error("x"), { code: "57P01" }))).toBe(false);

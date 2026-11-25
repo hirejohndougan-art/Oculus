@@ -53,7 +53,7 @@ export async function runAdminCli(
   let publicDb: ReturnType<typeof openDatabase> | undefined;
   if (publicUrl !== undefined && publicUrl.trim() !== "") {
     try {
-      publicDb = openDatabase(publicUrl, publicPoolOptions(4));
+      publicDb = openDatabase(publicUrl, publicPoolOptions());
     } catch {
       await db.close();
       err(`${PUBLIC_DATABASE_URL_ENV} is not a usable postgresql:// URL (its value is not shown).`);

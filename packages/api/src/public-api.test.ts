@@ -25,6 +25,7 @@ import { loadAdminFiles } from "./admin-files.js";
 import { buildAdminServer } from "./admin-server.js";
 import {
   clientKey,
+  PUBLIC_POOL_SIZE,
   PUBLIC_POOL_WAIT_MS,
   publicApiRoutes,
   publicPoolOptions,
@@ -364,7 +365,7 @@ describe("GET /records/:id on a public host", () => {
   it("the public pool's options wait a bounded time for a connection (S-037)", () => {
     expect(publicPoolOptions()).toEqual({
       applicationName: "oculus-public",
-      max: 4,
+      max: PUBLIC_POOL_SIZE,
       connectionTimeoutMillis: PUBLIC_POOL_WAIT_MS,
     });
     expect(PUBLIC_POOL_WAIT_MS).toBeGreaterThan(0);
@@ -389,5 +390,14 @@ describe("GET /records/:id on a public host", () => {
       if (!result.ok) expect(result.issues.map((i) => i.code)).toEqual(["invalid_options"]);
     }
     for (const good of [1_000, 60_000, undefined]) expect((await read(good)).ok).toBe(true);
+  });
+
+  it("the routes refuse a time limit every read would refuse (S-037)", () => {
+    for (const bad of [0, -1, 1.5, 60_001, Number.NaN]) {
+      expect(() => publicApiRoutes({ db: reader, sites: [], timeLimitMs: bad })).toThrow(
+        RangeError,
+      );
+    }
+    expect(() => publicApiRoutes({ db: reader, sites: [], timeLimitMs: 60_000 })).not.toThrow();
   });
 });

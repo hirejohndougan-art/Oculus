@@ -599,4 +599,53 @@ describe("oaiPmhReply", () => {
       await limited.close();
     }
   });
+
+  it("a list page out of reading time ends early with a token, and the list is still whole (S-037)", async () => {
+    const sites = await checkPublicSites(w.db, reader, [{ origin: PUBLIC, siteId: w.a1 }]);
+    const hurried = await buildServer({
+      env: { OCULUS_ORIGINS: PUBLIC },
+      routes: oaiPmhRoutes({
+        db: w.db,
+        publicDb: reader,
+        sites,
+        adminEmail: EMAIL,
+        rateLimits: { oai: 10_000 },
+        pageTimeLimitMs: 1,
+      }),
+    });
+    try {
+      const seen: string[] = [];
+      let reply = await oai("verb=ListIdentifiers&metadataPrefix=oai_dc", "127.0.0.1", hurried);
+      // A short page (at least one record is read per page, so the list moves on).
+      expect(identifiers(reply.body).length).toBeLessThan(2);
+      expect(tokenIn(reply.body)).toBeDefined();
+      seen.push(...identifiers(reply.body));
+      let token = tokenIn(reply.body);
+      let pages = 1;
+      while (token !== undefined) {
+        reply = await oai(`verb=ListIdentifiers&resumptionToken=${token}`, "127.0.0.1", hurried);
+        expect(errorCode(reply.body)).toBeUndefined();
+        seen.push(...identifiers(reply.body));
+        token = tokenIn(reply.body);
+        pages += 1;
+        expect(pages).toBeLessThan(100);
+      }
+      expect(pages).toBeGreaterThan(2);
+      expect(new Set(seen).size).toBe(seen.length);
+      expect(seen.sort()).toEqual([published, ...more].map((id) => `${PREFIX}${id}`).sort());
+    } finally {
+      await hurried.close();
+    }
+  });
+
+  it("refuses time limits it couldn't use when the routes are built (S-037)", () => {
+    const base = { db: w.db, publicDb: reader, sites: [], adminEmail: EMAIL };
+    for (const bad of [0, -1, 1.5, 60_001, Number.NaN]) {
+      expect(() => oaiPmhRoutes({ ...base, timeLimitMs: bad })).toThrow(RangeError);
+    }
+    for (const bad of [0, 1.5, 120_001]) {
+      expect(() => oaiPmhRoutes({ ...base, pageTimeLimitMs: bad })).toThrow(RangeError);
+    }
+    expect(() => oaiPmhRoutes({ ...base, timeLimitMs: 200, pageTimeLimitMs: 1 })).not.toThrow();
+  });
 });
