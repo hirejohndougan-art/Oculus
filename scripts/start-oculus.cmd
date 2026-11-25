@@ -1,7 +1,8 @@
 @echo off
 rem Starts Oculus on this computer in its own window (T-056, D-088).
 rem Double-click this file, or make a desktop shortcut to it. Closing the
-rem Oculus window stops it. The first time, and after each update
+rem Oculus window stops it. The very first time it also sets up Oculus's
+rem database (T-057) and asks a few questions. The first time, and after each update
 rem (git pull), it installs and builds Oculus first, which takes a few minutes.
 setlocal
 cd /d "%~dp0.."
@@ -26,6 +27,12 @@ call npm run build || goto failed
 if defined HEAD (echo %HEAD%)>"packages\api\dist\.built-from"
 
 :run
+set "SETTINGS=%APPDATA%\Oculus"
+if defined OCULUS_DESKTOP_HOME set "SETTINGS=%OCULUS_DESKTOP_HOME%"
+if not defined OCULUS_DATABASE_URL if not exist "%SETTINGS%\desktop.json" (
+  echo Setting up Oculus's database, the first time only...
+  node packages\api\dist\desktop-database-cli.js || goto failed
+)
 call npm run desktop
 if errorlevel 1 goto failed
 exit /b 0

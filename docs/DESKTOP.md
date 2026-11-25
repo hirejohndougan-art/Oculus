@@ -2,7 +2,7 @@
 
 Oculus is a web app, but you can run it on one computer and use it in its own window. Nothing goes on the internet. Your records stay in a PostgreSQL database on that computer (D-088).
 
-These steps are for Windows 11. On a Mac or Linux they are the same, except that the commands go in a terminal and you start Oculus with `npm run desktop`.
+These steps are for Windows 11. On a Mac or Linux they are the same, except that in a terminal in the Oculus folder you run `npm ci && npm run build`, then `npm run desktop:database` once, then `npm run desktop` each time.
 
 ## What you need, once
 
@@ -10,55 +10,22 @@ These steps are for Windows 11. On a Mac or Linux they are the same, except that
 2. **PostgreSQL 15 or newer** from https://www.postgresql.org/download/windows/ (the EDB installer, about 10 minutes). It asks you to choose a password for the `postgres` account. Write it down; you need it once, below.
 3. **Edge or Chrome.** Windows 11 already has Edge. Oculus opens in an Edge window with no tabs or address bar.
 
-## Make Oculus's database, once
-
-Task T-057 will do this part for you with one command. Until then, it takes four steps:
-
-1. Open **SQL Shell (psql)** from the Start menu. Press Enter at each question until it asks for the password, then type the `postgres` password.
-2. Paste these two lines, with a long password of your own in place of `choose-a-long-password`:
-
-   ```sql
-   CREATE ROLE oculus LOGIN PASSWORD 'choose-a-long-password';
-   CREATE DATABASE oculus OWNER oculus;
-   ```
-
-   Type `\q` to leave.
-3. Save that password where PostgreSQL looks for it. Make the folder `%APPDATA%\postgresql` and, in it, a text file `pgpass.conf` holding one line:
-
-   ```
-   localhost:5432:oculus:oculus:choose-a-long-password
-   ```
-
-4. Tell Oculus where its database is. Make the folder `%APPDATA%\Oculus` and, in it, a text file `desktop.json` holding:
-
-   ```json
-   { "databaseUrl": "postgresql://oculus@localhost:5432/oculus" }
-   ```
-
-   Never put the password in this file; Oculus refuses to start if you do.
-
-In Notepad, choose **Save as type: All files** for both files, or Windows saves them as `pgpass.conf.txt` and `desktop.json.txt` and nothing finds them.
-
-## Get Oculus and set it up, once
+## Get Oculus, once
 
 In a Command Prompt:
 
 ```
 git clone https://github.com/hirejohndougan-art/Oculus.git
-cd Oculus
-npm ci
-npm run build
-set OCULUS_DATABASE_URL=postgresql://oculus@localhost:5432/oculus
-node packages\db\dist\setup-cli.js
 ```
 
-The last line is `npm run setup` on a Mac or Linux. It asks for your organization's name, the first site's name, and your name, email and password. It runs only once.
+That makes an `Oculus` folder wherever the Command Prompt was (usually your user folder).
 
 ## Start Oculus
 
 Double-click `scripts\start-oculus.cmd` in the Oculus folder. To make a desktop icon, right-click it and choose **Show more options › Send to › Desktop (create shortcut)**.
 
 - The first time, and after each update, it installs and builds Oculus first (a few minutes).
+- **The very first time** it then sets up Oculus's database (T-057). It asks for the `postgres` password you chose when installing PostgreSQL (used once, never saved), then your organization's name, the first site's name, and your name, email and the password you'll sign in with. It makes two accounts in PostgreSQL just for Oculus, with long random passwords kept in `%APPDATA%\postgresql\pgpass.conf`, and writes `%APPDATA%\Oculus\desktop.json`. If anything goes wrong, it removes what it made, so you can simply try again.
 - Oculus opens in its own window at the sign-in screen. At your first sign-in you set up two-step sign-in with an authenticator app on your phone.
 - **Closing the Oculus window stops Oculus.** The black window behind it is Oculus running; leave it open while you work.
 - Starting it again while it's open just opens another window.
@@ -85,7 +52,8 @@ Close Oculus first. Then, in the Oculus folder, `git pull`, and double-click `st
 
 Everything is optional. In `desktop.json`:
 
-- `"databaseUrl"`: the database (or set `OCULUS_DATABASE_URL`, which wins).
+- `"databaseUrl"`: the database account Oculus works as (or set `OCULUS_DATABASE_URL`, which wins and is then used for everything).
+- `"ownerDatabaseUrl"`: the account that owns the database, used only to update it and check it at start (or `OCULUS_DATABASE_OWNER_URL`).
 - `"port"`: the port Oculus uses on this computer (default 4780; another free one if that's taken).
 
 Other settings: `OCULUS_DESKTOP_HOME` moves the settings folder (only to a folder no one else on the computer can open, since the secret key lives there), `OCULUS_DESKTOP_BROWSER` names the browser to open, and `OCULUS_SECRET_KEY` replaces the key file.

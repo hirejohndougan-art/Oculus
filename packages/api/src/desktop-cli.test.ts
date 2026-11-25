@@ -426,6 +426,12 @@ describe("npm run desktop", () => {
     }
   });
 
+  it("refuses an owner address that reaches a different database from the app's", async () => {
+    const run = start({ env: { OCULUS_DATABASE_OWNER_URL: empty.url } });
+    expect(await run.done).toBe(1);
+    expect(run.lines.join("\n")).toContain("different databases");
+  });
+
   it("says how to start when no database is named", async () => {
     const run = start({ env: { OCULUS_DATABASE_URL: undefined } });
     expect(await run.done).toBe(2);

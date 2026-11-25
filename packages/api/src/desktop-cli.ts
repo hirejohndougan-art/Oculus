@@ -28,7 +28,9 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+  checkWriterConnection,
   databaseBeforeSetup,
+  grantWriterRole,
   migrate,
   MigrationError,
   openDatabase,
@@ -168,6 +170,22 @@ async function sealingKeyIds(db: Database): Promise<string[]> {
   return rows.map((r) => r.id);
 }
 
+/** Whether two connections reach the same database on the same running server. */
+async function sameDatabase(a: Database, b: Database): Promise<boolean> {
+  const where = sql`SELECT current_database() AS d, pg_postmaster_start_time()::text AS t,
+                           current_setting('port') AS p`;
+  const [x] = await a.rows<{ d: string; t: string; p: string }>(where);
+  const [y] = await b.rows<{ d: string; t: string; p: string }>(where);
+  return x !== undefined && x.d === y?.d && x.t === y.t && x.p === y.p;
+}
+
+/** The writer connection's role name. */
+async function writerRoleName(db: Database): Promise<string> {
+  const [row] = await db.rows<{ name: string }>(sql`SELECT current_user AS name`);
+  if (row === undefined) throw new Error("no role");
+  return row.name;
+}
+
 /** The fingerprints of the key in use and any previous keys still accepted. */
 function knownKeyIds(key: string, env: Env): Set<string> {
   const ids = new Set([loadSecretKeyring({ [SECRET_KEY_VARIABLE]: key }).currentKeyId]);
@@ -200,13 +218,23 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
 
   let folder: string;
   let url: string;
+  let ownerUrl: string | undefined;
   let wantedPort: number;
   try {
     folder = settingsFolder(platform, env, options.home ?? homedir());
     ensureSettingsFolder(folder);
     const settings = readDesktopSettings(folder);
     url = chooseDatabaseUrl(env, settings, folder);
-    secrets.push(...passwordOf(url));
+    // The owner's address goes with the settings' writer address only: an
+    // OCULUS_DATABASE_URL given by hand is used for everything, as before.
+    const fromEnvUrl = env.OCULUS_DATABASE_URL;
+    ownerUrl =
+      env.OCULUS_DATABASE_OWNER_URL !== undefined && env.OCULUS_DATABASE_OWNER_URL !== ""
+        ? env.OCULUS_DATABASE_OWNER_URL
+        : fromEnvUrl !== undefined && fromEnvUrl.trim() !== ""
+          ? undefined
+          : settings.ownerDatabaseUrl;
+    secrets.push(...passwordOf(url), ...(ownerUrl === undefined ? [] : passwordOf(ownerUrl)));
     wantedPort = settings.port ?? DEFAULT_DESKTOP_PORT;
     const fromEnv = env.OCULUS_PORT;
     if (fromEnv !== undefined && fromEnv !== "") {
@@ -271,6 +299,7 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
   const token = lock.lock.token;
 
   let db: Database | undefined;
+  let ownerDb: Database | undefined;
   let app: FastifyInstance | undefined;
   let window: WindowProcess | undefined;
   try {
@@ -280,15 +309,26 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
     }
     try {
       db = openDatabase(url, { applicationName: "oculus-desktop", max: 10 });
+      if (ownerUrl !== undefined) {
+        ownerDb = openDatabase(ownerUrl, { applicationName: "oculus-desktop-owner", max: 1 });
+      }
     } catch {
       err("The database address is not a usable postgresql:// URL (its value is not shown).");
       return 2;
     }
+    // The owner (when there is one) checks and migrates; the server connects as the writer.
+    const checker = ownerDb ?? db;
     let state: "empty" | "set_up" | "other";
     let sealedWith: string[] = [];
     try {
-      state = await databaseBeforeSetup(db);
-      if (state === "set_up") sealedWith = await sealingKeyIds(db);
+      if (ownerDb !== undefined && !(await sameDatabase(ownerDb, db))) {
+        err(
+          "The owner's and the app's database addresses in desktop.json point at different databases. Fix desktop.json.",
+        );
+        return 1;
+      }
+      state = await databaseBeforeSetup(checker);
+      if (state === "set_up") sealedWith = await sealingKeyIds(checker);
     } catch {
       err(
         "Can't reach the database. Check that PostgreSQL is running and that the address and pgpass password are right.",
@@ -330,9 +370,24 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
       throw error;
     }
     try {
-      const result = await migrate({ connectionString: url, log: out });
+      const result = await migrate({ connectionString: ownerUrl ?? url, log: out });
       if (result.applied.length > 0) {
         out(`Updated the database (${String(result.applied.length)} change(s)).`);
+      }
+      if (ownerDb !== undefined) {
+        // New tables from new migrations need the writer's grants too (D-067).
+        const owner = ownerDb;
+        const server = db;
+        await owner.transaction(async (tx) => {
+          await grantWriterRole(tx, await writerRoleName(server));
+        });
+        const problems = await checkWriterConnection(server);
+        if (problems.length > 0) {
+          err(
+            `The app's database account has more power than Oculus allows (${problems.map((p) => p.code).join(", ")}). It must be a plain role made for Oculus (D-067).`,
+          );
+          return 1;
+        }
       }
     } catch (error) {
       err(
@@ -448,6 +503,7 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
     }
     try {
       await db?.close();
+      await ownerDb?.close();
     } catch {
       // As above.
     }

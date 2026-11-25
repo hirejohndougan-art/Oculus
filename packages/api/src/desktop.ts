@@ -96,7 +96,10 @@ export function ensureSettingsFolder(folder: string): void {
 }
 
 export interface DesktopSettings {
+  /** The writer's address: the server connects with it (D-067). */
   databaseUrl?: string;
+  /** The owner's address: migrations and the start-up checks use it (T-057). */
+  ownerDatabaseUrl?: string;
   port?: number;
 }
 
@@ -130,20 +133,20 @@ export function readDesktopSettings(folder: string): DesktopSettings {
   }
   const settings: DesktopSettings = {};
   for (const [key, entry] of Object.entries(value)) {
-    if (key === "databaseUrl") {
+    if (key === "databaseUrl" || key === "ownerDatabaseUrl") {
       if (typeof entry !== "string" || !/^postgres(ql)?:\/\//.test(entry)) {
         throw new DesktopError(
           "settings_invalid",
-          `"databaseUrl" in ${file} must be a postgresql:// address.`,
+          `"${key}" in ${file} must be a postgresql:// address.`,
         );
       }
       if (urlHasPassword(entry)) {
         throw new DesktopError(
           "password_in_settings",
-          `"databaseUrl" in ${file} holds a password. Take it out and put it in your pgpass file instead (on Windows %APPDATA%\\postgresql\\pgpass.conf, elsewhere ~/.pgpass).`,
+          `"${key}" in ${file} holds a password. Take it out and put it in your pgpass file instead (on Windows %APPDATA%\\postgresql\\pgpass.conf, elsewhere ~/.pgpass).`,
         );
       }
-      settings.databaseUrl = entry;
+      settings[key] = entry;
     } else if (key === "port") {
       if (typeof entry !== "number" || !Number.isInteger(entry) || entry < 1024 || entry > 65_535) {
         throw new DesktopError(
@@ -160,6 +163,17 @@ export function readDesktopSettings(folder: string): DesktopSettings {
     }
   }
   return settings;
+}
+
+/** Writes `desktop.json` (readable only by its owner); refuses if one exists. */
+export function writeDesktopSettings(folder: string, settings: DesktopSettings): void {
+  const file = join(folder, SETTINGS_FILE);
+  const fd = openSync(file, "wx", 0o600);
+  try {
+    writeSync(fd, `${JSON.stringify(settings, null, 2)}\n`);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /** The database: `OCULUS_DATABASE_URL` first, then `desktop.json`. */
