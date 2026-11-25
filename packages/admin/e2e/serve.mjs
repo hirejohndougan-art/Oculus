@@ -1,6 +1,6 @@
 // The end-to-end server: a throwaway PostgreSQL (scripts/test-database.mjs),
-// migrated, with one invented organization, one site, an object template,
-// one invented record, a volunteer (cataloger) and an editor (reviewer: may
+// migrated, with one invented organization, one site, an object template
+// with its Dublin Core mapping (D-096, T-050e), one invented record, a volunteer (cataloger) and an editor (reviewer: may
 // publish and read history), neither of whom has set up two-step sign-in;
 // then the admin's server (the built packages) on
 // http://localhost:OCULUS_E2E_PORT serving the built admin. Writes the
@@ -19,6 +19,7 @@ import {
   insertTemplateVersion,
   migrate,
   openDatabase,
+  writeDublinCoreMapping,
 } from "@oculus/db";
 import { buildAdminServer } from "@oculus/api";
 import { createService } from "@oculus/service";
@@ -197,6 +198,24 @@ try {
         field("shelf", "Shelf location", "text", { visibility: "staff" }),
       ],
     }),
+  );
+  // Its mapping, as setup stores the starter template's: without one no
+  // public site would show the record once published.
+  must(
+    await writeDublinCoreMapping(
+      db,
+      {
+        template: "object",
+        organizationId,
+        entries: [
+          { field: "rights", term: "rights" },
+          { field: "description", term: "description" },
+          { field: "date", term: "date" },
+        ],
+      },
+      0,
+      root,
+    ),
   );
   const recordTitle = "Invented depot lantern";
   must(

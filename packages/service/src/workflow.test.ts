@@ -34,6 +34,8 @@ import {
   migrate,
   openDatabase,
   publicTermCounts,
+  publicTermCountsForStaff,
+  publicOutputMarker,
   publishCheckIssues,
   readPublicRecord,
   readVersions,
@@ -981,6 +983,65 @@ describe("public subject counts come from public output only (T-034d, D-095)", (
     expect(ok(noUnits).recordsCounted).toBe(2);
   }, 60_000);
 
+  it("counts only fields mapped to the Dublin Core terms asked for (S-038)", async () => {
+    const { org } = await world();
+    const by = async (terms: string[]) =>
+      publicTermCounts(s.writer, org, siteFor(org), {
+        baseUrl: BASE,
+        mappings: mappings(org),
+        terms,
+      });
+    expect(counted(await by(["subject"]))).toHaveLength(3);
+    expect(counted(await by(["coverage"]))).toEqual([]);
+    expect(codes(await by(["not a term"]))).toEqual(["invalid_terms"]);
+  }, 60_000);
+
+  it("tells staff how many public records were left out and why, and nothing else (S-038)", async () => {
+    const { org } = await world();
+    const staff = ok(
+      await publicTermCountsForStaff(s.writer, org, siteFor(org), {
+        baseUrl: BASE,
+        mappings: mappings(org, ["pub-subj"]),
+      }),
+    );
+    expect(staff.counts.recordsCounted).toBe(2);
+    // The fonds and the series: their template has no mapping here.
+    expect(staff.recordsLeftOut).toBe(2);
+    expect(Object.values(staff.leftOut).every((n) => n === 2)).toBe(true);
+    expect(Object.keys(staff.leftOut).length).toBeGreaterThan(0);
+    // The public part is what publicTermCounts gives, exactly.
+    const plain = ok(
+      await publicTermCounts(s.writer, org, siteFor(org), {
+        baseUrl: BASE,
+        mappings: mappings(org, ["pub-subj"]),
+      }),
+    );
+    expect(staff.counts).toEqual(plain);
+  }, 60_000);
+
+  it("the marker moves with every record version, and only then (S-038)", async () => {
+    const { org } = await world();
+    const before = await publicOutputMarker(s.writer, org);
+    expect(await publicOutputMarker(s.writer, org)).toBe(before);
+    const made = ok(await service.createRecord(ctx(org), objectDraft()));
+    const afterCreate = await publicOutputMarker(s.writer, org);
+    expect(afterCreate).not.toBe(before);
+    ok(await service.publish(ctx(org), made.record.id, { expectedVersion: 1 }));
+    expect(await publicOutputMarker(s.writer, org)).not.toBe(afterCreate);
+    // An identifier type's edit moves it, even with its timestamp unchanged (its row version moves).
+    const beforeType = await publicOutputMarker(s.writer, org);
+    await s.owner.execute(
+      sql`UPDATE public.identifier_types SET updated_at = updated_at
+          WHERE organization_id = ${org}::uuid`,
+    );
+    expect(await publicOutputMarker(s.writer, org)).not.toBe(beforeType);
+    // Another organization's changes don't move it.
+    const other = await organization();
+    const mark = await publicOutputMarker(s.writer, org);
+    ok(await service.createRecord(ctx(other), objectDraft()));
+    expect(await publicOutputMarker(s.writer, org)).toBe(mark);
+  }, 60_000);
+
   it("another organization's site, or a site of none, counts nothing", async () => {
     const { org } = await world();
     const other = await organization();
@@ -1111,6 +1172,40 @@ describe("public subject counts come from public output only (T-034d, D-095)", (
       ),
     ).toEqual(["invalid_time_limit"]);
   }, 60_000);
+});
+
+describe("an organization whose stored time zone stops being known (T-034e, D-103)", () => {
+  it("refuses publishing and public output rather than guess the day", async () => {
+    await ready();
+    const org = await organization();
+    const { record } = await create(org, objectDraft());
+    ok(await service.publish(ctx(org), record.id, { expectedVersion: 1 }));
+    expect((await publicText(org, record.id)).ok).toBe(true);
+
+    // As if the operating system's time zone data dropped the stored zone.
+    await s.owner.transaction(async (q) => {
+      await q.execute(
+        sql`ALTER TABLE public.organizations DISABLE TRIGGER organizations_check_time_zone`,
+      );
+      await q.execute(
+        sql`UPDATE public.organizations SET time_zone = 'Africa/Atlantis' WHERE id = ${org}::uuid`,
+      );
+      await q.execute(
+        sql`ALTER TABLE public.organizations ENABLE ALWAYS TRIGGER organizations_check_time_zone`,
+      );
+    });
+
+    const found = await s.owner.transaction((q) => publishCheckIssues(q, org, record.id));
+    expect(found.map((i) => i.code)).toEqual(["unreadable_accessions"]);
+    const out = await publicText(org, record.id);
+    expect(out.ok).toBe(false);
+
+    await s.owner.execute(
+      sql`UPDATE public.organizations SET time_zone = 'America/Port-au-Prince' WHERE id = ${org}::uuid`,
+    );
+    expect(await s.owner.transaction((q) => publishCheckIssues(q, org, record.id))).toEqual([]);
+    expect((await publicText(org, record.id)).ok).toBe(true);
+  });
 });
 
 describe("the publish permission hook (T-041 plugs records.publish in here)", () => {

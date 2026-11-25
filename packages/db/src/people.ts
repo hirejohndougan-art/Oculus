@@ -24,6 +24,7 @@ import {
 import type { Queryable } from "./client.js";
 import { readActingSession, tokenHash } from "./sessions.js";
 import { sql } from "./sql.js";
+import type { SystemEventKind } from "./system-events.js";
 
 /** The writer's grants for this module's table (D-067): the change log is insert-only. */
 export const PEOPLE_TABLE_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Object.freeze({
@@ -61,6 +62,8 @@ export interface Member {
   readonly disabled: boolean;
   readonly addedAt: string;
   readonly lastSignInAt: string | null;
+  /** No role assignment at all, read in the same statement as the rest (T-064). */
+  readonly roleless: boolean;
 }
 
 interface MemberRow {
@@ -71,12 +74,15 @@ interface MemberRow {
   disabled: boolean;
   added_at: string;
   last_sign_in_at: string | null;
+  roleless: boolean;
 }
 
 const MEMBER_COLUMNS = sql`
   u.id::text AS user_id, u.display_name, u.email, u.system_admin,
   u.disabled_at IS NOT NULL AS disabled, to_char(m.added_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS added_at,
-  to_char(u.last_sign_in_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS last_sign_in_at`;
+  to_char(u.last_sign_in_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS last_sign_in_at,
+  NOT EXISTS (SELECT 1 FROM public.role_assignments g
+              WHERE g.organization_id = m.organization_id AND g.user_id = m.user_id) AS roleless`;
 
 function memberFromRow(r: MemberRow): Member {
   return Object.freeze({
@@ -87,6 +93,7 @@ function memberFromRow(r: MemberRow): Member {
     disabled: r.disabled,
     addedAt: r.added_at,
     lastSignInAt: r.last_sign_in_at,
+    roleless: r.roleless,
   });
 }
 
@@ -500,6 +507,8 @@ export interface AuditScope {
   readonly records: "all" | readonly SiteId[];
   /** People events: all of the organization's, role changes on these sites (no site manager grants), or none. */
   readonly people: "all" | readonly SiteId[];
+  /** Changes to the server itself (installs, rollbacks: T-060a): system managers only. */
+  readonly system?: boolean;
 }
 
 export const MAX_AUDIT_PAGE = 100;
@@ -536,6 +545,17 @@ export type AuditEntry =
       readonly scope: string | null;
       /** For invitations, the address invited. */
       readonly invitedEmail: string | null;
+    }
+  | {
+      readonly type: "system";
+      readonly at: string;
+      /** `user:<id>`, or `command_line` for the release command on the server. */
+      readonly actor: string;
+      readonly actorName: string | null;
+      readonly eventId: string;
+      readonly kind: SystemEventKind;
+      readonly version: string;
+      readonly fromVersion: string | null;
     };
 
 export interface AuditPage {
@@ -543,9 +563,9 @@ export interface AuditPage {
   readonly next: string | null;
 }
 
-/** `<time to the microsecond>_<r|e><key>`, as `next` gives it. */
+/** `<time to the microsecond>_<r|e|s><key>`, as `next` gives it. */
 const AUDIT_CURSOR =
-  /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6})_((?:r[0-9a-f-]{36}:\d{10})|(?:e[0-9a-f-]{36}))$/;
+  /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6})_((?:r[0-9a-f-]{36}:\d{10})|(?:[es][0-9a-f-]{36}))$/;
 
 export function isAuditCursor(value: unknown): value is string {
   if (typeof value !== "string" || value.length > 80) return false;
@@ -567,7 +587,7 @@ function isRealTime(text: string): boolean {
 }
 
 interface AuditRow {
-  type: "record" | "people";
+  type: "record" | "people" | "system";
   at: string;
   position: string;
   actor: string;
@@ -588,12 +608,15 @@ interface AuditRow {
   site_id: string | null;
   scope: string | null;
   invited_email: string | null;
+  version_to: string | null;
+  version_from: string | null;
 }
 
 /**
  * The organization's change log, newest first, a page at a time: record
  * versions (every save, deletion and workflow move, deleted records'
- * included) and people events, filtered in the query by `scope` (so a
+ * included), people events and, for system managers, changes to the server
+ * itself (installs and rollbacks, T-060a), filtered in the query by `scope` (so a
  * page's length never shows that hidden rows matched) and by `filter`.
  * Names are given for actors and subjects who are members of the
  * organization or system admins; anyone else is an ID only.
@@ -610,6 +633,7 @@ export async function readAuditTrail(
   const peopleSites = scope.people === "all" ? null : scope.people.filter((s) => isSiteId(s));
   const wantRecords = recordSites === null || recordSites.length > 0;
   const wantPeople = (peopleSites === null || peopleSites.length > 0) && !filter.recordId;
+  const wantSystem = scope.system === true && !filter.recordId;
   const actor = filter.actorId ?? null;
   const from = filter.from ?? null;
   const to = filter.to ?? null;
@@ -633,7 +657,7 @@ export async function readAuditTrail(
                AS deleted,
              NULL::text AS event_id, NULL::text AS kind, NULL::uuid AS subject_id,
              NULL::text AS role, NULL::text AS site_id, NULL::text AS scope,
-             NULL::uuid AS invitation_id
+             NULL::uuid AS invitation_id, NULL::text AS version_to, NULL::text AS version_from
       FROM public.record_versions v
       WHERE ${wantRecords}::boolean
         AND v.organization_id = ${organizationId}::uuid
@@ -649,7 +673,7 @@ export async function readAuditTrail(
       SELECT 'people', e.occurred_at, 'e' || e.id::text,
              'user:' || e.actor_id::text, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
              e.id::text, e.kind, e.subject_id, e.role, e.site_id::text,
-             e.scope_record_id::text, e.invitation_id
+             e.scope_record_id::text, e.invitation_id, NULL, NULL
       FROM public.people_events e
       WHERE ${wantPeople}::boolean
         AND e.organization_id = ${organizationId}::uuid
@@ -659,6 +683,18 @@ export async function readAuditTrail(
         AND (${actor}::uuid IS NULL OR e.actor_id = ${actor}::uuid)
         AND (${from}::timestamptz IS NULL OR e.occurred_at >= ${from}::timestamptz)
         AND (${to}::timestamptz IS NULL OR e.occurred_at < ${to}::timestamptz)
+      UNION ALL
+      -- Changes to the server itself (T-060a): no organization's, so only
+      -- for system managers (scope.system).
+      SELECT 'system', s.occurred_at, 's' || s.id::text,
+             CASE WHEN s.actor_id IS NULL THEN 'command_line' ELSE 'user:' || s.actor_id::text END,
+             NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+             s.id::text, s.kind, NULL, NULL, NULL, NULL, NULL, s.version, s.from_version
+      FROM public.system_events s
+      WHERE ${wantSystem}::boolean
+        AND (${actor}::uuid IS NULL OR s.actor_id = ${actor}::uuid)
+        AND (${from}::timestamptz IS NULL OR s.occurred_at >= ${from}::timestamptz)
+        AND (${to}::timestamptz IS NULL OR s.occurred_at < ${to}::timestamptz)
     )
     SELECT x.type, to_char(x.at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS at,
            to_char(x.at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US') || '_' || x.key
@@ -666,7 +702,7 @@ export async function readAuditTrail(
            x.actor, an.display_name AS actor_name, x.record_id, x.version, x.action, x.title,
            x.record_kind, x.changed_fields, x.reason, x.deleted, x.event_id, x.kind,
            x.subject_id::text AS subject_id, sn.display_name AS subject_name, x.role,
-           x.site_id, x.scope, i.email AS invited_email
+           x.site_id, x.scope, i.email AS invited_email, x.version_to, x.version_from
     FROM entries x
     LEFT JOIN names an ON 'user:' || an.id::text = x.actor
     LEFT JOIN names sn ON sn.id = x.subject_id
@@ -678,35 +714,46 @@ export async function readAuditTrail(
     LIMIT ${limit + 1}`);
   const page = rows.slice(0, limit);
   const entries: AuditEntry[] = page.map((r) =>
-    r.type === "record"
+    r.type === "system"
       ? Object.freeze({
-          type: "record" as const,
-          at: r.at,
-          actor: r.actor,
-          actorName: r.actor_name,
-          recordId: r.record_id ?? "",
-          version: r.version ?? 0,
-          action: r.action ?? "",
-          title: r.title,
-          kind: r.record_kind,
-          changedFields: Object.freeze([...(r.changed_fields ?? [])]),
-          reason: r.reason,
-          deleted: r.deleted === true,
-        })
-      : Object.freeze({
-          type: "people" as const,
+          type: "system" as const,
           at: r.at,
           actor: r.actor,
           actorName: r.actor_name,
           eventId: r.event_id ?? "",
-          kind: (r.kind ?? "invited") as PeopleEventKind,
-          subjectId: r.subject_id,
-          subjectName: r.subject_name,
-          role: r.role,
-          siteId: r.site_id,
-          scope: r.scope,
-          invitedEmail: r.invited_email,
-        }),
+          kind: (r.kind ?? "update_installed") as SystemEventKind,
+          version: r.version_to ?? "",
+          fromVersion: r.version_from,
+        })
+      : r.type === "record"
+        ? Object.freeze({
+            type: "record" as const,
+            at: r.at,
+            actor: r.actor,
+            actorName: r.actor_name,
+            recordId: r.record_id ?? "",
+            version: r.version ?? 0,
+            action: r.action ?? "",
+            title: r.title,
+            kind: r.record_kind,
+            changedFields: Object.freeze([...(r.changed_fields ?? [])]),
+            reason: r.reason,
+            deleted: r.deleted === true,
+          })
+        : Object.freeze({
+            type: "people" as const,
+            at: r.at,
+            actor: r.actor,
+            actorName: r.actor_name,
+            eventId: r.event_id ?? "",
+            kind: (r.kind ?? "invited") as PeopleEventKind,
+            subjectId: r.subject_id,
+            subjectName: r.subject_name,
+            role: r.role,
+            siteId: r.site_id,
+            scope: r.scope,
+            invitedEmail: r.invited_email,
+          }),
   );
   const last = page.at(-1);
   return Object.freeze({

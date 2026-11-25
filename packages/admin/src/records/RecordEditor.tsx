@@ -29,6 +29,7 @@ import { Choice, ConfirmPanel, StatePill, TextInput } from "./controls";
 import { FieldInput } from "./FieldInput";
 import { FilesPanel } from "./FilesPanel";
 import { HistoryPanel } from "./HistoryPanel";
+import { SharingPanel } from "../shares/SharingPanel";
 import {
   AGENT_TYPES,
   KIND_LABELS,
@@ -49,13 +50,25 @@ import {
   type RecordTypeSummary,
   type WorkflowMove,
 } from "./model";
-import { recordKey, useRecord, useRecordTypes, useSiteAbilities, useTemplates } from "./queries";
+import {
+  mappingFits,
+  recordKey,
+  useDublinCoreMapping,
+  useRecord,
+  useRecordTypes,
+  useSiteAbilities,
+  useTemplates,
+} from "./queries";
 import styles from "./Records.module.css";
 
 interface Status {
   readonly tone: "green" | "amber" | "blue";
   readonly text: string;
 }
+
+/** After publishing a record whose template has no Dublin Core mapping (D-096). */
+const PUBLISHED_UNSHOWN =
+  "Published, but no public site shows it yet: its template has no Dublin Core mapping that fits it.";
 
 const MOVE_DONE: Readonly<Record<WorkflowMove, string>> = {
   "submit-for-review": "Sent for review.",
@@ -289,6 +302,13 @@ function Editor(props: EditorProps) {
 
   const can = reply?.can ?? { edit: true, history: false, publish: false, delete: false };
   const state = reply?.state ?? "draft";
+  // A published record whose template has no mapping, or one that no
+  // longer fits it, isn't on any public site (T-050e, D-096).
+  const mappingReply = useDublinCoreMapping(siteId, reply?.record.templateKey);
+  const unmapped =
+    mappingReply.data !== undefined &&
+    template !== undefined &&
+    !mappingFits(mappingReply.data, template);
   const dirty = !sameDraft(draft, start, template);
   const readOnly = !can.edit;
   const fieldKeys = useMemo(() => new Set((template?.fields ?? []).map((f) => f.key)), [template]);
@@ -446,7 +466,11 @@ function Editor(props: EditorProps) {
         ifMatch: reply.version,
         site: siteId,
       });
-      setStatus({ tone: "green", text: MOVE_DONE[which] });
+      setStatus(
+        which === "publish" && unmapped
+          ? { tone: "amber", text: PUBLISHED_UNSHOWN }
+          : { tone: "green", text: MOVE_DONE[which] },
+      );
       await queries.invalidateQueries({ queryKey: ["items", siteId] });
       await queries.invalidateQueries({ queryKey: ["review-queue"] });
       await queries.invalidateQueries({ queryKey: recordKey(reply.record.id) });
@@ -534,6 +558,14 @@ function Editor(props: EditorProps) {
       </div>
       {moves.length > 0 && dirty ? (
         <p className={styles.meta}>Save or discard your changes before changing the status.</p>
+      ) : null}
+      {unmapped && (state === "published" || can.publish) ? (
+        <Note tone="amber">
+          {state === "published"
+            ? "This record is published, but no public site shows it yet: its template has no Dublin Core mapping that fits it."
+            : "If you publish this record, no public site will show it yet: its template has no Dublin Core mapping that fits it."}{" "}
+          Someone who may change templates can fix this under Settings, Templates.
+        </Note>
       ) : null}
 
       <div aria-live="polite">
@@ -841,6 +873,15 @@ function Editor(props: EditorProps) {
             </p>
           </ConfirmPanel>
         </form>
+
+        {reply !== undefined && can.edit ? (
+          <SharingPanel
+            key={reply.record.id}
+            siteId={siteId}
+            recordId={reply.record.id}
+            published={state === "published"}
+          />
+        ) : null}
 
         {reply?.record.kind === "digital_asset" ? (
           <FilesPanel

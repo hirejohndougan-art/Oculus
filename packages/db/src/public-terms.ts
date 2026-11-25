@@ -53,7 +53,7 @@ import {
   type SiteId,
   type Validated,
 } from "@oculus/core";
-import type { Database } from "./client.js";
+import type { Database, Queryable } from "./client.js";
 import { sql } from "./sql.js";
 import { publicRecordIn } from "./workflow.js";
 
@@ -81,10 +81,21 @@ export interface PublicTermCountOptions {
   readonly baseUrl: string;
   /** As `readPublicRecord`'s: the organization's Dublin Core mappings; the stored ones when left out. */
   readonly mappings?: readonly unknown[];
-  /** Only these fields count (for a Subjects page, the subject fields); all when left out. */
+  /** Only these fields count; all when left out. */
   readonly fields?: readonly string[];
+  /**
+   * Only fields the record's mapping maps to these Dublin Core terms count
+   * (a Subjects page: `["subject"]`, S-038); all mapped fields when left out.
+   */
+  readonly terms?: readonly string[];
   /** Stop and refuse (`too_slow`) after this long; default 30 000, at most 300 000. */
   readonly timeLimitMs?: number;
+}
+
+/** What only a server-side caller may add (S-038): a way to stop a count early. */
+export interface StaffCountControl {
+  /** Checked before each record; true stops the count, refused as `stopped`. */
+  readonly shouldStop?: () => boolean;
 }
 
 function refused<T>(
@@ -105,17 +116,20 @@ function own(obj: unknown, name: string): unknown {
 const DEFAULT_TIME_LIMIT_MS = 30_000;
 const MAX_TIME_LIMIT_MS = 300_000;
 
-function readOptions(options: unknown): Validated<{
+interface ReadOptions {
   baseUrl: string;
   mappings: readonly unknown[] | undefined;
   fields: ReadonlySet<string> | undefined;
+  terms: ReadonlySet<string> | undefined;
   timeLimitMs: number;
-}> {
+}
+
+function readOptions(options: unknown): Validated<ReadOptions> {
   const bad = (): Validated<never> =>
-    refused([], "invalid_options", "Give { baseUrl, mappings?, fields?, timeLimitMs? }.");
+    refused([], "invalid_options", "Give { baseUrl, mappings?, fields?, terms?, timeLimitMs? }.");
   if (typeof options !== "object" || options === null) return bad();
   for (const key of Object.keys(options)) {
-    if (!["baseUrl", "mappings", "fields", "timeLimitMs"].includes(key)) return bad();
+    if (!["baseUrl", "mappings", "fields", "terms", "timeLimitMs"].includes(key)) return bad();
   }
   const baseUrl = own(options, "baseUrl");
   const mappings = own(options, "mappings");
@@ -138,19 +152,28 @@ function readOptions(options: unknown): Validated<{
     }
   }
   const timeLimitMs = typeof limit === "number" ? limit : DEFAULT_TIME_LIMIT_MS;
-  const fieldList = own(options, "fields");
-  if (fieldList === undefined) {
-    return Object.hasOwn(options, "fields")
-      ? bad()
-      : { ok: true, value: { baseUrl, mappings: mappingList, fields: undefined, timeLimitMs } };
+  let fields: ReadonlySet<string> | undefined;
+  if (Object.hasOwn(options, "fields")) {
+    const fieldList = own(options, "fields");
+    if (fieldList === undefined) return bad();
+    if (!Array.isArray(fieldList) || fieldList.length > 200 || !fieldList.every(isFieldKey)) {
+      return refused(["fields"], "invalid_fields", "fields must be a list of field keys.");
+    }
+    fields = new Set<string>(fieldList);
   }
-  if (!Array.isArray(fieldList) || fieldList.length > 200 || !fieldList.every(isFieldKey)) {
-    return refused(["fields"], "invalid_fields", "fields must be a list of field keys.");
+  let terms: ReadonlySet<string> | undefined;
+  if (Object.hasOwn(options, "terms")) {
+    const termList = own(options, "terms");
+    if (
+      !Array.isArray(termList) ||
+      termList.length > 50 ||
+      !termList.every((t) => typeof t === "string" && /^[a-zA-Z]{1,40}$/.test(t))
+    ) {
+      return refused(["terms"], "invalid_terms", "terms must be a list of Dublin Core terms.");
+    }
+    terms = new Set<string>(termList as string[]);
   }
-  return {
-    ok: true,
-    value: { baseUrl, mappings: mappingList, fields: new Set<string>(fieldList), timeLimitMs },
-  };
+  return { ok: true, value: { baseUrl, mappings: mappingList, fields, terms, timeLimitMs } };
 }
 
 interface Tally {
@@ -173,14 +196,40 @@ export async function publicTermCounts(
   siteId: SiteId,
   options: PublicTermCountOptions,
 ): Promise<Validated<PublicTermCounts>> {
+  const result = await publicTermCountsForStaff(db, organizationId, siteId, options);
+  return result.ok ? { ok: true, value: result.value.counts } : result;
+}
+
+/** The counts, and for staff only: how many public records were left out, by reason. */
+export interface PublicTermCountsForStaff {
+  /** What a public site may show (no ID, no count of records held back). */
+  readonly counts: PublicTermCounts;
+  /**
+   * Staff only (S-038): how many records public on the site were left out
+   * because their public output was refused, by each refusal's issue code
+   * (a record refused for two reasons counts under both). Never shown to
+   * the public.
+   */
+  readonly leftOut: Readonly<Record<string, number>>;
+  /** Staff only: how many records were left out in all. */
+  readonly recordsLeftOut: number;
+}
+
+/** As `publicTermCounts`, with the staff-only count of records left out and why. */
+export async function publicTermCountsForStaff(
+  db: Database,
+  organizationId: OrganizationId,
+  siteId: SiteId,
+  options: PublicTermCountOptions,
+  control: StaffCountControl = {},
+): Promise<Validated<PublicTermCountsForStaff>> {
   if (!isOrganizationId(organizationId) || !isSiteId(siteId)) {
     return refused([], "not_available", "This record is not available.");
   }
   const read = readOptions(options);
   if (!read.ok) return read;
-  const { baseUrl, mappings, fields, timeLimitMs } = read.value;
   try {
-    return await countIn(db, organizationId, siteId, baseUrl, mappings, fields, timeLimitMs);
+    return await countIn(db, organizationId, siteId, read.value, control.shouldStop);
   } catch (error) {
     // The statement timeout cancelled a read (57014): the same refusal as the deadline.
     if ((error as { code?: unknown } | null)?.code === QUERY_CANCELED) return tooSlow();
@@ -198,11 +247,9 @@ async function countIn(
   db: Database,
   organizationId: OrganizationId,
   siteId: SiteId,
-  baseUrl: string,
-  mappings: readonly unknown[] | undefined,
-  fields: ReadonlySet<string> | undefined,
-  timeLimitMs: number,
-): Promise<Validated<PublicTermCounts>> {
+  { baseUrl, mappings, fields, terms, timeLimitMs }: ReadOptions,
+  shouldStop: (() => boolean) | undefined,
+): Promise<Validated<PublicTermCountsForStaff>> {
   const deadline = Date.now() + timeLimitMs;
   return db.transaction(async (tx) => {
     // One snapshot for every read below, and nothing written.
@@ -237,16 +284,29 @@ async function countIn(
     }
     const tallies = new Map<string, Tally>();
     let counted = 0;
+    let leftOutRecords = 0;
+    const leftOut = new Map<string, number>();
     for (const id of ids) {
+      if (shouldStop?.() === true) return refused([], "stopped", "The count was stopped.");
       if (!(await remaining())) return tooSlow();
       const one = await publicRecordIn(tx, organizationId, siteId, id, baseUrl, mappings);
       // What the public output refuses shows nothing, so it counts for nothing.
-      if (!one.ok) continue;
+      if (!one.ok) {
+        leftOutRecords += 1;
+        for (const code of new Set(one.issues.map((i) => i.code))) {
+          leftOut.set(code, (leftOut.get(code) ?? 0) + 1);
+        }
+        continue;
+      }
       counted += 1;
       const { view, template, mapping } = one.value;
       const mapped = validateDublinCoreMapping(mapping, template);
       if (!mapped.ok) continue;
-      const shownFields = new Set(mapped.value.entries.map((e) => e.field));
+      const shownFields = new Set(
+        mapped.value.entries
+          .filter((e) => terms === undefined || terms.has(e.term))
+          .map((e) => e.field),
+      );
       const termFields = new Set(
         template.fields.filter((f) => f.kind === "controlled_term").map((f) => f.key),
       );
@@ -280,7 +340,11 @@ async function countIn(
     );
     return {
       ok: true as const,
-      value: Object.freeze({ counts: Object.freeze(counts), recordsCounted: counted }),
+      value: Object.freeze({
+        counts: Object.freeze({ counts: Object.freeze(counts), recordsCounted: counted }),
+        leftOut: Object.freeze(Object.fromEntries([...leftOut].sort(([a], [b]) => compare(a, b)))),
+        recordsLeftOut: leftOutRecords,
+      }),
     };
   });
 }
@@ -340,4 +404,55 @@ function keyOf(term: ShownTerm): string {
     key = term.uri;
   }
   return `uri\u0000${key}`;
+}
+
+/**
+ * A marker that changes whenever something a site's public output reads may
+ * have changed in the organization (S-038): a record's version (every edit,
+ * publish and withdraw writes one), its identifiers (saved without a new
+ * version), a stored mapping, a template version, an identifier type.
+ * Compared, never shown. Counts and versions catch every insert and delete;
+ * the row versions (`xmin`) catch every update, whatever its `now()` (a
+ * transaction's start, so a timestamp can go backwards). Its cost grows with
+ * the organization's rows in those tables (one index-only or sequential pass
+ * each, a minute apart).
+ */
+export async function publicOutputMarker(
+  db: Database,
+  organizationId: OrganizationId,
+  timeLimitMs = 30_000,
+): Promise<string> {
+  if (!isOrganizationId(organizationId)) throw new TypeError("not an organization ID");
+  if (!Number.isInteger(timeLimitMs) || timeLimitMs < 1 || timeLimitMs > MAX_TIME_LIMIT_MS) {
+    throw new RangeError("timeLimitMs out of range");
+  }
+  const org = organizationId;
+  // A time limit of its own, so a lock (a migration) or a large organization
+  // can't hold the caller up: past it the query is cancelled and throws.
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`SET TRANSACTION READ ONLY`);
+    await tx.execute(
+      sql`SELECT pg_catalog.set_config('statement_timeout', ${String(timeLimitMs)}, true),
+                 pg_catalog.set_config('lock_timeout', ${String(timeLimitMs)}, true)`,
+    );
+    return markerIn(tx, org);
+  });
+}
+
+async function markerIn(tx: Queryable, org: OrganizationId): Promise<string> {
+  const [row] = await tx.rows<{ marker: string }>(sql`
+    SELECT concat_ws('|',
+      (SELECT count(*)::text || ':' || coalesce(max(recorded_at)::text, '')
+         FROM public.record_versions WHERE organization_id = ${org}::uuid),
+      (SELECT count(*)::text || ':' || coalesce(sum(version), 0)::text
+         FROM public.dublin_core_mappings WHERE organization_id = ${org}::uuid),
+      (SELECT count(*)::text FROM public.template_versions WHERE organization_id = ${org}::uuid),
+      (SELECT count(*)::text || ':' || coalesce(sum(xmin::text::numeric), 0)::text
+         FROM public.identifier_types WHERE organization_id = ${org}::uuid),
+      (SELECT count(*)::text || ':' || coalesce(sum(xmin::text::numeric), 0)::text
+         FROM public.record_identifiers WHERE organization_id = ${org}::uuid),
+      (SELECT count(*)::text || ':' || coalesce(sum(xmin::text::numeric), 0)::text
+         FROM public.former_identifiers WHERE organization_id = ${org}::uuid)
+    ) AS marker`);
+  return row?.marker ?? "";
 }

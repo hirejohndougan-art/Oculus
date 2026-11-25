@@ -2,6 +2,38 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 02:35 CT — manual (Chat C) — T-050c OAI-PMH, and S-038 Cached public Subjects counts
+- Result: done (both)
+- What changed: T-050c: `packages/api/src/oai-pmh.ts` (`GET /oai` on public hosts, the six verbs, oai_dc only), `packages/db/src/oai.ts` (lists and datestamps on the staff connection), `oaiPmhReply` in file-replies.ts (the only way `text/xml` goes out), `ReadSlots` shared by the public routes, an `oai` rate bucket. S-038: `packages/api/src/public-subjects.ts` (background counts, `GET /subjects`), `GET /api/sites/:id/public-subjects`, `publicTermCountsForStaff`, a `terms` option and `publicOutputMarker` (public-terms.ts), `onClose` on `buildServer`, `countsDb` on `buildAdminServer`.
+- Decisions: D-105, D-106
+- Review: two independent rounds each. T-050c: paging that could repeat forever and a token that could carry a held-back record's ID (both fixed; tokens sealed), then smaller points. S-038: nothing blocking; stale counts, a public asOf showing staff activity, marker gaps, slow stop, recount pressure, the marker's time limit and the refusal back-off fixed.
+- Gate: PASS · tests_passing 4724 (was 4695) · npm audit clean
+- Next: S-041 (stored OAI-PMH datestamps) is filed.
+
+## 2026-11-25 04:30 CT — Chat B — T-041d, T-041e, T-060a, T-063
+- Result: done (T-041b continues as T-041f, sharing on the public sites)
+- What changed: T-041d, shares over HTTP (`staff-api.ts`: a record's shares and offering it, a share's view and its four moves, a site's offers and shared items; an unknown share answers the same 404 as another organization's). T-041e, shares in the admin (`packages/admin/src/shares/`: a record's Sharing panel, each site's Shared with this site screen, a read-only view). T-060a, installs and rollbacks in the change log (migration 0030 `system_events`, written after each switch, shown to system managers only). T-063, the approval queue for reviewers who cover part of a site (John's Q-7: `recordsInState` walks scoped grants' subtrees in SQL).
+- Decisions: D-094 (HTTP and admin bullets), D-104, D-082 amended
+- Review: independent rounds for T-041d (tests and docs claimed more than they checked; fixed), T-041e (double submits, silent results, focus, a share under the wrong site; fixed) and T-060a (a possible hang after a command-line install, the change log before state.json; fixed). T-063 is tested equal to core's `permits` for every record, with a negative control.
+- Gate: PASS · tests_passing 4695 (was 4666) · npm audit clean
+- Next: every job in the pool is taken; Chat B stops.
+
+## 2026-11-25 02:45 CT — manual (Chat G) — T-050e Dublin Core mappings in the admin and in setup
+- Result: done
+- What changed: new screen Settings › Templates › Dublin Core (`packages/admin/src/settings/DublinCoreEditor.tsx`, linked from each template) saving through `GET`/`PUT /api/templates/:key/dublin-core` with If-None-Match/If-Match and D-076's confirmation; `npm run setup` stores the starter template's mapping (public fields as their `dcterms` standards, rights included) in its transaction; the record editor says when the template has no mapping that fits it, so no public site shows the record. Unit tests for the screen, the record editor's note and setup; the settings e2e visits the new screen with Alfa's rules.
+- Decisions: none new (D-096 amended)
+- Review: one independent round, nothing blocking. Fixed: the warning missed a mapping naming a field since made staff only; "Saved." could show for another template; the note named only system managers; D-096's "left for later" line. Filed S-039 (a first mapping for over 10,000 published records; saving an empty mapping).
+- Gate: see the merge commit · npm audit clean
+- Next: the job pool (T-034e is the first free job)
+
+## 2026-11-25 03:30 CT — manual (Chat D) — T-034e, T-064, T-065, S-032, S-029
+- Result: done (merged together)
+- What changed: **T-034e** each organization's time zone (migration 0029) and its own calendar day in the publish check and public output, through `organization_local_day`; `GET`/`PUT /api/organization/time-zone`. **T-064** (John, Q-10) site managers see role-less members by name only and grant only to people holding a role on their sites. **T-065** (John, Q-11) inviting needs a recent sign-in. **S-032** a too-large `If-Match` version is 400. **S-029** the deadlock test not reproduced in 270+ rounds under load; notes in the roadmap.
+- Decisions: D-103; D-084 amended (T-064, T-065)
+- Review: T-034e two independent rounds, nothing blocking (canonical zone names, failing closed on an unknown stored zone, who changed it). T-064 two rounds: the first found a manager of every site could grant to (and so reveal) someone holding only an every-site role, fixed with one shared rule and tests, and a read race fixed; the second found nothing blocking.
+- Gate: PASS · tests_passing 4651 (was 4624) · npm audit clean · licences all permissive
+- Next: the next free job on the board
+
 ## 2026-11-25 02:40 CT — manual (Chat E) — T-034d Public subject counts
 - Result: done
 - What changed: `publicTermCounts` (packages/db/src/public-terms.ts) counts, for one site, the controlled terms each public record shows in its own public output (one Repeatable Read snapshot; records the output refuses count for nothing), on the server's staff connection; only labels, URIs and counts come out; at most 10,000 records and a time limit. `readPublicRecord`'s work is shared as `publicRecordIn` (stored mappings included). Never from `record_terms`. Follow-up S-038 (a cached public Subjects page).

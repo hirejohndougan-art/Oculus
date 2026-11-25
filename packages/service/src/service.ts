@@ -73,8 +73,8 @@
  * `readRecordVersion` and `compareRecordVersions` need `records.history`
  * where the record is now (read-only people see no old versions, D-072),
  * and answer a version the record doesn't have only after that check;
- * `reviewQueue` lists records sent for review on the whole sites where the
- * person may publish.
+ * `reviewQueue` lists records sent for review where the person may publish:
+ * whole sites, and the units their scoped publish grants cover (T-063).
  *
  * Not here yet: loans and accessions (no tables yet; when they are stored,
  * closing a loan by an accession happens here, from the register and loan
@@ -653,6 +653,23 @@ async function wholeSites(
   );
   if (holding.some((g) => g.siteId === null)) return organizationSiteIds(tx, organizationId);
   return [...new Set(holding.map((g) => g.siteId as string))];
+}
+
+/**
+ * The units a person's scoped grants of `permission` cover, with each
+ * grant's site (`null`: every site), for lists filtered in SQL (T-063).
+ * None for a system manager, whose lists are the whole organization's.
+ */
+function scopedGrants(
+  access: Access,
+  permission: Permission,
+): readonly { readonly siteId: SiteId | null; readonly unit: RecordId }[] {
+  if (access.systemManager) return [];
+  return access.grants.flatMap((g) =>
+    g.scope !== null && (ROLE_PERMISSIONS[g.role] as readonly Permission[]).includes(permission)
+      ? [{ siteId: g.siteId, unit: g.scope }]
+      : [],
+  );
 }
 
 /** Thrown inside a transaction to roll it back and return the refusal. */
@@ -2583,6 +2600,8 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         try {
           listed = await recordsInState(tx, org, "ready_for_review", {
             sites: sites as "all" | readonly SiteId[],
+            // Reviewers who cover part of a site see that part (T-063, Q-7).
+            scopes: scopedGrants(access.value, "records.publish"),
             limit,
             ...(after === undefined ? {} : { after }),
           });

@@ -2,13 +2,16 @@
 // holds the built workspace packages (also as real copies where Node looks
 // for them), the migrations, the built admin and the production
 // dependencies only, never development ones or links; keygen, pack, verify
-// and a first install work end to end; and usage mistakes exit 2.
+// and a first install work end to end, written into the change log as made
+// on the command line (T-060a); and usage mistakes exit 2.
 import { mkdir, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { collectRelease, productionDependencies, runReleaseCli } from "./release-cli.js";
 import { verifyPackage, parseTrustedKeys } from "./update-package.js";
 import { tempDir } from "./update.fixtures.js";
+import { migrate, openDatabase, sql } from "@oculus/db";
+import { freshDatabase } from "../../db/src/test-database.fixtures.js";
 
 let repo: string;
 let work: string;
@@ -162,6 +165,41 @@ describe("the commands", () => {
     expect(
       await readFile(join(work, "updates", "current", "packages/api/dist/index.js"), "utf8"),
     ).toBe("// api");
+    // That database can't be reached, so the change log has no row: it says so.
+    expect(lines.join("\n")).toMatch(/couldn't be written into the change log/);
+  }, 60_000);
+
+  it("writes a first install into the change log, as made on the command line", async () => {
+    const testDb = await freshDatabase();
+    try {
+      await migrate({ connectionString: testDb.url });
+      lines.length = 0;
+      await run(["keygen", "--out", "main.pem"]);
+      const publicKey = /ed25519:[A-Za-z0-9_-]{43}/.exec(lines.join("\n"))?.[0] ?? "";
+      await run(["pack", "--key", "main.pem", "--version", "1.0.0"]);
+      lines.length = 0;
+      expect(
+        await run(["install", "oculus-1.0.0.zip", "--dir", "updates"], {
+          OCULUS_UPDATE_KEYS: publicKey,
+          OCULUS_DATABASE_URL: testDb.url,
+        }),
+      ).toBe(0);
+      expect(lines.join("\n")).not.toMatch(/change log/);
+      const db = openDatabase(testDb.url, { max: 1 });
+      try {
+        expect(
+          await db.rows(
+            sql`SELECT actor_id, kind, version, from_version FROM public.system_events`,
+          ),
+        ).toEqual([
+          { actor_id: null, kind: "update_installed", version: "1.0.0", from_version: null },
+        ]);
+      } finally {
+        await db.close();
+      }
+    } finally {
+      await testDb.drop();
+    }
   }, 60_000);
 
   it("refuses to verify against other keys", async () => {

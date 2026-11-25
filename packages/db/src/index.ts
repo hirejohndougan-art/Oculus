@@ -87,6 +87,8 @@ export { restoreVersion, restoreReason, MAX_DESCENDANTS_WALKED } from "./record-
 export { recordCheckIssues, fixedMessages, linkedIds } from "./record-checks.js";
 export type { RecordCheckOptions } from "./record-checks.js";
 export { deleteRecord } from "./record-delete.js";
+export { listPublishedForOai, oaiDatestamp, oaiRepository, MAX_OAI_CANDIDATES } from "./oai.js";
+export type { OaiCandidate, OaiListOptions } from "./oai.js";
 export {
   changeWorkflowState,
   publishCheckIssues,
@@ -108,8 +110,18 @@ export type {
   StateListEntry,
   WorkflowChangeResult,
 } from "./workflow.js";
-export { publicTermCounts, MAX_PUBLIC_COUNT_RECORDS } from "./public-terms.js";
-export type { PublicTermCount, PublicTermCountOptions, PublicTermCounts } from "./public-terms.js";
+export {
+  publicTermCounts,
+  publicTermCountsForStaff,
+  publicOutputMarker,
+  MAX_PUBLIC_COUNT_RECORDS,
+} from "./public-terms.js";
+export type {
+  PublicTermCount,
+  PublicTermCountOptions,
+  PublicTermCounts,
+  PublicTermCountsForStaff,
+} from "./public-terms.js";
 export type { RecordDeletion, RecordDeletionResult } from "./record-delete.js";
 export {
   grantWriterRole,
@@ -447,7 +459,19 @@ export {
   sharesOfRecord,
 } from "./shares.js";
 export type { Share, ShareState, SharedItemView } from "./shares.js";
+export {
+  SYSTEM_EVENT_KINDS,
+  SYSTEM_EVENT_TABLE_PRIVILEGES,
+  insertSystemEvent,
+} from "./system-events.js";
+export type { NewSystemEvent, SystemEventKind } from "./system-events.js";
 export { runSetupCli, terminalAsk } from "./setup-cli.js";
 export type { Ask } from "./setup-cli.js";
 export { backup, BackupError } from "./backup.js";
 export type { BackupOptions, BackupResult } from "./backup.js";
+
+export {
+  looksLikeTimeZone,
+  readOrganizationTimeZone,
+  writeOrganizationTimeZone,
+} from "./organization-time-zone.js";

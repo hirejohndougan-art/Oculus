@@ -68,6 +68,8 @@
  * change the sign-in rules (`If-None-Match: *` for the first change, else
  * `If-Match: "v<N>"`). The service lets only system managers do any of it;
  * the changes also need a recent sign-in (`403 reauthentication_required`).
+ * `GET`/`PUT /api/organization/time-zone` read the organization's time
+ * zone and local day, and set it (system managers, recent sign-in; T-034e).
  * An unknown site is `404 not_found`.
  *
  * Dublin Core mappings (T-050b, D-096): `GET`/`PUT
@@ -104,6 +106,7 @@ import { Refusal } from "./errors.js";
 import type { OculusReply, OculusRequest, OculusRoute } from "./routes.js";
 import { peopleApiRoutes, type PeopleApiOptions } from "./people-api.js";
 import { updateApiRoutes, type UpdateApiOptions } from "./update-api.js";
+import type { PublicSubjects } from "./public-subjects.js";
 import { DEFAULT_RATE_LIMITS, SessionRateLimiter, type RateBucket } from "./rate-limit.js";
 
 /** A fixed-shape log record: never an error object, a token, a body or a query. */
@@ -155,6 +158,8 @@ export interface StaffApiOptions {
   readonly people?: PeopleApiOptions;
   /** Software updates (T-060, update-api.ts); left out, those routes aren't served. */
   readonly updates?: UpdateApiOptions;
+  /** The cached public Subjects counts (S-038, public-subjects.ts), for their staff view. */
+  readonly publicSubjects?: Pick<PublicSubjects, "statusFor">;
 }
 
 /** The headers carrying an upload's original name (percent-encoded UTF-8) and claimed type. */
@@ -260,16 +265,21 @@ export function onlyKeys(
 const VERSION_TAG = /^"v([1-9][0-9]{0,9})"$/;
 const TYPE_TAG = /^"t-([A-Za-z0-9_-]{32})"$/;
 
+/** The service takes versions below 2^31 - 1; a bigger tag is malformed here, not refused there (S-032). */
+const inVersionRange = (text: string): boolean => {
+  const n = Number(text);
+  return Number.isSafeInteger(n) && n < 2 ** 31 - 1;
+};
+
 /** `If-Match: "v<N>"`: the version an edit started from (428 without, 400 malformed). */
 function ifMatchVersion(request: OculusRequest): number {
   const value = request.headers["if-match"];
   if (value === undefined) throw new Refusal(428, "precondition_required");
   const match = VERSION_TAG.exec(value);
-  const n = Number(match?.[1]);
-  if (match === null || !Number.isSafeInteger(n) || n >= 2 ** 31 - 1) {
+  if (match?.[1] === undefined || !inVersionRange(match[1])) {
     throw new Refusal(400, "bad_if_match");
   }
-  return n;
+  return Number(match[1]);
 }
 
 /**
@@ -288,6 +298,9 @@ function newOrMatch(request: OculusRequest, pattern: RegExp): { readonly tag: st
   }
   const found = pattern.exec(match ?? "");
   if (found?.[1] === undefined) throw new Refusal(400, "bad_if_match");
+  if (pattern === VERSION_TAG && !inVersionRange(found[1])) {
+    throw new Refusal(400, "bad_if_match");
+  }
   return { tag: found[1] };
 }
 
@@ -425,6 +438,7 @@ export function refused(
           i.path.length === 1 &&
           VERSION_PATHS.has(String(i.path[0]))) ||
         (i.code === "unknown_template" && onPath(i, "key")) ||
+        (i.code === "unknown_share" && onPath(i, "shareId")) ||
         (i.code === "unknown_site" && onPath(i, "siteId")),
     )
   ) {
@@ -1132,6 +1146,30 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
         return answer(result, reply, (site) => ({ site }));
       }),
     },
+    // The public Subjects counts' staff view (S-038, D-106): when they were
+    // made and how many public records were left out and why. For system
+    // managers and the site's managers; any other site is not found.
+    {
+      method: "GET",
+      path: "/api/sites/:id/public-subjects",
+      handler: signedIn("read", false, async (request, reply, { context }) => {
+        const siteId = request.params.id ?? "";
+        const access = await service.myAccess(context);
+        if (!access.ok) return answer(access, reply, () => ({}));
+        const manages =
+          access.value.systemManager ||
+          access.value.grants.some(
+            (g) =>
+              g.role === "site_manager" &&
+              g.scope === null &&
+              (g.siteId === null || g.siteId === siteId),
+          );
+        if (!manages) throw new Refusal(403, "not_permitted");
+        const status = options.publicSubjects?.statusFor(context.organizationId, siteId);
+        if (status === undefined) throw new Refusal(404, "not_found");
+        return status;
+      }),
+    },
     {
       method: "GET",
       path: "/api/system-settings",
@@ -1161,7 +1199,103 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
         });
       }),
     },
+
+    // Sharing items between sites (T-041d, D-094): the service decides every
+    // permission and answers another organization's share, one out of
+    // reach, and a missing one alike (`unknown_share`: 404 here).
+    {
+      method: "GET",
+      path: "/api/records/:id/shares",
+      handler: signedIn("read", false, async (request, reply, { context }) => {
+        const result = await service.sharesOfRecord(context, recordId(request));
+        return answer(result, reply, (shares) => ({ shares }));
+      }),
+    },
+    {
+      method: "POST",
+      path: "/api/records/:id/shares",
+      handler: signedIn("write", true, async (request, reply, { context }) => {
+        const body = objectBody(request);
+        const extra = onlyKeys(body, ["targetOrganizationId", "targetSiteId"], reply);
+        if (extra) return extra;
+        const result = await service.offerRecord(context, {
+          recordId: recordId(request),
+          targetOrganizationId: body.targetOrganizationId,
+          targetSiteId: body.targetSiteId,
+        });
+        return answer(result, reply, (share) => {
+          reply.status(201);
+          return { share };
+        });
+      }),
+    },
+    {
+      method: "GET",
+      path: "/api/shares/:id",
+      handler: signedIn("read", false, async (request, reply, { context }) => {
+        const result = await service.readSharedItem(context, request.params.id ?? "");
+        return answer(result, reply, (share) => ({ share }));
+      }),
+    },
+    shareMove("/api/shares/:id/accept", "acceptShare"),
+    shareMove("/api/shares/:id/decline", "declineShare"),
+    shareMove("/api/shares/:id/remove", "removeShare"),
+    shareMove("/api/shares/:id/withdraw", "withdrawShare"),
+    {
+      method: "GET",
+      path: "/api/sites/:id/share-offers",
+      handler: signedIn("read", false, async (request, reply, { context }) => {
+        const result = await service.sharesIntoSite(context, request.params.id ?? "");
+        return answer(result, reply, (shares) => ({ shares }));
+      }),
+    },
+    {
+      method: "GET",
+      path: "/api/sites/:id/shared-items",
+      handler: signedIn("read", false, async (request, reply, { context }) => {
+        const result = await service.listSharedItems(context, request.params.id ?? "");
+        return answer(result, reply, (shares) => ({ shares }));
+      }),
+    },
+    {
+      // T-034e (D-103): the organization's time zone and its local day.
+      method: "GET",
+      path: "/api/organization/time-zone",
+      handler: signedIn("read", false, async (_request, reply, { context }) => {
+        const result = await service.readOrganizationTimeZone(context);
+        return answer(result, reply, (value) => value);
+      }),
+    },
+    {
+      method: "PUT",
+      path: "/api/organization/time-zone",
+      handler: signedIn("write", true, async (request, reply, { session, context }) => {
+        const body = objectBody(request);
+        const extra = onlyKeys(body, ["timeZone"], reply);
+        if (extra) return extra;
+        recentSignIn(session);
+        const result = await service.changeOrganizationTimeZone(context, body.timeZone);
+        return answer(result, reply, (value) => value);
+      }),
+    },
   ];
+
+  /** One of a share's moves (D-094): no body. */
+  function shareMove(
+    path: string,
+    move: "acceptShare" | "declineShare" | "removeShare" | "withdrawShare",
+  ): OculusRoute {
+    return {
+      method: "POST",
+      path,
+      handler: signedIn("write", true, async (request, reply, { context }) => {
+        const read = optionalBody(request, [], reply);
+        if ("error" in read) return read;
+        const result = await service[move](context, request.params.id ?? "");
+        return answer(result, reply, (share) => ({ share }));
+      }),
+    };
+  }
 }
 
 /**

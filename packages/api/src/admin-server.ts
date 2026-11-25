@@ -68,7 +68,9 @@ import { originsFromEnv } from "./origin.js";
 import { isProduction } from "./environment.js";
 import { mailerFromEnv, type Mailer } from "./mail.js";
 import { trustedProxyFromEnv } from "./proxy.js";
-import { publicApiRoutes } from "./public-api.js";
+import { OAI_ADMIN_EMAIL_ENV, oaiAdminEmail, oaiPmhRoutes } from "./oai-pmh.js";
+import { publicApiRoutes, ReadSlots } from "./public-api.js";
+import { PublicSubjects, publicSubjectsRoutes } from "./public-subjects.js";
 import { PUBLIC_DATABASE_URL_ENV, checkPublicSites, publicSitesFromEnv } from "./public-sites.js";
 import type { OculusRoute } from "./routes.js";
 import { UPLOAD_TIMEOUTS, buildServer, type ServerOptions } from "./server.js";
@@ -79,6 +81,7 @@ import {
   staffApiRoutes,
   type ApiLogRecord,
 } from "./staff-api.js";
+import { updateChangeLog } from "./update-change-log.js";
 import { updateManagerFromEnv, type UpdateManager } from "./update-manager.js";
 
 export { isProduction };
@@ -196,6 +199,12 @@ export interface AdminServerOptions {
    * any. Never used for anything else.
    */
   readonly publicDb?: Database;
+  /**
+   * A small pool of its own on the staff role (S-038): the public Subjects
+   * counts are worked out on it in the background. Left out, `/subjects`
+   * isn't served.
+   */
+  readonly countsDb?: Database;
   /** Defaults to `process.env`. */
   readonly env?: Readonly<Record<string, string | undefined>>;
   /**
@@ -308,6 +317,9 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   const publicDb = options.publicDb;
   const publicSites =
     publicDb === undefined ? [] : await checkPublicSites(options.db, publicDb, publicHosts);
+  // One count of the public pool's connections for every public route (D-100, D-105).
+  const publicSlots = new ReadSlots(4);
+  const oaiEmail = oaiAdminEmail(env[OAI_ADMIN_EMAIL_ENV]);
 
   let admin: ServerOptions["admin"];
   if (adminOrigin !== undefined && adminOrigin !== "") {
@@ -334,6 +346,8 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
       ? null
       : (options.updates ??
         updateManagerFromEnv(env, {
+          // Installs and rollbacks in the change log (T-060a).
+          changeLog: updateChangeLog(options.db, "admin"),
           ...(options.requestRestart === undefined
             ? {}
             : { requestRestart: options.requestRestart }),
@@ -345,6 +359,13 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
             });
           },
         }));
+
+  // Public Subjects counts (S-038, D-106): counted in the background on their
+  // own pool, served from memory, stopped when the server closes.
+  const publicSubjects =
+    options.countsDb === undefined || publicSites.length === 0
+      ? undefined
+      : new PublicSubjects({ db: options.countsDb, sites: publicSites, log });
 
   const files = await fileStoreFromEnv(env);
   const service = createService(options.db, { onError: serviceErrorLogger(log), files });
@@ -362,6 +383,7 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
         ...(deliverEnrolment === undefined ? {} : { deliverEnrolment }),
       },
       ...(updates === null ? {} : { updates: { manager: updates } }),
+      ...(publicSubjects === undefined ? {} : { publicSubjects }),
     }),
     ...signInRoutes({
       db: options.db,
@@ -375,7 +397,19 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     }),
     ...(publicDb === undefined || publicSites.length === 0
       ? []
-      : publicApiRoutes({ db: publicDb, sites: publicSites, log })),
+      : publicApiRoutes({ db: publicDb, sites: publicSites, log, slots: publicSlots })),
+    // OAI-PMH (T-050c, D-105): only with an adminEmail for Identify.
+    ...(publicDb === undefined || publicSites.length === 0 || oaiEmail === undefined
+      ? []
+      : oaiPmhRoutes({
+          db: options.db,
+          publicDb,
+          sites: publicSites,
+          adminEmail: oaiEmail,
+          log,
+          slots: publicSlots,
+        })),
+    ...(publicSubjects === undefined ? [] : publicSubjectsRoutes({ subjects: publicSubjects })),
     ...(options.extraRoutes ?? []),
   ];
   // Stale temporary files and copies no row names (D-086): now, then on a
@@ -434,6 +468,7 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
       routes,
       ...(options.logger === undefined ? {} : { logger: options.logger }),
       ...(admin === undefined ? {} : { admin }),
+      ...(publicSubjects === undefined ? {} : { onClose: () => publicSubjects.stop() }),
     });
   } catch (error) {
     claim.release();
@@ -443,6 +478,8 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   timer.unref();
   const lease = setInterval(() => void renew(), FILE_LEASE_EVERY_MS);
   lease.unref();
+  // Started once the server is built, so a start that fails counts nothing.
+  publicSubjects?.start();
   app.server.once("close", () => {
     clearInterval(timer);
     clearInterval(lease);

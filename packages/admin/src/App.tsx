@@ -26,7 +26,14 @@ import { ApiError } from "./api";
 import { endSession, isSessionEnded, isSignInPath } from "./session";
 import { Frame } from "./frame/Frame";
 import { Home } from "./frame/Home";
-import { SiteHome, SiteNewRecord, SiteRecord, SiteReview } from "./frame/SiteHome";
+import {
+  SiteHome,
+  SiteNewRecord,
+  SiteRecord,
+  SiteReview,
+  SiteShared,
+  SiteSharedItem,
+} from "./frame/SiteHome";
 import { Audit } from "./people/Audit";
 import { Invite } from "./people/Invite";
 import { PeopleList } from "./people/PeopleList";
@@ -35,6 +42,7 @@ import { Roles } from "./people/Roles";
 import { Updates } from "./settings/Updates";
 import { Code } from "./screens/Code";
 import { SettingsLayout, SignInSettings, SitesSettings } from "./settings/Settings";
+import { DublinCoreScreen } from "./settings/DublinCoreEditor";
 import { TemplateList, TemplateScreen } from "./settings/TemplateEditor";
 import { ResetComplete } from "./screens/ResetComplete";
 import { ResetRequest } from "./screens/ResetRequest";
@@ -125,6 +133,9 @@ export const ROUTES: RouteObject[] = [
           { path: "sites/:siteId/review", element: <SiteReview /> },
           { path: "sites/:siteId/records/new", element: <SiteNewRecord /> },
           { path: "sites/:siteId/records/:recordId", element: <SiteRecord /> },
+          // Items shared with the site (T-041e).
+          { path: "sites/:siteId/shared", element: <SiteShared /> },
+          { path: "sites/:siteId/shared/:shareId", element: <SiteSharedItem /> },
           // People, roles and the audit trail (T-048).
           { path: "people", element: <PeopleList /> },
           { path: "people/invite", element: <Invite /> },
@@ -139,6 +150,7 @@ export const ROUTES: RouteObject[] = [
               { path: "sites", element: <SitesSettings /> },
               { path: "templates", element: <TemplateList /> },
               { path: "templates/:key", element: <TemplateScreen /> },
+              { path: "templates/:key/dublin-core", element: <DublinCoreScreen /> },
               { path: "new-template", element: <TemplateScreen isNew /> },
               { path: "sign-in", element: <SignInSettings /> },
               // Software updates (T-060).

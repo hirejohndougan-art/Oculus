@@ -77,7 +77,9 @@
  *    bytes only by returning `fileReply(...)`, which decides the Content-Type
  *    (never an active stored type), the Content-Disposition and the length;
  *    its reply gets `FILE_SECURITY_HEADERS` (nosniff, a sandboxing CSP,
- *    same-origin CORP) and nothing the handler set, cookies included. A
+ *    same-origin CORP) and nothing the handler set, cookies included.
+ *    OAI-PMH's `text/xml` (T-050c, D-105) goes out the same way, only
+ *    through `oaiPmhReply`, which checks the document is an OAI-PMH root. A
  *    streamed file is sent on the hijacked response, outside the handler
  *    timeout but within `timeouts.download`, and closing the server stops it.
  *
@@ -192,6 +194,8 @@ export interface ServerOptions {
    * one of `OCULUS_ORIGINS`.
    */
   readonly admin?: { readonly origin: string; readonly files: AdminFiles };
+  /** Called once when the server closes, after requests have ended (background work, S-038). */
+  readonly onClose?: () => Promise<void>;
 }
 
 function chooseTimeouts(overrides: Partial<ServerTimeouts> = {}): ServerTimeouts {
@@ -858,6 +862,13 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
   addRoute(app, health, timeouts.download, downloads, downloadsClosed, uploadTimeouts.request);
   for (const route of appRoutes) {
     addRoute(app, route, timeouts.download, downloads, downloadsClosed, uploadTimeouts.request);
+  }
+
+  const onClose = options.onClose;
+  if (onClose !== undefined) {
+    app.addHook("onClose", async () => {
+      await onClose();
+    });
   }
 
   await app.ready();

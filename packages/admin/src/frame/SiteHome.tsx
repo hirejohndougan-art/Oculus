@@ -3,7 +3,8 @@
  * the approval queue, a record and a new record. A site the person can't
  * open, or one of another organization opened by its address, says so
  * instead; a record address that isn't a record ID is answered as a record
- * that doesn't exist, without asking the server.
+ * that doesn't exist, without asking the server. Items shared with the
+ * site (T-041e) have a list and a read-only view of their own.
  */
 import type { ReactNode } from "react";
 import { useOutletContext, useParams } from "react-router";
@@ -12,6 +13,8 @@ import { ItemList } from "../records/ItemList";
 import { isRecordId } from "../records/model";
 import { NewRecordScreen, RecordScreen } from "../records/RecordEditor";
 import { ReviewQueue } from "../records/ReviewQueue";
+import { isId } from "../shares/model";
+import { SharedItemScreen, SharedWithSite } from "../shares/SharedWithSite";
 import type { SiteChoice } from "../types";
 import type { FrameContext } from "./Frame";
 import styles from "./Frame.module.css";
@@ -109,6 +112,44 @@ export function SiteRecord() {
             <h1 className={styles.pageTitle}>Record not found</h1>
             <Note tone="amber">There is no such record, or it isn't one you can open.</Note>
             <TextLink href={`/sites/${site.siteId}`}>Back to item records</TextLink>
+          </>
+        )
+      }
+    />
+  );
+}
+
+/** `/sites/:siteId/shared`: items other sites share with this one (T-041e). */
+export function SiteShared() {
+  return (
+    <SiteGuard
+      render={(site) => (
+        <SharedWithSite
+          key={site.siteId}
+          siteId={site.siteId}
+          siteName={site.siteName}
+          organizationId={site.organizationId}
+        />
+      )}
+    />
+  );
+}
+
+/** `/sites/:siteId/shared/:shareId`: one shared item, read-only. */
+export function SiteSharedItem() {
+  const { shareId } = useParams();
+  return (
+    <SiteGuard
+      render={(site) =>
+        isId(shareId) ? (
+          <SharedItemScreen key={shareId} siteId={site.siteId} shareId={shareId} />
+        ) : (
+          <>
+            <h1 className={styles.pageTitle}>Shared item not found</h1>
+            <Note tone="amber">
+              There is no such shared item, or it isn't shared with this site any more.
+            </Note>
+            <TextLink href={`/sites/${site.siteId}/shared`}>Back to shared items</TextLink>
           </>
         )
       }

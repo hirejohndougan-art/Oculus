@@ -14,14 +14,16 @@ export interface Rights {
   readonly manageAccounts: boolean;
 }
 
+/** `nameOnly`: a member with no role, as a site manager sees them (T-064): no email, state or sign-in. */
 export interface PersonSummary {
   readonly userId: string;
   readonly displayName: string;
-  readonly email: string;
-  readonly disabled: boolean;
+  readonly email?: string;
+  readonly disabled?: boolean;
   readonly systemAdmin?: boolean;
-  readonly lastSignInAt: string | null;
+  readonly lastSignInAt?: string | null;
   readonly roles: readonly Grant[];
+  readonly nameOnly?: true;
 }
 
 export interface PeopleList {
@@ -40,7 +42,7 @@ export interface SessionRow {
 }
 
 export interface PersonDetail {
-  readonly person: PersonSummary & { readonly addedAt: string };
+  readonly person: PersonSummary & { readonly addedAt?: string };
   readonly rights: Rights;
   readonly sessions?: readonly SessionRow[];
   readonly secondStep?: {
@@ -92,6 +94,18 @@ export type AuditEntry =
       readonly siteId: string | null;
       readonly scope: string | null;
       readonly invitedEmail: string | null;
+    }
+  | {
+      /** A change to the server itself (T-060a): system managers only. */
+      readonly type: "system";
+      readonly at: string;
+      /** `user:<id>`, or `command_line` for the release command on the server. */
+      readonly actor: string;
+      readonly actorName: string | null;
+      readonly eventId: string;
+      readonly kind: string;
+      readonly version: string;
+      readonly fromVersion: string | null;
     };
 
 export interface AuditPage {

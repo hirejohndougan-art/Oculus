@@ -174,6 +174,11 @@ export function Frame() {
                 Item records
               </NavLink>
             </li>
+            <li>
+              <NavLink className={styles.navLink} to={`/sites/${here.siteId}/shared`}>
+                Shared with this site
+              </NavLink>
+            </li>
             {abilities.data?.review === true ? (
               <li>
                 <NavLink className={styles.navLink} to={`/sites/${here.siteId}/review`}>

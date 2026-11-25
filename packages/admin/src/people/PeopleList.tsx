@@ -68,7 +68,9 @@ export function PeopleList() {
                   <span className={styles.pill}>System manager</span>
                 ) : null}
               </td>
-              <td>{p.email}</td>
+              <td>
+                {p.nameOnly === true ? <span className={styles.muted}>Not shown</span> : p.email}
+              </td>
               <td>
                 {p.roles.length === 0 ? (
                   <span className={styles.muted}>No role</span>
@@ -80,7 +82,13 @@ export function PeopleList() {
                   ))
                 )}
               </td>
-              <td>{when(p.lastSignInAt)}</td>
+              <td>
+                {p.nameOnly === true ? (
+                  <span className={styles.muted}>Not shown</span>
+                ) : (
+                  when(p.lastSignInAt ?? null)
+                )}
+              </td>
             </tr>
           ))}
         </tbody>
