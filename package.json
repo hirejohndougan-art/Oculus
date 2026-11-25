@@ -30,6 +30,7 @@
     "admin": "node packages/api/dist/admin-cli.js",
     "desktop": "node packages/api/dist/desktop-cli.js",
     "desktop:database": "node packages/api/dist/desktop-database-cli.js",
+    "release": "node packages/api/dist/release-cli.js",
     "e2e": "npm run build && npm run e2e -w @oculus/admin"
   },
   "devDependencies": {
