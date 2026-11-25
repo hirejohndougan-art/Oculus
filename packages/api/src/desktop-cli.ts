@@ -181,7 +181,7 @@ async function sealingKeyIds(db: Database): Promise<string[]> {
 
 /**
  * If the code has migrations the database hasn't (an update), backs the
- * database up first into the settings folder's `backups` (S-034b, D-100),
+ * database up first into the settings folder's `backups` (S-034b, D-102),
  * so an update can be undone with `db:restore`. Returns false, having said
  * why, if the backup couldn't be made: nothing is migrated then.
  */

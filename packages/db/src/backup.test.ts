@@ -2069,7 +2069,7 @@ describe("the restoring role's own privileges and settings", () => {
   }, 60_000);
 });
 
-// S-034b (D-100): Windows has no `sh` or process groups, so there the tools
+// S-034b (D-102): Windows has no `sh` or process groups, so there the tools
 // run directly. The same code path runs here with toolRunner "direct".
 describe("tools run directly, as on Windows", () => {
   it("backs up and restores, checked against the manifest", async () => {

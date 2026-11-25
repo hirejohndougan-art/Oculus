@@ -1294,7 +1294,7 @@ Builds T-057 on D-088 (the launcher), D-067 (one writer, `grantWriterRole`, `che
 
 **Rejected:** rewriting the npm scripts without `exec` (D-064's signal tests pin `exec`, and schedulers call node directly anyway); a reset that also removes two-step sign-in (that's an admin's reset, T-038, never a self-service one); writing the new hash with SQL directly (it would skip ending sessions, the counters and the password rules).
 
-## D-100 — Backups on Windows (tools run directly, found in the installer's folders) and a backup before every desktop update (2026-11-25, Chat D, S-034b)
+## D-102 — Backups on Windows (tools run directly, found in the installer's folders) and a backup before every desktop update (2026-11-25, Chat D, S-034b)
 D-064 runs pg_dump and pg_restore under a POSIX `sh` watchdog in their own process group, so backups and restores failed on Windows (D-099's note).
 
 - **Two ways to run a tool** (`ToolRunner` in backup.ts): `watchdog` (D-064, unchanged, the default everywhere but Windows) and `direct` (the default on Windows): the tool is spawned with no shell, its input is its stdin, stopping it terminates it (an unfinished pg_restore's one transaction never commits, so it rolls back), and it's registered for the exit clean-up by its PID (`trackProcess`). What `direct` gives up: if this process is killed outright, the tool may run on until it ends by itself; its server session then finishes or rolls back, as for a lost connection. `backup` and `restore` take `toolRunner` so the tests run the `direct` path on Linux too (round trip, stop mid-backup, stop mid-restore).

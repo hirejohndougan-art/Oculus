@@ -130,7 +130,7 @@ function errorCode(error: unknown): string {
 // ---------------------------------------------------------------------------
 // Finding and running pg_dump and pg_restore.
 
-/** A tool's file name: `pg_dump.exe` on Windows (S-034b, D-100). */
+/** A tool's file name: `pg_dump.exe` on Windows (S-034b, D-102). */
 export function executable(tool: string, platform: NodeJS.Platform = process.platform): string {
   return platform === "win32" ? `${tool}.exe` : tool;
 }
@@ -303,7 +303,7 @@ export async function writeAll(stream: Writable, chunk: Buffer): Promise<void> {
  */
 /**
  * How tools are run: under the POSIX watchdog (above), or directly, where
- * there is no `sh` or process group (Windows; S-034b, D-100). Run directly,
+ * there is no `sh` or process group (Windows; S-034b, D-102). Run directly,
  * a tool's input is its stdin, stopping it terminates it (Windows has no
  * SIGTERM; an unfinished pg_restore rolls back, its one transaction never
  * committed), and if this process is killed outright the tool may run on
