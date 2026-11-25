@@ -8,6 +8,7 @@ import {
   effectiveRecord,
   makeIdentifierChecker,
   publicOutput,
+  publicTemplateIssues,
   publicView,
   type CatalogRecord,
   type FieldValue,
@@ -101,6 +102,34 @@ describe("publicOutput issue messages quote no values (S-007)", () => {
     const result = publishNumber({ type: "accession_number", value: NUMBER });
     expect(codes(result)).toContain("format_mismatch");
     quotesNothing(result, NUMBER, "SECRETNUM", "D-####");
+  });
+
+  it("the publish check's copy of the template check finds the same, quoting nothing (S-026)", () => {
+    const check = (value: FieldValue) => {
+      const item = record("object", "Item", { rights: { uri: CNE }, number: value });
+      const built = effectiveRecord(item.id, [item], () => TPL, {
+        checkers: CHECKERS,
+        identifiers: identifiersOf(item, value),
+      });
+      if (!built.ok) throw new Error(JSON.stringify(built.issues));
+      return publicTemplateIssues(built.value, CHECKERS);
+    };
+    const misfit = check({ type: "accession_number", value: NUMBER });
+    expect(misfit.map((i) => i.code)).toEqual(["format_mismatch"]);
+    expect(misfit[0]?.path.slice(0, 2)).toEqual(["fields", "number"]);
+    const text = JSON.stringify(misfit);
+    for (const secret of [NUMBER, "SECRETNUM", "D-####", "accession_number"]) {
+      expect(text).not.toContain(secret);
+    }
+    expect(Object.isFrozen(misfit) && Object.isFrozen(misfit[0])).toBe(true);
+    // A number that fits passes, as the public output does.
+    const fits = { type: "accession_number", value: "D-0042" };
+    expect(check(fits)).toEqual([]);
+    expect(publishNumber(fits).ok).toBe(true);
+    // Anything that isn't an effective record is refused, never thrown.
+    expect(publicTemplateIssues({} as never, CHECKERS).map((i) => i.code)).toEqual([
+      "not_effective",
+    ]);
   });
 
   it("a value that fails the built-in check: its text isn't quoted", () => {

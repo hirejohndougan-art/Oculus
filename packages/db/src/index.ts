@@ -166,6 +166,12 @@ export {
 } from "./definitions.js";
 export type { TemplateSummary } from "./definitions.js";
 export {
+  publishedUsingTemplate,
+  readDublinCoreMapping,
+  writeDublinCoreMapping,
+} from "./dublin-core-mappings.js";
+export type { StoredDublinCoreMapping } from "./dublin-core-mappings.js";
+export {
   searchRecords,
   MAX_SEARCH_QUERY_LENGTH,
   DEFAULT_SEARCH_LIMIT,
