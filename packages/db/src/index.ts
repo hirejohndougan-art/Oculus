@@ -328,3 +328,10 @@ export {
   MAX_ORGANIZATION_CHOICES,
 } from "./sign-in-screens.js";
 export type { PendingSignInState, OrganizationChoice, SignedInPerson } from "./sign-in-screens.js";
+export {
+  STARTER_TEMPLATE_FIELDS,
+  STARTER_TEMPLATE_KEY,
+  isEmptyInstall,
+  setUpFirstInstall,
+} from "./first-setup.js";
+export type { FirstInstall, FirstInstallResult } from "./first-setup.js";
