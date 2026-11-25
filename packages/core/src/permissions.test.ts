@@ -204,7 +204,7 @@ describe("permits", () => {
   });
 
   it("a grant of an unknown role grants nothing", () => {
-    const odd = access([{ role: "curator" as BuiltInRole, siteId: null, scope: null }]);
+    const odd = access([{ role: "curator", siteId: null, scope: null }]);
     expect(permits(odd, "records.view", { on: "catalog", site: siteA })).toBe(false);
     expect(holdsAnywhere(odd, "records.view")).toBe(false);
   });
