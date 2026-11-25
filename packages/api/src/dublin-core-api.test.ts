@@ -7,6 +7,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { csrfTokenFor, type OrganizationId, type UserId } from "@oculus/core";
 import type { FastifyInstance } from "fastify";
+import { sql } from "@oculus/db";
+import { createService } from "@oculus/service";
 import { OCULUS_COOKIES } from "./cookies.js";
 import { buildServer } from "./server.js";
 import { CSRF_HEADER, staffApiRoutes } from "./staff-api.js";
@@ -173,5 +175,108 @@ describe("a template's Dublin Core mapping", () => {
     );
     expect(confirmed.status).toBe(200);
     expect(confirmed.json.publishedRecords).toContain(record.id);
+  });
+});
+
+describe("a change on more published records than can be listed (S-039)", () => {
+  it("is confirmed by its exact count, asked again when the count is out of date", async () => {
+    // The same database, a service that lists at most one record.
+    const small = await buildServer({
+      env: TEST_ENV,
+      routes: staffApiRoutes({
+        db: w.db,
+        service: createService(w.db, { maxListedPublished: 1 }),
+        log: () => undefined,
+      }),
+    });
+    try {
+      for (const title of ["An invented published kettle", "An invented published jug"]) {
+        const made = await makeObject(w, w.a, w.a1, title);
+        await publishAs(w, w.a, made.id);
+      }
+      const read = await call("GET", URL_OBJECT, "root");
+      const tag = `"v${String(read.json.version)}"`;
+      const put = async (body: Record<string, unknown>) => {
+        const token = tokens.root ?? "";
+        const res = await small.inject({
+          method: "PUT",
+          url: URL_OBJECT,
+          headers: {
+            origin: SAME_ORIGIN.origin,
+            cookie: `${OCULUS_COOKIES.session}=${token}`,
+            [CSRF_HEADER]: csrfTokenFor(token) ?? "",
+            "content-type": "application/json",
+            "if-match": tag,
+          },
+          payload: JSON.stringify(body),
+        });
+        return { status: res.statusCode, json: res.json<Record<string, unknown>>() };
+      };
+      const mapping = { entries: [...MAPPING.entries, { field: "note", term: "abstract" }] };
+      const [row] = await w.db.rows<{ n: number }>(sql`
+        SELECT count(*)::integer AS n FROM public.records
+        WHERE organization_id = ${w.a}::uuid AND template_key = 't-object'
+          AND workflow_state = 'published'`);
+      const count = row?.n ?? 0;
+      expect(count).toBeGreaterThan(1);
+      const asked = await put({ mapping });
+      expect(asked.status).toBe(409);
+      expect(asked.json.error).toBe("confirmation_required");
+      const issues = asked.json.issues as { code: string; path: unknown[] }[];
+      expect(issues.map((i) => i.code)).toEqual(["publishes_records", "published_records_counted"]);
+      expect(issues[1]?.path).toEqual(["publishedRecordCount", count]);
+      // No list: the records aren't named one by one.
+      expect(JSON.stringify(asked.json)).not.toContain("published_record_affected");
+      // confirmPublished alone, or a wrong count, asks again.
+      for (const body of [
+        { mapping, confirmPublished: true },
+        { mapping, confirmPublishedCount: count - 1 },
+        { mapping, confirmPublishedCount: count + 1 },
+      ]) {
+        const r = await put(body);
+        expect(r.status).toBe(409);
+      }
+      for (const bad of ["3", -1, 1.5, null]) {
+        expect((await put({ mapping, confirmPublishedCount: bad })).status).toBe(422);
+      }
+      // A record published after the ask makes the count out of date: asked again, with the new one.
+      const late = await makeObject(w, w.a, w.a1, "An invented late cup");
+      await publishAs(w, w.a, late.id);
+      const stale = await put({ mapping, confirmPublishedCount: count });
+      expect(stale.status).toBe(409);
+      expect((stale.json.issues as { path: unknown[] }[])[1]?.path).toEqual([
+        "publishedRecordCount",
+        count + 1,
+      ]);
+      const saved = await put({ mapping, confirmPublishedCount: count + 1 });
+      expect(saved.status).toBe(200);
+      expect(saved.json.publishedRecordCount).toBe(count + 1);
+      expect(saved.json.publishedRecords).toEqual([]);
+    } finally {
+      await small.close();
+    }
+  });
+
+  it("below the limit, a count is no confirmation: confirmPublished still is", async () => {
+    const read = await call("GET", URL_OBJECT, "root");
+    const tag = `"v${String(read.json.version)}"`;
+    const mapping = { entries: [MAPPING.entries[0]] };
+    const asked = await call(
+      "PUT",
+      URL_OBJECT,
+      "root",
+      { mapping, confirmPublishedCount: 1 },
+      {
+        "if-match": tag,
+      },
+    );
+    expect(asked.status).toBe(409);
+    expect(codes(asked)).toContain("published_record_affected");
+  });
+
+  it("refuses a list limit outside 1 to 10,000 when the service is made", () => {
+    for (const bad of [0, -1, 1.5, 10_001]) {
+      expect(() => createService(w.db, { maxListedPublished: bad })).toThrow(RangeError);
+    }
   });
 });
