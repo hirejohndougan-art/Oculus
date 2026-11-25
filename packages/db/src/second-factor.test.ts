@@ -1276,7 +1276,6 @@ describe("only a whole sign-in makes an address known (S-044)", () => {
     ).toMatchObject({ ok: true });
     await db.execute(sql`
       DELETE FROM public.sign_in_throttles WHERE key = ${throttleAccountKey(person.email)}`);
-    // 28 password checks: about 6 s on a busy two-CPU machine, past the 5 s default.
   }, 30_000);
 
   it("a wrong code, or setting up at first sign-in, counts the same way", async () => {

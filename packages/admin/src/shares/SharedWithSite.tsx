@@ -14,15 +14,18 @@ import { Button, Note, TextLink } from "../components/ui";
 import { ConfirmPanel } from "../records/controls";
 import { KIND_LABELS, valueText, whenText } from "../records/model";
 import styles from "../records/Records.module.css";
-import { fieldLabel, homeText, isId, type IncomingShare } from "./model";
+import { homeText, isId, itemTitle, viewLabel, type IncomingShare } from "./model";
 import {
   moveShare,
+  nextSharePage,
   refreshShares,
   useShareOffers,
   useSharedItem,
   useSharedItems,
   type ShareMove,
 } from "./queries";
+import { useMorePages } from "./paging";
+import { ShowMore } from "./ShowMore";
 
 /** A record kind in words; only the admin's own labels, never a prototype key. */
 function kindText(kind: string): string {
@@ -72,14 +75,23 @@ function SharedTable(props: {
             return (
               <tr key={share.id}>
                 <td>
-                  {href === undefined ? (
+                  {share.item === null ? (
+                    <>
+                      {itemTitle(share)}
+                      <br />
+                      <span className={styles.meta}>
+                        Its home site doesn't show it publicly now, so this site doesn't either. You
+                        can still remove it.
+                      </span>
+                    </>
+                  ) : href === undefined ? (
                     share.item.title
                   ) : (
                     <TextLink href={href}>{share.item.title}</TextLink>
                   )}
                 </td>
-                <td>{kindText(share.item.kind)}</td>
-                <td>{homeText(share.item)}</td>
+                <td>{share.item === null ? "Not shown" : kindText(share.item.kind)}</td>
+                <td>{share.item === null ? "Not shown" : homeText(share.item)}</td>
                 <td>{whenText(share.offeredAt)}</td>
                 {props.actions === undefined ? null : (
                   <td className={styles.actions}>{props.actions(share)}</td>
@@ -106,6 +118,15 @@ export function SharedWithSite(props: {
   const [status, setStatus] = useState<{ tone: "green" | "amber"; text: string }>();
   const [busy, setBusy] = useState(false);
   const [removing, setRemoving] = useState<IncomingShare>();
+  const offeredPages = useMorePages(offers.data?.offered, offers.dataUpdatedAt, (before) =>
+    nextSharePage(props.siteId, "offered", before),
+  );
+  const acceptedPages = useMorePages(offers.data?.accepted, offers.dataUpdatedAt, (before) =>
+    nextSharePage(props.siteId, "accepted", before),
+  );
+  const itemPages = useMorePages(items.data, items.dataUpdatedAt, (before) =>
+    nextSharePage(props.siteId, "items", before),
+  );
 
   // A ref, not only state: a second press before the re-render must not send twice.
   const moving = useRef(false);
@@ -155,8 +176,8 @@ export function SharedWithSite(props: {
   if (offers.isPending) {
     body = <p role="status">Loading the items shared with this site…</p>;
   } else if (offers.isSuccess) {
-    const waiting = offers.data.filter((s) => s.state === "offered");
-    const accepted = offers.data.filter((s) => s.state === "accepted");
+    const waiting = offeredPages.rows;
+    const accepted = acceptedPages.rows;
     body = (
       <>
         <Note tone="blue">
@@ -181,19 +202,20 @@ export function SharedWithSite(props: {
                     isDisabled={busy}
                     onPress={() => void move(share, "accept")}
                   >
-                    Accept {share.item.title}
+                    Accept {itemTitle(share)}
                   </Button>
                   <Button
                     variant="link"
                     isDisabled={busy}
                     onPress={() => void move(share, "decline")}
                   >
-                    Decline {share.item.title}
+                    Decline {itemTitle(share)}
                   </Button>
                 </>
               )}
             />
           )}
+          <ShowMore pages={offeredPages} what="offers" />
         </section>
         <section className={styles.panel} aria-labelledby="accepted-title">
           <h2 id="accepted-title" className={styles.sectionTitle}>
@@ -214,11 +236,14 @@ export function SharedWithSite(props: {
                     setRemoving(share);
                   }}
                 >
-                  Remove {share.item.title}
+                  {share.item === null
+                    ? `Remove the hidden item offered ${whenText(share.offeredAt)} (share ${share.id.slice(0, 8)})`
+                    : `Remove ${share.item.title}`}
                 </Button>
               )}
             />
           )}
+          <ShowMore pages={acceptedPages} what="shared items" />
         </section>
       </>
     );
@@ -237,14 +262,17 @@ export function SharedWithSite(props: {
       );
   } else {
     body =
-      items.data.length === 0 ? (
+      itemPages.rows.length === 0 ? (
         <p>Nothing is shared with this site yet.</p>
       ) : (
-        <SharedTable
-          siteId={props.siteId}
-          caption="Items shared with this site"
-          shares={items.data}
-        />
+        <>
+          <SharedTable
+            siteId={props.siteId}
+            caption="Items shared with this site"
+            shares={itemPages.rows}
+          />
+          <ShowMore pages={itemPages} what="shared items" />
+        </>
       );
   }
 
@@ -275,8 +303,8 @@ export function SharedWithSite(props: {
         }}
       >
         <p>
-          {removing?.item.title ?? ""} stops showing here. Its home site keeps it; to show it again,
-          they would offer it again.
+          {removing === undefined ? "" : itemTitle(removing)} stops showing here. Its home site
+          keeps it; to show it again, they would offer it again.
         </p>
       </ConfirmPanel>
       <div aria-busy={offers.isFetching || items.isFetching}>{body}</div>
@@ -319,6 +347,15 @@ export function SharedItemScreen(props: { readonly siteId: string; readonly shar
     );
   }
   const item = share.data.item;
+  if (item === null) {
+    return (
+      <>
+        <h1 className={styles.pageTitle}>Shared item not found</h1>
+        <p>There is no such shared item, or it isn't shared with this site any more.</p>
+        {back}
+      </>
+    );
+  }
   const fields = Object.entries(item.fields).filter(([, v]) => valueText(v) !== "");
   return (
     <>
@@ -337,7 +374,7 @@ export function SharedItemScreen(props: { readonly siteId: string; readonly shar
         <dl className={styles.grid}>
           {fields.map(([key, value]) => (
             <div key={key} className={styles.pair}>
-              <dt>{fieldLabel(key)}</dt>
+              <dt>{viewLabel(item, key)}</dt>
               <dd>{valueText(value)}</dd>
             </div>
           ))}

@@ -95,8 +95,9 @@ export {
   oaiStoredStamp,
   writeOaiStamps,
   MAX_OAI_CANDIDATES,
+  OAI_READ_TIME_LIMIT_MS,
 } from "./oai.js";
-export type { OaiCandidate, OaiListOptions } from "./oai.js";
+export type { OaiCandidate, OaiListOptions, OaiReadOptions } from "./oai.js";
 export {
   changeWorkflowState,
   publishCheckIssues,
@@ -432,6 +433,7 @@ export {
   SHARE_STATES,
   SHARE_TABLE_PRIVILEGES,
   MAX_SHARE_PAGE,
+  SHARE_CHANGED,
   insertShare,
   isShareId,
   liveShare,
@@ -442,7 +444,7 @@ export {
   sharesIntoSite,
   sharesOfRecord,
 } from "./shares.js";
-export type { Share, ShareState, SharedItemView } from "./shares.js";
+export type { Share, SharePageOptions, ShareState, SharedItemView } from "./shares.js";
 export {
   SYSTEM_EVENT_KINDS,
   SYSTEM_EVENT_TABLE_PRIVILEGES,
