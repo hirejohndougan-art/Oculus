@@ -360,7 +360,10 @@ export {
   namedContents,
   findStoredFileById,
   insertStoredFileEvent,
-  sweepableContents,
+  purgeCandidates,
+  readFileStoreLease,
+  lockFileStoreLease,
+  insertFileStoreEpoch,
   databaseIdentity,
   PLACING_GRACE_SECONDS,
   existingOrganizations,
@@ -368,7 +371,13 @@ export {
   insertFileStoreBinding,
   REMOVED_FILE_GRACE_SECONDS,
 } from "./stored-files.js";
-export type { NewStoredFile, StoredFile, StoredFileEventKind } from "./stored-files.js";
+export type {
+  NewStoredFile,
+  StoredFile,
+  StoredFileEventKind,
+  PurgeCandidate,
+  FileStoreLease,
+} from "./stored-files.js";
 export {
   sendSecondStepAlertNotices,
   ALERT_NOTICE_TABLE_PRIVILEGES,

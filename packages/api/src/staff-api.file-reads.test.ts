@@ -623,7 +623,7 @@ describe("thumbnails", () => {
     rmSync(cFolder);
   });
 
-  it("goes with its bytes: the sweep removes thumbnails of content no row names", async () => {
+  it("goes with its bytes: only the operator's purge removes them, with the copy", async () => {
     const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented removable photograph"));
     const body = makeJpeg(90, 60);
     const id = await add(asset, body, "removable.jpg");
@@ -640,9 +640,10 @@ describe("thumbnails", () => {
       headers: { "if-match": '"v1"' },
     });
     expect(removed.status).toBe(200);
-    // Removing deletes nothing on disk; only the sweep does, after the grace period.
+    // Removing deletes nothing on disk, nor does the automatic sweep.
     expect(existsSync(thumb("small"))).toBe(true);
     const sweeper = createService(w.db, { files: store });
+    expect(await sweeper.purgeFiles({ apply: false })).toMatchObject({ ok: true });
     expect(await sweeper.sweepFiles(3600_000)).toMatchObject({ unbound: false, failed: 0 });
     expect(existsSync(thumb("small"))).toBe(true);
     expect(existsSync(store.pathFor(w.a, sha(body)))).toBe(true);
@@ -659,7 +660,13 @@ describe("thumbnails", () => {
         sql`ALTER TABLE public.stored_file_events ENABLE ALWAYS TRIGGER stored_file_events_append_only`,
       );
     });
-    expect(await sweeper.sweepFiles(3600_000)).toMatchObject({ unbound: false, failed: 0 });
+    // The sweep still never touches the copy or its thumbnails.
+    expect(await sweeper.sweepFiles(0)).toMatchObject({ unbound: false, failed: 0 });
+    expect(existsSync(thumb("small"))).toBe(true);
+    // The purge deletes the copy and, by the same decision, its thumbnails.
+    const done = await sweeper.purgeFiles({ apply: true, only: [`${w.a}/${sha(body)}`] });
+    if (!done.ok) throw new Error(done.problem);
+    expect(done.value.deleted).toBeGreaterThanOrEqual(1);
     // Nothing left in the trash either.
     expect(existsSync(join(filesDir, w.a, "trash"))).toBe(true);
     expect(readdirSync(join(filesDir, w.a, "trash"))).toEqual([]);

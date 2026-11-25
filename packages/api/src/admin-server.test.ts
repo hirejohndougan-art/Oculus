@@ -4,7 +4,7 @@
 // OCULUS_ORIGINS), and the built admin served on the
 // admin's origin only, with its own CSP while the API keeps its own.
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { openDatabase, type Database } from "@oculus/db";
@@ -119,6 +119,32 @@ describe("the startup checks", () => {
     expect(clientAddressProblem({ OCULUS_CLIENT_ADDRESS: "yes" })).toMatch(/only be "direct"/);
     expect(clientAddressProblem({ NODE_ENV: "development" })).toBeUndefined();
   });
+
+  it("refuses to start when another server on this computer uses the files folder with another database", async () => {
+    // A first start binds the folder (and notes this server).
+    const first = await buildAdminServer({ db, env: DEV, adminFiles: files });
+    await first.close();
+    // A live server of another database: a stand-in entry for the parent
+    // process, which is alive.
+    const servers = join(filesDir, ".oculus-servers");
+    const host = hostname()
+      .replace(/[^A-Za-z0-9.-]/g, "_")
+      .slice(0, 100);
+    const theirs = join(servers, `${host}-${String(process.ppid)}`);
+    writeFileSync(theirs, "another%7Cdatabase\n");
+    try {
+      await expect(buildAdminServer({ db, env: DEV, adminFiles: files })).rejects.toThrow(
+        /another Oculus server on this computer uses this folder with another database/,
+      );
+    } finally {
+      rmSync(theirs, { force: true });
+    }
+    // Two servers of this one database: fine.
+    const one = await buildAdminServer({ db, env: DEV, adminFiles: files });
+    const two = await buildAdminServer({ db, env: DEV, adminFiles: files });
+    await one.close();
+    await two.close();
+  }, 30_000);
 
   it("refuses to start without a usable files folder or with bad caps, never showing them", async () => {
     for (const value of [undefined, "", "relative/files", join(filesDir, "missing")]) {

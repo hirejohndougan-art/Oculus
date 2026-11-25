@@ -35,27 +35,31 @@
  * one step by rename. Nothing is ever written in place. `discard` removes
  * the temporary file and releases its share of the organization's total.
  *
- * **The folder belongs to one install** (review B1): a marker file in its
- * root (`STORE_MARKER`) holds the install's ID, which the database holds
- * too (the service's `bindFileStore`). Until `bind` has been called with
- * the matching ID, nothing is ever deleted outside `incoming/`'s own
- * uploads.
+ * **The folder belongs to one install**: a marker file in its root
+ * (`STORE_MARKER`) holds the install's ID, which the database holds too
+ * (the service's `bindFileStore`), and the folder's lease epoch, which must
+ * equal the database's current one. Servers note themselves in
+ * `.oculus-servers` (`claimServer`), so a second database on this machine
+ * can't use the folder at the same time.
  *
- * The sweep (the service's `sweepFiles`) uses `staleIncoming` (temporary
- * files older than an upload may run, by the file system's own clock, never
- * one this process is still writing), `listContents` (regular files only;
- * anything else at a content path is counted and left alone) and `trash`,
- * then `emptyTrash`: copies no row names are moved aside under the
- * organization's file lock (a rename, cheap and atomic) and deleted after it
- * is released.
+ * **Nothing automatic deletes a stored copy** (D-086, fourth review). The
+ * automatic sweep (the service's `sweepFiles`) only removes temporary
+ * uploads (`staleIncoming`: older than an upload may run, by the file
+ * system's own clock, never one this process is still writing) and empties
+ * the trash a stopped purge left. Only the operator's purge
+ * (`npm run files:purge`) moves copies into the trash (`trash`, under the
+ * organization's file lock) and deletes them (`emptyTrash`, after it);
+ * `listContents` gives it regular files only (anything else at a content
+ * path is counted and left alone).
  */
 import { createHash, randomBytes } from "node:crypto";
-import { constants, createReadStream, openSync } from "node:fs";
+import { constants, createReadStream, openSync, rmSync } from "node:fs";
 import {
   link,
   lstat,
   mkdir,
   open,
+  readFile,
   readdir,
   rename,
   rm,
@@ -63,6 +67,7 @@ import {
   statfs,
   writeFile,
 } from "node:fs/promises";
+import { hostname } from "node:os";
 import { isAbsolute, join } from "node:path";
 import type { Readable } from "node:stream";
 import { SNIFF_BYTES, isOrganizationId, isSha256Hex, type OrganizationId } from "@oculus/core";
@@ -117,14 +122,19 @@ export type ReceiveResult =
 export const STORE_MARKER = ".oculus-store-id";
 
 /**
- * What the marker holds: the install's ID (line 1) and the identity of the
- * database that bound the folder (line 2, `databaseIdentity`), which a dump
- * restored elsewhere or under the same name doesn't share.
+ * What the marker holds: the install's ID (line 1), the identity of the
+ * database that last bound or adopted the folder (line 2, for people to
+ * read; nothing is decided by it), and the folder's lease epoch (line 3,
+ * which must equal the database's current epoch, D-086's fourth review).
  */
 export interface StoreMarker {
   readonly storeId: string;
   readonly database?: string;
+  readonly epoch?: string;
 }
+
+/** Where the servers using the folder note themselves (`claimServer`). */
+const SERVERS_FOLDER = ".oculus-servers";
 
 const MARKER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const MARKER_DATABASE = /^[0-9A-Za-z_.:-]{1,100}$/;
@@ -153,18 +163,25 @@ export interface FileStore {
   ): Promise<ReceiveResult>;
   /** Whether `extra` more bytes would leave the disk below the free-space floor. */
   lowOnSpace(extra: number): Promise<boolean>;
-  /** The install ID in the root's marker file, if there is one. */
+  /** The marker in the root, if there is one. */
   readMarker(): Promise<StoreMarker | undefined>;
   /** Writes the marker (only into a folder that has none). */
-  writeMarker(storeId: string, database: string): Promise<void>;
-  /**
-   * Adds the database identity to a marker that has none (an operator
-   * removed it to let a restored database sweep again), replacing the file
-   * in one step; refused when the marker names another install.
-   */
-  recordDatabase(storeId: string, database: string): Promise<void>;
+  writeMarker(marker: Required<StoreMarker>): Promise<void>;
+  /** Replaces the marker in one step (a rename), fsynced. */
+  replaceMarker(marker: Required<StoreMarker>): Promise<void>;
   /** Whether another server is writing the marker right now (its temporary file exists). */
   markerInProgress(): Promise<boolean>;
+  /** Milliseconds since the marker last changed, by the file system's own clock. */
+  markerAge(): Promise<number | undefined>;
+  /**
+   * Notes this server as using the folder for `key` (the install, the
+   * database and where it lives) until `release` or the process ends.
+   * Refused when another live server on this machine uses it for another
+   * key: two databases must never share one folder (D-086).
+   */
+  claimServer(
+    key: string,
+  ): Promise<{ readonly ok: true; release(): void } | { readonly ok: false }>;
   /** Whether the root holds anything at all. */
   isEmpty(): Promise<boolean>;
   /** Marks the store as checked against the database: the sweep may delete. */
@@ -484,11 +501,14 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
 
   /** Writes the marker through a temporary file, fsynced, then linked or renamed into place. */
   async function writeMarkerFile(
-    storeId: string,
-    database: string,
+    marker: Required<StoreMarker>,
     how: "link" | "rename",
   ): Promise<void> {
-    if (!MARKER_ID.test(storeId) || !MARKER_DATABASE.test(database)) {
+    if (
+      !MARKER_ID.test(marker.storeId) ||
+      !MARKER_DATABASE.test(marker.database) ||
+      !MARKER_ID.test(marker.epoch)
+    ) {
       throw new TypeError("Not a marker.");
     }
     const temp = join(root, `${STORE_MARKER}.${randomBytes(8).toString("hex")}`);
@@ -498,7 +518,10 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       0o600,
     );
     try {
-      await writeAll(handle, Buffer.from(`${storeId}\n${database}\n`, "utf8"));
+      await writeAll(
+        handle,
+        Buffer.from(`${marker.storeId}\n${marker.database}\n${marker.epoch}\n`, "utf8"),
+      );
       await handle.sync();
     } finally {
       await handle.close();
@@ -510,6 +533,17 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       await rm(temp, { force: true });
     }
     await syncDirectory(root);
+  }
+
+  /** "Now" by the file system's own clock: the time of a file written just now in `folder`. */
+  async function fileSystemNow(folder: string): Promise<number> {
+    const probe = join(folder, `.now-${randomBytes(8).toString("hex")}`);
+    await writeFile(probe, "", { mode: 0o600, flag: "wx" });
+    try {
+      return (await lstat(probe)).mtimeMs;
+    } finally {
+      await rm(probe, { force: true });
+    }
   }
 
   const store: FileStore = {
@@ -540,26 +574,80 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       } finally {
         await handle.close();
       }
-      const [storeId = "", database = ""] = text.split("\n").map((line) => line.trim());
-      if (!MARKER_ID.test(storeId) || (database !== "" && !MARKER_DATABASE.test(database))) {
+      const [storeId = "", database = "", epoch = ""] = text.split("\n").map((line) => line.trim());
+      if (
+        !MARKER_ID.test(storeId) ||
+        (database !== "" && !MARKER_DATABASE.test(database)) ||
+        (epoch !== "" && !MARKER_ID.test(epoch))
+      ) {
         throw new Error("The files folder's marker can't be read.");
       }
-      return Object.freeze(database === "" ? { storeId } : { storeId, database });
+      return Object.freeze({
+        storeId,
+        ...(database === "" ? {} : { database }),
+        ...(epoch === "" ? {} : { epoch }),
+      });
     },
 
-    async writeMarker(storeId, database) {
+    async writeMarker(marker) {
       // Never over an existing marker: link fails if one appeared meanwhile.
-      await writeMarkerFile(storeId, database, "link");
+      await writeMarkerFile(marker, "link");
     },
 
-    async recordDatabase(storeId, database) {
-      const current = await store.readMarker();
-      if (current?.storeId !== storeId || current.database !== undefined) {
-        throw new Error(
-          "The files folder's marker isn't this install's, or already names a database.",
-        );
+    async replaceMarker(marker) {
+      await writeMarkerFile(marker, "rename");
+    },
+
+    async markerAge() {
+      const info = await lstat(join(root, STORE_MARKER)).catch(() => undefined);
+      if (info === undefined) return undefined;
+      return Math.max(0, (await fileSystemNow(root)) - info.mtimeMs);
+    },
+
+    async claimServer(key) {
+      if (!/^[\x21-\x7e]{1,300}$/.test(key)) throw new TypeError("Not a server key.");
+      const folder = await safeFolder(SERVERS_FOLDER);
+      const host = hostname()
+        .replace(/[^A-Za-z0-9.-]/g, "_")
+        .slice(0, 100);
+      for (const entry of await readdir(folder, { withFileTypes: true })) {
+        const match = /^(.+)-([0-9]{1,10})$/.exec(entry.name);
+        if (!entry.isFile() || match?.[1] !== host) continue;
+        const pid = Number(match[2]);
+        const path = join(folder, entry.name);
+        let alive = pid !== process.pid;
+        if (alive) {
+          try {
+            process.kill(pid, 0);
+          } catch (error) {
+            alive = (error as { code?: unknown }).code === "EPERM";
+          }
+        }
+        if (!alive) {
+          // A server that has gone (or this process, starting again).
+          await rm(path, { force: true });
+          continue;
+        }
+        const theirs = (await readFile(path, "utf8").catch(() => "")).trim();
+        if (theirs !== key) return { ok: false };
       }
-      await writeMarkerFile(storeId, database, "rename");
+      const mine = join(folder, `${host}-${String(process.pid)}`);
+      await writeFile(mine, `${key}\n`, { mode: 0o600 });
+      const release = (): void => {
+        try {
+          rmSync(mine, { force: true });
+        } catch {
+          // Gone already.
+        }
+      };
+      process.once("exit", release);
+      return {
+        ok: true,
+        release: () => {
+          process.removeListener("exit", release);
+          release();
+        },
+      };
     },
 
     async markerInProgress() {
@@ -568,7 +656,7 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
     },
 
     async isEmpty() {
-      return (await readdir(root)).length === 0;
+      return (await readdir(root)).filter((name) => name !== SERVERS_FOLDER).length === 0;
     },
 
     async openContent(organizationId, sha256, size) {

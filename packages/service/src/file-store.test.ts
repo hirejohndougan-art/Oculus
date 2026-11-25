@@ -19,7 +19,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { newOrganizationId } from "@oculus/core";
@@ -308,33 +308,38 @@ describe("the safety and limits added after review", () => {
 });
 
 describe("the second review's changes", () => {
-  it("writes and reads the install marker, never over an existing one", async () => {
+  it("writes, replaces and reads the marker with its epoch, never over an existing one", async () => {
     const fresh = mkdtempSync(join(tmpdir(), "oculus-store-marker-"));
     const own = await openFileStore({ dir: fresh });
     expect(await own.isEmpty()).toBe(true);
     expect(await own.readMarker()).toBeUndefined();
+    expect(await own.markerAge()).toBeUndefined();
     const id = "11111111-2222-4333-8444-555555555555";
-    await own.writeMarker(id, "7001:16384");
-    expect(await own.readMarker()).toEqual({ storeId: id, database: "7001:16384" });
+    const epoch = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    await own.writeMarker({ storeId: id, database: "7001:16384", epoch });
+    expect(await own.readMarker()).toEqual({ storeId: id, database: "7001:16384", epoch });
     expect(statSync(join(fresh, STORE_MARKER)).mode & 0o777).toBe(0o600);
     await expect(
-      own.writeMarker("66666666-7777-4888-9999-aaaaaaaaaaaa", "7001:16384"),
+      own.writeMarker({ storeId: id, database: "7001:16384", epoch: id }),
     ).rejects.toThrow();
-    expect((await own.readMarker())?.storeId).toBe(id);
+    expect((await own.readMarker())?.epoch).toBe(epoch);
+    const next = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+    await own.replaceMarker({ storeId: id, database: "7001:16384", epoch: next });
+    expect((await own.readMarker())?.epoch).toBe(next);
+    const age = await own.markerAge();
+    expect(age).toBeGreaterThanOrEqual(0);
+    expect(age).toBeLessThan(60_000);
+    const past = new Date(Date.now() - 2 * 3600_000);
+    utimesSync(join(fresh, STORE_MARKER), past, past);
+    expect(await own.markerAge()).toBeGreaterThan(3600_000);
     expect(await own.markerInProgress()).toBe(false);
-    // The database line is added only to a marker of this install that has none.
-    await expect(own.recordDatabase(id, "7001:20000")).rejects.toThrow();
-    writeFileSync(join(fresh, STORE_MARKER), `${id}\n`);
-    expect(await own.readMarker()).toEqual({ storeId: id });
-    await expect(
-      own.recordDatabase("66666666-7777-4888-9999-aaaaaaaaaaaa", "7001:20000"),
-    ).rejects.toThrow();
-    await own.recordDatabase(id, "7001:20000");
-    expect(await own.readMarker()).toEqual({ storeId: id, database: "7001:20000" });
     // A marker that isn't one is an error, never taken as one.
     writeFileSync(join(fresh, STORE_MARKER), "../../etc\n");
     await expect(own.readMarker()).rejects.toThrow(/can't be read/);
-    writeFileSync(join(fresh, STORE_MARKER), `${id}\n7001:20000\n`);
+    writeFileSync(join(fresh, STORE_MARKER), `${id}\n7001:20000\nnot-an-epoch\n`);
+    await expect(own.readMarker()).rejects.toThrow(/can't be read/);
+    writeFileSync(join(fresh, STORE_MARKER), `${id}\n`);
+    expect(await own.readMarker()).toEqual({ storeId: id });
     // Another server's marker being written shows as in progress.
     writeFileSync(join(fresh, `${STORE_MARKER}.0123456789abcdef`), "");
     expect(await own.markerInProgress()).toBe(true);
@@ -345,7 +350,35 @@ describe("the second review's changes", () => {
     expect(() => {
       own.bind("../not-an-id");
     }).toThrow(TypeError);
-    expect(readdirSync(fresh)).toEqual([STORE_MARKER]);
+    rmSync(fresh, { recursive: true, force: true });
+  });
+
+  it("lets servers of one database share the folder and refuses a second database's", async () => {
+    const fresh = mkdtempSync(join(tmpdir(), "oculus-store-servers-"));
+    const own = await openFileStore({ dir: fresh });
+    const first = await own.claimServer("install|7001:16384|oculus|5432");
+    expect(first.ok).toBe(true);
+    // The same database (this process stands in for a second server of it).
+    const same = await own.claimServer("install|7001:16384|oculus|5432");
+    expect(same.ok).toBe(true);
+    // Another live server with another database: a stand-in entry for the
+    // parent process, which is alive.
+    const folder = join(fresh, ".oculus-servers");
+    const host = hostname()
+      .replace(/[^A-Za-z0-9.-]/g, "_")
+      .slice(0, 100);
+    writeFileSync(
+      join(folder, `${host}-${String(process.ppid)}`),
+      "install|7001:20000|copy|5432\n",
+    );
+    expect((await own.claimServer("install|7001:16384|oculus|5432")).ok).toBe(false);
+    // A server that has gone doesn't count.
+    rmSync(join(folder, `${host}-${String(process.ppid)}`));
+    writeFileSync(join(folder, `${host}-999999999`), "install|7001:20000|copy|5432\n");
+    expect((await own.claimServer("install|7001:16384|oculus|5432")).ok).toBe(true);
+    expect(existsSync(join(folder, `${host}-999999999`))).toBe(false);
+    if (first.ok) first.release();
+    expect(await own.isEmpty()).toBe(true);
     rmSync(fresh, { recursive: true, force: true });
   });
 
