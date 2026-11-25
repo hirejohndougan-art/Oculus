@@ -9,6 +9,14 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Review: one independent round, nothing blocking; fixed: a role on every site scoped to one unit no longer counts, and a viewer with no managed site sees no one (matching the SQL); unit tests for the rule.
 - Gate: PASS
 - Next: nothing claimed
+## 2026-11-25 02:35 CT — manual (Chat C) — T-050c OAI-PMH, and S-038 Cached public Subjects counts
+- Result: done (both)
+- What changed: T-050c: `packages/api/src/oai-pmh.ts` (`GET /oai` on public hosts, the six verbs, oai_dc only), `packages/db/src/oai.ts` (lists and datestamps on the staff connection), `oaiPmhReply` in file-replies.ts (the only way `text/xml` goes out), `ReadSlots` shared by the public routes, an `oai` rate bucket. S-038: `packages/api/src/public-subjects.ts` (background counts, `GET /subjects`), `GET /api/sites/:id/public-subjects`, `publicTermCountsForStaff`, a `terms` option and `publicOutputMarker` (public-terms.ts), `onClose` on `buildServer`, `countsDb` on `buildAdminServer`.
+- Decisions: D-105, D-106
+- Review: two independent rounds each. T-050c: paging that could repeat forever and a token that could carry a held-back record's ID (both fixed; tokens sealed), then smaller points. S-038: nothing blocking; stale counts, a public asOf showing staff activity, marker gaps, slow stop, recount pressure, the marker's time limit and the refusal back-off fixed.
+- Gate: PASS · tests_passing 4724 (was 4695) · npm audit clean
+- Next: S-041 (stored OAI-PMH datestamps) is filed.
+
 ## 2026-11-25 04:30 CT — Chat B — T-041d, T-041e, T-060a, T-063
 - Result: done (T-041b continues as T-041f, sharing on the public sites)
 - What changed: T-041d, shares over HTTP (`staff-api.ts`: a record's shares and offering it, a share's view and its four moves, a site's offers and shared items; an unknown share answers the same 404 as another organization's). T-041e, shares in the admin (`packages/admin/src/shares/`: a record's Sharing panel, each site's Shared with this site screen, a read-only view). T-060a, installs and rollbacks in the change log (migration 0030 `system_events`, written after each switch, shown to system managers only). T-063, the approval queue for reviewers who cover part of a site (John's Q-7: `recordsInState` walks scoped grants' subtrees in SQL).
