@@ -65,7 +65,7 @@ describe("append-only guards (0052)", () => {
           : table === "accession_versions"
             ? sql`TRUNCATE public.accession_versions`
             : sql`TRUNCATE public.second_step_alert_notices`;
-      expect(await refusedBy(statement)).toBe(`${table}_append_only`);
+      expect(await refusedBy(statement)).toBe(`${table}_no_truncate`);
     }
   });
 

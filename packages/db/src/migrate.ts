@@ -583,6 +583,18 @@ function timedOutOnLock(error: unknown): boolean {
   return (error.cause as { code?: unknown } | undefined)?.code === "55P03";
 }
 
+/** Whether the file's row is in the bookkeeping table (unknown counts as yes). */
+async function isRecorded(session: Session, file: MigrationFile): Promise<boolean> {
+  try {
+    const [row] = await session.rows<{ present: boolean }>(
+      sql`SELECT EXISTS (SELECT 1 FROM public.oculus_migrations WHERE name = ${file.name}) AS present`,
+    );
+    return row?.present !== false;
+  } catch {
+    return true;
+  }
+}
+
 function pause(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -711,7 +723,9 @@ export async function migrate(options: MigrateOptions): Promise<MigrateResult> {
               await applyOne(session, lock, file, fileLockTimeoutMs);
               break;
             } catch (error) {
-              if (!timedOutOnLock(error)) throw error;
+              // Never again a file that is in (a reset failing after its
+              // COMMIT, say), whatever the error's cause (S-065 review).
+              if (!timedOutOnLock(error) || (await isRecorded(session, file))) throw error;
               if (attempt >= fileLockAttempts) {
                 throw new MigrationError(
                   "file_lock_timeout",

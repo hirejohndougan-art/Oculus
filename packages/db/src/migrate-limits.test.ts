@@ -150,6 +150,40 @@ describe("time limits inside a migration file", () => {
     ]);
   });
 
+  it("never tries again a file that ended the runner's transaction, even on a lock timeout", async () => {
+    const db = await database();
+    const dir = migrationsDir({
+      "0002_table.sql": "CREATE TABLE busy (id int);\nCREATE TABLE once (id int);",
+    });
+    await migrate({ connectionString: db.url, dir });
+    const next = migrationsDir({
+      "0002_table.sql": "CREATE TABLE busy (id int);\nCREATE TABLE once (id int);",
+      "0003_commits.sql":
+        "INSERT INTO once VALUES (1);\nCOMMIT;\nSET lock_timeout = '100ms';\nALTER TABLE busy ADD COLUMN note text;",
+    });
+    const reader = await session(db.url);
+    await reader.control("BEGIN");
+    await reader.rows(sql`SELECT count(*) FROM public.busy`);
+    const log: string[] = [];
+    const error = await refusal(
+      migrate({
+        connectionString: db.url,
+        dir: next,
+        fileLockTimeoutMs: 100,
+        fileLockAttempts: 5,
+        fileLockPauseMs: 0,
+        log: (m) => log.push(m),
+      }),
+    );
+    await reader.control("ROLLBACK");
+    expect(error.code).toBe("transaction_ended");
+    expect(log.some((m) => m.includes("trying again"))).toBe(false);
+    const check = await session(db.url);
+    expect(
+      await check.rows<{ n: number }>(sql`SELECT count(*)::int AS n FROM public.once`),
+    ).toEqual([{ n: 1 }]);
+  });
+
   it("doesn't try again a file that fails for any other reason", async () => {
     const db = await database();
     const log: string[] = [];

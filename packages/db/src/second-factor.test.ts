@@ -1120,9 +1120,18 @@ describe("after a reset, only the emailed token lets anyone set up again (second
           SELECT public.second_step_token_required(${person.userId}::uuid) AS r`)
       )[0]?.r;
     expect(await required()).toBe(true);
-    // As the owner (the writer has no DELETE): the pass goes, the token stays.
-    await db.execute(sql`DELETE FROM public.second_step_passes
-      WHERE purpose = 'admin_reset' AND target_user_id = ${person.userId}::uuid`);
+    // As the owner (the writer has no DELETE), with 0052's guard off just
+    // for that (S-065): the pass goes, the token stays.
+    await db.transaction(async (q) => {
+      await q.execute(
+        sql`ALTER TABLE public.second_step_passes DISABLE TRIGGER second_step_passes_no_delete`,
+      );
+      await q.execute(sql`DELETE FROM public.second_step_passes
+        WHERE purpose = 'admin_reset' AND target_user_id = ${person.userId}::uuid`);
+      await q.execute(
+        sql`ALTER TABLE public.second_step_passes ENABLE ALWAYS TRIGGER second_step_passes_no_delete`,
+      );
+    });
     expect(await required()).toBe(true);
     const p = await pending(person.userId, org);
     expect(await startEnrolment(db, keys, p.token)).toMatchObject({
@@ -2107,6 +2116,7 @@ describe("the database promotes only with a real second step", () => {
       "second_factors.zzzz_second_factors_keep_identity",
       "second_step_passes.second_step_passes_append_only",
       "second_step_passes.second_step_passes_check_new",
+      "second_step_passes.second_step_passes_no_delete",
       "second_step_passes.second_step_passes_no_truncate",
       "second_step_recovery_codes.second_step_recovery_codes_check_change",
       "second_step_recovery_codes.second_step_recovery_codes_check_new",

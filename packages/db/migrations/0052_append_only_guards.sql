@@ -23,9 +23,11 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
+  -- The constraint named is the trigger's own name (`<table>_append_only`,
+  -- `<table>_no_truncate`, `<table>_no_delete`), so each refusal says which.
   RAISE EXCEPTION '% only grows.', TG_TABLE_NAME
     USING ERRCODE = 'integrity_constraint_violation',
-          CONSTRAINT = TG_TABLE_NAME || '_append_only';
+          CONSTRAINT = TG_NAME;
 END
 $$;
 
