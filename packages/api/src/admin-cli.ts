@@ -22,6 +22,7 @@ import { buildAdminServer, defaultLog } from "./admin-server.js";
 import { startAlertNotices, type AlertNoticeRunner } from "./alert-notices.js";
 import { mailerFromEnv, type Mailer } from "./mail.js";
 import { PUBLIC_DATABASE_URL_ENV } from "./public-sites.js";
+import { oaiPoolOptions } from "./oai-pmh.js";
 import { publicPoolOptions } from "./public-api.js";
 
 const DATABASE_URL_VARIABLE = "OCULUS_DATABASE_URL";
@@ -66,9 +67,12 @@ export async function runAdminCli(
     publicDb === undefined
       ? undefined
       : openDatabase(url, { applicationName: "oculus-counts", max: 1 });
+  // OAI-PMH's own pool on the staff role (S-051): a bounded wait for a
+  // connection and a client-side query limit, never the staff pool's queue.
+  const oaiDb = publicDb === undefined ? undefined : openDatabase(url, oaiPoolOptions());
   const closePools = async (): Promise<void> => {
     // All of them, whatever happens to any.
-    await Promise.allSettled([db.close(), publicDb?.close(), countsDb?.close()]);
+    await Promise.allSettled([db.close(), publicDb?.close(), countsDb?.close(), oaiDb?.close()]);
   };
   let mailer: Mailer | undefined;
   let notices: AlertNoticeRunner | undefined;
@@ -98,6 +102,7 @@ export async function runAdminCli(
       requestRestart: restart,
       ...(publicDb === undefined ? {} : { publicDb }),
       ...(countsDb === undefined ? {} : { countsDb }),
+      ...(oaiDb === undefined ? {} : { oaiDb }),
     });
     built = app;
     // "Someone is guessing your two-step codes" (D-077, D-085), every minute.
