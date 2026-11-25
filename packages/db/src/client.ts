@@ -43,6 +43,8 @@ export interface DatabaseOptions {
   max?: number;
   /** Name shown in pg_stat_activity. */
   applicationName?: string;
+  /** Give up connecting after this long (default: the URL's `connect_timeout`, else never). */
+  connectionTimeoutMillis?: number;
 }
 
 const OID = {
@@ -252,6 +254,9 @@ export function openDatabase(connectionString: string, options: DatabaseOptions 
     ...clientConfig(connectionString),
     max: options.max ?? 10,
     ...(options.applicationName === undefined ? {} : { application_name: options.applicationName }),
+    ...(options.connectionTimeoutMillis === undefined
+      ? {}
+      : { connectionTimeoutMillis: options.connectionTimeoutMillis }),
   });
   // An idle connection that fails (a server restart) is dropped by the pool;
   // without a listener the error would crash the process.
