@@ -88,7 +88,14 @@ export { restoreVersion, restoreReason, MAX_DESCENDANTS_WALKED } from "./record-
 export { recordCheckIssues, fixedMessages, linkedIds } from "./record-checks.js";
 export type { RecordCheckOptions } from "./record-checks.js";
 export { deleteRecord } from "./record-delete.js";
-export { listPublishedForOai, oaiDatestamp, oaiRepository, MAX_OAI_CANDIDATES } from "./oai.js";
+export {
+  listPublishedForOai,
+  oaiDatestamp,
+  oaiRepository,
+  oaiStoredStamp,
+  writeOaiStamps,
+  MAX_OAI_CANDIDATES,
+} from "./oai.js";
 export type { OaiCandidate, OaiListOptions } from "./oai.js";
 export {
   changeWorkflowState,

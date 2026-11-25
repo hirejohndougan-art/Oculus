@@ -32,6 +32,7 @@ const ALL_TABLES = [
   "identifier_holdings",
   "identifier_types",
   "invitations",
+  "oai_datestamps",
   "oculus_migrations",
   "organization_members",
   "organizations",
