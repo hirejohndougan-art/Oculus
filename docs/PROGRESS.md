@@ -7,8 +7,16 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - What changed: S-050 hardening (404 for an unknown share target, device names refused in update packages, a private updates folder, a Windows warning for a settings folder outside %APPDATA%, `failureClass` logging in `markKnownSource`, a comment fixed); S-049 public sites need an admin origin in every mode; U-007 the gate removes `packages/*/dist` first; S-031 setup checks applied migrations' names and hashes, refuses what the migrations never make, keeps the terminal quiet while migrating and names `template1` when extensions are the only contents; S-035's public side moved into T-058. Follow-up S-055 filed.
 - Decisions: D-090 amended (S-049)
 - Review: an independent review each for S-050, S-049 and S-031 (all safe; S-050's two small points and S-031's extension-detection gaps fixed; the rest is S-055)
-- Gate: see the next line
-- Next: Chat K's queue (T-018b with T-018a and S-013, then S-043b)
+- Gate: PASS · tests_passing see gate-baseline.json (was 5001) · npm audit clean
+- Next: Chat K's queue (T-018c, T-018d, then T-018b with T-018a and S-013)
+
+## 2026-11-25 10:40 CT — Chat J — S-036b Share limits and endings
+- Result: done (S-036 is now done)
+- What changed: migration 0043 (written as 0040; renumbered at merge: S-045 took 0040, and 0041–0042 are Chat A's): at most 100 open offers from one organization into one site, counting only offers whose record is published on a site now (`too_many_offers`), and no re-offer within 30 days of a decline (`declined_recently`), both in the share check under an advisory lock and only in Read Committed (OC061 otherwise); `record_shares` no longer cascades with its record, and triggers on `records` end live shares as `deleted` (record deleted) or `moved` (record moved onto the second site), keeping the decision; existing shares left live by earlier moves end as `moved`; `record_shares_target` in the lists' order. The service maps the limits (`MAX_OPEN_OFFERS`, `DECLINE_COOLDOWN_DAYS`), says `already_shared` first, and answers a record deleted mid-offer as missing; the admin names the new states and refusals.
+- Decisions: D-094 amended (S-036b)
+- Review: one independent round; nothing blocking. Fixed: hidden offers no longer fill a site's places, the count refuses non-Read-Committed writers, a deleted record mid-offer is `unknown_record`, the shadowed `found` variable, the amendment's wording; tests added for unanswered offers ending, the isolation check and unpublished offers freeing a place.
+- Gate: PASS (see the merge commit's raised baseline)
+- Next: none for Chat J (every other open job is Chat K's, John 2026-11-25 09:45 CT)
 
 ## 2026-11-25 10:30 CT — manual (Chat C) — S-046, S-047, S-051 OAI-PMH follow-ups
 
