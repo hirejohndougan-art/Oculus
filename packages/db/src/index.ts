@@ -363,6 +363,7 @@ export type {
 export {
   STARTER_TEMPLATE_FIELDS,
   STARTER_TEMPLATE_KEY,
+  databaseBeforeSetup,
   isEmptyInstall,
   setUpFirstInstall,
 } from "./first-setup.js";
