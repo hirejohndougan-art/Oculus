@@ -1,5 +1,5 @@
 -- Identifier changes are versions (S-061, D-061 and D-063 amended). Numbered
--- 0067, above main's 0058 and every number reserved on the work board.
+-- 0068, above main's 0058 and every number reserved on the work board.
 --
 -- Before this, saving only a record's identifiers (its current and former
 -- numbers) wrote no version: History and the audit trail didn't show it,
@@ -13,7 +13,7 @@
 --    was written, by type key: {"<type>": {"current": [{value, primary}],
 --    "former": [{value, retiredAt?, note?}]}} in their stored order. Filled
 --    in by the database (zzzz_record_versions_check), never the writer.
---    Versions written before 0067 keep NULL (not known). Staff-only, like
+--    Versions written before 0068 keep NULL (not known). Staff-only, like
 --    the rest of the table; nothing reads it to the public.
 -- 2. A save's changed_fields also names `identifiers.<type>` for every type
 --    whose numbers differ from the version before (when that version has a
@@ -158,7 +158,7 @@ BEGIN
     WHERE (NEW.record -> 'fields' -> k) IS DISTINCT FROM (previous -> 'fields' -> k)
     UNION ALL
     -- A save that changes the record's numbers names each type changed
-    -- (S-061). Not after a version written before 0067 (no snapshot to
+    -- (S-061). Not after a version written before 0068 (no snapshot to
     -- compare with), and never for a deletion (its changedFields stay empty).
     SELECT 'identifiers.' || k
     FROM (SELECT jsonb_object_keys(NEW.identifiers) AS k
