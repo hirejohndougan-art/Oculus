@@ -82,7 +82,7 @@ export async function runHoldsCli(
         // Only the SQLSTATE: a database message can quote a value.
         const code =
           typeof error === "object" && error !== null && "code" in error
-            ? String((error as { code: unknown }).code)
+            ? String(error.code)
             : "unknown";
         io.err(`An error (${code}) while checking a record; it was left as it was.`);
       },

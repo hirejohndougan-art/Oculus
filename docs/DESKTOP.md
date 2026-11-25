@@ -26,6 +26,7 @@ Double-click `scripts\start-oculus.cmd` in the Oculus folder. To make a desktop 
 
 - The first time, and after each update, it installs and builds Oculus first (a few minutes).
 - **The very first time** it then sets up Oculus's database (T-057). It asks for the `postgres` password you chose when installing PostgreSQL (used once, never saved), then your organization's name, the first site's name, and your name, email and the password you'll sign in with. It makes two accounts in PostgreSQL just for Oculus, with long random passwords kept in `%APPDATA%\postgresql\pgpass.conf`, and writes `%APPDATA%\Oculus\desktop.json`. If making the database goes wrong, it removes what it made, so you can simply try again. If a setup answer goes wrong (say the two passwords don't match), the database is kept and the next double-click asks the setup questions again.
+- Each start also checks access restrictions (T-034f): records whose restriction ended are put back on the public site, and records a new restriction or unsigned deed holds back are taken off it. Each change shows in the record's history.
 - Oculus opens in its own window at the sign-in screen. At your first sign-in you set up two-step sign-in with an authenticator app on your phone.
 - **Closing the Oculus window stops Oculus.** The black window behind it is Oculus running; leave it open while you work.
 - Starting it again while it's open just opens another window.

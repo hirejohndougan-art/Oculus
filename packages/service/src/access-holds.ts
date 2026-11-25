@@ -155,7 +155,7 @@ export async function applyAccessHolds(
   db: Database,
   options: AccessHoldsOptions,
 ): Promise<AccessHoldsReport> {
-  const apply = options.apply === true;
+  const apply = options.apply;
   const attempts = Math.max(1, Math.trunc(options.attempts ?? 3));
   const limit = Math.max(
     1,
