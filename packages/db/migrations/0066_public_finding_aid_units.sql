@@ -1,5 +1,5 @@
--- Public EAD exports (T-059b, D-120). Numbered 0056: 0050 to 0055 are
--- reserved by other chats' unmerged work (see the work board).
+-- Public EAD exports (T-059b, D-120). Numbered 0066: above main's 0058 and every
+-- number other chats hold on the work board (up to 0065, 2026-11-25 17:30 CT).
 --
 -- A finding aid's "Download EAD" on a public host needs the archival units
 -- below a unit, and the public reader (D-080) can read no table. This
