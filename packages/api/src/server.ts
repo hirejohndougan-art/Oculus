@@ -67,6 +67,14 @@
  *    (`ADMIN_SECURITY_HEADERS`) in place of the API's; every other reply
  *    keeps `SECURITY_HEADERS`.
  *
+ * 11. Files (file-replies.ts, M-001, D-089): a handler sends a stored file's
+ *    bytes only by returning `fileReply(...)`, which decides the Content-Type
+ *    (never an active stored type), the Content-Disposition and the length;
+ *    its reply gets `FILE_SECURITY_HEADERS` (nosniff, a sandboxing CSP,
+ *    same-origin CORP) and nothing the handler set, cookies included. A
+ *    streamed file is sent on the hijacked response, outside the handler
+ *    timeout but within `timeouts.download`, and closing the server stops it.
+ *
  * Adding another Fastify plugin, parser or error handler is its own decision
  * (D-051).
  */
@@ -93,6 +101,13 @@ import {
   summarizeThrown,
   type ThrownSummary,
 } from "./errors.js";
+import {
+  FILE_SECURITY_HEADERS,
+  MAX_DOWNLOAD_MS,
+  isFileReply,
+  sendFileStream,
+  type FileReply,
+} from "./file-replies.js";
 import { SECURITY_HEADERS } from "./headers.js";
 import { failsOriginCheck, originsFromEnv } from "./origin.js";
 import { RouteTable, pathOf, pathProblem } from "./paths.js";
@@ -121,6 +136,8 @@ export interface ServerTimeouts {
   readonly keepAlive: number;
   /** A handler that runs longer is answered with 503. */
   readonly handler: number;
+  /** A streamed file download (file-replies.ts) is cut off after this. */
+  readonly download: number;
 }
 
 /**
@@ -142,6 +159,7 @@ export const SERVER_TIMEOUTS: ServerTimeouts = {
   headers: 10_000,
   keepAlive: 5_000,
   handler: 30_000,
+  download: MAX_DOWNLOAD_MS,
 };
 
 /** How often Node checks the request and headers timeouts (its default is 30 s). */
@@ -277,6 +295,9 @@ function logLateFailure(request: FastifyRequest, fresh: Refusal, thrown: unknown
   }
 }
 
+/** Requests answered with a file (M-001, D-089): they get `FILE_SECURITY_HEADERS` in onSend. */
+const fileReplies = new WeakSet<FastifyRequest>();
+
 /**
  * Upload requests whose body wasn't read to its end: their connection is
  * closed after the reply (onSend adds `Connection: close`), so the rest of
@@ -366,7 +387,14 @@ function declaredLength(header: string | undefined): number | undefined {
  * result or failure is never handed to Fastify (which would log the request
  * URL, query string included, and the error object).
  */
-function addRoute(app: FastifyInstance, route: OculusRoute, uploadHandlerMs: number): void {
+function addRoute(
+  app: FastifyInstance,
+  route: OculusRoute,
+  downloadMs: number,
+  downloads: Set<{ stop: () => void }>,
+  downloadsClosed: { value: boolean },
+  uploadHandlerMs: number,
+): void {
   const credentials = route.credentials === true;
   const handler = route.handler;
   app.route({
@@ -396,14 +424,16 @@ function addRoute(app: FastifyInstance, route: OculusRoute, uploadHandlerMs: num
           ? undefined
           : uploadView(request, route.upload.maxBytes, controller.signal);
       let body: unknown;
+      let file: FileReply | undefined;
       try {
         const result: unknown = await handler(
           oculusRequest(request, controller.signal, upload),
           oculusReply(reply, () => running),
         );
+        if (isFileReply(result)) file = result;
         // Copied as plain data before Fastify sees it: a Response, stream or
         // Buffer would skip the header checks below (routes.ts).
-        body = resultBody(result);
+        else body = resultBody(result);
       } catch (thrown) {
         const fresh = rebuildThrown(thrown);
         if (ended()) {
@@ -421,6 +451,44 @@ function addRoute(app: FastifyInstance, route: OculusRoute, uploadHandlerMs: num
       }
       // Timed out (the 503 is already sent) or the client has gone.
       if (ended()) return undefined;
+      if (file !== undefined) {
+        // A file (file-replies.ts): exactly its own headers, whatever the
+        // handler set, always a 200, with the file headers.
+        for (const name of Object.keys(reply.getHeaders())) reply.removeHeader(name);
+        if (file.body instanceof Uint8Array) {
+          fileReplies.add(request);
+          return reply.code(200).headers(file.headers).send(file.body);
+        }
+        // Closing: no new download starts (one already running is stopped).
+        if (downloadsClosed.value) {
+          return reply.code(503).header("connection", "close").send({ error: "unavailable" });
+        }
+        // A stream: sent on the raw response, outside the handler timeout,
+        // within the download deadline, and stopped if the server closes.
+        void reply.hijack();
+        const entry: { sending?: { stop: () => void }; over?: true } = {};
+        const sending = sendFileStream(
+          reply.raw,
+          request.method,
+          { ...file.headers, ...FILE_SECURITY_HEADERS },
+          SECURITY_HEADERS,
+          file,
+          downloadMs,
+          (why) => {
+            entry.over = true;
+            if (entry.sending !== undefined) downloads.delete(entry.sending);
+            // A client going away is ordinary (seeking, leaving the page).
+            if (why !== "done" && why !== "client") {
+              request.log.warn({ failure: { code: `file_stream_${why}` } }, "file reply cut off");
+            }
+          },
+        );
+        if (entry.over === undefined) {
+          entry.sending = sending;
+          downloads.add(sending);
+        }
+        return undefined;
+      }
       return reply.send(body);
     },
   });
@@ -660,7 +728,11 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
       reply.removeHeader("set-cookie");
       throw new Error("a Set-Cookie header broke the cookie rules");
     }
-    const headers = adminReplies.has(request) ? ADMIN_SECURITY_HEADERS : SECURITY_HEADERS;
+    const headers = adminReplies.has(request)
+      ? ADMIN_SECURITY_HEADERS
+      : fileReplies.has(request)
+        ? FILE_SECURITY_HEADERS
+        : SECURITY_HEADERS;
     for (const [name, value] of Object.entries(headers)) void reply.header(name, value);
     // An upload not read to its end (refused before or while streaming).
     if (unfinishedUploads.has(request)) void reply.header("connection", "close");
@@ -686,6 +758,7 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
       }
       // Nothing the handler set (headers, cookies, Location) goes out with an error.
       for (const name of Object.keys(reply.getHeaders())) reply.removeHeader(name);
+      fileReplies.delete(request);
       return reply.code(statusCode).type("application/json; charset=utf-8").send(body);
     } catch {
       sendFallback(reply);
@@ -718,12 +791,20 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
       .send({ error: wrongMethod ? "method_not_allowed" : "not_found" });
   });
 
-  addRoute(
-    app,
-    checkRoute({ method: "GET", path: "/health", handler: () => ({ status: "ok" }) }),
-    uploadTimeouts.request,
-  );
-  for (const route of appRoutes) addRoute(app, route, uploadTimeouts.request);
+  // Streamed downloads in flight (file-replies.ts): stopped when the server
+  // closes, so a slow reader can't hold shutdown open.
+  const downloads = new Set<{ stop: () => void }>();
+  const downloadsClosed = { value: false };
+  app.addHook("preClose", (done) => {
+    downloadsClosed.value = true;
+    for (const download of [...downloads]) download.stop();
+    done();
+  });
+  const health = checkRoute({ method: "GET", path: "/health", handler: () => ({ status: "ok" }) });
+  addRoute(app, health, timeouts.download, downloads, downloadsClosed, uploadTimeouts.request);
+  for (const route of appRoutes) {
+    addRoute(app, route, timeouts.download, downloads, downloadsClosed, uploadTimeouts.request);
+  }
 
   await app.ready();
   return app;

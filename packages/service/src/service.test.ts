@@ -1770,6 +1770,86 @@ describe("restoring a version under another template (T-012a review)", () => {
   });
 });
 
+describe("restore's retry path (S-030)", () => {
+  /**
+   * The writer, except that just before the restore takes the record's row
+   * lock (`FOR NO KEY UPDATE` on records) another session saves the record,
+   * `times` times in all: the record moves between the unlocked first look
+   * and the lock.
+   */
+  function movingDb(org: OrganizationId, id: RecordId, times: number): Database {
+    let left = times;
+    const wrap = (tx: Queryable): Queryable => ({
+      rows: async (q) => {
+        if (left > 0 && q.text.includes("FOR NO KEY UPDATE") && q.text.includes("public.records")) {
+          left -= 1;
+          const now = ok(await readStoredRecord(s.owner, org, id));
+          ok(
+            await service2.updateRecord(
+              ctx(org, BOB),
+              id,
+              draftOf(now.record, { title: `Moved ${String(times - left)}` }),
+              { expectedVersion: now.version },
+            ),
+          );
+        }
+        return tx.rows(q);
+      },
+      execute: (q) => tx.execute(q),
+    });
+    return {
+      rows: (q) => s.writer.rows(q),
+      execute: (q) => s.writer.execute(q),
+      close: () => Promise.resolve(),
+      transaction: (work) => s.writer.transaction((tx) => work(wrap(tx))),
+    };
+  }
+
+  it("ends with retry after its attempts when the record moves under it, and writes nothing", async () => {
+    await ready();
+    const org = await organization();
+    const record = await create(org, objectDraft());
+    // The person saw version 2: the save landing between the look and the
+    // lock makes it version 2, so the lock decision made on version 1 is stale.
+    const result = await createService(movingDb(org, record.id, 1), {
+      now: () => NOW,
+      attempts: 1,
+    }).restoreVersion(ctx(org), record.id, 1, { expectedVersion: 2 });
+    expect(codes(result)).toEqual(["retry"]);
+    // Only the other session's save: no restore was written.
+    expect(await versionCount(org, record.id)).toBe(2);
+    expect(ok(await readStoredRecord(s.owner, org, record.id)).record.title).toBe("Moved 1");
+  });
+
+  it("succeeds on the next attempt once the record holds still", async () => {
+    await ready();
+    const org = await organization();
+    const record = await create(org, objectDraft());
+    const restored = await createService(movingDb(org, record.id, 1), {
+      now: () => NOW,
+      attempts: 2,
+    }).restoreVersion(ctx(org), record.id, 1, { expectedVersion: 2 });
+    expect(restored.ok).toBe(true);
+    expect(await versionCount(org, record.id)).toBe(3);
+    expect(ok(await readStoredRecord(s.owner, org, record.id)).record.title).toBe(record.title);
+  });
+
+  it("stops at its attempts when the record keeps moving: a conflict, nothing written", async () => {
+    await ready();
+    const org = await organization();
+    const record = await create(org, objectDraft());
+    // Moving again on the second attempt takes it past the version the
+    // person saw: the database's own check refuses it as a conflict.
+    const result = await createService(movingDb(org, record.id, 3), {
+      now: () => NOW,
+      attempts: 3,
+    }).restoreVersion(ctx(org), record.id, 1, { expectedVersion: 2 });
+    expect(result.ok).toBe(false);
+    expect(codes(result)).toEqual(["version_conflict"]);
+    expect(await versionCount(org, record.id)).toBe(3);
+  });
+});
+
 describe("updating records", () => {
   it("writes the next version with updatedAt never going backwards, and refreshes the terms", async () => {
     await ready();

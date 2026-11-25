@@ -28,6 +28,7 @@
     "baseline": "node scripts/check-baseline.mjs",
     "gate": "node scripts/gate.mjs",
     "admin": "node packages/api/dist/admin-cli.js",
+    "desktop": "node packages/api/dist/desktop-cli.js",
     "e2e": "npm run build && npm run e2e -w @oculus/admin"
   },
   "devDependencies": {

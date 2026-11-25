@@ -1,75 +1,136 @@
-// Files on a digital asset (M-002, D-086) in a real browser against the
-// built admin and a throwaway database and files folder, by keyboard only:
-// a Scanner signs in, opens the site's invented photograph record, adds an
-// image through the file chooser opened with Enter, watches it go up and
-// sees it listed with the type Oculus found in its bytes. Siteimprove Alfa's
-// rules run before and after; no CSP refusal or script error may happen.
-// With OCULUS_E2E_SHOTS set, screenshots are saved in that folder.
-import { join } from "node:path";
-import { expect, test, type FileChooser, type Page } from "@playwright/test";
-import { accessible, collectErrors, seed, signInAndSetUp } from "./helpers";
+// M-001 (D-089) in a real browser: a stored HTML or SVG file that carries
+// script can't run it, whether a page on another origin (a public site)
+// frames, embeds or links it, or someone opens it directly; and an SVG
+// stored under a raster type is never rendered as SVG. Framing and embedding
+// are stopped by several of the file headers together (frame-ancestors,
+// CORP, the sandbox, the download type); the unit tests check each header,
+// and opening a file directly shows the download rule on its own. The file server here
+// is Oculus's own (`buildServer` with `fileReply` routes), on its own port.
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
+import { expect, test } from "@playwright/test";
+import { buildServer, fileReply } from "@oculus/api";
 
-/** A real 1×1 PNG (one invented grey pixel). */
-const PIXEL = Buffer.from(
-  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
-  "base64",
-);
+const SCRIPT = "parent.postMessage('ran','*');top.postMessage('ran','*');document.title='ran';";
+const FILES = {
+  "/files/page.html": {
+    mediaType: "text/html",
+    bytes: `<!doctype html><title>x</title><script>${SCRIPT}</script><img src=x onerror="${SCRIPT}">`,
+  },
+  "/files/drawing.svg": {
+    mediaType: "image/svg+xml",
+    bytes: `<svg xmlns="http://www.w3.org/2000/svg" onload="${SCRIPT}"><script>${SCRIPT}</script></svg>`,
+  },
+  "/files/page.xhtml": {
+    mediaType: "application/xhtml+xml",
+    bytes: `<html xmlns="http://www.w3.org/1999/xhtml"><body><script>${SCRIPT}</script></body></html>`,
+  },
+  // SVG bytes stored under a raster type, asked for inline.
+  "/files/liar.png": {
+    mediaType: "image/png",
+    bytes: `<svg xmlns="http://www.w3.org/2000/svg" onload="${SCRIPT}"><script>${SCRIPT}</script></svg>`,
+  },
+} as const;
 
-async function shot(page: Page, name: string): Promise<void> {
-  const dir = process.env.OCULUS_E2E_SHOTS;
-  if (dir === undefined || dir === "") return;
-  await page.screenshot({ path: join(dir, `${name}.png`), fullPage: true });
-}
+let base = "";
+let close: (() => Promise<void>) | undefined;
+/** A stand-in public site: a real server on another port, so another origin. */
+let publicSite: Server | undefined;
+let publicBase = "";
+let publicPage = "";
+const fetched = new Map<string, number>();
 
-test("a Scanner adds an image to a digital asset by keyboard", async ({ page }) => {
-  const { scannerEmail, password, siteName, assetTitle } = seed();
-  const errors = collectErrors(page);
-  // Listen for the file chooser from the start: Playwright turns on its
-  // interception when the first listener is added, which takes a round
-  // trip; added just before the key press, a fast press can beat it.
-  let chooserOpened: (chooser: FileChooser) => void = () => undefined;
-  const chooser = new Promise<FileChooser>((resolve) => {
-    chooserOpened = resolve;
+test.beforeAll(async () => {
+  const placeholder = "http://127.0.0.1:1";
+  // The origin is known only once listening, and the Origin check reads it at
+  // build time: listen on a free port first, then build for that port.
+  const probe = await buildServer({ env: { OCULUS_ORIGINS: placeholder } });
+  await probe.listen({ host: "127.0.0.1", port: 0 });
+  const port = (probe.server.address() as AddressInfo).port;
+  await probe.close();
+  base = `http://127.0.0.1:${String(port)}`;
+  const app = await buildServer({
+    env: { OCULUS_ORIGINS: base },
+    routes: Object.entries(FILES).map(([path, file]) => ({
+      method: "GET" as const,
+      path,
+      handler: () => {
+        fetched.set(path, (fetched.get(path) ?? 0) + 1);
+        const bytes = Buffer.from(file.bytes);
+        return fileReply({
+          body: bytes,
+          size: bytes.byteLength,
+          mediaType: file.mediaType,
+          fileName: path.slice(path.lastIndexOf("/") + 1),
+          disposition: "inline",
+        });
+      },
+    })),
   });
-  page.on("filechooser", (opened) => {
-    chooserOpened(opened);
+  await app.listen({ host: "127.0.0.1", port });
+  close = () => app.close();
+  publicSite = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    response.end(publicPage);
   });
-  await signInAndSetUp(page, scannerEmail, password);
+  await new Promise<void>((resolve) => publicSite?.listen(0, "127.0.0.1", resolve));
+  publicBase = `http://localhost:${String((publicSite.address() as AddressInfo).port)}`;
+});
 
-  await expect(page.getByRole("heading", { level: 1, name: siteName })).toBeVisible();
-  const link = page.getByRole("link", { name: assetTitle, exact: true });
-  await link.focus();
-  await page.keyboard.press("Enter");
-  await expect(page.getByRole("heading", { level: 1, name: assetTitle })).toBeVisible();
+test.afterAll(async () => {
+  await close?.();
+  await new Promise((resolve) => publicSite?.close(resolve));
+});
 
-  const files = page.getByRole("region", { name: "Files" });
-  await expect(files.getByText("No files yet.")).toBeVisible();
-  await accessible(page, "Asset with no files");
-  await shot(page, "01-asset-no-files");
+test("a public page can't run a stored file's script by framing or embedding it", async ({
+  page,
+}) => {
+  const tags = Object.keys(FILES)
+    .map((path) => {
+      const url = `${base}${path}`;
+      return [
+        `<iframe src="${url}"></iframe>`,
+        `<iframe sandbox="allow-scripts" src="${url}"></iframe>`,
+        `<object data="${url}"></object>`,
+        `<embed src="${url}">`,
+        `<img src="${url}" alt="">`,
+      ].join("");
+    })
+    .join("");
+  // A frame that is allowed to run script proves the listener works.
+  publicPage = `<!doctype html><title>Public site</title><script>
+        window.ran = 0;
+        addEventListener("message", (event) => {
+          if (event.data === "control") window.control = true; else window.ran++;
+        });
+      </script><iframe srcdoc="<script>parent.postMessage('control','*')</script>"></iframe>${tags}`;
+  page.on("download", (download) => void download.cancel());
+  await page.goto(`${publicBase}/`);
+  await page.waitForTimeout(2000);
+  expect(await page.evaluate(() => (window as unknown as { control?: true }).control)).toBe(true);
+  // Every file was really requested from Oculus, by several of the tags
+  // (not blocked before reaching it).
+  expect(fetched.size).toBe(Object.keys(FILES).length);
+  for (const count of fetched.values()) expect(count).toBeGreaterThanOrEqual(2);
+  expect(await page.evaluate(() => (window as unknown as { ran: number }).ran)).toBe(0);
+  expect(await page.title()).toBe("Public site");
+});
 
-  // The file chooser opens from the keyboard.
-  const add = files.getByRole("button", { name: "Add files" });
-  await add.focus();
-  await page.keyboard.press("Enter");
-  const picker = await chooser;
-  expect(picker.isMultiple()).toBe(true);
-  const sent = page.waitForResponse(
-    (r) => /\/api\/records\/[0-9a-f-]{36}\/files$/.test(r.url()) && r.request().method() === "POST",
-  );
-  // The browser's guess at the type is a lie; the server reads the bytes.
-  await picker.setFiles({ name: "depot photograph.png", mimeType: "image/jpeg", buffer: PIXEL });
-  expect((await sent).status()).toBe(201);
+test("opening a stored HTML or SVG file downloads it rather than showing it", async ({ page }) => {
+  for (const path of ["/files/page.html", "/files/drawing.svg", "/files/page.xhtml"]) {
+    const downloading = page.waitForEvent("download");
+    await page.goto(`${base}${path}`).catch(() => undefined); // "Download is starting"
+    const download = await downloading;
+    expect(download.suggestedFilename()).toBe(path.slice(path.lastIndexOf("/") + 1));
+    await download.cancel();
+  }
+});
 
-  await expect(files.getByText("1 added.")).toBeVisible();
-  await expect(
-    files.getByRole("progressbar", { name: "Upload of depot photograph.png" }),
-  ).toBeVisible();
-  const table = files.getByRole("table", { name: "Files on this record" });
-  const row = table.getByRole("row", { name: /depot photograph\.png/ });
-  await expect(row).toContainText("image/png");
-  await expect(row).toContainText("bytes");
-  await accessible(page, "Asset with a file");
-  await shot(page, "02-asset-with-file");
-
-  expect(errors).toEqual([]);
+test("SVG stored as a PNG is not rendered as SVG and runs nothing", async ({ page }) => {
+  const response = await page.goto(`${base}/files/liar.png`);
+  expect(response?.headers()["content-type"]).toBe("image/png");
+  expect(response?.headers()["content-security-policy"]).toContain("sandbox");
+  await page.waitForTimeout(1000);
+  expect(await page.title()).not.toBe("ran");
+  expect(await page.locator("svg").count()).toBe(0);
 });
