@@ -3,7 +3,8 @@
 // signs in, searches the site's records, opens one, edits it, meets an edit
 // conflict made by "someone else" (a save through the API meanwhile) and
 // reloads, saves, publishes, reads the history and restores the first
-// version (confirming the public values it changes). Siteimprove Alfa's
+// version (confirming the public values it changes), then opens the
+// site's shared items. Siteimprove Alfa's
 // rules run on each new screen and state; no CSP refusal or script error
 // may happen on the way.
 import { expect, test, type Page } from "@playwright/test";
@@ -128,6 +129,16 @@ test("find a record, edit it, meet a conflict, publish, read its history and res
   await expect(page.getByRole("heading", { level: 1, name: siteName })).toBeVisible();
   const row = page.getByRole("row", { name: new RegExp(recordTitle) });
   await expect(row.getByText("Published")).toBeVisible();
+
+  // Items shared with the site (T-041e): none yet.
+  await press(page, "Shared with this site", "link");
+  await expect(
+    page.getByRole("heading", { level: 1, name: "Shared with this site" }),
+  ).toBeVisible();
+  await expect(
+    page.getByText(/Nothing is shared with this site yet|Only people who can see/),
+  ).toBeVisible();
+  await accessible(page, "Shared with this site");
 
   expect(errors).toEqual([]);
 });
