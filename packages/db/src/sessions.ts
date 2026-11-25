@@ -1243,19 +1243,21 @@ export async function runCleanup(db: Queryable): Promise<CleanupResult> {
   // failure; a waiting session's counter is useless once the session is gone.
   // A person's unexplained wrong codes (`wrong:`, S-045) an hour old can't
   // be explained any more (a waiting session lives 10 minutes): they are told
-  // now, as an alert, and taken off; the row itself is kept 30 days.
+  // now, as an alert, and taken off, in a new round so no session's share
+  // of them is taken off again (S-054b); the row itself is kept 30 days.
   const told = await db.rows<{ n: number }>(sql`
     WITH old AS (
-      SELECT key, failures FROM public.second_step_throttles
+      SELECT key, failures, last_failure_at FROM public.second_step_throttles
       WHERE key LIKE 'wrong:%' AND failures > 0
         AND last_failure_at < clock_timestamp() - make_interval(secs => ${UNEXPLAINED_TOLD_AFTER_SECONDS})
       ORDER BY key FOR UPDATE
     ), cleared AS (
-      UPDATE public.second_step_throttles t SET failures = 0
-      FROM old WHERE t.key = old.key RETURNING old.key, old.failures
+      UPDATE public.second_step_throttles t SET failures = 0, told_round = t.told_round + 1
+      FROM old WHERE t.key = old.key RETURNING old.key, old.failures, old.last_failure_at
     ), alerted AS (
-      INSERT INTO public.second_step_alerts (id, user_id, failures)
-      SELECT gen_random_uuid(), u.id, c.failures
+      -- last_code_at: when the newest of the codes was typed (S-054c).
+      INSERT INTO public.second_step_alerts (id, user_id, failures, last_code_at)
+      SELECT gen_random_uuid(), u.id, c.failures, c.last_failure_at
       FROM cleared c JOIN public.users u ON 'wrong:' || u.id::text = c.key
       RETURNING 1
     )

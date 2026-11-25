@@ -1747,7 +1747,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
               ),
             );
           }
-          // Who the definition change log names (migration 0051, D-117):
+          // Who the definition change log names (migration 0058, D-117):
           // its triggers read this for the rest of the transaction only.
           await tx.rows(
             sql`SELECT pg_catalog.set_config('oculus.actor', ${who.value.actor}, true)`,

@@ -1,4 +1,4 @@
-// Definitions in the change log (S-064, D-117, migration 0051): every
+// Definitions in the change log (S-064, D-117, migration 0058): every
 // INSERT or UPDATE of an identifier type, term, site, the storage levels or
 // a location, a Dublin Core mapping or the System settings writes a row in
 // the same transaction, naming `oculus.actor` (or the row's own editor);
@@ -222,7 +222,7 @@ describe("definition_events", () => {
     expect(await count()).toBe(before);
   });
 
-  it("still logs in replica mode, and has every 0051 trigger enabled ALWAYS", async () => {
+  it("still logs in replica mode, and has every 0058 trigger enabled ALWAYS", async () => {
     const before = (await events("site")).length;
     await db.transaction(async (q) => {
       await q.execute(sql`SET LOCAL session_replication_role = replica`);

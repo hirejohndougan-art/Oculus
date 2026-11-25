@@ -866,6 +866,107 @@ describe("wrong codes no right code explained raise an alert (S-045)", () => {
     expect(await unexplained(old.userId)).toBe(0);
   });
 
+  /** How many hours before now each alert's newest code was typed (S-054c), oldest alert first. */
+  async function codeAgesOf(userId: UserId): Promise<(number | null)[]> {
+    return (
+      await db.rows<{ hours: number | null }>(sql`
+        SELECT (extract(epoch FROM clock_timestamp() - last_code_at) / 3600)::float8 AS hours
+        FROM public.second_step_alerts WHERE user_id = ${userId}::uuid
+        ORDER BY created_at, id`)
+    ).map((x) => (x.hours === null ? null : Math.round(x.hours)));
+  }
+
+  it("the wait's alert carries the unexplained codes its day's count doesn't have (S-054c)", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    // Four codes today (one short of a wait), and six other unexplained codes
+    // the day's count doesn't have (left, say, before a full session's right
+    // code cleared the person's counter, with no cleanup run since).
+    await db.execute(sql`
+      INSERT INTO public.second_step_throttles (key, failures, last_failure_at)
+      VALUES (${`user:${person.userId}`}, 4, clock_timestamp() - interval '10 minutes'),
+             (${`wrong:${person.userId}`}, 6, clock_timestamp() - interval '20 minutes')`);
+    const a = await pending(person.userId, org);
+    expect(
+      await completeSecondStep(db, keys, a.token, {
+        source: source(),
+        code: await wrongFor(person.userId),
+      }),
+    ).toMatchObject({ code: "invalid_code" });
+    // The 5th of the day starts the wait. Its alert used to say 5 and take
+    // all 7 unexplained codes off the counter, so 2 were never told.
+    expect(await alertsOf(person.userId)).toEqual([7]);
+    expect(await unexplained(person.userId)).toBe(0);
+    // Nothing is told twice: not by the cleanup, nor by the next sign-in.
+    await later(person.userId, 25);
+    await runCleanup(db);
+    await full(person.userId, org);
+    expect(await alertsOf(person.userId)).toEqual([7]);
+  });
+
+  it("the wait's alert says the day's count when that is the larger (S-054c)", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    // A full session's wrong re-entry codes count for the day, not as unexplained.
+    const s = await full(person.userId, org);
+    for (let i = 0; i < 4; i++) {
+      await reauthenticate(db, keys, s.token, {
+        password: PASSWORD,
+        source: source(),
+        code: await wrongFor(person.userId),
+      });
+    }
+    expect(await unexplained(person.userId)).toBe(0);
+    const a = await pending(person.userId, org);
+    await completeSecondStep(db, keys, a.token, {
+      source: source(),
+      code: await wrongFor(person.userId),
+    });
+    expect(await alertsOf(person.userId)).toEqual([5]);
+    expect(await unexplained(person.userId)).toBe(0);
+  });
+
+  it("each alert keeps when its newest code was typed, which the notice gives (S-054c)", async () => {
+    await ready();
+    const org = await organization();
+    const told = await member(org);
+    const cleaned = await member(org);
+    const waited = await member(org);
+    // A sign-in's first code tells codes another session left a day before:
+    // the alert is written now, but the codes are from then.
+    const a = await pending(told.userId, org);
+    for (let i = 0; i < 2; i++) {
+      await completeSecondStep(db, keys, a.token, {
+        source: source(),
+        code: await wrongFor(told.userId),
+      });
+    }
+    await later(told.userId, 25);
+    await full(told.userId, org);
+    expect(await alertsOf(told.userId)).toEqual([2]);
+    expect(await codeAgesOf(told.userId)).toEqual([25]);
+    // The cleanup tells codes three hours old: their time, not the cleanup's.
+    const b = await pending(cleaned.userId, org);
+    await completeSecondStep(db, keys, b.token, {
+      source: source(),
+      code: await wrongFor(cleaned.userId),
+    });
+    await later(cleaned.userId, 3);
+    await runCleanup(db);
+    expect(await alertsOf(cleaned.userId)).toEqual([1]);
+    expect(await codeAgesOf(cleaned.userId)).toEqual([3]);
+    // A wait's alert is about the code that started it: now.
+    const c = await pending(waited.userId, org);
+    const wrong = await wrongFor(waited.userId);
+    for (let i = 0; i < 5; i++) {
+      await completeSecondStep(db, keys, c.token, { source: source(), code: wrong });
+    }
+    expect(await alertsOf(waited.userId)).toEqual([5]);
+    expect(await codeAgesOf(waited.userId)).toEqual([0]);
+  });
+
   it("doesn't count a signed-in person's re-entry codes, which come after a whole sign-in", async () => {
     await ready();
     const org = await organization();
@@ -2569,5 +2670,236 @@ describe("wrong-code counters are changed in key order, and a reset forgets unex
     const alerts = await db.rows(sql`
       SELECT 1 FROM public.second_step_alerts WHERE user_id = ${person.userId}::uuid`);
     expect(alerts).toEqual([]);
+  });
+});
+
+describe("each sign-in's own unexplained codes, counted once known wrong (S-054b)", () => {
+  async function alertsOf(userId: UserId): Promise<number[]> {
+    return (
+      await db.rows<{ failures: number }>(sql`
+        SELECT failures FROM public.second_step_alerts WHERE user_id = ${userId}::uuid
+        ORDER BY created_at, id`)
+    ).map((x) => x.failures);
+  }
+  async function unexplained(userId: UserId): Promise<number> {
+    const rows = await db.rows<{ n: number }>(sql`
+      SELECT failures AS n FROM public.second_step_throttles WHERE key = ${`wrong:${userId}`}`);
+    return rows[0]?.n ?? 0;
+  }
+  /** Two hours on for the person's unexplained codes, then the cleanup. */
+  async function cleanupLater(userId: UserId): Promise<void> {
+    await db.execute(sql`
+      UPDATE public.second_step_throttles
+      SET last_failure_at = last_failure_at - interval '2 hours'
+      WHERE key = ${`wrong:${userId}`}`);
+    await runCleanup(db);
+  }
+  async function wrongFor(userId: UserId): Promise<string> {
+    const right = await freshCode(userId);
+    return String((Number(right) + 500_000) % 1_000_000).padStart(6, "0");
+  }
+  /** `work` on its own connection, pausing once before the statement `match` picks to run `hook`. */
+  async function pausedAt<T>(
+    match: (text: string) => boolean,
+    hook: () => Promise<void>,
+    work: (conn: Database) => Promise<T>,
+  ): Promise<{ result: T; fired: boolean }> {
+    const base = openDatabase(testDb.url, { max: 1 });
+    let fired = false;
+    try {
+      const result = await work(
+        pauseBefore(base, match, async () => {
+          fired = true;
+          await hook();
+        }),
+      );
+      return { result, fired };
+    } finally {
+      await base.close();
+    }
+  }
+
+  it("a right code takes off only its own session's codes, never a later session's", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const wrong = await wrongFor(person.userId);
+    // A: two wrong codes, still open.
+    const a = await pending(person.userId, org);
+    for (let i = 0; i < 2; i++) {
+      await completeSecondStep(db, keys, a.token, { source: source(), code: wrong });
+    }
+    // B's first code tells A's 2; B adds 2 of its own.
+    const b = await pending(person.userId, org);
+    for (let i = 0; i < 2; i++) {
+      await completeSecondStep(db, keys, b.token, { source: source(), code: wrong });
+    }
+    expect(await alertsOf(person.userId)).toEqual([2]);
+    expect(await unexplained(person.userId)).toBe(2);
+    // A day on for the person's counter (its wait is another matter), so
+    // A's right code doesn't start one.
+    await db.execute(sql`
+      UPDATE public.second_step_throttles SET last_failure_at = last_failure_at - interval '25 hours'
+      WHERE key = ${`user:${person.userId}`}`);
+    // A signs in: its own 2 were already told; B's 2 stay to be told.
+    const r = await completeSecondStep(db, keys, a.token, {
+      source: source(),
+      code: await freshCode(person.userId),
+    });
+    expect(r.ok).toBe(true);
+    expect(await unexplained(person.userId)).toBe(2);
+    await cleanupLater(person.userId);
+    expect(await alertsOf(person.userId)).toEqual([2, 2]);
+  });
+
+  it("recovery codes aren't a session's share: a right code after one takes off only its TOTP codes", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const other = await pending(person.userId, org);
+    const mine = await pending(person.userId, org);
+    // Mine: a wrong recovery code first (its first code; nothing to tell yet),
+    // then one wrong TOTP code. The other session then sends 1 wrong code.
+    await completeSecondStep(db, keys, mine.token, {
+      source: source(),
+      recoveryCode: "aaaa-bbbb-cccc-dddd-eeee-ffff",
+    });
+    await completeSecondStep(db, keys, mine.token, {
+      source: source(),
+      code: await wrongFor(person.userId),
+    });
+    // The other session's first code tells my 1 and starts a new round.
+    await completeSecondStep(db, keys, other.token, {
+      source: source(),
+      code: await wrongFor(person.userId),
+    });
+    expect(await alertsOf(person.userId)).toEqual([1]);
+    await completeSecondStep(db, keys, mine.token, {
+      source: source(),
+      code: await wrongFor(person.userId),
+    });
+    expect(await unexplained(person.userId)).toBe(2);
+    const r = await completeSecondStep(db, keys, mine.token, {
+      source: source(),
+      code: await freshCode(person.userId),
+    });
+    expect(r.ok).toBe(true);
+    // My one code since the round began came off; the other session's stays.
+    expect(await unexplained(person.userId)).toBe(1);
+  });
+
+  it("another session's first code can't tell a right code on its way to the clear", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const a = await pending(person.userId, org);
+    const b = await pending(person.userId, org);
+    const code = await freshCode(person.userId);
+    const wrong = await wrongFor(person.userId);
+    const { result, fired } = await pausedAt(
+      // After the promotion, before the clear's first statement.
+      (text) =>
+        text.includes("DELETE FROM public.second_step_throttles") || text.includes("mine AS ("),
+      async () => {
+        expect(
+          await completeSecondStep(db, keys, b.token, { source: source(), code: wrong }),
+        ).toMatchObject({ code: "invalid_code" });
+      },
+      (conn) => completeSecondStep(conn, keys, a.token, { source: source(), code }),
+    );
+    expect(fired).toBe(true);
+    expect(result.ok).toBe(true);
+    // A's right code was never on the counter: nothing told; B's code stays.
+    expect(await alertsOf(person.userId)).toEqual([]);
+    expect(await unexplained(person.userId)).toBe(1);
+  });
+
+  it("a right code whose sign-in stopped for another reason is given back, and never told", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    // The session ends between the code check and the promotion.
+    const p = await pending(person.userId, org);
+    const { result, fired } = await pausedAt(
+      (text) => text.includes("s.stage = 'second_step'") && text.includes("FOR UPDATE OF s"),
+      async () => {
+        await db.execute(sql`DELETE FROM public.sessions WHERE id = ${p.sessionId}::uuid`);
+      },
+      async (conn) =>
+        completeSecondStep(conn, keys, p.token, {
+          source: source(),
+          code: await freshCode(person.userId),
+        }),
+    );
+    expect(fired).toBe(true);
+    expect(result).toMatchObject({ ok: false });
+    expect(await counters(person.userId)).toBe(0);
+    expect(await unexplained(person.userId)).toBe(0);
+    // And when the promotion fails with an error.
+    const q = await pending(person.userId, org);
+    const code = await freshCode(person.userId);
+    await expect(
+      pausedAt(
+        (text) => text.includes("s.stage = 'second_step'") && text.includes("FOR UPDATE OF s"),
+        () => Promise.reject(new Error("the connection broke (invented)")),
+        (conn) => completeSecondStep(conn, keys, q.token, { source: source(), code }),
+      ),
+    ).rejects.toThrow("the connection broke (invented)");
+    expect(await counters(person.userId)).toBe(0);
+    expect(await unexplained(person.userId)).toBe(0);
+    await cleanupLater(person.userId);
+    expect(await alertsOf(person.userId)).toEqual([]);
+  });
+
+  it("a wrong code is still counted when its own session ends while it is checked (review)", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const p = await pending(person.userId, org);
+    const wrong = await wrongFor(person.userId);
+    // The guesser signs out (or uses up the session) while the code is checked.
+    const { result, fired } = await pausedAt(
+      (text) => text.includes("INSERT INTO public.second_step_throttles (key) VALUES"),
+      async () => {
+        await db.execute(sql`DELETE FROM public.sessions WHERE id = ${p.sessionId}::uuid`);
+      },
+      (conn) => completeSecondStep(conn, keys, p.token, { source: source(), code: wrong }),
+    );
+    expect(fired).toBe(true);
+    expect(result).toMatchObject({ ok: false });
+    expect(await unexplained(person.userId)).toBe(1);
+    await cleanupLater(person.userId);
+    expect(await alertsOf(person.userId)).toEqual([1]);
+  });
+
+  it("a wrong code in flight across an admin reset isn't counted, so it is never told as someone else's", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const p = await pending(person.userId, org);
+    const wrong = await wrongFor(person.userId);
+    const adminSession = await full(admin, org);
+    // The attempt is past its session and factor checks when the reset commits.
+    const { result, fired } = await pausedAt(
+      (text) => text.includes("INSERT INTO public.second_step_throttles (key) VALUES"),
+      async () => {
+        ok(
+          await resetSecondFactor(
+            db,
+            keys,
+            adminSession.token,
+            person.userId,
+            { source: source(), recoveryCode: recovery(admin) },
+            deliverTo([]),
+          ),
+        );
+      },
+      (conn) => completeSecondStep(conn, keys, p.token, { source: source(), code: wrong }),
+    );
+    expect(fired).toBe(true);
+    expect(result).toMatchObject({ ok: false });
+    expect(await unexplained(person.userId)).toBe(0);
+    await cleanupLater(person.userId);
+    expect(await alertsOf(person.userId)).toEqual([]);
   });
 });

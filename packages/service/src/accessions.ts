@@ -567,7 +567,11 @@ export function accessionOperations(run: Runner): AccessionOperations {
         if (!may.ok) return may;
         const expected = expectedOf(own(options, "expectedVersion"), false);
         if (expected === undefined) return BAD_VERSION();
-        if (typeof agentId !== "string") return UNKNOWN_CONTACT();
+        if (!isRecordId(agentId)) return UNKNOWN_CONTACT();
+        // The same site check as saving (S-058): `donors.edit` on the
+        // agent's home site, not merely on some site.
+        const naming = await mayName(tx, who.organizationId, may.access, [agentId]);
+        if (naming) return naming;
         if (await deleteDonorContact(tx, who.organizationId, agentId, expected)) {
           return { ok: true, value: Object.freeze({ deleted: true as const }) };
         }

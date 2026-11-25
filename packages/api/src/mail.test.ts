@@ -191,6 +191,38 @@ describe("the messages", () => {
     }
   });
 
+  it("gives when the codes were typed, while the email lives from the alert's time (S-054c)", () => {
+    const at = "2026-11-25T18:00:00.000Z";
+    const codesAt = "2026-11-24T17:35:00.000Z";
+    const own = renderSecondStepAlert(
+      { to: "person", email: TO, failures: 2, at, codesAt },
+      ORIGIN,
+    );
+    expect(own.text).toContain("2 wrong codes by 17:35 UTC on 24 November 2026");
+    // Codes told a day on (a first code, a rare cleanup) still get a day to go out.
+    expect(own.notAfter).toBe(Date.parse(at) + 24 * 60 * 60 * 1000);
+    const admin = renderSecondStepAlert(
+      {
+        to: "system_admin",
+        email: "admin.invented@example.org",
+        people: [{ email: TO, failures: 2, at, codesAt }],
+        more: 0,
+      },
+      ORIGIN,
+    );
+    expect(admin.text).toContain(`${TO}: 2 wrong codes by 17:35 UTC on 24 November 2026`);
+    expect(admin.notAfter).toBe(own.notAfter);
+    // A code time after the alert's is never given; a malformed one is refused.
+    const after = renderSecondStepAlert(
+      { to: "person", email: TO, failures: 1, at: codesAt, codesAt: at },
+      ORIGIN,
+    );
+    expect(after.text).toContain("1 wrong code by 17:35 UTC on 24 November 2026");
+    expect(() =>
+      renderSecondStepAlert({ to: "person", email: TO, failures: 1, at, codesAt: "soon" }, ORIGIN),
+    ).toThrow(MailContentError);
+  });
+
   it("escapes every value in the HTML", () => {
     const name = `<script>alert("x")</script> & 'Friends'`;
     const mail = renderInvitation(

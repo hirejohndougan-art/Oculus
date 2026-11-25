@@ -5,11 +5,35 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 ## 2026-11-25 17:30 CT — manual (Chat S) — S-064 Change-log gaps
 
 - Result: done
-- What changed: migration 0051 `definition_events`, written by triggers on identifier types, terms, sites, storage levels and locations, Dublin Core mappings and the System settings, naming the transaction's `oculus.actor` (set by the service's `run`) or the row's editor; append-only, triggers ALWAYS. `readAuditTrail` also shows definitions, file attaches and removals, moves, accession saves (only with `donors.view` on every site) and share steps (home organization only; the other organization's people as `other_organization`). The audit screen words each kind. No secrets in definition tables (D-052 amended).
+- What changed: migration 0058 `definition_events`, written by triggers on identifier types, terms, sites, storage levels and locations, Dublin Core mappings and the System settings, naming the transaction's `oculus.actor` (set by the service's `run`) or the row's editor; append-only, triggers ALWAYS. `readAuditTrail` also shows definitions, file attaches and removals, moves, accession saves (only with `donors.view` on every site) and share steps (home organization only; the other organization's people as `other_organization`). The audit screen words each kind. No secrets in definition tables (D-052 amended).
 - Decisions: D-117 (D-052 amended)
 - Review: three independent rounds. The first found a same-organization share leaking a title to the receiving site, accession lines reaching people without `donors.view`, and test gaps; the second found the other organization's user IDs in share lines and receiving-side lines beyond D-094; the third found only documentation gaps. All fixed; indexes (S-066) and a receiving-side view (S-070) filed.
 - Gate: PASS · tests_passing 5250 (was 5233) · npm audit clean
 - Next: S-066, S-070 (follow-ups); Phase 2's other jobs are claimed.
+
+## 2026-11-25 16:50 CT — manual (Chat Y) — S-054c The wait's alert carries the older unexplained codes; the notice gives the codes' time
+- Result: done
+- What changed: second-factor.ts `takeCodeAttempt` (a wait's alert counts `max(day's count, unexplained codes)`; every alert stores `last_code_at`), sessions.ts `runCleanup` (its alert stores the `wrong:` row's time), alert-notices.ts (messages gain `codesAt`, `least(coalesce(last_code_at, created_at), created_at)`), mail-messages.ts (the wording gives `codesAt`, capped at `at`; the email's life still runs from `at`); migration 0055 (`second_step_alerts.last_code_at`, no CHECK). New tests in second-factor.test.ts, alert-notices.test.ts and mail.test.ts, failing without the change.
+- Decisions: D-077 amended (S-054c)
+- Review: two independent reviews. The first found that giving the codes' time as the message's `at` made the outbox drop notices of codes told a day on as expired; fixed (`codesAt` for wording only) and tested. The second: safe; notes (deploy migrations before code, as always; a wait during a re-entry can count another tab's in-flight codes) accepted.
+- Gate: PASS on main + S-054c twice (tests_passing 5219, then 5238 with T-075 and U-008); the last run, after S-058 merged in (only a PROGRESS.md conflict), was cut off and **not finished: John chose to merge without it** (2026-11-25 16:47 CT) so the other chats could go on. The next gate on main checks it. Baseline raised to 5238 (the last full count), not higher.
+- Next: S-054d. Merged after S-054b: the wait's larger count is now `unexplained + this sign-in code`, since S-054b puts a code on the counter only once it is known wrong.
+
+## 2026-11-25 16:47 CT — build (BUILD MODE) — S-054b A per-session TOTP count, counted and cleared atomically, given back when the clear is never reached
+- Result: done (S-054d filed)
+- What changed: migration 0050 adds `unexplained` and `told_round` to `second_step_throttles`. A sign-in's TOTP code goes on the person's `wrong:` counter only after it was found wrong (`countWrongCode`: `session:` and `wrong:` locked in key order, skipped when the factor was revoked meanwhile, still counted when the guesser's own session ended). Each session keeps its share of the counter for the current round; the first-code alert, the wait's alert and the cleanup each start a new round. A right code takes off exactly its share in one statement, so a later session's codes are never wiped and an in-flight right code is never told. A right code whose promotion is refused for another reason, or throws, is given back. Six tests in second-factor.test.ts; the five for the reported gaps fail on the old code.
+- Decisions: D-077 amended (S-054b)
+- Review: two independent rounds. Round 1: a blocker (signing out or using up the session mid-check left the guess uncounted), fixed by checking only the factor; inflated wait alerts and unknown-commit give-backs accepted in D-077. Round 2: no blocker; the session now ends even if the count fails, the count retries when the cleanup removed the row, and the share clear is best effort after a sign-in. A count lost to a busy database is filed as S-054d (risky).
+- Gate: PASS · tests_passing 5240 (was 5234 on main) · npm audit clean (the gate ran on the branch rebased onto main with S-062, T-075, U-008 and S-058)
+- Next: S-054d (S-054c, S-056 and most other open tasks are claimed by other chats)
+
+## 2026-11-25 16:45 CT — manual (Chat N) — S-058 Deleting a donor contact checks the agent's home site
+- Result: done
+- What changed: `deleteDonorContact` (service `accessions.ts`) now runs the same home-site check as `saveDonorContact` (`mayName`): `donors.edit` on the agent's own site, not on any site. Attack test: Donor relations on one site can't delete (or save) another site's agent's contact, even with a wrong version; with the role on that site it can.
+- Decisions: none
+- Review: independent review: safe (no hole, no data loss); notes: same behaviour as saving for records filed below the agent and for telling a missing agent from another site's
+- Gate: PASS · tests_passing 5234 (was 5233) · npm audit clean
+- Next: none for Chat N; every Phase 2 job is claimed
 
 ## 2026-11-25 16:00 CT — manual (Chat L) — U-008 Load-proof test timeouts
 

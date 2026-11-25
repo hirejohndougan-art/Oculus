@@ -1,0 +1,16 @@
+-- When the wrong two-step codes an alert tells were typed (S-054c, D-077
+-- amended). Numbered 0055, above the numbers other branches reserved
+-- (0050 to 0054).
+--
+-- An alert row's created_at is when it was written, which can be well after
+-- the codes it tells: the cleanup command tells unexplained codes an hour or
+-- more after the last one, and a sign-in's first code tells codes another
+-- session left days before. The notice said "by <created_at>", so it could
+-- put the codes later than they were. last_code_at is the time of the newest
+-- code the alert tells (the `wrong:` counter's last_failure_at, or the code
+-- that started a wait); the notice gives it. Rows written before this
+-- migration keep NULL, and the notice falls back to created_at for them.
+-- No CHECK against created_at: a clock stepped back between the code and
+-- the alert would then refuse the alert (and the sign-in with it); the
+-- notice reads least(last_code_at, created_at) instead.
+ALTER TABLE public.second_step_alerts ADD COLUMN last_code_at timestamptz;

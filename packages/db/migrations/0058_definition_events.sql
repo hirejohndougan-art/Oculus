@@ -1,5 +1,5 @@
--- Definition changes in the change log (S-064, D-117). Numbered 0051 above
--- main's 0049 and migration 0050 (reserved on the work board for S-061).
+-- Definition changes in the change log (S-064, D-117). Numbered 0058 above
+-- main's 0055 and the numbers reserved on the work board (0052 to 0057).
 --
 -- definition_events: one row per change to a definition the organization's
 -- records lean on, which until now changed in place with no record of who

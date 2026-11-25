@@ -12,7 +12,7 @@
  * own checked key; an unknown key is refused, never kept. **No secret
  * (an email password, a backup key, a site password or its hash) goes in
  * this document:** every change of it is copied for good into the
- * append-only change log (migration 0051, D-117). Secrets get a table of
+ * append-only change log (migration 0058, D-117). Secrets get a table of
  * their own.
  */
 import { types } from "node:util";
