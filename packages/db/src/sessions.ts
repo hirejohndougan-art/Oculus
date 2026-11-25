@@ -1261,14 +1261,22 @@ export async function runCleanup(db: Queryable): Promise<CleanupResult> {
     )
     SELECT count(*)::int AS n FROM alerted`);
   const secondStepAlerts = told[0]?.n ?? 0;
+  // Locked in key order first (S-054a), as a code attempt locks its
+  // counters: a delete in the table's own order could hold `wrong:` while
+  // waiting on the same person's `user:`, which an attempt holds while
+  // waiting on `wrong:`.
   const secondStepThrottles = await db.execute(sql`
-    DELETE FROM public.second_step_throttles t
-    WHERE t.last_failure_at IS NULL
-       OR (t.key NOT LIKE 'wrong:%' AND t.last_failure_at < clock_timestamp() - interval '1 day')
-       OR (t.key LIKE 'wrong:%'
-           AND t.last_failure_at < clock_timestamp() - make_interval(secs => ${WRONG_CODE_MEMORY_SECONDS}))
-       OR (t.key LIKE 'session:%' AND NOT EXISTS (
-             SELECT 1 FROM public.sessions s WHERE 'session:' || s.id::text = t.key))`);
+    WITH gone AS (
+      SELECT t.key FROM public.second_step_throttles t
+      WHERE t.last_failure_at IS NULL
+         OR (t.key NOT LIKE 'wrong:%' AND t.last_failure_at < clock_timestamp() - interval '1 day')
+         OR (t.key LIKE 'wrong:%'
+             AND t.last_failure_at < clock_timestamp() - make_interval(secs => ${WRONG_CODE_MEMORY_SECONDS}))
+         OR (t.key LIKE 'session:%' AND NOT EXISTS (
+               SELECT 1 FROM public.sessions s WHERE 'session:' || s.id::text = t.key))
+      ORDER BY t.key FOR UPDATE OF t
+    )
+    DELETE FROM public.second_step_throttles t USING gone WHERE t.key = gone.key`);
   const passwordResets = await deleteOldPasswordResets(db);
   return Object.freeze({
     sessions,

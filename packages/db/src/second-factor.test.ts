@@ -2352,3 +2352,191 @@ function promoteBy(sessionId: SessionId, org: OrganizationId, passId: string | n
       expires_at = signed_in_at + make_interval(secs => absolute_seconds)
     WHERE id = ${sessionId}::uuid`;
 }
+
+describe("wrong-code counters are changed in key order, and a reset forgets unexplained codes (S-054a)", () => {
+  const deadlocks = async (): Promise<number> =>
+    Number(
+      (
+        await db.rows<{ n: string }>(sql`
+          SELECT deadlocks::text AS n FROM pg_stat_database WHERE datname = current_database()`)
+      )[0]?.n ?? "0",
+    );
+
+  /**
+   * Runs `work` on a connection that reads second_step_throttles in the
+   * table's own order (no index scans), pausing before the statement `match`
+   * picks. Meanwhile another transaction locks `first`, waits until that
+   * statement waits on it, then locks `second` (a later key), as a code
+   * attempt locks its counters in key order. A statement that locks in key
+   * order waits on `first` holding nothing; one that already holds `second`
+   * deadlocks. `before` runs at the pause, before the locks.
+   */
+  async function raceInKeyOrder<T>(
+    match: (text: string) => boolean,
+    first: string,
+    second: string,
+    work: (conn: Database) => Promise<T>,
+    before?: () => Promise<void>,
+  ): Promise<T> {
+    const start = await deadlocks();
+    const base = openDatabase(testDb.url, { max: 1 });
+    const holder = openDatabase(testDb.url, { max: 1 });
+    try {
+      for (const setting of ["enable_indexscan", "enable_indexonlyscan", "enable_bitmapscan"]) {
+        await base.rows(sql`SELECT set_config(${setting}, 'off', false)`);
+      }
+      let holding: Promise<void> | undefined;
+      const paused = pauseBefore(base, match, async () => {
+        await before?.();
+        let firstLocked!: () => void;
+        const locked = new Promise<void>((resolve) => (firstLocked = resolve));
+        holding = holder.transaction(async (tx) => {
+          await tx.rows(sql`
+            SELECT 1 FROM public.second_step_throttles WHERE key = ${first} FOR UPDATE`);
+          firstLocked();
+          for (let i = 0; i < 200; i++) {
+            const waiting = await db.rows(sql`
+              SELECT 1 FROM pg_stat_activity
+              WHERE datname = current_database() AND wait_event_type = 'Lock'`);
+            if (waiting.length > 0) break;
+            await new Promise((r) => setTimeout(r, 25));
+          }
+          await tx.rows(sql`
+            SELECT 1 FROM public.second_step_throttles WHERE key = ${second} FOR UPDATE`);
+        });
+        holding.catch(() => undefined);
+        await locked;
+      });
+      const result = await work(paused);
+      expect(holding).toBeDefined();
+      await holding;
+      expect(await deadlocks()).toBe(start);
+      return result;
+    } finally {
+      await base.close();
+      await holder.close();
+    }
+  }
+
+  /** Moves `key`'s row to the end of the table (a new row version), so a scan in the table's order meets it last. */
+  async function toTheEnd(key: string): Promise<void> {
+    await db.execute(sql`
+      UPDATE public.second_step_throttles SET failures = failures WHERE key = ${key}`);
+  }
+
+  async function wrongFor(userId: UserId): Promise<string> {
+    const right = await freshCode(userId);
+    return String((Number(right) + 500_000) % 1_000_000).padStart(6, "0");
+  }
+
+  async function rowsOf(keys: readonly string[]): Promise<Record<string, number>> {
+    const rows = await db.rows<{ key: string; failures: number }>(sql`
+      SELECT key, failures FROM public.second_step_throttles WHERE key = ANY(${keys}::text[])`);
+    return Object.fromEntries(rows.map((r) => [r.key, r.failures]));
+  }
+
+  it("the cleanup's delete can't deadlock with an attempt holding the person's counter", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org, { factor: false });
+    const userKey = `user:${person.userId}`;
+    const wrongKey = `wrong:${person.userId}`;
+    // Both old enough to go; `wrong:` first in the table.
+    await db.execute(sql`
+      INSERT INTO public.second_step_throttles (key, failures, last_failure_at)
+      VALUES (${wrongKey}, 0, clock_timestamp() - interval '31 days')`);
+    await db.execute(sql`
+      INSERT INTO public.second_step_throttles (key, failures, last_failure_at)
+      VALUES (${userKey}, 1, clock_timestamp() - interval '2 days')`);
+    await raceInKeyOrder(
+      (text) => text.includes("DELETE FROM public.second_step_throttles t"),
+      userKey,
+      wrongKey,
+      (conn) => runCleanup(conn),
+    );
+    expect(await rowsOf([userKey, wrongKey])).toEqual({});
+  });
+
+  it("giving back a code that couldn't be checked can't deadlock with an attempt", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const otherKeys = loadSecretKeyring({ OCULUS_SECRET_KEY: FAKE_TEST_SECRET_KEY_2 });
+    const p = await pending(person.userId, org);
+    const sessionKey = `session:${p.sessionId}`;
+    const userKey = `user:${person.userId}`;
+    const r = await raceInKeyOrder(
+      (text) => text.includes("second_step_throttles") && text.includes("- 1, 0)"),
+      sessionKey,
+      userKey,
+      (conn) =>
+        completeSecondStep(conn, otherKeys, p.token, {
+          source: source(),
+          code: "123456",
+        }),
+      () => toTheEnd(sessionKey),
+    );
+    expect(r).toMatchObject({ code: "second_step_unavailable" });
+    // Given back: nothing is left counted against the person or the session.
+    expect(await rowsOf([sessionKey, userKey, `wrong:${person.userId}`])).toEqual({
+      [sessionKey]: 0,
+      [userKey]: 0,
+      [`wrong:${person.userId}`]: 0,
+    });
+  });
+
+  it("clearing the counters after a right code can't deadlock with an attempt", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const p = await pending(person.userId, org);
+    const sessionKey = `session:${p.sessionId}`;
+    const userKey = `user:${person.userId}`;
+    const code = await freshCode(person.userId);
+    const r = await raceInKeyOrder(
+      (text) => text.includes("DELETE FROM public.second_step_throttles"),
+      sessionKey,
+      userKey,
+      (conn) => completeSecondStep(conn, keys, p.token, { source: source(), code }),
+      () => toTheEnd(sessionKey),
+    );
+    expect(r.ok).toBe(true);
+    expect(await rowsOf([sessionKey, userKey])).toEqual({});
+  });
+
+  it("an admin reset forgets the person's unexplained codes, so they are never told as someone else's", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    // The person, on a broken authenticator, types two wrong codes, gives up
+    // and asks for a reset.
+    const p = await pending(person.userId, org);
+    const wrong = await wrongFor(person.userId);
+    for (let i = 0; i < 2; i++) {
+      expect(
+        await completeSecondStep(db, keys, p.token, { source: source(), code: wrong }),
+      ).toMatchObject({ code: "invalid_code" });
+    }
+    expect(await rowsOf([`wrong:${person.userId}`])).toEqual({ [`wrong:${person.userId}`]: 2 });
+    const adminSession = await full(admin, org);
+    ok(
+      await resetSecondFactor(
+        db,
+        keys,
+        adminSession.token,
+        person.userId,
+        { source: source(), recoveryCode: recovery(admin) },
+        deliverTo([]),
+      ),
+    );
+    expect(await rowsOf([`user:${person.userId}`, `wrong:${person.userId}`])).toEqual({});
+    // Two hours on, the cleanup has nothing of theirs to tell.
+    await db.execute(sql`
+      UPDATE public.second_step_throttles SET last_failure_at = last_failure_at - interval '2 hours'
+      WHERE key = ${`wrong:${person.userId}`}`);
+    await runCleanup(db);
+    const alerts = await db.rows(sql`
+      SELECT 1 FROM public.second_step_alerts WHERE user_id = ${person.userId}::uuid`);
+    expect(alerts).toEqual([]);
+  });
+});

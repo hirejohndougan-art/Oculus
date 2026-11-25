@@ -605,12 +605,22 @@ async function clearCodeAttempts(db: Queryable, counted: Counted): Promise<void>
         counted.sessionFailures - (counted.wrongCounted ? 0 : 1),
         counted.wrongCounted ? 1 : 0,
       );
-  await db.execute(
-    sql`DELETE FROM public.second_step_throttles WHERE key = ANY(${personal}::text[])`,
-  );
+  // Each statement locks its rows in key order first (S-054a), as
+  // takeCodeAttempt does: a scan in the table's own order could lock
+  // `user:` before `session:` and deadlock with an attempt.
   await db.execute(sql`
-    UPDATE public.second_step_throttles SET failures = greatest(failures - 1, 0)
-    WHERE key = ANY(${sources}::text[])`);
+    WITH locked AS (
+      SELECT key FROM public.second_step_throttles
+      WHERE key = ANY(${personal}::text[]) ORDER BY key FOR UPDATE
+    )
+    DELETE FROM public.second_step_throttles t USING locked WHERE t.key = locked.key`);
+  await db.execute(sql`
+    WITH locked AS (
+      SELECT key FROM public.second_step_throttles
+      WHERE key = ANY(${sources}::text[]) ORDER BY key FOR UPDATE
+    )
+    UPDATE public.second_step_throttles t SET failures = greatest(t.failures - 1, 0)
+    FROM locked WHERE t.key = locked.key`);
   // Last, as `wrong:` sorts after the others (the lock order of takeCodeAttempt).
   await db.execute(sql`
     UPDATE public.second_step_throttles SET failures = greatest(failures - ${explained}, 0)
@@ -624,9 +634,14 @@ async function clearCodeAttempts(db: Queryable, counted: Counted): Promise<void>
  */
 async function giveBackCodeAttempt(db: Queryable, counted: Counted): Promise<void> {
   const keys = counted.wrongCounted ? [...counted.keys, counted.wrongKey] : [...counted.keys];
+  // Locked in key order first (S-054a), as takeCodeAttempt locks them.
   await db.execute(sql`
-    UPDATE public.second_step_throttles SET failures = greatest(failures - 1, 0)
-    WHERE key = ANY(${keys}::text[])`);
+    WITH locked AS (
+      SELECT key FROM public.second_step_throttles
+      WHERE key = ANY(${keys}::text[]) ORDER BY key FOR UPDATE
+    )
+    UPDATE public.second_step_throttles t SET failures = greatest(t.failures - 1, 0)
+    FROM locked WHERE t.key = locked.key`);
 }
 
 /** Ends a session after its last allowed wrong code. */
@@ -1316,8 +1331,8 @@ class NotAMember extends Error {
 
 /**
  * Resets `targetUserId`'s two-step sign-in (D-019, D-052): their factor is
- * revoked, their recovery codes stop working, their wrong-code counter is
- * cleared, **every session of theirs ends**, and a one-time enrolment token
+ * revoked, their recovery codes stop working, their wrong-code counter and
+ * unexplained wrong codes (S-054a) are cleared, **every session of theirs ends**, and a one-time enrolment token
  * (3 days) is sent to their address with `deliver`: without it they can't
  * set it up again, so their password alone (which the writer role could
  * set) is not enough. For a system admin acting from their own full session
@@ -1418,8 +1433,15 @@ export async function resetSecondFactor(
                   clock_timestamp() + make_interval(secs => ${ENROLMENT_TOKEN_SECONDS}))
           RETURNING to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
             AS expires_at`);
+        // The person's counter, then (S-054a) their unexplained wrong codes,
+        // in key order: codes typed against the factor just revoked, mostly
+        // the person's own from a lost or broken device, are not told later
+        // as someone else's. Codes an hour old were already told by the
+        // cleanup.
         await tx.execute(sql`
           DELETE FROM public.second_step_throttles WHERE key = ${`user:${targetUserId}`}`);
+        await tx.execute(sql`
+          DELETE FROM public.second_step_throttles WHERE key = ${wrongKeyOf(targetUserId)}`);
         return { reset: reset > 0, ended, expiresAt: expiry[0]?.expires_at ?? "" };
       },
       // The user rows first, in ID order (the target's to end its sessions,
