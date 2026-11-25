@@ -6,10 +6,9 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Result: done
 - What changed: migration 0036 adds `public.shared_record_home` (SECURITY DEFINER, in `PUBLIC_READER_FUNCTIONS`); `readSharedPublicRecord` in workflow.ts reads an accepted item's home public output in one Repeatable Read snapshot; `GET /records/:id` falls back to it and adds `sharedFrom`. `record_public_on_site` is unchanged, so OAI-PMH and subject counts don't list shared items.
 - Decisions: D-111
-- Review: one independent round, nothing blocking; fixed an ambiguous-ID case (`LIMIT 1` with no order, and a site's own record sharing an ID with a shared one), documented the migration order, the two reads and their cost, and added tests (exact equality with the home output, a moved item reading as the site's own, an accepted item without a stored mapping).
-- Gate: PASS · tests_passing TBD (was 4729) · npm audit clean
-- Next: S-037
-
+- Review: two independent rounds, nothing blocking in either; fixed an ambiguous-ID case (`LIMIT 1` with no order, and a site's own record sharing an ID with a shared one), documented the migration order, the two reads and their cost, and added tests (exact equality with the home output, a moved item reading as the site's own, an accepted item without a stored mapping, and two ID clashes made by direct SQL).
+- Gate: PASS · tests_passing TBD (was 4734) · npm audit clean
+- Next: the next free job on the board
 
 ## 2026-11-25 03:00 CT — manual (Chat D) — S-042 Site managers see members whose role is on every site
 - Result: done
@@ -18,6 +17,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Review: one independent round, nothing blocking; fixed: a role on every site scoped to one unit no longer counts, and a viewer with no managed site sees no one (matching the SQL); unit tests for the rule.
 - Gate: PASS · tests_passing 4734 (was 4729) · npm audit clean · licences all permissive (the e2e step, disturbed by a stopped earlier run, passed on its own: 8 of 8; main then moved by roadmap claims only)
 - Next: nothing claimed
+
 ## 2026-11-25 04:45 CT — upkeep — U-006 Main's gate fails in a clean checkout
 - Result: gate fix
 - What changed: CI's gate on main had failed at lint on every push since M-001 (`files.spec.ts` imports `@oculus/api`, resolved to an unbuilt `dist`); `packages/admin/tsconfig.json` now maps `@oculus/api`, `db` and `service` to their sources (c3f0f46). Also in-major updates: @types/node 26.6.10, @types/react 19.3.2, react-router 8.5.3. TypeScript 7 / Vite 8 rechecked, still blocked (T-001b). Filed U-007 (the gate should start with no `dist`).
@@ -153,6 +153,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Review: n/a (not risky; tests only)
 - Gate: PASS · tests_passing 4376 (was 4372) · npm audit clean
 - Next: the next job in the work board's pool.
+
 ## 2026-11-24 21:20 CT — Chat B — M-001 Serve active file types safely
 - Result: done
 - What changed: `fileReply` (packages/api/src/file-replies.ts) is the only way a handler sends a file's bytes: plain images, audio and video may be shown as their bare type, everything else (HTML, SVG, XML, scripts, PDF, unknown) downloads as `application/octet-stream`; every file reply has nosniff, a sandboxing CSP, same-origin CORP and nothing the handler set; safe RFC 6266/8187 names; streams opened only when sent, outside the handler timeout, within a 2-hour deadline, closed on errors, wrong lengths, hang-ups and shutdown; HEAD opens nothing. HTTP attack tests and a Chromium test that a page on another origin can't run an HTML, SVG or XHTML file's script.
