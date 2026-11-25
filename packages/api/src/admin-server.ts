@@ -22,7 +22,10 @@
  * - `OCULUS_FILES_DIR` (M-002, D-086) is missing, not an absolute path, or
  *   not an existing writable directory, or the caps `OCULUS_FILE_MAX_MIB`
  *   (default 500) or `OCULUS_FILES_TOTAL_MAX_MIB` (per organization,
- *   default 20480) aren't whole numbers in range.
+ *   default 20480) or the free-space floor `OCULUS_FILES_MIN_FREE_MIB`
+ *   (default: 5% of the disk or 2 GiB, whichever is smaller) aren't whole
+ *   numbers in range. Stale temporary files and copies no row names are
+ *   swept at startup and every 15 minutes.
  *
  * It warns loudly (a `startup_warning` log record) when the database
  * server's `log_parameter_max_length_on_error` is above 0, since pg's
@@ -46,14 +49,25 @@ import { createService, openFileStore, type FileStore } from "@oculus/service";
 import type { FastifyInstance } from "fastify";
 import { ADMIN_ORIGIN_ENV, loadAdminFiles, type AdminFiles } from "./admin-files.js";
 import { trustedProxyFromEnv } from "./proxy.js";
-import { buildServer, type ServerOptions } from "./server.js";
+import { UPLOAD_TIMEOUTS, buildServer, type ServerOptions } from "./server.js";
 import { signInRoutes, type SignInApiOptions } from "./sign-in-api.js";
-import { serviceErrorLogger, staffApiRoutes, type ApiLogRecord } from "./staff-api.js";
+import {
+  redactedError,
+  serviceErrorLogger,
+  staffApiRoutes,
+  type ApiLogRecord,
+} from "./staff-api.js";
 
 export const CLIENT_ADDRESS_ENV = "OCULUS_CLIENT_ADDRESS";
 export const FILES_DIR_ENV = "OCULUS_FILES_DIR";
 export const FILE_MAX_ENV = "OCULUS_FILE_MAX_MIB";
 export const FILES_TOTAL_MAX_ENV = "OCULUS_FILES_TOTAL_MAX_MIB";
+export const FILES_MIN_FREE_ENV = "OCULUS_FILES_MIN_FREE_MIB";
+
+/** Temporary upload files older than this are swept: twice an upload's whole limit. */
+export const INCOMING_MAX_AGE_MS = 2 * UPLOAD_TIMEOUTS.request;
+/** How often the file sweep runs (and once at startup). */
+export const FILE_SWEEP_EVERY_MS = 15 * 60_000;
 
 /** A cap in MiB from the environment, as bytes; throws naming the variable, never the value. */
 function mibFromEnv(
@@ -85,11 +99,20 @@ export async function fileStoreFromEnv(
   }
   const maxFileBytes = mibFromEnv(env, FILE_MAX_ENV);
   const maxOrganizationBytes = mibFromEnv(env, FILES_TOTAL_MAX_ENV);
+  const minFree = env[FILES_MIN_FREE_ENV];
+  let minFreeBytes: number | undefined;
+  if (minFree !== undefined && minFree.trim() !== "") {
+    if (!/^(0|[1-9][0-9]{0,6})$/.test(minFree.trim())) {
+      throw new Error(`refusing to start: ${FILES_MIN_FREE_ENV} must be a whole number of MiB.`);
+    }
+    minFreeBytes = Number(minFree.trim()) * 1024 * 1024;
+  }
   try {
     return await openFileStore({
       dir,
       ...(maxFileBytes === undefined ? {} : { maxFileBytes }),
       ...(maxOrganizationBytes === undefined ? {} : { maxOrganizationBytes }),
+      ...(minFreeBytes === undefined ? {} : { minFreeBytes }),
     });
   } catch (error) {
     // openFileStore's messages name no path.
@@ -262,10 +285,26 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
       ...options.signIn,
     }),
   ];
-  return buildServer({
+  // Stale temporary files and copies no row names (D-086): now, then on a
+  // timer that stops with the server.
+  const sweep = async (): Promise<void> => {
+    try {
+      await service.sweepFiles(INCOMING_MAX_AGE_MS);
+    } catch (error) {
+      log({ event: "service_error", operation: "sweepFiles", ...redactedError(error) });
+    }
+  };
+  await sweep();
+  const app = await buildServer({
     env,
     routes,
     ...(options.logger === undefined ? {} : { logger: options.logger }),
     ...(admin === undefined ? {} : { admin }),
   });
+  const timer = setInterval(() => void sweep(), FILE_SWEEP_EVERY_MS);
+  timer.unref();
+  app.server.once("close", () => {
+    clearInterval(timer);
+  });
+  return app;
 }

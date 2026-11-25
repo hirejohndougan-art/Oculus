@@ -174,4 +174,23 @@ describe("the files panel", () => {
     expect(sizeText(500 * 1024 * 1024)).toBe("500 MB");
     expect(sizeText(3 * 1024 ** 3)).toBe("3.0 GB");
   });
+
+  it("removes a file after asking, with If-Match", async () => {
+    let removed = false;
+    const sent = fakeServer({
+      [LIST]: () => [200, { files: removed ? [] : [FILE], maxFileBytes: 1000 }],
+      [`DELETE /api/records/${RECORD_ID}/files/${FILE.id}`]: () => {
+        removed = true;
+        return [200, { removed: true }];
+      },
+    });
+    show();
+    await userEvent.click(await screen.findByRole("button", { name: `Remove ${FILE.name}` }));
+    expect(screen.getByRole("region", { name: `Remove ${FILE.name}?` })).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Remove the file" }));
+    expect(await screen.findByText(`Removed ${FILE.name}.`)).toBeTruthy();
+    expect(await screen.findByText("No files yet.")).toBeTruthy();
+    const call = sent.find((s) => s.method === "DELETE");
+    expect(call?.headers).toMatchObject({ "if-match": '"v4"', "x-oculus-site": SITE_1 });
+  });
 });

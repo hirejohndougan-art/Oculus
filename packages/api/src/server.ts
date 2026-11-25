@@ -41,7 +41,10 @@
  * 6. Proxies (proxy.ts): `trustProxy` is off unless `OCULUS_TRUSTED_PROXY`
  *    names the proxy's addresses, in ranges no wider than D-058 allows.
  * 7. Timeouts: explicit and shorter than Node's and Fastify's defaults
- *    (`SERVER_TIMEOUTS`); options can only shorten them.
+ *    (`SERVER_TIMEOUTS`); options can only shorten them. Upload routes get
+ *    their own (`UPLOAD_TIMEOUTS`, D-086: 60 s without a byte, 30 minutes
+ *    in all); on a server with one, Node's per-server request limit is the
+ *    upload's and every other request keeps its own from a timer here.
  *    After the handler timeout the request view's `signal` fires and the
  *    reply stops working.
  * 8. Errors (errors.ts): `{ "error": "<code>" }` only, never a message or a
@@ -101,6 +104,7 @@ import {
   resultBody,
   routeConfig,
   routeOptionsProblem,
+  MAX_UPLOAD_BYTES,
   type OculusRoute,
   type OculusUpload,
 } from "./routes.js";
@@ -118,6 +122,19 @@ export interface ServerTimeouts {
   /** A handler that runs longer is answered with 503. */
   readonly handler: number;
 }
+
+/**
+ * Upload routes only (M-002, D-086), milliseconds: `idle`, the longest a
+ * request may go without a byte arriving or leaving (the socket's timeout
+ * while it runs); `request`, the whole upload, body and handler. Every
+ * other request keeps `SERVER_TIMEOUTS`.
+ */
+export interface UploadTimeouts {
+  readonly idle: number;
+  readonly request: number;
+}
+
+export const UPLOAD_TIMEOUTS: UploadTimeouts = { idle: 60_000, request: 30 * 60_000 };
 
 export const SERVER_TIMEOUTS: ServerTimeouts = {
   connection: 30_000,
@@ -141,6 +158,8 @@ export interface ServerOptions {
   readonly logger?: boolean | { readonly stream: { write(line: string): void } };
   /** Shorter timeouts, for tests; a longer value is refused. */
   readonly timeouts?: Partial<ServerTimeouts>;
+  /** Shorter upload timeouts (`UPLOAD_TIMEOUTS`), for tests; a longer value is refused. */
+  readonly uploadTimeouts?: Partial<UploadTimeouts>;
   /** The application's routes (routes.ts); nothing else can add one. */
   readonly routes?: readonly OculusRoute[];
   /**
@@ -164,6 +183,21 @@ function chooseTimeouts(overrides: Partial<ServerTimeouts> = {}): ServerTimeouts
   }
   // Node requires the headers timeout to be no longer than the request timeout.
   return { ...result, headers: Math.min(result.headers, result.request) };
+}
+
+function chooseUploadTimeouts(overrides: Partial<UploadTimeouts> = {}): UploadTimeouts {
+  const result = { ...UPLOAD_TIMEOUTS };
+  for (const key of ["idle", "request"] as const) {
+    const value = overrides[key];
+    if (value === undefined) continue;
+    if (!Number.isInteger(value) || value <= 0 || value > UPLOAD_TIMEOUTS[key]) {
+      throw new Error(
+        `uploadTimeouts.${key} must be a whole number from 1 to ${String(UPLOAD_TIMEOUTS[key])}`,
+      );
+    }
+    result[key] = value;
+  }
+  return result;
 }
 
 /** The first rule an incoming request breaks, checked before routing's handler. */
@@ -250,14 +284,15 @@ function logLateFailure(request: FastifyRequest, fresh: Refusal, thrown: unknown
  */
 const unfinishedUploads = new WeakSet<FastifyRequest>();
 
-const CONTENT_LENGTH = /^[0-9]{1,16}$/;
-
 /**
  * The upload view of an upload route's body (routes.ts `OculusUpload`): the
  * bytes, counted as they arrive and refused past `maxBytes`, read once. The
  * stream is iterated by hand and never `return`ed: a for-await loop that
  * stopped early would destroy the request and with it the socket, so the
- * 413 could never be sent.
+ * 413 could never be sent. Each read races the request's signal (the
+ * handler timeout's 503 sent, or the client gone): when it fires the request
+ * is destroyed and the read fails at once, so a stalled or trickling client
+ * can never leave the reader (and its partial file) waiting forever.
  */
 function uploadView(
   request: FastifyRequest,
@@ -268,10 +303,19 @@ function uploadView(
   if (stream === undefined) return undefined;
   uploadStreams.delete(request);
   unfinishedUploads.add(request);
-  const length = request.headers["content-length"];
-  const declared =
-    typeof length === "string" && CONTENT_LENGTH.test(length) ? Number(length) : undefined;
+  const declared = declaredLength(request.headers["content-length"]);
   const contentType = (request.headers["content-type"] ?? "").toLowerCase();
+  const raw = request.raw;
+  const ended = new Promise<never>((_resolve, reject) => {
+    const fail = (): void => {
+      raw.destroy();
+      reject(new Error("the request has ended"));
+    };
+    if (signal.aborted) fail();
+    else signal.addEventListener("abort", fail, { once: true });
+  });
+  // Nobody may be waiting on it yet; its rejection is handled where raced.
+  ended.catch(() => undefined);
   let taken = false;
   return Object.freeze({
     contentType,
@@ -284,7 +328,7 @@ function uploadView(
         let total = 0;
         for (;;) {
           if (signal.aborted) throw new Error("the request has ended");
-          const next = await iterator.next();
+          const next = await Promise.race([iterator.next(), ended]);
           if (next.done === true) break;
           const chunk: unknown = next.value;
           if (!(chunk instanceof Uint8Array)) throw new Error("an upload chunk is bytes");
@@ -299,6 +343,19 @@ function uploadView(
 }
 
 /**
+ * A request's declared `Content-Length` as a number, `undefined` without
+ * one; throws a 413 for anything over `MAX_UPLOAD_BYTES` or longer than 16
+ * digits (Node has already refused a malformed one).
+ */
+function declaredLength(header: string | undefined): number | undefined {
+  if (header === undefined) return undefined;
+  if (!/^[0-9]{1,16}$/.test(header)) throw new Refusal(413, "payload_too_large");
+  const value = Number(header);
+  if (value > MAX_UPLOAD_BYTES) throw new Refusal(413, "payload_too_large");
+  return value;
+}
+
+/**
  * Registers one application route (already checked and copied by
  * `checkRoute`). Whatever the handler throws or rejects with is caught here
  * and replaced by a fresh Refusal (errors.ts), so no value of the handler's
@@ -309,13 +366,15 @@ function uploadView(
  * result or failure is never handed to Fastify (which would log the request
  * URL, query string included, and the error object).
  */
-function addRoute(app: FastifyInstance, route: OculusRoute): void {
+function addRoute(app: FastifyInstance, route: OculusRoute, uploadHandlerMs: number): void {
   const credentials = route.credentials === true;
   const handler = route.handler;
   app.route({
     method: route.method,
     url: route.path,
     ...(credentials ? { bodyLimit: CREDENTIALS_BODY_LIMIT } : {}),
+    // An upload's handler runs while its body arrives: its own, longer limit.
+    ...(route.upload === undefined ? {} : { handlerTimeout: uploadHandlerMs }),
     config: routeConfig(route),
     handler: async (request, reply) => {
       const controller = new AbortController();
@@ -480,10 +539,15 @@ function normalHost(protocol: string, host: unknown): string | undefined {
 /** Builds the configured Oculus server and waits until it is ready. */
 export async function buildServer(options: ServerOptions = {}): Promise<FastifyInstance> {
   const timeouts = chooseTimeouts(options.timeouts);
+  const uploadTimeouts = chooseUploadTimeouts(options.uploadTimeouts);
   const env = options.env ?? process.env;
   const trustProxy = trustedProxyFromEnv(env);
   const origins = originsFromEnv(env);
   const appRoutes = (options.routes ?? []).map(checkRoute);
+  // With an upload route, Node's whole-request limit (one per server) is the
+  // upload's, and every other request gets its usual limit from a timer of
+  // our own (the onRequest hook below).
+  const hasUploads = appRoutes.some((r) => r.upload !== undefined);
   const admin = options.admin;
   if (admin !== undefined && !origins.has(admin.origin)) {
     throw new Error("the admin's origin must be one of OCULUS_ORIGINS");
@@ -517,7 +581,7 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
     onProtoPoisoning: "error",
     onConstructorPoisoning: "error",
     connectionTimeout: timeouts.connection,
-    requestTimeout: timeouts.request,
+    requestTimeout: hasUploads ? uploadTimeouts.request : timeouts.request,
     keepAliveTimeout: timeouts.keepAlive,
     handlerTimeout: timeouts.handler,
     http: {
@@ -560,6 +624,36 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
   app.addHook("onRequest", (request, _reply, done) => {
     done(requestRefusal(request, origins));
   });
+
+  if (hasUploads) {
+    app.addHook("onRequest", (request, reply, done) => {
+      const raw = request.raw;
+      const socket = raw.socket;
+      if (request.routeOptions.config.oculus?.upload === true) {
+        // Inactivity: the socket's own timeout while this request runs
+        // (Node puts the keep-alive timeout back after the reply). The
+        // whole upload is the route's handler timeout and Node's
+        // requestTimeout.
+        // (`inject`'s stand-in socket has no timeout to set.)
+        if (typeof socket.setTimeout === "function") socket.setTimeout(uploadTimeouts.idle);
+        done();
+        return;
+      }
+      // Every other request: its body must arrive within the usual limit,
+      // as Node's requestTimeout would have required.
+      const timer = setTimeout(() => {
+        if (!raw.complete && !reply.raw.headersSent)
+          clientError({ code: "ERR_HTTP_REQUEST_TIMEOUT" }, socket);
+      }, timeouts.request);
+      timer.unref();
+      const clear = (): void => {
+        clearTimeout(timer);
+      };
+      raw.once("end", clear);
+      reply.raw.once("close", clear);
+      done();
+    });
+  }
 
   app.addHook("onSend", async (request, reply, payload) => {
     if (replyCookieProblem(reply, reply.getHeader("set-cookie")) !== undefined) {
@@ -624,8 +718,12 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
       .send({ error: wrongMethod ? "method_not_allowed" : "not_found" });
   });
 
-  addRoute(app, checkRoute({ method: "GET", path: "/health", handler: () => ({ status: "ok" }) }));
-  for (const route of appRoutes) addRoute(app, route);
+  addRoute(
+    app,
+    checkRoute({ method: "GET", path: "/health", handler: () => ({ status: "ok" }) }),
+    uploadTimeouts.request,
+  );
+  for (const route of appRoutes) addRoute(app, route, uploadTimeouts.request);
 
   await app.ready();
   return app;

@@ -20,7 +20,7 @@ import { organizationFileBytes, sql } from "@oculus/db";
 import { createService, openFileStore, type FileStore } from "@oculus/service";
 import type { FastifyInstance } from "fastify";
 import { OCULUS_COOKIES } from "./cookies.js";
-import { buildServer } from "./server.js";
+import { UPLOAD_TIMEOUTS, buildServer, type UploadTimeouts } from "./server.js";
 import {
   CSRF_HEADER,
   FILE_NAME_HEADER,
@@ -45,7 +45,7 @@ import { grant } from "../../service/src/people.fixtures.js";
 /** The per-file cap in these tests: 64 KiB, so a cap hit costs little. */
 const MAX_FILE = 64 * 1024;
 /** What the small-quota server allows beyond what the organization already stores. */
-const SMALL_ROOM = 10 * 1024;
+const SMALL_ROOM = 13 * 1024;
 
 const ORIGIN = "http://localhost";
 
@@ -72,7 +72,11 @@ const assetDraft = (title: string, siteRepresents?: string) => ({
 /** Assets: on A1, on A2, in organization B; an object on A1. */
 const ids: Record<string, string> = {};
 
-async function serve(world: World, files: FileStore): Promise<FastifyInstance> {
+async function serve(
+  world: World,
+  files: FileStore,
+  uploadTimeouts?: Partial<UploadTimeouts>,
+): Promise<FastifyInstance> {
   const service = createService(world.db, {
     onError: serviceErrorLogger((r) => logged.push(r)),
     files,
@@ -80,6 +84,7 @@ async function serve(world: World, files: FileStore): Promise<FastifyInstance> {
   const server = await buildServer({
     env: { OCULUS_ORIGINS: ORIGIN },
     logger: { stream: { write: (line: string) => serverLog.push(line) } },
+    ...(uploadTimeouts === undefined ? {} : { uploadTimeouts }),
     routes: staffApiRoutes({
       db: world.db,
       service,
@@ -155,6 +160,8 @@ interface Send {
   to?: { host: string; port: number };
   /** Send no Content-Length (chunked). */
   chunked?: boolean;
+  /** Milliseconds between chunks (default: none). */
+  pace?: number;
 }
 
 /** One real HTTP request; resolves with the reply even if the server stops reading early. */
@@ -177,7 +184,7 @@ function send(path: string, s: Send = {}): Promise<Reply> {
   }
   const chunks = s.body === undefined ? [] : Array.isArray(s.body) ? s.body : [s.body];
   const total = chunks.reduce((n, c) => n + c.length, 0);
-  if (method !== "GET" && s.chunked !== true) headers["content-length"] = String(total);
+  if (method !== "GET" && s.chunked !== true) headers["content-length"] ??= String(total);
   const target = s.to ?? base;
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -212,7 +219,7 @@ function send(path: string, s: Send = {}): Promise<Reply> {
         if (req.destroyed) return;
         const more = req.write(chunk);
         if (!more) await new Promise((r) => req.once("drain", r));
-        await new Promise((r) => setImmediate(r));
+        await new Promise((r) => (s.pace === undefined ? setImmediate(r) : setTimeout(r, s.pace)));
       }
       req.end();
     })();
@@ -511,7 +518,7 @@ describe("uploads: what is stored", () => {
   it("refuses cleanly past the organization's total, counting each content once", async () => {
     const asset = await makeAs(w, w.b, w.b1, assetDraft("An invented quota scan"));
     const twin = await makeAs(w, w.b, w.b1, assetDraft("An invented quota twin"));
-    // A second server over the same database whose store allows 10 KiB more
+    // A second server over the same database whose store allows 13 KiB more
     // than organization B already stores.
     const used = await organizationFileBytes(w.db, w.b);
     const small = await openFileStore({
@@ -524,19 +531,22 @@ describe("uploads: what is stored", () => {
     const six = fakePng(6 * 1024 - 31);
     const first = await upload(asset, { as: "stranger", body: six, to: smallBase });
     expect(first.status).toBe(201);
-    // The same content on another asset adds nothing; sent without a length
-    // (a declared length is counted before the content is known).
+    // The same content on another asset adds nothing to the total once
+    // attached (while it streams it counts, as the content isn't known yet;
+    // a declared length is counted the same way).
     expect(
       (await upload(twin, { as: "stranger", body: [six], chunked: true, to: smallBase })).status,
     ).toBe(201);
-    // New content past the total: refused, before reading when the length is declared...
-    const more = await upload(asset, { as: "stranger", body: fakePng(6 * 1024), to: smallBase });
+    expect(await organizationFileBytes(w.db, w.b)).toBe(used + six.length);
+    // New content past the total: refused before reading when the length is declared...
+    const seven = () => fakePng(7300);
+    const more = await upload(asset, { as: "stranger", body: seven(), to: smallBase });
     expect(more.status).toBe(413);
     expect(more.json).toEqual({ error: "quota_exceeded" });
-    // ...and after it, under the lock, when it isn't.
+    // ...and while it streams when it isn't.
     const chunked = await upload(asset, {
       as: "stranger",
-      body: [fakePng(3 * 1024), randomBytes(3 * 1024)],
+      body: [seven().subarray(0, 3000), seven().subarray(3000)],
       chunked: true,
       to: smallBase,
     });
@@ -612,5 +622,142 @@ describe("uploads: the logs", () => {
     ]) {
       expect(text).not.toContain(secret);
     }
+  });
+});
+
+describe("uploads: stalls, trickles and time limits", () => {
+  const warnings: string[] = [];
+  const onWarning = (w: Error & { code?: string }) => {
+    warnings.push(w.code ?? w.name);
+  };
+
+  it("removes the partial file of a client that stalls or trickles, and of a declared length too large", async () => {
+    process.on("warning", onWarning);
+    const dir = mkdtempSync(join(tmpdir(), "oculus-files-slow-"));
+    const slowStore = await openFileStore({ dir, maxFileBytes: 1024 * 1024 });
+    const slow = await serve(w, slowStore, { idle: 400, request: 1500 });
+    const to = addressOf(slow);
+    const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented stalled scan"));
+    const incoming = () => filesUnder(dir).filter((p) => p.includes("incoming"));
+
+    // Stalls: 40 KB of a declared 100,000 bytes, then silence.
+    const stalled = upload(asset, {
+      as: "cataloger",
+      to,
+      headers: { "content-length": "100000" },
+      body: [fakePng(40 * 1024)],
+    }).catch((error: unknown) => error);
+    await new Promise((r) => setTimeout(r, 200));
+    expect(incoming()).toHaveLength(1);
+    await stalled;
+    await new Promise((r) => setTimeout(r, 300));
+    expect(incoming()).toEqual([]);
+
+    // Trickles: 1 KB every 100 ms, past the whole-upload limit.
+    const trickled = await upload(asset, {
+      as: "cataloger",
+      to,
+      chunked: true,
+      pace: 100,
+      body: Array.from({ length: 40 }, () => randomBytes(1024)),
+    }).catch((error: unknown) => error);
+    if (!(trickled instanceof Error)) expect((trickled as Reply).status).toBe(503);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(incoming()).toEqual([]);
+    expect(await rowsFor(asset)).toBe(0);
+
+    // A declared length over 1 TiB or of 17 digits is refused outright.
+    for (const length of ["1099511627777", "10000000000000000"]) {
+      const r = await upload(asset, { as: "cataloger", to, headers: { "content-length": length } });
+      expect(r.status, length).toBe(413);
+      expect(r.json).toEqual({ error: "payload_too_large" });
+    }
+    // Other routes keep their usual limits on the same server.
+    const ok = await send(`/api/records/${asset}/files`, { as: "cataloger", method: "GET", to });
+    expect(ok.status).toBe(200);
+    await slow.close();
+    rmSync(dir, { recursive: true, force: true });
+    process.off("warning", onWarning);
+    expect(warnings.filter((code) => code === "DEP0137")).toEqual([]);
+  });
+
+  it("raises Node's whole-request limit to the upload's on a server with upload routes", () => {
+    expect(app.server.requestTimeout).toBe(UPLOAD_TIMEOUTS.request);
+  });
+});
+
+describe("removing files", () => {
+  it("removes a file with the edit rule and If-Match, then the sweep deletes its unnamed copy", async () => {
+    const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented removable scan"));
+    const body = fakePng(700);
+    const added = await upload(asset, { as: "cataloger", body, name: "remove me.png" });
+    const fileId = (added.json.file as { id: string }).id;
+    const path = `/api/records/${asset}/files/${fileId}`;
+    // Hidden, missing and other refusals.
+    expect(
+      (await send(path, { as: "reader", method: "DELETE", contentType: null, name: null })).status,
+    ).toBe(403);
+    expect(
+      (await send(path, { as: "other", method: "DELETE", contentType: null, name: null })).status,
+    ).toBe(404);
+    const missing = await send(`/api/records/${asset}/files/${newRecordId()}`, {
+      as: "cataloger",
+      method: "DELETE",
+      contentType: null,
+      name: null,
+    });
+    expect(missing.status).toBe(404);
+    expect(missing.text).toBe('{"error":"not_found"}');
+    expect(
+      (
+        await send(path, {
+          as: "cataloger",
+          method: "DELETE",
+          contentType: null,
+          name: null,
+          ifMatch: '"v9"',
+        })
+      ).status,
+    ).toBe(412);
+    // The asset can't be deleted while it has files.
+    const refusedDelete = await send(`/api/records/${asset}`, {
+      as: "root",
+      method: "DELETE",
+      contentType: null,
+      name: null,
+    });
+    expect(refusedDelete.status).toBe(422);
+    const blocker = (refusedDelete.json.issues as { code: string; message: string }[])[0];
+    expect(blocker?.code).toBe("has_files");
+    expect(blocker?.message).toMatch(/Remove its files first/);
+    // Removed: the row goes, the copy stays until the sweep.
+    const removed = await send(path, {
+      as: "cataloger",
+      method: "DELETE",
+      contentType: null,
+      name: null,
+    });
+    expect(removed.status).toBe(200);
+    expect(await rowsFor(asset)).toBe(0);
+    expect(existsSync(store.pathFor(w.a, sha(body)))).toBe(true);
+    const service = createService(w.db, { files: store });
+    const swept = await service.sweepFiles(3600_000);
+    expect(swept.contents).toBeGreaterThanOrEqual(1);
+    expect(existsSync(store.pathFor(w.a, sha(body)))).toBe(false);
+    // Copies rows still name stay.
+    const kept = filesUnder(filesDir).filter((p) => p.includes("sha256"));
+    expect(kept.length).toBeGreaterThan(0);
+    for (const p of kept) expect(existsSync(join(filesDir, p))).toBe(true);
+    // Now the asset can be deleted.
+    expect(
+      (
+        await send(`/api/records/${asset}`, {
+          as: "root",
+          method: "DELETE",
+          contentType: null,
+          name: null,
+        })
+      ).status,
+    ).toBe(200);
   });
 });

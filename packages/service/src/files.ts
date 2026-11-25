@@ -37,13 +37,16 @@ import {
   type RecordId,
 } from "@oculus/core";
 import {
+  deleteStoredFile,
   findStoredFile,
+  namedContents,
   insertStoredFile,
   listStoredFiles,
   lockOrganizationFiles,
   organizationFileBytes,
   organizationHasContent,
   versionConflict,
+  type Database,
   type Queryable,
   type RecordPlace,
   type StoredFile,
@@ -74,13 +77,26 @@ export interface AttachedFile {
   readonly created: boolean;
 }
 
+export interface RemoveFileOptions {
+  /** The asset's version (`If-Match`). */
+  readonly expectedVersion: number;
+}
+
+/** What a sweep removed. */
+export interface FileSweep {
+  /** Temporary files older than an upload may take (a crash, a stuck upload). */
+  readonly incoming: number;
+  /** Stored copies no row names any more (removed files, a failed COMMIT). */
+  readonly contents: number;
+}
+
 export interface FileOperations {
   /** Asked before an upload is read; see the module header. */
   mayAttachFile(
     context: ServiceContext,
     recordId: RecordId,
     check: AttachCheck,
-  ): Promise<ServiceResult<{ readonly maxFileBytes: number }>>;
+  ): Promise<ServiceResult<{ readonly maxFileBytes: number; readonly usedBytes: number }>>;
   /** Attaches received bytes to the asset; always discards the temporary file. */
   attachFile(
     context: ServiceContext,
@@ -88,6 +104,23 @@ export interface FileOperations {
     received: ReceivedFile,
     options: AttachOptions,
   ): Promise<ServiceResult<AttachedFile>>;
+  /**
+   * Removes one file from an asset: the same rule as attaching (the edit
+   * permission where the asset is, `If-Match`). The copy on disk goes at
+   * the next sweep, once no row names its content.
+   */
+  removeFile(
+    context: ServiceContext,
+    recordId: RecordId,
+    fileId: string,
+    options: RemoveFileOptions,
+  ): Promise<ServiceResult<{ readonly removed: true }>>;
+  /**
+   * A job, not a person's operation (no context): removes temporary files
+   * older than `incomingMaxAgeMs` and, for each organization under its file
+   * lock, the stored copies no row names. Run at startup and on a timer.
+   */
+  sweepFiles(incomingMaxAgeMs: number): Promise<FileSweep>;
   /** The asset's files (name, size, sniffed type, who and when). */
   listFiles(
     context: ServiceContext,
@@ -114,6 +147,7 @@ function refusal(path: (string | number)[], code: string, message: string): Serv
 const NO_STORE = refusal(["files"], "files_unavailable", "Files can't be stored on this server.");
 
 export function fileOperations(
+  db: Database,
   run: Runner,
   mayChange: PlaceCheck,
   store: FileStore | undefined,
@@ -163,6 +197,10 @@ export function fileOperations(
     return undefined;
   }
 
+  function diskFull(): ServiceRefusal {
+    return refusal(["files"], "disk_full", "The server is running out of disk space for files.");
+  }
+
   function overQuota(): ServiceRefusal {
     return refusal(
       ["files"],
@@ -178,6 +216,9 @@ export function fileOperations(
         const refused = await attachable(tx, who, recordId, check.expectedVersion);
         if (refused) return refused;
         const declared = check.declaredBytes;
+        // A first look without the lock; the upload counts as it streams,
+        // and attachFile counts again under the lock.
+        const used = await organizationFileBytes(tx, who.organizationId);
         if (declared !== undefined) {
           if (declared > store.maxFileBytes) {
             return refusal(
@@ -186,11 +227,13 @@ export function fileOperations(
               "The file is larger than the server takes.",
             );
           }
-          // A first look without the lock; attachFile counts again under it.
-          const used = await organizationFileBytes(tx, who.organizationId);
           if (used + declared > store.maxOrganizationBytes) return overQuota();
         }
-        return { ok: true, value: Object.freeze({ maxFileBytes: store.maxFileBytes }) };
+        if (await store.lowOnSpace(declared ?? 0)) return diskFull();
+        return {
+          ok: true,
+          value: Object.freeze({ maxFileBytes: store.maxFileBytes, usedBytes: used }),
+        };
       });
     },
 
@@ -259,6 +302,49 @@ export function fileOperations(
       } finally {
         await store?.discard(received).catch(() => undefined);
       }
+    },
+
+    async removeFile(context, recordId, fileId, options) {
+      return run(
+        "removeFile",
+        context,
+        async (tx, who): Promise<ServiceResult<{ readonly removed: true }>> => {
+          const refused = await attachable(tx, who, recordId, options.expectedVersion);
+          if (refused) return refused;
+          await lockOrganizationFiles(tx, who.organizationId);
+          if (!(await deleteStoredFile(tx, who.organizationId, recordId, fileId))) {
+            return refusal(["fileId"], "unknown_file", "The record has no such file.");
+          }
+          return { ok: true, value: Object.freeze({ removed: true as const }) };
+        },
+      );
+    },
+
+    async sweepFiles(incomingMaxAgeMs) {
+      if (store === undefined) return { incoming: 0, contents: 0 };
+      const incoming = await store.staleIncoming(incomingMaxAgeMs);
+      let contents = 0;
+      for (const organizationId of await store.organizations()) {
+        // Under the organization's file lock: an attach placing a copy
+        // holds it until its row is committed, so a copy is never taken
+        // from under a row about to name it.
+        contents += await db.transaction(async (tx) => {
+          await lockOrganizationFiles(tx, organizationId);
+          const onDisk = await store.contents(organizationId);
+          let removed = 0;
+          for (let i = 0; i < onDisk.length; i += 1000) {
+            const batch = onDisk.slice(i, i + 1000);
+            const named = await namedContents(tx, organizationId, batch);
+            for (const sha256 of batch) {
+              if (named.has(sha256)) continue;
+              await store.removeContent(organizationId, sha256);
+              removed++;
+            }
+          }
+          return removed;
+        });
+      }
+      return Object.freeze({ incoming, contents });
     },
 
     async listFiles(context, recordId) {

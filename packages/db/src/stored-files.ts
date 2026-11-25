@@ -26,10 +26,13 @@ import type { Queryable } from "./client.js";
 import { isActorId } from "./record-versions.js";
 import { sql } from "./sql.js";
 
-/** What the writer may do to the table (D-067's allowlist): insert, nothing else. */
+/**
+ * What the writer may do to the table (D-067's allowlist): insert a file,
+ * delete one (removing it from its asset); never change one.
+ */
 export const STORED_FILE_TABLE_PRIVILEGES: Readonly<Record<string, readonly string[]>> =
   Object.freeze({
-    stored_files: Object.freeze(["INSERT"]),
+    stored_files: Object.freeze(["INSERT", "DELETE"]),
   });
 
 /** One file attached to a digital asset. */
@@ -210,4 +213,38 @@ export async function insertStoredFile(tx: Queryable, file: NewStoredFile): Prom
   const row = rows[0];
   if (row === undefined) throw new Error("The stored file wasn't inserted.");
   return fromRow(row);
+}
+
+/**
+ * Removes one file from its asset: `true` if the row was there. The copy on
+ * disk stays until the sweep finds that no row names its content.
+ */
+export async function deleteStoredFile(
+  tx: Queryable,
+  organizationId: OrganizationId,
+  recordId: RecordId,
+  fileId: string,
+): Promise<boolean> {
+  checkOrganization(organizationId);
+  if (!isRecordId(recordId) || !isRecordId(fileId)) return false;
+  const deleted = await tx.execute(sql`
+    DELETE FROM public.stored_files
+    WHERE organization_id = ${organizationId}::uuid AND record_id = ${recordId}::uuid
+      AND id = ${fileId}::uuid`);
+  return deleted > 0;
+}
+
+/** Which of these contents some row of the organization still names. */
+export async function namedContents(
+  db: Queryable,
+  organizationId: OrganizationId,
+  hashes: readonly string[],
+): Promise<ReadonlySet<string>> {
+  checkOrganization(organizationId);
+  const wanted = hashes.filter((h) => isSha256Hex(h));
+  if (wanted.length === 0) return new Set();
+  const rows = await db.rows<{ sha256: string }>(sql`
+    SELECT DISTINCT sha256 FROM public.stored_files
+    WHERE organization_id = ${organizationId}::uuid AND sha256 = ANY(${wanted}::text[])`);
+  return new Set(rows.map((r) => r.sha256));
 }

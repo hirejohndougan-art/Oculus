@@ -354,6 +354,7 @@ function fileRefusal(result: ServiceRefusal): Refusal | undefined {
   if (codes.has("files_unavailable")) return new Refusal(503, "files_unavailable");
   if (codes.has("file_too_large")) return new Refusal(413, "payload_too_large");
   if (codes.has("quota_exceeded")) return new Refusal(413, "quota_exceeded");
+  if (codes.has("disk_full")) return new Refusal(507, "disk_full");
   return undefined;
 }
 
@@ -565,15 +566,21 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
           if (fixed !== undefined) throw fixed;
           return refused(check, reply, log);
         }
-        const received = await files.receive(
-          context.organizationId,
-          upload.chunks(),
-          request.signal,
-        );
+        const received = await files.receive(context.organizationId, upload.chunks(), {
+          signal: request.signal,
+          usedBytes: check.value.usedBytes,
+        });
         if (!received.ok) {
-          throw received.code === "empty_file"
-            ? new Refusal(400, "empty_file")
-            : new Refusal(413, "payload_too_large");
+          switch (received.code) {
+            case "empty_file":
+              throw new Refusal(400, "empty_file");
+            case "quota_exceeded":
+              throw new Refusal(413, "quota_exceeded");
+            case "disk_full":
+              throw new Refusal(507, "disk_full");
+            default:
+              throw new Refusal(413, "payload_too_large");
+          }
         }
         const result = await service.attachFile(context, id, received.file, {
           expectedVersion,
@@ -587,6 +594,28 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
         }
         reply.status(result.value.created ? 201 : 200);
         return { file: result.value.file, created: result.value.created };
+      }),
+    },
+    {
+      // Remove one file from an asset (M-002, D-086): the attach rule,
+      // If-Match on the asset. Its copy goes at the next sweep once no row
+      // names its content.
+      method: "DELETE",
+      path: "/api/records/:id/files/:fileId",
+      handler: signedIn("write", true, async (request, reply, { context }) => {
+        const expectedVersion = ifMatchVersion(request);
+        if (request.body !== undefined) throw new Refusal(400, "bad_body");
+        const result = await service.removeFile(
+          context,
+          recordId(request),
+          request.params.fileId ?? "",
+          { expectedVersion },
+        );
+        if (!result.ok && result.issues.some((i) => i.code === "unknown_file")) {
+          // A file the asset doesn't have: the same reply as a missing record.
+          throw new Refusal(404, "not_found");
+        }
+        return answer(result, reply, (value) => value);
       }),
     },
     {

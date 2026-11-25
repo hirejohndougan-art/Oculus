@@ -12,10 +12,10 @@
 --
 -- Separation (D-019, D-060): keyed (organization_id, id), the asset by a
 -- composite foreign key to its own organization's records, so no row points
--- across organizations. The writer may only INSERT (WRITER_PRIVILEGES); rows
--- never change (stored_files_fixed) and nothing deletes them yet (removing a
--- file is a later task). An asset holding files can't be deleted until then
--- (the foreign key refuses, ON DELETE NO ACTION).
+-- across organizations. The writer may INSERT and DELETE (removing a file
+-- from its asset); rows never change (stored_files_fixed). An asset holding
+-- files can't be deleted (the service answers has_files; the foreign key
+-- refuses too, ON DELETE NO ACTION).
 CREATE TABLE public.stored_files (
   organization_id uuid NOT NULL REFERENCES public.organizations (id),
   id uuid NOT NULL CONSTRAINT stored_files_id_v4
@@ -33,7 +33,7 @@ CREATE TABLE public.stored_files (
   -- formatting characters, no path separator.
   original_name text NOT NULL CONSTRAINT stored_files_original_name_format
     CHECK (char_length(original_name) BETWEEN 1 AND 255
-      AND original_name !~ '[\x01-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff/\\]'),
+      AND original_name !~ '[\x01-\x1f\x7f-\x9f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff\ufff9-\ufffb/\\]'),
   created_by text NOT NULL CONSTRAINT stored_files_created_by_format
     CHECK (created_by ~ '^(user:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|system:[a-z][a-z0-9_-]{0,63})$'),
   created_at timestamptz NOT NULL CONSTRAINT stored_files_created_at_ms

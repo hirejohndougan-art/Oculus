@@ -337,6 +337,8 @@ export {
   lockOrganizationFiles,
   organizationFileBytes,
   organizationHasContent,
+  deleteStoredFile,
+  namedContents,
 } from "./stored-files.js";
 export type { NewStoredFile, StoredFile } from "./stored-files.js";
 export {

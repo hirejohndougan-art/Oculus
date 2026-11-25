@@ -43,9 +43,25 @@ export {
   DEFAULT_MAX_FILE_BYTES,
   DEFAULT_MAX_ORGANIZATION_BYTES,
   MAX_CAP_BYTES,
+  DEFAULT_MIN_FREE_BYTES,
+  DEFAULT_MIN_FREE_FRACTION,
 } from "./file-store.js";
-export type { FileStore, FileStoreOptions, ReceivedFile, ReceiveResult } from "./file-store.js";
-export type { AttachCheck, AttachOptions, AttachedFile, FileOperations } from "./files.js";
+export type {
+  FileStore,
+  FileStoreOptions,
+  ReceivedFile,
+  ReceiveOptions,
+  ReceiveRefusal,
+  ReceiveResult,
+} from "./file-store.js";
+export type {
+  AttachCheck,
+  AttachOptions,
+  AttachedFile,
+  FileOperations,
+  FileSweep,
+  RemoveFileOptions,
+} from "./files.js";
 export type {
   PeopleOperations,
   PeopleContext,

@@ -101,7 +101,8 @@ export async function signInAndSetUp(
   if (check) await accessible(page, "Set up two-step sign-in");
   await page.getByRole("button", { name: "Start setting up" }).press("Enter");
 
-  await expect(page.getByRole("img", { name: /QR code/ })).toBeVisible();
+  // The set-up step hashes and seals the key; give it time on a loaded machine.
+  await expect(page.getByRole("img", { name: /QR code/ })).toBeVisible({ timeout: 15_000 });
   if (check) await accessible(page, "Scan the code");
   const key = (await page.locator("code").first().textContent()) ?? "";
   const secret = decodeBase32(key.replace(/\s+/g, ""));

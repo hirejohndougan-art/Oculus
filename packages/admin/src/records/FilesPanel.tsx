@@ -5,6 +5,7 @@
  * another, each with a progress bar and a Cancel button. A file larger than
  * the server takes is refused here before it is sent. Viewing and
  * downloading come later (M-003); nothing here shows a file's content.
+ * People who may edit can also remove a file (asked first, in the page).
  * Names are shown as text only.
  */
 import { useRef, useState } from "react";
@@ -12,6 +13,7 @@ import { FileTrigger } from "react-aria-components";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, api, problemText, uploadFile } from "../api";
 import { Button, Note } from "../components/ui";
+import { ConfirmPanel } from "./controls";
 import { whenText } from "./model";
 import styles from "./Records.module.css";
 
@@ -59,6 +61,8 @@ function failureText(error: unknown): string {
       return "It is larger than this server takes.";
     case "quota_exceeded":
       return "Your organization has used all its space for files.";
+    case "disk_full":
+      return "The server is running out of disk space. Ask whoever runs Oculus.";
     case "empty_file":
       return "The file is empty.";
     case "bad_file_name":
@@ -94,6 +98,9 @@ export function FilesPanel(props: Props) {
   });
   const [uploads, setUploads] = useState<readonly Upload[]>([]);
   const [busy, setBusy] = useState(false);
+  const [removing, setRemoving] = useState<StoredFileEntry>();
+  const [removeBusy, setRemoveBusy] = useState(false);
+  const [notice, setNotice] = useState<{ tone: "amber" | "green"; text: string }>();
   const cancel = useRef<AbortController | undefined>(undefined);
   const nextKey = useRef(1);
   const cancelAll = useRef(false);
@@ -162,6 +169,27 @@ export function FilesPanel(props: Props) {
       }
     }
     setBusy(false);
+  }
+
+  async function remove(file: StoredFileEntry) {
+    setRemoveBusy(true);
+    try {
+      await api(
+        `/api/records/${encodeURIComponent(recordId)}/files/${encodeURIComponent(file.id)}`,
+        {
+          method: "DELETE",
+          ifMatch: props.version,
+          site: siteId,
+        },
+      );
+      setNotice({ tone: "green", text: `Removed ${file.name}.` });
+      await queries.invalidateQueries({ queryKey: filesKey(recordId) });
+    } catch (error) {
+      setNotice({ tone: "amber", text: `${file.name} wasn't removed. ${failureText(error)}` });
+    } finally {
+      setRemoveBusy(false);
+      setRemoving(undefined);
+    }
   }
 
   const files = list.data?.files ?? [];
@@ -234,6 +262,28 @@ export function FilesPanel(props: Props) {
           ))}
         </ul>
       )}
+      {notice === undefined ? null : (
+        <Note tone={notice.tone} alert={notice.tone === "amber"}>
+          {notice.text}
+        </Note>
+      )}
+      <ConfirmPanel
+        isOpen={removing !== undefined}
+        title={`Remove ${removing?.name ?? "this file"}?`}
+        confirmLabel="Remove the file"
+        danger
+        busy={removeBusy}
+        onCancel={() => {
+          setRemoving(undefined);
+        }}
+        onConfirm={() => {
+          if (removing !== undefined) void remove(removing);
+        }}
+      >
+        <p>
+          It is taken off this record. Its copy on the server is deleted once no record uses it.
+        </p>
+      </ConfirmPanel>
       <p role="status" className={styles.meta}>
         {busy ? "Uploading…" : done > 0 ? `${String(done)} added.` : ""}
       </p>
@@ -255,6 +305,7 @@ export function FilesPanel(props: Props) {
                 <th scope="col">Size</th>
                 <th scope="col">Type</th>
                 <th scope="col">Added</th>
+                {props.canUpload ? <th scope="col">Actions</th> : null}
               </tr>
             </thead>
             <tbody>
@@ -264,6 +315,20 @@ export function FilesPanel(props: Props) {
                   <td>{sizeText(f.size)}</td>
                   <td>{f.mediaType}</td>
                   <td>{whenText(f.createdAt)}</td>
+                  {props.canUpload ? (
+                    <td>
+                      <Button
+                        variant="link"
+                        isDisabled={busy || removeBusy}
+                        onPress={() => {
+                          setNotice(undefined);
+                          setRemoving(f);
+                        }}
+                      >
+                        Remove {f.name}
+                      </Button>
+                    </td>
+                  ) : null}
                 </tr>
               ))}
             </tbody>

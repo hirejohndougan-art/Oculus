@@ -489,8 +489,16 @@ export function routeOptionsProblem(route: RouteOptions): string | undefined {
   if (typeof method !== "string" || !ROUTE_METHODS_WITH_HEAD.has(method)) {
     return "route method not allowed";
   }
+  const upload = route.config?.oculus?.upload === true;
   for (const [key, value] of Object.entries(route)) {
     if (value === undefined) continue;
+    // An upload route's own handler limit (server.ts UPLOAD_TIMEOUTS).
+    if (key === "handlerTimeout" && upload && (route.method === "POST" || route.method === "PUT")) {
+      if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > 30 * 60_000) {
+        return "an upload route's handler timeout is at most 30 minutes";
+      }
+      continue;
+    }
     if (!FASTIFY_ROUTE_KEYS.has(key)) return `route option not allowed: ${key}`;
   }
   const prefix = (route as { prefix?: unknown }).prefix;

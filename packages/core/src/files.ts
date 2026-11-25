@@ -248,16 +248,18 @@ export function sniffMediaType(input: Uint8Array): string {
   return "application/octet-stream";
 }
 
-/** C0 and C1 controls, DEL, and the bidirectional formatting characters. */
-const UNSAFE_NAME_CHARACTER =
-  // eslint-disable-next-line no-control-regex
-  /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]/u;
+/**
+ * Controls (C0, C1, DEL: `Cc`), every format character (`Cf`: the
+ * bidirectional ones, zero-width ones, soft hyphen, BOM), lone surrogates
+ * (`Cs`) and the line and paragraph separators.
+ */
+const UNSAFE_NAME_CHARACTER = /[\p{Cc}\p{Cf}\p{Cs}\u2028\u2029]/u;
 
 /**
  * The name a client gave a file, as metadata: the part after the last `/`
  * or `\`, NFC, trimmed of spaces, 1 to `MAX_FILE_NAME_LENGTH` code points.
- * `undefined` when it is empty, all dots, too long, or holds a control or
- * bidirectional formatting character. The result is shown as text only and
+ * `undefined` when it is empty, all dots, too long, or holds a control, a
+ * format character, a lone surrogate or a line or paragraph separator. The result is shown as text only and
  * never used in a path.
  */
 export function cleanFileName(input: unknown): string | undefined {

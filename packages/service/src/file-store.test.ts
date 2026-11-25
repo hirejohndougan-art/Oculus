@@ -5,8 +5,13 @@
 // refusals when opening. Every byte is invented.
 import { createHash, randomBytes } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
+  linkSync,
   lstatSync,
+  mkdirSync,
+  statSync,
+  utimesSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -125,7 +130,7 @@ describe("receive, place and discard", () => {
       controller.abort(new Error("the request has ended"));
       yield randomBytes(1000);
     }
-    await expect(store.receive(org, slow(), controller.signal)).rejects.toThrow();
+    await expect(store.receive(org, slow(), { signal: controller.signal })).rejects.toThrow();
     expect(tree()).toEqual(before);
   });
 
@@ -169,5 +174,134 @@ describe("receive, place and discard", () => {
     }
     await expect(store.receive(org, strings())).rejects.toThrow(TypeError);
     expect(tree().filter((p) => p.includes("incoming"))).toEqual([]);
+  });
+});
+
+describe("the safety and limits added after review", () => {
+  it("refuses a root writable by group or others", async () => {
+    const open = mkdtempSync(join(tmpdir(), "oculus-store-open-"));
+    chmodSync(open, 0o777);
+    await expect(openFileStore({ dir: open })).rejects.toThrow(/writable by it alone/);
+    chmodSync(open, 0o770);
+    await expect(openFileStore({ dir: open })).rejects.toThrow(/writable by it alone/);
+    chmodSync(open, 0o700);
+    await expect(openFileStore({ dir: open })).resolves.toBeDefined();
+    rmSync(open, { recursive: true, force: true });
+  });
+
+  it("never follows a link planted for a folder below the root", async () => {
+    const other = newOrganizationId();
+    const outside = mkdtempSync(join(tmpdir(), "oculus-store-outside-"));
+    mkdirSync(join(dir, other));
+    symlinkSync(outside, join(dir, other, "incoming"));
+    await expect(store.receive(other, chunksOf(randomBytes(10)))).rejects.toThrow(/plain folder/);
+    expect(readdirSync(outside)).toEqual([]);
+    rmSync(join(dir, other, "incoming"));
+    // A folder writable by others is refused too.
+    mkdirSync(join(dir, other, "incoming"));
+    chmodSync(join(dir, other, "incoming"), 0o777);
+    await expect(store.receive(other, chunksOf(randomBytes(10)))).rejects.toThrow(/plain folder/);
+    rmSync(join(dir, other), { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  it("leaves a stored copy with one link, and replaces a copy with another link to it", async () => {
+    const body = randomBytes(3000);
+    const got = await store.receive(org, chunksOf(body));
+    if (!got.ok) throw new Error(got.code);
+    expect(await store.place(got.file)).toBe("stored");
+    const target = store.pathFor(org, sha(body));
+    expect(statSync(target).nlink).toBe(1);
+    expect(tree().filter((p) => p.includes("incoming"))).toEqual([]);
+    await store.discard(got.file);
+    // Someone keeps a second link to the copy (to change it later in place).
+    const planted = join(dir, "planted-link");
+    linkSync(target, planted);
+    const again = await store.receive(org, chunksOf(body));
+    if (!again.ok) throw new Error(again.code);
+    expect(await store.place(again.file)).toBe("stored");
+    await store.discard(again.file);
+    expect(statSync(target).nlink).toBe(1);
+    rmSync(planted);
+  });
+
+  it("counts every upload of an organization in flight against its total", async () => {
+    const small = await openFileStore({ dir, maxFileBytes: 10_000, maxOrganizationBytes: 6_000 });
+    const other = newOrganizationId();
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    async function* slowFirst(): AsyncIterable<Uint8Array> {
+      yield randomBytes(4000);
+      await held;
+    }
+    const first = small.receive(other, slowFirst(), { usedBytes: 0 });
+    await new Promise((r) => setTimeout(r, 20));
+    // While 4,000 bytes are in flight, 3,000 more don't fit in 6,000.
+    expect(await small.receive(other, chunksOf(randomBytes(3000)), { usedBytes: 0 })).toEqual({
+      ok: false,
+      code: "quota_exceeded",
+    });
+    release();
+    const done = await first;
+    if (!done.ok) throw new Error(done.code);
+    // Released when discarded: now it fits.
+    await small.discard(done.file);
+    const later = await small.receive(other, chunksOf(randomBytes(3000)), { usedBytes: 0 });
+    expect(later.ok).toBe(true);
+    if (later.ok) await small.discard(later.file);
+    // What the organization stores counts too.
+    expect(await small.receive(other, chunksOf(randomBytes(3000)), { usedBytes: 4000 })).toEqual({
+      ok: false,
+      code: "quota_exceeded",
+    });
+    expect(tree().filter((p) => p.includes("incoming") && p.includes(other))).toEqual([]);
+  });
+
+  it("refuses when the disk would drop below the free-space floor", async () => {
+    let free = 10 * 1024 * 1024 * 1024;
+    const total = 100 * 1024 * 1024 * 1024;
+    const watched = await openFileStore({
+      dir,
+      freeSpace: () => Promise.resolve({ free, total }),
+    });
+    expect(await watched.lowOnSpace(0)).toBe(false);
+    // The floor: 5% of 100 GiB is 5 GiB, more than 2 GiB, so 2 GiB.
+    expect(await watched.lowOnSpace(8 * 1024 * 1024 * 1024 + 1)).toBe(true);
+    free = 1024 * 1024 * 1024;
+    expect(await watched.receive(org, chunksOf(randomBytes(10)))).toEqual({
+      ok: false,
+      code: "disk_full",
+    });
+    const configured = await openFileStore({
+      dir,
+      minFreeBytes: 0,
+      freeSpace: () => Promise.resolve({ free: 0, total }),
+    });
+    expect(await configured.lowOnSpace(1)).toBe(false);
+  });
+
+  it("sweeps old temporary files and removes copies on request, never fresh ones", async () => {
+    const other = newOrganizationId();
+    const incoming = join(dir, other, "incoming");
+    mkdirSync(incoming, { recursive: true, mode: 0o700 });
+    writeFileSync(join(incoming, "old.part"), "x");
+    writeFileSync(join(incoming, "new.part"), "x");
+    writeFileSync(join(incoming, "other.txt"), "x");
+    const past = new Date(Date.now() - 3 * 3600_000);
+    utimesSync(join(incoming, "old.part"), past, past);
+    expect(await store.staleIncoming(3600_000)).toBe(1);
+    expect(readdirSync(incoming).sort()).toEqual(["new.part", "other.txt"]);
+    const body = randomBytes(100);
+    const got = await store.receive(other, chunksOf(body));
+    if (!got.ok) throw new Error(got.code);
+    await store.place(got.file);
+    await store.discard(got.file);
+    expect(await store.organizations()).toContain(other);
+    expect(await store.contents(other)).toEqual([sha(body)]);
+    await store.removeContent(other, sha(body));
+    expect(await store.contents(other)).toEqual([]);
+    rmSync(join(dir, other), { recursive: true, force: true });
   });
 });

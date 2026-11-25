@@ -2928,6 +2928,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
     ...definitionOperations(run),
     ...peopleOperations(db, run, onError, searchTimeoutMs),
     ...fileOperations(
+      db,
       run,
       (tx, who, recordId, rowLock, all, any) =>
         mayChange(tx, { ...who, siteId: null }, recordId, rowLock, all, any),

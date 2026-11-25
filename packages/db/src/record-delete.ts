@@ -19,6 +19,8 @@
  *   removed through the identifier save first, where dropping one is shown
  *   and confirmed (D-061: a number gone from every record is free again, also
  *   under `all_time`);
+ * - `has_files`: files are attached to it (a digital asset, M-002, D-086);
+ *   they are removed first, one by one, from its Files panel;
  * - `has_role_grants`: roles are granted for this unit's subtree (D-072);
  *   those grants are changed first (granting one locks the unit `FOR KEY
  *   SHARE` through its foreign key, so it waits for or blocks a deletion).
@@ -174,6 +176,7 @@ export async function deleteRecord(
       numbers: number;
       linkers: number;
       grants: number;
+      files: number;
     }>(sql`
       SELECT
         (SELECT count(*)::integer FROM public.records
@@ -187,7 +190,9 @@ export async function deleteRecord(
            AND jsonb_path_exists(r.fields, '$.** ? (@.recordId == $id)',
                                  jsonb_build_object('id', ${recordId}::text))) AS linkers,
         (SELECT count(*)::integer FROM public.role_assignments
-         WHERE ${where} AND scope_record_id = ${recordId}::uuid) AS grants`);
+         WHERE ${where} AND scope_record_id = ${recordId}::uuid) AS grants,
+        (SELECT count(*)::integer FROM public.stored_files
+         WHERE ${where} AND record_id = ${recordId}::uuid) AS files`);
     const problems: Issue[] = [];
     if ((uses?.children ?? 0) > 0) {
       problems.push(
@@ -222,6 +227,15 @@ export async function deleteRecord(
           ["recordId"],
           "holds_identifiers",
           "This record holds identifiers (current or former). Remove them through the identifier save first.",
+        ),
+      );
+    }
+    if ((uses?.files ?? 0) > 0) {
+      problems.push(
+        issue(
+          ["recordId"],
+          "has_files",
+          "Files are attached to this record. Remove its files first, then delete it.",
         ),
       );
     }

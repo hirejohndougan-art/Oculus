@@ -98,6 +98,9 @@ async function post(
   app: FastifyInstance,
   parts: string[],
   length?: number,
+  pace = 5,
+  path = "/upload",
+  type = "application/octet-stream",
 ): Promise<{ status: number; connection: string | undefined; body: string }> {
   if (!app.server.listening) await app.listen({ host: "127.0.0.1", port: 0 });
   const { port } = app.server.address() as AddressInfo;
@@ -107,13 +110,13 @@ async function post(
         host: "127.0.0.1",
         port,
         method: "POST",
-        path: "/upload",
+        path,
         agent: false,
         headers: {
           host: "localhost",
           origin: "http://localhost",
           connection: "keep-alive",
-          "content-type": "application/octet-stream",
+          "content-type": type,
           ...(length === undefined ? {} : { "content-length": String(length) }),
         },
       },
@@ -138,7 +141,7 @@ async function post(
       for (const part of parts) {
         if (req.destroyed) return;
         req.write(part);
-        await new Promise((r) => setTimeout(r, 5));
+        await new Promise((r) => setTimeout(r, pace));
       }
       req.end();
     })();
@@ -211,5 +214,50 @@ describe("the upload view", () => {
     expect(res.status).toBe(200);
     expect(res.connection).toBe("close");
     await app.close();
+  });
+});
+
+describe("upload time limits", () => {
+  it("lets an upload run past the usual request limit, and keeps that limit for other routes", async () => {
+    const route: OculusRoute = {
+      method: "POST",
+      path: "/upload",
+      upload: { maxBytes: 1000 },
+      handler: async (request) => {
+        let total = 0;
+        for await (const chunk of request.upload?.chunks() ?? []) total += chunk.byteLength;
+        return { total };
+      },
+    };
+    const { app } = await testServer(
+      { timeouts: { request: 600, headers: 600 }, uploadTimeouts: { idle: 2000, request: 5000 } },
+      [route],
+    );
+    // An upload trickling for longer than the usual 600 ms limit: fine.
+    const slow = await post(
+      app,
+      Array.from({ length: 10 }, () => "0123456789"),
+      undefined,
+      120,
+    );
+    expect(slow.status).toBe(200);
+    expect(JSON.parse(slow.body)).toEqual({ total: 100 });
+    // A JSON body as slow on the same server: refused at the usual limit.
+    const started = Date.now();
+    const json = await post(app, ['{"a":', '"b"', "}"], 11, 500, "/echo", "application/json").catch(
+      (error: unknown) => error,
+    );
+    expect(json instanceof Error ? 408 : (json as { status: number }).status).toBe(408);
+    expect(Date.now() - started).toBeLessThan(3000);
+    await app.close();
+  });
+
+  it("refuses longer upload limits than the defaults", async () => {
+    await expect(testServer({ uploadTimeouts: { request: 31 * 60_000 } })).rejects.toThrow(
+      /uploadTimeouts.request/,
+    );
+    await expect(testServer({ uploadTimeouts: { idle: 0 } })).rejects.toThrow(
+      /uploadTimeouts.idle/,
+    );
   });
 });
