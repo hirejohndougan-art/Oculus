@@ -2,6 +2,13 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 15:00 CT — manual (Chat A) — T-053 Phase 2 review
+
+- **Done:** two independent reviewers looked across all of Phase 2: one at security (sign-in, sessions, roles and scoping, the HTTP layer, the public side, secrets and operations), one at data integrity and operations (schema and migrations, the service as the only writer, the record lifecycle, files, setup, backup, updates, the desktop, the gate). **Nothing blocking in either**: no route, list or count leaks another organization's or site's catalog data, and nothing reachable loses or corrupts data.
+- **Reports:** `docs/reports/2026-11-phase2-review-security.md` and `docs/reports/2026-11-phase2-review-data.md`.
+- **Filed:** S-058, S-059 (with Q-13 for John: who sees the donor register), T-075 (accepting an invitation has no screen or route yet), S-060 to S-065, U-008 (the load-sensitive gate tests).
+- Gate: not run (docs only).
+
 ## 2026-11-25 17:30 CT — manual (Chat A) — S-052 Safe purge of removed files
 
 - **Done:** removed files can be cleared again (D-086, migration 0049), through System settings › Removed files (system managers, recent sign-in), `npm run files:purge` (with `--dry-run`), or a daily timer that is off by default (`OCULUS_FILES_AUTO_PURGE=on`). A copy goes only when no database row names it, it was removed at least 7 days ago by both the database's and the file system's clocks, its mtime still matches the one logged at removal, and it is not quarantined; it goes to a trash folder first and is deleted a day later. The epoch lease ties purging to one database and one install (catalog-identity checks, `identity_unknown`/`identity_changed` refuse; only adopt moves the lease after an upgrade or move), and a generation-file lock keeps one purge step at a time. Limits are stated in D-086, README and DESKTOP.md.
