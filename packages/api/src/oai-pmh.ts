@@ -23,7 +23,7 @@
  * (in arguments) or dropped (in stored names).
  *
  * Choices (D-105): identifiers `oai:<host>:<record ID>`; datestamps to the
- * second; `deletedRecord` `no`; no sets; GET only (rule 5 needs an `Origin`
+ * second, stored (S-041, D-108); `deletedRecord` `transient`; no sets; GET only (rule 5 needs an `Origin`
  * on POST); sealed resumption tokens of 25 records; each client address
  * may make `DEFAULT_RATE_LIMITS.oai` requests a minute (429 with
  * `Retry-After`), and a request holds one of the public pool's slots for
@@ -39,6 +39,7 @@ import {
   listPublishedForOai,
   oaiDatestamp,
   oaiRepository,
+  oaiStoredStamp,
   readPublicRecord,
   type Database,
   type OaiCandidate,
@@ -401,8 +402,14 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
     return result.ok ? result.value : undefined;
   }
 
-  function header(host: string, id: string, stamp: string): string {
-    return `<header>${element("identifier", identifierFor(host, id))}${element("datestamp", secondsOf(stamp))}</header>`;
+  function header(host: string, id: string, stamp: string, deleted = false): string {
+    return `<header${deleted ? ' status="deleted"' : ""}>${element("identifier", identifierFor(host, id))}${element("datestamp", secondsOf(stamp))}</header>`;
+  }
+
+  /** A record that has stopped being shown on the site (a stored mark), or undefined. */
+  async function tombstone(site: PublicSite, id: string): Promise<string | undefined> {
+    const stored = await oaiStoredStamp(options.db, site.organizationId, site.siteId, id);
+    return stored?.deleted === true ? stored.stamp : undefined;
   }
 
   function metadata(oaiDcXml: string): string {
@@ -424,7 +431,7 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
       element("protocolVersion", "2.0"),
       element("adminEmail", email),
       element("earliestDatestamp", secondsOf(repository.earliest)),
-      element("deletedRecord", "no"),
+      element("deletedRecord", "transient"),
       element("granularity", "YYYY-MM-DDThh:mm:ssZ"),
       "</Identify>",
     ].join("\n");
@@ -446,10 +453,36 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
     const { identifier, metadataPrefix } = args;
     if (identifier === undefined || metadataPrefix === undefined) return fail("badArgument", false);
     const id = recordIdOf(host, identifier);
-    const output = id === undefined ? undefined : await publicRecord(site, id);
-    if (id === undefined || output === undefined) return fail("idDoesNotExist");
+    if (id === undefined) return fail("idDoesNotExist");
+    const output = await publicRecord(site, id);
+    if (output === undefined) {
+      // Only a record the site once showed has a mark; any other is unknown.
+      const gone = await tombstone(site, id);
+      if (gone === undefined) return fail("idDoesNotExist");
+      if (metadataPrefix !== OAI_DC_PREFIX) return fail("cannotDisseminateFormat");
+      return [
+        "<GetRecord>",
+        "<record>",
+        header(host, id, gone, true),
+        "</record>",
+        "</GetRecord>",
+      ].join("\n");
+    }
     if (metadataPrefix !== OAI_DC_PREFIX) return fail("cannotDisseminateFormat");
-    const stamp = await oaiDatestamp(options.db, site.organizationId, site.siteId, id);
+    // The stored datestamp; before the site's first background pass, the computed one.
+    const stored = await oaiStoredStamp(options.db, site.organizationId, site.siteId, id);
+    // A record back since the last pass keeps the later of its mark and its
+    // computed datestamp, so it never goes backwards (review of S-041).
+    let stamp: string | undefined;
+    if (stored !== undefined && !stored.deleted) {
+      stamp = stored.stamp;
+    } else {
+      const computed = await oaiDatestamp(options.db, site.organizationId, site.siteId, id);
+      stamp =
+        stored === undefined || computed === undefined || computed > stored.stamp
+          ? computed
+          : stored.stamp;
+    }
     if (stamp === undefined) return fail("idDoesNotExist");
     return [
       "<GetRecord>",
@@ -503,6 +536,15 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
           exhausted = false;
           outOfTime = true;
           break;
+        }
+        if (candidate.deleted === true) {
+          // Stopped being shown (S-041): a deleted header, in both lists
+          // (OAI-PMH §2.5.1); nothing to read.
+          scanned += 1;
+          after = candidate;
+          const gone = header(host, candidate.id, candidate.stamp, true);
+          shown.push(verb === "ListIdentifiers" ? gone : `<record>\n${gone}\n</record>`);
+          continue;
         }
         let output: Awaited<ReturnType<typeof publicRecord>>;
         try {
@@ -560,7 +602,11 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
         const identifier = args.identifier;
         if (identifier !== undefined) {
           const id = recordIdOf(host, identifier);
-          if (id === undefined || (await publicRecord(site, id)) === undefined) {
+          if (
+            id === undefined ||
+            ((await publicRecord(site, id)) === undefined &&
+              (await tombstone(site, id)) === undefined)
+          ) {
             return fail("idDoesNotExist");
           }
         }
