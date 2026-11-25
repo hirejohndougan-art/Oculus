@@ -3,7 +3,16 @@
 // production or the development one there (D-085), an admin origin outside
 // OCULUS_ORIGINS), and the built admin served on the
 // admin's origin only, with its own CSP while the API keeps its own.
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -12,6 +21,7 @@ import type { FastifyInstance } from "fastify";
 import { FAKE_TEST_SECRET_KEY } from "../../db/src/second-factor.fixtures.js";
 import { freshDatabase, type TestDatabase } from "../../db/src/test-database.fixtures.js";
 import { migrate } from "@oculus/db";
+import { STORE_MARKER } from "@oculus/service";
 import { ADMIN_CSP, adminFileFor, loadAdminFiles, type AdminFiles } from "./admin-files.js";
 import { runAdminCli } from "./admin-cli.js";
 import { buildAdminServer, clientAddressProblem, isProduction } from "./admin-server.js";
@@ -130,12 +140,30 @@ describe("the startup checks", () => {
     const host = hostname()
       .replace(/[^A-Za-z0-9.-]/g, "_")
       .slice(0, 100);
-    const theirs = join(servers, `${host}-${String(process.ppid)}`);
+    const theirs = join(servers, `${host}-${String(process.ppid)}-0123456789abcdef`);
     writeFileSync(theirs, "another%7Cdatabase\n");
+    const marker = join(filesDir, STORE_MARKER);
+    const before = readFileSync(marker, "utf8");
+    const beforeTime = statSync(marker).mtimeMs;
     try {
       await expect(buildAdminServer({ db, env: DEV, adminFiles: files })).rejects.toThrow(
         /another Oculus server on this computer uses this folder with another database/,
       );
+      // Refused before it changed anything: not the marker, not the lease.
+      expect(readFileSync(marker, "utf8")).toBe(before);
+      expect(statSync(marker).mtimeMs).toBe(beforeTime);
+      // Nor does it bind an empty folder it is refused.
+      const empty = mkdtempSync(join(tmpdir(), "oculus-admin-claim-"));
+      mkdirSync(join(empty, ".oculus-servers"), { mode: 0o700 });
+      writeFileSync(
+        join(empty, ".oculus-servers", `${host}-${String(process.ppid)}-0123456789abcdef`),
+        "another%7Cdatabase\n",
+      );
+      await expect(
+        buildAdminServer({ db, env: { ...DEV, OCULUS_FILES_DIR: empty }, adminFiles: files }),
+      ).rejects.toThrow(/another Oculus server/);
+      expect(existsSync(join(empty, STORE_MARKER))).toBe(false);
+      rmSync(empty, { recursive: true, force: true });
     } finally {
       rmSync(theirs, { force: true });
     }

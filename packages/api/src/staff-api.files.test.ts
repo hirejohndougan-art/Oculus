@@ -31,13 +31,21 @@ import {
   migrate,
   openDatabase,
   organizationFileBytes,
+  purgeCandidates,
   databaseIdentity,
   readFileStoreBinding,
   readFileStoreLease,
   sql,
+  Sql,
   type Database,
 } from "@oculus/db";
-import { STORE_MARKER, createService, openFileStore, type FileStore } from "@oculus/service";
+import {
+  ADOPT_QUIET_MS,
+  STORE_MARKER,
+  createService,
+  openFileStore,
+  type FileStore,
+} from "@oculus/service";
 import { freshDatabase, testServerUrl } from "../../db/src/test-database.fixtures.js";
 import { createDatabase, dropDatabase, withDatabaseName } from "../../db/src/client.js";
 import { findTools } from "../../db/src/backup.js";
@@ -750,7 +758,7 @@ async function placeOrphan(db: Database, body: Buffer, assetId: string): Promise
 }
 
 describe("removing files", () => {
-  it("removes a file with the edit rule and If-Match; nothing deletes its bytes but the purge, after 7 days", async () => {
+  it("removes a file with the edit rule and If-Match; nothing deletes its bytes", async () => {
     const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented removable scan"));
     const body = fakePng(700);
     const added = await upload(asset, { as: "cataloger", body, name: "remove me.png" });
@@ -788,25 +796,16 @@ describe("removing files", () => {
     expect(await rowsFor(asset)).toBe(0);
     const copy = store.pathFor(w.a, sha(body));
     const service = createService(w.db, { files: store });
-    expect(await service.purgeFiles({ apply: false })).toMatchObject({ ok: true });
     await backdate(w.db, { fileId }, "8 days");
-    // The automatic sweep never deletes a stored copy, however old.
+    // The automatic sweep never deletes a stored copy, however old, and
+    // there is no purge in this version (fifth review).
     const swept = await service.sweepFiles(0);
     expect(swept).toMatchObject({ unbound: false, failed: 0 });
-    expect(existsSync(copy)).toBe(true);
-    // The purge lists it, then deletes it.
-    const plan = await service.purgeFiles({ apply: false });
-    if (!plan.ok) throw new Error(plan.problem);
-    const entry = plan.value.candidates.find((c) => c.sha256 === sha(body));
-    expect(entry).toMatchObject({ organizationId: w.a, size: body.length, lastEvent: "removed" });
-    expect(existsSync(copy)).toBe(true);
-    const done = await service.purgeFiles({ apply: true, only: [`${w.a}/${sha(body)}`] });
-    if (!done.ok) throw new Error(done.problem);
-    expect(done.value.deleted).toBe(1);
-    expect(existsSync(copy)).toBe(false);
-    // Copies rows still name stay, and nothing is left in the trash.
-    const kept = filesUnder(filesDir).filter((p) => p.includes("sha256"));
-    expect(kept.length).toBeGreaterThan(0);
+    expect(await service.purgeFiles({ apply: true })).toEqual({
+      ok: false,
+      problem: "not_available",
+    });
+    expect(readFileSync(copy).equals(body)).toBe(true);
     expect(filesUnder(filesDir).filter((p) => p.includes("trash"))).toEqual([]);
     // The log holds the intent, the attach and the removal, by whom.
     const events = await w.db.rows<{ kind: string; actor: string }>(sql`
@@ -844,9 +843,23 @@ describe("removing files", () => {
   });
 });
 
-describe("the purge on one database (D-086)", () => {
-  it("deletes only what this database gave up: old removals and old failed attaches, never a removal's grace cut short", async () => {
+describe("purging is off in this version (D-086, fifth review)", () => {
+  it("refuses every purge before reading or changing anything", async () => {
     const service = createService(w.db, { files: store });
+    const marker = readFileSync(join(filesDir, STORE_MARKER), "utf8");
+    const lease = (await readFileStoreLease(w.db))?.epoch;
+    for (const options of [
+      { apply: false },
+      { apply: true },
+      { apply: true, only: [`${w.a}/${"ab".repeat(32)}`] },
+    ]) {
+      expect(await service.purgeFiles(options)).toEqual({ ok: false, problem: "not_available" });
+    }
+    expect(readFileSync(join(filesDir, STORE_MARKER), "utf8")).toBe(marker);
+    expect((await readFileStoreLease(w.db))?.epoch).toBe(lease);
+  });
+
+  it("keeps the rule a later purge starts from: old removals and old failed attaches only, never a removal's grace cut short", async () => {
     const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented purge scan"));
     // An orphan: an attach placed its copy two days ago and never committed.
     const orphan = fakePng(810);
@@ -882,28 +895,29 @@ describe("the purge on one database (D-086)", () => {
     });
     await backdate(w.db, { sha256: sha(back) }, "8 days");
     expect((await upload(asset, { as: "cataloger", body: back })).status).toBe(201);
-    // A copy this database has no record of at all.
-    const stray = fakePng(840);
-    const strayPath = store.pathFor(w.a, sha(stray));
-    mkdirSync(join(strayPath, ".."), { recursive: true, mode: 0o700 });
-    writeFileSync(strayPath, stray, { mode: 0o600 });
+    // Removed eight days ago and not attached since.
+    const old = fakePng(835);
+    const oldAdded = await upload(asset, { as: "cataloger", body: old });
+    await send(`/api/records/${asset}/files/${(oldAdded.json.file as { id: string }).id}`, {
+      as: "cataloger",
+      method: "DELETE",
+      contentType: null,
+      name: null,
+    });
+    await backdate(w.db, { sha256: sha(old) }, "8 days");
+    // A content this database has no record of at all.
+    const stray = sha(fakePng(840));
 
-    const plan = await service.purgeFiles({ apply: false });
-    if (!plan.ok) throw new Error(plan.problem);
-    const listed = plan.value.candidates.map((c) => c.sha256);
-    expect(listed).toContain(sha(orphan));
-    expect(listed).not.toContain(sha(relapse));
-    expect(listed).not.toContain(sha(back));
-    expect(listed).not.toContain(sha(stray));
-    const done = await service.purgeFiles({ apply: true });
-    if (!done.ok) throw new Error(done.problem);
-    expect(existsSync(store.pathFor(w.a, sha(orphan)))).toBe(false);
-    for (const kept of [relapse, back, stray]) {
+    const hashes = [orphan, relapse, back, old].map(sha).concat(stray);
+    const listed = (await purgeCandidates(w.db, w.a, hashes, null)).map((c) => c.sha256);
+    expect(listed.sort()).toEqual([sha(orphan), sha(old)].sort());
+    // Nothing was deleted.
+    for (const kept of [orphan, relapse, back, old]) {
       expect(readFileSync(store.pathFor(w.a, sha(kept))).equals(kept)).toBe(true);
     }
   });
 
-  it("refuses to purge when the folder's epoch isn't this database's", async () => {
+  it("turns the lease against a marker whose epoch isn't this database's", async () => {
     const service = createService(w.db, { files: store });
     const marker = readFileSync(join(filesDir, STORE_MARKER), "utf8");
     const [storeId, database] = marker.split("\n");
@@ -911,15 +925,51 @@ describe("the purge on one database (D-086)", () => {
       join(filesDir, STORE_MARKER),
       `${storeId ?? ""}\n${database ?? ""}\n${newRecordId()}\n`,
     );
-    expect(await service.purgeFiles({ apply: true })).toEqual({
-      ok: false,
-      problem: "lease_mismatch",
-    });
     expect(await service.renewFileLease()).toBe(false);
     // Put back as it was, and the lease moves on again.
     writeFileSync(join(filesDir, STORE_MARKER), marker);
     expect(await service.renewFileLease()).toBe(true);
   }, 30_000);
+});
+
+describe("every attach touches the stored copy (fifth review)", () => {
+  it("sets the copy's time to now on a new attach, a shared content and the same one again", async () => {
+    const one = await makeAs(w, w.a, w.a1, assetDraft("An invented touched scan"));
+    const two = await makeAs(w, w.a, w.a1, assetDraft("An invented second touched scan"));
+    const body = fakePng(860);
+    const path = store.pathFor(w.a, sha(body));
+    const age = (): number => Date.now() - statSync(path).mtimeMs;
+    const month = new Date(Date.now() - 30 * 86_400_000);
+    expect((await upload(one, { as: "cataloger", body })).status).toBe(201);
+    expect(age()).toBeLessThan(60_000);
+    // The same content on another asset: one copy, touched.
+    utimesSync(path, month, month);
+    expect((await upload(two, { as: "cataloger", body })).status).toBe(201);
+    expect(age()).toBeLessThan(60_000);
+    // The same content on the same asset again (the row already there).
+    utimesSync(path, month, month);
+    expect((await upload(one, { as: "cataloger", body })).status).toBe(200);
+    expect(age()).toBeLessThan(60_000);
+    // `placing` touches it too: an attach refused for its name, a check
+    // made after the intent is committed.
+    utimesSync(path, month, month);
+    const received = await store.receive(
+      w.a,
+      (async function* () {
+        await Promise.resolve();
+        yield body;
+      })(),
+    );
+    if (!received.ok) throw new Error(received.code);
+    const refused = await createService(w.db, { files: store }).attachFile(
+      { organizationId: w.a, actor: actorOf(w.root) },
+      one as never,
+      received.file,
+      { name: "bad\u202ename.png", expectedVersion: 1 },
+    );
+    expect(refused.ok).toBe(false);
+    expect(age()).toBeLessThan(60_000);
+  });
 });
 
 describe("the files folder belongs to one install", () => {
@@ -969,11 +1019,40 @@ describe("the files folder belongs to one install", () => {
         ok: false,
         problem: "not_empty",
       });
+      // A marker naming this fresh database, with no binding row yet (a
+      // crash between the two steps): taken only with a readable system
+      // identifier. By the OID alone (`-:<oid>`) it could be another
+      // cluster's database: refused (fifth review).
+      const identity = await databaseIdentity(db);
+      const oid = identity.split(":")[1] ?? "";
+      const blind: Database = {
+        rows: (q) =>
+          Sql.parts(q).join("").includes("pg_control_system")
+            ? Promise.reject(new Error("permission denied"))
+            : db.rows(q),
+        execute: (q) => db.execute(q),
+        transaction: (work) => db.transaction(work),
+        close: () => Promise.resolve(),
+      };
+      expect(await databaseIdentity(blind)).toBe(`-:${oid}`);
+      const byOid = await folder((dir) => {
+        writeFileSync(join(dir, STORE_MARKER), `${newRecordId()}\n-:${oid}\n${newRecordId()}\n`);
+      });
+      expect(await createService(blind, { files: byOid.store }).bindFileStore()).toEqual({
+        ok: false,
+        problem: "other_install",
+      });
+      expect(await readFileStoreBinding(db)).toBeUndefined();
+      const crashed = await folder((dir) => {
+        writeFileSync(join(dir, STORE_MARKER), `${newRecordId()}\n${identity}\n${newRecordId()}\n`);
+      });
+      expect((await createService(db, { files: crashed.store }).bindFileStore()).ok).toBe(true);
+      for (const f of [byOid, crashed]) rmSync(f.dir, { recursive: true, force: true });
       const swept = await createService(db, { files: full.store }).sweepFiles(0);
       expect(swept).toMatchObject({ unbound: true, contents: 0, incoming: 0 });
       expect(await createService(db, { files: store }).purgeFiles({ apply: true })).toEqual({
         ok: false,
-        problem: "not_bound",
+        problem: "not_available",
       });
       for (const f of [empty, foreign, full]) rmSync(f.dir, { recursive: true, force: true });
     } finally {
@@ -992,7 +1071,6 @@ describe("the files folder belongs to one install", () => {
     mkdirSync(join(odd, "cd".repeat(32)), { recursive: true, mode: 0o700 });
     const service = createService(w.db, { files: store });
     expect(await service.sweepFiles(0)).toMatchObject({ unbound: false, failed: 0 });
-    expect((await service.purgeFiles({ apply: true })).ok).toBe(true);
     expect(readFileSync(join(theirs, hash), "utf8")).toBe("another install's bytes");
     expect(existsSync(join(odd, "cd".repeat(32)))).toBe(true);
     rmSync(join(filesDir, stranger), { recursive: true, force: true });
@@ -1033,14 +1111,14 @@ async function removeVia(db: Database, assetId: string, fileId: string): Promise
   if (!removed.ok) throw new Error(JSON.stringify(removed.issues));
 }
 
-/** The marker as if it had stood still for two hours (an hour's quiet, for adopt). */
+/** The marker as if it had stood still long enough for adopt (three renewals and a minute). */
 function quiet(): void {
-  const past = new Date(Date.now() - 2 * 3600_000);
+  const past = new Date(Date.now() - ADOPT_QUIET_MS - 60_000);
   utimesSync(join(filesDir, STORE_MARKER), past, past);
 }
 
-describe("a second database on the folder never deletes production's files (fourth review)", () => {
-  it("R1a: a copy that removes a file production names can't purge it, nor can production while they share", async () => {
+describe("a second database on the folder never deletes production's files (fourth and fifth reviews)", () => {
+  it("R1a: a copy that removes a file production names deletes nothing, and the lease shows the sharing", async () => {
     const work = mkdtempSync(join(tmpdir(), "oculus-files-r1a-"));
     const name = `oculus_test_r1a_${randomBytes(6).toString("hex")}`;
     let copy: Database | undefined;
@@ -1060,14 +1138,12 @@ describe("a second database on the folder never deletes production's files (four
       });
       await removeVia(copy, asset, xId);
       await backdate(copy, { fileId: xId }, "8 days");
+      expect(await copyService.sweepFiles(0)).toMatchObject({ failed: 0 });
       expect(await copyService.purgeFiles({ apply: true })).toEqual({
         ok: false,
-        problem: "lease_mismatch",
+        problem: "not_available",
       });
-      expect(await createService(w.db, { files: store }).purgeFiles({ apply: true })).toEqual({
-        ok: false,
-        problem: "lease_mismatch",
-      });
+      expect(await createService(w.db, { files: store }).renewFileLease()).toBe(false);
       expect(readFileSync(store.pathFor(w.a, sha(x))).equals(x)).toBe(true);
     } finally {
       await copy?.close();
@@ -1096,6 +1172,7 @@ describe("a second database on the folder never deletes production's files (four
       expect(await createService(w.db, { files: store }).renewFileLease()).toBe(false);
       await removeVia(copy, asset, xId);
       await backdate(copy, { fileId: xId }, "8 days");
+      expect(await copyService.sweepFiles(0)).toMatchObject({ failed: 0 });
       expect((await copyService.purgeFiles({ apply: true })).ok).toBe(false);
       expect(readFileSync(store.pathFor(w.a, sha(x))).equals(x)).toBe(true);
     } finally {
@@ -1125,21 +1202,25 @@ describe("a second database on the folder never deletes production's files (four
       // The restored database removed X before it was adopted.
       await removeVia(copy, asset, xId);
       await backdate(copy, { fileId: xId }, "8 days");
-      // Adopt refuses while the marker keeps moving.
+      // Adopt refuses while the marker keeps moving, and two hours of
+      // quiet are not enough (three renewals).
+      expect(await restored.adoptFileStore()).toEqual({ ok: false, problem: "epoch_moving" });
+      const twoHours = new Date(Date.now() - 2 * 3600_000);
+      utimesSync(join(filesDir, STORE_MARKER), twoHours, twoHours);
       expect(await restored.adoptFileStore()).toEqual({ ok: false, problem: "epoch_moving" });
       quiet();
       expect(await restored.adoptFileStore()).toEqual({ ok: true });
-      // Its purge now runs, and keeps X (removed before the adopt) and Y
-      // (never known to it).
-      const purged = await restored.purgeFiles({ apply: true });
-      expect(purged).toMatchObject({ ok: true });
+      // Adopting enables nothing that deletes: X (removed before the adopt)
+      // and Y (never known to it) stay.
+      expect(await restored.sweepFiles(0)).toMatchObject({ failed: 0 });
+      expect(await restored.purgeFiles({ apply: true })).toEqual({
+        ok: false,
+        problem: "not_available",
+      });
       expect(readFileSync(store.pathFor(w.a, sha(x))).equals(x)).toBe(true);
       expect(readFileSync(store.pathFor(w.a, sha(y))).equals(y)).toBe(true);
       // Production now finds the folder isn't its own.
-      expect(await createService(w.db, { files: store }).purgeFiles({ apply: true })).toEqual({
-        ok: false,
-        problem: "lease_mismatch",
-      });
+      expect(await createService(w.db, { files: store }).renewFileLease()).toBe(false);
     } finally {
       await copy?.close();
       await dropDatabase(testServerUrl(), name).catch(() => undefined);
