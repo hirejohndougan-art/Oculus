@@ -548,7 +548,9 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
     let publicSites: { siteId: string; name: string; port: number; origin: string }[] = [];
     if (publicUrl === undefined) {
       out(
-        "The public sites aren't set up on this computer yet. To see them, close Oculus and run `npm run desktop:database` once more (on Windows, `node packages\\api\\dist\\desktop-database-cli.js`).",
+        env.OCULUS_DATABASE_URL !== undefined && env.OCULUS_DATABASE_URL.trim() !== ""
+          ? `The public sites are off: OCULUS_DATABASE_URL is set, so set ${PUBLIC_DATABASE_URL_ENV} to its public reader too to see them.`
+          : "The public sites aren't set up on this computer yet. To see them, close Oculus and run `npm run desktop:database` once more (on Windows, `node packages\\api\\dist\\desktop-database-cli.js`).",
       );
     } else {
       try {
@@ -652,8 +654,11 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
     } catch (error) {
       if (publicSites.length === 0) throw error;
       // The public side's own checks (the reader, D-080): the admin starts without it.
+      // A fixed line (D-109: codes only); if the cause wasn't the public
+      // side, the retry below fails the same way and says so.
+      const code = (error as { code?: unknown }).code;
       err(
-        `The public sites are off this time: ${error instanceof Error ? error.message : "unknown error"}`,
+        `The public sites are off this time; starting without them${typeof code === "string" && /^[a-z][a-z0-9_]{1,40}$/i.test(code) ? ` (${code})` : ""}.`,
       );
       publicSites = [];
       await publicListeners?.close();

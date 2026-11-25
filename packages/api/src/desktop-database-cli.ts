@@ -136,6 +136,8 @@ async function formatted(
  */
 export const READER_ONLY_FAILED = 5;
 
+const ALREADY_SET_UP = "Oculus's database is already set up. Nothing to do.";
+
 /** Runs the helper; returns the exit code. */
 export async function runDesktopDatabase(called: DesktopDatabaseOptions): Promise<number> {
   // `finished` runs at most once, whichever path calls it (T-071 review).
@@ -173,7 +175,19 @@ export async function runDesktopDatabase(called: DesktopDatabaseOptions): Promis
     if (settings.ownerDatabaseUrl !== undefined) {
       // Made by an earlier run: finish its setup questions if they weren't.
       const finished = settings.publicDatabaseUrl === undefined ? undefined : options.finished;
-      const code = await resume(settings.ownerDatabaseUrl, env, ask, out, err, finished);
+      const code = await resume(
+        settings.ownerDatabaseUrl,
+        env,
+        ask,
+        settings.publicDatabaseUrl === undefined
+          ? (line) => {
+              // The reader is added next: "Nothing to do" would be wrong.
+              if (line !== ALREADY_SET_UP) out(line);
+            }
+          : out,
+        err,
+        finished,
+      );
       if (code !== 0 || settings.publicDatabaseUrl !== undefined) {
         options.finished?.();
         return code;
@@ -425,7 +439,7 @@ async function resume(
     await owner.close();
   }
   if (state === "set_up") {
-    out("Oculus's database is already set up. Nothing to do.");
+    out(ALREADY_SET_UP);
     return 0;
   }
   if (state === "other") {

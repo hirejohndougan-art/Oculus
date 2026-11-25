@@ -352,8 +352,22 @@ describe("the open-in-the-default-browser route", () => {
     const ok = await post({ siteId: w.a1 }, { cookie, [CSRF_HEADER]: csrf });
     expect([ok.statusCode, ok.json()]).toEqual([200, { opened: true }]);
     expect(opened).toEqual(["http://localhost:4781/"]);
-    // At most once a second.
+    // At most once a second for each site.
     expect((await post({ siteId: w.a1 }, { cookie, [CSRF_HEADER]: csrf })).statusCode).toBe(429);
+    // Another site at the same moment is not held back by it.
+    const second = await fullSession(w.db, w.other, w.a);
+    expect(
+      (
+        await post(
+          { siteId: w.a2 },
+          {
+            cookie: `${OCULUS_COOKIES.session}=${second.token}`,
+            [CSRF_HEADER]: csrfTokenFor(second.token) ?? "",
+          },
+        )
+      ).statusCode,
+    ).toBe(200);
+    expect(opened.at(-1)).toBe("http://localhost:4782/");
     now += 1000;
     expect((await post({ siteId: w.a1 }, { cookie, [CSRF_HEADER]: csrf })).statusCode).toBe(200);
     // Another origin can't post here at all (D-058).
@@ -370,7 +384,7 @@ describe("the open-in-the-default-browser route", () => {
       payload: JSON.stringify({ siteId: w.a1 }),
     });
     expect(foreign.statusCode).toBe(403);
-    expect(opened).toHaveLength(2);
+    expect(opened).toHaveLength(3);
   });
 
   it("lists the sites one organization holds, oldest first", async () => {

@@ -84,7 +84,7 @@ export async function assignPublicPorts(
     }
     for (let tries = 0; port === undefined && tries < 20; tries++) {
       const candidate = await anyFree();
-      if (!taken.has(candidate)) port = candidate;
+      if (!taken.has(candidate) && (await isFree(candidate))) port = candidate;
     }
     if (port === undefined) throw new Error("no free port for a public site");
     out[site] = port;
@@ -251,7 +251,7 @@ export const OPEN_PUBLIC_SITE_PATH = "/api/desktop/public-site";
  * list, never an address from the request) in the default browser. Only on
  * the launcher's own `127.0.0.1:<port>` host (and `/api` is the admin's
  * host only anyway, D-090), only for a signed-in session with its CSRF
- * token (`X-Oculus-CSRF`), at most once a second, and only for a site the
+ * token (`X-Oculus-CSRF`), at most once a second for each site, and only for a site the
  * person may work in (`sitesForPerson`, as `GET /api/me` lists them). Any
  * other site is the unknown path's 404. A session that can't be read is
  * logged (`log`, a fixed code, never the token) and answered 503.
@@ -267,7 +267,8 @@ export function openPublicSiteRoute(options: {
   readonly log?: (code: string) => void;
 }): OculusRoute {
   const clock = options.clock ?? Date.now;
-  let last = -Infinity;
+  // Once a second per site, so opening one site then another isn't refused.
+  const last = new Map<string, number>();
   return {
     method: "POST",
     path: OPEN_PUBLIC_SITE_PATH,
@@ -300,8 +301,8 @@ export function openPublicSiteRoute(options: {
       }
       if (!mine.some((site) => site.siteId === siteId)) throw new Refusal(404, "not_found");
       const now = clock();
-      if (now - last < 1000) throw new Refusal(429, "rate_limited");
-      last = now;
+      if (now - (last.get(siteId) ?? -Infinity) < 1000) throw new Refusal(429, "rate_limited");
+      last.set(siteId, now);
       options.open(`${new URL(origin).origin}/`);
       return { opened: true };
     },

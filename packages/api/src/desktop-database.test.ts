@@ -591,6 +591,33 @@ describe("npm run desktop:database, then npm run desktop", () => {
     } finally {
       await admin.close();
     }
+    // Oculus still starts as before, without public sites, and says how to add them.
+    const adminDir = join(folder, "admin-build");
+    mkdirSync(adminDir, { recursive: true });
+    writeFileSync(join(adminDir, "index.html"), "<!doctype html><title>Invented admin</title>");
+    const out: string[] = [];
+    let stop: () => void = () => undefined;
+    const stopped = new Promise<void>((resolve) => {
+      stop = resolve;
+    });
+    const run = runDesktop({
+      env: { OCULUS_DESKTOP_HOME: folder, PGPASSFILE: pgpassFile },
+      out: (l) => out.push(l),
+      err: (l) => out.push(`ERR ${l}`),
+      findBrowser: () => undefined,
+      openDefault: () => undefined,
+      stopRequested: () => stopped,
+      adminDir,
+    });
+    for (let i = 0; i < 400 && !out.some((l) => l.startsWith("Oculus is running")); i++) {
+      if (out.some((l) => l.startsWith("ERR"))) break;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    expect(out.join("\n")).not.toContain("ERR");
+    expect(out.some((l) => l.startsWith("The public sites aren't set up"))).toBe(true);
+    expect(out.some((l) => l.startsWith("Public site "))).toBe(false);
+    stop();
+    expect(await run).toBe(0);
   });
 
   it("leaves a role of the reader's name alone when it already exists, and exits 5 (T-071)", async () => {
