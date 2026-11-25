@@ -436,3 +436,62 @@ describe("a staff field on a unit in between (T-059b third review)", () => {
     expect(prov[0]?.internal).toBe(true);
   });
 });
+
+describe("a place value the public view leaves out (T-059b fourth review, D-048)", () => {
+  it("is marked staff-only in a staff file", async () => {
+    ok(
+      await insertTemplateVersion(w.db, {
+        key: "t-pl",
+        organizationId: w.a,
+        label: "pl",
+        appliesTo: ["archival_unit"],
+        fields: [field("donor", "record_link", { label: "Donor" }), field("rights", "rights")],
+      }),
+    );
+    const root = { organizationId: w.a, actor: actorOf(w.root), siteId: w.a1 };
+    const secret = ok(
+      await w.service.createRecord(root, {
+        kind: "archival_unit",
+        level: "fonds",
+        title: "PRIVATE DONOR Jane Q",
+        templateKey: "t-pl",
+        fields: { rights: { uri: INC } },
+      }),
+    ).record.id;
+    const u = ok(
+      await w.service.createRecord(root, {
+        kind: "archival_unit",
+        level: "fonds",
+        title: "Invented PL",
+        templateKey: "t-pl",
+        fields: {
+          rights: { uri: INC },
+          donor: { recordId: secret, label: "PRIVATE DONOR Jane Q" },
+        },
+      }),
+    ).record.id;
+    // A template edit makes the field a public place; the value still has a place's shape.
+    ok(
+      await insertTemplateVersion(w.db, {
+        key: "t-pl",
+        organizationId: w.a,
+        label: "pl",
+        appliesTo: ["archival_unit"],
+        fields: [field("donor", "place", { label: "Donor" }), field("rights", "rights")],
+      }),
+    );
+    const got = ok(
+      await w.service.exportFindingAid(
+        { organizationId: w.a, actor: actorOf(w.cataloger), siteId: w.a1 },
+        u,
+        {},
+      ),
+    );
+    const read = readEad(got.xml);
+    if (!read.ok) throw new Error(JSON.stringify(read.issues));
+    const a = read.value.findingAid.archdesc;
+    expect(a.accessPoints.some((p) => p.label.includes("PRIVATE"))).toBe(false);
+    const notes = a.notes.filter((n) => n.paragraphs.some((p) => p.includes("PRIVATE DONOR")));
+    for (const n of notes) expect(n.internal).toBe(true);
+  }, 60_000);
+});

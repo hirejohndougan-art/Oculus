@@ -2695,28 +2695,28 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
               template?.ok === true ? template.value.template.fields.map((d) => [d.key, d]) : [],
             );
             const fields: EadExportField[] = [];
-            // Each value as core's effective record sees it (effective.ts):
-            // staff-only unless public all the way from where it comes, in
-            // the template now, fitting its field and, for a number, still
-            // held. Over-marking is safe; under-marking never happens here.
+            // Each value as core's effective record and public view see it
+            // (effective.ts): staff-only unless the public view of this unit
+            // holds it as it is. Over-marking is safe; under-marking never.
+            // The top unit's inherited values too, only from units the person
+            // may view: visibleInherited locks the chain (FOR SHARE) and checks
+            // it first, so the entries read next come from that same chain.
+            const visible =
+              row.id === recordId && record.parentId !== undefined
+                ? await visibleInherited(tx, who.organizationId, recordId, allowed.checker)
+                : [];
+            const visibleFrom = new Set(visible.map((v) => `${v.key}\u0000${v.from}`));
             const entries = await effectiveEntries(tx, who.organizationId, record.id);
             if (entries === undefined) {
-              // Can't be checked: every own value goes in marked staff-only.
+              // Can't be checked: its own values go in marked staff-only, nothing inherited.
               notices.push(
                 issue(
-                  [],
+                  [record.id],
                   "unit_unchecked",
-                  "A unit's values couldn't be checked, so all are marked staff-only.",
+                  "This unit's values couldn't be checked, so its own values are marked staff-only and nothing it inherits is included.",
                 ),
               );
             }
-            // The top unit's inherited values too (only when the person may
-            // see every unit above it, as the record screen shows them).
-            const mayInherit =
-              row.id === recordId &&
-              record.parentId !== undefined &&
-              (await visibleInherited(tx, who.organizationId, recordId, allowed.checker)).length >
-                0;
             const all: [string, JsonValue, boolean][] =
               entries === undefined
                 ? Object.entries(record.fields).map(([k, v]): [string, JsonValue, boolean] => [
@@ -2725,7 +2725,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
                     false,
                   ])
                 : entries
-                    .filter((e) => e.own || mayInherit)
+                    .filter((e) => e.own || visibleFrom.has(`${e.key}\u0000${e.from}`))
                     .map((e): [string, JsonValue, boolean] => [
                       e.key,
                       e.value as JsonValue,

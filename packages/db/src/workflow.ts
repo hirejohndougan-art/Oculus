@@ -775,7 +775,14 @@ export interface EffectiveEntry {
   readonly value: unknown;
   /** True for the record's own value. */
   readonly own: boolean;
-  /** The strictest visibility along the way, with misfits and unheld numbers staff (effective.ts). */
+  /** The record the value comes from (the record itself when own). */
+  readonly from: RecordId;
+  /**
+   * "public" only when the record's public view holds this value as it is
+   * (strictest visibility along the way, in the template, fitting its field,
+   * a held number of a public type, a place name that may show: effective.ts);
+   * "staff" otherwise.
+   */
   readonly visibility: "public" | "staff";
 }
 
@@ -802,13 +809,21 @@ export async function effectiveEntries(
     identifiers: s.identifiers,
   });
   if (!effective.ok) return undefined;
+  const view = publicView(effective.value);
+  const shown = new Map((view?.entries ?? []).map((e) => [e.key, JSON.stringify(e.value)]));
   return Object.freeze(
     effective.value.entries.map((entry) =>
       Object.freeze({
         key: entry.key,
         value: entry.value,
         own: entry.own,
-        visibility: entry.inTemplate && entry.visibility === "public" ? "public" : "staff",
+        from: entry.from.id,
+        visibility:
+          entry.inTemplate &&
+          entry.visibility === "public" &&
+          shown.get(entry.key) === JSON.stringify(entry.value)
+            ? "public"
+            : "staff",
       }),
     ),
   );
