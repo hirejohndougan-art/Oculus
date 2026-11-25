@@ -7,7 +7,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - What changed: John (2026-11-25): a role on every site includes the site manager's own, so such a member is seen in full and may be given more roles there. `holdsRoleOn` (packages/service/src/admin.ts) and `listMembers` (packages/db/src/people.ts) count every-site grants; members with no role stay name-only.
 - Decisions: D-084 amended
 - Review: one independent round, nothing blocking; fixed: a role on every site scoped to one unit no longer counts, and a viewer with no managed site sees no one (matching the SQL); unit tests for the rule.
-- Gate: PASS · tests_passing 4734 (was 4729) · npm audit clean · licences all permissive
+- Gate: PASS · tests_passing 4734 (was 4729) · npm audit clean · licences all permissive (the e2e step, disturbed by a stopped earlier run, passed on its own: 8 of 8; main then moved by roadmap claims only)
 - Next: nothing claimed
 ## 2026-11-25 04:45 CT — upkeep — U-006 Main's gate fails in a clean checkout
 - Result: gate fix
