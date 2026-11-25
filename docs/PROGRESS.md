@@ -8,7 +8,16 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Decisions: D-077 amended (S-054c)
 - Review: two independent reviews. The first found that giving the codes' time as the message's `at` made the outbox drop notices of codes told a day on as expired; fixed (`codesAt` for wording only) and tested. The second: safe; notes (deploy migrations before code, as always; a wait during a re-entry can count another tab's in-flight codes) accepted.
 - Gate: PASS on main + S-054c twice (tests_passing 5219, then 5238 with T-075 and U-008); the last run, after S-058 merged in (only a PROGRESS.md conflict), was cut off and **not finished: John chose to merge without it** (2026-11-25 16:47 CT) so the other chats could go on. The next gate on main checks it. Baseline raised to 5238 (the last full count), not higher.
-- Next: the build run's S-054b (keep both sides in `takeCodeAttempt`)
+- Next: S-054d. Merged after S-054b: the wait's larger count is now `unexplained + this sign-in code`, since S-054b puts a code on the counter only once it is known wrong.
+
+## 2026-11-25 16:47 CT — build (BUILD MODE) — S-054b A per-session TOTP count, counted and cleared atomically, given back when the clear is never reached
+- Result: done (S-054d filed)
+- What changed: migration 0050 adds `unexplained` and `told_round` to `second_step_throttles`. A sign-in's TOTP code goes on the person's `wrong:` counter only after it was found wrong (`countWrongCode`: `session:` and `wrong:` locked in key order, skipped when the factor was revoked meanwhile, still counted when the guesser's own session ended). Each session keeps its share of the counter for the current round; the first-code alert, the wait's alert and the cleanup each start a new round. A right code takes off exactly its share in one statement, so a later session's codes are never wiped and an in-flight right code is never told. A right code whose promotion is refused for another reason, or throws, is given back. Six tests in second-factor.test.ts; the five for the reported gaps fail on the old code.
+- Decisions: D-077 amended (S-054b)
+- Review: two independent rounds. Round 1: a blocker (signing out or using up the session mid-check left the guess uncounted), fixed by checking only the factor; inflated wait alerts and unknown-commit give-backs accepted in D-077. Round 2: no blocker; the session now ends even if the count fails, the count retries when the cleanup removed the row, and the share clear is best effort after a sign-in. A count lost to a busy database is filed as S-054d (risky).
+- Gate: PASS · tests_passing 5240 (was 5234 on main) · npm audit clean (the gate ran on the branch rebased onto main with S-062, T-075, U-008 and S-058)
+- Next: S-054d (S-054c, S-056 and most other open tasks are claimed by other chats)
+
 ## 2026-11-25 16:45 CT — manual (Chat N) — S-058 Deleting a donor contact checks the agent's home site
 - Result: done
 - What changed: `deleteDonorContact` (service `accessions.ts`) now runs the same home-site check as `saveDonorContact` (`mayName`): `donors.edit` on the agent's own site, not on any site. Attack test: Donor relations on one site can't delete (or save) another site's agent's contact, even with a wrong version; with the role on that site it can.
