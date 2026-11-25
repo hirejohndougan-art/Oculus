@@ -16,8 +16,10 @@
  * The kinds of request counted apart, each with its own limit per minute.
  * `credentials` counts sign-in, code, set-up and password-reset posts per
  * client address (T-045, D-081), before the database's own throttles.
+ * `public` counts a public site's record reads per client address (T-050d,
+ * D-100).
  */
-export type RateBucket = "read" | "write" | "check" | "search" | "credentials";
+export type RateBucket = "read" | "write" | "check" | "search" | "credentials" | "public";
 
 export type RateLimits = Readonly<Record<RateBucket, number>>;
 
@@ -28,6 +30,7 @@ export const DEFAULT_RATE_LIMITS: RateLimits = Object.freeze({
   check: 600,
   search: 60,
   credentials: 60,
+  public: 300,
 });
 
 const WINDOW_MS = 60_000;
