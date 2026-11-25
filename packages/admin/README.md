@@ -11,8 +11,19 @@ code from the authenticator app (or a recovery code), setting up two-step
 sign-in (QR code drawn in the browser with `uqr`, recovery codes shown once),
 choosing an organization, "Forgot your password?" and choosing a new password
 from a link (`/reset#<token>`), then the sidebar with the site selector and
-the top bar with the person and signing out. A site's home page is an empty
-placeholder until T-046.
+the top bar with the person and signing out.
+
+The item screens (T-046, D-083, `src/records/`): a site's home page lists its
+item records (staff search, filters for status and record type, ordering,
+pages; filters stay in the tab's memory, never in the address);
+"Waiting for review" lists records sent for review for people who may
+publish; the record editor builds its form from the record's template, shows
+inherited values, checks fields with the server's dry run, saves with
+`If-Match` (a 412 offers to reload, never overwrites), says before saving a
+published record that the change goes live at once, offers the workflow moves
+and Delete only where the server says the person may, and has a history panel
+(view, compare, restore) for people who may read history. Leaving with unsaved
+changes asks first. Confirmations appear in the page beside their control.
 
 ## Running it
 
@@ -57,6 +68,17 @@ Keyboard (no mouse at all):
 - [ ] Frame: the site selector opens with Enter or Space or Alt+Down, arrows
       move, Enter chooses, Escape closes and returns focus to it. The account
       button opens its menu with Enter; arrows move; Escape closes.
+- [ ] Item records: the search field, Search, the Status, Record type and
+      Order selects, each title link and the page buttons are reached in
+      order; Enter in the search field searches.
+- [ ] Record editor: every field is reached in order and announces its label,
+      "(required)", "Staff only" and its help; leaving a field with a problem
+      announces it. Save, Discard, the status buttons and Delete work with
+      Enter or Space. A confirmation (delete, restore, leaving with unsaved
+      changes) takes focus when it opens, Tab reaches its buttons, Escape
+      cancels it.
+- [ ] History: each "View version", "Restore version" and the Compare selects
+      are reached in order; the comparison table has a caption and headers.
 - [ ] Nothing traps focus; nothing moves focus unexpectedly while typing.
 
 Screen reader:

@@ -7,6 +7,7 @@
 import { useEffect, useState, type SubmitEvent } from "react";
 import { useNavigate } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
+import { endSession } from "../session";
 import { ApiError, api, problemText } from "../api";
 import { AuthLayout, authStyles } from "../components/AuthLayout";
 import { OrganizationPicker } from "../components/OrganizationPicker";
@@ -55,7 +56,8 @@ export function Code() {
         },
       });
       setCode("");
-      queries.removeQueries();
+      // A new session: nothing of an earlier one may show (its token is the reply's).
+      endSession(queries, { keepCsrfToken: true });
       await navigate("/", { replace: true });
     } catch (error) {
       if (!(error instanceof ApiError)) {

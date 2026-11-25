@@ -1,9 +1,11 @@
 // The end-to-end server: a throwaway PostgreSQL (scripts/test-database.mjs),
-// migrated, with one invented organization, one site and one volunteer who
-// has not set up two-step sign-in; then the admin's server (the built
-// packages) on http://localhost:OCULUS_E2E_PORT serving the built admin.
-// Writes the volunteer's invented address and password to OCULUS_E2E_SEED
-// for the tests. Everything is stopped and deleted on SIGTERM or SIGINT.
+// migrated, with one invented organization, one site, an object template,
+// one invented record, a volunteer (cataloger) and an editor (reviewer: may
+// publish and read history), neither of whom has set up two-step sign-in;
+// then the admin's server (the built packages) on
+// http://localhost:OCULUS_E2E_PORT serving the built admin. Writes the
+// invented addresses, password and record title to OCULUS_E2E_SEED for the
+// tests. Everything is stopped and deleted on SIGTERM or SIGINT.
 import { randomBytes } from "node:crypto";
 import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -13,6 +15,7 @@ import {
   createFirstSystemAdmin,
   createInvitation,
   insertOrganization,
+  insertTemplateVersion,
   migrate,
   openDatabase,
 } from "@oculus/db";
@@ -85,6 +88,74 @@ try {
       scope: null,
     }),
   );
+  // The editor: a reviewer on the site (edits, publishes, reads history).
+  const editorEmail = "editor@example.org";
+  must(
+    await createInvitation(db, { organizationId, email: editorEmail, invitedBy: root }, (m) => {
+      box.push(m);
+      return Promise.resolve();
+    }),
+  );
+  const editor = must(
+    await acceptInvitation(db, {
+      token: box[1].token,
+      organizationId,
+      email: editorEmail,
+      displayName: "Grace Invented",
+      password: PASSWORD,
+    }),
+  ).userId;
+  must(
+    await service.grantRole(actor, {
+      userId: editor,
+      role: "reviewer",
+      siteId: site.id,
+      scope: null,
+    }),
+  );
+  // An object template and one invented record on the site.
+  const field = (key, label, kind, extra = {}) => ({
+    key,
+    label,
+    kind,
+    required: false,
+    repeatable: false,
+    visibility: "public",
+    inherited: false,
+    ...extra,
+  });
+  must(
+    await insertTemplateVersion(db, {
+      key: "object",
+      organizationId,
+      label: "Object",
+      appliesTo: ["object"],
+      fields: [
+        field("rights", "Rights statement", "rights", {
+          help: "A rightsstatements.org or Creative Commons address.",
+        }),
+        field("description", "Description", "long_text"),
+        field("date", "Date", "date"),
+        field("shelf", "Shelf location", "text", { visibility: "staff" }),
+      ],
+    }),
+  );
+  const recordTitle = "Invented depot lantern";
+  must(
+    await service.createRecord(
+      { ...actor, siteId: site.id },
+      {
+        kind: "object",
+        title: recordTitle,
+        templateKey: "object",
+        fields: {
+          rights: { uri: "http://rightsstatements.org/vocab/InC/1.0/" },
+          description: "A tin lantern from an invented depot.",
+          date: "1909~",
+        },
+      },
+    ),
+  );
   const origin = `http://localhost:${String(port)}`;
   app = await buildAdminServer({
     db,
@@ -101,7 +172,13 @@ try {
   await app.listen({ host: "127.0.0.1", port });
   writeFileSync(
     seedFile,
-    JSON.stringify({ email, password: PASSWORD, siteName: "Invented Archive" }),
+    JSON.stringify({
+      email,
+      editorEmail,
+      password: PASSWORD,
+      siteName: "Invented Archive",
+      recordTitle,
+    }),
   );
 } catch (error) {
   console.error(error);

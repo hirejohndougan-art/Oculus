@@ -1,15 +1,26 @@
 /**
- * A site's home page: an empty placeholder until the dashboard and the item
- * list arrive (T-046). A site the person can't open, or one of another
- * organization opened by its address, says so instead.
+ * The screens of one site (T-046): its item records (the site's home page),
+ * the approval queue, a record and a new record. A site the person can't
+ * open, or one of another organization opened by its address, says so
+ * instead; a record address that isn't a record ID is answered as a record
+ * that doesn't exist, without asking the server.
  */
+import type { ReactNode } from "react";
 import { useOutletContext, useParams } from "react-router";
-import { Button, Note } from "../components/ui";
+import { Button, Note, TextLink } from "../components/ui";
+import { ItemList } from "../records/ItemList";
+import { isRecordId } from "../records/model";
+import { NewRecordScreen, RecordScreen } from "../records/RecordEditor";
+import { ReviewQueue } from "../records/ReviewQueue";
+import type { SiteChoice } from "../types";
 import type { FrameContext } from "./Frame";
 import styles from "./Frame.module.css";
 
-export function SiteHome() {
-  const { me, chooseSite, switching } = useOutletContext<FrameContext>();
+function SiteGuard(props: {
+  readonly render: (site: SiteChoice, context: FrameContext) => ReactNode;
+}) {
+  const context = useOutletContext<FrameContext>();
+  const { me, chooseSite, switching } = context;
   const { siteId } = useParams();
   const site = me.sites.find((s) => s.siteId === siteId);
   if (site === undefined) {
@@ -44,16 +55,63 @@ export function SiteHome() {
       </>
     );
   }
+  return <>{props.render(site, context)}</>;
+}
+
+/** `/sites/:siteId`: the site's item records. */
+export function SiteHome() {
   return (
-    <>
-      <div>
-        <h1 className={styles.pageTitle}>{site.siteName}</h1>
-        <p className={styles.lead}>
-          This is where {site.siteName}'s work will be listed: items to catalog, scans to attach and
-          records waiting for review.
-        </p>
-      </div>
-      <div className={styles.placeholder}>[The site's dashboard comes in a later update]</div>
-    </>
+    <SiteGuard
+      render={(site) => (
+        <ItemList key={site.siteId} siteId={site.siteId} siteName={site.siteName} />
+      )}
+    />
+  );
+}
+
+/** `/sites/:siteId/review`: records waiting for review. */
+export function SiteReview() {
+  return (
+    <SiteGuard
+      render={(site, { me }) => (
+        <ReviewQueue key={site.siteId} siteId={site.siteId} sites={me.sites} />
+      )}
+    />
+  );
+}
+
+/** `/sites/:siteId/records/new`. */
+export function SiteNewRecord() {
+  return (
+    <SiteGuard
+      render={(site, { me }) => (
+        <NewRecordScreen key={site.siteId} siteId={site.siteId} userId={me.userId} />
+      )}
+    />
+  );
+}
+
+/** `/sites/:siteId/records/:recordId`. */
+export function SiteRecord() {
+  const { recordId } = useParams();
+  return (
+    <SiteGuard
+      render={(site, { me }) =>
+        isRecordId(recordId) ? (
+          <RecordScreen
+            key={recordId}
+            siteId={site.siteId}
+            recordId={recordId}
+            userId={me.userId}
+          />
+        ) : (
+          <>
+            <h1 className={styles.pageTitle}>Record not found</h1>
+            <Note tone="amber">There is no such record, or it isn't one you can open.</Note>
+            <TextLink href={`/sites/${site.siteId}`}>Back to item records</TextLink>
+          </>
+        )
+      }
+    />
   );
 }
