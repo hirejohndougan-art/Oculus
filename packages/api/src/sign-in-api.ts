@@ -623,11 +623,12 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
           },
           organizationName:
             named?.organizationName ?? (organization?.ok === true ? organization.value.name : ""),
-          // Each site's public address, or null (T-070, D-109): only the
-          // sites listMySites gives this person, only origins checked at startup.
+          // The desktop launcher opens public sites itself (T-071, D-109).
           ...(options.desktopOpensPublicSites === true
             ? { opensPublicSites: "desktop" as const }
             : {}),
+          // Each site's public address, or null (T-070, D-109): only the
+          // sites listMySites gives this person, only origins checked at startup.
           sites: sites.value.map((site) => ({
             ...site,
             publicOrigin:

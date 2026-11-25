@@ -103,7 +103,11 @@ describe("listenPublicPorts", () => {
       ).rejects.toThrow();
     } finally {
       const closed = listeners.close();
-      await new Promise<void>((resolve) => admin.close(() => resolve()));
+      await new Promise<void>((resolve) =>
+        admin.close(() => {
+          resolve();
+        }),
+      );
       listeners.destroy();
       await closed;
     }
@@ -117,7 +121,11 @@ describe("listenPublicPorts", () => {
     try {
       await expect(listenPublicPorts(busy, [port])).rejects.toThrow();
     } finally {
-      await new Promise<void>((resolve) => busy.close(() => resolve()));
+      await new Promise<void>((resolve) =>
+        busy.close(() => {
+          resolve();
+        }),
+      );
     }
   });
 });
