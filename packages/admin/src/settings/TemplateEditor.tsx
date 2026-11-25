@@ -301,6 +301,8 @@ function TemplateForm(props: {
   function change(next: Partial<TemplateDraft>) {
     setEdited(true);
     setAsked(undefined);
+    // A save waiting for the password form was for the draft as it was.
+    reauth.cancel();
     if (save.error !== null) save.reset();
     setDraft((d) => ({ ...d, ...next }));
   }

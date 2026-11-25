@@ -65,8 +65,9 @@
  *    is given: `GET`/`HEAD` on the admin's own origin only, answered from
  *    files read into memory at startup, with the admin's own CSP
  *    (`ADMIN_SECURITY_HEADERS`) in place of the API's; every other reply
- *    keeps `SECURITY_HEADERS`. When the admin's origin is https, every
- *    reply on it also carries `Strict-Transport-Security` (`ADMIN_HSTS`,
+ *    keeps `SECURITY_HEADERS`. When the admin's origin is https, the
+ *    replies on it that pass through onSend (all but hijacked file streams
+ *    and sendDirect's) also carry `Strict-Transport-Security` (`ADMIN_HSTS`,
  *    S-060a).
  * 12. Hosts (T-050a, D-090), when `options.admin` is given: every `/api`
  *    path is answered only on the admin's own origin; on any other host (a
@@ -806,7 +807,9 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
         ? FILE_SECURITY_HEADERS
         : SECURITY_HEADERS;
     for (const [name, value] of Object.entries(headers)) void reply.header(name, value);
-    // Rule 9: HSTS on the admin's origin when it is https (S-060a).
+    // Rule 10: HSTS on the admin's origin when it is https (S-060a). Replies
+    // that skip onSend (hijacked file streams, sendDirect) go without it;
+    // any other reply on the origin sets the policy.
     if (adminProtocol === "https:" && onAdminOrigin(request)) {
       void reply.header("strict-transport-security", ADMIN_HSTS);
     }

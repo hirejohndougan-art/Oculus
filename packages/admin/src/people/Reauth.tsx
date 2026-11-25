@@ -120,5 +120,9 @@ export function useReauthenticated(what?: string) {
         }}
       />
     );
-  return { run, form };
+  /** Drops a change waiting for the form (the person changed what they were saving, S-060a). */
+  function cancel(): void {
+    setWaiting(undefined);
+  }
+  return { run, form, cancel };
 }

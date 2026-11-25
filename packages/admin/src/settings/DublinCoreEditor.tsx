@@ -330,6 +330,8 @@ function MappingForm(props: {
   function change(next: EntryDraft[]) {
     setEdited(true);
     setAsked(undefined);
+    // A save waiting for the password form was for the draft as it was.
+    reauth.cancel();
     if (save.error !== null) save.reset();
     setRows(next);
   }

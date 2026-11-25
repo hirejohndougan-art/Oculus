@@ -368,6 +368,21 @@ describe("the mapping helpers", () => {
 });
 
 describe("saving a mapping needs a recent sign-in (S-060a)", () => {
+  it("a change to the mapping while the form is open drops the waiting save", async () => {
+    const sent = server({
+      "PUT /api/templates/lantern/dublin-core": [403, { error: "reauthentication_required" }],
+    });
+    const user = userEvent.setup();
+    renderAt("/settings/templates/lantern/dublin-core");
+    expect(await screen.findByText("Version 2")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Remove row 2" }));
+    await user.click(screen.getByRole("button", { name: "Save mapping" }));
+    expect(await screen.findByRole("heading", { name: "Confirm it's you" })).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Remove row 1" }));
+    expect(screen.queryByRole("heading", { name: "Confirm it's you" })).toBeNull();
+    expect(sent.filter((s) => s.method === "PUT")).toHaveLength(1);
+  });
+
   it("asks for the password and a code again, then saves the same change", async () => {
     let calls = 0;
     const sent = server({

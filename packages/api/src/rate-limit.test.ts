@@ -85,6 +85,29 @@ describe("SessionRateLimiter", () => {
     expect(limiter.size).toBe(2);
   });
 
+  it("a new key costs the same with 45,000 windows held as with 1,000 (S-060a)", () => {
+    // A ratio measured in one process, so a busy machine slows both sides:
+    // a scan over the windows made it about 50 times dearer (the review).
+    const perNewKey = (live: number): number => {
+      let now = 0;
+      const limiter = new SessionRateLimiter(DEFAULT_RATE_LIMITS, () => now);
+      for (let i = 0; i < live; i++) limiter.take(`k${String(i)}`, "read");
+      const n = 20_000;
+      let best = Number.POSITIVE_INFINITY;
+      for (let round = 0; round < 3; round++) {
+        const t = performance.now();
+        for (let i = 0; i < n; i++) {
+          now += 1;
+          limiter.take(`n${String(round)}-${String(i)}`, "read");
+        }
+        best = Math.min(best, performance.now() - t);
+      }
+      return best / n;
+    };
+    perNewKey(1_000);
+    expect(perNewKey(45_000) / perNewKey(1_000)).toBeLessThan(8);
+  }, 60_000);
+
   it("a limit of 1 refuses the second request", () => {
     const limiter = new SessionRateLimiter({ ...DEFAULT_RATE_LIMITS, write: 1 }, () => 0);
     expect([limiter.take("a", "write"), limiter.take("a", "write")]).toEqual([true, false]);
