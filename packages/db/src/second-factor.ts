@@ -26,8 +26,9 @@
  *   `SECOND_STEP_THROTTLE`, waits up to 15 minutes, never a permanent
  *   lockout, each wait recorded in `second_step_alerts` for a notice);
  *   wrong TOTP codes no right code in the same session explained are kept
- *   for 30 days (`wrong:<user>`), and the next sign-in's first code records
- *   an alert for them (S-045), so a few guesses a day are told too;
+ *   for 30 days (`wrong:<user>`); the next session's first code, or the
+ *   cleanup command an hour on, records an alert for them (S-045), so a few
+ *   guesses a day are told too;
  *   every code, recovery codes included, per session (a waiting session
  *   ends after 5 wrong codes, a full one is signed out) and per client
  *   address. Recovery codes (120 bits) skip the per-person counter, so
@@ -431,6 +432,12 @@ interface Who {
   readonly sessionId?: SessionId;
   /** The client address, for its own counter. */
   readonly source?: string;
+  /**
+   * A sign-in's second step (a waiting session): only its TOTP codes go on
+   * the unexplained counter (S-045). A full session's codes (re-entry, new
+   * recovery codes, a reset) come after a whole sign-in, so they don't.
+   */
+  readonly signIn?: true;
 }
 
 interface Counted {
@@ -438,8 +445,10 @@ interface Counted {
   readonly sessionFailures: number;
   /** The person's unexplained wrong-code counter (S-045), always locked; never a wait. */
   readonly wrongKey: string;
-  /** Whether this attempt added one to it (TOTP codes only). */
+  /** Whether this attempt added one to it (a sign-in's TOTP codes only). */
   readonly wrongCounted: boolean;
+  /** Whether the session is a sign-in's, whose codes are on that counter. */
+  readonly signIn: boolean;
 }
 
 function wrongKeyOf(userId: UserId): string {
@@ -477,7 +486,8 @@ type Attempt =
 async function takeCodeAttempt(db: Database, who: Who, input: CodeInput): Promise<Attempt> {
   const keys = keysFor(who, input);
   const wrongKey = wrongKeyOf(who.userId);
-  const wrongCounted = input.kind === "totp";
+  const signIn = who.signIn === true;
+  const wrongCounted = signIn && input.kind === "totp";
   // Every counter, the unexplained one included, locked in key order.
   const locked = [...keys, wrongKey].sort();
   for (let round = 1; ; round++) {
@@ -527,10 +537,11 @@ async function takeCodeAttempt(db: Database, who: Who, input: CodeInput): Promis
       // has sent (at most; recovery codes aren't on it), this one included
       // if it is a TOTP code.
       const counted = unexplained + (wrongCounted ? 1 : 0);
-      const sent = who.sessionId === undefined ? 0 : sessionFailures - 1;
+      const sent = who.sessionId === undefined || !signIn ? 0 : sessionFailures - 1;
       const mine = Math.min(counted, sent + (wrongCounted ? 1 : 0));
       const fromOthers = counted - mine;
       let alertFailures: number | undefined;
+      let waitAlert = false;
       for (const { key, next } of decisions) {
         if (typeof next === "number") {
           await tx.execute(sql`
@@ -545,6 +556,7 @@ async function takeCodeAttempt(db: Database, who: Who, input: CodeInput): Promis
           const over = next.next.failures - SECOND_STEP_THROTTLE.free;
           if (key.startsWith("user:") && over >= 0 && over % 10 === 0) {
             alertFailures = next.next.failures;
+            waitAlert = true;
           }
         }
       }
@@ -557,8 +569,9 @@ async function takeCodeAttempt(db: Database, who: Who, input: CodeInput): Promis
           INSERT INTO public.second_step_alerts (id, user_id, failures)
           VALUES (${randomUUID()}::uuid, ${who.userId}::uuid, ${alertFailures})`);
       }
-      // Told now (or nothing to tell): only this session's own codes stay unexplained.
-      const left = alertFailures === undefined ? counted : mine;
+      // Told now (or nothing to tell): only this session's own codes stay
+      // unexplained, and none after a wait's alert, whose count has them.
+      const left = alertFailures === undefined ? counted : waitAlert ? 0 : mine;
       if (wrongCounted || left !== unexplained) {
         await tx.execute(sql`
           UPDATE public.second_step_throttles
@@ -566,7 +579,7 @@ async function takeCodeAttempt(db: Database, who: Who, input: CodeInput): Promis
               last_failure_at = CASE WHEN ${wrongCounted} THEN clock_timestamp() ELSE last_failure_at END
           WHERE key = ${wrongKey}`);
       }
-      return { allowed: true, keys, sessionFailures, wrongKey, wrongCounted };
+      return { allowed: true, keys, sessionFailures, wrongKey, wrongCounted, signIn };
     });
     if (decided !== "row_gone") return decided;
     if (round >= 3) return { allowed: false, retryAfterSeconds: 1 };
@@ -586,10 +599,12 @@ async function clearCodeAttempts(db: Queryable, counted: Counted): Promise<void>
   const personal = counted.keys.filter((k) => !k.startsWith("source:"));
   const sources = counted.keys.filter((k) => k.startsWith("source:"));
   // The session's codes, less this one if it is a recovery code (not on the counter).
-  const explained = Math.max(
-    counted.sessionFailures - (counted.wrongCounted ? 0 : 1),
-    counted.wrongCounted ? 1 : 0,
-  );
+  const explained = !counted.signIn
+    ? 0
+    : Math.max(
+        counted.sessionFailures - (counted.wrongCounted ? 0 : 1),
+        counted.wrongCounted ? 1 : 0,
+      );
   await db.execute(
     sql`DELETE FROM public.second_step_throttles WHERE key = ANY(${personal}::text[])`,
   );
@@ -661,6 +676,7 @@ async function checkCode(
       sessionFailures: attempt.sessionFailures,
       wrongKey: attempt.wrongKey,
       wrongCounted: attempt.wrongCounted,
+      signIn: attempt.signIn,
     };
   }
   if (verified.why === "unavailable") {
@@ -722,7 +738,7 @@ export async function completeSecondStep(
     const pending = await readPendingSession(db, token, call);
     if (!pending.ok) return pending;
     const { sessionId, userId } = pending.session;
-    const who: Who = { userId, sessionId, source };
+    const who: Who = { userId, sessionId, source, signIn: true };
     const factor = await liveFactor(db, userId);
     if (factor?.state !== "active") return ENROLMENT_REQUIRED;
     const checked = await checkCode(db, keys, who, factor, code);
@@ -957,7 +973,7 @@ export async function confirmEnrolment(
     const pending = await readPendingSession(db, token, call);
     if (!pending.ok) return pending;
     const { sessionId, userId } = pending.session;
-    const who: Who = { userId, sessionId, source };
+    const who: Who = { userId, sessionId, source, signIn: true };
     const factor = await liveFactor(db, userId);
     if (factor?.state === "active") return ALREADY_ENROLLED;
     if (factor?.enrol_session_id !== sessionId) return ENROLMENT_REQUIRED;

@@ -822,11 +822,11 @@ describe("wrong codes no right code explained raise an alert (S-045)", () => {
         });
       }
     }
-    // The person's 3 are two hours old, a week old for their wait counter
-    // too; the other's are minutes old and could still be explained.
+    // The person's 3 are two hours old; the other's are minutes old and
+    // could still be explained.
     await later(person.userId, 2);
     const done = await runCleanup(db);
-    expect(done.secondStepAlerts).toBeGreaterThanOrEqual(1);
+    expect(done.secondStepAlerts).toBe(1);
     expect(await alertsOf(person.userId)).toEqual([3]);
     expect(await unexplained(person.userId)).toBe(0);
     expect(await alertsOf(recent.userId)).toEqual([]);
@@ -835,6 +835,49 @@ describe("wrong codes no right code explained raise an alert (S-045)", () => {
     await runCleanup(db);
     await full(person.userId, org);
     expect(await alertsOf(person.userId)).toEqual([3]);
+  });
+
+  it("tells codes the wait's alert already told only once, and old rows before they go", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const old = await member(org);
+    const a = await pending(person.userId, org);
+    const wrong = await wrongFor(person.userId);
+    for (let i = 0; i < 5; i++) {
+      await completeSecondStep(db, keys, a.token, { source: source(), code: wrong });
+    }
+    // The 5th started the person's wait: one alert, with all 5.
+    expect(await alertsOf(person.userId)).toEqual([5]);
+    expect(await unexplained(person.userId)).toBe(0);
+    // A row 31 days old that still holds codes is told before it is deleted.
+    await db.execute(sql`
+      INSERT INTO public.second_step_throttles (key, failures, last_failure_at)
+      VALUES (${`wrong:${old.userId}`}, 2, clock_timestamp() - interval '31 days')`);
+    await later(person.userId, 2);
+    await runCleanup(db);
+    expect(await alertsOf(person.userId)).toEqual([5]);
+    expect(await alertsOf(old.userId)).toEqual([2]);
+    expect(await unexplained(old.userId)).toBe(0);
+  });
+
+  it("doesn't count a signed-in person's re-entry codes, which come after a whole sign-in", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const s = await full(person.userId, org);
+    expect(
+      await reauthenticate(db, keys, s.token, {
+        password: PASSWORD,
+        source: source(),
+        code: await wrongFor(person.userId),
+      }),
+    ).toMatchObject({ ok: false });
+    expect(await unexplained(person.userId)).toBe(0);
+    await later(person.userId, 2);
+    await runCleanup(db);
+    await full(person.userId, org);
+    expect(await alertsOf(person.userId)).toEqual([]);
   });
 
   it("forgets them after 30 days without another if no cleanup ran", async () => {
