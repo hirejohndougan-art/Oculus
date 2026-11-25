@@ -1214,7 +1214,7 @@ export interface CleanupResult {
   readonly passwordResets: number;
   /** Wrong-code counters (T-038) a day old (unexplained ones, S-045: 30 days), and those of sessions that have ended. */
   readonly secondStepThrottles: number;
-  /** Alerts written for unexplained wrong codes an hour old (S-045). */
+  /** Alerts written for unexplained wrong codes an hour old (S-045), and for codes whose count never came (S-054d). */
   readonly secondStepAlerts: number;
 }
 
@@ -1262,7 +1262,33 @@ export async function runCleanup(db: Queryable): Promise<CleanupResult> {
       RETURNING 1
     )
     SELECT count(*)::int AS n FROM alerted`);
-  const secondStepAlerts = told[0]?.n ?? 0;
+  // Sign-in codes checked an hour ago whose count never came (S-054d): told
+  // now, one alert per person, unless a right code in the same waiting
+  // session explained them (its sign-in pass) or the factor was revoked
+  // since (a reset, S-054b). A row marked told (a wait's alert had it) just
+  // goes. Only these rows are locked here, so no counter waits on this.
+  const unsettled = await db.rows<{ n: number }>(sql`
+    WITH old AS (
+      DELETE FROM public.second_step_code_checks c
+      WHERE c.started_at < clock_timestamp() - make_interval(secs => ${UNEXPLAINED_TOLD_AFTER_SECONDS})
+      RETURNING c.user_id, c.factor_id, c.session_id, c.started_at, c.told
+    ), unexplained AS (
+      SELECT o.user_id, count(*)::int AS failures, max(o.started_at) AS last_code_at
+      FROM old o
+      WHERE NOT o.told
+        AND EXISTS (SELECT 1 FROM public.second_factors f
+                    WHERE f.id = o.factor_id AND f.user_id = o.user_id AND f.state <> 'revoked')
+        AND NOT EXISTS (SELECT 1 FROM public.second_step_passes p
+                        WHERE p.user_id = o.user_id AND p.session_id = o.session_id
+                          AND p.purpose = 'sign_in')
+      GROUP BY o.user_id
+    ), alerted AS (
+      INSERT INTO public.second_step_alerts (id, user_id, failures, last_code_at)
+      SELECT gen_random_uuid(), u.user_id, u.failures, u.last_code_at FROM unexplained u
+      RETURNING 1
+    )
+    SELECT count(*)::int AS n FROM alerted`);
+  const secondStepAlerts = (told[0]?.n ?? 0) + (unsettled[0]?.n ?? 0);
   // Locked in key order first (S-054a), as a code attempt locks its
   // counters: a delete in the table's own order could hold `wrong:` while
   // waiting on the same person's `user:`, which an attempt holds while

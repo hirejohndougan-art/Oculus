@@ -141,6 +141,8 @@ export const SECOND_FACTOR_TABLE_PRIVILEGES: Readonly<Record<string, readonly st
     second_step_recovery_codes: Object.freeze(["INSERT", "UPDATE"]),
     second_step_throttles: Object.freeze(["INSERT", "UPDATE", "DELETE"]),
     second_step_alerts: Object.freeze(["INSERT"]),
+    // Sign-in codes being checked (S-054d): written, marked told, settled.
+    second_step_code_checks: Object.freeze(["INSERT", "UPDATE", "DELETE"]),
     second_step_enrolment_tokens: Object.freeze(["INSERT", "UPDATE"]),
   });
 
@@ -458,6 +460,12 @@ interface Counted {
    * already told it).
    */
   readonly countIfWrong: boolean;
+  /**
+   * The row standing for this code while it is checked (S-054d), when it
+   * would go on the unexplained counter: its count deletes it, so it is
+   * counted once, and the cleanup tells it if the count never came.
+   */
+  readonly checkId: string | undefined;
 }
 
 function wrongKeyOf(userId: UserId): string {
@@ -494,7 +502,12 @@ type Attempt =
  * when the newest code it tells was typed (`last_code_at`, S-054c), for the
  * notice.
  */
-async function takeCodeAttempt(db: Database, who: Who, input: CodeInput): Promise<Attempt> {
+async function takeCodeAttempt(
+  db: Database,
+  who: Who,
+  input: CodeInput,
+  factorId: string,
+): Promise<Attempt> {
   const keys = keysFor(who, input);
   const wrongKey = wrongKeyOf(who.userId);
   const signIn = who.signIn === true;
@@ -630,18 +643,46 @@ async function takeCodeAttempt(db: Database, who: Who, input: CodeInput): Promis
             WHERE key = ${signInSessionKey}`);
         }
       }
+      // A wait's alert told every code the person's counter has, codes
+      // other sign-ins are still checking included (S-054c): those won't go
+      // on the unexplained counter after their check (S-054d).
+      if (waitAlert) {
+        await tx.execute(sql`
+          UPDATE public.second_step_code_checks SET told = true
+          WHERE user_id = ${who.userId}::uuid AND NOT told`);
+      }
+      const countIfWrong = signInSessionKey !== undefined && input.kind === "totp" && !waitAlert;
+      // This code, until its check is settled (S-054d): in this transaction,
+      // so a code counted up front can never be checked without it.
+      let checkId: string | undefined;
+      if (countIfWrong && who.sessionId !== undefined) {
+        checkId = randomUUID();
+        await tx.execute(sql`
+          INSERT INTO public.second_step_code_checks (id, user_id, factor_id, session_id)
+          VALUES (${checkId}::uuid, ${who.userId}::uuid, ${factorId}::uuid,
+                  ${who.sessionId}::uuid)`);
+      }
       return {
         allowed: true,
         keys,
         sessionFailures,
         wrongKey,
         signInSessionKey,
-        countIfWrong: signInSessionKey !== undefined && input.kind === "totp" && !waitAlert,
+        countIfWrong,
+        checkId,
       };
     });
     if (decided !== "row_gone") return decided;
     if (round >= 3) return { allowed: false, retryAfterSeconds: 1 };
   }
+}
+
+/** A code's check settled without a count (S-054d): best effort, the cleanup knows a right code by its pass. */
+async function dropCodeCheck(db: Queryable, counted: Counted): Promise<void> {
+  if (counted.checkId === undefined) return;
+  await db
+    .execute(sql`DELETE FROM public.second_step_code_checks WHERE id = ${counted.checkId}::uuid`)
+    .catch(() => undefined);
 }
 
 /**
@@ -653,6 +694,7 @@ async function takeCodeAttempt(db: Database, who: Who, input: CodeInput): Promis
  * off twice, and a later session's codes are never taken off.
  */
 async function clearCodeAttempts(db: Queryable, counted: Counted): Promise<void> {
+  await dropCodeCheck(db, counted);
   const personal = counted.keys.filter((k) => !k.startsWith("source:"));
   const sources = counted.keys.filter((k) => k.startsWith("source:"));
   // First, in one statement, so no alert can come between reading the share
@@ -708,6 +750,7 @@ async function clearCodeAttempts(db: Queryable, counted: Counted): Promise<void>
  * unexplained counter (S-054b).
  */
 async function giveBackCodeAttempt(db: Queryable, counted: Counted): Promise<void> {
+  await dropCodeCheck(db, counted);
   // Locked in key order first (S-054a), as takeCodeAttempt locks them.
   await db.execute(sql`
     WITH locked AS (
@@ -737,7 +780,7 @@ async function countWrongCode(
   const wrongKey = counted.wrongKey;
   // Again if the cleanup deleted the new row in between (review), as takeCodeAttempt does.
   for (let round = 1; round <= 3; round++) {
-    const done = await countWrongCodeOnce(db, who, sessionKey, wrongKey, factorId);
+    const done = await countWrongCodeOnce(db, who, sessionKey, wrongKey, factorId, counted.checkId);
     if (done) return;
   }
 }
@@ -749,6 +792,7 @@ async function countWrongCodeOnce(
   sessionKey: string,
   wrongKey: string,
   factorId: string,
+  checkId: string | undefined,
 ): Promise<boolean> {
   return inTransaction(db, async (tx) => {
     await tx.execute(sql`
@@ -768,6 +812,14 @@ async function countWrongCodeOnce(
     const wrong = rows.find((r) => r.key === wrongKey);
     const ownRow = rows.find((r) => r.key === sessionKey);
     if (wrong === undefined) return false;
+    // Settled here, with the count (S-054d), after the counters (the order
+    // takeCodeAttempt locks in): gone means the cleanup told it already;
+    // told means a wait's alert did. Either way it isn't counted again.
+    if (checkId !== undefined) {
+      const [check] = await tx.rows<{ told: boolean }>(sql`
+        DELETE FROM public.second_step_code_checks WHERE id = ${checkId}::uuid RETURNING told`);
+      if (check === undefined || check.told) return true;
+    }
     // Only the factor, not the session: the guesser ends their own session
     // (signing out, or a code past its cap) while a code is being checked,
     // and the code must still be counted (S-054b review).
@@ -858,7 +910,7 @@ async function checkCode(
   factor: FactorRow,
   input: CodeInput,
 ): Promise<Checked> {
-  const attempt = await takeCodeAttempt(db, who, input);
+  const attempt = await takeCodeAttempt(db, who, input, factor.id);
   if (!attempt.allowed) {
     if ("exhausted" in attempt) {
       if (who.sessionId !== undefined) await endSessionById(db, who.sessionId);
@@ -876,6 +928,7 @@ async function checkCode(
       wrongKey: attempt.wrongKey,
       signInSessionKey: attempt.signInSessionKey,
       countIfWrong: attempt.countIfWrong,
+      checkId: attempt.checkId,
     };
   }
   if (verified.why === "unavailable") {
