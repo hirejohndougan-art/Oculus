@@ -165,9 +165,10 @@ export interface StaffApiOptions {
    * files_unavailable`.
    */
   readonly files?: FileStore;
-  /** Limits on streamed files per session (defaults: 4 at once, 16 KiB every 30 s); tests shorten them. */
+  /** Limits on streamed files (defaults: 4 a session, 8 a person, 64 KiB every 10 s); tests change them. */
   readonly downloads?: {
     readonly perSession?: number;
+    readonly perUser?: number;
     readonly minBytes?: number;
     readonly windowMs?: number;
   };
@@ -181,10 +182,12 @@ export interface StaffApiOptions {
 
 /** Files streamed at once per session (M-003). */
 export const MAX_DOWNLOADS_PER_SESSION = 4;
+/** Files streamed at once per person, across all their sessions (M-003). */
+export const MAX_DOWNLOADS_PER_USER = 8;
 /** A streamed file must send at least this many bytes in every window… */
-export const MIN_DOWNLOAD_BYTES = 16 * 1024;
+export const MIN_DOWNLOAD_BYTES = 64 * 1024;
 /** …of this many milliseconds, or it is cut off. */
-export const MIN_DOWNLOAD_WINDOW_MS = 30_000;
+export const MIN_DOWNLOAD_WINDOW_MS = 10_000;
 
 /** The headers carrying an upload's original name (percent-encoded UTF-8) and claimed type. */
 export const FILE_NAME_HEADER = "x-oculus-file-name";
@@ -615,16 +618,20 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
   // hold files open (and the server's sockets) for the 2-hour deadline.
   const downloadLimits = {
     perSession: options.downloads?.perSession ?? MAX_DOWNLOADS_PER_SESSION,
+    perUser: options.downloads?.perUser ?? MAX_DOWNLOADS_PER_USER,
     minBytes: options.downloads?.minBytes ?? MIN_DOWNLOAD_BYTES,
     windowMs: options.downloads?.windowMs ?? MIN_DOWNLOAD_WINDOW_MS,
   };
   const streaming = new Map<string, number>();
 
-  /** The opener, counted against the session while its stream is open, and kept to the minimum rate. */
-  function counted(sessionId: string, open: () => Readable): () => Readable {
+  /**
+   * The opener, counted against the session and the person while its
+   * stream is open, and kept to the minimum rate.
+   */
+  function counted(keys: readonly string[], open: () => Readable): () => Readable {
     return () => {
       const source = open();
-      streaming.set(sessionId, (streaming.get(sessionId) ?? 0) + 1);
+      for (const key of keys) streaming.set(key, (streaming.get(key) ?? 0) + 1);
       let sent = 0;
       let checked = 0;
       const counter = new Transform({
@@ -645,9 +652,11 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
         if (released) return;
         released = true;
         clearInterval(timer);
-        const left = (streaming.get(sessionId) ?? 1) - 1;
-        if (left <= 0) streaming.delete(sessionId);
-        else streaming.set(sessionId, left);
+        for (const key of keys) {
+          const left = (streaming.get(key) ?? 1) - 1;
+          if (left <= 0) streaming.delete(key);
+          else streaming.set(key, left);
+        }
       };
       // A storage error reaches the counter (the reply's 500 or cut-off);
       // the counter destroyed (client gone, too slow) closes the source.
@@ -665,7 +674,11 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
     context: ServiceContext,
     use: "download" | "view",
   ): Promise<unknown> {
-    if ((streaming.get(session.sessionId) ?? 0) >= downloadLimits.perSession) {
+    const keys = [`session:${session.sessionId}`, `user:${session.userId}`];
+    if (
+      (streaming.get(keys[0] ?? "") ?? 0) >= downloadLimits.perSession ||
+      (streaming.get(keys[1] ?? "") ?? 0) >= downloadLimits.perUser
+    ) {
       throw new Refusal(429, "too_many_downloads");
     }
     const result = await service.fileContent(
@@ -681,7 +694,7 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
     }
     const { file, open } = result.value;
     return fileReply({
-      body: counted(session.sessionId, open),
+      body: counted(keys, open),
       size: file.size,
       // The sniffed type (D-086); fileReply sends a download as
       // application/octet-stream whatever it is.

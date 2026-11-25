@@ -3,6 +3,11 @@
 // else, decompression bombs refused before or at the inflate ceiling, the
 // scaling, and the worker's queue, time limit and closing. Every image is
 // invented (images.fixtures.ts).
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { deflateSync } from "node:zlib";
 import { afterAll, describe, expect, it } from "vitest";
 import {
@@ -31,8 +36,11 @@ import {
   pngBombs,
   pngOf,
   ihdr,
+  jpegSmuggles,
   makeWebp,
+  noisePng,
   pngFrom,
+  vp8lManyGroups,
   webpAttacks,
   zeroPng,
   webpHeader,
@@ -349,6 +357,49 @@ describe("strict walks and the memory budget (review B1, B2)", () => {
     expect(() => planDecode("image/jpeg", jpeg7000, THUMBNAIL_LIMITS)).toThrow("too_large");
   });
 
+  it("walks JPEG markers as jpeg-js reads them, for thumbnails and the view (review B2a)", () => {
+    const tricks = jpegSmuggles(600, 400);
+    for (const [name, bytes, code] of [
+      ["FF 00 then a fake frame in a comment", tricks.ff00Smuggle, "jpeg_marker"],
+      ["a fill byte before a marker", tricks.fill, "jpeg_marker"],
+      ["a second frame after the scan", tricks.sofAfterScan, "jpeg_second_frame"],
+      ["SOF3", tricks.unknownMarker, "jpeg_marker"],
+    ] as const) {
+      expect(() => planDecode("image/jpeg", bytes, THUMBNAIL_LIMITS), name).toThrow(code);
+    }
+    // The view's check of the file's start agrees.
+    for (const bytes of [tricks.ff00Smuggle, tricks.fill, tricks.unknownMarker]) {
+      expect(viewDimensions("image/jpeg", bytes)).toBeUndefined();
+    }
+    // A fake frame header inside a well-formed comment is just a comment.
+    const real = makeJpeg(600, 400);
+    const fake = Buffer.from([
+      0xff, 0xc0, 0x00, 0x11, 0x08, 0, 16, 0, 16, 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1,
+    ]);
+    const com = Buffer.concat([Buffer.from([0xff, 0xfe, 0x00, 2 + fake.length]), fake]);
+    const honest = Buffer.concat([real.subarray(0, 2), com, real.subarray(2)]);
+    expect(planDecode("image/jpeg", honest, THUMBNAIL_LIMITS)).toMatchObject({
+      width: 600,
+      height: 400,
+    });
+    expect(decodeImage("image/jpeg", honest, THUMBNAIL_LIMITS)).toMatchObject({
+      width: 600,
+      height: 400,
+    });
+  });
+
+  it("plans lossless WebP for the most prefix-code groups its size allows (review B2b)", () => {
+    // The review's file shape: 1,024² with a group per 4 × 4 block (65,536
+    // groups in under 300 KB), which grew a decode by about 400 MiB.
+    const attack = vp8lManyGroups(1024, 1024);
+    expect(attack.length).toBeLessThan(300 * 1024);
+    expect(() => planDecode("image/webp", attack, THUMBNAIL_LIMITS)).toThrow("too_large");
+    // The largest such file accepted stays within the budget.
+    expect(
+      planDecode("image/webp", vp8lManyGroups(820, 820), THUMBNAIL_LIMITS).bytes,
+    ).toBeLessThanOrEqual(DECODE_BUDGET_BYTES);
+  });
+
   it("walks WebP strictly: animation chunks, a second frame, chunks out of order", async () => {
     const lossy = await makeWebp(16, 16);
     const frame = lossy.subarray(12);
@@ -444,6 +495,18 @@ describe("the worker", () => {
     });
   });
 
+  it("doesn't count a worker's start against a job's time limit (review)", async () => {
+    const quick = createThumbnailRenderer({ timeoutMs: 400 });
+    renderers.push(quick);
+    // The first job starts the worker and compiles the WebP decoder first.
+    expect((await quick.render("image/webp", await makeWebp(40, 30), 160)).ok).toBe(true);
+    expect((await quick.render("image/jpeg", makeJpeg(40, 30), 160)).ok).toBe(true);
+    expect(await quick.render("image/webp", vp8lManyGroups(1024, 1024), 160)).toEqual({
+      ok: false,
+      code: "refused",
+    });
+  });
+
   it("answers busy past its queue, stops a job past its time limit, and starts again", async () => {
     const renderer = createThumbnailRenderer({ maxQueued: 1, timeoutMs: 1 });
     renderers.push(renderer);
@@ -465,56 +528,88 @@ describe("the worker", () => {
 });
 
 /** The peak RSS growth while `run` runs, sampled every 10 ms. */
-async function peakGrowth(run: () => Promise<unknown>): Promise<number> {
-  const base = process.memoryUsage().rss;
-  let peak = base;
-  const timer = setInterval(() => {
-    peak = Math.max(peak, process.memoryUsage().rss);
-  }, 10);
+/**
+ * The peak memory one thumbnail costs, measured in a fresh process (review:
+ * memory the test process freed earlier would hide a decode's growth): the
+ * child loads the decoders and makes a tiny thumbnail first, then reads the
+ * file and makes its thumbnail; the growth is its peak resident size
+ * (Linux's VmHWM, reset first) less its resident size before, the file's
+ * own bytes included.
+ */
+function childPeak(format: string, bytes: Buffer): { ok: boolean; growth: number } {
+  const dir = mkdtempSync(join(tmpdir(), "oculus-peak-"));
   try {
-    await run();
+    const file = join(dir, "image");
+    writeFileSync(file, bytes);
+    const worker = pathToFileURL(fileURLToPath(new URL("./thumbnail-worker.ts", import.meta.url)));
+    const script = `
+      const m = await import(${JSON.stringify(worker.href)});
+      const { readFileSync } = await import("node:fs");
+      const tiny = Buffer.from(${JSON.stringify(makePng(4, 4).toString("base64"))}, "base64");
+      await m.renderThumbnail("image/png", tiny, 160);
+      await m.renderThumbnail("image/webp", Buffer.from(${JSON.stringify((tinyWebp ?? Buffer.alloc(0)).toString("base64"))}, "base64"), 160).catch(() => {});
+      // Linux's own counters: the peak reset now (clear_refs 5), then the
+      // peak after (VmHWM) less the resident size now. (maxRSS would carry
+      // the test runner's size over the exec.)
+      const { writeFileSync: w } = await import("node:fs");
+      const status = (key) => {
+        const line = readFileSync("/proc/self/status", "utf8").split("\\n").find((l) => l.startsWith(key + ":"));
+        return Number(line.slice(key.length + 1).trim().split(" ")[0]);
+      };
+      w("/proc/self/clear_refs", "5");
+      const before = status("VmRSS");
+      let ok = true;
+      try { await m.renderThumbnail(${JSON.stringify(format)}, readFileSync(${JSON.stringify(file)}), 160); } catch { ok = false; }
+      const after = status("VmHWM");
+      process.stdout.write(JSON.stringify({ ok, growth: (after - before) * 1024 }));
+    `;
+    // A clean environment: the test runner's NODE_OPTIONS would load its
+    // own hooks into the child and blur the measurement.
+    const run = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+      encoding: "utf8",
+      timeout: 120_000,
+      env: { PATH: process.env.PATH ?? "" },
+    });
+    const line = run.stdout.trim().split("\n").pop() ?? "";
+    return JSON.parse(line) as { ok: boolean; growth: number };
   } finally {
-    clearInterval(timer);
+    rmSync(dir, { recursive: true, force: true });
   }
-  peak = Math.max(peak, process.memoryUsage().rss);
-  return peak - base;
 }
+
+let tinyWebp: Buffer | undefined;
 
 describe("peak memory of the largest images accepted (review B2)", () => {
   const MIB = 1024 * 1024;
   it("keeps each decode's peak well under 512 MiB", { timeout: 300_000 }, async () => {
+    tinyWebp = await makeWebp(4, 4);
     const cases: [string, string, () => Promise<Buffer> | Buffer][] = [
-      ["JPEG 2,780²", "image/jpeg", () => makeJpeg(2780, 2780)],
-      ["PNG RGBA16 2,800²", "image/png", () => zeroPng(2800, 2800, 16, 6)],
-      ["PNG RGBA8 3,900²", "image/png", () => zeroPng(3900, 3900, 8, 6)],
-      ["GIF 5,500²", "image/gif", () => makeGif(5500, 5500)],
-      ["WebP lossy 4,900²", "image/webp", () => makeWebp(4900, 4900)],
-      ["WebP lossless 4,300²", "image/webp", () => makeWebp(4300, 4300, { lossless: true })],
+      ["JPEG 2,640²", "image/jpeg", () => makeJpeg(2640, 2640)],
+      ["PNG RGBA16 2,660² (noise)", "image/png", () => noisePng(2660, 2660, 16)],
+      ["PNG RGBA8 3,700² (noise)", "image/png", () => noisePng(3700, 3700)],
+      ["GIF 5,240²", "image/gif", () => makeGif(5240, 5240)],
+      ["WebP lossy 4,650²", "image/webp", () => makeWebp(4650, 4650)],
+      ["WebP lossless 820²", "image/webp", () => makeWebp(820, 820, { lossless: true })],
+      // The review's shape at the largest size accepted: a group per 4 × 4 block.
+      ["WebP lossless 820², 42,025 groups", "image/webp", () => vp8lManyGroups(820, 820)],
     ];
     const peaks: string[] = [];
-    const outcomes: [string, boolean, number][] = [];
+    const outcomes: [string, boolean, number, number][] = [];
     for (const [name, format, make] of cases) {
       const bytes = await make();
       const plan = planDecode(format, bytes, THUMBNAIL_LIMITS);
       expect(plan.bytes, name).toBeLessThanOrEqual(DECODE_BUDGET_BYTES);
-      const renderer = createThumbnailRenderer({ timeoutMs: 120_000 });
-      // The worker started and its decoders loaded first (a fixed cost of
-      // some 40 MiB, paid once): the growth below is the decode's own.
-      await renderer.render("image/png", makePng(4, 4), 160);
-      await renderer.render("image/webp", await makeWebp(4, 4), 160);
-      let result: Awaited<ReturnType<typeof renderer.render>> | undefined;
-      const growth = await peakGrowth(async () => {
-        result = await renderer.render(format, bytes, 160);
-      });
-      await renderer.close();
-      outcomes.push([name, result?.ok === true, growth]);
+      const { ok, growth } = childPeak(format, bytes);
+      outcomes.push([name, ok, growth, plan.bytes]);
       peaks.push(
         `${name}: ${String(Math.round(growth / MIB))} MiB (budget ${String(Math.round(plan.bytes / MIB))} MiB)`,
       );
     }
     console.log(`Peak RSS growth: ${peaks.join("; ")}`);
-    for (const [name, ok, growth] of outcomes) {
+    for (const [name, ok, growth, planned] of outcomes) {
       expect(ok, name).toBe(true);
+      // The plan is an upper bound, and well under 512 MiB.
+      expect(growth, name).toBeLessThan(planned);
       expect(growth, name).toBeLessThan(400 * MIB);
     }
   });

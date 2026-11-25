@@ -347,8 +347,9 @@ export function fileOperations(
   let renderer = thumbnails;
   /** Thumbnails being made now, by organization, content and size: asked twice, made once. */
   const making = new Map<string, Promise<ServiceResult<{ readonly jpeg: Uint8Array }>>>();
-  /** Thumbnails being made now (all organizations). */
+  /** Thumbnails being made now (all organizations), and the organizations making one. */
   let makingNow = 0;
+  const makingFor = new Set<string>();
   /** Each organization's thumbnails made in the current minute (a fixed window). */
   const budgets = new Map<string, { minute: number; used: number }>();
   const takeBudget = (organizationId: string): boolean => {
@@ -908,8 +909,12 @@ export function fileOperations(
       if (already !== undefined) return already;
       // A slot and the organization's budget before a byte is read (review
       // B3 and item 1): a few at once, a few a minute, then 503 busy.
-      if (makingNow >= atOnce || !takeBudget(organizationId)) return busy();
+      // One at a time per organization, so one can't fill every slot (review).
+      if (makingNow >= atOnce || makingFor.has(organizationId) || !takeBudget(organizationId)) {
+        return busy();
+      }
       makingNow++;
+      makingFor.add(organizationId);
       // Only while the copy is still there: the sweep removes a content's
       // thumbnails when it removes its copy, and never otherwise.
       const remember = async (what: Uint8Array | "none" | "timeout"): Promise<void> => {
@@ -962,6 +967,7 @@ export function fileOperations(
       } finally {
         making.delete(key);
         makingNow--;
+        makingFor.delete(organizationId);
       }
     },
 

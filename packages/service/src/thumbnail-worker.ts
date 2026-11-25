@@ -126,33 +126,94 @@ const ascii = (b: Uint8Array, i: number, text: string): boolean =>
 
 const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 
-function jpegDimensions(b: Uint8Array): { width: number; height: number } | undefined {
-  if (b[0] !== 0xff || b[1] !== 0xd8) return undefined;
+/** What the strict JPEG walk found: the one frame's size and components. */
+interface JpegLayout {
+  readonly width: number;
+  readonly height: number;
+  readonly components: number;
+}
+
+/** Markers allowed as segments (with a length) before and between scans. */
+const JPEG_SEGMENTS = new Set([
+  0xc4, // DHT
+  0xdb, // DQT
+  0xdd, // DRI
+  0xfe, // COM
+  ...Array.from({ length: 16 }, (_, k) => 0xe0 + k), // APP0–15
+]);
+/** The frame types jpeg-js decodes: baseline, extended, progressive. */
+const JPEG_FRAMES = new Set([0xc0, 0xc1, 0xc2]);
+
+/**
+ * Walks a JPEG's markers strictly, as its decoder reads them (review B2a:
+ * jpeg-js reads `FF 00` where a marker should be as a no-op, where a looser
+ * walk read a segment length, so a fake frame header hidden in a comment
+ * could be planned while another frame was decoded): SOI, then only DHT,
+ * DQT, DRI, APPn, COM and exactly one SOF0, SOF1 or SOF2 before the first
+ * SOS; `FF 00`, fill bytes, restart markers and every other marker where a
+ * marker belongs are refused. With `whole`, the scans are walked too (their
+ * entropy-coded data skipped by its `FF 00` stuffing and RST markers): a
+ * second frame header, or anything but those segments, SOS and EOI, is
+ * refused, and the file must reach EOI. Without it, the walk ends at the
+ * first SOS (the inline view's check of a file's start).
+ */
+function walkJpeg(b: Uint8Array, whole: boolean): JpegLayout {
+  if (b[0] !== 0xff || b[1] !== 0xd8) throw new ImageRefused("header");
+  let frame: JpegLayout | undefined;
+  let scanned = false;
   let i = 2;
-  while (i + 3 < b.length) {
-    if (b[i] !== 0xff) return undefined;
+  for (;;) {
+    if (i + 2 > b.length) throw new ImageRefused("jpeg_truncated");
+    if (b[i] !== 0xff) throw new ImageRefused("jpeg_marker");
     const marker = b[i + 1] ?? 0;
-    if (marker === 0xff) {
-      i++; // fill byte
-      continue;
+    if (marker === 0xd9) {
+      if (!scanned || frame === undefined) throw new ImageRefused("jpeg_truncated");
+      return frame;
     }
-    // Markers without a length: TEM, RST0–7.
-    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
-      i += 2;
-      continue;
+    if (!JPEG_FRAMES.has(marker) && marker !== 0xda && !JPEG_SEGMENTS.has(marker)) {
+      // FF 00, fill bytes, RST, TEM, DNL and every other marker.
+      throw new ImageRefused("jpeg_marker");
     }
-    // The image data or its end came before any frame header.
-    if (marker === 0xd9 || marker === 0xda) return undefined;
+    if (i + 4 > b.length) throw new ImageRefused("jpeg_truncated");
     const length = u16be(b, i + 2);
-    if (length < 2) return undefined;
-    const sof = marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker);
-    if (sof) {
-      if (i + 9 > b.length) return undefined;
-      return { height: u16be(b, i + 5), width: u16be(b, i + 7) };
+    const end = i + 2 + length;
+    if (length < 2 || end > b.length) throw new ImageRefused("jpeg_truncated");
+    if (JPEG_FRAMES.has(marker)) {
+      if (frame !== undefined || scanned) throw new ImageRefused("jpeg_second_frame");
+      if (length < 8) throw new ImageRefused("jpeg_marker");
+      frame = { height: u16be(b, i + 5), width: u16be(b, i + 7), components: b[i + 9] ?? 0 };
+    } else if (marker === 0xda) {
+      if (frame === undefined) throw new ImageRefused("jpeg_marker");
+      scanned = true;
+      if (!whole) return frame;
+      // The entropy-coded data: up to the next marker that isn't stuffing or RST.
+      let j = end;
+      for (;;) {
+        if (j + 1 >= b.length) throw new ImageRefused("jpeg_truncated");
+        if (b[j] === 0xff) {
+          const next = b[j + 1] ?? 0;
+          if (next === 0x00 || (next >= 0xd0 && next <= 0xd7)) {
+            j += 2;
+            continue;
+          }
+          break;
+        }
+        j++;
+      }
+      i = j;
+      continue;
     }
-    i += 2 + length;
+    i = end;
   }
-  return undefined;
+}
+
+function jpegDimensions(b: Uint8Array): { width: number; height: number } | undefined {
+  try {
+    const layout = walkJpeg(b, false);
+    return { width: layout.width, height: layout.height };
+  } catch {
+    return undefined;
+  }
 }
 
 function webpDimensions(b: Uint8Array): { width: number; height: number } | undefined {
@@ -467,32 +528,14 @@ export interface DecodePlan {
   readonly bytes: number;
 }
 
+/** The headroom on every plan (measured peaks vary by some 10% between runs). */
+const PLAN_MARGIN = 1.1;
+
+/** What libwebp's tables for one VP8L prefix-code group cost (measured: about 6 KiB). */
+export const VP8L_GROUP_BYTES = 6656;
+
 /** Scaling after decoding: flattening in place, then halving (⅓ more at most). */
 const SCALE_BYTES_PER_PIXEL = 4 * (4 / 3);
-
-function jpegComponents(b: Uint8Array): number | undefined {
-  let i = 2;
-  while (i + 3 < b.length) {
-    const marker = b[i + 1] ?? 0;
-    if (b[i] !== 0xff) return undefined;
-    if (marker === 0xff) {
-      i++;
-      continue;
-    }
-    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
-      i += 2;
-      continue;
-    }
-    if (marker === 0xd9 || marker === 0xda) return undefined;
-    const length = u16be(b, i + 2);
-    if (length < 2) return undefined;
-    if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) {
-      return b[i + 9];
-    }
-    i += 2 + length;
-  }
-  return undefined;
-}
 
 /**
  * Checks an image's header as the format named (never guessed), strictly
@@ -519,16 +562,19 @@ export function planDecode(format: string, bytes: Uint8Array, limits: ImageLimit
     const layout = walkWebp(bytes);
     ({ width, height } = layout);
     // libwebp's output in WebAssembly memory, its copy out, scaling; and
-    // for lossless, its ARGB working buffer.
+    // for lossless, its ARGB working buffer and its prefix-code groups
+    // (review B2b): a group's tables cost about 6 KiB, and a file of a few
+    // hundred kilobytes can give every 4 × 4 block a group of its own, so
+    // the plan counts the most groups the size allows.
     perPixel = 4 + 4 + (layout.lossless ? 4 : 0) + SCALE_BYTES_PER_PIXEL;
-    extra = 2 * bytes.length;
+    extra =
+      2 * bytes.length +
+      (layout.lossless ? Math.ceil(width / 4) * Math.ceil(height / 4) * VP8L_GROUP_BYTES : 0);
   } else if (format === "image/jpeg") {
-    const size = jpegDimensions(bytes);
-    const components = jpegComponents(bytes);
-    if (size === undefined || components === undefined || components < 1 || components > 4) {
-      throw new ImageRefused("header");
-    }
-    ({ width, height } = size);
+    const layout = walkJpeg(bytes, true);
+    const components = layout.components;
+    if (components < 1 || components > 4) throw new ImageRefused("jpeg_marker");
+    ({ width, height } = layout);
     // jpeg-js: its coefficient blocks and sample planes per component, then
     // RGBA (measured in the worker: up to 39 bytes a pixel at its peak for
     // three components, so about 7.8 megapixels fit the budget).
@@ -541,7 +587,8 @@ export function planDecode(format: string, bytes: Uint8Array, limits: ImageLimit
     perPixel = 1 + 4 + SCALE_BYTES_PER_PIXEL;
   }
   if (!withinLimits({ width, height }, limits)) throw new ImageRefused("too_large");
-  const cost = Math.ceil(width * height * perPixel + extra + bytes.length);
+  // A tenth more than the estimate: the measured peaks vary from run to run.
+  const cost = Math.ceil((width * height * perPixel + extra + bytes.length) * PLAN_MARGIN);
   if (cost > DECODE_BUDGET_BYTES) throw new ImageRefused("too_large");
   return { width, height, bytes: cost };
 }
@@ -638,9 +685,18 @@ function loadWebp(): Promise<WebpDecode> {
   return webpDecoder;
 }
 
-/** A failure that says nothing about the file (memory, a crash): never remembered. */
+/** A decoder that couldn't be loaded. */
+class Unavailable extends Error {
+  constructor(cause: unknown) {
+    super("decoder unavailable", { cause });
+    this.name = "Unavailable";
+  }
+}
+
+/** A failure that says nothing about the file (memory, a crash, no decoder): never remembered. */
 function transient(error: unknown): boolean {
   return (
+    error instanceof Unavailable ||
     error instanceof RangeError ||
     (error instanceof Error &&
       /memory/i.test(error.message) &&
@@ -663,10 +719,13 @@ export async function decodeAny(
   if (format === "image/webp") {
     const layout = walkWebp(bytes);
     let image: Awaited<ReturnType<WebpDecode>>;
+    // The decoder failing to load says nothing about the file.
+    const decode = await loadWebp().catch((error: unknown) => {
+      throw new Unavailable(error);
+    });
     try {
-      const decode = await loadWebp();
-      // A copy the decoder may keep: never the caller's buffer.
-      image = await decode(layout.body.slice().buffer);
+      // A copy of its own (a Buffer's slice would share its pool): never the caller's buffer.
+      image = await decode(Uint8Array.from(layout.body).buffer);
     } catch (error) {
       if (transient(error)) throw error;
       throw new ImageRefused("decode");
@@ -696,6 +755,10 @@ export function decodeImage(format: string, bytes: Uint8Array, limits: ImageLimi
         maxResolutionInMP: limits.maxPixels / 1_000_000,
         maxMemoryUsageInMB: Math.ceil(DECODE_BUDGET_BYTES / (1024 * 1024)),
       });
+      // The size decoded must be the size planned (review B2a).
+      if (image.width !== size.width || image.height !== size.height) {
+        throw new ImageRefused("jpeg_header");
+      }
       return { width: image.width, height: image.height, data: image.data };
     }
     if (format === "image/png") {
@@ -853,9 +916,6 @@ export type ThumbnailAnswer =
     }
   | { readonly id: number; readonly ok: false; readonly code: string; readonly recycle: boolean };
 
-/** A WebP above this many pixels leaves its worker to be replaced (its WebAssembly memory stays grown). */
-export const WEBP_RECYCLE_PIXELS = 4_000_000;
-
 /** The code of a failure that says nothing about the file (never remembered). */
 export const TRANSIENT = "transient";
 
@@ -864,10 +924,17 @@ export const WORKER_MARK = "oculus-thumbnail-worker";
 
 const port = parentPort;
 if (port !== null && (workerData as { mark?: unknown } | null)?.mark === WORKER_MARK) {
+  // Ready once the WebP decoder is compiled (a failure there shows in a job).
+  void loadWebp()
+    .catch(() => undefined)
+    .then(() => {
+      port.postMessage({ ready: true });
+    });
   port.on("message", (job: ThumbnailJob) => {
     void (async () => {
-      const size = job.format === "image/webp" ? imageDimensions(job.format, job.bytes) : undefined;
-      const recycle = size !== undefined && size.width * size.height > WEBP_RECYCLE_PIXELS;
+      // Every WebP decode leaves its worker to be replaced (review B2b): its
+      // WebAssembly memory grows for the decode and never shrinks.
+      const recycle = job.format === "image/webp";
       let answer: ThumbnailAnswer;
       try {
         const jpegBytes = await renderThumbnail(job.format, job.bytes, job.box);

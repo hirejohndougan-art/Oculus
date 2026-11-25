@@ -66,13 +66,19 @@ interface Pending {
   readonly done: (result: RenderResult) => void;
 }
 
+/** The longest a worker may take to start and load its decoders (30 s). */
+const STARTUP_MS = 30_000;
+
 export function createThumbnailRenderer(options: ThumbnailRendererOptions = {}): ThumbnailRenderer {
   const timeoutMs = options.timeoutMs ?? 20_000;
   const maxQueued = options.maxQueued ?? 1;
   const heapMiB = options.heapMiB ?? 256;
   const queue: Pending[] = [];
   let worker: Worker | undefined;
-  let running: { readonly pending: Pending; readonly timer: NodeJS.Timeout } | undefined;
+  let running:
+    { readonly pending: Pending; timer: NodeJS.Timeout | undefined; sent?: boolean } | undefined;
+  /** Workers that said they are ready. */
+  const ready = new WeakSet<Worker>();
   let nextId = 1;
   let closed = false;
 
@@ -104,9 +110,15 @@ export function createThumbnailRenderer(options: ThumbnailRendererOptions = {}):
     });
     w.stdout.resume();
     w.stderr.resume();
-    w.on("message", (answer: ThumbnailAnswer) => {
+    w.on("message", (answer: ThumbnailAnswer | { readonly ready: true }) => {
+      if ("ready" in answer) {
+        // Started and its decoders loaded: only now does the job's time run.
+        ready.add(w);
+        if (worker === w) dispatch();
+        return;
+      }
       if (running?.pending.job.id !== answer.id) return;
-      // A large WebP grew the worker's WebAssembly memory for good: replace it.
+      // A WebP's decode grew the worker's WebAssembly memory for good: replace it.
       if (answer.recycle) stopWorker();
       finish(
         answer.ok
@@ -134,14 +146,32 @@ export function createThumbnailRenderer(options: ThumbnailRendererOptions = {}):
     }
     worker ??= startWorker();
     worker.ref();
-    const timer = setTimeout(() => {
+    running = { pending, timer: undefined };
+    if (ready.has(worker)) {
+      dispatch();
+      return;
+    }
+    // Starting (and compiling the WebP decoder) doesn't count against the
+    // job's time limit (review), but has a limit of its own.
+    running.timer = setTimeout(() => {
+      stopWorker();
+      finish({ ok: false, code: "failed" });
+    }, STARTUP_MS);
+  }
+
+  /** Sends the running job to a ready worker and starts its time limit. */
+  function dispatch(): void {
+    const current = running;
+    if (current === undefined || worker === undefined || current.sent === true) return;
+    clearTimeout(current.timer);
+    current.sent = true;
+    current.timer = setTimeout(() => {
       // Too slow: stop the worker (its job can't be interrupted otherwise).
       stopWorker();
       finish({ ok: false, code: "timeout" });
     }, timeoutMs);
-    running = { pending, timer };
     // The job's bytes are copied into the worker (a transfer could detach the caller's buffer).
-    worker.postMessage(pending.job);
+    worker.postMessage(current.pending.job);
   }
 
   return Object.freeze({

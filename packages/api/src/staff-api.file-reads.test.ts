@@ -64,7 +64,9 @@ import {
   makeJpeg,
   makePng,
   pngBombs,
+  jpegSmuggles,
   makeWebp,
+  vp8lManyGroups,
   webpAttacks,
   webpHeader,
 } from "../../service/src/images.fixtures.js";
@@ -246,7 +248,7 @@ const extra: { close(): Promise<unknown> }[] = [];
 
 async function serveAlso(
   serviceOptions: Partial<Parameters<typeof createService>[1]>,
-  downloads?: { perSession?: number; minBytes?: number; windowMs?: number },
+  downloads?: { perSession?: number; perUser?: number; minBytes?: number; windowMs?: number },
 ): Promise<{ host: string; port: number }> {
   const service = createService(w.db, {
     onError: serviceErrorLogger((r) => logged.push(r)),
@@ -553,6 +555,7 @@ describe("thumbnails", () => {
       ["small-canvas.webp", webp.smallCanvas],
       ["lying-riff.webp", webp.lyingRiff],
       ["animated.webp", webp.animated],
+      ["many-groups.webp", vp8lManyGroups(1024, 1024)],
     ] as const) {
       added.push([name, await add(asset, bytes, name)]);
     }
@@ -787,6 +790,32 @@ describe("review fixes: timeouts, budgets, HEAD, failures and downloads", () => 
     expect(head.body.length).toBe(0);
   });
 
+  it("makes one thumbnail at a time per organization (review)", async () => {
+    const to = await serveAlso({
+      thumbnails: renderer,
+      thumbnailLimits: { perMinute: 1000, atOnce: 2 },
+    });
+    const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented pair of photographs"));
+    const one = await add(asset, makeJpeg(1500, 1100), "pair one.jpg");
+    const two = await add(asset, makeJpeg(1501, 1100), "pair two.jpg");
+    const [a, b] = await Promise.all([
+      send(fileUrl(asset, one, "thumbnail"), { as: "cataloger", to }),
+      send(fileUrl(asset, two, "thumbnail"), { as: "cataloger", to }),
+    ]);
+    expect([a.status, b.status].sort()).toEqual([200, 503]);
+  });
+
+  it("refuses to show or thumbnail a JPEG whose markers would be read two ways (B2a)", async () => {
+    const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented smuggled photograph"));
+    const id = await add(asset, jpegSmuggles(900, 700).ff00Smuggle, "smuggled.jpg");
+    const view = await send(fileUrl(asset, id, "view"), { as: "cataloger" });
+    expect(view.status).toBe(422);
+    expect(view.json.error).toBe("not_viewable");
+    const thumb = await send(fileUrl(asset, id, "thumbnail"), { as: "cataloger" });
+    expect(thumb.status).toBe(422);
+    expect(thumb.json.error).toBe("no_thumbnail");
+  });
+
   it("refuses to show a GIF whose frames reach past the limits (item 3)", async () => {
     const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented wide animation"));
     const wide = Buffer.from(makeGif(4, 4));
@@ -808,14 +837,14 @@ describe("review fixes: timeouts, budgets, HEAD, failures and downloads", () => 
     const token = tokens.cataloger ?? "";
     /** A download whose body is never read (the reader paused): its status once headers come. */
     const stalled: { destroy(): void }[] = [];
-    const startStalled = () =>
+    const startStalled = (as = token) =>
       new Promise<number>((resolve, reject) => {
         const req = httpRequest(
           {
             host: to.host,
             port: to.port,
             path: url,
-            headers: { host: "localhost", cookie: `${OCULUS_COOKIES.session}=${token}` },
+            headers: { host: "localhost", cookie: `${OCULUS_COOKIES.session}=${as}` },
             agent: false,
           },
           (res) => {
@@ -850,5 +879,38 @@ describe("review fixes: timeouts, budgets, HEAD, failures and downloads", () => 
     expect(again.status).toBe(200);
     expect(again.body.equals(body)).toBe(true);
     for (const req of stalled) req.destroy();
+    // Per person too, across sessions: a server allowing 3 a session and 2
+    // a person refuses a second session's second stream.
+    const perUser = await serveAlso(
+      {},
+      { perSession: 3, perUser: 2, minBytes: 1, windowMs: 60_000 },
+    );
+    const otherSession = (await fullSession(w.db, w.cataloger, w.a)).token;
+    const stalled2: { destroy(): void }[] = [];
+    const startOn = (as: string) =>
+      new Promise<number>((resolve, reject) => {
+        const req = httpRequest(
+          {
+            host: perUser.host,
+            port: perUser.port,
+            path: url,
+            headers: { host: "localhost", cookie: `${OCULUS_COOKIES.session}=${as}` },
+            agent: false,
+          },
+          (res) => {
+            res.pause();
+            res.on("error", () => undefined);
+            resolve(res.statusCode ?? 0);
+          },
+        );
+        req.on("error", reject);
+        stalled2.push(req);
+        req.end();
+      });
+    expect(await startOn(token)).toBe(200);
+    expect(await startOn(otherSession)).toBe(200);
+    const refused = await send(url, { as: "cataloger", to: perUser });
+    expect(refused.status).toBe(429);
+    for (const req of stalled2) req.destroy();
   }, 30_000);
 });

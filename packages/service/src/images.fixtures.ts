@@ -368,3 +368,146 @@ export async function webpAttacks(): Promise<{
     animated: riff([vp8x(0x02, 16, 16), chunksOf(small)]),
   };
 }
+
+/** Writes bits least significant first, as VP8L reads them. */
+class BitWriter {
+  private readonly bytes: number[] = [];
+  private value = 0;
+  private count = 0;
+  write(value: number, bits: number): void {
+    for (let k = 0; k < bits; k++) {
+      this.value |= ((value >>> k) & 1) << this.count;
+      this.count++;
+      if (this.count === 8) {
+        this.bytes.push(this.value);
+        this.value = 0;
+        this.count = 0;
+      }
+    }
+  }
+  /** A prefix code's bits, first bit of the code first. */
+  writeCode(code: number, length: number): void {
+    for (let k = length - 1; k >= 0; k--) this.write((code >>> k) & 1, 1);
+  }
+  finish(): Buffer {
+    if (this.count > 0) this.bytes.push(this.value);
+    return Buffer.from(this.bytes);
+  }
+}
+
+/** A simple prefix code of one symbol (0 or 1): no bits per use. */
+function oneSymbol(w: BitWriter, symbol: 0 | 1): void {
+  w.write(1, 1); // simple
+  w.write(0, 1); // one symbol
+  w.write(0, 1); // a 1-bit symbol
+  w.write(symbol, 1);
+}
+
+/**
+ * A normal prefix code giving symbols 0–255 eight bits each and the rest
+ * of the alphabet none (so a literal is its 8-bit value).
+ */
+function eightBitLiterals(w: BitWriter, alphabet: number): void {
+  w.write(0, 1); // normal
+  // Code-length code: symbols 0 and 8, one bit each. In the stored order
+  // (17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8) 0 is third and 8 twelfth.
+  w.write(12 - 4, 4);
+  const order = [17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8];
+  for (const symbol of order) w.write(symbol === 0 || symbol === 8 ? 1 : 0, 3);
+  w.write(0, 1); // no max_symbol: every symbol of the alphabet
+  for (let s = 0; s < alphabet; s++) w.writeCode(s < 256 ? 1 : 0, 1); // 8 → "1", 0 → "0"
+}
+
+/**
+ * A valid lossless WebP (VP8L) whose meta prefix image gives every 4 × 4
+ * block a prefix-code group of its own: (width/4) × (height/4) groups, each
+ * with five one-symbol codes, all pixels black. The review's attack: 1,024²
+ * makes 65,536 groups in under 300 KB.
+ */
+export function vp8lManyGroups(width: number, height: number): Buffer {
+  const w = new BitWriter();
+  w.write(0x2f, 8);
+  w.write(width - 1, 14);
+  w.write(height - 1, 14);
+  w.write(0, 1); // no alpha
+  w.write(0, 3); // version
+  w.write(0, 1); // no transform
+  w.write(0, 1); // no colour cache
+  w.write(1, 1); // meta prefix codes
+  w.write(0, 3); // prefix bits 2: 4 × 4 blocks
+  const mw = Math.ceil(width / 4);
+  const mh = Math.ceil(height / 4);
+  const groups = mw * mh;
+  // The meta image: no colour cache, its five codes, then each block's group.
+  w.write(0, 1);
+  eightBitLiterals(w, 256 + 24); // green
+  eightBitLiterals(w, 256); // red
+  oneSymbol(w, 0); // blue
+  oneSymbol(w, 0); // alpha
+  oneSymbol(w, 0); // distance
+  for (let g = 0; g < groups; g++) {
+    w.writeCode(g & 0xff, 8); // green: the group's low byte
+    w.writeCode(g >> 8, 8); // red: its high byte
+  }
+  // Every group's five codes, one symbol each: pixels cost no bits.
+  for (let g = 0; g < groups; g++) for (let c = 0; c < 5; c++) oneSymbol(w, 0);
+  const data = w.finish();
+  const pad = data.length % 2 === 1 ? Buffer.alloc(1) : Buffer.alloc(0);
+  const chunk = Buffer.concat([Buffer.from("VP8L"), u32le(data.length), data, pad]);
+  return Buffer.concat([Buffer.from("RIFF"), u32le(4 + chunk.length), Buffer.from("WEBP"), chunk]);
+}
+
+/** A JPEG SOF0 segment claiming `width` × `height`, three components. */
+function sof0(width: number, height: number): Buffer {
+  const b = Buffer.from([
+    0xff, 0xc0, 0x00, 0x11, 0x08, 0, 0, 0, 0, 0x03, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1,
+  ]);
+  b.writeUInt16BE(height, 5);
+  b.writeUInt16BE(width, 7);
+  return b;
+}
+
+/**
+ * JPEG parser disagreements (review B2a): `ff00Smuggle` starts with `FF 00`
+ * (jpeg-js skips it as two bytes) followed by a comment holding a fake
+ * 16 × 16 frame header and then a real `width` × `height` JPEG; `fill`
+ * puts a fill byte before a marker; `sofAfterScan` adds a second frame
+ * header after the image data; `unknownMarker` uses SOF3.
+ */
+export function jpegSmuggles(
+  width: number,
+  height: number,
+): {
+  ff00Smuggle: Buffer;
+  fill: Buffer;
+  sofAfterScan: Buffer;
+  unknownMarker: Buffer;
+} {
+  const real = makeJpeg(width, height);
+  const fake = sof0(16, 16);
+  const com = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.alloc(2), fake]);
+  com.writeUInt16BE(2 + fake.length, 2);
+  const body = real.subarray(2);
+  const eoi = real.length - 2;
+  const sof3 = Buffer.from(sof0(16, 16));
+  sof3[1] = 0xc3;
+  return {
+    ff00Smuggle: Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0x00]), com, body]),
+    fill: Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), body]),
+    sofAfterScan: Buffer.concat([real.subarray(0, eoi), sof0(width, height), real.subarray(eoi)]),
+    unknownMarker: Buffer.concat([Buffer.from([0xff, 0xd8]), sof3, body]),
+  };
+}
+
+/** A PNG of noise-like pixels (so its memory is really touched when decoded). */
+export function noisePng(width: number, height: number, depth: 8 | 16 = 8): Buffer {
+  const row = width * 4 * (depth / 8) + 1;
+  const raw = Buffer.alloc(row * height);
+  let x = 12345;
+  for (let i = 0; i < raw.length; i++) {
+    if (i % row === 0) continue; // filter byte 0
+    x = (x * 1103515245 + 12345) >>> 0;
+    raw[i] = x >>> 24;
+  }
+  return pngOf(width, height, deflateSync(raw, { level: 1 }), { depth, colorType: 6 });
+}
