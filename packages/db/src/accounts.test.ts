@@ -2221,7 +2221,9 @@ describe("failureClass (S-050)", () => {
       "SQLSTATE 57P01",
     );
     expect(failureClass(new TypeError("person@example.org"))).toBe("TypeError");
-    expect(failureClass({ code: "ECONNREFUSED", name: "Error" })).toBe("Error");
+    expect(failureClass({ code: "ECONNREFUSED", name: "Error" })).toBe("ECONNREFUSED");
+    expect(failureClass({ code: "EPERM", name: "Error" })).toBe("EPERM");
+    expect(failureClass({ code: "40001" })).toBe("SQLSTATE 40001");
     expect(failureClass({ name: "has spaces and 203.0.113.9" })).toBe("unknown");
     expect(failureClass(null)).toBe("unknown");
     expect(failureClass("text")).toBe("unknown");

@@ -1281,7 +1281,10 @@ export async function markKnownSource(db: Database, userId: string, source: stri
 /** A failure's class for a log line: a five-character SQLSTATE, or the error's name. */
 export function failureClass(error: unknown): string {
   const code = (error as { code?: unknown } | null)?.code;
-  if (typeof code === "string" && /^[0-9A-Z]{5}$/.test(code)) return `SQLSTATE ${code}`;
+  // An SQLSTATE: five digits or capitals with at least one digit (Node's
+  // EPERM, EPIPE … are errno names, logged as such).
+  if (typeof code === "string" && /^(?=.*[0-9])[0-9A-Z]{5}$/.test(code)) return `SQLSTATE ${code}`;
+  if (typeof code === "string" && /^E[A-Z]{2,15}$/.test(code)) return code;
   const name = (error as { name?: unknown } | null)?.name;
   return typeof name === "string" && /^[A-Za-z]{1,40}$/.test(name) ? name : "unknown";
 }
