@@ -104,23 +104,14 @@ export async function signInAndSetUp(
 
   await expect(page.getByRole("heading", { name: "Set up two-step sign-in" })).toBeVisible();
   if (check) await accessible(page, "Set up two-step sign-in");
-  // The set-up step hashes and seals the key; give it time on a loaded
-  // machine. A press that lands while the screen is still settling can be
-  // lost, so the key is pressed again (at most twice more) while the
-  // button is still there and ready; the assertion itself is unchanged.
+  // "Start setting up" stays disabled until the waiting sign-in's state has
+  // loaded (SetUp.tsx); a key pressed before then does nothing. One press,
+  // once it is enabled. The set-up step hashes and seals the key, so the
+  // code gets time on a loaded machine.
   const qr = page.getByRole("img", { name: /QR code/ });
   const start = page.getByRole("button", { name: "Start setting up" });
   await expect(start).toBeEnabled();
   await start.press("Enter");
-  for (let retry = 0; retry < 2; retry++) {
-    try {
-      await expect(qr).toBeVisible({ timeout: 5_000 });
-      break;
-    } catch {
-      // Still on the first screen with the button ready: the press was lost.
-      if ((await start.isVisible()) && (await start.isEnabled())) await start.press("Enter");
-    }
-  }
   await expect(qr).toBeVisible({ timeout: 15_000 });
   if (check) await accessible(page, "Scan the code");
   const key = (await page.locator("code").first().textContent()) ?? "";

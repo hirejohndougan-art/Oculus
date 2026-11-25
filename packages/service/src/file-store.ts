@@ -35,13 +35,34 @@
  * one step by rename. Nothing is ever written in place. `discard` removes
  * the temporary file and releases its share of the organization's total.
  *
+ * **The folder belongs to one install** (review B1): a marker file in its
+ * root (`STORE_MARKER`) holds the install's ID, which the database holds
+ * too (the service's `bindFileStore`). Until `bind` has been called with
+ * the matching ID, nothing is ever deleted outside `incoming/`'s own
+ * uploads.
+ *
  * The sweep (the service's `sweepFiles`) uses `staleIncoming` (temporary
- * files older than an upload may run) and `contents`/`removeContent` (copies
- * no row names, under the organization's file lock).
+ * files older than an upload may run, by the file system's own clock, never
+ * one this process is still writing), `listContents` (regular files only;
+ * anything else at a content path is counted and left alone) and `trash`,
+ * then `emptyTrash`: copies no row names are moved aside under the
+ * organization's file lock (a rename, cheap and atomic) and deleted after it
+ * is released.
  */
 import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
-import { link, lstat, mkdir, open, readdir, rename, rm, stat, statfs } from "node:fs/promises";
+import {
+  link,
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  rename,
+  rm,
+  stat,
+  statfs,
+  writeFile,
+} from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { SNIFF_BYTES, isOrganizationId, isSha256Hex, type OrganizationId } from "@oculus/core";
 
@@ -91,7 +112,12 @@ export type ReceiveResult =
   | { readonly ok: true; readonly file: ReceivedFile }
   | { readonly ok: false; readonly code: ReceiveRefusal };
 
+/** The marker file in the root that names the install the folder belongs to. */
+export const STORE_MARKER = ".oculus-store-id";
+
 export interface ReceiveOptions {
+  /** The declared length, if any: held against the free-space floor from the start. */
+  readonly declaredBytes?: number;
   /** Aborts the upload (the partial file is removed). */
   readonly signal?: AbortSignal;
   /** What the organization stores now (each content once), for its total. */
@@ -113,6 +139,16 @@ export interface FileStore {
   ): Promise<ReceiveResult>;
   /** Whether `extra` more bytes would leave the disk below the free-space floor. */
   lowOnSpace(extra: number): Promise<boolean>;
+  /** The install ID in the root's marker file, if there is one. */
+  readMarker(): Promise<string | undefined>;
+  /** Writes the marker (only into a folder that has none). */
+  writeMarker(storeId: string): Promise<void>;
+  /** Whether the root holds anything at all. */
+  isEmpty(): Promise<boolean>;
+  /** Marks the store as checked against the database: the sweep may delete. */
+  bind(storeId: string): void;
+  /** The install ID the store was bound to, if it has been. */
+  readonly boundTo: () => string | undefined;
   /** Puts the received bytes at their content path (see the module header). */
   place(file: ReceivedFile): Promise<"stored" | "already_stored">;
   /** Removes the temporary file and releases its share; safe to call more than once. */
@@ -123,6 +159,14 @@ export interface FileStore {
   organizations(): Promise<readonly OrganizationId[]>;
   /** The contents stored for an organization (their hashes). */
   contents(organizationId: OrganizationId): Promise<readonly string[]>;
+  /** The same, with how many entries at content paths aren't regular files (left alone). */
+  listContents(
+    organizationId: OrganizationId,
+  ): Promise<{ readonly hashes: readonly string[]; readonly skipped: number }>;
+  /** Moves a stored copy aside (call under the organization's file lock); `emptyTrash` deletes it. */
+  trash(organizationId: OrganizationId, sha256: string): Promise<void>;
+  /** Deletes what `trash` moved aside; returns how many. */
+  emptyTrash(organizationId: OrganizationId): Promise<number>;
   /** Deletes a stored copy (call under the organization's file lock, once no row names it). */
   removeContent(organizationId: OrganizationId, sha256: string): Promise<void>;
   /** Deletes temporary files older than `maxAgeMs`; returns how many. */
@@ -276,11 +320,21 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
     return path;
   }
 
+  /**
+   * Bytes uploads in this process are still expected to write: a declared
+   * length less what is written so far. Held against the floor, so many
+   * uploads starting at once can't each see the same free space.
+   */
+  let pendingSpace = 0;
+  /** Temporary files this process is writing (never swept). */
+  const active = new Set<string>();
+  let boundTo: string | undefined;
+
   async function lowOnSpace(extra: number): Promise<boolean> {
     if (minFree === 0) return false;
     const { free, total } = await freeSpace(root);
     const floor = minFree ?? Math.min(DEFAULT_MIN_FREE_BYTES, total * DEFAULT_MIN_FREE_FRACTION);
-    return free - extra < floor;
+    return free - pendingSpace - extra < floor;
   }
 
   const store: FileStore = {
@@ -288,19 +342,89 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
     maxOrganizationBytes,
     pathFor,
     lowOnSpace,
+    boundTo: () => boundTo,
+
+    bind(storeId) {
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(storeId)) {
+        throw new TypeError("Not an install ID.");
+      }
+      boundTo = storeId;
+    },
+
+    async readMarker() {
+      const path = join(root, STORE_MARKER);
+      const info = await lstat(path).catch(() => undefined);
+      if (info === undefined) return undefined;
+      if (!info.isFile() || info.size > 100)
+        throw new Error("The files folder's marker isn't a marker file.");
+      const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        return (await handle.readFile("utf8")).trim();
+      } finally {
+        await handle.close();
+      }
+    },
+
+    async writeMarker(storeId) {
+      const temp = join(root, `${STORE_MARKER}.${randomBytes(8).toString("hex")}`);
+      const handle = await open(
+        temp,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        await writeAll(handle, Buffer.from(`${storeId}\n`, "utf8"));
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      // Never over an existing marker: link fails if one appeared meanwhile.
+      try {
+        await link(temp, join(root, STORE_MARKER));
+      } finally {
+        await rm(temp, { force: true });
+      }
+      await syncDirectory(root);
+    },
+
+    async isEmpty() {
+      return (await readdir(root)).length === 0;
+    },
 
     async receive(organizationId, chunks, options = {}): Promise<ReceiveResult> {
       const { signal } = options;
       const used = options.usedBytes ?? 0;
       organizationDir(organizationId);
       const incoming = await safeFolder(organizationId, "incoming");
-      if (await lowOnSpace(0)) return { ok: false, code: "disk_full" };
+      const declared = options.declaredBytes ?? 0;
+      if (!Number.isSafeInteger(declared) || declared < 0) throw new TypeError("Not a length.");
+      // Reserved before the free space is read, so uploads starting at once
+      // each see the others' declared lengths (and its own).
+      let reservedSpace = declared;
+      pendingSpace += reservedSpace;
+      const unreserve = (bytes: number): void => {
+        const release = Math.min(reservedSpace, bytes);
+        reservedSpace -= release;
+        pendingSpace -= release;
+      };
+      if (await lowOnSpace(0)) {
+        unreserve(reservedSpace);
+        return { ok: false, code: "disk_full" };
+      }
       const path = join(incoming, `${randomBytes(16).toString("hex")}.part`);
-      const handle = await open(
-        path,
-        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-        0o600,
-      );
+      active.add(path);
+      let handle: Awaited<ReturnType<typeof open>>;
+      try {
+        handle = await open(
+          path,
+          constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+          0o600,
+        );
+      } catch (error) {
+        unreserve(reservedSpace);
+        active.delete(path);
+        throw error;
+      }
       const hash = createHash("sha256");
       const head = new Uint8Array(SNIFF_BYTES);
       let headLength = 0;
@@ -328,7 +452,8 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
           }
           if (size >= nextSpaceCheck) {
             nextSpaceCheck += FREE_SPACE_EVERY;
-            if (await lowOnSpace(chunk.byteLength)) {
+            // What is still reserved counts already; a chunk beyond it, too.
+            if (await lowOnSpace(Math.max(0, chunk.byteLength - reservedSpace))) {
               refused = "disk_full";
               break;
             }
@@ -340,6 +465,8 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
             headLength += take.byteLength;
           }
           await writeAll(handle, chunk);
+          // Written: no longer pending, it is on the disk now.
+          unreserve(chunk.byteLength);
         }
         signal?.throwIfAborted();
         if (refused === undefined && size === 0) refused = "empty_file";
@@ -364,8 +491,10 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
         kept = true;
         return { ok: true, file };
       } finally {
+        unreserve(reservedSpace);
         if (!closed) await handle.close().catch(() => undefined);
         if (!kept) {
+          active.delete(path);
           // What this upload counted against the total, and its partial file.
           addInFlight(organizationId, -counted);
           await rm(path, { force: true });
@@ -384,6 +513,7 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
         // copy has exactly one link (the "already stored" check needs it).
         await rm(path, { force: true });
         temporary.delete(file);
+        active.delete(path);
         await syncDirectory(folder);
         await syncDirectory(incoming);
       };
@@ -432,6 +562,7 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       if (path === undefined) return;
       temporary.delete(file);
       await rm(path, { force: true });
+      active.delete(path);
     },
 
     async organizations() {
@@ -443,39 +574,83 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
     },
 
     async contents(organizationId) {
+      return (await store.listContents(organizationId)).hashes;
+    },
+
+    async listContents(organizationId) {
       const base = join(organizationDir(organizationId), "sha256");
       const top = await lstat(base).catch(() => undefined);
-      if (top?.isDirectory() !== true) return [];
-      const out: string[] = [];
+      if (top?.isDirectory() !== true) return { hashes: [], skipped: 0 };
+      const hashes: string[] = [];
+      let skipped = 0;
       for (const prefix of await readdir(base, { withFileTypes: true })) {
-        if (!prefix.isDirectory() || !/^[0-9a-f]{2}$/.test(prefix.name)) continue;
+        if (!/^[0-9a-f]{2}$/.test(prefix.name)) continue;
+        if (!prefix.isDirectory()) {
+          skipped++;
+          continue;
+        }
         for (const entry of await readdir(join(base, prefix.name), { withFileTypes: true })) {
-          if (isSha256Hex(entry.name) && entry.name.startsWith(prefix.name)) out.push(entry.name);
+          if (!isSha256Hex(entry.name) || !entry.name.startsWith(prefix.name)) continue;
+          // A folder, link or anything else at a content path: left alone.
+          if (entry.isFile()) hashes.push(entry.name);
+          else skipped++;
         }
       }
-      return out.sort();
+      return { hashes: hashes.sort(), skipped };
     },
 
     async removeContent(organizationId, sha256) {
       const target = pathFor(organizationId, sha256);
+      const info = await lstat(target).catch(() => undefined);
+      if (info?.isFile() !== true) return;
       await rm(target, { force: true });
       await syncDirectory(
         join(organizationDir(organizationId), "sha256", sha256.slice(0, 2)),
       ).catch(() => undefined);
     },
 
+    async trash(organizationId, sha256) {
+      const target = pathFor(organizationId, sha256);
+      const info = await lstat(target).catch(() => undefined);
+      if (info?.isFile() !== true) return;
+      const bin = await safeFolder(organizationId, "trash");
+      await rename(target, join(bin, `${sha256}.${randomBytes(8).toString("hex")}`));
+    },
+
+    async emptyTrash(organizationId) {
+      const bin = join(organizationDir(organizationId), "trash");
+      const folder = await lstat(bin).catch(() => undefined);
+      if (folder?.isDirectory() !== true) return 0;
+      let removed = 0;
+      for (const entry of await readdir(bin, { withFileTypes: true })) {
+        if (!entry.isFile()) continue;
+        await rm(join(bin, entry.name), { force: true });
+        removed++;
+      }
+      await syncDirectory(bin).catch(() => undefined);
+      await syncDirectory(join(organizationDir(organizationId), "sha256")).catch(() => undefined);
+      return removed;
+    },
+
     async staleIncoming(maxAgeMs) {
       let removed = 0;
-      const cutoff = Date.now() - maxAgeMs;
       for (const organizationId of await store.organizations()) {
         const incoming = join(organizationDir(organizationId), "incoming");
         const folder = await lstat(incoming).catch(() => undefined);
-        if (folder?.isDirectory() !== true) continue;
+        if (folder?.isDirectory() !== true || !safeOwnership(folder)) continue;
+        // "Now" by the file system's own clock (a file written just now), so
+        // a skewed or network clock can't make fresh uploads look old.
+        const probe = join(incoming, `.now-${randomBytes(8).toString("hex")}`);
+        await writeFile(probe, "", { mode: 0o600, flag: "wx" });
+        const now = (await lstat(probe)).mtimeMs;
+        await rm(probe, { force: true });
         for (const entry of await readdir(incoming, { withFileTypes: true })) {
-          if (!entry.name.endsWith(".part")) continue;
+          if (!entry.isFile() || !entry.name.endsWith(".part")) continue;
           const path = join(incoming, entry.name);
+          // Never one this process is still writing or holding for an attach.
+          if (active.has(path)) continue;
           const info = await lstat(path).catch(() => undefined);
-          if (info === undefined || info.mtimeMs > cutoff) continue;
+          if (info === undefined || now - info.mtimeMs < maxAgeMs) continue;
           await rm(path, { force: true });
           removed++;
         }

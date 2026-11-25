@@ -45,6 +45,7 @@ export {
   MAX_CAP_BYTES,
   DEFAULT_MIN_FREE_BYTES,
   DEFAULT_MIN_FREE_FRACTION,
+  STORE_MARKER,
 } from "./file-store.js";
 export type {
   FileStore,
@@ -59,6 +60,7 @@ export type {
   AttachOptions,
   AttachedFile,
   FileOperations,
+  FileStoreProblem,
   FileSweep,
   RemoveFileOptions,
 } from "./files.js";

@@ -9,15 +9,31 @@
 // a lying Content-Type; and no file content or names in any log. Every
 // person, site, record and file is invented.
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { request as httpRequest, type IncomingHttpHeaders } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { csrfTokenFor, newRecordId, type OrganizationId, type UserId } from "@oculus/core";
-import { organizationFileBytes, sql } from "@oculus/db";
-import { createService, openFileStore, type FileStore } from "@oculus/service";
+import {
+  migrate,
+  openDatabase,
+  organizationFileBytes,
+  readFileStoreBinding,
+  sql,
+} from "@oculus/db";
+import { STORE_MARKER, createService, openFileStore, type FileStore } from "@oculus/service";
+import { freshDatabase } from "../../db/src/test-database.fixtures.js";
 import type { FastifyInstance } from "fastify";
 import { OCULUS_COOKIES } from "./cookies.js";
 import { UPLOAD_TIMEOUTS, buildServer, type UploadTimeouts } from "./server.js";
@@ -107,6 +123,8 @@ beforeAll(async () => {
   filesDir = mkdtempSync(join(tmpdir(), "oculus-files-test-"));
   smallDir = mkdtempSync(join(tmpdir(), "oculus-files-small-"));
   store = await openFileStore({ dir: filesDir, maxFileBytes: MAX_FILE });
+  // This test database's own folder (D-086): bound while it is empty.
+  expect(await createService(w.db, { files: store }).bindFileStore()).toEqual({ ok: true });
   app = await serve(w, store);
   base = addressOf(app);
   scanner = await w.member(w.a, "Scanner");
@@ -482,7 +500,7 @@ describe("uploads: what is stored", () => {
     });
     expect(raw.json).toEqual({ error: "bad_file_name" });
     // Everything stored is under the folder, named by organization and hash.
-    for (const path of filesUnder(filesDir)) {
+    for (const path of filesUnder(filesDir).filter((p) => p !== STORE_MARKER)) {
       expect(path).toMatch(/^[0-9a-f-]{36}\/sha256\/[0-9a-f]{2}\/[0-9a-f]{64}$/);
     }
     expect(existsSync(join(filesDir, "..", "passwd"))).toBe(false);
@@ -581,7 +599,6 @@ describe("uploads: what is stored", () => {
     expect((await upload(asset, { as: "cataloger", body })).status).toBe(201);
     const path = store.pathFor(w.a, sha(body));
     // Damage it in place (as rot or a stray write would).
-    const { writeFileSync } = await import("node:fs");
     writeFileSync(path, Buffer.concat([body.subarray(0, 100), Buffer.alloc(body.length - 100)]));
     expect((await upload(twin, { as: "cataloger", body })).status).toBe(201);
     expect(readFileSync(path).equals(body)).toBe(true);
@@ -687,19 +704,17 @@ describe("uploads: stalls, trickles and time limits", () => {
 });
 
 describe("removing files", () => {
-  it("removes a file with the edit rule and If-Match, then the sweep deletes its unnamed copy", async () => {
+  it("removes a file with the edit rule and If-Match, keeps its bytes for the grace period, then the sweep deletes them", async () => {
     const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented removable scan"));
     const body = fakePng(700);
     const added = await upload(asset, { as: "cataloger", body, name: "remove me.png" });
     const fileId = (added.json.file as { id: string }).id;
     const path = `/api/records/${asset}/files/${fileId}`;
+    const del = (as: string, extra: Partial<Send> = {}) =>
+      send(path, { as, method: "DELETE", contentType: null, name: null, ...extra });
     // Hidden, missing and other refusals.
-    expect(
-      (await send(path, { as: "reader", method: "DELETE", contentType: null, name: null })).status,
-    ).toBe(403);
-    expect(
-      (await send(path, { as: "other", method: "DELETE", contentType: null, name: null })).status,
-    ).toBe(404);
+    expect((await del("reader")).status).toBe(403);
+    expect((await del("other")).status).toBe(404);
     const missing = await send(`/api/records/${asset}/files/${newRecordId()}`, {
       as: "cataloger",
       method: "DELETE",
@@ -708,17 +723,9 @@ describe("removing files", () => {
     });
     expect(missing.status).toBe(404);
     expect(missing.text).toBe('{"error":"not_found"}');
-    expect(
-      (
-        await send(path, {
-          as: "cataloger",
-          method: "DELETE",
-          contentType: null,
-          name: null,
-          ifMatch: '"v9"',
-        })
-      ).status,
-    ).toBe(412);
+    expect((await del("cataloger", { ifMatch: '"v9"' })).status).toBe(412);
+    // A Scanner may remove only the files they attached themselves.
+    expect((await del("scanner")).status).toBe(403);
     // The asset can't be deleted while it has files.
     const refusedDelete = await send(`/api/records/${asset}`, {
       as: "root",
@@ -730,24 +737,42 @@ describe("removing files", () => {
     const blocker = (refusedDelete.json.issues as { code: string; message: string }[])[0];
     expect(blocker?.code).toBe("has_files");
     expect(blocker?.message).toMatch(/Remove its files first/);
-    // Removed: the row goes, the copy stays until the sweep.
-    const removed = await send(path, {
-      as: "cataloger",
-      method: "DELETE",
-      contentType: null,
-      name: null,
-    });
-    expect(removed.status).toBe(200);
+    // Removed: the row goes; the bytes stay for the grace period.
+    expect((await del("cataloger")).status).toBe(200);
     expect(await rowsFor(asset)).toBe(0);
-    expect(existsSync(store.pathFor(w.a, sha(body)))).toBe(true);
+    const copy = store.pathFor(w.a, sha(body));
     const service = createService(w.db, { files: store });
-    const swept = await service.sweepFiles(3600_000);
-    expect(swept.contents).toBeGreaterThanOrEqual(1);
-    expect(existsSync(store.pathFor(w.a, sha(body)))).toBe(false);
-    // Copies rows still name stay.
+    const first = await service.sweepFiles(3600_000);
+    expect(first).toMatchObject({ unbound: false, failed: 0 });
+    expect(existsSync(copy)).toBe(true);
+    // Eight days later (moved back as the owner, the append-only trigger
+    // off inside this transaction only and back on ALWAYS).
+    await w.db.transaction(async (q) => {
+      await q.execute(
+        sql`ALTER TABLE public.stored_file_events DISABLE TRIGGER stored_file_events_append_only`,
+      );
+      await q.execute(sql`
+        UPDATE public.stored_file_events SET occurred_at = occurred_at - interval '8 days'
+        WHERE file_id = ${fileId}::uuid`);
+      await q.execute(
+        sql`ALTER TABLE public.stored_file_events ENABLE ALWAYS TRIGGER stored_file_events_append_only`,
+      );
+    });
+    const later = await service.sweepFiles(3600_000);
+    expect(later.contents).toBeGreaterThanOrEqual(1);
+    expect(existsSync(copy)).toBe(false);
+    // Copies rows still name stay, and nothing is left in the trash.
     const kept = filesUnder(filesDir).filter((p) => p.includes("sha256"));
     expect(kept.length).toBeGreaterThan(0);
-    for (const p of kept) expect(existsSync(join(filesDir, p))).toBe(true);
+    expect(filesUnder(filesDir).filter((p) => p.includes("trash"))).toEqual([]);
+    // The log holds the attach and the removal, by whom.
+    const events = await w.db.rows<{ kind: string; actor: string }>(sql`
+      SELECT kind, actor FROM public.stored_file_events WHERE file_id = ${fileId}::uuid
+      ORDER BY occurred_at`);
+    expect(events).toEqual([
+      { kind: "attached", actor: actorOf(w.cataloger) },
+      { kind: "removed", actor: actorOf(w.cataloger) },
+    ]);
     // Now the asset can be deleted.
     expect(
       (
@@ -759,5 +784,92 @@ describe("removing files", () => {
         })
       ).status,
     ).toBe(200);
+  });
+
+  it("lets a Scanner remove a file they attached", async () => {
+    const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented scanner's scan"));
+    const added = await upload(asset, { as: "scanner", body: fakePng(300) });
+    const fileId = (added.json.file as { id: string }).id;
+    const removed = await send(`/api/records/${asset}/files/${fileId}`, {
+      as: "scanner",
+      method: "DELETE",
+      contentType: null,
+      name: null,
+    });
+    expect(removed.status).toBe(200);
+  });
+});
+
+describe("the files folder belongs to one install", () => {
+  it("refuses another install's folder, a folder without the expected marker, and a full folder without one", async () => {
+    const service = createService(w.db, { files: store });
+    // The same folder again: fine.
+    expect(await service.bindFileStore()).toEqual({ ok: true });
+    const marker = readFileSync(join(filesDir, STORE_MARKER), "utf8").trim();
+    expect(await readFileStoreBinding(w.db)).toBe(marker);
+    const folder = async (setup: (dir: string) => void) => {
+      const dir = mkdtempSync(join(tmpdir(), "oculus-files-bind-"));
+      setup(dir);
+      return { dir, store: await openFileStore({ dir }) };
+    };
+    // This database has a folder: an empty other one has no marker.
+    const empty = await folder(() => undefined);
+    expect(await createService(w.db, { files: empty.store }).bindFileStore()).toEqual({
+      ok: false,
+      problem: "marker_missing",
+    });
+    const foreign = await folder((dir) => {
+      writeFileSync(join(dir, STORE_MARKER), `${newRecordId()}\n`);
+    });
+    expect(await createService(w.db, { files: foreign.store }).bindFileStore()).toEqual({
+      ok: false,
+      problem: "other_install",
+    });
+    // A fresh database: another install's folder, and a full folder with no marker.
+    const fresh = await freshDatabase();
+    await migrate({ connectionString: fresh.url });
+    const db = openDatabase(fresh.url, { max: 2 });
+    try {
+      expect(await createService(db, { files: store }).bindFileStore()).toEqual({
+        ok: false,
+        problem: "other_install",
+      });
+      const full = await folder((dir) => {
+        writeFileSync(join(dir, "someone-elses.txt"), "x");
+      });
+      expect(await createService(db, { files: full.store }).bindFileStore()).toEqual({
+        ok: false,
+        problem: "not_empty",
+      });
+      // Unbound, the sweep deletes nothing at all.
+      const swept = await createService(db, { files: full.store }).sweepFiles(0);
+      expect(swept).toMatchObject({ unbound: true, contents: 0, incoming: 0 });
+      // And with this test database's own (bound) store, another database's
+      // service still refuses to sweep.
+      const other = await createService(db, { files: store }).sweepFiles(0);
+      expect(other.unbound).toBe(true);
+      for (const f of [empty, foreign, full]) rmSync(f.dir, { recursive: true, force: true });
+    } finally {
+      await db.close();
+      await fresh.drop();
+    }
+  });
+
+  it("sweeps only organizations of this database, and skips what isn't a regular file", async () => {
+    const stranger = newRecordId();
+    const hash = "ab".repeat(32);
+    const theirs = join(filesDir, stranger, "sha256", "ab");
+    mkdirSync(theirs, { recursive: true, mode: 0o700 });
+    writeFileSync(join(theirs, hash), "another install's bytes");
+    // A folder where a copy of organization A would be.
+    const odd = join(filesDir, w.a, "sha256", "cd");
+    mkdirSync(join(odd, "cd".repeat(32)), { recursive: true, mode: 0o700 });
+    const swept = await createService(w.db, { files: store }).sweepFiles(3600_000);
+    expect(swept).toMatchObject({ unbound: false, failed: 0 });
+    expect(swept.skipped).toBeGreaterThanOrEqual(1);
+    expect(readFileSync(join(theirs, hash), "utf8")).toBe("another install's bytes");
+    expect(existsSync(join(odd, "cd".repeat(32)))).toBe(true);
+    rmSync(join(filesDir, stranger), { recursive: true, force: true });
+    rmSync(odd, { recursive: true, force: true });
   });
 });

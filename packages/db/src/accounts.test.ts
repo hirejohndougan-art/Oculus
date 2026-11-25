@@ -665,7 +665,16 @@ describe("invitations", () => {
           inviteVia(conn, { organizationId: org, email: address, invitedBy: admin }),
         ),
       );
-      expect(made.every((r) => r.ok)).toBe(true);
+      // Each is stored; one sent while a newer one was made answers
+      // `superseded` (it was delivered, then revoked by the newer one), so
+      // every answer is `ok` or that, at least one is `ok`, and exactly one
+      // invitation stays pending.
+      const codes = made.map((r) => (r.ok ? "ok" : r.issues.map((i) => i.code).join(",")));
+      expect(
+        codes.every((c) => c === "ok" || c === "superseded"),
+        codes.join(" "),
+      ).toBe(true);
+      expect(codes).toContain("ok");
       const pending = await db.rows(sql`
         SELECT 1 FROM public.invitations WHERE organization_id = ${org}::uuid AND email = ${address}
           AND accepted_at IS NULL AND revoked_at IS NULL`);

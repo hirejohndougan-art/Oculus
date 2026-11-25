@@ -23,7 +23,7 @@ import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { newOrganizationId } from "@oculus/core";
-import { openFileStore, type FileStore } from "./file-store.js";
+import { STORE_MARKER, openFileStore, type FileStore } from "./file-store.js";
 
 let dir: string;
 let store: FileStore;
@@ -302,6 +302,97 @@ describe("the safety and limits added after review", () => {
     expect(await store.contents(other)).toEqual([sha(body)]);
     await store.removeContent(other, sha(body));
     expect(await store.contents(other)).toEqual([]);
+    rmSync(join(dir, other), { recursive: true, force: true });
+  });
+});
+
+describe("the second review's changes", () => {
+  it("writes and reads the install marker, never over an existing one", async () => {
+    const fresh = mkdtempSync(join(tmpdir(), "oculus-store-marker-"));
+    const own = await openFileStore({ dir: fresh });
+    expect(await own.isEmpty()).toBe(true);
+    expect(await own.readMarker()).toBeUndefined();
+    const id = "11111111-2222-4333-8444-555555555555";
+    await own.writeMarker(id);
+    expect(await own.readMarker()).toBe(id);
+    expect(statSync(join(fresh, STORE_MARKER)).mode & 0o777).toBe(0o600);
+    await expect(own.writeMarker("66666666-7777-4888-9999-aaaaaaaaaaaa")).rejects.toThrow();
+    expect(await own.readMarker()).toBe(id);
+    expect(own.boundTo()).toBeUndefined();
+    own.bind(id);
+    expect(own.boundTo()).toBe(id);
+    expect(() => {
+      own.bind("../not-an-id");
+    }).toThrow(TypeError);
+    expect(readdirSync(fresh)).toEqual([STORE_MARKER]);
+    rmSync(fresh, { recursive: true, force: true });
+  });
+
+  it("holds declared lengths against the free-space floor, so uploads starting together can't overshoot", async () => {
+    const MiB = 1024 * 1024;
+    const tight = await openFileStore({
+      dir,
+      minFreeBytes: 100 * MiB,
+      // 150 MiB free above a 100 MiB floor: room for one 30 MiB upload, not two.
+      freeSpace: () => Promise.resolve({ free: 150 * MiB, total: 1000 * MiB }),
+    });
+    const other = newOrganizationId();
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    async function* waits(): AsyncIterable<Uint8Array> {
+      yield randomBytes(10);
+      await held;
+    }
+    const first = tight.receive(other, waits(), { declaredBytes: 30 * MiB });
+    await new Promise((r) => setTimeout(r, 20));
+    // 30 MiB already reserved: another 30 would leave 90 MiB, under the floor.
+    expect(
+      await tight.receive(other, chunksOf(randomBytes(10)), { declaredBytes: 30 * MiB }),
+    ).toEqual({ ok: false, code: "disk_full" });
+    release();
+    const done = await first;
+    if (done.ok) await tight.discard(done.file);
+    // Released: now it fits.
+    const later = await tight.receive(other, chunksOf(randomBytes(10)), {
+      declaredBytes: 30 * MiB,
+    });
+    expect(later.ok).toBe(true);
+    if (later.ok) await tight.discard(later.file);
+    rmSync(join(dir, other), { recursive: true, force: true });
+  });
+
+  it("never sweeps a temporary file it is still writing, and moves copies to the trash before deleting them", async () => {
+    const other = newOrganizationId();
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    async function* waits(): AsyncIterable<Uint8Array> {
+      yield randomBytes(10);
+      await held;
+    }
+    const writing = store.receive(other, waits());
+    await new Promise((r) => setTimeout(r, 20));
+    // Even with a maximum age of 0, the upload in progress stays.
+    expect(await store.staleIncoming(0)).toBe(0);
+    release();
+    const done = await writing;
+    if (!done.ok) throw new Error(done.code);
+    expect(await store.place(done.file)).toBe("stored");
+    await store.discard(done.file);
+    const listed = await store.listContents(other);
+    expect(listed).toEqual({ hashes: [done.file.sha256], skipped: 0 });
+    await store.trash(other, done.file.sha256);
+    expect(await store.contents(other)).toEqual([]);
+    expect(await store.emptyTrash(other)).toBe(1);
+    expect(tree().filter((p) => p.includes(other))).toEqual([]);
+    // Something that isn't a regular file at a content path is counted, never removed.
+    mkdirSync(join(dir, other, "sha256", "ef", "ef".repeat(32)), { recursive: true });
+    expect(await store.listContents(other)).toEqual({ hashes: [], skipped: 1 });
+    await store.trash(other, "ef".repeat(32));
+    expect(existsSync(join(dir, other, "sha256", "ef", "ef".repeat(32)))).toBe(true);
     rmSync(join(dir, other), { recursive: true, force: true });
   });
 });

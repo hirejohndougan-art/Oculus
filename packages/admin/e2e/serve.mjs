@@ -30,10 +30,10 @@ const seedFile = process.env.OCULUS_E2E_SEED;
 if (seedFile === undefined) throw new Error("OCULUS_E2E_SEED is not set");
 
 const database = startTestDatabase({ bin: findPostgresBin() });
-// Uploaded files go here (M-002, D-086): OCULUS_FILES_DIR if given, else a
-// fresh folder under the temporary directory, deleted on stop.
-const ownFilesDir = process.env.OCULUS_FILES_DIR === undefined;
-const filesDir = process.env.OCULUS_FILES_DIR ?? mkdtempSync(join(tmpdir(), "oculus-e2e-files-"));
+// Uploaded files go to a fresh folder of this run's own, deleted on stop:
+// never OCULUS_FILES_DIR from the environment, which may be a real install's
+// (D-086, review B1).
+const filesDir = mkdtempSync(join(tmpdir(), "oculus-e2e-files-"));
 let app;
 let db;
 const stop = async () => {
@@ -43,7 +43,7 @@ const stop = async () => {
   } finally {
     database.stop();
     rmSync(seedFile, { force: true });
-    if (ownFilesDir) rmSync(filesDir, { recursive: true, force: true });
+    rmSync(filesDir, { recursive: true, force: true });
     rmSync(`${seedFile}.root-recovery.json`, { force: true });
     process.exit(0);
   }

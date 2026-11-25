@@ -4,7 +4,7 @@
 // arrive with chunked encoding, and `Connection: close` when the body isn't
 // read to its end.
 import { request as httpRequest } from "node:http";
-import type { AddressInfo } from "node:net";
+import { connect, type AddressInfo } from "node:net";
 import { describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { UPLOAD_TYPES } from "./body.js";
@@ -259,5 +259,116 @@ describe("upload time limits", () => {
     await expect(testServer({ uploadTimeouts: { idle: 0 } })).rejects.toThrow(
       /uploadTimeouts.idle/,
     );
+  });
+});
+
+/**
+ * Sends a request's head and part of its body over a raw socket, then
+ * stalls; resolves with the reply's status and how long until the server
+ * closed the connection.
+ */
+async function stall(
+  app: FastifyInstance,
+  head: string[],
+  partial: string,
+): Promise<{ status: number; closedAfter: number }> {
+  if (!app.server.listening) await app.listen({ host: "127.0.0.1", port: 0 });
+  const { port } = app.server.address() as AddressInfo;
+  const started = Date.now();
+  return new Promise((resolve) => {
+    const socket = connect({ host: "127.0.0.1", port });
+    let text = "";
+    socket.on("data", (chunk: Buffer) => {
+      text += chunk.toString("latin1");
+    });
+    socket.on("error", () => undefined);
+    socket.on("close", () => {
+      resolve({
+        status: Number(/^HTTP\/1\.1 (\d{3})/.exec(text)?.[1] ?? "0"),
+        closedAfter: Date.now() - started,
+      });
+    });
+    socket.write(`${head.join("\r\n")}\r\n\r\n${partial}`);
+  });
+}
+
+describe("requests that stall on a server with upload routes (review B2)", () => {
+  it("close at the usual limit or at once, whatever the route and however they are answered", async () => {
+    const route: OculusRoute = {
+      method: "POST",
+      path: "/upload",
+      upload: { maxBytes: 1000 },
+      handler: () => ({ ok: true }),
+    };
+    const { app } = await testServer({ timeouts: { request: 800, headers: 800 } }, [route]);
+    const usual = 800;
+    const cases: [string, string[], number][] = [
+      [
+        "a cross-origin POST",
+        [
+          "POST /echo HTTP/1.1",
+          "Host: localhost",
+          "Origin: https://elsewhere.example.org",
+          "Content-Type: application/json",
+          "Content-Length: 100000",
+        ],
+        403,
+      ],
+      [
+        "a GET with a body",
+        ["GET /items/abc HTTP/1.1", "Host: localhost", "Content-Length: 100000"],
+        200,
+      ],
+      [
+        "JSON to the upload route",
+        [
+          "POST /upload HTTP/1.1",
+          "Host: localhost",
+          "Origin: http://localhost",
+          "Content-Type: application/json",
+          "Content-Length: 100000",
+        ],
+        415,
+      ],
+      [
+        "a form to the upload route",
+        [
+          "POST /upload HTTP/1.1",
+          "Host: localhost",
+          "Origin: http://localhost",
+          "Content-Type: application/x-www-form-urlencoded",
+          "Content-Length: 100000",
+        ],
+        415,
+      ],
+      [
+        "a cross-origin POST to the upload route",
+        [
+          "POST /upload HTTP/1.1",
+          "Host: localhost",
+          "Origin: https://elsewhere.example.org",
+          "Content-Type: application/octet-stream",
+          "Content-Length: 100000",
+        ],
+        403,
+      ],
+      [
+        "a JSON body that never finishes",
+        [
+          "POST /echo HTTP/1.1",
+          "Host: localhost",
+          "Origin: http://localhost",
+          "Content-Type: application/json",
+          "Content-Length: 100000",
+        ],
+        408,
+      ],
+    ];
+    for (const [name, head, status] of cases) {
+      const result = await stall(app, head, '{"a":');
+      expect(result.status, name).toBe(status);
+      expect(result.closedAfter, name).toBeLessThan(usual + 1500);
+    }
+    await app.close();
   });
 });

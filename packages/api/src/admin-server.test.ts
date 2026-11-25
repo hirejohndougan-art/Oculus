@@ -130,7 +130,7 @@ describe("the startup checks", () => {
       expect(String(failure)).toMatch(/OCULUS_FILES_DIR/);
       if (value !== undefined && value !== "") expect(String(failure)).not.toContain(value);
     }
-    const plainFile = join(filesDir, "not-a-folder");
+    const plainFile = join(mkdtempSync(join(tmpdir(), "oculus-admin-plain-")), "not-a-folder");
     writeFileSync(plainFile, "x");
     await expect(
       buildAdminServer({ db, env: { ...DEV, OCULUS_FILES_DIR: plainFile }, adminFiles: files }),

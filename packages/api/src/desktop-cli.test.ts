@@ -56,12 +56,21 @@ async function setUpDatabase(dir?: string): Promise<{ database: TestDatabase; us
   }
 }
 
+/**
+ * One files folder for the whole file (M-002, D-086): the set-up database
+ * is bound to the first folder it is used with, so each test's fresh
+ * settings folder can't hold its own.
+ */
+let filesFolder: string;
+
 beforeAll(async () => {
+  filesFolder = mkdtempSync(join(tmpdir(), "oculus-desktop-cli-files-"));
   setUp = (await setUpDatabase()).database;
   empty = await freshDatabase();
 }, 120_000);
 
 afterAll(async () => {
+  rmSync(filesFolder, { recursive: true, force: true });
   await setUp.drop();
   await empty.drop();
 });
@@ -116,6 +125,7 @@ function start(overrides: Partial<DesktopOptions> & { env?: DesktopOptions["env"
       OCULUS_DESKTOP_HOME: folder,
       OCULUS_DATABASE_URL: setUp.url,
       OCULUS_DESKTOP_BROWSER: "/invented/browser",
+      OCULUS_FILES_DIR: filesFolder,
       ...overrides.env,
     },
     out: (line) => lines.push(line),
@@ -294,7 +304,9 @@ describe("npm run desktop", () => {
       } finally {
         await owner.close();
       }
-      const run = start({ env: { OCULUS_DATABASE_URL: database.url } });
+      const run = start({
+        env: { OCULUS_DATABASE_URL: database.url, OCULUS_FILES_DIR: undefined },
+      });
       expect(await run.done).toBe(1);
       expect(run.lines.join("\n")).toContain("backup");
       expect(existsSync(join(folder, "secret-key"))).toBe(false);
@@ -302,12 +314,20 @@ describe("npm run desktop", () => {
 
       // The wrong key is refused too; the key the set-ups were sealed with starts.
       const wrong = start({
-        env: { OCULUS_DATABASE_URL: database.url, OCULUS_SECRET_KEY: FAKE_TEST_SECRET_KEY_2 },
+        env: {
+          OCULUS_DATABASE_URL: database.url,
+          OCULUS_FILES_DIR: undefined,
+          OCULUS_SECRET_KEY: FAKE_TEST_SECRET_KEY_2,
+        },
       });
       expect(await wrong.done).toBe(1);
       expect(wrong.lines.join("\n")).toContain("isn't the one");
       const right = start({
-        env: { OCULUS_DATABASE_URL: database.url, OCULUS_SECRET_KEY: FAKE_TEST_SECRET_KEY },
+        env: {
+          OCULUS_DATABASE_URL: database.url,
+          OCULUS_FILES_DIR: undefined,
+          OCULUS_SECRET_KEY: FAKE_TEST_SECRET_KEY,
+        },
       });
       await running(right);
       right.stop();
@@ -331,7 +351,9 @@ describe("npm run desktop", () => {
       } finally {
         await owner2.close();
       }
-      const fresh = start({ env: { OCULUS_DATABASE_URL: database.url } });
+      const fresh = start({
+        env: { OCULUS_DATABASE_URL: database.url, OCULUS_FILES_DIR: undefined },
+      });
       await running(fresh);
       fresh.stop();
       expect(await fresh.done).toBe(0);
@@ -348,7 +370,9 @@ describe("npm run desktop", () => {
     for (const file of files.slice(0, -1)) cpSync(join(all, file), join(older, file));
     const { database } = await setUpDatabase(older);
     try {
-      const run = start({ env: { OCULUS_DATABASE_URL: database.url } });
+      const run = start({
+        env: { OCULUS_DATABASE_URL: database.url, OCULUS_FILES_DIR: undefined },
+      });
       await running(run);
       expect(run.lines.join("\n")).toContain("Updated the database (1 change(s)).");
       run.stop();
