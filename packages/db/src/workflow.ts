@@ -66,7 +66,6 @@ import {
   type Issue,
   type OrganizationId,
   type PublicOutput,
-  type PublicRecord,
   type RecordId,
   type RecordIdentifiers,
   type SiteId,
