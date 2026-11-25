@@ -25,6 +25,7 @@ import { Button, Note, TextLink } from "../components/ui";
 import { Choice, ConfirmPanel } from "../records/controls";
 import records from "../records/Records.module.css";
 import type { SettingsContext } from "./Settings";
+import { useReauthenticated } from "../people/Reauth";
 import { Problems, RowButton } from "./Settings";
 import { TEMPLATE_KEY, confirmationOf, issuesOf, type Confirmation } from "./templateForm";
 import styles from "./Settings.module.css";
@@ -307,6 +308,17 @@ function MappingForm(props: {
     },
   });
 
+  // Saving needs a recent sign-in (S-060a): the server asks for the password
+  // and a code again, and the save runs again once they're entered.
+  const reauth = useReauthenticated("For changes to what the public sites show");
+  function send(confirmation: Confirmation | undefined) {
+    void reauth
+      .run(async () => {
+        await save.mutateAsync(confirmation);
+      })
+      .catch(() => undefined);
+  }
+
   const error = save.error;
   const conflict = error instanceof ApiError && error.status === 412;
   const confirming = error instanceof ApiError && error.code === "confirmation_required";
@@ -323,7 +335,7 @@ function MappingForm(props: {
   }
   function submit(event: SubmitEvent) {
     event.preventDefault();
-    save.mutate(undefined);
+    send(undefined);
   }
 
   const fieldOptions = [
@@ -345,190 +357,194 @@ function MappingForm(props: {
   const noPublicFields = !fields.some((f) => f.isPublic);
 
   return (
-    <form className={records.layout} onSubmit={submit} aria-label="Dublin Core mapping">
-      <div className={records.panel}>
-        <div>
-          <TextLink href={`/settings/templates/${templateKey}`}>← {templateName}</TextLink>
-          <h2 className={records.sectionTitle}>Dublin Core for {templateName}</h2>
-          <p className={records.meta}>
-            Public sites share each published record&apos;s public fields as Dublin Core, so other
-            catalogs and search engines can read them. Choose which field goes out as which term.
-            The record&apos;s title always goes out as Title. Staff-only fields are never shared.
-          </p>
-          {hasMapping ? <p className={records.meta}>Version {stored.version}</p> : null}
-        </div>
-        {hasMapping ? null : (
-          <Note tone="amber">
-            This template has no Dublin Core mapping yet, so no public site shows its records, even
-            published ones. Save a mapping to show them.
-          </Note>
-        )}
-        {noPublicFields ? (
-          <p className={records.meta}>
-            {hasMapping
-              ? "This template has no public fields left. Remove the mapped fields and save, or make a field public in the template again. If its records need their rights to be published, make the rights field public again: a mapping without it can't be saved."
-              : "This template has no public fields yet. Make a field public in the template first."}
-          </p>
-        ) : null}
-        {rows.length === 0 ? (
-          <p className={records.meta}>No fields are mapped yet.</p>
-        ) : (
-          <ol className={styles.fieldList} aria-label="Mapped fields">
-            {rows.map((row, index) => (
-              <li key={row.uid} className={styles.row}>
-                <Choice
-                  className={styles.grow}
-                  label={`Row ${String(index + 1)}: field`}
-                  value={row.field}
-                  options={fieldOptions}
-                  onChange={(v) => {
-                    change(rows.map((r) => (r.uid === row.uid ? { ...r, field: v } : r)));
-                  }}
-                />
-                <Choice
-                  className={styles.grow}
-                  label={`Row ${String(index + 1)}: goes out as`}
-                  value={row.term}
-                  options={termOptions}
-                  onChange={(v) => {
-                    change(rows.map((r) => (r.uid === row.uid ? { ...r, term: v } : r)));
-                  }}
-                />
-                <RowButton
-                  label={`Remove row ${String(index + 1)}`}
-                  onPress={() => {
-                    change(rows.filter((r) => r.uid !== row.uid));
-                  }}
-                >
-                  Remove
-                </RowButton>
-              </li>
-            ))}
-          </ol>
-        )}
-        <div className={records.actions}>
-          <Button
-            variant="secondary"
-            isDisabled={noPublicFields}
-            onPress={() => {
-              change([...rows, { uid: nextUid++, field: "", term: "" }]);
-            }}
-          >
-            + Map a field
-          </Button>
-          {rows.length === 0 && suggestions.length > 0 ? (
-            <Button
-              variant="secondary"
-              onPress={() => {
-                change(suggestions);
-              }}
-            >
-              Fill in from the fields&apos; standards
-            </Button>
-          ) : null}
-        </div>
-      </div>
-
-      <div className={records.panel}>
-        <h2 className={records.sectionTitle}>Save</h2>
-        <p className={records.meta}>
-          The server checks the mapping against the template before saving. If records using this
-          template are published, the change shows on the public sites at once, and you&apos;re
-          asked to confirm first.
-        </p>
-        {conflict ? (
-          <div role="alert">
+    <>
+      <form className={records.layout} onSubmit={submit} aria-label="Dublin Core mapping">
+        <div className={records.panel}>
+          <div>
+            <TextLink href={`/settings/templates/${templateKey}`}>← {templateName}</TextLink>
+            <h2 className={records.sectionTitle}>Dublin Core for {templateName}</h2>
+            <p className={records.meta}>
+              Public sites share each published record&apos;s public fields as Dublin Core, so other
+              catalogs and search engines can read them. Choose which field goes out as which term.
+              The record&apos;s title always goes out as Title. Staff-only fields are never shared.
+            </p>
+            {hasMapping ? <p className={records.meta}>Version {stored.version}</p> : null}
+          </div>
+          {hasMapping ? null : (
             <Note tone="amber">
-              Someone else saved this mapping while you were editing. Your changes weren&apos;t
-              saved.{" "}
-              <Button
-                variant="link"
-                onPress={() => {
-                  void queries.invalidateQueries({
-                    queryKey: ["dublin-core", organizationId, templateKey],
-                  });
-                }}
-              >
-                Load the latest version
-              </Button>
+              This template has no Dublin Core mapping yet, so no public site shows its records,
+              even published ones. Save a mapping to show them.
             </Note>
-          </div>
-        ) : lines.length > 0 ? (
-          <div role="alert">
-            <Note tone="amber">
-              {"The mapping wasn't saved. These need fixing:"}
-              <ul className={records.issues}>
-                {lines.map((line, i) => (
-                  <li key={i}>{line}</li>
-                ))}
-              </ul>
-            </Note>
-          </div>
-        ) : confirming ? null : (
-          <Problems error={error} />
-        )}
-        {saved === undefined ? null : (
-          <div aria-live="polite">
-            <Note tone="green">
-              Saved.
-              {saved.shownOn > 0
-                ? ` The public sites show it now on ${String(saved.shownOn)} published ${saved.shownOn === 1 ? "record" : "records"}.`
-                : ""}
-            </Note>
-          </div>
-        )}
-        <ConfirmPanel
-          isOpen={blocker.state === "blocked"}
-          title="Leave without saving?"
-          confirmLabel="Leave and discard my changes"
-          cancelLabel="Stay on this mapping"
-          danger
-          onCancel={() => {
-            blocker.reset?.();
-          }}
-          onConfirm={() => {
-            blocker.proceed?.();
-          }}
-        >
-          <p>You have changes to this mapping that are not saved.</p>
-        </ConfirmPanel>
-        <ConfirmPanel
-          isOpen={asked !== undefined}
-          title="Confirm this change"
-          confirmLabel="Save and update the public sites"
-          busy={save.isPending}
-          onConfirm={() => {
-            save.mutate(asked);
-          }}
-          onCancel={() => {
-            setAsked(undefined);
-            save.reset();
-          }}
-        >
-          {/* A status, so a new number on a second ask is announced too (S-039 review). */}
-          <p role="status">
-            This change shows at once on {(asked?.publishedRecords ?? 0).toLocaleString()} published{" "}
-            {asked?.publishedRecords === 1 ? "record" : "records"} using this template.
-          </p>
-          {asked?.counted === true ? (
-            <p>
-              That is too many to list one by one, so check the mapping itself before you save. If
-              records are published or unpublished meanwhile, you will be asked again with the new
-              number.
+          )}
+          {noPublicFields ? (
+            <p className={records.meta}>
+              {hasMapping
+                ? "This template has no public fields left. Remove the mapped fields and save, or make a field public in the template again. If its records need their rights to be published, make the rights field public again: a mapping without it can't be saved."
+                : "This template has no public fields yet. Make a field public in the template first."}
             </p>
           ) : null}
-        </ConfirmPanel>
-        <div className={records.actions}>
-          <Button
-            type="submit"
-            variant="primary"
-            isDisabled={save.isPending || (noPublicFields && !hasMapping)}
-          >
-            Save mapping
-          </Button>
-          <TextLink href={`/settings/templates/${templateKey}`}>Back to the template</TextLink>
+          {rows.length === 0 ? (
+            <p className={records.meta}>No fields are mapped yet.</p>
+          ) : (
+            <ol className={styles.fieldList} aria-label="Mapped fields">
+              {rows.map((row, index) => (
+                <li key={row.uid} className={styles.row}>
+                  <Choice
+                    className={styles.grow}
+                    label={`Row ${String(index + 1)}: field`}
+                    value={row.field}
+                    options={fieldOptions}
+                    onChange={(v) => {
+                      change(rows.map((r) => (r.uid === row.uid ? { ...r, field: v } : r)));
+                    }}
+                  />
+                  <Choice
+                    className={styles.grow}
+                    label={`Row ${String(index + 1)}: goes out as`}
+                    value={row.term}
+                    options={termOptions}
+                    onChange={(v) => {
+                      change(rows.map((r) => (r.uid === row.uid ? { ...r, term: v } : r)));
+                    }}
+                  />
+                  <RowButton
+                    label={`Remove row ${String(index + 1)}`}
+                    onPress={() => {
+                      change(rows.filter((r) => r.uid !== row.uid));
+                    }}
+                  >
+                    Remove
+                  </RowButton>
+                </li>
+              ))}
+            </ol>
+          )}
+          <div className={records.actions}>
+            <Button
+              variant="secondary"
+              isDisabled={noPublicFields}
+              onPress={() => {
+                change([...rows, { uid: nextUid++, field: "", term: "" }]);
+              }}
+            >
+              + Map a field
+            </Button>
+            {rows.length === 0 && suggestions.length > 0 ? (
+              <Button
+                variant="secondary"
+                onPress={() => {
+                  change(suggestions);
+                }}
+              >
+                Fill in from the fields&apos; standards
+              </Button>
+            ) : null}
+          </div>
         </div>
-      </div>
-    </form>
+
+        <div className={records.panel}>
+          <h2 className={records.sectionTitle}>Save</h2>
+          <p className={records.meta}>
+            The server checks the mapping against the template before saving. If records using this
+            template are published, the change shows on the public sites at once, and you&apos;re
+            asked to confirm first.
+          </p>
+          {conflict ? (
+            <div role="alert">
+              <Note tone="amber">
+                Someone else saved this mapping while you were editing. Your changes weren&apos;t
+                saved.{" "}
+                <Button
+                  variant="link"
+                  onPress={() => {
+                    void queries.invalidateQueries({
+                      queryKey: ["dublin-core", organizationId, templateKey],
+                    });
+                  }}
+                >
+                  Load the latest version
+                </Button>
+              </Note>
+            </div>
+          ) : lines.length > 0 ? (
+            <div role="alert">
+              <Note tone="amber">
+                {"The mapping wasn't saved. These need fixing:"}
+                <ul className={records.issues}>
+                  {lines.map((line, i) => (
+                    <li key={i}>{line}</li>
+                  ))}
+                </ul>
+              </Note>
+            </div>
+          ) : confirming ? null : (
+            <Problems error={error} />
+          )}
+          {saved === undefined ? null : (
+            <div aria-live="polite">
+              <Note tone="green">
+                Saved.
+                {saved.shownOn > 0
+                  ? ` The public sites show it now on ${String(saved.shownOn)} published ${saved.shownOn === 1 ? "record" : "records"}.`
+                  : ""}
+              </Note>
+            </div>
+          )}
+          <ConfirmPanel
+            isOpen={blocker.state === "blocked"}
+            title="Leave without saving?"
+            confirmLabel="Leave and discard my changes"
+            cancelLabel="Stay on this mapping"
+            danger
+            onCancel={() => {
+              blocker.reset?.();
+            }}
+            onConfirm={() => {
+              blocker.proceed?.();
+            }}
+          >
+            <p>You have changes to this mapping that are not saved.</p>
+          </ConfirmPanel>
+          <ConfirmPanel
+            isOpen={asked !== undefined}
+            title="Confirm this change"
+            confirmLabel="Save and update the public sites"
+            busy={save.isPending}
+            onConfirm={() => {
+              send(asked);
+            }}
+            onCancel={() => {
+              setAsked(undefined);
+              save.reset();
+            }}
+          >
+            {/* A status, so a new number on a second ask is announced too (S-039 review). */}
+            <p role="status">
+              This change shows at once on {(asked?.publishedRecords ?? 0).toLocaleString()}{" "}
+              published {asked?.publishedRecords === 1 ? "record" : "records"} using this template.
+            </p>
+            {asked?.counted === true ? (
+              <p>
+                That is too many to list one by one, so check the mapping itself before you save. If
+                records are published or unpublished meanwhile, you will be asked again with the new
+                number.
+              </p>
+            ) : null}
+          </ConfirmPanel>
+          <div className={records.actions}>
+            <Button
+              type="submit"
+              variant="primary"
+              isDisabled={save.isPending || (noPublicFields && !hasMapping)}
+            >
+              Save mapping
+            </Button>
+            <TextLink href={`/settings/templates/${templateKey}`}>Back to the template</TextLink>
+          </div>
+        </div>
+      </form>
+      {/* Outside the editor's form: a form can't hold another (S-060a). */}
+      {reauth.form}
+    </>
   );
 }

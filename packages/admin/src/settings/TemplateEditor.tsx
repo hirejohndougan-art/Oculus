@@ -25,6 +25,7 @@ import { Choice, ConfirmPanel, TextInput } from "../records/controls";
 import { FIELD_KINDS, KIND_LABELS, RECORD_KINDS } from "../records/model";
 import records from "../records/Records.module.css";
 import type { SettingsContext } from "./Settings";
+import { useReauthenticated } from "../people/Reauth";
 import { Problems, RowButton } from "./Settings";
 import {
   KIND_NAMES,
@@ -278,6 +279,17 @@ function TemplateForm(props: {
     },
   });
 
+  // Saving needs a recent sign-in (S-060a): the server asks for the password
+  // and a code again, and the save runs again once they're entered.
+  const reauth = useReauthenticated("For changes to templates");
+  function send(confirmation: Confirmation | undefined) {
+    void reauth
+      .run(async () => {
+        await save.mutateAsync(confirmation);
+      })
+      .catch(() => undefined);
+  }
+
   const error = save.error;
   const conflict = error instanceof ApiError && error.status === 412;
   const confirming = error instanceof ApiError && error.code === "confirmation_required";
@@ -298,7 +310,7 @@ function TemplateForm(props: {
   function submit(event: SubmitEvent) {
     event.preventDefault();
     if (!TEMPLATE_KEY.test(key)) return;
-    save.mutate(undefined);
+    send(undefined);
   }
 
   const lines =
@@ -307,211 +319,215 @@ function TemplateForm(props: {
       : [];
 
   return (
-    <form className={records.layout} onSubmit={submit} aria-label="Template">
-      <div className={records.panel}>
-        <div>
-          <h2 className={records.sectionTitle}>
-            {stored === undefined ? "New template" : draft.label || stored.key}
-          </h2>
-          {stored === undefined ? null : (
-            <p className={records.meta}>
-              Key {stored.key} · version {stored.version}
-              {TEMPLATE_KEY.test(stored.key) ? (
-                <>
-                  {" · "}
-                  <TextLink href={`/settings/templates/${stored.key}/dublin-core`}>
-                    Dublin Core mapping
-                  </TextLink>
-                </>
-              ) : null}
-            </p>
-          )}
-        </div>
-        <div className={records.grid}>
-          {stored === undefined ? (
+    <>
+      <form className={records.layout} onSubmit={submit} aria-label="Template">
+        <div className={records.panel}>
+          <div>
+            <h2 className={records.sectionTitle}>
+              {stored === undefined ? "New template" : draft.label || stored.key}
+            </h2>
+            {stored === undefined ? null : (
+              <p className={records.meta}>
+                Key {stored.key} · version {stored.version}
+                {TEMPLATE_KEY.test(stored.key) ? (
+                  <>
+                    {" · "}
+                    <TextLink href={`/settings/templates/${stored.key}/dublin-core`}>
+                      Dublin Core mapping
+                    </TextLink>
+                  </>
+                ) : null}
+              </p>
+            )}
+          </div>
+          <div className={records.grid}>
+            {stored === undefined ? (
+              <TextInput
+                label="Key"
+                value={newKey}
+                onChange={(v) => {
+                  setNewKey(v);
+                  change({});
+                }}
+                isRequired
+                maxLength={64}
+                help="Records name their template by this. It can't change later."
+                errors={keyProblem === undefined ? undefined : [keyProblem]}
+              />
+            ) : null}
             <TextInput
-              label="Key"
-              value={newKey}
+              label="Name"
+              value={draft.label}
               onChange={(v) => {
-                setNewKey(v);
-                change({});
+                change({ label: v });
               }}
               isRequired
-              maxLength={64}
-              help="Records name their template by this. It can't change later."
-              errors={keyProblem === undefined ? undefined : [keyProblem]}
+              maxLength={200}
             />
-          ) : null}
-          <TextInput
-            label="Name"
-            value={draft.label}
-            onChange={(v) => {
-              change({ label: v });
-            }}
-            isRequired
-            maxLength={200}
-          />
-          <TextInput
-            className={records.wide}
-            label="Description"
-            value={draft.description}
-            onChange={(v) => {
-              change({ description: v });
-            }}
-            multiline
-            help="Optional. Shown to staff choosing a template."
-          />
-        </div>
-        <fieldset className={records.fieldset}>
-          <legend className={records.legend}>Used for</legend>
-          <div className={styles.checks}>
-            {RECORD_KINDS.map((kind) => (
-              <Check
-                key={kind}
-                label={KIND_LABELS[kind] ?? kind}
-                isSelected={draft.appliesTo.includes(kind)}
-                onChange={(on) => {
-                  change({
-                    appliesTo: on
-                      ? [...draft.appliesTo, kind]
-                      : draft.appliesTo.filter((k) => k !== kind),
-                  });
-                }}
-              />
-            ))}
+            <TextInput
+              className={records.wide}
+              label="Description"
+              value={draft.description}
+              onChange={(v) => {
+                change({ description: v });
+              }}
+              multiline
+              help="Optional. Shown to staff choosing a template."
+            />
           </div>
-        </fieldset>
-
-        <h3 className={records.sectionTitle}>Fields</h3>
-        {draft.fields.length === 0 ? (
-          <p className={records.meta}>No fields yet.</p>
-        ) : (
-          <ol className={styles.fieldList} aria-label="Fields">
-            {draft.fields.map((field, index) => (
-              <li key={field.uid}>
-                <FieldCard
-                  field={field}
-                  index={index}
-                  count={draft.fields.length}
-                  onChange={(next) => {
-                    changeField(index, next);
-                  }}
-                  onMove={(step) => {
-                    change({ fields: moved(draft.fields, index, step) });
-                  }}
-                  onRemove={() => {
-                    change({ fields: draft.fields.filter((_, i) => i !== index) });
+          <fieldset className={records.fieldset}>
+            <legend className={records.legend}>Used for</legend>
+            <div className={styles.checks}>
+              {RECORD_KINDS.map((kind) => (
+                <Check
+                  key={kind}
+                  label={KIND_LABELS[kind] ?? kind}
+                  isSelected={draft.appliesTo.includes(kind)}
+                  onChange={(on) => {
+                    change({
+                      appliesTo: on
+                        ? [...draft.appliesTo, kind]
+                        : draft.appliesTo.filter((k) => k !== kind),
+                    });
                   }}
                 />
-              </li>
-            ))}
-          </ol>
-        )}
-        <div>
-          <Button
-            variant="secondary"
-            onPress={() => {
-              change({ fields: [...draft.fields, newFieldDraft()] });
+              ))}
+            </div>
+          </fieldset>
+
+          <h3 className={records.sectionTitle}>Fields</h3>
+          {draft.fields.length === 0 ? (
+            <p className={records.meta}>No fields yet.</p>
+          ) : (
+            <ol className={styles.fieldList} aria-label="Fields">
+              {draft.fields.map((field, index) => (
+                <li key={field.uid}>
+                  <FieldCard
+                    field={field}
+                    index={index}
+                    count={draft.fields.length}
+                    onChange={(next) => {
+                      changeField(index, next);
+                    }}
+                    onMove={(step) => {
+                      change({ fields: moved(draft.fields, index, step) });
+                    }}
+                    onRemove={() => {
+                      change({ fields: draft.fields.filter((_, i) => i !== index) });
+                    }}
+                  />
+                </li>
+              ))}
+            </ol>
+          )}
+          <div>
+            <Button
+              variant="secondary"
+              onPress={() => {
+                change({ fields: [...draft.fields, newFieldDraft()] });
+              }}
+            >
+              + Add a field
+            </Button>
+          </div>
+        </div>
+
+        <div className={records.panel}>
+          <h2 className={records.sectionTitle}>Save</h2>
+          <p className={records.meta}>
+            The server checks the template before saving. Changes to fields records already use, and
+            changes that show values on published records, are listed for you to confirm first.
+          </p>
+          {conflict ? (
+            <div role="alert">
+              <Note tone="amber">
+                Someone else saved this template while you were editing. Your changes weren't saved.{" "}
+                <Button
+                  variant="link"
+                  onPress={() => {
+                    void queries.invalidateQueries({
+                      queryKey: ["system-template", organizationId, key],
+                    });
+                  }}
+                >
+                  Load the latest version
+                </Button>
+              </Note>
+            </div>
+          ) : lines.length > 0 ? (
+            <div role="alert">
+              <Note tone="amber">
+                {"The template wasn't saved. These need fixing:"}
+                <ul className={records.issues}>
+                  {lines.map((line, i) => (
+                    <li key={i}>{line}</li>
+                  ))}
+                </ul>
+              </Note>
+            </div>
+          ) : confirming ? null : (
+            <Problems error={error} />
+          )}
+          {saved ? (
+            <div aria-live="polite">
+              <Note tone="green">Saved.</Note>
+            </div>
+          ) : null}
+          <ConfirmPanel
+            isOpen={blocker.state === "blocked"}
+            title="Leave without saving?"
+            confirmLabel="Leave and discard my changes"
+            cancelLabel="Stay on this template"
+            danger
+            onCancel={() => {
+              blocker.reset?.();
+            }}
+            onConfirm={() => {
+              blocker.proceed?.();
             }}
           >
-            + Add a field
-          </Button>
-        </div>
-      </div>
-
-      <div className={records.panel}>
-        <h2 className={records.sectionTitle}>Save</h2>
-        <p className={records.meta}>
-          The server checks the template before saving. Changes to fields records already use, and
-          changes that show values on published records, are listed for you to confirm first.
-        </p>
-        {conflict ? (
-          <div role="alert">
-            <Note tone="amber">
-              Someone else saved this template while you were editing. Your changes weren't saved.{" "}
-              <Button
-                variant="link"
-                onPress={() => {
-                  void queries.invalidateQueries({
-                    queryKey: ["system-template", organizationId, key],
-                  });
-                }}
-              >
-                Load the latest version
-              </Button>
-            </Note>
-          </div>
-        ) : lines.length > 0 ? (
-          <div role="alert">
-            <Note tone="amber">
-              {"The template wasn't saved. These need fixing:"}
-              <ul className={records.issues}>
-                {lines.map((line, i) => (
-                  <li key={i}>{line}</li>
-                ))}
-              </ul>
-            </Note>
-          </div>
-        ) : confirming ? null : (
-          <Problems error={error} />
-        )}
-        {saved ? (
-          <div aria-live="polite">
-            <Note tone="green">Saved.</Note>
-          </div>
-        ) : null}
-        <ConfirmPanel
-          isOpen={blocker.state === "blocked"}
-          title="Leave without saving?"
-          confirmLabel="Leave and discard my changes"
-          cancelLabel="Stay on this template"
-          danger
-          onCancel={() => {
-            blocker.reset?.();
-          }}
-          onConfirm={() => {
-            blocker.proceed?.();
-          }}
-        >
-          <p>You have changes to this template that are not saved.</p>
-        </ConfirmPanel>
-        <ConfirmPanel
-          isOpen={asked !== undefined}
-          title="Confirm these changes"
-          confirmLabel="Save with these changes"
-          busy={save.isPending}
-          onConfirm={() => {
-            save.mutate(asked);
-          }}
-          onCancel={() => {
-            setAsked(undefined);
-            save.reset();
-          }}
-        >
-          <ul>
-            {(asked?.messages ?? []).map((m, i) => (
-              <li key={i}>{m}</li>
-            ))}
-            {asked !== undefined && asked.publishedRecords > 0 ? (
-              <li>
-                This change shows values at once on {asked.publishedRecords} published{" "}
-                {asked.publishedRecords === 1 ? "record" : "records"}.
-              </li>
-            ) : null}
-          </ul>
-        </ConfirmPanel>
-        <div className={records.actions}>
-          <Button
-            type="submit"
-            variant="primary"
-            isDisabled={save.isPending || !TEMPLATE_KEY.test(key)}
+            <p>You have changes to this template that are not saved.</p>
+          </ConfirmPanel>
+          <ConfirmPanel
+            isOpen={asked !== undefined}
+            title="Confirm these changes"
+            confirmLabel="Save with these changes"
+            busy={save.isPending}
+            onConfirm={() => {
+              send(asked);
+            }}
+            onCancel={() => {
+              setAsked(undefined);
+              save.reset();
+            }}
           >
-            {stored === undefined ? "Create template" : "Save template"}
-          </Button>
-          <TextLink href="/settings/templates">Back to the templates</TextLink>
+            <ul>
+              {(asked?.messages ?? []).map((m, i) => (
+                <li key={i}>{m}</li>
+              ))}
+              {asked !== undefined && asked.publishedRecords > 0 ? (
+                <li>
+                  This change shows values at once on {asked.publishedRecords} published{" "}
+                  {asked.publishedRecords === 1 ? "record" : "records"}.
+                </li>
+              ) : null}
+            </ul>
+          </ConfirmPanel>
+          <div className={records.actions}>
+            <Button
+              type="submit"
+              variant="primary"
+              isDisabled={save.isPending || !TEMPLATE_KEY.test(key)}
+            >
+              {stored === undefined ? "Create template" : "Save template"}
+            </Button>
+            <TextLink href="/settings/templates">Back to the templates</TextLink>
+          </div>
         </div>
-      </div>
-    </form>
+      </form>
+      {/* Outside the editor's form: a form can't hold another (S-060a). */}
+      {reauth.form}
+    </>
   );
 }
 

@@ -596,3 +596,44 @@ describe("templates", () => {
     expect(puts[2]?.confirm).toEqual([{ code: "field_removed", key: "maker" }]);
   });
 });
+
+describe("saving a template needs a recent sign-in (S-060a)", () => {
+  it("asks for the password and a code again, then saves the same change", async () => {
+    let calls = 0;
+    const sent = server({
+      "POST /api/reauthenticate": [200, { reauthenticated: true }],
+      "PUT /api/templates/lantern": (s) => {
+        calls += 1;
+        return calls === 1
+          ? [403, { error: "reauthentication_required" }]
+          : [
+              200,
+              {
+                key: "lantern",
+                version: 4,
+                template: { key: "lantern", ...(s.body as { template: object }).template },
+                publishedRecords: [],
+              },
+            ];
+      },
+    });
+    const user = userEvent.setup();
+    renderAt("/settings/templates/lantern");
+    const maker = await screen.findByRole("region", { name: "Maker" });
+    const label = within(maker).getByRole("textbox", { name: /^Label/ });
+    await user.clear(label);
+    await user.type(label, "Maker or workshop");
+    await user.click(screen.getByRole("button", { name: "Save template" }));
+    expect(await screen.findByRole("heading", { name: "Confirm it's you" })).toBeTruthy();
+    expect(screen.getByText(/For changes to templates, enter your password/)).toBeTruthy();
+    expect(screen.queryByText("Saved.")).toBeNull();
+    await user.type(screen.getByLabelText("Your password"), "an invented password");
+    await user.type(screen.getByLabelText("Code from your app, or a recovery code"), "123456");
+    await user.click(screen.getByRole("button", { name: "Confirm and continue" }));
+    expect(await screen.findByText("Saved.")).toBeTruthy();
+    const puts = sent.filter((s) => s.method === "PUT");
+    expect(puts).toHaveLength(2);
+    expect(puts[1]?.body).toEqual(puts[0]?.body);
+    expect(puts[1]?.headers["if-match"]).toBe('"v3"');
+  });
+});

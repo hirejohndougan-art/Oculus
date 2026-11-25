@@ -366,3 +366,34 @@ describe("the mapping helpers", () => {
     expect(mappableFields({ fields: [null, 1, { label: "no key" }] })).toEqual([]);
   });
 });
+
+describe("saving a mapping needs a recent sign-in (S-060a)", () => {
+  it("asks for the password and a code again, then saves the same change", async () => {
+    let calls = 0;
+    const sent = server({
+      "POST /api/reauthenticate": [200, { reauthenticated: true }],
+      "PUT /api/templates/lantern/dublin-core": (s) => {
+        calls += 1;
+        return calls === 1 ? [403, { error: "reauthentication_required" }] : saved(s);
+      },
+    });
+    const user = userEvent.setup();
+    renderAt("/settings/templates/lantern/dublin-core");
+    expect(await screen.findByText("Version 2")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Remove row 2" }));
+    await user.click(screen.getByRole("button", { name: "Save mapping" }));
+    expect(await screen.findByRole("heading", { name: "Confirm it's you" })).toBeTruthy();
+    expect(
+      screen.getByText(/For changes to what the public sites show, enter your password/),
+    ).toBeTruthy();
+    await user.type(screen.getByLabelText("Your password"), "an invented password");
+    await user.type(screen.getByLabelText("Code from your app, or a recovery code"), "123456");
+    await user.click(screen.getByRole("button", { name: "Confirm and continue" }));
+    expect(await screen.findByText("Saved.")).toBeTruthy();
+    const puts = sent.filter((s) => s.method === "PUT");
+    expect(puts.map((s) => s.body)).toEqual([
+      { mapping: { entries: [{ field: "rights", term: "rights" }] } },
+      { mapping: { entries: [{ field: "rights", term: "rights" }] } },
+    ]);
+  });
+});

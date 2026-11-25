@@ -95,7 +95,9 @@
  * /api/templates/:key/dublin-core`, a template's stored mapping
  * (`If-None-Match: *` for the first, `If-Match: "v<N>"` after; a change
  * shown at once on published records answers `409 confirmation_required`
- * until `confirmPublished`).
+ * until `confirmPublished`). Saving a template, a mapping or an identifier
+ * type also needs a recent sign-in (`403 reauthentication_required`, S-060a):
+ * each can show staff-only values on every published record.
  *
  * Not here: signing in, the second step, password reset and signing out
  * (T-045 adds those routes beside these, with `credentials: true` for the
@@ -1253,11 +1255,14 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
     {
       method: "PUT",
       path: "/api/templates/:key",
-      handler: signedIn("write", true, async (request, reply, { context }) => {
+      handler: signedIn("write", true, async (request, reply, { session, context }) => {
         const precondition = newOrMatch(request, VERSION_TAG);
         const body = objectBody(request);
         const extra = onlyKeys(body, ["template", "confirm", "confirmPublished"], reply);
         if (extra) return extra;
+        // A template can make staff-only fields public on every published
+        // record, or take records off the public sites (S-060a).
+        recentSignIn(session);
         const template = body.template;
         const key = request.params.key;
         if (typeof template !== "object" || template === null || Array.isArray(template)) {
@@ -1306,7 +1311,7 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
     {
       method: "PUT",
       path: "/api/templates/:key/dublin-core",
-      handler: signedIn("write", true, async (request, reply, { context }) => {
+      handler: signedIn("write", true, async (request, reply, { session, context }) => {
         const precondition = newOrMatch(request, VERSION_TAG);
         const body = objectBody(request);
         const extra = onlyKeys(
@@ -1315,6 +1320,7 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
           reply,
         );
         if (extra) return extra;
+        recentSignIn(session);
         const result = await service.saveDublinCoreMapping(
           context,
           request.params.key ?? "",
@@ -1348,7 +1354,7 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
     {
       method: "PUT",
       path: "/api/identifier-types/:key",
-      handler: signedIn("write", true, async (request, reply, { context }) => {
+      handler: signedIn("write", true, async (request, reply, { session, context }) => {
         const precondition = newOrMatch(request, TYPE_TAG);
         const body = objectBody(request);
         const extra = onlyKeys(
@@ -1357,6 +1363,7 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
           reply,
         );
         if (extra) return extra;
+        recentSignIn(session);
         const type = body.identifierType;
         const key = request.params.key;
         if (typeof type !== "object" || type === null || Array.isArray(type)) {
