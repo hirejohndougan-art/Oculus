@@ -341,6 +341,8 @@ export function SignInSettings() {
   const read = useQuery({
     queryKey: SETTINGS_KEY,
     queryFn: () => api<StoredSettings>("/api/system-settings"),
+    // The form starts fresh for each version: a background refetch would drop typed edits.
+    refetchOnReconnect: false,
   });
   if (read.data === undefined) {
     return read.error === null ? <p role="status">Loading…</p> : <Problems error={read.error} />;

@@ -158,6 +158,8 @@ export function TemplateScreen(props: { readonly isNew?: boolean }) {
     queryKey: ["system-template", me.organizationId, key],
     queryFn: () => api<TemplateReply>(`/api/templates/${key}`),
     enabled: known,
+    // The form starts fresh for each version: a background refetch would drop typed edits.
+    refetchOnReconnect: false,
   });
   if (props.isNew === true) {
     return <TemplateForm key="new" organizationId={me.organizationId} />;
