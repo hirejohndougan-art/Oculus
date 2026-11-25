@@ -25,6 +25,10 @@ const OFFER_PROBLEMS: Readonly<Record<string, string>> = {
     "There is no such site under that organization, or it is this record's own site. Check both IDs with the other site's manager.",
   already_shared: "This record is already offered or shared to that site.",
   not_published: "Only a published record can be offered. Publish it first.",
+  too_many_offers:
+    "That site already has 100 offers from your organization waiting for an answer. Ask its manager to answer some first.",
+  declined_recently:
+    "That site declined this record in the last 30 days. You can offer it again after that.",
 };
 
 export function SharingPanel(props: {

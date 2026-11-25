@@ -6,7 +6,15 @@
  *   editing it needs) offers it to another site, of their own organization
  *   or another one, named by its organization and site IDs (a site's manager
  *   passes them on: Oculus lists no other organization's sites). Never to
- *   the record's own home site; one live offer per record and site.
+ *   the record's own home site; one live offer per record and site. Limits
+ *   (S-036b, checked by the database): at most `MAX_OPEN_OFFERS` open offers
+ *   from one organization into one site (`too_many_offers`), and none of a
+ *   record to a site that declined it in the last `DECLINE_COOLDOWN_DAYS`
+ *   (`declined_recently`).
+ * - **Endings the database makes** (S-036b): deleting the record at home
+ *   ends its live shares as `deleted`, and moving it onto the second site
+ *   as `moved`; both keep the decision, and the shares outlive the record,
+ *   so the second organization keeps its record of what it decided.
  * - **Deciding** (`acceptShare`, `declineShare`): the second site's manager
  *   (`site.settings` there, or a system manager), in a session of the second
  *   site's organization.
@@ -54,7 +62,9 @@ import {
   type UserId,
 } from "@oculus/core";
 import {
+  DECLINE_COOLDOWN_DAYS,
   insertShare,
+  liveShare,
   lockRecord,
   lockShare,
   moveShare,
@@ -65,6 +75,9 @@ import {
   sharedItemViews,
   SHARE_CHANGED,
   MAX_SHARE_PAGE,
+  MAX_OPEN_OFFERS,
+  SHARE_COOLDOWN_STATE,
+  SHARE_OFFER_LIMIT_STATE,
   sharesIntoSite as storedSharesIntoSite,
   sharesOfRecord as storedSharesOfRecord,
   type Database,
@@ -171,6 +184,19 @@ const UNKNOWN_SHARE = (): Refusal =>
 const UNKNOWN_SITE = (): Refusal =>
   refusal(["targetSiteId"], "unknown_site", "There is no such site to offer it to.");
 const NOT_PERMITTED = (): Refusal => refusal([], "not_permitted", NOT_PERMITTED_MESSAGE);
+const ALREADY_SHARED = (): Refusal =>
+  refusal(["targetSiteId"], "already_shared", "It is already offered to or shown on that site.");
+
+/** A thrown database error's SQLSTATE, if it has one. */
+function sqlStateOf(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  try {
+    const code = (error as { code?: unknown }).code;
+    return typeof code === "string" ? code : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 function summary(share: Share): ShareSummary {
   return Object.freeze({
@@ -378,22 +404,45 @@ export function shareOperations(db: Database, run: Runner, outside: Outside): Sh
         ) {
           return UNKNOWN_SITE();
         }
-        const share = await insertShare(tx, {
-          id: randomUUID(),
-          organizationId: who.organizationId,
-          recordId,
-          targetOrganizationId,
-          targetSiteId,
-          offeredBy: access.userId,
-        });
-        // A live share there already (perhaps made a moment ago by another offer).
-        if (share === undefined) {
-          return refusal(
-            ["targetSiteId"],
-            "already_shared",
-            "It is already offered to or shown on that site.",
-          );
+        // A live share there already: said before the limits are counted.
+        if (
+          (await liveShare(tx, who.organizationId, recordId, targetOrganizationId, targetSiteId)) !==
+          undefined
+        ) {
+          return ALREADY_SHARED();
         }
+        let share: Share | undefined;
+        try {
+          share = await insertShare(tx, {
+            id: randomUUID(),
+            organizationId: who.organizationId,
+            recordId,
+            targetOrganizationId,
+            targetSiteId,
+            offeredBy: access.userId,
+          });
+        } catch (error) {
+          // The database's limits (0040, S-036b); the transaction is rolled
+          // back with the refusal, and nothing more runs in it.
+          const state = sqlStateOf(error);
+          if (state === SHARE_OFFER_LIMIT_STATE) {
+            return refusal(
+              ["targetSiteId"],
+              "too_many_offers",
+              `That site already has ${MAX_OPEN_OFFERS} open offers from your organization. Wait for it to answer some first.`,
+            );
+          }
+          if (state === SHARE_COOLDOWN_STATE) {
+            return refusal(
+              ["targetSiteId"],
+              "declined_recently",
+              `That site declined this item in the last ${DECLINE_COOLDOWN_DAYS} days. It can be offered again after that.`,
+            );
+          }
+          throw error;
+        }
+        // A live share there already (perhaps made a moment ago by another offer).
+        if (share === undefined) return ALREADY_SHARED();
         return { ok: true, value: summary(share) };
       });
     },
