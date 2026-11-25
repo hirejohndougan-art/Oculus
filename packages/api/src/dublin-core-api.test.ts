@@ -119,6 +119,13 @@ describe("a template's Dublin Core mapping", () => {
     expect(read.json.version).toBe(2);
   });
 
+  it("a version too big for the service is a malformed If-Match, 400 (S-032)", async () => {
+    for (const tag of ['"v2147483647"', '"v9999999999"']) {
+      const r = await call("PUT", URL_OBJECT, "root", { mapping: MAPPING }, { "if-match": tag });
+      expect([tag, r.status, r.json]).toEqual([tag, 400, { error: "bad_if_match" }]);
+    }
+  });
+
   it("refuses a staff field, unknown keys, an unknown template and another organization's member", async () => {
     const staff = await call(
       "PUT",
