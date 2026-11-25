@@ -268,11 +268,10 @@ class Reader {
    * case), so a misspelt "Internal " is never read as public.
    */
   internal(el: XmlElement): boolean {
+    // Any attribute named audience counts, whatever its namespace, so an
+    // odd prefix can't make staff-only text public.
     return el.attributes.some(
-      (a) =>
-        a.ns === "" &&
-        a.name === "audience" &&
-        normalizeEadText(a.value).toLowerCase() !== "external",
+      (a) => a.name === "audience" && normalizeEadText(a.value).toLowerCase() !== "external",
     );
   }
 
@@ -469,7 +468,7 @@ class Reader {
       this.warn(
         path,
         "internal_left_out",
-        'The header is marked staff-only (audience="internal"), so its titles, notes, author and publisher were left out; only its identifier was kept.',
+        'The header is marked staff-only (audience="internal"), so its titles, notes, author and publisher were left out; only its identifier and country and agency codes were kept.',
       );
       notes.length = 0;
       delete h.title;
@@ -513,11 +512,25 @@ class Reader {
       const parts = kids(ev);
       const by = (name: string): XmlElement | undefined => parts.find((k) => k.name === name);
       const agent = by("agent");
+      const marker = (name: string, wanted: string): boolean => {
+        const e = by(name);
+        return e?.attributes.length === 1 && value(e) === wanted && e.children.length === 0;
+      };
+      // Only a date and time, as Oculus writes it: anything else is reported.
+      const when = by("eventdatetime");
+      const stamp = /^[0-9T:.+\-Z]{1,40}$/;
+      const whenOk =
+        when !== undefined &&
+        when.children.every((c) => typeof c === "string") &&
+        stamp.test(when.children.join("").trim()) &&
+        when.attributes.every(
+          (a) => a.ns === "" && a.name === "standarddatetime" && stamp.test(a.value),
+        );
       return (
         parts.length === 4 &&
-        value(by("eventtype") ?? ev) === "created" &&
-        value(by("agenttype") ?? ev) === "machine" &&
-        by("eventdatetime") !== undefined &&
+        marker("eventtype", "created") &&
+        marker("agenttype", "machine") &&
+        whenOk &&
         agent?.children.length === 1 &&
         typeof agent.children[0] === "string" &&
         agent.children[0].trim() === "Oculus"
@@ -1203,8 +1216,13 @@ class Reader {
         );
         return;
       }
+      // The address as the file gave it: cleaning would quietly change it.
+      const rawBad = d.attributes.some(
+        (a) =>
+          /^(xlink:)?href$/.test(this.attrKey(a.name, a.ns)) && textProblem(a.value) !== undefined,
+      );
       const problem = webUrlProblem(url);
-      if (problem !== undefined || textProblem(url) !== undefined) {
+      if (problem !== undefined || textProblem(url) !== undefined || rawBad) {
         this.warn(
           p,
           "bad_url",
@@ -1278,7 +1296,14 @@ class Reader {
         } else this.unknown(p, k, shown(kind));
       }
     };
-    walk(el, path, false);
+    // Inside a staff-only note every part is staff-only too, so marked parts
+    // are kept (under the note's mark) rather than left out.
+    if (internal) this.staffOnly += 1;
+    try {
+      walk(el, path, false);
+    } finally {
+      if (internal) this.staffOnly -= 1;
+    }
     if (paragraphs.length === 0) {
       if (head !== undefined)
         this.skip(
@@ -1296,11 +1321,14 @@ class Reader {
   private listItems(list: XmlElement, path: Path, out: string[]): void {
     for (const { el: k, path: p } of this.children(list, path)) {
       if (k.name === "head" || k.name === "item" || k.name === "listhead") {
+        this.attrs(k, p, [], ["audience"]);
         const text = this.textOf(k, p);
         if (text !== undefined) out.push(text);
       } else if (k.name === "defitem") {
+        this.attrs(k, p, [], ["audience"]);
         const parts: string[] = [];
         for (const { el: d, path: dp } of this.children(k, p)) {
+          this.attrs(d, dp, [], ["audience"]);
           const text = this.textOf(d, dp);
           if (text !== undefined) parts.push(text);
         }
@@ -1312,13 +1340,17 @@ class Reader {
   private chronItems(list: XmlElement, path: Path, out: string[]): void {
     for (const { el: k, path: p } of this.children(list, path)) {
       if (k.name === "head") {
+        this.attrs(k, p, [], ["audience"]);
         const text = this.textOf(k, p);
         if (text !== undefined) out.push(text);
       } else if (k.name === "chronitem" || k.name === "listhead") {
+        this.attrs(k, p, [], ["audience"]);
         const parts: string[] = [];
         for (const { el: d, path: dp } of this.children(k, p)) {
+          this.attrs(d, dp, [], ["audience"]);
           if (d.name === "eventgrp" || d.name === "chronitemset") {
             for (const { el: e, path: ep } of this.children(d, dp)) {
+              this.attrs(e, ep, [], ["audience"]);
               const text = this.textOf(e, ep);
               if (text !== undefined) parts.push(text);
             }

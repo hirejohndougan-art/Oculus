@@ -190,6 +190,38 @@ export function parseXml(input: string | Uint8Array): Validated<XmlElement> {
       );
     }
   });
+  // Attributes are counted and measured as saxes reads each one (namespace
+  // declarations included), not when the start tag is finished: a start tag
+  // with millions of attributes would otherwise be built whole first.
+  let tagAttributes = 0;
+  parser.on("opentagstart", () => {
+    tagAttributes = 0;
+  });
+  parser.on("attribute", (attr: { name: string; value: string }) => {
+    tagAttributes += 1;
+    attributeCount += 1;
+    if (attributeCount > MAX_XML_TOTAL_ATTRIBUTES) {
+      stop(
+        "too_many_attributes",
+        `The file has more than ${String(MAX_XML_TOTAL_ATTRIBUTES)} attributes.`,
+      );
+    }
+    if (tagAttributes > MAX_XML_ATTRIBUTES) {
+      stop(
+        "too_many_attributes",
+        `An element has more than ${String(MAX_XML_ATTRIBUTES)} attributes.`,
+      );
+    }
+    if (
+      attr.value.length > MAX_XML_ATTRIBUTE_LENGTH ||
+      attr.name.length > MAX_XML_ATTRIBUTE_LENGTH
+    ) {
+      stop(
+        "attribute_too_long",
+        `An attribute is longer than ${String(MAX_XML_ATTRIBUTE_LENGTH)} characters.`,
+      );
+    }
+  });
   parser.on("opentag", (tag: SaxesTagNS) => {
     elements += 1;
     if (elements > MAX_XML_ELEMENTS) {
@@ -201,26 +233,8 @@ export function parseXml(input: string | Uint8Array): Validated<XmlElement> {
     const attributes: XmlAttribute[] = [];
     for (const attr of Object.values(tag.attributes)) {
       // Namespace declarations are how names are read, not data.
+      // (Counted and measured above, as each was read.)
       if (attr.prefix === "xmlns" || attr.name === "xmlns") continue;
-      attributeCount += 1;
-      if (attributeCount > MAX_XML_TOTAL_ATTRIBUTES) {
-        stop(
-          "too_many_attributes",
-          `The file has more than ${String(MAX_XML_TOTAL_ATTRIBUTES)} attributes.`,
-        );
-      }
-      if (attributes.length >= MAX_XML_ATTRIBUTES) {
-        stop(
-          "too_many_attributes",
-          `An element has more than ${String(MAX_XML_ATTRIBUTES)} attributes.`,
-        );
-      }
-      if (attr.value.length > MAX_XML_ATTRIBUTE_LENGTH) {
-        stop(
-          "attribute_too_long",
-          `An attribute is longer than ${String(MAX_XML_ATTRIBUTE_LENGTH)} characters.`,
-        );
-      }
       attributes.push({ name: attr.local, ns: attr.uri, value: attr.value });
     }
     stack.push({
