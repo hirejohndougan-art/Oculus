@@ -450,6 +450,7 @@ export {
   MAX_VALUATION_DIGITS,
   newLoanId,
   isLoanId,
+  loanNumberKey,
   validateLoan,
   indexLoans,
   isLoanBook,

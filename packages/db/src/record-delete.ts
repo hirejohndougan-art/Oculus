@@ -24,6 +24,9 @@
  * - `in_accession`, `accession_source`: an accession lists it among what
  *   it produced, or it is an accession's source agent or has a donor
  *   contact (T-018c, D-114); the message names no accession;
+ * - `on_loan`, `loan_agent`, `has_condition_checks`: a loan lists it, names
+ *   it as lender or borrower, or condition checks name it (T-018b, D-118);
+ *   loans and checks are kept for good, so it is too;
  * - `has_moves`, `storage_agent`: it has a storage history (T-018d, D-115),
  *   or an outside storage location names it as its agent;
  * - `has_role_grants`: roles are granted for this unit's subtree (D-072);
@@ -64,6 +67,7 @@ import {
 import type { Queryable } from "./client.js";
 import { validateRecordChange } from "./record-versions.js";
 import { accessionUses } from "./accessions.js";
+import { loanUses } from "./loans.js";
 import { storageUses } from "./storage.js";
 import { sql } from "./sql.js";
 import { clearRecordTerms } from "./vocabularies.js";
@@ -264,6 +268,36 @@ export async function deleteRecord(
           ["recordId"],
           "in_accession",
           "An accession lists this record among what it brought in. Take it off the accession first.",
+        ),
+      );
+    }
+    // Loans and condition checks (T-018b, D-118): the foreign keys would
+    // refuse anyway; said first, naming no loan.
+    const loans = await loanUses(db, org, recordId);
+    if (loans.onLoan) {
+      problems.push(
+        issue(
+          ["recordId"],
+          "on_loan",
+          "A loan lists this record. Loans are kept for good, so the record is kept too.",
+        ),
+      );
+    }
+    if (loans.agent) {
+      problems.push(
+        issue(
+          ["recordId"],
+          "loan_agent",
+          "A loan names this agent as its lender or borrower. Loans are kept for good, so the agent is kept too.",
+        ),
+      );
+    }
+    if (loans.checks) {
+      problems.push(
+        issue(
+          ["recordId"],
+          "has_condition_checks",
+          "Condition checks name this record. They are kept for good, so the record is kept too.",
         ),
       );
     }

@@ -348,6 +348,14 @@ export function newLoanId(): LoanId {
   return randomUUID() as LoanId;
 }
 
+/**
+ * The key a loan's number is unique by, among the organization's loans that
+ * way (in or out): what `indexLoans` compares, for the database's unique key.
+ */
+export function loanNumberKey(number: string): string {
+  return fold(number);
+}
+
 /** True if `value` is a well-formed loan ID (lowercase version 4 UUID). */
 export function isLoanId(value: unknown): value is LoanId {
   return typeof value === "string" && UUID_V4.test(value);

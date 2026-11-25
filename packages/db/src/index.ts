@@ -545,6 +545,18 @@ export {
 } from "./storage.js";
 export type { StorageSaveOutcome, StoredDefinition, StoredStorage } from "./storage.js";
 export {
+  LOAN_TABLE_PRIVILEGES,
+  insertConditionCheck,
+  insertLoan,
+  loanUses,
+  readAccessionRecordsMap,
+  readConditionChecks,
+  readLoanHistory,
+  readLoans,
+  updateLoan,
+} from "./loans.js";
+export type { LoanSaveOutcome, StoredLoan, StoredLoanVersion } from "./loans.js";
+export {
   SYSTEM_EVENT_KINDS,
   SYSTEM_EVENT_TABLE_PRIVILEGES,
   insertSystemEvent,

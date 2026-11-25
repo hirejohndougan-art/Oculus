@@ -144,3 +144,10 @@ export type {
   SavedAccession,
 } from "./accessions.js";
 export type { RecordStorage, StorageOperations, StorageView } from "./storage.js";
+export type {
+  LoanDetail,
+  LoanOperations,
+  LoanVersion,
+  LoanView,
+  UnexplainedLoanMoves,
+} from "./loans.js";

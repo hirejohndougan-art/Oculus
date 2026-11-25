@@ -31,6 +31,7 @@ import { SESSION_TABLE_PRIVILEGES } from "./sessions.js";
 import { STORED_FILE_TABLE_PRIVILEGES } from "./stored-files.js";
 import { FILE_SCAN_TABLE_PRIVILEGES } from "./file-scans.js";
 import { ACCESSION_TABLE_PRIVILEGES } from "./accessions.js";
+import { LOAN_TABLE_PRIVILEGES } from "./loans.js";
 import { STORAGE_TABLE_PRIVILEGES } from "./storage.js";
 import { sql } from "./sql.js";
 
@@ -97,6 +98,10 @@ export const WRITER_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Ob
   // Storage (T-018d, D-115): levels and locations made and changed, never
   // deleted; moves insert only (a mistake is put right by a later move).
   ...STORAGE_TABLE_PRIVILEGES,
+  // Loans and condition checks (T-018b, D-118): loans made and changed,
+  // never deleted; checks insert only. A loan's records and history are the
+  // migration's trigger's.
+  ...LOAN_TABLE_PRIVILEGES,
   // The change log of people and roles (T-048, D-084): insert only.
   ...PEOPLE_TABLE_PRIVILEGES,
   // Two-step alert notices (D-085): one row per alert, only ever added.
