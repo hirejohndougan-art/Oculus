@@ -7,9 +7,9 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Result: done
 - What changed: migration 0051 `definition_events`, written by triggers on identifier types, terms, sites, storage levels and locations, Dublin Core mappings and the System settings, naming the transaction's `oculus.actor` (set by the service's `run`) or the row's editor; append-only, triggers ALWAYS. `readAuditTrail` also shows definitions, file attaches and removals, moves, accession saves (only with `donors.view` on every site) and share steps (home organization only; the other organization's people as `other_organization`). The audit screen words each kind. No secrets in definition tables (D-052 amended).
 - Decisions: D-117 (D-052 amended)
-- Review: three independent rounds. The first found a same-organization share leaking a title to the receiving site, accession lines reaching people without `donors.view`, and test gaps; the second found the other organization's user IDs in share lines and receiving-side lines beyond D-094; the third found only documentation gaps. All fixed; indexes (S-066) and a receiving-side view (S-067) filed.
+- Review: three independent rounds. The first found a same-organization share leaking a title to the receiving site, accession lines reaching people without `donors.view`, and test gaps; the second found the other organization's user IDs in share lines and receiving-side lines beyond D-094; the third found only documentation gaps. All fixed; indexes (S-066) and a receiving-side view (S-070) filed.
 - Gate: PASS · tests_passing 5250 (was 5233) · npm audit clean
-- Next: S-066, S-067 (follow-ups); Phase 2's other jobs are claimed.
+- Next: S-066, S-070 (follow-ups); Phase 2's other jobs are claimed.
 
 ## 2026-11-25 16:00 CT — manual (Chat L) — U-008 Load-proof test timeouts
 
