@@ -33,6 +33,7 @@ import {
   insertTemplateVersion,
   migrate,
   openDatabase,
+  publicTermCounts,
   publishCheckIssues,
   readPublicRecord,
   readVersions,
@@ -752,6 +753,194 @@ describe("a number that no longer fits a changed format (S-026, D-091)", () => {
       [],
     );
     expect((await publicText(org, made.record.id)).ok).toBe(true);
+  }, 60_000);
+});
+
+describe("public subject counts come from public output only (T-034d, D-095)", () => {
+  const LIGHT = "http://id.loc.gov/authorities/subjects/sh85077022";
+  const term = (label: string, uri?: string) =>
+    uri === undefined ? { label } : { label, uri, vocabulary: "lcsh" };
+  const subjectFields = [
+    field("rights", "rights"),
+    field("subject", "controlled_term", { repeatable: true }),
+    field("hidden", "controlled_term", { visibility: "staff" }),
+  ];
+  const unitFields = [
+    field("rights", "rights"),
+    field("subject", "controlled_term", { repeatable: true, inherited: true }),
+  ];
+  const mappings = (org: OrganizationId, templates = ["pub-subj", "pub-subj-unit"]) =>
+    templates.map((template) => ({
+      organizationId: org,
+      template,
+      entries: [
+        { field: "rights", term: "rights" },
+        { field: "subject", term: "subject" },
+      ],
+    }));
+
+  async function world() {
+    await ready();
+    const org = await organization();
+    for (const [key, kind, fields] of [
+      ["pub-subj", "object", subjectFields],
+      ["pub-subj-unit", "archival_unit", unitFields],
+    ] as const) {
+      ok(
+        await insertTemplateVersion(s.owner, {
+          key,
+          organizationId: org,
+          label: key,
+          appliesTo: [kind],
+          fields,
+        }),
+      );
+    }
+    const item = (title: string, fields: Record<string, unknown>) =>
+      create(org, {
+        kind: "object",
+        title,
+        templateKey: "pub-subj",
+        fields: { rights: { uri: INC }, ...fields },
+      });
+    const a = await item("An invented lantern", {
+      subject: [term("Lighthouses", LIGHT), term("Fishing")],
+      hidden: term("Secret staff term"),
+    });
+    const b = await item("An invented net", {
+      subject: [
+        term("Lighthouses—Texas", LIGHT.replace("http:", "https:")),
+        term("Fishing"),
+        term("Fishing"),
+      ],
+    });
+    const draft = await item("An invented draft", {
+      subject: [term("Fishing"), term("Unpublished term")],
+    });
+    const gone = await item("An invented withdrawn thing", { subject: [term("Withdrawn term")] });
+    const fonds = (
+      await create(org, {
+        kind: "archival_unit",
+        level: "fonds",
+        title: "An invented fonds",
+        templateKey: "pub-subj-unit",
+        fields: { rights: { uri: INC }, subject: [term("Shipwrecks")] },
+      })
+    ).record;
+    const series = (
+      await create(org, {
+        kind: "archival_unit",
+        level: "series",
+        parentId: fonds.id,
+        title: "An invented series",
+        templateKey: "pub-subj-unit",
+        fields: { rights: { uri: INC } },
+      })
+    ).record;
+    for (const r of [a.record, b.record, gone.record, fonds, series]) {
+      ok(await service.publish(ctx(org), r.id, { expectedVersion: 1 }));
+    }
+    ok(await service.withdraw(ctx(org), gone.record.id, { expectedVersion: 2 }));
+    return { org, draft };
+  }
+
+  const counted = (r: Awaited<ReturnType<typeof publicTermCounts>>) =>
+    ok(r).counts.map((c) => [c.label, c.records, c.uri ?? null]);
+
+  it("counts each term once per public record that shows it, inherited values included", async () => {
+    const { org } = await world();
+    const result = await publicTermCounts(s.reader, org, siteFor(org), {
+      baseUrl: BASE,
+      mappings: mappings(org),
+    });
+    expect(counted(result)).toEqual([
+      ["Fishing", 2, null],
+      ["Lighthouses", 2, LIGHT],
+      ["Shipwrecks", 2, null],
+    ]);
+    expect(ok(result).recordsRead).toBe(4);
+    const text = JSON.stringify(result);
+    for (const hidden of ["Secret staff term", "Unpublished term", "Withdrawn term"]) {
+      expect(text).not.toContain(hidden);
+    }
+    expect(ok(result).counts[0]?.vocabulary).toBe("local");
+    expect(ok(result).counts[1]?.vocabulary).toBe("lcsh");
+    expect(Object.isFrozen(ok(result).counts)).toBe(true);
+  }, 60_000);
+
+  it("counts only the fields asked for, and only fields the mapping shows", async () => {
+    const { org } = await world();
+    const only = (fields: string[]) =>
+      publicTermCounts(s.reader, org, siteFor(org), {
+        baseUrl: BASE,
+        mappings: mappings(org),
+        fields,
+      });
+    expect(counted(await only(["subject"]))).toHaveLength(3);
+    expect(counted(await only(["hidden"]))).toEqual([]);
+    // A template with no mapping given: its records' output is refused, so they count for nothing.
+    const noUnits = await publicTermCounts(s.reader, org, siteFor(org), {
+      baseUrl: BASE,
+      mappings: mappings(org, ["pub-subj"]),
+    });
+    expect(counted(noUnits)).toEqual([
+      ["Fishing", 2, null],
+      ["Lighthouses", 2, LIGHT],
+    ]);
+  }, 60_000);
+
+  it("another organization's site, or a site of none, counts nothing", async () => {
+    const { org } = await world();
+    const other = await organization();
+    const empty = await publicTermCounts(s.reader, other, siteFor(org), {
+      baseUrl: BASE,
+      mappings: mappings(other),
+    });
+    expect(ok(empty)).toEqual({ counts: [], recordsRead: 0 });
+    const bad = await publicTermCounts(s.reader, org, "not-a-site" as SiteId, {
+      baseUrl: BASE,
+      mappings: mappings(org),
+    });
+    expect(codes(bad)).toEqual(["not_available"]);
+    expect(
+      codes(
+        await publicTermCounts(s.reader, org, siteFor(org), {
+          baseUrl: BASE,
+          mappings: mappings(org),
+          extra: true,
+        } as never),
+      ),
+    ).toEqual(["invalid_options"]);
+    expect(
+      codes(
+        await publicTermCounts(s.reader, org, siteFor(org), {
+          baseUrl: BASE,
+          mappings: mappings(org),
+          fields: ["Not A Key"],
+        }),
+      ),
+    ).toEqual(["invalid_fields"]);
+  }, 60_000);
+
+  it("the public reader can call the listing function, and it refuses bad arguments", async () => {
+    const { org } = await world();
+    const ids = await s.reader.transaction((q) =>
+      q.rows<{ id: string }>(sql`
+        SELECT id::text AS id FROM public.public_site_record_ids(
+          ${org}::uuid, ${siteFor(org)}::uuid, NULL, 10) AS id`),
+    );
+    expect(ids).toHaveLength(4);
+    expect(
+      (
+        await refusal(
+          s.reader.transaction((q) =>
+            q.rows(sql`SELECT public.public_site_record_ids(
+                         ${org}::uuid, ${siteFor(org)}::uuid, NULL, 0)`),
+          ),
+        )
+      ).code,
+    ).toBe("22023");
+    expect(await checkPublicReaderConnection(s.reader)).toEqual([]);
   }, 60_000);
 });
 
