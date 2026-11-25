@@ -2,6 +2,12 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 17:30 CT — manual (Chat A) — S-052 Safe purge of removed files
+
+- **Done:** removed files can be cleared again (D-086, migration 0049), through System settings › Removed files (system managers, recent sign-in), `npm run files:purge` (with `--dry-run`), or a daily timer that is off by default (`OCULUS_FILES_AUTO_PURGE=on`). A copy goes only when no database row names it, it was removed at least 7 days ago by both the database's and the file system's clocks, its mtime still matches the one logged at removal, and it is not quarantined; it goes to a trash folder first and is deleted a day later. The epoch lease ties purging to one database and one install (catalog-identity checks, `identity_unknown`/`identity_changed` refuse; only adopt moves the lease after an upgrade or move), and a generation-file lock keeps one purge step at a time. Limits are stated in D-086, README and DESKTOP.md.
+- **Reviews:** five independent reviews; the last found nothing blocking, and every finding was fixed. The one-click "accept this database" step was removed after two rounds.
+- Gate: see below.
+
 ## 2026-11-25 14:10 CT — build (BUILD MODE) — S-054a Wrong-code counters locked in key order; an admin reset forgets the unexplained codes
 - Result: done (S-054 split into S-054a, S-054b and S-054c)
 - What changed: second-factor.ts `giveBackCodeAttempt` and `clearCodeAttempts`, and sessions.ts `runCleanup`'s delete, lock their `second_step_throttles` rows with `SELECT … ORDER BY key FOR UPDATE` in a CTE first, the order `takeCodeAttempt` takes (no possible 40P01 with an attempt); `resetSecondFactor` deletes the person's `wrong:` row with `user:`. Four tests in second-factor.test.ts, all failing without the change (three races on a connection with index scans off and the earlier key's row moved to the end of the table; one reset then cleanup). Source: PostgreSQL 16 docs, SELECT "The Locking Clause" and §13.3.4 Deadlocks.
