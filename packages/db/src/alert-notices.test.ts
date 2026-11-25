@@ -216,6 +216,11 @@ describe("sendSecondStepAlertNotices", () => {
         ENABLE ALWAYS TRIGGER second_step_alert_notices_check_new`);
       await q.execute(sql`ALTER TABLE public.second_step_alert_notices
         ENABLE ALWAYS TRIGGER second_step_alert_notices_no_change`);
+      // 0052's guards (S-065), put back as the migration left them.
+      await q.execute(sql`ALTER TABLE public.second_step_alert_notices
+        ENABLE ALWAYS TRIGGER second_step_alert_notices_append_only`);
+      await q.execute(sql`ALTER TABLE public.second_step_alert_notices
+        ENABLE ALWAYS TRIGGER second_step_alert_notices_no_truncate`);
     });
     await alert(p.userId, 25);
     const later = inbox();
@@ -267,6 +272,26 @@ describe("sendSecondStepAlertNotices", () => {
     ]);
     expect(runs.map((r) => r?.notified).sort()).toEqual([0, 1]);
     expect(box.messages.filter((m) => m.to === "person")).toHaveLength(1);
+  });
+
+  it("decides nothing, at once, while another process holds the lock (S-065)", async () => {
+    await ready();
+    await drain();
+    const p = await person();
+    await alert(p.userId, 5);
+    const box = inbox();
+    // Another process in the middle of a run: it holds the lock, and this
+    // run doesn't wait for it (the old one waited with no limit).
+    await db.transaction(async (other) => {
+      await other.rows(sql`SELECT pg_advisory_xact_lock(85, 0)`);
+      const started = Date.now();
+      const skipped = await sendSecondStepAlertNotices(db, box.deliver);
+      expect(Date.now() - started).toBeLessThan(5_000);
+      expect(skipped).toMatchObject({ alerts: 0, notified: 0, sent: 0 });
+    });
+    expect(box.messages).toEqual([]);
+    // Once it's free, the next run sends the notice.
+    expect((await sendSecondStepAlertNotices(db, box.deliver))?.notified).toBe(1);
   });
 
   it("counts a refused send, drops what it threw, and doesn't send it again", async () => {

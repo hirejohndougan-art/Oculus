@@ -84,8 +84,9 @@ export const WRITER_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Ob
   // recovery codes written (codes also used and superseded); the wrong-code
   // counters. Nothing deletes a factor, a pass or a recovery code.
   ...SECOND_FACTOR_TABLE_PRIVILEGES,
-  // Stored files (M-002, D-086): attached by INSERT; rows never change and
-  // nothing deletes them yet.
+  // Stored files (M-002, D-086): attached by INSERT; rows never change, and
+  // `removeFile` deletes the row of a file taken off its record (its events
+  // stay, append-only).
   ...STORED_FILE_TABLE_PRIVILEGES,
   // Virus scan results (S-040, D-113): queued, then moved along; never
   // deleted, and an infected content never changed back (0048's guard).
@@ -102,7 +103,8 @@ export const WRITER_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Ob
   // Two-step alert notices (D-085): one row per alert, only ever added.
   ...ALERT_NOTICE_TABLE_PRIVILEGES,
   // Shares between sites (T-041b, D-094): offered, then moved along their
-  // life; never deleted by the writer (rows go with their record).
+  // life; never deleted by the writer. Since 0043 they outlive their record,
+  // ending as `deleted` or `moved` (S-036b).
   ...SHARE_TABLE_PRIVILEGES,
   // Installs and rollbacks in the change log (T-060a): append-only.
   ...SYSTEM_EVENT_TABLE_PRIVILEGES,

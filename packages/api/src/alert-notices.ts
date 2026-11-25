@@ -3,8 +3,11 @@
  * admin's process: "someone is guessing your two-step codes" goes to the
  * person and the system admins at most once per person per window, the
  * database deciding (0021). Several processes may run it; an advisory lock
- * makes them take turns. Runs never overlap in one process, the timer
- * doesn't keep the process alive, and failures are logged by class only
+ * that is only tried, never waited for, lets one of them do a run while the
+ * others skip it (S-065). Runs never overlap in one process: a tick that
+ * comes while a run is still going is skipped, not queued, so a run that
+ * hangs never piles up one waiting run per minute (S-065). The timer doesn't
+ * keep the process alive, and failures are logged by class only
  * (`redactedError`), never with an address.
  */
 import {
@@ -15,7 +18,7 @@ import {
 import { redactedError, type ApiLogRecord } from "./staff-api.js";
 
 export interface AlertNoticeRunner {
-  /** Runs once now (waits for a run in progress first). */
+  /** Runs once now (waits for a run in progress first; a tick never queues). */
   runNow(): Promise<void>;
   /** Stops the timer and waits for a run in progress. */
   stop(): Promise<void>;
@@ -61,12 +64,19 @@ export function startAlertNotices(options: AlertNoticeRunnerOptions): AlertNotic
       record({ event: "service_error", operation: "alertNotices", ...redactedError(error) });
     }
   };
+  // Runs asked for and not yet finished (timer ticks and `runNow`).
+  let inFlight = 0;
   const next = (): Promise<void> => {
-    running = running.then(once);
+    inFlight += 1;
+    running = running.then(once).finally(() => {
+      inFlight -= 1;
+    });
     return running;
   };
+  // A tick while a run is going (or waiting to go) is skipped, not queued:
+  // the next one comes in a minute anyway (review L6).
   const timer = setInterval(() => {
-    if (!stopped) void next();
+    if (!stopped && inFlight === 0) void next();
   }, intervalMs);
   timer.unref();
   return {

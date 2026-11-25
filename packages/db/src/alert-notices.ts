@@ -8,7 +8,10 @@
  * `second_step_alert_notices` (0021) what became of every alert:
  *
  * - alerts are read and decided under one transaction-level advisory lock
- *   (classid 85, key 0), so two processes never send the same notice;
+ *   (classid 85, key 0), so two processes never send the same notice; the
+ *   lock is only tried (`pg_try_advisory_xact_lock`): a run that finds it
+ *   taken decides nothing and returns at once, since another process is
+ *   already doing the work (S-065), rather than waiting with no limit;
  *   0021's trigger also takes a per-person lock and refuses a second
  *   `notified` row within the window, and a `folded` row with no reason;
  * - a person with a notice in the window: every new alert of theirs is
@@ -144,7 +147,11 @@ export async function sendSecondStepAlertNotices(
   let decided: { alerts: number; messages: SecondStepAlertMessage[]; notified: number };
   try {
     decided = await inTransaction(db, async (tx) => {
-      await tx.rows(sql`SELECT pg_advisory_xact_lock(85, 0)`);
+      const [lock] = await tx.rows<{ ok: boolean }>(
+        sql`SELECT pg_try_advisory_xact_lock(85, 0) AS ok`,
+      );
+      // Another process is deciding now; it sends what is there (S-065).
+      if (lock?.ok !== true) return { alerts: 0, messages: [], notified: 0 };
       const pending = await tx.rows<PendingAlert>(sql`
         SELECT a.id::text AS id, a.user_id::text AS user_id, a.failures,
                to_char(a.created_at AT TIME ZONE 'UTC', ${ISO}) AS at,

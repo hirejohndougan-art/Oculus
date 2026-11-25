@@ -35,6 +35,19 @@
  * ROLE, RESET SESSION AUTHORIZATION, DISCARD TEMP, DEALLOCATE ALL), and the
  * runner names its table and functions with their schemas, so a file can't
  * change what the next file or the runner's own statements do (D-057).
+ *
+ * Time limits inside a file's transaction (S-065): `statement_timeout` and,
+ * from PostgreSQL 17, `transaction_timeout` are turned off for that
+ * transaction only (`set_config(…, true)`), so a role's or database's limit
+ * can't cancel a long but healthy migration (a table rewrite on a large
+ * catalog). `lock_timeout` is set to `fileLockTimeoutMs` (default 10 s)
+ * instead, so a file that needs a table lock a long reader holds (during an
+ * in-place update the old server keeps serving) gives up quickly rather than
+ * making every other query queue behind it. Such a file is rolled back and
+ * tried again, up to `fileLockAttempts` times (default 5) with a growing
+ * pause; after the last it stops as `file_lock_timeout`, nothing of it
+ * applied. Migrations must stay safe for the previous release to keep
+ * running on (D-118).
  */
 import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
@@ -82,6 +95,7 @@ export class MigrationError extends Error {
       | "out_of_order"
       | "transaction_ended"
       | "lock_timeout"
+      | "file_lock_timeout"
       | "lock_lost"
       | "commit_unknown"
       | "applied_not_recorded"
@@ -198,6 +212,12 @@ export interface MigrateOptions {
   dir?: string;
   /** How long to wait for another runner's lock, in ms (default 60 000). */
   lockTimeoutMs?: number;
+  /** The `lock_timeout` inside each file's transaction, in ms (default 10 000; S-065). */
+  fileLockTimeoutMs?: number;
+  /** How many times a file that timed out on a lock is tried (default 5). */
+  fileLockAttempts?: number;
+  /** The pause after a file's first lock timeout, in ms, doubled each time (default 2 000). */
+  fileLockPauseMs?: number;
   log?: (message: string) => void;
 }
 
@@ -340,7 +360,26 @@ function transactionEnded(file: MigrationFile, prepared: readonly string[]): Mig
   );
 }
 
-async function applyOne(session: Session, lock: Lock, file: MigrationFile): Promise<void> {
+/**
+ * The time limits of a file's transaction (S-065), for this transaction only:
+ * no statement or transaction time limit, and `lockTimeoutMs` for any lock
+ * wait. `transaction_timeout` exists from PostgreSQL 17 (left alone before).
+ */
+async function fileTimeLimits(session: Session, lockTimeoutMs: number): Promise<void> {
+  await session.execute(
+    sql`SELECT pg_catalog.set_config('statement_timeout', '0', true),
+               pg_catalog.set_config('lock_timeout', ${String(lockTimeoutMs)}, true),
+               CASE WHEN pg_catalog.current_setting('transaction_timeout', true) IS NULL THEN NULL
+                    ELSE pg_catalog.set_config('transaction_timeout', '0', true) END`,
+  );
+}
+
+async function applyOne(
+  session: Session,
+  lock: Lock,
+  file: MigrationFile,
+  lockTimeoutMs: number,
+): Promise<void> {
   if (!(await lockHeld(lock))) {
     throw new MigrationError(
       "lock_lost",
@@ -353,6 +392,7 @@ async function applyOne(session: Session, lock: Lock, file: MigrationFile): Prom
   let committed = false;
   await session.control("BEGIN");
   try {
+    await fileTimeLimits(session, lockTimeoutMs);
     // Gives the transaction an ID now, so whether the file ended it can be
     // asked of the server afterwards, whether the file then failed or not.
     const [row] = await session.rows<Started>(
@@ -375,6 +415,9 @@ async function applyOne(session: Session, lock: Lock, file: MigrationFile): Prom
     // Inside the transaction, so a file's SET, prepared statements and
     // temporary tables can't reach the runner's own statements below.
     await resetSession(session);
+    // RESET ALL brought back the role's and database's limits; the deferred
+    // triggers and the COMMIT below are still the file's work.
+    await fileTimeLimits(session, lockTimeoutMs);
     // A PREPARE TRANSACTION in the file changes the transaction ID, so this
     // catches it too.
     if (!(await inRunnersTransaction(session, started))) throw transactionEnded(file, []);
@@ -530,6 +573,20 @@ async function applyOne(session: Session, lock: Lock, file: MigrationFile): Prom
   }
 }
 
+/**
+ * Whether a file failed only because a lock wait passed `lock_timeout`
+ * (55P03), cleanly rolled back: a plain `failed`, never a file that ended
+ * the runner's transaction or lost the lock.
+ */
+function timedOutOnLock(error: unknown): boolean {
+  if (!(error instanceof MigrationError) || error.code !== "failed") return false;
+  return (error.cause as { code?: unknown } | undefined)?.code === "55P03";
+}
+
+function pause(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function resetSession(session: Session): Promise<void> {
   await session.execute(sql`RESET ALL`);
   await session.execute(sql`RESET ROLE`);
@@ -544,6 +601,18 @@ export async function migrate(options: MigrateOptions): Promise<MigrateResult> {
   const lockTimeoutMs = options.lockTimeoutMs ?? 60_000;
   if (!Number.isInteger(lockTimeoutMs) || lockTimeoutMs < 1) {
     throw new TypeError("lockTimeoutMs must be a positive whole number.");
+  }
+  const fileLockTimeoutMs = options.fileLockTimeoutMs ?? 10_000;
+  const fileLockAttempts = options.fileLockAttempts ?? 5;
+  const fileLockPauseMs = options.fileLockPauseMs ?? 2_000;
+  if (!Number.isInteger(fileLockTimeoutMs) || fileLockTimeoutMs < 1) {
+    throw new TypeError("fileLockTimeoutMs must be a positive whole number.");
+  }
+  if (!Number.isInteger(fileLockAttempts) || fileLockAttempts < 1 || fileLockAttempts > 20) {
+    throw new TypeError("fileLockAttempts must be a whole number from 1 to 20.");
+  }
+  if (!Number.isInteger(fileLockPauseMs) || fileLockPauseMs < 0 || fileLockPauseMs > 60_000) {
+    throw new TypeError("fileLockPauseMs must be a whole number from 0 to 60,000.");
   }
   const files = await readMigrations(options.dir ?? defaultMigrationsDir());
   // The lock's own connection: it takes the lock and never runs a file.
@@ -637,7 +706,25 @@ export async function migrate(options: MigrateOptions): Promise<MigrateResult> {
         const pending = pendingMigrations(files, await appliedMigrations(session));
         const applied: string[] = [];
         for (const file of pending) {
-          await applyOne(session, lock, file);
+          for (let attempt = 1; ; attempt += 1) {
+            try {
+              await applyOne(session, lock, file, fileLockTimeoutMs);
+              break;
+            } catch (error) {
+              if (!timedOutOnLock(error)) throw error;
+              if (attempt >= fileLockAttempts) {
+                throw new MigrationError(
+                  "file_lock_timeout",
+                  `${file.name} waited more than ${String(fileLockTimeoutMs)} ms for a lock ${String(attempt)} times (something else, such as a long query, held a table it changes), so it was rolled back each time and nothing of it was applied. Run the migrations again when the database is less busy.`,
+                  { cause: error },
+                );
+              }
+              log(
+                `${file.name} waited too long for a lock and was rolled back; trying again (${String(attempt + 1)} of ${String(fileLockAttempts)}).`,
+              );
+              await pause(fileLockPauseMs * 2 ** (attempt - 1));
+            }
+          }
           applied.push(file.name);
           log(`Applied ${file.name}`);
         }

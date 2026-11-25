@@ -612,8 +612,6 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     scans = setInterval(() => void scan(), FILE_SCAN_EVERY_MS);
     scans.unref();
   }
-  // Started once the server is built, so a start that fails counts nothing.
-  publicSubjects?.start();
   app.server.once("close", () => {
     clearInterval(timer);
     clearInterval(lease);
