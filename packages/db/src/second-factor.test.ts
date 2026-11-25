@@ -1345,7 +1345,9 @@ describe("re-entering the password can't deadlock with a reset (second review)",
       await resetConn.close();
     }
     expect(await deadlocks()).toBe(before);
-  });
+    // Room for the setup's sign-ins plus waitUntilBlockedBy's own 20 s, so a
+    // stuck race reports its clear message, not a bare timeout (U-008).
+  }, 60_000);
 });
 
 describe("a lost race isn't a wrong code", () => {
@@ -1900,7 +1902,9 @@ describe("a system admin's reset", () => {
       await resetter.close();
     }
     expect(await deadlocks()).toBe(before);
-  });
+    // Room for the setup's sign-ins plus waitUntilBlockedBy's own 20 s, so a
+    // stuck race reports its clear message, not a bare timeout (U-008).
+  }, 60_000);
 });
 
 /** Moves a session back in time by `seconds`, as the owner, with its guards off inside the transaction only. */
