@@ -7,7 +7,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - What changed: `packages/api` mail-messages, mail-outbox and mail (SMTP, STARTTLS required, development sender refused in production); reset links, set-up codes and invitations by email, wired into T-048's hooks; the second-step alert notices (migration 0021, one summary per admin per run, longer retries, alerts listed on the Person page and in the frame); the password-changed notice.
 - Decisions: D-085
 - Review: one independent round, no blocking issue; fixed alert loss under credential stuffing and short outages, TLS failure classes, close() deadline, first-send expiry, TLS option order, address-only admin summaries.
-- Gate: PASS · tests_passing 4261 (was 4208) · npm audit clean
+- Gate: PASS · tests_passing 4292 (was 4261, with T-048a merged) · npm audit clean
 - Next: M-002 (finishing), M-003
 
 ## 2026-11-24 21:05 CT — manual (Chat C) — T-048a Admin: System settings
