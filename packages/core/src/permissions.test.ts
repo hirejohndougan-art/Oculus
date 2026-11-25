@@ -220,6 +220,13 @@ describe("System settings", () => {
     expect(v.ok && Object.isFrozen(v.value)).toBe(true);
   });
 
+  it("default to 30 minutes unused (John, Q-8; T-062, D-098), from 5 to 720", () => {
+    expect(DEFAULT_SYSTEM_SETTINGS.sessionIdleMinutes).toBe(30);
+    const idle = (minutes: number) =>
+      validateSystemSettings({ sessionIdleMinutes: minutes, sessionAbsoluteMinutes: 720 }).ok;
+    expect([4, 5, 30, 720, 721].map(idle)).toEqual([false, true, true, true, false]);
+  });
+
   it("refuses missing, unknown, out-of-range, fractional and inconsistent values", () => {
     const code = (input: unknown) => {
       const r = validateSystemSettings(input);

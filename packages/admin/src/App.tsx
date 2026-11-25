@@ -24,6 +24,10 @@ import {
 import { RouterProvider as AriaRouterProvider } from "react-aria-components";
 import { ApiError } from "./api";
 import { endSession, isSessionEnded, isSignInPath } from "./session";
+import { setSessionEnding } from "./idle/unsaved";
+import { announceSignedOut } from "./idle/channel";
+import { ME_KEY } from "./frame/useMe";
+import type { Me } from "./types";
 import { Frame } from "./frame/Frame";
 import { Home } from "./frame/Home";
 import {
@@ -69,6 +73,10 @@ export function makeQueryClient(): QueryClient {
         retry: (count, error) =>
           !(error instanceof ApiError && error.status >= 400 && error.status < 500) && count < 2,
         refetchOnWindowFocus: false,
+        // Not on reconnecting either: such a refetch isn't the person doing
+        // anything, and it would count as a use of the session (T-062,
+        // D-098). Screens refetch when the person acts.
+        refetchOnReconnect: false,
       },
     },
   });
@@ -92,8 +100,14 @@ function SessionWatch() {
     const handler = () => {
       if (handled) return;
       handled = true;
-      void Promise.resolve(navigate("/sign-in", { replace: true })).then(() => {
+      // The session is gone for every tab of this browser (they share the
+      // cookie): tell them (T-062, D-098).
+      announceSignedOut(queries.getQueryData<Me>(ME_KEY)?.sessionMarker, "ended");
+      // An editor with unsaved changes mustn't hold the way to sign in.
+      setSessionEnding(true);
+      void Promise.resolve(navigate("/sign-in", { replace: true })).finally(() => {
         endSession(queries);
+        setSessionEnding(false);
       });
     };
     onSessionEnded = handler;

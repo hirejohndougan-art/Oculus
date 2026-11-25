@@ -2,6 +2,22 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 03:33 CT — manual (Chat A) — T-062 Sign out after a period of no use (John, Q-8)
+- Result: done
+- What changed: idle limit 30 minutes by default; `resolveSession(..., { activity: false })` for background reads; `isActivity` counts only same-origin uses; `idleSeconds` and a session marker in `/api/session` and `/api/me`; admin `idle/` (IdleTimer, IdleGuard, cross-tab channel with per-tab ids and session markers, an unsaved-changes registry); the update screen's status poll is a background read.
+- Decisions: D-098
+- Review: one independent round. Fixed: a never-settling sign-out request left the screen up (now cleared first); cross-site navigations counted as use; manual sign-out not reaching other tabs; a stale tab signing out an active one; header consistency; client counting of 4xx uses; focus fallback and announcements; no guessed limit.
+- Gate: PASS · tests_passing 4812 (was 4756) · npm audit clean
+- Next: M-002 (no automatic deletion), M-003 (thumbnail limits, WebP)
+
+## 2026-11-25 05:10 CT — Chat J — T-041f Shared items on the public sites
+- Result: done
+- What changed: migration 0036 adds `public.shared_record_home` (SECURITY DEFINER, in `PUBLIC_READER_FUNCTIONS`); `readSharedPublicRecord` in workflow.ts reads an accepted item's home public output in one Repeatable Read snapshot; `GET /records/:id` falls back to it and adds `sharedFrom`. `record_public_on_site` is unchanged, so OAI-PMH and subject counts don't list shared items.
+- Decisions: D-111
+- Review: two independent rounds, nothing blocking in either; fixed an ambiguous-ID case (`LIMIT 1` with no order, and a site's own record sharing an ID with a shared one), documented the migration order, the two reads and their cost, and added tests (exact equality with the home output, a moved item reading as the site's own, an accepted item without a stored mapping, and two ID clashes made by direct SQL).
+- Gate: PASS · tests_passing 4756 (was 4745) · npm audit clean (run on main with S-037; main then gained only S-037's progress entry and baseline)
+- Next: the next free job on the board
+
 ## 2026-11-25 05:13 CT — build (BUILD MODE) — S-037 Time limits on the public reader pool
 - Result: done
 - What changed: `readPublicRecord` takes `timeLimitMs` (a transaction-local `statement_timeout`, default 5 s); the public pool waits at most 5 s for a connection (`publicPoolOptions`, `PUBLIC_POOL_SIZE` shared with the read slots); `isDatabaseTimeout` (57014, pg-pool's wait) answers `503 busy` on `GET /records/:id` and OAI-PMH; OAI list pages stop reading after 15 s, or just before a later read that timed out, and end with a resumption token. Tests lock `public.records`, exhaust the pool and cancel reads mid-page. Commits a44f691, 894a758, the second-review fix, c4b899a.
@@ -17,6 +33,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Review: one independent round, nothing blocking; fixed: a role on every site scoped to one unit no longer counts, and a viewer with no managed site sees no one (matching the SQL); unit tests for the rule.
 - Gate: PASS · tests_passing 4734 (was 4729) · npm audit clean · licences all permissive (the e2e step, disturbed by a stopped earlier run, passed on its own: 8 of 8; main then moved by roadmap claims only)
 - Next: nothing claimed
+
 ## 2026-11-25 04:45 CT — upkeep — U-006 Main's gate fails in a clean checkout
 - Result: gate fix
 - What changed: CI's gate on main had failed at lint on every push since M-001 (`files.spec.ts` imports `@oculus/api`, resolved to an unbuilt `dist`); `packages/admin/tsconfig.json` now maps `@oculus/api`, `db` and `service` to their sources (c3f0f46). Also in-major updates: @types/node 26.6.10, @types/react 19.3.2, react-router 8.5.3. TypeScript 7 / Vite 8 rechecked, still blocked (T-001b). Filed U-007 (the gate should start with no `dist`).
@@ -152,6 +169,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Review: n/a (not risky; tests only)
 - Gate: PASS · tests_passing 4376 (was 4372) · npm audit clean
 - Next: the next job in the work board's pool.
+
 ## 2026-11-24 21:20 CT — Chat B — M-001 Serve active file types safely
 - Result: done
 - What changed: `fileReply` (packages/api/src/file-replies.ts) is the only way a handler sends a file's bytes: plain images, audio and video may be shown as their bare type, everything else (HTML, SVG, XML, scripts, PDF, unknown) downloads as `application/octet-stream`; every file reply has nosniff, a sandboxing CSP, same-origin CORP and nothing the handler set; safe RFC 6266/8187 names; streams opened only when sent, outside the handler timeout, within a 2-hour deadline, closed on errors, wrong lengths, hang-ups and shutdown; HEAD opens nothing. HTTP attack tests and a Chromium test that a page on another origin can't run an HTML, SVG or XHTML file's script.

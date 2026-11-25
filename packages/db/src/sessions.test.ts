@@ -580,24 +580,61 @@ describe("promotion needs a proof that only the second step makes", () => {
 });
 
 describe("full sessions", () => {
+  // The default idle limit is 30 minutes since T-062 (D-098; it was 4
+  // hours, D-052): this test follows the default rather than a number.
   it("end after the idle limit, and use keeps them going", async () => {
     await ready();
     const org = await organization();
     const person = await member(org);
     const s = await full(person, org);
-    await age(s.session.sessionId, 4 * 3600 - 60);
+    const idle = DEFAULT_SESSION_POLICY.idleSeconds;
+    expect(s.session.idleSeconds).toBe(idle);
+    await age(s.session.sessionId, idle - 60);
     const used = await resolveSession(db, s.token);
     expect(used.ok).toBe(true);
-    // Just used: another 4 hours from now.
+    // Just used: another idle limit from now.
     await age(s.session.sessionId, 60, { keepLastSeen: true });
     expect((await resolveSession(db, s.token)).ok).toBe(true);
-    await age(s.session.sessionId, 4 * 3600 + 1);
+    await age(s.session.sessionId, idle + 1);
     expect(await resolveSession(db, s.token)).toBe(NO_SESSION);
     // Nothing revives it, even a direct write.
     await expect(
       db.execute(sql`UPDATE public.sessions SET last_seen_at = clock_timestamp()
         WHERE id = ${s.session.sessionId}::uuid`),
     ).rejects.toMatchObject({ constraint: "sessions_ended" });
+  });
+
+  it("aren't kept going by a background lookup (T-062, D-098)", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const s = await full(person, org);
+    const idle = DEFAULT_SESSION_POLICY.idleSeconds;
+    const seen = async () =>
+      (
+        await db.rows<{ t: string }>(sql`
+          SELECT last_seen_at::text AS t FROM public.sessions WHERE id = ${s.session.sessionId}::uuid`)
+      )[0]?.t;
+    await age(s.session.sessionId, idle - 60);
+    const before = await seen();
+    const polled = await resolveSession(db, s.token, { activity: false });
+    expect(polled).toMatchObject({ ok: true, session: { sessionId: s.session.sessionId } });
+    expect(await seen()).toBe(before);
+    // It reports the same idle end as before, not a refreshed one.
+    if (!polled.ok) throw new Error("polled");
+    const end = Date.parse(polled.session.idleExpiresAt);
+    expect(end - Date.now()).toBeLessThan(61_000);
+    // Past the limit with only background lookups: ended for both kinds.
+    await age(s.session.sessionId, 61);
+    expect(await resolveSession(db, s.token, { activity: false })).toBe(NO_SESSION);
+    expect(await resolveSession(db, s.token)).toBe(NO_SESSION);
+    // A waiting session is refused by a background lookup too.
+    const p = await pending(person, org);
+    expect(await resolveSession(db, p.token, { activity: false })).toBe(NO_SESSION);
+    // The option is a boolean, nothing else.
+    await expect(resolveSession(db, s.token, { activity: "no" } as never)).rejects.toThrow(
+      TypeError,
+    );
   });
 
   it("end 12 hours after the password however much they are used", async () => {
@@ -650,13 +687,13 @@ describe("full sessions", () => {
       const changed = ok(
         await writeSystemSettings(
           db,
-          { sessionIdleMinutes: 30, sessionAbsoluteMinutes: 600 },
+          { sessionIdleMinutes: 45, sessionAbsoluteMinutes: 600 },
           before.version,
           admin,
         ),
       );
       const p = await pending(person, org);
-      expect(await limitsOf(p.sessionId)).toEqual({ idle: 1800, absolute: 36_000 });
+      expect(await limitsOf(p.sessionId)).toEqual({ idle: 2700, absolute: 36_000 });
       // A stored document core no longer accepts: the defaults, and the sign-in goes through.
       await db.execute(sql`
         UPDATE public.system_settings
@@ -1750,7 +1787,7 @@ describe("the cleanup", () => {
     const person = await member(org);
     const live = await full(person, org);
     const idle = await full(person, org);
-    await age(idle.session.sessionId, 4 * 3600 + 5);
+    await age(idle.session.sessionId, DEFAULT_SESSION_POLICY.idleSeconds + 5);
     const stalePending = await pending(person, org);
     await age(stalePending.sessionId, 11 * 60);
     const freshPending = await pending(person, org);
