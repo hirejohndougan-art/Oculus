@@ -174,8 +174,19 @@ export interface FullSession {
   readonly signedInAt: string;
   /** The absolute end. */
   readonly expiresAt: string;
-  /** When it ends if not used again (refreshed by this lookup). */
+  /** When it ends if not used again (refreshed by this lookup, unless it was background). */
   readonly idleExpiresAt: string;
+  /**
+   * How long it may sit unused, in seconds: the limit it was made with
+   * (D-069), which the admin's own idle timer follows (T-062, D-098).
+   */
+  readonly idleSeconds: number;
+  /**
+   * Seconds until the idle end by the database's clock, as of this lookup
+   * (whole seconds, rounded down): so the admin can set its timer by the
+   * server without comparing clocks (T-062, D-098).
+   */
+  readonly idleSecondsLeft: number;
   /** When the password was last entered in this session. */
   readonly passwordAt: string;
   /** Whether that was within the window asked for (10 minutes by default). */
@@ -363,6 +374,8 @@ export interface FullRow {
   signed_in_at: string;
   expires_at: string;
   idle_expires_at: string;
+  idle_seconds: number;
+  idle_left: number;
   password_at: string;
   recent: boolean;
 }
@@ -376,6 +389,8 @@ export function fullSession(row: FullRow): FullSession {
     signedInAt: row.signed_in_at,
     expiresAt: row.expires_at,
     idleExpiresAt: row.idle_expires_at,
+    idleSeconds: row.idle_seconds,
+    idleSecondsLeft: row.idle_left,
     passwordAt: row.password_at,
     recentlyAuthenticated: row.recent,
   });
@@ -390,6 +405,10 @@ export function fullColumns(recentSeconds: number) {
     to_char(s.expires_at AT TIME ZONE 'UTC', ${ISO}) AS expires_at,
     to_char(least(s.expires_at, s.last_seen_at + make_interval(secs => s.idle_seconds))
             AT TIME ZONE 'UTC', ${ISO}) AS idle_expires_at,
+    s.idle_seconds,
+    greatest(0, floor(extract(epoch FROM
+      least(s.expires_at, s.last_seen_at + make_interval(secs => s.idle_seconds))
+      - clock_timestamp())))::integer AS idle_left,
     to_char(s.password_at AT TIME ZONE 'UTC', ${ISO}) AS password_at,
     s.password_at > clock_timestamp() - make_interval(secs => ${recentSeconds}) AS recent`;
 }
@@ -740,11 +759,20 @@ export async function promoteSession(
 export interface ResolveOptions extends SessionCallOptions {
   /** The window for `recentlyAuthenticated`: 60 to 3,600 seconds, 600 by default. */
   readonly recentAuthenticationSeconds?: number;
+  /**
+   * Whether this lookup is a use of the session (T-062, D-098): `true` (the
+   * default) moves `last_seen_at` to now; `false`, for a request the admin
+   * marks as background (polling, a check of whether the session is still
+   * alive), checks every limit the same way but leaves `last_seen_at` alone,
+   * so background requests never keep an unattended session going. It can
+   * only make a session end sooner, never later.
+   */
+  readonly activity?: boolean;
 }
 
 /**
- * The full session `token` names, refreshed (`last_seen_at`), or
- * `NO_SESSION`. One statement: the database checks the stage, the absolute
+ * The full session `token` names, refreshed (`last_seen_at`; not for a
+ * background lookup, `activity: false`), or `NO_SESSION`. One statement: the database checks the stage, the absolute
  * and idle limits by its own clock, that the account is active, that the
  * sign-in is after its `sessions_valid_after`, and that it may still work
  * in the session's organization. A session waiting for its second step is
@@ -756,16 +784,25 @@ export async function resolveSession(
   token: unknown,
   options: ResolveOptions = {},
 ): Promise<{ readonly ok: true; readonly session: FullSession } | NoSession | SessionFailure> {
-  const call = callOptions(options, ["recentAuthenticationSeconds"]);
+  const call = callOptions(options, ["recentAuthenticationSeconds", "activity"]);
   const recent = recentWindow(options);
+  const activity = own(options, "activity") ?? true;
+  if (typeof activity !== "boolean") throw new TypeError("activity is true or false.");
   const hash = tokenHash(token);
   if (hash === undefined) return NO_SESSION;
   try {
-    const rows = await db.rows<FullRow>(sql`
+    // The same conditions either way; a background lookup only reads, so
+    // the idle limit keeps counting from the last real use.
+    const rows = activity
+      ? await db.rows<FullRow>(sql`
       UPDATE public.sessions s SET last_seen_at = clock_timestamp()
       FROM public.users u
       WHERE s.token_hash = ${hash} AND ${LIVE_FULL}
-      RETURNING ${fullColumns(recent)}`);
+      RETURNING ${fullColumns(recent)}`)
+      : await db.rows<FullRow>(sql`
+      SELECT ${fullColumns(recent)}
+      FROM public.sessions s JOIN public.users u ON u.id = s.user_id
+      WHERE s.token_hash = ${hash} AND ${LIVE_FULL}`);
     const row = rows[0];
     return row === undefined ? NO_SESSION : { ok: true, session: fullSession(row) };
   } catch (error) {

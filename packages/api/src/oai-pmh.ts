@@ -28,11 +28,14 @@
  * may make `DEFAULT_RATE_LIMITS.oai` requests a minute (429 with
  * `Retry-After`), and a request holds one of the public pool's slots for
  * its whole page, OAI-PMH at most `OAI_MAX_SLOTS` of them (503 `busy` with
- * `Retry-After` when none is free).
+ * `Retry-After` when none is free). A read past its time limit (each
+ * public read's `statement_timeout`, the public pool's wait for a
+ * connection; S-037) is the same `503 busy`.
  */
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { isRecordId } from "@oculus/core";
 import {
+  isDatabaseTimeout,
   listPublishedForOai,
   oaiDatestamp,
   oaiRepository,
@@ -43,7 +46,7 @@ import {
 } from "@oculus/db";
 import { Refusal } from "./errors.js";
 import { oaiPmhReply, OAI_PMH_PROLOGUE } from "./file-replies.js";
-import { clientKey, originOf, ReadSlots } from "./public-api.js";
+import { checkTimeLimit, clientKey, originOf, ReadSlots } from "./public-api.js";
 import type { PublicSite } from "./public-sites.js";
 import { DEFAULT_RATE_LIMITS, SessionRateLimiter, type RateBucket } from "./rate-limit.js";
 import type { OculusRequest, OculusReply, OculusRoute } from "./routes.js";
@@ -56,6 +59,12 @@ export const OAI_ADMIN_EMAIL_ENV = "OCULUS_OAI_ADMIN_EMAIL";
 export const OAI_PAGE_SIZE = 25;
 /** The most listed records one request reads, shown or held back. */
 export const OAI_MAX_SCAN = 200;
+/**
+ * How long one list page may spend reading records (S-037). Past it the page
+ * ends with what it has and a resumption token, so a slow database can't keep
+ * a harvest in a slot for `OAI_MAX_SCAN` reads; at least one is always read.
+ */
+export const OAI_PAGE_TIME_LIMIT_MS = 15_000;
 /** The most of the public pool's slots OAI-PMH holds at once. */
 export const OAI_MAX_SLOTS = 2;
 
@@ -78,6 +87,10 @@ export interface OaiPmhOptions {
   readonly clock?: () => number;
   /** The public pool's slots, shared with `GET /records/:id`. */
   readonly slots?: ReadSlots;
+  /** Each record read's statement time limit (S-037); `readPublicRecord`'s default when left out. */
+  readonly timeLimitMs?: number;
+  /** A list page's reading time (S-037); `OAI_PAGE_TIME_LIMIT_MS` when left out. */
+  readonly pageTimeLimitMs?: number;
 }
 
 /** An address fit for `adminEmail`, or undefined: plain, short, nothing XML must escape. */
@@ -368,6 +381,11 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
   const slots = options.slots ?? new ReadSlots(4);
   // OAI-PMH may hold at most two of the shared slots, so harvests (each
   // up to OAI_MAX_SCAN reads) never leave `GET /records/:id` without one.
+  checkTimeLimit(options.timeLimitMs);
+  const pageTimeLimitMs = options.pageTimeLimitMs ?? OAI_PAGE_TIME_LIMIT_MS;
+  if (!Number.isInteger(pageTimeLimitMs) || pageTimeLimitMs < 1 || pageTimeLimitMs > 120_000) {
+    throw new RangeError("pageTimeLimitMs must be a whole number from 1 to 120000");
+  }
   const oaiSlots = new ReadSlots(Math.max(1, Math.min(OAI_MAX_SLOTS, slots.size - 1)));
   const tokens = new TokenSeal();
   const adminEmail = oaiAdminEmail(options.adminEmail);
@@ -379,6 +397,7 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
     if (!isRecordId(id)) return undefined;
     const result = await readPublicRecord(options.publicDb, site.organizationId, site.siteId, id, {
       baseUrl: `${site.origin}/records/`,
+      ...(options.timeLimitMs === undefined ? {} : { timeLimitMs: options.timeLimitMs }),
     });
     return result.ok ? result.value : undefined;
   }
@@ -497,7 +516,9 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
     let after = cursor.after;
     let scanned = 0;
     let exhausted = false;
-    while (shown.length < OAI_PAGE_SIZE && scanned < OAI_MAX_SCAN && !exhausted) {
+    let outOfTime = false;
+    const deadline = Date.now() + pageTimeLimitMs;
+    while (shown.length < OAI_PAGE_SIZE && scanned < OAI_MAX_SCAN && !exhausted && !outOfTime) {
       const want = Math.min(OAI_PAGE_SIZE - shown.length + 5, OAI_MAX_SCAN - scanned);
       const candidates = await listPublishedForOai(options.db, site.organizationId, site.siteId, {
         ...cursor.window,
@@ -510,15 +531,37 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
           exhausted = false;
           break;
         }
-        scanned += 1;
-        after = candidate;
+        if (scanned > 0 && Date.now() >= deadline) {
+          // Out of time (S-037): this candidate and the rest come on the next page.
+          exhausted = false;
+          outOfTime = true;
+          break;
+        }
         if (candidate.deleted === true) {
-          // Stopped being shown: a deleted header, in both lists (OAI-PMH §2.5.1).
+          // Stopped being shown (S-041): a deleted header, in both lists
+          // (OAI-PMH §2.5.1); nothing to read.
+          scanned += 1;
+          after = candidate;
           const gone = header(host, candidate.id, candidate.stamp, true);
           shown.push(verb === "ListIdentifiers" ? gone : `<record>\n${gone}\n</record>`);
           continue;
         }
-        const output = await publicRecord(site, candidate.id);
+        let output: Awaited<ReturnType<typeof publicRecord>>;
+        try {
+          output = await publicRecord(site, candidate.id);
+        } catch (thrown) {
+          // A read past the page's first that ran out of time (S-037): the
+          // page ends before this candidate, which is read first next time,
+          // so one slow read is retried instead of failing the page. The
+          // page's first read timing out is the request's 503 busy.
+          if (scanned === 0 || !isDatabaseTimeout(thrown)) throw thrown;
+          exhausted = false;
+          outOfTime = true;
+          break;
+        }
+        // Only now: `after` (the token's place) moves past this candidate.
+        scanned += 1;
+        after = candidate;
         if (output === undefined) continue;
         shown.push(
           verb === "ListIdentifiers"
@@ -618,6 +661,12 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
           echoed = { verb, ...args };
           body = await answer(site, host, verb, args, baseUrl);
         } catch (thrown) {
+          if (isDatabaseTimeout(thrown)) {
+            // A time limit ran out (S-037): busy, as when no slot is free.
+            log({ event: "service_error", operation: "oaiPmh", name: "timeout" });
+            reply.status(503).header("retry-after", "5");
+            return { error: "busy" };
+          }
           if (!(thrown instanceof OaiFailure)) {
             log({
               event: "service_error",

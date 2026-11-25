@@ -22,6 +22,7 @@ import { buildAdminServer, defaultLog } from "./admin-server.js";
 import { startAlertNotices, type AlertNoticeRunner } from "./alert-notices.js";
 import { mailerFromEnv, type Mailer } from "./mail.js";
 import { PUBLIC_DATABASE_URL_ENV } from "./public-sites.js";
+import { publicPoolOptions } from "./public-api.js";
 
 const DATABASE_URL_VARIABLE = "OCULUS_DATABASE_URL";
 
@@ -52,7 +53,7 @@ export async function runAdminCli(
   let publicDb: ReturnType<typeof openDatabase> | undefined;
   if (publicUrl !== undefined && publicUrl.trim() !== "") {
     try {
-      publicDb = openDatabase(publicUrl, { applicationName: "oculus-public", max: 4 });
+      publicDb = openDatabase(publicUrl, publicPoolOptions());
     } catch {
       await db.close();
       err(`${PUBLIC_DATABASE_URL_ENV} is not a usable postgresql:// URL (its value is not shown).`);
