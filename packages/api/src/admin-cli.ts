@@ -71,6 +71,8 @@ export async function runAdminCli(
   };
   let mailer: Mailer | undefined;
   let notices: AlertNoticeRunner | undefined;
+  // Closed on a failed start too, so the Subjects counts stop before the pools (S-038).
+  let built: { close: () => Promise<unknown> } | undefined;
   try {
     mailer = mailerFromEnv(env, { log: defaultLog });
     // After an update with OCULUS_UPDATE_RESTART=exit (T-060, D-092): stop
@@ -96,6 +98,7 @@ export async function runAdminCli(
       ...(publicDb === undefined ? {} : { publicDb }),
       ...(countsDb === undefined ? {} : { countsDb }),
     });
+    built = app;
     // "Someone is guessing your two-step codes" (D-077, D-085), every minute.
     const outbox = mailer.outbox;
     notices = startAlertNotices({
@@ -116,6 +119,7 @@ export async function runAdminCli(
     await app.listen({ host: env.OCULUS_HOST ?? "127.0.0.1", port });
     return undefined;
   } catch (error) {
+    await built?.close().catch(() => undefined);
     await notices?.stop();
     await mailer?.close();
     await closePools();

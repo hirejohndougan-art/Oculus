@@ -1028,6 +1028,13 @@ describe("public subject counts come from public output only (T-034d, D-095)", (
     expect(afterCreate).not.toBe(before);
     ok(await service.publish(ctx(org), made.record.id, { expectedVersion: 1 }));
     expect(await publicOutputMarker(s.writer, org)).not.toBe(afterCreate);
+    // An identifier type's edit moves it, even with its timestamp unchanged (its row version moves).
+    const beforeType = await publicOutputMarker(s.writer, org);
+    await s.owner.execute(
+      sql`UPDATE public.identifier_types SET updated_at = updated_at
+          WHERE organization_id = ${org}::uuid`,
+    );
+    expect(await publicOutputMarker(s.writer, org)).not.toBe(beforeType);
     // Another organization's changes don't move it.
     const other = await organization();
     const mark = await publicOutputMarker(s.writer, org);

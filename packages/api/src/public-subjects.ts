@@ -9,15 +9,19 @@
  * each public site. `GET /subjects` on a public host answers from that
  * result alone and never touches the database.
  *
- * Refreshing: every `checkEveryMs` (default a minute) the cache reads a
- * cheap marker of what public output depends on (`publicOutputMarker`: the
- * organization's record versions, mappings, templates and identifier
- * types). When it changed since the last count, or the last count is older
- * than `maxAgeMs` (default an hour), the site is counted again. Publishing,
- * withdrawing and editing a published record each write a record version,
- * so each moves the marker. Until the new count is done, and whenever a count
- * is refused (too many records, too slow) or fails, the last good result is
- * still served.
+ * Refreshing: every `checkEveryMs` (default a minute) the cache reads, once
+ * per organization, a marker of what public output depends on
+ * (`publicOutputMarker`: record versions and identifiers, mappings,
+ * templates, identifier types). When it moved since the counts served were
+ * made, the site is counted again, at most once every `minGapMs` (default
+ * five minutes, so busy cataloguing doesn't mean back-to-back recounts);
+ * without a change, once the counts are `maxAgeMs` old (default an hour).
+ * Meanwhile the last good result is served, but only for `staleMs` (default
+ * 30 minutes) after a change it doesn't reflect, and never past a day: a
+ * withdrawn record's subject mustn't stay up because recounts keep being
+ * refused. A recount whose public result is unchanged keeps its `asOf`, so
+ * the public can't watch staff work. `stop()` stops a count at its next
+ * record.
  *
  * Staff see, through `/api/sites/:id/public-subjects` (staff-api.ts), when
  * the counts were made and how many of the site's public records were left
@@ -47,8 +51,15 @@ export interface PublicSubjectsOptions {
   readonly clock?: () => number;
   /** How often to look for changes (default 60 000 ms). */
   readonly checkEveryMs?: number;
+  /** At most one count per site this often, changes or not (default 300 000 ms). */
+  readonly minGapMs?: number;
   /** Count again after this long even without a change (default 3 600 000 ms). */
   readonly maxAgeMs?: number;
+  /**
+   * Stop showing counts a change has made out of date after this long
+   * without a good recount (default 1 800 000 ms); then `/subjects` is 503.
+   */
+  readonly staleMs?: number;
   /** Each count's time limit (default 120 000 ms; `publicTermCounts`' ceiling is 300 000). */
   readonly timeLimitMs?: number;
 }
@@ -72,16 +83,25 @@ export interface PublicSubjectsStatus {
   /** The last count that didn't finish, if it came after the counts served. */
   readonly lastProblem: { readonly code: string; readonly at: string } | null;
   readonly counting: boolean;
+  /** Whether a public host shows the counts now (false: none yet, or too far out of date). */
+  readonly shown: boolean;
+}
+
+interface Good extends PublicSubjectsResult {
+  readonly at: number;
+  /** The marker the counts were made at. */
+  readonly marker: string;
+  readonly leftOut: Readonly<Record<string, number>>;
+  readonly recordsLeftOut: number;
 }
 
 interface SiteState {
   readonly site: PublicSite;
-  good?: PublicSubjectsResult & {
-    readonly at: number;
-    readonly leftOut: Readonly<Record<string, number>>;
-    readonly recordsLeftOut: number;
-  };
-  marker?: string;
+  good?: Good | undefined;
+  /** The last count attempted, good or not. */
+  lastAttempt?: number | undefined;
+  /** When a change the counts served don't reflect was first seen. */
+  changedSince?: number | undefined;
   problem?: { code: string; at: number } | undefined;
   counting: boolean;
 }
@@ -94,7 +114,9 @@ export class PublicSubjects {
   private readonly log: (record: ApiLogRecord) => void;
   private readonly clock: () => number;
   private readonly checkEveryMs: number;
+  private readonly minGapMs: number;
   private readonly maxAgeMs: number;
+  private readonly staleMs: number;
   private readonly timeLimitMs: number;
   private timer: ReturnType<typeof setTimeout> | undefined;
   private running: Promise<void> | undefined;
@@ -113,7 +135,9 @@ export class PublicSubjects {
     this.log = options.log ?? (() => undefined);
     this.clock = options.clock ?? Date.now;
     this.checkEveryMs = whole(options.checkEveryMs ?? 60_000, 1000, 86_400_000, "checkEveryMs");
+    this.minGapMs = whole(options.minGapMs ?? 300_000, 0, 86_400_000, "minGapMs");
     this.maxAgeMs = whole(options.maxAgeMs ?? 3_600_000, 1000, 604_800_000, "maxAgeMs");
+    this.staleMs = whole(options.staleMs ?? 1_800_000, 1000, 86_400_000, "staleMs");
     this.timeLimitMs = whole(options.timeLimitMs ?? 120_000, 1, 300_000, "timeLimitMs");
   }
 
@@ -133,75 +157,141 @@ export class PublicSubjects {
     this.timer.unref();
   }
 
-  /** Stops the checks and waits for a count in progress to end. */
+  /**
+   * Stops the checks: a count in progress stops at its next record, and no
+   * check starts again. Resolves once nothing runs on the pool.
+   */
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.timer !== undefined) clearTimeout(this.timer);
     this.timer = undefined;
     await this.running;
+    await Promise.all([...this.inFlight]);
   }
 
-  /** One pass over every public site: count the ones that changed or are old. */
+  private readonly inFlight = new Set<Promise<void>>();
+
+  /** One pass: the marker once per organization, then each site that needs a count. */
   async check(): Promise<void> {
-    for (const state of this.states.values()) {
-      if (this.stopped) return;
-      await this.checkSite(state);
+    if (this.stopped) return;
+    const pass = this.pass();
+    this.inFlight.add(pass);
+    try {
+      await pass;
+    } finally {
+      this.inFlight.delete(pass);
     }
   }
 
-  private async checkSite(state: SiteState): Promise<void> {
-    if (state.counting) return;
+  private async pass(): Promise<void> {
+    const markers = new Map<string, string | Error>();
+    for (const state of this.states.values()) {
+      if (this.stopped) return;
+      const org = state.site.organizationId;
+      if (!markers.has(org)) {
+        try {
+          markers.set(org, await publicOutputMarker(this.options.db, org));
+        } catch (error) {
+          markers.set(org, error instanceof Error ? error : new Error("unknown"));
+        }
+      }
+      const marker = markers.get(org);
+      if (marker instanceof Error || marker === undefined) {
+        this.failed(state, marker);
+        continue;
+      }
+      await this.checkSite(state, marker);
+    }
+  }
+
+  private failed(state: SiteState, error: Error | undefined): void {
+    const now = this.clock();
+    state.problem = { code: "unavailable", at: now };
+    state.lastAttempt = now;
+    // Whether anything changed is unknown now: treat it as changed, so the
+    // counts aren't served stale forever.
+    state.changedSince ??= now;
+    this.log({
+      event: "service_error",
+      operation: "publicSubjects",
+      name: error?.constructor.name.slice(0, 40) ?? "unknown",
+    });
+  }
+
+  private async checkSite(state: SiteState, marker: string): Promise<void> {
+    if (state.counting || this.stopped) return;
+    const now = this.clock();
+    const good = state.good;
+    if (good?.marker === marker) {
+      state.changedSince = undefined;
+    } else {
+      state.changedSince ??= now;
+    }
+    const since = now - (state.lastAttempt ?? -Infinity);
+    const due =
+      good === undefined
+        ? // No counts yet: try at once, then (refused or failed) every minGap.
+          state.lastAttempt === undefined || since >= this.minGapMs
+        : state.changedSince !== undefined
+          ? // A change: count again, at most once every minGap.
+            since >= this.minGapMs
+          : // No change: only once the counts are old.
+            now - good.at >= this.maxAgeMs && since >= this.minGapMs;
+    if (!due) return;
     state.counting = true;
+    state.lastAttempt = now;
     const { organizationId, siteId, origin } = state.site;
     try {
-      // Read before counting, so a change made during the count is seen next time.
-      const marker = await publicOutputMarker(this.options.db, organizationId);
-      // The last attempt, good or refused: a refused count (too many
-      // records, too slow) isn't tried again every minute, only after a
-      // change or once it is old.
-      const last = Math.max(state.good?.at ?? -Infinity, state.problem?.at ?? -Infinity);
-      const old = this.clock() - last >= this.maxAgeMs;
-      if (!old && marker === state.marker) return;
-      const result = await publicTermCountsForStaff(this.options.db, organizationId, siteId, {
-        baseUrl: `${origin}/records/`,
-        terms: SUBJECT_TERMS,
-        timeLimitMs: this.timeLimitMs,
-      });
-      const now = this.clock();
+      const result = await publicTermCountsForStaff(
+        this.options.db,
+        organizationId,
+        siteId,
+        { baseUrl: `${origin}/records/`, terms: SUBJECT_TERMS, timeLimitMs: this.timeLimitMs },
+        { shouldStop: () => this.stopped },
+      );
+      const done = this.clock();
       if (!result.ok) {
-        state.problem = { code: result.issues[0]?.code ?? "refused", at: now };
-        state.marker = marker;
+        state.problem = { code: result.issues[0]?.code ?? "refused", at: done };
         return;
       }
+      const counts = result.value.counts;
+      // The same public result keeps its asOf: a recount after staff work
+      // that changed nothing public shows nothing (review of S-038).
+      const same =
+        good?.recordsCounted === counts.recordsCounted &&
+        JSON.stringify(good.counts) === JSON.stringify(counts.counts);
       state.good = Object.freeze({
-        counts: result.value.counts.counts,
-        recordsCounted: result.value.counts.recordsCounted,
-        asOf: second(now),
-        at: now,
+        counts: counts.counts,
+        recordsCounted: counts.recordsCounted,
+        asOf: same ? good.asOf : second(done),
+        at: done,
+        marker,
         leftOut: result.value.leftOut,
         recordsLeftOut: result.value.recordsLeftOut,
       });
       state.problem = undefined;
-      state.marker = marker;
+      state.changedSince = undefined;
     } catch (error) {
-      // Keep the last good result; try again at the next check.
-      state.problem = { code: "unavailable", at: this.clock() };
-      this.log({
-        event: "service_error",
-        operation: "publicSubjects",
-        name: error instanceof Error ? error.constructor.name.slice(0, 40) : "unknown",
-      });
+      this.failed(state, error instanceof Error ? error : undefined);
     } finally {
       state.counting = false;
     }
   }
 
-  /** What a public host's Subjects page shows, or undefined before the first count. */
+  /**
+   * What a public host's Subjects page shows; null when there are no counts
+   * to show: none yet, or the ones made have been out of step with a change
+   * for longer than `staleMs` (a withdrawn record's subject mustn't stay up
+   * because recounts keep failing), or are a day old.
+   */
   forOrigin(origin: string): PublicSubjectsResult | null | undefined {
     const state = this.byOrigin.get(origin);
     if (state === undefined) return undefined;
     const good = state.good;
     if (good === undefined) return null;
+    const now = this.clock();
+    if (state.changedSince !== undefined && now - state.changedSince > this.staleMs) return null;
+    if (now - good.at > MAX_SERVED_MS) return null;
     return { counts: good.counts, recordsCounted: good.recordsCounted, asOf: good.asOf };
   }
 
@@ -221,9 +311,13 @@ export class PublicSubjects {
       leftOut: good?.leftOut ?? {},
       lastProblem: problem,
       counting: state.counting,
+      shown: this.forOrigin(state.site.origin) !== null,
     };
   }
 }
+
+/** Counts older than this are never shown, whatever happened since (a day). */
+const MAX_SERVED_MS = 86_400_000;
 
 function whole(value: number, min: number, max: number, name: string): number {
   if (!Number.isInteger(value) || value < min || value > max) {

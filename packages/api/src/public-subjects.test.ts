@@ -6,7 +6,7 @@
 // public records were left out and why. Every person and record is invented.
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { csrfTokenFor, type OrganizationId, type UserId } from "@oculus/core";
-import { insertTemplateVersion, openDatabase, type Database } from "@oculus/db";
+import { insertTemplateVersion, openDatabase, sql, type Database } from "@oculus/db";
 import type { FastifyInstance } from "fastify";
 import { OCULUS_COOKIES } from "./cookies.js";
 import { PublicSubjects, publicSubjectsRoutes } from "./public-subjects.js";
@@ -95,7 +95,7 @@ beforeAll(async () => {
   await publishAs(w, w.a, held.id);
 
   site = { origin: PUBLIC, siteId: w.a1, organizationId: w.a };
-  subjects = new PublicSubjects({ db: counts, sites: [site], clock: () => now });
+  subjects = new PublicSubjects({ db: counts, sites: [site], clock: () => now, minGapMs: 0 });
   pub = await buildServer({
     env: { OCULUS_ORIGINS: PUBLIC },
     routes: publicSubjectsRoutes({ subjects }),
@@ -196,10 +196,48 @@ describe("GET /subjects on a public host", () => {
     const after = (await get()).json<{ subjects: { label: string }[]; asOf: string }>();
     expect(after.subjects.map((s) => s.label)).toContain("Buoys");
     expect(after.asOf).not.toBe(first);
-    // Old counts are made again even with no change.
-    now += 3_600_000;
+    // A draft saved elsewhere moves the marker, but the public result is the
+    // same, so its asOf doesn't move: the public can't watch staff work.
+    await subjectRecord(w.a2, "An invented draft elsewhere", [term("Draft term")], false);
+    now += 60_000;
     await subjects.check();
-    expect((await get()).json<{ asOf: string }>().asOf).not.toBe(after.asOf);
+    expect((await get()).json<{ asOf: string }>().asOf).toBe(after.asOf);
+    // Withdrawing takes the record's subject away at the next count.
+    const buoy =
+      (
+        await w.db.rows<{ id: string }>(
+          sql`SELECT id::text AS id FROM public.records WHERE title = 'An invented buoy'`,
+        )
+      )[0]?.id ?? "";
+    ok(
+      await w.service.withdraw({ organizationId: w.a, actor: actorOf(w.root) }, buoy as never, {
+        expectedVersion: 2,
+      }),
+    );
+    now += 60_000;
+    await subjects.check();
+    expect(JSON.stringify((await get()).json())).not.toContain("Buoys");
+  });
+
+  it("waits minGapMs between counts after a change, and counts old results again only when due", async () => {
+    let t = now;
+    const gap = new PublicSubjects({
+      db: counts,
+      sites: [site],
+      clock: () => t,
+      minGapMs: 300_000,
+    });
+    await gap.check();
+    const first = gap.statusFor(w.a, w.a1)?.asOf;
+    await subjectRecord(w.a1, "An invented anchor", [term("Anchors")]);
+    t += 60_000;
+    await gap.check();
+    expect(JSON.stringify(gap.forOrigin(PUBLIC))).not.toContain("Anchors");
+    t += 300_000;
+    await gap.check();
+    expect(JSON.stringify(gap.forOrigin(PUBLIC))).toContain("Anchors");
+    expect(gap.statusFor(w.a, w.a1)?.asOf).not.toBe(first);
+    await gap.stop();
   });
 
   it("keeps the last good result when a count fails, and says so to staff", async () => {
@@ -215,11 +253,16 @@ describe("GET /subjects on a public host", () => {
     const good = own.forOrigin(PUBLIC);
     expect(good?.recordsCounted).toBeGreaterThan(0);
     await pool.close();
-    now += 3_600_000;
+    now += 60_000;
     await own.check();
+    // For a while the last good counts are still shown...
     expect(own.forOrigin(PUBLIC)).toEqual(good);
     expect(own.statusFor(w.a, w.a1)?.lastProblem?.code).toBe("unavailable");
     expect(logged).toContain("service_error");
+    // ...but not once they may be out of date for longer than staleMs.
+    now += 1_800_001;
+    expect(own.forOrigin(PUBLIC)).toBeNull();
+    expect(own.statusFor(w.a, w.a1)?.shown).toBe(false);
     await own.stop();
   });
 });
@@ -258,6 +301,16 @@ describe("PublicSubjects", () => {
     quiet.start();
     await new Promise((resolve) => setTimeout(resolve, 50));
     await quiet.stop();
-    expect(quiet.forOrigin(PUBLIC)?.recordsCounted).toBeGreaterThan(0);
+    // Stopped: a check does nothing, so nothing runs on a closed pool.
+    await quiet.check();
+  });
+
+  it("stop() ends a count in progress at its next record", async () => {
+    const slow = new PublicSubjects({ db: counts, sites: [site] });
+    const pass = slow.check();
+    await slow.stop();
+    await pass;
+    // Either finished first or stopped: never left running.
+    expect(slow.statusFor(w.a, w.a1)?.counting).toBe(false);
   });
 });

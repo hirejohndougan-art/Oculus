@@ -92,6 +92,12 @@ export interface PublicTermCountOptions {
   readonly timeLimitMs?: number;
 }
 
+/** What only a server-side caller may add (S-038): a way to stop a count early. */
+export interface StaffCountControl {
+  /** Checked before each record; true stops the count, refused as `stopped`. */
+  readonly shouldStop?: () => boolean;
+}
+
 function refused<T>(
   path: readonly (string | number)[],
   code: string,
@@ -149,6 +155,7 @@ function readOptions(options: unknown): Validated<ReadOptions> {
   let fields: ReadonlySet<string> | undefined;
   if (Object.hasOwn(options, "fields")) {
     const fieldList = own(options, "fields");
+    if (fieldList === undefined) return bad();
     if (!Array.isArray(fieldList) || fieldList.length > 200 || !fieldList.every(isFieldKey)) {
       return refused(["fields"], "invalid_fields", "fields must be a list of field keys.");
     }
@@ -214,6 +221,7 @@ export async function publicTermCountsForStaff(
   organizationId: OrganizationId,
   siteId: SiteId,
   options: PublicTermCountOptions,
+  control: StaffCountControl = {},
 ): Promise<Validated<PublicTermCountsForStaff>> {
   if (!isOrganizationId(organizationId) || !isSiteId(siteId)) {
     return refused([], "not_available", "This record is not available.");
@@ -221,7 +229,7 @@ export async function publicTermCountsForStaff(
   const read = readOptions(options);
   if (!read.ok) return read;
   try {
-    return await countIn(db, organizationId, siteId, read.value);
+    return await countIn(db, organizationId, siteId, read.value, control.shouldStop);
   } catch (error) {
     // The statement timeout cancelled a read (57014): the same refusal as the deadline.
     if ((error as { code?: unknown } | null)?.code === QUERY_CANCELED) return tooSlow();
@@ -240,6 +248,7 @@ async function countIn(
   organizationId: OrganizationId,
   siteId: SiteId,
   { baseUrl, mappings, fields, terms, timeLimitMs }: ReadOptions,
+  shouldStop: (() => boolean) | undefined,
 ): Promise<Validated<PublicTermCountsForStaff>> {
   const deadline = Date.now() + timeLimitMs;
   return db.transaction(async (tx) => {
@@ -278,6 +287,7 @@ async function countIn(
     let leftOutRecords = 0;
     const leftOut = new Map<string, number>();
     for (const id of ids) {
+      if (shouldStop?.() === true) return refused([], "stopped", "The count was stopped.");
       if (!(await remaining())) return tooSlow();
       const one = await publicRecordIn(tx, organizationId, siteId, id, baseUrl, mappings);
       // What the public output refuses shows nothing, so it counts for nothing.
@@ -399,26 +409,33 @@ function keyOf(term: ShownTerm): string {
 /**
  * A marker that changes whenever something a site's public output reads may
  * have changed in the organization (S-038): a record's version (every edit,
- * publish and withdraw writes one), a stored mapping, a template version, an
- * identifier type. Cheap (indexed maxima and counts); compared, never shown.
+ * publish and withdraw writes one), its identifiers (saved without a new
+ * version), a stored mapping, a template version, an identifier type.
+ * Compared, never shown. Counts and versions catch every insert and delete;
+ * the row versions (`xmin`) catch every update, whatever its `now()` (a
+ * transaction's start, so a timestamp can go backwards). Its cost grows with
+ * the organization's rows in those tables (one index-only or sequential pass
+ * each, a minute apart).
  */
 export async function publicOutputMarker(
   db: Database,
   organizationId: OrganizationId,
 ): Promise<string> {
   if (!isOrganizationId(organizationId)) throw new TypeError("not an organization ID");
+  const org = organizationId;
   const [row] = await db.rows<{ marker: string }>(sql`
     SELECT concat_ws('|',
-      -- The count too: a version written by a transaction that began
-      -- before the latest one can carry an older recorded_at.
       (SELECT count(*)::text || ':' || coalesce(max(recorded_at)::text, '')
-         FROM public.record_versions WHERE organization_id = ${organizationId}::uuid),
-      (SELECT count(*)::text || ':' || coalesce(max(changed_at)::text, '')
-         FROM public.dublin_core_mappings WHERE organization_id = ${organizationId}::uuid),
-      (SELECT count(*)::text FROM public.template_versions
-        WHERE organization_id = ${organizationId}::uuid),
-      (SELECT count(*)::text || ':' || coalesce(max(updated_at)::text, '')
-         FROM public.identifier_types WHERE organization_id = ${organizationId}::uuid)
+         FROM public.record_versions WHERE organization_id = ${org}::uuid),
+      (SELECT count(*)::text || ':' || coalesce(sum(version), 0)::text
+         FROM public.dublin_core_mappings WHERE organization_id = ${org}::uuid),
+      (SELECT count(*)::text FROM public.template_versions WHERE organization_id = ${org}::uuid),
+      (SELECT count(*)::text || ':' || coalesce(sum(xmin::text::numeric), 0)::text
+         FROM public.identifier_types WHERE organization_id = ${org}::uuid),
+      (SELECT count(*)::text || ':' || coalesce(sum(xmin::text::numeric), 0)::text
+         FROM public.record_identifiers WHERE organization_id = ${org}::uuid),
+      (SELECT count(*)::text || ':' || coalesce(sum(xmin::text::numeric), 0)::text
+         FROM public.former_identifiers WHERE organization_id = ${org}::uuid)
     ) AS marker`);
   return row?.marker ?? "";
 }
