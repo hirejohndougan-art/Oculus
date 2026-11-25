@@ -91,7 +91,6 @@ import {
   readRecordPlace,
   readRecordsUsingTemplate,
   readDublinCoreMapping as readStoredMapping,
-  readRecordIdentifiers,
   readRecordsForChecks,
   readTemplate as readStoredTemplate,
   updateIdentifierType,
@@ -789,8 +788,26 @@ export function definitionOperations(run: Runner): DefinitionOperations {
         const org = who.organizationId;
         const access = await writerAccess(tx, who);
         if (!access.ok) return access;
-        const opts = readOptions(saveOptions, ["expectedTag", "confirm", "confirmPublished"]);
+        const opts = readOptions(saveOptions, [
+          "expectedTag",
+          "confirm",
+          "confirmPublished",
+          "confirmDropped",
+        ]);
         if (!opts.ok) return opts;
+        const confirmDropped = opts.value.confirmDropped;
+        if (
+          confirmDropped !== undefined &&
+          (!Array.isArray(confirmDropped) ||
+            confirmDropped.length > 10_000 ||
+            !confirmDropped.every((id) => typeof id === "string"))
+        ) {
+          return refusal(
+            ["options", "confirmDropped"],
+            "invalid_option",
+            "confirmDropped lists the IDs of the published records the change takes off public sites.",
+          );
+        }
         const expectedTag = opts.value.expectedTag;
         if (expectedTag !== null && (typeof expectedTag !== "string" || !TAG.test(expectedTag))) {
           return refusal(
@@ -885,7 +902,7 @@ export function definitionOperations(run: Runner): DefinitionOperations {
         // lock, which publishing waits on), and listed in the confirmation;
         // the confirmations themselves still come from the call above.
         let dropped: readonly RecordId[] = [];
-        let formatMessage: string | undefined;
+        let formatSuffix = "";
         if (compared.value.changes.some((c) => c.code === "format_changed")) {
           const holders = await publishedHoldingType(tx, org, type.key);
           if (holders === undefined) {
@@ -896,16 +913,16 @@ export function definitionOperations(run: Runner): DefinitionOperations {
             );
           }
           if (holders.length > 0) {
+            // Which published records drop off is read from their public
+            // fields' `{ type, value }` (core's publishedMisfits), so the
+            // records and templates are all it needs; identifier sets would
+            // only feed a count of misfits among these records, which isn't
+            // asked (the message below keeps core's unchecked wording).
             const records = await readRecordsForChecks(tx, org, holders);
-            const identifiers = [];
-            for (const id of holders) {
-              const set = await readRecordIdentifiers(tx, org, id);
-              if (set?.ok === true) identifiers.push(set.value);
-            }
             const templates = (await listStoredTemplates(tx, org)).map((t) => t.template);
             const withUse = identifierTypeChanges(old, type, {
               identifierTypes: types.value,
-              identifiers,
+              identifiers: [],
               records,
               templates,
               published: holders,
@@ -914,7 +931,10 @@ export function definitionOperations(run: Runner): DefinitionOperations {
             if (!withUse.ok) return withUse;
             const formatChange = withUse.value.changes.find((c) => c.code === "format_changed");
             dropped = formatChange?.publishedRecordIds ?? [];
-            if (dropped.length > 0) formatMessage = formatChange?.message;
+          }
+          if (dropped.length > 0) {
+            const n = dropped.length;
+            formatSuffix = ` ${n === 1 ? "1 published record" : `${String(n)} published records`} would show as not available on public sites until ${n === 1 ? "its number is" : "their numbers are"} fixed.`;
           }
         }
         const needed = compared.value.changes
@@ -922,10 +942,7 @@ export function definitionOperations(run: Runner): DefinitionOperations {
           .map((c) => ({
             code: c.code,
             key: c.type,
-            message:
-              c.code === "format_changed" && formatMessage !== undefined
-                ? formatMessage
-                : c.message,
+            message: c.code === "format_changed" ? `${c.message}${formatSuffix}` : c.message,
           }));
         const madePublic = compared.value.changes.some((c) => c.code === "made_public");
         const affected = madePublic ? await publishedHoldingType(tx, org, type.key) : [];
@@ -947,6 +964,26 @@ export function definitionOperations(run: Runner): DefinitionOperations {
         const notConfirmed = unconfirmed(needed, confirm.value);
         if (notConfirmed.length > 0) {
           return { ok: false, issues: [...notConfirmed, ...droppedIssues] };
+        }
+        // The confirmation is tied to the list: exactly these records,
+        // as read now. A confirmation sent before seeing them, or before a
+        // record was published meanwhile, asks again.
+        const listed = new Set(Array.isArray(confirmDropped) ? (confirmDropped) : []);
+        if (
+          dropped.length > 0 &&
+          (listed.size !== dropped.length || !dropped.every((id) => listed.has(id)))
+        ) {
+          return {
+            ok: false,
+            issues: [
+              issue(
+                ["confirmDropped"],
+                "drops_published_records",
+                `This change takes ${String(dropped.length)} published record(s) off the public sites. Check them, then confirm them (confirmDropped).`,
+              ),
+              ...droppedIssues,
+            ],
+          };
         }
         const saved = await updateIdentifierType(tx, type);
         if (!saved.ok) return saved;

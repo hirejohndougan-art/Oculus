@@ -382,7 +382,11 @@ export function refused(
       ...(result.conflict === undefined ? {} : { conflict: result.conflict }),
     };
   }
-  if (codes.has("needs_confirmation") || codes.has("publishes_records")) {
+  if (
+    codes.has("needs_confirmation") ||
+    codes.has("publishes_records") ||
+    codes.has("drops_published_records")
+  ) {
     reply.status(409);
     return { error: "confirmation_required", issues };
   }
@@ -878,7 +882,11 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
       handler: signedIn("write", true, async (request, reply, { context }) => {
         const precondition = newOrMatch(request, TYPE_TAG);
         const body = objectBody(request);
-        const extra = onlyKeys(body, ["identifierType", "confirm", "confirmPublished"], reply);
+        const extra = onlyKeys(
+          body,
+          ["identifierType", "confirm", "confirmPublished", "confirmDropped"],
+          reply,
+        );
         if (extra) return extra;
         const type = body.identifierType;
         const key = request.params.key;
@@ -908,6 +916,7 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
             ...(body.confirmPublished === undefined
               ? {}
               : { confirmPublished: body.confirmPublished }),
+            ...(body.confirmDropped === undefined ? {} : { confirmDropped: body.confirmDropped }),
           },
         );
         return answer(result, reply, (value) => {

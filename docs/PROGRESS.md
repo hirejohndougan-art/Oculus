@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 03:10 CT — manual (Chat C) — S-033 Identifier type edits list the records a new format drops
+- Result: done
+- What changed: `saveIdentifierType` lists the published records a new format takes off public sites and needs `confirmDropped` naming exactly them; `droppedFromPublic` in the reply; `PUT /api/identifier-types/:key` passes `confirmDropped` (409 `drops_published_records`); `readRecordsForChecks` exported from `@oculus/db`.
+- Decisions: D-091 amendment
+- Review: one independent round, nothing blocking; fixed an undercounting message, a confirmation that could skip the list (now tied to the exact IDs), and per-record reads under the type's lock.
+- Gate: see the merge commit · npm audit clean
+- Next: T-050c (OAI-PMH)
+
 ## 2026-11-25 00:40 CT — manual (Chat C) — T-050b Stored Dublin Core mappings
 - Result: done (the old T-050b split into T-050b, T-050d and T-050e)
 - What changed: migration 0022 (`dublin_core_mappings`, `public_dublin_core_mapping`); `packages/db/src/dublin-core-mappings.ts`; `readPublicRecord` uses the stored mapping when none is passed; service `readDublinCoreMapping`/`saveDublinCoreMapping`; `GET`/`PUT /api/templates/:key/dublin-core`.

@@ -708,14 +708,38 @@ describe("a number that no longer fits a changed format (S-026, D-091)", () => {
     const confirm = nextIssues
       .filter((i) => i.code === "needs_confirmation")
       .map((i) => ({ code: String(i.path[1]), key: String(i.path[2]) }));
+    // Confirming the changes isn't enough: the records themselves must be confirmed.
+    const unlisted = await service.saveIdentifierType(root, changed, {
+      expectedTag: current.tag,
+      confirm,
+      confirmPublished: true,
+    });
+    expect(codes(unlisted)).toContain("drops_published_records");
+    // A list that no longer matches (another misfit published meanwhile) asks again.
+    const late = ok(
+      await service.createRecord(ctx(org), objectDraft({ number: shown("INV-3") }), {
+        identifiers: numbers("INV-3"),
+      }),
+    ).record.id;
+    ok(await service.publish(ctx(org), late, { expectedVersion: 1 }));
+    const stale = await service.saveIdentifierType(root, changed, {
+      expectedTag: current.tag,
+      confirm,
+      confirmPublished: true,
+      confirmDropped: [misfit],
+    });
+    expect(codes(stale)).toContain("drops_published_records");
+    expect((await publicText(org, misfit)).ok).toBe(true);
+    const both = [misfit, late].sort();
     const saved = ok(
       await service.saveIdentifierType(root, changed, {
         expectedTag: current.tag,
         confirm,
         confirmPublished: true,
+        confirmDropped: both,
       }),
     );
-    expect(saved.droppedFromPublic).toEqual([misfit]);
+    expect([...(saved.droppedFromPublic ?? [])].sort()).toEqual(both);
     expect((await publicText(org, misfit)).ok).toBe(false);
     expect((await publicText(org, fits)).ok).toBe(true);
   }, 60_000);
