@@ -241,16 +241,21 @@ export function onlyKeys(
 const VERSION_TAG = /^"v([1-9][0-9]{0,9})"$/;
 const TYPE_TAG = /^"t-([A-Za-z0-9_-]{32})"$/;
 
+/** The service takes versions below 2^31 - 1; a bigger tag is malformed here, not refused there (S-032). */
+const inVersionRange = (text: string): boolean => {
+  const n = Number(text);
+  return Number.isSafeInteger(n) && n < 2 ** 31 - 1;
+};
+
 /** `If-Match: "v<N>"`: the version an edit started from (428 without, 400 malformed). */
 function ifMatchVersion(request: OculusRequest): number {
   const value = request.headers["if-match"];
   if (value === undefined) throw new Refusal(428, "precondition_required");
   const match = VERSION_TAG.exec(value);
-  const n = Number(match?.[1]);
-  if (match === null || !Number.isSafeInteger(n) || n >= 2 ** 31 - 1) {
+  if (match?.[1] === undefined || !inVersionRange(match[1])) {
     throw new Refusal(400, "bad_if_match");
   }
-  return n;
+  return Number(match[1]);
 }
 
 /**
@@ -269,6 +274,9 @@ function newOrMatch(request: OculusRequest, pattern: RegExp): { readonly tag: st
   }
   const found = pattern.exec(match ?? "");
   if (found?.[1] === undefined) throw new Refusal(400, "bad_if_match");
+  if (pattern === VERSION_TAG && !inVersionRange(found[1])) {
+    throw new Refusal(400, "bad_if_match");
+  }
   return { tag: found[1] };
 }
 
