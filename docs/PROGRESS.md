@@ -2,13 +2,21 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
-## 2026-11-25 16:00 CT — manual (Chat N) — S-058 Deleting a donor contact checks the agent's home site
+## 2026-11-25 16:25 CT — manual (Chat N) — S-058 Deleting a donor contact checks the agent's home site
 - Result: done
 - What changed: `deleteDonorContact` (service `accessions.ts`) now runs the same home-site check as `saveDonorContact` (`mayName`): `donors.edit` on the agent's own site, not on any site. Attack test: Donor relations on one site can't delete (or save) another site's agent's contact, even with a wrong version; with the role on that site it can.
 - Decisions: none
 - Review: independent review: safe (no hole, no data loss); notes: same behaviour as saving for records filed below the agent and for telling a missing agent from another site's
-- Gate: PASS · tests_passing 5215 (was 5214) · npm audit clean
+- Gate: PASS · tests_passing TBD (was 5233) · npm audit clean
 - Next: none for Chat N; every Phase 2 job is claimed
+
+## 2026-11-25 16:05 CT — manual (Chat M) — T-075 Accept an invitation
+- Result: done
+- What changed: `sign-in-api.ts` (`POST /api/invitation/accept`: the token from the link, the invitee's address, a name and a password; the account is made and signed in, so the next screen is two-step set-up; `POST /api/invitation/accept-signed-in` for someone who already has an account, user from the session only); `accounts.ts` (`acceptInvitation` and `acceptInvitationForUser` take the organization from the invitation when it is left out); the admin's `/invitation` screen (`AcceptInvitation.tsx`), which reads the token from the fragment once. Tests: `invitation-api.test.ts` (one reply for every unusable link, `account_exists` only for a complete form, Origin, CSRF, session and per-address rules, no token or address in logs) and `AcceptInvitation.test.tsx`.
+- Decisions: D-068 amended
+- Review: one independent review: nothing unsafe. Fixed: a typo in the address now keeps the form instead of a dead-link page; after a server failure the screen says the account may already be made; the cookie is written only after the waiting session's state is read; thrown account errors are logged as class and SQLSTATE and answered 503; the secrecy test checks tokens too.
+- Gate: PASS · tests_passing 5233 (was 5214) · npm audit clean
+- Next: none for Chat M (every Phase 2 job is taken)
 
 ## 2026-11-25 15:45 CT — manual (Chat P) — S-062 The server checks its database role at start; updates need the writer role named
 - Result: done

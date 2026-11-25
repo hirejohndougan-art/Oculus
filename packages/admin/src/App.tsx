@@ -50,6 +50,7 @@ import { SettingsLayout, SignInSettings, SitesSettings } from "./settings/Settin
 import { FileScanSettings } from "./settings/FileScans";
 import { DublinCoreScreen } from "./settings/DublinCoreEditor";
 import { TemplateList, TemplateScreen } from "./settings/TemplateEditor";
+import { AcceptInvitation } from "./screens/AcceptInvitation";
 import { ResetComplete } from "./screens/ResetComplete";
 import { ResetRequest } from "./screens/ResetRequest";
 import { SetUp } from "./screens/SetUp";
@@ -140,6 +141,7 @@ export const ROUTES: RouteObject[] = [
       { path: "/sign-in/set-up", element: <SetUp /> },
       { path: "/forgot", element: <ResetRequest /> },
       { path: "/reset", element: <ResetComplete /> },
+      { path: "/invitation", element: <AcceptInvitation /> },
       {
         path: "/",
         element: <Frame />,
