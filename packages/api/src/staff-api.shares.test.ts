@@ -1,6 +1,6 @@
 // Sharing items between sites over HTTP (T-041d, D-094), against a fresh
-// migrated database: every route with no session, without CSRF and from a
-// foreign Origin; offering a published item from site A1 to organization
+// migrated database: every route with no session, every change without
+// CSRF, from a foreign Origin and with a wrong body; offering a published item from site A1 to organization
 // B's site B1 and its manager accepting it; what B's people then read (the
 // public view only, never the staff-only field); and above all that an
 // unknown share, another organization's share and one the person may not
@@ -124,21 +124,31 @@ describe("sharing over HTTP", () => {
     expect(
       (await call("POST", `/api/shares/${shareId}/withdraw`, { as: "cataloger" })).status,
     ).toBe(200);
-    expect((await call("GET", `/api/shares/${shareId}`, { as: "stranger" })).status).toBe(404);
+    const after = await call("GET", `/api/shares/${shareId}`, { as: "stranger" });
+    expect(after.status).toBe(404);
+    expect(shape(after)).toEqual(
+      shape(await call("GET", `/api/shares/${newRecordId()}`, { as: "stranger" })),
+    );
+    // Once ended, a move is share_not_open (422) for someone who may act on it.
+    const late = await call("POST", `/api/shares/${shareId}/remove`, { as: "bManager" });
+    expect(late.status).toBe(422);
+    expect((late.json.issues as { code: string }[]).map((i) => i.code)).toEqual(["share_not_open"]);
   });
 
   it("answers an unknown share, another organization's and one out of reach with one 404", async () => {
     const id = await publishedItem("Invented guarded lantern");
     const shareId = await offerToB(id);
     const missing = newRecordId();
-    for (const [who, path] of [
-      ["stranger", "accept"],
-      ["cataloger", "accept"],
-      ["other", "withdraw"],
-      ["reader", "withdraw"],
-      ["bManager", "withdraw"],
-      ["stranger", "decline"],
-    ] as const) {
+    const moves = ["accept", "decline", "remove", "withdraw"] as const;
+    // Who may not make each move: A's people can't decide, B's can't withdraw,
+    // and those without the permissions can do nothing.
+    const outOfReach: Record<(typeof moves)[number], readonly string[]> = {
+      accept: ["stranger", "cataloger", "other", "reader"],
+      decline: ["stranger", "cataloger", "other", "reader"],
+      remove: ["stranger", "cataloger", "other", "reader"],
+      withdraw: ["other", "reader", "bManager", "stranger"],
+    };
+    for (const [path, who] of moves.flatMap((m) => outOfReach[m].map((p) => [m, p] as const))) {
       const r = await call("POST", `/api/shares/${shareId}/${path}`, { as: who });
       const none = await call("POST", `/api/shares/${missing}/${path}`, { as: who });
       const bad = await call("POST", `/api/shares/not-an-id/${path}`, { as: who });
@@ -197,6 +207,41 @@ describe("sharing over HTTP", () => {
     expect((await call("GET", `/api/sites/${w.b1}/share-offers`, { as: "stranger" })).status).toBe(
       403,
     );
+    // The share moves and reads: no session 401, no CSRF or a foreign Origin 403.
+    const shareId = await offerToB(await publishedItem("Invented watched lantern"));
+    for (const move of ["accept", "decline", "remove", "withdraw"]) {
+      const url = `/api/shares/${shareId}/${move}`;
+      const who = move === "withdraw" ? "cataloger" : "bManager";
+      expect((await call("POST", url)).status).toBe(401);
+      expect((await call("POST", url, { as: who, csrf: false })).status).toBe(403);
+      expect((await call("POST", url, { as: who, origin: "https://evil.example" })).status).toBe(
+        403,
+      );
+      expect((await call("POST", url, { as: who, body: { note: "x" } })).status).toBe(422);
+      expect((await call("POST", url, { as: who, body: [1] })).status).toBe(400);
+    }
+    expect((await call("GET", `/api/shares/${shareId}`)).status).toBe(401);
+    expect((await call("GET", `/api/sites/${w.b1}/shared-items`)).status).toBe(401);
+    expect((await call("GET", `/api/records/${id}/shares`)).status).toBe(401);
+    // The share is still open after all those refusals.
+    expect(
+      (await call("GET", `/api/sites/${w.b1}/share-offers`, { as: "bManager" })).json.shares,
+    ).toEqual(expect.arrayContaining([expect.objectContaining({ id: shareId, state: "offered" })]));
+    // Site lists can't probe site IDs: another organization's site, a site the
+    // person doesn't manage or see, an unknown and a malformed ID all answer alike.
+    for (const list of ["share-offers", "shared-items"]) {
+      for (const who of ["cataloger", "stranger", "reader"]) {
+        const theirs = await call("GET", `/api/sites/${w.b1}/${list}`, { as: who });
+        if (who === "stranger" && list === "shared-items") continue; // may see B1's catalog
+        expect(theirs.status).toBe(403);
+        expect(shape(theirs)).toEqual(
+          shape(await call("GET", `/api/sites/${newRecordId()}/${list}`, { as: who })),
+        );
+        expect(shape(theirs)).toEqual(
+          shape(await call("GET", `/api/sites/not-an-id/${list}`, { as: who })),
+        );
+      }
+    }
     // An unpublished item can't be offered: 422 with its reason.
     const draft = await makeObject(w, w.a, w.a1, "Invented draft lantern");
     const r = await call("POST", `/api/records/${draft.id}/shares`, { as: "cataloger", body });
