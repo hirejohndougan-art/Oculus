@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 02:00 CT — manual (Chat C) — T-050d Public record reads
+- Result: done
+- What changed: `packages/api/src/public-api.ts` (`GET /records/:id` on public hosts, mounted by `buildAdminServer` when public sites are configured); a `public` rate bucket.
+- Decisions: D-100
+- Review: one independent round, nothing blocking; fixed the public pool filling under many slow reads (a cap on reads at once, IPv6 counted by /64), the log line, and D-100's wording; S-037 filed (time limits on the reader pool).
+- Gate: see the merge commit · npm audit clean
+- Next: T-050c (OAI-PMH) or T-050e
+
 ## 2026-11-25 01:55 CT — Chat B — T-041c Shares: storage and the service (part of T-041b)
 - Result: done (T-041b continues as T-041d to T-041f)
 - What changed: migration 0024 (`record_shares`), `packages/db/src/shares.ts`, `publishedRecordView` (workflow.ts), `packages/service/src/shares.ts`: offer a published item to another site (any organization's), accept, decline, remove (the second site's manager), withdraw (home), lists, and a read-only view for the second site that is what the public could see, never through the record's own checks.
