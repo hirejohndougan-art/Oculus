@@ -27,7 +27,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { csrfTokenFor, type OrganizationId, type UserId } from "@oculus/core";
+import { csrfTokenFor, newSiteId, type OrganizationId, type UserId } from "@oculus/core";
 import {
   openDatabase,
   purgeCandidates,
@@ -323,6 +323,9 @@ describe("the purge's steps", () => {
       e.type === "file" && e.bytes === body.length ? [e.kind] : [],
     );
     expect(lines).toEqual(expect.arrayContaining(["removed", "attached"]));
+    // Not for someone who sees only another site's records.
+    const elsewhere = await readAuditTrail(w.db, w.a, { records: [newSiteId()], people: [] }, {});
+    expect(elsewhere.entries.filter((e) => e.type === "file")).toEqual([]);
     await drain();
   });
 

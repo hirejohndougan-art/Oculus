@@ -16,7 +16,8 @@
 -- table has one, the account the row itself names (updated_by,
 -- changed_by). Neither: NULL, shown as "the command line" (first-time
 -- setup, the migrations themselves). An UPDATE that changes nothing but a
--- timestamp writes no row. Nothing deletes these definitions (the writer
+-- timestamp, editor or version number writes no row, and a row's version
+-- number isn't kept (the definition's own history is this log). Nothing deletes these definitions (the writer
 -- has no DELETE on them, roles.ts), so deletions aren't logged.
 --
 -- Append-only as people_events (0020): the writer has INSERT only, triggers
@@ -111,7 +112,7 @@ DECLARE
   old_row jsonb;
   new_row jsonb := to_jsonb(NEW);
   noise text[] := ARRAY['organization_id', 'created_at', 'updated_at', 'changed_at',
-                        'updated_by', 'changed_by', 'singleton'];
+                        'updated_by', 'changed_by', 'singleton', 'version'];
   given text := current_setting('oculus.actor', true);
   who text;
   by_id text := coalesce(new_row ->> 'updated_by', new_row ->> 'changed_by');

@@ -98,13 +98,19 @@ describe("definition_events", () => {
     expect(rows[1]?.after).not.toHaveProperty("created_at");
   });
 
-  it("writes nothing when only a timestamp changes", async () => {
+  it("writes nothing when only a timestamp changes, or nothing at all", async () => {
     const before = (await events("site")).length;
     await as(`user:${admin}`, (tx) => renameSite(tx, org, siteB, "Invented Library"));
-    await db.execute(
-      sql`UPDATE public.sites SET created_at = created_at WHERE id = ${siteB}::uuid`,
-    );
     expect(await events("site")).toHaveLength(before);
+    const term = await as(`user:${admin}`, (tx) =>
+      saveTerm(tx, { organizationId: org, term: { vocabulary: "local", label: "Invented lamps" } }),
+    );
+    if (!term.ok) throw new Error("no term");
+    const terms = (await events("term")).length;
+    await db.execute(
+      sql`UPDATE public.terms SET updated_at = now() + interval '1 hour' WHERE id = ${term.value.id}::uuid`,
+    );
+    expect(await events("term")).toHaveLength(terms);
   });
 
   it("goes with its change: a rolled-back change leaves no row", async () => {
@@ -158,7 +164,7 @@ describe("definition_events", () => {
         term: { vocabulary: "local", label: "Invented bed quilts" },
       }),
     );
-    const terms = await events("term");
+    const terms = (await events("term")).filter((r) => r.subject_key === term.value.id);
     expect(terms.map((r) => [r.action, r.subject_key, r.after.label])).toEqual([
       ["created", term.value.id, "Invented quilts"],
       ["changed", term.value.id, "Invented bed quilts"],

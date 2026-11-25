@@ -358,9 +358,9 @@ describe("accessions through the service (T-018c)", () => {
         { expectedVersion: 1 },
       ),
     );
-    const lines = async (records: "all" | SiteId[]) =>
+    const lines = async (records: "all" | SiteId[], accessions = true) =>
       (
-        await readAuditTrail(s.owner, w.org, { records, people: "all" }, { limit: 100 })
+        await readAuditTrail(s.owner, w.org, { records, people: "all", accessions }, { limit: 100 })
       ).entries.filter((e) => e.type === "accession");
     expect(await lines("all")).toEqual([
       expect.objectContaining({
@@ -372,7 +372,15 @@ describe("accessions through the service (T-018c)", () => {
       expect.objectContaining({ version: 1, number: input.number.value }),
     ]);
     expect(JSON.stringify(await lines("all"))).not.toContain(w.donor.title);
-    expect(await lines([w.site])).toEqual([]);
+    // Only with donors.view on every site (D-036): the service gives a
+    // cataloger none, a system manager both.
+    expect(await lines("all", false)).toEqual([]);
+    const cataloger = await service.auditTrail(ctx(w, w.cataloger), {});
+    if (!cataloger.ok) throw new Error("no trail");
+    expect(cataloger.value.entries.some((e) => e.type === "accession")).toBe(false);
+    const root = await service.auditTrail(ctx(w, w.root), {});
+    if (!root.ok) throw new Error("no trail");
+    expect(root.value.entries.some((e) => e.type === "accession")).toBe(true);
   });
 
   it("never gives an all-time number to a second accession, even after the first gave it up", async () => {

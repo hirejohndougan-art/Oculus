@@ -363,6 +363,14 @@ describe("storage through the service (T-018d)", () => {
       }),
       expect.objectContaining({ action: "created", name: "Invented Room 9" }),
     ]);
+    // Moves follow the record's site (review): its site sees them, another doesn't.
+    const other = await makeSite(service, w.root, w.org, `Invented other site ${String(count)}`);
+    const scoped = async (site: SiteId) =>
+      (
+        await readAuditTrail(s.owner, w.org, { records: [site], people: [site] }, { limit: 100 })
+      ).entries.filter((e) => e.type === "move");
+    expect(await scoped(w.site)).toHaveLength(1);
+    expect(await scoped(other)).toEqual([]);
     // A record filter keeps the record's moves and drops the definitions.
     const one = await readAuditTrail(
       s.owner,

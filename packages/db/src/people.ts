@@ -513,6 +513,11 @@ export interface AuditScope {
   readonly people: "all" | readonly SiteId[];
   /** Changes to the server itself (installs, rollbacks: T-060a): system managers only. */
   readonly system?: boolean;
+  /**
+   * Accession saves (S-064, D-117): only for those who may read donor
+   * matters on every site (`donors.view`, D-036); the service decides.
+   */
+  readonly accessions?: boolean;
 }
 
 export const MAX_AUDIT_PAGE = 100;
@@ -640,7 +645,7 @@ export type AuditEntry =
       readonly shareId: string;
       readonly kind: ShareStep;
       readonly recordId: string;
-      /** The record's title, in its home organization's trail only. */
+      /** The record's title, only for those who see the record itself. */
       readonly title: string | null;
       readonly targetSiteId: string | null;
     };
@@ -954,15 +959,15 @@ export async function readAuditTrail(
         AND (${from}::timestamptz IS NULL OR m.recorded_at >= ${from}::timestamptz)
         AND (${to}::timestamptz IS NULL OR m.recorded_at < ${to}::timestamptz)
       UNION ALL
-      -- Accession saves (T-018c): whole-organization viewers only, and only
-      -- the number (the donor stays on the accession's own page).
+      -- Accession saves (T-018c): only with scope.accessions (donors.view on
+      -- every site), and only the number (the donor stays on its own page).
       SELECT 'accession', a.saved_at,
              'a' || a.accession_id::text || ':' || lpad(a.version::text, 10, '0'),
              'user:' || a.saved_by::text, NULL, a.version, NULL, NULL, NULL, NULL, NULL, NULL,
              a.accession_id::text, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
              jsonb_build_object('number', a.definition #>> '{number,value}')
       FROM public.accession_versions a
-      WHERE ${wantRecords && recordSites === null && filter.recordId === undefined}::boolean
+      WHERE ${scope.accessions === true && filter.recordId === undefined}::boolean
         AND a.organization_id = ${organizationId}::uuid
         AND (${actor}::uuid IS NULL OR a.saved_by = ${actor}::uuid)
         AND (${from}::timestamptz IS NULL OR a.saved_at >= ${from}::timestamptz)
@@ -974,9 +979,8 @@ export async function readAuditTrail(
       -- gets no title (the record isn't theirs; it may be unpublished now).
       SELECT 'share', step.at, 'h' || sh.id::text || ':' || step.part, step.actor,
              sh.record_id::text, NULL, NULL,
-             CASE WHEN sh.organization_id = ${organizationId}::uuid THEN r.title END,
-             CASE WHEN sh.organization_id = ${organizationId}::uuid THEN r.kind END,
-             NULL, NULL, sh.organization_id = ${organizationId}::uuid AND r.id IS NULL,
+             CASE WHEN home.sees THEN r.title END, CASE WHEN home.sees THEN r.kind END,
+             NULL, NULL, home.sees AND r.id IS NULL,
              sh.id::text, step.kind, NULL, NULL, sh.target_site_id::text, NULL, NULL, NULL,
              NULL, NULL, NULL, NULL
       FROM public.record_shares sh
@@ -987,12 +991,20 @@ export async function readAuditTrail(
          sh.decided_at, 'user:' || sh.decided_by::text),
         ('e', sh.state, sh.ended_at, coalesce('user:' || sh.ended_by::text, 'automatic'))
       ) AS step (part, kind, at, actor)
+      -- Whether the viewer sees the record itself (its home organization,
+      -- and its home site in their scope): only then its title. Shares
+      -- between two sites of one organization included (review).
+      CROSS JOIN LATERAL (SELECT
+        sh.organization_id = ${organizationId}::uuid
+          AND (${recordSites === null}::boolean OR r.site_id = ANY (${recordSites ?? []}::uuid[]))
+        AS sees) AS home
       WHERE ${wantRecords}::boolean
         AND step.at IS NOT NULL
-        AND ((sh.organization_id = ${organizationId}::uuid
-              AND (${recordSites === null}::boolean
-                   OR r.site_id = ANY (${recordSites ?? []}::uuid[])))
+        AND (home.sees
+             -- The receiving side: the steps of its own site's shares, not
+             -- the automatic endings (0043: such shares show nowhere).
              OR (sh.target_organization_id = ${organizationId}::uuid
+                 AND step.kind NOT IN ('deleted', 'moved')
                  AND (${recordSites === null}::boolean
                       OR sh.target_site_id = ANY (${recordSites ?? []}::uuid[]))))
         AND (${actor}::text IS NULL OR step.actor = 'user:' || ${actor}::text)

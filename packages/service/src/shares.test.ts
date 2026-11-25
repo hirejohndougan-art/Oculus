@@ -434,6 +434,17 @@ describe("deciding and ending", () => {
     expect(await steps(w.lib, [w.l1])).toEqual(expected("Invented depot lantern"));
     expect(await steps(w.lib, [w.l2])).toEqual([]);
     expect(await steps(w.dhs, [w.d1])).toEqual(expected(null));
+    // A share between two sites of one organization (review): someone who
+    // sees only the receiving site gets the steps, never the title.
+    const inside = await offer(w, { org: w.lib, site: w.l2 });
+    expect(await steps(w.lib, [w.l2])).toEqual([["offered", actorOf(w.libCataloger), null, w.l2]]);
+    expect((await steps(w.lib, "all"))[0]).toEqual([
+      "offered",
+      actorOf(w.libCataloger),
+      "Invented depot lantern",
+      w.l2,
+    ]);
+    expect(inside.id).not.toBe(share.id);
     // The sites and mappings made through the service name who made them.
     const made = (
       await readAuditTrail(s.owner, w.lib, { records: "all", people: "all" }, { limit: 100 })
