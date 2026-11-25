@@ -47,8 +47,8 @@ import {
   type UserId,
 } from "@oculus/core";
 import {
-  actingSession,
   deleteStoredFile,
+  keepSessionInUse,
   existingOrganizations,
   findStoredFile,
   findStoredFileById,
@@ -133,13 +133,14 @@ export interface AttachOptions {
   /** The media type the client claimed, if any: a hint only. */
   readonly claimedType?: string;
   /**
-   * The uploader's session token (S-060b): when given, the attach is refused
-   * (`no_session`) unless that session is still live and the actor's, read
-   * in the attach's own transactions. An upload can run for a long time; a
+   * The uploader's session (S-060b): when given, the attach is refused
+   * (`no_session`) unless that session is still a usable full session of
+   * the actor, checked by its ID in each of the attach's transactions (and
+   * kept in use, as a request would). An upload can run for a long time; a
    * session ended, an account disabled or a membership removed meanwhile
    * stops it here. The staff API always gives it.
    */
-  readonly sessionToken?: string;
+  readonly sessionId?: string;
 }
 
 export interface AttachedFile {
@@ -841,7 +842,7 @@ export function fileOperations(
                 "The file was received for another organization.",
               );
             }
-            const ended = await stillSignedIn(tx, who, options.sessionToken);
+            const ended = await stillSignedIn(tx, who, options.sessionId);
             if (ended) return ended;
             const refused = await attachable(tx, who, recordId, options.expectedVersion);
             if (refused) return refused;
@@ -890,7 +891,7 @@ export function fileOperations(
             if (claimed !== null && !isClaimedMediaType(claimed)) {
               return refusal(["claimedType"], "invalid_media_type", "Not a media type.");
             }
-            const ended = await stillSignedIn(tx, who, options.sessionToken);
+            const ended = await stillSignedIn(tx, who, options.sessionId);
             if (ended) return ended;
             const refused = await attachable(tx, who, recordId, options.expectedVersion);
             if (refused) return refused;
@@ -1419,17 +1420,17 @@ export function fileOperations(
 }
 
 /**
- * `no_session` unless `token` names a live full session of the actor
- * (S-060b). No token (a job, a test): nothing to check.
+ * `no_session` unless `sessionId` is a usable full session of the actor
+ * (S-060b), which it keeps in use. No session (a job, a test): nothing to check.
  */
 async function stillSignedIn(
   tx: Queryable,
   who: { readonly actor: string },
-  token: string | undefined,
+  sessionId: string | undefined,
 ): Promise<ServiceRefusal | undefined> {
-  if (token === undefined) return undefined;
-  const acting = await actingSession(tx, token);
-  if (acting === undefined || `user:${acting.userId}` !== who.actor) {
+  if (sessionId === undefined) return undefined;
+  const user = who.actor.startsWith("user:") ? who.actor.slice(5) : undefined;
+  if (user === undefined || (await keepSessionInUse(tx, sessionId, user)) !== "live") {
     return refusal([], "no_session", "Sign in again.");
   }
   return undefined;

@@ -811,6 +811,42 @@ export async function resolveSession(
 }
 
 /**
+ * A file still being sent or received keeps its session in use (S-060b, from
+ * the Phase 2 security review's L5): `live` refreshes `last_seen_at`, as a
+ * request does, while the session `sessionId` of `userId` is still a usable
+ * full session; `ended` once it isn't (signed out, ended by a manager, the
+ * account disabled, the membership removed, past its absolute end), and for
+ * an ID that isn't one. By session ID, not token, so re-entering the password
+ * (a new token for the same session) doesn't end a transfer. `unavailable`
+ * when the database can't answer (the raw error to `onError`); anything
+ * else is thrown.
+ */
+export async function keepSessionInUse(
+  db: Queryable,
+  sessionId: unknown,
+  userId: unknown,
+  options: { readonly onError?: (error: unknown) => void } = {},
+): Promise<"live" | "ended" | "unavailable"> {
+  if (!isSessionId(sessionId) || typeof userId !== "string") return "ended";
+  try {
+    const rows = await db.rows<{ live: boolean }>(sql`
+      UPDATE public.sessions s SET last_seen_at = clock_timestamp()
+      FROM public.users u
+      WHERE s.id = ${sessionId}::uuid AND s.user_id::text = ${userId} AND ${LIVE_FULL}
+      RETURNING true AS live`);
+    return rows.length > 0 ? "live" : "ended";
+  } catch (error) {
+    if (!isDatabaseFailure(error)) throw error;
+    try {
+      options.onError?.(error);
+    } catch {
+      // A failing logger changes nothing.
+    }
+    return "unavailable";
+  }
+}
+
+/**
  * Gives a full session a new token (ASVS 5.0 7.2.4): for any change of what
  * it may do (T-019d's site unlocks, T-041's role changes). The old token
  * stops working at once.

@@ -30,6 +30,7 @@ import { csrfTokenFor, newRecordId, type OrganizationId, type UserId } from "@oc
 import {
   endSession,
   migrate,
+  rotateSession,
   openDatabase,
   organizationFileBytes,
   purgeCandidates,
@@ -108,6 +109,7 @@ async function serve(
   world: World,
   files: FileStore,
   uploadTimeouts?: Partial<UploadTimeouts>,
+  downloads?: { readonly sessionCheckMs?: number },
 ): Promise<FastifyInstance> {
   const service = createService(world.db, {
     onError: serviceErrorLogger((r) => logged.push(r)),
@@ -123,6 +125,7 @@ async function serve(
       files,
       log: (r) => logged.push(r),
       rateLimits: { write: 10_000, read: 10_000 },
+      ...(downloads === undefined ? {} : { downloads }),
     }),
   });
   await server.listen({ host: "127.0.0.1", port: 0 });
@@ -762,42 +765,100 @@ async function placeOrphan(db: Database, body: Buffer, assetId: string): Promise
 }
 
 describe("an upload whose session ends while it arrives (S-060b)", () => {
-  it("isn't attached: 401, and the asset gains no file", async () => {
-    const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented scan, session ending"));
-    let ending: string | undefined;
-    // The store as the server sees it, but the session is ended (signed
-    // out) once the bytes are in and before the attach.
-    const endingStore: FileStore = {
-      ...store,
-      receive: async (...args: Parameters<FileStore["receive"]>) => {
-        const received = await store.receive(...args);
-        if (ending !== undefined) await endSession(w.db, ending);
-        return received;
-      },
-    };
-    const server = await serve(w, endingStore);
-    try {
-      const to = addressOf(server);
-      const live = (await fullSession(w.db, w.cataloger, w.a)).token;
-      tokens.ending = live;
-      ending = live;
-      const r = await upload(asset, { as: "ending", body: fakePng(512), name: "late.png", to });
-      expect([r.status, r.json]).toEqual([401, { error: "unauthenticated" }]);
-      const files = await w.db.rows<{ n: string }>(
-        sql`SELECT count(*) AS n FROM public.stored_files WHERE record_id = ${asset}::uuid`,
+  /** The store as the server sees it, with `hook` run at one step of an upload. */
+  const hooked = (step: "receive" | "inspect", hook: () => Promise<unknown>): FileStore => ({
+    ...store,
+    receive: async (...args: Parameters<FileStore["receive"]>) => {
+      const received = await store.receive(...args);
+      if (step === "receive") await hook();
+      return received;
+    },
+    inspect: async (...args: Parameters<FileStore["inspect"]>) => {
+      // Between the attach's intent and the attach itself.
+      if (step === "inspect") await hook();
+      return store.inspect(...args);
+    },
+  });
+  const filesOf = async (asset: string) =>
+    Number(
+      (
+        await w.db.rows<{ n: string }>(
+          sql`SELECT count(*) AS n FROM public.stored_files WHERE record_id = ${asset}::uuid`,
+        )
+      )[0]?.n,
+    );
+
+  it("isn't attached once its session ends, before or after the attach's first transaction", async () => {
+    for (const step of ["receive", "inspect"] as const) {
+      const asset = await makeAs(w, w.a, w.a1, assetDraft(`An invented scan, ${step}`));
+      const signedIn = (await fullSession(w.db, w.cataloger, w.a)).token;
+      tokens.ending = signedIn;
+      const server = await serve(
+        w,
+        hooked(step, () => endSession(w.db, signedIn)),
       );
-      expect(Number(files[0]?.n)).toBe(0);
-      // A session still live attaches through the same store.
-      ending = undefined;
-      tokens.ending = (await fullSession(w.db, w.cataloger, w.a)).token;
-      const ok = await upload(asset, { as: "ending", body: fakePng(512), name: "ok.png", to });
-      expect(ok.status).toBe(201);
+      try {
+        const r = await upload(asset, {
+          as: "ending",
+          body: fakePng(512),
+          name: "late.png",
+          to: addressOf(server),
+        });
+        expect([step, r.status, r.json]).toEqual([step, 401, { error: "unauthenticated" }]);
+        expect(await filesOf(asset)).toBe(0);
+      } finally {
+        await server.close();
+      }
+    }
+  });
+
+  it("re-entering the password (a new token for the same session) doesn't stop it", async () => {
+    const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented scan, rotated"));
+    const signedIn = (await fullSession(w.db, w.cataloger, w.a)).token;
+    tokens.rotating = signedIn;
+    const server = await serve(
+      w,
+      hooked("inspect", () => rotateSession(w.db, signedIn)),
+    );
+    try {
+      const r = await upload(asset, {
+        as: "rotating",
+        body: fakePng(512),
+        name: "kept.png",
+        to: addressOf(server),
+      });
+      expect(r.status).toBe(201);
+      expect(await filesOf(asset)).toBe(1);
     } finally {
       await server.close();
     }
   });
 
-  it("the service refuses an attach for a session that isn't live or isn't the actor's", async () => {
+  it("stops while the bytes still arrive, and keeps nothing", async () => {
+    const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented scan, cut off"));
+    const signedIn = (await fullSession(w.db, w.cataloger, w.a)).token;
+    tokens.cut = signedIn;
+    const server = await serve(w, store, undefined, { sessionCheckMs: 100 });
+    try {
+      const sending = upload(asset, {
+        as: "cut",
+        body: Array.from({ length: 20 }, () => fakePng(1024)),
+        name: "cut.png",
+        chunked: true,
+        pace: 100,
+        to: addressOf(server),
+      });
+      await new Promise((r) => setTimeout(r, 400));
+      await endSession(w.db, signedIn);
+      const r = await sending;
+      expect([r.status, r.json]).toEqual([401, { error: "unauthenticated" }]);
+      expect(await filesOf(asset)).toBe(0);
+    } finally {
+      await server.close();
+    }
+  }, 30_000);
+
+  it("the service refuses an attach for a session that isn't usable or isn't the actor's", async () => {
     const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented scan, service check"));
     const service = createService(w.db, { files: store });
     const receive = async () => {
@@ -811,24 +872,24 @@ describe("an upload whose session ends while it arrives (S-060b)", () => {
       if (!received.ok) throw new Error(received.code);
       return received.file;
     };
-    const ended = (await fullSession(w.db, w.cataloger, w.a)).token;
-    await endSession(w.db, ended);
-    const someoneElse = (await fullSession(w.db, w.manager, w.a)).token;
-    for (const sessionToken of [ended, someoneElse, "not-a-token"]) {
+    const ended = await fullSession(w.db, w.cataloger, w.a);
+    await endSession(w.db, ended.token);
+    const someoneElse = (await fullSession(w.db, w.manager, w.a)).sessionId;
+    for (const sessionId of [ended.sessionId, someoneElse, "not-a-session"]) {
       const r = await service.attachFile(
         { organizationId: w.a, actor: actorOf(w.cataloger) },
         asset as never,
         await receive(),
-        { name: "x.png", expectedVersion: 1, sessionToken },
+        { name: "x.png", expectedVersion: 1, sessionId },
       );
       expect(r.ok ? "attached" : r.issues.map((i) => i.code)).toEqual(["no_session"]);
     }
-    const live = (await fullSession(w.db, w.cataloger, w.a)).token;
+    const live = (await fullSession(w.db, w.cataloger, w.a)).sessionId;
     const r = await service.attachFile(
       { organizationId: w.a, actor: actorOf(w.cataloger) },
       asset as never,
       await receive(),
-      { name: "x.png", expectedVersion: 1, sessionToken: live },
+      { name: "x.png", expectedVersion: 1, sessionId: live },
     );
     expect(r.ok).toBe(true);
   });

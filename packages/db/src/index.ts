@@ -285,6 +285,7 @@ export {
   beginSession,
   readPendingSession,
   resolveSession,
+  keepSessionInUse,
   rotateSession,
   switchOrganization,
   listSessions,

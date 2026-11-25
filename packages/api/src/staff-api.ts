@@ -112,7 +112,7 @@ import {
   type Issue,
   type RecordId,
 } from "@oculus/core";
-import { resolveSession, type FullSession, type Queryable } from "@oculus/db";
+import { keepSessionInUse, resolveSession, type FullSession, type Queryable } from "@oculus/db";
 import {
   contextFromSession,
   type FileStore,
@@ -618,12 +618,7 @@ export function refused(
 export type Handler = (
   request: OculusRequest,
   reply: OculusReply,
-  signed: {
-    readonly session: FullSession;
-    readonly context: ServiceContext;
-    /** The session's token, for operations that check it in their own transaction. */
-    readonly token: string;
-  },
+  signed: { readonly session: FullSession; readonly context: ServiceContext },
 ) => Promise<unknown>;
 
 /** The staff API's routes, for `buildServer({ routes })`. */
@@ -673,7 +668,7 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
         ...contextFromSession(session),
         ...(siteHeader === undefined ? {} : { siteId: siteHeader }),
       };
-      return handler(request, reply, { session, context, token });
+      return handler(request, reply, { session, context });
     };
   }
 
@@ -727,11 +722,67 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
   const streaming = new Map<string, number>();
 
   /**
+   * Transfers still running, by session (S-060b): one check per session
+   * every `sessionCheckMs`, by session ID (a new token from re-entering the
+   * password changes nothing), which also keeps the session in use, so a
+   * long download or upload doesn't hit the idle limit. Once the session is
+   * no longer a usable full session (signed out, ended by a manager, the
+   * account disabled, the membership removed, past its absolute end, from
+   * this process or another), every transfer of it is stopped. A database
+   * that can't answer for a moment stops nothing.
+   */
+  interface Watch {
+    readonly stops: Set<() => void>;
+    timer?: NodeJS.Timeout;
+    checking: boolean;
+  }
+  const watched = new Map<string, Watch>();
+  function watchSession(session: FullSession, stop: () => void): () => void {
+    let entry = watched.get(session.sessionId);
+    if (entry === undefined) {
+      const made: Watch = { stops: new Set(), checking: false };
+      made.timer = setInterval(() => {
+        if (made.checking) return;
+        made.checking = true;
+        keepSessionInUse(db, session.sessionId, session.userId, {
+          onError: (error) => {
+            log({ event: "session_error", ...redactedError(error) });
+          },
+        })
+          .then((state) => {
+            if (state !== "ended") return;
+            for (const each of [...made.stops]) each();
+          })
+          .catch(() => undefined)
+          .finally(() => {
+            made.checking = false;
+          });
+      }, downloadLimits.sessionCheckMs);
+      made.timer.unref();
+      watched.set(session.sessionId, made);
+      entry = made;
+    }
+    const mine = entry;
+    mine.stops.add(stop);
+    return () => {
+      mine.stops.delete(stop);
+      if (mine.stops.size === 0 && watched.get(session.sessionId) === mine) {
+        clearInterval(mine.timer);
+        watched.delete(session.sessionId);
+      }
+    };
+  }
+
+  /**
    * The opener, counted against the session and the person while its
    * stream is open, kept to the minimum rate, and stopped once its session
    * has ended (S-060b).
    */
-  function counted(keys: readonly string[], token: string, open: () => Readable): () => Readable {
+  function counted(
+    keys: readonly string[],
+    session: FullSession,
+    open: () => Readable,
+  ): () => Readable {
     return () => {
       const source = open();
       for (const key of keys) streaming.set(key, (streaming.get(key) ?? 0) + 1);
@@ -750,36 +801,17 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
         checked = sent;
       }, downloadLimits.windowMs);
       timer.unref();
-      // The session is read, not refreshed (a download isn't activity), and
-      // only a definite "no session" stops it: a database that can't answer
-      // for a moment doesn't cut every download off.
-      let checking = false;
-      const sessionTimer = setInterval(() => {
-        if (checking || counter.destroyed) return;
-        checking = true;
-        resolveSession(db, token, {
-          activity: false,
-          onError: (error) => {
-            log({ event: "session_error", ...redactedError(error) });
-          },
-        })
-          .then((resolved) => {
-            if (!resolved.ok && resolved.code === "no_session") {
-              counter.destroy(new Error("the session ended"));
-            }
-          })
-          .catch(() => undefined)
-          .finally(() => {
-            checking = false;
-          });
-      }, downloadLimits.sessionCheckMs);
-      sessionTimer.unref();
+      // Stopped once its session has ended (S-060b); the watch keeps the
+      // session in use meanwhile.
+      const unwatch = watchSession(session, () => {
+        counter.destroy(new Error("the session ended"));
+      });
       let released = false;
       const release = (): void => {
         if (released) return;
         released = true;
         clearInterval(timer);
-        clearInterval(sessionTimer);
+        unwatch();
         for (const key of keys) {
           const left = (streaming.get(key) ?? 1) - 1;
           if (left <= 0) streaming.delete(key);
@@ -799,7 +831,6 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
     request: OculusRequest,
     reply: OculusReply,
     session: FullSession,
-    token: string,
     context: ServiceContext,
     use: "download" | "view",
   ): Promise<unknown> {
@@ -823,7 +854,7 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
     }
     const { file, open } = result.value;
     return fileReply({
-      body: counted(keys, token, open),
+      body: counted(keys, session, open),
       size: file.size,
       // The sniffed type (D-086); fileReply sends a download as
       // application/octet-stream whatever it is.
@@ -845,7 +876,7 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
       method: "POST",
       path: "/api/records/:id/files",
       upload: { maxBytes: uploadLimit },
-      handler: signedIn("write", true, async (request, reply, { context, token }) => {
+      handler: signedIn("write", true, async (request, reply, { session, context }) => {
         const expectedVersion = ifMatchVersion(request);
         const upload = request.upload;
         if (upload === undefined) throw new Refusal(400, "bad_body");
@@ -866,11 +897,24 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
         }
         // The smaller cap while scanning is on: the scanner's (S-040).
         const cap = check.value.maxFileBytes;
-        const received = await files.receive(context.organizationId, upload.chunks(), {
-          signal: request.signal,
-          usedBytes: check.value.usedBytes,
-          maxBytes: cap,
+        // Stopped if the session ends while the bytes arrive (S-060b).
+        const sessionEnded = new AbortController();
+        const unwatch = watchSession(session, () => {
+          sessionEnded.abort();
         });
+        let received: Awaited<ReturnType<typeof files.receive>>;
+        try {
+          received = await files.receive(context.organizationId, upload.chunks(), {
+            signal: AbortSignal.any([request.signal, sessionEnded.signal]),
+            usedBytes: check.value.usedBytes,
+            maxBytes: cap,
+          });
+        } catch (error) {
+          if (sessionEnded.signal.aborted) throw new Refusal(401, "unauthenticated");
+          throw error;
+        } finally {
+          unwatch();
+        }
         if (!received.ok) {
           switch (received.code) {
             case "empty_file":
@@ -889,7 +933,7 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
         const result = await service.attachFile(context, id, received.file, {
           expectedVersion,
           // Still live and this person's when the file is attached (S-060b).
-          sessionToken: token,
+          sessionId: session.sessionId,
           name,
           ...(claimed === undefined ? {} : { claimedType: claimed }),
         });
@@ -929,8 +973,8 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
       // sent as application/octet-stream (fileReply), named by RFC 6266.
       method: "GET",
       path: "/api/records/:id/files/:fileId/content",
-      handler: signedIn("read", false, (request, reply, { session, context, token }) =>
-        readFileRoute(request, reply, session, token, context, "download"),
+      handler: signedIn("read", false, (request, reply, { session, context }) =>
+        readFileRoute(request, reply, session, context, "download"),
       ),
     },
     {
@@ -938,8 +982,8 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
       // sniffed type only, with fileReply's sandboxing CSP and nosniff.
       method: "GET",
       path: "/api/records/:id/files/:fileId/view",
-      handler: signedIn("read", false, (request, reply, { session, context, token }) =>
-        readFileRoute(request, reply, session, token, context, "view"),
+      handler: signedIn("read", false, (request, reply, { session, context }) =>
+        readFileRoute(request, reply, session, context, "view"),
       ),
     },
     {

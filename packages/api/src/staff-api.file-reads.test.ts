@@ -28,7 +28,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { csrfTokenFor, newRecordId, type OrganizationId, type UserId } from "@oculus/core";
-import { endSession, sql } from "@oculus/db";
+import { endSession, rotateSession, sql } from "@oculus/db";
 import {
   createService,
   createThumbnailRenderer,
@@ -996,9 +996,9 @@ describe("review fixes: timeouts, budgets, HEAD, failures and downloads", () => 
     const ending = (await fullSession(w.db, w.cataloger, w.a)).token;
     const staying = (await fullSession(w.db, w.cataloger, w.a)).token;
     const open: { destroy(): void }[] = [];
-    /** A download whose body is never read (a paused reader): its status once headers come. */
+    /** A download not read yet (a paused reader); `read` then takes it to its end. */
     const start = (as: string) =>
-      new Promise<number>((resolve, reject) => {
+      new Promise<{ status: number; read: () => Promise<number> }>((resolve, reject) => {
         const req = httpRequest(
           {
             host: to.host,
@@ -1010,7 +1010,18 @@ describe("review fixes: timeouts, budgets, HEAD, failures and downloads", () => 
           (res) => {
             res.pause();
             res.on("error", () => undefined);
-            resolve(res.statusCode ?? 0);
+            const read = () =>
+              new Promise<number>((done) => {
+                let bytes = 0;
+                res.on("data", (chunk: Buffer) => {
+                  bytes += chunk.length;
+                });
+                res.once("close", () => {
+                  done(bytes);
+                });
+                res.resume();
+              });
+            resolve({ status: res.statusCode ?? 0, read });
           },
         );
         req.on("error", reject);
@@ -1021,9 +1032,14 @@ describe("review fixes: timeouts, budgets, HEAD, failures and downloads", () => 
     // server's log says so (by code only), as for one too slow.
     const cutOff = () => serverLog.filter((l) => l.includes("file_stream_storage")).length;
     const before = cutOff();
-    expect([await start(ending), await start(staying)]).toEqual([200, 200]);
+    const cut = await start(ending);
+    const kept = await start(staying);
+    expect([cut.status, kept.status]).toEqual([200, 200]);
     await new Promise((r) => setTimeout(r, 500));
     expect(cutOff()).toBe(before);
+    // The other session re-enters its password (a new token, the same
+    // session): that changes nothing for its download.
+    expect((await rotateSession(w.db, staying)).ok).toBe(true);
     // Signed out: the running download stops within a few checks.
     await endSession(w.db, ending);
     const deadline = Date.now() + 5_000;
@@ -1031,11 +1047,13 @@ describe("review fixes: timeouts, budgets, HEAD, failures and downloads", () => 
       await new Promise((r) => setTimeout(r, 50));
     }
     expect(cutOff()).toBe(before + 1);
-    // The other session's download keeps going.
     await new Promise((r) => setTimeout(r, 1_000));
     expect(cutOff()).toBe(before + 1);
+    // The signed-out one ended short; the other one comes whole.
+    expect(await cut.read()).toBeLessThan(body.length);
+    expect(await kept.read()).toBe(body.length);
     for (const req of open) req.destroy();
-  }, 30_000);
+  }, 60_000);
 
   it("limits streamed files per session and cuts off one too slow (item 5)", async () => {
     const to = await serveAlso({}, { perSession: 2, minBytes: 2 * 1024 * 1024, windowMs: 300 });
