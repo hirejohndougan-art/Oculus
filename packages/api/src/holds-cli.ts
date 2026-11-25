@@ -1,5 +1,5 @@
 /**
- * `npm run holds` (T-034f, D-120), after `npm run build`, with
+ * `npm run holds` (T-034f, D-123), after `npm run build`, with
  * `OCULUS_DATABASE_URL` set as for the admin server (the writer's account):
  * one access-holds pass over every organization. Published records an
  * accession now holds back (a deed not signed, an access restriction in

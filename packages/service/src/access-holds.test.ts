@@ -1,4 +1,4 @@
-// The access-holds pass (T-034f, D-120), over a fresh database as the
+// The access-holds pass (T-034f, D-123), over a fresh database as the
 // writer role, with the public reader for public output: published records
 // an accession holds back are withdrawn as a version by the pass, records
 // it withdrew are published again once nothing holds them (on the

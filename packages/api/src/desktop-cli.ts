@@ -7,7 +7,7 @@
  *    Oculus's;
  * 2. applies any new migrations, so updating Oculus is `git pull`,
  *    `npm run build`, then start it again;
- * 3. runs the access-holds pass (T-034f, D-120): records whose access
+ * 3. runs the access-holds pass (T-034f, D-123): records whose access
  *    restriction ended are published again, records an accession now holds
  *    back are withdrawn (a failure is said and doesn't stop the start);
  * 4. starts the admin's server on 127.0.0.1 only, at port 4780 (or the

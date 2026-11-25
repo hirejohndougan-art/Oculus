@@ -1,5 +1,5 @@
 /**
- * Which records the access-holds pass (T-034f, D-120) looks at. The pass
+ * Which records the access-holds pass (T-034f, D-123) looks at. The pass
  * itself is the service's (`applyAccessHolds`); this only finds candidates.
  * Every candidate is checked again, one at a time, under its row lock and
  * the organization's holds lock, by the publish check itself: these lists

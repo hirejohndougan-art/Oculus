@@ -1,5 +1,5 @@
 /**
- * The access-holds pass (T-034f, D-120): keeps records' stored state in step
+ * The access-holds pass (T-034f, D-123): keeps records' stored state in step
  * with their accessions' deeds and access restrictions, on each
  * organization's own day (D-103).
  *
