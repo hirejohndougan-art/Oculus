@@ -469,7 +469,7 @@ class Reader {
       this.warn(
         path,
         "internal_left_out",
-        "The header is marked staff-only (audience=\"internal\"), so its titles, notes, author and publisher were left out; only its identifier was kept.",
+        'The header is marked staff-only (audience="internal"), so its titles, notes, author and publisher were left out; only its identifier was kept.',
       );
       notes.length = 0;
       delete h.title;
