@@ -1,13 +1,17 @@
 // @vitest-environment jsdom
 // Signing out after a period of no use, on screen (T-062, D-098), with fake
-// timers: the frame's own read of the person is background and the idle
-// timer's check is a use; a minute before the session's limit an
-// alertdialog warns, takes focus and offers "Stay signed in"; staying asks
-// the server and gives focus back; at the limit the admin signs out on the
-// server, forgets the session's data and shows the sign-in screen with the
-// reason; unsaved editor changes are named in the warning and don't hold
-// the way to sign in; a sign-out in another tab clears this one too; and
-// the localStorage fallback carries the same messages.
+// timers against a small model of the server's session: the frame's own
+// read of the person is background and the idle timer's check is a use; a
+// minute before the limit an alertdialog warns, takes focus and offers
+// "Stay signed in"; staying asks the server and gives focus back (or to the
+// main region when the element is gone); at the end the server is asked,
+// and only when it says the session has ended is the screen cleared first
+// and the sign-out sent afterwards, without waiting (a sign-out that never
+// settles leaves nothing on screen); the server unreachable clears this
+// screen only; unsaved editor changes are named and don't hold the way to
+// sign in; sign-outs of this session in other tabs (for no use, by hand,
+// ended) clear this one; another session's news is checked with the
+// server; and the localStorage fallback carries the same messages.
 import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { currentCsrfToken } from "../api";
@@ -25,7 +29,26 @@ import { IDLE_STORAGE_KEY, openStorageIdleChannel, type IdleMessage } from "./ch
 import { hasUnsavedChanges, isSessionEnding } from "./unsaved";
 
 const MINUTE = 60_000;
-const SESSION: Reply = [200, { idleSeconds: 1800, csrfToken: "f".repeat(43) }];
+const MARKER = "AAAAAAAAAAAAAAAA";
+const OTHER = "BBBBBBBBBBBBBBBB";
+
+/** The server's session: every request not marked background is a use. */
+const model = { lastUse: 0, ended: false, marker: MARKER };
+function alive(): boolean {
+  return !model.ended && Date.now() < model.lastUse + 30 * MINUTE;
+}
+function sessionReply(): Reply {
+  if (!alive()) return [401, { error: "unauthenticated" }];
+  return [
+    200,
+    {
+      idleSeconds: 1800,
+      idleSecondsLeft: Math.floor((model.lastUse + 30 * MINUTE - Date.now()) / 1000),
+      sessionMarker: model.marker,
+      csrfToken: "f".repeat(43),
+    },
+  ];
+}
 
 /** Every idle channel the page opens, as a BroadcastChannel stand-in we can post into. */
 class FakeBroadcastChannel {
@@ -70,10 +93,16 @@ afterEach(() => {
   window.localStorage.clear();
 });
 
-function server(routes: Record<string, Reply | ((s: Sent) => Reply)> = {}) {
-  return fakeServer({
-    "GET /api/me": [200, { ...me([A1]), idleSeconds: 1800 }],
-    "GET /api/session": SESSION,
+function server(
+  routes: Record<string, Reply | ((s: Sent) => Reply)> = {},
+  person: Record<string, unknown> = { idleSeconds: 1800, sessionMarker: MARKER },
+) {
+  model.lastUse = Date.now();
+  model.ended = false;
+  model.marker = MARKER;
+  const sent = fakeServer({
+    "GET /api/me": [200, { ...me([A1]), ...person }],
+    "GET /api/session": () => sessionReply(),
     "GET /api/working-site": [200, { createKinds: ["object"], review: false }],
     "GET /api/record-types": [200, TYPES_REPLY],
     "GET /api/templates": [200, TEMPLATES_REPLY],
@@ -81,6 +110,16 @@ function server(routes: Record<string, Reply | ((s: Sent) => Reply)> = {}) {
     "POST /api/sign-out": [200, { signedOut: true }],
     ...routes,
   });
+  // The server counts every request not marked background while alive.
+  const answer = globalThis.fetch;
+  vi.stubGlobal("fetch", (input: string, init: RequestInit = {}) => {
+    const headers = (init.headers ?? {}) as Record<string, string>;
+    if (headers["x-oculus-background"] === undefined && input !== "/api/sign-out" && alive()) {
+      model.lastUse = Date.now();
+    }
+    return answer(input, init);
+  });
+  return sent;
 }
 
 async function frame() {
@@ -143,6 +182,32 @@ describe("the idle warning", () => {
     expect(sent.some((s) => s.path === "/api/sign-out")).toBe(false);
   });
 
+  it("sends focus to the main region when the element that had it is gone, and announces each threshold once", async () => {
+    server();
+    renderAt(`/sites/${SITE_1}`);
+    await frame();
+    const gone = document.createElement("button");
+    gone.textContent = "Invented control";
+    document.body.append(gone);
+    gone.focus();
+    const dialog = await untilWarning();
+    gone.remove();
+    const live = () => dialog.querySelector("[aria-live=assertive]")?.textContent ?? "";
+    expect(live()).toBe("");
+    await act(() => vi.advanceTimersByTimeAsync(31_000));
+    expect(live()).toMatch(/^You'll be signed out in (29|30) seconds\.$/);
+    const first = live();
+    await act(() => vi.advanceTimersByTimeAsync(5_000));
+    expect(live()).toBe(first);
+    await act(() => vi.advanceTimersByTimeAsync(15_000));
+    expect(live()).toMatch(/^You'll be signed out in (9|10) seconds\.$/);
+    fireEvent.click(within(dialog).getByRole("button", { name: "Stay signed in" }));
+    await waitFor(() => {
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+    });
+    expect(document.activeElement).toBe(document.getElementById("main"));
+  });
+
   it("is dismissed by a key press or a click anywhere, but not by its own focus", async () => {
     server();
     renderAt(`/sites/${SITE_1}`);
@@ -183,18 +248,101 @@ describe("the idle warning", () => {
     ).toBeTruthy();
     expect(currentCsrfToken()).toBeUndefined();
     expect(screen.queryByText("Ada Invented")).toBeNull();
+    // The server was asked first, as background.
+    const confirm = sessionChecks(sent).at(-1);
+    expect(confirm?.headers["x-oculus-background"]).toBe("1");
     // The other tabs are told.
-    expect(FakeBroadcastChannel.posted).toContainEqual({ type: "signed-out" });
+    expect(FakeBroadcastChannel.posted).toContainEqual({
+      type: "signed-out",
+      session: MARKER,
+      reason: "idle",
+    });
     expect(isSessionEnding()).toBe(false);
   });
 
-  it("still clears the screen when the server can't be reached to sign out", async () => {
+  it("clears the screen even when the sign-out never settles", async () => {
+    const sent = server();
+    const answer = globalThis.fetch;
+    let signal: AbortSignal | undefined;
+    vi.stubGlobal("fetch", (input: string, init: RequestInit = {}) => {
+      if (input !== "/api/sign-out") return answer(input, init);
+      signal = init.signal ?? undefined;
+      sent.push({
+        method: init.method ?? "GET",
+        path: input,
+        headers: (init.headers ?? {}) as Record<string, string>,
+        body: undefined,
+      });
+      return new Promise<Response>(() => undefined); // never settles
+    });
+    renderAt(`/sites/${SITE_1}`);
+    await frame();
+    await act(() => vi.advanceTimersByTimeAsync(30 * MINUTE));
+    await screen.findByRole("heading", { level: 1, name: "Sign in" });
+    expect(currentCsrfToken()).toBeUndefined();
+    expect(screen.queryByText("Ada Invented")).toBeNull();
+    // The sign-out still went, with the token kept for it and a time limit.
+    await waitFor(() => {
+      expect(sent.some((s) => s.path === "/api/sign-out")).toBe(true);
+    });
+    const out = sent.find((s) => s.path === "/api/sign-out");
+    expect(out?.headers["x-oculus-csrf"]).toBe("f".repeat(43));
+    expect(signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("still clears the screen when the server answers the sign-out with a failure", async () => {
     server({ "POST /api/sign-out": [503, { error: "unavailable" }] });
     renderAt(`/sites/${SITE_1}`);
     await frame();
     await act(() => vi.advanceTimersByTimeAsync(30 * MINUTE));
     await screen.findByRole("heading", { level: 1, name: "Sign in" });
     expect(currentCsrfToken()).toBeUndefined();
+  });
+
+  it("clears only this screen when the server can't be reached at the end", async () => {
+    const sent = server();
+    renderAt(`/sites/${SITE_1}`);
+    await frame();
+    await act(() => vi.advanceTimersByTimeAsync(29 * MINUTE));
+    // The server goes away.
+    const answer = globalThis.fetch;
+    vi.stubGlobal("fetch", (input: string, init: RequestInit = {}) =>
+      input === "/api/session" ? Promise.reject(new TypeError("offline")) : answer(input, init),
+    );
+    await act(() => vi.advanceTimersByTimeAsync(2 * MINUTE));
+    await screen.findByRole("heading", { level: 1, name: "Sign in" });
+    expect(screen.getByText(/this screen was cleared/)).toBeTruthy();
+    expect(currentCsrfToken()).toBeUndefined();
+    // Neither the other tabs nor the server were told: the session may be alive there.
+    expect(
+      FakeBroadcastChannel.posted.filter((m) => JSON.stringify(m).includes("signed-out")),
+    ).toEqual([]);
+    expect(sent.some((s) => s.path === "/api/sign-out")).toBe(false);
+  });
+
+  it("goes on when its time is up but the server says the session is alive", async () => {
+    const sent = server();
+    renderAt(`/sites/${SITE_1}`);
+    await frame();
+    await act(() => vi.advanceTimersByTimeAsync(20 * MINUTE));
+    // Another tab used it; its message never came.
+    model.lastUse = Date.now();
+    await act(() => vi.advanceTimersByTimeAsync(11 * MINUTE));
+    expect(screen.getByRole("heading", { level: 1, name: "Invented archive site" })).toBeTruthy();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(sent.some((s) => s.path === "/api/sign-out")).toBe(false);
+    expect(
+      FakeBroadcastChannel.posted.filter((m) => JSON.stringify(m).includes("signed-out")),
+    ).toEqual([]);
+  });
+
+  it("starts no timer without the session's own limit, and leaves it to the server", async () => {
+    const sent = server({}, { sessionMarker: MARKER });
+    renderAt(`/sites/${SITE_1}`);
+    await frame();
+    await act(() => vi.advanceTimersByTimeAsync(60 * MINUTE));
+    expect(sessionChecks(sent)).toEqual([]);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
   });
 
   it("names unsaved changes, and they don't hold the way to sign in", async () => {
@@ -240,7 +388,8 @@ describe("across tabs", () => {
     await act(() => vi.advanceTimersByTimeAsync(20 * MINUTE));
     const channel = FakeBroadcastChannel.all.find((c) => c.name === "oculus-idle");
     act(() => {
-      channel?.deliver({ type: "use", at: Date.now() });
+      model.lastUse = Date.now();
+      channel?.deliver({ type: "use", session: MARKER, at: Date.now() });
     });
     await act(() => vi.advanceTimersByTimeAsync(20 * MINUTE));
     expect(screen.queryByRole("alertdialog")).toBeNull();
@@ -249,31 +398,83 @@ describe("across tabs", () => {
     expect(sessionChecks(sent)).toHaveLength(1);
   });
 
-  it("a sign-out in another tab clears this one without asking the server again", async () => {
-    const sent = server();
-    renderAt(`/sites/${SITE_1}`);
-    await frame();
-    const channel = FakeBroadcastChannel.all.find((c) => c.name === "oculus-idle");
-    act(() => {
-      channel?.deliver({ type: "signed-out" });
-    });
-    await screen.findByRole("heading", { level: 1, name: "Sign in" });
-    expect(screen.getByText(/You were signed out because Oculus wasn't used/)).toBeTruthy();
-    expect(sent.some((s) => s.path === "/api/sign-out")).toBe(false);
-    expect(currentCsrfToken()).toBeUndefined();
+  it("a sign-out of this session in another tab clears this one without asking the server", async () => {
+    for (const [reason, notice] of [
+      ["idle", /You were signed out because Oculus wasn't used for 30 minutes/],
+      ["manual", /You signed out in another tab/],
+      ["ended", /Your sign-in has ended/],
+    ] as const) {
+      const sent = server();
+      const { unmount } = renderAt(`/sites/${SITE_1}`);
+      await frame();
+      const channel = FakeBroadcastChannel.all.find((c) => c.name === "oculus-idle");
+      act(() => {
+        channel?.deliver({ type: "signed-out", session: MARKER, reason });
+      });
+      await screen.findByRole("heading", { level: 1, name: "Sign in" });
+      expect(screen.getByText(notice)).toBeTruthy();
+      expect(sent.some((s) => s.path === "/api/sign-out")).toBe(false);
+      expect(currentCsrfToken()).toBeUndefined();
+      unmount();
+      FakeBroadcastChannel.all = [];
+    }
   });
 
-  it("ignores messages of any other shape", async () => {
+  it("ignores another session's sign-out and messages of any other shape", async () => {
     server();
     renderAt(`/sites/${SITE_1}`);
     await frame();
     const channel = FakeBroadcastChannel.all.find((c) => c.name === "oculus-idle");
     act(() => {
-      channel?.deliver({ type: "signed-out", by: "someone" });
+      channel?.deliver({ type: "signed-out", session: OTHER, reason: "manual" });
+      channel?.deliver({ type: "signed-out", session: MARKER, reason: "manual", by: "x" });
+      channel?.deliver({ type: "signed-out" });
       channel?.deliver("signed-out");
     });
     await act(() => vi.advanceTimersByTimeAsync(1000));
     expect(screen.getByRole("heading", { level: 1, name: "Invented archive site" })).toBeTruthy();
+  });
+
+  it("on another session's use, asks the server, and reloads when that session is now this browser's", async () => {
+    const sent = server();
+    const { router } = renderAt(`/sites/${SITE_1}`);
+    await frame();
+    const before = sessionChecks(sent).length;
+    model.marker = OTHER;
+    const channel = FakeBroadcastChannel.all.find((c) => c.name === "oculus-idle");
+    act(() => {
+      channel?.deliver({ type: "use", session: OTHER, at: Date.now() });
+    });
+    await waitFor(() => {
+      expect(router.state.location.pathname).toBe("/");
+    });
+    const check = sessionChecks(sent)[before];
+    expect(check?.headers["x-oculus-background"]).toBe("1");
+  });
+
+  it("signing out by hand tells the other tabs", async () => {
+    server();
+    renderAt(`/sites/${SITE_1}`);
+    await frame();
+    fireEvent.click(screen.getByRole("button", { name: /^Account:/ }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Sign out" }));
+    await screen.findByRole("heading", { level: 1, name: "Sign in" });
+    expect(FakeBroadcastChannel.posted).toContainEqual({
+      type: "signed-out",
+      session: MARKER,
+      reason: "manual",
+    });
+  });
+
+  it("a 401 anywhere tells the other tabs the session has ended", async () => {
+    server({ "GET /api/record-types": [401, { error: "unauthenticated" }] });
+    renderAt(`/sites/${SITE_1}`);
+    await screen.findByRole("heading", { level: 1, name: "Sign in" });
+    expect(FakeBroadcastChannel.posted).toContainEqual({
+      type: "signed-out",
+      session: MARKER,
+      reason: "ended",
+    });
   });
 
   it("falls back to localStorage events without a BroadcastChannel", async () => {
@@ -294,7 +495,11 @@ describe("across tabs", () => {
       window.dispatchEvent(
         new StorageEvent("storage", {
           key: IDLE_STORAGE_KEY,
-          newValue: JSON.stringify({ message: { type: "signed-out" }, n: 1, r: 0.5 }),
+          newValue: JSON.stringify({
+            message: { type: "signed-out", session: MARKER, reason: "manual" },
+            n: 1,
+            r: 0.5,
+          }),
         }),
       );
     });

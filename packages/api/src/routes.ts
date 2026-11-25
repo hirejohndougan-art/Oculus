@@ -64,7 +64,8 @@ export interface OculusReply {
  * The request headers a handler can read; every other header stays with the
  * HTTP layer. `x-oculus-csrf` carries the session's CSRF token on every
  * change and `x-oculus-site` the working site (T-042, D-079);
- * `x-oculus-background: 1` marks a read that isn't a use of the session
+ * `x-oculus-background: 1` marks a read that isn't a use of the session,
+ * and `sec-fetch-site` tells a cross-site request, which isn't one either
  * (T-062, D-098). All are checked by the API's handlers, never trusted as
  * they are.
  */
@@ -79,6 +80,7 @@ export const REQUEST_HEADERS = [
   "x-oculus-csrf",
   "x-oculus-site",
   "x-oculus-background",
+  "sec-fetch-site",
 ] as const;
 export type RequestHeaderName = (typeof REQUEST_HEADERS)[number];
 

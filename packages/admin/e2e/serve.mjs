@@ -236,6 +236,9 @@ try {
       organizationName: "Invented Historical Society",
       helperName: "Ben Invented",
       idleEmail,
+      // T-062's idle test moves its session's times back (as the owner),
+      // the server-side half of its fake clock. A throwaway local database.
+      databaseUrl: database.url,
     }),
   );
 } catch (error) {

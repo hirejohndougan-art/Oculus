@@ -181,6 +181,12 @@ export interface FullSession {
    * (D-069), which the admin's own idle timer follows (T-062, D-098).
    */
   readonly idleSeconds: number;
+  /**
+   * Seconds until the idle end by the database's clock, as of this lookup
+   * (whole seconds, rounded down): so the admin can set its timer by the
+   * server without comparing clocks (T-062, D-098).
+   */
+  readonly idleSecondsLeft: number;
   /** When the password was last entered in this session. */
   readonly passwordAt: string;
   /** Whether that was within the window asked for (10 minutes by default). */
@@ -369,6 +375,7 @@ export interface FullRow {
   expires_at: string;
   idle_expires_at: string;
   idle_seconds: number;
+  idle_left: number;
   password_at: string;
   recent: boolean;
 }
@@ -383,6 +390,7 @@ export function fullSession(row: FullRow): FullSession {
     expiresAt: row.expires_at,
     idleExpiresAt: row.idle_expires_at,
     idleSeconds: row.idle_seconds,
+    idleSecondsLeft: row.idle_left,
     passwordAt: row.password_at,
     recentlyAuthenticated: row.recent,
   });
@@ -398,6 +406,9 @@ export function fullColumns(recentSeconds: number) {
     to_char(least(s.expires_at, s.last_seen_at + make_interval(secs => s.idle_seconds))
             AT TIME ZONE 'UTC', ${ISO}) AS idle_expires_at,
     s.idle_seconds,
+    greatest(0, floor(extract(epoch FROM
+      least(s.expires_at, s.last_seen_at + make_interval(secs => s.idle_seconds))
+      - clock_timestamp())))::integer AS idle_left,
     to_char(s.password_at AT TIME ZONE 'UTC', ${ISO}) AS password_at,
     s.password_at > clock_timestamp() - make_interval(secs => ${recentSeconds}) AS recent`;
 }

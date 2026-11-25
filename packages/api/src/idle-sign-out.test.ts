@@ -50,6 +50,7 @@ afterAll(async () => {
 interface Call {
   readonly token?: string;
   readonly background?: string;
+  readonly fetchSite?: string;
   readonly body?: unknown;
 }
 
@@ -61,6 +62,7 @@ function request(method: "GET" | "POST" | "PUT", url: string, c: Call = {}) {
     if (method !== "GET") headers[CSRF_HEADER] = csrfTokenFor(c.token) ?? "";
   }
   if (c.background !== undefined) headers[BACKGROUND_HEADER] = c.background;
+  if (c.fetchSite !== undefined) headers["sec-fetch-site"] = c.fetchSite;
   if (c.body !== undefined) headers["content-type"] = "application/json";
   return app.inject({
     method,
@@ -105,6 +107,23 @@ describe("GET /api/session", () => {
     expect(body.idleSeconds).toBe(1800);
     expect(typeof body.idleExpiresAt).toBe("string");
     expect(r.body).not.toContain(s.token);
+  });
+
+  it("gives the time left by the database's clock and a session marker that isn't the ID", async () => {
+    const s = await session();
+    await ageSession(w.db, s.sessionId, 600);
+    const polled = await request("GET", "/api/session", { token: s.token, background: "1" });
+    const body = polled.json<{ idleSecondsLeft: number; sessionMarker: string }>();
+    expect(body.idleSecondsLeft).toBeGreaterThanOrEqual(1198);
+    expect(body.idleSecondsLeft).toBeLessThanOrEqual(1200);
+    expect(body.sessionMarker).toMatch(/^[A-Za-z0-9_-]{16}$/);
+    expect(polled.body).not.toContain(s.sessionId);
+    // The same marker on /api/me; another session's differs.
+    const me = await request("GET", "/api/me", { token: s.token, background: "1" });
+    expect(me.json<{ sessionMarker: string }>().sessionMarker).toBe(body.sessionMarker);
+    const other = await session();
+    const theirs = await request("GET", "/api/session", { token: other.token });
+    expect(theirs.json<{ sessionMarker: string }>().sessionMarker).not.toBe(body.sessionMarker);
   });
 
   it("is 401 without a session", async () => {
@@ -217,6 +236,71 @@ describe("a background read", () => {
       body: { siteId: w.a1, record: {} },
     });
     expect(staff.body).toBe('{"error":"bad_request"}');
+  });
+});
+
+describe("a request from another site", () => {
+  it("is served but isn't a use, so a cross-site navigation can't keep a session going", async () => {
+    const s = await session();
+    await ageSession(w.db, s.sessionId, 60);
+    const before = await lastSeen(s.sessionId);
+    for (const site of ["cross-site", "same-site", "CROSS-SITE", "anything"]) {
+      const r = await request("GET", "/api/session", { token: s.token, fetchSite: site });
+      expect(r.statusCode, site).toBe(200);
+    }
+    expect(await lastSeen(s.sessionId)).toBe(before);
+    // From the admin itself, a typed address, or a client without the header: a use.
+    for (const site of ["same-origin", "none", undefined]) {
+      await ageSession(w.db, s.sessionId, 1);
+      const seen = await lastSeen(s.sessionId);
+      const r = await request("GET", "/api/session", {
+        token: s.token,
+        ...(site === undefined ? {} : { fetchSite: site }),
+      });
+      expect(r.statusCode).toBe(200);
+      expect(await lastSeen(s.sessionId), String(site)).not.toBe(seen);
+    }
+  });
+
+  it("past the limit is refused like any other", async () => {
+    const s = await session();
+    for (let i = 0; i < 2; i++) {
+      await ageSession(w.db, s.sessionId, 16 * 60);
+      await request("GET", "/api/session", { token: s.token, fetchSite: "cross-site" });
+    }
+    expectEnded(await request("GET", "/api/session", { token: s.token }));
+  });
+});
+
+describe("the background header on the sign-in routes", () => {
+  it("is refused on every change, before anything happens", async () => {
+    const s = await session();
+    for (const path of [
+      "/api/sign-in",
+      "/api/sign-in/code",
+      "/api/sign-in/set-up",
+      "/api/sign-in/set-up/confirm",
+      "/api/sign-out",
+      "/api/sign-out/others",
+      "/api/reauthenticate",
+      "/api/organization",
+      "/api/password-reset",
+      "/api/password-reset/complete",
+    ]) {
+      const r = await request("POST", path, { token: s.token, background: "1", body: {} });
+      expect([path, r.statusCode, r.body]).toEqual([path, 400, '{"error":"bad_request"}']);
+    }
+    // The sign-out above changed nothing: the session lives.
+    expect((await request("GET", "/api/session", { token: s.token })).statusCode).toBe(200);
+  });
+
+  it("is accepted and changes nothing on the waiting session's read, in its one spelling", async () => {
+    const plain = await request("GET", "/api/sign-in/pending");
+    const marked = await request("GET", "/api/sign-in/pending", { background: "1" });
+    expect(marked.statusCode).toBe(plain.statusCode);
+    expect(marked.body).toBe(plain.body);
+    const bad = await request("GET", "/api/sign-in/pending", { background: "yes" });
+    expect(bad.statusCode).toBe(400);
   });
 });
 

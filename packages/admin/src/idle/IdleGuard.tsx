@@ -2,28 +2,37 @@
  * Signing out after a period of no use (T-062, D-098), on screen: inside
  * the frame, so only while signed in. It runs the `IdleTimer` on the
  * session's own limit, counts a key press, a pointer press, a scroll and
- * coming back to the tab as activity, shows the one-minute warning, and
- * when the time is up signs out on the server, forgets the session's data
- * (`endSession`: the CSRF token, the query cache, the lists' memory) and
- * goes to the sign-in screen with a short reason. Unsaved editor changes
- * are not kept anywhere: the warning says they will be lost.
+ * coming back to the tab as activity, and shows the one-minute warning.
+ * When the time is up and the server says the session has ended, it first
+ * clears the screen (the sign-in screen with a short reason, then
+ * `endSession`: the CSRF token, the query cache, the lists' memory) and
+ * only then sends the sign-out, with the token it kept and a 5-second limit,
+ * without waiting for it: a request that never settles can't leave the
+ * screen up. Unsaved editor changes are not kept anywhere: the warning says
+ * they will be lost.
  *
  * The warning is a panel fixed over the page, not a modal (D-083: a modal
  * hides the page from Alfa's checks and dims it below AA contrast). It is an
  * `alertdialog` named by its heading and described by its text; focus moves
- * to "Stay signed in" when it appears and back to where it was when it goes;
- * Escape stays signed in too; the countdown is announced at 30 and 10
- * seconds in an assertive live region (every second would drown out
- * everything else).
+ * to "Stay signed in" when it appears and back to where it was when it goes
+ * (or to the page's main region if that element is gone); Escape stays
+ * signed in too; the countdown is announced once on reaching 30 seconds and
+ * once on reaching 10 in an assertive live region (every second would drown
+ * out everything else).
  */
 import { useEffect, useId, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router";
-import { api, onSessionUse } from "../api";
+import { api, currentCsrfToken, onSessionUse } from "../api";
 import { Button } from "../components/ui";
-import { endSession } from "../session";
-import { openIdleChannel, type IdleChannel } from "./channel";
-import { IdleTimer } from "./IdleTimer";
+import { endSession, isSessionEnded } from "../session";
+import {
+  isSessionMarker,
+  openIdleChannel,
+  type IdleChannel,
+  type SignedOutReason,
+} from "./channel";
+import { IdleTimer, type ExpiredWhere } from "./IdleTimer";
 import { hasUnsavedChanges, setSessionEnding } from "./unsaved";
 import styles from "./Idle.module.css";
 
@@ -36,6 +45,9 @@ import styles from "./Idle.module.css";
  */
 export const ACTIVITY_EVENTS = ["keydown", "pointerdown", "wheel", "touchstart", "focus"] as const;
 
+/** How long the sign-out request and the end-of-time check may take. */
+const SIGN_OUT_TIMEOUT_MS = 5000;
+
 /** "1 second", "45 seconds". */
 function seconds(n: number): string {
   return `${String(n)} ${n === 1 ? "second" : "seconds"}`;
@@ -46,13 +58,31 @@ function secondsLeft(deadline: number): number {
 }
 
 /** The sign-in screen's reason. */
-export function signedOutNotice(idleSeconds: number, unsaved: boolean): string {
+export function signedOutNotice(
+  reason: SignedOutReason | "unconfirmed",
+  idleSeconds: number,
+  unsaved: boolean,
+): string {
   const minutes = Math.max(1, Math.round(idleSeconds / 60));
   const span = minutes === 1 ? "a minute" : `${String(minutes)} minutes`;
-  return (
-    `You were signed out because Oculus wasn't used for ${span}.` +
-    (unsaved ? " Changes that weren't saved were lost." : "")
-  );
+  const lost = unsaved ? " Changes that weren't saved were lost." : "";
+  switch (reason) {
+    case "idle":
+      return `You were signed out because Oculus wasn't used for ${span}.${lost}`;
+    case "unconfirmed":
+      return `Oculus wasn't used for ${span}, so this screen was cleared. Sign in to go on.${lost}`;
+    case "manual":
+      return `You signed out in another tab.${lost}`;
+    case "ended":
+      return `Your sign-in has ended. Sign in again.${lost}`;
+  }
+}
+
+/** Where focus goes when the element that had it before the warning is gone. */
+function fallbackFocus(): HTMLElement | null {
+  const main = document.getElementById("main");
+  if (main !== null) return main;
+  return document.querySelector("h1");
 }
 
 export function IdleWarning(props: {
@@ -67,12 +97,21 @@ export function IdleWarning(props: {
   const ref = useRef<HTMLDivElement>(null);
   const [left, setLeft] = useState(() => secondsLeft(deadline));
   const [spoken, setSpoken] = useState("");
+  // The thresholds already announced: each once, even if a tick is skipped.
+  const announced = useRef<{ 30: boolean; 10: boolean }>({ 30: false, 10: false });
 
   useEffect(() => {
     const tick = setInterval(() => {
       const n = secondsLeft(deadline);
       setLeft(n);
-      if (n === 30 || n === 10) setSpoken(`You'll be signed out in ${seconds(n)}.`);
+      for (const threshold of [10, 30] as const) {
+        if (n <= threshold && !announced.current[threshold]) {
+          announced.current[30] = true;
+          if (threshold === 10) announced.current[10] = true;
+          setSpoken(`You'll be signed out in ${seconds(n)}.`);
+          break;
+        }
+      }
     }, 1000);
     return () => {
       clearInterval(tick);
@@ -84,16 +123,15 @@ export function IdleWarning(props: {
     const stay = ref.current?.querySelector("button");
     (stay ?? ref.current)?.focus();
     return () => {
-      // Back to where the person was, if it is still there and focus is
-      // still with the warning (not moved by the person meanwhile).
+      // Back to where the person was, or to the page's main region if that
+      // is gone, unless the person has moved focus meanwhile.
       const now = document.activeElement;
-      if (
-        before instanceof HTMLElement &&
-        before.isConnected &&
-        (now === null || now === document.body || !now.isConnected)
-      ) {
-        before.focus();
-      }
+      if (now !== null && now !== document.body && now.isConnected) return;
+      const target =
+        before instanceof HTMLElement && before.isConnected && before !== document.body
+          ? before
+          : fallbackFocus();
+      target?.focus();
     };
   }, []);
 
@@ -136,10 +174,12 @@ export function IdleWarning(props: {
 export function IdleGuard(props: {
   /** The session's idle limit from `GET /api/me`. */
   readonly idleSeconds: number;
+  /** The session's marker from `GET /api/me`. */
+  readonly marker: string;
   /** The cross-tab channel (tests); a BroadcastChannel or its fallback otherwise. */
   readonly channel?: () => IdleChannel;
 }) {
-  const { idleSeconds } = props;
+  const { idleSeconds, marker } = props;
   const openChannel = props.channel ?? openIdleChannel;
   const navigate = useNavigate();
   const queries = useQueryClient();
@@ -154,25 +194,46 @@ export function IdleGuard(props: {
   useEffect(() => {
     const channel = openChannel();
     let live = true;
-    async function signOut(where: "here" | "elsewhere") {
-      const unsaved = hasUnsavedChanges();
-      setWarning(undefined);
-      if (where === "here") {
-        // Ended on the server first; a failure (offline, already ended)
-        // still clears this screen, and the server ends it at its next use.
-        try {
-          await api("/api/sign-out", { body: {} });
-        } catch {
-          // As above.
-        }
-      }
+    /** Forget the screen first, then (here) end the session on the server without waiting. */
+    async function leave(where: ExpiredWhere) {
       if (!live) return;
+      live = false;
+      const unsaved = hasUnsavedChanges();
+      const reason =
+        typeof where === "string" ? (where === "here" ? "idle" : where) : where.elsewhere;
+      // The token to sign out with, before endSession forgets it.
+      const csrf = currentCsrfToken();
+      setWarning(undefined);
       setSessionEnding(true);
       try {
         await go.current("/sign-in", {
           replace: true,
-          state: { notice: signedOutNotice(idleSeconds, unsaved) },
+          state: { notice: signedOutNotice(reason, idleSeconds, unsaved) },
         });
+      } finally {
+        endSession(queries);
+        setSessionEnding(false);
+      }
+      if (where === "here") {
+        // Fire and forget, with a time limit: the screen is already clear,
+        // and a session the server has ended needs nothing more. A sign-out
+        // that never arrives changes nothing either: the session is past its
+        // limit on the server.
+        void api("/api/sign-out", {
+          body: {},
+          ...(csrf === undefined ? {} : { csrfToken: csrf }),
+          signal: AbortSignal.timeout(SIGN_OUT_TIMEOUT_MS),
+        }).catch(() => undefined);
+      }
+    }
+    /** Another session is this browser's now: drop this one's data and load the frame again. */
+    async function replaced() {
+      if (!live) return;
+      live = false;
+      setWarning(undefined);
+      setSessionEnding(true);
+      try {
+        await go.current("/", { replace: true });
       } finally {
         endSession(queries);
         setSessionEnding(false);
@@ -180,8 +241,25 @@ export function IdleGuard(props: {
     }
     const t = new IdleTimer({
       idleSeconds,
+      marker,
       channel,
       ping: () => api("/api/session"),
+      confirm: async () => {
+        try {
+          const reply = await api<{ sessionMarker?: unknown; idleSecondsLeft?: unknown }>(
+            "/api/session",
+            { background: true, signal: AbortSignal.timeout(SIGN_OUT_TIMEOUT_MS) },
+          );
+          const left = reply.idleSecondsLeft;
+          if (!isSessionMarker(reply.sessionMarker) || typeof left !== "number") {
+            throw new Error("unexpected reply");
+          }
+          return { alive: true, marker: reply.sessionMarker, secondsLeft: left };
+        } catch (error) {
+          if (isSessionEnded(error)) return { alive: false };
+          throw error;
+        }
+      },
       onWarn: (deadline) => {
         setWarning({ deadline, unsaved: hasUnsavedChanges() });
       },
@@ -189,7 +267,10 @@ export function IdleGuard(props: {
         setWarning(undefined);
       },
       onExpire: (where) => {
-        void signOut(where);
+        void leave(where);
+      },
+      onReplaced: () => {
+        void replaced();
       },
     });
     timer.current = t;
@@ -221,7 +302,7 @@ export function IdleGuard(props: {
       channel.close();
       timer.current = undefined;
     };
-  }, [idleSeconds, queries, openChannel]);
+  }, [idleSeconds, marker, queries, openChannel]);
 
   if (warning === undefined) return null;
   return (

@@ -1,15 +1,29 @@
 /**
  * The admin's tabs tell each other about the session (T-062, D-098): when
  * one tab used the session (so the idle limit restarts in every tab) and
- * when one signed out for no use (so every tab clears its screen). Over a
+ * when one signed out (so every tab clears its screen). Over a
  * `BroadcastChannel`, or, where there is none, over `storage` events on one
- * localStorage key. Only a time and a kind are sent: nothing of the
- * session, the person or the screen. A message that isn't exactly one of
- * the two shapes is dropped.
+ * localStorage key. Every message names its session by the server's
+ * `sessionMarker` (a short hash of the session's ID, not a secret), so a
+ * tab can tell news of its own session from another's. Nothing else of the
+ * session, the person or the screen is sent. A message that isn't exactly
+ * one of the shapes is dropped.
  */
 
+/** Why a tab signed out: no use, the person chose to, or the server had ended it. */
+export type SignedOutReason = "idle" | "manual" | "ended";
+
 export type IdleMessage =
-  { readonly type: "use"; readonly at: number } | { readonly type: "signed-out" };
+  | { readonly type: "use"; readonly session: string; readonly at: number }
+  | { readonly type: "signed-out"; readonly session: string; readonly reason: SignedOutReason };
+
+const MARKER = /^[A-Za-z0-9_-]{16}$/;
+const REASONS: readonly string[] = ["idle", "manual", "ended"];
+
+/** Whether `value` has the form of a server's session marker. */
+export function isSessionMarker(value: unknown): value is string {
+  return typeof value === "string" && MARKER.test(value);
+}
 
 export interface IdleChannel {
   post(message: IdleMessage): void;
@@ -22,20 +36,32 @@ const NAME = "oculus-idle";
 /** The localStorage key of the fallback. Holds the last message only. */
 export const IDLE_STORAGE_KEY = "oculus.idle";
 
-/** The message, if `data` is exactly one of the two shapes. */
+/** The message, if `data` is exactly one of the shapes. */
 export function readIdleMessage(data: unknown): IdleMessage | undefined {
   if (typeof data !== "object" || data === null || Array.isArray(data)) return undefined;
   const record = data as Record<string, unknown>;
+  if (!isSessionMarker(record.session)) return undefined;
   const keys = Object.keys(record).sort().join(",");
-  if (record.type === "signed-out" && keys === "type") return { type: "signed-out" };
+  if (
+    record.type === "signed-out" &&
+    keys === "reason,session,type" &&
+    typeof record.reason === "string" &&
+    REASONS.includes(record.reason)
+  ) {
+    return {
+      type: "signed-out",
+      session: record.session,
+      reason: record.reason as SignedOutReason,
+    };
+  }
   if (
     record.type === "use" &&
-    keys === "at,type" &&
+    keys === "at,session,type" &&
     typeof record.at === "number" &&
     Number.isFinite(record.at) &&
     record.at > 0
   ) {
-    return { type: "use", at: record.at };
+    return { type: "use", session: record.session, at: record.at };
   }
   return undefined;
 }
@@ -130,6 +156,18 @@ const silent: IdleChannel = {
 /** A BroadcastChannel if the browser has one, else localStorage events, else nothing. */
 export function openIdleChannel(): IdleChannel {
   return broadcastChannel() ?? storageChannel() ?? silent;
+}
+
+/**
+ * Tells the other tabs that this session has ended (signing out by hand, or
+ * the server answering 401): they clear their screens too. Opens a channel
+ * for the one message.
+ */
+export function announceSignedOut(session: unknown, reason: SignedOutReason): void {
+  if (!isSessionMarker(session)) return;
+  const channel = openIdleChannel();
+  channel.post({ type: "signed-out", session, reason });
+  channel.close();
 }
 
 /** The localStorage fallback on its own (tests). */

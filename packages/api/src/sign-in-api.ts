@@ -74,7 +74,13 @@ import { OCULUS_COOKIES } from "./cookies.js";
 import { Refusal } from "./errors.js";
 import { DEFAULT_RATE_LIMITS, SessionRateLimiter, type RateBucket } from "./rate-limit.js";
 import type { OculusReply, OculusRequest, OculusRoute } from "./routes.js";
-import { CSRF_HEADER, isActivity, redactedError, type ApiLogRecord } from "./staff-api.js";
+import {
+  CSRF_HEADER,
+  isActivity,
+  redactedError,
+  sessionMarker,
+  type ApiLogRecord,
+} from "./staff-api.js";
 
 export interface SignInApiOptions {
   /** The writer's pool (D-067): sessions, factors and resets live there. */
@@ -237,6 +243,7 @@ function sessionView(session: FullSession, token: string) {
     expiresAt: session.expiresAt,
     idleExpiresAt: session.idleExpiresAt,
     idleSeconds: session.idleSeconds,
+    sessionMarker: sessionMarker(session.sessionId),
     csrfToken: csrfTokenFor(token) ?? null,
   };
 }
@@ -685,7 +692,15 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
     const handler = route.handler;
     return {
       ...route,
-      handler: guarded(async (request, reply) => await handler(request, reply)),
+      handler: guarded(async (request, reply) => {
+        // X-Oculus-Background (T-062, D-098): refused on every change and
+        // in any spelling but `1`, before anything else; on a read that
+        // doesn't resolve a full session (`GET /api/sign-in/pending`) it is
+        // accepted and changes nothing, since a waiting session's end is
+        // fixed at its password.
+        isActivity(request);
+        return await handler(request, reply);
+      }),
     };
   });
 }
