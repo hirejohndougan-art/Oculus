@@ -30,6 +30,7 @@ import {
   readDesktopSettings,
   readLock,
   settingsFolder,
+  windowsSettingsWarning,
   STARTING_LOCK_MS,
   takeLock,
   urlHasPassword,
@@ -76,6 +77,19 @@ describe("settingsFolder", () => {
     expect(settingsFolder("win32", { OCULUS_DESKTOP_HOME: "/given", APPDATA: "x" }, "/h")).toBe(
       "/given",
     );
+  });
+
+  it("warns on Windows when OCULUS_DESKTOP_HOME is outside %APPDATA% (S-050)", () => {
+    const appData = "C:\\Users\\a\\AppData\\Roaming";
+    const warn = (given: string | undefined, platform: NodeJS.Platform = "win32") =>
+      windowsSettingsWarning(platform, { APPDATA: appData, OCULUS_DESKTOP_HOME: given });
+    expect(warn("D:\\Shared\\Oculus")).toContain("outside your own AppData folder");
+    expect(warn("C:\\Users\\a\\AppData\\Roaming-evil")).toBeDefined();
+    expect(warn("C:\\Users\\a\\AppData\\Roaming\\..\\..\\Public")).toBeDefined();
+    expect(warn("c:\\users\\A\\appdata\\roaming\\Oculus Test")).toBeUndefined();
+    expect(warn(undefined)).toBeUndefined();
+    expect(warn("/anywhere", "linux")).toBeUndefined();
+    expect(windowsSettingsWarning("win32", { OCULUS_DESKTOP_HOME: "D:\\x" })).toBeDefined();
   });
 
   it("refuses when there is nowhere to keep settings", () => {

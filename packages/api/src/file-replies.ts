@@ -132,6 +132,14 @@ export function mayShowInline(mediaType: unknown): boolean {
  * leading dots or spaces; at most `MAX_FILE_NAME_LENGTH` characters; `file`
  * if nothing is left.
  */
+/**
+ * A Windows device name (CON, nul.txt, COM1, CONIN$ …), case-insensitive,
+ * with or without an extension: such a name can't be saved as a file on
+ * Windows. Used here and by the update unpacker's name check (S-050).
+ */
+export const WINDOWS_DEVICE_NAME =
+  /^(?:con|prn|aux|nul|conin\$|conout\$|com[0-9¹²³]|lpt[0-9¹²³])(?:\.|$)/iu;
+
 export function safeFileName(name: unknown): string {
   const text = typeof name === "string" ? name.normalize("NFC") : "";
   let cleaned = text
@@ -142,7 +150,7 @@ export function safeFileName(name: unknown): string {
     .replace(/^[\s.]+/u, "")
     .replace(/[\s.]+$/u, "");
   // Windows device names (CON, nul.txt, COM1, CONIN$ …) can't be saved as they are.
-  if (/^(?:con|prn|aux|nul|conin\$|conout\$|com[0-9¹²³]|lpt[0-9¹²³])(?:\.|$)/iu.test(cleaned)) {
+  if (WINDOWS_DEVICE_NAME.test(cleaned)) {
     cleaned = `_${cleaned}`;
   }
   const chars = Array.from(cleaned);

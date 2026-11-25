@@ -398,8 +398,17 @@ export class UpdateManager {
     }
   }
 
+  /**
+   * The updates folder, made private (0700) when this creates it (S-050):
+   * it holds the waiting and older releases, logs and backups, which no
+   * other account on the server needs to read.
+   */
+  private async makeHome(): Promise<void> {
+    await mkdir(this.home, { recursive: true, mode: 0o700 });
+  }
+
   private async writeState(state: StoredState): Promise<void> {
-    await mkdir(this.home, { recursive: true });
+    await this.makeHome();
     const temp = this.path(`state.json.${randomBytes(6).toString("hex")}`);
     await writeFile(temp, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
     await rename(temp, this.path("state.json"));
@@ -446,7 +455,7 @@ export class UpdateManager {
    * is removed only by its holder. A lock whose process is gone is taken over.
    */
   private async lock(): Promise<() => Promise<void>> {
-    await mkdir(this.home, { recursive: true });
+    await this.makeHome();
     const file = this.path("update.lock");
     const token = randomBytes(12).toString("hex");
     const text = `${String(process.pid)} ${token}`;
@@ -681,6 +690,7 @@ export class UpdateManager {
     try {
       await this.removeLeftovers();
       step("checking");
+      await mkdir(this.path("releases"), { recursive: true, mode: 0o700 });
       const incoming = this.path("releases", `.incoming-${randomBytes(6).toString("hex")}`);
       let verified;
       try {
