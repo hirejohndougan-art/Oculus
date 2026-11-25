@@ -169,10 +169,11 @@ export interface RecordPosition {
 }
 
 /**
- * The sites that accepted the record from its home site (D-074): there it
- * is viewable, read-only. Sharing is T-041b's; until it stores accepted
- * offers, no record is shared anywhere, so this is always empty. It is here
- * so every permission check already asks.
+ * The sites that accepted the record from its home site, for the record's
+ * own permission checks (D-072's hook). Always empty, by D-094: shares
+ * (T-041b, `shares.ts`) are seen through their own read-only view and
+ * never widen `records.view` on the record itself, so `onRecord` and
+ * `allowsUnlocked` stay as they are. It stays so every check still asks.
  */
 export function sitesSharedInto(
   organizationId: OrganizationId,
@@ -180,8 +181,6 @@ export function sitesSharedInto(
 ): Promise<ReadonlySet<SiteId>> {
   const none: ReadonlySet<SiteId> = new Set<SiteId>();
   if (!isOrganizationId(organizationId) || !isRecordId(recordId)) return Promise.resolve(none);
-  // T-041b reads the record's accepted offers here (adding the caller's
-  // transaction as the first argument). No offer is stored yet.
   return Promise.resolve(none);
 }
 

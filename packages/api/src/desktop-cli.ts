@@ -22,7 +22,8 @@
  * Nothing printed shows the database URL's password or the secret key.
  *
  * Exit codes: 0 stopped normally, 1 refused or failed, 2 usage, 3 the
- * database `npm run desktop:database` made still needs its setup questions.
+ * database `npm run desktop:database` made still needs its setup questions,
+ * 4 another start is still starting or busy (nothing done; a message to read).
  */
 import { spawn as nodeSpawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
@@ -30,7 +31,12 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+  backup,
   checkWriterConnection,
+  defaultMigrationsDir,
+  pendingMigrations,
+  readMigrations,
+  type AppliedMigration,
   databaseBeforeSetup,
   grantWriterRole,
   migrate,
@@ -172,6 +178,74 @@ async function sealingKeyIds(db: Database): Promise<string[]> {
   return rows.map((r) => r.id);
 }
 
+/**
+ * If the code has migrations the database hasn't (an update), backs the
+ * database up first into the settings folder's `backups` (S-034b, D-102),
+ * so an update can be undone with `db:restore`. Returns false, having said
+ * why, if the backup couldn't be made: nothing is migrated then.
+ */
+async function backupBeforeUpdate(
+  db: Database,
+  connectionString: string,
+  folder: string,
+  env: Env,
+  out: Line,
+  err: Line,
+): Promise<boolean> {
+  let applied: AppliedMigration[];
+  try {
+    applied = await db.rows<AppliedMigration>(
+      sql`SELECT name, sha256 FROM public.oculus_migrations ORDER BY name`,
+    );
+  } catch {
+    // Fail closed: without the list, an update might run with no backup.
+    err("Couldn't read the database's list of changes, so nothing was changed. Try again.");
+    return false;
+  }
+  let pending: number;
+  try {
+    pending = pendingMigrations(await readMigrations(defaultMigrationsDir()), applied).length;
+  } catch {
+    // migrate() refuses the same way, before changing anything, and says why.
+    return true;
+  }
+  if (pending === 0) return true;
+  const dir = join(folder, "backups");
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const file = join(dir, `before-update-${stamp}.oculus-backup`);
+  out(`This update changes Oculus's database (${String(pending)} change(s)). Backing it up first…`);
+  // Ctrl+C or closing the console stops the backup cleanly (no partial file,
+  // no private folder left behind); nothing is migrated then.
+  const stop = new AbortController();
+  const signals = ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"] as const;
+  const onSignal = (): void => {
+    stop.abort();
+  };
+  for (const signal of signals) process.on(signal, onSignal);
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    await backup({
+      connectionString,
+      file,
+      env: { ...env },
+      signal: stop.signal,
+      log: (line) => {
+        if (/warn|could not|couldn't/i.test(line)) out(line);
+      },
+    });
+  } catch (error) {
+    const reason = error instanceof Error && error.message !== "" ? `: ${error.message}` : ".";
+    err(
+      `Couldn't back up the database before updating it${reason} Nothing was changed. To update without a backup, add "backupBeforeUpdate": false to desktop.json (or, if the PostgreSQL tools are somewhere unusual, set PG_BIN to their folder).`,
+    );
+    return false;
+  } finally {
+    for (const signal of signals) process.off(signal, onSignal);
+  }
+  out(`Backup saved: ${file}`);
+  return true;
+}
+
 /** Whether two connections reach the same database on the same running server. */
 async function sameDatabase(a: Database, b: Database): Promise<boolean> {
   const where = sql`SELECT current_database() AS d, pg_postmaster_start_time()::text AS t,
@@ -222,6 +296,7 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
   let url: string;
   let ownerUrl: string | undefined;
   let ownerFromSettings: boolean;
+  let backupFirst: boolean;
   let wantedPort: number;
   try {
     folder = settingsFolder(platform, env, options.home ?? homedir());
@@ -240,6 +315,7 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
     ownerFromSettings = ownerUrl !== undefined && ownerUrl === settings.ownerDatabaseUrl;
     secrets.push(...passwordOf(url), ...(ownerUrl === undefined ? [] : passwordOf(ownerUrl)));
     wantedPort = settings.port ?? DEFAULT_DESKTOP_PORT;
+    backupFirst = settings.backupBeforeUpdate !== false;
     const fromEnv = env.OCULUS_PORT;
     if (fromEnv !== undefined && fromEnv !== "") {
       const port = Number(fromEnv);
@@ -269,13 +345,13 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
   }
   if (lock.kind === "starting") {
     out("Oculus is already starting. Its window opens when it's ready.");
-    return 0;
+    return 4;
   }
   if (lock.kind === "busy") {
     out(
       "Oculus is already running but busy right now. Try again in a minute, or use its open window.",
     );
-    return 0;
+    return 4;
   }
   if (lock.kind === "running") {
     if (lock.lock.database !== database) {
@@ -379,6 +455,10 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
         return 1;
       }
       throw error;
+    }
+    if (backupFirst) {
+      const made = await backupBeforeUpdate(checker, ownerUrl ?? url, folder, env, out, err);
+      if (!made) return 1;
     }
     try {
       const result = await migrate({ connectionString: ownerUrl ?? url, log: out });

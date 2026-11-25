@@ -56,6 +56,7 @@ import {
   publicOutput,
   publicTemplateIssues,
   publicView,
+  type PublicRecord,
   validateRecord,
   type CatalogRecord,
   type DublinCoreMapping,
@@ -574,6 +575,45 @@ export async function publishCheckIssues(
   // S-026, D-091) fails here too, after every other reason.
   const template = publicTemplateIssues(effective.value, s.checkers);
   return template.length === 0 ? blocked : Object.freeze([...blocked, ...template]);
+}
+
+/**
+ * What the public is shown of a record now (T-041c, D-094), in the caller's
+ * transaction (which should be one REPEATABLE READ snapshot: `sharedItemViews`
+ * opens one). `undefined` unless the public could see it: published, on a
+ * home site (D-080's `record_public_on_site`), and passing the publish check
+ * public output runs (`effectivePublishIssues`: identifiers, rights, misfit
+ * values, deeds and access restrictions). Then `publicView` of its
+ * effective record: inherited public values in; staff-only fields,
+ * `record_link` values and labels, rights notes, place record IDs and
+ * non-public identifiers out. (Which public fields a site's Dublin Core
+ * mapping puts out is the public page's business, T-050b.)
+ */
+export async function publishedRecordView(
+  db: Queryable,
+  organizationId: OrganizationId,
+  recordId: RecordId,
+): Promise<PublicRecord | undefined> {
+  if (!isOrganizationId(organizationId) || !isRecordId(recordId)) return undefined;
+  const [row] = await db.rows<{ public: boolean }>(sql`
+    SELECT workflow_state = 'published' AND site_id IS NOT NULL AS public
+    FROM public.records
+    WHERE organization_id = ${organizationId}::uuid AND id = ${recordId}::uuid`);
+  if (row?.public !== true) return undefined;
+  const snapshot = await readSnapshot(db, organizationId, recordId, false);
+  if (!snapshot.ok) return undefined;
+  const s = snapshot.value;
+  const index = indexRecords(s.records);
+  if (!index.ok) return undefined;
+  const effective = effectiveRecord(recordId, index.value, s.templateFor, {
+    checkers: s.checkers,
+    identifiers: s.identifiers,
+  });
+  if (!effective.ok) return undefined;
+  if (effectivePublishIssues(effective.value, { accessions: s.accessions }).length > 0) {
+    return undefined;
+  }
+  return publicView(effective.value);
 }
 
 /** One value a record's public output takes from another record (S-020). */

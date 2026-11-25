@@ -37,6 +37,7 @@ const ALL_TABLES = [
   "password_resets",
   "people_events",
   "record_identifiers",
+  "record_shares",
   "record_term_index",
   "record_terms",
   "record_type_versions",
