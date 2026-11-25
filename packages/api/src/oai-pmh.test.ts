@@ -647,32 +647,37 @@ describe("stored datestamps (S-041, D-108)", () => {
     expect(get.body).not.toContain('status="deleted"');
   });
 
-  it("a shown record that stops being shown before the next pass is already a deleted header (S-047)", async () => {
+  it("a record no longer shown is skipped until the pass marks it, and one restored first keeps its datestamp (S-047)", async () => {
     const quiet = more[1] ?? "";
+    const before = (await storedStamps()).get(quiet);
     ok(
       await w.service.withdraw({ organizationId: w.a, actor: actorOf(w.root) }, quiet as never, {
         expectedVersion: 2,
       }),
     );
-    // No pass yet: its stored row still says shown, the public reader refuses it.
-    expect((await storedStamps()).get(quiet)?.deleted).toBe(false);
-    const get = await oai(`verb=GetRecord&metadataPrefix=oai_dc&identifier=${PREFIX}${quiet}`);
-    expect(get.body).toContain(
-      `<header status="deleted"><identifier>${PREFIX}${quiet}</identifier>`,
-    );
-    let all = "";
-    let reply = await oai("verb=ListIdentifiers&metadataPrefix=oai_dc");
-    all += reply.body;
-    let token = tokenIn(reply.body);
-    while (token !== undefined) {
-      reply = await oai(`verb=ListIdentifiers&resumptionToken=${token}`);
-      expect(identifiers(reply.body).length).toBeGreaterThan(0);
+    // No pass yet: skipped, never a deleted header at its old datestamp.
+    const listAll = async () => {
+      let all = "";
+      let reply = await oai("verb=ListIdentifiers&metadataPrefix=oai_dc");
       all += reply.body;
-      token = tokenIn(reply.body);
-    }
-    expect(all).toContain(`<header status="deleted"><identifier>${PREFIX}${quiet}</identifier>`);
+      let token = tokenIn(reply.body);
+      while (token !== undefined) {
+        reply = await oai(`verb=ListIdentifiers&resumptionToken=${token}`);
+        all += reply.body;
+        token = tokenIn(reply.body);
+      }
+      return all;
+    };
+    expect(await listAll()).not.toContain(quiet);
+    const get = await oai(`verb=GetRecord&metadataPrefix=oai_dc&identifier=${PREFIX}${quiet}`);
+    expect(errorCode(get.body)).toBe("idDoesNotExist");
+    // Restored before the next pass: shown again, same oai_dc, same datestamp,
+    // and no harvester was ever told it was deleted.
+    await publishAs(w, w.a, quiet, 3);
     await stamps.check();
-    expect((await storedStamps()).get(quiet)?.deleted).toBe(true);
+    const after = (await storedStamps()).get(quiet);
+    expect(after).toEqual(before);
+    expect(await listAll()).toContain(`<identifier>${PREFIX}${quiet}</identifier>`);
   });
 
   it("before a site's first pass, GetRecord gives the site's lower bound, never a staff save time (S-046)", async () => {

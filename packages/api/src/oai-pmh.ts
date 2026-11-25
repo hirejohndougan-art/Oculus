@@ -431,11 +431,8 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
   /** The staff reads' time limit (S-043a), as the public reads'. */
   const staffRead = options.timeLimitMs === undefined ? {} : { timeLimitMs: options.timeLimitMs };
 
-  /**
-   * The stored datestamp of a record the site has shown (S-041), whether or
-   * not it is still shown, or undefined for one it never showed.
-   */
-  async function storedStamp(site: PublicSite, id: string): Promise<string | undefined> {
+  /** A record the pass has marked as no longer shown on the site, or undefined (S-041). */
+  async function tombstone(site: PublicSite, id: string): Promise<string | undefined> {
     const stored = await oaiStoredStamp(
       options.db,
       site.organizationId,
@@ -443,7 +440,7 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
       id,
       staffRead,
     );
-    return stored?.stamp;
+    return stored?.deleted === true ? stored.stamp : undefined;
   }
 
   function metadata(oaiDcXml: string): string {
@@ -491,16 +488,23 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
     const output = await publicRecord(site, id);
     // A record the site has shown has a stored datestamp (S-041); one it
     // never showed has none and is unknown, never "deleted".
-    const stored = await storedStamp(site, id);
+    const stored = await oaiStoredStamp(
+      options.db,
+      site.organizationId,
+      site.siteId,
+      id,
+      staffRead,
+    );
     if (output === undefined) {
-      // Not shown now: a deleted header, whether the pass has marked it yet
-      // or not (S-047), at its stored datestamp.
-      if (stored === undefined) return fail("idDoesNotExist");
+      // Not shown now: a deleted header once the pass has marked it (with a
+      // datestamp of its own); until then, or for a record the site never
+      // showed, unknown (as the lists skip it).
+      if (stored?.deleted !== true) return fail("idDoesNotExist");
       if (metadataPrefix !== OAI_DC_PREFIX) return fail("cannotDisseminateFormat");
       return [
         "<GetRecord>",
         "<record>",
-        header(host, id, stored, true),
+        header(host, id, stored.stamp, true),
         "</record>",
         "</GetRecord>",
       ].join("\n");
@@ -509,7 +513,7 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
     // Before the site's first background pass there is no stored datestamp:
     // the site's lower bound stands in, never a time computed from record
     // versions, which would tell a harvester when staff saved (S-046).
-    let stamp = stored;
+    let stamp = stored?.stamp;
     if (stamp === undefined) {
       const repository = await oaiRepository(
         options.db,
@@ -613,14 +617,13 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
         // Only now: `after` (the token's place) moves past this candidate.
         scanned += 1;
         after = candidate;
-        if (output === undefined) {
-          // Shown when the pass last ran, not now: a deleted header at its
-          // stored datestamp (S-047), so a page never comes back empty and a
-          // run of such records reads as what it is.
-          const gone = header(host, candidate.id, candidate.stamp, true);
-          shown.push(verb === "ListIdentifiers" ? gone : `<record>\n${gone}\n</record>`);
-          continue;
-        }
+        // Shown when the pass last ran, not now: skipped until the next pass
+        // marks it deleted with a datestamp of its own. A deleted header here,
+        // at the old datestamp, would make a harvester drop a record that
+        // comes back before that pass for good (review of S-047). Only records
+        // the site has shown have rows (S-041), so a run of skipped ones tells
+        // nothing about records that were never public.
+        if (output === undefined) continue;
         shown.push(
           verb === "ListIdentifiers"
             ? header(host, candidate.id, candidate.stamp)
@@ -663,7 +666,7 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
           if (
             id === undefined ||
             ((await publicRecord(site, id)) === undefined &&
-              (await storedStamp(site, id)) === undefined)
+              (await tombstone(site, id)) === undefined)
           ) {
             return fail("idDoesNotExist");
           }

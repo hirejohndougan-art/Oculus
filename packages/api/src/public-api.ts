@@ -58,16 +58,17 @@ export const PUBLIC_POOL_SIZE = 4;
 export const PUBLIC_POOL_WAIT_MS = 5_000;
 
 /**
- * The options every process opens the public reader pool with (S-037):
- * `max` connections, at most `PUBLIC_POOL_WAIT_MS` waiting for one. A
- * route's `maxConcurrent` (or its `ReadSlots`) must not exceed `max`.
- */
-/**
  * The client-side limit on any one query of the public routes' pools
  * (S-051): above every statement limit they use (at most 60 s), so it only
  * fires when the server or network has stopped answering.
  */
 export const PUBLIC_QUERY_TIMEOUT_MS = 90_000;
+
+/**
+ * The options every process opens the public reader pool with (S-037):
+ * `max` connections, at most `PUBLIC_POOL_WAIT_MS` waiting for one. A
+ * route's `maxConcurrent` (or its `ReadSlots`) must not exceed `max`.
+ */
 
 export function publicPoolOptions(max = PUBLIC_POOL_SIZE): {
   applicationName: string;

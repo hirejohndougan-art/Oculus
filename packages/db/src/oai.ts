@@ -12,21 +12,16 @@
  * The lists read the stored datestamps (S-041, D-108: `oai_datestamps`,
  * written by `writeOaiStamps` from the background pass's fingerprints of
  * each record's oai_dc). Nothing here computes a datestamp from record
- * versions any more (S-046): that told a harvester when staff saved anything. A computed datestamp is the later of when its current version was
- * written (`record_versions.recorded_at`: every edit and every workflow
- * move writes a version) and when its template's stored Dublin Core
- * mapping last changed (D-096), since either changes its `oai_dc` record.
- * It doesn't follow changes to other records (a parent's title, a linked
- * record) or to vocabulary labels; D-105 says so.
+ * versions any more (S-046): that told a harvester when staff saved anything.
  *
  * Every statement here runs under a server-side time limit (S-043a): the
  * lists' at most 30 seconds (they wait on purpose for a datestamp write in
  * progress), and the one-record reads' and Identify's `timeLimitMs` (5
  * seconds by default), so a slow or locked staff database can't hold an
  * OAI-PMH slot for long. A statement that runs out of time throws an
- * `isDatabaseTimeout` error, which the routes answer `503 busy`. Not yet
- * bounded (S-051): the wait for a free staff connection, and a server or
- * network that stops answering altogether.
+ * `isDatabaseTimeout` error, which the routes answer `503 busy`. The wait
+ * for a free connection and a server that stops answering are bounded by
+ * the routes' own pool (`oaiPoolOptions`, S-051).
  */
 import { isOrganizationId, isRecordId, isSiteId } from "@oculus/core";
 import type { Database, Queryable } from "./client.js";
