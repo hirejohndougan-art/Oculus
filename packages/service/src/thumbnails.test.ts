@@ -4,8 +4,13 @@
 // ceiling, the scaling, the decoder process's queue, time limit, closing
 // and hard memory cap, and the third review's four repros. Every image is
 // invented (images.fixtures.ts), and made here.
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync } from "node:fs";
+import { closeSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { monitorEventLoopDelay } from "node:perf_hooks";
+import { fileURLToPath } from "node:url";
 import { deflateSync } from "node:zlib";
 import { afterAll, describe, expect, it } from "vitest";
 import {
@@ -13,7 +18,8 @@ import {
   VIEW_LIMITS,
   DECODE_BUDGET_BYTES,
   DECODE_MEMORY_CAP_BYTES,
-  WORKER_MARK,
+  THUMBNAIL_HEADER_BYTES,
+  precheckThumbnail,
   decodeAny,
   decodeImage,
   gifExtent,
@@ -31,6 +37,12 @@ import {
   decodeJpeg,
   flatJpeg,
   gifFrameOutside,
+  gifManyFrames,
+  jpegManyDri,
+  pngEmptyIdats,
+  pngEmptyTexts,
+  pngShortTrns,
+  webpManyChunks,
   hugeGif,
   hugeJpeg,
   makeGif,
@@ -46,6 +58,7 @@ import {
   noisePng,
   pngFrom,
   vp8lBigTables,
+  vp8lIncompleteCode,
   vp8lManyGroups,
   webpAttacks,
   zeroPng,
@@ -409,12 +422,20 @@ describe("strict walks and the memory budget (review B1, B2)", () => {
     // A group with colour-cache bits 11 is planned at 20 KB, not 6.5 (finding 2).
     expect(vp8lGroupBytes(11)).toBeGreaterThan(20_000);
     expect(vp8lGroupBytes(0)).toBeGreaterThan(11_800);
-    // The server's cheap check (no stream read) lets it through; the decoder process doesn't.
+    // The server's header check lets it through; the decoder process's plan doesn't.
     const big = vp8lBigTables();
-    expect(planDecode("image/webp", big, THUMBNAIL_LIMITS, false).bytes).toBeLessThan(
-      DECODE_BUDGET_BYTES,
-    );
+    expect(() => {
+      precheckThumbnail("image/webp", big.subarray(0, THUMBNAIL_HEADER_BYTES), THUMBNAIL_LIMITS);
+    }).not.toThrow();
     expect(() => planDecode("image/webp", big, THUMBNAIL_LIMITS)).toThrow("too_large");
+  });
+
+  it("reads every group's prefix codes and refuses an incomplete one before libwebp 1.1.0 sees it (CVE-2023-4863)", async () => {
+    const bad = vp8lIncompleteCode();
+    expect(() => planDecode("image/webp", bad, THUMBNAIL_LIMITS)).toThrow("webp_lossless");
+    await expect(decodeAny("image/webp", bad, THUMBNAIL_LIMITS)).rejects.toThrow("webp_lossless");
+    // The same file with every code valid is planned.
+    expect(planDecode("image/webp", vp8lManyGroups(64, 64), THUMBNAIL_LIMITS).width).toBe(64);
   });
 
   it("walks WebP strictly: animation chunks, a second frame, chunks out of order", async () => {
@@ -514,25 +535,45 @@ describe("the decoder process", () => {
     });
   });
 
-  it("never runs a job in the process that refused, failed or decoded a WebP before it", async () => {
+  it("starts a fresh process for every job", async () => {
     const renderer = createThumbnailRenderer();
     renderers.push(renderer);
-    const started = () => renderer.processesStarted();
-    // Kept, at most, after a clean answer that left it holding little
-    // (`REUSE_SLACK_BYTES`; how much it holds varies, so only allowed here).
     expect((await renderer.render("image/jpeg", makeJpeg(40, 30), 160)).ok).toBe(true);
-    expect((await renderer.render("image/png", makePng(40, 30), 160)).ok).toBe(true);
-    expect(started()).toBeLessThanOrEqual(2);
-    // A refusal: the next job gets a new process.
     expect((await renderer.render("image/jpeg", jpegSofSlack(), 160)).ok).toBe(false);
-    const afterRefusal = started();
-    expect((await renderer.render("image/gif", makeGif(20, 10), 160)).ok).toBe(true);
-    expect(started()).toBe(afterRefusal + 1);
-    // A WebP (its WebAssembly memory never shrinks): a new one after it.
     expect((await renderer.render("image/webp", await makeWebp(20, 10), 160)).ok).toBe(true);
-    const afterWebp = started();
-    expect((await renderer.render("image/jpeg", makeJpeg(20, 10), 160)).ok).toBe(true);
-    expect(started()).toBe(afterWebp + 1);
+    expect((await renderer.render("image/gif", makeGif(20, 10), 160)).ok).toBe(true);
+    expect(renderer.processesStarted()).toBe(4);
+  });
+
+  it("reads the file from a descriptor it is given, never moved or closed by it", async () => {
+    const renderer = createThumbnailRenderer();
+    renderers.push(renderer);
+    const path = join(tmpdir(), `oculus-thumb-test-${String(process.pid)}.jpg`);
+    writeFileSync(path, makeJpeg(200, 100));
+    const fd = openSync(path, "r");
+    try {
+      const first = await renderer.render("image/jpeg", { fd }, 160);
+      const second = await renderer.render("image/jpeg", { fd }, 160);
+      expect(first.ok && second.ok).toBe(true);
+      if (first.ok) expect(decodeJpeg(first.jpeg)).toMatchObject({ width: 160, height: 80 });
+      // Still open, at its start: read by position only.
+      const probe = Buffer.alloc(2);
+      expect(readSync(fd, probe, 0, 2, null)).toBe(2);
+      expect([...probe]).toEqual([0xff, 0xd8]);
+    } finally {
+      closeSync(fd);
+      rmSync(path, { force: true });
+    }
+  });
+
+  it("refuses an image a decoder throws on (a RangeError from pngjs), so it is remembered", async () => {
+    expect(() => decodeImage("image/png", pngShortTrns(), THUMBNAIL_LIMITS)).toThrow("decode");
+    const renderer = createThumbnailRenderer();
+    renderers.push(renderer);
+    expect(await renderer.render("image/png", pngShortTrns(), 160)).toMatchObject({
+      ok: false,
+      code: "refused",
+    });
   });
 
   it("doesn't count a process's start against a job's time limit (review)", async () => {
@@ -607,36 +648,6 @@ async function repros(): Promise<[string, string, Buffer, string][]> {
   ];
 }
 
-/**
- * The highest resident size of this process's decoder processes while
- * `run` runs, sampled every 2 ms from /proc (for the watchdog fallback,
- * where the renderer doesn't read it).
- */
-async function decoderPeak<T>(run: () => Promise<T>): Promise<{ result: T; peak: number }> {
-  let peak = 0;
-  const sample = (): void => {
-    for (const entry of readdirSync("/proc")) {
-      if (!/^\d+$/.test(entry)) continue;
-      try {
-        const status = readFileSync(`/proc/${entry}/status`, "latin1");
-        if (!new RegExp(`^PPid:\\s*${String(process.pid)}$`, "m").test(status)) continue;
-        if (!readFileSync(`/proc/${entry}/cmdline`, "latin1").includes(WORKER_MARK)) continue;
-        const hwm = /^VmHWM:\s*(\d+) kB/m.exec(status);
-        if (hwm !== null) peak = Math.max(peak, Number(hwm[1]) * 1024);
-      } catch {
-        // Gone in between.
-      }
-    }
-  };
-  const timer = setInterval(sample, 2);
-  try {
-    const result = await run();
-    return { result, peak };
-  } finally {
-    clearInterval(timer);
-  }
-}
-
 describe("the third review's repros (T-072)", () => {
   it("refuses each one by its plan, and in the decoder process", { timeout: 120_000 }, async () => {
     const renderer = createThumbnailRenderer();
@@ -666,9 +677,9 @@ describe("the third review's repros (T-072)", () => {
         peaks.push(`${name}: ${String(Math.round((result.peakBytes ?? 0) / MIB))} MiB`);
         expect(result.peakBytes, name).toBeGreaterThan(DECODE_MEMORY_CAP_BYTES / 2);
         expect(result.peakBytes, name).toBeLessThanOrEqual(DECODE_MEMORY_CAP_BYTES);
-        // The next job gets a fresh process and works.
-        expect((await renderer.render("image/jpeg", makeJpeg(30, 20), 160)).ok, name).toBe(true);
+        // Killed twice (a kill is tried once more in a fresh process before it counts).
         expect(renderer.processesStarted(), name).toBe(2);
+        expect((await renderer.render("image/jpeg", makeJpeg(30, 20), 160)).ok, name).toBe(true);
         await renderer.close();
       }
       process.stdout.write(`Killed at: ${peaks.join("; ")}\n`);
@@ -676,22 +687,192 @@ describe("the third review's repros (T-072)", () => {
   );
 
   it(
-    "kills one by the process's own watchdog where the parent can't read its size",
-    { timeout: 120_000 },
+    "holds the cap by the process's own watchdog alone (the parent not watching)",
+    { timeout: 300_000 },
     async () => {
-      const renderer = createThumbnailRenderer({ check: "unplanned", watch: "self" });
-      renderers.push(renderer);
-      const [, format, bytes] = (await repros())[3] ?? [];
-      const { result, peak } = await decoderPeak(() =>
-        renderer.render(format ?? "", bytes ?? Buffer.alloc(0), 160),
-      );
-      expect(result).toMatchObject({ ok: false, code: "killed" });
-      // Uncapped, this one takes about 1 GiB; the whole process (its start-up
-      // size included) stayed far below that.
-      expect(peak).toBeGreaterThan(0);
-      expect(peak).toBeLessThan(DECODE_MEMORY_CAP_BYTES + 160 * MIB);
+      const peaks: string[] = [];
+      const all = await repros();
+      for (const [name, format, bytes] of [all[0], all[3]].filter((r) => r !== undefined)) {
+        const renderer = createThumbnailRenderer({ check: "unplanned", parentWatch: false });
+        renderers.push(renderer);
+        const result = await renderer.render(format, bytes, 160);
+        // The watchdog's own report gives the peak.
+        expect(result, name).toMatchObject({ ok: false, code: "killed" });
+        peaks.push(`${name}: ${String(Math.round((result.peakBytes ?? 0) / MIB))} MiB`);
+        expect(result.peakBytes, name).toBeGreaterThan(DECODE_MEMORY_CAP_BYTES / 2);
+        expect(result.peakBytes, name).toBeLessThanOrEqual(DECODE_MEMORY_CAP_BYTES);
+        await renderer.close();
+      }
+      process.stdout.write(`Watchdog alone killed at: ${peaks.join("; ")}\n`);
     },
   );
+
+  it(
+    "holds the cap while the server's event loop is blocked for a second at a time (review B1)",
+    { timeout: 300_000 },
+    async () => {
+      const [, format, bytes] = (await repros())[3] ?? [];
+      const renderer = createThumbnailRenderer({ check: "unplanned", timeoutMs: 120_000 });
+      renderers.push(renderer);
+      let done: Awaited<ReturnType<typeof renderer.render>> | undefined;
+      void renderer.render(format ?? "", bytes ?? Buffer.alloc(0), 160).then((r) => {
+        done = r;
+      });
+      // The parent's sampler can't run while this loop spins; the watchdog can.
+      while (done === undefined) {
+        const until = Date.now() + 1000;
+        while (Date.now() < until) {
+          // Blocked.
+        }
+        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      const result = done;
+      process.stdout.write(
+        `Parent blocked, killed at: ${String(Math.round((result.peakBytes ?? 0) / MIB))} MiB\n`,
+      );
+      expect(result).toMatchObject({ ok: false, code: "killed" });
+      expect(result.peakBytes).toBeLessThanOrEqual(DECODE_MEMORY_CAP_BYTES);
+    },
+  );
+
+  it(
+    "ends a decoder process whose parent died mid-decode (review B1)",
+    { timeout: 120_000 },
+    async () => {
+      // A stand-in server: starts a decoder on a slow, legal decode, says its
+      // process ID once the job is sent, then is killed.
+      const dir = tmpdir();
+      const file = join(dir, `oculus-orphan-${String(process.pid)}.jpg`);
+      writeFileSync(file, flatJpeg(2480, 2480));
+      const worker = fileURLToPath(new URL("./thumbnail-worker.ts", import.meta.url));
+      const script = `
+        const m = await import(${JSON.stringify(worker)});
+        const { openSync } = await import("node:fs");
+        const child = m.spawnDecoder({ fd: openSync(${JSON.stringify(file)}, "r"), killAt: m.DECODE_MEMORY_CAP_BYTES - m.KILL_HEADROOM_BYTES, heapMiB: 384 });
+        child.on("message", (message) => {
+          if (message.ready) {
+            child.send({ id: 1, format: "image/jpeg", box: 160 });
+            process.stdout.write(String(child.pid) + "\\n");
+          }
+        });
+      `;
+      const server = spawn(process.execPath, ["--input-type=module", "-e", script], {
+        stdio: ["ignore", "pipe", "ignore"],
+        env: { PATH: process.env.PATH ?? "" },
+      });
+      try {
+        const pid = await new Promise<number>((resolve, reject) => {
+          let out = "";
+          server.stdout.on("data", (c: Buffer) => {
+            out += c.toString();
+            if (out.includes("\n")) resolve(Number(out.trim()));
+          });
+          server.on("exit", () => {
+            reject(new Error("the stand-in server ended first"));
+          });
+        });
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        // Alive: there, and not a zombie waiting to be reaped.
+        const alive = (): boolean => {
+          try {
+            return !/^State:\s*Z/m.test(readFileSync(`/proc/${String(pid)}/status`, "latin1"));
+          } catch {
+            return false;
+          }
+        };
+        expect(alive()).toBe(true);
+        server.kill("SIGKILL");
+        const killedAt = Date.now();
+        while (alive() && Date.now() - killedAt < 5000) {
+          await new Promise((resolve) => setTimeout(resolve, 2));
+        }
+        const gone = Date.now() - killedAt;
+        process.stdout.write(`Orphaned decoder gone after ${String(gone)} ms\n`);
+        // Its watchdog sees the parent gone within a few milliseconds; the
+        // decode alone would take far longer.
+        expect(alive()).toBe(false);
+        expect(gone).toBeLessThan(500);
+      } finally {
+        server.kill("SIGKILL");
+        rmSync(file, { force: true });
+      }
+    },
+  );
+});
+
+describe("walk bombs: the server reads only a header (review of T-072, B2)", () => {
+  it(
+    "keeps the server's event loop free and its memory flat; each is refused in the decoder process",
+    { timeout: 600_000 },
+    async () => {
+      const cases: [string, string, () => Promise<Buffer> | Buffer, string][] = [
+        ["J1: 17 million DRI segments", "image/jpeg", () => jpegManyDri(), "refused"],
+        ["P1: 8.7 million empty IDAT chunks", "image/png", () => pngEmptyIdats(), "refused"],
+        ["P2: 8.7 million empty tEXt chunks", "image/png", () => pngEmptyTexts(), "refused"],
+        ["W1: 13 million unknown WebP chunks", "image/webp", () => webpManyChunks(), "refused"],
+        ["G1: 6.6 million 1 × 1 GIF frames", "image/gif", () => gifManyFrames(), "refused"],
+      ];
+      const lines: string[] = [];
+      for (const [name, format, make, code] of cases) {
+        const path = join(tmpdir(), `oculus-walk-bomb-${String(process.pid)}`);
+        {
+          const bytes = await make();
+          expect(bytes.length, name).toBeGreaterThan(99 * MIB);
+          writeFileSync(path, bytes);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        const fd = openSync(path, "r");
+        try {
+          const before = process.memoryUsage.rss();
+          const delay = monitorEventLoopDelay({ resolution: 10 });
+          delay.enable();
+          // What the server does (files.ts): the header, then the descriptor.
+          const head = Buffer.alloc(THUMBNAIL_HEADER_BYTES);
+          readSync(fd, head, 0, head.length, 0);
+          let result: { ok: boolean; code?: string; peakBytes?: number } | undefined;
+          try {
+            precheckThumbnail(format, head, THUMBNAIL_LIMITS);
+          } catch {
+            result = { ok: false, code: "refused" };
+          }
+          if (result === undefined) {
+            const renderer = createThumbnailRenderer();
+            renderers.push(renderer);
+            result = await renderer.render(format, { fd }, 160);
+          }
+          delay.disable();
+          const grew = process.memoryUsage.rss() - before;
+          const worst = delay.max / 1e6;
+          lines.push(
+            `${name}: ${result.ok ? "made" : String(result.code)}, event loop delay max ${worst.toFixed(0)} ms, server RSS ${grew >= 0 ? "+" : ""}${String(Math.round(grew / MIB))} MiB, decoder ${String(Math.round((result.peakBytes ?? 0) / MIB))} MiB`,
+          );
+          expect(result, name).toMatchObject({ ok: false, code });
+          expect(worst, name).toBeLessThan(100);
+          expect(grew, name).toBeLessThan(32 * MIB);
+        } finally {
+          closeSync(fd);
+          rmSync(path, { force: true });
+        }
+      }
+      process.stdout.write(`Walk bombs: ${lines.join("; ")}\n`);
+    },
+  );
+
+  it("refuses each in the plan as soon as its count passes the limit", async () => {
+    for (const [name, format, bytes, code] of [
+      ["J1", "image/jpeg", jpegManyDri(1_000_000), "jpeg_segments"],
+      ["P1", "image/png", pngEmptyIdats(1_000_000), "png_chunk"],
+      ["P2", "image/png", pngEmptyTexts(1_000_000), "png_chunks"],
+      ["W1", "image/webp", await webpManyChunks(1_000_000), "webp_chunks"],
+      ["G1", "image/gif", gifManyFrames(1_000_000), "gif_blocks"],
+    ] as const) {
+      expect(() => planDecode(format, bytes, THUMBNAIL_LIMITS), name).toThrow(code);
+    }
+    // Small ones of the same shapes are real images.
+    expect(planDecode("image/png", pngEmptyTexts(4000), THUMBNAIL_LIMITS).width).toBe(8);
+    expect(planDecode("image/gif", gifManyFrames(4000), THUMBNAIL_LIMITS).width).toBe(1);
+  });
 });
 
 describe("peak memory of the largest images accepted (review B2, T-072)", () => {

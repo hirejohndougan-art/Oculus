@@ -2,10 +2,12 @@
 // the content hash only, the per-file cap mid-stream with nothing left
 // behind, a client that goes away, the checksum, placing over an existing
 // copy (kept when it is the same, replaced when damaged or a link), and the
-// refusals when opening. Every byte is invented.
+// refusals when opening (and opening a copy for the thumbnail decoder,
+// T-072). Every byte is invented.
 import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
   existsSync,
   linkSync,
   lstatSync,
@@ -14,6 +16,7 @@ import {
   utimesSync,
   mkdtempSync,
   readFileSync,
+  readSync,
   readdirSync,
   rmSync,
   symlinkSync,
@@ -426,6 +429,32 @@ describe("the second review's changes", () => {
     symlinkSync(target, own.pathFor(org, linked));
     expect(await own.touch(org, linked)).toBe(false);
     expect(Date.now() - lstatSync(target).mtimeMs).toBeGreaterThan(86_400_000);
+    rmSync(fresh, { recursive: true, force: true });
+  });
+
+  it("opens a stored copy as a descriptor for the decoder process, and only a plain copy of its own (T-072)", async () => {
+    const fresh = mkdtempSync(join(tmpdir(), "oculus-store-fd-"));
+    const own = await openFileStore({ dir: fresh });
+    const org = newOrganizationId();
+    const body = Buffer.from("invented stored bytes");
+    const got = await own.receive(org, chunksOf(body));
+    if (!got.ok) throw new Error(got.code);
+    await own.place(got.file);
+    const fd = await own.openContentDescriptor(org, got.file.sha256, body.length);
+    if (fd === undefined) throw new Error("not opened");
+    const back = Buffer.alloc(body.length);
+    expect(readSync(fd, back, 0, back.length, 0)).toBe(body.length);
+    expect(back.equals(body)).toBe(true);
+    closeSync(fd);
+    // The wrong size, none there, or a link where the copy should be: nothing opened.
+    expect(await own.openContentDescriptor(org, got.file.sha256, body.length + 1)).toBeUndefined();
+    expect(await own.openContentDescriptor(org, "0".repeat(64), 1)).toBeUndefined();
+    const target = join(fresh, "elsewhere");
+    writeFileSync(target, body);
+    const linked = "b".repeat(64);
+    mkdirSync(dirname(own.pathFor(org, linked)), { recursive: true });
+    symlinkSync(target, own.pathFor(org, linked));
+    expect(await own.openContentDescriptor(org, linked, body.length)).toBeUndefined();
     rmSync(fresh, { recursive: true, force: true });
   });
 

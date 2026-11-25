@@ -801,10 +801,11 @@ describe("review fixes: timeouts, budgets, HEAD, failures and downloads", () => 
     expect(r.status).toBe(422);
     expect(r.json.error).toBe("no_thumbnail");
     expect(existsSync(thumbPath(body, "none"))).toBe(true);
-    expect(capped.processesStarted()).toBe(1);
+    // Killed, tried once more in a fresh process, killed again: then remembered.
+    expect(capped.processesStarted()).toBe(2);
     // Asked again: the cache answers, and no decoder process is started.
     expect((await send(fileUrl(asset, id, "thumbnail"), { as: "cataloger", to })).status).toBe(422);
-    expect(capped.processesStarted()).toBe(1);
+    expect(capped.processesStarted()).toBe(2);
     await capped.close();
   }, 120_000);
 

@@ -1,42 +1,46 @@
 /**
  * The thumbnail renderer (M-003, T-072, D-097): a decoder process of its
- * own (thumbnail-worker.ts) that decodes and scales one image at a time.
+ * own (thumbnail-worker.ts) for every image, one at a time.
  *
- * - **A hard memory cap outside JavaScript (T-072).** Decodes run in a
- *   child process, not a thread, so the whole of its memory (heap, pixel
- *   buffers, WebAssembly) can be watched and taken back. While a job runs
- *   its resident size is read from Linux's /proc every 10 ms; once it has
- *   grown, from its size when it was ready, to within `KILL_HEADROOM_BYTES`
- *   of `DECODE_MEMORY_CAP_BYTES`, the process is stopped (SIGSTOP, so it
- *   grows no further while its peak is read), then killed (SIGKILL), and
- *   the job is answered `killed`: its peak stays within the cap.
- *   Where /proc can't be read, a thread inside the decoder process samples
- *   its size every 5 ms and kills the process itself. The plan
- *   (`planDecode`) is the first guard; this is the one that holds.
- * - **A fresh process after anything but a clean answer.** A refusal, a
- *   failure, a kill, a timeout, every WebP (WebAssembly memory never
- *   shrinks) and a decode that left the process holding more than
- *   `REUSE_SLACK_BYTES` all start the next job in a new process.
- * - **Heap flags and a time limit.** The process runs with a heap limit
- *   (`--max-old-space-size`) and a clean environment, its output is
- *   discarded, and each job has a time limit (`timeout`), past which the
- *   process is killed. Starting it doesn't count against the job's time.
+ * - **A hard memory cap outside JavaScript (T-072).** Each decode runs in a
+ *   child process started for it, not a thread, so the whole of its memory
+ *   (heap, pixel buffers, WebAssembly) is one process's. Two guards watch
+ *   its resident size plus swap, from its size once it was ready:
+ *   - **its own watchdog thread** (the primary guard, review B1), every
+ *     5 ms, which kills the process past the trigger whatever the server
+ *     or the decode is doing, and as soon as its parent is gone;
+ *   - **the parent**, every 10 ms from Linux's /proc, which stops it
+ *     (SIGSTOP, so it grows no further while its peak is read) and kills
+ *     it (SIGKILL) past the same trigger.
+ *   The trigger is `KILL_HEADROOM_BYTES` below `DECODE_MEMORY_CAP_BYTES`,
+ *   so the peak stays within the cap. A kill is answered `killed`, after
+ *   one more try in a fresh process (a kill could come of timing).
+ * - **The file, not its bytes.** The process is handed the stored copy's
+ *   descriptor and reads the file itself (nothing is copied over IPC); the
+ *   server reads only its header (`precheckThumbnail`).
+ * - **Heap flags and a time limit.** The process runs with a heap limit, an
+ *   empty environment and its output discarded; each job has a time limit
+ *   (`timeout`), past which the process is killed. Starting it doesn't
+ *   count against the job's time.
  * - **One job at a time, a short queue.** At most `maxQueued` jobs (one by
- *   default) wait; more are refused at once (`busy`, a 503), so a burst of
- *   requests for large images can't pile up memory or CPU on a small
- *   server. The service adds its own limits per organization and server.
- * - The process is unreferenced while idle, so it never keeps the server
- *   alive, and `close()` kills it. If the server goes, it goes.
+ *   default) wait; more are refused at once (`busy`, a 503). The service
+ *   adds its own limits per organization and server.
+ * - `close()` kills the running process.
  */
-import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import type { ChildProcess } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { closeSync, constants, openSync, rmSync, writeSync } from "node:fs";
+import { tmpdir } from "node:os";
+import type { Readable } from "node:stream";
+import { join } from "node:path";
 import {
   DECODE_MEMORY_CAP_BYTES,
+  DECODER_MARKER_FD,
+  KILLED_EXIT_CODE,
   KILL_HEADROOM_BYTES,
   TRANSIENT,
-  WORKER_MARK,
   procMemory,
+  spawnDecoder,
   type DecodeCheck,
   type ThumbnailAnswer,
   type ThumbnailJob,
@@ -54,11 +58,10 @@ export interface ThumbnailRendererOptions {
   /** How often the parent reads the decoder process's size, in ms (default 10). */
   readonly sampleMs?: number;
   /**
-   * Who watches the decoder process's memory: `parent` (from /proc, the
-   * default where it can be read) or `self` (a thread in the process, the
-   * fallback elsewhere; tests choose it to try it on Linux).
+   * Whether the parent watches too (default: where /proc can be read).
+   * Tests turn it off to show the decoder process's own watchdog holding.
    */
-  readonly watch?: "parent" | "self";
+  readonly parentWatch?: boolean;
   /**
    * Tests of the memory cap only: `unplanned` hands the decoder the bytes
    * without planning, to show the cap holding what a plan would miss.
@@ -77,61 +80,54 @@ export type RenderResult =
       readonly ok: false;
       /**
        * `refused`: the decoder refused the image, and `killed`: the decode
-       * passed the memory cap (both the same every time, so they may be
-       * remembered); `failed`: the process crashed or couldn't start, or
-       * the decoder ran out of memory on its own (says nothing about the
-       * image: never remembered); `timeout`: too slow; `busy`: the queue is
-       * full.
+       * passed the memory cap twice (both the same every time, so they may
+       * be remembered); `failed`: the process crashed or couldn't start, or
+       * an allocation failed (says nothing about the image: never
+       * remembered); `timeout`: too slow; `busy`: the queue is full.
        */
       readonly code: "refused" | "killed" | "failed" | "busy" | "timeout";
       readonly peakBytes?: number;
     };
 
+/** What to render: the bytes (tests), or a descriptor open on the file (the caller closes it). */
+export type ThumbnailSource = Uint8Array | { readonly fd: number };
+
 export interface ThumbnailRenderer {
-  /** Renders a thumbnail of `bytes`, decoded as `format`, to fit `box`. */
-  render(format: string, bytes: Uint8Array, box: number): Promise<RenderResult>;
-  /** How many decoder processes it has started (each refusal, kill or WebP starts another). */
+  /** Renders a thumbnail of the file, decoded as `format`, to fit `box`. */
+  render(format: string, source: ThumbnailSource, box: number): Promise<RenderResult>;
+  /** How many decoder processes it has started (one a job, two for a job killed once). */
   processesStarted(): number;
   /** Kills the decoder process; jobs still waiting are answered `busy`. */
   close(): Promise<void>;
 }
 
-/** The decoder's file: the build's JavaScript, or (tests, from the source) the TypeScript. */
-function workerPath(): string {
-  const built = fileURLToPath(new URL("./thumbnail-worker.js", import.meta.url));
-  return existsSync(built)
-    ? built
-    : fileURLToPath(new URL("./thumbnail-worker.ts", import.meta.url));
-}
-
 /** The longest a decoder process may take to start and load its decoders (30 s). */
 const STARTUP_MS = 30_000;
 
-/** A process left holding more than this after a clean answer is replaced (32 MiB). */
-export const REUSE_SLACK_BYTES = 32 * 1024 * 1024;
-
-/**
- * The decoder process's environment: nothing of the server's (no secrets,
- * no NODE_OPTIONS loading hooks or changing its limits), but what Windows
- * needs to start a process.
- */
-function decoderEnv(): NodeJS.ProcessEnv {
-  const root = process.env.SystemRoot;
-  return root === undefined ? {} : { SystemRoot: root };
-}
-
-interface Decoder {
-  readonly child: ChildProcess;
-  readonly pid: number;
-  /** Whether the parent reads its size (else its own watchdog holds the cap). */
-  readonly parentWatches: boolean;
-  ready: boolean;
-  /** Its resident size when it said it was ready (parent-watched only). */
-  baseline: number | undefined;
+/** Bytes given as such are written to a private temporary file for the decoder process. */
+function temporaryFile(bytes: Uint8Array): { fd: number; remove: () => void } {
+  const path = join(tmpdir(), `oculus-thumbnail-${randomBytes(12).toString("hex")}`);
+  const fd = openSync(
+    path,
+    constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+    0o600,
+  );
+  const remove = (): void => {
+    closeSync(fd);
+    rmSync(path, { force: true });
+  };
+  try {
+    for (let at = 0; at < bytes.length;) at += writeSync(fd, bytes, at, bytes.length - at, at);
+  } catch (error) {
+    remove();
+    throw error;
+  }
+  return { fd, remove };
 }
 
 interface Pending {
-  readonly job: ThumbnailJob;
+  readonly job: Omit<ThumbnailJob, "check">;
+  readonly source: ThumbnailSource;
   readonly done: (result: RenderResult) => void;
 }
 
@@ -140,199 +136,165 @@ export function createThumbnailRenderer(options: ThumbnailRendererOptions = {}):
   const maxQueued = options.maxQueued ?? 1;
   const cap = options.memoryCapBytes ?? DECODE_MEMORY_CAP_BYTES;
   const heapMiB = options.heapMiB ?? Math.ceil(cap / (1024 * 1024));
+  const sampleMs = options.sampleMs ?? 10;
   /** Killed this far up, so its peak (a sample later) stays within the cap. */
   const killAt = cap - Math.min(KILL_HEADROOM_BYTES, cap / 4);
-  const sampleMs = options.sampleMs ?? 10;
   const queue: Pending[] = [];
-  let decoder: Decoder | undefined;
-  let running:
-    | {
-        readonly pending: Pending;
-        timer: NodeJS.Timeout | undefined;
-        sampler?: NodeJS.Timeout;
-        sent?: boolean;
-      }
-    | undefined;
+  let running: { readonly stop: () => void } | undefined;
   let nextId = 1;
   let closed = false;
   let started = 0;
 
-  /** Kills the decoder process (it is never asked again). */
-  function stopDecoder(): void {
-    const d = decoder;
-    decoder = undefined;
-    if (d === undefined) return;
-    d.child.removeAllListeners();
-    d.child.kill("SIGKILL");
-  }
-
-  function finish(result: RenderResult): void {
-    const current = running;
-    if (current === undefined) return;
-    running = undefined;
-    clearTimeout(current.timer);
-    clearInterval(current.sampler);
-    current.pending.done(result);
-    next();
-  }
-
-  /** The decoder's growth since it was ready, now and at its peak (since the job began). */
-  function growth(d: Decoder): { now: number; peak: number } | undefined {
-    if (!d.parentWatches || d.baseline === undefined) return undefined;
-    const memory = procMemory(d.pid);
-    if (memory === undefined) return undefined;
-    return { now: memory.rss - d.baseline, peak: memory.peak - d.baseline };
-  }
-
-  /** Past the cap: stopped at once (so it grows no further), its peak read, killed. */
-  function killForMemory(d: Decoder): void {
-    try {
-      process.kill(d.pid, "SIGSTOP");
-    } catch {
-      // Already gone: its exit says so.
-    }
-    const seen = growth(d);
-    stopDecoder();
-    finish({ ok: false, code: "killed", ...(seen === undefined ? {} : { peakBytes: seen.peak }) });
-  }
-
-  function startDecoder(): Decoder {
-    // The parent watches where it can read /proc; elsewhere the process watches itself.
-    const parentWatches = options.watch !== "self" && procMemory("self") !== undefined;
+  /** One attempt: a fresh decoder process for the job, answered once. */
+  function attempt(
+    job: Pending["job"],
+    fd: number,
+  ): { readonly result: Promise<RenderResult>; readonly stop: () => void } {
     started++;
-    const child = spawn(
-      process.execPath,
-      [
-        `--max-old-space-size=${String(heapMiB)}`,
-        "--max-semi-space-size=16",
-        workerPath(),
-        WORKER_MARK,
-        String(parentWatches ? 0 : killAt),
-      ],
-      {
-        // Its own output never reaches the server's log.
-        stdio: ["ignore", "ignore", "ignore", "ipc"],
-        serialization: "advanced",
-        env: decoderEnv(),
-        windowsHide: true,
-      },
-    );
-    const d: Decoder = {
-      child,
-      pid: child.pid ?? -1,
-      parentWatches,
-      ready: false,
-      baseline: undefined,
+    const child: ChildProcess = spawnDecoder({ fd, killAt, heapMiB });
+    const pid = child.pid ?? -1;
+    const parentWatches = options.parentWatch ?? procMemory("self") !== undefined;
+    let baseline: number | undefined;
+    let timer: NodeJS.Timeout | undefined;
+    let sampler: NodeJS.Timeout | undefined;
+    let marker = "";
+    let answer: (result: RenderResult) => void = () => undefined;
+    const result = new Promise<RenderResult>((resolve) => {
+      answer = resolve;
+    });
+    let answered = false;
+    // Descriptor 5 (the typed tuple stops at 4).
+    const pipe = (child.stdio as readonly unknown[])[DECODER_MARKER_FD] as
+      Readable | null | undefined;
+    const end = (value: RenderResult): void => {
+      if (answered) return;
+      answered = true;
+      clearTimeout(timer);
+      clearInterval(sampler);
+      child.removeAllListeners();
+      pipe?.removeAllListeners();
+      pipe?.on("error", () => undefined);
+      child.kill("SIGKILL");
+      answer(value);
     };
-    child.on("message", (answer: ThumbnailAnswer | { readonly ready: true }) => {
-      if ("ready" in answer) {
+    const growth = (): { now: number; peak: number } | undefined => {
+      if (baseline === undefined) return undefined;
+      const memory = procMemory(pid);
+      return memory === undefined
+        ? undefined
+        : { now: memory.rss - baseline, peak: memory.peak - baseline };
+    };
+    // The watchdog's report, if it killed the process: "killed <peak growth>" or "orphan".
+    pipe?.on("data", (chunk: Buffer) => {
+      if (marker.length < 256) marker += chunk.toString("latin1");
+    });
+    pipe?.on("error", () => undefined);
+    child.on("message", (message: ThumbnailAnswer | { readonly ready: true }) => {
+      if ("ready" in message) {
         // Started, its decoders loaded and warmed up: its size now is the baseline.
-        d.ready = true;
-        d.baseline = parentWatches ? procMemory(d.pid)?.rss : undefined;
-        if (parentWatches && d.baseline === undefined) {
-          // Its size can't be read after all: never decode without the cap.
-          if (decoder === d) {
-            stopDecoder();
-            finish({ ok: false, code: "failed" });
-          }
-          return;
+        baseline = procMemory(pid)?.rss;
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          // Too slow: kill the process (its job can't be interrupted otherwise).
+          end({ ok: false, code: "timeout" });
+        }, timeoutMs);
+        if (parentWatches && baseline !== undefined) {
+          sampler = setInterval(() => {
+            const seen = growth();
+            if (seen === undefined || seen.now <= killAt) return;
+            // Past the trigger: stopped at once (so it grows no further), its peak read, killed.
+            try {
+              process.kill(pid, "SIGSTOP");
+            } catch {
+              // Already gone: its exit says so.
+            }
+            const last = growth() ?? seen;
+            end({ ok: false, code: "killed", peakBytes: last.peak });
+          }, sampleMs);
         }
-        if (decoder === d) dispatch();
+        const sent: ThumbnailJob =
+          options.check === undefined ? job : { ...job, check: options.check };
+        child.send(sent, (error) => {
+          if (error !== null) end({ ok: false, code: "failed" });
+        });
         return;
       }
-      const current = running;
-      if (current?.pending.job.id !== answer.id) return;
-      const seen = growth(d);
+      if (message.id !== job.id) return;
+      const seen = growth();
       const peak = seen === undefined ? {} : { peakBytes: seen.peak };
-      // Kept only after a clean answer that left little behind (and never after a WebP).
-      if (
-        !answer.ok ||
-        current.pending.job.format === "image/webp" ||
-        (seen?.now ?? 0) > REUSE_SLACK_BYTES
-      ) {
-        stopDecoder();
-      }
-      finish(
-        answer.ok
-          ? { ok: true, jpeg: new Uint8Array(answer.jpeg), ...peak }
-          : { ok: false, code: answer.code === TRANSIENT ? "failed" : "refused", ...peak },
+      end(
+        message.ok
+          ? { ok: true, jpeg: new Uint8Array(message.jpeg), ...peak }
+          : { ok: false, code: message.code === TRANSIENT ? "failed" : "refused", ...peak },
       );
     });
-    // An exit we didn't cause: SIGKILL is memory (its own watchdog, or the
-    // system's out-of-memory killer); anything else a crash or a failed start.
-    const lost = (_code: number | null, signal: NodeJS.Signals | null): void => {
-      if (decoder === d) decoder = undefined;
-      child.removeAllListeners();
-      finish({ ok: false, code: signal === "SIGKILL" ? "killed" : "failed" });
-    };
-    child.on("exit", lost);
-    child.on("error", () => {
-      lost(null, null);
-      child.kill("SIGKILL");
-    });
-    return d;
-  }
-
-  function next(): void {
-    if (running !== undefined || closed) return;
-    const pending = queue.shift();
-    if (pending === undefined) {
-      decoder?.child.unref();
-      decoder?.child.channel?.unref();
-      return;
-    }
-    decoder ??= startDecoder();
-    decoder.child.ref();
-    decoder.child.channel?.ref();
-    running = { pending, timer: undefined };
-    if (decoder.ready) {
-      dispatch();
-      return;
-    }
-    // Starting doesn't count against the job's time limit (review), but has a limit of its own.
-    running.timer = setTimeout(() => {
-      stopDecoder();
-      finish({ ok: false, code: "failed" });
-    }, STARTUP_MS);
-  }
-
-  /** Sends the running job to a ready decoder, starts its time limit and its memory watch. */
-  function dispatch(): void {
-    const current = running;
-    const d = decoder;
-    if (current === undefined || d === undefined || current.sent === true || !d.ready) return;
-    clearTimeout(current.timer);
-    current.sent = true;
-    current.timer = setTimeout(() => {
-      // Too slow: kill the process (its job can't be interrupted otherwise).
-      stopDecoder();
-      finish({ ok: false, code: "timeout" });
-    }, timeoutMs);
-    if (d.parentWatches && d.baseline !== undefined) {
-      current.sampler = setInterval(() => {
-        const seen = growth(d);
-        if (seen !== undefined && seen.now > killAt && decoder === d) killForMemory(d);
-      }, sampleMs);
-    }
-    const job =
-      options.check === undefined
-        ? current.pending.job
-        : { ...current.pending.job, check: options.check };
-    d.child.send(job, (error) => {
-      if (error !== null && running === current) {
-        stopDecoder();
-        finish({ ok: false, code: "failed" });
+    // Its end, once its pipes are closed (so the watchdog's report has been read).
+    child.on("close", (code, signal) => {
+      const report = /^killed (\d+)/.exec(marker);
+      if (report !== null) {
+        end({ ok: false, code: "killed", peakBytes: Number(report[1]) });
+      } else if (signal === "SIGKILL" || code === KILLED_EXIT_CODE) {
+        // The system's out-of-memory killer, or a watchdog that couldn't report.
+        end({ ok: false, code: "killed" });
+      } else {
+        end({ ok: false, code: "failed" });
       }
+    });
+    child.on("error", () => {
+      end({ ok: false, code: "failed" });
+    });
+    // Starting doesn't count against the job's time limit (review), but has a limit of its own.
+    timer = setTimeout(() => {
+      end({ ok: false, code: "failed" });
+    }, STARTUP_MS);
+    return {
+      result,
+      stop: () => {
+        end({ ok: false, code: "busy" });
+      },
+    };
+  }
+
+  async function run(pending: Pending): Promise<RenderResult> {
+    const { source } = pending;
+    const temporary = source instanceof Uint8Array ? temporaryFile(source) : undefined;
+    const fd = temporary?.fd ?? (source instanceof Uint8Array ? -1 : source.fd);
+    try {
+      let result: RenderResult = { ok: false, code: "busy" };
+      // A kill is tried once more in a fresh process before it counts (review).
+      for (let tries = 0; tries < 2 && !closed; tries++) {
+        const current = attempt(pending.job, fd);
+        running = current;
+        result = await current.result;
+        running = undefined;
+        if (result.ok || result.code !== "killed") break;
+      }
+      return closed ? { ok: false, code: "busy" } : result;
+    } finally {
+      temporary?.remove();
+    }
+  }
+
+  let working = false;
+  function next(): void {
+    if (working || closed) return;
+    const pending = queue.shift();
+    if (pending === undefined) return;
+    working = true;
+    void run(pending).then((result) => {
+      working = false;
+      pending.done(result);
+      next();
     });
   }
 
   return Object.freeze({
-    render(format: string, bytes: Uint8Array, box: number): Promise<RenderResult> {
+    render(format: string, source: ThumbnailSource, box: number): Promise<RenderResult> {
       if (closed || queue.length >= maxQueued) {
         return Promise.resolve({ ok: false, code: "busy" } as const);
       }
       return new Promise<RenderResult>((resolve) => {
-        queue.push({ job: { id: nextId++, format, bytes, box }, done: resolve });
+        queue.push({ job: { id: nextId++, format, box }, source, done: resolve });
         next();
       });
     },
@@ -340,14 +302,7 @@ export function createThumbnailRenderer(options: ThumbnailRendererOptions = {}):
     close(): Promise<void> {
       closed = true;
       for (const pending of queue.splice(0)) pending.done({ ok: false, code: "busy" });
-      if (running !== undefined) {
-        clearTimeout(running.timer);
-        clearInterval(running.sampler);
-        const current = running;
-        running = undefined;
-        current.pending.done({ ok: false, code: "busy" });
-      }
-      stopDecoder();
+      running?.stop();
       return Promise.resolve();
     },
   });

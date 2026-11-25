@@ -72,13 +72,16 @@ import {
 import { editPermissions, notPermitted, type RecordAccess, type Refusal } from "./access.js";
 import type { Runner } from "./admin.js";
 import type { FileStore, ReceivedFile, StoreMarker } from "./file-store.js";
+import { closeSync } from "node:fs";
 import {
   THUMBNAIL_BOXES,
   THUMBNAIL_LIMITS,
   THUMBNAIL_TYPES,
   VIEW_LIMITS,
   VIEW_TYPES,
-  planDecode,
+  THUMBNAIL_HEADER_BYTES,
+  THUMBNAIL_SOURCE_MAX_BYTES,
+  precheckThumbnail,
   viewDimensions,
   withinLimits,
   type ThumbnailSize,
@@ -149,8 +152,8 @@ export interface FileContent {
   readonly open: () => Readable;
 }
 
-/** The largest file a thumbnail is made from (100 MiB): it is read whole into memory. */
-export const MAX_THUMBNAIL_SOURCE_BYTES = 100 * 1024 * 1024;
+/** The largest file a thumbnail is made from (100 MiB): the decoder process reads it whole. */
+export const MAX_THUMBNAIL_SOURCE_BYTES = THUMBNAIL_SOURCE_MAX_BYTES;
 
 /** How much of a file's start is read to find an image's size before showing it (1 MiB). */
 export const VIEW_HEADER_BYTES = 1024 * 1024;
@@ -911,24 +914,31 @@ export function fileOperations(
         await store.writeThumbnail(organizationId, file.sha256, size, what).catch(() => undefined);
       };
       const made = (async (): Promise<ServiceResult<{ readonly jpeg: Uint8Array }>> => {
-        const bytes = await store.readContent(
+        // Only the header is read here (review of T-072, B2: walking a whole
+        // file on the server's event loop is a bomb of its own); the
+        // decoder process walks, plans and decodes the file itself.
+        const head = await store.readContent(
           organizationId,
           file.sha256,
           file.size,
-          MAX_THUMBNAIL_SOURCE_BYTES,
+          THUMBNAIL_HEADER_BYTES,
         );
-        if (bytes?.length !== file.size) return missingCopy();
-        // The header, its structure and the memory budget first, here: a
-        // bomb is refused before any decoder runs. (A VP8L stream's prefix
-        // codes are read by the decoder process, which plans again.)
+        if (head === undefined) return missingCopy();
         try {
-          planDecode(file.mediaType, bytes, THUMBNAIL_LIMITS, false);
+          precheckThumbnail(file.mediaType, head, THUMBNAIL_LIMITS);
         } catch {
           await remember("none");
           return noThumbnail();
         }
+        const fd = await store.openContentDescriptor(organizationId, file.sha256, file.size);
+        if (fd === undefined) return missingCopy();
         renderer ??= createThumbnailRenderer();
-        const result = await renderer.render(file.mediaType, bytes, box);
+        let result: Awaited<ReturnType<ThumbnailRenderer["render"]>>;
+        try {
+          result = await renderer.render(file.mediaType, { fd }, box);
+        } finally {
+          closeSync(fd);
+        }
         if (result.ok) {
           await remember(result.jpeg);
           return { ok: true, value: { jpeg: result.jpeg } };

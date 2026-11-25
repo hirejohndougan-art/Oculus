@@ -53,7 +53,7 @@
  * age shows its last use in any database.
  */
 import { createHash, randomBytes } from "node:crypto";
-import { constants, createReadStream, openSync, rmSync } from "node:fs";
+import { closeSync, constants, createReadStream, fstatSync, openSync, rmSync } from "node:fs";
 import {
   link,
   lstat,
@@ -215,6 +215,18 @@ export interface FileStore {
     sha256: string,
     size: number,
   ): Promise<(() => Readable) | undefined>;
+  /**
+   * A stored copy opened for reading (T-072: handed to the thumbnail
+   * decoder process, which reads it itself), checked as `openContent`
+   * checks it and again on the descriptor after opening (`O_NOFOLLOW`; a
+   * regular file of ours, one link, exactly `size` bytes). The caller
+   * closes it. `undefined` when it is missing or isn't right.
+   */
+  openContentDescriptor(
+    organizationId: OrganizationId,
+    sha256: string,
+    size: number,
+  ): Promise<number | undefined>;
   /**
    * Up to `maxBytes` of a stored copy from its start, checked as
    * `openContent` checks it; `undefined` when it is missing or isn't right.
@@ -730,6 +742,27 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
         const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
         return createReadStream("", { fd, autoClose: true });
       };
+    },
+
+    async openContentDescriptor(organizationId, sha256, size) {
+      const path = await checkedContent(organizationId, sha256, size);
+      if (path === undefined) return undefined;
+      let fd: number;
+      try {
+        fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      } catch {
+        return undefined;
+      }
+      try {
+        const info = fstatSync(fd);
+        if (info.isFile() && info.nlink === 1 && info.size === size && safeOwnership(info)) {
+          return fd;
+        }
+      } catch {
+        // Closed below.
+      }
+      closeSync(fd);
+      return undefined;
     },
 
     async readContent(organizationId, sha256, size, maxBytes) {

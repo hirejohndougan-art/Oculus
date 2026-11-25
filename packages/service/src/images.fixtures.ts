@@ -867,3 +867,130 @@ export async function alphBigTables(size = 1000): Promise<Buffer> {
   const alpha = Buffer.concat([Buffer.from([0x01]), vp8lBigTablesStream(size, size, 11).finish()]);
   return riff([vp8x(0x10, size, size), riffChunk("ALPH", alpha), chunksOf(lossy)]);
 }
+
+// ---------------------------------------------------------------------------
+// The T-072 review's walk bombs (B2): millions of tiny segments, chunks or
+// frames in just under the 100 MiB a thumbnail is made from, each built by
+// filling a repeated pattern (quick, and nothing on disk).
+
+/** Just under the 100 MiB a thumbnail is made from. */
+const WALK_BOMB_BYTES = 100 * 1024 * 1024 - 64 * 1024;
+
+/** `head`, then `pattern` repeated to fill, then `tail`, `total` bytes at most. */
+function repeated(head: Uint8Array, pattern: Uint8Array, tail: Uint8Array, total: number): Buffer {
+  const count = Math.floor((total - head.length - tail.length) / pattern.length);
+  const out = Buffer.alloc(head.length + count * pattern.length + tail.length);
+  out.set(head, 0);
+  out.fill(pattern, head.length, head.length + count * pattern.length);
+  out.set(tail, head.length + count * pattern.length);
+  return out;
+}
+
+/** J1: SOI, some 17 million `FF DD 00 04 00 00` DRI segments, then an 8 × 8 image. */
+export function jpegManyDri(total = WALK_BOMB_BYTES): Buffer {
+  const tail = makeJpeg(8, 8).subarray(2);
+  return repeated(Buffer.from([0xff, 0xd8]), Buffer.from([0xff, 0xdd, 0, 4, 0, 0]), tail, total);
+}
+
+/** P1: an 8 × 8 PNG's header, some 8.7 million zero-length IDAT chunks, its data and IEND. */
+export function pngEmptyIdats(total = WALK_BOMB_BYTES): Buffer {
+  const png = makePng(8, 8);
+  return repeated(png.subarray(0, 33), chunk("IDAT", new Uint8Array(0)), png.subarray(33), total);
+}
+
+/** P2: an 8 × 8 PNG's header, some 8.7 million empty tEXt chunks, its data and IEND. */
+export function pngEmptyTexts(total = WALK_BOMB_BYTES): Buffer {
+  const png = makePng(8, 8);
+  return repeated(png.subarray(0, 33), chunk("tEXt", new Uint8Array(0)), png.subarray(33), total);
+}
+
+/** W1: a 16 × 16 WebP's VP8X, some 13 million empty unknown chunks, then its frame. */
+export async function webpManyChunks(total = WALK_BOMB_BYTES): Promise<Buffer> {
+  const frame = chunksOf(await makeWebp(16, 16));
+  const head = Buffer.concat([
+    Buffer.from("RIFF"),
+    Buffer.alloc(4),
+    Buffer.from("WEBP"),
+    vp8x(0, 16, 16),
+  ]);
+  const out = repeated(head, Buffer.from("ABCD\0\0\0\0", "latin1"), frame, total);
+  out.writeUInt32LE(out.length - 8, 4);
+  return out;
+}
+
+/** G1: a 1 × 1 GIF of some 6.6 million 1 × 1 frames (omggif makes an object for each). */
+export function gifManyFrames(total = WALK_BOMB_BYTES): Buffer {
+  // Screen 1 × 1 with a 2-colour table; each frame a descriptor, LZW size 2,
+  // one sub-block (clear, 0, end: 0x44 0x01), the block end.
+  const head = Buffer.from([
+    ...Buffer.from("GIF89a"),
+    1,
+    0,
+    1,
+    0,
+    0x80,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0xff,
+    0xff,
+    0xff,
+  ]);
+  const frame = Buffer.from([0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x44, 0x01, 0]);
+  return repeated(head, frame, Buffer.from([0x3b]), total);
+}
+
+/** A 16-bit grey PNG with a 1-byte tRNS chunk (pngjs throws a RangeError on it). */
+export function pngShortTrns(): Buffer {
+  const rows = deflateSync(Buffer.alloc(4 * (1 + 8)));
+  return pngFrom([
+    ["IHDR", ihdr(4, 4, 16, 0)],
+    ["tRNS", Buffer.from([0])],
+    ["IDAT", rows],
+    ["IEND", new Uint8Array(0)],
+  ]);
+}
+
+/**
+ * A lossless WebP like `vp8lManyGroups`, but its last group's green code
+ * is incomplete (two symbols of lengths 1 and 2: three quarters of the
+ * code space), the kind of code libwebp before 1.3.2 wrote past its tables
+ * for (CVE-2023-4863). The plan must read every group's codes and refuse it.
+ */
+export function vp8lIncompleteCode(size = 64): Buffer {
+  const w = new BitWriter();
+  w.write(0x2f, 8);
+  w.write(size - 1, 14);
+  w.write(size - 1, 14);
+  w.write(0, 1);
+  w.write(0, 3);
+  w.write(0, 1); // no transform
+  w.write(0, 1); // no colour cache
+  w.write(1, 1); // meta prefix codes
+  w.write(0, 3); // 4 × 4 blocks
+  const groups = Math.ceil(size / 4) ** 2;
+  w.write(0, 1);
+  eightBitLiterals(w, 256 + 24);
+  eightBitLiterals(w, 256);
+  oneSymbol(w, 0);
+  oneSymbol(w, 0);
+  oneSymbol(w, 0);
+  for (let g = 0; g < groups; g++) {
+    w.writeCode(g & 0xff, 8);
+    w.writeCode(g >> 8, 8);
+  }
+  for (let g = 0; g < groups; g++) {
+    if (g === groups - 1) {
+      const lengths = new Uint8Array(280);
+      lengths[0] = 1;
+      lengths[1] = 2;
+      writeNormalCode(w, lengths);
+    } else {
+      oneSymbol(w, 0);
+    }
+    for (let c = 1; c < 5; c++) oneSymbol(w, 0);
+  }
+  return riff([riffChunk("VP8L", w.finish())]);
+}

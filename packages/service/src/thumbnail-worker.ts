@@ -29,10 +29,11 @@
  * started from the build or, in tests, from the source with Node's type
  * stripping.
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { spawn, type ChildProcess } from "node:child_process";
+import { fstatSync, readFileSync, readSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { inflateSync } from "node:zlib";
 
 /** The formats Oculus makes thumbnails of (sniffed types, D-086). */
@@ -120,9 +121,12 @@ const u16be = (b: Uint8Array, i: number): number => ((b[i] ?? 0) << 8) | (b[i + 
 const u16le = (b: Uint8Array, i: number): number => (b[i] ?? 0) | ((b[i + 1] ?? 0) << 8);
 const u24le = (b: Uint8Array, i: number): number => u16le(b, i) | ((b[i + 2] ?? 0) << 16);
 const u32be = (b: Uint8Array, i: number): number => u16be(b, i) * 65_536 + u16be(b, i + 2);
-const ascii = (b: Uint8Array, i: number, text: string): boolean =>
-  b.length >= i + text.length &&
-  Array.from({ length: text.length }, (_, k) => k).every((k) => b[i + k] === text.charCodeAt(k));
+/** Whether `text` (ASCII) is at `i`: byte for byte, no strings made (B2). */
+function ascii(b: Uint8Array, i: number, text: string): boolean {
+  if (b.length < i + text.length) return false;
+  for (let k = 0; k < text.length; k++) if (b[i + k] !== text.charCodeAt(k)) return false;
+  return true;
+}
 
 const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 
@@ -161,6 +165,12 @@ const JPEG_SEGMENTS = new Set([
 const JPEG_FRAMES = new Set([0xc0, 0xc1, 0xc2]);
 /** The largest sampling factor JPEG allows (ITU T.81 B.2.2); jpeg-js takes up to 15. */
 const JPEG_MAX_SAMPLING = 4;
+/**
+ * The most segments a JPEG may have (review of T-072, B2: millions of tiny
+ * segments cost time and, kept, memory): 64 DHT, DQT and DRI together,
+ * 1,000 scans, 4,096 segments of any kind. Real files have a few dozen.
+ */
+export const JPEG_LIMITS = Object.freeze({ tables: 64, scans: 1000, segments: 4096 });
 
 /**
  * Checks a segment's length against exactly what jpeg-js reads of it
@@ -270,8 +280,19 @@ function walkJpeg(b: Uint8Array, whole: boolean, rebuild = false): JpegLayout {
   if (b[0] !== 0xff || b[1] !== 0xd8) throw new ImageRefused("header");
   let frame: JpegLayout | undefined;
   let scanned = false;
-  const kept: Uint8Array[] = [b.subarray(0, 2)];
+  // What is kept, as start and end offsets (never views, B2): SOI, tables, the frame, scans, EOI.
+  const kept = new Uint32Array(2 * (2 + JPEG_LIMITS.tables + 1 + JPEG_LIMITS.scans + 1));
+  let keptCount = 0;
+  const keep = (start: number, end: number): void => {
+    kept[2 * keptCount] = start;
+    kept[2 * keptCount + 1] = end;
+    keptCount++;
+  };
+  keep(0, 2);
   let adobe: Uint8Array | undefined;
+  let tables = 0;
+  let scans = 0;
+  let segments = 0;
   let i = 2;
   for (;;) {
     if (i + 2 > b.length) throw new ImageRefused("jpeg_truncated");
@@ -280,13 +301,20 @@ function walkJpeg(b: Uint8Array, whole: boolean, rebuild = false): JpegLayout {
     if (marker === 0xd9) {
       if (!scanned || frame === undefined) throw new ImageRefused("jpeg_truncated");
       if (!rebuild) return frame;
-      if (adobe !== undefined) kept.splice(1, 0, adobe);
-      kept.push(b.subarray(i, i + 2));
-      const canonical = new Uint8Array(kept.reduce((n, part) => n + part.length, 0));
+      keep(i, i + 2);
+      let total = adobe?.length ?? 0;
+      for (let k = 0; k < keptCount; k++) total += (kept[2 * k + 1] ?? 0) - (kept[2 * k] ?? 0);
+      const canonical = new Uint8Array(total);
       let at = 0;
-      for (const part of kept) {
+      for (let k = 0; k < keptCount; k++) {
+        const part = b.subarray(kept[2 * k] ?? 0, kept[2 * k + 1] ?? 0);
         canonical.set(part, at);
         at += part.length;
+        // The Adobe marker right after SOI.
+        if (k === 0 && adobe !== undefined) {
+          canonical.set(adobe, at);
+          at += adobe.length;
+        }
       }
       return { ...frame, canonical };
     }
@@ -294,6 +322,11 @@ function walkJpeg(b: Uint8Array, whole: boolean, rebuild = false): JpegLayout {
       // FF 00, fill bytes, RST, TEM, DNL and every other marker.
       throw new ImageRefused("jpeg_marker");
     }
+    if (++segments > JPEG_LIMITS.segments) throw new ImageRefused("jpeg_segments");
+    if ((marker === 0xc4 || marker === 0xdb || marker === 0xdd) && ++tables > JPEG_LIMITS.tables) {
+      throw new ImageRefused("jpeg_segments");
+    }
+    if (marker === 0xda && ++scans > JPEG_LIMITS.scans) throw new ImageRefused("jpeg_segments");
     if (i + 4 > b.length) throw new ImageRefused("jpeg_truncated");
     const length = u16be(b, i + 2);
     const end = i + 2 + length;
@@ -322,11 +355,11 @@ function walkJpeg(b: Uint8Array, whole: boolean, rebuild = false): JpegLayout {
         }
         break;
       }
-      kept.push(b.subarray(i, j));
+      keep(i, j);
       i = j;
       continue;
     }
-    if (marker < 0xe0) kept.push(b.subarray(i, end));
+    if (marker < 0xe0) keep(i, end);
     i = end;
   }
 }
@@ -463,7 +496,25 @@ interface PngLayout {
   readonly depth: number;
   readonly colorType: number;
   readonly interlaced: boolean;
-  readonly idat: readonly Uint8Array[];
+  /** Each IDAT chunk's data as start and end offsets (never views, B2). */
+  readonly idat: Uint32Array;
+  readonly idatBytes: number;
+}
+
+/**
+ * The most chunks a PNG may have (review of T-072, B2): 65,536, room for
+ * libpng's 8 KiB IDAT chunks in a 100 MiB file, far below the millions of
+ * empty chunks a hostile file can hold.
+ */
+export const PNG_MAX_CHUNKS = 65_536;
+
+/** Whether four bytes are a PNG chunk type (letters only), compared as bytes. */
+function pngType(b: Uint8Array, i: number): boolean {
+  for (let k = 0; k < 4; k++) {
+    const c = (b[i + k] ?? 0) | 0x20;
+    if (c < 0x61 || c > 0x7a) return false;
+  }
+  return true;
 }
 
 /**
@@ -471,8 +522,9 @@ interface PngLayout {
  * IHDR, so a second one could smuggle a larger image past the limits):
  * the signature, then exactly one IHDR of length 13 first; at most one
  * PLTE, before the image data, present for colour type 3 and absent for
- * grey types; the IDAT chunks consecutive; IEND last with nothing after
- * it; every length within the file. Anything else is refused.
+ * grey types; the IDAT chunks consecutive and none empty; IEND last with
+ * nothing after it; every length within the file; at most `PNG_MAX_CHUNKS`
+ * chunks. Anything else is refused.
  */
 function walkPng(bytes: Uint8Array): PngLayout {
   if (!PNG_SIGNATURE.every((v, i) => bytes[i] === v)) throw new ImageRefused("png_header");
@@ -492,47 +544,66 @@ function walkPng(bytes: Uint8Array): PngLayout {
   ) {
     throw new ImageRefused("png_header");
   }
-  const idat: Uint8Array[] = [];
+  let idat = new Uint32Array(64);
+  let idatCount = 0;
+  let idatBytes = 0;
   let palettes = 0;
+  let chunks = 1;
   let idatState: "before" | "in" | "after" = "before";
   let i = 8 + 25;
   for (;;) {
+    if (++chunks > PNG_MAX_CHUNKS) throw new ImageRefused("png_chunks");
     if (i + 12 > bytes.length) throw new ImageRefused("png_truncated");
     const length = u32be(bytes, i);
     const end = i + 12 + length;
     if (length > 0x7fffffff || end > bytes.length) throw new ImageRefused("png_truncated");
-    const type = String.fromCharCode(...bytes.subarray(i + 4, i + 8));
-    if (!/^[A-Za-z]{4}$/.test(type)) throw new ImageRefused("png_chunk");
-    if (type === "IHDR") throw new ImageRefused("png_second_header");
-    if (type === "IDAT") {
-      if (idatState === "after") throw new ImageRefused("png_chunk");
+    if (!pngType(bytes, i + 4)) throw new ImageRefused("png_chunk");
+    if (ascii(bytes, i + 4, "IHDR")) throw new ImageRefused("png_second_header");
+    if (ascii(bytes, i + 4, "IDAT")) {
+      if (idatState === "after" || length === 0) throw new ImageRefused("png_chunk");
       idatState = "in";
-      idat.push(bytes.subarray(i + 8, i + 8 + length));
+      if (2 * idatCount + 2 > idat.length) {
+        const grown = new Uint32Array(idat.length * 2);
+        grown.set(idat);
+        idat = grown;
+      }
+      idat[2 * idatCount] = i + 8;
+      idat[2 * idatCount + 1] = i + 8 + length;
+      idatCount++;
+      idatBytes += length;
     } else {
       if (idatState === "in") idatState = "after";
-      if (type === "PLTE") {
+      if (ascii(bytes, i + 4, "PLTE")) {
         palettes++;
         if (palettes > 1 || idatState !== "before" || colorType === 0 || colorType === 4) {
           throw new ImageRefused("png_palette");
         }
       }
-      if (type === "IEND") {
+      if (ascii(bytes, i + 4, "IEND")) {
         if (end !== bytes.length) throw new ImageRefused("png_after_end");
         break;
       }
     }
     i = end;
   }
-  if (idat.length === 0) throw new ImageRefused("png_truncated");
+  if (idatCount === 0) throw new ImageRefused("png_truncated");
   if (colorType === 3 && palettes !== 1) throw new ImageRefused("png_palette");
-  return { width, height, depth, colorType, interlaced: interlace === 1, idat };
+  return {
+    width,
+    height,
+    depth,
+    colorType,
+    interlaced: interlace === 1,
+    idat: idat.subarray(0, 2 * idatCount),
+    idatBytes,
+  };
 }
 
 /**
  * Inflates a PNG's image data with a ceiling of exactly what its header
  * allows, so a few kilobytes that inflate to gigabytes are refused there.
  */
-function checkPngData(layout: PngLayout): void {
+function checkPngData(bytes: Uint8Array, layout: PngLayout): void {
   const channels = PNG_CHANNELS[layout.colorType] ?? 4;
   const ceiling = pngInflatedBytes(
     layout.width,
@@ -540,8 +611,14 @@ function checkPngData(layout: PngLayout): void {
     layout.depth * channels,
     layout.interlaced,
   );
+  const data = new Uint8Array(layout.idatBytes);
+  for (let k = 0, at = 0; k < layout.idat.length; k += 2) {
+    const part = bytes.subarray(layout.idat[k] ?? 0, layout.idat[k + 1] ?? 0);
+    data.set(part, at);
+    at += part.length;
+  }
   try {
-    inflateSync(Buffer.concat(layout.idat), { maxOutputLength: ceiling });
+    inflateSync(data, { maxOutputLength: ceiling });
   } catch {
     // Over the ceiling (a bomb) or not valid zlib data.
     throw new ImageRefused("png_data");
@@ -569,6 +646,9 @@ interface WebpLayout {
   readonly frameEnd: number;
   readonly alpha?: WebpAlpha;
 }
+
+/** The most chunks a WebP may have (B2; real files have a handful). */
+export const WEBP_MAX_CHUNKS = 64;
 
 /** Width and height from a VP8 or VP8L chunk's own data. */
 function webpFrameSize(
@@ -623,9 +703,11 @@ function walkWebp(bytes: Uint8Array): WebpLayout {
   let iccp = false;
   let i = 12;
   let first = true;
+  let chunks = 0;
   while (i < body.length) {
+    if (++chunks > WEBP_MAX_CHUNKS) throw new ImageRefused("webp_chunks");
     if (i + 8 > body.length) throw new ImageRefused("webp_chunk");
-    const type = String.fromCharCode(...body.subarray(i, i + 4));
+    const is = (fourcc: string): boolean => ascii(body, i, fourcc);
     const length =
       (body[i + 4] ?? 0) +
       (body[i + 5] ?? 0) * 256 +
@@ -633,24 +715,25 @@ function walkWebp(bytes: Uint8Array): WebpLayout {
       (body[i + 7] ?? 0) * 16_777_216;
     const end = i + 8 + length + (length % 2);
     if (end > body.length && i + 8 + length !== body.length) throw new ImageRefused("webp_chunk");
-    if (type === "VP8X") {
+    if (is("VP8X")) {
       if (!first || length !== 10) throw new ImageRefused("webp_chunk");
       if (((body[i + 8] ?? 0) & 0x02) !== 0) throw new ImageRefused("webp_animated");
       canvas = { width: 1 + u24le(body, i + 12), height: 1 + u24le(body, i + 15) };
-    } else if (type === "ANIM" || type === "ANMF") {
+    } else if (is("ANIM") || is("ANMF")) {
       throw new ImageRefused("webp_animated");
-    } else if (type === "VP8 " || type === "VP8L") {
+    } else if (is("VP8 ") || is("VP8L")) {
+      const lossless = is("VP8L");
       if (frame !== undefined) throw new ImageRefused("webp_second_frame");
       if (!first && canvas === undefined) throw new ImageRefused("webp_chunk");
       // libwebp ignores ALPH for a lossless frame (its alpha is its own): refused.
-      if (type === "VP8L" && alpha !== undefined) throw new ImageRefused("webp_chunk");
+      if (lossless && alpha !== undefined) throw new ImageRefused("webp_chunk");
       frame = {
-        ...webpFrameSize(type, body, i + 8, length),
-        lossless: type === "VP8L",
+        ...webpFrameSize(lossless ? "VP8L" : "VP8 ", body, i + 8, length),
+        lossless,
         start: i + 8,
         end: i + 8 + length,
       };
-    } else if (type === "ALPH") {
+    } else if (is("ALPH")) {
       if (canvas === undefined || frame !== undefined || alpha !== undefined || length < 1) {
         throw new ImageRefused("webp_chunk");
       }
@@ -660,7 +743,7 @@ function walkWebp(bytes: Uint8Array): WebpLayout {
         throw new ImageRefused("webp_alpha");
       }
       alpha = { compression: header & 3, start: i + 9, end: i + 8 + length };
-    } else if (type === "ICCP") {
+    } else if (is("ICCP")) {
       if (canvas === undefined || frame !== undefined || iccp) throw new ImageRefused("webp_chunk");
       iccp = true;
     } else if (first) {
@@ -934,6 +1017,11 @@ interface Vp8lCost {
   readonly subPixels: number;
   /** Sub-images read (each has one group of its own). */
   readonly subImages: number;
+  /**
+   * Reads every group's five prefix codes and checks each is valid
+   * (CVE-2023-4863): call once the plan is within the budget.
+   */
+  readonly checkGroups: () => void;
 }
 
 /**
@@ -986,7 +1074,13 @@ function vp8lCost(
     for (const px of entropy) largest = Math.max(largest, (px >> 8) & 0xffff);
     groups = largest + 1;
   }
-  return { groups, cacheBits, subPixels, subImages };
+  const checkGroups = (): void => {
+    const green = 256 + 24 + (cacheBits > 0 ? 1 << cacheBits : 0);
+    for (let g = 0; g < groups; g++) {
+      for (const size of [green, 256, 256, 256, 40]) vp8lReadCode(br, size);
+    }
+  };
+  return { groups, cacheBits, subPixels, subImages, checkGroups };
 }
 
 /** What libwebp's prefix-code tables and sub-images cost for one VP8L stream, at most. */
@@ -1068,20 +1162,43 @@ function jpegFrameBytes(layout: JpegLayout): number {
   return bytes;
 }
 
+/** How much of a file's start the server reads before handing it to the decoder process (64 KiB). */
+export const THUMBNAIL_HEADER_BYTES = 64 * 1024;
+
 /**
- * Checks an image's header as the format named (never guessed), strictly
- * for JPEG, PNG and WebP, against the limits and the memory budget, and
- * returns what decoding it will cost; throws `ImageRefused` otherwise.
- * With `deep` false (the server's check before queueing), a VP8L stream's
- * prefix codes aren't read (that decodes its sub-images), so the plan is a
- * lower bound there; the decoder process plans again with `deep`.
+ * The server's own check before a thumbnail is queued (review of T-072,
+ * B2): only `head`, at most `THUMBNAIL_HEADER_BYTES` of the file's start,
+ * so it costs the server nothing whatever the file holds. The bytes must
+ * start as the format named does, and a size its header declares within
+ * them must be within the limits; anything the header doesn't settle is
+ * left to the decoder process, which walks and plans the whole file.
+ * Throws `ImageRefused` for a file to remember as having no thumbnail.
  */
-export function planDecode(
-  format: string,
-  bytes: Uint8Array,
-  limits: ImageLimits,
-  deep = true,
-): DecodePlan {
+export function precheckThumbnail(format: string, head: Uint8Array, limits: ImageLimits): void {
+  if (!THUMBNAIL_TYPES.has(format)) throw new ImageRefused("format");
+  const bounded = head.subarray(0, THUMBNAIL_HEADER_BYTES);
+  const signed =
+    format === "image/jpeg"
+      ? bounded[0] === 0xff && bounded[1] === 0xd8
+      : format === "image/png"
+        ? PNG_SIGNATURE.every((v, i) => bounded[i] === v)
+        : format === "image/gif"
+          ? ascii(bounded, 0, "GIF87a") || ascii(bounded, 0, "GIF89a")
+          : ascii(bounded, 0, "RIFF") && ascii(bounded, 8, "WEBP");
+  if (!signed) throw new ImageRefused("header");
+  const size = imageDimensions(format, bounded);
+  if (size !== undefined && !withinLimits(size, limits)) throw new ImageRefused("too_large");
+}
+
+/**
+ * Checks an image as the format named (never guessed), walking it strictly
+ * for JPEG, PNG, WebP and GIF, against the limits and the memory budget,
+ * and returns what decoding it will cost; throws `ImageRefused` otherwise.
+ * It reads the whole file (a VP8L stream's sub-images included), so it
+ * runs in the decoder process only (review of T-072, B2): the server
+ * checks just the header (`precheckThumbnail`).
+ */
+export function planDecode(format: string, bytes: Uint8Array, limits: ImageLimits): DecodePlan {
   if (!THUMBNAIL_TYPES.has(format)) throw new ImageRefused("format");
   let width: number;
   let height: number;
@@ -1113,11 +1230,27 @@ export function planDecode(
       extra += width * height * (alpha.compression === 1 ? 5 : 1);
     }
     const { body } = layout;
-    if (layout.lossless) {
-      check = () =>
-        vp8lTableBytes(vp8lCost(body, layout.frameStart + 5, layout.frameEnd, width, height));
-    } else if (alpha?.compression === 1) {
-      check = () => vp8lTableBytes(vp8lCost(body, alpha.start, alpha.end, width, height));
+    // libwebp here is 1.1.0, before 1.3.2's fix for CVE-2023-4863 (a
+    // crafted prefix code overflowing its tables): every code of every
+    // group is read and must be complete (or one symbol) before libwebp
+    // sees the stream, so the tables never pass kTableSize.
+    const stream = layout.lossless
+      ? { start: layout.frameStart + 5, end: layout.frameEnd }
+      : alpha?.compression === 1
+        ? { start: alpha.start, end: alpha.end }
+        : undefined;
+    if (stream !== undefined) {
+      check = () => {
+        const cost = vp8lCost(body, stream.start, stream.end, width, height);
+        const tables = vp8lTableBytes(cost);
+        if (
+          Math.ceil((width * height * perPixel + extra + tables + bytes.length) * PLAN_MARGIN) <=
+          DECODE_BUDGET_BYTES
+        ) {
+          cost.checkGroups();
+        }
+        return tables;
+      };
     }
   } else if (format === "image/jpeg") {
     const layout = walkJpeg(bytes, true);
@@ -1129,6 +1262,8 @@ export function planDecode(
   } else {
     const size = imageDimensions(format, bytes);
     if (size === undefined) throw new ImageRefused("header");
+    // Every block walked to the trailer, at most GIF_MAX_BLOCKS of them (B2).
+    if (gifExtent(bytes) === undefined) throw new ImageRefused("gif_blocks");
     ({ width, height } = size);
     // omggif: one index byte a pixel of the first frame, the RGBA screen, scaling.
     perPixel = 1 + 4 + SCALE_BYTES_PER_PIXEL;
@@ -1138,11 +1273,14 @@ export function planDecode(
     Math.ceil((width * height * perPixel + extra + bytes.length) * PLAN_MARGIN);
   // The cheap estimate first: past the budget, nothing more is read.
   if (plan() > DECODE_BUDGET_BYTES) throw new ImageRefused("too_large");
-  if (deep && check !== undefined) extra += check();
+  if (check !== undefined) extra += check();
   const cost = plan();
   if (cost > DECODE_BUDGET_BYTES) throw new ImageRefused("too_large");
   return { width, height, bytes: cost };
 }
+
+/** The most frames and extension blocks a GIF may have (B2). */
+export const GIF_MAX_BLOCKS = 10_000;
 
 /**
  * The extent a GIF's frames reach (the largest of its logical screen and
@@ -1153,6 +1291,7 @@ export function planDecode(
 export function gifExtent(b: Uint8Array): { width: number; height: number } | undefined {
   if (!ascii(b, 0, "GIF87a") && !ascii(b, 0, "GIF89a")) return undefined;
   if (b.length < 13) return undefined;
+  let blocks = 0;
   let width = u16le(b, 6);
   let height = u16le(b, 8);
   const flags = b[10] ?? 0;
@@ -1170,6 +1309,9 @@ export function gifExtent(b: Uint8Array): { width: number; height: number } | un
     if (i >= b.length) return undefined;
     const block = b[i];
     if (block === 0x3b) return { width, height };
+    // Frames and extensions together, at most GIF_MAX_BLOCKS (B2: omggif
+    // makes an object for every frame before it decodes the first).
+    if (++blocks > GIF_MAX_BLOCKS) return undefined;
     if (block === 0x21) {
       i += 2;
       if (!skipSubBlocks()) return undefined;
@@ -1244,14 +1386,19 @@ class Unavailable extends Error {
   }
 }
 
-/** A failure that says nothing about the file (memory, a crash, no decoder): never remembered. */
+/** A failure that says nothing about the file (an allocation, no decoder): never remembered. */
 function transient(error: unknown): boolean {
+  // Only an allocation that failed (or a decoder that didn't load) says
+  // nothing about the file; every other exception inside a decoder (a
+  // RangeError from pngjs on a malformed tRNS, say) is a refusal, the same
+  // every time, and remembered (review of T-072).
+  if (error instanceof Unavailable) return true;
+  if (!(error instanceof Error)) return false;
+  const message = error.message.toLowerCase();
   return (
-    error instanceof Unavailable ||
-    error instanceof RangeError ||
-    (error instanceof Error &&
-      /memory/i.test(error.message) &&
-      !error.message.includes("maxMemoryUsageInMB"))
+    message.includes("allocation failed") ||
+    message.includes("out of memory") ||
+    message.includes("could not allocate")
   );
 }
 
@@ -1332,7 +1479,7 @@ export function decodeImage(
     }
     if (format === "image/png") {
       // One header (walkPng refused a second), so pngjs decodes this size.
-      if (check === "planned") checkPngData(walkPng(bytes));
+      if (check === "planned") checkPngData(bytes, walkPng(bytes));
       const image = pngjs.PNG.sync.read(
         Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
         { checkCRC: true },
@@ -1467,11 +1614,13 @@ export async function renderThumbnail(
   return jpeg.encode(small, QUALITY).data;
 }
 
-/** A job sent to the decoder process, and its answer. */
+/** The largest file a thumbnail is made from (100 MiB): the decoder process reads it whole. */
+export const THUMBNAIL_SOURCE_MAX_BYTES = 100 * 1024 * 1024;
+
+/** A job sent to the decoder process (its file is its descriptor 4), and its answer. */
 export interface ThumbnailJob {
   readonly id: number;
   readonly format: string;
-  readonly bytes: Uint8Array;
   readonly box: number;
   /** Tests of the memory cap only (`DecodeCheck`). */
   readonly check?: DecodeCheck;
@@ -1483,18 +1632,29 @@ export type ThumbnailAnswer =
 /** The code of a failure that says nothing about the file (never remembered). */
 export const TRANSIENT = "transient";
 
-/** The argument that marks a decoder process started by thumbnails.ts (and only it). */
+/** The argument that marks a decoder process started by `spawnDecoder` (and only it). */
 export const WORKER_MARK = "oculus-thumbnail-decoder";
 
-/** A process's resident size and its peak since last reset, from Linux's /proc (bytes). */
+/** The decoder process's descriptors: the file it decodes, and the pipe its watchdog reports on. */
+export const DECODER_FILE_FD = 4;
+export const DECODER_MARKER_FD = 5;
+
+/** The exit code of a decoder process its watchdog killed (where a signal can't say so). */
+export const KILLED_EXIT_CODE = 137;
+
+/**
+ * A process's resident size (swap included) and its peak since last
+ * reset, from Linux's /proc (bytes); `undefined` elsewhere.
+ */
 export function procMemory(pid: number | "self"): { rss: number; peak: number } | undefined {
   try {
     const status = readFileSync(`/proc/${String(pid)}/status`, "latin1");
     const field = (key: string): number => {
-      const match = new RegExp(`^${key}:\\s*(\\d+) kB`, "m").exec(status);
-      return match === null ? Number.NaN : Number(match[1]) * 1024;
+      const at = status.indexOf(`\n${key}:`);
+      if (at < 0) return Number.NaN;
+      return Number.parseInt(status.slice(at + key.length + 2).trimStart(), 10) * 1024;
     };
-    const rss = field("VmRSS");
+    const rss = field("VmRSS") + (field("VmSwap") || 0);
     const peak = field("VmHWM");
     return Number.isFinite(rss) && Number.isFinite(peak) ? { rss, peak } : undefined;
   } catch {
@@ -1512,58 +1672,101 @@ function resetPeak(): void {
 }
 
 /**
- * Where the memory cap is held when the parent can't read this process's
- * size (no /proc): a thread of this process samples its resident size
- * every 5 ms and kills the whole process past the limit. The decode runs
- * on the main thread, so only another thread can watch it.
+ * The decoder process's own guard (review of T-072, B1: the parent's
+ * sampler stalls whenever the server's event loop is busy, and dies with
+ * it): a thread of the decoder process, started before any job, that every
+ * 5 ms reads the process's resident size plus swap (/proc/self/status,
+ * else `process.memoryUsage.rss()`) and kills the whole process once it
+ * has grown past `killAt`, after writing "killed <peak growth>" to the
+ * marker pipe; and that kills it at once if its parent is gone (its parent
+ * process ID changed). The decode runs on the main thread, so only another
+ * thread can watch it, whatever the main thread is doing (WebAssembly
+ * included).
  */
 const WATCHDOG = `
 const { workerData } = require("node:worker_threads");
-const limit = workerData.limit;
+const { readFileSync, writeSync } = require("node:fs");
+const { killAt, parent, marker } = workerData;
+const field = (status, key) => {
+  const at = status.indexOf("\\n" + key + ":");
+  return at < 0 ? 0 : Number.parseInt(status.slice(at + key.length + 2).trimStart(), 10) * 1024 || 0;
+};
+const read = () => {
+  try {
+    const status = readFileSync("/proc/self/status", "latin1");
+    return { now: field(status, "VmRSS") + field(status, "VmSwap"), peak: field(status, "VmHWM") };
+  } catch {
+    const rss = process.memoryUsage.rss();
+    return { now: rss, peak: rss };
+  }
+};
+const base = read().now;
+const die = (line) => {
+  try { writeSync(marker, line + "\\n"); } catch {}
+  process.kill(process.pid, "SIGKILL");
+};
 setInterval(() => {
-  if (process.memoryUsage.rss() > limit) process.kill(process.pid, "SIGKILL");
+  if (process.ppid !== parent) die("orphan");
+  const m = read();
+  if (m.now - base > killAt) die("killed " + String(Math.max(m.now, m.peak) - base));
 }, 5);
 `;
 
+/** Reads the whole file on a descriptor by position (a retry's process reads it again). */
+function readDescriptor(fd: number): Uint8Array {
+  const size = fstatSync(fd).size;
+  if (size > THUMBNAIL_SOURCE_MAX_BYTES) throw new ImageRefused("too_large");
+  const bytes = new Uint8Array(size);
+  let filled = 0;
+  while (filled < size) {
+    const read = readSync(fd, bytes, filled, size - filled, filled);
+    if (read === 0) break;
+    filled += read;
+  }
+  if (filled !== size) throw new ImageRefused("truncated");
+  return bytes;
+}
+
 /**
- * The decoder process (T-072): started by thumbnails.ts with this file,
- * `WORKER_MARK` and the cap for its own watchdog (0 when the parent
- * samples it), with heap flags and a clean environment. It loads the
- * decoders, warms them up, resets its peak and says it is ready; then it
- * answers one job at a time over IPC. Its parent kills it past the memory
- * cap or the time limit, and replaces it after every answer but a clean
- * one. If its parent goes, it goes.
+ * The decoder process (T-072): started by `spawnDecoder` for one job. It
+ * loads the decoders and warms them up, starts its watchdog, resets its
+ * peak and says it is ready; then it decodes the one job it is sent, from
+ * the file on its descriptor 4, and answers. Its parent kills it after the
+ * answer, past the memory cap or the time limit; if its parent goes, so
+ * does it.
  */
-async function serve(send: (message: unknown) => void, watchdogCap: number): Promise<void> {
+async function serve(
+  send: (message: unknown) => void,
+  killAt: number,
+  parent: number,
+): Promise<void> {
   process.on("disconnect", () => process.exit(0));
+  const { Worker } = await import("node:worker_threads");
+  const watchdog = new Worker(WATCHDOG, {
+    eval: true,
+    workerData: { killAt, parent, marker: DECODER_MARKER_FD },
+  });
+  watchdog.unref();
+  await new Promise((resolve) => watchdog.once("online", resolve));
   // Warm-up: every decoder loaded and run once, so the baseline holds them.
   await loadWebp().catch(() => undefined);
   const tiny = jpeg.encode({ width: 8, height: 8, data: new Uint8Array(256) }, QUALITY).data;
   await renderThumbnail("image/jpeg", tiny, 160).catch(() => undefined);
-  if (watchdogCap > 0) {
-    const { Worker } = await import("node:worker_threads");
-    const watchdog = new Worker(WATCHDOG, {
-      eval: true,
-      workerData: { limit: process.memoryUsage.rss() + watchdogCap },
-    });
-    watchdog.unref();
-    await new Promise((resolve) => watchdog.once("online", resolve));
-  }
   resetPeak();
   process.on("message", (job: ThumbnailJob) => {
     void (async () => {
-      resetPeak();
       let answer: ThumbnailAnswer;
       try {
-        const bytes = new Uint8Array(job.bytes.buffer, job.bytes.byteOffset, job.bytes.byteLength);
+        const bytes = readDescriptor(DECODER_FILE_FD);
         const jpegBytes = await renderThumbnail(job.format, bytes, job.box, job.check);
         answer = { id: job.id, ok: true, jpeg: jpegBytes };
       } catch (error) {
-        // A refusal is the same every time; anything else (memory) may pass.
+        // A refusal is the same every time; a failed allocation may pass.
         answer = {
           id: job.id,
           ok: false,
-          code: error instanceof ImageRefused ? error.message : TRANSIENT,
+          code:
+            error instanceof ImageRefused ? error.message : transient(error) ? TRANSIENT : "decode",
         };
       }
       send(answer);
@@ -1572,7 +1775,43 @@ async function serve(send: (message: unknown) => void, watchdogCap: number): Pro
   send({ ready: true });
 }
 
+/**
+ * Starts a decoder process for one job on the file open on `fd` (T-072):
+ * this very file, run by the same Node.js with heap flags and an empty
+ * environment (none of the server's variables, no NODE_OPTIONS), its
+ * output discarded; the file on its descriptor 4 (it reads it itself, so
+ * no bytes are copied over IPC), its watchdog's pipe on descriptor 5.
+ */
+export function spawnDecoder(options: {
+  readonly fd: number;
+  readonly killAt: number;
+  readonly heapMiB: number;
+}): ChildProcess {
+  const root = process.env.SystemRoot;
+  return spawn(
+    process.execPath,
+    [
+      `--max-old-space-size=${String(options.heapMiB)}`,
+      "--max-semi-space-size=16",
+      fileURLToPath(import.meta.url),
+      WORKER_MARK,
+      String(options.killAt),
+      String(process.pid),
+    ],
+    {
+      stdio: ["ignore", "ignore", "ignore", "ipc", options.fd, "pipe"],
+      serialization: "advanced",
+      env: root === undefined ? {} : { SystemRoot: root },
+      windowsHide: true,
+    },
+  );
+}
+
 if (process.argv[2] === WORKER_MARK && typeof process.send === "function") {
   const send = process.send.bind(process);
-  void serve((message) => send(message), Number(process.argv[3] ?? 0) || 0);
+  void serve(
+    (message) => send(message),
+    Number(process.argv[3] ?? 0) || DECODE_MEMORY_CAP_BYTES - KILL_HEADROOM_BYTES,
+    Number(process.argv[4] ?? 0),
+  );
 }
