@@ -905,61 +905,97 @@ export async function readPublicRecord(
   return db.transaction(async (tx) => {
     // One snapshot for every read below, and nothing written.
     await tx.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`);
-    const [found] = await tx.rows<{ snapshot: PublicSnapshotRow | null }>(sql`
-      SELECT public.public_record_snapshot(${organizationId}::uuid, ${siteId}::uuid,
-                                           ${recordId}::uuid) AS snapshot`);
-    const row = found?.snapshot ?? null;
-    if (row === null) return { ok: false, issues: NOT_AVAILABLE };
-    if (row.tooMany === true) return refused([], "too_many_records", CANT_CHECK);
-    const snapshot = await buildSnapshot(
+    const read = await publicRecordIn(
       tx,
       organizationId,
+      siteId,
       recordId,
-      publicSource(organizationId, row),
-    );
-    if (!snapshot.ok) return snapshot;
-    const s = snapshot.value;
-    // The record itself is public on the site (checked by the function, in this snapshot).
-    if (!s.published.includes(recordId)) return { ok: false, issues: NOT_AVAILABLE };
-    const record = s.records.find((r) => r.id === recordId);
-    if (record === undefined) return { ok: false, issues: NOT_AVAILABLE };
-    const index = indexRecords(s.records);
-    if (!index.ok) return refused(["records"], "unreadable_record", CANT_CHECK);
-    const effective = effectiveRecord(recordId, index.value, s.templateFor, {
-      checkers: s.checkers,
-      identifiers: s.identifiers,
-    });
-    if (!effective.ok) return refused([], "unreadable_record", CANT_CHECK);
-    const view = publicView(effective.value);
-    if (view === undefined) return refused([], "unreadable_record", CANT_CHECK);
-    let mapping: unknown;
-    if (mappings === undefined) {
-      // The stored one, from the same snapshot (Repeatable Read, above).
-      const [stored] = await tx.rows<{ mapping: unknown }>(sql`
-        SELECT public.public_dublin_core_mapping(${organizationId}::uuid, ${siteId}::uuid,
-                                                 ${recordId}::uuid) AS mapping`);
-      mapping = stored?.mapping ?? undefined;
-      if (mapping === null) mapping = undefined;
-    } else {
-      mapping = (mappings as readonly unknown[]).find(
-        (m) => ownValue(m, "template") === record.templateKey,
-      );
-    }
-    if (mapping === undefined) {
-      return refused(
-        ["mappings"],
-        "no_mapping",
-        "No Dublin Core mapping is given for this record's template.",
-      );
-    }
-    return publicOutput(view, mapping, {
       baseUrl,
-      published: s.published,
-      records: index.value,
-      templateFor: s.templateFor,
-      checkers: s.checkers,
-      identifiers: s.identifiers,
-      accessions: s.accessions,
-    });
+      mappings as readonly unknown[] | undefined,
+    );
+    return read.ok ? { ok: true, value: read.value.output } : read;
   });
+}
+
+/** One record's public output, with the view and template it was made from (`publicRecordIn`). */
+export interface PublicRecordRead {
+  readonly output: PublicOutput;
+  readonly view: PublicRecord;
+  readonly template: FieldTemplate;
+  readonly mapping: unknown;
+}
+
+/**
+ * `readPublicRecord`'s work inside the caller's transaction, which must
+ * already be Repeatable Read and read only (`publicTermCounts` reads many
+ * records in one). Arguments are checked by the caller. Without `mappings`,
+ * the record's template's stored mapping is used, read in the same snapshot
+ * (T-050b). Not exported from `@oculus/db`.
+ */
+export async function publicRecordIn(
+  tx: Queryable,
+  organizationId: OrganizationId,
+  siteId: SiteId,
+  recordId: RecordId,
+  baseUrl: string,
+  mappings: readonly unknown[] | undefined,
+): Promise<Validated<PublicRecordRead>> {
+  const [found] = await tx.rows<{ snapshot: PublicSnapshotRow | null }>(sql`
+    SELECT public.public_record_snapshot(${organizationId}::uuid, ${siteId}::uuid,
+                                         ${recordId}::uuid) AS snapshot`);
+  const row = found?.snapshot ?? null;
+  if (row === null) return { ok: false, issues: NOT_AVAILABLE };
+  if (row.tooMany === true) return refused([], "too_many_records", CANT_CHECK);
+  const snapshot = await buildSnapshot(
+    tx,
+    organizationId,
+    recordId,
+    publicSource(organizationId, row),
+  );
+  if (!snapshot.ok) return snapshot;
+  const s = snapshot.value;
+  // The record itself is public on the site (checked by the function, in this snapshot).
+  if (!s.published.includes(recordId)) return { ok: false, issues: NOT_AVAILABLE };
+  const record = s.records.find((r) => r.id === recordId);
+  if (record === undefined) return { ok: false, issues: NOT_AVAILABLE };
+  const template = s.templateFor(record);
+  if (template === undefined) return refused([], "unreadable_record", CANT_CHECK);
+  const index = indexRecords(s.records);
+  if (!index.ok) return refused(["records"], "unreadable_record", CANT_CHECK);
+  const effective = effectiveRecord(recordId, index.value, s.templateFor, {
+    checkers: s.checkers,
+    identifiers: s.identifiers,
+  });
+  if (!effective.ok) return refused([], "unreadable_record", CANT_CHECK);
+  const view = publicView(effective.value);
+  if (view === undefined) return refused([], "unreadable_record", CANT_CHECK);
+  let mapping: unknown;
+  if (mappings === undefined) {
+    // The stored one, from the same snapshot (Repeatable Read, the caller's).
+    const [stored] = await tx.rows<{ mapping: unknown }>(sql`
+      SELECT public.public_dublin_core_mapping(${organizationId}::uuid, ${siteId}::uuid,
+                                               ${recordId}::uuid) AS mapping`);
+    mapping = stored?.mapping ?? undefined;
+    if (mapping === null) mapping = undefined;
+  } else {
+    mapping = mappings.find((m) => ownValue(m, "template") === record.templateKey);
+  }
+  if (mapping === undefined) {
+    return refused(
+      ["mappings"],
+      "no_mapping",
+      "No Dublin Core mapping is given for this record's template.",
+    );
+  }
+  const output = publicOutput(view, mapping, {
+    baseUrl,
+    published: s.published,
+    records: index.value,
+    templateFor: s.templateFor,
+    checkers: s.checkers,
+    identifiers: s.identifiers,
+    accessions: s.accessions,
+  });
+  if (!output.ok) return output;
+  return { ok: true, value: Object.freeze({ output: output.value, view, template, mapping }) };
 }
