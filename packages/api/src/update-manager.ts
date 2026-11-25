@@ -876,6 +876,16 @@ export class UpdateManager {
             "This update changes the database, and this server isn't set up to do that from the admin (OCULUS_UPDATE_MIGRATE_DATABASE_URL and OCULUS_UPDATE_WRITER_ROLE). Install it with npm run release -- install on the server instead.",
           );
         }
+        // Named before anything changes (S-062): new tables the writer isn't
+        // granted would make every request touching them fail after the switch.
+        const role = this.writerRole ?? options.fallbackWriterRole;
+        if (role === undefined) {
+          throw new UpdateRefusal(
+            "migrations_need_writer_role",
+            409,
+            "This update changes the database, so the app's database role must be given rights to its new tables. Set OCULUS_UPDATE_WRITER_ROLE to that role's name and install again. Nothing was changed.",
+          );
+        }
         const asOwner = { OCULUS_DATABASE_URL: ownerUrl };
         let backupName: string | undefined;
         if (this.backups && current !== undefined) {
@@ -915,8 +925,7 @@ export class UpdateManager {
             `The new version's database changes failed, so the running version stays, but some changes may already be in the database. Details are in logs/${log} in the updates folder. ${backupName === undefined ? "No backup was taken." : `If Oculus misbehaves, restore backups/${backupName}.`}`,
           );
         }
-        const role = this.writerRole ?? options.fallbackWriterRole;
-        if (role !== undefined) {
+        {
           step("granting");
           const granted = await this.runScript(
             join(target, "packages", "db", "dist", "grant-cli.js"),

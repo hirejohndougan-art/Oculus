@@ -400,11 +400,6 @@ export async function runReleaseCli(
               ...(role === undefined || role === "" ? {} : { fallbackWriterRole: role }),
             },
           );
-          if (role === undefined || role === "") {
-            out(
-              "Note: OCULUS_UPDATE_WRITER_ROLE isn't set, so no role was given rights to new tables.",
-            );
-          }
         } finally {
           await db?.close();
         }
