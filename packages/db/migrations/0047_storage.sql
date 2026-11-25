@@ -53,8 +53,8 @@ CREATE TABLE public.storage_moves (
   id uuid NOT NULL
     CHECK (id::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'),
   definition jsonb NOT NULL CHECK (jsonb_typeof(definition) = 'object'),
-  record_id uuid GENERATED ALWAYS AS ((definition ->> 'recordId')::uuid) STORED,
-  location_id uuid GENERATED ALWAYS AS ((definition ->> 'locationId')::uuid) STORED,
+  record_id uuid NOT NULL GENERATED ALWAYS AS ((definition ->> 'recordId')::uuid) STORED,
+  location_id uuid NOT NULL GENERATED ALWAYS AS ((definition ->> 'locationId')::uuid) STORED,
   recorded_by uuid NOT NULL REFERENCES public.users (id),
   recorded_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   PRIMARY KEY (organization_id, id),
@@ -109,8 +109,14 @@ SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
   IF NEW.definition ->> 'recordedAt'
-     <> to_char(NEW.recorded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') THEN
+     IS DISTINCT FROM to_char(NEW.recorded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') THEN
     RAISE EXCEPTION 'a move''s recordedAt must be when it was written down' USING ERRCODE = 'OC084';
+  END IF;
+  -- Written down now, by the database's clock: never back- or forward-dated
+  -- (same-day moves are ordered by it).
+  IF NEW.recorded_at > clock_timestamp()
+     OR NEW.recorded_at < clock_timestamp() - interval '1 minute' THEN
+    RAISE EXCEPTION 'a move is written down at the database''s time' USING ERRCODE = 'OC085';
   END IF;
   RETURN NEW;
 END

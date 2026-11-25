@@ -189,7 +189,7 @@ async function world(): Promise<World> {
       title: "Invented Paper Conservation Studio",
       templateKey: "t-agent",
       fields: {},
-    } as never),
+    }),
   ).record;
   return { org, site, vase, conservator, cataloger, reader, root };
 }
@@ -367,6 +367,28 @@ describe("storage through the service (T-018d)", () => {
     expect(codes(await service.deleteRecord(at, w.vase.id, { expectedVersion: 1 }))).toContain(
       "has_moves",
     );
+    // The database checks a move's time itself.
+    const id = "3f2b1c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+    const move = (recordedAt: string | undefined) => ({
+      id,
+      organizationId: w.org,
+      recordId: w.vase.id,
+      locationId: r.id,
+      movedOn: "2026-01-03",
+      reason: "rehousing",
+      ...(recordedAt === undefined ? {} : { recordedAt }),
+    });
+    for (const [recordedAt, at, code] of [
+      ["2020-01-01T00:00:00.000Z", "2020-01-01T00:00:00.000Z", "OC085"],
+      [undefined, "2026-01-01T00:00:00.000Z", "OC084"],
+    ] as const) {
+      await expect(
+        s.writer.execute(sql`INSERT INTO public.storage_moves
+          (organization_id, id, definition, recorded_by, recorded_at)
+          VALUES (${w.org}::uuid, ${id}::uuid, ${JSON.stringify(move(recordedAt))}::jsonb,
+                  ${w.cataloger}::uuid, ${at}::timestamptz)`),
+      ).rejects.toMatchObject({ code });
+    }
     for (const table of ["levels", "locations", "moves"]) {
       await expect(
         s.reader.rows(

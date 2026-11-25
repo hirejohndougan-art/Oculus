@@ -42,8 +42,16 @@ export interface StoredStorage {
 }
 
 /** The organization's storage lock (D-115): every storage save takes it first. */
-export async function lockStorage(db: Queryable, organizationId: OrganizationId): Promise<void> {
-  await db.rows(sql`SELECT pg_advisory_xact_lock(115, hashtext(${organizationId}::text))`);
+export async function lockStorage(
+  db: Queryable,
+  organizationId: OrganizationId,
+  mode: "shared" | "exclusive" = "exclusive",
+): Promise<void> {
+  await db.rows(
+    mode === "shared"
+      ? sql`SELECT pg_advisory_xact_lock_shared(115, hashtext(${organizationId}::text))`
+      : sql`SELECT pg_advisory_xact_lock(115, hashtext(${organizationId}::text))`,
+  );
 }
 
 /** The database's clock now, as core writes times (ISO 8601 UTC, milliseconds). */
@@ -79,6 +87,8 @@ export async function readStorage(
   if (!isOrganizationId(organizationId)) {
     return Object.freeze({ levels: undefined, locations: [], moves: [] });
   }
+  // Shared: no save commits between the three reads (a save holds it exclusive).
+  await lockStorage(db, organizationId, "shared");
   const [levels] = await db.rows<DefinitionRow>(sql`
     SELECT definition, version, ${STAMP} AS updated_at FROM public.storage_levels
     WHERE organization_id = ${organizationId}::uuid`);

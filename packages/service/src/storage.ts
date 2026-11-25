@@ -120,6 +120,17 @@ const CONFLICT = (): Refusal =>
     "It was saved by someone else since you opened it. Read it again.",
   );
 
+/**
+ * Core's refusal of the storage as a whole, without paths: they can name
+ * moves of records the person may not see. Codes and fixed messages stay.
+ */
+function wholeRefusal(issues: readonly { code: string; message: string }[]): Refusal {
+  return {
+    ok: false,
+    issues: issues.map((i) => issue(["storage"], i.code, i.message)),
+  };
+}
+
 /** A whole-catalog grant, on any site, of a role holding `permission` (or a system manager). */
 function holdsSomewhere(access: Access, permission: RolePermission): boolean {
   if (access.systemManager) return true;
@@ -249,7 +260,7 @@ export function storageOperations(run: Runner): StorageOperations {
           checked.value,
           stored.locations.map((l) => l.definition),
         );
-        if (!again.ok) return { ok: false, issues: again.issues };
+        if (!again.ok) return wholeRefusal(again.issues);
         const saved = await saveStorageLevels(
           tx,
           who.organizationId,
@@ -295,7 +306,12 @@ export function storageOperations(run: Runner): StorageOperations {
         const agentId = checked.value.agentId;
         if (agentId !== undefined) {
           const place = await readRecordPlace(tx, who.organizationId, agentId);
-          if (place?.kind !== "agent") {
+          // One the person can't edit on its home site answers like a missing one.
+          const mayUse =
+            may.access.systemManager ||
+            (place?.siteId != null &&
+              holdsForWholeCatalog(may.access, "records.edit", place.siteId));
+          if (place?.kind !== "agent" || !mayUse) {
             return refusal(
               ["agentId"],
               "unknown_agent",
@@ -320,7 +336,7 @@ export function storageOperations(run: Runner): StorageOperations {
           checked.value,
         ];
         const again = reindexLocations(log.log, levelsOf(who.organizationId, stored), locations);
-        if (!again.ok) return { ok: false, issues: again.issues };
+        if (!again.ok) return wholeRefusal(again.issues);
         const saved = await saveStorageLocation(
           tx,
           who.organizationId,
@@ -377,7 +393,7 @@ export function storageOperations(run: Runner): StorageOperations {
         const log = logOf(who.organizationId, stored);
         if (!log.ok) return log;
         const next = withMove(log.log, made.value, new Date(now));
-        if (!next.ok) return { ok: false, issues: next.issues };
+        if (!next.ok) return wholeRefusal(next.issues);
         const saved = await insertStorageMove(
           tx,
           who.organizationId,

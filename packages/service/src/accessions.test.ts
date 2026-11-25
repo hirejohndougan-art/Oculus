@@ -399,14 +399,17 @@ describe("accessions through the service (T-018c)", () => {
     const other = await makeSite(service, w.root, w.org, `Invented far site ${String(count)}`);
     // A scan on the other site of the vase (this site): holding the vase holds it too.
     const scan = ok(
-      await service.createRecord({ organizationId: w.org, actor: actorOf(w.root), siteId: other }, {
-        kind: "digital_asset",
-        title: "Invented scan of the vase",
-        mediaType: "image/jpeg",
-        represents: w.vase.id,
-        templateKey: "t-asset",
-        fields: {},
-      } as never),
+      await service.createRecord(
+        { organizationId: w.org, actor: actorOf(w.root), siteId: other },
+        {
+          kind: "digital_asset",
+          title: "Invented scan of the vase",
+          mediaType: "image/jpeg",
+          represents: w.vase.id,
+          templateKey: "t-asset",
+          fields: {},
+        },
+      ),
     );
     expect(scan.record.id).toBeDefined();
     const refused = await service.createAccession(
