@@ -22,7 +22,12 @@
  *   the address (D-068's secrecy rule). A `mailer` or `deliverReset` passed
  *   in is used as it is;
  * - `OCULUS_ADMIN_ORIGIN` is set but isn't one of `OCULUS_ORIGINS`, or the
- *   admin build can't be read;
+ *   admin build can't be read; in production, it isn't set (T-050a, D-090:
+ *   the staff API is then answered on the admin's host only);
+ * - `OCULUS_PUBLIC_SITES` is wrong (public-sites.ts), names a site that
+ *   doesn't exist, or is set without a public reader connection
+ *   (`publicDb`); or that connection, whenever one is given, could read more
+ *   than the public read path (`checkPublicReaderConnection`, D-080);
  * - `OCULUS_FILES_DIR` (M-002, D-086) is missing, not an absolute path, or
  *   not an existing writable directory, or the caps `OCULUS_FILE_MAX_MIB`
  *   (default 500) or `OCULUS_FILES_TOTAL_MAX_MIB` (per organization,
@@ -57,9 +62,11 @@ import {
 } from "@oculus/service";
 import type { FastifyInstance } from "fastify";
 import { ADMIN_ORIGIN_ENV, loadAdminFiles, type AdminFiles } from "./admin-files.js";
+import { originsFromEnv } from "./origin.js";
 import { isProduction } from "./environment.js";
 import { mailerFromEnv, type Mailer } from "./mail.js";
 import { trustedProxyFromEnv } from "./proxy.js";
+import { PUBLIC_DATABASE_URL_ENV, checkPublicSites, publicSitesFromEnv } from "./public-sites.js";
 import type { OculusRoute } from "./routes.js";
 import { UPLOAD_TIMEOUTS, buildServer, type ServerOptions } from "./server.js";
 import { signInRoutes, type SignInApiOptions } from "./sign-in-api.js";
@@ -160,6 +167,12 @@ export const DEFAULT_ADMIN_DIR = join(
 export interface AdminServerOptions {
   /** The writer's pool (D-067). */
   readonly db: Database;
+  /**
+   * The public sites' pool, connected as a public reader role (D-080,
+   * T-050a): checked at startup; required when `OCULUS_PUBLIC_SITES` lists
+   * any. Never used for anything else.
+   */
+  readonly publicDb?: Database;
   /** Defaults to `process.env`. */
   readonly env?: Readonly<Record<string, string | undefined>>;
   /**
@@ -247,6 +260,23 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   const deliverEnrolment = options.deliverEnrolment ?? mailer?.deliverEnrolment;
 
   const adminOrigin = env[ADMIN_ORIGIN_ENV];
+  if (production && (adminOrigin === undefined || adminOrigin === "")) {
+    throw new Error(
+      `refusing to start: ${ADMIN_ORIGIN_ENV} must name the admin's own origin in production, so the staff API answers on that host only (D-052, D-090).`,
+    );
+  }
+  // Public hosts and their reader (T-050a): checked now, so a wrong
+  // connection or site never serves a request. T-050b's public routes use them.
+  const publicHosts = publicSitesFromEnv(env, originsFromEnv(env), adminOrigin);
+  if (publicHosts.length > 0 && options.publicDb === undefined) {
+    throw new Error(
+      `refusing to start: OCULUS_PUBLIC_SITES lists public sites but ${PUBLIC_DATABASE_URL_ENV} gives no public reader connection (D-080).`,
+    );
+  }
+  if (options.publicDb !== undefined) {
+    await checkPublicSites(options.db, options.publicDb, publicHosts);
+  }
+
   let admin: ServerOptions["admin"];
   if (adminOrigin !== undefined && adminOrigin !== "") {
     admin = {
