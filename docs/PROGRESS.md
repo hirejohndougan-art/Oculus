@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 17:35 CT — manual (Chat A) — T-043 API: history, restore, approval and publishing
+- Result: done
+- What changed: staff API routes for a record's version list (summaries only), one version, compare, restore (If-Match, `confirmMadePublic`), submit for review, return to draft, publish and withdraw (each its own POST with If-Match), and the approval queue over whole publish sites. Read-only and Scanner see no history (John). `readRecord` returns the workflow state. Migration 0019: a partial index for the queue, which runs under the search timeout.
+- Decisions: D-082
+- Review: first round found restore's unlocked look read the old version before any permission check (timing showed a hidden record's existence and size) and the version list read every full snapshot; both fixed. A second review of the fix found no blocking issue. Q-6 and Q-7 asked of John; S-030 filed.
+- Gate: PASS · tests_passing 4090 (was 4063) · npm audit clean
+- Next: T-046 (in review); then T-048
+
 ## 2026-11-24 16:03 CT — manual (John: "continue building") — T-045 Admin: sign-in and the screen frame
 - Result: done
 - What changed: `packages/admin` (React 19, Vite, React Router, TanStack Query, React Aria; D-073): sign-in, the two-step code with a recovery-code option, organization choice, two-step set-up (QR, the key in groups, ten recovery codes shown once), forgot and reset password (token in the address fragment, removed at once), and the frame with the sidebar, site picker and top bar. `packages/api/src/sign-in-api.ts`: sign-in, pending, code, set-up, sign-out, sign-out elsewhere, organization switch, me, password reset. `admin-server.ts` serves the built admin from memory on the admin origin with its own strict CSP; `npm run admin` starts it. Gate: a keyboard-only Playwright end-to-end step with Siteimprove Alfa accessibility checks; font files checked against FONTS.json (OFL-1.1 for fonts only).
