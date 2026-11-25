@@ -1,6 +1,6 @@
 /**
  * Stored files (M-002, D-086): the rows saying which digital asset holds
- * which content (`public.stored_files`, migration 0022). The bytes are on
+ * which content (`public.stored_files`, migration 0025). The bytes are on
  * disk, named by organization and SHA-256 only (service `file-store.ts`);
  * nothing here touches the file system.
  *
@@ -196,7 +196,7 @@ export async function listStoredFiles(
  * Inserts one stored file row. The caller (the service) has checked the
  * person, the asset and the organization's total under
  * `lockOrganizationFiles`; the database checks the asset is a digital asset
- * and that one content has one size (0022).
+ * and that one content has one size (0025).
  */
 export async function insertStoredFile(tx: Queryable, file: NewStoredFile): Promise<StoredFile> {
   checkOrganization(file.organizationId);

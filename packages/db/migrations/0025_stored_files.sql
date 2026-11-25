@@ -1,6 +1,7 @@
 -- Stored files (M-002, D-086): one row per file attached to a digital asset.
--- Numbered 0022: 0020 and 0021 are T-048's and T-040's branches (renumber
--- at merge if they move).
+-- Numbered 0025: 0022 to 0024 belong to other branches (T-050b's Dublin
+-- Core mappings and two reserved numbers); 0026 follows with the second
+-- review's additions.
 --
 -- The bytes live on disk under OCULUS_FILES_DIR, named by their SHA-256 and
 -- the organization only (service file-store.ts): one copy per organization
