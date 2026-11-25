@@ -7,8 +7,16 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - What changed: `packages/db/src/shares.ts` (`MAX_SHARE_PAGE` 50, a `before` cursor scoped to its own list, order `offered_at DESC, id DESC`, `includeHidden` for the manager's accepted list, `sharedItemViews` through `publicRecordIn` with the home mapping's fields and labels, `SHARE_CHANGED`); `packages/service/src/shares.ts` (pages with exact `next` cursors, hidden accepted items as `item: null` for the manager only); `?before`/`?state` and `{ shares, next }` on the share routes; `packages/admin/src/shares/` (`useMorePages`, "Show more" on the site's two lists, the shared items and a record's shares, hidden items said in words with their own Remove names, home labels).
 - Decisions: D-094 amended
 - Review: two independent rounds, nothing blocking in either. First: fixed "Show more" stopping when rows were left out after the limit (now exact `next` cursors), duplicate and stale rows after a refetch, a record's list capped at 50, shares ended mid-request shown as hidden, identical button names, `before` without `state`; added tests for foreign cursors, a short page with a `next`, the record panel, and a hidden item's screen. Second: cursors now any share into the site in any state (a cursor decided between pages no longer stops the paging), Show more says what it did in a live region without moving focus, the record panel's empty text and count say when more may follow, one request at a time, counts of new shares only. The index order is left to S-036b.
-- Gate: PASS · tests_passing TBD (was 4819) · npm audit clean. Main's gate failed on its own after S-044: `second-factor.test.ts`'s "keep them waiting" test takes about 6.5 s against the 5 s default here; it now has a 30 s limit (as U-005).
+- Gate: PASS · tests_passing 4836 (was 4823; run on main with S-043a, which then gained only its progress entry) · npm audit clean. Main's gate failed on its own after S-044: `second-factor.test.ts`'s "keep them waiting" test takes about 6.5 s against the 5 s default here; it now has a 30 s limit (as U-005).
 - Next: S-036b
+
+## 2026-11-25 07:55 CT — build (BUILD MODE) — S-043a Time limits on OAI-PMH's staff reads, and the page deadline on the routes' clock
+- Result: done (S-043 split into S-043a and S-043b)
+- What changed: `oaiStoredStamp`, `oaiDatestamp` and `oaiRepository` (packages/db/src/oai.ts) take `{ timeLimitMs }` and run in a transaction with a local `statement_timeout` (5 s default; the routes pass their `timeLimitMs`), so a locked or slow staff database is `503 busy`, not a held OAI slot; a list page's deadline uses the routes' `clock`. Four tests, all failing before the change. Commits 4bdacf3, a88dddb, b766039. Source: PostgreSQL 16 docs §20.11 (statement_timeout includes lock waits).
+- Decisions: none
+- Review: one independent round: no security, data-loss or leak problems. It found that the comments claimed too much (fixed), and four gaps, filed as S-051: an unbounded wait for a staff pool connection, no client-side query timeout, the list's `lock_timeout` answering `unavailable`, and the deadline not checked before each list call.
+- Gate: PASS · tests_passing 4823 (was 4819) · npm audit clean
+- Next: the next free Phase 2 task (S-043b, S-051, S-031, S-035, U-007 or S-050)
 
 ## 2026-11-25 06:54 CT — security — S-044 Someone with only the password could push the person's known addresses out
 - Result: done (findings, all low; most serious fixed)
