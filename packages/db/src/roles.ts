@@ -86,7 +86,7 @@ export const WRITER_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Ob
   // nothing deletes them yet.
   ...STORED_FILE_TABLE_PRIVILEGES,
   // Virus scan results (S-040, D-113): queued, then moved along; never
-  // deleted, and an infected content never changed back (0041's guard).
+  // deleted, and an infected content never changed back (0044's guard).
   ...FILE_SCAN_TABLE_PRIVILEGES,
   // The change log of people and roles (T-048, D-084): insert only.
   ...PEOPLE_TABLE_PRIVILEGES,

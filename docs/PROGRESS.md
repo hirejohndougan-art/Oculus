@@ -2,6 +2,13 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 13:30 CT — manual (Chat A) — S-040 Scan uploaded files for viruses
+
+- **Done:** each upload is scanned by a separately installed ClamAV daemon over its socket (own INSTREAM client, no dependency, no linking; D-113, migration 0044, written as 0041 and renumbered after main's 0043). While scanning is on, only clean files are served: pending and failed answer 409, infected 423 and are quarantined for good. Files stored before scanning was on stay served until their first scan; files too large to scan are shown as such. With no scanner (the desktop trial) files are "not scanned" and served, with a notice. Rescans keep clean files served; uploads over the scanner's limit are refused with 413.
+- **Reviews:** one full independent review and one focused check of the fixes; nothing blocking in either, and every finding fixed.
+- **Filed:** S-040a (release a false positive), S-040b (needs John: should production refuse to start without a scanner).
+- Gate: see below.
+
 ## 2026-11-25 10:40 CT — Chat J — S-036b Share limits and endings
 - Result: done (S-036 is now done)
 - What changed: migration 0043 (written as 0040; renumbered at merge: S-045 took 0040, and 0041–0042 are Chat A's): at most 100 open offers from one organization into one site, counting only offers whose record is published on a site now (`too_many_offers`), and no re-offer within 30 days of a decline (`declined_recently`), both in the share check under an advisory lock and only in Read Committed (OC061 otherwise); `record_shares` no longer cascades with its record, and triggers on `records` end live shares as `deleted` (record deleted) or `moved` (record moved onto the second site), keeping the decision; existing shares left live by earlier moves end as `moved`; `record_shares_target` in the lists' order. The service maps the limits (`MAX_OPEN_OFFERS`, `DECLINE_COOLDOWN_DAYS`), says `already_shared` first, and answers a record deleted mid-offer as missing; the admin names the new states and refusals.
