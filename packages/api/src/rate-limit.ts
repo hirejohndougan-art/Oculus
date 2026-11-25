@@ -19,7 +19,7 @@
  * `public` counts a public site's record reads per client address (T-050d,
  * D-100).
  */
-export type RateBucket = "read" | "write" | "check" | "search" | "credentials" | "public";
+export type RateBucket = "read" | "write" | "check" | "search" | "credentials" | "public" | "oai";
 
 export type RateLimits = Readonly<Record<RateBucket, number>>;
 
@@ -31,6 +31,8 @@ export const DEFAULT_RATE_LIMITS: RateLimits = Object.freeze({
   search: 60,
   credentials: 60,
   public: 300,
+  // OAI-PMH requests (T-050c, D-105): each reads up to a page of records.
+  oai: 12,
 });
 
 const WINDOW_MS = 60_000;
