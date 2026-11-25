@@ -28,6 +28,8 @@ const ALL_TABLES = [
   "accession_records",
   "accession_versions",
   "accessions",
+  "custom_role_events",
+  "custom_roles",
   "donor_contacts",
   "dublin_core_mappings",
   "file_purge_steps",

@@ -6,7 +6,7 @@
  *   roles that exist). The staff API asks for a recent sign-in as well.
  * - **What a role may hold:** core's `validateCustomRole` (catalog
  *   permissions and `site.settings`; never a system permission, and not
- *   `site.people` yet, S-066). So a custom role never reaches beyond what a
+ *   `site.people` yet, S-067). So a custom role never reaches beyond what a
  *   site manager already holds, and granting one changes nothing about who
  *   may grant roles (0018's guard, `mayManage`).
  * - **Sensitive permissions** (`records.publish`, `donors.view`,
@@ -338,7 +338,7 @@ export function customRoleOperations(run: Runner): CustomRoleOperations {
 
         // Sensitive permissions added: confirmed one by one (D-036).
         const added = addedSensitive(before?.permissions, role.permissions);
-        const asked = new Set(confirm as string[]);
+        const asked = new Set(confirm);
         if (
           added.length > 0 &&
           (added.length !== asked.size || !added.every((p) => asked.has(p)))
@@ -462,10 +462,7 @@ export function customRoleOperations(run: Runner): CustomRoleOperations {
             };
           }
           // The target, read (and locked against deletion) now.
-          if (
-            !isBuiltInRole(moveTo) &&
-            (await readCustomRole(tx, org, moveTo as string)) === undefined
-          ) {
+          if (!isBuiltInRole(moveTo) && (await readCustomRole(tx, org, moveTo)) === undefined) {
             return refusal(["options", "moveTo"], "unknown_role", UNKNOWN_ROLE);
           }
           if (confirmHolders !== holdings.length) {
@@ -487,7 +484,7 @@ export function customRoleOperations(run: Runner): CustomRoleOperations {
               id: newRecordId(),
               organizationId: org,
               userId: h.userId,
-              role: moveTo as string,
+              role: moveTo,
               siteId: h.siteId as never,
               scope: h.scope as never,
               grantedBy: me.value,
@@ -500,7 +497,7 @@ export function customRoleOperations(run: Runner): CustomRoleOperations {
                 actorId: me.value,
                 kind: "role_granted",
                 subjectId: h.userId,
-                role: moveTo as string,
+                role: moveTo,
                 siteId: h.siteId as never,
                 scope: h.scope,
               });
@@ -524,14 +521,14 @@ export function customRoleOperations(run: Runner): CustomRoleOperations {
           label: role.label,
           permissions: role.permissions,
           grants: holdings.length,
-          ...(holdings.length > 0 && moveTo !== null ? { movedTo: moveTo as string } : {}),
+          ...(holdings.length > 0 && moveTo !== null ? { movedTo: moveTo } : {}),
         });
         return {
           ok: true,
           value: Object.freeze({
             key,
             moved: holdings.length,
-            movedTo: holdings.length > 0 ? (moveTo as string) : null,
+            movedTo: holdings.length > 0 && typeof moveTo === "string" ? moveTo : null,
           }),
         };
       });

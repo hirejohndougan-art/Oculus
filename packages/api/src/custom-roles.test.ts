@@ -232,7 +232,7 @@ describe("holding a custom role", () => {
     const me = asUser(person, w.a1);
     ok(
       await w.service.updateRecord(
-        me as never,
+        me,
         object.id as never,
         objectDraft("An invented oil lamp"),
         {
@@ -240,11 +240,11 @@ describe("holding a custom role", () => {
         },
       ),
     );
-    expect(codes(await w.service.createRecord(me as never, objectDraft("New")))).toEqual([
+    expect(codes(await w.service.createRecord(me, objectDraft("New")))).toEqual([
       "not_permitted",
     ]);
     expect(
-      codes(await w.service.publish(me as never, object.id as never, { expectedVersion: 2 })),
+      codes(await w.service.publish(me, object.id as never, { expectedVersion: 2 })),
     ).toEqual(["not_permitted"]);
 
     // Taking edit away needs the holders confirmed, then applies to the next write.
@@ -259,7 +259,7 @@ describe("holding a custom role", () => {
     );
     expect(
       codes(
-        await w.service.updateRecord(me as never, object.id as never, objectDraft("Again"), {
+        await w.service.updateRecord(me, object.id as never, objectDraft("Again"), {
           expectedVersion: 2,
         }),
       ),
@@ -313,7 +313,7 @@ describe("holding a custom role", () => {
     );
     expect(
       codes(
-        await w.service.updateRecord(me as never, object.id as never, objectDraft("Again"), {
+        await w.service.updateRecord(me, object.id as never, objectDraft("Again"), {
           expectedVersion: 2,
         }),
       ),
@@ -336,7 +336,7 @@ describe("holding a custom role", () => {
   });
 
   it("the role list shows custom roles to those who grant roles", async () => {
-    const catalog = ok(await w.service.roleCatalog(asUser(w.manager) as never));
+    const catalog = ok(await w.service.roleCatalog(asUser(w.manager)));
     expect(catalog.find((r) => r.role === "describer")).toMatchObject({
       label: "Describer",
       permissions: ["records.view"],

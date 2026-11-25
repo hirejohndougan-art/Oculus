@@ -4,7 +4,7 @@
 -- its key (lower case letters and underscores, never a built-in role's
 -- name), label, optional description and permissions (catalog permissions
 -- and site.settings only: never a system permission, and not site.people,
--- which 0018's grant guard knows for site managers only; S-066). The key
+-- which 0018's grant guard knows for site managers only; S-067). The key
 -- and organization never change; the version goes up by one on every
 -- change. A role is deleted only while nobody holds it (the service moves
 -- its holders to another role first, in the same transaction).

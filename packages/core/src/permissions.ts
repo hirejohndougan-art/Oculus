@@ -356,7 +356,7 @@ export function hasScopedGrants(access: Access): boolean {
  * The permissions a custom role may hold: every catalog permission and the
  * site's settings. Never a system permission (D-036), and not `site.people`
  * yet: granting roles is checked by the database for site managers only
- * (0018's guard), so a custom role that manages people waits for S-066.
+ * (0018's guard), so a custom role that manages people waits for S-067.
  */
 export const CUSTOM_ROLE_PERMISSIONS = Object.freeze([
   ...CATALOG_PERMISSIONS,
@@ -443,7 +443,7 @@ export function validateCustomRole(input: unknown): Validated<CustomRole> {
       );
       return undefined;
     }
-    if ([...value].length > max) {
+    if (Array.from(value).length > max) {
       issues.push(issue([path], "too_long", `The ${path} is at most ${String(max)} characters.`));
       return undefined;
     }
@@ -489,7 +489,7 @@ export function validateCustomRole(input: unknown): Validated<CustomRole> {
     value: Object.freeze({
       organizationId: organizationId as OrganizationId,
       key: key as string,
-      label: shownLabel as string,
+      label: shownLabel ?? "",
       ...(shownDescription === undefined ? {} : { description: shownDescription }),
       permissions: Object.freeze(ordered),
     }),

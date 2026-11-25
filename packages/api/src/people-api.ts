@@ -10,7 +10,8 @@
  *   may see, and what they may do (`rights`).
  * - `GET /api/people/:id`: one member; for system managers also their live
  *   sessions (never a token or an address) and two-step status.
- * - `GET /api/roles`: the built-in roles and their permissions.
+ * - `GET /api/roles`: the built-in roles and the organization's custom roles
+ *   (T-041a), with their permissions.
  * - `POST /api/invitations` `{ email, expiresInDays? }`: 201
  *   `{ invitationId, email, expiresAt }`. The token goes only to the
  *   invitee's mailbox (D-068's rule): never in a reply or a log.

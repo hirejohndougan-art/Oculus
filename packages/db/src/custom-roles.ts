@@ -18,7 +18,6 @@ import {
   isOrganizationId,
   isUserId,
   type CustomRole,
-  type CustomRolePermission,
   type OrganizationId,
   type UserId,
 } from "@oculus/core";
@@ -62,7 +61,7 @@ function roleFromRow(r: RoleRow): StoredCustomRole | undefined {
   if (!Array.isArray(r.permissions) || !r.permissions.every(isCustomRolePermission)) {
     return undefined;
   }
-  const held = r.permissions as CustomRolePermission[];
+  const held = r.permissions;
   return Object.freeze({
     organizationId: r.organization_id as OrganizationId,
     key: r.key,

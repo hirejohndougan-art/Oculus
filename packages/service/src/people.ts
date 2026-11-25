@@ -56,7 +56,6 @@ import {
   newRecordId,
   permits,
   type Access,
-  type BuiltInRole,
   type OrganizationId,
   type Permission,
   type SiteId,

@@ -42,7 +42,6 @@ import {
   newSiteId,
   permits,
   type Access,
-  type BuiltInRole,
   type OrganizationId,
   type RoleGrant,
   type Site,
