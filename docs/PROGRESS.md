@@ -2,6 +2,15 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 17:30 CT — manual (Chat S) — S-064 Change-log gaps
+
+- Result: done
+- What changed: migration 0051 `definition_events`, written by triggers on identifier types, terms, sites, storage levels and locations, Dublin Core mappings and the System settings, naming the transaction's `oculus.actor` (set by the service's `run`) or the row's editor; append-only, triggers ALWAYS. `readAuditTrail` also shows definitions, file attaches and removals, moves, accession saves (only with `donors.view` on every site) and share steps (home organization only; the other organization's people as `other_organization`). The audit screen words each kind. No secrets in definition tables (D-052 amended).
+- Decisions: D-117 (D-052 amended)
+- Review: three independent rounds. The first found a same-organization share leaking a title to the receiving site, accession lines reaching people without `donors.view`, and test gaps; the second found the other organization's user IDs in share lines and receiving-side lines beyond D-094; the third found only documentation gaps. All fixed; indexes (S-066) and a receiving-side view (S-067) filed.
+- Gate: PASS · tests_passing 5250 (was 5233) · npm audit clean
+- Next: S-066, S-067 (follow-ups); Phase 2's other jobs are claimed.
+
 ## 2026-11-25 16:00 CT — manual (Chat L) — U-008 Load-proof test timeouts
 
 - **Done:** `vitest.config.js` sets `testTimeout` 30 s and `hookTimeout` 120 s for the suite. The 19 db and service test files that set up their database lazily in `ready()` now warm it in `beforeAll`, with the error kept in the memoized promise so a missing database still fails each test on its own. `migrate.test`'s leaked-setting test uses `statement_timeout = '20ms'` against a 200 ms sleep (was 1 ms against 50 ms). The two second-factor deadlock tests wait for a backend blocked by the specific lock holder (`pg_blocking_pids`) and fail clearly after 20 s instead of releasing after 5 s. No assertion changes.

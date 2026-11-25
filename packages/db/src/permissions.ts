@@ -388,7 +388,12 @@ function refused<T>(path: (string | number)[], code: string, message: string): V
   return { ok: false, issues: [issue(path, code, message)] };
 }
 
-/** Stores a new site (checked by core's `validateSite`). The organization must exist. */
+/**
+ * Stores a new site (checked by core's `validateSite`). The organization must exist.
+ * No secret (a site password or its hash, D-052) ever goes on the site
+ * row: every change of it is copied for good into the append-only change
+ * log (migration 0051, D-117).
+ */
 export async function insertSite(db: Queryable, input: unknown): Promise<Validated<Site>> {
   const organizationId: unknown =
     typeof input === "object" && input !== null
