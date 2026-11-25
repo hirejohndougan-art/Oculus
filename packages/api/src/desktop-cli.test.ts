@@ -20,7 +20,12 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { request } from "node:http";
 import type { UserId } from "@oculus/core";
 import { migrate, openDatabase, setUpFirstInstall, sql } from "@oculus/db";
-import { giveTestFactor, testKeyring } from "../../db/src/second-factor.fixtures.js";
+import {
+  FAKE_TEST_SECRET_KEY,
+  FAKE_TEST_SECRET_KEY_2,
+  giveTestFactor,
+  testKeyring,
+} from "../../db/src/second-factor.fixtures.js";
 import { freshDatabase, type TestDatabase } from "../../db/src/test-database.fixtures.js";
 import { runDesktop, type DesktopOptions, type WindowProcess } from "./desktop-cli.js";
 
@@ -294,6 +299,19 @@ describe("npm run desktop", () => {
       expect(run.lines.join("\n")).toContain("backup");
       expect(existsSync(join(folder, "secret-key"))).toBe(false);
       expect(run.lines.some((l) => l.startsWith("Oculus is running"))).toBe(false);
+
+      // The wrong key is refused too; the key the set-ups were sealed with starts.
+      const wrong = start({
+        env: { OCULUS_DATABASE_URL: database.url, OCULUS_SECRET_KEY: FAKE_TEST_SECRET_KEY_2 },
+      });
+      expect(await wrong.done).toBe(1);
+      expect(wrong.lines.join("\n")).toContain("isn't the one");
+      const right = start({
+        env: { OCULUS_DATABASE_URL: database.url, OCULUS_SECRET_KEY: FAKE_TEST_SECRET_KEY },
+      });
+      await running(right);
+      right.stop();
+      expect(await right.done).toBe(0);
     } finally {
       await database.drop();
     }

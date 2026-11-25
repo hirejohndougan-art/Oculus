@@ -45,11 +45,12 @@ In a Command Prompt:
 git clone https://github.com/hirejohndougan-art/Oculus.git
 cd Oculus
 npm ci
+npm run build
 set OCULUS_DATABASE_URL=postgresql://oculus@localhost:5432/oculus
-npm run setup
+node packages\db\dist\setup-cli.js
 ```
 
-`npm run setup` asks for your organization's name, the first site's name, and your name, email and password. It runs only once.
+The last line is `npm run setup` on a Mac or Linux. It asks for your organization's name, the first site's name, and your name, email and password. It runs only once.
 
 ## Start Oculus
 
@@ -70,7 +71,7 @@ Double-click `scripts\start-oculus.cmd` in the Oculus folder. To make a desktop 
 
 ## Updating
 
-In the Oculus folder: `git pull`, then double-click `start-oculus.cmd` as usual. It rebuilds Oculus and updates the database by itself.
+Close Oculus first. Then, in the Oculus folder, `git pull`, and double-click `start-oculus.cmd` as usual (it needs the internet for a minute to fetch updates). It rebuilds Oculus and updates the database by itself.
 
 ## What the desktop version doesn't do yet
 

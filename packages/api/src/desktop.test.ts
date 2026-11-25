@@ -26,7 +26,7 @@ import {
   anyFreePort,
   databaseLabel,
   instanceAnswers,
-  instanceHash,
+  instanceProof,
   readDesktopSettings,
   readLock,
   settingsFolder,
@@ -105,6 +105,11 @@ describe("readDesktopSettings", () => {
       databaseUrl: "postgresql://oculus@localhost:5432/oculus",
       port: 4999,
     });
+  });
+
+  it("reads a file Notepad saved with a byte-order mark", () => {
+    write('\uFEFF{"port":4999}');
+    expect(readDesktopSettings(folder)).toEqual({ port: 4999 });
   });
 
   it("refuses a password in the address, without repeating it", () => {
@@ -275,6 +280,36 @@ describe("choosePort", () => {
   });
 });
 
+/** A local HTTP server answering `/desktop/instance` with `answer(challenge)` after `delayMs`. */
+async function instanceServer(
+  answer: (challenge: string) => unknown,
+  delayMs = 0,
+): Promise<{ url: string; close: () => Promise<void> }> {
+  const server = createHttpServer((request, reply) => {
+    const challenge = new URL(request.url ?? "/", "http://x").searchParams.get("challenge") ?? "";
+    setTimeout(() => {
+      reply.setHeader("content-type", "application/json");
+      reply.end(JSON.stringify(answer(challenge)));
+    }, delayMs);
+  });
+  const port = await new Promise<number>((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      resolve(typeof address === "object" && address !== null ? address.port : 0);
+    });
+  });
+  return {
+    url: `http://127.0.0.1:${String(port)}/`,
+    close: () =>
+      new Promise((resolve) => {
+        server.closeAllConnections();
+        server.close(() => {
+          resolve();
+        });
+      }),
+  };
+}
+
 describe("the launcher lock", () => {
   const lockFile = () => join(folder, "desktop.lock");
   const write = (value: object) => {
@@ -317,51 +352,68 @@ describe("the launcher lock", () => {
   });
 
   it("treats a program on the lock's port that doesn't know the token as stale", async () => {
-    const impostor = createHttpServer((_request, reply) => {
-      reply.setHeader("content-type", "application/json");
-      reply.end(JSON.stringify({ instance: instanceHash("some-other-token-".repeat(3)) }));
-    });
-    const port = await new Promise<number>((resolve) => {
-      impostor.listen(0, "127.0.0.1", () => {
-        const address = impostor.address();
-        resolve(typeof address === "object" && address !== null ? address.port : 0);
-      });
-    });
+    const impostor = await instanceServer(() => ({ proof: "0".repeat(64) }));
     try {
-      const url = `http://127.0.0.1:${String(port)}/`;
+      const url = impostor.url;
       write({ pid: 1, token, database: "x", started: Date.now(), url });
-      expect(await instanceAnswers({ pid: 1, token, database: "x", started: 0, url })).toBe(false);
+      expect(await instanceAnswers({ pid: 1, token, database: "x", started: 0, url })).toBe("no");
       expect((await takeLock(folder, "x")).kind).toBe("taken");
     } finally {
-      await new Promise((resolve) => impostor.close(resolve));
+      await impostor.close();
     }
   });
 
-  it("finds a running launcher only by its token's hash", async () => {
-    const answering = createHttpServer((request, reply) => {
-      reply.setHeader("content-type", "application/json");
-      reply.end(
-        JSON.stringify(
-          request.url === "/desktop/instance" ? { instance: instanceHash(token) } : {},
-        ),
-      );
-    });
-    const port = await new Promise<number>((resolve) => {
-      answering.listen(0, "127.0.0.1", () => {
-        const address = answering.address();
-        resolve(typeof address === "object" && address !== null ? address.port : 0);
-      });
-    });
+  it("finds a running launcher only by a proof of its token", async () => {
+    const real = await instanceServer((challenge) => ({ proof: instanceProof(token, challenge) }));
     try {
-      const url = `http://127.0.0.1:${String(port)}/`;
+      const url = real.url;
       write({ pid: 1, token, database: "x", started: Date.now(), url });
       expect(await takeLock(folder, "x")).toEqual({
         kind: "running",
         lock: { pid: 1, token, database: "x", started: expect.any(Number) as number, url },
       });
     } finally {
-      await new Promise((resolve) => answering.close(resolve));
+      await real.close();
     }
+  });
+
+  it("never takes a live launcher that's slow to answer for a stale one", async () => {
+    const slow = await instanceServer(
+      (challenge) => ({ proof: instanceProof(token, challenge) }),
+      1500,
+    );
+    try {
+      write({ pid: 1, token, database: "x", started: Date.now(), url: slow.url });
+      expect((await takeLock(folder, "x", Date.now, 200)).kind).toBe("busy");
+      expect(readLock(folder)?.token).toBe(token);
+    } finally {
+      await slow.close();
+    }
+  });
+
+  it("lets only one of two simultaneous starts take over a stale lock", async () => {
+    const port = await anyFreePort();
+    write({
+      pid: 1,
+      token,
+      database: "x",
+      started: Date.now(),
+      url: `http://127.0.0.1:${String(port)}/`,
+    });
+    const outcomes = await Promise.all([
+      takeLock(folder, "x"),
+      takeLock(folder, "x"),
+      takeLock(folder, "x"),
+    ]);
+    // Exactly one start ends up owning the lock; any other that briefly
+    // took it finds it lost when it writes its address, and stops.
+    const owners = outcomes.filter((o) => o.kind === "taken" && o.owned());
+    expect(owners).toHaveLength(1);
+    for (const o of outcomes) {
+      if (o.kind === "taken" && o !== owners[0])
+        expect(o.setUrl("http://127.0.0.1:2/")).toBe(false);
+    }
+    expect(outcomes.filter((o) => o.kind === "starting").length).toBeGreaterThanOrEqual(1);
   });
 
   it("ignores garbage and any address but 127.0.0.1", async () => {
@@ -380,12 +432,12 @@ describe("the launcher lock", () => {
   it("records the address, and releases only its own lock", async () => {
     const outcome = await takeLock(folder, "x");
     if (outcome.kind !== "taken") throw new Error(outcome.kind);
-    outcome.setUrl("http://127.0.0.1:4780/");
+    expect(outcome.setUrl("http://127.0.0.1:4780/")).toBe(true);
     expect(readLock(folder)?.url).toBe("http://127.0.0.1:4780/");
     write({ pid: 1, token, database: "x", started: 0 });
     outcome.release();
     expect(existsSync(lockFile())).toBe(true);
-    outcome.setUrl("http://127.0.0.1:1/");
+    expect(outcome.setUrl("http://127.0.0.1:1/")).toBe(false);
     expect(readLock(folder)?.token).toBe(token);
   });
 });
@@ -393,10 +445,13 @@ describe("the launcher lock", () => {
 describe("databaseLabel", () => {
   it("names the database and host, never the password", () => {
     expect(databaseLabel("postgresql://o:Invented-pw-9@db.example:5433/oculus")).toBe(
-      "oculus on db.example:5433",
+      "oculus as o on db.example:5433",
     );
     expect(databaseLabel("postgresql://o@localhost/oculus?host=%2Ftmp%2Fs")).toBe(
-      "oculus on a local socket",
+      "oculus as o on /tmp/s",
+    );
+    expect(databaseLabel("postgresql://o@localhost/other?host=%2Ftmp%2Fs")).not.toBe(
+      databaseLabel("postgresql://o@localhost/oculus?host=%2Ftmp%2Fs"),
     );
   });
 });
@@ -407,6 +462,16 @@ describe("windowProfileFolder", () => {
       join("C:\\L", "Oculus", "window"),
     );
     expect(windowProfileFolder("linux", {}, "/h/.config/oculus")).toBe("/h/.config/oculus/window");
+  });
+});
+
+describe("loadOrCreateSecretKey after a crash left the key file empty", () => {
+  it("makes it again while nothing is sealed, and refuses once something is", () => {
+    writeFileSync(join(folder, "secret-key"), "", { mode: 0o600 });
+    expect(codeOf(() => loadOrCreateSecretKey(folder, {}, "linux", false))).toBe(
+      "secret_key_invalid",
+    );
+    expect(loadOrCreateSecretKey(folder, {}, "linux", true).created).toBe(true);
   });
 });
 

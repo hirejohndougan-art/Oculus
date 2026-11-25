@@ -21,13 +21,15 @@
  *   does. Losing it loses every two-step sign-in set-up (D-077), so it must
  *   be backed up with the database backups.
  */
-import { createHash, randomBytes } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import {
   closeSync,
   existsSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   writeSync,
@@ -115,7 +117,8 @@ export function readDesktopSettings(folder: string): DesktopSettings {
   if (!existsSync(file)) return {};
   let value: unknown;
   try {
-    value = JSON.parse(readFileSync(file, "utf8"));
+    // Notepad may start the file with a byte-order mark.
+    value = JSON.parse(readFileSync(file, "utf8").replace(/^\uFEFF/, ""));
   } catch {
     throw new DesktopError(
       "settings_unreadable",
@@ -172,7 +175,7 @@ export function chooseDatabaseUrl(env: Env, settings: DesktopSettings, folder: s
       `2. Put its address in ${join(folder, SETTINGS_FILE)}, for example`,
       '   { "databaseUrl": "postgresql://oculus@localhost:5432/oculus" }',
       "   with the password in your pgpass file, not in that file.",
-      "3. Run `npm run setup` once, then `npm run desktop` again.",
+      "3. Run `npm run setup` once (on Windows, `node packages\\db\\dist\\setup-cli.js` after `npm run build`), then `npm run desktop` again.",
     ].join("\n"),
   );
 }
@@ -193,6 +196,11 @@ export function loadOrCreateSecretKey(
   if (fromEnv !== undefined && fromEnv !== "") return { key: fromEnv, created: false };
   const file = join(folder, KEY_FILE);
   let created = false;
+  // A crash between making the key file and writing it leaves it empty;
+  // with nothing sealed yet, it is simply made again.
+  if (mayCreate && existsSync(file) && readFileSync(file, "utf8").trim() === "") {
+    rmSync(file, { force: true });
+  }
   if (!existsSync(file) && !mayCreate) {
     throw new DesktopError(
       "secret_key_missing",
@@ -364,9 +372,13 @@ const LOCK_FILE = "desktop.lock";
 export const STARTING_LOCK_MS = 10 * 60_000;
 export const INSTANCE_PATH = "/desktop/instance";
 
-/** The hash `/desktop/instance` answers with; the token itself never leaves the lock file. */
-export function instanceHash(token: string): string {
-  return createHash("sha256").update(`oculus-desktop-instance:${token}`).digest("hex");
+/**
+ * The launcher's answer to `/desktop/instance?challenge=<hex>`: an HMAC of a
+ * fresh challenge under the lock's token, so the answer proves the token
+ * without revealing anything a program could replay later.
+ */
+export function instanceProof(token: string, challenge: string): string {
+  return createHmac("sha256", token).update(`oculus-desktop-instance:${challenge}`).digest("hex");
 }
 
 export function pidAlive(pid: number): boolean {
@@ -380,10 +392,12 @@ export function pidAlive(pid: number): boolean {
 
 /** Reads a lock, or `undefined` if it's missing or not a lock. */
 export function readLock(folder: string): LockContents | undefined {
+  return readLockFile(join(folder, LOCK_FILE));
+}
+
+function readLockFile(path: string): LockContents | undefined {
   try {
-    const value = JSON.parse(
-      readFileSync(join(folder, LOCK_FILE), "utf8"),
-    ) as Partial<LockContents>;
+    const value = JSON.parse(readFileSync(path, "utf8")) as Partial<LockContents>;
     if (
       typeof value.pid !== "number" ||
       !Number.isInteger(value.pid) ||
@@ -409,41 +423,108 @@ export function readLock(folder: string): LockContents | undefined {
   }
 }
 
-/** Whether the server at `url` is the launcher that wrote `lock`. */
-export async function instanceAnswers(lock: LockContents): Promise<boolean> {
-  if (lock.url === undefined) return false;
+/**
+ * Whether the server at the lock's address is the launcher that wrote the
+ * lock: `yes`, `no` (nothing listens there, or something that doesn't know
+ * the token), or `busy` (no answer in time: a live launcher under load,
+ * never taken for a stale one).
+ */
+export async function instanceAnswers(
+  lock: LockContents,
+  timeoutMs = 5000,
+): Promise<"yes" | "no" | "busy"> {
+  if (lock.url === undefined) return "no";
+  const challenge = randomBytes(16).toString("hex");
+  const target = new URL(INSTANCE_PATH, lock.url);
+  target.searchParams.set("challenge", challenge);
   try {
-    const reply = await fetch(new URL(INSTANCE_PATH, lock.url), {
-      signal: AbortSignal.timeout(2000),
+    const reply = await fetch(target, {
+      signal: AbortSignal.timeout(timeoutMs),
       redirect: "error",
     });
-    if (!reply.ok) return false;
-    const body = (await reply.json()) as { instance?: unknown };
-    return body.instance === instanceHash(lock.token);
-  } catch {
-    return false;
+    if (!reply.ok) return "no";
+    const body = (await reply.json()) as { proof?: unknown };
+    return body.proof === instanceProof(lock.token, challenge) ? "yes" : "no";
+  } catch (error) {
+    const name = error instanceof Error ? error.name : "";
+    return name === "TimeoutError" || name === "AbortError" ? "busy" : "no";
   }
 }
 
 export type LockOutcome =
-  | { kind: "taken"; lock: LockContents; setUrl: (url: string) => void; release: () => void }
+  | {
+      kind: "taken";
+      lock: LockContents;
+      setUrl: (url: string) => boolean;
+      owned: () => boolean;
+      release: () => void;
+    }
   | { kind: "running"; lock: LockContents & { url: string } }
-  | { kind: "starting" };
+  | { kind: "starting" }
+  | { kind: "busy" };
 
-function writeNew(file: string, contents: LockContents): boolean {
-  let fd: number;
-  try {
-    fd = openSync(file, "wx", 0o600);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
-    throw error;
-  }
+/**
+ * Creates the lock with its whole contents at once: written to a private
+ * temporary file, then hard-linked into place (`link` fails if the lock
+ * exists), so no other start ever reads a half-written lock.
+ */
+function createWhole(file: string, contents: LockContents): boolean {
+  const temporary = `${file}.${String(process.pid)}.${randomBytes(6).toString("hex")}.tmp`;
+  const fd = openSync(temporary, "wx", 0o600);
   try {
     writeSync(fd, JSON.stringify(contents));
   } finally {
     closeSync(fd);
   }
-  return true;
+  try {
+    linkSync(temporary, file);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+}
+
+/** Replaces our own lock's contents atomically (write, then rename over it). */
+function replaceWhole(file: string, contents: LockContents): void {
+  const temporary = `${file}.${String(process.pid)}.${randomBytes(6).toString("hex")}.tmp`;
+  const fd = openSync(temporary, "wx", 0o600);
+  try {
+    writeSync(fd, JSON.stringify(contents));
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(temporary, file);
+}
+
+/**
+ * Takes a stale lock out of the way: renames it aside (atomic, so only one
+ * start can move it), then checks it is the lock judged stale. If another
+ * start's fresh lock was moved instead, it is linked back (or, if yet
+ * another start already holds the place, left to that one).
+ */
+function moveAside(file: string, stale: LockContents | undefined): void {
+  const aside = `${file}.${randomBytes(6).toString("hex")}.stale`;
+  try {
+    renameSync(file, aside);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  try {
+    const moved = readLockFile(aside);
+    if (moved !== undefined && stale !== undefined && moved.token !== stale.token) {
+      try {
+        linkSync(aside, file);
+      } catch {
+        // Another start holds the place now; the moved lock's owner finds it lost.
+      }
+    }
+  } finally {
+    rmSync(aside, { force: true });
+  }
 }
 
 /** Takes the lock, or says which launcher already has it. */
@@ -451,6 +532,7 @@ export async function takeLock(
   folder: string,
   database: string,
   now: () => number = Date.now,
+  timeoutMs = 5000,
 ): Promise<LockOutcome> {
   const file = join(folder, LOCK_FILE);
   const mine: LockContents = {
@@ -459,21 +541,18 @@ export async function takeLock(
     database,
     started: now(),
   };
-  for (let attempt = 0; attempt < 2; attempt++) {
-    if (writeNew(file, mine)) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (createWhole(file, mine)) {
       const owned = (): boolean => readLock(folder)?.token === mine.token;
       return {
         kind: "taken",
         lock: mine,
+        owned,
         setUrl: (url) => {
-          if (!owned()) return;
+          if (!owned()) return false;
           mine.url = url;
-          const fd = openSync(file, "w", 0o600);
-          try {
-            writeSync(fd, JSON.stringify(mine));
-          } finally {
-            closeSync(fd);
-          }
+          replaceWhole(file, mine);
+          return owned();
         },
         release: () => {
           try {
@@ -485,33 +564,41 @@ export async function takeLock(
       };
     }
     const held = readLock(folder);
-    if (held?.url !== undefined && (await instanceAnswers(held))) {
-      return { kind: "running", lock: { ...held, url: held.url } };
+    if (held?.url !== undefined) {
+      const answer = await instanceAnswers(held, timeoutMs);
+      if (answer === "yes") return { kind: "running", lock: { ...held, url: held.url } };
+      if (answer === "busy" && held.pid !== process.pid && pidAlive(held.pid)) {
+        return { kind: "busy" };
+      }
     }
     if (
       held !== undefined &&
       held.url === undefined &&
-      held.pid !== process.pid &&
       pidAlive(held.pid) &&
       now() - held.started < STARTING_LOCK_MS
     ) {
       return { kind: "starting" };
     }
     // Stale: its launcher is gone, or something else answers on its port.
-    rmSync(file, { force: true });
+    moveAside(file, held);
   }
   return { kind: "starting" };
 }
 
-/** A short, password-free name for a database address, for messages and the lock. */
+/**
+ * A password-free name for a database address, for messages and the lock:
+ * the user, the host (or socket folder), the port and the database, so two
+ * different databases never get the same name.
+ */
 export function databaseLabel(url: string): string {
   try {
     const parsed = new URL(url);
     const name = decodeURIComponent(parsed.pathname.replace(/^\//, "")) || "(default)";
+    const user = decodeURIComponent(parsed.username) || "(default user)";
     const socket = parsed.searchParams.get("host");
-    if (socket?.startsWith("/") === true) return `${name} on a local socket`;
     const host = socket ?? (parsed.hostname === "" ? "localhost" : parsed.hostname);
-    return `${name} on ${host}${parsed.port === "" ? "" : `:${parsed.port}`}`;
+    const port = parsed.searchParams.get("port") ?? parsed.port;
+    return `${name} as ${user} on ${host}${port === "" ? "" : `:${port}`}`;
   } catch {
     return "(unreadable address)";
   }

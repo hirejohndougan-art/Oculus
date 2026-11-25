@@ -31,6 +31,7 @@ import {
   migrate,
   MigrationError,
   openDatabase,
+  loadSecretKeyring,
   SECRET_KEY_VARIABLE,
   sql,
   type Database,
@@ -48,7 +49,7 @@ import {
   ensureSettingsFolder,
   findAppBrowser,
   INSTANCE_PATH,
-  instanceHash,
+  instanceProof,
   loadOrCreateSecretKey,
   readDesktopSettings,
   settingsFolder,
@@ -107,9 +108,14 @@ function defaultOpenDefault(url: string): void {
 
 function defaultStopRequested(): Promise<void> {
   return new Promise((resolve) => {
+    let asked = 0;
     // SIGHUP: the console window was closed; SIGBREAK: Ctrl+Break on Windows.
     for (const signal of ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"] as const) {
       process.on(signal, () => {
+        asked++;
+        if (asked > 1) process.exit(130); // A second Ctrl+C: stop now.
+        // If shutting down hangs (a query held up by another program), give up after 20 s.
+        setTimeout(() => process.exit(1), 20_000).unref();
         resolve();
       });
     }
@@ -144,13 +150,31 @@ function passwordOf(url: string): string[] {
   return found;
 }
 
-/** Whether the database holds two-step set-ups (sealed with some key). */
-async function hasSecondFactors(db: Database): Promise<boolean> {
+/** The fingerprints of the keys the database's two-step set-ups are sealed with (D-077). */
+async function sealingKeyIds(db: Database): Promise<string[]> {
   const [table] = await db.rows<{ present: boolean }>(
     sql`SELECT to_regclass('public.second_factors') IS NOT NULL AS present`,
   );
-  if (table?.present !== true) return false;
-  return (await db.rows(sql`SELECT 1 FROM public.second_factors LIMIT 1`)).length > 0;
+  if (table?.present !== true) return [];
+  const rows = await db.rows<{ id: string }>(sql`
+    SELECT DISTINCT encode(substring(secret_box FROM 2 FOR 8), 'hex') AS id
+    FROM public.second_factors`);
+  return rows.map((r) => r.id);
+}
+
+/** The fingerprints of the key in use and any previous keys still accepted. */
+function knownKeyIds(key: string, env: Env): Set<string> {
+  const ids = new Set([loadSecretKeyring({ [SECRET_KEY_VARIABLE]: key }).currentKeyId]);
+  for (const previous of (env.OCULUS_SECRET_KEY_PREVIOUS ?? "").split(",")) {
+    const text = previous.trim();
+    if (text === "") continue;
+    try {
+      ids.add(loadSecretKeyring({ [SECRET_KEY_VARIABLE]: text }).currentKeyId);
+    } catch {
+      // The server itself refuses a bad previous key at start.
+    }
+  }
+  return ids;
 }
 
 /** Runs the launcher; resolves with the exit code once Oculus has stopped. */
@@ -209,6 +233,12 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
     out("Oculus is already starting. Its window opens when it's ready.");
     return 0;
   }
+  if (lock.kind === "busy") {
+    out(
+      "Oculus is already running but busy right now. Try again in a minute, or use its open window.",
+    );
+    return 0;
+  }
   if (lock.kind === "running") {
     if (lock.lock.database !== database) {
       err(
@@ -249,10 +279,10 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
       return 2;
     }
     let state: "empty" | "set_up" | "other";
-    let enrolled: boolean;
+    let sealedWith: string[] = [];
     try {
       state = await databaseBeforeSetup(db);
-      enrolled = state === "set_up" && (await hasSecondFactors(db));
+      if (state === "set_up") sealedWith = await sealingKeyIds(db);
     } catch {
       err(
         "Can't reach the database. Check that PostgreSQL is running and that the address and pgpass password are right.",
@@ -261,7 +291,7 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
     }
     if (state === "empty") {
       err(
-        "This database hasn't been set up yet. Run `npm run setup` once (with OCULUS_DATABASE_URL set to the same database), then start Oculus again.",
+        "This database hasn't been set up yet. Run `npm run setup` once (on Windows, `node packages\\db\\dist\\setup-cli.js`), with OCULUS_DATABASE_URL set to the same database, then start Oculus again.",
       );
       return 1;
     }
@@ -271,9 +301,16 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
     }
     let key: string;
     try {
-      const secretKey = loadOrCreateSecretKey(folder, env, platform, !enrolled);
+      const secretKey = loadOrCreateSecretKey(folder, env, platform, sealedWith.length === 0);
       key = secretKey.key;
       secrets.push(key);
+      const known = knownKeyIds(key, env);
+      if (sealedWith.some((id) => !known.has(id))) {
+        err(
+          `The secret key in use (${env[SECRET_KEY_VARIABLE] ? "OCULUS_SECRET_KEY" : join(folder, "secret-key")}) isn't the one people's two-step sign-in was set up with. Put the right key back from your backup; starting with this one would lock them out.`,
+        );
+        return 1;
+      }
       if (secretKey.created) {
         out(
           `Made Oculus's secret key in ${join(folder, "secret-key")}. Back it up along with your database backups: without it, everyone has to set up two-step sign-in again.`,
@@ -311,16 +348,36 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
       OCULUS_TRUSTED_PROXY: undefined,
       OCULUS_CLIENT_ADDRESS: undefined,
     };
-    const hash = instanceHash(token);
+    const ownHost = `127.0.0.1:${String(port)}`;
     app = await buildAdminServer({
       db,
       env: serverEnv,
-      extraRoutes: [{ method: "GET", path: INSTANCE_PATH, handler: () => ({ instance: hash }) }],
+      extraRoutes: [
+        {
+          method: "GET",
+          path: INSTANCE_PATH,
+          handler: (request, reply) => {
+            const challenge = request.query.challenge;
+            if (
+              request.host !== ownHost ||
+              typeof challenge !== "string" ||
+              !/^[0-9a-f]{32}$/.test(challenge)
+            ) {
+              reply.status(404);
+              return { error: "not_found" };
+            }
+            return { proof: instanceProof(token, challenge) };
+          },
+        },
+      ],
       ...(options.adminDir === undefined ? {} : { adminDir: options.adminDir }),
     });
     await app.listen({ host: "127.0.0.1", port });
     const address = `${origin}/`;
-    setUrl(address);
+    if (!setUrl(address)) {
+      err("Another start of Oculus took over while this one was starting. Use its window.");
+      return 1;
+    }
     out(`Oculus is running at ${address}`);
 
     const stop = options.stopRequested?.() ?? defaultStopRequested();
@@ -380,10 +437,15 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
     }
     try {
       await app?.close();
-    } finally {
-      await db?.close();
-      release();
+    } catch {
+      // Closing is best effort; the process ends next.
     }
+    try {
+      await db?.close();
+    } catch {
+      // As above.
+    }
+    release();
   }
 }
 

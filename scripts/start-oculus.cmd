@@ -5,9 +5,11 @@ rem Oculus window stops it. The first time, and after each update
 rem (git pull), it installs and builds Oculus first, which takes a few minutes.
 setlocal
 cd /d "%~dp0.."
+set "INSTALLED="
 if not exist "node_modules" (
   echo Installing what Oculus needs, the first time only...
   call npm ci || goto failed
+  set "INSTALLED=1"
 )
 set "HEAD="
 set "BUILT="
@@ -19,7 +21,7 @@ goto run
 
 :build
 echo Updating what Oculus needs and building it...
-call npm ci || goto failed
+if not defined INSTALLED call npm ci || goto failed
 call npm run build || goto failed
 if defined HEAD (echo %HEAD%)>"packages\api\dist\.built-from"
 
