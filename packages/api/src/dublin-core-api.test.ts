@@ -1,4 +1,4 @@
-// A template's stored Dublin Core mapping over HTTP (T-050b, D-094):
+// A template's stored Dublin Core mapping over HTTP (T-050b, D-096):
 // `GET`/`PUT /api/templates/:key/dublin-core`. Anyone who may read
 // templates reads it (version 0 and null before the first save); only a
 // system manager saves it (D-072), from the version it started from, and a

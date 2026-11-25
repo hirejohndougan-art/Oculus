@@ -125,7 +125,7 @@ export interface SavedIdentifierType extends TaggedIdentifierType {
   readonly publishedRecords: readonly RecordId[];
 }
 
-/** A template's Dublin Core mapping as read (T-050b, D-094): version 0 and `null` when none is stored. */
+/** A template's Dublin Core mapping as read (T-050b, D-096): version 0 and `null` when none is stored. */
 export interface DublinCoreMappingVersion {
   readonly key: string;
   readonly version: number;
@@ -156,7 +156,7 @@ export interface DefinitionOperations {
     template: unknown,
     options: unknown,
   ): Promise<ServiceResult<SavedTemplate>>;
-  /** A template's stored Dublin Core mapping (T-050b, D-094), for anyone who may read templates. */
+  /** A template's stored Dublin Core mapping (T-050b, D-096), for anyone who may read templates. */
   readDublinCoreMapping(
     context: ServiceContext,
     key: string,

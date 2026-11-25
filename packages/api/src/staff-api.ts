@@ -65,7 +65,7 @@
  * the changes also need a recent sign-in (`403 reauthentication_required`).
  * An unknown site is `404 not_found`.
  *
- * Dublin Core mappings (T-050b, D-094): `GET`/`PUT
+ * Dublin Core mappings (T-050b, D-096): `GET`/`PUT
  * /api/templates/:key/dublin-core`, a template's stored mapping
  * (`If-None-Match: *` for the first, `If-Match: "v<N>"` after; a change
  * shown at once on published records answers `409 confirmation_required`
@@ -824,7 +824,7 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
         });
       }),
     },
-    // A template's Dublin Core mapping (T-050b, D-094, D-012): read by anyone
+    // A template's Dublin Core mapping (T-050b, D-096, D-012): read by anyone
     // who may read templates; saved by those who may change definitions,
     // with D-076's published-records confirmation.
     {

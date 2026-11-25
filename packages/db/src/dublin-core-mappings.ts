@@ -1,6 +1,6 @@
 /**
- * Stored Dublin Core mappings (T-050b, D-094, D-012): one current mapping
- * per template, beside it (migration 0024), with a version counting its
+ * Stored Dublin Core mappings (T-050b, D-096, D-012): one current mapping
+ * per template, beside it (migration 0025), with a version counting its
  * changes.
  *
  * Nothing here decides who may change a mapping or checks it against its

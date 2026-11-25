@@ -1744,7 +1744,7 @@ describe("the database refuses every other change of state, for every writer", (
   });
 });
 
-describe("stored Dublin Core mappings (T-050b, D-094)", () => {
+describe("stored Dublin Core mappings (T-050b, D-096)", () => {
   const rootCtx = (org: OrganizationId) => ({
     ...ctx(org),
     actor: actorOf(folks?.root ?? ("" as UserId)),

@@ -741,7 +741,7 @@ export interface PublicRecordOptions {
    * The organization's Dublin Core mappings; the one for the record's
    * template is used. Configuration, not record data: `publicOutput` checks
    * it against the template and the organization (D-047). Left out: the
-   * template's stored mapping (T-050b, D-094), read in the same snapshot
+   * template's stored mapping (T-050b, D-096), read in the same snapshot
    * through `public_dublin_core_mapping`, which the public reader may call.
    */
   readonly mappings?: readonly DublinCoreMapping[];
