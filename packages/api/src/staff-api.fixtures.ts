@@ -304,3 +304,19 @@ export async function publishAs(
 }
 
 export { actorOf };
+
+/** One unused recovery code of a person who already has a test factor (T-048: an admin's own code). */
+export function spareRecoveryCode(userId: UserId): string {
+  const code = factors.get(userId)?.codes.pop();
+  if (code === undefined) throw new Error("no test factor or no codes left");
+  return code;
+}
+
+/**
+ * Moves a whole session back by `seconds` (sign-in, password entry, last
+ * use and end alike, so it stays live), so its password entry is no longer
+ * "recent" (D-069: 10 minutes).
+ */
+export async function staleReauth(db: Database, sessionId: string, seconds: number): Promise<void> {
+  await ageSession(db, sessionId, seconds);
+}

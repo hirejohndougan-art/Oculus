@@ -26,6 +26,7 @@ import { ME_KEY } from "../frame/useMe";
 import { TextInput } from "../records/controls";
 import records from "../records/Records.module.css";
 import type { Me, SiteChoice } from "../types";
+import { useReauthenticated } from "../people/Reauth";
 import { issueLine, issuesOf } from "./templateForm";
 import styles from "./Settings.module.css";
 
@@ -44,6 +45,10 @@ export function refusalText(error: unknown): readonly string[] {
 
 export function Problems(props: { readonly error: unknown }) {
   if (props.error === null || props.error === undefined) return null;
+  // The password re-entry form answers this one (useReauthenticated).
+  if (props.error instanceof ApiError && props.error.code === "reauthentication_required") {
+    return null;
+  }
   const lines = refusalText(props.error);
   return (
     <div role="alert">
@@ -90,7 +95,8 @@ export function SettingsLayout() {
         <h1 className={records.pageTitle}>System settings</h1>
         <p className={records.lead}>
           Settings for the whole of Oculus, for every organization and site. Only system managers
-          see these. Adding or renaming a site and changing the sign-in rules need a recent sign-in.
+          see these. Adding or renaming a site and changing the sign-in rules ask for your password
+          again if you signed in a while ago.
         </p>
       </div>
       <nav aria-label="System settings">
@@ -166,10 +172,16 @@ function SiteRow(props: { readonly site: SiteChoice }) {
       await queries.invalidateQueries({ queryKey: ME_KEY });
     },
   });
+  const reauth = useReauthenticated("For changes to sites");
   function submit(event: SubmitEvent) {
     event.preventDefault();
     setDone(false);
-    rename.mutate(name.trim());
+    const value = name.trim();
+    void reauth
+      .run(async () => {
+        await rename.mutateAsync(value);
+      })
+      .catch(() => undefined);
   }
   return (
     <tr>
@@ -201,6 +213,7 @@ function SiteRow(props: { readonly site: SiteChoice }) {
         ) : (
           site.siteName
         )}
+        {reauth.form}
         <Problems error={rename.error} />
         {done ? <span className={styles.muted}> Renamed.</span> : null}
       </td>
@@ -239,10 +252,16 @@ export function SitesSettings() {
       await queries.invalidateQueries({ queryKey: ME_KEY });
     },
   });
+  const reauth = useReauthenticated("For changes to sites");
   function submit(event: SubmitEvent) {
     event.preventDefault();
     setMade(undefined);
-    create.mutate({ organizationId, name: name.trim() });
+    const body = { organizationId, name: name.trim() };
+    void reauth
+      .run(async () => {
+        await create.mutateAsync(body);
+      })
+      .catch(() => undefined);
   }
   return (
     <>
@@ -324,6 +343,7 @@ export function SitesSettings() {
           </Button>
         </div>
       </form>
+      {reauth.form}
     </>
   );
 }
@@ -397,62 +417,70 @@ function SignInForm(props: {
     },
   });
   const conflict = save.error instanceof ApiError && save.error.status === 412;
+  const reauth = useReauthenticated("For changes to the sign-in rules");
   function submit(event: SubmitEvent) {
     event.preventDefault();
-    save.mutate();
+    void reauth
+      .run(async () => {
+        await save.mutateAsync();
+      })
+      .catch(() => undefined);
   }
   return (
-    <form className={records.panel} onSubmit={submit} aria-labelledby="sign-in-rules">
-      <h2 id="sign-in-rules" className={records.sectionTitle}>
-        Sign-in rules
-      </h2>
-      <p className={records.meta}>
-        These apply to sessions started after a change; people already signed in keep theirs.
-      </p>
-      <div className={records.grid}>
-        <TextInput
-          label="Sign out after this many minutes unused"
-          value={idle}
-          onChange={setIdle}
-          isRequired
-          help="5 to 720 minutes. No longer than the limit beside it."
-        />
-        <TextInput
-          label="Sign out after this many minutes in all"
-          value={absolute}
-          onChange={setAbsolute}
-          isRequired
-          help="60 to 1,440 minutes (24 hours)."
-        />
-      </div>
-      {conflict ? (
-        <div role="alert">
-          <Note tone="amber">
-            Someone else changed these rules while you were editing.{" "}
-            <Button
-              variant="link"
-              onPress={() => {
-                void queries.invalidateQueries({ queryKey: SETTINGS_KEY });
-              }}
-            >
-              Load their version
-            </Button>
-          </Note>
+    <>
+      <form className={records.panel} onSubmit={submit} aria-labelledby="sign-in-rules">
+        <h2 id="sign-in-rules" className={records.sectionTitle}>
+          Sign-in rules
+        </h2>
+        <p className={records.meta}>
+          These apply to sessions started after a change; people already signed in keep theirs.
+        </p>
+        <div className={records.grid}>
+          <TextInput
+            label="Sign out after this many minutes unused"
+            value={idle}
+            onChange={setIdle}
+            isRequired
+            help="5 to 720 minutes. No longer than the limit beside it."
+          />
+          <TextInput
+            label="Sign out after this many minutes in all"
+            value={absolute}
+            onChange={setAbsolute}
+            isRequired
+            help="60 to 1,440 minutes (24 hours)."
+          />
         </div>
-      ) : (
-        <Problems error={save.error} />
-      )}
-      {saved ? (
-        <div aria-live="polite">
-          <Note tone="green">Saved.</Note>
+        {conflict ? (
+          <div role="alert">
+            <Note tone="amber">
+              Someone else changed these rules while you were editing.{" "}
+              <Button
+                variant="link"
+                onPress={() => {
+                  void queries.invalidateQueries({ queryKey: SETTINGS_KEY });
+                }}
+              >
+                Load their version
+              </Button>
+            </Note>
+          </div>
+        ) : (
+          <Problems error={save.error} />
+        )}
+        {saved ? (
+          <div aria-live="polite">
+            <Note tone="green">Saved.</Note>
+          </div>
+        ) : null}
+        <div className={records.actions}>
+          <Button type="submit" variant="primary" isDisabled={save.isPending}>
+            Save sign-in rules
+          </Button>
         </div>
-      ) : null}
-      <div className={records.actions}>
-        <Button type="submit" variant="primary" isDisabled={save.isPending}>
-          Save sign-in rules
-        </Button>
-      </div>
-    </form>
+      </form>
+      {reauth.form}
+    </>
   );
 }
 

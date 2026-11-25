@@ -113,6 +113,32 @@ try {
       scope: null,
     }),
   );
+  // A third invented member for T-048's people test (people.spec.ts), so
+  // resetting their two-step sign-in leaves the others' tests alone.
+  const helperEmail = "helper@example.org";
+  must(
+    await createInvitation(db, { organizationId, email: helperEmail, invitedBy: root }, (m) => {
+      box.push(m);
+      return Promise.resolve();
+    }),
+  );
+  const helper = must(
+    await acceptInvitation(db, {
+      token: box[2].token,
+      organizationId,
+      email: helperEmail,
+      displayName: "Ben Invented",
+      password: PASSWORD,
+    }),
+  ).userId;
+  must(
+    await service.grantRole(actor, {
+      userId: helper,
+      role: "cataloger",
+      siteId: site.id,
+      scope: null,
+    }),
+  );
   // An object template and one invented record on the site.
   const field = (key, label, kind, extra = {}) => ({
     key,
@@ -180,6 +206,10 @@ try {
       password: PASSWORD,
       siteName: "Invented Archive",
       recordTitle,
+      // T-048's people screens: the system manager signs in too.
+      rootEmail: "root@example.org",
+      organizationName: "Invented Historical Society",
+      helperName: "Ben Invented",
     }),
   );
 } catch (error) {

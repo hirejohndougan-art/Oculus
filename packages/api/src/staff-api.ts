@@ -88,6 +88,7 @@ import {
 import { OCULUS_COOKIES } from "./cookies.js";
 import { Refusal } from "./errors.js";
 import type { OculusReply, OculusRequest, OculusRoute } from "./routes.js";
+import { peopleApiRoutes, type PeopleApiOptions } from "./people-api.js";
 import { DEFAULT_RATE_LIMITS, SessionRateLimiter, type RateBucket } from "./rate-limit.js";
 
 /** A fixed-shape log record: never an error object, a token, a body or a query. */
@@ -101,6 +102,9 @@ export interface ApiLogRecord {
     | "client_address_warning"
     | "reset_settled"
     | "reset_link_produced"
+    // The people routes in development (admin-server.ts, T-048).
+    | "invitation_produced"
+    | "set_up_link_produced"
     | "startup_warning";
   readonly operation?: string;
   readonly code?: string;
@@ -118,6 +122,8 @@ export interface StaffApiOptions {
   readonly rateLimits?: Partial<Record<RateBucket, number>>;
   /** The limiter's clock (tests). */
   readonly clock?: () => number;
+  /** People, roles and the audit trail (T-048, people-api.ts); left out, those routes aren't served. */
+  readonly people?: PeopleApiOptions;
 }
 
 /** The header carrying the CSRF token on every change. */
@@ -188,7 +194,7 @@ export function serviceErrorLogger(
 // Reading the request
 
 /** A JSON object body, or `400 bad_body`. */
-function objectBody(request: OculusRequest): Readonly<Record<string, unknown>> {
+export function objectBody(request: OculusRequest): Readonly<Record<string, unknown>> {
   const body = request.body;
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
     throw new Refusal(400, "bad_body");
@@ -197,7 +203,7 @@ function objectBody(request: OculusRequest): Readonly<Record<string, unknown>> {
 }
 
 /** The body's keys must be among `allowed`; else `422 invalid` naming the first other. */
-function onlyKeys(
+export function onlyKeys(
   body: Readonly<Record<string, unknown>>,
   allowed: readonly string[],
   reply: OculusReply,
@@ -248,7 +254,7 @@ function newOrMatch(request: OculusRequest, pattern: RegExp): { readonly tag: st
 }
 
 /** One text query parameter (400 when sent twice). */
-function queryText(request: OculusRequest, name: string): string | undefined {
+export function queryText(request: OculusRequest, name: string): string | undefined {
   const value = request.query[name];
   if (value === undefined) return undefined;
   if (typeof value !== "string") throw new Refusal(400, "bad_query");
@@ -256,7 +262,7 @@ function queryText(request: OculusRequest, name: string): string | undefined {
 }
 
 /** A whole number query parameter (400 otherwise). */
-function queryNumber(request: OculusRequest, name: string, max: number): number | undefined {
+export function queryNumber(request: OculusRequest, name: string, max: number): number | undefined {
   const text = queryText(request, name);
   if (text === undefined) return undefined;
   if (!/^[1-9][0-9]{0,9}$/.test(text)) throw new Refusal(400, "bad_query");
@@ -315,7 +321,11 @@ const CONTEXT_CODES: ReadonlySet<string> = new Set([
 ]);
 
 /** The refusal as the HTTP reply: thrown `Refusal` for fixed codes, or data with issues. */
-function refused(result: ServiceRefusal, reply: OculusReply, log: (r: ApiLogRecord) => void) {
+export function refused(
+  result: ServiceRefusal,
+  reply: OculusReply,
+  log: (r: ApiLogRecord) => void,
+) {
   const issues = result.issues;
   const codes = new Set(issues.map((i) => i.code));
   const onPath = (i: Issue, first: string): boolean => i.path.length === 1 && i.path[0] === first;
@@ -375,7 +385,7 @@ function refused(result: ServiceRefusal, reply: OculusReply, log: (r: ApiLogReco
 // ---------------------------------------------------------------------------
 // The routes
 
-type Handler = (
+export type Handler = (
   request: OculusRequest,
   reply: OculusReply,
   signed: { readonly session: FullSession; readonly context: ServiceContext },
@@ -740,6 +750,9 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
     workflowRoute("/api/records/:id/return-to-draft", "returnToDraft"),
     workflowRoute("/api/records/:id/publish", "publish"),
     workflowRoute("/api/records/:id/withdraw", "withdraw"),
+    ...(options.people === undefined
+      ? []
+      : peopleApiRoutes(options.people, { service, log, signedIn })),
     {
       method: "GET",
       path: "/api/templates",

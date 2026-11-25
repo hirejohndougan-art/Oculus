@@ -107,7 +107,10 @@ describe("who sees System settings", () => {
     const nav = screen.getByRole("navigation", { name: "Oculus" });
     expect(within(nav).queryByRole("link", { name: "System settings" })).toBeNull();
     expect(screen.queryByRole("table")).toBeNull();
-    expect(sent.filter((s) => s.path !== "/api/me")).toEqual([]);
+    // Nothing of System settings is asked for (the sidebar asks for its own links).
+    expect(sent.filter((s) => /^\/api\/(sites|system-settings|templates)/.test(s.path))).toEqual(
+      [],
+    );
   });
 
   it("a system manager has the link, and /settings opens Sites", async () => {
@@ -203,9 +206,10 @@ describe("sites", () => {
     expect(put?.body).toEqual({ organizationId: ORG_A, name: "Invented annex" });
   });
 
-  it("says when a change needs a fresh sign-in, and the server's own problems", async () => {
+  it("asks for the password again when the sign-in isn't recent, then makes the change", async () => {
     let calls = 0;
-    server({
+    const sent = server({
+      "POST /api/reauthenticate": [200, { reauthenticated: true }],
       "POST /api/sites": () => {
         calls += 1;
         return calls === 1
@@ -223,9 +227,18 @@ describe("sites", () => {
     renderAt("/settings/sites");
     await user.type(await screen.findByRole("textbox", { name: /Site name/ }), "Invented");
     await user.click(screen.getByRole("button", { name: "Add site" }));
-    expect(await screen.findByText(/this needs a fresh sign-in/)).toBeTruthy();
-    await user.click(screen.getByRole("button", { name: "Add site" }));
+    expect(await screen.findByRole("heading", { name: "Confirm it's you" })).toBeTruthy();
+    expect(screen.getByText(/For changes to sites, enter your password/)).toBeTruthy();
+    await user.type(screen.getByLabelText("Your password"), "an invented password");
+    await user.type(screen.getByLabelText("Code from your app, or a recovery code"), "123456");
+    await user.click(screen.getByRole("button", { name: "Confirm and continue" }));
     expect(await screen.findByText("Every site needs a name.")).toBeTruthy();
+    const reauth = sent.find((s) => s.path === "/api/reauthenticate");
+    expect(reauth?.body).toEqual({ password: "an invented password", code: "123456" });
+    expect(sent.filter((s) => s.path === "/api/sites").map((s) => s.body)).toEqual([
+      { organizationId: ORG_A, name: "Invented" },
+      { organizationId: ORG_A, name: "Invented" },
+    ]);
   });
 });
 

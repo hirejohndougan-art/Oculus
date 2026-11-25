@@ -19,6 +19,7 @@ import { ApiError, api, problemText } from "../api";
 import { forgetLists } from "../records/listMemory";
 import { endSession, isSessionEnded } from "../session";
 import { Button, Note } from "../components/ui";
+import { AdminNav } from "../people/AdminNav";
 import type { Me, SiteChoice } from "../types";
 import styles from "./Frame.module.css";
 import { SiteSelector } from "./SiteSelector";
@@ -182,6 +183,7 @@ export function Frame() {
             ) : null}
           </ul>
         )}
+        <AdminNav />
         {person.systemAdmin ? (
           <div className={styles.navGroup}>
             <span className={styles.selectorLabel}>System</span>
