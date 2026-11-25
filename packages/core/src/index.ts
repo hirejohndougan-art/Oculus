@@ -735,3 +735,60 @@ export {
   MAX_CLIENT_LABEL_LENGTH,
 } from "./sessions.js";
 export type { SessionId, SessionPolicy } from "./sessions.js";
+
+export {
+  MAX_XML_BYTES,
+  MAX_XML_DEPTH,
+  MAX_XML_ELEMENTS,
+  MAX_XML_ATTRIBUTES,
+  MAX_XML_ATTRIBUTE_LENGTH,
+  MAX_XML_TOTAL_ATTRIBUTES,
+  parseXml,
+} from "./xml-tree.js";
+export type { XmlAttribute, XmlElement } from "./xml-tree.js";
+
+export {
+  EAD_VERSIONS,
+  EAD2002_NAMESPACE,
+  EAD3_NAMESPACE,
+  EAD_NOTE_KINDS,
+  EAD_NAME_ELEMENTS,
+  EAD_ACCESS_ELEMENTS,
+  EAD_DACS_FIELDS,
+  EAD2002_NORMAL_DATE,
+  MAX_EAD_UNITS,
+  MAX_EAD_TEXT_LENGTH,
+  normalizeEadText,
+  eadParagraphs,
+  levelFromEad,
+  eadDateEdtf,
+  eadUnits,
+  validateFindingAid,
+} from "./ead-model.js";
+export type {
+  EadVersion,
+  EadNoteKind,
+  EadNameElement,
+  EadAccessElement,
+  EadNote,
+  EadName,
+  EadAccessPoint,
+  EadDate,
+  EadExtent,
+  EadLanguage,
+  EadContainer,
+  EadLink,
+  EadUnit,
+  EadHeader,
+  FindingAid,
+  LevelFromEad,
+  EadDacsMapping,
+  EadDateEdtf,
+  EadUnitInTree,
+} from "./ead-model.js";
+
+export { MAX_EAD_NOTICES, readEad } from "./ead-read.js";
+export type { EadNotice, EadLevelChange, EadReadReport, EadRead } from "./ead-read.js";
+
+export { writeEad } from "./ead-write.js";
+export type { EadWriteOptions, EadWritten } from "./ead-write.js";

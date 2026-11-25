@@ -79,6 +79,16 @@ const BAD_TEXT =
 /** A high surrogate not followed by a low one, or a low one not after a high one. */
 const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
 
+/**
+ * `text` without the characters `textProblem` refuses. For importers that
+ * report what they removed; validators never call this.
+ */
+export function withoutBadText(text: string): string {
+  return text
+    .replace(new RegExp(BAD_TEXT.source, "g"), "")
+    .replace(new RegExp(LONE_SURROGATE.source, "g"), "");
+}
+
 /** Why a piece of text can't be stored, or undefined if it's fine. */
 export function textProblem(text: string): string | undefined {
   if (BAD_TEXT.test(text)) return "contains invisible control or direction-changing characters";
