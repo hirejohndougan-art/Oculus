@@ -7,7 +7,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - What changed: idle limit 30 minutes by default; `resolveSession(..., { activity: false })` for background reads; `isActivity` counts only same-origin uses; `idleSeconds` and a session marker in `/api/session` and `/api/me`; admin `idle/` (IdleTimer, IdleGuard, cross-tab channel with per-tab ids and session markers, an unsaved-changes registry); the update screen's status poll is a background read.
 - Decisions: D-098
 - Review: one independent round. Fixed: a never-settling sign-out request left the screen up (now cleared first); cross-site navigations counted as use; manual sign-out not reaching other tabs; a stale tab signing out an active one; header consistency; client counting of 4xx uses; focus fallback and announcements; no guessed limit.
-- Gate: PASS · tests_passing 4780 (was 4724) · npm audit clean
+- Gate: PASS · tests_passing 4785 (was 4724) · npm audit clean
 - Next: M-002 (no automatic deletion), M-003 (thumbnail limits, WebP)
 
 ## 2026-11-25 04:45 CT — upkeep — U-006 Main's gate fails in a clean checkout
