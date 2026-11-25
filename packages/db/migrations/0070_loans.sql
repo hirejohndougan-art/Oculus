@@ -1,7 +1,7 @@
 -- Loans in and out, and condition checks (T-018b with T-018a and S-013,
--- D-118; core: loans.ts and condition-checks.ts, D-044). Numbered 0067:
+-- D-118; core: loans.ts and condition-checks.ts, D-044). Numbered 0070:
 -- above main's 0058 and every number reserved on the work board (up to
--- Chat X's 0066); the runner allows gaps.
+-- Chat AA's 0067, with room to spare); the runner allows gaps.
 --
 -- STAFF ONLY: loans name lenders, borrowers, values, insurance and dates;
 -- condition checks name checkers. The public reader (D-080) has no

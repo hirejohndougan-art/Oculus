@@ -1,6 +1,6 @@
 /**
  * Stored loans and condition checks (T-018b with T-018a and S-013, D-118):
- * the rows of `0067_loans.sql`. Core checks every loan against the whole
+ * the rows of `0070_loans.sql`. Core checks every loan against the whole
  * move log and every other loan (loans.ts: `indexLoans`, `withLoan`) and
  * every check (condition-checks.ts); who may do what is the service's
  * (packages/service `loans.ts`). These functions only read and write, each
