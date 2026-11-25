@@ -59,6 +59,7 @@ import {
   listRoleAssignments,
   lockPeopleForRoleChange,
   lockRecord,
+  memberGrants,
   readRecordPlace,
   readRoleAssignment,
   readSite,
@@ -202,6 +203,26 @@ interface Who {
   readonly actor: string;
 }
 
+/**
+ * Whether the actor may already see the member as a grant's target (John,
+ * Q-10, T-064): a system manager anyone; a site manager only someone holding
+ * a role on a site they manage (on every site, for one managing every site).
+ * Anyone else, the role-less included, answers as a missing person: a site
+ * manager can't make someone visible by giving them a small role.
+ */
+async function seenBy(
+  tx: Queryable,
+  org: OrganizationId,
+  access: Access,
+  userId: UserId,
+): Promise<boolean> {
+  if (access.systemManager) return true;
+  const managed = managedSites(access);
+  return (await memberGrants(tx, org, userId)).some((g) =>
+    managed === "all" ? true : g.siteId !== null && managed.has(g.siteId),
+  );
+}
+
 /** Grants a role in the caller's transaction (`grantRole`'s rules; the people service adds its log). */
 export async function grantRoleIn(
   tx: Queryable,
@@ -251,7 +272,7 @@ export async function grantRoleIn(
       "A site manager manages a whole site, never one collection.",
     );
   }
-  if (!(await isMember(tx, org, userId))) {
+  if (!(await isMember(tx, org, userId)) || !(await seenBy(tx, org, first.value, userId))) {
     return refusal(["userId"], "unknown_person", UNKNOWN_PERSON);
   }
   // Then both people's rows, in ID order, and the same checks again
@@ -262,7 +283,7 @@ export async function grantRoleIn(
   const access = await readAccess(tx, org, who.actor);
   if (!access.ok) return access;
   if (!mayManage(access.value, role, siteId)) return notPermitted();
-  if (!(await isMember(tx, org, userId))) {
+  if (!(await isMember(tx, org, userId)) || !(await seenBy(tx, org, access.value, userId))) {
     return refusal(["userId"], "unknown_person", UNKNOWN_PERSON);
   }
   if (siteId !== null && (await readSite(tx, org, siteId)) === undefined) {

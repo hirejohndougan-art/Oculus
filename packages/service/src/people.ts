@@ -10,10 +10,14 @@
  *   managers (`site.people`) see the members holding a role on a site they
  *   manage, or no role at all, and only the roles they may manage there
  *   (none on every site, no site manager grants: as `listRoleAssignments`).
+ *   A member with no role at all they see by name only (`nameOnly`: no
+ *   email, account state, last sign-in or date added; John's Q-10, T-064).
  *   Anyone else is refused. A person out of view, another organization's
  *   member and an unknown ID are the same `unknown_person`.
  * - **Granting and revoking roles**: `grantRole`'s and `revokeRole`'s rules
- *   (who may grant what, D-072, backed by 0018's trigger), plus the
+ *   (who may grant what, D-072, backed by 0018's trigger; a site manager
+ *   grants only to someone already holding a role on a site they manage,
+ *   anyone else answered as a missing person: T-064), plus the
  *   password and second step entered in the last 10 minutes (D-072's left
  *   item; `reauthentication_required`), checked after the permission so a
  *   person who may not act learns nothing more.
@@ -102,15 +106,20 @@ export interface PeopleContext extends ServiceContext {
   readonly sessionToken: string;
 }
 
-/** A member as the people list shows them; `systemAdmin` only to system managers. */
+/**
+ * A member as the people list shows them; `systemAdmin` only to system
+ * managers. A site manager sees a member with no role at all by name only
+ * (`nameOnly`, John's Q-10, T-064): no email, account state or last sign-in.
+ */
 export interface PersonSummary {
   readonly userId: UserId;
   readonly displayName: string;
-  readonly email: string;
-  readonly disabled: boolean;
+  readonly email?: string;
+  readonly disabled?: boolean;
   readonly systemAdmin?: boolean;
-  readonly lastSignInAt: string | null;
+  readonly lastSignInAt?: string | null;
   readonly roles: readonly MemberGrant[];
+  readonly nameOnly?: true;
 }
 
 /** What the viewer may do, for the screens (the server checks again on every change). */
@@ -129,7 +138,8 @@ export interface PeopleList {
 }
 
 export interface PersonDetail {
-  readonly person: PersonSummary & { readonly addedAt: string };
+  /** `addedAt` too, except for a member seen by name only. */
+  readonly person: PersonSummary & { readonly addedAt?: string };
   readonly rights: PeopleRights;
   /** System managers only. */
   readonly sessions?: readonly MemberSession[];
@@ -296,7 +306,20 @@ function grantsFor(
       });
 }
 
-function summary(member: Member, roles: readonly MemberGrant[], viewer: Viewer): PersonSummary {
+function summary(
+  member: Member,
+  roles: readonly MemberGrant[],
+  viewer: Viewer,
+  roleless: boolean,
+): PersonSummary {
+  if (roleless && !viewer.system) {
+    return Object.freeze({
+      userId: member.userId,
+      displayName: member.displayName,
+      roles,
+      nameOnly: true as const,
+    });
+  }
   return Object.freeze({
     userId: member.userId,
     displayName: member.displayName,
@@ -477,14 +500,18 @@ export function peopleOperations(
         );
         const people: PersonSummary[] = [];
         // One query for everyone's roles (review: not one per member).
+        const ids = listed.members.map((m) => m.userId);
         const grants = await membersGrants(
           tx,
           who.organizationId,
-          listed.members.map((m) => m.userId),
+          ids,
           v.system ? {} : { siteIds: v.sites, exceptRole: "site_manager" },
         );
+        // Who holds no role at all (T-064): one more query, for site managers only.
+        const any = v.system ? grants : await membersGrants(tx, who.organizationId, ids);
         for (const member of listed.members) {
-          people.push(summary(member, grants.get(member.userId) ?? [], v));
+          const roleless = (any.get(member.userId) ?? []).length === 0;
+          people.push(summary(member, grants.get(member.userId) ?? [], v, roleless));
         }
         return {
           ok: true,
@@ -506,10 +533,13 @@ export function peopleOperations(
         const member = await visibleMember(tx, who.organizationId, v, userId);
         if (member === undefined) return unknownPerson();
         const roles = await grantsFor(tx, who.organizationId, v, member.userId);
+        const roleless =
+          !v.system && (await memberGrants(tx, who.organizationId, member.userId)).length === 0;
+        const shown = summary(member, roles, v, roleless);
         return {
           ok: true,
           value: Object.freeze({
-            person: Object.freeze({ ...summary(member, roles, v), addedAt: member.addedAt }),
+            person: Object.freeze(roleless ? shown : { ...shown, addedAt: member.addedAt }),
             rights: rightsOf(v),
             ...(v.system
               ? {

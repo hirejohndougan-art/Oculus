@@ -272,6 +272,33 @@ describe("seeing people", () => {
     expect((r.json.rights as { manageAccounts: boolean }).manageAccounts).toBe(false);
   });
 
+  it("shows a site manager someone with no role by name only; a system manager sees all (John, Q-10)", async () => {
+    type Seen = Record<string, unknown> & { userId: string };
+    const asManager = (await call("GET", "/api/people", { as: "manager" })).json.people as Seen[];
+    const lone = asManager.find((p) => p.userId === newcomer);
+    expect(lone).toEqual({ userId: newcomer, displayName: "Invented Newcomer", roles: [], nameOnly: true });
+    const withRole = asManager.find((p) => p.userId === w.cataloger);
+    expect(typeof withRole?.email).toBe("string");
+    expect(withRole?.nameOnly).toBeUndefined();
+
+    const one = await call("GET", `/api/people/${newcomer}`, { as: "manager" });
+    expect(one.status).toBe(200);
+    expect(one.json.person).toEqual({
+      userId: newcomer,
+      displayName: "Invented Newcomer",
+      roles: [],
+      nameOnly: true,
+    });
+    expect(JSON.stringify(one.json)).not.toMatch(/@|addedAt|lastSignInAt|disabled/);
+
+    const asRoot = (await call("GET", "/api/people", { as: "root" })).json.people as Seen[];
+    const full = asRoot.find((p) => p.userId === newcomer);
+    expect(typeof full?.email).toBe("string");
+    expect(full?.nameOnly).toBeUndefined();
+    const rootOne = await call("GET", `/api/people/${newcomer}`, { as: "root" });
+    expect(typeof (rootOne.json.person as Seen).addedAt).toBe("string");
+  });
+
   it("refuses people who manage nobody", async () => {
     for (const as of ["cataloger", "reader", "other"]) {
       expect((await call("GET", "/api/people", { as })).status).toBe(403);
@@ -312,7 +339,7 @@ describe("seeing people", () => {
 
 describe("granting and revoking roles (D-072)", () => {
   it("lets a site manager grant a role below site manager on their own site, logged", async () => {
-    const r = await call("POST", `/api/people/${newcomer}/roles`, {
+    const r = await call("POST", `/api/people/${helper}/roles`, {
       as: "manager",
       body: { role: "read_only", siteId: w.a1, scope: null },
     });
@@ -408,16 +435,16 @@ describe("granting and revoking roles (D-072)", () => {
     const s = await fullSession(w.db, w.manager, w.a);
     await staleReauth(w.db, s.sessionId, 11 * 60);
     tokens.staleManager = s.token;
-    const before = await grantCount(newcomer);
-    const r = await call("POST", `/api/people/${newcomer}/roles`, {
+    const before = await grantCount(helper);
+    const r = await call("POST", `/api/people/${helper}/roles`, {
       as: "staleManager",
-      body: { role: "cataloger", siteId: w.a1, scope: null },
+      body: { role: "reviewer", siteId: w.a1, scope: null },
     });
     expect(r.status).toBe(403);
     expect(r.json.error).toBe("reauthentication_required");
-    expect(await grantCount(newcomer)).toBe(before);
+    expect(await grantCount(helper)).toBe(before);
     // Without the permission, the answer is the permission's.
-    const denied = await call("POST", `/api/people/${newcomer}/roles`, {
+    const denied = await call("POST", `/api/people/${helper}/roles`, {
       as: "staleManager",
       body: { role: "site_manager", siteId: w.a1, scope: null },
     });
@@ -443,12 +470,34 @@ describe("granting and revoking roles (D-072)", () => {
     const token = /__Host-oculus_session=([^;]+)/.exec(cookie)?.[1] ?? "";
     expect(token).not.toBe(tokens.staleManager);
     tokens.freshManager = token;
-    const r = await call("POST", `/api/people/${newcomer}/roles`, {
+    const r = await call("POST", `/api/people/${helper}/roles`, {
       as: "freshManager",
-      body: { role: "cataloger", siteId: w.a1, scope: null },
+      body: { role: "reviewer", siteId: w.a1, scope: null },
     });
     expect(r.status).toBe(201);
   }, 30_000);
+
+  it("a site manager can't grant to someone with no role: answered as a missing person (John, Q-10)", async () => {
+    const lone = await w.member(w.a, "Lone");
+    const body = { role: "read_only", siteId: w.a1, scope: null };
+    const refusedLone = await call("POST", `/api/people/${lone}/roles`, { as: "manager", body });
+    const missing = await call("POST", `/api/people/${MADE_UP}/roles`, { as: "manager", body });
+    expect(refusedLone.status).toBe(404);
+    expect(shape(refusedLone)).toEqual(shape(missing));
+    // Someone whose only role is on a site they don't manage is the same.
+    const elsewhere = await call("POST", `/api/people/${w.other}/roles`, { as: "manager", body });
+    expect(shape(elsewhere)).toEqual(shape(missing));
+    expect(await grantCount(lone)).toBe(0);
+    // A system manager gives the first role; then the site manager may add more.
+    const first = await call("POST", `/api/people/${lone}/roles`, { as: "root", body });
+    expect(first.status).toBe(201);
+    const more = await call("POST", `/api/people/${lone}/roles`, {
+      as: "manager",
+      body: { role: "reviewer", siteId: w.a1, scope: null },
+    });
+    expect(more.status).toBe(201);
+    expect(await grantCount(lone)).toBe(2);
+  });
 });
 
 describe("accounts: system managers only", () => {
