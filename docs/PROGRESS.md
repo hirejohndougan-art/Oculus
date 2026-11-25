@@ -2,6 +2,13 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 08:30 CT — manual (Chat A) — M-002 Upload and store files; M-003 View and download files
+
+- **Done:** staff upload files to a record (one or many), stored once by content hash under `OCULUS_FILES_DIR` (migrations 0038 and 0039, D-086); uploads stop when free space falls below the smaller of 5% or 2 GB (John). Download for every file, an inline view for images that the browser decodes, and a viewer with keyboard navigation (D-097). Five independent reviews of M-002 and three of M-003; every real finding fixed.
+- **Held back on purpose:** no automatic code deletes a stored copy, and purging is off until S-052. Server-side thumbnails are off (the file list shows a format placeholder) because each review found new ways a crafted JPEG or WebP could make the decoder use far more memory than planned; T-072 lists what must hold before they return.
+- **Filed:** S-052 (safe purge), T-072 (safe thumbnails); S-040 (virus scanning) stays open.
+- Gate: PASS (tests_passing 4982, 166 files, 10 e2e specs; baseline raised from 4836).
+
 ## 2026-11-25 07:40 CT — Chat J — S-036a Share lists and views
 - Result: done
 - What changed: `packages/db/src/shares.ts` (`MAX_SHARE_PAGE` 50, a `before` cursor scoped to its own list, order `offered_at DESC, id DESC`, `includeHidden` for the manager's accepted list, `sharedItemViews` through `publicRecordIn` with the home mapping's fields and labels, `SHARE_CHANGED`); `packages/service/src/shares.ts` (pages with exact `next` cursors, hidden accepted items as `item: null` for the manager only); `?before`/`?state` and `{ shares, next }` on the share routes; `packages/admin/src/shares/` (`useMorePages`, "Show more" on the site's two lists, the shared items and a record's shares, hidden items said in words with their own Remove names, home labels).
