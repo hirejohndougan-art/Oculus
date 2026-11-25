@@ -19,6 +19,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { request as httpRequest, type IncomingHttpHeaders } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -29,11 +30,15 @@ import {
   migrate,
   openDatabase,
   organizationFileBytes,
+  databaseIdentity,
   readFileStoreBinding,
   sql,
+  type Database,
 } from "@oculus/db";
 import { STORE_MARKER, createService, openFileStore, type FileStore } from "@oculus/service";
-import { freshDatabase } from "../../db/src/test-database.fixtures.js";
+import { freshDatabase, testServerUrl } from "../../db/src/test-database.fixtures.js";
+import { createDatabase, dropDatabase, withDatabaseName } from "../../db/src/client.js";
+import { findTools } from "../../db/src/backup.js";
 import type { FastifyInstance } from "fastify";
 import { OCULUS_COOKIES } from "./cookies.js";
 import { UPLOAD_TIMEOUTS, buildServer, type UploadTimeouts } from "./server.js";
@@ -770,6 +775,7 @@ describe("removing files", () => {
       SELECT kind, actor FROM public.stored_file_events WHERE file_id = ${fileId}::uuid
       ORDER BY occurred_at`);
     expect(events).toEqual([
+      { kind: "placing", actor: actorOf(w.cataloger) },
       { kind: "attached", actor: actorOf(w.cataloger) },
       { kind: "removed", actor: actorOf(w.cataloger) },
     ]);
@@ -805,8 +811,9 @@ describe("the files folder belongs to one install", () => {
     const service = createService(w.db, { files: store });
     // The same folder again: fine.
     expect(await service.bindFileStore()).toEqual({ ok: true });
-    const marker = readFileSync(join(filesDir, STORE_MARKER), "utf8").trim();
+    const [marker, database] = readFileSync(join(filesDir, STORE_MARKER), "utf8").split("\n");
     expect(await readFileStoreBinding(w.db)).toBe(marker);
+    expect(database).toBe(await databaseIdentity(w.db));
     const folder = async (setup: (dir: string) => void) => {
       const dir = mkdtempSync(join(tmpdir(), "oculus-files-bind-"));
       setup(dir);
@@ -871,5 +878,183 @@ describe("the files folder belongs to one install", () => {
     expect(existsSync(join(odd, "cd".repeat(32)))).toBe(true);
     rmSync(join(filesDir, stranger), { recursive: true, force: true });
     rmSync(odd, { recursive: true, force: true });
+  });
+});
+
+/** pg_dump of a database into a file, and pg_restore of it into a new, empty one. */
+async function dumpTo(url: string, file: string): Promise<void> {
+  const bin = await findTools(process.env, ["pg_dump", "pg_restore"]);
+  const result = spawnSync(join(bin, "pg_dump"), ["-Fc", "--no-owner", "-f", file, "-d", url], {
+    encoding: "utf8",
+  });
+  if (result.status !== 0) throw new Error(`pg_dump failed: ${result.stderr}`);
+}
+
+async function restoreInto(file: string, name: string): Promise<string> {
+  const bin = await findTools(process.env, ["pg_dump", "pg_restore"]);
+  await createDatabase(testServerUrl(), name);
+  const url = withDatabaseName(testServerUrl(), name);
+  const result = spawnSync(
+    join(bin, "pg_restore"),
+    ["--no-owner", "--no-acl", "--exit-on-error", "-d", url, file],
+    { encoding: "utf8" },
+  );
+  if (result.status !== 0) throw new Error(`pg_restore failed: ${result.stderr}`);
+  return url;
+}
+
+/** Attaches bytes to an asset through the service of another database (no HTTP server for it). */
+async function attachVia(db: Database, assetId: string, body: Buffer): Promise<void> {
+  const service = createService(db, { files: store });
+  const received = await store.receive(
+    w.a,
+    (async function* () {
+      await Promise.resolve();
+      yield body;
+    })(),
+  );
+  if (!received.ok) throw new Error(received.code);
+  const attached = await service.attachFile(
+    { organizationId: w.a, actor: actorOf(w.root) },
+    assetId as never,
+    received.file,
+    { expectedVersion: 1, name: "restored.png" },
+  );
+  if (!attached.ok) throw new Error(JSON.stringify(attached.issues));
+}
+
+/**
+ * Puts the marker back as the given database would have it, as an operator
+ * re-enabling a restored database's sweep would (by removing the database
+ * line, then starting it).
+ */
+function reenable(): void {
+  const [storeId] = readFileSync(join(filesDir, STORE_MARKER), "utf8").split("\n");
+  writeFileSync(join(filesDir, STORE_MARKER), `${storeId ?? ""}\n`);
+}
+
+describe("a restored or copied database never deletes files it didn't remove (third review)", () => {
+  it("keeps files attached after the copy was made, in a copy and after a restore under the same name", async () => {
+    const work = mkdtempSync(join(tmpdir(), "oculus-files-restore-"));
+    const ownMarker = readFileSync(join(filesDir, STORE_MARKER), "utf8");
+    const name = `oculus_test_copy_${randomBytes(6).toString("hex")}`;
+    let copy: Database | undefined;
+    try {
+      // The reviewer's repro: X attached, A dumped into B, Y attached to A.
+      const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented restored scan"));
+      const x = fakePng(400);
+      expect((await upload(asset, { as: "cataloger", body: x })).status).toBe(201);
+      await dumpTo(w.testDb.url, join(work, "a.dump"));
+      const y = fakePng(500);
+      expect((await upload(asset, { as: "cataloger", body: y })).status).toBe(201);
+      const url = await restoreInto(join(work, "a.dump"), name);
+      copy = openDatabase(url, { max: 3 });
+      const copyService = createService(copy, { files: store });
+      // Bound (uploads work), but its sweep is off: another database.
+      expect(await copyService.bindFileStore()).toEqual({ ok: true, warning: "database_changed" });
+      expect(await copyService.sweepFiles(0)).toMatchObject({
+        halted: "database_changed",
+        contents: 0,
+      });
+      expect(existsSync(store.pathFor(w.a, sha(y)))).toBe(true);
+      // Even with its sweep turned back on, it deletes only what it
+      // removed itself: Y is unknown to it and stays.
+      reenable();
+      expect(await copyService.bindFileStore()).toEqual({ ok: true });
+      const swept = await copyService.sweepFiles(0);
+      expect(swept).toMatchObject({ unbound: false, failed: 0 });
+      expect(swept.halted).toBeUndefined();
+      expect(swept.unknown).toBeGreaterThanOrEqual(1);
+      expect(readFileSync(store.pathFor(w.a, sha(y))).equals(y)).toBe(true);
+      expect(readFileSync(store.pathFor(w.a, sha(x))).equals(x)).toBe(true);
+      // The original's sweep now halts (the marker names the copy), and deletes nothing.
+      const original = await createService(w.db, { files: store }).sweepFiles(0);
+      expect(original.halted).toBe("database_changed");
+
+      // The documented recovery path: the copy is production now; it is
+      // backed up, gets Z, then last night's dump is restored under the
+      // same name and started on the same folder.
+      await dumpTo(url, join(work, "b.dump"));
+      const z = fakePng(600);
+      await attachVia(copy, asset, z);
+      await copy.close();
+      copy = undefined;
+      await dropDatabase(testServerUrl(), name);
+      const again = await restoreInto(join(work, "b.dump"), name);
+      copy = openDatabase(again, { max: 3 });
+      const restored = createService(copy, { files: store });
+      expect(await restored.bindFileStore()).toEqual({ ok: true, warning: "database_changed" });
+      expect((await restored.sweepFiles(0)).halted).toBe("database_changed");
+      reenable();
+      expect(await restored.bindFileStore()).toEqual({ ok: true });
+      const after = await restored.sweepFiles(0);
+      expect(after.halted).toBeUndefined();
+      expect(after.unknown).toBeGreaterThanOrEqual(1);
+      expect(readFileSync(store.pathFor(w.a, sha(z))).equals(z)).toBe(true);
+      expect(readFileSync(store.pathFor(w.a, sha(y))).equals(y)).toBe(true);
+    } finally {
+      await copy?.close();
+      await dropDatabase(testServerUrl(), name).catch(() => undefined);
+      // This test database's own marker back, so nothing after this changes.
+      writeFileSync(join(filesDir, STORE_MARKER), ownMarker);
+      rmSync(work, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it("deletes a copy an attach placed but never committed, after a day, and nothing it has no record of", async () => {
+    const service = createService(w.db, { files: store });
+    const orphan = fakePng(800);
+    // An attach intent committed, the copy placed, the row never committed.
+    const received = await store.receive(
+      w.a,
+      (async function* () {
+        await Promise.resolve();
+        yield orphan;
+      })(),
+    );
+    if (!received.ok) throw new Error(received.code);
+    await store.place(received.file);
+    await store.discard(received.file);
+    const fileId = newRecordId();
+    await w.db.execute(sql`
+      INSERT INTO public.stored_file_events (organization_id, id, kind, file_id, record_id, sha256,
+        byte_size, actor)
+      VALUES (${w.a}::uuid, ${newRecordId()}::uuid, 'placing', ${fileId}::uuid,
+        ${ids.a1 ?? ""}::uuid, ${sha(orphan)}, ${orphan.length}, ${actorOf(w.root)})`);
+    // A copy this database knows nothing of.
+    const stray = fakePng(900);
+    const strayReceived = await store.receive(
+      w.a,
+      (async function* () {
+        await Promise.resolve();
+        yield stray;
+      })(),
+    );
+    if (!strayReceived.ok) throw new Error(strayReceived.code);
+    await store.place(strayReceived.file);
+    await store.discard(strayReceived.file);
+    const fresh = await service.sweepFiles(3600_000);
+    expect(fresh.halted).toBeUndefined();
+    expect(existsSync(store.pathFor(w.a, sha(orphan)))).toBe(true);
+    await w.db.transaction(async (q) => {
+      await q.execute(
+        sql`ALTER TABLE public.stored_file_events DISABLE TRIGGER stored_file_events_append_only`,
+      );
+      await q.execute(sql`
+        UPDATE public.stored_file_events SET occurred_at = occurred_at - interval '2 days'
+        WHERE file_id = ${fileId}::uuid`);
+      await q.execute(
+        sql`ALTER TABLE public.stored_file_events ENABLE ALWAYS TRIGGER stored_file_events_append_only`,
+      );
+    });
+    const later = await service.sweepFiles(3600_000);
+    expect(later.contents).toBeGreaterThanOrEqual(1);
+    expect(existsSync(store.pathFor(w.a, sha(orphan)))).toBe(false);
+    expect(existsSync(store.pathFor(w.a, sha(stray)))).toBe(true);
+    expect(later.unknown).toBeGreaterThanOrEqual(1);
+    // Every attach logged its intent before placing its copy.
+    const kinds = await w.db.rows<{ kind: string }>(sql`
+      SELECT DISTINCT kind FROM public.stored_file_events WHERE organization_id = ${w.a}::uuid`);
+    expect(kinds.map((k) => k.kind).sort()).toEqual(["attached", "placing", "removed"]);
   });
 });

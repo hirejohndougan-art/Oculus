@@ -115,6 +115,19 @@ export type ReceiveResult =
 /** The marker file in the root that names the install the folder belongs to. */
 export const STORE_MARKER = ".oculus-store-id";
 
+/**
+ * What the marker holds: the install's ID (line 1) and the identity of the
+ * database that bound the folder (line 2, `databaseIdentity`), which a dump
+ * restored elsewhere or under the same name doesn't share.
+ */
+export interface StoreMarker {
+  readonly storeId: string;
+  readonly database?: string;
+}
+
+const MARKER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const MARKER_DATABASE = /^[0-9A-Za-z_.:-]{1,100}$/;
+
 export interface ReceiveOptions {
   /** The declared length, if any: held against the free-space floor from the start. */
   readonly declaredBytes?: number;
@@ -140,9 +153,17 @@ export interface FileStore {
   /** Whether `extra` more bytes would leave the disk below the free-space floor. */
   lowOnSpace(extra: number): Promise<boolean>;
   /** The install ID in the root's marker file, if there is one. */
-  readMarker(): Promise<string | undefined>;
+  readMarker(): Promise<StoreMarker | undefined>;
   /** Writes the marker (only into a folder that has none). */
-  writeMarker(storeId: string): Promise<void>;
+  writeMarker(storeId: string, database: string): Promise<void>;
+  /**
+   * Adds the database identity to a marker that has none (an operator
+   * removed it to let a restored database sweep again), replacing the file
+   * in one step; refused when the marker names another install.
+   */
+  recordDatabase(storeId: string, database: string): Promise<void>;
+  /** Whether another server is writing the marker right now (its temporary file exists). */
+  markerInProgress(): Promise<boolean>;
   /** Whether the root holds anything at all. */
   isEmpty(): Promise<boolean>;
   /** Marks the store as checked against the database: the sweep may delete. */
@@ -167,10 +188,8 @@ export interface FileStore {
   trash(organizationId: OrganizationId, sha256: string): Promise<void>;
   /** Deletes what `trash` moved aside; returns how many. */
   emptyTrash(organizationId: OrganizationId): Promise<number>;
-  /** Deletes a stored copy (call under the organization's file lock, once no row names it). */
-  removeContent(organizationId: OrganizationId, sha256: string): Promise<void>;
   /** Deletes temporary files older than `maxAgeMs`; returns how many. */
-  staleIncoming(maxAgeMs: number): Promise<number>;
+  staleIncoming(maxAgeMs: number, organizations?: readonly string[]): Promise<number>;
 }
 
 function checkCap(name: string, value: number | undefined, fallback: number): number {
@@ -337,6 +356,36 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
     return free - pendingSpace - extra < floor;
   }
 
+  /** Writes the marker through a temporary file, fsynced, then linked or renamed into place. */
+  async function writeMarkerFile(
+    storeId: string,
+    database: string,
+    how: "link" | "rename",
+  ): Promise<void> {
+    if (!MARKER_ID.test(storeId) || !MARKER_DATABASE.test(database)) {
+      throw new TypeError("Not a marker.");
+    }
+    const temp = join(root, `${STORE_MARKER}.${randomBytes(8).toString("hex")}`);
+    const handle = await open(
+      temp,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    try {
+      await writeAll(handle, Buffer.from(`${storeId}\n${database}\n`, "utf8"));
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    try {
+      if (how === "link") await link(temp, join(root, STORE_MARKER));
+      else await rename(temp, join(root, STORE_MARKER));
+    } finally {
+      await rm(temp, { force: true });
+    }
+    await syncDirectory(root);
+  }
+
   const store: FileStore = {
     maxFileBytes,
     maxOrganizationBytes,
@@ -345,7 +394,7 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
     boundTo: () => boundTo,
 
     bind(storeId) {
-      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(storeId)) {
+      if (!MARKER_ID.test(storeId)) {
         throw new TypeError("Not an install ID.");
       }
       boundTo = storeId;
@@ -355,36 +404,41 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       const path = join(root, STORE_MARKER);
       const info = await lstat(path).catch(() => undefined);
       if (info === undefined) return undefined;
-      if (!info.isFile() || info.size > 100)
+      if (!info.isFile() || info.size > 300) {
         throw new Error("The files folder's marker isn't a marker file.");
+      }
       const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      let text: string;
       try {
-        return (await handle.readFile("utf8")).trim();
+        text = await handle.readFile("utf8");
       } finally {
         await handle.close();
       }
+      const [storeId = "", database = ""] = text.split("\n").map((line) => line.trim());
+      if (!MARKER_ID.test(storeId) || (database !== "" && !MARKER_DATABASE.test(database))) {
+        throw new Error("The files folder's marker can't be read.");
+      }
+      return Object.freeze(database === "" ? { storeId } : { storeId, database });
     },
 
-    async writeMarker(storeId) {
-      const temp = join(root, `${STORE_MARKER}.${randomBytes(8).toString("hex")}`);
-      const handle = await open(
-        temp,
-        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-        0o600,
-      );
-      try {
-        await writeAll(handle, Buffer.from(`${storeId}\n`, "utf8"));
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
+    async writeMarker(storeId, database) {
       // Never over an existing marker: link fails if one appeared meanwhile.
-      try {
-        await link(temp, join(root, STORE_MARKER));
-      } finally {
-        await rm(temp, { force: true });
+      await writeMarkerFile(storeId, database, "link");
+    },
+
+    async recordDatabase(storeId, database) {
+      const current = await store.readMarker();
+      if (current?.storeId !== storeId || current.database !== undefined) {
+        throw new Error(
+          "The files folder's marker isn't this install's, or already names a database.",
+        );
       }
-      await syncDirectory(root);
+      await writeMarkerFile(storeId, database, "rename");
+    },
+
+    async markerInProgress() {
+      const entries = await readdir(root);
+      return entries.some((name) => name.startsWith(`${STORE_MARKER}.`));
     },
 
     async isEmpty() {
@@ -599,16 +653,6 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       return { hashes: hashes.sort(), skipped };
     },
 
-    async removeContent(organizationId, sha256) {
-      const target = pathFor(organizationId, sha256);
-      const info = await lstat(target).catch(() => undefined);
-      if (info?.isFile() !== true) return;
-      await rm(target, { force: true });
-      await syncDirectory(
-        join(organizationDir(organizationId), "sha256", sha256.slice(0, 2)),
-      ).catch(() => undefined);
-    },
-
     async trash(organizationId, sha256) {
       const target = pathFor(organizationId, sha256);
       const info = await lstat(target).catch(() => undefined);
@@ -632,9 +676,11 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       return removed;
     },
 
-    async staleIncoming(maxAgeMs) {
+    async staleIncoming(maxAgeMs, organizations) {
       let removed = 0;
+      const only = organizations === undefined ? undefined : new Set(organizations);
       for (const organizationId of await store.organizations()) {
+        if (only !== undefined && !only.has(organizationId)) continue;
         const incoming = join(organizationDir(organizationId), "incoming");
         const folder = await lstat(incoming).catch(() => undefined);
         if (folder?.isDirectory() !== true || !safeOwnership(folder)) continue;

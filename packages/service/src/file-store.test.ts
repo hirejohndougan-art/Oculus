@@ -300,8 +300,9 @@ describe("the safety and limits added after review", () => {
     await store.discard(got.file);
     expect(await store.organizations()).toContain(other);
     expect(await store.contents(other)).toEqual([sha(body)]);
-    await store.removeContent(other, sha(body));
+    await store.trash(other, sha(body));
     expect(await store.contents(other)).toEqual([]);
+    expect(await store.emptyTrash(other)).toBe(1);
     rmSync(join(dir, other), { recursive: true, force: true });
   });
 });
@@ -313,11 +314,31 @@ describe("the second review's changes", () => {
     expect(await own.isEmpty()).toBe(true);
     expect(await own.readMarker()).toBeUndefined();
     const id = "11111111-2222-4333-8444-555555555555";
-    await own.writeMarker(id);
-    expect(await own.readMarker()).toBe(id);
+    await own.writeMarker(id, "7001:16384");
+    expect(await own.readMarker()).toEqual({ storeId: id, database: "7001:16384" });
     expect(statSync(join(fresh, STORE_MARKER)).mode & 0o777).toBe(0o600);
-    await expect(own.writeMarker("66666666-7777-4888-9999-aaaaaaaaaaaa")).rejects.toThrow();
-    expect(await own.readMarker()).toBe(id);
+    await expect(
+      own.writeMarker("66666666-7777-4888-9999-aaaaaaaaaaaa", "7001:16384"),
+    ).rejects.toThrow();
+    expect((await own.readMarker())?.storeId).toBe(id);
+    expect(await own.markerInProgress()).toBe(false);
+    // The database line is added only to a marker of this install that has none.
+    await expect(own.recordDatabase(id, "7001:20000")).rejects.toThrow();
+    writeFileSync(join(fresh, STORE_MARKER), `${id}\n`);
+    expect(await own.readMarker()).toEqual({ storeId: id });
+    await expect(
+      own.recordDatabase("66666666-7777-4888-9999-aaaaaaaaaaaa", "7001:20000"),
+    ).rejects.toThrow();
+    await own.recordDatabase(id, "7001:20000");
+    expect(await own.readMarker()).toEqual({ storeId: id, database: "7001:20000" });
+    // A marker that isn't one is an error, never taken as one.
+    writeFileSync(join(fresh, STORE_MARKER), "../../etc\n");
+    await expect(own.readMarker()).rejects.toThrow(/can't be read/);
+    writeFileSync(join(fresh, STORE_MARKER), `${id}\n7001:20000\n`);
+    // Another server's marker being written shows as in progress.
+    writeFileSync(join(fresh, `${STORE_MARKER}.0123456789abcdef`), "");
+    expect(await own.markerInProgress()).toBe(true);
+    rmSync(join(fresh, `${STORE_MARKER}.0123456789abcdef`));
     expect(own.boundTo()).toBeUndefined();
     own.bind(id);
     expect(own.boundTo()).toBe(id);

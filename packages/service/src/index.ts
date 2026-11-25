@@ -54,6 +54,7 @@ export type {
   ReceiveOptions,
   ReceiveRefusal,
   ReceiveResult,
+  StoreMarker,
 } from "./file-store.js";
 export type {
   AttachCheck,
