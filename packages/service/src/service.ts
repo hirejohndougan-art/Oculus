@@ -1065,6 +1065,15 @@ function sqlState(error: unknown): string | undefined {
   }
 }
 
+/** `isDatabaseTimeout`, never throwing (a hostile getter), so `cleanError` never throws. */
+function poolWaitRanOut(error: unknown): boolean {
+  try {
+    return isDatabaseTimeout(error);
+  } catch {
+    return false;
+  }
+}
+
 /** The database was busy (S-063): a lock or a connection wasn't free in time. */
 function busyRefusal(): ServiceRefusal {
   return refusal([], "timeout", "The database was busy and nothing was done. Try again.");
@@ -1077,7 +1086,7 @@ function busyRefusal(): ServiceRefusal {
 function cleanError(error: unknown): ServiceRefusal {
   // No free pooled connection within the staff pool's wait (S-063): busy,
   // nothing was saved, try again.
-  if (isDatabaseTimeout(error) && sqlState(error) === undefined) return busyRefusal();
+  if (sqlState(error) === undefined && poolWaitRanOut(error)) return busyRefusal();
   const state = sqlState(error);
   switch (state) {
     case RETRY:

@@ -27,6 +27,7 @@ import { ADMIN_CSP, adminFileFor, loadAdminFiles, type AdminFiles } from "./admi
 import { runAdminCli } from "./admin-cli.js";
 import { buildAdminServer, clientAddressProblem, isProduction } from "./admin-server.js";
 import { SECURITY_HEADERS } from "./headers.js";
+import type { Mailer } from "./mail.js";
 import type { ApiLogRecord } from "./staff-api.js";
 
 let testDb: TestDatabase;
@@ -426,7 +427,7 @@ describe("the background jobs (S-063)", () => {
   const seeded = async (): Promise<boolean> =>
     (await db.rows(sql`SELECT 1 FROM public.sign_in_throttles WHERE key = ${KEY}`)).length === 1;
 
-  it("runs the cleanup and the alert notices in the server, and stops both when it closes", async () => {
+  it("runs the cleanup in the server, and stops it when it closes", async () => {
     await seed();
     const logged: ApiLogRecord[] = [];
     const app = await buildAdminServer({
@@ -444,7 +445,7 @@ describe("the background jobs (S-063)", () => {
     } finally {
       await app.close();
     }
-    // Closed: neither job runs again (the cleanup would have run every 30 ms).
+    // Closed: it doesn't run again (it would have run every 30 ms).
     await seed();
     await sleep(300);
     expect(await seeded()).toBe(true);
@@ -452,14 +453,55 @@ describe("the background jobs (S-063)", () => {
     await db.execute(sql`DELETE FROM public.sign_in_throttles WHERE key = ${KEY}`);
   }, 30_000);
 
-  it("doesn't send two-step alert notices through the development sender", async () => {
-    // A notice "sent" there would tell no one and hold the next one back a day.
-    const logged: ApiLogRecord[] = [];
+  /** A mailer whose notice lane counts the notice runs (each run asks its room first). */
+  function countingMailer(): { mailer: Mailer; runs: () => number } {
+    let runs = 0;
+    const nothing = (): Promise<void> => Promise.resolve();
+    const mailer = {
+      deliverReset: nothing,
+      deliverInvitation: nothing,
+      deliverEnrolment: nothing,
+      deliverPasswordChanged: nothing,
+      deliverAlert: nothing,
+      outbox: {
+        room: () => {
+          runs++;
+          return 0;
+        },
+      },
+      close: nothing,
+    } as unknown as Mailer;
+    return { mailer, runs: () => runs };
+  }
+
+  it("runs the two-step alert notices with SMTP set up, and stops them when it closes", async () => {
+    const { mailer, runs } = countingMailer();
+    const app = await buildAdminServer({
+      db,
+      env: { ...DEV, OCULUS_SMTP_HOST: "smtp.invalid" },
+      adminFiles: files,
+      mailer,
+      housekeeping: { cleanupFirstAfterMs: 60_000, noticesEveryMs: 10 },
+    });
+    try {
+      const deadline = Date.now() + 15_000;
+      while (runs() < 2 && Date.now() < deadline) await sleep(20);
+      expect(runs()).toBeGreaterThanOrEqual(2);
+    } finally {
+      await app.close();
+    }
+    const after = runs();
+    await sleep(200);
+    expect(runs()).toBe(after);
+  }, 30_000);
+
+  it("doesn't run them without SMTP: the development sender tells no one", async () => {
+    const { mailer, runs } = countingMailer();
     const app = await buildAdminServer({
       db,
       env: DEV,
       adminFiles: files,
-      log: (r) => logged.push(r),
+      mailer,
       housekeeping: { cleanupFirstAfterMs: 60_000, noticesEveryMs: 10 },
     });
     try {
@@ -467,6 +509,6 @@ describe("the background jobs (S-063)", () => {
     } finally {
       await app.close();
     }
-    expect(logged.filter((r) => r.event === "alert_notices" || r.event === "mail_dev")).toEqual([]);
+    expect(runs()).toBe(0);
   }, 30_000);
 });
