@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 07:40 CT — Chat J — S-036a Share lists and views
+- Result: done
+- What changed: `packages/db/src/shares.ts` (`MAX_SHARE_PAGE` 50, a `before` cursor scoped to its own list, order `offered_at DESC, id DESC`, `includeHidden` for the manager's accepted list, `sharedItemViews` through `publicRecordIn` with the home mapping's fields and labels, `SHARE_CHANGED`); `packages/service/src/shares.ts` (pages with exact `next` cursors, hidden accepted items as `item: null` for the manager only); `?before`/`?state` and `{ shares, next }` on the share routes; `packages/admin/src/shares/` (`useMorePages`, "Show more" on the site's two lists, the shared items and a record's shares, hidden items said in words with their own Remove names, home labels).
+- Decisions: D-094 amended
+- Review: two independent rounds. First: nothing blocking; fixed "Show more" stopping when rows were left out after the limit (now exact `next` cursors), duplicate and stale rows after a refetch, a record's list capped at 50, shares ended mid-request shown as hidden, identical button names, `before` without `state`; added tests for foreign cursors, a short page with a `next`, the record panel, and a hidden item's screen. The index order is left to S-036b.
+- Gate: PASS · tests_passing TBD (was 4817) · npm audit clean
+- Next: S-036b
+
 ## 2026-11-25 04:00 CT — manual (Chat C) — S-041 Stored OAI-PMH datestamps
 - Result: done
 - What changed: migration 0037 (`oai_datestamps`), `writeOaiStamps`, `oaiStoredStamp` and a table-based `listPublishedForOai` (packages/db/src/oai.ts), `fingerprints` in `publicTermCountsForStaff`, the Subjects pass's `oaiStamps` option (written per site, its failures its own, shown to staff), deleted headers and `deletedRecord` transient in oai-pmh.ts, `terms` in the marker, `buildAdminServer` refusing OAI-PMH without `countsDb`.
