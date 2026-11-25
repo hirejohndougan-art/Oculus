@@ -24,6 +24,7 @@ import {
 import { RouterProvider as AriaRouterProvider } from "react-aria-components";
 import { ApiError } from "./api";
 import { endSession, isSessionEnded, isSignInPath } from "./session";
+import { setSessionEnding } from "./idle/unsaved";
 import { Frame } from "./frame/Frame";
 import { Home } from "./frame/Home";
 import { SiteHome, SiteNewRecord, SiteRecord, SiteReview } from "./frame/SiteHome";
@@ -83,8 +84,11 @@ function SessionWatch() {
     const handler = () => {
       if (handled) return;
       handled = true;
-      void Promise.resolve(navigate("/sign-in", { replace: true })).then(() => {
+      // An editor with unsaved changes mustn't hold the way to sign in.
+      setSessionEnding(true);
+      void Promise.resolve(navigate("/sign-in", { replace: true })).finally(() => {
         endSession(queries);
+        setSessionEnding(false);
       });
     };
     onSessionEnded = handler;

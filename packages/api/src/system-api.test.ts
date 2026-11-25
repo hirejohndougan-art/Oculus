@@ -253,8 +253,9 @@ describe("the sign-in rules", () => {
   it("read at version 0, changed first with If-None-Match, then with If-Match; a stale edit is 412", async () => {
     const first = await call("GET", "/api/system-settings", { as: "root" });
     expect(first.status).toBe(200);
+    // The default idle limit is 30 minutes since T-062 (D-098; it was 240).
     expect(first.json).toEqual({
-      settings: { sessionIdleMinutes: 240, sessionAbsoluteMinutes: 720 },
+      settings: { sessionIdleMinutes: 30, sessionAbsoluteMinutes: 720 },
       version: 0,
     });
     expect(first.res.headers.etag).toBeUndefined();

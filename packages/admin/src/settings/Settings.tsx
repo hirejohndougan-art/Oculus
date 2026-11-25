@@ -441,7 +441,7 @@ function SignInForm(props: {
             value={idle}
             onChange={setIdle}
             isRequired
-            help="5 to 720 minutes. No longer than the limit beside it."
+            help="5 to 720 minutes (30 by default). A warning shows a minute before. No longer than the limit beside it."
           />
           <TextInput
             label="Sign out after this many minutes in all"

@@ -18,6 +18,8 @@ export interface Seed {
   readonly password: string;
   readonly siteName: string;
   readonly recordTitle: string;
+  /** T-062's idle sign-out test's own person. */
+  readonly idleEmail: string;
 }
 
 export function seed(): Seed {

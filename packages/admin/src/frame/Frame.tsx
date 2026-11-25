@@ -25,6 +25,7 @@ import styles from "./Frame.module.css";
 import { SiteSelector } from "./SiteSelector";
 import { useSiteAbilities } from "../records/queries";
 import { ME_KEY, useMe } from "./useMe";
+import { IdleGuard } from "../idle/IdleGuard";
 
 /** Up to two initials for the round account button. */
 export function initials(name: string): string {
@@ -254,6 +255,8 @@ export function Frame() {
           <Outlet context={context} />
         </main>
       </div>
+      {/* Signing out after a period of no use (T-062, D-098). */}
+      <IdleGuard idleSeconds={person.idleSeconds ?? 1800} />
     </div>
   );
 }

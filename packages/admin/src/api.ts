@@ -14,6 +14,12 @@
  *   `ifNoneMatch` sends `If-None-Match: *` for a first version.
  * - A reply `{ "error": code, ... }` becomes an `ApiError` carrying the
  *   status, the code and the rest of the body; nothing is retried here.
+ * - `background` marks a read the person didn't ask for (polling, checking
+ *   the session is still alive) with `X-Oculus-Background: 1`, so it isn't a
+ *   use of the session and never holds off the idle limit (T-062, D-098).
+ *   Every other request that the server answers with success is a use: its
+ *   send time goes to `onSessionUse` listeners (the idle timer), which is
+ *   never later than the moment the server counted it.
  */
 
 export class ApiError extends Error {
@@ -52,6 +58,22 @@ export interface RequestOptions {
   /** The working site (D-079's `X-Oculus-Site`), for the staff API. */
   readonly site?: string;
   readonly signal?: AbortSignal;
+  /** A read that isn't a use of the session (GET only; T-062, D-098). */
+  readonly background?: boolean;
+}
+
+type UseListener = (sentAt: number) => void;
+const useListeners = new Set<UseListener>();
+
+/**
+ * Calls `listener` with the send time (`Date.now()`) of every request that
+ * counted as a use of the session. Returns the way to stop.
+ */
+export function onSessionUse(listener: UseListener): () => void {
+  useListeners.add(listener);
+  return () => {
+    useListeners.delete(listener);
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -78,6 +100,12 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
   if (options.ifMatch !== undefined) headers["if-match"] = `"v${String(options.ifMatch)}"`;
   if (options.ifNoneMatch === true) headers["if-none-match"] = "*";
   if (options.site !== undefined) headers["x-oculus-site"] = options.site;
+  const background = options.background === true;
+  if (background) {
+    if (method !== "GET") throw new Error("only a read can be background");
+    headers["x-oculus-background"] = "1";
+  }
+  const sentAt = Date.now();
   let response: Response;
   try {
     response = await fetch(path, {
@@ -107,6 +135,9 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
     throw new ApiError(response.status, code, record);
   }
   rememberCsrf(body);
+  if (!background) {
+    for (const listener of [...useListeners]) listener(sentAt);
+  }
   return body as T;
 }
 

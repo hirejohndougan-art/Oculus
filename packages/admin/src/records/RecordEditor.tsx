@@ -22,6 +22,7 @@
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useBlocker, useLocation, useNavigate } from "react-router";
+import { isSessionEnding, useUnsavedChanges } from "../idle/unsaved";
 import { useQueryClient } from "@tanstack/react-query";
 import { ApiError, api, problemText } from "../api";
 import { Button, Note, TextLink } from "../components/ui";
@@ -299,8 +300,13 @@ function Editor(props: EditorProps) {
   // Leaving with unsaved changes: ask in the app; the browser asks on reload.
   const blocker = useBlocker(
     ({ currentLocation, nextLocation }) =>
-      dirty && !leaving.current && currentLocation.pathname !== nextLocation.pathname,
+      dirty &&
+      !leaving.current &&
+      !isSessionEnding() &&
+      currentLocation.pathname !== nextLocation.pathname,
   );
+  // The idle warning says these changes will be lost (T-062, D-098).
+  useUnsavedChanges(dirty);
   useEffect(() => {
     if (!dirty) return undefined;
     const warn = (event: BeforeUnloadEvent) => {

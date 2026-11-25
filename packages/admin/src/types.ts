@@ -16,6 +16,8 @@ export interface Me {
   readonly email: string;
   readonly expiresAt: string;
   readonly idleExpiresAt: string;
+  /** How long the session may sit unused, in seconds (T-062, D-098). */
+  readonly idleSeconds?: number;
   readonly csrfToken: string | null;
   readonly sites: readonly SiteChoice[];
   /** Wrong two-step codes for this account in the last 30 days (D-077, D-085). */

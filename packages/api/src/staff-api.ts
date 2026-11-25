@@ -136,6 +136,29 @@ export interface StaffApiOptions {
 export const CSRF_HEADER = "x-oculus-csrf";
 /** The header naming the working site. */
 export const SITE_HEADER = "x-oculus-site";
+/**
+ * The header that marks a read as background (T-062, D-098): `1` on a GET
+ * the admin sends without the person doing anything (polling, a check of
+ * whether the session is still alive). Such a read is served as usual but
+ * isn't a use of the session, so it never holds off the idle limit. Only
+ * `1` is accepted; on a change it is refused, because a change is always a
+ * use. Sending it can only make a session end sooner, so it needs no proof.
+ */
+export const BACKGROUND_HEADER = "x-oculus-background";
+
+/**
+ * Whether the request counts as a use of the session: `false` for a GET
+ * marked with `X-Oculus-Background: 1`. Any other value, or the header on a
+ * change, is `400 bad_request`.
+ */
+export function isActivity(request: OculusRequest): boolean {
+  const value = request.headers[BACKGROUND_HEADER];
+  if (value === undefined) return true;
+  if (value !== "1" || (request.method !== "GET" && request.method !== "HEAD")) {
+    throw new Refusal(400, "bad_request");
+  }
+  return false;
+}
 
 const SYSTEM_CODE = /^E[A-Z0-9_]{1,40}$/;
 const SQLSTATE = /^[0-9A-Z]{5}$/;
@@ -419,7 +442,9 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
       if (unsafe && !checkCsrfToken(token, request.headers[CSRF_HEADER])) {
         throw new Refusal(403, "csrf_failed");
       }
+      const activity = isActivity(request);
       const resolved = await resolveSession(db, token, {
+        activity,
         onError: (error) => {
           log({ event: "session_error", ...redactedError(error) });
         },
@@ -492,6 +517,10 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
           systemAdmin: session.systemAdmin,
           expiresAt: session.expiresAt,
           idleExpiresAt: session.idleExpiresAt,
+          // The limit the admin's idle timer follows (T-062, D-098). The
+          // timer asks here with a use when the person is active, and with
+          // X-Oculus-Background: 1 to see whether the session still lives.
+          idleSeconds: session.idleSeconds,
           recentlyAuthenticated: session.recentlyAuthenticated,
           // Derived from the cookie's token (D-069): the admin sends it back
           // in X-Oculus-CSRF on every change. Readable by this origin only.
