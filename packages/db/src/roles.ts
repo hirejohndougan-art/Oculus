@@ -89,6 +89,9 @@ export const WRITER_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Ob
   ...SHARE_TABLE_PRIVILEGES,
   // Installs and rollbacks in the change log (T-060a): append-only.
   ...SYSTEM_EVENT_TABLE_PRIVILEGES,
+  // Stored OAI-PMH datestamps (S-041, D-108): made and moved by the
+  // background pass; a record that stops being shown is marked, never deleted.
+  oai_datestamps: ["INSERT", "UPDATE"],
 });
 
 /**
