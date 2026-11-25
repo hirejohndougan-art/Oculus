@@ -127,7 +127,12 @@ function what(entry: AuditEntry, sites: ReadonlyMap<string, string>): string {
   if (entry.type === "share") {
     const site =
       entry.targetSiteId === null ? "" : ` with ${sites.get(entry.targetSiteId) ?? "another site"}`;
-    const item = entry.title === null ? "a shared item" : `“${entry.title}”`;
+    const item =
+      entry.title !== null
+        ? `“${entry.title}”`
+        : entry.deleted === true
+          ? "a deleted record"
+          : "a shared item";
     return `${SHARE_STEPS[entry.kind] ?? entry.kind} ${item}${site}`;
   }
   if (entry.type === "system" && Object.hasOwn(FILE_EVENTS, entry.kind)) {
@@ -301,13 +306,15 @@ export function Audit() {
                         ? "Oculus's daily clean-up"
                         : e.actor === "lease"
                           ? "Oculus (another database used the files folder)"
-                          : e.actor === "automatic"
-                            ? "Oculus (automatically)"
-                            : e.type === "system"
-                              ? "A former system manager"
-                              : e.actor.startsWith("system:")
-                                ? "Oculus"
-                                : "Someone outside this organization")}
+                          : e.actor === "other_organization"
+                            ? "Someone at the other organization"
+                            : e.actor === "automatic"
+                              ? "Oculus (automatically)"
+                              : e.type === "system"
+                                ? "A former system manager"
+                                : e.actor.startsWith("system:")
+                                  ? "Oculus"
+                                  : "Someone outside this organization")}
                 </td>
                 <td>{what(e, sites)}</td>
                 <td className={styles.muted}>

@@ -413,38 +413,54 @@ describe("deciding and ending", () => {
     expect((await offer(w, { org: w.dhs, site: w.d1 })).id).not.toBe(share.id);
   });
 
-  it("shows each step in both organizations' audit trails, the title only at home (S-064)", async () => {
+  it("shows a share's steps to those who see the record, never naming the other organization's people (S-064)", async () => {
     await ready();
     const w = await world();
     const share = await offer(w, { org: w.dhs, site: w.d1 });
     ok(await service.acceptShare(at(w.dhs, w.dhsManager), share.id));
     ok(await service.removeShare(at(w.dhs, w.dhsManager), share.id));
-    const steps = async (org: OrganizationId, records: "all" | SiteId[]) =>
+    const steps = async (org: OrganizationId, records: "all" | SiteId[], actorId?: UserId) =>
       (
-        await readAuditTrail(s.owner, org, { records, people: "all" }, { limit: 100 })
+        await readAuditTrail(
+          s.owner,
+          org,
+          { records, people: "all" },
+          { limit: 100, ...(actorId === undefined ? {} : { actorId }) },
+        )
       ).entries.flatMap((e) =>
         e.type === "share" ? [[e.kind, e.actor, e.title, e.targetSiteId]] : [],
       );
-    const expected = (title: string | null) => [
-      ["removed", actorOf(w.dhsManager), title, w.d1],
-      ["accepted", actorOf(w.dhsManager), title, w.d1],
-      ["offered", actorOf(w.libCataloger), title, w.d1],
+    const home = [
+      ["removed", "other_organization", "Invented depot lantern", w.d1],
+      ["accepted", "other_organization", "Invented depot lantern", w.d1],
+      ["offered", actorOf(w.libCataloger), "Invented depot lantern", w.d1],
     ];
-    expect(await steps(w.lib, "all")).toEqual(expected("Invented depot lantern"));
-    expect(await steps(w.lib, [w.l1])).toEqual(expected("Invented depot lantern"));
+    expect(await steps(w.lib, "all")).toEqual(home);
+    expect(await steps(w.lib, [w.l1])).toEqual(home);
     expect(await steps(w.lib, [w.l2])).toEqual([]);
-    expect(await steps(w.dhs, [w.d1])).toEqual(expected(null));
-    // A share between two sites of one organization (review): someone who
-    // sees only the receiving site gets the steps, never the title.
-    const inside = await offer(w, { org: w.lib, site: w.l2 });
-    expect(await steps(w.lib, [w.l2])).toEqual([["offered", actorOf(w.libCataloger), null, w.l2]]);
-    expect((await steps(w.lib, "all"))[0]).toEqual([
+    // The other organization's person can't be found by ID either.
+    expect(await steps(w.lib, "all", w.dhsManager)).toEqual([]);
+    // The receiving organization's trail shows none of it (D-094, 0043).
+    expect(await steps(w.dhs, "all")).toEqual([]);
+    expect(await steps(w.dhs, [w.d1])).toEqual([]);
+    // A share between two sites of one organization: someone who sees only
+    // the receiving site sees nothing of it, not even the record's ID.
+    ok(
+      await service.offerRecord(at(w.lib, w.libCataloger, w.l1), {
+        recordId: w.item.id,
+        targetOrganizationId: w.lib,
+        targetSiteId: w.l2,
+      }),
+    );
+    expect(await steps(w.lib, [w.l2])).toEqual([]);
+    const l2 = await readAuditTrail(s.owner, w.lib, { records: [w.l2], people: [w.l2] }, {});
+    expect(JSON.stringify(l2)).not.toContain(w.item.id);
+    expect((await steps(w.lib, [w.l1]))[0]).toEqual([
       "offered",
       actorOf(w.libCataloger),
       "Invented depot lantern",
       w.l2,
     ]);
-    expect(inside.id).not.toBe(share.id);
     // The sites and mappings made through the service name who made them.
     const made = (
       await readAuditTrail(s.owner, w.lib, { records: "all", people: "all" }, { limit: 100 })

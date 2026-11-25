@@ -517,6 +517,19 @@ describe("the audit trail", () => {
               kind: "deleted",
               recordId: id(13),
               title: null,
+              deleted: true,
+              targetSiteId: null,
+            },
+            {
+              type: "share",
+              at: "2026-11-25T04:00:00.000Z",
+              actor: "other_organization",
+              actorName: null,
+              shareId: id(7),
+              kind: "accepted",
+              recordId: id(14),
+              title: "Invented lamp",
+              deleted: false,
               targetSiteId: null,
             },
           ],
@@ -531,7 +544,9 @@ describe("the audit trail", () => {
     expect(screen.getByText("Removed a file from “Invented quilt” (2 KB)")).toBeTruthy();
     expect(screen.getByText("Moved “Invented quilt” to “Shelf A”")).toBeTruthy();
     expect(screen.getByText("Saved accession 2026.014 (version 2)")).toBeTruthy();
-    expect(screen.getByText("Ended the share (record deleted) of a shared item")).toBeTruthy();
+    expect(screen.getByText("Ended the share (record deleted) of a deleted record")).toBeTruthy();
     expect(screen.getByText("Oculus (automatically)")).toBeTruthy();
+    expect(screen.getByText("Accepted the share of “Invented lamp”")).toBeTruthy();
+    expect(screen.getByText("Someone at the other organization")).toBeTruthy();
   });
 });

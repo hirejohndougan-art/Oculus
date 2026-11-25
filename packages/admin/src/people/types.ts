@@ -158,13 +158,14 @@ export type AuditEntry =
   | {
       readonly type: "share";
       readonly at: string;
-      /** `user:<id>`, or `automatic` when the record's deletion or move ended it. */
+      /** `user:<id>`, `automatic` when the record's deletion or move ended it, or `other_organization`. */
       readonly actor: string;
       readonly actorName: string | null;
       readonly shareId: string;
       readonly kind: string;
       readonly recordId: string;
       readonly title: string | null;
+      readonly deleted?: boolean;
       readonly targetSiteId: string | null;
     };
 

@@ -622,7 +622,7 @@ export type AuditEntry =
       readonly locationName: string | null;
     }
   | {
-      /** An accession saved (T-018c); whole-organization viewers only. */
+      /** An accession saved (T-018c); only with `donors.view` on every site (scope.accessions). */
       readonly type: "accession";
       readonly at: string;
       readonly actor: string;
@@ -635,18 +635,23 @@ export type AuditEntry =
       /**
        * A step in a share's life (T-041c): offered, accepted or declined,
        * then withdrawn or removed (by a person) or ended because the
-       * record was deleted or moved (`automatic`).
+       * record was deleted or moved (`automatic`). In the home
+       * organization's trail only, for those who see the record.
        */
       readonly type: "share";
       readonly at: string;
-      /** `user:<id>`, or `automatic` for an ending the database made. */
+      /**
+       * `user:<id>`; `automatic` for an ending the database made;
+       * `other_organization` for someone of the receiving organization.
+       */
       readonly actor: string;
       readonly actorName: string | null;
       readonly shareId: string;
       readonly kind: ShareStep;
       readonly recordId: string;
-      /** The record's title, only for those who see the record itself. */
+      /** The record's title; null once deleted. */
       readonly title: string | null;
+      readonly deleted: boolean;
       readonly targetSiteId: string | null;
     };
 
@@ -808,6 +813,7 @@ function auditEntryOf(r: AuditRow): AuditEntry | undefined {
         kind: (r.kind ?? "offered") as ShareStep,
         recordId: r.record_id ?? "",
         title: r.title,
+        deleted: r.deleted === true,
         targetSiteId: r.site_id,
       });
     default:
@@ -973,41 +979,34 @@ export async function readAuditTrail(
         AND (${from}::timestamptz IS NULL OR a.saved_at >= ${from}::timestamptz)
         AND (${to}::timestamptz IS NULL OR a.saved_at < ${to}::timestamptz)
       UNION ALL
-      -- A share's steps (T-041c, S-036b), in both organizations' trails:
-      -- the home one's for those who see the record, the receiving one's
-      -- for those who see the site it was offered to. The receiving side
-      -- gets no title (the record isn't theirs; it may be unpublished now).
-      SELECT 'share', step.at, 'h' || sh.id::text || ':' || step.part, step.actor,
-             sh.record_id::text, NULL, NULL,
-             CASE WHEN home.sees THEN r.title END, CASE WHEN home.sees THEN r.kind END,
-             NULL, NULL, home.sees AND r.id IS NULL,
+      -- A share's steps (T-041c, S-036b), for those who see the record
+      -- itself (its home organization, and its home site in their scope;
+      -- shares between two sites of one organization included). The
+      -- receiving side is never shown here: D-094 shows it its offers and
+      -- items by other rules, and 0043 hides a deleted record's shares there
+      -- (review). Someone of another organization is never named or given
+      -- by ID: other_organization (D-019).
+      SELECT 'share', step.at, 'h' || sh.id::text || ':' || step.part, who.actor,
+             sh.record_id::text, NULL, NULL, r.title, r.kind, NULL, NULL, r.id IS NULL,
              sh.id::text, step.kind, NULL, NULL, sh.target_site_id::text, NULL, NULL, NULL,
              NULL, NULL, NULL, NULL
       FROM public.record_shares sh
       LEFT JOIN public.records r ON r.organization_id = sh.organization_id AND r.id = sh.record_id
       CROSS JOIN LATERAL (VALUES
-        ('o', 'offered', sh.offered_at, 'user:' || sh.offered_by::text),
+        ('o', 'offered', sh.offered_at, sh.offered_by),
         ('d', CASE WHEN sh.state = 'declined' THEN 'declined' ELSE 'accepted' END,
-         sh.decided_at, 'user:' || sh.decided_by::text),
-        ('e', sh.state, sh.ended_at, coalesce('user:' || sh.ended_by::text, 'automatic'))
-      ) AS step (part, kind, at, actor)
-      -- Whether the viewer sees the record itself (its home organization,
-      -- and its home site in their scope): only then its title. Shares
-      -- between two sites of one organization included (review).
-      CROSS JOIN LATERAL (SELECT
-        sh.organization_id = ${organizationId}::uuid
-          AND (${recordSites === null}::boolean OR r.site_id = ANY (${recordSites ?? []}::uuid[]))
-        AS sees) AS home
+         sh.decided_at, sh.decided_by),
+        ('e', sh.state, sh.ended_at, sh.ended_by)
+      ) AS step (part, kind, at, by_id)
+      CROSS JOIN LATERAL (SELECT CASE
+        WHEN step.by_id IS NULL THEN 'automatic'
+        WHEN EXISTS (SELECT 1 FROM names n WHERE n.id = step.by_id) THEN 'user:' || step.by_id::text
+        ELSE 'other_organization' END AS actor) AS who
       WHERE ${wantRecords}::boolean
         AND step.at IS NOT NULL
-        AND (home.sees
-             -- The receiving side: the steps of its own site's shares, not
-             -- the automatic endings (0043: such shares show nowhere).
-             OR (sh.target_organization_id = ${organizationId}::uuid
-                 AND step.kind NOT IN ('deleted', 'moved')
-                 AND (${recordSites === null}::boolean
-                      OR sh.target_site_id = ANY (${recordSites ?? []}::uuid[]))))
-        AND (${actor}::text IS NULL OR step.actor = 'user:' || ${actor}::text)
+        AND sh.organization_id = ${organizationId}::uuid
+        AND (${recordSites === null}::boolean OR r.site_id = ANY (${recordSites ?? []}::uuid[]))
+        AND (${actor}::text IS NULL OR who.actor = 'user:' || ${actor}::text)
         AND (${filter.recordId ?? null}::uuid IS NULL OR sh.record_id = ${filter.recordId ?? null}::uuid)
         AND (${from}::timestamptz IS NULL OR step.at >= ${from}::timestamptz)
         AND (${to}::timestamptz IS NULL OR step.at < ${to}::timestamptz)
