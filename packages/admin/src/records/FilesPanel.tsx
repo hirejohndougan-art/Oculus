@@ -200,7 +200,11 @@ export function FilesPanel(props: Props) {
       setNotice({ tone: "green", text: `Removed ${file.name}.` });
       await queries.invalidateQueries({ queryKey: filesKey(recordId) });
     } catch (error) {
-      setNotice({ tone: "amber", text: `${file.name} wasn't removed. ${failureText(error)}` });
+      const why =
+        error instanceof ApiError && error.code === "not_permitted"
+          ? "You may remove only the files you added yourself."
+          : failureText(error);
+      setNotice({ tone: "amber", text: `${file.name} wasn't removed. ${why}` });
     } finally {
       setRemoveBusy(false);
       setRemoving(undefined);

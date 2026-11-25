@@ -96,6 +96,7 @@ import {
   DEFAULT_BODY_LIMIT,
   bodyHeaderProblem,
   registerBodyParsers,
+  UPLOAD_TYPES,
   uploadStreams,
 } from "./body.js";
 import { ADMIN_SECURITY_HEADERS, adminFileFor, type AdminFiles } from "./admin-files.js";
@@ -238,7 +239,29 @@ function requestRefusal(
   const refusal = bodyHeaderProblem(request) ?? cookieHeaderProblem(request.headers.cookie);
   if (refusal !== undefined) return refusal;
   if (failsOriginCheck(request, origins)) return new Refusal(403, "cross_origin");
+  if (isUploadRoute(request) && uploadTypeProblem(request)) {
+    return new Refusal(415, "unsupported_media_type");
+  }
   return undefined;
+}
+
+function isUploadRoute(request: FastifyRequest): boolean {
+  return request.routeOptions.config.oculus?.upload === true;
+}
+
+/**
+ * On an upload route: a body whose type isn't one of `UPLOAD_TYPES`, bare
+ * (or a body with no type). Refused in onRequest, before a byte of it is
+ * read and under the usual time limits (review B2); the parsers check again.
+ */
+function uploadTypeProblem(request: FastifyRequest): boolean {
+  const headers = request.headers;
+  const hasBody =
+    headers["transfer-encoding"] !== undefined ||
+    (headers["content-length"] !== undefined && headers["content-length"] !== "0");
+  if (!hasBody) return false;
+  const type = headers["content-type"];
+  return type === undefined || !UPLOAD_TYPES.includes(type.toLowerCase());
 }
 
 const CLIENT_ERRORS: Readonly<Record<string, readonly [number, string, string]>> = {
@@ -305,13 +328,6 @@ function logLateFailure(request: FastifyRequest, fresh: Refusal, thrown: unknown
 const fileReplies = new WeakSet<FastifyRequest>();
 
 /**
- * Upload requests whose body wasn't read to its end: their connection is
- * closed after the reply (onSend adds `Connection: close`), so the rest of
- * the body is never read into a keep-alive connection's next request.
- */
-const unfinishedUploads = new WeakSet<FastifyRequest>();
-
-/**
  * The upload view of an upload route's body (routes.ts `OculusUpload`): the
  * bytes, counted as they arrive and refused past `maxBytes`, read once. The
  * stream is iterated by hand and never `return`ed: a for-await loop that
@@ -329,7 +345,6 @@ function uploadView(
   const stream = uploadStreams.get(request);
   if (stream === undefined) return undefined;
   uploadStreams.delete(request);
-  unfinishedUploads.add(request);
   const declared = declaredLength(request.headers["content-length"]);
   const contentType = (request.headers["content-type"] ?? "").toLowerCase();
   const raw = request.raw;
@@ -363,7 +378,6 @@ function uploadView(
           if (total > maxBytes) throw new Refusal(413, "payload_too_large");
           yield chunk;
         }
-        unfinishedUploads.delete(request);
       })();
     },
   });
@@ -534,6 +548,8 @@ function sendFallback(reply: FastifyReply): void {
 /** `{ "error": code }` with the security headers, for replies that skip onSend. */
 function sendDirect(reply: FastifyReply, status: number, code: string): void {
   try {
+    // A body not read to its end never becomes the next request (B2).
+    if (!reply.request.raw.complete) void reply.header("connection", "close");
     void reply
       .code(status)
       .headers(SECURITY_HEADERS)
@@ -701,8 +717,8 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
 
   // Rule 3 first: nothing else looks at a refused path. Then rule 12: with
   // an admin origin, `/api` is the admin host's only.
-  app.addHook("onRequest", (request, _reply, done) => {
-    const refusal = requestRefusal(request, origins);
+  app.addHook("onRequest", (request, reply, done) => {
+    let refusal = requestRefusal(request, origins);
     if (
       refusal === undefined &&
       admin !== undefined &&
@@ -712,40 +728,51 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
         normalHost(adminProtocol, request.host) === adminHost
       )
     ) {
-      done(new Refusal(404, "not_found"));
-      return;
+      refusal = new Refusal(404, "not_found");
+    }
+    if (hasUploads) {
+      if (refusal === undefined && isUploadRoute(request)) uploadLimits(request);
+      else usualLimit(request, reply);
     }
     done(refusal);
   });
 
-  if (hasUploads) {
-    app.addHook("onRequest", (request, reply, done) => {
-      const raw = request.raw;
-      const socket = raw.socket;
-      if (request.routeOptions.config.oculus?.upload === true) {
-        // Inactivity: the socket's own timeout while this request runs
-        // (Node puts the keep-alive timeout back after the reply). The
-        // whole upload is the route's handler timeout and Node's
-        // requestTimeout.
-        // (`inject`'s stand-in socket has no timeout to set.)
-        if (typeof socket.setTimeout === "function") socket.setTimeout(uploadTimeouts.idle);
-        done();
-        return;
-      }
-      // Every other request: its body must arrive within the usual limit,
-      // as Node's requestTimeout would have required.
-      const timer = setTimeout(() => {
-        if (!raw.complete && !reply.raw.headersSent)
-          clientError({ code: "ERR_HTTP_REQUEST_TIMEOUT" }, socket);
-      }, timeouts.request);
-      timer.unref();
-      const clear = (): void => {
-        clearTimeout(timer);
-      };
-      raw.once("end", clear);
-      reply.raw.once("close", clear);
-      done();
-    });
+  /**
+   * An accepted upload (D-086): no byte for `uploadTimeouts.idle` ends it
+   * (the socket's own timeout while it runs; Node puts the keep-alive
+   * timeout back after the reply). The whole upload is the route's handler
+   * timeout and Node's requestTimeout.
+   */
+  function uploadLimits(request: FastifyRequest): void {
+    const socket = request.raw.socket;
+    // (`inject`'s stand-in socket has no timeout to set.)
+    if (typeof socket.setTimeout === "function") socket.setTimeout(uploadTimeouts.idle);
+  }
+
+  /**
+   * Every other request on a server with upload routes (whose Node
+   * requestTimeout is the upload's): the usual limit from a timer of our
+   * own. If the body still hasn't arrived by then, the 408 Node would send,
+   * or, when a reply has already gone out (a request refused before its
+   * body was read), the connection is closed (review B2).
+   */
+  function usualLimit(request: FastifyRequest, reply: FastifyReply): void {
+    const raw = request.raw;
+    const socket = raw.socket;
+    if (raw.complete) return;
+    const timer = setTimeout(() => {
+      if (raw.complete) return;
+      if (!reply.raw.headersSent) clientError({ code: "ERR_HTTP_REQUEST_TIMEOUT" }, socket);
+      else socket.destroy();
+    }, timeouts.request);
+    timer.unref();
+    const clear = (): void => {
+      clearTimeout(timer);
+      raw.removeListener("end", clear);
+      socket.removeListener("close", clear);
+    };
+    raw.once("end", clear);
+    socket.once("close", clear);
   }
 
   app.addHook("onSend", async (request, reply, payload) => {
@@ -759,8 +786,10 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
         ? FILE_SECURITY_HEADERS
         : SECURITY_HEADERS;
     for (const [name, value] of Object.entries(headers)) void reply.header(name, value);
-    // An upload not read to its end (refused before or while streaming).
-    if (unfinishedUploads.has(request)) void reply.header("connection", "close");
+    // Any body not read to its end (refused before or while it arrived, on
+    // any route): the connection closes after the reply, so the rest never
+    // becomes the next request and the client can't hold it open (B2).
+    if (!request.raw.complete) void reply.header("connection", "close");
     return payload;
   });
 

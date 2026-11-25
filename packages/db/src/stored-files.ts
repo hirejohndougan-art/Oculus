@@ -33,6 +33,10 @@ import { sql } from "./sql.js";
 export const STORED_FILE_TABLE_PRIVILEGES: Readonly<Record<string, readonly string[]>> =
   Object.freeze({
     stored_files: Object.freeze(["INSERT", "DELETE"]),
+    // Every attach and removal, append-only (0026).
+    stored_file_events: Object.freeze(["INSERT"]),
+    // The files folder's install ID, made once (0026).
+    file_store_binding: Object.freeze(["INSERT"]),
   });
 
 /** One file attached to a digital asset. */
@@ -106,7 +110,8 @@ function checkOrganization(organizationId: unknown): void {
 
 /**
  * Takes the organization's file lock until the transaction ends (exclusive,
- * advisory, classid 68; 65 to 67 are the arrangement and definition locks).
+ * advisory, classid 69: 65 to 67 are the arrangement and definition locks,
+ * 68 the invitations', 85 T-040's alert notices).
  * Every attach takes it before reading the total, so two uploads can't both
  * pass the organization's cap, and the copy on disk is placed while it is
  * held.
@@ -116,7 +121,7 @@ export async function lockOrganizationFiles(
   organizationId: OrganizationId,
 ): Promise<void> {
   checkOrganization(organizationId);
-  await tx.rows(sql`SELECT pg_advisory_xact_lock(68, hashtext(${organizationId}::text))`);
+  await tx.rows(sql`SELECT pg_advisory_xact_lock(69, hashtext(${organizationId}::text))`);
 }
 
 /** Bytes the organization stores: each content counted once, however many assets hold it. */
@@ -267,4 +272,107 @@ export async function namedContents(
     SELECT DISTINCT sha256 FROM public.stored_files
     WHERE organization_id = ${organizationId}::uuid AND sha256 = ANY(${wanted}::text[])`);
   return new Set(rows.map((r) => r.sha256));
+}
+
+/** One file of an asset by its ID, if the asset has it. */
+export async function findStoredFileById(
+  db: Queryable,
+  organizationId: OrganizationId,
+  recordId: RecordId,
+  fileId: string,
+): Promise<StoredFile | undefined> {
+  checkOrganization(organizationId);
+  if (!isRecordId(recordId) || !isRecordId(fileId)) return undefined;
+  const rows = await db.rows<FileRow>(sql`
+    SELECT ${COLUMNS} FROM public.stored_files f
+    WHERE f.organization_id = ${organizationId}::uuid AND f.record_id = ${recordId}::uuid
+      AND f.id = ${fileId}::uuid`);
+  const row = rows[0];
+  return row === undefined ? undefined : fromRow(row);
+}
+
+/** What happened to a file: `stored_file_events`' kinds. */
+export const STORED_FILE_EVENT_KINDS = ["attached", "removed"] as const;
+export type StoredFileEventKind = (typeof STORED_FILE_EVENT_KINDS)[number];
+
+/** Logs an attach or a removal (the database stamps the time). */
+export async function insertStoredFileEvent(
+  tx: Queryable,
+  organizationId: OrganizationId,
+  kind: StoredFileEventKind,
+  file: StoredFile,
+  actor: string,
+): Promise<void> {
+  checkOrganization(organizationId);
+  if (!(STORED_FILE_EVENT_KINDS as readonly string[]).includes(kind)) {
+    throw new TypeError("Not an event kind.");
+  }
+  if (!isActorId(actor)) throw new TypeError("Not an actor.");
+  await tx.execute(sql`
+    INSERT INTO public.stored_file_events (organization_id, id, kind, file_id, record_id, sha256,
+      byte_size, actor)
+    VALUES (${organizationId}::uuid, gen_random_uuid(), ${kind}, ${file.id}::uuid,
+      ${file.recordId}::uuid, ${file.sha256}, ${file.size}::bigint, ${actor})`);
+}
+
+/** How long a removed file's bytes stay on disk before the sweep may take them. */
+export const REMOVED_FILE_GRACE_SECONDS = 7 * 24 * 3600;
+
+/**
+ * Which of these contents the sweep must keep: those some row names, and
+ * those removed within the grace period (`graceSeconds`, by the database's
+ * clock).
+ */
+export async function keptContents(
+  db: Queryable,
+  organizationId: OrganizationId,
+  hashes: readonly string[],
+  graceSeconds = REMOVED_FILE_GRACE_SECONDS,
+): Promise<ReadonlySet<string>> {
+  checkOrganization(organizationId);
+  if (!Number.isInteger(graceSeconds) || graceSeconds < 0) throw new TypeError("Not a grace.");
+  const wanted = hashes.filter((h) => isSha256Hex(h));
+  if (wanted.length === 0) return new Set();
+  const rows = await db.rows<{ sha256: string }>(sql`
+    SELECT DISTINCT sha256 FROM public.stored_files
+    WHERE organization_id = ${organizationId}::uuid AND sha256 = ANY(${wanted}::text[])
+    UNION
+    SELECT DISTINCT sha256 FROM public.stored_file_events
+    WHERE organization_id = ${organizationId}::uuid AND sha256 = ANY(${wanted}::text[])
+      AND kind = 'removed'
+      AND occurred_at > clock_timestamp() - make_interval(secs => ${graceSeconds})`);
+  return new Set(rows.map((r) => r.sha256));
+}
+
+/** Which of these organization IDs exist in this database. */
+export async function existingOrganizations(
+  db: Queryable,
+  organizationIds: readonly string[],
+): Promise<ReadonlySet<string>> {
+  const wanted = organizationIds.filter((id) => isOrganizationId(id));
+  if (wanted.length === 0) return new Set();
+  const rows = await db.rows<{ id: string }>(sql`
+    SELECT id::text AS id FROM public.organizations WHERE id = ANY(${wanted}::uuid[])`);
+  return new Set(rows.map((r) => r.id));
+}
+
+/** The files folder's install ID this database holds, if it has one yet. */
+export async function readFileStoreBinding(db: Queryable): Promise<string | undefined> {
+  const rows = await db.rows<{ store_id: string }>(sql`
+    SELECT store_id::text AS store_id FROM public.file_store_binding WHERE singleton`);
+  return rows[0]?.store_id;
+}
+
+/**
+ * Records the files folder's install ID, once: returns the ID the database
+ * holds afterwards (another server may have made one first).
+ */
+export async function insertFileStoreBinding(db: Queryable, storeId: string): Promise<string> {
+  if (!isRecordId(storeId)) throw new TypeError("Not an ID.");
+  await db.execute(sql`
+    INSERT INTO public.file_store_binding (singleton, store_id) VALUES (true, ${storeId}::uuid)
+    ON CONFLICT (singleton) DO NOTHING`);
+  const held = await readFileStoreBinding(db);
+  if (held === undefined) throw new Error("The files folder's ID wasn't stored.");
+  return held;
 }

@@ -14,6 +14,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -25,6 +26,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { csrfTokenFor, newRecordId, type OrganizationId, type UserId } from "@oculus/core";
+import { sql } from "@oculus/db";
 import {
   createService,
   createThumbnailRenderer,
@@ -181,6 +183,8 @@ beforeAll(async () => {
   w = await makeWorld();
   filesDir = mkdtempSync(join(tmpdir(), "oculus-file-reads-"));
   store = await openFileStore({ dir: filesDir, maxFileBytes: MAX_FILE });
+  // This test database's own folder (D-086): bound while it is empty.
+  expect(await createService(w.db, { files: store }).bindFileStore()).toEqual({ ok: true });
   renderer = createThumbnailRenderer();
   const service = createService(w.db, {
     onError: serviceErrorLogger((r) => logged.push(r)),
@@ -591,10 +595,29 @@ describe("thumbnails", () => {
       headers: { "if-match": '"v1"' },
     });
     expect(removed.status).toBe(200);
-    // Removing deletes nothing on disk; only the sweep does.
+    // Removing deletes nothing on disk; only the sweep does, after the grace period.
     expect(existsSync(thumb("small"))).toBe(true);
     const sweeper = createService(w.db, { files: store });
-    await sweeper.sweepFiles(3600_000);
+    expect(await sweeper.sweepFiles(3600_000)).toMatchObject({ unbound: false, failed: 0 });
+    expect(existsSync(thumb("small"))).toBe(true);
+    expect(existsSync(store.pathFor(w.a, sha(body)))).toBe(true);
+    // Eight days later (moved back as the owner, the append-only trigger off
+    // inside this transaction only and back on ALWAYS).
+    await w.db.transaction(async (q) => {
+      await q.execute(
+        sql`ALTER TABLE public.stored_file_events DISABLE TRIGGER stored_file_events_append_only`,
+      );
+      await q.execute(sql`
+        UPDATE public.stored_file_events SET occurred_at = occurred_at - interval '8 days'
+        WHERE file_id = ${id}::uuid`);
+      await q.execute(
+        sql`ALTER TABLE public.stored_file_events ENABLE ALWAYS TRIGGER stored_file_events_append_only`,
+      );
+    });
+    expect(await sweeper.sweepFiles(3600_000)).toMatchObject({ unbound: false, failed: 0 });
+    // Nothing left in the trash either.
+    expect(existsSync(join(filesDir, w.a, "trash"))).toBe(true);
+    expect(readdirSync(join(filesDir, w.a, "trash"))).toEqual([]);
     expect(existsSync(store.pathFor(w.a, sha(body)))).toBe(false);
     expect(existsSync(thumb("small"))).toBe(false);
     expect(existsSync(thumb("medium"))).toBe(false);

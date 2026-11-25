@@ -59,6 +59,7 @@ import {
   createThumbnailRenderer,
   openFileStore,
   type FileStore,
+  type FileStoreProblem,
 } from "@oculus/service";
 import type { FastifyInstance } from "fastify";
 import { ADMIN_ORIGIN_ENV, loadAdminFiles, type AdminFiles } from "./admin-files.js";
@@ -84,6 +85,17 @@ export const FILES_DIR_ENV = "OCULUS_FILES_DIR";
 export const FILE_MAX_ENV = "OCULUS_FILE_MAX_MIB";
 export const FILES_TOTAL_MAX_ENV = "OCULUS_FILES_TOTAL_MAX_MIB";
 export const FILES_MIN_FREE_ENV = "OCULUS_FILES_MIN_FREE_MIB";
+
+/** Why the files folder was refused, as the startup error says it (never the path). */
+const FILE_STORE_PROBLEMS: Readonly<Record<FileStoreProblem, string>> = {
+  no_store: "no files folder is configured.",
+  other_install:
+    "the folder belongs to another Oculus install (its .oculus-store-id names another database). Give this install a folder of its own.",
+  marker_missing:
+    "this database has used a files folder before, but this folder has no .oculus-store-id. Point it at that folder (restore it from backup if it was lost).",
+  not_empty:
+    "the folder isn't empty and has no .oculus-store-id. Give Oculus an empty folder of its own.",
+};
 
 /** Temporary upload files older than this are swept: twice an upload's whole limit. */
 export const INCOMING_MAX_AGE_MS = 2 * UPLOAD_TIMEOUTS.request;
@@ -321,9 +333,17 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   ];
   // Stale temporary files and copies no row names (D-086): now, then on a
   // timer that stops with the server.
+  // The files folder must be this install's (D-086, review B1).
+  const bound = await service.bindFileStore();
+  if (!bound.ok) {
+    throw new Error(`refusing to start: ${FILES_DIR_ENV}: ${FILE_STORE_PROBLEMS[bound.problem]}`);
+  }
   const sweep = async (): Promise<void> => {
     try {
-      await service.sweepFiles(INCOMING_MAX_AGE_MS);
+      const swept = await service.sweepFiles(INCOMING_MAX_AGE_MS);
+      if (swept.skipped > 0) log({ event: "startup_warning", code: "files_sweep_skipped" });
+      if (swept.failed > 0)
+        log({ event: "service_error", operation: "sweepFiles", code: "partial" });
     } catch (error) {
       log({ event: "service_error", operation: "sweepFiles", ...redactedError(error) });
     }

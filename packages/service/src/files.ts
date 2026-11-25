@@ -46,8 +46,13 @@ import {
 } from "@oculus/core";
 import {
   deleteStoredFile,
+  existingOrganizations,
   findStoredFile,
-  namedContents,
+  findStoredFileById,
+  insertFileStoreBinding,
+  insertStoredFileEvent,
+  keptContents,
+  readFileStoreBinding,
   insertStoredFile,
   listStoredFiles,
   lockOrganizationFiles,
@@ -60,7 +65,7 @@ import {
   type RecordPlace,
   type StoredFile,
 } from "@oculus/db";
-import { editPermissions, type RecordAccess, type Refusal } from "./access.js";
+import { editPermissions, notPermitted, type RecordAccess, type Refusal } from "./access.js";
 import type { Runner } from "./admin.js";
 import type { FileStore, ReceivedFile } from "./file-store.js";
 import {
@@ -106,8 +111,17 @@ export interface RemoveFileOptions {
 export interface FileSweep {
   /** Temporary files older than an upload may take (a crash, a stuck upload). */
   readonly incoming: number;
-  /** Stored copies no row names any more (removed files, a failed COMMIT). */
+  /**
+   * Stored copies no row names any more and not removed within the grace
+   * period (removed files, a failed COMMIT).
+   */
   readonly contents: number;
+  /** Entries at content paths that aren't regular files: left alone, to be looked at. */
+  readonly skipped: number;
+  /** Organizations (or the temporary files) whose sweep failed; the others went on. */
+  readonly failed: number;
+  /** True when the folder isn't bound to this database: nothing was swept. */
+  readonly unbound: boolean;
 }
 
 /** Why a file is read: to download it (any type), or to show it in the browser. */
@@ -124,6 +138,9 @@ export const MAX_THUMBNAIL_SOURCE_BYTES = 100 * 1024 * 1024;
 
 /** How much of a file's start is read to find an image's size before showing it (1 MiB). */
 export const VIEW_HEADER_BYTES = 1024 * 1024;
+
+/** Why the files folder can't be used with this database (`bindFileStore`). */
+export type FileStoreProblem = "no_store" | "other_install" | "marker_missing" | "not_empty";
 
 export interface FileOperations {
   /** Asked before an upload is read; see the module header. */
@@ -179,6 +196,17 @@ export interface FileOperations {
     fileId: string,
     size: ThumbnailSize,
   ): Promise<ServiceResult<{ readonly jpeg: Uint8Array }>>;
+  /**
+   * Ties the files folder to this database (review B1): the first time, an
+   * empty folder gets a new install ID, in the database and in the folder's
+   * marker file; afterwards the two must agree. Refused for a folder with
+   * another install's marker, a folder without the marker this database
+   * expects, and a folder with anything in it but no marker. Until it
+   * succeeds the sweep deletes nothing.
+   */
+  bindFileStore(): Promise<
+    { readonly ok: true } | { readonly ok: false; readonly problem: FileStoreProblem }
+  >;
   /** The asset's files (name, size, sniffed type, who and when). */
   listFiles(
     context: ServiceContext,
@@ -253,6 +281,20 @@ export function fileOperations(
     recordId: RecordId,
     expectedVersion: number,
   ): Promise<ServiceRefusal | undefined> {
+    const checked = await placeFor(tx, who, recordId, expectedVersion);
+    return checked.ok ? undefined : checked;
+  }
+
+  /** `attachable`, answering the place and checker when allowed. */
+  async function placeFor(
+    tx: Queryable,
+    who: Parameters<PlaceCheck>[1],
+    recordId: RecordId,
+    expectedVersion: number,
+  ): Promise<
+    | { readonly ok: true; readonly place: RecordPlace; readonly checker: RecordAccess }
+    | ServiceRefusal
+  > {
     if (!isRecordId(recordId)) {
       return refusal(["recordId"], "invalid_id", "A record ID is a lowercase version 4 UUID.");
     }
@@ -284,7 +326,7 @@ export function fileOperations(
         ...(conflict === undefined ? {} : { conflict }),
       };
     }
-    return undefined;
+    return allowed;
   }
 
   function diskFull(): ServiceRefusal {
@@ -384,6 +426,7 @@ export function fileOperations(
               createdBy: who.actor,
               createdAt: new Date(Math.floor(now.getTime())),
             });
+            await insertStoredFileEvent(tx, who.organizationId, "attached", file, who.actor);
             // Last, still under the file lock: the bytes at their content path.
             await store.place(received);
             return { ok: true, value: Object.freeze({ file, created: true }) };
@@ -399,49 +442,111 @@ export function fileOperations(
         "removeFile",
         context,
         async (tx, who): Promise<ServiceResult<{ readonly removed: true }>> => {
-          const refused = await attachable(tx, who, recordId, options.expectedVersion);
-          if (refused) return refused;
+          const allowed = await placeFor(tx, who, recordId, options.expectedVersion);
+          if (!allowed.ok) return allowed;
           await lockOrganizationFiles(tx, who.organizationId);
+          const file = await findStoredFileById(tx, who.organizationId, recordId, fileId);
+          if (file === undefined) {
+            return refusal(["fileId"], "unknown_file", "The record has no such file.");
+          }
+          // records.edit removes any file; a Scanner (media.attach alone)
+          // only the files they attached themselves.
+          const place = allowed.place;
+          const target = await allowed.checker.target({
+            kind: place.kind,
+            id: recordId,
+            parentId: place.parentId,
+            represents: place.represents,
+            siteId: place.siteId,
+          });
+          if (!allowed.checker.allows(["records.edit"], target) && file.createdBy !== who.actor) {
+            return notPermitted();
+          }
           if (!(await deleteStoredFile(tx, who.organizationId, recordId, fileId))) {
             return refusal(["fileId"], "unknown_file", "The record has no such file.");
           }
+          // Logged; the log also keeps the bytes for REMOVED_FILE_GRACE_SECONDS.
+          await insertStoredFileEvent(tx, who.organizationId, "removed", file, who.actor);
           return { ok: true, value: Object.freeze({ removed: true as const }) };
         },
       );
     },
 
-    async sweepFiles(incomingMaxAgeMs) {
-      if (store === undefined) return { incoming: 0, contents: 0 };
-      const incoming = await store.staleIncoming(incomingMaxAgeMs);
-      let contents = 0;
-      for (const organizationId of await store.organizations()) {
-        // Under the organization's file lock: an attach placing a copy
-        // holds it until its row is committed, so a copy is never taken
-        // from under a row about to name it.
-        contents += await db.transaction(async (tx) => {
-          await lockOrganizationFiles(tx, organizationId);
-          // Copies and cached thumbnails (M-003) alike: a thumbnail of
-          // content no row names goes too.
-          const onDisk = [
-            ...new Set([
-              ...(await store.contents(organizationId)),
-              ...(await store.thumbnailContents(organizationId)),
-            ]),
-          ].sort();
-          let removed = 0;
-          for (let i = 0; i < onDisk.length; i += 1000) {
-            const batch = onDisk.slice(i, i + 1000);
-            const named = await namedContents(tx, organizationId, batch);
-            for (const sha256 of batch) {
-              if (named.has(sha256)) continue;
-              await store.removeContent(organizationId, sha256);
-              removed++;
-            }
-          }
-          return removed;
-        });
+    async bindFileStore() {
+      if (store === undefined) return { ok: false, problem: "no_store" };
+      const held = await readFileStoreBinding(db);
+      const marker = await store.readMarker();
+      if (held !== undefined) {
+        if (marker === held) {
+          store.bind(held);
+          return { ok: true };
+        }
+        return { ok: false, problem: marker === undefined ? "marker_missing" : "other_install" };
       }
-      return Object.freeze({ incoming, contents });
+      // This database has never used a files folder.
+      if (marker !== undefined) return { ok: false, problem: "other_install" };
+      if (!(await store.isEmpty())) return { ok: false, problem: "not_empty" };
+      const storeId = await insertFileStoreBinding(db, randomUUID());
+      try {
+        await store.writeMarker(storeId);
+      } catch (error) {
+        // Another server of this install wrote it first: fine if it agrees.
+        if ((await store.readMarker()) !== storeId) throw error;
+      }
+      store.bind(storeId);
+      return { ok: true };
+    },
+
+    async sweepFiles(incomingMaxAgeMs) {
+      const none = { incoming: 0, contents: 0, skipped: 0, failed: 0, unbound: false };
+      if (store === undefined) return none;
+      // Not yet checked against this database: the folder may be another
+      // install's, so nothing outside our own uploads is touched.
+      if (store.boundTo() === undefined || store.boundTo() !== (await readFileStoreBinding(db))) {
+        return { ...none, unbound: true };
+      }
+      let failed = 0;
+      let incoming = 0;
+      try {
+        incoming = await store.staleIncoming(incomingMaxAgeMs);
+      } catch {
+        failed++;
+      }
+      let contents = 0;
+      let skipped = 0;
+      const onDisk = await store.organizations();
+      // Only organizations of this database: any other folder is left alone.
+      const known = await existingOrganizations(db, onDisk);
+      for (const organizationId of onDisk) {
+        if (!known.has(organizationId)) continue;
+        try {
+          // Decided under the organization's file lock (an attach placing a
+          // copy holds it until its row is committed), and moved aside there
+          // in one cheap rename each; deleted after the lock is released.
+          skipped += await db.transaction(async (tx) => {
+            await lockOrganizationFiles(tx, organizationId);
+            const listed = await store.listContents(organizationId);
+            // Copies and cached thumbnails (M-003) alike: thumbnails go with
+            // their bytes, and a thumbnail left without its copy goes too.
+            const hashes = [
+              ...new Set([...listed.hashes, ...(await store.thumbnailContents(organizationId))]),
+            ].sort();
+            for (let i = 0; i < hashes.length; i += 1000) {
+              const batch = hashes.slice(i, i + 1000);
+              const kept = await keptContents(tx, organizationId, batch);
+              for (const sha256 of batch) {
+                if (!kept.has(sha256)) await store.trash(organizationId, sha256);
+              }
+            }
+            return listed.skipped;
+          });
+          contents += await store.emptyTrash(organizationId);
+        } catch {
+          // One organization's trouble doesn't stop the others.
+          failed++;
+        }
+      }
+      return Object.freeze({ incoming, contents, skipped, failed, unbound: false });
     },
 
     async fileContent(context, recordId, fileId, use) {
