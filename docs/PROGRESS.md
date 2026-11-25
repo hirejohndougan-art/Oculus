@@ -2,12 +2,12 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
-## 2026-11-25 11:30 CT — Chat K — S-048, S-050, S-049, U-007, S-031, S-035 (one gate)
+## 2026-11-25 11:00 CT — Chat K — S-048, S-050, S-049, U-007, S-031, S-035 (one gate)
 - Result: done (S-048 and S-035 were already done by S-036a and M-003; their lines say how)
 - What changed: S-050 hardening (404 for an unknown share target, device names refused in update packages, a private updates folder, a Windows warning for a settings folder outside %APPDATA%, `failureClass` logging in `markKnownSource`, a comment fixed); S-049 public sites need an admin origin in every mode; U-007 the gate removes `packages/*/dist` first; S-031 setup checks applied migrations' names and hashes, refuses what the migrations never make, keeps the terminal quiet while migrating and names `template1` when extensions are the only contents; S-035's public side moved into T-058. Follow-up S-055 filed.
 - Decisions: D-090 amended (S-049)
 - Review: an independent review each for S-050, S-049 and S-031 (all safe; S-050's two small points and S-031's extension-detection gaps fixed; the rest is S-055)
-- Gate: PASS · tests_passing see gate-baseline.json (was 5001) · npm audit clean
+- Gate: PASS · tests_passing 5018 (was 5001) · npm audit clean
 - Next: Chat K's queue (T-018c, T-018d, then T-018b with T-018a and S-013)
 
 ## 2026-11-25 10:40 CT — Chat J — S-036b Share limits and endings
