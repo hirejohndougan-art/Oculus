@@ -1225,23 +1225,9 @@ export async function signInChecked(
     await tx.execute(sql`
       UPDATE public.sign_in_throttles SET failures = greatest(failures - 1, 0)
       WHERE key = ${sourceKey}`);
-    if (reauthOf === undefined && sourceKey !== OTHER_SOURCE_KEY) {
-      // This address is now known for the account (S-018), its own counter cleared.
-      await tx.execute(sql`
-        INSERT INTO public.sign_in_known_sources (account_key, source_key, signed_in_at)
-        VALUES (${accountKey}, ${sourceKey}, clock_timestamp())
-        ON CONFLICT (account_key, source_key) DO UPDATE
-        SET signed_in_at = excluded.signed_in_at, failures = 0, last_failure_at = NULL`);
-      // At most MAX_KNOWN_SOURCES per account, the newest (S-018 review).
-      await tx.execute(sql`
-        DELETE FROM public.sign_in_known_sources k
-        WHERE k.account_key = ${accountKey}
-          AND k.source_key NOT IN (
-            SELECT n.source_key FROM public.sign_in_known_sources n
-            WHERE n.account_key = ${accountKey}
-            ORDER BY n.signed_in_at DESC, n.source_key
-            LIMIT ${MAX_KNOWN_SOURCES})`);
-    }
+    // The address becomes known only once the second step passes
+    // (`markKnownSource`, S-044): a right password alone could otherwise
+    // push the person's real addresses out of the newest MAX_KNOWN_SOURCES.
     await tx.execute(
       sql`UPDATE public.users SET last_sign_in_at = now() WHERE id = ${user.id}::uuid`,
     );
@@ -1265,6 +1251,51 @@ export async function signInChecked(
     organizationIds: Object.freeze([...user.organization_ids]),
     secondStep: "required",
   };
+}
+
+/**
+ * Marks `source` as known for the person's account (S-018) once their sign-in
+ * has passed its second step, never on the password alone (S-044): someone
+ * who has only the password could otherwise sign in from MAX_KNOWN_SOURCES
+ * fresh addresses, push the person's real ones out, and keep them waiting
+ * behind the account counter with one wrong guess per wait. The newest
+ * MAX_KNOWN_SOURCES addresses are kept. Called after the session was
+ * promoted, so it never throws: a failure here only leaves the address
+ * unknown (it waits like a stranger's during an account wait) and must not
+ * turn a finished sign-in into an error whose new token is lost.
+ */
+export async function markKnownSource(db: Database, userId: string, source: string): Promise<void> {
+  const sourceKey = throttleSourceKey(source);
+  if (sourceKey === OTHER_SOURCE_KEY) return;
+  try {
+    await markKnown(db, userId, sourceKey);
+  } catch {
+    // Best effort, as above.
+  }
+}
+
+async function markKnown(db: Database, userId: string, sourceKey: string): Promise<void> {
+  await inTransaction(db, async (tx) => {
+    const rows = await tx.rows<{ email: string }>(sql`
+      SELECT email FROM public.users WHERE id = ${userId}::uuid`);
+    const email = rows[0]?.email;
+    if (email === undefined) return;
+    const accountKey = throttleAccountKey(email);
+    await tx.execute(sql`
+      INSERT INTO public.sign_in_known_sources (account_key, source_key, signed_in_at)
+      VALUES (${accountKey}, ${sourceKey}, clock_timestamp())
+      ON CONFLICT (account_key, source_key) DO UPDATE
+      SET signed_in_at = excluded.signed_in_at, failures = 0, last_failure_at = NULL`);
+    // At most MAX_KNOWN_SOURCES per account, the newest (S-018 review).
+    await tx.execute(sql`
+      DELETE FROM public.sign_in_known_sources k
+      WHERE k.account_key = ${accountKey}
+        AND k.source_key NOT IN (
+          SELECT n.source_key FROM public.sign_in_known_sources n
+          WHERE n.account_key = ${accountKey}
+          ORDER BY n.signed_in_at DESC, n.source_key
+          LIMIT ${MAX_KNOWN_SOURCES})`);
+  });
 }
 
 // ---------------------------------------------------------------------------
