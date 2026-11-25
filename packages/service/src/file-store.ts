@@ -73,7 +73,7 @@ const MIB = 1024 * 1024;
 export const DEFAULT_MAX_FILE_BYTES = 500 * MIB;
 /** The default total per organization: 20 GiB. */
 export const DEFAULT_MAX_ORGANIZATION_BYTES = 20 * 1024 * MIB;
-/** No cap may be set above this: 1 TiB (0022's column check). */
+/** No cap may be set above this: 1 TiB (0025's column check). */
 export const MAX_CAP_BYTES = 1024 * 1024 * MIB;
 /** The default free-space floor: 5% of the disk or 2 GiB, whichever is smaller. */
 export const DEFAULT_MIN_FREE_BYTES = 2 * 1024 * MIB;
