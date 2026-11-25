@@ -22,7 +22,8 @@
  * Nothing printed shows the database URL's password or the secret key.
  *
  * Exit codes: 0 stopped normally, 1 refused or failed, 2 usage, 3 the
- * database `npm run desktop:database` made still needs its setup questions.
+ * database `npm run desktop:database` made still needs its setup questions,
+ * 4 another start is still starting or busy (nothing done; a message to read).
  */
 import { spawn as nodeSpawn } from "node:child_process";
 import { homedir } from "node:os";
@@ -268,7 +269,7 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
   }
   if (lock.kind === "starting") {
     out("Oculus is already starting. Its window opens when it's ready.");
-    return 0;
+    return 4;
   }
   if (lock.kind === "busy") {
     out(
