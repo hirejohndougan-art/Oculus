@@ -602,37 +602,58 @@ export async function revokeInvitation(
 
 const INVALID_INVITATION = "This invitation link can't be used. Ask for a new one.";
 
-/** A usable invitation's ID and organization name, or undefined. */
+/**
+ * A usable invitation's ID, organization and organization name, or
+ * undefined. Without `organizationId` the organization is the invitation's
+ * own (token hashes are unique, so the token names one invitation): the
+ * link in the email carries only the token (T-075).
+ */
 async function usableInvitation(
   q: Queryable,
   tokenHash: Uint8Array,
-  organizationId: OrganizationId,
+  organizationId: OrganizationId | undefined,
   email: string,
   claimFor?: UserId,
-): Promise<{ id: InvitationId; organizationName: string } | undefined> {
+): Promise<
+  { id: InvitationId; organizationId: OrganizationId; organizationName: string } | undefined
+> {
+  const inOrganization =
+    organizationId === undefined ? sql`TRUE` : sql`i.organization_id = ${organizationId}::uuid`;
   const conditions = sql`
-    i.token_hash = ${tokenHash} AND i.organization_id = ${organizationId}::uuid
+    i.token_hash = ${tokenHash} AND ${inOrganization}
     AND i.email = ${email} AND i.accepted_at IS NULL AND i.revoked_at IS NULL
     AND i.expires_at > clock_timestamp()`;
+  interface Row {
+    id: InvitationId;
+    organization_id: OrganizationId;
+    name: string;
+  }
   const rows =
     claimFor === undefined
-      ? await q.rows<{ id: InvitationId; name: string }>(sql`
-          SELECT i.id::text AS id, o.name FROM public.invitations i
+      ? await q.rows<Row>(sql`
+          SELECT i.id::text AS id, i.organization_id::text AS organization_id, o.name
+          FROM public.invitations i
           JOIN public.organizations o ON o.id = i.organization_id
           WHERE ${conditions}`)
-      : await q.rows<{ id: InvitationId; name: string }>(sql`
+      : await q.rows<Row>(sql`
           UPDATE public.invitations i SET accepted_at = clock_timestamp(), accepted_by = ${claimFor}::uuid
           FROM public.organizations o
           WHERE o.id = i.organization_id AND ${conditions}
-          RETURNING i.id::text AS id, o.name`);
+          RETURNING i.id::text AS id, i.organization_id::text AS organization_id, o.name`);
   const row = rows[0];
-  return row === undefined ? undefined : { id: row.id, organizationName: row.name };
+  return row === undefined
+    ? undefined
+    : { id: row.id, organizationId: row.organization_id, organizationName: row.name };
 }
 
-/** What `acceptInvitation` takes: everything from the invitation form. */
+/**
+ * What `acceptInvitation` takes: everything from the invitation form.
+ * `organizationId` may be left out: the invitation's own is used (the link
+ * carries only the token; T-075).
+ */
 export interface InvitationAcceptance {
   readonly token: string;
-  readonly organizationId: OrganizationId;
+  readonly organizationId?: OrganizationId;
   readonly email: string;
   readonly displayName: string;
   readonly password: string;
@@ -663,7 +684,11 @@ export async function acceptInvitation(
   const token = own(input, "token");
   const organizationId = own(input, "organizationId");
   const email = normalizeEmail(own(input, "email"));
-  if (!isInvitationToken(token) || !isOrganizationId(organizationId) || email === undefined) {
+  if (
+    !isInvitationToken(token) ||
+    (organizationId !== undefined && !isOrganizationId(organizationId)) ||
+    email === undefined
+  ) {
     return refused("invalid_invitation", INVALID_INVITATION);
   }
   const tokenHash = hashInvitationToken(token);
@@ -713,8 +738,8 @@ export async function acceptInvitation(
         VALUES (${userId}::uuid, ${email}, ${displayName}, ${hash}, ${claimed.id}::uuid)`);
       await tx.execute(sql`
         INSERT INTO public.organization_members (organization_id, user_id, invitation_id)
-        VALUES (${organizationId}::uuid, ${userId}::uuid, ${claimed.id}::uuid)`);
-      return { ok: true, value: { userId, organizationId } };
+        VALUES (${claimed.organizationId}::uuid, ${userId}::uuid, ${claimed.id}::uuid)`);
+      return { ok: true, value: { userId, organizationId: claimed.organizationId } };
     });
   } catch (error) {
     // Another invitation made an account for this address meanwhile.
@@ -739,7 +764,8 @@ export async function acceptInvitationForUser(
   db: Database,
   input: {
     readonly token: string;
-    readonly organizationId: OrganizationId;
+    /** Left out: the invitation's own (T-075). */
+    readonly organizationId?: OrganizationId;
     readonly userId: UserId;
   },
 ): Promise<Validated<Membership>> {
@@ -749,7 +775,10 @@ export async function acceptInvitationForUser(
   if (!hasOnly(input, ["token", "organizationId", "userId"]) || !isUserId(userId)) {
     return refused("invalid_request", "Give the token, organization and user ID only.");
   }
-  if (!isInvitationToken(token) || !isOrganizationId(organizationId)) {
+  if (
+    !isInvitationToken(token) ||
+    (organizationId !== undefined && !isOrganizationId(organizationId))
+  ) {
     return refused("invalid_invitation", INVALID_INVITATION);
   }
   const tokenHash = hashInvitationToken(token);
@@ -764,13 +793,13 @@ export async function acceptInvitationForUser(
     if (claimed === undefined) return refused("invalid_invitation", INVALID_INVITATION);
     const inserted = await tx.execute(sql`
       INSERT INTO public.organization_members (organization_id, user_id, invitation_id)
-      VALUES (${organizationId}::uuid, ${userId}::uuid, ${claimed.id}::uuid)
+      VALUES (${claimed.organizationId}::uuid, ${userId}::uuid, ${claimed.id}::uuid)
       ON CONFLICT (organization_id, user_id) DO NOTHING`);
     if (inserted === 0) {
       // Already in: the claim is rolled back with everything else.
       throw new AlreadyMember();
     }
-    return { ok: true, value: { userId, organizationId } };
+    return { ok: true, value: { userId, organizationId: claimed.organizationId } };
   }).catch((error: unknown) => {
     if (error instanceof AlreadyMember) {
       return refused<Membership>("already_member", "You are already in this organization.");

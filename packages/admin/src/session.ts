@@ -31,6 +31,7 @@ export function isSignInPath(pathname: string): boolean {
     pathname === "/sign-in" ||
     pathname.startsWith("/sign-in/") ||
     pathname === "/forgot" ||
-    pathname === "/reset"
+    pathname === "/reset" ||
+    pathname === "/invitation"
   );
 }
