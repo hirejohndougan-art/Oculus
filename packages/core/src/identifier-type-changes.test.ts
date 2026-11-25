@@ -166,6 +166,97 @@ describe("identifierTypeChanges", () => {
     expect(summary(fits)).toEqual([["format_changed", false, []]]);
   });
 
+  it("lists the published records a new format takes off public sites (S-026)", () => {
+    const pub = { ...without(ACCESSION, "autoNumber"), public: true, pattern: "DHS-#{4,5}" };
+    const D = "6c4d5e6f-7a8b-4c9d-8e1f-2a3b4c5d6e7f";
+    const E = "7d5e6f7a-8b9c-4d0e-9f2a-3b4c5d6e7f80";
+    const F = "8e6f7a8b-9c0d-4e1f-8a3b-4c5d6e7f8091";
+    const unit = (id: string, fields: Record<string, unknown>, parentId?: string) => ({
+      ...record(id, fields),
+      kind: "archival_unit",
+      level: "item",
+      ...(parentId === undefined ? {} : { parentId }),
+    });
+    const records = [
+      // A holds a misfit in a field; B and C below it only inherit it (they
+      // stay public without it); D holds one but is unpublished; E holds one
+      // only in its identifiers; F fits.
+      unit(A, { number: { type: "accession", value: "DHS-0001" } }),
+      unit(B, {}, A),
+      unit(C, {}, B),
+      unit(D, { number: { type: "accession", value: "DHS-0004" } }, A),
+      unit(E, {}),
+      unit(F, { number: { type: "accession", value: "DHS-00006" } }),
+    ];
+    const existing = {
+      ...use([set(E, [{ type: "accession", value: "DHS-0005" }])], records, [pub, BOX]),
+      published: [A, C, E, F],
+    };
+    const r = ok(identifierTypeChanges(pub, { ...pub, pattern: "DHS-#####" }, existing));
+    const change = r.changes[0];
+    expect(change?.code).toBe("format_changed");
+    expect(change?.recordIds).toEqual([E, A, D]);
+    expect(change?.publishedRecordIds).toEqual([A]);
+    expect(change?.publishedRecordCount).toBe(1);
+    expect(change?.message).toContain("1 published record would show as not available");
+    expect(change?.message).not.toContain("DHS-0001");
+    expect(Object.isFrozen(change?.publishedRecordIds)).toBe(true);
+
+    // A field that's staff in the record's template shows nothing, so it takes nothing off.
+    const templates = [
+      {
+        key: "unit",
+        organizationId: ORG,
+        label: "Unit",
+        appliesTo: ["archival_unit"],
+        fields: [
+          {
+            key: "number",
+            label: "Number",
+            kind: "identifier",
+            required: false,
+            repeatable: false,
+            visibility: "staff",
+            inherited: false,
+          },
+        ],
+      },
+    ];
+    const staff = ok(
+      identifierTypeChanges(
+        pub,
+        { ...pub, pattern: "DHS-#####" },
+        {
+          ...existing,
+          records: records.map((x) => ({ ...x, templateKey: "unit" })),
+          templates,
+        },
+      ),
+    );
+    expect(staff.changes[0]?.publishedRecordIds).toEqual([]);
+    expect(staff.changes[0]?.message).not.toContain("published record");
+
+    // Without existing.published, nothing is said about published records.
+    const plain = ok(
+      identifierTypeChanges(pub, { ...pub, pattern: "DHS-#####" }, use([], records, [pub, BOX])),
+    );
+    expect(plain.changes[0]).not.toHaveProperty("publishedRecordIds");
+  });
+
+  it("refuses a published list that isn't a list of record IDs, each once", () => {
+    const wide = { ...without(ACCESSION, "autoNumber"), pattern: "DHS-#{4,5}" };
+    const changed = { ...wide, pattern: "DHS-#####" };
+    for (const [published, code] of [
+      ["nope", "not_a_list"],
+      [["not-an-id"], "invalid_id"],
+      [[A, A], "duplicate_id"],
+    ] as const) {
+      expect(
+        codes(identifierTypeChanges(wide, changed, { ...use(SETS, [], [wide, BOX]), published })),
+      ).toEqual([code]);
+    }
+  });
+
   it("reports values that clash under a stricter uniqueness rule", () => {
     const r = ok(identifierTypeChanges(BOX, { ...BOX, uniqueness: "current" }, use(SETS)));
     expect(summary(r)).toEqual([["uniqueness_tightened", true, [B, C]]]);

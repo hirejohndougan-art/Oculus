@@ -393,6 +393,7 @@ export {
   MAX_BASE_URL_LENGTH,
   MAX_OUTPUT_CHARS,
   publicOutput,
+  publicTemplateIssues,
 } from "./public-output.js";
 export type { PublishOptions, PublicOutput, DublinCoreValues } from "./public-output.js";
 
