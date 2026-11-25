@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 12:45 CT — Chat K — T-018c Accessions and donor contacts stored; T-018d Storage locations and moves stored
+- Result: done (T-018b split into T-018c, T-018d and the loans, which stay T-018b with T-018a and S-013; T-073 filed for the admin screens)
+- What changed: migrations 0046 (accessions, accession_records, accession_versions, accession_numbers, donor_contacts; `public_record_snapshot` gains `accessionHolds`) and 0047 (storage_levels, storage_locations, storage_moves); core `indexAccessionHolds` and `accessionHoldsOn`; db `accessions.ts` and `storage.ts`; the publish check and the public output now read stored accessions' holds, so an unsigned deed or a restriction in force holds records back; service operations for accessions, donor contacts, storage levels, locations and moves; record deletion refuses `in_accession`, `accession_source`, `has_moves` and `storage_agent`; trigger functions are left out of the public reader's definer check.
+- Decisions: D-114, D-115
+- Review: T-018c three independent rounds (a publish/save race, closed with an organization-wide advisory lock; cross-site holds; all-time numbers; fail-open holds), all fixed; T-018d one round (move times, cross-site agents, read consistency, refusal paths), all fixed.
+- Gate: PASS · tests_passing see the baseline commit · npm audit clean
+- Next: Chat K's queue (T-018b with T-018a and S-013, then T-073)
+
 ## 2026-11-25 11:25 CT — build (BUILD MODE) — S-053 "Last sign-in" is stamped at the right password, before the second step
 - Result: done
 - What changed: `signIn`'s success transaction no longer sets `users.last_sign_in_at`; `markSignedIn` (accounts.ts) stamps it after `completeSecondStep` or `confirmEnrolment` promoted the session, then calls `markKnownSource`; its own statement, best effort, a failure said by class only (as S-050's `markKnownSource`). Re-entering the password no longer moves it. Three tests in second-factor.test.ts (password plus a wrong code, set-up at first sign-in, a promotion refused for the organization), all failing without the change; password-resets.test.ts's deadlock test pins on the address counter's update. Commits on main up to the baseline raise.
