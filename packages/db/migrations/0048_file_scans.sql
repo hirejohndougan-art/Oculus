@@ -1,4 +1,4 @@
--- Virus scanning of stored files (S-040, D-113). Numbered 0044: main ends
+-- Virus scanning of stored files (S-040, D-113). Numbered 0048: main ends
 -- at 0039 and 0040 is reserved for another task; renumber at merge only if
 -- main has gone past it.
 --

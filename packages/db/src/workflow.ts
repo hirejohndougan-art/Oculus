@@ -43,7 +43,7 @@ import {
   applyWorkflowAction,
   effectivePublishIssues,
   effectiveRecord,
-  indexAccessions,
+  indexAccessionHolds,
   indexRecords,
   isOrganizationId,
   isRecordId,
@@ -58,6 +58,7 @@ import {
   publicView,
   type PublicRecord,
   validateRecord,
+  type AccessionHold,
   type CatalogRecord,
   type DublinCoreMapping,
   type FieldValueChecker,
@@ -96,6 +97,7 @@ import {
   type FormerRow,
   type StoredRecordIdentifiers,
 } from "./identifiers.js";
+import { holdsFrom, readAccessionHolds } from "./accessions.js";
 import { linkedIds } from "./record-checks.js";
 import { validateRecordChange, writeVersion, type RecordVersion } from "./record-versions.js";
 import { sql } from "./sql.js";
@@ -448,6 +450,8 @@ interface SnapshotSource {
   identifiers(recordId: RecordId): Promise<StoredRecordIdentifiers | undefined>;
   /** Of `ids`, those public now (published; on the public site, for the public output). */
   published(ids: readonly RecordId[]): Promise<readonly RecordId[]>;
+  /** The holds of the accessions that produced any of `ids` (D-114): never their contents. */
+  holds(ids: readonly RecordId[]): Promise<readonly AccessionHold[] | undefined>;
 }
 
 /** The tables, in the caller's transaction; with `lock`, definitions locked (shared) until COMMIT. */
@@ -472,6 +476,7 @@ function tableSource(db: Queryable, org: OrganizationId, lock: boolean): Snapsho
       return readIdentifierTypes(db, org);
     },
     identifiers: (recordId) => readRecordIdentifiers(db, org, recordId),
+    holds: (ids) => readAccessionHolds(db, org, ids, { lock }),
     published: async (ids) =>
       (
         await db.rows<{ id: string }>(sql`
@@ -555,19 +560,22 @@ async function buildSnapshot(
   // The organization's own calendar day (T-034e, D-056, D-103), never the
   // server's UTC day: a restriction ends on the organization's day. Read
   // through organization_local_day, which the public reader may run too.
-  // Accessions are not stored yet (T-018b), so the register holds none.
+  // The holds of stored accessions (T-018c, D-114): only their deed
+  // status, access restriction and which of these records they produced.
   const [day] = await db.rows<{ today: string | null }>(
     sql`SELECT public.organization_local_day(${org}::uuid) AS today`,
   );
   const today = day?.today ?? "";
-  const register = indexAccessions(org, {
-    accessions: [],
+  const holds = await source.holds(records.map((r) => r.id));
+  // Holds that can't be read refuse, never "none" (D-114).
+  if (holds === undefined) return refused(["accessions"], "unreadable_accessions", CANT_CHECK);
+  const register = indexAccessionHolds(org, {
+    holds,
     records,
-    identifierTypes: types.value,
     today,
   });
   // An empty day (the stored zone no longer known to PostgreSQL) makes
-  // indexAccessions refuse (invalid_today), so this refuses: never a guess.
+  // indexAccessionHolds refuse (invalid_today), so this refuses: never a guess.
   if (!register.ok) return refused(["accessions"], "unreadable_accessions", CANT_CHECK);
 
   return {
@@ -876,6 +884,8 @@ interface PublicSnapshotRow {
         former: readonly FormerRow[] | null;
       }[]
     | null;
+  /** The holds of the accessions behind these records (migration 0046, D-114). */
+  readonly accessionHolds?: unknown;
 }
 
 /**
@@ -919,6 +929,8 @@ function publicSource(org: OrganizationId, row: PublicSnapshotRow): SnapshotSour
       );
     },
     published: (ids) => Promise.resolve(ids.filter((id) => publicIds.has(id))),
+    // Computed by public_record_snapshot for exactly the records it returns.
+    holds: () => Promise.resolve(holdsFrom(row.accessionHolds)),
   };
 }
 

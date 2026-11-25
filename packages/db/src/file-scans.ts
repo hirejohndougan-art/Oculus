@@ -1,5 +1,5 @@
 /**
- * Virus scan results of stored content (S-040, D-113; migration 0044).
+ * Virus scan results of stored content (S-040, D-113; migration 0048).
  *
  * One row per organization and SHA-256: content is stored once however many
  * assets hold it (D-086), so its scan result is shared by all of them. The
@@ -36,7 +36,7 @@ export const FILE_SCAN_TABLE_PRIVILEGES: Readonly<Record<string, readonly string
     file_scan_events: Object.freeze(["INSERT"]),
   });
 
-/** A stored scan state (0044). */
+/** A stored scan state (0048). */
 export const SCAN_STATES = ["pending", "unscanned", "clean", "infected", "failed"] as const;
 export type ScanState = (typeof SCAN_STATES)[number];
 

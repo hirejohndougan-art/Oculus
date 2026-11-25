@@ -30,6 +30,8 @@ import { ALERT_NOTICE_TABLE_PRIVILEGES } from "./alert-notices.js";
 import { SESSION_TABLE_PRIVILEGES } from "./sessions.js";
 import { STORED_FILE_TABLE_PRIVILEGES } from "./stored-files.js";
 import { FILE_SCAN_TABLE_PRIVILEGES } from "./file-scans.js";
+import { ACCESSION_TABLE_PRIVILEGES } from "./accessions.js";
+import { STORAGE_TABLE_PRIVILEGES } from "./storage.js";
 import { sql } from "./sql.js";
 
 /**
@@ -86,8 +88,15 @@ export const WRITER_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Ob
   // nothing deletes them yet.
   ...STORED_FILE_TABLE_PRIVILEGES,
   // Virus scan results (S-040, D-113): queued, then moved along; never
-  // deleted, and an infected content never changed back (0044's guard).
+  // deleted, and an infected content never changed back (0048's guard).
   ...FILE_SCAN_TABLE_PRIVILEGES,
+  // Accessions and donor contacts (T-018c, D-114): accessions are made and
+  // changed, never deleted; a contact may be deleted. Their produced-records
+  // list and history are the migration's trigger's.
+  ...ACCESSION_TABLE_PRIVILEGES,
+  // Storage (T-018d, D-115): levels and locations made and changed, never
+  // deleted; moves insert only (a mistake is put right by a later move).
+  ...STORAGE_TABLE_PRIVILEGES,
   // The change log of people and roles (T-048, D-084): insert only.
   ...PEOPLE_TABLE_PRIVILEGES,
   // Two-step alert notices (D-085): one row per alert, only ever added.
@@ -430,7 +439,9 @@ async function checkRoleConnection(
                          || pg_catalog.oidvectortypes(p.proargtypes) || ')' AS name
                   FROM pg_catalog.pg_proc p
                   JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+                  -- A trigger function can't be called by itself (T-018c).
                   WHERE p.prosecdef AND ${profile.definers !== undefined}::boolean
+                    AND p.prorettype <> 'pg_catalog.trigger'::pg_catalog.regtype
                     AND pg_catalog.has_function_privilege(w.oid, p.oid, 'EXECUTE')) AS f
             WHERE f.name <> ALL(${[...(profile.definers ?? [])]}::text[])) AS definers,
            (NOT w.current

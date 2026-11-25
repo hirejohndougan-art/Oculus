@@ -120,3 +120,11 @@ export type {
   RoleCatalogEntry,
 } from "./people.js";
 export type { IncomingShare, ShareOperations, ShareSummary } from "./shares.js";
+export type {
+  AccessionOperations,
+  AccessionPage,
+  AccessionView,
+  DonorContactView,
+  SavedAccession,
+} from "./accessions.js";
+export type { RecordStorage, StorageOperations, StorageView } from "./storage.js";

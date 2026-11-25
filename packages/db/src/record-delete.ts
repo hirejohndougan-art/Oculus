@@ -21,6 +21,11 @@
  *   under `all_time`);
  * - `has_files`: files are attached to it (a digital asset, M-002, D-086);
  *   they are removed first, one by one, from its Files panel;
+ * - `in_accession`, `accession_source`: an accession lists it among what
+ *   it produced, or it is an accession's source agent or has a donor
+ *   contact (T-018c, D-114); the message names no accession;
+ * - `has_moves`, `storage_agent`: it has a storage history (T-018d, D-115),
+ *   or an outside storage location names it as its agent;
  * - `has_role_grants`: roles are granted for this unit's subtree (D-072);
  *   those grants are changed first (granting one locks the unit `FOR KEY
  *   SHARE` through its foreign key, so it waits for or blocks a deletion).
@@ -58,6 +63,8 @@ import {
 } from "./catalog.js";
 import type { Queryable } from "./client.js";
 import { validateRecordChange } from "./record-versions.js";
+import { accessionUses } from "./accessions.js";
+import { storageUses } from "./storage.js";
 import { sql } from "./sql.js";
 import { clearRecordTerms } from "./vocabularies.js";
 
@@ -245,6 +252,46 @@ export async function deleteRecord(
           ["recordId"],
           "has_role_grants",
           "Roles are granted for this unit and what is below it. Change those grants first.",
+        ),
+      );
+    }
+    // Accessions (T-018c, D-114): the foreign keys would refuse anyway; said
+    // first, naming no accession (the person may not see donors, D-036).
+    const accessions = await accessionUses(db, org, recordId);
+    if (accessions.produced) {
+      problems.push(
+        issue(
+          ["recordId"],
+          "in_accession",
+          "An accession lists this record among what it brought in. Take it off the accession first.",
+        ),
+      );
+    }
+    const storage = await storageUses(db, org, recordId);
+    if (storage.moves) {
+      problems.push(
+        issue(
+          ["recordId"],
+          "has_moves",
+          "This record has a storage history. Records that have moved are kept, so their history stays whole.",
+        ),
+      );
+    }
+    if (storage.agent) {
+      problems.push(
+        issue(
+          ["recordId"],
+          "storage_agent",
+          "A storage location outside the organization names this agent. Change that location first.",
+        ),
+      );
+    }
+    if (accessions.source) {
+      problems.push(
+        issue(
+          ["recordId"],
+          "accession_source",
+          "This agent is an accession's source or has donor contact details. Change those first.",
         ),
       );
     }
