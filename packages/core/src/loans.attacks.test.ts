@@ -351,9 +351,10 @@ describe("forged snapshots and borrowed moves", () => {
   });
 
   it("can't close a loan with items out, or mark it returned with a move from before", () => {
-    expect(codes(withLoan(BOOK, { ...loan(), status: "closed" }))).toEqual([
-      "closed_with_items_out",
-    ]);
+    // D-118: closing with an item out is a problem of the book, not of the loan alone.
+    const saved = ok(loanList(BOOK))[0];
+    if (saved === undefined) throw new Error("no loan");
+    expect(codes(withLoan(BOOK, { ...saved, status: "closed" }))).toEqual(["closed_unsettled"]);
     expect(
       problemCodes(
         indexLoans(LOG, [

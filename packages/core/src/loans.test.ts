@@ -248,7 +248,10 @@ describe("validateLoan", () => {
         status,
       );
     }
-    expect(codes(validateLoan(loanOut({ status: "closed" })))).toEqual(["closed_with_items_out"]);
+    // D-118: a loan closed with an item still out is a problem of the book.
+    const closed = loanOut({ status: "closed" });
+    expect(codes(validateLoan(closed))).toEqual([]);
+    expect(problemCodes(indexLoans(LOG, [closed]))).toEqual(["closed_unsettled"]);
   });
 });
 
@@ -267,7 +270,8 @@ describe("loan states and the move log", () => {
   });
 
   it("phases: agreed before anything moves, returned when everything is back", () => {
-    const agreed = loanOut({ items: [{ recordId: print }] });
+    // The map is home now (the print is at the borrower's: D-118 would flag it unlinked).
+    const agreed = loanOut({ items: [{ recordId: map }] });
     expect(ok(loanState(book([agreed]), agreed.id)).phase).toBe("agreed");
     const back = loanOut({
       items: [{ recordId: map, loanOutMoveId: mapOut.id, returnMoveId: mapBack.id }],
@@ -546,7 +550,10 @@ describe("indexLoans refuses loans that disagree with the move log", () => {
     const out = loanOut();
     const b = book([loanIn(), out]);
     expect(codes(withLoan(b, { ...loanIn(), id: out.id }))).toEqual(["direction_changed"]);
-    const bad = withLoan(b, { ...out, items: [{ recordId: print, loanOutMoveId: newMoveId() }] });
+    const bad = withLoan(b, {
+      ...out,
+      items: [{ recordId: print, loanOutMoveId: newMoveId() }, ...out.items.slice(1)],
+    });
     expect(bad.ok ? [] : bad.issues[0]?.path).toEqual(["items", 0, "loanOutMoveId"]);
   });
 });
@@ -774,11 +781,10 @@ describe("an overdue loan can't be hidden by editing it (review fixes)", () => {
       ],
     };
     expect(codes(withLoan(b, reopened))).toEqual(["link_removed"]);
-    // An item that is back may be taken off the loan.
-    const fewer = ok(
-      withLoan(b, { ...out, items: [{ recordId: print, loanOutMoveId: printOut.id }] }),
-    );
-    expect(ok(overdueLoans(fewer, "2026-11-23")).map((s) => s.loan.id)).toEqual([out.id]);
+    // D-118: no item comes off an agreed loan, even one that is back.
+    expect(
+      codes(withLoan(b, { ...out, items: [{ recordId: print, loanOutMoveId: printOut.id }] })),
+    ).toEqual(["item_removed"]);
     expect(ok(overdueLoans(b, "2026-11-23")).map((s) => s.loan.id)).toEqual([out.id]);
   });
 
@@ -790,6 +796,8 @@ describe("an overdue loan can't be hidden by editing it (review fixes)", () => {
     const state = ok(loanState(b, closed.id));
     expect(state.phase).toBe("unknown");
     expect(state.problems.map((p) => [p.code, p.path])).toEqual([
+      ["unlinked_loan_out", ["items", 0]],
+      ["closed_unsettled", ["items", 0]],
       ["closed_with_unlinked_move", ["items", 0]],
     ]);
     expect(ok(overdueLoans(b, "2026-11-23")).map((s) => s.loan.id)).toEqual([closed.id]);
@@ -809,7 +817,10 @@ describe("an overdue loan can't be hidden by editing it (review fixes)", () => {
         mapBack,
       ]),
     );
-    expect(problemCodes(indexLoans(elsewhere, [closed]))).toEqual([]);
+    // D-118: it was never sent on this loan, which must be said to close it.
+    expect(problemCodes(indexLoans(elsewhere, [closed]))).toEqual(["closed_unsettled"]);
+    const notSent = { ...closed, items: [{ recordId: print, notSent: true as const }, mapItem] };
+    expect(problemCodes(indexLoans(elsewhere, [notSent]))).toEqual([]);
   });
 
   it("lists loan_out moves no loan out names or extends", () => {
@@ -840,10 +851,16 @@ describe("an overdue loan can't be hidden by editing it (review fixes)", () => {
     const raced = book([unlinked]);
     const state = ok(loanState(raced, lin.id));
     expect(state.phase).toBe("unknown");
-    expect(state.problems.map((p) => p.code)).toEqual(["closed_without_departure"]);
+    expect(state.problems.map((p) => p.code)).toEqual(["unlinked_arrival", "closed_unsettled"]);
     expect(ok(overdueLoans(raced, "2027-04-01")).map((s) => s.loan.id)).toEqual([lin.id]);
-    // An item that never arrived (no move since the loan began) needs no departure.
-    const neverCame = loanIn({ ...closing, items: [{ recordId: newRecordId() }] });
+    // An item that never arrived is said so (D-118): it needs no departure.
+    const neverCame = loanIn({
+      ...closing,
+      items: [{ recordId: newRecordId(), notReceived: true }],
+    });
+    expect(
+      problemCodes(indexLoans(LOG, [{ ...neverCame, items: [{ recordId: newRecordId() }] }])),
+    ).toEqual(["closed_unsettled"]);
     expect(ok(loanState(book([neverCame]), neverCame.id)).phase).toBe("closed");
     // The ordinary way: it departs to the lender, the loan names it, then closes.
     const departure = move(lantern, lenderPlace.id, "2026-11-20", "departure");
@@ -856,8 +873,10 @@ describe("an overdue loan can't be hidden by editing it (review fixes)", () => {
     after = ok(withLoan(after, { ...linked, ...closing }));
     expect(ok(loanState(after, lin.id)).phase).toBe("closed");
     expect(ok(overdueLoans(after, "2027-06-01"))).toEqual([]);
-    // Once it has departed, the item may come off the loan.
-    expect(ok(withLoan(after, { ...linked, items: [{ recordId: newRecordId() }] })).size).toBe(1);
+    // D-118: it stays on the loan for good.
+    expect(codes(withLoan(after, { ...linked, items: [{ recordId: newRecordId() }] }))).toEqual([
+      "item_removed",
+    ]);
   });
 
   it("a link may be changed to another move that fits", () => {
