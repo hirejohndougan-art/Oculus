@@ -19,7 +19,12 @@
  *    numbers, a byte order mark, bad UTF-8 and bad percent-encoding refused.
  * 2. Limits (body.ts, routes.ts): counted in bytes, chunked bodies included:
  *    1 MiB by default, 8 KiB on credentials routes (sign-in, two-step, site
- *    password); routes can't choose their own.
+ *    password); routes can't choose their own. The one exception is an
+ *    upload route (M-002, D-086): `upload: { maxBytes }`, only body.ts
+ *    `UPLOAD_TYPES` (which no other route takes), the body never parsed or
+ *    buffered but streamed to the handler as `request.upload` and refused
+ *    with 413 once it passes `maxBytes`; an upload not read to its end gets
+ *    `Connection: close`.
  * 3. Paths (paths.ts): encoded slashes, backslashes, dots and unreserved
  *    characters, `.`/`..` segments, NUL and other control characters, double
  *    encoding and `//` refused with 400 in the first onRequest hook, before
@@ -74,6 +79,7 @@ import {
   DEFAULT_BODY_LIMIT,
   bodyHeaderProblem,
   registerBodyParsers,
+  uploadStreams,
 } from "./body.js";
 import { ADMIN_SECURITY_HEADERS, adminFileFor, type AdminFiles } from "./admin-files.js";
 import { cookieHeaderProblem, replyCookieProblem } from "./cookies.js";
@@ -96,6 +102,7 @@ import {
   routeConfig,
   routeOptionsProblem,
   type OculusRoute,
+  type OculusUpload,
 } from "./routes.js";
 
 /** Milliseconds. Node's defaults: no socket timeout, 300 s request, 60 s headers. */
@@ -237,6 +244,61 @@ function logLateFailure(request: FastifyRequest, fresh: Refusal, thrown: unknown
 }
 
 /**
+ * Upload requests whose body wasn't read to its end: their connection is
+ * closed after the reply (onSend adds `Connection: close`), so the rest of
+ * the body is never read into a keep-alive connection's next request.
+ */
+const unfinishedUploads = new WeakSet<FastifyRequest>();
+
+const CONTENT_LENGTH = /^[0-9]{1,16}$/;
+
+/**
+ * The upload view of an upload route's body (routes.ts `OculusUpload`): the
+ * bytes, counted as they arrive and refused past `maxBytes`, read once. The
+ * stream is iterated by hand and never `return`ed: a for-await loop that
+ * stopped early would destroy the request and with it the socket, so the
+ * 413 could never be sent.
+ */
+function uploadView(
+  request: FastifyRequest,
+  maxBytes: number,
+  signal: AbortSignal,
+): OculusUpload | undefined {
+  const stream = uploadStreams.get(request);
+  if (stream === undefined) return undefined;
+  uploadStreams.delete(request);
+  unfinishedUploads.add(request);
+  const length = request.headers["content-length"];
+  const declared =
+    typeof length === "string" && CONTENT_LENGTH.test(length) ? Number(length) : undefined;
+  const contentType = (request.headers["content-type"] ?? "").toLowerCase();
+  let taken = false;
+  return Object.freeze({
+    contentType,
+    declaredBytes: declared,
+    chunks(): AsyncIterable<Uint8Array> {
+      if (taken) throw new Error("an upload's bytes can be read once");
+      taken = true;
+      const iterator = stream[Symbol.asyncIterator]();
+      return (async function* bytes() {
+        let total = 0;
+        for (;;) {
+          if (signal.aborted) throw new Error("the request has ended");
+          const next = await iterator.next();
+          if (next.done === true) break;
+          const chunk: unknown = next.value;
+          if (!(chunk instanceof Uint8Array)) throw new Error("an upload chunk is bytes");
+          total += chunk.byteLength;
+          if (total > maxBytes) throw new Refusal(413, "payload_too_large");
+          yield chunk;
+        }
+        unfinishedUploads.delete(request);
+      })();
+    },
+  });
+}
+
+/**
  * Registers one application route (already checked and copied by
  * `checkRoute`). Whatever the handler throws or rejects with is caught here
  * and replaced by a fresh Refusal (errors.ts), so no value of the handler's
@@ -270,10 +332,14 @@ function addRoute(app: FastifyInstance, route: OculusRoute): void {
       if (response.writableEnded || response.destroyed) stop();
       else response.once("close", stop);
       const ended = (): boolean => controller.signal.aborted || reply.sent;
+      const upload =
+        route.upload === undefined
+          ? undefined
+          : uploadView(request, route.upload.maxBytes, controller.signal);
       let body: unknown;
       try {
         const result: unknown = await handler(
-          oculusRequest(request, controller.signal),
+          oculusRequest(request, controller.signal, upload),
           oculusReply(reply, () => running),
         );
         // Copied as plain data before Fastify sees it: a Response, stream or
@@ -502,6 +568,8 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
     }
     const headers = adminReplies.has(request) ? ADMIN_SECURITY_HEADERS : SECURITY_HEADERS;
     for (const [name, value] of Object.entries(headers)) void reply.header(name, value);
+    // An upload not read to its end (refused before or while streaming).
+    if (unfinishedUploads.has(request)) void reply.header("connection", "close");
     return payload;
   });
 

@@ -24,6 +24,7 @@ import type { Queryable } from "./client.js";
 import { PASSWORD_RESET_TABLE_PRIVILEGES } from "./password-resets.js";
 import { SECOND_FACTOR_TABLE_PRIVILEGES } from "./second-factor.js";
 import { SESSION_TABLE_PRIVILEGES } from "./sessions.js";
+import { STORED_FILE_TABLE_PRIVILEGES } from "./stored-files.js";
 import { sql } from "./sql.js";
 
 /**
@@ -74,6 +75,9 @@ export const WRITER_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Ob
   // recovery codes written (codes also used and superseded); the wrong-code
   // counters. Nothing deletes a factor, a pass or a recovery code.
   ...SECOND_FACTOR_TABLE_PRIVILEGES,
+  // Stored files (M-002, D-086): attached by INSERT; rows never change and
+  // nothing deletes them yet.
+  ...STORED_FILE_TABLE_PRIVILEGES,
 });
 
 /**

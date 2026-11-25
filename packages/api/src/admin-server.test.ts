@@ -23,11 +23,15 @@ let db: Database;
 let dir: string;
 let files: AdminFiles;
 
+/** The files folder every server here uses (M-002, D-086). */
+const filesDir = mkdtempSync(join(tmpdir(), "oculus-admin-files-"));
+
 const DEV = {
   NODE_ENV: "development",
   OCULUS_ORIGINS: "http://localhost,http://127.0.0.1:3001",
   OCULUS_ADMIN_ORIGIN: "http://localhost",
   OCULUS_SECRET_KEY: FAKE_TEST_SECRET_KEY,
+  OCULUS_FILES_DIR: filesDir,
 };
 
 beforeAll(async () => {
@@ -46,6 +50,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   rmSync(dir, { recursive: true, force: true });
+  rmSync(filesDir, { recursive: true, force: true });
   await db.close();
   await testDb.drop();
 });
@@ -113,6 +118,33 @@ describe("the startup checks", () => {
     expect(clientAddressProblem({ OCULUS_CLIENT_ADDRESS: "direct" })).toBeUndefined();
     expect(clientAddressProblem({ OCULUS_CLIENT_ADDRESS: "yes" })).toMatch(/only be "direct"/);
     expect(clientAddressProblem({ NODE_ENV: "development" })).toBeUndefined();
+  });
+
+  it("refuses to start without a usable files folder or with bad caps, never showing them", async () => {
+    for (const value of [undefined, "", "relative/files", join(filesDir, "missing")]) {
+      const failure = await buildAdminServer({
+        db,
+        env: { ...DEV, OCULUS_FILES_DIR: value },
+        adminFiles: files,
+      }).catch((error: unknown) => error);
+      expect(String(failure)).toMatch(/OCULUS_FILES_DIR/);
+      if (value !== undefined && value !== "") expect(String(failure)).not.toContain(value);
+    }
+    const plainFile = join(filesDir, "not-a-folder");
+    writeFileSync(plainFile, "x");
+    await expect(
+      buildAdminServer({ db, env: { ...DEV, OCULUS_FILES_DIR: plainFile }, adminFiles: files }),
+    ).rejects.toThrow(/OCULUS_FILES_DIR/);
+    for (const [name, value] of [
+      ["OCULUS_FILE_MAX_MIB", "0"],
+      ["OCULUS_FILE_MAX_MIB", "1.5"],
+      ["OCULUS_FILES_TOTAL_MAX_MIB", "99999999"],
+      ["OCULUS_FILES_TOTAL_MAX_MIB", "-3"],
+    ] as const) {
+      await expect(
+        buildAdminServer({ db, env: { ...DEV, [name]: value }, adminFiles: files }),
+      ).rejects.toThrow(new RegExp(name));
+    }
   });
 
   it("refuses to start without a usable secret key, never showing it", async () => {

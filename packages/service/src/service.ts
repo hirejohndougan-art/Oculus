@@ -128,6 +128,8 @@ import {
 } from "./access.js";
 import { adminOperations, type AdminOperations } from "./admin.js";
 import { definitionOperations, type DefinitionOperations } from "./definitions.js";
+import type { FileStore } from "./file-store.js";
+import { fileOperations, type FileOperations } from "./files.js";
 import {
   changeWorkflowState,
   checkWriterConnection,
@@ -353,6 +355,11 @@ export interface ServiceOptions {
    * `search_timeout`. Default 5,000; 1 to 30,000.
    */
   readonly searchTimeoutMs?: number;
+  /**
+   * The file store (M-002, D-086, `openFileStore`). Without one, attaching
+   * files is refused as `files_unavailable`; listing still works.
+   */
+  readonly files?: FileStore;
 }
 
 /** What `checkRecord` returns: core's issues for the draft as it would be saved now. */
@@ -444,7 +451,7 @@ export interface ReviewQueue {
 export const MAX_VERSION_PAGE = 100;
 
 /** The service: every write of a record and its related rows, and who may make them. */
-export interface RecordService extends AdminOperations, DefinitionOperations {
+export interface RecordService extends AdminOperations, DefinitionOperations, FileOperations {
   /** The record as stored, for someone who may view it (`records.view`). */
   readRecord(context: ServiceContext, recordId: RecordId): Promise<ServiceResult<ReadRecord>>;
   /**
@@ -2917,6 +2924,13 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
 
     ...adminOperations(run),
     ...definitionOperations(run),
+    ...fileOperations(
+      run,
+      (tx, who, recordId, rowLock, all, any) =>
+        mayChange(tx, { ...who, siteId: null }, recordId, rowLock, all, any),
+      options.files,
+      clock,
+    ),
     submitForReview: workflowAction("submit_for_review"),
     returnToDraft: workflowAction("return_to_draft"),
     publish: workflowAction("publish"),

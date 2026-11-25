@@ -141,3 +141,79 @@ export function waitText(seconds: number): string {
   const minutes = Math.ceil(seconds / 60);
   return minutes === 1 ? "about a minute" : `about ${String(minutes)} minutes`;
 }
+
+export interface UploadOptions {
+  /** The record's version the upload starts from: `If-Match: "v<n>"`. */
+  readonly ifMatch: number;
+  /** The working site (`X-Oculus-Site`). */
+  readonly site: string;
+  /** Called as bytes go out. */
+  readonly onProgress?: (sent: number, total: number) => void;
+  /** Aborting cancels the upload (`ApiError` with code `cancelled`). */
+  readonly signal?: AbortSignal;
+}
+
+const SIMPLE_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/;
+
+/**
+ * Uploads one file's bytes (M-002, D-086) to an upload route, with
+ * progress: `XMLHttpRequest`, since `fetch` reports no upload progress.
+ * The body is the file as it is, `application/octet-stream`; its name goes
+ * percent-encoded in `X-Oculus-File-Name` and the browser's guess at its
+ * type in `X-Oculus-File-Type` (a hint only: the server sniffs the bytes).
+ * Same origin, the CSRF header and `If-Match`, as `api()`.
+ */
+export function uploadFile<T>(path: string, file: File, options: UploadOptions): Promise<T> {
+  if (!path.startsWith("/api/")) throw new Error("uploadFile() reaches /api/ paths only");
+  return new Promise<T>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", path);
+    xhr.setRequestHeader("accept", "application/json");
+    xhr.setRequestHeader("content-type", "application/octet-stream");
+    if (csrfToken !== undefined) xhr.setRequestHeader("x-oculus-csrf", csrfToken);
+    xhr.setRequestHeader("if-match", `"v${String(options.ifMatch)}"`);
+    xhr.setRequestHeader("x-oculus-site", options.site);
+    xhr.setRequestHeader("x-oculus-file-name", encodeURIComponent(file.name));
+    const type = file.type.toLowerCase();
+    if (SIMPLE_TYPE.test(type)) xhr.setRequestHeader("x-oculus-file-type", type);
+    xhr.upload.onprogress = (event) => {
+      options.onProgress?.(event.loaded, event.lengthComputable ? event.total : file.size);
+    };
+    const abort = () => {
+      xhr.abort();
+    };
+    options.signal?.addEventListener("abort", abort, { once: true });
+    const done = () => {
+      options.signal?.removeEventListener("abort", abort);
+    };
+    xhr.onabort = () => {
+      done();
+      reject(new ApiError(0, "cancelled", {}));
+    };
+    xhr.onerror = () => {
+      done();
+      reject(new ApiError(0, "network_error", {}));
+    };
+    xhr.onload = () => {
+      done();
+      let body: unknown;
+      try {
+        body = xhr.responseText === "" ? null : (JSON.parse(xhr.responseText) as unknown);
+      } catch {
+        body = null;
+      }
+      if (xhr.status < 200 || xhr.status > 299) {
+        const record = isRecord(body) ? body : {};
+        const code = typeof record.error === "string" ? record.error : "unexpected_reply";
+        reject(new ApiError(xhr.status, code, record));
+        return;
+      }
+      resolve(body as T);
+    };
+    if (options.signal?.aborted === true) {
+      reject(new ApiError(0, "cancelled", {}));
+      return;
+    }
+    xhr.send(file);
+  });
+}

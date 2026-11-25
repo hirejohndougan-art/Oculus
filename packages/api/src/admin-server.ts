@@ -18,7 +18,11 @@
  *   sender). In development, the default only logs that a link was made,
  *   never the token or the address (D-068's secrecy rule);
  * - `OCULUS_ADMIN_ORIGIN` is set but isn't one of `OCULUS_ORIGINS`, or the
- *   admin build can't be read.
+ *   admin build can't be read;
+ * - `OCULUS_FILES_DIR` (M-002, D-086) is missing, not an absolute path, or
+ *   not an existing writable directory, or the caps `OCULUS_FILE_MAX_MIB`
+ *   (default 500) or `OCULUS_FILES_TOTAL_MAX_MIB` (per organization,
+ *   default 20480) aren't whole numbers in range.
  *
  * It warns loudly (a `startup_warning` log record) when the database
  * server's `log_parameter_max_length_on_error` is above 0, since pg's
@@ -31,7 +35,7 @@
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { loadSecretKeyring, sql, type Database, type PasswordResetDelivery } from "@oculus/db";
-import { createService } from "@oculus/service";
+import { createService, openFileStore, type FileStore } from "@oculus/service";
 import type { FastifyInstance } from "fastify";
 import { ADMIN_ORIGIN_ENV, loadAdminFiles, type AdminFiles } from "./admin-files.js";
 import { trustedProxyFromEnv } from "./proxy.js";
@@ -40,6 +44,54 @@ import { signInRoutes, type SignInApiOptions } from "./sign-in-api.js";
 import { serviceErrorLogger, staffApiRoutes, type ApiLogRecord } from "./staff-api.js";
 
 export const CLIENT_ADDRESS_ENV = "OCULUS_CLIENT_ADDRESS";
+export const FILES_DIR_ENV = "OCULUS_FILES_DIR";
+export const FILE_MAX_ENV = "OCULUS_FILE_MAX_MIB";
+export const FILES_TOTAL_MAX_ENV = "OCULUS_FILES_TOTAL_MAX_MIB";
+
+/** A cap in MiB from the environment, as bytes; throws naming the variable, never the value. */
+function mibFromEnv(
+  env: Readonly<Record<string, string | undefined>>,
+  name: string,
+): number | undefined {
+  const text = env[name];
+  if (text === undefined || text.trim() === "") return undefined;
+  if (!/^[1-9][0-9]{0,6}$/.test(text.trim())) {
+    throw new Error(`refusing to start: ${name} must be a whole number of MiB from 1 to 1048576.`);
+  }
+  const mib = Number(text.trim());
+  if (mib > 1_048_576) {
+    throw new Error(`refusing to start: ${name} must be a whole number of MiB from 1 to 1048576.`);
+  }
+  return mib * 1024 * 1024;
+}
+
+/**
+ * The file store from `OCULUS_FILES_DIR` and the two caps (D-086). Refuses
+ * (throws) without the folder: uploads are part of the admin.
+ */
+export async function fileStoreFromEnv(
+  env: Readonly<Record<string, string | undefined>>,
+): Promise<FileStore> {
+  const dir = env[FILES_DIR_ENV];
+  if (dir === undefined || dir.trim() === "") {
+    throw new Error(`refusing to start: ${FILES_DIR_ENV} must name the folder files are kept in.`);
+  }
+  const maxFileBytes = mibFromEnv(env, FILE_MAX_ENV);
+  const maxOrganizationBytes = mibFromEnv(env, FILES_TOTAL_MAX_ENV);
+  try {
+    return await openFileStore({
+      dir,
+      ...(maxFileBytes === undefined ? {} : { maxFileBytes }),
+      ...(maxOrganizationBytes === undefined ? {} : { maxOrganizationBytes }),
+    });
+  } catch (error) {
+    // openFileStore's messages name no path.
+    throw new Error(
+      `refusing to start: ${FILES_DIR_ENV}: ${error instanceof Error ? error.message : "unusable"}`,
+      { cause: error },
+    );
+  }
+}
 
 /** Where the admin build is, from this file (dist or src, both two levels under the repo's packages). */
 export const DEFAULT_ADMIN_DIR = join(
@@ -151,9 +203,10 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     log({ event: "startup_warning", code: "database_unreadable" });
   }
 
-  const service = createService(options.db, { onError: serviceErrorLogger(log) });
+  const files = await fileStoreFromEnv(env);
+  const service = createService(options.db, { onError: serviceErrorLogger(log), files });
   const routes = [
-    ...staffApiRoutes({ db: options.db, service, log }),
+    ...staffApiRoutes({ db: options.db, service, log, files }),
     ...signInRoutes({
       db: options.db,
       keys,

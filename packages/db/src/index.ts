@@ -328,3 +328,14 @@ export {
   MAX_ORGANIZATION_CHOICES,
 } from "./sign-in-screens.js";
 export type { PendingSignInState, OrganizationChoice, SignedInPerson } from "./sign-in-screens.js";
+export {
+  STORED_FILE_TABLE_PRIVILEGES,
+  MAX_FILES_PER_LIST,
+  findStoredFile,
+  insertStoredFile,
+  listStoredFiles,
+  lockOrganizationFiles,
+  organizationFileBytes,
+  organizationHasContent,
+} from "./stored-files.js";
+export type { NewStoredFile, StoredFile } from "./stored-files.js";

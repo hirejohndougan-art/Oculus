@@ -7,7 +7,8 @@
 // invented addresses, password and record title to OCULUS_E2E_SEED for the
 // tests. Everything is stopped and deleted on SIGTERM or SIGINT.
 import { randomBytes } from "node:crypto";
-import { rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { newOrganizationId } from "@oculus/core";
 import {
@@ -29,6 +30,10 @@ const seedFile = process.env.OCULUS_E2E_SEED;
 if (seedFile === undefined) throw new Error("OCULUS_E2E_SEED is not set");
 
 const database = startTestDatabase({ bin: findPostgresBin() });
+// Uploaded files go here (M-002, D-086): OCULUS_FILES_DIR if given, else a
+// fresh folder under the temporary directory, deleted on stop.
+const ownFilesDir = process.env.OCULUS_FILES_DIR === undefined;
+const filesDir = process.env.OCULUS_FILES_DIR ?? mkdtempSync(join(tmpdir(), "oculus-e2e-files-"));
 let app;
 let db;
 const stop = async () => {
@@ -38,6 +43,7 @@ const stop = async () => {
   } finally {
     database.stop();
     rmSync(seedFile, { force: true });
+    if (ownFilesDir) rmSync(filesDir, { recursive: true, force: true });
     process.exit(0);
   }
 };
@@ -113,6 +119,31 @@ try {
       scope: null,
     }),
   );
+  // A scanner on the site (attaches files to digital assets, M-002).
+  const scannerEmail = "scanner@example.org";
+  must(
+    await createInvitation(db, { organizationId, email: scannerEmail, invitedBy: root }, (m) => {
+      box.push(m);
+      return Promise.resolve();
+    }),
+  );
+  const scanner = must(
+    await acceptInvitation(db, {
+      token: box[2].token,
+      organizationId,
+      email: scannerEmail,
+      displayName: "Lin Invented",
+      password: PASSWORD,
+    }),
+  ).userId;
+  must(
+    await service.grantRole(actor, {
+      userId: scanner,
+      role: "scanner",
+      siteId: site.id,
+      scope: null,
+    }),
+  );
   // An object template and one invented record on the site.
   const field = (key, label, kind, extra = {}) => ({
     key,
@@ -156,6 +187,29 @@ try {
       },
     ),
   );
+  // A digital asset template and one invented asset (no files yet).
+  must(
+    await insertTemplateVersion(db, {
+      key: "photo",
+      organizationId,
+      label: "Photograph",
+      appliesTo: ["digital_asset"],
+      fields: [field("rights", "Rights statement", "rights"), field("caption", "Caption", "text")],
+    }),
+  );
+  const assetTitle = "Invented depot photograph";
+  must(
+    await service.createRecord(
+      { ...actor, siteId: site.id },
+      {
+        kind: "digital_asset",
+        mediaType: "image/png",
+        title: assetTitle,
+        templateKey: "photo",
+        fields: { rights: { uri: "http://rightsstatements.org/vocab/InC/1.0/" } },
+      },
+    ),
+  );
   const origin = `http://localhost:${String(port)}`;
   app = await buildAdminServer({
     db,
@@ -165,6 +219,7 @@ try {
       OCULUS_ADMIN_ORIGIN: origin,
       // A fresh random key for this throwaway run only; never stored.
       OCULUS_SECRET_KEY: randomBytes(32).toString("base64url"),
+      OCULUS_FILES_DIR: filesDir,
     },
     adminDir: join(import.meta.dirname, "..", "dist"),
     log: () => undefined,
@@ -175,9 +230,11 @@ try {
     JSON.stringify({
       email,
       editorEmail,
+      scannerEmail,
       password: PASSWORD,
       siteName: "Invented Archive",
       recordTitle,
+      assetTitle,
     }),
   );
 } catch (error) {

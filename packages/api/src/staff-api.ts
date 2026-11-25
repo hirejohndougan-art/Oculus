@@ -57,13 +57,21 @@
  * there), and `GET /api/records/:id` says what the person may do with the
  * record (`can`) and what it inherits (`inherited`).
  *
+ * Files (M-002, D-086): `POST /api/records/:id/files` streams one file's
+ * bytes to the file store (an upload route: its own type list, the cap
+ * counted as it streams), after the session, CSRF, `If-Match` and the
+ * asset's edit permission are checked and before a byte is read; `GET
+ * /api/records/:id/files` lists an asset's files. Never the bytes (M-003).
+ *
  * Not here: signing in, the second step, password reset and signing out
  * (T-045 adds those routes beside these, with `credentials: true` for the
  * 8 KiB limit, and writes the cookie through the reply's cookie writer).
  */
 import {
   checkCsrfToken,
+  cleanFileName,
   csrfTokenFor,
+  isClaimedMediaType,
   isSiteId,
   issue,
   type Issue,
@@ -72,6 +80,7 @@ import {
 import { resolveSession, type FullSession, type Queryable } from "@oculus/db";
 import {
   contextFromSession,
+  type FileStore,
   type RecordService,
   type ServiceContext,
   type ServiceRefusal,
@@ -110,7 +119,20 @@ export interface StaffApiOptions {
   readonly rateLimits?: Partial<Record<RateBucket, number>>;
   /** The limiter's clock (tests). */
   readonly clock?: () => number;
+  /**
+   * The file store (M-002, D-086), the same one the service was made with
+   * (`createService(db, { files })`). Without one, uploads answer `503
+   * files_unavailable`.
+   */
+  readonly files?: FileStore;
 }
+
+/** The headers carrying an upload's original name (percent-encoded UTF-8) and claimed type. */
+export const FILE_NAME_HEADER = "x-oculus-file-name";
+export const FILE_TYPE_HEADER = "x-oculus-file-type";
+
+/** An upload's name when the client gives none. */
+const UNNAMED_FILE = "untitled";
 
 /** The header carrying the CSRF token on every change. */
 export const CSRF_HEADER = "x-oculus-csrf";
@@ -281,6 +303,52 @@ function optionalBody(
   const body = objectBody(request);
   const extra = onlyKeys(body, allowed, reply);
   return extra ?? { body };
+}
+
+/**
+ * An upload's original name from `X-Oculus-File-Name` (percent-encoded
+ * UTF-8, as `encodeURIComponent` writes it), cleaned by core's
+ * `cleanFileName`: metadata only, never part of a path. `400 bad_file_name`
+ * when it can't be decoded or kept.
+ */
+function uploadName(request: OculusRequest): string {
+  const raw = request.headers[FILE_NAME_HEADER];
+  if (raw === undefined) return UNNAMED_FILE;
+  let decoded: string;
+  try {
+    if (raw.length > 2048) throw new Error("too long");
+    decoded = decodeURIComponent(raw);
+  } catch {
+    throw new Refusal(400, "bad_file_name");
+  }
+  const name = cleanFileName(decoded);
+  if (name === undefined) throw new Refusal(400, "bad_file_name");
+  return name;
+}
+
+/**
+ * The type the client claims for an upload: `X-Oculus-File-Type`, else the
+ * request's own type unless it is `application/octet-stream`. A hint, kept
+ * beside the type sniffed from the bytes; `400 bad_file_type` when malformed.
+ */
+function claimedType(request: OculusRequest, contentType: string): string | undefined {
+  const raw = request.headers[FILE_TYPE_HEADER];
+  if (raw === undefined) {
+    return contentType === "application/octet-stream" ? undefined : contentType;
+  }
+  const type = raw.trim().toLowerCase();
+  if (type === "") return undefined;
+  if (!isClaimedMediaType(type)) throw new Refusal(400, "bad_file_type");
+  return type;
+}
+
+/** The file codes of the service, as HTTP refusals; `undefined` for anything else. */
+function fileRefusal(result: ServiceRefusal): Refusal | undefined {
+  const codes = new Set(result.issues.map((i) => i.code));
+  if (codes.has("files_unavailable")) return new Refusal(503, "files_unavailable");
+  if (codes.has("file_too_large")) return new Refusal(413, "payload_too_large");
+  if (codes.has("quota_exceeded")) return new Refusal(413, "quota_exceeded");
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -456,7 +524,75 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
     };
   }
 
+  const files = options.files;
+  // The route's own streaming cap is the store's per-file cap (D-086).
+  const uploadLimit = files?.maxFileBytes ?? 1;
+
   return [
+    {
+      // Attach a file to a digital asset (M-002, D-086): the body is the
+      // file's bytes, streamed to disk, never buffered. Everything about the
+      // person and the asset is checked before a byte is read.
+      method: "POST",
+      path: "/api/records/:id/files",
+      upload: { maxBytes: uploadLimit },
+      handler: signedIn("write", true, async (request, reply, { context }) => {
+        const expectedVersion = ifMatchVersion(request);
+        const upload = request.upload;
+        if (upload === undefined) throw new Refusal(400, "bad_body");
+        const name = uploadName(request);
+        const claimed = claimedType(request, upload.contentType);
+        if (files === undefined) throw new Refusal(503, "files_unavailable");
+        const id = recordId(request);
+        const declared = upload.declaredBytes;
+        if (declared === 0) throw new Refusal(400, "empty_file");
+        const check = await service.mayAttachFile(context, id, {
+          expectedVersion,
+          ...(declared === undefined ? {} : { declaredBytes: declared }),
+        });
+        if (!check.ok) {
+          const fixed = fileRefusal(check);
+          if (fixed !== undefined) throw fixed;
+          return refused(check, reply, log);
+        }
+        const received = await files.receive(
+          context.organizationId,
+          upload.chunks(),
+          request.signal,
+        );
+        if (!received.ok) {
+          throw received.code === "empty_file"
+            ? new Refusal(400, "empty_file")
+            : new Refusal(413, "payload_too_large");
+        }
+        const result = await service.attachFile(context, id, received.file, {
+          expectedVersion,
+          name,
+          ...(claimed === undefined ? {} : { claimedType: claimed }),
+        });
+        if (!result.ok) {
+          const fixed = fileRefusal(result);
+          if (fixed !== undefined) throw fixed;
+          return refused(result, reply, log);
+        }
+        reply.status(result.value.created ? 201 : 200);
+        return { file: result.value.file, created: result.value.created };
+      }),
+    },
+    {
+      // The asset's files: name, size, sniffed type, who and when. Never
+      // the bytes (viewing and download are M-003's).
+      method: "GET",
+      path: "/api/records/:id/files",
+      handler: signedIn("read", false, async (request, reply, { context }) => {
+        const result = await service.listFiles(context, recordId(request));
+        return answer(result, reply, (value) => ({
+          files: value,
+          // So the admin can refuse a file that's too large before sending it.
+          maxFileBytes: files?.maxFileBytes ?? null,
+        }));
+      }),
+    },
     {
       method: "GET",
       path: "/api/session",

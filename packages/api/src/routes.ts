@@ -76,8 +76,34 @@ export const REQUEST_HEADERS = [
   "user-agent",
   "x-oculus-csrf",
   "x-oculus-site",
+  // An upload's original file name (percent-encoded UTF-8) and the type the
+  // client claims for it (M-002, D-086): metadata, checked by the handler.
+  "x-oculus-file-name",
+  "x-oculus-file-type",
 ] as const;
 export type RequestHeaderName = (typeof REQUEST_HEADERS)[number];
+
+/** The most an upload route may take in one request: 1 TiB (stored files' own limit). */
+export const MAX_UPLOAD_BYTES = 1024 ** 4;
+
+/**
+ * An upload route's body (M-002, D-086): its bytes as they arrive, never the
+ * stream itself (from which the socket and the server are one step away).
+ */
+export interface OculusUpload {
+  /** The request's Content-Type, lower case: one of body.ts `UPLOAD_TYPES`. */
+  readonly contentType: string;
+  /** The Content-Length the client declared, if any (chunked bodies have none). */
+  readonly declaredBytes: number | undefined;
+  /**
+   * The body's bytes, in order, once (a second call throws). Throws a 413
+   * `payload_too_large` Refusal as soon as the bytes pass the route's
+   * `upload.maxBytes`, and an error if the client goes away mid-body.
+   * Stopping early (a `break`, or not reading) is allowed: the connection
+   * is closed after the reply.
+   */
+  chunks(): AsyncIterable<Uint8Array>;
+}
 
 /** What a handler sees of the request: plain, frozen data. */
 export interface OculusRequest {
@@ -103,6 +129,8 @@ export interface OculusRequest {
    * with side effects (writes, outbound requests) should stop.
    */
   readonly signal: AbortSignal;
+  /** On an upload route only: the body as bytes. */
+  readonly upload?: OculusUpload;
 }
 
 export interface OculusRoute {
@@ -113,6 +141,13 @@ export interface OculusRoute {
   readonly form?: boolean;
   /** A sign-in, two-step or site password post: the 8 KiB body limit. */
   readonly credentials?: boolean;
+  /**
+   * An upload route (POST or PUT only, not a form or credentials route):
+   * the body is one of body.ts `UPLOAD_TYPES`, streamed to the handler as
+   * `request.upload`, never parsed or buffered, and refused past `maxBytes`
+   * (1 to `MAX_UPLOAD_BYTES`) while it streams.
+   */
+  readonly upload?: { readonly maxBytes: number };
   /**
    * Returns the body to send: plain data is sent as JSON, a string as it is,
    * `undefined` sends nothing. Anything else is a 500.
@@ -125,6 +160,7 @@ const ROUTE_KEYS: ReadonlySet<string> = new Set([
   "path",
   "form",
   "credentials",
+  "upload",
   "handler",
 ]);
 
@@ -145,6 +181,7 @@ export function checkRoute(route: unknown): OculusRoute {
   const path = r.path;
   const form = r.form;
   const credentials = r.credentials;
+  const upload = r.upload;
   const handler = r.handler;
   if (typeof method !== "string" || !ROUTE_METHODS.includes(method as RouteMethod)) {
     throw new Error(`route method not allowed: ${String(method)}`);
@@ -159,11 +196,37 @@ export function checkRoute(route: unknown): OculusRoute {
     }
   }
   if (typeof handler !== "function") throw new Error("route handler must be a function");
+  let maxBytes: number | undefined;
+  if (upload !== undefined) {
+    if (typeof upload !== "object" || upload === null) throw new Error("route upload is an object");
+    const keys = Object.keys(upload);
+    if (keys.length !== 1 || keys[0] !== "maxBytes") {
+      throw new Error("route upload has maxBytes only");
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(upload, "maxBytes");
+    const value: unknown =
+      descriptor !== undefined && "value" in descriptor ? descriptor.value : undefined;
+    if (
+      typeof value !== "number" ||
+      !Number.isSafeInteger(value) ||
+      value < 1 ||
+      value > MAX_UPLOAD_BYTES
+    ) {
+      throw new Error(
+        `route upload.maxBytes is a whole number from 1 to ${String(MAX_UPLOAD_BYTES)}`,
+      );
+    }
+    if ((method !== "POST" && method !== "PUT") || form === true || credentials === true) {
+      throw new Error("an upload route is a POST or PUT, not a form or credentials route");
+    }
+    maxBytes = value;
+  }
   return Object.freeze({
     method: method as RouteMethod,
     path,
     form: form === true,
     credentials: credentials === true,
+    ...(maxBytes === undefined ? {} : { upload: Object.freeze({ maxBytes }) }),
     handler: handler as OculusRoute["handler"],
   });
 }
@@ -189,7 +252,11 @@ function textEntries(source: unknown): [string, string | readonly string[]][] {
 }
 
 /** The frozen request view handed to handlers; holds no reference to Fastify or Node objects. */
-export function oculusRequest(request: FastifyRequest, signal: AbortSignal): OculusRequest {
+export function oculusRequest(
+  request: FastifyRequest,
+  signal: AbortSignal,
+  upload?: OculusUpload,
+): OculusRequest {
   const headers: Partial<Record<RequestHeaderName, string>> = {};
   for (const name of REQUEST_HEADERS) {
     const value: unknown = request.headers[name];
@@ -215,6 +282,7 @@ export function oculusRequest(request: FastifyRequest, signal: AbortSignal): Ocu
     headers: Object.freeze(headers),
     cookies: Object.freeze(cookies),
     signal,
+    ...(upload === undefined ? {} : { upload }),
   });
 }
 
@@ -383,7 +451,11 @@ export function oculusReply(reply: FastifyReply, open: () => boolean = () => tru
 /** The frozen `config` a route is registered with; body.ts reads `oculus` from it. */
 export function routeConfig(route: OculusRoute): { readonly oculus: OculusRouteConfig } {
   return Object.freeze({
-    oculus: Object.freeze({ form: route.form === true, credentials: route.credentials === true }),
+    oculus: Object.freeze({
+      form: route.form === true,
+      credentials: route.credentials === true,
+      ...(route.upload === undefined ? {} : { upload: true }),
+    }),
   });
 }
 

@@ -27,6 +27,7 @@ import { ApiError, api, problemText } from "../api";
 import { Button, Note, TextLink } from "../components/ui";
 import { Choice, ConfirmPanel, StatePill, TextInput } from "./controls";
 import { FieldInput } from "./FieldInput";
+import { FilesPanel } from "./FilesPanel";
 import { HistoryPanel } from "./HistoryPanel";
 import {
   AGENT_TYPES,
@@ -840,6 +841,15 @@ function Editor(props: EditorProps) {
             </p>
           </ConfirmPanel>
         </form>
+
+        {reply?.record.kind === "digital_asset" ? (
+          <FilesPanel
+            siteId={siteId}
+            recordId={reply.record.id}
+            version={reply.version}
+            canUpload={can.edit}
+          />
+        ) : null}
 
         {reply !== undefined && can.history ? (
           <HistoryPanel

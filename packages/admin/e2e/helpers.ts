@@ -12,9 +12,11 @@ import { decodeBase32, totpAt } from "@oculus/core";
 export interface Seed {
   readonly email: string;
   readonly editorEmail: string;
+  readonly scannerEmail: string;
   readonly password: string;
   readonly siteName: string;
   readonly recordTitle: string;
+  readonly assetTitle: string;
 }
 
 export function seed(): Seed {

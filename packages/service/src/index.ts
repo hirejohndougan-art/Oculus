@@ -38,3 +38,11 @@ export type {
 export { contextFromSession, NOT_PERMITTED_MESSAGE } from "./access.js";
 export type { SessionLike } from "./access.js";
 export type { AdminOperations, MyAccess, RoleRequest } from "./admin.js";
+export {
+  openFileStore,
+  DEFAULT_MAX_FILE_BYTES,
+  DEFAULT_MAX_ORGANIZATION_BYTES,
+  MAX_CAP_BYTES,
+} from "./file-store.js";
+export type { FileStore, FileStoreOptions, ReceivedFile, ReceiveResult } from "./file-store.js";
+export type { AttachCheck, AttachOptions, AttachedFile, FileOperations } from "./files.js";

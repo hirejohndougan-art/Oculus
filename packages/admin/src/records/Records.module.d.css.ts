@@ -29,6 +29,7 @@ declare const styles: {
   readonly parts: string;
   readonly pill: string;
   readonly popover: string;
+  readonly progress: string;
   readonly search: string;
   readonly searchField: string;
   readonly sectionTitle: string;
@@ -38,6 +39,9 @@ declare const styles: {
   readonly tableWrap: string;
   readonly tag: string;
   readonly textarea: string;
+  readonly upload: string;
+  readonly uploadName: string;
+  readonly uploads: string;
   readonly version: string;
   readonly versionTitle: string;
   readonly versions: string;
