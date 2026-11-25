@@ -2,6 +2,12 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 09:45 CT — manual (Chat C) — S-046, S-047, S-051 OAI-PMH follow-ups
+
+- **Done:** S-046: no datestamp is computed from record versions any more (`oaiDatestamp` removed); a record with no stored row answers GetRecord at the site's lower bound. S-047: since S-041 only records a site has shown have rows, so a run of skipped ones says nothing about never-public records; a record no longer shown is skipped (GetRecord `idDoesNotExist`) until the next pass marks it deleted, so one restored in between is never reported deleted (review fix). S-051: list reads take a per-call `timeLimitMs` bounded by the page, no `lock_timeout`; OAI-PMH has its own 2-connection pool (`oaiPoolOptions`) with a bounded wait, and the public and OAI pools give up client-side after 90 s (`queryTimeoutMillis`). D-108 amended.
+- Reviewed by an independent reviewer; the one blocking finding (deleted headers for unmarked rows) fixed and tested.
+- Gate: PASS (tests_passing 4985, 166 files, 10 e2e specs; baseline raised from 4982).
+
 ## 2026-11-25 08:30 CT — manual (Chat A) — M-002 Upload and store files; M-003 View and download files
 
 - **Done:** staff upload files to a record (one or many), stored once by content hash under `OCULUS_FILES_DIR` (migrations 0038 and 0039, D-086); uploads stop when free space falls below the smaller of 5% or 2 GB (John). Download for every file, an inline view for images that the browser decodes, and a viewer with keyboard navigation (D-097). Five independent reviews of M-002 and three of M-003; every real finding fixed.
