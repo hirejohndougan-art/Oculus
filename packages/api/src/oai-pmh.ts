@@ -225,6 +225,8 @@ interface Window {
 
 /** The last instant a stamp can name (9999-12-31T23:59:59.999Z). */
 const LATEST = Date.parse("9999-12-31T23:59:59.999Z");
+/** The first instant PostgreSQL can hold in these terms (0001-01-01). */
+const EARLIEST = Date.parse("0001-01-01T00:00:00.000Z");
 
 const DAY = /^(\d{4})-(\d{2})-(\d{2})$/;
 const SECOND = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z$/;
@@ -248,11 +250,15 @@ function windowOf(from: string | undefined, until: string | undefined): Window {
   }
   if (f !== undefined && u !== undefined && f.day !== u.day) return fail("badArgument");
   if (f !== undefined && u !== undefined && f.at > u.at) return fail("badArgument");
+  // Before year 1 (PostgreSQL has no year 0): `from` is no bound, and an
+  // `until` there leaves nothing.
+  if (u !== undefined && u.at < EARLIEST) return fail("noRecordsMatch");
+  const start = f === undefined || f.at < EARLIEST ? undefined : f.at;
   const end = u === undefined ? undefined : u.at + (u.day ? 86_400_000 : 1000);
   // Past year 9999 (until=9999-12-31) there is no bound to give.
   const before = end === undefined || end > LATEST ? undefined : end;
   return {
-    ...(f === undefined ? {} : { from: new Date(f.at).toISOString() }),
+    ...(start === undefined ? {} : { from: new Date(start).toISOString() }),
     ...(before === undefined ? {} : { before: new Date(before).toISOString() }),
   };
 }
@@ -275,7 +281,7 @@ const STAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 class TokenSeal {
   private readonly key = randomBytes(32);
 
-  seal(cursor: Cursor): string {
+  seal(cursor: Cursor, site: string): string {
     const plain = [
       cursor.window.from ?? "",
       cursor.window.before ?? "",
@@ -284,11 +290,13 @@ class TokenSeal {
     ];
     const nonce = randomBytes(12);
     const cipher = createCipheriv("aes-256-gcm", this.key, nonce);
+    // Tied to the site: another site's token is refused.
+    cipher.setAAD(Buffer.from(site, "utf8"));
     const body = Buffer.concat([cipher.update(JSON.stringify(plain), "utf8"), cipher.final()]);
     return Buffer.concat([nonce, body, cipher.getAuthTag()]).toString("base64url");
   }
 
-  open(token: string): Cursor {
+  open(token: string, site: string): Cursor {
     if (!/^[A-Za-z0-9_-]{40,400}$/.test(token)) return fail("badResumptionToken");
     const bytes = Buffer.from(token, "base64url");
     if (bytes.toString("base64url") !== token || bytes.length < 29) {
@@ -298,6 +306,7 @@ class TokenSeal {
     try {
       const decipher = createDecipheriv("aes-256-gcm", this.key, bytes.subarray(0, 12));
       decipher.setAuthTag(bytes.subarray(bytes.length - 16));
+      decipher.setAAD(Buffer.from(site, "utf8"));
       const text = Buffer.concat([
         decipher.update(bytes.subarray(12, bytes.length - 16)),
         decipher.final(),
@@ -311,7 +320,9 @@ class TokenSeal {
     }
     const [from, before, stamp, id] = plain as [string, string, string, string];
     const stampOk = (value: string): boolean =>
-      STAMP.test(value) && new Date(value).toISOString() === value;
+      STAMP.test(value) &&
+      !Number.isNaN(Date.parse(value)) &&
+      new Date(value).toISOString() === value;
     if (
       (from !== "" && !stampOk(from)) ||
       (before !== "" && !stampOk(before)) ||
@@ -356,7 +367,7 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
   const slots = options.slots ?? new ReadSlots(4);
   // OAI-PMH may hold at most two of the shared slots, so harvests (each
   // up to OAI_MAX_SCAN reads) never leave `GET /records/:id` without one.
-  const oaiSlots = new ReadSlots(Math.min(OAI_MAX_SLOTS, slots.size));
+  const oaiSlots = new ReadSlots(Math.max(1, Math.min(OAI_MAX_SLOTS, slots.size - 1)));
   const tokens = new TokenSeal();
   const adminEmail = oaiAdminEmail(options.adminEmail);
   if (adminEmail === undefined) throw new Error("oaiPmhRoutes needs an admin email");
@@ -442,7 +453,7 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
     if (token !== undefined) {
       // resumptionToken is exclusive (OAI-PMH §3.5).
       if (Object.keys(args).length !== 1) return fail("badArgument", false);
-      cursor = tokens.open(token);
+      cursor = tokens.open(token, `${site.organizationId}:${site.siteId}`);
     } else {
       if (args.metadataPrefix === undefined) return fail("badArgument", false);
       if (args.metadataPrefix !== OAI_DC_PREFIX) return fail("cannotDisseminateFormat");
@@ -482,7 +493,10 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
     if (shown.length === 0 && exhausted && token === undefined) return fail("noRecordsMatch");
     let resumption = "";
     if (!exhausted && after !== undefined) {
-      resumption = element("resumptionToken", tokens.seal({ window: cursor.window, after }));
+      resumption = element(
+        "resumptionToken",
+        tokens.seal({ window: cursor.window, after }, `${site.organizationId}:${site.siteId}`),
+      );
     } else if (token !== undefined) {
       // The last page of a list that was resumed ends with an empty token.
       resumption = "<resumptionToken/>";
@@ -534,6 +548,11 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
         const origin = originOf(request);
         const site = origin === undefined ? undefined : byOrigin.get(origin);
         if (site === undefined || origin === undefined) throw NOT_FOUND();
+        // Worked out before any slot is taken, so nothing between taking and
+        // the `finally` below can throw.
+        const host = new URL(origin).hostname;
+        const baseUrl = `${origin}/oai`;
+        const responseDate = `${new Date(clock()).toISOString().slice(0, 19)}Z`;
         if (!limiter.take(clientKey(request.ip), "oai")) {
           reply.status(429).header("retry-after", "60");
           return { error: "rate_limited" };
@@ -549,9 +568,6 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
           reply.status(503).header("retry-after", "5");
           return { error: "busy" };
         }
-        const host = new URL(origin).hostname;
-        const baseUrl = `${origin}/oai`;
-        const responseDate = `${new Date(clock()).toISOString().slice(0, 19)}Z`;
         let echoed: Record<string, string> | undefined;
         let body: string;
         try {

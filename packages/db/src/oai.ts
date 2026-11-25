@@ -123,7 +123,9 @@ export async function oaiDatestamp(
 
 /**
  * What Identify says of the site: its name, and a lower bound for every
- * datestamp (when the site was made, to the second). Not the earliest
+ * datestamp (the day before the site was made: a version written in a
+ * transaction that started before the site existed can carry an earlier
+ * `now()`). Not the earliest
  * record's stamp: that record may be one public output holds back (D-105).
  * Every record on the site was put there by a version written after then.
  */
@@ -135,7 +137,7 @@ export async function oaiRepository(
   if (!isOrganizationId(organizationId) || !isSiteId(siteId)) return undefined;
   const [row] = await db.rows<{ name: string; earliest: string }>(sql`
     SELECT s.name,
-           to_char(date_trunc('second', s.created_at) AT TIME ZONE 'UTC',
+           to_char(date_trunc('day', s.created_at AT TIME ZONE 'UTC') - interval '1 day',
                    'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS earliest
     FROM public.sites s
     WHERE s.organization_id = ${organizationId}::uuid AND s.id = ${siteId}::uuid`);

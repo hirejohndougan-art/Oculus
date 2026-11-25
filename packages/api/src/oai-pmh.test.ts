@@ -319,6 +319,19 @@ describe("GET /oai on a public host", () => {
     expect(errorCode(refused.body)).toBe("badResumptionToken");
   });
 
+  it("dates before year 1 are no bound for from, and leave nothing for until", async () => {
+    for (const from of ["0000-01-01", "0000-01-01T00:00:00Z"]) {
+      const reply = await oai(`verb=ListIdentifiers&metadataPrefix=oai_dc&from=${from}`);
+      expect([from, reply.statusCode, identifiers(reply.body).length]).toEqual([
+        from,
+        200,
+        OAI_PAGE_SIZE,
+      ]);
+    }
+    const until = await oai("verb=ListIdentifiers&metadataPrefix=oai_dc&until=0000-01-01");
+    expect([until.statusCode, errorCode(until.body)]).toEqual([200, "noRecordsMatch"]);
+  });
+
   it("a far-future until is no bound at all", async () => {
     for (const until of ["9999-12-31", "9999-12-31T23:59:59Z"]) {
       const reply = await oai(`verb=ListIdentifiers&metadataPrefix=oai_dc&until=${until}`);
