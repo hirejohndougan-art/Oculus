@@ -105,7 +105,8 @@ import {
   templateMoveChanges,
   validateRecord,
   findingAidFromUnits,
-  MAX_EAD_EXPORT_CHARS,
+  MAX_EAD_EXPORT_BYTES,
+  valueFitsField,
   writeEad,
   type EadExportField,
   type EadExportUnit,
@@ -2696,21 +2697,50 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
             // The top unit's inherited values too (the person's view, as the
             // record screen shows them): nothing in the file carries them.
             const own = Object.entries(record.fields);
-            const inherited =
-              row.id === recordId && record.parentId !== undefined
-                ? (await visibleInherited(tx, who.organizationId, recordId, allowed.checker))
-                    .filter((v) => !Object.prototype.hasOwnProperty.call(record.fields, v.key))
-                    .map((v): [string, JsonValue] => [v.key, v.value as JsonValue])
-                : [];
-            for (const [fieldKey, value] of [...own, ...inherited]) {
+            const inherited: [string, JsonValue, boolean][] = [];
+            if (row.id === recordId && record.parentId !== undefined) {
+              const values = await visibleInherited(
+                tx,
+                who.organizationId,
+                recordId,
+                allowed.checker,
+              );
+              for (const v of values) {
+                if (Object.prototype.hasOwnProperty.call(record.fields, v.key)) continue;
+                // Public only when it is public where it comes from too: the
+                // strictest visibility along the way counts (effective.ts).
+                const source = await readStoredRecord(tx, who.organizationId, v.from);
+                const sourceKey =
+                  source?.ok === true ? (source.value.record.templateKey ?? "") : "";
+                if (!templates.has(sourceKey)) {
+                  templates.set(sourceKey, await readTemplate(tx, who.organizationId, sourceKey));
+                }
+                const sourceTemplate = templates.get(sourceKey);
+                const sourceDef =
+                  sourceTemplate?.ok === true
+                    ? sourceTemplate.value.template.fields.find((d) => d.key === v.key)
+                    : undefined;
+                inherited.push([v.key, v.value as JsonValue, sourceDef?.visibility === "public"]);
+              }
+            }
+            const all: [string, JsonValue, boolean][] = [
+              ...own.map(([k, v]): [string, JsonValue, boolean] => [k, v, true]),
+              ...inherited,
+            ];
+            for (const [fieldKey, value, publicAtSource] of all) {
               const def = defs.get(fieldKey);
-              // A value its template no longer has is staff-only, as everywhere (effective.ts).
+              // Staff-only unless its field is public here (and where it comes
+              // from) and the value still fits the field: a value its template
+              // no longer has or no longer fits is staff-only, as everywhere
+              // (effective.ts, D-039).
+              const shown =
+                def?.visibility === "public" && publicAtSource && valueFitsField(value, def);
               fields.push({
                 key: fieldKey,
                 label: def?.label ?? fieldKey,
                 kind: def?.kind ?? "text",
                 value,
-                staffOnly: def?.visibility !== "public",
+                staffOnly: !shown,
                 ...(def?.options === undefined ? {} : { options: def.options }),
               });
             }
@@ -2734,7 +2764,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
           if (!time.ok) return time;
           const written = writeEad(made.value.findingAid, { version, generatedAt: time.value });
           if (!written.ok) return written;
-          if (written.value.xml.length > MAX_EAD_EXPORT_CHARS) {
+          if (Buffer.byteLength(written.value.xml, "utf8") > MAX_EAD_EXPORT_BYTES) {
             return refusal(
               ["recordId"],
               "too_large",

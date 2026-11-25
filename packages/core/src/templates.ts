@@ -1371,7 +1371,7 @@ function checkOne(
  * True when `value` has the structure `field` takes as it is now: a list of
  * 1 to MAX_REPEATS values for a repeatable field, one value otherwise, each
  * passing the built-in check for the field's kind. No checkers run. For
- * `effective.ts` (not exported from the package), so a value stored under
+ * `effective.ts` and the EAD staff export (T-059b), so a value stored under
  * an older version of the field (a record link kept in a field since made
  * text) never reaches a public view. Never throws.
  */

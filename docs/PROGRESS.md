@@ -2,7 +2,7 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
-## 2026-11-25 17:05 CT — Chat AA — T-059a EAD reader, writer and mappings in core
+## 2026-11-25 16:10 CT — Chat AA — T-059a EAD reader, writer and mappings in core
 - Result: done (built locally, not pushed or merged: John's instruction)
 - What changed: Chat H's `autopilot/T-059a` with main merged in (042115e); review fixes b2cd8e6 and be01a4b (`xml-tree.ts` counts attributes and namespace declarations as saxes reads them; `ead-read.ts` keeps staff-only parts inside staff-only notes, refuses a link address that needed cleaning, checks Oculus's own EAD3 history whole, reports list and chronology attributes, counts a prefixed `audience`); new `ead.review2.test.ts`.
 - Decisions: D-110 (Chat H's, amended)

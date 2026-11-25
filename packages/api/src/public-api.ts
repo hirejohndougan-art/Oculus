@@ -36,7 +36,7 @@
  * `PUBLIC_POOL_WAIT_MS` for a connection (`publicPoolOptions`); either
  * running out is `503 busy` too.
  */
-import { isRecordId, MAX_EAD_EXPORT_CHARS, writeEad } from "@oculus/core";
+import { isRecordId, MAX_EAD_EXPORT_BYTES, writeEad } from "@oculus/core";
 import {
   isDatabaseTimeout,
   MAX_PUBLIC_READ_TIME_LIMIT_MS,
@@ -236,7 +236,10 @@ export function publicApiRoutes(options: PublicApiOptions): OculusRoute[] {
                 generatedAt: new Date(options.clock?.() ?? Date.now()).toISOString(),
               })
             : undefined;
-          if (written?.ok === true && written.value.xml.length <= MAX_EAD_EXPORT_CHARS) {
+          if (
+            written?.ok === true &&
+            Buffer.byteLength(written.value.xml, "utf8") <= MAX_EAD_EXPORT_BYTES
+          ) {
             xml = written.value.xml;
           }
         } catch (error) {

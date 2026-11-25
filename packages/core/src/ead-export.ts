@@ -97,8 +97,8 @@ export interface EadExport {
   readonly notices: readonly Issue[];
 }
 
-/** The longest export file, in characters (a finding aid stays one download). */
-export const MAX_EAD_EXPORT_CHARS = 32 * 2 ** 20;
+/** The biggest export file, in UTF-8 bytes (a finding aid stays one download). */
+export const MAX_EAD_EXPORT_BYTES = 32 * 2 ** 20;
 
 /** The most units one export holds (a finding aid stays one download). */
 export const MAX_EXPORT_UNITS = 5_000;
@@ -395,7 +395,7 @@ function mapField(
 
   // A number whose identifier type isn't public is staff-only, whatever field
   // shows it (D-022): in a staff file it goes in a note of its own, marked.
-  if (field.kind === "identifier" && staff) {
+  if (field.kind === "identifier" && staff && !field.staffOnly) {
     const hidden = values.filter((v) => {
       const type = prop(v, "type");
       return !(typeof type === "string" && options.publicIdentifierTypes?.has(type) === true);

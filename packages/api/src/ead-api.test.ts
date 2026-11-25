@@ -304,3 +304,86 @@ describe("public EAD exports are braked", () => {
     expect(codes).toEqual([200, 200, 200, 200, 200, 200, 429]);
   });
 });
+
+describe("staff files mark inherited and misfit values (T-059b second review)", () => {
+  beforeAll(async () => {
+    ok(
+      await insertTemplateVersion(w.db, {
+        key: "t-par",
+        organizationId: w.a,
+        label: "Parent",
+        appliesTo: ["archival_unit"],
+        fields: [
+          field("provenance", "text", {
+            label: "Provenance",
+            visibility: "staff",
+            inherited: true,
+          }),
+          field("rights", "rights"),
+        ],
+      }),
+    );
+    const kid = (oldLink: "link" | "text") =>
+      insertTemplateVersion(w.db, {
+        key: "t-kid",
+        organizationId: w.a,
+        label: "Kid",
+        appliesTo: ["archival_unit"],
+        fields: [
+          field("provenance", "text", { label: "Provenance", inherited: true }),
+          field("rights", "rights"),
+          field("old_link", oldLink, { label: "Old link" }),
+        ],
+      });
+    ok(await kid("link"));
+    const ctx = { organizationId: w.a, actor: actorOf(w.root), siteId: w.a1 };
+    const p = ok(
+      await w.service.createRecord(ctx, {
+        kind: "archival_unit",
+        level: "fonds",
+        title: "Invented P",
+        templateKey: "t-par",
+        fields: { provenance: "STAFFPROV secret donor", rights: { uri: INC } },
+      }),
+    );
+    ids.P = p.record.id;
+    const k = ok(
+      await w.service.createRecord(ctx, {
+        kind: "archival_unit",
+        level: "series",
+        title: "Invented K",
+        templateKey: "t-kid",
+        parentId: p.record.id,
+        fields: {
+          rights: { uri: INC },
+          old_link: { url: "https://example.org/x", label: "MISFITLABEL" },
+        },
+      }),
+    );
+    ids.K = k.record.id;
+    // The template changes: old_link becomes plain text, so the stored link no longer fits.
+    ok(await kid("text"));
+  });
+
+  it("marks a value inherited from a staff field staff-only, though the child's field is public", async () => {
+    const reply = await get("localhost", `/api/records/${id("K")}/ead`, tokens.cataloger);
+    expect(reply.statusCode).toBe(200);
+    const read = readEad(reply.body);
+    if (!read.ok) throw new Error(JSON.stringify(read.issues));
+    const notes = read.value.findingAid.archdesc.notes;
+    const prov = notes.filter((n) => n.paragraphs.some((p) => p.includes("STAFFPROV")));
+    expect(prov.length).toBe(1);
+    expect(prov[0]?.internal).toBe(true);
+  });
+
+  it("marks a value that no longer fits its field staff-only", async () => {
+    const reply = await get("localhost", `/api/records/${id("K")}/ead`, tokens.cataloger);
+    const read = readEad(reply.body);
+    if (!read.ok) throw new Error(JSON.stringify(read.issues));
+    const misfit = read.value.findingAid.archdesc.notes.filter((n) =>
+      n.paragraphs.some((p) => p.includes("MISFITLABEL") || p.includes("example.org")),
+    );
+    expect(misfit.length).toBeGreaterThan(0);
+    for (const n of misfit) expect(n.internal).toBe(true);
+  });
+});

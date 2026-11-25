@@ -153,6 +153,7 @@ export {
   MAX_REGISTRY_TEMPLATES,
   indexTemplates,
   isTemplateRegistry,
+  valueFitsField,
 } from "./templates.js";
 export type {
   FieldKind,
@@ -805,7 +806,7 @@ export type { EadNotice, EadLevelChange, EadReadReport, EadRead } from "./ead-re
 export { writeEad } from "./ead-write.js";
 export type { EadWriteOptions, EadWritten } from "./ead-write.js";
 
-export { MAX_EAD_EXPORT_CHARS, MAX_EXPORT_UNITS, findingAidFromUnits } from "./ead-export.js";
+export { MAX_EAD_EXPORT_BYTES, MAX_EXPORT_UNITS, findingAidFromUnits } from "./ead-export.js";
 export type {
   EadAudience,
   EadExport,

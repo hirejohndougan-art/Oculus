@@ -129,7 +129,8 @@ export async function readPublicFindingAid(
     // Units read and kept: nothing below a unit left out is read at all.
     const kept = new Set<string>();
     for (const row of rows) {
-      if (clock() > until) {
+      const left = until - clock();
+      if (left <= 0) {
         return {
           ok: false,
           issues: [
@@ -137,6 +138,11 @@ export async function readPublicFindingAid(
           ],
         };
       }
+      // Every statement from here on stops by the deadline, too.
+      const limit = Math.max(1, Math.min(timeLimitMs, Math.ceil(left)));
+      await tx.execute(
+        sql`SELECT pg_catalog.set_config('statement_timeout', ${String(limit)}, true)`,
+      );
       if (!isRecordId(row.id) || !isLevel(row.level)) continue;
       const parentId = row.id === rootId ? undefined : row.parentId;
       if (parentId !== undefined && (parentId === null || !kept.has(parentId))) continue;
