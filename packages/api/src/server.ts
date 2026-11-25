@@ -58,6 +58,12 @@
  *    files read into memory at startup, with the admin's own CSP
  *    (`ADMIN_SECURITY_HEADERS`) in place of the API's; every other reply
  *    keeps `SECURITY_HEADERS`.
+ * 12. Hosts (T-050a, D-090), when `options.admin` is given: every `/api`
+ *    path is answered only on the admin's own origin; on any other host (a
+ *    public site's, an unlisted one) it is `404 not_found`, the reply an
+ *    unknown path gets, before any route or cookie is looked at. So a public
+ *    site's pages can't reach the staff API through their own host, and the
+ *    session cookie (host-only, `__Host-`) is never asked for there.
  *
  * 11. Files (file-replies.ts, M-001, D-089): a handler sends a stored file's
  *    bytes only by returning `fileReply(...)`, which decides the Content-Type
@@ -466,6 +472,11 @@ function safeLogCall(this: unknown, args: unknown[], method: (...args: unknown[]
   method.call(this, fields, message);
 }
 
+/** `/api` and everything under it: the staff and sign-in routes (rule 12). */
+export function isApiPath(path: string): boolean {
+  return path === "/api" || path.startsWith("/api/");
+}
+
 /** A request's host as `URL.host` writes it for `protocol` (default port dropped), or undefined. */
 function normalHost(protocol: string, host: unknown): string | undefined {
   if (typeof host !== "string" || host === "") return undefined;
@@ -557,9 +568,23 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
     routes.add(route.method, route.url);
   });
 
-  // Rule 3 first: nothing else looks at a refused path.
+  // Rule 3 first: nothing else looks at a refused path. Then rule 12: with
+  // an admin origin, `/api` is the admin host's only.
   app.addHook("onRequest", (request, _reply, done) => {
-    done(requestRefusal(request, origins));
+    const refusal = requestRefusal(request, origins);
+    if (
+      refusal === undefined &&
+      admin !== undefined &&
+      isApiPath(pathOf(request.raw.url ?? "")) &&
+      !(
+        `${request.protocol}:` === adminProtocol &&
+        normalHost(adminProtocol, request.host) === adminHost
+      )
+    ) {
+      done(new Refusal(404, "not_found"));
+      return;
+    }
+    done(refusal);
   });
 
   app.addHook("onSend", async (request, reply, payload) => {
