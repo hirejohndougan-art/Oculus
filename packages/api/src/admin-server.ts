@@ -54,6 +54,7 @@ import { originsFromEnv } from "./origin.js";
 import { isProduction } from "./environment.js";
 import { mailerFromEnv, type Mailer } from "./mail.js";
 import { trustedProxyFromEnv } from "./proxy.js";
+import { publicApiRoutes } from "./public-api.js";
 import { PUBLIC_DATABASE_URL_ENV, checkPublicSites, publicSitesFromEnv } from "./public-sites.js";
 import type { OculusRoute } from "./routes.js";
 import { buildServer, type ServerOptions } from "./server.js";
@@ -175,16 +176,17 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     );
   }
   // Public hosts and their reader (T-050a): checked now, so a wrong
-  // connection or site never serves a request. T-050b's public routes use them.
+  // connection or site never serves a request. The public read routes
+  // (T-050d) use them.
   const publicHosts = publicSitesFromEnv(env, originsFromEnv(env), adminOrigin);
   if (publicHosts.length > 0 && options.publicDb === undefined) {
     throw new Error(
       `refusing to start: OCULUS_PUBLIC_SITES lists public sites but ${PUBLIC_DATABASE_URL_ENV} gives no public reader connection (D-080).`,
     );
   }
-  if (options.publicDb !== undefined) {
-    await checkPublicSites(options.db, options.publicDb, publicHosts);
-  }
+  const publicDb = options.publicDb;
+  const publicSites =
+    publicDb === undefined ? [] : await checkPublicSites(options.db, publicDb, publicHosts);
 
   let admin: ServerOptions["admin"];
   if (adminOrigin !== undefined && adminOrigin !== "") {
@@ -229,6 +231,9 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
       warnSharedAddress: production,
       ...options.signIn,
     }),
+    ...(publicDb === undefined || publicSites.length === 0
+      ? []
+      : publicApiRoutes({ db: publicDb, sites: publicSites, log })),
     ...(options.extraRoutes ?? []),
   ];
   return buildServer({
