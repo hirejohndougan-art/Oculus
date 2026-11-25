@@ -74,8 +74,10 @@ export interface PublicSubjectsResult {
 
 /** What staff see of a public site's counts. */
 export interface PublicSubjectsStatus {
-  /** When the counts being served were made, or null before the first. */
+  /** Since when the counts served have been the same (what the public sees), or null before the first. */
   readonly asOf: string | null;
+  /** When they were last counted. */
+  readonly lastCounted: string | null;
   readonly recordsCounted: number | null;
   /** Records public on the site that were left out, in all and by refusal code. */
   readonly recordsLeftOut: number | null;
@@ -103,6 +105,8 @@ interface SiteState {
   /** When a change the counts served don't reflect was first seen. */
   changedSince?: number | undefined;
   problem?: { code: string; at: number } | undefined;
+  /** The marker the last refused count was tried at: not tried again at it until maxAgeMs. */
+  refusedAt?: string | undefined;
   counting: boolean;
 }
 
@@ -139,19 +143,24 @@ export class PublicSubjects {
     this.maxAgeMs = whole(options.maxAgeMs ?? 3_600_000, 1000, 604_800_000, "maxAgeMs");
     this.staleMs = whole(options.staleMs ?? 1_800_000, 1000, 86_400_000, "staleMs");
     this.timeLimitMs = whole(options.timeLimitMs ?? 120_000, 1, 300_000, "timeLimitMs");
+    if (this.staleMs < this.minGapMs + this.checkEveryMs) {
+      throw new RangeError("staleMs must be at least minGapMs + checkEveryMs");
+    }
   }
 
   /** Starts the background checks (the first at once). */
   start(): void {
     if (this.stopped || this.timer !== undefined) return;
     const loop = (): void => {
-      this.running = this.check().finally(() => {
-        this.running = undefined;
-        if (!this.stopped) {
-          this.timer = setTimeout(loop, this.checkEveryMs);
-          this.timer.unref();
-        }
-      });
+      this.running = this.check()
+        .catch(() => undefined)
+        .finally(() => {
+          this.running = undefined;
+          if (!this.stopped) {
+            this.timer = setTimeout(loop, this.checkEveryMs);
+            this.timer.unref();
+          }
+        });
     };
     this.timer = setTimeout(loop, 0);
     this.timer.unref();
@@ -174,6 +183,9 @@ export class PublicSubjects {
   /** One pass: the marker once per organization, then each site that needs a count. */
   async check(): Promise<void> {
     if (this.stopped) return;
+    // One pass at a time: a second call waits for the one running.
+    const running = [...this.inFlight][0];
+    if (running !== undefined) return running;
     const pass = this.pass();
     this.inFlight.add(pass);
     try {
@@ -190,7 +202,7 @@ export class PublicSubjects {
       const org = state.site.organizationId;
       if (!markers.has(org)) {
         try {
-          markers.set(org, await publicOutputMarker(this.options.db, org));
+          markers.set(org, await publicOutputMarker(this.options.db, org, MARKER_TIME_LIMIT_MS));
         } catch (error) {
           markers.set(org, error instanceof Error ? error : new Error("unknown"));
         }
@@ -230,11 +242,14 @@ export class PublicSubjects {
     const since = now - (state.lastAttempt ?? -Infinity);
     const due =
       good === undefined
-        ? // No counts yet: try at once, then (refused or failed) every minGap.
-          state.lastAttempt === undefined || since >= this.minGapMs
+        ? // No counts yet: try at once, then every minGap (a refusal at the
+          // same marker: every maxAgeMs).
+          state.lastAttempt === undefined ||
+          since >= (state.refusedAt === marker ? this.maxAgeMs : this.minGapMs)
         : state.changedSince !== undefined
-          ? // A change: count again, at most once every minGap.
-            since >= this.minGapMs
+          ? // A change: count again, at most once every minGap, but a count
+            // refused at this same marker only once it is maxAgeMs old.
+            since >= (state.refusedAt === marker ? this.maxAgeMs : this.minGapMs)
           : // No change: only once the counts are old.
             now - good.at >= this.maxAgeMs && since >= this.minGapMs;
     if (!due) return;
@@ -252,6 +267,7 @@ export class PublicSubjects {
       const done = this.clock();
       if (!result.ok) {
         state.problem = { code: result.issues[0]?.code ?? "refused", at: done };
+        if (result.issues[0]?.code !== "stopped") state.refusedAt = marker;
         return;
       }
       const counts = result.value.counts;
@@ -270,6 +286,7 @@ export class PublicSubjects {
         recordsLeftOut: result.value.recordsLeftOut,
       });
       state.problem = undefined;
+      state.refusedAt = undefined;
       state.changedSince = undefined;
     } catch (error) {
       this.failed(state, error instanceof Error ? error : undefined);
@@ -306,6 +323,7 @@ export class PublicSubjects {
         : null;
     return {
       asOf: good?.asOf ?? null,
+      lastCounted: good === undefined ? null : second(good.at),
       recordsCounted: good?.recordsCounted ?? null,
       recordsLeftOut: good?.recordsLeftOut ?? null,
       leftOut: good?.leftOut ?? {},
@@ -315,6 +333,9 @@ export class PublicSubjects {
     };
   }
 }
+
+/** The marker's own time limit (it is cheap; past this something holds it up). */
+const MARKER_TIME_LIMIT_MS = 30_000;
 
 /** Counts older than this are never shown, whatever happened since (a day). */
 const MAX_SERVED_MS = 86_400_000;

@@ -305,6 +305,29 @@ describe("PublicSubjects", () => {
     await quiet.check();
   });
 
+  it("a refused count isn't tried again at the same marker until it is maxAgeMs old", async () => {
+    let t = now;
+    const refused = new PublicSubjects({
+      db: counts,
+      sites: [site],
+      clock: () => t,
+      timeLimitMs: 1,
+    });
+    await refused.check();
+    const first = refused.statusFor(w.a, w.a1)?.lastProblem;
+    expect(first?.code).toBe("too_slow");
+    t += 600_000;
+    await refused.check();
+    expect(refused.statusFor(w.a, w.a1)?.lastProblem).toEqual(first);
+    t += 3_600_000;
+    await refused.check();
+    expect(refused.statusFor(w.a, w.a1)?.lastProblem?.at).not.toBe(first?.at);
+    await refused.stop();
+    expect(
+      () => new PublicSubjects({ db: counts, sites: [], minGapMs: 600_000, staleMs: 60_000 }),
+    ).toThrow(RangeError);
+  });
+
   it("stop() ends a count in progress at its next record", async () => {
     const slow = new PublicSubjects({ db: counts, sites: [site] });
     const pass = slow.check();

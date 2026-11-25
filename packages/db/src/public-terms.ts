@@ -53,7 +53,7 @@ import {
   type SiteId,
   type Validated,
 } from "@oculus/core";
-import type { Database } from "./client.js";
+import type { Database, Queryable } from "./client.js";
 import { sql } from "./sql.js";
 import { publicRecordIn } from "./workflow.js";
 
@@ -420,10 +420,27 @@ function keyOf(term: ShownTerm): string {
 export async function publicOutputMarker(
   db: Database,
   organizationId: OrganizationId,
+  timeLimitMs = 30_000,
 ): Promise<string> {
   if (!isOrganizationId(organizationId)) throw new TypeError("not an organization ID");
+  if (!Number.isInteger(timeLimitMs) || timeLimitMs < 1 || timeLimitMs > MAX_TIME_LIMIT_MS) {
+    throw new RangeError("timeLimitMs out of range");
+  }
   const org = organizationId;
-  const [row] = await db.rows<{ marker: string }>(sql`
+  // A time limit of its own, so a lock (a migration) or a large organization
+  // can't hold the caller up: past it the query is cancelled and throws.
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`SET TRANSACTION READ ONLY`);
+    await tx.execute(
+      sql`SELECT pg_catalog.set_config('statement_timeout', ${String(timeLimitMs)}, true),
+                 pg_catalog.set_config('lock_timeout', ${String(timeLimitMs)}, true)`,
+    );
+    return markerIn(tx, org);
+  });
+}
+
+async function markerIn(tx: Queryable, org: OrganizationId): Promise<string> {
+  const [row] = await tx.rows<{ marker: string }>(sql`
     SELECT concat_ws('|',
       (SELECT count(*)::text || ':' || coalesce(max(recorded_at)::text, '')
          FROM public.record_versions WHERE organization_id = ${org}::uuid),
