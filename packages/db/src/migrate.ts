@@ -47,7 +47,7 @@
  * tried again, up to `fileLockAttempts` times (default 5) with a growing
  * pause; after the last it stops as `file_lock_timeout`, nothing of it
  * applied. Migrations must stay safe for the previous release to keep
- * running on (D-118).
+ * running on (D-120).
  */
 import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
