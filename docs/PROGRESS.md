@@ -9,6 +9,14 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Review: one independent round, nothing blocking; fixed: a role on every site scoped to one unit no longer counts, and a viewer with no managed site sees no one (matching the SQL); unit tests for the rule.
 - Gate: PASS · tests_passing 4734 (was 4729) · npm audit clean · licences all permissive
 - Next: nothing claimed
+## 2026-11-25 04:45 CT — upkeep — U-006 Main's gate fails in a clean checkout
+- Result: gate fix
+- What changed: CI's gate on main had failed at lint on every push since M-001 (`files.spec.ts` imports `@oculus/api`, resolved to an unbuilt `dist`); `packages/admin/tsconfig.json` now maps `@oculus/api`, `db` and `service` to their sources (c3f0f46). Also in-major updates: @types/node 26.6.10, @types/react 19.3.2, react-router 8.5.3. TypeScript 7 / Vite 8 rechecked, still blocked (T-001b). Filed U-007 (the gate should start with no `dist`).
+- Decisions: none
+- Review: n/a (build configuration only)
+- Gate: PASS, run twice from a checkout with no `dist` (before and after rebasing onto S-039) · tests_passing 4729 (was 4729) · npm audit clean
+- Next: U-007, then the next free job on the board
+
 ## 2026-11-25 06:10 CT — Chat B — S-039 A first mapping for a template with very many published records
 - Result: done
 - What changed: a Dublin Core mapping change on more published records than can be listed (10,000) is confirmed by its exact count (`confirmPublishedCount`, read under the template's lock) instead of being refused, system managers only; the mapping screen shows the number and sends it back, and saves an empty mapping when the template has no public fields left. `createService` takes `maxListedPublished` (tests).
