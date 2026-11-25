@@ -273,6 +273,7 @@ function addRoute(
   route: OculusRoute,
   downloadMs: number,
   downloads: Set<{ stop: () => void }>,
+  downloadsClosed: { value: boolean },
 ): void {
   const credentials = route.credentials === true;
   const handler = route.handler;
@@ -331,6 +332,10 @@ function addRoute(
         if (file.body instanceof Uint8Array) {
           fileReplies.add(request);
           return reply.code(200).headers(file.headers).send(file.body);
+        }
+        // Closing: no new download starts (one already running is stopped).
+        if (downloadsClosed.value) {
+          return reply.code(503).header("connection", "close").send({ error: "unavailable" });
         }
         // A stream: sent on the raw response, outside the handler timeout,
         // within the download deadline, and stopped if the server closes.
@@ -626,13 +631,17 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
   // Streamed downloads in flight (file-replies.ts): stopped when the server
   // closes, so a slow reader can't hold shutdown open.
   const downloads = new Set<{ stop: () => void }>();
+  const downloadsClosed = { value: false };
   app.addHook("preClose", (done) => {
+    downloadsClosed.value = true;
     for (const download of [...downloads]) download.stop();
     done();
   });
   const health = checkRoute({ method: "GET", path: "/health", handler: () => ({ status: "ok" }) });
-  addRoute(app, health, timeouts.download, downloads);
-  for (const route of appRoutes) addRoute(app, route, timeouts.download, downloads);
+  addRoute(app, health, timeouts.download, downloads, downloadsClosed);
+  for (const route of appRoutes) {
+    addRoute(app, route, timeouts.download, downloads, downloadsClosed);
+  }
 
   await app.ready();
   return app;

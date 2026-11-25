@@ -178,24 +178,33 @@ export function contentDisposition(disposition: "inline" | "attachment", name: u
 /** Cuts a stream off with an error if it gives more or fewer than `size` bytes. */
 export class ExactLength extends Transform {
   private seen = 0;
+  /** Set when the stream gave something wrong: not bytes, too many or too few. */
+  wrong = false;
   constructor(private readonly size: number) {
-    super();
+    // Object mode on the writable side, so a chunk that isn't bytes (an
+    // object, a string from setEncoding) reaches the check below instead of
+    // making Writable throw inside the source's data event.
+    super({ writableObjectMode: true });
+  }
+  private refuse(done: TransformCallback, message: string): void {
+    this.wrong = true;
+    done(new Error(message));
   }
   override _transform(chunk: unknown, _encoding: BufferEncoding, done: TransformCallback): void {
-    const bytes = chunk instanceof Uint8Array ? chunk : undefined;
-    if (bytes === undefined) {
-      done(new Error("a file stream must give bytes"));
+    if (!(chunk instanceof Uint8Array)) {
+      this.refuse(done, "a file stream must give bytes");
       return;
     }
-    this.seen += bytes.byteLength;
+    this.seen += chunk.byteLength;
     if (this.seen > this.size) {
-      done(new Error("the file stream is longer than its size"));
+      this.refuse(done, "the file stream is longer than its size");
       return;
     }
-    done(null, bytes);
+    done(null, chunk);
   }
   override _flush(done: TransformCallback): void {
-    done(this.seen === this.size ? null : new Error("the file stream is shorter than its size"));
+    if (this.seen === this.size) done(null);
+    else this.refuse(done, "the file stream is shorter than its size");
   }
 }
 
@@ -276,6 +285,9 @@ export function sendFileStream(
   }
   let source: Readable | undefined;
   let finished = false;
+  let started = false;
+  /** What went wrong first: the source, the length, or the client. */
+  let cause: FileStreamEnd | undefined;
   const finish = (why: FileStreamEnd): void => {
     if (finished) return;
     finished = true;
@@ -286,26 +298,31 @@ export function sendFileStream(
   };
   const failBeforeStart = (): void => {
     if (finished) return;
-    if (response.headersSent || response.destroyed) {
-      finish("storage");
+    if (started || response.headersSent || response.destroyed) {
+      finish(cause ?? "storage");
       return;
     }
+    finished = true;
+    clearTimeout(timer);
+    source?.destroy();
     response.writeHead(500, {
       ...errorHeaders,
       "content-type": "application/json; charset=utf-8",
       "content-length": String(Buffer.byteLength(ERROR_BODY)),
     });
     response.end(ERROR_BODY);
-    finished = true;
-    clearTimeout(timer);
-    source?.destroy();
     ended("storage");
   };
   const timer = setTimeout(() => {
     finish("deadline");
   }, deadlineMs);
   response.once("close", () => {
-    if (!response.writableFinished) finish("client");
+    if (response.writableFinished) return;
+    cause ??= "client";
+    // Let pipeline's own callback, which runs next, report first.
+    setImmediate(() => {
+      finish(cause ?? "client");
+    });
   });
   try {
     source = open();
@@ -315,28 +332,45 @@ export function sendFileStream(
     return { stop: () => undefined };
   }
   const opened = source;
-  const onEarlyError = (): void => {
-    failBeforeStart();
-  };
-  opened.once("error", onEarlyError);
-  opened.once("readable", () => {
-    if (finished) return;
-    opened.removeListener("error", onEarlyError);
+  const size = Number(file.headers["content-length"]);
+  opened.on("error", () => {
+    cause ??= "storage";
+    if (!started) failBeforeStart();
+  });
+  const start = (): void => {
+    if (finished || started) return;
+    if (opened.errored !== null || (opened.destroyed && !opened.readableEnded)) {
+      failBeforeStart();
+      return;
+    }
+    started = true;
     response.writeHead(200, headers);
-    const size = Number(file.headers["content-length"]);
     const exact = new ExactLength(size);
-    let lengthWrong = false;
-    exact.once("error", () => {
-      lengthWrong = true;
-    });
     pipeline(opened, exact, response, (error) => {
       if (!error) {
         finish("done");
         return;
       }
-      finish(lengthWrong ? "length" : response.destroyed && !opened.errored ? "client" : "storage");
+      // A wrong length is reported as such even though destroying the
+      // response also looks like the client going away.
+      finish(exact.wrong ? "length" : (cause ?? "storage"));
     });
-  });
+  };
+  if (opened.errored !== null) {
+    failBeforeStart();
+  } else if (opened.readableEnded) {
+    // Already at its end: right only for an empty file.
+    if (size === 0) start();
+    else failBeforeStart();
+  } else if (opened.destroyed) {
+    failBeforeStart();
+  } else {
+    opened.once("readable", start);
+    // Closed before any data or end: nothing will come.
+    opened.once("close", () => {
+      if (!started) failBeforeStart();
+    });
+  }
   return {
     stop: () => {
       finish("closing");

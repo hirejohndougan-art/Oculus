@@ -378,11 +378,15 @@ function fetchOver(
   });
 }
 
+const logLines: string[] = [];
+
 async function listening(
   handler: OculusRoute["handler"],
   timeouts?: { handler?: number; download?: number },
 ): Promise<number> {
-  ({ app } = await testServer(timeouts === undefined ? {} : { timeouts }, [
+  logLines.length = 0;
+  const logger = { stream: { write: (line: string) => void logLines.push(line) } };
+  ({ app } = await testServer(timeouts === undefined ? { logger } : { timeouts, logger }, [
     { method: "GET", path: "/stream", handler },
   ]));
   await app.listen({ host: "127.0.0.1", port: 0 });
@@ -598,6 +602,124 @@ describe("streamed file replies over real HTTP", () => {
     const r = await fetchOver(port, "GET", "/stream");
     expect(r.status).toBe(503);
     await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(opened).toBe(0);
+  });
+
+  it("cuts off a stream that gives objects or strings, without crashing", async () => {
+    watch();
+    for (const make of [
+      () => Readable.from([{ a: 1 }]),
+      () => Readable.from(["text"], { objectMode: true }),
+      () => {
+        const r = Readable.from([Buffer.from("abcd")], { objectMode: false });
+        r.setEncoding("latin1");
+        return r;
+      },
+    ]) {
+      const port = await listening(() =>
+        fileReply({ body: make, size: 4, mediaType: "image/png", fileName: "p" }),
+      );
+      const r = await fetchOver(port, "GET", "/stream");
+      expect(r.complete).toBe(false);
+      await until(() => logLines.some((l) => l.includes("file_stream_length")));
+      expect(logLines.some((l) => l.includes("file_stream_length"))).toBe(true);
+      await stop();
+    }
+  });
+
+  it("logs storage and length failures, and not a client going away", async () => {
+    watch();
+    const failing = await listening(() =>
+      fileReply({
+        body: () => new Source(1_000_000, { failAt: 200_000 }),
+        size: 1_000_000,
+        mediaType: "image/png",
+        fileName: "p",
+      }),
+    );
+    expect((await fetchOver(failing, "GET", "/stream")).complete).toBe(false);
+    await until(() => logLines.some((l) => l.includes("file_stream_storage")));
+    expect(logLines.some((l) => l.includes("file_stream_storage"))).toBe(true);
+    await stop();
+
+    const long = await listening(() =>
+      fileReply({
+        body: () => new Source(200_000),
+        size: 100_000,
+        mediaType: "image/png",
+        fileName: "p",
+      }),
+    );
+    expect((await fetchOver(long, "GET", "/stream")).complete).toBe(false);
+    await until(() => logLines.some((l) => l.includes("file_stream_length")));
+    expect(logLines.some((l) => l.includes("file_stream_length"))).toBe(true);
+    await stop();
+
+    const source = new Source(50_000_000, { chunk: 65_536 });
+    const big = await listening(() =>
+      fileReply({ body: () => source, size: 50_000_000, mediaType: "image/png", fileName: "p" }),
+    );
+    await fetchOver(big, "GET", "/stream", 100_000);
+    await until(() => source.destroyed);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(logLines.some((l) => l.includes("file_stream_"))).toBe(false);
+  });
+
+  it("answers a stream that is already closed, ended or failed with a 500 at once", async () => {
+    watch();
+    const closed = (): Readable => {
+      const r = new Source(10);
+      r.destroy();
+      return r;
+    };
+    const ended = (): Readable => {
+      const r = Readable.from([]);
+      r.resume();
+      return r;
+    };
+    for (const make of [closed, ended]) {
+      const port = await listening(() =>
+        fileReply({ body: make, size: 10, mediaType: "image/png", fileName: "p" }),
+      );
+      const started = Date.now();
+      const r = await fetchOver(port, "GET", "/stream");
+      // At once, and never a whole 200: a 500, or (a stream that ends with no
+      // bytes once it is being sent) cut off as too short.
+      expect(Date.now() - started).toBeLessThan(2000);
+      expect(r.complete && r.status === 200).toBe(false);
+      if (make === closed) expect(r.status).toBe(500);
+      await stop();
+    }
+  });
+
+  it("refuses a download that would start while the server is closing", async () => {
+    watch();
+    let release: () => void = () => undefined;
+    const waiting = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let opened = 0;
+    const port = await listening(async () => {
+      await waiting;
+      return fileReply({
+        body: () => {
+          opened++;
+          return new Source(10_000_000, { chunk: 1024, delayMs: 20 });
+        },
+        size: 10_000_000,
+        mediaType: "image/png",
+        fileName: "p",
+      });
+    });
+    const fetching = fetchOver(port, "GET", "/stream");
+    await new Promise((r) => setTimeout(r, 100));
+    const closing = stop();
+    await new Promise((r) => setTimeout(r, 50));
+    release();
+    const started = Date.now();
+    await closing;
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect((await fetching).status).toBe(503);
     expect(opened).toBe(0);
   });
 });
