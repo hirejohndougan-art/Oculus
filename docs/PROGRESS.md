@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 09:55 CT — build (BUILD MODE) — S-045 Four wrong codes a day never raise an alert
+- Result: done (the `last_sign_in_at` half split off as S-053)
+- What changed: a `wrong:<user>` row in `second_step_throttles` (migration 0040 widens the key check) counts a sign-in's wrong TOTP codes that no right code in the same session explained; a session's first code writes a `second_step_alerts` row for codes other sessions left, and `runCleanup` writes one for codes an hour old (`UNEXPLAINED_TOLD_AFTER_SECONDS`), each told once; forgotten after 30 days (`WRONG_CODE_MEMORY_SECONDS`); a typo followed by the right code (or a recovery code) raises none; full sessions' codes (re-entry, recovery codes, resets) aren't counted; a wait's alert takes them all. Eight tests in second-factor.test.ts; the attack tests (4 guesses a day, a recovery code in a new session, the cleanup) fail without the change. Commits on main up to 85e3286.
+- Decisions: D-077 amended (S-045)
+- Review: two independent rounds. First: no hole letting a password holder guess unseen, but codes could be dropped silently after 30 days on accounts seldom signed into (fixed: the cleanup tells them an hour on) and the 30 days hard-coded (fixed); smaller points filed as S-054. Second: CTE, locks and privileges sound; fixed a wait's alert being told again by the cleanup, and full sessions' codes counting (false alerts for a re-entry typo); added tests for both and for a 31-day-old row.
+- Gate: PASS · tests_passing 4990 (was 4982) · npm audit clean (run on the branch rebased onto main with M-002/M-003; main then gained only roadmap and decision edits)
+- Next: the next free Phase 2 task (S-048, S-049, S-050, S-053, S-054, S-043b, U-007, S-031 or S-035; S-046, S-047, S-051 and S-052 are claimed)
+
 ## 2026-11-25 08:30 CT — manual (Chat A) — M-002 Upload and store files; M-003 View and download files
 
 - **Done:** staff upload files to a record (one or many), stored once by content hash under `OCULUS_FILES_DIR` (migrations 0038 and 0039, D-086); uploads stop when free space falls below the smaller of 5% or 2 GB (John). Download for every file, an inline view for images that the browser decodes, and a viewer with keyboard navigation (D-097). Five independent reviews of M-002 and three of M-003; every real finding fixed.
