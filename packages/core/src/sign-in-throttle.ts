@@ -31,8 +31,8 @@
  * address, so the account counter alone let a stranger guessing once per
  * wait keep a person (the install's only system admin included) waiting for
  * ever. A client address (`throttleSourceKey`, never `OTHER_SOURCE_KEY`)
- * from which the account signed in with the right password in the last
- * `KNOWN_SOURCE_SECONDS` is *known* for it, and has a counter of its own
+ * from which the account completed a sign-in (password and second step,
+ * S-044) in the last `KNOWN_SOURCE_SECONDS` is *known* for it, and has a counter of its own
  * for that account with the account rule. During an account wait an
  * attempt from a known address is still let through, as long as its own
  * counter and the address counter allow it (`decideSignInAttempt`); every
@@ -72,7 +72,7 @@ export const SOURCE_THROTTLE: ThrottleRule = Object.freeze({
 });
 
 /**
- * How long after a right password an address stays known for the account
+ * How long after a whole sign-in an address stays known for the account
  * (S-018): 30 days, so the person's usual networks stay known between
  * visits; a new network waits like a stranger's until its first sign-in.
  */
@@ -80,8 +80,9 @@ export const KNOWN_SOURCE_SECONDS = 30 * 24 * 60 * 60;
 
 /**
  * The most addresses kept known for one account (S-018 review): the newest
- * by last right password. Someone with the password can't fill the table,
- * and an old network drops out when a 21st is used.
+ * by last whole sign-in. An address is added only once the second step
+ * passes (S-044), so someone with the password alone can't push the
+ * person's real addresses out; an old network drops out when a 21st is used.
  */
 export const MAX_KNOWN_SOURCES = 20;
 

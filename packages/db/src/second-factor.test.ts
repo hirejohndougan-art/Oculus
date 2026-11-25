@@ -22,6 +22,7 @@ import {
   normalizeRecoveryCode,
   throttleAccountKey,
   throttleReauthKey,
+  throttleSourceKey,
   type OrganizationId,
   type SessionId,
   type UserId,
@@ -1228,6 +1229,82 @@ describe("re-entering the password needs the second step", () => {
           token_hash = ${hashSessionToken(newSessionToken())}, rotated_at = clock_timestamp()
         WHERE id = ${s.sessionId}::uuid`),
     ).rejects.toMatchObject({ constraint: "sessions_reauth_pass" });
+  });
+});
+
+describe("only a whole sign-in makes an address known (S-044)", () => {
+  async function knownSources(email: string): Promise<string[]> {
+    const rows = await db.rows<{ source_key: string }>(sql`
+      SELECT source_key FROM public.sign_in_known_sources
+      WHERE account_key = ${throttleAccountKey(email)} ORDER BY source_key`);
+    return rows.map((r) => r.source_key);
+  }
+
+  it("someone with only the password can't push the person's own address out and keep them waiting", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const home = source();
+    // The person signs in from home: password, then their code.
+    expect(
+      await signIn(db, { email: person.email, password: PASSWORD, source: home }),
+    ).toMatchObject({ ok: true });
+    expect(await knownSources(person.email)).toEqual([]);
+    const p = await pending(person.userId, org);
+    expect(
+      await completeSecondStep(db, keys, p.token, {
+        source: home,
+        recoveryCode: recovery(person.userId),
+      }),
+    ).toMatchObject({ ok: true });
+    expect(await knownSources(person.email)).toEqual([throttleSourceKey(home)]);
+    // The attack: the right password from 25 fresh addresses, never the code …
+    for (let i = 0; i < 25; i++) {
+      expect(
+        await signIn(db, { email: person.email, password: PASSWORD, source: source() }),
+      ).toMatchObject({ ok: true });
+    }
+    // … then one wrong guess per wait keeps the account counter waiting.
+    await signIn(db, { email: person.email, password: "attacker guess", source: source() });
+    await db.execute(sql`
+      UPDATE public.sign_in_throttles SET failures = 400, last_failure_at = clock_timestamp()
+      WHERE key = ${throttleAccountKey(person.email)}`);
+    // Home is still known, and the person still gets in from there.
+    expect(await knownSources(person.email)).toEqual([throttleSourceKey(home)]);
+    expect(
+      await signIn(db, { email: person.email, password: PASSWORD, source: home }),
+    ).toMatchObject({ ok: true });
+    await db.execute(sql`
+      DELETE FROM public.sign_in_throttles WHERE key = ${throttleAccountKey(person.email)}`);
+  });
+
+  it("a wrong code, or setting up at first sign-in, counts the same way", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org, { factor: false });
+    const from = source();
+    const begun = await beginSession(db, {
+      email: person.email,
+      password: PASSWORD,
+      source: from,
+      organizationId: org,
+    });
+    if (!begun.ok) throw new Error("no sign-in");
+    expect(await knownSources(person.email)).toEqual([]);
+    const start = await startEnrolment(db, keys, begun.token, { issuer: "Invented Society" });
+    if (!start.ok) throw new Error(JSON.stringify(start));
+    const secret = decodeBase32(start.secret);
+    if (secret === undefined) throw new Error("not base32");
+    const right = await codeAt(secret);
+    const wrong = String((Number(right) + 1) % 1_000_000).padStart(6, "0");
+    expect(
+      await confirmEnrolment(db, keys, begun.token, { source: from, code: wrong }),
+    ).toMatchObject({ code: "invalid_code" });
+    expect(await knownSources(person.email)).toEqual([]);
+    expect(
+      await confirmEnrolment(db, keys, begun.token, { source: from, code: right }),
+    ).toMatchObject({ ok: true });
+    expect(await knownSources(person.email)).toEqual([throttleSourceKey(from)]);
   });
 });
 
