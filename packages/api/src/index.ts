@@ -104,3 +104,16 @@ export {
 export type { MailKind, RenderedMail } from "./mail-messages.js";
 export { startAlertNotices } from "./alert-notices.js";
 export type { AlertNoticeRunner, AlertNoticeRunnerOptions } from "./alert-notices.js";
+export {
+  fileReply,
+  isFileReply,
+  mayShowInline,
+  safeFileName,
+  contentDisposition,
+  INLINE_FILE_TYPES,
+  DOWNLOAD_TYPE,
+  FILE_CSP,
+  FILE_SECURITY_HEADERS,
+  MAX_FILE_NAME_LENGTH,
+} from "./file-replies.js";
+export type { FileReply, FileReplyInput } from "./file-replies.js";

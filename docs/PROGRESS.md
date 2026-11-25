@@ -10,6 +10,14 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Gate: PASS · tests_passing 4359 (was 4344) · npm audit clean. A first run timed out once in `second-factor.test.ts` › "locks user rows before factor rows" under load (passes alone 3 of 3; this change doesn't touch the database package), like S-029.
 - Next: S-026 (T-050b needs stored Dublin Core mappings first)
 
+## 2026-11-24 21:20 CT — Chat B — M-001 Serve active file types safely
+- Result: done
+- What changed: `fileReply` (packages/api/src/file-replies.ts) is the only way a handler sends a file's bytes: plain images, audio and video may be shown as their bare type, everything else (HTML, SVG, XML, scripts, PDF, unknown) downloads as `application/octet-stream`; every file reply has nosniff, a sandboxing CSP, same-origin CORP and nothing the handler set; safe RFC 6266/8187 names; streams opened only when sent, outside the handler timeout, within a 2-hour deadline, closed on errors, wrong lengths, hang-ups and shutdown; HEAD opens nothing. HTTP attack tests and a Chromium test that a page on another origin can't run an HTML, SVG or XHTML file's script.
+- Decisions: D-089
+- Review: three independent rounds plus a short fourth look. Fixed: a storage error or an object-mode stream could crash the server, downloads were cut at 30 s, sources leaked on abort, wrong lengths and failed handlers, HEAD read whole files, a missing file dropped the connection, failures were logged as hang-ups, shutdown could be held, name details. Left as S-035 (download limits per client).
+- Gate: PASS · tests_passing 4372 (was 4344) · npm audit clean
+- Next: the next job in the work board's pool (S-026).
+
 ## 2026-11-24 22:40 CT — manual (Chat D) — T-056 Desktop launcher
 - Result: done
 - What changed: `npm run desktop` and `scripts/start-oculus.cmd` run the admin on 127.0.0.1 in an Edge or Chrome app window with its own profile, stopping when the window closes; settings, a 0600 secret key and a single-instance lock in the per-user settings folder; `extraRoutes` on `buildAdminServer`; docs/DESKTOP.md (Windows guide). John chose to stay inside D-002 (no Electron, no bundled PostgreSQL). Smoke-tested with a real Chrome under Xvfb: sign-in screen in the window, server stopped on close.
