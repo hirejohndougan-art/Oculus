@@ -231,21 +231,14 @@ describe("holding a custom role", () => {
     const object = await makeObject(w, w.a, w.a1, "An invented lamp");
     const me = asUser(person, w.a1);
     ok(
-      await w.service.updateRecord(
-        me,
-        object.id as never,
-        objectDraft("An invented oil lamp"),
-        {
-          expectedVersion: object.version,
-        },
-      ),
+      await w.service.updateRecord(me, object.id as never, objectDraft("An invented oil lamp"), {
+        expectedVersion: object.version,
+      }),
     );
-    expect(codes(await w.service.createRecord(me, objectDraft("New")))).toEqual([
+    expect(codes(await w.service.createRecord(me, objectDraft("New")))).toEqual(["not_permitted"]);
+    expect(codes(await w.service.publish(me, object.id as never, { expectedVersion: 2 }))).toEqual([
       "not_permitted",
     ]);
-    expect(
-      codes(await w.service.publish(me, object.id as never, { expectedVersion: 2 })),
-    ).toEqual(["not_permitted"]);
 
     // Taking edit away needs the holders confirmed, then applies to the next write.
     const narrower = { key: "editor", label: "Editor", permissions: ["records.view"] };
@@ -333,6 +326,60 @@ describe("holding a custom role", () => {
       ORDER BY occurred_at`);
     // Moved onto a grant they already held: only the revoke is logged.
     expect(moved.map((m) => `${m.kind}:${m.role}`)).toEqual(["role_revoked:editor"]);
+  });
+
+  it("moving holders to a role that publishes is confirmed first, and the change log can't be changed", async () => {
+    ok(
+      await w.service.saveCustomRole(
+        rootIn(),
+        { key: "viewer", label: "Viewer", permissions: ["records.view"] },
+        { expectedVersion: 0 },
+      ),
+    );
+    const person = await w.member(w.a, "Viewer");
+    ok(
+      await w.service.grantRole(rootIn(), {
+        userId: person,
+        role: "viewer",
+        siteId: w.a1,
+        scope: null,
+      }),
+    );
+    const asked = await w.service.deleteCustomRole(rootIn(), "viewer", {
+      expectedVersion: 1,
+      moveTo: "reviewer",
+      confirmHolders: 1,
+    });
+    expect(codes(asked)).toEqual(["needs_confirmation"]);
+    expect(asked.ok ? [] : asked.issues.map((i) => i.path)).toEqual([
+      ["confirm", "records.publish"],
+    ]);
+    expect(
+      ok(
+        await w.service.deleteCustomRole(rootIn(), "viewer", {
+          expectedVersion: 1,
+          moveTo: "reviewer",
+          confirmHolders: 1,
+          confirm: ["records.publish"],
+        }),
+      ),
+    ).toEqual({ key: "viewer", moved: 1, movedTo: "reviewer" });
+    const granted = await w.db.rows<{ role: string }>(sql`
+      SELECT role FROM public.people_events
+      WHERE subject_id = ${person}::uuid AND kind = 'role_granted' AND role = 'reviewer'`);
+    expect(granted).toHaveLength(1);
+    // Append only, for every writer; a version goes up by one.
+    await expect(
+      w.db.execute(sql`UPDATE public.custom_role_events SET label = 'x'
+                       WHERE organization_id = ${w.a}::uuid`),
+    ).rejects.toThrow(/never changed/);
+    await expect(
+      w.db.execute(sql`DELETE FROM public.custom_role_events WHERE organization_id = ${w.a}::uuid`),
+    ).rejects.toThrow(/never changed/);
+    await expect(
+      w.db.execute(sql`UPDATE public.custom_roles SET version = version + 5
+                       WHERE organization_id = ${w.a}::uuid AND key = 'describer'`),
+    ).rejects.toThrow(/up by one/);
   });
 
   it("the role list shows custom roles to those who grant roles", async () => {

@@ -32,9 +32,12 @@
  */
 import {
   BUILT_IN_ROLES,
+  ROLE_PERMISSIONS,
+  SENSITIVE_PERMISSIONS,
   addedSensitive,
   isBuiltInRole,
   isCustomRoleKey,
+  isCustomRolePermission,
   isPlainObject,
   issue,
   newRecordId,
@@ -47,6 +50,7 @@ import {
 import {
   deleteCustomRole as deleteStoredRole,
   deleteRoleAssignment,
+  countHoldings,
   holdingsOfRole,
   insertCustomRole,
   insertPeopleEvent,
@@ -56,6 +60,7 @@ import {
   lockPeopleForRoleChange,
   readCustomRole,
   recordCustomRoleEvent,
+  shareCustomRole,
   updateCustomRole,
   type Queryable,
   type RoleHolding,
@@ -163,8 +168,11 @@ export function customRoleOperations(run: Runner): CustomRoleOperations {
   async function manager(
     tx: Queryable,
     who: { organizationId: OrganizationId; actor: string },
-    lock = true,
+    lock = false,
   ): Promise<ServiceResult<UserId>> {
+    // A first look without locks (as grantRoleIn): the actor's row is locked
+    // with the holders' in one ordered call (lockRole), never FOR SHARE first,
+    // which two such changes would deadlock upgrading (db permissions.ts).
     const access = await readAccess(tx, who.organizationId, who.actor, { lock });
     if (!access.ok) return access;
     if (!access.value.systemManager) return notPermitted();
@@ -179,6 +187,9 @@ export function customRoleOperations(run: Runner): CustomRoleOperations {
     tx: Queryable,
     org: OrganizationId,
     key: string,
+    actor: UserId,
+    /** Another custom role to hold FOR KEY SHARE (a deletion's target), locked in key order. */
+    alsoShare?: string,
   ): Promise<
     | {
         readonly ok: true;
@@ -198,11 +209,31 @@ export function customRoleOperations(run: Runner): CustomRoleOperations {
         ),
       };
     }
-    const locked = new Set<string>(first.map((h) => h.userId));
+    const locked = new Set<string>([actor, ...first.map((h) => h.userId)]);
+    // People first, in one ordered call (the order a role grant takes them),
+    // then the roles in key order.
     await lockPeopleForRoleChange(tx, [...locked] as UserId[]);
+    const unknownTarget = {
+      ok: false as const,
+      result: refusal<never>(["options", "moveTo"], "unknown_role", UNKNOWN_ROLE),
+    };
+    if (
+      alsoShare !== undefined &&
+      alsoShare < key &&
+      !(await shareCustomRole(tx, org, alsoShare))
+    ) {
+      return unknownTarget;
+    }
     const role = await readCustomRole(tx, org, key, { lock: "update" });
     if (role === undefined) {
       return { ok: false, result: refusal(["key"], "unknown_role", UNKNOWN_ROLE) };
+    }
+    if (
+      alsoShare !== undefined &&
+      alsoShare > key &&
+      !(await shareCustomRole(tx, org, alsoShare))
+    ) {
+      return unknownTarget;
     }
     const holdings = await holdingsOfRole(tx, org, key, MAX_ROLE_HOLDINGS + 1);
     if (holdings.length > MAX_ROLE_HOLDINGS) {
@@ -211,9 +242,19 @@ export function customRoleOperations(run: Runner): CustomRoleOperations {
         result: refusal([], "too_many_grants", "This role has too many grants to change at once."),
       };
     }
-    // Granted in between (committed before the role's lock): lock them too.
-    const extra = holdings.map((h) => h.userId).filter((u) => !locked.has(u));
-    if (extra.length > 0) await lockPeopleForRoleChange(tx, extra);
+    // Granted in between: locking them now would take a person after the
+    // role, the other way round from a grant. Rare; the caller tries again.
+    if (holdings.some((h) => !locked.has(h.userId))) {
+      return {
+        ok: false,
+        result: refusal([], "retry", "Someone was given this role just now. Try again."),
+      };
+    }
+    // The actor's own access, read again under their row's lock.
+    const again = await readAccess(tx, org, `user:${actor}`);
+    if (!again.ok || !again.value.systemManager) {
+      return { ok: false, result: notPermitted() };
+    }
     return { ok: true, role, holdings };
   }
 
@@ -223,17 +264,13 @@ export function customRoleOperations(run: Runner): CustomRoleOperations {
         const me = await manager(tx, who, false);
         if (!me.ok) return me;
         const roles = await listStoredRoles(tx, who.organizationId);
-        const views: CustomRoleView[] = [];
-        for (const role of roles) {
-          const holdings = await holdingsOfRole(
-            tx,
-            who.organizationId,
-            role.key,
-            MAX_ROLE_HOLDINGS,
-          );
-          views.push(Object.freeze({ role, grants: holdings.length }));
-        }
-        return { ok: true, value: Object.freeze(views) };
+        const counts = await countHoldings(tx, who.organizationId);
+        return {
+          ok: true,
+          value: Object.freeze(
+            roles.map((role) => Object.freeze({ role, grants: counts.get(role.key) ?? 0 })),
+          ),
+        };
       });
     },
 
@@ -323,7 +360,7 @@ export function customRoleOperations(run: Runner): CustomRoleOperations {
             );
           }
         } else {
-          const locked = await lockRole(tx, org, role.key);
+          const locked = await lockRole(tx, org, role.key, me.value);
           if (!locked.ok) return locked.result;
           before = locked.role;
           holdings = locked.holdings;
@@ -404,7 +441,12 @@ export function customRoleOperations(run: Runner): CustomRoleOperations {
         const me = await manager(tx, who);
         if (!me.ok) return me;
         if (!isCustomRoleKey(key)) return refusal(["key"], "unknown_role", UNKNOWN_ROLE);
-        const opts = readOptions(options, ["expectedVersion", "moveTo", "confirmHolders"]);
+        const opts = readOptions(options, [
+          "expectedVersion",
+          "moveTo",
+          "confirmHolders",
+          "confirm",
+        ]);
         if (!opts.ok) return opts;
         const expectedVersion = own(opts.value, "expectedVersion");
         if (typeof expectedVersion !== "number" || !Number.isInteger(expectedVersion)) {
@@ -437,7 +479,13 @@ export function customRoleOperations(run: Runner): CustomRoleOperations {
             }
           }
         }
-        const locked = await lockRole(tx, org, key);
+        const locked = await lockRole(
+          tx,
+          org,
+          key,
+          me.value,
+          typeof moveTo === "string" && isCustomRoleKey(moveTo) ? moveTo : undefined,
+        );
         if (!locked.ok) return locked.result;
         const { role, holdings } = locked;
         if (role.version !== expectedVersion) {
@@ -461,9 +509,38 @@ export function customRoleOperations(run: Runner): CustomRoleOperations {
               ],
             };
           }
-          // The target, read (and locked against deletion) now.
-          if (!isBuiltInRole(moveTo) && (await readCustomRole(tx, org, moveTo)) === undefined) {
+          // The target: built in, or held FOR KEY SHARE by lockRole above.
+          const target: readonly string[] | undefined = isBuiltInRole(moveTo)
+            ? ROLE_PERMISSIONS[moveTo]
+            : (await readCustomRole(tx, org, moveTo))?.permissions;
+          if (target === undefined) {
             return refusal(["options", "moveTo"], "unknown_role", UNKNOWN_ROLE);
+          }
+          // Moving gives the holders what the target allows: publishing and
+          // donor data it adds are confirmed, as adding them to a role is (D-036).
+          const gained = target.filter(
+            (p) =>
+              isCustomRolePermission(p) &&
+              SENSITIVE_PERMISSIONS.has(p) &&
+              !role.permissions.includes(p),
+          );
+          const confirmMove: unknown = own(opts.value, "confirm") ?? [];
+          if (
+            gained.length > 0 &&
+            (!Array.isArray(confirmMove) ||
+              gained.length !== confirmMove.length ||
+              !gained.every((p) => confirmMove.includes(p)))
+          ) {
+            return {
+              ok: false,
+              issues: gained.map((p) =>
+                issue(
+                  ["confirm", p],
+                  "needs_confirmation",
+                  `Moving its holders to that role lets them ${p === "records.publish" ? "publish and withdraw records" : p === "donors.view" ? "see donors, accessions and deeds of gift" : "change donors, accessions and deeds of gift"}.`,
+                ),
+              ),
+            };
           }
           if (confirmHolders !== holdings.length) {
             return { ok: false, issues: holdersIssues(holdings, "move") };

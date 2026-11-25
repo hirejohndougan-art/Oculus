@@ -161,6 +161,35 @@ export async function deleteCustomRole(
   return rows.length > 0;
 }
 
+/** How many grants of each of the organization's custom roles there are. */
+export async function countHoldings(
+  db: Queryable,
+  organizationId: OrganizationId,
+): Promise<ReadonlyMap<string, number>> {
+  if (!isOrganizationId(organizationId)) return new Map();
+  const rows = await db.rows<{ role: string; n: string }>(sql`
+    SELECT a.role, count(*)::text AS n
+    FROM public.role_assignments a
+    JOIN public.custom_roles c ON c.organization_id = a.organization_id AND c.key = a.role
+    WHERE a.organization_id = ${organizationId}::uuid
+    GROUP BY a.role`);
+  return new Map(rows.map((r) => [r.role, Number(r.n)]));
+}
+
+/** Locks a role's row FOR KEY SHARE (it can't be deleted until COMMIT); `false` if there is none. */
+export async function shareCustomRole(
+  db: Queryable,
+  organizationId: OrganizationId,
+  key: string,
+): Promise<boolean> {
+  if (!isOrganizationId(organizationId) || !isCustomRoleKey(key)) return false;
+  const rows = await db.rows(sql`
+    SELECT 1 FROM public.custom_roles
+    WHERE organization_id = ${organizationId}::uuid AND key = ${key}
+    FOR KEY SHARE`);
+  return rows.length > 0;
+}
+
 /** One grant of a role, for "who is affected". */
 export interface RoleHolding {
   readonly assignmentId: string;

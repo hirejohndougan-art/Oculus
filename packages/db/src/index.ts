@@ -546,6 +546,7 @@ export {
 export type { StorageSaveOutcome, StoredDefinition, StoredStorage } from "./storage.js";
 export {
   CUSTOM_ROLE_TABLE_PRIVILEGES,
+  countHoldings,
   deleteCustomRole,
   holdingsOfRole,
   insertCustomRole,
@@ -553,6 +554,7 @@ export {
   listCustomRoles,
   readCustomRole,
   recordCustomRoleEvent,
+  shareCustomRole,
   updateCustomRole,
 } from "./custom-roles.js";
 export type {

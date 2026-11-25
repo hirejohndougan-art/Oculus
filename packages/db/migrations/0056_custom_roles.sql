@@ -10,7 +10,7 @@
 -- its holders to another role first, in the same transaction).
 --
 -- custom_role_events: the change log of custom roles (made, changed,
--- deleted), insert only: who, when, the role's label and permissions after
+-- deleted), append only and stamped when made (as people_events): who, when, the role's label and permissions after
 -- the change, how many grants it had, and for a deletion the role its
 -- holders were moved to.
 --
@@ -61,6 +61,63 @@ CREATE TABLE public.custom_role_events (
 
 CREATE INDEX custom_role_events_time
   ON public.custom_role_events (organization_id, occurred_at DESC, id DESC);
+
+-- The change log is append only, stamped when the change is made (as
+-- people_events, 0020).
+CREATE FUNCTION public.custom_role_events_check_new() RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  IF NEW.occurred_at < now() OR NEW.occurred_at > clock_timestamp() THEN
+    RAISE EXCEPTION 'A change is logged when it is made.'
+      USING ERRCODE = 'integrity_constraint_violation',
+            CONSTRAINT = 'custom_role_events_now';
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER custom_role_events_check_new
+  BEFORE INSERT ON public.custom_role_events
+  FOR EACH ROW EXECUTE FUNCTION public.custom_role_events_check_new();
+
+CREATE FUNCTION public.custom_role_events_append_only() RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  RAISE EXCEPTION 'The change log is never changed or emptied.'
+    USING ERRCODE = 'integrity_constraint_violation',
+          CONSTRAINT = 'custom_role_events_append_only';
+END
+$$;
+
+CREATE TRIGGER custom_role_events_append_only
+  BEFORE UPDATE OR DELETE ON public.custom_role_events
+  FOR EACH ROW EXECUTE FUNCTION public.custom_role_events_append_only();
+
+CREATE TRIGGER custom_role_events_no_truncate
+  BEFORE TRUNCATE ON public.custom_role_events
+  FOR EACH STATEMENT EXECUTE FUNCTION public.custom_role_events_append_only();
+
+-- A role's version goes up by exactly one on every change.
+CREATE FUNCTION public.custom_roles_version_step() RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  IF NEW.version <> OLD.version + 1 THEN
+    RAISE EXCEPTION 'A role''s version goes up by one on every change.'
+      USING ERRCODE = 'integrity_constraint_violation',
+            CONSTRAINT = 'custom_roles_version_step';
+  END IF;
+  RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER custom_roles_version_step BEFORE UPDATE ON public.custom_roles
+  FOR EACH ROW EXECUTE FUNCTION public.custom_roles_version_step();
 
 -- The organization and key never change.
 CREATE TRIGGER zzzz_custom_roles_keep_identity BEFORE UPDATE ON public.custom_roles
@@ -116,6 +173,10 @@ $$;
 CREATE TRIGGER role_assignments_check_role BEFORE INSERT ON public.role_assignments
   FOR EACH ROW EXECUTE FUNCTION public.role_assignments_check_role();
 
+ALTER TABLE public.custom_role_events ENABLE ALWAYS TRIGGER custom_role_events_check_new;
+ALTER TABLE public.custom_role_events ENABLE ALWAYS TRIGGER custom_role_events_append_only;
+ALTER TABLE public.custom_role_events ENABLE ALWAYS TRIGGER custom_role_events_no_truncate;
+ALTER TABLE public.custom_roles ENABLE ALWAYS TRIGGER custom_roles_version_step;
 ALTER TABLE public.custom_roles ENABLE ALWAYS TRIGGER zzzz_custom_roles_keep_identity;
 ALTER TABLE public.custom_roles ENABLE ALWAYS TRIGGER custom_roles_check_delete;
 ALTER TABLE public.role_assignments ENABLE ALWAYS TRIGGER role_assignments_check_role;
