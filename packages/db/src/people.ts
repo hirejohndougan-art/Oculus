@@ -23,7 +23,7 @@ import {
 } from "@oculus/core";
 import type { Queryable } from "./client.js";
 import { readActingSession, tokenHash } from "./sessions.js";
-import { sql } from "./sql.js";
+import { sql, type Sql } from "./sql.js";
 import type { SystemEventKind } from "./system-events.js";
 
 /** The writer's grants for this module's table (D-067): the change log is insert-only. */
@@ -851,6 +851,27 @@ export async function readAuditTrail(
   const to = filter.to ?? null;
   const cursorAt = cursor?.[1] ?? null;
   const cursorKey = cursor?.[2] ?? null;
+  // Each kind of entry is read newest first and only one page of it (S-066):
+  // with its `(organization_id, time DESC)` index, a long history costs a
+  // page per kind, not the whole table. The outer query then merges them.
+  // Each part's columns are typed here: a part on its own would read its
+  // blank (NULL) columns as text.
+  const paged = (branch: Sql): Sql => sql`(
+      SELECT b.type::text, b.at::timestamptz, b.key::text, b.actor::text, b.record_id::text,
+             b.version::integer, b.action::text, b.title::text, b.record_kind::text,
+             b.changed_fields::text[], b.reason::text, b.deleted::boolean, b.event_id::text,
+             b.kind::text, b.subject_id::uuid, b.role::text, b.site_id::text, b.scope::text,
+             b.invitation_id::uuid, b.version_to::text, b.version_from::text,
+             b.file_count::integer, b.byte_count::bigint, b.detail::jsonb
+      FROM (${branch}) AS b (type, at, key, actor, record_id, version, action, title,
+                             record_kind, changed_fields, reason, deleted, event_id, kind,
+                             subject_id, role, site_id, scope, invitation_id, version_to,
+                             version_from, file_count, byte_count, detail)
+      WHERE ${cursorAt}::text IS NULL
+         OR (b.at <= (${cursorAt}::timestamp AT TIME ZONE 'UTC')
+             AND (b.at, b.key) < ((${cursorAt}::timestamp AT TIME ZONE 'UTC'), ${cursorKey}::text))
+      ORDER BY b.at DESC, b.key DESC
+      LIMIT ${limit + 1})`;
   const rows = await db.rows<AuditRow>(sql`
     WITH names AS (
       SELECT u.id, u.display_name FROM public.users u
@@ -859,6 +880,7 @@ export async function readAuditTrail(
                     WHERE m.organization_id = ${organizationId}::uuid AND m.user_id = u.id)
     ),
     entries AS (
+      ${paged(sql`
       SELECT 'record' AS type, v.recorded_at AS at,
              'r' || v.record_id::text || ':' || lpad(v.version::text, 10, '0') AS key,
              v.actor, v.record_id::text AS record_id, v.version, v.action,
@@ -882,7 +904,9 @@ export async function readAuditTrail(
         AND (${filter.recordId ?? null}::uuid IS NULL OR v.record_id = ${filter.recordId ?? null}::uuid)
         AND (${from}::timestamptz IS NULL OR v.recorded_at >= ${from}::timestamptz)
         AND (${to}::timestamptz IS NULL OR v.recorded_at < ${to}::timestamptz)
+      `)}
       UNION ALL
+      ${paged(sql`
       SELECT 'people', e.occurred_at, 'e' || e.id::text,
              'user:' || e.actor_id::text, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
              e.id::text, e.kind, e.subject_id, e.role, e.site_id::text,
@@ -896,7 +920,9 @@ export async function readAuditTrail(
         AND (${actor}::uuid IS NULL OR e.actor_id = ${actor}::uuid)
         AND (${from}::timestamptz IS NULL OR e.occurred_at >= ${from}::timestamptz)
         AND (${to}::timestamptz IS NULL OR e.occurred_at < ${to}::timestamptz)
+      `)}
       UNION ALL
+      ${paged(sql`
       -- Changes to the server itself (T-060a): no organization's, so only
       -- for system managers (scope.system).
       SELECT 'system', s.occurred_at, 's' || s.id::text,
@@ -910,7 +936,9 @@ export async function readAuditTrail(
         AND (${actor}::uuid IS NULL OR s.actor_id = ${actor}::uuid)
         AND (${from}::timestamptz IS NULL OR s.occurred_at >= ${from}::timestamptz)
         AND (${to}::timestamptz IS NULL OR s.occurred_at < ${to}::timestamptz)
+      `)}
       UNION ALL
+      ${paged(sql`
       -- Definitions made or changed (S-064, D-117): the organization's for
       -- whole-organization viewers, a site's for those who see its records,
       -- the System settings for system managers.
@@ -930,7 +958,9 @@ export async function readAuditTrail(
         AND (${actor}::text IS NULL OR d.actor = 'user:' || ${actor}::text)
         AND (${from}::timestamptz IS NULL OR d.occurred_at >= ${from}::timestamptz)
         AND (${to}::timestamptz IS NULL OR d.occurred_at < ${to}::timestamptz)
+      `)}
       UNION ALL
+      ${paged(sql`
       -- Files attached and removed (M-002), scoped like record versions.
       SELECT 'file', f.occurred_at, 'f' || f.id::text, f.actor, f.record_id::text, NULL,
              f.kind, r.title, r.kind, NULL, NULL, r.id IS NULL, f.id::text, f.kind, NULL, NULL,
@@ -946,7 +976,9 @@ export async function readAuditTrail(
         AND (${filter.recordId ?? null}::uuid IS NULL OR f.record_id = ${filter.recordId ?? null}::uuid)
         AND (${from}::timestamptz IS NULL OR f.occurred_at >= ${from}::timestamptz)
         AND (${to}::timestamptz IS NULL OR f.occurred_at < ${to}::timestamptz)
+      `)}
       UNION ALL
+      ${paged(sql`
       -- Moves to a storage location (T-018d), scoped like record versions.
       SELECT 'move', m.recorded_at, 'm' || m.id::text, 'user:' || m.recorded_by::text,
              m.record_id::text, NULL, NULL, r.title, r.kind, NULL, NULL, r.id IS NULL,
@@ -964,7 +996,9 @@ export async function readAuditTrail(
         AND (${filter.recordId ?? null}::uuid IS NULL OR m.record_id = ${filter.recordId ?? null}::uuid)
         AND (${from}::timestamptz IS NULL OR m.recorded_at >= ${from}::timestamptz)
         AND (${to}::timestamptz IS NULL OR m.recorded_at < ${to}::timestamptz)
+      `)}
       UNION ALL
+      ${paged(sql`
       -- Accession saves (T-018c): only with scope.accessions (donors.view on
       -- every site), and only the number (the donor stays on its own page).
       SELECT 'accession', a.saved_at,
@@ -978,7 +1012,9 @@ export async function readAuditTrail(
         AND (${actor}::uuid IS NULL OR a.saved_by = ${actor}::uuid)
         AND (${from}::timestamptz IS NULL OR a.saved_at >= ${from}::timestamptz)
         AND (${to}::timestamptz IS NULL OR a.saved_at < ${to}::timestamptz)
+      `)}
       UNION ALL
+      ${paged(sql`
       -- A share's steps (T-041c, S-036b), for those who see the record
       -- itself (its home organization, and its home site in their scope;
       -- shares between two sites of one organization included). The
@@ -986,30 +1022,68 @@ export async function readAuditTrail(
       -- items by other rules, and 0043 hides a deleted record's shares there
       -- (review). Someone of another organization is never named or given
       -- by ID: other_organization (D-019).
-      SELECT 'share', step.at, 'h' || sh.id::text || ':' || step.part, who.actor,
+      -- One part per step (S-066), so each reads its own index.
+      SELECT 'share', sh.offered_at, 'h' || sh.id::text || ':o', who.actor,
              sh.record_id::text, NULL, NULL, r.title, r.kind, NULL, NULL, r.id IS NULL,
-             sh.id::text, step.kind, NULL, NULL, sh.target_site_id::text, NULL, NULL, NULL,
+             sh.id::text, 'offered', NULL, NULL, sh.target_site_id::text, NULL, NULL, NULL,
              NULL, NULL, NULL, NULL
       FROM public.record_shares sh
       LEFT JOIN public.records r ON r.organization_id = sh.organization_id AND r.id = sh.record_id
-      CROSS JOIN LATERAL (VALUES
-        ('o', 'offered', sh.offered_at, sh.offered_by),
-        ('d', CASE WHEN sh.state = 'declined' THEN 'declined' ELSE 'accepted' END,
-         sh.decided_at, sh.decided_by),
-        ('e', sh.state, sh.ended_at, sh.ended_by)
-      ) AS step (part, kind, at, by_id)
       CROSS JOIN LATERAL (SELECT CASE
-        WHEN step.by_id IS NULL THEN 'automatic'
-        WHEN EXISTS (SELECT 1 FROM names n WHERE n.id = step.by_id) THEN 'user:' || step.by_id::text
+        WHEN sh.offered_by IS NULL THEN 'automatic'
+        WHEN EXISTS (SELECT 1 FROM names n WHERE n.id = sh.offered_by) THEN 'user:' || sh.offered_by::text
         ELSE 'other_organization' END AS actor) AS who
       WHERE ${wantRecords}::boolean
-        AND step.at IS NOT NULL
+        AND sh.offered_at IS NOT NULL
         AND sh.organization_id = ${organizationId}::uuid
         AND (${recordSites === null}::boolean OR r.site_id = ANY (${recordSites ?? []}::uuid[]))
         AND (${actor}::text IS NULL OR who.actor = 'user:' || ${actor}::text)
         AND (${filter.recordId ?? null}::uuid IS NULL OR sh.record_id = ${filter.recordId ?? null}::uuid)
-        AND (${from}::timestamptz IS NULL OR step.at >= ${from}::timestamptz)
-        AND (${to}::timestamptz IS NULL OR step.at < ${to}::timestamptz)
+        AND (${from}::timestamptz IS NULL OR sh.offered_at >= ${from}::timestamptz)
+        AND (${to}::timestamptz IS NULL OR sh.offered_at < ${to}::timestamptz)
+      `)}
+      UNION ALL
+      ${paged(sql`
+      SELECT 'share', sh.decided_at, 'h' || sh.id::text || ':d', who.actor,
+             sh.record_id::text, NULL, NULL, r.title, r.kind, NULL, NULL, r.id IS NULL,
+             sh.id::text, CASE WHEN sh.state = 'declined' THEN 'declined' ELSE 'accepted' END, NULL, NULL, sh.target_site_id::text, NULL, NULL, NULL,
+             NULL, NULL, NULL, NULL
+      FROM public.record_shares sh
+      LEFT JOIN public.records r ON r.organization_id = sh.organization_id AND r.id = sh.record_id
+      CROSS JOIN LATERAL (SELECT CASE
+        WHEN sh.decided_by IS NULL THEN 'automatic'
+        WHEN EXISTS (SELECT 1 FROM names n WHERE n.id = sh.decided_by) THEN 'user:' || sh.decided_by::text
+        ELSE 'other_organization' END AS actor) AS who
+      WHERE ${wantRecords}::boolean
+        AND sh.decided_at IS NOT NULL
+        AND sh.organization_id = ${organizationId}::uuid
+        AND (${recordSites === null}::boolean OR r.site_id = ANY (${recordSites ?? []}::uuid[]))
+        AND (${actor}::text IS NULL OR who.actor = 'user:' || ${actor}::text)
+        AND (${filter.recordId ?? null}::uuid IS NULL OR sh.record_id = ${filter.recordId ?? null}::uuid)
+        AND (${from}::timestamptz IS NULL OR sh.decided_at >= ${from}::timestamptz)
+        AND (${to}::timestamptz IS NULL OR sh.decided_at < ${to}::timestamptz)
+      `)}
+      UNION ALL
+      ${paged(sql`
+      SELECT 'share', sh.ended_at, 'h' || sh.id::text || ':e', who.actor,
+             sh.record_id::text, NULL, NULL, r.title, r.kind, NULL, NULL, r.id IS NULL,
+             sh.id::text, sh.state, NULL, NULL, sh.target_site_id::text, NULL, NULL, NULL,
+             NULL, NULL, NULL, NULL
+      FROM public.record_shares sh
+      LEFT JOIN public.records r ON r.organization_id = sh.organization_id AND r.id = sh.record_id
+      CROSS JOIN LATERAL (SELECT CASE
+        WHEN sh.ended_by IS NULL THEN 'automatic'
+        WHEN EXISTS (SELECT 1 FROM names n WHERE n.id = sh.ended_by) THEN 'user:' || sh.ended_by::text
+        ELSE 'other_organization' END AS actor) AS who
+      WHERE ${wantRecords}::boolean
+        AND sh.ended_at IS NOT NULL
+        AND sh.organization_id = ${organizationId}::uuid
+        AND (${recordSites === null}::boolean OR r.site_id = ANY (${recordSites ?? []}::uuid[]))
+        AND (${actor}::text IS NULL OR who.actor = 'user:' || ${actor}::text)
+        AND (${filter.recordId ?? null}::uuid IS NULL OR sh.record_id = ${filter.recordId ?? null}::uuid)
+        AND (${from}::timestamptz IS NULL OR sh.ended_at >= ${from}::timestamptz)
+        AND (${to}::timestamptz IS NULL OR sh.ended_at < ${to}::timestamptz)
+      `)}
     )
     SELECT x.type, to_char(x.at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS at,
            to_char(x.at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US') || '_' || x.key
