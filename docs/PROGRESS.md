@@ -2,6 +2,30 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 22:40 CT — manual (Chat D) — T-056 Desktop launcher
+- Result: done
+- What changed: `npm run desktop` and `scripts/start-oculus.cmd` run the admin on 127.0.0.1 in an Edge or Chrome app window with its own profile, stopping when the window closes; settings, a 0600 secret key and a single-instance lock in the per-user settings folder; `extraRoutes` on `buildAdminServer`; docs/DESKTOP.md (Windows guide). John chose to stay inside D-002 (no Electron, no bundled PostgreSQL). Smoke-tested with a real Chrome under Xvfb: sign-in screen in the window, server stopped on close.
+- Decisions: D-088
+- Review: three independent rounds. Fixed: server left running after a failure after listen; stale and reused-PID locks (now an HMAC challenge to the running server, whole-file lock, rename takeover, busy is not stale); a new key over sealed two-step secrets or a wrong key (refused, revoked set-ups ignored); weak Origin test; SIGHUP/SIGBREAK; npm ci after updates; Windows setup step (`exec` in npm scripts). Left as S-033.
+- Gate: PASS · tests_passing see baseline · npm audit clean
+- Next: T-057 (desktop database helper, Chat D)
+
+## 2026-11-24 21:10 CT — manual (Chat A) — T-040 Sending password reset email
+- Result: done
+- What changed: `packages/api` mail-messages, mail-outbox and mail (SMTP, STARTTLS required, development sender refused in production); reset links, set-up codes and invitations by email, wired into T-048's hooks; the second-step alert notices (migration 0021, one summary per admin per run, longer retries, alerts listed on the Person page and in the frame); the password-changed notice.
+- Decisions: D-085
+- Review: one independent round, no blocking issue; fixed alert loss under credential stuffing and short outages, TLS failure classes, close() deadline, first-send expiry, TLS option order, address-only admin summaries.
+- Gate: PASS · tests_passing 4292 (was 4261, with T-048a merged) · npm audit clean
+- Next: M-002 (finishing), M-003
+
+## 2026-11-24 21:05 CT — manual (Chat C) — T-048a Admin: System settings
+- Result: done
+- What changed: System settings for system managers (sidebar "System" group, `/settings`): Sites (list, add, rename), Templates (list and a field editor through the existing template PUT with its confirmations), Sign-in rules. API: `POST /api/sites`, `PUT /api/sites/:id`, `GET`/`PUT /api/system-settings`, each change behind a recent sign-in answered with T-048's re-entry form. HTTP, screen and e2e tests (Alfa on each settings screen).
+- Decisions: D-087
+- Review: one independent round, nothing blocking; fixed confirmations arriving published-records-first (the first answer is now kept) and two wordings; S-032 filed (huge If-Match versions answer 422).
+- Gate: PASS · tests_passing 4239 (was 4208) · npm audit clean
+- Next: M-001
+
 ## 2026-11-24 20:15 CT — Chat B — T-055 First-time setup command
 - Result: done
 - What changed: `npm run setup` migrates an empty database and makes the first system admin (two-step set-up at first sign-in), organization, site and a starter `Item` template in one transaction; refuses, before changing anything, a database that is set up or not Oculus's. `setUpFirstInstall`, `databaseBeforeSetup`, README note.

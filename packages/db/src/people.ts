@@ -286,7 +286,22 @@ export interface MemberSecondStep {
   /** Rows of `second_step_alerts` in the last 30 days: someone typed wrong codes. */
   readonly recentAlerts: number;
   readonly lastAlertAt: string | null;
+  /**
+   * The newest of those (at most `MEMBER_ALERTS_LISTED`), each with what the
+   * notice sender made of it (D-085): `emailed` (the person and the system
+   * admins were sent the notice), `covered` (an earlier notice in the window
+   * covered it, or it was seen too late), `pending` (not yet handled). An
+   * email lost in a crash or a long outage still leaves this trace.
+   */
+  readonly alerts: readonly {
+    readonly at: string;
+    readonly failures: number;
+    readonly notice: "emailed" | "covered" | "pending";
+  }[];
 }
+
+/** Alerts listed on a person's page at most. */
+export const MEMBER_ALERTS_LISTED = 10;
 
 export async function memberSecondStep(db: Queryable, userId: UserId): Promise<MemberSecondStep> {
   const [row] = await db.rows<{
@@ -301,11 +316,34 @@ export async function memberSecondStep(db: Queryable, userId: UserId): Promise<M
               AND a.created_at > clock_timestamp() - interval '30 days') AS alerts,
            (SELECT to_char(max(a.created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') FROM public.second_step_alerts a
             WHERE a.user_id = ${userId}::uuid) AS last_alert`);
+  const listed = await db.rows<{ at: string; failures: number; outcome: string | null }>(sql`
+    SELECT to_char(a.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS at,
+           a.failures, n.outcome
+    FROM public.second_step_alerts a
+    LEFT JOIN public.second_step_alert_notices n ON n.alert_id = a.id
+    WHERE a.user_id = ${userId}::uuid
+      AND a.created_at > clock_timestamp() - interval '30 days'
+    ORDER BY a.created_at DESC, a.id DESC
+    LIMIT ${MEMBER_ALERTS_LISTED}`);
   return Object.freeze({
     inUse: row?.enrolled_at != null,
     enrolledAt: row?.enrolled_at ?? null,
     recentAlerts: row?.alerts ?? 0,
     lastAlertAt: row?.last_alert ?? null,
+    alerts: Object.freeze(
+      listed.map((a) =>
+        Object.freeze({
+          at: a.at,
+          failures: a.failures,
+          notice:
+            a.outcome === "notified"
+              ? ("emailed" as const)
+              : a.outcome === "folded"
+                ? ("covered" as const)
+                : ("pending" as const),
+        }),
+      ),
+    ),
   });
 }
 

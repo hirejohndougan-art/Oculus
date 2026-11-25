@@ -10,7 +10,12 @@ import { ApiError, api, problemText } from "../api";
 import { Button, Field, Note } from "../components/ui";
 import styles from "./People.module.css";
 
-export function Reauth(props: { readonly onDone: () => void; readonly onCancel: () => void }) {
+export function Reauth(props: {
+  readonly onDone: () => void;
+  readonly onCancel: () => void;
+  /** What the change is, as "For changes to people". */
+  readonly what?: string;
+}) {
   const [password, setPassword] = useState("");
   const [code, setCode] = useState("");
   const [problem, setProblem] = useState<string>();
@@ -50,7 +55,7 @@ export function Reauth(props: { readonly onDone: () => void; readonly onCancel: 
       <h2 id="reauth-title" className={styles.confirmTitle}>
         Confirm it's you
       </h2>
-      <p>For changes to people, enter your password and a code again.</p>
+      <p>{props.what ?? "For changes to people"}, enter your password and a code again.</p>
       <Field
         label="Your password"
         name="password"
@@ -88,7 +93,7 @@ export function Reauth(props: { readonly onDone: () => void; readonly onCancel: 
  * Runs a change; if the server asks for a recent entry, keeps the change
  * until `reauth` is done (render `form` where the change was asked for).
  */
-export function useReauthenticated() {
+export function useReauthenticated(what?: string) {
   const [waiting, setWaiting] = useState<(() => Promise<void>) | undefined>();
   async function run(change: () => Promise<void>): Promise<void> {
     try {
@@ -104,6 +109,7 @@ export function useReauthenticated() {
   const form =
     waiting === undefined ? null : (
       <Reauth
+        {...(what === undefined ? {} : { what })}
         onDone={() => {
           const change = waiting;
           setWaiting(undefined);

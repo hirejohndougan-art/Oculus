@@ -14,9 +14,13 @@
  *   passwords by anyone make everyone wait). In development (`NODE_ENV`
  *   `development` or `test`) the server runs on localhost, where one
  *   address is expected;
- * - in production, no `deliverReset` is given (T-040 makes the email
- *   sender). In development, the default only logs that a link was made,
- *   never the token or the address (D-068's secrecy rule);
+ * - no mail sender can be made (`mailerFromEnv`, mail.ts, D-085): in
+ *   production SMTP must be configured (`OCULUS_SMTP_HOST`,
+ *   `OCULUS_MAIL_FROM`, `OCULUS_ADMIN_ORIGIN`) and the development
+ *   sender's variables must not be set. In development without SMTP, the
+ *   development sender logs only the message's kind, never the token or
+ *   the address (D-068's secrecy rule). A `mailer` or `deliverReset` passed
+ *   in is used as it is;
  * - `OCULUS_ADMIN_ORIGIN` is set but isn't one of `OCULUS_ORIGINS`, or the
  *   admin build can't be read.
  *
@@ -41,11 +45,15 @@ import {
 import { createService } from "@oculus/service";
 import type { FastifyInstance } from "fastify";
 import { ADMIN_ORIGIN_ENV, loadAdminFiles, type AdminFiles } from "./admin-files.js";
+import { isProduction } from "./environment.js";
+import { mailerFromEnv, type Mailer } from "./mail.js";
 import { trustedProxyFromEnv } from "./proxy.js";
 import type { OculusRoute } from "./routes.js";
 import { buildServer, type ServerOptions } from "./server.js";
 import { signInRoutes, type SignInApiOptions } from "./sign-in-api.js";
 import { serviceErrorLogger, staffApiRoutes, type ApiLogRecord } from "./staff-api.js";
+
+export { isProduction };
 
 export const CLIENT_ADDRESS_ENV = "OCULUS_CLIENT_ADDRESS";
 
@@ -63,13 +71,18 @@ export interface AdminServerOptions {
   readonly db: Database;
   /** Defaults to `process.env`. */
   readonly env?: Readonly<Record<string, string | undefined>>;
-  /** Sends password reset links (T-040). Required in production. */
+  /**
+   * The mail sender (mail.ts, D-085); default: `mailerFromEnv(env)`. Whoever
+   * passes one closes it.
+   */
+  readonly mailer?: Mailer;
+  /** Sends password reset links in place of the mailer's (tests). */
   readonly deliverReset?: PasswordResetDelivery;
   /**
    * Send invitations and the set-up token after a reset of two-step sign-in
-   * (T-040). In development each defaults to logging that a message was
-   * made (never its token or address); in production, without one, the
-   * matching people route answers 503 `delivery_unavailable`.
+   * in place of the mailer's (tests). By default the mailer's (D-085). A
+   * test that passes only `deliverReset` gets no mailer, and the matching
+   * people route then answers 503 `delivery_unavailable`.
    */
   readonly deliverInvitation?: InvitationDelivery;
   readonly deliverEnrolment?: EnrolmentDelivery;
@@ -87,29 +100,13 @@ export interface AdminServerOptions {
   readonly signIn?: Pick<SignInApiOptions, "rateLimits" | "clock" | "resetOptions">;
 }
 
-function defaultLog(record: ApiLogRecord): void {
+/** The default log: one JSON line on standard error. */
+export function defaultLog(record: ApiLogRecord): void {
   try {
     process.stderr.write(`${JSON.stringify({ oculus: record })}\n`);
   } catch {
     // Logging can't stop the server.
   }
-}
-
-/** Development only: says a message was made, never its token or address (D-068). */
-function developmentDelivery(
-  log: (record: ApiLogRecord) => void,
-  event: "invitation_produced" | "set_up_link_produced",
-): () => Promise<void> {
-  return () => {
-    log({ event });
-    return Promise.resolve();
-  };
-}
-
-/** True unless `NODE_ENV` says development or test. */
-export function isProduction(env: Readonly<Record<string, string | undefined>>): boolean {
-  const mode = env.NODE_ENV;
-  return mode !== "development" && mode !== "test";
 }
 
 /**
@@ -146,19 +143,17 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   const addressProblem = clientAddressProblem(env);
   if (addressProblem !== undefined) throw new Error(addressProblem);
 
+  // D-085: a real sender in production, the development one (which logs
+  // the kind only) elsewhere. Made before anything else starts, so a
+  // refusal leaves nothing running.
   let deliverReset = options.deliverReset;
+  let mailer: Mailer | undefined;
   if (deliverReset === undefined) {
-    if (production) {
-      throw new Error(
-        "refusing to start: no password reset sender (deliverReset) is configured (T-040).",
-      );
-    }
-    deliverReset = () => {
-      // Development only: say a link was made, never the token or the address.
-      log({ event: "reset_link_produced" });
-      return Promise.resolve();
-    };
+    mailer = options.mailer ?? mailerFromEnv(env, { log });
+    deliverReset = mailer.deliverReset;
   }
+  const deliverInvitation = options.deliverInvitation ?? mailer?.deliverInvitation;
+  const deliverEnrolment = options.deliverEnrolment ?? mailer?.deliverEnrolment;
 
   const adminOrigin = env[ADMIN_ORIGIN_ENV];
   let admin: ServerOptions["admin"];
@@ -189,16 +184,9 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
       people: {
         keys,
         deliverReset,
-        ...(options.deliverInvitation !== undefined
-          ? { deliverInvitation: options.deliverInvitation }
-          : production
-            ? {}
-            : { deliverInvitation: developmentDelivery(log, "invitation_produced") }),
-        ...(options.deliverEnrolment !== undefined
-          ? { deliverEnrolment: options.deliverEnrolment }
-          : production
-            ? {}
-            : { deliverEnrolment: developmentDelivery(log, "set_up_link_produced") }),
+        // D-085: the mailer feeds every people route that sends mail.
+        ...(deliverInvitation === undefined ? {} : { deliverInvitation }),
+        ...(deliverEnrolment === undefined ? {} : { deliverEnrolment }),
       },
     }),
     ...signInRoutes({
@@ -206,6 +194,7 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
       keys,
       service,
       deliverReset,
+      ...(mailer === undefined ? {} : { deliverPasswordChanged: mailer.deliverPasswordChanged }),
       log,
       warnSharedAddress: production,
       ...options.signIn,

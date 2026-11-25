@@ -69,7 +69,7 @@ Double-click `scripts\start-oculus.cmd` in the Oculus folder. To make a desktop 
 
 - **Your database.** `npm run db:backup -- <file>` makes a backup (see the README).
 - **The secret key** in `%APPDATA%\Oculus\secret-key`, made the first time Oculus starts. Two-step sign-in depends on it, and database backups don't include it. Copy it somewhere safe, like a USB drive kept with your backups. Once anyone has set up two-step sign-in, Oculus refuses to start without that key rather than make a new one that would lock everyone out: put it back from your backup. If it's truly lost, ask for help before doing anything else.
-- **Your password and recovery codes.** Until email is set up there's no password reset, and the recovery codes Oculus shows at your first sign-in are the only way in if you lose your phone. Keep both somewhere safe.
+- **Your password and recovery codes.** Without email set up there's no password reset, and the recovery codes Oculus shows at your first sign-in are the only way in if you lose your phone. Keep both somewhere safe.
 
 ## Updating
 
@@ -77,7 +77,7 @@ Close Oculus first. Then, in the Oculus folder, `git pull`, and double-click `st
 
 ## What the desktop version doesn't do yet
 
-- **No email.** "Forgot your password?" and invitations don't send anything until email is set up (T-040), so don't forget your password.
+- **No email unless you set it up.** Oculus can send email through any mail account's SMTP settings (the `OCULUS_SMTP_…` settings in the README, D-085). Without them, "Forgot your password?" and invitations send nothing, so don't forget your password.
 - **One computer.** Other people can't reach it. That needs the server version (T-051).
 - **No public website yet.** That's a later phase.
 

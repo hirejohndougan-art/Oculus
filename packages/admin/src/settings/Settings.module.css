@@ -1,0 +1,110 @@
+/* System settings (T-048a): sites, templates and the sign-in rules, after
+   design/DESIGN.md §5 and §6. The page header, tables, panels and fields
+   come from the item screens' styles (Records.module.css). */
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-bottom: 1px solid var(--border);
+}
+.tab {
+  display: inline-flex;
+  align-items: center;
+  min-height: 46px;
+  padding: 0 14px;
+  border-bottom: 3px solid transparent;
+  color: var(--text);
+  font: 600 var(--size-small) var(--font-heading);
+  text-decoration: none;
+}
+.tab[aria-current="page"] {
+  border-bottom-color: var(--accent);
+}
+.tab:focus-visible {
+  outline: 3px solid var(--link);
+  outline-offset: 2px;
+}
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+}
+.grow {
+  flex: 1 1 260px;
+  min-width: 0;
+}
+.checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+}
+.check {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: var(--control-height);
+  font-size: var(--size-small);
+  cursor: pointer;
+}
+.check[data-focus-visible] {
+  outline: 3px solid var(--link);
+  outline-offset: 2px;
+}
+.box {
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--border-input);
+  border-radius: 3px;
+  flex: none;
+  background: var(--surface);
+}
+.check[data-selected] .box {
+  background: var(--ink);
+  border-color: var(--ink);
+}
+.check[data-selected] .box::after {
+  content: "";
+  display: block;
+  width: 5px;
+  height: 10px;
+  margin: 1px 0 0 5px;
+  border: solid #ffffff;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+.fieldList {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.fieldCard {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+}
+.fieldHead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.fieldName {
+  font: 600 var(--size-card-title) var(--font-heading);
+  overflow-wrap: anywhere;
+}
+.muted {
+  color: var(--text-muted);
+  font-size: var(--size-caption);
+}

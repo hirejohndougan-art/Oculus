@@ -271,3 +271,11 @@
   outline: 3px solid #ffffff;
   outline-offset: 2px;
 }
+.navGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.navGroup > .selectorLabel {
+  padding: 0 10px;
+}

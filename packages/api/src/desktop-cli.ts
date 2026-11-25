@@ -9,8 +9,9 @@
  *    `npm run build`, then start it again;
  * 3. starts the admin's server on 127.0.0.1 only, at port 4780 (or the
  *    settings' `port`, or a free one if that's taken), as a development
- *    server: one person, one address, and password-reset and invitation
- *    messages only noted in the log until email is set up (T-040);
+ *    server: one person, one address, and, without the OCULUS_SMTP_…
+ *    settings (D-085), password-reset and invitation messages only noted
+ *    in the log;
  * 4. opens it in an Edge or Chrome app window with Oculus's own profile, and
  *    stops the server when that window closes (or on Ctrl+C).
  *
