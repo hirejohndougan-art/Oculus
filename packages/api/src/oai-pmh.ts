@@ -30,7 +30,8 @@
  * its whole page, OAI-PMH at most `OAI_MAX_SLOTS` of them (503 `busy` with
  * `Retry-After` when none is free). A read past its time limit (each
  * public read's `statement_timeout`, the public pool's wait for a
- * connection; S-037) is the same `503 busy`.
+ * connection; S-037; the staff connection's reads, S-043a) is the same
+ * `503 busy`. A list page's reading time runs on the routes' `clock`.
  */
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { isRecordId } from "@oculus/core";
@@ -87,7 +88,11 @@ export interface OaiPmhOptions {
   readonly clock?: () => number;
   /** The public pool's slots, shared with `GET /records/:id`. */
   readonly slots?: ReadSlots;
-  /** Each record read's statement time limit (S-037); `readPublicRecord`'s default when left out. */
+  /**
+   * Each read's statement time limit (S-037): every record read through the
+   * public reader, and the staff connection's one-record reads and
+   * Identify's (S-043a). Their defaults (5 s) when left out.
+   */
   readonly timeLimitMs?: number;
   /** A list page's reading time (S-037); `OAI_PAGE_TIME_LIMIT_MS` when left out. */
   readonly pageTimeLimitMs?: number;
@@ -406,9 +411,18 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
     return `<header${deleted ? ' status="deleted"' : ""}>${element("identifier", identifierFor(host, id))}${element("datestamp", secondsOf(stamp))}</header>`;
   }
 
+  /** The staff reads' time limit (S-043a), as the public reads'. */
+  const staffRead = options.timeLimitMs === undefined ? {} : { timeLimitMs: options.timeLimitMs };
+
   /** A record that has stopped being shown on the site (a stored mark), or undefined. */
   async function tombstone(site: PublicSite, id: string): Promise<string | undefined> {
-    const stored = await oaiStoredStamp(options.db, site.organizationId, site.siteId, id);
+    const stored = await oaiStoredStamp(
+      options.db,
+      site.organizationId,
+      site.siteId,
+      id,
+      staffRead,
+    );
     return stored?.deleted === true ? stored.stamp : undefined;
   }
 
@@ -422,7 +436,7 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
   }
 
   async function identify(site: PublicSite, baseUrl: string): Promise<string> {
-    const repository = await oaiRepository(options.db, site.organizationId, site.siteId);
+    const repository = await oaiRepository(options.db, site.organizationId, site.siteId, staffRead);
     if (repository === undefined) throw new Error("the public site is gone");
     return [
       "<Identify>",
@@ -470,14 +484,26 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
     }
     if (metadataPrefix !== OAI_DC_PREFIX) return fail("cannotDisseminateFormat");
     // The stored datestamp; before the site's first background pass, the computed one.
-    const stored = await oaiStoredStamp(options.db, site.organizationId, site.siteId, id);
+    const stored = await oaiStoredStamp(
+      options.db,
+      site.organizationId,
+      site.siteId,
+      id,
+      staffRead,
+    );
     // A record back since the last pass keeps the later of its mark and its
     // computed datestamp, so it never goes backwards (review of S-041).
     let stamp: string | undefined;
     if (stored !== undefined && !stored.deleted) {
       stamp = stored.stamp;
     } else {
-      const computed = await oaiDatestamp(options.db, site.organizationId, site.siteId, id);
+      const computed = await oaiDatestamp(
+        options.db,
+        site.organizationId,
+        site.siteId,
+        id,
+        staffRead,
+      );
       stamp =
         stored === undefined || computed === undefined || computed > stored.stamp
           ? computed
@@ -517,7 +543,8 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
     let scanned = 0;
     let exhausted = false;
     let outOfTime = false;
-    const deadline = Date.now() + pageTimeLimitMs;
+    // On the routes' clock (S-043a), as the brake and responseDate are.
+    const deadline = clock() + pageTimeLimitMs;
     while (shown.length < OAI_PAGE_SIZE && scanned < OAI_MAX_SCAN && !exhausted && !outOfTime) {
       const want = Math.min(OAI_PAGE_SIZE - shown.length + 5, OAI_MAX_SCAN - scanned);
       const candidates = await listPublishedForOai(options.db, site.organizationId, site.siteId, {
@@ -531,7 +558,7 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
           exhausted = false;
           break;
         }
-        if (scanned > 0 && Date.now() >= deadline) {
+        if (scanned > 0 && clock() >= deadline) {
           // Out of time (S-037): this candidate and the rest come on the next page.
           exhausted = false;
           outOfTime = true;

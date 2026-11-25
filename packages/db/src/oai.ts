@@ -18,6 +18,13 @@
  * mapping last changed (D-096), since either changes its `oai_dc` record.
  * It doesn't follow changes to other records (a parent's title, a linked
  * record) or to vocabulary labels; D-105 says so.
+ *
+ * Every read here is bounded (S-043a): the lists wait at most 30 seconds
+ * (they wait on purpose for a datestamp write in progress), and the
+ * one-record reads and Identify's run under `timeLimitMs` (5 seconds by
+ * default), so a slow or locked staff database can't hold an OAI-PMH slot
+ * for long. A read that runs out of time throws an `isDatabaseTimeout`
+ * error, which the routes answer `503 busy`.
  */
 import { isOrganizationId, isRecordId, isSiteId } from "@oculus/core";
 import type { Database, Queryable } from "./client.js";
@@ -25,6 +32,45 @@ import { sql, type Sql } from "./sql.js";
 
 /** The most candidates one call returns. */
 export const MAX_OAI_CANDIDATES = 500;
+
+/** A one-record read's or Identify's statement time limit when none is given (S-043a). */
+export const OAI_READ_TIME_LIMIT_MS = 5_000;
+/** The longest time limit those reads take. */
+const MAX_OAI_READ_TIME_LIMIT_MS = 60_000;
+
+export interface OaiReadOptions {
+  /** The read's statement time limit, in whole milliseconds from 1 to 60000. */
+  readonly timeLimitMs?: number;
+}
+
+/**
+ * Runs `work` in a transaction whose statements, lock waits included, are
+ * cancelled after the time limit (SQLSTATE 57014, an `isDatabaseTimeout`).
+ * Only `statement_timeout`, not `lock_timeout`: a lock wait running out must
+ * read as a time limit too, never as a failure. Throws `RangeError` on a
+ * limit it couldn't use.
+ */
+async function bounded<T>(
+  db: Database,
+  { timeLimitMs = OAI_READ_TIME_LIMIT_MS }: OaiReadOptions,
+  work: (tx: Queryable) => Promise<T>,
+): Promise<T> {
+  if (
+    !Number.isInteger(timeLimitMs) ||
+    timeLimitMs < 1 ||
+    timeLimitMs > MAX_OAI_READ_TIME_LIMIT_MS
+  ) {
+    throw new RangeError(
+      `timeLimitMs must be a whole number from 1 to ${String(MAX_OAI_READ_TIME_LIMIT_MS)}`,
+    );
+  }
+  return db.transaction(async (tx) => {
+    await tx.execute(
+      sql`SELECT pg_catalog.set_config('statement_timeout', ${String(timeLimitMs)}, true)`,
+    );
+    return work(tx);
+  });
+}
 
 /** A datestamp as the database writes it: UTC, whole milliseconds. */
 const STAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -209,37 +255,43 @@ async function writeIn(
 
 /** A record's stored datestamp on the site, and whether it has stopped being shown. */
 export async function oaiStoredStamp(
-  db: Queryable,
+  db: Database,
   organizationId: string,
   siteId: string,
   recordId: string,
+  options: OaiReadOptions = {},
 ): Promise<{ stamp: string; deleted: boolean } | undefined> {
   if (!isOrganizationId(organizationId) || !isSiteId(siteId) || !isRecordId(recordId)) {
     return undefined;
   }
-  const [row] = await db.rows<{ stamp: string; deleted: boolean }>(sql`
+  const [row] = await bounded(db, options, (tx) =>
+    tx.rows<{ stamp: string; deleted: boolean }>(sql`
     SELECT d.deleted,
            to_char(d.stamp AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS stamp
     FROM public.oai_datestamps d
     WHERE d.organization_id = ${organizationId}::uuid AND d.site_id = ${siteId}::uuid
-      AND d.record_id = ${recordId}::uuid`);
+      AND d.record_id = ${recordId}::uuid`),
+  );
   return row === undefined ? undefined : { stamp: row.stamp, deleted: row.deleted };
 }
 
 /** One published record's datestamp on the site, or `undefined` if it isn't published there. */
 export async function oaiDatestamp(
-  db: Queryable,
+  db: Database,
   organizationId: string,
   siteId: string,
   recordId: string,
+  options: OaiReadOptions = {},
 ): Promise<string | undefined> {
   if (!isOrganizationId(organizationId) || !isSiteId(siteId) || !isRecordId(recordId)) {
     return undefined;
   }
-  const [row] = await db.rows<{ stamp: string }>(sql`
+  const [row] = await bounded(db, options, (tx) =>
+    tx.rows<{ stamp: string }>(sql`
     WITH c AS (${stamped(organizationId, siteId)})
     SELECT to_char(c.stamp AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS stamp
-    FROM c WHERE c.id = ${recordId}::uuid`);
+    FROM c WHERE c.id = ${recordId}::uuid`),
+  );
   return row?.stamp;
 }
 
@@ -252,16 +304,19 @@ export async function oaiDatestamp(
  * Every record on the site was put there by a version written after then.
  */
 export async function oaiRepository(
-  db: Queryable,
+  db: Database,
   organizationId: string,
   siteId: string,
+  options: OaiReadOptions = {},
 ): Promise<{ name: string; earliest: string } | undefined> {
   if (!isOrganizationId(organizationId) || !isSiteId(siteId)) return undefined;
-  const [row] = await db.rows<{ name: string; earliest: string }>(sql`
+  const [row] = await bounded(db, options, (tx) =>
+    tx.rows<{ name: string; earliest: string }>(sql`
     SELECT s.name,
            to_char(date_trunc('day', s.created_at AT TIME ZONE 'UTC') - interval '1 day',
                    'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS earliest
     FROM public.sites s
-    WHERE s.organization_id = ${organizationId}::uuid AND s.id = ${siteId}::uuid`);
+    WHERE s.organization_id = ${organizationId}::uuid AND s.id = ${siteId}::uuid`),
+  );
   return row === undefined ? undefined : { name: row.name, earliest: row.earliest };
 }
