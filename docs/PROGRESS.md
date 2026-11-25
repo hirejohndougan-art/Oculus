@@ -2,7 +2,7 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
-## 2026-11-24 23:55 CT — Chat B — T-041c Shares: storage and the service (part of T-041b)
+## 2026-11-24 23:20 CT — Chat B — T-041c Shares: storage and the service (part of T-041b)
 - Result: done (T-041b continues as T-041d to T-041f)
 - What changed: migration 0024 (`record_shares`), `packages/db/src/shares.ts`, `publishedRecordView` (workflow.ts), `packages/service/src/shares.ts`: offer a published item to another site (any organization's), accept, decline, remove (the second site's manager), withdraw (home), lists, and a read-only view for the second site that is what the public could see, never through the record's own checks.
 - Decisions: D-094
