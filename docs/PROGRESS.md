@@ -7,7 +7,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - What changed: `publicTermCounts` (packages/db/src/public-terms.ts) counts, for one site, the controlled terms each public record shows in its own public output (one Repeatable Read snapshot; records the output refuses count for nothing), on the server's staff connection; only labels, URIs and counts come out; at most 10,000 records and a time limit. `readPublicRecord`'s work is shared as `publicRecordIn` (stored mappings included). Never from `record_terms`. Follow-up S-038 (a cached public Subjects page).
 - Decisions: D-095
 - Review: two independent rounds. Round 1 (fixed): the first design gave the public reader a function listing every published record (migration 0023, now gone), which would have handed out the IDs of held-back records whose snapshots carry staff values; a records count that included held-back records; vocabulary keys and term hashes in the result; no time limit. Round 2 (fixed): terms told apart by what the public sees; a hard time ceiling; tests for held-back records and stored mappings. Caching left to S-038.
-- Gate: see below
+- Gate: PASS · tests_passing 4624 (was 4618) · npm audit clean
 - Next: S-038 (after T-050d), or the next free job on the board
 
 ## 2026-11-25 03:10 CT — manual (Chat C) — S-033 Identifier type edits list the records a new format drops
