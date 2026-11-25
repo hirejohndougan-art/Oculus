@@ -335,10 +335,12 @@ export {
   ALERT_NOTICE_TABLE_PRIVILEGES,
   ALERT_NOTICE_WINDOW_SECONDS,
   ALERT_NOTICE_BATCH,
+  ALERT_SUMMARY_LINES,
 } from "./alert-notices.js";
 export type {
   SecondStepAlertMessage,
   SecondStepAlertDelivery,
+  AlertedPerson,
   AlertNoticeRun,
   AlertNoticeOptions,
 } from "./alert-notices.js";
@@ -359,6 +361,7 @@ export {
   PEOPLE_EVENT_KINDS,
   PEOPLE_TABLE_PRIVILEGES,
   MAX_MEMBERS,
+  MEMBER_ALERTS_LISTED,
   MAX_AUDIT_PAGE,
   DEFAULT_AUDIT_PAGE,
 } from "./people.js";

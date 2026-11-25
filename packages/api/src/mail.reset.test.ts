@@ -255,4 +255,50 @@ describe("the set-up code after an admin's reset of two-step sign-in", () => {
     );
     expect(started.statusCode).toBe(200);
   });
+
+  it("survives credential stuffing: 12 people alerted in one run, one summary to the admin, whose own reset still goes (review M1)", async () => {
+    smtp.reset();
+    await sendSecondStepAlertNotices(w.db, () => Promise.resolve());
+    const folks: UserId[] = [];
+    for (let i = 0; i < 12; i++) folks.push(await w.member(w.a, `Stuffed${String(i)}`));
+    for (const id of folks) {
+      await w.db.execute(sql`INSERT INTO public.second_step_alerts (id, user_id, failures)
+        VALUES (gen_random_uuid(), ${id}::uuid, 5)`);
+    }
+    const runner = startAlertNotices({
+      db: w.db,
+      deliver: mailer.deliverAlert,
+      log: (record) => logged.push(record),
+      intervalMs: 3_600_000,
+      room: () => mailer.outbox.room("notice"),
+    });
+    try {
+      await runner.runNow();
+    } finally {
+      await runner.stop();
+    }
+    await mailer.outbox.idle();
+    const root = await emailOf(w.root);
+    const toRoot = smtp.messages.filter((m) => m.to[0] === root);
+    expect(toRoot).toHaveLength(1);
+    const summary = parseMail(toRoot[0]?.data ?? "");
+    for (const id of folks) expect(summary.text).toContain(await emailOf(id));
+    expect(summary.text).not.toContain("Stuffed");
+    expect(smtp.messages).toHaveLength(13);
+    expect(logged.filter((r) => r.event === "mail_refused")).toEqual([]);
+    // The admin's own reset link is not held back by any of this.
+    await expect(
+      mailer.deliverReset(
+        {
+          email: root,
+          token: "A".repeat(43),
+          expiresAt: new Date(Date.now() + 1_800_000).toISOString(),
+          requestedBy: "self",
+        },
+        new AbortController().signal,
+      ),
+    ).resolves.toBeUndefined();
+    await mailer.outbox.idle();
+    expect(smtp.messages).toHaveLength(14);
+  }, 120_000);
 });

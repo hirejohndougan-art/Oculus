@@ -5,6 +5,7 @@
 // to advertise it (and then refuses the upgrade), so a sender that requires
 // TLS must give up before MAIL FROM. Test data only.
 import { createServer, type Server, type Socket } from "node:net";
+import { createServer as createTlsServer } from "node:tls";
 
 export interface Received {
   readonly from: string;
@@ -18,6 +19,8 @@ export interface FakeSmtpOptions {
   readonly auth?: { readonly user: string; readonly pass: string };
   /** Advertise STARTTLS (the upgrade itself is refused with 454). */
   readonly advertiseStartTls?: boolean;
+  /** Implicit TLS from the first byte (port 465 style) with this key and certificate. */
+  readonly tls?: { readonly key: string; readonly cert: string };
 }
 
 export interface FakeSmtp {
@@ -46,7 +49,7 @@ export async function startFakeSmtp(options: FakeSmtpOptions = {}): Promise<Fake
   let greetingDelay = 0;
   let connections = 0;
 
-  const server: Server = createServer((socket) => {
+  const handler = (socket: Socket): void => {
     connections += 1;
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
@@ -157,7 +160,12 @@ export async function startFakeSmtp(options: FakeSmtpOptions = {}): Promise<Fake
     };
     if (greetingDelay > 0) setTimeout(greet, greetingDelay);
     else greet();
-  });
+  };
+  const server: Server =
+    options.tls === undefined
+      ? createServer(handler)
+      : createTlsServer({ key: options.tls.key, cert: options.tls.cert }, handler);
+  server.on("tlsClientError", () => undefined);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   if (address === null || typeof address === "string") throw new Error("no port");

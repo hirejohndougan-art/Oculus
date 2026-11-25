@@ -378,6 +378,13 @@ export function renderPasswordChanged(
   );
 }
 
+function isList(value: unknown): boolean {
+  return Array.isArray(value);
+}
+
+/** People an admin's summary lists at most (the rest are counted). */
+export const ALERT_SUMMARY_MAX_LINES = 50;
+
 /** What `renderSecondStepAlert` needs: D-085's `SecondStepAlertMessage`. */
 export type SecondStepAlertMailInput =
   | {
@@ -389,33 +396,39 @@ export type SecondStepAlertMailInput =
   | {
       readonly to: "system_admin";
       readonly email: string;
-      readonly person: { readonly displayName: string; readonly email: string };
-      readonly failures: number;
-      readonly at: string;
+      readonly people: readonly {
+        readonly email: string;
+        readonly failures: number;
+        readonly at: string;
+      }[];
+      readonly more: number;
     };
 
+function codesText(failures: number): string {
+  return failures === 1 ? "1 wrong code" : `${String(failures)} wrong codes`;
+}
+
 /**
- * "Someone is guessing your two-step codes" (D-077): to the person, or to
- * a system admin naming the person. No token; the only link is the sign-in
- * page.
+ * "Someone is guessing your two-step codes" (D-077): to the person, or one
+ * summary to a system admin listing the people by address only (never the
+ * self-chosen display name, review L1), at most 50 lines and "and N more".
+ * No token; the only link is the sign-in page.
  */
 export function renderSecondStepAlert(
   input: SecondStepAlertMailInput,
   origin: string,
 ): RenderedMail {
   const to = checkAddress(input.email);
-  const failures = checkCount(input.failures);
-  const at = checkExpiry(input.at);
-  const when = expiryText(at);
-  const codes = failures === 1 ? "1 wrong code" : `${String(failures)} wrong codes`;
   if (input.to === "person") {
+    const failures = checkCount(input.failures);
+    const at = checkExpiry(input.at);
     return build(
       "two_step_alert",
       to,
       "Someone may know your Oculus password",
       [
         {
-          text: `Someone has been entering wrong two-step sign-in codes for your Oculus account (${codes} by ${when}). Codes are asked for only after the right password, so whoever it is probably knows your password. Your two-step sign-in has kept them out.`,
+          text: `Someone has been entering wrong two-step sign-in codes for your Oculus account (${codesText(failures)} by ${expiryText(at)}). Codes are asked for only after the right password, so whoever it is probably knows your password. Your two-step sign-in has kept them out.`,
         },
         {
           text: 'If it wasn\'t you, choose a new password now: open the sign-in page and use "Forgot your password?".',
@@ -430,23 +443,44 @@ export function renderSecondStepAlert(
     );
   }
   if ((input.to as unknown) !== "system_admin") throw new MailContentError("bad_value");
-  const name = checkName(input.person.displayName);
-  const address = checkAddress(input.person.email);
+  const people: readonly {
+    readonly email: unknown;
+    readonly failures: unknown;
+    readonly at: unknown;
+  }[] = input.people;
+  if (!isList(input.people) || people.length === 0 || people.length > ALERT_SUMMARY_MAX_LINES) {
+    throw new MailContentError("bad_value");
+  }
+  const more = input.more;
+  if (typeof more !== "number" || !Number.isInteger(more) || more < 0 || more > 1_000_000) {
+    throw new MailContentError("bad_value");
+  }
+  let newest = 0;
+  const lines = people.map((p) => {
+    const address = checkAddress(p.email);
+    const failures = checkCount(p.failures);
+    const at = checkExpiry(p.at);
+    newest = Math.max(newest, at);
+    return { text: `${address}: ${codesText(failures)} by ${expiryText(at)}` };
+  });
+  const count = people.length + more;
   return build(
     "two_step_alert",
     to,
-    "Oculus: someone is guessing an account's two-step codes",
+    "Oculus: someone is guessing two-step codes",
     [
       {
-        text: `Someone has been entering wrong two-step sign-in codes for the Oculus account of ${name} (${address}): ${codes} by ${when}. Codes are asked for only after the right password, so that password is probably known to someone else. Two-step sign-in has kept them out.`,
+        text: `Someone has been entering wrong two-step sign-in codes for ${count === 1 ? "this Oculus account" : `these ${String(count)} Oculus accounts`}. Codes are asked for only after the right password, so those passwords are probably known to someone else. Two-step sign-in has kept them out.`,
       },
+      ...lines,
+      ...(more > 0 ? [{ text: `And ${String(more)} more.` }] : []),
       {
-        text: `Confirm with ${name} another way. If it wasn't them, end their sessions and have them choose a new password. They have been told too.`,
+        text: "Confirm with each person another way. If it wasn't them, end their sessions and have them choose a new password. They have been told too, and each person's page shows their recent alerts.",
       },
       { link: `${origin}/sign-in` },
       { text: "Oculus sends at most one such email a day about each person." },
     ],
     [],
-    at + NOTICE_LIFE_MS,
+    newest + NOTICE_LIFE_MS,
   );
 }

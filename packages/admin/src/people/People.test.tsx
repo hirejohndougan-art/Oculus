@@ -179,12 +179,19 @@ describe("a person's page", () => {
           enrolledAt: "2026-11-01T10:00:00.000Z",
           recentAlerts: 2,
           lastAlertAt: "2026-11-20T10:00:00.000Z",
+          alerts: [
+            { at: "2026-11-20T10:00:00.000Z", failures: 15, notice: "covered" },
+            { at: "2026-11-20T09:00:00.000Z", failures: 5, notice: "emailed" },
+          ],
         },
       },
       { [`POST /api/people/${PERSON}/password-reset`]: [200, { expiresAt: "x" }] },
     );
     renderAt(`/people/${PERSON}`);
     expect(await screen.findByText(/typed wrong codes for this account 2 times/)).toBeTruthy();
+    const listed = screen.getByRole("list", { name: "Recent wrong-code alerts" });
+    expect(listed.textContent).toContain("15 wrong codes, covered by an earlier email");
+    expect(listed.textContent).toContain("5 wrong codes, emailed to them and the system managers");
     await userEvent.click(screen.getByRole("button", { name: "Send a password reset link…" }));
     expect(screen.queryByText(/take over the account/)).toBeNull();
     await userEvent.click(screen.getByRole("button", { name: "Send the link" }));

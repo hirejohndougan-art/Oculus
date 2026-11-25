@@ -20,8 +20,11 @@
  *   most once, not at least once: a lost notice is logged by the mailer,
  *   and the next alert after the window sends again);
  * - the person's message goes to their own address (if the account isn't
- *   disabled); the admins' names the person by name and address, and goes
- *   to each active system admin but the person themselves.
+ *   disabled); each active system admin gets **one summary per run** listing
+ *   the people notified (by address only, never the self-chosen display
+ *   name, which could carry a phishing sentence; review L1), at most
+ *   `ALERT_SUMMARY_LINES` of them and "and N more", leaving out the admin
+ *   themselves.
  *
  * `deliver`'s failures are counted, never thrown, and what it throws is
  * dropped unread. Database failures reach `onError` (pg's `where` and
@@ -43,22 +46,38 @@ export const ALERT_NOTICE_WINDOW_SECONDS = 86_400;
 /** Alerts decided per call at most (the rest wait for the next call). */
 export const ALERT_NOTICE_BATCH = 200;
 
-/** One email: to the person, or to a system admin about the person. */
+/** People listed in one admin summary at most; the rest are counted (`more`). */
+export const ALERT_SUMMARY_LINES = 50;
+
+/** One person in an admin's summary: by address only, never their self-chosen name. */
+export interface AlertedPerson {
+  readonly email: string;
+  /** The wrong codes counted when the alert was recorded. */
+  readonly failures: number;
+  /** When it was recorded (core's ISO form). */
+  readonly at: string;
+}
+
+/**
+ * One email: to the person, or **one summary per system admin per run**
+ * listing everyone notified in that run (review M1: one email per person per
+ * admin filled the admins' mailboxes and the outbox under credential
+ * stuffing).
+ */
 export type SecondStepAlertMessage =
   | {
       readonly to: "person";
       readonly email: string;
-      /** The wrong codes counted when the alert was recorded. */
       readonly failures: number;
-      /** When it was recorded (core's ISO form). */
       readonly at: string;
     }
   | {
       readonly to: "system_admin";
       readonly email: string;
-      readonly person: { readonly displayName: string; readonly email: string };
-      readonly failures: number;
-      readonly at: string;
+      /** At most `ALERT_SUMMARY_LINES`, newest alert first. */
+      readonly people: readonly AlertedPerson[];
+      /** How many more were notified in this run but not listed. */
+      readonly more: number;
     };
 
 /** Sends one notice (the mailer's `deliverAlert`). Rejects if it wasn't queued. */
@@ -78,6 +97,12 @@ export interface AlertNoticeRun {
 export interface AlertNoticeOptions {
   /** Seconds, 3,600 to 604,800 (default 86,400). */
   readonly windowSeconds?: number;
+  /**
+   * Most emails one run may hand over (the mailer's free room, review M1).
+   * A person whose notice wouldn't fit is left undecided for a later run;
+   * 0 decides nothing.
+   */
+  readonly maxMessages?: number;
   readonly onError?: (error: unknown) => void;
 }
 
@@ -93,7 +118,6 @@ interface PendingAlert {
 
 interface Person {
   email: string;
-  display_name: string;
   disabled: boolean;
   recent: boolean;
 }
@@ -110,6 +134,10 @@ export async function sendSecondStepAlertNotices(
 ): Promise<AlertNoticeRun | undefined> {
   if (typeof deliver !== "function") throw new TypeError("deliver is a function.");
   const window = options.windowSeconds ?? ALERT_NOTICE_WINDOW_SECONDS;
+  const maxMessages = options.maxMessages ?? Number.MAX_SAFE_INTEGER;
+  if (!Number.isInteger(maxMessages) || maxMessages < 0) {
+    throw new TypeError("maxMessages is a whole number, 0 or more.");
+  }
   if (!Number.isInteger(window) || window < 3_600 || window > 604_800) {
     throw new TypeError("windowSeconds is a whole number from 3,600 to 604,800.");
   }
@@ -136,10 +164,11 @@ export async function sendSecondStepAlertNotices(
         SELECT id::text AS id, email FROM public.users
         WHERE system_admin AND disabled_at IS NULL ORDER BY id`);
       const messages: SecondStepAlertMessage[] = [];
+      const alerted: (AlertedPerson & { userId: UserId })[] = [];
       let notified = 0;
       for (const [userId, alerts] of byUser) {
         const people = await tx.rows<Person>(sql`
-          SELECT u.email, u.display_name, u.disabled_at IS NOT NULL AS disabled,
+          SELECT u.email, u.disabled_at IS NOT NULL AS disabled,
                  EXISTS (SELECT 1 FROM public.second_step_alert_notices n
                          WHERE n.user_id = u.id AND n.outcome = 'notified'
                            AND n.noticed_at > clock_timestamp() - make_interval(secs => ${window}))
@@ -148,6 +177,14 @@ export async function sendSecondStepAlertNotices(
         const person = people[0];
         if (person === undefined) continue;
         const newest = person.recent ? undefined : alerts.filter((a) => a.young).at(-1);
+        // Room for this person's email and, if they are the first notified
+        // in this run, one summary per admin; otherwise leave them for later.
+        if (newest !== undefined) {
+          const need = (person.disabled ? 0 : 1) + (alerted.length === 0 ? admins.length : 0);
+          // The admins' summaries go out after the loop: count them already.
+          const planned = messages.length + (alerted.length > 0 ? admins.length : 0);
+          if (planned + need > maxMessages) break;
+        }
         // The notified one first, so the trigger finds it when it checks the folded ones.
         const order =
           newest === undefined ? alerts : [newest, ...alerts.filter((a) => a !== newest)];
@@ -162,15 +199,23 @@ export async function sendSecondStepAlertNotices(
         notified += 1;
         const base = { failures: newest.failures, at: newest.at };
         if (!person.disabled) messages.push({ to: "person", email: person.email, ...base });
-        for (const admin of admins) {
-          if (admin.id === userId) continue;
-          messages.push({
-            to: "system_admin",
-            email: admin.email,
-            person: { displayName: person.display_name, email: person.email },
-            ...base,
-          });
-        }
+        alerted.push({ userId, email: person.email, ...base });
+      }
+      // Newest first, so the cap keeps the freshest.
+      alerted.sort((x, y) => (x.at < y.at ? 1 : x.at > y.at ? -1 : 0));
+      for (const admin of admins) {
+        const others = alerted.filter((p) => p.userId !== admin.id);
+        if (others.length === 0) continue;
+        messages.push({
+          to: "system_admin",
+          email: admin.email,
+          people: Object.freeze(
+            others
+              .slice(0, ALERT_SUMMARY_LINES)
+              .map((p) => Object.freeze({ email: p.email, failures: p.failures, at: p.at })),
+          ),
+          more: Math.max(0, others.length - ALERT_SUMMARY_LINES),
+        });
       }
       return { alerts: pending.length, messages, notified };
     });

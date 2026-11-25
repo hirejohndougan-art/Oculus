@@ -49,7 +49,13 @@ export async function runAdminCli(
     mailer = mailerFromEnv(env, { log: defaultLog });
     const app = await buildAdminServer({ db, env, logger: true, mailer, log: defaultLog });
     // "Someone is guessing your two-step codes" (D-077, D-085), every minute.
-    notices = startAlertNotices({ db, deliver: mailer.deliverAlert, log: defaultLog });
+    const outbox = mailer.outbox;
+    notices = startAlertNotices({
+      db,
+      deliver: mailer.deliverAlert,
+      log: defaultLog,
+      room: () => outbox.room("notice"),
+    });
     const close = (): void => {
       void app
         .close()

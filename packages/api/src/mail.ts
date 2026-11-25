@@ -45,7 +45,6 @@ import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { isIP } from "node:net";
 import { join } from "node:path";
-import type { ConnectionOptions } from "node:tls";
 import { normalizeEmail } from "@oculus/core";
 import type {
   EnrolmentDelivery,
@@ -191,9 +190,9 @@ export function smtpConfigFromEnv(
   });
 }
 
-/** Test-only settings for the SMTP sender (a test CA, shorter waits). */
+/** Test-only settings for the SMTP sender: a CA to trust, shorter waits. Never weaker TLS. */
 export interface SmtpTestingOptions {
-  readonly tls?: ConnectionOptions;
+  readonly ca?: string;
   readonly timeoutsMs?: number;
 }
 
@@ -214,10 +213,11 @@ export function smtpTransport(config: SmtpConfig, testing: SmtpTestingOptions = 
       ? {}
       : { auth: { user: config.user, pass: config.password } }),
     tls: {
+      ...(testing.ca === undefined ? {} : { ca: testing.ca }),
+      ...(isIP(config.host) === 0 ? { servername: config.host } : {}),
+      // Last, so nothing can turn them off (review L6).
       minVersion: "TLSv1.2",
       rejectUnauthorized: true,
-      ...(isIP(config.host) === 0 ? { servername: config.host } : {}),
-      ...testing.tls,
     },
     connectionTimeout: wait,
     greetingTimeout: wait,

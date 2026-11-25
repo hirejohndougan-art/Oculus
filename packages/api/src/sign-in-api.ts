@@ -602,6 +602,12 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
           ...sessionView(session, token),
           displayName: person.displayName,
           email: person.email,
+          // D-077's wrong-code alerts of the last 30 days (D-085): a trace on
+          // screen even when the email was lost.
+          secondStepAlerts: {
+            recent: person.secondStepAlerts.recent,
+            lastAt: person.secondStepAlerts.lastAt,
+          },
           organizationName:
             named?.organizationName ?? (organization?.ok === true ? organization.value.name : ""),
           sites: sites.value,

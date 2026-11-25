@@ -29,6 +29,8 @@ export interface AlertNoticeRunnerOptions {
   readonly intervalMs?: number;
   /** Passed on (default 24 hours). */
   readonly windowSeconds?: number;
+  /** How many more emails the mailer takes now (its notice lane's room); a run hands over no more. */
+  readonly room?: () => number;
 }
 
 export function startAlertNotices(options: AlertNoticeRunnerOptions): AlertNoticeRunner {
@@ -47,6 +49,7 @@ export function startAlertNotices(options: AlertNoticeRunnerOptions): AlertNotic
     try {
       const run = await sendSecondStepAlertNotices(db, deliver, {
         ...(options.windowSeconds === undefined ? {} : { windowSeconds: options.windowSeconds }),
+        ...(options.room === undefined ? {} : { maxMessages: options.room() }),
         onError: (error) => {
           record({ event: "service_error", operation: "alertNotices", ...redactedError(error) });
         },

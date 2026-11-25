@@ -4,6 +4,7 @@
 // limit, logs that never hold a token or an address, the configuration's
 // refusals, and the development sender refused in production. Every
 // address, name and token is invented.
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -27,7 +28,7 @@ import {
   renderSecondStepAlert,
   renderTwoStepSetup,
 } from "./mail-messages.js";
-import { classifyMailError, createOutbox, MailRefusedError } from "./mail-outbox.js";
+import { classifyMailError, createOutbox, laneOf, MailRefusedError } from "./mail-outbox.js";
 import { parseMail, startFakeSmtp, type FakeSmtp } from "./smtp-server.fixtures.js";
 import type { ApiLogRecord } from "./staff-api.js";
 
@@ -139,49 +140,55 @@ describe("the messages", () => {
     expect(mail.text).not.toContain("#");
   });
 
-  it("warns the person and the admins that someone is guessing codes, escaping the name", () => {
+  it("warns the person, and sends admins one summary by address only with a cap", () => {
     const at = "2026-11-24T17:35:00.000Z";
     const own = renderSecondStepAlert({ to: "person", email: TO, failures: 15, at }, ORIGIN);
     expect(own.subject).toBe("Someone may know your Oculus password");
     expect(own.text).toContain("15 wrong codes by 17:35 UTC on 24 November 2026");
     expect(own.text).toContain(`${ORIGIN}/sign-in`);
-    const name = `Ada <b>"Invented"</b>`;
+    const people = Array.from({ length: 50 }, (_, i) => ({
+      email: `person${String(i)}.invented@example.org`,
+      failures: 1 + i,
+      at,
+    }));
     const admin = renderSecondStepAlert(
-      {
-        to: "system_admin",
-        email: "admin.invented@example.org",
-        person: { displayName: name, email: TO },
-        failures: 1,
-        at,
-      },
+      { to: "system_admin", email: "admin.invented@example.org", people, more: 7 },
       ORIGIN,
     );
     expect(admin.to).toBe("admin.invented@example.org");
-    expect(admin.subject).not.toContain(TO);
-    expect(admin.text).toContain(`${name} (${TO}): 1 wrong code by`);
-    expect(admin.html).toContain("Ada &lt;b&gt;&quot;Invented&quot;&lt;/b&gt;");
-    expect(admin.html).not.toContain("<b>");
+    expect(admin.subject).toBe("Oculus: someone is guessing two-step codes");
+    expect(admin.text).toContain("these 57 Oculus accounts");
+    expect(admin.text).toContain("person0.invented@example.org: 1 wrong code by 17:35 UTC");
+    expect(admin.text).toContain("person49.invented@example.org: 50 wrong codes by");
+    expect(admin.text).toContain("And 7 more.");
     for (const mail of [own, admin]) {
       expect([...mail.html.matchAll(/href="([^"]*)"/g)].map((m) => m[1])).toEqual([
         `${ORIGIN}/sign-in`,
       ]);
       expect(mail.html).not.toMatch(/<img|src=/i);
     }
-    expect(() =>
-      renderSecondStepAlert(
-        {
-          to: "system_admin",
-          email: "admin.invented@example.org",
-          person: { displayName: "Ada\r\nBcc: spy@example.net", email: TO },
-          failures: 1,
-          at,
-        },
-        ORIGIN,
-      ),
-    ).toThrow(MailContentError);
-    expect(() =>
-      renderSecondStepAlert({ to: "person", email: TO, failures: 0, at }, ORIGIN),
-    ).toThrow(MailContentError);
+    // No more than 50 lines, no empty summary, no malformed address or count.
+    const bad: unknown[] = [
+      { to: "system_admin", email: TO, people: [...people, people[0]], more: 0 },
+      { to: "system_admin", email: TO, people: [], more: 3 },
+      {
+        to: "system_admin",
+        email: TO,
+        people: [{ email: "Ada <a@example.org>", failures: 1, at }],
+        more: 0,
+      },
+      {
+        to: "system_admin",
+        email: TO,
+        people: [{ email: `${TO}\r\nBcc: x@example.net`, failures: 1, at }],
+        more: 0,
+      },
+      { to: "system_admin", email: TO, people: [{ email: TO, failures: 1, at }], more: -1 },
+      { to: "person", email: TO, failures: 0, at },
+    ];
+    for (const input of bad) {
+      expect(() => renderSecondStepAlert(input as never, ORIGIN)).toThrow(MailContentError);
+    }
   });
 
   it("escapes every value in the HTML", () => {
@@ -524,6 +531,158 @@ describe("sending over SMTP", () => {
     for (const secret of [TOKEN, TOKEN_2, TO, "example.org", "invented.example"]) {
       expect(text).not.toContain(secret);
     }
+  });
+});
+
+describe("two lanes, longer retries for notices, TLS failures and closing (review M1, M2, L2 to L4, L6)", () => {
+  const notice = (email = TO) => ({ to: "person" as const, email, failures: 5, at: LATER });
+
+  it("puts notices in their own lane, so they never use up a person's link limit or the queue", async () => {
+    expect(laneOf("password_reset")).toBe("link");
+    expect(laneOf("two_step_setup")).toBe("link");
+    expect(laneOf("invitation")).toBe("link");
+    expect(laneOf("two_step_alert")).toBe("notice");
+    expect(laneOf("password_changed")).toBe("notice");
+    smtp.delayGreeting(200);
+    const m = mailer({
+      perRecipientPerHour: 2,
+      maxQueued: 5,
+      notices: { perRecipientPerHour: 3, maxQueued: 4 },
+    });
+    for (let i = 0; i < 3; i++) await m.deliverAlert(notice());
+    await expect(m.deliverAlert(notice())).rejects.toThrow(/recipient_limit/);
+    await m.deliverAlert(notice("grace.invented@example.org"));
+    await expect(m.deliverAlert(notice("grace.invented@example.org"))).rejects.toThrow(
+      /queue_full/,
+    );
+    expect(m.outbox.room("notice")).toBe(0);
+    // The person's own reset links still go: their lane is untouched.
+    await m.deliverReset(reset(), SIGNAL);
+    await m.deliverReset(reset(), SIGNAL);
+    expect(m.outbox.room("link")).toBe(3);
+    await m.outbox.idle();
+    expect(smtp.messages).toHaveLength(6);
+  });
+
+  it("retries notices far longer than links", async () => {
+    smtp.refuseNext(7, "451 4.3.0 try again later");
+    const m = mailer({ notices: { baseDelayMs: 5, maxDelayMs: 20 } });
+    await m.deliverAlert(notice());
+    await m.outbox.idle();
+    expect(smtp.messages).toHaveLength(1);
+    expect(logs.filter((r) => r.event === "mail_retry")).toHaveLength(7);
+    smtp.reset();
+    logs.length = 0;
+    smtp.refuseNext(7, "451 4.3.0 try again later");
+    const l = mailer();
+    await l.deliverReset(reset(), SIGNAL);
+    await l.outbox.idle();
+    expect(smtp.messages).toHaveLength(0);
+    expect(logs.at(-1)).toMatchObject({ event: "mail_failed", code: "rejected_temporary" });
+  });
+
+  it("never sends a message whose time is up, the first try included", async () => {
+    const m = mailer();
+    await m.deliverReset(
+      { ...reset(), expiresAt: new Date(Date.now() + 30_000).toISOString() },
+      SIGNAL,
+    );
+    await m.outbox.idle();
+    expect(smtp.messages).toHaveLength(0);
+    expect(logs).toEqual([{ event: "mail_failed", operation: "password_reset", code: "expired" }]);
+  });
+
+  it("classifies a TLS failure under ESOCKET as tls and doesn't retry it", async () => {
+    expect(
+      classifyMailError({ code: "ESOCKET", originalCode: "DEPTH_ZERO_SELF_SIGNED_CERT" }),
+    ).toBe("tls");
+    expect(
+      classifyMailError({ code: "ESOCKET", cause: { code: "ERR_TLS_CERT_ALTNAME_INVALID" } }),
+    ).toBe("tls");
+    expect(classifyMailError({ code: "ESOCKET", originalCode: "EPROTO" })).toBe("tls");
+    expect(classifyMailError({ code: "ESOCKET", originalCode: "ECONNREFUSED" })).toBe("network");
+    // Implicit TLS against a server that speaks plain text: a handshake failure.
+    const m = mailer({}, { OCULUS_SMTP_TLS: "implicit", OCULUS_SMTP_HOST: "localhost" });
+    await m.deliverReset(reset(), SIGNAL);
+    await m.outbox.idle();
+    expect(logs).toEqual([{ event: "mail_failed", operation: "password_reset", code: "tls" }]);
+  });
+
+  it("refuses a certificate it can't verify, without retrying, and accepts one from a trusted CA", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "oculus-smtp-tls-"));
+    try {
+      execFileSync(
+        "openssl",
+        [
+          "req",
+          "-x509",
+          "-newkey",
+          "ec",
+          "-pkeyopt",
+          "ec_paramgen_curve:prime256v1",
+          "-nodes",
+          "-keyout",
+          join(dir, "key.pem"),
+          "-out",
+          join(dir, "cert.pem"),
+          "-days",
+          "1",
+          "-subj",
+          "/CN=localhost",
+          "-addext",
+          "subjectAltName=DNS:localhost",
+        ],
+        { stdio: "ignore" },
+      );
+      const key = readFileSync(join(dir, "key.pem"), "utf8");
+      const cert = readFileSync(join(dir, "cert.pem"), "utf8");
+      const secure = await startFakeSmtp({ tls: { key, cert } });
+      try {
+        const config = smtpConfigFromEnv({
+          ...ENV,
+          OCULUS_SMTP_HOST: "localhost",
+          OCULUS_SMTP_TLS: "implicit",
+          OCULUS_SMTP_PORT: String(secure.port),
+        });
+        const make = (ca?: string) => {
+          const made = createMailer({
+            transport: smtpTransport(config, {
+              timeoutsMs: 2_000,
+              ...(ca === undefined ? {} : { ca }),
+            }),
+            adminOrigin: ORIGIN,
+            production: false,
+            log,
+            outbox: { baseDelayMs: 10 },
+          });
+          mailers.push(made);
+          return made;
+        };
+        const untrusted = make();
+        await untrusted.deliverReset(reset(), SIGNAL);
+        await untrusted.outbox.idle();
+        expect(logs).toEqual([{ event: "mail_failed", operation: "password_reset", code: "tls" }]);
+        expect(secure.messages).toHaveLength(0);
+        const trusted = make(cert);
+        await trusted.deliverReset(reset(), SIGNAL);
+        await trusted.outbox.idle();
+        expect(secure.messages).toHaveLength(1);
+      } finally {
+        await secure.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("gives up waiting on close after its deadline, even if a send ignores the signal", async () => {
+    const stuck = { send: () => new Promise<void>(() => undefined) };
+    const outbox = createOutbox({ transport: stuck, log, closeTimeoutMs: 100 });
+    outbox.enqueue(renderPasswordReset(reset(), ORIGIN));
+    await new Promise((r) => setTimeout(r, 20));
+    const started = performance.now();
+    await outbox.close();
+    expect(performance.now() - started).toBeLessThan(1_000);
   });
 });
 

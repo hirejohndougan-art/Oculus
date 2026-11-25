@@ -10,9 +10,11 @@ import type { InvitationMessage } from "./accounts.js";
 import { insertOrganization } from "./catalog.js";
 import { openDatabase, type Database, type Queryable } from "./client.js";
 import { migrate } from "./migrate.js";
+import { memberSecondStep } from "./people.js";
 import { WRITER_PRIVILEGES, checkWriterConnection, grantWriterRole } from "./roles.js";
 import {
   ALERT_NOTICE_TABLE_PRIVILEGES,
+  ALERT_SUMMARY_LINES,
   sendSecondStepAlertNotices,
   type SecondStepAlertMessage,
 } from "./alert-notices.js";
@@ -130,10 +132,16 @@ describe("sendSecondStepAlertNotices", () => {
       {
         to: "system_admin",
         email: ADMIN_EMAIL,
-        person: { displayName: expect.any(String) as string, email: p.email },
-        failures: 15,
-        at: expect.any(String) as string,
+        // By address only: never the self-chosen display name (review L1).
+        people: [{ email: p.email, failures: 15, at: expect.any(String) as string }],
+        more: 0,
       },
+    ]);
+    // The person's page shows what became of each alert (review M2).
+    const seen = await memberSecondStep(db, p.userId);
+    expect(seen.alerts.map((a) => [a.failures, a.notice])).toEqual([
+      [15, "emailed"],
+      [5, "covered"],
     ]);
     expect(await outcomes(p.userId)).toEqual(["folded", "notified"]);
     // Nothing left: a second run sends nothing.
@@ -145,6 +153,46 @@ describe("sendSecondStepAlertNotices", () => {
       failed: 0,
     });
     expect(again.messages).toEqual([]);
+  });
+
+  it("sends each admin one summary per run however many people were alerted, capped with a count", async () => {
+    await ready();
+    await drain();
+    const folks = [];
+    for (let i = 0; i < ALERT_SUMMARY_LINES + 2; i++) folks.push(await person());
+    for (const p of folks) await alert(p.userId, 5);
+    const box = inbox();
+    const run = await sendSecondStepAlertNotices(db, box.deliver);
+    expect(run?.notified).toBe(ALERT_SUMMARY_LINES + 2);
+    const summaries = box.messages.filter((m) => m.to === "system_admin");
+    expect(summaries).toHaveLength(1);
+    const summary = summaries[0];
+    if (summary?.to !== "system_admin") throw new Error("no summary");
+    expect(summary.people).toHaveLength(ALERT_SUMMARY_LINES);
+    expect(summary.more).toBe(2);
+    expect(box.messages.filter((m) => m.to === "person")).toHaveLength(ALERT_SUMMARY_LINES + 2);
+  }, 120_000);
+
+  it("hands over no more than the mailer has room for, leaving the rest for a later run", async () => {
+    await ready();
+    await drain();
+    const first = await person();
+    const second = await person();
+    const third = await person();
+    const folks = [first, second, third];
+    for (const p of folks) await alert(p.userId, 5);
+    const box = inbox();
+    // Room for one person's email and the one admin's summary.
+    expect(await sendSecondStepAlertNotices(db, box.deliver, { maxMessages: 2 })).toMatchObject({
+      notified: 1,
+      sent: 2,
+    });
+    expect(await outcomes(second.userId)).toEqual([]);
+    expect(await sendSecondStepAlertNotices(db, box.deliver, { maxMessages: 0 })).toMatchObject({
+      notified: 0,
+    });
+    const rest = await sendSecondStepAlertNotices(db, box.deliver);
+    expect(rest).toMatchObject({ notified: 2, sent: 3 });
   });
 
   it("folds later alerts within the window into the notice, and notifies again after it", async () => {
