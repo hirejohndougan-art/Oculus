@@ -49,7 +49,7 @@ export async function writerConnectionRefusal(db: Queryable): Promise<string | u
   const codes = [...new Set(problems.map((p) => p.code))].sort();
   const missingOnly = codes.every((code) => code === "missing_privilege");
   return missingOnly
-    ? `${DATABASE_URL_VARIABLE}'s role lacks some of the writer's privileges (missing_privilege), usually tables from an update that weren't granted to it. Run node packages/db/dist/grant-cli.js <writer role> with OCULUS_DATABASE_URL set to the owner's account, then start again (D-067).`
+    ? `${DATABASE_URL_VARIABLE}'s role lacks some of the writer's privileges (missing_privilege), usually tables from an update that weren't granted to it. Run the running release's packages/db/dist/grant-cli.js <writer role> (under <updates folder>/current on a server) with OCULUS_DATABASE_URL set to the owner's account, then start again (D-067).`
     : `${DATABASE_URL_VARIABLE} must connect as the plain writer role made for Oculus (grantWriterRole, D-067), never a superuser or the owner; found: ${codes.join(", ")}`;
 }
 

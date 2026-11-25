@@ -387,7 +387,7 @@ export async function runReleaseCli(
         try {
           const version = await manager.verifyInto(at(file));
           out(`Verified Oculus ${version}.`);
-          const role = env.OCULUS_UPDATE_WRITER_ROLE;
+          const role = env.OCULUS_UPDATE_WRITER_ROLE?.trim();
           await manager.install(
             version,
             "release-cli",

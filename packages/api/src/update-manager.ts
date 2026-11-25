@@ -60,6 +60,7 @@ import {
   type TrustedKey,
   type UpdateManifest,
 } from "./update-package.js";
+import { reservedRoleName } from "@oculus/db";
 import { DEFAULT_ZIP_LIMITS } from "./update-zip.js";
 
 export const UPDATE_DIR_ENV = "OCULUS_UPDATE_DIR";
@@ -879,6 +880,13 @@ export class UpdateManager {
         // Named before anything changes (S-062): new tables the writer isn't
         // granted would make every request touching them fail after the switch.
         const role = this.writerRole ?? options.fallbackWriterRole;
+        if (role !== undefined && (!ROLE_NAME.test(role) || reservedRoleName(role))) {
+          throw new UpdateRefusal(
+            "invalid_writer_role",
+            409,
+            "OCULUS_UPDATE_WRITER_ROLE must be the app's database role name (lower case, digits and _). Nothing was changed.",
+          );
+        }
         if (role === undefined) {
           throw new UpdateRefusal(
             "migrations_need_writer_role",

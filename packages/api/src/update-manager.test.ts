@@ -343,6 +343,11 @@ describe("installing", () => {
     await expect(m.install("0.2.0", "release-cli", () => undefined, owner)).rejects.toMatchObject({
       code: "migrations_need_writer_role",
     });
+    for (const bad of ["Oculus_Writer", "oculus writer", "pg_monitor", "public"]) {
+      await expect(
+        m.install("0.2.0", "release-cli", () => undefined, { ...owner, fallbackWriterRole: bad }),
+      ).rejects.toMatchObject({ code: "invalid_writer_role" });
+    }
     // Nothing ran: no backup, no migration, no switch.
     expect(calls).toEqual([]);
     expect(await readlink(join(home, "current"))).toBe(join("releases", "0.1.0"));
