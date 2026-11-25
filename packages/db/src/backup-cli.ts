@@ -168,6 +168,11 @@ export async function runRestoreCli(
     safe.out(
       `Everything changed since the backup (made ${result.manifest.createdAt}) is undone, including passwords, two-step set-ups, recovery codes used since, roles, and accounts disabled since: check them in People before people sign in again.`,
     );
+    if (out.openTwoStepResets > 0) {
+      safe.out(
+        `${String(out.openTwoStepResets)} account(s) had a two-step reset link still open in the backup: it works again, with the password the backup holds, until it expires. Reset their two-step again in People.`,
+      );
+    }
     if (out.pendingInvitations > 0) {
       safe.out(
         `${String(out.pendingInvitations)} invitation(s) from the backup are still pending: revoke in People any that shouldn't stand.`,

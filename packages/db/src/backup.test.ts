@@ -954,6 +954,7 @@ describe("a restore signs everyone out (S-060c)", () => {
       sessions: 1,
       resetLinks: 1,
       pendingInvitations: 1,
+      openTwoStepResets: 0,
     });
     const restored = pool(target.url);
     expect(await restored.rows(sql`SELECT id FROM public.sessions`)).toEqual([]);

@@ -993,9 +993,11 @@ export interface RestoreResult {
  * the incident a restore often answers. So every account's
  * `sessions_valid_after` moves to now (every session from before is dead),
  * the restored sessions are deleted, and the reset links still pending are
- * deleted. Pending invitations are only counted: an invitation stays in the
- * people log, so it is for a person to revoke in People if it shouldn't
- * stand. Tables a backup older than their migration lacks are skipped.
+ * deleted. Pending invitations and open two-step reset links are only
+ * counted, for a person to settle in People: revoking an invitation needs
+ * an active system admin (`invitations_settle_once`) and deleting a two-step
+ * reset link would drop the new set-up it requires. Tables a backup older
+ * than their migration lacks are skipped.
  */
 export interface RestoreSignOut {
   /** Accounts whose earlier sign-ins no longer count. */
@@ -1006,6 +1008,12 @@ export interface RestoreSignOut {
   readonly resetLinks: number;
   /** Invitations still pending in the backup, left for a person to check. */
   readonly pendingInvitations: number;
+  /**
+   * Accounts with a two-step reset link (an enrolment token) still open in
+   * the backup: it works again until it expires, with the backup's password.
+   * Left for a person: deleting it would drop the requirement it carries.
+   */
+  readonly openTwoStepResets: number;
 }
 
 /**
@@ -1296,22 +1304,25 @@ export async function restore(options: RestoreOptions): Promise<RestoreResult> {
 
 /** Ends every sign-in a restored backup carries (RestoreSignOut), in one transaction. */
 async function signEveryoneOut(session: Session): Promise<RestoreSignOut> {
-  const [has] = await session.rows<{
-    valid_after: boolean;
-    sessions: boolean;
-    resets: boolean;
-    invitations: boolean;
-  }>(sql`
-    SELECT EXISTS (
-             SELECT 1 FROM pg_catalog.pg_attribute
-             WHERE attrelid = pg_catalog.to_regclass('public.users')
-               AND attname = 'sessions_valid_after' AND NOT attisdropped
-           ) AS valid_after,
-           pg_catalog.to_regclass('public.sessions') IS NOT NULL AS sessions,
-           pg_catalog.to_regclass('public.password_resets') IS NOT NULL AS resets,
-           pg_catalog.to_regclass('public.invitations') IS NOT NULL AS invitations`);
-  if (has === undefined) throw new Error("the catalog query returned no row");
   try {
+    const [has] = await session.rows<{
+      valid_after: boolean;
+      sessions: boolean;
+      resets: boolean;
+      invitations: boolean;
+      enrolments: boolean;
+    }>(sql`
+      SELECT EXISTS (
+               SELECT 1 FROM pg_catalog.pg_attribute
+               WHERE attrelid = pg_catalog.to_regclass('public.users')
+                 AND attname = 'sessions_valid_after' AND NOT attisdropped
+             ) AS valid_after,
+             pg_catalog.to_regclass('public.sessions') IS NOT NULL AS sessions,
+             pg_catalog.to_regclass('public.password_resets') IS NOT NULL AS resets,
+             pg_catalog.to_regclass('public.invitations') IS NOT NULL AS invitations,
+             pg_catalog.to_regclass('public.second_step_enrolment_tokens') IS NOT NULL
+               AS enrolments`);
+    if (has === undefined) throw new Error("the catalog query returned no row");
     await session.control("BEGIN");
     // Sessions first, so they are counted (moving an account's
     // sessions_valid_after ends its sessions too, by 0010's trigger).
@@ -1333,8 +1344,20 @@ async function signEveryoneOut(session: Session): Promise<RestoreSignOut> {
           WHERE accepted_at IS NULL AND revoked_at IS NULL
             AND expires_at > pg_catalog.clock_timestamp()`)
       : [];
+    const [enrolling] = has.enrolments
+      ? await session.rows<{ n: number }>(sql`
+          SELECT pg_catalog.count(DISTINCT user_id)::pg_catalog.int4 AS n
+          FROM public.second_step_enrolment_tokens
+          WHERE expires_at > pg_catalog.clock_timestamp()`)
+      : [];
     await session.control("COMMIT");
-    return { accounts, sessions, resetLinks, pendingInvitations: invited?.n ?? 0 };
+    return {
+      accounts,
+      sessions,
+      resetLinks,
+      pendingInvitations: invited?.n ?? 0,
+      openTwoStepResets: enrolling?.n ?? 0,
+    };
   } catch (error) {
     if (session.transactionState() !== "idle") {
       await session.control("ROLLBACK").catch(() => undefined);
