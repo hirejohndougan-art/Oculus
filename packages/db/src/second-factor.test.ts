@@ -894,8 +894,9 @@ describe("wrong codes no right code explained raise an alert (S-045)", () => {
     expect(await alertsOf(person.userId)).toEqual([7]);
     expect(await unexplained(person.userId)).toBe(0);
     // Nothing is told twice: not by the cleanup, nor by the next sign-in.
-    await later(person.userId, 2);
+    await later(person.userId, 25);
     await runCleanup(db);
+    await full(person.userId, org);
     expect(await alertsOf(person.userId)).toEqual([7]);
   });
 

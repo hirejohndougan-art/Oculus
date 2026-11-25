@@ -54,11 +54,14 @@ export interface AlertedPerson {
   readonly email: string;
   /** The wrong codes counted when the alert was recorded. */
   readonly failures: number;
+  /** When it was recorded (core's ISO form); the email's life runs from it. */
+  readonly at: string;
   /**
    * When the newest wrong code it tells was typed (core's ISO form; S-054c),
-   * or, for alerts written before that was kept, when it was recorded.
+   * never after `at`; for alerts written before that was kept, `at`. The
+   * email gives this time (`at` when absent). Always set here.
    */
-  readonly at: string;
+  readonly codesAt: string;
 }
 
 /**
@@ -73,6 +76,7 @@ export type SecondStepAlertMessage =
       readonly email: string;
       readonly failures: number;
       readonly at: string;
+      readonly codesAt?: string;
     }
   | {
       readonly to: "system_admin";
@@ -116,6 +120,7 @@ interface PendingAlert {
   user_id: UserId;
   failures: number;
   at: string;
+  codes_at: string;
   young: boolean;
 }
 
@@ -150,10 +155,13 @@ export async function sendSecondStepAlertNotices(
       await tx.rows(sql`SELECT pg_advisory_xact_lock(85, 0)`);
       const pending = await tx.rows<PendingAlert>(sql`
         SELECT a.id::text AS id, a.user_id::text AS user_id, a.failures,
-               -- When the newest code was typed (S-054c); older rows have
-               -- no such time, and a clock stepped back can't put it later.
+               to_char(a.created_at AT TIME ZONE 'UTC', ${ISO}) AS at,
+               -- When the newest code was typed (S-054c), for the wording
+               -- only: the email's life still runs from created_at, so codes
+               -- told a day or more on are still sent. Older rows have no
+               -- such time, and a clock stepped back can't put it later.
                to_char(least(coalesce(a.last_code_at, a.created_at), a.created_at)
-                         AT TIME ZONE 'UTC', ${ISO}) AS at,
+                         AT TIME ZONE 'UTC', ${ISO}) AS codes_at,
                a.created_at > clock_timestamp() - make_interval(secs => ${window}) AS young
         FROM public.second_step_alerts a
         WHERE NOT EXISTS (SELECT 1 FROM public.second_step_alert_notices n WHERE n.alert_id = a.id)
@@ -203,7 +211,7 @@ export async function sendSecondStepAlertNotices(
         }
         if (newest === undefined) continue;
         notified += 1;
-        const base = { failures: newest.failures, at: newest.at };
+        const base = { failures: newest.failures, at: newest.at, codesAt: newest.codes_at };
         if (!person.disabled) messages.push({ to: "person", email: person.email, ...base });
         alerted.push({ userId, email: person.email, ...base });
       }
@@ -216,9 +224,14 @@ export async function sendSecondStepAlertNotices(
           to: "system_admin",
           email: admin.email,
           people: Object.freeze(
-            others
-              .slice(0, ALERT_SUMMARY_LINES)
-              .map((p) => Object.freeze({ email: p.email, failures: p.failures, at: p.at })),
+            others.slice(0, ALERT_SUMMARY_LINES).map((p) =>
+              Object.freeze({
+                email: p.email,
+                failures: p.failures,
+                at: p.at,
+                codesAt: p.codesAt,
+              }),
+            ),
           ),
           more: Math.max(0, others.length - ALERT_SUMMARY_LINES),
         });

@@ -128,12 +128,25 @@ describe("sendSecondStepAlertNotices", () => {
     const run = await sendSecondStepAlertNotices(db, box.deliver);
     expect(run).toEqual({ alerts: 2, notified: 1, sent: 2, failed: 0 });
     expect(box.messages).toEqual([
-      { to: "person", email: p.email, failures: 15, at: expect.any(String) as string },
+      {
+        to: "person",
+        email: p.email,
+        failures: 15,
+        at: expect.any(String) as string,
+        codesAt: expect.any(String) as string,
+      },
       {
         to: "system_admin",
         email: ADMIN_EMAIL,
         // By address only: never the self-chosen display name (review L1).
-        people: [{ email: p.email, failures: 15, at: expect.any(String) as string }],
+        people: [
+          {
+            email: p.email,
+            failures: 15,
+            at: expect.any(String) as string,
+            codesAt: expect.any(String) as string,
+          },
+        ],
         more: 0,
       },
     ]);
@@ -244,7 +257,13 @@ describe("sendSecondStepAlertNotices", () => {
     const box = inbox();
     await sendSecondStepAlertNotices(db, box.deliver);
     expect(box.messages).toEqual([
-      { to: "person", email: ADMIN_EMAIL, failures: 5, at: expect.any(String) as string },
+      {
+        to: "person",
+        email: ADMIN_EMAIL,
+        failures: 5,
+        at: expect.any(String) as string,
+        codesAt: expect.any(String) as string,
+      },
     ]);
     const p = await person();
     await db.execute(sql`UPDATE public.users SET disabled_at = clock_timestamp()
@@ -308,8 +327,17 @@ describe("sendSecondStepAlertNotices", () => {
     await sendSecondStepAlertNotices(db, box.deliver);
     const toPerson = (email: string) =>
       box.messages.find((m) => m.to === "person" && m.email === email);
-    expect(toPerson(p.email)).toMatchObject({ failures: 2, at: of(p.userId)?.code });
-    expect(toPerson(q.email)).toMatchObject({ failures: 1, at: of(q.userId)?.created });
+    // The wording gives the codes' time; the email's life runs from the alert's.
+    expect(toPerson(p.email)).toMatchObject({
+      failures: 2,
+      at: of(p.userId)?.created,
+      codesAt: of(p.userId)?.code,
+    });
+    expect(toPerson(q.email)).toMatchObject({
+      failures: 1,
+      at: of(q.userId)?.created,
+      codesAt: of(q.userId)?.created,
+    });
     expect(of(p.userId)?.code).not.toBe(of(p.userId)?.created);
     // An alert written before the time was kept gives when it was written.
     const r = await person();
@@ -322,6 +350,7 @@ describe("sendSecondStepAlertNotices", () => {
     expect(later.messages.find((m) => m.to === "person")).toMatchObject({
       failures: 3,
       at: created[0]?.at,
+      codesAt: created[0]?.at,
     });
   });
 
