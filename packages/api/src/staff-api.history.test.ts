@@ -1140,6 +1140,58 @@ describe("review fixes: what is read before and for a refusal (T-043 review B1, 
     }
   });
 
+  it("a restore whose record moves between its first look and its lock is 503 retry, writing nothing (S-030)", async () => {
+    const target = await makeObject(w, w.a, w.a1, "Invented first title");
+    // Just before the restore locks the row, another save lands: version 2.
+    let moves = 1;
+    const wrap = (tx: Queryable): Queryable => ({
+      rows: async (q) => {
+        if (
+          moves > 0 &&
+          q.text.includes("FOR NO KEY UPDATE") &&
+          q.text.includes("public.records")
+        ) {
+          moves -= 1;
+          await retitle(target.id, 1, "Invented second title");
+        }
+        return tx.rows(q);
+      },
+      execute: (q) => tx.execute(q),
+    });
+    const moving: Database = {
+      rows: (q) => w.db.rows(q),
+      execute: (q) => w.db.execute(q),
+      close: () => Promise.resolve(),
+      transaction: (work) => w.db.transaction((tx) => work(wrap(tx))),
+    };
+    const once = createService(moving, { attempts: 1 });
+    const server = await buildServer({
+      env: TEST_ENV,
+      routes: staffApiRoutes({ db: w.db, service: once, log: (r) => logged.push(r) }),
+    });
+    try {
+      const r = await call(
+        "POST",
+        `/api/records/${target.id}/versions/1/restore`,
+        { as: "cataloger", headers: { "if-match": '"v2"' }, body: {} },
+        server,
+      );
+      expect([r.status, r.json]).toEqual([503, { error: "retry" }]);
+      expect(await stored(target.id)).toMatchObject({ version: 2, title: "Invented second title" });
+      // Asked again, it holds still and goes through.
+      const again = await call(
+        "POST",
+        `/api/records/${target.id}/versions/1/restore`,
+        { as: "cataloger", headers: { "if-match": '"v2"' }, body: {} },
+        server,
+      );
+      expect(again.status).toBe(200);
+      expect(await stored(target.id)).toMatchObject({ version: 3, title: "Invented first title" });
+    } finally {
+      await server.close();
+    }
+  });
+
   it("the approval queue's list is stopped by its statement_timeout (503)", async () => {
     const slow = createService(w.db, { searchTimeoutMs: 300 });
     const server = await buildServer({
