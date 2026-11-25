@@ -7,7 +7,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - What changed: `admin-cli.ts` (`writerConnectionRefusal`; `npm run admin` refuses a superuser, an owner or a writer missing grants before it starts), `update-manager.ts` (`migrations_need_writer_role`, `invalid_writer_role` before any backup or migration), `release-cli.ts` (the role is trimmed; the old "Note" is gone); new `admin-cli-role.test.ts`; tests in `update-manager.test.ts`, `release-cli.test.ts`, `update-api.test.ts`.
 - Decisions: D-067 and D-092 amended
 - Review: independent review: no security hole or data loss; one gap (a mistyped role name passed the check and the database was migrated before the grant failed) fixed; the grant hint now names the running release's script; the wrong-but-existing-role case noted in T-051's runbook line.
-- Gate: see below
+- Gate: PASS · tests_passing 5214 (was 5207) · npm audit clean
 - Next: the next free Phase 2 job on the board
 
 ## 2026-11-25 15:00 CT — manual (Chat A) — T-053 Phase 2 review
