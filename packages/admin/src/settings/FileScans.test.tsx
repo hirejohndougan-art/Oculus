@@ -35,7 +35,8 @@ const COUNTS = {
   clean: 1204,
   infected: 1,
   failed: 3,
-  tooLarge: 2,
+  failedTooLarge: 2,
+  tooLargeToScan: 5,
   unscanned: 40,
   rescanning: 0,
 };
@@ -61,7 +62,13 @@ describe("virus scanning settings", () => {
     expect(screen.getByText("3 files couldn't be scanned yet (tried again later)")).toBeTruthy();
     // Too large: not tried again, and said so.
     expect(
-      screen.getByText(/2 files are too large for the scanner \(not tried again/),
+      screen.getByText(
+        /2 new files were too large for the scanner and can't be opened \(not tried again/,
+      ),
+    ).toBeTruthy();
+    // Old files too large to scan: still available, said so.
+    expect(
+      screen.getByText(/5 files are too large to scan: they can still be opened/),
     ).toBeTruthy();
     expect(screen.getByText("1 file holds a virus and is quarantined")).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Scan every file again" }));

@@ -817,9 +817,12 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
           if (fixed !== undefined) throw fixed;
           return refused(check, reply, log);
         }
+        // The smaller cap while scanning is on: the scanner's (S-040).
+        const cap = check.value.maxFileBytes;
         const received = await files.receive(context.organizationId, upload.chunks(), {
           signal: request.signal,
           usedBytes: check.value.usedBytes,
+          maxBytes: cap,
         });
         if (!received.ok) {
           switch (received.code) {
@@ -830,7 +833,10 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
             case "disk_full":
               throw new Refusal(507, "disk_full");
             default:
-              throw new Refusal(413, "payload_too_large");
+              // Past the scanner's limit (below the store's own): said so.
+              throw cap < files.maxFileBytes
+                ? new Refusal(413, "too_large_to_scan")
+                : new Refusal(413, "payload_too_large");
           }
         }
         const result = await service.attachFile(context, id, received.file, {

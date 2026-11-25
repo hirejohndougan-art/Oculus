@@ -351,6 +351,39 @@ describe("virus scans (S-040)", () => {
     expect(within(table).getByRole("button", { name: "Preview photo.jpg" })).toBeTruthy();
   });
 
+  it("offers files too large to scan, and says they weren't scanned (M1)", async () => {
+    fakeServer({
+      [LIST]: [200, { files: [scanned("too_large_to_scan")], maxFileBytes: 1000 }],
+    });
+    show(false);
+    expect(await screen.findByText(/larger than the virus scanner accepts/)).toBeTruthy();
+    const table = screen.getByRole("table", { name: "Files on this record" });
+    expect(within(table).getByText("Too large to scan")).toBeTruthy();
+    expect(within(table).getByRole("link", { name: "Download photo.jpg" })).toBeTruthy();
+  });
+
+  it("says that uploading an unscanned file again holds every copy (M3)", async () => {
+    fakeServer({ [LIST]: [200, { files: [scanned("not_yet_scanned")], maxFileBytes: 1000 }] });
+    show(false);
+    expect(await screen.findByText(/every copy of it waits for that scan/)).toBeTruthy();
+  });
+
+  it("says plainly when the server or the scanner refuses a file's size", async () => {
+    fakeServer({ [LIST]: [200, { files: [], maxFileBytes: 1000 }] });
+    let n = 0;
+    fakeXhr(() => {
+      n += 1;
+      return [413, { error: n === 1 ? "too_large_to_scan" : "file_too_large" }];
+    });
+    show();
+    await screen.findByText("No files yet.");
+    const input = document.querySelector<HTMLInputElement>('input[type="file"]');
+    if (input === null) throw new Error("no file input");
+    await userEvent.upload(input, [file("scan.tif", 10), file("other.tif", 10)]);
+    expect(await screen.findByText("It is larger than the virus scanner accepts.")).toBeTruthy();
+    expect(await screen.findByText("It is larger than this server takes.")).toBeTruthy();
+  });
+
   it("keeps asking while a scan is due: often for a new upload, slowly for a retry", () => {
     const f = (scan: string, scanQueued: boolean) =>
       ({ ...PHOTO, scan, scanQueued }) as Parameters<typeof scanPollMs>[0][number];

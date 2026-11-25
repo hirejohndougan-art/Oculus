@@ -146,6 +146,12 @@ export interface ReceiveOptions {
   readonly signal?: AbortSignal;
   /** What the organization stores now (each content once), for its total. */
   readonly usedBytes?: number;
+  /**
+   * A cap below the store's own (`maxFileBytes`), such as the virus
+   * scanner's limit (S-040): passed, the upload stops there as
+   * `file_too_large`. Never raises the store's cap.
+   */
+  readonly maxBytes?: number;
 }
 
 export interface FileStore {
@@ -799,6 +805,13 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
     async receive(organizationId, chunks, options = {}): Promise<ReceiveResult> {
       const { signal } = options;
       const used = options.usedBytes ?? 0;
+      if (
+        options.maxBytes !== undefined &&
+        (!Number.isSafeInteger(options.maxBytes) || options.maxBytes < 1)
+      ) {
+        throw new TypeError("Not a cap.");
+      }
+      const cap = Math.min(maxFileBytes, options.maxBytes ?? maxFileBytes);
       organizationDir(organizationId);
       const incoming = await safeFolder(organizationId, "incoming");
       const declared = options.declaredBytes ?? 0;
@@ -845,7 +858,7 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
           signal?.throwIfAborted();
           if (!(chunk instanceof Uint8Array)) throw new TypeError("A body chunk is bytes.");
           size += chunk.byteLength;
-          if (size > maxFileBytes) {
+          if (size > cap) {
             refused = "file_too_large";
             break;
           }

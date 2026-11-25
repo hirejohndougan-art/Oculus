@@ -37,8 +37,12 @@ CREATE TABLE public.file_scans (
   generation integer NOT NULL DEFAULT 0 CONSTRAINT file_scans_generation_range
     CHECK (generation BETWEEN 0 AND 2147483647),
   -- When the queue may take it next (NULL: not by itself, until a rescan).
-  -- Moved ahead while a scan runs (a lease).
   next_attempt_at timestamptz DEFAULT clock_timestamp(),
+  -- Held by a worker scanning it until then (a lease: a crash only delays
+  -- it). The claim takes no row whose lease is running, whatever a rescan
+  -- or a new upload did to next_attempt_at meanwhile, so one content is
+  -- never scanned by two workers at once. Cleared when a result is stored.
+  leased_until timestamptz,
   -- A clean content asked to be scanned again (it stays clean meanwhile).
   rescan_requested_at timestamptz,
   -- Why the last scan failed: the state's cause for failed, the last
@@ -136,7 +140,7 @@ BEGIN
   IF NEW.state NOT IN ('pending', 'unscanned') OR NEW.signature IS NOT NULL
      OR NEW.failure IS NOT NULL OR NEW.scanned_at IS NOT NULL
      OR NEW.quarantined_at IS NOT NULL OR NEW.rescan_requested_at IS NOT NULL
-     OR NEW.attempts <> 0 OR NEW.generation <> 0 THEN
+     OR NEW.attempts <> 0 OR NEW.generation <> 0 OR NEW.leased_until IS NOT NULL THEN
     RAISE EXCEPTION 'A scan result starts queued.'
       USING ERRCODE = 'integrity_constraint_violation',
             CONSTRAINT = 'file_scans_start_queued';

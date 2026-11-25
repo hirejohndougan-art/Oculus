@@ -205,9 +205,10 @@ export interface ClaimedScan {
 }
 
 /**
- * Takes the next due content that some stored file still names, and moves
- * its next attempt `leaseSeconds` ahead, so no other worker takes it
- * meanwhile and a crash only delays it. Organizations take turns: the
+ * Takes the next due content that some stored file still names and that no
+ * worker holds, and holds it for `leaseSeconds` (`leased_until`), so no
+ * other worker takes it meanwhile, whatever a rescan or an upload does to
+ * its next attempt, and a crash only delays it. Organizations take turns: the
  * first after `after` (by ID, going round) that has something due. A job
  * over every organization. `undefined` when nothing is due.
  */
@@ -230,6 +231,7 @@ export async function claimDueScan(
     WITH next AS (
       SELECT s.organization_id, s.sha256 FROM public.file_scans s
       WHERE s.state <> 'infected' AND s.next_attempt_at <= clock_timestamp()
+        AND (s.leased_until IS NULL OR s.leased_until <= clock_timestamp())
         AND EXISTS (SELECT 1 FROM public.stored_files f
                     WHERE f.organization_id = s.organization_id AND f.sha256 = s.sha256)
       ORDER BY (${after ?? null}::uuid IS NOT NULL AND s.organization_id <= ${after ?? null}::uuid),
@@ -238,7 +240,7 @@ export async function claimDueScan(
       FOR UPDATE OF s SKIP LOCKED
     )
     UPDATE public.file_scans s
-    SET next_attempt_at = clock_timestamp() + make_interval(secs => ${leaseSeconds}::integer)
+    SET leased_until = clock_timestamp() + make_interval(secs => ${leaseSeconds}::integer)
     FROM next
     WHERE s.organization_id = next.organization_id AND s.sha256 = next.sha256
     RETURNING s.organization_id::text AS organization_id, s.sha256, s.attempts, s.generation,
@@ -274,7 +276,7 @@ export type ScanResult =
 export type RecordedScan =
   /** Stored (and logged). */
   | "stored"
-  /** A rescan came in after the claim: not stored, queued again now. */
+  /** A rescan came in after the claim: not stored; the rescan queued it again. */
   | "stale"
   /** Already infected (or gone): nothing changed. */
   | "unchanged";
@@ -314,13 +316,18 @@ export async function recordScanResult(
       VALUES (${organizationId}::uuid, gen_random_uuid(), ${extra.kind}, ${sha256},
         ${extra.signature ?? null}, ${extra.failure ?? null}, ${actor})`);
   };
-  /** A clean or failed result claimed before the latest rescan: queued again now. */
-  const stale = async (): Promise<RecordedScan> => {
-    const queued = await tx.execute(sql`
-      UPDATE public.file_scans SET next_attempt_at = clock_timestamp()
-      WHERE organization_id = ${organizationId}::uuid AND sha256 = ${sha256}
-        AND state <> 'infected'`);
-    return queued > 0 ? "stale" : "unchanged";
+  /**
+   * A clean or failed result claimed before the latest rescan: nothing is
+   * written. The rescan already made the row due; it is taken again when
+   * this worker's lease runs out.
+   */
+  const stale = (): RecordedScan => "stale";
+  /** Whether the row is infected (or gone): then nothing changes at all. */
+  const isInfected = async (): Promise<boolean> => {
+    const rows = await tx.rows<{ state: string }>(sql`
+      SELECT state FROM public.file_scans
+      WHERE organization_id = ${organizationId}::uuid AND sha256 = ${sha256}`);
+    return rows[0] === undefined || rows[0].state === "infected";
   };
   switch (result.state) {
     case "infected": {
@@ -329,7 +336,7 @@ export async function recordScanResult(
         UPDATE public.file_scans
         SET state = 'infected', failure = NULL, signature = ${result.signature},
           next_attempt_at = NULL, rescan_requested_at = NULL, scanned_at = clock_timestamp(),
-          quarantined_at = coalesce(quarantined_at, clock_timestamp())
+          leased_until = NULL, quarantined_at = coalesce(quarantined_at, clock_timestamp())
         WHERE organization_id = ${organizationId}::uuid AND sha256 = ${sha256}
           AND state <> 'infected'`);
       if (changed === 0) return "unchanged";
@@ -340,10 +347,10 @@ export async function recordScanResult(
       const changed = await tx.execute(sql`
         UPDATE public.file_scans
         SET state = 'clean', failure = NULL, attempts = 0, next_attempt_at = NULL,
-          rescan_requested_at = NULL, scanned_at = clock_timestamp()
+          rescan_requested_at = NULL, scanned_at = clock_timestamp(), leased_until = NULL
         WHERE organization_id = ${organizationId}::uuid AND sha256 = ${sha256}
           AND state <> 'infected' AND generation = ${generation}::integer`);
-      if (changed === 0) return stale();
+      if (changed === 0) return (await isInfected()) ? "unchanged" : stale();
       await log({ kind: "clean" });
       return "stored";
     }
@@ -365,10 +372,11 @@ export async function recordScanResult(
           next_attempt_at = CASE WHEN ${retry}::integer IS NULL THEN NULL
             ELSE clock_timestamp() + make_interval(secs => ${retry}::integer) END,
           rescan_requested_at = CASE WHEN ${retry}::integer IS NULL THEN NULL
-            ELSE rescan_requested_at END
+            ELSE rescan_requested_at END,
+          leased_until = NULL
         WHERE organization_id = ${organizationId}::uuid AND sha256 = ${sha256}
           AND state <> 'infected' AND generation = ${generation}::integer`);
-      if (changed === 0) return stale();
+      if (changed === 0) return (await isInfected()) ? "unchanged" : stale();
       await log({ kind: "failed", failure: result.failure });
       return "stored";
     }
@@ -416,28 +424,48 @@ export interface ScanCounts {
   readonly infected: number;
   /** Failed and tried again later. */
   readonly failed: number;
-  /** Failed and not tried again by itself (too large for the scanner). */
-  readonly tooLarge: number;
+  /** A new upload's scan failed as too large: not served, not tried again by itself. */
+  readonly failedTooLarge: number;
+  /**
+   * Stored before scanning was on, or clean before the scanner's limit was
+   * lowered, and too large to scan now: served, never scanned (D-113).
+   */
+  readonly tooLargeToScan: number;
   /** Stored before scanning was on and not scanned yet (served meanwhile). */
   readonly unscanned: number;
   /** Clean contents waiting to be scanned again (served meanwhile). */
   readonly rescanning: number;
 }
 
-/** Counts by state over the contents some stored file of the organization names. */
+/**
+ * Counts by state over the contents some stored file of the organization
+ * names. With `scanLimitBytes` (scanning on), a clean content larger than
+ * it counts as too large to scan.
+ */
 export async function scanCounts(
   db: Queryable,
   organizationId: OrganizationId,
+  scanLimitBytes?: number,
 ): Promise<ScanCounts> {
   checkOrganization(organizationId);
+  if (
+    scanLimitBytes !== undefined &&
+    (!Number.isSafeInteger(scanLimitBytes) || scanLimitBytes < 1)
+  ) {
+    throw new TypeError("Not a limit.");
+  }
   const rows = await db.rows<{ bucket: string; n: number }>(sql`
     SELECT CASE
+        WHEN s.state IN ('unscanned', 'clean') AND s.failure = 'too_large'
+          AND s.next_attempt_at IS NULL THEN 'tooLargeToScan'
+        WHEN s.state = 'clean' AND ${scanLimitBytes ?? null}::bigint IS NOT NULL
+          AND c.size > ${scanLimitBytes ?? null}::bigint THEN 'tooLargeToScan'
         WHEN s.state IS NULL OR s.state = 'unscanned' THEN 'unscanned'
-        WHEN s.state = 'failed' AND s.next_attempt_at IS NULL THEN 'tooLarge'
+        WHEN s.state = 'failed' AND s.next_attempt_at IS NULL THEN 'failedTooLarge'
         ELSE s.state END AS bucket,
       count(*)::integer AS n
-    FROM (SELECT DISTINCT f.sha256 FROM public.stored_files f
-          WHERE f.organization_id = ${organizationId}::uuid) c
+    FROM (SELECT f.sha256, max(f.byte_size) AS size FROM public.stored_files f
+          WHERE f.organization_id = ${organizationId}::uuid GROUP BY f.sha256) c
     LEFT JOIN public.file_scans s
       ON s.organization_id = ${organizationId}::uuid AND s.sha256 = c.sha256
     GROUP BY 1
@@ -454,7 +482,8 @@ export async function scanCounts(
     clean: count("clean"),
     infected: count("infected"),
     failed: count("failed"),
-    tooLarge: count("tooLarge"),
+    failedTooLarge: count("failedTooLarge"),
+    tooLargeToScan: count("tooLargeToScan"),
     unscanned: count("unscanned"),
     rescanning: count("rescanning"),
   });

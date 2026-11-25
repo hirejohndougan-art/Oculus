@@ -22,7 +22,8 @@ interface ScanStatus {
     readonly clean: number;
     readonly infected: number;
     readonly failed: number;
-    readonly tooLarge: number;
+    readonly failedTooLarge: number;
+    readonly tooLargeToScan: number;
     readonly unscanned: number;
     readonly rescanning: number;
   };
@@ -100,12 +101,21 @@ export function FileScanSettings() {
                   "files couldn't be scanned yet (tried again later)",
                 )}
               </li>
-              {counts.tooLarge > 0 ? (
+              {counts.tooLargeToScan > 0 ? (
                 <li>
                   {plural(
-                    counts.tooLarge,
-                    "file is too large for the scanner (not tried again until the scanner's limit is raised and every file is scanned again)",
-                    "files are too large for the scanner (not tried again until the scanner's limit is raised and every file is scanned again)",
+                    counts.tooLargeToScan,
+                    "file is too large to scan: it can still be opened, but it hasn't been scanned for viruses (added before scanning was turned on or before the scanner's limit was lowered)",
+                    "files are too large to scan: they can still be opened, but they haven't been scanned for viruses (added before scanning was turned on or before the scanner's limit was lowered)",
+                  )}
+                </li>
+              ) : null}
+              {counts.failedTooLarge > 0 ? (
+                <li>
+                  {plural(
+                    counts.failedTooLarge,
+                    "new file was too large for the scanner and can't be opened (not tried again until the scanner's limit is raised and every file is scanned again)",
+                    "new files were too large for the scanner and can't be opened (not tried again until the scanner's limit is raised and every file is scanned again)",
                   )}
                 </li>
               ) : null}

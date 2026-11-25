@@ -36,7 +36,13 @@ import styles from "./Records.module.css";
 
 /** A file's virus scan, as the server lists it (D-113). */
 export type ScanState =
-  "pending" | "not_yet_scanned" | "clean" | "infected" | "failed" | "not_scanned";
+  | "pending"
+  | "not_yet_scanned"
+  | "too_large_to_scan"
+  | "clean"
+  | "infected"
+  | "failed"
+  | "not_scanned";
 
 export interface StoredFileEntry {
   readonly id: string;
@@ -74,7 +80,8 @@ export function servable(file: StoredFileEntry): boolean {
     file.scan === undefined ||
     file.scan === "clean" ||
     file.scan === "not_scanned" ||
-    file.scan === "not_yet_scanned"
+    file.scan === "not_yet_scanned" ||
+    file.scan === "too_large_to_scan"
   );
 }
 
@@ -85,6 +92,7 @@ const SCAN_PILLS: Readonly<Record<ScanState, { readonly label: string; readonly 
   failed: { label: "Scan failed", tone: styles.amber },
   not_scanned: { label: "Not scanned", tone: styles.gray },
   not_yet_scanned: { label: "Not yet scanned", tone: styles.gray },
+  too_large_to_scan: { label: "Too large to scan", tone: styles.amber },
 };
 
 /** The file's scan as DESIGN.md's pill. */
@@ -146,7 +154,10 @@ function failureText(error: unknown): string {
   if (!(error instanceof ApiError)) return "It couldn't be uploaded. Try again.";
   switch (error.code) {
     case "payload_too_large":
+    case "file_too_large":
       return "It is larger than this server takes.";
+    case "too_large_to_scan":
+      return "It is larger than the virus scanner accepts.";
     case "quota_exceeded":
       return "Your organization has used all its space for files.";
     case "disk_full":
@@ -310,6 +321,7 @@ export function FilesPanel(props: Props) {
   const images = files.filter((f) => VIEWABLE.has(f.mediaType) && servable(f));
   const unscanned = files.some((f) => f.scan === "not_scanned");
   const notYet = files.some((f) => f.scan === "not_yet_scanned");
+  const tooLarge = files.some((f) => f.scan === "too_large_to_scan");
   const infected = files.filter((f) => f.scan === "infected").length;
   const scanNotes: ReactNode[] = [];
   if (unscanned) {
@@ -324,7 +336,17 @@ export function FilesPanel(props: Props) {
     scanNotes.push(
       <Note key="not-yet" tone="blue">
         Files marked Not yet scanned were added before virus scanning was turned on. They can still
-        be opened while they wait for their first scan.
+        be opened while they wait for their first scan. If the same file is uploaded again, every
+        copy of it waits for that scan before it can be opened.
+      </Note>,
+    );
+  }
+  if (tooLarge) {
+    scanNotes.push(
+      <Note key="too-large" tone="amber">
+        Files marked Too large to scan are larger than the virus scanner accepts, so they have not
+        been scanned for viruses. They were added before scanning was turned on or before its limit
+        was lowered, and can still be opened: open them only if you trust where they came from.
       </Note>,
     );
   }
