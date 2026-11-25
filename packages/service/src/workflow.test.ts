@@ -653,6 +653,97 @@ describe("a number that no longer fits a changed format (S-026, D-091)", () => {
     expect(await stateOf(org, id)).toBe("published");
   }, 60_000);
 
+  it("saving a new format through the service lists the published records it takes off public sites (S-033)", async () => {
+    await ready();
+    const org = await organization();
+    const misfit = ok(
+      await service.createRecord(ctx(org), objectDraft({ number: shown("INV-1") }), {
+        identifiers: numbers("INV-1"),
+      }),
+    ).record.id;
+    ok(await service.publish(ctx(org), misfit, { expectedVersion: 1 }));
+    const fits = ok(
+      await service.createRecord(ctx(org), objectDraft({ number: shown("DPL7") }), {
+        identifiers: numbers("DPL7"),
+      }),
+    ).record.id;
+    ok(await service.publish(ctx(org), fits, { expectedVersion: 1 }));
+    const draftMisfit = ok(
+      await service.createRecord(ctx(org), objectDraft({ number: shown("INV-2") }), {
+        identifiers: numbers("INV-2"),
+      }),
+    ).record.id;
+
+    const root = { ...ctx(org), actor: actorOf(folks?.root ?? ("" as UserId)) };
+    const [current] = ok(await service.listIdentifierTypes(root)).filter(
+      (t) => t.type.key === "object_number",
+    );
+    if (current === undefined) throw new Error("no type");
+    const changed = { ...current.type, pattern: "DPL#{1,9}" };
+    const asked = await service.saveIdentifierType(root, changed, { expectedTag: current.tag });
+    expect(asked.ok).toBe(false);
+    const issues = asked.ok ? [] : asked.issues;
+    const dropped = issues
+      .filter((i) => i.code === "published_record_dropped")
+      .map((i) => i.path[1]);
+    // Only the published record whose number doesn't fit; not the draft, not the one that fits.
+    expect(dropped).toEqual([misfit]);
+    // Then the format change's own confirmation, listing them again.
+    const next = await service.saveIdentifierType(root, changed, {
+      expectedTag: current.tag,
+      confirmPublished: true,
+    });
+    const nextIssues = next.ok ? [] : next.issues;
+    expect(
+      nextIssues.filter((i) => i.code === "published_record_dropped").map((i) => i.path[1]),
+    ).toEqual([misfit]);
+    expect(
+      nextIssues.find((i) => i.code === "needs_confirmation" && i.path[1] === "format_changed")
+        ?.message,
+    ).toMatch(/1 published record would show as not available/);
+    // Still public until confirmed.
+    expect((await publicText(org, misfit)).ok).toBe(true);
+    expect(draftMisfit).not.toBe(misfit);
+
+    const confirm = nextIssues
+      .filter((i) => i.code === "needs_confirmation")
+      .map((i) => ({ code: String(i.path[1]), key: String(i.path[2]) }));
+    // Confirming the changes isn't enough: the records themselves must be confirmed.
+    const unlisted = await service.saveIdentifierType(root, changed, {
+      expectedTag: current.tag,
+      confirm,
+      confirmPublished: true,
+    });
+    expect(codes(unlisted)).toContain("drops_published_records");
+    // A list that no longer matches (another misfit published meanwhile) asks again.
+    const late = ok(
+      await service.createRecord(ctx(org), objectDraft({ number: shown("INV-3") }), {
+        identifiers: numbers("INV-3"),
+      }),
+    ).record.id;
+    ok(await service.publish(ctx(org), late, { expectedVersion: 1 }));
+    const stale = await service.saveIdentifierType(root, changed, {
+      expectedTag: current.tag,
+      confirm,
+      confirmPublished: true,
+      confirmDropped: [misfit],
+    });
+    expect(codes(stale)).toContain("drops_published_records");
+    expect((await publicText(org, misfit)).ok).toBe(true);
+    const both = [misfit, late].sort();
+    const saved = ok(
+      await service.saveIdentifierType(root, changed, {
+        expectedTag: current.tag,
+        confirm,
+        confirmPublished: true,
+        confirmDropped: both,
+      }),
+    );
+    expect([...(saved.droppedFromPublic ?? [])].sort()).toEqual(both);
+    expect((await publicText(org, misfit)).ok).toBe(false);
+    expect((await publicText(org, fits)).ok).toBe(true);
+  }, 60_000);
+
   it("a record that only inherits a misfit number stays public, without it", async () => {
     await ready();
     const org = await organization();
