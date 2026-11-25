@@ -470,10 +470,15 @@ describe("the change log (T-060a)", () => {
 
   it("is written once each switch is made, never for a failed install", async () => {
     const written: HistoryEntry[] = [];
+    // The folder's own record is saved first: the entry is in state.json already.
+    let saved = true;
     const m = manager({
-      changeLog: (entry) => {
+      changeLog: async (entry) => {
+        const state = JSON.parse(await readFile(join(home, "state.json"), "utf8")) as {
+          history: HistoryEntry[];
+        };
+        saved &&= state.history.at(-1)?.version === entry.version;
         written.push(entry);
-        return Promise.resolve();
       },
     });
     fail = "migrate-cli.js";
@@ -495,6 +500,7 @@ describe("the change log (T-060a)", () => {
       { kind: "install", version: "0.3.0", from: "0.2.0", by: "user-1" },
       { kind: "rollback", version: "0.2.0", from: "0.3.0", by: "user-2" },
     ]);
+    expect(saved).toBe(true);
   });
 
   it("only logs a failure or a database that doesn't answer: the switch stands", async () => {

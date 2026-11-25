@@ -932,7 +932,6 @@ export class UpdateManager {
       const history = [...state.history, entry];
       const next = { pending: null, history: history.slice(-HISTORY_LIMIT) };
       this.log("update_installed", { version, from: from ?? "development" });
-      await this.logChange(entry);
       // The switch is made: what follows can't undo it, so a failure is logged, not reported.
       try {
         await this.writeState(next);
@@ -940,6 +939,8 @@ export class UpdateManager {
       } catch {
         this.log("update_bookkeeping_failed", { version });
       }
+      // After the folder's own record, so a slow database never leaves it behind.
+      await this.logChange(entry);
     } finally {
       await unlock();
     }
@@ -967,12 +968,12 @@ export class UpdateManager {
       this.swapped = true;
       const entry = { kind: "rollback" as const, version, from, at: this.now(), by };
       const history = [...state.history, entry];
-      await this.logChange(entry);
       try {
         await this.writeState({ ...state, history: history.slice(-HISTORY_LIMIT) });
       } catch {
         this.log("update_bookkeeping_failed", { version });
       }
+      await this.logChange(entry);
       this.log("update_rolled_back", { version, from: from ?? "development" });
     } finally {
       await unlock();

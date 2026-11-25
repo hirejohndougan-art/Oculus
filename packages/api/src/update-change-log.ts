@@ -8,7 +8,7 @@
  * manager), never written as if it came from the command line.
  */
 import { isUserId } from "@oculus/core";
-import { insertSystemEvent, type Database } from "@oculus/db";
+import { insertSystemEvent, sql, type Database } from "@oculus/db";
 import type { HistoryEntry } from "./update-manager.js";
 
 export function updateChangeLog(
@@ -20,13 +20,16 @@ export function updateChangeLog(
       throw new TypeError("updateChangeLog: no system manager named.");
     }
     const actorId = from === "admin" && isUserId(entry.by) ? entry.by : null;
-    await db.transaction((tx) =>
-      insertSystemEvent(tx, {
+    await db.transaction(async (tx) => {
+      // Never waits long on a lock or a slow server: the switch is made already.
+      await tx.execute(sql`SET LOCAL lock_timeout = '5s'`);
+      await tx.execute(sql`SET LOCAL statement_timeout = '10s'`);
+      await insertSystemEvent(tx, {
         actorId,
         kind: entry.kind === "install" ? "update_installed" : "update_rolled_back",
         version: entry.version,
         fromVersion: entry.from,
-      }),
-    );
+      });
+    });
   };
 }

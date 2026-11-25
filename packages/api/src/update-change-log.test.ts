@@ -160,9 +160,7 @@ describe("the hook", () => {
     await expect(updateChangeLog(w.db, "admin")(entry({ by: "release-cli" }))).rejects.toThrow(
       TypeError,
     );
-    await expect(
-      updateChangeLog(w.db, "admin")(entry({ by: w.root, version: "1" })),
-    ).rejects.toThrow(TypeError);
+    await expect(updateChangeLog(w.db, "admin")(entry({ by: "" }))).rejects.toThrow(TypeError);
   });
 });
 

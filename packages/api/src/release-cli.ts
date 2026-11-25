@@ -363,7 +363,12 @@ export async function runReleaseCli(
         // as made on the server's command line.
         let db: Database | undefined;
         try {
-          db = openDatabase(env.OCULUS_DATABASE_URL, { applicationName: "oculus-release" });
+          db = openDatabase(env.OCULUS_DATABASE_URL, {
+            applicationName: "oculus-release",
+            max: 1,
+            // With the change log's lock and statement limits, closing never waits long.
+            connectionTimeoutMillis: 10_000,
+          });
         } catch {
           db = undefined;
         }
