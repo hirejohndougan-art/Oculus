@@ -3,7 +3,7 @@
 // of all six kinds round-trip through core's validators and the database, and
 // direct SQL can't break the core rules the tables back up or point anything
 // across organizations (D-019, D-060).
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   RIGHTS_FIELD_KEY,
   STANDARD_PRESETS,
@@ -74,6 +74,11 @@ async function ready(): Promise<void> {
   })();
   db = (await setup).db;
 }
+
+// Warm the setup before the first test, under the suite's longer hook limit
+// (U-008). A failure stays in `setup`, so with no database each test still
+// fails on its own when it calls ready().
+beforeAll(() => ready().catch(() => undefined));
 
 afterAll(async () => {
   const done = await setup?.catch(() => undefined);

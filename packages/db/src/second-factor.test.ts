@@ -11,7 +11,7 @@
 // and key is invented (example.org, RFC 2606); the keys are hashes of
 // phrases saying they are fake.
 import { inspect } from "node:util";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   decodeBase32,
   hashSessionToken,
@@ -105,6 +105,11 @@ async function ready(): Promise<void> {
   })();
   ({ db, admin, testDb } = await setup);
 }
+
+// Warm the setup before the first test, under the suite's longer hook limit
+// (U-008). A failure stays in `setup`, so with no database each test still
+// fails on its own when it calls ready().
+beforeAll(() => ready().catch(() => undefined));
 
 afterAll(async () => {
   const done = await setup?.catch(() => undefined);
@@ -1414,7 +1419,7 @@ describe("re-entering the password can't deadlock with a reset (second review)",
       const paused = pauseBefore(
         reauthConn,
         (text) => text.includes("reauth_pass ="),
-        async () => {
+        async (tx) => {
           resetting = resetSecondFactor(
             resetConn,
             keys,
@@ -1423,13 +1428,8 @@ describe("re-entering the password can't deadlock with a reset (second review)",
             { source: source(), recoveryCode: recovery(admin) },
             deliverTo([]),
           );
-          for (let i = 0; i < 200; i++) {
-            const waiting = await db.rows(sql`
-              SELECT 1 FROM pg_stat_activity
-              WHERE datname = current_database() AND wait_event_type = 'Lock'`);
-            if (waiting.length > 0) break;
-            await new Promise((r) => setTimeout(r, 25));
-          }
+          // Wait for the reset itself to queue behind this transaction (U-008).
+          await waitUntilBlockedBy(await backendPid(tx));
         },
       );
       const r = await reauthenticate(paused, keys, s.token, {
@@ -1446,7 +1446,9 @@ describe("re-entering the password can't deadlock with a reset (second review)",
       await resetConn.close();
     }
     expect(await deadlocks()).toBe(before);
-  });
+    // Room for the setup's sign-ins plus waitUntilBlockedBy's own 20 s, so a
+    // stuck race reports its clear message, not a bare timeout (U-008).
+  }, 60_000);
 });
 
 describe("a lost race isn't a wrong code", () => {
@@ -1972,9 +1974,12 @@ describe("a system admin's reset", () => {
       // FOR SHARE and is about to lock the admin's factor (as a pass would).
       let release: () => void = () => undefined;
       const held = new Promise<void>((r) => (release = r));
+      let holderPid!: (pid: number) => void;
+      const holderPidKnown = new Promise<number>((r) => (holderPid = r));
       const holding = holder.transaction(async (tx) => {
         await tx.execute(sql`SET LOCAL lock_timeout = '10s'`);
         await tx.rows(sql`SELECT 1 FROM public.users WHERE id = ${person.userId}::uuid FOR SHARE`);
+        holderPid(await backendPid(tx));
         await held;
         await tx.rows(sql`SELECT 1 FROM public.second_factors
           WHERE user_id = ${admin}::uuid AND state = 'active' FOR UPDATE`);
@@ -1987,14 +1992,9 @@ describe("a system admin's reset", () => {
         { source: source(), recoveryCode: recovery(admin) },
         deliverTo([]),
       );
-      // Wait until the reset is waiting on a lock (the person's user row).
-      for (let i = 0; i < 200; i++) {
-        const waiting = await db.rows(sql`
-          SELECT 1 FROM pg_stat_activity
-          WHERE datname = current_database() AND wait_event_type = 'Lock'`);
-        if (waiting.length > 0) break;
-        await new Promise((r) => setTimeout(r, 25));
-      }
+      // Wait until the reset is waiting on the holder's lock (the person's
+      // user row), not just any lock (U-008).
+      await waitUntilBlockedBy(await holderPidKnown);
       release();
       await holding;
       expect(ok(await resetting)).toMatchObject({ reset: true });
@@ -2003,7 +2003,9 @@ describe("a system admin's reset", () => {
       await resetter.close();
     }
     expect(await deadlocks()).toBe(before);
-  });
+    // Room for the setup's sign-ins plus waitUntilBlockedBy's own 20 s, so a
+    // stuck race reports its clear message, not a bare timeout (U-008).
+  }, 60_000);
 });
 
 /** Moves a session back in time by `seconds`, as the owner, with its guards off inside the transaction only. */
@@ -2026,26 +2028,55 @@ async function ageSession(sessionId: SessionId, seconds: number): Promise<void> 
   });
 }
 
+/** The server process behind `q` (inside a transaction, the one holding its locks). */
+async function backendPid(q: Queryable): Promise<number> {
+  const [row] = await q.rows<{ pid: number }>(sql`SELECT pg_backend_pid() AS pid`);
+  if (row === undefined) throw new Error("no backend pid");
+  return row.pid;
+}
+
+/**
+ * Waits until a backend of this database is waiting on a lock that backend
+ * `pid` holds (U-008). Waiting for "any lock wait" could match the wrong
+ * backend, and giving up quietly after a few seconds let a busy machine release
+ * the holder before the race was set up; this fails clearly instead.
+ */
+async function waitUntilBlockedBy(pid: number, withinMs = 20_000): Promise<void> {
+  const deadline = Date.now() + withinMs;
+  for (;;) {
+    const waiting = await db.rows(sql`
+      SELECT 1 FROM pg_stat_activity
+      WHERE datname = current_database() AND ${pid}::int = ANY(pg_blocking_pids(pid))`);
+    if (waiting.length > 0) return;
+    if (Date.now() > deadline) {
+      throw new Error(
+        `no backend waited on a lock held by ${String(pid)} within ${String(withinMs)} ms`,
+      );
+    }
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
 /** `base`, with `hook` awaited once before the first statement `match` picks. */
 function pauseBefore(
   base: Database,
   match: (text: string) => boolean,
-  hook: () => Promise<void>,
+  hook: (q: Queryable) => Promise<void>,
 ): Database {
   let fired = false;
-  const gate = async (query: Sql): Promise<void> => {
+  const gate = async (q: Queryable, query: Sql): Promise<void> => {
     if (!fired && match(query.text)) {
       fired = true;
-      await hook();
+      await hook(q);
     }
   };
   const wrap = (q: Queryable): Queryable => ({
     rows: async <R extends Row = Row>(query: Sql): Promise<R[]> => {
-      await gate(query);
+      await gate(q, query);
       return q.rows<R>(query);
     },
     execute: async (query: Sql): Promise<number> => {
-      await gate(query);
+      await gate(q, query);
       return q.execute(query);
     },
   });

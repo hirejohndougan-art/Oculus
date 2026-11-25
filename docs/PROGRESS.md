@@ -9,6 +9,20 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Review: two independent reviews. The first found that giving the codes' time as the message's `at` made the outbox drop notices of codes told a day on as expired; fixed (`codesAt` for wording only) and tested. The second: safe; notes (deploy migrations before code, as always; a wait during a re-entry can count another tab's in-flight codes) accepted.
 - Gate: see the baseline commit · npm audit clean
 - Next: the build run's S-054b (keep both sides in `takeCodeAttempt`)
+## 2026-11-25 16:00 CT — manual (Chat L) — U-008 Load-proof test timeouts
+
+- **Done:** `vitest.config.js` sets `testTimeout` 30 s and `hookTimeout` 120 s for the suite. The 19 db and service test files that set up their database lazily in `ready()` now warm it in `beforeAll`, with the error kept in the memoized promise so a missing database still fails each test on its own. `migrate.test`'s leaked-setting test uses `statement_timeout = '20ms'` against a 200 ms sleep (was 1 ms against 50 ms). The two second-factor deadlock tests wait for a backend blocked by the specific lock holder (`pg_blocking_pids`) and fail clearly after 20 s instead of releasing after 5 s. No assertion changes.
+- **Checked:** with 10 busy loops on this 2-core machine, main's `second-factor` and `vocabularies` files failed with two 5000 ms timeouts; this branch passed all 137 tests in those files and `migrate.test`.
+- Review: one independent round: safe (no weakened test, swallowed setup errors still fail each test, the waits find the right backend). Its one note, the 20 s wait running into the 30 s test limit, fixed by giving the two deadlock tests 60 s.
+- Gate: PASS · tests_passing 5233 (was 5233; U-008 adds no tests, it makes existing ones hold up under load) · npm audit clean
+
+## 2026-11-25 16:05 CT — manual (Chat M) — T-075 Accept an invitation
+- Result: done
+- What changed: `sign-in-api.ts` (`POST /api/invitation/accept`: the token from the link, the invitee's address, a name and a password; the account is made and signed in, so the next screen is two-step set-up; `POST /api/invitation/accept-signed-in` for someone who already has an account, user from the session only); `accounts.ts` (`acceptInvitation` and `acceptInvitationForUser` take the organization from the invitation when it is left out); the admin's `/invitation` screen (`AcceptInvitation.tsx`), which reads the token from the fragment once. Tests: `invitation-api.test.ts` (one reply for every unusable link, `account_exists` only for a complete form, Origin, CSRF, session and per-address rules, no token or address in logs) and `AcceptInvitation.test.tsx`.
+- Decisions: D-068 amended
+- Review: one independent review: nothing unsafe. Fixed: a typo in the address now keeps the form instead of a dead-link page; after a server failure the screen says the account may already be made; the cookie is written only after the waiting session's state is read; thrown account errors are logged as class and SQLSTATE and answered 503; the secrecy test checks tokens too.
+- Gate: PASS · tests_passing 5233 (was 5214) · npm audit clean
+- Next: none for Chat M (every Phase 2 job is taken)
 
 ## 2026-11-25 15:45 CT — manual (Chat P) — S-062 The server checks its database role at start; updates need the writer role named
 - Result: done

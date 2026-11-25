@@ -3,7 +3,7 @@
 // alerts folded into a notice or seen too late, two runs at once, failed
 // sends, and 0021's guards as the writer role. Every person and address is
 // invented.
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { newOrganizationId, type OrganizationId, type UserId, type Validated } from "@oculus/core";
 import { acceptInvitation, createFirstSystemAdmin, createInvitation } from "./accounts.js";
 import type { InvitationMessage } from "./accounts.js";
@@ -54,6 +54,11 @@ async function ready(): Promise<void> {
   })();
   await setup;
 }
+
+// Warm the setup before the first test, under the suite's longer hook limit
+// (U-008). A failure stays in `setup`, so with no database each test still
+// fails on its own when it calls ready().
+beforeAll(() => ready().catch(() => undefined));
 
 afterAll(async () => {
   await setup?.catch(() => undefined);

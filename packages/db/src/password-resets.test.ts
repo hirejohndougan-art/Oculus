@@ -8,7 +8,7 @@
 // the writer role with exactly WRITER_PRIVILEGES, and the cleanup. Every
 // person, address and password is invented (example.org is reserved for
 // examples, RFC 2606; addresses are from RFC 1918's private ranges).
-import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   hashResetToken,
   hashSessionToken,
@@ -99,6 +99,11 @@ async function ready(): Promise<void> {
   })();
   ({ db, admin, testDb } = await setup);
 }
+
+// Warm the setup before the first test, under the suite's longer hook limit
+// (U-008). A failure stays in `setup`, so with no database each test still
+// fails on its own when it calls ready().
+beforeAll(() => ready().catch(() => undefined));
 
 afterEach(() => {
   vi.restoreAllMocks();
