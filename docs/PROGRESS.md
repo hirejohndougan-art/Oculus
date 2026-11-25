@@ -7,7 +7,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - What changed: `npm run desktop` and `scripts/start-oculus.cmd` run the admin on 127.0.0.1 in an Edge or Chrome app window with its own profile, stopping when the window closes; settings, a 0600 secret key and a single-instance lock in the per-user settings folder; `extraRoutes` on `buildAdminServer`; docs/DESKTOP.md (Windows guide). John chose to stay inside D-002 (no Electron, no bundled PostgreSQL). Smoke-tested with a real Chrome under Xvfb: sign-in screen in the window, server stopped on close.
 - Decisions: D-088
 - Review: three independent rounds. Fixed: server left running after a failure after listen; stale and reused-PID locks (now an HMAC challenge to the running server, whole-file lock, rename takeover, busy is not stale); a new key over sealed two-step secrets or a wrong key (refused, revoked set-ups ignored); weak Origin test; SIGHUP/SIGBREAK; npm ci after updates; Windows setup step (`exec` in npm scripts). Left as S-033.
-- Gate: PASS · tests_passing see baseline · npm audit clean
+- Gate: PASS · tests_passing 4344 (was 4292) · npm audit clean
 - Next: T-057 (desktop database helper, Chat D)
 
 ## 2026-11-24 21:10 CT — manual (Chat A) — T-040 Sending password reset email
