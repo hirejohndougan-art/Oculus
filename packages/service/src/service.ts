@@ -129,10 +129,13 @@ import {
 import { adminOperations, type AdminOperations } from "./admin.js";
 import { definitionOperations, type DefinitionOperations } from "./definitions.js";
 import type { FileStore } from "./file-store.js";
+import { fileScanQueue, type FileScanner, type FileScanQueueOptions } from "./file-scans.js";
 import type { ThumbnailRenderer } from "./thumbnails.js";
 import { fileOperations, type FileOperations } from "./files.js";
 import { peopleOperations, type PeopleOperations } from "./people.js";
 import { shareOperations, type ShareOperations } from "./shares.js";
+import { accessionOperations, type AccessionOperations } from "./accessions.js";
+import { storageOperations, type StorageOperations } from "./storage.js";
 import {
   changeWorkflowState,
   checkWriterConnection,
@@ -374,12 +377,26 @@ export interface ServiceOptions {
    * Thumbnails made at once and per organization a minute (defaults
    * `THUMBNAILS_AT_ONCE`, `THUMBNAILS_PER_MINUTE`); tests change them.
    */
-  readonly thumbnailLimits?: { readonly atOnce?: number; readonly perMinute?: number };
+  readonly thumbnailLimits?: {
+    readonly atOnce?: number;
+    readonly perMinute?: number;
+    readonly inARow?: number;
+  };
   /**
-   * Whether thumbnails are made at all (default `THUMBNAILS_ENABLED`, off
-   * until T-072, D-097). Only tests of the code kept for T-072 turn it on.
+   * Whether thumbnails are made at all (default `THUMBNAILS_ENABLED`, on
+   * since T-072, D-097); tests turn it off.
    */
   readonly thumbnailsEnabled?: boolean;
+  /**
+   * The virus scanner (S-040, D-113; `clamdScanner`). With it and a file
+   * store, each upload is scanned in the background and only clean files
+   * are read; without it files are `not_scanned` and read as before (an
+   * infected one never). Whoever builds the service stops its queue
+   * (`stopFileScans`).
+   */
+  readonly scanner?: FileScanner;
+  /** The scan queue's concurrency and backoff (tests shorten it). */
+  readonly scanQueue?: Pick<FileScanQueueOptions, "concurrency" | "backoffMs">;
   /**
    * The most published records a Dublin Core mapping change lists one by
    * one; past it, the change is confirmed by its count (S-039). Default
@@ -478,7 +495,14 @@ export const MAX_VERSION_PAGE = 100;
 
 /** The service: every write of a record and its related rows, and who may make them. */
 export interface RecordService
-  extends AdminOperations, DefinitionOperations, PeopleOperations, ShareOperations, FileOperations {
+  extends
+    AdminOperations,
+    DefinitionOperations,
+    PeopleOperations,
+    ShareOperations,
+    FileOperations,
+    AccessionOperations,
+    StorageOperations {
   /** The record as stored, for someone who may view it (`records.view`). */
   readRecord(context: ServiceContext, recordId: RecordId): Promise<ServiceResult<ReadRecord>>;
   /**
@@ -3017,11 +3041,19 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
       options.thumbnails,
       options.thumbnailLimits,
       options.thumbnailsEnabled,
+      options.scanner === undefined || options.files === undefined
+        ? undefined
+        : fileScanQueue(db, options.files, options.scanner, {
+            ...options.scanQueue,
+            ...(onError === undefined ? {} : { onError }),
+          }),
       (code) => {
         onError?.(Object.assign(new Error(code), { code }), "files");
       },
     ),
     ...shareOperations(db, run, outside),
+    ...accessionOperations(run),
+    ...storageOperations(run),
     submitForReview: workflowAction("submit_for_review"),
     returnToDraft: workflowAction("return_to_draft"),
     publish: workflowAction("publish"),

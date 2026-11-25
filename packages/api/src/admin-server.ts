@@ -38,7 +38,12 @@
  *   minutes. Removed files are purged only by a system manager's button or
  *   `npm run files:purge`, unless `OCULUS_FILES_AUTO_PURGE=on` (default
  *   off), which runs one purge step every 25 hours (S-052: a day and an
- *   hour, so a second step due a day after the first is never just missed).
+ *   hour, so a second step due a day after the first is never just missed);
+ * - the virus scanner's settings (`OCULUS_CLAMD_*`, file-scanning.ts,
+ *   S-040, D-113) are malformed. None set is fine: files are then
+ *   `not_scanned` and served as before; in production that is logged as a
+ *   `startup_warning` (`files_not_scanned`), and a scanner set up but not
+ *   answering as `clamd_unreachable` (it is tried again by the queue).
  *
  * It warns loudly (a `startup_warning` log record) when the database
  * server's `log_parameter_max_length_on_error` is above 0, since pg's
@@ -61,15 +66,18 @@ import {
 } from "@oculus/db";
 import {
   AUTOMATIC_PURGE_EVERY_MS,
+  clamdScanner,
   createService,
   createThumbnailRenderer,
   FILE_LEASE_RENEW_MS,
+  pingClamd,
   openFileStore,
   type FileStore,
   type FileStoreProblem,
 } from "@oculus/service";
 import type { FastifyInstance } from "fastify";
 import { ADMIN_ORIGIN_ENV, loadAdminFiles, type AdminFiles } from "./admin-files.js";
+import { scannerFromEnv } from "./file-scanning.js";
 import { originsFromEnv } from "./origin.js";
 import { isProduction } from "./environment.js";
 import { mailerFromEnv, type Mailer } from "./mail.js";
@@ -140,6 +148,9 @@ async function serverKey(db: Database): Promise<string> {
   const identity = await databaseIdentity(db);
   return encodeURIComponent(`${identity}|${rows[0]?.name ?? "-"}|${String(rows[0]?.port ?? "-")}`);
 }
+
+/** How often the scan queue looks for due scans (and once at startup; uploads kick it too). */
+export const FILE_SCAN_EVERY_MS = 60_000;
 
 /** How often the file sweep runs (and once at startup). */
 export const FILE_SWEEP_EVERY_MS = 15 * 60_000;
@@ -222,6 +233,12 @@ export interface AdminServerOptions {
    * isn't served.
    */
   readonly countsDb?: Database;
+  /**
+   * OAI-PMH's own small pool on the staff role (S-051, `oaiPoolOptions`):
+   * its list and datestamp reads wait a bounded time for a connection.
+   * Left out (tests), they use `db`.
+   */
+  readonly oaiDb?: Database;
   /** Defaults to `process.env`. */
   readonly env?: Readonly<Record<string, string | undefined>>;
   /**
@@ -250,8 +267,8 @@ export interface AdminServerOptions {
   /** Routes of the program that starts the server (the desktop launcher's instance check, D-088). */
   readonly extraRoutes?: readonly OculusRoute[];
   /**
-   * Server-side thumbnails (M-003, D-097): off by default and until T-072
-   * makes them safe; `GET .../thumbnail` then answers `422 no_thumbnail`.
+   * Server-side thumbnails (M-003, T-072, D-097): on by default; `false`
+   * turns them off, and `GET .../thumbnail` then answers `422 no_thumbnail`.
    */
   readonly thumbnails?: boolean;
   /** Passed on to the sign-in routes (tests). */
@@ -403,15 +420,31 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
         });
 
   const files = await fileStoreFromEnv(env);
-  // Thumbnails (M-003, D-097) are off until T-072: no renderer, so no
-  // worker is ever started. Turned on, one worker, stopped with the server.
-  const thumbnailsOn = options.thumbnails === true;
+  // Virus scanning (S-040, D-113): only with clamd set up.
+  const scanning = scannerFromEnv(env);
+  if (scanning === undefined && production) {
+    log({ event: "startup_warning", code: "files_not_scanned" });
+  }
+  // Uploads over the scanner's limit are refused while scanning is on
+  // (S-040 review S1): the file cap is then really the scanner's.
+  if (scanning !== undefined && files.maxFileBytes > scanning.clamd.streamMaxBytes) {
+    log({ event: "startup_warning", code: "file_cap_over_scan_limit" });
+  }
+  // Thumbnails (M-003, T-072, D-097): one renderer (a decoder child
+  // process at a time), stopped with the server. Turned off, none is made.
+  const thumbnailsOn = options.thumbnails !== false;
   const thumbnails = thumbnailsOn ? createThumbnailRenderer() : undefined;
   const service = createService(options.db, {
     onError: serviceErrorLogger(log),
     files,
     thumbnailsEnabled: thumbnailsOn,
     ...(thumbnails === undefined ? {} : { thumbnails }),
+    ...(scanning === undefined
+      ? {}
+      : {
+          scanner: clamdScanner(scanning.clamd),
+          scanQueue: { concurrency: scanning.concurrency },
+        }),
   });
   const routes = [
     ...staffApiRoutes({
@@ -446,7 +479,7 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     ...(publicDb === undefined || publicSites.length === 0 || oaiEmail === undefined
       ? []
       : oaiPmhRoutes({
-          db: options.db,
+          db: options.oaiDb ?? options.db,
           publicDb,
           sites: publicSites,
           adminEmail: oaiEmail,
@@ -517,6 +550,13 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     }
   };
   await sweep();
+  const scan = async (): Promise<void> => {
+    try {
+      await service.scanQueuedFiles();
+    } catch (error) {
+      log({ event: "service_error", operation: "scanQueuedFiles", ...redactedError(error) });
+    }
+  };
   let app: FastifyInstance;
   try {
     app = await buildServer({
@@ -524,7 +564,12 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
       routes,
       ...(options.logger === undefined ? {} : { logger: options.logger }),
       ...(admin === undefined ? {} : { admin }),
-      ...(publicSubjects === undefined ? {} : { onClose: () => publicSubjects.stop() }),
+      // Stopped before the server's close finishes: the public counts and
+      // the scans running now (S-040 review L5).
+      onClose: async () => {
+        await publicSubjects?.stop();
+        await service.stopFileScans();
+      },
     });
   } catch (error) {
     claim.release();
@@ -554,6 +599,19 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     ? setInterval(() => void purge(), AUTOMATIC_PURGE_EVERY_MS)
     : undefined;
   purgeTimer?.unref();
+  // The scan queue (S-040): what is due now, then every minute. A scanner
+  // that doesn't answer is logged; its scans fail and are tried again.
+  let scans: ReturnType<typeof setInterval> | undefined;
+  if (scanning !== undefined) {
+    void pingClamd({ ...scanning.clamd, timeoutMs: Math.min(scanning.clamd.timeoutMs, 5000) })
+      .then((answered) => {
+        if (!answered) log({ event: "startup_warning", code: "clamd_unreachable" });
+      })
+      .catch(() => undefined);
+    void scan();
+    scans = setInterval(() => void scan(), FILE_SCAN_EVERY_MS);
+    scans.unref();
+  }
   // Started once the server is built, so a start that fails counts nothing.
   publicSubjects?.start();
   app.server.once("close", () => {
@@ -561,6 +619,7 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     clearInterval(lease);
     if (purgeTimer !== undefined) clearInterval(purgeTimer);
     if (retry !== undefined) clearTimeout(retry);
+    if (scans !== undefined) clearInterval(scans);
     claim.release();
     void thumbnails?.close();
   });

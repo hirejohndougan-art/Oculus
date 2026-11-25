@@ -9,6 +9,7 @@
 // second site read or change the record through the ordinary operations.
 // Every person, site and record here is invented.
 import { afterAll, describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import {
   newOrganizationId,
   newRecordId,
@@ -24,6 +25,8 @@ import {
   grantWriterRole,
   insertOrganization,
   insertTemplateVersion,
+  DECLINE_COOLDOWN_DAYS,
+  MAX_OPEN_OFFERS,
   MAX_SHARE_PAGE,
   migrate,
   openDatabase,
@@ -1238,5 +1241,274 @@ describe("share lists and views (S-036a)", () => {
       ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1)).shares.map((x) => x.item),
     ).toEqual([null]);
     expect(ok(await service.listSharedItems(at(w.dhs, w.dhsReader), w.d1)).shares).toEqual([]);
+  });
+});
+
+describe("share limits and endings (S-036b)", () => {
+  interface Row {
+    state: string;
+    decided_by: string | null;
+    decided_at: string | null;
+    ended_by: string | null;
+    ended_at: string | null;
+  }
+  const stored = async (id: string): Promise<Row | undefined> =>
+    (
+      await s.owner.rows<Row>(sql`
+        SELECT state, decided_by::text AS decided_by, decided_at::text AS decided_at,
+               ended_by::text AS ended_by, ended_at::text AS ended_at
+        FROM public.record_shares WHERE id = ${id}::uuid`)
+    )[0];
+
+  /** A published item of the Library's L1, besides the world's own. */
+  async function anotherItem(w: World, title: string): Promise<CatalogRecord> {
+    const made = ok(
+      await service.createRecord(at(w.lib, w.libCataloger, w.l1), {
+        kind: "object",
+        title,
+        templateKey: "t-object",
+        fields: {
+          description: "Invented.",
+          rights: { uri: "http://rightsstatements.org/vocab/InC/1.0/" },
+        },
+      }),
+    ).record;
+    ok(await service.publish(at(w.lib, folks.root, w.l1), made.id, { expectedVersion: 1 }));
+    return made;
+  }
+
+  it("keeps the second site's decisions when the home side deletes the item", async () => {
+    await ready();
+    const w = await world();
+    const accepted = await offer(w, { org: w.dhs, site: w.d1 });
+    ok(await service.acceptShare(at(w.dhs, w.dhsManager), accepted.id));
+    const declined = await offer(w, { org: w.lib, site: w.l2 });
+    ok(await service.declineShare(at(w.lib, w.l2Manager), declined.id));
+    const rootAt = at(w.lib, folks.root, w.l1);
+    const before = ok(await service.readRecord(rootAt, w.item.id));
+    ok(await service.withdraw(rootAt, w.item.id, { expectedVersion: before.version }));
+    const now = ok(await service.readRecord(rootAt, w.item.id));
+    ok(await service.deleteRecord(rootAt, w.item.id, { expectedVersion: now.version }));
+    // The accepted share ends as deleted, its decision kept; the declined one stays.
+    const a = await stored(accepted.id);
+    expect(a).toMatchObject({ state: "deleted", decided_by: w.dhsManager, ended_by: null });
+    expect(a?.ended_at).not.toBeNull();
+    expect(await stored(declined.id)).toMatchObject({
+      state: "declined",
+      decided_by: w.l2Manager,
+    });
+    // Still shown nowhere.
+    expect(codes(await service.readSharedItem(at(w.dhs, w.dhsManager), accepted.id))).toEqual([
+      "unknown_share",
+    ]);
+    expect(ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1)).shares).toEqual([]);
+    expect(codes(await service.removeShare(at(w.dhs, w.dhsManager), accepted.id))).toEqual([
+      "share_not_open",
+    ]);
+  });
+
+  it("ends a share when its item moves onto the second site, and doesn't bring it back", async () => {
+    await ready();
+    const w = await world();
+    const share = await offer(w, { org: w.lib, site: w.l2 });
+    ok(await service.acceptShare(at(w.lib, w.l2Manager), share.id));
+    // An offer elsewhere is untouched by the move.
+    const other = await offer(w, { org: w.dhs, site: w.d1 });
+    const rootAt = at(w.lib, folks.root, w.l1);
+    const move = async (siteId: SiteId) => {
+      const now = ok(await service.readRecord(rootAt, w.item.id));
+      ok(
+        await service.updateRecord(
+          rootAt,
+          w.item.id,
+          { ...now.record, siteId },
+          { expectedVersion: now.version },
+        ),
+      );
+    };
+    await move(w.l2);
+    expect(await stored(share.id)).toMatchObject({
+      state: "moved",
+      decided_by: w.l2Manager,
+      ended_by: null,
+    });
+    expect((await stored(other.id))?.state).toBe("offered");
+    // Back home: the old share stays ended, and L2 shows nothing.
+    await move(w.l1);
+    expect((await stored(share.id))?.state).toBe("moved");
+    expect(ok(await service.listSharedItems(at(w.lib, w.l2Manager), w.l2)).shares).toEqual([]);
+    const listed = ok(await service.sharesOfRecord(rootAt, w.item.id)).shares;
+    expect(listed.find((x) => x.id === share.id)?.state).toBe("moved");
+    // It can be offered anew.
+    const again = await offer(w, { org: w.lib, site: w.l2 });
+    expect(again.state).toBe("offered");
+  });
+
+  it("refuses moves to deleted or moved that didn't happen", async () => {
+    await ready();
+    const w = await world();
+    const share = await offer(w, { org: w.lib, site: w.l2 });
+    for (const state of ["deleted", "moved"]) {
+      await expect(
+        s.writer.execute(sql`UPDATE public.record_shares
+          SET state = ${state}, ended_at = clock_timestamp() WHERE id = ${share.id}::uuid`),
+      ).rejects.toMatchObject({ constraint: "record_shares_life" });
+    }
+    // An offer of a record that doesn't exist.
+    await expect(
+      s.writer.execute(sql`INSERT INTO public.record_shares
+            (id, organization_id, record_id, target_organization_id, target_site_id, offered_by)
+          VALUES (${newRecordId()}::uuid, ${w.lib}::uuid, ${newRecordId()}::uuid, ${w.dhs}::uuid,
+                  ${w.d1}::uuid, ${w.libCataloger}::uuid)`),
+    ).rejects.toMatchObject({ constraint: "record_shares_record" });
+  });
+
+  it("refuses offering a record again soon after the site declined it", async () => {
+    await ready();
+    const w = await world();
+    const first = await offer(w, { org: w.dhs, site: w.d1 });
+    ok(await service.declineShare(at(w.dhs, w.dhsManager), first.id));
+    const again = await service.offerRecord(at(w.lib, w.libCataloger, w.l1), {
+      recordId: w.item.id,
+      targetOrganizationId: w.dhs,
+      targetSiteId: w.d1,
+    });
+    expect(codes(again)).toEqual(["declined_recently"]);
+    // Another site may still be offered it, and a withdrawn offer doesn't count.
+    const l2 = await offer(w, { org: w.lib, site: w.l2 });
+    ok(await service.withdrawShare(at(w.lib, w.libCataloger, w.l1), l2.id));
+    expect((await offer(w, { org: w.lib, site: w.l2 })).state).toBe("offered");
+    // Once the wait is over (the decline set back by hand), it can be offered again.
+    await s.owner.transaction(async (q) => {
+      await q.execute(sql`ALTER TABLE public.record_shares DISABLE TRIGGER record_shares_check`);
+      await q.execute(sql`UPDATE public.record_shares
+        SET decided_at = now() - make_interval(days => ${String(DECLINE_COOLDOWN_DAYS)} + 1)
+        WHERE id = ${first.id}::uuid`);
+      await q.execute(
+        sql`ALTER TABLE public.record_shares ENABLE ALWAYS TRIGGER record_shares_check`,
+      );
+    });
+    expect((await offer(w, { org: w.dhs, site: w.d1 })).state).toBe("offered");
+  });
+
+  it("limits the open offers one organization has into one site", async () => {
+    await ready();
+    const w = await world();
+    // MAX_OPEN_OFFERS - 1 offers stored directly (the limit is the database's).
+    const ids: string[] = [];
+    const fillers: CatalogRecord[] = [];
+    for (let n = 0; n < MAX_OPEN_OFFERS - 1; n++) {
+      const r = await anotherItem(w, `Invented filler ${String(n)}`);
+      fillers.push(r);
+      const id = newRecordId();
+      await s.writer.execute(sql`INSERT INTO public.record_shares
+            (id, organization_id, record_id, target_organization_id, target_site_id, offered_by)
+          VALUES (${id}::uuid, ${w.lib}::uuid, ${r.id}::uuid, ${w.dhs}::uuid, ${w.d1}::uuid,
+                  ${w.libCataloger}::uuid)`);
+      ids.push(id);
+    }
+    // Two offers at the same moment for the last place: exactly one gets it.
+    const a = await anotherItem(w, "Invented lamp A");
+    const b = await anotherItem(w, "Invented lamp B");
+    const both = await Promise.all(
+      [a, b].map((r) =>
+        service.offerRecord(at(w.lib, w.libCataloger, w.l1), {
+          recordId: r.id,
+          targetOrganizationId: w.dhs,
+          targetSiteId: w.d1,
+        }),
+      ),
+    );
+    expect(both.map((r) => (r.ok ? "ok" : codes(r)[0])).sort()).toEqual(["ok", "too_many_offers"]);
+    // The world's own item is refused too, until the site answers one.
+    const offerItem = () =>
+      service.offerRecord(at(w.lib, w.libCataloger, w.l1), {
+        recordId: w.item.id,
+        targetOrganizationId: w.dhs,
+        targetSiteId: w.d1,
+      });
+    expect(codes(await offerItem())).toEqual(["too_many_offers"]);
+    // Other sites, and other organizations' offers into D1, aren't counted.
+    expect((await offer(w, { org: w.lib, site: w.l2 })).state).toBe("offered");
+    // An offer whose item the home side unpublished since no longer takes a
+    // place (the second site can't see or answer it).
+    const rootAt = at(w.lib, folks.root, w.l1);
+    const first = fillers[0];
+    if (first === undefined) throw new Error("no filler");
+    const now = ok(await service.readRecord(rootAt, first.id));
+    ok(await service.withdraw(rootAt, first.id, { expectedVersion: now.version }));
+    expect((await offerItem()).ok).toBe(true);
+    // Full again; answering one frees a place.
+    const c = await anotherItem(w, "Invented lamp C");
+    const offerItemAgain = () =>
+      service.offerRecord(at(w.lib, w.libCataloger, w.l1), {
+        recordId: c.id,
+        targetOrganizationId: w.dhs,
+        targetSiteId: w.d1,
+      });
+    expect(codes(await offerItemAgain())).toEqual(["too_many_offers"]);
+    await s.writer.execute(sql`UPDATE public.record_shares
+        SET state = 'accepted', decided_by = ${w.dhsManager}::uuid, decided_at = clock_timestamp()
+        WHERE id = ${ids[1] ?? ""}::uuid`);
+    expect((await offerItemAgain()).ok).toBe(true);
+  }, 120_000);
+
+  it("ends offers not yet answered too, when the item is moved or deleted", async () => {
+    await ready();
+    const w = await world();
+    const toL2 = await offer(w, { org: w.lib, site: w.l2 });
+    const toD1 = await offer(w, { org: w.dhs, site: w.d1 });
+    const rootAt = at(w.lib, folks.root, w.l1);
+    let now = ok(await service.readRecord(rootAt, w.item.id));
+    ok(
+      await service.updateRecord(
+        rootAt,
+        w.item.id,
+        { ...now.record, siteId: w.l2 },
+        { expectedVersion: now.version },
+      ),
+    );
+    expect(await stored(toL2.id)).toMatchObject({ state: "moved", decided_by: null });
+    expect(codes(await service.acceptShare(at(w.lib, w.l2Manager), toL2.id))).toEqual([
+      "share_not_open",
+    ]);
+    now = ok(await service.readRecord(rootAt, w.item.id));
+    ok(
+      await service.withdraw(at(w.lib, folks.root, w.l2), w.item.id, {
+        expectedVersion: now.version,
+      }),
+    );
+    now = ok(await service.readRecord(rootAt, w.item.id));
+    ok(
+      await service.deleteRecord(at(w.lib, folks.root, w.l2), w.item.id, {
+        expectedVersion: now.version,
+      }),
+    );
+    expect(await stored(toD1.id)).toMatchObject({ state: "deleted", decided_by: null });
+  });
+
+  it("refuses an offer made outside Read Committed (the limit's count needs it)", async () => {
+    await ready();
+    const w = await world();
+    await expect(
+      s.writer.transaction(async (q) => {
+        await q.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`);
+        await q.execute(sql`INSERT INTO public.record_shares
+            (id, organization_id, record_id, target_organization_id, target_site_id, offered_by)
+          VALUES (${newRecordId()}::uuid, ${w.lib}::uuid, ${w.item.id}::uuid, ${w.dhs}::uuid,
+                  ${w.d1}::uuid, ${w.libCataloger}::uuid)`);
+      }),
+    ).rejects.toMatchObject({ code: "OC061" });
+  });
+
+  it("keeps the limits in shares.ts and the migration the same", () => {
+    const text = readFileSync(
+      new URL("../../db/migrations/0043_share_limits_and_endings.sql", import.meta.url),
+      "utf8",
+    );
+    expect(text).toContain(`IF open_offers >= ${String(MAX_OPEN_OFFERS)} THEN`);
+    expect(text).toContain(
+      `d.decided_at > now() - interval '${String(DECLINE_COOLDOWN_DAYS)} days'`,
+    );
   });
 });

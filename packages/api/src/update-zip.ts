@@ -26,6 +26,7 @@
  */
 import { open, type FileHandle } from "node:fs/promises";
 import { crc32, deflateRawSync, inflateRawSync } from "node:zlib";
+import { WINDOWS_DEVICE_NAME } from "./file-replies.js";
 
 export interface ZipLimits {
   /** Bytes in the whole file. */
@@ -94,6 +95,8 @@ export function zipNameProblem(name: string): string | undefined {
     if (segment.startsWith(" ") || segment.endsWith(" ") || segment.endsWith(".")) {
       return "segment";
     }
+    // CON, nul.txt, aux.js, COM1 … can't be written on Windows (S-050).
+    if (WINDOWS_DEVICE_NAME.test(segment)) return "device_name";
   }
   return undefined;
 }

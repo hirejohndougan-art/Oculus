@@ -223,8 +223,8 @@ interface Who {
  * from `managedSites`; "all" meaning every site of the organization), or a
  * whole-catalog role on every site (`siteId` and `scope` null), which
  * includes the manager's own (John, 2026-11-25; S-042). A role on every site
- * scoped to one unit is that unit's site's only, so it counts only as that.
- * The one rule for the people list, a person's page and a grant's target;
+ * scoped to one unit doesn't count for any site manager (S-050: neither
+ * here nor in `listMembers`). The one rule for the people list, a person's page and a grant's target;
  * `listMembers` asks the same in SQL. No managed site: no one.
  */
 export function holdsRoleOn(

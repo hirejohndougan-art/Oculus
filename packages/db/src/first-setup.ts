@@ -49,6 +49,12 @@ import { contentsOf } from "./backup-catalog.js";
 import type { Database } from "./client.js";
 import { insertOrganization, insertTemplateVersion } from "./catalog.js";
 import { writeDublinCoreMapping } from "./dublin-core-mappings.js";
+import {
+  defaultMigrationsDir,
+  MigrationError,
+  pendingMigrations,
+  readMigrations,
+} from "./migrate.js";
 import { insertSite } from "./permissions.js";
 import { inTransaction } from "./sessions.js";
 import { sql } from "./sql.js";
@@ -155,6 +161,53 @@ const KEYS = ["email", "displayName", "password", "organizationName", "siteName"
 const NEVER_OCULUS = ["default_privileges", "publications", "subscriptions", "event_triggers"];
 
 /**
+ * Kinds of object Oculus's migrations never make (S-031): no schema of
+ * their own, no extension, language, cast, operator, collation, text search
+ * object, foreign server or the like. A database that has Oculus's
+ * migration table but no people or organizations yet, and has any of these,
+ * isn't treated as an empty Oculus install that setup may finish.
+ */
+const NOT_FROM_MIGRATIONS = [
+  "schemas",
+  "extensions",
+  "languages",
+  "casts",
+  "transforms",
+  "conversions",
+  "collations",
+  "operators",
+  "operator_classes",
+  "operator_families",
+  "access_methods",
+  "text_search_configurations",
+  "text_search_dictionaries",
+  "text_search_parsers",
+  "text_search_templates",
+  "statistics_objects",
+  "foreign_data_wrappers",
+  "foreign_servers",
+  "large_objects",
+];
+
+/**
+ * Whether the applied migrations are exactly a first run of this release's
+ * files (S-031): every applied name is one of the files, with the same
+ * SHA-256, and none is out of order (`pendingMigrations`' own checks).
+ */
+async function appliedMatchFiles(
+  applied: readonly { name: string; sha256: string }[],
+  dir: string,
+): Promise<boolean> {
+  try {
+    pendingMigrations(await readMigrations(dir), applied);
+    return true;
+  } catch (error) {
+    if (error instanceof MigrationError) return false;
+    throw error;
+  }
+}
+
+/**
  * What a database is before setup migrates it: `"empty"`, `"set_up"` (Oculus's,
  * with people or organizations) or `"other"` (anything else). Setup migrates
  * only an `"empty"` one, so it never changes a database it then refuses.
@@ -166,8 +219,17 @@ const NEVER_OCULUS = ["default_privileges", "publications", "subscriptions", "ev
  * With it, a database is not Oculus's if it has default privileges,
  * publications, subscriptions or event triggers, or if `users` or
  * `organizations` exist before the migration that makes them was applied.
+ * And it is `"empty"` (setup may migrate it) only if its applied migrations'
+ * names and hashes match this release's files (`dir`, the default
+ * migrations folder) and it has nothing the migrations never make
+ * (`NOT_FROM_MIGRATIONS`, S-031). Those two checks don't make a database
+ * with people `"other"`: an install may have gained an extension or be
+ * behind this release, and migrating it says what is wrong.
  */
-export async function databaseBeforeSetup(db: Database): Promise<"empty" | "set_up" | "other"> {
+export async function databaseBeforeSetup(
+  db: Database,
+  dir: string = defaultMigrationsDir(),
+): Promise<"empty" | "set_up" | "other"> {
   const contents = await contentsOf(db);
   const [row] = await db.rows<{ oculus: boolean; users: boolean; orgs: boolean }>(sql`
     SELECT to_regclass('public.oculus_migrations') IS NOT NULL AS oculus,
@@ -176,11 +238,9 @@ export async function databaseBeforeSetup(db: Database): Promise<"empty" | "set_
   if (row === undefined) return "other";
   if (!row.oculus) return Object.keys(contents).length === 0 ? "empty" : "other";
   if (NEVER_OCULUS.some((kind) => (contents[kind] ?? 0) > 0)) return "other";
-  const applied = new Set(
-    (await db.rows<{ name: string }>(sql`SELECT name FROM public.oculus_migrations`)).map(
-      (r) => r.name,
-    ),
-  );
+  const rows = await db.rows<{ name: string; sha256: string | null }>(sql`
+    SELECT name, to_jsonb(m) ->> 'sha256' AS sha256 FROM public.oculus_migrations m`);
+  const applied = new Set(rows.map((r) => r.name));
   if (row.orgs && !applied.has("0002_catalog.sql")) return "other";
   if (row.users && !applied.has("0009_users.sql")) return "other";
   if (row.users && (await db.rows(sql`SELECT 1 FROM public.users LIMIT 1`)).length > 0) {
@@ -189,7 +249,88 @@ export async function databaseBeforeSetup(db: Database): Promise<"empty" | "set_
   if (row.orgs && (await db.rows(sql`SELECT 1 FROM public.organizations LIMIT 1`)).length > 0) {
     return "set_up";
   }
+  if (NOT_FROM_MIGRATIONS.some((kind) => (contents[kind] ?? 0) > 0)) return "other";
+  // The table must be the one the first migration makes (its hash column included).
+  const [shape] = await db.rows<{ hashed: boolean }>(sql`
+    SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute
+                   WHERE attrelid = 'public.oculus_migrations'::regclass
+                     AND attname = 'sha256' AND NOT attisdropped) AS hashed`);
+  if (shape?.hashed !== true) return "other";
+  const hashed = rows.map((r) => ({ name: r.name, sha256: r.sha256 ?? "" }));
+  if (!(await appliedMatchFiles(hashed, dir))) return "other";
   return "empty";
+}
+
+/**
+ * Kinds of object an extension can bring with it (`contentsOf`'s names):
+ * a database with anything else besides them isn't explained by an
+ * extension in `template1`.
+ */
+const EXTENSION_KINDS = new Set([
+  "extensions",
+  "schemas",
+  "relations",
+  "functions",
+  "types",
+  "constraints",
+  "operators",
+  "operator_classes",
+  "operator_families",
+  "casts",
+  "collations",
+  "conversions",
+  "languages",
+  "transforms",
+  "access_methods",
+  "text_search_configurations",
+  "text_search_dictionaries",
+  "text_search_parsers",
+  "text_search_templates",
+  "foreign_data_wrappers",
+]);
+
+/**
+ * Whether a database's only contents are extensions and what they bring
+ * (S-031): CREATE DATABASE copies `template1`, so an extension installed
+ * there is in every new database, and setup's refusal can say so.
+ */
+export async function onlyExtensionsBeforeSetup(db: Database): Promise<boolean> {
+  const contents = await contentsOf(db);
+  if ((contents.extensions ?? 0) === 0) return false;
+  if (Object.keys(contents).some((kind) => !EXTENSION_KINDS.has(kind))) return false;
+  return (await objectsOutsideExtensions(db)) === 0;
+}
+
+/**
+ * How many schemas, functions, tables, views, sequences, domains, enums and
+ * composite types no extension owns (an extension's own indexes, TOAST
+ * tables and row types belong to its tables, so aren't counted).
+ */
+async function objectsOutsideExtensions(db: Database): Promise<number> {
+  const [row] = await db.rows<{ n: number }>(sql`
+    WITH ext AS (
+      SELECT classid, objid FROM pg_catalog.pg_depend WHERE deptype = 'e'
+    )
+    SELECT (
+      (SELECT count(*) FROM pg_catalog.pg_namespace n WHERE n.oid >= 16384
+         AND n.nspname NOT LIKE 'pg\\_temp\\_%' AND n.nspname NOT LIKE 'pg\\_toast\\_temp\\_%'
+         AND (n.oid) NOT IN (SELECT objid FROM ext WHERE classid = 'pg_catalog.pg_namespace'::regclass))
+      + (SELECT count(*) FROM pg_catalog.pg_proc p WHERE p.oid >= 16384
+         AND p.oid NOT IN (SELECT objid FROM ext WHERE classid = 'pg_catalog.pg_proc'::regclass))
+      + (SELECT count(*) FROM pg_catalog.pg_class c WHERE c.oid >= 16384
+         AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S', 'c')
+         AND c.relnamespace::regnamespace::text NOT LIKE 'pg\\_%'
+         AND c.oid NOT IN (SELECT objid FROM ext WHERE classid = 'pg_catalog.pg_class'::regclass)
+         -- a sequence owned by an extension's table column
+         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
+                         WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.objid = c.oid
+                           AND d.deptype IN ('a', 'i')
+                           AND d.refobjid IN (SELECT objid FROM ext
+                                              WHERE classid = 'pg_catalog.pg_class'::regclass)))
+      + (SELECT count(*) FROM pg_catalog.pg_type t WHERE t.oid >= 16384 AND t.typtype IN ('d', 'e', 'r', 'm')
+         AND t.oid NOT IN (SELECT objid FROM ext WHERE classid = 'pg_catalog.pg_type'::regclass))
+    )::int AS n`);
+  return row?.n ?? 1;
 }
 
 /** Whether the database has no users and no organizations. */

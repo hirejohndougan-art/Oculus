@@ -538,6 +538,8 @@ export {
   validateAccession,
   validateDonorContact,
   indexAccessions,
+  indexAccessionHolds,
+  accessionHoldsOn,
   isAccessionRegister,
   accessionById,
   accessionsByNumber,
@@ -560,6 +562,8 @@ export type {
   Accession,
   DonorContact,
   AccessionRegister,
+  AccessionHold,
+  AccessionHoldsRegister,
   AccessionRegisterInput,
 } from "./accessions.js";
 export type { PublishCheckOptions } from "./effective.js";

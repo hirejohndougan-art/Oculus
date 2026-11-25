@@ -33,12 +33,22 @@ import type { Database, Queryable } from "./client.js";
 import { sql } from "./sql.js";
 import { publicRecordIn } from "./workflow.js";
 
-/** The writer's privileges on the shares (roles.ts): never DELETE (rows go with their record). */
+/** The writer's privileges on the shares (roles.ts): never DELETE (rows outlive their record, S-036b). */
 export const SHARE_TABLE_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Object.freeze({
   record_shares: ["INSERT", "UPDATE"],
 });
 
-export const SHARE_STATES = ["offered", "accepted", "declined", "withdrawn", "removed"] as const;
+export const SHARE_STATES = [
+  "offered",
+  "accepted",
+  "declined",
+  "withdrawn",
+  "removed",
+  // Set only by the database (0043, S-036b): the record was deleted at home,
+  // or moved onto the second site.
+  "deleted",
+  "moved",
+] as const;
 export type ShareState = (typeof SHARE_STATES)[number];
 
 /**
@@ -47,6 +57,23 @@ export type ShareState = (typeof SHARE_STATES)[number];
  * screen (offers and accepted items) builds at most twice this many.
  */
 export const MAX_SHARE_PAGE = 50;
+
+/**
+ * The most open offers (`offered`) one organization may have into one site
+ * at a time (S-036b). Checked by the database (0043) when an offer is made;
+ * past it, the offer fails with SQLSTATE `OC071`.
+ */
+export const MAX_OPEN_OFFERS = 100;
+
+/**
+ * How long after a site declines a record it can't be offered that record
+ * again (S-036b): SQLSTATE `OC072` from the database (0043).
+ */
+export const DECLINE_COOLDOWN_DAYS = 30;
+
+/** The SQLSTATEs of the two limits (0043). */
+export const SHARE_OFFER_LIMIT_STATE = "OC071";
+export const SHARE_COOLDOWN_STATE = "OC072";
 
 /** A page of a share list: newest first, after `before` (a share ID) when given. */
 export interface SharePageOptions {

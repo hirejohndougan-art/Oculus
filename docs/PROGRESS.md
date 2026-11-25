@@ -2,6 +2,65 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 14:30 CT — manual (Chat A) — T-072 Safe server-side thumbnails
+
+- **Done:** thumbnails are back on (D-097). Every decode runs in its own child process with an in-child watchdog that kills it past a 352 MiB growth cap (also on its deadline, and when its parent is gone), plus the parent's sampler as a second layer. The server only reads a 64 KiB header; strict JPEG segment lengths, sampling factors up to 4, VP8L and VP8L-compressed ALPH planned per group and every prefix code checked complete, segment, chunk and frame count caps. Failed spawns, descriptor exhaustion and outside kills are all handled. WebP originals are untouched; thumbnails are JPEG.
+- **Reviews:** four independent reviews; the last found nothing blocking, and every finding was fixed.
+- **Filed:** T-074 (thumbnails for large photos; jpeg-js stops near 6 MP), S-057 (a libwebp build without CVE-2023-4863).
+- Gate: PASS (tests_passing 5141; baseline raised from 5104).
+
+## 2026-11-25 13:30 CT — manual (Chat A) — S-040 Scan uploaded files for viruses
+
+- **Done:** each upload is scanned by a separately installed ClamAV daemon over its socket (own INSTREAM client, no dependency, no linking; D-113, migration 0048, written as 0041 and renumbered after main's 0047). While scanning is on, only clean files are served: pending and failed answer 409, infected 423 and are quarantined for good. Files stored before scanning was on stay served until their first scan; files too large to scan are shown as such. With no scanner (the desktop trial) files are "not scanned" and served, with a notice. Rescans keep clean files served; uploads over the scanner's limit are refused with 413.
+- **Reviews:** one full independent review and one focused check of the fixes; nothing blocking in either, and every finding fixed.
+- **Filed:** S-040a (release a false positive), S-040b (needs John: should production refuse to start without a scanner).
+- Gate: PASS (tests_passing 5104; baseline raised from 5045).
+## 2026-11-25 12:45 CT — Chat K — T-018c Accessions and donor contacts stored; T-018d Storage locations and moves stored
+- Result: done (T-018b split into T-018c, T-018d and the loans, which stay T-018b with T-018a and S-013; T-073 filed for the admin screens)
+- What changed: migrations 0046 (accessions, accession_records, accession_versions, accession_numbers, donor_contacts; `public_record_snapshot` gains `accessionHolds`) and 0047 (storage_levels, storage_locations, storage_moves); core `indexAccessionHolds` and `accessionHoldsOn`; db `accessions.ts` and `storage.ts`; the publish check and the public output now read stored accessions' holds, so an unsigned deed or a restriction in force holds records back; service operations for accessions, donor contacts, storage levels, locations and moves; record deletion refuses `in_accession`, `accession_source`, `has_moves` and `storage_agent`; trigger functions are left out of the public reader's definer check.
+- Decisions: D-114, D-115
+- Review: T-018c three independent rounds (a publish/save race, closed with an organization-wide advisory lock; cross-site holds; all-time numbers; fail-open holds), all fixed; T-018d one round (move times, cross-site agents, read consistency, refusal paths), all fixed.
+- Gate: PASS · tests_passing 5045 · npm audit clean
+- Next: Chat K's queue (T-018b with T-018a and S-013, then T-073)
+
+## 2026-11-25 11:25 CT — build (BUILD MODE) — S-053 "Last sign-in" is stamped at the right password, before the second step
+- Result: done
+- What changed: `signIn`'s success transaction no longer sets `users.last_sign_in_at`; `markSignedIn` (accounts.ts) stamps it after `completeSecondStep` or `confirmEnrolment` promoted the session, then calls `markKnownSource`; its own statement, best effort, a failure said by class only (as S-050's `markKnownSource`). Re-entering the password no longer moves it. Three tests in second-factor.test.ts (password plus a wrong code, set-up at first sign-in, a promotion refused for the organization), all failing without the change; password-resets.test.ts's deadlock test pins on the address counter's update. Commits on main up to the baseline raise.
+- Decisions: D-077 amended (S-053)
+- Review: one independent round: safe. Nits fixed: `signIn`'s stale comment; the silent catch now warns like S-050's. Filed S-056 (no test now covers the rehash UPDATE racing a reset).
+- Gate: PASS · tests_passing 5021 (was 5018) · npm audit clean (run on the branch rebased onto main with Chat K's S-031, S-035, S-048, S-049, S-050, U-007)
+- Next: the next free task (S-054 or S-056; most others are claimed by Chat K)
+
+## 2026-11-25 11:00 CT — Chat K — S-048, S-050, S-049, U-007, S-031, S-035 (one gate)
+- Result: done (S-048 and S-035 were already done by S-036a and M-003; their lines say how)
+- What changed: S-050 hardening (404 for an unknown share target, device names refused in update packages, a private updates folder, a Windows warning for a settings folder outside %APPDATA%, `failureClass` logging in `markKnownSource`, a comment fixed); S-049 public sites need an admin origin in every mode; U-007 the gate removes `packages/*/dist` first; S-031 setup checks applied migrations' names and hashes, refuses what the migrations never make, keeps the terminal quiet while migrating and names `template1` when extensions are the only contents; S-035's public side moved into T-058. Follow-up S-055 filed.
+- Decisions: D-090 amended (S-049)
+- Review: an independent review each for S-050, S-049 and S-031 (all safe; S-050's two small points and S-031's extension-detection gaps fixed; the rest is S-055)
+- Gate: PASS · tests_passing 5018 (was 5001) · npm audit clean
+- Next: Chat K's queue (T-018c, T-018d, then T-018b with T-018a and S-013)
+
+## 2026-11-25 10:40 CT — Chat J — S-036b Share limits and endings
+- Result: done (S-036 is now done)
+- What changed: migration 0043 (written as 0040; renumbered at merge: S-045 took 0040, and 0041–0042 are Chat A's): at most 100 open offers from one organization into one site, counting only offers whose record is published on a site now (`too_many_offers`), and no re-offer within 30 days of a decline (`declined_recently`), both in the share check under an advisory lock and only in Read Committed (OC061 otherwise); `record_shares` no longer cascades with its record, and triggers on `records` end live shares as `deleted` (record deleted) or `moved` (record moved onto the second site), keeping the decision; existing shares left live by earlier moves end as `moved`; `record_shares_target` in the lists' order. The service maps the limits (`MAX_OPEN_OFFERS`, `DECLINE_COOLDOWN_DAYS`), says `already_shared` first, and answers a record deleted mid-offer as missing; the admin names the new states and refusals.
+- Decisions: D-094 amended (S-036b)
+- Review: one independent round; nothing blocking. Fixed: hidden offers no longer fill a site's places, the count refuses non-Read-Committed writers, a deleted record mid-offer is `unknown_record`, the shadowed `found` variable, the amendment's wording; tests added for unanswered offers ending, the isolation check and unpublished offers freeing a place.
+- Gate: PASS (see the merge commit's raised baseline)
+- Next: none for Chat J (every other open job is Chat K's, John 2026-11-25 09:45 CT)
+
+## 2026-11-25 10:30 CT — manual (Chat C) — S-046, S-047, S-051 OAI-PMH follow-ups
+
+- **Done:** S-046: no datestamp is computed from record versions any more (`oaiDatestamp` removed); a record with no stored row answers GetRecord at the site's lower bound. S-047: since S-041 only records a site has shown have rows, so a run of skipped ones says nothing about never-public records; a record no longer shown is skipped (GetRecord `idDoesNotExist`) until the next pass marks it deleted, so one restored in between is never reported deleted (review fix). S-051: list reads take a per-call `timeLimitMs` bounded by the page, no `lock_timeout`; OAI-PMH has its own 2-connection pool (`oaiPoolOptions`) with a bounded wait, and the public and OAI pools give up client-side after 90 s (`queryTimeoutMillis`). D-108 amended.
+- Reviewed by an independent reviewer; the one blocking finding (deleted headers for unmarked rows) fixed and tested.
+- Gate: PASS (tests_passing 4993, 10 e2e specs; baseline raised from 4990).
+
+## 2026-11-25 09:55 CT — build (BUILD MODE) — S-045 Four wrong codes a day never raise an alert
+- Result: done (the `last_sign_in_at` half split off as S-053)
+- What changed: a `wrong:<user>` row in `second_step_throttles` (migration 0040 widens the key check) counts a sign-in's wrong TOTP codes that no right code in the same session explained; a session's first code writes a `second_step_alerts` row for codes other sessions left, and `runCleanup` writes one for codes an hour old (`UNEXPLAINED_TOLD_AFTER_SECONDS`), each told once; forgotten after 30 days (`WRONG_CODE_MEMORY_SECONDS`); a typo followed by the right code (or a recovery code) raises none; full sessions' codes (re-entry, recovery codes, resets) aren't counted; a wait's alert takes them all. Eight tests in second-factor.test.ts; the attack tests (4 guesses a day, a recovery code in a new session, the cleanup) fail without the change. Commits on main up to 85e3286.
+- Decisions: D-077 amended (S-045)
+- Review: two independent rounds. First: no hole letting a password holder guess unseen, but codes could be dropped silently after 30 days on accounts seldom signed into (fixed: the cleanup tells them an hour on) and the 30 days hard-coded (fixed); smaller points filed as S-054. Second: CTE, locks and privileges sound; fixed a wait's alert being told again by the cleanup, and full sessions' codes counting (false alerts for a re-entry typo); added tests for both and for a 31-day-old row.
+- Gate: PASS · tests_passing 4990 (was 4982) · npm audit clean (run on the branch rebased onto main with M-002/M-003; main then gained only roadmap and decision edits)
+- Next: the next free Phase 2 task (S-048, S-049, S-050, S-053, S-054, S-043b, U-007, S-031 or S-035; S-046, S-047, S-051 and S-052 are claimed)
+
 ## 2026-11-25 08:30 CT — manual (Chat A) — M-002 Upload and store files; M-003 View and download files
 
 - **Done:** staff upload files to a record (one or many), stored once by content hash under `OCULUS_FILES_DIR` (migrations 0038 and 0039, D-086); uploads stop when free space falls below the smaller of 5% or 2 GB (John). Download for every file, an inline view for images that the browser decodes, and a viewer with keyboard navigation (D-097). Five independent reviews of M-002 and three of M-003; every real finding fixed.

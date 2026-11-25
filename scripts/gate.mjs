@@ -2,11 +2,15 @@
 // Stops at the first failure.
 import { spawn } from "node:child_process";
 import { mkdirSync, rmSync } from "node:fs";
+import { removeBuildOutput } from "./clean-build.mjs";
 import { findPostgresBin, startTestDatabase } from "./test-database.mjs";
 
 // Start clean so the baseline check can never read an old test report.
 rmSync(".gate", { recursive: true, force: true });
 mkdirSync(".gate", { recursive: true });
+// And from no build (U-007): the type check, tests and build must not lean
+// on an old `packages/*/dist`.
+removeBuildOutput(process.cwd());
 
 const steps = [
   ["Format (Prettier)", "npm", ["run", "format:check"]],

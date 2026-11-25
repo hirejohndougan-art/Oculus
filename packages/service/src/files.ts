@@ -60,6 +60,13 @@ import {
   readFileStoreLease,
   lockFileStoreLease,
   insertFileStoreEpoch,
+  queueScan,
+  rescanContents,
+  scanCounts,
+  scanState,
+  scanStates,
+  type ScanCounts,
+  type StoredScan,
   readFileStoreBinding,
   insertStoredFile,
   listStoredFiles,
@@ -73,7 +80,13 @@ import {
   type RecordPlace,
   type StoredFile,
 } from "@oculus/db";
-import { editPermissions, notPermitted, type RecordAccess, type Refusal } from "./access.js";
+import {
+  editPermissions,
+  notPermitted,
+  readAccess,
+  type RecordAccess,
+  type Refusal,
+} from "./access.js";
 import type { Runner } from "./admin.js";
 import {
   LeaseLockBusy,
@@ -88,13 +101,17 @@ import {
   type PurgeProblem,
   type PurgeResult,
 } from "./file-purge.js";
+import type { FileScanQueue, ScanPass } from "./file-scans.js";
+import { closeSync } from "node:fs";
 import {
   THUMBNAIL_BOXES,
   THUMBNAIL_LIMITS,
   THUMBNAIL_TYPES,
   VIEW_LIMITS,
   VIEW_TYPES,
-  planDecode,
+  THUMBNAIL_HEADER_BYTES,
+  THUMBNAIL_SOURCE_MAX_BYTES,
+  precheckThumbnail,
   viewDimensions,
   withinLimits,
   type ThumbnailSize,
@@ -156,6 +173,61 @@ export interface FileSweep {
   readonly halted?: "marker_changed" | "database_changed";
 }
 
+/**
+ * A file's virus scan as the admin shows it (S-040, D-113): its content's
+ * stored state; `not_scanned` when no scanner is set up (and it isn't clean
+ * or infected); with a scanner, `not_yet_scanned` for content stored before
+ * scanning was turned on and not scanned yet (served meanwhile), and
+ * `too_large_to_scan` for such content, or a clean one, larger than the
+ * scanner takes (served, never scanned: D-113).
+ */
+export type FileScanState =
+  | "pending"
+  | "not_yet_scanned"
+  | "too_large_to_scan"
+  | "clean"
+  | "infected"
+  | "failed"
+  | "not_scanned";
+
+/** A file as `listFiles` lists it: the row and its content's scan. */
+export type ListedFile = StoredFile & {
+  readonly scan: FileScanState;
+  /** Whether a scan of it is queued to run (again) by itself: worth asking again later. */
+  readonly scanQueued: boolean;
+};
+
+/** Virus scanning as System settings shows it, for the session's organization. */
+export interface FileScanStatus {
+  /** Whether a scanner is set up on this server. */
+  readonly scanning: boolean;
+  readonly counts: ScanCounts;
+}
+
+/** The scan state shown for a content's stored result. */
+export function shownScanState(
+  scanning: boolean,
+  stored: StoredScan | undefined,
+  /** The file's size and the scanner's limit: a clean file larger than it is too large to scan. */
+  size?: { readonly bytes: number; readonly scanLimit: number },
+): FileScanState {
+  if (stored?.state === "infected") return "infected";
+  if (
+    scanning &&
+    stored !== undefined &&
+    (stored.state === "clean" || stored.state === "unscanned") &&
+    ((stored.failure === "too_large" && stored.nextAttemptAt === null) ||
+      (stored.state === "clean" && size !== undefined && size.bytes > size.scanLimit))
+  ) {
+    return "too_large_to_scan";
+  }
+  if (stored?.state === "clean") return "clean";
+  if (!scanning) return "not_scanned";
+  // No row: stored before scanning was on (every upload with it on makes one).
+  if (stored === undefined || stored.state === "unscanned") return "not_yet_scanned";
+  return stored.state;
+}
+
 /** Why a file is read: to download it (any type), or to show it in the browser. */
 export type FileUse = "download" | "view";
 
@@ -165,8 +237,8 @@ export interface FileContent {
   readonly open: () => Readable;
 }
 
-/** The largest file a thumbnail is made from (100 MiB): it is read whole into memory. */
-export const MAX_THUMBNAIL_SOURCE_BYTES = 100 * 1024 * 1024;
+/** The largest file a thumbnail is made from (100 MiB): the decoder process reads it whole. */
+export const MAX_THUMBNAIL_SOURCE_BYTES = THUMBNAIL_SOURCE_MAX_BYTES;
 
 /** How much of a file's start is read to find an image's size before showing it (1 MiB). */
 export const VIEW_HEADER_BYTES = 1024 * 1024;
@@ -175,12 +247,12 @@ export const VIEW_HEADER_BYTES = 1024 * 1024;
 export const VIEW_GIF_BYTES = 16 * 1024 * 1024;
 
 /**
- * Server-side thumbnails are off (D-097): three ways around the decode
- * memory budget were found, and they come back with T-072 ("Safe
- * server-side thumbnails"). While off, `fileThumbnail` answers
- * `no_thumbnail` for every file and no worker is ever started.
+ * Server-side thumbnails are on (T-072, D-097): every decode runs in a
+ * child process with a hard memory cap (thumbnails.ts). Turned off,
+ * `fileThumbnail` answers `no_thumbnail` for every file and no decoder
+ * process is ever started.
  */
-export const THUMBNAILS_ENABLED = false;
+export const THUMBNAILS_ENABLED = true;
 
 /** How long a thumbnail that took too long is left before it is tried again (24 hours). */
 export const THUMBNAIL_RETRY_MS = 24 * 3600 * 1000;
@@ -190,6 +262,14 @@ export const THUMBNAILS_AT_ONCE = 2;
 
 /** Thumbnails an organization may have made (not from the cache) per minute. */
 export const THUMBNAILS_PER_MINUTE = 6;
+
+/**
+ * Thumbnails one organization may have made in a row while another was
+ * turned away for want of a slot (review 2 of T-072: round the
+ * organizations), and how long such a turning away counts.
+ */
+export const THUMBNAILS_IN_A_ROW = 3;
+const WAITING_MS = 30_000;
 
 export interface ThumbnailOptions {
   /** Only from the cache (HEAD): `not_cached` when nothing is cached. */
@@ -339,11 +419,34 @@ export interface FileOperations {
           | "use_adopt";
       }
   >;
-  /** The asset's files (name, size, sniffed type, who and when). */
+  /** The asset's files (name, size, sniffed type, who and when, and each one's virus scan). */
   listFiles(
     context: ServiceContext,
     recordId: RecordId,
-  ): Promise<ServiceResult<readonly StoredFile[]>>;
+  ): Promise<ServiceResult<readonly ListedFile[]>>;
+  /**
+   * Virus scanning for System settings (S-040): whether a scanner is set
+   * up, and the organization's contents by scan state. System managers only.
+   */
+  fileScanStatus(context: ServiceContext): Promise<ServiceResult<FileScanStatus>>;
+  /**
+   * Scans every clean and failed content of the organization again (after
+   * the scanner's signatures were updated, say); infected ones stay
+   * quarantined. System managers only; `scanning_off` without a scanner.
+   */
+  rescanFiles(context: ServiceContext): Promise<ServiceResult<{ readonly queued: number }>>;
+  /**
+   * A job (no context): queues contents without a scan result and scans
+   * what is due; resolves when the queue is idle. Nothing without a scanner.
+   */
+  scanQueuedFiles(): Promise<ScanPass>;
+  /** Stops the scan queue (the server is closing), waiting for scans running now. */
+  stopFileScans(): Promise<void>;
+  /**
+   * The largest upload taken (bytes): the store's cap, and while scanning
+   * is on no more than the scanner takes. `undefined` without a store.
+   */
+  fileUploadLimit(): number | undefined;
 }
 
 /** service.ts's `mayChange`: access, the row locked, the place checked. */
@@ -409,11 +512,31 @@ export function fileOperations(
   store: FileStore | undefined,
   clock: () => Date,
   thumbnails?: ThumbnailRenderer,
-  thumbnailLimits: { readonly atOnce?: number; readonly perMinute?: number } = {},
+  thumbnailLimits: {
+    readonly atOnce?: number;
+    readonly perMinute?: number;
+    readonly inARow?: number;
+  } = {},
   thumbnailsEnabled: boolean = THUMBNAILS_ENABLED,
+  scans?: FileScanQueue,
   /** Where a warning goes (the service's `onError`): a code, never a path or name. */
   warn: (code: string) => void = () => undefined,
 ): FileOperations {
+  const scanning = scans !== undefined && store !== undefined;
+  /** The largest upload taken: the store's cap, and the scanner's while scanning is on. */
+  const uploadLimit = (): number | undefined =>
+    store === undefined
+      ? undefined
+      : scanning
+        ? Math.min(store.maxFileBytes, scans.maxBytes)
+        : store.maxFileBytes;
+  /** An upload the scanner couldn't take (S-040 review S1): refused before it is kept. */
+  const tooLargeToScan = (): ServiceRefusal =>
+    refusal(
+      ["files"],
+      "too_large_to_scan",
+      "The file is larger than the virus scanner takes, so it couldn't be scanned or downloaded.",
+    );
   /**
    * A touch the file system wouldn't let change the copy's time: the attach
    * still succeeds, the event says so (the purge then never takes the
@@ -435,6 +558,11 @@ export function fileOperations(
   /** Thumbnails being made now (all organizations), and the organizations making one. */
   let makingNow = 0;
   const makingFor = new Set<string>();
+  /** Organizations turned away for want of a slot, and when; the one served last, and how often. */
+  const waiting = new Map<string, number>();
+  let streakFor: string | undefined;
+  let streak = 0;
+  const inARow = thumbnailLimits.inARow ?? THUMBNAILS_IN_A_ROW;
   /** Each organization's thumbnails made in the current minute (a fixed window). */
   const budgets = new Map<string, { minute: number; used: number }>();
   const takeBudget = (organizationId: string): boolean => {
@@ -471,8 +599,53 @@ export function fileOperations(
       if (file === undefined) {
         return refusal(["fileId"], "unknown_file", "The record has no such file.");
       }
+      // Only after the person may see the file: its scan (S-040, D-113).
+      const unscanned = scanRefusal(
+        shownScanState(
+          scanning,
+          await scanState(tx, who.organizationId, file.sha256),
+          scans === undefined ? undefined : { bytes: file.size, scanLimit: scans.maxBytes },
+        ),
+      );
+      if (unscanned !== undefined) return unscanned;
       return { ok: true, value: { file, organizationId: who.organizationId } };
     });
+  }
+
+  /**
+   * Whether a file in this scan state may be read (D-113): with a scanner,
+   * only `clean`; without one, anything but `infected`, which is never read.
+   */
+  function scanRefusal(state: FileScanState): ServiceRefusal | undefined {
+    switch (state) {
+      // Stored before scanning was on (not_yet_scanned): served until its
+      // first scan (D-113).
+      // too_large_to_scan: stored before scanning was on, or clean before
+      // the scanner's limit was lowered: served, never scanned (D-113).
+      case "clean":
+      case "not_scanned":
+      case "not_yet_scanned":
+      case "too_large_to_scan":
+        return undefined;
+      case "infected":
+        return refusal(
+          ["fileId"],
+          "quarantined",
+          "A virus was found in this file. It is quarantined and can't be opened.",
+        );
+      case "failed":
+        return refusal(
+          ["fileId"],
+          "scan_failed",
+          "This file couldn't be scanned for viruses yet, so it can't be opened. It is tried again.",
+        );
+      default:
+        return refusal(
+          ["fileId"],
+          "scan_pending",
+          "This file is being scanned for viruses. Try again in a moment.",
+        );
+    }
   }
 
   const missingCopy = (): ServiceRefusal =>
@@ -644,12 +817,16 @@ export function fileOperations(
               "The file is larger than the server takes.",
             );
           }
+          if (scanning && declared > scans.maxBytes) return tooLargeToScan();
           if (used + declared > store.maxOrganizationBytes) return overQuota();
         }
         if (await store.lowOnSpace(declared ?? 0)) return diskFull();
         return {
           ok: true,
-          value: Object.freeze({ maxFileBytes: store.maxFileBytes, usedBytes: used }),
+          value: Object.freeze({
+            maxFileBytes: uploadLimit() ?? store.maxFileBytes,
+            usedBytes: used,
+          }),
         };
       });
     },
@@ -662,6 +839,8 @@ export function fileOperations(
         // and the sweep may take it after a day; without the intent the
         // copy would be "unknown" and kept for ever.
         const fileId = randomUUID();
+        // Without a declared length, the size is known only now.
+        if (scanning && received.size > scans.maxBytes) return tooLargeToScan();
         const intent = await run(
           "attachIntent",
           context,
@@ -696,7 +875,7 @@ export function fileOperations(
         // attach's `place` only checks it is still the same (no hashing
         // under the file lock, S-052 second review).
         const prior = await store?.inspect(received).catch(() => undefined);
-        return await run(
+        const attached = await run(
           "attachFile",
           context,
           async (tx, who): Promise<ServiceResult<AttachedFile>> => {
@@ -763,6 +942,9 @@ export function fileOperations(
                   true,
                 );
               }
+              // Its scan queued as any upload's (S-040: an unscanned content
+              // uploaded again waits for its scan).
+              if (scanning) await queueScan(tx, who.organizationId, received.sha256);
               return { ok: true, value: Object.freeze({ file: existing, created: false }) };
             }
             if (!(await organizationHasContent(tx, who.organizationId, received.sha256))) {
@@ -782,6 +964,9 @@ export function fileOperations(
               createdBy: who.actor,
               createdAt: new Date(Math.floor(now.getTime())),
             });
+            // Its scan queued with the row (S-040): content already known
+            // keeps its result, so infected bytes stay quarantined.
+            if (scanning) await queueScan(tx, who.organizationId, received.sha256);
             // Last, still under the file lock: the bytes at their content path.
             await store.place(received, prior);
             const touched = await store.touch(who.organizationId, received.sha256);
@@ -797,6 +982,9 @@ export function fileOperations(
             return { ok: true, value: Object.freeze({ file, created: true }) };
           },
         );
+        // Scanned after COMMIT, in the background: the upload doesn't wait.
+        if (attached.ok) scans?.kick();
+        return attached;
       } finally {
         await store?.discard(received).catch(() => undefined);
       }
@@ -1049,7 +1237,7 @@ export function fileOperations(
           gif ? VIEW_GIF_BYTES : VIEW_HEADER_BYTES,
         );
         if (head === undefined) return missingCopy();
-        if (!withinLimits(viewDimensions(file.mediaType, head), VIEW_LIMITS)) {
+        if (!withinLimits(viewDimensions(file.mediaType, head, file.size), VIEW_LIMITS)) {
           return refusal(["fileId"], "not_viewable", "This file can only be downloaded.");
         }
       }
@@ -1067,8 +1255,8 @@ export function fileOperations(
       const found = await readable(context, "fileThumbnail", recordId, fileId);
       if (!found.ok) return found;
       const { file, organizationId } = found.value;
-      // Off until T-072 (D-097): every file, after the same checks as any
-      // read (so a hidden file is still the same 404), has no thumbnail, and
+      // Turned off (D-097): every file, after the same checks as any read
+      // (so a hidden file is still the same 404), has no thumbnail, and
       // nothing is read, cached or decoded.
       if (!thumbnailsEnabled) return noThumbnail();
       if (!THUMBNAIL_TYPES.has(file.mediaType) || file.size > MAX_THUMBNAIL_SOURCE_BYTES) {
@@ -1093,8 +1281,26 @@ export function fileOperations(
       // A slot and the organization's budget before a byte is read (review
       // B3 and item 1): a few at once, a few a minute, then 503 busy.
       // One at a time per organization, so one can't fill every slot (review).
-      if (makingNow >= atOnce || makingFor.has(organizationId) || !takeBudget(organizationId)) {
+      // And round the organizations (review 2): one that has had
+      // THUMBNAILS_IN_A_ROW in a row waits while another was turned away
+      // for want of a slot in the last WAITING_MS.
+      const now = clock().getTime();
+      for (const [org, at] of waiting) if (now - at > WAITING_MS) waiting.delete(org);
+      const othersWaiting = [...waiting.keys()].some((org) => org !== organizationId);
+      const ownTurnUsed = streakFor === organizationId && streak >= inARow && othersWaiting;
+      if (makingFor.has(organizationId)) return busy();
+      if (makingNow >= atOnce || ownTurnUsed) {
+        if (waiting.size > 10_000) waiting.clear();
+        waiting.set(organizationId, now);
         return busy();
+      }
+      if (!takeBudget(organizationId)) return busy();
+      waiting.delete(organizationId);
+      if (streakFor === organizationId) {
+        streak++;
+      } else {
+        streakFor = organizationId;
+        streak = 1;
       }
       makingNow++;
       makingFor.add(organizationId);
@@ -1106,23 +1312,34 @@ export function fileOperations(
         await store.writeThumbnail(organizationId, file.sha256, size, what).catch(() => undefined);
       };
       const made = (async (): Promise<ServiceResult<{ readonly jpeg: Uint8Array }>> => {
-        const bytes = await store.readContent(
+        // Only the header is read here (review of T-072, B2: walking a whole
+        // file on the server's event loop is a bomb of its own); the
+        // decoder process walks, plans and decodes the file itself.
+        const head = await store.readContent(
           organizationId,
           file.sha256,
           file.size,
-          MAX_THUMBNAIL_SOURCE_BYTES,
+          THUMBNAIL_HEADER_BYTES,
         );
-        if (bytes?.length !== file.size) return missingCopy();
-        // The header, its structure and the memory budget first, here: a
-        // bomb is refused before any decoder runs.
+        if (head === undefined) return missingCopy();
         try {
-          planDecode(file.mediaType, bytes, THUMBNAIL_LIMITS);
+          precheckThumbnail(file.mediaType, head, THUMBNAIL_LIMITS);
         } catch {
           await remember("none");
           return noThumbnail();
         }
+        const fd = await store.openContentDescriptor(organizationId, file.sha256, file.size);
+        if (fd === undefined) return missingCopy();
         renderer ??= createThumbnailRenderer();
-        const result = await renderer.render(file.mediaType, bytes, box);
+        let result: Awaited<ReturnType<ThumbnailRenderer["render"]>>;
+        try {
+          result = await renderer.render(file.mediaType, { fd }, box);
+        } catch {
+          result = { ok: false, code: "failed" };
+        } finally {
+          // Closed whatever happened (review 2, B1).
+          closeSync(fd);
+        }
         if (result.ok) {
           await remember(result.jpeg);
           return { ok: true, value: { jpeg: result.jpeg } };
@@ -1131,23 +1348,33 @@ export function fileOperations(
           case "busy":
             return busy();
           case "refused":
-            // The decoder's own refusal: the same every time, so remembered.
+          case "killed":
+            // The decoder's own refusal, or a decode killed past the memory
+            // cap (T-072): the same every time, so remembered and never
+            // tried again.
             await remember("none");
             return noThumbnail();
           case "timeout":
+          case "lost":
             // Remembered for a while (THUMBNAIL_RETRY_MS), so it can't keep
-            // the worker busy by being asked for again and again.
+            // the decoder busy by being asked for again and again; a kill
+            // nothing confirmed as the memory cap is treated so too (review 2).
             await remember("timeout");
             return noThumbnail();
           default:
             // Out of memory or a crash: says nothing about the file.
             return refusal(["files"], "internal_error", "The thumbnail couldn't be made.");
         }
-      })();
+      })().catch(
+        // Anything thrown on the way (the cache, the copy): a plain 500, never a stuck slot.
+        (): ServiceResult<{ readonly jpeg: Uint8Array }> =>
+          refusal(["files"], "internal_error", "The thumbnail couldn't be made."),
+      );
       making.set(key, made);
       try {
         return await made;
       } finally {
+        // Released whatever happened (review 2, B1).
         making.delete(key);
         makingNow--;
         makingFor.delete(organizationId);
@@ -1162,8 +1389,80 @@ export function fileOperations(
         const allowed = await mayChange(tx, who, recordId, "share", []);
         if (!allowed.ok) return allowed;
         const files = await listStoredFiles(tx, who.organizationId, recordId);
-        return { ok: true, value: files };
+        const results = await scanStates(
+          tx,
+          who.organizationId,
+          files.map((f) => f.sha256),
+        );
+        const listed: readonly ListedFile[] = Object.freeze(
+          files.map((f) => {
+            const stored = results.get(f.sha256);
+            return Object.freeze({
+              ...f,
+              scan: shownScanState(
+                scanning,
+                stored,
+                scans === undefined ? undefined : { bytes: f.size, scanLimit: scans.maxBytes },
+              ),
+              // No row yet: the next pass queues it.
+              scanQueued: scanning && stored?.nextAttemptAt !== null,
+            });
+          }),
+        );
+        return { ok: true, value: listed };
       });
+    },
+
+    fileUploadLimit() {
+      return uploadLimit();
+    },
+
+    async fileScanStatus(context) {
+      return run("fileScanStatus", context, async (tx, who) => {
+        const access = await readAccess(tx, who.organizationId, who.actor);
+        if (!access.ok) return access;
+        if (!access.value.systemManager) return notPermitted();
+        const counts = await scanCounts(
+          tx,
+          who.organizationId,
+          scanning ? scans.maxBytes : undefined,
+        );
+        return { ok: true, value: Object.freeze({ scanning, counts }) };
+      });
+    },
+
+    async rescanFiles(context) {
+      const result = await run(
+        "rescanFiles",
+        context,
+        async (tx, who): Promise<ServiceResult<{ readonly queued: number }>> => {
+          const access = await readAccess(tx, who.organizationId, who.actor);
+          if (!access.ok) return access;
+          if (!access.value.systemManager) return notPermitted();
+          if (!scanning) {
+            return refusal(
+              ["files"],
+              "scanning_off",
+              "No virus scanner is set up on this server, so nothing can be scanned.",
+            );
+          }
+          const queued = await rescanContents(tx, who.organizationId, who.actor);
+          return { ok: true, value: Object.freeze({ queued }) };
+        },
+      );
+      if (result.ok) scans?.kick();
+      return result;
+    },
+
+    async scanQueuedFiles() {
+      if (scans === undefined || store === undefined) {
+        return Object.freeze({ queued: 0, clean: 0, infected: 0, failed: 0 });
+      }
+      return scans.runOnce();
+    },
+
+    async stopFileScans() {
+      await scans?.stop();
     },
   };
 }

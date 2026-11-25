@@ -25,6 +25,10 @@
  * - **Throttled** (D-077): TOTP codes per person (core's
  *   `SECOND_STEP_THROTTLE`, waits up to 15 minutes, never a permanent
  *   lockout, each wait recorded in `second_step_alerts` for a notice);
+ *   wrong TOTP codes no right code in the same session explained are kept
+ *   for 30 days (`wrong:<user>`); the next session's first code, or the
+ *   cleanup command an hour on, records an alert for them (S-045), so a few
+ *   guesses a day are told too;
  *   every code, recovery codes included, per session (a waiting session
  *   ends after 5 wrong codes, a full one is signed out) and per client
  *   address. Recovery codes (120 bits) skip the per-person counter, so
@@ -66,7 +70,7 @@ import {
 } from "@oculus/core";
 import {
   INVALID_CREDENTIALS,
-  markKnownSource,
+  markSignedIn,
   signInChecked,
   type SignInFailure,
   type VerifiedSignIn,
@@ -112,6 +116,7 @@ import {
   type PromotionRefusal,
   type SessionCallOptions,
   type SessionFailure,
+  WRONG_CODE_MEMORY_SECONDS,
 } from "./sessions.js";
 import { sql } from "./sql.js";
 
@@ -427,11 +432,27 @@ interface Who {
   readonly sessionId?: SessionId;
   /** The client address, for its own counter. */
   readonly source?: string;
+  /**
+   * A sign-in's second step (a waiting session): only its TOTP codes go on
+   * the unexplained counter (S-045). A full session's codes (re-entry, new
+   * recovery codes, a reset) come after a whole sign-in, so they don't.
+   */
+  readonly signIn?: true;
 }
 
 interface Counted {
   readonly keys: readonly string[];
   readonly sessionFailures: number;
+  /** The person's unexplained wrong-code counter (S-045), always locked; never a wait. */
+  readonly wrongKey: string;
+  /** Whether this attempt added one to it (a sign-in's TOTP codes only). */
+  readonly wrongCounted: boolean;
+  /** Whether the session is a sign-in's, whose codes are on that counter. */
+  readonly signIn: boolean;
+}
+
+function wrongKeyOf(userId: UserId): string {
+  return `wrong:${userId}`;
 }
 
 /** The counters an attempt with `input` counts against, in key order. */
@@ -454,22 +475,32 @@ type Attempt =
  * Counts this attempt up front against its counters, in one short
  * transaction with the rows locked in key order, so codes sent at once are
  * counted one by one; or says how long to wait. An attempt during a wait is
- * not counted (D-068). When the person's counter starts a wait (and every
- * 10 wrong codes after), an alert row is written for the notice.
+ * not counted (D-068). An alert row is written for the notice when the
+ * person's counter starts a wait (and every 10 wrong codes after), or
+ * (S-045) when a session's first code finds wrong TOTP codes from other
+ * sessions that no right code explained: someone with the password tried
+ * codes and gave up, which the person's counter, cleared by their next right
+ * code and forgotten after a day, would never show. An alert takes those
+ * codes off the unexplained counter, so each is told once.
  */
 async function takeCodeAttempt(db: Database, who: Who, input: CodeInput): Promise<Attempt> {
   const keys = keysFor(who, input);
+  const wrongKey = wrongKeyOf(who.userId);
+  const signIn = who.signIn === true;
+  const wrongCounted = signIn && input.kind === "totp";
+  // Every counter, the unexplained one included, locked in key order.
+  const locked = [...keys, wrongKey].sort();
   for (let round = 1; ; round++) {
     const decided = await inTransaction(db, async (tx): Promise<Attempt | "row_gone"> => {
-      for (const key of keys) {
+      for (const key of locked) {
         await tx.execute(sql`
           INSERT INTO public.second_step_throttles (key) VALUES (${key}) ON CONFLICT (key) DO NOTHING`);
       }
       const rows = await tx.rows<{ key: string; failures: number; last_ms: number | null }>(sql`
         SELECT key, failures, (extract(epoch FROM last_failure_at) * 1000)::float8 AS last_ms
-        FROM public.second_step_throttles WHERE key = ANY(${keys}::text[])
+        FROM public.second_step_throttles WHERE key = ANY(${locked}::text[])
         ORDER BY key FOR UPDATE`);
-      if (rows.length !== keys.length) return "row_gone";
+      if (rows.length !== locked.length) return "row_gone";
       const clock = await tx.rows<{ now_ms: number }>(sql`
         SELECT (extract(epoch FROM clock_timestamp()) * 1000)::float8 AS now_ms`);
       const now = clock[0]?.now_ms;
@@ -477,7 +508,15 @@ async function takeCodeAttempt(db: Database, who: Who, input: CodeInput): Promis
       const decisions: { key: string; next: number | ThrottleDecision }[] = [];
       let wait = 0;
       let sessionFailures = 0;
+      let unexplained = 0;
       for (const row of rows) {
+        if (row.key === wrongKey) {
+          // Forgotten after WRONG_CODE_MEMORY_SECONDS without a new one.
+          const fresh =
+            row.last_ms !== null && now - row.last_ms < WRONG_CODE_MEMORY_SECONDS * 1000;
+          unexplained = fresh ? row.failures : 0;
+          continue;
+        }
         if (row.key.startsWith("session:")) {
           if (row.failures >= MAX_PENDING_CODE_FAILURES) return { allowed: false, exhausted: true };
           sessionFailures = row.failures + 1;
@@ -494,6 +533,15 @@ async function takeCodeAttempt(db: Database, who: Who, input: CodeInput): Promis
         decisions.push({ key: row.key, next: d });
       }
       if (wait > 0) return { allowed: false, retryAfterSeconds: wait };
+      // This session's own share of the unexplained counter: the codes it
+      // has sent (at most; recovery codes aren't on it), this one included
+      // if it is a TOTP code.
+      const counted = unexplained + (wrongCounted ? 1 : 0);
+      const sent = who.sessionId === undefined || !signIn ? 0 : sessionFailures - 1;
+      const mine = Math.min(counted, sent + (wrongCounted ? 1 : 0));
+      const fromOthers = counted - mine;
+      let alertFailures: number | undefined;
+      let waitAlert = false;
       for (const { key, next } of decisions) {
         if (typeof next === "number") {
           await tx.execute(sql`
@@ -507,29 +555,66 @@ async function takeCodeAttempt(db: Database, who: Who, input: CodeInput): Promis
             WHERE key = ${key}`);
           const over = next.next.failures - SECOND_STEP_THROTTLE.free;
           if (key.startsWith("user:") && over >= 0 && over % 10 === 0) {
-            await tx.execute(sql`
-              INSERT INTO public.second_step_alerts (id, user_id, failures)
-              VALUES (${randomUUID()}::uuid, ${who.userId}::uuid, ${next.next.failures})`);
+            alertFailures = next.next.failures;
+            waitAlert = true;
           }
         }
       }
-      return { allowed: true, keys, sessionFailures };
+      // A session's first code finding other sessions' unexplained wrong codes (S-045).
+      if (alertFailures === undefined && sessionFailures <= 1 && fromOthers > 0) {
+        alertFailures = fromOthers;
+      }
+      if (alertFailures !== undefined) {
+        await tx.execute(sql`
+          INSERT INTO public.second_step_alerts (id, user_id, failures)
+          VALUES (${randomUUID()}::uuid, ${who.userId}::uuid, ${alertFailures})`);
+      }
+      // Told now (or nothing to tell): only this session's own codes stay
+      // unexplained, and none after a wait's alert, whose count has them.
+      const left = alertFailures === undefined ? counted : waitAlert ? 0 : mine;
+      if (wrongCounted || left !== unexplained) {
+        await tx.execute(sql`
+          UPDATE public.second_step_throttles
+          SET failures = ${left},
+              last_failure_at = CASE WHEN ${wrongCounted} THEN clock_timestamp() ELSE last_failure_at END
+          WHERE key = ${wrongKey}`);
+      }
+      return { allowed: true, keys, sessionFailures, wrongKey, wrongCounted, signIn };
     });
     if (decided !== "row_gone") return decided;
     if (round >= 3) return { allowed: false, retryAfterSeconds: 1 };
   }
 }
 
-/** A right code: the person's and the session's counters start again; the address's loses one. */
+/**
+ * A right code: the person's and the session's counters start again; the
+ * address's loses one; and the wrong codes this session sent are explained
+ * (a typo then the right code), so they come off the unexplained counter
+ * (S-045). Recovery codes the session sent count there too, so this can take
+ * off a few more than the session added; other sessions' codes were already
+ * told by this session's first code, so at most those of a session started
+ * since are lost.
+ */
 async function clearCodeAttempts(db: Queryable, counted: Counted): Promise<void> {
   const personal = counted.keys.filter((k) => !k.startsWith("source:"));
   const sources = counted.keys.filter((k) => k.startsWith("source:"));
+  // The session's codes, less this one if it is a recovery code (not on the counter).
+  const explained = !counted.signIn
+    ? 0
+    : Math.max(
+        counted.sessionFailures - (counted.wrongCounted ? 0 : 1),
+        counted.wrongCounted ? 1 : 0,
+      );
   await db.execute(
     sql`DELETE FROM public.second_step_throttles WHERE key = ANY(${personal}::text[])`,
   );
   await db.execute(sql`
     UPDATE public.second_step_throttles SET failures = greatest(failures - 1, 0)
     WHERE key = ANY(${sources}::text[])`);
+  // Last, as `wrong:` sorts after the others (the lock order of takeCodeAttempt).
+  await db.execute(sql`
+    UPDATE public.second_step_throttles SET failures = greatest(failures - ${explained}, 0)
+    WHERE key = ${counted.wrongKey}`);
 }
 
 /**
@@ -538,9 +623,10 @@ async function clearCodeAttempts(db: Queryable, counted: Counted): Promise<void>
  * lost a race (used meanwhile on another connection).
  */
 async function giveBackCodeAttempt(db: Queryable, counted: Counted): Promise<void> {
+  const keys = counted.wrongCounted ? [...counted.keys, counted.wrongKey] : [...counted.keys];
   await db.execute(sql`
     UPDATE public.second_step_throttles SET failures = greatest(failures - 1, 0)
-    WHERE key = ANY(${[...counted.keys]}::text[])`);
+    WHERE key = ANY(${keys}::text[])`);
 }
 
 /** Ends a session after its last allowed wrong code. */
@@ -588,6 +674,9 @@ async function checkCode(
       pass: verified.pass,
       keys: attempt.keys,
       sessionFailures: attempt.sessionFailures,
+      wrongKey: attempt.wrongKey,
+      wrongCounted: attempt.wrongCounted,
+      signIn: attempt.signIn,
     };
   }
   if (verified.why === "unavailable") {
@@ -649,7 +738,7 @@ export async function completeSecondStep(
     const pending = await readPendingSession(db, token, call);
     if (!pending.ok) return pending;
     const { sessionId, userId } = pending.session;
-    const who: Who = { userId, sessionId, source };
+    const who: Who = { userId, sessionId, source, signIn: true };
     const factor = await liveFactor(db, userId);
     if (factor?.state !== "active") return ENROLMENT_REQUIRED;
     const checked = await checkCode(db, keys, who, factor, code);
@@ -671,8 +760,9 @@ export async function completeSecondStep(
     ) {
       await clearCodeAttempts(db, checked);
     }
-    // Only a whole sign-in makes the address known (S-044).
-    if (done.ok) await markKnownSource(db, userId, source);
+    // Only a whole sign-in makes the address known (S-044) and is stamped
+    // as the last sign-in (S-053).
+    if (done.ok) await markSignedIn(db, userId, source);
     return done;
   } catch (error) {
     return failureFor(error, call);
@@ -884,7 +974,7 @@ export async function confirmEnrolment(
     const pending = await readPendingSession(db, token, call);
     if (!pending.ok) return pending;
     const { sessionId, userId } = pending.session;
-    const who: Who = { userId, sessionId, source };
+    const who: Who = { userId, sessionId, source, signIn: true };
     const factor = await liveFactor(db, userId);
     if (factor?.state === "active") return ALREADY_ENROLLED;
     if (factor?.enrol_session_id !== sessionId) return ENROLMENT_REQUIRED;
@@ -909,7 +999,7 @@ export async function confirmEnrolment(
       return done;
     }
     await clearCodeAttempts(db, checked);
-    await markKnownSource(db, userId, source);
+    await markSignedIn(db, userId, source);
     return { ...done, recoveryCodes: Object.freeze(recoveryCodes) };
   } catch (error) {
     return failureFor(error, call);

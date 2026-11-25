@@ -53,8 +53,15 @@ export function publicSitesFromEnv(
 ): readonly PublicSiteHost[] {
   const raw = env[PUBLIC_SITES_ENV];
   if (raw === undefined || raw.trim() === "") return [];
-  const adminHostname =
-    adminOrigin === undefined || adminOrigin === "" ? undefined : new URL(adminOrigin).hostname;
+  // Without an admin origin, `/api` would be served on every host (server.ts
+  // rule 12 needs the admin's host to keep it there), so a public host could
+  // answer staff routes. Refuse to serve public sites at all (S-049).
+  if (adminOrigin === undefined || adminOrigin.trim() === "") {
+    throw new Error(
+      `${PUBLIC_SITES_ENV} lists public sites but OCULUS_ADMIN_ORIGIN is unset: name the admin's own origin, so the staff API never answers on a public host (D-052).`,
+    );
+  }
+  const adminHostname = new URL(adminOrigin).hostname;
   const seen = new Set<string>();
   const out: PublicSiteHost[] = [];
   for (const entry of raw.split(",").map((e) => e.trim())) {
@@ -71,7 +78,7 @@ export function publicSitesFromEnv(
     }
     // The host, not the origin: cookies aren't kept apart by scheme or port,
     // so the admin's session cookie would reach a public page on its host.
-    if (adminHostname !== undefined && new URL(origin).hostname === adminHostname) {
+    if (new URL(origin).hostname === adminHostname) {
       throw new Error(
         `${PUBLIC_SITES_ENV}: ${origin} is on the admin's host; a public site needs a host of its own (D-052)`,
       );

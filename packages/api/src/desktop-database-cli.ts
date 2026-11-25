@@ -325,6 +325,7 @@ async function firstSetup(
     out,
     err,
     finished,
+    undefined,
     // The writer got its grant above; the owner doesn't need one.
     { identityGrant: false },
   );

@@ -52,10 +52,10 @@ function server(status: unknown, extra: Record<string, Reply | ((s: Sent) => Rep
 describe("Clean up removed files", () => {
   it("is a System settings tab showing what is waiting and its size", async () => {
     server(STATUS);
-    renderAt("/settings/files");
+    renderAt("/settings/removed-files");
     const tabs = await screen.findByRole("navigation", { name: "System settings" });
     expect(within(tabs).getByRole("link", { name: "Removed files" }).getAttribute("href")).toBe(
-      "/settings/files",
+      "/settings/removed-files",
     );
     expect(
       await screen.findByRole("heading", { level: 2, name: "Clean up removed files" }),
@@ -77,7 +77,7 @@ describe("Clean up removed files", () => {
       },
       "POST /api/reauthenticate": [200, { ok: true }],
     });
-    renderAt("/settings/files");
+    renderAt("/settings/removed-files");
     await user.click(await screen.findByRole("button", { name: "Run a clean-up step" }));
     expect(await screen.findByRole("heading", { name: "Confirm it's you" })).toBeTruthy();
     expect(screen.getByText(/To clean up removed files, enter your password/)).toBeTruthy();
@@ -94,19 +94,19 @@ describe("Clean up removed files", () => {
 
   it("says why nothing can be cleaned up when the folder isn't this database's", async () => {
     server({ available: false, problem: "lease_mismatch" });
-    renderAt("/settings/files");
+    renderAt("/settings/removed-files");
     expect(await screen.findByText(/Another database is using the files folder/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Run a clean-up step" })).toBeNull();
   });
 
   it("shows what is stuck in the trash, and says when the disk can't be cleaned up", async () => {
     server({ ...STATUS, stuck: { files: 1, bytes: 5 * 1024 * 1024 } });
-    renderAt("/settings/files");
+    renderAt("/settings/removed-files");
     expect(await screen.findByText(/Stuck in the trash/)).toBeTruthy();
     expect(screen.getByText("1 file (5.0 MB)")).toBeTruthy();
     cleanup();
     server({ available: false, problem: "mtime_unreliable" });
-    renderAt("/settings/files");
+    renderAt("/settings/removed-files");
     expect(await screen.findByText(/doesn't keep file times exactly enough/)).toBeTruthy();
   });
 
@@ -125,7 +125,7 @@ describe("Clean up removed files", () => {
         "POST /api/reauthenticate": [200, { ok: true }],
       },
     );
-    renderAt("/settings/files");
+    renderAt("/settings/removed-files");
     expect(await screen.findByText(/The files folder names another database/)).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Accept this database as the owner" }));
     await user.type(await screen.findByLabelText("Your password"), "invented password");
@@ -142,7 +142,7 @@ describe("Clean up removed files", () => {
       { available: false, problem: "identity_changed" },
       { "POST /api/system/files/cleanup/accept-identity": [409, { error: "use_adopt" }] },
     );
-    renderAt("/settings/files");
+    renderAt("/settings/removed-files");
     await userEvent.click(
       await screen.findByRole("button", { name: "Accept this database as the owner" }),
     );
@@ -151,7 +151,7 @@ describe("Clean up removed files", () => {
 
   it("has nothing to run when nothing is waiting", async () => {
     server({ ...STATUS, trashed: none, deleted: none });
-    renderAt("/settings/files");
+    renderAt("/settings/removed-files");
     expect(await screen.findByText("Nothing can be cleaned up right now.")).toBeTruthy();
     expect(
       screen.getByRole("button", { name: "Run a clean-up step" }).hasAttribute("disabled"),
@@ -163,7 +163,7 @@ describe("Clean up removed files", () => {
       "GET /api/me": [200, { ...me([A1]), systemAdmin: true }],
       "GET /api/system/files/cleanup": [403, { error: "not_permitted" }],
     });
-    renderAt("/settings/files");
+    renderAt("/settings/removed-files");
     expect(
       await screen.findByText("Only system managers can clean up removed files."),
     ).toBeTruthy();

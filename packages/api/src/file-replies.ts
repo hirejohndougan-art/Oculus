@@ -127,6 +127,14 @@ export function mayShowInline(mediaType: unknown): boolean {
 }
 
 /**
+ * A Windows device name (CON, nul.txt, COM1, CONIN$ …), case-insensitive,
+ * with or without an extension: such a name can't be saved as a file on
+ * Windows. Used here and by the update unpacker's name check (S-050).
+ */
+export const WINDOWS_DEVICE_NAME =
+  /^(?:con|prn|aux|nul|conin\$|conout\$|com[0-9¹²³]|lpt[0-9¹²³])(?:\.|$)/iu;
+
+/**
  * A file name fit for `Content-Disposition`: no control, format (bidi,
  * zero-width) or private-use characters, no path separators or quotes, no
  * leading dots or spaces; at most `MAX_FILE_NAME_LENGTH` characters; `file`
@@ -142,7 +150,7 @@ export function safeFileName(name: unknown): string {
     .replace(/^[\s.]+/u, "")
     .replace(/[\s.]+$/u, "");
   // Windows device names (CON, nul.txt, COM1, CONIN$ …) can't be saved as they are.
-  if (/^(?:con|prn|aux|nul|conin\$|conout\$|com[0-9¹²³]|lpt[0-9¹²³])(?:\.|$)/iu.test(cleaned)) {
+  if (WINDOWS_DEVICE_NAME.test(cleaned)) {
     cleaned = `_${cleaned}`;
   }
   const chars = Array.from(cleaned);

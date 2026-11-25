@@ -26,7 +26,12 @@ import { Writable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { openDatabase, type Database } from "./client.js";
 import { redact, secretsOf } from "./backup-connection.js";
-import { databaseBeforeSetup, isEmptyInstall, setUpFirstInstall } from "./first-setup.js";
+import {
+  databaseBeforeSetup,
+  isEmptyInstall,
+  onlyExtensionsBeforeSetup,
+  setUpFirstInstall,
+} from "./first-setup.js";
 import { migrate, MigrationError } from "./migrate.js";
 import { DATABASE_URL_VARIABLE } from "./migrate-cli.js";
 import { grantIdentityRead, identityGrantHint } from "./roles.js";
@@ -60,6 +65,8 @@ export async function runSetupCli(
   rawErr: Line,
   /** Called once every question is answered (the terminal lets go of the keyboard). */
   finished?: () => void,
+  /** Runs the migration with the keyboard quiet (`terminalAsk`'s `quietWhile`, S-031). */
+  quietWhile: <T>(work: () => Promise<T>) => Promise<T> = (work) => work(),
   /**
    * Whether to let the connected role read the cluster's system identifier
    * (default true; S-052): `npm run desktop:database` grants it to its
@@ -104,13 +111,17 @@ export async function runSetupCli(
       return 1;
     }
     if (before === "other") {
+      const extensions = await onlyExtensionsBeforeSetup(db).catch(() => false);
       err(
-        "Setup refused: this database isn't empty and isn't an Oculus database (it has tables, functions, extensions or settings of its own). Make a new, empty database for Oculus (`createdb oculus`) and point OCULUS_DATABASE_URL at it.",
+        extensions
+          ? "Setup refused: this new database already has extensions in it, so it isn't empty. A new database copies everything in `template1`, so an extension installed there is in every new database. Make Oculus's database from `template0` instead (`createdb -T template0 oculus`), or remove the extension from `template1`, and run setup again."
+          : "Setup refused: this database isn't empty and isn't an Oculus database (it has tables, functions, extensions or settings of its own, or its migrations don't match this release's). Make a new, empty database for Oculus (`createdb oculus`) and point OCULUS_DATABASE_URL at it.",
       );
       return 1;
     }
     try {
-      await migrate({ connectionString: url, log: out });
+      // Keys pressed while migrating aren't shown (and are never answers).
+      await quietWhile(() => migrate({ connectionString: url, log: out }));
     } catch (error) {
       if (error instanceof MigrationError) {
         err(`Setup stopped: the database could not be prepared (${error.code}): ${error.message}`);
@@ -212,7 +223,11 @@ function messageOf(error: unknown): string {
  * and secret answers are not echoed. Ctrl+C at a question ends the
  * input, so the command stops with nothing saved.
  */
-export function terminalAsk(): { ask: Ask; close: () => void } {
+export function terminalAsk(): {
+  ask: Ask;
+  close: () => void;
+  quietWhile: <T>(work: () => Promise<T>) => Promise<T>;
+} {
   const tty = process.stdin.isTTY;
   let muted = false;
   let rl: Interface | undefined;
@@ -302,11 +317,35 @@ export function terminalAsk(): { ask: Ask; close: () => void } {
       r.prompt();
     });
   };
+  /**
+   * Runs `work` with a terminal's echo off (S-031): keys pressed meanwhile
+   * aren't shown and are thrown away, and Ctrl+C still stops it (as SIGINT,
+   * as the terminal itself would send).
+   */
+  const quietWhile = async <T>(work: () => Promise<T>): Promise<T> => {
+    const stdin = process.stdin;
+    if (!tty || rl !== undefined || typeof stdin.setRawMode !== "function") return work();
+    const onData = (chunk: Buffer | string): void => {
+      const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+      if (bytes.includes(3)) process.kill(process.pid, "SIGINT");
+    };
+    stdin.setRawMode(true);
+    stdin.on("data", onData);
+    stdin.resume();
+    try {
+      return await work();
+    } finally {
+      stdin.off("data", onData);
+      stdin.setRawMode(false);
+      stdin.pause();
+    }
+  };
   return {
     ask,
     close: () => {
       rl?.close();
     },
+    quietWhile,
   };
 }
 
@@ -323,6 +362,7 @@ if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.a
         console.error(line);
       },
       terminal.close,
+      terminal.quietWhile,
     );
   } finally {
     terminal.close();

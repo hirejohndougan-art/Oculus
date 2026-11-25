@@ -35,6 +35,7 @@ import {
   databaseIdentity,
   readAuditTrail,
   readFileStoreLease,
+  queueScan,
   sql,
   Sql,
   type Database,
@@ -514,35 +515,6 @@ describe("the review's fixes (S-052 review)", () => {
     expect(has(body)).toBe(true);
   });
 
-  it("keeps whatever the one list of keepers names (stored_content_kept: S-040's quarantine goes there)", async () => {
-    const { body } = await removedLongAgo();
-    // As S-040's migration would: one more line in the function (here, an
-    // invented table standing in for its quarantine).
-    await w.db.execute(sql`CREATE TABLE public.test_quarantine (sha256 text PRIMARY KEY)`);
-    await w.db.execute(sql`INSERT INTO public.test_quarantine VALUES (${sha(body)})`);
-    await w.db.execute(sql`
-      CREATE OR REPLACE FUNCTION public.stored_content_kept(organization uuid, content text)
-      RETURNS boolean LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $$
-        SELECT EXISTS (SELECT 1 FROM public.stored_files f
-                       WHERE f.organization_id = organization AND f.sha256 = content)
-            OR EXISTS (SELECT 1 FROM public.test_quarantine q WHERE q.sha256 = content)
-      $$`);
-    try {
-      expect((await purge(false)).trashed.files).toBe(0);
-      expect((await purge()).trashed.files).toBe(0);
-      expect(has(body)).toBe(true);
-    } finally {
-      await w.db.execute(sql`
-        CREATE OR REPLACE FUNCTION public.stored_content_kept(organization uuid, content text)
-        RETURNS boolean LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $$
-          SELECT EXISTS (SELECT 1 FROM public.stored_files f
-                         WHERE f.organization_id = organization AND f.sha256 = content)
-        $$`);
-      await w.db.execute(sql`DROP TABLE public.test_quarantine`);
-    }
-    await drain();
-  });
-
   it("writes the change log per step, and calls the daily run the timer", async () => {
     const one = await removedLongAgo();
     const two = await removedLongAgo();
@@ -907,6 +879,119 @@ async function callPath(method: "GET" | "POST", url: string, as: string, body?: 
 
 const call = (method: "GET" | "POST", as: string, body?: unknown) =>
   callPath(method, "/api/system/files/cleanup", as, body);
+
+describe("with S-040's virus scans", () => {
+  /** A service whose scanner answers `verdict` for everything it is shown, counting what it opened. */
+  function scanning(verdict: "clean" | "infected") {
+    const seen: string[] = [];
+    const scanned = createService(w.db, {
+      files: store,
+      scanner: {
+        maxBytes: 1024 * 1024,
+        timeoutMs: 1000,
+        scan: async (source) => {
+          const parts: Buffer[] = [];
+          for await (const chunk of source) parts.push(chunk as Buffer);
+          seen.push(sha(Buffer.concat(parts)));
+          return verdict === "clean"
+            ? { ok: true as const, verdict: "clean" as const }
+            : {
+                ok: true as const,
+                verdict: "infected" as const,
+                signature: "Invented.Test.Signature",
+              };
+        },
+      },
+    });
+    return { scanned, seen };
+  }
+
+  /** Queued for a scan as an upload with a scanner would be, with no scanner running. */
+  const queuedScan = async (body: Buffer): Promise<void> => {
+    await w.db.transaction((tx) => queueScan(tx, w.a, sha(body)));
+  };
+
+  const scanStateOf = async (body: Buffer): Promise<string | undefined> =>
+    (
+      await w.db.rows<{ state: string }>(sql`
+        SELECT state FROM public.file_scans WHERE organization_id = ${w.a}::uuid
+          AND sha256 = ${sha(body)}`)
+    )[0]?.state;
+
+  it("never trashes a quarantined (infected) content, removed or not; a pending scan doesn't keep one", async () => {
+    const { scanned } = scanning("infected");
+    const bad = bytes();
+    const badId = await attach(bad, asset, scanned);
+    await scanned.scanQueuedFiles();
+    await scanned.stopFileScans();
+    expect(await scanStateOf(bad)).toBe("infected");
+    ageCopy(bad, 10);
+    await remove(badId);
+    await ageEvents(w.db, bad, 30);
+    expect((await purge(false)).trashed.files).toBe(0);
+    expect((await purge()).trashed.files).toBe(0);
+    expect(has(bad)).toBe(true);
+    // Pending (queued, never scanned): taken like any other.
+    const waiting = bytes();
+    const waitingId = await attach(waiting);
+    await queuedScan(waiting);
+    expect(await scanStateOf(waiting)).toBe("pending");
+    ageCopy(waiting, 10);
+    await remove(waitingId);
+    await ageEvents(w.db, waiting, 8);
+    expect((await purge()).trashed.files).toBe(1);
+    expect(has(waiting)).toBe(false);
+    await drain();
+  });
+
+  it("the scan queue skips purged content and never records clean for bytes it can't read", async () => {
+    // Queued, removed and purged before its scan: never claimed.
+    const gone = bytes();
+    const goneId = await attach(gone);
+    await queuedScan(gone);
+    ageCopy(gone, 10);
+    await remove(goneId);
+    await ageEvents(w.db, gone, 8);
+    expect((await purge()).trashed.files).toBe(1);
+    const { scanned: later, seen: laterSeen } = scanning("clean");
+    await later.scanQueuedFiles();
+    await later.stopFileScans();
+    expect(laterSeen).not.toContain(sha(gone));
+    expect(await scanStateOf(gone)).toBe("pending");
+    // A content still named whose copy is missing: failed, never clean.
+    const lost = bytes();
+    await attach(lost);
+    await queuedScan(lost);
+    rmSync(copyOf(lost));
+    const { scanned: again, seen } = scanning("clean");
+    await again.scanQueuedFiles();
+    await again.stopFileScans();
+    expect(await scanStateOf(lost)).toBe("failed");
+    expect(seen).not.toContain(sha(lost));
+    await drain();
+  });
+
+  it("putting a copy back from the trash leaves its scan as it was", async () => {
+    const { scanned } = scanning("clean");
+    const body = bytes();
+    const fileId = await attach(body, asset, scanned);
+    await scanned.scanQueuedFiles();
+    await scanned.stopFileScans();
+    expect(await scanStateOf(body)).toBe("clean");
+    ageCopy(body, 10);
+    await remove(fileId);
+    await ageEvents(w.db, body, 8);
+    expect((await purge()).trashed.files).toBe(1);
+    // Uploaded again: back from the trash, still clean, and downloadable.
+    const back = await attach(body, asset, scanned);
+    await scanned.stopFileScans();
+    expect(has(body)).toBe(true);
+    expect(await scanStateOf(body)).toBe("clean");
+    const read = await scanned.fileContent(ctx(), asset as never, back, "download");
+    expect(read.ok).toBe(true);
+    await drain();
+  });
+});
 
 describe("Clean up removed files in the admin", () => {
   it("is for system managers; a step needs a recent sign-in and goes to the change log", async () => {

@@ -1,5 +1,5 @@
--- The safe purge of removed files (S-052, D-086 amended). Numbered 0042, the
--- number reserved for S-052 (0040 and 0041 belong to other work).
+-- The safe purge of removed files (S-052, D-086 amended). Numbered 0049, after
+-- main's 0048 (S-040's file_scans, which section 4 reads).
 --
 -- 1. A removal remembers the stored copy's own time. When a file is removed,
 --    the service reads the copy's modification time (the file system's
@@ -109,17 +109,23 @@ ALTER TABLE public.file_purge_steps ENABLE ALWAYS TRIGGER file_purge_steps_no_tr
 
 -- 4. Whether anything still keeps a content: the one list the purge asks
 --    (its candidates, and every check again inside a step). A content named
---    here is never moved or deleted. Today only stored_files names a
---    content; a table added later that names one by (organization_id,
---    sha256) and must keep it (S-040's file_scans quarantine, for one) adds
---    one `OR EXISTS (...)` line here, in its own migration
---    (CREATE OR REPLACE).
+--    here is never moved or deleted:
+--    - a stored_files row names it;
+--    - its virus scan found it infected (S-040, 0048's file_scans, the same
+--      organization and sha256): quarantined content is kept for good. A
+--      pending, unscanned or failed scan doesn't keep it by itself.
+--    A table added later that names contents by (organization_id, sha256)
+--    and must keep them adds one `OR EXISTS (...)` line here, in its own
+--    migration (CREATE OR REPLACE).
 CREATE FUNCTION public.stored_content_kept(organization uuid, content text) RETURNS boolean
 LANGUAGE sql STABLE
 SET search_path = pg_catalog, pg_temp
 AS $$
   SELECT EXISTS (SELECT 1 FROM public.stored_files f
                  WHERE f.organization_id = organization AND f.sha256 = content)
+      OR EXISTS (SELECT 1 FROM public.file_scans s
+                 WHERE s.organization_id = organization AND s.sha256 = content
+                   AND s.state = 'infected')
 $$;
 
 -- 5. The change log (system_events, 0030): each step of the purge (one

@@ -90,7 +90,6 @@ export type { RecordCheckOptions } from "./record-checks.js";
 export { deleteRecord } from "./record-delete.js";
 export {
   listPublishedForOai,
-  oaiDatestamp,
   oaiRepository,
   oaiStoredStamp,
   writeOaiStamps,
@@ -296,6 +295,8 @@ export {
   deleteExpiredSessions,
   deleteOldPasswordResets,
   runCleanup,
+  WRONG_CODE_MEMORY_SECONDS,
+  UNEXPLAINED_TOLD_AFTER_SECONDS,
   NO_SESSION,
   MAX_LISTED_SESSIONS,
   SESSION_TABLE_PRIVILEGES,
@@ -377,6 +378,29 @@ export {
   MAX_ORGANIZATION_CHOICES,
 } from "./sign-in-screens.js";
 export type { PendingSignInState, OrganizationChoice, SignedInPerson } from "./sign-in-screens.js";
+export {
+  FILE_SCAN_TABLE_PRIVILEGES,
+  SCAN_FAILURES,
+  SCAN_STATES,
+  claimDueScan,
+  isScanSignature,
+  queueScan,
+  queueUnscanned,
+  recordScanResult,
+  rescanContents,
+  scanCounts,
+  scanState,
+  scanStates,
+} from "./file-scans.js";
+export type {
+  ClaimedScan,
+  RecordedScan,
+  ScanCounts,
+  ScanFailure,
+  ScanResult,
+  ScanState,
+  StoredScan,
+} from "./file-scans.js";
 export {
   STORED_FILE_TABLE_PRIVILEGES,
   MAX_FILES_PER_LIST,
@@ -473,6 +497,10 @@ export {
   SHARE_STATES,
   SHARE_TABLE_PRIVILEGES,
   MAX_SHARE_PAGE,
+  MAX_OPEN_OFFERS,
+  DECLINE_COOLDOWN_DAYS,
+  SHARE_OFFER_LIMIT_STATE,
+  SHARE_COOLDOWN_STATE,
   SHARE_CHANGED,
   insertShare,
   isShareId,
@@ -485,6 +513,37 @@ export {
   sharesOfRecord,
 } from "./shares.js";
 export type { Share, SharePageOptions, ShareState, SharedItemView } from "./shares.js";
+export {
+  ACCESSION_TABLE_PRIVILEGES,
+  MAX_ACCESSION_PAGE,
+  accessionUses,
+  accessionsProducing,
+  deleteDonorContact,
+  insertAccession,
+  listAccessions,
+  lockAccessionHolds,
+  sitesBelow,
+  numberUsedBefore,
+  readAccession,
+  readAccessionHolds,
+  readAccessionRecords,
+  publishedBelow,
+  readDonorContact,
+  saveDonorContact,
+  updateAccession,
+} from "./accessions.js";
+export type { SaveOutcome, StoredAccession, StoredDonorContact } from "./accessions.js";
+export {
+  STORAGE_TABLE_PRIVILEGES,
+  storageNow,
+  insertStorageMove,
+  lockStorage,
+  readStorage,
+  saveStorageLevels,
+  saveStorageLocation,
+  storageUses,
+} from "./storage.js";
+export type { StorageSaveOutcome, StoredDefinition, StoredStorage } from "./storage.js";
 export {
   SYSTEM_EVENT_KINDS,
   SYSTEM_EVENT_TABLE_PRIVILEGES,
