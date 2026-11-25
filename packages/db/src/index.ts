@@ -90,7 +90,6 @@ export type { RecordCheckOptions } from "./record-checks.js";
 export { deleteRecord } from "./record-delete.js";
 export {
   listPublishedForOai,
-  oaiDatestamp,
   oaiRepository,
   oaiStoredStamp,
   writeOaiStamps,

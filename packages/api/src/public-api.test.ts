@@ -27,6 +27,7 @@ import {
   clientKey,
   PUBLIC_POOL_SIZE,
   PUBLIC_POOL_WAIT_MS,
+  PUBLIC_QUERY_TIMEOUT_MS,
   publicApiRoutes,
   publicPoolOptions,
 } from "./public-api.js";
@@ -371,7 +372,11 @@ describe("GET /records/:id on a public host", () => {
       applicationName: "oculus-public",
       max: PUBLIC_POOL_SIZE,
       connectionTimeoutMillis: PUBLIC_POOL_WAIT_MS,
+      queryTimeoutMillis: PUBLIC_QUERY_TIMEOUT_MS,
     });
+    // Above every statement limit (at most 60 s), so it only fires on a dead
+    // server or network (S-051).
+    expect(PUBLIC_QUERY_TIMEOUT_MS).toBeGreaterThan(60_000);
     expect(PUBLIC_POOL_WAIT_MS).toBeGreaterThan(0);
     expect(PUBLIC_POOL_WAIT_MS).toBeLessThanOrEqual(10_000);
   });

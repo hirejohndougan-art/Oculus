@@ -62,12 +62,25 @@ export const PUBLIC_POOL_WAIT_MS = 5_000;
  * `max` connections, at most `PUBLIC_POOL_WAIT_MS` waiting for one. A
  * route's `maxConcurrent` (or its `ReadSlots`) must not exceed `max`.
  */
+/**
+ * The client-side limit on any one query of the public routes' pools
+ * (S-051): above every statement limit they use (at most 60 s), so it only
+ * fires when the server or network has stopped answering.
+ */
+export const PUBLIC_QUERY_TIMEOUT_MS = 90_000;
+
 export function publicPoolOptions(max = PUBLIC_POOL_SIZE): {
   applicationName: string;
   max: number;
   connectionTimeoutMillis: number;
+  queryTimeoutMillis: number;
 } {
-  return { applicationName: "oculus-public", max, connectionTimeoutMillis: PUBLIC_POOL_WAIT_MS };
+  return {
+    applicationName: "oculus-public",
+    max,
+    connectionTimeoutMillis: PUBLIC_POOL_WAIT_MS,
+    queryTimeoutMillis: PUBLIC_QUERY_TIMEOUT_MS,
+  };
 }
 
 export interface PublicApiOptions {

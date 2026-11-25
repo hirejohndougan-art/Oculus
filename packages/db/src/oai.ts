@@ -11,8 +11,8 @@
  *
  * The lists read the stored datestamps (S-041, D-108: `oai_datestamps`,
  * written by `writeOaiStamps` from the background pass's fingerprints of
- * each record's oai_dc). `oaiDatestamp` below is the computed fallback for
- * GetRecord before a site's first pass. A computed datestamp is the later of when its current version was
+ * each record's oai_dc). Nothing here computes a datestamp from record
+ * versions any more (S-046): that told a harvester when staff saved anything. A computed datestamp is the later of when its current version was
  * written (`record_versions.recorded_at`: every edit and every workflow
  * move writes a version) and when its template's stored Dublin Core
  * mapping last changed (D-096), since either changes its `oai_dc` record.
@@ -30,7 +30,7 @@
  */
 import { isOrganizationId, isRecordId, isSiteId } from "@oculus/core";
 import type { Database, Queryable } from "./client.js";
-import { sql, type Sql } from "./sql.js";
+import { sql } from "./sql.js";
 
 /** The most candidates one call returns. */
 export const MAX_OAI_CANDIDATES = 500;
@@ -93,29 +93,15 @@ export interface OaiListOptions {
   /** Datestamps before this instant (exclusive; the caller widens `until`). */
   readonly before?: string;
   readonly limit: number;
+  /**
+   * The statement time limit, lock waits included (default 30 000 ms, at
+   * most 60 000): the routes pass what is left of the page's time (S-051).
+   */
+  readonly timeLimitMs?: number;
 }
 
 function isStamp(value: unknown): value is string {
   return typeof value === "string" && STAMP.test(value) && !Number.isNaN(Date.parse(value));
-}
-
-/** The published records on `site`, each with its datestamp (one row per record). */
-function stamped(organizationId: string, siteId: string): Sql {
-  return sql`
-    SELECT r.id,
-           -- Whole milliseconds, as the token carries it: changed_at has
-           -- microseconds, and a finer stamp than the token's would resume
-           -- before the page it ended (D-105).
-           date_trunc('milliseconds',
-                      greatest(coalesce(v.recorded_at, r.updated_at),
-                               coalesce(m.changed_at, '-infinity'::timestamptz))) AS stamp
-    FROM public.records r
-    LEFT JOIN public.record_versions v
-      ON v.organization_id = r.organization_id AND v.record_id = r.id AND v.version = r.version
-    LEFT JOIN public.dublin_core_mappings m
-      ON m.organization_id = r.organization_id AND m.template_key = r.template_key
-    WHERE r.organization_id = ${organizationId}::uuid
-      AND public.record_public_on_site(r, ${siteId}::uuid)`;
 }
 
 function bad(): never {
@@ -141,14 +127,17 @@ export async function listPublishedForOai(
   if (after !== undefined && (!isRecordId(after.id) || !isStamp(after.stamp))) bad();
   if (from !== undefined && !isStamp(from)) bad();
   if (before !== undefined && !isStamp(before)) bad();
+  const limitMs = options.timeLimitMs ?? 30_000;
+  if (!Number.isInteger(limitMs) || limitMs < 1 || limitMs > MAX_OAI_READ_TIME_LIMIT_MS) bad();
   return db.transaction(async (tx) => {
     // Wait for a datestamp write in progress to commit (SHARE conflicts with
     // its ROW EXCLUSIVE): its rows carry a time from before they could be
     // seen, so a list that ran meanwhile, with a later responseDate, would
-    // miss them for good (review of S-041). Bounded, never a hang.
+    // miss them for good (review of S-041). Bounded by `statement_timeout`
+    // alone, which covers lock waits too and reads as a timeout (busy), as
+    // `lock_timeout`'s 55P03 would not (S-051).
     await tx.execute(
-      sql`SELECT pg_catalog.set_config('lock_timeout', '30000', true),
-                 pg_catalog.set_config('statement_timeout', '30000', true)`,
+      sql`SELECT pg_catalog.set_config('statement_timeout', ${String(limitMs)}, true)`,
     );
     await tx.execute(sql`LOCK TABLE public.oai_datestamps IN SHARE MODE`);
     return listIn(tx, organizationId, siteId, options);
@@ -275,26 +264,6 @@ export async function oaiStoredStamp(
       AND d.record_id = ${recordId}::uuid`),
   );
   return row === undefined ? undefined : { stamp: row.stamp, deleted: row.deleted };
-}
-
-/** One published record's datestamp on the site, or `undefined` if it isn't published there. */
-export async function oaiDatestamp(
-  db: Database,
-  organizationId: string,
-  siteId: string,
-  recordId: string,
-  options: OaiReadOptions = {},
-): Promise<string | undefined> {
-  if (!isOrganizationId(organizationId) || !isSiteId(siteId) || !isRecordId(recordId)) {
-    return undefined;
-  }
-  const [row] = await bounded(db, options, (tx) =>
-    tx.rows<{ stamp: string }>(sql`
-    WITH c AS (${stamped(organizationId, siteId)})
-    SELECT to_char(c.stamp AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS stamp
-    FROM c WHERE c.id = ${recordId}::uuid`),
-  );
-  return row?.stamp;
 }
 
 /**

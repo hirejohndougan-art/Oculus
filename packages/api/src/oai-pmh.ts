@@ -38,7 +38,6 @@ import { isRecordId } from "@oculus/core";
 import {
   isDatabaseTimeout,
   listPublishedForOai,
-  oaiDatestamp,
   oaiRepository,
   oaiStoredStamp,
   readPublicRecord,
@@ -47,7 +46,7 @@ import {
 } from "@oculus/db";
 import { Refusal } from "./errors.js";
 import { oaiPmhReply, OAI_PMH_PROLOGUE } from "./file-replies.js";
-import { checkTimeLimit, clientKey, originOf, ReadSlots } from "./public-api.js";
+import { checkTimeLimit, clientKey, originOf, publicPoolOptions, ReadSlots } from "./public-api.js";
 import type { PublicSite } from "./public-sites.js";
 import { DEFAULT_RATE_LIMITS, SessionRateLimiter, type RateBucket } from "./rate-limit.js";
 import type { OculusRequest, OculusReply, OculusRoute } from "./routes.js";
@@ -66,8 +65,26 @@ export const OAI_MAX_SCAN = 200;
  * a harvest in a slot for `OAI_MAX_SCAN` reads; at least one is always read.
  */
 export const OAI_PAGE_TIME_LIMIT_MS = 15_000;
+/** The longest one list read may take (the page's first; later ones get what is left). */
+const LIST_READ_LIMIT_MS = 30_000;
+
 /** The most of the public pool's slots OAI-PMH holds at once. */
 export const OAI_MAX_SLOTS = 2;
+
+/**
+ * The options for OAI-PMH's own pool on the staff role (S-051): one
+ * connection per OAI slot, a bounded wait for one (then `503 busy`, as the
+ * public pool), and the client-side query limit, so a request holding an
+ * OAI slot and a shared public slot never waits without end.
+ */
+export function oaiPoolOptions(): {
+  applicationName: string;
+  max: number;
+  connectionTimeoutMillis: number;
+  queryTimeoutMillis: number;
+} {
+  return { ...publicPoolOptions(OAI_MAX_SLOTS), applicationName: "oculus-oai" };
+}
 
 const OAI_NS = "http://www.openarchives.org/OAI/2.0/";
 const OAI_SCHEMA = "http://www.openarchives.org/OAI/2.0/OAI-PMH.xsd";
@@ -414,8 +431,11 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
   /** The staff reads' time limit (S-043a), as the public reads'. */
   const staffRead = options.timeLimitMs === undefined ? {} : { timeLimitMs: options.timeLimitMs };
 
-  /** A record that has stopped being shown on the site (a stored mark), or undefined. */
-  async function tombstone(site: PublicSite, id: string): Promise<string | undefined> {
+  /**
+   * The stored datestamp of a record the site has shown (S-041), whether or
+   * not it is still shown, or undefined for one it never showed.
+   */
+  async function storedStamp(site: PublicSite, id: string): Promise<string | undefined> {
     const stored = await oaiStoredStamp(
       options.db,
       site.organizationId,
@@ -423,7 +443,7 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
       id,
       staffRead,
     );
-    return stored?.deleted === true ? stored.stamp : undefined;
+    return stored?.stamp;
   }
 
   function metadata(oaiDcXml: string): string {
@@ -469,45 +489,35 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
     const id = recordIdOf(host, identifier);
     if (id === undefined) return fail("idDoesNotExist");
     const output = await publicRecord(site, id);
+    // A record the site has shown has a stored datestamp (S-041); one it
+    // never showed has none and is unknown, never "deleted".
+    const stored = await storedStamp(site, id);
     if (output === undefined) {
-      // Only a record the site once showed has a mark; any other is unknown.
-      const gone = await tombstone(site, id);
-      if (gone === undefined) return fail("idDoesNotExist");
+      // Not shown now: a deleted header, whether the pass has marked it yet
+      // or not (S-047), at its stored datestamp.
+      if (stored === undefined) return fail("idDoesNotExist");
       if (metadataPrefix !== OAI_DC_PREFIX) return fail("cannotDisseminateFormat");
       return [
         "<GetRecord>",
         "<record>",
-        header(host, id, gone, true),
+        header(host, id, stored, true),
         "</record>",
         "</GetRecord>",
       ].join("\n");
     }
     if (metadataPrefix !== OAI_DC_PREFIX) return fail("cannotDisseminateFormat");
-    // The stored datestamp; before the site's first background pass, the computed one.
-    const stored = await oaiStoredStamp(
-      options.db,
-      site.organizationId,
-      site.siteId,
-      id,
-      staffRead,
-    );
-    // A record back since the last pass keeps the later of its mark and its
-    // computed datestamp, so it never goes backwards (review of S-041).
-    let stamp: string | undefined;
-    if (stored !== undefined && !stored.deleted) {
-      stamp = stored.stamp;
-    } else {
-      const computed = await oaiDatestamp(
+    // Before the site's first background pass there is no stored datestamp:
+    // the site's lower bound stands in, never a time computed from record
+    // versions, which would tell a harvester when staff saved (S-046).
+    let stamp = stored;
+    if (stamp === undefined) {
+      const repository = await oaiRepository(
         options.db,
         site.organizationId,
         site.siteId,
-        id,
         staffRead,
       );
-      stamp =
-        stored === undefined || computed === undefined || computed > stored.stamp
-          ? computed
-          : stored.stamp;
+      stamp = repository?.earliest;
     }
     if (stamp === undefined) return fail("idDoesNotExist");
     return [
@@ -547,11 +557,25 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
     const deadline = clock() + pageTimeLimitMs;
     while (shown.length < OAI_PAGE_SIZE && scanned < OAI_MAX_SCAN && !exhausted && !outOfTime) {
       const want = Math.min(OAI_PAGE_SIZE - shown.length + 5, OAI_MAX_SCAN - scanned);
-      const candidates = await listPublishedForOai(options.db, site.organizationId, site.siteId, {
-        ...cursor.window,
-        ...(after === undefined ? {} : { after }),
-        limit: want,
-      });
+      // The page's time bounds each list read too (S-051): checked before the
+      // call, and the call gets only what is left (the first, the full limit).
+      const left = deadline - clock();
+      // (A break leaves `exhausted` false, so the page ends with a token.)
+      if (scanned > 0 && left < 1) break;
+      let candidates: OaiCandidate[];
+      try {
+        candidates = await listPublishedForOai(options.db, site.organizationId, site.siteId, {
+          ...cursor.window,
+          ...(after === undefined ? {} : { after }),
+          limit: want,
+          timeLimitMs: scanned === 0 ? LIST_READ_LIMIT_MS : Math.min(LIST_READ_LIMIT_MS, left),
+        });
+      } catch (thrown) {
+        // Past the page's first, a list read that runs out of time ends the
+        // page here; the token resumes after the last record shown.
+        if (scanned === 0 || !isDatabaseTimeout(thrown)) throw thrown;
+        break;
+      }
       if (candidates.length < want) exhausted = true;
       for (const candidate of candidates) {
         if (shown.length >= OAI_PAGE_SIZE) {
@@ -589,7 +613,14 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
         // Only now: `after` (the token's place) moves past this candidate.
         scanned += 1;
         after = candidate;
-        if (output === undefined) continue;
+        if (output === undefined) {
+          // Shown when the pass last ran, not now: a deleted header at its
+          // stored datestamp (S-047), so a page never comes back empty and a
+          // run of such records reads as what it is.
+          const gone = header(host, candidate.id, candidate.stamp, true);
+          shown.push(verb === "ListIdentifiers" ? gone : `<record>\n${gone}\n</record>`);
+          continue;
+        }
         shown.push(
           verb === "ListIdentifiers"
             ? header(host, candidate.id, candidate.stamp)
@@ -632,7 +663,7 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
           if (
             id === undefined ||
             ((await publicRecord(site, id)) === undefined &&
-              (await tombstone(site, id)) === undefined)
+              (await storedStamp(site, id)) === undefined)
           ) {
             return fail("idDoesNotExist");
           }

@@ -204,6 +204,12 @@ export interface AdminServerOptions {
    * isn't served.
    */
   readonly countsDb?: Database;
+  /**
+   * OAI-PMH's own small pool on the staff role (S-051, `oaiPoolOptions`):
+   * its list and datestamp reads wait a bounded time for a connection.
+   * Left out (tests), they use `db`.
+   */
+  readonly oaiDb?: Database;
   /** Defaults to `process.env`. */
   readonly env?: Readonly<Record<string, string | undefined>>;
   /**
@@ -428,7 +434,7 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     ...(publicDb === undefined || publicSites.length === 0 || oaiEmail === undefined
       ? []
       : oaiPmhRoutes({
-          db: options.db,
+          db: options.oaiDb ?? options.db,
           publicDb,
           sites: publicSites,
           adminEmail: oaiEmail,
