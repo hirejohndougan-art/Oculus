@@ -30,7 +30,14 @@
  */
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
-import { loadSecretKeyring, sql, type Database, type PasswordResetDelivery } from "@oculus/db";
+import {
+  loadSecretKeyring,
+  sql,
+  type Database,
+  type EnrolmentDelivery,
+  type InvitationDelivery,
+  type PasswordResetDelivery,
+} from "@oculus/db";
 import { createService } from "@oculus/service";
 import type { FastifyInstance } from "fastify";
 import { ADMIN_ORIGIN_ENV, loadAdminFiles, type AdminFiles } from "./admin-files.js";
@@ -57,6 +64,14 @@ export interface AdminServerOptions {
   readonly env?: Readonly<Record<string, string | undefined>>;
   /** Sends password reset links (T-040). Required in production. */
   readonly deliverReset?: PasswordResetDelivery;
+  /**
+   * Send invitations and the set-up token after a reset of two-step sign-in
+   * (T-040). In development each defaults to logging that a message was
+   * made (never its token or address); in production, without one, the
+   * matching people route answers 503 `delivery_unavailable`.
+   */
+  readonly deliverInvitation?: InvitationDelivery;
+  readonly deliverEnrolment?: EnrolmentDelivery;
   /** The admin build's folder (default: packages/admin/dist). */
   readonly adminDir?: string;
   /** Already-loaded admin files (tests). */
@@ -75,6 +90,17 @@ function defaultLog(record: ApiLogRecord): void {
   } catch {
     // Logging can't stop the server.
   }
+}
+
+/** Development only: says a message was made, never its token or address (D-068). */
+function developmentDelivery(
+  log: (record: ApiLogRecord) => void,
+  event: "invitation_produced" | "set_up_link_produced",
+): () => Promise<void> {
+  return () => {
+    log({ event });
+    return Promise.resolve();
+  };
 }
 
 /** True unless `NODE_ENV` says development or test. */
@@ -153,7 +179,25 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
 
   const service = createService(options.db, { onError: serviceErrorLogger(log) });
   const routes = [
-    ...staffApiRoutes({ db: options.db, service, log }),
+    ...staffApiRoutes({
+      db: options.db,
+      service,
+      log,
+      people: {
+        keys,
+        deliverReset,
+        ...(options.deliverInvitation !== undefined
+          ? { deliverInvitation: options.deliverInvitation }
+          : production
+            ? {}
+            : { deliverInvitation: developmentDelivery(log, "invitation_produced") }),
+        ...(options.deliverEnrolment !== undefined
+          ? { deliverEnrolment: options.deliverEnrolment }
+          : production
+            ? {}
+            : { deliverEnrolment: developmentDelivery(log, "set_up_link_produced") }),
+      },
+    }),
     ...signInRoutes({
       db: options.db,
       keys,
