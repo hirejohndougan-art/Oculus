@@ -11,6 +11,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { newRecordId, newSiteId } from "@oculus/core";
 import {
   grantPublicReaderRole,
+  insertTemplateVersion,
   openDatabase,
   sql,
   type Database,
@@ -21,7 +22,7 @@ import { testServerUrl } from "../../db/src/test-database.fixtures.js";
 import { FAKE_TEST_SECRET_KEY } from "../../db/src/second-factor.fixtures.js";
 import { loadAdminFiles } from "./admin-files.js";
 import { buildAdminServer } from "./admin-server.js";
-import { publicApiRoutes } from "./public-api.js";
+import { clientKey, publicApiRoutes } from "./public-api.js";
 import { checkPublicSites } from "./public-sites.js";
 import { buildServer } from "./server.js";
 import { actorOf, makeObject, makeWorld, ok, publishAs, type World } from "./staff-api.fixtures.js";
@@ -38,6 +39,7 @@ let published: string;
 let draft: string;
 let otherSite: string;
 let otherOrg: string;
+let unmapped: string;
 
 async function withRole(q: Queryable, statement: string, role: string): Promise<void> {
   await q.rows(sql`SELECT set_config('oculus_test.role', ${role}, true),
@@ -90,6 +92,39 @@ beforeAll(async () => {
   await publishAs(w, w.a, otherSite);
   otherOrg = (await makeObject(w, w.b, w.b1, "An invented library lantern")).id;
   await publishAs(w, w.b, otherOrg);
+  // A published record whose template has no stored mapping.
+  ok(
+    await insertTemplateVersion(w.db, {
+      key: "t-object-plain",
+      organizationId: w.a,
+      label: "Plain object",
+      appliesTo: ["object"],
+      fields: [
+        {
+          key: "rights",
+          label: "rights",
+          kind: "rights",
+          required: false,
+          repeatable: false,
+          visibility: "public",
+          inherited: false,
+        },
+      ],
+    }),
+  );
+  const plain = ok(
+    await w.service.createRecord(
+      { organizationId: w.a, actor: actorOf(w.root), siteId: w.a1 },
+      {
+        kind: "object",
+        title: "An invented unmapped lantern",
+        templateKey: "t-object-plain",
+        fields: { rights: { uri: "http://rightsstatements.org/vocab/InC/1.0/" } },
+      },
+    ),
+  );
+  unmapped = plain.record.id;
+  await publishAs(w, w.a, unmapped);
 
   dir = mkdtempSync(join(tmpdir(), "oculus-t050d-"));
   writeFileSync(join(dir, "index.html"), "<!doctype html><title>Oculus</title>");
@@ -142,10 +177,10 @@ describe("GET /records/:id on a public host", () => {
     expect(reply.headers["x-content-type-options"]).toBe("nosniff");
   });
 
-  it("everything else is the unknown path's 404, byte for byte", async () => {
+  it("on a public host, everything else is the unknown path's 404, byte for byte", async () => {
     const unknown = await get("127.0.0.1", "/no-such-path");
     for (const [host, url] of [
-      ["localhost", `/records/${published}`],
+      ["127.0.0.1", `/records/${unmapped}`],
       ["127.0.0.1", `/records/${draft}`],
       ["127.0.0.1", `/records/${otherSite}`],
       ["127.0.0.1", `/records/${otherOrg}`],
@@ -155,6 +190,13 @@ describe("GET /records/:id on a public host", () => {
     ] as const) {
       const reply = await get(host, url);
       expect([host, url, reply.statusCode, reply.body]).toEqual([host, url, 404, unknown.body]);
+    }
+  });
+
+  it("the admin's host and other hosts get 404 for any record", async () => {
+    for (const host of ["localhost", "unlisted.example.org", "127.0.0.1:8080"]) {
+      const reply = await get(host, `/records/${published}`);
+      expect([host, reply.statusCode, reply.json()]).toEqual([host, 404, { error: "not_found" }]);
     }
   });
 
@@ -185,5 +227,35 @@ describe("GET /records/:id on a public host", () => {
     } finally {
       await braked.close();
     }
+  });
+
+  it("refuses at once past the reads allowed at a time, and counts IPv6 by its /64", async () => {
+    const sites = await checkPublicSites(w.db, reader, [{ origin: PUBLIC, siteId: w.a1 }]);
+    const capped = await buildServer({
+      env: { OCULUS_ORIGINS: PUBLIC },
+      routes: publicApiRoutes({ db: reader, sites, maxConcurrent: 1 }),
+    });
+    try {
+      const replies = await Promise.all(
+        Array.from({ length: 4 }, () => get("127.0.0.1", `/records/${published}`, capped)),
+      );
+      const codes = replies.map((r) => r.statusCode).sort();
+      expect(codes[0]).toBe(200);
+      expect(codes.every((c) => c === 200 || c === 503)).toBe(true);
+      for (const r of replies.filter((x) => x.statusCode === 503)) {
+        expect(r.json()).toEqual({ error: "busy" });
+      }
+      // The slot is given back: a later read works.
+      expect((await get("127.0.0.1", `/records/${published}`, capped)).statusCode).toBe(200);
+    } finally {
+      await capped.close();
+    }
+    expect(clientKey("203.0.113.9")).toBe("203.0.113.9");
+    expect(clientKey("::ffff:203.0.113.9")).toBe("203.0.113.9");
+    expect(clientKey("2001:db8:1:2:aaaa::1")).toBe("2001:db8:1:2::/64");
+    expect(clientKey("2001:db8:1:2:bbbb:cccc:dddd:eeee")).toBe("2001:db8:1:2::/64");
+    expect(clientKey("2001:db8::1")).toBe("2001:db8:0:0::/64");
+    expect(clientKey("2001:0db8:0001:0002::5")).toBe("2001:db8:1:2::/64");
+    expect(clientKey("::1")).toBe("0:0:0:0::/64");
   });
 });

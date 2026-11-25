@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 02:00 CT — manual (Chat C) — T-050d Public record reads
+- Result: done
+- What changed: `packages/api/src/public-api.ts` (`GET /records/:id` on public hosts, mounted by `buildAdminServer` when public sites are configured); a `public` rate bucket.
+- Decisions: D-100
+- Review: one independent round, nothing blocking; fixed the public pool filling under many slow reads (a cap on reads at once, IPv6 counted by /64), the log line, and D-100's wording; S-037 filed (time limits on the reader pool).
+- Gate: see the merge commit · npm audit clean
+- Next: T-050c (OAI-PMH) or T-050e
+
 ## 2026-11-25 00:40 CT — manual (Chat C) — T-050b Stored Dublin Core mappings
 - Result: done (the old T-050b split into T-050b, T-050d and T-050e)
 - What changed: migration 0022 (`dublin_core_mappings`, `public_dublin_core_mapping`); `packages/db/src/dublin-core-mappings.ts`; `readPublicRecord` uses the stored mapping when none is passed; service `readDublinCoreMapping`/`saveDublinCoreMapping`; `GET`/`PUT /api/templates/:key/dublin-core`.
