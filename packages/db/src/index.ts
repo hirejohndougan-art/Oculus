@@ -22,6 +22,7 @@ export {
   typeParsers,
   ConnectionLostError,
   isDatabaseTimeout,
+  TimeLimitError,
   createDatabase,
   dropDatabase,
 } from "./client.js";

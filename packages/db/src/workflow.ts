@@ -87,7 +87,7 @@ import {
   type StoredTemplate,
   type VersionConflict,
 } from "./catalog.js";
-import type { Database, Queryable } from "./client.js";
+import { TimeLimitError, type Database, type Queryable } from "./client.js";
 import {
   checkTypes,
   readIdentifierTypes,
@@ -854,16 +854,81 @@ export interface PublicRecordOptions {
    * connection as long as it takes: past it the read throws (SQLSTATE
    * 57014, `isDatabaseTimeout`). A read is three statements that can take
    * time (the snapshot, the organization's local day and the mapping), so
-   * its database work is about three times this at most. Default `PUBLIC_READ_TIME_LIMIT_MS`; a whole number
+   * its database work is about three times this at most. The JS work
+   * between them (and before the COMMIT) is bounded by it too (S-043b): a
+   * gap longer than this throws `TimeLimitError`, and the server ends a
+   * connection left idle in the transaction `IDLE_MARGIN_MS` longer
+   * (`idle_in_transaction_session_timeout`). Default `PUBLIC_READ_TIME_LIMIT_MS`; a whole number
    * from 1 to `MAX_PUBLIC_READ_TIME_LIMIT_MS`.
    */
   readonly timeLimitMs?: number;
+  /** @internal The clock the gaps between statements are measured on (tests); `Date.now`. */
+  readonly clock?: () => number;
+}
+
+/**
+ * How much longer than a public read's limit the server lets its
+ * connection sit idle in the transaction before ending it (S-043b): the
+ * client's own check (`TimeLimitError`) comes first, so a gap just past
+ * the limit is a clean refusal on a connection that stays usable, and the
+ * server's limit only ends one whose JS work ran far longer.
+ */
+export const IDLE_MARGIN_MS = 1_000;
+
+/**
+ * A public read's queries with every gap between them bounded (S-043b):
+ * each statement must start within `limitMs` of the end of the one before
+ * (or of `start`), and `check` asks the same before the COMMIT. The
+ * statements themselves are bounded by `statement_timeout`.
+ */
+function gapBounded(
+  tx: Queryable,
+  limitMs: number,
+  clock: () => number,
+): { readonly q: Queryable; check(): void } {
+  let last = clock();
+  const check = (): void => {
+    if (clock() - last > limitMs) throw new TimeLimitError();
+  };
+  const done = <T>(result: T): T => {
+    last = clock();
+    return result;
+  };
+  return {
+    q: {
+      rows: async (query) => {
+        check();
+        return done(await tx.rows(query));
+      },
+      execute: async (query) => {
+        check();
+        return done(await tx.execute(query));
+      },
+    },
+    check,
+  };
+}
+
+/** The settings each public read's transaction starts with (S-037, S-043b), local to it. */
+async function limitPublicRead(tx: Queryable, timeLimitMs: number): Promise<void> {
+  // Local to the transaction, so the pooled connection keeps its own settings after.
+  await tx.execute(
+    sql`SELECT pg_catalog.set_config('statement_timeout', ${String(timeLimitMs)}, true),
+               pg_catalog.set_config('idle_in_transaction_session_timeout',
+                                     ${String(timeLimitMs + IDLE_MARGIN_MS)}, true)`,
+  );
 }
 
 /** `readPublicRecord`'s default time limit per statement (S-037). */
 export const PUBLIC_READ_TIME_LIMIT_MS = 5_000;
 /** The largest time limit `readPublicRecord` takes. */
 export const MAX_PUBLIC_READ_TIME_LIMIT_MS = 60_000;
+
+/** A read's clock (tests may give one); `Date.now` otherwise. */
+function clockOf(options: object): () => number {
+  const given = ownValue(options, "clock");
+  return typeof given === "function" ? (given as () => number) : Date.now;
+}
 
 /** The answer for a record that isn't published, doesn't exist or is another organization's. */
 const NOT_AVAILABLE: readonly Issue[] = Object.freeze([
@@ -973,6 +1038,7 @@ export async function readPublicRecord(
   const mappings = ownValue(options, "mappings");
   const givenLimit = ownValue(options, "timeLimitMs");
   const timeLimitMs = givenLimit === undefined ? PUBLIC_READ_TIME_LIMIT_MS : givenLimit;
+  const clock = clockOf(options);
   if (typeof baseUrl !== "string" || (mappings !== undefined && !Array.isArray(mappings))) {
     return refused([], "invalid_options", "Give { baseUrl, mappings?, timeLimitMs? }.");
   }
@@ -991,19 +1057,20 @@ export async function readPublicRecord(
   return db.transaction(async (tx) => {
     // One snapshot for every read below, and nothing written.
     await tx.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`);
-    // S-037: each statement below may take at most this long (local to the
-    // transaction, so the pooled connection keeps its own setting after).
-    await tx.execute(
-      sql`SELECT pg_catalog.set_config('statement_timeout', ${String(timeLimitMs)}, true)`,
-    );
+    // S-037: each statement below may take at most this long, and S-043b:
+    // so may the JS work between them.
+    await limitPublicRead(tx, timeLimitMs);
+    const timed = gapBounded(tx, timeLimitMs, clock);
     const read = await publicRecordIn(
-      tx,
+      timed.q,
       organizationId,
       siteId,
       recordId,
       baseUrl,
       mappings as readonly unknown[] | undefined,
     );
+    // The output's JS work came after the last statement: bounded before the COMMIT.
+    timed.check();
     return read.ok ? { ok: true, value: read.value.output } : read;
   });
 }
@@ -1030,8 +1097,10 @@ export interface SharedPublicRecordOptions {
    * record, D-111). Called once, with the home organization and site.
    */
   readonly baseUrlFor: (home: SharedHome) => string;
-  /** As `PublicRecordOptions.timeLimitMs` (S-037): each statement's time limit. */
+  /** As `PublicRecordOptions.timeLimitMs` (S-037, S-043b): each statement's and each gap's time limit. */
   readonly timeLimitMs?: number;
+  /** @internal As `PublicRecordOptions.clock`. */
+  readonly clock?: () => number;
 }
 
 /**
@@ -1062,6 +1131,7 @@ export async function readSharedPublicRecord(
   const baseUrlFor = ownValue(options, "baseUrlFor");
   const givenLimit = ownValue(options, "timeLimitMs");
   const timeLimitMs = givenLimit === undefined ? PUBLIC_READ_TIME_LIMIT_MS : givenLimit;
+  const clock = clockOf(options);
   if (typeof baseUrlFor !== "function") {
     return refused([], "invalid_options", "Give { baseUrlFor, timeLimitMs? }.");
   }
@@ -1079,11 +1149,10 @@ export async function readSharedPublicRecord(
   }
   return db.transaction(async (tx) => {
     await tx.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`);
-    // S-037: each statement may take at most this long, as readPublicRecord's.
-    await tx.execute(
-      sql`SELECT pg_catalog.set_config('statement_timeout', ${String(timeLimitMs)}, true)`,
-    );
-    const [found] = await tx.rows<{ home: Record<string, unknown> | null }>(sql`
+    // S-037, S-043b: as readPublicRecord's.
+    await limitPublicRead(tx, timeLimitMs);
+    const timed = gapBounded(tx, timeLimitMs, clock);
+    const [found] = await timed.q.rows<{ home: Record<string, unknown> | null }>(sql`
       SELECT public.shared_record_home(${organizationId}::uuid, ${siteId}::uuid,
                                        ${recordId}::uuid) AS home`);
     const raw = found?.home ?? null;
@@ -1110,7 +1179,8 @@ export async function readSharedPublicRecord(
     if (typeof baseUrl !== "string") {
       return refused([], "invalid_options", "baseUrlFor must give a URL.");
     }
-    const read = await publicRecordIn(tx, homeOrg, homeSite, recordId, baseUrl, undefined);
+    const read = await publicRecordIn(timed.q, homeOrg, homeSite, recordId, baseUrl, undefined);
+    timed.check();
     if (!read.ok) return read;
     return { ok: true, value: Object.freeze({ output: read.value.output, home }) };
   });

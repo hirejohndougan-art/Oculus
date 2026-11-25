@@ -30,13 +30,14 @@ import { OAI_PMH_PROLOGUE, isFileReply, oaiPmhReply } from "./file-replies.js";
 import {
   OAI_MAX_SLOTS,
   OAI_PAGE_SIZE,
+  OAI_SKIP_AFTER_STRIKES,
   oaiAdminEmail,
   oaiPmhRoutes,
   oaiPoolOptions,
 } from "./oai-pmh.js";
-import { ReadSlots } from "./public-api.js";
+import { publicApiRoutes, ReadSlots, slowKey, SlowReads } from "./public-api.js";
 import { PublicSubjects } from "./public-subjects.js";
-import { checkPublicSites } from "./public-sites.js";
+import { checkPublicSites, type PublicSite } from "./public-sites.js";
 import { buildServer } from "./server.js";
 import { actorOf, makeObject, makeWorld, ok, publishAs, type World } from "./staff-api.fixtures.js";
 
@@ -1061,6 +1062,226 @@ describe("the staff connection's time limits and the page clock (S-043a)", () =>
       expect(tokenIn(reply.body)).toBeDefined();
     } finally {
       await racing.close();
+    }
+  });
+});
+
+describe("a record always slower than the public read limit (S-043b)", () => {
+  function firstOf(sites: readonly PublicSite[]): PublicSite {
+    const site = sites[0];
+    if (site === undefined) throw new Error("no public site");
+    return site;
+  }
+
+  /**
+   * The public reader, but every read of `target` notes the time limits it
+   * runs under and then fails as a statement past `statement_timeout`
+   * would, while `failing` says so; every other read is the reader's own.
+   */
+  function slowFor(target: () => string, failing: () => boolean) {
+    const limits: { statement: string; idle: string }[] = [];
+    const db: Database = {
+      ...reader,
+      transaction: (work) =>
+        reader.transaction((tx) =>
+          work({
+            rows: async (query) => {
+              // Each read's first statement: the record's snapshot.
+              if (
+                query.text.includes("public_record_snapshot") &&
+                query.values.includes(target())
+              ) {
+                const [now] = await tx.rows<{ statement: string; idle: string }>(sql`
+                  SELECT pg_catalog.current_setting('statement_timeout') AS statement,
+                         pg_catalog.current_setting('idle_in_transaction_session_timeout') AS idle`);
+                if (now !== undefined) limits.push(now);
+                if (failing()) {
+                  throw Object.assign(new Error("canceling statement due to statement timeout"), {
+                    code: "57014",
+                  });
+                }
+              }
+              return tx.rows(query);
+            },
+            execute: (query) => tx.execute(query),
+          }),
+        ),
+    };
+    return { db, limits };
+  }
+
+  it("is left out of the lists after its reads at the larger limit time out twice in a row, logged for staff", async () => {
+    const sites = await checkPublicSites(w.db, reader, [{ origin: PUBLIC, siteId: w.a1 }]);
+    const target = more[3] ?? "";
+    const { db, limits } = slowFor(
+      () => target,
+      () => true,
+    );
+    const logged: { event: string; code?: string }[] = [];
+    const slowReads = new SlowReads({ limitMs: 1_000 });
+    const server = await buildServer({
+      env: { OCULUS_ORIGINS: PUBLIC },
+      routes: oaiPmhRoutes({
+        db: w.db,
+        publicDb: db,
+        sites,
+        adminEmail: EMAIL,
+        rateLimits: { oai: 10_000 },
+        timeLimitMs: 200,
+        slowReads,
+        log: (r) => logged.push(r),
+      }),
+    });
+    try {
+      const seen: string[] = [];
+      let query = "verb=ListIdentifiers&metadataPrefix=oai_dc";
+      let busy = 0;
+      for (let requests = 0; requests < 40; requests++) {
+        const reply = await oai(query, "127.0.0.1", server);
+        if (reply.statusCode === 503) {
+          // A harvester retries the same request after Retry-After.
+          expect([reply.headers["retry-after"], reply.json()]).toEqual(["5", { error: "busy" }]);
+          busy += 1;
+          continue;
+        }
+        expect(reply.statusCode).toBe(200);
+        expect(errorCode(reply.body)).toBeUndefined();
+        seen.push(...identifiers(reply.body));
+        const token = tokenIn(reply.body);
+        if (token === undefined) break;
+        query = `verb=ListIdentifiers&resumptionToken=${token}`;
+      }
+      // Busy once or twice (first at the normal limit if it began a page,
+      // then at the larger), then stepped past; every other record is there once.
+      expect(busy).toBeGreaterThanOrEqual(1);
+      expect(busy).toBeLessThanOrEqual(2);
+      expect(new Set(seen).size).toBe(seen.length);
+      expect(seen.sort()).toEqual(
+        [published, ...more]
+          .filter((id) => id !== target)
+          .map((id) => `${PREFIX}${id}`)
+          .sort(),
+      );
+      // Read first at the routes' limit, then twice at the larger one, each
+      // gap between statements bounded too (the limit plus IDLE_MARGIN_MS).
+      expect(limits).toEqual([
+        { statement: "200ms", idle: "1200ms" },
+        { statement: "1s", idle: "2s" },
+        { statement: "1s", idle: "2s" },
+      ]);
+      expect(slowReads.strikes(slowKey(firstOf(sites), target))).toBe(OAI_SKIP_AFTER_STRIKES);
+      // Logged for staff with its ID, once; nothing of it went to the harvester.
+      expect(logged.filter((r) => r.event === "oai_record_skipped")).toEqual([
+        { event: "oai_record_skipped", operation: "oaiPmh", name: "slow_record", code: target },
+      ]);
+      expect(seen.join(" ")).not.toContain(target);
+      // GetRecord never skips: still busy, at the larger limit.
+      const one = await oai(
+        `verb=GetRecord&metadataPrefix=oai_dc&identifier=${PREFIX}${target}`,
+        "127.0.0.1",
+        server,
+      );
+      expect([one.statusCode, one.json()]).toEqual([503, { error: "busy" }]);
+      expect(limits.at(-1)).toEqual({ statement: "1s", idle: "2s" });
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("a record that is only slow is read with the larger limit next time, and answers", async () => {
+    const sites = await checkPublicSites(w.db, reader, [{ origin: PUBLIC, siteId: w.a1 }]);
+    let failing = true;
+    const { db, limits } = slowFor(
+      () => published,
+      () => failing,
+    );
+    const slowReads = new SlowReads({ limitMs: 1_000 });
+    const server = await buildServer({
+      env: { OCULUS_ORIGINS: PUBLIC },
+      routes: [
+        ...publicApiRoutes({ db, sites, timeLimitMs: 200, slowReads }),
+        ...oaiPmhRoutes({
+          db: w.db,
+          publicDb: db,
+          sites,
+          adminEmail: EMAIL,
+          rateLimits: { oai: 10_000 },
+          timeLimitMs: 200,
+          slowReads,
+        }),
+      ],
+    });
+    try {
+      const get = () =>
+        server.inject({
+          method: "GET",
+          url: `/records/${published}`,
+          headers: { host: "127.0.0.1" },
+        });
+      const first = await get();
+      expect([first.statusCode, first.json()]).toEqual([503, { error: "busy" }]);
+      // The database is fine again: the next read has the larger limit and answers.
+      failing = false;
+      const second = await get();
+      expect(second.statusCode).toBe(200);
+      expect(second.json<{ id: string }>().id).toBe(`${PUBLIC}/records/${published}`);
+      // Known slow, shared with OAI-PMH: GetRecord reads it at the larger limit too.
+      const one = await oai(
+        `verb=GetRecord&metadataPrefix=oai_dc&identifier=${PREFIX}${published}`,
+        "127.0.0.1",
+        server,
+      );
+      expect(one.statusCode).toBe(200);
+      expect(errorCode(one.body)).toBeUndefined();
+      expect(limits.map((l) => l.statement)).toEqual(["200ms", "1s", "1s"]);
+      // Answered in time: no strikes held against it.
+      expect(slowReads.strikes(slowKey(firstOf(sites), published))).toBe(0);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("a known-slow record mid-page waits for a page with its whole larger limit left", async () => {
+    const sites = await checkPublicSites(w.db, reader, [{ origin: PUBLIC, siteId: w.a1 }]);
+    const target = more[2] ?? "";
+    const { db, limits } = slowFor(
+      () => target,
+      () => false,
+    );
+    // Known slow already; its larger limit (1 s) is more than a page (500 ms) has.
+    const slowReads = new SlowReads({ limitMs: 1_000 });
+    slowReads.timedOut(slowKey(firstOf(sites), target), false);
+    const server = await buildServer({
+      env: { OCULUS_ORIGINS: PUBLIC },
+      routes: oaiPmhRoutes({
+        db: w.db,
+        publicDb: db,
+        sites,
+        adminEmail: EMAIL,
+        rateLimits: { oai: 10_000 },
+        timeLimitMs: 200,
+        pageTimeLimitMs: 500,
+        slowReads,
+      }),
+    });
+    try {
+      const seen: string[] = [];
+      let query = "verb=ListIdentifiers&metadataPrefix=oai_dc";
+      for (let pages = 0; pages < 40; pages++) {
+        const reply = await oai(query, "127.0.0.1", server);
+        expect(reply.statusCode).toBe(200);
+        const ids = identifiers(reply.body);
+        // Only ever read as a page's first.
+        if (ids.includes(`${PREFIX}${target}`)) expect(ids[0]).toBe(`${PREFIX}${target}`);
+        seen.push(...ids);
+        const token = tokenIn(reply.body);
+        if (token === undefined) break;
+        query = `verb=ListIdentifiers&resumptionToken=${token}`;
+      }
+      expect(seen.sort()).toEqual([published, ...more].map((id) => `${PREFIX}${id}`).sort());
+      expect(limits.map((l) => l.statement)).toEqual(["1s"]);
+    } finally {
+      await server.close();
     }
   });
 });

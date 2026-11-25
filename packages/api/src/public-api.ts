@@ -34,12 +34,16 @@
  * Each read also has time limits of its own (S-037): its statements run
  * under `readPublicRecord`'s `statement_timeout`, and the pool waits at most
  * `PUBLIC_POOL_WAIT_MS` for a connection (`publicPoolOptions`); either
- * running out is `503 busy` too.
+ * running out is `503 busy` too. A record whose read ran out of time is
+ * remembered (`SlowReads`, S-043b) and read with the larger
+ * `SLOW_READ_TIME_LIMIT_MS` from then on, so a record that is merely slow
+ * is answered on the next try instead of being `busy` for good.
  */
 import { isRecordId } from "@oculus/core";
 import {
   isDatabaseTimeout,
   MAX_PUBLIC_READ_TIME_LIMIT_MS,
+  PUBLIC_READ_TIME_LIMIT_MS,
   readPublicRecord,
   readSharedPublicRecord,
   type Database,
@@ -98,6 +102,75 @@ export interface PublicApiOptions {
   readonly slots?: ReadSlots;
   /** Each read's statement time limit (S-037); `readPublicRecord`'s default when left out. */
   readonly timeLimitMs?: number;
+  /** Records known to be slow (S-043b), shared with the OAI-PMH routes; one of its own when left out. */
+  readonly slowReads?: SlowReads;
+}
+
+/** The time limit a record known to be slow is read with (S-043b), per statement and gap. */
+export const SLOW_READ_TIME_LIMIT_MS = 15_000;
+/** How long a record stays known as slow after its last read that ran out of time. */
+export const SLOW_READ_MEMORY_MS = 24 * 60 * 60 * 1000;
+/** The most records remembered as slow; the longest unseen is forgotten first. */
+export const SLOW_READ_MAX_RECORDS = 1_000;
+
+/**
+ * The records whose public reads ran out of time (S-043b), in this
+ * process's memory. A record whose read at the normal limit timed out is
+ * read with `limitMs` from then on (a larger limit for single reads, the
+ * record's own); `strikes` counts its reads at that larger limit that ran
+ * out of time in a row, which the OAI-PMH lists use to step past a record
+ * that is always too slow rather than stop every harvest at it. Forgotten
+ * `SLOW_READ_MEMORY_MS` after its last timeout, or on restart; only a
+ * record's site and ID are kept, never anything a visitor sent.
+ */
+export class SlowReads {
+  readonly limitMs: number;
+  private readonly clock: () => number;
+  private readonly marks = new Map<string, { strikes: number; at: number }>();
+  constructor(options: { limitMs?: number; clock?: () => number } = {}) {
+    this.limitMs = options.limitMs ?? SLOW_READ_TIME_LIMIT_MS;
+    checkTimeLimit(this.limitMs);
+    this.clock = options.clock ?? Date.now;
+  }
+  private mark(key: string): { strikes: number; at: number } | undefined {
+    const found = this.marks.get(key);
+    if (found !== undefined && this.clock() - found.at > SLOW_READ_MEMORY_MS) {
+      this.marks.delete(key);
+      return undefined;
+    }
+    return found;
+  }
+  /** Whether the record's last read ran out of time (and isn't forgotten yet). */
+  isSlow(key: string): boolean {
+    return this.mark(key) !== undefined;
+  }
+  /** The larger limit's timeouts in a row so far (0 when none, or not known slow). */
+  strikes(key: string): number {
+    return this.mark(key)?.strikes ?? 0;
+  }
+  /** A read ran out of time: at the larger limit (`slow`) it counts a strike. Gives the strikes. */
+  timedOut(key: string, slow: boolean): number {
+    const strikes = (this.mark(key)?.strikes ?? 0) + (slow ? 1 : 0);
+    // Re-inserted, so the Map's order is least recently timed out first.
+    this.marks.delete(key);
+    this.marks.set(key, { strikes, at: this.clock() });
+    while (this.marks.size > SLOW_READ_MAX_RECORDS) {
+      const oldest = this.marks.keys().next().value;
+      if (oldest === undefined) break;
+      this.marks.delete(oldest);
+    }
+    return strikes;
+  }
+  /** A read at the larger limit came back in time: still slow, no strikes. */
+  answered(key: string): void {
+    const found = this.mark(key);
+    if (found !== undefined) found.strikes = 0;
+  }
+}
+
+/** The key `SlowReads` remembers a site's record under. */
+export function slowKey(site: PublicSite, id: string): string {
+  return `${site.organizationId}:${site.siteId}:${id}`;
 }
 
 /**
@@ -121,6 +194,19 @@ export class ReadSlots {
   give(): void {
     if (this.running > 0) this.running -= 1;
   }
+}
+
+/**
+ * A read's `timeLimitMs` option: the routes' own (or `readPublicRecord`'s
+ * default), or for a record known to be slow `slowReads`'s larger limit
+ * (never below the routes' own).
+ */
+export function readLimit(
+  timeLimitMs: number | undefined,
+  slowReads: SlowReads | undefined,
+): { timeLimitMs?: number } {
+  if (slowReads === undefined) return timeLimitMs === undefined ? {} : { timeLimitMs };
+  return { timeLimitMs: Math.max(slowReads.limitMs, timeLimitMs ?? PUBLIC_READ_TIME_LIMIT_MS) };
 }
 
 /** Refuses at build time a time limit `readPublicRecord` would refuse on every read. */
@@ -178,6 +264,8 @@ export function publicApiRoutes(options: PublicApiOptions): OculusRoute[] {
   const log = options.log ?? (() => undefined);
   const slots = options.slots ?? new ReadSlots(options.maxConcurrent ?? PUBLIC_POOL_SIZE);
   checkTimeLimit(options.timeLimitMs);
+  const slowReads =
+    options.slowReads ?? new SlowReads(options.clock === undefined ? {} : { clock: options.clock });
   /** A shared item's home site's public origin, when it is one of this server's public sites. */
   const homeOrigin = (home: SharedHome): string | undefined =>
     options.sites.find((s) => s.siteId === home.siteId && s.organizationId === home.organizationId)
@@ -201,10 +289,14 @@ export function publicApiRoutes(options: PublicApiOptions): OculusRoute[] {
         let result: Awaited<ReturnType<typeof readPublicRecord>>;
         let shared: Awaited<ReturnType<typeof readSharedPublicRecord>> | undefined;
         let operation = "readPublicRecord";
+        // A record whose read ran out of time before gets the larger limit (S-043b).
+        const key = slowKey(site, id);
+        const slow = slowReads.isSlow(key);
+        const limit = readLimit(options.timeLimitMs, slow ? slowReads : undefined);
         try {
           result = await readPublicRecord(options.db, site.organizationId, site.siteId, id, {
             baseUrl: `${site.origin}/records/`,
-            ...(options.timeLimitMs === undefined ? {} : { timeLimitMs: options.timeLimitMs }),
+            ...limit,
           });
           if (!result.ok) {
             // Not the site's own: maybe an item shared into it (T-041f).
@@ -216,13 +308,16 @@ export function publicApiRoutes(options: PublicApiOptions): OculusRoute[] {
               id,
               {
                 baseUrlFor: (home) => `${homeOrigin(home) ?? site.origin}/records/`,
-                ...(options.timeLimitMs === undefined ? {} : { timeLimitMs: options.timeLimitMs }),
+                ...limit,
               },
             );
           }
+          if (slow) slowReads.answered(key);
         } catch (error) {
           if (isDatabaseTimeout(error)) {
-            // A time limit ran out (S-037): busy, as when every slot is taken.
+            // A time limit ran out (S-037): busy, as when every slot is taken,
+            // and the record is read with the larger limit next time (S-043b).
+            slowReads.timedOut(key, slow);
             log({ event: "service_error", operation, name: "timeout" });
             throw new Refusal(503, "busy");
           }

@@ -32,6 +32,16 @@
  * public read's `statement_timeout`, the public pool's wait for a
  * connection; S-037; the staff connection's statements, S-043a) is the same
  * `503 busy`. A list page's reading time runs on the routes' `clock`.
+ *
+ * A record whose public read ran out of time is remembered as slow
+ * (`SlowReads`, shared with `GET /records/:id`; S-043b) and read with the
+ * larger `SLOW_READ_TIME_LIMIT_MS` from then on: a list page reads it only
+ * with that whole limit left (else it is the next page's first read). One
+ * that runs out of time even then, `OAI_SKIP_AFTER_STRIKES` times in a row,
+ * is left out of the list (as a held-back record is: no header, nothing of
+ * it leaves) and logged for staff as `oai_record_skipped` with its ID, so
+ * a harvest goes on past it instead of stopping there for good. GetRecord
+ * never skips: it answers `503 busy`.
  */
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { isRecordId } from "@oculus/core";
@@ -46,7 +56,16 @@ import {
 } from "@oculus/db";
 import { Refusal } from "./errors.js";
 import { oaiPmhReply, OAI_PMH_PROLOGUE } from "./file-replies.js";
-import { checkTimeLimit, clientKey, originOf, publicPoolOptions, ReadSlots } from "./public-api.js";
+import {
+  checkTimeLimit,
+  clientKey,
+  originOf,
+  publicPoolOptions,
+  ReadSlots,
+  readLimit,
+  slowKey,
+  SlowReads,
+} from "./public-api.js";
 import type { PublicSite } from "./public-sites.js";
 import { DEFAULT_RATE_LIMITS, SessionRateLimiter, type RateBucket } from "./rate-limit.js";
 import type { OculusRequest, OculusReply, OculusRoute } from "./routes.js";
@@ -67,6 +86,13 @@ export const OAI_MAX_SCAN = 200;
 export const OAI_PAGE_TIME_LIMIT_MS = 15_000;
 /** The longest one list read may take (the page's first; later ones get what is left). */
 const LIST_READ_LIMIT_MS = 30_000;
+
+/**
+ * A list leaves out a record whose read at the larger limit (S-043b) ran
+ * out of time this many times in a row: each was a separate page, so a
+ * database that is only briefly slow doesn't drop a record from a harvest.
+ */
+export const OAI_SKIP_AFTER_STRIKES = 2;
 
 /** The most of the public pool's slots OAI-PMH holds at once. */
 export const OAI_MAX_SLOTS = 2;
@@ -113,6 +139,8 @@ export interface OaiPmhOptions {
   readonly timeLimitMs?: number;
   /** A list page's reading time (S-037); `OAI_PAGE_TIME_LIMIT_MS` when left out. */
   readonly pageTimeLimitMs?: number;
+  /** Records known to be slow (S-043b), shared with `GET /records/:id`; one of its own when left out. */
+  readonly slowReads?: SlowReads;
 }
 
 /** An address fit for `adminEmail`, or undefined: plain, short, nothing XML must escape. */
@@ -414,13 +442,31 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
   if (adminEmail === undefined) throw new Error("oaiPmhRoutes needs an admin email");
   const email: string = adminEmail;
 
-  /** The public output of a record public on the site, or undefined. */
+  const slowReads =
+    options.slowReads ?? new SlowReads(options.clock === undefined ? {} : { clock: options.clock });
+  /** The larger limit a record known to be slow is read with (S-043b). */
+  const slowLimitMs = readLimit(options.timeLimitMs, slowReads).timeLimitMs ?? 0;
+
+  /**
+   * The public output of a record public on the site, or undefined. A
+   * record known to be slow is read with the larger limit (S-043b); a read
+   * that runs out of time is remembered (`SlowReads`) and thrown on.
+   */
   async function publicRecord(site: PublicSite, id: string) {
     if (!isRecordId(id)) return undefined;
-    const result = await readPublicRecord(options.publicDb, site.organizationId, site.siteId, id, {
-      baseUrl: `${site.origin}/records/`,
-      ...(options.timeLimitMs === undefined ? {} : { timeLimitMs: options.timeLimitMs }),
-    });
+    const key = slowKey(site, id);
+    const slow = slowReads.isSlow(key);
+    let result: Awaited<ReturnType<typeof readPublicRecord>>;
+    try {
+      result = await readPublicRecord(options.publicDb, site.organizationId, site.siteId, id, {
+        baseUrl: `${site.origin}/records/`,
+        ...readLimit(options.timeLimitMs, slow ? slowReads : undefined),
+      });
+    } catch (thrown) {
+      if (isDatabaseTimeout(thrown)) slowReads.timedOut(key, slow);
+      throw thrown;
+    }
+    if (slow) slowReads.answered(key);
     return result.ok ? result.value : undefined;
   }
 
@@ -601,15 +647,38 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
           shown.push(verb === "ListIdentifiers" ? gone : `<record>\n${gone}\n</record>`);
           continue;
         }
+        const key = slowKey(site, candidate.id);
+        if (scanned > 0 && slowReads.isSlow(key) && deadline - clock() < slowLimitMs) {
+          // Known to be slow (S-043b): read only with its whole larger limit
+          // left, so the page's first read next time if not.
+          exhausted = false;
+          outOfTime = true;
+          break;
+        }
         let output: Awaited<ReturnType<typeof publicRecord>>;
         try {
           output = await publicRecord(site, candidate.id);
         } catch (thrown) {
+          if (!isDatabaseTimeout(thrown)) throw thrown;
+          if (slowReads.strikes(key) >= OAI_SKIP_AFTER_STRIKES) {
+            // Too slow even at the larger limit, again (S-043b): left out,
+            // as a held-back record is, and logged for staff; the token
+            // moves past it so the harvest goes on.
+            log({
+              event: "oai_record_skipped",
+              operation: "oaiPmh",
+              name: "slow_record",
+              code: candidate.id,
+            });
+            scanned += 1;
+            after = candidate;
+            continue;
+          }
           // A read past the page's first that ran out of time (S-037): the
           // page ends before this candidate, which is read first next time,
           // so one slow read is retried instead of failing the page. The
           // page's first read timing out is the request's 503 busy.
-          if (scanned === 0 || !isDatabaseTimeout(thrown)) throw thrown;
+          if (scanned === 0) throw thrown;
           exhausted = false;
           outOfTime = true;
           break;

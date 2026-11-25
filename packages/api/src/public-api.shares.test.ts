@@ -14,10 +14,12 @@ import {
   checkPublicReaderConnection,
   grantPublicReaderRole,
   insertTemplateVersion,
+  isDatabaseTimeout,
   openDatabase,
   readPublicRecord,
   readSharedPublicRecord,
   sql,
+  TimeLimitError,
   type Database,
   type Queryable,
 } from "@oculus/db";
@@ -397,5 +399,67 @@ describe("items shared into a public site", () => {
     for (const r of refusals) {
       expect(r.ok ? [] : r.issues.map((i) => i.code)).toEqual(["not_available"]);
     }
+  });
+
+  it("JS work between a read's statements past its limit is a time limit, the server's end of the idle connection too; the pool reads on (S-043b)", async () => {
+    const item = await sharedIntoA1(w.b, w.b1, "An invented slowly shown lantern");
+    /** `baseUrlFor` runs between two statements: JS work that holds the connection `ms`. */
+    const working = (ms: number) => () => {
+      const until = Date.now() + ms;
+      while (Date.now() < until) {
+        // Busy, as a long publicOutput would be: the event loop is held too.
+      }
+      return `${PUBLIC}/records/`;
+    };
+    const read = (ms: number) =>
+      readSharedPublicRecord(reader, w.a, w.a1, item.id as never, {
+        timeLimitMs: 200,
+        baseUrlFor: working(ms),
+      }).then(
+        (result) => result,
+        (thrown: unknown) => thrown,
+      );
+    // Past the limit but not the server's margin: refused before the next
+    // statement, on a connection that stays open.
+    const near = await read(500);
+    expect(near).toBeInstanceOf(TimeLimitError);
+    expect(isDatabaseTimeout(near)).toBe(true);
+    // Far past it: the server has ended the idle connection (limit plus
+    // IDLE_MARGIN_MS) by the time the read goes on; still a time limit, not a fault.
+    const far = await read(1_700);
+    expect(far).toBeInstanceOf(TimeLimitError);
+    expect(isDatabaseTimeout(far)).toBe(true);
+    // The pool gave a fresh connection back: the next reads answer, both pool connections.
+    const again = await Promise.all([read(0), read(0)]);
+    for (const result of again) {
+      expect(result).toMatchObject({ ok: true });
+    }
+    // The route reads it as usual.
+    const reply = await get("127.0.0.1", `/records/${item.id}`);
+    expect(reply.statusCode).toBe(200);
+  });
+
+  it("readPublicRecord's own gaps are bounded on its clock (S-043b)", async () => {
+    const item = await makeObject(w, w.a, w.a1, "An invented clocked lantern");
+    await publishAs(w, w.a, item.id);
+    // Each look at the clock after the third jumps far ahead: the gap
+    // before the read's second statement is past its limit.
+    let looks = 0;
+    const clock = () => (++looks > 3 ? 1_000_000 : 0);
+    const thrown = await readPublicRecord(reader, w.a, w.a1, item.id as never, {
+      baseUrl: `${PUBLIC}/records/`,
+      timeLimitMs: 200,
+      clock,
+    }).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(thrown).toBeInstanceOf(TimeLimitError);
+    // With the real clock it answers.
+    const fine = await readPublicRecord(reader, w.a, w.a1, item.id as never, {
+      baseUrl: `${PUBLIC}/records/`,
+      timeLimitMs: 200,
+    });
+    expect(fine.ok).toBe(true);
   });
 });

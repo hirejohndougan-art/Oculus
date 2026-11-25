@@ -193,6 +193,22 @@ export class ConnectionLostError extends Error {
   }
 }
 
+/**
+ * A read stopped by its own time limit on the client's side (S-043b): the
+ * JS work between two of a public read's statements (or before its COMMIT)
+ * took longer than the read's limit, so the connection sat idle in its
+ * transaction that long. It carries SQLSTATE 57014 (query_canceled), as a
+ * statement past `statement_timeout` does, so `isDatabaseTimeout` (and
+ * `isDatabaseFailure`) read both the same way: `503 busy` on public routes.
+ */
+export class TimeLimitError extends Error {
+  readonly code = "57014";
+  constructor(message = "A read ran past its time limit between its statements.") {
+    super(message);
+    this.name = "TimeLimitError";
+  }
+}
+
 /** pg's own errors for a connection that failed or ended (they carry no code). */
 const CONNECTION_FAILURES = new Set([
   "Connection terminated",
@@ -306,7 +322,14 @@ export function openDatabase(connectionString: string, options: DatabaseOptions 
             state.broken = true;
           }
         }
-        if (state.lost !== undefined && !(error instanceof ConnectionLostError)) {
+        // A read stopped by its own time limit stays that (S-043b), even when
+        // the server has meanwhile ended the connection for idling in its
+        // transaction (`idle_in_transaction_session_timeout`).
+        if (
+          state.lost !== undefined &&
+          !(error instanceof ConnectionLostError) &&
+          !(error instanceof TimeLimitError)
+        ) {
           throw new ConnectionLostError(state.lost);
         }
         throw error;
@@ -332,7 +355,7 @@ const CONNECTION_WAITS = new Set(["timeout exceeded when trying to connect"]);
 /**
  * Whether `error` means a time limit ran out (S-037), not that the database
  * failed: a statement cancelled by `statement_timeout` (SQLSTATE 57014,
- * query_canceled), or no pooled connection free within the pool's
+ * query_canceled; or `TimeLimitError`, S-043b), or no pooled connection free within the pool's
  * `connectionTimeoutMillis`. Public reads answer these `503 busy`. Every such error is also
  * an `isDatabaseFailure`.
  */

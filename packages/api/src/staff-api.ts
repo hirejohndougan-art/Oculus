@@ -154,7 +154,9 @@ export interface ApiLogRecord {
     // The two-step alert notices (alert-notices.ts): people notified, as `code`.
     | "alert_notices"
     // Software updates (T-060): the step in `operation`, a version in `code`.
-    | "update_event";
+    | "update_event"
+    // OAI-PMH left a record out of a list as too slow to read (S-043b): its ID as `code`.
+    | "oai_record_skipped";
   readonly operation?: string;
   readonly code?: string;
   readonly name?: string;
