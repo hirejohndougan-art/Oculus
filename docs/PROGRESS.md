@@ -2,6 +2,15 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 14:10 CT — build (BUILD MODE) — S-054a Wrong-code counters locked in key order; an admin reset forgets the unexplained codes
+- Result: done (S-054 split into S-054a, S-054b and S-054c)
+- What changed: second-factor.ts `giveBackCodeAttempt` and `clearCodeAttempts`, and sessions.ts `runCleanup`'s delete, lock their `second_step_throttles` rows with `SELECT … ORDER BY key FOR UPDATE` in a CTE first, the order `takeCodeAttempt` takes (no possible 40P01 with an attempt); `resetSecondFactor` deletes the person's `wrong:` row with `user:`. Four tests in second-factor.test.ts, all failing without the change (three races on a connection with index scans off and the earlier key's row moved to the end of the table; one reset then cleanup). Source: PostgreSQL 16 docs, SELECT "The Locking Clause" and §13.3.4 Deadlocks.
+- Gate fixes on main (main failed the gate here after T-072 and T-018c merged): ESLint ran out of memory at Node's default heap, so `npm run lint` now runs ESLint with a 4 GB heap (rules and files unchanged); two tests that were wrong, not the code, now wait for what they describe: T-072's SIGKILL test killed the decoder during start-up (answered `failed`, 2 runs in 3), T-018c's publish-check race started the save before the check held the lock (failed under load).
+- Decisions: D-077 amended (S-054a)
+- Review: one independent round: safe. Notes: the reset drops a guesser's codes under an hour old (accepted in D-077; the code comment now says the cleanup is assumed hourly); an attempt in flight across a reset can still write a `wrong:` row (added to S-054b).
+- Gate: PASS · tests_passing 5145 (was 5141) · npm audit clean
+- Next: S-054b (then S-054c, S-056)
+
 ## 2026-11-25 14:30 CT — manual (Chat A) — T-072 Safe server-side thumbnails
 
 - **Done:** thumbnails are back on (D-097). Every decode runs in its own child process with an in-child watchdog that kills it past a 352 MiB growth cap (also on its deadline, and when its parent is gone), plus the parent's sampler as a second layer. The server only reads a 64 KiB header; strict JPEG segment lengths, sampling factors up to 4, VP8L and VP8L-compressed ALPH planned per group and every prefix code checked complete, segment, chunk and frame count caps. Failed spawns, descriptor exhaustion and outside kills are all handled. WebP originals are untouched; thumbnails are JPEG.
