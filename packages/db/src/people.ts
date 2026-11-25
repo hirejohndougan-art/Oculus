@@ -553,13 +553,20 @@ export type AuditEntry =
   | {
       readonly type: "system";
       readonly at: string;
-      /** `user:<id>`, or `command_line` for the release command on the server. */
+      /**
+       * `user:<id>`, `command_line` for a command on the server, or `timer`
+       * for the daily purge (S-052).
+       */
       readonly actor: string;
       readonly actorName: string | null;
       readonly eventId: string;
       readonly kind: SystemEventKind;
+      /** The version after an update; "" for a purge (S-052). */
       readonly version: string;
       readonly fromVersion: string | null;
+      /** A purge's contents and bytes (S-052); null for an update. */
+      readonly files: number | null;
+      readonly bytes: number | null;
     };
 
 export interface AuditPage {
@@ -614,6 +621,8 @@ interface AuditRow {
   invited_email: string | null;
   version_to: string | null;
   version_from: string | null;
+  file_count: number | null;
+  byte_count: number | null;
 }
 
 /**
@@ -661,7 +670,8 @@ export async function readAuditTrail(
                AS deleted,
              NULL::text AS event_id, NULL::text AS kind, NULL::uuid AS subject_id,
              NULL::text AS role, NULL::text AS site_id, NULL::text AS scope,
-             NULL::uuid AS invitation_id, NULL::text AS version_to, NULL::text AS version_from
+             NULL::uuid AS invitation_id, NULL::text AS version_to, NULL::text AS version_from,
+             NULL::integer AS file_count, NULL::bigint AS byte_count
       FROM public.record_versions v
       WHERE ${wantRecords}::boolean
         AND v.organization_id = ${organizationId}::uuid
@@ -677,7 +687,7 @@ export async function readAuditTrail(
       SELECT 'people', e.occurred_at, 'e' || e.id::text,
              'user:' || e.actor_id::text, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
              e.id::text, e.kind, e.subject_id, e.role, e.site_id::text,
-             e.scope_record_id::text, e.invitation_id, NULL, NULL
+             e.scope_record_id::text, e.invitation_id, NULL, NULL, NULL, NULL
       FROM public.people_events e
       WHERE ${wantPeople}::boolean
         AND e.organization_id = ${organizationId}::uuid
@@ -691,9 +701,11 @@ export async function readAuditTrail(
       -- Changes to the server itself (T-060a): no organization's, so only
       -- for system managers (scope.system).
       SELECT 'system', s.occurred_at, 's' || s.id::text,
-             CASE WHEN s.actor_id IS NULL THEN 'command_line' ELSE 'user:' || s.actor_id::text END,
+             CASE WHEN s.actor_id IS NOT NULL THEN 'user:' || s.actor_id::text
+                  WHEN s.source IN ('timer', 'lease') THEN s.source ELSE 'command_line' END,
              NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-             s.id::text, s.kind, NULL, NULL, NULL, NULL, NULL, s.version, s.from_version
+             s.id::text, s.kind, NULL, NULL, NULL, NULL, NULL, s.version, s.from_version,
+             s.file_count, s.byte_count
       FROM public.system_events s
       WHERE ${wantSystem}::boolean
         AND (${actor}::uuid IS NULL OR s.actor_id = ${actor}::uuid)
@@ -706,7 +718,8 @@ export async function readAuditTrail(
            x.actor, an.display_name AS actor_name, x.record_id, x.version, x.action, x.title,
            x.record_kind, x.changed_fields, x.reason, x.deleted, x.event_id, x.kind,
            x.subject_id::text AS subject_id, sn.display_name AS subject_name, x.role,
-           x.site_id, x.scope, i.email AS invited_email, x.version_to, x.version_from
+           x.site_id, x.scope, i.email AS invited_email, x.version_to, x.version_from,
+           x.file_count, x.byte_count::float8 AS byte_count
     FROM entries x
     LEFT JOIN names an ON 'user:' || an.id::text = x.actor
     LEFT JOIN names sn ON sn.id = x.subject_id
@@ -728,6 +741,8 @@ export async function readAuditTrail(
           kind: (r.kind ?? "update_installed") as SystemEventKind,
           version: r.version_to ?? "",
           fromVersion: r.version_from,
+          files: r.file_count,
+          bytes: r.byte_count,
         })
       : r.type === "record"
         ? Object.freeze({

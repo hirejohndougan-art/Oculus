@@ -30,6 +30,7 @@ const ALL_TABLES = [
   "accessions",
   "donor_contacts",
   "dublin_core_mappings",
+  "file_purge_steps",
   "file_scan_events",
   "file_scans",
   "file_store_binding",

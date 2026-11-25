@@ -139,6 +139,9 @@ export type {
 export type { RecordDeletion, RecordDeletionResult } from "./record-delete.js";
 export {
   grantWriterRole,
+  grantIdentityRead,
+  identityGrantHint,
+  reservedRoleName,
   checkWriterConnection,
   grantPublicReaderRole,
   checkPublicReaderConnection,
@@ -417,7 +420,11 @@ export {
   lockFileStoreLease,
   insertFileStoreEpoch,
   databaseIdentity,
-  PLACING_GRACE_SECONDS,
+  identityKnown,
+  currentFingerprint,
+  TRASH_GRACE_SECONDS,
+  trashedContents,
+  insertFilePurgeStep,
   existingOrganizations,
   readFileStoreBinding,
   insertFileStoreBinding,
@@ -428,6 +435,7 @@ export type {
   StoredFile,
   StoredFileEventKind,
   PurgeCandidate,
+  TrashedContent,
   FileStoreLease,
 } from "./stored-files.js";
 export {
@@ -541,7 +549,7 @@ export {
   SYSTEM_EVENT_TABLE_PRIVILEGES,
   insertSystemEvent,
 } from "./system-events.js";
-export type { NewSystemEvent, SystemEventKind } from "./system-events.js";
+export type { NewFilePurgeEvent, NewSystemEvent, SystemEventKind } from "./system-events.js";
 export { runSetupCli, terminalAsk } from "./setup-cli.js";
 export type { Ask } from "./setup-cli.js";
 export { backup, BackupError } from "./backup.js";

@@ -514,8 +514,11 @@ describe("uploads: what is stored", () => {
       name: null,
     });
     expect(raw.json).toEqual({ error: "bad_file_name" });
-    // Everything stored is under the folder, named by organization and hash.
-    for (const path of filesUnder(filesDir).filter((p) => p !== STORE_MARKER)) {
+    // Everything stored is under the folder, named by organization and hash
+    // (beside the marker and the lease lock's generations, S-052).
+    for (const path of filesUnder(filesDir).filter(
+      (p) => p !== STORE_MARKER && !p.startsWith(".oculus-lease."),
+    )) {
       expect(path).toMatch(/^[0-9a-f-]{36}\/sha256\/[0-9a-f]{2}\/[0-9a-f]{64}$/);
     }
     expect(existsSync(join(filesDir, "..", "passwd"))).toBe(false);
@@ -797,14 +800,12 @@ describe("removing files", () => {
     const copy = store.pathFor(w.a, sha(body));
     const service = createService(w.db, { files: store });
     await backdate(w.db, { fileId }, "8 days");
-    // The automatic sweep never deletes a stored copy, however old, and
-    // there is no purge in this version (fifth review).
+    // The automatic sweep never deletes a stored copy, however old; the
+    // purge (S-052) keeps it too: by the file system's clock the copy was
+    // used just now, whatever the database's clock says.
     const swept = await service.sweepFiles(0);
     expect(swept).toMatchObject({ unbound: false, failed: 0 });
-    expect(await service.purgeFiles({ apply: true })).toEqual({
-      ok: false,
-      problem: "not_available",
-    });
+    expect((await service.purgeFiles({ apply: true })).ok).toBe(true);
     expect(readFileSync(copy).equals(body)).toBe(true);
     expect(filesUnder(filesDir).filter((p) => p.includes("trash"))).toEqual([]);
     // The log holds the intent, the attach and the removal, by whom.
@@ -843,23 +844,8 @@ describe("removing files", () => {
   });
 });
 
-describe("purging is off in this version (D-086, fifth review)", () => {
-  it("refuses every purge before reading or changing anything", async () => {
-    const service = createService(w.db, { files: store });
-    const marker = readFileSync(join(filesDir, STORE_MARKER), "utf8");
-    const lease = (await readFileStoreLease(w.db))?.epoch;
-    for (const options of [
-      { apply: false },
-      { apply: true },
-      { apply: true, only: [`${w.a}/${"ab".repeat(32)}`] },
-    ]) {
-      expect(await service.purgeFiles(options)).toEqual({ ok: false, problem: "not_available" });
-    }
-    expect(readFileSync(join(filesDir, STORE_MARKER), "utf8")).toBe(marker);
-    expect((await readFileStoreLease(w.db))?.epoch).toBe(lease);
-  });
-
-  it("keeps the rule a later purge starts from: old removals and old failed attaches only, never a removal's grace cut short", async () => {
+describe("the purge's rule on the database's side (S-052)", () => {
+  it("takes only old removals with the copy's time logged: never a failed attach, a relapse, a re-attach or unknown content", async () => {
     const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented purge scan"));
     // An orphan: an attach placed its copy two days ago and never committed.
     const orphan = fakePng(810);
@@ -909,8 +895,13 @@ describe("purging is off in this version (D-086, fifth review)", () => {
     const stray = sha(fakePng(840));
 
     const hashes = [orphan, relapse, back, old].map(sha).concat(stray);
-    const listed = (await purgeCandidates(w.db, w.a, hashes, null)).map((c) => c.sha256);
-    expect(listed.sort()).toEqual([sha(orphan), sha(old)].sort());
+    const listed = (await purgeCandidates(w.db, w.a, null, hashes)).map((c) => c.sha256);
+    expect(listed).toEqual([sha(old)]);
+    // The removal logged the copy's own time.
+    const [candidate] = await purgeCandidates(w.db, w.a, null, [sha(old)]);
+    expect(candidate?.copyMtimeNs).toBe(
+      statSync(store.pathFor(w.a, sha(old)), { bigint: true }).mtimeNs,
+    );
     // Nothing was deleted.
     for (const kept of [orphan, relapse, back, old]) {
       expect(readFileSync(store.pathFor(w.a, sha(kept))).equals(kept)).toBe(true);
@@ -1028,7 +1019,7 @@ describe("the files folder belongs to one install", () => {
       const blind: Database = {
         rows: (q) =>
           Sql.parts(q).join("").includes("pg_control_system")
-            ? Promise.reject(new Error("permission denied"))
+            ? Promise.reject(Object.assign(new Error("permission denied"), { code: "42501" }))
             : db.rows(q),
         execute: (q) => db.execute(q),
         transaction: (work) => db.transaction(work),
@@ -1050,9 +1041,10 @@ describe("the files folder belongs to one install", () => {
       for (const f of [byOid, crashed]) rmSync(f.dir, { recursive: true, force: true });
       const swept = await createService(db, { files: full.store }).sweepFiles(0);
       expect(swept).toMatchObject({ unbound: true, contents: 0, incoming: 0 });
+      // A database that never bound the folder can't purge it.
       expect(await createService(db, { files: store }).purgeFiles({ apply: true })).toEqual({
         ok: false,
-        problem: "not_available",
+        problem: "not_bound",
       });
       for (const f of [empty, foreign, full]) rmSync(f.dir, { recursive: true, force: true });
     } finally {
@@ -1111,13 +1103,19 @@ async function removeVia(db: Database, assetId: string, fileId: string): Promise
   if (!removed.ok) throw new Error(JSON.stringify(removed.issues));
 }
 
+/** Sets a content's stored copy's time `days` back (a copy last used long ago). */
+function ageCopy(body: Buffer, days: number): void {
+  const past = new Date(Date.now() - days * 86_400_000);
+  utimesSync(store.pathFor(w.a, sha(body)), past, past);
+}
+
 /** The marker as if it had stood still long enough for adopt (three renewals and a minute). */
 function quiet(): void {
   const past = new Date(Date.now() - ADOPT_QUIET_MS - 60_000);
   utimesSync(join(filesDir, STORE_MARKER), past, past);
 }
 
-describe("a second database on the folder never deletes production's files (fourth and fifth reviews)", () => {
+describe("a second database on the folder never deletes production's files (fourth and fifth reviews, S-052)", () => {
   it("R1a: a copy that removes a file production names deletes nothing, and the lease shows the sharing", async () => {
     const work = mkdtempSync(join(tmpdir(), "oculus-files-r1a-"));
     const name = `oculus_test_r1a_${randomBytes(6).toString("hex")}`;
@@ -1127,6 +1125,8 @@ describe("a second database on the folder never deletes production's files (four
       const x = fakePng(900);
       const added = await upload(asset, { as: "cataloger", body: x });
       const xId = (added.json.file as { id: string }).id;
+      // X's copy last used long ago, so by every other rule the copy could take it.
+      ageCopy(x, 10);
       await dumpTo(w.testDb.url, join(work, "a.dump"));
       // Production starts (or its hourly renewal runs): the epoch moves.
       expect(await createService(w.db, { files: store }).renewFileLease()).toBe(true);
@@ -1139,9 +1139,14 @@ describe("a second database on the folder never deletes production's files (four
       await removeVia(copy, asset, xId);
       await backdate(copy, { fileId: xId }, "8 days");
       expect(await copyService.sweepFiles(0)).toMatchObject({ failed: 0 });
+      // The copy's epoch isn't the folder's: refused before anything moves.
       expect(await copyService.purgeFiles({ apply: true })).toEqual({
         ok: false,
-        problem: "not_available",
+        problem: "lease_mismatch",
+      });
+      expect(await copyService.purgeFiles({ apply: false })).toEqual({
+        ok: false,
+        problem: "lease_mismatch",
       });
       expect(await createService(w.db, { files: store }).renewFileLease()).toBe(false);
       expect(readFileSync(store.pathFor(w.a, sha(x))).equals(x)).toBe(true);
@@ -1153,7 +1158,7 @@ describe("a second database on the folder never deletes production's files (four
     }
   }, 120_000);
 
-  it("R1b: a clone taken right after production's renewal is caught at production's next renewal", async () => {
+  it("R1b: a copy taken right after production's renewal holds nothing and writes nothing, and production keeps its lease", async () => {
     const work = mkdtempSync(join(tmpdir(), "oculus-files-r1b-"));
     const name = `oculus_test_r1b_${randomBytes(6).toString("hex")}`;
     let copy: Database | undefined;
@@ -1162,19 +1167,32 @@ describe("a second database on the folder never deletes production's files (four
       const x = fakePng(910);
       const added = await upload(asset, { as: "cataloger", body: x });
       const xId = (added.json.file as { id: string }).id;
+      ageCopy(x, 10);
       expect(await createService(w.db, { files: store }).renewFileLease()).toBe(true);
       // The copy holds the very epoch the folder has.
       await dumpTo(w.testDb.url, join(work, "a.dump"));
       copy = openDatabase(await restoreInto(join(work, "a.dump"), name), { max: 3 });
       const copyService = createService(copy, { files: store });
-      expect(await copyService.bindFileStore()).toEqual({ ok: true });
-      // Production's next hourly renewal finds the folder moved on without it.
-      expect(await createService(w.db, { files: store }).renewFileLease()).toBe(false);
+      // A dump restored is another database (its identity, in the marker,
+      // differs): even with the folder's very epoch it holds nothing, and
+      // writes nothing (S-052 reviews), so production keeps its lease.
+      const before = readFileSync(join(filesDir, STORE_MARKER), "utf8");
+      expect(await copyService.bindFileStore()).toEqual({
+        ok: true,
+        warning: "files_identity_changed",
+      });
+      expect(readFileSync(join(filesDir, STORE_MARKER), "utf8")).toBe(before);
+      expect(await createService(w.db, { files: store }).renewFileLease()).toBe(true);
       await removeVia(copy, asset, xId);
       await backdate(copy, { fileId: xId }, "8 days");
       expect(await copyService.sweepFiles(0)).toMatchObject({ failed: 0 });
-      expect((await copyService.purgeFiles({ apply: true })).ok).toBe(false);
+      // Production renewed, so the copy's epoch is behind too now.
+      expect(await copyService.purgeFiles({ apply: true })).toEqual({
+        ok: false,
+        problem: "lease_mismatch",
+      });
       expect(readFileSync(store.pathFor(w.a, sha(x))).equals(x)).toBe(true);
+      expect(await store.trashEntries(w.a)).toEqual([]);
     } finally {
       await copy?.close();
       await dropDatabase(testServerUrl(), name).catch(() => undefined);
@@ -1192,6 +1210,7 @@ describe("a second database on the folder never deletes production's files (four
       const x = fakePng(920);
       const added = await upload(asset, { as: "cataloger", body: x });
       const xId = (added.json.file as { id: string }).id;
+      ageCopy(x, 10);
       // Last night's dump; production attaches Y afterwards.
       await dumpTo(w.testDb.url, join(work, "a.dump"));
       const y = fakePng(930);
@@ -1210,17 +1229,21 @@ describe("a second database on the folder never deletes production's files (four
       expect(await restored.adoptFileStore()).toEqual({ ok: false, problem: "epoch_moving" });
       quiet();
       expect(await restored.adoptFileStore()).toEqual({ ok: true });
-      // Adopting enables nothing that deletes: X (removed before the adopt)
-      // and Y (never known to it) stay.
+      // After the adopt the restored database may purge, but only what it
+      // removes from now on: X (removed before the adopt) and Y (never known
+      // to it) stay.
       expect(await restored.sweepFiles(0)).toMatchObject({ failed: 0 });
-      expect(await restored.purgeFiles({ apply: true })).toEqual({
-        ok: false,
-        problem: "not_available",
-      });
+      const purged = await restored.purgeFiles({ apply: true });
+      expect(purged.ok && purged.value.trashed.files).toBe(0);
+      expect(await store.trashEntries(w.a)).toEqual([]);
       expect(readFileSync(store.pathFor(w.a, sha(x))).equals(x)).toBe(true);
       expect(readFileSync(store.pathFor(w.a, sha(y))).equals(y)).toBe(true);
-      // Production now finds the folder isn't its own.
+      // Production now finds the folder isn't its own, and can't purge either.
       expect(await createService(w.db, { files: store }).renewFileLease()).toBe(false);
+      expect(await createService(w.db, { files: store }).purgeFiles({ apply: true })).toEqual({
+        ok: false,
+        problem: "lease_mismatch",
+      });
     } finally {
       await copy?.close();
       await dropDatabase(testServerUrl(), name).catch(() => undefined);

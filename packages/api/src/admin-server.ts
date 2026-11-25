@@ -33,8 +33,12 @@
  *   (default 500) or `OCULUS_FILES_TOTAL_MAX_MIB` (per organization,
  *   default 20480) or the free-space floor `OCULUS_FILES_MIN_FREE_MIB`
  *   (default: 5% of the disk or 2 GiB, whichever is smaller) aren't whole
- *   numbers in range. Stale temporary files and copies no row names are
- *   swept at startup and every 15 minutes;
+ *   numbers in range, or `OCULUS_FILES_AUTO_PURGE` is anything but `on` or
+ *   `off`. Stale temporary files are swept at startup and every 15
+ *   minutes. Removed files are purged only by a system manager's button or
+ *   `npm run files:purge`, unless `OCULUS_FILES_AUTO_PURGE=on` (default
+ *   off), which runs one purge step every 25 hours (S-052: a day and an
+ *   hour, so a second step due a day after the first is never just missed);
  * - the virus scanner's settings (`OCULUS_CLAMD_*`, file-scanning.ts,
  *   S-040, D-113) are malformed. None set is fine: files are then
  *   `not_scanned` and served as before; in production that is logged as a
@@ -61,6 +65,7 @@ import {
   type PasswordResetDelivery,
 } from "@oculus/db";
 import {
+  AUTOMATIC_PURGE_EVERY_MS,
   clamdScanner,
   createService,
   createThumbnailRenderer,
@@ -100,6 +105,19 @@ export const FILES_DIR_ENV = "OCULUS_FILES_DIR";
 export const FILE_MAX_ENV = "OCULUS_FILE_MAX_MIB";
 export const FILES_TOTAL_MAX_ENV = "OCULUS_FILES_TOTAL_MAX_MIB";
 export const FILES_MIN_FREE_ENV = "OCULUS_FILES_MIN_FREE_MIB";
+/** `on` runs one purge step every 25 hours (S-052); default `off`: nothing purges on a timer. */
+export const FILES_AUTO_PURGE_ENV = "OCULUS_FILES_AUTO_PURGE";
+
+/**
+ * Whether the automatic purge is turned on: only `on` turns it on; unset,
+ * empty or `off` leaves it off; anything else refuses to start.
+ */
+export function automaticPurgeFromEnv(env: Readonly<Record<string, string | undefined>>): boolean {
+  const value = env[FILES_AUTO_PURGE_ENV]?.trim() ?? "";
+  if (value === "" || value === "off") return false;
+  if (value === "on") return true;
+  throw new Error(`refusing to start: ${FILES_AUTO_PURGE_ENV} must be on or off.`);
+}
 
 /** Why the files folder was refused, as the startup error says it (never the path). */
 const FILE_STORE_PROBLEMS: Readonly<Record<FileStoreProblem, string>> = {
@@ -487,6 +505,7 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
       );
     }
   };
+  const automaticPurge = automaticPurgeFromEnv(env);
   const key = await serverKey(options.db);
   const claim = await prepared(() => files.claimServer(key));
   if (!claim.ok) {
@@ -505,10 +524,12 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     claim.release();
     throw new Error(`refusing to start: ${FILES_DIR_ENV}: ${FILE_STORE_PROBLEMS[bound.problem]}`);
   }
-  if (bound.warning === "files_shared_or_restored") {
-    // Another database uses this folder, or this one was restored or
-    // copied: it starts, and an operator runs `files:adopt` once sure.
-    log({ event: "startup_warning", code: "files_shared_or_restored" });
+  if (bound.warning !== undefined) {
+    // Another database uses this folder, or this one was restored, copied
+    // or upgraded, or its identity can't be read, or the lease lock was
+    // busy: it starts; the purge refuses until an operator adopts the
+    // folder (or, when busy, the renewal tried again within a minute).
+    log({ event: "startup_warning", code: bound.warning });
   }
   const renew = async (): Promise<void> => {
     try {
@@ -560,6 +581,24 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   timer.unref();
   const lease = setInterval(() => void renew(), FILE_LEASE_EVERY_MS);
   lease.unref();
+  // Another server held the lease lock at the start: the renewal is tried
+  // again within a minute, not only at the hour (S-052 third review).
+  const retry =
+    bound.warning === "files_lease_busy" ? setTimeout(() => void renew(), 30_000) : undefined;
+  retry?.unref();
+  // The purge on a timer only when turned on (S-052; default off).
+  const purge = async (): Promise<void> => {
+    try {
+      const purged = await service.purgeFiles({ apply: true, via: "timer" });
+      if (!purged.ok) log({ event: "startup_warning", code: `files_purge_${purged.problem}` });
+    } catch (error) {
+      log({ event: "service_error", operation: "purgeFiles", ...redactedError(error) });
+    }
+  };
+  const purgeTimer = automaticPurge
+    ? setInterval(() => void purge(), AUTOMATIC_PURGE_EVERY_MS)
+    : undefined;
+  purgeTimer?.unref();
   // The scan queue (S-040): what is due now, then every minute. A scanner
   // that doesn't answer is logged; its scans fail and are tried again.
   let scans: ReturnType<typeof setInterval> | undefined;
@@ -578,6 +617,8 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   app.server.once("close", () => {
     clearInterval(timer);
     clearInterval(lease);
+    if (purgeTimer !== undefined) clearInterval(purgeTimer);
+    if (retry !== undefined) clearTimeout(retry);
     if (scans !== undefined) clearInterval(scans);
     claim.release();
     void thumbnails?.close();

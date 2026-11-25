@@ -39,6 +39,7 @@ export { contextFromSession, NOT_PERMITTED_MESSAGE } from "./access.js";
 export type { SessionLike } from "./access.js";
 export type { AdminOperations, MyAccess, RoleRequest } from "./admin.js";
 export { ADOPT_QUIET_MS, FILE_LEASE_RENEW_MS } from "./files.js";
+export { hostKey } from "./lease-lock.js";
 export {
   openFileStore,
   DEFAULT_MAX_FILE_BYTES,
@@ -47,8 +48,14 @@ export {
   DEFAULT_MIN_FREE_BYTES,
   DEFAULT_MIN_FREE_FRACTION,
   STORE_MARKER,
+  LEASE_LOCK,
+  LeaseLockBusy,
+  leaseGenerations,
 } from "./file-store.js";
 export type {
+  CopyStamp,
+  PlaceCheck,
+  TrashEntry,
   FileStore,
   FileStoreOptions,
   ReceivedFile,
@@ -105,11 +112,20 @@ export type {
   FileScanStatus,
   ListedFile,
   FileStoreProblem,
+  FileStoreWarning,
   FileSweep,
-  PurgeEntry,
-  PurgeProblem,
   RemoveFileOptions,
 } from "./files.js";
+export {
+  AUTOMATIC_PURGE_EVERY_MS,
+  PURGE_ACTOR,
+  PURGE_LEASE_MS,
+  type PurgeOptions,
+  type PurgeProblem,
+  type PurgeReport,
+  type PurgeResult,
+  type PurgeTotals,
+} from "./file-purge.js";
 export type {
   PeopleOperations,
   PeopleContext,

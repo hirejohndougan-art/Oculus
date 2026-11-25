@@ -3047,6 +3047,9 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
             ...options.scanQueue,
             ...(onError === undefined ? {} : { onError }),
           }),
+      (code) => {
+        onError?.(Object.assign(new Error(code), { code }), "files");
+      },
     ),
     ...shareOperations(db, run, outside),
     ...accessionOperations(run),

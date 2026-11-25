@@ -43,6 +43,8 @@ import {
   type OrganizationId,
   type Permission,
   type RecordId,
+  isUserId,
+  type UserId,
 } from "@oculus/core";
 import {
   deleteStoredFile,
@@ -51,11 +53,12 @@ import {
   findStoredFileById,
   insertFileStoreBinding,
   insertStoredFileEvent,
+  insertSystemEvent,
   databaseIdentity,
+  identityKnown,
   readFileStoreLease,
   lockFileStoreLease,
   insertFileStoreEpoch,
-  type PurgeCandidate,
   queueScan,
   rescanContents,
   scanCounts,
@@ -84,8 +87,20 @@ import {
   type Refusal,
 } from "./access.js";
 import type { Runner } from "./admin.js";
+import {
+  LeaseLockBusy,
+  type FileStore,
+  type ReceivedFile,
+  type StoreMarker,
+} from "./file-store.js";
+import {
+  restoreAllTrash,
+  runFilePurge,
+  type PurgeOptions,
+  type PurgeProblem,
+  type PurgeResult,
+} from "./file-purge.js";
 import type { FileScanQueue, ScanPass } from "./file-scans.js";
-import type { FileStore, ReceivedFile, StoreMarker } from "./file-store.js";
 import { closeSync } from "node:fs";
 import {
   THUMBNAIL_BOXES,
@@ -260,16 +275,23 @@ export interface ThumbnailOptions {
   readonly cacheOnly?: boolean;
 }
 
-/** One content the purge would delete. */
-export interface PurgeEntry extends PurgeCandidate {
-  readonly organizationId: string;
-}
+export type { PurgeProblem };
 
 /**
- * Why the purge was refused. Only `not_available` for now: purging is off
- * until it can be made safe (D-086, fifth review; S-043).
+ * Why a bound folder isn't fully this database's (`bindFileStore`): another
+ * database moved its lease, or this one was restored or copied
+ * (`files_shared_or_restored`); the epoch is ours but the marker names
+ * another identity (`files_identity_changed`: a pg_upgrade, a move, or a
+ * logical copy: only an adopt goes on); this role can't read the cluster's
+ * identity (`files_identity_unknown`: the purge never runs); or another
+ * server held the lease lock (`files_lease_busy`: the hourly renewal tries
+ * again).
  */
-export type PurgeProblem = "not_available";
+export type FileStoreWarning =
+  | "files_shared_or_restored"
+  | "files_identity_changed"
+  | "files_identity_unknown"
+  | "files_lease_busy";
 
 /** Why the files folder can't be used with this database (`bindFileStore`). */
 export type FileStoreProblem = "no_store" | "other_install" | "marker_missing" | "not_empty";
@@ -290,8 +312,8 @@ export interface FileOperations {
   ): Promise<ServiceResult<AttachedFile>>;
   /**
    * Removes one file from an asset: the same rule as attaching (the edit
-   * permission where the asset is, `If-Match`). The copy on disk stays:
-   * nothing in this version deletes a stored copy (D-086).
+   * permission where the asset is, `If-Match`). The copy on disk stays;
+   * the removal logs its time, and only the purge may free it later (S-052).
    */
   removeFile(
     context: ServiceContext,
@@ -301,8 +323,8 @@ export interface FileOperations {
   ): Promise<ServiceResult<{ readonly removed: true }>>;
   /**
    * A job, not a person's operation (no context): removes temporary files
-   * older than `incomingMaxAgeMs` in this database's organizations, and
-   * empties their trash; never a stored copy. Run at startup and on a timer.
+   * older than `incomingMaxAgeMs` in this database's organizations; never a
+   * stored copy, and never the purge's trash. Run at startup and on a timer.
    */
   sweepFiles(incomingMaxAgeMs: number): Promise<FileSweep>;
   /**
@@ -338,7 +360,7 @@ export interface FileOperations {
    * succeeds the sweep deletes nothing.
    */
   bindFileStore(): Promise<
-    | { readonly ok: true; readonly warning?: "files_shared_or_restored" }
+    | { readonly ok: true; readonly warning?: FileStoreWarning }
     | { readonly ok: false; readonly problem: FileStoreProblem }
   >;
   /**
@@ -348,19 +370,13 @@ export interface FileOperations {
    */
   renewFileLease(): Promise<boolean>;
   /**
-   * The operator's purge: not available in this version (D-086, fifth
-   * review). A copy of the database whose epoch still matched the marker
-   * could purge content production had attached again since, so removed
-   * files keep their space until a later version adds a safe purge (S-043).
-   * Always refused with `not_available`; nothing is read or changed.
+   * The purge of removed files (S-052, file-purge.ts): one step of it under
+   * the folder's lease, or with `apply: false` a dry run that changes
+   * nothing. Not a person's operation: the caller checks who may (system
+   * managers, with a recent sign-in, from the admin; the operator on the
+   * command line).
    */
-  purgeFiles(options: { readonly apply: boolean; readonly only?: readonly string[] }): Promise<
-    | {
-        readonly ok: true;
-        readonly value: { readonly candidates: readonly PurgeEntry[]; readonly deleted: number };
-      }
-    | { readonly ok: false; readonly problem: PurgeProblem }
-  >;
+  purgeFiles(options: PurgeOptions): Promise<PurgeResult>;
   /**
    * `npm run files:adopt`: makes this database the folder's own again after
    * a restore or a copy: a new epoch, this database's identity in the
@@ -453,6 +469,15 @@ async function waitFor<T>(read: () => Promise<T | undefined>): Promise<T | undef
   return undefined;
 }
 
+/** What a renewal found (`renewLease`). */
+type LeaseState = "held" | "identity_changed" | "identity_unknown" | "shared";
+
+const LEASE_WARNINGS: Readonly<Record<Exclude<LeaseState, "held">, FileStoreWarning>> = {
+  identity_changed: "files_identity_changed",
+  identity_unknown: "files_identity_unknown",
+  shared: "files_shared_or_restored",
+};
+
 export function fileOperations(
   db: Database,
   run: Runner,
@@ -467,6 +492,8 @@ export function fileOperations(
   } = {},
   thumbnailsEnabled: boolean = THUMBNAILS_ENABLED,
   scans?: FileScanQueue,
+  /** Where a warning goes (the service's `onError`): a code, never a path or name. */
+  warn: (code: string) => void = () => undefined,
 ): FileOperations {
   const scanning = scans !== undefined && store !== undefined;
   /** The largest upload taken: the store's cap, and the scanner's while scanning is on. */
@@ -483,6 +510,19 @@ export function fileOperations(
       "too_large_to_scan",
       "The file is larger than the virus scanner takes, so it couldn't be scanned or downloaded.",
     );
+  /**
+   * A touch the file system wouldn't let change the copy's time: the attach
+   * still succeeds, the event says so (the purge then never takes the
+   * content), and a warning is logged.
+   */
+  const untouchable = (touched: "touched" | "missing" | "unchanged"): boolean => {
+    if (touched !== "unchanged") return false;
+    warn("copy_time_unchanged");
+    return true;
+  };
+  /** A `user:<id>` actor's user ID, for the change log; null for any other. */
+  const userOf = (actor: string): UserId | null =>
+    actor.startsWith("user:") && isUserId(actor.slice(5)) ? (actor.slice(5) as UserId) : null;
   const atOnce = thumbnailLimits.atOnce ?? THUMBNAILS_AT_ONCE;
   const perMinute = thumbnailLimits.perMinute ?? THUMBNAILS_PER_MINUTE;
   let renderer = thumbnails;
@@ -655,48 +695,75 @@ export function fileOperations(
     });
   }
 
+  /** A marker poisoned by a lease found moved: its database line says so. */
+  const POISONED = "poisoned:";
+
   /**
-   * The lease (D-086, fourth review): if the marker's epoch is this
-   * database's current one, a new epoch is committed here and then put in
-   * the marker; `true`. Otherwise (another database uses the folder, or
-   * this one was restored or copied) nothing here changes, the marker gets
-   * an epoch no database holds, so neither side's lease matches until an
-   * operator runs `files:adopt`, and `false`. A mismatch is looked at again
-   * twice a second apart first: another server of this database may be
-   * between its commit and its rename.
+   * The lease (D-086, fourth review; S-052 second review). Under the
+   * folder's lease lock: if the marker's epoch is this database's current
+   * one and it names this database's identity, a new epoch is committed
+   * here and then put in the marker: `held` (or `identity_unknown` when the
+   * identity is only `-:<oid>`: the purge never runs). If it names another
+   * identity, nothing is written: `identity_changed`. Otherwise (another
+   * database uses the folder, or this one was restored or copied) nothing
+   * here changes, and the marker is poisoned once (an epoch no database
+   * holds, its database line `poisoned:…`), never again while it stays so,
+   * so an adopt can find it quiet; everything in the trash goes back;
+   * `shared`. A mismatch is looked at again twice a second apart first.
+   * Errors reading the marker or the database are thrown, never taken as a
+   * mismatch.
    */
-  async function renewLease(): Promise<boolean> {
-    if (store === undefined) return false;
+  async function renewLease(): Promise<LeaseState> {
+    if (store === undefined) return "shared";
     const bound = store.boundTo();
-    if (bound === undefined) return false;
+    if (bound === undefined) return "shared";
     const identity = await databaseIdentity(db);
     for (let attempt = 0; attempt < 3; attempt++) {
       const epoch = randomUUID();
-      const renewed = await db.transaction(async (tx) => {
-        await lockFileStoreLease(tx);
-        const marker = await store.readMarker().catch(() => undefined);
-        const lease = await readFileStoreLease(tx);
-        if (marker?.storeId !== bound || lease === undefined || marker.epoch !== lease.epoch) {
-          return false;
-        }
-        await insertFileStoreEpoch(tx, epoch, "renew", identity);
-        return true;
-      });
-      if (renewed) {
+      const renewed = await store.withLeaseLock(async (held) => {
+        // Still this holder's (not paused past it) before anything is written.
+        if (!(await held())) throw new LeaseLockBusy();
+        const moved = await db.transaction(async (tx) => {
+          await lockFileStoreLease(tx);
+          const marker = await store.readMarker();
+          const lease = await readFileStoreLease(tx);
+          if (marker?.storeId !== bound || lease === undefined || marker.epoch !== lease.epoch) {
+            return undefined;
+          }
+          // The epoch is ours but the marker names another identity (this
+          // database after a pg_upgrade or a dump-and-restore, or a copy of the
+          // one that uses the folder): nothing is written, so a copy that
+          // starts takes nothing from the folder's owner, until an operator
+          // adopts the folder (S-052 second and fourth reviews).
+          if (marker.database !== identity) return "identity_changed" as const;
+          await insertFileStoreEpoch(tx, epoch, "renew", identity);
+          return "moved" as const;
+        });
+        if (moved === undefined || moved === "identity_changed") return moved;
+        // (Committed, but not held any more: the marker is left as it is,
+        // and the next renewal finds the two apart, the safe way.)
+        if (!(await held())) throw new LeaseLockBusy();
         await store.replaceMarker({ storeId: bound, database: identity, epoch });
-        return true;
-      }
+        return identityKnown(identity) ? ("held" as const) : ("identity_unknown" as const);
+      });
+      if (renewed !== undefined) return renewed;
       if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 1000));
     }
-    const marker = await store.readMarker().catch(() => undefined);
-    if (marker?.storeId === bound) {
-      await store.replaceMarker({
-        storeId: bound,
-        database: marker.database ?? identity,
-        epoch: randomUUID(),
-      });
-    }
-    return false;
+    await store.withLeaseLock(async (held) => {
+      const marker = await store.readMarker();
+      if (!(await held())) throw new LeaseLockBusy();
+      if (marker?.storeId === bound && marker.database?.startsWith(POISONED) !== true) {
+        await store.replaceMarker({
+          storeId: bound,
+          database: `${POISONED}${marker.database ?? identity}`.slice(0, 100),
+          epoch: randomUUID(),
+        });
+      }
+    });
+    // Neither side may purge now: whatever a purge put in the trash goes
+    // back (S-052).
+    await restoreAllTrash(db, store).catch(() => undefined);
+    return "shared";
   }
 
   function diskFull(): ServiceRefusal {
@@ -767,20 +834,26 @@ export function fileOperations(
             }
             const refused = await attachable(tx, who, recordId, options.expectedVersion);
             if (refused) return refused;
+            // A copy already there shows its last use in its own times (by
+            // the file system's clock): the purge relies on it (S-052).
+            const touched = await store.touch(who.organizationId, received.sha256);
             await insertStoredFileEvent(
               tx,
               who.organizationId,
               "placing",
               { id: fileId, recordId, sha256: received.sha256, size: received.size },
               who.actor,
+              undefined,
+              untouchable(touched),
             );
-            // A copy already there shows its last use in its own times (by
-            // the file system's clock): a later purge relies on it (S-043).
-            await store.touch(who.organizationId, received.sha256);
             return { ok: true, value: true };
           },
         );
         if (!intent.ok) return intent;
+        // What is at the content path, hashed before any lock is taken: the
+        // attach's `place` only checks it is still the same (no hashing
+        // under the file lock, S-052 second review).
+        const prior = await store?.inspect(received).catch(() => undefined);
         const attached = await run(
           "attachFile",
           context,
@@ -809,6 +882,17 @@ export function fileOperations(
             const refused = await attachable(tx, who, recordId, options.expectedVersion);
             if (refused) return refused;
             await lockOrganizationFiles(tx, who.organizationId);
+            // A copy the purge moved to the trash comes back first (S-052),
+            // in the change log.
+            const back = await store.restoreFromTrash(who.organizationId, received.sha256);
+            if (back !== "none") {
+              await insertSystemEvent(tx, {
+                actorId: userOf(who.actor),
+                kind: "files_restored",
+                files: 1,
+                bytes: received.size,
+              });
+            }
             const existing = await findStoredFile(
               tx,
               who.organizationId,
@@ -817,9 +901,28 @@ export function fileOperations(
             );
             if (existing !== undefined) {
               // The copy on disk was placed when that row was made; touched,
-              // as every attach touches it. Its scan queued as any upload's
-              // (an unscanned content uploaded again waits for its scan).
-              await store.touch(who.organizationId, received.sha256);
+              // as every attach touches it. If it is missing (or isn't a
+              // plain copy of ours), the bytes just received put it back
+              // (review B2).
+              let touched = await store.touch(who.organizationId, received.sha256);
+              if (touched === "missing") {
+                await store.place(received, prior);
+                touched = await store.touch(who.organizationId, received.sha256);
+              }
+              if (untouchable(touched)) {
+                // Recorded, so the purge never takes this content.
+                await insertStoredFileEvent(
+                  tx,
+                  who.organizationId,
+                  "placing",
+                  { id: fileId, recordId, sha256: received.sha256, size: received.size },
+                  who.actor,
+                  undefined,
+                  true,
+                );
+              }
+              // Its scan queued as any upload's (S-040: an unscanned content
+              // uploaded again waits for its scan).
               if (scanning) await queueScan(tx, who.organizationId, received.sha256);
               return { ok: true, value: Object.freeze({ file: existing, created: false }) };
             }
@@ -840,13 +943,21 @@ export function fileOperations(
               createdBy: who.actor,
               createdAt: new Date(Math.floor(now.getTime())),
             });
-            await insertStoredFileEvent(tx, who.organizationId, "attached", file, who.actor);
             // Its scan queued with the row (S-040): content already known
             // keeps its result, so infected bytes stay quarantined.
             if (scanning) await queueScan(tx, who.organizationId, received.sha256);
             // Last, still under the file lock: the bytes at their content path.
-            await store.place(received);
-            await store.touch(who.organizationId, received.sha256);
+            await store.place(received, prior);
+            const touched = await store.touch(who.organizationId, received.sha256);
+            await insertStoredFileEvent(
+              tx,
+              who.organizationId,
+              "attached",
+              file,
+              who.actor,
+              undefined,
+              untouchable(touched),
+            );
             return { ok: true, value: Object.freeze({ file, created: true }) };
           },
         );
@@ -886,8 +997,13 @@ export function fileOperations(
           if (!(await deleteStoredFile(tx, who.organizationId, recordId, fileId))) {
             return refusal(["fileId"], "unknown_file", "The record has no such file.");
           }
-          // Logged; the log also keeps the bytes for REMOVED_FILE_GRACE_SECONDS.
-          await insertStoredFileEvent(tx, who.organizationId, "removed", file, who.actor);
+          // Logged, with the copy's own time (S-052): the purge takes the
+          // copy only while its time is still this one.
+          // A time before 1970 is logged as none: the removal still works,
+          // and that copy is never purged.
+          const stamp = await store?.copyStamp(who.organizationId, file.sha256);
+          const mtime = stamp !== undefined && stamp.mtimeNs >= 0n ? stamp.mtimeNs : undefined;
+          await insertStoredFileEvent(tx, who.organizationId, "removed", file, who.actor, mtime);
           return { ok: true, value: Object.freeze({ removed: true as const }) };
         },
       );
@@ -939,14 +1055,22 @@ export function fileOperations(
       if (marker === undefined) return { ok: false, problem: "marker_missing" };
       if (marker.storeId !== held) return { ok: false, problem: "other_install" };
       store.bind(held);
-      // The lease: a new epoch now, if the folder's still matches ours.
-      const renewed = await renewLease();
-      return renewed ? { ok: true } : { ok: true, warning: "files_shared_or_restored" };
+      // The lease: a new epoch now, if the folder's still matches ours. A
+      // lease lock another server holds doesn't stop the start: the hourly
+      // renewal tries again.
+      let state: LeaseState;
+      try {
+        state = await renewLease();
+      } catch (error) {
+        if (error instanceof LeaseLockBusy) return { ok: true, warning: "files_lease_busy" };
+        throw error;
+      }
+      return state === "held" ? { ok: true } : { ok: true, warning: LEASE_WARNINGS[state] };
     },
 
     async renewFileLease() {
       if (store?.boundTo() === undefined) return false;
-      return renewLease();
+      return (await renewLease()) !== "shared";
     },
 
     async sweepFiles(incomingMaxAgeMs) {
@@ -963,9 +1087,8 @@ export function fileOperations(
       if (bound === undefined || bound !== (await readFileStoreBinding(db))) {
         return { ...none, unbound: true };
       }
-      // Never a stored copy: only temporary uploads, and the trash a purge
-      // left (a purge stopped between moving copies aside and deleting them),
-      // in this database's organizations' folders only.
+      // Never a stored copy and never the purge's trash: only temporary
+      // uploads, in this database's organizations' folders only.
       const onDisk = await store.organizations();
       const known = await existingOrganizations(db, onDisk);
       const ours = onDisk.filter((id) => known.has(id));
@@ -976,39 +1099,50 @@ export function fileOperations(
       } catch {
         failed++;
       }
-      let contents = 0;
-      for (const organizationId of ours) {
-        try {
-          contents += await store.emptyTrash(organizationId);
-        } catch {
-          failed++;
-        }
-      }
-      return Object.freeze({ incoming, contents, skipped: 0, unknown: 0, failed, unbound: false });
+      return Object.freeze({
+        incoming,
+        contents: 0,
+        skipped: 0,
+        unknown: 0,
+        failed,
+        unbound: false,
+      });
     },
 
-    purgeFiles() {
-      // Off until S-043 (see the interface): refused before anything is read.
-      return Promise.resolve({ ok: false, problem: "not_available" });
+    async purgeFiles(options) {
+      // A copy of this database with the folder's epoch: poisoned, and the
+      // trash put back, as a renewal would (review B1a).
+      return runFilePurge(db, store, options);
     },
 
     async adoptFileStore() {
       if (store === undefined) return { ok: false, problem: "no_store" };
       const held = await readFileStoreBinding(db);
-      const marker = await store.readMarker().catch(() => undefined);
+      const marker = await store.readMarker();
       if (marker === undefined) return { ok: false, problem: "marker_missing" };
       if (held === undefined || marker.storeId !== held)
         return { ok: false, problem: "other_install" };
-      // Another database still moving the epoch: not now.
+      // Another database still moving the epoch: not now. This is also the
+      // only way on after a pg_upgrade or any other identity change (S-052
+      // fourth review): the marker must have stood still for three hours.
       const age = await store.markerAge();
       if (age === undefined || age < ADOPT_QUIET_MS) return { ok: false, problem: "epoch_moving" };
       const identity = await databaseIdentity(db);
       const epoch = randomUUID();
-      await db.transaction(async (tx) => {
-        await lockFileStoreLease(tx);
-        await insertFileStoreEpoch(tx, epoch, "adopt", identity);
+      const adopted = await store.withLeaseLock(async (stillHeld) => {
+        // Looked at again inside the lock: nothing may have moved the marker
+        // since (fifth review).
+        const quiet = await store.markerAge();
+        if (quiet === undefined || quiet < ADOPT_QUIET_MS || !(await stillHeld())) return false;
+        await db.transaction(async (tx) => {
+          await lockFileStoreLease(tx);
+          await insertFileStoreEpoch(tx, epoch, "adopt", identity);
+        });
+        if (!(await stillHeld())) return false;
+        await store.replaceMarker({ storeId: held, database: identity, epoch });
+        return true;
       });
-      await store.replaceMarker({ storeId: held, database: identity, epoch });
+      if (!adopted) return { ok: false, problem: "epoch_moving" };
       store.bind(held);
       return { ok: true };
     },

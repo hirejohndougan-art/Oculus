@@ -28,7 +28,14 @@ import { hostname, tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { newOrganizationId } from "@oculus/core";
-import { STORE_MARKER, openFileStore, type FileStore } from "./file-store.js";
+import {
+  LEASE_LOCK,
+  STORE_MARKER,
+  leaseGenerations,
+  openFileStore,
+  type FileStore,
+} from "./file-store.js";
+import { hostKey } from "./lease-lock.js";
 
 /**
  * `lstat` as the store calls it, passed through, but able to run something
@@ -324,9 +331,6 @@ describe("the safety and limits added after review", () => {
     await store.discard(got.file);
     expect(await store.organizations()).toContain(other);
     expect(await store.contents(other)).toEqual([sha(body)]);
-    await store.trash(other, sha(body));
-    expect(await store.contents(other)).toEqual([]);
-    expect(await store.emptyTrash(other)).toBe(1);
     rmSync(join(dir, other), { recursive: true, force: true });
   });
 });
@@ -414,13 +418,26 @@ describe("the second review's changes", () => {
     // PID that this process doesn't hold (left by an earlier process).
     const gone = join(folder, `${host}-999999999-0123456789abcdef`);
     const earlier = join(folder, `${host}-${String(process.pid)}-fedcba9876543210`);
-    writeFileSync(gone, "7001:20000|copy|5432\n");
-    writeFileSync(earlier, "7001:20000|copy|5432\n");
+    // (Notes say which host, boot and PID namespace their PID belongs to.)
+    writeFileSync(gone, `7001:20000|copy|5432\n${hostKey() ?? "-"}\n`);
+    writeFileSync(earlier, `7001:20000|copy|5432\n${hostKey() ?? "-"}\n`);
     const later = await own.claimServer("7001:16384|oculus|5432");
     expect(later.ok).toBe(true);
     expect(existsSync(gone)).toBe(false);
     expect(existsSync(earlier)).toBe(false);
     if (later.ok) later.release();
+    // A note from another PID namespace (another container): its PID means
+    // nothing here, so only its age counts. Fresh, it refuses; 30 minutes
+    // still, it is gone (S-052 third review).
+    const elsewhere = join(folder, `${host}-1-0123456789abcdef`);
+    writeFileSync(elsewhere, "7001:20000|copy|5432\nhost|other-boot|pid:[1]\n");
+    expect((await own.claimServer("7001:16384|oculus|5432")).ok).toBe(false);
+    const old = new Date(Date.now() - 31 * 60_000);
+    utimesSync(elsewhere, old, old);
+    const after = await own.claimServer("7001:16384|oculus|5432");
+    expect(after.ok).toBe(true);
+    expect(existsSync(elsewhere)).toBe(false);
+    if (after.ok) after.release();
     if (first.ok) first.release();
     expect(notes()).toEqual([]);
     expect(await own.isEmpty()).toBe(true);
@@ -437,10 +454,10 @@ describe("the second review's changes", () => {
     const path = own.pathFor(org, got.file.sha256);
     const past = new Date(Date.now() - 30 * 86_400_000);
     utimesSync(path, past, past);
-    expect(await own.touch(org, got.file.sha256)).toBe(true);
+    expect(await own.touch(org, got.file.sha256)).toBe("touched");
     expect(Date.now() - statSync(path).mtimeMs).toBeLessThan(60_000);
     // None there.
-    expect(await own.touch(org, "0".repeat(64))).toBe(false);
+    expect(await own.touch(org, "0".repeat(64))).toBe("missing");
     // A link where the copy should be is never followed.
     const target = join(fresh, "elsewhere");
     writeFileSync(target, "x");
@@ -448,7 +465,7 @@ describe("the second review's changes", () => {
     const linked = "a".repeat(64);
     mkdirSync(dirname(own.pathFor(org, linked)), { recursive: true });
     symlinkSync(target, own.pathFor(org, linked));
-    expect(await own.touch(org, linked)).toBe(false);
+    expect(await own.touch(org, linked)).toBe("missing");
     expect(Date.now() - lstatSync(target).mtimeMs).toBeGreaterThan(86_400_000);
     rmSync(fresh, { recursive: true, force: true });
   });
@@ -580,15 +597,237 @@ describe("the second review's changes", () => {
     await store.discard(done.file);
     const listed = await store.listContents(other);
     expect(listed).toEqual({ hashes: [done.file.sha256], skipped: 0 });
-    await store.trash(other, done.file.sha256);
+    const hash = done.file.sha256;
+    // The purge's two steps (S-052): only while the copy's time is the one given.
+    const stamp = await store.copyStamp(other, hash);
+    if (stamp === undefined) throw new Error("no stamp");
+    expect(stamp.size).toBe(done.file.size);
+    expect(await store.trashContent(other, hash, stamp.mtimeNs + 1n)).toBe("changed");
+    expect(await store.contents(other)).toEqual([hash]);
+    await store.writeThumbnail(other, hash, "small", "none");
+    expect(await store.trashContent(other, hash, stamp.mtimeNs)).toBe("trashed");
     expect(await store.contents(other)).toEqual([]);
-    expect(await store.emptyTrash(other)).toBe(1);
-    expect(tree().filter((p) => p.includes(other))).toEqual([]);
-    // Something that isn't a regular file at a content path is counted, never removed.
+    expect(await store.readThumbnail(other, hash, "small")).toBeUndefined();
+    const [entry] = await store.trashEntries(other);
+    expect(entry).toMatchObject({ sha256: hash, size: done.file.size, mtimeNs: stamp.mtimeNs });
+    expect(Number.isFinite(entry?.markedMs)).toBe(true);
+    expect(readdirSync(join(dir, other, "trash", hash)).sort()).toEqual([
+      "content",
+      "marked",
+      "thumbnail-small-v1.none",
+    ]);
+    expect(await store.trashContent(other, hash, stamp.mtimeNs)).toBe("missing");
+    // Put back: the same bytes, the same time.
+    expect(await store.restoreFromTrash(other, hash)).toBe("restored");
+    expect((await store.copyStamp(other, hash))?.mtimeNs).toBe(stamp.mtimeNs);
+    expect(existsSync(join(dir, other, "trash", hash))).toBe(false);
+    expect(await store.restoreFromTrash(other, hash)).toBe("none");
+    // Trashed again, then deleted only with the right time.
+    expect(await store.trashContent(other, hash, stamp.mtimeNs)).toBe("trashed");
+    expect(await store.deleteTrashed(other, hash, stamp.mtimeNs - 1n)).toBe("changed");
+    expect(await store.deleteTrashed(other, hash, stamp.mtimeNs)).toBe("deleted");
+    expect(await store.deleteTrashed(other, hash, stamp.mtimeNs)).toBe("missing");
+    expect(await store.trashEntries(other)).toEqual([]);
+    expect(tree().filter((p) => p.includes(other) && !p.includes("incoming"))).toEqual([]);
+    // Something that isn't a regular file at a content path is counted, never moved.
     mkdirSync(join(dir, other, "sha256", "ef", "ef".repeat(32)), { recursive: true });
     expect(await store.listContents(other)).toEqual({ hashes: [], skipped: 1 });
-    await store.trash(other, "ef".repeat(32));
+    expect(await store.copyStamp(other, "ef".repeat(32))).toBeUndefined();
+    expect(await store.trashContent(other, "ef".repeat(32), 0n)).toBe("changed");
     expect(existsSync(join(dir, other, "sha256", "ef", "ef".repeat(32)))).toBe(true);
     rmSync(join(dir, other), { recursive: true, force: true });
   });
+
+  it("puts a trashed copy back for an upload, or drops it when the same content is stored again", async () => {
+    const other = newOrganizationId();
+    const body = randomBytes(300);
+    const first = await store.receive(other, chunksOf(body));
+    if (!first.ok) throw new Error(first.code);
+    await store.place(first.file);
+    await store.discard(first.file);
+    const stamp = await store.copyStamp(other, sha(body));
+    if (stamp === undefined) throw new Error("no stamp");
+    expect(await store.trashContent(other, sha(body), stamp.mtimeNs)).toBe("trashed");
+    // An upload placed the same bytes again meanwhile: the trashed copy goes.
+    const again = await store.receive(other, chunksOf(body));
+    if (!again.ok) throw new Error(again.code);
+    expect(await store.place(again.file)).toBe("stored");
+    await store.discard(again.file);
+    expect(await store.restoreFromTrash(other, sha(body))).toBe("already_stored");
+    expect(readFileSync(store.pathFor(other, sha(body))).equals(body)).toBe(true);
+    expect(existsSync(join(dir, other, "trash", sha(body)))).toBe(false);
+    rmSync(join(dir, other), { recursive: true, force: true });
+  });
 });
+
+describe("the S-052 review's store changes", () => {
+  it("keeps sub-second times (the purge's self-test), and every touch changes a copy's time", async () => {
+    expect(await store.mtimeSelfTest()).toBe(true);
+    expect(readdirSync(dir).filter((n) => n.startsWith(".mtime-"))).toEqual([]);
+    const other = newOrganizationId();
+    const body = randomBytes(64);
+    const got = await store.receive(other, chunksOf(body));
+    if (!got.ok) throw new Error(got.code);
+    await store.place(got.file);
+    await store.discard(got.file);
+    const time = () => lstatSync(store.pathFor(other, sha(body)), { bigint: true }).mtimeNs;
+    let before = time();
+    for (let i = 0; i < 5; i++) {
+      expect(await store.touch(other, sha(body))).toBe("touched");
+      expect(time()).not.toBe(before);
+      before = time();
+    }
+    rmSync(join(dir, other), { recursive: true, force: true });
+  });
+
+  it("takes the lease lock one at a time, and takes over a lock its holder left", async () => {
+    const order: string[] = [];
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    const first = store.withLeaseLock(async () => {
+      order.push("first in");
+      await held;
+      order.push("first out");
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    const second = store.withLeaseLock(() => {
+      order.push("second");
+      return Promise.resolve(7);
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    expect(order).toEqual(["first in"]);
+    release();
+    expect(await second).toBe(7);
+    await first;
+    expect(order).toEqual(["first in", "first out", "second"]);
+    // Released: its generation says so.
+    expect(readFileSync(await current(dir), "utf8")).toBe("released\n");
+    // A lock left by a process on this host that is gone.
+    writeFileSync(await next(dir), `${hostKey() ?? "-"}\n999999999\nabcd\n`);
+    expect(await store.withLeaseLock(() => Promise.resolve("taken"))).toBe("taken");
+    // A lock from elsewhere, older than two minutes by the file system's clock.
+    const elsewhere = await next(dir);
+    writeFileSync(elsewhere, "another-host\n12\nabcd\n");
+    const old = new Date(Date.now() - 5 * 60_000);
+    utimesSync(elsewhere, old, old);
+    expect(await store.withLeaseLock(() => Promise.resolve("taken"))).toBe("taken");
+    // A holder deletes only the generations below its own.
+    expect((await leaseGenerations(dir)).length).toBe(1);
+    // Nor are lock files counted as the folder's content.
+    const empty = mkdtempSync(join(tmpdir(), "oculus-store-lock-"));
+    writeFileSync(join(empty, `${LEASE_LOCK}.1`), "x");
+    // Nor a clock probe a crash left (L-d).
+    writeFileSync(join(empty, ".now-0123456789abcdef"), "");
+    writeFileSync(join(empty, ".mtime-0123456789abcdef"), "");
+    expect(await (await openFileStore({ dir: empty })).isEmpty()).toBe(true);
+    rmSync(empty, { recursive: true, force: true });
+  });
+
+  it("reports a trashed copy with a second link as stuck and never deletes or moves it", async () => {
+    const other = newOrganizationId();
+    const body = randomBytes(80);
+    const got = await store.receive(other, chunksOf(body));
+    if (!got.ok) throw new Error(got.code);
+    await store.place(got.file);
+    await store.discard(got.file);
+    const stamp = await store.copyStamp(other, sha(body));
+    if (stamp === undefined) throw new Error("no stamp");
+    expect(await store.trashContent(other, sha(body), stamp.mtimeNs)).toBe("trashed");
+    const trashed = join(dir, other, "trash", sha(body), "content");
+    const extra = join(dir, other, "kept-elsewhere");
+    linkSync(trashed, extra);
+    expect(await store.trashEntries(other)).toEqual([
+      expect.objectContaining({ sha256: sha(body), stuck: true, size: body.length }),
+    ]);
+    expect(await store.deleteTrashed(other, sha(body), stamp.mtimeNs)).toBe("changed");
+    expect(await store.restoreFromTrash(other, sha(body))).toBe("none");
+    expect(readFileSync(trashed).equals(body)).toBe(true);
+    expect(existsSync(store.pathFor(other, sha(body)))).toBe(false);
+    rmSync(join(dir, other), { recursive: true, force: true });
+  });
+});
+
+describe("the S-052 second review's store changes", () => {
+  it("L1: two takers of a stale lock never hold it at once", async () => {
+    for (let round = 0; round < 5; round++) {
+      writeFileSync(await next(dir), `${hostKey() ?? "-"}\n999999999\nstale\n`);
+      let inside = 0;
+      let most = 0;
+      const work = async () => {
+        inside++;
+        most = Math.max(most, inside);
+        await new Promise((r) => setTimeout(r, 20));
+        inside--;
+      };
+      await Promise.all([store.withLeaseLock(work), store.withLeaseLock(work)]);
+      expect(most).toBe(1);
+      expect(readFileSync(await current(dir), "utf8")).toBe("released\n");
+    }
+  });
+
+  it("L3: a lock with this PID but a nonce it doesn't hold, or a time in the future, is stale; a live PID here never is", async () => {
+    writeFileSync(await next(dir), `${hostKey() ?? "-"}\n${String(process.pid)}\nnot-mine\n`);
+    expect(await store.withLeaseLock(() => Promise.resolve("taken"))).toBe("taken");
+    const future = await next(dir);
+    writeFileSync(future, "another-host\n12\nabcd\n");
+    const later = new Date(Date.now() + 3600_000);
+    utimesSync(future, later, later);
+    expect(await store.withLeaseLock(() => Promise.resolve("taken"))).toBe("taken");
+  });
+
+  it("L2: a held lock's time moves on while the work runs, and a release leaves a later generation alone", async () => {
+    const beating = await openFileStore({ dir, leaseLockBeatMs: 30 });
+    await beating.withLeaseLock(async (held) => {
+      const mine = await current(dir);
+      const old = new Date(Date.now() - 10 * 60_000);
+      utimesSync(mine, old, old);
+      await new Promise((r) => setTimeout(r, 200));
+      expect(Date.now() - statSync(mine).mtimeMs).toBeLessThan(60_000);
+      // Someone took a later generation meanwhile: no longer held.
+      writeFileSync(await next(dir), "another-host\n12\ntheirs\n");
+      expect(await held()).toBe(false);
+    });
+    expect(readFileSync(await current(dir), "utf8")).toBe("another-host\n12\ntheirs\n");
+    // (Released for the next tests, as its holder would.)
+    writeFileSync(await current(dir), "released\n");
+  });
+
+  it("L2: place trusts the hash taken before the lock only while the copy is the one hashed", async () => {
+    const other = newOrganizationId();
+    const body = randomBytes(90);
+    const first = await store.receive(other, chunksOf(body));
+    if (!first.ok) throw new Error(first.code);
+    await store.place(first.file);
+    await store.discard(first.file);
+    const again = await store.receive(other, chunksOf(body));
+    if (!again.ok) throw new Error(again.code);
+    const prior = await store.inspect(again.file);
+    expect(prior?.same).toBe(true);
+    expect(await store.place(again.file, prior)).toBe("already_stored");
+    await store.discard(again.file);
+    // The copy changed after it was hashed (same size, other bytes): replaced.
+    const third = await store.receive(other, chunksOf(body));
+    if (!third.ok) throw new Error(third.code);
+    const seen = await store.inspect(third.file);
+    const path = store.pathFor(other, sha(body));
+    writeFileSync(path, randomBytes(90));
+    const later = new Date(Date.now() + 5000);
+    utimesSync(path, later, later);
+    expect(await store.place(third.file, seen)).toBe("stored");
+    expect(readFileSync(path).equals(body)).toBe(true);
+    await store.discard(third.file);
+    rmSync(join(dir, other), { recursive: true, force: true });
+  });
+});
+
+/** The current lease lock generation's path. */
+async function current(root: string): Promise<string> {
+  return join(root, `${LEASE_LOCK}.${String((await leaseGenerations(root))[0] ?? 0)}`);
+}
+
+/** The next lease lock generation's path (as a taker would make it). */
+async function next(root: string): Promise<string> {
+  return join(root, `${LEASE_LOCK}.${String(((await leaseGenerations(root))[0] ?? 0) + 1)}`);
+}

@@ -45,14 +45,19 @@
  * **Nothing automatic deletes a stored copy** (D-086, fourth review). The
  * automatic sweep (the service's `sweepFiles`) only removes temporary
  * uploads (`staleIncoming`: older than an upload may run, by the file
- * system's own clock, never one this process is still writing) and empties
- * the trash an earlier purge left. In this version nothing purges (D-086,
- * fifth review); `trash`, `emptyTrash` and `listContents` stay for the safe
- * purge to come (S-043), which will also rely on `touch`: every attach sets
- * the stored copy's times to now by the file system's own clock, so its
- * age shows its last use in any database.
+ * system's own clock, never one this process is still writing). Every
+ * attach sets the stored copy's times to now by the file system's own clock
+ * (`touch`), so its time shows its last use in any database.
+ *
+ * **The purge's trash** (S-052, D-086): the service's purge moves a copy
+ * whose time is still the one logged with its removal into
+ * `<organization>/trash/<sha256>/content` by one rename (`trashContent`,
+ * step 1), with its thumbnails beside it and a `marked` file whose time is
+ * the file system's at that moment; a later run deletes it from there
+ * (`deleteTrashed`, step 2) only if its time is still the same. An upload of
+ * the same content puts it back first (`restoreFromTrash`).
  */
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomInt } from "node:crypto";
 import { closeSync, constants, createReadStream, fstatSync, openSync, rmSync } from "node:fs";
 import {
   link,
@@ -63,14 +68,19 @@ import {
   readdir,
   rename,
   rm,
+  rmdir,
   stat,
   statfs,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { hostname } from "node:os";
 import { isAbsolute, join } from "node:path";
 import type { Readable } from "node:stream";
 import { SNIFF_BYTES, isOrganizationId, isSha256Hex, type OrganizationId } from "@oculus/core";
+import { LEASE_LOCK, LeaseLockBusy, hostKey, leaseGenerations, leaseLock } from "./lease-lock.js";
+
+export { LEASE_LOCK, LeaseLockBusy, leaseGenerations };
 
 /** Bytes in a mebibyte. */
 const MIB = 1024 * 1024;
@@ -101,6 +111,8 @@ export interface FileStoreOptions {
   readonly minFreeBytes?: number;
   /** The free space on the disk (tests). Default: `statfs`. */
   readonly freeSpace?: (dir: string) => Promise<{ free: number; total: number }>;
+  /** How often a held lease lock's time moves on (tests). Default 20 seconds. */
+  readonly leaseLockBeatMs?: number;
 }
 
 /** A received file: what the service needs, and nothing that names a path. */
@@ -110,6 +122,39 @@ export interface ReceivedFile {
   readonly size: number;
   /** The first bytes (at most `SNIFF_BYTES`), for sniffing the media type. */
   readonly head: Uint8Array;
+}
+
+/** What `inspect` found at a content path, for `place` to check again under the lock. */
+export interface PlaceCheck {
+  readonly mtimeNs: bigint;
+  readonly size: number;
+  readonly ino: bigint;
+  /** A plain copy of ours with one link holding exactly the received content. */
+  readonly same: boolean;
+}
+
+/** A stored copy's time and size (`copyStamp`). */
+export interface CopyStamp {
+  readonly mtimeNs: bigint;
+  readonly mtimeMs: number;
+  readonly size: number;
+}
+
+/** One content in an organization's trash (`trashEntries`). */
+export interface TrashEntry {
+  readonly sha256: string;
+  readonly size: number;
+  /** The trashed copy's time (a rename keeps it); 0 when stuck. */
+  readonly mtimeNs: bigint;
+  /** When it was moved there, by the file system's clock (its `marked` file); NaN if unmarked. */
+  readonly markedMs: number;
+  /**
+   * The trashed copy isn't a plain file of ours with one link (a second
+   * hard link, another owner, a group- or world-writable mode, a link):
+   * the purge never deletes, restores or records it, and reports it for a
+   * person to look at.
+   */
+  readonly stuck: boolean;
 }
 
 export type ReceiveRefusal = "file_too_large" | "empty_file" | "quota_exceeded" | "disk_full";
@@ -135,6 +180,10 @@ export interface StoreMarker {
 
 /** Where the servers using the folder note themselves (`claimServer`). */
 const SERVERS_FOLDER = ".oculus-servers";
+/** How often a running server moves its note's time on (5 minutes). */
+const SERVER_NOTE_BEAT_MS = 5 * 60_000;
+/** A note whose PID can't be checked is stale this long after its last move (30 minutes). */
+const SERVER_NOTE_STALE_MS = 30 * 60_000;
 
 const MARKER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const MARKER_DATABASE = /^[0-9A-Za-z_.:-]{1,100}$/;
@@ -198,13 +247,30 @@ export interface FileStore {
   /** The install ID the store was bound to, if it has been. */
   readonly boundTo: () => string | undefined;
   /**
-   * Sets a stored copy's access and modification times to now by the file system's
-   * own clock (every attach calls it): `false` when there is no plain copy
-   * of our own there (`place` replaces anything else).
+   * Sets a stored copy's access and modification times to now by the file
+   * system's own clock (every attach calls it): `missing` when there is no
+   * plain copy of our own there (`place` replaces anything else);
+   * `unchanged` when the file system wouldn't change its time (then the
+   * purge must never take the content: the caller records so).
    */
-  touch(organizationId: OrganizationId, sha256: string): Promise<boolean>;
-  /** Puts the received bytes at their content path (see the module header). */
-  place(file: ReceivedFile): Promise<"stored" | "already_stored">;
+  touch(
+    organizationId: OrganizationId,
+    sha256: string,
+  ): Promise<"touched" | "missing" | "unchanged">;
+  /**
+   * What is at a received file's content path now, hashed (call it before
+   * taking the organization's file lock, so nothing is hashed under it):
+   * `place` then trusts that verdict only if the copy's size, time and inode
+   * are still the same.
+   */
+  inspect(file: ReceivedFile): Promise<PlaceCheck | undefined>;
+  /**
+   * Puts the received bytes at their content path (see the module header).
+   * With `prior` (from `inspect`), nothing is hashed: a copy there that
+   * still matches it is kept if it was the same content, and anything else
+   * is replaced by the received bytes. Without, the copy there is hashed.
+   */
+  place(file: ReceivedFile, prior?: PlaceCheck): Promise<"stored" | "already_stored">;
   /** Removes the temporary file and releases its share; safe to call more than once. */
   discard(file: ReceivedFile): Promise<void>;
   /** Where the content is stored (for reading in M-003 and in tests). */
@@ -265,11 +331,6 @@ export interface FileStore {
     size: string,
     jpeg: Uint8Array | "none" | "timeout",
   ): Promise<void>;
-  /**
-   * Moves a content's cached thumbnails (every size and version) aside, for
-   * `emptyTrash` to delete (the sweep, M-003).
-   */
-  trashThumbnails(organizationId: OrganizationId, sha256: string): Promise<void>;
   /** The organizations with a folder here. */
   organizations(): Promise<readonly OrganizationId[]>;
   /** The contents stored for an organization (their hashes). */
@@ -279,12 +340,64 @@ export interface FileStore {
     organizationId: OrganizationId,
   ): Promise<{ readonly hashes: readonly string[]; readonly skipped: number }>;
   /**
-   * Moves a stored copy and its cached thumbnails (M-003) aside (call under
-   * the organization's file lock); `emptyTrash` deletes them.
+   * The stored copy's modification time (nanoseconds and milliseconds, by
+   * the file system) and size, when it is a plain copy of ours (every
+   * folder on the way checked); `undefined` otherwise.
    */
-  trash(organizationId: OrganizationId, sha256: string): Promise<void>;
-  /** Deletes what `trash` moved aside; returns how many. */
-  emptyTrash(organizationId: OrganizationId): Promise<number>;
+  copyStamp(organizationId: OrganizationId, sha256: string): Promise<CopyStamp | undefined>;
+  /** "Now" by the file system's own clock (a file written just now in the organization's folder). */
+  fileSystemNow(organizationId: OrganizationId): Promise<number>;
+  /**
+   * Whether this file system keeps a modification time as it is set, to the
+   * microsecond: a probe file is given a chosen sub-second time and read
+   * back. The purge compares copies' times exactly, so it refuses to run
+   * without this (S-052).
+   */
+  mtimeSelfTest(): Promise<boolean>;
+  /**
+   * Runs `work` holding the folder's lease lock (lease-lock.ts): a purge
+   * step, a lease renewal, a bind, an adopt and an accept of any database
+   * using the folder never run inside another's. `held()` reads the lock
+   * again; a purge step checks it right before each rename or unlink.
+   */
+  withLeaseLock<T>(work: (held: () => Promise<boolean>) => Promise<T>): Promise<T>;
+  /**
+   * The purge's step 1 (call under the organization's file lock): moves the
+   * copy into `trash/<sha256>/content` by one rename, its thumbnails beside
+   * it, with a `marked` file stamped by the file system's clock, only if
+   * the copy's time is still `mtimeNs`. `changed` (nothing moved) when it
+   * isn't, or the copy isn't a plain one of ours; `missing` when none is there.
+   */
+  trashContent(
+    organizationId: OrganizationId,
+    sha256: string,
+    mtimeNs: bigint,
+  ): Promise<"trashed" | "changed" | "missing">;
+  /** What is in the organization's trash: each content with its copy's time and its mark's. */
+  trashEntries(organizationId: OrganizationId): Promise<readonly TrashEntry[]>;
+  /**
+   * Puts a trashed copy back at its content path (call under the
+   * organization's file lock; an upload of the content and a purge that
+   * finds it in use do): `restored`; `already_stored` when the same
+   * content is there already (the trashed copy then goes); `none` when
+   * nothing of it is in the trash, or it is stuck (`TrashEntry.stuck`: then
+   * nothing is touched). Its thumbnails are deleted (made again).
+   */
+  restoreFromTrash(
+    organizationId: OrganizationId,
+    sha256: string,
+  ): Promise<"restored" | "already_stored" | "none">;
+  /**
+   * The purge's step 2 (under the organization's file lock): deletes a
+   * trashed copy, its thumbnails and its mark, only if the copy's time is
+   * still `mtimeNs`; `changed` (nothing deleted) otherwise; `missing` when
+   * it isn't in the trash.
+   */
+  deleteTrashed(
+    organizationId: OrganizationId,
+    sha256: string,
+    mtimeNs: bigint,
+  ): Promise<"deleted" | "changed" | "missing">;
   /** Deletes temporary files older than `maxAgeMs`; returns how many. */
   staleIncoming(maxAgeMs: number, organizations?: readonly string[]): Promise<number>;
 }
@@ -523,6 +636,10 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
   /** The `.oculus-servers` notes this process holds (`claimServer`). */
   const claimed = new Set<string>();
   let boundTo: string | undefined;
+  const lock = leaseLock({
+    root,
+    ...(options.leaseLockBeatMs === undefined ? {} : { beatMs: options.leaseLockBeatMs }),
+  });
 
   async function lowOnSpace(extra: number): Promise<boolean> {
     if (minFree === 0) return false;
@@ -576,6 +693,59 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
     } finally {
       await rm(probe, { force: true });
     }
+  }
+
+  /** A plain file of ours with one link: its time and size (nanoseconds too). */
+  async function stampOf(path: string): Promise<CopyStamp | undefined> {
+    const info = await lstat(path, { bigint: true }).catch(() => undefined);
+    if (
+      info === undefined ||
+      !info.isFile() ||
+      info.nlink !== 1n ||
+      !safeOwnership({ uid: Number(info.uid), mode: Number(info.mode) })
+    ) {
+      return undefined;
+    }
+    return Object.freeze({
+      mtimeNs: info.mtimeNs,
+      mtimeMs: Number(info.mtimeNs / 1000n) / 1000,
+      size: Number(info.size),
+    });
+  }
+
+  /** Moves a content's cached thumbnails (every size and version) into its trash folder. */
+  async function moveThumbnails(
+    organizationId: OrganizationId,
+    sha256: string,
+    bin: string,
+  ): Promise<void> {
+    const thumbnails = await existingFolder(organizationId, "thumbnails");
+    if (thumbnails === undefined) return;
+    for (const size of await readdir(thumbnails, { withFileTypes: true })) {
+      if (!size.isDirectory() || !THUMBNAIL_SIZE.test(size.name)) continue;
+      const folder = await existingFolder(
+        organizationId,
+        "thumbnails",
+        size.name,
+        sha256.slice(0, 2),
+      );
+      if (folder === undefined) continue;
+      for (const entry of await readdir(folder, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.startsWith(`${sha256}.`)) continue;
+        const kind = entry.name.slice(sha256.length + 1);
+        if (!/^[a-z0-9.]{1,16}$/.test(kind)) continue;
+        await rename(join(folder, entry.name), join(bin, `thumbnail-${size.name}-${kind}`));
+      }
+    }
+  }
+
+  /** Deletes the regular files left in a content's trash folder, then the folder. */
+  async function emptyBin(bin: string): Promise<void> {
+    for (const entry of await readdir(bin, { withFileTypes: true })) {
+      if (entry.isFile()) await rm(join(bin, entry.name), { force: true });
+    }
+    await rmdir(bin).catch(() => undefined);
+    await syncDirectory(join(bin, "..")).catch(() => undefined);
   }
 
   const store: FileStore = {
@@ -647,7 +817,8 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       const name = `${host}-${String(process.pid)}-${randomBytes(8).toString("hex")}`;
       const mine = join(folder, name);
       const temp = join(folder, `.${name}.tmp`);
-      await writeFile(temp, `${key}\n`, { mode: 0o600, flag: "wx" });
+      // The key, then this host as a PID's meaning (lease-lock.ts `hostKey`).
+      await writeFile(temp, `${key}\n${hostKey() ?? "-"}\n`, { mode: 0o600, flag: "wx" });
       try {
         await link(temp, mine);
       } catch (error) {
@@ -656,7 +827,17 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       } finally {
         await rm(temp, { force: true });
       }
+      // The note's time moves on while this server runs, so a note whose
+      // process can't be checked (another PID namespace, or no host key) is
+      // judged by its age.
+      const beat = setInterval(() => {
+        void fileSystemNow(folder)
+          .then((now) => utimes(mine, now / 1000, now / 1000))
+          .catch(() => undefined);
+      }, SERVER_NOTE_BEAT_MS);
+      beat.unref();
       const release = (): void => {
+        clearInterval(beat);
         claimed.delete(name);
         try {
           rmSync(mine, { force: true });
@@ -678,24 +859,37 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
           if (!entry.isFile() || match?.[1] !== host) continue;
           const pid = Number(match[2]);
           const path = join(folder, entry.name);
+          const text = await readFile(path, "utf8").catch(() => undefined);
+          const [theirKey, theirHost] = (text ?? "").split("\n");
+          const here = hostKey();
           let alive: boolean;
-          if (pid === process.pid) {
-            // This process's own notes are the ones it holds; any other is
-            // left from a process that had this PID before.
-            alive = claimed.has(entry.name);
-          } else {
-            alive = true;
-            try {
-              process.kill(pid, 0);
-            } catch (error) {
-              alive = (error as { code?: unknown }).code === "EPERM";
+          if (here !== undefined && theirHost === here) {
+            // The same host, boot and PID namespace: the PID says.
+            if (pid === process.pid) {
+              // This process's own notes are the ones it holds; any other is
+              // left from a process that had this PID before.
+              alive = claimed.has(entry.name);
+            } else {
+              alive = true;
+              try {
+                process.kill(pid, 0);
+              } catch (error) {
+                alive = (error as { code?: unknown }).code === "EPERM";
+              }
             }
+          } else {
+            // Its PID can't be checked from here: only its age (S-052
+            // third review, PID namespaces).
+            const info = await lstat(path).catch(() => undefined);
+            alive =
+              info !== undefined &&
+              Math.abs((await fileSystemNow(folder)) - info.mtimeMs) <= SERVER_NOTE_STALE_MS;
           }
           if (!alive) {
             await rm(path, { force: true });
             continue;
           }
-          const theirs = (await readFile(path, "utf8").catch(() => undefined))?.trim();
+          const theirs = text === undefined ? undefined : theirKey?.trim();
           // A note gone meanwhile was released; any other key refuses.
           if (theirs !== undefined && theirs !== key) {
             done();
@@ -719,15 +913,23 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       } catch (error) {
         const code = (error as { code?: unknown }).code;
         // None there, or a link where a copy should be (`place` replaces it).
-        if (code === "ENOENT" || code === "ELOOP" || code === "ENOTDIR") return false;
+        if (code === "ENOENT" || code === "ELOOP" || code === "ENOTDIR") return "missing";
         throw error;
       }
       try {
         const info = await handle.stat();
-        if (!info.isFile() || info.nlink !== 1 || !safeOwnership(info)) return false;
-        const now = (await fileSystemNow(await safeFolder(organizationId, "incoming"))) / 1000;
-        await handle.utimes(now, now);
-        return true;
+        if (!info.isFile() || info.nlink !== 1 || !safeOwnership(info)) return "missing";
+        const before = (await handle.stat({ bigint: true })).mtimeNs;
+        const nowMs = await fileSystemNow(await safeFolder(organizationId, "incoming"));
+        await handle.utimes(nowMs / 1000, nowMs / 1000);
+        // The purge relies on every touch changing the time (S-052): if it
+        // came out the same, the later of now and a millisecond after it.
+        if ((await handle.stat({ bigint: true })).mtimeNs === before) {
+          const later = Math.max(nowMs, Number(before / 1_000_000n) + 1) / 1000;
+          await handle.utimes(later, later);
+          if ((await handle.stat({ bigint: true })).mtimeNs === before) return "unchanged";
+        }
+        return "touched";
       } finally {
         await handle.close();
       }
@@ -739,7 +941,16 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
     },
 
     async isEmpty() {
-      return (await readdir(root)).filter((name) => name !== SERVERS_FOLDER).length === 0;
+      return (
+        (await readdir(root)).filter(
+          // The servers' notes, the lease lock's files and the file system
+          // clock's probes (a crash can leave one; a lock holder tidies them).
+          (name) =>
+            name !== SERVERS_FOLDER &&
+            !name.startsWith(".oculus-lease.") &&
+            !/^\.(now|mtime)-[0-9a-f]{16}$/.test(name),
+        ).length === 0
+      );
     },
 
     async openContent(organizationId, sha256, size) {
@@ -839,7 +1050,7 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
         }
         // A rename replaces whatever is at the name (a planted link
         // included) in one step. Nothing else is deleted here: only the
-        // sweep deletes (trash, then emptyTrash); a JPEG beside a ".none" wins.
+        // purge deletes (trashContent, then deleteTrashed); a JPEG beside a ".none" wins.
         const name =
           jpeg === "none" || jpeg === "timeout" ? `${sha256}.v1.${jpeg}` : `${sha256}.v1.jpg`;
         await rename(temporaryPath, join(folder, name));
@@ -967,7 +1178,22 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       }
     },
 
-    async place(file) {
+    async inspect(file) {
+      const target = pathFor(file.organizationId, file.sha256);
+      const folder = await existingFolder(file.organizationId, "sha256", file.sha256.slice(0, 2));
+      if (folder === undefined) return undefined;
+      const info = await lstat(target, { bigint: true }).catch(() => undefined);
+      if (info === undefined) return undefined;
+      const plain =
+        info.isFile() &&
+        info.nlink === 1n &&
+        safeOwnership({ uid: Number(info.uid), mode: Number(info.mode) }) &&
+        Number(info.size) === file.size;
+      const same = plain && (await hashFile(target).catch(() => "")) === file.sha256;
+      return Object.freeze({ mtimeNs: info.mtimeNs, size: Number(info.size), ino: info.ino, same });
+    },
+
+    async place(file, prior) {
       const path = temporary.get(file);
       if (path === undefined) throw new Error("Not a file this store received.");
       const target = pathFor(file.organizationId, file.sha256);
@@ -999,15 +1225,24 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
           return "stored";
         }
       }
-      // Already there: keep it only if it is surely the same content.
-      const existing = await lstat(target);
-      if (
+      // Already there: keep it only if it is surely the same content. With
+      // `prior`, by the hash taken before the lock (S-052 second review: no
+      // hashing under it), if the copy is still the one hashed.
+      const existing = await lstat(target, { bigint: true });
+      const plain =
         existing.isFile() &&
-        existing.nlink === 1 &&
-        safeOwnership(existing) &&
-        existing.size === file.size &&
-        (await hashFile(target)) === file.sha256
-      ) {
+        existing.nlink === 1n &&
+        safeOwnership({ uid: Number(existing.uid), mode: Number(existing.mode) }) &&
+        Number(existing.size) === file.size;
+      const same =
+        prior === undefined
+          ? plain && (await hashFile(target)) === file.sha256
+          : plain &&
+            prior.same &&
+            prior.mtimeNs === existing.mtimeNs &&
+            prior.ino === existing.ino &&
+            prior.size === file.size;
+      if (same) {
         await settle();
         return "already_stored";
       }
@@ -1064,51 +1299,163 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       return { hashes: hashes.sort(), skipped };
     },
 
-    async trash(organizationId, sha256) {
-      const target = pathFor(organizationId, sha256);
-      const info = await lstat(target).catch(() => undefined);
-      if (info?.isFile() !== true) return;
-      const bin = await safeFolder(organizationId, "trash");
-      await rename(target, join(bin, `${sha256}.${randomBytes(8).toString("hex")}`));
+    async copyStamp(organizationId, sha256) {
+      const folder = await existingFolder(organizationId, "sha256", sha256.slice(0, 2));
+      if (folder === undefined) return undefined;
+      return stampOf(pathFor(organizationId, sha256));
     },
 
-    async trashThumbnails(organizationId, sha256) {
-      if (!isSha256Hex(sha256)) throw new TypeError("Not a SHA-256.");
-      const thumbnails = await existingFolder(organizationId, "thumbnails");
-      if (thumbnails === undefined) return;
-      for (const size of await readdir(thumbnails, { withFileTypes: true })) {
-        if (!size.isDirectory() || !THUMBNAIL_SIZE.test(size.name)) continue;
-        const folder = await existingFolder(
-          organizationId,
-          "thumbnails",
-          size.name,
-          sha256.slice(0, 2),
-        );
-        if (folder === undefined) continue;
-        for (const entry of await readdir(folder, { withFileTypes: true })) {
-          if (!entry.isFile() || !entry.name.startsWith(`${sha256}.`)) continue;
-          const bin = await safeFolder(organizationId, "trash");
-          await rename(
-            join(folder, entry.name),
-            join(bin, `${sha256}.${randomBytes(8).toString("hex")}`),
-          );
+    async fileSystemNow(organizationId) {
+      return fileSystemNow(await safeFolder(organizationId, "incoming"));
+    },
+
+    async mtimeSelfTest() {
+      const probe = join(root, `.mtime-${randomBytes(8).toString("hex")}`);
+      await writeFile(probe, "", { mode: 0o600, flag: "wx" });
+      try {
+        const whole = 1_600_000_000 + randomInt(0, 100_000_000);
+        const micros = randomInt(1, 1_000_000);
+        const seconds = whole + micros / 1e6;
+        await utimes(probe, seconds, seconds);
+        const got = (await lstat(probe, { bigint: true })).mtimeNs;
+        const want = BigInt(whole) * 1_000_000_000n + BigInt(micros) * 1000n;
+        // To within two microseconds: Node passes the time as a double of
+        // seconds, which holds microseconds and truncates the rest.
+        return (got > want ? got - want : want - got) <= 2000n;
+      } finally {
+        await rm(probe, { force: true });
+      }
+    },
+
+    async withLeaseLock(work) {
+      return lock.withLock(work);
+    },
+
+    async trashContent(organizationId, sha256, mtimeNs) {
+      const target = pathFor(organizationId, sha256);
+      const folder = await existingFolder(organizationId, "sha256", sha256.slice(0, 2));
+      if (folder === undefined) return "missing";
+      if ((await lstat(target).catch(() => undefined)) === undefined) return "missing";
+      const stamp = await stampOf(target);
+      if (stamp?.mtimeNs !== mtimeNs) return "changed";
+      await safeFolder(organizationId, "trash");
+      const bin = join(organizationDir(organizationId), "trash", sha256);
+      // A folder of its own, made now. One left from an interrupted step
+      // without a copy in it is emptied first; one holding a copy means
+      // something is wrong, and nothing is moved.
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await mkdir(bin, { mode: 0o700 });
+          break;
+        } catch (error) {
+          const left = await existingFolder(organizationId, "trash", sha256);
+          const holds = await lstat(join(bin, "content")).catch(() => undefined);
+          if (
+            attempt > 0 ||
+            (error as { code?: unknown }).code !== "EEXIST" ||
+            left === undefined ||
+            holds !== undefined
+          ) {
+            return "changed";
+          }
+          await emptyBin(left);
         }
       }
+      if ((await existingFolder(organizationId, "trash", sha256)) === undefined) return "changed";
+      try {
+        // The mark first: its time is the file system's at this moment.
+        await writeFile(join(bin, "marked"), "", { mode: 0o600, flag: "wx" });
+        // One rename, in the same files folder: the copy is either here or there.
+        await rename(target, join(bin, "content"));
+      } catch (error) {
+        if ((await lstat(join(bin, "content")).catch(() => undefined)) === undefined) {
+          await emptyBin(bin);
+        }
+        throw error;
+      }
+      await moveThumbnails(organizationId, sha256, bin);
+      await syncDirectory(bin);
+      await syncDirectory(folder);
+      return "trashed";
     },
 
-    async emptyTrash(organizationId) {
-      const bin = join(organizationDir(organizationId), "trash");
-      const folder = await lstat(bin).catch(() => undefined);
-      if (folder?.isDirectory() !== true) return 0;
-      let removed = 0;
-      for (const entry of await readdir(bin, { withFileTypes: true })) {
-        if (!entry.isFile()) continue;
-        await rm(join(bin, entry.name), { force: true });
-        removed++;
+    async trashEntries(organizationId) {
+      const base = await existingFolder(organizationId, "trash");
+      if (base === undefined) return [];
+      const out: TrashEntry[] = [];
+      for (const entry of await readdir(base, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !isSha256Hex(entry.name)) continue;
+        const bin = await existingFolder(organizationId, "trash", entry.name);
+        if (bin === undefined) continue;
+        const content = await lstat(join(bin, "content")).catch(() => undefined);
+        if (content === undefined) continue;
+        const stamp = await stampOf(join(bin, "content"));
+        const mark = await lstat(join(bin, "marked")).catch(() => undefined);
+        out.push(
+          Object.freeze({
+            sha256: entry.name,
+            size: stamp?.size ?? content.size,
+            mtimeNs: stamp?.mtimeNs ?? 0n,
+            markedMs: mark?.isFile() === true ? mark.mtimeMs : Number.NaN,
+            stuck: stamp === undefined,
+          }),
+        );
       }
-      await syncDirectory(bin).catch(() => undefined);
-      await syncDirectory(join(organizationDir(organizationId), "sha256")).catch(() => undefined);
-      return removed;
+      return out.sort((a, b) => (a.sha256 < b.sha256 ? -1 : 1));
+    },
+
+    async restoreFromTrash(organizationId, sha256) {
+      if (!isSha256Hex(sha256)) throw new TypeError("Not a SHA-256.");
+      const bin = await existingFolder(organizationId, "trash", sha256);
+      if (bin === undefined) return "none";
+      const trashed = join(bin, "content");
+      const target = pathFor(organizationId, sha256);
+      let answer: "restored" | "already_stored" | "none" = "none";
+      const there = await lstat(trashed).catch(() => undefined);
+      // Stuck (not a plain copy of ours): left exactly as it is, for a person.
+      if (there !== undefined && !(await plainFile(trashed))) return "none";
+      if (there !== undefined) {
+        const folder = await safeFolder(organizationId, "sha256", sha256.slice(0, 2));
+        const there = await lstat(target).catch(() => undefined);
+        if (there === undefined) {
+          // Back by one rename; its time is kept (the attach then touches it).
+          await rename(trashed, target);
+          await syncDirectory(folder);
+          answer = "restored";
+        } else if (
+          there.isFile() &&
+          there.nlink === 1 &&
+          safeOwnership(there) &&
+          there.size === (await lstat(trashed)).size
+        ) {
+          // A plain copy of ours of the right size is stored already (an
+          // upload placed it, its bytes checked as they came in): the
+          // trashed copy isn't needed. Nothing is hashed here, under the
+          // locks (S-052 second review).
+          await rm(trashed, { force: true });
+          answer = "already_stored";
+        } else {
+          // Something else at the content path: replaced in one step, as `place` would.
+          await rename(trashed, target);
+          await syncDirectory(folder);
+          answer = "restored";
+        }
+      }
+      await emptyBin(bin);
+      return answer;
+    },
+
+    async deleteTrashed(organizationId, sha256, mtimeNs) {
+      if (!isSha256Hex(sha256)) throw new TypeError("Not a SHA-256.");
+      const bin = await existingFolder(organizationId, "trash", sha256);
+      if (bin === undefined) return "missing";
+      const trashed = join(bin, "content");
+      if ((await lstat(trashed).catch(() => undefined)) === undefined) return "missing";
+      const stamp = await stampOf(trashed);
+      if (stamp?.mtimeNs !== mtimeNs) return "changed";
+      await rm(trashed, { force: true });
+      await emptyBin(bin);
+      return "deleted";
     },
 
     async staleIncoming(maxAgeMs, organizations) {

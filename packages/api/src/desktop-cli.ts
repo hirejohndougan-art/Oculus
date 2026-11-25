@@ -39,6 +39,7 @@ import {
   type AppliedMigration,
   databaseBeforeSetup,
   grantWriterRole,
+  identityGrantHint,
   migrate,
   MigrationError,
   openDatabase,
@@ -487,9 +488,10 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
           (p) => p.code !== "missing_privilege",
         );
         if (before.length > 0) return refuse(before);
-        await owner.transaction(async (tx) => {
-          await grantWriterRole(tx, await writerRoleName(server));
-        });
+        const writer = await writerRoleName(server);
+        const granted = await owner.transaction((tx) => grantWriterRole(tx, writer));
+        // Not a failure (S-052): the purge of removed files waits for it.
+        if (!granted.identityReadable) out(identityGrantHint(writer));
         const after = await checkWriterConnection(server);
         if (after.length > 0) return refuse(after);
       }

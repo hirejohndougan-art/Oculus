@@ -128,6 +128,7 @@ import { fileReply } from "./file-replies.js";
 import type { OculusReply, OculusRequest, OculusRoute } from "./routes.js";
 import { peopleApiRoutes, type PeopleApiOptions } from "./people-api.js";
 import { updateApiRoutes, type UpdateApiOptions } from "./update-api.js";
+import { filesPurgeApiRoutes } from "./files-purge-api.js";
 import type { PublicSubjects } from "./public-subjects.js";
 import { DEFAULT_RATE_LIMITS, SessionRateLimiter, type RateBucket } from "./rate-limit.js";
 
@@ -1227,6 +1228,8 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
     ...(options.updates === undefined
       ? []
       : updateApiRoutes(options.updates, { service, log, signedIn })),
+    // Clean up removed files (S-052): only where files are stored.
+    ...(files === undefined ? [] : filesPurgeApiRoutes({ service, log, signedIn })),
     {
       method: "GET",
       path: "/api/templates",

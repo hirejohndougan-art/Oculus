@@ -1,7 +1,8 @@
-// The operator's file command (M-002, D-086): `files:adopt` refuses while
-// the folder is busy and deletes nothing; there is no purge in this version
-// (fifth review). Over a fresh database and a throwaway files folder; no
-// URL or path is printed.
+// The operator's file commands (M-002, D-086): `files:purge` runs a step of
+// the purge (S-052) or, with --dry-run, says what one would do and changes
+// nothing; `files:adopt` refuses while the folder is busy and deletes
+// nothing. Over a fresh database and a throwaway files folder; no URL or
+// path is printed.
 import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,7 +11,7 @@ import { migrate, openDatabase, type Database } from "@oculus/db";
 import { ADOPT_QUIET_MS, STORE_MARKER, createService, openFileStore } from "@oculus/service";
 import { newRecordId } from "@oculus/core";
 import { freshDatabase, type TestDatabase } from "../../db/src/test-database.fixtures.js";
-import { runFilesCli } from "./files-cli.js";
+import { purgeLines, runFilesCli } from "./files-cli.js";
 
 let testDb: TestDatabase;
 let db: Database;
@@ -56,13 +57,79 @@ describe("files-cli", () => {
     expect(await missing).toBe(2);
   });
 
-  it("has no purge: it says so and touches nothing", async () => {
+  it("purges by the admin's rules: a dry run changes nothing, a step takes the lease", async () => {
     const before = readFileSync(join(dir, STORE_MARKER), "utf8");
-    const r = run(["purge", "--yes"]);
-    expect(await r.done).toBe(2);
-    expect(r.lines.join("\n")).toMatch(/no purge in this version.*keep using disk space/);
-    expect(r.lines.join("\n")).not.toContain(dir);
+    expect(await run(["purge", "--yes"]).done).toBe(2);
+    const dry = run(["purge", "--dry-run"]);
+    expect(await dry.done).toBe(0);
+    expect(dry.lines).toContain("Dry run: nothing was changed.");
+    expect(dry.lines.join("\n")).toMatch(/Would move to the trash: 0 files \(0 bytes\)/);
+    expect(dry.lines.join("\n")).not.toContain(dir);
     expect(readFileSync(join(dir, STORE_MARKER), "utf8")).toBe(before);
+    const step = run(["purge"]);
+    expect(await step.done).toBe(0);
+    expect(step.lines).toContain("One purge step done.");
+    // The lease moved on: the step took it.
+    expect(readFileSync(join(dir, STORE_MARKER), "utf8")).not.toBe(before);
+    // A folder whose lease isn't this database's: refused, and said why.
+    const marker = join(dir, STORE_MARKER);
+    const kept = readFileSync(marker, "utf8");
+    const [storeId, database] = kept.split("\n");
+    writeFileSync(marker, `${storeId ?? ""}\n${database ?? ""}\n${newRecordId()}\n`);
+    const refused = run(["purge"]);
+    expect(await refused.done).toBe(1);
+    expect(refused.lines.join("\n")).toMatch(/lease isn't this database's/);
+    writeFileSync(marker, kept);
+  });
+
+  it("after an identity change says to adopt, and has no way round the wait (R4-B1)", async () => {
+    const marker = join(dir, STORE_MARKER);
+    const kept = readFileSync(marker, "utf8");
+    const [storeId, database, epoch] = kept.split("\n");
+    const oid = (database ?? "").split(":")[1] ?? "";
+    writeFileSync(marker, `${storeId ?? ""}\n987654321:${oid}\n${epoch ?? ""}\n`);
+    const refused = run(["purge", "--dry-run"]);
+    expect(await refused.done).toBe(1);
+    expect(refused.lines.join("\n")).toMatch(/npm run files:adopt/);
+    expect(refused.lines.join("\n")).not.toMatch(/accept/);
+    expect(readFileSync(marker, "utf8")).toBe(
+      `${storeId ?? ""}\n987654321:${oid}\n${epoch ?? ""}\n`,
+    );
+    expect(await run(["accept-identity"]).done).toBe(2);
+    writeFileSync(marker, kept);
+  });
+
+  it("warns when its role reads the identity differently from the server's (L6)", async () => {
+    const marker = join(dir, STORE_MARKER);
+    const kept = readFileSync(marker, "utf8");
+    const [storeId, database, epoch] = kept.split("\n");
+    // As a server whose role can't run pg_control_system() would write it.
+    writeFileSync(
+      marker,
+      `${storeId ?? ""}\n-:${(database ?? "").split(":")[1] ?? ""}\n${epoch ?? ""}\n`,
+    );
+    const r = run(["purge", "--dry-run"]);
+    expect(await r.done).toBe(1);
+    expect(r.lines.join("\n")).toMatch(/reads the database's identity differently/);
+    writeFileSync(marker, kept);
+    const quiet = run(["purge", "--dry-run"]);
+    await quiet.done;
+    expect(quiet.lines.join("\n")).not.toMatch(/differently/);
+  });
+
+  it("prints what is stuck in the trash and a step stopped early", () => {
+    const none = { files: 0, bytes: 0 };
+    const lines = purgeLines({
+      dryRun: false,
+      trashed: none,
+      deleted: none,
+      restored: none,
+      waiting: none,
+      stuck: { files: 2, bytes: 3 * 1024 * 1024 },
+      stopped: "lease_lost",
+    });
+    expect(lines.join("\n")).toMatch(/Stuck in the trash, left alone .*: 2 files \(3\.0 MiB\)/);
+    expect(lines.join("\n")).toMatch(/lease moved/);
   });
 
   it("refuses adopt while the folder is busy, then adopts and deletes nothing", async () => {

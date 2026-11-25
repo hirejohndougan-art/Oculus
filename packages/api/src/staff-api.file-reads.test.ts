@@ -15,6 +15,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -654,7 +655,7 @@ describe("thumbnails", () => {
     rmSync(cFolder);
   });
 
-  it("are never deleted on their own: not by removal, the sweep or a purge (none ships yet)", async () => {
+  it("are never deleted on their own (not by removal or the sweep), and go to the purge's trash with their copy (S-052)", async () => {
     const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented removable photograph"));
     const body = makeJpeg(90, 60);
     const id = await add(asset, body, "removable.jpg");
@@ -664,6 +665,10 @@ describe("thumbnails", () => {
     ).toBe(200);
     const thumb = (size: string) =>
       join(filesDir, w.a, "thumbnails", size, sha(body).slice(0, 2), `${sha(body)}.v1.jpg`);
+    // The copy last used ten days ago by the file system's clock, so the
+    // purge may take it (S-052).
+    const tenDays = new Date(Date.now() - 10 * 86_400_000);
+    utimesSync(store.pathFor(w.a, sha(body)), tenDays, tenDays);
     const removed = await send(`/api/records/${asset}/files/${id}`, {
       as: "cataloger",
       method: "DELETE",
@@ -685,14 +690,21 @@ describe("thumbnails", () => {
     });
     const sweeper = createService(w.db, { files: store });
     expect(await sweeper.sweepFiles(0)).toMatchObject({ unbound: false, failed: 0 });
-    expect(await sweeper.purgeFiles({ apply: true })).toEqual({
-      ok: false,
-      problem: "not_available",
-    });
-    // The copy and both thumbnails are all still there.
+    // The sweep took nothing: the copy and both thumbnails are all there.
     expect(existsSync(store.pathFor(w.a, sha(body)))).toBe(true);
     expect(existsSync(thumb("small"))).toBe(true);
     expect(existsSync(thumb("medium"))).toBe(true);
+    // The purge's first step moves the copy and both thumbnails to the trash together.
+    const purged = await sweeper.purgeFiles({ apply: true });
+    expect(purged.ok && purged.value.trashed.files).toBe(1);
+    expect(existsSync(store.pathFor(w.a, sha(body)))).toBe(false);
+    expect(existsSync(thumb("small")) || existsSync(thumb("medium"))).toBe(false);
+    expect(readdirSync(join(filesDir, w.a, "trash", sha(body))).sort()).toEqual([
+      "content",
+      "marked",
+      "thumbnail-medium-v1.jpg",
+      "thumbnail-small-v1.jpg",
+    ]);
   });
 });
 

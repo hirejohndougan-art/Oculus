@@ -66,7 +66,19 @@ const SYSTEM_EVENTS: Readonly<Record<string, string>> = {
   update_rolled_back: "Went back to Oculus",
 };
 
+/** A purge step's change (S-052). */
+const FILE_EVENTS: Readonly<Record<string, string>> = {
+  files_trashed: "Moved removed files to the trash:",
+  files_deleted: "Deleted removed files from the trash:",
+  files_restored: "Put files back from the trash:",
+};
+
 function what(entry: AuditEntry, sites: ReadonlyMap<string, string>): string {
+  if (entry.type === "system" && Object.hasOwn(FILE_EVENTS, entry.kind)) {
+    const n = entry.files ?? 0;
+    const mb = ((entry.bytes ?? 0) / (1024 * 1024)).toFixed(1);
+    return `${FILE_EVENTS[entry.kind] ?? entry.kind} ${String(n)} file${n === 1 ? "" : "s"} (${mb} MB)`;
+  }
   if (entry.type === "system") {
     const label = Object.hasOwn(SYSTEM_EVENTS, entry.kind) ? SYSTEM_EVENTS[entry.kind] : undefined;
     const before = entry.fromVersion ?? "a development build";
@@ -215,11 +227,15 @@ export function Audit() {
                   {e.actorName ??
                     (e.actor === "command_line"
                       ? "The server's command line"
-                      : e.type === "system"
-                        ? "A former system manager"
-                        : e.actor.startsWith("system:")
-                          ? "Oculus"
-                          : "Someone outside this organization")}
+                      : e.actor === "timer"
+                        ? "Oculus's daily clean-up"
+                        : e.actor === "lease"
+                          ? "Oculus (another database used the files folder)"
+                          : e.type === "system"
+                            ? "A former system manager"
+                            : e.actor.startsWith("system:")
+                              ? "Oculus"
+                              : "Someone outside this organization")}
                 </td>
                 <td>{what(e, sites)}</td>
                 <td className={styles.muted}>

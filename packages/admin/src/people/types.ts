@@ -99,13 +99,16 @@ export type AuditEntry =
       /** A change to the server itself (T-060a): system managers only. */
       readonly type: "system";
       readonly at: string;
-      /** `user:<id>`, or `command_line` for the release command on the server. */
+      /** `user:<id>`, `command_line` for a command on the server, or `timer` for the daily purge. */
       readonly actor: string;
       readonly actorName: string | null;
       readonly eventId: string;
       readonly kind: string;
       readonly version: string;
       readonly fromVersion: string | null;
+      /** A purge step's files and bytes (S-052); absent or null for an update. */
+      readonly files?: number | null;
+      readonly bytes?: number | null;
     };
 
 export interface AuditPage {

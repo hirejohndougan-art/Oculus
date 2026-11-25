@@ -124,17 +124,35 @@ export const WRITER_GRANTS: readonly string[] = Object.freeze([
   ),
 ]);
 
+/**
+ * `public` (every role) and `pg_` names (PostgreSQL's own roles), in any
+ * case: never a writer, never given a grant (S-052 third review).
+ */
+export function reservedRoleName(role: string): boolean {
+  const name = role.toLowerCase();
+  return name === "public" || name.startsWith("pg_");
+}
+
 /** A role name `grantWriterRole` takes: lower case, digits and `_`, up to 63 characters. */
 const ROLE_NAME = /^[a-z_][a-z0-9_]{0,62}$/;
 
 /**
  * Gives `role` the writer's privileges (`WRITER_GRANTS`) in the connected
  * database. Run as the owner of the tables (the migrating role), in a
- * transaction. The role must exist.
+ * transaction. The role must exist. Also tries `grantIdentityRead`, which
+ * only a superuser (or a role holding that grant with its option) can do:
+ * `identityReadable` says whether the role can now read the cluster's
+ * system identifier, which the purge of removed files needs (S-052).
  */
-export async function grantWriterRole(db: Queryable, role: string): Promise<void> {
+export async function grantWriterRole(
+  db: Queryable,
+  role: string,
+): Promise<{ readonly identityReadable: boolean }> {
   if (!ROLE_NAME.test(role)) {
     throw new TypeError("A role name is lower case letters, digits and _, at most 63 characters.");
+  }
+  if (reservedRoleName(role)) {
+    throw new TypeError("PUBLIC and pg_ roles are never Oculus's writer.");
   }
   for (const statement of WRITER_GRANTS) {
     // Names can't be parameters: the name goes in through set_config and is
@@ -145,6 +163,45 @@ export async function grantWriterRole(db: Queryable, role: string): Promise<void
       EXECUTE format(current_setting('oculus.grant_statement'), current_setting('oculus.grant_role'));
     END $$`);
   }
+  return { identityReadable: await grantIdentityRead(db, role) };
+}
+
+/**
+ * The line to show when `grantIdentityRead` couldn't make its grant
+ * (S-052, D-086): nothing fails over it, but the purge refuses until then.
+ */
+export function identityGrantHint(role: string): string {
+  return `Purging removed files will answer identity_unknown until a superuser runs, in this database: GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO ${role};`;
+}
+
+/**
+ * Lets `role` (default: the connected role) read the cluster's system
+ * identifier, `GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system()`, in
+ * the connected database (S-052): without it the database's identity is
+ * only `-:<oid>`, which a restore into a fresh cluster shares, and the purge
+ * of removed files refuses (`identity_unknown`). Only a superuser can grant
+ * it; for anyone else it changes nothing and never fails (safe inside a
+ * transaction). Returns whether the role can read it now.
+ */
+export async function grantIdentityRead(db: Queryable, role?: string): Promise<boolean> {
+  const [who] = await db.rows<{ name: string }>(sql`SELECT current_user::text AS name`);
+  const target = role ?? who?.name ?? "";
+  if (reservedRoleName(target)) throw new TypeError("PUBLIC and pg_ roles are never given this.");
+  const [already] = await db.rows<{ ok: boolean }>(sql`
+    SELECT pg_catalog.has_function_privilege(${target}, 'pg_catalog.pg_control_system()', 'EXECUTE')
+      AS ok`);
+  if (already?.ok === true) return true;
+  await db.rows(sql`SELECT set_config('oculus.grant_role', ${target}, true)`);
+  await db.execute(sql`DO $$ BEGIN
+    EXECUTE format('GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO %I',
+                   current_setting('oculus.grant_role'));
+  EXCEPTION WHEN insufficient_privilege THEN
+    NULL;
+  END $$`);
+  const [now] = await db.rows<{ ok: boolean }>(sql`
+    SELECT pg_catalog.has_function_privilege(${target}, 'pg_catalog.pg_control_system()', 'EXECUTE')
+      AS ok`);
+  return now?.ok === true;
 }
 
 /** What `checkWriterConnection` finds wrong with the connection's role. */
