@@ -26,15 +26,22 @@ CREATE TABLE public.file_store_binding (
   bound_at timestamptz NOT NULL DEFAULT now()
 );
 
--- What happened to files: every attach and every removal, append-only (like
--- D-084's people_events). A removal also keeps the content's bytes on disk
--- for seven days: the sweep removes a copy only when no row names it and no
--- removal of it happened within that time.
+-- What happened to files, append-only (like D-084's people_events):
+--   placing   an attach is about to put a copy on disk (committed in its own
+--             transaction before the copy is placed);
+--   attached  the attach committed;
+--   removed   the file was removed from its asset.
+-- The sweep deletes only what this database itself decided to give up
+-- (deny by default, third review): a copy no row names whose latest event
+-- here is a removal older than seven days, or a placing older than a day
+-- (an attach that failed after placing its copy). A copy this database has
+-- no event for is kept: a restored or cloned database never deletes files
+-- it didn't remove itself.
 CREATE TABLE public.stored_file_events (
   organization_id uuid NOT NULL REFERENCES public.organizations (id),
   id uuid NOT NULL CONSTRAINT stored_file_events_id_v4
     CHECK (id::text ~ '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'),
-  kind text NOT NULL CONSTRAINT stored_file_events_kind CHECK (kind IN ('attached', 'removed')),
+  kind text NOT NULL CONSTRAINT stored_file_events_kind CHECK (kind IN ('placing', 'attached', 'removed')),
   -- No foreign keys to the file or the record: a removed file's row is gone,
   -- and the log outlives both.
   file_id uuid NOT NULL,

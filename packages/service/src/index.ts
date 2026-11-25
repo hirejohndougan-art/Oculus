@@ -54,6 +54,7 @@ export type {
   ReceiveOptions,
   ReceiveRefusal,
   ReceiveResult,
+  StoreMarker,
 } from "./file-store.js";
 export { MAX_THUMBNAIL_SOURCE_BYTES, VIEW_HEADER_BYTES } from "./files.js";
 export {

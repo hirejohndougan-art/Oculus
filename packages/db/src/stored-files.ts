@@ -292,7 +292,7 @@ export async function findStoredFileById(
 }
 
 /** What happened to a file: `stored_file_events`' kinds. */
-export const STORED_FILE_EVENT_KINDS = ["attached", "removed"] as const;
+export const STORED_FILE_EVENT_KINDS = ["placing", "attached", "removed"] as const;
 export type StoredFileEventKind = (typeof STORED_FILE_EVENT_KINDS)[number];
 
 /** Logs an attach or a removal (the database stamps the time). */
@@ -300,7 +300,7 @@ export async function insertStoredFileEvent(
   tx: Queryable,
   organizationId: OrganizationId,
   kind: StoredFileEventKind,
-  file: StoredFile,
+  file: Pick<StoredFile, "id" | "recordId" | "sha256" | "size">,
   actor: string,
 ): Promise<void> {
   checkOrganization(organizationId);
@@ -317,31 +317,82 @@ export async function insertStoredFileEvent(
 
 /** How long a removed file's bytes stay on disk before the sweep may take them. */
 export const REMOVED_FILE_GRACE_SECONDS = 7 * 24 * 3600;
+/** How long a copy placed by an attach that never committed stays before the sweep may take it. */
+export const PLACING_GRACE_SECONDS = 24 * 3600;
 
 /**
- * Which of these contents the sweep must keep: those some row names, and
- * those removed within the grace period (`graceSeconds`, by the database's
- * clock).
+ * What the sweep may do with these contents, **denying by default** (D-086,
+ * third review): `deletable` holds only contents no row names whose latest
+ * event in this database is a removal older than `removedGrace` or a
+ * placing older than `placingGrace` (by the database's clock); `unknown`
+ * holds contents no row names and this database has no event for at all
+ * (another install's, or files attached after this database was copied):
+ * they are kept, only counted. Everything else is kept.
  */
-export async function keptContents(
+export async function sweepableContents(
   db: Queryable,
   organizationId: OrganizationId,
   hashes: readonly string[],
-  graceSeconds = REMOVED_FILE_GRACE_SECONDS,
-): Promise<ReadonlySet<string>> {
+  grace: { readonly removed?: number; readonly placing?: number } = {},
+): Promise<{ readonly deletable: ReadonlySet<string>; readonly unknown: ReadonlySet<string> }> {
   checkOrganization(organizationId);
-  if (!Number.isInteger(graceSeconds) || graceSeconds < 0) throw new TypeError("Not a grace.");
+  const removedGrace = grace.removed ?? REMOVED_FILE_GRACE_SECONDS;
+  const placingGrace = grace.placing ?? PLACING_GRACE_SECONDS;
+  for (const g of [removedGrace, placingGrace]) {
+    if (!Number.isInteger(g) || g < 0) throw new TypeError("Not a grace.");
+  }
   const wanted = hashes.filter((h) => isSha256Hex(h));
-  if (wanted.length === 0) return new Set();
-  const rows = await db.rows<{ sha256: string }>(sql`
-    SELECT DISTINCT sha256 FROM public.stored_files
-    WHERE organization_id = ${organizationId}::uuid AND sha256 = ANY(${wanted}::text[])
-    UNION
-    SELECT DISTINCT sha256 FROM public.stored_file_events
-    WHERE organization_id = ${organizationId}::uuid AND sha256 = ANY(${wanted}::text[])
-      AND kind = 'removed'
-      AND occurred_at > clock_timestamp() - make_interval(secs => ${graceSeconds})`);
-  return new Set(rows.map((r) => r.sha256));
+  if (wanted.length === 0) return { deletable: new Set(), unknown: new Set() };
+  const rows = await db.rows<{
+    sha256: string;
+    named: boolean;
+    kind: string | null;
+    old: boolean;
+  }>(sql`
+    SELECT h.sha256,
+      EXISTS (SELECT 1 FROM public.stored_files f
+              WHERE f.organization_id = ${organizationId}::uuid AND f.sha256 = h.sha256) AS named,
+      last.kind,
+      coalesce(last.occurred_at < clock_timestamp() - make_interval(secs =>
+        CASE last.kind WHEN 'removed' THEN ${removedGrace}::integer
+                       ELSE ${placingGrace}::integer END), false) AS old
+    FROM unnest(${wanted}::text[]) AS h(sha256)
+    LEFT JOIN LATERAL (
+      SELECT e.kind, e.occurred_at FROM public.stored_file_events e
+      WHERE e.organization_id = ${organizationId}::uuid AND e.sha256 = h.sha256
+      ORDER BY e.occurred_at DESC, e.id DESC
+      LIMIT 1
+    ) last ON true`);
+  const deletable = new Set<string>();
+  const unknown = new Set<string>();
+  for (const row of rows) {
+    if (row.named) continue;
+    if (row.kind === null) unknown.add(row.sha256);
+    else if ((row.kind === "removed" || row.kind === "placing") && row.old)
+      deletable.add(row.sha256);
+  }
+  return { deletable, unknown };
+}
+
+/**
+ * Something that tells this database apart from a dump of it restored
+ * elsewhere, or under the same name: its OID (a restore makes a new
+ * database) and, where the role may read it, the cluster's system
+ * identifier (a different cluster). A physical clone keeps both; the
+ * sweep's deny-by-default rule is what protects that case.
+ */
+export async function databaseIdentity(db: Queryable): Promise<string> {
+  const rows = await db.rows<{ oid: string }>(sql`
+    SELECT oid::text AS oid FROM pg_catalog.pg_database WHERE datname = current_database()`);
+  let system = "-";
+  try {
+    const control = await db.rows<{ id: string }>(sql`
+      SELECT system_identifier::text AS id FROM pg_catalog.pg_control_system()`);
+    system = control[0]?.id ?? "-";
+  } catch {
+    // Not readable by this role: the OID alone.
+  }
+  return `${system}:${rows[0]?.oid ?? "-"}`;
 }
 
 /** Which of these organization IDs exist in this database. */

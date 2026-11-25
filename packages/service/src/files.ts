@@ -51,7 +51,8 @@ import {
   findStoredFileById,
   insertFileStoreBinding,
   insertStoredFileEvent,
-  keptContents,
+  sweepableContents,
+  databaseIdentity,
   readFileStoreBinding,
   insertStoredFile,
   listStoredFiles,
@@ -67,7 +68,7 @@ import {
 } from "@oculus/db";
 import { editPermissions, notPermitted, type RecordAccess, type Refusal } from "./access.js";
 import type { Runner } from "./admin.js";
-import type { FileStore, ReceivedFile } from "./file-store.js";
+import type { FileStore, ReceivedFile, StoreMarker } from "./file-store.js";
 import {
   THUMBNAIL_BOXES,
   THUMBNAIL_LIMITS,
@@ -118,10 +119,21 @@ export interface FileSweep {
   readonly contents: number;
   /** Entries at content paths that aren't regular files: left alone, to be looked at. */
   readonly skipped: number;
+  /**
+   * Copies no row names that this database has no record of at all (another
+   * install's, or files attached after this database was copied): kept.
+   */
+  readonly unknown: number;
   /** Organizations (or the temporary files) whose sweep failed; the others went on. */
   readonly failed: number;
   /** True when the folder isn't bound to this database: nothing was swept. */
   readonly unbound: boolean;
+  /**
+   * Why a bound store wasn't swept: the marker is gone or names another
+   * install (`marker_changed`), or names another database, as after a
+   * restore or a copy (`database_changed`).
+   */
+  readonly halted?: "marker_changed" | "database_changed";
 }
 
 /** Why a file is read: to download it (any type), or to show it in the browser. */
@@ -205,7 +217,8 @@ export interface FileOperations {
    * succeeds the sweep deletes nothing.
    */
   bindFileStore(): Promise<
-    { readonly ok: true } | { readonly ok: false; readonly problem: FileStoreProblem }
+    | { readonly ok: true; readonly warning?: "database_changed" }
+    | { readonly ok: false; readonly problem: FileStoreProblem }
   >;
   /** The asset's files (name, size, sniffed type, who and when). */
   listFiles(
@@ -231,6 +244,26 @@ function refusal(path: (string | number)[], code: string, message: string): Serv
 }
 
 const NO_STORE = refusal(["files"], "files_unavailable", "Files can't be stored on this server.");
+
+/** A marker, waiting briefly while another server is writing one (its temporary file exists). */
+async function markerSettled(store: FileStore): Promise<StoreMarker | undefined> {
+  for (let i = 0; i < 30; i++) {
+    const marker = await store.readMarker();
+    if (marker !== undefined || !(await store.markerInProgress())) return marker;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return store.readMarker();
+}
+
+/** `read`'s first defined answer within about three seconds, or `undefined`. */
+async function waitFor<T>(read: () => Promise<T | undefined>): Promise<T | undefined> {
+  for (let i = 0; i < 30; i++) {
+    const value = await read();
+    if (value !== undefined) return value;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return undefined;
+}
 
 export function fileOperations(
   db: Database,
@@ -371,6 +404,37 @@ export function fileOperations(
 
     async attachFile(context, recordId, received, options) {
       try {
+        // The attach intent, committed on its own before any copy is
+        // placed (deny-by-default sweep, third review): if the attach then
+        // fails after placing its copy, this database knows it put it there
+        // and the sweep may take it after a day; without the intent the
+        // copy would be "unknown" and kept for ever.
+        const fileId = randomUUID();
+        const intent = await run(
+          "attachIntent",
+          context,
+          async (tx, who): Promise<ServiceResult<true>> => {
+            if (store === undefined) return NO_STORE;
+            if (received.organizationId !== who.organizationId) {
+              return refusal(
+                ["files"],
+                "wrong_organization",
+                "The file was received for another organization.",
+              );
+            }
+            const refused = await attachable(tx, who, recordId, options.expectedVersion);
+            if (refused) return refused;
+            await insertStoredFileEvent(
+              tx,
+              who.organizationId,
+              "placing",
+              { id: fileId, recordId, sha256: received.sha256, size: received.size },
+              who.actor,
+            );
+            return { ok: true, value: true };
+          },
+        );
+        if (!intent.ok) return intent;
         return await run(
           "attachFile",
           context,
@@ -416,7 +480,7 @@ export function fileOperations(
             const now = clock();
             const file = await insertStoredFile(tx, {
               organizationId: who.organizationId,
-              id: randomUUID(),
+              id: fileId,
               recordId,
               sha256: received.sha256,
               size: received.size,
@@ -474,58 +538,103 @@ export function fileOperations(
 
     async bindFileStore() {
       if (store === undefined) return { ok: false, problem: "no_store" };
-      const held = await readFileStoreBinding(db);
-      const marker = await store.readMarker();
-      if (held !== undefined) {
-        if (marker === held) {
-          store.bind(held);
-          return { ok: true };
+      const identity = await databaseIdentity(db);
+      let held = await readFileStoreBinding(db);
+      let marker = await markerSettled(store);
+      if (held === undefined && marker === undefined) {
+        // This database has never used a files folder: an empty one gets a
+        // new install ID, marker first (so a crash leaves a marker this
+        // database can still adopt, below), then the row.
+        if (!(await store.isEmpty())) return { ok: false, problem: "not_empty" };
+        const storeId = randomUUID();
+        let wrote = false;
+        try {
+          await store.writeMarker(storeId, identity);
+          wrote = true;
+        } catch {
+          // Another server of this database (or another install) wrote one
+          // first: decided below from what it wrote.
         }
-        return { ok: false, problem: marker === undefined ? "marker_missing" : "other_install" };
+        if (wrote) {
+          held = await insertFileStoreBinding(db, storeId);
+          marker = { storeId, database: identity };
+        } else {
+          marker = await markerSettled(store);
+        }
       }
-      // This database has never used a files folder.
-      if (marker !== undefined) return { ok: false, problem: "other_install" };
-      if (!(await store.isEmpty())) return { ok: false, problem: "not_empty" };
-      const storeId = await insertFileStoreBinding(db, randomUUID());
-      try {
-        await store.writeMarker(storeId);
-      } catch (error) {
-        // Another server of this install wrote it first: fine if it agrees.
-        if ((await store.readMarker()) !== storeId) throw error;
+      if (held === undefined && marker !== undefined) {
+        // A marker without this database's row: either another server of
+        // this database is between its two steps, or a crash came between
+        // them (the marker names this database's identity, nothing else
+        // ever does), or it is another install's.
+        held = await waitFor(() => readFileStoreBinding(db));
+        if (held === undefined && marker.database === identity) {
+          held = await insertFileStoreBinding(db, marker.storeId);
+        }
       }
-      store.bind(storeId);
-      return { ok: true };
+      if (held === undefined) return { ok: false, problem: "other_install" };
+      if (marker === undefined) return { ok: false, problem: "marker_missing" };
+      if (marker.storeId !== held) return { ok: false, problem: "other_install" };
+      store.bind(held);
+      if (marker.database === undefined) {
+        // An operator removed the database line to let this database sweep
+        // again (after a restore): it is recorded now.
+        await store.recordDatabase(held, identity);
+        return { ok: true };
+      }
+      // A restored or copied database: bound (uploads work), but its sweep
+      // stays off until an operator says this is the database now.
+      return marker.database === identity
+        ? { ok: true }
+        : { ok: true, warning: "database_changed" };
     },
 
     async sweepFiles(incomingMaxAgeMs) {
-      const none = { incoming: 0, contents: 0, skipped: 0, failed: 0, unbound: false };
+      const none: FileSweep = {
+        incoming: 0,
+        contents: 0,
+        skipped: 0,
+        unknown: 0,
+        failed: 0,
+        unbound: false,
+      };
       if (store === undefined) return none;
       // Not yet checked against this database: the folder may be another
       // install's, so nothing outside our own uploads is touched.
-      if (store.boundTo() === undefined || store.boundTo() !== (await readFileStoreBinding(db))) {
+      const bound = store.boundTo();
+      if (bound === undefined || bound !== (await readFileStoreBinding(db))) {
         return { ...none, unbound: true };
       }
+      // The marker again, every time, and the database's identity in it.
+      const marker = await store.readMarker().catch(() => undefined);
+      if (marker?.storeId !== bound) return { ...none, halted: "marker_changed" };
+      if (marker.database !== (await databaseIdentity(db))) {
+        return { ...none, halted: "database_changed" };
+      }
+      // Only organizations of this database: any other folder is left alone.
+      const onDisk = await store.organizations();
+      const known = await existingOrganizations(db, onDisk);
+      const ours = onDisk.filter((id) => known.has(id));
       let failed = 0;
       let incoming = 0;
       try {
-        incoming = await store.staleIncoming(incomingMaxAgeMs);
+        incoming = await store.staleIncoming(incomingMaxAgeMs, ours);
       } catch {
         failed++;
       }
       let contents = 0;
       let skipped = 0;
-      const onDisk = await store.organizations();
-      // Only organizations of this database: any other folder is left alone.
-      const known = await existingOrganizations(db, onDisk);
-      for (const organizationId of onDisk) {
-        if (!known.has(organizationId)) continue;
+      let unknown = 0;
+      for (const organizationId of ours) {
         try {
           // Decided under the organization's file lock (an attach placing a
           // copy holds it until its row is committed), and moved aside there
           // in one cheap rename each; deleted after the lock is released.
-          skipped += await db.transaction(async (tx) => {
+          // Deny by default: only what this database itself gave up.
+          const counts = await db.transaction(async (tx) => {
             await lockOrganizationFiles(tx, organizationId);
             const listed = await store.listContents(organizationId);
+            let unknownHere = 0;
             // Copies and cached thumbnails (M-003) alike: thumbnails go with
             // their bytes, and a thumbnail left without its copy goes too.
             const hashes = [
@@ -533,20 +642,21 @@ export function fileOperations(
             ].sort();
             for (let i = 0; i < hashes.length; i += 1000) {
               const batch = hashes.slice(i, i + 1000);
-              const kept = await keptContents(tx, organizationId, batch);
-              for (const sha256 of batch) {
-                if (!kept.has(sha256)) await store.trash(organizationId, sha256);
-              }
+              const decided = await sweepableContents(tx, organizationId, batch);
+              unknownHere += decided.unknown.size;
+              for (const sha256 of decided.deletable) await store.trash(organizationId, sha256);
             }
-            return listed.skipped;
+            return { skipped: listed.skipped, unknown: unknownHere };
           });
+          skipped += counts.skipped;
+          unknown += counts.unknown;
           contents += await store.emptyTrash(organizationId);
         } catch {
           // One organization's trouble doesn't stop the others.
           failed++;
         }
       }
-      return Object.freeze({ incoming, contents, skipped, failed, unbound: false });
+      return Object.freeze({ incoming, contents, skipped, unknown, failed, unbound: false });
     },
 
     async fileContent(context, recordId, fileId, use) {

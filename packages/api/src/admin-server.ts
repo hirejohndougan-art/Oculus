@@ -93,7 +93,7 @@ const FILE_STORE_PROBLEMS: Readonly<Record<FileStoreProblem, string>> = {
   other_install:
     "the folder belongs to another Oculus install (its .oculus-store-id names another database). Give this install a folder of its own.",
   marker_missing:
-    "this database has used a files folder before, but this folder has no .oculus-store-id. Point it at that folder (restore it from backup if it was lost).",
+    "this database has used a files folder before, and this folder has no .oculus-store-id. Set OCULUS_FILES_DIR to the folder this database used (restore that folder from backup if it was lost).",
   not_empty:
     "the folder isn't empty and has no .oculus-store-id. Give Oculus an empty folder of its own.",
 };
@@ -362,7 +362,22 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   // Stale temporary files and copies no row names (D-086): now, then on a
   // timer that stops with the server.
   // The files folder must be this install's (D-086, review B1).
-  const bound = await service.bindFileStore();
+  let bound: Awaited<ReturnType<typeof service.bindFileStore>>;
+  try {
+    bound = await service.bindFileStore();
+  } catch (error) {
+    // A file system error's message holds the path: only its code is shown.
+    const code = (error as { code?: unknown }).code;
+    throw new Error(
+      `refusing to start: ${FILES_DIR_ENV}: the folder couldn't be prepared (${typeof code === "string" && /^[A-Z][A-Z0-9_]{1,30}$/.test(code) ? code : "error"}).`,
+      { cause: error },
+    );
+  }
+  if (bound.ok && bound.warning === "database_changed") {
+    // A restored or copied database on this folder: it starts, but it
+    // never sweeps until an operator says this is the database now (D-086).
+    log({ event: "startup_warning", code: "files_database_changed" });
+  }
   if (!bound.ok) {
     throw new Error(`refusing to start: ${FILES_DIR_ENV}: ${FILE_STORE_PROBLEMS[bound.problem]}`);
   }
@@ -370,6 +385,9 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     try {
       const swept = await service.sweepFiles(INCOMING_MAX_AGE_MS);
       if (swept.skipped > 0) log({ event: "startup_warning", code: "files_sweep_skipped" });
+      if (swept.halted !== undefined) {
+        log({ event: "startup_warning", code: `files_sweep_${swept.halted}` });
+      }
       if (swept.failed > 0)
         log({ event: "service_error", operation: "sweepFiles", code: "partial" });
     } catch (error) {
