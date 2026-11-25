@@ -104,10 +104,24 @@ export async function signInAndSetUp(
 
   await expect(page.getByRole("heading", { name: "Set up two-step sign-in" })).toBeVisible();
   if (check) await accessible(page, "Set up two-step sign-in");
-  await page.getByRole("button", { name: "Start setting up" }).press("Enter");
-
-  // The set-up step hashes and seals the key; give it time on a loaded machine.
-  await expect(page.getByRole("img", { name: /QR code/ })).toBeVisible({ timeout: 15_000 });
+  // The set-up step hashes and seals the key; give it time on a loaded
+  // machine. A press that lands while the screen is still settling can be
+  // lost, so the key is pressed again (at most twice more) while the
+  // button is still there and ready; the assertion itself is unchanged.
+  const qr = page.getByRole("img", { name: /QR code/ });
+  const start = page.getByRole("button", { name: "Start setting up" });
+  await expect(start).toBeEnabled();
+  await start.press("Enter");
+  for (let retry = 0; retry < 2; retry++) {
+    try {
+      await expect(qr).toBeVisible({ timeout: 5_000 });
+      break;
+    } catch {
+      // Still on the first screen with the button ready: the press was lost.
+      if ((await start.isVisible()) && (await start.isEnabled())) await start.press("Enter");
+    }
+  }
+  await expect(qr).toBeVisible({ timeout: 15_000 });
   if (check) await accessible(page, "Scan the code");
   const key = (await page.locator("code").first().textContent()) ?? "";
   const secret = decodeBase32(key.replace(/\s+/g, ""));
