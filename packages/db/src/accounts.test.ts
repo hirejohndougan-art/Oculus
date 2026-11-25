@@ -28,6 +28,7 @@ import {
   createFirstSystemAdmin,
   createInvitation,
   deleteExpiredSignInThrottles,
+  failureClass,
   markKnownSource,
   revokeInvitation,
   signIn,
@@ -2212,4 +2213,19 @@ describe("the writer's grants (D-068)", () => {
       });
     }
   }, 60_000);
+});
+
+describe("failureClass (S-050)", () => {
+  it("names a failure by its SQLSTATE or error name, never its message", () => {
+    expect(failureClass(Object.assign(new Error("secret 203.0.113.9"), { code: "57P01" }))).toBe(
+      "SQLSTATE 57P01",
+    );
+    expect(failureClass(new TypeError("person@example.org"))).toBe("TypeError");
+    expect(failureClass({ code: "ECONNREFUSED", name: "Error" })).toBe("ECONNREFUSED");
+    expect(failureClass({ code: "EPERM", name: "Error" })).toBe("EPERM");
+    expect(failureClass({ code: "40001" })).toBe("SQLSTATE 40001");
+    expect(failureClass({ name: "has spaces and 203.0.113.9" })).toBe("unknown");
+    expect(failureClass(null)).toBe("unknown");
+    expect(failureClass("text")).toBe("unknown");
+  });
 });

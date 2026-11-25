@@ -67,6 +67,7 @@ import {
   takeLock,
   urlHasPassword,
   windowProfileFolder,
+  windowsSettingsWarning,
   type Env,
 } from "./desktop.js";
 import { ORIGINS_ENV } from "./origin.js";
@@ -300,6 +301,8 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
   let wantedPort: number;
   try {
     folder = settingsFolder(platform, env, options.home ?? homedir());
+    const warning = windowsSettingsWarning(platform, env);
+    if (warning !== undefined) err(warning);
     ensureSettingsFolder(folder);
     const settings = readDesktopSettings(folder);
     url = chooseDatabaseUrl(env, settings, folder);

@@ -487,6 +487,8 @@ describe("sharing on a record's screen", () => {
       [`POST ${API}/shares`]: () => {
         offered += 1;
         const code = ["", "already_shared", "unknown_site", "not_published"][offered - 1];
+        // An unknown site is the ordinary 404 (S-050).
+        if (code === "unknown_site") return [404, { error: "not_found" }];
         return code === ""
           ? [201, { share: { ...mine, state: "offered" } }]
           : [422, { error: "invalid", issues: [{ path: [], code, message: "x" }] }];
