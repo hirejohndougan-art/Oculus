@@ -79,8 +79,8 @@ export interface PublicTermCounts {
 export interface PublicTermCountOptions {
   /** As `readPublicRecord`'s: the URL records are published under, ending in `/`. */
   readonly baseUrl: string;
-  /** As `readPublicRecord`'s: the organization's Dublin Core mappings. */
-  readonly mappings: readonly unknown[];
+  /** As `readPublicRecord`'s: the organization's Dublin Core mappings; the stored ones when left out. */
+  readonly mappings?: readonly unknown[];
   /** Only these fields count (for a Subjects page, the subject fields); all when left out. */
   readonly fields?: readonly string[];
   /** Stop and refuse (`too_slow`) after this long; default 30 000, at most 300 000. */
@@ -107,19 +107,21 @@ const MAX_TIME_LIMIT_MS = 300_000;
 
 function readOptions(options: unknown): Validated<{
   baseUrl: string;
-  mappings: readonly unknown[];
+  mappings: readonly unknown[] | undefined;
   fields: ReadonlySet<string> | undefined;
   timeLimitMs: number;
 }> {
   const bad = (): Validated<never> =>
-    refused([], "invalid_options", "Give { baseUrl, mappings, fields?, timeLimitMs? }.");
+    refused([], "invalid_options", "Give { baseUrl, mappings?, fields?, timeLimitMs? }.");
   if (typeof options !== "object" || options === null) return bad();
   for (const key of Object.keys(options)) {
     if (!["baseUrl", "mappings", "fields", "timeLimitMs"].includes(key)) return bad();
   }
   const baseUrl = own(options, "baseUrl");
   const mappings = own(options, "mappings");
-  if (typeof baseUrl !== "string" || !Array.isArray(mappings)) return bad();
+  if (typeof baseUrl !== "string") return bad();
+  if (Object.hasOwn(options, "mappings") && !Array.isArray(mappings)) return bad();
+  const mappingList = Array.isArray(mappings) ? (mappings as readonly unknown[]) : undefined;
   const limit = own(options, "timeLimitMs");
   if (Object.hasOwn(options, "timeLimitMs")) {
     if (
@@ -140,14 +142,14 @@ function readOptions(options: unknown): Validated<{
   if (fieldList === undefined) {
     return Object.hasOwn(options, "fields")
       ? bad()
-      : { ok: true, value: { baseUrl, mappings, fields: undefined, timeLimitMs } };
+      : { ok: true, value: { baseUrl, mappings: mappingList, fields: undefined, timeLimitMs } };
   }
   if (!Array.isArray(fieldList) || fieldList.length > 200 || !fieldList.every(isFieldKey)) {
     return refused(["fields"], "invalid_fields", "fields must be a list of field keys.");
   }
   return {
     ok: true,
-    value: { baseUrl, mappings, fields: new Set<string>(fieldList), timeLimitMs },
+    value: { baseUrl, mappings: mappingList, fields: new Set<string>(fieldList), timeLimitMs },
   };
 }
 
@@ -197,7 +199,7 @@ async function countIn(
   organizationId: OrganizationId,
   siteId: SiteId,
   baseUrl: string,
-  mappings: readonly unknown[],
+  mappings: readonly unknown[] | undefined,
   fields: ReadonlySet<string> | undefined,
   timeLimitMs: number,
 ): Promise<Validated<PublicTermCounts>> {

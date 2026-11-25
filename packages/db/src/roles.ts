@@ -44,6 +44,8 @@ export const WRITER_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Ob
   organizations: ["INSERT", "UPDATE"],
   templates: ["INSERT"],
   template_versions: ["INSERT"],
+  // T-050b (D-096): one current mapping per template, replaced in place.
+  dublin_core_mappings: ["INSERT", "UPDATE"],
   record_types: ["INSERT"],
   record_type_versions: ["INSERT"],
   records: ["INSERT", "UPDATE", "DELETE"],
@@ -526,10 +528,13 @@ async function checkRoleConnection(
 
 /**
  * The functions the public sites read through, with their argument types:
- * `public_record_snapshot` (0017), the only way `readPublicRecord` reads.
+ * `public_record_snapshot` (0017) and `public_dublin_core_mapping` (0022,
+ * D-096), the only ways `readPublicRecord` reads.
  */
 export const PUBLIC_READER_FUNCTIONS: readonly string[] = Object.freeze([
   "public.public_record_snapshot(uuid, uuid, uuid)",
+  // T-050b (D-096): a public record's stored Dublin Core mapping.
+  "public.public_dublin_core_mapping(uuid, uuid, uuid)",
 ]);
 
 /**

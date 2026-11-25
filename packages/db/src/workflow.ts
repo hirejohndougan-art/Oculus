@@ -751,9 +751,11 @@ export interface PublicRecordOptions {
   /**
    * The organization's Dublin Core mappings; the one for the record's
    * template is used. Configuration, not record data: `publicOutput` checks
-   * it against the template and the organization (D-047).
+   * it against the template and the organization (D-047). Left out: the
+   * template's stored mapping (T-050b, D-096), read in the same snapshot
+   * through `public_dublin_core_mapping`, which the public reader may call.
    */
-  readonly mappings: readonly DublinCoreMapping[];
+  readonly mappings?: readonly DublinCoreMapping[];
 }
 
 /** The answer for a record that isn't published, doesn't exist or is another organization's. */
@@ -830,10 +832,11 @@ function publicSource(org: OrganizationId, row: PublicSnapshotRow): SnapshotSour
  * records public on the same site; anything else goes out as nothing
  * (D-045, D-048).
  *
- * Everything is read through one call of the database function
- * `public_record_snapshot` (SECURITY DEFINER, migration 0017) in a
+ * Everything is read through the database functions
+ * `public_record_snapshot` (SECURITY DEFINER, migration 0017) and, when no
+ * `mappings` are given, `public_dublin_core_mapping` (0022, D-096), in one
  * Repeatable Read, read-only transaction, so the state, the records, the
- * templates and the identifiers all come from one moment, and the
+ * templates, the identifiers and the mapping all come from one moment, and the
  * connection needs no table privilege at all: use a role made by
  * `grantPublicReaderRole` and checked by `checkPublicReaderConnection`
  * (roles.ts). It writes nothing.
@@ -857,13 +860,20 @@ export async function readPublicRecord(
   }
   const baseUrl = ownValue(options, "baseUrl");
   const mappings = ownValue(options, "mappings");
-  if (typeof baseUrl !== "string" || !Array.isArray(mappings)) {
-    return refused([], "invalid_options", "Give { baseUrl, mappings }.");
+  if (typeof baseUrl !== "string" || (mappings !== undefined && !Array.isArray(mappings))) {
+    return refused([], "invalid_options", "Give { baseUrl, mappings? }.");
   }
   return db.transaction(async (tx) => {
     // One snapshot for every read below, and nothing written.
     await tx.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`);
-    const read = await publicRecordIn(tx, organizationId, siteId, recordId, baseUrl, mappings);
+    const read = await publicRecordIn(
+      tx,
+      organizationId,
+      siteId,
+      recordId,
+      baseUrl,
+      mappings as readonly unknown[] | undefined,
+    );
     return read.ok ? { ok: true, value: read.value.output } : read;
   });
 }
@@ -879,8 +889,9 @@ export interface PublicRecordRead {
 /**
  * `readPublicRecord`'s work inside the caller's transaction, which must
  * already be Repeatable Read and read only (`publicTermCounts` reads many
- * records in one). Arguments are checked by the caller. Not exported from
- * `@oculus/db`.
+ * records in one). Arguments are checked by the caller. Without `mappings`,
+ * the record's template's stored mapping is used, read in the same snapshot
+ * (T-050b). Not exported from `@oculus/db`.
  */
 export async function publicRecordIn(
   tx: Queryable,
@@ -888,7 +899,7 @@ export async function publicRecordIn(
   siteId: SiteId,
   recordId: RecordId,
   baseUrl: string,
-  mappings: readonly unknown[],
+  mappings: readonly unknown[] | undefined,
 ): Promise<Validated<PublicRecordRead>> {
   const [found] = await tx.rows<{ snapshot: PublicSnapshotRow | null }>(sql`
     SELECT public.public_record_snapshot(${organizationId}::uuid, ${siteId}::uuid,
@@ -919,7 +930,17 @@ export async function publicRecordIn(
   if (!effective.ok) return refused([], "unreadable_record", CANT_CHECK);
   const view = publicView(effective.value);
   if (view === undefined) return refused([], "unreadable_record", CANT_CHECK);
-  const mapping = mappings.find((m) => ownValue(m, "template") === record.templateKey);
+  let mapping: unknown;
+  if (mappings === undefined) {
+    // The stored one, from the same snapshot (Repeatable Read, the caller's).
+    const [stored] = await tx.rows<{ mapping: unknown }>(sql`
+      SELECT public.public_dublin_core_mapping(${organizationId}::uuid, ${siteId}::uuid,
+                                               ${recordId}::uuid) AS mapping`);
+    mapping = stored?.mapping ?? undefined;
+    if (mapping === null) mapping = undefined;
+  } else {
+    mapping = mappings.find((m) => ownValue(m, "template") === record.templateKey);
+  }
   if (mapping === undefined) {
     return refused(
       ["mappings"],

@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 00:40 CT — manual (Chat C) — T-050b Stored Dublin Core mappings
+- Result: done (the old T-050b split into T-050b, T-050d and T-050e)
+- What changed: migration 0022 (`dublin_core_mappings`, `public_dublin_core_mapping`); `packages/db/src/dublin-core-mappings.ts`; `readPublicRecord` uses the stored mapping when none is passed; service `readDublinCoreMapping`/`saveDublinCoreMapping`; `GET`/`PUT /api/templates/:key/dublin-core`.
+- Decisions: D-096
+- Review: one independent round, nothing blocking; fixed a mapping without rights taking records offline, the full record read under the lock, the version check passable by direct SQL, and two stale comments.
+- Gate: PASS · tests_passing 4420 (was 4411) · npm audit clean. Migration renumbered 0022 at merge (main stopped at 0021).
+- Next: T-050d (public record reads)
+
 ## 2026-11-25 00:35 CT — manual (Chat E) — S-026 Publish check for ID number formats
 - Result: done
 - What changed: the publish check (`publishCheckIssues`) runs the public output's own template check (`publicTemplateIssues`, new in core), so a public ID number that no longer fits its type's changed format fails it (`format_mismatch`, fixed text) instead of the record passing and quietly dropping off the public sites; `identifierTypeChanges` takes `existing.published` and lists on `format_changed` the published records that would show as not available. Tests in core and against the database (publish check, public output, the fix path, inherited numbers). Follow-up S-033 (the service-side confirmation).
