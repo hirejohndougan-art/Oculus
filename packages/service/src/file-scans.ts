@@ -9,6 +9,14 @@
  * streams the stored copy to the scanner (`FileScanner`: clamd, clamd.ts)
  * and records what it said (`recordScanResult`), which also logs it.
  *
+ * - **Only an infected verdict takes a served file away:** a rescan keeps a
+ *   clean content clean while it waits, and a failed scan of a clean or
+ *   not-yet-scanned content leaves it served. A rescan that comes in while
+ *   a content is being scanned isn't lost: the result of the older claim
+ *   isn't stored and the content is scanned again (`generation`, db).
+ * - **Organizations take turns:** each claim starts after the organization
+ *   the last one took, so one organization's thousand files don't hold up
+ *   another's upload.
  * - **Failures are retried with backoff** (`scanBackoffMs`: 1, 4, 16, 64
  *   minutes …, at most 6 hours apart); a file larger than the scanner takes
  *   (`too_large`) isn't retried by itself, since nothing will change until
@@ -84,6 +92,8 @@ export interface ScanPass {
 }
 
 export interface FileScanQueue {
+  /** The largest file the scanner takes (bytes). */
+  readonly maxBytes: number;
   /** Starts workers for whatever is due (after an attach or a rescan); never waits. */
   kick(): void;
   /** Queues contents without a result, then scans everything due; resolves when idle. */
@@ -111,7 +121,10 @@ export function fileScanQueue(
   let idleWaiters: (() => void)[] = [];
   /** Kicked while every worker was busy: one more look when one finishes. */
   let again = false;
-  let tally = { clean: 0, infected: 0, failed: 0 };
+  /** Each running `runOnce`'s own tally: a scan counts in every one running. */
+  const tallies = new Set<{ clean: number; infected: number; failed: number }>();
+  /** The organization the last claim took: the next claim tries the next one first. */
+  let lastOrganization: ClaimedScan["organizationId"] | undefined;
 
   const report = (error: unknown, operation: string): void => {
     try {
@@ -137,7 +150,13 @@ export function fileScanQueue(
     } catch {
       return failed("unreadable");
     }
-    const verdict = await scanner.scan(source, job.size);
+    let verdict: ClamdVerdict;
+    try {
+      verdict = await scanner.scan(source, job.size);
+    } finally {
+      // Whatever the scanner did with it, the file is closed.
+      source.destroy();
+    }
     if (!verdict.ok) return failed(verdict.failure);
     return verdict.verdict === "clean"
       ? { state: "clean" }
@@ -156,10 +175,11 @@ export function fileScanQueue(
         retryInSeconds: Math.max(1, Math.ceil(backoff(job.attempts + 1) / 1000)),
       };
     }
-    await db.transaction((tx) =>
-      recordScanResult(tx, job.organizationId, job.sha256, result, SCAN_ACTOR),
+    const recorded = await db.transaction((tx) =>
+      recordScanResult(tx, job.organizationId, job.sha256, result, SCAN_ACTOR, job.generation),
     );
-    tally = { ...tally, [result.state]: tally[result.state] + 1 };
+    if (recorded !== "stored") return;
+    for (const tally of tallies) tally[result.state]++;
   }
 
   async function worker(): Promise<void> {
@@ -167,12 +187,13 @@ export function fileScanQueue(
       while (!stopped) {
         let job: ClaimedScan | undefined;
         try {
-          job = await claimDueScan(db, leaseSeconds);
+          job = await claimDueScan(db, leaseSeconds, lastOrganization);
         } catch (error) {
           report(error, "claimScan");
           return;
         }
         if (job === undefined) return;
+        lastOrganization = job.organizationId;
         try {
           await scanOne(job);
         } catch (error) {
@@ -214,6 +235,8 @@ export function fileScanQueue(
   }
 
   return {
+    maxBytes: scanner.maxBytes,
+
     kick() {
       start();
     },
@@ -225,9 +248,14 @@ export function fileScanQueue(
       } catch (error) {
         report(error, "queueUnscanned");
       }
-      tally = { clean: 0, infected: 0, failed: 0 };
-      start();
-      await idle();
+      const tally = { clean: 0, infected: 0, failed: 0 };
+      tallies.add(tally);
+      try {
+        start();
+        await idle();
+      } finally {
+        tallies.delete(tally);
+      }
       return Object.freeze({ queued, ...tally });
     },
 

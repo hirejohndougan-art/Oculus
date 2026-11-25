@@ -156,14 +156,19 @@ export interface FileSweep {
 
 /**
  * A file's virus scan as the admin shows it (S-040, D-113): its content's
- * stored state, or `not_scanned` when no scanner is set up (or it was
- * never scanned and none is now). With a scanner, content with no result
- * yet is `pending`.
+ * stored state; `not_scanned` when no scanner is set up (and it isn't clean
+ * or infected); with a scanner, `not_yet_scanned` for content stored before
+ * scanning was turned on and not scanned yet (served meanwhile).
  */
-export type FileScanState = "pending" | "clean" | "infected" | "failed" | "not_scanned";
+export type FileScanState =
+  "pending" | "not_yet_scanned" | "clean" | "infected" | "failed" | "not_scanned";
 
 /** A file as `listFiles` lists it: the row and its content's scan. */
-export type ListedFile = StoredFile & { readonly scan: FileScanState };
+export type ListedFile = StoredFile & {
+  readonly scan: FileScanState;
+  /** Whether a scan of it is queued to run (again) by itself: worth asking again later. */
+  readonly scanQueued: boolean;
+};
 
 /** Virus scanning as System settings shows it, for the session's organization. */
 export interface FileScanStatus {
@@ -177,7 +182,9 @@ export function shownScanState(scanning: boolean, stored: StoredScan | undefined
   if (stored?.state === "infected") return "infected";
   if (stored?.state === "clean") return "clean";
   if (!scanning) return "not_scanned";
-  return stored?.state ?? "pending";
+  // No row: stored before scanning was on (every upload with it on makes one).
+  if (stored === undefined || stored.state === "unscanned") return "not_yet_scanned";
+  return stored.state;
 }
 
 /** Why a file is read: to download it (any type), or to show it in the browser. */
@@ -359,6 +366,11 @@ export interface FileOperations {
   scanQueuedFiles(): Promise<ScanPass>;
   /** Stops the scan queue (the server is closing), waiting for scans running now. */
   stopFileScans(): Promise<void>;
+  /**
+   * The largest upload taken (bytes): the store's cap, and while scanning
+   * is on no more than the scanner takes. `undefined` without a store.
+   */
+  fileUploadLimit(): number | undefined;
 }
 
 /** service.ts's `mayChange`: access, the row locked, the place checked. */
@@ -420,6 +432,20 @@ export function fileOperations(
   scans?: FileScanQueue,
 ): FileOperations {
   const scanning = scans !== undefined && store !== undefined;
+  /** The largest upload taken: the store's cap, and the scanner's while scanning is on. */
+  const uploadLimit = (): number | undefined =>
+    store === undefined
+      ? undefined
+      : scanning
+        ? Math.min(store.maxFileBytes, scans.maxBytes)
+        : store.maxFileBytes;
+  /** An upload the scanner couldn't take (S-040 review S1): refused before it is kept. */
+  const tooLargeToScan = (): ServiceRefusal =>
+    refusal(
+      ["files"],
+      "too_large_to_scan",
+      "The file is larger than the virus scanner takes, so it couldn't be scanned or downloaded.",
+    );
   const atOnce = thumbnailLimits.atOnce ?? THUMBNAILS_AT_ONCE;
   const perMinute = thumbnailLimits.perMinute ?? THUMBNAILS_PER_MINUTE;
   let renderer = thumbnails;
@@ -479,8 +505,11 @@ export function fileOperations(
    */
   function scanRefusal(state: FileScanState): ServiceRefusal | undefined {
     switch (state) {
+      // Stored before scanning was on (not_yet_scanned): served until its
+      // first scan (D-113).
       case "clean":
       case "not_scanned":
+      case "not_yet_scanned":
         return undefined;
       case "infected":
         return refusal(
@@ -651,12 +680,16 @@ export function fileOperations(
               "The file is larger than the server takes.",
             );
           }
+          if (scanning && declared > scans.maxBytes) return tooLargeToScan();
           if (used + declared > store.maxOrganizationBytes) return overQuota();
         }
         if (await store.lowOnSpace(declared ?? 0)) return diskFull();
         return {
           ok: true,
-          value: Object.freeze({ maxFileBytes: store.maxFileBytes, usedBytes: used }),
+          value: Object.freeze({
+            maxFileBytes: uploadLimit() ?? store.maxFileBytes,
+            usedBytes: used,
+          }),
         };
       });
     },
@@ -669,6 +702,8 @@ export function fileOperations(
         // and the sweep may take it after a day; without the intent the
         // copy would be "unknown" and kept for ever.
         const fileId = randomUUID();
+        // Without a declared length, the size is known only now.
+        if (scanning && received.size > scans.maxBytes) return tooLargeToScan();
         const intent = await run(
           "attachIntent",
           context,
@@ -1074,12 +1109,22 @@ export function fileOperations(
           files.map((f) => f.sha256),
         );
         const listed: readonly ListedFile[] = Object.freeze(
-          files.map((f) =>
-            Object.freeze({ ...f, scan: shownScanState(scanning, scans.get(f.sha256)) }),
-          ),
+          files.map((f) => {
+            const stored = scans.get(f.sha256);
+            return Object.freeze({
+              ...f,
+              scan: shownScanState(scanning, stored),
+              // No row yet: the next pass queues it.
+              scanQueued: scanning && stored?.nextAttemptAt !== null,
+            });
+          }),
         );
         return { ok: true, value: listed };
       });
+    },
+
+    fileUploadLimit() {
+      return uploadLimit();
     },
 
     async fileScanStatus(context) {

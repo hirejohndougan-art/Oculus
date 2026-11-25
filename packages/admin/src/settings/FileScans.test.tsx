@@ -30,14 +30,22 @@ const SITES = [
   },
 ];
 const admin = { ...me(SITES), systemAdmin: true };
-const COUNTS = { pending: 2, clean: 1204, infected: 1, failed: 3, unscanned: 1 };
+const COUNTS = {
+  pending: 2,
+  clean: 1204,
+  infected: 1,
+  failed: 3,
+  tooLarge: 2,
+  unscanned: 40,
+  rescanning: 0,
+};
 
 function server(routes: Record<string, Reply | ((s: Sent) => Reply)>, person: unknown = admin) {
   return fakeServer({ "GET /api/me": [200, person], ...routes });
 }
 
 describe("virus scanning settings", () => {
-  it("shows scanning on with the counts, and scans every file again", async () => {
+  it("shows scanning on with the counts, and scans every file again once confirmed", async () => {
     const sent = server({
       "GET /api/system/file-scans": [200, { scanning: true, counts: COUNTS }],
       "POST /api/system/file-scans/rescan": [200, { queued: 1207 }],
@@ -48,9 +56,19 @@ describe("virus scanning settings", () => {
     const nav = screen.getByRole("navigation", { name: "System settings" });
     expect(within(nav).getByRole("link", { name: "Virus scanning" })).toBeTruthy();
     expect(screen.getByText("1,204 files are clean")).toBeTruthy();
-    expect(screen.getByText("3 files are waiting to be scanned")).toBeTruthy();
+    expect(screen.getByText("2 new files are waiting for their scan")).toBeTruthy();
+    expect(screen.getByText(/40 files from before scanning was turned on/)).toBeTruthy();
+    expect(screen.getByText("3 files couldn't be scanned yet (tried again later)")).toBeTruthy();
+    // Too large: not tried again, and said so.
+    expect(
+      screen.getByText(/2 files are too large for the scanner \(not tried again/),
+    ).toBeTruthy();
     expect(screen.getByText("1 file holds a virus and is quarantined")).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Scan every file again" }));
+    // Asked first, saying what will happen; nothing sent yet.
+    expect(await screen.findByText(/Clean files can still be downloaded and opened/)).toBeTruthy();
+    expect(sent.some((s) => s.method === "POST")).toBe(false);
+    await user.click(screen.getByRole("button", { name: "Scan them again" }));
     expect(await screen.findByText("1,207 files will be scanned again.")).toBeTruthy();
     const post = sent.find((s) => s.method === "POST");
     expect(post?.path).toBe("/api/system/file-scans/rescan");
@@ -65,6 +83,7 @@ describe("virus scanning settings", () => {
     const user = userEvent.setup();
     renderAt("/settings/files");
     await user.click(await screen.findByRole("button", { name: "Scan every file again" }));
+    await user.click(await screen.findByRole("button", { name: "Scan them again" }));
     expect(await screen.findByText(/To scan every file again, enter your password/)).toBeTruthy();
   });
 
@@ -77,6 +96,18 @@ describe("virus scanning settings", () => {
       await screen.findByText(/Scanning is off: uploaded files are not scanned for viruses/),
     ).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Scan every file again" })).toBeNull();
+  });
+
+  it("cancels the rescan when asked to", async () => {
+    const sent = server({
+      "GET /api/system/file-scans": [200, { scanning: true, counts: COUNTS }],
+    });
+    const user = userEvent.setup();
+    renderAt("/settings/files");
+    await user.click(await screen.findByRole("button", { name: "Scan every file again" }));
+    await user.click(await screen.findByRole("button", { name: "Cancel" }));
+    expect(screen.queryByText(/Clean files can still be downloaded/)).toBeNull();
+    expect(sent.some((s) => s.method === "POST")).toBe(false);
   });
 
   it("isn't shown to anyone but a system manager", async () => {

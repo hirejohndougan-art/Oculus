@@ -15,14 +15,16 @@
  * the server sniffed from the bytes, never by the name.
  *
  * Virus scanning (S-040, D-113): each file shows its scan as a pill
- * (Scanning…, Clean, Infected (quarantined), Scan failed, Not scanned).
- * Only files the server will send get a Download link and a preview: with
- * a scanner, clean ones; without one, every file but an infected one, and
- * a notice says they were not scanned for viruses. While any file is being
- * scanned the list is read again every few seconds, marked
- * `X-Oculus-Background: 1` (it isn't a use of the session).
+ * (Scanning…, Not yet scanned, Clean, Infected (quarantined), Scan failed,
+ * Not scanned). Only files the server will send get a Download link and a
+ * preview: with a scanner, clean ones and those stored before scanning was
+ * turned on (until their first scan); without one, every file but an
+ * infected one, and a notice says they were not scanned for viruses. While
+ * a scan is due the list is read again on a timer (`scanPollMs`); only
+ * those timed reads are marked `X-Oculus-Background: 1` (they aren't a use
+ * of the session).
  */
-import { useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Button as AriaButton, FileTrigger } from "react-aria-components";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, api, problemText, uploadFile } from "../api";
@@ -33,7 +35,8 @@ import { whenText } from "./model";
 import styles from "./Records.module.css";
 
 /** A file's virus scan, as the server lists it (D-113). */
-export type ScanState = "pending" | "clean" | "infected" | "failed" | "not_scanned";
+export type ScanState =
+  "pending" | "not_yet_scanned" | "clean" | "infected" | "failed" | "not_scanned";
 
 export interface StoredFileEntry {
   readonly id: string;
@@ -43,14 +46,36 @@ export interface StoredFileEntry {
   readonly createdAt: string;
   /** Left out by servers before S-040: read as not scanned. */
   readonly scan?: ScanState;
+  /** A scan of it is queued to run (again) by itself. */
+  readonly scanQueued?: boolean;
 }
 
-/** How often the list is read again while a file is being scanned. */
+/** How often the list is read again while a new upload is being scanned. */
 export const SCAN_POLL_MS = 4000;
+/** How often while only failed or not-yet-scanned files wait for a scan. */
+export const SCAN_RETRY_POLL_MS = 30_000;
+
+/** How soon to read the list again for its scans, or `undefined` for not. */
+export function scanPollMs(files: readonly StoredFileEntry[]): number | undefined {
+  if (files.some((f) => f.scan === "pending")) return SCAN_POLL_MS;
+  if (
+    files.some(
+      (f) => (f.scan === "failed" || f.scan === "not_yet_scanned") && f.scanQueued === true,
+    )
+  ) {
+    return SCAN_RETRY_POLL_MS;
+  }
+  return undefined;
+}
 
 /** Whether the server sends this file (D-113): clean, or not scanned at all. */
 export function servable(file: StoredFileEntry): boolean {
-  return file.scan === undefined || file.scan === "clean" || file.scan === "not_scanned";
+  return (
+    file.scan === undefined ||
+    file.scan === "clean" ||
+    file.scan === "not_scanned" ||
+    file.scan === "not_yet_scanned"
+  );
 }
 
 const SCAN_PILLS: Readonly<Record<ScanState, { readonly label: string; readonly tone: string }>> = {
@@ -59,6 +84,7 @@ const SCAN_PILLS: Readonly<Record<ScanState, { readonly label: string; readonly 
   infected: { label: "Infected (quarantined)", tone: styles.red },
   failed: { label: "Scan failed", tone: styles.amber },
   not_scanned: { label: "Not scanned", tone: styles.gray },
+  not_yet_scanned: { label: "Not yet scanned", tone: styles.gray },
 };
 
 /** The file's scan as DESIGN.md's pill. */
@@ -152,22 +178,33 @@ interface Props {
 export function FilesPanel(props: Props) {
   const { siteId, recordId } = props;
   const queries = useQueryClient();
-  /** Set while files are being scanned: the reads that follow are the poll's. */
-  const polling = useRef(false);
+  const listUrl = `/api/records/${encodeURIComponent(recordId)}/files`;
   const list = useQuery({
     queryKey: filesKey(recordId),
-    queryFn: () =>
-      api<FileListReply>(`/api/records/${encodeURIComponent(recordId)}/files`, {
-        site: siteId,
-        background: polling.current,
-      }),
+    queryFn: () => api<FileListReply>(listUrl, { site: siteId }),
     refetchOnWindowFocus: false,
-    refetchInterval: (query) => {
-      const scanning = query.state.data?.files.some((f) => f.scan === "pending") === true;
-      polling.current = scanning;
-      return scanning ? SCAN_POLL_MS : false;
-    },
   });
+  // While scans are due, the list is read again on a timer: only those
+  // reads are marked X-Oculus-Background (not a use of the session).
+  const pollMs = scanPollMs(list.data?.files ?? []);
+  /** Moves on after each timed read (answered or not), so the next is set. */
+  const [polls, setPolls] = useState(0);
+  useEffect(() => {
+    if (pollMs === undefined) return;
+    const timer = setTimeout(() => {
+      api<FileListReply>(listUrl, { site: siteId, background: true })
+        .then((reply) => {
+          queries.setQueryData(filesKey(recordId), reply);
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          setPolls((n) => n + 1);
+        });
+    }, pollMs);
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [pollMs, polls, list.dataUpdatedAt, queries, recordId, listUrl, siteId]);
   const [uploads, setUploads] = useState<readonly Upload[]>([]);
   const [busy, setBusy] = useState(false);
   const [removing, setRemoving] = useState<StoredFileEntry>();
@@ -272,6 +309,7 @@ export function FilesPanel(props: Props) {
   const files = list.data?.files ?? [];
   const images = files.filter((f) => VIEWABLE.has(f.mediaType) && servable(f));
   const unscanned = files.some((f) => f.scan === "not_scanned");
+  const notYet = files.some((f) => f.scan === "not_yet_scanned");
   const infected = files.filter((f) => f.scan === "infected").length;
   const scanNotes: ReactNode[] = [];
   if (unscanned) {
@@ -279,6 +317,14 @@ export function FilesPanel(props: Props) {
       <Note key="unscanned" tone="amber">
         These files have not been scanned for viruses: this server has no virus scanner set up. Open
         them only if you trust where they came from.
+      </Note>,
+    );
+  }
+  if (notYet) {
+    scanNotes.push(
+      <Note key="not-yet" tone="blue">
+        Files marked Not yet scanned were added before virus scanning was turned on. They can still
+        be opened while they wait for their first scan.
       </Note>,
     );
   }

@@ -36,7 +36,9 @@ export type FakeClamdMode =
   /** Closes the connection after the first chunk (clamd going down mid-stream). */
   | "drop"
   /** Sends far more than a reply ever is. */
-  | "flood";
+  | "flood"
+  /** Answers "stream: OK" after the first chunk, before the stream ends. */
+  | "early_ok";
 
 export interface FakeClamd {
   readonly address: ClamdAddress;
@@ -99,6 +101,7 @@ export async function startFakeClamd(
           );
           break;
         case "size_limit":
+        case "early_ok":
           answer("stream: OK\0");
           break;
         case "silent":
@@ -153,6 +156,10 @@ export async function startFakeClamd(
         bodyBytes += length;
         buffer = buffer.subarray(4 + length);
         chunks++;
+        if (fake.mode === "early_ok" && chunks === 1) {
+          answer("stream: OK\0");
+          return;
+        }
         if (fake.mode === "drop" && chunks === 1) {
           done = true;
           socket.destroy();

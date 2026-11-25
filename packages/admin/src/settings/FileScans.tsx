@@ -2,14 +2,15 @@
  * Settings › Virus scanning (S-040, D-113): whether this server scans
  * uploaded files for viruses, how many of the organization's files are in
  * each state, and "Scan every file again", which a system manager uses
- * after the scanner's virus signatures were updated (a recent sign-in is
- * asked for). Scanning is set up where Oculus runs (`OCULUS_CLAMD_*`), not
+ * after the scanner's virus signatures were updated: confirmed in the page
+ * first, saying what will happen, then a recent sign-in is asked for. Scanning is set up where Oculus runs (`OCULUS_CLAMD_*`), not
  * here: without it the screen says plainly that files are not scanned.
  */
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, api } from "../api";
 import { Button, Note } from "../components/ui";
+import { ConfirmPanel } from "../records/controls";
 import records from "../records/Records.module.css";
 import { useReauthenticated } from "../people/Reauth";
 import { Problems } from "./Settings";
@@ -21,7 +22,9 @@ interface ScanStatus {
     readonly clean: number;
     readonly infected: number;
     readonly failed: number;
+    readonly tooLarge: number;
     readonly unscanned: number;
+    readonly rescanning: number;
   };
 }
 
@@ -33,6 +36,7 @@ const plural = (n: number, one: string, many: string) =>
 export function FileScanSettings() {
   const queries = useQueryClient();
   const [queued, setQueued] = useState<number>();
+  const [confirming, setConfirming] = useState(false);
   const read = useQuery({
     queryKey: FILE_SCANS_KEY,
     queryFn: () => api<ScanStatus>("/api/system/file-scans"),
@@ -64,13 +68,31 @@ export function FileScanSettings() {
             </Note>
             <ul className={records.meta}>
               <li>{plural(counts.clean, "file is clean", "files are clean")}</li>
+              {counts.rescanning > 0 ? (
+                <li>
+                  {plural(
+                    counts.rescanning,
+                    "clean file is waiting to be scanned again (it can still be opened)",
+                    "clean files are waiting to be scanned again (they can still be opened)",
+                  )}
+                </li>
+              ) : null}
               <li>
                 {plural(
-                  counts.pending + counts.unscanned,
-                  "file is waiting to be scanned",
-                  "files are waiting to be scanned",
+                  counts.pending,
+                  "new file is waiting for its scan",
+                  "new files are waiting for their scan",
                 )}
               </li>
+              {counts.unscanned > 0 ? (
+                <li>
+                  {plural(
+                    counts.unscanned,
+                    "file from before scanning was turned on isn't scanned yet (it can still be opened)",
+                    "files from before scanning was turned on aren't scanned yet (they can still be opened)",
+                  )}
+                </li>
+              ) : null}
               <li>
                 {plural(
                   counts.failed,
@@ -78,6 +100,15 @@ export function FileScanSettings() {
                   "files couldn't be scanned yet (tried again later)",
                 )}
               </li>
+              {counts.tooLarge > 0 ? (
+                <li>
+                  {plural(
+                    counts.tooLarge,
+                    "file is too large for the scanner (not tried again until the scanner's limit is raised and every file is scanned again)",
+                    "files are too large for the scanner (not tried again until the scanner's limit is raised and every file is scanned again)",
+                  )}
+                </li>
+              ) : null}
               <li>
                 {plural(
                   counts.infected,
@@ -87,7 +118,7 @@ export function FileScanSettings() {
               </li>
             </ul>
             <p className={records.meta}>
-              After the scanner&rsquo;s virus signatures are updated, scan every clean file again.
+              After the scanner&rsquo;s virus signatures are updated, scan every file again.
               Quarantined files stay quarantined.
             </p>
             {queued === undefined ? null : (
@@ -105,19 +136,39 @@ export function FileScanSettings() {
             <div className={records.actions}>
               <Button
                 variant="secondary"
-                isDisabled={rescan.isPending}
+                isDisabled={rescan.isPending || confirming}
                 onPress={() => {
                   setQueued(undefined);
-                  void reauth
-                    .run(async () => {
-                      await rescan.mutateAsync();
-                    })
-                    .catch(() => undefined);
+                  setConfirming(true);
                 }}
               >
                 Scan every file again
               </Button>
             </div>
+            <ConfirmPanel
+              isOpen={confirming}
+              title="Scan every file again?"
+              confirmLabel="Scan them again"
+              busy={rescan.isPending}
+              onCancel={() => {
+                setConfirming(false);
+              }}
+              onConfirm={() => {
+                setConfirming(false);
+                void reauth
+                  .run(async () => {
+                    await rescan.mutateAsync();
+                  })
+                  .catch(() => undefined);
+              }}
+            >
+              <p>
+                Every file of this organization is scanned again, a few at a time. Clean files can
+                still be downloaded and opened while they wait. A file now found to hold a virus is
+                quarantined, and no one can open it after that. Files that couldn&rsquo;t be scanned
+                are tried again now.
+              </p>
+            </ConfirmPanel>
           </>
         ) : (
           <Note tone="amber">

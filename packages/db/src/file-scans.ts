@@ -2,16 +2,25 @@
  * Virus scan results of stored content (S-040, D-113; migration 0041).
  *
  * One row per organization and SHA-256: content is stored once however many
- * assets hold it (D-086), so its scan result is shared by all of them. No
- * row means the content has never been scanned. The service is the only
- * writer (D-067): the attach queues a scan, the scan queue claims due rows
- * and records what the scanner said, and a system manager's rescan puts
- * clean and failed contents back in the queue. An infected content is
- * quarantined for good: the database refuses to change it back
- * (`file_scans_quarantine_holds`) and nothing deletes a row.
+ * assets hold it (D-086), so its scan result is shared by all of them. The
+ * service is the only writer (D-067): the attach queues a scan (`pending`),
+ * the queue puts contents stored before scanning was turned on in line
+ * (`unscanned`, still served), claims due rows and records what the scanner
+ * said, and a system manager's rescan asks for every content to be scanned
+ * again. **Only an infected verdict takes a served file away:** a clean
+ * content asked to be rescanned stays clean while it waits, and a failed
+ * scan of a clean or unscanned content leaves it as it was. An infected
+ * content is quarantined for good: the database refuses to change it back
+ * or to change its signature (`file_scans_quarantine_holds`), and nothing
+ * deletes a row.
  *
- * Every query names one organization (D-019), except the queue's claim,
- * which is a job over every organization and hands back the one it took.
+ * **Rescans during a scan aren't lost:** each rescan request moves the
+ * row's `generation` on; the claim hands out the generation it saw, and a
+ * clean or failed result claimed under an older one isn't stored (the row
+ * stays queued and is scanned again). An infected verdict is always stored.
+ *
+ * Every query names one organization (D-019), except the queue's jobs,
+ * which run over every organization and hand back the one they took.
  */
 import { isOrganizationId, isSha256Hex, type OrganizationId } from "@oculus/core";
 import type { Queryable } from "./client.js";
@@ -28,7 +37,7 @@ export const FILE_SCAN_TABLE_PRIVILEGES: Readonly<Record<string, readonly string
   });
 
 /** A stored scan state (0041). */
-export const SCAN_STATES = ["pending", "clean", "infected", "failed"] as const;
+export const SCAN_STATES = ["pending", "unscanned", "clean", "infected", "failed"] as const;
 export type ScanState = (typeof SCAN_STATES)[number];
 
 /** Why a scan failed. */
@@ -57,6 +66,10 @@ export interface StoredScan {
   readonly signature: string | null;
   readonly attempts: number;
   readonly scannedAt: string | null;
+  /** When the queue will take it (again); `null` when it won't by itself. */
+  readonly nextAttemptAt: string | null;
+  /** A clean content waiting to be scanned again. */
+  readonly rescanRequested: boolean;
 }
 
 interface ScanRow {
@@ -66,11 +79,16 @@ interface ScanRow {
   signature: string | null;
   attempts: number;
   scanned_at: string | null;
+  next_attempt_at: string | null;
+  rescan_requested: boolean;
 }
 
+const MS = 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"';
 const COLUMNS = sql`
   s.sha256, s.state, s.failure, s.signature, s.attempts,
-  to_char(s.scanned_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS scanned_at`;
+  to_char(s.scanned_at AT TIME ZONE 'UTC', ${MS}) AS scanned_at,
+  to_char(s.next_attempt_at AT TIME ZONE 'UTC', ${MS}) AS next_attempt_at,
+  s.rescan_requested_at IS NOT NULL AS rescan_requested`;
 
 function fromRow(row: ScanRow): StoredScan {
   if (
@@ -86,6 +104,8 @@ function fromRow(row: ScanRow): StoredScan {
     signature: row.signature,
     attempts: row.attempts,
     scannedAt: row.scanned_at,
+    nextAttemptAt: row.next_attempt_at,
+    rescanRequested: row.rescan_requested,
   });
 }
 
@@ -95,6 +115,17 @@ function checkOrganization(organizationId: unknown): void {
 
 function checkHash(sha256: unknown): void {
   if (!isSha256Hex(sha256)) throw new TypeError("Not a SHA-256.");
+}
+
+function checkGeneration(generation: unknown): void {
+  if (
+    typeof generation !== "number" ||
+    !Number.isSafeInteger(generation) ||
+    generation < 0 ||
+    generation > 2_147_483_647
+  ) {
+    throw new TypeError("Not a scan generation.");
+  }
 }
 
 /** The scan results of these contents (those with none are missing from the map). */
@@ -123,9 +154,11 @@ export async function scanState(
 }
 
 /**
- * Queues a content for scanning, unless it already has a result (the same
- * bytes attached again keep theirs: clean stays clean, infected stays
- * quarantined). `true` when a new row was made.
+ * Queues a newly uploaded content for scanning (`pending`: not served until
+ * clean). A content that already has a result keeps it (clean stays clean,
+ * infected stays quarantined), except one stored before scanning was turned
+ * on and not scanned yet: uploaded again, it waits for its scan like any
+ * new upload. `true` when the row was made or moved to pending.
  */
 export async function queueScan(
   tx: Queryable,
@@ -137,20 +170,23 @@ export async function queueScan(
   const made = await tx.execute(sql`
     INSERT INTO public.file_scans (organization_id, sha256, state)
     VALUES (${organizationId}::uuid, ${sha256}, 'pending')
-    ON CONFLICT (organization_id, sha256) DO NOTHING`);
+    ON CONFLICT (organization_id, sha256) DO UPDATE
+    SET state = 'pending', failure = NULL, attempts = 0, next_attempt_at = clock_timestamp()
+    WHERE file_scans.state = 'unscanned'`);
   return made > 0;
 }
 
 /**
- * Queues up to `limit` stored contents that have no scan result at all
- * (attached before scanning was set up). A job over every organization;
- * answers how many were queued.
+ * Puts up to `limit` stored contents that have no scan result at all
+ * (stored before scanning was turned on) in the queue as `unscanned`: still
+ * served until their first scan, so turning scanning on locks nothing. A
+ * job over every organization; answers how many were queued.
  */
 export async function queueUnscanned(tx: Queryable, limit: number): Promise<number> {
   if (!Number.isSafeInteger(limit) || limit < 1) throw new TypeError("Not a limit.");
   return tx.execute(sql`
     INSERT INTO public.file_scans (organization_id, sha256, state)
-    SELECT c.organization_id, c.sha256, 'pending'
+    SELECT c.organization_id, c.sha256, 'unscanned'
     FROM (SELECT DISTINCT f.organization_id, f.sha256 FROM public.stored_files f
           WHERE NOT EXISTS (SELECT 1 FROM public.file_scans s
                             WHERE s.organization_id = f.organization_id AND s.sha256 = f.sha256)
@@ -164,33 +200,40 @@ export interface ClaimedScan {
   readonly sha256: string;
   readonly size: number;
   readonly attempts: number;
+  /** The row's generation when it was claimed (`recordScanResult` checks it). */
+  readonly generation: number;
 }
 
 /**
- * Takes the next due content (pending, or failed and due again) that some
- * stored file still names, and moves its next attempt `leaseSeconds` ahead,
- * so no other worker takes it meanwhile and a crash only delays it. A job
+ * Takes the next due content that some stored file still names, and moves
+ * its next attempt `leaseSeconds` ahead, so no other worker takes it
+ * meanwhile and a crash only delays it. Organizations take turns: the
+ * first after `after` (by ID, going round) that has something due. A job
  * over every organization. `undefined` when nothing is due.
  */
 export async function claimDueScan(
   db: Queryable,
   leaseSeconds: number,
+  after?: OrganizationId,
 ): Promise<ClaimedScan | undefined> {
   if (!Number.isSafeInteger(leaseSeconds) || leaseSeconds < 1) {
     throw new TypeError("Not a lease.");
   }
+  if (after !== undefined) checkOrganization(after);
   const rows = await db.rows<{
     organization_id: string;
     sha256: string;
     attempts: number;
+    generation: number;
     size: number | null;
   }>(sql`
     WITH next AS (
       SELECT s.organization_id, s.sha256 FROM public.file_scans s
-      WHERE s.state IN ('pending', 'failed') AND s.next_attempt_at <= clock_timestamp()
+      WHERE s.state <> 'infected' AND s.next_attempt_at <= clock_timestamp()
         AND EXISTS (SELECT 1 FROM public.stored_files f
                     WHERE f.organization_id = s.organization_id AND f.sha256 = s.sha256)
-      ORDER BY s.next_attempt_at
+      ORDER BY (${after ?? null}::uuid IS NOT NULL AND s.organization_id <= ${after ?? null}::uuid),
+        s.organization_id, s.next_attempt_at
       LIMIT 1
       FOR UPDATE OF s SKIP LOCKED
     )
@@ -198,7 +241,7 @@ export async function claimDueScan(
     SET next_attempt_at = clock_timestamp() + make_interval(secs => ${leaseSeconds}::integer)
     FROM next
     WHERE s.organization_id = next.organization_id AND s.sha256 = next.sha256
-    RETURNING s.organization_id::text AS organization_id, s.sha256, s.attempts,
+    RETURNING s.organization_id::text AS organization_id, s.sha256, s.attempts, s.generation,
       (SELECT f.byte_size FROM public.stored_files f
        WHERE f.organization_id = s.organization_id AND f.sha256 = s.sha256
        LIMIT 1)::float8 AS size`);
@@ -212,6 +255,7 @@ export async function claimDueScan(
     sha256: row.sha256,
     size: row.size,
     attempts: row.attempts,
+    generation: row.generation,
   });
 }
 
@@ -226,10 +270,26 @@ export type ScanResult =
       readonly retryInSeconds: number | null;
     };
 
+/** What `recordScanResult` did. */
+export type RecordedScan =
+  /** Stored (and logged). */
+  | "stored"
+  /** A rescan came in after the claim: not stored, queued again now. */
+  | "stale"
+  /** Already infected (or gone): nothing changed. */
+  | "unchanged";
+
 /**
- * Stores a scan's result and logs it (`file_scan_events`). An infected
- * content is quarantined (its first quarantine time kept); a content
- * already infected is never changed by a later result (`false`).
+ * Stores a scan's result and logs it (`file_scan_events`), for the
+ * generation the claim saw:
+ * - infected: always (a new verdict takes the file away), quarantined with
+ *   its first quarantine time;
+ * - clean: only if no rescan came in since the claim; otherwise the row is
+ *   queued again at once (`stale`);
+ * - failed: the same rule; a pending or failed content becomes failed, while
+ *   a clean or unscanned one keeps its state (and stays served) and is
+ *   tried again after the backoff.
+ * A content already infected never changes (`unchanged`).
  */
 export async function recordScanResult(
   tx: Queryable,
@@ -237,41 +297,55 @@ export async function recordScanResult(
   sha256: string,
   result: ScanResult,
   actor: string,
-): Promise<boolean> {
+  generation: number,
+): Promise<RecordedScan> {
   checkOrganization(organizationId);
   checkHash(sha256);
+  checkGeneration(generation);
   if (!isActorId(actor)) throw new TypeError("Not an actor.");
-  let changed: number;
+  const log = async (extra: {
+    kind: "clean" | "infected" | "failed";
+    signature?: string;
+    failure?: ScanFailure;
+  }): Promise<void> => {
+    await tx.execute(sql`
+      INSERT INTO public.file_scan_events (organization_id, id, kind, sha256, signature, failure,
+        actor)
+      VALUES (${organizationId}::uuid, gen_random_uuid(), ${extra.kind}, ${sha256},
+        ${extra.signature ?? null}, ${extra.failure ?? null}, ${actor})`);
+  };
+  /** A clean or failed result claimed before the latest rescan: queued again now. */
+  const stale = async (): Promise<RecordedScan> => {
+    const queued = await tx.execute(sql`
+      UPDATE public.file_scans SET next_attempt_at = clock_timestamp()
+      WHERE organization_id = ${organizationId}::uuid AND sha256 = ${sha256}
+        AND state <> 'infected'`);
+    return queued > 0 ? "stale" : "unchanged";
+  };
   switch (result.state) {
-    case "clean":
-      changed = await tx.execute(sql`
-        UPDATE public.file_scans
-        SET state = 'clean', failure = NULL, attempts = 0, next_attempt_at = NULL,
-          scanned_at = clock_timestamp()
-        WHERE organization_id = ${organizationId}::uuid AND sha256 = ${sha256}
-          AND state <> 'infected'`);
-      if (changed > 0) {
-        await tx.execute(sql`
-          INSERT INTO public.file_scan_events (organization_id, id, kind, sha256, actor)
-          VALUES (${organizationId}::uuid, gen_random_uuid(), 'clean', ${sha256}, ${actor})`);
-      }
-      break;
     case "infected": {
       if (!isScanSignature(result.signature)) throw new TypeError("Not a signature name.");
-      changed = await tx.execute(sql`
+      const changed = await tx.execute(sql`
         UPDATE public.file_scans
         SET state = 'infected', failure = NULL, signature = ${result.signature},
-          next_attempt_at = NULL, scanned_at = clock_timestamp(),
+          next_attempt_at = NULL, rescan_requested_at = NULL, scanned_at = clock_timestamp(),
           quarantined_at = coalesce(quarantined_at, clock_timestamp())
         WHERE organization_id = ${organizationId}::uuid AND sha256 = ${sha256}
           AND state <> 'infected'`);
-      if (changed > 0) {
-        await tx.execute(sql`
-          INSERT INTO public.file_scan_events (organization_id, id, kind, sha256, signature, actor)
-          VALUES (${organizationId}::uuid, gen_random_uuid(), 'infected', ${sha256},
-            ${result.signature}, ${actor})`);
-      }
-      break;
+      if (changed === 0) return "unchanged";
+      await log({ kind: "infected", signature: result.signature });
+      return "stored";
+    }
+    case "clean": {
+      const changed = await tx.execute(sql`
+        UPDATE public.file_scans
+        SET state = 'clean', failure = NULL, attempts = 0, next_attempt_at = NULL,
+          rescan_requested_at = NULL, scanned_at = clock_timestamp()
+        WHERE organization_id = ${organizationId}::uuid AND sha256 = ${sha256}
+          AND state <> 'infected' AND generation = ${generation}::integer`);
+      if (changed === 0) return stale();
+      await log({ kind: "clean" });
+      return "stored";
     }
     case "failed": {
       if (!(SCAN_FAILURES as readonly string[]).includes(result.failure)) {
@@ -281,33 +355,37 @@ export async function recordScanResult(
       if (retry !== null && (!Number.isSafeInteger(retry) || retry < 1)) {
         throw new TypeError("Not a retry time.");
       }
-      changed = await tx.execute(sql`
+      // A clean content not retried by itself (too large, say) is no longer
+      // waiting for a rescan: it stays clean.
+      const changed = await tx.execute(sql`
         UPDATE public.file_scans
-        SET state = 'failed', failure = ${result.failure},
+        SET state = CASE WHEN state IN ('clean', 'unscanned') THEN state ELSE 'failed' END,
+          failure = ${result.failure},
           attempts = least(attempts + 1, 1000000),
           next_attempt_at = CASE WHEN ${retry}::integer IS NULL THEN NULL
-            ELSE clock_timestamp() + make_interval(secs => ${retry}::integer) END
+            ELSE clock_timestamp() + make_interval(secs => ${retry}::integer) END,
+          rescan_requested_at = CASE WHEN ${retry}::integer IS NULL THEN NULL
+            ELSE rescan_requested_at END
         WHERE organization_id = ${organizationId}::uuid AND sha256 = ${sha256}
-          AND state <> 'infected'`);
-      if (changed > 0) {
-        await tx.execute(sql`
-          INSERT INTO public.file_scan_events (organization_id, id, kind, sha256, failure, actor)
-          VALUES (${organizationId}::uuid, gen_random_uuid(), 'failed', ${sha256},
-            ${result.failure}, ${actor})`);
-      }
-      break;
+          AND state <> 'infected' AND generation = ${generation}::integer`);
+      if (changed === 0) return stale();
+      await log({ kind: "failed", failure: result.failure });
+      return "stored";
     }
     default:
       throw new TypeError("Not a scan result.");
   }
-  return changed > 0;
 }
 
 /**
- * Puts every clean and failed content of the organization back in the
- * queue (after the scanner's signatures were updated, say), and logs the
- * request. Infected contents stay quarantined; pending ones are queued
- * already. Answers how many were queued.
+ * Asks for every content of the organization that a stored file still names
+ * to be scanned again (after the scanner's signatures were updated, say),
+ * and logs the request. Clean contents stay clean, and served, while they
+ * wait; failed ones are tried again now; pending and unscanned ones are
+ * queued already, and a scan of them running now is done again. Infected
+ * contents stay quarantined. Every touched row's generation moves on, so a
+ * scan running now doesn't store an answer from before the request.
+ * Answers how many were queued.
  */
 export async function rescanContents(
   tx: Queryable,
@@ -317,9 +395,14 @@ export async function rescanContents(
   checkOrganization(organizationId);
   if (!isActorId(actor)) throw new TypeError("Not an actor.");
   const queued = await tx.execute(sql`
-    UPDATE public.file_scans
-    SET state = 'pending', failure = NULL, attempts = 0, next_attempt_at = clock_timestamp()
-    WHERE organization_id = ${organizationId}::uuid AND state IN ('clean', 'failed')`);
+    UPDATE public.file_scans s
+    SET state = CASE WHEN s.state = 'failed' THEN 'pending' ELSE s.state END,
+      failure = NULL, attempts = 0, next_attempt_at = clock_timestamp(),
+      rescan_requested_at = CASE WHEN s.state = 'clean' THEN clock_timestamp() END,
+      generation = CASE WHEN s.generation >= 2147483647 THEN 0 ELSE s.generation + 1 END
+    WHERE s.organization_id = ${organizationId}::uuid AND s.state <> 'infected'
+      AND EXISTS (SELECT 1 FROM public.stored_files f
+                  WHERE f.organization_id = s.organization_id AND f.sha256 = s.sha256)`);
   await tx.execute(sql`
     INSERT INTO public.file_scan_events (organization_id, id, kind, queued, actor)
     VALUES (${organizationId}::uuid, gen_random_uuid(), 'rescan', ${queued}::integer, ${actor})`);
@@ -331,9 +414,14 @@ export interface ScanCounts {
   readonly pending: number;
   readonly clean: number;
   readonly infected: number;
+  /** Failed and tried again later. */
   readonly failed: number;
-  /** Stored contents with no scan result at all. */
+  /** Failed and not tried again by itself (too large for the scanner). */
+  readonly tooLarge: number;
+  /** Stored before scanning was on and not scanned yet (served meanwhile). */
   readonly unscanned: number;
+  /** Clean contents waiting to be scanned again (served meanwhile). */
+  readonly rescanning: number;
 }
 
 /** Counts by state over the contents some stored file of the organization names. */
@@ -342,19 +430,32 @@ export async function scanCounts(
   organizationId: OrganizationId,
 ): Promise<ScanCounts> {
   checkOrganization(organizationId);
-  const rows = await db.rows<{ state: string | null; n: number }>(sql`
-    SELECT s.state, count(*)::integer AS n
+  const rows = await db.rows<{ bucket: string; n: number }>(sql`
+    SELECT CASE
+        WHEN s.state IS NULL OR s.state = 'unscanned' THEN 'unscanned'
+        WHEN s.state = 'failed' AND s.next_attempt_at IS NULL THEN 'tooLarge'
+        ELSE s.state END AS bucket,
+      count(*)::integer AS n
     FROM (SELECT DISTINCT f.sha256 FROM public.stored_files f
           WHERE f.organization_id = ${organizationId}::uuid) c
     LEFT JOIN public.file_scans s
       ON s.organization_id = ${organizationId}::uuid AND s.sha256 = c.sha256
-    GROUP BY s.state`);
-  const count = (state: string | null): number => rows.find((r) => r.state === state)?.n ?? 0;
+    GROUP BY 1
+    UNION ALL
+    SELECT 'rescanning', count(*)::integer FROM public.file_scans s
+    WHERE s.organization_id = ${organizationId}::uuid AND s.state = 'clean'
+      AND s.rescan_requested_at IS NOT NULL
+      AND EXISTS (SELECT 1 FROM public.stored_files f
+                  WHERE f.organization_id = s.organization_id AND f.sha256 = s.sha256)`);
+  const count = (bucket: string): number =>
+    rows.filter((r) => r.bucket === bucket).reduce((n, r) => n + r.n, 0);
   return Object.freeze({
     pending: count("pending"),
     clean: count("clean"),
     infected: count("infected"),
     failed: count("failed"),
-    unscanned: count(null),
+    tooLarge: count("tooLarge"),
+    unscanned: count("unscanned"),
+    rescanning: count("rescanning"),
   });
 }

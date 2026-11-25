@@ -16,7 +16,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { csrfTokenFor } from "@oculus/core";
-import { sql } from "@oculus/db";
+import type { Readable } from "node:stream";
+import {
+  claimDueScan,
+  queueScan,
+  queueUnscanned,
+  recordScanResult,
+  rescanContents,
+  sql,
+} from "@oculus/db";
 import {
   clamdScanner,
   createService,
@@ -70,7 +78,14 @@ interface Reply {
 function send(
   to: Base,
   path: string,
-  s: { as?: string; method?: string; body?: Buffer; headers?: Record<string, string> } = {},
+  s: {
+    as?: string;
+    method?: string;
+    body?: Buffer;
+    headers?: Record<string, string>;
+    /** Sent in chunks without a Content-Length. */
+    chunked?: boolean;
+  } = {},
 ): Promise<Reply> {
   const method = s.method ?? "GET";
   const token = s.as === undefined ? undefined : tokens[s.as];
@@ -79,7 +94,9 @@ function send(
   if (method !== "GET" && method !== "HEAD" && token !== undefined) {
     headers[CSRF_HEADER] = csrfTokenFor(token) ?? "";
   }
-  if (s.body !== undefined) headers["content-length"] = String(s.body.length);
+  if (s.body !== undefined && s.chunked !== true) {
+    headers["content-length"] = String(s.body.length);
+  }
   return new Promise((resolve, reject) => {
     const req = httpRequest(
       { host: to.host, port: to.port, method, path, headers, agent: false },
@@ -99,8 +116,19 @@ function send(
         res.on("error", reject);
       },
     );
-    req.on("error", reject);
-    req.end(s.body);
+    req.on("error", (error: NodeJS.ErrnoException) => {
+      // A refused upload may close before the whole body is written.
+      if (error.code === "EPIPE" || error.code === "ECONNRESET") return;
+      reject(error);
+    });
+    if (s.chunked === true && s.body !== undefined) {
+      for (let at = 0; at < s.body.length; at += 64 * 1024) {
+        req.write(s.body.subarray(at, at + 64 * 1024));
+      }
+      req.end();
+    } else {
+      req.end(s.body);
+    }
   });
 }
 
@@ -113,9 +141,15 @@ const assetDraft = (title: string) => ({
 });
 
 /** Uploads bytes to an asset; returns the file's ID. Answers before the scan. */
-async function add(to: Base, asset: string, body: Buffer, name: string): Promise<string> {
+async function add(
+  to: Base,
+  asset: string,
+  body: Buffer,
+  name: string,
+  as = "cataloger",
+): Promise<string> {
   const r = await send(to, `/api/records/${asset}/files`, {
-    as: "cataloger",
+    as,
     method: "POST",
     body,
     headers: {
@@ -170,6 +204,16 @@ async function scanRow(sha256OfFile: { asset: string; file: string }) {
     JOIN public.stored_files f ON f.organization_id = s.organization_id AND f.sha256 = s.sha256
     WHERE f.id = ${sha256OfFile.file}::uuid`);
   return rows;
+}
+
+/** Asks for a rescan as someone. */
+function rescanAs(who: string): Promise<Reply> {
+  return send(scanned.base, "/api/system/file-scans/rescan", {
+    as: who,
+    method: "POST",
+    body: Buffer.from("{}"),
+    headers: { "content-type": "application/json" },
+  });
 }
 
 /** Makes every failed scan due now (in place of waiting out its backoff). */
@@ -375,53 +419,302 @@ describe("with a scanner", () => {
     const counts = status.json.counts as Record<string, number>;
     expect(counts.infected).toBe(1);
     expect(counts.clean).toBeGreaterThanOrEqual(3);
+    // The too-large one isn't tried again: counted on its own.
+    expect(counts.tooLarge).toBe(1);
     for (const who of ["cataloger", "manager"]) {
       expect((await send(scanned.base, "/api/system/file-scans", { as: who })).status, who).toBe(
         403,
       );
-      const r = await send(scanned.base, "/api/system/file-scans/rescan", {
-        as: who,
-        method: "POST",
-        body: Buffer.from("{}"),
-        headers: { "content-type": "application/json" },
-      });
-      expect(r.status, who).toBe(403);
+      expect((await rescanAs(who)).status, who).toBe(403);
     }
+    // A scanner that hangs: the rescan's scans stay unfinished for a while.
+    clamd.mode = "silent";
     const scansBefore = clamd.connections();
-    const rescan = await send(scanned.base, "/api/system/file-scans/rescan", {
-      as: "root",
-      method: "POST",
-      body: Buffer.from("{}"),
-      headers: { "content-type": "application/json" },
-    });
+    const rescan = await rescanAs("root");
     expect(rescan.status).toBe(200);
-    // Every clean and failed content (the too-large one included); not the infected one.
-    expect(rescan.json.queued).toBe((counts.clean ?? 0) + (counts.failed ?? 0));
+    // Every content a stored file names but the infected one.
+    expect(rescan.json.queued).toBe(
+      (counts.clean ?? 0) + (counts.failed ?? 0) + (counts.tooLarge ?? 0),
+    );
+    // Clean files stay clean, and served, while they wait (review S2).
+    expect((await listed(scanned.base, ids.a ?? ""))[ids.cleanFile ?? ""]).toBe("clean");
+    expect(
+      (await send(scanned.base, content(ids.a ?? "", ids.cleanFile ?? ""), { as: "cataloger" }))
+        .status,
+    ).toBe(200);
+    const waiting = await send(scanned.base, "/api/system/file-scans", { as: "root" });
+    expect((waiting.json.counts as Record<string, number>).rescanning).toBe(counts.clean);
+    // Their scans time out: still clean and served, tried again later.
+    await scanned.service.scanQueuedFiles();
+    expect(
+      (await send(scanned.base, content(ids.a ?? "", ids.cleanFile ?? ""), { as: "cataloger" }))
+        .status,
+    ).toBe(200);
+    const rescanned = await w.db.rows<{ state: string; failure: string | null; queued: boolean }>(
+      sql`SELECT s.state, s.failure, s.rescan_requested_at IS NOT NULL AS queued
+          FROM public.file_scans s JOIN public.stored_files f
+            ON f.organization_id = s.organization_id AND f.sha256 = s.sha256
+          WHERE f.id = ${ids.cleanFile ?? ""}::uuid`,
+    );
+    expect(rescanned).toEqual([{ state: "clean", failure: "timeout", queued: true }]);
+    // Then the scanner answers: clean again, no longer waiting.
+    clamd.mode = "detect";
+    await w.db.execute(sql`
+      UPDATE public.file_scans SET next_attempt_at = clock_timestamp()
+      WHERE next_attempt_at IS NOT NULL`);
     await scanned.service.scanQueuedFiles();
     expect(clamd.connections()).toBeGreaterThan(scansBefore);
     expect((await scanRow({ asset: ids.a ?? "", file: ids.infectedA ?? "" }))[0]?.state).toBe(
       "infected",
     );
-    expect((await scanRow({ asset: ids.a ?? "", file: ids.cleanFile ?? "" }))[0]?.state).toBe(
-      "clean",
-    );
+    expect((await scanRow({ asset: ids.a ?? "", file: ids.cleanFile ?? "" }))[0]).toMatchObject({
+      state: "clean",
+      failure: null,
+      due: null,
+    });
     const logs = await w.db.rows<{ kind: string; queued: number; actor: string }>(sql`
       SELECT kind, queued, actor FROM public.file_scan_events WHERE kind = 'rescan'`);
     expect(logs).toEqual([{ kind: "rescan", queued: rescan.json.queued, actor: `user:${w.root}` }]);
   });
 
-  it("queues files attached before scanning was set up", async () => {
+  it("takes a file away after a rescan only when it is now found infected", async () => {
+    const body = Buffer.from(`An invented page, clean at first. ${FAKE_VIRUS_MARKER}`);
+    clamd.mode = "ok";
+    const file = await add(scanned.base, ids.b ?? "", body, "later found.txt");
+    await scanned.service.scanQueuedFiles();
+    expect((await listed(scanned.base, ids.b ?? ""))[file]).toBe("clean");
+    // New signatures: the same bytes are now found.
+    clamd.mode = "detect";
+    expect((await rescanAs("root")).status).toBe(200);
+    await scanned.service.scanQueuedFiles();
+    expect((await listed(scanned.base, ids.b ?? ""))[file]).toBe("infected");
+    const r = await send(scanned.base, content(ids.b ?? "", file), { as: "cataloger" });
+    expect([r.status, r.json]).toEqual([423, { error: "quarantined" }]);
+  });
+
+  it("doesn't lose a rescan asked for while the content is being scanned (review S3)", async () => {
+    const file = await add(
+      plain.base,
+      ids.c ?? "",
+      Buffer.from("An invented page scanned while a rescan comes in."),
+      "race.txt",
+    );
+    const [sha] = await w.db.rows<{ sha256: string }>(sql`
+      SELECT sha256 FROM public.stored_files WHERE id = ${file}::uuid`);
+    const hash = sha?.sha256 ?? "";
+    await w.db.transaction((tx) => queueScan(tx, w.a, hash));
+    // Only this content due, so the claim takes it.
+    await w.db.execute(sql`
+      UPDATE public.file_scans SET next_attempt_at = clock_timestamp() + interval '1 hour'
+      WHERE sha256 <> ${hash} AND next_attempt_at IS NOT NULL`);
+    const claimed = await claimDueScan(w.db, 60);
+    expect(claimed?.sha256).toBe(hash);
+    // A rescan comes in while it is scanned…
+    await w.db.transaction((tx) => rescanContents(tx, w.a, `user:${w.root}`));
+    // …so the clean answer from before it isn't stored: still queued, due now.
+    const recorded = await w.db.transaction((tx) =>
+      recordScanResult(
+        tx,
+        w.a,
+        hash,
+        { state: "clean" },
+        "system:virus-scan",
+        claimed?.generation ?? 0,
+      ),
+    );
+    expect(recorded).toBe("stale");
+    const [row] = await w.db.rows<{ state: string; due: boolean }>(sql`
+      SELECT state, next_attempt_at <= clock_timestamp() AS due FROM public.file_scans
+      WHERE organization_id = ${w.a}::uuid AND sha256 = ${hash}`);
+    expect(row).toEqual({ state: "pending", due: true });
+    // An infected verdict is stored even after a later rescan: it takes the file away.
+    // (The rescan made every content due: only this one again.)
+    await w.db.execute(sql`
+      UPDATE public.file_scans SET next_attempt_at = clock_timestamp() + interval '1 hour'
+      WHERE sha256 <> ${hash} AND next_attempt_at IS NOT NULL`);
+    const again = await claimDueScan(w.db, 60);
+    expect(again?.sha256).toBe(hash);
+    await w.db.transaction((tx) => rescanContents(tx, w.a, `user:${w.root}`));
+    expect(
+      await w.db.transaction((tx) =>
+        recordScanResult(
+          tx,
+          w.a,
+          hash,
+          { state: "infected", signature: FAKE_SIGNATURE },
+          "system:virus-scan",
+          again?.generation ?? 0,
+        ),
+      ),
+    ).toBe("stored");
+    expect((await listed(scanned.base, ids.c ?? ""))[file]).toBe("infected");
+    await w.db.execute(sql`
+      UPDATE public.file_scans SET next_attempt_at = clock_timestamp()
+      WHERE next_attempt_at IS NOT NULL`);
+  });
+
+  it("refuses an upload larger than the scanner takes, declared or not (review S1)", async () => {
+    const big = Buffer.alloc(1024 * 1024 + 10, 0x63);
+    const r = await send(scanned.base, `/api/records/${ids.a ?? ""}/files`, {
+      as: "cataloger",
+      method: "POST",
+      body: big,
+      headers: {
+        "content-type": "application/octet-stream",
+        "if-match": '"v1"',
+        [FILE_NAME_HEADER]: "big.bin",
+      },
+    });
+    expect([r.status, r.json]).toEqual([413, { error: "too_large_to_scan" }]);
+    const chunked = await send(scanned.base, `/api/records/${ids.a ?? ""}/files`, {
+      as: "cataloger",
+      method: "POST",
+      body: big,
+      chunked: true,
+      headers: {
+        "content-type": "application/octet-stream",
+        "if-match": '"v1"',
+        [FILE_NAME_HEADER]: "big.bin",
+      },
+    });
+    expect([chunked.status, chunked.json]).toEqual([413, { error: "too_large_to_scan" }]);
+    const rows = await w.db.rows(sql`
+      SELECT 1 FROM public.stored_files WHERE original_name = 'big.bin'`);
+    expect(rows).toEqual([]);
+    // The list tells the admin the scanner's limit, so it refuses before sending.
+    const list = await send(scanned.base, `/api/records/${ids.a ?? ""}/files`, { as: "cataloger" });
+    expect(list.json.maxFileBytes).toBe(1024 * 1024);
+    const plainList = await send(plain.base, `/api/records/${ids.a ?? ""}/files`, {
+      as: "cataloger",
+    });
+    expect(plainList.json.maxFileBytes).toBe(8 * 1024 * 1024);
+  });
+
+  it("keeps serving files from before scanning was turned on until their first scan", async () => {
     const body = Buffer.from("An invented page uploaded while scanning was off.");
     const file = await add(plain.base, ids.c ?? "", body, "before.txt");
     expect(await scanRow({ asset: ids.c ?? "", file })).toEqual([]);
-    // With a scanner it has no result yet: pending, not served.
-    expect((await listed(scanned.base, ids.c ?? ""))[file]).toBe("pending");
+    // With a scanner it has no result yet: not yet scanned, still served.
+    expect((await listed(scanned.base, ids.c ?? ""))[file]).toBe("not_yet_scanned");
     expect((await send(scanned.base, content(ids.c ?? "", file), { as: "cataloger" })).status).toBe(
-      409,
+      200,
     );
+    // Queued as unscanned; a failed first scan leaves it served.
+    clamd.mode = "silent";
+    const failedPass = await scanned.service.scanQueuedFiles();
+    expect(failedPass.queued).toBe(1);
+    expect((await scanRow({ asset: ids.c ?? "", file }))[0]).toMatchObject({
+      state: "unscanned",
+      failure: "timeout",
+    });
+    expect((await listed(scanned.base, ids.c ?? ""))[file]).toBe("not_yet_scanned");
+    expect((await send(scanned.base, content(ids.c ?? "", file), { as: "cataloger" })).status).toBe(
+      200,
+    );
+    clamd.mode = "detect";
+    await dueNow();
+    await w.db.execute(sql`
+      UPDATE public.file_scans SET next_attempt_at = clock_timestamp()
+      WHERE state = 'unscanned'`);
     const pass = await scanned.service.scanQueuedFiles();
-    expect(pass.queued).toBe(1);
+    // Each pass counts its own scans (review L4).
+    expect(pass.clean).toBeGreaterThanOrEqual(1);
     expect((await listed(scanned.base, ids.c ?? ""))[file]).toBe("clean");
+  });
+
+  it("makes the same bytes uploaded again wait for their scan, even if stored before", async () => {
+    const body = Buffer.from("An invented page from before scanning, uploaded again.");
+    const before = await add(plain.base, ids.a ?? "", body, "old.txt");
+    await w.db.transaction((tx) => queueUnscanned(tx, 100));
+    expect((await listed(scanned.base, ids.a ?? ""))[before]).toBe("not_yet_scanned");
+    clamd.mode = "silent";
+    const again = await add(scanned.base, ids.b ?? "", body, "old again.txt");
+    expect((await listed(scanned.base, ids.b ?? ""))[again]).toBe("pending");
+    expect(
+      (await send(scanned.base, content(ids.b ?? "", again), { as: "cataloger" })).status,
+    ).toBe(409);
+    await scanned.service.scanQueuedFiles();
+    clamd.mode = "detect";
+    await dueNow();
+    await scanned.service.scanQueuedFiles();
+    expect((await listed(scanned.base, ids.b ?? ""))[again]).toBe("clean");
+  });
+
+  it("lets organizations take turns in the queue (review L6)", async () => {
+    const theirs = await makeAs(w, w.b, w.b1, assetDraft("An invented library letter"));
+    await add(
+      plain.base,
+      theirs,
+      Buffer.from("An invented library page."),
+      "library.txt",
+      "stranger",
+    );
+    for (let i = 0; i < 3; i++) {
+      await add(
+        plain.base,
+        ids.a ?? "",
+        Buffer.from(`An invented archive page ${String(i)}.`),
+        `a${String(i)}.txt`,
+      );
+    }
+    await w.db.transaction((tx) => queueUnscanned(tx, 100));
+    await w.db.execute(sql`
+      UPDATE public.file_scans SET next_attempt_at = clock_timestamp()
+      WHERE state = 'unscanned'`);
+    const first = await claimDueScan(w.db, 60, w.a);
+    expect(first?.organizationId).toBe(w.b);
+    const second = await claimDueScan(w.db, 60, w.b);
+    expect(second?.organizationId).toBe(w.a);
+    // Scanned in the end, every one.
+    await w.db.execute(sql`
+      UPDATE public.file_scans SET next_attempt_at = clock_timestamp()
+      WHERE next_attempt_at IS NOT NULL`);
+    await scanned.service.scanQueuedFiles();
+    const left = await w.db.rows(sql`
+      SELECT 1 FROM public.file_scans WHERE state = 'unscanned'`);
+    expect(left).toEqual([]);
+  });
+
+  it("starts every row queued and keeps an infected signature fixed (review L2)", async () => {
+    const hash = "f".repeat(64);
+    await expect(
+      w.db.execute(sql`INSERT INTO public.file_scans (organization_id, sha256, state)
+        VALUES (${w.a}::uuid, ${hash}, 'clean')`),
+    ).rejects.toThrow(/starts queued/);
+    await expect(
+      w.db.execute(sql`INSERT INTO public.file_scans (organization_id, sha256, state, attempts)
+        VALUES (${w.a}::uuid, ${hash}, 'pending', 3)`),
+    ).rejects.toThrow(/starts queued/);
+    await expect(
+      w.db.execute(sql`UPDATE public.file_scans SET signature = 'Something.Else'
+        WHERE state = 'infected'`),
+    ).rejects.toThrow(/stays quarantined/);
+  });
+
+  it("closes the file it scanned, whatever the scanner did with it (review L3)", async () => {
+    const opened: Readable[] = [];
+    const lazy = createService(w.db, {
+      files: store,
+      scanner: {
+        maxBytes: 1024 * 1024,
+        timeoutMs: 1000,
+        // Reads nothing and answers clean.
+        scan: (source) => {
+          opened.push(source);
+          return Promise.resolve({ ok: true, verdict: "clean" });
+        },
+      },
+    });
+    await add(
+      plain.base,
+      ids.c ?? "",
+      Buffer.from("An invented page for the lazy scanner."),
+      "lazy.txt",
+    );
+    await lazy.scanQueuedFiles();
+    await lazy.stopFileScans();
+    expect(opened.length).toBeGreaterThanOrEqual(1);
+    for (const source of opened) expect(source.destroyed).toBe(true);
   });
 });
 

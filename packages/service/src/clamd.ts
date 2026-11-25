@@ -18,7 +18,11 @@
  * NUL, more than `MAX_REPLY_BYTES`, words that aren't one of those) is a
  * `protocol` failure: never read as clean.
  *
- * - **Where:** a Unix socket (`{ socket }`, clamd's `LocalSocket`), or TCP
+ * - **Whole streams only:** a stream that reads as more or fewer bytes than
+ *   its `size` is `unreadable` and its end is never sent; a clean reply
+ *   that comes before the end was written is a `protocol` failure.
+ * - **Where:** a Unix socket (`{ socket }`, clamd's `LocalSocket`; the one
+ *   to prefer: the folder's permissions decide who may connect), or TCP
  *   to the loopback address only (`{ host, port }`, clamd's `TCPSocket` with
  *   `TCPAddr 127.0.0.1`): the bytes go unencrypted, so never to another
  *   machine (`clamdAddressProblem`).
@@ -60,8 +64,10 @@ export type ClamdFailure =
   | "too_large"
   /** clamd answered with an ERROR. */
   | "refused"
-  /** An answer that isn't clamd's. */
-  | "protocol";
+  /** An answer that isn't clamd's, or a clean one before the stream ended. */
+  | "protocol"
+  /** The stream to scan didn't read as `size` bytes (a stored copy that broke or changed). */
+  | "unreadable";
 
 export type ClamdVerdict =
   | { readonly ok: true; readonly verdict: "clean" }
@@ -150,14 +156,24 @@ function exchange(
   options: ClamdOptions,
   command: string,
   body: { readonly source: Readable; readonly size: number } | undefined,
-): Promise<{ readonly reply: string } | { readonly failure: ClamdFailure }> {
+): Promise<
+  | {
+      readonly reply: string;
+      /** Whether the stream's end (the zero length) had been written when the reply came. */
+      readonly terminated: boolean;
+    }
+  | { readonly failure: ClamdFailure }
+> {
   const chunkBytes = options.chunkBytes ?? DEFAULT_CHUNK_BYTES;
   return new Promise((resolve) => {
     let settled = false;
     const received: Buffer[] = [];
     let receivedBytes = 0;
+    let terminated = false;
     const socket = open(options.address);
-    const finish = (answer: { reply: string } | { failure: ClamdFailure }): void => {
+    const finish = (
+      answer: { reply: string; terminated: boolean } | { failure: ClamdFailure },
+    ): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -183,7 +199,7 @@ function exchange(
       }
       received.push(chunk);
       const reply = replyIfComplete();
-      if (reply !== undefined) finish({ reply });
+      if (reply !== undefined) finish({ reply, terminated });
     });
     // A connection that ends or breaks without a whole reply: clamd went
     // away (or never was there), or sent something that isn't one.
@@ -220,6 +236,11 @@ function exchange(
             for (let at = 0; at < piece.byteLength; at += chunkBytes) {
               const part = piece.subarray(at, Math.min(at + chunkBytes, piece.byteLength));
               sent += part.byteLength;
+              // Longer than its size says: not the bytes the row names.
+              if (sent > body.size) {
+                finish({ failure: "unreadable" });
+                return;
+              }
               if (sent > options.streamMaxBytes) {
                 finish({ failure: "too_large" });
                 return;
@@ -233,10 +254,18 @@ function exchange(
         } catch {
           // The stored copy couldn't be read to the end: no verdict from a
           // part of it.
-          finish({ failure: "unavailable" });
+          finish({ failure: "unreadable" });
           return;
         }
-        // The end of the stream: a zero length. Then the reply (above).
+        if (settled) return;
+        // Shorter than its size says: clamd never sees the end of a part.
+        if (sent !== body.size) {
+          finish({ failure: "unreadable" });
+          return;
+        }
+        // The end of the stream: a zero length. Only a reply after it can
+        // be clean (scanWithClamd). Then the reply (above).
+        terminated = true;
         await write(Buffer.alloc(4));
       })();
     });
@@ -258,7 +287,13 @@ export async function scanWithClamd(
     return { ok: false, failure: "too_large" };
   }
   const answer = await exchange(options, "zINSTREAM", { source, size });
-  return "reply" in answer ? parseClamdReply(answer.reply) : { ok: false, failure: answer.failure };
+  if (!("reply" in answer)) return { ok: false, failure: answer.failure };
+  const verdict = parseClamdReply(answer.reply);
+  // "OK" before clamd had the whole stream says nothing about the file.
+  if (verdict.ok && verdict.verdict === "clean" && !answer.terminated) {
+    return { ok: false, failure: "protocol" };
+  }
+  return verdict;
 }
 
 /** Whether clamd answers `PONG` to `zPING` within the time limit. */

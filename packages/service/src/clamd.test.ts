@@ -96,14 +96,31 @@ describe("scanning a stream", () => {
     expect(f.connections()).toBe(0);
   });
 
-  it("stops sending when a stream turns out longer than its size says", async () => {
+  it("stops with unreadable when a stream turns out longer than its size says", async () => {
     const f = await fake({ mode: "ok" });
     const answer = await scanWithClamd(
-      options(f, { streamMaxBytes: 1000, chunkBytes: 100 }),
+      options(f, { streamMaxBytes: 10_000, chunkBytes: 100 }),
       Readable.from([bytes(5000)]),
       900,
     );
-    expect(answer).toEqual({ ok: false, failure: "too_large" });
+    expect(answer).toEqual({ ok: false, failure: "unreadable" });
+    // The end of the stream was never sent, so clamd gave no verdict.
+    expect(f.streams).toEqual([]);
+  });
+
+  it("never ends a stream shorter than its size says: unreadable", async () => {
+    const f = await fake({ mode: "ok" });
+    const answer = await scanWithClamd(options(f), Readable.from([bytes(500)]), 900);
+    expect(answer).toEqual({ ok: false, failure: "unreadable" });
+    expect(f.streams).toEqual([]);
+  });
+
+  it("doesn't take a clean reply that comes before the stream's end", async () => {
+    const f = await fake({ mode: "early_ok" });
+    const body = bytes(300_000);
+    expect(
+      await scanWithClamd(options(f, { chunkBytes: 1000 }), Readable.from([body]), body.length),
+    ).toEqual({ ok: false, failure: "protocol" });
   });
 
   it("reads clamd's own size limit mid-stream as too_large", async () => {
@@ -178,7 +195,7 @@ describe("scanning a stream", () => {
     });
     expect(await scanWithClamd(options(f), broken, 100)).toEqual({
       ok: false,
-      failure: "unavailable",
+      failure: "unreadable",
     });
   });
 

@@ -3,6 +3,7 @@
 // production or the development one there (D-085), an admin origin outside
 // OCULUS_ORIGINS), and the built admin served on the
 // admin's origin only, with its own CSP while the API keeps its own.
+import { startFakeClamd } from "../../service/src/clamd.fixtures.js";
 import {
   existsSync,
   mkdirSync,
@@ -172,6 +173,41 @@ describe("the startup checks", () => {
     const two = await buildAdminServer({ db, env: DEV, adminFiles: files });
     await one.close();
     await two.close();
+  }, 30_000);
+
+  it("warns when the file cap is above the virus scanner's limit, and stops its scans on close", async () => {
+    const clamd = await startFakeClamd({ mode: "ok", tcp: true });
+    try {
+      const address = clamd.address as { host: string; port: number };
+      const scanning = {
+        ...DEV,
+        OCULUS_CLAMD_HOST: address.host,
+        OCULUS_CLAMD_PORT: String(address.port),
+        OCULUS_CLAMD_STREAM_MAX_MIB: "1",
+      };
+      for (const [cap, warned] of [
+        ["2", true],
+        ["1", false],
+      ] as const) {
+        const logged: { event: string; code?: string }[] = [];
+        const app = await buildAdminServer({
+          db,
+          env: { ...scanning, OCULUS_FILE_MAX_MIB: cap },
+          adminFiles: files,
+          log: (r) => logged.push(r),
+        });
+        // Closing waits for the scan queue (Fastify's onClose).
+        await app.close();
+        expect(
+          logged.some(
+            (r) => r.event === "startup_warning" && r.code === "file_cap_over_scan_limit",
+          ),
+          cap,
+        ).toBe(warned);
+      }
+    } finally {
+      await clamd.close();
+    }
   }, 30_000);
 
   it("refuses to start without a usable files folder or with bad caps, never showing them", async () => {

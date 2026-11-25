@@ -9,7 +9,7 @@ import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SITE_1, fakeServer } from "../testing.fixtures";
-import { FilesPanel, sizeText } from "./FilesPanel";
+import { FilesPanel, SCAN_POLL_MS, SCAN_RETRY_POLL_MS, scanPollMs, sizeText } from "./FilesPanel";
 import { viewErrorText } from "./FileViewer";
 import { RECORD_ID } from "./records.fixtures";
 
@@ -337,6 +337,29 @@ describe("virus scans (S-040)", () => {
     const table = screen.getByRole("table", { name: "Files on this record" });
     expect(within(table).getByText("Not scanned")).toBeTruthy();
     expect(within(table).getByRole("link", { name: "Download photo.jpg" })).toBeTruthy();
+  });
+
+  it("offers files from before scanning was turned on, and says why they aren't scanned yet", async () => {
+    fakeServer({
+      [LIST]: [200, { files: [scanned("not_yet_scanned")], maxFileBytes: 1000 }],
+    });
+    show(false);
+    expect(await screen.findByText(/added before virus scanning was turned on/)).toBeTruthy();
+    const table = screen.getByRole("table", { name: "Files on this record" });
+    expect(within(table).getByText("Not yet scanned")).toBeTruthy();
+    expect(within(table).getByRole("link", { name: "Download photo.jpg" })).toBeTruthy();
+    expect(within(table).getByRole("button", { name: "Preview photo.jpg" })).toBeTruthy();
+  });
+
+  it("keeps asking while a scan is due: often for a new upload, slowly for a retry", () => {
+    const f = (scan: string, scanQueued: boolean) =>
+      ({ ...PHOTO, scan, scanQueued }) as Parameters<typeof scanPollMs>[0][number];
+    expect(scanPollMs([f("pending", true)])).toBe(SCAN_POLL_MS);
+    expect(scanPollMs([f("failed", true)])).toBe(SCAN_RETRY_POLL_MS);
+    expect(scanPollMs([f("not_yet_scanned", true)])).toBe(SCAN_RETRY_POLL_MS);
+    // A failed scan not tried again by itself (too large) isn't waited for.
+    expect(scanPollMs([f("failed", false), f("clean", false)])).toBeUndefined();
+    expect(scanPollMs([f("infected", false), f("not_scanned", false)])).toBeUndefined();
   });
 
   it("reads the list again in the background while a file is being scanned", async () => {

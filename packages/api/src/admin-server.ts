@@ -401,6 +401,11 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   if (scanning === undefined && production) {
     log({ event: "startup_warning", code: "files_not_scanned" });
   }
+  // Uploads over the scanner's limit are refused while scanning is on
+  // (S-040 review S1): the file cap is then really the scanner's.
+  if (scanning !== undefined && files.maxFileBytes > scanning.clamd.streamMaxBytes) {
+    log({ event: "startup_warning", code: "file_cap_over_scan_limit" });
+  }
   // Thumbnails (M-003, D-097) are off until T-072: no renderer, so no
   // worker is ever started. Turned on, one worker, stopped with the server.
   const thumbnailsOn = options.thumbnails === true;
@@ -532,7 +537,12 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
       routes,
       ...(options.logger === undefined ? {} : { logger: options.logger }),
       ...(admin === undefined ? {} : { admin }),
-      ...(publicSubjects === undefined ? {} : { onClose: () => publicSubjects.stop() }),
+      // Stopped before the server's close finishes: the public counts and
+      // the scans running now (S-040 review L5).
+      onClose: async () => {
+        await publicSubjects?.stop();
+        await service.stopFileScans();
+      },
     });
   } catch (error) {
     claim.release();
@@ -563,7 +573,6 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     clearInterval(timer);
     clearInterval(lease);
     if (scans !== undefined) clearInterval(scans);
-    void service.stopFileScans();
     claim.release();
     void thumbnails?.close();
   });

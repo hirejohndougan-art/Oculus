@@ -3,7 +3,8 @@
  * is on only when one of these says where clamd listens:
  *
  * - `OCULUS_CLAMD_SOCKET`: clamd's Unix socket (its `LocalSocket`), an
- *   absolute path; or
+ *   absolute path: the one to prefer, since the socket's folder permissions
+ *   decide who may connect; or
  * - `OCULUS_CLAMD_HOST` and `OCULUS_CLAMD_PORT` (default 3310): TCP on the
  *   loopback address only (`127.0.0.1` or `::1`, written as an address),
  *   since the bytes go unencrypted. Not both a socket and a host.
@@ -15,8 +16,8 @@
  * - `OCULUS_CLAMD_STREAM_MAX_MIB` (default 100, current clamd's own
  *   default, 1 to 4095): set it to clamd's `StreamMaxLength` (or less), and
  *   keep clamd's `MaxFileSize` at least as large (clamd passes a file over
- *   it unscanned as OK). Larger files are `failed` (`too_large`) and never
- *   served while scanning is on: raise both to scan them;
+ *   it unscanned as OK). While scanning is on, larger uploads are refused
+ *   (`413 too_large_to_scan`): raise both to take them;
  * - `OCULUS_CLAMD_CONCURRENCY` (default 2, 1 to 16): scans at once.
  *
  * None set: no scanner, files are `not_scanned` and served as before (the

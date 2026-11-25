@@ -8,27 +8,41 @@
 -- kept when they are removed (a later upload of the same bytes finds the
 -- same result at once; an infected content stays quarantined).
 --
---   pending   waiting for the scanner (or being scanned now)
---   clean     the scanner found nothing
---   infected  the scanner found something: quarantined, never served, and
---             never changed back by the writer (file_scans_guard)
---   failed    the scan couldn't be done (timeout, scanner down, too large,
---             a refusal or a reply that made no sense); retried with
---             backoff unless the cause won't change by itself (too_large)
+--   pending    uploaded with scanning on: waiting for its first scan, not
+--              served until it is clean
+--   unscanned  stored before scanning was turned on: waiting for its first
+--              scan and still served until then (turning scanning on must
+--              not lock the whole collection); a failed scan leaves it so
+--   clean      the scanner found nothing; a rescan keeps it clean (and
+--              served) while it waits (rescan_requested_at)
+--   infected   the scanner found something: quarantined, never served, and
+--              never changed back by the writer (file_scans_guard)
+--   failed     the first scan of a pending upload couldn't be done (timeout,
+--              scanner down, a refusal or a reply that made no sense);
+--              retried with backoff unless the cause won't change by itself
 --
--- A content with no row has never been scanned ("not_scanned" in the API).
--- Nothing here deletes anything: no row and no stored copy (D-086).
+-- Only an infected verdict takes a served file away. A content with no row
+-- has never been scanned. Nothing here deletes anything: no row and no
+-- stored copy (D-086).
 CREATE TABLE public.file_scans (
   organization_id uuid NOT NULL REFERENCES public.organizations (id),
   sha256 text NOT NULL CONSTRAINT file_scans_sha256_format CHECK (sha256 ~ '^[0-9a-f]{64}$'),
   state text NOT NULL CONSTRAINT file_scans_state
-    CHECK (state IN ('pending', 'clean', 'infected', 'failed')),
+    CHECK (state IN ('pending', 'unscanned', 'clean', 'infected', 'failed')),
   -- Failed attempts since the last result that wasn't a failure.
   attempts integer NOT NULL DEFAULT 0 CONSTRAINT file_scans_attempts_range
     CHECK (attempts BETWEEN 0 AND 1000000),
-  -- When the queue may take it next (pending and failed only; NULL: not
-  -- by itself, until a rescan). Moved ahead while a scan runs (a lease).
+  -- Moved on by every rescan request: a scan claimed under an older one
+  -- doesn't store a clean or failed result (it is queued again).
+  generation integer NOT NULL DEFAULT 0 CONSTRAINT file_scans_generation_range
+    CHECK (generation BETWEEN 0 AND 2147483647),
+  -- When the queue may take it next (NULL: not by itself, until a rescan).
+  -- Moved ahead while a scan runs (a lease).
   next_attempt_at timestamptz DEFAULT clock_timestamp(),
+  -- A clean content asked to be scanned again (it stays clean meanwhile).
+  rescan_requested_at timestamptz,
+  -- Why the last scan failed: the state's cause for failed, the last
+  -- attempt's for an unscanned or clean content waiting to be tried again.
   failure text CONSTRAINT file_scans_failure
     CHECK (failure IN ('timeout', 'unavailable', 'too_large', 'refused', 'protocol', 'unreadable')),
   -- The scanner's name for what it found: printable ASCII, no spaces.
@@ -40,12 +54,16 @@ CREATE TABLE public.file_scans (
   PRIMARY KEY (organization_id, sha256),
   CONSTRAINT file_scans_infected_shape
     CHECK ((state = 'infected') = (signature IS NOT NULL AND quarantined_at IS NOT NULL)),
-  CONSTRAINT file_scans_failed_shape CHECK ((state = 'failed') = (failure IS NOT NULL)),
-  CONSTRAINT file_scans_queue_shape CHECK (state IN ('pending', 'failed') OR next_attempt_at IS NULL)
+  CONSTRAINT file_scans_failed_shape CHECK (state <> 'failed' OR failure IS NOT NULL),
+  CONSTRAINT file_scans_failure_shape CHECK (failure IS NULL OR state IN ('failed', 'unscanned', 'clean')),
+  CONSTRAINT file_scans_rescan_shape CHECK (rescan_requested_at IS NULL OR state = 'clean'),
+  CONSTRAINT file_scans_queue_shape CHECK (
+    next_attempt_at IS NULL OR state IN ('pending', 'unscanned', 'failed')
+    OR (state = 'clean' AND rescan_requested_at IS NOT NULL))
 );
 
 CREATE INDEX file_scans_due ON public.file_scans (next_attempt_at)
-  WHERE state IN ('pending', 'failed');
+  WHERE next_attempt_at IS NOT NULL;
 
 -- Every scan result and every rescan request, append-only (like
 -- stored_file_events): what was found in which content, and when.
@@ -76,8 +94,8 @@ CREATE TABLE public.file_scan_events (
 CREATE INDEX file_scan_events_content
   ON public.file_scan_events (organization_id, sha256, occurred_at);
 
--- A quarantine holds: an infected content never goes back to another state
--- by any writer (a false positive is for an operator, by hand, as the
+-- A quarantine holds: an infected content never goes back to another state,
+-- and its signature and quarantine time never change, by any writer (a false positive is for an operator, by hand, as the
 -- owner); no row is ever deleted; updated_at is the database's clock.
 CREATE FUNCTION public.file_scans_guard() RETURNS trigger
 LANGUAGE plpgsql
@@ -96,7 +114,8 @@ BEGIN
             CONSTRAINT = 'file_scans_fixed_key';
   END IF;
   IF OLD.state = 'infected' AND (NEW.state <> 'infected'
-     OR NEW.quarantined_at IS DISTINCT FROM OLD.quarantined_at) THEN
+     OR NEW.quarantined_at IS DISTINCT FROM OLD.quarantined_at
+     OR NEW.signature IS DISTINCT FROM OLD.signature) THEN
     RAISE EXCEPTION 'An infected file stays quarantined.'
       USING ERRCODE = 'integrity_constraint_violation',
             CONSTRAINT = 'file_scans_quarantine_holds';
@@ -106,11 +125,23 @@ BEGIN
 END
 $$;
 
+-- Every row starts queued, with nothing found yet: pending (an upload with
+-- scanning on) or unscanned (stored before scanning was turned on). No
+-- writer can insert a result it didn't scan for.
 CREATE FUNCTION public.file_scans_stamp() RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
+  IF NEW.state NOT IN ('pending', 'unscanned') OR NEW.signature IS NOT NULL
+     OR NEW.failure IS NOT NULL OR NEW.scanned_at IS NOT NULL
+     OR NEW.quarantined_at IS NOT NULL OR NEW.rescan_requested_at IS NOT NULL
+     OR NEW.attempts <> 0 OR NEW.generation <> 0 THEN
+    RAISE EXCEPTION 'A scan result starts queued.'
+      USING ERRCODE = 'integrity_constraint_violation',
+            CONSTRAINT = 'file_scans_start_queued';
+  END IF;
+  NEW.next_attempt_at := clock_timestamp();
   NEW.updated_at := clock_timestamp();
   RETURN NEW;
 END

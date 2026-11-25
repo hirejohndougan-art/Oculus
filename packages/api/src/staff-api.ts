@@ -74,8 +74,10 @@
  * Virus scanning (S-040, D-113): each listed file carries its content's
  * `scan` (`pending`, `clean`, `infected`, `failed`, `not_scanned`). With a
  * scanner set up only clean files are read: `409 scan_pending` and `409
- * scan_failed` otherwise; an infected file is `423 quarantined`, scanner or
- * not. System managers read `GET /api/system/file-scans` (on or off, and
+ * scan_failed` otherwise, files stored before scanning was turned on are
+ * read until their first scan (`not_yet_scanned`); an infected file is `423
+ * quarantined`, scanner or not. While scanning is on an upload larger than
+ * the scanner takes is `413 too_large_to_scan`. System managers read `GET /api/system/file-scans` (on or off, and
  * the organization's counts) and queue every clean and failed file again
  * with `POST /api/system/file-scans/rescan` (recent sign-in; `409
  * scanning_off` without a scanner).
@@ -494,6 +496,8 @@ function fileRefusal(result: ServiceRefusal): Refusal | undefined {
   if (codes.has("scan_pending")) return new Refusal(409, "scan_pending");
   if (codes.has("scan_failed")) return new Refusal(409, "scan_failed");
   if (codes.has("scanning_off")) return new Refusal(409, "scanning_off");
+  // Larger than the scanner takes: it could never be scanned, so never kept.
+  if (codes.has("too_large_to_scan")) return new Refusal(413, "too_large_to_scan");
   if (codes.has("no_thumbnail")) return new Refusal(422, "no_thumbnail");
   if (codes.has("busy")) return new Refusal(503, "busy");
   if (codes.has("not_cached")) return new Refusal(405, "method_not_allowed");
@@ -923,7 +927,8 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
         return answer(result, reply, (value) => ({
           files: value,
           // So the admin can refuse a file that's too large before sending it.
-          maxFileBytes: files?.maxFileBytes ?? null,
+          // While scanning is on, no more than the scanner takes (S-040).
+          maxFileBytes: service.fileUploadLimit() ?? null,
         }));
       }),
     },

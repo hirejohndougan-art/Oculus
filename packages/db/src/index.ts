@@ -390,6 +390,7 @@ export {
 } from "./file-scans.js";
 export type {
   ClaimedScan,
+  RecordedScan,
   ScanCounts,
   ScanFailure,
   ScanResult,
