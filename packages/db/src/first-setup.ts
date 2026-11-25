@@ -262,27 +262,73 @@ export async function databaseBeforeSetup(
 }
 
 /**
- * Whether a database's only contents are extensions and what they own
+ * Kinds of object an extension can bring with it (`contentsOf`'s names):
+ * a database with anything else besides them isn't explained by an
+ * extension in `template1`.
+ */
+const EXTENSION_KINDS = new Set([
+  "extensions",
+  "schemas",
+  "relations",
+  "functions",
+  "types",
+  "constraints",
+  "operators",
+  "operator_classes",
+  "operator_families",
+  "casts",
+  "collations",
+  "conversions",
+  "languages",
+  "transforms",
+  "access_methods",
+  "text_search_configurations",
+  "text_search_dictionaries",
+  "text_search_parsers",
+  "text_search_templates",
+  "foreign_data_wrappers",
+]);
+
+/**
+ * Whether a database's only contents are extensions and what they bring
  * (S-031): CREATE DATABASE copies `template1`, so an extension installed
  * there is in every new database, and setup's refusal can say so.
  */
 export async function onlyExtensionsBeforeSetup(db: Database): Promise<boolean> {
   const contents = await contentsOf(db);
   if ((contents.extensions ?? 0) === 0) return false;
+  if (Object.keys(contents).some((kind) => !EXTENSION_KINDS.has(kind))) return false;
   return (await objectsOutsideExtensions(db)) === 0;
 }
 
-/** How many schemas, functions and relations no extension owns. */
+/**
+ * How many schemas, functions, tables, views, sequences, domains, enums and
+ * composite types no extension owns (an extension's own indexes, TOAST
+ * tables and row types belong to its tables, so aren't counted).
+ */
 async function objectsOutsideExtensions(db: Database): Promise<number> {
   const [row] = await db.rows<{ n: number }>(sql`
+    WITH ext AS (
+      SELECT classid, objid FROM pg_catalog.pg_depend WHERE deptype = 'e'
+    )
     SELECT (
       (SELECT count(*) FROM pg_catalog.pg_namespace n WHERE n.oid >= 16384
          AND n.nspname NOT LIKE 'pg\\_temp\\_%' AND n.nspname NOT LIKE 'pg\\_toast\\_temp\\_%'
-         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = 'pg_catalog.pg_namespace'::regclass AND d.objid = n.oid AND d.deptype = 'e'))
+         AND (n.oid) NOT IN (SELECT objid FROM ext WHERE classid = 'pg_catalog.pg_namespace'::regclass))
       + (SELECT count(*) FROM pg_catalog.pg_proc p WHERE p.oid >= 16384
-         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = 'pg_catalog.pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e'))
+         AND p.oid NOT IN (SELECT objid FROM ext WHERE classid = 'pg_catalog.pg_proc'::regclass))
       + (SELECT count(*) FROM pg_catalog.pg_class c WHERE c.oid >= 16384
-         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e'))
+         AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S', 'c')
+         AND c.relnamespace::regnamespace::text NOT LIKE 'pg\\_%'
+         AND c.oid NOT IN (SELECT objid FROM ext WHERE classid = 'pg_catalog.pg_class'::regclass)
+         -- a sequence owned by an extension's table column
+         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
+                         WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.objid = c.oid
+                           AND d.deptype IN ('a', 'i')
+                           AND d.refobjid IN (SELECT objid FROM ext
+                                              WHERE classid = 'pg_catalog.pg_class'::regclass)))
+      + (SELECT count(*) FROM pg_catalog.pg_type t WHERE t.oid >= 16384 AND t.typtype IN ('d', 'e', 'r', 'm')
+         AND t.oid NOT IN (SELECT objid FROM ext WHERE classid = 'pg_catalog.pg_type'::regclass))
     )::int AS n`);
   return row?.n ?? 1;
 }

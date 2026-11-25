@@ -546,7 +546,16 @@ describe("npm run setup", () => {
       expect(run.code).toBe(1);
       expect(run.out).toContain("template1");
       expect(run.out).toContain("createdb -T template0 oculus");
-      // With something of someone else's too, the ordinary refusal.
+      // An extension with a view of its own: still the template1 hint.
+      await db.execute(sql`CREATE EXTENSION pg_stat_statements`);
+      const viewed = await runCli({ OCULUS_DATABASE_URL: testDb.url }, typed);
+      expect(viewed.out).toContain("template1");
+      // With something of someone else's too, the ordinary refusal: a domain,
+      // then a table.
+      await db.execute(sql`CREATE DOMAIN public.theirs_d AS int`);
+      const domain = await runCli({ OCULUS_DATABASE_URL: testDb.url }, typed);
+      expect(domain.out).not.toContain("template1");
+      await db.execute(sql`DROP DOMAIN public.theirs_d`);
       await db.execute(sql`CREATE TABLE public.theirs (a int)`);
       const other = await runCli({ OCULUS_DATABASE_URL: testDb.url }, typed);
       expect(other.out).not.toContain("template1");
