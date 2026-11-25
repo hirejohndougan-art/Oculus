@@ -53,8 +53,12 @@ async function withRole(q: Queryable, statement: string, role: string): Promise<
   END $$`);
 }
 
+/** A throwaway files folder (M-002, D-086): the admin refuses to start without one. */
+const FILES_DIR = mkdtempSync(join(tmpdir(), "oculus-public-hosts-files-"));
+
 const ENV = {
   NODE_ENV: "production",
+  OCULUS_FILES_DIR: FILES_DIR,
   OCULUS_ORIGINS: [...ORIGINS].join(","),
   OCULUS_ADMIN_ORIGIN: ADMIN,
   OCULUS_SECRET_KEY: FAKE_TEST_SECRET_KEY,
@@ -98,6 +102,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   rmSync(dir, { recursive: true, force: true });
+  rmSync(FILES_DIR, { recursive: true, force: true });
   await reader.close();
   await owner.close();
   await testDb.drop();
