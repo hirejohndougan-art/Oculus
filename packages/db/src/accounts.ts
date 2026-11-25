@@ -1268,8 +1268,12 @@ export async function markSignedIn(db: Database, userId: string, source: string)
     await db.execute(
       sql`UPDATE public.users SET last_sign_in_at = clock_timestamp() WHERE id = ${userId}::uuid`,
     );
-  } catch {
-    // Best effort, as above.
+  } catch (error) {
+    // Best effort, as above, but said like `markKnownSource`'s (S-050): only
+    // the failure's class, never the person.
+    process.emitWarning(`Couldn't stamp a sign-in's time (${failureClass(error)}).`, {
+      code: "OCULUS_LAST_SIGN_IN",
+    });
   }
   await markKnownSource(db, userId, source);
 }
