@@ -90,7 +90,7 @@ export function SettingsLayout() {
         <h1 className={records.pageTitle}>System settings</h1>
         <p className={records.lead}>
           Settings for the whole of Oculus, for every organization and site. Only system managers
-          see these. Each change needs a recent sign-in.
+          see these. Adding or renaming a site and changing the sign-in rules need a recent sign-in.
         </p>
       </div>
       <nav aria-label="System settings">

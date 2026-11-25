@@ -253,12 +253,19 @@ function TemplateForm(props: {
     onError: (error, sent) => {
       if (!(error instanceof ApiError && error.code === "confirmation_required")) return;
       const next = confirmationOf(issuesOf(error.body));
-      // Confirmed changes and then asked about published records: the
-      // changes stay confirmed (the server wants exactly that set again).
+      // The server asks one thing at a time (published records first, then
+      // changes records use): what the person already confirmed stays
+      // confirmed. A new list of changes replaces the old one (the server
+      // wants exactly that set).
       setAsked(
-        next.confirm.length === 0 && sent !== undefined
-          ? { ...next, confirm: sent.confirm, messages: sent.messages }
-          : next,
+        sent === undefined
+          ? next
+          : {
+              confirm: next.confirm.length > 0 ? next.confirm : sent.confirm,
+              messages: next.confirm.length > 0 ? next.messages : sent.messages,
+              publishedRecords:
+                next.publishedRecords > 0 ? next.publishedRecords : sent.publishedRecords,
+            },
       );
     },
   });

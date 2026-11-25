@@ -526,4 +526,60 @@ describe("templates", () => {
       expect(router.state.location.pathname).toBe("/settings/templates");
     });
   });
+
+  it("published records asked about first, then the changes: the first answer is kept", async () => {
+    let calls = 0;
+    const sent = server({
+      "PUT /api/templates/lantern": () => {
+        calls += 1;
+        if (calls === 1) {
+          return [
+            409,
+            {
+              error: "confirmation_required",
+              issues: [
+                { path: ["confirmPublished"], code: "publishes_records", message: "x" },
+                {
+                  path: ["publishedRecords", "r1"],
+                  code: "published_record_affected",
+                  message: "x",
+                },
+              ],
+            },
+          ];
+        }
+        if (calls === 2) {
+          return [
+            409,
+            {
+              error: "confirmation_required",
+              issues: [
+                {
+                  path: ["confirm", "field_removed", "maker"],
+                  code: "needs_confirmation",
+                  message: "Records use Maker.",
+                },
+              ],
+            },
+          ];
+        }
+        return [200, { ...TEMPLATE, version: 4, publishedRecords: [] }];
+      },
+    });
+    const user = userEvent.setup();
+    renderAt("/settings/templates/lantern");
+    await user.click(await screen.findByRole("button", { name: "Save template" }));
+    expect(await screen.findByText(/shows values at once on 1 published record\b/)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Save with these changes" }));
+    expect(await screen.findByText("Records use Maker.")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Save with these changes" }));
+    expect(await screen.findByText("Saved.")).toBeTruthy();
+    const puts = sent
+      .filter((s) => s.method === "PUT")
+      .map((s) => s.body as Record<string, unknown>);
+    expect(puts).toHaveLength(3);
+    expect(puts[1]?.confirmPublished).toBe(true);
+    expect(puts[2]?.confirmPublished).toBe(true);
+    expect(puts[2]?.confirm).toEqual([{ code: "field_removed", key: "maker" }]);
+  });
 });

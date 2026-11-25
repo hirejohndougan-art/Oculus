@@ -132,7 +132,7 @@ export function problemText(error: unknown): string {
     case "unauthenticated":
       return "Your sign-in has ended. Sign in again.";
     case "reauthentication_required":
-      return "For safety, this needs a fresh sign-in. Sign out, sign in again, then try again within 10 minutes.";
+      return "For safety, this needs a fresh sign-in. Sign out, sign in again, then try again straight away.";
     case "csrf_failed":
     case "cross_origin":
       return "This page is out of date. Reload it and try again.";
