@@ -567,16 +567,135 @@ export type AuditEntry =
       /** A purge's contents and bytes (S-052); null for an update. */
       readonly files: number | null;
       readonly bytes: number | null;
+    }
+  | {
+      /**
+       * A definition the records lean on was made or changed (S-064, D-117):
+       * an identifier type, a term, a site, the storage levels or a
+       * location, a Dublin Core mapping or (system managers only) the
+       * System settings.
+       */
+      readonly type: "definition";
+      readonly at: string;
+      /** `user:<id>`, or `command_line` for set-up or a command on the server. */
+      readonly actor: string;
+      readonly actorName: string | null;
+      readonly eventId: string;
+      readonly subject: DefinitionSubject;
+      /** The type's key, the term's, site's or location's ID, the mapping's template; null for the levels and settings. */
+      readonly key: string | null;
+      readonly action: "created" | "changed";
+      /** Its name or label after the change, where it has one. */
+      readonly name: string | null;
+      /** The stored properties that changed (empty when created). */
+      readonly changes: readonly string[];
+    }
+  | {
+      /** A file attached to a record or removed from it (M-002). */
+      readonly type: "file";
+      readonly at: string;
+      readonly actor: string;
+      readonly actorName: string | null;
+      readonly eventId: string;
+      readonly kind: "attached" | "removed";
+      readonly recordId: string;
+      /** The record's title now; null once it has been deleted. */
+      readonly title: string | null;
+      readonly fileId: string;
+      readonly bytes: number;
+    }
+  | {
+      /** A record moved to a storage location (T-018d). */
+      readonly type: "move";
+      readonly at: string;
+      readonly actor: string;
+      readonly actorName: string | null;
+      readonly eventId: string;
+      readonly recordId: string;
+      readonly title: string | null;
+      readonly locationId: string;
+      readonly locationName: string | null;
+    }
+  | {
+      /** An accession saved (T-018c); whole-organization viewers only. */
+      readonly type: "accession";
+      readonly at: string;
+      readonly actor: string;
+      readonly actorName: string | null;
+      readonly accessionId: string;
+      readonly version: number;
+      readonly number: string | null;
+    }
+  | {
+      /**
+       * A step in a share's life (T-041c): offered, accepted or declined,
+       * then withdrawn or removed (by a person) or ended because the
+       * record was deleted or moved (`automatic`).
+       */
+      readonly type: "share";
+      readonly at: string;
+      /** `user:<id>`, or `automatic` for an ending the database made. */
+      readonly actor: string;
+      readonly actorName: string | null;
+      readonly shareId: string;
+      readonly kind: ShareStep;
+      readonly recordId: string;
+      /** The record's title, in its home organization's trail only. */
+      readonly title: string | null;
+      readonly targetSiteId: string | null;
     };
+
+export const DEFINITION_SUBJECTS = Object.freeze([
+  "identifier_type",
+  "term",
+  "site",
+  "storage_levels",
+  "storage_location",
+  "dublin_core_mapping",
+  "system_settings",
+] as const);
+export type DefinitionSubject = (typeof DEFINITION_SUBJECTS)[number];
+
+export type ShareStep =
+  "offered" | "accepted" | "declined" | "withdrawn" | "removed" | "deleted" | "moved";
+
+/**
+ * The top-level properties (and one level into a stored `definition`,
+ * `mapping` or `settings` document) whose values differ, sorted.
+ */
+export function changedProperties(before: unknown, after: unknown): readonly string[] {
+  const plain = (v: unknown): Record<string, unknown> =>
+    typeof v === "object" && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
+  const a = plain(before);
+  const b = plain(after);
+  const out = new Set<string>();
+  for (const key of new Set([...Object.keys(a), ...Object.keys(b)])) {
+    if (key === "version") continue;
+    const x = a[key];
+    const y = b[key];
+    if (JSON.stringify(x) === JSON.stringify(y)) continue;
+    const nested = key === "definition" || key === "mapping" || key === "settings";
+    const xs = plain(x);
+    const ys = plain(y);
+    if (nested && (Object.keys(xs).length > 0 || Object.keys(ys).length > 0)) {
+      for (const inner of new Set([...Object.keys(xs), ...Object.keys(ys)])) {
+        if (JSON.stringify(xs[inner]) !== JSON.stringify(ys[inner])) out.add(inner);
+      }
+    } else {
+      out.add(key);
+    }
+  }
+  return Object.freeze([...out].sort());
+}
 
 export interface AuditPage {
   readonly entries: readonly AuditEntry[];
   readonly next: string | null;
 }
 
-/** `<time to the microsecond>_<r|e|s><key>`, as `next` gives it. */
+/** `<time to the microsecond>_<r|e|s|d|f|m|a|h><key>`, as `next` gives it. */
 const AUDIT_CURSOR =
-  /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6})_((?:r[0-9a-f-]{36}:\d{10})|(?:[es][0-9a-f-]{36}))$/;
+  /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6})_((?:[ra][0-9a-f-]{36}:\d{10})|(?:[esdfm][0-9a-f-]{36})|(?:h[0-9a-f-]{36}:[ode]))$/;
 
 export function isAuditCursor(value: unknown): value is string {
   if (typeof value !== "string" || value.length > 80) return false;
@@ -598,7 +717,7 @@ function isRealTime(text: string): boolean {
 }
 
 interface AuditRow {
-  type: "record" | "people" | "system";
+  type: "record" | "people" | "system" | "definition" | "file" | "move" | "accession" | "share";
   at: string;
   position: string;
   actor: string;
@@ -623,6 +742,72 @@ interface AuditRow {
   version_from: string | null;
   file_count: number | null;
   byte_count: number | null;
+  detail: Record<string, unknown> | null;
+}
+
+const text = (value: unknown): string | null => (typeof value === "string" ? value : null);
+
+/** The S-064 kinds of line (D-117); `undefined` for the older three. */
+function auditEntryOf(r: AuditRow): AuditEntry | undefined {
+  const detail = r.detail ?? {};
+  const base = { at: r.at, actor: r.actor, actorName: r.actor_name };
+  switch (r.type) {
+    case "definition":
+      return Object.freeze({
+        type: "definition" as const,
+        ...base,
+        eventId: r.event_id ?? "",
+        subject: (r.kind ?? "term") as DefinitionSubject,
+        key: text(detail["key"]),
+        action: r.action === "created" ? ("created" as const) : ("changed" as const),
+        name: r.title,
+        changes:
+          r.action === "created"
+            ? Object.freeze([] as string[])
+            : changedProperties(detail["before"], detail["after"]),
+      });
+    case "file":
+      return Object.freeze({
+        type: "file" as const,
+        ...base,
+        eventId: r.event_id ?? "",
+        kind: r.kind === "removed" ? ("removed" as const) : ("attached" as const),
+        recordId: r.record_id ?? "",
+        title: r.title,
+        fileId: text(detail["fileId"]) ?? "",
+        bytes: r.byte_count ?? 0,
+      });
+    case "move":
+      return Object.freeze({
+        type: "move" as const,
+        ...base,
+        eventId: r.event_id ?? "",
+        recordId: r.record_id ?? "",
+        title: r.title,
+        locationId: text(detail["locationId"]) ?? "",
+        locationName: text(detail["locationName"]),
+      });
+    case "accession":
+      return Object.freeze({
+        type: "accession" as const,
+        ...base,
+        accessionId: r.event_id ?? "",
+        version: r.version ?? 0,
+        number: text(detail["number"]),
+      });
+    case "share":
+      return Object.freeze({
+        type: "share" as const,
+        ...base,
+        shareId: r.event_id ?? "",
+        kind: (r.kind ?? "offered") as ShareStep,
+        recordId: r.record_id ?? "",
+        title: r.title,
+        targetSiteId: r.site_id,
+      });
+    default:
+      return undefined;
+  }
 }
 
 /**
@@ -631,6 +816,9 @@ interface AuditRow {
  * included), people events and, for system managers, changes to the server
  * itself (installs and rollbacks, T-060a), filtered in the query by `scope` (so a
  * page's length never shows that hidden rows matched) and by `filter`.
+ * Since S-064 (D-117) it also shows definitions made or changed, files
+ * attached and removed, moves, accession saves and share steps, each
+ * scoped as its own comment in the query says.
  * Names are given for actors and subjects who are members of the
  * organization or system admins; anyone else is an ID only.
  */
@@ -671,7 +859,7 @@ export async function readAuditTrail(
              NULL::text AS event_id, NULL::text AS kind, NULL::uuid AS subject_id,
              NULL::text AS role, NULL::text AS site_id, NULL::text AS scope,
              NULL::uuid AS invitation_id, NULL::text AS version_to, NULL::text AS version_from,
-             NULL::integer AS file_count, NULL::bigint AS byte_count
+             NULL::integer AS file_count, NULL::bigint AS byte_count, NULL::jsonb AS detail
       FROM public.record_versions v
       WHERE ${wantRecords}::boolean
         AND v.organization_id = ${organizationId}::uuid
@@ -687,7 +875,7 @@ export async function readAuditTrail(
       SELECT 'people', e.occurred_at, 'e' || e.id::text,
              'user:' || e.actor_id::text, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
              e.id::text, e.kind, e.subject_id, e.role, e.site_id::text,
-             e.scope_record_id::text, e.invitation_id, NULL, NULL, NULL, NULL
+             e.scope_record_id::text, e.invitation_id, NULL, NULL, NULL, NULL, NULL
       FROM public.people_events e
       WHERE ${wantPeople}::boolean
         AND e.organization_id = ${organizationId}::uuid
@@ -705,12 +893,112 @@ export async function readAuditTrail(
                   WHEN s.source IN ('timer', 'lease') THEN s.source ELSE 'command_line' END,
              NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
              s.id::text, s.kind, NULL, NULL, NULL, NULL, NULL, s.version, s.from_version,
-             s.file_count, s.byte_count
+             s.file_count, s.byte_count, NULL
       FROM public.system_events s
       WHERE ${wantSystem}::boolean
         AND (${actor}::uuid IS NULL OR s.actor_id = ${actor}::uuid)
         AND (${from}::timestamptz IS NULL OR s.occurred_at >= ${from}::timestamptz)
         AND (${to}::timestamptz IS NULL OR s.occurred_at < ${to}::timestamptz)
+      UNION ALL
+      -- Definitions made or changed (S-064, D-117): the organization's for
+      -- whole-organization viewers, a site's for those who see its records,
+      -- the System settings for system managers.
+      SELECT 'definition', d.occurred_at, 'd' || d.id::text,
+             coalesce(d.actor, 'command_line'), NULL, NULL, d.action,
+             coalesce(d.after ->> 'name', d.after ->> 'label',
+                      d.after #>> '{definition,name}', d.after #>> '{definition,label}'),
+             NULL, NULL, NULL, NULL, d.id::text, d.subject, NULL, NULL,
+             CASE WHEN d.subject = 'site' THEN d.subject_key END, NULL, NULL, NULL, NULL, NULL,
+             NULL, jsonb_build_object('key', d.subject_key, 'before', d.before, 'after', d.after)
+      FROM public.definition_events d
+      WHERE ${filter.recordId === undefined}::boolean
+        AND ((${wantRecords}::boolean AND d.organization_id = ${organizationId}::uuid
+              AND (${recordSites === null}::boolean
+                   OR (d.subject = 'site' AND d.subject_key = ANY (${recordSites ?? []}::text[]))))
+             OR (${wantSystem}::boolean AND d.organization_id IS NULL))
+        AND (${actor}::text IS NULL OR d.actor = 'user:' || ${actor}::text)
+        AND (${from}::timestamptz IS NULL OR d.occurred_at >= ${from}::timestamptz)
+        AND (${to}::timestamptz IS NULL OR d.occurred_at < ${to}::timestamptz)
+      UNION ALL
+      -- Files attached and removed (M-002), scoped like record versions.
+      SELECT 'file', f.occurred_at, 'f' || f.id::text, f.actor, f.record_id::text, NULL,
+             f.kind, r.title, r.kind, NULL, NULL, r.id IS NULL, f.id::text, f.kind, NULL, NULL,
+             NULL, NULL, NULL, NULL, NULL, NULL, f.byte_size,
+             jsonb_build_object('fileId', f.file_id)
+      FROM public.stored_file_events f
+      LEFT JOIN public.records r ON r.organization_id = f.organization_id AND r.id = f.record_id
+      WHERE ${wantRecords}::boolean
+        AND f.organization_id = ${organizationId}::uuid
+        AND f.kind IN ('attached', 'removed')
+        AND (${recordSites === null}::boolean OR r.site_id = ANY (${recordSites ?? []}::uuid[]))
+        AND (${actor}::text IS NULL OR f.actor = 'user:' || ${actor}::text)
+        AND (${filter.recordId ?? null}::uuid IS NULL OR f.record_id = ${filter.recordId ?? null}::uuid)
+        AND (${from}::timestamptz IS NULL OR f.occurred_at >= ${from}::timestamptz)
+        AND (${to}::timestamptz IS NULL OR f.occurred_at < ${to}::timestamptz)
+      UNION ALL
+      -- Moves to a storage location (T-018d), scoped like record versions.
+      SELECT 'move', m.recorded_at, 'm' || m.id::text, 'user:' || m.recorded_by::text,
+             m.record_id::text, NULL, NULL, r.title, r.kind, NULL, NULL, r.id IS NULL,
+             m.id::text, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+             jsonb_build_object('locationId', m.location_id, 'locationName',
+                                l.definition ->> 'name')
+      FROM public.storage_moves m
+      LEFT JOIN public.records r ON r.organization_id = m.organization_id AND r.id = m.record_id
+      LEFT JOIN public.storage_locations l
+        ON l.organization_id = m.organization_id AND l.id = m.location_id
+      WHERE ${wantRecords}::boolean
+        AND m.organization_id = ${organizationId}::uuid
+        AND (${recordSites === null}::boolean OR r.site_id = ANY (${recordSites ?? []}::uuid[]))
+        AND (${actor}::uuid IS NULL OR m.recorded_by = ${actor}::uuid)
+        AND (${filter.recordId ?? null}::uuid IS NULL OR m.record_id = ${filter.recordId ?? null}::uuid)
+        AND (${from}::timestamptz IS NULL OR m.recorded_at >= ${from}::timestamptz)
+        AND (${to}::timestamptz IS NULL OR m.recorded_at < ${to}::timestamptz)
+      UNION ALL
+      -- Accession saves (T-018c): whole-organization viewers only, and only
+      -- the number (the donor stays on the accession's own page).
+      SELECT 'accession', a.saved_at,
+             'a' || a.accession_id::text || ':' || lpad(a.version::text, 10, '0'),
+             'user:' || a.saved_by::text, NULL, a.version, NULL, NULL, NULL, NULL, NULL, NULL,
+             a.accession_id::text, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+             jsonb_build_object('number', a.definition #>> '{number,value}')
+      FROM public.accession_versions a
+      WHERE ${wantRecords && recordSites === null && filter.recordId === undefined}::boolean
+        AND a.organization_id = ${organizationId}::uuid
+        AND (${actor}::uuid IS NULL OR a.saved_by = ${actor}::uuid)
+        AND (${from}::timestamptz IS NULL OR a.saved_at >= ${from}::timestamptz)
+        AND (${to}::timestamptz IS NULL OR a.saved_at < ${to}::timestamptz)
+      UNION ALL
+      -- A share's steps (T-041c, S-036b), in both organizations' trails:
+      -- the home one's for those who see the record, the receiving one's
+      -- for those who see the site it was offered to. The receiving side
+      -- gets no title (the record isn't theirs; it may be unpublished now).
+      SELECT 'share', step.at, 'h' || sh.id::text || ':' || step.part, step.actor,
+             sh.record_id::text, NULL, NULL,
+             CASE WHEN sh.organization_id = ${organizationId}::uuid THEN r.title END,
+             CASE WHEN sh.organization_id = ${organizationId}::uuid THEN r.kind END,
+             NULL, NULL, sh.organization_id = ${organizationId}::uuid AND r.id IS NULL,
+             sh.id::text, step.kind, NULL, NULL, sh.target_site_id::text, NULL, NULL, NULL,
+             NULL, NULL, NULL, NULL
+      FROM public.record_shares sh
+      LEFT JOIN public.records r ON r.organization_id = sh.organization_id AND r.id = sh.record_id
+      CROSS JOIN LATERAL (VALUES
+        ('o', 'offered', sh.offered_at, 'user:' || sh.offered_by::text),
+        ('d', CASE WHEN sh.state = 'declined' THEN 'declined' ELSE 'accepted' END,
+         sh.decided_at, 'user:' || sh.decided_by::text),
+        ('e', sh.state, sh.ended_at, coalesce('user:' || sh.ended_by::text, 'automatic'))
+      ) AS step (part, kind, at, actor)
+      WHERE ${wantRecords}::boolean
+        AND step.at IS NOT NULL
+        AND ((sh.organization_id = ${organizationId}::uuid
+              AND (${recordSites === null}::boolean
+                   OR r.site_id = ANY (${recordSites ?? []}::uuid[])))
+             OR (sh.target_organization_id = ${organizationId}::uuid
+                 AND (${recordSites === null}::boolean
+                      OR sh.target_site_id = ANY (${recordSites ?? []}::uuid[]))))
+        AND (${actor}::text IS NULL OR step.actor = 'user:' || ${actor}::text)
+        AND (${filter.recordId ?? null}::uuid IS NULL OR sh.record_id = ${filter.recordId ?? null}::uuid)
+        AND (${from}::timestamptz IS NULL OR step.at >= ${from}::timestamptz)
+        AND (${to}::timestamptz IS NULL OR step.at < ${to}::timestamptz)
     )
     SELECT x.type, to_char(x.at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS at,
            to_char(x.at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US') || '_' || x.key
@@ -719,7 +1007,7 @@ export async function readAuditTrail(
            x.record_kind, x.changed_fields, x.reason, x.deleted, x.event_id, x.kind,
            x.subject_id::text AS subject_id, sn.display_name AS subject_name, x.role,
            x.site_id, x.scope, i.email AS invited_email, x.version_to, x.version_from,
-           x.file_count, x.byte_count::float8 AS byte_count
+           x.file_count, x.byte_count::float8 AS byte_count, x.detail
     FROM entries x
     LEFT JOIN names an ON 'user:' || an.id::text = x.actor
     LEFT JOIN names sn ON sn.id = x.subject_id
@@ -730,8 +1018,10 @@ export async function readAuditTrail(
     ORDER BY x.at DESC, x.key DESC
     LIMIT ${limit + 1}`);
   const page = rows.slice(0, limit);
-  const entries: AuditEntry[] = page.map((r) =>
-    r.type === "system"
+  const entries: AuditEntry[] = page.map((r) => {
+    const special = auditEntryOf(r);
+    if (special !== undefined) return special;
+    return r.type === "system"
       ? Object.freeze({
           type: "system" as const,
           at: r.at,
@@ -772,8 +1062,8 @@ export async function readAuditTrail(
             siteId: r.site_id,
             scope: r.scope,
             invitedEmail: r.invited_email,
-          }),
-  );
+          });
+  });
   const last = page.at(-1);
   return Object.freeze({
     entries: Object.freeze(entries),

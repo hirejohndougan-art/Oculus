@@ -444,4 +444,94 @@ describe("the audit trail", () => {
     expect(screen.getByText("Root Invented")).toBeTruthy();
     expect(screen.getByText("Oculus's daily clean-up")).toBeTruthy();
   });
+
+  it("shows definitions, files, moves, accessions and share steps (S-064)", async () => {
+    const id = (n: number) => `00000000-0000-4000-8000-0000000000${String(n).padStart(2, "0")}`;
+    const by = { actor: "user:x", actorName: "Root Invented" };
+    fakeServer({
+      "GET /api/me": [200, me([A1])],
+      "GET /api/people": [200, { people: [person()], truncated: false, rights: SYSTEM }],
+      "GET /api/audit?limit=1": [200, { entries: [], next: null }],
+      "GET /api/audit?limit=50": [
+        200,
+        {
+          entries: [
+            {
+              type: "definition",
+              at: "2026-11-25T10:00:00.000Z",
+              ...by,
+              eventId: id(1),
+              subject: "identifier_type",
+              key: "object_number",
+              action: "changed",
+              name: "Object no.",
+              changes: ["label", "uniqueness"],
+            },
+            {
+              type: "definition",
+              at: "2026-11-25T09:00:00.000Z",
+              actor: "command_line",
+              actorName: null,
+              eventId: id(2),
+              subject: "site",
+              key: A1,
+              action: "created",
+              name: "Invented Archives",
+              changes: [],
+            },
+            {
+              type: "file",
+              at: "2026-11-25T08:00:00.000Z",
+              ...by,
+              eventId: id(3),
+              kind: "removed",
+              recordId: id(10),
+              title: "Invented quilt",
+              fileId: id(11),
+              bytes: 2048,
+            },
+            {
+              type: "move",
+              at: "2026-11-25T07:00:00.000Z",
+              ...by,
+              eventId: id(4),
+              recordId: id(10),
+              title: "Invented quilt",
+              locationId: id(12),
+              locationName: "Shelf A",
+            },
+            {
+              type: "accession",
+              at: "2026-11-25T06:00:00.000Z",
+              ...by,
+              accessionId: id(5),
+              version: 2,
+              number: "2026.014",
+            },
+            {
+              type: "share",
+              at: "2026-11-25T05:00:00.000Z",
+              actor: "automatic",
+              actorName: null,
+              shareId: id(6),
+              kind: "deleted",
+              recordId: id(13),
+              title: null,
+              targetSiteId: null,
+            },
+          ],
+          next: null,
+        },
+      ],
+    });
+    renderAt("/audit");
+    expect(await screen.findByText("Changed the identifier type “Object no.”")).toBeTruthy();
+    expect(screen.getByText("Changed: label, uniqueness")).toBeTruthy();
+    expect(screen.getByText("Added the site “Invented Archives”")).toBeTruthy();
+    expect(screen.getByText("Removed a file from “Invented quilt” (2 KB)")).toBeTruthy();
+    expect(screen.getByText("Moved “Invented quilt” to “Shelf A”")).toBeTruthy();
+    expect(screen.getByText("Saved accession 2026.014 (version 2)")).toBeTruthy();
+    expect(screen.getByText("Ended the share (record deleted) of a shared item")).toBeTruthy();
+    expect(screen.getByText("Oculus (automatically)")).toBeTruthy();
+  });
 });

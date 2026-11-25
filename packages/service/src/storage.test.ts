@@ -22,6 +22,7 @@ import {
   insertTemplateVersion,
   migrate,
   openDatabase,
+  readAuditTrail,
   sql,
   type Database,
   type Queryable,
@@ -316,6 +317,61 @@ describe("storage through the service (T-018d)", () => {
         }),
       ),
     ).toEqual(["not_permitted"]);
+  });
+
+  it("puts locations made and renamed, and moves, in the audit trail (S-064)", async () => {
+    await ready();
+    const w = await world();
+    const r = await room(w, "Invented Room 9");
+    ok(
+      await service.saveStorageLocation(
+        ctx(w, w.cataloger),
+        r.id,
+        { kind: "storage", name: "Invented Room 9 East", level: 0 },
+        { expectedVersion: 1 },
+      ),
+    );
+    ok(
+      await service.recordMove(ctx(w, w.cataloger), {
+        recordId: w.vase.id,
+        locationId: r.id,
+        movedOn: "2026-01-02",
+        reason: "placement",
+      }),
+    );
+    const trail = await readAuditTrail(
+      s.owner,
+      w.org,
+      { records: "all", people: "all" },
+      { limit: 100 },
+    );
+    const lines = trail.entries.filter((e) => e.type === "move" || e.type === "definition");
+    expect(lines.find((e) => e.type === "move")).toMatchObject({
+      actor: actorOf(w.cataloger),
+      recordId: w.vase.id,
+      title: "Invented blue vase",
+      locationId: r.id,
+      locationName: "Invented Room 9 East",
+    });
+    const location = lines.filter((e) => e.type === "definition" && e.key === r.id);
+    expect(location).toEqual([
+      expect.objectContaining({
+        action: "changed",
+        actor: actorOf(w.cataloger),
+        name: "Invented Room 9 East",
+        changes: ["name"],
+      }),
+      expect.objectContaining({ action: "created", name: "Invented Room 9" }),
+    ]);
+    // A record filter keeps the record's moves and drops the definitions.
+    const one = await readAuditTrail(
+      s.owner,
+      w.org,
+      { records: "all", people: "all" },
+      { recordId: w.vase.id, limit: 100 },
+    );
+    expect(one.entries.some((e) => e.type === "move")).toBe(true);
+    expect(one.entries.some((e) => e.type === "definition")).toBe(false);
   });
 
   it("answers another organization's record like a missing one", async () => {

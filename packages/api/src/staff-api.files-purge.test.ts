@@ -317,6 +317,12 @@ describe("the purge's steps", () => {
       ["files_deleted", 1, body.length],
       ["files_trashed", 1, body.length],
     ]);
+    // Its attach and removal, for those who see the record (S-064).
+    const files = await readAuditTrail(w.db, w.a, { records: "all", people: "all" }, {});
+    const lines = files.entries.flatMap((e) =>
+      e.type === "file" && e.bytes === body.length ? [e.kind] : [],
+    );
+    expect(lines).toEqual(expect.arrayContaining(["removed", "attached"]));
     await drain();
   });
 

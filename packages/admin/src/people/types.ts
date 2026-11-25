@@ -109,6 +109,63 @@ export type AuditEntry =
       /** A purge step's files and bytes (S-052); absent or null for an update. */
       readonly files?: number | null;
       readonly bytes?: number | null;
+    }
+  | {
+      /** A definition made or changed (S-064): a type, term, site, storage, mapping or settings. */
+      readonly type: "definition";
+      readonly at: string;
+      readonly actor: string;
+      readonly actorName: string | null;
+      readonly eventId: string;
+      readonly subject: string;
+      readonly key: string | null;
+      readonly action: string;
+      readonly name: string | null;
+      readonly changes: readonly string[];
+    }
+  | {
+      readonly type: "file";
+      readonly at: string;
+      readonly actor: string;
+      readonly actorName: string | null;
+      readonly eventId: string;
+      readonly kind: string;
+      readonly recordId: string;
+      readonly title: string | null;
+      readonly fileId: string;
+      readonly bytes: number;
+    }
+  | {
+      readonly type: "move";
+      readonly at: string;
+      readonly actor: string;
+      readonly actorName: string | null;
+      readonly eventId: string;
+      readonly recordId: string;
+      readonly title: string | null;
+      readonly locationId: string;
+      readonly locationName: string | null;
+    }
+  | {
+      readonly type: "accession";
+      readonly at: string;
+      readonly actor: string;
+      readonly actorName: string | null;
+      readonly accessionId: string;
+      readonly version: number;
+      readonly number: string | null;
+    }
+  | {
+      readonly type: "share";
+      readonly at: string;
+      /** `user:<id>`, or `automatic` when the record's deletion or move ended it. */
+      readonly actor: string;
+      readonly actorName: string | null;
+      readonly shareId: string;
+      readonly kind: string;
+      readonly recordId: string;
+      readonly title: string | null;
+      readonly targetSiteId: string | null;
     };
 
 export interface AuditPage {

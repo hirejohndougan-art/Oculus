@@ -30,6 +30,7 @@ import {
   MAX_SHARE_PAGE,
   migrate,
   openDatabase,
+  readAuditTrail,
   sharesIntoSite,
   sql,
   type Database,
@@ -410,6 +411,46 @@ describe("deciding and ending", () => {
     expect(removed.state).toBe("removed");
     // Offering again after a removal makes a new offer.
     expect((await offer(w, { org: w.dhs, site: w.d1 })).id).not.toBe(share.id);
+  });
+
+  it("shows each step in both organizations' audit trails, the title only at home (S-064)", async () => {
+    await ready();
+    const w = await world();
+    const share = await offer(w, { org: w.dhs, site: w.d1 });
+    ok(await service.acceptShare(at(w.dhs, w.dhsManager), share.id));
+    ok(await service.removeShare(at(w.dhs, w.dhsManager), share.id));
+    const steps = async (org: OrganizationId, records: "all" | SiteId[]) =>
+      (await readAuditTrail(s.owner, org, { records, people: "all" }, { limit: 100 })).entries
+        .filter((e) => e.type === "share")
+        .map((e) => (e.type === "share" ? [e.kind, e.actor, e.title, e.targetSiteId] : []));
+    const expected = (title: string | null) => [
+      ["removed", actorOf(w.dhsManager), title, w.d1],
+      ["accepted", actorOf(w.dhsManager), title, w.d1],
+      ["offered", actorOf(w.libCataloger), title, w.d1],
+    ];
+    expect(await steps(w.lib, "all")).toEqual(expected("Invented depot lantern"));
+    expect(await steps(w.lib, [w.l1])).toEqual(expected("Invented depot lantern"));
+    expect(await steps(w.lib, [w.l2])).toEqual([]);
+    expect(await steps(w.dhs, [w.d1])).toEqual(expected(null));
+    // The sites and mappings made through the service name who made them.
+    const made = (
+      await readAuditTrail(s.owner, w.lib, { records: "all", people: "all" }, { limit: 100 })
+    ).entries.filter((e) => e.type === "definition");
+    expect(made).toContainEqual(
+      expect.objectContaining({
+        subject: "site",
+        key: w.l1,
+        action: "created",
+        actor: actorOf(folks.root),
+      }),
+    );
+    expect(made).toContainEqual(
+      expect.objectContaining({
+        subject: "dublin_core_mapping",
+        key: "t-object",
+        actor: actorOf(folks.root),
+      }),
+    );
   });
 
   it("lets the home side withdraw an offer or an accepted item, and no one else", async () => {

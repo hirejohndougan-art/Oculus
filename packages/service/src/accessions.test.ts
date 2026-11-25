@@ -28,6 +28,7 @@ import {
   lockAccessionHolds,
   migrate,
   openDatabase,
+  readAuditTrail,
   publishCheckIssues,
   readPublicRecord,
   sql,
@@ -342,6 +343,36 @@ describe("accessions through the service (T-018c)", () => {
       SELECT count(*)::int AS n, min(saved_by::text) AS who FROM public.accession_versions
       WHERE organization_id = ${w.org}::uuid AND accession_id = ${first.accession.id}::uuid`);
     expect(history).toEqual({ n: 2, who: w.donorStaff });
+  });
+
+  it("shows accession saves, by number only, to whole-organization viewers (S-064)", async () => {
+    await ready();
+    const w = await world();
+    const input = accessionInput(w);
+    const first = ok(await service.createAccession(ctx(w, w.donorStaff), input));
+    ok(
+      await service.updateAccession(
+        ctx(w, w.donorStaff),
+        first.accession.id,
+        { ...input, deedStatus: "signed", deedSignedOn: "2026-04-01" },
+        { expectedVersion: 1 },
+      ),
+    );
+    const lines = async (records: "all" | SiteId[]) =>
+      (
+        await readAuditTrail(s.owner, w.org, { records, people: "all" }, { limit: 100 })
+      ).entries.filter((e) => e.type === "accession");
+    expect(await lines("all")).toEqual([
+      expect.objectContaining({
+        actor: actorOf(w.donorStaff),
+        accessionId: first.accession.id,
+        version: 2,
+        number: input.number.value,
+      }),
+      expect.objectContaining({ version: 1, number: input.number.value }),
+    ]);
+    expect(JSON.stringify(await lines("all"))).not.toContain(w.donor.title);
+    expect(await lines([w.site])).toEqual([]);
   });
 
   it("never gives an all-time number to a second accession, even after the first gave it up", async () => {
