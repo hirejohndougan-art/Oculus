@@ -9,7 +9,7 @@
  *   the migration's header and fills nothing in itself).
  * - `sharesIntoSite` and `sharesOfRecord` list shares, newest first, at most
  *   `MAX_SHARE_PAGE`.
- * - `sharedItemView` builds what a second site may see of an accepted item:
+ * - `sharedItemViews` builds what a second site may see of shares:
  *   exactly what the public is shown of it (`publishedRecordView`), only
  *   while it is published, with the names of its home site and
  *   organization.
@@ -26,7 +26,7 @@ import {
   type SiteId,
   type UserId,
 } from "@oculus/core";
-import type { Queryable } from "./client.js";
+import type { Database, Queryable } from "./client.js";
 import { sql } from "./sql.js";
 import { publishedRecordView } from "./workflow.js";
 
@@ -215,7 +215,8 @@ export async function moveShare(
  * Shares into a site in one state, newest first, at most `MAX_SHARE_PAGE`.
  * Offers and accepted items are asked for separately, so a flood of offers
  * never pushes accepted items out of a list. A share into what is now the
- * record's own home site (it was moved there since) is left out.
+ * record's own home site (it was moved there since), or whose record isn't
+ * published on a home site, is left out before the limit.
  */
 export async function sharesIntoSite(
   tx: Queryable,
@@ -230,11 +231,15 @@ export async function sharesIntoSite(
     WHERE sh.target_organization_id = ${targetOrganizationId}::uuid
       AND sh.target_site_id = ${targetSiteId}::uuid
       AND sh.state = ${state}
-      AND NOT EXISTS (
+      -- Only items the second site could be shown (published, on a home
+      -- site, not moved onto the second site), before the limit, so items
+      -- nobody there can see never fill the page.
+      AND EXISTS (
         SELECT 1 FROM public.records r
         WHERE r.organization_id = sh.organization_id AND r.id = sh.record_id
-          AND sh.organization_id = sh.target_organization_id
-          AND r.site_id = sh.target_site_id)
+          AND r.workflow_state = 'published' AND r.site_id IS NOT NULL
+          AND NOT (sh.organization_id = sh.target_organization_id
+                   AND r.site_id = sh.target_site_id))
     ORDER BY sh.offered_at DESC, sh.id
     LIMIT ${MAX_SHARE_PAGE}`);
   return rows.map(toShare);
@@ -266,35 +271,54 @@ export interface SharedItemView {
 }
 
 /**
- * The view of a shared item as the public sees it now, or `undefined` when
- * the record is gone, isn't published (only published items are shown on a
- * second site), or now sits on the second site itself.
+ * The views of `shares` as the public sees them now, by share ID, built in
+ * one REPEATABLE READ, read-only transaction of its own (one snapshot: no
+ * view mixes moments). A share is left out unless, in that snapshot, it is
+ * still in the state it was given in, its record is not on the second site
+ * itself, and the public could see the record (`publishedRecordView`).
  */
-export async function sharedItemView(
-  tx: Queryable,
-  share: Share,
-): Promise<SharedItemView | undefined> {
-  const [names] = await tx.rows<{
-    organization: string;
-    site: string | null;
-    site_id: string | null;
-  }>(sql`
-    SELECT o.name AS organization, s.name AS site, r.site_id::text AS site_id
-    FROM public.records r
-    JOIN public.organizations o ON o.id = r.organization_id
-    LEFT JOIN public.sites s ON s.organization_id = r.organization_id AND s.id = r.site_id
-    WHERE r.organization_id = ${share.organizationId}::uuid AND r.id = ${share.recordId}::uuid`);
-  if (names === undefined) return undefined;
-  if (share.organizationId === share.targetOrganizationId && names.site_id === share.targetSiteId) {
-    return undefined;
-  }
-  const view = await publishedRecordView(tx, share.organizationId, share.recordId);
-  if (view === undefined) return undefined;
-  return Object.freeze({
-    title: view.title,
-    kind: view.kind,
-    fields: view.fields,
-    homeSite: names.site,
-    homeOrganization: names.organization,
+export async function sharedItemViews(
+  db: Database,
+  shares: readonly Share[],
+): Promise<ReadonlyMap<string, SharedItemView>> {
+  const out = new Map<string, SharedItemView>();
+  if (shares.length === 0) return out;
+  await db.transaction(async (tx) => {
+    await tx.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`);
+    for (const share of shares) {
+      const [names] = await tx.rows<{
+        organization: string;
+        site: string | null;
+        site_id: string | null;
+        state: string;
+      }>(sql`
+        SELECT o.name AS organization, s.name AS site, r.site_id::text AS site_id,
+               sh.state
+        FROM public.record_shares sh
+        JOIN public.records r ON r.organization_id = sh.organization_id AND r.id = sh.record_id
+        JOIN public.organizations o ON o.id = r.organization_id
+        LEFT JOIN public.sites s ON s.organization_id = r.organization_id AND s.id = r.site_id
+        WHERE sh.id = ${share.id}::uuid`);
+      if (names?.state !== share.state) continue;
+      if (
+        share.organizationId === share.targetOrganizationId &&
+        names.site_id === share.targetSiteId
+      ) {
+        continue;
+      }
+      const view = await publishedRecordView(tx, share.organizationId, share.recordId);
+      if (view === undefined) continue;
+      out.set(
+        share.id,
+        Object.freeze({
+          title: view.title,
+          kind: view.kind,
+          fields: view.fields,
+          homeSite: names.site,
+          homeOrganization: names.organization,
+        }),
+      );
+    }
   });
+  return out;
 }

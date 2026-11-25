@@ -15,13 +15,15 @@
 -- change, a state moves only along the arrows above with who and when
 -- (stamped at the moment of the change), a decision is made only by
 -- accepting or declining, and a record is never offered to its own home
--- site (read under the record's key-share lock). A share into a site the
+-- site (read under the record's share lock). A share into a site the
 -- record was moved to later is left out by every reader (shares.ts). Who may offer, decide
 -- and end a share is the service's (shares.ts). Rows go when their record
 -- is deleted (ON DELETE CASCADE): a deleted record is shown nowhere. The
 -- writer has SELECT, INSERT and UPDATE (roles.ts), never DELETE.
 --
--- Every trigger here is ENABLE ALWAYS (D-067), so replica mode skips none.
+-- Every trigger here is ENABLE ALWAYS (D-067), so replica mode skips none of
+-- them (foreign keys, including the cascade, are PostgreSQL's own and don't
+-- fire in replica mode, as for every table).
 
 CREATE TABLE public.record_shares (
   id uuid PRIMARY KEY
@@ -84,9 +86,10 @@ BEGIN
       RAISE EXCEPTION 'An offer is stamped when it is made.'
         USING ERRCODE = 'integrity_constraint_violation', CONSTRAINT = 'record_shares_now';
     END IF;
-    -- Locked, so a move of the record can't slip past this check.
+    -- FOR SHARE (which a move's FOR NO KEY UPDATE waits for), so a move of
+    -- the record can't slip past this check.
     SELECT r.site_id INTO home FROM public.records r
-      WHERE r.organization_id = NEW.organization_id AND r.id = NEW.record_id FOR KEY SHARE;
+      WHERE r.organization_id = NEW.organization_id AND r.id = NEW.record_id FOR SHARE;
     IF NEW.target_organization_id = NEW.organization_id AND home IS NOT DISTINCT FROM NEW.target_site_id
     THEN
       RAISE EXCEPTION 'A record is not offered to its own home site.'

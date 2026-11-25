@@ -396,7 +396,7 @@ export {
   lockShare,
   moveShare,
   readShare,
-  sharedItemView,
+  sharedItemViews,
   sharesIntoSite,
   sharesOfRecord,
 } from "./shares.js";

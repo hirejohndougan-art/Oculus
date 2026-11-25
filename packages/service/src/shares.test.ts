@@ -754,4 +754,79 @@ describe("second review", () => {
       }),
     ).rejects.toMatchObject({ constraint: "record_shares_life" });
   });
+
+  it("shows nothing the public couldn't see: no home site, or public output refused", async () => {
+    await ready();
+    const w = await world();
+    const rootNoSite = { organizationId: w.lib, actor: actorOf(folks.root) };
+    const noSite = ok(
+      await service.createRecord(rootNoSite, {
+        kind: "object",
+        title: "Invented lantern on no site",
+        templateKey: "t-object",
+        fields: { rights: { uri: "http://rightsstatements.org/vocab/InC/1.0/" } },
+      }),
+    ).record;
+    ok(await service.publish(rootNoSite, noSite.id, { expectedVersion: 1 }));
+    expect(
+      codes(
+        await service.offerRecord(rootNoSite, {
+          recordId: noSite.id,
+          targetOrganizationId: w.dhs,
+          targetSiteId: w.d1,
+        }),
+      ),
+    ).toEqual(["not_published"]);
+    // A shown item whose public output is refused later (its description no
+    // longer fits the field after a template change) is shown no more.
+    const share = await offer(w, { org: w.dhs, site: w.d1 });
+    ok(await service.acceptShare(at(w.dhs, w.dhsManager), share.id));
+    expect(ok(await service.listSharedItems(at(w.dhs, w.dhsReader), w.d1))).toHaveLength(1);
+    ok(
+      await insertTemplateVersion(s.owner, {
+        key: "t-object",
+        organizationId: w.lib,
+        label: "Objects",
+        appliesTo: ["object"],
+        fields: [
+          {
+            key: "description",
+            label: "description",
+            kind: "date",
+            required: false,
+            repeatable: false,
+            visibility: "public",
+            inherited: false,
+          },
+          {
+            key: "rights",
+            label: "rights",
+            kind: "rights",
+            required: false,
+            repeatable: false,
+            visibility: "public",
+            inherited: false,
+          },
+        ],
+      }),
+    );
+    expect(ok(await service.listSharedItems(at(w.dhs, w.dhsReader), w.d1))).toEqual([]);
+    expect(codes(await service.readSharedItem(at(w.dhs, w.dhsReader), share.id))).toEqual([
+      "unknown_share",
+    ]);
+  });
+
+  it("doesn't let items nobody on the site can see fill its lists", async () => {
+    await ready();
+    const w = await world();
+    const share = await offer(w, { org: w.dhs, site: w.d1 });
+    const rootAt = at(w.lib, folks.root, w.l1);
+    const now = ok(await service.readRecord(rootAt, w.item.id));
+    ok(await service.withdraw(rootAt, w.item.id, { expectedVersion: now.version }));
+    const [row] = await s.owner.rows<{ n: number }>(sql`
+      SELECT count(*)::int AS n FROM public.record_shares WHERE id = ${share.id}::uuid`);
+    expect(row?.n).toBe(1);
+    // Left out in the query itself (before its limit), not after.
+    expect(ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1))).toEqual([]);
+  });
 });

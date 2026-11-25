@@ -18,11 +18,13 @@
  *   (`sharesOfRecord`).
  * - **Seeing an accepted item** (`readSharedItem`, `listSharedItems`):
  *   anyone with `records.view` for the whole of the second site's catalog
- *   (or a system manager) sees `SharedItemView`: exactly what the public is
- *   shown of it (`publishedRecordView`: no staff-only fields, links, rights
- *   notes or non-public ID numbers), only while it is published and not on
- *   the second site itself, with the names of its home site and
- *   organization. Never history, rights settings or people (D-019). The item is never changed
+ *   (or a system manager) sees `SharedItemView`: what the public is shown
+ *   of it (`publishedRecordView`: no staff-only fields, links, rights notes
+ *   or non-public ID numbers), only while the public could see it at all
+ *   (published, on a home site, passing public output's publish check) and
+ *   it isn't on the second site itself, with the names of its home site and
+ *   organization, built in a REPEATABLE READ snapshot of its own after the
+ *   checks. Never history, rights settings or people (D-019). The item is never changed
  *   from the second site, and a share never widens `onRecord`: the record's
  *   own permission checks don't read shares (`sitesSharedInto` stays empty,
  *   D-094), so the S-028 equivalence of `allowsUnlocked` and `onRecord`
@@ -55,9 +57,10 @@ import {
   readShare,
   readSite,
   readWorkflowState,
-  sharedItemView,
+  sharedItemViews,
   sharesIntoSite as storedSharesIntoSite,
   sharesOfRecord as storedSharesOfRecord,
+  type Database,
   type Queryable,
   type Share,
   type ShareState,
@@ -151,7 +154,7 @@ function seesSite(access: Access, site: SiteId): boolean {
   return holdsForWholeCatalog(access, "records.view", site);
 }
 
-export function shareOperations(run: Runner): ShareOperations {
+export function shareOperations(db: Database, run: Runner): ShareOperations {
   /**
    * The home side's check for a record: the person may edit it at its home
    * site (`onRecord`, which answers a record they can't see as
@@ -188,10 +191,19 @@ export function shareOperations(run: Runner): ShareOperations {
     );
   }
 
-  /** The second side's view of an incoming share, or `undefined` if its record is gone. */
-  async function incoming(tx: Queryable, share: Share): Promise<IncomingShare | undefined> {
-    const item = await sharedItemView(tx, share);
-    return item === undefined ? undefined : Object.freeze({ ...summary(share), item });
+  /**
+   * The second side's views of `shares` (after the operation's checks, in a
+   * snapshot of their own: `sharedItemViews`), in order; a share whose item
+   * the public can't see now is left out.
+   */
+  async function incoming(shares: readonly Share[]): Promise<readonly IncomingShare[]> {
+    const views = await sharedItemViews(db, shares);
+    const out: IncomingShare[] = [];
+    for (const share of shares) {
+      const item = views.get(share.id);
+      if (item !== undefined) out.push(Object.freeze({ ...summary(share), item }));
+    }
+    return Object.freeze(out);
   }
 
   /**
@@ -259,7 +271,10 @@ export function shareOperations(run: Runner): ShareOperations {
         if (place === undefined) return noSuchRecord();
         // Only what is already public goes to another site (D-094): an
         // offer never shows an unpublished item to anyone new.
-        if ((await readWorkflowState(tx, who.organizationId, recordId))?.state !== "published") {
+        if (
+          place.siteId === null ||
+          (await readWorkflowState(tx, who.organizationId, recordId))?.state !== "published"
+        ) {
           return refusal(
             ["recordId"],
             "not_published",
@@ -327,7 +342,7 @@ export function shareOperations(run: Runner): ShareOperations {
     },
 
     async sharesIntoSite(context, siteId) {
-      return run("sharesIntoSite", context, async (tx, who) => {
+      const checked = await run("sharesIntoSite", context, async (tx, who) => {
         const access = await readAccess(tx, who.organizationId, who.actor);
         if (!access.ok) return access;
         if (
@@ -341,13 +356,9 @@ export function shareOperations(run: Runner): ShareOperations {
           ...(await storedSharesIntoSite(tx, who.organizationId, siteId, "offered")),
           ...(await storedSharesIntoSite(tx, who.organizationId, siteId, "accepted")),
         ];
-        const out: IncomingShare[] = [];
-        for (const share of shares) {
-          const view = await incoming(tx, share);
-          if (view !== undefined) out.push(view);
-        }
-        return { ok: true, value: Object.freeze(out) };
+        return { ok: true, value: shares };
       });
+      return checked.ok ? { ok: true, value: await incoming(checked.value) } : checked;
     },
 
     async sharesOfRecord(context, recordId) {
@@ -363,20 +374,22 @@ export function shareOperations(run: Runner): ShareOperations {
     },
 
     async readSharedItem(context, shareId) {
-      return run("readSharedItem", context, async (tx, who) => {
+      const checked = await run("readSharedItem", context, async (tx, who) => {
         const access = await readAccess(tx, who.organizationId, who.actor);
         if (!access.ok) return UNKNOWN_SHARE();
         const share = await readShare(tx, shareId, "target", who.organizationId);
         if (share?.state !== "accepted" || !seesSite(access.value, share.targetSiteId)) {
           return UNKNOWN_SHARE();
         }
-        const view = await incoming(tx, share);
-        return view === undefined ? UNKNOWN_SHARE() : { ok: true, value: view };
+        return { ok: true, value: share };
       });
+      if (!checked.ok) return checked;
+      const [view] = await incoming([checked.value]);
+      return view === undefined ? UNKNOWN_SHARE() : { ok: true, value: view };
     },
 
     async listSharedItems(context, siteId) {
-      return run("listSharedItems", context, async (tx, who) => {
+      const checked = await run("listSharedItems", context, async (tx, who) => {
         const access = await readAccess(tx, who.organizationId, who.actor);
         if (!access.ok) return access;
         if (
@@ -386,14 +399,12 @@ export function shareOperations(run: Runner): ShareOperations {
         ) {
           return NOT_PERMITTED();
         }
-        const shares = await storedSharesIntoSite(tx, who.organizationId, siteId, "accepted");
-        const out: IncomingShare[] = [];
-        for (const share of shares) {
-          const view = await incoming(tx, share);
-          if (view !== undefined) out.push(view);
-        }
-        return { ok: true, value: Object.freeze(out) };
+        return {
+          ok: true,
+          value: await storedSharesIntoSite(tx, who.organizationId, siteId, "accepted"),
+        };
       });
+      return checked.ok ? { ok: true, value: await incoming(checked.value) } : checked;
     },
   };
 }

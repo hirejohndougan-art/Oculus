@@ -568,13 +568,16 @@ export async function publishCheckIssues(
 }
 
 /**
- * What the public is shown of a published record now (T-041c, D-094), read
- * in the caller's transaction from the staff tables as `publishCheckIssues`
- * reads them: `publicView` of its effective record, so inherited public
- * values are in, and staff-only fields, `record_link` values, rights notes,
- * place record IDs, identifiers of types that aren't public (or no longer
- * held) and values that no longer fit their field are out. `undefined` for
- * a record that isn't published or can't be read.
+ * What the public is shown of a record now (T-041c, D-094), in the caller's
+ * transaction (which should be one REPEATABLE READ snapshot: `sharedItemViews`
+ * opens one). `undefined` unless the public could see it: published, on a
+ * home site (D-080's `record_public_on_site`), and passing the publish check
+ * public output runs (`effectivePublishIssues`: identifiers, rights, misfit
+ * values, deeds and access restrictions). Then `publicView` of its
+ * effective record: inherited public values in; staff-only fields,
+ * `record_link` values and labels, rights notes, place record IDs and
+ * non-public identifiers out. (Which public fields a site's Dublin Core
+ * mapping puts out is the public page's business, T-050b.)
  */
 export async function publishedRecordView(
   db: Queryable,
@@ -582,9 +585,11 @@ export async function publishedRecordView(
   recordId: RecordId,
 ): Promise<PublicRecord | undefined> {
   if (!isOrganizationId(organizationId) || !isRecordId(recordId)) return undefined;
-  if ((await readWorkflowState(db, organizationId, recordId))?.state !== "published") {
-    return undefined;
-  }
+  const [row] = await db.rows<{ public: boolean }>(sql`
+    SELECT workflow_state = 'published' AND site_id IS NOT NULL AS public
+    FROM public.records
+    WHERE organization_id = ${organizationId}::uuid AND id = ${recordId}::uuid`);
+  if (row?.public !== true) return undefined;
   const snapshot = await readSnapshot(db, organizationId, recordId, false);
   if (!snapshot.ok) return undefined;
   const s = snapshot.value;
@@ -595,6 +600,9 @@ export async function publishedRecordView(
     identifiers: s.identifiers,
   });
   if (!effective.ok) return undefined;
+  if (effectivePublishIssues(effective.value, { accessions: s.accessions }).length > 0) {
+    return undefined;
+  }
   return publicView(effective.value);
 }
 
