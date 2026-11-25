@@ -25,6 +25,7 @@ import {
   type ShareMove,
 } from "./queries";
 import { useMorePages } from "./paging";
+import { ShowMore } from "./ShowMore";
 
 /** A record kind in words; only the admin's own labels, never a prototype key. */
 function kindText(kind: string): string {
@@ -127,39 +128,6 @@ export function SharedWithSite(props: {
     nextSharePage(props.siteId, "items", before),
   );
 
-  /** A "Show more" button for a list with a next page; says how many more it showed. */
-  function moreButton(pages: ReturnType<typeof useMorePages<IncomingShare>>, what: string) {
-    if (pages.next === null && pages.error === undefined) return null;
-    return (
-      <div className={styles.actions}>
-        {pages.error === undefined ? null : (
-          <Note tone="amber" alert>
-            More couldn't be loaded. {problemText(pages.error)}
-          </Note>
-        )}
-        {pages.next === null ? null : (
-          <Button
-            variant="secondary"
-            isDisabled={pages.loading}
-            onPress={() =>
-              void pages.loadMore().then((count) => {
-                setStatus({
-                  tone: "green",
-                  text:
-                    count === 0
-                      ? `No more ${what} to show.`
-                      : `Showing ${String(count)} more ${what}.`,
-                });
-              })
-            }
-          >
-            Show more {what}
-          </Button>
-        )}
-      </div>
-    );
-  }
-
   // A ref, not only state: a second press before the re-render must not send twice.
   const moving = useRef(false);
   const statusRef = useRef<HTMLDivElement>(null);
@@ -247,7 +215,7 @@ export function SharedWithSite(props: {
               )}
             />
           )}
-          {moreButton(offeredPages, "offers")}
+          <ShowMore pages={offeredPages} what="offers" />
         </section>
         <section className={styles.panel} aria-labelledby="accepted-title">
           <h2 id="accepted-title" className={styles.sectionTitle}>
@@ -269,13 +237,13 @@ export function SharedWithSite(props: {
                   }}
                 >
                   {share.item === null
-                    ? `Remove the hidden item offered ${whenText(share.offeredAt)}`
+                    ? `Remove the hidden item offered ${whenText(share.offeredAt)} (share ${share.id.slice(0, 8)})`
                     : `Remove ${share.item.title}`}
                 </Button>
               )}
             />
           )}
-          {moreButton(acceptedPages, "shared items")}
+          <ShowMore pages={acceptedPages} what="shared items" />
         </section>
       </>
     );
@@ -303,7 +271,7 @@ export function SharedWithSite(props: {
             caption="Items shared with this site"
             shares={itemPages.rows}
           />
-          {moreButton(itemPages, "shared items")}
+          <ShowMore pages={itemPages} what="shared items" />
         </>
       );
   }

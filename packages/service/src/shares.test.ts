@@ -1075,11 +1075,13 @@ describe("share lists and views (S-036a)", () => {
         ok(await service.sharesIntoSite(manager, w.d1, { state: "offered", before })).shares,
       ).toEqual([]);
     }
+    // A cursor share that was decided since still marks where its page ended.
     ok(await service.acceptShare(manager, otherShare.id));
     expect(
-      ok(await service.sharesIntoSite(manager, w.d1, { state: "offered", before: otherShare.id }))
-        .shares,
-    ).toEqual([]);
+      ok(
+        await service.sharesIntoSite(manager, w.d1, { state: "offered", before: otherShare.id }),
+      ).shares.map((x) => x.id),
+    ).toEqual([intoD1.id]);
     // Another record's share isn't a cursor for this record's list.
     const home = at(w.lib, w.libCataloger, w.l1);
     expect(

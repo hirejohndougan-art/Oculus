@@ -18,6 +18,7 @@ import styles from "../records/Records.module.css";
 import { SHARE_STATE_LABELS, cleanId, isId, isLive, type ShareSummary } from "./model";
 import { moveShare, nextRecordSharesPage, refreshShares, useRecordShares } from "./queries";
 import { useMorePages } from "./paging";
+import { ShowMore } from "./ShowMore";
 
 const OFFER_PROBLEMS: Readonly<Record<string, string>> = {
   unknown_site:
@@ -172,7 +173,11 @@ export function SharingPanel(props: {
           The sharing list couldn't be loaded. {problemText(shares.error)}
         </Note>
       ) : live.length === 0 ? (
-        <p>It isn't offered or shared to any other site.</p>
+        <p>
+          {pages.next === null
+            ? "It isn't offered or shared to any other site."
+            : "None of the shares shown so far are open. Show more to see older ones."}
+        </p>
       ) : (
         <ul className={styles.versions} aria-label="Sites it is offered or shared to">
           {live.map((share) => (
@@ -198,7 +203,10 @@ export function SharingPanel(props: {
       )}
       {ended.length === 0 ? null : (
         <details className={styles.details}>
-          <summary>Earlier shares ({String(ended.length)})</summary>
+          <summary>
+            Earlier shares ({String(ended.length)}
+            {pages.next === null ? "" : " shown so far"})
+          </summary>
           <ul>
             {ended.map((share) => (
               <li key={share.id}>
@@ -211,32 +219,7 @@ export function SharingPanel(props: {
           </ul>
         </details>
       )}
-      {pages.next === null ? null : (
-        <div className={styles.actions}>
-          <Button
-            variant="secondary"
-            isDisabled={pages.loading}
-            onPress={() =>
-              void pages.loadMore().then((count) => {
-                setStatus({
-                  tone: "green",
-                  text:
-                    count === 0
-                      ? "No more shares to show."
-                      : `Showing ${String(count)} more shares.`,
-                });
-              })
-            }
-          >
-            Show more shares
-          </Button>
-        </div>
-      )}
-      {pages.error === undefined ? null : (
-        <Note tone="amber" alert>
-          More shares couldn't be loaded. {problemText(pages.error)}
-        </Note>
-      )}
+      <ShowMore pages={pages} what="shares" />
       {props.published ? (
         <form
           className={styles.fieldset}

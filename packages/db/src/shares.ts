@@ -56,7 +56,7 @@ export interface SharePageOptions {
 /**
  * The page condition: shares strictly older than `before` in the lists'
  * order (newest first, then by ID), or no rows for a `before` that isn't a
- * share ID of the same list's shares. `scope` limits which share may be a
+ * share of the same site (or record), in any state. `scope` limits which share may be a
  * cursor, so another list's (or organization's) share can't be one.
  */
 function pageAfter(before: unknown, scope: ReturnType<typeof sql>): ReturnType<typeof sql> {
@@ -262,10 +262,12 @@ export async function sharesIntoSite(
     options.includeHidden === true
       ? sql`r.organization_id IS NOT NULL`
       : sql`r.workflow_state = 'published' AND r.site_id IS NOT NULL`;
+  // The cursor is any share into this site (any state: one that was
+  // decided or ended since the page before still marks where it ended).
   const page = pageAfter(
     options.before,
     sql`c.target_organization_id = ${targetOrganizationId}::uuid
-        AND c.target_site_id = ${targetSiteId}::uuid AND c.state = ${state}`,
+        AND c.target_site_id = ${targetSiteId}::uuid`,
   );
   const rows = await tx.rows<ShareRow>(sql`
     SELECT ${COLUMNS} FROM public.record_shares sh

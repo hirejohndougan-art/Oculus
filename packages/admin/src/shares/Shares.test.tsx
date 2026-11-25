@@ -253,11 +253,57 @@ describe("a shared item", () => {
     expect(screen.getAllByRole("button", { name: /^Show more/ })).toHaveLength(1);
     await userEvent.click(screen.getByRole("button", { name: "Show more shared items" }));
     expect(await screen.findByText("Invented lantern 4")).toBeTruthy();
-    expect(await screen.findByText("Showing 3 more shared items.")).toBeTruthy();
+    expect(
+      await screen.findByText("Showing 2 more shared items. That's all of them."),
+    ).toBeTruthy();
     expect(sent.some((x) => x.path.includes(`state=accepted&before=${cursor}`))).toBe(true);
     // A share in both pages is listed once.
     expect(screen.getAllByText("Invented lantern 2")).toHaveLength(1);
     expect(screen.queryByRole("button", { name: /^Show more/ })).toBeNull();
+  });
+
+  it("drops later pages when the first page is fetched again, and says when none of a page can be shown", async () => {
+    const page = (from: number, count: number) =>
+      Array.from({ length: count }, (_, n) => {
+        const id = `cccccccc-cccc-4ccc-8ccc-${String(from + n).padStart(12, "0")}`;
+        return incoming(id, "accepted", `Invented kettle ${String(from + n)}`);
+      });
+    const first = page(0, 2);
+    const firstId = first[0]?.id ?? "";
+    const cursor = "dddddddd-dddd-4ddd-8ddd-000000000000";
+    const cursor2 = "dddddddd-dddd-4ddd-8ddd-000000000001";
+    siteServer({
+      [OFFERS]: [200, { shares: first, next: { offered: null, accepted: cursor } }],
+      // A page whose shares can't be shown here, but more may follow.
+      [`GET /api/sites/${SITE_1}/share-offers?state=accepted&before=${cursor}`]: [
+        200,
+        { shares: [], next: { offered: null, accepted: cursor2 } },
+      ],
+      [`GET /api/sites/${SITE_1}/share-offers?state=accepted&before=${cursor2}`]: [
+        200,
+        { shares: page(5, 1), next: { offered: null, accepted: null } },
+      ],
+      [`POST /api/shares/${firstId}/remove`]: [200, { share: { id: firstId, state: "removed" } }],
+    });
+    renderAt(SHARED);
+    await screen.findByRole("table", { name: "Items shared with this site" });
+    await userEvent.click(screen.getByRole("button", { name: "Show more shared items" }));
+    expect(
+      await screen.findByText(
+        "None of the next shared items can be shown here. Show more looks further.",
+      ),
+    ).toBeTruthy();
+    // Focus stays on the button while there is more.
+    expect(document.activeElement?.textContent).toBe("Show more shared items");
+    await userEvent.click(screen.getByRole("button", { name: "Show more shared items" }));
+    expect(await screen.findByText("Invented kettle 5")).toBeTruthy();
+    // A move fetches the first page again: the later page is dropped.
+    await userEvent.click(screen.getByRole("button", { name: "Remove Invented kettle 0" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Remove" }));
+    await waitFor(() => {
+      expect(screen.queryByText("Invented kettle 5")).toBeNull();
+    });
+    expect(screen.getByRole("button", { name: "Show more shared items" })).toBeTruthy();
   });
 
   it("says a shared item the public can't see isn't found", async () => {
@@ -380,7 +426,11 @@ describe("sharing on a record's screen", () => {
     });
     renderAt(PATH);
     const box = await panel();
-    expect(await box.findByText("It isn't offered or shared to any other site.")).toBeTruthy();
+    expect(
+      await box.findByText(
+        "None of the shares shown so far are open. Show more to see older ones.",
+      ),
+    ).toBeTruthy();
     await userEvent.click(box.getByRole("button", { name: "Show more shares" }));
     expect(await box.findByRole("button", { name: /^Withdraw from / })).toBeTruthy();
     expect(box.queryByRole("button", { name: "Show more shares" })).toBeNull();
