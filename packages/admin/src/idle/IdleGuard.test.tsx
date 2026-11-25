@@ -54,6 +54,7 @@ function sessionReply(): Reply {
 class FakeBroadcastChannel {
   static all: FakeBroadcastChannel[] = [];
   static posted: unknown[] = [];
+  static envelopes: unknown[] = [];
   readonly name: string;
   private readonly listeners = new Set<(event: MessageEvent) => void>();
   constructor(name: string) {
@@ -61,7 +62,9 @@ class FakeBroadcastChannel {
     FakeBroadcastChannel.all.push(this);
   }
   postMessage(data: unknown) {
-    FakeBroadcastChannel.posted.push(data);
+    // The envelope: this tab's name and the message.
+    FakeBroadcastChannel.posted.push((data as { message: unknown }).message);
+    FakeBroadcastChannel.envelopes.push(data);
   }
   addEventListener(_type: string, listener: (event: MessageEvent) => void) {
     this.listeners.add(listener);
@@ -72,8 +75,9 @@ class FakeBroadcastChannel {
   close() {
     this.listeners.clear();
   }
-  /** Another tab says something. */
-  deliver(data: unknown) {
+  /** Another tab says something (in its envelope). */
+  deliver(message: unknown, tab = "another-tab") {
+    const data = { tab, message };
     for (const l of this.listeners) l(new MessageEvent("message", { data }));
   }
 }
@@ -82,6 +86,7 @@ beforeEach(() => {
   vi.useFakeTimers({ shouldAdvanceTime: true, now: new Date("2026-11-24T12:00:00Z") });
   FakeBroadcastChannel.all = [];
   FakeBroadcastChannel.posted = [];
+  FakeBroadcastChannel.envelopes = [];
   vi.stubGlobal("BroadcastChannel", FakeBroadcastChannel);
 });
 
@@ -452,6 +457,22 @@ describe("across tabs", () => {
     expect(check?.headers["x-oculus-background"]).toBe("1");
   });
 
+  it("drops what this tab sent itself (a BroadcastChannel delivers to the same tab too)", async () => {
+    server();
+    renderAt(`/sites/${SITE_1}`);
+    await frame();
+    await waitFor(() => {
+      expect(FakeBroadcastChannel.envelopes.length).toBeGreaterThan(0);
+    });
+    const own = (FakeBroadcastChannel.envelopes[0] as { tab: string }).tab;
+    const channel = FakeBroadcastChannel.all.find((c) => c.name === "oculus-idle");
+    act(() => {
+      channel?.deliver({ type: "signed-out", session: MARKER, reason: "manual" }, own);
+    });
+    await act(() => vi.advanceTimersByTimeAsync(1000));
+    expect(screen.getByRole("heading", { level: 1, name: "Invented archive site" })).toBeTruthy();
+  });
+
   it("signing out by hand tells the other tabs", async () => {
     server();
     renderAt(`/sites/${SITE_1}`);
@@ -459,6 +480,7 @@ describe("across tabs", () => {
     fireEvent.click(screen.getByRole("button", { name: /^Account:/ }));
     fireEvent.click(await screen.findByRole("menuitem", { name: "Sign out" }));
     await screen.findByRole("heading", { level: 1, name: "Sign in" });
+    expect(screen.getByText("You are signed out.")).toBeTruthy();
     expect(FakeBroadcastChannel.posted).toContainEqual({
       type: "signed-out",
       session: MARKER,
@@ -496,6 +518,7 @@ describe("across tabs", () => {
         new StorageEvent("storage", {
           key: IDLE_STORAGE_KEY,
           newValue: JSON.stringify({
+            tab: "another-tab",
             message: { type: "signed-out", session: MARKER, reason: "manual" },
             n: 1,
             r: 0.5,

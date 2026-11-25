@@ -66,6 +66,26 @@ export function readIdleMessage(data: unknown): IdleMessage | undefined {
   return undefined;
 }
 
+/**
+ * This tab's own name for the envelope around each message: a
+ * BroadcastChannel also delivers to the other channels of the same tab (a
+ * sign-out announced from the account menu would reach this tab's own idle
+ * timer and change its notice), so a tab drops what it sent itself.
+ */
+const TAB = (() => {
+  const bytes = new Uint8Array(9);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+})();
+
+/** The message inside an envelope from another tab, or nothing. */
+function fromEnvelope(data: unknown): IdleMessage | undefined {
+  if (typeof data !== "object" || data === null) return undefined;
+  const envelope = data as Record<string, unknown>;
+  if (typeof envelope.tab !== "string" || envelope.tab === TAB) return undefined;
+  return readIdleMessage(envelope.message);
+}
+
 function broadcastChannel(): IdleChannel | undefined {
   if (typeof BroadcastChannel !== "function") return undefined;
   let channel: BroadcastChannel;
@@ -77,14 +97,14 @@ function broadcastChannel(): IdleChannel | undefined {
   return {
     post(message) {
       try {
-        channel.postMessage(message);
+        channel.postMessage({ tab: TAB, message });
       } catch {
         // A closed channel: nothing to tell.
       }
     },
     listen(listener) {
       const handler = (event: MessageEvent) => {
-        const message = readIdleMessage(event.data);
+        const message = fromEnvelope(event.data);
         if (message !== undefined) listener(message);
       };
       channel.addEventListener("message", handler);
@@ -112,7 +132,10 @@ function storageChannel(): IdleChannel | undefined {
       try {
         // A counter makes each write a change, so a repeated message is
         // still an event in the other tabs.
-        storage.setItem(IDLE_STORAGE_KEY, JSON.stringify({ message, n: count, r: Math.random() }));
+        storage.setItem(
+          IDLE_STORAGE_KEY,
+          JSON.stringify({ tab: TAB, message, n: count, r: Math.random() }),
+        );
       } catch {
         // Storage full or refused: the other tabs find out from the server.
       }
@@ -126,8 +149,7 @@ function storageChannel(): IdleChannel | undefined {
         } catch {
           return;
         }
-        if (typeof parsed !== "object" || parsed === null) return;
-        const message = readIdleMessage((parsed as Record<string, unknown>).message);
+        const message = fromEnvelope(parsed);
         if (message !== undefined) listener(message);
       };
       window.addEventListener("storage", handler);
