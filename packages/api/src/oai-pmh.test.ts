@@ -26,6 +26,7 @@ import { buildAdminServer } from "./admin-server.js";
 import { OAI_PMH_PROLOGUE, isFileReply, oaiPmhReply } from "./file-replies.js";
 import { OAI_PAGE_SIZE, oaiAdminEmail, oaiPmhRoutes } from "./oai-pmh.js";
 import { ReadSlots } from "./public-api.js";
+import { PublicSubjects } from "./public-subjects.js";
 import { checkPublicSites } from "./public-sites.js";
 import { buildServer } from "./server.js";
 import { actorOf, makeObject, makeWorld, ok, publishAs, type World } from "./staff-api.fixtures.js";
@@ -45,6 +46,7 @@ let draft: string;
 let otherSite: string;
 let otherOrg: string;
 let unmapped: string;
+let stamps: PublicSubjects;
 const more: string[] = [];
 
 async function withRole(q: Queryable, statement: string, role: string): Promise<void> {
@@ -157,6 +159,9 @@ beforeAll(async () => {
       rateLimits: { oai: 10_000 },
     }),
   });
+  // The background pass that stores the datestamps (S-041), as admin-server runs it.
+  stamps = new PublicSubjects({ db: w.db, sites, oaiStamps: true, minGapMs: 0 });
+  await stamps.check();
 }, 240_000);
 
 afterAll(async () => {
@@ -200,7 +205,7 @@ describe("GET /oai on a public host", () => {
     expect(reply.body).toContain('<request verb="Identify">http://127.0.0.1/oai</request>');
     expect(reply.body).toContain("<repositoryName>Invented archive site</repositoryName>");
     expect(reply.body).toContain(`<adminEmail>${EMAIL}</adminEmail>`);
-    expect(reply.body).toContain("<deletedRecord>no</deletedRecord>");
+    expect(reply.body).toContain("<deletedRecord>transient</deletedRecord>");
     expect(reply.body).toContain("<granularity>YYYY-MM-DDThh:mm:ssZ</granularity>");
     expect(reply.body).toMatch(
       /<earliestDatestamp>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ<\/earliestDatestamp>/,
@@ -524,6 +529,75 @@ describe("GET /oai on a public host", () => {
     } finally {
       await braked.close();
     }
+  });
+});
+
+describe("stored datestamps (S-041, D-108)", () => {
+  const storedStamps = async () =>
+    new Map(
+      (
+        await w.db.rows<{ id: string; stamp: string; deleted: boolean }>(sql`
+          SELECT record_id::text AS id, stamp::text AS stamp, deleted FROM public.oai_datestamps
+          WHERE organization_id = ${w.a}::uuid AND site_id = ${w.a1}::uuid`)
+      ).map((r) => [r.id, r]),
+    );
+
+  it("stores a row only for records the site showed", async () => {
+    const rows = await storedStamps();
+    expect(rows.has(published)).toBe(true);
+    for (const id of [draft, unmapped, otherSite, otherOrg]) expect(rows.has(id)).toBe(false);
+  });
+
+  it("a pass after a change that doesn't alter a record's oai_dc keeps its datestamp", async () => {
+    const before = await storedStamps();
+    await makeObject(w, w.a, w.a1, "An invented draft that changes nothing public");
+    await stamps.check();
+    const after = await storedStamps();
+    expect(after.get(published)?.stamp).toBe(before.get(published)?.stamp);
+  });
+
+  it("a change to what the public sees moves every affected record's datestamp", async () => {
+    const before = await storedStamps();
+    // The template's mapping no longer shows the note: every object's oai_dc changes.
+    ok(
+      await w.service.saveDublinCoreMapping(
+        { organizationId: w.a, actor: actorOf(w.root) },
+        "t-object",
+        { entries: [{ field: "rights", term: "rights" }] },
+        { expectedVersion: 2, confirmPublished: true },
+      ),
+    );
+    await stamps.check();
+    const after = await storedStamps();
+    expect(after.get(published)?.stamp).not.toBe(before.get(published)?.stamp);
+  });
+
+  it("a record that stops being shown gets a deleted header, in lists and GetRecord", async () => {
+    const gone = more[0] ?? "";
+    ok(
+      await w.service.withdraw({ organizationId: w.a, actor: actorOf(w.root) }, gone as never, {
+        expectedVersion: 2,
+      }),
+    );
+    await stamps.check();
+    const get = await oai(`verb=GetRecord&metadataPrefix=oai_dc&identifier=${PREFIX}${gone}`);
+    expect(get.body).toContain(
+      `<header status="deleted"><identifier>${PREFIX}${gone}</identifier>`,
+    );
+    expect(get.body).not.toContain("<metadata>");
+    let all = "";
+    let reply = await oai("verb=ListRecords&metadataPrefix=oai_dc");
+    all += reply.body;
+    let token = tokenIn(reply.body);
+    while (token !== undefined) {
+      reply = await oai(`verb=ListRecords&resumptionToken=${token}`);
+      all += reply.body;
+      token = tokenIn(reply.body);
+    }
+    expect(all).toContain(`<header status="deleted"><identifier>${PREFIX}${gone}</identifier>`);
+    // A record never shown is still unknown, never "deleted".
+    const never = await oai(`verb=GetRecord&metadataPrefix=oai_dc&identifier=${PREFIX}${draft}`);
+    expect(errorCode(never.body)).toBe("idDoesNotExist");
   });
 });
 

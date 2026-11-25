@@ -39,6 +39,7 @@
  * `timeLimitMs` (default 30 seconds): either refuses the whole count
  * (`too_many_records`, `too_slow`), never a part. Issues are for staff.
  */
+import { createHash } from "node:crypto";
 import {
   isFieldKey,
   isOrganizationId,
@@ -213,6 +214,11 @@ export interface PublicTermCountsForStaff {
   readonly leftOut: Readonly<Record<string, number>>;
   /** Staff only: how many records were left out in all. */
   readonly recordsLeftOut: number;
+  /**
+   * Staff only (S-041): each counted record's ID and a SHA-256 of its
+   * oai_dc record, for the stored OAI-PMH datestamps. Never shown.
+   */
+  readonly fingerprints: ReadonlyMap<string, string>;
 }
 
 /** As `publicTermCounts`, with the staff-only count of records left out and why. */
@@ -285,6 +291,7 @@ async function countIn(
     const tallies = new Map<string, Tally>();
     let counted = 0;
     let leftOutRecords = 0;
+    const fingerprints = new Map<string, string>();
     const leftOut = new Map<string, number>();
     for (const id of ids) {
       if (shouldStop?.() === true) return refused([], "stopped", "The count was stopped.");
@@ -299,7 +306,8 @@ async function countIn(
         continue;
       }
       counted += 1;
-      const { view, template, mapping } = one.value;
+      const { view, template, mapping, output } = one.value;
+      fingerprints.set(id, createHash("sha256").update(output.oaiDcXml, "utf8").digest("hex"));
       const mapped = validateDublinCoreMapping(mapping, template);
       if (!mapped.ok) continue;
       const shownFields = new Set(
@@ -344,6 +352,7 @@ async function countIn(
         counts: Object.freeze({ counts: Object.freeze(counts), recordsCounted: counted }),
         leftOut: Object.freeze(Object.fromEntries([...leftOut].sort(([a], [b]) => compare(a, b)))),
         recordsLeftOut: leftOutRecords,
+        fingerprints,
       }),
     };
   });

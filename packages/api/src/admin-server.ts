@@ -253,7 +253,13 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   const publicSubjects =
     options.countsDb === undefined || publicSites.length === 0
       ? undefined
-      : new PublicSubjects({ db: options.countsDb, sites: publicSites, log });
+      : new PublicSubjects({
+          db: options.countsDb,
+          sites: publicSites,
+          log,
+          // OAI-PMH's lists read the datestamps this pass stores (S-041, D-108).
+          oaiStamps: oaiEmail !== undefined,
+        });
 
   const service = createService(options.db, { onError: serviceErrorLogger(log) });
   const routes = [

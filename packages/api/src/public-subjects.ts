@@ -30,6 +30,7 @@
 import {
   publicOutputMarker,
   publicTermCountsForStaff,
+  writeOaiStamps,
   type Database,
   type PublicTermCount,
 } from "@oculus/db";
@@ -62,6 +63,11 @@ export interface PublicSubjectsOptions {
   readonly staleMs?: number;
   /** Each count's time limit (default 120 000 ms; `publicTermCounts`' ceiling is 300 000). */
   readonly timeLimitMs?: number;
+  /**
+   * Also store each site's OAI-PMH datestamps from the same pass (S-041,
+   * D-108): `buildAdminServer` turns this on when OAI-PMH is served.
+   */
+  readonly oaiStamps?: boolean;
 }
 
 /** What a public site shows. */
@@ -269,6 +275,11 @@ export class PublicSubjects {
         state.problem = { code: result.issues[0]?.code ?? "refused", at: done };
         if (result.issues[0]?.code !== "stopped") state.refusedAt = marker;
         return;
+      }
+      if (this.options.oaiStamps === true) {
+        // From the same snapshot the counts came from: a record whose
+        // oai_dc changed gets a new datestamp, one no longer shown is marked.
+        await writeOaiStamps(this.options.db, organizationId, siteId, result.value.fingerprints);
       }
       const counts = result.value.counts;
       // The same public result keeps its asOf: a recount after staff work

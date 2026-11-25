@@ -9,7 +9,10 @@
  * listed record again through `readPublicRecord` on the public reader, and
  * show only the ones that come back.
  *
- * A record's datestamp is the later of when its current version was
+ * The lists read the stored datestamps (S-041, D-108: `oai_datestamps`,
+ * written by `writeOaiStamps` from the background pass's fingerprints of
+ * each record's oai_dc). `oaiDatestamp` below is the computed fallback for
+ * GetRecord before a site's first pass. A computed datestamp is the later of when its current version was
  * written (`record_versions.recorded_at`: every edit and every workflow
  * move writes a version) and when its template's stored Dublin Core
  * mapping last changed (D-096), since either changes its `oai_dc` record.
@@ -30,6 +33,8 @@ export interface OaiCandidate {
   readonly id: string;
   /** `YYYY-MM-DDTHH:MM:SS.mmmZ`. */
   readonly stamp: string;
+  /** The record has stopped being shown on the site (S-041): a deleted header. */
+  readonly deleted?: boolean;
 }
 
 export interface OaiListOptions {
@@ -70,9 +75,11 @@ function bad(): never {
 }
 
 /**
- * Up to `limit` published records on the site, oldest datestamp first (ties
- * by ID), after `after` and within `from`/`before`. Throws `TypeError` on
- * malformed arguments (the routes check theirs first).
+ * Up to `limit` of the site's stored datestamps (S-041, D-108), oldest
+ * first (ties by ID), after `after` and within `from`/`before`: records
+ * shown on the site, and records that have stopped being shown (`deleted`).
+ * Empty until the background pass has stamped the site. Throws `TypeError`
+ * on malformed arguments (the routes check theirs first).
  */
 export async function listPublishedForOai(
   db: Queryable,
@@ -86,22 +93,89 @@ export async function listPublishedForOai(
   if (after !== undefined && (!isRecordId(after.id) || !isStamp(after.stamp))) bad();
   if (from !== undefined && !isStamp(from)) bad();
   if (before !== undefined && !isStamp(before)) bad();
-  const rows = await db.rows<{ id: string; stamp: string }>(sql`
-    WITH c AS (${stamped(organizationId, siteId)})
-    SELECT c.id::text AS id,
-           to_char(c.stamp AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS stamp
-    FROM c
-    WHERE TRUE
-      ${from === undefined ? sql`` : sql`AND c.stamp >= ${from}::timestamptz`}
-      ${before === undefined ? sql`` : sql`AND c.stamp < ${before}::timestamptz`}
+  const rows = await db.rows<{ id: string; stamp: string; deleted: boolean }>(sql`
+    SELECT d.record_id::text AS id, d.deleted,
+           to_char(d.stamp AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS stamp
+    FROM public.oai_datestamps d
+    WHERE d.organization_id = ${organizationId}::uuid AND d.site_id = ${siteId}::uuid
+      ${from === undefined ? sql`` : sql`AND d.stamp >= ${from}::timestamptz`}
+      ${before === undefined ? sql`` : sql`AND d.stamp < ${before}::timestamptz`}
       ${
         after === undefined
           ? sql``
-          : sql`AND (c.stamp, c.id) > (${after.stamp}::timestamptz, ${after.id}::uuid)`
+          : sql`AND (d.stamp, d.record_id) > (${after.stamp}::timestamptz, ${after.id}::uuid)`
       }
-    ORDER BY c.stamp, c.id
+    ORDER BY d.stamp, d.record_id
     LIMIT ${limit}`);
-  return rows.map((row) => Object.freeze({ id: row.id, stamp: row.stamp }));
+  return rows.map((row) =>
+    Object.freeze({ id: row.id, stamp: row.stamp, ...(row.deleted ? { deleted: true } : {}) }),
+  );
+}
+
+/**
+ * Stores what the background pass saw of a site (S-041, D-108): every
+ * record shown, with a fingerprint of its oai_dc record. A new record, or one
+ * whose fingerprint changed or that comes back, gets the time now; a stored
+ * record not in `shown` is marked deleted, with the time now. One statement,
+ * so the time is the write's own. Returns how many rows moved.
+ */
+export async function writeOaiStamps(
+  db: Queryable,
+  organizationId: string,
+  siteId: string,
+  shown: ReadonlyMap<string, string>,
+): Promise<number> {
+  if (!isOrganizationId(organizationId) || !isSiteId(siteId)) bad();
+  const ids: string[] = [];
+  const prints: string[] = [];
+  for (const [id, print] of shown) {
+    if (!isRecordId(id) || !/^[0-9a-f]{64}$/.test(print)) bad();
+    ids.push(id);
+    prints.push(print);
+  }
+  const [row] = await db.rows<{ moved: string }>(sql`
+    WITH now_ms(at) AS (SELECT date_trunc('milliseconds', clock_timestamp())),
+    incoming(record_id, fingerprint) AS (
+      SELECT * FROM unnest(${ids}::uuid[], ${prints}::text[])
+    ),
+    up AS (
+      INSERT INTO public.oai_datestamps AS d
+        (organization_id, site_id, record_id, stamp, fingerprint)
+      SELECT ${organizationId}::uuid, ${siteId}::uuid, i.record_id, n.at, i.fingerprint
+      FROM incoming i CROSS JOIN now_ms n
+      ON CONFLICT (organization_id, site_id, record_id) DO UPDATE
+        SET stamp = EXCLUDED.stamp, fingerprint = EXCLUDED.fingerprint, deleted = false
+        WHERE d.fingerprint <> EXCLUDED.fingerprint OR d.deleted
+      RETURNING 1
+    ),
+    gone AS (
+      UPDATE public.oai_datestamps d SET deleted = true, stamp = (SELECT at FROM now_ms)
+      WHERE d.organization_id = ${organizationId}::uuid AND d.site_id = ${siteId}::uuid
+        AND NOT d.deleted
+        AND NOT EXISTS (SELECT 1 FROM incoming i WHERE i.record_id = d.record_id)
+      RETURNING 1
+    )
+    SELECT ((SELECT count(*) FROM up) + (SELECT count(*) FROM gone))::text AS moved`);
+  return Number(row?.moved ?? 0);
+}
+
+/** A record's stored datestamp on the site, and whether it has stopped being shown. */
+export async function oaiStoredStamp(
+  db: Queryable,
+  organizationId: string,
+  siteId: string,
+  recordId: string,
+): Promise<{ stamp: string; deleted: boolean } | undefined> {
+  if (!isOrganizationId(organizationId) || !isSiteId(siteId) || !isRecordId(recordId)) {
+    return undefined;
+  }
+  const [row] = await db.rows<{ stamp: string; deleted: boolean }>(sql`
+    SELECT d.deleted,
+           to_char(d.stamp AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS stamp
+    FROM public.oai_datestamps d
+    WHERE d.organization_id = ${organizationId}::uuid AND d.site_id = ${siteId}::uuid
+      AND d.record_id = ${recordId}::uuid`);
+  return row === undefined ? undefined : { stamp: row.stamp, deleted: row.deleted };
 }
 
 /** One published record's datestamp on the site, or `undefined` if it isn't published there. */
