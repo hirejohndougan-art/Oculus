@@ -62,9 +62,11 @@ import {
   readRecordPlace,
   readRoleAssignment,
   readSite,
+  readOrganizationTimeZone,
   readSystemSettings as readStoredSettings,
   renameSite as renameStoredSite,
   sitesForPerson,
+  writeOrganizationTimeZone,
   writeSystemSettings,
   type Queryable,
   type RoleAssignment,
@@ -144,6 +146,18 @@ export interface AdminOperations {
     settings: unknown,
     options: unknown,
   ): Promise<ServiceResult<StoredSystemSettings>>;
+  /**
+   * The session's organization's time zone and its local day (T-034e,
+   * D-103): anyone with access to the organization may read it.
+   */
+  readOrganizationTimeZone(
+    context: ServiceContext,
+  ): Promise<ServiceResult<{ timeZone: string; today: string }>>;
+  /** Sets the session's organization's time zone (system managers, D-072). */
+  changeOrganizationTimeZone(
+    context: ServiceContext,
+    timeZone: unknown,
+  ): Promise<ServiceResult<{ timeZone: string; today: string }>>;
 }
 
 function refusal<T>(path: (string | number)[], code: string, message: string): ServiceResult<T> {
@@ -527,6 +541,24 @@ export function adminOperations(run: Runner): AdminOperations {
           );
         }
         return writeSystemSettings(tx, settings, expected, allowed.value);
+      });
+    },
+
+    async readOrganizationTimeZone(context) {
+      return run("readOrganizationTimeZone", context, async (tx, who) => {
+        const access = await readAccess(tx, who.organizationId, who.actor);
+        if (!access.ok) return access;
+        const found = await readOrganizationTimeZone(tx, who.organizationId);
+        if (found === undefined) return notPermitted();
+        return { ok: true, value: found };
+      });
+    },
+
+    async changeOrganizationTimeZone(context, timeZone) {
+      return run("changeOrganizationTimeZone", context, async (tx, who) => {
+        const allowed = await systemManager(tx, who);
+        if (!allowed.ok) return allowed;
+        return writeOrganizationTimeZone(tx, who.organizationId, timeZone);
       });
     },
   };
