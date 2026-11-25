@@ -69,9 +69,20 @@ import {
   urlHasPassword,
   windowProfileFolder,
   windowsSettingsWarning,
+  writeDesktopSettings,
   type Env,
 } from "./desktop.js";
 import { ORIGINS_ENV } from "./origin.js";
+import {
+  assignPublicPorts,
+  desktopSites,
+  listenPublicPorts,
+  openPublicSiteRoute,
+  publicOriginFor,
+  type PublicListeners,
+} from "./desktop-public.js";
+import { PUBLIC_DATABASE_URL_ENV, PUBLIC_SITES_ENV } from "./public-sites.js";
+import type { OculusReply, OculusRequest, OculusRoute } from "./routes.js";
 
 type Line = (line: string) => void;
 
@@ -300,6 +311,8 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
   let ownerFromSettings: boolean;
   let backupFirst: boolean;
   let wantedPort: number;
+  let publicUrl: string | undefined;
+  let savedPublicPorts: Record<string, number> | undefined;
   try {
     folder = settingsFolder(platform, env, options.home ?? homedir());
     const warning = windowsSettingsWarning(platform, env);
@@ -317,7 +330,21 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
           ? undefined
           : settings.ownerDatabaseUrl;
     ownerFromSettings = ownerUrl !== undefined && ownerUrl === settings.ownerDatabaseUrl;
-    secrets.push(...passwordOf(url), ...(ownerUrl === undefined ? [] : passwordOf(ownerUrl)));
+    // The public reader (T-071, D-109): OCULUS_PUBLIC_DATABASE_URL, else
+    // desktop.json's, which goes with desktop.json's own database only.
+    const fromEnvPublic = env[PUBLIC_DATABASE_URL_ENV];
+    publicUrl =
+      fromEnvPublic !== undefined && fromEnvPublic.trim() !== ""
+        ? fromEnvPublic
+        : fromEnvUrl !== undefined && fromEnvUrl.trim() !== ""
+          ? undefined
+          : settings.publicDatabaseUrl;
+    savedPublicPorts = settings.publicPorts;
+    secrets.push(
+      ...passwordOf(url),
+      ...(ownerUrl === undefined ? [] : passwordOf(ownerUrl)),
+      ...(publicUrl === undefined ? [] : passwordOf(publicUrl)),
+    );
     wantedPort = settings.port ?? DEFAULT_DESKTOP_PORT;
     backupFirst = settings.backupBeforeUpdate !== false;
     const fromEnv = env.OCULUS_PORT;
@@ -384,6 +411,9 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
 
   let db: Database | undefined;
   let ownerDb: Database | undefined;
+  let publicDb: Database | undefined;
+  let countsDb: Database | undefined;
+  let publicListeners: PublicListeners | undefined;
   let app: FastifyInstance | undefined;
   let window: WindowProcess | undefined;
   try {
@@ -510,41 +540,118 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
     // of their own in the settings folder, readable by the person only.
     const filesDir = env.OCULUS_FILES_DIR ?? join(folder, "files");
     if (env.OCULUS_FILES_DIR === undefined) mkdirSync(filesDir, { recursive: true, mode: 0o700 });
-    const serverEnv: Record<string, string | undefined> = {
-      ...env,
-      OCULUS_FILES_DIR: filesDir,
-      NODE_ENV: "development",
-      [ORIGINS_ENV]: origin,
-      [ADMIN_ORIGIN_ENV]: origin,
-      [SECRET_KEY_VARIABLE]: key,
-      OCULUS_TRUSTED_PROXY: undefined,
-      OCULUS_CLIENT_ADDRESS: undefined,
-    };
     const ownHost = `127.0.0.1:${String(port)}`;
-    app = await buildAdminServer({
-      db,
-      env: serverEnv,
-      extraRoutes: [
-        {
-          method: "GET",
-          path: INSTANCE_PATH,
-          handler: (request, reply) => {
-            const challenge = request.query.challenge;
-            if (
-              request.host !== ownHost ||
-              typeof challenge !== "string" ||
-              !/^[0-9a-f]{32}$/.test(challenge)
-            ) {
-              reply.status(404);
-              return { error: "not_found" };
-            }
-            return { proof: instanceProof(token, challenge) };
-          },
-        },
-      ],
-      ...(options.adminDir === undefined ? {} : { adminDir: options.adminDir }),
-    });
+    const writer = db;
+
+    // Each site's public side (T-071, D-109): its own port on 127.0.0.1,
+    // reached as http://localhost:<port>, reading through the public reader only.
+    let publicSites: { siteId: string; name: string; port: number; origin: string }[] = [];
+    if (publicUrl === undefined) {
+      out(
+        "The public sites aren't set up on this computer yet. To see them, close Oculus and run `npm run desktop:database` once more (on Windows, `node packages\\api\\dist\\desktop-database-cli.js`).",
+      );
+    } else {
+      try {
+        publicDb = openDatabase(publicUrl, { applicationName: "oculus-desktop-public", max: 4 });
+        const sites = await desktopSites(writer);
+        const ports = await assignPublicPorts(
+          sites.map((s) => s.id),
+          savedPublicPorts,
+          port,
+        );
+        publicSites = sites.map((s) => {
+          const sitePort = ports[s.id] ?? 0;
+          return { siteId: s.id, name: s.name, port: sitePort, origin: publicOriginFor(sitePort) };
+        });
+        const merged = { ...savedPublicPorts, ...ports };
+        if (JSON.stringify(merged) !== JSON.stringify(savedPublicPorts ?? {})) {
+          writeDesktopSettings(folder, { publicPorts: merged });
+        }
+      } catch {
+        err("Couldn't prepare the public sites; Oculus starts without them.");
+        publicSites = [];
+      }
+    }
+
+    const instanceRoute: OculusRoute = {
+      method: "GET",
+      path: INSTANCE_PATH,
+      handler: (request: OculusRequest, reply: OculusReply) => {
+        const challenge = request.query.challenge;
+        if (
+          request.host !== ownHost ||
+          typeof challenge !== "string" ||
+          !/^[0-9a-f]{32}$/.test(challenge)
+        ) {
+          reply.status(404);
+          return { error: "not_found" };
+        }
+        return { proof: instanceProof(token, challenge) };
+      },
+    };
+    const build = (sites: readonly { siteId: string; origin: string }[]) => {
+      const serverEnv: Record<string, string | undefined> = {
+        ...env,
+        OCULUS_FILES_DIR: filesDir,
+        NODE_ENV: "development",
+        [ORIGINS_ENV]: [origin, ...sites.map((s) => s.origin)].join(","),
+        [ADMIN_ORIGIN_ENV]: origin,
+        [SECRET_KEY_VARIABLE]: key,
+        [PUBLIC_SITES_ENV]:
+          sites.length === 0 ? undefined : sites.map((s) => `${s.origin}=${s.siteId}`).join(","),
+        [PUBLIC_DATABASE_URL_ENV]: sites.length === 0 ? undefined : publicUrl,
+        OCULUS_TRUSTED_PROXY: undefined,
+        OCULUS_CLIENT_ADDRESS: undefined,
+      };
+      const withPublic = sites.length > 0 && publicDb !== undefined;
+      if (withPublic) {
+        countsDb ??= openDatabase(url, { applicationName: "oculus-desktop-counts", max: 1 });
+      }
+      return buildAdminServer({
+        db: writer,
+        env: serverEnv,
+        extraRoutes: withPublic
+          ? [
+              instanceRoute,
+              openPublicSiteRoute({
+                db: writer,
+                ownHost,
+                origins: new Map(sites.map((s) => [s.siteId, s.origin])),
+                open: openDefault,
+              }),
+            ]
+          : [instanceRoute],
+        ...(withPublic && publicDb !== undefined && countsDb !== undefined
+          ? { publicDb, countsDb, desktopOpensPublicSites: true }
+          : {}),
+        ...(options.adminDir === undefined ? {} : { adminDir: options.adminDir }),
+      });
+    };
+    try {
+      app = await build(publicSites);
+    } catch (error) {
+      if (publicSites.length === 0) throw error;
+      // The public side's own checks (the reader, D-080): the admin starts without it.
+      err(
+        `The public sites are off this time: ${error instanceof Error ? error.message : "unknown error"}`,
+      );
+      publicSites = [];
+      app = await build(publicSites);
+    }
     await app.listen({ host: "127.0.0.1", port });
+    if (publicSites.length > 0) {
+      try {
+        publicListeners = await listenPublicPorts(
+          app.server,
+          publicSites.map((s) => s.port),
+        );
+        for (const site of publicSites) {
+          out(`Public site "${site.name}": ${site.origin}/`);
+        }
+      } catch {
+        err("Couldn't open the public sites' ports; the admin works, the public sites don't.");
+      }
+    }
     const address = `${origin}/`;
     if (!setUrl(address)) {
       err("Another start of Oculus took over while this one was starting. Use its window.");
@@ -607,14 +714,25 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
     } catch {
       // Already gone.
     }
+    // The public ports stop taking connections first; closing the admin's
+    // server ends the idle ones, and any left are ended after it.
+    const publicClosed = publicListeners?.close();
     try {
       await app?.close();
     } catch {
       // Closing is best effort; the process ends next.
     }
+    publicListeners?.destroy();
+    try {
+      await publicClosed;
+    } catch {
+      // As above.
+    }
     try {
       await db?.close();
       await ownerDb?.close();
+      await publicDb?.close();
+      await countsDb?.close();
     } catch {
       // As above.
     }

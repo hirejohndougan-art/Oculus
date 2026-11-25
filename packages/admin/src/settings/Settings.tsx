@@ -172,7 +172,7 @@ export function organizationsOf(me: Me): readonly { id: string; name: string }[]
   return [...out].map(([id, name]) => ({ id, name }));
 }
 
-function SiteRow(props: { readonly site: SiteChoice }) {
+function SiteRow(props: { readonly site: SiteChoice; readonly desktopOpen: boolean }) {
   const { site } = props;
   const queries = useQueryClient();
   const [editing, setEditing] = useState(false);
@@ -242,6 +242,7 @@ function SiteRow(props: { readonly site: SiteChoice }) {
           siteName={site.siteName}
           publicOrigin={site.publicOrigin}
           place="settings"
+          desktopOpen={props.desktopOpen}
         />
       </td>
       <td>
@@ -316,7 +317,11 @@ export function SitesSettings() {
               </thead>
               <tbody>
                 {me.sites.map((site) => (
-                  <SiteRow key={site.siteId} site={site} />
+                  <SiteRow
+                    key={site.siteId}
+                    site={site}
+                    desktopOpen={me.opensPublicSites === "desktop"}
+                  />
                 ))}
               </tbody>
             </table>

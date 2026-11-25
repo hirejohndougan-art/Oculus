@@ -37,6 +37,8 @@ import type { Env } from "./desktop.js";
 export const DESKTOP_DATABASE = "oculus";
 export const DESKTOP_OWNER_ROLE = "oculus_owner";
 export const DESKTOP_WRITER_ROLE = "oculus_app";
+/** The public sites' reader (D-080; T-071, D-109): can read no table. */
+export const DESKTOP_PUBLIC_ROLE = "oculus_public";
 const SCRAM_ITERATIONS = 4096;
 
 /**

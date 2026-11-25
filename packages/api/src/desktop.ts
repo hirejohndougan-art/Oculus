@@ -118,9 +118,19 @@ export interface DesktopSettings {
   databaseUrl?: string;
   /** The owner's address: migrations and the start-up checks use it (T-057). */
   ownerDatabaseUrl?: string;
+  /**
+   * The public reader's address (D-080): the public sites read through it
+   * only (T-071, D-109). Made by `npm run desktop:database`.
+   */
+  publicDatabaseUrl?: string;
   /** Back up before applying new migrations (default true; S-034b). */
   backupBeforeUpdate?: boolean;
   port?: number;
+  /**
+   * Each site's public port on this computer, by site ID (T-071), kept so
+   * its public address stays the same between starts.
+   */
+  publicPorts?: Record<string, number>;
 }
 
 /** True when a postgresql:// URL carries a password (in the userinfo or `?password=`). */
@@ -153,7 +163,7 @@ export function readDesktopSettings(folder: string): DesktopSettings {
   }
   const settings: DesktopSettings = {};
   for (const [key, entry] of Object.entries(value)) {
-    if (key === "databaseUrl" || key === "ownerDatabaseUrl") {
+    if (key === "databaseUrl" || key === "ownerDatabaseUrl" || key === "publicDatabaseUrl") {
       if (typeof entry !== "string" || !/^postgres(ql)?:\/\//.test(entry)) {
         throw new DesktopError(
           "settings_invalid",
@@ -183,6 +193,8 @@ export function readDesktopSettings(folder: string): DesktopSettings {
         );
       }
       settings.port = entry;
+    } else if (key === "publicPorts") {
+      settings.publicPorts = publicPortsSetting(entry, file);
     } else {
       throw new DesktopError(
         "settings_invalid",
@@ -191,6 +203,32 @@ export function readDesktopSettings(folder: string): DesktopSettings {
     }
   }
   return settings;
+}
+
+const SITE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+/** `publicPorts`: site IDs to ports from 1024 to 65535, no port twice. */
+function publicPortsSetting(entry: unknown, file: string): Record<string, number> {
+  const refuse = (): never => {
+    throw new DesktopError(
+      "settings_invalid",
+      `"publicPorts" in ${file} must map site IDs to different whole numbers from 1024 to 65535.`,
+    );
+  };
+  if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return refuse();
+  const out: Record<string, number> = {};
+  const seen = new Set<number>();
+  for (const [siteId, port] of Object.entries(entry)) {
+    if (!SITE_ID.test(siteId)) refuse();
+    if (typeof port !== "number" || !Number.isInteger(port) || port < 1024 || port > 65_535) {
+      refuse();
+    }
+    const value = port as number;
+    if (seen.has(value)) refuse();
+    seen.add(value);
+    out[siteId] = value;
+  }
+  return out;
 }
 
 /**
