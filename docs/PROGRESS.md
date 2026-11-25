@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 11:30 CT — Chat K — S-048, S-050, S-049, U-007, S-031, S-035 (one gate)
+- Result: done (S-048 and S-035 were already done by S-036a and M-003; their lines say how)
+- What changed: S-050 hardening (404 for an unknown share target, device names refused in update packages, a private updates folder, a Windows warning for a settings folder outside %APPDATA%, `failureClass` logging in `markKnownSource`, a comment fixed); S-049 public sites need an admin origin in every mode; U-007 the gate removes `packages/*/dist` first; S-031 setup checks applied migrations' names and hashes, refuses what the migrations never make, keeps the terminal quiet while migrating and names `template1` when extensions are the only contents; S-035's public side moved into T-058. Follow-up S-055 filed.
+- Decisions: D-090 amended (S-049)
+- Review: an independent review each for S-050, S-049 and S-031 (all safe; S-050's two small points and S-031's extension-detection gaps fixed; the rest is S-055)
+- Gate: see the next line
+- Next: Chat K's queue (T-018b with T-018a and S-013, then S-043b)
+
 ## 2026-11-25 10:30 CT — manual (Chat C) — S-046, S-047, S-051 OAI-PMH follow-ups
 
 - **Done:** S-046: no datestamp is computed from record versions any more (`oaiDatestamp` removed); a record with no stored row answers GetRecord at the site's lower bound. S-047: since S-041 only records a site has shown have rows, so a run of skipped ones says nothing about never-public records; a record no longer shown is skipped (GetRecord `idDoesNotExist`) until the next pass marks it deleted, so one restored in between is never reported deleted (review fix). S-051: list reads take a per-call `timeLimitMs` bounded by the page, no `lock_timeout`; OAI-PMH has its own 2-connection pool (`oaiPoolOptions`) with a bounded wait, and the public and OAI pools give up client-side after 90 s (`queryTimeoutMillis`). D-108 amended.
