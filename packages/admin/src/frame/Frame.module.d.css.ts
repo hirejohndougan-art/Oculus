@@ -17,6 +17,7 @@ declare const styles: {
   readonly menu: string;
   readonly menuInfo: string;
   readonly menuItem: string;
+  readonly navGroup: string;
   readonly navLink: string;
   readonly navList: string;
   readonly option: string;

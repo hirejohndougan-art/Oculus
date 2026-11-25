@@ -12,6 +12,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import {
+  Navigate,
   Outlet,
   RouterProvider,
   createBrowserRouter,
@@ -32,6 +33,8 @@ import { PeopleList } from "./people/PeopleList";
 import { Person } from "./people/Person";
 import { Roles } from "./people/Roles";
 import { Code } from "./screens/Code";
+import { SettingsLayout, SignInSettings, SitesSettings } from "./settings/Settings";
+import { TemplateList, TemplateScreen } from "./settings/TemplateEditor";
 import { ResetComplete } from "./screens/ResetComplete";
 import { ResetRequest } from "./screens/ResetRequest";
 import { SetUp } from "./screens/SetUp";
@@ -127,6 +130,18 @@ export const ROUTES: RouteObject[] = [
           { path: "people/:userId", element: <Person /> },
           { path: "roles", element: <Roles /> },
           { path: "audit", element: <Audit /> },
+          {
+            path: "settings",
+            element: <SettingsLayout />,
+            children: [
+              { index: true, element: <Navigate to="/settings/sites" replace /> },
+              { path: "sites", element: <SitesSettings /> },
+              { path: "templates", element: <TemplateList /> },
+              { path: "templates/:key", element: <TemplateScreen /> },
+              { path: "new-template", element: <TemplateScreen isNew /> },
+              { path: "sign-in", element: <SignInSettings /> },
+            ],
+          },
         ],
       },
     ],

@@ -10,6 +10,14 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Gate: PASS · tests_passing 4261 (was 4208) · npm audit clean
 - Next: M-002 (finishing), M-003
 
+## 2026-11-24 21:05 CT — manual (Chat C) — T-048a Admin: System settings
+- Result: done
+- What changed: System settings for system managers (sidebar "System" group, `/settings`): Sites (list, add, rename), Templates (list and a field editor through the existing template PUT with its confirmations), Sign-in rules. API: `POST /api/sites`, `PUT /api/sites/:id`, `GET`/`PUT /api/system-settings`, each change behind a recent sign-in answered with T-048's re-entry form. HTTP, screen and e2e tests (Alfa on each settings screen).
+- Decisions: D-087
+- Review: one independent round, nothing blocking; fixed confirmations arriving published-records-first (the first answer is now kept) and two wordings; S-032 filed (huge If-Match versions answer 422).
+- Gate: PASS · tests_passing 4239 (was 4208) · npm audit clean
+- Next: M-001
+
 ## 2026-11-24 20:15 CT — Chat B — T-055 First-time setup command
 - Result: done
 - What changed: `npm run setup` migrates an empty database and makes the first system admin (two-step set-up at first sign-in), organization, site and a starter `Item` template in one transaction; refuses, before changing anything, a database that is set up or not Oculus's. `setUpFirstInstall`, `databaseBeforeSetup`, README note.
