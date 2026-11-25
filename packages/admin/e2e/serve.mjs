@@ -294,6 +294,10 @@ try {
       OCULUS_FILES_DIR: filesDir,
     },
     adminDir: join(import.meta.dirname, "..", "dist"),
+    // Every test signs in from 127.0.0.1 within the same minute or so: the
+    // per-address limit on sign-in posts (60 a minute, D-081) is raised for
+    // this run only, so the tenth test isn't refused for the first nine.
+    signIn: { rateLimits: { credentials: 600 } },
     log: () => undefined,
     // Every spec signs in from 127.0.0.1 within the same minute or so; with
     // ten specs the per-address credentials brake (60 a minute, D-081)
