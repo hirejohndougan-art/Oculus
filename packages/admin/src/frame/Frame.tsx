@@ -229,6 +229,20 @@ export function Frame() {
           </MenuTrigger>
         </header>
         <main id="main" className={styles.content} tabIndex={-1}>
+          {person.secondStepAlerts !== undefined && person.secondStepAlerts.recent > 0 ? (
+            <Note tone="amber">
+              Someone typed wrong two-step codes for your account{" "}
+              {person.secondStepAlerts.recent === 1
+                ? "once"
+                : `${String(person.secondStepAlerts.recent)} times`}{" "}
+              in the last 30 days
+              {person.secondStepAlerts.lastAt === null
+                ? ""
+                : ` (last ${new Date(person.secondStepAlerts.lastAt).toLocaleString()})`}
+              . If it wasn&apos;t you, your password may be known to someone else: sign out, choose
+              a new password with &quot;Forgot your password?&quot; and tell your system manager.
+            </Note>
+          ) : null}
           <div aria-live="polite">
             {status === undefined ? null : <Note tone={status.tone}>{status.text}</Note>}
             {status?.retry === undefined ? null : (

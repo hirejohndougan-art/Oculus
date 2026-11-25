@@ -236,6 +236,21 @@ export function Person() {
               someone else.
             </Note>
           ) : null}
+          {secondStep.alerts !== undefined && secondStep.alerts.length > 0 ? (
+            <ul aria-label="Recent wrong-code alerts">
+              {secondStep.alerts.map((a) => (
+                <li key={`${a.at}-${String(a.failures)}`}>
+                  {when(a.at)}: {String(a.failures)} wrong {a.failures === 1 ? "code" : "codes"}
+                  {", "}
+                  {a.notice === "emailed"
+                    ? "emailed to them and the system managers"
+                    : a.notice === "covered"
+                      ? "covered by an earlier email"
+                      : "email not sent yet"}
+                </li>
+              ))}
+            </ul>
+          ) : null}
           <div className={styles.actions}>
             <Button
               variant="secondary"

@@ -9,6 +9,15 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Review: three independent rounds plus a short fourth look. Fixed: a storage error or an object-mode stream could crash the server, downloads were cut at 30 s, sources leaked on abort, wrong lengths and failed handlers, HEAD read whole files, a missing file dropped the connection, failures were logged as hang-ups, shutdown could be held, name details. Left as S-033 (download limits per client).
 - Gate: see the merge commit
 - Next: the next job in the work board's pool (S-026).
+
+## 2026-11-24 21:10 CT — manual (Chat A) — T-040 Sending password reset email
+- Result: done
+- What changed: `packages/api` mail-messages, mail-outbox and mail (SMTP, STARTTLS required, development sender refused in production); reset links, set-up codes and invitations by email, wired into T-048's hooks; the second-step alert notices (migration 0021, one summary per admin per run, longer retries, alerts listed on the Person page and in the frame); the password-changed notice.
+- Decisions: D-085
+- Review: one independent round, no blocking issue; fixed alert loss under credential stuffing and short outages, TLS failure classes, close() deadline, first-send expiry, TLS option order, address-only admin summaries.
+- Gate: PASS · tests_passing 4292 (was 4261, with T-048a merged) · npm audit clean
+- Next: M-002 (finishing), M-003
+
 ## 2026-11-24 21:05 CT — manual (Chat C) — T-048a Admin: System settings
 - Result: done
 - What changed: System settings for system managers (sidebar "System" group, `/settings`): Sites (list, add, rename), Templates (list and a field editor through the existing template PUT with its confirmations), Sign-in rules. API: `POST /api/sites`, `PUT /api/sites/:id`, `GET`/`PUT /api/system-settings`, each change behind a recent sign-in answered with T-048's re-entry form. HTTP, screen and e2e tests (Alfa on each settings screen).
