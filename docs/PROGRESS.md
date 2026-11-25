@@ -2,6 +2,13 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 20:15 CT — Chat B — T-055 First-time setup command
+- Result: done
+- What changed: `npm run setup` migrates an empty database and makes the first system admin (two-step set-up at first sign-in), organization, site and a starter `Item` template in one transaction; refuses, before changing anything, a database that is set up or not Oculus's. `setUpFirstInstall`, `databaseBeforeSetup`, README note.
+- Decisions: none
+- Review: three independent rounds; fixed every finding (it migrated before refusing; the empty-database check now reuses restore's `contentsOf`; terminal input that could become an answer; input checks). Left as S-031.
+- Gate: see the merge commit · tests_passing raised in gate-baseline.json
+- Next: the next job in the work board's pool.
 ## 2026-11-24 18:25 CT — manual (Chat A) — T-046 Admin: item list and record editor
 - Result: done
 - What changed: admin item list and approval queue; a record editor built from the template (inherited values, checks beside fields, If-Match conflicts named, workflow buttons per `can`, history view/compare/restore, delete, new records, leave guard). API: `GET /api/records`, `GET /api/working-site`, `GET /api/record-types`; `can` and `inherited` on record reads. `endSession` clears the CSRF token, query cache and list memory whenever a session ends or begins. e2e walks the whole flow by keyboard with Alfa.
