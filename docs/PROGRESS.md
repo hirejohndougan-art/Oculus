@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 17:30 CT — manual (Chat Z) — T-047a Admin: ID number types
+- Result: done (built, not pushed: John asked that nothing be pushed yet); T-047 split into T-047a and T-047b (record types need a service operation first)
+- What changed: Settings › ID numbers (`IdentifierTypes.tsx`, `identifierTypeForm.ts`), routes in App.tsx, `ifMatchTag` in `api()`; tests and an e2e step. Branch `autopilot/T-047`, local only, from main 69c020e.
+- Decisions: none (uses D-009, D-022, D-031, D-076, D-091 as they are)
+- Review: see the branch's last commit
+- Gate: see the branch's last commit · npm audit clean
+- Next: the next free Phase 3 job (Chat Z)
+
 ## 2026-11-25 16:05 CT — manual (Chat M) — T-075 Accept an invitation
 - Result: done
 - What changed: `sign-in-api.ts` (`POST /api/invitation/accept`: the token from the link, the invitee's address, a name and a password; the account is made and signed in, so the next screen is two-step set-up; `POST /api/invitation/accept-signed-in` for someone who already has an account, user from the session only); `accounts.ts` (`acceptInvitation` and `acceptInvitationForUser` take the organization from the invitation when it is left out); the admin's `/invitation` screen (`AcceptInvitation.tsx`), which reads the token from the fragment once. Tests: `invitation-api.test.ts` (one reply for every unusable link, `account_exists` only for a complete form, Origin, CSRF, session and per-address rules, no token or address in logs) and `AcceptInvitation.test.tsx`.

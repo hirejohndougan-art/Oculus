@@ -6,6 +6,8 @@
  *   organization; rename one (`POST /api/sites`, `PUT /api/sites/:id`).
  * - **Templates:** the session organization's templates and their fields
  *   (TemplateEditor.tsx).
+ * - **ID numbers:** the session organization's identifier types
+ *   (IdentifierTypes.tsx, T-047a).
  * - **Sign-in rules:** how long a session may sit unused and how long it
  *   lasts at most (`/api/system-settings`, with the version it started from).
  * - **Virus scanning:** whether uploads are scanned, and scanning every
@@ -111,6 +113,11 @@ export function SettingsLayout() {
           <li>
             <NavLink className={styles.tab} to="/settings/templates">
               Templates
+            </NavLink>
+          </li>
+          <li>
+            <NavLink className={styles.tab} to="/settings/identifier-types">
+              ID numbers
             </NavLink>
           </li>
           <li>

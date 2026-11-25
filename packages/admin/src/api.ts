@@ -54,6 +54,8 @@ export interface RequestOptions {
   readonly body?: unknown;
   /** The version an edit started from: sent as `If-Match: "v<n>"`. */
   readonly ifMatch?: number;
+  /** The tag an identifier type edit started from: sent as `If-Match: "t-<tag>"` (T-047a). */
+  readonly ifMatchTag?: string;
   /** A first change of something with no version yet: sent as `If-None-Match: *`. */
   readonly ifNoneMatch?: boolean;
   /** The working site (D-079's `X-Oculus-Site`), for the staff API. */
@@ -123,6 +125,10 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
   const csrf = options.csrfToken ?? csrfToken;
   if (method !== "GET" && csrf !== undefined) headers["x-oculus-csrf"] = csrf;
   if (options.ifMatch !== undefined) headers["if-match"] = `"v${String(options.ifMatch)}"`;
+  if (options.ifMatchTag !== undefined) {
+    if (!/^[A-Za-z0-9_-]{32}$/.test(options.ifMatchTag)) throw new Error("not a type tag");
+    headers["if-match"] = `"t-${options.ifMatchTag}"`;
+  }
   if (options.ifNoneMatch === true) headers["if-none-match"] = "*";
   if (options.site !== undefined) headers["x-oculus-site"] = options.site;
   const background = options.background === true;

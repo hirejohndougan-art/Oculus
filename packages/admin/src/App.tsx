@@ -50,6 +50,7 @@ import { SettingsLayout, SignInSettings, SitesSettings } from "./settings/Settin
 import { FileScanSettings } from "./settings/FileScans";
 import { DublinCoreScreen } from "./settings/DublinCoreEditor";
 import { TemplateList, TemplateScreen } from "./settings/TemplateEditor";
+import { IdentifierTypeList, IdentifierTypeScreen } from "./settings/IdentifierTypes";
 import { AcceptInvitation } from "./screens/AcceptInvitation";
 import { ResetComplete } from "./screens/ResetComplete";
 import { ResetRequest } from "./screens/ResetRequest";
@@ -170,6 +171,10 @@ export const ROUTES: RouteObject[] = [
               { path: "templates/:key", element: <TemplateScreen /> },
               { path: "templates/:key/dublin-core", element: <DublinCoreScreen /> },
               { path: "new-template", element: <TemplateScreen isNew /> },
+              // ID number types (T-047a).
+              { path: "identifier-types", element: <IdentifierTypeList /> },
+              { path: "identifier-types/:key", element: <IdentifierTypeScreen /> },
+              { path: "new-identifier-type", element: <IdentifierTypeScreen isNew /> },
               { path: "sign-in", element: <SignInSettings /> },
               // Virus scanning (S-040).
               { path: "files", element: <FileScanSettings /> },

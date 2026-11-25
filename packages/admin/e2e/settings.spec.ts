@@ -1,8 +1,8 @@
 // System settings (T-048a) in a real browser against the built admin and a
 // throwaway database, by keyboard: the system manager signs in, opens System
 // settings from the sidebar, adds a site, opens the templates and one
-// template's fields and its Dublin Core mapping (T-050e), and the sign-in
-// rules. Siteimprove Alfa's rules run on
+// template's fields and its Dublin Core mapping (T-050e), the ID number
+// types and a new one (T-047a), and the sign-in rules. Siteimprove Alfa's rules run on
 // each screen; no CSP refusal or script error may happen on the way.
 import { expect, test, type Page } from "@playwright/test";
 import { accessible, collectErrors, seed, signInRoot } from "./helpers";
@@ -50,6 +50,20 @@ test("a system manager adds a site and reads the templates and the sign-in rules
   await expect(page.getByRole("heading", { name: /^Dublin Core for / })).toBeVisible();
   await expect(page.getByRole("button", { name: "Save mapping" })).toBeVisible();
   await accessible(page, "System settings: a template's Dublin Core mapping");
+
+  // ID number types (T-047a): the list, then a new staff-only type.
+  await press(page, "ID numbers", "link");
+  await expect(page.getByRole("heading", { name: /^ID number types of / })).toBeVisible();
+  await accessible(page, "System settings: ID numbers");
+  await press(page, "+ New ID number type", "link");
+  await page.getByLabel("Key").focus();
+  await page.keyboard.type("invented_box");
+  await page.getByLabel("Name").focus();
+  await page.keyboard.type("Invented box label");
+  await accessible(page, "System settings: a new ID number type");
+  await press(page, "Create ID number type");
+  await expect(page.getByRole("heading", { name: "Invented box label" })).toBeVisible();
+  await expect(page.getByText("Key invented_box")).toBeVisible();
 
   // The sign-in rules.
   await press(page, "Sign-in rules", "link");
