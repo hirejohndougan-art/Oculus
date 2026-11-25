@@ -8,7 +8,7 @@
 // exactly WRITER_PRIVILEGES, the cleanup, and the same answer (and about the
 // same time) for every unusable token. Every person, address and password is
 // invented (example.org is reserved for examples, RFC 2606).
-import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_SESSION_POLICY,
   checkCsrfToken,
@@ -132,6 +132,11 @@ async function ready(): Promise<void> {
   })();
   ({ db, admin, testDb } = await setup);
 }
+
+// Warm the setup before the first test, under the suite's longer hook limit
+// (U-008). A failure stays in `setup`, so with no database each test still
+// fails on its own when it calls ready().
+beforeAll(() => ready().catch(() => undefined));
 
 afterEach(() => {
   vi.restoreAllMocks();

@@ -877,8 +877,11 @@ INSERT INTO d VALUES (1);`,
     const db = await database();
     const dir = migrationsDir({
       "0002_settings.sql":
-        "CREATE SCHEMA elsewhere;\nCREATE TABLE elsewhere.oculus_migrations (name text, sha256 text);\nSET search_path = elsewhere;\nSET statement_timeout = 1;",
-      "0003_table.sql": "SELECT pg_sleep(0.05);\nCREATE TABLE t3 (id int);",
+        "CREATE SCHEMA elsewhere;\nCREATE TABLE elsewhere.oculus_migrations (name text, sha256 text);\nSET search_path = elsewhere;\nSET statement_timeout = '20ms';",
+      // 20 ms, not 1 ms (U-008): the runner's own next statement runs under the
+      // limit too, and a busy machine can pass 1 ms on one round trip. A leaked
+      // limit still kills 0003's 200 ms sleep.
+      "0003_table.sql": "SELECT pg_sleep(0.2);\nCREATE TABLE t3 (id int);",
     });
     const result = await migrate({ connectionString: db.url, dir });
     expect(result.applied).toEqual([

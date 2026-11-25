@@ -4,7 +4,7 @@
 // organizations and sites, role changes taking effect at once, revocations
 // racing writes, the writer role's grants on the new tables, and the
 // database's own guards. Every person, site and record here is invented.
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   ROLE_PERMISSIONS,
   newOrganizationId,
@@ -108,6 +108,11 @@ async function ready(): Promise<void> {
   })();
   folks = await peopleReady;
 }
+
+// Warm the setup before the first test, under the suite's longer hook limit
+// (U-008). A failure stays in `setup`, so with no database each test still
+// fails on its own when it calls ready().
+beforeAll(() => ready().catch(() => undefined));
 
 afterAll(async () => {
   const done = await setup?.catch(() => undefined);

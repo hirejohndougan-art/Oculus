@@ -387,7 +387,7 @@ export async function runReleaseCli(
         try {
           const version = await manager.verifyInto(at(file));
           out(`Verified Oculus ${version}.`);
-          const role = env.OCULUS_UPDATE_WRITER_ROLE;
+          const role = env.OCULUS_UPDATE_WRITER_ROLE?.trim();
           await manager.install(
             version,
             "release-cli",
@@ -400,11 +400,6 @@ export async function runReleaseCli(
               ...(role === undefined || role === "" ? {} : { fallbackWriterRole: role }),
             },
           );
-          if (role === undefined || role === "") {
-            out(
-              "Note: OCULUS_UPDATE_WRITER_ROLE isn't set, so no role was given rights to new tables.",
-            );
-          }
         } finally {
           await db?.close();
         }

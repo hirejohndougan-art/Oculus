@@ -1,7 +1,7 @@
 // The sql tag and the client against a real server: injection attempts through
 // values, identifiers and nested fragments change nothing, and the type
 // parsers return text where pg would otherwise lose precision or shift days.
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { openDatabase, type Database } from "./client.js";
 import { joinSql, sql } from "./sql.js";
 import { freshDatabase, type TestDatabase } from "./test-database.fixtures.js";
@@ -21,6 +21,11 @@ async function ready(): Promise<void> {
   })();
   db = (await setup).db;
 }
+
+// Warm the setup before the first test, under the suite's longer hook limit
+// (U-008). A failure stays in `setup`, so with no database each test still
+// fails on its own when it calls ready().
+beforeAll(() => ready().catch(() => undefined));
 
 afterAll(async () => {
   const done = await setup?.catch(() => undefined);
