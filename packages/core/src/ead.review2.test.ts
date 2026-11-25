@@ -47,6 +47,17 @@ describe("staff-only parts of a staff-only note (review 2, item 1)", () => {
     expect(text).toContain("Y");
   });
 
+  it("keeps a marked heading of a staff-only note", () => {
+    const { findingAid } = read(
+      arch(
+        `<scopecontent audience="internal"><head audience="internal">HEAD</head><p>P</p></scopecontent>`,
+      ),
+    );
+    const note = findingAid.archdesc.notes.find((n) => n.kind === "scopecontent");
+    expect(note?.internal).toBe(true);
+    expect(JSON.stringify(note)).toContain("HEAD");
+  });
+
   it("still leaves marked parts out of a public note, and keeps them out of public text", () => {
     const { findingAid, report } = read(
       arch(
@@ -74,10 +85,12 @@ describe("staff-only parts of a staff-only note (review 2, item 1)", () => {
 
 describe("attribute limits while reading (review 2, item 2)", () => {
   it("refuses one start tag with too many attributes before it is built", () => {
-    const attrs = Array.from({ length: 200_000 }, (_, i) => `a${String(i)}=""`).join(" ");
+    // Before the fix, 2 million attributes were built whole (about 10 s and
+    // over 500 MB) before being counted; now the 65th stops the read.
+    const attrs = Array.from({ length: 2_000_000 }, (_, i) => `a${String(i)}=""`).join(" ");
     const started = Date.now();
     expect(codes(`<r ${attrs}/>`)).toEqual(["too_many_attributes"]);
-    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(Date.now() - started).toBeLessThan(4_000);
   });
 
   it("counts namespace declarations on one element", () => {
@@ -107,6 +120,15 @@ describe("attribute limits while reading (review 2, item 2)", () => {
 });
 
 describe("link addresses (review 2, item 3)", () => {
+  it("judges only the address that is used", () => {
+    const { findingAid } = read(
+      arch(
+        `<dao xmlns:xlink="http://www.w3.org/1999/xlink" xlink:href="https://x.example/ok" href="https://x/&#x200B;"/>`,
+      ),
+    );
+    expect(JSON.stringify(findingAid)).toContain("https://x.example/ok");
+  });
+
   it("refuses an address with a hidden direction-changing character instead of cleaning it", () => {
     const { findingAid, report } = read(
       arch(
@@ -140,6 +162,20 @@ describe("Oculus's own EAD3 history (review 2, item 4)", () => {
     expect(historyNotices(xml)).toBeGreaterThan(0);
   });
 
+  it("is reported when the date's text isn't a date", () => {
+    const xml = own().replace(/(<eventdatetime[^>]*>)[^<]*(<\/eventdatetime>)/, "$1SECRET STUFF$2");
+    expect(historyNotices(xml)).toBeGreaterThan(0);
+  });
+
+  it("is reported when the agent has attributes or an event holds text", () => {
+    const withAttr = own().replace("<agent>", '<agent label="SECRET">');
+    expect(withAttr).toContain("SECRET");
+    expect(historyNotices(withAttr)).toBeGreaterThan(0);
+    const withText = own().replace("<maintenanceevent>", "<maintenanceevent>SECRET");
+    expect(withText).toContain("SECRET");
+    expect(historyNotices(withText)).toBeGreaterThan(0);
+  });
+
   it("is reported when an event type has children", () => {
     const xml = own().replace(
       /<eventtype value="created"\s*\/>/,
@@ -166,6 +202,17 @@ describe("list and chronology parts (review 2, item 5)", () => {
 });
 
 describe("a prefixed audience (review 2, item 6)", () => {
+  it("counts in any namespace, and is reported as the audience, not as unmapped", () => {
+    const { findingAid, report } = read(
+      arch(
+        `<scopecontent xmlns:q="urn:q" q:audience="internal"><head>H</head><p>SEC</p></scopecontent>`,
+      ),
+    );
+    const note = findingAid.archdesc.notes.find((n) => n.kind === "scopecontent");
+    expect(note?.internal).toBe(true);
+    expect(report.unmapped.some((n) => n.path.includes("audience"))).toBe(false);
+  });
+
   it("counts as staff-only", () => {
     const { findingAid } = read(
       wrap(

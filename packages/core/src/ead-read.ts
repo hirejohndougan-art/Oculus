@@ -188,7 +188,9 @@ class Reader {
   ): Map<string, string> {
     const found = new Map<string, string>();
     for (const a of el.attributes) {
-      const key = this.attrKey(a.name, a.ns);
+      // Any attribute named audience is the staff-only mark (as internal()
+      // reads it), whatever its namespace prefix.
+      const key = a.name === "audience" ? "audience" : this.attrKey(a.name, a.ns);
       if (key === "audience") {
         const value = normalizeEadText(a.value).toLowerCase();
         if (value !== "internal" && value !== "external") {
@@ -505,10 +507,15 @@ class Reader {
     if (el.name === "maintenancestatus") {
       return el.attributes.length === 1 && value(el) === "new" && kids(el).length === 0;
     }
-    if (el.name !== "maintenancehistory" || el.attributes.length > 0) return false;
+    // No text of its own anywhere but the date and the agent's name.
+    const onlyElements = (e: XmlElement): boolean =>
+      e.children.every((c) => typeof c !== "string" || c.trim() === "");
+    if (el.name !== "maintenancehistory" || el.attributes.length > 0 || !onlyElements(el))
+      return false;
     const events = kids(el);
     const own = events.every((ev) => {
-      if (ev.name !== "maintenanceevent" || ev.attributes.length > 0) return false;
+      if (ev.name !== "maintenanceevent" || ev.attributes.length > 0 || !onlyElements(ev))
+        return false;
       const parts = kids(ev);
       const by = (name: string): XmlElement | undefined => parts.find((k) => k.name === name);
       const agent = by("agent");
@@ -531,7 +538,8 @@ class Reader {
         marker("eventtype", "created") &&
         marker("agenttype", "machine") &&
         whenOk &&
-        agent?.children.length === 1 &&
+        agent?.attributes.length === 0 &&
+        agent.children.length === 1 &&
         typeof agent.children[0] === "string" &&
         agent.children[0].trim() === "Oculus"
       );
@@ -1217,10 +1225,14 @@ class Reader {
         return;
       }
       // The address as the file gave it: cleaning would quietly change it.
-      const rawBad = d.attributes.some(
-        (a) =>
-          /^(xlink:)?href$/.test(this.attrKey(a.name, a.ns)) && textProblem(a.value) !== undefined,
-      );
+      const usedKey =
+        this.version === "ead3"
+          ? "href"
+          : d.attributes.some((a) => this.attrKey(a.name, a.ns) === "xlink:href")
+            ? "xlink:href"
+            : "href";
+      const raw = d.attributes.find((a) => this.attrKey(a.name, a.ns) === usedKey)?.value;
+      const rawBad = raw !== undefined && textProblem(raw) !== undefined;
       const problem = webUrlProblem(url);
       if (problem !== undefined || textProblem(url) !== undefined || rawBad) {
         this.warn(
