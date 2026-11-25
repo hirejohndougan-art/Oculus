@@ -17,7 +17,13 @@
  */
 export { sql, joinSql, isSql, Sql, MAX_PARAMETERS } from "./sql.js";
 export type { SqlScalar, SqlValue } from "./sql.js";
-export { openDatabase, typeParsers, ConnectionLostError } from "./client.js";
+export {
+  openDatabase,
+  typeParsers,
+  ConnectionLostError,
+  createDatabase,
+  dropDatabase,
+} from "./client.js";
 export type { Database, DatabaseOptions, Queryable, Row } from "./client.js";
 export {
   migrate,
@@ -401,3 +407,5 @@ export {
   sharesOfRecord,
 } from "./shares.js";
 export type { Share, ShareState, SharedItemView } from "./shares.js";
+export { runSetupCli, terminalAsk } from "./setup-cli.js";
+export type { Ask } from "./setup-cli.js";
