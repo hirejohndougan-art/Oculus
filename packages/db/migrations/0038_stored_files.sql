@@ -1,5 +1,5 @@
 -- Stored files (M-002, D-086): one row per file attached to a digital asset.
--- Numbered 0032: main reaches 0030 and 0031 is reserved for S-041; 0033
+-- Numbered 0038: main reaches 0036 and 0037 is reserved for S-041; 0039
 -- follows with the review's additions.
 --
 -- The bytes live on disk under OCULUS_FILES_DIR, named by their SHA-256 and

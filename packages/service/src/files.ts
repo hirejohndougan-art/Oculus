@@ -22,7 +22,7 @@
  * - `listFiles` needs `records.view` where the asset is, like reading it.
  *
  * Attaching a file doesn't change the asset's record or its version: the
- * files are their own rows (0032). `If-Match` only makes sure the person
+ * files are their own rows (0038). `If-Match` only makes sure the person
  * attached to the asset as they last saw it.
  */
 import { randomUUID } from "node:crypto";
