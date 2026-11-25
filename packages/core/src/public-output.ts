@@ -165,6 +165,7 @@ import {
   effectivePublishIssues,
   isTemplateSource,
   linkDeedCheck,
+  publicView,
   recordIndex,
   templateFromSource,
   type EffectiveRecord,
@@ -1040,6 +1041,58 @@ function templateCheck(
   if (refusals.length > 0) throw new OutputError(refusals);
   return Object.freeze(warnings.map((w) => Object.freeze({ ...w })));
 }
+
+/**
+ * The template check `publicOutput` runs on a record's public values (S-026,
+ * D-091), for the publish check: the issues that would make the public
+ * output refuse the record, with the same codes and paths, and empty when
+ * the check passes. `checkers` are the ones the public output is given
+ * (`makeIdentifierChecker` and `makeRecordLinkChecker` from the same
+ * snapshot). A value that no longer fits its identifier type's format (the
+ * format changed after it was saved, D-031) comes back as `format_mismatch`,
+ * so a published record the public sites would show as not available fails
+ * the publish check too, rather than passing it and quietly dropping off.
+ * For staff only, like every publish check issue; messages are fixed text and
+ * never quote a value. Never throws.
+ */
+export function publicTemplateIssues(
+  effective: EffectiveRecord,
+  checkers: unknown,
+): readonly Issue[] {
+  try {
+    const view = publicView(effective);
+    const origin = view === undefined ? undefined : publicViewOrigin(view);
+    if (view === undefined || origin === undefined) {
+      return frozenIssues([
+        issue(
+          [],
+          "not_effective",
+          "This is not an effective record from effectiveRecord, so it can't be checked.",
+        ),
+      ]);
+    }
+    const full = fullValues(view, effective, origin.template, origin.links);
+    templateCheck(effective.record, full, origin.template, checkers);
+    return Object.freeze([]);
+  } catch (error) {
+    if (!(error instanceof OutputError)) {
+      return frozenIssues([issue([], "unreadable", "The effective record could not be read.")]);
+    }
+    return frozenIssues(
+      error.issues.map((i) =>
+        i.code === "format_mismatch" ? issue(i.path, i.code, FORMAT_MISMATCH_MESSAGE) : i,
+      ),
+    );
+  }
+}
+
+function frozenIssues(issues: readonly Issue[]): readonly Issue[] {
+  return Object.freeze(issues.map((i) => Object.freeze({ ...i })));
+}
+
+/** The publish check's message for a public identifier value that no longer fits its format. */
+const FORMAT_MISMATCH_MESSAGE =
+  "A number this field shows no longer fits its identifier type's format (the format changed after it was saved), so the record can't be published, and public sites show it as not available while it is published. Change the number to fit the format, or retire it and give the record one that fits.";
 
 /** The message of every `link_target_missing` staff warning. */
 const LINK_TARGET_MISSING_MESSAGE =
