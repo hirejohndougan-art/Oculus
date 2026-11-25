@@ -384,7 +384,7 @@ Server and deployment:
   - From T-060 (D-092): set `OCULUS_UPDATE_DIR` and `OCULUS_UPDATE_KEYS` (John's main and backup public keys), point the start command at `<updates folder>/current/packages/api/dist/admin-cli.js`, make the first install with `npm run release -- install`, and check on SiteGround whether its Node.js manager restarts a process that exits (`OCULUS_UPDATE_RESTART=exit`) and whether `pg_dump` is there for the backup before an update. Keep the updates folder outside `public_html` (it holds backups). John decided (2026-11-25, D-092): the running server doesn't hold the database owner's password, so leave `OCULUS_UPDATE_MIGRATE_DATABASE_URL` unset; updates that change the database are installed over SSH with `npm run release -- install` (the runbook explains how).
   - Production setup for any host meeting D-035, with SiteGround as the first: confirm with John that his plan allows a long-running Node process, then TLS, secrets from the environment, scheduled backups and an off-site copy (T-052), session and token cleanup as commands a scheduler or cron can run, and a written runbook for updates and restore (§9). Never deploy without John.
 
-- [ ] T-053 **Phase 2 review.** deps: T-020 to T-052
+- [~] T-053 **Phase 2 review.** deps: T-020 to T-052 In progress (Chat A, 2026-11-25): branch autopilot/T-053. Nightly runs: skip this task.
   - Check Phase 2 against PLATFORM_PLAN.md §3 and the "one writer" principle, get an independent security review of the whole of Phase 2, and write the Phase 3 tasks (including M-001).
 
 
