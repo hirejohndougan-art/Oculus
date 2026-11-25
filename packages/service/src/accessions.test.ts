@@ -652,6 +652,67 @@ describe("donor contacts through the service (T-018c)", () => {
       "unknown_contact",
     ]);
   });
+
+  it("are deleted only by someone who works with donors on the agent's own site (S-058)", async () => {
+    await ready();
+    const w = await world();
+    const other = await makeSite(service, w.root, w.org, `Invented contact site ${String(count)}`);
+    const agent = ok(
+      await service.createRecord(
+        { organizationId: w.org, actor: actorOf(w.root), siteId: other },
+        {
+          kind: "agent",
+          agentType: "person",
+          title: "Invented Other-Site Donor",
+          templateKey: "t-agent",
+          fields: {},
+        },
+      ),
+    ).record;
+    const input = { email: "other-site-donor@example.invalid" };
+    ok(await service.saveDonorContact(ctx(w, w.root), agent.id, input, { expectedVersion: 0 }));
+    // Donor relations on the first site only: saving is refused there, and so is deleting.
+    expect(
+      codes(
+        await service.saveDonorContact(ctx(w, w.donorStaff), agent.id, input, {
+          expectedVersion: 1,
+        }),
+      ),
+    ).toEqual(["not_permitted"]);
+    expect(
+      codes(
+        await service.deleteDonorContact(ctx(w, w.donorStaff), agent.id, { expectedVersion: 1 }),
+      ),
+    ).toEqual(["not_permitted"]);
+    // A wrong version doesn't get past the check either.
+    expect(
+      codes(
+        await service.deleteDonorContact(ctx(w, w.donorStaff), agent.id, { expectedVersion: 9 }),
+      ),
+    ).toEqual(["not_permitted"]);
+    // The contact is still there.
+    expect(ok(await service.readDonorContact(ctx(w, w.root), agent.id)).contact.email).toBe(
+      input.email,
+    );
+    // Someone who works with donors on that site may delete it.
+    await grant(service, w.root, w.org, {
+      userId: w.donorStaff,
+      role: "donor_relations",
+      siteId: other,
+    });
+    ok(await service.deleteDonorContact(ctx(w, w.donorStaff), agent.id, { expectedVersion: 1 }));
+    expect(codes(await service.readDonorContact(ctx(w, w.root), agent.id))).toEqual([
+      "unknown_contact",
+    ]);
+    // An ID that isn't one, or names no contact, is answered as a missing contact.
+    expect(
+      codes(
+        await service.deleteDonorContact(ctx(w, w.donorStaff), "not-an-id", {
+          expectedVersion: 1,
+        }),
+      ),
+    ).toEqual(["unknown_contact"]);
+  });
 });
 
 /** A fixed table name for the reader test (from this file's own list only). */
