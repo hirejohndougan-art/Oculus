@@ -55,6 +55,7 @@ import {
   organizationChoices,
   pendingSignInState,
   readOrganization,
+  reauthenticate,
   readPendingSession,
   readSignedInPerson,
   requestPasswordReset,
@@ -513,6 +514,46 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
         const ended = await endOtherSessions(db, token, { onError: onError("endOtherSessions") });
         if (!ended.ok) throw fixedAnswer(ended.code);
         return { ended: ended.ended };
+      },
+    },
+    {
+      // Entering the password and a code again before a sensitive change
+      // (D-069, D-077; T-048's people changes): a new token in the cookie,
+      // its CSRF token in the reply. A wrong password is 403, not 401: the
+      // session is still alive.
+      method: "POST",
+      path: "/api/reauthenticate",
+      credentials: true,
+      handler: async (request, reply) => {
+        const source = sourceOf(request);
+        const { token } = await fullSessionOf(request, true);
+        const body = textBody(request, ["password", "code", "recoveryCode"]);
+        if (
+          body.password === undefined ||
+          (body.code === undefined) === (body.recoveryCode === undefined)
+        ) {
+          throw new Refusal(400, "bad_body");
+        }
+        const done = await reauthenticate(
+          db,
+          keys,
+          token,
+          {
+            password: body.password,
+            source,
+            ...(body.code === undefined ? {} : { code: body.code }),
+            ...(body.recoveryCode === undefined ? {} : { recoveryCode: body.recoveryCode }),
+          },
+          { onError: onError("reauthenticate") },
+        );
+        if (!done.ok) {
+          if (done.code === "invalid_credentials") throw new Refusal(403, "invalid_credentials");
+          if (done.code === "throttled") {
+            return throttled(reply, "retryAfterSeconds" in done ? done.retryAfterSeconds : 1);
+          }
+          throw fixedAnswer(done.code);
+        }
+        return signedIn(reply, done.token, done.session);
       },
     },
     {

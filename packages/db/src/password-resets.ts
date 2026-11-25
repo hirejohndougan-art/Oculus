@@ -68,7 +68,13 @@ import {
   takeAttempt,
 } from "./accounts.js";
 import { isDatabaseFailure, type Database, type Queryable } from "./client.js";
-import { endAllSessionsForUser, failureFor, readActingSession } from "./sessions.js";
+import {
+  endAllSessionsForUser,
+  failureFor,
+  isMemberIn,
+  memberOfOption,
+  readActingSession,
+} from "./sessions.js";
 import { sql } from "./sql.js";
 
 /**
@@ -599,6 +605,8 @@ async function sendToAddress(
 
 /** Options for `sendPasswordReset`. */
 export interface AdminResetOptions {
+  /** Only a member of this organization (T-048), checked in the link's own transaction. */
+  readonly memberOf?: string;
   readonly lifeSeconds?: number;
   readonly deliveryTimeoutMs?: number;
   readonly onError?: (error: unknown) => void;
@@ -630,7 +638,13 @@ export async function sendPasswordReset(
   options: AdminResetOptions = {},
 ): Promise<Validated<{ readonly expiresAt: string }>> {
   if (typeof deliver !== "function") throw new TypeError("sendPasswordReset needs a delivery.");
-  const checked = checkOptions(options, ["lifeSeconds", "deliveryTimeoutMs", "onError"]);
+  const checked = checkOptions(options, [
+    "lifeSeconds",
+    "deliveryTimeoutMs",
+    "onError",
+    "memberOf",
+  ]);
+  const memberOf = memberOfOption(options);
   const call = checked.onError === undefined ? {} : { onError: checked.onError };
   if (!isUserId(userId)) return refused("invalid_request", "That isn't a user ID.");
   if (!isSessionToken(adminToken)) return refused("no_session", NO_SESSION_MESSAGE);
@@ -657,6 +671,9 @@ export async function sendPasswordReset(
           FROM public.users u WHERE u.id = ${userId}::uuid`);
         const user = users[0];
         if (user === undefined) return refused("unknown_user", "There is no such account.");
+        if (memberOf !== undefined && !(await isMemberIn(tx, memberOf, userId))) {
+          return refused("unknown_user", "There is no such account.");
+        }
         if (user.disabled) {
           return refused("account_disabled", "That account is disabled; enable it first.");
         }

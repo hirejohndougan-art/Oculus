@@ -95,6 +95,8 @@ import {
   fullSession,
   hasOnly,
   inTransaction,
+  isMemberIn,
+  memberOfOption,
   own,
   promoteSession,
   readPendingSession,
@@ -1210,6 +1212,14 @@ export interface EnrolmentMessage {
 /** Sends an enrolment message (T-040 makes it email). Rejects if it couldn't be sent. */
 export type EnrolmentDelivery = (message: EnrolmentMessage) => Promise<void>;
 
+/** Thrown inside the reset's transaction to roll it back when `memberOf` no longer holds. */
+class NotAMember extends Error {
+  constructor() {
+    super("not_a_member");
+    this.name = "NotAMember";
+  }
+}
+
 /**
  * Resets `targetUserId`'s two-step sign-in (D-019, D-052): their factor is
  * revoked, their recovery codes stop working, their wrong-code counter is
@@ -1234,12 +1244,13 @@ export async function resetSecondFactor(
   targetUserId: unknown,
   input: { readonly code?: string; readonly recoveryCode?: string; readonly source: string },
   deliver: EnrolmentDelivery,
-  options: SessionCallOptions = {},
+  options: SessionCallOptions & { readonly memberOf?: string } = {},
 ): Promise<
   Validated<{ readonly reset: boolean; readonly ended: number; readonly delivered: boolean }>
 > {
   assertSecretKeyring(keys);
-  const call = safeOptions(options);
+  const call = safeOptions(options, ["memberOf"]);
+  const memberOf = memberOfOption(options);
   if (typeof deliver !== "function") throw new TypeError("deliver is a function.");
   if (!isUserId(targetUserId)) return refused("invalid_request", "That isn't a user ID.");
   if (!hasOnly(input, ["code", "recoveryCode", "source"])) {
@@ -1277,6 +1288,9 @@ export async function resetSecondFactor(
       SELECT email FROM public.users WHERE id = ${targetUserId}::uuid`);
     const email = targets[0]?.email;
     if (email === undefined) return refused("unknown_user", "There is no such user.");
+    if (memberOf !== undefined && !(await isMemberIn(db, memberOf, targetUserId))) {
+      return refused("unknown_user", "There is no such user.");
+    }
     const factor = await liveFactor(db, admin.user_id);
     if (factor?.state !== "active") {
       return refused(ENROLMENT_REQUIRED.code, ENROLMENT_REQUIRED.message);
@@ -1291,6 +1305,11 @@ export async function resetSecondFactor(
       checked,
       { sessionId: admin.id, purpose: "admin_reset", targetUserId },
       async (tx, passId) => {
+        // T-048: the membership again, in the transaction that resets
+        // (after the user rows are locked), so it can't change in between.
+        if (memberOf !== undefined && !(await isMemberIn(tx, memberOf, targetUserId))) {
+          throw new NotAMember();
+        }
         const ended = await endAllSessionsForUser(tx, targetUserId);
         const reset = await tx.execute(sql`
           UPDATE public.second_factors
@@ -1335,6 +1354,7 @@ export async function resetSecondFactor(
     }
     return { ok: true, value: { reset: done.reset, ended: done.ended, delivered } };
   } catch (error) {
+    if (error instanceof NotAMember) return refused("unknown_user", "There is no such user.");
     return refusedFor(error, call);
   }
 }

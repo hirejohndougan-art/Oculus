@@ -1,0 +1,238 @@
+/**
+ * The audit trail (T-048): the organization's change log, newest first,
+ * as far as the person may see it (the server filters, D-084), filtered by
+ * person, record and dates, a page at a time.
+ */
+import { useState, type SubmitEvent } from "react";
+import { useInfiniteQuery } from "@tanstack/react-query";
+import { useOutletContext } from "react-router";
+import { api, problemText } from "../api";
+import { Button, Field, Note } from "../components/ui";
+import type { FrameContext } from "../frame/Frame";
+import frame from "../frame/Frame.module.css";
+import styles from "./People.module.css";
+import { grantText, refused, siteNames, usePeople } from "./shared";
+import { when, type AuditEntry, type AuditPage } from "./types";
+
+interface Filter {
+  readonly person: string;
+  readonly record: string;
+  readonly from: string;
+  readonly to: string;
+}
+
+const EMPTY: Filter = { person: "", record: "", from: "", to: "" };
+
+/** The day after `day` (YYYY-MM-DD): "to" is inclusive on the screen, exclusive on the server. */
+function dayAfter(day: string): string {
+  const time = Date.parse(`${day}T00:00:00Z`);
+  return Number.isNaN(time) ? day : new Date(time + 86_400_000).toISOString().slice(0, 10);
+}
+
+function query(filter: Filter, after: string | null): string {
+  const params = new URLSearchParams();
+  if (filter.person !== "") params.set("person", filter.person);
+  if (filter.record.trim() !== "") params.set("record", filter.record.trim().toLowerCase());
+  if (filter.from !== "") params.set("from", filter.from);
+  if (filter.to !== "") params.set("to", dayAfter(filter.to));
+  if (after !== null) params.set("after", after);
+  params.set("limit", "50");
+  return `/api/audit?${params.toString()}`;
+}
+
+const ACTIONS: Readonly<Record<string, string>> = {
+  save: "Saved",
+  delete: "Deleted",
+  submit_for_review: "Sent for review",
+  return_to_draft: "Returned to draft",
+  publish: "Published",
+  withdraw: "Unpublished",
+};
+
+const EVENTS: Readonly<Record<string, string>> = {
+  invited: "Invited",
+  account_disabled: "Disabled the account of",
+  account_enabled: "Enabled the account of",
+  role_granted: "Gave a role to",
+  role_revoked: "Removed a role from",
+  second_factor_reset: "Reset two-step sign-in of",
+  password_reset_sent: "Sent a password reset link to",
+  sessions_ended: "Signed out everywhere:",
+};
+
+function what(entry: AuditEntry, sites: ReadonlyMap<string, string>): string {
+  if (entry.type === "record") {
+    const title = entry.title ?? "a record";
+    const version = `version ${String(entry.version)}`;
+    return `${ACTIONS[entry.action] ?? entry.action} “${title}” (${version}${entry.deleted ? ", since deleted" : ""})`;
+  }
+  const subject = entry.subjectName ?? entry.invitedEmail ?? "someone";
+  const role =
+    entry.role === null
+      ? ""
+      : `: ${grantText({ role: entry.role, siteId: entry.siteId, scope: entry.scope }, sites)}`;
+  return `${EVENTS[entry.kind] ?? entry.kind} ${subject}${role}`;
+}
+
+export function Audit() {
+  const { me } = useOutletContext<FrameContext>();
+  const sites = siteNames(me);
+  const people = usePeople();
+  const [draft, setDraft] = useState<Filter>(EMPTY);
+  const [filter, setFilter] = useState<Filter>(EMPTY);
+  const trail = useInfiniteQuery({
+    queryKey: ["audit", filter],
+    initialPageParam: null as string | null,
+    queryFn: ({ pageParam }) => api<AuditPage>(query(filter, pageParam)),
+    getNextPageParam: (last) => last.next,
+  });
+
+  function submit(event: SubmitEvent) {
+    event.preventDefault();
+    setFilter(draft);
+  }
+
+  const heading = (
+    <div>
+      <h1 className={frame.pageTitle}>Audit trail</h1>
+      <p className={frame.lead}>
+        Every change to records and people you may see, newest first. Deleted records keep their
+        history here.
+      </p>
+    </div>
+  );
+  if (trail.error !== null && trail.data === undefined) {
+    return (
+      <>
+        {heading}
+        <Note tone="amber">
+          {refused(trail.error)
+            ? "You don't have a role that shows the audit trail."
+            : problemText(trail.error)}
+        </Note>
+      </>
+    );
+  }
+  const entries = trail.data?.pages.flatMap((p) => p.entries) ?? [];
+  return (
+    <>
+      {heading}
+      <form
+        className={`${styles.panel} ${styles.form}`}
+        aria-label="Filter the audit trail"
+        onSubmit={submit}
+      >
+        {people.data === undefined ? null : (
+          <div className={styles.label}>
+            <label htmlFor="audit-person">Person</label>
+            <select
+              id="audit-person"
+              className={styles.select}
+              value={draft.person}
+              onChange={(event) => {
+                setDraft({ ...draft, person: event.target.value });
+              }}
+            >
+              <option value="">Anyone</option>
+              {people.data.people.map((p) => (
+                <option key={p.userId} value={p.userId}>
+                  {p.displayName}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+        <Field
+          label="Record ID"
+          name="record"
+          value={draft.record}
+          onChange={(record) => {
+            setDraft({ ...draft, record });
+          }}
+        />
+        <div className={styles.label}>
+          <label htmlFor="audit-from">From</label>
+          <input
+            id="audit-from"
+            className={styles.select}
+            type="date"
+            value={draft.from}
+            onChange={(event) => {
+              setDraft({ ...draft, from: event.target.value });
+            }}
+          />
+        </div>
+        <div className={styles.label}>
+          <label htmlFor="audit-to">To</label>
+          <input
+            id="audit-to"
+            className={styles.select}
+            type="date"
+            value={draft.to}
+            onChange={(event) => {
+              setDraft({ ...draft, to: event.target.value });
+            }}
+          />
+        </div>
+        <div>
+          <Button type="submit" variant="primary">
+            Show
+          </Button>
+        </div>
+      </form>
+      {trail.error === null ? null : <Note tone="amber">{problemText(trail.error)}</Note>}
+      {trail.data === undefined ? (
+        <p role="status">Loading…</p>
+      ) : entries.length === 0 ? (
+        <p>No changes match.</p>
+      ) : (
+        <table className={styles.table}>
+          <caption className={styles.muted}>Changes, newest first</caption>
+          <thead>
+            <tr>
+              <th scope="col">When</th>
+              <th scope="col">Who</th>
+              <th scope="col">What</th>
+              <th scope="col">Details</th>
+            </tr>
+          </thead>
+          <tbody>
+            {entries.map((e) => (
+              <tr key={e.type === "record" ? `${e.recordId}:${String(e.version)}` : e.eventId}>
+                <td>{when(e.at)}</td>
+                <td>
+                  {e.actorName ??
+                    (e.actor.startsWith("system:")
+                      ? "Oculus"
+                      : "Someone outside this organization")}
+                </td>
+                <td>{what(e, sites)}</td>
+                <td className={styles.muted}>
+                  {e.type === "record"
+                    ? [
+                        e.changedFields.length > 0 ? `Changed: ${e.changedFields.join(", ")}` : "",
+                        e.reason === null ? "" : `Reason: ${e.reason}`,
+                      ]
+                        .filter(Boolean)
+                        .join(". ")
+                    : ""}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      {trail.hasNextPage ? (
+        <div>
+          <Button
+            variant="secondary"
+            isDisabled={trail.isFetchingNextPage}
+            onPress={() => void trail.fetchNextPage()}
+          >
+            Show older changes
+          </Button>
+        </div>
+      ) : null}
+    </>
+  );
+}
