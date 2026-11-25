@@ -6,7 +6,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Result: done
 - What changed: John (2026-11-25): a role on every site includes the site manager's own, so such a member is seen in full and may be given more roles there. `holdsRoleOn` (packages/service/src/admin.ts) and `listMembers` (packages/db/src/people.ts) count every-site grants; members with no role stay name-only.
 - Decisions: D-084 amended
-- Review: one independent round
+- Review: one independent round, nothing blocking; fixed: a role on every site scoped to one unit no longer counts, and a viewer with no managed site sees no one (matching the SQL); unit tests for the rule.
 - Gate: PASS
 - Next: nothing claimed
 
