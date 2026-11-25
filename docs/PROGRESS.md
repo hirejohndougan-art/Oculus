@@ -6,9 +6,17 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Result: done
 - What changed: `packages/core/src/xml-tree.ts` (`parseXml` on saxes 6.0.0, now a core dependency: no DOCTYPE internal subset, no entities beyond XML's five, nothing fetched; size, depth, element and attribute caps), `ead-model.ts` (the one finding-aid model, `validateFindingAid`, level and DACS mappings, `eadDateEdtf`, `eadUnits`), `ead-read.ts` (`readEad`: EAD 2002 namespaced or DTD-era, EAD3 1.x, a report of everything unmapped, flattened, level-changed or left out; a future major version refused), `ead-write.ts` (`writeEad`, either version). Round trips both ways, attack tests, a schema-shape check; outputs validated with xmllint against ead.xsd (2008 and 2021 releases) and ead3.xsd 1.1.1 while built. Sources: the EAD 2002 and EAD3 schemas and tag libraries, D-107, D-008, D-010.
 - Decisions: D-110
-- Review: one independent round. Fixed: staff-only (`audience="internal"`) text read as public on the root, did, dsc, list and chronology entries, header codes and EAD3 date and language sets (now checked once for every child element, with a test marking every element of five files); audience in any case; staff-only header; inline spacing; read models the writer refused; attribute limits; a total attribute cap; EAD 2002 codes; several silent overwrites. Filed S-051 (EAD3 schema in the tests, EAD3 only) and S-052 (reader follow-ups).
+- Review: one independent round. Fixed: staff-only (`audience="internal"`) text read as public on the root, did, dsc, list and chronology entries, header codes and EAD3 date and language sets (now checked once for every child element, with a test marking every element of five files); audience in any case; staff-only header; inline spacing; read models the writer refused; attribute limits; a total attribute cap; EAD 2002 codes; several silent overwrites. Filed S-056 (EAD3 schema in the tests, EAD3 only) and S-057 (reader follow-ups).
 - Gate: PASS · tests_passing 4922 (was 4817) · npm audit clean
 - Next: T-059b (EAD exports)
+
+## 2026-11-25 07:55 CT — build (BUILD MODE) — S-043a Time limits on OAI-PMH's staff reads, and the page deadline on the routes' clock
+- Result: done (S-043 split into S-043a and S-043b)
+- What changed: `oaiStoredStamp`, `oaiDatestamp` and `oaiRepository` (packages/db/src/oai.ts) take `{ timeLimitMs }` and run in a transaction with a local `statement_timeout` (5 s default; the routes pass their `timeLimitMs`), so a locked or slow staff database is `503 busy`, not a held OAI slot; a list page's deadline uses the routes' `clock`. Four tests, all failing before the change. Commits 4bdacf3, a88dddb, b766039. Source: PostgreSQL 16 docs §20.11 (statement_timeout includes lock waits).
+- Decisions: none
+- Review: one independent round: no security, data-loss or leak problems. It found that the comments claimed too much (fixed), and four gaps, filed as S-051: an unbounded wait for a staff pool connection, no client-side query timeout, the list's `lock_timeout` answering `unavailable`, and the deadline not checked before each list call.
+- Gate: PASS · tests_passing 4823 (was 4819) · npm audit clean
+- Next: the next free Phase 2 task (S-043b, S-051, S-031, S-035, U-007 or S-050)
 
 ## 2026-11-25 06:54 CT — security — S-044 Someone with only the password could push the person's known addresses out
 - Result: done (findings, all low; most serious fixed)

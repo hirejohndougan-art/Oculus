@@ -95,8 +95,9 @@ export {
   oaiStoredStamp,
   writeOaiStamps,
   MAX_OAI_CANDIDATES,
+  OAI_READ_TIME_LIMIT_MS,
 } from "./oai.js";
-export type { OaiCandidate, OaiListOptions } from "./oai.js";
+export type { OaiCandidate, OaiListOptions, OaiReadOptions } from "./oai.js";
 export {
   changeWorkflowState,
   publishCheckIssues,
