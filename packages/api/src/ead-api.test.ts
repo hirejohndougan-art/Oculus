@@ -46,6 +46,12 @@ let filesDir: string;
 const ids: Record<string, RecordId> = {};
 const tokens: Record<string, string> = {};
 
+function id(name: string): RecordId {
+  const found = ids[name];
+  if (found === undefined) throw new Error(`no record ${name}`);
+  return found;
+}
+
 async function withRole(q: Queryable, statement: string, role: string): Promise<void> {
   await q.rows(sql`SELECT set_config('oculus_test.role', ${role}, true),
                           set_config('oculus_test.statement', ${statement}, true)`);
@@ -74,7 +80,7 @@ async function unit(
         date: "1920/1935",
         rights: { uri: INC },
       },
-    } as never),
+    }),
   );
   ids[name] = made.record.id;
   if (publish) await publishAs(w, w.a, made.record.id);
@@ -181,7 +187,7 @@ const get = (host: string, url: string, token?: string) =>
 
 describe("GET /records/:id/ead on a public host", () => {
   it("gives the published unit and the published units below it, public values only", async () => {
-    const reply = await get("127.0.0.1", `/records/${ids.fonds}/ead`);
+    const reply = await get("127.0.0.1", `/records/${id("fonds")}/ead`);
     expect(reply.statusCode).toBe(200);
     expect(reply.headers["content-type"]).toBe("application/octet-stream");
     expect(reply.headers["content-disposition"]).toContain("attachment");
@@ -202,7 +208,7 @@ describe("GET /records/:id/ead on a public host", () => {
   });
 
   it("gives EAD3 when asked", async () => {
-    const reply = await get("127.0.0.1", `/records/${ids.series}/ead?version=ead3`);
+    const reply = await get("127.0.0.1", `/records/${id("series")}/ead?version=ead3`);
     expect(reply.statusCode).toBe(200);
     expect(reply.body).toContain('xmlns="http://ead3.archivists.org/schema/"');
     expect(reply.body).toContain("Invented series");
@@ -212,29 +218,29 @@ describe("GET /records/:id/ead on a public host", () => {
   it("answers everything else as the unknown path's 404, byte for byte", async () => {
     const unknown = await get("127.0.0.1", "/no-such-path");
     for (const url of [
-      `/records/${ids.draftfonds}/ead`,
-      `/records/${ids.draftfile}/ead`,
+      `/records/${id("draftfonds")}/ead`,
+      `/records/${id("draftfile")}/ead`,
       `/records/${newRecordId()}/ead`,
       "/records/not-an-id/ead",
-      `/records/${ids.fonds}/ead?version=ead4`,
+      `/records/${id("fonds")}/ead?version=ead4`,
     ]) {
       const reply = await get("127.0.0.1", url);
       expect([url, reply.statusCode, reply.body]).toEqual([url, 404, unknown.body]);
     }
     // A published unit under a draft answers as its own record page does.
-    const page = await get("127.0.0.1", `/records/${ids.hidden}`);
-    const own = await get("127.0.0.1", `/records/${ids.hidden}/ead`);
+    const page = await get("127.0.0.1", `/records/${id("hidden")}`);
+    const own = await get("127.0.0.1", `/records/${id("hidden")}/ead`);
     expect(own.statusCode).toBe(page.statusCode);
-    const admin = await get("localhost", `/records/${ids.fonds}/ead`);
+    const admin = await get("localhost", `/records/${id("fonds")}/ead`);
     expect(admin.statusCode).toBe(404);
   });
 
   it("reads through the public reader only", async () => {
-    const read = await readPublicFindingAid(reader, w.a, w.a1, ids.fonds as never, {
+    const read = await readPublicFindingAid(reader, w.a, w.a1, id("fonds"), {
       baseUrl: `${PUBLIC}/records/`,
     });
     expect(read.ok).toBe(true);
-    const other = await readPublicFindingAid(reader, w.a, w.a2, ids.fonds as never, {
+    const other = await readPublicFindingAid(reader, w.a, w.a2, id("fonds"), {
       baseUrl: `${PUBLIC}/records/`,
     });
     expect(other.ok).toBe(false);
@@ -245,7 +251,7 @@ describe("GET /api/records/:id/ead for staff", () => {
   it("gives the whole tree with staff-only values marked staff-only", async () => {
     const reply = await get(
       "localhost",
-      `/api/records/${ids.fonds}/ead?version=ead3`,
+      `/api/records/${id("fonds")}/ead?version=ead3`,
       tokens.cataloger,
     );
     expect(reply.statusCode).toBe(200);
@@ -264,17 +270,17 @@ describe("GET /api/records/:id/ead for staff", () => {
   });
 
   it("refuses someone who can't view the unit, and a record that isn't an archival unit", async () => {
-    const other = await get("localhost", `/api/records/${ids.fonds}/ead`, tokens.other);
+    const other = await get("localhost", `/api/records/${id("fonds")}/ead`, tokens.other);
     expect(other.statusCode).toBeGreaterThanOrEqual(403);
     expect(other.body).not.toContain("Invented");
-    const stranger = await get("localhost", `/api/records/${ids.fonds}/ead`, tokens.stranger);
+    const stranger = await get("localhost", `/api/records/${id("fonds")}/ead`, tokens.stranger);
     expect(stranger.statusCode).toBeGreaterThanOrEqual(403);
     expect(stranger.body).not.toContain("Invented");
-    const signedOut = await get("localhost", `/api/records/${ids.fonds}/ead`);
+    const signedOut = await get("localhost", `/api/records/${id("fonds")}/ead`);
     expect(signedOut.statusCode).toBe(401);
     const bad = await get(
       "localhost",
-      `/api/records/${ids.fonds}/ead?version=ead4`,
+      `/api/records/${id("fonds")}/ead?version=ead4`,
       tokens.cataloger,
     );
     expect([400, 422]).toContain(bad.statusCode);
