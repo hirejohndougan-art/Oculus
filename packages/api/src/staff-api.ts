@@ -373,7 +373,10 @@ export function ifMatchVersion(request: OculusRequest): number {
  * `If-Match` with its tag; exactly one of them (428 without, 400 both or
  * malformed).
  */
-export function newOrMatch(request: OculusRequest, pattern: RegExp): { readonly tag: string } | "new" {
+export function newOrMatch(
+  request: OculusRequest,
+  pattern: RegExp,
+): { readonly tag: string } | "new" {
   const match = request.headers["if-match"];
   const none = request.headers["if-none-match"];
   if (match === undefined && none === undefined) throw new Refusal(428, "precondition_required");

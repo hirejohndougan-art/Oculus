@@ -38,6 +38,10 @@ import {
   SiteShared,
   SiteSharedItem,
 } from "./frame/SiteHome";
+import { Accessions } from "./intake/Accessions";
+import { EditAccession, NewAccession } from "./intake/AccessionEditor";
+import { Deeds } from "./intake/Deeds";
+import { Donor, Donors } from "./intake/Donors";
 import { Audit } from "./people/Audit";
 import { Invite } from "./people/Invite";
 import { PeopleList } from "./people/PeopleList";
@@ -152,6 +156,13 @@ export const ROUTES: RouteObject[] = [
           // Items shared with the site (T-041e).
           { path: "sites/:siteId/shared", element: <SiteShared /> },
           { path: "sites/:siteId/shared/:shareId", element: <SiteSharedItem /> },
+          // Intake: accessions, deeds of gift and donors (T-073).
+          { path: "intake/accessions", element: <Accessions /> },
+          { path: "intake/accessions/new", element: <NewAccession /> },
+          { path: "intake/accessions/:accessionId", element: <EditAccession /> },
+          { path: "intake/deeds", element: <Deeds /> },
+          { path: "intake/donors", element: <Donors /> },
+          { path: "intake/donors/:agentId", element: <Donor /> },
           // People, roles and the audit trail (T-048).
           { path: "people", element: <PeopleList /> },
           { path: "people/invite", element: <Invite /> },

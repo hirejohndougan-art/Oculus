@@ -1,0 +1,194 @@
+/* Intake (T-073): accessions, deeds of gift and donors. Tables, panels, filter chips and status pills. */
+.header {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 12px;
+}
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  font-size: var(--size-small);
+}
+.table th,
+.table td {
+  text-align: left;
+  vertical-align: top;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--fill-soft);
+}
+.table th {
+  font: 600 var(--size-caption) var(--font-body);
+  color: var(--text-muted);
+  background: var(--surface-soft);
+}
+.muted {
+  color: var(--text-muted);
+}
+.pill {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  background: var(--pill-gray-bg);
+  color: var(--pill-gray-text);
+  font-size: var(--size-caption);
+  white-space: nowrap;
+}
+.pillAmber {
+  background: var(--pill-amber-bg);
+  color: var(--pill-amber-text);
+}
+.pillGreen {
+  background: var(--pill-green-bg);
+  color: var(--pill-green-text);
+}
+.pillBlue {
+  background: var(--pill-blue-bg);
+  color: var(--pill-blue-text);
+}
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.chip {
+  min-height: 36px;
+  padding: 0 14px;
+  border: 1px solid var(--border-chip);
+  border-radius: var(--radius-pill);
+  background: var(--surface);
+  color: var(--text);
+  font: 600 var(--size-small) var(--font-body);
+  cursor: pointer;
+}
+.chip[aria-pressed="true"] {
+  background: var(--frame-charcoal);
+  border-color: var(--frame-charcoal);
+  color: #ffffff;
+}
+.chip:focus-visible,
+.select:focus-visible,
+.input:focus-visible,
+.textarea:focus-visible {
+  outline: 3px solid var(--link);
+  outline-offset: 2px;
+}
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.panelTitle {
+  font: 700 var(--size-card-title) var(--font-heading);
+  margin: 0;
+}
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+  align-items: start;
+}
+.label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font: 600 var(--size-small) var(--font-body);
+  color: var(--text-label);
+}
+.help {
+  font: 400 var(--size-caption) var(--font-body);
+  color: var(--text-muted);
+}
+.select,
+.input {
+  min-height: var(--control-height);
+  padding: 0 10px;
+  border: 1px solid var(--border-input);
+  border-radius: var(--radius-control);
+  font: var(--size-body) var(--font-body);
+  background: var(--surface);
+  color: var(--text);
+  width: 100%;
+  box-sizing: border-box;
+}
+.textarea {
+  min-height: 96px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-input);
+  border-radius: var(--radius-control);
+  font: var(--size-body) var(--font-body);
+  color: var(--text);
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+}
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.listItem {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--fill-soft);
+}
+.navGroup {
+  margin-top: 12px;
+}
+.groupLabel {
+  display: block;
+  padding: 0 20px 6px;
+  font: 600 var(--size-micro) var(--font-body);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--nav-group-label);
+}
+.nav {
+  list-style: none;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0 10px;
+}
+.navLink {
+  display: flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 0 10px;
+  border-radius: var(--radius-control);
+  color: #ffffff;
+  font: 600 var(--size-small) var(--font-body);
+  text-decoration: none;
+}
+.navLink[data-focus-visible] {
+  outline: 3px solid #ffffff;
+  outline-offset: 2px;
+}
+.navLink[aria-current="page"] {
+  background: var(--nav-active);
+}

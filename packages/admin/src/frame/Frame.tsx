@@ -20,6 +20,7 @@ import { forgetLists } from "../records/listMemory";
 import { endSession, isSessionEnded } from "../session";
 import { Button, Note } from "../components/ui";
 import { AdminNav } from "../people/AdminNav";
+import { IntakeNav } from "../intake/IntakeNav";
 import type { Me, SiteChoice } from "../types";
 import styles from "./Frame.module.css";
 import { SiteSelector } from "./SiteSelector";
@@ -192,6 +193,7 @@ export function Frame() {
             ) : null}
           </ul>
         )}
+        <IntakeNav />
         <AdminNav />
         {person.systemAdmin ? (
           <div className={styles.navGroup}>

@@ -7,12 +7,7 @@
 // records back says which (`nowHeld`); nothing of an accession reaches a
 // public reply. Every person, record and number here is invented.
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import {
-  csrfTokenFor,
-  newRecordId,
-  type OrganizationId,
-  type UserId,
-} from "@oculus/core";
+import { csrfTokenFor, newRecordId, type OrganizationId, type UserId } from "@oculus/core";
 import type { FastifyInstance } from "fastify";
 import { insertIdentifierType, insertTemplateVersion } from "@oculus/db";
 import { OCULUS_COOKIES } from "./cookies.js";
@@ -171,7 +166,9 @@ describe("accessions over HTTP", () => {
     expect((read.json.accession as { materials: string }).materials).toBe(SECRET.materials);
     const list = await call("GET", "/api/accessions", "donor");
     expect(list.status).toBe(200);
-    const ids = (list.json.accessions as { accession: { id: string } }[]).map((a) => a.accession.id);
+    const ids = (list.json.accessions as { accession: { id: string } }[]).map(
+      (a) => a.accession.id,
+    );
     expect(ids).toContain(saved.accession.id);
     expect(list.json.next).toBeNull();
   });
@@ -210,9 +207,7 @@ describe("accessions over HTTP", () => {
 
   it("a number used once is refused again (422), and unknown keys are 422", async () => {
     const first = accession();
-    expect((await call("POST", "/api/accessions", "donor", { accession: first })).status).toBe(
-      201,
-    );
+    expect((await call("POST", "/api/accessions", "donor", { accession: first })).status).toBe(201);
     const again = await call("POST", "/api/accessions", "donor", { accession: first });
     expect([again.status, codes(again)]).toEqual([422, ["duplicate_number"]]);
     const extra = await call("POST", "/api/accessions", "donor", { accession: first, x: 1 });
@@ -262,7 +257,9 @@ describe("accessions over HTTP", () => {
     );
     expect([edit.status, edit.res.body]).toEqual([404, JSON.stringify({ error: "not_found" })]);
     const list = await call("GET", "/api/accessions", "bdonor");
-    const ids = (list.json.accessions as { accession: { id: string } }[]).map((a) => a.accession.id);
+    const ids = (list.json.accessions as { accession: { id: string } }[]).map(
+      (a) => a.accession.id,
+    );
     expect(ids).not.toContain(id);
   });
 

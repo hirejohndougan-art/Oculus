@@ -21,6 +21,8 @@ export interface Seed {
   readonly siteName: string;
   readonly recordTitle: string;
   readonly assetTitle: string;
+  /** T-073's invented donor (an agent record on the site). */
+  readonly donorName: string;
   /** T-062's idle sign-out test's own person. */
   readonly idleEmail: string;
   /** The throwaway database (T-062's test ages its session there). */

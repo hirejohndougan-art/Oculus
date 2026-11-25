@@ -15,6 +15,7 @@ import {
   acceptInvitation,
   createFirstSystemAdmin,
   createInvitation,
+  insertIdentifierType,
   insertOrganization,
   insertTemplateVersion,
   migrate,
@@ -282,6 +283,35 @@ try {
       },
     ),
   );
+  // T-073's intake test: an agent template, one invented donor (an agent
+  // record) and the accession number type.
+  must(
+    await insertTemplateVersion(db, {
+      key: "agent",
+      organizationId,
+      label: "Person or organization",
+      appliesTo: ["agent"],
+      fields: [field("biography", "Biography", "long_text")],
+    }),
+  );
+  const donorName = "Invented Marsh family";
+  must(
+    await service.createRecord(
+      { ...actor, siteId: site.id },
+      { kind: "agent", agentType: "family", title: donorName, templateKey: "agent", fields: {} },
+    ),
+  );
+  must(
+    await db.transaction((q) =>
+      insertIdentifierType(q, {
+        organizationId,
+        key: "accession_number",
+        label: "Accession number",
+        uniqueness: "all_time",
+        public: false,
+      }),
+    ),
+  );
   const origin = `http://localhost:${String(port)}`;
   app = await buildAdminServer({
     db,
@@ -315,6 +345,7 @@ try {
       rootEmail: "root@example.org",
       organizationName: "Invented Historical Society",
       helperName: "Ben Invented",
+      donorName,
       idleEmail,
       // T-062's idle test moves its session's times back (as the owner),
       // the server-side half of its fake clock. A throwaway local database.
