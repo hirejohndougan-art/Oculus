@@ -368,6 +368,40 @@ describe("the mapping helpers", () => {
 });
 
 describe("saving a mapping needs a recent sign-in (S-060a)", () => {
+  it("a change while the password check is on its way drops the save it was for", async () => {
+    let answer: (() => void) | undefined;
+    const sent = server({
+      "PUT /api/templates/lantern/dublin-core": [403, { error: "reauthentication_required" }],
+      "POST /api/reauthenticate": [200, { reauthenticated: true }],
+    });
+    // The password check's reply is held until the test lets it go.
+    const plain = globalThis.fetch;
+    vi.stubGlobal("fetch", (input: string, init?: RequestInit) => {
+      if (input !== "/api/reauthenticate") return plain(input, init);
+      return new Promise<Response>((resolve) => {
+        answer = () => {
+          resolve(plain(input, init));
+        };
+      });
+    });
+    const user = userEvent.setup();
+    renderAt("/settings/templates/lantern/dublin-core");
+    expect(await screen.findByText("Version 2")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Remove row 2" }));
+    await user.click(screen.getByRole("button", { name: "Save mapping" }));
+    expect(await screen.findByRole("heading", { name: "Confirm it's you" })).toBeTruthy();
+    await user.type(screen.getByLabelText("Your password"), "an invented password");
+    await user.type(screen.getByLabelText("Code from your app, or a recovery code"), "123456");
+    await user.click(screen.getByRole("button", { name: "Confirm and continue" }));
+    await waitFor(() => {
+      expect(answer).toBeDefined();
+    });
+    await user.click(screen.getByRole("button", { name: "Remove row 1" }));
+    answer?.();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(sent.filter((s) => s.method === "PUT")).toHaveLength(1);
+  });
+
   it("a change to the mapping while the form is open drops the waiting save", async () => {
     const sent = server({
       "PUT /api/templates/lantern/dublin-core": [403, { error: "reauthentication_required" }],

@@ -282,9 +282,15 @@ function TemplateForm(props: {
   // Saving needs a recent sign-in (S-060a): the server asks for the password
   // and a code again, and the save runs again once they're entered.
   const reauth = useReauthenticated("For changes to templates");
+  // Each change to the draft starts a new generation: a save asked for an
+  // earlier one (waiting for the password form, or answered by it after the
+  // change) is dropped, never sent with the new draft (S-060a review).
+  const generation = useRef(0);
   function send(confirmation: Confirmation | undefined) {
+    const asked = generation.current;
     void reauth
       .run(async () => {
+        if (generation.current !== asked) return;
         await save.mutateAsync(confirmation);
       })
       .catch(() => undefined);
@@ -302,6 +308,7 @@ function TemplateForm(props: {
     setEdited(true);
     setAsked(undefined);
     // A save waiting for the password form was for the draft as it was.
+    generation.current += 1;
     reauth.cancel();
     if (save.error !== null) save.reset();
     setDraft((d) => ({ ...d, ...next }));
