@@ -98,6 +98,7 @@ import { Refusal } from "./errors.js";
 import type { OculusReply, OculusRequest, OculusRoute } from "./routes.js";
 import { peopleApiRoutes, type PeopleApiOptions } from "./people-api.js";
 import { updateApiRoutes, type UpdateApiOptions } from "./update-api.js";
+import type { PublicSubjects } from "./public-subjects.js";
 import { DEFAULT_RATE_LIMITS, SessionRateLimiter, type RateBucket } from "./rate-limit.js";
 
 /** A fixed-shape log record: never an error object, a token, a body or a query. */
@@ -143,6 +144,8 @@ export interface StaffApiOptions {
   readonly people?: PeopleApiOptions;
   /** Software updates (T-060, update-api.ts); left out, those routes aren't served. */
   readonly updates?: UpdateApiOptions;
+  /** The cached public Subjects counts (S-038, public-subjects.ts), for their staff view. */
+  readonly publicSubjects?: Pick<PublicSubjects, "statusFor">;
 }
 
 /** The header carrying the CSRF token on every change. */
@@ -976,6 +979,30 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
           siteId: request.params.id ?? "",
         });
         return answer(result, reply, (site) => ({ site }));
+      }),
+    },
+    // The public Subjects counts' staff view (S-038, D-106): when they were
+    // made and how many public records were left out and why. For system
+    // managers and the site's managers; any other site is not found.
+    {
+      method: "GET",
+      path: "/api/sites/:id/public-subjects",
+      handler: signedIn("read", false, async (request, reply, { context }) => {
+        const siteId = request.params.id ?? "";
+        const access = await service.myAccess(context);
+        if (!access.ok) return answer(access, reply, () => ({}));
+        const manages =
+          access.value.systemManager ||
+          access.value.grants.some(
+            (g) =>
+              g.role === "site_manager" &&
+              g.scope === null &&
+              (g.siteId === null || g.siteId === siteId),
+          );
+        if (!manages) throw new Refusal(403, "not_permitted");
+        const status = options.publicSubjects?.statusFor(context.organizationId, siteId);
+        if (status === undefined) throw new Refusal(404, "not_found");
+        return status;
       }),
     },
     {
