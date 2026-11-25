@@ -2,7 +2,6 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
-
 ## 2026-11-24 22:40 CT — Chat B — M-001 Serve active file types safely
 - Result: done
 - What changed: `fileReply` (packages/api/src/file-replies.ts) is the only way a handler sends a file's bytes: plain images, audio and video may be shown as their bare type, everything else (HTML, SVG, XML, scripts, PDF, unknown) downloads as `application/octet-stream`; every file reply has nosniff, a sandboxing CSP, same-origin CORP and nothing the handler set; safe RFC 6266/8187 names; streams opened only when sent, outside the handler timeout, within a 2-hour deadline, closed on errors, wrong lengths, hang-ups and shutdown; HEAD opens nothing. HTTP attack tests and a Chromium test that a page on another origin can't run an HTML, SVG or XHTML file's script.
