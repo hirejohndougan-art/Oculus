@@ -7,7 +7,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - What changed: migrations 0046 (accessions, accession_records, accession_versions, accession_numbers, donor_contacts; `public_record_snapshot` gains `accessionHolds`) and 0047 (storage_levels, storage_locations, storage_moves); core `indexAccessionHolds` and `accessionHoldsOn`; db `accessions.ts` and `storage.ts`; the publish check and the public output now read stored accessions' holds, so an unsigned deed or a restriction in force holds records back; service operations for accessions, donor contacts, storage levels, locations and moves; record deletion refuses `in_accession`, `accession_source`, `has_moves` and `storage_agent`; trigger functions are left out of the public reader's definer check.
 - Decisions: D-114, D-115
 - Review: T-018c three independent rounds (a publish/save race, closed with an organization-wide advisory lock; cross-site holds; all-time numbers; fail-open holds), all fixed; T-018d one round (move times, cross-site agents, read consistency, refusal paths), all fixed.
-- Gate: PASS · tests_passing see the baseline commit · npm audit clean
+- Gate: PASS · tests_passing 5045 · npm audit clean
 - Next: Chat K's queue (T-018b with T-018a and S-013, then T-073)
 
 ## 2026-11-25 11:25 CT — build (BUILD MODE) — S-053 "Last sign-in" is stamped at the right password, before the second step
