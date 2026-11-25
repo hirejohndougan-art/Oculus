@@ -48,13 +48,24 @@ import {
   type RecordTypeSummary,
   type WorkflowMove,
 } from "./model";
-import { recordKey, useRecord, useRecordTypes, useSiteAbilities, useTemplates } from "./queries";
+import {
+  recordKey,
+  useHasDublinCoreMapping,
+  useRecord,
+  useRecordTypes,
+  useSiteAbilities,
+  useTemplates,
+} from "./queries";
 import styles from "./Records.module.css";
 
 interface Status {
   readonly tone: "green" | "amber" | "blue";
   readonly text: string;
 }
+
+/** After publishing a record whose template has no Dublin Core mapping (D-096). */
+const PUBLISHED_UNSHOWN =
+  "Published, but no public site shows it yet: its template has no Dublin Core mapping.";
 
 const MOVE_DONE: Readonly<Record<WorkflowMove, string>> = {
   "submit-for-review": "Sent for review.",
@@ -288,6 +299,9 @@ function Editor(props: EditorProps) {
 
   const can = reply?.can ?? { edit: true, history: false, publish: false, delete: false };
   const state = reply?.state ?? "draft";
+  // A published record whose template has no mapping isn't on any public site (T-050e).
+  const hasMapping = useHasDublinCoreMapping(siteId, reply?.record.templateKey);
+  const unmapped = hasMapping.data === false;
   const dirty = !sameDraft(draft, start, template);
   const readOnly = !can.edit;
   const fieldKeys = useMemo(() => new Set((template?.fields ?? []).map((f) => f.key)), [template]);
@@ -445,7 +459,11 @@ function Editor(props: EditorProps) {
         ifMatch: reply.version,
         site: siteId,
       });
-      setStatus({ tone: "green", text: MOVE_DONE[which] });
+      setStatus(
+        which === "publish" && unmapped
+          ? { tone: "amber", text: PUBLISHED_UNSHOWN }
+          : { tone: "green", text: MOVE_DONE[which] },
+      );
       await queries.invalidateQueries({ queryKey: ["items", siteId] });
       await queries.invalidateQueries({ queryKey: ["review-queue"] });
       await queries.invalidateQueries({ queryKey: recordKey(reply.record.id) });
@@ -533,6 +551,14 @@ function Editor(props: EditorProps) {
       </div>
       {moves.length > 0 && dirty ? (
         <p className={styles.meta}>Save or discard your changes before changing the status.</p>
+      ) : null}
+      {unmapped && (state === "published" || can.publish) ? (
+        <Note tone="amber">
+          {state === "published"
+            ? "This record is published, but no public site shows it yet: its template has no Dublin Core mapping."
+            : "If you publish this record, no public site will show it yet: its template has no Dublin Core mapping."}{" "}
+          A system manager adds one under Settings, Templates.
+        </Note>
       ) : null}
 
       <div aria-live="polite">

@@ -264,6 +264,68 @@ describe("workflow and delete", () => {
     expect(post?.headers["if-match"]).toBe('"v3"');
   });
 
+  it("says when the template has no Dublin Core mapping, so no public site shows the record (T-050e)", async () => {
+    const sent = server([200, recordReply({ can: ALL })], {
+      "GET /api/templates/t-object/dublin-core": [
+        200,
+        { key: "t-object", version: 0, mapping: null },
+      ],
+      [`POST ${API}/publish`]: [200, {}],
+    });
+    renderAt(PATH);
+    await opened();
+    expect(
+      await screen.findByText(/If you publish this record, no public site will show it yet/),
+    ).toBeTruthy();
+    const read = sent.find((s) => s.path === "/api/templates/t-object/dublin-core");
+    expect(read?.headers["x-oculus-site"]).toBe(SITE_1);
+    await userEvent.click(screen.getByRole("button", { name: "Publish" }));
+    expect(
+      await screen.findByText(
+        "Published, but no public site shows it yet: its template has no Dublin Core mapping.",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("says nothing about the mapping when the template has one, or for people who can't publish", async () => {
+    server([200, recordReply({ can: ALL })], {
+      "GET /api/templates/t-object/dublin-core": [
+        200,
+        { key: "t-object", version: 1, mapping: {} },
+      ],
+    });
+    renderAt(PATH);
+    await opened();
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Publish" })).toBeTruthy();
+    });
+    expect(screen.queryByText(/no Dublin Core mapping/)).toBeNull();
+    cleanup();
+    server([200, recordReply({ can: CATALOGER })], {
+      "GET /api/templates/t-object/dublin-core": [
+        200,
+        { key: "t-object", version: 0, mapping: null },
+      ],
+    });
+    renderAt(PATH);
+    await opened();
+    expect(screen.queryByText(/no Dublin Core mapping/)).toBeNull();
+  });
+
+  it("tells the people who can see it that a published record isn't shown without a mapping", async () => {
+    server([200, recordReply({ state: "published", can: CATALOGER })], {
+      "GET /api/templates/t-object/dublin-core": [
+        200,
+        { key: "t-object", version: 0, mapping: null },
+      ],
+    });
+    renderAt(PATH);
+    await opened();
+    expect(
+      await screen.findByText(/This record is published, but no public site shows it yet/),
+    ).toBeTruthy();
+  });
+
   it("waits for unsaved changes before a status change", async () => {
     server([200, recordReply({ can: ALL })]);
     renderAt(PATH);

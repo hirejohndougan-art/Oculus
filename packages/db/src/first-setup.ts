@@ -9,7 +9,11 @@
  * - the first organization;
  * - its first site;
  * - a starter template, `item` (STARTER_TEMPLATE), that the system admin
- *   can change or replace later.
+ *   can change or replace later;
+ * - the starter template's Dublin Core mapping (T-050e, D-096): each public
+ *   field goes out as the DCMI term it names in its `standards`, so records
+ *   published with it can be shown on a public site, which needs a stored
+ *   mapping (D-096 has no fallback).
  *
  * It refuses with `already_set_up` if the database has any user or any
  * organization, so it can't run twice, and two runs at once can't both
@@ -29,7 +33,11 @@ import {
   validateDisplayName,
   validateOrganization,
   validateSite,
+  isDublinCoreTerm,
+  validateDublinCoreMapping,
   validateTemplate,
+  type DublinCoreEntry,
+  type DublinCoreMapping,
   type FieldDefinition,
   type Issue,
   type OrganizationId,
@@ -40,6 +48,7 @@ import {
 import { contentsOf } from "./backup-catalog.js";
 import type { Database } from "./client.js";
 import { insertOrganization, insertTemplateVersion } from "./catalog.js";
+import { writeDublinCoreMapping } from "./dublin-core-mappings.js";
 import { insertSite } from "./permissions.js";
 import { inTransaction } from "./sessions.js";
 import { sql } from "./sql.js";
@@ -108,6 +117,20 @@ export const STARTER_TEMPLATE_FIELDS: readonly FieldDefinition[] = Object.freeze
   field("location", "Shelf location", "text", "staff"),
   field("staff_notes", "Staff notes", "long_text", "staff"),
 ]);
+
+/**
+ * The starter template's Dublin Core entries: each public field as the DCMI
+ * term its `standards` name (`dcterms`). Staff-only fields never appear.
+ */
+export const STARTER_DUBLIN_CORE_ENTRIES: readonly DublinCoreEntry[] = Object.freeze(
+  STARTER_TEMPLATE_FIELDS.flatMap((f) =>
+    f.visibility !== "public"
+      ? []
+      : (f.standards ?? [])
+          .filter((s) => s.standard === "dcterms" && isDublinCoreTerm(s.element))
+          .map((s) => Object.freeze({ field: f.key, term: s.element }) as DublinCoreEntry),
+  ),
+);
 
 function refused<T>(code: string, message: string, path: (string | number)[] = []): Validated<T> {
   return { ok: false, issues: [{ path, code, message }] };
@@ -259,6 +282,21 @@ export async function setUpFirstInstall(
     // The starter template is fixed; a refusal here is a bug, not bad input.
     throw new Error("The starter template does not pass validateTemplate.");
   }
+  let mapping: DublinCoreMapping | undefined;
+  if (template !== undefined) {
+    const checked = validateDublinCoreMapping(
+      {
+        template: STARTER_TEMPLATE_KEY,
+        organizationId: template.value.organizationId,
+        entries: STARTER_DUBLIN_CORE_ENTRIES,
+      },
+      template.value,
+    );
+    // Fixed too: a refusal is a bug.
+    if (!checked.ok)
+      throw new Error("The starter mapping does not pass validateDublinCoreMapping.");
+    mapping = checked.value;
+  }
   if (
     issues.length > 0 ||
     email === undefined ||
@@ -267,7 +305,8 @@ export async function setUpFirstInstall(
     !organization.ok ||
     site === undefined ||
     !site.ok ||
-    template === undefined
+    template === undefined ||
+    mapping === undefined
   ) {
     return { ok: false, issues };
   }
@@ -297,6 +336,7 @@ export async function setUpFirstInstall(
       must(await insertOrganization(tx, organization.value));
       must(await insertSite(tx, site.value));
       must(await insertTemplateVersion(tx, template.value));
+      must(await writeDublinCoreMapping(tx, mapping, 0, userId));
     });
   } catch (error) {
     if (error instanceof AlreadySetUp || sqlState(error) === "23505") {

@@ -308,6 +308,14 @@ function TemplateForm(props: {
           {stored === undefined ? null : (
             <p className={records.meta}>
               Key {stored.key} · version {stored.version}
+              {TEMPLATE_KEY.test(stored.key) ? (
+                <>
+                  {" · "}
+                  <TextLink href={`/settings/templates/${stored.key}/dublin-core`}>
+                    Dublin Core mapping
+                  </TextLink>
+                </>
+              ) : null}
             </p>
           )}
         </div>

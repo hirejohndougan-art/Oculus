@@ -44,6 +44,29 @@ export function useTemplates(siteId: string) {
   });
 }
 
+/**
+ * Whether a template has a stored Dublin Core mapping (T-050e, D-096): a
+ * published record whose template has none isn't shown on any public site.
+ * Keyed by organization, like the templates; the mapping screen refreshes it.
+ */
+export function useHasDublinCoreMapping(siteId: string, templateKey: string | undefined) {
+  const organizationId = useMe().data?.organizationId;
+  return useQuery({
+    queryKey: ["dublin-core-status", organizationId, templateKey],
+    queryFn: async () =>
+      (
+        await api<{ version: number }>(`/api/templates/${templateKey ?? ""}/dublin-core`, {
+          site: siteId,
+        })
+      ).version > 0,
+    staleTime: 60_000,
+    enabled:
+      organizationId !== undefined &&
+      templateKey !== undefined &&
+      /^[a-z][a-z0-9_-]{0,63}$/.test(templateKey),
+  });
+}
+
 export function useRecordTypes(siteId: string) {
   const organizationId = useMe().data?.organizationId;
   return useQuery({
