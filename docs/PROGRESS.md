@@ -7,7 +7,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - What changed: server rule 12, `/api` on the admin's host only; `OCULUS_ADMIN_ORIGIN` required in production; `OCULUS_PUBLIC_SITES` and the public reader pool (`OCULUS_PUBLIC_DATABASE_URL`, `publicDb`) checked at startup. New `packages/api/src/public-sites.ts`.
 - Decisions: D-090
 - Review: one independent round, nothing blocking; fixed the admin's hostname on another port passing as a public site, a site ID held by two organizations, a reader of another database, and shutdown closing only one pool; added an https-behind-proxy test.
-- Gate: PASS · tests_passing 4307 (was 4292) · npm audit clean. A first run timed out once in `second-factor.test.ts` › "locks user rows before factor rows" under load (passes alone 3 of 3; this change doesn't touch the database package), like S-029.
+- Gate: PASS · tests_passing 4359 (was 4344) · npm audit clean. A first run timed out once in `second-factor.test.ts` › "locks user rows before factor rows" under load (passes alone 3 of 3; this change doesn't touch the database package), like S-029.
 - Next: S-026 (T-050b needs stored Dublin Core mappings first)
 
 ## 2026-11-24 22:40 CT — manual (Chat D) — T-056 Desktop launcher
