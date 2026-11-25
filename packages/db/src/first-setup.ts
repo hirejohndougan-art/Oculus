@@ -37,6 +37,7 @@ import {
   type UserId,
   type Validated,
 } from "@oculus/core";
+import { contentsOf } from "./backup-catalog.js";
 import type { Database } from "./client.js";
 import { insertOrganization, insertTemplateVersion } from "./catalog.js";
 import { insertSite } from "./permissions.js";
@@ -124,50 +125,34 @@ function own(input: object, key: string): unknown {
 const KEYS = ["email", "displayName", "password", "organizationName", "siteName"] as const;
 
 /**
+ * Database-wide settings Oculus's migrations never make, which would copy or
+ * open up everything setup then stores (password hashes, sessions,
+ * staff-only fields) or run code during the migrations.
+ */
+const NEVER_OCULUS = ["default_privileges", "publications", "subscriptions", "event_triggers"];
+
+/**
  * What a database is before setup migrates it: `"empty"`, `"set_up"` (Oculus's,
- * with people or organizations) or `"other"` (something that isn't an
- * empty or partly migrated Oculus database). Setup migrates only an
- * `"empty"` one, so it never changes a database it then refuses.
+ * with people or organizations) or `"other"` (anything else). Setup migrates
+ * only an `"empty"` one, so it never changes a database it then refuses.
  *
- * Without Oculus's migration table, a database is empty only if no schema
- * outside PostgreSQL's own holds a table, view, sequence or other relation,
- * and `public` holds no functions or types of its own. With it, a database
- * is not Oculus's if it has relations outside `public`, or if `users` or
+ * Without Oculus's migration table, a database is empty only if it is
+ * exactly as CREATE DATABASE made it (`contentsOf`, the check restore uses:
+ * any schema, relation, function, type, operator, extension, default
+ * privilege, publication, event trigger, large object, setting … counts).
+ * With it, a database is not Oculus's if it has default privileges,
+ * publications, subscriptions or event triggers, or if `users` or
  * `organizations` exist before the migration that makes them was applied.
  */
 export async function databaseBeforeSetup(db: Database): Promise<"empty" | "set_up" | "other"> {
-  const [row] = await db.rows<{
-    elsewhere: number;
-    in_public: number;
-    routines: number;
-    types: number;
-    oculus: boolean;
-    users: boolean;
-    orgs: boolean;
-  }>(sql`
-    SELECT
-      (SELECT count(*)::int FROM pg_catalog.pg_class c
-         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname NOT IN ('public', 'pg_catalog', 'information_schema', 'pg_toast')
-          AND n.nspname NOT LIKE 'pg\_temp\_%' AND n.nspname NOT LIKE 'pg\_toast\_temp\_%'
-          AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')) AS elsewhere,
-      (SELECT count(*)::int FROM pg_catalog.pg_class c
-         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')) AS in_public,
-      (SELECT count(*)::int FROM pg_catalog.pg_proc p
-         JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-        WHERE n.nspname = 'public') AS routines,
-      (SELECT count(*)::int FROM pg_catalog.pg_type t
-         JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
-        WHERE n.nspname = 'public' AND t.typrelid = 0 AND t.typelem = 0) AS types,
-      to_regclass('public.oculus_migrations') IS NOT NULL AS oculus,
-      to_regclass('public.users') IS NOT NULL AS users,
-      to_regclass('public.organizations') IS NOT NULL AS orgs`);
+  const contents = await contentsOf(db);
+  const [row] = await db.rows<{ oculus: boolean; users: boolean; orgs: boolean }>(sql`
+    SELECT to_regclass('public.oculus_migrations') IS NOT NULL AS oculus,
+           to_regclass('public.users') IS NOT NULL AS users,
+           to_regclass('public.organizations') IS NOT NULL AS orgs`);
   if (row === undefined) return "other";
-  if (row.elsewhere > 0) return "other";
-  if (!row.oculus) {
-    return row.in_public === 0 && row.routines === 0 && row.types === 0 ? "empty" : "other";
-  }
+  if (!row.oculus) return Object.keys(contents).length === 0 ? "empty" : "other";
+  if (NEVER_OCULUS.some((kind) => (contents[kind] ?? 0) > 0)) return "other";
   const applied = new Set(
     (await db.rows<{ name: string }>(sql`SELECT name FROM public.oculus_migrations`)).map(
       (r) => r.name,

@@ -357,7 +357,7 @@ describe("npm run setup", () => {
         await db.execute(sql`CREATE TABLE public.not_oculus (id int)`);
         const run = await runCli({ OCULUS_DATABASE_URL: testDb.url }, typed);
         expect(run.code).toBe(1);
-        expect(run.out).toContain("aren't Oculus's");
+        expect(run.out).toContain("isn't an Oculus database");
         expect(run.asked).toEqual([]);
         const [row] = await db.rows<{ there: boolean }>(
           sql`SELECT to_regclass('public.oculus_migrations') IS NOT NULL AS there`,
@@ -413,6 +413,19 @@ describe("npm run setup", () => {
       [sql`CREATE SEQUENCE public.s`],
       [sql`CREATE FUNCTION public.f() RETURNS int LANGUAGE sql AS 'SELECT 1'`],
       [sql`CREATE TYPE public.records AS ENUM ('a')`],
+      [sql`CREATE TYPE public.c AS (a int)`],
+      [sql`CREATE SCHEMA pgxtempx`, sql`CREATE TABLE pgxtempx.secret (a int)`],
+      [
+        sql`CREATE SCHEMA only_functions`,
+        sql`CREATE FUNCTION only_functions.f() RETURNS int LANGUAGE sql AS 'SELECT 1'`,
+      ],
+      [sql`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO PUBLIC`],
+      [sql`CREATE PUBLICATION everything FOR ALL TABLES`],
+      // An Oculus database with a publication added: still refused.
+      [
+        sql`CREATE TABLE public.oculus_migrations (name text PRIMARY KEY)`,
+        sql`CREATE PUBLICATION everything FOR ALL TABLES`,
+      ],
       // Oculus's bookkeeping, with someone else's users table that predates 0009.
       [
         sql`CREATE TABLE public.oculus_migrations (name text PRIMARY KEY)`,

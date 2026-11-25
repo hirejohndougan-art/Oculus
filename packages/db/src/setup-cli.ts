@@ -93,7 +93,7 @@ export async function runSetupCli(
     }
     if (before === "other") {
       err(
-        "Setup refused: this database already has tables that aren't Oculus's. Make a new, empty database for Oculus and point OCULUS_DATABASE_URL at it.",
+        "Setup refused: this database isn't empty and isn't an Oculus database (it has tables, functions, extensions or settings of its own). Make a new, empty database for Oculus (`createdb oculus`) and point OCULUS_DATABASE_URL at it.",
       );
       return 1;
     }
