@@ -8,6 +8,14 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - **Reviews:** one full independent review and one focused check of the fixes; nothing blocking in either, and every finding fixed.
 - **Filed:** S-040a (release a false positive), S-040b (needs John: should production refuse to start without a scanner).
 - Gate: see below.
+## 2026-11-25 11:25 CT — build (BUILD MODE) — S-053 "Last sign-in" is stamped at the right password, before the second step
+- Result: done
+- What changed: `signIn`'s success transaction no longer sets `users.last_sign_in_at`; `markSignedIn` (accounts.ts) stamps it after `completeSecondStep` or `confirmEnrolment` promoted the session, then calls `markKnownSource`; its own statement, best effort, a failure said by class only (as S-050's `markKnownSource`). Re-entering the password no longer moves it. Three tests in second-factor.test.ts (password plus a wrong code, set-up at first sign-in, a promotion refused for the organization), all failing without the change; password-resets.test.ts's deadlock test pins on the address counter's update. Commits on main up to the baseline raise.
+- Decisions: D-077 amended (S-053)
+- Review: one independent round: safe. Nits fixed: `signIn`'s stale comment; the silent catch now warns like S-050's. Filed S-056 (no test now covers the rehash UPDATE racing a reset).
+- Gate: PASS · tests_passing 5021 (was 5018) · npm audit clean (run on the branch rebased onto main with Chat K's S-031, S-035, S-048, S-049, S-050, U-007)
+- Next: the next free task (S-054 or S-056; most others are claimed by Chat K)
+
 ## 2026-11-25 11:00 CT — Chat K — S-048, S-050, S-049, U-007, S-031, S-035 (one gate)
 - Result: done (S-048 and S-035 were already done by S-036a and M-003; their lines say how)
 - What changed: S-050 hardening (404 for an unknown share target, device names refused in update packages, a private updates folder, a Windows warning for a settings folder outside %APPDATA%, `failureClass` logging in `markKnownSource`, a comment fixed); S-049 public sites need an admin origin in every mode; U-007 the gate removes `packages/*/dist` first; S-031 setup checks applied migrations' names and hashes, refuses what the migrations never make, keeps the terminal quiet while migrating and names `template1` when extensions are the only contents; S-035's public side moved into T-058. Follow-up S-055 filed.
