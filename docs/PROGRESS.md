@@ -7,7 +7,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - What changed: `npm run desktop:database` makes `oculus_owner`, `oculus_app` and the `oculus` database on the person's own PostgreSQL with the `postgres` password typed once (SCRAM verifiers, never plain passwords), keeps the passwords only in pgpass, writes `desktop.json` and runs setup; resumes an unfinished setup; undoes a failed creation. The launcher migrates as the owner, grants and checks the writer, and serves as the writer. `start-oculus.cmd` runs the helper the first time. `@oculus/db` exports `createDatabase`, `dropDatabase`, `runSetupCli`, `terminalAsk`.
 - Decisions: D-093
 - Review: two independent rounds; fixed the stuck unfinished setup, leftover pgpass lines, a non-UTF-8 pgpass being damaged, query keys overriding the new addresses, and the pre-grant check that would have refused a correct writer after an update. Left as S-034 (9, 10).
-- Gate: PASS · tests_passing 4390 (was 4376) · npm audit clean
+- Gate: PASS · tests_passing 4405 (was 4391) · npm audit clean
 - Next: S-034 (desktop follow-ups), or the job pool
 
 ## 2026-11-24 22:20 CT — manual (Chat C) — T-050a Hosts for the admin and the public sites
