@@ -6,7 +6,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
 - **Done:** removed files can be cleared again (D-086, migration 0049), through System settings › Removed files (system managers, recent sign-in), `npm run files:purge` (with `--dry-run`), or a daily timer that is off by default (`OCULUS_FILES_AUTO_PURGE=on`). A copy goes only when no database row names it, it was removed at least 7 days ago by both the database's and the file system's clocks, its mtime still matches the one logged at removal, and it is not quarantined; it goes to a trash folder first and is deleted a day later. The epoch lease ties purging to one database and one install (catalog-identity checks, `identity_unknown`/`identity_changed` refuse; only adopt moves the lease after an upgrade or move), and a generation-file lock keeps one purge step at a time. Limits are stated in D-086, README and DESKTOP.md.
 - **Reviews:** five independent reviews; the last found nothing blocking, and every finding was fixed. The one-click "accept this database" step was removed after two rounds.
-- Gate: see below.
+- Gate: PASS (tests_passing 5207; baseline raised from 5145).
 
 ## 2026-11-25 14:10 CT — build (BUILD MODE) — S-054a Wrong-code counters locked in key order; an admin reset forgets the unexplained codes
 - Result: done (S-054 split into S-054a, S-054b and S-054c)
