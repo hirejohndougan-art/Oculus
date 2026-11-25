@@ -15,7 +15,12 @@
  *   manager removes an accepted item (`removeShare`).
  * - **Lists**: a site's offers and accepted items for its manager
  *   (`sharesIntoSite`), a record's shares for whoever may edit it
- *   (`sharesOfRecord`).
+ *   (`sharesOfRecord`). Each is paged (S-036a): at most `MAX_SHARE_PAGE` a
+ *   page, newest first, the next page asked for with `{ before }`, the last
+ *   share's ID (and, for a site's list, `{ state }`, `offered` or
+ *   `accepted`). The manager's list also holds accepted items the public
+ *   can't see right now, with `item: null` (`hidden`), so they can be
+ *   removed; nobody else is shown those.
  * - **Seeing an accepted item** (`readSharedItem`, `listSharedItems`):
  *   anyone with `records.view` for the whole of the second site's catalog
  *   (or a system manager) sees `SharedItemView`: what the public is shown
@@ -89,9 +94,22 @@ export interface ShareSummary {
   readonly endedAt: string | null;
 }
 
-/** An offer or accepted item, as the second site's manager sees it. */
+/** An offer or accepted item, as the second site's people see it. */
 export interface IncomingShare extends ShareSummary {
-  readonly item: SharedItemView;
+  /**
+   * What the public is shown of it, or `null` (only in the site manager's
+   * own list, S-036a) while the public can't see it at all: unpublished,
+   * refused by the publish check, or without a stored Dublin Core mapping.
+   * Nothing else is said about why.
+   */
+  readonly item: SharedItemView | null;
+}
+
+/** A page of a share list (S-036a): `before`, the last share's ID of the page before. */
+export interface SharePageRequest {
+  readonly before?: unknown;
+  /** For a site's list: only this state's page (`offered` or `accepted`); both when left out. */
+  readonly state?: unknown;
 }
 
 export interface ShareOperations {
@@ -104,11 +122,13 @@ export interface ShareOperations {
   sharesIntoSite(
     context: ServiceContext,
     siteId: unknown,
+    page?: SharePageRequest,
   ): Promise<ServiceResult<readonly IncomingShare[]>>;
   /** The record's shares (every state), for whoever may edit it. */
   sharesOfRecord(
     context: ServiceContext,
     recordId: unknown,
+    page?: SharePageRequest,
   ): Promise<ServiceResult<readonly ShareSummary[]>>;
   /** An item accepted into the site, as the site's people may see it. */
   readSharedItem(context: ServiceContext, shareId: unknown): Promise<ServiceResult<IncomingShare>>;
@@ -116,6 +136,7 @@ export interface ShareOperations {
   listSharedItems(
     context: ServiceContext,
     siteId: unknown,
+    page?: SharePageRequest,
   ): Promise<ServiceResult<readonly IncomingShare[]>>;
 }
 
@@ -202,15 +223,50 @@ export function shareOperations(db: Database, run: Runner, outside: Outside): Sh
    * snapshot of their own: `sharedItemViews`), in order; a share whose item
    * the public can't see now is left out.
    */
-  async function incoming(shares: readonly Share[]): Promise<readonly IncomingShare[]> {
+  /**
+   * The shares with their views. Offers and accepted items the public can't
+   * see are left out, unless `keepHidden` (the site manager's own list,
+   * S-036a), which keeps accepted ones with `item: null`.
+   */
+  async function incoming(
+    shares: readonly Share[],
+    keepHidden = false,
+  ): Promise<readonly IncomingShare[]> {
     const views = await sharedItemViews(db, shares);
     const out: IncomingShare[] = [];
     for (const share of shares) {
       const item = views.get(share.id);
       if (item !== undefined) out.push(Object.freeze({ ...summary(share), item }));
+      else if (keepHidden && share.state === "accepted") {
+        out.push(Object.freeze({ ...summary(share), item: null }));
+      }
     }
     return Object.freeze(out);
   }
+
+  /** A page request's parts, or undefined when it isn't one. */
+  function pageOf(
+    page: unknown,
+    allowState: boolean,
+  ): { before?: unknown; state?: "offered" | "accepted" } | undefined {
+    if (page === undefined) return {};
+    if (!hasOnly(page, allowState ? ["before", "state"] : ["before"])) return undefined;
+    const before = own(page, "before");
+    const state = own(page, "state");
+    if (before !== undefined && typeof before !== "string") return undefined;
+    if (state !== undefined && state !== "offered" && state !== "accepted") return undefined;
+    return {
+      ...(before === undefined ? {} : { before }),
+      ...(state === undefined ? {} : { state }),
+    };
+  }
+
+  const BAD_PAGE = () =>
+    refusal(
+      ["page"],
+      "invalid_request",
+      "A page is { before } (a share ID) and, for a site's list, { state }.",
+    );
 
   /**
    * A share the second site acts on: locked, of the session's organization's
@@ -347,7 +403,7 @@ export function shareOperations(db: Database, run: Runner, outside: Outside): Sh
       });
     },
 
-    async sharesIntoSite(context, siteId) {
+    async sharesIntoSite(context, siteId, page) {
       const checked = await run("sharesIntoSite", context, async (tx, who) => {
         const access = await readAccess(tx, who.organizationId, who.actor);
         if (!access.ok) return access;
@@ -358,25 +414,41 @@ export function shareOperations(db: Database, run: Runner, outside: Outside): Sh
         ) {
           return NOT_PERMITTED();
         }
-        const shares = [
-          ...(await storedSharesIntoSite(tx, who.organizationId, siteId, "offered")),
-          ...(await storedSharesIntoSite(tx, who.organizationId, siteId, "accepted")),
-        ];
+        const wanted = pageOf(page, true);
+        if (wanted === undefined) return BAD_PAGE();
+        const states =
+          wanted.state === undefined ? (["offered", "accepted"] as const) : [wanted.state];
+        const shares: Share[] = [];
+        for (const state of states) {
+          shares.push(
+            ...(await storedSharesIntoSite(tx, who.organizationId, siteId, state, {
+              before: wanted.before,
+              includeHidden: state === "accepted",
+            })),
+          );
+        }
         return { ok: true, value: shares };
       });
       if (!checked.ok) return checked;
       const shares = checked.value;
-      return outside("sharesIntoSite", async () => ({ ok: true, value: await incoming(shares) }));
+      return outside("sharesIntoSite", async () => ({
+        ok: true,
+        value: await incoming(shares, true),
+      }));
     },
 
-    async sharesOfRecord(context, recordId) {
+    async sharesOfRecord(context, recordId, page) {
       return run("sharesOfRecord", context, async (tx, who) => {
         if (!isRecordId(recordId)) return noSuchRecord();
         const access = await readAccess(tx, who.organizationId, who.actor);
         if (!access.ok) return access;
         const allowed = await mayShareRecord(tx, who, access.value, recordId, "read");
         if (allowed) return allowed;
-        const shares = await storedSharesOfRecord(tx, who.organizationId, recordId);
+        const wanted = pageOf(page, false);
+        if (wanted === undefined) return BAD_PAGE();
+        const shares = await storedSharesOfRecord(tx, who.organizationId, recordId, {
+          before: wanted.before,
+        });
         return { ok: true, value: Object.freeze(shares.map(summary)) };
       });
     },
@@ -399,7 +471,7 @@ export function shareOperations(db: Database, run: Runner, outside: Outside): Sh
       });
     },
 
-    async listSharedItems(context, siteId) {
+    async listSharedItems(context, siteId, page) {
       const checked = await run("listSharedItems", context, async (tx, who) => {
         const access = await readAccess(tx, who.organizationId, who.actor);
         if (!access.ok) return access;
@@ -410,9 +482,13 @@ export function shareOperations(db: Database, run: Runner, outside: Outside): Sh
         ) {
           return NOT_PERMITTED();
         }
+        const wanted = pageOf(page, false);
+        if (wanted === undefined) return BAD_PAGE();
         return {
           ok: true,
-          value: await storedSharesIntoSite(tx, who.organizationId, siteId, "accepted"),
+          value: await storedSharesIntoSite(tx, who.organizationId, siteId, "accepted", {
+            before: wanted.before,
+          }),
         };
       });
       if (!checked.ok) return checked;

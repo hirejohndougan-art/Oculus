@@ -32,7 +32,7 @@ import {
   recordReply,
 } from "../records/records.fixtures";
 import { forgetLists } from "../records/listMemory";
-import { fieldLabel } from "./model";
+import { SHARE_PAGE, fieldLabel } from "./model";
 
 afterEach(() => {
   cleanup();
@@ -213,6 +213,68 @@ describe("the Shared with this site screen", () => {
 });
 
 describe("a shared item", () => {
+  it("lists an accepted item the public can't see now for the manager to remove, without a link", async () => {
+    const sent = siteServer({
+      [OFFERS]: [200, { shares: [{ ...incoming(SHARE_2, "accepted", "unused"), item: null }] }],
+      [`POST /api/shares/${SHARE_2}/remove`]: [200, { share: { id: SHARE_2, state: "removed" } }],
+    });
+    renderAt(SHARED);
+    const shared = await screen.findByRole("table", { name: "Items shared with this site" });
+    expect(within(shared).getByText(/home site doesn.t show it publicly now/)).toBeTruthy();
+    expect(within(shared).queryByRole("link")).toBeNull();
+    expect(within(shared).queryByText("unused")).toBeNull();
+    await userEvent.click(
+      within(shared).getByRole("button", {
+        name: "Remove An item not shown to the public right now",
+      }),
+    );
+    await userEvent.click(await screen.findByRole("button", { name: "Remove" }));
+    await waitFor(() => {
+      expect(sent.some((x) => x.path === `/api/shares/${SHARE_2}/remove`)).toBe(true);
+    });
+  });
+
+  it("shows more of a full list a page at a time, from the last share shown", async () => {
+    const page = (from: number, count: number) =>
+      Array.from({ length: count }, (_, n) => {
+        const id = `aaaaaaaa-aaaa-4aaa-8aaa-${String(from + n).padStart(12, "0")}`;
+        return incoming(id, "accepted", `Invented lantern ${String(from + n)}`);
+      });
+    const first = page(0, SHARE_PAGE);
+    const lastId = first.at(-1)?.id ?? "";
+    const sent = siteServer({
+      [OFFERS]: [200, { shares: first }],
+      [`GET /api/sites/${SITE_1}/share-offers?state=accepted&before=${lastId}`]: [
+        200,
+        { shares: page(SHARE_PAGE, 3) },
+      ],
+    });
+    renderAt(SHARED);
+    await screen.findByRole("table", { name: "Items shared with this site" });
+    // Offers aren't a full page, so only the accepted items offer more.
+    expect(screen.getAllByRole("button", { name: "Show more" })).toHaveLength(1);
+    await userEvent.click(screen.getByRole("button", { name: "Show more" }));
+    expect(await screen.findByText(`Invented lantern ${String(SHARE_PAGE + 2)}`)).toBeTruthy();
+    expect(sent.some((x) => x.path.includes(`state=accepted&before=${lastId}`))).toBe(true);
+    // The last page wasn't full: nothing more to ask for.
+    expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+  });
+
+  it("names a shared item's fields by its home template's labels", async () => {
+    const share = incoming(SHARE_2, "accepted", "Invented kettle");
+    siteServer({
+      [`GET /api/shares/${SHARE_2}`]: [
+        200,
+        { share: { ...share, item: { ...share.item, labels: { date_made: "When it was made" } } } },
+      ],
+    });
+    renderAt(`${SHARED}/${SHARE_2}`);
+    expect(await screen.findByText("When it was made")).toBeTruthy();
+    expect(screen.queryByText("Date made")).toBeNull();
+    // A field with no label is still named readably.
+    expect(screen.getByText("Description")).toBeTruthy();
+  });
+
   it("is shown read-only, its values as text, with its home named", async () => {
     siteServer({
       [`GET /api/shares/${SHARE_2}`]: [

@@ -14,9 +14,10 @@ import { Button, Note, TextLink } from "../components/ui";
 import { ConfirmPanel } from "../records/controls";
 import { KIND_LABELS, valueText, whenText } from "../records/model";
 import styles from "../records/Records.module.css";
-import { fieldLabel, homeText, isId, type IncomingShare } from "./model";
+import { SHARE_PAGE, homeText, isId, itemTitle, viewLabel, type IncomingShare } from "./model";
 import {
   moveShare,
+  nextSharePage,
   refreshShares,
   useShareOffers,
   useSharedItem,
@@ -42,6 +43,9 @@ const DONE: Readonly<Record<ShareMove, string>> = {
   remove: "Removed. This site no longer shows the item.",
   withdraw: "Withdrawn.",
 };
+
+/** The lists that come a page at a time. */
+type PageList = "offered" | "accepted" | "items";
 
 function itemPath(siteId: string, shareId: string): string | undefined {
   return isId(siteId) && isId(shareId) ? `/sites/${siteId}/shared/${shareId}` : undefined;
@@ -72,14 +76,23 @@ function SharedTable(props: {
             return (
               <tr key={share.id}>
                 <td>
-                  {href === undefined ? (
+                  {share.item === null ? (
+                    <>
+                      {itemTitle(share)}
+                      <br />
+                      <span className={styles.meta}>
+                        Its home site doesn't show it publicly now, so this site doesn't either. You
+                        can still remove it.
+                      </span>
+                    </>
+                  ) : href === undefined ? (
                     share.item.title
                   ) : (
                     <TextLink href={href}>{share.item.title}</TextLink>
                   )}
                 </td>
-                <td>{kindText(share.item.kind)}</td>
-                <td>{homeText(share.item)}</td>
+                <td>{share.item === null ? "Not shown" : kindText(share.item.kind)}</td>
+                <td>{share.item === null ? "Not shown" : homeText(share.item)}</td>
                 <td>{whenText(share.offeredAt)}</td>
                 {props.actions === undefined ? null : (
                   <td className={styles.actions}>{props.actions(share)}</td>
@@ -106,6 +119,44 @@ export function SharedWithSite(props: {
   const [status, setStatus] = useState<{ tone: "green" | "amber"; text: string }>();
   const [busy, setBusy] = useState(false);
   const [removing, setRemoving] = useState<IncomingShare>();
+  /** Later pages of each list (S-036a), and whether the last one was full. */
+  const [more, setMore] = useState<
+    Partial<Record<PageList, { rows: IncomingShare[]; full: boolean }>>
+  >({});
+  const [loadingMore, setLoadingMore] = useState(false);
+
+  /** The list with its later pages, and a "Show more" button while there may be more. */
+  function paged(list: PageList, first: readonly IncomingShare[]) {
+    const extra = more[list];
+    const rows = [...first, ...(extra?.rows ?? [])];
+    const full = extra === undefined ? first.length >= SHARE_PAGE : extra.full;
+    const last = rows.at(-1);
+    const button =
+      !full || last === undefined ? null : (
+        <Button
+          variant="secondary"
+          isDisabled={loadingMore}
+          onPress={() => void showMore(list, last.id)}
+        >
+          Show more
+        </Button>
+      );
+    return { rows, button };
+  }
+
+  async function showMore(list: PageList, before: string) {
+    setLoadingMore(true);
+    try {
+      const page = await nextSharePage(props.siteId, list, before);
+      setMore((now) => ({
+        ...now,
+        [list]: { rows: [...(now[list]?.rows ?? []), ...page], full: page.length >= SHARE_PAGE },
+      }));
+    } catch (error) {
+      setStatus({ tone: "amber", text: `More couldn't be loaded. ${problemText(error)}` });
+    }
+    setLoadingMore(false);
+  }
 
   // A ref, not only state: a second press before the re-render must not send twice.
   const moving = useRef(false);
@@ -134,6 +185,7 @@ export function SharedWithSite(props: {
     }
     // Buttons stay disabled until the lists show the move.
     await refreshShares(queries, props.siteId);
+    setMore({});
     setRemoving(undefined);
     setStatus(result);
     setBusy(false);
@@ -155,8 +207,16 @@ export function SharedWithSite(props: {
   if (offers.isPending) {
     body = <p role="status">Loading the items shared with this site…</p>;
   } else if (offers.isSuccess) {
-    const waiting = offers.data.filter((s) => s.state === "offered");
-    const accepted = offers.data.filter((s) => s.state === "accepted");
+    const waitingPage = paged(
+      "offered",
+      offers.data.filter((s) => s.state === "offered"),
+    );
+    const acceptedPage = paged(
+      "accepted",
+      offers.data.filter((s) => s.state === "accepted"),
+    );
+    const waiting = waitingPage.rows;
+    const accepted = acceptedPage.rows;
     body = (
       <>
         <Note tone="blue">
@@ -181,19 +241,20 @@ export function SharedWithSite(props: {
                     isDisabled={busy}
                     onPress={() => void move(share, "accept")}
                   >
-                    Accept {share.item.title}
+                    Accept {itemTitle(share)}
                   </Button>
                   <Button
                     variant="link"
                     isDisabled={busy}
                     onPress={() => void move(share, "decline")}
                   >
-                    Decline {share.item.title}
+                    Decline {itemTitle(share)}
                   </Button>
                 </>
               )}
             />
           )}
+          {waitingPage.button}
         </section>
         <section className={styles.panel} aria-labelledby="accepted-title">
           <h2 id="accepted-title" className={styles.sectionTitle}>
@@ -214,11 +275,12 @@ export function SharedWithSite(props: {
                     setRemoving(share);
                   }}
                 >
-                  Remove {share.item.title}
+                  Remove {itemTitle(share)}
                 </Button>
               )}
             />
           )}
+          {acceptedPage.button}
         </section>
       </>
     );
@@ -236,15 +298,19 @@ export function SharedWithSite(props: {
         loadFailed(items.error, () => void items.refetch())
       );
   } else {
+    const itemsPage = paged("items", items.data);
     body =
-      items.data.length === 0 ? (
+      itemsPage.rows.length === 0 ? (
         <p>Nothing is shared with this site yet.</p>
       ) : (
-        <SharedTable
-          siteId={props.siteId}
-          caption="Items shared with this site"
-          shares={items.data}
-        />
+        <>
+          <SharedTable
+            siteId={props.siteId}
+            caption="Items shared with this site"
+            shares={itemsPage.rows}
+          />
+          {itemsPage.button}
+        </>
       );
   }
 
@@ -275,8 +341,8 @@ export function SharedWithSite(props: {
         }}
       >
         <p>
-          {removing?.item.title ?? ""} stops showing here. Its home site keeps it; to show it again,
-          they would offer it again.
+          {removing === undefined ? "" : itemTitle(removing)} stops showing here. Its home site
+          keeps it; to show it again, they would offer it again.
         </p>
       </ConfirmPanel>
       <div aria-busy={offers.isFetching || items.isFetching}>{body}</div>
@@ -319,6 +385,15 @@ export function SharedItemScreen(props: { readonly siteId: string; readonly shar
     );
   }
   const item = share.data.item;
+  if (item === null) {
+    return (
+      <>
+        <h1 className={styles.pageTitle}>Shared item not found</h1>
+        <p>There is no such shared item, or it isn't shared with this site any more.</p>
+        {back}
+      </>
+    );
+  }
   const fields = Object.entries(item.fields).filter(([, v]) => valueText(v) !== "");
   return (
     <>
@@ -337,7 +412,7 @@ export function SharedItemScreen(props: { readonly siteId: string; readonly shar
         <dl className={styles.grid}>
           {fields.map(([key, value]) => (
             <div key={key} className={styles.pair}>
-              <dt>{fieldLabel(key)}</dt>
+              <dt>{viewLabel(item, key)}</dt>
               <dd>{valueText(value)}</dd>
             </div>
           ))}

@@ -435,7 +435,7 @@ export {
   sharesIntoSite,
   sharesOfRecord,
 } from "./shares.js";
-export type { Share, ShareState, SharedItemView } from "./shares.js";
+export type { Share, SharePageOptions, ShareState, SharedItemView } from "./shares.js";
 export {
   SYSTEM_EVENT_KINDS,
   SYSTEM_EVENT_TABLE_PRIVILEGES,

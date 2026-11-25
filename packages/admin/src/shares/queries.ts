@@ -65,6 +65,25 @@ export function useSharedItem(siteId: string, shareId: string) {
   });
 }
 
+/**
+ * The next page of one of a site's lists (S-036a), after `before` (the last
+ * share's ID shown): the manager's offers or accepted items, or anyone's
+ * accepted items.
+ */
+export async function nextSharePage(
+  siteId: string,
+  list: "offered" | "accepted" | "items",
+  before: string,
+): Promise<IncomingShare[]> {
+  const site = encodeURIComponent(siteId);
+  const after = encodeURIComponent(before);
+  const path =
+    list === "items"
+      ? `/api/sites/${site}/shared-items?before=${after}`
+      : `/api/sites/${site}/share-offers?state=${list}&before=${after}`;
+  return (await api<{ shares: IncomingShare[] }>(path, { site: siteId })).shares;
+}
+
 export type ShareMove = "accept" | "decline" | "remove" | "withdraw";
 
 /** Makes one move on a share; the caller refreshes what it shows. */

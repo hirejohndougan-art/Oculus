@@ -336,6 +336,23 @@ export function queryText(request: OculusRequest, name: string): string | undefi
   return value;
 }
 
+/**
+ * A share list's page (S-036a): `?before=<share ID>` and, for a site's
+ * list, `?state=offered|accepted`. Left for the service to check; only a
+ * repeated parameter is refused here (400).
+ */
+export function sharePage(
+  request: OculusRequest,
+  withState = false,
+): { before?: string; state?: string } {
+  const before = queryText(request, "before");
+  const state = withState ? queryText(request, "state") : undefined;
+  return {
+    ...(before === undefined ? {} : { before }),
+    ...(state === undefined ? {} : { state }),
+  };
+}
+
 /** A whole number query parameter (400 otherwise). */
 export function queryNumber(request: OculusRequest, name: string, max: number): number | undefined {
   const text = queryText(request, name);
@@ -1104,7 +1121,7 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
       method: "GET",
       path: "/api/records/:id/shares",
       handler: signedIn("read", false, async (request, reply, { context }) => {
-        const result = await service.sharesOfRecord(context, recordId(request));
+        const result = await service.sharesOfRecord(context, recordId(request), sharePage(request));
         return answer(result, reply, (shares) => ({ shares }));
       }),
     },
@@ -1142,7 +1159,11 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
       method: "GET",
       path: "/api/sites/:id/share-offers",
       handler: signedIn("read", false, async (request, reply, { context }) => {
-        const result = await service.sharesIntoSite(context, request.params.id ?? "");
+        const result = await service.sharesIntoSite(
+          context,
+          request.params.id ?? "",
+          sharePage(request, true),
+        );
         return answer(result, reply, (shares) => ({ shares }));
       }),
     },
@@ -1150,7 +1171,11 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
       method: "GET",
       path: "/api/sites/:id/shared-items",
       handler: signedIn("read", false, async (request, reply, { context }) => {
-        const result = await service.listSharedItems(context, request.params.id ?? "");
+        const result = await service.listSharedItems(
+          context,
+          request.params.id ?? "",
+          sharePage(request),
+        );
         return answer(result, reply, (shares) => ({ shares }));
       }),
     },
