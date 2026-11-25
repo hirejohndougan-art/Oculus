@@ -8,7 +8,7 @@ import { cleanup, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SITE_1, fakeServer, me, renderAt, type Reply } from "../testing.fixtures";
-import { forgetLists } from "./ItemList";
+import { forgetLists } from "./listMemory";
 import { A1, RECORD_ID, TYPES_REPLY } from "./records.fixtures";
 
 afterEach(() => {

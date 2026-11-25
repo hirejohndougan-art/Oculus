@@ -1343,6 +1343,37 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
   }
 
   /**
+   * The values a unit inherits, for its reader (T-046 review), failing
+   * closed. Every record above it is locked `FOR SHARE` first (after the
+   * record's own row lock and any arrangement lock, as `lockAbove`), and the
+   * set read again, so nothing above can move, change or be deleted between
+   * reading the values and checking who may see their sources; then nothing
+   * is shown when the set changed meanwhile, when the effective record names
+   * a record above that isn't among those locked (gone, or moved in), or
+   * when any of them is out of the person's sight (a system manager filed it
+   * across sites): its values, and even that it lets a value through, are
+   * not theirs to see.
+   */
+  async function visibleInherited(
+    tx: Queryable,
+    organizationId: OrganizationId,
+    recordId: RecordId,
+    checker: RecordAccess,
+  ): Promise<readonly InheritedValue[]> {
+    const above = await recordClosureIds(tx, organizationId, [recordId]);
+    if (above === undefined) return [];
+    const locked = new Set(await lockRecordsShared(tx, organizationId, above));
+    const again = await recordClosureIds(tx, organizationId, [recordId]);
+    if (again?.length !== above.length || !again.every((id) => locked.has(id))) return [];
+    const found = await inheritedValues(tx, organizationId, recordId);
+    if (found === undefined) return [];
+    if (!found.chain.every((id) => locked.has(id))) return [];
+    if (!found.values.every((v) => locked.has(v.from))) return [];
+    if ((await checker.hiddenAmong(found.chain)).size > 0) return [];
+    return found.values;
+  }
+
+  /**
    * S-020: locks every record above `ids` (their parents, represented
    * records and so on up, `ids` included) `FOR SHARE`, in ID order, and reads
    * the set again: if it changed meanwhile, the operation starts again
@@ -2412,13 +2443,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
         const record = stored.value.record;
         let inherited: readonly InheritedValue[] = [];
         if (record.kind === "archival_unit" && record.parentId !== undefined) {
-          const found = await inheritedValues(tx, who.organizationId, recordId);
-          // Nothing from above when any unit above is out of sight (a system
-          // manager filed it across sites): its values, and even that it lets
-          // a value through, are not the person's to see.
-          if (found !== undefined && (await allowed.checker.hiddenAmong(found.chain)).size === 0) {
-            inherited = found.values;
-          }
+          inherited = await visibleInherited(tx, who.organizationId, recordId, allowed.checker);
         }
         return {
           ok: true,

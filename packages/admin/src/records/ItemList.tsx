@@ -14,15 +14,8 @@ import ui from "../components/ui.module.css";
 import { Choice, StatePill, TextInput } from "./controls";
 import { KIND_LABELS, STATE_LABELS, recordPath, whenText } from "./model";
 import { useItems, useRecordTypes, useSiteAbilities, type ListParams } from "./queries";
+import { rememberList, rememberedList } from "./listMemory";
 import styles from "./Records.module.css";
-
-/** The list's state per site, for this tab only (memory; gone on reload). */
-const remembered = new Map<string, { params: ListParams; pages: (string | undefined)[] }>();
-
-/** Forgets every list's search words and filters (signing out). */
-export function forgetLists(): void {
-  remembered.clear();
-}
 
 const START: ListParams = { q: "", state: "", type: "", sort: "updated", after: undefined };
 
@@ -30,10 +23,12 @@ export function ItemList(props: { readonly siteId: string; readonly siteName: st
   const { siteId } = props;
   const location = useLocation();
   const notice = (location.state as { notice?: unknown } | null)?.notice;
-  const saved = remembered.get(siteId);
+  const saved = rememberedList(siteId);
   const [params, setParamsState] = useState<ListParams>(saved?.params ?? START);
   // The `after` of every page shown so far, for "Previous page".
-  const [pages, setPagesState] = useState<(string | undefined)[]>(saved?.pages ?? [undefined]);
+  const [pages, setPagesState] = useState<(string | undefined)[]>(
+    saved === undefined ? [undefined] : [...saved.pages],
+  );
   const [words, setWords] = useState(saved?.params.q ?? "");
   const items = useItems(siteId, params);
   const types = useRecordTypes(siteId);
@@ -42,7 +37,7 @@ export function ItemList(props: { readonly siteId: string; readonly siteName: st
   function update(next: ListParams, nextPages: (string | undefined)[]) {
     setParamsState(next);
     setPagesState(nextPages);
-    remembered.set(siteId, { params: next, pages: nextPages });
+    rememberList(siteId, { params: next, pages: nextPages });
   }
   function filter(change: Partial<ListParams>) {
     update({ ...params, ...change, after: undefined }, [undefined]);

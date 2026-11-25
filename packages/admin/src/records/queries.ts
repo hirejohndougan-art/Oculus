@@ -6,6 +6,7 @@
  */
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api";
+import { useMe } from "../frame/useMe";
 import type {
   ListedRecord,
   QueueEntry,
@@ -27,22 +28,31 @@ export function useSiteAbilities(siteId: string | undefined) {
   });
 }
 
+/**
+ * The organization's templates and record types: keyed by the organization
+ * the session works in, so another organization's never answer after a
+ * switch (D-019).
+ */
 export function useTemplates(siteId: string) {
+  const organizationId = useMe().data?.organizationId;
   return useQuery({
-    queryKey: ["templates"],
+    queryKey: ["templates", organizationId],
     queryFn: async () =>
       (await api<{ templates: TemplateSummary[] }>("/api/templates", { site: siteId })).templates,
     staleTime: 60_000,
+    enabled: organizationId !== undefined,
   });
 }
 
 export function useRecordTypes(siteId: string) {
+  const organizationId = useMe().data?.organizationId;
   return useQuery({
-    queryKey: ["record-types"],
+    queryKey: ["record-types", organizationId],
     queryFn: async () =>
       (await api<{ recordTypes: RecordTypeSummary[] }>("/api/record-types", { site: siteId }))
         .recordTypes,
     staleTime: 60_000,
+    enabled: organizationId !== undefined,
   });
 }
 
@@ -51,6 +61,12 @@ export function useRecord(siteId: string, recordId: string) {
     queryKey: recordKey(recordId),
     queryFn: () =>
       api<ReadRecordReply>(`/api/records/${encodeURIComponent(recordId)}`, { site: siteId }),
+    // The editor starts a fresh form for each version it is given: a
+    // refetch on reconnect must not replace the form under typed edits. The
+    // record is read again only after the person's own save, move, restore
+    // or reload.
+    refetchOnReconnect: false,
+    refetchOnWindowFocus: false,
   });
 }
 

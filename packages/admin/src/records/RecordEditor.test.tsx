@@ -9,6 +9,7 @@
 // record text shown as text, never as HTML or a link.
 import { cleanup, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { onlineManager } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SITE_1, fakeServer, me, renderAt, type Reply, type Sent } from "../testing.fixtures";
 import {
@@ -23,7 +24,7 @@ import {
   VERSIONS_REPLY,
   recordReply,
 } from "./records.fixtures";
-import { forgetLists } from "./ItemList";
+import { forgetLists } from "./listMemory";
 
 afterEach(() => {
   cleanup();
@@ -199,6 +200,20 @@ describe("the record editor's form", () => {
       await screen.findByRole("heading", { level: 1, name: "Changed elsewhere" }),
     ).toBeTruthy();
     expect(screen.getByLabelText<HTMLInputElement>(/^Shelf/).value).toBe("");
+  });
+
+  it("keeps typed edits when the connection comes back (no refetch under the form)", async () => {
+    let version = 3;
+    const sent = server(() => [200, recordReply({ version })]);
+    renderAt(PATH);
+    await opened();
+    await userEvent.type(screen.getByLabelText(/^Shelf/), "Typed offline");
+    version = 4;
+    onlineManager.setOnline(false);
+    onlineManager.setOnline(true);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(sent.filter((s) => s.path === API)).toHaveLength(1);
+    expect(screen.getByLabelText<HTMLInputElement>(/^Shelf/).value).toBe("Typed offline");
   });
 
   it("says before saving that a published record's changes go live at once", async () => {

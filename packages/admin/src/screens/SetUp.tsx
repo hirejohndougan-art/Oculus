@@ -9,6 +9,7 @@
 import { useState, type SubmitEvent } from "react";
 import { useNavigate } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
+import { endSession } from "../session";
 import { CheckboxButton, CheckboxField } from "react-aria-components";
 import { ApiError, api, problemText } from "../api";
 import { AuthLayout, authStyles } from "../components/AuthLayout";
@@ -125,7 +126,8 @@ export function SetUp() {
 
   async function finish() {
     setRecoveryCodes(undefined);
-    queries.removeQueries();
+    // A new session: nothing of an earlier one may show (its token is the reply's).
+    endSession(queries, { keepCsrfToken: true });
     await navigate("/", { replace: true });
   }
 

@@ -7,7 +7,13 @@
 // sight. Every person, site and record is invented.
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { csrfTokenFor, type OrganizationId, type UserId } from "@oculus/core";
-import { insertRecordTypeVersion, insertTemplateVersion } from "@oculus/db";
+import {
+  insertRecordTypeVersion,
+  insertTemplateVersion,
+  type Database,
+  type Queryable,
+} from "@oculus/db";
+import { createService } from "@oculus/service";
 import type { FastifyInstance } from "fastify";
 import { OCULUS_COOKIES } from "./cookies.js";
 import { buildServer } from "./server.js";
@@ -323,6 +329,107 @@ describe("GET /api/records/:id: what the person may do, and what it inherits", (
       { key: "provenance", value: "Hidden words.", from: ids.hiddenFonds },
     ]);
   });
+});
+
+describe("inherited values while the units above change (review: fail closed)", () => {
+  it("never shows a hidden unit's values, even if it is moved away and deleted mid-read", async () => {
+    const draftUnder = (title: string, parentId: string, level = "series") => ({
+      kind: "archival_unit",
+      level,
+      parentId,
+      title,
+      templateKey: "t-inherit",
+      fields: { rights: { uri: INC } },
+    });
+    const root = { organizationId: w.a, actor: actorOf(w.root) };
+    const hidden = await makeAs(w, w.a, w.a2, {
+      kind: "archival_unit",
+      level: "fonds",
+      title: "Racing hidden fonds",
+      templateKey: "t-inherit",
+      fields: { rights: { uri: INC }, provenance: "Racing hidden words." },
+    });
+    const visible = await makeAs(w, w.a, w.a1, {
+      kind: "archival_unit",
+      level: "fonds",
+      title: "Racing visible fonds",
+      templateKey: "t-inherit",
+      fields: { rights: { uri: INC } },
+    });
+    const series = await makeAs(w, w.a, w.a1, draftUnder("Racing series", hidden));
+    const file = await makeAs(w, w.a, w.a1, draftUnder("Racing file", series, "file"));
+
+    // Between reading the values and checking who may see where they came
+    // from, a system manager moves the series out and deletes the hidden fonds.
+    let moved: Promise<unknown> | undefined;
+    let sawClosure = false;
+    const hook = async () => {
+      moved = (async () => {
+        ok(
+          await w.service.updateRecord(
+            root,
+            series as never,
+            draftUnder("Racing series", visible),
+            {
+              expectedVersion: 1,
+            },
+          ),
+        );
+        ok(await w.service.deleteRecord(root, hidden as never, { expectedVersion: 1 }));
+      })();
+      // Long enough for both to finish when nothing holds them back.
+      await Promise.race([moved, new Promise((resolve) => setTimeout(resolve, 1500))]);
+    };
+    const hooked: Database = {
+      rows: (q) => w.db.rows(q),
+      execute: (q) => w.db.execute(q),
+      close: () => Promise.resolve(),
+      transaction: (work) =>
+        w.db.transaction((tx) => {
+          const seen: Queryable = {
+            rows: async (q) => {
+              if (q.text.includes("WITH RECURSIVE up(id) AS")) sawClosure = true;
+              if (
+                sawClosure &&
+                moved === undefined &&
+                q.text.includes(
+                  "r.represents_id::text AS represents_id, r.site_id::text AS site_id",
+                )
+              ) {
+                await hook();
+              }
+              return tx.rows(q);
+            },
+            execute: (q) => tx.execute(q),
+          };
+          return work(seen);
+        }),
+    };
+    const service = createService(hooked);
+    const server = await buildServer({
+      env: TEST_ENV,
+      routes: staffApiRoutes({ db: w.db, service, log: () => undefined }),
+    });
+    try {
+      const token = tokens.cataloger ?? "";
+      const res = await server.inject({
+        method: "GET",
+        url: `/api/records/${file}`,
+        headers: { origin: SAME_ORIGIN.origin, cookie: `${OCULUS_COOKIES.session}=${token}` },
+      });
+      expect(moved).toBeDefined();
+      expect(res.statusCode).toBe(200);
+      expect(res.body).not.toContain("Racing hidden words.");
+      expect((JSON.parse(res.body) as { inherited: unknown }).inherited).toEqual([]);
+      // The move and deletion went through once the read was done.
+      await moved;
+      const after = await get(`/api/records/${series}`, "cataloger");
+      expect((after.json.record as { parentId?: string }).parentId).toBe(visible);
+    } finally {
+      await moved?.catch(() => undefined);
+      await server.close();
+    }
+  }, 30_000);
 });
 
 describe("the lists change nothing", () => {
