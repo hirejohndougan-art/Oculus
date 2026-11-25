@@ -16,6 +16,7 @@ import {
   SlowReads,
 } from "./public-api.js";
 import type { PublicSite } from "./public-sites.js";
+import { OAI_REQUEST_BUDGET_MS } from "./oai-pmh.js";
 import { SERVER_TIMEOUTS } from "./server.js";
 
 describe("SlowReads (S-043b)", () => {
@@ -108,6 +109,9 @@ describe("SlowReads (S-043b)", () => {
     expect(fallback.budgetMs + 2 * PUBLIC_READ_TIME_LIMIT_MS).toBeLessThanOrEqual(
       SERVER_TIMEOUTS.handler,
     );
+    // A list request's reads, all told, leave time for the reply (OAI_REQUEST_BUDGET_MS).
+    expect(OAI_REQUEST_BUDGET_MS).toBeLessThanOrEqual(SERVER_TIMEOUTS.handler - 5_000);
+    expect(SLOW_READ_BUDGET_MS).toBeLessThan(OAI_REQUEST_BUDGET_MS);
   });
 
   it("keys a record by its organization and site, so one site's slow record isn't another's", () => {
