@@ -9,11 +9,18 @@ import { copyFileSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { newOrganizationId, validateTemplate, type Validated } from "@oculus/core";
+import {
+  newOrganizationId,
+  validateDublinCoreMapping,
+  validateTemplate,
+  type Validated,
+} from "@oculus/core";
 import { createFirstSystemAdmin, signIn } from "./accounts.js";
 import { insertOrganization, readTemplate } from "./catalog.js";
 import { openDatabase, type Database } from "./client.js";
+import { readDublinCoreMapping } from "./dublin-core-mappings.js";
 import {
+  STARTER_DUBLIN_CORE_ENTRIES,
   STARTER_TEMPLATE_FIELDS,
   STARTER_TEMPLATE_KEY,
   databaseBeforeSetup,
@@ -63,7 +70,8 @@ async function counts(db: Database): Promise<Record<string, number>> {
     SELECT (SELECT count(*)::int FROM public.users) AS users,
            (SELECT count(*)::int FROM public.organizations) AS organizations,
            (SELECT count(*)::int FROM public.sites) AS sites,
-           (SELECT count(*)::int FROM public.template_versions) AS templates`);
+           (SELECT count(*)::int FROM public.template_versions) AS templates,
+           (SELECT count(*)::int FROM public.dublin_core_mappings) AS mappings`);
   if (row === undefined) throw new Error("no row");
   return row;
 }
@@ -74,7 +82,13 @@ describe("setUpFirstInstall", () => {
     expect(await isEmptyInstall(db)).toBe(true);
     const made = ok(await setUpFirstInstall(db, INPUT));
     expect(made.templateKey).toBe(STARTER_TEMPLATE_KEY);
-    expect(await counts(db)).toEqual({ users: 1, organizations: 1, sites: 1, templates: 1 });
+    expect(await counts(db)).toEqual({
+      users: 1,
+      organizations: 1,
+      sites: 1,
+      templates: 1,
+      mappings: 1,
+    });
     const [user] = await db.rows<{
       email: string;
       display_name: string;
@@ -117,6 +131,26 @@ describe("setUpFirstInstall", () => {
       "location",
       "staff_notes",
     ]);
+    // The starter mapping (T-050e): every public field as the DCMI term it
+    // names, rights included, made by the new system admin; no staff field.
+    const stored = await readDublinCoreMapping(db, made.organizationId, "item");
+    expect(stored?.version).toBe(1);
+    expect(stored?.mapping).toEqual({
+      template: "item",
+      organizationId: made.organizationId,
+      entries: [
+        { field: "description", term: "description" },
+        { field: "date", term: "date" },
+        { field: "creator", term: "creator" },
+        { field: "subject", term: "subject" },
+        { field: "rights", term: "rights" },
+      ],
+    });
+    expect(ok(validateDublinCoreMapping(stored?.mapping, template)).entries).toHaveLength(5);
+    const [row] = await db.rows<{ changed_by: string }>(
+      sql`SELECT changed_by::text AS changed_by FROM public.dublin_core_mappings`,
+    );
+    expect(row?.changed_by).toBe(made.userId);
   });
 
   it("refuses to run twice and leaves the first setup alone", async () => {
@@ -128,7 +162,13 @@ describe("setUpFirstInstall", () => {
       organizationName: "Another Invented Society",
     });
     expect(again).toMatchObject({ ok: false, issues: [{ code: "already_set_up" }] });
-    expect(await counts(db)).toEqual({ users: 1, organizations: 1, sites: 1, templates: 1 });
+    expect(await counts(db)).toEqual({
+      users: 1,
+      organizations: 1,
+      sites: 1,
+      templates: 1,
+      mappings: 1,
+    });
   });
 
   it("refuses a database that already has a user, or only an organization", async () => {
@@ -168,7 +208,13 @@ describe("setUpFirstInstall", () => {
     ]);
     expect(results.filter((r) => r.ok)).toHaveLength(1);
     expect(results.find((r) => !r.ok)).toMatchObject({ issues: [{ code: "already_set_up" }] });
-    expect(await counts(db)).toEqual({ users: 1, organizations: 1, sites: 1, templates: 1 });
+    expect(await counts(db)).toEqual({
+      users: 1,
+      organizations: 1,
+      sites: 1,
+      templates: 1,
+      mappings: 1,
+    });
   });
 
   it("checks every answer before anything is saved", async () => {
@@ -183,11 +229,23 @@ describe("setUpFirstInstall", () => {
     expect(r.ok).toBe(false);
     const fields = new Set(r.ok ? [] : r.issues.map((i) => i.path[0]));
     expect(fields).toEqual(new Set(["email", "displayName", "password", "organizationName"]));
-    expect(await counts(db)).toEqual({ users: 0, organizations: 0, sites: 0, templates: 0 });
+    expect(await counts(db)).toEqual({
+      users: 0,
+      organizations: 0,
+      sites: 0,
+      templates: 0,
+      mappings: 0,
+    });
     // A bad site name alone is reported too.
     const site = await setUpFirstInstall(db, { ...INPUT, siteName: "" });
     expect(site.ok ? [] : site.issues.map((i) => i.path[0])).toEqual(["siteName"]);
-    expect(await counts(db)).toEqual({ users: 0, organizations: 0, sites: 0, templates: 0 });
+    expect(await counts(db)).toEqual({
+      users: 0,
+      organizations: 0,
+      sites: 0,
+      templates: 0,
+      mappings: 0,
+    });
   });
 
   it("refuses unknown keys, getters and non-objects", async () => {
@@ -228,7 +286,13 @@ describe("setUpFirstInstall", () => {
     Object.defineProperty(getter, "email", { get: () => INPUT.email, enumerable: true });
     const r = await setUpFirstInstall(db, getter);
     expect(r.ok ? [] : r.issues.map((i) => i.path[0])).toEqual(["email"]);
-    expect(await counts(db)).toEqual({ users: 0, organizations: 0, sites: 0, templates: 0 });
+    expect(await counts(db)).toEqual({
+      users: 0,
+      organizations: 0,
+      sites: 0,
+      templates: 0,
+      mappings: 0,
+    });
   });
 
   it("has a starter template that core accepts", () => {
@@ -240,6 +304,12 @@ describe("setUpFirstInstall", () => {
       fields: STARTER_TEMPLATE_FIELDS,
     });
     expect(valid.ok).toBe(true);
+    // Its mapping names only public fields, and maps the rights (D-096).
+    const publicKeys = new Set(
+      STARTER_TEMPLATE_FIELDS.filter((f) => f.visibility === "public").map((f) => f.key),
+    );
+    expect(STARTER_DUBLIN_CORE_ENTRIES.every((e) => publicKeys.has(e.field))).toBe(true);
+    expect(STARTER_DUBLIN_CORE_ENTRIES).toContainEqual({ field: "rights", term: "rights" });
   });
 });
 
@@ -294,7 +364,13 @@ describe("npm run setup", () => {
       expect(run.asked.map((a) => a.secret)).toEqual([false, false, false, false, true, true]);
       const db = openDatabase(testDb.url, { max: 1 });
       try {
-        expect(await counts(db)).toEqual({ users: 1, organizations: 1, sites: 1, templates: 1 });
+        expect(await counts(db)).toEqual({
+          users: 1,
+          organizations: 1,
+          sites: 1,
+          templates: 1,
+          mappings: 1,
+        });
       } finally {
         await db.close();
       }
@@ -346,7 +422,13 @@ describe("npm run setup", () => {
     expect(bad.out).not.toContain(PASSWORD);
     const ended = await runCli({ OCULUS_DATABASE_URL: url }, typed.slice(0, 2));
     expect(ended.code).toBe(2);
-    expect(await counts(db)).toEqual({ users: 0, organizations: 0, sites: 0, templates: 0 });
+    expect(await counts(db)).toEqual({
+      users: 0,
+      organizations: 0,
+      sites: 0,
+      templates: 0,
+      mappings: 0,
+    });
   });
 
   it("refuses a database with someone else's tables, without adding Oculus's", async () => {
