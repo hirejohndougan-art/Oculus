@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 16:00 CT — manual (Chat N) — S-058 Deleting a donor contact checks the agent's home site
+- Result: done
+- What changed: `deleteDonorContact` (service `accessions.ts`) now runs the same home-site check as `saveDonorContact` (`mayName`): `donors.edit` on the agent's own site, not on any site. Attack test: Donor relations on one site can't delete (or save) another site's agent's contact, even with a wrong version; with the role on that site it can.
+- Decisions: none
+- Review: independent review: safe (no hole, no data loss); notes: same behaviour as saving for records filed below the agent and for telling a missing agent from another site's
+- Gate: PASS · tests_passing TBD (was 5214) · npm audit clean
+- Next: none for Chat N; every Phase 2 job is claimed
+
 ## 2026-11-25 15:45 CT — manual (Chat P) — S-062 The server checks its database role at start; updates need the writer role named
 - Result: done
 - What changed: `admin-cli.ts` (`writerConnectionRefusal`; `npm run admin` refuses a superuser, an owner or a writer missing grants before it starts), `update-manager.ts` (`migrations_need_writer_role`, `invalid_writer_role` before any backup or migration), `release-cli.ts` (the role is trimmed; the old "Note" is gone); new `admin-cli-role.test.ts`; tests in `update-manager.test.ts`, `release-cli.test.ts`, `update-api.test.ts`.
