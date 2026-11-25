@@ -1,4 +1,4 @@
-// Serving stored files (M-001, D-088): an active stored type (HTML, SVG,
+// Serving stored files (M-001, D-089): an active stored type (HTML, SVG,
 // XHTML, any XML, scripts, PDF, unknown) is never sent as it is and is only
 // ever a download; only plain images, audio and video may be shown; every
 // file reply has nosniff, a sandboxing CSP and same-origin CORP, and nothing

@@ -1,5 +1,5 @@
 /**
- * Serving stored files safely (M-001, D-088). The only way a handler sends a
+ * Serving stored files safely (M-001, D-089). The only way a handler sends a
  * file's bytes is to return `fileReply(...)`; the server (server.ts) then
  * sends exactly the headers made here, and `FILE_SECURITY_HEADERS` in place
  * of the API's, whatever the handler set with `type()` or `header()`.

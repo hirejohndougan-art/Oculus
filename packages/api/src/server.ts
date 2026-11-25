@@ -59,7 +59,7 @@
  *    (`ADMIN_SECURITY_HEADERS`) in place of the API's; every other reply
  *    keeps `SECURITY_HEADERS`.
  *
- * 11. Files (file-replies.ts, M-001, D-088): a handler sends a stored file's
+ * 11. Files (file-replies.ts, M-001, D-089): a handler sends a stored file's
  *    bytes only by returning `fileReply(...)`, which decides the Content-Type
  *    (never an active stored type), the Content-Disposition and the length;
  *    its reply gets `FILE_SECURITY_HEADERS` (nosniff, a sandboxing CSP,
@@ -254,7 +254,7 @@ function logLateFailure(request: FastifyRequest, fresh: Refusal, thrown: unknown
  * result or failure is never handed to Fastify (which would log the request
  * URL, query string included, and the error object).
  */
-/** Requests answered with a file (M-001, D-088): they get `FILE_SECURITY_HEADERS` in onSend. */
+/** Requests answered with a file (M-001, D-089): they get `FILE_SECURITY_HEADERS` in onSend. */
 const fileReplies = new WeakSet<FastifyRequest>();
 
 function addRoute(app: FastifyInstance, route: OculusRoute): void {
