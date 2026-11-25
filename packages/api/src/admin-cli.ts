@@ -14,6 +14,7 @@
  * (alert-notices.ts). The notices, the mailer's outbox and the server are
  * closed on SIGINT and SIGTERM.
  */
+import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { openDatabase } from "@oculus/db";
 import { buildAdminServer, defaultLog } from "./admin-server.js";
@@ -65,12 +66,26 @@ export async function runAdminCli(
   let notices: AlertNoticeRunner | undefined;
   try {
     mailer = mailerFromEnv(env, { log: defaultLog });
+    // After an update with OCULUS_UPDATE_RESTART=exit (T-060, D-092): stop
+    // cleanly so the host's process manager starts the new version.
+    let restarting = false;
+    const restart = (): void => {
+      if (restarting) return;
+      restarting = true;
+      void app
+        .close()
+        .then(() => notices?.stop())
+        .then(() => mailer?.close())
+        .then(closePools)
+        .finally(() => process.exit(0));
+    };
     const app = await buildAdminServer({
       db,
       env,
       logger: true,
       mailer,
       log: defaultLog,
+      requestRestart: restart,
       ...(publicDb === undefined ? {} : { publicDb }),
     });
     // "Someone is guessing your two-step codes" (D-077, D-085), every minute.
@@ -102,7 +117,12 @@ export async function runAdminCli(
   }
 }
 
-if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Through a link too: the host starts `<updates folder>/current/…` (T-060), and
+// Node gives this module its real path.
+if (
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href
+) {
   const code = await runAdminCli(process.env, (line) => {
     console.error(line);
   });

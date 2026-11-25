@@ -113,6 +113,7 @@ import { Refusal } from "./errors.js";
 import { fileReply } from "./file-replies.js";
 import type { OculusReply, OculusRequest, OculusRoute } from "./routes.js";
 import { peopleApiRoutes, type PeopleApiOptions } from "./people-api.js";
+import { updateApiRoutes, type UpdateApiOptions } from "./update-api.js";
 import { DEFAULT_RATE_LIMITS, SessionRateLimiter, type RateBucket } from "./rate-limit.js";
 
 /** A fixed-shape log record: never an error object, a token, a body or a query. */
@@ -135,7 +136,9 @@ export interface ApiLogRecord {
     | "mail_dropped"
     | "mail_dev"
     // The two-step alert notices (alert-notices.ts): people notified, as `code`.
-    | "alert_notices";
+    | "alert_notices"
+    // Software updates (T-060): the step in `operation`, a version in `code`.
+    | "update_event";
   readonly operation?: string;
   readonly code?: string;
   readonly name?: string;
@@ -160,6 +163,8 @@ export interface StaffApiOptions {
   readonly files?: FileStore;
   /** People, roles and the audit trail (T-048, people-api.ts); left out, those routes aren't served. */
   readonly people?: PeopleApiOptions;
+  /** Software updates (T-060, update-api.ts); left out, those routes aren't served. */
+  readonly updates?: UpdateApiOptions;
 }
 
 /** The headers carrying an upload's original name (percent-encoded UTF-8) and claimed type. */
@@ -1020,6 +1025,9 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
     ...(options.people === undefined
       ? []
       : peopleApiRoutes(options.people, { service, log, signedIn })),
+    ...(options.updates === undefined
+      ? []
+      : updateApiRoutes(options.updates, { service, log, signedIn })),
     {
       method: "GET",
       path: "/api/templates",

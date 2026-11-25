@@ -77,6 +77,7 @@ import {
   staffApiRoutes,
   type ApiLogRecord,
 } from "./staff-api.js";
+import { updateManagerFromEnv, type UpdateManager } from "./update-manager.js";
 
 export { isProduction };
 
@@ -203,6 +204,14 @@ export interface AdminServerOptions {
   readonly extraRoutes?: readonly OculusRoute[];
   /** Passed on to the sign-in routes (tests). */
   readonly signIn?: Pick<SignInApiOptions, "rateLimits" | "clock" | "resetOptions">;
+  /**
+   * Software updates (T-060, D-092). Default: built from `OCULUS_UPDATE_DIR`
+   * and the other `OCULUS_UPDATE_*` variables (none set: the screen says how
+   * to set it up). `null` turns the routes off (tests).
+   */
+  readonly updates?: UpdateManager | null;
+  /** Asked for after an install or rollback when `OCULUS_UPDATE_RESTART=exit` (admin-cli.ts). */
+  readonly requestRestart?: () => void;
 }
 
 /** The default log: one JSON line on standard error. */
@@ -297,6 +306,24 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     log({ event: "startup_warning", code: "database_unreadable" });
   }
 
+  // D-092: a malformed update setting stops the start, naming the variable only.
+  const updates =
+    options.updates === null
+      ? null
+      : (options.updates ??
+        updateManagerFromEnv(env, {
+          ...(options.requestRestart === undefined
+            ? {}
+            : { requestRestart: options.requestRestart }),
+          log: (event, fields) => {
+            log({
+              event: "update_event",
+              operation: event,
+              ...(fields.version === undefined ? {} : { code: fields.version }),
+            });
+          },
+        }));
+
   const files = await fileStoreFromEnv(env);
   // Thumbnails (M-003, D-097): one worker, stopped with the server.
   const thumbnails = createThumbnailRenderer();
@@ -318,6 +345,7 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
         ...(deliverInvitation === undefined ? {} : { deliverInvitation }),
         ...(deliverEnrolment === undefined ? {} : { deliverEnrolment }),
       },
+      ...(updates === null ? {} : { updates: { manager: updates } }),
     }),
     ...signInRoutes({
       db: options.db,

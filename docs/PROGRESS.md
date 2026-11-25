@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 22:45 CT — manual (Chat F) — T-060 Updates from an uploaded package
+- Result: done
+- What changed: a strict ZIP reader and writer, signed packages (Ed25519 over a manifest of every file's SHA-256), `npm run release` (keygen, pack, verify, first install), an updates folder with releases, `current`, backups and history, staff API routes under `/api/system/update` (system managers; install and rollback need a fresh entry), and the admin's Updates screen with chunked upload and progress. Tried end to end in the sandbox: a 6.5 MB, 4,003-file package of this build installed into an empty folder, migrated a fresh database and started from `current`.
+- Decisions: D-092
+- Review: one independent round. Two blocking findings fixed: migrations ran with the app's writer URL (now an owner URL given only to the backup, migrate and new grant steps, which re-grants the writer after migrating; without it, database-changing updates are refused from the admin) and the release scripts did nothing when the updates folder's path held a link (now started by real paths). Also fixed: an atomic lock file removed only by its holder, one part written at a time, the screen retrying parts when rate-limited, failed steps' output kept in `logs/`, leftovers and old backups removed, no local extra fields, the writer's entry limit, bookkeeping after the switch no longer reported as a failure.
+- Gate: PASS (full gate, end-to-end included, after the review fixes) · tests_passing 4580 (was 4420) · npm audit clean
+- Next: T-060a filed (the change log); T-051 notes added for SiteGround. Renumbered twice: T-056/D-088 went to the desktop launcher and T-058 to IIIF while this was built.
+
 ## 2026-11-25 00:40 CT — manual (Chat C) — T-050b Stored Dublin Core mappings
 - Result: done (the old T-050b split into T-050b, T-050d and T-050e)
 - What changed: migration 0022 (`dublin_core_mappings`, `public_dublin_core_mapping`); `packages/db/src/dublin-core-mappings.ts`; `readPublicRecord` uses the stored mapping when none is passed; service `readDublinCoreMapping`/`saveDublinCoreMapping`; `GET`/`PUT /api/templates/:key/dublin-core`.
