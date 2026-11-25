@@ -158,7 +158,7 @@ describe("file replies over HTTP", () => {
 
   it("streams a file, and cuts off a stream longer or shorter than its size", async () => {
     const ok = await serve(() => ({
-      body: Readable.from([PNG.subarray(0, 4), PNG.subarray(4)]),
+      body: () => Readable.from([PNG.subarray(0, 4), PNG.subarray(4)]),
       size: PNG.byteLength,
       mediaType: "image/png",
       fileName: "p.png",
@@ -169,7 +169,7 @@ describe("file replies over HTTP", () => {
       let received: number | undefined;
       try {
         const r = await serve(() => ({
-          body: Readable.from([PNG]),
+          body: () => Readable.from([PNG]),
           size,
           mediaType: "image/png",
           fileName: "p.png",
@@ -282,6 +282,11 @@ describe("file names in Content-Disposition", () => {
     expect(long.endsWith(".html")).toBe(true);
     expect(Array.from(long)).toHaveLength(MAX_FILE_NAME_LENGTH);
     expect(safeFileName("a\tb")).toBe("a b");
+    expect(safeFileName("c\uFEFFd")).toBe("cd");
+    expect(Array.from(safeFileName(`con.${"x".repeat(200)}`)).length).toBeLessThanOrEqual(
+      MAX_FILE_NAME_LENGTH,
+    );
+    expect(safeFileName("CONIN$")).toBe("_CONIN$");
     expect(safeFileName("CON")).toBe("_CON");
     expect(safeFileName("nul.txt")).toBe("_nul.txt");
     expect(safeFileName("console.txt")).toBe("console.txt");
@@ -375,7 +380,7 @@ function fetchOver(
 
 async function listening(
   handler: OculusRoute["handler"],
-  timeouts?: { handler: number },
+  timeouts?: { handler?: number; download?: number },
 ): Promise<number> {
   ({ app } = await testServer(timeouts === undefined ? {} : { timeouts }, [
     { method: "GET", path: "/stream", handler },
@@ -403,12 +408,12 @@ describe("streamed file replies over real HTTP", () => {
     process.on("uncaughtException", onUncaught);
   };
 
-  it("survives a storage error, even with work between fileReply and return", async () => {
+  it("answers a file that can't be read with the ordinary 500, and closes it", async () => {
     watch();
     const source = new Source(100_000, { failAt: 0 });
     const port = await listening(async () => {
       const reply = fileReply({
-        body: source,
+        body: () => source,
         size: 100_000,
         mediaType: "image/png",
         fileName: "p",
@@ -417,9 +422,80 @@ describe("streamed file replies over real HTTP", () => {
       return reply;
     });
     const r = await fetchOver(port, "GET", "/stream");
-    expect(r.complete).toBe(false);
-    expect(r.bytes).toBe(0);
+    expect(r.status).toBe(500);
+    expect(r.complete).toBe(true);
+    expect(r.headers["content-security-policy"]).toBe(SECURITY_HEADERS["content-security-policy"]);
+    expect(r.headers["content-disposition"]).toBeUndefined();
     await until(() => source.destroyed);
+    expect(source.destroyed).toBe(true);
+    // The connection is still good for the next request.
+    expect((await fetchOver(port, "GET", "/health")).status).toBe(200);
+  });
+
+  it("answers an opener that throws with the ordinary 500", async () => {
+    watch();
+    const port = await listening(() =>
+      fileReply({
+        body: () => {
+          throw new Error("ENOENT");
+        },
+        size: 10,
+        mediaType: "image/png",
+        fileName: "p",
+      }),
+    );
+    const r = await fetchOver(port, "GET", "/stream");
+    expect(r.status).toBe(500);
+  });
+
+  it("opens nothing when the handler throws after making a file reply", async () => {
+    watch();
+    let opened = 0;
+    const port = await listening(async () => {
+      fileReply({
+        body: () => {
+          opened++;
+          return new Source(10);
+        },
+        size: 10,
+        mediaType: "image/png",
+        fileName: "p",
+      });
+      await new Promise((r) => setTimeout(r, 10));
+      throw new Error("the audit write failed");
+    });
+    for (let i = 0; i < 5; i++) expect((await fetchOver(port, "GET", "/stream")).status).toBe(500);
+    expect(opened).toBe(0);
+  });
+
+  it("cuts a download off at the download deadline", async () => {
+    watch();
+    const source = new Source(10_000_000, { chunk: 1024, delayMs: 20 });
+    const port = await listening(
+      () =>
+        fileReply({ body: () => source, size: 10_000_000, mediaType: "image/png", fileName: "p" }),
+      { download: 300 },
+    );
+    const started = Date.now();
+    const r = await fetchOver(port, "GET", "/stream");
+    expect(r.complete).toBe(false);
+    expect(Date.now() - started).toBeLessThan(3000);
+    await until(() => source.destroyed);
+    expect(source.destroyed).toBe(true);
+  });
+
+  it("stops downloads in flight when the server closes", async () => {
+    watch();
+    const source = new Source(10_000_000, { chunk: 1024, delayMs: 20 });
+    const port = await listening(() =>
+      fileReply({ body: () => source, size: 10_000_000, mediaType: "image/png", fileName: "p" }),
+    );
+    const fetching = fetchOver(port, "GET", "/stream");
+    await until(() => source.sent > 0);
+    const started = Date.now();
+    await stop();
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect((await fetching).complete).toBe(false);
     expect(source.destroyed).toBe(true);
   });
 
@@ -429,7 +505,7 @@ describe("streamed file replies over real HTTP", () => {
     const port = await listening(
       () =>
         fileReply({
-          body: new Source(total, { chunk: 4096, delayMs: 50 }),
+          body: () => new Source(total, { chunk: 4096, delayMs: 50 }),
           size: total,
           mediaType: "video/mp4",
           fileName: "v.mp4",
@@ -449,7 +525,12 @@ describe("streamed file replies over real HTTP", () => {
     watch();
     const source = new Source(50_000_000, { chunk: 65_536 });
     const port = await listening(() =>
-      fileReply({ body: source, size: 50_000_000, mediaType: "image/png", fileName: "big.png" }),
+      fileReply({
+        body: () => source,
+        size: 50_000_000,
+        mediaType: "image/png",
+        fileName: "big.png",
+      }),
     );
     const r = await fetchOver(port, "GET", "/stream", 100_000);
     expect(r.complete).toBe(false);
@@ -466,7 +547,7 @@ describe("streamed file replies over real HTTP", () => {
     ] as const) {
       const source = new Source(total);
       const port = await listening(() =>
-        fileReply({ body: source, size, mediaType: "image/png", fileName: "p.png" }),
+        fileReply({ body: () => source, size, mediaType: "image/png", fileName: "p.png" }),
       );
       const r = await fetchOver(port, "GET", "/stream");
       expect(r.complete).toBe(false);
@@ -481,30 +562,42 @@ describe("streamed file replies over real HTTP", () => {
     watch();
     const source = new Source(131_000_000);
     const port = await listening(() =>
-      fileReply({ body: source, size: 131_000_000, mediaType: "image/png", fileName: "p.png" }),
+      fileReply({
+        body: () => source,
+        size: 131_000_000,
+        mediaType: "image/png",
+        fileName: "p.png",
+      }),
     );
     const r = await fetchOver(port, "HEAD", "/stream");
     expect(r.status).toBe(200);
     expect(r.headers["content-length"]).toBe("131000000");
     expect(r.headers["content-security-policy"]).toBe(FILE_CSP);
     expect(source.sent).toBe(0);
-    expect(source.destroyed).toBe(true);
+    expect(source.reads).toBe(0); // never even opened
   });
 
-  it("destroys a file reply that comes back after the handler timeout", async () => {
+  it("opens nothing for a file reply that comes back after the handler timeout", async () => {
     watch();
-    const source = new Source(100_000);
+    let opened = 0;
     const port = await listening(
       async () => {
         await new Promise((r) => setTimeout(r, 400));
-        return fileReply({ body: source, size: 100_000, mediaType: "image/png", fileName: "p" });
+        return fileReply({
+          body: () => {
+            opened++;
+            return new Source(100_000);
+          },
+          size: 100_000,
+          mediaType: "image/png",
+          fileName: "p",
+        });
       },
       { handler: 100 },
     );
     const r = await fetchOver(port, "GET", "/stream");
     expect(r.status).toBe(503);
-    await until(() => source.destroyed);
-    expect(source.destroyed).toBe(true);
-    expect(source.sent).toBe(0);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(opened).toBe(0);
   });
 });

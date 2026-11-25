@@ -24,10 +24,13 @@
  * - **The length** is fixed: `size` must match the bytes given, and a
  *   stream that runs long or short is cut off with an error, so a reply can
  *   never send more than its Content-Length says.
- * - **Streams** are read only when the reply goes out (`sendFileStream`),
- *   outside the handler timeout, through `pipeline`, so a storage error, a
- *   wrong length or a client that goes away closes the source; HEAD reads
- *   nothing; a reply that is never sent is destroyed (`discardFileReply`).
+ * - **Streams** are opened only when the reply goes out (`sendFileStream`),
+ *   so a reply that is never sent (the handler threw later, the request
+ *   ended) opens nothing; then sent outside the handler timeout, through
+ *   `pipeline`, within a deadline, so a storage error, a wrong length, a
+ *   client that goes away or the server closing closes the source. A file
+ *   that can't be read before its first byte is the ordinary 500. HEAD
+ *   opens nothing.
  *
  * Where files are served from (an origin of their own, apart from the public
  * sites) is T-050's; ranges and caching are M-003's or later.
@@ -79,8 +82,12 @@ export const MAX_FILE_NAME_LENGTH = 150;
 export const MAX_FILE_REPLY_SIZE = 2 ** 40;
 
 export interface FileReplyInput {
-  /** The bytes, or a stream of them (M-003 opens it from storage). */
-  readonly body: Uint8Array | Readable;
+  /**
+   * The bytes, or a function that opens a stream of them (M-003 opens the
+   * file from storage). It is called only when the reply goes out, so
+   * nothing is opened for a reply that is never sent.
+   */
+  readonly body: Uint8Array | (() => Readable);
   /** The exact number of bytes. */
   readonly size: number;
   /** The stored (sniffed) media type: only decides inline or download. */
@@ -94,7 +101,7 @@ export interface FileReplyInput {
 /** A file reply: made only by `fileReply`, sent only by the server. */
 export interface FileReply {
   readonly headers: Readonly<Record<string, string>>;
-  readonly body: Uint8Array | Readable;
+  readonly body: Uint8Array | (() => Readable);
 }
 
 const made = new WeakSet<object>();
@@ -128,11 +135,16 @@ export function mayShowInline(mediaType: unknown): boolean {
 export function safeFileName(name: unknown): string {
   const text = typeof name === "string" ? name.normalize("NFC") : "";
   let cleaned = text
+    .replace(/[\p{Cf}]/gu, "") // format characters (bidi, zero-width, U+FEFF) go first
     .replace(/\s+/gu, " ")
-    .replace(/[\p{Cc}\p{Cf}\p{Co}\p{Cs}\p{Zl}\p{Zp}]/gu, "")
+    .replace(/[\p{Cc}\p{Co}\p{Cs}\p{Zl}\p{Zp}]/gu, "")
     .replace(/[/\\"*:<>?|]/g, "_")
     .replace(/^[\s.]+/u, "")
     .replace(/[\s.]+$/u, "");
+  // Windows device names (CON, nul.txt, COM1, CONIN$ …) can't be saved as they are.
+  if (/^(?:con|prn|aux|nul|conin\$|conout\$|com[0-9¹²³]|lpt[0-9¹²³])(?:\.|$)/iu.test(cleaned)) {
+    cleaned = `_${cleaned}`;
+  }
   const chars = Array.from(cleaned);
   if (chars.length > MAX_FILE_NAME_LENGTH) {
     // Keep a short extension (`.tiff`, `.html`) and cut the stem instead.
@@ -145,8 +157,6 @@ export function safeFileName(name: unknown): string {
         .join("")
         .replace(/[\s.]+$/u, "") + keep.join("");
   }
-  // Windows device names (CON, nul.txt, COM1 …) can't be saved as they are.
-  if (/^(?:con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\.|$)/iu.test(cleaned)) cleaned = `_${cleaned}`;
   return cleaned === "" ? "file" : cleaned;
 }
 
@@ -163,10 +173,6 @@ export function contentDisposition(disposition: "inline" | "attachment", name: u
   const safe = safeFileName(name);
   const ascii = safe.replace(/[^A-Za-z0-9 ._()+,=@[\]{}~!#$&^-]/gu, "_");
   return `${disposition}; filename="${ascii}"; filename*=UTF-8''${extValue(safe)}`;
-}
-
-function ignore(): void {
-  // The stream's errors are handled where it is piped (sendFileStream).
 }
 
 /** Cuts a stream off with an error if it gives more or fewer than `size` bytes. */
@@ -207,18 +213,14 @@ export function fileReply(input: FileReplyInput): FileReply {
   if (!Number.isSafeInteger(size) || size < 0 || size > MAX_FILE_REPLY_SIZE) {
     throw new Error("a file's size must be a whole number of bytes");
   }
-  let sent: Uint8Array | Readable;
+  let sent: Uint8Array | (() => Readable);
   if (body instanceof Uint8Array) {
     if (body.byteLength !== size) throw new Error("the file's bytes don't match its size");
     sent = Buffer.from(body.buffer, body.byteOffset, body.byteLength);
-  } else if (body instanceof Readable) {
-    // Not read yet: the server pipes it (`sendFileStream`) only once the
-    // reply goes out, and destroys it if it never does. Until then an error
-    // from storage must not become an uncaught exception.
-    body.on("error", ignore);
+  } else if (typeof body === "function") {
     sent = body;
   } else {
-    throw new Error("a file's body must be bytes or a readable stream");
+    throw new Error("a file's body must be bytes or a function that opens a stream");
   }
   const inline = asked === "inline" && mayShowInline(mediaType);
   const headers = Object.freeze({
@@ -231,42 +233,113 @@ export function fileReply(input: FileReplyInput): FileReply {
   return reply;
 }
 
+/** Why a streamed file reply stopped: `client` (the client went away) isn't a fault. */
+export type FileStreamEnd = "done" | "client" | "storage" | "length" | "deadline" | "closing";
+
+/** The longest a streamed download may run (2 hours); `SERVER_TIMEOUTS.download`. */
+export const MAX_DOWNLOAD_MS = 7_200_000;
+
+const ERROR_BODY = '{"error":"internal_error"}';
+
 /**
  * Sends a streamed file reply on the raw response (server.ts, after
- * `reply.hijack()`): the status, `headers` and the stream through
- * `ExactLength`, with `pipeline`, so an error anywhere, a stream of the wrong
- * length or the client going away destroys the source and the response
- * together (no open file left behind, never more than Content-Length sent).
- * A HEAD request gets the headers and nothing is read. Calls `failed` once
- * if the transfer breaks. Hijacked, the reply is outside the handler
- * timeout, so a long download isn't cut at 30 seconds.
+ * `reply.hijack()`), outside the handler timeout:
+ *
+ * - HEAD: the headers only; nothing is opened.
+ * - GET: opens the stream, and waits for its first bytes (or its end) before
+ *   writing the headers, so a file that can't be read is the ordinary
+ *   `500 {"error":"internal_error"}` with `errorHeaders`, not a dropped
+ *   connection. Then `pipeline(source, ExactLength, response)`: a storage
+ *   error, a stream of the wrong length or the client going away destroys
+ *   the source and the response together (never more than Content-Length).
+ * - The whole download must end within `deadlineMs`, and `stop()` (the
+ *   server closing) ends it at once.
+ *
+ * `ended` is called once with why it stopped.
  */
 export function sendFileStream(
   response: ServerResponse,
   method: string,
   headers: Readonly<Record<string, string>>,
+  errorHeaders: Readonly<Record<string, string>>,
   file: FileReply,
-  failed: () => void,
-): void {
-  const source = file.body;
-  if (!(source instanceof Readable)) throw new Error("sendFileStream sends streams only");
-  response.writeHead(200, headers);
+  deadlineMs: number,
+  ended: (why: FileStreamEnd) => void,
+): { stop: () => void } {
+  const open = file.body;
+  if (typeof open !== "function") throw new Error("sendFileStream sends streams only");
   if (method === "HEAD") {
-    source.destroy();
+    response.writeHead(200, headers);
     response.end();
-    return;
+    ended("done");
+    return { stop: () => undefined };
   }
-  const size = Number(file.headers["content-length"]);
-  pipeline(source, new ExactLength(size), response, (error) => {
-    if (error) {
-      source.destroy();
-      response.destroy();
-      failed();
+  let source: Readable | undefined;
+  let finished = false;
+  const finish = (why: FileStreamEnd): void => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timer);
+    source?.destroy();
+    if (why !== "done") response.destroy();
+    ended(why);
+  };
+  const failBeforeStart = (): void => {
+    if (finished) return;
+    if (response.headersSent || response.destroyed) {
+      finish("storage");
+      return;
     }
+    response.writeHead(500, {
+      ...errorHeaders,
+      "content-type": "application/json; charset=utf-8",
+      "content-length": String(Buffer.byteLength(ERROR_BODY)),
+    });
+    response.end(ERROR_BODY);
+    finished = true;
+    clearTimeout(timer);
+    source?.destroy();
+    ended("storage");
+  };
+  const timer = setTimeout(() => {
+    finish("deadline");
+  }, deadlineMs);
+  response.once("close", () => {
+    if (!response.writableFinished) finish("client");
   });
-}
-
-/** Lets go of a file reply that will never be sent (the request ended first). */
-export function discardFileReply(file: FileReply): void {
-  if (file.body instanceof Readable) file.body.destroy();
+  try {
+    source = open();
+    if (!(source instanceof Readable)) throw new Error("the opener must return a readable stream");
+  } catch {
+    failBeforeStart();
+    return { stop: () => undefined };
+  }
+  const opened = source;
+  const onEarlyError = (): void => {
+    failBeforeStart();
+  };
+  opened.once("error", onEarlyError);
+  opened.once("readable", () => {
+    if (finished) return;
+    opened.removeListener("error", onEarlyError);
+    response.writeHead(200, headers);
+    const size = Number(file.headers["content-length"]);
+    const exact = new ExactLength(size);
+    let lengthWrong = false;
+    exact.once("error", () => {
+      lengthWrong = true;
+    });
+    pipeline(opened, exact, response, (error) => {
+      if (!error) {
+        finish("done");
+        return;
+      }
+      finish(lengthWrong ? "length" : response.destroyed && !opened.errored ? "client" : "storage");
+    });
+  });
+  return {
+    stop: () => {
+      finish("closing");
+    },
+  };
 }
