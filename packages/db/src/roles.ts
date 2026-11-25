@@ -18,6 +18,7 @@
  * never revokes what a role already holds, and `checkWriterConnection`
  * refuses a role holding anything more.
  */
+import { SHARE_TABLE_PRIVILEGES } from "./shares.js";
 import { ACCOUNT_TABLE_PRIVILEGES } from "./accounts.js";
 import { PEOPLE_TABLE_PRIVILEGES } from "./people.js";
 import { PERMISSION_TABLE_PRIVILEGES } from "./permissions.js";
@@ -45,6 +46,8 @@ export const WRITER_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Ob
   organizations: ["INSERT", "UPDATE"],
   templates: ["INSERT"],
   template_versions: ["INSERT"],
+  // T-050b (D-096): one current mapping per template, replaced in place.
+  dublin_core_mappings: ["INSERT", "UPDATE"],
   record_types: ["INSERT"],
   record_type_versions: ["INSERT"],
   records: ["INSERT", "UPDATE", "DELETE"],
@@ -84,6 +87,9 @@ export const WRITER_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Ob
   ...PEOPLE_TABLE_PRIVILEGES,
   // Two-step alert notices (D-085): one row per alert, only ever added.
   ...ALERT_NOTICE_TABLE_PRIVILEGES,
+  // Shares between sites (T-041b, D-094): offered, then moved along their
+  // life; never deleted by the writer (rows go with their record).
+  ...SHARE_TABLE_PRIVILEGES,
 });
 
 /**
@@ -530,10 +536,13 @@ async function checkRoleConnection(
 
 /**
  * The functions the public sites read through, with their argument types:
- * `public_record_snapshot` (0017), the only way `readPublicRecord` reads.
+ * `public_record_snapshot` (0017) and `public_dublin_core_mapping` (0022,
+ * D-096), the only ways `readPublicRecord` reads.
  */
 export const PUBLIC_READER_FUNCTIONS: readonly string[] = Object.freeze([
   "public.public_record_snapshot(uuid, uuid, uuid)",
+  // T-050b (D-096): a public record's stored Dublin Core mapping.
+  "public.public_dublin_core_mapping(uuid, uuid, uuid)",
 ]);
 
 /**
