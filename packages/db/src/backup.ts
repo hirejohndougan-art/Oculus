@@ -295,13 +295,6 @@ export async function writeAll(stream: Writable, chunk: Buffer): Promise<void> {
 }
 
 /**
- * Runs a tool under the watchdog. Aborting `signal` sends SIGTERM to the
- * tool's whole process group, and SIGKILL after a grace period. If the
- * watchdog itself dies by a signal, the group is killed at once, so the
- * tool can't keep the pipes open. While it runs, the group is registered for
- * the synchronous clean-up on exit (backup-cleanup.ts).
- */
-/**
  * How tools are run: under the POSIX watchdog (above), or directly, where
  * there is no `sh` or process group (Windows; S-034b, D-102). Run directly,
  * a tool's input is its stdin, stopping it terminates it (Windows has no
@@ -316,6 +309,13 @@ export function defaultToolRunner(platform: NodeJS.Platform = process.platform):
   return platform === "win32" ? "direct" : "watchdog";
 }
 
+/**
+ * Runs a tool under the watchdog. Aborting `signal` sends SIGTERM to the
+ * tool's whole process group, and SIGKILL after a grace period. If the
+ * watchdog itself dies by a signal, the group is killed at once, so the
+ * tool can't keep the pipes open. While it runs, the group is registered for
+ * the synchronous clean-up on exit (backup-cleanup.ts).
+ */
 async function runTool(
   cmd: string,
   args: string[],

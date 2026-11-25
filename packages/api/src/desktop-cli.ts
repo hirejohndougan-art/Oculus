@@ -32,7 +32,6 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   backup,
-  BackupError,
   checkWriterConnection,
   defaultMigrationsDir,
   pendingMigrations,
@@ -193,14 +192,21 @@ async function backupBeforeUpdate(
   out: Line,
   err: Line,
 ): Promise<boolean> {
-  let pending: number;
+  let applied: AppliedMigration[];
   try {
-    const applied = await db.rows<AppliedMigration>(
+    applied = await db.rows<AppliedMigration>(
       sql`SELECT name, sha256 FROM public.oculus_migrations ORDER BY name`,
     );
+  } catch {
+    // Fail closed: without the list, an update might run with no backup.
+    err("Couldn't read the database's list of changes, so nothing was changed. Try again.");
+    return false;
+  }
+  let pending: number;
+  try {
     pending = pendingMigrations(await readMigrations(defaultMigrationsDir()), applied).length;
   } catch {
-    // migrate() reports what's wrong with the migrations itself.
+    // migrate() refuses the same way, before changing anything, and says why.
     return true;
   }
   if (pending === 0) return true;
@@ -208,14 +214,33 @@ async function backupBeforeUpdate(
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const file = join(dir, `before-update-${stamp}.oculus-backup`);
   out(`This update changes Oculus's database (${String(pending)} change(s)). Backing it up first…`);
+  // Ctrl+C or closing the console stops the backup cleanly (no partial file,
+  // no private folder left behind); nothing is migrated then.
+  const stop = new AbortController();
+  const signals = ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"] as const;
+  const onSignal = (): void => {
+    stop.abort();
+  };
+  for (const signal of signals) process.on(signal, onSignal);
   try {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    await backup({ connectionString, file, env: { ...env } });
+    await backup({
+      connectionString,
+      file,
+      env: { ...env },
+      signal: stop.signal,
+      log: (line) => {
+        if (/warn|could not|couldn't/i.test(line)) out(line);
+      },
+    });
   } catch (error) {
+    const reason = error instanceof Error && error.message !== "" ? `: ${error.message}` : ".";
     err(
-      `Couldn't back up the database before updating it${error instanceof BackupError ? `: ${error.message}` : "."} Nothing was changed. To update without a backup, add "backupBeforeUpdate": false to desktop.json.`,
+      `Couldn't back up the database before updating it${reason} Nothing was changed. To update without a backup, add "backupBeforeUpdate": false to desktop.json (or, if the PostgreSQL tools are somewhere unusual, set PG_BIN to their folder).`,
     );
     return false;
+  } finally {
+    for (const signal of signals) process.off(signal, onSignal);
   }
   out(`Backup saved: ${file}`);
   return true;
