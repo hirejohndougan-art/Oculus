@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 16:05 CT — manual (Chat M) — T-075 Accept an invitation
+- Result: done
+- What changed: `sign-in-api.ts` (`POST /api/invitation/accept`: the token from the link, the invitee's address, a name and a password; the account is made and signed in, so the next screen is two-step set-up; `POST /api/invitation/accept-signed-in` for someone who already has an account, user from the session only); `accounts.ts` (`acceptInvitation` and `acceptInvitationForUser` take the organization from the invitation when it is left out); the admin's `/invitation` screen (`AcceptInvitation.tsx`), which reads the token from the fragment once. Tests: `invitation-api.test.ts` (one reply for every unusable link, `account_exists` only for a complete form, Origin, CSRF, session and per-address rules, no token or address in logs) and `AcceptInvitation.test.tsx`.
+- Decisions: D-068 amended
+- Review: one independent review: nothing unsafe. Fixed: a typo in the address now keeps the form instead of a dead-link page; after a server failure the screen says the account may already be made; the cookie is written only after the waiting session's state is read; thrown account errors are logged as class and SQLSTATE and answered 503; the secrecy test checks tokens too.
+- Gate: PASS · tests_passing 5233 (was 5214) · npm audit clean
+- Next: none for Chat M (every Phase 2 job is taken)
+
 ## 2026-11-25 15:45 CT — manual (Chat P) — S-062 The server checks its database role at start; updates need the writer role named
 - Result: done
 - What changed: `admin-cli.ts` (`writerConnectionRefusal`; `npm run admin` refuses a superuser, an owner or a writer missing grants before it starts), `update-manager.ts` (`migrations_need_writer_role`, `invalid_writer_role` before any backup or migration), `release-cli.ts` (the role is trimmed; the old "Note" is gone); new `admin-cli-role.test.ts`; tests in `update-manager.test.ts`, `release-cli.test.ts`, `update-api.test.ts`.
