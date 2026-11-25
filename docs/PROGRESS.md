@@ -7,7 +7,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - What changed: System settings for system managers (sidebar "System" group, `/settings`): Sites (list, add, rename), Templates (list and a field editor through the existing template PUT with its confirmations), Sign-in rules. API: `POST /api/sites`, `PUT /api/sites/:id`, `GET`/`PUT /api/system-settings`, each change behind a recent sign-in answered with T-048's re-entry form. HTTP, screen and e2e tests (Alfa on each settings screen).
 - Decisions: D-087
 - Review: one independent round, nothing blocking; fixed confirmations arriving published-records-first (the first answer is now kept) and two wordings; S-031 filed (huge If-Match versions answer 422).
-- Gate: see the merge commit · npm audit clean
+- Gate: PASS · tests_passing 4224 (was 4193) · npm audit clean
 - Next: M-001
 
 ## 2026-11-24 19:57 CT — manual (Chat A) — T-048 Admin: people, roles and the audit trail
