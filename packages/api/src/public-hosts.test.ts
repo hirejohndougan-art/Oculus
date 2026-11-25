@@ -169,6 +169,8 @@ describe("the API on the admin's host only", () => {
         headers: { host: "127.0.0.1" },
       });
       expect([other.statusCode, other.json()]).toEqual([404, { error: "not_found" }]);
+      // An http admin origin (the desktop, development) gets no HSTS (S-060a).
+      expect(ok.headers["strict-transport-security"]).toBeUndefined();
     } finally {
       await local.close();
     }
@@ -208,6 +210,29 @@ describe("the API on the admin's host only", () => {
       expect([ok.statusCode, ok.json()]).toEqual([200, { thing: true }]);
       const away = await via("archive.example.org");
       expect([away.statusCode, away.json()]).toEqual([404, { error: "not_found" }]);
+      // HSTS on the https admin origin only (S-060a): its API, its files and
+      // its refusals; never on a public site's host.
+      expect(ok.headers["strict-transport-security"]).toBe("max-age=31536000");
+      expect(away.headers["strict-transport-security"]).toBeUndefined();
+      for (const url of ["/", "/no-such-path", "/api/no-such-route"]) {
+        const page = await proxied.inject({
+          method: "GET",
+          url,
+          remoteAddress: "127.0.0.1",
+          headers: {
+            host: "127.0.0.1",
+            "x-forwarded-host": "admin.example.org",
+            "x-forwarded-proto": "https",
+          },
+        });
+        expect([url, page.headers["strict-transport-security"]]).toEqual([
+          url,
+          "max-age=31536000",
+        ]);
+      }
+      // Without a trusted proxy the request is plain http: no HSTS.
+      const direct = await on("admin.example.org", "GET", "/api/thing");
+      expect(direct.headers["strict-transport-security"]).toBeUndefined();
     } finally {
       await proxied.close();
     }

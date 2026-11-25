@@ -65,7 +65,9 @@
  *    is given: `GET`/`HEAD` on the admin's own origin only, answered from
  *    files read into memory at startup, with the admin's own CSP
  *    (`ADMIN_SECURITY_HEADERS`) in place of the API's; every other reply
- *    keeps `SECURITY_HEADERS`.
+ *    keeps `SECURITY_HEADERS`. When the admin's origin is https, every
+ *    reply on it also carries `Strict-Transport-Security` (`ADMIN_HSTS`,
+ *    S-060a).
  * 12. Hosts (T-050a, D-090), when `options.admin` is given: every `/api`
  *    path is answered only on the admin's own origin; on any other host (a
  *    public site's, an unlisted one) it is `404 not_found`, the reply an
@@ -327,6 +329,16 @@ function logLateFailure(request: FastifyRequest, fresh: Refusal, thrown: unknown
     // A logger that fails can't change the reply, which is already sent.
   }
 }
+
+/**
+ * `Strict-Transport-Security` for the admin's https origin (S-060a, the Phase
+ * 2 security review's L3): a year, this host only. The `__Host-` session
+ * cookie is Secure already; this stops a first visit over http, or a
+ * stripped redirect, from serving a forged admin page. No `includeSubDomains`
+ * or `preload`: the admin's host may share a domain with sites Oculus
+ * doesn't run. A public site's host is the proxy's to set (T-051's deployment notes).
+ */
+export const ADMIN_HSTS = "max-age=31536000";
 
 /** Requests answered with a file (M-001, D-089): they get `FILE_SECURITY_HEADERS` in onSend. */
 const fileReplies = new WeakSet<FastifyRequest>();
@@ -719,6 +731,12 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
     routes.add(route.method, route.url);
   });
 
+  /** The request came to the admin's own origin (scheme and host), as rule 12 reads it. */
+  const onAdminOrigin = (request: FastifyRequest): boolean =>
+    admin !== undefined &&
+    `${request.protocol}:` === adminProtocol &&
+    normalHost(adminProtocol, request.host) === adminHost;
+
   // Rule 3 first: nothing else looks at a refused path. Then rule 12: with
   // an admin origin, `/api` is the admin host's only.
   app.addHook("onRequest", (request, reply, done) => {
@@ -727,10 +745,7 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
       refusal === undefined &&
       admin !== undefined &&
       isApiPath(pathOf(request.raw.url ?? "")) &&
-      !(
-        `${request.protocol}:` === adminProtocol &&
-        normalHost(adminProtocol, request.host) === adminHost
-      )
+      !onAdminOrigin(request)
     ) {
       refusal = new Refusal(404, "not_found");
     }
@@ -791,6 +806,10 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
         ? FILE_SECURITY_HEADERS
         : SECURITY_HEADERS;
     for (const [name, value] of Object.entries(headers)) void reply.header(name, value);
+    // Rule 9: HSTS on the admin's origin when it is https (S-060a).
+    if (adminProtocol === "https:" && onAdminOrigin(request)) {
+      void reply.header("strict-transport-security", ADMIN_HSTS);
+    }
     // Any body not read to its end (refused before or while it arrived, on
     // any route): the connection closes after the reply, so the rest never
     // becomes the next request and the client can't hold it open (B2).
