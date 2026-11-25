@@ -41,6 +41,31 @@ export interface PublicApiOptions {
   readonly clock?: () => number;
   /** Reads allowed at once, at most the public pool's size (default 4, as `admin-cli.ts` opens it). */
   readonly maxConcurrent?: number;
+  /** Slots shared with the OAI-PMH routes (T-050c), in place of `maxConcurrent`. */
+  readonly slots?: ReadSlots;
+}
+
+/**
+ * The public pool's connections, counted: a read takes a slot or is refused
+ * at once, so requests never queue for a connection behind slow reads. The
+ * record reads and OAI-PMH (T-050c, D-105) share one, as they share the pool.
+ */
+export class ReadSlots {
+  private running = 0;
+  constructor(readonly size: number) {
+    if (!Number.isInteger(size) || size < 1 || size > 100) {
+      throw new RangeError("maxConcurrent must be a whole number from 1 to 100");
+    }
+  }
+  /** Takes a slot, or false when every slot is in use. */
+  take(): boolean {
+    if (this.running >= this.size) return false;
+    this.running += 1;
+    return true;
+  }
+  give(): void {
+    if (this.running > 0) this.running -= 1;
+  }
 }
 
 /** The key a client is braked by: an IPv4 address, or an IPv6 address's /64. */
@@ -62,7 +87,7 @@ export function clientKey(ip: string): string {
 }
 
 /** The request's origin as `URL.origin` writes it, or undefined. */
-function originOf(request: OculusRequest): string | undefined {
+export function originOf(request: OculusRequest): string | undefined {
   try {
     const url = new URL(`${request.protocol}://${request.host}`);
     if (url.username !== "" || url.password !== "" || url.pathname !== "/") return undefined;
@@ -82,11 +107,7 @@ export function publicApiRoutes(options: PublicApiOptions): OculusRoute[] {
     options.clock,
   );
   const log = options.log ?? (() => undefined);
-  const maxConcurrent = options.maxConcurrent ?? 4;
-  if (!Number.isInteger(maxConcurrent) || maxConcurrent < 1 || maxConcurrent > 100) {
-    throw new RangeError("maxConcurrent must be a whole number from 1 to 100");
-  }
-  let running = 0;
+  const slots = options.slots ?? new ReadSlots(options.maxConcurrent ?? 4);
 
   return [
     {
@@ -102,8 +123,7 @@ export function publicApiRoutes(options: PublicApiOptions): OculusRoute[] {
         }
         const id = request.params.id ?? "";
         if (!isRecordId(id)) throw NOT_FOUND();
-        if (running >= maxConcurrent) throw new Refusal(503, "busy");
-        running += 1;
+        if (!slots.take()) throw new Refusal(503, "busy");
         let result: Awaited<ReturnType<typeof readPublicRecord>>;
         try {
           result = await readPublicRecord(options.db, site.organizationId, site.siteId, id, {
@@ -118,7 +138,7 @@ export function publicApiRoutes(options: PublicApiOptions): OculusRoute[] {
           });
           throw new Refusal(503, "unavailable");
         } finally {
-          running -= 1;
+          slots.give();
         }
         if (!result.ok) {
           // Staff-only reasons (D-016, S-007) never leave; the public sees "not found".
