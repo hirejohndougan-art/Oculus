@@ -5,7 +5,8 @@
  * code. Nothing from the error itself reaches the client: no message, no
  * stack trace, no Fastify error code, no part of the request body. Server
  * errors (5xx) are logged on the server; the client sees only
- * `internal_error` or `unavailable`.
+ * `internal_error` or `unavailable`, or `busy` or `timeout` (503) when a
+ * database time limit ran out (S-063).
  *
  * Whatever a handler throws is replaced by a fresh Refusal before Fastify
  * sees it (`rebuildThrown`, server.ts), and is logged only as a
@@ -89,7 +90,7 @@ function ownData(value: object, key: string): unknown {
 export function rebuildThrown(thrown: unknown): Refusal {
   try {
     if (typeof thrown !== "object" || thrown === null) return internalError();
-    if (!(thrown instanceof Refusal)) return internalError();
+    if (!(thrown instanceof Refusal)) return timeLimitRefusal(thrown) ?? internalError();
     const status = ownData(thrown, "statusCode");
     const code = ownData(thrown, "code");
     if (!isErrorStatus(status) || typeof code !== "string" || !CODE.test(code)) {
@@ -99,6 +100,30 @@ export function rebuildThrown(thrown: unknown): Refusal {
   } catch {
     return INTERNAL_REFUSAL;
   }
+}
+
+/** pg-pool's error for no free connection within the pool's wait (client.ts, `isDatabaseTimeout`). */
+const POOL_WAIT_MESSAGE = "timeout exceeded when trying to connect";
+
+/**
+ * A database time limit that ran out (S-063), as `503`: `busy` when no
+ * pooled connection came free in time, `timeout` when the server stopped a
+ * statement (57014, `statement_timeout`) or a lock wait (55P03,
+ * `lock_timeout`). These are load, not faults: the request can be tried
+ * again. `undefined` for anything else. Own data properties only, as
+ * everywhere in this file.
+ */
+function timeLimitRefusal(thrown: object): Refusal | undefined {
+  const code = ownData(thrown, "code");
+  if (code === "57014" || code === "55P03") return new Refusal(503, "timeout");
+  if (
+    code === undefined &&
+    plainErrorShape(thrown) &&
+    ownData(thrown, "message") === POOL_WAIT_MESSAGE
+  ) {
+    return new Refusal(503, "busy");
+  }
+  return undefined;
 }
 
 /** How a thrown value is described in the server log: plain strings only. */

@@ -51,6 +51,7 @@ import {
 import type { FastifyInstance } from "fastify";
 import { ADMIN_ORIGIN_ENV } from "./admin-files.js";
 import { buildAdminServer } from "./admin-server.js";
+import { staffPoolOptions } from "./staff-pool.js";
 import {
   appWindowArgs,
   chooseDatabaseUrl,
@@ -392,7 +393,7 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
       out("Note: the database address holds a password. Your pgpass file is a safer place for it.");
     }
     try {
-      db = openDatabase(url, { applicationName: "oculus-desktop", max: 10 });
+      db = openDatabase(url, staffPoolOptions("oculus-desktop"));
       if (ownerUrl !== undefined) {
         ownerDb = openDatabase(ownerUrl, { applicationName: "oculus-desktop-owner", max: 1 });
       }

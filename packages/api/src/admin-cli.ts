@@ -11,19 +11,21 @@
  * Deployment (D-035, T-050, T-051) decides how this runs in production.
  * Email goes through the mailer the environment configures (mail.ts,
  * D-085): SMTP in production (it refuses to start without it), the
- * development sender otherwise. The two-step alert notices run every minute
- * (alert-notices.ts). The notices, the mailer's outbox and the server are
- * closed on SIGINT and SIGTERM.
+ * development sender otherwise. The two-step alert notices (every minute) and
+ * the cleanup (hourly) run inside the server (admin-server.ts, S-063). The
+ * staff pool has S-063's time limits (staff-pool.ts). The server (and with it
+ * those jobs), the mailer's outbox and the pools are closed on SIGINT and
+ * SIGTERM.
  */
 import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { openDatabase } from "@oculus/db";
 import { buildAdminServer, defaultLog } from "./admin-server.js";
-import { startAlertNotices, type AlertNoticeRunner } from "./alert-notices.js";
 import { mailerFromEnv, type Mailer } from "./mail.js";
 import { PUBLIC_DATABASE_URL_ENV } from "./public-sites.js";
 import { oaiPoolOptions } from "./oai-pmh.js";
 import { publicPoolOptions } from "./public-api.js";
+import { staffPoolOptions } from "./staff-pool.js";
 
 const DATABASE_URL_VARIABLE = "OCULUS_DATABASE_URL";
 
@@ -44,7 +46,7 @@ export async function runAdminCli(
   }
   let db: ReturnType<typeof openDatabase>;
   try {
-    db = openDatabase(url, { applicationName: "oculus-admin" });
+    db = openDatabase(url, staffPoolOptions("oculus-admin"));
   } catch {
     // The parser's message can quote the URL, which may hold a password.
     err(`${DATABASE_URL_VARIABLE} is not a usable postgresql:// URL (its value is not shown).`);
@@ -75,7 +77,6 @@ export async function runAdminCli(
     await Promise.allSettled([db.close(), publicDb?.close(), countsDb?.close(), oaiDb?.close()]);
   };
   let mailer: Mailer | undefined;
-  let notices: AlertNoticeRunner | undefined;
   // Closed on a failed start too, so the Subjects counts stop before the pools (S-038).
   let built: { close: () => Promise<unknown> } | undefined;
   try {
@@ -88,7 +89,6 @@ export async function runAdminCli(
       restarting = true;
       void app
         .close()
-        .then(() => notices?.stop())
         .then(() => mailer?.close())
         .then(closePools)
         .finally(() => process.exit(0));
@@ -105,18 +105,9 @@ export async function runAdminCli(
       ...(oaiDb === undefined ? {} : { oaiDb }),
     });
     built = app;
-    // "Someone is guessing your two-step codes" (D-077, D-085), every minute.
-    const outbox = mailer.outbox;
-    notices = startAlertNotices({
-      db,
-      deliver: mailer.deliverAlert,
-      log: defaultLog,
-      room: () => outbox.room("notice"),
-    });
     const close = (): void => {
       void app
         .close()
-        .then(() => notices?.stop())
         .then(() => mailer?.close())
         .then(closePools);
     };
@@ -126,7 +117,6 @@ export async function runAdminCli(
     return undefined;
   } catch (error) {
     await built?.close().catch(() => undefined);
-    await notices?.stop();
     await mailer?.close();
     await closePools();
     // Startup refusals name the variable and the reason, never a value.

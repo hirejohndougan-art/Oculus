@@ -45,6 +45,13 @@
  *   `startup_warning` (`files_not_scanned`), and a scanner set up but not
  *   answering as `clamd_unreachable` (it is tried again by the queue).
  *
+ * Once built, it also runs the background jobs every install needs (S-063),
+ * stopped when the server closes: the cleanup of ended sessions, old
+ * counters and reset links (cleanup-runner.ts, hourly) and the two-step
+ * alert notices (alert-notices.ts, every minute, through the mailer; none
+ * without one). `housekeeping: false` turns both off (tests). The desktop
+ * launcher and `npm run admin` both start the server here, so both run them.
+ *
  * It warns loudly (a `startup_warning` log record) when the database
  * server's `log_parameter_max_length_on_error` is above 0, since pg's
  * error `where` then carries bound values (D-068); Oculus's own logs never
@@ -77,6 +84,8 @@ import {
 } from "@oculus/service";
 import type { FastifyInstance } from "fastify";
 import { ADMIN_ORIGIN_ENV, loadAdminFiles, type AdminFiles } from "./admin-files.js";
+import { startAlertNotices, type AlertNoticeRunner } from "./alert-notices.js";
+import { startCleanup } from "./cleanup-runner.js";
 import { scannerFromEnv } from "./file-scanning.js";
 import { originsFromEnv } from "./origin.js";
 import { isProduction } from "./environment.js";
@@ -281,6 +290,21 @@ export interface AdminServerOptions {
   readonly updates?: UpdateManager | null;
   /** Asked for after an install or rollback when `OCULUS_UPDATE_RESTART=exit` (admin-cli.ts). */
   readonly requestRestart?: () => void;
+  /**
+   * The background cleanup and two-step alert notices (S-063): on by
+   * default; `false` turns both off. Shorter timings are for tests.
+   */
+  readonly housekeeping?: boolean | HousekeepingTimes;
+}
+
+/** The background jobs' timings (S-063); each left out keeps its default. */
+export interface HousekeepingTimes {
+  /** Default `CLEANUP_FIRST_AFTER_MS` (cleanup-runner.ts). */
+  readonly cleanupFirstAfterMs?: number;
+  /** Default `CLEANUP_EVERY_MS`. */
+  readonly cleanupEveryMs?: number;
+  /** Default 60 s (alert-notices.ts). */
+  readonly noticesEveryMs?: number;
 }
 
 /** The default log: one JSON line on standard error. */
@@ -331,8 +355,15 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   // refusal leaves nothing running.
   let deliverReset = options.deliverReset;
   let mailer: Mailer | undefined;
+  // Made here, so closed here once the server has closed (S-063).
+  let ownMailer: Mailer | undefined;
   if (deliverReset === undefined) {
-    mailer = options.mailer ?? mailerFromEnv(env, { log });
+    if (options.mailer === undefined) {
+      ownMailer = mailerFromEnv(env, { log });
+      mailer = ownMailer;
+    } else {
+      mailer = options.mailer;
+    }
     deliverReset = mailer.deliverReset;
   }
   const deliverInvitation = options.deliverInvitation ?? mailer?.deliverInvitation;
@@ -557,6 +588,10 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
       log({ event: "service_error", operation: "scanQueuedFiles", ...redactedError(error) });
     }
   };
+  // The background jobs (S-063), started once the server is built and
+  // stopped by its close, before the mailer they send through.
+  let cleanup: ReturnType<typeof startCleanup> | undefined;
+  let notices: AlertNoticeRunner | undefined;
   let app: FastifyInstance;
   try {
     app = await buildServer({
@@ -569,6 +604,8 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
       onClose: async () => {
         await publicSubjects?.stop();
         await service.stopFileScans();
+        await Promise.allSettled([cleanup?.stop(), notices?.stop()]);
+        await ownMailer?.close();
       },
     });
   } catch (error) {
@@ -614,6 +651,30 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   }
   // Started once the server is built, so a start that fails counts nothing.
   publicSubjects?.start();
+  if (options.housekeeping !== false) {
+    const times: HousekeepingTimes =
+      typeof options.housekeeping === "object" ? options.housekeeping : {};
+    cleanup = startCleanup({
+      db: options.db,
+      log,
+      ...(times.cleanupFirstAfterMs === undefined
+        ? {}
+        : { firstAfterMs: times.cleanupFirstAfterMs }),
+      ...(times.cleanupEveryMs === undefined ? {} : { intervalMs: times.cleanupEveryMs }),
+    });
+    // "Someone is guessing your two-step codes" (D-077, D-085), every minute,
+    // through the mailer's notice lane; with no mailer (tests) there is none.
+    if (mailer !== undefined) {
+      const outbox = mailer.outbox;
+      notices = startAlertNotices({
+        db: options.db,
+        deliver: mailer.deliverAlert,
+        log,
+        room: () => outbox.room("notice"),
+        ...(times.noticesEveryMs === undefined ? {} : { intervalMs: times.noticesEveryMs }),
+      });
+    }
+  }
   app.server.once("close", () => {
     clearInterval(timer);
     clearInterval(lease);

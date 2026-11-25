@@ -153,6 +153,8 @@ export interface ApiLogRecord {
     | "mail_dev"
     // The two-step alert notices (alert-notices.ts): people notified, as `code`.
     | "alert_notices"
+    // The hourly cleanup (cleanup-runner.ts, S-063): rows deleted or alerts written, as `code`.
+    | "cleanup"
     // Software updates (T-060): the step in `operation`, a version in `code`.
     | "update_event";
   readonly operation?: string;

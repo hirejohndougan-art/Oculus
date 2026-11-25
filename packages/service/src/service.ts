@@ -1104,6 +1104,9 @@ function cleanError(error: unknown): ServiceRefusal {
         "The service's database role may not make this change. Check its grants.",
       );
     case "57014":
+    // A lock wait past the staff pool's `lock_timeout` (S-063).
+    // falls through
+    case "55P03":
       return refusal([], "timeout", "The change took too long and was stopped. Nothing was saved.");
     default:
       return refusal([], "internal_error", "Something went wrong; nothing was saved.");

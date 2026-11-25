@@ -63,7 +63,10 @@ export {
   CLIENT_ADDRESS_ENV,
   DEFAULT_ADMIN_DIR,
 } from "./admin-server.js";
-export type { AdminServerOptions } from "./admin-server.js";
+export type { AdminServerOptions, HousekeepingTimes } from "./admin-server.js";
+export { startCleanup, CLEANUP_EVERY_MS, CLEANUP_FIRST_AFTER_MS } from "./cleanup-runner.js";
+export type { CleanupRunner, CleanupRunnerOptions } from "./cleanup-runner.js";
+export { staffPoolOptions } from "./staff-pool.js";
 export {
   loadAdminFiles,
   adminFileFor,

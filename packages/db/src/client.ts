@@ -51,6 +51,16 @@ export interface DatabaseOptions {
    * work uses, so it only fires when the server or network has stopped.
    */
   queryTimeoutMillis?: number;
+  /**
+   * Session defaults sent when each connection opens (S-063): the server's
+   * `lock_timeout`, `statement_timeout` and
+   * `idle_in_transaction_session_timeout`, in milliseconds. A `SET LOCAL` or
+   * `set_config(…, true)` in a transaction still overrides them for that
+   * transaction. Left out, the role's or server's own setting applies.
+   */
+  lockTimeoutMillis?: number;
+  statementTimeoutMillis?: number;
+  idleInTransactionTimeoutMillis?: number;
 }
 
 const OID = {
@@ -254,6 +264,18 @@ export function isDatabaseFailure(error: unknown): boolean {
   );
 }
 
+/**
+ * A session time limit as pg sends it: a whole number of milliseconds from 1
+ * to a day. pg drops a 0 silently and would send a fraction cut down, so
+ * both are refused here (S-063).
+ */
+function positiveMillis(name: string, value: number): number {
+  if (!Number.isInteger(value) || value < 1 || value > 86_400_000) {
+    throw new RangeError(`${name} must be a whole number of milliseconds from 1 to 86400000.`);
+  }
+  return value;
+}
+
 /** Opens a connection pool. The connection string comes from the environment, never the repo. */
 export function openDatabase(connectionString: string, options: DatabaseOptions = {}): Database {
   const pool = new pg.Pool({
@@ -268,6 +290,27 @@ export function openDatabase(connectionString: string, options: DatabaseOptions 
     ...(options.queryTimeoutMillis === undefined
       ? {}
       : { query_timeout: options.queryTimeoutMillis }),
+    // Startup parameters of every connection (S-063), so a stuck lock or a
+    // runaway statement ends with an error instead of holding the pool.
+    ...(options.lockTimeoutMillis === undefined
+      ? {}
+      : { lock_timeout: positiveMillis("lockTimeoutMillis", options.lockTimeoutMillis) }),
+    ...(options.statementTimeoutMillis === undefined
+      ? {}
+      : {
+          statement_timeout: positiveMillis(
+            "statementTimeoutMillis",
+            options.statementTimeoutMillis,
+          ),
+        }),
+    ...(options.idleInTransactionTimeoutMillis === undefined
+      ? {}
+      : {
+          idle_in_transaction_session_timeout: positiveMillis(
+            "idleInTransactionTimeoutMillis",
+            options.idleInTransactionTimeoutMillis,
+          ),
+        }),
   });
   // An idle connection that fails (a server restart) is dropped by the pool;
   // without a listener the error would crash the process.

@@ -17,7 +17,7 @@ import {
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { openDatabase, type Database } from "@oculus/db";
+import { openDatabase, sql, type Database } from "@oculus/db";
 import type { FastifyInstance } from "fastify";
 import { FAKE_TEST_SECRET_KEY } from "../../db/src/second-factor.fixtures.js";
 import { freshDatabase, type TestDatabase } from "../../db/src/test-database.fixtures.js";
@@ -412,4 +412,60 @@ describe("the built admin on the admin's origin", () => {
     }
     expect(JSON.stringify(logged)).not.toContain("example.org");
   });
+});
+
+describe("the background jobs (S-063)", () => {
+  const KEY = "source:other";
+  const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+  /** A sign-in counter with no failures: the cleanup deletes it. */
+  const seed = (): Promise<unknown> =>
+    db.execute(
+      sql`INSERT INTO public.sign_in_throttles (key, failures) VALUES (${KEY}, 0)
+          ON CONFLICT (key) DO UPDATE SET failures = 0, last_failure_at = NULL`,
+    );
+  const seeded = async (): Promise<boolean> =>
+    (await db.rows(sql`SELECT 1 FROM public.sign_in_throttles WHERE key = ${KEY}`)).length === 1;
+
+  it("runs the cleanup and the alert notices in the server, and stops both when it closes", async () => {
+    await seed();
+    const logged: ApiLogRecord[] = [];
+    const app = await buildAdminServer({
+      db,
+      env: DEV,
+      adminFiles: files,
+      log: (r) => logged.push(r),
+      housekeeping: { cleanupFirstAfterMs: 20, cleanupEveryMs: 30, noticesEveryMs: 20 },
+    });
+    try {
+      const deadline = Date.now() + 15_000;
+      while ((await seeded()) && Date.now() < deadline) await sleep(25);
+      expect(await seeded()).toBe(false);
+      expect(logged).toContainEqual({ event: "cleanup", code: expect.any(String) as string });
+    } finally {
+      await app.close();
+    }
+    // Closed: neither job runs again (the cleanup would have run every 30 ms).
+    await seed();
+    await sleep(300);
+    expect(await seeded()).toBe(true);
+    expect(logged.filter((r) => r.event === "service_error")).toEqual([]);
+    await db.execute(sql`DELETE FROM public.sign_in_throttles WHERE key = ${KEY}`);
+  }, 30_000);
+
+  it("runs neither with housekeeping: false", async () => {
+    await seed();
+    const app = await buildAdminServer({
+      db,
+      env: DEV,
+      adminFiles: files,
+      housekeeping: false,
+    });
+    try {
+      await sleep(300);
+      expect(await seeded()).toBe(true);
+    } finally {
+      await app.close();
+      await db.execute(sql`DELETE FROM public.sign_in_throttles WHERE key = ${KEY}`);
+    }
+  }, 30_000);
 });
