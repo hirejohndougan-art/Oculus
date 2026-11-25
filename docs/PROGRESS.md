@@ -6,8 +6,8 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Result: done (built, not pushed: John asked that nothing be pushed yet); T-047 split into T-047a and T-047b (record types need a service operation first)
 - What changed: Settings › ID numbers (`IdentifierTypes.tsx`, `identifierTypeForm.ts`), routes in App.tsx, `ifMatchTag` in `api()`; tests and an e2e step. Branch `autopilot/T-047`, local only, from main 69c020e.
 - Decisions: none (uses D-009, D-022, D-031, D-076, D-091 as they are)
-- Review: see the branch's last commit
-- Gate: see the branch's last commit · npm audit clean
+- Review: independent review: safe; its items fixed (the confirmation closes on other errors, the key is fixed while saving, a changed list of dropped records is said)
+- Gate: PASS · tests_passing 5244 (was 5233) · npm audit clean
 - Next: the next free Phase 3 job (Chat Z)
 
 ## 2026-11-25 16:05 CT — manual (Chat M) — T-075 Accept an invitation
