@@ -38,6 +38,10 @@ interface FormIssue {
 }
 
 export const DEAD_INVITATION = "This invitation link can't be used. Ask for a new one.";
+export const WRONG_ADDRESS_OR_DEAD =
+  "This invitation can't be used with that email address. Check that you typed the address the invitation was sent to. If it's right, the link has been used or has expired: ask for a new one.";
+export const MAYBE_MADE =
+  "If it happens again, your account may already be made: try signing in with the password you chose.";
 export const SIGN_IN_FIRST =
   "Sign in to your Oculus account in this browser first, then open the invitation link from your email again.";
 
@@ -74,7 +78,7 @@ export function AcceptInvitation() {
     setBusy(true);
     try {
       const reply = await api<Accepted>("/api/invitation/accept", {
-        body: { token, email, displayName: name.trim(), password },
+        body: { token, email: email.trim(), displayName: name.trim(), password },
       });
       setPassword("");
       setAgain("");
@@ -87,7 +91,10 @@ export function AcceptInvitation() {
       }
     } catch (error) {
       if (error instanceof ApiError && error.code === "invalid_invitation") {
-        setState("dead");
+        // A mistyped address reads the same as a dead link (D-068), and the
+        // token is out of the address bar: keep the form, so a typo can be
+        // put right without asking for a new link.
+        setProblem(WRONG_ADDRESS_OR_DEAD);
       } else if (error instanceof ApiError && error.code === "account_exists") {
         setPassword("");
         setAgain("");
@@ -101,7 +108,10 @@ export function AcceptInvitation() {
         setNameError(messageFor("displayName"));
         setPasswordError(messageFor("password"));
       } else {
-        setProblem(problemText(error));
+        // The account may have been made before the reply was lost (a time
+        // limit, a dropped connection): trying the link again would then
+        // say it can't be used, so say that signing in may work.
+        setProblem(`${problemText(error)} ${MAYBE_MADE}`);
       }
     } finally {
       setBusy(false);

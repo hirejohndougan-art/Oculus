@@ -7,7 +7,7 @@ import { cleanup, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fakeServer, renderAt } from "../testing.fixtures";
-import { DEAD_INVITATION, SIGN_IN_FIRST } from "./AcceptInvitation";
+import { MAYBE_MADE, SIGN_IN_FIRST, WRONG_ADDRESS_OR_DEAD } from "./AcceptInvitation";
 
 afterEach(() => {
   cleanup();
@@ -94,14 +94,42 @@ describe("joining as a new person", () => {
     expect(screen.getByText("A name is 1–200.")).toBeTruthy();
   });
 
-  it("says a used, expired or wrong link can't be used, and one without a token too", async () => {
+  it("keeps the form when the address or link is refused, so a typo can be put right", async () => {
     window.history.replaceState(null, "", `/invitation#${TOKEN}`);
-    fakeServer({ "POST /api/invitation/accept": [400, { error: "invalid_invitation" }] });
+    let calls = 0;
+    const sent = fakeServer({
+      "POST /api/invitation/accept": () => {
+        calls += 1;
+        return calls === 1
+          ? [400, { error: "invalid_invitation" }]
+          : [201, { joined: true, signedIn: false }];
+      },
+    });
     renderAt("/invitation");
     await fillIn();
-    expect(await screen.findByRole("heading", { name: "This link can't be used" })).toBeTruthy();
-    expect(screen.getByText(DEAD_INVITATION)).toBeTruthy();
-    cleanup();
+    expect((await screen.findByRole("alert")).textContent).toBe(WRONG_ADDRESS_OR_DEAD);
+    await userEvent.click(screen.getByRole("button", { name: "Make my account" }));
+    expect(await screen.findByRole("heading", { name: "Your account is ready" })).toBeTruthy();
+    expect(sent.map((s) => (s.body as { token?: string } | undefined)?.token)).toEqual([
+      TOKEN,
+      TOKEN,
+    ]);
+  });
+
+  it("sends the address trimmed, and after a server failure says signing in may work", async () => {
+    window.history.replaceState(null, "", `/invitation#${TOKEN}`);
+    const sent = fakeServer({ "POST /api/invitation/accept": [503, { error: "timeout" }] });
+    renderAt("/invitation");
+    await userEvent.type(await screen.findByLabelText(/^Email/), "  spaced@example.org ");
+    await userEvent.type(screen.getByLabelText(/^Your name/), "Invented Volunteer");
+    await userEvent.type(screen.getByLabelText(/^Password/), PASSWORD);
+    await userEvent.type(screen.getByLabelText(/^Type it again/), PASSWORD);
+    await userEvent.click(screen.getByRole("button", { name: "Make my account" }));
+    expect((await screen.findByRole("alert")).textContent).toContain(MAYBE_MADE);
+    expect((sent[0]?.body as { email: string }).email).toBe("spaced@example.org");
+  });
+
+  it("says a link without a token can't be used", async () => {
     window.history.replaceState(null, "", "/invitation");
     renderAt("/invitation");
     expect(await screen.findByRole("heading", { name: "This link can't be used" })).toBeTruthy();

@@ -26,6 +26,7 @@ let limited: FastifyInstance;
 const logged: ApiLogRecord[] = [];
 let nextAddress = 0;
 let nextPerson = 0;
+const tokens: string[] = [];
 
 function address(): string {
   nextAddress += 1;
@@ -82,6 +83,7 @@ async function invite(
   if (!made.ok) throw new Error(JSON.stringify(made.issues));
   const token = box[0]?.token;
   if (token === undefined) throw new Error("not delivered");
+  tokens.push(token);
   return { token, invitationId: made.value.invitationId };
 }
 
@@ -414,5 +416,7 @@ describe("secrecy", () => {
     const text = JSON.stringify(logged);
     expect(text).not.toMatch(/@example\.org/);
     expect(text).not.toContain(PASSWORD);
+    expect(tokens.length).toBeGreaterThan(5);
+    for (const token of tokens) expect(text).not.toContain(token);
   });
 });

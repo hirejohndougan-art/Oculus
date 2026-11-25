@@ -367,6 +367,20 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
   }
 
   /**
+   * Runs an account function that doesn't log for itself: anything it
+   * throws is logged as class and SQLSTATE only (never its message, which
+   * could carry a bound value) and answered `503 unavailable`.
+   */
+  async function redacted<T>(operation: string, run: () => Promise<T>): Promise<T> {
+    try {
+      return await run();
+    } catch (error) {
+      onError(operation)(error);
+      throw new Refusal(503, "unavailable");
+    }
+  }
+
+  /**
    * After a right code that still needs an organization: 409 with the
    * person's choices by name (they passed the second step; nothing was
    * used up, so the same code is sent again with one of them).
@@ -686,12 +700,14 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
         ) {
           throw new Refusal(400, "bad_body");
         }
-        const accepted = await acceptInvitation(db, {
-          token: body.token,
-          email: body.email,
-          displayName: body.displayName,
-          password: body.password,
-        });
+        const accepted = await redacted("acceptInvitation", () =>
+          acceptInvitation(db, {
+            token: body.token,
+            email: body.email,
+            displayName: body.displayName,
+            password: body.password,
+          }),
+        );
         if (!accepted.ok) return invitationRefusal(reply, accepted.issues);
         const label = clientLabel(request.headers["user-agent"]);
         const started = await beginSession(
@@ -705,10 +721,17 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
           },
           { onError: onError("beginSession") },
         );
-        if (!started.ok) {
-          // The account exists now; the person can sign in from the Login
-          // screen (a full password queue, a throttle reached meanwhile).
-          reply.status(201);
+        reply.status(201);
+        // The account exists now; if signing it in fails (a full password
+        // queue, a throttle reached meanwhile), the person signs in from the
+        // Login screen. The cookie is written only once the waiting
+        // session's state has been read.
+        if (!started.ok) return { joined: true, signedIn: false };
+        const state = await pendingSignInState(db, started.token, {
+          onError: onError("pendingState"),
+        });
+        if (!state.ok) {
+          await endSession(db, started.token, { onError: onError("endSession") });
           return { joined: true, signedIn: false };
         }
         const previous = request.cookies[OCULUS_COOKIES.session];
@@ -716,11 +739,6 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
           await endSession(db, previous, { onError: onError("endSession") });
         }
         reply.setCookie(OCULUS_COOKIES.session, started.token);
-        const state = await pendingSignInState(db, started.token, {
-          onError: onError("pendingState"),
-        });
-        reply.status(201);
-        if (!state.ok) return { joined: true, signedIn: false };
         return {
           joined: true,
           signedIn: true,
@@ -741,10 +759,9 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
         const { session } = await fullSessionOf(request, true);
         const body = textBody(request, ["token"]);
         if (body.token === undefined) throw new Refusal(400, "bad_body");
-        const accepted = await acceptInvitationForUser(db, {
-          token: body.token,
-          userId: session.userId,
-        });
+        const accepted = await redacted("acceptInvitationForUser", () =>
+          acceptInvitationForUser(db, { token: body.token, userId: session.userId }),
+        );
         if (!accepted.ok) return invitationRefusal(reply, accepted.issues);
         const named = await readOrganization(db, accepted.value.organizationId);
         reply.status(201);
