@@ -80,6 +80,13 @@ import type { Readable } from "node:stream";
 import { SNIFF_BYTES, isOrganizationId, isSha256Hex, type OrganizationId } from "@oculus/core";
 import { LEASE_LOCK, LeaseLockBusy, hostKey, leaseGenerations, leaseLock } from "./lease-lock.js";
 
+/**
+ * The name a remembered refusal is cached under (beside `<sha256>.`): `v2`
+ * since T-074a decodes large JPEGs, so refusals the older decoder left
+ * (`v1.none`) are tried again once.
+ */
+const REFUSAL_MARKER = "v2.none";
+
 export { LEASE_LOCK, LeaseLockBusy, leaseGenerations };
 
 /** Bytes in a mebibyte. */
@@ -313,7 +320,7 @@ export interface FileStore {
    * A cached thumbnail (M-003): its JPEG bytes, `"none"` when an earlier
    * attempt found it can't be made, or `undefined` when nothing is cached.
    * Kept per organization beside the copies (`thumbnails/<size>/<2
-   * hex>/<sha256>.v1.jpg` or `.v1.none`), checked as the copies are.
+   * hex>/<sha256>.v1.jpg` or `.v2.none`), checked as the copies are.
    */
   readThumbnail(
     organizationId: OrganizationId,
@@ -1021,7 +1028,10 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
         }
         return undefined;
       }
-      if (await plainFile(join(folder, `${sha256}.v1.none`), 0)) return "none";
+      // Refusals are remembered as `.v2.none` since T-074a: a `.v1.none`
+      // was written by the decoder before it read large JPEGs, so it is
+      // tried once more (and the old marker left to go with its copy).
+      if (await plainFile(join(folder, `${sha256}.${REFUSAL_MARKER}`), 0)) return "none";
       const timeout = join(folder, `${sha256}.v1.timeout`);
       if (await plainFile(timeout, 0)) {
         const info = await lstat(timeout);
@@ -1052,7 +1062,11 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
         // included) in one step. Nothing else is deleted here: only the
         // purge deletes (trashContent, then deleteTrashed); a JPEG beside a ".none" wins.
         const name =
-          jpeg === "none" || jpeg === "timeout" ? `${sha256}.v1.${jpeg}` : `${sha256}.v1.jpg`;
+          jpeg === "none"
+            ? `${sha256}.${REFUSAL_MARKER}`
+            : jpeg === "timeout"
+              ? `${sha256}.v1.timeout`
+              : `${sha256}.v1.jpg`;
         await rename(temporaryPath, join(folder, name));
         placed = true;
       } finally {

@@ -470,6 +470,22 @@ describe("the second review's changes", () => {
     rmSync(fresh, { recursive: true, force: true });
   });
 
+  it("forgets refusals the decoder made before it read large JPEGs (T-074a)", async () => {
+    const fresh = mkdtempSync(join(tmpdir(), "oculus-store-none-"));
+    const own = await openFileStore({ dir: fresh });
+    const o = newOrganizationId();
+    const hash = "c".repeat(64);
+    await own.writeThumbnail(o, hash, "small", "none");
+    const folder = join(fresh, o, "thumbnails", "small", hash.slice(0, 2));
+    expect(readdirSync(folder)).toEqual([`${hash}.v2.none`]);
+    expect(await own.readThumbnail(o, hash, "small")).toBe("none");
+    // An older install's marker alone: not remembered, so it is tried again.
+    rmSync(join(folder, `${hash}.v2.none`));
+    writeFileSync(join(folder, `${hash}.v1.none`), "", { mode: 0o600 });
+    expect(await own.readThumbnail(o, hash, "small")).toBeUndefined();
+    rmSync(fresh, { recursive: true, force: true });
+  });
+
   it("opens a stored copy as a descriptor for the decoder process, and only a plain copy of its own (T-072)", async () => {
     const fresh = mkdtempSync(join(tmpdir(), "oculus-store-fd-"));
     const own = await openFileStore({ dir: fresh });
@@ -614,7 +630,7 @@ describe("the second review's changes", () => {
     expect(readdirSync(join(dir, other, "trash", hash)).sort()).toEqual([
       "content",
       "marked",
-      "thumbnail-small-v1.none",
+      "thumbnail-small-v2.none",
     ]);
     expect(await store.trashContent(other, hash, stamp.mtimeNs)).toBe("missing");
     // Put back: the same bytes, the same time.

@@ -64,6 +64,7 @@ import {
   jpegSmuggles,
   jpegSofSlack,
   makeWebp,
+  noiseJpeg,
   noisePng,
   pngFrom,
   vp8lBigTables,
@@ -1342,6 +1343,11 @@ describe("peak memory of the largest images accepted (review B2, T-072)", () => 
         ["JPEG 2,480² (4:4:4)", "image/jpeg", () => flatJpeg(2480, 2480)],
         // Decoded at 1/8 from their DC terms (T-074a).
         ["JPEG 7,000² (4:4:4, at 1/8)", "image/jpeg", () => flatJpeg(7000, 7000)],
+        [
+          "JPEG 4,000 × 3,000 noise, quality 95 (at 1/8)",
+          "image/jpeg",
+          () => noiseJpeg(4000, 3000),
+        ],
         [
           "JPEG 8,000 × 6,000 progressive 4:2:0 (at 1/8)",
           "image/jpeg",

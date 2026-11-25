@@ -1178,7 +1178,8 @@ function jpegFrameBytes(layout: JpegLayout): number {
  * megapixels. A block's DC coefficient alone is its average (ITU T.81
  * A.3.3: the inverse DCT of a block with only its DC term is DC/8 at every
  * sample), so decoding only the DC terms gives the image at 1/8 of each
- * side, libjpeg's smallest DCT scaling, at 4 bytes a block: a 50-megapixel
+ * side, as libjpeg's smallest DCT scaling (which for 4:2:0 also uses a
+ * chroma block's lowest AC terms), at 4 bytes a block: a 50-megapixel
  * photograph needs some 10 MB instead of several GB. Baseline and extended
  * (SOF0, SOF1) scans are read in full, every AC coefficient decoded and
  * dropped; progressive (SOF2) DC scans are read and AC scans skipped

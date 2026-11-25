@@ -603,7 +603,7 @@ describe("thumbnails", () => {
       "thumbnails",
       "small",
       sha(bombs.interlaced).slice(0, 2),
-      `${sha(bombs.interlaced)}.v1.none`,
+      `${sha(bombs.interlaced)}.v2.none`,
     );
     expect(existsSync(marker)).toBe(true);
     const again = await send(fileUrl(asset, added[2]?.[1] ?? "", "thumbnail"), { as: "cataloger" });
@@ -732,7 +732,15 @@ describe("the logs", () => {
 
 describe("review fixes: timeouts, budgets, HEAD, failures and downloads", () => {
   const thumbPath = (body: Buffer, kind: string, size = "small") =>
-    join(filesDir, w.a, "thumbnails", size, sha(body).slice(0, 2), `${sha(body)}.v1.${kind}`);
+    join(
+      filesDir,
+      w.a,
+      "thumbnails",
+      size,
+      sha(body).slice(0, 2),
+      // Refusals are `v2` since T-074a; JPEGs and timeouts stay `v1`.
+      `${sha(body)}.${kind === "none" ? "v2" : "v1"}.${kind}`,
+    );
 
   it("remembers a timeout for a day, then tries again (B3)", async () => {
     const slow = createThumbnailRenderer({ timeoutMs: 1 });

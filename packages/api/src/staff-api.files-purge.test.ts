@@ -276,7 +276,7 @@ describe("the purge's steps", () => {
     expect(readdirSync(trashOf(body)).sort()).toEqual([
       "content",
       "marked",
-      "thumbnail-small-v1.none",
+      "thumbnail-small-v2.none",
     ]);
     expect(await store.readThumbnail(w.a, sha(body), "small")).toBeUndefined();
     // A file still attached is never touched, however old its copy.

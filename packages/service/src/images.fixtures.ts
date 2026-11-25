@@ -1214,3 +1214,21 @@ export function blockJpeg(
   parts.push(Buffer.from([0xff, 0xd9]));
   return Buffer.concat(parts);
 }
+
+/**
+ * A baseline JPEG of seeded noise over a gradient at quality 95 (T-074a):
+ * real AC data in every block and several megabytes of it, so a decode's
+ * reading of AC codes and the plan's count of the input are both measured.
+ */
+export function noiseJpeg(width: number, height: number): Buffer {
+  const data = new Uint8Array(width * height * 4);
+  let seed = 12_345;
+  for (let i = 0; i < data.length; i++) {
+    seed = (seed * 1_103_515_245 + 12_345) & 0x7fffffff;
+    data[i] =
+      i % 4 === 3
+        ? 255
+        : Math.round(((seed >> 16) & 255) * 0.4 + ((i >> 2) % width) * (150 / width));
+  }
+  return jpeg.encode({ width, height, data }, 95).data;
+}
