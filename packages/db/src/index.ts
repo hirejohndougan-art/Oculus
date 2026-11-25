@@ -93,6 +93,7 @@ export {
   changeWorkflowState,
   publishCheckIssues,
   readPublicRecord,
+  readSharedPublicRecord,
   publicValueSources,
   inheritedValues,
   recordDependents,
@@ -106,6 +107,9 @@ export {
 export type {
   InheritedValue,
   PublicRecordOptions,
+  SharedHome,
+  SharedPublicRecord,
+  SharedPublicRecordOptions,
   PublicValueSource,
   StateListEntry,
   WorkflowChangeResult,
