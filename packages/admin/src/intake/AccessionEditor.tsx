@@ -61,8 +61,19 @@ export function EditAccession() {
   return <AccessionScreen id={accessionId ?? ""} />;
 }
 
+/** What the last save said: kept here, above the editor, which starts afresh for each version. */
+interface AfterSave {
+  readonly saved: boolean;
+  readonly nowHeld: readonly string[];
+}
+
 function AccessionScreen(props: { readonly id: string | undefined }) {
   const read = useAccession(props.id);
+  const arrived = (useLocation().state ?? {}) as Arrived;
+  const [after, setAfter] = useState<AfterSave>({
+    saved: arrived.saved === true,
+    nowHeld: arrived.nowHeld ?? [],
+  });
   const title = props.id === undefined ? "Log an accession" : "Accession";
   if (props.id !== undefined) {
     if (read.error !== null) return <Refused title={title} error={read.error} />;
@@ -76,6 +87,10 @@ function AccessionScreen(props: { readonly id: string | undefined }) {
       initial={view === undefined ? EMPTY_FORM : formOf(view.accession)}
       id={view?.accession.id}
       version={view?.version}
+      after={after}
+      onSaved={(nowHeld) => {
+        setAfter({ saved: true, nowHeld });
+      }}
     />
   );
 }
@@ -84,16 +99,18 @@ function AccessionEditor(props: {
   readonly initial: AccessionForm;
   readonly id: string | undefined;
   readonly version: number | undefined;
+  readonly after: AfterSave;
+  readonly onSaved: (nowHeld: readonly string[]) => void;
 }) {
   const navigate = useNavigate();
   const queries = useQueryClient();
-  const arrived = (useLocation().state ?? {}) as Arrived;
   const types = useIdentifierTypes();
   const [form, setForm] = useState<AccessionForm>(props.initial);
   const [busy, setBusy] = useState(false);
   const [problem, setProblem] = useState<string>();
-  const [saved, setSaved] = useState(arrived.saved === true);
-  const held = arrived.nowHeld ?? [];
+  // "Saved." until the person changes something.
+  const [saved, setSaved] = useState(props.after.saved);
+  const held = props.after.nowHeld;
   const [picking, setPicking] = useState<"donor" | "records" | undefined>(
     props.id === undefined ? "donor" : undefined,
   );
@@ -126,19 +143,16 @@ function AccessionEditor(props: {
         body,
         ...(props.version === undefined ? {} : { ifMatch: props.version }),
       });
-      await queries.invalidateQueries({ queryKey: REGISTER_KEY });
-      // What the fresh form (keyed by version) starts with: first the
-      // address's state, then the new version.
-      await navigate(".", {
-        replace: true,
-        state: { saved: true, nowHeld: next.nowHeld } satisfies Arrived,
-      });
+      // What the fresh form (keyed by version) starts with: first what the
+      // save said, then the new version.
+      props.onSaved(next.nowHeld);
       queries.setQueryData(accessionKey(id), {
         accession: next.accession,
         version: next.version,
         createdAt: next.createdAt,
         updatedAt: next.updatedAt,
       });
+      await queries.invalidateQueries({ queryKey: REGISTER_KEY });
     } catch (error) {
       setProblem(accessionProblem(error));
     } finally {
@@ -175,7 +189,7 @@ function AccessionEditor(props: {
         <TextLink href="/intake/accessions">Back to accessions</TextLink>
       </div>
       <div aria-live="polite">{saved ? <Note tone="green">Saved.</Note> : null}</div>
-      <HeldRecords recordIds={held} accessionNumber={props.initial.numberValue} />
+      <HeldRecords recordIds={held} />
       <form
         className={styles.panel}
         aria-label={isNew ? "New accession" : "Accession"}

@@ -7,8 +7,9 @@ import { useQuery } from "@tanstack/react-query";
 import { ApiError, api } from "../api";
 import type { AccessionPage, AccessionView, DonorContactView } from "./model";
 
-export const REGISTER_KEY = ["accessions"] as const;
-export const accessionKey = (id: string) => ["accessions", "one", id] as const;
+// Separate prefixes: invalidating the register never refetches an accession open in the editor.
+export const REGISTER_KEY = ["accession-register"] as const;
+export const accessionKey = (id: string) => ["accession", id] as const;
 export const contactKey = (agentId: string) => ["donor-contact", agentId] as const;
 
 /** At most this many pages (of 200) are read for one screen. */

@@ -85,10 +85,7 @@ function HeldRecord(props: { readonly recordId: string; readonly reason: string 
   );
 }
 
-export function HeldRecords(props: {
-  readonly recordIds: readonly string[];
-  readonly accessionNumber: string;
-}) {
+export function HeldRecords(props: { readonly recordIds: readonly string[] }) {
   if (props.recordIds.length === 0) return null;
   return (
     <section className={styles.panel} aria-labelledby="held-title">
@@ -108,7 +105,7 @@ export function HeldRecords(props: {
           <HeldRecord
             key={id}
             recordId={id}
-            reason={`Held back by accession ${props.accessionNumber}`}
+            reason="Held back by an accession (its deed or a restriction)"
           />
         ))}
       </ul>

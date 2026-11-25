@@ -107,7 +107,7 @@ export function accessionsApiRoutes(shared: Shared): OculusRoute[] {
       path: "/api/accessions",
       handler: signedIn("read", false, async (request, reply, { context }) => {
         const before = queryText(request, "before");
-        if (before !== undefined && !/^[0-9a-f-]{36}$/.test(before)) {
+        if (before !== undefined && !/^[0-9a-f-]{36}$/i.test(before)) {
           throw new Refusal(400, "bad_query");
         }
         const result = await service.listAccessions(

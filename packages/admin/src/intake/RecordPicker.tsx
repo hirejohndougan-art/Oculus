@@ -40,7 +40,7 @@ export function RecordPicker(props: {
     setProblem(undefined);
     try {
       const reply = await api<{ records: ListedRecord[] }>(
-        `/api/records?q=${encodeURIComponent(query.trim())}&limit=25`,
+        `/api/records?q=${encodeURIComponent(query.trim())}&limit=100`,
         { site },
       );
       setFound(reply.records.filter((r) => props.kinds.includes(r.kind)));
@@ -56,7 +56,20 @@ export function RecordPicker(props: {
     }
   }
 
-  const idOk = RECORD_ID.test(byId.trim()) && byIdLabel.trim() !== "";
+  const idOk = RECORD_ID.test(byId.trim().toLowerCase()) && byIdLabel.trim() !== "";
+  const takeId = () => {
+    if (!idOk) return;
+    props.onPick({ recordId: byId.trim().toLowerCase(), label: byIdLabel.trim() });
+    setById("");
+    setByIdLabel("");
+  };
+  // Enter in the picker's own fields never submits the accession's form.
+  const enterUsesId = (event: { key: string; preventDefault: () => void }) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      takeId();
+    }
+  };
   return (
     <div className={styles.panel} role="group" aria-label={props.label}>
       <div className={styles.grid}>
@@ -140,6 +153,7 @@ export function RecordPicker(props: {
             onChange={(event) => {
               setById(event.target.value);
             }}
+            onKeyDown={enterUsesId}
           />
         </label>
         <label className={styles.label}>
@@ -151,18 +165,11 @@ export function RecordPicker(props: {
             onChange={(event) => {
               setByIdLabel(event.target.value);
             }}
+            onKeyDown={enterUsesId}
           />
         </label>
         <div className={styles.actions}>
-          <Button
-            variant="secondary"
-            isDisabled={!idOk}
-            onPress={() => {
-              props.onPick({ recordId: byId.trim().toLowerCase(), label: byIdLabel.trim() });
-              setById("");
-              setByIdLabel("");
-            }}
-          >
+          <Button variant="secondary" isDisabled={!idOk} onPress={takeId}>
             Use this ID
           </Button>
         </div>

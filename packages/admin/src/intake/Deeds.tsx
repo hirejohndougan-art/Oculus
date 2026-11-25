@@ -131,9 +131,7 @@ export function Deeds() {
         </div>
         <TextLink href="/intake/accessions/new">Log an accession</TextLink>
       </div>
-      {held === undefined ? null : (
-        <HeldRecords recordIds={held.ids} accessionNumber={held.number} />
-      )}
+      {held === undefined ? null : <HeldRecords recordIds={held.ids} />}
       {waiting.length === 0 ? (
         <Note tone="green">Every accession has its deed signed or doesn&apos;t need one.</Note>
       ) : (

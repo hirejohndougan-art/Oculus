@@ -191,7 +191,9 @@ describe("logging an accession", () => {
       return found;
     });
     expect(withdraw?.headers["if-match"]).toBe('"v4"');
-    expect(withdraw?.body).toEqual({ reason: "Held back by accession 2026.014" });
+    expect(withdraw?.body).toEqual({
+      reason: "Held back by an accession (its deed or a restriction)",
+    });
   });
 
   it("edits from the version read, and says so when someone else saved first", async () => {
@@ -214,6 +216,52 @@ describe("logging an accession", () => {
       accession: { note: "Invented note", accessRestriction: { kind: "staff_and_researchers" } },
     });
     expect(Object.keys((put?.body as { accession: object }).accession)).not.toContain("id");
+  });
+});
+
+describe("editing an accession", () => {
+  it("says Saved after a successful edit and offers what it now holds back", async () => {
+    let version = 3;
+    const current = () =>
+      view(
+        accession(ACC_2, {
+          deedStatus: version === 3 ? "signed" : "sent",
+          records: [{ recordId: LANTERN, label: "Lantern" }],
+        }),
+        version,
+      );
+    server({
+      [`GET /api/accessions/${ACC_2}`]: () => [200, current()],
+      [`PUT /api/accessions/${ACC_2}`]: () => {
+        version = 4;
+        return [200, { ...current(), nowHeld: [LANTERN] }];
+      },
+      [`GET /api/records/${LANTERN}`]: [404, { error: "not_found" }],
+    });
+    const user = userEvent.setup();
+    renderAt(`/intake/accessions/${ACC_2}`);
+    await user.selectOptions(await screen.findByLabelText("Deed status"), "sent");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(await screen.findByText("Saved.")).toBeTruthy();
+    expect(
+      await screen.findByRole("region", { name: "Published records now held back" }),
+    ).toBeTruthy();
+    expect(await screen.findByText(/A record you can't see/)).toBeTruthy();
+  });
+
+  it("Enter in the record ID field adds it and doesn't save the accession", async () => {
+    const sent = server({ [`GET /api/accessions/${ACC_2}`]: [200, REGISTER.accessions[1]] });
+    const user = userEvent.setup();
+    renderAt(`/intake/accessions/${ACC_2}`);
+    await user.click(await screen.findByRole("button", { name: "Add a record" }));
+    const add = screen.getByRole("group", { name: "Add a record" });
+    await user.type(within(add).getByLabelText("And a label for it"), "Box");
+    await user.type(
+      within(add).getByLabelText("Or the record's ID"),
+      `${AGENT.toUpperCase()}{Enter}`,
+    );
+    expect(await screen.findByRole("button", { name: "Remove Box" })).toBeTruthy();
+    expect(sent.some((s) => s.method === "PUT")).toBe(false);
   });
 });
 

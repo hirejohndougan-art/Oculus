@@ -10,7 +10,7 @@ import { api } from "../api";
 import type { AccessionPage } from "./model";
 import styles from "./Intake.module.css";
 
-export const INTAKE_ACCESS_KEY = ["accessions", "access"] as const;
+export const INTAKE_ACCESS_KEY = ["accession-register", "access"] as const;
 
 export function IntakeNav() {
   const location = useLocation();
