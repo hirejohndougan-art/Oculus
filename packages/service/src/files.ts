@@ -457,13 +457,20 @@ export function fileOperations(
         // database can still adopt, below), then the row.
         if (!(await store.isEmpty())) return { ok: false, problem: "not_empty" };
         const storeId = randomUUID();
+        let wrote = false;
         try {
           await store.writeMarker(storeId, identity);
+          wrote = true;
         } catch {
           // Another server of this database (or another install) wrote one
           // first: decided below from what it wrote.
         }
-        marker = await markerSettled(store);
+        if (wrote) {
+          held = await insertFileStoreBinding(db, storeId);
+          marker = { storeId, database: identity };
+        } else {
+          marker = await markerSettled(store);
+        }
       }
       if (held === undefined && marker !== undefined) {
         // A marker without this database's row: either another server of
