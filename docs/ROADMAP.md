@@ -366,7 +366,7 @@ Admin screens in the browser:
   - From D-019 and D-025, handed over by T-019 (its own task because T-048 is people, roles and the audit trail): the System settings screen for the whole install, system managers only (T-041): sites (create, rename, which organization), sign-in and security rules, site password protection (with T-019d), email, backups and updates. Separate from each site's own Site settings.
 
 Server and deployment:
-- [~] T-050 **Server layout for the admin and the public sites.** deps: T-042 (risky) Split into T-050a (done), T-050b and T-050c.
+- [x] T-050 **Server layout for the admin and the public sites.** deps: T-042 (risky) Split into T-050a to T-050e, all done.
   - One app (D-034). The public sites may read only published data, through a read-only path (its own database role or a public read API) that tests show can't reach staff fields or unpublished records. Public pages render only `publicOutput` results, never a `publicView` directly, and build them with the records and templates loaded at publish or request time (D-054).
   - Render only `publicOutput`'s public forms (`dublinCore`, `jsonLd`, `jsonLdText`, `oaiDcXml`), never the whole result: `staffWarnings` is staff-only (S-011c).
   - Public Subjects pages (D-062): never call `termUsageCounts` or read `record_terms` from a public site. Their counts are staff-only (unpublished records and staff fields too); public counts come from T-034's count over `publicOutput` or the public views of published records (or the index built from them at publish time).
