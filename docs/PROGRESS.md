@@ -10,6 +10,22 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Gate: PASS (full gate, end-to-end included, after the review fixes) · tests_passing 4565 (was 4405) · npm audit clean
 - Next: T-060a filed (the change log); T-051 notes added for SiteGround. Renumbered twice: T-056/D-088 went to the desktop launcher and T-058 to IIIF while this was built.
 
+## 2026-11-25 00:40 CT — manual (Chat C) — T-050b Stored Dublin Core mappings
+- Result: done (the old T-050b split into T-050b, T-050d and T-050e)
+- What changed: migration 0022 (`dublin_core_mappings`, `public_dublin_core_mapping`); `packages/db/src/dublin-core-mappings.ts`; `readPublicRecord` uses the stored mapping when none is passed; service `readDublinCoreMapping`/`saveDublinCoreMapping`; `GET`/`PUT /api/templates/:key/dublin-core`.
+- Decisions: D-096
+- Review: one independent round, nothing blocking; fixed a mapping without rights taking records offline, the full record read under the lock, the version check passable by direct SQL, and two stale comments.
+- Gate: PASS · tests_passing 4420 (was 4411) · npm audit clean. Migration renumbered 0022 at merge (main stopped at 0021).
+- Next: T-050d (public record reads)
+
+## 2026-11-25 00:35 CT — manual (Chat E) — S-026 Publish check for ID number formats
+- Result: done
+- What changed: the publish check (`publishCheckIssues`) runs the public output's own template check (`publicTemplateIssues`, new in core), so a public ID number that no longer fits its type's changed format fails it (`format_mismatch`, fixed text) instead of the record passing and quietly dropping off the public sites; `identifierTypeChanges` takes `existing.published` and lists on `format_changed` the published records that would show as not available. Tests in core and against the database (publish check, public output, the fix path, inherited numbers). Follow-up S-033 (the service-side confirmation).
+- Decisions: D-091
+- Review: one independent round. Fixed: records that only inherit a misfit number were listed as going offline (they stay public without it; now tested against `readPublicRecord`); an error code; D-091 now says the publish check applies every template-check refusal. The missing service confirmation is S-033.
+- Gate: PASS · tests_passing 4411 (was 4405) · npm audit clean
+- Next: T-034d (public subject counts, Chat E)
+
 ## 2026-11-25 00:15 CT — manual (Chat D) — T-057 Desktop database helper
 - Result: done
 - What changed: `npm run desktop:database` makes `oculus_owner`, `oculus_app` and the `oculus` database on the person's own PostgreSQL with the `postgres` password typed once (SCRAM verifiers, never plain passwords), keeps the passwords only in pgpass, writes `desktop.json` and runs setup; resumes an unfinished setup; undoes a failed creation. The launcher migrates as the owner, grants and checks the writer, and serves as the writer. `start-oculus.cmd` runs the helper the first time. `@oculus/db` exports `createDatabase`, `dropDatabase`, `runSetupCli`, `terminalAsk`.

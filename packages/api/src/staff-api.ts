@@ -65,6 +65,12 @@
  * the changes also need a recent sign-in (`403 reauthentication_required`).
  * An unknown site is `404 not_found`.
  *
+ * Dublin Core mappings (T-050b, D-096): `GET`/`PUT
+ * /api/templates/:key/dublin-core`, a template's stored mapping
+ * (`If-None-Match: *` for the first, `If-Match: "v<N>"` after; a change
+ * shown at once on published records answers `409 confirmation_required`
+ * until `confirmPublished`).
+ *
  * Not here: signing in, the second step, password reset and signing out
  * (T-045 adds those routes beside these, with `credentials: true` for the
  * 8 KiB limit, and writes the cookie through the reply's cookie writer).
@@ -814,6 +820,46 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
           {
             expectedVersion: precondition === "new" ? 0 : Number(precondition.tag),
             ...(body.confirm === undefined ? {} : { confirm: body.confirm }),
+            ...(body.confirmPublished === undefined
+              ? {}
+              : { confirmPublished: body.confirmPublished }),
+          },
+        );
+        return answer(result, reply, (value) => {
+          if (precondition === "new") reply.status(201);
+          reply.header("etag", `"v${String(value.version)}"`);
+          return value;
+        });
+      }),
+    },
+    // A template's Dublin Core mapping (T-050b, D-096, D-012): read by anyone
+    // who may read templates; saved by those who may change definitions,
+    // with D-076's published-records confirmation.
+    {
+      method: "GET",
+      path: "/api/templates/:key/dublin-core",
+      handler: signedIn("read", false, async (request, reply, { context }) => {
+        const result = await service.readDublinCoreMapping(context, request.params.key ?? "");
+        return answer(result, reply, (value) => {
+          if (value.version > 0) reply.header("etag", `"v${String(value.version)}"`);
+          return value;
+        });
+      }),
+    },
+    {
+      method: "PUT",
+      path: "/api/templates/:key/dublin-core",
+      handler: signedIn("write", true, async (request, reply, { context }) => {
+        const precondition = newOrMatch(request, VERSION_TAG);
+        const body = objectBody(request);
+        const extra = onlyKeys(body, ["mapping", "confirmPublished"], reply);
+        if (extra) return extra;
+        const result = await service.saveDublinCoreMapping(
+          context,
+          request.params.key ?? "",
+          body.mapping,
+          {
+            expectedVersion: precondition === "new" ? 0 : Number(precondition.tag),
             ...(body.confirmPublished === undefined
               ? {}
               : { confirmPublished: body.confirmPublished }),
