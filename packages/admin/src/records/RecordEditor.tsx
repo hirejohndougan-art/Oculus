@@ -432,7 +432,9 @@ function Editor(props: EditorProps) {
                   ? (template?.fields.find((f) => `fields.${f.key}` === n)?.label ?? n.slice(7))
                   : n === "workflowState"
                     ? "status"
-                    : n,
+                    : n.startsWith("identifiers.")
+                      ? `ID numbers (${n.slice(12)})`
+                      : n,
               )
           : [];
         setConflict({ changed });

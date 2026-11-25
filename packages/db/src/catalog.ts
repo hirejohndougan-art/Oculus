@@ -848,12 +848,26 @@ export async function versionConflict(
   const differences: ChangedName[] = compared.value.differences.map(({ name, change }) =>
     Object.freeze({ name, change }),
   );
-  // The numbers aren't part of the record's content: the versions between
-  // name the identifier types they changed (S-061).
+  // The numbers aren't part of the record's content (S-061): compare the two
+  // versions' snapshots, like the content. A version from before 0050 has
+  // none: then the versions between name the types they changed.
   const numbers = await db.rows<{ name: string }>(sql`
-    SELECT DISTINCT n AS name
-    FROM public.record_versions, unnest(changed_fields) AS n
-    WHERE organization_id = ${organizationId}::uuid AND record_id = ${recordId}::uuid
+    WITH ends AS (
+      SELECT (SELECT identifiers FROM public.record_versions
+              WHERE organization_id = ${organizationId}::uuid AND record_id = ${recordId}::uuid
+                AND version = ${expectedVersion}::integer) AS was,
+             (SELECT identifiers FROM public.record_versions
+              WHERE organization_id = ${organizationId}::uuid AND record_id = ${recordId}::uuid
+                AND version = ${current.version}::integer) AS now)
+    SELECT 'identifiers.' || k AS name
+    FROM ends, (SELECT jsonb_object_keys(now) AS k FROM ends
+                UNION SELECT jsonb_object_keys(was) FROM ends) AS keys
+    WHERE was IS NOT NULL AND now IS NOT NULL AND (was -> k) IS DISTINCT FROM (now -> k)
+    UNION
+    SELECT DISTINCT n
+    FROM ends, public.record_versions, unnest(changed_fields) AS n
+    WHERE (ends.was IS NULL OR ends.now IS NULL)
+      AND organization_id = ${organizationId}::uuid AND record_id = ${recordId}::uuid
       AND version > ${expectedVersion}::integer AND version <= ${current.version}::integer
       AND n LIKE 'identifiers.%'`);
   for (const { name } of numbers) differences.push(Object.freeze({ name, change: "changed" }));

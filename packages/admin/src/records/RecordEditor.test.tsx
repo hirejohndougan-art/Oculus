@@ -180,7 +180,10 @@ describe("the record editor's form", () => {
             conflict: {
               expectedVersion: 3,
               currentVersion: 4,
-              differences: [{ name: "fields.note", change: "changed" }],
+              differences: [
+                { name: "fields.note", change: "changed" },
+                { name: "identifiers.object_number", change: "changed" },
+              ],
             },
           },
         ],
@@ -191,7 +194,8 @@ describe("the record editor's form", () => {
     await userEvent.type(screen.getByLabelText(/^Shelf/), "Mine");
     await userEvent.click(screen.getByRole("button", { name: "Save changes" }));
     const alert = await screen.findByText(/Someone else changed this record since you opened it/);
-    expect(alert.textContent).toContain("(Note)");
+    expect(alert.textContent).toContain("Note");
+    expect(alert.textContent).toContain("ID numbers (object_number)");
     expect(alert.textContent).toContain("Nothing was overwritten");
     expect(sent.filter((s) => s.method === "PUT")).toHaveLength(1);
     // My text is still on screen.

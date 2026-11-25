@@ -2152,6 +2152,24 @@ describe("restoring through the service", () => {
         former: [{ value: "OLD-7", note: "Before 1990." }],
       },
     });
+    // Numbers changed and changed back: a conflict, but nothing named as
+    // changed from where the stale copy started (as for content).
+    const kept = { current: numbers("DHS-2", "DHS-1").current, former: former.identifiers.former };
+    ok(
+      await service.saveIdentifiers(ctx(org), record.id, numbers("DHS-2"), {
+        expectedVersion: 4,
+        confirmDropped: [
+          { type: "object_number", value: "DHS-1" },
+          { type: "object_number", value: "OLD-7" },
+        ],
+      }),
+    );
+    ok(await service.saveIdentifiers(ctx(org), record.id, kept, { expectedVersion: 5 }));
+    const late = await service.saveIdentifiers(ctx(org, BOB), record.id, kept, {
+      expectedVersion: 4,
+    });
+    expect(codes(late)).toEqual(["version_conflict"]);
+    expect(late.ok ? undefined : late.conflict?.differences).toEqual([]);
   });
 
   it("restores an old version as the next one and refreshes the terms", async () => {
