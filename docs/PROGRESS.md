@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 05:10 CT — Chat J — T-041f Shared items on the public sites
+- Result: done
+- What changed: migration 0036 adds `public.shared_record_home` (SECURITY DEFINER, in `PUBLIC_READER_FUNCTIONS`); `readSharedPublicRecord` in workflow.ts reads an accepted item's home public output in one Repeatable Read snapshot; `GET /records/:id` falls back to it and adds `sharedFrom`. `record_public_on_site` is unchanged, so OAI-PMH and subject counts don't list shared items.
+- Decisions: D-111
+- Review: one independent round, nothing blocking; fixed an ambiguous-ID case (`LIMIT 1` with no order, and a site's own record sharing an ID with a shared one), documented the migration order, the two reads and their cost, and added tests (exact equality with the home output, a moved item reading as the site's own, an accepted item without a stored mapping).
+- Gate: PASS · tests_passing TBD (was 4729) · npm audit clean
+- Next: S-037
+
 ## 2026-11-25 04:45 CT — upkeep — U-006 Main's gate fails in a clean checkout
 - Result: gate fix
 - What changed: CI's gate on main had failed at lint on every push since M-001 (`files.spec.ts` imports `@oculus/api`, resolved to an unbuilt `dist`); `packages/admin/tsconfig.json` now maps `@oculus/api`, `db` and `service` to their sources (c3f0f46). Also in-major updates: @types/node 26.6.10, @types/react 19.3.2, react-router 8.5.3. TypeScript 7 / Vite 8 rechecked, still blocked (T-001b). Filed U-007 (the gate should start with no `dist`).
