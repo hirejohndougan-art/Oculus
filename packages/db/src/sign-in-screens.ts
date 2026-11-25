@@ -114,6 +114,12 @@ export async function organizationChoices(
 export interface SignedInPerson {
   readonly displayName: string;
   readonly email: string;
+  /**
+   * Wrong two-step codes recorded for this account in the last 30 days
+   * (D-077's alerts, D-085): the count and the newest one's time, so the
+   * person sees it after signing in even if the email was lost.
+   */
+  readonly secondStepAlerts: { readonly recent: number; readonly lastAt: string | null };
 }
 
 /**
@@ -126,11 +132,28 @@ export async function readSignedInPerson(
   userId: UserId,
 ): Promise<SignedInPerson | undefined> {
   if (!isUserId(userId)) return undefined;
-  const rows = await db.rows<{ display_name: string; email: string }>(sql`
-    SELECT display_name, email FROM public.users
-    WHERE id = ${userId}::uuid AND disabled_at IS NULL`);
+  const rows = await db.rows<{
+    display_name: string;
+    email: string;
+    alerts: number;
+    last_alert: string | null;
+  }>(sql`
+    SELECT u.display_name, u.email,
+           (SELECT count(*)::int FROM public.second_step_alerts a
+            WHERE a.user_id = u.id
+              AND a.created_at > clock_timestamp() - interval '30 days') AS alerts,
+           (SELECT to_char(max(a.created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+            FROM public.second_step_alerts a
+            WHERE a.user_id = u.id
+              AND a.created_at > clock_timestamp() - interval '30 days') AS last_alert
+    FROM public.users u
+    WHERE u.id = ${userId}::uuid AND u.disabled_at IS NULL`);
   const row = rows[0];
   return row === undefined
     ? undefined
-    : Object.freeze({ displayName: row.display_name, email: row.email });
+    : Object.freeze({
+        displayName: row.display_name,
+        email: row.email,
+        secondStepAlerts: Object.freeze({ recent: row.alerts, lastAt: row.last_alert }),
+      });
 }

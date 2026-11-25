@@ -115,6 +115,19 @@ export type PasswordResetDelivery = (
   signal: AbortSignal,
 ) => Promise<void>;
 
+/** The notice after a reset: the account's own address and when (core's ISO form). No token. */
+export interface PasswordChangedMessage {
+  readonly email: string;
+  readonly changedAt: string;
+}
+
+/**
+ * Tells the account that its password was just changed by a reset link
+ * (T-040: the mailer's `deliverPasswordChanged`). Called after the commit
+ * and not awaited; what it rejects with is dropped.
+ */
+export type PasswordChangedDelivery = (message: PasswordChangedMessage) => Promise<void>;
+
 /**
  * What became of a request, after the reply (for the server's log; never
  * shown to the person who asked, and never holding the token or address):
@@ -778,11 +791,21 @@ const BUSY_MESSAGE = "Too many passwords are being checked right now. Try again 
 export async function completePasswordReset(
   db: Database,
   input: ResetCompletion,
-  options: { readonly onError?: (error: unknown) => void } = {},
+  options: {
+    readonly onError?: (error: unknown) => void;
+    readonly notifyChanged?: PasswordChangedDelivery;
+  } = {},
 ): Promise<Validated<{ readonly reset: true }>> {
   const onError = own(options, "onError");
-  if (!hasOnly(options, ["onError"]) || (onError !== undefined && typeof onError !== "function")) {
-    throw new TypeError("completePasswordReset's options take onError (a function) only.");
+  const notifyChanged = own(options, "notifyChanged");
+  if (
+    !hasOnly(options, ["onError", "notifyChanged"]) ||
+    (onError !== undefined && typeof onError !== "function") ||
+    (notifyChanged !== undefined && typeof notifyChanged !== "function")
+  ) {
+    throw new TypeError(
+      "completePasswordReset's options take onError and notifyChanged (functions) only.",
+    );
   }
   const call = onError === undefined ? {} : { onError: onError as (error: unknown) => void };
   if (!hasOnly(input, ["token", "password"])) {
@@ -865,6 +888,16 @@ export async function completePasswordReset(
       } catch (error) {
         if (!isDatabaseFailure(error)) throw error;
         notify(call.onError, error);
+      }
+      // Tell the account's own address that its password changed (T-040,
+      // D-085): after the commit, never awaited, never holding a token.
+      if (notifyChanged !== undefined) {
+        const message = Object.freeze({ email: reset.email, changedAt: new Date().toISOString() });
+        try {
+          void (notifyChanged as PasswordChangedDelivery)(message).catch(() => undefined);
+        } catch {
+          // A sender that throws changes nothing: the reset is done.
+        }
       }
     }
     return done;

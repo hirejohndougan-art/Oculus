@@ -24,6 +24,7 @@ import { PERMISSION_TABLE_PRIVILEGES } from "./permissions.js";
 import type { Queryable } from "./client.js";
 import { PASSWORD_RESET_TABLE_PRIVILEGES } from "./password-resets.js";
 import { SECOND_FACTOR_TABLE_PRIVILEGES } from "./second-factor.js";
+import { ALERT_NOTICE_TABLE_PRIVILEGES } from "./alert-notices.js";
 import { SESSION_TABLE_PRIVILEGES } from "./sessions.js";
 import { STORED_FILE_TABLE_PRIVILEGES } from "./stored-files.js";
 import { sql } from "./sql.js";
@@ -81,6 +82,8 @@ export const WRITER_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Ob
   ...STORED_FILE_TABLE_PRIVILEGES,
   // The change log of people and roles (T-048, D-084): insert only.
   ...PEOPLE_TABLE_PRIVILEGES,
+  // Two-step alert notices (D-085): one row per alert, only ever added.
+  ...ALERT_NOTICE_TABLE_PRIVILEGES,
 });
 
 /**

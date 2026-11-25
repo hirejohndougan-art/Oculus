@@ -44,6 +44,7 @@ const stop = async () => {
     database.stop();
     rmSync(seedFile, { force: true });
     if (ownFilesDir) rmSync(filesDir, { recursive: true, force: true });
+    rmSync(`${seedFile}.root-recovery.json`, { force: true });
     process.exit(0);
   }
 };

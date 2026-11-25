@@ -62,6 +62,13 @@
  * counted as it streams), after the session, CSRF, `If-Match` and the
  * asset's edit permission are checked and before a byte is read; `GET
  * /api/records/:id/files` lists an asset's files. Never the bytes (M-003).
+ * System settings (T-048a, D-087): `POST /api/sites` and `PUT
+ * /api/sites/:id` make and rename a site (in the session's organization, or
+ * the `organizationId` given), and `GET`/`PUT /api/system-settings` read and
+ * change the sign-in rules (`If-None-Match: *` for the first change, else
+ * `If-Match: "v<N>"`). The service lets only system managers do any of it;
+ * the changes also need a recent sign-in (`403 reauthentication_required`).
+ * An unknown site is `404 not_found`.
  *
  * Not here: signing in, the second step, password reset and signing out
  * (T-045 adds those routes beside these, with `credentials: true` for the
@@ -102,11 +109,17 @@ export interface ApiLogRecord {
     | "sign_in_error"
     | "client_address_warning"
     | "reset_settled"
-    | "reset_link_produced"
-    // The people routes in development (admin-server.ts, T-048).
-    | "invitation_produced"
-    | "set_up_link_produced"
-    | "startup_warning";
+    | "startup_warning"
+    // The mail outbox and senders (mail-outbox.ts, mail.ts, D-085): the
+    // message kind as `operation`, an error class or reason as `code`.
+    | "mail_sent"
+    | "mail_retry"
+    | "mail_failed"
+    | "mail_refused"
+    | "mail_dropped"
+    | "mail_dev"
+    // The two-step alert notices (alert-notices.ts): people notified, as `code`.
+    | "alert_notices";
   readonly operation?: string;
   readonly code?: string;
   readonly name?: string;
@@ -400,7 +413,8 @@ export function refused(
         (NO_VERSION_CODES.has(i.code) &&
           i.path.length === 1 &&
           VERSION_PATHS.has(String(i.path[0]))) ||
-        (i.code === "unknown_template" && onPath(i, "key")),
+        (i.code === "unknown_template" && onPath(i, "key")) ||
+        (i.code === "unknown_site" && onPath(i, "siteId")),
     )
   ) {
     throw new Refusal(404, "not_found");
@@ -1021,5 +1035,80 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
         });
       }),
     },
+    // System settings (T-048a, D-087): sites and the sign-in rules, for
+    // system managers only (the service refuses everyone else). Making or
+    // renaming a site and changing the rules also need a recent sign-in
+    // (the T-041 review, D-072), checked here from the session.
+    {
+      method: "POST",
+      path: "/api/sites",
+      handler: signedIn("write", true, async (request, reply, { session, context }) => {
+        const body = objectBody(request);
+        const extra = onlyKeys(body, ["organizationId", "name"], reply);
+        if (extra) return extra;
+        recentSignIn(session);
+        const result = await service.createSite(context, body);
+        return answer(result, reply, (site) => {
+          reply.status(201);
+          return { site };
+        });
+      }),
+    },
+    {
+      method: "PUT",
+      path: "/api/sites/:id",
+      handler: signedIn("write", true, async (request, reply, { session, context }) => {
+        const body = objectBody(request);
+        const extra = onlyKeys(body, ["organizationId", "name"], reply);
+        if (extra) return extra;
+        recentSignIn(session);
+        const result = await service.renameSite(context, {
+          ...body,
+          siteId: request.params.id ?? "",
+        });
+        return answer(result, reply, (site) => ({ site }));
+      }),
+    },
+    {
+      method: "GET",
+      path: "/api/system-settings",
+      handler: signedIn("read", false, async (_request, reply, { context }) => {
+        const result = await service.readSystemSettings(context);
+        return answer(result, reply, (value) => {
+          if (value.version > 0) reply.header("etag", `"v${String(value.version)}"`);
+          return value;
+        });
+      }),
+    },
+    {
+      method: "PUT",
+      path: "/api/system-settings",
+      handler: signedIn("write", true, async (request, reply, { session, context }) => {
+        const precondition = newOrMatch(request, VERSION_TAG);
+        const body = objectBody(request);
+        const extra = onlyKeys(body, ["settings"], reply);
+        if (extra) return extra;
+        recentSignIn(session);
+        const result = await service.changeSystemSettings(context, body.settings, {
+          expectedVersion: precondition === "new" ? 0 : Number(precondition.tag),
+        });
+        return answer(result, reply, (value) => {
+          reply.header("etag", `"v${String(value.version)}"`);
+          return value;
+        });
+      }),
+    },
   ];
+}
+
+/**
+ * A change only a recently signed-in session may make (D-072, D-087): `403
+ * reauthentication_required` otherwise, as T-037's `endUserSessions` answers.
+ */
+function recentSignIn(session: FullSession): void {
+  // Anyone else is the service's to refuse (`not_permitted`), so a person
+  // who may not make the change is never told to sign in again for it.
+  if (session.systemAdmin && !session.recentlyAuthenticated) {
+    throw new Refusal(403, "reauthentication_required");
+  }
 }
