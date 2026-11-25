@@ -31,7 +31,15 @@
  */
 import type { ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { closeSync, constants, openSync, rmSync, writeSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  openSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import type { Readable } from "node:stream";
 import { join } from "node:path";
@@ -71,6 +79,10 @@ export interface ThumbnailRendererOptions {
   readonly check?: DecodeCheck;
   /** Tests only: what starts a decoder process (default `spawnDecoder`), to make it fail. */
   readonly spawn?: typeof spawnDecoder;
+  /** Descriptors that must be free before a process is started (default 16). */
+  readonly minFreeDescriptors?: number;
+  /** Tests only: the clock for the pause after running out of descriptors. */
+  readonly now?: () => number;
 }
 
 export type RenderResult =
@@ -110,6 +122,36 @@ export interface ThumbnailRenderer {
 
 /** The longest a decoder process may take to start and load its decoders (30 s). */
 const STARTUP_MS = 30_000;
+
+/** How long no process is started after a spawn failed for want of descriptors (60 s). */
+export const DESCRIPTOR_PAUSE_MS = 60_000;
+
+/**
+ * Descriptors this process may still open: its soft limit (Linux's
+ * /proc/self/limits) less those open (/proc/self/fd); `undefined` where
+ * that can't be read, and then nothing is checked.
+ */
+function descriptorsFree(): number | undefined {
+  try {
+    const line = readFileSync("/proc/self/limits", "latin1")
+      .split("\n")
+      .find((l) => l.startsWith("Max open files"));
+    if (line === undefined) return undefined;
+    const soft = line.slice("Max open files".length).trim().split(/\s+/)[0] ?? "";
+    if (soft === "unlimited") return Number.POSITIVE_INFINITY;
+    const limit = Number(soft);
+    if (!Number.isFinite(limit)) return undefined;
+    return limit - readdirSync("/proc/self/fd").length;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether a failed spawn was for want of descriptors. */
+const outOfDescriptors = (error: unknown): boolean => {
+  const code = (error as { code?: unknown } | null)?.code;
+  return code === "EMFILE" || code === "ENFILE";
+};
 
 /** Bytes given as such are written to a private temporary file for the decoder process. */
 function temporaryFile(bytes: Uint8Array): { fd: number; remove: () => void } {
@@ -151,19 +193,34 @@ export function createThumbnailRenderer(options: ThumbnailRendererOptions = {}):
   let nextId = 1;
   let closed = false;
   let started = 0;
+  const now = options.now ?? Date.now;
+  const minFree = options.minFreeDescriptors ?? 16;
+  /** No process is started before this (after EMFILE or ENFILE, review 3). */
+  let pausedUntil = 0;
 
   /** One attempt: a fresh decoder process for the job, answered once. */
   function attempt(
     job: Pending["job"],
     fd: number,
   ): { readonly result: Promise<RenderResult>; readonly stop: () => void } {
+    const refuse = (
+      code: "busy" | "failed",
+    ): {
+      readonly result: Promise<RenderResult>;
+      readonly stop: () => void;
+    } => ({ result: Promise.resolve({ ok: false, code }), stop: () => undefined });
+    // Not while paused after running out of descriptors, nor with too few free (review 3).
+    if (now() < pausedUntil) return refuse("busy");
+    const free = descriptorsFree();
+    if (free !== undefined && free < minFree) return refuse("busy");
     started++;
     let child: ChildProcess;
     try {
       child = (options.spawn ?? spawnDecoder)({ fd, killAt, heapMiB });
-    } catch {
+    } catch (error) {
       // No process at all (ENOMEM under strict overcommit, say): says nothing about the image.
-      return { result: Promise.resolve({ ok: false, code: "failed" }), stop: () => undefined };
+      if (outOfDescriptors(error)) pausedUntil = now() + DESCRIPTOR_PAUSE_MS;
+      return refuse("failed");
     }
     const pid = child.pid ?? -1;
     const parentWatches = options.parentWatch ?? procMemory("self") !== undefined;
@@ -198,9 +255,12 @@ export function createThumbnailRenderer(options: ThumbnailRendererOptions = {}):
       answer(value);
     };
     // Listened for first: a spawn that failed reports it here, never as an unhandled error.
-    child.on("error", () => {
+    child.on("error", (error) => {
+      if (outOfDescriptors(error)) pausedUntil = now() + DESCRIPTOR_PAUSE_MS;
       end({ ok: false, code: "failed" });
     });
+    /** Whether its watchdog has taken the job (its baseline and deadline set). */
+    let acknowledged = false;
     const growth = (): { now: number; peak: number } | undefined => {
       if (baseline === undefined) return undefined;
       const memory = procMemory(pid);
@@ -213,52 +273,63 @@ export function createThumbnailRenderer(options: ThumbnailRendererOptions = {}):
       if (marker.length < 256) marker += chunk.toString("latin1");
     });
     pipe?.on("error", () => undefined);
-    child.on("message", (message: ThumbnailAnswer | { readonly ready: true }) => {
-      if ("ready" in message) {
-        // Started, its decoders loaded and warmed up: its size now is the baseline.
-        baseline = procMemory(pid)?.rss;
-        clearTimeout(timer);
-        timer = setTimeout(() => {
-          // Too slow: kill the process (its job can't be interrupted otherwise).
-          end({ ok: false, code: "timeout" });
-        }, timeoutMs);
-        if (parentWatches && baseline !== undefined) {
-          sampler = setInterval(() => {
-            const seen = growth();
-            if (seen === undefined || seen.now <= killAt) return;
-            // Past the trigger: stopped at once (so it grows no further), its peak read, killed.
-            try {
-              process.kill(pid, "SIGSTOP");
-            } catch {
-              // Already gone: its exit says so.
-            }
-            const last = growth() ?? seen;
-            end({ ok: false, code: "killed", peakBytes: last.peak });
-          }, sampleMs);
+    child.on(
+      "message",
+      (message: ThumbnailAnswer | { readonly ready: true } | { readonly started: number }) => {
+        if ("started" in message) {
+          acknowledged = message.started === job.id;
+          return;
         }
-        const full: ThumbnailJob = { ...job, timeoutMs };
-        const sent: ThumbnailJob =
-          options.check === undefined ? full : { ...full, check: options.check };
-        child.send(sent, (error) => {
-          if (error !== null) end({ ok: false, code: "failed" });
-        });
-        return;
-      }
-      if (message.id !== job.id) return;
-      const seen = growth();
-      const peak = seen === undefined ? {} : { peakBytes: seen.peak };
-      end(
-        message.ok
-          ? { ok: true, jpeg: new Uint8Array(message.jpeg), ...peak }
-          : { ok: false, code: message.code === TRANSIENT ? "failed" : "refused", ...peak },
-      );
-    });
+        if ("ready" in message) {
+          // Started, its decoders loaded and warmed up: its size now is the baseline.
+          baseline = procMemory(pid)?.rss;
+          clearTimeout(timer);
+          timer = setTimeout(() => {
+            // Too slow: kill the process (its job can't be interrupted otherwise).
+            end({ ok: false, code: "timeout" });
+          }, timeoutMs);
+          if (parentWatches && baseline !== undefined) {
+            sampler = setInterval(() => {
+              const seen = growth();
+              if (seen === undefined || seen.now <= killAt) return;
+              // Past the trigger: stopped at once (so it grows no further), its peak read, killed.
+              try {
+                process.kill(pid, "SIGSTOP");
+              } catch {
+                // Already gone: its exit says so.
+              }
+              const last = growth() ?? seen;
+              end({ ok: false, code: "killed", peakBytes: last.peak });
+            }, sampleMs);
+          }
+          const full: ThumbnailJob = { ...job, timeoutMs };
+          const sent: ThumbnailJob =
+            options.check === undefined ? full : { ...full, check: options.check };
+          child.send(sent, (error) => {
+            if (error !== null) end({ ok: false, code: "failed" });
+          });
+          return;
+        }
+        if (message.id !== job.id) return;
+        const seen = growth();
+        const peak = seen === undefined ? {} : { peakBytes: seen.peak };
+        end(
+          message.ok
+            ? { ok: true, jpeg: new Uint8Array(message.jpeg), ...peak }
+            : { ok: false, code: message.code === TRANSIENT ? "failed" : "refused", ...peak },
+        );
+      },
+    );
     // Its end, once its pipes are closed (so the watchdog's report has been read).
     child.on("close", (code, signal) => {
       const report = /^killed (\d+)/.exec(marker);
       if (report !== null) {
         // The cap, confirmed by the watchdog's own report.
         end({ ok: false, code: "killed", peakBytes: Number(report[1]) });
+      } else if (!acknowledged) {
+        // Died before its watchdog took the job (start-up, loading): says
+        // nothing about the image (review 3).
+        end({ ok: false, code: "failed" });
       } else if (marker.startsWith("timeout")) {
         end({ ok: false, code: "timeout" });
       } else if (signal === "SIGKILL" || code === KILLED_EXIT_CODE) {
@@ -322,7 +393,7 @@ export function createThumbnailRenderer(options: ThumbnailRendererOptions = {}):
 
   return Object.freeze({
     render(format: string, source: ThumbnailSource, box: number): Promise<RenderResult> {
-      if (closed || queue.length >= maxQueued) {
+      if (closed || queue.length >= maxQueued || now() < pausedUntil) {
         return Promise.resolve({ ok: false, code: "busy" } as const);
       }
       return new Promise<RenderResult>((resolve) => {

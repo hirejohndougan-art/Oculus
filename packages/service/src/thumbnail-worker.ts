@@ -1342,12 +1342,15 @@ export function gifExtent(b: Uint8Array): { width: number; height: number } | un
 
 /**
  * The size a browser would draw an image at, read as the format named, for
- * the inline view's limits: the GIF's every frame, a WebP walked strictly;
+ * the inline view's limits: the GIF's every frame, a WebP walked strictly
+ * (or, longer than `bytes`, sized by its first chunk, never animated and
+ * never claiming more than `fileSize`, the stored file's size, when given);
  * `undefined` when it can't be told from `bytes`.
  */
 export function viewDimensions(
   format: string,
   bytes: Uint8Array,
+  fileSize?: number,
 ): { readonly width: number; readonly height: number } | undefined {
   if (format === "image/gif") return gifExtent(bytes);
   if (format === "image/webp") {
@@ -1359,7 +1362,12 @@ export function viewDimensions(
       (bytes[5] ?? 0) * 256 +
       (bytes[6] ?? 0) * 65_536 +
       (bytes[7] ?? 0) * 16_777_216;
-    if (riffSize + 8 > bytes.length) return webpDimensions(bytes);
+    if (riffSize + 8 > bytes.length) {
+      // Never more than the stored file holds, and never animated (review 3).
+      if (fileSize !== undefined && riffSize + 8 > fileSize) return undefined;
+      if (ascii(bytes, 12, "VP8X") && ((bytes[20] ?? 0) & 0x02) !== 0) return undefined;
+      return webpDimensions(bytes);
+    }
     try {
       const layout = walkWebp(bytes);
       return { width: layout.width, height: layout.height };
@@ -1797,6 +1805,8 @@ async function serve(
       const started = new Promise((resolve) => watchdog.once("message", resolve));
       watchdog.postMessage({ timeoutMs: job.timeoutMs });
       await started;
+      // The parent: from now on a death is the job's, not the start's (review 3).
+      send({ started: job.id });
       let answer: ThumbnailAnswer;
       try {
         const bytes = readDescriptor(DECODER_FILE_FD);

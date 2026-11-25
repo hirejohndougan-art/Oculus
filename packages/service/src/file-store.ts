@@ -304,6 +304,9 @@ const WINDOWS = process.platform === "win32";
 const MY_UID = typeof process.getuid === "function" ? process.getuid() : undefined;
 
 /** Ours (where uids exist) and not writable by group or others (where modes mean that). */
+/** O_NONBLOCK where there is one (not on Windows, whatever the types say). */
+const NONBLOCK = (constants as { O_NONBLOCK?: number }).O_NONBLOCK ?? 0;
+
 function safeOwnership(info: { uid: number; mode: number }): boolean {
   if (WINDOWS) return true;
   if (MY_UID !== undefined && info.uid !== MY_UID) return false;
@@ -739,7 +742,16 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       // Opened only when the reply goes out (file-replies.ts); O_NOFOLLOW
       // again at that moment, and the reply's exact length checks the rest.
       return () => {
-        const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+        // O_NONBLOCK and a regular-file check on the descriptor (review 3):
+        // a FIFO or device renamed over the copy after the check can't hang
+        // the open or the read; the reply fails before it starts instead.
+        const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | NONBLOCK);
+        try {
+          if (!fstatSync(fd).isFile()) throw new Error("Not a plain file.");
+        } catch (error) {
+          closeSync(fd);
+          throw error;
+        }
         return createReadStream("", { fd, autoClose: true });
       };
     },
@@ -751,13 +763,7 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       try {
         // O_NONBLOCK: a FIFO or device swapped in after the check can't
         // hang the open (review 2); fstat refuses it before any read.
-        fd = openSync(
-          path,
-          constants.O_RDONLY |
-            constants.O_NOFOLLOW |
-            // Not defined on Windows, whatever the types say.
-            ((constants as { O_NONBLOCK?: number }).O_NONBLOCK ?? 0),
-        );
+        fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | NONBLOCK);
       } catch {
         return undefined;
       }

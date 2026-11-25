@@ -37,7 +37,7 @@ import {
   vp8lGroupBytes,
   withinLimits,
 } from "./thumbnail-worker.js";
-import { createThumbnailRenderer } from "./thumbnails.js";
+import { DESCRIPTOR_PAUSE_MS, createThumbnailRenderer } from "./thumbnails.js";
 import {
   alphBigTables,
   decodeJpeg,
@@ -539,7 +539,27 @@ describe("the inline view's checks (review 2)", () => {
     big.writeUInt32LE(big.length - 8, 4);
     expect(viewDimensions("image/webp", big.subarray(0, MIB))).toEqual({ width: 16, height: 16 });
     // Read whole, it is walked strictly (and its metadata is allowed).
-    expect(viewDimensions("image/webp", big)).toEqual({ width: 16, height: 16 });
+    expect(viewDimensions("image/webp", big)).toEqual({ width: 16, height: 16 }); // Never a RIFF larger than the stored file (review 3).
+    expect(viewDimensions("image/webp", big.subarray(0, MIB), big.length - 1)).toBeUndefined();
+    expect(viewDimensions("image/webp", big.subarray(0, MIB), big.length)).toEqual({
+      width: 16,
+      height: 16,
+    });
+    // Never an animated VP8X (review 3).
+    const vp8x = Buffer.alloc(18);
+    vp8x.write("VP8X", 0, "latin1");
+    vp8x.writeUInt32LE(10, 4);
+    vp8x[8] = 0x02;
+    vp8x.writeUIntLE(15, 12, 3);
+    vp8x.writeUIntLE(15, 15, 3);
+    const animated = Buffer.concat([small.subarray(0, 12), vp8x, small.subarray(12), exif]);
+    animated.writeUInt32LE(animated.length - 8, 4);
+    expect(viewDimensions("image/webp", animated.subarray(0, MIB))).toBeUndefined();
+    animated[20] = 0;
+    expect(viewDimensions("image/webp", animated.subarray(0, MIB))).toEqual({
+      width: 16,
+      height: 16,
+    });
   });
 });
 
@@ -712,9 +732,11 @@ describe("a decoder process that can't start (review 2, B1)", () => {
     expect((await renderer.render("image/jpeg", makeJpeg(40, 30), 160)).ok).toBe(true);
   });
 
-  it("answers failed for a child with no stdio that reports EMFILE, never crashing", async () => {
+  it("answers failed for a child with no stdio that reports EMFILE, never crashing, then pauses (review 3)", async () => {
     let calls = 0;
+    let clock = 1_000_000;
     const renderer = createThumbnailRenderer({
+      now: () => clock,
       spawn: (options) => {
         calls++;
         if (calls > 1) return spawnDecoder(options);
@@ -736,7 +758,42 @@ describe("a decoder process that can't start (review 2, B1)", () => {
       ok: false,
       code: "failed",
     });
+    // For a minute no process is started: busy at once.
+    clock += DESCRIPTOR_PAUSE_MS - 1;
+    expect(await renderer.render("image/png", makePng(20, 20), 160)).toEqual({
+      ok: false,
+      code: "busy",
+    });
+    expect(calls).toBe(1);
+    clock += 2;
     expect((await renderer.render("image/png", makePng(20, 20), 160)).ok).toBe(true);
+    expect(calls).toBe(2);
+  });
+
+  it("starts no process with too few descriptors free (review 3)", async () => {
+    const renderer = createThumbnailRenderer({ minFreeDescriptors: Number.MAX_SAFE_INTEGER });
+    renderers.push(renderer);
+    expect(await renderer.render("image/jpeg", makeJpeg(20, 10), 160)).toEqual({
+      ok: false,
+      code: "busy",
+    });
+    expect(renderer.processesStarted()).toBe(0);
+  });
+
+  it("answers failed, not lost, for a process that dies before its watchdog took the job (review 3)", async () => {
+    const renderer = createThumbnailRenderer({
+      spawn: (options) => {
+        const child = spawnDecoder(options);
+        // Killed while still starting (it takes some 300 ms to be ready).
+        setTimeout(() => child.kill("SIGKILL"), 30);
+        return child;
+      },
+    });
+    renderers.push(renderer);
+    expect(await renderer.render("image/jpeg", makeJpeg(20, 10), 160)).toEqual({
+      ok: false,
+      code: "failed",
+    });
   });
 
   it("answers failed when the bytes can't be written for it, and keeps going", async () => {

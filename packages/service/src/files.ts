@@ -874,7 +874,7 @@ export function fileOperations(
           gif ? VIEW_GIF_BYTES : VIEW_HEADER_BYTES,
         );
         if (head === undefined) return missingCopy();
-        if (!withinLimits(viewDimensions(file.mediaType, head), VIEW_LIMITS)) {
+        if (!withinLimits(viewDimensions(file.mediaType, head, file.size), VIEW_LIMITS)) {
           return refusal(["fileId"], "not_viewable", "This file can only be downloaded.");
         }
       }
