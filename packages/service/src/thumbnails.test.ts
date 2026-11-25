@@ -815,16 +815,28 @@ describe("a decoder process that can't start (review 2, B1)", () => {
 
   it("answers lost, not killed, for a SIGKILL nothing confirmed as the cap (review 2)", async () => {
     let child: ChildProcess | undefined;
+    // Whether its watchdog has taken the job: a kill before that is a
+    // start-up failure ("failed"), not this case.
+    const job = { started: false };
     const renderer = createThumbnailRenderer({
-      spawn: (options) => (child = spawnDecoder(options)),
+      spawn: (options) => {
+        const spawned = spawnDecoder(options);
+        spawned.on("message", (message: unknown) => {
+          if (typeof message === "object" && message !== null && "started" in message) {
+            job.started = true;
+          }
+        });
+        return (child = spawned);
+      },
     });
     renderers.push(renderer);
     const pending = renderer.render("image/jpeg", flatJpeg(2480, 2480), 160);
     // Killed from outside (as the system's out-of-memory killer would) once
-    // the decode is well under way (100 MiB over its start-up size).
+    // the decode is well under way (100 MiB over its size when it took the job).
     let start: number | undefined;
     for (let k = 0; k < 5000; k++) {
       await new Promise((resolve) => setTimeout(resolve, 2));
+      if (!job.started) continue;
       const rss = child?.pid === undefined ? undefined : procMemory(child.pid)?.rss;
       if (rss === undefined) continue;
       start ??= rss;
