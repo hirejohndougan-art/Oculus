@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Railroad Depot theme</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;800&family=Barlow:wght@400;600&display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#111111}a:hover{color:#6b4e00}
+</style>
+</helmet>
+<div style="background: #f3efe6; font-family: Barlow, sans-serif; color: #1b1b1b; min-height: 960px">
+<header style="background: #111111; padding: 16px clamp(16px, 4vw, 40px); display: flex; flex-wrap: wrap; gap: 16px; justify-content: space-between; align-items: center">
+<div style="font-family: 'Barlow Condensed', sans-serif; font-weight: 800; font-size: 26px; letter-spacing: 2px; text-transform: uppercase; color: #f4c430">Dickinson Historical Society</div>
+<nav style="display: flex; flex-wrap: wrap; gap: 24px; font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 19px; letter-spacing: 1px; text-transform: uppercase"><a href="T12-Depot-collection.dc.html" style="color: #ffffff; text-decoration: none">Collections</a><a href="T12-Depot-search.dc.html" style="color: #ffffff; text-decoration: none">Browse</a><a href="#" style="color: #ffffff; text-decoration: none">Exhibits</a><a href="T12-Depot-search.dc.html" style="color: #ffffff; text-decoration: none">Search</a></nav>
+</header>
+<section style="background: #f4c430; padding: clamp(16px, 4vw, 44px) clamp(16px, 4vw, 40px); display: flex; flex-wrap: wrap; gap: 32px; align-items: center">
+<h1 style="margin: 0; flex: 2 1 520px; font-family: 'Barlow Condensed', sans-serif; font-weight: 800; font-size: clamp(46px, 7.19vw, 92px); line-height: 0.92; text-transform: uppercase; color: #111111">All aboard for Dickinson's past</h1>
+<div style="flex: 1 1 300px; display: flex; flex-direction: column; gap: 12px">
+<p style="margin: 0; font-size: 18px; line-height: 1.5; color: #111111">The Society&#39;s digital archive. Each collection has its own platform below.</p>
+<div style="display: flex; gap: 0">
+<label for="q12" style="position: absolute; left: -9999px">Search</label>
+<input id="q12" type="text" placeholder="Search" style="flex: 1; min-width: 0; padding: 14px 16px; font-size: 16px; font-family: inherit; border: 3px solid #111111; background: #ffffff">
+<button style="padding: 14px 22px; font-family: 'Barlow Condensed', sans-serif; font-weight: 800; font-size: 20px; text-transform: uppercase; background: #111111; color: #f4c430; border: 0">Go</button>
+</div>
+</div>
+</section>
+<section style="padding: 32px clamp(16px, 4vw, 40px) 16px">
+<div style="background: #111111; color: #ffffff; padding: 8px 20px 12px">
+<div style="display: flex; gap: 16px; font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 15px; letter-spacing: 2px; text-transform: uppercase; color: #f4c430; padding: 10px 0; border-bottom: 1px solid #555555"><span style="flex: 0 0 64px">Platform</span><span style="flex: 1">Collection</span><span style="flex: 0 0 64px; text-align: right">Items</span></div>
+<sc-for list="{{board}}" as="b" hint-placeholder-count="4">
+<a href="#" style="display: flex; gap: 16px; align-items: center; padding: 14px 0; border-bottom: 1px solid #555555; color: #ffffff; text-decoration: none; font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: clamp(19px, 2.1vw, 26px); letter-spacing: 1px; text-transform: uppercase"><span style="flex: 0 0 64px; color: #f4c430">{{b.no}}</span><span style="flex: 1">[Collection name]</span><span style="flex: 0 0 64px; text-align: right">[N]</span></a>
+</sc-for>
+</div>
+</section>
+<section style="padding: 16px clamp(16px, 4vw, 40px) clamp(16px, 4vw, 48px); display: flex; flex-wrap: wrap; gap: 24px; align-items: stretch">
+<div style="flex: 1 1 380px; min-height: 200px; background: #cfc9bb; color: #1b1b1b; font-size: 13px; display: flex; align-items: center; justify-content: center">Photo: Aerial view of Dickinson</div>
+<div style="flex: 1 1 380px; border: 3px solid #111111; padding: 22px 24px; display: flex; flex-direction: column; gap: 8px; justify-content: center">
+<div style="font-family: 'Barlow Condensed', sans-serif; font-weight: 600; font-size: 16px; letter-spacing: 2px; text-transform: uppercase">Now arriving</div>
+<div style="font-family: 'Barlow Condensed', sans-serif; font-weight: 800; font-size: 38px; line-height: 1; text-transform: uppercase">Aerial view of Dickinson, late 1920s</div>
+<div style="font-size: 15px">DS5C740001 · Photograph · [Rights statement]</div>
+<a href="T12-Depot-item.dc.html" style="font-weight: 600; font-size: 16px">View the record</a>
+</div>
+</section>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1280,"height":960}}'>
+class Component extends DCLogic {
+renderVals() {
+return { board: ['1', '2', '3', '4'].map((no) => ({ no })) };
+}
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Finding Aid First theme</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#0b4f8a}a:hover{color:#06305a}
+</style>
+</helmet>
+<div style="background: #f4f6f8; font-family: 'IBM Plex Sans', sans-serif; color: #23292f; min-height: 960px; display: flex; flex-direction: column">
+<header style="background: #ffffff; border-bottom: 1px solid #c5ccd3; padding: 14px 28px; display: flex; flex-wrap: wrap; gap: 14px; align-items: center; justify-content: space-between">
+<div style="font-weight: 600; font-size: 17px">Dickinson Historical Society <span style="color: #55606b; font-weight: 400">/ Digital Archive</span></div>
+<div style="display: flex; gap: 8px; flex: 0 1 420px">
+<label for="q7" style="position: absolute; left: -9999px">Search</label>
+<input id="q7" type="text" placeholder="Search titles, names, ID numbers" style="flex: 1; min-width: 0; padding: 10px 12px; font-size: 15px; font-family: inherit; border: 1px solid #77828d; border-radius: 3px">
+<button style="padding: 10px 18px; font-family: inherit; font-weight: 600; font-size: 15px; background: #0b4f8a; color: #ffffff; border: 0; border-radius: 3px">Search</button>
+</div>
+</header>
+<div style="display: flex; flex-wrap: wrap; flex: 1">
+<nav aria-label="Archive tree" style="flex: 1 1 300px; max-width: 100%; background: #ffffff; border-right: 1px solid #c5ccd3; padding: 22px 22px 32px; box-sizing: border-box; font-size: 15px; display: flex; flex-direction: column; gap: 4px">
+<div style="font-size: 12px; letter-spacing: 1.5px; text-transform: uppercase; color: #55606b; font-weight: 600; padding-bottom: 8px">How the archive is arranged</div>
+<sc-for list="{{tree}}" as="n" hint-placeholder-count="10">
+<a href="#" style="display: flex; gap: 10px; padding: 9px 10px; border-radius: 3px; text-decoration: none; color: #23292f; background: {{n.bg}}; margin-left: {{n.indent}}"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #55606b; flex: 0 0 52px; padding-top: 2px">{{n.level}}</span><span style="font-weight: {{n.weight}}">{{n.label}}</span></a>
+</sc-for>
+</nav>
+<main style="flex: 999 1 560px; min-width: 0; padding: 32px clamp(16px, 4vw, 40px) clamp(16px, 4vw, 48px); box-sizing: border-box; display: flex; flex-direction: column; gap: 20px">
+<div style="font-size: 14px; color: #55606b">[Fonds title] › [Series title] › [File title]</div>
+<h1 style="margin: 0; font-weight: 600; font-size: 34px; line-height: 1.2">[Series title]</h1>
+<p style="margin: 0; font-size: 16px; line-height: 1.65; max-width: 680px">A series is a group of records kept together because they were made or used together. [Scope note written by the archivist goes here.]</p>
+<div style="display: flex; flex-wrap: wrap; gap: 32px; font-size: 14px; border-top: 1px solid #c5ccd3; border-bottom: 1px solid #c5ccd3; padding: 14px 0"><div><div style="color: #55606b">Dates</div><div style="font-weight: 500">[date range]</div></div><div><div style="color: #55606b">Extent</div><div style="font-weight: 500">[N] items</div></div><div><div style="color: #55606b">Reference code</div><div style="font-family: 'IBM Plex Mono', monospace">[Reference code]</div></div></div>
+<div style="background: #ffffff; border: 1px solid #c5ccd3; border-radius: 4px; overflow-x: auto">
+<table style="width: 100%; border-collapse: collapse; font-size: 15px; min-width: 520px">
+<thead><tr style="background: #eaeef2; text-align: left"><th style="padding: 11px 14px; font-weight: 600">ID number</th><th style="padding: 11px 14px; font-weight: 600">Title</th><th style="padding: 11px 14px; font-weight: 600">Date</th><th style="padding: 11px 14px; font-weight: 600">Type</th></tr></thead>
+<tbody>
+<tr style="border-top: 1px solid #dde2e7"><td style="padding: 11px 14px; font-family: 'IBM Plex Mono', monospace; font-size: 14px">DS5C740001</td><td style="padding: 11px 14px"><a href="#">Aerial view of Dickinson, late 1920s</a></td><td style="padding: 11px 14px">[date]</td><td style="padding: 11px 14px">Photograph</td></tr>
+<tr style="border-top: 1px solid #dde2e7"><td style="padding: 11px 14px; font-family: 'IBM Plex Mono', monospace; font-size: 14px">[ID number]</td><td style="padding: 11px 14px"><a href="#">[Item title]</a></td><td style="padding: 11px 14px">[date]</td><td style="padding: 11px 14px">[Type]</td></tr>
+<tr style="border-top: 1px solid #dde2e7"><td style="padding: 11px 14px; font-family: 'IBM Plex Mono', monospace; font-size: 14px">[ID number]</td><td style="padding: 11px 14px"><a href="#">[Item title]</a></td><td style="padding: 11px 14px">[date]</td><td style="padding: 11px 14px">[Type]</td></tr>
+<tr style="border-top: 1px solid #dde2e7"><td style="padding: 11px 14px; font-family: 'IBM Plex Mono', monospace; font-size: 14px">[ID number]</td><td style="padding: 11px 14px"><a href="#">[Item title]</a></td><td style="padding: 11px 14px">[date]</td><td style="padding: 11px 14px">[Type]</td></tr>
+</tbody>
+</table>
+</div>
+</main>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1280,"height":960}}'>
+class Component extends DCLogic {
+renderVals() {
+const rows = [['Fonds', '[Fonds title]', 0], ['Series', '[Series title]', 1, true], ['File', '[File title]', 2], ['File', '[File title]', 2], ['Series', '[Series title]', 1], ['Series', '[Series title]', 1], ['Fonds', '[Fonds title]', 0], ['Series', '[Series title]', 1], ['Fonds', '[Fonds title]', 0]];
+return { tree: rows.map(([level, label, depth, on]) => ({ level, label, indent: (depth * 18) + 'px', bg: on ? '#e3edf7' : 'transparent', weight: on || depth === 0 ? 600 : 400 })) };
+}
+}
+</script>
+</body>
+</html>

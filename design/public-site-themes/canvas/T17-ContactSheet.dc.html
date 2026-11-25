@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Contact Sheet theme</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#111111}a:hover{color:#b3261e}
+</style>
+</helmet>
+<div style="background: #ebebe8; font-family: Manrope, sans-serif; color: #161616; min-height: 960px">
+<header style="padding: 18px 32px; display: flex; flex-wrap: wrap; gap: 14px; justify-content: space-between; align-items: center">
+<div style="font-weight: 800; font-size: 18px">Dickinson Historical Society <span style="font-family: 'JetBrains Mono', monospace; font-weight: 400; font-size: 13px">/ photo archive</span></div>
+<div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center">
+<label for="q17" style="position: absolute; left: -9999px">Search photographs</label>
+<input id="q17" type="text" placeholder="Search photographs" style="width: 260px; max-width: 100%; padding: 10px 12px; font-size: 15px; font-family: inherit; border: 1px solid #161616; background: #ffffff; box-sizing: border-box">
+<a href="T17-ContactSheet-collection.dc.html" style="padding: 10px 14px; font-weight: 600; font-size: 14px">Collections</a><a href="#" style="padding: 10px 14px; font-weight: 600; font-size: 14px">About</a>
+</div>
+</header>
+<div style="padding: 0 32px 14px; display: flex; flex-wrap: wrap; gap: 8px; font-size: 14px; font-weight: 600">
+<sc-for list="{{filters}}" as="f" hint-placeholder-count="7">
+<a href="#" style="padding: 9px 14px; min-height: 26px; border: 1px solid #161616; background: {{f.bg}}; color: {{f.fg}}; text-decoration: none">{{f.label}}</a>
+</sc-for>
+</div>
+<section style="background: #161616; padding: 22px 32px 26px">
+<div style="display: flex; justify-content: space-between; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #f2c94c; padding-bottom: 10px"><span>ROLL 01 · [Collection name]</span><span>[N] FRAMES</span></div>
+<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 110px), 1fr)); gap: 10px">
+<sc-for list="{{frames}}" as="fr" hint-placeholder-count="18">
+<a href="#" aria-label="Open photograph" style="text-decoration: none; display: flex; flex-direction: column; gap: 5px"><div style="height: 104px; background: {{fr.tone}}; outline: {{fr.ring}}; outline-offset: 2px"></div><div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #d6d6d6">{{fr.no}}</div></a>
+</sc-for>
+</div>
+</section>
+<section style="padding: 28px 32px clamp(16px, 4vw, 44px); display: flex; flex-wrap: wrap; gap: 32px; align-items: flex-start">
+<div style="flex: 2 1 420px; min-width: 0; height: 280px; background: #c4c4c0; color: #161616; font-size: 13px; display: flex; align-items: center; justify-content: center; border: 3px solid #b3261e; box-sizing: border-box">Photo: Aerial view of Dickinson</div>
+<div style="flex: 1 1 300px; min-width: 0; display: flex; flex-direction: column; gap: 10px">
+<div style="font-family: 'JetBrains Mono', monospace; font-size: 13px; color: #b3261e; font-weight: 500">FRAME 03 · SELECTED</div>
+<h1 style="margin: 0; font-weight: 800; font-size: 32px; line-height: 1.15">Aerial view of Dickinson, late 1920s</h1>
+<div style="font-family: 'JetBrains Mono', monospace; font-size: 14px; line-height: 1.9">ID       DS5C740001<br>Type     Photograph<br>Rights   [Rights statement]</div>
+<div style="display: flex; flex-wrap: wrap; gap: 10px; padding-top: 6px"><a href="T17-ContactSheet-item.dc.html" style="padding: 12px 20px; background: #161616; color: #ffffff; font-weight: 600; text-decoration: none">Open record</a><a href="#" style="padding: 12px 20px; border: 1px solid #161616; font-weight: 600; text-decoration: none">Next frame</a></div>
+</div>
+</section>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1280,"height":960}}'>
+class Component extends DCLogic {
+renderVals() {
+const tones = ['#5a5a5a', '#787878', '#444444', '#8c8c8c', '#666666', '#505050'];
+const frames = Array.from({ length: 18 }, (_, i) => ({ no: String(i + 1).padStart(2, '0'), tone: tones[(i * 5) % 6], ring: i === 2 ? '3px solid #f2c94c' : 'none' }));
+const labels = ['All', 'Streets', 'People', 'Buildings', 'The bayou', 'Schools', 'Events'];
+return { frames, filters: labels.map((label, i) => ({ label, bg: i ? '#ffffff' : '#161616', fg: i ? '#161616' : '#ffffff' })) };
+}
+}
+</script>
+</body>
+</html>

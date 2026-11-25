@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Postcard theme</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#0d5560}a:hover{color:#06333a}
+</style>
+</helmet>
+<div style="background: #d8ece9; font-family: 'DM Sans', sans-serif; color: #1f3336; min-height: 960px">
+<header style="max-width: 1160px; margin: 0 auto; padding: 24px 32px; display: flex; flex-wrap: wrap; gap: 16px; justify-content: space-between; align-items: center">
+<div style="font-family: 'DM Serif Display', serif; font-size: 26px; color: #0d5560">Greetings from Dickinson</div>
+<nav style="display: flex; flex-wrap: wrap; gap: 22px; font-size: 15px; font-weight: 500"><a href="T14-Postcard-collection.dc.html">Collections</a><a href="T14-Postcard-search.dc.html">Browse</a><a href="#">Exhibits</a><a href="#">About the Society</a><a href="T14-Postcard-search.dc.html">Search</a></nav>
+</header>
+<section style="max-width: 1160px; margin: 0 auto; padding: 8px 32px 36px">
+<div style="background: #fffdf6; border: 1px solid #1f3336; box-shadow: 8px 8px 0 #0d5560; display: flex; flex-wrap: wrap">
+<div style="flex: 3 1 440px; min-height: 340px; background: #c7d6d3; color: #1f3336; font-size: 13px; display: flex; align-items: center; justify-content: center; margin: 16px; box-sizing: border-box">Photo: Aerial view of Dickinson</div>
+<div style="flex: 2 1 320px; min-width: 0; padding: 28px 28px 28px 24px; border-left: 2px dashed #7d9794; display: flex; flex-direction: column; gap: 14px; box-sizing: border-box">
+<div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 16px">
+<div style="font-size: 12px; letter-spacing: 2px; text-transform: uppercase; font-weight: 700; color: #a6321f">Post card</div>
+<div aria-hidden="true" style="width: 64px; height: 76px; border: 2px dotted #a6321f; color: #a6321f; font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center; text-align: center">DHS<br>ARCHIVE</div>
+</div>
+<h1 style="margin: 0; font-family: 'DM Serif Display', serif; font-weight: 400; font-size: 36px; line-height: 1.12; color: #0d5560">Aerial view of Dickinson, late 1920s</h1>
+<div style="font-size: 15px; line-height: 2; border-bottom: 1px solid #7d9794">Photograph</div>
+<div style="font-size: 15px; line-height: 2; border-bottom: 1px solid #7d9794">ID number DS5C740001</div>
+<div style="font-size: 15px; line-height: 2; border-bottom: 1px solid #7d9794">[Rights statement]</div>
+<a href="#" style="align-self: flex-start; margin-top: 6px; padding: 12px 22px; background: #a6321f; color: #ffffff; font-weight: 700; text-decoration: none; border-radius: 4px">Turn it over</a>
+</div>
+</div>
+</section>
+<section style="max-width: 1160px; margin: 0 auto; padding: 0 32px clamp(16px, 4vw, 48px)">
+<h2 style="margin: 0 0 20px; font-family: 'DM Serif Display', serif; font-weight: 400; font-size: 28px; color: #0d5560">More from the rack</h2>
+<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 22px">
+<sc-for list="{{cards}}" as="c" hint-placeholder-count="4">
+<a href="#" style="background: #fffdf6; border: 1px solid #1f3336; padding: 10px 10px 14px; text-decoration: none; transform: rotate({{c.tilt}}); display: flex; flex-direction: column; gap: 10px">
+<div style="height: 140px; background: {{c.tone}}; color: #1f3336; font-size: 12px; display: flex; align-items: center; justify-content: center">Collection photo</div>
+<div><div style="font-family: 'DM Serif Display', serif; font-size: 20px; color: #0d5560">[Collection name]</div><div style="font-size: 14px; color: #3a5256">[N] items</div></div>
+</a>
+</sc-for>
+</div>
+</section>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1280,"height":960}}'>
+class Component extends DCLogic {
+renderVals() {
+const t = [['-1.5deg', '#c7d6d3'], ['1deg', '#e9d9b8'], ['-0.5deg', '#e3c2b6'], ['1.5deg', '#c9d3e0']];
+return { cards: t.map(([tilt, tone]) => ({ tilt, tone })) };
+}
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Museum Label theme</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;700&family=Inter:wght@400;500&display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#1a1a1a}a:hover{color:#555555}
+</style>
+</helmet>
+<div style="background: #f6f5f2; font-family: Inter, sans-serif; color: #1a1a1a; min-height: 960px">
+<header style="padding: 26px clamp(16px, 4vw, 56px); display: flex; flex-wrap: wrap; gap: 16px; justify-content: space-between; align-items: baseline">
+<div style="font-family: 'Cormorant Garamond', serif; font-weight: 700; font-size: 26px">Dickinson Historical Society</div>
+<nav style="display: flex; flex-wrap: wrap; gap: 30px; font-size: 13px; letter-spacing: 1.5px; text-transform: uppercase"><a href="T10-MuseumLabel-search.dc.html" style="text-decoration: none">Objects</a><a href="T10-MuseumLabel-collection.dc.html" style="text-decoration: none">Collections</a><a href="#" style="text-decoration: none">Exhibits</a><a href="#" style="text-decoration: none">Visit</a><a href="T10-MuseumLabel-search.dc.html" style="text-decoration: none">Search</a></nav>
+</header>
+<section style="padding: 24px clamp(16px, 4vw, 56px) clamp(16px, 4vw, 48px); display: flex; flex-wrap: wrap; gap: 56px; align-items: flex-end">
+<div style="flex: 3 1 520px; min-width: 0; height: 560px; background: #dddbd5; color: #3a3a3a; font-size: 14px; display: flex; align-items: center; justify-content: center; box-shadow: 0 18px 40px rgba(0,0,0,0.14)">Photo: Aerial view of Dickinson</div>
+<div style="flex: 1 1 280px; min-width: 0; background: #ffffff; padding: 28px 28px 32px; display: flex; flex-direction: column; gap: 12px; box-shadow: 0 2px 6px rgba(0,0,0,0.1)">
+<div style="font-size: 12px; letter-spacing: 2px; text-transform: uppercase; color: #5a5a5a">Object of the week</div>
+<h1 style="margin: 0; font-family: 'Cormorant Garamond', serif; font-weight: 700; font-size: 34px; line-height: 1.1">Aerial view of Dickinson</h1>
+<div style="font-size: 15px">Late 1920s<br>Photograph<br>[Maker, if known]</div>
+<p style="margin: 0; font-size: 15px; line-height: 1.65; color: #3a3a3a">[The wall-label text: three or four plain sentences on what this is and why it matters, taken from the record's description.]</p>
+<div style="font-size: 13px; color: #5a5a5a; border-top: 1px solid #c9c7c0; padding-top: 12px">DS5C740001 · [Collection name] · [Rights statement]</div>
+<a href="T10-MuseumLabel-item.dc.html" style="font-size: 14px; font-weight: 500">Full record</a>
+</div>
+</section>
+<section style="padding: 0 clamp(16px, 4vw, 56px) clamp(16px, 4vw, 56px)">
+<div style="display: flex; justify-content: space-between; align-items: baseline; border-top: 1px solid #1a1a1a; padding-top: 16px; margin-bottom: 20px"><h2 style="margin: 0; font-family: 'Cormorant Garamond', serif; font-weight: 700; font-size: 26px">Also on view</h2><a href="T10-MuseumLabel-collection.dc.html" style="font-size: 14px">All collections</a></div>
+<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: 24px">
+<sc-for list="{{more}}" as="m" hint-placeholder-count="5">
+<a href="#" style="text-decoration: none; display: flex; flex-direction: column; gap: 10px"><div style="height: 130px; background: #dddbd5"></div><div style="font-size: 14px; line-height: 1.4"><span style="font-weight: 500">{{m.title}}</span><br><span style="color: #5a5a5a">[date]</span></div></a>
+</sc-for>
+</div>
+</section>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1280,"height":1060}}'>
+class Component extends DCLogic {
+renderVals() {
+return { more: [1, 2, 3, 4, 5].map(() => ({ title: '[Item title]' })) };
+}
+}
+</script>
+</body>
+</html>

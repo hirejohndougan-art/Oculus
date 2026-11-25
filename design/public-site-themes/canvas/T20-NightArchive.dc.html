@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Night Archive theme</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#ffb454}a:hover{color:#ffd9a3}
+</style>
+</helmet>
+<div style="background: #10141a; font-family: Inter, sans-serif; color: #d5dbe3; min-height: 960px; display: flex; flex-wrap: wrap">
+<aside style="flex: 1 1 240px; background: #171d26; padding: 28px 24px; box-sizing: border-box; display: flex; flex-direction: column; gap: 26px">
+<div style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 19px; line-height: 1.25; color: #ffffff">Dickinson Historical Society</div>
+<nav style="display: flex; flex-direction: column; gap: 4px; font-size: 16px">
+<a href="#" style="padding: 11px 14px; border-radius: 6px; background: #252e3b; color: #ffffff; text-decoration: none; border-left: 3px solid #ffb454">Home</a>
+<a href="T20-NightArchive-collection.dc.html" style="padding: 11px 14px; color: #d5dbe3; text-decoration: none">Collections</a>
+<a href="T20-NightArchive-search.dc.html" style="padding: 11px 14px; color: #d5dbe3; text-decoration: none">Browse</a>
+<a href="T20-NightArchive-findingaid.dc.html" style="padding: 11px 14px; color: #d5dbe3; text-decoration: none">Finding aids</a>
+<a href="#" style="padding: 11px 14px; color: #d5dbe3; text-decoration: none">Exhibits</a>
+<a href="#" style="padding: 11px 14px; color: #d5dbe3; text-decoration: none">About</a>
+</nav>
+<button style="margin-top: auto; padding: 12px 14px; min-height: 44px; font-family: inherit; font-size: 15px; background: transparent; color: #d5dbe3; border: 1px solid #4a5666; border-radius: 6px; text-align: left">Switch to light page</button>
+</aside>
+<main style="flex: 999 1 560px; min-width: 0; padding: 36px clamp(16px, 4vw, 44px) clamp(16px, 4vw, 48px); box-sizing: border-box; display: flex; flex-direction: column; gap: 28px">
+<div style="display: flex; gap: 10px; align-items: center; background: #171d26; border: 1px solid #4a5666; border-radius: 10px; padding: 6px 6px 6px 18px">
+<svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#d5dbe3" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
+<label for="q20" style="position: absolute; left: -9999px">Search the archive</label>
+<input id="q20" type="text" placeholder="Search names, places, years, ID numbers" style="flex: 1; min-width: 0; padding: 12px 0; font-size: 17px; font-family: inherit; background: transparent; border: 0; color: #ffffff">
+<button style="padding: 12px 24px; font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 16px; background: #ffb454; color: #1a1205; border: 0; border-radius: 7px">Search</button>
+</div>
+<div style="display: flex; flex-wrap: wrap; gap: 28px; align-items: stretch">
+<div style="flex: 3 1 420px; min-width: 0; min-height: 360px; background: #2a3442; border-radius: 12px; color: #d5dbe3; font-size: 13px; display: flex; align-items: center; justify-content: center">Photo: Aerial view of Dickinson</div>
+<div style="flex: 2 1 280px; min-width: 0; display: flex; flex-direction: column; gap: 14px; justify-content: center">
+<div style="font-size: 13px; letter-spacing: 2px; text-transform: uppercase; color: #ffb454; font-weight: 500">Tonight's item</div>
+<h1 style="margin: 0; font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: clamp(30px, 3.12vw, 40px); line-height: 1.1; color: #ffffff">Aerial view of Dickinson, late 1920s</h1>
+<div style="display: flex; flex-wrap: wrap; gap: 8px; font-size: 14px"><span style="padding: 6px 12px; background: #252e3b; border-radius: 16px">DS5C740001</span><span style="padding: 6px 12px; background: #252e3b; border-radius: 16px">Photograph</span><span style="padding: 6px 12px; background: #252e3b; border-radius: 16px">[Rights statement]</span></div>
+<a href="T20-NightArchive-item.dc.html" style="font-weight: 500; font-size: 16px">View the record</a>
+</div>
+</div>
+<div>
+<h2 style="margin: 0 0 14px; font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 22px; color: #ffffff">Collections</h2>
+<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 16px">
+<sc-for list="{{cols}}" as="c" hint-placeholder-count="6">
+<a href="#" style="background: #171d26; border: 1px solid #323c4a; border-radius: 10px; padding: 18px; text-decoration: none; display: flex; justify-content: space-between; align-items: center; gap: 12px"><span><span style="display: block; font-family: 'Space Grotesk', sans-serif; font-weight: 500; font-size: 18px; color: #ffffff">[Collection name]</span><span style="display: block; font-size: 14px; color: #aab4c0">[N] items</span></span><span aria-hidden="true" style="width: 10px; height: 10px; border-radius: 50%; background: {{c.dot}}"></span></a>
+</sc-for>
+</div>
+</div>
+</main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1280,"height":960}}'>
+class Component extends DCLogic {
+renderVals() {
+return { cols: ['#ffb454', '#6fb8ff', '#8fd694', '#ff8f8f', '#c9a5ff', '#f2e08a'].map((dot) => ({ dot })) };
+}
+}
+</script>
+</body>
+</html>

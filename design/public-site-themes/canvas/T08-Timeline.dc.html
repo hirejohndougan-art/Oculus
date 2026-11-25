@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Timeline theme</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=Work+Sans:wght@400;600;800&display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#1b2a4a}a:hover{color:#0c1528}
+</style>
+</helmet>
+<div style="background: #f7f4ec; font-family: 'Work Sans', sans-serif; color: #26303f; min-height: 960px">
+<header style="background: #1b2a4a; padding: 18px clamp(16px, 4vw, 40px); display: flex; flex-wrap: wrap; gap: 16px; justify-content: space-between; align-items: center">
+<div style="font-weight: 800; font-size: 19px; color: #ffffff">Dickinson Historical Society</div>
+<nav style="display: flex; flex-wrap: wrap; gap: 24px; font-size: 15px"><a href="T08-Timeline-search.dc.html" style="color: #ffffff">Timeline</a><a href="T08-Timeline-collection.dc.html" style="color: #ffffff">Collections</a><a href="T08-Timeline-search.dc.html" style="color: #ffffff">Browse</a><a href="T08-Timeline-search.dc.html" style="color: #ffffff">Search</a></nav>
+</header>
+<section style="max-width: 1160px; margin: 0 auto; padding: clamp(16px, 4vw, 48px) 32px 28px; display: flex; flex-wrap: wrap; gap: 24px; align-items: flex-end; justify-content: space-between">
+<h1 style="margin: 0; flex: 1 1 520px; font-weight: 800; font-size: clamp(30px, 3.91vw, 50px); line-height: 1.08; color: #1b2a4a">Walk through Dickinson, one decade at a time</h1>
+<p style="margin: 0; flex: 0 1 340px; font-size: 17px; line-height: 1.55">Pick a decade to see everything in the archive dated to those years.</p>
+</section>
+<section style="max-width: 1160px; margin: 0 auto; padding: 0 32px">
+<div style="overflow-x: auto">
+<div style="display: flex; min-width: 900px; border-bottom: 4px solid #1b2a4a">
+<sc-for list="{{decades}}" as="d" hint-placeholder-count="9">
+<a href="#" style="flex: 1; text-decoration: none; text-align: center; padding: 14px 4px 12px; font-weight: 600; font-size: 17px; background: {{d.bg}}; color: #1b2a4a; position: relative">{{d.label}}<span aria-hidden="true" style="position: absolute; left: 50%; bottom: -12px; width: 16px; height: 16px; margin-left: -8px; border-radius: 50%; background: {{d.dot}}; border: 3px solid #1b2a4a; box-sizing: border-box"></span></a>
+</sc-for>
+</div>
+</div>
+</section>
+<section style="max-width: 1160px; margin: 0 auto; padding: clamp(16px, 4vw, 44px) 32px 24px; display: flex; flex-wrap: wrap; gap: 32px">
+<div style="flex: 0 0 200px"><div style="font-weight: 800; font-size: clamp(36px, 5.62vw, 72px); line-height: 1; color: #1b2a4a">1920s</div><div style="font-size: 15px; margin-top: 8px">[N] items from these years</div><a href="#" style="display: inline-block; margin-top: 14px; font-weight: 600; font-size: 15px">See all of the 1920s</a></div>
+<a href="#" style="flex: 2 1 380px; min-width: 0; background: #ffffff; border: 1px solid #c9c2ae; text-decoration: none; display: flex; flex-direction: column">
+<div style="height: 250px; background: #cfc9b8; color: #333a45; font-size: 13px; display: flex; align-items: center; justify-content: center">Photo: Aerial view of Dickinson</div>
+<div style="padding: 18px 20px"><div style="font-weight: 800; font-size: 23px; color: #1b2a4a">Aerial view of Dickinson, late 1920s</div><div style="font-size: 14px; margin-top: 4px; color: #4a5361">DS5C740001 · Photograph · [Rights statement]</div></div>
+</a>
+<div style="flex: 1 1 240px; display: flex; flex-direction: column; gap: 14px">
+<sc-for list="{{more}}" as="m" hint-placeholder-count="3">
+<a href="#" style="background: #ffffff; border: 1px solid #c9c2ae; text-decoration: none; padding: 14px 16px; display: flex; gap: 14px; align-items: center"><div style="flex: 0 0 64px; height: 64px; background: #cfc9b8"></div><div><div style="font-weight: 600; font-size: 16px; color: #1b2a4a">[Item title]</div><div style="font-size: 13px; color: #4a5361">{{m.year}}</div></div></a>
+</sc-for>
+</div>
+</section>
+<section style="max-width: 1160px; margin: 0 auto; padding: 16px 32px clamp(16px, 4vw, 48px); display: flex; flex-wrap: wrap; gap: 12px; align-items: center; font-size: 15px">
+<span style="font-weight: 600">Or browse by collection:</span>
+<a href="#" style="padding: 10px 16px; border: 1px solid #1b2a4a; border-radius: 22px; text-decoration: none">[Collection name]</a><a href="#" style="padding: 10px 16px; border: 1px solid #1b2a4a; border-radius: 22px; text-decoration: none">[Collection name]</a><a href="#" style="padding: 10px 16px; border: 1px solid #1b2a4a; border-radius: 22px; text-decoration: none">[Collection name]</a>
+</section>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1280,"height":960}}'>
+class Component extends DCLogic {
+renderVals() {
+const ds = ['1880s', '1890s', '1900s', '1910s', '1920s', '1930s', '1940s', '1950s', '1960s'];
+return { decades: ds.map((label) => ({ label, bg: label === '1920s' ? '#e6c15a' : 'transparent', dot: label === '1920s' ? '#e6c15a' : '#f7f4ec' })), more: [{ year: '[date]' }, { year: '[date]' }, { year: '[date]' }] };
+}
+}
+</script>
+</body>
+</html>

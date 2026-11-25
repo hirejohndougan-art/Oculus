@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Swiss Grid theme</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#111111}a:hover{color:#c8102e}
+</style>
+</helmet>
+<div style="background: #ffffff; font-family: Archivo, sans-serif; color: #111111; min-height: 960px; padding: 32px clamp(16px, 4vw, 48px) clamp(16px, 4vw, 48px); box-sizing: border-box">
+<header style="display: flex; flex-wrap: wrap; gap: 16px; justify-content: space-between; border-top: 8px solid #111111; padding-top: 14px; font-size: 15px">
+<div style="font-weight: 800">Dickinson Historical Society</div>
+<nav style="display: flex; flex-wrap: wrap; gap: 28px; font-weight: 600"><a href="T06-SwissGrid-collection.dc.html" style="text-decoration: none">Collections</a><a href="T06-SwissGrid-search.dc.html" style="text-decoration: none">Browse</a><a href="T06-SwissGrid-findingaid.dc.html" style="text-decoration: none">Finding aids</a><a href="#" style="text-decoration: none">Exhibits</a><a href="T06-SwissGrid-search.dc.html" style="text-decoration: none">Search</a></nav>
+</header>
+<section style="display: flex; flex-wrap: wrap; gap: 32px; padding: clamp(16px, 4vw, 56px) 0 clamp(16px, 4vw, 40px); align-items: flex-end">
+<h1 style="flex: 3 1 520px; margin: 0; font-weight: 800; font-size: clamp(48px, 7.5vw, 96px); line-height: 0.92; letter-spacing: -3px">Digital<br>Archive<span style="color: #c8102e">.</span></h1>
+<p style="flex: 1 1 260px; margin: 0; font-size: 17px; line-height: 1.5">The Society's holdings, numbered, dated and open. Start with a collection or go straight to search.</p>
+</section>
+<section style="display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); border-top: 2px solid #111111">
+<sc-for list="{{cols}}" as="c" hint-placeholder-count="4">
+<a href="#" style="text-decoration: none; padding: 18px 18px 26px 0; border-bottom: 2px solid #111111; display: flex; flex-direction: column; gap: 40px">
+<div style="font-weight: 800; font-size: clamp(30px, 3.44vw, 44px); color: #c8102e; line-height: 1">{{c.no}}</div>
+<div><div style="font-weight: 800; font-size: 20px; line-height: 1.2">[Collection name]</div><div style="font-size: 14px; color: #4a4a4a; margin-top: 4px">[N] items · [date range]</div></div>
+</a>
+</sc-for>
+</section>
+<section style="display: flex; flex-wrap: wrap; gap: 32px; padding-top: 32px">
+<div style="flex: 2 1 480px; height: 300px; background: #d6d6d6; color: #333333; font-size: 13px; display: flex; align-items: center; justify-content: center">Photo: Aerial view of Dickinson</div>
+<div style="flex: 1 1 280px; display: flex; flex-direction: column; gap: 0; font-size: 15px">
+<div style="font-weight: 800; font-size: 26px; line-height: 1.15; padding-bottom: 16px">Aerial view of Dickinson, late 1920s</div>
+<div style="display: flex; justify-content: space-between; border-top: 1px solid #111111; padding: 9px 0"><span style="color: #4a4a4a">ID number</span><span style="font-weight: 600">DS5C740001</span></div>
+<div style="display: flex; justify-content: space-between; border-top: 1px solid #111111; padding: 9px 0"><span style="color: #4a4a4a">Type</span><span style="font-weight: 600">Photograph</span></div>
+<div style="display: flex; justify-content: space-between; border-top: 1px solid #111111; padding: 9px 0"><span style="color: #4a4a4a">Collection</span><span style="font-weight: 600">[Collection name]</span></div>
+<div style="display: flex; justify-content: space-between; border-top: 1px solid #111111; border-bottom: 1px solid #111111; padding: 9px 0"><span style="color: #4a4a4a">Rights</span><span style="font-weight: 600">[Rights statement]</span></div>
+<a href="T06-SwissGrid-item.dc.html" style="margin-top: 16px; align-self: flex-start; background: #111111; color: #ffffff; padding: 12px 20px; font-weight: 600; text-decoration: none">Open record</a>
+</div>
+</section>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1280,"height":960}}'>
+class Component extends DCLogic {
+renderVals() {
+return { cols: ['01', '02', '03', '04'].map((no) => ({ no })) };
+}
+}
+</script>
+</body>
+</html>

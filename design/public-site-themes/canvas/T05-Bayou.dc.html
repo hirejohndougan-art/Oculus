@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Bayou theme</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@500;700&family=Public+Sans:wght@400;600&display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#0f4f47}a:hover{color:#08302b}
+</style>
+</helmet>
+<div style="background: #eef3ee; font-family: 'Public Sans', sans-serif; color: #24332f; min-height: 960px">
+<div style="display: flex; flex-wrap: wrap; min-height: 560px">
+<div style="flex: 1 1 480px; background: #12403a; color: #ffffff; padding: 32px clamp(16px, 4vw, 48px) clamp(16px, 4vw, 48px); display: flex; flex-direction: column; gap: 22px; box-sizing: border-box">
+<div style="display: flex; flex-wrap: wrap; gap: 14px; justify-content: space-between; align-items: center; font-size: 15px">
+<div style="font-family: Fraunces, serif; font-weight: 700; font-size: 20px">Dickinson Historical Society</div>
+<nav style="display: flex; flex-wrap: wrap; gap: 20px"><a href="T05-Bayou-collection.dc.html" style="color: #ffffff">Collections</a><a href="T05-Bayou-search.dc.html" style="color: #ffffff">Browse</a><a href="#" style="color: #ffffff">About</a></nav>
+</div>
+<div style="flex: 1; display: flex; flex-direction: column; justify-content: center; gap: 18px">
+<div style="font-size: 13px; letter-spacing: 2px; text-transform: uppercase; color: #a9d6c8; font-weight: 600">On Dickinson Bayou</div>
+<h1 style="margin: 0; font-family: Fraunces, serif; font-weight: 700; font-size: clamp(30px, 4.06vw, 52px); line-height: 1.08">A town that grew up along the water</h1>
+<p style="margin: 0; font-size: 18px; line-height: 1.6; color: #dcebe6">Photographs, family papers and objects kept by the Society, open for anyone to search.</p>
+<div style="display: flex; flex-wrap: wrap; gap: 8px">
+<label for="q5" style="position: absolute; left: -9999px">Search the archive</label>
+<input id="q5" type="text" placeholder="Search the archive" style="flex: 1 1 240px; padding: 14px 16px; font-size: 16px; font-family: inherit; border: 0; border-radius: 28px">
+<button style="padding: 14px 28px; font-family: inherit; font-weight: 600; font-size: 16px; background: #e6c15a; color: #1d2a12; border: 0; border-radius: 28px">Search</button>
+</div>
+</div>
+</div>
+<div style="flex: 1 1 480px; background: #9db8ae; color: #12302b; display: flex; align-items: flex-end; min-height: 320px">
+<div style="background: #eef3ee; margin: 0 0 32px 32px; padding: 16px 20px; max-width: 340px"><div style="font-size: 13px; color: #44574f">Photo: Aerial view of Dickinson</div><div style="font-family: Fraunces, serif; font-weight: 700; font-size: 20px; margin-top: 4px">Aerial view of Dickinson, late 1920s</div><a href="T05-Bayou-item.dc.html" style="font-size: 14px; font-weight: 600">DS5C740001 · View record</a></div>
+</div>
+</div>
+<section style="max-width: 1160px; margin: 0 auto; padding: clamp(16px, 4vw, 48px) 32px clamp(16px, 4vw, 56px)">
+<div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 24px"><h2 style="margin: 0; font-family: Fraunces, serif; font-weight: 700; font-size: 30px; color: #12403a">Follow a current</h2><a href="T05-Bayou-collection.dc.html" style="font-weight: 600; font-size: 15px">All collections</a></div>
+<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 20px">
+<sc-for list="{{cols}}" as="c" hint-placeholder-count="4">
+<a href="#" style="text-decoration: none; display: flex; flex-direction: column; gap: 12px">
+<div style="height: 180px; border-radius: 90px 90px 8px 8px; background: #c3d4cc; color: #24332f; font-size: 13px; display: flex; align-items: center; justify-content: center">Collection photo</div>
+<div><div style="font-family: Fraunces, serif; font-weight: 700; font-size: 20px; color: #12403a">{{c.name}}</div><div style="font-size: 14px; color: #44574f">[N] items</div></div>
+</a>
+</sc-for>
+</div>
+</section>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1280,"height":960}}'>
+class Component extends DCLogic {
+renderVals() {
+return { cols: [1, 2, 3, 4].map(() => ({ name: '[Collection name]' })) };
+}
+}
+</script>
+</body>
+</html>

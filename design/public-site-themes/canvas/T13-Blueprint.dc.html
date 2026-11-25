@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Blueprint theme</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#ffffff}a:hover{color:#cfe0ff}
+</style>
+</helmet>
+<div style="background: #14397a; background-image: linear-gradient(rgba(255,255,255,0.09) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.09) 1px, transparent 1px); background-size: 32px 32px; font-family: 'Space Mono', monospace; color: #ffffff; min-height: 960px; padding: 32px clamp(16px, 4vw, 40px) clamp(16px, 4vw, 48px); box-sizing: border-box">
+<div style="border: 2px solid #ffffff; min-height: 870px; display: flex; flex-direction: column">
+<header style="display: flex; flex-wrap: wrap; border-bottom: 2px solid #ffffff">
+<div style="flex: 1 1 320px; padding: 16px 22px; font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 20px">Dickinson Historical Society</div>
+<nav style="display: flex; flex-wrap: wrap; font-size: 14px"><a href="#" style="padding: 18px 20px; border-left: 2px solid #ffffff; text-decoration: none">COLLECTIONS</a><a href="#" style="padding: 18px 20px; border-left: 2px solid #ffffff; text-decoration: none">BROWSE</a><a href="#" style="padding: 18px 20px; border-left: 2px solid #ffffff; text-decoration: none">FINDING AIDS</a><a href="#" style="padding: 18px 20px; border-left: 2px solid #ffffff; text-decoration: none">SEARCH</a></nav>
+</header>
+<div style="display: flex; flex-wrap: wrap; flex: 1">
+<section style="flex: 3 1 520px; min-width: 0; padding: clamp(16px, 4vw, 40px) 36px; display: flex; flex-direction: column; gap: 22px; box-sizing: border-box">
+<div style="font-size: 13px; letter-spacing: 2px">SHEET 1 OF [N] · PLAN OF THE ARCHIVE</div>
+<h1 style="margin: 0; font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: clamp(30px, 4.53vw, 58px); line-height: 1.02">How Dickinson was built, drawn up item by item</h1>
+<div style="display: flex; gap: 0; max-width: 560px">
+<label for="q13" style="position: absolute; left: -9999px">Search</label>
+<input id="q13" type="text" placeholder="Search the plans" style="flex: 1; min-width: 0; padding: 14px 16px; font-size: 15px; font-family: inherit; border: 2px solid #ffffff; background: #0e2a5c; color: #ffffff">
+<button style="padding: 14px 22px; font-family: inherit; font-weight: 700; font-size: 15px; background: #ffffff; color: #14397a; border: 0">SEARCH</button>
+</div>
+<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 0; border: 2px solid #ffffff; margin-top: 12px">
+<sc-for list="{{cols}}" as="c" hint-placeholder-count="3">
+<a href="#" style="padding: 20px 18px 24px; border-left: {{c.rule}}; text-decoration: none; display: flex; flex-direction: column; gap: 28px"><div style="font-size: 13px">{{c.tag}}</div><div><div style="font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 20px; line-height: 1.2">[Collection name]</div><div style="font-size: 13px; margin-top: 6px">[N] items</div></div></a>
+</sc-for>
+</div>
+</section>
+<aside style="flex: 2 1 340px; min-width: 0; border-left: 2px solid #ffffff; display: flex; flex-direction: column">
+<div style="flex: 1; min-height: 280px; display: flex; align-items: center; justify-content: center; font-size: 13px; border-bottom: 2px dashed #ffffff; background: rgba(255,255,255,0.08)">Photo: Aerial view of Dickinson</div>
+<div style="padding: 0; font-size: 14px">
+<div style="padding: 14px 20px; border-bottom: 1px solid #ffffff; font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 22px; line-height: 1.2">Aerial view of Dickinson, late 1920s</div>
+<div style="display: flex; border-bottom: 1px solid #ffffff"><span style="flex: 0 0 110px; padding: 10px 20px; border-right: 1px solid #ffffff">ID NO.</span><span style="padding: 10px 16px">DS5C740001</span></div>
+<div style="display: flex; border-bottom: 1px solid #ffffff"><span style="flex: 0 0 110px; padding: 10px 20px; border-right: 1px solid #ffffff">TYPE</span><span style="padding: 10px 16px">Photograph</span></div>
+<div style="display: flex; border-bottom: 1px solid #ffffff"><span style="flex: 0 0 110px; padding: 10px 20px; border-right: 1px solid #ffffff">RIGHTS</span><span style="padding: 10px 16px">[Rights statement]</span></div>
+<a href="T13-Blueprint-item.dc.html" style="display: block; padding: 14px 20px; font-weight: 700">OPEN RECORD</a>
+</div>
+</aside>
+</div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1280,"height":960}}'>
+class Component extends DCLogic {
+renderVals() {
+return { cols: ['A-1', 'A-2', 'A-3'].map((tag, i) => ({ tag, rule: i ? '2px solid #ffffff' : '0' })) };
+}
+}
+</script>
+</body>
+</html>

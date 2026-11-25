@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Coastal Light theme</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:wght@400;500&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#1f5a73}a:hover{color:#0f3545}
+</style>
+</helmet>
+<div style="background: #f5f8fa; font-family: Inter, sans-serif; color: #2b3a42; min-height: 960px">
+<header style="max-width: 1040px; margin: 0 auto; padding: 32px 32px 0; display: flex; flex-wrap: wrap; gap: 16px; justify-content: space-between; align-items: center">
+<div style="font-family: Newsreader, serif; font-weight: 500; font-size: 22px; color: #1c2b33">Dickinson Historical Society</div>
+<nav style="display: flex; flex-wrap: wrap; gap: 28px; font-size: 15px"><a href="T19-CoastalLight-collection.dc.html" style="text-decoration: none">Collections</a><a href="T19-CoastalLight-search.dc.html" style="text-decoration: none">Browse</a><a href="#" style="text-decoration: none">Exhibits</a><a href="#" style="text-decoration: none">About</a></nav>
+</header>
+<section style="max-width: 760px; margin: 0 auto; padding: 96px 32px 72px; display: flex; flex-direction: column; gap: 28px">
+<h1 style="margin: 0; font-family: Newsreader, serif; font-weight: 400; font-size: clamp(30px, 4.69vw, 60px); line-height: 1.1; color: #1c2b33">A quiet place to look at the past.</h1>
+<div style="border-bottom: 2px solid #1c2b33; display: flex; align-items: center; gap: 12px; padding-bottom: 10px">
+<svg aria-hidden="true" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#1c2b33" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
+<label for="q19" style="position: absolute; left: -9999px">Search the archive</label>
+<input id="q19" type="text" placeholder="Search the archive" style="flex: 1; min-width: 0; padding: 10px 0; font-size: 22px; font-family: Newsreader, serif; border: 0; background: transparent; color: #1c2b33">
+<button style="padding: 10px 6px; min-height: 44px; font-family: inherit; font-weight: 600; font-size: 15px; background: transparent; color: #1f5a73; border: 0">Search</button>
+</div>
+<div style="display: flex; flex-wrap: wrap; gap: 10px 22px; font-size: 15px"><span style="color: #51636d">Start with</span><a href="#">Photographs</a><a href="#">Family papers</a><a href="#">Maps</a><a href="T19-CoastalLight-search.dc.html">Objects</a><a href="T19-CoastalLight-findingaid.dc.html">Finding aids</a></div>
+</section>
+<section style="max-width: 1040px; margin: 0 auto; padding: 0 32px clamp(16px, 4vw, 40px); display: flex; flex-wrap: wrap; gap: 48px; align-items: center">
+<div style="flex: 3 1 440px; min-width: 0; height: 330px; background: #d5e0e6; border-radius: 4px; color: #2b3a42; font-size: 13px; display: flex; align-items: center; justify-content: center">Photo: Aerial view of Dickinson</div>
+<div style="flex: 2 1 280px; min-width: 0; display: flex; flex-direction: column; gap: 12px">
+<div style="font-size: 13px; letter-spacing: 1.5px; text-transform: uppercase; color: #51636d">From the archive</div>
+<div style="font-family: Newsreader, serif; font-weight: 500; font-size: 32px; line-height: 1.15; color: #1c2b33">Aerial view of Dickinson, late 1920s</div>
+<div style="font-size: 15px; line-height: 1.7; color: #51636d">Photograph<br>DS5C740001<br>[Rights statement]</div>
+<a href="T19-CoastalLight-item.dc.html" style="font-weight: 500; font-size: 15px">View the record</a>
+</div>
+</section>
+<section style="max-width: 1040px; margin: 0 auto; padding: 24px 32px 64px; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 40px; border-top: 1px solid #c4d0d7">
+<sc-for list="{{cols}}" as="c" hint-placeholder-count="3">
+<a href="#" style="text-decoration: none; padding-top: 24px; display: flex; flex-direction: column; gap: 6px"><div style="font-family: Newsreader, serif; font-weight: 500; font-size: 24px; color: #1c2b33">[Collection name]</div><div style="font-size: 15px; line-height: 1.6; color: #51636d">{{c.note}}</div></a>
+</sc-for>
+</section>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1280,"height":1040}}'>
+class Component extends DCLogic {
+renderVals() {
+return { cols: [1, 2, 3].map(() => ({ note: '[One sentence about the collection.] [N] items.' })) };
+}
+}
+</script>
+</body>
+</html>

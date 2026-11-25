@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Library Stacks theme</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=Lora:wght@500;700&family=Nunito+Sans:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#6b1d2a}a:hover{color:#3d0f17}
+</style>
+</helmet>
+<div style="background: #faf7f2; font-family: 'Nunito Sans', sans-serif; color: #2a2522; min-height: 960px">
+<header style="padding: 20px clamp(16px, 4vw, 40px); display: flex; flex-wrap: wrap; gap: 16px; justify-content: space-between; align-items: center; border-bottom: 1px solid #c9bfb2">
+<div><div style="font-family: Lora, serif; font-weight: 700; font-size: 24px; color: #6b1d2a">Dickinson Public Library</div><div style="font-size: 13px; color: #554c45">Local history shelf, hosted by the Dickinson Historical Society</div></div>
+<nav style="display: flex; flex-wrap: wrap; gap: 22px; font-size: 15px; font-weight: 600"><a href="T18-LibraryStacks-search.dc.html">Shelves</a><a href="#">New arrivals</a><a href="#">Ask a librarian</a><a href="T18-LibraryStacks-search.dc.html">Search</a></nav>
+</header>
+<section style="max-width: 1160px; margin: 0 auto; padding: clamp(16px, 4vw, 44px) 32px 28px; display: flex; flex-wrap: wrap; gap: 32px; align-items: center">
+<div style="flex: 1 1 420px; min-width: 0; display: flex; flex-direction: column; gap: 16px">
+<h1 style="margin: 0; font-family: Lora, serif; font-weight: 700; font-size: clamp(30px, 3.59vw, 46px); line-height: 1.12">Pull something off the local history shelf</h1>
+<p style="margin: 0; font-size: 18px; line-height: 1.6">Each spine is a shelf. Pick one, or look an item up by its number.</p>
+<div style="display: flex; flex-wrap: wrap; gap: 8px; max-width: 480px">
+<label for="q18" style="position: absolute; left: -9999px">Title, author or number</label>
+<input id="q18" type="text" placeholder="Title, author or number, like DPL3" style="flex: 1 1 240px; padding: 13px 16px; font-size: 16px; font-family: inherit; border: 1px solid #6e635a; border-radius: 6px; background: #ffffff">
+<button style="padding: 13px 24px; font-family: inherit; font-weight: 700; font-size: 16px; background: #6b1d2a; color: #ffffff; border: 0; border-radius: 6px">Search</button>
+</div>
+</div>
+<div style="flex: 1 1 460px; min-width: 0">
+<div style="display: flex; align-items: flex-end; gap: 6px; height: 300px; padding: 0 12px">
+<sc-for list="{{spines}}" as="s" hint-placeholder-count="8">
+<a href="#" style="flex: 1; height: {{s.h}}; background: {{s.bg}}; color: {{s.fg}}; text-decoration: none; border-radius: 3px 3px 0 0; display: flex; align-items: center; justify-content: center; min-width: 30px"><span style="writing-mode: vertical-rl; font-family: Lora, serif; font-weight: 700; font-size: 17px; letter-spacing: 0.5px">{{s.label}}</span></a>
+</sc-for>
+</div>
+<div style="height: 14px; background: #5b4636; border-radius: 2px"></div>
+</div>
+</section>
+<section style="max-width: 1160px; margin: 0 auto; padding: 20px 32px clamp(16px, 4vw, 48px)">
+<h2 style="margin: 0 0 18px; font-family: Lora, serif; font-weight: 700; font-size: 26px">New arrivals</h2>
+<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 20px">
+<sc-for list="{{items}}" as="it" hint-placeholder-count="4">
+<a href="#" style="background: #ffffff; border: 1px solid #c9bfb2; border-radius: 8px; padding: 16px; text-decoration: none; display: flex; flex-direction: column; gap: 10px">
+<div style="height: 150px; background: #ddd5ca; border-radius: 4px; color: #2a2522; font-size: 12px; display: flex; align-items: center; justify-content: center">Cover or scan</div>
+<div style="align-self: flex-start; padding: 3px 10px; background: #f1e3c4; color: #4a3508; font-weight: 700; font-size: 13px; border-radius: 12px">{{it.id}}</div>
+<div style="font-family: Lora, serif; font-weight: 700; font-size: 18px; line-height: 1.3; color: #2a2522">[Item title]</div>
+<div style="font-size: 14px; color: #554c45">[Author or maker] · [date]</div>
+</a>
+</sc-for>
+</div>
+</section>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1280,"height":960}}'>
+class Component extends DCLogic {
+renderVals() {
+const s = [['Yearbooks', '86%', '#6b1d2a', '#ffffff'], ['Newspapers', '100%', '#1f3d4d', '#ffffff'], ['Family histories', '92%', '#c9a24a', '#2a2010'], ['Maps', '70%', '#3f5a3a', '#ffffff'], ['City records', '96%', '#8a4a2a', '#ffffff'], ['Churches', '80%', '#2b2b48', '#ffffff'], ['Schools', '90%', '#d8cdb8', '#2a2522'], ['Oral histories', '76%', '#6b1d2a', '#ffffff']];
+return { spines: s.map(([label, h, bg, fg]) => ({ label, h, bg, fg })), items: ['DPL1', 'DPL2', 'DPL3', '[ID number]'].map((id) => ({ id })) };
+}
+}
+</script>
+</body>
+</html>

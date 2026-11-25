@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Map Room theme</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=Bitter:wght@500;700&family=Karla:wght@400;600&display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#7a2e12}a:hover{color:#4a1a08}
+</style>
+</helmet>
+<div style="background: #f1ecdf; font-family: Karla, sans-serif; color: #2d2a24; min-height: 960px; display: flex; flex-direction: column">
+<header style="padding: 16px 32px; display: flex; flex-wrap: wrap; gap: 16px; justify-content: space-between; align-items: center; border-bottom: 2px solid #2d2a24">
+<div style="font-family: Bitter, serif; font-weight: 700; font-size: 20px">Dickinson Historical Society <span style="font-weight: 500">Map Room</span></div>
+<nav style="display: flex; flex-wrap: wrap; gap: 22px; font-size: 16px; font-weight: 600"><a href="T09-MapRoom-search.dc.html">Map</a><a href="T09-MapRoom-collection.dc.html">Collections</a><a href="T09-MapRoom-search.dc.html">Browse</a><a href="T09-MapRoom-search.dc.html">Search</a></nav>
+</header>
+<div style="display: flex; flex-wrap: wrap; flex: 1">
+<div role="img" aria-label="Map of Dickinson with pins where archive items were made or found" style="flex: 3 1 520px; min-height: 520px; background: #d9e2d0; position: relative; overflow: hidden">
+<div aria-hidden="true" style="position: absolute; left: -5%; top: 46%; width: 110%; height: 34px; background: #a9c4cf; transform: rotate(-9deg); border-radius: 20px"></div>
+<div aria-hidden="true" style="position: absolute; left: 30%; top: -5%; width: 6px; height: 110%; background: #8c8676; transform: rotate(14deg)"></div>
+<div aria-hidden="true" style="position: absolute; left: -5%; top: 22%; width: 110%; height: 4px; background: #ffffff"></div>
+<div aria-hidden="true" style="position: absolute; left: 62%; top: -5%; width: 4px; height: 110%; background: #ffffff"></div>
+<div aria-hidden="true" style="position: absolute; left: -5%; top: 74%; width: 110%; height: 4px; background: #ffffff"></div>
+<sc-for list="{{pins}}" as="p" hint-placeholder-count="5">
+<a href="#" aria-label="Items at this place" style="position: absolute; left: {{p.x}}; top: {{p.y}}; width: 44px; height: 44px; margin: -22px 0 0 -22px; display: flex; align-items: center; justify-content: center; text-decoration: none"><span style="width: 30px; height: 30px; border-radius: 50%; background: {{p.bg}}; color: #ffffff; font-weight: 600; font-size: 13px; display: flex; align-items: center; justify-content: center; border: 2px solid #ffffff">[N]</span></a>
+</sc-for>
+<div style="position: absolute; left: 16px; bottom: 16px; background: #f1ecdf; border: 1px solid #2d2a24; padding: 8px 12px; font-size: 13px">Map placeholder. Blue band: Dickinson Bayou. Gray line: the railroad.</div>
+</div>
+<aside style="flex: 2 1 360px; min-width: 0; padding: 28px 32px clamp(16px, 4vw, 40px); box-sizing: border-box; display: flex; flex-direction: column; gap: 18px; border-left: 2px solid #2d2a24">
+<h1 style="margin: 0; font-family: Bitter, serif; font-weight: 700; font-size: 34px; line-height: 1.15">Find the history of a place you know</h1>
+<p style="margin: 0; font-size: 16px; line-height: 1.55">Choose a pin, or type a street or landmark.</p>
+<div style="display: flex; gap: 8px">
+<label for="q9" style="position: absolute; left: -9999px">Street or landmark</label>
+<input id="q9" type="text" placeholder="Street or landmark" style="flex: 1; min-width: 0; padding: 12px 14px; font-size: 16px; font-family: inherit; border: 2px solid #2d2a24; background: #ffffff">
+<button style="padding: 12px 20px; font-family: inherit; font-weight: 600; font-size: 16px; background: #7a2e12; color: #ffffff; border: 0">Find</button>
+</div>
+<div style="font-size: 13px; letter-spacing: 1.5px; text-transform: uppercase; font-weight: 600; border-bottom: 1px solid #2d2a24; padding-bottom: 6px; margin-top: 6px">At the selected pin</div>
+<a href="#" style="display: flex; gap: 14px; text-decoration: none; color: #2d2a24"><div style="flex: 0 0 96px; height: 72px; background: #cfc8b4; font-size: 11px; display: flex; align-items: center; justify-content: center">Photo</div><div><div style="font-family: Bitter, serif; font-weight: 700; font-size: 18px; line-height: 1.25">Aerial view of Dickinson, late 1920s</div><div style="font-size: 14px">DS5C740001 · Photograph</div></div></a>
+<a href="#" style="display: flex; gap: 14px; text-decoration: none; color: #2d2a24"><div style="flex: 0 0 96px; height: 72px; background: #cfc8b4; font-size: 11px; display: flex; align-items: center; justify-content: center">Photo</div><div><div style="font-family: Bitter, serif; font-weight: 700; font-size: 18px; line-height: 1.25">[Item title]</div><div style="font-size: 14px">[ID number] · [Type]</div></div></a>
+<a href="#" style="display: flex; gap: 14px; text-decoration: none; color: #2d2a24"><div style="flex: 0 0 96px; height: 72px; background: #cfc8b4; font-size: 11px; display: flex; align-items: center; justify-content: center">Photo</div><div><div style="font-family: Bitter, serif; font-weight: 700; font-size: 18px; line-height: 1.25">[Item title]</div><div style="font-size: 14px">[ID number] · [Type]</div></div></a>
+<a href="#" style="font-weight: 600; font-size: 15px">Show the same items as a list</a>
+</aside>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1280,"height":960}}'>
+class Component extends DCLogic {
+renderVals() {
+const pts = [['28%', '30%'], ['55%', '48%', true], ['70%', '18%'], ['42%', '70%'], ['82%', '62%']];
+return { pins: pts.map(([x, y, on]) => ({ x, y, bg: on ? '#7a2e12' : '#2d2a24' })) };
+}
+}
+</script>
+</body>
+</html>
