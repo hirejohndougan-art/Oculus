@@ -336,7 +336,13 @@ export async function setUpFirstInstall(
       must(await insertOrganization(tx, organization.value));
       must(await insertSite(tx, site.value));
       must(await insertTemplateVersion(tx, template.value));
-      must(await writeDublinCoreMapping(tx, mapping, 0, userId));
+      // Setup runs after every migration (setup-cli, the desktop helper), so
+      // the table is there. A database at a schema from before migration
+      // 0022 (as the launcher's own update test makes) gets no mapping, as
+      // the setup of that time made none.
+      const [table] = await tx.rows<{ present: boolean }>(sql`
+        SELECT to_regclass('public.dublin_core_mappings') IS NOT NULL AS present`);
+      if (table?.present === true) must(await writeDublinCoreMapping(tx, mapping, 0, userId));
     });
   } catch (error) {
     if (error instanceof AlreadySetUp || sqlState(error) === "23505") {
