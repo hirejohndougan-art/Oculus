@@ -802,7 +802,6 @@ describe("an overdue loan can't be hidden by editing it (review fixes)", () => {
     expect(state.phase).toBe("unknown");
     expect(state.problems.map((p) => [p.code, p.path])).toEqual([
       ["closed_unsettled", ["items", 0]],
-      ["closed_with_unlinked_move", ["items", 0]],
     ]);
     expect(ok(overdueLoans(b, "2026-11-23")).map((s) => s.loan.id)).toEqual([closed.id]);
     expect(ok(unexplainedLoanMoves(b)).map((m) => m.id)).toEqual([printOut.id]);

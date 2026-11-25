@@ -609,3 +609,45 @@ describe("review fixes (D-118's reviews)", () => {
     expect(ok(loanState(b, loan.id)).items[0]?.dueMatchesLoan).toBe(false);
   });
 });
+
+describe("third review: loans out and their due dates", () => {
+  const vase = newRecordId();
+  const home = move(vase, shelf.id, "2026-01-10", "placement");
+
+  it("an item out with no due date in the move log is overdue now, whatever the end date", () => {
+    const out = move(vase, borrowerPlace.id, "2026-06-05", "loan_out");
+    const loan = loanOut([{ recordId: vase, loanOutMoveId: out.id }], { endOn: "2099-12-31" });
+    expect(overdueIds(ok(indexLoans(log([home, out]), [loan])))).toEqual([loan.id]);
+  });
+
+  it("an unlinked return then an undated loan_out: listed, and the loan_out reported", () => {
+    const out = move(vase, borrowerPlace.id, "2026-06-05", "loan_out", {
+      expectedReturnOn: "2026-10-31",
+    });
+    const back = move(vase, shelf.id, "2026-07-01", "return");
+    const again = move(vase, borrowerPlace.id, "2026-07-02", "loan_out");
+    const loan = loanOut([{ recordId: vase, loanOutMoveId: out.id }], { endOn: "2099-12-31" });
+    const b = ok(indexLoans(log([home, out, back, again]), [loan]));
+    expect(overdueIds(b)).toEqual([loan.id]);
+    expect(ok(unexplainedLoanMoves(b)).map((m) => m.id)).toEqual([again.id]);
+  });
+
+  it("a borrower's second venue doesn't block closing", () => {
+    const venue2 = { ...borrowerPlace, id: newLocationId(), name: "Coastal annex" };
+    const index = ok(indexLocations(LEVELS, [...LOCATIONS, venue2] as StorageLocation[]));
+    const out = move(vase, borrowerPlace.id, "2026-06-05", "loan_out", {
+      expectedReturnOn: "2026-10-31",
+    });
+    const moveOn = move(vase, venue2.id, "2026-07-05", "loan_out", {
+      expectedReturnOn: "2026-10-31",
+    });
+    const back = move(vase, shelf.id, "2026-10-20", "return");
+    const loan = loanOut([{ recordId: vase, loanOutMoveId: out.id, returnMoveId: back.id }], {
+      status: "closed",
+      statusOn: "2026-10-21",
+    });
+    const b = ok(indexLoans(ok(indexMoves(index, [home, out, moveOn, back])), [loan]));
+    expect(ok(loanState(b, loan.id)).phase).toBe("closed");
+    expect(ok(unexplainedLoanMoves(b)).map((m) => m.id)).toEqual([moveOn.id]);
+  });
+});

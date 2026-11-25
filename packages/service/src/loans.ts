@@ -277,16 +277,44 @@ export function loanOperations(run: Runner): LoanOperations {
   }
 
   /** Whether the person may `permission` every record of `ids` on its home site. */
+  /** Each transaction's record places, read once (third review: lists read them per loan). */
+  const placeCache = new WeakMap<
+    Queryable,
+    Map<string, Awaited<ReturnType<typeof readRecordPlace>>>
+  >();
+  async function placeOf(
+    tx: Queryable,
+    org: OrganizationId,
+    id: RecordId,
+  ): Promise<Awaited<ReturnType<typeof readRecordPlace>>> {
+    let cache = placeCache.get(tx);
+    if (cache === undefined) {
+      cache = new Map();
+      placeCache.set(tx, cache);
+    }
+    if (cache.has(id)) return cache.get(id);
+    const place = await readRecordPlace(tx, org, id);
+    cache.set(id, place);
+    return place;
+  }
+
+  /**
+   * Whether the person may `permission` every record of `ids` on its home
+   * site. With `skipMissing`, records deleted since (only old history names
+   * them) are left out (third review).
+   */
   async function mayAll(
     tx: Queryable,
     org: OrganizationId,
     access: Access,
     ids: readonly RecordId[],
     permission: "records.view" | "records.edit",
+    skipMissing = false,
   ): Promise<boolean> {
     if (access.systemManager) return true;
     for (const id of new Set(ids)) {
-      const place = await readRecordPlace(tx, org, id);
+      const place = await placeOf(tx, org, id);
+      if (place === undefined && skipMissing) continue;
       if (place?.siteId == null || !holdsForWholeCatalog(access, permission, place.siteId)) {
         return false;
       }
@@ -545,7 +573,7 @@ export function loanOperations(run: Runner): LoanOperations {
             return UNKNOWN_LOAN();
           }
         }
-        if (!(await mayAll(tx, who.organizationId, may.access, named, "records.view"))) {
+        if (!(await mayAll(tx, who.organizationId, may.access, named, "records.view", true))) {
           return UNKNOWN_LOAN();
         }
         return {
@@ -592,20 +620,6 @@ export function loanOperations(run: Runner): LoanOperations {
         const next = checked.value;
         const records = await checkRecords(tx, who.organizationId, may.access, next);
         if (records !== undefined) return records;
-        // Naming an accession reads the donor register (D-036): donors.view.
-        if (
-          next.direction === "in" &&
-          next.items.some(
-            (i) => (i as { keptByAccessionId?: unknown }).keptByAccessionId !== undefined,
-          ) &&
-          !holdsSomewhere(may.access, "donors.view")
-        ) {
-          return refusal(
-            ["loan", "items"],
-            "not_permitted",
-            "Marking an item kept names an accession; that takes Donor relations.",
-          );
-        }
         const b = await bookOf(tx, who.organizationId, true);
         if (b === undefined) return UNREADABLE();
         if (loanId !== null) {
@@ -622,6 +636,52 @@ export function loanOperations(run: Runner): LoanOperations {
           if (versionOf(b, found.loan.id) !== expected) return CONFLICT();
         } else if (loanById(b.book, id) !== undefined) {
           return CONFLICT();
+        }
+        const before = loanById(b.book, id);
+        const markerOf = (loan: Loan | undefined, recordId: RecordId, key: string): unknown =>
+          (
+            loan?.items.find((i) => i.recordId === recordId) as Record<string, unknown> | undefined
+          )?.[key];
+        for (const item of next.items) {
+          // Naming an accession reads the donor register (D-036): only when
+          // the marker is set or changed (third review).
+          const kept = markerOf(next, item.recordId, "keptByAccessionId");
+          if (
+            kept !== undefined &&
+            kept !== markerOf(before, item.recordId, "keptByAccessionId") &&
+            !holdsSomewhere(may.access, "donors.view")
+          ) {
+            return refusal(
+              ["loan", "items"],
+              "not_permitted",
+              "Marking an item kept names an accession; that takes Donor relations.",
+            );
+          }
+          // A renewal settles the loan it continues: the person must be able
+          // to edit that loan too (third review).
+          const continues = markerOf(next, item.recordId, "continuesLoanId");
+          if (
+            continues !== undefined &&
+            continues !== markerOf(before, item.recordId, "continuesLoanId")
+          ) {
+            const earlier = isLoanId(continues) ? loanById(b.book, continues) : undefined;
+            if (
+              earlier !== undefined &&
+              !(await mayAll(
+                tx,
+                who.organizationId,
+                may.access,
+                recordsOf(earlier),
+                "records.edit",
+              ))
+            ) {
+              return refusal(
+                ["loan", "items"],
+                "renewal_mismatch",
+                "This item continues no open item of that loan: it must be an agreed loan in from the same lender, listing this record, not yet gone back, kept or marked notReceived.",
+              );
+            }
+          }
         }
         const book = withLoan(b.book, next, b.now);
         if (!book.ok) return ownIssues(book.issues);

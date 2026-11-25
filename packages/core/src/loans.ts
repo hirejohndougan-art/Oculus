@@ -114,9 +114,8 @@ export interface LoanOutItem {
   /** The `return` move that brought it home. Only after `loanOutMoveId`. */
   readonly returnMoveId?: MoveId;
   /**
-   * Recorded on purpose: it never went to the borrower (and won't). A
-   * problem (`sent_after_all`) while the record is at the borrower's and no
-   * other loan out explains it.
+   * Recorded on purpose: it never went to the borrower (and won't). Kept in
+   * the loan's history with who set it and when (D-118).
    */
   readonly notSent?: true;
 }
@@ -135,9 +134,8 @@ export interface LoanInItem {
   /** The `departure` move that sent it back to the lender. Only after it arrived. */
   readonly departureMoveId?: MoveId;
   /**
-   * Recorded on purpose: it never came (and won't). A problem
-   * (`received_after_all`) while the record is in our care and no other
-   * loan in explains it.
+   * Recorded on purpose: it never came (and won't). Kept in the loan's
+   * history with who set it and when (D-118).
    */
   readonly notReceived?: true;
   /** It stayed for good (bought or given): the accession that names it. Only after it arrived. */
@@ -539,11 +537,7 @@ const LOAN_BOOKS = new WeakMap<object, BookData>();
  * - overlaps another loan of the same record the same way
  *   (`overlapping_loans`, on every loan involved): a record is lent to one
  *   borrower at a time.
- * And a `closed` loan out whose record has a `loan_out` move to the borrower,
- * in the loan period, that no loan explains (`closed_with_unlinked_move`),
- * or a `closed` loan in with an item that has no departure linked although
- * its record has a move dated on or after `beginOn`
- * (`closed_without_departure`).
+ * And a `closed` loan with an item not settled (`closed_unsettled`, D-118).
  * A loan with any of these is in phase `unknown` and listed by
  * `overdueLoans` once past its end date. `now` is for tests. Never throws.
  */
@@ -801,7 +795,12 @@ export function overdueLoans(book: LoanBook, today: unknown): Validated<readonly
     const state = stateOf(data, entry);
     // A loan out item due back by the move log before today is late even if
     // the loan's end date was moved later without recording it (review fix).
-    const dueLate = state.items.some((i) => i.out && i.dueBack !== null && i.dueBack < today);
+    // An item out with no due date in the move log (sent without one, or a
+    // return recorded meanwhile) is late now: its loan's end date alone
+    // never takes it off (D-118, third review).
+    const dueLate =
+      entry.loan.direction === "out" &&
+      state.items.some((i) => i.out && (i.dueBack === null || i.dueBack < today));
     if (entry.loan.endOn >= today && !dueLate) continue;
     // D-118: an agreed loan is over only when every item is settled, by a
     // linked end move or an explicit, recorded way; dates alone never do it.
@@ -1041,7 +1040,14 @@ function buildBook(
         lent.push({
           recordId: item.recordId,
           from: start.index,
-          to: end ? end.index : moves.length,
+          // An extension comes before the item's next return, linked or not
+          // (third review: an unlinked return ended the stay).
+          to: end
+            ? end.index
+            : ((): number => {
+                const next = moves.findIndex((m, k) => k > start.index && m.reason === "return");
+                return next === -1 ? moves.length : next;
+              })(),
           locationId: start.move.locationId,
         });
       }
@@ -1275,7 +1281,10 @@ function buildBook(
   // blocked ordinary loans for good.) A record kept for good is ours, so
   // its later moves are not arrivals.
   const keptRecords = new Set<RecordId>();
-  for (const r of raw) if (settledOf(r) === "kept") keptRecords.add(r.recordId);
+  for (const r of raw) {
+    if (r.keptBy !== null && kept.get(r.keptBy)?.has(r.recordId) === true)
+      keptRecords.add(r.recordId);
+  }
   const strayArrivals: StorageMove[] = [];
   const seenRecords = new Set<RecordId>();
   for (const r of raw) {
@@ -1307,28 +1316,9 @@ function buildBook(
           : "A loan in can't be closed until this item's departure is linked, or it is marked notReceived, kept by an accession or renewed.",
       );
     }
-    if (r.loan.direction === "out") {
-      // A closed loan out can't leave a record's loan_out to this borrower,
-      // in the loan period, unlinked (review fix): the item may be out.
-      const loan = r.loan;
-      const stray = (strayByRecord.get(r.recordId) ?? []).some((m) => {
-        const place = logLocation(log, m.locationId);
-        return (
-          place?.kind === "external" &&
-          place.agentId === loan.agentId &&
-          m.movedOn >= loan.beginOn &&
-          m.movedOn <= loan.endOn
-        );
-      });
-      if (stray) {
-        flag(
-          loan.id,
-          ["items", r.j],
-          "closed_with_unlinked_move",
-          "This record went out to the borrower during the loan in a move no loan names. Link it to this item, and its return, before closing.",
-        );
-      }
-    }
+    // A loan_out no loan names is reported (`unexplainedLoanMoves`), never a
+    // problem (D-118, third review: a borrower's second venue would have
+    // blocked closing for good).
   }
 
   const entries = new Map<LoanId, Entry>();
