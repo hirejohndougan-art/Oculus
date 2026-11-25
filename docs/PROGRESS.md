@@ -7,7 +7,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - What changed: `saveIdentifierType` lists the published records a new format takes off public sites and needs `confirmDropped` naming exactly them; `droppedFromPublic` in the reply; `PUT /api/identifier-types/:key` passes `confirmDropped` (409 `drops_published_records`); `readRecordsForChecks` exported from `@oculus/db`.
 - Decisions: D-091 amendment
 - Review: one independent round, nothing blocking; fixed an undercounting message, a confirmation that could skip the list (now tied to the exact IDs), and per-record reads under the type's lock.
-- Gate: PASS (T-050d and S-033 merged together) · tests_passing TBD · npm audit clean
+- Gate: PASS (T-050d and S-033 merged together) · tests_passing 4618 (was 4611) · npm audit clean
 - Next: T-050c (OAI-PMH)
 
 ## 2026-11-25 02:00 CT — manual (Chat C) — T-050d Public record reads
@@ -15,7 +15,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - What changed: `packages/api/src/public-api.ts` (`GET /records/:id` on public hosts, mounted by `buildAdminServer` when public sites are configured); a `public` rate bucket.
 - Decisions: D-100
 - Review: one independent round, nothing blocking; fixed the public pool filling under many slow reads (a cap on reads at once, IPv6 counted by /64), the log line, and D-100's wording; S-037 filed (time limits on the reader pool).
-- Gate: PASS (T-050d and S-033 merged together) · tests_passing TBD · npm audit clean
+- Gate: PASS (T-050d and S-033 merged together) · tests_passing 4618 (was 4611) · npm audit clean
 - Next: T-050c (OAI-PMH) or T-050e
 
 ## 2026-11-25 01:55 CT — Chat B — T-041c Shares: storage and the service (part of T-041b)
