@@ -46,6 +46,8 @@ import {
   type OrganizationId,
 } from "@oculus/core";
 import {
+  acceptInvitation,
+  acceptInvitationForUser,
   beginSession,
   completePasswordReset,
   completeSecondStep,
@@ -232,6 +234,37 @@ function throttled(reply: OculusReply, seconds: number): unknown {
   const wait = Math.min(86_400, Math.max(1, Math.ceil(seconds)));
   reply.status(429).header("retry-after", String(wait));
   return { error: "throttled", retryAfterSeconds: wait };
+}
+
+/**
+ * The reply to a refused invitation (T-075): fixed codes only. The
+ * person's own name and password problems are listed with the rules' own
+ * messages (they typed them); nothing else about the account or the
+ * invitation is said.
+ */
+function invitationRefusal(
+  reply: OculusReply,
+  issues: readonly {
+    readonly path: readonly (string | number)[];
+    readonly code: string;
+    readonly message: string;
+  }[],
+): unknown {
+  const codes = issues.map((i) => i.code);
+  if (codes.includes("invalid_invitation")) throw new Refusal(400, "invalid_invitation");
+  if (codes.includes("account_exists")) throw new Refusal(409, "account_exists");
+  if (codes.includes("already_member")) throw new Refusal(409, "already_member");
+  if (
+    issues.length > 0 &&
+    issues.every((i) => i.path[0] === "password" || i.path[0] === "displayName")
+  ) {
+    reply.status(422);
+    return {
+      error: "invalid_form",
+      issues: issues.map((i) => ({ path: [...i.path], code: i.code, message: i.message })),
+    };
+  }
+  throw fixedAnswer(codes[0] ?? "internal_error");
 }
 
 /** What every screen gets about a full session: never the token. */
@@ -622,6 +655,103 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
           organizationName:
             named?.organizationName ?? (organization?.ok === true ? organization.value.name : ""),
           sites: sites.value,
+        };
+      },
+    },
+    {
+      // Accepting an invitation as a new person (T-075, D-068): the token
+      // from the link's fragment, the invitee's own address, a name and a
+      // password. Every reason the link can't be used is one reply
+      // (`invalid_invitation`); only a complete, valid form learns that the
+      // address already has an account (`account_exists`: sign in, then
+      // use the link again). The new account is then signed in with the
+      // password just chosen, so the next screen is setting up two-step
+      // sign-in (D-052), exactly as after `POST /api/sign-in`. The
+      // database is asked nothing about an address until the token, the
+      // address and the invitation all match, and passwords are hashed
+      // only then: a guessed token costs one indexed lookup, under the
+      // per-address limit every sign-in post shares.
+      method: "POST",
+      path: "/api/invitation/accept",
+      credentials: true,
+      handler: async (request, reply) => {
+        const source = sourceOf(request);
+        const body = textBody(request, ["token", "email", "displayName", "password"]);
+        limitAddress(source);
+        if (
+          body.token === undefined ||
+          body.email === undefined ||
+          body.displayName === undefined ||
+          body.password === undefined
+        ) {
+          throw new Refusal(400, "bad_body");
+        }
+        const accepted = await acceptInvitation(db, {
+          token: body.token,
+          email: body.email,
+          displayName: body.displayName,
+          password: body.password,
+        });
+        if (!accepted.ok) return invitationRefusal(reply, accepted.issues);
+        const label = clientLabel(request.headers["user-agent"]);
+        const started = await beginSession(
+          db,
+          {
+            email: body.email,
+            password: body.password,
+            source,
+            organizationId: accepted.value.organizationId,
+            ...(label === undefined ? {} : { clientLabel: label }),
+          },
+          { onError: onError("beginSession") },
+        );
+        if (!started.ok) {
+          // The account exists now; the person can sign in from the Login
+          // screen (a full password queue, a throttle reached meanwhile).
+          reply.status(201);
+          return { joined: true, signedIn: false };
+        }
+        const previous = request.cookies[OCULUS_COOKIES.session];
+        if (previous !== undefined && previous !== started.token) {
+          await endSession(db, previous, { onError: onError("endSession") });
+        }
+        reply.setCookie(OCULUS_COOKIES.session, started.token);
+        const state = await pendingSignInState(db, started.token, {
+          onError: onError("pendingState"),
+        });
+        reply.status(201);
+        if (!state.ok) return { joined: true, signedIn: false };
+        return {
+          joined: true,
+          signedIn: true,
+          expiresAt: state.expiresAt,
+          next: state.next,
+          setUpLinkRequired: state.enrolmentTokenRequired,
+          csrfToken: csrfTokenFor(started.token) ?? null,
+        };
+      },
+    },
+    {
+      // Accepting an invitation with the account one is signed in with
+      // (T-075): the person comes from the full session, never the body
+      // (D-068). The invitation must be for that account's address.
+      method: "POST",
+      path: "/api/invitation/accept-signed-in",
+      handler: async (request, reply) => {
+        const { session } = await fullSessionOf(request, true);
+        const body = textBody(request, ["token"]);
+        if (body.token === undefined) throw new Refusal(400, "bad_body");
+        const accepted = await acceptInvitationForUser(db, {
+          token: body.token,
+          userId: session.userId,
+        });
+        if (!accepted.ok) return invitationRefusal(reply, accepted.issues);
+        const named = await readOrganization(db, accepted.value.organizationId);
+        reply.status(201);
+        return {
+          joined: true,
+          organizationId: accepted.value.organizationId,
+          organizationName: named?.ok === true ? named.value.name : "",
         };
       },
     },
