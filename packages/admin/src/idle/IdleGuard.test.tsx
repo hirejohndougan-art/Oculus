@@ -181,7 +181,11 @@ describe("the idle warning", () => {
       expect(screen.queryByRole("alertdialog")).toBeNull();
     });
     expect(sessionChecks(sent).length).toBeGreaterThan(before);
-    expect(document.activeElement).toBe(search);
+    // Focus comes back in the effect that runs after the warning closes;
+    // under a loaded gate that effect can land a tick after the dialog goes.
+    await waitFor(() => {
+      expect(document.activeElement).toBe(search);
+    });
     // A new 30 minutes: no sign-out at the old end.
     await act(() => vi.advanceTimersByTimeAsync(2 * MINUTE));
     expect(sent.some((s) => s.path === "/api/sign-out")).toBe(false);
