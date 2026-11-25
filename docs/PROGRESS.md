@@ -7,7 +7,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - What changed: four tests that save a record from another session just before a restore takes its row lock: retry after the attempts with nothing written, success on the next attempt, a conflict when it keeps moving, and 503 `retry` over HTTP followed by a restore that goes through. Checked that they fail without the retry check.
 - Decisions: none
 - Review: n/a (not risky; tests only)
-- Gate: see the merge commit
+- Gate: PASS · tests_passing 4376 (was 4372) · npm audit clean
 - Next: the next job in the work board's pool.
 ## 2026-11-24 21:20 CT — Chat B — M-001 Serve active file types safely
 - Result: done
