@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 16:45 CT — manual (Chat X) — S-065 Data and operations follow-ups from the Phase 2 review
+- Result: done
+- What changed: `migrate.ts` (no statement or transaction time limit inside a file's transaction, a 10 s `lock_timeout`, retries, `file_lock_timeout`); migration 0052 (append-only guards on `storage_moves`, `accession_versions`, `second_step_alert_notices`, `second_step_passes`); `migrate-upgrade.test.ts` (a populated 0039 database upgraded to head; later table-changing files must be covered); the alert-notice runner skips ticks while a run is going and only tries its lock; stale comments and a second `publicSubjects?.start()` gone; D-120 records the migration rule, that orphan placed copies stay, and the writes outside the service.
+- Decisions: D-120 (D-067 and D-086 point to it)
+- Review: one independent review: no security hole or data loss. Fixed: two `second-factor` tests the new guard broke, guard errors now name their own trigger, a recorded file is never tried again, a test that a file ending the runner's transaction isn't retried. Left: notices give no sign while another process holds their lock (no worse than before).
+- Gate: PASS · tests_passing 5249 (was 5233) · npm audit clean
+- Next: none for Chat X if no Phase 2 job is free
+
 ## 2026-11-25 16:05 CT — manual (Chat M) — T-075 Accept an invitation
 - Result: done
 - What changed: `sign-in-api.ts` (`POST /api/invitation/accept`: the token from the link, the invitee's address, a name and a password; the account is made and signed in, so the next screen is two-step set-up; `POST /api/invitation/accept-signed-in` for someone who already has an account, user from the session only); `accounts.ts` (`acceptInvitation` and `acceptInvitationForUser` take the organization from the invitation when it is left out); the admin's `/invitation` screen (`AcceptInvitation.tsx`), which reads the token from the fragment once. Tests: `invitation-api.test.ts` (one reply for every unusable link, `account_exists` only for a complete form, Origin, CSRF, session and per-address rules, no token or address in logs) and `AcceptInvitation.test.tsx`.
