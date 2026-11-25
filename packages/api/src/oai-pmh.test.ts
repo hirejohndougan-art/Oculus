@@ -55,9 +55,13 @@ async function withRole(q: Queryable, statement: string, role: string): Promise<
   END $$`);
 }
 
+/** Uploaded files (M-002, D-086): a throwaway folder of this file's own. */
+const filesDir = mkdtempSync(join(tmpdir(), "oculus-oai-files-"));
+
 function envFor(extra: Record<string, string> = {}): Record<string, string> {
   return {
     NODE_ENV: "development",
+    OCULUS_FILES_DIR: filesDir,
     OCULUS_ORIGINS: `${ADMIN},${PUBLIC}`,
     OCULUS_ADMIN_ORIGIN: ADMIN,
     OCULUS_SECRET_KEY: FAKE_TEST_SECRET_KEY,
@@ -162,6 +166,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await app.close();
   rmSync(dir, { recursive: true, force: true });
+  rmSync(filesDir, { recursive: true, force: true });
   await reader.close();
   await w.db.close();
   await w.testDb.drop();
