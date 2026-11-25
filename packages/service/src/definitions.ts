@@ -87,6 +87,7 @@ import {
   publishedAmong,
   publishedHoldingType,
   publishedUsingTemplate,
+  countPublishedUsingTemplate,
   readIdentifierTypes,
   readRecordPlace,
   readRecordsUsingTemplate,
@@ -143,7 +144,10 @@ export interface DublinCoreMappingVersion {
 
 /** A saved mapping, with the published records it changed at once (D-076). */
 export interface SavedDublinCoreMapping extends DublinCoreMappingVersion {
+  /** The published records it showed on at once, when few enough to list. */
   readonly publishedRecords: readonly RecordId[];
+  /** How many there were (more than `publishedRecords` holds past the list's limit, S-039). */
+  readonly publishedRecordCount: number;
 }
 
 export interface DefinitionOperations {
@@ -445,7 +449,10 @@ export function publicShapeChanged(before: FieldTemplate, after: FieldTemplate):
   return shape(before) !== shape(after);
 }
 
-export function definitionOperations(run: Runner): DefinitionOperations {
+export function definitionOperations(
+  run: Runner,
+  settings: { readonly maxListedPublished?: number | undefined } = {},
+): DefinitionOperations {
   async function readerAccess(tx: Queryable, who: Who): Promise<ServiceResult<Access>> {
     const access = await readAccess(tx, who.organizationId, who.actor);
     if (!access.ok) return access;
@@ -655,8 +662,26 @@ export function definitionOperations(run: Runner): DefinitionOperations {
         if (!access.ok) return access;
         const changedBy = actorUser(who.actor);
         if (changedBy === undefined) return notPermitted();
-        const opts = readOptions(saveOptions, ["expectedVersion", "confirmPublished"]);
+        const opts = readOptions(saveOptions, [
+          "expectedVersion",
+          "confirmPublished",
+          "confirmPublishedCount",
+        ]);
         if (!opts.ok) return opts;
+        const countConfirmed = opts.value.confirmPublishedCount;
+        if (
+          countConfirmed !== undefined &&
+          (typeof countConfirmed !== "number" ||
+            !Number.isInteger(countConfirmed) ||
+            countConfirmed < 0 ||
+            countConfirmed >= 2 ** 31 - 1)
+        ) {
+          return refusal(
+            ["options", "confirmPublishedCount"],
+            "invalid_option",
+            "confirmPublishedCount is the number of published records the change shows on.",
+          );
+        }
         const expected = opts.value.expectedVersion;
         if (
           typeof expected !== "number" ||
@@ -744,7 +769,41 @@ export function definitionOperations(run: Runner): DefinitionOperations {
         let affected: readonly RecordId[] | undefined = [];
         if (canonicalJson(stored?.mapping ?? null) !== canonicalJson(valid.value)) {
           // IDs only, under the lock (record saves and publishing wait).
-          affected = await publishedUsingTemplate(tx, org, key);
+          affected = await publishedUsingTemplate(tx, org, key, settings.maxListedPublished);
+        }
+        // Too many to list (S-039): a first mapping has no smaller steps, so
+        // the change is confirmed by its exact count, read under the lock. A
+        // count that is out of date (records published or withdrawn since)
+        // asks again. Only someone who may publish every record may do it:
+        // a system manager (a list can't be checked record by record here).
+        let counted = 0;
+        if (affected === undefined) {
+          if (!checker.access.systemManager) {
+            return refusal(
+              [],
+              "not_permitted",
+              "This change would show values at once on published records you may not publish.",
+            );
+          }
+          counted = await countPublishedUsingTemplate(tx, org, key);
+          if (countConfirmed !== counted) {
+            return {
+              ok: false,
+              issues: [
+                issue(
+                  ["confirmPublishedCount"],
+                  "publishes_records",
+                  `This change shows values at once on ${String(counted)} published records, too many to list one by one. Check the mapping, then confirm that number (confirmPublishedCount).`,
+                ),
+                issue(
+                  ["publishedRecordCount", counted],
+                  "published_records_counted",
+                  "The number of published records the change shows on.",
+                ),
+              ],
+            };
+          }
+          affected = [];
         }
         const gate = await publishedGate(tx, who, checker, affected, confirmPublished.value);
         if (gate) return gate;
@@ -756,7 +815,9 @@ export function definitionOperations(run: Runner): DefinitionOperations {
             key,
             version: saved.value.version,
             mapping: valid.value,
-            publishedRecords: Object.freeze([...(affected ?? [])]),
+            publishedRecords: Object.freeze([...affected]),
+            // Their number: the list's length, or the count confirmed (S-039).
+            publishedRecordCount: counted > 0 ? counted : affected.length,
           }),
         };
       });

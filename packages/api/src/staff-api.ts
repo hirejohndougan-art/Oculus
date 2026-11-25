@@ -1195,7 +1195,11 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
       handler: signedIn("write", true, async (request, reply, { context }) => {
         const precondition = newOrMatch(request, VERSION_TAG);
         const body = objectBody(request);
-        const extra = onlyKeys(body, ["mapping", "confirmPublished"], reply);
+        const extra = onlyKeys(
+          body,
+          ["mapping", "confirmPublished", "confirmPublishedCount"],
+          reply,
+        );
         if (extra) return extra;
         const result = await service.saveDublinCoreMapping(
           context,
@@ -1206,6 +1210,10 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
             ...(body.confirmPublished === undefined
               ? {}
               : { confirmPublished: body.confirmPublished }),
+            // Past the list's limit, the count confirms instead (S-039).
+            ...(body.confirmPublishedCount === undefined
+              ? {}
+              : { confirmPublishedCount: body.confirmPublishedCount }),
           },
         );
         return answer(result, reply, (value) => {
