@@ -2,6 +2,21 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 05:13 CT — build (BUILD MODE) — S-037 Time limits on the public reader pool
+- Result: done
+- What changed: `readPublicRecord` takes `timeLimitMs` (a transaction-local `statement_timeout`, default 5 s); the public pool waits at most 5 s for a connection (`publicPoolOptions`, `PUBLIC_POOL_SIZE` shared with the read slots); `isDatabaseTimeout` (57014, pg-pool's wait) answers `503 busy` on `GET /records/:id` and OAI-PMH; OAI list pages stop reading after 15 s, or just before a later read that timed out, and end with a resumption token. Tests lock `public.records`, exhaust the pool and cancel reads mid-page. Commits a44f691, 894a758, the second-review fix, c4b899a.
+- Decisions: D-100 amended (time limits)
+- Review: two independent rounds. Round 1: nothing blocking; fixed OAI pages holding a slot for 200 slow reads (page time limit), limits now refused when routes are built, a slow new connection stays `unavailable` (an outage), pool size and slots tied. Round 2: safe; fixed one timed-out read failing a whole OAI page (now ends the page before it). Filed S-043 (a record always slower than the limit; OAI staff-connection reads unbounded; injectable clock; JS work between statements).
+- Gate: PASS · tests_passing 4745 (was 4734) · npm audit clean
+- Next: the next free roadmap task (U-007, S-031, S-035 or S-043; many others are claimed by chats)
+
+## 2026-11-25 03:00 CT — manual (Chat D) — S-042 Site managers see members whose role is on every site
+- Result: done
+- What changed: John (2026-11-25): a role on every site includes the site manager's own, so such a member is seen in full and may be given more roles there. `holdsRoleOn` (packages/service/src/admin.ts) and `listMembers` (packages/db/src/people.ts) count every-site grants; members with no role stay name-only.
+- Decisions: D-084 amended
+- Review: one independent round, nothing blocking; fixed: a role on every site scoped to one unit no longer counts, and a viewer with no managed site sees no one (matching the SQL); unit tests for the rule.
+- Gate: PASS · tests_passing 4734 (was 4729) · npm audit clean · licences all permissive (the e2e step, disturbed by a stopped earlier run, passed on its own: 8 of 8; main then moved by roadmap claims only)
+- Next: nothing claimed
 ## 2026-11-25 04:45 CT — upkeep — U-006 Main's gate fails in a clean checkout
 - Result: gate fix
 - What changed: CI's gate on main had failed at lint on every push since M-001 (`files.spec.ts` imports `@oculus/api`, resolved to an unbuilt `dist`); `packages/admin/tsconfig.json` now maps `@oculus/api`, `db` and `service` to their sources (c3f0f46). Also in-major updates: @types/node 26.6.10, @types/react 19.3.2, react-router 8.5.3. TypeScript 7 / Vite 8 rechecked, still blocked (T-001b). Filed U-007 (the gate should start with no `dist`).
