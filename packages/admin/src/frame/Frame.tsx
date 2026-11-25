@@ -4,8 +4,8 @@
  * with the person and signing out; the page in between. Every screen after
  * sign-in sits inside it. A skip link jumps past the sidebar.
  */
-import { useState } from "react";
-import { Navigate, Outlet, useNavigate, useParams } from "react-router";
+import { useEffect, useState } from "react";
+import { NavLink, Navigate, Outlet, useNavigate, useParams } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   Button as AriaButton,
@@ -15,12 +15,15 @@ import {
   Popover,
   Separator,
 } from "react-aria-components";
-import { ApiError, api, problemText, setCsrfToken } from "../api";
+import { ApiError, api, problemText } from "../api";
+import { forgetLists } from "../records/listMemory";
+import { endSession, isSessionEnded } from "../session";
 import { Button, Note } from "../components/ui";
 import { AdminNav } from "../people/AdminNav";
 import type { Me, SiteChoice } from "../types";
 import styles from "./Frame.module.css";
 import { SiteSelector } from "./SiteSelector";
+import { useSiteAbilities } from "../records/queries";
 import { ME_KEY, useMe } from "./useMe";
 
 /** Up to two initials for the round account button. */
@@ -44,14 +47,25 @@ export function Frame() {
   const queries = useQueryClient();
   const { siteId } = useParams();
   const me = useMe();
+  const signedIn = me.data;
+  const here = signedIn?.sites.find(
+    (s) => s.siteId === siteId && s.organizationId === signedIn.organizationId,
+  );
+  const abilities = useSiteAbilities(here?.siteId);
   const [status, setStatus] = useState<{
     tone: "green" | "amber";
     text: string;
     retry?: () => void;
   }>();
   const [switching, setSwitching] = useState(false);
+  const ended = me.error instanceof ApiError && me.error.status === 401;
+  useEffect(() => {
+    // The session ended on the server: forget everything of it before the
+    // next person signs in here.
+    if (ended || isSessionEnded(me.error)) endSession(queries);
+  }, [ended, me.error, queries]);
 
-  if (me.error instanceof ApiError && me.error.status === 401) {
+  if (ended) {
     return <Navigate to="/sign-in" replace />;
   }
   if (me.data === undefined) {
@@ -86,8 +100,7 @@ export function Frame() {
       }
     }
     setStatus(undefined);
-    setCsrfToken(null);
-    queries.clear();
+    endSession(queries);
     await navigate("/sign-in", {
       replace: true,
       state: { notice: "You are signed out." },
@@ -118,6 +131,12 @@ export function Frame() {
     setSwitching(true);
     api("/api/organization", { body: { organizationId: site.organizationId } })
       .then(async () => {
+        // Another organization: none of the old one's templates, record
+        // types, lists or records may stay in the cache. The person's own
+        // query is refetched in place (its reply carries the new session's
+        // CSRF token too).
+        forgetLists();
+        queries.removeQueries({ predicate: (q) => q.queryKey[0] !== ME_KEY[0] });
         await queries.invalidateQueries({ queryKey: ME_KEY });
         await navigate(`/sites/${site.siteId}`);
       })
@@ -148,6 +167,22 @@ export function Frame() {
             isDisabled={switching}
           />
         ) : null}
+        {here === undefined ? null : (
+          <ul className={styles.navList}>
+            <li>
+              <NavLink className={styles.navLink} to={`/sites/${here.siteId}`} end>
+                Item records
+              </NavLink>
+            </li>
+            {abilities.data?.review === true ? (
+              <li>
+                <NavLink className={styles.navLink} to={`/sites/${here.siteId}/review`}>
+                  Waiting for review
+                </NavLink>
+              </li>
+            ) : null}
+          </ul>
+        )}
         <AdminNav />
       </nav>
       <div className={styles.body}>

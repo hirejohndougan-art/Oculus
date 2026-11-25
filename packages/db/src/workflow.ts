@@ -618,6 +618,54 @@ export async function publicValueSources(
   return [...pairs.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([, v]) => v);
 }
 
+/** One value a record takes from a record above it, as the editor shows it (T-046). */
+export interface InheritedValue {
+  /** The field of the record. */
+  readonly key: string;
+  readonly value: unknown;
+  /** The record above it that holds the value. */
+  readonly from: RecordId;
+}
+
+/**
+ * STAFF ONLY. The values the record inherits now (D-013's effective record:
+ * fields it has no value of its own for, from the units above it), with
+ * the record each comes from and the IDs of every record above it
+ * (`chain`, so the caller can refuse to show anything when one of them is
+ * out of the person's sight). Read in the caller's transaction without
+ * locks, as `publicValueSources` reads them; `undefined` when the record or
+ * anything above it can't be read (then the editor shows no inherited
+ * values). Staff values are included: the admin shows them to staff.
+ */
+export async function inheritedValues(
+  db: Queryable,
+  organizationId: OrganizationId,
+  recordId: RecordId,
+): Promise<
+  { readonly values: readonly InheritedValue[]; readonly chain: readonly RecordId[] } | undefined
+> {
+  if (!isOrganizationId(organizationId) || !isRecordId(recordId)) return undefined;
+  const snapshot = await readSnapshot(db, organizationId, recordId, false);
+  if (!snapshot.ok) return undefined;
+  const s = snapshot.value;
+  const index = indexRecords(s.records);
+  if (!index.ok) return undefined;
+  const effective = effectiveRecord(recordId, index.value, s.templateFor, {
+    checkers: s.checkers,
+    identifiers: s.identifiers,
+  });
+  if (!effective.ok) return undefined;
+  const values = effective.value.entries
+    .filter((entry) => !entry.own && entry.inTemplate && entry.from.id !== recordId)
+    .map((entry) => Object.freeze({ key: entry.key, value: entry.value, from: entry.from.id }));
+  return Object.freeze({
+    values: Object.freeze(values),
+    chain: Object.freeze(
+      effective.value.chain.map((step) => step.id).filter((id) => id !== recordId),
+    ),
+  });
+}
+
 /**
  * The records whose public output can depend on the record (S-020): every
  * record below it (units filed under it, at any depth) and every digital

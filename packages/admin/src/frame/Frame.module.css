@@ -240,3 +240,34 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.navList {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.navLink {
+  display: flex;
+  align-items: center;
+  min-height: var(--control-height);
+  padding: 0 12px;
+  border-left: 3px solid transparent;
+  border-radius: var(--radius-control);
+  color: #ffffff;
+  font: 600 var(--size-small) var(--font-body);
+  text-decoration: none;
+}
+.navLink:hover {
+  color: #ffffff;
+  background: var(--nav-active);
+}
+.navLink[aria-current="page"] {
+  background: var(--nav-active);
+  border-left-color: var(--accent);
+}
+.navLink:focus-visible {
+  outline: 3px solid #ffffff;
+  outline-offset: 2px;
+}

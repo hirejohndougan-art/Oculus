@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 18:25 CT — manual (Chat A) — T-046 Admin: item list and record editor
+- Result: done
+- What changed: admin item list and approval queue; a record editor built from the template (inherited values, checks beside fields, If-Match conflicts named, workflow buttons per `can`, history view/compare/restore, delete, new records, leave guard). API: `GET /api/records`, `GET /api/working-site`, `GET /api/record-types`; `can` and `inherited` on record reads. `endSession` clears the CSRF token, query cache and list memory whenever a session ends or begins. e2e walks the whole flow by keyboard with Alfa.
+- Decisions: D-083
+- Review: one independent round, no blocking issue; four findings fixed (search words surviving a session end; organization switch keeping old templates; `inherited` read race failing open; edits lost on reconnect).
+- Gate: PASS · tests_passing 4141 (was 4090) · npm audit clean
+- Next: T-048 (building), T-040
+
 ## 2026-11-24 17:35 CT — manual (Chat A) — T-043 API: history, restore, approval and publishing
 - Result: done
 - What changed: staff API routes for a record's version list (summaries only), one version, compare, restore (If-Match, `confirmMadePublic`), submit for review, return to draft, publish and withdraw (each its own POST with If-Match), and the approval queue over whole publish sites. Read-only and Scanner see no history (John). `readRecord` returns the workflow state. Migration 0019: a partial index for the queue, which runs under the search timeout.

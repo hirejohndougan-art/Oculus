@@ -86,6 +86,7 @@ export {
   publishCheckIssues,
   readPublicRecord,
   publicValueSources,
+  inheritedValues,
   recordDependents,
   recordClosureIds,
   lockRecordsShared,
@@ -94,6 +95,7 @@ export {
   MAX_STATE_LIST_LIMIT,
 } from "./workflow.js";
 export type {
+  InheritedValue,
   PublicRecordOptions,
   PublicValueSource,
   StateListEntry,
@@ -164,6 +166,14 @@ export {
   MAX_SEARCH_LIMIT,
 } from "./search.js";
 export type { SearchHit, SearchResults, SearchOptions, MatchedBy } from "./search.js";
+export { listRecords, listRecordTypes, MAX_LIST_LIMIT, MAX_LIST_OFFSET } from "./record-list.js";
+export type {
+  ListedRecord,
+  RecordList,
+  RecordListOptions,
+  RecordListSort,
+  RecordTypeSummary,
+} from "./record-list.js";
 export {
   createFirstSystemAdmin,
   createInvitation,

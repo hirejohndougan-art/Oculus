@@ -51,6 +51,12 @@
  * not_found`), and a version the record doesn't have the same way, but
  * only once the person may read its history.
  *
+ * The admin's lists (T-046, D-083): `GET /api/records` (the working site's
+ * items, filtered by state and record type, sorted, or searched), `GET
+ * /api/record-types`, `GET /api/working-site` (what the person may do
+ * there), and `GET /api/records/:id` says what the person may do with the
+ * record (`can`) and what it inherits (`inherited`).
+ *
  * Not here: signing in, the second step, password reset and signing out
  * (T-045 adds those routes beside these, with `credentials: true` for the
  * 8 KiB limit, and writes the cookie through the reply's cookie writer).
@@ -485,7 +491,13 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
         const result = await service.readRecord(context, recordId(request));
         return answer(result, reply, (value) => {
           reply.header("etag", `"v${String(value.version)}"`);
-          return { record: value.record, version: value.version, state: value.state };
+          return {
+            record: value.record,
+            version: value.version,
+            state: value.state,
+            can: value.can,
+            inherited: value.inherited,
+          };
         });
       }),
     },
@@ -587,6 +599,61 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
           ...(limit === undefined ? {} : { limit }),
           ...(after === undefined ? {} : { after }),
         });
+        return answer(result, reply, (value) => value);
+      }),
+    },
+    {
+      // The items list (T-046, D-083): the working site's records, filtered,
+      // sorted or searched, a page at a time. Every filter is applied in
+      // the database query, so a page's length says nothing about records
+      // the person can't see.
+      method: "GET",
+      path: "/api/records",
+      handler: signedIn("search", false, async (request, reply, { context }) => {
+        const query = queryText(request, "q");
+        const state = queryText(request, "state");
+        const recordType = queryText(request, "type");
+        const sort = queryText(request, "sort");
+        const after = queryText(request, "after");
+        const limit = queryNumber(request, "limit", 100);
+        if (
+          (state !== undefined && !/^[a-z_]{1,40}$/.test(state)) ||
+          (recordType !== undefined && !/^[a-z][a-z0-9_-]{0,63}$/.test(recordType)) ||
+          (sort !== undefined && sort !== "updated" && sort !== "title") ||
+          (after !== undefined && !/^[0-9a-f.-]{1,80}$/.test(after)) ||
+          query?.trim() === ""
+        ) {
+          throw new Refusal(400, "bad_query");
+        }
+        const result = await service.listItems(context, {
+          ...(query === undefined ? {} : { query }),
+          ...(state === undefined ? {} : { state }),
+          ...(recordType === undefined ? {} : { recordType }),
+          ...(sort === undefined ? {} : { sort }),
+          ...(after === undefined ? {} : { after }),
+          ...(limit === undefined ? {} : { limit }),
+        });
+        return answer(result, reply, (value) => ({
+          records: value.records,
+          next: value.next ?? null,
+        }));
+      }),
+    },
+    {
+      method: "GET",
+      path: "/api/record-types",
+      handler: signedIn("read", false, async (_request, reply, { context }) => {
+        const result = await service.listRecordTypes(context);
+        return answer(result, reply, (value) => ({ recordTypes: value }));
+      }),
+    },
+    {
+      // What the person may do in the working site (T-046): which buttons
+      // the admin shows. Every operation still checks for itself.
+      method: "GET",
+      path: "/api/working-site",
+      handler: signedIn("read", false, async (_request, reply, { context }) => {
+        const result = await service.siteAbilities(context);
         return answer(result, reply, (value) => value);
       }),
     },
