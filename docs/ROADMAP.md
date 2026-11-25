@@ -17,6 +17,7 @@ These are never picked by a run. The weekly report repeats each question until J
 - [x] Q-9 Until more system managers can be made, the first admin account can't be disabled from the app (the last-system-manager guard). Acceptable? John (2026-11-24): disabling it must need a second system manager to go through a confirming step. To build once more system managers can be made.
 - [ ] Q-10 Site managers see the name and email of every member with no role yet, and can make anyone in the organization visible by giving them a small role on their site. Keep, or hide role-less people's emails and only allow grants to people they can already see?
 - [ ] Q-11 Should inviting someone require re-entering the password and code, like role changes do?
+- [ ] Q-12 (for T-058) How big may the published copy of an image be that the public and other sites can view and download? Full size for everything published, a cap (about 2000 px on the long side) unless the record's rights statement allows full size, or chosen per record?
 
 ## Phase 1 — Record model and ID numbers
 
@@ -393,6 +394,11 @@ Moved here by John on 2026-11-23 so the first launch is smaller. Not counted in 
   - A screen listing pending changes and records ready for review, with approve and reject, available to reviewers and admins only.
 - [ ] U-004 **Move password hashing to Argon2id.** deps: T-036
   - When the `engines` floor reaches Node 24.7 (Node 22 support ends April 2027), switch new hashes to `crypto.argon2` (OWASP settings) with a decision entry; PHC strings move each user over at sign-in (D-052).
+- [ ] T-058 **IIIF: deep zoom and image sharing.** deps: M-002, M-003, M-001, T-050 (risky)
+  - PLATFORM_PLAN §4 and §7. John (2026-11-24): build after launch; zoom tiles made once at upload as static IIIF Image API level 0 tiles (works on shared hosting, more disk), not an on-request image server; Presentation API manifests for published records; Universal Viewer (MIT) on public item pages. CORS only on public, published resources (D-058's IIIF note). Staff-only files and unpublished records never get tiles or manifests that a public site can reach (D-045, D-075).
+  - Before building: a decision entry for the tiling library (it must pass D-002: `sharp`/libvips is LGPL, so not allowed) and Universal Viewer's own dependencies through the license check; disk use per image for the Society's largest scans. The largest size shared publicly waits on Q-12.
+- [ ] T-059 **EAD import and export.** deps: T-050b (needs John for scope)
+  - PLATFORM_PLAN §7 (EAD import and export). Export a fonds or collection's finding aid (DACS fields, its tree of series, files and items, published parts only for public use) as EAD 3, and import EAD from other systems with a report of anything it couldn't map. Only if the Society or a partner wants formal finding aids to share; confirm with John before building.
 
 ## Phases 4–7
 Plugins and themes (D-025, John: system managers install them, site managers choose among the installed ones). Before any plugin system: - [ ] P-001 **Decision: what a plugin may do and how it's checked before install.** (risky) Plugins run code on the server, so this needs a security model (permissions, signing like the update packages in PLATFORM_PLAN §9, the D-002 license rule).
