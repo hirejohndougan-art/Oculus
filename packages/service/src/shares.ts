@@ -427,7 +427,7 @@ export function shareOperations(db: Database, run: Runner, outside: Outside): Sh
             offeredBy: access.userId,
           });
         } catch (error) {
-          // The database's limits (0040, S-036b); the transaction is rolled
+          // The database's limits (0043, S-036b); the transaction is rolled
           // back with the refusal, and nothing more runs in it.
           const state = sqlStateOf(error);
           if (state === SHARE_OFFER_LIMIT_STATE) {

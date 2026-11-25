@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 10:40 CT — Chat J — S-036b Share limits and endings
+- Result: done (S-036 is now done)
+- What changed: migration 0043 (written as 0040; renumbered at merge: S-045 took 0040, and 0041–0042 are Chat A's): at most 100 open offers from one organization into one site, counting only offers whose record is published on a site now (`too_many_offers`), and no re-offer within 30 days of a decline (`declined_recently`), both in the share check under an advisory lock and only in Read Committed (OC061 otherwise); `record_shares` no longer cascades with its record, and triggers on `records` end live shares as `deleted` (record deleted) or `moved` (record moved onto the second site), keeping the decision; existing shares left live by earlier moves end as `moved`; `record_shares_target` in the lists' order. The service maps the limits (`MAX_OPEN_OFFERS`, `DECLINE_COOLDOWN_DAYS`), says `already_shared` first, and answers a record deleted mid-offer as missing; the admin names the new states and refusals.
+- Decisions: D-094 amended (S-036b)
+- Review: one independent round; nothing blocking. Fixed: hidden offers no longer fill a site's places, the count refuses non-Read-Committed writers, a deleted record mid-offer is `unknown_record`, the shadowed `found` variable, the amendment's wording; tests added for unanswered offers ending, the isolation check and unpublished offers freeing a place.
+- Gate: see the merge commit's baseline
+- Next: S-031 (setup follow-ups) for Chat J, if still free
+
 ## 2026-11-25 09:55 CT — build (BUILD MODE) — S-045 Four wrong codes a day never raise an alert
 - Result: done (the `last_sign_in_at` half split off as S-053)
 - What changed: a `wrong:<user>` row in `second_step_throttles` (migration 0040 widens the key check) counts a sign-in's wrong TOTP codes that no right code in the same session explained; a session's first code writes a `second_step_alerts` row for codes other sessions left, and `runCleanup` writes one for codes an hour old (`UNEXPLAINED_TOLD_AFTER_SECONDS`), each told once; forgotten after 30 days (`WRONG_CODE_MEMORY_SECONDS`); a typo followed by the right code (or a recovery code) raises none; full sessions' codes (re-entry, recovery codes, resets) aren't counted; a wait's alert takes them all. Eight tests in second-factor.test.ts; the attack tests (4 guesses a day, a recovery code in a new session, the cleanup) fail without the change. Commits on main up to 85e3286.

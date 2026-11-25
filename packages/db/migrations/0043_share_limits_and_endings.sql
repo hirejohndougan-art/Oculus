@@ -1,7 +1,6 @@
--- Share limits and endings (S-036b, D-094 amended). Numbered 0040: 0038 and
--- 0039 are reserved by another branch (M-002); the runner allows gaps but
--- refuses a file that sorts before one already applied, so a lower number
--- that merges after this one renumbers above it (the work board's rule).
+-- Share limits and endings (S-036b, D-094 amended). Numbered 0043: it was
+-- written as 0040, which a build run's S-045 took first on main, and 0041
+-- and 0042 are reserved by another branch (S-040, S-052).
 --
 -- 1. Two new final states, both set only by the database itself, below:
 --      offered | accepted -> deleted  (the record was deleted at home)

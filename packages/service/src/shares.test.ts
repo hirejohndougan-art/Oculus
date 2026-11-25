@@ -1503,7 +1503,7 @@ describe("share limits and endings (S-036b)", () => {
 
   it("keeps the limits in shares.ts and the migration the same", () => {
     const text = readFileSync(
-      new URL("../../db/migrations/0040_share_limits_and_endings.sql", import.meta.url),
+      new URL("../../db/migrations/0043_share_limits_and_endings.sql", import.meta.url),
       "utf8",
     );
     expect(text).toContain(`IF open_offers >= ${MAX_OPEN_OFFERS} THEN`);
