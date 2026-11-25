@@ -208,6 +208,13 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   // One count of the public pool's connections for every public route (D-100, D-105).
   const publicSlots = new ReadSlots(PUBLIC_POOL_SIZE);
   const oaiEmail = oaiAdminEmail(env[OAI_ADMIN_EMAIL_ENV]);
+  // OAI-PMH's lists read the datestamps the background pass stores (S-041):
+  // without its pool they would stay empty, so refuse rather than serve that.
+  if (oaiEmail !== undefined && publicSites.length > 0 && options.countsDb === undefined) {
+    throw new Error(
+      `refusing to start: ${OAI_ADMIN_EMAIL_ENV} turns on OAI-PMH, which needs the background counts' own connection (countsDb, D-108).`,
+    );
+  }
 
   let admin: ServerOptions["admin"];
   if (adminOrigin !== undefined && adminOrigin !== "") {
@@ -253,7 +260,13 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   const publicSubjects =
     options.countsDb === undefined || publicSites.length === 0
       ? undefined
-      : new PublicSubjects({ db: options.countsDb, sites: publicSites, log });
+      : new PublicSubjects({
+          db: options.countsDb,
+          sites: publicSites,
+          log,
+          // OAI-PMH's lists read the datestamps this pass stores (S-041, D-108).
+          oaiStamps: oaiEmail !== undefined,
+        });
 
   const service = createService(options.db, { onError: serviceErrorLogger(log) });
   const routes = [
