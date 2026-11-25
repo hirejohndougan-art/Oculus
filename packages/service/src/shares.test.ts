@@ -445,9 +445,37 @@ describe("deciding and ending", () => {
     expect(await steps(w.lib, [w.l2])).toEqual([]);
     // The other organization's person can't be found by ID either.
     expect(await steps(w.lib, "all", w.dhsManager)).toEqual([]);
-    // The receiving organization's trail shows none of it (D-094, 0043).
+    // The receiving organization's trail shows nothing of it to its
+    // catalogers and readers (D-094)…
     expect(await steps(w.dhs, "all")).toEqual([]);
     expect(await steps(w.dhs, [w.d1])).toEqual([]);
+    // …but its site's manager sees each step (S-070): their own people by
+    // name, the home side's never, and no title.
+    const received = async (org: OrganizationId, sites: "all" | SiteId[]) =>
+      (
+        await readAuditTrail(
+          s.owner,
+          org,
+          { records: [], people: [], receivedShares: sites },
+          { limit: 100 },
+        )
+      ).entries.flatMap((e) =>
+        e.type === "share" ? [[e.kind, e.actor, e.title, e.targetSiteId]] : [],
+      );
+    expect(await received(w.dhs, [w.d1])).toEqual([
+      ["removed", actorOf(w.dhsManager), null, w.d1],
+      ["accepted", actorOf(w.dhsManager), null, w.d1],
+      ["offered", "other_organization", null, w.d1],
+    ]);
+    expect(await received(w.dhs, "all")).toHaveLength(3);
+    // Through the service: the manager of D1 gets them, its cataloger doesn't.
+    const viaService = async (who: UserId) => {
+      const r = await service.auditTrail(at(w.dhs, who), { limit: 100 });
+      if (!r.ok) return [];
+      return r.value.entries.filter((e) => e.type === "share");
+    };
+    expect(await viaService(w.dhsManager)).toHaveLength(3);
+    expect(await viaService(w.dhsCataloger)).toEqual([]);
     // A share between two sites of one organization: someone who sees only
     // the receiving site sees nothing of it, not even the record's ID.
     ok(
@@ -460,6 +488,10 @@ describe("deciding and ending", () => {
     expect(await steps(w.lib, [w.l2])).toEqual([]);
     const l2 = await readAuditTrail(s.owner, w.lib, { records: [w.l2], people: [w.l2] }, {});
     expect(JSON.stringify(l2)).not.toContain(w.item.id);
+    // L2's manager sees the offer into L2, without the title (S-070).
+    expect(await received(w.lib, [w.l2])).toEqual([
+      ["offered", actorOf(w.libCataloger), null, w.l2],
+    ]);
     expect((await steps(w.lib, [w.l1]))[0]).toEqual([
       "offered",
       actorOf(w.libCataloger),
@@ -677,6 +709,9 @@ describe("what the second site sees", () => {
       "unknown_share",
     ]);
     expect(ok(await service.listSharedItems(at(w.dhs, w.dhsReader), w.d1)).shares).toEqual([]);
+    // Nor does the receiving manager's audit trail show it any more (0043, S-070).
+    const trail = ok(await service.auditTrail(at(w.dhs, w.dhsManager), { limit: 100 }));
+    expect(trail.entries.filter((e) => e.type === "share")).toEqual([]);
   });
 });
 

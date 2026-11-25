@@ -518,6 +518,13 @@ export interface AuditScope {
    * matters on every site (`donors.view`, D-036); the service decides.
    */
   readonly accessions?: boolean;
+  /**
+   * The receiving side of shares (S-070): the steps of shares offered to
+   * these sites (every site of the organization for "all"), as D-094 shows
+   * them to the site's manager; never a deleted or moved record's share
+   * (0043), never a title. The service gives the sites the viewer manages.
+   */
+  readonly receivedShares?: "all" | readonly SiteId[];
 }
 
 export const MAX_AUDIT_PAGE = 100;
@@ -649,7 +656,7 @@ export type AuditEntry =
       readonly shareId: string;
       readonly kind: ShareStep;
       readonly recordId: string;
-      /** The record's title; null once deleted. */
+      /** The record's title, for those who see the record; null otherwise or once deleted. */
       readonly title: string | null;
       readonly deleted: boolean;
       readonly targetSiteId: string | null;
@@ -846,6 +853,10 @@ export async function readAuditTrail(
   const wantRecords = recordSites === null || recordSites.length > 0;
   const wantPeople = (peopleSites === null || peopleSites.length > 0) && !filter.recordId;
   const wantSystem = scope.system === true && !filter.recordId;
+  const receivedSites =
+    scope.receivedShares === undefined || scope.receivedShares === "all"
+      ? []
+      : scope.receivedShares.filter((x) => isSiteId(x));
   const actor = filter.actorId ?? null;
   const from = filter.from ?? null;
   const to = filter.to ?? null;
@@ -981,13 +992,15 @@ export async function readAuditTrail(
       UNION ALL
       -- A share's steps (T-041c, S-036b), for those who see the record
       -- itself (its home organization, and its home site in their scope;
-      -- shares between two sites of one organization included). The
-      -- receiving side is never shown here: D-094 shows it its offers and
-      -- items by other rules, and 0043 hides a deleted record's shares there
-      -- (review). Someone of another organization is never named or given
-      -- by ID: other_organization (D-019).
+      -- shares between two sites of one organization included), with its
+      -- title; and (S-070) for the managers of the site it was offered to,
+      -- as D-094 shows them its offers, with no title and never a deleted
+      -- or moved record's share (0043). Someone of another organization is
+      -- never named or given by ID: other_organization (D-019).
       SELECT 'share', step.at, 'h' || sh.id::text || ':' || step.part, who.actor,
-             sh.record_id::text, NULL, NULL, r.title, r.kind, NULL, NULL, r.id IS NULL,
+             sh.record_id::text, NULL, NULL,
+             CASE WHEN home.sees THEN r.title END, CASE WHEN home.sees THEN r.kind END,
+             NULL, NULL, home.sees AND r.id IS NULL,
              sh.id::text, step.kind, NULL, NULL, sh.target_site_id::text, NULL, NULL, NULL,
              NULL, NULL, NULL, NULL
       FROM public.record_shares sh
@@ -1002,10 +1015,20 @@ export async function readAuditTrail(
         WHEN step.by_id IS NULL THEN 'automatic'
         WHEN EXISTS (SELECT 1 FROM names n WHERE n.id = step.by_id) THEN 'user:' || step.by_id::text
         ELSE 'other_organization' END AS actor) AS who
-      WHERE ${wantRecords}::boolean
-        AND step.at IS NOT NULL
-        AND sh.organization_id = ${organizationId}::uuid
-        AND (${recordSites === null}::boolean OR r.site_id = ANY (${recordSites ?? []}::uuid[]))
+      CROSS JOIN LATERAL (SELECT coalesce(
+        ${wantRecords}::boolean AND sh.organization_id = ${organizationId}::uuid
+          AND (${recordSites === null}::boolean OR r.site_id = ANY (${recordSites ?? []}::uuid[])),
+        false) AS sees) AS home
+      CROSS JOIN LATERAL (SELECT
+        sh.target_organization_id = ${organizationId}::uuid
+          AND sh.state NOT IN ('deleted', 'moved')
+          AND (${scope.receivedShares === "all"}::boolean
+               OR sh.target_site_id = ANY (${receivedSites}::uuid[]))
+        AS sees) AS received
+      WHERE step.at IS NOT NULL
+        AND (sh.organization_id = ${organizationId}::uuid
+             OR sh.target_organization_id = ${organizationId}::uuid)
+        AND (home.sees OR received.sees)
         AND (${actor}::text IS NULL OR who.actor = 'user:' || ${actor}::text)
         AND (${filter.recordId ?? null}::uuid IS NULL OR sh.record_id = ${filter.recordId ?? null}::uuid)
         AND (${from}::timestamptz IS NULL OR step.at >= ${from}::timestamptz)

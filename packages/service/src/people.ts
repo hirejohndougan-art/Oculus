@@ -395,6 +395,12 @@ function wholeSitesHolding(
   return all.filter((s) => named.has(s));
 }
 
+/** The sites whose received shares the viewer sees in the audit trail (S-070): those they manage. */
+function receivedSharesOf(access: Access): "all" | readonly SiteId[] {
+  const managed = managedSites(access);
+  return managed === "all" ? "all" : [...managed];
+}
+
 const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
 const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,6})?)?Z$/;
 
@@ -920,6 +926,8 @@ export function peopleOperations(
                   v.system ||
                   (all.length > 0 &&
                     wholeSitesHolding(v.access, "donors.view", all).length === all.length),
+                // S-070: the steps of shares into the sites the viewer manages (D-094).
+                receivedShares: receivedSharesOf(v.access),
               },
               {
                 ...(person === undefined ? {} : { actorId: person }),
