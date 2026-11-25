@@ -2,6 +2,22 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+
+## 2026-11-24 22:40 CT — Chat B — M-001 Serve active file types safely
+- Result: done
+- What changed: `fileReply` (packages/api/src/file-replies.ts) is the only way a handler sends a file's bytes: plain images, audio and video may be shown as their bare type, everything else (HTML, SVG, XML, scripts, PDF, unknown) downloads as `application/octet-stream`; every file reply has nosniff, a sandboxing CSP, same-origin CORP and nothing the handler set; safe RFC 6266/8187 names; streams opened only when sent, outside the handler timeout, within a 2-hour deadline, closed on errors, wrong lengths, hang-ups and shutdown; HEAD opens nothing. HTTP attack tests and a Chromium test that a page on another origin can't run an HTML, SVG or XHTML file's script.
+- Decisions: D-089
+- Review: three independent rounds. Fixed: a storage error could crash the server, downloads were cut at 30 s, sources leaked on abort, wrong lengths and failed handlers, HEAD read whole files, a missing file dropped the connection, name details. Left as S-033 (download limits per client).
+- Gate: see the merge commit
+- Next: the next job in the work board's pool (S-026).
+## 2026-11-24 21:05 CT — manual (Chat C) — T-048a Admin: System settings
+- Result: done
+- What changed: System settings for system managers (sidebar "System" group, `/settings`): Sites (list, add, rename), Templates (list and a field editor through the existing template PUT with its confirmations), Sign-in rules. API: `POST /api/sites`, `PUT /api/sites/:id`, `GET`/`PUT /api/system-settings`, each change behind a recent sign-in answered with T-048's re-entry form. HTTP, screen and e2e tests (Alfa on each settings screen).
+- Decisions: D-087
+- Review: one independent round, nothing blocking; fixed confirmations arriving published-records-first (the first answer is now kept) and two wordings; S-032 filed (huge If-Match versions answer 422).
+- Gate: PASS · tests_passing 4239 (was 4208) · npm audit clean
+- Next: M-001
+
 ## 2026-11-24 20:15 CT — Chat B — T-055 First-time setup command
 - Result: done
 - What changed: `npm run setup` migrates an empty database and makes the first system admin (two-step set-up at first sign-in), organization, site and a starter `Item` template in one transaction; refuses, before changing anything, a database that is set up or not Oculus's. `setUpFirstInstall`, `databaseBeforeSetup`, README note.
