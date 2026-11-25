@@ -7,7 +7,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - What changed: migration 0022 (`dublin_core_mappings`, `public_dublin_core_mapping`); `packages/db/src/dublin-core-mappings.ts`; `readPublicRecord` uses the stored mapping when none is passed; service `readDublinCoreMapping`/`saveDublinCoreMapping`; `GET`/`PUT /api/templates/:key/dublin-core`.
 - Decisions: D-096
 - Review: one independent round, nothing blocking; fixed a mapping without rights taking records offline, the full record read under the lock, the version check passable by direct SQL, and two stale comments.
-- Gate: see the merge commit · npm audit clean
+- Gate: PASS · tests_passing 4420 (was 4411) · npm audit clean. Migration renumbered 0022 at merge (main stopped at 0021).
 - Next: T-050d (public record reads)
 
 ## 2026-11-25 00:35 CT — manual (Chat E) — S-026 Publish check for ID number formats
