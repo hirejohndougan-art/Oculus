@@ -15,7 +15,7 @@ import {
   ALERT_NOTICE_TABLE_PRIVILEGES,
   sendSecondStepAlertNotices,
   type SecondStepAlertMessage,
-} from "./second-step-alert-notices.js";
+} from "./alert-notices.js";
 import { sql } from "./sql.js";
 import { freshDatabase, testServerUrl, type TestDatabase } from "./test-database.fixtures.js";
 

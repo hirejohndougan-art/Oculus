@@ -335,10 +335,10 @@ export {
   ALERT_NOTICE_TABLE_PRIVILEGES,
   ALERT_NOTICE_WINDOW_SECONDS,
   ALERT_NOTICE_BATCH,
-} from "./second-step-alert-notices.js";
+} from "./alert-notices.js";
 export type {
   SecondStepAlertMessage,
   SecondStepAlertDelivery,
   AlertNoticeRun,
   AlertNoticeOptions,
-} from "./second-step-alert-notices.js";
+} from "./alert-notices.js";
