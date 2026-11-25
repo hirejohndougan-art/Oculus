@@ -25,6 +25,7 @@ import {
   insertIdentifierType,
   insertOrganization,
   insertTemplateVersion,
+  lockAccessionHolds,
   migrate,
   openDatabase,
   publishCheckIssues,
@@ -173,6 +174,7 @@ async function world(): Promise<World> {
     ["t-object", ["object"]],
     ["t-unit", ["archival_unit"]],
     ["t-agent", ["agent"]],
+    ["t-asset", ["digital_asset"]],
   ] as const) {
     ok(
       await insertTemplateVersion(s.owner, {
@@ -389,6 +391,53 @@ describe("accessions through the service (T-018c)", () => {
         accessionInput(w, { records: [{ recordId: elsewhere.id, label: "Jar" }] }),
       ),
     );
+  });
+
+  it("names nothing whose hold would reach another site's records", async () => {
+    await ready();
+    const w = await world();
+    const other = await makeSite(service, w.root, w.org, `Invented far site ${String(count)}`);
+    // A scan on the other site of the vase (this site): holding the vase holds it too.
+    const scan = ok(
+      await service.createRecord({ organizationId: w.org, actor: actorOf(w.root), siteId: other }, {
+        kind: "digital_asset",
+        title: "Invented scan of the vase",
+        mediaType: "image/jpeg",
+        represents: w.vase.id,
+        templateKey: "t-asset",
+        fields: {},
+      } as never),
+    );
+    expect(scan.record.id).toBeDefined();
+    const refused = await service.createAccession(
+      ctx(w, w.donorStaff),
+      accessionInput(w, { records: [{ recordId: w.vase.id, label: "Vase" }] }),
+    );
+    expect(codes(refused)).toEqual(["not_permitted"]);
+  });
+
+  it("waits for a publish check in flight, so the two never pass each other", async () => {
+    await ready();
+    const w = await world();
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // A publish check holding the holds lock shared until it commits.
+    const publishing = s.owner.transaction(async (q) => {
+      await lockAccessionHolds(q, w.org, "shared");
+      await held;
+    });
+    let saved = false;
+    const saving = service.createAccession(ctx(w, w.donorStaff), accessionInput(w)).then((r) => {
+      saved = true;
+      return r;
+    });
+    await new Promise((r) => setTimeout(r, 400));
+    expect(saved).toBe(false);
+    release();
+    await publishing;
+    expect((await saving).ok).toBe(true);
   });
 
   it("refuses an input with an ID, an organization or a key it doesn't take", async () => {

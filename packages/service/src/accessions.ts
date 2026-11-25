@@ -43,12 +43,14 @@ import {
   type DonorContact,
   type RecordId,
   type RolePermission,
+  type SiteId,
 } from "@oculus/core";
 import {
   MAX_ACCESSION_PAGE,
   deleteDonorContact,
   insertAccession,
-  lockRecord,
+  lockAccessionHolds,
+  sitesBelow,
   listAccessions,
   numberUsedBefore,
   publishedBelow,
@@ -213,15 +215,13 @@ export function accessionOperations(run: Runner): AccessionOperations {
     ids: readonly RecordId[],
   ): Promise<Refusal | undefined> {
     if (access.systemManager) return undefined;
-    for (const id of ids) {
-      const place = await readRecordPlace(tx, org, id);
-      // A record that doesn't exist is core's to report (unknown_record).
-      if (place === undefined) continue;
-      if (place.siteId === null || !holdsForWholeCatalog(access, "donors.edit", place.siteId)) {
+    // The named records and everything below them: what a hold would reach.
+    for (const site of await sitesBelow(tx, org, ids)) {
+      if (site === null || !holdsForWholeCatalog(access, "donors.edit", site as SiteId)) {
         return refusal(
           ["records"],
           "not_permitted",
-          "An accession can name only records of sites where you work with donors and accessions.",
+          "An accession can name only records (and what is filed below them) of sites where you work with donors and accessions.",
         );
       }
     }
@@ -257,19 +257,8 @@ export function accessionOperations(run: Runner): AccessionOperations {
     return row?.today ?? "";
   }
 
-  /**
-   * Locks every record `candidate` names (and `before`, the stored version's)
-   * `FOR NO KEY UPDATE`, in ID order: a publish of one of them, or of a
-   * record below one, holds `FOR SHARE` on it until it commits, so the
-   * two never pass each other (D-114): either the publish committed first
-   * and `nowHeld` sees it, or it waits and its check sees this accession.
-   */
-  async function lockNamed(
-    tx: Queryable,
-    org: Accession["organizationId"],
-    candidate: unknown,
-    before?: unknown,
-  ): Promise<readonly RecordId[]> {
+  /** Every record `candidate` names (and `before`, the stored version's), in ID order. */
+  function namedIds(candidate: unknown, before?: unknown): readonly RecordId[] {
     const ids = new Set<string>();
     for (const value of [candidate, before]) {
       const source = own(own(value, "sourceAgent"), "recordId");
@@ -282,9 +271,7 @@ export function accessionOperations(run: Runner): AccessionOperations {
         }
       }
     }
-    const sorted = [...ids].sort() as RecordId[];
-    for (const id of sorted) await lockRecord(tx, org, id, "no_key_update");
-    return sorted;
+    return [...ids].sort() as RecordId[];
   }
 
   /** Core's whole check of one accession, against the records it names and the types, read now. */
@@ -465,7 +452,9 @@ export function accessionOperations(run: Runner): AccessionOperations {
         if (!may.ok) return may;
         const candidate = candidateOf(input, newAccessionId(), who.organizationId);
         if (!candidate.ok) return candidate;
-        const named = await lockNamed(tx, who.organizationId, candidate.value);
+        // Before anything is read: no publish check runs meanwhile (D-114).
+        await lockAccessionHolds(tx, who.organizationId, "exclusive");
+        const named = namedIds(candidate.value);
         const naming = await mayName(tx, who.organizationId, may.access, named);
         if (naming) return naming;
         const checked = await checkAccession(tx, who.organizationId, candidate.value);
@@ -483,11 +472,13 @@ export function accessionOperations(run: Runner): AccessionOperations {
         const expected = expectedOf(own(options, "expectedVersion"), false);
         if (expected === undefined) return BAD_VERSION();
         if (typeof id !== "string") return UNKNOWN_ACCESSION();
+        // Before anything is read: no publish check runs meanwhile (D-114).
+        await lockAccessionHolds(tx, who.organizationId, "exclusive");
         const row = await readAccession(tx, who.organizationId, id, { lock: true });
         if (row === undefined) return UNKNOWN_ACCESSION();
         const candidate = candidateOf(input, id, who.organizationId);
         if (!candidate.ok) return candidate;
-        const named = await lockNamed(tx, who.organizationId, candidate.value, row.definition);
+        const named = namedIds(candidate.value, row.definition);
         const naming = await mayName(tx, who.organizationId, may.access, named);
         if (naming) return naming;
         const checked = await checkAccession(tx, who.organizationId, candidate.value);
@@ -535,6 +526,8 @@ export function accessionOperations(run: Runner): AccessionOperations {
         }
         const checked = validateDonorContact(candidate);
         if (!checked.ok) return { ok: false, issues: checked.issues };
+        const naming = await mayName(tx, who.organizationId, may.access, [agentId]);
+        if (naming) return naming;
         // The agent must be one of the organization's agents (core's register check).
         const types = await readIdentifierTypes(tx, who.organizationId);
         const records = await readAccessionRecords(tx, who.organizationId, [agentId]);

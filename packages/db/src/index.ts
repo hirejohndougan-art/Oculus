@@ -490,6 +490,8 @@ export {
   deleteDonorContact,
   insertAccession,
   listAccessions,
+  lockAccessionHolds,
+  sitesBelow,
   numberUsedBefore,
   readAccession,
   readAccessionHolds,

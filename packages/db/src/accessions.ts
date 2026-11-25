@@ -222,10 +222,31 @@ function refusedSave(error: unknown): SaveOutcome {
 }
 
 /**
+ * The organization's accession holds lock (D-114), a transaction-level
+ * advisory lock (classid 114): every accession save takes it exclusive
+ * before anything else, and a publish check that locks takes it shared
+ * before it reads the holds. So a publish and a save never pass each other:
+ * the publish's check sees the saved accession, or the save's `nowHeld`
+ * sees the committed publish.
+ */
+export async function lockAccessionHolds(
+  db: Queryable,
+  organizationId: OrganizationId,
+  mode: "shared" | "exclusive",
+): Promise<void> {
+  await db.rows(
+    mode === "shared"
+      ? sql`SELECT pg_advisory_xact_lock_shared(114, hashtext(${organizationId}::text))`
+      : sql`SELECT pg_advisory_xact_lock(114, hashtext(${organizationId}::text))`,
+  );
+}
+
+/**
  * The holds of the accessions that produced any of `ids` (D-114): only
  * their deed status, access restriction and which of `ids` they produced.
- * With `lock`, those accession rows are locked `FOR SHARE` until COMMIT, so
- * a save that would change a hold waits for (or is seen by) the caller.
+ * With `lock`, the organization's holds lock is taken shared first
+ * (`lockAccessionHolds`), so no accession save runs until the caller
+ * commits, and the caller waits for one in flight.
  */
 export async function readAccessionHolds(
   db: Queryable,
@@ -235,19 +256,10 @@ export async function readAccessionHolds(
 ): Promise<readonly AccessionHold[]> {
   if (!isOrganizationId(organizationId) || ids.length === 0) return [];
   const wanted = ids.filter((id) => isRecordId(id));
-  if (options.lock === true) {
-    await db.rows(sql`
-      SELECT 1 FROM public.accessions a
-      WHERE a.organization_id = ${organizationId}::uuid
-        AND EXISTS (SELECT 1 FROM public.accession_records ar
-                    WHERE ar.organization_id = a.organization_id AND ar.accession_id = a.id
-                      AND ar.record_id = ANY(${wanted}::uuid[]))
-      ORDER BY a.id
-      FOR SHARE OF a`);
-  }
+  if (options.lock === true) await lockAccessionHolds(db, organizationId, "shared");
   const [row] = await db.rows<{ holds: unknown }>(sql`
     SELECT public.accession_holds_of(${organizationId}::uuid, ${wanted}::uuid[]) AS holds`);
-  return holdsFrom(row?.holds);
+  return holdsFrom(row?.holds) ?? [];
 }
 
 /**
@@ -255,8 +267,8 @@ export async function readAccessionHolds(
  * takes them (a null restriction left out). Core checks them; this only
  * reshapes.
  */
-export function holdsFrom(value: unknown): readonly AccessionHold[] {
-  if (!Array.isArray(value)) return [];
+export function holdsFrom(value: unknown): readonly AccessionHold[] | undefined {
+  if (!Array.isArray(value)) return undefined;
   return Object.freeze(
     value.map((h: unknown) => {
       const entry = (typeof h === "object" && h !== null ? h : {}) as Record<string, unknown>;
@@ -441,4 +453,28 @@ export async function numberUsedBefore(
                      AND number_key = ${numberKey}
                      AND accession_id <> ${accessionId}::uuid) AS used`);
   return row?.used === true;
+}
+
+/**
+ * The home sites of `ids` and of everything below them (units filed under
+ * them, digital assets representing any of those): what an accession naming
+ * `ids` would hold back. `null` stands for a record on no site.
+ */
+export async function sitesBelow(
+  db: Queryable,
+  organizationId: OrganizationId,
+  ids: readonly RecordId[],
+): Promise<readonly (string | null)[]> {
+  const wanted = ids.filter((id) => isRecordId(id));
+  if (!isOrganizationId(organizationId) || wanted.length === 0) return [];
+  const rows = await db.rows<{ site_id: string | null }>(sql`
+    WITH RECURSIVE down(id) AS (
+      SELECT unnest(${wanted}::uuid[])
+      UNION
+      SELECT r.id FROM public.records r JOIN down ON r.organization_id = ${organizationId}::uuid
+        AND (r.parent_id = down.id OR r.represents_id = down.id)
+    )
+    SELECT DISTINCT r.site_id::text AS site_id FROM public.records r JOIN down ON r.id = down.id
+    WHERE r.organization_id = ${organizationId}::uuid`);
+  return Object.freeze(rows.map((r) => r.site_id));
 }

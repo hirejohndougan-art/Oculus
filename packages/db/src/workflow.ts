@@ -451,7 +451,7 @@ interface SnapshotSource {
   /** Of `ids`, those public now (published; on the public site, for the public output). */
   published(ids: readonly RecordId[]): Promise<readonly RecordId[]>;
   /** The holds of the accessions that produced any of `ids` (D-114): never their contents. */
-  holds(ids: readonly RecordId[]): Promise<readonly AccessionHold[]>;
+  holds(ids: readonly RecordId[]): Promise<readonly AccessionHold[] | undefined>;
 }
 
 /** The tables, in the caller's transaction; with `lock`, definitions locked (shared) until COMMIT. */
@@ -566,8 +566,11 @@ async function buildSnapshot(
     sql`SELECT public.organization_local_day(${org}::uuid) AS today`,
   );
   const today = day?.today ?? "";
+  const holds = await source.holds(records.map((r) => r.id));
+  // Holds that can't be read refuse, never "none" (D-114).
+  if (holds === undefined) return refused(["accessions"], "unreadable_accessions", CANT_CHECK);
   const register = indexAccessionHolds(org, {
-    holds: await source.holds(records.map((r) => r.id)),
+    holds,
     records,
     today,
   });
