@@ -8,8 +8,15 @@
  * server, and several processes would each count on their own (D-035: one
  * process is the expected deployment).
  *
- * Memory is bounded: at most `MAX_TRACKED` windows are kept; past that,
- * ended windows are dropped first, then the oldest.
+ * Memory is bounded and every request costs O(1) (S-060a, from the Phase 2
+ * security review's L2). Windows still counting are kept in the order they
+ * started, so ended ones are always at the front and are dropped from
+ * there; past `MAX_TRACKED`, the oldest still counting is dropped too, which
+ * can only give that key back what it had left. A window that has reached
+ * its limit moves to a second list and is never dropped before it ends, so
+ * a flood of other keys can't reset a limited one; that list keeps the
+ * `MAX_LIMITED` most recently limited, a bound only a flood of millions of
+ * requests a minute could reach.
  */
 
 /**
@@ -37,9 +44,35 @@ export const DEFAULT_RATE_LIMITS: RateLimits = Object.freeze({
 
 const WINDOW_MS = 60_000;
 const MAX_TRACKED = 50_000;
+const MAX_LIMITED = 50_000;
+
+interface RateWindow {
+  readonly start: number;
+  count: number;
+}
+
+/** A window is over a minute after it started, or at once if the clock went back. */
+function ended(window: RateWindow, now: number): boolean {
+  return now - window.start >= WINDOW_MS || now < window.start;
+}
+
+/** Drops ended windows from the front of `map` (oldest first), then the oldest past `max - 1`. */
+function makeRoom(map: Map<string, RateWindow>, now: number, max: number): void {
+  for (const [key, window] of map) {
+    if (!ended(window, now)) break;
+    map.delete(key);
+  }
+  for (const key of map.keys()) {
+    if (map.size < max) break;
+    map.delete(key);
+  }
+}
 
 export class SessionRateLimiter {
-  private readonly windows = new Map<string, { start: number; count: number }>();
+  /** Windows still under their limit, oldest start first. */
+  private readonly windows = new Map<string, RateWindow>();
+  /** Windows at their limit, kept until they end (or past `MAX_LIMITED`, oldest first). */
+  private readonly limited = new Map<string, RateWindow>();
 
   constructor(
     private readonly limits: RateLimits = DEFAULT_RATE_LIMITS,
@@ -59,32 +92,31 @@ export class SessionRateLimiter {
   take(sessionId: string, bucket: RateBucket): boolean {
     const now = this.clock();
     const key = `${bucket}:${sessionId}`;
-    const window = this.windows.get(key);
-    if (window === undefined || now - window.start >= WINDOW_MS || now < window.start) {
-      this.windows.delete(key);
-      this.prune(now);
-      this.windows.set(key, { start: now, count: 1 });
-      return true;
+    const limit = this.limits[bucket];
+    const held = this.limited.get(key);
+    if (held !== undefined) {
+      if (!ended(held, now)) return false;
+      this.limited.delete(key);
     }
-    if (window.count >= this.limits[bucket]) return false;
+    let window = this.windows.get(key);
+    if (window === undefined || ended(window, now)) {
+      // Deleted first, so a new window goes to the end of the start order.
+      this.windows.delete(key);
+      makeRoom(this.windows, now, MAX_TRACKED);
+      window = { start: now, count: 0 };
+      this.windows.set(key, window);
+    }
     window.count++;
+    if (window.count >= limit) {
+      this.windows.delete(key);
+      makeRoom(this.limited, now, MAX_LIMITED);
+      this.limited.set(key, window);
+    }
     return true;
   }
 
   /** How many windows are kept (for tests). */
   get size(): number {
-    return this.windows.size;
-  }
-
-  private prune(now: number): void {
-    if (this.windows.size < MAX_TRACKED) return;
-    for (const [key, w] of this.windows) {
-      if (now - w.start >= WINDOW_MS || now < w.start) this.windows.delete(key);
-    }
-    // Insertion order is oldest first.
-    for (const key of this.windows.keys()) {
-      if (this.windows.size < MAX_TRACKED) break;
-      this.windows.delete(key);
-    }
+    return this.windows.size + this.limited.size;
   }
 }
