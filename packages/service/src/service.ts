@@ -170,6 +170,7 @@ import {
   readStoredRecord,
   readTemplate,
   readIdentifierTypes,
+  effectiveEntries,
   findingAidUnitIds,
   MAX_STAFF_FINDING_AID_UNITS,
   readVersion,
@@ -2694,47 +2695,46 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
               template?.ok === true ? template.value.template.fields.map((d) => [d.key, d]) : [],
             );
             const fields: EadExportField[] = [];
-            // The top unit's inherited values too (the person's view, as the
-            // record screen shows them): nothing in the file carries them.
-            const own = Object.entries(record.fields);
-            const inherited: [string, JsonValue, boolean][] = [];
-            if (row.id === recordId && record.parentId !== undefined) {
-              const values = await visibleInherited(
-                tx,
-                who.organizationId,
-                recordId,
-                allowed.checker,
+            // Each value as core's effective record sees it (effective.ts):
+            // staff-only unless public all the way from where it comes, in
+            // the template now, fitting its field and, for a number, still
+            // held. Over-marking is safe; under-marking never happens here.
+            const entries = await effectiveEntries(tx, who.organizationId, record.id);
+            if (entries === undefined) {
+              // Can't be checked: every own value goes in marked staff-only.
+              notices.push(
+                issue(
+                  [],
+                  "unit_unchecked",
+                  "A unit's values couldn't be checked, so all are marked staff-only.",
+                ),
               );
-              for (const v of values) {
-                if (Object.prototype.hasOwnProperty.call(record.fields, v.key)) continue;
-                // Public only when it is public where it comes from too: the
-                // strictest visibility along the way counts (effective.ts).
-                const source = await readStoredRecord(tx, who.organizationId, v.from);
-                const sourceKey =
-                  source?.ok === true ? (source.value.record.templateKey ?? "") : "";
-                if (!templates.has(sourceKey)) {
-                  templates.set(sourceKey, await readTemplate(tx, who.organizationId, sourceKey));
-                }
-                const sourceTemplate = templates.get(sourceKey);
-                const sourceDef =
-                  sourceTemplate?.ok === true
-                    ? sourceTemplate.value.template.fields.find((d) => d.key === v.key)
-                    : undefined;
-                inherited.push([v.key, v.value as JsonValue, sourceDef?.visibility === "public"]);
-              }
             }
-            const all: [string, JsonValue, boolean][] = [
-              ...own.map(([k, v]): [string, JsonValue, boolean] => [k, v, true]),
-              ...inherited,
-            ];
-            for (const [fieldKey, value, publicAtSource] of all) {
+            // The top unit's inherited values too (only when the person may
+            // see every unit above it, as the record screen shows them).
+            const mayInherit =
+              row.id === recordId &&
+              record.parentId !== undefined &&
+              (await visibleInherited(tx, who.organizationId, recordId, allowed.checker)).length >
+                0;
+            const all: [string, JsonValue, boolean][] =
+              entries === undefined
+                ? Object.entries(record.fields).map(([k, v]): [string, JsonValue, boolean] => [
+                    k,
+                    v,
+                    false,
+                  ])
+                : entries
+                    .filter((e) => e.own || mayInherit)
+                    .map((e): [string, JsonValue, boolean] => [
+                      e.key,
+                      e.value as JsonValue,
+                      e.visibility === "public",
+                    ]);
+            for (const [fieldKey, value, publicEffective] of all) {
               const def = defs.get(fieldKey);
-              // Staff-only unless its field is public here (and where it comes
-              // from) and the value still fits the field: a value its template
-              // no longer has or no longer fits is staff-only, as everywhere
-              // (effective.ts, D-039).
               const shown =
-                def?.visibility === "public" && publicAtSource && valueFitsField(value, def);
+                publicEffective && def?.visibility === "public" && valueFitsField(value, def);
               fields.push({
                 key: fieldKey,
                 label: def?.label ?? fieldKey,

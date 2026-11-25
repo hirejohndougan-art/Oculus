@@ -16,8 +16,9 @@
  *   headed with the field's label, never a public element. The header says
  *   the file holds staff-only values.
  *
- * Only a record's own values are used: EAD's tree carries what a unit
- * inherits from the units above it, so inherited values are not repeated.
+ * The caller gives each unit's own values, and the top unit's inherited
+ * ones too: EAD's tree carries what the units below inherit, but nothing in
+ * the file carries what the top unit inherits.
  *
  * Fields map by their DACS key (`EAD_DACS_FIELDS`): `reference_code` →
  * `unitid`, `date`/`bulk_date` → `unitdate`, `extent` → `physdesc`,

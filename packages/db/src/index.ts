@@ -106,6 +106,7 @@ export {
   MAX_PUBLIC_READ_TIME_LIMIT_MS,
   publicValueSources,
   inheritedValues,
+  effectiveEntries,
   recordDependents,
   recordClosureIds,
   lockRecordsShared,
@@ -116,6 +117,7 @@ export {
 } from "./workflow.js";
 export type {
   InheritedValue,
+  EffectiveEntry,
   PublicRecordOptions,
   SharedHome,
   SharedPublicRecord,

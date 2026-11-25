@@ -387,3 +387,52 @@ describe("staff files mark inherited and misfit values (T-059b second review)", 
     for (const n of misfit) expect(n.internal).toBe(true);
   });
 });
+
+describe("a staff field on a unit in between (T-059b third review)", () => {
+  beforeAll(async () => {
+    const tpl = (key: string, visibility: "public" | "staff") =>
+      insertTemplateVersion(w.db, {
+        key,
+        organizationId: w.a,
+        label: key,
+        appliesTo: ["archival_unit"],
+        fields: [
+          field("provenance2", "text", { label: "Provenance2", visibility, inherited: true }),
+          field("rights", "rights"),
+        ],
+      });
+    ok(await tpl("t-g5", "public"));
+    ok(await tpl("t-m5", "staff"));
+    ok(await tpl("t-k5", "public"));
+    const ctx = { organizationId: w.a, actor: actorOf(w.root), siteId: w.a1 };
+    const make = async (title: string, level: string, templateKey: string, parentId?: string) =>
+      ok(
+        await w.service.createRecord(ctx, {
+          kind: "archival_unit",
+          level,
+          title,
+          templateKey,
+          ...(parentId === undefined ? {} : { parentId }),
+          fields: {
+            rights: { uri: INC },
+            ...(parentId === undefined ? { provenance2: "MIDSTAFF secret" } : {}),
+          },
+        }),
+      ).record.id;
+    const g = await make("Invented G5", "fonds", "t-g5");
+    const m = await make("Invented M5", "series", "t-m5", g);
+    ids.K5 = await make("Invented K5", "file", "t-k5", m);
+  });
+
+  it("marks an inherited value staff-only when a unit on the way makes the field staff", async () => {
+    const reply = await get("localhost", `/api/records/${id("K5")}/ead`, tokens.cataloger);
+    expect(reply.statusCode).toBe(200);
+    const read = readEad(reply.body);
+    if (!read.ok) throw new Error(JSON.stringify(read.issues));
+    const prov = read.value.findingAid.archdesc.notes.filter((n) =>
+      n.paragraphs.some((p) => p.includes("MIDSTAFF")),
+    );
+    expect(prov.length).toBe(1);
+    expect(prov[0]?.internal).toBe(true);
+  });
+});

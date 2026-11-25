@@ -138,14 +138,14 @@ export async function readPublicFindingAid(
           ],
         };
       }
+      if (!isRecordId(row.id) || !isLevel(row.level)) continue;
+      const parentId = row.id === rootId ? undefined : row.parentId;
+      if (parentId !== undefined && (parentId === null || !kept.has(parentId))) continue;
       // Every statement from here on stops by the deadline, too.
       const limit = Math.max(1, Math.min(timeLimitMs, Math.ceil(left)));
       await tx.execute(
         sql`SELECT pg_catalog.set_config('statement_timeout', ${String(limit)}, true)`,
       );
-      if (!isRecordId(row.id) || !isLevel(row.level)) continue;
-      const parentId = row.id === rootId ? undefined : row.parentId;
-      if (parentId !== undefined && (parentId === null || !kept.has(parentId))) continue;
       // Exactly the read a public record page makes, in this snapshot.
       const read = await publicRecordIn(
         tx,

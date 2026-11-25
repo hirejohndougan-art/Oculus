@@ -769,6 +769,51 @@ export async function inheritedValues(
   });
 }
 
+/** One of a record's effective values, as core's `effectiveRecord` sees it (T-059b). */
+export interface EffectiveEntry {
+  readonly key: string;
+  readonly value: unknown;
+  /** True for the record's own value. */
+  readonly own: boolean;
+  /** The strictest visibility along the way, with misfits and unheld numbers staff (effective.ts). */
+  readonly visibility: "public" | "staff";
+}
+
+/**
+ * STAFF ONLY. Every effective value of the record (its own and inherited),
+ * each with the visibility core's `effectiveRecord` gives it, for the EAD
+ * staff export (T-059b), which must mark exactly what core calls staff.
+ * Undefined when the record or what it depends on can't be read. Run inside
+ * the caller's transaction; no permission is checked here.
+ */
+export async function effectiveEntries(
+  db: Queryable,
+  organizationId: OrganizationId,
+  recordId: RecordId,
+): Promise<readonly EffectiveEntry[] | undefined> {
+  if (!isOrganizationId(organizationId) || !isRecordId(recordId)) return undefined;
+  const snapshot = await readSnapshot(db, organizationId, recordId, false);
+  if (!snapshot.ok) return undefined;
+  const s = snapshot.value;
+  const index = indexRecords(s.records);
+  if (!index.ok) return undefined;
+  const effective = effectiveRecord(recordId, index.value, s.templateFor, {
+    checkers: s.checkers,
+    identifiers: s.identifiers,
+  });
+  if (!effective.ok) return undefined;
+  return Object.freeze(
+    effective.value.entries.map((entry) =>
+      Object.freeze({
+        key: entry.key,
+        value: entry.value,
+        own: entry.own,
+        visibility: entry.inTemplate && entry.visibility === "public" ? "public" : "staff",
+      }),
+    ),
+  );
+}
+
 /**
  * The records whose public output can depend on the record (S-020): every
  * record below it (units filed under it, at any depth) and every digital
