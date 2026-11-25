@@ -34,7 +34,14 @@
  */
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
-import { loadSecretKeyring, sql, type Database, type PasswordResetDelivery } from "@oculus/db";
+import {
+  loadSecretKeyring,
+  sql,
+  type Database,
+  type EnrolmentDelivery,
+  type InvitationDelivery,
+  type PasswordResetDelivery,
+} from "@oculus/db";
 import { createService } from "@oculus/service";
 import type { FastifyInstance } from "fastify";
 import { ADMIN_ORIGIN_ENV, loadAdminFiles, type AdminFiles } from "./admin-files.js";
@@ -70,6 +77,14 @@ export interface AdminServerOptions {
   readonly mailer?: Mailer;
   /** Sends password reset links in place of the mailer's (tests). */
   readonly deliverReset?: PasswordResetDelivery;
+  /**
+   * Send invitations and the set-up token after a reset of two-step sign-in
+   * in place of the mailer's (tests). By default the mailer's (D-085). A
+   * test that passes only `deliverReset` gets no mailer, and the matching
+   * people route then answers 503 `delivery_unavailable`.
+   */
+  readonly deliverInvitation?: InvitationDelivery;
+  readonly deliverEnrolment?: EnrolmentDelivery;
   /** The admin build's folder (default: packages/admin/dist). */
   readonly adminDir?: string;
   /** Already-loaded admin files (tests). */
@@ -134,6 +149,8 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     mailer = options.mailer ?? mailerFromEnv(env, { log });
     deliverReset = mailer.deliverReset;
   }
+  const deliverInvitation = options.deliverInvitation ?? mailer?.deliverInvitation;
+  const deliverEnrolment = options.deliverEnrolment ?? mailer?.deliverEnrolment;
 
   const adminOrigin = env[ADMIN_ORIGIN_ENV];
   let admin: ServerOptions["admin"];
@@ -157,7 +174,18 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
 
   const service = createService(options.db, { onError: serviceErrorLogger(log) });
   const routes = [
-    ...staffApiRoutes({ db: options.db, service, log }),
+    ...staffApiRoutes({
+      db: options.db,
+      service,
+      log,
+      people: {
+        keys,
+        deliverReset,
+        // D-085: the mailer feeds every people route that sends mail.
+        ...(deliverInvitation === undefined ? {} : { deliverInvitation }),
+        ...(deliverEnrolment === undefined ? {} : { deliverEnrolment }),
+      },
+    }),
     ...signInRoutes({
       db: options.db,
       keys,

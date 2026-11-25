@@ -1048,6 +1048,30 @@ export async function endAllSessionsForUser(tx: Queryable, userId: UserId): Prom
 }
 
 /**
+ * T-048 (D-084): the `memberOf` option of `endUserSessions`,
+ * `resetSecondFactor` and `sendPasswordReset`: an organization ID, or
+ * `undefined` when not given; anything else is a TypeError.
+ */
+export function memberOfOption(options: unknown): OrganizationId | undefined {
+  const value = own(options, "memberOf");
+  if (value === undefined) return undefined;
+  if (!isOrganizationId(value)) throw new TypeError("memberOf is an organization ID.");
+  return value;
+}
+
+/** Whether `userId` is a member of `organizationId`, read in the caller's transaction. */
+export async function isMemberIn(
+  tx: Queryable,
+  organizationId: OrganizationId,
+  userId: UserId,
+): Promise<boolean> {
+  const rows = await tx.rows(sql`
+    SELECT 1 FROM public.organization_members
+    WHERE organization_id = ${organizationId}::uuid AND user_id = ${userId}::uuid`);
+  return rows.length > 0;
+}
+
+/**
  * The live full session whose token hashes to `hash`, as the person acting
  * through it: their user ID, whether they are a system admin and whether
  * they entered their password in the last 10 minutes. Read without locking
@@ -1089,9 +1113,10 @@ export async function endUserSessions(
   db: Database,
   adminToken: unknown,
   userId: unknown,
-  options: SessionCallOptions = {},
+  options: SessionCallOptions & { readonly memberOf?: string } = {},
 ): Promise<Validated<{ readonly ended: number }>> {
-  const call = callOptions(options);
+  const call = callOptions(options, ["memberOf"]);
+  const memberOf = memberOfOption(options);
   if (!isUserId(userId)) return refused("invalid_request", "That isn't a user ID.");
   const hash = tokenHash(adminToken);
   if (hash === undefined) return refused(NO_SESSION.code, NO_SESSION.message);
@@ -1105,6 +1130,11 @@ export async function endUserSessions(
           "reauthentication_required",
           "Enter your password again to end someone's sessions.",
         );
+      }
+      // T-048: with memberOf, only a member of that organization, read in
+      // this same transaction (no gap between the check and the ending).
+      if (memberOf !== undefined && !(await isMemberIn(tx, memberOf, userId))) {
+        return refused("unknown_user", "There is no such user.");
       }
       const ended = await endAllSessionsForUser(tx, userId);
       return { ok: true, value: { ended } };

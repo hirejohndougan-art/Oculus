@@ -38,3 +38,12 @@ export type {
 export { contextFromSession, NOT_PERMITTED_MESSAGE } from "./access.js";
 export type { SessionLike } from "./access.js";
 export type { AdminOperations, MyAccess, RoleRequest } from "./admin.js";
+export type {
+  PeopleOperations,
+  PeopleContext,
+  PeopleList,
+  PeopleRights,
+  PersonDetail,
+  PersonSummary,
+  RoleCatalogEntry,
+} from "./people.js";

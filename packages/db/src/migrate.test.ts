@@ -33,6 +33,7 @@ const ALL_TABLES = [
   "organization_members",
   "organizations",
   "password_resets",
+  "people_events",
   "record_identifiers",
   "record_term_index",
   "record_terms",
