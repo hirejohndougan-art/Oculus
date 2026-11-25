@@ -511,18 +511,22 @@ async function buildSnapshot(
     identifiers.push(held.value);
   }
 
-  // Accessions are not stored yet (T-018b), so the register holds none and
-  // holds nothing back; the day matters only once they are, when T-034e
-  // works it out from the organization's time zone (D-056).
-  const [day] = await db.rows<{ today: string }>(
-    sql`SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS today`,
+  // The organization's own calendar day (T-034e, D-056, D-103), never the
+  // server's UTC day: a restriction ends on the organization's day. Read
+  // through organization_local_day, which the public reader may run too.
+  // Accessions are not stored yet (T-018b), so the register holds none.
+  const [day] = await db.rows<{ today: string | null }>(
+    sql`SELECT public.organization_local_day(${org}::uuid) AS today`,
   );
+  const today = day?.today ?? "";
   const register = indexAccessions(org, {
     accessions: [],
     records,
     identifierTypes: types.value,
-    today: day?.today ?? "",
+    today,
   });
+  // An empty day (the stored zone no longer known to PostgreSQL) makes
+  // indexAccessions refuse (invalid_today), so this refuses: never a guess.
   if (!register.ok) return refused(["accessions"], "unreadable_accessions", CANT_CHECK);
 
   return {
