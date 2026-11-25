@@ -62,6 +62,8 @@ export interface Member {
   readonly disabled: boolean;
   readonly addedAt: string;
   readonly lastSignInAt: string | null;
+  /** No role assignment at all, read in the same statement as the rest (T-064). */
+  readonly roleless: boolean;
 }
 
 interface MemberRow {
@@ -72,12 +74,15 @@ interface MemberRow {
   disabled: boolean;
   added_at: string;
   last_sign_in_at: string | null;
+  roleless: boolean;
 }
 
 const MEMBER_COLUMNS = sql`
   u.id::text AS user_id, u.display_name, u.email, u.system_admin,
   u.disabled_at IS NOT NULL AS disabled, to_char(m.added_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS added_at,
-  to_char(u.last_sign_in_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS last_sign_in_at`;
+  to_char(u.last_sign_in_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS last_sign_in_at,
+  NOT EXISTS (SELECT 1 FROM public.role_assignments g
+              WHERE g.organization_id = m.organization_id AND g.user_id = m.user_id) AS roleless`;
 
 function memberFromRow(r: MemberRow): Member {
   return Object.freeze({
@@ -88,6 +93,7 @@ function memberFromRow(r: MemberRow): Member {
     disabled: r.disabled,
     addedAt: r.added_at,
     lastSignInAt: r.last_sign_in_at,
+    roleless: r.roleless,
   });
 }
 

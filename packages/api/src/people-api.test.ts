@@ -272,6 +272,38 @@ describe("seeing people", () => {
     expect((r.json.rights as { manageAccounts: boolean }).manageAccounts).toBe(false);
   });
 
+  it("shows a site manager someone with no role by name only; a system manager sees all (John, Q-10)", async () => {
+    type Seen = Record<string, unknown> & { userId: string };
+    const asManager = (await call("GET", "/api/people", { as: "manager" })).json.people as Seen[];
+    const lone = asManager.find((p) => p.userId === newcomer);
+    expect(lone).toEqual({
+      userId: newcomer,
+      displayName: "Invented Newcomer",
+      roles: [],
+      nameOnly: true,
+    });
+    const withRole = asManager.find((p) => p.userId === w.cataloger);
+    expect(typeof withRole?.email).toBe("string");
+    expect(withRole?.nameOnly).toBeUndefined();
+
+    const one = await call("GET", `/api/people/${newcomer}`, { as: "manager" });
+    expect(one.status).toBe(200);
+    expect(one.json.person).toEqual({
+      userId: newcomer,
+      displayName: "Invented Newcomer",
+      roles: [],
+      nameOnly: true,
+    });
+    expect(JSON.stringify(one.json)).not.toMatch(/@|addedAt|lastSignInAt|disabled/);
+
+    const asRoot = (await call("GET", "/api/people", { as: "root" })).json.people as Seen[];
+    const full = asRoot.find((p) => p.userId === newcomer);
+    expect(typeof full?.email).toBe("string");
+    expect(full?.nameOnly).toBeUndefined();
+    const rootOne = await call("GET", `/api/people/${newcomer}`, { as: "root" });
+    expect(typeof (rootOne.json.person as Seen).addedAt).toBe("string");
+  });
+
   it("refuses people who manage nobody", async () => {
     for (const as of ["cataloger", "reader", "other"]) {
       expect((await call("GET", "/api/people", { as })).status).toBe(403);
@@ -312,7 +344,7 @@ describe("seeing people", () => {
 
 describe("granting and revoking roles (D-072)", () => {
   it("lets a site manager grant a role below site manager on their own site, logged", async () => {
-    const r = await call("POST", `/api/people/${newcomer}/roles`, {
+    const r = await call("POST", `/api/people/${helper}/roles`, {
       as: "manager",
       body: { role: "read_only", siteId: w.a1, scope: null },
     });
@@ -408,16 +440,16 @@ describe("granting and revoking roles (D-072)", () => {
     const s = await fullSession(w.db, w.manager, w.a);
     await staleReauth(w.db, s.sessionId, 11 * 60);
     tokens.staleManager = s.token;
-    const before = await grantCount(newcomer);
-    const r = await call("POST", `/api/people/${newcomer}/roles`, {
+    const before = await grantCount(helper);
+    const r = await call("POST", `/api/people/${helper}/roles`, {
       as: "staleManager",
-      body: { role: "cataloger", siteId: w.a1, scope: null },
+      body: { role: "reviewer", siteId: w.a1, scope: null },
     });
     expect(r.status).toBe(403);
     expect(r.json.error).toBe("reauthentication_required");
-    expect(await grantCount(newcomer)).toBe(before);
+    expect(await grantCount(helper)).toBe(before);
     // Without the permission, the answer is the permission's.
-    const denied = await call("POST", `/api/people/${newcomer}/roles`, {
+    const denied = await call("POST", `/api/people/${helper}/roles`, {
       as: "staleManager",
       body: { role: "site_manager", siteId: w.a1, scope: null },
     });
@@ -443,12 +475,120 @@ describe("granting and revoking roles (D-072)", () => {
     const token = /__Host-oculus_session=([^;]+)/.exec(cookie)?.[1] ?? "";
     expect(token).not.toBe(tokens.staleManager);
     tokens.freshManager = token;
-    const r = await call("POST", `/api/people/${newcomer}/roles`, {
+    const r = await call("POST", `/api/people/${helper}/roles`, {
       as: "freshManager",
-      body: { role: "cataloger", siteId: w.a1, scope: null },
+      body: { role: "reviewer", siteId: w.a1, scope: null },
     });
     expect(r.status).toBe(201);
   }, 30_000);
+
+  it("a site manager can't grant to someone with no role: answered as a missing person (John, Q-10)", async () => {
+    const lone = await w.member(w.a, "Lone");
+    const body = { role: "read_only", siteId: w.a1, scope: null };
+    const refusedLone = await call("POST", `/api/people/${lone}/roles`, { as: "manager", body });
+    const missing = await call("POST", `/api/people/${MADE_UP}/roles`, { as: "manager", body });
+    expect(refusedLone.status).toBe(404);
+    expect(shape(refusedLone)).toEqual(shape(missing));
+    // Someone whose only role is on a site they don't manage is the same.
+    const elsewhere = await call("POST", `/api/people/${w.other}/roles`, { as: "manager", body });
+    expect(shape(elsewhere)).toEqual(shape(missing));
+    expect(await grantCount(lone)).toBe(0);
+    // A system manager gives the first role; then the site manager may add more.
+    const first = await call("POST", `/api/people/${lone}/roles`, { as: "root", body });
+    expect(first.status).toBe(201);
+    const more = await call("POST", `/api/people/${lone}/roles`, {
+      as: "manager",
+      body: { role: "reviewer", siteId: w.a1, scope: null },
+    });
+    expect(more.status).toBe(201);
+    expect(await grantCount(lone)).toBe(2);
+  });
+});
+
+describe("who a site manager sees, and may grant to (T-064 review)", () => {
+  const body = (role: string, siteId: string | null = w.a1, scope: string | null = null) => ({
+    role,
+    siteId,
+    scope,
+  });
+
+  it("a manager of every site doesn't see, and can't grant to, someone whose only role is on every site", async () => {
+    const boss = await w.member(w.a, "Boss");
+    const target = await w.member(w.a, "Target");
+    expect(
+      (
+        await call("POST", `/api/people/${boss}/roles`, {
+          as: "root",
+          body: body("site_manager", null),
+        })
+      ).status,
+    ).toBe(201);
+    expect(
+      (
+        await call("POST", `/api/people/${target}/roles`, {
+          as: "root",
+          body: body("read_only", null),
+        })
+      ).status,
+    ).toBe(201);
+    tokens.boss = (await fullSession(w.db, boss, w.a)).token;
+
+    const listed = (await call("GET", "/api/people", { as: "boss" })).json.people as {
+      userId: string;
+    }[];
+    expect(listed.map((p) => p.userId)).not.toContain(target);
+    const missing = await call("GET", `/api/people/${MADE_UP}`, { as: "boss" });
+    expect(shape(await call("GET", `/api/people/${target}`, { as: "boss" }))).toEqual(
+      shape(missing),
+    );
+    const refused = await call("POST", `/api/people/${target}/roles`, {
+      as: "boss",
+      body: body("reviewer"),
+    });
+    const refusedMissing = await call("POST", `/api/people/${MADE_UP}/roles`, {
+      as: "boss",
+      body: body("reviewer"),
+    });
+    expect(refused.status).toBe(404);
+    expect(shape(refused)).toEqual(shape(refusedMissing));
+    expect(await grantCount(target)).toBe(1);
+    // Someone with a role on one of the sites is seen in full and can be given more.
+    const onSite = (await call("GET", `/api/people/${helper}`, { as: "boss" })).json.person as {
+      email?: string;
+    };
+    expect(typeof onSite.email).toBe("string");
+  });
+
+  it("a member whose only role is site manager on the manager's site is seen in full and can be granted to", async () => {
+    const peer = await w.member(w.a, "Peer");
+    expect(
+      (await call("POST", `/api/people/${peer}/roles`, { as: "root", body: body("site_manager") }))
+        .status,
+    ).toBe(201);
+    const seen = (await call("GET", `/api/people/${peer}`, { as: "manager" })).json.person as {
+      email?: string;
+      nameOnly?: boolean;
+    };
+    expect(typeof seen.email).toBe("string");
+    expect(seen.nameOnly).toBeUndefined();
+    const more = await call("POST", `/api/people/${peer}/roles`, {
+      as: "manager",
+      body: body("reviewer"),
+    });
+    expect(more.status).toBe(201);
+  });
+
+  it("a role-less target is a missing person before its scope or its role is looked at", async () => {
+    const lone = await w.member(w.a, "Solo");
+    const missingPerson = shape(
+      await call("POST", `/api/people/${MADE_UP}/roles`, { as: "manager", body: body("reviewer") }),
+    );
+    for (const b of [body("reviewer", w.a1, MADE_UP), body("reviewer", w.a1, a1Record)]) {
+      const r = await call("POST", `/api/people/${lone}/roles`, { as: "manager", body: b });
+      expect(shape(r)).toEqual(missingPerson);
+    }
+    expect(await grantCount(lone)).toBe(0);
+  });
 });
 
 describe("accounts: system managers only", () => {
@@ -600,6 +740,45 @@ describe("invitations", () => {
     });
     expect(elsewhere.status).toBe(fresh.status);
     expect(Object.keys(elsewhere.json).sort()).toEqual(Object.keys(fresh.json).sort());
+  });
+
+  it("needs the password and code entered in the last 10 minutes (John, Q-11)", async () => {
+    const s = await fullSession(w.db, w.root, w.a);
+    await staleReauth(w.db, s.sessionId, 11 * 60);
+    tokens.staleInviter = s.token;
+    const before = invitations.length;
+    const beforeEvents = await events("invited");
+    const stale = await call("POST", "/api/invitations", {
+      as: "staleInviter",
+      body: { email: "too.late@example.org" },
+    });
+    expect([stale.status, stale.json.error]).toEqual([403, "reauthentication_required"]);
+    expect(invitations).toHaveLength(before);
+    expect(await events("invited")).toBe(beforeEvents);
+    const [made] = await w.db.rows<{ n: number }>(
+      sql`SELECT count(*)::int AS n FROM public.invitations WHERE email = 'too.late@example.org'`,
+    );
+    expect(made?.n).toBe(0);
+
+    // Entered just now (a new full sign-in): the same invitation goes out.
+    tokens.freshInviter = (await fullSession(w.db, w.root, w.a)).token;
+    const fresh = await call("POST", "/api/invitations", {
+      as: "freshInviter",
+      body: { email: "too.late@example.org" },
+    });
+    expect(fresh.status).toBe(201);
+    expect(invitations).toHaveLength(before + 1);
+  });
+
+  it("asks a site manager for nothing more: still refused as not permitted, never asked to sign in again", async () => {
+    const s = await fullSession(w.db, w.manager, w.a);
+    await staleReauth(w.db, s.sessionId, 11 * 60);
+    tokens.staleInviteManager = s.token;
+    const r = await call("POST", "/api/invitations", {
+      as: "staleInviteManager",
+      body: { email: "someone.else@example.org" },
+    });
+    expect([r.status, r.json.error]).toEqual([403, "not_permitted"]);
   });
 
   it("refuses a malformed address and bad lives", async () => {

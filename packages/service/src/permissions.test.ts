@@ -431,6 +431,8 @@ describe("every role against every operation", () => {
         "grant a role",
         async (_, c) => {
           const target = await folks.member(w.a, `target-${newRecordId().slice(0, 6)}`);
+          // A site manager grants only to someone already on their site (T-064).
+          await grant(service, root, w.a, { userId: target, role: "reviewer", siteId: w.a1 });
           return service.grantRole(c, {
             userId: target,
             role: "read_only",
@@ -994,6 +996,8 @@ describe("organizations and sites stay apart", () => {
     const w = await world();
     const manager = ctxOf(w.a, w.byRole.site_manager);
     const p = await folks.member(w.a, `managed-${newRecordId().slice(0, 6)}`);
+    // A site manager grants only to someone already on their site (T-064).
+    await grant(service, folks.root, w.a, { userId: p, role: "reviewer", siteId: w.a1 });
     const r = (extra: Record<string, unknown>) => ({
       userId: p,
       role: "cataloger",
@@ -2317,6 +2321,8 @@ describe("grants scoped to units of their own site (second review)", () => {
       await service.createRecord(rootIn(null), unitDraft("fonds", "Invented loose")),
     ).record;
     const p = await folks.member(w.a, `scopee2-${newRecordId().slice(0, 6)}`);
+    // A site manager grants only to someone already on their site (T-064).
+    await grant(service, folks.root, w.a, { userId: p, role: "reviewer", siteId: w.a1 });
     const req = (scope: RecordId, siteId: SiteId | null = w.a1) => ({
       userId: p,
       role: "read_only",

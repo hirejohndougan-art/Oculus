@@ -10,10 +10,14 @@
  *   managers (`site.people`) see the members holding a role on a site they
  *   manage, or no role at all, and only the roles they may manage there
  *   (none on every site, no site manager grants: as `listRoleAssignments`).
+ *   A member with no role at all they see by name only (`nameOnly`: no
+ *   email, account state, last sign-in or date added; John's Q-10, T-064).
  *   Anyone else is refused. A person out of view, another organization's
  *   member and an unknown ID are the same `unknown_person`.
  * - **Granting and revoking roles**: `grantRole`'s and `revokeRole`'s rules
- *   (who may grant what, D-072, backed by 0018's trigger), plus the
+ *   (who may grant what, D-072, backed by 0018's trigger; a site manager
+ *   grants only to someone already holding a role on a site they manage,
+ *   anyone else answered as a missing person: T-064), plus the
  *   password and second step entered in the last 10 minutes (D-072's left
  *   item; `reauthentication_required`), checked after the permission so a
  *   person who may not act learns nothing more.
@@ -94,7 +98,15 @@ import {
   sql,
 } from "@oculus/db";
 import { actorUser, notPermitted, readAccess } from "./access.js";
-import { grantRoleIn, hasOnly, managedSites, own, revokeRoleIn, type Runner } from "./admin.js";
+import {
+  grantRoleIn,
+  hasOnly,
+  holdsRoleOn,
+  managedSites,
+  own,
+  revokeRoleIn,
+  type Runner,
+} from "./admin.js";
 import type { ServiceContext, ServiceResult } from "./service.js";
 
 /** The context of a change to a person: also the acting session's token (never stored or logged). */
@@ -102,15 +114,20 @@ export interface PeopleContext extends ServiceContext {
   readonly sessionToken: string;
 }
 
-/** A member as the people list shows them; `systemAdmin` only to system managers. */
+/**
+ * A member as the people list shows them; `systemAdmin` only to system
+ * managers. A site manager sees a member with no role at all by name only
+ * (`nameOnly`, John's Q-10, T-064): no email, account state or last sign-in.
+ */
 export interface PersonSummary {
   readonly userId: UserId;
   readonly displayName: string;
-  readonly email: string;
-  readonly disabled: boolean;
+  readonly email?: string;
+  readonly disabled?: boolean;
   readonly systemAdmin?: boolean;
-  readonly lastSignInAt: string | null;
+  readonly lastSignInAt?: string | null;
   readonly roles: readonly MemberGrant[];
+  readonly nameOnly?: true;
 }
 
 /** What the viewer may do, for the screens (the server checks again on every change). */
@@ -129,7 +146,8 @@ export interface PeopleList {
 }
 
 export interface PersonDetail {
-  readonly person: PersonSummary & { readonly addedAt: string };
+  /** `addedAt` too, except for a member seen by name only. */
+  readonly person: PersonSummary & { readonly addedAt?: string };
   readonly rights: PeopleRights;
   /** System managers only. */
   readonly sessions?: readonly MemberSession[];
@@ -296,7 +314,20 @@ function grantsFor(
       });
 }
 
-function summary(member: Member, roles: readonly MemberGrant[], viewer: Viewer): PersonSummary {
+function summary(
+  member: Member,
+  roles: readonly MemberGrant[],
+  viewer: Viewer,
+  roleless: boolean,
+): PersonSummary {
+  if (roleless && !viewer.system) {
+    return Object.freeze({
+      userId: member.userId,
+      displayName: member.displayName,
+      roles,
+      nameOnly: true as const,
+    });
+  }
   return Object.freeze({
     userId: member.userId,
     displayName: member.displayName,
@@ -310,20 +341,22 @@ function summary(member: Member, roles: readonly MemberGrant[], viewer: Viewer):
 
 /**
  * The member if the viewer may see them (a system manager: any member; a
- * site manager: one with a role on a site they manage, or with no role).
+ * site manager: one with a role on a site they manage, or with no role), and
+ * whether they hold no role at all, decided from the same read of their
+ * grants (T-064 review: never from a second read that can differ).
  */
 async function visibleMember(
   tx: Queryable,
   organizationId: OrganizationId,
   viewer: Viewer,
   userId: unknown,
-): Promise<Member | undefined> {
+): Promise<(Member & { readonly roleless: boolean }) | undefined> {
   if (!isUserId(userId)) return undefined;
   const member = await readMember(tx, organizationId, userId);
   if (member === undefined || viewer.system) return member;
   const all = await memberGrants(tx, organizationId, userId);
-  if (all.length === 0) return member;
-  return all.some((g) => g.siteId !== null && viewer.sites.includes(g.siteId)) ? member : undefined;
+  if (all.length === 0) return { ...member, roleless: true };
+  return holdsRoleOn(all, new Set(viewer.sites)) ? { ...member, roleless: false } : undefined;
 }
 
 /** `undefined` if the acting session entered password and second step in the last 10 minutes. */
@@ -477,14 +510,16 @@ export function peopleOperations(
         );
         const people: PersonSummary[] = [];
         // One query for everyone's roles (review: not one per member).
+        const ids = listed.members.map((m) => m.userId);
         const grants = await membersGrants(
           tx,
           who.organizationId,
-          listed.members.map((m) => m.userId),
+          ids,
           v.system ? {} : { siteIds: v.sites, exceptRole: "site_manager" },
         );
+        // Who holds no role at all comes from the listing's own statement (T-064).
         for (const member of listed.members) {
-          people.push(summary(member, grants.get(member.userId) ?? [], v));
+          people.push(summary(member, grants.get(member.userId) ?? [], v, member.roleless));
         }
         return {
           ok: true,
@@ -506,10 +541,12 @@ export function peopleOperations(
         const member = await visibleMember(tx, who.organizationId, v, userId);
         if (member === undefined) return unknownPerson();
         const roles = await grantsFor(tx, who.organizationId, v, member.userId);
+        const roleless = !v.system && member.roleless;
+        const shown = summary(member, roles, v, roleless);
         return {
           ok: true,
           value: Object.freeze({
-            person: Object.freeze({ ...summary(member, roles, v), addedAt: member.addedAt }),
+            person: Object.freeze(roleless ? shown : { ...shown, addedAt: member.addedAt }),
             rights: rightsOf(v),
             ...(v.system
               ? {
@@ -560,6 +597,9 @@ export function peopleOperations(
         const viewer = await viewerOf(tx, who);
         if (!viewer.ok) return viewer;
         if (!viewer.value.system) return notPermitted();
+        // John, Q-11 (T-065): like role and account changes.
+        const stale = await notRecent<UserId>(tx, context, who);
+        if (stale) return stale;
         return { ok: true, value: viewer.value.userId };
       });
       if (!allowed.ok) return allowed;

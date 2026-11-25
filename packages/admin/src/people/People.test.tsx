@@ -88,6 +88,21 @@ describe("the people list", () => {
     ).toEqual(["People", "Roles", "Audit trail"]);
   });
 
+  it("says an email and last sign-in are not shown for someone seen by name only", async () => {
+    const nameOnly = { userId: PERSON, displayName: "Lone Invented", roles: [], nameOnly: true };
+    server(
+      SITE_MANAGER,
+      {},
+      {
+        "GET /api/people": [200, { people: [nameOnly], truncated: false, rights: SITE_MANAGER }],
+      },
+    );
+    renderAt("/people");
+    await screen.findByRole("link", { name: "Lone Invented" });
+    expect(screen.getAllByText("Not shown")).toHaveLength(2);
+    expect(screen.queryByText("never")).toBeNull();
+  });
+
   it("offers no inviting to a site manager", async () => {
     server(SITE_MANAGER, {});
     renderAt("/people");
@@ -123,6 +138,24 @@ describe("a person's page", () => {
     ]) {
       expect(screen.queryByRole("button", { name })).toBeNull();
     }
+  });
+
+  it("shows someone with no role by name only, with no way to give them a role (John, Q-10)", async () => {
+    const nameOnly = { userId: PERSON, displayName: "Lone Invented", roles: [], nameOnly: true };
+    server(
+      SITE_MANAGER,
+      {},
+      {
+        "GET /api/people": [200, { people: [nameOnly], truncated: false, rights: SITE_MANAGER }],
+        [`GET /api/people/${PERSON}`]: [200, { person: nameOnly, rights: SITE_MANAGER }],
+      },
+    );
+    renderAt(`/people/${PERSON}`);
+    await screen.findByRole("heading", { level: 1, name: "Lone Invented" });
+    expect(screen.getByText(/A system manager gives a person their first role/)).toBeTruthy();
+    expect(screen.queryByRole("form", { name: "Give a role" })).toBeNull();
+    expect(screen.queryByText(/Member since/)).toBeNull();
+    expect(screen.queryByText(/never/)).toBeNull();
   });
 
   it("confirms in the page before removing a role, and sends the DELETE only then", async () => {

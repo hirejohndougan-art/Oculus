@@ -8,7 +8,15 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Decisions: D-094 (HTTP and admin bullets), D-104, D-082 amended
 - Review: independent rounds for T-041d (tests and docs claimed more than they checked; fixed), T-041e (double submits, silent results, focus, a share under the wrong site; fixed) and T-060a (a possible hang after a command-line install, the change log before state.json; fixed). T-063 is tested equal to core's `permits` for every record, with a negative control.
 - Gate: see the merge commit
-- Next: S-038 or another free job.
+- Next: every job in the pool is taken; Chat B stops.
+
+## 2026-11-25 03:30 CT — manual (Chat D) — T-034e, T-064, T-065, S-032, S-029
+- Result: done (merged together)
+- What changed: **T-034e** each organization's time zone (migration 0029) and its own calendar day in the publish check and public output, through `organization_local_day`; `GET`/`PUT /api/organization/time-zone`. **T-064** (John, Q-10) site managers see role-less members by name only and grant only to people holding a role on their sites. **T-065** (John, Q-11) inviting needs a recent sign-in. **S-032** a too-large `If-Match` version is 400. **S-029** the deadlock test not reproduced in 270+ rounds under load; notes in the roadmap.
+- Decisions: D-103; D-084 amended (T-064, T-065)
+- Review: T-034e two independent rounds, nothing blocking (canonical zone names, failing closed on an unknown stored zone, who changed it). T-064 two rounds: the first found a manager of every site could grant to (and so reveal) someone holding only an every-site role, fixed with one shared rule and tests, and a read race fixed; the second found nothing blocking.
+- Gate: PASS · tests_passing 4651 (was 4624) · npm audit clean · licences all permissive
+- Next: the next free job on the board
 
 ## 2026-11-25 02:40 CT — manual (Chat E) — T-034d Public subject counts
 - Result: done

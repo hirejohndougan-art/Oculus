@@ -542,6 +542,8 @@ export const PUBLIC_READER_FUNCTIONS: readonly string[] = Object.freeze([
   "public.public_record_snapshot(uuid, uuid, uuid)",
   // T-050b (D-096): a public record's stored Dublin Core mapping.
   "public.public_dublin_core_mapping(uuid, uuid, uuid)",
+  // T-034e (D-103): an organization's local day, for the accession register.
+  "public.organization_local_day(uuid)",
 ]);
 
 /**

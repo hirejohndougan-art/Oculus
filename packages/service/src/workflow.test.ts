@@ -1113,6 +1113,40 @@ describe("public subject counts come from public output only (T-034d, D-095)", (
   }, 60_000);
 });
 
+describe("an organization whose stored time zone stops being known (T-034e, D-103)", () => {
+  it("refuses publishing and public output rather than guess the day", async () => {
+    await ready();
+    const org = await organization();
+    const { record } = await create(org, objectDraft());
+    ok(await service.publish(ctx(org), record.id, { expectedVersion: 1 }));
+    expect((await publicText(org, record.id)).ok).toBe(true);
+
+    // As if the operating system's time zone data dropped the stored zone.
+    await s.owner.transaction(async (q) => {
+      await q.execute(
+        sql`ALTER TABLE public.organizations DISABLE TRIGGER organizations_check_time_zone`,
+      );
+      await q.execute(
+        sql`UPDATE public.organizations SET time_zone = 'Africa/Atlantis' WHERE id = ${org}::uuid`,
+      );
+      await q.execute(
+        sql`ALTER TABLE public.organizations ENABLE ALWAYS TRIGGER organizations_check_time_zone`,
+      );
+    });
+
+    const found = await s.owner.transaction((q) => publishCheckIssues(q, org, record.id));
+    expect(found.map((i) => i.code)).toEqual(["unreadable_accessions"]);
+    const out = await publicText(org, record.id);
+    expect(out.ok).toBe(false);
+
+    await s.owner.execute(
+      sql`UPDATE public.organizations SET time_zone = 'America/Port-au-Prince' WHERE id = ${org}::uuid`,
+    );
+    expect(await s.owner.transaction((q) => publishCheckIssues(q, org, record.id))).toEqual([]);
+    expect((await publicText(org, record.id)).ok).toBe(true);
+  });
+});
+
 describe("the publish permission hook (T-041 plugs records.publish in here)", () => {
   it("is asked for publishing, withdrawing and confirming values public on a published record, and nothing else", async () => {
     await ready();
