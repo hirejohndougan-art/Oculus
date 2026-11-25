@@ -32,7 +32,7 @@ import {
   recordReply,
 } from "../records/records.fixtures";
 import { forgetLists } from "../records/listMemory";
-import { SHARE_PAGE, fieldLabel } from "./model";
+import { fieldLabel } from "./model";
 
 afterEach(() => {
   cleanup();
@@ -224,9 +224,7 @@ describe("a shared item", () => {
     expect(within(shared).queryByRole("link")).toBeNull();
     expect(within(shared).queryByText("unused")).toBeNull();
     await userEvent.click(
-      within(shared).getByRole("button", {
-        name: "Remove An item not shown to the public right now",
-      }),
+      within(shared).getByRole("button", { name: /^Remove the hidden item offered / }),
     );
     await userEvent.click(await screen.findByRole("button", { name: "Remove" }));
     await waitFor(() => {
@@ -234,30 +232,46 @@ describe("a shared item", () => {
     });
   });
 
-  it("shows more of a full list a page at a time, from the last share shown", async () => {
+  it("shows more of a list from the server's next, and stops when there is none", async () => {
     const page = (from: number, count: number) =>
       Array.from({ length: count }, (_, n) => {
         const id = `aaaaaaaa-aaaa-4aaa-8aaa-${String(from + n).padStart(12, "0")}`;
         return incoming(id, "accepted", `Invented lantern ${String(from + n)}`);
       });
-    const first = page(0, SHARE_PAGE);
-    const lastId = first.at(-1)?.id ?? "";
+    // The server read a full page but showed fewer: its `next` still leads on.
+    const cursor = "bbbbbbbb-bbbb-4bbb-8bbb-000000000000";
     const sent = siteServer({
-      [OFFERS]: [200, { shares: first }],
-      [`GET /api/sites/${SITE_1}/share-offers?state=accepted&before=${lastId}`]: [
+      [OFFERS]: [200, { shares: page(0, 3), next: { offered: null, accepted: cursor } }],
+      [`GET /api/sites/${SITE_1}/share-offers?state=accepted&before=${cursor}`]: [
         200,
-        { shares: page(SHARE_PAGE, 3) },
+        { shares: [...page(2, 1), ...page(3, 2)], next: { offered: null, accepted: null } },
       ],
     });
     renderAt(SHARED);
     await screen.findByRole("table", { name: "Items shared with this site" });
-    // Offers aren't a full page, so only the accepted items offer more.
-    expect(screen.getAllByRole("button", { name: "Show more" })).toHaveLength(1);
-    await userEvent.click(screen.getByRole("button", { name: "Show more" }));
-    expect(await screen.findByText(`Invented lantern ${String(SHARE_PAGE + 2)}`)).toBeTruthy();
-    expect(sent.some((x) => x.path.includes(`state=accepted&before=${lastId}`))).toBe(true);
-    // The last page wasn't full: nothing more to ask for.
-    expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+    // Only the accepted items have a next page.
+    expect(screen.getAllByRole("button", { name: /^Show more/ })).toHaveLength(1);
+    await userEvent.click(screen.getByRole("button", { name: "Show more shared items" }));
+    expect(await screen.findByText("Invented lantern 4")).toBeTruthy();
+    expect(await screen.findByText("Showing 3 more shared items.")).toBeTruthy();
+    expect(sent.some((x) => x.path.includes(`state=accepted&before=${cursor}`))).toBe(true);
+    // A share in both pages is listed once.
+    expect(screen.getAllByText("Invented lantern 2")).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: /^Show more/ })).toBeNull();
+  });
+
+  it("says a shared item the public can't see isn't found", async () => {
+    siteServer({
+      [`GET /api/shares/${SHARE_2}`]: [
+        200,
+        { share: { ...incoming(SHARE_2, "accepted", "unused"), item: null } },
+      ],
+    });
+    renderAt(`${SHARED}/${SHARE_2}`);
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Shared item not found" }),
+    ).toBeTruthy();
+    expect(screen.queryByText("unused")).toBeNull();
   });
 
   it("names a shared item's fields by its home template's labels", async () => {
@@ -357,6 +371,20 @@ describe("sharing on a record's screen", () => {
       )!,
     );
   }
+
+  it("shows more of a record's shares, so an open one behind many ended ones can be withdrawn", async () => {
+    const ended = { ...mine, id: SHARE_2, state: "declined" };
+    recordServer("published", {
+      [`GET ${API}/shares`]: [200, { shares: [ended], next: SHARE_2 }],
+      [`GET ${API}/shares?before=${SHARE_2}`]: [200, { shares: [mine], next: null }],
+    });
+    renderAt(PATH);
+    const box = await panel();
+    expect(await box.findByText("It isn't offered or shared to any other site.")).toBeTruthy();
+    await userEvent.click(box.getByRole("button", { name: "Show more shares" }));
+    expect(await box.findByRole("button", { name: /^Withdraw from / })).toBeTruthy();
+    expect(box.queryByRole("button", { name: "Show more shares" })).toBeNull();
+  });
 
   it("lists where it is shared, by ID for another organization, and withdraws after asking", async () => {
     let withdrawn = false;

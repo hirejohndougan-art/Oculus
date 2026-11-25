@@ -299,6 +299,11 @@ describe("sharing over HTTP", () => {
         expect(r.status).toBe(200);
       }
     }
+    expect(offered.json.next).toEqual({ offered: null, accepted: null });
+    const noState = await call("GET", `/api/sites/${w.b1}/share-offers?before=${a}`, {
+      as: "bManager",
+    });
+    expect(noState.status).toBe(422);
     const twice = await call("GET", `/api/sites/${w.b1}/share-offers?before=${a}&before=${b}`, {
       as: "bManager",
     });

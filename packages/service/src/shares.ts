@@ -63,6 +63,8 @@ import {
   readSite,
   readWorkflowState,
   sharedItemViews,
+  SHARE_CHANGED,
+  MAX_SHARE_PAGE,
   sharesIntoSite as storedSharesIntoSite,
   sharesOfRecord as storedSharesOfRecord,
   type Database,
@@ -105,7 +107,25 @@ export interface IncomingShare extends ShareSummary {
   readonly item: SharedItemView | null;
 }
 
-/** A page of a share list (S-036a): `before`, the last share's ID of the page before. */
+/**
+ * One page of a share list (S-036a), and where the next one starts: `next`
+ * is the `before` to ask with (the last share the page read, shown or not),
+ * or `null` when this page wasn't full. A page can show fewer shares than
+ * `MAX_SHARE_PAGE` and still have a `next`: shares the person may not be
+ * shown are read and left out.
+ */
+export interface SharePage<T> {
+  readonly shares: readonly T[];
+  readonly next: string | null;
+}
+
+/** A site manager's page: offers and accepted items, each with its own `next`. */
+export interface SiteSharesPage {
+  readonly shares: readonly IncomingShare[];
+  readonly next: { readonly offered: string | null; readonly accepted: string | null };
+}
+
+/** A page of a share list (S-036a): `before`, a page's `next`. */
 export interface SharePageRequest {
   readonly before?: unknown;
   /** For a site's list: only this state's page (`offered` or `accepted`); both when left out. */
@@ -123,13 +143,13 @@ export interface ShareOperations {
     context: ServiceContext,
     siteId: unknown,
     page?: SharePageRequest,
-  ): Promise<ServiceResult<readonly IncomingShare[]>>;
+  ): Promise<ServiceResult<SiteSharesPage>>;
   /** The record's shares (every state), for whoever may edit it. */
   sharesOfRecord(
     context: ServiceContext,
     recordId: unknown,
     page?: SharePageRequest,
-  ): Promise<ServiceResult<readonly ShareSummary[]>>;
+  ): Promise<ServiceResult<SharePage<ShareSummary>>>;
   /** An item accepted into the site, as the site's people may see it. */
   readSharedItem(context: ServiceContext, shareId: unknown): Promise<ServiceResult<IncomingShare>>;
   /** The items accepted into the site. */
@@ -137,7 +157,7 @@ export interface ShareOperations {
     context: ServiceContext,
     siteId: unknown,
     page?: SharePageRequest,
-  ): Promise<ServiceResult<readonly IncomingShare[]>>;
+  ): Promise<ServiceResult<SharePage<IncomingShare>>>;
 }
 
 type Refusal = ServiceRefusal;
@@ -236,12 +256,19 @@ export function shareOperations(db: Database, run: Runner, outside: Outside): Sh
     const out: IncomingShare[] = [];
     for (const share of shares) {
       const item = views.get(share.id);
+      // Ended or moved onto the site since it was listed: not shown at all.
+      if (item === SHARE_CHANGED) continue;
       if (item !== undefined) out.push(Object.freeze({ ...summary(share), item }));
       else if (keepHidden && share.state === "accepted") {
         out.push(Object.freeze({ ...summary(share), item: null }));
       }
     }
     return Object.freeze(out);
+  }
+
+  /** The `before` of the page after `page` (its last share), or null if `page` wasn't full. */
+  function nextOf(page: readonly Share[]): string | null {
+    return page.length >= MAX_SHARE_PAGE ? (page.at(-1)?.id ?? null) : null;
   }
 
   /** A page request's parts, or undefined when it isn't one. */
@@ -415,25 +442,32 @@ export function shareOperations(db: Database, run: Runner, outside: Outside): Sh
           return NOT_PERMITTED();
         }
         const wanted = pageOf(page, true);
-        if (wanted === undefined) return BAD_PAGE();
+        // A cursor belongs to one state's list: `before` needs `state`.
+        if (wanted === undefined || (wanted.before !== undefined && wanted.state === undefined)) {
+          return BAD_PAGE();
+        }
         const states =
           wanted.state === undefined ? (["offered", "accepted"] as const) : [wanted.state];
-        const shares: Share[] = [];
+        const read: Partial<Record<"offered" | "accepted", readonly Share[]>> = {};
         for (const state of states) {
-          shares.push(
-            ...(await storedSharesIntoSite(tx, who.organizationId, siteId, state, {
-              before: wanted.before,
-              includeHidden: state === "accepted",
-            })),
-          );
+          read[state] = await storedSharesIntoSite(tx, who.organizationId, siteId, state, {
+            before: wanted.before,
+            includeHidden: state === "accepted",
+          });
         }
-        return { ok: true, value: shares };
+        return { ok: true, value: read };
       });
       if (!checked.ok) return checked;
-      const shares = checked.value;
+      const read = checked.value;
       return outside("sharesIntoSite", async () => ({
         ok: true,
-        value: await incoming(shares, true),
+        value: Object.freeze({
+          shares: await incoming([...(read.offered ?? []), ...(read.accepted ?? [])], true),
+          next: Object.freeze({
+            offered: nextOf(read.offered ?? []),
+            accepted: nextOf(read.accepted ?? []),
+          }),
+        }),
       }));
     },
 
@@ -449,7 +483,13 @@ export function shareOperations(db: Database, run: Runner, outside: Outside): Sh
         const shares = await storedSharesOfRecord(tx, who.organizationId, recordId, {
           before: wanted.before,
         });
-        return { ok: true, value: Object.freeze(shares.map(summary)) };
+        return {
+          ok: true,
+          value: Object.freeze({
+            shares: Object.freeze(shares.map(summary)),
+            next: nextOf(shares),
+          }),
+        };
       });
     },
 
@@ -493,7 +533,10 @@ export function shareOperations(db: Database, run: Runner, outside: Outside): Sh
       });
       if (!checked.ok) return checked;
       const shares = checked.value;
-      return outside("listSharedItems", async () => ({ ok: true, value: await incoming(shares) }));
+      return outside("listSharedItems", async () => ({
+        ok: true,
+        value: Object.freeze({ shares: await incoming(shares), next: nextOf(shares) }),
+      }));
     },
   };
 }

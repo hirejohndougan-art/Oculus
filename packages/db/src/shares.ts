@@ -343,20 +343,23 @@ function mappedFields(mapping: unknown): ReadonlySet<string> | undefined {
   return keys;
 }
 
+/** A share that, in the view's snapshot, is no longer in the state it was listed in (S-036a). */
+export const SHARE_CHANGED = "changed" as const;
+
 /**
  * The views of `shares` as the public sees them now, by share ID, built in
  * one REPEATABLE READ, read-only transaction of its own (one snapshot: no
- * view mixes moments). A share is left out unless, in that snapshot, it is
- * still in the state it was given in, its record is not on the second site
- * itself, and its home site's public pages would show the record
- * (`publicRecordIn` for the home organization and site, with its stored
- * mapping, D-111).
+ * view mixes moments). A share whose state changed since it was listed, or
+ * whose record is now on the second site itself, maps to `SHARE_CHANGED`
+ * (its caller leaves it out). One whose home site's public pages wouldn't
+ * show the record (`publicRecordIn` for the home organization and site,
+ * with its stored mapping, D-111) is left out of the map (hidden).
  */
 export async function sharedItemViews(
   db: Database,
   shares: readonly Share[],
-): Promise<ReadonlyMap<string, SharedItemView>> {
-  const out = new Map<string, SharedItemView>();
+): Promise<ReadonlyMap<string, SharedItemView | typeof SHARE_CHANGED>> {
+  const out = new Map<string, SharedItemView | typeof SHARE_CHANGED>();
   if (shares.length === 0) return out;
   await db.transaction(async (tx) => {
     await tx.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`);
@@ -374,14 +377,18 @@ export async function sharedItemViews(
         JOIN public.organizations o ON o.id = r.organization_id
         LEFT JOIN public.sites s ON s.organization_id = r.organization_id AND s.id = r.site_id
         WHERE sh.id = ${share.id}::uuid`);
-      if (names?.state !== share.state) continue;
-      if (names.site_id === null || !isSiteId(names.site_id)) continue;
+      if (names?.state !== share.state) {
+        out.set(share.id, SHARE_CHANGED);
+        continue;
+      }
       if (
         share.organizationId === share.targetOrganizationId &&
         names.site_id === share.targetSiteId
       ) {
+        out.set(share.id, SHARE_CHANGED);
         continue;
       }
+      if (names.site_id === null || !isSiteId(names.site_id)) continue;
       const read = await publicRecordIn(
         tx,
         share.organizationId,

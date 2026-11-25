@@ -14,7 +14,7 @@ import { Button, Note, TextLink } from "../components/ui";
 import { ConfirmPanel } from "../records/controls";
 import { KIND_LABELS, valueText, whenText } from "../records/model";
 import styles from "../records/Records.module.css";
-import { SHARE_PAGE, homeText, isId, itemTitle, viewLabel, type IncomingShare } from "./model";
+import { homeText, isId, itemTitle, viewLabel, type IncomingShare } from "./model";
 import {
   moveShare,
   nextSharePage,
@@ -24,6 +24,7 @@ import {
   useSharedItems,
   type ShareMove,
 } from "./queries";
+import { useMorePages } from "./paging";
 
 /** A record kind in words; only the admin's own labels, never a prototype key. */
 function kindText(kind: string): string {
@@ -43,9 +44,6 @@ const DONE: Readonly<Record<ShareMove, string>> = {
   remove: "Removed. This site no longer shows the item.",
   withdraw: "Withdrawn.",
 };
-
-/** The lists that come a page at a time. */
-type PageList = "offered" | "accepted" | "items";
 
 function itemPath(siteId: string, shareId: string): string | undefined {
   return isId(siteId) && isId(shareId) ? `/sites/${siteId}/shared/${shareId}` : undefined;
@@ -119,43 +117,47 @@ export function SharedWithSite(props: {
   const [status, setStatus] = useState<{ tone: "green" | "amber"; text: string }>();
   const [busy, setBusy] = useState(false);
   const [removing, setRemoving] = useState<IncomingShare>();
-  /** Later pages of each list (S-036a), and whether the last one was full. */
-  const [more, setMore] = useState<
-    Partial<Record<PageList, { rows: IncomingShare[]; full: boolean }>>
-  >({});
-  const [loadingMore, setLoadingMore] = useState(false);
+  const offeredPages = useMorePages(offers.data?.offered, offers.dataUpdatedAt, (before) =>
+    nextSharePage(props.siteId, "offered", before),
+  );
+  const acceptedPages = useMorePages(offers.data?.accepted, offers.dataUpdatedAt, (before) =>
+    nextSharePage(props.siteId, "accepted", before),
+  );
+  const itemPages = useMorePages(items.data, items.dataUpdatedAt, (before) =>
+    nextSharePage(props.siteId, "items", before),
+  );
 
-  /** The list with its later pages, and a "Show more" button while there may be more. */
-  function paged(list: PageList, first: readonly IncomingShare[]) {
-    const extra = more[list];
-    const rows = [...first, ...(extra?.rows ?? [])];
-    const full = extra === undefined ? first.length >= SHARE_PAGE : extra.full;
-    const last = rows.at(-1);
-    const button =
-      !full || last === undefined ? null : (
-        <Button
-          variant="secondary"
-          isDisabled={loadingMore}
-          onPress={() => void showMore(list, last.id)}
-        >
-          Show more
-        </Button>
-      );
-    return { rows, button };
-  }
-
-  async function showMore(list: PageList, before: string) {
-    setLoadingMore(true);
-    try {
-      const page = await nextSharePage(props.siteId, list, before);
-      setMore((now) => ({
-        ...now,
-        [list]: { rows: [...(now[list]?.rows ?? []), ...page], full: page.length >= SHARE_PAGE },
-      }));
-    } catch (error) {
-      setStatus({ tone: "amber", text: `More couldn't be loaded. ${problemText(error)}` });
-    }
-    setLoadingMore(false);
+  /** A "Show more" button for a list with a next page; says how many more it showed. */
+  function moreButton(pages: ReturnType<typeof useMorePages<IncomingShare>>, what: string) {
+    if (pages.next === null && pages.error === undefined) return null;
+    return (
+      <div className={styles.actions}>
+        {pages.error === undefined ? null : (
+          <Note tone="amber" alert>
+            More couldn't be loaded. {problemText(pages.error)}
+          </Note>
+        )}
+        {pages.next === null ? null : (
+          <Button
+            variant="secondary"
+            isDisabled={pages.loading}
+            onPress={() =>
+              void pages.loadMore().then((count) => {
+                setStatus({
+                  tone: "green",
+                  text:
+                    count === 0
+                      ? `No more ${what} to show.`
+                      : `Showing ${String(count)} more ${what}.`,
+                });
+              })
+            }
+          >
+            Show more {what}
+          </Button>
+        )}
+      </div>
+    );
   }
 
   // A ref, not only state: a second press before the re-render must not send twice.
@@ -185,7 +187,6 @@ export function SharedWithSite(props: {
     }
     // Buttons stay disabled until the lists show the move.
     await refreshShares(queries, props.siteId);
-    setMore({});
     setRemoving(undefined);
     setStatus(result);
     setBusy(false);
@@ -207,16 +208,8 @@ export function SharedWithSite(props: {
   if (offers.isPending) {
     body = <p role="status">Loading the items shared with this site…</p>;
   } else if (offers.isSuccess) {
-    const waitingPage = paged(
-      "offered",
-      offers.data.filter((s) => s.state === "offered"),
-    );
-    const acceptedPage = paged(
-      "accepted",
-      offers.data.filter((s) => s.state === "accepted"),
-    );
-    const waiting = waitingPage.rows;
-    const accepted = acceptedPage.rows;
+    const waiting = offeredPages.rows;
+    const accepted = acceptedPages.rows;
     body = (
       <>
         <Note tone="blue">
@@ -254,7 +247,7 @@ export function SharedWithSite(props: {
               )}
             />
           )}
-          {waitingPage.button}
+          {moreButton(offeredPages, "offers")}
         </section>
         <section className={styles.panel} aria-labelledby="accepted-title">
           <h2 id="accepted-title" className={styles.sectionTitle}>
@@ -275,12 +268,14 @@ export function SharedWithSite(props: {
                     setRemoving(share);
                   }}
                 >
-                  Remove {itemTitle(share)}
+                  {share.item === null
+                    ? `Remove the hidden item offered ${whenText(share.offeredAt)}`
+                    : `Remove ${share.item.title}`}
                 </Button>
               )}
             />
           )}
-          {acceptedPage.button}
+          {moreButton(acceptedPages, "shared items")}
         </section>
       </>
     );
@@ -298,18 +293,17 @@ export function SharedWithSite(props: {
         loadFailed(items.error, () => void items.refetch())
       );
   } else {
-    const itemsPage = paged("items", items.data);
     body =
-      itemsPage.rows.length === 0 ? (
+      itemPages.rows.length === 0 ? (
         <p>Nothing is shared with this site yet.</p>
       ) : (
         <>
           <SharedTable
             siteId={props.siteId}
             caption="Items shared with this site"
-            shares={itemsPage.rows}
+            shares={itemPages.rows}
           />
-          {itemsPage.button}
+          {moreButton(itemPages, "shared items")}
         </>
       );
   }

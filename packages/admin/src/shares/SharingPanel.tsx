@@ -16,7 +16,8 @@ import { ConfirmPanel } from "../records/controls";
 import { issuesIn, whenText } from "../records/model";
 import styles from "../records/Records.module.css";
 import { SHARE_STATE_LABELS, cleanId, isId, isLive, type ShareSummary } from "./model";
-import { moveShare, refreshShares, useRecordShares } from "./queries";
+import { moveShare, nextRecordSharesPage, refreshShares, useRecordShares } from "./queries";
+import { useMorePages } from "./paging";
 
 const OFFER_PROBLEMS: Readonly<Record<string, string>> = {
   unknown_site:
@@ -125,7 +126,10 @@ export function SharingPanel(props: {
     sending.current = false;
   }
 
-  const list = shares.data ?? [];
+  const pages = useMorePages(shares.data, shares.dataUpdatedAt, (before) =>
+    nextRecordSharesPage(props.siteId, props.recordId, before),
+  );
+  const list = pages.rows;
   const live = list.filter((s) => isLive(s.state));
   const ended = list.filter((s) => !isLive(s.state));
 
@@ -206,6 +210,32 @@ export function SharingPanel(props: {
             ))}
           </ul>
         </details>
+      )}
+      {pages.next === null ? null : (
+        <div className={styles.actions}>
+          <Button
+            variant="secondary"
+            isDisabled={pages.loading}
+            onPress={() =>
+              void pages.loadMore().then((count) => {
+                setStatus({
+                  tone: "green",
+                  text:
+                    count === 0
+                      ? "No more shares to show."
+                      : `Showing ${String(count)} more shares.`,
+                });
+              })
+            }
+          >
+            Show more shares
+          </Button>
+        </div>
+      )}
+      {pages.error === undefined ? null : (
+        <Note tone="amber" alert>
+          More shares couldn't be loaded. {problemText(pages.error)}
+        </Note>
       )}
       {props.published ? (
         <form

@@ -425,6 +425,7 @@ export {
   SHARE_STATES,
   SHARE_TABLE_PRIVILEGES,
   MAX_SHARE_PAGE,
+  SHARE_CHANGED,
   insertShare,
   isShareId,
   liveShare,

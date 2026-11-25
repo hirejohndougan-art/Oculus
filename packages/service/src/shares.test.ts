@@ -300,7 +300,7 @@ describe("offering an item", () => {
       targetOrganizationId: w.dhs,
       targetSiteId: w.d1,
     });
-    const listed = ok(await service.sharesOfRecord(at(w.lib, w.libCataloger), w.item.id));
+    const listed = ok(await service.sharesOfRecord(at(w.lib, w.libCataloger), w.item.id)).shares;
     expect(listed.map((x) => x.id)).toEqual([share.id]);
   });
 
@@ -467,7 +467,7 @@ describe("what the second site sees", () => {
       "unknown_share",
     ]);
     // The manager sees the offer, with the same view.
-    const offers = ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1));
+    const offers = ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1)).shares;
     expect(offers.map((x) => x.id)).toEqual([share.id]);
     expect(leaks(offers)).toEqual([]);
     ok(await service.acceptShare(at(w.dhs, w.dhsManager), share.id));
@@ -486,7 +486,7 @@ describe("what the second site sees", () => {
         homeOrganization: "Invented Library " + String(count),
       });
       expect(leaks(seen)).toEqual([]);
-      const list = ok(await service.listSharedItems(at(w.dhs, userId), w.d1));
+      const list = ok(await service.listSharedItems(at(w.dhs, userId), w.d1)).shares;
       expect(list.map((x) => x.id)).toEqual([share.id]);
       expect(leaks(list)).toEqual([]);
     }
@@ -533,7 +533,7 @@ describe("what the second site sees", () => {
     expect(codes(onward)).toEqual(["unknown_record"]);
     expect(codes(await service.withdrawShare(ctx, share.id))).toEqual(["unknown_share"]);
     // It is listed only among the items shared with the second site.
-    const shared = ok(await service.listSharedItems(ctx, w.l2));
+    const shared = ok(await service.listSharedItems(ctx, w.l2)).shares;
     expect(shared.map((x) => x.recordId)).toEqual([w.item.id]);
     // Another organization's manager of an accepting site can't read it the ordinary way either.
     const other = await offer(w, { org: w.dhs, site: w.d1 });
@@ -566,7 +566,7 @@ describe("what the second site sees", () => {
       "unknown_share",
     ]);
     // The home side's list doesn't name anyone of the Society.
-    const listed = ok(await service.sharesOfRecord(at(w.lib, w.libCataloger), w.item.id));
+    const listed = ok(await service.sharesOfRecord(at(w.lib, w.libCataloger), w.item.id)).shares;
     expect(Object.keys(listed[0] ?? {}).sort()).toEqual(
       [
         "decidedAt",
@@ -598,7 +598,7 @@ describe("what the second site sees", () => {
     expect(codes(await service.readSharedItem(at(w.dhs, w.dhsReader), share.id))).toEqual([
       "unknown_share",
     ]);
-    expect(ok(await service.listSharedItems(at(w.dhs, w.dhsReader), w.d1))).toEqual([]);
+    expect(ok(await service.listSharedItems(at(w.dhs, w.dhsReader), w.d1)).shares).toEqual([]);
   });
 });
 
@@ -682,7 +682,7 @@ describe("second review", () => {
     const w = await world();
     const share = await offer(w, { org: w.lib, site: w.l2 });
     ok(await service.acceptShare(at(w.lib, w.l2Manager), share.id));
-    expect(ok(await service.listSharedItems(at(w.lib, w.l2Manager), w.l2))).toHaveLength(1);
+    expect(ok(await service.listSharedItems(at(w.lib, w.l2Manager), w.l2)).shares).toHaveLength(1);
     const rootAt = at(w.lib, folks.root, w.l1);
     const now = ok(await service.readRecord(rootAt, w.item.id));
     ok(
@@ -693,7 +693,7 @@ describe("second review", () => {
         { expectedVersion: now.version },
       ),
     );
-    expect(ok(await service.listSharedItems(at(w.lib, w.l2Manager), w.l2))).toEqual([]);
+    expect(ok(await service.listSharedItems(at(w.lib, w.l2Manager), w.l2)).shares).toEqual([]);
     expect(codes(await service.readSharedItem(at(w.lib, w.l2Manager), share.id))).toEqual([
       "unknown_share",
     ]);
@@ -807,7 +807,7 @@ describe("second review", () => {
     // longer fits the field after a template change) is shown no more.
     const share = await offer(w, { org: w.dhs, site: w.d1 });
     ok(await service.acceptShare(at(w.dhs, w.dhsManager), share.id));
-    expect(ok(await service.listSharedItems(at(w.dhs, w.dhsReader), w.d1))).toHaveLength(1);
+    expect(ok(await service.listSharedItems(at(w.dhs, w.dhsReader), w.d1)).shares).toHaveLength(1);
     ok(
       await insertTemplateVersion(s.owner, {
         key: "t-object",
@@ -836,7 +836,7 @@ describe("second review", () => {
         ],
       }),
     );
-    expect(ok(await service.listSharedItems(at(w.dhs, w.dhsReader), w.d1))).toEqual([]);
+    expect(ok(await service.listSharedItems(at(w.dhs, w.dhsReader), w.d1)).shares).toEqual([]);
     expect(codes(await service.readSharedItem(at(w.dhs, w.dhsReader), share.id))).toEqual([
       "unknown_share",
     ]);
@@ -854,7 +854,7 @@ describe("second review", () => {
     expect(row?.n).toBe(1);
     // Left out in the query itself (before its limit), not after.
     expect(await sharesIntoSite(s.owner, w.dhs, w.d1, "offered")).toEqual([]);
-    expect(ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1))).toEqual([]);
+    expect(ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1)).shares).toEqual([]);
   });
 
   it("stops showing an accepted item once it is on no site", async () => {
@@ -952,30 +952,32 @@ describe("share lists and views (S-036a)", () => {
     }
     const newestFirst = [...shares].reverse().map((x) => x.id);
     const manager = at(w.dhs, w.dhsManager);
-    const first = ok(await service.sharesIntoSite(manager, w.d1));
+    const first = ok(await service.sharesIntoSite(manager, w.d1)).shares;
     expect(first.map((x) => x.id)).toEqual(newestFirst);
     const after = ok(
       await service.sharesIntoSite(manager, w.d1, { state: "offered", before: newestFirst[0] }),
-    );
+    ).shares;
     expect(after.map((x) => x.id)).toEqual(newestFirst.slice(1));
     const last = ok(
       await service.sharesIntoSite(manager, w.d1, { state: "offered", before: newestFirst[2] }),
-    );
+    ).shares;
     expect(last).toEqual([]);
     // An accepted item's page doesn't see the offers, and no one else's share is a cursor.
-    expect(ok(await service.sharesIntoSite(manager, w.d1, { state: "accepted" }))).toEqual([]);
+    expect(ok(await service.sharesIntoSite(manager, w.d1, { state: "accepted" })).shares).toEqual(
+      [],
+    );
     for (const before of [newRecordId(), "not-an-id"]) {
-      expect(ok(await service.sharesIntoSite(manager, w.d1, { state: "offered", before }))).toEqual(
-        [],
-      );
+      expect(
+        ok(await service.sharesIntoSite(manager, w.d1, { state: "offered", before })).shares,
+      ).toEqual([]);
     }
     // A record's own list pages the same way.
     const home = at(w.lib, w.libCataloger, w.l1);
-    const own = ok(await service.sharesOfRecord(home, w.item.id));
+    const own = ok(await service.sharesOfRecord(home, w.item.id)).shares;
     expect(own.map((x) => x.id)).toEqual([shares[0]?.id]);
-    expect(ok(await service.sharesOfRecord(home, w.item.id, { before: shares[0]?.id }))).toEqual(
-      [],
-    );
+    expect(
+      ok(await service.sharesOfRecord(home, w.item.id, { before: shares[0]?.id })).shares,
+    ).toEqual([]);
     for (const bad of [{ state: "declined" }, { before: 7 }, { other: 1 }]) {
       expect(codes(await service.sharesIntoSite(manager, w.d1, bad))).toEqual(["invalid_request"]);
     }
@@ -984,22 +986,114 @@ describe("share lists and views (S-036a)", () => {
     ]);
   });
 
-  it("gives a page of at most MAX_SHARE_PAGE, and the next page after it", async () => {
+  it("gives a page of at most MAX_SHARE_PAGE and an exact next, even when it leaves some out", async () => {
     await ready();
     const w = await world();
-    const ids: string[] = [];
+    // A template with no stored mapping: its items' offers can't be shown (nothing to decide on).
+    ok(
+      await insertTemplateVersion(s.owner, {
+        key: "t-unmapped",
+        organizationId: w.lib,
+        label: "Unmapped objects",
+        appliesTo: ["object"],
+        fields: [
+          {
+            key: "rights",
+            label: "Rights",
+            kind: "rights",
+            required: false,
+            repeatable: false,
+            visibility: "public",
+            inherited: false,
+          },
+        ],
+      }),
+    );
+    const shown: string[] = [];
+    const all: string[] = [];
     for (let n = 0; n < MAX_SHARE_PAGE + 2; n++) {
-      const item = await publishedItem(w, `Invented many lantern ${String(n)}`);
-      ids.push((await offerToD1(w, item.id)).id);
+      // Two of the newest page's offers can't be shown.
+      const unmapped = n === MAX_SHARE_PAGE - 1 || n === MAX_SHARE_PAGE - 10;
+      const made = unmapped
+        ? ok(
+            await service.createRecord(at(w.lib, w.libCataloger, w.l1), {
+              kind: "object",
+              title: `Invented unmapped lantern ${String(n)}`,
+              templateKey: "t-unmapped",
+              fields: { rights: { uri: "http://rightsstatements.org/vocab/InC/1.0/" } },
+            }),
+          ).record
+        : undefined;
+      if (made !== undefined) {
+        ok(
+          await service.publish(
+            { organizationId: w.lib, actor: actorOf(folks.root), siteId: w.l1 },
+            made.id,
+            { expectedVersion: 1 },
+          ),
+        );
+      }
+      const id = made?.id ?? (await publishedItem(w, `Invented many lantern ${String(n)}`)).id;
+      const share = await offerToD1(w, id);
+      all.push(share.id);
+      if (!unmapped) shown.push(share.id);
     }
     const manager = at(w.dhs, w.dhsManager);
     const page1 = ok(await service.sharesIntoSite(manager, w.d1, { state: "offered" }));
-    expect(page1).toHaveLength(MAX_SHARE_PAGE);
+    // A full page was read; two of it weren't shown, and the next page still follows it.
+    expect(page1.shares).toHaveLength(MAX_SHARE_PAGE - 2);
+    expect(page1.next.offered).toBe([...all].reverse()[MAX_SHARE_PAGE - 1]);
+    expect(page1.next.accepted).toBeNull();
     const page2 = ok(
-      await service.sharesIntoSite(manager, w.d1, { state: "offered", before: page1.at(-1)?.id }),
+      await service.sharesIntoSite(manager, w.d1, {
+        state: "offered",
+        before: page1.next.offered,
+      }),
     );
-    expect([...page1, ...page2].map((x) => x.id)).toEqual([...ids].reverse());
-  }, 120_000);
+    expect(page2.next.offered).toBeNull();
+    expect([...page1.shares, ...page2.shares].map((x) => x.id)).toEqual([...shown].reverse());
+  }, 180_000);
+
+  it("never takes another list's share as a cursor, and needs a state with a cursor", async () => {
+    await ready();
+    const w = await world();
+    const intoD1 = await offerToD1(w, w.item.id);
+    // A share of the same record into another site of the home organization.
+    const intoL2 = ok(
+      await service.offerRecord(at(w.lib, w.libCataloger, w.l1), {
+        recordId: w.item.id,
+        targetOrganizationId: w.lib,
+        targetSiteId: w.l2,
+      }),
+    );
+    const other = await publishedItem(w, "Invented other lantern");
+    const otherShare = await offerToD1(w, other.id);
+    const manager = at(w.dhs, w.dhsManager);
+    // L2's share, and an accepted-list cursor for the offered list, give empty pages.
+    for (const before of [intoL2.id]) {
+      expect(
+        ok(await service.sharesIntoSite(manager, w.d1, { state: "offered", before })).shares,
+      ).toEqual([]);
+    }
+    ok(await service.acceptShare(manager, otherShare.id));
+    expect(
+      ok(await service.sharesIntoSite(manager, w.d1, { state: "offered", before: otherShare.id }))
+        .shares,
+    ).toEqual([]);
+    // Another record's share isn't a cursor for this record's list.
+    const home = at(w.lib, w.libCataloger, w.l1);
+    expect(
+      ok(await service.sharesOfRecord(home, w.item.id, { before: otherShare.id })).shares,
+    ).toEqual([]);
+    expect(ok(await service.sharesOfRecord(home, w.item.id)).shares.map((x) => x.id)).toEqual([
+      intoL2.id,
+      intoD1.id,
+    ]);
+    // A cursor without a state on a site's list is refused.
+    expect(codes(await service.sharesIntoSite(manager, w.d1, { before: intoD1.id }))).toEqual([
+      "invalid_request",
+    ]);
+  });
 
   it("shows the manager, and only the manager, an accepted item the public can't see now, to remove it", async () => {
     await ready();
@@ -1009,18 +1103,18 @@ describe("share lists and views (S-036a)", () => {
     const rootAt = { organizationId: w.lib, actor: actorOf(folks.root), siteId: w.l1 };
     const now = ok(await service.readRecord(rootAt, w.item.id));
     ok(await service.withdraw(rootAt, w.item.id, { expectedVersion: now.version }));
-    const managed = ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1));
+    const managed = ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1)).shares;
     expect(managed.map((x) => [x.id, x.state, x.item])).toEqual([[share.id, "accepted", null]]);
     // Nobody else sees it, and its view isn't readable.
     for (const userId of [w.dhsReader, w.dhsCataloger, w.dhsManager]) {
-      expect(ok(await service.listSharedItems(at(w.dhs, userId), w.d1))).toEqual([]);
+      expect(ok(await service.listSharedItems(at(w.dhs, userId), w.d1)).shares).toEqual([]);
       expect(codes(await service.readSharedItem(at(w.dhs, userId), share.id))).toEqual([
         "unknown_share",
       ]);
     }
     // The manager can remove it.
     expect(ok(await service.removeShare(at(w.dhs, w.dhsManager), share.id)).state).toBe("removed");
-    expect(ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1))).toEqual([]);
+    expect(ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1)).shares).toEqual([]);
   });
 
   it("shows only the fields the home mapping publishes, named by the home template's labels", async () => {
@@ -1136,11 +1230,11 @@ describe("share lists and views (S-036a)", () => {
     );
     const share = await offerToD1(w, made.id);
     // An offer the public can't see isn't listed at all (nothing to decide on).
-    expect(ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1))).toEqual([]);
+    expect(ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1)).shares).toEqual([]);
     ok(await service.acceptShare(at(w.dhs, w.dhsManager), share.id));
     expect(
-      ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1)).map((x) => x.item),
+      ok(await service.sharesIntoSite(at(w.dhs, w.dhsManager), w.d1)).shares.map((x) => x.item),
     ).toEqual([null]);
-    expect(ok(await service.listSharedItems(at(w.dhs, w.dhsReader), w.d1))).toEqual([]);
+    expect(ok(await service.listSharedItems(at(w.dhs, w.dhsReader), w.d1)).shares).toEqual([]);
   });
 });

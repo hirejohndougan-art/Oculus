@@ -1122,7 +1122,7 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
       path: "/api/records/:id/shares",
       handler: signedIn("read", false, async (request, reply, { context }) => {
         const result = await service.sharesOfRecord(context, recordId(request), sharePage(request));
-        return answer(result, reply, (shares) => ({ shares }));
+        return answer(result, reply, (page) => ({ shares: page.shares, next: page.next }));
       }),
     },
     {
@@ -1164,7 +1164,7 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
           request.params.id ?? "",
           sharePage(request, true),
         );
-        return answer(result, reply, (shares) => ({ shares }));
+        return answer(result, reply, (page) => ({ shares: page.shares, next: page.next }));
       }),
     },
     {
@@ -1176,7 +1176,7 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
           request.params.id ?? "",
           sharePage(request),
         );
-        return answer(result, reply, (shares) => ({ shares }));
+        return answer(result, reply, (page) => ({ shares: page.shares, next: page.next }));
       }),
     },
     {
