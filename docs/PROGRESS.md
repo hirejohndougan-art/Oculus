@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 05:13 CT — build (BUILD MODE) — S-037 Time limits on the public reader pool
+- Result: done
+- What changed: `readPublicRecord` takes `timeLimitMs` (a transaction-local `statement_timeout`, default 5 s); the public pool waits at most 5 s for a connection (`publicPoolOptions`, `PUBLIC_POOL_SIZE` shared with the read slots); `isDatabaseTimeout` (57014, pg-pool's wait) answers `503 busy` on `GET /records/:id` and OAI-PMH; OAI list pages stop reading after 15 s, or just before a later read that timed out, and end with a resumption token. Tests lock `public.records`, exhaust the pool and cancel reads mid-page. Commits a44f691, 894a758, the second-review fix, c4b899a.
+- Decisions: D-100 amended (time limits)
+- Review: two independent rounds. Round 1: nothing blocking; fixed OAI pages holding a slot for 200 slow reads (page time limit), limits now refused when routes are built, a slow new connection stays `unavailable` (an outage), pool size and slots tied. Round 2: safe; fixed one timed-out read failing a whole OAI page (now ends the page before it). Filed S-043 (a record always slower than the limit; OAI staff-connection reads unbounded; injectable clock; JS work between statements).
+- Gate: PASS · tests_passing 4745 (was 4734) · npm audit clean
+- Next: the next free roadmap task (U-007, S-031, S-035 or S-043; many others are claimed by chats)
+
 ## 2026-11-25 03:00 CT — manual (Chat D) — S-042 Site managers see members whose role is on every site
 - Result: done
 - What changed: John (2026-11-25): a role on every site includes the site manager's own, so such a member is seen in full and may be given more roles there. `holdsRoleOn` (packages/service/src/admin.ts) and `listMembers` (packages/db/src/people.ts) count every-site grants; members with no role stay name-only.
