@@ -11,13 +11,14 @@ import {
   writeFileSync,
 } from "node:fs";
 import { request as httpRequest } from "node:http";
+import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { checkPublicReaderConnection, checkWriterConnection, openDatabase, sql } from "@oculus/db";
 import { runDesktop } from "./desktop-cli.js";
-import { runDesktopDatabase } from "./desktop-database-cli.js";
+import { READER_ONLY_FAILED, runDesktopDatabase } from "./desktop-database-cli.js";
 import {
   addPgpassEntries,
   addressFor,
@@ -313,6 +314,51 @@ describe("npm run desktop:database, then npm run desktop", () => {
     expect(Object.values(kept.publicPorts ?? {})).toEqual([Number(port)]);
     stop();
     expect(await run).toBe(0);
+
+    // Next start, with another program on that port: the site gets another
+    // free port, is served there, and the new port is kept (T-071 review).
+    const squatter = createTcpServer((socket) => socket.destroy());
+    await new Promise<void>((resolve) => squatter.listen(Number(port), "127.0.0.1", resolve));
+    try {
+      const again: string[] = [];
+      let stopAgain: () => void = () => undefined;
+      const stoppedAgain = new Promise<void>((resolve) => {
+        stopAgain = resolve;
+      });
+      const second = runDesktop({
+        env: { OCULUS_DESKTOP_HOME: folder, PGPASSFILE: join(folder, "pgpass") },
+        out: (l) => again.push(l),
+        err: (l) => again.push(`ERR ${l}`),
+        findBrowser: () => undefined,
+        openDefault: () => undefined,
+        stopRequested: () => stoppedAgain,
+        adminDir,
+      });
+      for (let i = 0; i < 400 && !again.some((l) => l.startsWith("Oculus is running")); i++) {
+        if (again.some((l) => l.startsWith("ERR"))) break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      expect(again.join("\n")).not.toContain("ERR");
+      const moved =
+        again
+          .find((l) => l.startsWith('Public site "Invented Archive": '))
+          ?.slice('Public site "Invented Archive": '.length) ?? "";
+      const movedPort = new URL(moved).port;
+      expect(movedPort).not.toBe(port);
+      expect((await getAs(movedPort, "/")).body).toContain("<h1>Invented Archive</h1>");
+      const keptAgain = JSON.parse(readFileSync(join(folder, "desktop.json"), "utf8")) as {
+        publicPorts?: Record<string, number>;
+      };
+      expect(Object.values(keptAgain.publicPorts ?? {})).toEqual([Number(movedPort)]);
+      stopAgain();
+      expect(await second).toBe(0);
+    } finally {
+      await new Promise<void>((resolve) => {
+        squatter.close(() => {
+          resolve();
+        });
+      });
+    }
     // The grant was put back before serving.
     const writerAfter = openDatabase(writerUrl.href, { max: 1 });
     try {
@@ -483,6 +529,106 @@ describe("npm run desktop:database, then npm run desktop", () => {
       }),
     ).toBe(0);
     expect(none.asked).toEqual([]);
+  });
+
+  it("takes back the reader it made and granted when saving it fails, exits 5 and calls finished once (T-071)", async () => {
+    const n = names("rollback");
+    expect(
+      await runDesktopDatabase({
+        env: env(),
+        ask: answers([ADMIN_PASSWORD, ACCOUNT_PASSWORD, ACCOUNT_PASSWORD]).ask,
+        out: () => undefined,
+        err: () => undefined,
+        names: n,
+      }),
+    ).toBe(0);
+    // As an earlier version left it. The pgpass file the helper writes to is
+    // a folder this time, so saving the reader's line fails after the role
+    // is made and granted (pg itself still reads the real file).
+    const file = join(folder, "desktop.json");
+    const settings = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    delete settings.publicDatabaseUrl;
+    writeFileSync(file, JSON.stringify(settings));
+    const realOwner = String(settings.ownerDatabaseUrl);
+    const unwritable = join(folder, "pgpass-folder");
+    mkdirSync(unwritable);
+    const pgpassFile = join(folder, "pgpass");
+    process.env.PGPASSFILE = pgpassFile;
+    const owner = openDatabase(realOwner, { max: 1 });
+    try {
+      await owner.execute(sql`REVOKE USAGE ON SCHEMA public FROM t057_rollback_public`);
+    } finally {
+      await owner.close();
+    }
+    const adminUrl = new URL(server.url);
+    adminUrl.password = encodeURIComponent(ADMIN_PASSWORD);
+    const admin = openDatabase(adminUrl.href, { max: 1 });
+    try {
+      await admin.execute(sql`DROP ROLE t057_rollback_public`);
+      const pgpassBefore = readFileSync(pgpassFile, "utf8");
+      const lines: string[] = [];
+      let finishedCalls = 0;
+      const code = await runDesktopDatabase({
+        env: env({ PGPASSFILE: unwritable }),
+        ask: answers([ADMIN_PASSWORD]).ask,
+        out: (l) => lines.push(l),
+        err: (l) => lines.push(`ERR ${l}`),
+        names: n,
+        finished: () => {
+          finishedCalls++;
+        },
+      });
+      expect(code).toBe(READER_ONLY_FAILED);
+      expect(finishedCalls).toBe(1);
+      expect(lines.join("\n")).toContain("What was made has been removed");
+      const left = await admin.rows(
+        sql`SELECT 1 FROM pg_roles WHERE rolname = 't057_rollback_public'`,
+      );
+      expect(left).toEqual([]);
+      expect(readFileSync(pgpassFile, "utf8")).toBe(pgpassBefore);
+      const after = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+      expect(after.publicDatabaseUrl).toBeUndefined();
+    } finally {
+      await admin.close();
+    }
+  });
+
+  it("leaves a role of the reader's name alone when it already exists, and exits 5 (T-071)", async () => {
+    const n = names("clash");
+    expect(
+      await runDesktopDatabase({
+        env: env(),
+        ask: answers([ADMIN_PASSWORD, ACCOUNT_PASSWORD, ACCOUNT_PASSWORD]).ask,
+        out: () => undefined,
+        err: () => undefined,
+        names: n,
+      }),
+    ).toBe(0);
+    const file = join(folder, "desktop.json");
+    const settings = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    delete settings.publicDatabaseUrl;
+    writeFileSync(file, JSON.stringify(settings));
+    process.env.PGPASSFILE = join(folder, "pgpass");
+    // The reader role from the first run is still there: someone else's now.
+    const code = await runDesktopDatabase({
+      env: env(),
+      ask: answers([ADMIN_PASSWORD]).ask,
+      out: () => undefined,
+      err: () => undefined,
+      names: n,
+    });
+    expect(code).toBe(READER_ONLY_FAILED);
+    const adminUrl = new URL(server.url);
+    adminUrl.password = encodeURIComponent(ADMIN_PASSWORD);
+    const admin = openDatabase(adminUrl.href, { max: 1 });
+    try {
+      const kept = await admin.rows(
+        sql`SELECT 1 FROM pg_roles WHERE rolname = 't057_clash_public'`,
+      );
+      expect(kept).toHaveLength(1);
+    } finally {
+      await admin.close();
+    }
   });
 
   it("changes nothing when the postgres password is wrong", async () => {

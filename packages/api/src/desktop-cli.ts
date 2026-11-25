@@ -76,10 +76,10 @@ import { ORIGINS_ENV } from "./origin.js";
 import {
   assignPublicPorts,
   desktopSites,
-  listenPublicPorts,
+  holdPublicPorts,
   openPublicSiteRoute,
   publicOriginFor,
-  type PublicListeners,
+  type HeldPublicPorts,
 } from "./desktop-public.js";
 import { PUBLIC_DATABASE_URL_ENV, PUBLIC_SITES_ENV } from "./public-sites.js";
 import type { OculusReply, OculusRequest, OculusRoute } from "./routes.js";
@@ -413,7 +413,7 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
   let ownerDb: Database | undefined;
   let publicDb: Database | undefined;
   let countsDb: Database | undefined;
-  let publicListeners: PublicListeners | undefined;
+  let publicListeners: HeldPublicPorts | undefined;
   let app: FastifyInstance | undefined;
   let window: WindowProcess | undefined;
   try {
@@ -559,17 +559,34 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
           savedPublicPorts,
           port,
         );
-        publicSites = sites.map((s) => {
-          const sitePort = ports[s.id] ?? 0;
-          return { siteId: s.id, name: s.name, port: sitePort, origin: publicOriginFor(sitePort) };
-        });
         const merged = { ...savedPublicPorts, ...ports };
         if (JSON.stringify(merged) !== JSON.stringify(savedPublicPorts ?? {})) {
           writeDesktopSettings(folder, { publicPorts: merged });
         }
+        // Held before the server is built (T-071 review, item 1): only the
+        // sites whose port is held are given to it and shown.
+        publicListeners = await holdPublicPorts(sites.map((s) => ports[s.id] ?? 0));
+        const held = new Set(publicListeners.held);
+        for (const s of sites) {
+          const sitePort = ports[s.id] ?? 0;
+          if (held.has(sitePort)) {
+            publicSites.push({
+              siteId: s.id,
+              name: s.name,
+              port: sitePort,
+              origin: publicOriginFor(sitePort),
+            });
+          } else {
+            err(
+              `The public side of "${s.name}" is off this time: port ${String(sitePort)} was taken by another program.`,
+            );
+          }
+        }
       } catch {
         err("Couldn't prepare the public sites; Oculus starts without them.");
         publicSites = [];
+        await publicListeners?.close();
+        publicListeners = undefined;
       }
     }
 
@@ -618,6 +635,9 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
                 ownHost,
                 origins: new Map(sites.map((s) => [s.siteId, s.origin])),
                 open: openDefault,
+                log: (code) => {
+                  err(`Opening a public site failed (${code}).`);
+                },
               }),
             ]
           : [instanceRoute],
@@ -636,20 +656,15 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
         `The public sites are off this time: ${error instanceof Error ? error.message : "unknown error"}`,
       );
       publicSites = [];
+      await publicListeners?.close();
+      publicListeners = undefined;
       app = await build(publicSites);
     }
     await app.listen({ host: "127.0.0.1", port });
-    if (publicSites.length > 0) {
-      try {
-        publicListeners = await listenPublicPorts(
-          app.server,
-          publicSites.map((s) => s.port),
-        );
-        for (const site of publicSites) {
-          out(`Public site "${site.name}": ${site.origin}/`);
-        }
-      } catch {
-        err("Couldn't open the public sites' ports; the admin works, the public sites don't.");
+    if (publicSites.length > 0 && publicListeners !== undefined) {
+      publicListeners.attach(app.server);
+      for (const site of publicSites) {
+        out(`Public site "${site.name}": ${site.origin}/`);
       }
     }
     const address = `${origin}/`;

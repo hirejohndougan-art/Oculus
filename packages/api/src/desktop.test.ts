@@ -165,6 +165,43 @@ describe("readDesktopSettings", () => {
   });
 });
 
+describe("readDesktopSettings: publicPorts (T-071)", () => {
+  const A = "4d6f5b1e-9c3a-4b7e-8f21-0a1b2c3d4e5f";
+  const B = "5e7a6c2f-0d4b-4c8f-9a32-1b2c3d4e5f60";
+  const write = (value: unknown) => {
+    writeFileSync(join(folder, "desktop.json"), JSON.stringify({ publicPorts: value }));
+  };
+
+  it("reads site IDs to ports", () => {
+    write({ [A]: 4781, [B]: 4782 });
+    expect(readDesktopSettings(folder)).toEqual({ publicPorts: { [A]: 4781, [B]: 4782 } });
+    write({});
+    expect(readDesktopSettings(folder)).toEqual({ publicPorts: {} });
+  });
+
+  it("refuses anything but real site IDs to different ports from 1024 to 65535", () => {
+    for (const value of [
+      [4781],
+      null,
+      "4781",
+      { "not-a-site": 4781 },
+      { [A.toUpperCase()]: 4781 },
+      { [A]: 80 },
+      { [A]: 1023 },
+      { [A]: 65_536 },
+      { [A]: 4781.5 },
+      { [A]: "4781" },
+      { [A]: 4781, [B]: 4781 },
+    ]) {
+      write(value);
+      expect(
+        codeOf(() => readDesktopSettings(folder)),
+        JSON.stringify(value),
+      ).toBe("settings_invalid");
+    }
+  });
+});
+
 describe("urlHasPassword", () => {
   it("finds a password in either place, and none in a plain address", () => {
     expect(urlHasPassword("postgresql://a:b@h/d")).toBe(true);

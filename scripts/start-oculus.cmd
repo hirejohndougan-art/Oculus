@@ -38,7 +38,10 @@ goto start
 
 :database
 echo Setting up Oculus's database...
-node packages\api\dist\desktop-database-cli.js || goto failed
+node packages\api\dist\desktop-database-cli.js
+rem 5: only the public sites' reader couldn't be added; Oculus works as before.
+if "%ERRORLEVEL%"=="5" goto start
+if errorlevel 1 goto failed
 
 :start
 rem Node directly (not npm run), so its exit code arrives as it is.

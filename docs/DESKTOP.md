@@ -43,7 +43,7 @@ Oculus also shows each site's public side, the pages visitors will see, on this 
 - Nobody else can open it: like the rest of Oculus, it answers only this computer.
 - A site you add while Oculus is running gets its public address the next time you start Oculus.
 
-**If you set up Oculus before the public sites came** (the black window says "The public sites aren't set up on this computer yet"): close Oculus, then in a Command Prompt in the Oculus folder run `node packages\api\dist\desktop-database-cli.js` (`npm run desktop:database` on a Mac or Linux). It asks for the `postgres` password once more and adds the read-only account. Then start Oculus as usual.
+**If you set up Oculus before the public sites came** (the black window says "The public sites aren't set up on this computer yet"): close Oculus, then in a Command Prompt in the Oculus folder run `node packages\api\dist\desktop-database-cli.js` (`npm run desktop:database` on a Mac or Linux). It asks for the `postgres` password once more and adds the read-only account. Then start Oculus as usual. If adding it fails, nothing else changes: Oculus still starts as before, without the public sites, and you can try again later.
 
 ## Keep these safe
 

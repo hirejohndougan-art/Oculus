@@ -9,11 +9,16 @@
  *   `OCULUS_PUBLIC_SITES` refuses a public origin on the admin's host
  *   (D-090). Browsers resolve `localhost` to the loopback address
  *   themselves.
- * - **Listening.** Every port is bound on 127.0.0.1 only. A public port is a
+ * - **Listening.** Every port is bound on the loopback addresses only:
+ *   127.0.0.1, and ::1 too where the computer has IPv6, because `localhost`
+ *   may resolve to either; a port another program holds on ::1 counts as
+ *   taken, so a browser never reaches someone else's program at a site's
+ *   address. The ports are held before the server is built, and only the
+ *   sites whose port is held are given to it (and shown). A public port is a
  *   plain TCP listener that hands each connection to the admin's own HTTP
- *   server (`server.emit("connection")`), so the same timeouts, limits and
- *   rules apply, and public sites are told apart by the origin the browser
- *   sends, as on a real server.
+ *   server (`server.emit("connection")`) once it is attached, so the same
+ *   timeouts, limits and rules apply, and public sites are told apart by the
+ *   origin the browser sends, as on a real server.
  * - **Ports** are kept in `desktop.json` (`publicPorts`, by site ID) so a
  *   site's public address stays the same between starts; a site without one,
  *   or whose port is taken, gets the next free port from 4781 up.
@@ -21,9 +26,9 @@
 import type { Server as HttpServer } from "node:http";
 import { createServer, type Server, type Socket } from "node:net";
 import { checkCsrfToken } from "@oculus/core";
-import { resolveSession, sql, type Queryable } from "@oculus/db";
+import { resolveSession, sitesForPerson, sql, type Queryable } from "@oculus/db";
 import { OCULUS_COOKIES } from "./cookies.js";
-import { anyFreePort, portIsFree } from "./desktop.js";
+import { anyFreePort } from "./desktop.js";
 import { Refusal } from "./errors.js";
 import type { OculusRoute } from "./routes.js";
 import { CSRF_HEADER, objectBody } from "./staff-api.js";
@@ -45,13 +50,13 @@ export async function desktopSites(
 /**
  * A port for each site: its saved one if free (and not another's), else the
  * next free one from `FIRST_PUBLIC_PORT`, never `adminPort`. `isFree` is
- * `portIsFree` (tests replace it).
+ * `publicPortIsFree` (tests replace it).
  */
 export async function assignPublicPorts(
   sites: readonly string[],
   saved: Readonly<Record<string, number>> | undefined,
   adminPort: number,
-  isFree: (port: number) => Promise<boolean> = portIsFree,
+  isFree: (port: number) => Promise<boolean> = publicPortIsFree,
   anyFree: () => Promise<number> = anyFreePort,
 ): Promise<Record<string, number>> {
   const taken = new Set<number>([adminPort]);
@@ -93,6 +98,59 @@ export function publicOriginFor(port: number): string {
   return `http://localhost:${String(port)}`;
 }
 
+/** Error codes that mean "no IPv6 loopback here", not "someone holds the port". */
+const NO_IPV6 = new Set(["EADDRNOTAVAIL", "EAFNOSUPPORT", "EPROTONOSUPPORT", "EINVAL"]);
+
+type Bound =
+  { readonly ok: true; readonly listener: Server } | { readonly ok: false; readonly code: string };
+
+/** Binds one listener (exclusively) at `host:port`; `onSocket` gets its connections. */
+function bind(host: string, port: number, onSocket: (socket: Socket) => void): Promise<Bound> {
+  return new Promise((resolve) => {
+    const listener = createServer(onSocket);
+    listener.once("error", (error: NodeJS.ErrnoException) => {
+      resolve({ ok: false, code: typeof error.code === "string" ? error.code : "error" });
+    });
+    listener.listen({ host, port, exclusive: true }, () => {
+      listener.removeAllListeners("error");
+      // A later error on a listening socket must not crash the launcher.
+      listener.on("error", () => undefined);
+      resolve({ ok: true, listener });
+    });
+  });
+}
+
+function closeListener(listener: Server): Promise<void> {
+  return new Promise((resolve) => {
+    listener.close(() => {
+      resolve();
+    });
+  });
+}
+
+/**
+ * Whether a public port is free: on 127.0.0.1, and on ::1 unless the
+ * computer has no IPv6 loopback (a program holding it there would answer
+ * `localhost:<port>` for some browsers, D-109).
+ */
+export async function publicPortIsFree(port: number, secondHost = "::1"): Promise<boolean> {
+  const ignore = (socket: Socket) => {
+    socket.destroy();
+  };
+  const v4 = await bind("127.0.0.1", port, ignore);
+  if (!v4.ok) return false;
+  try {
+    const v6 = await bind(secondHost, port, ignore);
+    if (v6.ok) {
+      await closeListener(v6.listener);
+      return true;
+    }
+    return NO_IPV6.has(v6.code);
+  } finally {
+    await closeListener(v4.listener);
+  }
+}
+
 /** Listeners that hand their connections to the admin's HTTP server. */
 export interface PublicListeners {
   /** Stops taking connections; resolves once they have all ended. */
@@ -101,61 +159,87 @@ export interface PublicListeners {
   destroy(): void;
 }
 
+/** Public ports held before the server is built (T-071 review, item 1). */
+export interface HeldPublicPorts extends PublicListeners {
+  /** The ports held, in the order asked; the others are left alone. */
+  readonly held: readonly number[];
+  /**
+   * Hands every connection from now on to `server` (the admin's, already
+   * listening). Until then, and after `close`, connections are refused.
+   */
+  attach(server: HttpServer): void;
+}
+
 /**
- * Listens on 127.0.0.1 at each port and hands every connection to `server`
- * (the admin's, already listening). Closes what it opened if any port
- * fails. A listener's `close` waits for the connections it accepted, so the
- * launcher calls `close`, then closes the admin's server (which ends idle
- * ones), then `destroy` for any left.
+ * Holds each port on 127.0.0.1 and, where the computer has IPv6, on ::1. A
+ * port that can't be held on either (taken, or held by another program on
+ * ::1) is skipped and not in `held`; nothing is thrown for it.
+ */
+export async function holdPublicPorts(
+  ports: readonly number[],
+  /** The second loopback address (tests use another 127.x where there's no IPv6). */
+  secondHost = "::1",
+): Promise<HeldPublicPorts> {
+  const listeners: Server[] = [];
+  const sockets = new Set<Socket>();
+  let target: HttpServer | undefined;
+  let closing = false;
+  const onSocket = (socket: Socket) => {
+    // Not attached yet, or closing: no connection is taken.
+    if (closing || target?.listening !== true) {
+      socket.destroy();
+      return;
+    }
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+    target.emit("connection", socket);
+  };
+  const held: number[] = [];
+  for (const port of ports) {
+    const v4 = await bind("127.0.0.1", port, onSocket);
+    if (!v4.ok) continue;
+    const v6 = await bind(secondHost, port, onSocket);
+    if (v6.ok) {
+      listeners.push(v4.listener, v6.listener);
+    } else if (NO_IPV6.has(v6.code)) {
+      listeners.push(v4.listener);
+    } else {
+      // Another program answers localhost:<port> on ::1: not this site's port.
+      await closeListener(v4.listener);
+      continue;
+    }
+    held.push(port);
+  }
+  return {
+    held,
+    attach(server) {
+      target = server;
+    },
+    close() {
+      closing = true;
+      return Promise.all(listeners.map(closeListener)).then(() => undefined);
+    },
+    destroy() {
+      for (const socket of sockets) socket.destroy();
+    },
+  };
+}
+
+/**
+ * Holds every port and hands its connections to `server` (already
+ * listening); refuses (closing what it opened) if any port can't be held.
  */
 export async function listenPublicPorts(
   server: HttpServer,
   ports: readonly number[],
 ): Promise<PublicListeners> {
-  const listeners: Server[] = [];
-  const sockets = new Set<Socket>();
-  const close = (): Promise<void> =>
-    Promise.all(
-      listeners.map(
-        (listener) =>
-          new Promise<void>((resolve) => {
-            listener.close(() => {
-              resolve();
-            });
-          }),
-      ),
-    ).then(() => undefined);
-  const destroy = (): void => {
-    for (const socket of sockets) socket.destroy();
-  };
-  try {
-    for (const port of ports) {
-      const listener = createServer((socket: Socket) => {
-        // Closing: no new connection is taken.
-        if (!server.listening) {
-          socket.destroy();
-          return;
-        }
-        sockets.add(socket);
-        socket.once("close", () => sockets.delete(socket));
-        server.emit("connection", socket);
-      });
-      listeners.push(listener);
-      await new Promise<void>((resolve, reject) => {
-        listener.once("error", reject);
-        listener.listen({ host: "127.0.0.1", port, exclusive: true }, () => {
-          listener.off("error", reject);
-          resolve();
-        });
-      });
-    }
-  } catch (error) {
-    const closing = close();
-    destroy();
-    await closing;
-    throw error;
+  const hold = await holdPublicPorts(ports);
+  if (hold.held.length !== ports.length) {
+    await hold.close();
+    throw new Error("a public port is taken");
   }
-  return { close, destroy };
+  hold.attach(server);
+  return hold;
 }
 
 /** The launcher's route that opens a public site in the default browser. */
@@ -167,8 +251,10 @@ export const OPEN_PUBLIC_SITE_PATH = "/api/desktop/public-site";
  * list, never an address from the request) in the default browser. Only on
  * the launcher's own `127.0.0.1:<port>` host (and `/api` is the admin's
  * host only anyway, D-090), only for a signed-in session with its CSRF
- * token (`X-Oculus-CSRF`), at most once a second. Any other site is the
- * unknown path's 404.
+ * token (`X-Oculus-CSRF`), at most once a second, and only for a site the
+ * person may work in (`sitesForPerson`, as `GET /api/me` lists them). Any
+ * other site is the unknown path's 404. A session that can't be read is
+ * logged (`log`, a fixed code, never the token) and answered 503.
  */
 export function openPublicSiteRoute(options: {
   readonly db: Queryable;
@@ -177,6 +263,8 @@ export function openPublicSiteRoute(options: {
   readonly origins: ReadonlyMap<string, string>;
   readonly open: (url: string) => void;
   readonly clock?: () => number;
+  /** A fixed event code when the session or the person's sites can't be read. */
+  readonly log?: (code: string) => void;
 }): OculusRoute {
   const clock = options.clock ?? Date.now;
   let last = -Infinity;
@@ -193,6 +281,7 @@ export function openPublicSiteRoute(options: {
       const resolved = await resolveSession(options.db, token);
       if (!resolved.ok) {
         if (resolved.code === "no_session") throw new Refusal(401, "unauthenticated");
+        options.log?.(`open_public_site_session_${resolved.code}`);
         throw new Refusal(503, "unavailable");
       }
       const body = objectBody(request);
@@ -202,6 +291,14 @@ export function openPublicSiteRoute(options: {
       }
       const origin = options.origins.get(siteId);
       if (origin === undefined) throw new Refusal(404, "not_found");
+      let mine: readonly { readonly siteId: string }[];
+      try {
+        mine = await sitesForPerson(options.db, resolved.session.userId);
+      } catch {
+        options.log?.("open_public_site_sites_unreadable");
+        throw new Refusal(503, "unavailable");
+      }
+      if (!mine.some((site) => site.siteId === siteId)) throw new Refusal(404, "not_found");
       const now = clock();
       if (now - last < 1000) throw new Refusal(429, "rate_limited");
       last = now;

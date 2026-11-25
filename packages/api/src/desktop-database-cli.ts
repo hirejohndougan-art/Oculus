@@ -129,8 +129,25 @@ async function formatted(
   });
 }
 
+/**
+ * The exit code when only the public sites' reader couldn't be added to a
+ * database an earlier version made (T-071): Oculus itself works as before,
+ * so the Windows start script goes on to start it (T-071 review).
+ */
+export const READER_ONLY_FAILED = 5;
+
 /** Runs the helper; returns the exit code. */
-export async function runDesktopDatabase(options: DesktopDatabaseOptions): Promise<number> {
+export async function runDesktopDatabase(called: DesktopDatabaseOptions): Promise<number> {
+  // `finished` runs at most once, whichever path calls it (T-071 review).
+  let finishedCalled = false;
+  const options: DesktopDatabaseOptions = {
+    ...called,
+    finished: () => {
+      if (finishedCalled) return;
+      finishedCalled = true;
+      called.finished?.();
+    },
+  };
   const { env, ask } = options;
   const platform = options.platform ?? process.platform;
   const home = options.home ?? homedir();
@@ -469,7 +486,7 @@ async function addPublicReader(input: {
     adminUser = decodeURIComponent(parsed.username) || "postgres";
   } catch {
     err(`${ADMIN_URL_VARIABLE} must be a postgresql:// address with no password in it.`);
-    return 2;
+    return READER_ONLY_FAILED;
   }
   out("");
   out("Oculus can now show your public sites on this computer too. That needs one more");
@@ -481,7 +498,7 @@ async function addPublicReader(input: {
     err(
       "No password was given. Nothing was changed; Oculus works as before, without public sites.",
     );
-    return 1;
+    return READER_ONLY_FAILED;
   }
   if (adminPassword !== "") input.secrets.push(adminPassword);
   const adminUrl = adminPassword === "" ? adminBase : withPassword(adminBase, adminPassword);
@@ -490,7 +507,7 @@ async function addPublicReader(input: {
     admin = openDatabase(adminUrl, { applicationName: "oculus-desktop-database", max: 1 });
   } catch {
     err(`${ADMIN_URL_VARIABLE} is not a usable postgresql:// address.`);
-    return 2;
+    return READER_ONLY_FAILED;
   }
   const password = newRolePassword();
   input.secrets.push(password);
@@ -500,7 +517,7 @@ async function addPublicReader(input: {
   } catch {
     err('"ownerDatabaseUrl" in desktop.json is not a usable postgresql:// address.');
     await admin.close();
-    return 1;
+    return READER_ONLY_FAILED;
   }
   const readerAddress = addressFor(input.ownerAddress, input.reader, ownerDatabase);
   let made = false;
@@ -514,20 +531,22 @@ async function addPublicReader(input: {
       err(
         `Couldn't sign in to PostgreSQL as "${adminUser}". Check the password, and that PostgreSQL is running. Nothing was changed.`,
       );
-      return 1;
+      return READER_ONLY_FAILED;
     }
     const existing = await admin.rows(sql`SELECT 1 FROM pg_roles WHERE rolname = ${input.reader}`);
     if (existing.length > 0) {
       err(
         `PostgreSQL already has the role ${input.reader}. Nothing was changed. If it's from an earlier try, remove it in pgAdmin (or ask for help) and run this again.`,
       );
-      return 1;
+      return READER_ONLY_FAILED;
     }
-    made = true;
     await formatted(admin, "CREATE ROLE %I LOGIN PASSWORD %L", [
       input.reader,
       scramVerifier(password),
     ]);
+    // Only now is the role this run's to remove (a failed CREATE made nothing,
+    // and a role of that name made meanwhile by someone else isn't ours).
+    made = true;
     owner = openDatabase(input.ownerAddress, {
       applicationName: "oculus-desktop-database",
       max: 1,
@@ -560,7 +579,7 @@ async function addPublicReader(input: {
         err(`Couldn't remove what was made. In pgAdmin, remove the role "${input.reader}".`);
       }
     }
-    return 1;
+    return READER_ONLY_FAILED;
   } finally {
     await owner?.close();
     await admin.close();

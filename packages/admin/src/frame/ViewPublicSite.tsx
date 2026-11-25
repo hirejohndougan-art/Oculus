@@ -10,10 +10,11 @@
  * On the desktop (T-071) the launcher opens public sites itself
  * (`desktopOpen`): a click asks it to open the site in the default browser
  * (it opens its own address for that site, never one sent from here), and
- * follows the ordinary link if it can't.
+ * follows the ordinary link if it can't (except after a 429: the launcher
+ * opened it a moment ago).
  */
 import type { MouseEvent } from "react";
-import { api } from "../api";
+import { ApiError, api } from "../api";
 import styles from "./Frame.module.css";
 
 /** The site's public home address (`<origin>/`), or undefined when the value isn't a bare http(s) origin. */
@@ -67,7 +68,9 @@ export function ViewPublicSite(props: {
     if (props.desktopOpen !== true || address === undefined) return;
     event.preventDefault();
     const fallback = address;
-    api("/api/desktop/public-site", { body: { siteId: props.siteId } }).catch(() => {
+    api("/api/desktop/public-site", { body: { siteId: props.siteId } }).catch((error: unknown) => {
+      // 429: the launcher opened it a moment ago (a double click); no second tab.
+      if (error instanceof ApiError && error.status === 429) return;
       window.open(fallback, "_blank", "noopener,noreferrer");
     });
   }
