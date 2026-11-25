@@ -2,6 +2,22 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 00:35 CT — manual (Chat E) — S-026 Publish check for ID number formats
+- Result: done
+- What changed: the publish check (`publishCheckIssues`) runs the public output's own template check (`publicTemplateIssues`, new in core), so a public ID number that no longer fits its type's changed format fails it (`format_mismatch`, fixed text) instead of the record passing and quietly dropping off the public sites; `identifierTypeChanges` takes `existing.published` and lists on `format_changed` the published records that would show as not available. Tests in core and against the database (publish check, public output, the fix path, inherited numbers). Follow-up S-033 (the service-side confirmation).
+- Decisions: D-091
+- Review: one independent round. Fixed: records that only inherit a misfit number were listed as going offline (they stay public without it; now tested against `readPublicRecord`); an error code; D-091 now says the publish check applies every template-check refusal. The missing service confirmation is S-033.
+- Gate: PASS · tests_passing 4411 (was 4405) · npm audit clean
+- Next: T-034d (public subject counts, Chat E)
+
+## 2026-11-25 00:15 CT — manual (Chat D) — T-057 Desktop database helper
+- Result: done
+- What changed: `npm run desktop:database` makes `oculus_owner`, `oculus_app` and the `oculus` database on the person's own PostgreSQL with the `postgres` password typed once (SCRAM verifiers, never plain passwords), keeps the passwords only in pgpass, writes `desktop.json` and runs setup; resumes an unfinished setup; undoes a failed creation. The launcher migrates as the owner, grants and checks the writer, and serves as the writer. `start-oculus.cmd` runs the helper the first time. `@oculus/db` exports `createDatabase`, `dropDatabase`, `runSetupCli`, `terminalAsk`.
+- Decisions: D-093
+- Review: two independent rounds; fixed the stuck unfinished setup, leftover pgpass lines, a non-UTF-8 pgpass being damaged, query keys overriding the new addresses, and the pre-grant check that would have refused a correct writer after an update. Left as S-034 (9, 10).
+- Gate: PASS · tests_passing 4405 (was 4391) · npm audit clean
+- Next: S-034 (desktop follow-ups), or the job pool
+
 ## 2026-11-24 22:20 CT — manual (Chat C) — T-050a Hosts for the admin and the public sites
 - Result: done (T-050 split into T-050a to T-050c)
 - What changed: server rule 12, `/api` on the admin's host only; `OCULUS_ADMIN_ORIGIN` required in production; `OCULUS_PUBLIC_SITES` and the public reader pool (`OCULUS_PUBLIC_DATABASE_URL`, `publicDb`) checked at startup. New `packages/api/src/public-sites.ts`.
