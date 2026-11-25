@@ -6,9 +6,17 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Result: done
 - What changed: `fileReply` (packages/api/src/file-replies.ts) is the only way a handler sends a file's bytes: plain images, audio and video may be shown as their bare type, everything else (HTML, SVG, XML, scripts, PDF, unknown) downloads as `application/octet-stream`; every file reply has nosniff, a sandboxing CSP, same-origin CORP and nothing the handler set; safe RFC 6266/8187 names; streams opened only when sent, outside the handler timeout, within a 2-hour deadline, closed on errors, wrong lengths, hang-ups and shutdown; HEAD opens nothing. HTTP attack tests and a Chromium test that a page on another origin can't run an HTML, SVG or XHTML file's script.
 - Decisions: D-089
-- Review: three independent rounds plus a short fourth look. Fixed: a storage error or an object-mode stream could crash the server, downloads were cut at 30 s, sources leaked on abort, wrong lengths and failed handlers, HEAD read whole files, a missing file dropped the connection, failures were logged as hang-ups, shutdown could be held, name details. Left as S-033 (download limits per client).
+- Review: three independent rounds plus a short fourth look. Fixed: a storage error or an object-mode stream could crash the server, downloads were cut at 30 s, sources leaked on abort, wrong lengths and failed handlers, HEAD read whole files, a missing file dropped the connection, failures were logged as hang-ups, shutdown could be held, name details. Left as S-035 (download limits per client).
 - Gate: PASS · tests_passing 4320 (was 4292) · npm audit clean
 - Next: the next job in the work board's pool (S-026).
+
+## 2026-11-24 22:40 CT — manual (Chat D) — T-056 Desktop launcher
+- Result: done
+- What changed: `npm run desktop` and `scripts/start-oculus.cmd` run the admin on 127.0.0.1 in an Edge or Chrome app window with its own profile, stopping when the window closes; settings, a 0600 secret key and a single-instance lock in the per-user settings folder; `extraRoutes` on `buildAdminServer`; docs/DESKTOP.md (Windows guide). John chose to stay inside D-002 (no Electron, no bundled PostgreSQL). Smoke-tested with a real Chrome under Xvfb: sign-in screen in the window, server stopped on close.
+- Decisions: D-088
+- Review: three independent rounds. Fixed: server left running after a failure after listen; stale and reused-PID locks (now an HMAC challenge to the running server, whole-file lock, rename takeover, busy is not stale); a new key over sealed two-step secrets or a wrong key (refused, revoked set-ups ignored); weak Origin test; SIGHUP/SIGBREAK; npm ci after updates; Windows setup step (`exec` in npm scripts). Left as S-034.
+- Gate: PASS · tests_passing 4344 (was 4292) · npm audit clean
+- Next: T-057 (desktop database helper, Chat D)
 
 ## 2026-11-24 21:10 CT — manual (Chat A) — T-040 Sending password reset email
 - Result: done
