@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 02:35 CT — manual (Chat C) — T-050c OAI-PMH, and S-038 Cached public Subjects counts
+- Result: done (both)
+- What changed: T-050c: `packages/api/src/oai-pmh.ts` (`GET /oai` on public hosts, the six verbs, oai_dc only), `packages/db/src/oai.ts` (lists and datestamps on the staff connection), `oaiPmhReply` in file-replies.ts (the only way `text/xml` goes out), `ReadSlots` shared by the public routes, an `oai` rate bucket. S-038: `packages/api/src/public-subjects.ts` (background counts, `GET /subjects`), `GET /api/sites/:id/public-subjects`, `publicTermCountsForStaff`, a `terms` option and `publicOutputMarker` (public-terms.ts), `onClose` on `buildServer`, `countsDb` on `buildAdminServer`.
+- Decisions: D-105, D-106
+- Review: two independent rounds each. T-050c: paging that could repeat forever and a token that could carry a held-back record's ID (both fixed; tokens sealed), then smaller points. S-038: nothing blocking; stale counts, a public asOf showing staff activity, marker gaps, slow stop, recount pressure, the marker's time limit and the refusal back-off fixed.
+- Gate: TBD
+- Next: S-041 (stored OAI-PMH datestamps) is filed.
+
 ## 2026-11-25 03:30 CT — manual (Chat D) — T-034e, T-064, T-065, S-032, S-029
 - Result: done (merged together)
 - What changed: **T-034e** each organization's time zone (migration 0029) and its own calendar day in the publish check and public output, through `organization_local_day`; `GET`/`PUT /api/organization/time-zone`. **T-064** (John, Q-10) site managers see role-less members by name only and grant only to people holding a role on their sites. **T-065** (John, Q-11) inviting needs a recent sign-in. **S-032** a too-large `If-Match` version is 400. **S-029** the deadlock test not reproduced in 270+ rounds under load; notes in the roadmap.
