@@ -29,11 +29,18 @@ if defined HEAD (echo %HEAD%)>"packages\api\dist\.built-from"
 :run
 set "SETTINGS=%APPDATA%\Oculus"
 if defined OCULUS_DESKTOP_HOME set "SETTINGS=%OCULUS_DESKTOP_HOME%"
-if not defined OCULUS_DATABASE_URL if not exist "%SETTINGS%\desktop.json" (
-  echo Setting up Oculus's database, the first time only...
-  node packages\api\dist\desktop-database-cli.js || goto failed
-)
-call npm run desktop
+if not defined OCULUS_DATABASE_URL if not exist "%SETTINGS%\desktop.json" goto database
+goto start
+
+:database
+echo Setting up Oculus's database...
+node packages\api\dist\desktop-database-cli.js || goto failed
+
+:start
+rem Node directly (not npm run), so its exit code arrives as it is.
+node packages\api\dist\desktop-cli.js
+rem 3: the database is made but the setup questions were never finished.
+if "%ERRORLEVEL%"=="3" goto database
 if errorlevel 1 goto failed
 exit /b 0
 

@@ -23,6 +23,7 @@ import {
   pgpassField,
   pgpassPath,
   pgpassTarget,
+  removePgpassLines,
   scramVerifier,
 } from "./desktop-database.js";
 
@@ -66,6 +67,18 @@ describe("the pieces", () => {
     if (process.platform !== "win32") expect(statSync(file).mode & 0o777).toBe(0o600);
   });
 
+  it("keeps the existing file's bytes exactly, and takes back only the lines it added", () => {
+    const file = join(folder, "pgpass");
+    const old = Buffer.from([0x68, 0x3a, 0x31, 0x3a, 0x64, 0x3a, 0x75, 0x3a, 0xe9, 0x0a]); // a Latin-1 password
+    writeFileSync(file, old, { mode: 0o644 });
+    const added = addPgpassEntries(file, [
+      { host: "h", port: "1", database: "d", user: "v", password: "p" },
+    ]);
+    if (process.platform !== "win32") expect(statSync(file).mode & 0o777).toBe(0o600);
+    removePgpassLines(file, added);
+    expect(readFileSync(file).equals(old)).toBe(true);
+  });
+
   it("finds the pgpass file where libpq looks", () => {
     expect(pgpassPath("linux", {}, "/home/a")).toBe("/home/a/.pgpass");
     expect(pgpassPath("win32", { APPDATA: "C:\\R" }, "C:\\h")).toBe(
@@ -82,6 +95,9 @@ describe("the pieces", () => {
     );
     expect(address).toBe("postgresql://oculus_app@db.example:5433/oculus?sslmode=require");
     expect(pgpassTarget(address)).toEqual({ host: "db.example", port: "5433" });
+    expect(addressFor("postgresql://p@h/postgres?user=x&dbname=y&host=%2Fs", "o", "oculus")).toBe(
+      "postgresql://o@h/oculus?host=%2Fs",
+    );
     expect(pgpassTarget("postgresql://a@localhost/oculus?host=%2Ftmp%2Fs")).toEqual({
       host: "/tmp/s",
       port: "5432",
@@ -228,9 +244,97 @@ describe("npm run desktop:database, then npm run desktop", () => {
       headers: { "content-type": "application/json", origin: new URL(address).origin },
       body: JSON.stringify({ email: "root@example.org", password: ACCOUNT_PASSWORD }),
     });
-    expect(reply.status).toBeLessThan(500);
+    expect(reply.status).toBe(200);
+    expect(((await reply.json()) as { next?: string }).next).toBe("set_up");
     stop();
     expect(await run).toBe(0);
+  });
+
+  it("keeps the database when a setup answer goes wrong, and finishes the questions on the next run", async () => {
+    const n = names("resume");
+    writeFileSync(join(folder, "desktop.json"), '{"port":4999}');
+    const first = answers([ADMIN_PASSWORD, ACCOUNT_PASSWORD, "a different password"]);
+    const lines: string[] = [];
+    const code = await runDesktopDatabase({
+      env: env(),
+      ask: first.ask,
+      out: (l) => lines.push(l),
+      err: (l) => lines.push(`ERR ${l}`),
+      names: n,
+    });
+    expect(code).toBe(1);
+    expect(lines.join("\n")).toContain("Run this again");
+    const settings = JSON.parse(readFileSync(join(folder, "desktop.json"), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    expect(settings.port).toBe(4999);
+
+    // The launcher sees the unfinished setup and says so with exit code 3.
+    process.env.PGPASSFILE = join(folder, "pgpass");
+    const launcher: string[] = [];
+    const three = await runDesktop({
+      env: { OCULUS_DESKTOP_HOME: folder },
+      out: (l) => launcher.push(l),
+      err: (l) => launcher.push(l),
+      findBrowser: () => undefined,
+      openDefault: () => undefined,
+      stopRequested: () => new Promise(() => undefined),
+    });
+    expect(three).toBe(3);
+    expect(launcher.join("\n")).toContain("desktop:database");
+
+    const second = answers([ACCOUNT_PASSWORD, ACCOUNT_PASSWORD]);
+    const again = await runDesktopDatabase({
+      env: env(),
+      ask: second.ask,
+      out: () => undefined,
+      err: () => undefined,
+      names: n,
+    });
+    expect(again).toBe(0);
+    expect(second.asked.some((q) => q.includes("postgres"))).toBe(false);
+    // A third run has nothing to do.
+    const third = answers([]);
+    expect(
+      await runDesktopDatabase({
+        env: env(),
+        ask: third.ask,
+        out: () => undefined,
+        err: () => undefined,
+        names: n,
+      }),
+    ).toBe(0);
+    expect(third.asked).toEqual([]);
+  });
+
+  it("removes what it made, pgpass lines included, when making the database fails", async () => {
+    // An upper-case writer name is refused by grantWriterRole after both roles and the database exist.
+    const n = { database: "t057_undo", owner: "t057_undo_owner", writer: "T057_Undo_App" };
+    writeFileSync(join(folder, "pgpass"), "keep:me:please:x:y\n", { mode: 0o600 });
+    const lines: string[] = [];
+    const code = await runDesktopDatabase({
+      env: env(),
+      ask: answers([ADMIN_PASSWORD]).ask,
+      out: (l) => lines.push(l),
+      err: (l) => lines.push(`ERR ${l}`),
+      names: n,
+    });
+    expect(code).toBe(1);
+    expect(lines.join("\n")).toContain("removed");
+    expect(existsSync(join(folder, "desktop.json"))).toBe(false);
+    expect(readFileSync(join(folder, "pgpass"), "utf8")).toBe("keep:me:please:x:y\n");
+    const adminUrl = new URL(server.url);
+    adminUrl.password = encodeURIComponent(ADMIN_PASSWORD);
+    const admin = openDatabase(adminUrl.href, { max: 1 });
+    try {
+      const left = await admin.rows(sql`
+        SELECT 1 FROM pg_database WHERE datname = ${n.database}
+        UNION ALL SELECT 1 FROM pg_roles WHERE rolname IN (${n.owner}, ${n.writer})`);
+      expect(left).toEqual([]);
+    } finally {
+      await admin.close();
+    }
   });
 
   it("changes nothing when the postgres password is wrong", async () => {

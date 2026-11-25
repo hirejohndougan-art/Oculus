@@ -27,6 +27,7 @@ import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
 import {
   createDatabase,
+  databaseBeforeSetup,
   dropDatabase,
   grantWriterRole,
   migrate,
@@ -48,6 +49,7 @@ import {
 import {
   addPgpassEntries,
   addressFor,
+  removePgpassLines,
   DESKTOP_DATABASE,
   DESKTOP_OWNER_ROLE,
   DESKTOP_WRITER_ROLE,
@@ -140,8 +142,12 @@ export async function runDesktopDatabase(options: DesktopDatabaseOptions): Promi
     folder = settingsFolder(platform, env, home);
     ensureSettingsFolder(folder);
     const settings = readDesktopSettings(folder);
-    if (settings.databaseUrl !== undefined || settings.ownerDatabaseUrl !== undefined) {
-      err(`Oculus's database is already set up (${folder}). Nothing was changed.`);
+    if (settings.ownerDatabaseUrl !== undefined) {
+      // Made by an earlier run: finish its setup questions if they weren't.
+      return await resume(settings.ownerDatabaseUrl, env, ask, out, err, options.finished);
+    }
+    if (settings.databaseUrl !== undefined) {
+      err(`${folder} already names a database for Oculus. Nothing was changed.`);
       return 1;
     }
   } catch (error) {
@@ -187,6 +193,8 @@ export async function runDesktopDatabase(options: DesktopDatabaseOptions): Promi
   const ownerAddress = addressFor(adminBase, names.owner, names.database);
   const writerAddress = addressFor(adminBase, names.writer, names.database);
   let made = false;
+  let added: string[] = [];
+  const pgpassFile = pgpassPath(platform, env, home);
   try {
     let version: number;
     try {
@@ -241,34 +249,110 @@ export async function runDesktopDatabase(options: DesktopDatabaseOptions): Promi
       await owner.close();
     }
 
-    const file = pgpassPath(platform, env, home);
     const target = pgpassTarget(ownerAddress);
-    addPgpassEntries(file, [
+    added = addPgpassEntries(pgpassFile, [
       { ...target, database: names.database, user: names.owner, password: ownerPassword },
       { ...target, database: names.database, user: names.writer, password: writerPassword },
     ]);
+    // Last: once desktop.json names the database, a later run resumes instead of starting over.
     writeDesktopSettings(folder, { databaseUrl: writerAddress, ownerDatabaseUrl: ownerAddress });
-    out(`Done. The new accounts' passwords are in ${file}; Oculus's settings are in ${folder}.`);
+    out(
+      `Done. The new accounts' passwords are in ${pgpassFile}; Oculus's settings are in ${folder}.`,
+    );
     made = false; // Kept from here on, whatever setup does.
   } catch (error) {
     err(
       `Setting up the database failed: ${error instanceof Error ? error.message : "unknown error"}`,
     );
-    if (made) await undo(admin, adminUrl, names, err);
+    if (made) {
+      await undo(admin, adminUrl, names, err);
+      try {
+        removePgpassLines(pgpassFile, added);
+      } catch {
+        err(
+          `Couldn't take the new lines back out of ${pgpassFile}; they name accounts that no longer exist.`,
+        );
+      }
+    }
     return 1;
   } finally {
     await admin.close();
   }
 
-  out("");
-  out("Now the first-time setup: your organization, its first site, and your own account.");
-  return runSetupCli(
-    { ...env, OCULUS_DATABASE_URL: withPassword(ownerAddress, ownerPassword) },
+  return firstSetup(
+    withPassword(ownerAddress, ownerPassword),
+    env,
     ask,
     out,
     err,
     options.finished,
   );
+}
+
+/** The first-time setup questions (T-055), as the owner. */
+async function firstSetup(
+  ownerUrl: string,
+  env: Env,
+  ask: Ask,
+  out: Line,
+  err: Line,
+  finished: (() => void) | undefined,
+): Promise<number> {
+  out("");
+  out("Now the first-time setup: your organization, its first site, and your own account.");
+  const code = await runSetupCli(
+    { ...env, OCULUS_DATABASE_URL: ownerUrl },
+    ask,
+    out,
+    err,
+    finished,
+  );
+  out("");
+  out(
+    code === 0
+      ? "All set. Start Oculus with `npm run desktop` (on Windows, double-click scripts\\start-oculus.cmd)."
+      : "The database is kept. Run this again (on Windows, double-click scripts\\start-oculus.cmd) to answer the setup questions.",
+  );
+  return code;
+}
+
+/** An earlier run made the database: finish the setup questions if they weren't answered. */
+async function resume(
+  ownerAddress: string,
+  env: Env,
+  ask: Ask,
+  out: Line,
+  err: Line,
+  finished: (() => void) | undefined,
+): Promise<number> {
+  let owner: Database;
+  try {
+    owner = openDatabase(ownerAddress, { applicationName: "oculus-desktop-database", max: 1 });
+  } catch {
+    err('"ownerDatabaseUrl" in desktop.json is not a usable postgresql:// address.');
+    return 1;
+  }
+  let state: "empty" | "set_up" | "other";
+  try {
+    state = await databaseBeforeSetup(owner);
+  } catch {
+    err(
+      "Can't reach Oculus's database. Check that PostgreSQL is running and that your pgpass file still has the oculus_owner line.",
+    );
+    return 1;
+  } finally {
+    await owner.close();
+  }
+  if (state === "set_up") {
+    out("Oculus's database is already set up. Nothing to do.");
+    return 0;
+  }
+  if (state === "other") {
+    err("The database desktop.json names isn't an Oculus database. Nothing was changed.");
+    return 1;
+  }
+  out("Oculus's database is made, but the first-time setup wasn't finished.");
+  return firstSetup(ownerAddress, env, ask, out, err, finished);
 }
 
 /** Drops what this run made, so it can be run again. */

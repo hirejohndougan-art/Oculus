@@ -21,7 +21,8 @@
  * listens, the window, the server, the pool and the lock are closed.
  * Nothing printed shows the database URL's password or the secret key.
  *
- * Exit codes: 0 stopped normally, 1 refused or failed, 2 usage.
+ * Exit codes: 0 stopped normally, 1 refused or failed, 2 usage, 3 the
+ * database `npm run desktop:database` made still needs its setup questions.
  */
 import { spawn as nodeSpawn } from "node:child_process";
 import { homedir } from "node:os";
@@ -336,6 +337,13 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
       return 1;
     }
     if (state === "empty") {
+      if (ownerUrl !== undefined) {
+        // Made by `npm run desktop:database`, but its setup questions weren't finished.
+        err(
+          "Oculus's database is made, but the first-time setup wasn't finished. Run `npm run desktop:database` again to finish it (on Windows, start-oculus.cmd does this by itself).",
+        );
+        return 3;
+      }
       err(
         "This database hasn't been set up yet. Run `npm run setup` once (on Windows, `node packages\\db\\dist\\setup-cli.js`), with OCULUS_DATABASE_URL set to the same database, then start Oculus again.",
       );
@@ -375,19 +383,25 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
         out(`Updated the database (${String(result.applied.length)} change(s)).`);
       }
       if (ownerDb !== undefined) {
-        // New tables from new migrations need the writer's grants too (D-067).
         const owner = ownerDb;
         const server = db;
+        // Checked before granting, so a role that isn't a plain writer (a
+        // hand-edited desktop.json naming another account) is never given
+        // the writer's grants; then granted (new tables from new migrations
+        // need them, D-067) and checked again.
+        const refuse = (problems: readonly { code: string }[]): number => {
+          err(
+            `The app's database account has more power than Oculus allows (${problems.map((p) => p.code).join(", ")}). It must be the plain role made for Oculus (D-067).`,
+          );
+          return 1;
+        };
+        const before = await checkWriterConnection(server);
+        if (before.length > 0) return refuse(before);
         await owner.transaction(async (tx) => {
           await grantWriterRole(tx, await writerRoleName(server));
         });
-        const problems = await checkWriterConnection(server);
-        if (problems.length > 0) {
-          err(
-            `The app's database account has more power than Oculus allows (${problems.map((p) => p.code).join(", ")}). It must be a plain role made for Oculus (D-067).`,
-          );
-          return 1;
-        }
+        const after = await checkWriterConnection(server);
+        if (after.length > 0) return refuse(after);
       }
     } catch (error) {
       err(

@@ -19,14 +19,16 @@
  */
 import { createHash, createHmac, pbkdf2Sync, randomBytes } from "node:crypto";
 import {
+  chmodSync,
   closeSync,
   existsSync,
   mkdirSync,
   openSync,
   readFileSync,
+  renameSync,
+  rmSync,
   statSync,
   writeSync,
-  chmodSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Env } from "./desktop.js";
@@ -79,26 +81,59 @@ export interface PgpassEntry {
   password: string;
 }
 
-/**
- * Adds lines to the pgpass file, making it (mode 0600) if it's missing. On
- * POSIX a file others can read is tightened to 0600, since libpq ignores
- * one that isn't. Existing lines are kept: libpq uses the first match, so
- * new lines go first.
- */
-export function addPgpassEntries(file: string, entries: readonly PgpassEntry[]): void {
-  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
-  const lines = entries.map((e) =>
+/** The pgpass lines for `entries`, fields escaped. */
+export function pgpassLines(entries: readonly PgpassEntry[]): string[] {
+  return entries.map((e) =>
     [e.host, e.port, e.database, e.user, e.password].map(pgpassField).join(":"),
   );
-  const before = existsSync(file) ? readFileSync(file, "utf8") : "";
-  const text = `${lines.join("\n")}\n${before}`;
-  const fd = openSync(file, "w", 0o600);
+}
+
+/**
+ * Replaces the pgpass file's bytes safely: the existing file is made 0600
+ * first (POSIX), the new bytes go to a private temporary file that is then
+ * renamed over it, so a crash never leaves it half written, and existing
+ * lines are kept byte for byte (whatever their encoding).
+ */
+function rewritePgpass(file: string, bytes: Buffer): void {
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  if (existsSync(file) && process.platform !== "win32" && (statSync(file).mode & 0o077) !== 0) {
+    chmodSync(file, 0o600);
+  }
+  const temporary = `${file}.${randomBytes(6).toString("hex")}.tmp`;
+  const fd = openSync(temporary, "wx", 0o600);
   try {
-    writeSync(fd, text);
+    writeSync(fd, bytes);
   } finally {
     closeSync(fd);
   }
-  if (process.platform !== "win32" && (statSync(file).mode & 0o077) !== 0) chmodSync(file, 0o600);
+  try {
+    renameSync(temporary, file);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+}
+
+/**
+ * Adds lines to the pgpass file (made 0600 if missing). libpq uses the
+ * first match, so new lines go first. Returns the lines added.
+ */
+export function addPgpassEntries(file: string, entries: readonly PgpassEntry[]): string[] {
+  const lines = pgpassLines(entries);
+  const before = existsSync(file) ? readFileSync(file) : Buffer.alloc(0);
+  rewritePgpass(file, Buffer.concat([Buffer.from(`${lines.join("\n")}\n`, "utf8"), before]));
+  return lines;
+}
+
+/** Removes exactly these lines (the ones a failed run added), keeping every other byte. */
+export function removePgpassLines(file: string, lines: readonly string[]): void {
+  if (!existsSync(file) || lines.length === 0) return;
+  let bytes = readFileSync(file);
+  for (const line of lines) {
+    const needle = Buffer.from(`${line}\n`, "utf8");
+    const at = bytes.indexOf(needle);
+    if (at >= 0) bytes = Buffer.concat([bytes.subarray(0, at), bytes.subarray(at + needle.length)]);
+  }
+  rewritePgpass(file, bytes);
 }
 
 /** The host, port and query of an address, with another user and database. */
@@ -107,7 +142,8 @@ export function addressFor(adminUrl: string, user: string, database: string): st
   url.username = encodeURIComponent(user);
   url.password = "";
   url.pathname = `/${encodeURIComponent(database)}`;
-  url.searchParams.delete("password");
+  // Query keys that would override the path's user or database (as libpq reads them).
+  for (const key of ["password", "user", "dbname"]) url.searchParams.delete(key);
   return url.href;
 }
 

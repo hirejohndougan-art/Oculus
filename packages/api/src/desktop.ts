@@ -165,14 +165,24 @@ export function readDesktopSettings(folder: string): DesktopSettings {
   return settings;
 }
 
-/** Writes `desktop.json` (readable only by its owner); refuses if one exists. */
+/**
+ * Adds settings to `desktop.json` (made 0600 if missing), keeping the ones
+ * already there, through a temporary file renamed into place.
+ */
 export function writeDesktopSettings(folder: string, settings: DesktopSettings): void {
   const file = join(folder, SETTINGS_FILE);
-  const fd = openSync(file, "wx", 0o600);
+  const merged = { ...readDesktopSettings(folder), ...settings };
+  const temporary = `${file}.${randomBytes(6).toString("hex")}.tmp`;
+  const fd = openSync(temporary, "wx", 0o600);
   try {
-    writeSync(fd, `${JSON.stringify(settings, null, 2)}\n`);
+    writeSync(fd, `${JSON.stringify(merged, null, 2)}\n`);
   } finally {
     closeSync(fd);
+  }
+  try {
+    renameSync(temporary, file);
+  } finally {
+    rmSync(temporary, { force: true });
   }
 }
 
@@ -185,11 +195,10 @@ export function chooseDatabaseUrl(env: Env, settings: DesktopSettings, folder: s
     "no_database",
     [
       "Oculus doesn't know which database to use yet.",
-      "1. Install PostgreSQL 15 or newer (https://www.postgresql.org/download/) and make an empty database for Oculus.",
-      `2. Put its address in ${join(folder, SETTINGS_FILE)}, for example`,
-      '   { "databaseUrl": "postgresql://oculus@localhost:5432/oculus" }',
-      "   with the password in your pgpass file, not in that file.",
-      "3. Run `npm run setup` once (on Windows, `node packages\\db\\dist\\setup-cli.js` after `npm run build`), then `npm run desktop` again.",
+      "1. Install PostgreSQL 15 or newer (https://www.postgresql.org/download/).",
+      "2. Run `npm run desktop:database` (on Windows, double-click scripts\\start-oculus.cmd, which runs it the first time). It makes Oculus's database and asks the first-time setup questions.",
+      `   (Or name an existing database in ${join(folder, SETTINGS_FILE)} as "databaseUrl", with its password in your pgpass file.)`,
+      "3. Then `npm run desktop` again.",
     ].join("\n"),
   );
 }
