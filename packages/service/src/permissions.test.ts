@@ -8,6 +8,9 @@ import { afterAll, describe, expect, it } from "vitest";
 import {
   ROLE_PERMISSIONS,
   newOrganizationId,
+  permits,
+  type Access,
+  type RoleGrant,
   newRecordId,
   newSiteId,
   type CatalogRecord,
@@ -27,6 +30,7 @@ import {
   insertTemplateVersion,
   migrate,
   openDatabase,
+  placesHolding,
   sql,
   type Database,
   type Queryable,
@@ -790,6 +794,121 @@ describe("collection-level permissions", () => {
       "already_granted",
     ]);
   }, 60_000);
+});
+
+describe("the approval queue for reviewers who cover part of a site (T-063, Q-7)", () => {
+  it("lists exactly the records core's permits lets each person publish", async () => {
+    await ready();
+    const w = await world();
+    const root = ctxOf(w.a, folks.root);
+    const make = async (draft: unknown) => ok(await service.createRecord(root, draft)).record;
+    // Beyond the world's F1 > S1 > X1 (+AX) and F2 > S2 and O: a scan of
+    // the scan, a scan of the object, and a series of F1 homed on site A2.
+    const ax2 = await make(assetDraft(w.ax.id, "An invented scan of a scan"));
+    const ao = await make(assetDraft(w.o.id, "An invented scan of the object"));
+    const s3 = ok(
+      await service.createRecord(
+        ctxOf(w.a, folks.root, w.a2),
+        unitDraft("series", "Invented Series Three", w.f1.id),
+      ),
+    ).record;
+    const all = [w.f1, w.s1, w.x1, w.ax, ax2, w.f2, w.s2, w.o, ao, s3];
+    for (const r of all) {
+      ok(await service.submitForReview(root, r.id, { expectedVersion: 1 }));
+    }
+    const people: [string, { role: string; scope?: RecordId | null; siteId?: SiteId | null }[]][] =
+      [
+        ["series", [{ role: "reviewer", scope: w.s1.id }]],
+        ["fonds-any-site", [{ role: "reviewer", scope: w.f1.id, siteId: null }]],
+        ["fonds-a1", [{ role: "reviewer", scope: w.f1.id }]],
+        ["series3-a2", [{ role: "reviewer", scope: s3.id, siteId: w.a2 }]],
+        [
+          "two",
+          [
+            { role: "reviewer", scope: w.s2.id },
+            { role: "reviewer", scope: w.x1.id },
+          ],
+        ],
+        [
+          "whole-a2-and-f2",
+          [
+            { role: "reviewer", siteId: w.a2 },
+            { role: "reviewer", scope: w.f2.id },
+          ],
+        ],
+        ["scoped-and-cataloger", [{ role: "reviewer", scope: w.x1.id }, { role: "cataloger" }]],
+      ];
+    const places = await placesHolding(
+      s.owner,
+      w.a,
+      all.map((r) => r.id),
+      { units: true, lock: false },
+    );
+    for (const [name, grants] of people) {
+      const userId = await personWith(w, name, grants);
+      const access: Access = {
+        organizationId: w.a,
+        systemManager: false,
+        grants: grants.map((g) => ({
+          role: g.role as RoleGrant["role"],
+          siteId: g.siteId === undefined ? w.a1 : g.siteId,
+          scope: g.scope ?? null,
+        })),
+      };
+      const expected = all
+        .filter((r) => {
+          const held = places.get(r.id);
+          if (held === undefined) return false;
+          return permits(access, "records.publish", {
+            on: "units",
+            units: held.units ?? new Set(),
+            site: held.place.siteId,
+          });
+        })
+        .map((r) => r.id)
+        .sort();
+      const queue = ok(await service.reviewQueue(ctxOf(w.a, userId), { limit: 100 }));
+      expect([name, queue.records.map((r) => r.id)]).toEqual([name, expected]);
+      // One a page reaches the same records, in the same order.
+      const paged: string[] = [];
+      let after: string | undefined;
+      for (let i = 0; i < 20; i += 1) {
+        const page = ok(
+          await service.reviewQueue(ctxOf(w.a, userId), {
+            limit: 1,
+            ...(after === undefined ? {} : { after }),
+          }),
+        );
+        paged.push(...page.records.map((r) => r.id));
+        after = page.next;
+        if (after === undefined) break;
+      }
+      expect([name, paged]).toEqual([name, expected]);
+    }
+    // What the cases cover, so a change to the world can't empty the test.
+    const seen = async (name: string) =>
+      ok(
+        await service.reviewQueue(
+          ctxOf(
+            w.a,
+            await personWith(w, `${name}-again`, people.find((p) => p[0] === name)?.[1] ?? []),
+          ),
+          { limit: 100 },
+        ),
+      ).records.map((r) => r.id);
+    expect(await seen("series")).toEqual([w.s1.id, w.x1.id, w.ax.id, ax2.id].sort());
+    expect(await seen("fonds-a1")).not.toContain(s3.id);
+    expect(await seen("fonds-any-site")).toContain(s3.id);
+    expect(await seen("series3-a2")).toEqual([s3.id]);
+    expect(await seen("fonds-any-site")).not.toContain(ao.id);
+  }, 120_000);
+
+  it("still refuses people who may publish nowhere, and a scoped cataloger", async () => {
+    await ready();
+    const w = await world();
+    const c = await personWith(w, "scoped-cataloger", [{ role: "cataloger", scope: w.f1.id }]);
+    expect(codes(await service.reviewQueue(ctxOf(w.a, c)))).toEqual(["not_permitted"]);
+  });
 });
 
 describe("organizations and sites stay apart", () => {

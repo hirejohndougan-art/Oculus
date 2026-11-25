@@ -178,6 +178,13 @@ export async function recordsInState(
   state: WorkflowState,
   options: {
     readonly sites: "all" | readonly SiteId[];
+    /**
+     * Scoped grants that also reach records (T-063): a record in `unit`'s
+     * subtree (core's rule: the unit, units filed below it, digital assets
+     * standing for one of those) whose home site is `siteId`, or any site
+     * for `null`. Never a record on no site.
+     */
+    readonly scopes?: readonly { readonly siteId: SiteId | null; readonly unit: RecordId }[];
     readonly after?: RecordId;
     readonly limit: number;
   },
@@ -203,7 +210,12 @@ export async function recordsInState(
   if (sites !== "all" && !sites.every((site) => isSiteId(site))) {
     return { ok: false, issues: [issue(["sites"], "invalid_sites", "Not a list of site IDs.")] };
   }
+  const scopes = options.scopes ?? [];
+  if (!scopes.every((g) => isRecordId(g.unit) && (g.siteId === null || isSiteId(g.siteId)))) {
+    return { ok: false, issues: [issue(["scopes"], "invalid_scopes", "Not a list of scopes.")] };
+  }
   const all = sites === "all";
+  const scoped = !all && scopes.length > 0;
   const rows = await db.rows<{
     id: RecordId;
     kind: string;
@@ -212,12 +224,41 @@ export async function recordsInState(
     version: number;
     updated_at: string;
   }>(sql`
+    WITH RECURSIVE scope(unit, site) AS (
+      SELECT * FROM unnest(${scopes.map((g) => g.unit)}::uuid[],
+                           ${scopes.map((g) => g.siteId)}::uuid[])
+    ),
+    -- Every record in each scope's subtree, as core's coveredBy reads it
+    -- from below (permissions.ts unitsFrom, mirrored): the unit, units filed
+    -- under it at most 70 levels down, and digital assets standing for one
+    -- of those through at most 8 assets in between (70 and 8 are
+    -- unitsHolding's walk limits). With the scope's site.
+    covered(id, kind, site, dist, hops) AS (
+      SELECT r.id, r.kind, scope.site, 0, 0
+      FROM scope JOIN public.records r
+        ON r.organization_id = ${organizationId}::uuid AND r.id = scope.unit
+      WHERE ${scoped}::boolean AND r.kind = 'archival_unit'
+      UNION
+      SELECT r.id, r.kind, c.site,
+             CASE WHEN r.kind = 'archival_unit' THEN c.dist + 1 ELSE c.dist END,
+             CASE WHEN r.kind = 'archival_unit' THEN 0 ELSE c.hops + 1 END
+      FROM covered c JOIN public.records r ON r.organization_id = ${organizationId}::uuid
+      WHERE (c.kind = 'archival_unit' AND r.kind = 'archival_unit' AND r.parent_id = c.id
+             AND c.dist < 70)
+         OR (r.kind = 'digital_asset' AND r.represents_id = c.id
+             AND ((c.kind = 'archival_unit' AND c.dist < 70)
+                  OR (c.kind = 'digital_asset' AND c.hops < 9)))
+    )
     SELECT id::text AS id, kind, title, site_id::text AS site_id, version,
            to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS updated_at
-    FROM public.records
+    FROM public.records rec
     WHERE organization_id = ${organizationId}::uuid
       AND workflow_state = ${state}
-      AND (${all}::boolean OR site_id = ANY(${all ? [] : [...sites]}::uuid[]))
+      AND (${all}::boolean
+           OR site_id = ANY(${all ? [] : [...sites]}::uuid[])
+           OR (site_id IS NOT NULL AND EXISTS (
+                 SELECT 1 FROM covered c
+                 WHERE c.id = rec.id AND (c.site IS NULL OR c.site = rec.site_id))))
       AND (${after ?? null}::uuid IS NULL OR id > ${after ?? null}::uuid)
     ORDER BY id
     LIMIT ${limit + 1}::integer`);
