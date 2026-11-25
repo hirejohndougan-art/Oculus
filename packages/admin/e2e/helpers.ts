@@ -12,6 +12,9 @@ import { decodeBase32, totpAt } from "@oculus/core";
 export interface Seed {
   readonly email: string;
   readonly editorEmail: string;
+  /** The system manager (T-048a's System settings). */
+  readonly rootEmail: string;
+  readonly organizationName: string;
   readonly password: string;
   readonly siteName: string;
   readonly recordTitle: string;
@@ -85,6 +88,8 @@ export async function signInAndSetUp(
   email: string,
   password: string,
   check = false,
+  /** For someone who chooses an organization with the code (a system manager with no membership). */
+  organization?: string,
 ): Promise<void> {
   await page.goto("/");
   await expect(page.getByRole("heading", { level: 1, name: "Sign in" })).toBeVisible();
@@ -107,6 +112,11 @@ export async function signInAndSetUp(
   await page.getByLabel("6-digit code from the app").focus();
   await page.keyboard.type(totpAt(secret, Math.floor(Date.now() / 1000)));
   await page.keyboard.press("Enter");
+  if (organization !== undefined) {
+    await page.getByRole("radio", { name: organization }).focus();
+    await page.keyboard.press("Space");
+    await page.getByRole("button", { name: "Confirm" }).press("Enter");
+  }
 
   const codes = page.getByRole("list", { name: "Recovery codes" });
   await expect(codes.getByRole("listitem")).toHaveCount(10);
