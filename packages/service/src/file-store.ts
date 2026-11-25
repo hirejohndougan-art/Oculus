@@ -226,8 +226,6 @@ export interface FileStore {
    * `emptyTrash` to delete (the sweep, M-003).
    */
   trashThumbnails(organizationId: OrganizationId, sha256: string): Promise<void>;
-  /** The contents an organization has cached thumbnails of (their hashes), for the sweep. */
-  thumbnailContents(organizationId: OrganizationId): Promise<readonly string[]>;
   /** The organizations with a folder here. */
   organizations(): Promise<readonly OrganizationId[]>;
   /** The contents stored for an organization (their hashes). */
@@ -646,25 +644,6 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       } finally {
         if (!placed) await rm(temporaryPath, { force: true });
       }
-    },
-
-    async thumbnailContents(organizationId) {
-      const base = join(organizationDir(organizationId), "thumbnails");
-      const top = await lstat(base).catch(() => undefined);
-      if (top?.isDirectory() !== true) return [];
-      const out = new Set<string>();
-      for (const size of await readdir(base, { withFileTypes: true })) {
-        if (!size.isDirectory() || !THUMBNAIL_SIZE.test(size.name)) continue;
-        for (const prefix of await readdir(join(base, size.name), { withFileTypes: true })) {
-          if (!prefix.isDirectory() || !/^[0-9a-f]{2}$/.test(prefix.name)) continue;
-          const folder = join(base, size.name, prefix.name);
-          for (const entry of await readdir(folder, { withFileTypes: true })) {
-            const sha256 = entry.name.slice(0, 64);
-            if (isSha256Hex(sha256) && sha256.startsWith(prefix.name)) out.add(sha256);
-          }
-        }
-      }
-      return [...out].sort();
     },
 
     async receive(organizationId, chunks, options = {}): Promise<ReceiveResult> {

@@ -681,23 +681,8 @@ export function fileOperations(
               unknownHere += decided.unknown.size;
               for (const sha256 of decided.deletable) {
                 await store.trash(organizationId, sha256);
-                // Its thumbnails (M-003) go with its bytes.
-                await store.trashThumbnails(organizationId, sha256);
-              }
-            }
-            // Thumbnails left without their copy (made while it was swept):
-            // the same predicate, and only the thumbnails are moved.
-            const copies = new Set(listed.hashes);
-            const orphans = (await store.thumbnailContents(organizationId)).filter(
-              (h) => !copies.has(h),
-            );
-            for (let i = 0; i < orphans.length; i += 1000) {
-              const decided = await sweepableContents(
-                tx,
-                organizationId,
-                orphans.slice(i, i + 1000),
-              );
-              for (const sha256 of decided.deletable) {
+                // Its thumbnails (M-003) go with its bytes, by the same
+                // decision and only then: never from what the folder holds.
                 await store.trashThumbnails(organizationId, sha256);
               }
             }
@@ -783,8 +768,13 @@ export function fileOperations(
       // B3 and item 1): a few at once, a few a minute, then 503 busy.
       if (makingNow >= atOnce || !takeBudget(organizationId)) return busy();
       makingNow++;
-      const remember = (what: Uint8Array | "none" | "timeout"): Promise<void> =>
-        store.writeThumbnail(organizationId, file.sha256, size, what).catch(() => undefined);
+      // Only while the copy is still there: the sweep removes a content's
+      // thumbnails when it removes its copy, and never otherwise.
+      const remember = async (what: Uint8Array | "none" | "timeout"): Promise<void> => {
+        const still = await store.readContent(organizationId, file.sha256, file.size, 0);
+        if (still === undefined) return;
+        await store.writeThumbnail(organizationId, file.sha256, size, what).catch(() => undefined);
+      };
       const made = (async (): Promise<ServiceResult<{ readonly jpeg: Uint8Array }>> => {
         const bytes = await store.readContent(
           organizationId,
