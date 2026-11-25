@@ -7,7 +7,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - What changed: S-034a: `exec.cmd` at the root and in packages/db (npm's `exec node …` scripts start under cmd.exe), `npm run desktop:password` (the ordinary reset with the console as the mailbox), launcher exit code 4 for "already starting/busy". S-034b: a `direct` tool runner for pg_dump/pg_restore where there's no `sh` (Windows; the POSIX watchdog unchanged), tools found in `%ProgramFiles%\\PostgreSQL\\<major>\\bin`, and the desktop backs up before every update that changes the database (fails closed; Ctrl+C stops it cleanly).
 - Decisions: D-099, D-102
 - Review: one independent round each. S-034a: busy also exits 4; wording. S-034b: nothing blocking; fail closed when the change list can't be read, signal handling for the pre-update backup, reasons on every failure. Filed: a rare restore hang at a chunk boundary (both runners, pre-existing) and pruning old backups (S-034 items 12, 13).
-- Gate: PASS · tests_passing TBD · npm audit clean
+- Gate: PASS · tests_passing 4591 (was 4580) · npm audit clean
 - Next: T-034e (Chat D, in review)
 
 ## 2026-11-24 22:45 CT — manual (Chat F) — T-060 Updates from an uploaded package
