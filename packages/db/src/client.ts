@@ -310,6 +310,32 @@ export function openDatabase(connectionString: string, options: DatabaseOptions 
   };
 }
 
+/** pg's own errors for a connection not had within `connectionTimeoutMillis` (pg-pool). */
+const CONNECTION_WAITS = new Set([
+  "timeout exceeded when trying to connect",
+  "Connection terminated due to connection timeout",
+]);
+
+/**
+ * Whether `error` means a time limit ran out (S-037), not that the database
+ * failed: a statement cancelled by `statement_timeout` (SQLSTATE 57014,
+ * query_canceled), or no connection within the pool's
+ * `connectionTimeoutMillis`, whether waiting for a pooled one or opening a
+ * new one. Public reads answer these `503 busy`. Every such error is also
+ * an `isDatabaseFailure`.
+ */
+export function isDatabaseTimeout(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const { code } = error as { code?: unknown };
+  if (code === "57014") return true;
+  return (
+    code === undefined &&
+    error instanceof Error &&
+    Object.getPrototypeOf(error) === Error.prototype &&
+    CONNECTION_WAITS.has(error.message)
+  );
+}
+
 /** A single dedicated connection, for the migration runner (it holds a session lock). */
 export interface Session extends Queryable {
   close(): Promise<void>;

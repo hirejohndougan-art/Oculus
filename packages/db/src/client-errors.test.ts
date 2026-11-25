@@ -9,6 +9,7 @@ import {
   createDatabase,
   dropDatabase,
   isDatabaseFailure,
+  isDatabaseTimeout,
   openDatabase,
   type Database,
 } from "./client.js";
@@ -162,5 +163,66 @@ describe("database failures and programming errors (S-016)", () => {
       connect.mockRestore();
     }
     expect(counts).toEqual([1, 1]);
+  });
+});
+
+describe("isDatabaseTimeout (S-037)", () => {
+  it("is true for a cancelled statement and pg-pool's waits, and for nothing else", () => {
+    expect(
+      isDatabaseTimeout(Object.assign(new Error("canceling statement"), { code: "57014" })),
+    ).toBe(true);
+    expect(isDatabaseTimeout(new Error("timeout exceeded when trying to connect"))).toBe(true);
+    expect(isDatabaseTimeout(new Error("Connection terminated due to connection timeout"))).toBe(
+      true,
+    );
+    // Other failures are failures, not timeouts.
+    expect(isDatabaseTimeout(Object.assign(new Error("x"), { code: "57P01" }))).toBe(false);
+    expect(isDatabaseTimeout(Object.assign(new Error("x"), { code: "08006" }))).toBe(false);
+    expect(isDatabaseTimeout(new Error("Connection terminated"))).toBe(false);
+    expect(isDatabaseTimeout(new ConnectionLostError(new Error("gone")))).toBe(false);
+    // Our own errors and look-alikes are not pg's.
+    expect(isDatabaseTimeout(new TypeError("timeout exceeded when trying to connect"))).toBe(false);
+    expect(
+      isDatabaseTimeout(
+        Object.assign(new Error("timeout exceeded when trying to connect"), { code: "X" }),
+      ),
+    ).toBe(false);
+    expect(isDatabaseTimeout({ message: "timeout exceeded when trying to connect" })).toBe(false);
+    expect(isDatabaseTimeout(null)).toBe(false);
+    expect(isDatabaseTimeout("57014")).toBe(false);
+    // Every timeout is also a database failure (S-016).
+    expect(isDatabaseFailure(Object.assign(new Error("c"), { code: "57014" }))).toBe(true);
+    expect(isDatabaseFailure(new Error("timeout exceeded when trying to connect"))).toBe(true);
+  });
+
+  it("a real pool past its connectionTimeoutMillis throws a timeout", async () => {
+    testDb ??= await freshDatabase();
+    const db = openDatabase(testDb.url, { max: 1, connectionTimeoutMillis: 100 });
+    pools.push(db);
+    let release: () => void = () => undefined;
+    let started: () => void = () => undefined;
+    const holding = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    // Holds the pool's only connection until released.
+    const held = db.transaction(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+          started();
+        }),
+    );
+    await holding;
+    try {
+      const error = await db.rows(sql`SELECT 1`).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      expect(isDatabaseTimeout(error)).toBe(true);
+    } finally {
+      release();
+      await held;
+    }
+    expect(await db.rows(sql`SELECT 1 AS one`)).toEqual([{ one: 1 }]);
   });
 });

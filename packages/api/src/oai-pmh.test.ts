@@ -547,4 +547,56 @@ describe("oaiPmhReply", () => {
       expect(() => oaiPmhReply(bad)).toThrow();
     }
   });
+
+  it("a GetRecord stalled past its time limit is 503 busy with Retry-After (S-037)", async () => {
+    const sites = await checkPublicSites(w.db, reader, [{ origin: PUBLIC, siteId: w.a1 }]);
+    const logged: unknown[] = [];
+    const limited = await buildServer({
+      env: { OCULUS_ORIGINS: PUBLIC },
+      routes: oaiPmhRoutes({
+        db: w.db,
+        publicDb: reader,
+        sites,
+        adminEmail: EMAIL,
+        rateLimits: { oai: 10_000 },
+        timeLimitMs: 200,
+        log: (r) => logged.push(r),
+      }),
+    });
+    // Something holds the records table, so a public snapshot would wait as long as it is held.
+    const owner = openDatabase(w.testDb.url, { max: 1 });
+    let release: () => void = () => undefined;
+    let locked: () => void = () => undefined;
+    const holding = new Promise<void>((resolve) => {
+      locked = resolve;
+    });
+    const held = owner.transaction(async (q) => {
+      await q.execute(sql`LOCK TABLE public.records IN ACCESS EXCLUSIVE MODE`);
+      locked();
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    });
+    const query = `verb=GetRecord&metadataPrefix=oai_dc&identifier=${PREFIX}${published}`;
+    try {
+      await holding;
+      const reply = await oai(query, "127.0.0.1", limited);
+      expect(reply.statusCode).toBe(503);
+      expect(reply.headers["retry-after"]).toBe("5");
+      expect(reply.json()).toEqual({ error: "busy" });
+      expect(logged).toEqual([{ event: "service_error", operation: "oaiPmh", name: "timeout" }]);
+    } finally {
+      release();
+      await held;
+      await owner.close();
+    }
+    try {
+      // The slots were given back and the lock is gone: the same request works.
+      const again = await oai(query, "127.0.0.1", limited);
+      expect(again.statusCode).toBe(200);
+      expect(errorCode(again.body)).toBeUndefined();
+    } finally {
+      await limited.close();
+    }
+  });
 });

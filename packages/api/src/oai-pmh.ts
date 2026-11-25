@@ -28,11 +28,14 @@
  * may make `DEFAULT_RATE_LIMITS.oai` requests a minute (429 with
  * `Retry-After`), and a request holds one of the public pool's slots for
  * its whole page, OAI-PMH at most `OAI_MAX_SLOTS` of them (503 `busy` with
- * `Retry-After` when none is free).
+ * `Retry-After` when none is free). A read past its time limit (each
+ * public read's `statement_timeout`, the public pool's wait for a
+ * connection; S-037) is the same `503 busy`.
  */
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { isRecordId } from "@oculus/core";
 import {
+  isDatabaseTimeout,
   listPublishedForOai,
   oaiDatestamp,
   oaiRepository,
@@ -77,6 +80,8 @@ export interface OaiPmhOptions {
   readonly clock?: () => number;
   /** The public pool's slots, shared with `GET /records/:id`. */
   readonly slots?: ReadSlots;
+  /** Each record read's statement time limit (S-037); `readPublicRecord`'s default when left out. */
+  readonly timeLimitMs?: number;
 }
 
 /** An address fit for `adminEmail`, or undefined: plain, short, nothing XML must escape. */
@@ -378,6 +383,7 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
     if (!isRecordId(id)) return undefined;
     const result = await readPublicRecord(options.publicDb, site.organizationId, site.siteId, id, {
       baseUrl: `${site.origin}/records/`,
+      ...(options.timeLimitMs === undefined ? {} : { timeLimitMs: options.timeLimitMs }),
     });
     return result.ok ? result.value : undefined;
   }
@@ -575,6 +581,12 @@ export function oaiPmhRoutes(options: OaiPmhOptions): OculusRoute[] {
           echoed = { verb, ...args };
           body = await answer(site, host, verb, args, baseUrl);
         } catch (thrown) {
+          if (isDatabaseTimeout(thrown)) {
+            // A time limit ran out (S-037): busy, as when no slot is free.
+            log({ event: "service_error", operation: "oaiPmh", name: "timeout" });
+            reply.status(503).header("retry-after", "5");
+            return { error: "busy" };
+          }
           if (!(thrown instanceof OaiFailure)) {
             log({
               event: "service_error",

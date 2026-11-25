@@ -840,7 +840,22 @@ export interface PublicRecordOptions {
    * through `public_dublin_core_mapping`, which the public reader may call.
    */
   readonly mappings?: readonly DublinCoreMapping[];
+  /**
+   * The `statement_timeout` (milliseconds) each of the read's statements
+   * runs under (S-037), so one slow snapshot can't hold a public reader
+   * connection as long as it takes: past it the read throws (SQLSTATE
+   * 57014, `isDatabaseTimeout`). A read is two statements that can take
+   * time (the snapshot and the mapping), so it holds its connection about
+   * twice this at most. Default `PUBLIC_READ_TIME_LIMIT_MS`; a whole number
+   * from 1 to `MAX_PUBLIC_READ_TIME_LIMIT_MS`.
+   */
+  readonly timeLimitMs?: number;
 }
+
+/** `readPublicRecord`'s default time limit per statement (S-037). */
+export const PUBLIC_READ_TIME_LIMIT_MS = 5_000;
+/** The largest time limit `readPublicRecord` takes. */
+export const MAX_PUBLIC_READ_TIME_LIMIT_MS = 60_000;
 
 /** The answer for a record that isn't published, doesn't exist or is another organization's. */
 const NOT_AVAILABLE: readonly Issue[] = Object.freeze([
@@ -944,12 +959,31 @@ export async function readPublicRecord(
   }
   const baseUrl = ownValue(options, "baseUrl");
   const mappings = ownValue(options, "mappings");
+  const givenLimit = ownValue(options, "timeLimitMs");
+  const timeLimitMs = givenLimit === undefined ? PUBLIC_READ_TIME_LIMIT_MS : givenLimit;
   if (typeof baseUrl !== "string" || (mappings !== undefined && !Array.isArray(mappings))) {
-    return refused([], "invalid_options", "Give { baseUrl, mappings? }.");
+    return refused([], "invalid_options", "Give { baseUrl, mappings?, timeLimitMs? }.");
+  }
+  if (
+    typeof timeLimitMs !== "number" ||
+    !Number.isInteger(timeLimitMs) ||
+    timeLimitMs < 1 ||
+    timeLimitMs > MAX_PUBLIC_READ_TIME_LIMIT_MS
+  ) {
+    return refused(
+      ["timeLimitMs"],
+      "invalid_options",
+      `timeLimitMs must be a whole number from 1 to ${String(MAX_PUBLIC_READ_TIME_LIMIT_MS)}.`,
+    );
   }
   return db.transaction(async (tx) => {
     // One snapshot for every read below, and nothing written.
     await tx.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`);
+    // S-037: each statement below may take at most this long (local to the
+    // transaction, so the pooled connection keeps its own setting after).
+    await tx.execute(
+      sql`SELECT pg_catalog.set_config('statement_timeout', ${String(timeLimitMs)}, true)`,
+    );
     const read = await publicRecordIn(
       tx,
       organizationId,
