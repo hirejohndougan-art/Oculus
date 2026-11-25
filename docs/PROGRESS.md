@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 21:10 CT — manual (Chat A) — T-040 Sending password reset email
+- Result: done
+- What changed: `packages/api` mail-messages, mail-outbox and mail (SMTP, STARTTLS required, development sender refused in production); reset links, set-up codes and invitations by email, wired into T-048's hooks; the second-step alert notices (migration 0021, one summary per admin per run, longer retries, alerts listed on the Person page and in the frame); the password-changed notice.
+- Decisions: D-085
+- Review: one independent round, no blocking issue; fixed alert loss under credential stuffing and short outages, TLS failure classes, close() deadline, first-send expiry, TLS option order, address-only admin summaries.
+- Gate: PASS · tests_passing 4261 (was 4208) · npm audit clean
+- Next: M-002 (finishing), M-003
+
 ## 2026-11-24 20:15 CT — Chat B — T-055 First-time setup command
 - Result: done
 - What changed: `npm run setup` migrates an empty database and makes the first system admin (two-step set-up at first sign-in), organization, site and a starter `Item` template in one transaction; refuses, before changing anything, a database that is set up or not Oculus's. `setUpFirstInstall`, `databaseBeforeSetup`, README note.
