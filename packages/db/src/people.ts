@@ -11,6 +11,7 @@
  */
 import {
   isBuiltInRole,
+  isCustomRoleKey,
   isOrganizationId,
   isRecordId,
   isSiteId,
@@ -473,7 +474,7 @@ export async function insertPeopleEvent(tx: Queryable, event: NewPeopleEvent): P
     !isOrganizationId(event.organizationId) ||
     !isUserId(event.actorId) ||
     !PEOPLE_EVENT_KINDS.includes(event.kind) ||
-    (event.role != null && !isBuiltInRole(event.role))
+    (event.role != null && !isBuiltInRole(event.role) && !isCustomRoleKey(event.role))
   ) {
     throw new TypeError("insertPeopleEvent: a malformed event.");
   }

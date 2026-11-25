@@ -545,6 +545,23 @@ export {
 } from "./storage.js";
 export type { StorageSaveOutcome, StoredDefinition, StoredStorage } from "./storage.js";
 export {
+  CUSTOM_ROLE_TABLE_PRIVILEGES,
+  deleteCustomRole,
+  holdingsOfRole,
+  insertCustomRole,
+  listCustomRoleEvents,
+  listCustomRoles,
+  readCustomRole,
+  recordCustomRoleEvent,
+  updateCustomRole,
+} from "./custom-roles.js";
+export type {
+  CustomRoleEvent,
+  RoleHolding,
+  StoredCustomRole,
+  StoredCustomRoleEvent,
+} from "./custom-roles.js";
+export {
   SYSTEM_EVENT_KINDS,
   SYSTEM_EVENT_TABLE_PRIVILEGES,
   insertSystemEvent,

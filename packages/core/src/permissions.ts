@@ -2,9 +2,12 @@
  * Roles and permissions (T-041, D-025, D-036, D-072).
  *
  * **The service checks permissions, never role names** (D-036). A role is a
- * named set of permissions from the fixed list below; only built-in roles
- * exist until custom roles (T-041a, after launch). Two levels sit above the
- * roles (D-025):
+ * named set of permissions from the fixed list below: a built-in role
+ * (`ROLE_PERMISSIONS`) or an organization's custom role (T-041a, D-120:
+ * `CustomRole`, made by system managers from `CUSTOM_ROLE_PERMISSIONS`
+ * only). A grant carries the permissions its role held when it was read
+ * (`RoleGrant.permissions`), so built-in and custom roles are checked
+ * alike. Two levels sit above the roles (D-025):
  * - **system managers** (`users.system_admin`) can do everything in every
  *   organization, and are the only ones with the system permissions
  *   (`SYSTEM_PERMISSIONS`: System settings, sites, users, plugins). No role
@@ -40,7 +43,9 @@
  * same transaction as the write (packages/db `permissions.ts`), then asks
  * here.
  */
-import type { OrganizationId, SiteId } from "./organizations.js";
+import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";
+import { isOrganizationId, type OrganizationId, type SiteId } from "./organizations.js";
+import { textProblem } from "./plain-data.js";
 import type { RecordId } from "./record-id.js";
 
 /**
@@ -173,6 +178,18 @@ export const ROLE_PERMISSIONS: Readonly<Record<BuiltInRole, readonly RolePermiss
     donor_relations: freeze<RolePermission>(["donors.view", "donors.edit"]),
   });
 
+/**
+ * What a grant allows: its own `permissions` if read with them (a custom
+ * role), else its built-in role's; nothing for a role neither names.
+ */
+export function grantPermissions(grant: {
+  readonly role: string;
+  readonly permissions?: readonly RolePermission[];
+}): readonly Permission[] {
+  if (grant.permissions !== undefined) return grant.permissions;
+  return isBuiltInRole(grant.role) ? ROLE_PERMISSIONS[grant.role] : [];
+}
+
 export function isBuiltInRole(value: unknown): value is BuiltInRole {
   return typeof value === "string" && (BUILT_IN_ROLES as readonly string[]).includes(value);
 }
@@ -203,7 +220,14 @@ function isSystemPermission(p: Permission): p is SystemPermission {
 
 /** One role held by one person in one organization. */
 export interface RoleGrant {
-  readonly role: BuiltInRole;
+  /** A built-in role, or the key of one of the organization's custom roles (T-041a). */
+  readonly role: string;
+  /**
+   * What the role allowed when the grant was read (the custom role's own
+   * list, read in the same transaction). Left out: a built-in role's
+   * `ROLE_PERMISSIONS` (an unknown role without it grants nothing).
+   */
+  readonly permissions?: readonly RolePermission[];
   /** The site, or `null` for every site of the organization. */
   readonly siteId: SiteId | null;
   /** The unit whose subtree it covers, or `null` for the whole catalog. */
@@ -261,8 +285,7 @@ export function permits(access: Access, permission: Permission, target: Permissi
   if (access.systemManager) return true;
   if (isSystemPermission(permission)) return false;
   return access.grants.some((grant) => {
-    const held = ROLE_PERMISSIONS[grant.role] as readonly Permission[] | undefined;
-    if (!held?.includes(permission)) return false;
+    if (!grantPermissions(grant).includes(permission)) return false;
     if (isSitePermission(permission)) {
       return (
         target.on === "site" &&
@@ -293,9 +316,7 @@ export function permits(access: Access, permission: Permission, target: Permissi
  */
 export function holdsAnywhere(access: Access, permission: Permission): boolean {
   if (access.systemManager) return true;
-  return access.grants.some((grant) =>
-    (ROLE_PERMISSIONS[grant.role] as readonly Permission[] | undefined)?.includes(permission),
-  );
+  return access.grants.some((grant) => grantPermissions(grant).includes(permission));
 }
 
 /**
@@ -326,4 +347,159 @@ export function worksOnSite(access: Access, site: SiteId): boolean {
  */
 export function hasScopedGrants(access: Access): boolean {
   return !access.systemManager && access.grants.some((g) => g.scope !== null);
+}
+
+// ---------------------------------------------------------------------------
+// Custom roles (T-041a, D-036, D-120)
+
+/**
+ * The permissions a custom role may hold: every catalog permission and the
+ * site's settings. Never a system permission (D-036), and not `site.people`
+ * yet: granting roles is checked by the database for site managers only
+ * (0018's guard), so a custom role that manages people waits for S-066.
+ */
+export const CUSTOM_ROLE_PERMISSIONS = Object.freeze([
+  ...CATALOG_PERMISSIONS,
+  "site.settings",
+] as const);
+export type CustomRolePermission = (typeof CUSTOM_ROLE_PERMISSIONS)[number];
+
+/** Adding one of these to a role needs a confirmation (D-036: publish, donor data). */
+export const SENSITIVE_PERMISSIONS: ReadonlySet<CustomRolePermission> = new Set([
+  "records.publish",
+  "donors.view",
+  "donors.edit",
+]);
+
+/** A custom role's key: lower case letters and underscores, as stored grants and the change log hold role names. */
+const CUSTOM_ROLE_KEY = /^[a-z][a-z_]{0,39}$/;
+export const CUSTOM_ROLE_KEY_RULE =
+  "1 to 40 lower case letters and underscores, starting with a letter, and not a built-in role's name";
+export const MAX_ROLE_LABEL = 100;
+export const MAX_ROLE_DESCRIPTION = 500;
+
+export function isCustomRoleKey(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    CUSTOM_ROLE_KEY.test(value) &&
+    !isBuiltInRole(value) &&
+    value !== "constructor" &&
+    value !== "prototype"
+  );
+}
+
+export function isCustomRolePermission(value: unknown): value is CustomRolePermission {
+  return (
+    typeof value === "string" && (CUSTOM_ROLE_PERMISSIONS as readonly string[]).includes(value)
+  );
+}
+
+/** A role a system manager made for one organization (D-036). */
+export interface CustomRole {
+  readonly organizationId: OrganizationId;
+  readonly key: string;
+  readonly label: string;
+  readonly description?: string;
+  /** At least one, each once, in `CUSTOM_ROLE_PERMISSIONS`' order. */
+  readonly permissions: readonly CustomRolePermission[];
+}
+
+/**
+ * Checks a custom role as sent: exactly these keys, a valid key, a label
+ * of one line, permissions from `CUSTOM_ROLE_PERMISSIONS` only (a system
+ * permission or `site.people` is refused by name), each once. Returns the
+ * role with its permissions in the list's order.
+ */
+export function validateCustomRole(input: unknown): Validated<CustomRole> {
+  if (!isPlainObject(input)) {
+    return { ok: false, issues: [issue([], "invalid_role", "A role is an object.")] };
+  }
+  const issues: Issue[] = [];
+  const allowed = new Set(["organizationId", "key", "label", "description", "permissions"]);
+  for (const k of Object.keys(input)) {
+    if (!allowed.has(k)) {
+      issues.push(
+        issue([k], "unknown_setting", "A role has a key, label, description and permissions."),
+      );
+    }
+  }
+  const { organizationId, key, label, description, permissions } = input;
+  if (!isOrganizationId(organizationId)) {
+    issues.push(issue(["organizationId"], "invalid_id", "A role belongs to one organization."));
+  }
+  if (!isCustomRoleKey(key)) {
+    issues.push(issue(["key"], "invalid_key", `A role's key is ${CUSTOM_ROLE_KEY_RULE}.`));
+  }
+  const line = (
+    value: unknown,
+    path: string,
+    max: number,
+    required: boolean,
+  ): string | undefined => {
+    if (value === undefined && !required) return undefined;
+    if (typeof value !== "string" || value.trim() === "" || value !== value.trim()) {
+      issues.push(
+        issue([path], "invalid_text", `The ${path} is text with no spaces at either end.`),
+      );
+      return undefined;
+    }
+    if ([...value].length > max) {
+      issues.push(issue([path], "too_long", `The ${path} is at most ${String(max)} characters.`));
+      return undefined;
+    }
+    const problem = textProblem(value);
+    if (problem !== undefined || /[\n\r\t]/.test(value)) {
+      issues.push(issue([path], "invalid_text", `The ${path} ${problem ?? "is one line"}.`));
+      return undefined;
+    }
+    return value;
+  };
+  const shownLabel = line(label, "label", MAX_ROLE_LABEL, true);
+  const shownDescription = line(description, "description", MAX_ROLE_DESCRIPTION, false);
+  const chosen: CustomRolePermission[] = [];
+  if (!Array.isArray(permissions) || permissions.length === 0) {
+    issues.push(issue(["permissions"], "no_permissions", "A role holds at least one permission."));
+  } else {
+    const seen = new Set<unknown>();
+    permissions.forEach((p: unknown, i) => {
+      if (seen.has(p)) {
+        issues.push(
+          issue(["permissions", i], "repeated_permission", "A permission is listed once."),
+        );
+      } else if (isCustomRolePermission(p)) {
+        chosen.push(p);
+      } else if (isPermission(p)) {
+        issues.push(
+          issue(
+            ["permissions", i],
+            "permission_not_allowed",
+            "A custom role can't hold this permission: system managers' powers and managing people stay with built-in roles.",
+          ),
+        );
+      } else {
+        issues.push(issue(["permissions", i], "unknown_permission", "This isn't a permission."));
+      }
+      seen.add(p);
+    });
+  }
+  if (issues.length > 0) return { ok: false, issues };
+  const ordered = CUSTOM_ROLE_PERMISSIONS.filter((p) => chosen.includes(p));
+  return {
+    ok: true,
+    value: Object.freeze({
+      organizationId: organizationId as OrganizationId,
+      key: key as string,
+      label: shownLabel as string,
+      ...(shownDescription === undefined ? {} : { description: shownDescription }),
+      permissions: Object.freeze(ordered),
+    }),
+  };
+}
+
+/** The sensitive permissions `after` holds that `before` didn't (all of them for a new role). */
+export function addedSensitive(
+  before: readonly string[] | undefined,
+  after: readonly CustomRolePermission[],
+): readonly CustomRolePermission[] {
+  return after.filter((p) => SENSITIVE_PERMISSIONS.has(p) && !(before ?? []).includes(p));
 }

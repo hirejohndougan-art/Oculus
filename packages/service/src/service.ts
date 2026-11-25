@@ -92,7 +92,7 @@ import {
   compareRecords,
   droppedIdentifiers,
   holdsAnywhere,
-  ROLE_PERMISSIONS,
+  grantPermissions,
   identifierFieldIssues,
   isFieldKey,
   isOrganizationId,
@@ -136,6 +136,7 @@ import { peopleOperations, type PeopleOperations } from "./people.js";
 import { shareOperations, type ShareOperations } from "./shares.js";
 import { accessionOperations, type AccessionOperations } from "./accessions.js";
 import { storageOperations, type StorageOperations } from "./storage.js";
+import { customRoleOperations, type CustomRoleOperations } from "./custom-roles.js";
 import {
   changeWorkflowState,
   checkWriterConnection,
@@ -502,7 +503,8 @@ export interface RecordService
     ShareOperations,
     FileOperations,
     AccessionOperations,
-    StorageOperations {
+    StorageOperations,
+    CustomRoleOperations {
   /** The record as stored, for someone who may view it (`records.view`). */
   readRecord(context: ServiceContext, recordId: RecordId): Promise<ServiceResult<ReadRecord>>;
   /**
@@ -696,8 +698,7 @@ async function wholeSites(
 ): Promise<"all" | readonly string[]> {
   if (access.systemManager) return "all";
   const holding = access.grants.filter(
-    (g) =>
-      g.scope === null && (ROLE_PERMISSIONS[g.role] as readonly Permission[]).includes(permission),
+    (g) => g.scope === null && grantPermissions(g).includes(permission),
   );
   if (holding.some((g) => g.siteId === null)) return organizationSiteIds(tx, organizationId);
   return [...new Set(holding.map((g) => g.siteId as string))];
@@ -714,7 +715,7 @@ function scopedGrants(
 ): readonly { readonly siteId: SiteId | null; readonly unit: RecordId }[] {
   if (access.systemManager) return [];
   return access.grants.flatMap((g) =>
-    g.scope !== null && (ROLE_PERMISSIONS[g.role] as readonly Permission[]).includes(permission)
+    g.scope !== null && grantPermissions(g).includes(permission)
       ? [{ siteId: g.siteId, unit: g.scope }]
       : [],
   );
@@ -3007,7 +3008,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
             access.value.grants.some(
               (g) =>
                 (g.siteId === null || g.siteId === site) &&
-                (ROLE_PERMISSIONS[g.role] as readonly Permission[]).includes(permission),
+                grantPermissions(g).includes(permission),
             );
           const kinds =
             site === null && !access.value.systemManager
@@ -3054,6 +3055,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
     ...shareOperations(db, run, outside),
     ...accessionOperations(run),
     ...storageOperations(run),
+    ...customRoleOperations(run),
     submitForReview: workflowAction("submit_for_review"),
     returnToDraft: workflowAction("return_to_draft"),
     publish: workflowAction("publish"),

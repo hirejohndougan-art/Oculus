@@ -32,6 +32,7 @@ import { STORED_FILE_TABLE_PRIVILEGES } from "./stored-files.js";
 import { FILE_SCAN_TABLE_PRIVILEGES } from "./file-scans.js";
 import { ACCESSION_TABLE_PRIVILEGES } from "./accessions.js";
 import { STORAGE_TABLE_PRIVILEGES } from "./storage.js";
+import { CUSTOM_ROLE_TABLE_PRIVILEGES } from "./custom-roles.js";
 import { sql } from "./sql.js";
 
 /**
@@ -99,6 +100,9 @@ export const WRITER_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Ob
   ...STORAGE_TABLE_PRIVILEGES,
   // The change log of people and roles (T-048, D-084): insert only.
   ...PEOPLE_TABLE_PRIVILEGES,
+  // Custom roles (T-041a, D-120): made, changed and deleted (only while
+  // nobody holds one, 0056's guard); their change log insert only.
+  ...CUSTOM_ROLE_TABLE_PRIVILEGES,
   // Two-step alert notices (D-085): one row per alert, only ever added.
   ...ALERT_NOTICE_TABLE_PRIVILEGES,
   // Shares between sites (T-041b, D-094): offered, then moved along their

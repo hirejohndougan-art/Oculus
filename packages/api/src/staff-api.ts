@@ -556,7 +556,9 @@ export function refused(
         (i.code === "unknown_site" && onPath(i, "siteId")) ||
         // A share offered to a site that doesn't exist (or to its own home
         // site): the same 404 as any other unknown site (S-050).
-        (i.code === "unknown_site" && onPath(i, "targetSiteId")),
+        (i.code === "unknown_site" && onPath(i, "targetSiteId")) ||
+        // A custom role that isn't the organization's (T-041a).
+        (i.code === "unknown_role" && onPath(i, "key")),
     )
   ) {
     throw new Refusal(404, "not_found");
@@ -589,7 +591,10 @@ export function refused(
   if (
     codes.has("needs_confirmation") ||
     codes.has("publishes_records") ||
-    codes.has("drops_published_records")
+    codes.has("drops_published_records") ||
+    // A custom role people hold (T-041a): who first, then their number.
+    codes.has("affects_people") ||
+    codes.has("role_in_use")
   ) {
     reply.status(409);
     return { error: "confirmation_required", issues };
@@ -1393,6 +1398,90 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
           reply.header("etag", `"t-${value.tag}"`);
           return value;
         });
+      }),
+    },
+    // Custom roles (T-041a, D-036, D-120): system managers only (the
+    // service refuses everyone else), with a recent sign-in for changes.
+    {
+      method: "GET",
+      path: "/api/custom-roles",
+      handler: signedIn("read", false, async (_request, reply, { context }) => {
+        const result = await service.listCustomRoles(context);
+        return answer(result, reply, (views) => ({
+          roles: views.map((v) => ({ ...v.role, grants: v.grants })),
+        }));
+      }),
+    },
+    {
+      method: "GET",
+      path: "/api/custom-roles/history",
+      handler: signedIn("read", false, async (_request, reply, { context }) => {
+        const result = await service.customRoleHistory(context);
+        return answer(result, reply, (events) => ({ events }));
+      }),
+    },
+    {
+      method: "GET",
+      path: "/api/custom-roles/:key/holders",
+      handler: signedIn("read", false, async (request, reply, { context }) => {
+        const result = await service.customRoleHolders(context, request.params.key ?? "");
+        return answer(result, reply, (holders) => ({ holders }));
+      }),
+    },
+    {
+      method: "PUT",
+      path: "/api/custom-roles/:key",
+      handler: signedIn("write", true, async (request, reply, { session, context }) => {
+        const precondition = newOrMatch(request, VERSION_TAG);
+        const body = objectBody(request);
+        const extra = onlyKeys(body, ["role", "confirm", "confirmHolders"], reply);
+        if (extra) return extra;
+        const role = body.role;
+        const key = request.params.key ?? "";
+        if (typeof role !== "object" || role === null || Array.isArray(role)) {
+          throw new Refusal(400, "bad_body");
+        }
+        const named = (role as Record<string, unknown>).key;
+        if (named !== undefined && named !== key) {
+          reply.status(422);
+          return {
+            error: "invalid",
+            issues: [issue(["role", "key"], "wrong_key", "The role's key is the path's.")],
+          };
+        }
+        recentSignIn(session);
+        const result = await service.saveCustomRole(
+          context,
+          { ...(role as Record<string, unknown>), key },
+          {
+            expectedVersion: precondition === "new" ? 0 : Number(precondition.tag),
+            ...(body.confirm === undefined ? {} : { confirm: body.confirm }),
+            ...(body.confirmHolders === undefined ? {} : { confirmHolders: body.confirmHolders }),
+          },
+        );
+        return answer(result, reply, (value) => {
+          if (precondition === "new") reply.status(201);
+          reply.header("etag", `"v${String(value.role.version)}"`);
+          return { role: { ...value.role, grants: value.grants } };
+        });
+      }),
+    },
+    {
+      method: "POST",
+      path: "/api/custom-roles/:key/delete",
+      handler: signedIn("write", true, async (request, reply, { session, context }) => {
+        const expectedVersion = ifMatchVersion(request);
+        const read = optionalBody(request, ["moveTo", "confirmHolders"], reply);
+        if ("error" in read) return read;
+        recentSignIn(session);
+        const result = await service.deleteCustomRole(context, request.params.key ?? "", {
+          expectedVersion,
+          ...(read.body.moveTo === undefined ? {} : { moveTo: read.body.moveTo }),
+          ...(read.body.confirmHolders === undefined
+            ? {}
+            : { confirmHolders: read.body.confirmHolders }),
+        });
+        return answer(result, reply, (value) => value);
       }),
     },
     // System settings (T-048a, D-087): sites and the sign-in rules, for

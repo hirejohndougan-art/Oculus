@@ -49,6 +49,7 @@ import {
   BUILT_IN_ROLES,
   ROLE_LABELS,
   ROLE_PERMISSIONS,
+  grantPermissions,
   isRecordId,
   isUserId,
   issue,
@@ -69,6 +70,7 @@ import {
   endUserSessions,
   insertPeopleEvent,
   isAuditCursor,
+  listCustomRoles,
   listMembers,
   memberGrants,
   membersGrants,
@@ -155,11 +157,14 @@ export interface PersonDetail {
 }
 
 export interface RoleCatalogEntry {
-  readonly role: BuiltInRole;
+  /** A built-in role, or one of the organization's custom roles (T-041a). */
+  readonly role: string;
   readonly label: string;
   readonly permissions: readonly string[];
   /** Whether the viewer may grant it somewhere. */
   readonly grantable: boolean;
+  /** One of the organization's own roles (T-041a). */
+  readonly custom?: true;
 }
 
 export interface PeopleOperations {
@@ -387,8 +392,7 @@ function wholeSitesHolding(
   all: readonly SiteId[],
 ): readonly SiteId[] {
   const holding = access.grants.filter(
-    (g) =>
-      g.scope === null && (ROLE_PERMISSIONS[g.role] as readonly Permission[]).includes(permission),
+    (g) => g.scope === null && grantPermissions(g).includes(permission),
   );
   if (holding.some((g) => g.siteId === null)) return all;
   const named = new Set<SiteId | null>(holding.map((g) => g.siteId));
@@ -565,10 +569,14 @@ export function peopleOperations(
         if (!viewer.ok) return viewer;
         const v = viewer.value;
         if (!v.system && v.sites.length === 0) return notPermitted();
+        // The organization's custom roles follow the built-in ones (T-041a,
+        // D-120): anyone who may grant roles may grant them, as they hold
+        // nothing beyond a site manager's.
+        const custom = await listCustomRoles(tx, who.organizationId);
         return {
           ok: true,
-          value: Object.freeze(
-            BUILT_IN_ROLES.map((role) =>
+          value: Object.freeze([
+            ...BUILT_IN_ROLES.map((role) =>
               Object.freeze({
                 role,
                 label: ROLE_LABELS[role],
@@ -576,7 +584,16 @@ export function peopleOperations(
                 grantable: v.system || role !== "site_manager",
               }),
             ),
-          ),
+            ...custom.map((c) =>
+              Object.freeze({
+                role: c.key,
+                label: c.label,
+                permissions: Object.freeze([...c.permissions]),
+                grantable: true,
+                custom: true as const,
+              }),
+            ),
+          ]),
         };
       });
     },

@@ -32,6 +32,7 @@
 import {
   BUILT_IN_ROLES,
   isBuiltInRole,
+  isCustomRoleKey,
   isOrganizationId,
   isRecordId,
   isSiteId,
@@ -61,6 +62,7 @@ import {
   lockRecord,
   memberGrants,
   readRecordPlace,
+  readCustomRole,
   readRoleAssignment,
   readSite,
   readOrganizationTimeZone,
@@ -92,7 +94,8 @@ export type Runner = <T>(
 export interface RoleRequest {
   /** A member of the session's organization. */
   readonly userId: string;
-  readonly role: BuiltInRole;
+  /** A built-in role, or one of the organization's custom roles (T-041a). */
+  readonly role: string;
   /** One site of the organization, or `null` for every site (system managers only). */
   readonly siteId: string | null;
   /** An archival unit whose subtree it covers, or `null` for the whole catalog. */
@@ -205,7 +208,7 @@ export function managedSites(access: Access): "all" | ReadonlySet<SiteId> {
 }
 
 /** Whether `access` may grant or revoke this kind of assignment. */
-export function mayManage(access: Access, role: BuiltInRole, siteId: SiteId | null): boolean {
+export function mayManage(access: Access, role: string, siteId: SiteId | null): boolean {
   if (access.systemManager) return true;
   // Site managers and roles on every site are system managers' (D-025).
   if (role === "site_manager" || siteId === null) return false;
@@ -284,8 +287,15 @@ export async function grantRoleIn(
   if (!isUserId(userId)) {
     return refusal(["userId"], "invalid_id", "A person's ID is a lowercase version 4 UUID.");
   }
-  if (!isBuiltInRole(role)) {
-    return refusal(["role"], "unknown_role", `A role is one of ${BUILT_IN_ROLES.join(", ")}.`);
+  // A built-in role, or one of the organization's custom roles (T-041a,
+  // D-120): looked up below, once the actor is known, so nobody learns
+  // another organization's role names (each organization's are its own).
+  if (!isBuiltInRole(role) && !isCustomRoleKey(role)) {
+    return refusal(
+      ["role"],
+      "unknown_role",
+      `A role is one of ${BUILT_IN_ROLES.join(", ")}, or one of the organization's own.`,
+    );
   }
   if (siteId !== null && !isSiteId(siteId)) {
     return refusal(["siteId"], "invalid_id", "A site ID is a lowercase version 4 UUID.");
@@ -298,6 +308,13 @@ export async function grantRoleIn(
   const first = await readAccess(tx, org, who.actor, { lock: false });
   if (!first.ok) return first;
   if (!mayManage(first.value, role, siteId)) return notPermitted();
+  if (!isBuiltInRole(role) && (await readCustomRole(tx, org, role)) === undefined) {
+    return refusal(
+      ["role"],
+      "unknown_role",
+      `A role is one of ${BUILT_IN_ROLES.join(", ")}, or one of the organization's own.`,
+    );
+  }
   if (role === "site_manager" && scope !== null) {
     return refusal(
       ["scope"],

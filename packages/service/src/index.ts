@@ -144,3 +144,10 @@ export type {
   SavedAccession,
 } from "./accessions.js";
 export type { RecordStorage, StorageOperations, StorageView } from "./storage.js";
+export { MAX_ROLE_HOLDINGS } from "./custom-roles.js";
+export type {
+  CustomRoleOperations,
+  CustomRoleView,
+  DeletedCustomRole,
+  SavedCustomRole,
+} from "./custom-roles.js";

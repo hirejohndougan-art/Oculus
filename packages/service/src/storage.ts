@@ -23,7 +23,7 @@
  */
 import {
   DEFAULT_STORAGE_LEVELS,
-  ROLE_PERMISSIONS,
+  grantPermissions,
   createStorageMove,
   holdsForWholeCatalog,
   indexLocations,
@@ -134,12 +134,7 @@ function wholeRefusal(issues: readonly { code: string; message: string }[]): Ref
 /** A whole-catalog grant, on any site, of a role holding `permission` (or a system manager). */
 function holdsSomewhere(access: Access, permission: RolePermission): boolean {
   if (access.systemManager) return true;
-  return access.grants.some(
-    (g) =>
-      g.scope === null &&
-      ((ROLE_PERMISSIONS[g.role] as readonly RolePermission[] | undefined)?.includes(permission) ??
-        false),
-  );
+  return access.grants.some((g) => g.scope === null && grantPermissions(g).includes(permission));
 }
 
 function expectedOf(value: unknown): number | undefined {

@@ -28,7 +28,9 @@
  */
 import {
   DEFAULT_SYSTEM_SETTINGS,
+  CUSTOM_ROLE_PERMISSIONS,
   isBuiltInRole,
+  isCustomRoleKey,
   isOrganizationId,
   isRecordId,
   isSiteId,
@@ -98,24 +100,42 @@ export async function loadAccess(
           WHERE id = ${userId}::uuid
           FOR SHARE`);
   if (!user?.active) return undefined;
-  const rows = await db.rows<{ role: string; site_id: string | null; scope: string | null }>(sql`
-    SELECT a.role, a.site_id::text AS site_id, a.scope_record_id::text AS scope
+  // A custom role's permissions are read with its grant (T-041a, D-120): a
+  // change to the role locks its holders' rows first, so this read and that
+  // change don't overlap.
+  const rows = await db.rows<{
+    role: string;
+    site_id: string | null;
+    scope: string | null;
+    custom: string[] | null;
+  }>(sql`
+    SELECT a.role, a.site_id::text AS site_id, a.scope_record_id::text AS scope,
+           c.permissions AS custom
     FROM public.role_assignments a
     JOIN public.organization_members m
       ON m.organization_id = a.organization_id AND m.user_id = a.user_id
+    LEFT JOIN public.custom_roles c
+      ON c.organization_id = a.organization_id AND c.key = a.role
     WHERE a.organization_id = ${organizationId}::uuid AND a.user_id = ${userId}::uuid
     ORDER BY a.id`);
   const grants: RoleGrant[] = [];
   for (const row of rows) {
-    // A row the rules don't know (a role added by hand) grants nothing.
-    if (!isBuiltInRole(row.role)) continue;
     if (row.site_id !== null && !isSiteId(row.site_id)) continue;
     if (row.scope !== null && !isRecordId(row.scope)) continue;
+    if (isBuiltInRole(row.role)) {
+      grants.push(Object.freeze({ role: row.role, siteId: row.site_id, scope: row.scope }));
+      continue;
+    }
+    // A custom role's own permissions, and only those a custom role may
+    // hold; a row the rules don't know (a role added by hand) grants nothing.
+    if (!isCustomRoleKey(row.role) || row.custom === null) continue;
+    const permissions = CUSTOM_ROLE_PERMISSIONS.filter((p) => row.custom?.includes(p));
     grants.push(
       Object.freeze({
         role: row.role,
         siteId: row.site_id,
         scope: row.scope,
+        permissions: Object.freeze(permissions),
       }),
     );
   }
@@ -517,7 +537,8 @@ export interface NewRoleAssignment {
   readonly id: string;
   readonly organizationId: OrganizationId;
   readonly userId: UserId;
-  readonly role: BuiltInRole;
+  /** A built-in role or one of the organization's custom roles (T-041a). */
+  readonly role: string;
   readonly siteId: SiteId | null;
   readonly scope: RecordId | null;
   readonly grantedBy: UserId;
@@ -563,7 +584,7 @@ interface AssignmentRow {
 }
 
 function assignmentFromRow(r: AssignmentRow): RoleAssignment | undefined {
-  if (!isBuiltInRole(r.role)) return undefined;
+  if (!isBuiltInRole(r.role) && !isCustomRoleKey(r.role)) return undefined;
   return Object.freeze({
     id: r.id,
     organizationId: r.organization_id as OrganizationId,

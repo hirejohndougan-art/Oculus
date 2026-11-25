@@ -37,7 +37,7 @@ import {
   newAccessionId,
   validateAccession,
   validateDonorContact,
-  ROLE_PERMISSIONS,
+  grantPermissions,
   type Access,
   type Accession,
   type DonorContact,
@@ -156,12 +156,7 @@ const CONTACT_KEYS = ["email", "phone", "address", "note"];
  */
 function holdsDonorPermission(access: Access, permission: RolePermission): boolean {
   if (access.systemManager) return true;
-  return access.grants.some(
-    (g) =>
-      g.scope === null &&
-      ((ROLE_PERMISSIONS[g.role] as readonly RolePermission[] | undefined)?.includes(permission) ??
-        false),
-  );
+  return access.grants.some((g) => g.scope === null && grantPermissions(g).includes(permission));
 }
 
 function view(row: StoredAccession, accession: Accession): AccessionView {
