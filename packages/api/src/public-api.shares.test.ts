@@ -13,7 +13,9 @@ import { newSiteId, type OrganizationId, type SiteId } from "@oculus/core";
 import {
   checkPublicReaderConnection,
   grantPublicReaderRole,
+  insertTemplateVersion,
   openDatabase,
+  readPublicRecord,
   readSharedPublicRecord,
   sql,
   type Database,
@@ -160,6 +162,18 @@ describe("items shared into a public site", () => {
     expect(reply.body).not.toContain(w.b);
     expect(reply.body).not.toContain(w.b1);
     expect(reply.headers["cache-control"]).toBe("no-store");
+    // Exactly what its home site's public output is, read the home site's own way.
+    const home = await readPublicRecord(reader, w.b, w.b1, item.id as never, {
+      baseUrl: `${PUBLIC}/records/`,
+    });
+    expect(home.ok).toBe(true);
+    if (home.ok) {
+      expect({ id: body.id, dublinCore: body.dublinCore, jsonLd: body.jsonLd }).toEqual({
+        id: home.value.id,
+        dublinCore: home.value.dublinCore,
+        jsonLd: home.value.jsonLd,
+      });
+    }
     // The other public host (A2) wasn't offered it.
     const elsewhere = await get("[::1]", `/records/${item.id}`);
     expect([elsewhere.statusCode, elsewhere.body]).toEqual([404, await unknownBody()]);
@@ -231,10 +245,58 @@ describe("items shared into a public site", () => {
     );
     const reply = await get("127.0.0.1", `/records/${item.id}`);
     expect(reply.body).not.toContain("sharedFrom");
+    if (reply.statusCode === 200) {
+      // Read as A1's own record now.
+      expect(Object.keys(reply.json<object>()).sort()).toEqual(["dublinCore", "id", "jsonLd"]);
+      expect(reply.json<{ id: string }>().id).toBe(`${PUBLIC}/records/${item.id}`);
+    } else {
+      expect([reply.statusCode, reply.body]).toEqual([404, await unknownBody()]);
+    }
     const direct = await readSharedPublicRecord(reader, w.a, w.a1, item.id as never, {
       baseUrlFor: () => `${PUBLIC}/records/`,
     });
     expect(direct.ok ? [] : direct.issues.map((i) => i.code)).toEqual(["not_available"]);
+  });
+
+  it("an accepted item whose home template has no stored mapping shows on neither site", async () => {
+    ok(
+      await insertTemplateVersion(w.db, {
+        key: "t-object-plain",
+        organizationId: w.b,
+        label: "Plain object",
+        appliesTo: ["object"],
+        fields: [
+          {
+            key: "rights",
+            label: "rights",
+            kind: "rights",
+            required: false,
+            repeatable: false,
+            visibility: "public",
+            inherited: false,
+          },
+        ],
+      }),
+    );
+    const made = ok(
+      await w.service.createRecord(as(w.b, w.b1), {
+        kind: "object",
+        title: "An invented unmapped shared lantern",
+        templateKey: "t-object-plain",
+        fields: { rights: { uri: "http://rightsstatements.org/vocab/InC/1.0/" } },
+      }),
+    );
+    await publishAs(w, w.b, made.record.id);
+    const share = ok(
+      await w.service.offerRecord(as(w.b, w.b1), {
+        recordId: made.record.id,
+        targetOrganizationId: w.a,
+        targetSiteId: w.a1,
+      }),
+    );
+    ok(await w.service.acceptShare(as(w.a, w.a1), share.id));
+    const reply = await get("127.0.0.1", `/records/${made.record.id}`);
+    expect([reply.statusCode, reply.body]).toEqual([404, await unknownBody()]);
   });
 
   it("answers not_available, the same for every case, from the database read itself", async () => {

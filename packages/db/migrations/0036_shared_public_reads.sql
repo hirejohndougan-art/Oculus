@@ -1,5 +1,8 @@
 -- Shared items on the public sites (T-041f, D-074, D-094, D-111). Numbered
--- 0036 (0031 to 0035 are reserved by other branches; the runner allows gaps).
+-- 0036: 0031 to 0035 are reserved by other branches. The runner allows gaps
+-- but refuses a file that sorts before one already applied (out_of_order),
+-- so a branch with a lower number that merges after this one renumbers its
+-- files above 0036, as the work board's numbering rule says.
 --
 -- An item accepted into a second site (record_shares, 0024) shows on that
 -- site's public pages exactly as its home site shows it, with its home site
@@ -9,10 +12,14 @@
 --   - a share of the record into (p_org, p_site) is accepted (offered,
 --     declined, withdrawn and removed shares show nothing);
 --   - the record is public on its own home site now (record_public_on_site,
---     0017: published, and on a site), so withdrawing it from publication,
---     or moving it onto no site, hides it at once on the second site too;
+--     0017: published, and on a site), so withdrawing it from publication
+--     hides it at once on the second site too;
 --   - the record isn't already the second site's own item (moved onto it,
---     D-094): then it is read as the site's own, or not at all.
+--     D-094): then it is read as the site's own, or not at all;
+--   - the ID is unambiguous: no record of p_site itself has it (published
+--     or not), and exactly one shared record does. Record IDs are random and made by Oculus, so
+--     two organizations holding the same one takes a restore or an import
+--     collision; then nothing is shown rather than one of them at random.
 -- Otherwise NULL, the same NULL for a record that doesn't exist, isn't
 -- shared, is another site's, and for a site that isn't p_org's.
 --
@@ -37,21 +44,29 @@ RETURNS jsonb
 LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $$
-  SELECT jsonb_build_object(
-           'organizationId', r.organization_id::text,
-           'siteId', r.site_id::text,
-           'organizationName', o.name,
-           'siteName', st.name)
-  FROM public.record_shares sh
-  JOIN public.records r
-    ON r.organization_id = sh.organization_id AND r.id = sh.record_id
-  JOIN public.organizations o ON o.id = r.organization_id
-  JOIN public.sites st ON st.organization_id = r.organization_id AND st.id = r.site_id
-  WHERE sh.target_organization_id = p_org
-    AND sh.target_site_id = p_site
-    AND sh.record_id = p_record
-    AND sh.state = 'accepted'
-    AND public.record_public_on_site(r, r.site_id)
-    AND NOT (r.organization_id = p_org AND r.site_id = p_site)
-  LIMIT 1
+  WITH found AS (
+    SELECT jsonb_build_object(
+             'organizationId', r.organization_id::text,
+             'siteId', r.site_id::text,
+             'organizationName', o.name,
+             'siteName', st.name) AS home
+    FROM public.record_shares sh
+    JOIN public.records r
+      ON r.organization_id = sh.organization_id AND r.id = sh.record_id
+    JOIN public.organizations o ON o.id = r.organization_id
+    JOIN public.sites st ON st.organization_id = r.organization_id AND st.id = r.site_id
+    WHERE sh.target_organization_id = p_org
+      AND sh.target_site_id = p_site
+      AND sh.record_id = p_record
+      AND sh.state = 'accepted'
+      AND public.record_public_on_site(r, r.site_id)
+      AND NOT (r.organization_id = p_org AND r.site_id = p_site)
+  )
+  SELECT CASE
+    WHEN (SELECT count(*) FROM found) = 1
+     AND NOT EXISTS (SELECT 1 FROM public.records own
+                     WHERE own.organization_id = p_org AND own.id = p_record
+                       AND own.site_id = p_site)
+    THEN (SELECT home FROM found)
+  END
 $$;
