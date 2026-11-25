@@ -30,7 +30,7 @@
  * its whole page, OAI-PMH at most `OAI_MAX_SLOTS` of them (503 `busy` with
  * `Retry-After` when none is free). A read past its time limit (each
  * public read's `statement_timeout`, the public pool's wait for a
- * connection; S-037; the staff connection's reads, S-043a) is the same
+ * connection; S-037; the staff connection's statements, S-043a) is the same
  * `503 busy`. A list page's reading time runs on the routes' `clock`.
  */
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";

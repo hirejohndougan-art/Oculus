@@ -19,12 +19,14 @@
  * It doesn't follow changes to other records (a parent's title, a linked
  * record) or to vocabulary labels; D-105 says so.
  *
- * Every read here is bounded (S-043a): the lists wait at most 30 seconds
- * (they wait on purpose for a datestamp write in progress), and the
- * one-record reads and Identify's run under `timeLimitMs` (5 seconds by
- * default), so a slow or locked staff database can't hold an OAI-PMH slot
- * for long. A read that runs out of time throws an `isDatabaseTimeout`
- * error, which the routes answer `503 busy`.
+ * Every statement here runs under a server-side time limit (S-043a): the
+ * lists' at most 30 seconds (they wait on purpose for a datestamp write in
+ * progress), and the one-record reads' and Identify's `timeLimitMs` (5
+ * seconds by default), so a slow or locked staff database can't hold an
+ * OAI-PMH slot for long. A statement that runs out of time throws an
+ * `isDatabaseTimeout` error, which the routes answer `503 busy`. Not yet
+ * bounded (S-044): the wait for a free staff connection, and a server or
+ * network that stops answering altogether.
  */
 import { isOrganizationId, isRecordId, isSiteId } from "@oculus/core";
 import type { Database, Queryable } from "./client.js";
