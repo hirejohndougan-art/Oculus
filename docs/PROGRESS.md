@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 07:55 CT — build (BUILD MODE) — S-043a Time limits on OAI-PMH's staff reads, and the page deadline on the routes' clock
+- Result: done (S-043 split into S-043a and S-043b)
+- What changed: `oaiStoredStamp`, `oaiDatestamp` and `oaiRepository` (packages/db/src/oai.ts) take `{ timeLimitMs }` and run in a transaction with a local `statement_timeout` (5 s default; the routes pass their `timeLimitMs`), so a locked or slow staff database is `503 busy`, not a held OAI slot; a list page's deadline uses the routes' `clock`. Four tests, all failing before the change. Commits 4bdacf3, a88dddb, b766039. Source: PostgreSQL 16 docs §20.11 (statement_timeout includes lock waits).
+- Decisions: none
+- Review: one independent round: no security, data-loss or leak problems. It found that the comments claimed too much (fixed), and four gaps, filed as S-051: an unbounded wait for a staff pool connection, no client-side query timeout, the list's `lock_timeout` answering `unavailable`, and the deadline not checked before each list call.
+- Gate: PASS · tests_passing 4823 (was 4819) · npm audit clean
+- Next: the next free Phase 2 task (S-043b, S-051, S-031, S-035, U-007 or S-050)
+
 ## 2026-11-25 06:54 CT — security — S-044 Someone with only the password could push the person's known addresses out
 - Result: done (findings, all low; most serious fixed)
 - Security: `npm audit` 0 vulnerabilities. Secret scan of the whole tree and every commit since the last security run (`944e16b..00ad9e9`, 380 commits, 290 files; keys, tokens, private keys, JWTs, `.env`/key files, URL credentials, emails, phone numbers): nothing; only obvious fakes in tests (`invented`/`example` addresses and passwords, the RFC TOTP sample secret). All commit authors are `noreply@anthropic.com`. No private data about real people. Dependabot, code-scanning and secret-scanning alerts: 403 (not reachable). Code review of every commit in the range by four independent reviewers (sign-in and accounts; the public boundary; updates, desktop, setup and files; roles and the staff API): no critical, high or medium finding. **Nothing private reaches public output**: public reads, OAI-PMH, subject counts and shared items (T-041f) all go through `record_public_on_site` and `publicOutput`; the SECURITY DEFINER functions pin `search_path`; the update unpacker, signatures and downgrade checks, CSRF, sessions, TOTP, reset and recovery codes held up. Low findings: S-044 (fixed here); S-045 four wrong codes a day never raise an alert; S-046 OAI datestamps before a site's first pass show staff activity (mostly closed by S-041); S-047 OAI shows a run of held-back records; S-048 second-site staff see more of a shared item than its home public; S-049 the staff API on public hosts without an admin origin (non-production only); S-050 small hardening. All added to ROADMAP as `(risky)` at the top of Phase 2.
