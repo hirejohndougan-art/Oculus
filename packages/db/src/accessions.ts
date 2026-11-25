@@ -253,13 +253,13 @@ export async function readAccessionHolds(
   organizationId: OrganizationId,
   ids: readonly RecordId[],
   options: { readonly lock?: boolean } = {},
-): Promise<readonly AccessionHold[]> {
+): Promise<readonly AccessionHold[] | undefined> {
   if (!isOrganizationId(organizationId) || ids.length === 0) return [];
   const wanted = ids.filter((id) => isRecordId(id));
   if (options.lock === true) await lockAccessionHolds(db, organizationId, "shared");
   const [row] = await db.rows<{ holds: unknown }>(sql`
     SELECT public.accession_holds_of(${organizationId}::uuid, ${wanted}::uuid[]) AS holds`);
-  return holdsFrom(row?.holds) ?? [];
+  return holdsFrom(row?.holds);
 }
 
 /**
@@ -475,6 +475,7 @@ export async function sitesBelow(
         AND (r.parent_id = down.id OR r.represents_id = down.id)
     )
     SELECT DISTINCT r.site_id::text AS site_id FROM public.records r JOIN down ON r.id = down.id
-    WHERE r.organization_id = ${organizationId}::uuid`);
+    WHERE r.organization_id = ${organizationId}::uuid
+    LIMIT 1000`);
   return Object.freeze(rows.map((r) => r.site_id));
 }
