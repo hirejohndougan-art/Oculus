@@ -89,10 +89,14 @@ export function SharingPanel(props: {
       };
       await refreshShares(queries, site, props.recordId);
     } catch (error) {
+      // The record is on screen, so a 404 here is the site: no such site
+      // under that organization, or this record's own (S-050).
       const code =
         error instanceof ApiError && error.status === 422
           ? issuesIn(error.body)[0]?.code
-          : undefined;
+          : error instanceof ApiError && error.status === 404
+            ? "unknown_site"
+            : undefined;
       result = {
         tone: "amber",
         text:

@@ -6,7 +6,7 @@
 // rollback only when the database wasn't changed, older releases removed,
 // and the refusals: older or same versions, a server not running from the
 // updates folder, a busy folder and bad settings.
-import { readFile, readdir, readlink, rm, writeFile } from "node:fs/promises";
+import { readFile, readdir, readlink, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
@@ -104,6 +104,23 @@ describe("the first install (release command)", () => {
       { kind: "install", version: "0.1.0", from: null, by: "release-cli" },
     ]);
   });
+});
+
+describe("the updates folder (S-050)", () => {
+  it.skipIf(process.platform === "win32")(
+    "is made private, with its releases folder, when it doesn't exist yet",
+    async () => {
+      const parent = home;
+      home = join(parent, "new-home");
+      try {
+        await firstInstall("0.1.0");
+        expect((await stat(home)).mode & 0o777).toBe(0o700);
+        expect((await stat(join(home, "releases"))).mode & 0o777).toBe(0o700);
+      } finally {
+        home = parent; // afterEach removes the whole throwaway folder
+      }
+    },
+  );
 });
 
 describe("uploading", () => {

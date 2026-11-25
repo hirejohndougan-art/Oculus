@@ -552,7 +552,10 @@ export function refused(
           VERSION_PATHS.has(String(i.path[0]))) ||
         (i.code === "unknown_template" && onPath(i, "key")) ||
         (i.code === "unknown_share" && onPath(i, "shareId")) ||
-        (i.code === "unknown_site" && onPath(i, "siteId")),
+        (i.code === "unknown_site" && onPath(i, "siteId")) ||
+        // A share offered to a site that doesn't exist (or to its own home
+        // site): the same 404 as any other unknown site (S-050).
+        (i.code === "unknown_site" && onPath(i, "targetSiteId")),
     )
   ) {
     throw new Refusal(404, "not_found");

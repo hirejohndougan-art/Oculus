@@ -179,9 +179,20 @@ describe("names", () => {
     ["trailing.", "segment"],
     [" lead", "segment"],
     ["x".repeat(401), "length"],
+    ["CON", "device_name"],
+    ["dist/nul", "device_name"],
+    ["aux.js", "device_name"],
+    ["lib/COM1.txt", "device_name"],
+    ["Lpt9", "device_name"],
   ])("%j is refused (%s)", async (name, problem) => {
     expect(zipNameProblem(name)).toBe(problem);
     expect(await refusal(raw([file(name)]))).toBe("bad_name");
+  });
+
+  it("keeps names that only start like a device name", () => {
+    for (const name of ["console.js", "dist/connect.js", "auxiliary", "com10", "nullish.txt"]) {
+      expect(zipNameProblem(name)).toBeUndefined();
+    }
   });
 
   it("refuses names that collide on a case-insensitive disk", async () => {

@@ -269,6 +269,24 @@ describe("sharing over HTTP", () => {
     const r = await call("POST", `/api/records/${draft.id}/shares`, { as: "cataloger", body });
     expect(r.status).toBe(422);
     expect((r.json.issues as { code: string }[]).map((i) => i.code)).toEqual(["not_published"]);
+    // A site that doesn't exist, or the record's own home site: the ordinary
+    // 404 for an unknown site, byte for byte (S-050).
+    const item = await publishedItem("Invented nowhere lantern");
+    const nowhere = await call("POST", `/api/records/${item}/shares`, {
+      as: "cataloger",
+      body: { targetOrganizationId: w.b, targetSiteId: newRecordId() },
+    });
+    const home = await call("POST", `/api/records/${item}/shares`, {
+      as: "cataloger",
+      body: { targetOrganizationId: w.a, targetSiteId: w.a1 },
+    });
+    const noRecord = await call("POST", `/api/records/${newRecordId()}/shares`, {
+      as: "cataloger",
+      body: { targetOrganizationId: w.b, targetSiteId: w.b1 },
+    });
+    expect(nowhere.status).toBe(404);
+    expect(shape(nowhere)).toEqual(shape(home));
+    expect(shape(nowhere)).toEqual(shape(noRecord));
   });
 
   it("pages the lists by ?before and ?state, and refuses a bad page (S-036a)", async () => {

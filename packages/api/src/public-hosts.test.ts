@@ -271,9 +271,32 @@ describe("OCULUS_PUBLIC_SITES", () => {
     expect(bad(ARCHIVE)).toThrow(/<origin>=<site id>/);
     expect(bad(`${ARCHIVE}=${id.toUpperCase()}`)).toThrow(/site ID/);
   });
+
+  it("refuses public sites without an admin origin, so /api stays off public hosts (S-049)", () => {
+    for (const admin of [undefined, "", "  "]) {
+      expect(() =>
+        publicSitesFromEnv({ OCULUS_PUBLIC_SITES: `${ARCHIVE}=${id}` }, ORIGINS, admin),
+      ).toThrow(/OCULUS_ADMIN_ORIGIN is unset/);
+    }
+    // No public sites: nothing to refuse (a development admin without an origin).
+    expect(publicSitesFromEnv({}, ORIGINS, undefined)).toEqual([]);
+    expect(publicSitesFromEnv({ OCULUS_PUBLIC_SITES: " " }, ORIGINS, undefined)).toEqual([]);
+  });
 });
 
 describe("startup", () => {
+  it("outside production too, refuses public sites without the admin's origin (S-049)", async () => {
+    const site = newSiteId();
+    await expect(
+      start({
+        ...ENV,
+        NODE_ENV: "development",
+        OCULUS_ADMIN_ORIGIN: undefined,
+        OCULUS_PUBLIC_SITES: `${ARCHIVE}=${site}`,
+      }),
+    ).rejects.toThrow(/OCULUS_ADMIN_ORIGIN is unset/);
+  });
+
   it("in production, refuses to start without the admin's origin", async () => {
     await expect(start({ ...ENV, OCULUS_ADMIN_ORIGIN: undefined })).rejects.toThrow(
       /OCULUS_ADMIN_ORIGIN must name the admin's own origin/,
