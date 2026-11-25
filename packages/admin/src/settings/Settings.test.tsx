@@ -507,4 +507,23 @@ describe("templates", () => {
     expect(await screen.findByText(/There is no template with that key/)).toBeTruthy();
     expect(sent.some((s) => s.path.startsWith("/api/templates/"))).toBe(false);
   });
+
+  it("asks before leaving with unsaved changes, and stays when asked to", async () => {
+    server();
+    const user = userEvent.setup();
+    const { router } = renderAt("/settings/templates/lantern");
+    const name = await screen.findByRole("textbox", { name: /^Name/ });
+    await user.type(name, " changed");
+    await user.click(screen.getByRole("link", { name: "Back to the templates" }));
+    expect(
+      await screen.findByText("You have changes to this template that are not saved."),
+    ).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Stay on this template" }));
+    expect(router.state.location.pathname).toBe("/settings/templates/lantern");
+    await user.click(screen.getByRole("link", { name: "Back to the templates" }));
+    await user.click(await screen.findByRole("button", { name: "Leave and discard my changes" }));
+    await waitFor(() => {
+      expect(router.state.location.pathname).toBe("/settings/templates");
+    });
+  });
 });

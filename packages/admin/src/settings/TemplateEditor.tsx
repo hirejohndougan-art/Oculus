@@ -14,8 +14,8 @@
  * Template text (labels, help, keys) is shown as text by React, never as
  * HTML; a key goes into an address only once it matches core's key rule.
  */
-import { useState, type SubmitEvent } from "react";
-import { useNavigate, useOutletContext, useParams } from "react-router";
+import { useEffect, useRef, useState, type SubmitEvent } from "react";
+import { useBlocker, useNavigate, useOutletContext, useParams } from "react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CheckboxButton, CheckboxField } from "react-aria-components";
 import { ApiError, api } from "../api";
@@ -205,6 +205,23 @@ function TemplateForm(props: {
   const [edited, setEdited] = useState(false);
   const saved = props.justSaved === true && !edited;
   const key = stored?.key ?? newKey.trim();
+  const leaving = useRef(false);
+
+  // Leaving with unsaved changes: ask in the app; the browser asks on reload.
+  const blocker = useBlocker(
+    ({ currentLocation, nextLocation }) =>
+      edited && !leaving.current && currentLocation.pathname !== nextLocation.pathname,
+  );
+  useEffect(() => {
+    if (!edited) return undefined;
+    const warn = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => {
+      window.removeEventListener("beforeunload", warn);
+    };
+  }, [edited]);
 
   const save = useMutation({
     mutationFn: (confirmation: Confirmation | undefined) =>
@@ -229,6 +246,7 @@ function TemplateForm(props: {
       props.onSaved?.(reply.version);
       queries.setQueryData(["system-template", organizationId, reply.key], reply);
       if (stored === undefined) {
+        leaving.current = true;
         await navigate(`/settings/templates/${reply.key}`, { replace: true });
       }
     },
@@ -419,6 +437,21 @@ function TemplateForm(props: {
             <Note tone="green">Saved.</Note>
           </div>
         ) : null}
+        <ConfirmPanel
+          isOpen={blocker.state === "blocked"}
+          title="Leave without saving?"
+          confirmLabel="Leave and discard my changes"
+          cancelLabel="Stay on this template"
+          danger
+          onCancel={() => {
+            blocker.reset?.();
+          }}
+          onConfirm={() => {
+            blocker.proceed?.();
+          }}
+        >
+          <p>You have changes to this template that are not saved.</p>
+        </ConfirmPanel>
         <ConfirmPanel
           isOpen={asked !== undefined}
           title="Confirm these changes"
