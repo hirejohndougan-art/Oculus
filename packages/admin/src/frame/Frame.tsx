@@ -182,6 +182,18 @@ export function Frame() {
             ) : null}
           </ul>
         )}
+        {person.systemAdmin ? (
+          <div className={styles.navGroup}>
+            <span className={styles.selectorLabel}>System</span>
+            <ul className={styles.navList}>
+              <li>
+                <NavLink className={styles.navLink} to="/settings">
+                  System settings
+                </NavLink>
+              </li>
+            </ul>
+          </div>
+        ) : null}
       </nav>
       <div className={styles.body}>
         <header className={styles.topbar}>

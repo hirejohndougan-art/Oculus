@@ -10,7 +10,8 @@
  *   code, a switch of organization each make a new session token).
  * - `site` sends the working site in `X-Oculus-Site` (D-079).
  * - `ifMatch` sends `If-Match` for edits (D-079: `"v<version>"`), so an edit
- *   made on an old copy is refused with 412 instead of overwriting.
+ *   made on an old copy is refused with 412 instead of overwriting;
+ *   `ifNoneMatch` sends `If-None-Match: *` for a first version.
  * - A reply `{ "error": code, ... }` becomes an `ApiError` carrying the
  *   status, the code and the rest of the body; nothing is retried here.
  */
@@ -46,6 +47,8 @@ export interface RequestOptions {
   readonly body?: unknown;
   /** The version an edit started from: sent as `If-Match: "v<n>"`. */
   readonly ifMatch?: number;
+  /** A first change of something with no version yet: sent as `If-None-Match: *`. */
+  readonly ifNoneMatch?: boolean;
   /** The working site (D-079's `X-Oculus-Site`), for the staff API. */
   readonly site?: string;
   readonly signal?: AbortSignal;
@@ -73,6 +76,7 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
   if (options.body !== undefined) headers["content-type"] = "application/json";
   if (method !== "GET" && csrfToken !== undefined) headers["x-oculus-csrf"] = csrfToken;
   if (options.ifMatch !== undefined) headers["if-match"] = `"v${String(options.ifMatch)}"`;
+  if (options.ifNoneMatch === true) headers["if-none-match"] = "*";
   if (options.site !== undefined) headers["x-oculus-site"] = options.site;
   let response: Response;
   try {
@@ -127,6 +131,8 @@ export function problemText(error: unknown): string {
       return "Oculus is busy just now. Try again in a moment.";
     case "unauthenticated":
       return "Your sign-in has ended. Sign in again.";
+    case "reauthentication_required":
+      return "For safety, this needs a fresh sign-in. Sign out, sign in again, then try again within 10 minutes.";
     case "csrf_failed":
     case "cross_origin":
       return "This page is out of date. Reload it and try again.";
