@@ -1084,8 +1084,8 @@ interface UserRow {
  *    without access to `organizationId` (for a system admin: one that
  *    doesn't exist). The attempt stays counted.
  * 5. On success: the account counter is cleared, one is taken off the
- *    address counter, the sign-in time is stored, and an
- *    old-settings hash is replaced. `busy` if too many passwords are being checked at once
+ *    address counter, and an old-settings hash is replaced. The sign-in
+ *    time is stored only once the second step passes (`markSignedIn`, S-053). `busy` if too many passwords are being checked at once
  *    (the attempt is then not counted).
  */
 export async function signIn(db: Database, input: SignInRequest): Promise<SignInResult> {
