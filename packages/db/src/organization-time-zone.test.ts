@@ -157,7 +157,7 @@ describe("an organization's time zone", () => {
     }
   });
 
-  it("gives an unknown organization the UTC day, saying nothing about whether it exists", async () => {
+  it("gives an unknown organization the UTC day", async () => {
     const { day, now } = await dayAndNow(newOrganizationId());
     expect(day).toBe(dayIn("UTC", now));
   });
