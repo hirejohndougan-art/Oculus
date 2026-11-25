@@ -21,6 +21,7 @@ export {
   openDatabase,
   typeParsers,
   ConnectionLostError,
+  isDatabaseTimeout,
   createDatabase,
   dropDatabase,
 } from "./client.js";
@@ -93,6 +94,9 @@ export {
   changeWorkflowState,
   publishCheckIssues,
   readPublicRecord,
+  readSharedPublicRecord,
+  PUBLIC_READ_TIME_LIMIT_MS,
+  MAX_PUBLIC_READ_TIME_LIMIT_MS,
   publicValueSources,
   inheritedValues,
   recordDependents,
@@ -106,6 +110,9 @@ export {
 export type {
   InheritedValue,
   PublicRecordOptions,
+  SharedHome,
+  SharedPublicRecord,
+  SharedPublicRecordOptions,
   PublicValueSource,
   StateListEntry,
   WorkflowChangeResult,
@@ -183,6 +190,7 @@ export type { TemplateSummary } from "./definitions.js";
 export { readRecordsForChecks } from "./catalog.js";
 export {
   publishedUsingTemplate,
+  countPublishedUsingTemplate,
   readDublinCoreMapping,
   writeDublinCoreMapping,
 } from "./dublin-core-mappings.js";

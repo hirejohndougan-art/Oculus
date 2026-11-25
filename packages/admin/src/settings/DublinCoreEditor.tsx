@@ -74,6 +74,8 @@ interface MappingReply {
   readonly version: number;
   readonly mapping: unknown;
   readonly publishedRecords?: readonly string[];
+  /** How many published records it showed on (past the list's limit too, S-039). */
+  readonly publishedRecordCount?: number;
 }
 
 interface TemplateReply {
@@ -275,16 +277,21 @@ function MappingForm(props: {
         method: "PUT",
         body: {
           mapping: { entries },
-          ...(confirmation !== undefined && confirmation.publishedRecords > 0
-            ? { confirmPublished: true }
-            : {}),
+          ...(confirmation === undefined || confirmation.publishedRecords === 0
+            ? {}
+            : confirmation.counted === true
+              ? { confirmPublishedCount: confirmation.publishedRecords }
+              : { confirmPublished: true }),
         },
         ...(hasMapping ? { ifMatch: stored.version } : { ifNoneMatch: true }),
       });
     },
     onSuccess: async (reply) => {
       setAsked(undefined);
-      props.onSaved({ version: reply.version, shownOn: reply.publishedRecords?.length ?? 0 });
+      props.onSaved({
+        version: reply.version,
+        shownOn: reply.publishedRecordCount ?? reply.publishedRecords?.length ?? 0,
+      });
       // The form is made again for the new version, from this reply.
       queries.setQueryData(["dublin-core", organizationId, templateKey], {
         key: reply.key,
@@ -358,7 +365,9 @@ function MappingForm(props: {
         )}
         {noPublicFields ? (
           <p className={records.meta}>
-            This template has no public fields yet. Make a field public in the template first.
+            {hasMapping
+              ? "This template has no public fields left. Remove the mapped fields and save, or make a field public in the template again. If its records need their rights to be published, make the rights field public again: a mapping without it can't be saved."
+              : "This template has no public fields yet. Make a field public in the template first."}
           </p>
         ) : null}
         {rows.length === 0 ? (
@@ -496,13 +505,25 @@ function MappingForm(props: {
             save.reset();
           }}
         >
-          <p>
-            This change shows at once on {asked?.publishedRecords ?? 0} published{" "}
+          {/* A status, so a new number on a second ask is announced too (S-039 review). */}
+          <p role="status">
+            This change shows at once on {(asked?.publishedRecords ?? 0).toLocaleString()} published{" "}
             {asked?.publishedRecords === 1 ? "record" : "records"} using this template.
           </p>
+          {asked?.counted === true ? (
+            <p>
+              That is too many to list one by one, so check the mapping itself before you save. If
+              records are published or unpublished meanwhile, you will be asked again with the new
+              number.
+            </p>
+          ) : null}
         </ConfirmPanel>
         <div className={records.actions}>
-          <Button type="submit" variant="primary" isDisabled={save.isPending || noPublicFields}>
+          <Button
+            type="submit"
+            variant="primary"
+            isDisabled={save.isPending || (noPublicFields && !hasMapping)}
+          >
             Save mapping
           </Button>
           <TextLink href={`/settings/templates/${templateKey}`}>Back to the template</TextLink>

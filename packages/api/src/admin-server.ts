@@ -69,7 +69,7 @@ import { isProduction } from "./environment.js";
 import { mailerFromEnv, type Mailer } from "./mail.js";
 import { trustedProxyFromEnv } from "./proxy.js";
 import { OAI_ADMIN_EMAIL_ENV, oaiAdminEmail, oaiPmhRoutes } from "./oai-pmh.js";
-import { publicApiRoutes, ReadSlots } from "./public-api.js";
+import { PUBLIC_POOL_SIZE, publicApiRoutes, ReadSlots } from "./public-api.js";
 import { PublicSubjects, publicSubjectsRoutes } from "./public-subjects.js";
 import { PUBLIC_DATABASE_URL_ENV, checkPublicSites, publicSitesFromEnv } from "./public-sites.js";
 import type { OculusRoute } from "./routes.js";
@@ -316,7 +316,7 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   const publicSites =
     publicDb === undefined ? [] : await checkPublicSites(options.db, publicDb, publicHosts);
   // One count of the public pool's connections for every public route (D-100, D-105).
-  const publicSlots = new ReadSlots(4);
+  const publicSlots = new ReadSlots(PUBLIC_POOL_SIZE);
   const oaiEmail = oaiAdminEmail(env[OAI_ADMIN_EMAIL_ENV]);
 
   let admin: ServerOptions["admin"];

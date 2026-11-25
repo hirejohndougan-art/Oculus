@@ -172,6 +172,32 @@ try {
       scope: null,
     }),
   );
+  // A fifth invented member for T-062's idle sign-out test (idle.spec.ts),
+  // so its session's sign-out leaves the others' tests alone.
+  const idleEmail = "idle@example.org";
+  must(
+    await createInvitation(db, { organizationId, email: idleEmail, invitedBy: root }, (m) => {
+      box.push(m);
+      return Promise.resolve();
+    }),
+  );
+  const idler = must(
+    await acceptInvitation(db, {
+      token: box[4].token,
+      organizationId,
+      email: idleEmail,
+      displayName: "Cy Invented",
+      password: PASSWORD,
+    }),
+  ).userId;
+  must(
+    await service.grantRole(actor, {
+      userId: idler,
+      role: "cataloger",
+      siteId: site.id,
+      scope: null,
+    }),
+  );
   // An object template and one invented record on the site.
   const field = (key, label, kind, extra = {}) => ({
     key,
@@ -285,6 +311,10 @@ try {
       rootEmail: "root@example.org",
       organizationName: "Invented Historical Society",
       helperName: "Ben Invented",
+      idleEmail,
+      // T-062's idle test moves its session's times back (as the owner),
+      // the server-side half of its fake clock. A throwaway local database.
+      databaseUrl: database.url,
     }),
   );
 } catch (error) {

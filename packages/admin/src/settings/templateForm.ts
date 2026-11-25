@@ -246,6 +246,11 @@ export interface Confirmation {
   readonly messages: readonly string[];
   /** Published records the change shows values on at once (D-076), or 0. */
   readonly publishedRecords: number;
+  /**
+   * Too many to list: the server counted them, and the save is confirmed
+   * by sending that number back (`confirmPublishedCount`, S-039).
+   */
+  readonly counted?: boolean;
 }
 
 export function confirmationOf(issues: readonly Issue[]): Confirmation {
@@ -253,6 +258,7 @@ export function confirmationOf(issues: readonly Issue[]): Confirmation {
   const messages: string[] = [];
   let published = 0;
   let publishes = false;
+  let counted: number | undefined;
   for (const i of issues) {
     if (i.code === "needs_confirmation" && i.path[0] === "confirm") {
       const [, code, key] = i.path;
@@ -264,7 +270,13 @@ export function confirmationOf(issues: readonly Issue[]): Confirmation {
       publishes = true;
     } else if (i.code === "published_record_affected") {
       published += 1;
+    } else if (i.code === "published_records_counted") {
+      const n = i.path[1];
+      if (typeof n === "number" && Number.isInteger(n) && n > 0) counted = n;
     }
+  }
+  if (publishes && counted !== undefined) {
+    return { confirm, messages, publishedRecords: counted, counted: true };
   }
   return {
     confirm,

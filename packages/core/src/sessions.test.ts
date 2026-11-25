@@ -127,8 +127,9 @@ describe("CSRF tokens", () => {
 });
 
 describe("session time limits", () => {
-  it("default to 4 hours idle and 12 hours absolute (D-052), 10 minutes for the second step", () => {
-    expect(DEFAULT_SESSION_POLICY).toEqual({ idleSeconds: 14_400, absoluteSeconds: 43_200 });
+  // The idle default changed from D-052's 4 hours to John's 30 minutes (Q-8, T-062, D-098).
+  it("default to 30 minutes idle (D-098) and 12 hours absolute (D-052), 10 minutes for the second step", () => {
+    expect(DEFAULT_SESSION_POLICY).toEqual({ idleSeconds: 1_800, absoluteSeconds: 43_200 });
     expect(Object.isFrozen(DEFAULT_SESSION_POLICY)).toBe(true);
     expect(SECOND_STEP_SECONDS).toBe(600);
     expect(validateSessionPolicy({ ...DEFAULT_SESSION_POLICY })).toEqual(DEFAULT_SESSION_POLICY);

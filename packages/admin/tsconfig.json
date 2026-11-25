@@ -14,9 +14,16 @@
     "declaration": false,
     "sourceMap": false,
     "allowImportingTsExtensions": false,
-    // The end-to-end tests compute codes with core's own TOTP (from its
-    // sources when type checking; from its build when Playwright runs).
-    "paths": { "@oculus/core": ["../core/src/index.ts"] }
+    // The end-to-end tests compute codes with core's own TOTP, and files.spec
+    // runs api's own file server. Type checking and lint read the packages
+    // from their sources, so they work in a clean checkout before anything is
+    // built; Playwright runs against their builds.
+    "paths": {
+      "@oculus/core": ["../core/src/index.ts"],
+      "@oculus/db": ["../db/src/index.ts"],
+      "@oculus/service": ["../service/src/index.ts"],
+      "@oculus/api": ["../api/src/index.ts"]
+    }
   },
   "include": ["src", "e2e", "vite.config.ts", "playwright.config.ts"]
 }

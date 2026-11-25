@@ -106,20 +106,44 @@ export async function writeDublinCoreMapping(
 /**
  * The organization's published records using the template, by ID, as a
  * mapping change shows values on them at once (D-076); `undefined` past
- * `MAX_AFFECTED_PUBLISHED`. Reads IDs only.
+ * `limit` (`MAX_AFFECTED_PUBLISHED`, or lower for tests). Reads IDs only.
  */
 export async function publishedUsingTemplate(
   db: Queryable,
   organizationId: OrganizationId,
   templateKey: string,
+  limit: number = MAX_AFFECTED_PUBLISHED,
 ): Promise<readonly RecordId[] | undefined> {
   if (!isOrganizationId(organizationId) || !isTemplateKey(templateKey)) return [];
+  const most =
+    Number.isInteger(limit) && limit >= 0 && limit <= MAX_AFFECTED_PUBLISHED
+      ? limit
+      : MAX_AFFECTED_PUBLISHED;
   const rows = await db.rows<{ id: string }>(sql`
     SELECT id::text AS id FROM public.records
     WHERE organization_id = ${organizationId}::uuid AND template_key = ${templateKey}
       AND workflow_state = 'published'
     ORDER BY id
-    LIMIT ${MAX_AFFECTED_PUBLISHED + 1}::integer`);
-  if (rows.length > MAX_AFFECTED_PUBLISHED) return undefined;
+    LIMIT ${most + 1}::integer`);
+  if (rows.length > most) return undefined;
   return Object.freeze(rows.map((r) => r.id as RecordId));
+}
+
+/**
+ * How many of the organization's published records use the template
+ * (S-039): for a mapping change past `MAX_AFFECTED_PUBLISHED`, confirmed
+ * by this count instead of a list. Read under the template's lock, as
+ * `publishedUsingTemplate`.
+ */
+export async function countPublishedUsingTemplate(
+  db: Queryable,
+  organizationId: OrganizationId,
+  templateKey: string,
+): Promise<number> {
+  if (!isOrganizationId(organizationId) || !isTemplateKey(templateKey)) return 0;
+  const [row] = await db.rows<{ n: number }>(sql`
+    SELECT count(*)::integer AS n FROM public.records
+    WHERE organization_id = ${organizationId}::uuid AND template_key = ${templateKey}
+      AND workflow_state = 'published'`);
+  return row?.n ?? 0;
 }
