@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 22:45 CT — manual (Chat F) — T-060 Updates from an uploaded package
+- Result: done
+- What changed: a strict ZIP reader and writer, signed packages (Ed25519 over a manifest of every file's SHA-256), `npm run release` (keygen, pack, verify, first install), an updates folder with releases, `current`, backups and history, staff API routes under `/api/system/update` (system managers; install and rollback need a fresh entry), and the admin's Updates screen with chunked upload and progress. Tried end to end in the sandbox: a 6.5 MB, 4,003-file package of this build installed into an empty folder, migrated a fresh database and started from `current`.
+- Decisions: D-092
+- Review: one independent round. Two blocking findings fixed: migrations ran with the app's writer URL (now an owner URL given only to the backup, migrate and new grant steps, which re-grants the writer after migrating; without it, database-changing updates are refused from the admin) and the release scripts did nothing when the updates folder's path held a link (now started by real paths). Also fixed: an atomic lock file removed only by its holder, one part written at a time, the screen retrying parts when rate-limited, failed steps' output kept in `logs/`, leftovers and old backups removed, no local extra fields, the writer's entry limit, bookkeeping after the switch no longer reported as a failure.
+- Gate: PASS (full gate, end-to-end included, after the review fixes) · tests_passing 4504 (before merging main 429ba3c) · npm audit clean
+- Next: T-060a filed (the change log); T-051 notes added for SiteGround. Renumbered twice: T-056/D-088 went to the desktop launcher and T-058 to IIIF while this was built.
+
 ## 2026-11-24 21:20 CT — Chat B — M-001 Serve active file types safely
 - Result: done
 - What changed: `fileReply` (packages/api/src/file-replies.ts) is the only way a handler sends a file's bytes: plain images, audio and video may be shown as their bare type, everything else (HTML, SVG, XML, scripts, PDF, unknown) downloads as `application/octet-stream`; every file reply has nosniff, a sandboxing CSP, same-origin CORP and nothing the handler set; safe RFC 6266/8187 names; streams opened only when sent, outside the handler timeout, within a 2-hour deadline, closed on errors, wrong lengths, hang-ups and shutdown; HEAD opens nothing. HTTP attack tests and a Chromium test that a page on another origin can't run an HTML, SVG or XHTML file's script.
