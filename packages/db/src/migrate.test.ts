@@ -55,6 +55,7 @@ const ALL_TABLES = [
   "sign_in_known_sources",
   "sign_in_throttles",
   "sites",
+  "system_events",
   "system_settings",
   "template_versions",
   "templates",

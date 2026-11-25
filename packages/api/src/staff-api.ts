@@ -370,6 +370,7 @@ export function refused(
           i.path.length === 1 &&
           VERSION_PATHS.has(String(i.path[0]))) ||
         (i.code === "unknown_template" && onPath(i, "key")) ||
+        (i.code === "unknown_share" && onPath(i, "shareId")) ||
         (i.code === "unknown_site" && onPath(i, "siteId")),
     )
   ) {
@@ -1034,6 +1035,64 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
         });
       }),
     },
+
+    // Sharing items between sites (T-041d, D-094): the service decides every
+    // permission and answers another organization's share, one out of
+    // reach, and a missing one alike (`unknown_share`: 404 here).
+    {
+      method: "GET",
+      path: "/api/records/:id/shares",
+      handler: signedIn("read", false, async (request, reply, { context }) => {
+        const result = await service.sharesOfRecord(context, recordId(request));
+        return answer(result, reply, (shares) => ({ shares }));
+      }),
+    },
+    {
+      method: "POST",
+      path: "/api/records/:id/shares",
+      handler: signedIn("write", true, async (request, reply, { context }) => {
+        const body = objectBody(request);
+        const extra = onlyKeys(body, ["targetOrganizationId", "targetSiteId"], reply);
+        if (extra) return extra;
+        const result = await service.offerRecord(context, {
+          recordId: recordId(request),
+          targetOrganizationId: body.targetOrganizationId,
+          targetSiteId: body.targetSiteId,
+        });
+        return answer(result, reply, (share) => {
+          reply.status(201);
+          return { share };
+        });
+      }),
+    },
+    {
+      method: "GET",
+      path: "/api/shares/:id",
+      handler: signedIn("read", false, async (request, reply, { context }) => {
+        const result = await service.readSharedItem(context, request.params.id ?? "");
+        return answer(result, reply, (share) => ({ share }));
+      }),
+    },
+    shareMove("/api/shares/:id/accept", "acceptShare"),
+    shareMove("/api/shares/:id/decline", "declineShare"),
+    shareMove("/api/shares/:id/remove", "removeShare"),
+    shareMove("/api/shares/:id/withdraw", "withdrawShare"),
+    {
+      method: "GET",
+      path: "/api/sites/:id/share-offers",
+      handler: signedIn("read", false, async (request, reply, { context }) => {
+        const result = await service.sharesIntoSite(context, request.params.id ?? "");
+        return answer(result, reply, (shares) => ({ shares }));
+      }),
+    },
+    {
+      method: "GET",
+      path: "/api/sites/:id/shared-items",
+      handler: signedIn("read", false, async (request, reply, { context }) => {
+        const result = await service.listSharedItems(context, request.params.id ?? "");
+        return answer(result, reply, (shares) => ({ shares }));
+      }),
+    },
     {
       // T-034e (D-103): the organization's time zone and its local day.
       method: "GET",
@@ -1056,6 +1115,23 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
       }),
     },
   ];
+
+  /** One of a share's moves (D-094): no body. */
+  function shareMove(
+    path: string,
+    move: "acceptShare" | "declineShare" | "removeShare" | "withdrawShare",
+  ): OculusRoute {
+    return {
+      method: "POST",
+      path,
+      handler: signedIn("write", true, async (request, reply, { context }) => {
+        const read = optionalBody(request, [], reply);
+        if ("error" in read) return read;
+        const result = await service[move](context, request.params.id ?? "");
+        return answer(result, reply, (share) => ({ share }));
+      }),
+    };
+  }
 }
 
 /**
