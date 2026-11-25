@@ -14,7 +14,11 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { csrfTokenFor, type RecordId, type UserId } from "@oculus/core";
 import {
+  openDatabase,
+  endUserSessions,
+  resetSecondFactor,
   resolveSession,
+  sendPasswordReset,
   setAccountDisabled,
   sql,
   type EnrolmentMessage,
@@ -58,7 +62,11 @@ let a2Record: string;
 let deletedRecord: string;
 
 beforeAll(async () => {
-  w = await makeWorld({ onError: serviceErrorLogger((r) => logged.push(r)) });
+  w = await makeWorld({
+    onError: serviceErrorLogger((r) => logged.push(r)),
+    // Short, so the audit trail's statement_timeout test is quick.
+    searchTimeoutMs: 1_000,
+  });
   const keys = testKeyring();
   app = await buildServer({
     env: TEST_ENV,
@@ -682,6 +690,88 @@ describe("the audit trail", () => {
     expect(second.entries[0]).not.toEqual(first.entries[0]);
     expect((await trail("root", "?after=nonsense")).status).toBe(422);
     expect((await trail("root", "?from=yesterday")).status).toBe(422);
+  });
+});
+
+describe("review fixes", () => {
+  it("answers impossible cursors and dates 422, never 500", async () => {
+    const id = "6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a4b";
+    for (const query of [
+      `after=${encodeURIComponent(`2026-13-45T99:99:99.999999_e${id}`)}`,
+      `after=${encodeURIComponent(`0000-01-01T00:00:00.000000_e${id}`)}`,
+      `after=${encodeURIComponent(`2026-02-30T10:00:00.000000_e${id}`)}`,
+      "from=2026-02-30",
+      "to=2026-13-01",
+      "from=2026-02-28T25:00Z",
+    ]) {
+      const r = await call("GET", `/api/audit?${query}`, { as: "root" });
+      expect(r.status, query).toBe(422);
+    }
+    const fine = await call("GET", `/api/audit?from=2024-02-29&to=2026-02-28`, { as: "root" });
+    expect(fine.status).toBe(200);
+  });
+
+  it("stops a slow audit trail with 503 timeout", async () => {
+    const holder = openDatabase(w.testDb.url, { max: 1 });
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const locking = holder.transaction(async (q) => {
+      await q.execute(sql`LOCK TABLE public.people_events IN ACCESS EXCLUSIVE MODE`);
+      await held;
+    });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const r = await call("GET", "/api/audit", { as: "root" });
+      expect(r.status).toBe(503);
+      expect(r.json.error).toBe("timeout");
+    } finally {
+      release();
+      await locking;
+      await holder.close();
+    }
+  }, 30_000);
+
+  it("answers a malformed person ID on a grant exactly as a missing person", async () => {
+    const body = { role: "cataloger", siteId: w.a1, scope: null };
+    const bad = await call("POST", "/api/people/not-an-id/roles", { as: "root", body });
+    const missing = await call("POST", `/api/people/${MADE_UP}/roles`, { as: "root", body });
+    expect(bad.status).toBe(404);
+    expect(shape(bad)).toEqual(shape(missing));
+  });
+
+  it("logs an invitation whose message failed", async () => {
+    const before = await events("invited");
+    const made = await w.service.invitePerson(
+      { organizationId: w.a, actor: actorOf(w.root), sessionToken: tokens.root ?? "" },
+      { email: "unlucky@example.org" },
+      () => Promise.reject(new Error("the invented mail server is down")),
+    );
+    expect(made.ok ? [] : made.issues.map((i) => i.code)).toEqual(["delivery_failed"]);
+    expect(await events("invited")).toBe(before + 1);
+  });
+
+  it("re-checks membership in the account functions' own transactions (memberOf)", async () => {
+    const stranger = await fullSession(w.db, w.stranger, w.b);
+    const ended = await endUserSessions(w.db, tokens.root, w.stranger, { memberOf: w.a });
+    expect(ended.ok ? [] : ended.issues.map((i) => i.code)).toEqual(["unknown_user"]);
+    expect((await resolveSession(w.db, stranger.token)).ok).toBe(true);
+    const sent = await sendPasswordReset(w.db, tokens.root, w.stranger, () => Promise.resolve(), {
+      memberOf: w.a,
+    });
+    expect(sent.ok ? [] : sent.issues.map((i) => i.code)).toEqual(["unknown_user"]);
+    const reset = await resetSecondFactor(
+      w.db,
+      testKeyring(),
+      tokens.root,
+      w.stranger,
+      { recoveryCode: spareRecoveryCode(w.root), source: "10.43.0.1" },
+      () => Promise.resolve(),
+      { memberOf: w.a },
+    );
+    expect(reset.ok ? [] : reset.issues.map((i) => i.code)).toEqual(["unknown_user"]);
+    expect((await resolveSession(w.db, stranger.token)).ok).toBe(true);
   });
 });
 

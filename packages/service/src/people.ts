@@ -66,6 +66,7 @@ import {
   isAuditCursor,
   listMembers,
   memberGrants,
+  membersGrants,
   memberSecondStep,
   memberSessions,
   organizationSiteIds,
@@ -74,6 +75,8 @@ import {
   resetSecondFactor,
   sendPasswordReset,
   setAccountDisabled,
+  databaseNow,
+  invitationMadeSince,
   type AuditPage,
   type Database,
   type EnrolmentDelivery,
@@ -87,6 +90,7 @@ import {
   type Queryable,
   type RoleAssignment,
   type SecretKeyring,
+  sql,
 } from "@oculus/db";
 import { actorUser, notPermitted, readAccess } from "./access.js";
 import { grantRoleIn, hasOnly, managedSites, own, revokeRoleIn, type Runner } from "./admin.js";
@@ -201,11 +205,26 @@ export interface PeopleOperations {
   auditTrail(context: ServiceContext, filter: unknown): Promise<ServiceResult<AuditPage>>;
 }
 
+/** A thrown error's SQLSTATE (own data property only), if any. */
+function sqlStateOf(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const d = Object.getOwnPropertyDescriptor(error, "code");
+  return d !== undefined && typeof d.value === "string" ? d.value : undefined;
+}
+
 function refusal<T>(path: (string | number)[], code: string, message: string): ServiceResult<T> {
   return { ok: false, issues: [issue(path, code, message)] };
 }
 
 const UNKNOWN_PERSON = "There is no such member of this organization.";
+
+/** Refusals after which a message may have gone, or a link or invitation may still be live: logged too. */
+const SENT_OR_TRIED: ReadonlySet<string> = new Set([
+  "superseded",
+  "revoked",
+  "delivery_failed",
+  "delivery_failed_may_be_pending",
+]);
 
 function unknownPerson<T>(): ServiceResult<T> {
   return refusal(["userId"], "unknown_person", UNKNOWN_PERSON);
@@ -342,7 +361,15 @@ function timeBound(value: unknown): string | undefined | false {
   if (Number.isNaN(time) || time < Date.UTC(1970, 0, 1) || time > Date.UTC(9999, 0, 1)) {
     return false;
   }
-  return new Date(time).toISOString();
+  // A real date and time only: 2026-02-30 or 25:00 parse in some engines
+  // (rolled over), so the text must read back the same (review).
+  const iso = new Date(time).toISOString();
+  const given = text.replace(/Z$/, "");
+  const [date = "", clock = ""] = given.split("T");
+  if (iso.slice(0, 10) !== date || iso.slice(11, 11 + clock.length) !== clock) {
+    return false;
+  }
+  return iso;
 }
 
 /** Database refusals of the account functions, as the service's issues (path `[]` → `userId` where it is about the person). */
@@ -378,6 +405,7 @@ export function peopleOperations(
   db: Database,
   baseRun: Runner,
   onError?: (error: unknown, operation: string) => void,
+  searchTimeoutMs = 5_000,
 ): PeopleOperations {
   const run: Runner = (operation, context, work) => baseRun(operation, withoutToken(context), work);
   const report = (operation: string) => (error: unknown) => {
@@ -436,10 +464,15 @@ export function peopleOperations(
           v.system ? {} : { visibleTo: v.sites },
         );
         const people: PersonSummary[] = [];
+        // One query for everyone's roles (review: not one per member).
+        const grants = await membersGrants(
+          tx,
+          who.organizationId,
+          listed.members.map((m) => m.userId),
+          v.system ? {} : { siteIds: v.sites, exceptRole: "site_manager" },
+        );
         for (const member of listed.members) {
-          people.push(
-            summary(member, await grantsFor(tx, who.organizationId, v, member.userId), v),
-          );
+          people.push(summary(member, grants.get(member.userId) ?? [], v));
         }
         return {
           ok: true,
@@ -518,6 +551,7 @@ export function peopleOperations(
         return { ok: true, value: viewer.value.userId };
       });
       if (!allowed.ok) return allowed;
+      const since = await databaseNow(db);
       const made = await createInvitation(
         db,
         {
@@ -529,6 +563,24 @@ export function peopleOperations(
         deliver,
       );
       if (!made.ok) {
+        // A message that may have gone (or failed to) is logged too
+        // (review): the invitation exists, pending or withdrawn.
+        if (made.issues.some((i) => SENT_OR_TRIED.has(i.code))) {
+          const invitationId = await invitationMadeSince(
+            db,
+            context.organizationId,
+            allowed.value,
+            own(request, "email") as string,
+            since,
+          );
+          if (invitationId !== undefined) {
+            await logAfter(context, "invitePerson", {
+              actorId: allowed.value,
+              kind: "invited",
+              invitationId,
+            });
+          }
+        }
         // The token was never shown; the reply never says whether the
         // address has an account in another organization (D-068).
         return {
@@ -641,7 +693,7 @@ export function peopleOperations(
         target.value.userId,
         input,
         deliver,
-        { onError: report("resetSecondFactor") },
+        { onError: report("resetSecondFactor"), memberOf: context.organizationId },
       );
       if (!reset.ok) return fromDatabase(reset);
       await logAfter(context, "resetPersonSecondStep", {
@@ -690,8 +742,24 @@ export function peopleOperations(
       if (!target.ok) return target;
       const sent = await sendPasswordReset(db, context.sessionToken, target.value.userId, deliver, {
         onError: report("sendPasswordReset"),
+        memberOf: context.organizationId,
       });
-      if (!sent.ok) return fromDatabase(sent);
+      if (!sent.ok) {
+        // A link that may still be live (its withdrawal failed) or was
+        // replaced by the person's own request while sent: logged too.
+        if (
+          sent.issues.some(
+            (i) => i.code === "delivery_failed_may_be_pending" || i.code === "superseded",
+          )
+        ) {
+          await logAfter(context, "sendPersonPasswordReset", {
+            actorId: target.value.actorId,
+            subjectId: target.value.userId,
+            kind: "password_reset_sent",
+          });
+        }
+        return fromDatabase(sent);
+      }
       await logAfter(context, "sendPersonPasswordReset", {
         actorId: target.value.actorId,
         subjectId: target.value.userId,
@@ -705,6 +773,7 @@ export function peopleOperations(
       if (!target.ok) return target;
       const ended = await endUserSessions(db, context.sessionToken, target.value.userId, {
         onError: report("endUserSessions"),
+        memberOf: context.organizationId,
       });
       if (!ended.ok) return fromDatabase(ended);
       await logAfter(context, "endPersonSessions", {
@@ -764,22 +833,34 @@ export function peopleOperations(
         if (records !== "all" && records.length === 0 && people !== "all" && people.length === 0) {
           return notPermitted();
         }
-        return {
-          ok: true,
-          value: await readAuditTrail(
-            tx,
-            who.organizationId,
-            { records, people },
-            {
-              ...(person === undefined ? {} : { actorId: person }),
-              ...(record === undefined ? {} : { recordId: record }),
-              ...(from === undefined ? {} : { from }),
-              ...(to === undefined ? {} : { to }),
-              ...(after === undefined ? {} : { after }),
-              limit,
-            },
-          ),
-        };
+        // As search and the queue (D-066, D-079, D-082): a statement_timeout
+        // for the trail's own statement, so a slow one stops (review).
+        await tx.rows(
+          sql`SELECT set_config('statement_timeout', ${String(searchTimeoutMs)}, true)`,
+        );
+        try {
+          return {
+            ok: true,
+            value: await readAuditTrail(
+              tx,
+              who.organizationId,
+              { records, people },
+              {
+                ...(person === undefined ? {} : { actorId: person }),
+                ...(record === undefined ? {} : { recordId: record }),
+                ...(from === undefined ? {} : { from }),
+                ...(to === undefined ? {} : { to }),
+                ...(after === undefined ? {} : { after }),
+                limit,
+              },
+            ),
+          };
+        } catch (error) {
+          if (sqlStateOf(error) === "57014") {
+            return refusal([], "timeout", "Reading the audit trail took too long and was stopped.");
+          }
+          throw error;
+        }
       });
     },
   };

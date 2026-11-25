@@ -117,6 +117,11 @@ function peopleRefused(
   log: (record: ApiLogRecord) => void,
 ): unknown {
   for (const i of result.issues) {
+    // A malformed person ID is answered as a missing person, as on every
+    // other people route (review).
+    if (i.code === "invalid_id" && i.path.length === 1 && i.path[0] === "userId") {
+      throw new Refusal(404, "not_found");
+    }
     const fixed = FIXED[i.code];
     if (fixed !== undefined) throw new Refusal(...fixed);
     if (i.code === "throttled") {
@@ -327,7 +332,8 @@ export function peopleApiRoutes(options: PeopleApiOptions, shared: Shared): Ocul
     {
       method: "GET",
       path: "/api/audit",
-      handler: signedIn("read", false, async (request, reply, { context }) => {
+      // One query over two large tables: the search bucket (review).
+      handler: signedIn("search", false, async (request, reply, { context }) => {
         const filter: Record<string, unknown> = {};
         for (const key of ["person", "record", "from", "to", "after"]) {
           const value = queryText(request, key);

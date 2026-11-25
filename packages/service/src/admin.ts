@@ -107,9 +107,16 @@ export interface AdminOperations {
   myAccess(context: ServiceContext): Promise<ServiceResult<MyAccess>>;
   /** The sites the actor may open (D-019): all for a system manager. */
   listMySites(context: ServiceContext): Promise<ServiceResult<readonly SiteChoice[]>>;
-  /** Grants a role (module header for who may). */
+  /**
+   * Grants a role (module header for who may). **Internal** (T-048, D-084):
+   * no fresh re-entry check and no change-log line; routes and screens use
+   * `grantPersonRole` (people.ts). Kept for set-up code and tests.
+   */
   grantRole(context: ServiceContext, request: unknown): Promise<ServiceResult<RoleAssignment>>;
-  /** Revokes a role assignment by its ID. */
+  /**
+   * Revokes a role assignment by its ID. **Internal** (T-048, D-084): routes
+   * use `revokePersonRole` (people.ts), which checks a fresh re-entry and logs.
+   */
   revokeRole(
     context: ServiceContext,
     assignmentId: string,

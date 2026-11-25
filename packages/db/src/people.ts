@@ -188,6 +188,50 @@ export async function memberGrants(
   );
 }
 
+/**
+ * The role assignments of several people at once (one query), with
+ * `memberGrants`'s options; every ID asked for is in the map.
+ */
+export async function membersGrants(
+  db: Queryable,
+  organizationId: OrganizationId,
+  userIds: readonly UserId[],
+  options: { readonly siteIds?: readonly SiteId[]; readonly exceptRole?: string } = {},
+): Promise<ReadonlyMap<UserId, readonly MemberGrant[]>> {
+  const ids = userIds.filter((id) => isUserId(id));
+  const out = new Map<UserId, MemberGrant[]>(ids.map((id) => [id, []]));
+  if (!isOrganizationId(organizationId) || ids.length === 0) return out;
+  const sites = options.siteIds?.filter((s) => isSiteId(s)) ?? null;
+  const rows = await db.rows<{
+    user_id: UserId;
+    id: string;
+    role: string;
+    site_id: SiteId | null;
+    scope: string | null;
+    granted_at: string;
+  }>(sql`
+    SELECT user_id::text AS user_id, id::text AS id, role, site_id::text AS site_id,
+           scope_record_id::text AS scope,
+           to_char(granted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS granted_at
+    FROM public.role_assignments
+    WHERE organization_id = ${organizationId}::uuid AND user_id = ANY (${ids}::uuid[])
+      AND (${sites === null}::boolean OR site_id = ANY (${sites ?? []}::uuid[]))
+      AND (${options.exceptRole ?? null}::text IS NULL OR role <> ${options.exceptRole ?? null}::text)
+    ORDER BY user_id, granted_at, id`);
+  for (const r of rows) {
+    out.get(r.user_id)?.push(
+      Object.freeze({
+        id: r.id,
+        role: r.role,
+        siteId: r.site_id,
+        scope: r.scope,
+        grantedAt: r.granted_at,
+      }),
+    );
+  }
+  return out;
+}
+
 /** A person's live session, as an administrator sees it: never a token, hash or address. */
 export interface MemberSession {
   readonly sessionId: string;
@@ -263,6 +307,38 @@ export async function memberSecondStep(db: Queryable, userId: UserId): Promise<M
     recentAlerts: row?.alerts ?? 0,
     lastAlertAt: row?.last_alert ?? null,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Invitations whose sending failed (T-048 review: logged too)
+
+/** The database's clock now, in the form `invitationMadeSince` takes. */
+export async function databaseNow(db: Queryable): Promise<string> {
+  const [row] = await db.rows<{ now: string }>(
+    sql`SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US') AS now`,
+  );
+  return row?.now ?? "1970-01-01T00:00:00.000000";
+}
+
+/**
+ * The newest invitation `inviter` made for `email` in the organization since
+ * `since` (`databaseNow`), whatever became of it: for the change log when
+ * `createInvitation` answers without an ID (its message failed or was
+ * superseded).
+ */
+export async function invitationMadeSince(
+  db: Queryable,
+  organizationId: OrganizationId,
+  inviter: UserId,
+  email: string,
+  since: string,
+): Promise<string | undefined> {
+  const [row] = await db.rows<{ id: string }>(sql`
+    SELECT id::text AS id FROM public.invitations
+    WHERE organization_id = ${organizationId}::uuid AND invited_by = ${inviter}::uuid
+      AND email = lower(${email}) AND created_at >= (${since}::timestamp AT TIME ZONE 'UTC')
+    ORDER BY created_at DESC, id DESC LIMIT 1`);
+  return row?.id;
 }
 
 // ---------------------------------------------------------------------------
@@ -434,7 +510,22 @@ const AUDIT_CURSOR =
   /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6})_((?:r[0-9a-f-]{36}:\d{10})|(?:e[0-9a-f-]{36}))$/;
 
 export function isAuditCursor(value: unknown): value is string {
-  return typeof value === "string" && value.length <= 80 && AUDIT_CURSOR.test(value);
+  if (typeof value !== "string" || value.length > 80) return false;
+  const match = AUDIT_CURSOR.exec(value);
+  return match?.[1] !== undefined && isRealTime(match[1]);
+}
+
+/**
+ * Whether `YYYY-MM-DDTHH:MM:SS.ffffff` names a real moment from year 1 to
+ * 9999 (no 13th month, 30 February or hour 99): it reads back the same
+ * after a round trip through `Date` (to the millisecond; the microseconds
+ * are digits by the pattern).
+ */
+function isRealTime(text: string): boolean {
+  const year = Number(text.slice(0, 4));
+  if (!Number.isInteger(year) || year < 1) return false;
+  const time = new Date(`${text.slice(0, 23)}Z`);
+  return !Number.isNaN(time.getTime()) && time.toISOString().slice(0, 23) === text.slice(0, 23);
 }
 
 interface AuditRow {

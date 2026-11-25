@@ -2918,7 +2918,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
 
     ...adminOperations(run),
     ...definitionOperations(run),
-    ...peopleOperations(db, run, onError),
+    ...peopleOperations(db, run, onError, searchTimeoutMs),
     submitForReview: workflowAction("submit_for_review"),
     returnToDraft: workflowAction("return_to_draft"),
     publish: workflowAction("publish"),
