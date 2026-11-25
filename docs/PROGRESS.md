@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-24 22:20 CT — manual (Chat C) — T-050a Hosts for the admin and the public sites
+- Result: done (T-050 split into T-050a to T-050c)
+- What changed: server rule 12, `/api` on the admin's host only; `OCULUS_ADMIN_ORIGIN` required in production; `OCULUS_PUBLIC_SITES` and the public reader pool (`OCULUS_PUBLIC_DATABASE_URL`, `publicDb`) checked at startup. New `packages/api/src/public-sites.ts`.
+- Decisions: D-090
+- Review: one independent round, nothing blocking; fixed the admin's hostname on another port passing as a public site, a site ID held by two organizations, a reader of another database, and shutdown closing only one pool; added an https-behind-proxy test.
+- Gate: see the merge commit · npm audit clean
+- Next: S-026 (T-050b needs stored Dublin Core mappings first)
+
 ## 2026-11-24 21:05 CT — manual (Chat C) — T-048a Admin: System settings
 - Result: done
 - What changed: System settings for system managers (sidebar "System" group, `/settings`): Sites (list, add, rename), Templates (list and a field editor through the existing template PUT with its confirmations), Sign-in rules. API: `POST /api/sites`, `PUT /api/sites/:id`, `GET`/`PUT /api/system-settings`, each change behind a recent sign-in answered with T-048's re-entry form. HTTP, screen and e2e tests (Alfa on each settings screen).

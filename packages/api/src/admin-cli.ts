@@ -53,8 +53,8 @@ export async function runAdminCli(
     }
   }
   const closeAll = async (): Promise<void> => {
-    await db.close();
-    await publicDb?.close();
+    // Both, whatever happens to either.
+    await Promise.allSettled([db.close(), publicDb?.close()]);
   };
   try {
     const app = await buildAdminServer({

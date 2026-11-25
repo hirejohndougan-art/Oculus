@@ -7,14 +7,16 @@
  * must be one of `OCULUS_ORIGINS`, may appear once, and may not be the
  * admin's origin (D-052: the admin has a hostname of its own, so its
  * session cookie never reaches a public page). Two origins may name the
- * same site (a `www.` name and a bare one).
+ * same site (a `www.` name and a bare one). "Not the admin's" compares
+ * hostnames, since cookies are not kept apart by scheme or port.
  *
  * The public sites read only through the public reader role (D-034, D-080):
  * `OCULUS_PUBLIC_DATABASE_URL` names a connection as a role made by
  * `grantPublicReaderRole`, and `checkPublicSites` refuses to go on unless
  * `checkPublicReaderConnection` reports nothing for it, so a connection
  * that could read a table (the writer's, an owner's, a superuser's) is
- * never used for a public site. Each site must exist; its organization is
+ * never used for a public site, and it must reach the writer's database
+ * (not a copy). Each site must exist, in exactly one organization; its organization is
  * read once, with the writer's pool, because the public reader can read no
  * table (`readPublicRecord` takes both).
  *
@@ -51,6 +53,8 @@ export function publicSitesFromEnv(
 ): readonly PublicSiteHost[] {
   const raw = env[PUBLIC_SITES_ENV];
   if (raw === undefined || raw.trim() === "") return [];
+  const adminHostname =
+    adminOrigin === undefined || adminOrigin === "" ? undefined : new URL(adminOrigin).hostname;
   const seen = new Set<string>();
   const out: PublicSiteHost[] = [];
   for (const entry of raw.split(",").map((e) => e.trim())) {
@@ -65,9 +69,11 @@ export function publicSitesFromEnv(
     if (!origins.has(origin)) {
       throw new Error(`${PUBLIC_SITES_ENV}: ${origin} isn't one of OCULUS_ORIGINS`);
     }
-    if (origin === adminOrigin) {
+    // The host, not the origin: cookies aren't kept apart by scheme or port,
+    // so the admin's session cookie would reach a public page on its host.
+    if (adminHostname !== undefined && new URL(origin).hostname === adminHostname) {
       throw new Error(
-        `${PUBLIC_SITES_ENV}: ${origin} is the admin's origin; a public site needs a host of its own (D-052)`,
+        `${PUBLIC_SITES_ENV}: ${origin} is on the admin's host; a public site needs a host of its own (D-052)`,
       );
     }
     if (seen.has(origin)) throw new Error(`${PUBLIC_SITES_ENV}: ${origin} is listed twice`);
@@ -99,13 +105,37 @@ export async function checkPublicSites(
       `${PUBLIC_DATABASE_URL_ENV} must connect as a public reader role (grantPublicReaderRole, D-080); found: ${codes}`,
     );
   }
+  // The same database as the writer's: a reader pointed at another install
+  // (a copy, staging) would pass the check and serve the wrong records.
+  const same = sql`
+    SELECT d.oid::text AS oid, d.datname AS name, pg_postmaster_start_time()::text AS started
+    FROM pg_catalog.pg_database d WHERE d.datname = current_database()`;
+  const [mine] = await writer.rows<{ oid: string; name: string; started: string }>(same);
+  const [theirs] = await reader.rows<{ oid: string; name: string; started: string }>(same);
+  if (
+    mine === undefined ||
+    mine.oid !== theirs?.oid ||
+    mine.name !== theirs.name ||
+    mine.started !== theirs.started
+  ) {
+    throw new Error(
+      `${PUBLIC_DATABASE_URL_ENV} must connect to the same database as OCULUS_DATABASE_URL`,
+    );
+  }
   const out: PublicSite[] = [];
   for (const host of hosts) {
-    const [row] = await writer.rows<{ organization_id: string }>(sql`
+    const rows = await writer.rows<{ organization_id: string }>(sql`
       SELECT organization_id::text AS organization_id FROM public.sites
-      WHERE id = ${host.siteId}::uuid`);
+      WHERE id = ${host.siteId}::uuid LIMIT 2`);
+    const row = rows[0];
     if (row === undefined) {
       throw new Error(`${PUBLIC_SITES_ENV}: there is no site ${host.siteId} (for ${host.origin})`);
+    }
+    // Site IDs are unique only within an organization (D-060): never guess which one.
+    if (rows.length > 1) {
+      throw new Error(
+        `${PUBLIC_SITES_ENV}: site ${host.siteId} exists in more than one organization; it can't be served until that is resolved`,
+      );
     }
     out.push(Object.freeze({ ...host, organizationId: row.organization_id as OrganizationId }));
   }

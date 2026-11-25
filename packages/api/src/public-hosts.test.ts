@@ -185,6 +185,29 @@ describe("the API on the admin's host only", () => {
     }
   });
 
+  it("answers an https admin host behind a trusted proxy", async () => {
+    const proxied = await buildServer({
+      env: { OCULUS_ORIGINS: [...ORIGINS].join(","), OCULUS_TRUSTED_PROXY: "loopback" },
+      admin: { origin: ADMIN, files },
+      routes: [{ method: "GET", path: "/api/thing", handler: () => ({ thing: true }) }],
+    });
+    try {
+      const via = (host: string) =>
+        proxied.inject({
+          method: "GET",
+          url: "/api/thing",
+          remoteAddress: "127.0.0.1",
+          headers: { host: "127.0.0.1", "x-forwarded-host": host, "x-forwarded-proto": "https" },
+        });
+      const ok = await via("admin.example.org");
+      expect([ok.statusCode, ok.json()]).toEqual([200, { thing: true }]);
+      const away = await via("archive.example.org");
+      expect([away.statusCode, away.json()]).toEqual([404, { error: "not_found" }]);
+    } finally {
+      await proxied.close();
+    }
+  });
+
   it("/health still answers on every host", async () => {
     const reply = await on("archive.example.org", "GET", "/health");
     expect(reply.statusCode).toBe(200);
@@ -228,7 +251,16 @@ describe("OCULUS_PUBLIC_SITES", () => {
     const bad = (value: string) => () =>
       publicSitesFromEnv({ OCULUS_PUBLIC_SITES: value }, ORIGINS, ADMIN);
     expect(bad(`https://other.example.org=${id}`)).toThrow(/isn't one of OCULUS_ORIGINS/);
-    expect(bad(`${ADMIN}=${id}`)).toThrow(/admin's origin/);
+    expect(bad(`${ADMIN}=${id}`)).toThrow(/admin's host/);
+    // Another port or scheme on the admin's host: the cookie would still reach it.
+    const extra = new Set([...ORIGINS, "https://admin.example.org:8443"]);
+    expect(() =>
+      publicSitesFromEnv(
+        { OCULUS_PUBLIC_SITES: `https://admin.example.org:8443=${id}` },
+        extra,
+        ADMIN,
+      ),
+    ).toThrow(/admin's host/);
     expect(bad(`${ARCHIVE}=${id},${ARCHIVE}=${id}`)).toThrow(/listed twice/);
     expect(bad(`${ARCHIVE}=not-a-site`)).toThrow(/site ID/);
     expect(bad(ARCHIVE)).toThrow(/<origin>=<site id>/);
@@ -256,6 +288,43 @@ describe("startup", () => {
     );
     expect(String(failure)).toMatch(/must connect as a public reader role/);
     expect(String(failure)).not.toContain(testDb.url);
+  });
+
+  it("refuses a reader of another database", async () => {
+    const other = await freshDatabase();
+    const url = new URL(other.url);
+    const elsewhere = openDatabase(url.toString(), { max: 1 });
+    try {
+      await migrate({ connectionString: other.url });
+      // The owner there can read tables, so it fails the role check first;
+      // a reader role there is what this case is about.
+      await elsewhere.transaction((q) => grantPublicReaderRole(q, readerRole));
+      url.username = readerRole;
+      const otherReader = openDatabase(url.toString(), { max: 1 });
+      try {
+        await expect(
+          start({ ...ENV, OCULUS_PUBLIC_SITES: `${ARCHIVE}=${site}` }, otherReader),
+        ).rejects.toThrow(/same database/);
+      } finally {
+        await otherReader.close();
+      }
+    } finally {
+      await elsewhere.close();
+      await other.drop();
+    }
+  });
+
+  it("refuses a site ID that two organizations hold", async () => {
+    const org2 = newOrganizationId();
+    await insertOrganization(owner, { id: org2, name: "Invented Library" });
+    const twin = newSiteId();
+    const org1 = newOrganizationId();
+    await insertOrganization(owner, { id: org1, name: "Invented Museum" });
+    await insertSite(owner, { id: twin, organizationId: org1, name: "Invented one" });
+    await insertSite(owner, { id: twin, organizationId: org2, name: "Invented two" });
+    await expect(
+      start({ ...ENV, OCULUS_PUBLIC_SITES: `${ARCHIVE}=${twin}` }, reader),
+    ).rejects.toThrow(/more than one organization/);
   });
 
   it("refuses a site that doesn't exist", async () => {
