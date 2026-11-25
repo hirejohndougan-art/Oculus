@@ -29,6 +29,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -70,6 +71,7 @@ import {
   serviceFileText,
   toolEnvironment,
 } from "./backup-connection.js";
+import { createFirstSystemAdmin, createInvitation } from "./accounts.js";
 import { openDatabase, openSession, type Database } from "./client.js";
 import { insertOrganization, insertRecord, insertTemplateVersion, readRecord } from "./catalog.js";
 import {
@@ -895,6 +897,102 @@ async function restoring(databaseName: string, wait?: string): Promise<boolean> 
       AND (${wait ?? null}::text IS NULL OR wait_event = ${wait ?? null}::text)`);
   return rows.length > 0;
 }
+
+describe("a restore signs everyone out (S-060c)", () => {
+  it("ends the backup's sessions and pending reset links, and counts pending invitations", async () => {
+    const testDb = await database();
+    await migrate({ connectionString: testDb.url });
+    const db = pool(testDb.url);
+    const org = newOrganizationId();
+    ok(await insertOrganization(db, { id: org, name: "Invented Restore Society" }));
+    const admin = ok(
+      await createFirstSystemAdmin(db, {
+        email: "restore-admin@example.org",
+        displayName: "Invented Admin",
+        password: "an invented password for the restore test",
+      }),
+    ).userId;
+    // A session, a pending reset link and a used one, and an invitation, as
+    // the backup will hold them.
+    await db.execute(sql`
+      INSERT INTO public.sessions (id, token_hash, user_id, organization_id, stage, signed_in_at,
+        created_at, last_seen_at, rotated_at, password_at, idle_seconds, absolute_seconds, expires_at)
+      SELECT gen_random_uuid(), ${randomBytes(32)}, ${admin}::uuid, ${org}::uuid,
+        'second_step', t, t, t, t, t, 14400, 43200, t + interval '10 minutes'
+      FROM (SELECT clock_timestamp() AS t) c`);
+    for (let i = 0; i < 2; i++) {
+      await db.execute(sql`
+        INSERT INTO public.password_resets (id, user_id, token_hash, requested_by, created_at, expires_at)
+        VALUES (gen_random_uuid(), ${admin}::uuid, ${randomBytes(32)}, ${admin}::uuid,
+          clock_timestamp(), clock_timestamp() + interval '30 minutes')`);
+      if (i === 0) {
+        await db.execute(sql`
+          UPDATE public.password_resets SET used_at = clock_timestamp()
+          WHERE used_at IS NULL AND revoked_at IS NULL`);
+      }
+    }
+    ok(
+      await createInvitation(
+        db,
+        { organizationId: org, email: "invited@example.org", invitedBy: admin },
+        () => Promise.resolve(),
+      ),
+    );
+    const dir = await directory();
+    const file = join(dir, "signed-in.oculus-backup");
+    await backup({ connectionString: testDb.url, file, tempDir: await directory() });
+
+    const target = await emptyTarget();
+    const before = Date.now();
+    const result = await restore({
+      connectionString: target.url,
+      file,
+      tempDir: await directory(),
+    });
+    expect(result.signedOut).toEqual({
+      accounts: 1,
+      sessions: 1,
+      resetLinks: 1,
+      pendingInvitations: 1,
+    });
+    const restored = pool(target.url);
+    expect(await restored.rows(sql`SELECT id FROM public.sessions`)).toEqual([]);
+    const resets = await restored.rows<{ used: boolean }>(
+      sql`SELECT used_at IS NOT NULL AS used FROM public.password_resets`,
+    );
+    expect(resets).toEqual([{ used: true }]);
+    // Every account's earlier sign-ins stopped counting during the restore.
+    const [user] = await restored.rows<{ moved: boolean }>(
+      sql`SELECT sessions_valid_after >= to_timestamp(${before / 1000 - 1}) AS moved
+          FROM public.users WHERE id = ${admin}::uuid`,
+    );
+    expect(user?.moved).toBe(true);
+    // The invitation is left for a person to check.
+    const pendingInvitations = await restored.rows(
+      sql`SELECT id FROM public.invitations WHERE accepted_at IS NULL AND revoked_at IS NULL`,
+    );
+    expect(pendingInvitations).toHaveLength(1);
+  }, 60_000);
+
+  it("the command says everyone is signed out and what to check", async () => {
+    const { file } = await sharedBackup();
+    const target = await emptyTarget();
+    const lines: string[] = [];
+    const push = (line: string): void => {
+      lines.push(line);
+    };
+    const code = await runRestoreCli(
+      [file],
+      { ...process.env, OCULUS_DATABASE_URL: target.url },
+      push,
+      push,
+    );
+    expect(code).toBe(0);
+    const text = lines.join("\n");
+    expect(text).toMatch(/Everyone is signed out/);
+    expect(text).toMatch(/passwords, two-step set-ups, recovery codes used since, roles/);
+  }, 60_000);
+});
 
 describe("stopping a backup or restore", () => {
   it("mid-backup: ends pg_dump and leaves no file, temporary file or process", async () => {

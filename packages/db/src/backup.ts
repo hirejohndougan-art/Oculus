@@ -981,6 +981,31 @@ export interface RestoreResult {
   pending: string[];
   /** A stop was asked for after pg_restore had committed; the restore is complete and checked. */
   stoppedAfterCommit: boolean;
+  /** What the restore ended once it was checked, so nothing from the backup lets anyone in (S-060c). */
+  signedOut: RestoreSignOut;
+}
+
+/**
+ * What a restore ends once the restored database is checked (S-060c, from
+ * the Phase 2 security review's L6). A backup holds the sign-ins of its own
+ * moment: sessions since ended, reset links since used or revoked. Restored
+ * as they were, they would let in whoever held them, which matters most in
+ * the incident a restore often answers. So every account's
+ * `sessions_valid_after` moves to now (every session from before is dead),
+ * the restored sessions are deleted, and the reset links still pending are
+ * deleted. Pending invitations are only counted: an invitation stays in the
+ * people log, so it is for a person to revoke in People if it shouldn't
+ * stand. Tables a backup older than their migration lacks are skipped.
+ */
+export interface RestoreSignOut {
+  /** Accounts whose earlier sign-ins no longer count. */
+  readonly accounts: number;
+  /** Sessions restored from the backup and deleted. */
+  readonly sessions: number;
+  /** Password reset links that were still pending, deleted. */
+  readonly resetLinks: number;
+  /** Invitations still pending in the backup, left for a person to check. */
+  readonly pendingInvitations: number;
 }
 
 /**
@@ -1260,10 +1285,65 @@ export async function restore(options: RestoreOptions): Promise<RestoreResult> {
     options.onCommitted?.();
     log("Checking the restored database against the manifest...");
     await verify(session, manifest, options.noPrivileges === true, roleBefore);
-    return { manifest, pending, stoppedAfterCommit };
+    log("Signing everyone out of the restored database...");
+    const signedOut = await signEveryoneOut(session);
+    return { manifest, pending, stoppedAfterCommit, signedOut };
   } finally {
     await session?.close().catch(() => undefined);
     await space.remove();
+  }
+}
+
+/** Ends every sign-in a restored backup carries (RestoreSignOut), in one transaction. */
+async function signEveryoneOut(session: Session): Promise<RestoreSignOut> {
+  const [has] = await session.rows<{
+    valid_after: boolean;
+    sessions: boolean;
+    resets: boolean;
+    invitations: boolean;
+  }>(sql`
+    SELECT EXISTS (
+             SELECT 1 FROM pg_catalog.pg_attribute
+             WHERE attrelid = pg_catalog.to_regclass('public.users')
+               AND attname = 'sessions_valid_after' AND NOT attisdropped
+           ) AS valid_after,
+           pg_catalog.to_regclass('public.sessions') IS NOT NULL AS sessions,
+           pg_catalog.to_regclass('public.password_resets') IS NOT NULL AS resets,
+           pg_catalog.to_regclass('public.invitations') IS NOT NULL AS invitations`);
+  if (has === undefined) throw new Error("the catalog query returned no row");
+  try {
+    await session.control("BEGIN");
+    // Sessions first, so they are counted (moving an account's
+    // sessions_valid_after ends its sessions too, by 0010's trigger).
+    const sessions = has.sessions ? await session.execute(sql`DELETE FROM public.sessions`) : 0;
+    // Forward only, to the database's clock (0010's trigger checks both):
+    // a session copied in later, from before now, still doesn't count.
+    const accounts = has.valid_after
+      ? await session.execute(sql`
+          UPDATE public.users SET sessions_valid_after = pg_catalog.clock_timestamp()
+          WHERE sessions_valid_after < pg_catalog.clock_timestamp()`)
+      : 0;
+    const resetLinks = has.resets
+      ? await session.execute(sql`
+          DELETE FROM public.password_resets WHERE used_at IS NULL AND revoked_at IS NULL`)
+      : 0;
+    const [invited] = has.invitations
+      ? await session.rows<{ n: number }>(sql`
+          SELECT pg_catalog.count(*)::pg_catalog.int4 AS n FROM public.invitations
+          WHERE accepted_at IS NULL AND revoked_at IS NULL
+            AND expires_at > pg_catalog.clock_timestamp()`)
+      : [];
+    await session.control("COMMIT");
+    return { accounts, sessions, resetLinks, pendingInvitations: invited?.n ?? 0 };
+  } catch (error) {
+    if (session.transactionState() !== "idle") {
+      await session.control("ROLLBACK").catch(() => undefined);
+    }
+    throw new BackupError(
+      "restore_failed",
+      "The backup was restored and checked, but signing everyone out of it failed, so sessions and reset links from the backup may still work. Don't use this database: drop it and restore again.",
+      { cause: error },
+    );
   }
 }
 

@@ -43,7 +43,7 @@ Double-click `scripts\start-oculus.cmd` in the Oculus folder. To make a desktop 
 
 Close Oculus first. Then, in the Oculus folder, `git pull`, and double-click `start-oculus.cmd` as usual (it needs the internet for a minute to fetch updates). If the update changes the database, Oculus backs it up first and says where the backup is. If it can't make the backup, it changes nothing and says why. (It finds PostgreSQL's backup tools in `C:\Program Files\PostgreSQL`; if you installed PostgreSQL somewhere else, set `PG_BIN` to its `bin` folder.)
 
-To undo an update with one of those backups, ask for help: it means making a new, empty database in pgAdmin owned by `oculus_owner`, restoring into it with `npm run db:restore`, and pointing `desktop.json` at it. It rebuilds Oculus and updates the database by itself.
+To undo an update with one of those backups, ask for help: it means making a new, empty database in pgAdmin owned by `oculus_owner`, restoring into it with `npm run db:restore`, and pointing `desktop.json` at it. It rebuilds Oculus and updates the database by itself. After a restore everyone signs in again, and anything changed since that backup (a password, a two-step set-up, a role) is back as it was then.
 
 ## If you forget your password
 

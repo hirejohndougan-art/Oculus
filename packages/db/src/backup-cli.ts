@@ -161,6 +161,18 @@ export async function runRestoreCli(
     safe.out(
       `Done: restored and checked ${String(result.manifest.tables.length)} tables, ${String(rows)} rows, ${String(result.manifest.migrations.length)} migrations.`,
     );
+    const out = result.signedOut;
+    safe.out(
+      `Everyone is signed out: sign-ins from before the restore no longer work (${String(out.accounts)} accounts, ${String(out.sessions)} sessions from the backup ended, ${String(out.resetLinks)} pending password reset links cancelled).`,
+    );
+    safe.out(
+      `Everything changed since the backup (made ${result.manifest.createdAt}) is undone, including passwords, two-step set-ups, recovery codes used since, roles, and accounts disabled since: check them in People before people sign in again.`,
+    );
+    if (out.pendingInvitations > 0) {
+      safe.out(
+        `${String(out.pendingInvitations)} invitation(s) from the backup are still pending: revoke in People any that shouldn't stand.`,
+      );
+    }
     if (result.pending.length > 0) {
       safe.out(
         `This version of Oculus has ${String(result.pending.length)} newer migration(s) (${result.pending.join(", ")}): run npm run db:migrate next.`,
