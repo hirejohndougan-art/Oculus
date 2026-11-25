@@ -56,6 +56,13 @@ import {
   lockFileStoreLease,
   insertFileStoreEpoch,
   type PurgeCandidate,
+  queueScan,
+  rescanContents,
+  scanCounts,
+  scanState,
+  scanStates,
+  type ScanCounts,
+  type StoredScan,
   readFileStoreBinding,
   insertStoredFile,
   listStoredFiles,
@@ -69,8 +76,15 @@ import {
   type RecordPlace,
   type StoredFile,
 } from "@oculus/db";
-import { editPermissions, notPermitted, type RecordAccess, type Refusal } from "./access.js";
+import {
+  editPermissions,
+  notPermitted,
+  readAccess,
+  type RecordAccess,
+  type Refusal,
+} from "./access.js";
 import type { Runner } from "./admin.js";
+import type { FileScanQueue, ScanPass } from "./file-scans.js";
 import type { FileStore, ReceivedFile, StoreMarker } from "./file-store.js";
 import {
   THUMBNAIL_BOXES,
@@ -138,6 +152,32 @@ export interface FileSweep {
    * restore or a copy (`database_changed`).
    */
   readonly halted?: "marker_changed" | "database_changed";
+}
+
+/**
+ * A file's virus scan as the admin shows it (S-040, D-113): its content's
+ * stored state, or `not_scanned` when no scanner is set up (or it was
+ * never scanned and none is now). With a scanner, content with no result
+ * yet is `pending`.
+ */
+export type FileScanState = "pending" | "clean" | "infected" | "failed" | "not_scanned";
+
+/** A file as `listFiles` lists it: the row and its content's scan. */
+export type ListedFile = StoredFile & { readonly scan: FileScanState };
+
+/** Virus scanning as System settings shows it, for the session's organization. */
+export interface FileScanStatus {
+  /** Whether a scanner is set up on this server. */
+  readonly scanning: boolean;
+  readonly counts: ScanCounts;
+}
+
+/** The scan state shown for a content's stored result. */
+export function shownScanState(scanning: boolean, stored: StoredScan | undefined): FileScanState {
+  if (stored?.state === "infected") return "infected";
+  if (stored?.state === "clean") return "clean";
+  if (!scanning) return "not_scanned";
+  return stored?.state ?? "pending";
 }
 
 /** Why a file is read: to download it (any type), or to show it in the browser. */
@@ -296,11 +336,29 @@ export interface FileOperations {
         readonly problem: "no_store" | "marker_missing" | "other_install" | "epoch_moving";
       }
   >;
-  /** The asset's files (name, size, sniffed type, who and when). */
+  /** The asset's files (name, size, sniffed type, who and when, and each one's virus scan). */
   listFiles(
     context: ServiceContext,
     recordId: RecordId,
-  ): Promise<ServiceResult<readonly StoredFile[]>>;
+  ): Promise<ServiceResult<readonly ListedFile[]>>;
+  /**
+   * Virus scanning for System settings (S-040): whether a scanner is set
+   * up, and the organization's contents by scan state. System managers only.
+   */
+  fileScanStatus(context: ServiceContext): Promise<ServiceResult<FileScanStatus>>;
+  /**
+   * Scans every clean and failed content of the organization again (after
+   * the scanner's signatures were updated, say); infected ones stay
+   * quarantined. System managers only; `scanning_off` without a scanner.
+   */
+  rescanFiles(context: ServiceContext): Promise<ServiceResult<{ readonly queued: number }>>;
+  /**
+   * A job (no context): queues contents without a scan result and scans
+   * what is due; resolves when the queue is idle. Nothing without a scanner.
+   */
+  scanQueuedFiles(): Promise<ScanPass>;
+  /** Stops the scan queue (the server is closing), waiting for scans running now. */
+  stopFileScans(): Promise<void>;
 }
 
 /** service.ts's `mayChange`: access, the row locked, the place checked. */
@@ -359,7 +417,9 @@ export function fileOperations(
   thumbnails?: ThumbnailRenderer,
   thumbnailLimits: { readonly atOnce?: number; readonly perMinute?: number } = {},
   thumbnailsEnabled: boolean = THUMBNAILS_ENABLED,
+  scans?: FileScanQueue,
 ): FileOperations {
+  const scanning = scans !== undefined && store !== undefined;
   const atOnce = thumbnailLimits.atOnce ?? THUMBNAILS_AT_ONCE;
   const perMinute = thumbnailLimits.perMinute ?? THUMBNAILS_PER_MINUTE;
   let renderer = thumbnails;
@@ -404,8 +464,43 @@ export function fileOperations(
       if (file === undefined) {
         return refusal(["fileId"], "unknown_file", "The record has no such file.");
       }
+      // Only after the person may see the file: its scan (S-040, D-113).
+      const unscanned = scanRefusal(
+        shownScanState(scanning, await scanState(tx, who.organizationId, file.sha256)),
+      );
+      if (unscanned !== undefined) return unscanned;
       return { ok: true, value: { file, organizationId: who.organizationId } };
     });
+  }
+
+  /**
+   * Whether a file in this scan state may be read (D-113): with a scanner,
+   * only `clean`; without one, anything but `infected`, which is never read.
+   */
+  function scanRefusal(state: FileScanState): ServiceRefusal | undefined {
+    switch (state) {
+      case "clean":
+      case "not_scanned":
+        return undefined;
+      case "infected":
+        return refusal(
+          ["fileId"],
+          "quarantined",
+          "A virus was found in this file. It is quarantined and can't be opened.",
+        );
+      case "failed":
+        return refusal(
+          ["fileId"],
+          "scan_failed",
+          "This file couldn't be scanned for viruses yet, so it can't be opened. It is tried again.",
+        );
+      default:
+        return refusal(
+          ["fileId"],
+          "scan_pending",
+          "This file is being scanned for viruses. Try again in a moment.",
+        );
+    }
   }
 
   const missingCopy = (): ServiceRefusal =>
@@ -602,7 +697,7 @@ export function fileOperations(
           },
         );
         if (!intent.ok) return intent;
-        return await run(
+        const attached = await run(
           "attachFile",
           context,
           async (tx, who): Promise<ServiceResult<AttachedFile>> => {
@@ -660,12 +755,18 @@ export function fileOperations(
               createdAt: new Date(Math.floor(now.getTime())),
             });
             await insertStoredFileEvent(tx, who.organizationId, "attached", file, who.actor);
+            // Its scan queued with the row (S-040): content already known
+            // keeps its result, so infected bytes stay quarantined.
+            if (scanning) await queueScan(tx, who.organizationId, received.sha256);
             // Last, still under the file lock: the bytes at their content path.
             await store.place(received);
             await store.touch(who.organizationId, received.sha256);
             return { ok: true, value: Object.freeze({ file, created: true }) };
           },
         );
+        // Scanned after COMMIT, in the background: the upload doesn't wait.
+        if (attached.ok && attached.value.created) scans?.kick();
+        return attached;
       } finally {
         await store?.discard(received).catch(() => undefined);
       }
@@ -967,8 +1068,62 @@ export function fileOperations(
         const allowed = await mayChange(tx, who, recordId, "share", []);
         if (!allowed.ok) return allowed;
         const files = await listStoredFiles(tx, who.organizationId, recordId);
-        return { ok: true, value: files };
+        const scans = await scanStates(
+          tx,
+          who.organizationId,
+          files.map((f) => f.sha256),
+        );
+        const listed: readonly ListedFile[] = Object.freeze(
+          files.map((f) =>
+            Object.freeze({ ...f, scan: shownScanState(scanning, scans.get(f.sha256)) }),
+          ),
+        );
+        return { ok: true, value: listed };
       });
+    },
+
+    async fileScanStatus(context) {
+      return run("fileScanStatus", context, async (tx, who) => {
+        const access = await readAccess(tx, who.organizationId, who.actor);
+        if (!access.ok) return access;
+        if (!access.value.systemManager) return notPermitted();
+        const counts = await scanCounts(tx, who.organizationId);
+        return { ok: true, value: Object.freeze({ scanning, counts }) };
+      });
+    },
+
+    async rescanFiles(context) {
+      const result = await run(
+        "rescanFiles",
+        context,
+        async (tx, who): Promise<ServiceResult<{ readonly queued: number }>> => {
+          const access = await readAccess(tx, who.organizationId, who.actor);
+          if (!access.ok) return access;
+          if (!access.value.systemManager) return notPermitted();
+          if (!scanning) {
+            return refusal(
+              ["files"],
+              "scanning_off",
+              "No virus scanner is set up on this server, so nothing can be scanned.",
+            );
+          }
+          const queued = await rescanContents(tx, who.organizationId, who.actor);
+          return { ok: true, value: Object.freeze({ queued }) };
+        },
+      );
+      if (result.ok) scans?.kick();
+      return result;
+    },
+
+    async scanQueuedFiles() {
+      if (scans === undefined || store === undefined) {
+        return Object.freeze({ queued: 0, clean: 0, infected: 0, failed: 0 });
+      }
+      return scans.runOnce();
+    },
+
+    async stopFileScans() {
+      await scans?.stop();
     },
   };
 }

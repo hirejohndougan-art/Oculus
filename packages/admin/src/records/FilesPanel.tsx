@@ -13,8 +13,16 @@
  * off until T-072, D-097) and open in a simple viewer (FileViewer.tsx),
  * where the browser shows the image itself. Which files are images is decided by the type
  * the server sniffed from the bytes, never by the name.
+ *
+ * Virus scanning (S-040, D-113): each file shows its scan as a pill
+ * (Scanning…, Clean, Infected (quarantined), Scan failed, Not scanned).
+ * Only files the server will send get a Download link and a preview: with
+ * a scanner, clean ones; without one, every file but an infected one, and
+ * a notice says they were not scanned for viruses. While any file is being
+ * scanned the list is read again every few seconds, marked
+ * `X-Oculus-Background: 1` (it isn't a use of the session).
  */
-import { useRef, useState } from "react";
+import { useRef, useState, type ReactNode } from "react";
 import { Button as AriaButton, FileTrigger } from "react-aria-components";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, api, problemText, uploadFile } from "../api";
@@ -24,13 +32,47 @@ import { FileViewer, fileUrl } from "./FileViewer";
 import { whenText } from "./model";
 import styles from "./Records.module.css";
 
+/** A file's virus scan, as the server lists it (D-113). */
+export type ScanState = "pending" | "clean" | "infected" | "failed" | "not_scanned";
+
 export interface StoredFileEntry {
   readonly id: string;
   readonly name: string;
   readonly size: number;
   readonly mediaType: string;
   readonly createdAt: string;
+  /** Left out by servers before S-040: read as not scanned. */
+  readonly scan?: ScanState;
 }
+
+/** How often the list is read again while a file is being scanned. */
+export const SCAN_POLL_MS = 4000;
+
+/** Whether the server sends this file (D-113): clean, or not scanned at all. */
+export function servable(file: StoredFileEntry): boolean {
+  return file.scan === undefined || file.scan === "clean" || file.scan === "not_scanned";
+}
+
+const SCAN_PILLS: Readonly<Record<ScanState, { readonly label: string; readonly tone: string }>> = {
+  pending: { label: "Scanning…", tone: styles.blue },
+  clean: { label: "Clean", tone: styles.green },
+  infected: { label: "Infected (quarantined)", tone: styles.red },
+  failed: { label: "Scan failed", tone: styles.amber },
+  not_scanned: { label: "Not scanned", tone: styles.gray },
+};
+
+/** The file's scan as DESIGN.md's pill. */
+export function ScanPill(props: { readonly scan: ScanState | undefined }) {
+  const pill = SCAN_PILLS[props.scan ?? "not_scanned"];
+  return <span className={`${styles.pill} ${pill.tone}`}>{pill.label}</span>;
+}
+
+/** What stands in for the Download link of a file the server won't send. */
+const WITHHELD: Readonly<Record<string, string>> = {
+  pending: "Download once the scan is done",
+  failed: "Download once a scan succeeds",
+  infected: "Quarantined: can't be downloaded",
+};
 
 interface FileListReply {
   readonly files: readonly StoredFileEntry[];
@@ -110,11 +152,21 @@ interface Props {
 export function FilesPanel(props: Props) {
   const { siteId, recordId } = props;
   const queries = useQueryClient();
+  /** Set while files are being scanned: the reads that follow are the poll's. */
+  const polling = useRef(false);
   const list = useQuery({
     queryKey: filesKey(recordId),
     queryFn: () =>
-      api<FileListReply>(`/api/records/${encodeURIComponent(recordId)}/files`, { site: siteId }),
+      api<FileListReply>(`/api/records/${encodeURIComponent(recordId)}/files`, {
+        site: siteId,
+        background: polling.current,
+      }),
     refetchOnWindowFocus: false,
+    refetchInterval: (query) => {
+      const scanning = query.state.data?.files.some((f) => f.scan === "pending") === true;
+      polling.current = scanning;
+      return scanning ? SCAN_POLL_MS : false;
+    },
   });
   const [uploads, setUploads] = useState<readonly Upload[]>([]);
   const [busy, setBusy] = useState(false);
@@ -218,7 +270,27 @@ export function FilesPanel(props: Props) {
   }
 
   const files = list.data?.files ?? [];
-  const images = files.filter((f) => VIEWABLE.has(f.mediaType));
+  const images = files.filter((f) => VIEWABLE.has(f.mediaType) && servable(f));
+  const unscanned = files.some((f) => f.scan === "not_scanned");
+  const infected = files.filter((f) => f.scan === "infected").length;
+  const scanNotes: ReactNode[] = [];
+  if (unscanned) {
+    scanNotes.push(
+      <Note key="unscanned" tone="amber">
+        These files have not been scanned for viruses: this server has no virus scanner set up. Open
+        them only if you trust where they came from.
+      </Note>,
+    );
+  }
+  if (infected > 0) {
+    scanNotes.push(
+      <Note key="infected" tone="amber">
+        {infected === 1
+          ? "A virus was found in one file. It is quarantined: no one can download or open it."
+          : `Viruses were found in ${String(infected)} files. They are quarantined: no one can download or open them.`}
+      </Note>,
+    );
+  }
   const done = uploads.filter((u) => u.status === "done").length;
 
   return (
@@ -338,72 +410,83 @@ export function FilesPanel(props: Props) {
       ) : files.length === 0 ? (
         <p className={styles.empty}>No files yet.</p>
       ) : (
-        <div className={styles.tableWrap}>
-          <table className={styles.table}>
-            <caption>Files on this record</caption>
-            <thead>
-              <tr>
-                <th scope="col">Preview</th>
-                <th scope="col">Name</th>
-                <th scope="col">Size</th>
-                <th scope="col">Type</th>
-                <th scope="col">Added</th>
-                <th scope="col">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {files.map((f) => (
-                <tr key={f.id}>
-                  <td>
-                    {VIEWABLE.has(f.mediaType) ? (
-                      <AriaButton
-                        className={styles.thumbButton}
-                        id={previewId(f.id)}
-                        aria-label={`Preview ${f.name}`}
-                        onPress={() => {
-                          setViewing(images.indexOf(f));
-                        }}
-                      >
-                        <span className={styles.thumbPlaceholder}>
-                          {FORMAT_LABELS[f.mediaType] ?? "View"}
-                        </span>
-                      </AriaButton>
-                    ) : (
-                      <span className={styles.meta}>None</span>
-                    )}
-                  </td>
-                  <td>{f.name}</td>
-                  <td>{sizeText(f.size)}</td>
-                  <td>{f.mediaType}</td>
-                  <td>{whenText(f.createdAt)}</td>
-                  <td>
-                    <div className={styles.fileActions}>
-                      <a
-                        className={styles.downloadLink}
-                        href={fileUrl(recordId, f.id, "content")}
-                        download
-                      >
-                        Download {f.name}
-                      </a>
-                      {props.canUpload ? (
-                        <Button
-                          variant="link"
-                          isDisabled={busy || removeBusy}
+        <>
+          {scanNotes}
+          <div className={styles.tableWrap}>
+            <table className={styles.table}>
+              <caption>Files on this record</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Preview</th>
+                  <th scope="col">Name</th>
+                  <th scope="col">Size</th>
+                  <th scope="col">Type</th>
+                  <th scope="col">Added</th>
+                  <th scope="col">Virus scan</th>
+                  <th scope="col">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {files.map((f) => (
+                  <tr key={f.id}>
+                    <td>
+                      {VIEWABLE.has(f.mediaType) && servable(f) ? (
+                        <AriaButton
+                          className={styles.thumbButton}
+                          id={previewId(f.id)}
+                          aria-label={`Preview ${f.name}`}
                           onPress={() => {
-                            setNotice(undefined);
-                            setRemoving(f);
+                            setViewing(images.indexOf(f));
                           }}
                         >
-                          Remove {f.name}
-                        </Button>
-                      ) : null}
-                    </div>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+                          <span className={styles.thumbPlaceholder}>
+                            {FORMAT_LABELS[f.mediaType] ?? "View"}
+                          </span>
+                        </AriaButton>
+                      ) : (
+                        <span className={styles.meta}>None</span>
+                      )}
+                    </td>
+                    <td>{f.name}</td>
+                    <td>{sizeText(f.size)}</td>
+                    <td>{f.mediaType}</td>
+                    <td>{whenText(f.createdAt)}</td>
+                    <td>
+                      <ScanPill scan={f.scan} />
+                    </td>
+                    <td>
+                      <div className={styles.fileActions}>
+                        {servable(f) ? (
+                          <a
+                            className={styles.downloadLink}
+                            href={fileUrl(recordId, f.id, "content")}
+                            download
+                          >
+                            Download {f.name}
+                          </a>
+                        ) : (
+                          <span className={styles.meta}>{WITHHELD[f.scan ?? ""] ?? ""}</span>
+                        )}
+                        {props.canUpload ? (
+                          <Button
+                            variant="link"
+                            isDisabled={busy || removeBusy}
+                            onPress={() => {
+                              setNotice(undefined);
+                              setRemoving(f);
+                            }}
+                          >
+                            Remove {f.name}
+                          </Button>
+                        ) : null}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
       )}
     </section>
   );

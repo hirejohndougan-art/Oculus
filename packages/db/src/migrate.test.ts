@@ -25,6 +25,8 @@ import { freshDatabase, type TestDatabase } from "./test-database.fixtures.js";
 /** Every table the real migrations create, in name order. */
 const ALL_TABLES = [
   "dublin_core_mappings",
+  "file_scan_events",
+  "file_scans",
   "file_store_binding",
   "file_store_epochs",
   "former_identifiers",

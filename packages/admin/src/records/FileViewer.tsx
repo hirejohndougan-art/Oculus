@@ -29,6 +29,10 @@ export function viewErrorText(status: number): string {
       return "This image can't be shown here: it is too large or not a plain image. Download it to see it.";
     case 404:
       return "This file is no longer on the record. Reload the page.";
+    case 409:
+      return "This image hasn't passed its virus scan yet, so it can't be shown. Try again in a moment.";
+    case 423:
+      return "A virus was found in this file. It is quarantined and can't be shown.";
     case 401:
       return "You have been signed out. Sign in again to see this image.";
     case 429:

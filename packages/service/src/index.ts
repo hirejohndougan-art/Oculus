@@ -58,6 +58,27 @@ export type {
   StoreMarker,
 } from "./file-store.js";
 export { MAX_THUMBNAIL_SOURCE_BYTES, VIEW_HEADER_BYTES } from "./files.js";
+export { shownScanState } from "./files.js";
+export {
+  CLAMD_DEFAULT_STREAM_MAX_BYTES,
+  DEFAULT_CHUNK_BYTES,
+  MAX_REPLY_BYTES,
+  clamdAddressProblem,
+  isLoopback,
+  parseClamdReply,
+  pingClamd,
+  scanWithClamd,
+} from "./clamd.js";
+export type { ClamdAddress, ClamdFailure, ClamdOptions, ClamdVerdict } from "./clamd.js";
+export {
+  DEFAULT_SCAN_CONCURRENCY,
+  MAX_SCAN_BACKOFF_MS,
+  SCAN_ACTOR,
+  clamdScanner,
+  fileScanQueue,
+  scanBackoffMs,
+} from "./file-scans.js";
+export type { FileScanQueue, FileScanQueueOptions, FileScanner, ScanPass } from "./file-scans.js";
 export {
   THUMBNAIL_BOXES,
   THUMBNAIL_LIMITS,
@@ -80,6 +101,9 @@ export type {
   AttachOptions,
   AttachedFile,
   FileOperations,
+  FileScanState,
+  FileScanStatus,
+  ListedFile,
   FileStoreProblem,
   FileSweep,
   PurgeEntry,

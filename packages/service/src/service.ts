@@ -129,6 +129,7 @@ import {
 import { adminOperations, type AdminOperations } from "./admin.js";
 import { definitionOperations, type DefinitionOperations } from "./definitions.js";
 import type { FileStore } from "./file-store.js";
+import { fileScanQueue, type FileScanner, type FileScanQueueOptions } from "./file-scans.js";
 import type { ThumbnailRenderer } from "./thumbnails.js";
 import { fileOperations, type FileOperations } from "./files.js";
 import { peopleOperations, type PeopleOperations } from "./people.js";
@@ -380,6 +381,16 @@ export interface ServiceOptions {
    * until T-072, D-097). Only tests of the code kept for T-072 turn it on.
    */
   readonly thumbnailsEnabled?: boolean;
+  /**
+   * The virus scanner (S-040, D-113; `clamdScanner`). With it and a file
+   * store, each upload is scanned in the background and only clean files
+   * are read; without it files are `not_scanned` and read as before (an
+   * infected one never). Whoever builds the service stops its queue
+   * (`stopFileScans`).
+   */
+  readonly scanner?: FileScanner;
+  /** The scan queue's concurrency and backoff (tests shorten it). */
+  readonly scanQueue?: Pick<FileScanQueueOptions, "concurrency" | "backoffMs">;
   /**
    * The most published records a Dublin Core mapping change lists one by
    * one; past it, the change is confirmed by its count (S-039). Default
@@ -3017,6 +3028,12 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
       options.thumbnails,
       options.thumbnailLimits,
       options.thumbnailsEnabled,
+      options.scanner === undefined || options.files === undefined
+        ? undefined
+        : fileScanQueue(db, options.files, options.scanner, {
+            ...options.scanQueue,
+            ...(onError === undefined ? {} : { onError }),
+          }),
     ),
     ...shareOperations(db, run, outside),
     submitForReview: workflowAction("submit_for_review"),

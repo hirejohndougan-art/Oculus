@@ -46,6 +46,7 @@ import { Roles } from "./people/Roles";
 import { Updates } from "./settings/Updates";
 import { Code } from "./screens/Code";
 import { SettingsLayout, SignInSettings, SitesSettings } from "./settings/Settings";
+import { FileScanSettings } from "./settings/FileScans";
 import { DublinCoreScreen } from "./settings/DublinCoreEditor";
 import { TemplateList, TemplateScreen } from "./settings/TemplateEditor";
 import { ResetComplete } from "./screens/ResetComplete";
@@ -167,6 +168,8 @@ export const ROUTES: RouteObject[] = [
               { path: "templates/:key/dublin-core", element: <DublinCoreScreen /> },
               { path: "new-template", element: <TemplateScreen isNew /> },
               { path: "sign-in", element: <SignInSettings /> },
+              // Virus scanning (S-040).
+              { path: "files", element: <FileScanSettings /> },
               // Software updates (T-060).
               { path: "updates", element: <Updates /> },
             ],
