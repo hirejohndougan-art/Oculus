@@ -7,7 +7,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - What changed: **T-034e** each organization's time zone (migration 0029) and its own calendar day in the publish check and public output, through `organization_local_day`; `GET`/`PUT /api/organization/time-zone`. **T-064** (John, Q-10) site managers see role-less members by name only and grant only to people holding a role on their sites. **T-065** (John, Q-11) inviting needs a recent sign-in. **S-032** a too-large `If-Match` version is 400. **S-029** the deadlock test not reproduced in 270+ rounds under load; notes in the roadmap.
 - Decisions: D-103; D-084 amended (T-064, T-065)
 - Review: T-034e two independent rounds, nothing blocking (canonical zone names, failing closed on an unknown stored zone, who changed it). T-064 two rounds: the first found a manager of every site could grant to (and so reveal) someone holding only an every-site role, fixed with one shared rule and tests, and a read race fixed; the second found nothing blocking.
-- Gate: see below
+- Gate: PASS · tests_passing 4651 (was 4624) · npm audit clean · licences all permissive
 - Next: the next free job on the board
 
 ## 2026-11-25 02:40 CT — manual (Chat E) — T-034d Public subject counts
