@@ -21,6 +21,7 @@ export {
   openDatabase,
   typeParsers,
   ConnectionLostError,
+  isDatabaseTimeout,
   createDatabase,
   dropDatabase,
 } from "./client.js";
@@ -94,6 +95,8 @@ export {
   publishCheckIssues,
   readPublicRecord,
   readSharedPublicRecord,
+  PUBLIC_READ_TIME_LIMIT_MS,
+  MAX_PUBLIC_READ_TIME_LIMIT_MS,
   publicValueSources,
   inheritedValues,
   recordDependents,

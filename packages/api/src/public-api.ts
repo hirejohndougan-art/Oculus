@@ -31,9 +31,15 @@
  * can touch up to 10,000 records. And at most `maxConcurrent` reads run at
  * once (the public pool's size): past that a read is refused at once with
  * `503 busy`, so requests never queue for a connection behind slow reads.
+ * Each read also has time limits of its own (S-037): its statements run
+ * under `readPublicRecord`'s `statement_timeout`, and the pool waits at most
+ * `PUBLIC_POOL_WAIT_MS` for a connection (`publicPoolOptions`); either
+ * running out is `503 busy` too.
  */
 import { isRecordId } from "@oculus/core";
 import {
+  isDatabaseTimeout,
+  MAX_PUBLIC_READ_TIME_LIMIT_MS,
   readPublicRecord,
   readSharedPublicRecord,
   type Database,
@@ -44,6 +50,25 @@ import type { PublicSite } from "./public-sites.js";
 import { DEFAULT_RATE_LIMITS, SessionRateLimiter, type RateBucket } from "./rate-limit.js";
 import type { OculusRequest, OculusRoute } from "./routes.js";
 import type { ApiLogRecord } from "./staff-api.js";
+
+/** The public reader pool's connections, and so the public routes' read slots. */
+export const PUBLIC_POOL_SIZE = 4;
+
+/** How long the public reader pool waits for a connection, in milliseconds (S-037). */
+export const PUBLIC_POOL_WAIT_MS = 5_000;
+
+/**
+ * The options every process opens the public reader pool with (S-037):
+ * `max` connections, at most `PUBLIC_POOL_WAIT_MS` waiting for one. A
+ * route's `maxConcurrent` (or its `ReadSlots`) must not exceed `max`.
+ */
+export function publicPoolOptions(max = PUBLIC_POOL_SIZE): {
+  applicationName: string;
+  max: number;
+  connectionTimeoutMillis: number;
+} {
+  return { applicationName: "oculus-public", max, connectionTimeoutMillis: PUBLIC_POOL_WAIT_MS };
+}
 
 export interface PublicApiOptions {
   /** The public reader's pool (D-080), checked at startup (public-sites.ts). */
@@ -57,6 +82,8 @@ export interface PublicApiOptions {
   readonly maxConcurrent?: number;
   /** Slots shared with the OAI-PMH routes (T-050c), in place of `maxConcurrent`. */
   readonly slots?: ReadSlots;
+  /** Each read's statement time limit (S-037); `readPublicRecord`'s default when left out. */
+  readonly timeLimitMs?: number;
 }
 
 /**
@@ -79,6 +106,20 @@ export class ReadSlots {
   }
   give(): void {
     if (this.running > 0) this.running -= 1;
+  }
+}
+
+/** Refuses at build time a time limit `readPublicRecord` would refuse on every read. */
+export function checkTimeLimit(timeLimitMs: number | undefined): void {
+  if (timeLimitMs === undefined) return;
+  if (
+    !Number.isInteger(timeLimitMs) ||
+    timeLimitMs < 1 ||
+    timeLimitMs > MAX_PUBLIC_READ_TIME_LIMIT_MS
+  ) {
+    throw new RangeError(
+      `timeLimitMs must be a whole number from 1 to ${String(MAX_PUBLIC_READ_TIME_LIMIT_MS)}`,
+    );
   }
 }
 
@@ -121,7 +162,8 @@ export function publicApiRoutes(options: PublicApiOptions): OculusRoute[] {
     options.clock,
   );
   const log = options.log ?? (() => undefined);
-  const slots = options.slots ?? new ReadSlots(options.maxConcurrent ?? 4);
+  const slots = options.slots ?? new ReadSlots(options.maxConcurrent ?? PUBLIC_POOL_SIZE);
+  checkTimeLimit(options.timeLimitMs);
   /** A shared item's home site's public origin, when it is one of this server's public sites. */
   const homeOrigin = (home: SharedHome): string | undefined =>
     options.sites.find((s) => s.siteId === home.siteId && s.organizationId === home.organizationId)
@@ -148,6 +190,7 @@ export function publicApiRoutes(options: PublicApiOptions): OculusRoute[] {
         try {
           result = await readPublicRecord(options.db, site.organizationId, site.siteId, id, {
             baseUrl: `${site.origin}/records/`,
+            ...(options.timeLimitMs === undefined ? {} : { timeLimitMs: options.timeLimitMs }),
           });
           if (!result.ok) {
             // Not the site's own: maybe an item shared into it (T-041f).
@@ -157,10 +200,18 @@ export function publicApiRoutes(options: PublicApiOptions): OculusRoute[] {
               site.organizationId,
               site.siteId,
               id,
-              { baseUrlFor: (home) => `${homeOrigin(home) ?? site.origin}/records/` },
+              {
+                baseUrlFor: (home) => `${homeOrigin(home) ?? site.origin}/records/`,
+                ...(options.timeLimitMs === undefined ? {} : { timeLimitMs: options.timeLimitMs }),
+              },
             );
           }
         } catch (error) {
+          if (isDatabaseTimeout(error)) {
+            // A time limit ran out (S-037): busy, as when every slot is taken.
+            log({ event: "service_error", operation, name: "timeout" });
+            throw new Refusal(503, "busy");
+          }
           // The class name only (a database fault and a bug look different), never the message.
           log({
             event: "service_error",
