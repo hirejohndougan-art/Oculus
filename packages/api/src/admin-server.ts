@@ -14,9 +14,13 @@
  *   passwords by anyone make everyone wait). In development (`NODE_ENV`
  *   `development` or `test`) the server runs on localhost, where one
  *   address is expected;
- * - in production, no `deliverReset` is given (T-040 makes the email
- *   sender). In development, the default only logs that a link was made,
- *   never the token or the address (D-068's secrecy rule);
+ * - no mail sender can be made (`mailerFromEnv`, mail.ts, D-085): in
+ *   production SMTP must be configured (`OCULUS_SMTP_HOST`,
+ *   `OCULUS_MAIL_FROM`, `OCULUS_ADMIN_ORIGIN`) and the development
+ *   sender's variables must not be set. In development without SMTP, the
+ *   development sender logs only the message's kind, never the token or
+ *   the address (D-068's secrecy rule). A `mailer` or `deliverReset` passed
+ *   in is used as it is;
  * - `OCULUS_ADMIN_ORIGIN` is set but isn't one of `OCULUS_ORIGINS`, or the
  *   admin build can't be read.
  *
@@ -34,10 +38,14 @@ import { loadSecretKeyring, sql, type Database, type PasswordResetDelivery } fro
 import { createService } from "@oculus/service";
 import type { FastifyInstance } from "fastify";
 import { ADMIN_ORIGIN_ENV, loadAdminFiles, type AdminFiles } from "./admin-files.js";
+import { isProduction } from "./environment.js";
+import { mailerFromEnv, type Mailer } from "./mail.js";
 import { trustedProxyFromEnv } from "./proxy.js";
 import { buildServer, type ServerOptions } from "./server.js";
 import { signInRoutes, type SignInApiOptions } from "./sign-in-api.js";
 import { serviceErrorLogger, staffApiRoutes, type ApiLogRecord } from "./staff-api.js";
+
+export { isProduction };
 
 export const CLIENT_ADDRESS_ENV = "OCULUS_CLIENT_ADDRESS";
 
@@ -55,7 +63,12 @@ export interface AdminServerOptions {
   readonly db: Database;
   /** Defaults to `process.env`. */
   readonly env?: Readonly<Record<string, string | undefined>>;
-  /** Sends password reset links (T-040). Required in production. */
+  /**
+   * The mail sender (mail.ts, D-085); default: `mailerFromEnv(env)`. Whoever
+   * passes one closes it.
+   */
+  readonly mailer?: Mailer;
+  /** Sends password reset links in place of the mailer's (tests). */
   readonly deliverReset?: PasswordResetDelivery;
   /** The admin build's folder (default: packages/admin/dist). */
   readonly adminDir?: string;
@@ -69,18 +82,13 @@ export interface AdminServerOptions {
   readonly signIn?: Pick<SignInApiOptions, "rateLimits" | "clock" | "resetOptions">;
 }
 
-function defaultLog(record: ApiLogRecord): void {
+/** The default log: one JSON line on standard error. */
+export function defaultLog(record: ApiLogRecord): void {
   try {
     process.stderr.write(`${JSON.stringify({ oculus: record })}\n`);
   } catch {
     // Logging can't stop the server.
   }
-}
-
-/** True unless `NODE_ENV` says development or test. */
-export function isProduction(env: Readonly<Record<string, string | undefined>>): boolean {
-  const mode = env.NODE_ENV;
-  return mode !== "development" && mode !== "test";
 }
 
 /**
@@ -117,19 +125,11 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   const addressProblem = clientAddressProblem(env);
   if (addressProblem !== undefined) throw new Error(addressProblem);
 
-  let deliverReset = options.deliverReset;
-  if (deliverReset === undefined) {
-    if (production) {
-      throw new Error(
-        "refusing to start: no password reset sender (deliverReset) is configured (T-040).",
-      );
-    }
-    deliverReset = () => {
-      // Development only: say a link was made, never the token or the address.
-      log({ event: "reset_link_produced" });
-      return Promise.resolve();
-    };
-  }
+  // D-085: a real sender in production, the development one (which logs
+  // the kind only) elsewhere. Made before anything else starts, so a
+  // refusal leaves nothing running.
+  const deliverReset =
+    options.deliverReset ?? (options.mailer ?? mailerFromEnv(env, { log })).deliverReset;
 
   const adminOrigin = env[ADMIN_ORIGIN_ENV];
   let admin: ServerOptions["admin"];

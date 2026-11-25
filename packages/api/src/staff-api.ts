@@ -86,8 +86,15 @@ export interface ApiLogRecord {
     | "sign_in_error"
     | "client_address_warning"
     | "reset_settled"
-    | "reset_link_produced"
-    | "startup_warning";
+    | "startup_warning"
+    // The mail outbox and senders (mail-outbox.ts, mail.ts, D-085): the
+    // message kind as `operation`, an error class or reason as `code`.
+    | "mail_sent"
+    | "mail_retry"
+    | "mail_failed"
+    | "mail_refused"
+    | "mail_dropped"
+    | "mail_dev";
   readonly operation?: string;
   readonly code?: string;
   readonly name?: string;

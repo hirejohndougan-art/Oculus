@@ -21,6 +21,7 @@
     "@oculus/core": "0.0.0",
     "@oculus/db": "0.0.0",
     "@oculus/service": "0.0.0",
-    "fastify": "5.12.8"
+    "fastify": "5.12.8",
+    "nodemailer": "10.6.1"
   }
 }
