@@ -14,7 +14,7 @@
   "scripts": {
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "lint": "eslint .",
+    "lint": "node --max-old-space-size=4096 node_modules/eslint/bin/eslint.js .",
     "typecheck": "npm run typecheck --workspaces",
     "test": "vitest run",
     "build": "npm run build -w @oculus/core && npm run build -w @oculus/db && npm run build -w @oculus/service && npm run build -w @oculus/api && npm run build -w @oculus/admin",
