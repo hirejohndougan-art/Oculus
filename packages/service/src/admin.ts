@@ -148,7 +148,7 @@ const UNKNOWN_SITE = "There is no such site.";
 const UNKNOWN_ASSIGNMENT = "There is no such role assignment.";
 
 /** An own data property, never a getter's result or a proxy trap's. */
-function own(input: unknown, key: string): unknown {
+export function own(input: unknown, key: string): unknown {
   if (typeof input !== "object" || input === null) return undefined;
   try {
     const d = Object.getOwnPropertyDescriptor(input, key);
@@ -159,7 +159,7 @@ function own(input: unknown, key: string): unknown {
 }
 
 /** Only `keys`, as own string keys of a plain object. */
-function hasOnly(input: unknown, keys: readonly string[]): boolean {
+export function hasOnly(input: unknown, keys: readonly string[]): boolean {
   if (typeof input !== "object" || input === null || Array.isArray(input)) return false;
   try {
     const proto: unknown = Object.getPrototypeOf(input);
@@ -171,7 +171,7 @@ function hasOnly(input: unknown, keys: readonly string[]): boolean {
 }
 
 /** The sites on which `access` may manage people (every site: `"all"`). */
-function managedSites(access: Access): "all" | ReadonlySet<SiteId> {
+export function managedSites(access: Access): "all" | ReadonlySet<SiteId> {
   if (access.systemManager) return "all";
   const sites = new Set<SiteId>();
   for (const g of access.grants) {
@@ -183,11 +183,169 @@ function managedSites(access: Access): "all" | ReadonlySet<SiteId> {
 }
 
 /** Whether `access` may grant or revoke this kind of assignment. */
-function mayManage(access: Access, role: BuiltInRole, siteId: SiteId | null): boolean {
+export function mayManage(access: Access, role: BuiltInRole, siteId: SiteId | null): boolean {
   if (access.systemManager) return true;
   // Site managers and roles on every site are system managers' (D-025).
   if (role === "site_manager" || siteId === null) return false;
   return permits(access, "site.people", { on: "site", siteId });
+}
+
+interface Who { readonly organizationId: OrganizationId; readonly actor: string }
+
+/** Grants a role in the caller's transaction (`grantRole`'s rules; the people service adds its log). */
+export async function grantRoleIn(
+  tx: Queryable,
+  who: Who,
+  request: unknown,
+): Promise<ServiceResult<RoleAssignment>> {
+  const org = who.organizationId;
+  if (!hasOnly(request, ["userId", "role", "siteId", "scope"])) {
+    return refusal(
+      ["request"],
+      "invalid_request",
+      "A role grant is userId, role, siteId (or null) and scope (or null).",
+    );
+  }
+  if (!Object.hasOwn(request as object, "siteId") || !Object.hasOwn(request as object, "scope")) {
+    return refusal(
+      ["request"],
+      "invalid_request",
+      "Name the site and the scope, each null for every site or the whole catalog.",
+    );
+  }
+  const userId = own(request, "userId");
+  const role = own(request, "role");
+  const siteId = own(request, "siteId");
+  const scope = own(request, "scope");
+  if (!isUserId(userId)) {
+    return refusal(["userId"], "invalid_id", "A person's ID is a lowercase version 4 UUID.");
+  }
+  if (!isBuiltInRole(role)) {
+    return refusal(["role"], "unknown_role", `A role is one of ${BUILT_IN_ROLES.join(", ")}.`);
+  }
+  if (siteId !== null && !isSiteId(siteId)) {
+    return refusal(["siteId"], "invalid_id", "A site ID is a lowercase version 4 UUID.");
+  }
+  if (scope !== null && !isRecordId(scope)) {
+    return refusal(["scope"], "invalid_id", "A record ID is a lowercase version 4 UUID.");
+  }
+  // A first look without locks: who the actor is and whether the
+  // person is a member, before any row is locked.
+  const first = await readAccess(tx, org, who.actor, { lock: false });
+  if (!first.ok) return first;
+  if (!mayManage(first.value, role, siteId)) return notPermitted();
+  if (role === "site_manager" && scope !== null) {
+    return refusal(
+      ["scope"],
+      "whole_catalog_only",
+      "A site manager manages a whole site, never one collection.",
+    );
+  }
+  if (!(await isMember(tx, org, userId))) {
+    return refusal(["userId"], "unknown_person", UNKNOWN_PERSON);
+  }
+  // Then both people's rows, in ID order, and the same checks again
+  // under the locks: the person's roles change one at a time (after
+  // any write in flight that checked them), and the actor's can't
+  // change before COMMIT.
+  await lockPeopleForRoleChange(tx, [first.userId, userId]);
+  const access = await readAccess(tx, org, who.actor);
+  if (!access.ok) return access;
+  if (!mayManage(access.value, role, siteId)) return notPermitted();
+  if (!(await isMember(tx, org, userId))) {
+    return refusal(["userId"], "unknown_person", UNKNOWN_PERSON);
+  }
+  if (siteId !== null && (await readSite(tx, org, siteId)) === undefined) {
+    return refusal(["siteId"], "unknown_site", UNKNOWN_SITE);
+  }
+  if (scope !== null) {
+    // The unit must be on the grant's site (any site of the
+    // organization for a grant on every site), for everyone, and one
+    // the actor may view. Anything else is answered exactly as a unit
+    // that doesn't exist, before its kind is looked at, so the answer
+    // says nothing about records the actor can't see (D-074 review).
+    // The arrangement lock (for scoped grants) and then the unit's
+    // row FOR SHARE hold its site and place until COMMIT.
+    const unknownScope = refusal<RoleAssignment>(
+      ["scope"],
+      "unknown_record",
+      "The organization has no such record.",
+    );
+    const checker = new RecordAccess(tx, org, access.value);
+    await checker.settle();
+    const locked = await lockRecord(tx, org, scope, "share");
+    const place = locked === undefined ? undefined : await readRecordPlace(tx, org, scope);
+    if (place === undefined) return unknownScope;
+    const onSite = siteId === null ? place.siteId !== null : place.siteId === siteId;
+    if (!onSite) return unknownScope;
+    if (!access.value.systemManager) {
+      const hidden = await checker.onRecord(
+        {
+          kind: place.kind,
+          id: scope,
+          parentId: place.parentId,
+          represents: place.represents,
+          siteId: place.siteId,
+        },
+        [],
+      );
+      if (hidden) return unknownScope;
+    }
+    if (place.kind !== "archival_unit") {
+      return refusal(
+        ["scope"],
+        "not_a_unit",
+        "A role is granted for a fonds, series, collection, file or item.",
+      );
+    }
+  }
+  return insertRoleAssignment(tx, {
+    id: newRecordId(),
+    organizationId: org,
+    userId,
+    role,
+    siteId: siteId,
+    scope: scope,
+    grantedBy: access.userId,
+  });
+}
+
+/** Revokes a role assignment in the caller's transaction (`revokeRole`'s rules); returns the assignment revoked. */
+export async function revokeRoleIn(
+  tx: Queryable,
+  who: Who,
+  assignmentId: string,
+): Promise<ServiceResult<RoleAssignment>> {
+  const org = who.organizationId;
+  if (!isRecordId(assignmentId)) {
+    return refusal(
+      ["assignmentId"],
+      "invalid_id",
+      "An assignment ID is a lowercase version 4 UUID.",
+    );
+  }
+  const first = await readAccess(tx, org, who.actor, { lock: false });
+  if (!first.ok) return first;
+  const unknown = refusal<RoleAssignment>(
+    ["assignmentId"],
+    "unknown_assignment",
+    UNKNOWN_ASSIGNMENT,
+  );
+  const seen = await readRoleAssignment(tx, org, assignmentId);
+  // One the actor can't manage is answered as one that doesn't exist.
+  if (seen === undefined || !mayManage(first.value, seen.role, seen.siteId)) {
+    return unknown;
+  }
+  // Both people's rows in ID order (grantRole), then the checks again.
+  await lockPeopleForRoleChange(tx, [first.userId, seen.userId]);
+  const access = await readAccess(tx, org, who.actor);
+  if (!access.ok) return access;
+  const found = await readRoleAssignment(tx, org, assignmentId);
+  if (found?.userId !== seen.userId || !mayManage(access.value, found.role, found.siteId)) {
+    return unknown;
+  }
+  if (!(await deleteRoleAssignment(tx, org, assignmentId))) return unknown;
+  return { ok: true, value: found };
 }
 
 export function adminOperations(run: Runner): AdminOperations {
@@ -226,159 +384,15 @@ export function adminOperations(run: Runner): AdminOperations {
     },
 
     async grantRole(context, request) {
-      return run("grantRole", context, async (tx, who) => {
-        const org = who.organizationId;
-        if (!hasOnly(request, ["userId", "role", "siteId", "scope"])) {
-          return refusal(
-            ["request"],
-            "invalid_request",
-            "A role grant is userId, role, siteId (or null) and scope (or null).",
-          );
-        }
-        if (
-          !Object.hasOwn(request as object, "siteId") ||
-          !Object.hasOwn(request as object, "scope")
-        ) {
-          return refusal(
-            ["request"],
-            "invalid_request",
-            "Name the site and the scope, each null for every site or the whole catalog.",
-          );
-        }
-        const userId = own(request, "userId");
-        const role = own(request, "role");
-        const siteId = own(request, "siteId");
-        const scope = own(request, "scope");
-        if (!isUserId(userId)) {
-          return refusal(["userId"], "invalid_id", "A person's ID is a lowercase version 4 UUID.");
-        }
-        if (!isBuiltInRole(role)) {
-          return refusal(
-            ["role"],
-            "unknown_role",
-            `A role is one of ${BUILT_IN_ROLES.join(", ")}.`,
-          );
-        }
-        if (siteId !== null && !isSiteId(siteId)) {
-          return refusal(["siteId"], "invalid_id", "A site ID is a lowercase version 4 UUID.");
-        }
-        if (scope !== null && !isRecordId(scope)) {
-          return refusal(["scope"], "invalid_id", "A record ID is a lowercase version 4 UUID.");
-        }
-        // A first look without locks: who the actor is and whether the
-        // person is a member, before any row is locked.
-        const first = await readAccess(tx, org, who.actor, { lock: false });
-        if (!first.ok) return first;
-        if (!mayManage(first.value, role, siteId)) return notPermitted();
-        if (role === "site_manager" && scope !== null) {
-          return refusal(
-            ["scope"],
-            "whole_catalog_only",
-            "A site manager manages a whole site, never one collection.",
-          );
-        }
-        if (!(await isMember(tx, org, userId))) {
-          return refusal(["userId"], "unknown_person", UNKNOWN_PERSON);
-        }
-        // Then both people's rows, in ID order, and the same checks again
-        // under the locks: the person's roles change one at a time (after
-        // any write in flight that checked them), and the actor's can't
-        // change before COMMIT.
-        await lockPeopleForRoleChange(tx, [first.userId, userId]);
-        const access = await readAccess(tx, org, who.actor);
-        if (!access.ok) return access;
-        if (!mayManage(access.value, role, siteId)) return notPermitted();
-        if (!(await isMember(tx, org, userId))) {
-          return refusal(["userId"], "unknown_person", UNKNOWN_PERSON);
-        }
-        if (siteId !== null && (await readSite(tx, org, siteId)) === undefined) {
-          return refusal(["siteId"], "unknown_site", UNKNOWN_SITE);
-        }
-        if (scope !== null) {
-          // The unit must be on the grant's site (any site of the
-          // organization for a grant on every site), for everyone, and one
-          // the actor may view. Anything else is answered exactly as a unit
-          // that doesn't exist, before its kind is looked at, so the answer
-          // says nothing about records the actor can't see (D-074 review).
-          // The arrangement lock (for scoped grants) and then the unit's
-          // row FOR SHARE hold its site and place until COMMIT.
-          const unknownScope = refusal<RoleAssignment>(
-            ["scope"],
-            "unknown_record",
-            "The organization has no such record.",
-          );
-          const checker = new RecordAccess(tx, org, access.value);
-          await checker.settle();
-          const locked = await lockRecord(tx, org, scope, "share");
-          const place = locked === undefined ? undefined : await readRecordPlace(tx, org, scope);
-          if (place === undefined) return unknownScope;
-          const onSite = siteId === null ? place.siteId !== null : place.siteId === siteId;
-          if (!onSite) return unknownScope;
-          if (!access.value.systemManager) {
-            const hidden = await checker.onRecord(
-              {
-                kind: place.kind,
-                id: scope,
-                parentId: place.parentId,
-                represents: place.represents,
-                siteId: place.siteId,
-              },
-              [],
-            );
-            if (hidden) return unknownScope;
-          }
-          if (place.kind !== "archival_unit") {
-            return refusal(
-              ["scope"],
-              "not_a_unit",
-              "A role is granted for a fonds, series, collection, file or item.",
-            );
-          }
-        }
-        return insertRoleAssignment(tx, {
-          id: newRecordId(),
-          organizationId: org,
-          userId,
-          role,
-          siteId: siteId,
-          scope: scope,
-          grantedBy: access.userId,
-        });
-      });
+      return run("grantRole", context, (tx, who) => grantRoleIn(tx, who, request));
     },
 
     async revokeRole(context, assignmentId) {
       return run("revokeRole", context, async (tx, who) => {
-        const org = who.organizationId;
-        if (!isRecordId(assignmentId)) {
-          return refusal(
-            ["assignmentId"],
-            "invalid_id",
-            "An assignment ID is a lowercase version 4 UUID.",
-          );
-        }
-        const first = await readAccess(tx, org, who.actor, { lock: false });
-        if (!first.ok) return first;
-        const unknown = refusal<{ readonly revoked: string }>(
-          ["assignmentId"],
-          "unknown_assignment",
-          UNKNOWN_ASSIGNMENT,
-        );
-        const seen = await readRoleAssignment(tx, org, assignmentId);
-        // One the actor can't manage is answered as one that doesn't exist.
-        if (seen === undefined || !mayManage(first.value, seen.role, seen.siteId)) {
-          return unknown;
-        }
-        // Both people's rows in ID order (grantRole), then the checks again.
-        await lockPeopleForRoleChange(tx, [first.userId, seen.userId]);
-        const access = await readAccess(tx, org, who.actor);
-        if (!access.ok) return access;
-        const found = await readRoleAssignment(tx, org, assignmentId);
-        if (found?.userId !== seen.userId || !mayManage(access.value, found.role, found.siteId)) {
-          return unknown;
-        }
-        if (!(await deleteRoleAssignment(tx, org, assignmentId))) return unknown;
-        return { ok: true, value: Object.freeze({ revoked: assignmentId }) };
+        const revoked = await revokeRoleIn(tx, who, assignmentId);
+        return revoked.ok
+          ? { ok: true, value: Object.freeze({ revoked: revoked.value.id }) }
+          : revoked;
       });
     },
 

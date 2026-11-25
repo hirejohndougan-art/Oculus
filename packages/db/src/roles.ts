@@ -19,6 +19,7 @@
  * refuses a role holding anything more.
  */
 import { ACCOUNT_TABLE_PRIVILEGES } from "./accounts.js";
+import { PEOPLE_TABLE_PRIVILEGES } from "./people.js";
 import { PERMISSION_TABLE_PRIVILEGES } from "./permissions.js";
 import type { Queryable } from "./client.js";
 import { PASSWORD_RESET_TABLE_PRIVILEGES } from "./password-resets.js";
@@ -74,6 +75,8 @@ export const WRITER_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Ob
   // recovery codes written (codes also used and superseded); the wrong-code
   // counters. Nothing deletes a factor, a pass or a recovery code.
   ...SECOND_FACTOR_TABLE_PRIVILEGES,
+  // The change log of people and roles (T-048, D-084): insert only.
+  ...PEOPLE_TABLE_PRIVILEGES,
 });
 
 /**
