@@ -1,4 +1,4 @@
-// The desktop database helper (T-057, D-092): its pieces, and the whole run
+// The desktop database helper (T-057, D-093): its pieces, and the whole run
 // against a throwaway PostgreSQL that uses scram-sha-256 passwords, as an
 // installed one does, followed by the launcher connecting as the writer.
 import {

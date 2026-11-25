@@ -1,5 +1,5 @@
 /**
- * `npm run desktop:database` (T-057, D-092; on Windows
+ * `npm run desktop:database` (T-057, D-093; on Windows
  * `node packages\api\dist\desktop-database-cli.js`, which
  * `scripts/start-oculus.cmd` runs by itself the first time): sets up
  * Oculus's database on a PostgreSQL the person installed, then runs the

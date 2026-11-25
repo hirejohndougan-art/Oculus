@@ -1,5 +1,5 @@
 /**
- * The desktop database helper's parts (T-057, D-092): on a PostgreSQL the
+ * The desktop database helper's parts (T-057, D-093): on a PostgreSQL the
  * person installed themselves, make Oculus's two roles and its database
  * with the `postgres` account's password typed once, keep the new roles'
  * passwords in the person's pgpass file, and say where they are in
