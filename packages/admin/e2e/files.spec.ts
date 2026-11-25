@@ -6,7 +6,7 @@
 // rules run before and after; no CSP refusal or script error may happen.
 // With OCULUS_E2E_SHOTS set, screenshots are saved in that folder.
 import { join } from "node:path";
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type FileChooser, type Page } from "@playwright/test";
 import { accessible, collectErrors, seed, signInAndSetUp } from "./helpers";
 
 /** A real 1×1 PNG (one invented grey pixel). */
@@ -24,6 +24,16 @@ async function shot(page: Page, name: string): Promise<void> {
 test("a Scanner adds an image to a digital asset by keyboard", async ({ page }) => {
   const { scannerEmail, password, siteName, assetTitle } = seed();
   const errors = collectErrors(page);
+  // Listen for the file chooser from the start: Playwright turns on its
+  // interception when the first listener is added, which takes a round
+  // trip; added just before the key press, a fast press can beat it.
+  let chooserOpened: (chooser: FileChooser) => void = () => undefined;
+  const chooser = new Promise<FileChooser>((resolve) => {
+    chooserOpened = resolve;
+  });
+  page.on("filechooser", (opened) => {
+    chooserOpened(opened);
+  });
   await signInAndSetUp(page, scannerEmail, password);
 
   await expect(page.getByRole("heading", { level: 1, name: siteName })).toBeVisible();
@@ -40,7 +50,6 @@ test("a Scanner adds an image to a digital asset by keyboard", async ({ page }) 
   // The file chooser opens from the keyboard.
   const add = files.getByRole("button", { name: "Add files" });
   await add.focus();
-  const chooser = page.waitForEvent("filechooser");
   await page.keyboard.press("Enter");
   const picker = await chooser;
   expect(picker.isMultiple()).toBe(true);
