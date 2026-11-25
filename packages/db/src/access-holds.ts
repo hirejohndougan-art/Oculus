@@ -143,3 +143,42 @@ export async function lockRecordState(
     lastWithdrawnBy: move?.action === "withdraw" ? move.actor : null,
   });
 }
+
+/**
+ * Whether anyone but `actor` has written a version of any record above
+ * `recordId` (its parents and the records it represents, all the way up)
+ * since `recordId`'s version `version` was written: a change whose values
+ * the record would show (inherited, D-013) that nobody decided to publish
+ * through it. True also when that version can't be found.
+ */
+export async function changedAboveSince(
+  db: Queryable,
+  organizationId: OrganizationId,
+  recordId: RecordId,
+  version: number,
+  actor: string,
+): Promise<boolean> {
+  const [row] = await db.rows<{ changed: boolean }>(sql`
+    WITH RECURSIVE up(id) AS (
+      SELECT x.id FROM public.records r
+      CROSS JOIN LATERAL (VALUES (r.parent_id), (r.represents_id)) AS x(id)
+      WHERE r.organization_id = ${organizationId}::uuid AND r.id = ${recordId}::uuid
+        AND x.id IS NOT NULL
+      UNION
+      SELECT x.id FROM public.records r JOIN up ON r.id = up.id
+      CROSS JOIN LATERAL (VALUES (r.parent_id), (r.represents_id)) AS x(id)
+      WHERE r.organization_id = ${organizationId}::uuid AND x.id IS NOT NULL
+    ),
+    since AS (
+      SELECT recorded_at FROM public.record_versions
+      WHERE organization_id = ${organizationId}::uuid AND record_id = ${recordId}::uuid
+        AND version = ${version}::integer
+    )
+    SELECT NOT EXISTS (SELECT 1 FROM since)
+        OR EXISTS (
+          SELECT 1 FROM public.record_versions v JOIN up ON v.record_id = up.id, since
+          WHERE v.organization_id = ${organizationId}::uuid
+            AND v.actor <> ${actor} AND v.recorded_at > since.recorded_at
+        ) AS changed`);
+  return row?.changed !== false;
+}

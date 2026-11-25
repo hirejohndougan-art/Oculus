@@ -38,7 +38,7 @@ export function holdsLines(report: AccessHoldsReport): string[] {
   }
   if (report.blocked > 0) {
     lines.push(
-      `No longer held back, but the publish check refuses them for another reason; left withdrawn for staff to look at: ${n(report.blocked, "record", "records")}.`,
+      `No longer held back, but left withdrawn for staff to publish (the publish check refuses them for another reason, or a record above them was changed since): ${n(report.blocked, "record", "records")}.`,
     );
   }
   if (report.failed > 0) {

@@ -37,6 +37,7 @@
 import { type OrganizationId, type RecordId } from "@oculus/core";
 import {
   changeWorkflowState,
+  changedAboveSince,
   lockRecordState,
   organizationDay,
   organizationIds,
@@ -82,7 +83,11 @@ export interface AccessHoldsReport {
   readonly published: number;
   /** Records this pass had withdrawn that are still held back. */
   readonly stillHeld: number;
-  /** Records this pass had withdrawn, no longer held, that the publish check refuses for another reason. */
+  /**
+   * Records this pass had withdrawn, no longer held, left withdrawn for a
+   * person: the publish check refuses them for another reason, or a person
+   * changed a record above them since.
+   */
   readonly blocked: number;
   /** Records that couldn't be checked or changed (told to `onError`). */
   readonly failed: number;
@@ -139,6 +144,11 @@ const publishIfFree: Step = async (tx, org, id) => {
   const state = await lockRecordState(tx, org, id);
   if (state?.state !== "withdrawn" || state.lastWithdrawnBy !== ACCESS_HOLDS_ACTOR) {
     return { outcome: "skipped", keep: false };
+  }
+  // Something above it a person changed since (a parent's inherited
+  // value, or a person withdrawing the parent): left for a person to publish.
+  if (await changedAboveSince(tx, org, id, state.version, ACCESS_HOLDS_ACTOR)) {
+    return { outcome: "blocked", keep: false };
   }
   const changed = await changeWorkflowState(tx, org, id, "publish", {
     expectedVersion: state.version,

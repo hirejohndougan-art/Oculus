@@ -429,9 +429,13 @@ describe("the access-holds pass (T-034f)", () => {
       }
       await q.execute(sql`UPDATE public.records SET fields = fields - 'rights'
                           WHERE organization_id = ${w.org}::uuid AND id = ${w.vase.id}::uuid`);
-      // Put back as the migrations made them.
-      await q.execute(sql`ALTER TABLE public.records ENABLE TRIGGER zzzz_records_version_step`);
-      await q.execute(sql`ALTER TABLE public.records ENABLE TRIGGER zzzz_records_have_version`);
+      // Put back as the migrations made them (always on, 0012).
+      await q.execute(
+        sql`ALTER TABLE public.records ENABLE ALWAYS TRIGGER zzzz_records_version_step`,
+      );
+      await q.execute(
+        sql`ALTER TABLE public.records ENABLE ALWAYS TRIGGER zzzz_records_have_version`,
+      );
     });
     ok(
       await service.updateAccession(
@@ -473,13 +477,55 @@ describe("the access-holds pass (T-034f)", () => {
   it("reads every page, so no record waits behind others that never change", async () => {
     await ready();
     const w = await world();
-    ok(await service.createAccession(donors(w), accessionInput(w)));
+    const made = ok(await service.createAccession(donors(w), accessionInput(w)));
     const paged = await applyAccessHolds(s.writer, {
       apply: true,
       organizationId: w.org,
       pageSize: 1,
     });
     expect(paged).toMatchObject({ withdrawn: 2, failed: 0 });
+    expect(await stateOf(w, w.item.id)).toBe("withdrawn");
+    ok(
+      await service.updateAccession(
+        donors(w),
+        made.accession.id,
+        accessionInput(w, { deedStatus: "signed" }),
+        { expectedVersion: 1 },
+      ),
+    );
+    const again = await applyAccessHolds(s.writer, {
+      apply: true,
+      organizationId: w.org,
+      pageSize: 1,
+    });
+    expect(again).toMatchObject({ published: 2, failed: 0 });
+  });
+
+  it("leaves a record for a person when a record above it was changed since", async () => {
+    await ready();
+    const w = await world();
+    const made = ok(await service.createAccession(donors(w), accessionInput(w)));
+    expect(await pass(w)).toMatchObject({ withdrawn: 2 });
+    // A person edits the withdrawn fonds: what the item inherits may change.
+    const fonds = ok(await service.readRecord(root(w), w.fonds.id));
+    ok(
+      await service.updateRecord(
+        root(w),
+        w.fonds.id,
+        { ...fonds.record, fields: { ...fonds.record.fields, description: "Edited by a person." } },
+        { expectedVersion: fonds.version },
+      ),
+    );
+    ok(
+      await service.updateAccession(
+        donors(w),
+        made.accession.id,
+        accessionInput(w, { deedStatus: "signed" }),
+        { expectedVersion: 1 },
+      ),
+    );
+    expect(await pass(w)).toMatchObject({ published: 0, blocked: 1 });
+    expect(await stateOf(w, w.fonds.id)).toBe("withdrawn");
     expect(await stateOf(w, w.item.id)).toBe("withdrawn");
   });
 
