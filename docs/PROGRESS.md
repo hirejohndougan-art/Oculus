@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 04:00 CT — manual (Chat C) — S-041 Stored OAI-PMH datestamps
+- Result: done
+- What changed: migration 0031 (`oai_datestamps`), `writeOaiStamps`, `oaiStoredStamp` and a table-based `listPublishedForOai` (packages/db/src/oai.ts), `fingerprints` in `publicTermCountsForStaff`, the Subjects pass's `oaiStamps` option (written per site, its failures its own, shown to staff), deleted headers and `deletedRecord` transient in oai-pmh.ts, `terms` in the marker, `buildAdminServer` refusing OAI-PMH without `countsDb`.
+- Decisions: D-108
+- Review: one independent round, nothing blocking; fixed the commit-visibility window (lists wait for a write in progress), bounded and per-site-locked writes, monotonic datestamps, the terms marker, refusing OAI-PMH without the pass, GetRecord's datestamp for a record back since the last pass.
+- Gate: TBD
+- Next: T-059a (EAD reader and writer) is the next free job.
+
 ## 2026-11-25 06:10 CT — Chat B — S-039 A first mapping for a template with very many published records
 - Result: done
 - What changed: a Dublin Core mapping change on more published records than can be listed (10,000) is confirmed by its exact count (`confirmPublishedCount`, read under the template's lock) instead of being refused, system managers only; the mapping screen shows the number and sends it back, and saves an empty mapping when the template has no public fields left. `createService` takes `maxListedPublished` (tests).
