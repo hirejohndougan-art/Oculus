@@ -526,13 +526,10 @@ async function checkRoleConnection(
 
 /**
  * The functions the public sites read through, with their argument types:
- * `public_record_snapshot` (0017), the only way `readPublicRecord` reads,
- * and `public_site_record_ids` (0023), the IDs of the records public on a
- * site, for `publicTermCounts` (T-034d).
+ * `public_record_snapshot` (0017), the only way `readPublicRecord` reads.
  */
 export const PUBLIC_READER_FUNCTIONS: readonly string[] = Object.freeze([
   "public.public_record_snapshot(uuid, uuid, uuid)",
-  "public.public_site_record_ids(uuid, uuid, uuid, integer)",
 ]);
 
 /**

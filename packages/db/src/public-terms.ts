@@ -5,31 +5,39 @@
  * The staff index of `vocabularies.ts` (`record_terms`, `termUsageCounts`)
  * counts every field of every record, published or not, so it is never
  * read here. `publicTermCounts` works the counts out from the public output
- * itself, as a public site would see it: every record public on the site
- * (`public_site_record_ids`, migration 0023) goes through `publicRecordIn`
- * (`readPublicRecord`'s own path through `public_record_snapshot`, 0017),
- * all in one Repeatable Read, read-only transaction, so the counts are of
- * one moment. A record counts for a term when its public output was made
- * (anything the public output refuses counts for nothing) and the term is
- * the value, or one of the values, of a `controlled_term` field of its
- * template that its Dublin Core mapping maps: exactly the terms its public
- * output shows. Inherited values count where they are shown, on the record
- * that shows them. A record showing a term twice counts once for it.
+ * itself: every record public on the site (by 0017's `record_public_on_site`)
+ * goes through `publicRecordIn` (`readPublicRecord`'s own path through
+ * `public_record_snapshot`), all in one Repeatable Read, read-only
+ * transaction, so the counts are of one moment. A record counts for a term
+ * when its public output was made (anything the public output refuses, such
+ * as a record a deed or restriction holds back, counts for nothing) and the
+ * term is the value, or one of the values, of a `controlled_term` field of
+ * its template that its Dublin Core mapping maps: exactly the terms its
+ * public output shows. Inherited values count where they are shown, on the
+ * record that shows them. A record showing a term twice counts once for it.
  *
- * Terms are told apart by core's `termIdentity` (as the staff index does:
- * vocabulary and `termUriKey`, or vocabulary and exact label), stored as its
- * SHA-256, so an http and an https copy of one address count as one term.
- * Each count shows the label and URI as public output shows them: those of
- * the counted records, the one most of them show (ties to the lowest in code
- * unit order), never a stored staff copy or anything an unpublished record
- * holds. The connection needs no table privilege: use the public reader
- * (`grantPublicReaderRole`). Nothing is written.
+ * **What comes out is public; how it is worked out is not.** The listing
+ * reads the records table, so the connection is the server's staff one (the
+ * writer role, which a public site's process already holds), never the
+ * public reader: giving the public reader a list of every published record
+ * would hand it the IDs of records the public output holds back, whose
+ * snapshots carry staff values (review of T-034d). The result holds only
+ * what the public output shows: each term's label and URI and how many
+ * records show it, and how many records' public output was counted. It
+ * never holds a vocabulary key, a term key, an ID or a count of records
+ * held back.
+ *
+ * Terms are told apart by core's `termIdentity` (vocabulary and
+ * `termUriKey`, or vocabulary and exact label), as the staff index tells
+ * them apart, so an http and an https copy of one address count as one
+ * term. Each count shows the label and URI the most counted records show
+ * (ties to the lowest in code unit order).
  *
  * The work grows with the records on the site (one snapshot each), so a
- * public site should cache the answer; an index kept at publish time is left
- * for later (see D-095). At most `MAX_PUBLIC_COUNT_RECORDS` records are
- * read: a site with more is refused (`too_many_records`), never counted in
- * part. The issues are for staff, as every public read's are (D-016, S-007).
+ * public site must cache the answer, never work it out per request. At most
+ * `MAX_PUBLIC_COUNT_RECORDS` records are read, and the work stops after
+ * `timeLimitMs` (default 30 seconds): either refuses the whole count
+ * (`too_many_records`, `too_slow`), never a part. Issues are for staff.
  */
 import { createHash } from "node:crypto";
 import {
@@ -54,15 +62,9 @@ import { publicRecordIn } from "./workflow.js";
 
 /** At most this many records public on one site are counted (more refuses). */
 export const MAX_PUBLIC_COUNT_RECORDS = 10_000;
-/** IDs read per call of `public_site_record_ids`. */
-const PAGE = 1_000;
 
 /** How many of a site's public records show one term. */
 export interface PublicTermCount {
-  /** SHA-256 of core's `termIdentity`, as `termKey` in `vocabularies.ts`. */
-  readonly termKey: string;
-  /** The term's vocabulary; `local` for a local term. */
-  readonly vocabulary: string;
   /** The label most of the counted records' public output shows. */
   readonly label: string;
   /** The URI shown with that label, when it has one. */
@@ -71,10 +73,10 @@ export interface PublicTermCount {
 }
 
 export interface PublicTermCounts {
-  /** Most records first, then by label, then by term key. */
+  /** Most records first, then by label, then by URI. */
   readonly counts: readonly PublicTermCount[];
-  /** How many records public on the site were read. */
-  readonly recordsRead: number;
+  /** How many records' public output was counted (records held back aren't). */
+  readonly recordsCounted: number;
 }
 
 export interface PublicTermCountOptions {
@@ -84,6 +86,8 @@ export interface PublicTermCountOptions {
   readonly mappings: readonly unknown[];
   /** Only these fields count (for a Subjects page, the subject fields); all when left out. */
   readonly fields?: readonly string[];
+  /** Stop and refuse (`too_slow`) after this long; default 30 000, at most 300 000. */
+  readonly timeLimitMs?: number;
 }
 
 function refused<T>(
@@ -101,34 +105,56 @@ function own(obj: unknown, name: string): unknown {
   return d !== undefined && "value" in d ? d.value : undefined;
 }
 
+const DEFAULT_TIME_LIMIT_MS = 30_000;
+const MAX_TIME_LIMIT_MS = 300_000;
+
 function readOptions(options: unknown): Validated<{
   baseUrl: string;
   mappings: readonly unknown[];
   fields: ReadonlySet<string> | undefined;
+  timeLimitMs: number;
 }> {
   const bad = (): Validated<never> =>
-    refused([], "invalid_options", "Give { baseUrl, mappings, fields? }.");
+    refused([], "invalid_options", "Give { baseUrl, mappings, fields?, timeLimitMs? }.");
   if (typeof options !== "object" || options === null) return bad();
   for (const key of Object.keys(options)) {
-    if (key !== "baseUrl" && key !== "mappings" && key !== "fields") return bad();
+    if (!["baseUrl", "mappings", "fields", "timeLimitMs"].includes(key)) return bad();
   }
   const baseUrl = own(options, "baseUrl");
   const mappings = own(options, "mappings");
   if (typeof baseUrl !== "string" || !Array.isArray(mappings)) return bad();
+  const limit = own(options, "timeLimitMs");
+  if (Object.hasOwn(options, "timeLimitMs")) {
+    if (
+      typeof limit !== "number" ||
+      !Number.isInteger(limit) ||
+      limit < 1 ||
+      limit > MAX_TIME_LIMIT_MS
+    ) {
+      return refused(
+        ["timeLimitMs"],
+        "invalid_time_limit",
+        `timeLimitMs must be a whole number of milliseconds from 1 to ${String(MAX_TIME_LIMIT_MS)}.`,
+      );
+    }
+  }
+  const timeLimitMs = typeof limit === "number" ? limit : DEFAULT_TIME_LIMIT_MS;
   const fieldList = own(options, "fields");
   if (fieldList === undefined) {
     return Object.hasOwn(options, "fields")
       ? bad()
-      : { ok: true, value: { baseUrl, mappings, fields: undefined } };
+      : { ok: true, value: { baseUrl, mappings, fields: undefined, timeLimitMs } };
   }
   if (!Array.isArray(fieldList) || fieldList.length > 200 || !fieldList.every(isFieldKey)) {
     return refused(["fields"], "invalid_fields", "fields must be a list of field keys.");
   }
-  return { ok: true, value: { baseUrl, mappings, fields: new Set<string>(fieldList) } };
+  return {
+    ok: true,
+    value: { baseUrl, mappings, fields: new Set<string>(fieldList), timeLimitMs },
+  };
 }
 
 interface Tally {
-  vocabulary: string;
   records: number;
   /** How many counted records show each `label\0uri`. */
   shown: Map<string, number>;
@@ -136,10 +162,11 @@ interface Tally {
 
 /**
  * How many of the records public on `siteId` show each controlled term in
- * their public output (see the module header). Refused with `not_available`
- * alone for an organization or site ID that isn't one, as `readPublicRecord`
- * is; a site that isn't the organization's has no public records, so its
- * counts are empty.
+ * their public output (see the module header). `db` is the server's staff
+ * connection (it reads the records table), never the public reader's.
+ * Refused with `not_available` alone for an organization or site ID that
+ * isn't one, as `readPublicRecord` is; a site that isn't the organization's
+ * has no public records, so its counts are empty.
  */
 export async function publicTermCounts(
   db: Database,
@@ -152,36 +179,62 @@ export async function publicTermCounts(
   }
   const read = readOptions(options);
   if (!read.ok) return read;
-  const { baseUrl, mappings, fields } = read.value;
+  const { baseUrl, mappings, fields, timeLimitMs } = read.value;
+  try {
+    return await countIn(db, organizationId, siteId, baseUrl, mappings, fields, timeLimitMs);
+  } catch (error) {
+    // The statement timeout cancelled a read (57014): the same refusal as the deadline.
+    if ((error as { code?: unknown } | null)?.code === QUERY_CANCELED) return tooSlow();
+    throw error;
+  }
+}
+
+const QUERY_CANCELED = "57014";
+
+function tooSlow(): Validated<never> {
+  return refused([], "too_slow", "Counting the records public on this site took too long.");
+}
+
+async function countIn(
+  db: Database,
+  organizationId: OrganizationId,
+  siteId: SiteId,
+  baseUrl: string,
+  mappings: readonly unknown[],
+  fields: ReadonlySet<string> | undefined,
+  timeLimitMs: number,
+): Promise<Validated<PublicTermCounts>> {
+  const deadline = Date.now() + timeLimitMs;
   return db.transaction(async (tx) => {
     // One snapshot for every read below, and nothing written.
     await tx.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`);
+    await tx.execute(sql`SELECT set_config('statement_timeout', ${String(timeLimitMs)}, true)`);
+    const rows = await tx.rows<{ id: string }>(sql`
+      SELECT r.id::text AS id FROM public.records r
+      WHERE r.organization_id = ${organizationId}::uuid
+        AND public.record_public_on_site(r, ${siteId}::uuid)
+      ORDER BY r.id
+      LIMIT ${MAX_PUBLIC_COUNT_RECORDS + 1}`);
+    if (rows.length > MAX_PUBLIC_COUNT_RECORDS) {
+      return refused(
+        [],
+        "too_many_records",
+        `More than ${String(MAX_PUBLIC_COUNT_RECORDS)} records are public on this site, so they can't be counted here.`,
+      );
+    }
     const ids: RecordId[] = [];
-    let after: string | null = null;
-    for (;;) {
-      const page = await tx.rows<{ id: string }>(sql`
-        SELECT id::text AS id
-        FROM public.public_site_record_ids(${organizationId}::uuid, ${siteId}::uuid,
-                                           ${after}::uuid, ${PAGE + 1}) AS id`);
-      for (const row of page.slice(0, PAGE)) {
-        if (!isRecordId(row.id)) return refused([], "unreadable_record", CANT_COUNT);
-        ids.push(row.id);
-      }
-      if (ids.length > MAX_PUBLIC_COUNT_RECORDS) {
-        return refused(
-          [],
-          "too_many_records",
-          `More than ${String(MAX_PUBLIC_COUNT_RECORDS)} records are public on this site, so they can't be counted here.`,
-        );
-      }
-      if (page.length <= PAGE) break;
-      after = ids[ids.length - 1] ?? null;
+    for (const row of rows) {
+      if (!isRecordId(row.id)) return refused([], "unreadable_record", CANT_COUNT);
+      ids.push(row.id);
     }
     const tallies = new Map<string, Tally>();
+    let counted = 0;
     for (const id of ids) {
+      if (Date.now() > deadline) return tooSlow();
       const one = await publicRecordIn(tx, organizationId, siteId, id, baseUrl, mappings);
       // What the public output refuses shows nothing, so it counts for nothing.
       if (!one.ok) continue;
+      counted += 1;
       const { view, template, mapping } = one.value;
       const mapped = validateDublinCoreMapping(mapping, template);
       if (!mapped.ok) continue;
@@ -201,7 +254,7 @@ export async function publicTermCounts(
       for (const [key, term] of seen) {
         let tally = tallies.get(key);
         if (tally === undefined) {
-          tally = { vocabulary: term.vocabulary ?? "local", records: 0, shown: new Map() };
+          tally = { records: 0, shown: new Map() };
           tallies.set(key, tally);
         }
         tally.records += 1;
@@ -209,28 +262,22 @@ export async function publicTermCounts(
         tally.shown.set(shown, (tally.shown.get(shown) ?? 0) + 1);
       }
     }
-    const counts = [...tallies.entries()].map(([termKey, t]) => {
+    const counts = [...tallies.values()].map((t) => {
       const [label = "", uri = ""] = mostShown(t.shown).split("\u0000");
-      return Object.freeze({
-        termKey,
-        vocabulary: t.vocabulary,
-        label,
-        ...(uri === "" ? {} : { uri }),
-        records: t.records,
-      });
+      return Object.freeze({ label, ...(uri === "" ? {} : { uri }), records: t.records });
     });
     counts.sort(
-      (a, b) => b.records - a.records || compare(a.label, b.label) || compare(a.termKey, b.termKey),
+      (a, b) =>
+        b.records - a.records || compare(a.label, b.label) || compare(a.uri ?? "", b.uri ?? ""),
     );
     return {
       ok: true as const,
-      value: Object.freeze({ counts: Object.freeze(counts), recordsRead: ids.length }),
+      value: Object.freeze({ counts: Object.freeze(counts), recordsCounted: counted }),
     };
   });
 }
 
 const CANT_COUNT = "The records public on this site can't be read for counting.";
-
 function compare(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }

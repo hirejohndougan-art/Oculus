@@ -846,7 +846,7 @@ describe("public subject counts come from public output only (T-034d, D-095)", (
 
   it("counts each term once per public record that shows it, inherited values included", async () => {
     const { org } = await world();
-    const result = await publicTermCounts(s.reader, org, siteFor(org), {
+    const result = await publicTermCounts(s.writer, org, siteFor(org), {
       baseUrl: BASE,
       mappings: mappings(org),
     });
@@ -855,20 +855,21 @@ describe("public subject counts come from public output only (T-034d, D-095)", (
       ["Lighthouses", 2, LIGHT],
       ["Shipwrecks", 2, null],
     ]);
-    expect(ok(result).recordsRead).toBe(4);
+    expect(ok(result).recordsCounted).toBe(4);
     const text = JSON.stringify(result);
     for (const hidden of ["Secret staff term", "Unpublished term", "Withdrawn term"]) {
       expect(text).not.toContain(hidden);
     }
-    expect(ok(result).counts[0]?.vocabulary).toBe("local");
-    expect(ok(result).counts[1]?.vocabulary).toBe("lcsh");
+    // Only what the public output shows: no vocabulary key, term key or ID.
+    expect(Object.keys(ok(result).counts[1] ?? {}).sort()).toEqual(["label", "records", "uri"]);
+    expect(text).not.toContain("lcsh");
     expect(Object.isFrozen(ok(result).counts)).toBe(true);
   }, 60_000);
 
   it("counts only the fields asked for, and only fields the mapping shows", async () => {
     const { org } = await world();
     const only = (fields: string[]) =>
-      publicTermCounts(s.reader, org, siteFor(org), {
+      publicTermCounts(s.writer, org, siteFor(org), {
         baseUrl: BASE,
         mappings: mappings(org),
         fields,
@@ -876,7 +877,7 @@ describe("public subject counts come from public output only (T-034d, D-095)", (
     expect(counted(await only(["subject"]))).toHaveLength(3);
     expect(counted(await only(["hidden"]))).toEqual([]);
     // A template with no mapping given: its records' output is refused, so they count for nothing.
-    const noUnits = await publicTermCounts(s.reader, org, siteFor(org), {
+    const noUnits = await publicTermCounts(s.writer, org, siteFor(org), {
       baseUrl: BASE,
       mappings: mappings(org, ["pub-subj"]),
     });
@@ -884,24 +885,26 @@ describe("public subject counts come from public output only (T-034d, D-095)", (
       ["Fishing", 2, null],
       ["Lighthouses", 2, LIGHT],
     ]);
+    // Records whose output is refused aren't counted, so their number never shows.
+    expect(ok(noUnits).recordsCounted).toBe(2);
   }, 60_000);
 
   it("another organization's site, or a site of none, counts nothing", async () => {
     const { org } = await world();
     const other = await organization();
-    const empty = await publicTermCounts(s.reader, other, siteFor(org), {
+    const empty = await publicTermCounts(s.writer, other, siteFor(org), {
       baseUrl: BASE,
       mappings: mappings(other),
     });
-    expect(ok(empty)).toEqual({ counts: [], recordsRead: 0 });
-    const bad = await publicTermCounts(s.reader, org, "not-a-site" as SiteId, {
+    expect(ok(empty)).toEqual({ counts: [], recordsCounted: 0 });
+    const bad = await publicTermCounts(s.writer, org, "not-a-site" as SiteId, {
       baseUrl: BASE,
       mappings: mappings(org),
     });
     expect(codes(bad)).toEqual(["not_available"]);
     expect(
       codes(
-        await publicTermCounts(s.reader, org, siteFor(org), {
+        await publicTermCounts(s.writer, org, siteFor(org), {
           baseUrl: BASE,
           mappings: mappings(org),
           extra: true,
@@ -910,7 +913,7 @@ describe("public subject counts come from public output only (T-034d, D-095)", (
     ).toEqual(["invalid_options"]);
     expect(
       codes(
-        await publicTermCounts(s.reader, org, siteFor(org), {
+        await publicTermCounts(s.writer, org, siteFor(org), {
           baseUrl: BASE,
           mappings: mappings(org),
           fields: ["Not A Key"],
@@ -919,25 +922,28 @@ describe("public subject counts come from public output only (T-034d, D-095)", (
     ).toEqual(["invalid_fields"]);
   }, 60_000);
 
-  it("the public reader can call the listing function, and it refuses bad arguments", async () => {
+  it("needs the staff connection, and stops when it takes too long", async () => {
     const { org } = await world();
-    const ids = await s.reader.transaction((q) =>
-      q.rows<{ id: string }>(sql`
-        SELECT id::text AS id FROM public.public_site_record_ids(
-          ${org}::uuid, ${siteFor(org)}::uuid, NULL, 10) AS id`),
-    );
-    expect(ids).toHaveLength(4);
-    expect(
-      (
-        await refusal(
-          s.reader.transaction((q) =>
-            q.rows(sql`SELECT public.public_site_record_ids(
-                         ${org}::uuid, ${siteFor(org)}::uuid, NULL, 0)`),
-          ),
-        )
-      ).code,
-    ).toBe("22023");
+    // The public reader reads no table, so it can't list a site's records at all.
+    await expect(
+      publicTermCounts(s.reader, org, siteFor(org), { baseUrl: BASE, mappings: mappings(org) }),
+    ).rejects.toThrow();
     expect(await checkPublicReaderConnection(s.reader)).toEqual([]);
+    const slow = await publicTermCounts(s.writer, org, siteFor(org), {
+      baseUrl: BASE,
+      mappings: mappings(org),
+      timeLimitMs: 1,
+    });
+    expect(codes(slow)).toEqual(["too_slow"]);
+    expect(
+      codes(
+        await publicTermCounts(s.writer, org, siteFor(org), {
+          baseUrl: BASE,
+          mappings: mappings(org),
+          timeLimitMs: 0,
+        }),
+      ),
+    ).toEqual(["invalid_time_limit"]);
   }, 60_000);
 });
 
