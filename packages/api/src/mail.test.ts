@@ -22,7 +22,9 @@ import {
   escapeHtml,
   MailContentError,
   renderInvitation,
+  renderPasswordChanged,
   renderPasswordReset,
+  renderSecondStepAlert,
   renderTwoStepSetup,
 } from "./mail-messages.js";
 import { classifyMailError, createOutbox, MailRefusedError } from "./mail-outbox.js";
@@ -121,6 +123,65 @@ describe("the messages", () => {
     for (const [, url] of mail.html.matchAll(/href="([^"]*)"/g)) {
       expect(url).not.toContain(TOKEN);
     }
+  });
+
+  it("tells the person their password was changed, with no token and only the sign-in link", () => {
+    const mail = renderPasswordChanged(
+      { email: TO, changedAt: "2026-11-24T17:35:00.000Z" },
+      ORIGIN,
+    );
+    expect(mail.subject).toBe("Your Oculus password was changed");
+    expect(mail.text).toContain("17:35 UTC on 24 November 2026");
+    expect(mail.secrets).toEqual([]);
+    expect([...mail.html.matchAll(/href="([^"]*)"/g)].map((m) => m[1])).toEqual([
+      `${ORIGIN}/sign-in`,
+    ]);
+    expect(mail.text).not.toContain("#");
+  });
+
+  it("warns the person and the admins that someone is guessing codes, escaping the name", () => {
+    const at = "2026-11-24T17:35:00.000Z";
+    const own = renderSecondStepAlert({ to: "person", email: TO, failures: 15, at }, ORIGIN);
+    expect(own.subject).toBe("Someone may know your Oculus password");
+    expect(own.text).toContain("15 wrong codes by 17:35 UTC on 24 November 2026");
+    expect(own.text).toContain(`${ORIGIN}/sign-in`);
+    const name = `Ada <b>"Invented"</b>`;
+    const admin = renderSecondStepAlert(
+      {
+        to: "system_admin",
+        email: "admin.invented@example.org",
+        person: { displayName: name, email: TO },
+        failures: 1,
+        at,
+      },
+      ORIGIN,
+    );
+    expect(admin.to).toBe("admin.invented@example.org");
+    expect(admin.subject).not.toContain(TO);
+    expect(admin.text).toContain(`${name} (${TO}): 1 wrong code by`);
+    expect(admin.html).toContain("Ada &lt;b&gt;&quot;Invented&quot;&lt;/b&gt;");
+    expect(admin.html).not.toContain("<b>");
+    for (const mail of [own, admin]) {
+      expect([...mail.html.matchAll(/href="([^"]*)"/g)].map((m) => m[1])).toEqual([
+        `${ORIGIN}/sign-in`,
+      ]);
+      expect(mail.html).not.toMatch(/<img|src=/i);
+    }
+    expect(() =>
+      renderSecondStepAlert(
+        {
+          to: "system_admin",
+          email: "admin.invented@example.org",
+          person: { displayName: "Ada\r\nBcc: spy@example.net", email: TO },
+          failures: 1,
+          at,
+        },
+        ORIGIN,
+      ),
+    ).toThrow(MailContentError);
+    expect(() =>
+      renderSecondStepAlert({ to: "person", email: TO, failures: 0, at }, ORIGIN),
+    ).toThrow(MailContentError);
   });
 
   it("escapes every value in the HTML", () => {
@@ -244,6 +305,18 @@ describe("sending over SMTP", () => {
     await m.outbox.idle();
     const subjects = smtp.messages.map((r) => parseMail(r.data).headers.get("subject"));
     expect(subjects.sort()).toEqual(["You're invited to Oculus", "Your Oculus set-up code"]);
+  });
+
+  it("delivers the alert and the password-changed notice", async () => {
+    const m = mailer();
+    await m.deliverAlert({ to: "person", email: TO, failures: 5, at: LATER });
+    await m.deliverPasswordChanged({ email: TO, changedAt: LATER });
+    await m.outbox.idle();
+    const subjects = smtp.messages.map((r) => parseMail(r.data).headers.get("subject"));
+    expect(subjects.sort()).toEqual([
+      "Someone may know your Oculus password",
+      "Your Oculus password was changed",
+    ]);
   });
 
   it("refuses a message with CR or LF before anything reaches the server", async () => {

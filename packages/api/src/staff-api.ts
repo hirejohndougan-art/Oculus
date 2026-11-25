@@ -100,7 +100,9 @@ export interface ApiLogRecord {
     | "mail_failed"
     | "mail_refused"
     | "mail_dropped"
-    | "mail_dev";
+    | "mail_dev"
+    // The two-step alert notices (alert-notices.ts): people notified, as `code`.
+    | "alert_notices";
   readonly operation?: string;
   readonly code?: string;
   readonly name?: string;

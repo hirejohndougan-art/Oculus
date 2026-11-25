@@ -47,7 +47,13 @@ import { isIP } from "node:net";
 import { join } from "node:path";
 import type { ConnectionOptions } from "node:tls";
 import { normalizeEmail } from "@oculus/core";
-import type { EnrolmentDelivery, InvitationDelivery, PasswordResetDelivery } from "@oculus/db";
+import type {
+  EnrolmentDelivery,
+  InvitationDelivery,
+  PasswordChangedDelivery,
+  PasswordResetDelivery,
+  SecondStepAlertDelivery,
+} from "@oculus/db";
 import nodemailer from "nodemailer";
 import { ADMIN_ORIGIN_ENV } from "./admin-files.js";
 import { isProduction } from "./environment.js";
@@ -56,7 +62,9 @@ import {
   checkHeaderValue,
   MailContentError,
   renderInvitation,
+  renderPasswordChanged,
   renderPasswordReset,
+  renderSecondStepAlert,
   renderTwoStepSetup,
   type MailKind,
   type RenderedMail,
@@ -307,6 +315,10 @@ export interface Mailer {
   readonly deliverEnrolment: EnrolmentDelivery;
   /** For `createInvitation` (D-068). */
   readonly deliverInvitation: InvitationDelivery;
+  /** For `completePasswordReset`'s `notifyChanged`: the notice after a reset. */
+  readonly deliverPasswordChanged: PasswordChangedDelivery;
+  /** For `sendSecondStepAlertNotices` (D-077): someone is guessing codes. */
+  readonly deliverAlert: SecondStepAlertDelivery;
   readonly outbox: MailOutbox;
   /** Stops the outbox (drops what is waiting, aborts sends in progress). */
   close(): Promise<void>;
@@ -357,6 +369,10 @@ export function createMailer(options: MailerOptions): Mailer {
       hand("two_step_setup", undefined, () => renderTwoStepSetup(message, origin)),
     deliverInvitation: (message, signal) =>
       hand("invitation", signal, () => renderInvitation(message, origin)),
+    deliverPasswordChanged: (message) =>
+      hand("password_changed", undefined, () => renderPasswordChanged(message, origin)),
+    deliverAlert: (message) =>
+      hand("two_step_alert", undefined, () => renderSecondStepAlert(message, origin)),
     outbox,
     close: () => outbox.close(),
   } satisfies Mailer);

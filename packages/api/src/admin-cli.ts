@@ -8,12 +8,14 @@
  * Deployment (D-035, T-050, T-051) decides how this runs in production.
  * Email goes through the mailer the environment configures (mail.ts,
  * D-085): SMTP in production (it refuses to start without it), the
- * development sender otherwise. The mailer's outbox is closed on SIGINT and
- * SIGTERM with the server.
+ * development sender otherwise. The two-step alert notices run every minute
+ * (alert-notices.ts). The notices, the mailer's outbox and the server are
+ * closed on SIGINT and SIGTERM.
  */
 import { pathToFileURL } from "node:url";
 import { openDatabase } from "@oculus/db";
 import { buildAdminServer, defaultLog } from "./admin-server.js";
+import { startAlertNotices, type AlertNoticeRunner } from "./alert-notices.js";
 import { mailerFromEnv, type Mailer } from "./mail.js";
 
 const DATABASE_URL_VARIABLE = "OCULUS_DATABASE_URL";
@@ -42,12 +44,16 @@ export async function runAdminCli(
     return 2;
   }
   let mailer: Mailer | undefined;
+  let notices: AlertNoticeRunner | undefined;
   try {
     mailer = mailerFromEnv(env, { log: defaultLog });
     const app = await buildAdminServer({ db, env, logger: true, mailer, log: defaultLog });
+    // "Someone is guessing your two-step codes" (D-077, D-085), every minute.
+    notices = startAlertNotices({ db, deliver: mailer.deliverAlert, log: defaultLog });
     const close = (): void => {
       void app
         .close()
+        .then(() => notices?.stop())
         .then(() => mailer?.close())
         .then(() => db.close());
     };
@@ -56,6 +62,7 @@ export async function runAdminCli(
     await app.listen({ host: env.OCULUS_HOST ?? "127.0.0.1", port });
     return undefined;
   } catch (error) {
+    await notices?.stop();
     await mailer?.close();
     await db.close();
     // Startup refusals name the variable and the reason, never a value.

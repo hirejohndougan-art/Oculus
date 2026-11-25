@@ -3,14 +3,17 @@
 // process. An account and an unknown address get the same reply at once,
 // even while the mail server is slow; only the account gets a message; its
 // link works; the logs hold no token or address; and an admin's reset of
-// two-step sign-in emails a set-up code the set-up screen accepts. Every
-// person and address is invented.
+// two-step sign-in emails a set-up code the set-up screen accepts. A used
+// link is followed by a "your password was changed" notice, and the alert
+// runner emails "someone is guessing your codes" once. Every person and
+// address is invented.
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { completeSecondStep, resetSecondFactor, sql } from "@oculus/db";
+import { completeSecondStep, resetSecondFactor, sendSecondStepAlertNotices, sql } from "@oculus/db";
 import type { UserId } from "@oculus/core";
 import type { FastifyInstance, LightMyRequestResponse } from "fastify";
 import { giveTestFactor, testKeyring } from "../../db/src/second-factor.fixtures.js";
 import { TEST_PASSWORD } from "../../service/src/people.fixtures.js";
+import { startAlertNotices } from "./alert-notices.js";
 import { OCULUS_COOKIES } from "./cookies.js";
 import { createMailer, smtpConfigFromEnv, smtpTransport, type Mailer } from "./mail.js";
 import { buildServer } from "./server.js";
@@ -96,6 +99,7 @@ beforeAll(async () => {
       keys,
       service: w.service,
       deliverReset: mailer.deliverReset,
+      deliverPasswordChanged: mailer.deliverPasswordChanged,
       log: (record) => logged.push(record),
       resetOptions: { backgroundDelayMs: { min: 0, max: 0 } },
     }),
@@ -158,6 +162,52 @@ describe("a reset request with the real mailer", () => {
       password: `${TEST_PASSWORD}-and-new`,
     });
     expect(done.statusCode).toBe(200);
+    // The person is told their password changed: no token, only the sign-in page.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await mailer.outbox.idle();
+    expect(smtp.messages).toHaveLength(2);
+    const notice = parseMail(smtp.messages[1]?.data ?? "");
+    expect(smtp.messages[1]?.to).toEqual([email]);
+    expect(notice.headers.get("subject")).toBe("Your Oculus password was changed");
+    expect(notice.text).not.toContain(String(token));
+    expect([...notice.html.matchAll(/href="([^"]*)"/g)].map((m) => m[1])).toEqual([
+      `${ORIGIN}/sign-in`,
+    ]);
+  });
+});
+
+describe("the two-step alert notices", () => {
+  it("email the person and the system admin once per window from the runner", async () => {
+    smtp.reset();
+    await sendSecondStepAlertNotices(w.db, () => Promise.resolve());
+    const email = await emailOf(w.cataloger);
+    await w.db.execute(sql`INSERT INTO public.second_step_alerts (id, user_id, failures)
+      VALUES (gen_random_uuid(), ${w.cataloger}::uuid, 5)`);
+    const runner = startAlertNotices({
+      db: w.db,
+      deliver: mailer.deliverAlert,
+      log: (record) => logged.push(record),
+      intervalMs: 3_600_000,
+    });
+    try {
+      await runner.runNow();
+      await w.db.execute(sql`INSERT INTO public.second_step_alerts (id, user_id, failures)
+        VALUES (gen_random_uuid(), ${w.cataloger}::uuid, 15)`);
+      await runner.runNow();
+    } finally {
+      await runner.stop();
+    }
+    await mailer.outbox.idle();
+    const to = smtp.messages.map((m) => m.to[0]);
+    expect(to).toHaveLength(2);
+    expect(to).toContain(email);
+    expect(to).toContain(await emailOf(w.root));
+    const own = smtp.messages.find((m) => m.to[0] === email);
+    expect(parseMail(own?.data ?? "").headers.get("subject")).toBe(
+      "Someone may know your Oculus password",
+    );
+    expect(logged).toContainEqual({ event: "alert_notices", code: "1" });
+    expect(JSON.stringify(logged)).not.toContain(email);
   });
 });
 

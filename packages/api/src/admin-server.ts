@@ -128,8 +128,12 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   // D-085: a real sender in production, the development one (which logs
   // the kind only) elsewhere. Made before anything else starts, so a
   // refusal leaves nothing running.
-  const deliverReset =
-    options.deliverReset ?? (options.mailer ?? mailerFromEnv(env, { log })).deliverReset;
+  let deliverReset = options.deliverReset;
+  let mailer: Mailer | undefined;
+  if (deliverReset === undefined) {
+    mailer = options.mailer ?? mailerFromEnv(env, { log });
+    deliverReset = mailer.deliverReset;
+  }
 
   const adminOrigin = env[ADMIN_ORIGIN_ENV];
   let admin: ServerOptions["admin"];
@@ -159,6 +163,7 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
       keys,
       service,
       deliverReset,
+      ...(mailer === undefined ? {} : { deliverPasswordChanged: mailer.deliverPasswordChanged }),
       log,
       warnSharedAddress: production,
       ...options.signIn,

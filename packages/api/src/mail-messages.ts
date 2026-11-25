@@ -33,7 +33,8 @@
 import { normalizeEmail } from "@oculus/core";
 
 /** Which message: also the log's `operation` (never the address or token). */
-export type MailKind = "password_reset" | "two_step_setup" | "invitation";
+export type MailKind =
+  "password_reset" | "password_changed" | "two_step_setup" | "two_step_alert" | "invitation";
 
 /** A message ready to send. */
 export interface RenderedMail {
@@ -116,7 +117,17 @@ function checkExpiry(value: unknown): number {
   return at;
 }
 
-function checkOrganizationName(value: unknown): string {
+function checkCount(value: unknown): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 1_000_000) {
+    throw new MailContentError("bad_value");
+  }
+  return value;
+}
+
+/** How long a message without a link is still worth sending (a day). */
+const NOTICE_LIFE_MS = 86_400_000;
+
+function checkName(value: unknown): string {
   if (
     typeof value !== "string" ||
     value.trim() === "" ||
@@ -312,7 +323,7 @@ export function renderInvitation(input: InvitationMailInput, origin: string): Re
   const to = checkAddress(input.email);
   const token = checkToken(input.token);
   const at = checkExpiry(input.expiresAt);
-  const organization = checkOrganizationName(input.organizationName);
+  const organization = checkName(input.organizationName);
   return build(
     "invitation",
     to,
@@ -329,5 +340,113 @@ export function renderInvitation(input: InvitationMailInput, origin: string): Re
     ],
     [token],
     at,
+  );
+}
+
+/** What `renderPasswordChanged` needs: D-085's `PasswordChangedMessage`. */
+export interface PasswordChangedMailInput {
+  readonly email: string;
+  readonly changedAt: string;
+}
+
+/**
+ * The notice after a reset link was used (OWASP Forgot Password): no token
+ * and no link but the sign-in page.
+ */
+export function renderPasswordChanged(
+  input: PasswordChangedMailInput,
+  origin: string,
+): RenderedMail {
+  const to = checkAddress(input.email);
+  const at = checkExpiry(input.changedAt);
+  return build(
+    "password_changed",
+    to,
+    "Your Oculus password was changed",
+    [
+      {
+        text: `The password of the Oculus account that uses this email address was changed with a reset link at ${expiryText(at)}, and every session of the account was signed out.`,
+      },
+      { text: "If that was you, there is nothing more to do. Sign in here:" },
+      { link: `${origin}/sign-in` },
+      {
+        text: "If it wasn't you, tell your administrator at once: someone who can read your email may have changed it.",
+      },
+    ],
+    [],
+    at + NOTICE_LIFE_MS,
+  );
+}
+
+/** What `renderSecondStepAlert` needs: D-085's `SecondStepAlertMessage`. */
+export type SecondStepAlertMailInput =
+  | {
+      readonly to: "person";
+      readonly email: string;
+      readonly failures: number;
+      readonly at: string;
+    }
+  | {
+      readonly to: "system_admin";
+      readonly email: string;
+      readonly person: { readonly displayName: string; readonly email: string };
+      readonly failures: number;
+      readonly at: string;
+    };
+
+/**
+ * "Someone is guessing your two-step codes" (D-077): to the person, or to
+ * a system admin naming the person. No token; the only link is the sign-in
+ * page.
+ */
+export function renderSecondStepAlert(
+  input: SecondStepAlertMailInput,
+  origin: string,
+): RenderedMail {
+  const to = checkAddress(input.email);
+  const failures = checkCount(input.failures);
+  const at = checkExpiry(input.at);
+  const when = expiryText(at);
+  const codes = failures === 1 ? "1 wrong code" : `${String(failures)} wrong codes`;
+  if (input.to === "person") {
+    return build(
+      "two_step_alert",
+      to,
+      "Someone may know your Oculus password",
+      [
+        {
+          text: `Someone has been entering wrong two-step sign-in codes for your Oculus account (${codes} by ${when}). Codes are asked for only after the right password, so whoever it is probably knows your password. Your two-step sign-in has kept them out.`,
+        },
+        {
+          text: 'If it wasn\'t you, choose a new password now: open the sign-in page and use "Forgot your password?".',
+        },
+        { link: `${origin}/sign-in` },
+        {
+          text: "If it was you mistyping codes, you can ignore this email. Your system administrators have been told too. Oculus sends at most one such email a day.",
+        },
+      ],
+      [],
+      at + NOTICE_LIFE_MS,
+    );
+  }
+  if ((input.to as unknown) !== "system_admin") throw new MailContentError("bad_value");
+  const name = checkName(input.person.displayName);
+  const address = checkAddress(input.person.email);
+  return build(
+    "two_step_alert",
+    to,
+    "Oculus: someone is guessing an account's two-step codes",
+    [
+      {
+        text: `Someone has been entering wrong two-step sign-in codes for the Oculus account of ${name} (${address}): ${codes} by ${when}. Codes are asked for only after the right password, so that password is probably known to someone else. Two-step sign-in has kept them out.`,
+      },
+      {
+        text: `Confirm with ${name} another way. If it wasn't them, end their sessions and have them choose a new password. They have been told too.`,
+      },
+      { link: `${origin}/sign-in` },
+      { text: "Oculus sends at most one such email a day about each person." },
+    ],
+    [],
+    at + NOTICE_LIFE_MS,
   );
 }

@@ -42,6 +42,7 @@ const ALL_TABLES = [
   "records",
   "role_assignments",
   "second_factors",
+  "second_step_alert_notices",
   "second_step_alerts",
   "second_step_enrolment_tokens",
   "second_step_passes",

@@ -264,6 +264,8 @@ export {
 export type {
   PasswordResetMessage,
   PasswordResetDelivery,
+  PasswordChangedDelivery,
+  PasswordChangedMessage,
   ResetOutcome,
   ResetRequestOptions,
   ResetRequest,
@@ -328,3 +330,15 @@ export {
   MAX_ORGANIZATION_CHOICES,
 } from "./sign-in-screens.js";
 export type { PendingSignInState, OrganizationChoice, SignedInPerson } from "./sign-in-screens.js";
+export {
+  sendSecondStepAlertNotices,
+  ALERT_NOTICE_TABLE_PRIVILEGES,
+  ALERT_NOTICE_WINDOW_SECONDS,
+  ALERT_NOTICE_BATCH,
+} from "./second-step-alert-notices.js";
+export type {
+  SecondStepAlertMessage,
+  SecondStepAlertDelivery,
+  AlertNoticeRun,
+  AlertNoticeOptions,
+} from "./second-step-alert-notices.js";

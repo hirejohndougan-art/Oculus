@@ -63,6 +63,7 @@ import {
   switchOrganization,
   type Database,
   type FullSession,
+  type PasswordChangedDelivery,
   type PasswordResetDelivery,
   type ResetRequestOptions,
   type SecretKeyring,
@@ -87,6 +88,11 @@ export interface SignInApiOptions {
    * (admin-server.ts) refuses to start in production without one.
    */
   readonly deliverReset: PasswordResetDelivery;
+  /**
+   * Tells the account its password was changed after a reset link is used
+   * (the mailer's `deliverPasswordChanged`, D-085). Not awaited; optional.
+   */
+  readonly deliverPasswordChanged?: PasswordChangedDelivery;
   /** Where fixed-shape log records go; default: one JSON line on standard error. */
   readonly log?: (record: ApiLogRecord) => void;
   /**
@@ -241,6 +247,12 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
   const { db, keys, service } = options;
   if (typeof options.deliverReset !== "function") {
     throw new TypeError("signInRoutes needs deliverReset (the password reset link's sender).");
+  }
+  if (
+    options.deliverPasswordChanged !== undefined &&
+    typeof options.deliverPasswordChanged !== "function"
+  ) {
+    throw new TypeError("deliverPasswordChanged is a function.");
   }
   const log = options.log ?? defaultLog;
   const clock = options.clock ?? Date.now;
@@ -599,7 +611,12 @@ export function signInRoutes(options: SignInApiOptions): OculusRoute[] {
         const done = await completePasswordReset(
           db,
           { token: body.token, password: body.password },
-          { onError: onError("completePasswordReset") },
+          {
+            onError: onError("completePasswordReset"),
+            ...(options.deliverPasswordChanged === undefined
+              ? {}
+              : { notifyChanged: options.deliverPasswordChanged }),
+          },
         );
         if (done.ok) return { reset: true };
         const codes = done.issues.map((i) => i.code);

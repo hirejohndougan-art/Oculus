@@ -94,9 +94,13 @@ export {
   renderPasswordReset,
   renderTwoStepSetup,
   renderInvitation,
+  renderPasswordChanged,
+  renderSecondStepAlert,
   escapeHtml,
   checkHeaderValue,
   checkAdminOrigin,
   MailContentError,
 } from "./mail-messages.js";
 export type { MailKind, RenderedMail } from "./mail-messages.js";
+export { startAlertNotices } from "./alert-notices.js";
+export type { AlertNoticeRunner, AlertNoticeRunnerOptions } from "./alert-notices.js";
