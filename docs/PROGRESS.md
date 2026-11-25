@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 00:10 CT — manual (Chat G) — T-050e Dublin Core mappings in the admin and in setup
+- Result: done
+- What changed: new screen Settings › Templates › Dublin Core (`packages/admin/src/settings/DublinCoreEditor.tsx`, linked from each template) saving through `GET`/`PUT /api/templates/:key/dublin-core` with If-None-Match/If-Match and D-076's confirmation; `npm run setup` stores the starter template's mapping (public fields as their `dcterms` standards, rights included) in its transaction; the record editor says when the template has no mapping that fits it, so no public site shows the record. Unit tests for the screen, the record editor's note and setup; the settings e2e visits the new screen with Alfa's rules.
+- Decisions: none new (D-096 amended)
+- Review: one independent round, nothing blocking. Fixed: the warning missed a mapping naming a field since made staff only; "Saved." could show for another template; the note named only system managers; D-096's "left for later" line. Filed S-037 (a first mapping for over 10,000 published records; saving an empty mapping).
+- Gate: see the merge commit · npm audit clean
+- Next: the job pool (T-034e is the first free job)
+
 ## 2026-11-25 00:40 CT — manual (Chat C) — T-050b Stored Dublin Core mappings
 - Result: done (the old T-050b split into T-050b, T-050d and T-050e)
 - What changed: migration 0022 (`dublin_core_mappings`, `public_dublin_core_mapping`); `packages/db/src/dublin-core-mappings.ts`; `readPublicRecord` uses the stored mapping when none is passed; service `readDublinCoreMapping`/`saveDublinCoreMapping`; `GET`/`PUT /api/templates/:key/dublin-core`.
