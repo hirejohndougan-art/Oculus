@@ -85,8 +85,8 @@ export const ACCOUNT_TABLE_PRIVILEGES: Readonly<Record<string, readonly string[]
   invitations: Object.freeze(["INSERT", "UPDATE"]),
   organization_members: Object.freeze(["INSERT"]),
   sign_in_throttles: Object.freeze(["INSERT", "UPDATE", "DELETE"]),
-  // Known addresses (S-018): recorded at a right password, counted like the
-  // counters above, deleted by the cleanup.
+  // Known addresses (S-018): recorded after a whole sign-in (S-044), counted
+  // like the counters above, deleted by the cleanup.
   sign_in_known_sources: Object.freeze(["INSERT", "UPDATE", "DELETE"]),
 });
 
@@ -934,7 +934,8 @@ interface Counted {
 /**
  * Counts this attempt against its counters, or says how long to wait. One
  * short transaction with the rows locked (the two counters in key order,
- * then the known address's row; every caller locks in that order), so
+ * then the known address's row; `markKnown` locks known rows only, so no
+ * cycle), so
  * attempts sent at once are counted one by one. `knownSources` says whether
  * the address may be known for the account (sign-in; never re-entry, S-018).
  */
@@ -983,8 +984,8 @@ async function decideSignInAttemptRows(
       FROM public.sign_in_throttles WHERE key IN (${accountKey}, ${sourceKey})
       ORDER BY key FOR UPDATE`);
     if (rows.length !== 2) return "row_gone";
-    // Known for the account if it signed in from here with the right
-    // password recently (S-018). Read the same way whether or not the
+    // Known for the account if a whole sign-in (password and second step,
+    // S-044) came from here recently (S-018). Read the same way whether or not the
     // address typed has an account.
     const knownRows = knownSources
       ? await tx.rows<KnownRow>(sql`
@@ -1071,8 +1072,8 @@ interface UserRow {
  * 6.3.8). In order:
  * 1. The request's shape (`invalid_request`: not text, or absurdly long).
  * 2. The throttle (`throttled`, with `retryAfterSeconds`): the account and
- *    address counters, where an address the account signed in from with
- *    the right password in the last 30 days counts on its own counter for
+ *    address counters, where an address the account completed a sign-in
+ *    from (S-044: after the second step) in the last 30 days counts on its own counter for
  *    the account instead of waiting for the account's (S-018: strangers
  *    can't keep anyone out at their usual addresses); the attempt is
  *    counted now.
@@ -1083,8 +1084,7 @@ interface UserRow {
  *    without access to `organizationId` (for a system admin: one that
  *    doesn't exist). The attempt stays counted.
  * 5. On success: the account counter is cleared, one is taken off the
- *    address counter, the address becomes (or stays) known for the account
- *    with its counter cleared, the sign-in time is stored, and an
+ *    address counter, the sign-in time is stored, and an
  *    old-settings hash is replaced. `busy` if too many passwords are being checked at once
  *    (the attempt is then not counted).
  */
@@ -1336,7 +1336,7 @@ export async function clearSignInThrottle(
  * Deletes counters that no longer matter: none at all, or no failure (or
  * reset request) for longer than their own rule's reset time: the account,
  * re-entry and reset-account counters 24 hours, the address counters 1 hour;
- * and known addresses with no right password from there in 30 days (S-018).
+ * and known addresses with no whole sign-in from there in 30 days (S-018).
  * For the cleanup command any scheduler runs (T-037, D-035). Returns how
  * many went.
  */
@@ -1354,7 +1354,7 @@ export async function deleteExpiredSignInThrottles(db: Queryable): Promise<numbe
                  WHEN key LIKE 'account:%' THEN ${ACCOUNT_THROTTLE.resetAfterSeconds}::int
                  WHEN key LIKE 'reauth:%' THEN ${ACCOUNT_THROTTLE.resetAfterSeconds}::int
                  ELSE ${SOURCE_THROTTLE.resetAfterSeconds}::int END)`);
-  // Addresses no longer known (S-018): no right password from there in 30 days.
+  // Addresses no longer known (S-018): no whole sign-in from there in 30 days.
   const known = await db.execute(sql`
     DELETE FROM public.sign_in_known_sources
     WHERE signed_in_at < clock_timestamp() - make_interval(secs => ${KNOWN_SOURCE_SECONDS})`);
