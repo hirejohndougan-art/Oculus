@@ -7,7 +7,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - What changed: `npm run setup` migrates an empty database and makes the first system admin (two-step set-up at first sign-in), organization, site and a starter `Item` template in one transaction; refuses, before changing anything, a database that is set up or not Oculus's. `setUpFirstInstall`, `databaseBeforeSetup`, README note.
 - Decisions: none
 - Review: three independent rounds; fixed every finding (it migrated before refusing; the empty-database check now reuses restore's `contentsOf`; terminal input that could become an answer; input checks). Left as S-031.
-- Gate: see the merge commit · tests_passing raised in gate-baseline.json
+- Gate: PASS · tests_passing 4208 (was 4193) · npm audit clean
 - Next: the next job in the work board's pool.
 
 ## 2026-11-24 19:57 CT — manual (Chat A) — T-048 Admin: people, roles and the audit trail
