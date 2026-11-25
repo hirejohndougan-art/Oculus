@@ -7,7 +7,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - What changed: migration 0037 (`oai_datestamps`), `writeOaiStamps`, `oaiStoredStamp` and a table-based `listPublishedForOai` (packages/db/src/oai.ts), `fingerprints` in `publicTermCountsForStaff`, the Subjects pass's `oaiStamps` option (written per site, its failures its own, shown to staff), deleted headers and `deletedRecord` transient in oai-pmh.ts, `terms` in the marker, `buildAdminServer` refusing OAI-PMH without `countsDb`.
 - Decisions: D-108
 - Review: one independent round, nothing blocking; fixed the commit-visibility window (lists wait for a write in progress), bounded and per-site-locked writes, monotonic datestamps, the terms marker, refusing OAI-PMH without the pass, GetRecord's datestamp for a record back since the last pass.
-- Gate: TBD-S041
+- Gate: PASS · tests_passing 4817 (was 4812) · npm audit clean
 - Next: T-059a (EAD reader and writer) is the next free job.
 
 ## 2026-11-25 03:33 CT — manual (Chat A) — T-062 Sign out after a period of no use (John, Q-8)
