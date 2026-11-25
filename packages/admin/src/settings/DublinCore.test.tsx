@@ -204,6 +204,72 @@ describe("the Dublin Core screen", () => {
     expect(puts[1]).toHaveProperty("confirmPublished", true);
   });
 
+  it("past the list's limit, shows the count and sends it back (S-039)", async () => {
+    let calls = 0;
+    const sent = server({
+      "PUT /api/templates/lantern/dublin-core": (s) => {
+        calls += 1;
+        if (calls === 1) {
+          return [
+            409,
+            {
+              error: "confirmation_required",
+              issues: [
+                { path: ["confirmPublishedCount"], code: "publishes_records", message: "x" },
+                {
+                  path: ["publishedRecordCount", 12345],
+                  code: "published_records_counted",
+                  message: "x",
+                },
+              ],
+            },
+          ];
+        }
+        const [status, body] = saved(s);
+        return [status, { ...(body as object), publishedRecords: [], publishedRecordCount: 12345 }];
+      },
+    });
+    const user = userEvent.setup();
+    renderAt("/settings/templates/lantern/dublin-core");
+    await user.click(await screen.findByRole("button", { name: "Remove row 2" }));
+    await user.click(screen.getByRole("button", { name: "Save mapping" }));
+    expect(await screen.findByText(/shows at once on 12,345 published records/)).toBeTruthy();
+    expect(screen.getByText(/too many to list one by one/)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Save and update the public sites" }));
+    await waitFor(() => {
+      expect(sent.filter((s) => s.method === "PUT")).toHaveLength(2);
+    });
+    const puts = sent.filter((s) => s.method === "PUT").map((s) => s.body as object);
+    expect(puts[1]).toHaveProperty("confirmPublishedCount", 12345);
+    expect(puts[1]).not.toHaveProperty("confirmPublished");
+  });
+
+  it("saves an empty mapping when the template has no public fields left", async () => {
+    const staffOnly = {
+      ...TEMPLATE,
+      template: {
+        ...TEMPLATE.template,
+        fields: TEMPLATE.template.fields.map((f) => ({ ...f, visibility: "staff" })),
+      },
+    };
+    const sent = server({
+      "GET /api/templates/lantern": [200, staffOnly],
+      "GET /api/templates": [200, { templates: [staffOnly] }],
+      "PUT /api/templates/lantern/dublin-core": saved,
+    });
+    const user = userEvent.setup();
+    renderAt("/settings/templates/lantern/dublin-core");
+    expect(await screen.findByText(/no public fields left/)).toBeTruthy();
+    await user.click(await screen.findByRole("button", { name: "Remove row 2" }));
+    await user.click(screen.getByRole("button", { name: "Remove row 1" }));
+    await user.click(screen.getByRole("button", { name: "Save mapping" }));
+    await waitFor(() => {
+      expect(sent.some((s) => s.method === "PUT")).toBe(true);
+    });
+    const put = sent.find((s) => s.method === "PUT");
+    expect(put?.body).toEqual({ mapping: { entries: [] } });
+  });
+
   it("cancelling the confirmation sends nothing more", async () => {
     const sent = server({
       "PUT /api/templates/lantern/dublin-core": [

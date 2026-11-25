@@ -187,6 +187,7 @@ import {
   type RecordTypeSummary,
   type StateListEntry,
   sql,
+  MAX_AFFECTED_PUBLISHED,
 } from "@oculus/db";
 
 /**
@@ -355,6 +356,12 @@ export interface ServiceOptions {
    * `search_timeout`. Default 5,000; 1 to 30,000.
    */
   readonly searchTimeoutMs?: number;
+  /**
+   * The most published records a Dublin Core mapping change lists one by
+   * one; past it, the change is confirmed by its count (S-039). Default
+   * `MAX_AFFECTED_PUBLISHED`; tests set it low.
+   */
+  readonly maxListedPublished?: number;
 }
 
 /** What `checkRecord` returns: core's issues for the draft as it would be saved now. */
@@ -1312,6 +1319,16 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
     throw new RangeError("attempts is a whole number from 1 to 10.");
   }
   const onError = options.onError;
+  if (
+    options.maxListedPublished !== undefined &&
+    (!Number.isInteger(options.maxListedPublished) ||
+      options.maxListedPublished < 1 ||
+      options.maxListedPublished > MAX_AFFECTED_PUBLISHED)
+  ) {
+    throw new RangeError(
+      `maxListedPublished is a whole number from 1 to ${String(MAX_AFFECTED_PUBLISHED)}.`,
+    );
+  }
   const searchTimeoutMs = options.searchTimeoutMs ?? 5_000;
   if (!Number.isInteger(searchTimeoutMs) || searchTimeoutMs < 1 || searchTimeoutMs > 30_000) {
     throw new RangeError("searchTimeoutMs is a whole number from 1 to 30,000.");
@@ -2964,7 +2981,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
     },
 
     ...adminOperations(run),
-    ...definitionOperations(run),
+    ...definitionOperations(run, { maxListedPublished: options.maxListedPublished }),
     ...peopleOperations(db, run, onError, searchTimeoutMs),
     ...shareOperations(db, run, outside),
     submitForReview: workflowAction("submit_for_review"),

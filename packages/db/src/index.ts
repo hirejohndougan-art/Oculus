@@ -183,6 +183,7 @@ export type { TemplateSummary } from "./definitions.js";
 export { readRecordsForChecks } from "./catalog.js";
 export {
   publishedUsingTemplate,
+  countPublishedUsingTemplate,
   readDublinCoreMapping,
   writeDublinCoreMapping,
 } from "./dublin-core-mappings.js";
