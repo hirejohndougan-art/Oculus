@@ -133,6 +133,8 @@ import type { ThumbnailRenderer } from "./thumbnails.js";
 import { fileOperations, type FileOperations } from "./files.js";
 import { peopleOperations, type PeopleOperations } from "./people.js";
 import { shareOperations, type ShareOperations } from "./shares.js";
+import { accessionOperations, type AccessionOperations } from "./accessions.js";
+import { storageOperations, type StorageOperations } from "./storage.js";
 import {
   changeWorkflowState,
   checkWriterConnection,
@@ -478,7 +480,14 @@ export const MAX_VERSION_PAGE = 100;
 
 /** The service: every write of a record and its related rows, and who may make them. */
 export interface RecordService
-  extends AdminOperations, DefinitionOperations, PeopleOperations, ShareOperations, FileOperations {
+  extends
+    AdminOperations,
+    DefinitionOperations,
+    PeopleOperations,
+    ShareOperations,
+    FileOperations,
+    AccessionOperations,
+    StorageOperations {
   /** The record as stored, for someone who may view it (`records.view`). */
   readRecord(context: ServiceContext, recordId: RecordId): Promise<ServiceResult<ReadRecord>>;
   /**
@@ -3019,6 +3028,8 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
       options.thumbnailsEnabled,
     ),
     ...shareOperations(db, run, outside),
+    ...accessionOperations(run),
+    ...storageOperations(run),
     submitForReview: workflowAction("submit_for_review"),
     returnToDraft: workflowAction("return_to_draft"),
     publish: workflowAction("publish"),

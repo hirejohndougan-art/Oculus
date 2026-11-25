@@ -743,6 +743,161 @@ export function indexAccessions(
   }
 }
 
+/**
+ * A register of holds only (D-114), made by `indexAccessionHolds`: core's
+ * deed check accepts it exactly like one from `indexAccessions`, but it
+ * holds no accession, number, source, materials, note or contact, so the
+ * queries here (`accessionById` …) know nothing of it.
+ */
+export interface AccessionHoldsRegister {
+  readonly organizationId: OrganizationId;
+  readonly heldAsOf: string;
+}
+
+/** One accession as the publish check needs it: why it might hold, and what it produced. */
+export interface AccessionHold {
+  readonly deedStatus: DeedStatus;
+  readonly accessRestriction?: AccessRestriction;
+  /** The records it produced, of those the register is made with. */
+  readonly records: readonly RecordId[];
+}
+
+const HOLD_KEYS: ReadonlySet<string> = new Set(["holds", "records", "today"]);
+const HOLD_ENTRY_KEYS: ReadonlySet<string> = new Set([
+  "deedStatus",
+  "accessRestriction",
+  "records",
+]);
+
+/**
+ * The holds of stored accessions for the publish check and the public
+ * output (D-114): `{ holds, records, today }`, each hold only its deed
+ * status, its access restriction and the IDs of the records it produced
+ * among `records`. Held, as for `indexAccessions`: those records, the
+ * units filed below them and the digital assets that represent any of
+ * those, while the deed is needed but not signed or the restriction is in
+ * force on `today`. A produced record not among `records` is ignored (it
+ * can't be below or represented by one that is). Refuses, naming nothing
+ * of a hold's contents, anything it can't read. Never throws.
+ */
+export function indexAccessionHolds(
+  organizationId: OrganizationId,
+  input: unknown,
+): Validated<AccessionHoldsRegister> {
+  try {
+    if (!isOrganizationId(organizationId)) {
+      return refused(
+        ["organizationId"],
+        "invalid_organization",
+        "A register belongs to one organization: give its organization ID.",
+      );
+    }
+    if (types.isProxy(input) || !isPlainObject(input)) {
+      return refused([], "invalid_input", "Give { holds, records, today }.");
+    }
+    const parts = new Map<string, unknown>();
+    for (const key of Reflect.ownKeys(input)) {
+      if (typeof key !== "string" || !HOLD_KEYS.has(key)) {
+        return refused([], "invalid_input", "The input has a property this doesn't take.");
+      }
+      const slot = Object.getOwnPropertyDescriptor(input, key);
+      if (slot === undefined || !("value" in slot)) {
+        return refused([key], "invalid_input", `${key} can't be a getter.`);
+      }
+      parts.set(key, slot.value);
+    }
+    const today = parts.get("today");
+    if (!isDay(today)) {
+      return refused(
+        ["today"],
+        "invalid_today",
+        "Give today's date in the organization's time zone, written YYYY-MM-DD, as today.",
+      );
+    }
+    const found = recordSet(parts.get("records"));
+    if (!found.ok) return prefixed(["records"], found.issues);
+    if (found.value.organizationId !== undefined && found.value.organizationId !== organizationId) {
+      return { ok: false, issues: [mixedOrganizationsIssue(["records"], "These records")] };
+    }
+    const usable: CatalogRecord[] = [];
+    for (const record of found.value.byId.values()) {
+      if (record === undefined) continue;
+      if (record.organizationId !== organizationId) {
+        return { ok: false, issues: [mixedOrganizationsIssue(["records"], "These records")] };
+      }
+      usable.push(record);
+    }
+    const known = new Set(usable.map((r) => r.id));
+    const list = readList(parts.get("holds"), MAX_ACCESSIONS, "holds");
+    if (!list.ok) return prefixed(["holds"], list.issues);
+    const unreadable = (i: number): Validated<AccessionHoldsRegister> =>
+      refused(
+        ["holds", i],
+        "invalid_hold",
+        "A hold is { deedStatus, accessRestriction?, records }.",
+      );
+    const deedHolding: { id: AccessionId; records: { recordId: RecordId }[] }[] = [];
+    const restrictionHolding: { id: AccessionId; records: { recordId: RecordId }[] }[] = [];
+    for (const [i, entry] of list.value.entries()) {
+      if (!isPlainObject(entry)) return unreadable(i);
+      const e = entry as Readonly<Record<string, JsonValue>>;
+      if (Object.keys(e).some((k) => !HOLD_ENTRY_KEYS.has(k))) return unreadable(i);
+      const own = (key: string): JsonValue | undefined =>
+        Object.prototype.hasOwnProperty.call(e, key) ? e[key] : undefined;
+      const deed = own("deedStatus");
+      if (!(DEED_STATUSES as readonly unknown[]).includes(deed)) return unreadable(i);
+      const restriction = own("accessRestriction");
+      if (restriction !== undefined && restriction !== null) {
+        const issues = new IssueList();
+        checkRestriction(restriction, issues);
+        if (issues.count > 0) return unreadable(i);
+      }
+      const ids = own("records");
+      if (!Array.isArray(ids) || ids.length > MAX_ACCESSION_RECORDS) return unreadable(i);
+      const produced: { recordId: RecordId }[] = [];
+      for (const id of ids) {
+        if (!isRecordId(id)) return unreadable(i);
+        if (known.has(id)) produced.push({ recordId: id });
+      }
+      const pseudo = { id: newAccessionId(), records: produced };
+      if (DEED_HOLD_STATUSES.includes(deed as DeedStatus)) deedHolding.push(pseudo);
+      if (
+        restriction !== undefined &&
+        restriction !== null &&
+        restrictionInForce(restriction as unknown as AccessRestriction, today)
+      ) {
+        restrictionHolding.push(pseudo);
+      }
+    }
+    const deeds = heldBy(deedHolding, usable);
+    const restricted = heldBy(restrictionHolding, usable);
+    const register: AccessionHoldsRegister = Object.freeze({ organizationId, heldAsOf: today });
+    markDeedHolds(register, {
+      organizationId,
+      isHeld: (id) => deeds.has(id) || restricted.has(id),
+      holdReasons: (id) =>
+        Object.freeze([
+          ...(deeds.has(id) ? (["deed"] as const) : []),
+          ...(restricted.has(id) ? (["restriction"] as const) : []),
+        ]),
+      isKnown: (id) => known.has(id),
+    });
+    return { ok: true, value: register };
+  } catch {
+    return refused([], "unreadable", "The holds could not be read as plain data.");
+  }
+}
+
+/**
+ * Whether `accession` holds what it produced back from publishing on
+ * `today` (the organization's day, YYYY-MM-DD): its deed is needed but not
+ * signed, or its access restriction is in force (D-043, D-056).
+ */
+export function accessionHoldsOn(accession: Accession, today: string): boolean {
+  if (DEED_HOLD_STATUSES.includes(accession.deedStatus)) return true;
+  return restrictionInForce(ownData(accession, "accessRestriction"), today);
+}
+
 /** True if `value` is a register made by `indexAccessions`. */
 export function isAccessionRegister(value: unknown): value is AccessionRegister {
   return typeof value === "object" && value !== null && REGISTERS.has(value);
@@ -934,7 +1089,10 @@ function holdsIn(
  * it.
  */
 function heldBy(
-  accessions: readonly Accession[],
+  accessions: readonly {
+    readonly id: AccessionId;
+    readonly records: readonly { readonly recordId: RecordId }[];
+  }[],
   records: readonly CatalogRecord[],
 ): ReadonlyMap<RecordId, readonly AccessionId[]> {
   const below = new Map<RecordId, RecordId[]>();

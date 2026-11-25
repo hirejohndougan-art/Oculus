@@ -29,6 +29,8 @@ import { SECOND_FACTOR_TABLE_PRIVILEGES } from "./second-factor.js";
 import { ALERT_NOTICE_TABLE_PRIVILEGES } from "./alert-notices.js";
 import { SESSION_TABLE_PRIVILEGES } from "./sessions.js";
 import { STORED_FILE_TABLE_PRIVILEGES } from "./stored-files.js";
+import { ACCESSION_TABLE_PRIVILEGES } from "./accessions.js";
+import { STORAGE_TABLE_PRIVILEGES } from "./storage.js";
 import { sql } from "./sql.js";
 
 /**
@@ -84,6 +86,13 @@ export const WRITER_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Ob
   // Stored files (M-002, D-086): attached by INSERT; rows never change and
   // nothing deletes them yet.
   ...STORED_FILE_TABLE_PRIVILEGES,
+  // Accessions and donor contacts (T-018c, D-114): accessions are made and
+  // changed, never deleted; a contact may be deleted. Their produced-records
+  // list and history are the migration's trigger's.
+  ...ACCESSION_TABLE_PRIVILEGES,
+  // Storage (T-018d, D-115): levels and locations made and changed, never
+  // deleted; moves insert only (a mistake is put right by a later move).
+  ...STORAGE_TABLE_PRIVILEGES,
   // The change log of people and roles (T-048, D-084): insert only.
   ...PEOPLE_TABLE_PRIVILEGES,
   // Two-step alert notices (D-085): one row per alert, only ever added.
@@ -426,7 +435,9 @@ async function checkRoleConnection(
                          || pg_catalog.oidvectortypes(p.proargtypes) || ')' AS name
                   FROM pg_catalog.pg_proc p
                   JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+                  -- A trigger function can't be called by itself (T-018c).
                   WHERE p.prosecdef AND ${profile.definers !== undefined}::boolean
+                    AND p.prorettype <> 'pg_catalog.trigger'::pg_catalog.regtype
                     AND pg_catalog.has_function_privilege(w.oid, p.oid, 'EXECUTE')) AS f
             WHERE f.name <> ALL(${[...(profile.definers ?? [])]}::text[])) AS definers,
            (NOT w.current
