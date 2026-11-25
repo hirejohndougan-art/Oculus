@@ -47,11 +47,13 @@ import {
   loanList,
   loanNumberKey,
   loanOutMove,
+  loanProblems,
   loanState,
   newLoanId,
   overdueLoans,
   reindexLoans,
   unexplainedDepartures,
+  unexplainedArrivals,
   unexplainedLoanMoves,
   validateLoan,
   withConditionCheck,
@@ -125,6 +127,8 @@ export interface LoanVersion {
 export interface UnexplainedLoanMoves {
   readonly departures: readonly StorageMove[];
   readonly loanOutMoves: readonly StorageMove[];
+  /** Borrowed records brought into our care in moves no loan in names (D-118). */
+  readonly arrivals: readonly StorageMove[];
 }
 
 export interface LoanOperations {
@@ -526,10 +530,21 @@ export function loanOperations(run: Runner): LoanOperations {
         const versions = await readLoanHistory(tx, who.organizationId, found.loan.id);
         // Every version's records, not only today's (review fix): an earlier
         // version may name a record or lender the person may not see.
-        const named = versions.flatMap((v) => {
-          const checked = validateLoan(v.definition, b.now);
-          return checked.ok ? recordsOf(checked.value) : [];
-        });
+        // Read straight from the stored JSON, so a version that no longer
+        // validates still has its records checked (second review).
+        const named: RecordId[] = [];
+        for (const v of versions) {
+          const d = v.definition as { agentId?: unknown; items?: unknown };
+          if (isRecordId(d.agentId)) named.push(d.agentId);
+          if (Array.isArray(d.items)) {
+            for (const item of d.items as { recordId?: unknown }[]) {
+              if (isRecordId(item.recordId)) named.push(item.recordId);
+              else return UNKNOWN_LOAN();
+            }
+          } else {
+            return UNKNOWN_LOAN();
+          }
+        }
         if (!(await mayAll(tx, who.organizationId, may.access, named, "records.view"))) {
           return UNKNOWN_LOAN();
         }
@@ -577,6 +592,20 @@ export function loanOperations(run: Runner): LoanOperations {
         const next = checked.value;
         const records = await checkRecords(tx, who.organizationId, may.access, next);
         if (records !== undefined) return records;
+        // Naming an accession reads the donor register (D-036): donors.view.
+        if (
+          next.direction === "in" &&
+          next.items.some(
+            (i) => (i as { keptByAccessionId?: unknown }).keptByAccessionId !== undefined,
+          ) &&
+          !holdsSomewhere(may.access, "donors.view")
+        ) {
+          return refusal(
+            ["loan", "items"],
+            "not_permitted",
+            "Marking an item kept names an accession; that takes Donor relations.",
+          );
+        }
         const b = await bookOf(tx, who.organizationId, true);
         if (b === undefined) return UNREADABLE();
         if (loanId !== null) {
@@ -694,6 +723,27 @@ export function loanOperations(run: Runner): LoanOperations {
         const next = { ...loan, items } as Loan;
         const moved = reindexLoans(b.book, log.value);
         if (!moved.ok) return UNREADABLE();
+        // The move itself may not give any other loan a problem (second review).
+        const before = loanProblems(b.book);
+        const after = loanProblems(moved.value);
+        if (!before.ok || !after.ok) return UNREADABLE();
+        const had = new Set(
+          before.value.flatMap((p) =>
+            p.problems.map((i) => `${p.loanId} ${i.code} ${JSON.stringify(i.path)}`),
+          ),
+        );
+        const caused = after.value.some(
+          (p) =>
+            p.loanId !== loan.id &&
+            p.problems.some((i) => !had.has(`${p.loanId} ${i.code} ${JSON.stringify(i.path)}`)),
+        );
+        if (caused) {
+          return refusal(
+            ["otherLoans"],
+            "affects_other_loan",
+            "This move would give another loan a problem.",
+          );
+        }
         const book = withLoan(moved.value, next, new Date(now));
         if (!book.ok) return ownIssues(book.issues);
         const written = await insertStorageMove(
@@ -755,7 +805,8 @@ export function loanOperations(run: Runner): LoanOperations {
         if (b === undefined) return UNREADABLE();
         const gone = unexplainedDepartures(b.book);
         const sent = unexplainedLoanMoves(b.book);
-        if (!gone.ok || !sent.ok) return UNREADABLE();
+        const came = unexplainedArrivals(b.book);
+        if (!gone.ok || !sent.ok || !came.ok) return UNREADABLE();
         const visible = async (moves: readonly StorageMove[]): Promise<StorageMove[]> => {
           const kept: StorageMove[] = [];
           for (const m of moves) {
@@ -770,6 +821,7 @@ export function loanOperations(run: Runner): LoanOperations {
           value: Object.freeze({
             departures: Object.freeze(await visible(gone.value)),
             loanOutMoves: Object.freeze(await visible(sent.value)),
+            arrivals: Object.freeze(await visible(came.value)),
           }),
         };
       });

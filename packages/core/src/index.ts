@@ -465,6 +465,7 @@ export {
   loanProblems,
   unexplainedDepartures,
   unexplainedLoanMoves,
+  unexplainedArrivals,
 } from "./loans.js";
 export type {
   LoanId,

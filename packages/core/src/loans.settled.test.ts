@@ -20,6 +20,8 @@ import {
   overdueLoans,
   reindexLoans,
   reindexLocations,
+  unexplainedArrivals,
+  unexplainedLoanMoves,
   validateLoan,
   withLoan,
   type LoanBook,
@@ -159,22 +161,24 @@ describe("S-013: a borrowed record here with no linked arrival never hides the l
   const lantern = newRecordId();
   const arrival = move(lantern, shelf.id, "2026-06-03", "placement");
 
-  it("an agreed loan in whose item arrived unlinked is unknown, and overdue after its end", () => {
+  it("an agreed loan in whose item arrived unlinked stays owed, and the arrival is reported", () => {
     const loan = loanIn([{ recordId: lantern }]);
     const b = ok(indexLoans(log([arrival]), [loan]));
     const state = ok(loanState(b, loan.id));
-    expect(state.phase).toBe("unknown");
-    expect(state.problems.map((p) => p.code)).toEqual(["unlinked_arrival"]);
+    expect(state.phase).toBe("agreed");
+    expect(state.unsettled).toEqual([lantern]);
+    expect(overdueIds(b, "2026-10-31")).toEqual([]);
     expect(overdueIds(b)).toEqual([loan.id]);
-    // withLoan won't save it that way; linking the arrival puts it right.
-    expect(codes(withLoan(ok(indexLoans(log([arrival]), [])), loan))).toEqual(["unlinked_arrival"]);
+    expect(ok(unexplainedArrivals(b)).map((m) => m.id)).toEqual([arrival.id]);
+    // Linking it clears the report; the loan stays owed until it departs.
     const linked = { ...loan, items: [{ recordId: lantern, arrivalMoveId: arrival.id }] };
     const fixed = ok(withLoan(b, linked));
     expect(ok(loanState(fixed, loan.id)).phase).toBe("on_loan");
+    expect(ok(unexplainedArrivals(fixed))).toEqual([]);
     expect(overdueIds(fixed)).toEqual([loan.id]);
   });
 
-  it("one item back and another arrived unlinked: still overdue, never 'returned'", () => {
+  it("one item back and another arrived unlinked: still overdue, never settled", () => {
     const lamp = newRecordId();
     const lampIn = move(lamp, shelf.id, "2026-06-03", "placement");
     const lampBack = move(lamp, lenderPlace.id, "2026-10-01", "departure");
@@ -183,45 +187,27 @@ describe("S-013: a borrowed record here with no linked arrival never hides the l
       { recordId: lantern },
     ]);
     const b = ok(indexLoans(log([lampIn, lampBack, arrival]), [loan]));
-    expect(ok(loanState(b, loan.id)).phase).toBe("unknown");
+    expect(ok(loanState(b, loan.id)).unsettled).toEqual([lantern]);
     expect(overdueIds(b)).toEqual([loan.id]);
   });
 
-  it("moving beginOn later, or an arrival long before the loan, changes nothing (no dates)", () => {
+  it("moving beginOn later, an early arrival, a display case or an outside place change nothing", () => {
     const early = move(lantern, shelf.id, "2026-01-02", "placement");
-    for (const beginOn of ["2026-06-01", "2026-09-30"]) {
-      const loan = loanIn([{ recordId: lantern }], { beginOn });
-      expect(problemCodes(indexLoans(log([early]), [loan]))).toEqual(["unlinked_arrival"]);
-    }
-  });
-
-  it("a first move to a display case is still our care", () => {
     const shown = move(lantern, showcase.id, "2026-06-03", "exhibition");
-    const loan = loanIn([{ recordId: lantern }]);
-    expect(problemCodes(indexLoans(log([shown]), [loan]))).toEqual(["unlinked_arrival"]);
-  });
-
-  it("a record never housed here, or at an outside place: no problem, but owed past the end date", () => {
     const outside = move(lantern, otherLenderPlace.id, "2026-06-03", "conservation");
-    for (const moves of [[], [outside]]) {
-      const loan = loanIn([{ recordId: lantern }]);
-      const b = ok(indexLoans(log(moves), [loan]));
-      const state = ok(loanState(b, loan.id));
-      expect(state.problems).toEqual([]);
-      expect(state.phase).toBe("agreed");
-      expect(state.unsettled).toEqual([lantern]);
-      expect(overdueIds(b, "2026-10-31")).toEqual([]);
-      expect(overdueIds(b)).toEqual([loan.id]);
+    for (const moves of [[early], [shown], [outside], []]) {
+      for (const beginOn of ["2026-06-01", "2026-09-30"]) {
+        const loan = loanIn([{ recordId: lantern }], { beginOn });
+        const b = ok(indexLoans(log(moves), [loan]));
+        expect(ok(loanState(b, loan.id)).unsettled).toEqual([lantern]);
+        expect(overdueIds(b)).toEqual([loan.id]);
+      }
     }
   });
 
   it("changing a location's kind afterwards doesn't settle the loan", () => {
     const loan = loanIn([{ recordId: lantern }]);
-    const moves = [arrival];
-    const before = ok(indexLoans(log(moves), [loan]));
-    expect(overdueIds(before)).toEqual([loan.id]);
-    // The shelf "becomes" an outside place of someone else: the record is
-    // no longer in our care by the log, but the item is still owed.
+    const before = ok(indexLoans(log([arrival]), [loan]));
     const relabelled = LOCATIONS.map((l) =>
       l.id === shelf.id
         ? {
@@ -233,14 +219,9 @@ describe("S-013: a borrowed record here with no linked arrival never hides the l
           }
         : l,
     );
-    const index = reindexLocations(log(moves), LEVELS, relabelled);
-    if (index.ok) {
-      const after = ok(reindexLoans(before, index.value.log));
-      expect(overdueIds(after)).toEqual([loan.id]);
-    } else {
-      // Core refuses the relabel outright (a used location keeps its kind): fine too.
-      expect(index.ok).toBe(false);
-    }
+    const index = reindexLocations(log([arrival]), LEVELS, relabelled);
+    if (index.ok) expect(overdueIds(ok(reindexLoans(before, index.value.log)))).toEqual([loan.id]);
+    expect(overdueIds(before)).toEqual([loan.id]);
   });
 
   it("a decoy loan linking the arrival doesn't settle the real loan's item", () => {
@@ -250,30 +231,29 @@ describe("S-013: a borrowed record here with no linked arrival never hides the l
       endOn: "2099-12-31",
     });
     const b = ok(indexLoans(log([arrival]), [real, decoy]));
-    // The real loan has no problem now (the decoy explains the presence) but
-    // its item is still owed, so it is overdue after its own end date.
     expect(ok(loanState(b, real.id)).unsettled).toEqual([lantern]);
     expect(overdueIds(b)).toEqual([real.id]);
   });
 
-  it("notReceived settles an item, unless the record is here after all", () => {
+  it("only an explicit, recorded marker settles it: notReceived (kept in the loan's history)", () => {
     const loan = loanIn([{ recordId: lantern, notReceived: true }]);
     expect(overdueIds(ok(indexLoans(log([]), [loan])))).toEqual([]);
+    // A marker that turns out wrong is the staff member's recorded word; the
+    // arrival still shows on the report for someone to reconcile.
     const b = ok(indexLoans(log([arrival]), [loan]));
-    expect(ok(loanState(b, loan.id)).problems.map((p) => p.code)).toEqual(["received_after_all"]);
-    expect(overdueIds(b)).toEqual([loan.id]);
+    expect(ok(unexplainedArrivals(b)).map((m) => m.id)).toEqual([arrival.id]);
   });
 
-  it("gone back, then here again with no loan: the old loan is unknown", () => {
+  it("gone back, then here again with no loan: reported", () => {
     const back = move(lantern, lenderPlace.id, "2026-10-01", "departure");
     const again = move(lantern, shelf.id, "2026-11-01", "placement");
     const loan = loanIn([
       { recordId: lantern, arrivalMoveId: arrival.id, departureMoveId: back.id },
     ]);
-    expect(overdueIds(ok(indexLoans(log([arrival, back]), [loan])))).toEqual([]);
     const b = ok(indexLoans(log([arrival, back, again]), [loan]));
-    expect(ok(loanState(b, loan.id)).problems.map((p) => p.code)).toEqual(["back_again_unlinked"]);
-    expect(overdueIds(b)).toEqual([loan.id]);
+    expect(ok(unexplainedArrivals(b)).map((m) => m.id)).toEqual([again.id]);
+    // Ordinary work is never blocked by it (the second review's false positives).
+    expect(ok(loanState(b, loan.id)).problems).toEqual([]);
   });
 
   it("an inherited notReceived or keptByAccessionId never settles an item", () => {
@@ -291,7 +271,6 @@ describe("S-013: a borrowed record here with no linked arrival never hides the l
     }
   });
 });
-
 describe("the false positives the S-013 review found stay clear", () => {
   const clock = newRecordId();
   const arrival = move(clock, shelf.id, "2026-06-03", "placement");
@@ -521,35 +500,20 @@ describe("statuses and items once agreed (D-118)", () => {
   });
 });
 
-describe("loans out: the record at the borrower's with no open loan out", () => {
+describe("loans out: only a linked return or notSent settles an item", () => {
   const print = newRecordId();
   const home = move(print, shelf.id, "2026-01-10", "placement");
   const out = move(print, borrowerPlace.id, "2026-06-05", "loan_out", {
     expectedReturnOn: "2026-10-31",
   });
 
-  it("unlinked, marked notSent, or returned and out again", () => {
-    expect(problemCodes(indexLoans(log([home, out]), [loanOut([{ recordId: print }])]))).toEqual([
-      "unlinked_loan_out",
-    ]);
-    expect(
-      problemCodes(indexLoans(log([home, out]), [loanOut([{ recordId: print, notSent: true }])])),
-    ).toEqual(["sent_after_all"]);
+  it("an unlinked loan_out stays owed and is reported; a linked return settles it", () => {
+    const b = ok(indexLoans(log([home, out]), [loanOut([{ recordId: print }])]));
+    expect(overdueIds(b)).toHaveLength(1);
+    expect(ok(unexplainedLoanMoves(b)).map((m) => m.id)).toEqual([out.id]);
     const back = move(print, shelf.id, "2026-10-20", "return");
-    const again = move(print, borrowerPlace.id, "2026-11-01", "loan_out", {
-      expectedReturnOn: "2027-01-31",
-    });
     const returned = loanOut([{ recordId: print, loanOutMoveId: out.id, returnMoveId: back.id }]);
     expect(problemCodes(indexLoans(log([home, out, back]), [returned]))).toEqual([]);
-    expect(problemCodes(indexLoans(log([home, out, back, again]), [returned]))).toEqual([
-      "out_again_unlinked",
-    ]);
-    // A second loan out linking the new loan_out explains it.
-    const second = loanOut([{ recordId: print, loanOutMoveId: again.id }], {
-      beginOn: "2026-11-01",
-      endOn: "2027-01-31",
-    });
-    expect(problemCodes(indexLoans(log([home, out, back, again]), [returned, second]))).toEqual([]);
   });
 
   it("a return link to the wrong move never counts as returned", () => {
@@ -559,7 +523,6 @@ describe("loans out: the record at the borrower's with no open loan out", () => 
     expect(overdueIds(b)).toEqual([loan.id]);
   });
 });
-
 describe("valuation, insurance and authoriser (T-018a)", () => {
   const item = { recordId: newRecordId() };
 
@@ -593,21 +556,21 @@ afterEach(() => {
   expect(Object.prototype.hasOwnProperty.call(Object.prototype, "notReceived")).toBe(false);
 });
 
-describe("review fixes (D-118's first review)", () => {
+describe("review fixes (D-118's reviews)", () => {
   const urn = newRecordId();
   const arrival = move(urn, shelf.id, "2026-06-03", "placement");
 
-  it("cancelling can't hide an unlinked arrival, and a cancelled loan stays cancelled", () => {
+  it("a cancelled loan stays cancelled, with its items and markers", () => {
     const loan = loanIn([{ recordId: urn }]);
     const b = ok(indexLoans(log([]), [loan]));
-    const moved = ok(reindexLoans(b, log([arrival])));
     const cancel = {
       ...loan,
       status: "cancelled" as const,
       items: [{ recordId: urn, notReceived: true as const }],
     };
-    expect(codes(withLoan(moved, cancel))).toEqual(["received_after_all"]);
-    // Cancelled while nothing had come: fine, and final.
+    expect(codes(withLoan(b, { ...cancel, items: [{ recordId: urn }] }))).toEqual([
+      "status_change_refused",
+    ]);
     const cancelled = ok(withLoan(b, cancel));
     for (const status of ["requested", "agreed", "declined"] as const) {
       expect(codes(withLoan(cancelled, { ...cancel, status }))).toContain("status_change_refused");
@@ -615,38 +578,17 @@ describe("review fixes (D-118's first review)", () => {
     expect(codes(withLoan(cancelled, { ...cancel, items: [{ recordId: urn }] }))).toEqual([
       "item_removed",
     ]);
-    // It came after all: the cancelled loan is unknown, and overdue.
-    const later = ok(reindexLoans(cancelled, log([arrival])));
-    expect(ok(loanState(later, loan.id)).phase).toBe("unknown");
-    expect(overdueIds(later)).toEqual([loan.id]);
   });
 
-  it("an unlinked arrival counts even after the record went somewhere outside", () => {
-    const away = move(urn, otherLenderPlace.id, "2026-07-01", "conservation", {
-      expectedReturnOn: "2026-12-31",
-    });
-    const loan = loanIn([{ recordId: urn, notReceived: true }]);
-    expect(problemCodes(indexLoans(log([arrival, away]), [loan]))).toEqual(["received_after_all"]);
-  });
-
-  it("a long-open loan doesn't explain a later unlinked arrival", () => {
-    const first = loanIn([{ recordId: urn, arrivalMoveId: arrival.id }], { number: "LI-OLD" });
-    const gone = move(urn, lenderPlace.id, "2026-07-01", "departure");
-    const again = move(urn, shelf.id, "2026-08-01", "placement");
-    const second = loanIn([{ recordId: urn, notReceived: true }], { beginOn: "2026-08-01" });
-    const b = ok(indexLoans(log([arrival, gone, again]), [first, second]));
-    expect(ok(loanState(b, second.id)).problems.map((p) => p.code)).toEqual(["received_after_all"]);
-  });
-
-  it("a loan_out moved on elsewhere still counts against notSent", () => {
-    const print = newRecordId();
-    const home = move(print, shelf.id, "2026-01-10", "placement");
-    const out = move(print, borrowerPlace.id, "2026-06-05", "loan_out", {
-      expectedReturnOn: "2026-10-31",
-    });
-    const fixed = move(print, otherLenderPlace.id, "2026-06-06", "correction");
-    const loan = loanOut([{ recordId: print, notSent: true }]);
-    expect(problemCodes(indexLoans(log([home, out, fixed]), [loan]))).toEqual(["sent_after_all"]);
+  it("ordinary work is never blocked: exhibition first, a correction, a placement back", () => {
+    const shown = move(urn, showcase.id, "2026-06-02", "exhibition");
+    const placed = move(urn, shelf.id, "2026-06-03", "placement");
+    const back = move(urn, lenderPlace.id, "2026-10-01", "departure");
+    const loan = loanIn([{ recordId: urn, arrivalMoveId: placed.id, departureMoveId: back.id }]);
+    const b = ok(indexLoans(log([shown, placed, back]), [loan]));
+    expect(ok(loanState(b, loan.id)).problems).toEqual([]);
+    expect(overdueIds(b)).toEqual([]);
+    expect(ok(unexplainedArrivals(b)).map((m) => m.id)).toEqual([shown.id]);
   });
 
   it("the lender stays once anything moved", () => {

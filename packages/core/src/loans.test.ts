@@ -801,7 +801,6 @@ describe("an overdue loan can't be hidden by editing it (review fixes)", () => {
     const state = ok(loanState(b, closed.id));
     expect(state.phase).toBe("unknown");
     expect(state.problems.map((p) => [p.code, p.path])).toEqual([
-      ["unlinked_loan_out", ["items", 0]],
       ["closed_unsettled", ["items", 0]],
       ["closed_with_unlinked_move", ["items", 0]],
     ]);
@@ -856,7 +855,7 @@ describe("an overdue loan can't be hidden by editing it (review fixes)", () => {
     const raced = book([unlinked]);
     const state = ok(loanState(raced, lin.id));
     expect(state.phase).toBe("unknown");
-    expect(state.problems.map((p) => p.code)).toEqual(["unlinked_arrival", "closed_unsettled"]);
+    expect(state.problems.map((p) => p.code)).toEqual(["closed_unsettled"]);
     expect(ok(overdueLoans(raced, "2027-04-01")).map((s) => s.loan.id)).toEqual([lin.id]);
     // An item that never arrived is said so (D-118): it needs no departure.
     const neverCame = loanIn({

@@ -502,6 +502,8 @@ interface BookData {
   readonly unexplained: readonly StorageMove[];
   /** `loan_out` moves in the log that no loan out names or extends. */
   readonly unexplainedOut: readonly StorageMove[];
+  /** Moves bringing a borrowed record into our care that no loan in names (D-118). */
+  readonly unexplainedIn: readonly StorageMove[];
 }
 
 interface Entry {
@@ -765,6 +767,20 @@ export function unexplainedLoanMoves(book: LoanBook): Validated<readonly Storage
   const data = bookData(book);
   if (data === undefined) return notABook();
   return { ok: true, value: data.unexplainedOut };
+}
+
+/**
+ * Moves that brought a borrowed record (one on a loan in) into our care with
+ * no loan in naming them as its arrival, oldest first: its first move, or
+ * the first after it was at an outside place, other than a `return`. A
+ * record kept for good is left out. Reported, not refused (D-118): the
+ * loans stay owed until an item is settled by an explicit, recorded way;
+ * this list shows staff what to reconcile.
+ */
+export function unexplainedArrivals(book: LoanBook): Validated<readonly StorageMove[]> {
+  const data = bookData(book);
+  if (data === undefined) return notABook();
+  return { ok: true, value: data.unexplainedIn };
 }
 
 /**
@@ -1249,98 +1265,34 @@ function buildBook(
     list.push(m);
     strayByRecord.set(m.recordId, list);
   }
-  // Unexplained arrivals and sendings (D-118, S-013), from the record's
-  // whole history, never its dates: a move that brought a borrowed record
-  // into our care (its first move, or the first after it was at an outside
-  // place, other than a return) that no loan in names as an arrival; a
-  // `loan_out` no loan out names or extends (above). Each makes every loan
-  // of the record that says it isn't owing (never started, marked never
-  // received or sent, gone back or returned) unknown: a record here (or at
-  // the borrower's) with no loan explaining it can't be on a loan that
-  // looks finished. A record kept for good is ours, so its later moves are
-  // not arrivals. Requested and declined loans owe nothing and aren't
-  // checked; agreed, closed and cancelled ones are.
+  // Unexplained arrivals (D-118, S-013, after the second review): moves
+  // that brought a borrowed record into our care (its first move, or the
+  // first after it was at an outside place, other than a `return`) that no
+  // loan in names as an arrival. Reported, never a problem: the record's
+  // loans stay owed by the settling rule alone, and only an explicit,
+  // recorded marker settles them. (Two reviews showed that turning these
+  // into problems both left decoys and location edits a way round and
+  // blocked ordinary loans for good.) A record kept for good is ours, so
+  // its later moves are not arrivals.
   const keptRecords = new Set<RecordId>();
   for (const r of raw) if (settledOf(r) === "kept") keptRecords.add(r.recordId);
-  const strayArrivals = new Set<RecordId>();
+  const strayArrivals: StorageMove[] = [];
+  const seenRecords = new Set<RecordId>();
   for (const r of raw) {
-    if (r.loan.direction !== "in" || strayArrivals.has(r.recordId) || keptRecords.has(r.recordId)) {
-      continue;
-    }
+    if (r.loan.direction !== "in" || seenRecords.has(r.recordId)) continue;
+    seenRecords.add(r.recordId);
+    if (keptRecords.has(r.recordId)) continue;
     let outside = true;
     for (const m of r.moves) {
       const place = logLocation(log, m.locationId);
       const external = place?.kind === "external";
-      if (!external && outside && m.reason !== "return" && !named.has(m.id)) {
-        strayArrivals.add(r.recordId);
-        break;
-      }
+      if (!external && outside && m.reason !== "return" && !named.has(m.id)) strayArrivals.push(m);
       outside = external;
     }
   }
-  const straySent = new Set<string>();
-  for (const m of unexplainedOut) {
-    const place = logLocation(log, m.locationId);
-    if (place?.kind === "external" && place.agentId !== undefined) {
-      straySent.add(`${m.recordId} ${place.agentId}`);
-    }
-  }
-  const checked = (l: Loan): boolean =>
-    l.status === "agreed" || l.status === "closed" || l.status === "cancelled";
-  for (const r of raw) {
-    if (!checked(r.loan)) continue;
-    const by = settledOf(r);
-    const unstarted = by === null && !r.startNamed && r.continues === null;
-    if (r.loan.direction === "in") {
-      if (!strayArrivals.has(r.recordId)) continue;
-      if (unstarted) {
-        flag(
-          r.loan.id,
-          ["items", r.j],
-          "unlinked_arrival",
-          "This record came into our care in a move no loan in names as its arrival. Link the placement that housed it.",
-        );
-      } else if (by === "not_received") {
-        flag(
-          r.loan.id,
-          ["items", r.j, "notReceived"],
-          "received_after_all",
-          "This record is marked as never received, but it came into our care in a move no loan in names as its arrival.",
-        );
-      } else if (by === "departed") {
-        flag(
-          r.loan.id,
-          ["items", r.j, "departureMoveId"],
-          "back_again_unlinked",
-          "This record came into our care in a move no loan in names as its arrival. Record the loan in it came on, linking that arrival.",
-        );
-      }
-    } else {
-      if (!straySent.has(`${r.recordId} ${r.loan.agentId}`)) continue;
-      if (unstarted) {
-        flag(
-          r.loan.id,
-          ["items", r.j],
-          "unlinked_loan_out",
-          "This record went to the borrower in a loan_out no loan out names. Link the move that sent it.",
-        );
-      } else if (by === "not_sent") {
-        flag(
-          r.loan.id,
-          ["items", r.j, "notSent"],
-          "sent_after_all",
-          "This record is marked as never sent, but it went to the borrower in a loan_out no loan out names.",
-        );
-      } else if (by === "returned") {
-        flag(
-          r.loan.id,
-          ["items", r.j, "returnMoveId"],
-          "out_again_unlinked",
-          "This record went to the borrower again in a loan_out no loan out names.",
-        );
-      }
-    }
-  }
+  strayArrivals.sort((x, y) =>
+    x.recordedAt < y.recordedAt ? -1 : x.recordedAt > y.recordedAt ? 1 : 0,
+  );
 
   for (const r of raw) {
     if (r.loan.status !== "closed") continue;
@@ -1421,6 +1373,7 @@ function buildBook(
     byRecord: frozenByRecord,
     unexplained,
     unexplainedOut,
+    unexplainedIn: Object.freeze(strayArrivals),
   });
   return { ok: true, value: book };
 }

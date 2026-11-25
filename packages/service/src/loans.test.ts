@@ -327,7 +327,7 @@ describe("loans through the service (T-018b, D-118)", () => {
     ]);
   });
 
-  it("S-013: a borrowed record placed here unlinked makes its loan unknown, and edits must link it", async () => {
+  it("S-013: a borrowed record placed here unlinked keeps its loan owed, and is reported", async () => {
     await ready();
     const w = await world();
     const p = await places(w);
@@ -344,31 +344,34 @@ describe("loans through the service (T-018b, D-118)", () => {
       }),
     );
     const read = ok(await service.readLoan(ctx(w, w.reader), saved.loan.id));
-    expect(read.state.phase).toBe("unknown");
-    expect(read.state.problems.map((x) => x.code)).toEqual(["unlinked_arrival"]);
+    expect(read.state.unsettled).toEqual([w.lantern.id]);
     expect(ok(await service.overdueLoans(ctx(w, w.reader))).map((x) => x.loan.id)).toEqual([
       saved.loan.id,
     ]);
-    // Moving the dates doesn't help; marking it never received doesn't either.
-    for (const edit of [
-      { beginOn: "2026-10-01", endOn: "2027-12-31" },
-      { items: [{ recordId: w.lantern.id, notReceived: true }] },
-    ]) {
-      const tried = await service.saveLoan(ctx(w, w.cataloger), saved.loan.id, loanIn(w, edit), {
-        expectedVersion: 1,
-      });
-      expect(codes(tried)[0]).toMatch(/unlinked_arrival|received_after_all/);
-    }
-    // Linking the arrival puts it right.
+    expect(
+      ok(await service.unexplainedLoanMoves(ctx(w, w.reader))).arrivals.map((m) => m.id),
+    ).toEqual([placed.id]);
+    // Moving the dates doesn't help.
+    const moved = ok(
+      await service.saveLoan(
+        ctx(w, w.cataloger),
+        saved.loan.id,
+        loanIn(w, { beginOn: "2026-10-01" }),
+        { expectedVersion: 1 },
+      ),
+    );
+    expect(moved.state.unsettled).toEqual([w.lantern.id]);
+    // Linking the arrival clears the report.
     const linked = ok(
       await service.saveLoan(
         ctx(w, w.cataloger),
         saved.loan.id,
         loanIn(w, { items: [{ recordId: w.lantern.id, arrivalMoveId: placed.id }] }),
-        { expectedVersion: 1 },
+        { expectedVersion: 2 },
       ),
     );
     expect(linked.state.phase).toBe("on_loan");
+    expect(ok(await service.unexplainedLoanMoves(ctx(w, w.reader))).arrivals).toEqual([]);
   });
 
   it("takes nothing but the loan from the caller: no register, no book, no extra keys", async () => {
@@ -417,11 +420,15 @@ describe("loans through the service (T-018b, D-118)", () => {
     const kept = loanIn(w, {
       items: [{ recordId: w.lantern.id, arrivalMoveId, keptByAccessionId: accessionId }],
     });
-    // No such accession yet.
+    // Naming an accession takes Donor relations.
     expect(
       codes(
         await service.saveLoan(ctx(w, w.cataloger), saved.loan.id, kept, { expectedVersion: 2 }),
       ),
+    ).toEqual(["not_permitted"]);
+    // No such accession yet.
+    expect(
+      codes(await service.saveLoan(ctx(w, w.root), saved.loan.id, kept, { expectedVersion: 2 })),
     ).toEqual(["not_kept"]);
     const definition = (records: string[]) => ({
       id: accessionId,
@@ -437,7 +444,7 @@ describe("loans through the service (T-018b, D-118)", () => {
               ${JSON.stringify(definition([w.lantern.id]))}::jsonb, '2026.001',
               ${w.root}::uuid, ${w.root}::uuid)`);
     const settled = ok(
-      await service.saveLoan(ctx(w, w.cataloger), saved.loan.id, kept, { expectedVersion: 2 }),
+      await service.saveLoan(ctx(w, w.root), saved.loan.id, kept, { expectedVersion: 2 }),
     );
     expect(settled.state.items[0]?.settledBy).toBe("kept");
     expect(ok(await service.overdueLoans(ctx(w, w.reader)))).toEqual([]);
