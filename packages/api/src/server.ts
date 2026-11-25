@@ -59,6 +59,12 @@
  *    (`ADMIN_SECURITY_HEADERS`) in place of the API's; every other reply
  *    keeps `SECURITY_HEADERS`.
  *
+ * 11. Files (file-replies.ts, M-001, D-088): a handler sends a stored file's
+ *    bytes only by returning `fileReply(...)`, which decides the Content-Type
+ *    (never an active stored type), the Content-Disposition and the length;
+ *    its reply gets `FILE_SECURITY_HEADERS` (nosniff, a sandboxing CSP,
+ *    same-origin CORP) and nothing the handler set, cookies included.
+ *
  * Adding another Fastify plugin, parser or error handler is its own decision
  * (D-051).
  */
@@ -84,6 +90,7 @@ import {
   summarizeThrown,
   type ThrownSummary,
 } from "./errors.js";
+import { FILE_SECURITY_HEADERS, isFileReply, type FileReply } from "./file-replies.js";
 import { SECURITY_HEADERS } from "./headers.js";
 import { failsOriginCheck, originsFromEnv } from "./origin.js";
 import { RouteTable, pathOf, pathProblem } from "./paths.js";
@@ -247,6 +254,9 @@ function logLateFailure(request: FastifyRequest, fresh: Refusal, thrown: unknown
  * result or failure is never handed to Fastify (which would log the request
  * URL, query string included, and the error object).
  */
+/** Requests answered with a file (M-001, D-088): they get `FILE_SECURITY_HEADERS` in onSend. */
+const fileReplies = new WeakSet<FastifyRequest>();
+
 function addRoute(app: FastifyInstance, route: OculusRoute): void {
   const credentials = route.credentials === true;
   const handler = route.handler;
@@ -271,14 +281,16 @@ function addRoute(app: FastifyInstance, route: OculusRoute): void {
       else response.once("close", stop);
       const ended = (): boolean => controller.signal.aborted || reply.sent;
       let body: unknown;
+      let file: FileReply | undefined;
       try {
         const result: unknown = await handler(
           oculusRequest(request, controller.signal),
           oculusReply(reply, () => running),
         );
+        if (isFileReply(result)) file = result;
         // Copied as plain data before Fastify sees it: a Response, stream or
         // Buffer would skip the header checks below (routes.ts).
-        body = resultBody(result);
+        else body = resultBody(result);
       } catch (thrown) {
         const fresh = rebuildThrown(thrown);
         if (ended()) {
@@ -296,6 +308,13 @@ function addRoute(app: FastifyInstance, route: OculusRoute): void {
       }
       // Timed out (the 503 is already sent) or the client has gone.
       if (ended()) return undefined;
+      if (file !== undefined) {
+        // A file (file-replies.ts): exactly its own headers, whatever the
+        // handler set, always a 200, and the file headers in onSend.
+        for (const name of Object.keys(reply.getHeaders())) reply.removeHeader(name);
+        fileReplies.add(request);
+        return reply.code(200).headers(file.headers).send(file.body);
+      }
       return reply.send(body);
     },
   });
@@ -500,7 +519,11 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
       reply.removeHeader("set-cookie");
       throw new Error("a Set-Cookie header broke the cookie rules");
     }
-    const headers = adminReplies.has(request) ? ADMIN_SECURITY_HEADERS : SECURITY_HEADERS;
+    const headers = adminReplies.has(request)
+      ? ADMIN_SECURITY_HEADERS
+      : fileReplies.has(request)
+        ? FILE_SECURITY_HEADERS
+        : SECURITY_HEADERS;
     for (const [name, value] of Object.entries(headers)) void reply.header(name, value);
     return payload;
   });
@@ -524,6 +547,7 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
       }
       // Nothing the handler set (headers, cookies, Location) goes out with an error.
       for (const name of Object.keys(reply.getHeaders())) reply.removeHeader(name);
+      fileReplies.delete(request);
       return reply.code(statusCode).type("application/json; charset=utf-8").send(body);
     } catch {
       sendFallback(reply);

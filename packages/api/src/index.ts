@@ -72,3 +72,16 @@ export {
   ADMIN_ORIGIN_ENV,
 } from "./admin-files.js";
 export type { AdminFile, AdminFiles } from "./admin-files.js";
+export {
+  fileReply,
+  isFileReply,
+  mayShowInline,
+  safeFileName,
+  contentDisposition,
+  INLINE_FILE_TYPES,
+  DOWNLOAD_TYPE,
+  FILE_CSP,
+  FILE_SECURITY_HEADERS,
+  MAX_FILE_NAME_LENGTH,
+} from "./file-replies.js";
+export type { FileReply, FileReplyInput } from "./file-replies.js";
