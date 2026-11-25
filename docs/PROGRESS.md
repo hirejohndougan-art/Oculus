@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 16:20 CT — manual (Chat Z) — T-070 "View public site" button (finished)
+- Result: done (built, not pushed: John asked that nothing be pushed yet)
+- What changed: Chat I's branch with main (1a47d62) merged in; one conflict in `admin-server.ts` (main's `buildServer` call kept, `publicHomes` added back). Branch `autopilot/T-070`, local only.
+- Decisions: D-109 (T-070 part, from Chat I)
+- Review: Chat I's independent review passed it as is; the merge changed only the conflict above
+- Gate: PASS · tests_passing 5220 (was 5207) · npm audit clean
+- Next: T-071 (Chat Z, on top of this branch)
+
 ## 2026-11-25 07:55 CT — manual (Chat I) — T-070 "View public site" button in the admin
 - Result: done
 - What changed: `GET /api/me` adds each site's public origin (only from `OCULUS_PUBLIC_SITES` as checked at startup, only for the person's sites); `frame/ViewPublicSite.tsx` under the site selector and in Settings › Sites opens `<origin>/` in a new tab (`rel="noopener noreferrer"`, no Referer), disabled with "This site has no public address yet" when there is none; server rule 13 (`public-home.ts`): a public host's `/` answers one fixed page with the site's name and "This public site is being built", no record data, CSP with the one style's hash. Commit ba66cc7.
