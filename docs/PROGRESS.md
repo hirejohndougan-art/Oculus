@@ -7,7 +7,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - **Done:** thumbnails are back on (D-097). Every decode runs in its own child process with an in-child watchdog that kills it past a 352 MiB growth cap (also on its deadline, and when its parent is gone), plus the parent's sampler as a second layer. The server only reads a 64 KiB header; strict JPEG segment lengths, sampling factors up to 4, VP8L and VP8L-compressed ALPH planned per group and every prefix code checked complete, segment, chunk and frame count caps. Failed spawns, descriptor exhaustion and outside kills are all handled. WebP originals are untouched; thumbnails are JPEG.
 - **Reviews:** four independent reviews; the last found nothing blocking, and every finding was fixed.
 - **Filed:** T-074 (thumbnails for large photos; jpeg-js stops near 6 MP), S-057 (a libwebp build without CVE-2023-4863).
-- Gate: see below.
+- Gate: PASS (tests_passing 5141; baseline raised from 5104).
 
 ## 2026-11-25 13:30 CT — manual (Chat A) — S-040 Scan uploaded files for viruses
 
