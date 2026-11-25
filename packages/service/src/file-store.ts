@@ -209,14 +209,23 @@ export interface FileStore {
     organizationId: OrganizationId,
     sha256: string,
     size: string,
-  ): Promise<Uint8Array | "none" | undefined>;
-  /** Caches a thumbnail (or `"none"`): written to a temporary file, then renamed into place. */
+  ): Promise<Uint8Array | "none" | { readonly timedOutAt: number } | undefined>;
+  /**
+   * Caches a thumbnail, `"none"` (the decoder refused it: never tried
+   * again) or `"timeout"` (too slow: tried again after a while): written
+   * to a temporary file, then renamed into place.
+   */
   writeThumbnail(
     organizationId: OrganizationId,
     sha256: string,
     size: string,
-    jpeg: Uint8Array | "none",
+    jpeg: Uint8Array | "none" | "timeout",
   ): Promise<void>;
+  /**
+   * Moves a content's cached thumbnails (every size and version) aside, for
+   * `emptyTrash` to delete (the sweep, M-003).
+   */
+  trashThumbnails(organizationId: OrganizationId, sha256: string): Promise<void>;
   /** The contents an organization has cached thumbnails of (their hashes), for the sweep. */
   thumbnailContents(organizationId: OrganizationId): Promise<readonly string[]>;
   /** The organizations with a folder here. */
@@ -600,7 +609,13 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
         }
         return undefined;
       }
-      return (await plainFile(join(folder, `${sha256}.v1.none`), 0)) ? "none" : undefined;
+      if (await plainFile(join(folder, `${sha256}.v1.none`), 0)) return "none";
+      const timeout = join(folder, `${sha256}.v1.timeout`);
+      if (await plainFile(timeout, 0)) {
+        const info = await lstat(timeout);
+        return { timedOutAt: info.mtimeMs };
+      }
+      return undefined;
     },
 
     async writeThumbnail(organizationId, sha256, size, jpeg) {
@@ -616,7 +631,7 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       let placed = false;
       try {
         try {
-          if (jpeg !== "none") await writeAll(handle, jpeg);
+          if (typeof jpeg !== "string") await writeAll(handle, jpeg);
           await handle.sync();
         } finally {
           await handle.close();
@@ -624,7 +639,8 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
         // A rename replaces whatever is at the name (a planted link
         // included) in one step. Nothing else is deleted here: only the
         // sweep deletes (trash, then emptyTrash); a JPEG beside a ".none" wins.
-        const name = jpeg === "none" ? `${sha256}.v1.none` : `${sha256}.v1.jpg`;
+        const name =
+          jpeg === "none" || jpeg === "timeout" ? `${sha256}.v1.${jpeg}` : `${sha256}.v1.jpg`;
         await rename(temporaryPath, join(folder, name));
         placed = true;
       } finally {
@@ -862,11 +878,13 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
     async trash(organizationId, sha256) {
       const target = pathFor(organizationId, sha256);
       const info = await lstat(target).catch(() => undefined);
-      if (info?.isFile() === true) {
-        const bin = await safeFolder(organizationId, "trash");
-        await rename(target, join(bin, `${sha256}.${randomBytes(8).toString("hex")}`));
-      }
-      // Its cached thumbnails (M-003), every size and version: moved aside too.
+      if (info?.isFile() !== true) return;
+      const bin = await safeFolder(organizationId, "trash");
+      await rename(target, join(bin, `${sha256}.${randomBytes(8).toString("hex")}`));
+    },
+
+    async trashThumbnails(organizationId, sha256) {
+      if (!isSha256Hex(sha256)) throw new TypeError("Not a SHA-256.");
       const thumbnails = await existingFolder(organizationId, "thumbnails");
       if (thumbnails === undefined) return;
       for (const size of await readdir(thumbnails, { withFileTypes: true })) {

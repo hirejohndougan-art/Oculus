@@ -262,43 +262,354 @@ function pngInflatedBytes(
 }
 
 const PNG_CHANNELS: Readonly<Record<number, number>> = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 };
+/** The bit depths each colour type allows (PNG 3rd edition, table 11.1). */
+const PNG_DEPTHS: Readonly<Record<number, readonly number[]>> = {
+  0: [1, 2, 4, 8, 16],
+  2: [8, 16],
+  3: [1, 2, 4, 8],
+  4: [8, 16],
+  6: [8, 16],
+};
+
+/** A PNG's one header and its image data, as the strict walk found them. */
+interface PngLayout {
+  readonly width: number;
+  readonly height: number;
+  readonly depth: number;
+  readonly colorType: number;
+  readonly interlaced: boolean;
+  readonly idat: readonly Uint8Array[];
+}
 
 /**
- * Checks a PNG before pngjs reads it: the chunks are walked (lengths within
- * the file), and the image data is inflated with a ceiling of exactly what
- * the header allows, so a few kilobytes that inflate to gigabytes are
- * refused at the ceiling.
+ * Walks a PNG's chunks strictly (review B1: pngjs decodes by the last
+ * IHDR, so a second one could smuggle a larger image past the limits):
+ * the signature, then exactly one IHDR of length 13 first; at most one
+ * PLTE, before the image data, present for colour type 3 and absent for
+ * grey types; the IDAT chunks consecutive; IEND last with nothing after
+ * it; every length within the file. Anything else is refused.
  */
-function checkPng(bytes: Uint8Array, width: number, height: number): void {
+function walkPng(bytes: Uint8Array): PngLayout {
+  if (!PNG_SIGNATURE.every((v, i) => bytes[i] === v)) throw new ImageRefused("png_header");
+  if (u32be(bytes, 8) !== 13 || !ascii(bytes, 12, "IHDR")) throw new ImageRefused("png_header");
+  const width = u32be(bytes, 16);
+  const height = u32be(bytes, 20);
   const depth = bytes[24] ?? 0;
   const colorType = bytes[25] ?? 0;
+  const compression = bytes[26] ?? 0;
+  const filter = bytes[27] ?? 0;
   const interlace = bytes[28] ?? 0;
-  const channels = PNG_CHANNELS[colorType];
-  if (channels === undefined || ![1, 2, 4, 8, 16].includes(depth) || interlace > 1) {
+  if (
+    PNG_DEPTHS[colorType]?.includes(depth) !== true ||
+    compression !== 0 ||
+    filter !== 0 ||
+    interlace > 1
+  ) {
     throw new ImageRefused("png_header");
   }
-  const parts: Uint8Array[] = [];
-  let i = 8;
-  let ended = false;
-  while (i + 12 <= bytes.length) {
+  const idat: Uint8Array[] = [];
+  let palettes = 0;
+  let idatState: "before" | "in" | "after" = "before";
+  let i = 8 + 25;
+  for (;;) {
+    if (i + 12 > bytes.length) throw new ImageRefused("png_truncated");
     const length = u32be(bytes, i);
     const end = i + 12 + length;
-    if (end > bytes.length) throw new ImageRefused("png_truncated");
-    if (ascii(bytes, i + 4, "IDAT")) parts.push(bytes.subarray(i + 8, i + 8 + length));
-    if (ascii(bytes, i + 4, "IEND")) {
-      ended = true;
-      break;
+    if (length > 0x7fffffff || end > bytes.length) throw new ImageRefused("png_truncated");
+    const type = String.fromCharCode(...bytes.subarray(i + 4, i + 8));
+    if (!/^[A-Za-z]{4}$/.test(type)) throw new ImageRefused("png_chunk");
+    if (type === "IHDR") throw new ImageRefused("png_second_header");
+    if (type === "IDAT") {
+      if (idatState === "after") throw new ImageRefused("png_chunk");
+      idatState = "in";
+      idat.push(bytes.subarray(i + 8, i + 8 + length));
+    } else {
+      if (idatState === "in") idatState = "after";
+      if (type === "PLTE") {
+        palettes++;
+        if (palettes > 1 || idatState !== "before" || colorType === 0 || colorType === 4) {
+          throw new ImageRefused("png_palette");
+        }
+      }
+      if (type === "IEND") {
+        if (end !== bytes.length) throw new ImageRefused("png_after_end");
+        break;
+      }
     }
     i = end;
   }
-  if (!ended || parts.length === 0) throw new ImageRefused("png_truncated");
-  const ceiling = pngInflatedBytes(width, height, depth * channels, interlace === 1);
+  if (idat.length === 0) throw new ImageRefused("png_truncated");
+  if (colorType === 3 && palettes !== 1) throw new ImageRefused("png_palette");
+  return { width, height, depth, colorType, interlaced: interlace === 1, idat };
+}
+
+/**
+ * Inflates a PNG's image data with a ceiling of exactly what its header
+ * allows, so a few kilobytes that inflate to gigabytes are refused there.
+ */
+function checkPngData(layout: PngLayout): void {
+  const channels = PNG_CHANNELS[layout.colorType] ?? 4;
+  const ceiling = pngInflatedBytes(
+    layout.width,
+    layout.height,
+    layout.depth * channels,
+    layout.interlaced,
+  );
   try {
-    inflateSync(Buffer.concat(parts), { maxOutputLength: ceiling });
+    inflateSync(Buffer.concat(layout.idat), { maxOutputLength: ceiling });
   } catch {
     // Over the ceiling (a bomb) or not valid zlib data.
     throw new ImageRefused("png_data");
   }
+}
+
+/** The chunks of a WebP file, walked strictly. */
+interface WebpLayout {
+  readonly width: number;
+  readonly height: number;
+  readonly lossless: boolean;
+  /** The bytes the RIFF size names. */
+  readonly body: Uint8Array;
+}
+
+/** Width and height from a VP8 or VP8L chunk's own data. */
+function webpFrameSize(
+  type: string,
+  b: Uint8Array,
+  at: number,
+  length: number,
+): { width: number; height: number } {
+  if (type === "VP8 ") {
+    if (length < 10 || b[at + 3] !== 0x9d || b[at + 4] !== 0x01 || b[at + 5] !== 0x2a) {
+      throw new ImageRefused("webp_frame");
+    }
+    return { width: u16le(b, at + 6) & 0x3fff, height: u16le(b, at + 8) & 0x3fff };
+  }
+  if (length < 5 || b[at] !== 0x2f) throw new ImageRefused("webp_frame");
+  const b1 = b[at + 1] ?? 0;
+  const b2 = b[at + 2] ?? 0;
+  const b3 = b[at + 3] ?? 0;
+  const b4 = b[at + 4] ?? 0;
+  return {
+    width: 1 + (b1 | ((b2 & 0x3f) << 8)),
+    height: 1 + ((b2 >> 6) | (b3 << 2) | ((b4 & 0x0f) << 10)),
+  };
+}
+
+/**
+ * Walks a WebP's RIFF container strictly: the RIFF size within the file
+ * (only those bytes are decoded); a simple file (one VP8 or VP8L chunk) or
+ * an extended one (VP8X first, then optionally ICCP and ALPH, then exactly
+ * one VP8 or VP8L chunk, then metadata); no animation (the VP8X flag, ANIM
+ * or ANMF chunks); every chunk within the RIFF size; the frame's own size
+ * equal to the VP8X canvas. The size used for the limits is the frame's.
+ */
+function walkWebp(bytes: Uint8Array): WebpLayout {
+  if (!ascii(bytes, 0, "RIFF") || !ascii(bytes, 8, "WEBP")) throw new ImageRefused("header");
+  const riffSize =
+    (bytes[4] ?? 0) +
+    (bytes[5] ?? 0) * 256 +
+    (bytes[6] ?? 0) * 65_536 +
+    (bytes[7] ?? 0) * 16_777_216;
+  if (riffSize < 12 || riffSize + 8 > bytes.length) throw new ImageRefused("webp_riff");
+  const body = bytes.subarray(0, riffSize + 8);
+  let canvas: { width: number; height: number } | undefined;
+  let frame: { width: number; height: number; lossless: boolean } | undefined;
+  let i = 12;
+  let first = true;
+  while (i < body.length) {
+    if (i + 8 > body.length) throw new ImageRefused("webp_chunk");
+    const type = String.fromCharCode(...body.subarray(i, i + 4));
+    const length =
+      (body[i + 4] ?? 0) +
+      (body[i + 5] ?? 0) * 256 +
+      (body[i + 6] ?? 0) * 65_536 +
+      (body[i + 7] ?? 0) * 16_777_216;
+    const end = i + 8 + length + (length % 2);
+    if (end > body.length && i + 8 + length !== body.length) throw new ImageRefused("webp_chunk");
+    if (type === "VP8X") {
+      if (!first || length !== 10) throw new ImageRefused("webp_chunk");
+      if (((body[i + 8] ?? 0) & 0x02) !== 0) throw new ImageRefused("webp_animated");
+      canvas = { width: 1 + u24le(body, i + 12), height: 1 + u24le(body, i + 15) };
+    } else if (type === "ANIM" || type === "ANMF") {
+      throw new ImageRefused("webp_animated");
+    } else if (type === "VP8 " || type === "VP8L") {
+      if (frame !== undefined) throw new ImageRefused("webp_second_frame");
+      if (!first && canvas === undefined) throw new ImageRefused("webp_chunk");
+      frame = { ...webpFrameSize(type, body, i + 8, length), lossless: type === "VP8L" };
+    } else if (type === "ALPH" || type === "ICCP") {
+      if (canvas === undefined || frame !== undefined) throw new ImageRefused("webp_chunk");
+    } else if (first) {
+      throw new ImageRefused("webp_chunk");
+    }
+    first = false;
+    i = end;
+  }
+  if (frame === undefined) throw new ImageRefused("webp_frame");
+  if (canvas !== undefined && (canvas.width !== frame.width || canvas.height !== frame.height)) {
+    throw new ImageRefused("webp_canvas");
+  }
+  return { width: frame.width, height: frame.height, lossless: frame.lossless, body };
+}
+
+/**
+ * The most memory one decode may take, input and every copy included
+ * (review B2: `resourceLimits` bounds only the JavaScript heap, and pixel
+ * buffers live outside it): 320 MiB. Each format's cost per pixel below
+ * was measured (thumbnails.test.ts, peak RSS) and rounded up.
+ */
+export const DECODE_BUDGET_BYTES = 320 * 1024 * 1024;
+
+/** What decoding and scaling an image costs at most, in bytes (see `DECODE_BUDGET_BYTES`). */
+export interface DecodePlan {
+  readonly width: number;
+  readonly height: number;
+  readonly bytes: number;
+}
+
+/** Scaling after decoding: flattening in place, then halving (⅓ more at most). */
+const SCALE_BYTES_PER_PIXEL = 4 * (4 / 3);
+
+function jpegComponents(b: Uint8Array): number | undefined {
+  let i = 2;
+  while (i + 3 < b.length) {
+    const marker = b[i + 1] ?? 0;
+    if (b[i] !== 0xff) return undefined;
+    if (marker === 0xff) {
+      i++;
+      continue;
+    }
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+      i += 2;
+      continue;
+    }
+    if (marker === 0xd9 || marker === 0xda) return undefined;
+    const length = u16be(b, i + 2);
+    if (length < 2) return undefined;
+    if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) {
+      return b[i + 9];
+    }
+    i += 2 + length;
+  }
+  return undefined;
+}
+
+/**
+ * Checks an image's header as the format named (never guessed), strictly
+ * for PNG and WebP, against the limits and the memory budget, and returns
+ * what decoding it will cost; throws `ImageRefused` otherwise. Cheap: no
+ * pixel is decoded, so the server runs it before queueing a job too.
+ */
+export function planDecode(format: string, bytes: Uint8Array, limits: ImageLimits): DecodePlan {
+  if (!THUMBNAIL_TYPES.has(format)) throw new ImageRefused("format");
+  let width: number;
+  let height: number;
+  let perPixel: number;
+  let extra = 0;
+  if (format === "image/png") {
+    const layout = walkPng(bytes);
+    ({ width, height } = layout);
+    const channels = PNG_CHANNELS[layout.colorType] ?? 4;
+    const inflated = pngInflatedBytes(width, height, layout.depth * channels, layout.interlaced);
+    // Our ceiling check's inflate, pngjs's inflate and its unfiltered copy;
+    // a 16-bit image's 16-bit bitmap; the RGBA output; scaling.
+    extra = 3 * inflated;
+    perPixel = (layout.depth === 16 ? 8 : 0) + 4 + SCALE_BYTES_PER_PIXEL;
+  } else if (format === "image/webp") {
+    const layout = walkWebp(bytes);
+    ({ width, height } = layout);
+    // libwebp's output in WebAssembly memory, its copy out, scaling; and
+    // for lossless, its ARGB working buffer.
+    perPixel = 4 + 4 + (layout.lossless ? 4 : 0) + SCALE_BYTES_PER_PIXEL;
+    extra = 2 * bytes.length;
+  } else if (format === "image/jpeg") {
+    const size = jpegDimensions(bytes);
+    const components = jpegComponents(bytes);
+    if (size === undefined || components === undefined || components < 1 || components > 4) {
+      throw new ImageRefused("header");
+    }
+    ({ width, height } = size);
+    // jpeg-js: its coefficient blocks and sample planes per component, then
+    // RGBA (measured in the worker: up to 39 bytes a pixel at its peak for
+    // three components, so about 7.8 megapixels fit the budget).
+    perPixel = components * 11 + 4 + SCALE_BYTES_PER_PIXEL;
+  } else {
+    const size = imageDimensions(format, bytes);
+    if (size === undefined) throw new ImageRefused("header");
+    ({ width, height } = size);
+    // omggif: one index byte a pixel of the first frame, the RGBA screen, scaling.
+    perPixel = 1 + 4 + SCALE_BYTES_PER_PIXEL;
+  }
+  if (!withinLimits({ width, height }, limits)) throw new ImageRefused("too_large");
+  const cost = Math.ceil(width * height * perPixel + extra + bytes.length);
+  if (cost > DECODE_BUDGET_BYTES) throw new ImageRefused("too_large");
+  return { width, height, bytes: cost };
+}
+
+/**
+ * The extent a GIF's frames reach (the largest of its logical screen and
+ * every image descriptor), walking its blocks; `undefined` when the walk
+ * doesn't reach the trailer within `bytes` (review: the browser draws
+ * every frame, not only the screen).
+ */
+export function gifExtent(b: Uint8Array): { width: number; height: number } | undefined {
+  if (!ascii(b, 0, "GIF87a") && !ascii(b, 0, "GIF89a")) return undefined;
+  if (b.length < 13) return undefined;
+  let width = u16le(b, 6);
+  let height = u16le(b, 8);
+  const flags = b[10] ?? 0;
+  let i = 13 + ((flags & 0x80) !== 0 ? 3 * 2 ** ((flags & 0x07) + 1) : 0);
+  const skipSubBlocks = (): boolean => {
+    for (;;) {
+      if (i >= b.length) return false;
+      const size = b[i] ?? 0;
+      i += 1;
+      if (size === 0) return true;
+      i += size;
+    }
+  };
+  for (;;) {
+    if (i >= b.length) return undefined;
+    const block = b[i];
+    if (block === 0x3b) return { width, height };
+    if (block === 0x21) {
+      i += 2;
+      if (!skipSubBlocks()) return undefined;
+    } else if (block === 0x2c) {
+      if (i + 10 > b.length) return undefined;
+      const x = u16le(b, i + 1);
+      const y = u16le(b, i + 3);
+      width = Math.max(width, x + u16le(b, i + 5));
+      height = Math.max(height, y + u16le(b, i + 7));
+      const local = b[i + 9] ?? 0;
+      i += 10 + ((local & 0x80) !== 0 ? 3 * 2 ** ((local & 0x07) + 1) : 0);
+      i += 1; // LZW minimum code size
+      if (!skipSubBlocks()) return undefined;
+    } else {
+      return undefined;
+    }
+  }
+}
+
+/**
+ * The size a browser would draw an image at, read as the format named, for
+ * the inline view's limits: the GIF's every frame, a WebP walked strictly;
+ * `undefined` when it can't be told from `bytes`.
+ */
+export function viewDimensions(
+  format: string,
+  bytes: Uint8Array,
+): { readonly width: number; readonly height: number } | undefined {
+  if (format === "image/gif") return gifExtent(bytes);
+  if (format === "image/webp") {
+    try {
+      const layout = walkWebp(bytes);
+      return { width: layout.width, height: layout.height };
+    } catch {
+      return undefined;
+    }
+  }
+  return imageDimensions(format, bytes);
 }
 
 /** libwebp's decoder (@jsquash/webp), loaded once per worker from its own files. */
@@ -327,67 +638,55 @@ function loadWebp(): Promise<WebpDecode> {
   return webpDecoder;
 }
 
-/**
- * Checks a WebP's container before libwebp reads it, and returns the bytes
- * the RIFF size names: a size claiming more than the file holds is refused,
- * as is an animated WebP (the VP8X animation flag).
- */
-function checkWebp(bytes: Uint8Array): Uint8Array {
-  const riffSize =
-    (bytes[4] ?? 0) +
-    (bytes[5] ?? 0) * 256 +
-    (bytes[6] ?? 0) * 65_536 +
-    (bytes[7] ?? 0) * 16_777_216;
-  if (riffSize < 12 || riffSize + 8 > bytes.length) throw new ImageRefused("webp_riff");
-  if (ascii(bytes, 12, "VP8X") && ((bytes[20] ?? 0) & 0x02) !== 0) {
-    throw new ImageRefused("webp_animated");
-  }
-  return bytes.subarray(0, riffSize + 8);
-}
-
-/** Decodes a WebP within the limits (asynchronous: the decoder is WebAssembly). */
-async function decodeWebp(bytes: Uint8Array, limits: ImageLimits): Promise<Rgba> {
-  const size = imageDimensions("image/webp", bytes);
-  if (size === undefined) throw new ImageRefused("header");
-  if (!withinLimits(size, limits)) throw new ImageRefused("too_large");
-  const body = checkWebp(bytes);
-  let image: Awaited<ReturnType<WebpDecode>>;
-  try {
-    const decode = await loadWebp();
-    // A copy the decoder may keep: never the caller's buffer.
-    image = await decode(body.slice().buffer);
-  } catch {
-    throw new ImageRefused("decode");
-  }
-  if (image.width !== size.width || image.height !== size.height) {
-    throw new ImageRefused("webp_header");
-  }
-  return {
-    width: image.width,
-    height: image.height,
-    data: new Uint8Array(image.data.buffer, image.data.byteOffset, image.data.byteLength),
-  };
+/** A failure that says nothing about the file (memory, a crash): never remembered. */
+function transient(error: unknown): boolean {
+  return (
+    error instanceof RangeError ||
+    (error instanceof Error &&
+      /memory/i.test(error.message) &&
+      !error.message.includes("maxMemoryUsageInMB"))
+  );
 }
 
 /**
- * Decodes an image of the format named to RGBA pixels, within the limits.
- * JPEG, PNG and GIF are decoded at once; WebP is asynchronous.
+ * Decodes an image of the format named to RGBA pixels, within the limits
+ * and the memory budget (`planDecode` first). Throws `ImageRefused` for an
+ * image it won't decode (the same every time), anything else for a
+ * failure that may pass (memory).
  */
 export async function decodeAny(
   format: string,
   bytes: Uint8Array,
   limits: ImageLimits,
 ): Promise<Rgba> {
-  return format === "image/webp" ? decodeWebp(bytes, limits) : decodeImage(format, bytes, limits);
+  const plan = planDecode(format, bytes, limits);
+  if (format === "image/webp") {
+    const layout = walkWebp(bytes);
+    let image: Awaited<ReturnType<WebpDecode>>;
+    try {
+      const decode = await loadWebp();
+      // A copy the decoder may keep: never the caller's buffer.
+      image = await decode(layout.body.slice().buffer);
+    } catch (error) {
+      if (transient(error)) throw error;
+      throw new ImageRefused("decode");
+    }
+    if (image.width !== plan.width || image.height !== plan.height) {
+      throw new ImageRefused("webp_header");
+    }
+    return {
+      width: image.width,
+      height: image.height,
+      data: new Uint8Array(image.data.buffer, image.data.byteOffset, image.data.byteLength),
+    };
+  }
+  return decodeImage(format, bytes, limits);
 }
 
-/** Decodes an image of the format named to RGBA pixels, within the limits. */
+/** Decodes a JPEG, PNG or GIF (WebP: `decodeAny`) within the limits and the budget. */
 export function decodeImage(format: string, bytes: Uint8Array, limits: ImageLimits): Rgba {
-  // WebP goes through decodeAny (asynchronous).
-  if (!THUMBNAIL_TYPES.has(format) || format === "image/webp") throw new ImageRefused("format");
-  const size = imageDimensions(format, bytes);
-  if (size === undefined) throw new ImageRefused("header");
-  if (!withinLimits(size, limits)) throw new ImageRefused("too_large");
+  if (format === "image/webp") throw new ImageRefused("format");
+  const size = planDecode(format, bytes, limits);
   try {
     if (format === "image/jpeg") {
       const image = jpeg.decode(bytes, {
@@ -395,12 +694,13 @@ export function decodeImage(format: string, bytes: Uint8Array, limits: ImageLimi
         formatAsRGBA: true,
         tolerantDecoding: false,
         maxResolutionInMP: limits.maxPixels / 1_000_000,
-        maxMemoryUsageInMB: 1024,
+        maxMemoryUsageInMB: Math.ceil(DECODE_BUDGET_BYTES / (1024 * 1024)),
       });
       return { width: image.width, height: image.height, data: image.data };
     }
     if (format === "image/png") {
-      checkPng(bytes, size.width, size.height);
+      // One header (walkPng refused a second), so pngjs decodes this size.
+      checkPngData(walkPng(bytes));
       const image = pngjs.PNG.sync.read(
         Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
         { checkCRC: true },
@@ -423,7 +723,7 @@ export function decodeImage(format: string, bytes: Uint8Array, limits: ImageLimi
     reader.decodeAndBlitFrameRGBA(0, data);
     return { width: reader.width, height: reader.height, data };
   } catch (error) {
-    if (error instanceof ImageRefused) throw error;
+    if (error instanceof ImageRefused || transient(error)) throw error;
     // The decoder's own refusal (its message may quote the file): a fixed code.
     throw new ImageRefused("decode");
   }
@@ -556,6 +856,9 @@ export type ThumbnailAnswer =
 /** A WebP above this many pixels leaves its worker to be replaced (its WebAssembly memory stays grown). */
 export const WEBP_RECYCLE_PIXELS = 4_000_000;
 
+/** The code of a failure that says nothing about the file (never remembered). */
+export const TRANSIENT = "transient";
+
 /** Marks the worker started by thumbnails.ts (and only it). */
 export const WORKER_MARK = "oculus-thumbnail-worker";
 
@@ -573,8 +876,10 @@ if (port !== null && (workerData as { mark?: unknown } | null)?.mark === WORKER_
         answer = {
           id: job.id,
           ok: false,
-          code: error instanceof ImageRefused ? error.message : "decode",
-          recycle,
+          // A refusal is the same every time; anything else (memory) may pass.
+          code: error instanceof ImageRefused ? error.message : TRANSIENT,
+          // After a failure that isn't a refusal, start afresh.
+          recycle: recycle || !(error instanceof ImageRefused),
         };
       }
       port.postMessage(answer);

@@ -154,6 +154,59 @@ export function pngOf(
   ]);
 }
 
+/** A PNG from chunks given as [type, data] (valid CRCs), for strict-walk tests. */
+export function pngFrom(chunks: readonly (readonly [string, Uint8Array])[]): Buffer {
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    ...chunks.map(([type, data]) => chunk(type, data)),
+  ]);
+}
+
+/** An IHDR chunk's data. */
+export function ihdr(
+  width: number,
+  height: number,
+  depth = 8,
+  colorType = 0,
+  interlace = 0,
+): Buffer {
+  return Buffer.concat([
+    u32be(width),
+    u32be(height),
+    Buffer.from([depth, colorType, 0, 0, interlace]),
+  ]);
+}
+
+/** Exactly `bytes` zero bytes compressed with zlib, streamed (never all in memory). */
+export async function zlibZeroBytes(bytes: number): Promise<Buffer> {
+  const deflate = createDeflate({ level: 6 });
+  const parts: Buffer[] = [];
+  deflate.on("data", (c: Buffer) => parts.push(c));
+  const ended = new Promise((resolve) => deflate.once("end", resolve));
+  const zero = Buffer.alloc(1024 * 1024);
+  let left = bytes;
+  while (left > 0) {
+    const piece = left >= zero.length ? zero : zero.subarray(0, left);
+    left -= piece.length;
+    if (!deflate.write(piece)) await new Promise((r) => deflate.once("drain", r));
+  }
+  deflate.end();
+  await ended;
+  return Buffer.concat(parts);
+}
+
+/** A valid all-black PNG of any size and format (zero filter bytes and samples). */
+export async function zeroPng(
+  width: number,
+  height: number,
+  depth = 8,
+  colorType = 6,
+): Promise<Buffer> {
+  const channels = ({ 0: 1, 2: 3, 4: 2, 6: 4 } as Record<number, number>)[colorType] ?? 4;
+  const rowBytes = Math.ceil((width * depth * channels) / 8) + 1;
+  return pngOf(width, height, await zlibZeroBytes(rowBytes * height), { depth, colorType });
+}
+
 /** Zeros compressed with zlib: `mib` MiB of them in a few hundred KiB. */
 export async function zlibZeros(mib: number): Promise<Buffer> {
   const deflate = createDeflate({ level: 9 });

@@ -2,26 +2,32 @@
  * The thumbnail renderer (M-003, D-097): one worker thread
  * (thumbnail-worker.ts) that decodes and scales one image at a time.
  *
- * - **One job at a time, a short queue.** At most `maxQueued` jobs wait;
+ * - **One job at a time, a short queue.** At most `maxQueued` jobs (one by
+ *   default) wait;
  *   more are refused at once (`busy`, a 503), so a burst of requests for
  *   large images can't pile up memory or CPU on a small server.
  * - **Limits on the worker itself.** It runs with a heap limit
  *   (`resourceLimits`) and each job with a time limit: a job that runs out
  *   of either has its worker stopped (the next job starts a fresh one) and
- *   is answered `refused` (out of memory, like an image the decoder
- *   refused) or `timeout`.
+ *   is answered `failed` (out of memory or a crash: never remembered,
+ *   unlike `refused`, the decoder's own answer) or `timeout`.
  * - The worker is unreferenced while idle, so it never keeps a process
  *   alive, and `close()` stops it.
  */
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
-import { WORKER_MARK, type ThumbnailAnswer, type ThumbnailJob } from "./thumbnail-worker.js";
+import {
+  TRANSIENT,
+  WORKER_MARK,
+  type ThumbnailAnswer,
+  type ThumbnailJob,
+} from "./thumbnail-worker.js";
 
 export interface ThumbnailRendererOptions {
   /** The longest one job may take, in milliseconds (default 20 s). */
   readonly timeoutMs?: number;
-  /** Jobs that may wait behind the running one (default 8). */
+  /** Jobs that may wait behind the running one (default 1: at most two decodes' memory at once). */
   readonly maxQueued?: number;
   /** The worker's heap limit in MiB (default 256). */
   readonly heapMiB?: number;
@@ -29,7 +35,16 @@ export interface ThumbnailRendererOptions {
 
 export type RenderResult =
   | { readonly ok: true; readonly jpeg: Uint8Array }
-  | { readonly ok: false; readonly code: "refused" | "busy" | "timeout" };
+  | {
+      readonly ok: false;
+      /**
+       * `refused`: the decoder refused the image (the same every time, so it
+       * may be remembered); `failed`: the worker ran out of memory, crashed
+       * or failed otherwise (says nothing about the image: never
+       * remembered); `timeout`: too slow; `busy`: the queue is full.
+       */
+      readonly code: "refused" | "failed" | "busy" | "timeout";
+    };
 
 export interface ThumbnailRenderer {
   /** Renders a thumbnail of `bytes`, decoded as `format`, to fit `box`. */
@@ -53,7 +68,7 @@ interface Pending {
 
 export function createThumbnailRenderer(options: ThumbnailRendererOptions = {}): ThumbnailRenderer {
   const timeoutMs = options.timeoutMs ?? 20_000;
-  const maxQueued = options.maxQueued ?? 8;
+  const maxQueued = options.maxQueued ?? 1;
   const heapMiB = options.heapMiB ?? 256;
   const queue: Pending[] = [];
   let worker: Worker | undefined;
@@ -93,13 +108,17 @@ export function createThumbnailRenderer(options: ThumbnailRendererOptions = {}):
       if (running?.pending.job.id !== answer.id) return;
       // A large WebP grew the worker's WebAssembly memory for good: replace it.
       if (answer.recycle) stopWorker();
-      finish(answer.ok ? { ok: true, jpeg: answer.jpeg } : { ok: false, code: "refused" });
+      finish(
+        answer.ok
+          ? { ok: true, jpeg: answer.jpeg }
+          : { ok: false, code: answer.code === TRANSIENT ? "failed" : "refused" },
+      );
     });
     // Out of memory, a crash or an exit: this job is refused, the next gets a new worker.
     const lost = (): void => {
       if (worker === w) worker = undefined;
       w.removeAllListeners();
-      finish({ ok: false, code: "refused" });
+      finish({ ok: false, code: "failed" });
     };
     w.on("error", lost);
     w.on("exit", lost);

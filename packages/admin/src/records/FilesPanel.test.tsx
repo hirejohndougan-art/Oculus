@@ -10,6 +10,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SITE_1, fakeServer } from "../testing.fixtures";
 import { FilesPanel, sizeText } from "./FilesPanel";
+import { viewErrorText } from "./FileViewer";
 import { RECORD_ID } from "./records.fixtures";
 
 afterEach(() => {
@@ -110,17 +111,54 @@ const PAGE = {
 };
 
 describe("viewing and downloading (M-003)", () => {
-  it("shows a placeholder when the server makes no thumbnail", async () => {
-    fakeServer({ [LIST]: [200, { files: [SKY], maxFileBytes: 1000 }] });
-    show(false);
-    const button = await screen.findByRole("button", { name: "Preview sky.webp" });
-    const img = button.querySelector("img");
-    if (img === null) throw new Error("no thumbnail");
-    img.dispatchEvent(new Event("error"));
-    await waitFor(() => {
-      expect(button.querySelector("img")).toBeNull();
+  it("shows a placeholder when the server makes no thumbnail, and tries again when it was busy", async () => {
+    const thumb = `/api/records/${RECORD_ID}/files/${SKY.id}/thumbnail?size=small`;
+    const photoThumb = `/api/records/${RECORD_ID}/files/${PHOTO.id}/thumbnail?size=small`;
+    fakeServer({
+      [LIST]: [200, { files: [SKY, PHOTO], maxFileBytes: 1000 }],
+      [`HEAD ${thumb}`]: [422, { error: "no_thumbnail" }],
+      [`HEAD ${photoThumb}`]: [405, { error: "method_not_allowed" }],
     });
-    expect(within(button).getByText("View")).toBeTruthy();
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      show(false);
+      const button = await screen.findByRole("button", { name: "Preview sky.webp" });
+      const img = button.querySelector("img");
+      if (img === null) throw new Error("no thumbnail");
+      expect(img.getAttribute("loading")).toBe("lazy");
+      img.dispatchEvent(new Event("error"));
+      await waitFor(() => {
+        expect(button.querySelector("img")).toBeNull();
+      });
+      expect(within(button).getByText("View")).toBeTruthy();
+      // Busy (not cached yet): the same thumbnail is asked for again later.
+      const photo = screen.getByRole("button", { name: "Preview photo.jpg" });
+      photo.querySelector("img")?.dispatchEvent(new Event("error"));
+      await vi.advanceTimersByTimeAsync(4500);
+      await waitFor(() => {
+        expect(photo.querySelector("img")?.getAttribute("src")).toBe(`${photoThumb}&attempt=1`);
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("says why an image can't be shown, by its status", async () => {
+    fakeServer({
+      [LIST]: [200, { files: [PHOTO], maxFileBytes: 1000 }],
+      [`HEAD /api/records/${RECORD_ID}/files/${PHOTO.id}/view`]: [422, { error: "not_viewable" }],
+    });
+    show(false);
+    await userEvent.click(await screen.findByRole("button", { name: "Preview photo.jpg" }));
+    const viewer = await screen.findByRole("region", { name: "Preview of photo.jpg" });
+    within(viewer).getByRole("img").dispatchEvent(new Event("error"));
+    expect(await within(viewer).findByRole("alert")).toHaveProperty(
+      "textContent",
+      viewErrorText(422),
+    );
+    expect(viewErrorText(404)).toMatch(/no longer/);
+    expect(viewErrorText(503)).toMatch(/Try again/);
+    expect(within(viewer).getByRole("link", { name: "Download photo.jpg" })).toBeTruthy();
   });
 
   it("offers a download for every file and a preview only for images, by sniffed type", async () => {

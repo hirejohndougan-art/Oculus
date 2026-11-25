@@ -75,7 +75,8 @@ import {
   THUMBNAIL_TYPES,
   VIEW_LIMITS,
   VIEW_TYPES,
-  imageDimensions,
+  planDecode,
+  viewDimensions,
   withinLimits,
   type ThumbnailSize,
 } from "./thumbnail-worker.js";
@@ -151,6 +152,23 @@ export const MAX_THUMBNAIL_SOURCE_BYTES = 100 * 1024 * 1024;
 /** How much of a file's start is read to find an image's size before showing it (1 MiB). */
 export const VIEW_HEADER_BYTES = 1024 * 1024;
 
+/** The largest GIF shown inline (16 MiB): read whole to find every frame's extent. */
+export const VIEW_GIF_BYTES = 16 * 1024 * 1024;
+
+/** How long a thumbnail that took too long is left before it is tried again (24 hours). */
+export const THUMBNAIL_RETRY_MS = 24 * 3600 * 1000;
+
+/** Thumbnails made at once (each holds its file and its decode's memory). */
+export const THUMBNAILS_AT_ONCE = 2;
+
+/** Thumbnails an organization may have made (not from the cache) per minute. */
+export const THUMBNAILS_PER_MINUTE = 6;
+
+export interface ThumbnailOptions {
+  /** Only from the cache (HEAD): `not_cached` when nothing is cached. */
+  readonly cacheOnly?: boolean;
+}
+
 /** Why the files folder can't be used with this database (`bindFileStore`). */
 export type FileStoreProblem = "no_store" | "other_install" | "marker_missing" | "not_empty";
 
@@ -207,6 +225,7 @@ export interface FileOperations {
     recordId: RecordId,
     fileId: string,
     size: ThumbnailSize,
+    options?: ThumbnailOptions,
   ): Promise<ServiceResult<{ readonly jpeg: Uint8Array }>>;
   /**
    * Ties the files folder to this database (review B1): the first time, an
@@ -272,10 +291,31 @@ export function fileOperations(
   store: FileStore | undefined,
   clock: () => Date,
   thumbnails?: ThumbnailRenderer,
+  thumbnailLimits: { readonly atOnce?: number; readonly perMinute?: number } = {},
 ): FileOperations {
+  const atOnce = thumbnailLimits.atOnce ?? THUMBNAILS_AT_ONCE;
+  const perMinute = thumbnailLimits.perMinute ?? THUMBNAILS_PER_MINUTE;
   let renderer = thumbnails;
   /** Thumbnails being made now, by organization, content and size: asked twice, made once. */
   const making = new Map<string, Promise<ServiceResult<{ readonly jpeg: Uint8Array }>>>();
+  /** Thumbnails being made now (all organizations). */
+  let makingNow = 0;
+  /** Each organization's thumbnails made in the current minute (a fixed window). */
+  const budgets = new Map<string, { minute: number; used: number }>();
+  const takeBudget = (organizationId: string): boolean => {
+    const minute = Math.floor(clock().getTime() / 60_000);
+    const entry = budgets.get(organizationId);
+    if (entry?.minute !== minute) {
+      if (budgets.size > 10_000) budgets.clear();
+      budgets.set(organizationId, { minute, used: 1 });
+      return true;
+    }
+    if (entry.used >= perMinute) return false;
+    entry.used++;
+    return true;
+  };
+  const busy = (): ServiceRefusal =>
+    refusal(["files"], "busy", "Too many thumbnails are being made. Try again.");
 
   /** The file as the person may read it: the asset visible to them, the file its own. */
   async function readable(
@@ -635,16 +675,31 @@ export function fileOperations(
             await lockOrganizationFiles(tx, organizationId);
             const listed = await store.listContents(organizationId);
             let unknownHere = 0;
-            // Copies and cached thumbnails (M-003) alike: thumbnails go with
-            // their bytes, and a thumbnail left without its copy goes too.
-            const hashes = [
-              ...new Set([...listed.hashes, ...(await store.thumbnailContents(organizationId))]),
-            ].sort();
-            for (let i = 0; i < hashes.length; i += 1000) {
-              const batch = hashes.slice(i, i + 1000);
+            for (let i = 0; i < listed.hashes.length; i += 1000) {
+              const batch = listed.hashes.slice(i, i + 1000);
               const decided = await sweepableContents(tx, organizationId, batch);
               unknownHere += decided.unknown.size;
-              for (const sha256 of decided.deletable) await store.trash(organizationId, sha256);
+              for (const sha256 of decided.deletable) {
+                await store.trash(organizationId, sha256);
+                // Its thumbnails (M-003) go with its bytes.
+                await store.trashThumbnails(organizationId, sha256);
+              }
+            }
+            // Thumbnails left without their copy (made while it was swept):
+            // the same predicate, and only the thumbnails are moved.
+            const copies = new Set(listed.hashes);
+            const orphans = (await store.thumbnailContents(organizationId)).filter(
+              (h) => !copies.has(h),
+            );
+            for (let i = 0; i < orphans.length; i += 1000) {
+              const decided = await sweepableContents(
+                tx,
+                organizationId,
+                orphans.slice(i, i + 1000),
+              );
+              for (const sha256 of decided.deletable) {
+                await store.trashThumbnails(organizationId, sha256);
+              }
             }
             return { skipped: listed.skipped, unknown: unknownHere };
           });
@@ -674,14 +729,20 @@ export function fileOperations(
         if (!VIEW_TYPES.has(file.mediaType)) {
           return refusal(["fileId"], "not_viewable", "This file can only be downloaded.");
         }
+        // A GIF draws every frame: its whole block structure is walked, so
+        // only GIFs up to VIEW_GIF_BYTES are shown.
+        const gif = file.mediaType === "image/gif";
+        if (gif && file.size > VIEW_GIF_BYTES) {
+          return refusal(["fileId"], "not_viewable", "This file can only be downloaded.");
+        }
         const head = await store.readContent(
           organizationId,
           file.sha256,
           file.size,
-          VIEW_HEADER_BYTES,
+          gif ? VIEW_GIF_BYTES : VIEW_HEADER_BYTES,
         );
         if (head === undefined) return missingCopy();
-        if (!withinLimits(imageDimensions(file.mediaType, head), VIEW_LIMITS)) {
+        if (!withinLimits(viewDimensions(file.mediaType, head), VIEW_LIMITS)) {
           return refusal(["fileId"], "not_viewable", "This file can only be downloaded.");
         }
       }
@@ -690,7 +751,7 @@ export function fileOperations(
       return { ok: true, value: Object.freeze({ file, open }) };
     },
 
-    async fileThumbnail(context, recordId, fileId, size) {
+    async fileThumbnail(context, recordId, fileId, size, options = {}) {
       if (store === undefined) return NO_STORE;
       const box = Object.hasOwn(THUMBNAIL_BOXES, size) ? THUMBNAIL_BOXES[size] : undefined;
       if (box === undefined) {
@@ -703,18 +764,28 @@ export function fileOperations(
         return noThumbnail();
       }
       // Cached per organization and content: never another organization's.
+      // The cache is a help, never a need: trouble with it is a miss.
+      const cached = await store
+        .readThumbnail(organizationId, file.sha256, size)
+        .catch(() => undefined);
+      if (cached instanceof Uint8Array) return { ok: true, value: { jpeg: cached } };
+      if (cached === "none") return noThumbnail();
+      if (cached !== undefined && clock().getTime() - cached.timedOutAt < THUMBNAIL_RETRY_MS) {
+        return noThumbnail();
+      }
+      if (options.cacheOnly === true) {
+        return refusal(["fileId"], "not_cached", "No thumbnail is cached for this file.");
+      }
       const key = `${organizationId}/${file.sha256}/${size}`;
       const already = making.get(key);
       if (already !== undefined) return already;
+      // A slot and the organization's budget before a byte is read (review
+      // B3 and item 1): a few at once, a few a minute, then 503 busy.
+      if (makingNow >= atOnce || !takeBudget(organizationId)) return busy();
+      makingNow++;
+      const remember = (what: Uint8Array | "none" | "timeout"): Promise<void> =>
+        store.writeThumbnail(organizationId, file.sha256, size, what).catch(() => undefined);
       const made = (async (): Promise<ServiceResult<{ readonly jpeg: Uint8Array }>> => {
-        // The cache is a help, never a need: trouble with it is a miss.
-        const remember = (jpeg: Uint8Array | "none"): Promise<void> =>
-          store.writeThumbnail(organizationId, file.sha256, size, jpeg).catch(() => undefined);
-        const cached = await store
-          .readThumbnail(organizationId, file.sha256, size)
-          .catch(() => undefined);
-        if (cached === "none") return noThumbnail();
-        if (cached !== undefined) return { ok: true, value: { jpeg: cached } };
         const bytes = await store.readContent(
           organizationId,
           file.sha256,
@@ -722,30 +793,43 @@ export function fileOperations(
           MAX_THUMBNAIL_SOURCE_BYTES,
         );
         if (bytes?.length !== file.size) return missingCopy();
-        // The header first, here: a bomb is refused before any decoder runs.
-        if (!withinLimits(imageDimensions(file.mediaType, bytes), THUMBNAIL_LIMITS)) {
+        // The header, its structure and the memory budget first, here: a
+        // bomb is refused before any decoder runs.
+        try {
+          planDecode(file.mediaType, bytes, THUMBNAIL_LIMITS);
+        } catch {
           await remember("none");
           return noThumbnail();
         }
         renderer ??= createThumbnailRenderer();
         const result = await renderer.render(file.mediaType, bytes, box);
-        if (!result.ok) {
-          if (result.code === "busy") {
-            return refusal(["files"], "busy", "Too many thumbnails are being made. Try again.");
-          }
-          // Refused by the decoder or out of memory: remembered, so it isn't
-          // tried again. A timeout may be the server's load: not remembered.
-          if (result.code === "refused") await remember("none");
-          return noThumbnail();
+        if (result.ok) {
+          await remember(result.jpeg);
+          return { ok: true, value: { jpeg: result.jpeg } };
         }
-        await remember(result.jpeg);
-        return { ok: true, value: { jpeg: result.jpeg } };
+        switch (result.code) {
+          case "busy":
+            return busy();
+          case "refused":
+            // The decoder's own refusal: the same every time, so remembered.
+            await remember("none");
+            return noThumbnail();
+          case "timeout":
+            // Remembered for a while (THUMBNAIL_RETRY_MS), so it can't keep
+            // the worker busy by being asked for again and again.
+            await remember("timeout");
+            return noThumbnail();
+          default:
+            // Out of memory or a crash: says nothing about the file.
+            return refusal(["files"], "internal_error", "The thumbnail couldn't be made.");
+        }
       })();
       making.set(key, made);
       try {
         return await made;
       } finally {
         making.delete(key);
+        makingNow--;
       }
     },
 

@@ -18,6 +18,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { request as httpRequest, type IncomingHttpHeaders } from "node:http";
@@ -69,7 +70,7 @@ import {
 } from "../../service/src/images.fixtures.js";
 
 const ORIGIN = "http://localhost";
-const MAX_FILE = 4 * 1024 * 1024;
+const MAX_FILE = 64 * 1024 * 1024;
 
 let w: World;
 let filesDir: string;
@@ -104,6 +105,7 @@ function send(
     method?: string;
     body?: Buffer;
     headers?: Record<string, string>;
+    to?: { host: string; port: number };
   } = {},
 ): Promise<Reply> {
   const method = s.method ?? "GET";
@@ -116,7 +118,7 @@ function send(
   if (s.body !== undefined) headers["content-length"] = String(s.body.length);
   return new Promise((resolve, reject) => {
     const req = httpRequest(
-      { host: base.host, port: base.port, method, path, headers, agent: false },
+      { host: (s.to ?? base).host, port: (s.to ?? base).port, method, path, headers, agent: false },
       (res) => {
         const parts: Buffer[] = [];
         res.on("data", (c: Buffer) => parts.push(c));
@@ -193,6 +195,7 @@ beforeAll(async () => {
     onError: serviceErrorLogger((r) => logged.push(r)),
     files: store,
     thumbnails: renderer,
+    thumbnailLimits: { perMinute: 10_000 },
   });
   app = await buildServer({
     env: { OCULUS_ORIGINS: ORIGIN },
@@ -238,7 +241,38 @@ beforeAll(async () => {
   fileIds.b1 = await add(ids.b1, makeJpeg(21, 21), "library.jpg", "stranger");
 }, 120_000);
 
+/** Servers of the tests below with their own limits; closed at the end. */
+const extra: { close(): Promise<unknown> }[] = [];
+
+async function serveAlso(
+  serviceOptions: Partial<Parameters<typeof createService>[1]>,
+  downloads?: { perSession?: number; minBytes?: number; windowMs?: number },
+): Promise<{ host: string; port: number }> {
+  const service = createService(w.db, {
+    onError: serviceErrorLogger((r) => logged.push(r)),
+    files: store,
+    ...serviceOptions,
+  });
+  const other = await buildServer({
+    env: { OCULUS_ORIGINS: ORIGIN },
+    logger: { stream: { write: (line: string) => serverLog.push(line) } },
+    routes: staffApiRoutes({
+      db: w.db,
+      service,
+      files: store,
+      log: (r) => logged.push(r),
+      rateLimits: { write: 10_000, read: 10_000 },
+      ...(downloads === undefined ? {} : { downloads }),
+    }),
+  });
+  await other.listen({ host: "127.0.0.1", port: 0 });
+  extra.push(other);
+  const address = other.server.address() as AddressInfo;
+  return { host: address.address, port: address.port };
+}
+
 afterAll(async () => {
+  for (const server of extra) await server.close();
   await app.close();
   await renderer.close();
   await w.db.close();
@@ -661,4 +695,153 @@ describe("the logs", () => {
       expect(text).not.toContain(secret);
     }
   });
+});
+
+describe("review fixes: timeouts, budgets, HEAD, failures and downloads", () => {
+  const thumbPath = (body: Buffer, kind: string, size = "small") =>
+    join(filesDir, w.a, "thumbnails", size, sha(body).slice(0, 2), `${sha(body)}.v1.${kind}`);
+
+  it("remembers a timeout for a day, then tries again (B3)", async () => {
+    const slow = createThumbnailRenderer({ timeoutMs: 1 });
+    const to = await serveAlso({ thumbnails: slow, thumbnailLimits: { perMinute: 1000 } });
+    const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented slow photograph"));
+    const body = makeJpeg(900, 700);
+    const id = await add(asset, body, "slow.jpg");
+    const first = await send(fileUrl(asset, id, "thumbnail"), { as: "cataloger", to });
+    expect(first.status).toBe(422);
+    expect(first.json.error).toBe("no_thumbnail");
+    const marker = thumbPath(body, "timeout");
+    expect(existsSync(marker)).toBe(true);
+    expect(existsSync(thumbPath(body, "none"))).toBe(false);
+    // Asked again within the day: answered from the marker, no new attempt.
+    const before = statSync(marker).mtimeMs;
+    expect((await send(fileUrl(asset, id, "thumbnail"), { as: "cataloger", to })).status).toBe(422);
+    expect(statSync(marker).mtimeMs).toBe(before);
+    // A day later it is tried again (and here, too slow again).
+    const old = new Date(Date.now() - 25 * 3600 * 1000);
+    utimesSync(marker, old, old);
+    expect((await send(fileUrl(asset, id, "thumbnail"), { as: "cataloger", to })).status).toBe(422);
+    expect(statSync(marker).mtimeMs).toBeGreaterThan(old.getTime() + 3600 * 1000);
+    // The normal server, with time enough, makes it then.
+    const made = await send(fileUrl(asset, id, "thumbnail"), { as: "cataloger" });
+    expect(made.status).toBe(422);
+    utimesSync(marker, old, old);
+    expect((await send(fileUrl(asset, id, "thumbnail"), { as: "cataloger" })).status).toBe(200);
+    await slow.close();
+  });
+
+  it("answers 503 busy past an organization's thumbnails a minute, and serves the cache still (B3)", async () => {
+    const to = await serveAlso({ thumbnails: renderer, thumbnailLimits: { perMinute: 2 } });
+    const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented busy photograph"));
+    const ids3 = [];
+    for (let n = 0; n < 3; n++)
+      ids3.push(await add(asset, makeJpeg(30 + n, 20), `busy ${String(n)}.jpg`));
+    const statuses = [];
+    for (const id of ids3) {
+      statuses.push((await send(fileUrl(asset, id, "thumbnail"), { as: "cataloger", to })).status);
+    }
+    expect(statuses).toEqual([200, 200, 503]);
+    // Cached ones don't count.
+    expect(
+      (await send(fileUrl(asset, ids3[0] ?? "", "thumbnail"), { as: "cataloger", to })).status,
+    ).toBe(200);
+  });
+
+  it("never remembers a worker failure as no thumbnail (B3)", async () => {
+    // A worker that ran out of memory or crashed: "failed", a 500, nothing cached.
+    const broken: ThumbnailRenderer = {
+      render: () => Promise.resolve({ ok: false, code: "failed" }),
+      close: () => Promise.resolve(),
+    };
+    const to = await serveAlso({ thumbnails: broken, thumbnailLimits: { perMinute: 1000 } });
+    const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented unlucky photograph"));
+    const body = makeJpeg(41, 29);
+    const id = await add(asset, body, "unlucky.jpg");
+    const r = await send(fileUrl(asset, id, "thumbnail"), { as: "cataloger", to });
+    expect(r.status).toBe(500);
+    expect(existsSync(thumbPath(body, "none"))).toBe(false);
+    expect(existsSync(thumbPath(body, "timeout"))).toBe(false);
+    // The normal server makes it.
+    expect((await send(fileUrl(asset, id, "thumbnail"), { as: "cataloger" })).status).toBe(200);
+    await broken.close();
+  });
+
+  it("answers HEAD on a thumbnail from the cache only (item 6)", async () => {
+    const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented HEAD photograph"));
+    const body = makeJpeg(52, 31);
+    const id = await add(asset, body, "head.jpg");
+    const url = fileUrl(asset, id, "thumbnail");
+    expect((await send(url, { as: "cataloger", method: "HEAD" })).status).toBe(405);
+    expect(existsSync(thumbPath(body, "jpg"))).toBe(false);
+    expect((await send(url, { as: "cataloger" })).status).toBe(200);
+    const head = await send(url, { as: "cataloger", method: "HEAD" });
+    expect(head.status).toBe(200);
+    expect(head.headers["content-type"]).toBe("image/jpeg");
+    expect(head.body.length).toBe(0);
+  });
+
+  it("refuses to show a GIF whose frames reach past the limits (item 3)", async () => {
+    const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented wide animation"));
+    const wide = Buffer.from(makeGif(4, 4));
+    const at = wide.indexOf(0x2c, 13 + 12);
+    wide.writeUInt16LE(60_000, at + 5);
+    wide.writeUInt16LE(60_000, at + 7);
+    const id = await add(asset, wide, "wide.gif");
+    const r = await send(fileUrl(asset, id, "view"), { as: "cataloger" });
+    expect(r.status).toBe(422);
+    expect(r.json.error).toBe("not_viewable");
+  });
+
+  it("limits streamed files per session and cuts off one too slow (item 5)", async () => {
+    const to = await serveAlso({}, { perSession: 2, minBytes: 2 * 1024 * 1024, windowMs: 300 });
+    const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented large scan"));
+    const body = Buffer.concat([makeJpeg(8, 8), Buffer.alloc(40 * 1024 * 1024, 7)]);
+    const id = await add(asset, body, "large.jpg");
+    const url = fileUrl(asset, id, "content");
+    const token = tokens.cataloger ?? "";
+    /** A download whose body is never read (the reader paused): its status once headers come. */
+    const stalled: { destroy(): void }[] = [];
+    const startStalled = () =>
+      new Promise<number>((resolve, reject) => {
+        const req = httpRequest(
+          {
+            host: to.host,
+            port: to.port,
+            path: url,
+            headers: { host: "localhost", cookie: `${OCULUS_COOKIES.session}=${token}` },
+            agent: false,
+          },
+          (res) => {
+            res.pause();
+            res.on("error", () => undefined);
+            resolve(res.statusCode ?? 0);
+          },
+        );
+        req.on("error", reject);
+        stalled.push(req);
+        req.end();
+      });
+    const cutBefore = serverLog.filter((l) => l.includes("file_stream_storage")).length;
+    expect(await startStalled()).toBe(200);
+    expect(await startStalled()).toBe(200);
+    // A third at once is refused.
+    const third = await send(url, { as: "cataloger", to });
+    expect(third.status).toBe(429);
+    expect(third.json.error).toBe("too_many_downloads");
+    // The stalled ones are cut off by the server within a few windows (a
+    // paused client doesn't notice; the server's log says so, by code only).
+    const deadline = Date.now() + 10_000;
+    while (
+      serverLog.filter((l) => l.includes("file_stream_storage")).length < cutBefore + 2 &&
+      Date.now() < deadline
+    ) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(serverLog.filter((l) => l.includes("file_stream_storage")).length).toBe(cutBefore + 2);
+    // Then the session may download again, whole.
+    const again = await send(url, { as: "cataloger", to });
+    expect(again.status).toBe(200);
+    expect(again.body.equals(body)).toBe(true);
+    for (const req of stalled) req.destroy();
+  }, 30_000);
 });

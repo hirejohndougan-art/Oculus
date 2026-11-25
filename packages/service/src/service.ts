@@ -369,6 +369,11 @@ export interface ServiceOptions {
    * worker never keeps the process alive.
    */
   readonly thumbnails?: ThumbnailRenderer;
+  /**
+   * Thumbnails made at once and per organization a minute (defaults
+   * `THUMBNAILS_AT_ONCE`, `THUMBNAILS_PER_MINUTE`); tests change them.
+   */
+  readonly thumbnailLimits?: { readonly atOnce?: number; readonly perMinute?: number };
 }
 
 /** What `checkRecord` returns: core's issues for the draft as it would be saved now. */
@@ -2969,6 +2974,7 @@ export function createService(db: Database, options: ServiceOptions = {}): Recor
       options.files,
       clock,
       options.thumbnails,
+      options.thumbnailLimits,
     ),
     ...shareOperations(db, run, outside),
     submitForReview: workflowAction("submit_for_review"),

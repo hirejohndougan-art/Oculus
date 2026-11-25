@@ -13,7 +13,7 @@
  * can't make one) and open in a simple viewer (FileViewer.tsx). Which files are images is decided by the type
  * the server sniffed from the bytes, never by the name.
  */
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button as AriaButton, FileTrigger } from "react-aria-components";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, api, problemText, uploadFile } from "../api";
@@ -49,6 +49,54 @@ interface Upload {
 const VIEWABLE = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 
 const previewId = (fileId: string) => `preview-${fileId}`;
+
+/**
+ * A thumbnail, loaded lazily (only when it scrolls into view). When it
+ * fails, a HEAD request asks why: 422 means the server makes none (a
+ * placeholder from then on); anything else (busy, a fault) is tried again
+ * a little later, twice at most.
+ */
+function Thumbnail(props: { readonly url: string }) {
+  const [attempt, setAttempt] = useState(0);
+  const [none, setNone] = useState(false);
+  const live = useRef(true);
+  useEffect(() => {
+    live.current = true;
+    return () => {
+      live.current = false;
+    };
+  }, []);
+  if (none) return <span className={styles.thumbPlaceholder}>View</span>;
+  return (
+    <img
+      className={styles.thumb}
+      loading="lazy"
+      src={attempt === 0 ? props.url : `${props.url}&attempt=${String(attempt)}`}
+      alt=""
+      onError={() => {
+        void (async () => {
+          let status = 0;
+          try {
+            status = (await fetch(props.url, { method: "HEAD" })).status;
+          } catch {
+            // Offline: tried again below.
+          }
+          if (!live.current) return;
+          if (status === 422 || status === 404 || attempt >= 2) {
+            setNone(true);
+            return;
+          }
+          setTimeout(
+            () => {
+              if (live.current) setAttempt((a) => a + 1);
+            },
+            4000 * (attempt + 1),
+          );
+        })();
+      }}
+    />
+  );
+}
 
 export const filesKey = (recordId: string) => ["record", recordId, "files"] as const;
 
@@ -113,8 +161,6 @@ export function FilesPanel(props: Props) {
   const [removeBusy, setRemoveBusy] = useState(false);
   const [notice, setNotice] = useState<{ tone: "amber" | "green"; text: string }>();
   const [viewing, setViewing] = useState<number>();
-  const openedFrom = useRef<string | undefined>(undefined);
-  const [noThumbnail, setNoThumbnail] = useState<ReadonlySet<string>>(new Set());
   const cancel = useRef<AbortController | undefined>(undefined);
   const nextKey = useRef(1);
   const cancelAll = useRef(false);
@@ -312,12 +358,12 @@ export function FilesPanel(props: Props) {
         index={viewing}
         onIndex={setViewing}
         onClose={() => {
-          const opener = openedFrom.current;
+          const shown = viewing === undefined ? undefined : images[viewing];
           setViewing(undefined);
-          // The focus goes back to the preview button that opened it.
-          if (opener !== undefined) {
+          // The focus goes to the preview button of the image shown last.
+          if (shown !== undefined) {
             requestAnimationFrame(() => {
-              document.getElementById(previewId(opener))?.focus();
+              document.getElementById(previewId(shown.id))?.focus();
             });
           }
         }}
@@ -354,22 +400,10 @@ export function FilesPanel(props: Props) {
                         id={previewId(f.id)}
                         aria-label={`Preview ${f.name}`}
                         onPress={() => {
-                          openedFrom.current = f.id;
                           setViewing(images.indexOf(f));
                         }}
                       >
-                        {!noThumbnail.has(f.id) ? (
-                          <img
-                            className={styles.thumb}
-                            src={`${fileUrl(recordId, f.id, "thumbnail")}?size=small`}
-                            alt=""
-                            onError={() => {
-                              setNoThumbnail((all) => new Set([...all, f.id]));
-                            }}
-                          />
-                        ) : (
-                          <span className={styles.thumbPlaceholder}>View</span>
-                        )}
+                        <Thumbnail url={`${fileUrl(recordId, f.id, "thumbnail")}?size=small`} />
                       </AriaButton>
                     ) : (
                       <span className={styles.meta}>None</span>

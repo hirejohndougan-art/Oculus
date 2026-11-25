@@ -110,6 +110,7 @@ import {
 } from "@oculus/service";
 import { OCULUS_COOKIES } from "./cookies.js";
 import { Refusal } from "./errors.js";
+import { Transform, pipeline, type Readable } from "node:stream";
 import { fileReply } from "./file-replies.js";
 import type { OculusReply, OculusRequest, OculusRoute } from "./routes.js";
 import { peopleApiRoutes, type PeopleApiOptions } from "./people-api.js";
@@ -161,11 +162,24 @@ export interface StaffApiOptions {
    * files_unavailable`.
    */
   readonly files?: FileStore;
+  /** Limits on streamed files per session (defaults: 4 at once, 16 KiB every 30 s); tests shorten them. */
+  readonly downloads?: {
+    readonly perSession?: number;
+    readonly minBytes?: number;
+    readonly windowMs?: number;
+  };
   /** People, roles and the audit trail (T-048, people-api.ts); left out, those routes aren't served. */
   readonly people?: PeopleApiOptions;
   /** Software updates (T-060, update-api.ts); left out, those routes aren't served. */
   readonly updates?: UpdateApiOptions;
 }
+
+/** Files streamed at once per session (M-003). */
+export const MAX_DOWNLOADS_PER_SESSION = 4;
+/** A streamed file must send at least this many bytes in every window… */
+export const MIN_DOWNLOAD_BYTES = 16 * 1024;
+/** …of this many milliseconds, or it is cut off. */
+export const MIN_DOWNLOAD_WINDOW_MS = 30_000;
 
 /** The headers carrying an upload's original name (percent-encoded UTF-8) and claimed type. */
 export const FILE_NAME_HEADER = "x-oculus-file-name";
@@ -390,6 +404,7 @@ function fileRefusal(result: ServiceRefusal): Refusal | undefined {
   if (codes.has("not_viewable")) return new Refusal(422, "not_viewable");
   if (codes.has("no_thumbnail")) return new Refusal(422, "no_thumbnail");
   if (codes.has("busy")) return new Refusal(503, "busy");
+  if (codes.has("not_cached")) return new Refusal(405, "method_not_allowed");
   if (codes.has("files_unavailable")) return new Refusal(503, "files_unavailable");
   if (codes.has("file_too_large")) return new Refusal(413, "payload_too_large");
   if (codes.has("quota_exceeded")) return new Refusal(413, "quota_exceeded");
@@ -576,12 +591,65 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
   }
 
   /** Download or view one file (M-003): the service checks, fileReply sends. */
+  // Streamed files per session (M-003, review item 5; S-035's core): at
+  // most `perSession` at once, and each must keep sending at least
+  // `minBytes` every `windowMs` or it is cut off, so a slow reader can't
+  // hold files open (and the server's sockets) for the 2-hour deadline.
+  const downloadLimits = {
+    perSession: options.downloads?.perSession ?? MAX_DOWNLOADS_PER_SESSION,
+    minBytes: options.downloads?.minBytes ?? MIN_DOWNLOAD_BYTES,
+    windowMs: options.downloads?.windowMs ?? MIN_DOWNLOAD_WINDOW_MS,
+  };
+  const streaming = new Map<string, number>();
+
+  /** The opener, counted against the session while its stream is open, and kept to the minimum rate. */
+  function counted(sessionId: string, open: () => Readable): () => Readable {
+    return () => {
+      const source = open();
+      streaming.set(sessionId, (streaming.get(sessionId) ?? 0) + 1);
+      let sent = 0;
+      let checked = 0;
+      const counter = new Transform({
+        transform(chunk: Buffer, _encoding, done) {
+          sent += chunk.byteLength;
+          done(null, chunk);
+        },
+      });
+      const timer = setInterval(() => {
+        if (sent - checked < downloadLimits.minBytes) {
+          counter.destroy(new Error("the download is too slow"));
+        }
+        checked = sent;
+      }, downloadLimits.windowMs);
+      timer.unref();
+      let released = false;
+      const release = (): void => {
+        if (released) return;
+        released = true;
+        clearInterval(timer);
+        const left = (streaming.get(sessionId) ?? 1) - 1;
+        if (left <= 0) streaming.delete(sessionId);
+        else streaming.set(sessionId, left);
+      };
+      // A storage error reaches the counter (the reply's 500 or cut-off);
+      // the counter destroyed (client gone, too slow) closes the source.
+      pipeline(source, counter, () => undefined);
+      counter.once("close", release);
+      return counter;
+    };
+  }
+
+  /** Download or view one file (M-003): the service checks, fileReply sends. */
   async function readFileRoute(
     request: OculusRequest,
     reply: OculusReply,
+    session: FullSession,
     context: ServiceContext,
     use: "download" | "view",
   ): Promise<unknown> {
+    if ((streaming.get(session.sessionId) ?? 0) >= downloadLimits.perSession) {
+      throw new Refusal(429, "too_many_downloads");
+    }
     const result = await service.fileContent(
       context,
       recordId(request),
@@ -595,7 +663,7 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
     }
     const { file, open } = result.value;
     return fileReply({
-      body: open,
+      body: counted(session.sessionId, open),
       size: file.size,
       // The sniffed type (D-086); fileReply sends a download as
       // application/octet-stream whatever it is.
@@ -693,8 +761,8 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
       // sent as application/octet-stream (fileReply), named by RFC 6266.
       method: "GET",
       path: "/api/records/:id/files/:fileId/content",
-      handler: signedIn("read", false, (request, reply, { context }) =>
-        readFileRoute(request, reply, context, "download"),
+      handler: signedIn("read", false, (request, reply, { session, context }) =>
+        readFileRoute(request, reply, session, context, "download"),
       ),
     },
     {
@@ -702,8 +770,8 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
       // sniffed type only, with fileReply's sandboxing CSP and nosniff.
       method: "GET",
       path: "/api/records/:id/files/:fileId/view",
-      handler: signedIn("read", false, (request, reply, { context }) =>
-        readFileRoute(request, reply, context, "view"),
+      handler: signedIn("read", false, (request, reply, { session, context }) =>
+        readFileRoute(request, reply, session, context, "view"),
       ),
     },
     {
@@ -713,11 +781,13 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
       handler: signedIn("read", false, async (request, reply, { context }) => {
         const size = queryText(request, "size") ?? "small";
         if (size !== "small" && size !== "medium") throw new Refusal(400, "bad_query");
+        // HEAD never makes a thumbnail: the cache's, or 405.
         const result = await service.fileThumbnail(
           context,
           recordId(request),
           request.params.fileId ?? "",
           size,
+          { cacheOnly: request.method === "HEAD" },
         );
         if (!result.ok) {
           const fixed = fileRefusal(result);

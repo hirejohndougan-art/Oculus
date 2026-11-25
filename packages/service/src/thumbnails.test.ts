@@ -8,8 +8,12 @@ import { afterAll, describe, expect, it } from "vitest";
 import {
   THUMBNAIL_LIMITS,
   VIEW_LIMITS,
+  DECODE_BUDGET_BYTES,
   decodeAny,
   decodeImage,
+  gifExtent,
+  planDecode,
+  viewDimensions,
   fitInBox,
   imageDimensions,
   renderThumbnail,
@@ -26,8 +30,11 @@ import {
   makePng,
   pngBombs,
   pngOf,
+  ihdr,
   makeWebp,
+  pngFrom,
   webpAttacks,
+  zeroPng,
   webpHeader,
 } from "./images.fixtures.js";
 
@@ -204,7 +211,7 @@ describe("WebP", () => {
     const attacks = await webpAttacks();
     for (const [name, bytes, code] of [
       ["16,384² lossless header", attacks.hugeLossless, "too_large"],
-      ["16,384² canvas", attacks.hugeCanvas, "too_large"],
+      ["16,384² canvas over a 16² frame", attacks.hugeCanvas, "webp_canvas"],
       ["RIFF size past the file", attacks.lyingRiff, "webp_riff"],
       ["animated", attacks.animated, "webp_animated"],
     ] as const) {
@@ -212,13 +219,11 @@ describe("WebP", () => {
       await expect(decodeAny("image/webp", bytes, THUMBNAIL_LIMITS), name).rejects.toThrow(code);
       expect(process.memoryUsage().arrayBuffers - before, name).toBeLessThan(32 * 1024 * 1024);
     }
-    // A 2,000 × 2,000 frame under a 16 × 16 canvas: libwebp refuses the
-    // mismatch before allocating the frame (16 MB of pixels).
-    const before = process.memoryUsage().arrayBuffers;
-    await expect(decodeAny("image/webp", attacks.smallCanvas, THUMBNAIL_LIMITS)).rejects.toThrow(
-      /decode|webp_header/,
+    // A 2,000 × 2,000 frame under a 16 × 16 canvas: refused by the walk,
+    // before libwebp sees it.
+    expect(() => planDecode("image/webp", attacks.smallCanvas, THUMBNAIL_LIMITS)).toThrow(
+      "webp_canvas",
     );
-    expect(process.memoryUsage().arrayBuffers - before).toBeLessThan(8 * 1024 * 1024);
   });
 
   it(
@@ -244,6 +249,163 @@ describe("WebP", () => {
       }
     },
   );
+});
+
+describe("strict walks and the memory budget (review B1, B2)", () => {
+  const idat = deflateSync(Buffer.alloc(4 * (1 + 4)));
+  const plain = (extra: readonly (readonly [string, Uint8Array])[] = []) =>
+    pngFrom([["IHDR", ihdr(4, 4)], ...extra, ["IDAT", idat], ["IEND", new Uint8Array(0)]]);
+
+  it("takes a well-formed PNG", () => {
+    expect(planDecode("image/png", plain(), THUMBNAIL_LIMITS)).toMatchObject({
+      width: 4,
+      height: 4,
+    });
+    expect(decodeImage("image/png", plain(), THUMBNAIL_LIMITS).data.length).toBe(64);
+  });
+
+  it("refuses a second IHDR (pngjs would decode by the last), and every other misplaced chunk", () => {
+    const end = ["IEND", new Uint8Array(0)] as const;
+    const cases: [string, Buffer, string][] = [
+      // B1's file: a small first header, a large second one.
+      [
+        "second IHDR",
+        pngFrom([["IHDR", ihdr(4, 4)], ["IHDR", ihdr(12_000, 12_000)], ["IDAT", idat], end]),
+        "png_second_header",
+      ],
+      [
+        "IHDR of 14 bytes",
+        pngFrom([["IHDR", Buffer.concat([ihdr(4, 4), Buffer.alloc(1)])], ["IDAT", idat], end]),
+        "png_header",
+      ],
+      ["IDAT first", pngFrom([["IDAT", idat], ["IHDR", ihdr(4, 4)], end]), "png_header"],
+      ["data after IEND", Buffer.concat([plain(), Buffer.from("trailing")]), "png_after_end"],
+      [
+        "chunk after IEND",
+        Buffer.concat([plain(), pngFrom([["tEXt", Buffer.from("x")]]).subarray(8)]),
+        "png_after_end",
+      ],
+      [
+        "IDAT split by another chunk",
+        pngFrom([
+          ["IHDR", ihdr(4, 4)],
+          ["IDAT", idat],
+          ["tEXt", Buffer.from("x")],
+          ["IDAT", idat],
+          end,
+        ]),
+        "png_chunk",
+      ],
+      [
+        "palette PNG without PLTE",
+        pngFrom([["IHDR", ihdr(4, 4, 8, 3)], ["IDAT", idat], end]),
+        "png_palette",
+      ],
+      [
+        "PLTE after IDAT",
+        pngFrom([["IHDR", ihdr(4, 4, 8, 3)], ["IDAT", idat], ["PLTE", Buffer.alloc(3)], end]),
+        "png_palette",
+      ],
+      [
+        "two PLTE",
+        pngFrom([
+          ["IHDR", ihdr(4, 4, 8, 3)],
+          ["PLTE", Buffer.alloc(3)],
+          ["PLTE", Buffer.alloc(3)],
+          ["IDAT", idat],
+          end,
+        ]),
+        "png_palette",
+      ],
+      ["PLTE in a grey PNG", plain([["PLTE", Buffer.alloc(3)]]), "png_palette"],
+      ["no IEND", plain().subarray(0, plain().length - 12), "png_truncated"],
+      ["8-bit depth 3", pngFrom([["IHDR", ihdr(4, 4, 3)], ["IDAT", idat], end]), "png_header"],
+    ];
+    for (const [name, bytes, code] of cases) {
+      expect(() => planDecode("image/png", bytes, THUMBNAIL_LIMITS), name).toThrow(code);
+      expect(() => decodeImage("image/png", bytes, THUMBNAIL_LIMITS), name).toThrow(code);
+    }
+  });
+
+  it("holds every format to the memory budget, 16-bit PNGs far lower", async () => {
+    // 3,000² RGBA: within the pixel limit, but 16-bit costs more than the budget allows.
+    const rgba16 = await zeroPng(3000, 3000, 16, 6);
+    expect(() => planDecode("image/png", rgba16, THUMBNAIL_LIMITS)).toThrow("too_large");
+    const rgba8 = await zeroPng(3000, 3000, 8, 6);
+    expect(planDecode("image/png", rgba8, THUMBNAIL_LIMITS).bytes).toBeLessThan(
+      DECODE_BUDGET_BYTES,
+    );
+    // A 7,000² JPEG header (49 MP, within the old pixel limit) is over the budget.
+    const jpeg7000 = Buffer.from(makeJpeg(8, 8));
+    for (let i = 2; i + 9 < jpeg7000.length;) {
+      const marker = jpeg7000[i + 1] ?? 0;
+      if (marker === 0xc0) {
+        jpeg7000.writeUInt16BE(7000, i + 5);
+        jpeg7000.writeUInt16BE(7000, i + 7);
+        break;
+      }
+      i += 2 + jpeg7000.readUInt16BE(i + 2);
+    }
+    expect(() => planDecode("image/jpeg", jpeg7000, THUMBNAIL_LIMITS)).toThrow("too_large");
+  });
+
+  it("walks WebP strictly: animation chunks, a second frame, chunks out of order", async () => {
+    const lossy = await makeWebp(16, 16);
+    const frame = lossy.subarray(12);
+    const riffOf = (...parts: Buffer[]) => {
+      const body = Buffer.concat([Buffer.from("WEBP"), ...parts]);
+      const size = Buffer.alloc(4);
+      size.writeUInt32LE(body.length);
+      return Buffer.concat([Buffer.from("RIFF"), size, body]);
+    };
+    const chunkOf = (type: string, data: Buffer) => {
+      const size = Buffer.alloc(4);
+      size.writeUInt32LE(data.length);
+      return Buffer.concat([
+        Buffer.from(type),
+        size,
+        data,
+        data.length % 2 ? Buffer.alloc(1) : Buffer.alloc(0),
+      ]);
+    };
+    const vp8x = (flags: number) => {
+      const d = Buffer.alloc(10);
+      d[0] = flags;
+      d.writeUIntLE(15, 4, 3);
+      d.writeUIntLE(15, 7, 3);
+      return chunkOf("VP8X", d);
+    };
+    expect(planDecode("image/webp", riffOf(vp8x(0), frame), THUMBNAIL_LIMITS)).toMatchObject({
+      width: 16,
+    });
+    for (const [name, bytes, code] of [
+      ["ANIM chunk", riffOf(vp8x(0), chunkOf("ANIM", Buffer.alloc(6)), frame), "webp_animated"],
+      ["ANMF chunk", riffOf(vp8x(0), chunkOf("ANMF", Buffer.alloc(16))), "webp_animated"],
+      ["second frame", riffOf(vp8x(0), frame, frame), "webp_second_frame"],
+      [
+        "ALPH after the frame",
+        riffOf(vp8x(0x10), frame, chunkOf("ALPH", Buffer.alloc(2))),
+        "webp_chunk",
+      ],
+      ["ALPH in a simple file", riffOf(chunkOf("ALPH", Buffer.alloc(2)), frame), "webp_chunk"],
+      ["VP8X not first", riffOf(frame, vp8x(0)), "webp_chunk"],
+      ["no frame", riffOf(vp8x(0)), "webp_frame"],
+    ] as const) {
+      expect(() => planDecode("image/webp", bytes, THUMBNAIL_LIMITS), name).toThrow(code);
+    }
+  });
+
+  it("finds a GIF's full extent from every frame, for the inline view", () => {
+    const gif = makeGif(4, 4);
+    expect(gifExtent(gif)).toEqual({ width: 4, height: 4 });
+    // A frame placed far outside the 4 × 4 screen widens what the browser draws.
+    const wide = Buffer.from(gif);
+    const at = wide.indexOf(0x2c, 13 + 12);
+    wide.writeUInt16LE(30_000, at + 1);
+    expect(viewDimensions("image/gif", wide)).toEqual({ width: 30_004, height: 4 });
+    // A GIF cut short is not known.
+    expect(gifExtent(gif.subarray(0, gif.length - 4))).toBeUndefined();
+  });
 });
 
 describe("scaling", () => {
@@ -299,5 +461,61 @@ describe("the worker", () => {
       ok: false,
       code: "busy",
     });
+  });
+});
+
+/** The peak RSS growth while `run` runs, sampled every 10 ms. */
+async function peakGrowth(run: () => Promise<unknown>): Promise<number> {
+  const base = process.memoryUsage().rss;
+  let peak = base;
+  const timer = setInterval(() => {
+    peak = Math.max(peak, process.memoryUsage().rss);
+  }, 10);
+  try {
+    await run();
+  } finally {
+    clearInterval(timer);
+  }
+  peak = Math.max(peak, process.memoryUsage().rss);
+  return peak - base;
+}
+
+describe("peak memory of the largest images accepted (review B2)", () => {
+  const MIB = 1024 * 1024;
+  it("keeps each decode's peak well under 512 MiB", { timeout: 300_000 }, async () => {
+    const cases: [string, string, () => Promise<Buffer> | Buffer][] = [
+      ["JPEG 2,780²", "image/jpeg", () => makeJpeg(2780, 2780)],
+      ["PNG RGBA16 2,800²", "image/png", () => zeroPng(2800, 2800, 16, 6)],
+      ["PNG RGBA8 3,900²", "image/png", () => zeroPng(3900, 3900, 8, 6)],
+      ["GIF 5,500²", "image/gif", () => makeGif(5500, 5500)],
+      ["WebP lossy 4,900²", "image/webp", () => makeWebp(4900, 4900)],
+      ["WebP lossless 4,300²", "image/webp", () => makeWebp(4300, 4300, { lossless: true })],
+    ];
+    const peaks: string[] = [];
+    const outcomes: [string, boolean, number][] = [];
+    for (const [name, format, make] of cases) {
+      const bytes = await make();
+      const plan = planDecode(format, bytes, THUMBNAIL_LIMITS);
+      expect(plan.bytes, name).toBeLessThanOrEqual(DECODE_BUDGET_BYTES);
+      const renderer = createThumbnailRenderer({ timeoutMs: 120_000 });
+      // The worker started and its decoders loaded first (a fixed cost of
+      // some 40 MiB, paid once): the growth below is the decode's own.
+      await renderer.render("image/png", makePng(4, 4), 160);
+      await renderer.render("image/webp", await makeWebp(4, 4), 160);
+      let result: Awaited<ReturnType<typeof renderer.render>> | undefined;
+      const growth = await peakGrowth(async () => {
+        result = await renderer.render(format, bytes, 160);
+      });
+      await renderer.close();
+      outcomes.push([name, result?.ok === true, growth]);
+      peaks.push(
+        `${name}: ${String(Math.round(growth / MIB))} MiB (budget ${String(Math.round(plan.bytes / MIB))} MiB)`,
+      );
+    }
+    console.log(`Peak RSS growth: ${peaks.join("; ")}`);
+    for (const [name, ok, growth] of outcomes) {
+      expect(ok, name).toBe(true);
+      expect(growth, name).toBeLessThan(400 * MIB);
+    }
   });
 });

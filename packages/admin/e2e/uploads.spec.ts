@@ -153,7 +153,8 @@ test("a Scanner adds an image to a digital asset by keyboard", async ({ page }) 
   ).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(files.getByRole("region", { name: /^Preview of/ })).toHaveCount(0);
-  await expect(preview).toBeFocused();
+  // The focus goes to the thumbnail of the image shown last.
+  await expect(files.getByRole("button", { name: "Preview depot photograph.png" })).toBeFocused();
 
   // The download link saves the file's own bytes under its name.
   const download = files.getByRole("link", { name: "Download harbour view.png" });
