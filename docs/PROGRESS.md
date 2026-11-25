@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 06:30 CT — manual (Chat H) — T-059a EAD reader, writer and mappings in core
+- Result: done
+- What changed: `packages/core/src/xml-tree.ts` (`parseXml` on saxes 6.0.0, now a core dependency: no DOCTYPE internal subset, no entities beyond XML's five, nothing fetched; size, depth, element and attribute caps), `ead-model.ts` (the one finding-aid model, `validateFindingAid`, level and DACS mappings, `eadDateEdtf`, `eadUnits`), `ead-read.ts` (`readEad`: EAD 2002 namespaced or DTD-era, EAD3 1.x, a report of everything unmapped, flattened, level-changed or left out; a future major version refused), `ead-write.ts` (`writeEad`, either version). Round trips both ways, attack tests, a schema-shape check; outputs validated with xmllint against ead.xsd (2008 and 2021 releases) and ead3.xsd 1.1.1 while built. Sources: the EAD 2002 and EAD3 schemas and tag libraries, D-107, D-008, D-010.
+- Decisions: D-110
+- Review: one independent round. Fixed: staff-only (`audience="internal"`) text read as public on the root, did, dsc, list and chronology entries, header codes and EAD3 date and language sets (now checked once for every child element, with a test marking every element of five files); audience in any case; staff-only header; inline spacing; read models the writer refused; attribute limits; a total attribute cap; EAD 2002 codes; several silent overwrites. Filed S-044 (EAD3 schema in the tests, EAD3 only) and S-045 (reader follow-ups).
+- Gate: PASS · tests_passing 4917 (was 4812) · npm audit clean
+- Next: T-059b (EAD exports)
+
 ## 2026-11-25 03:33 CT — manual (Chat A) — T-062 Sign out after a period of no use (John, Q-8)
 - Result: done
 - What changed: idle limit 30 minutes by default; `resolveSession(..., { activity: false })` for background reads; `isActivity` counts only same-origin uses; `idleSeconds` and a session marker in `/api/session` and `/api/me`; admin `idle/` (IdleTimer, IdleGuard, cross-tab channel with per-tab ids and session markers, an unsaved-changes registry); the update screen's status poll is a background read.
