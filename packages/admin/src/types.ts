@@ -18,6 +18,8 @@ export interface Me {
   readonly idleExpiresAt: string;
   readonly csrfToken: string | null;
   readonly sites: readonly SiteChoice[];
+  /** Wrong two-step codes for this account in the last 30 days (D-077, D-085). */
+  readonly secondStepAlerts?: { readonly recent: number; readonly lastAt: string | null };
 }
 
 export interface PendingState {

@@ -1,7 +1,7 @@
 // The admin's server (T-045, D-081): its startup refusals (no secret key, a
-// client address that can't be told apart in production, no reset sender in
-// production, an admin origin outside OCULUS_ORIGINS), the development
-// reset sender that logs no token, and the built admin served on the
+// client address that can't be told apart in production, no mail sender in
+// production or the development one there (D-085), an admin origin outside
+// OCULUS_ORIGINS), and the built admin served on the
 // admin's origin only, with its own CSP while the API keeps its own.
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -148,6 +148,30 @@ describe("the startup checks", () => {
       log: () => undefined,
     });
     await started.close();
+  });
+
+  it("makes the SMTP sender from the environment in production, and refuses the development one", async () => {
+    const production = { ...DEV, NODE_ENV: "production", OCULUS_CLIENT_ADDRESS: "direct" };
+    const smtp = {
+      ...production,
+      OCULUS_ORIGINS: "https://admin.invented.example",
+      OCULUS_ADMIN_ORIGIN: "https://admin.invented.example",
+      OCULUS_SMTP_HOST: "smtp.invented.example",
+      OCULUS_MAIL_FROM: "oculus@invented.example",
+    };
+    const started = await buildAdminServer({
+      db,
+      env: smtp,
+      adminFiles: files,
+      log: () => undefined,
+    });
+    await started.close();
+    await expect(
+      buildAdminServer({ db, env: { ...smtp, OCULUS_DEV_MAIL_DIR: "/tmp" }, adminFiles: files }),
+    ).rejects.toThrow(/development only/);
+    await expect(
+      buildAdminServer({ db, env: { ...smtp, OCULUS_SMTP_TLS: "none" }, adminFiles: files }),
+    ).rejects.toThrow(/OCULUS_SMTP_TLS/);
   });
 
   it("exits cleanly on a badly formed database URL, never showing it", async () => {

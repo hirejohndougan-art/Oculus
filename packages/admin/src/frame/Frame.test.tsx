@@ -59,6 +59,26 @@ describe("the frame", () => {
     );
   });
 
+  it("tells the person when someone typed wrong two-step codes for their account (D-085)", async () => {
+    fakeServer({
+      "GET /api/me": [
+        200,
+        { ...me([A1]), secondStepAlerts: { recent: 3, lastAt: "2026-11-20T10:00:00.000Z" } },
+      ],
+    });
+    renderAt("/");
+    expect(
+      await screen.findByText(/typed wrong two-step codes for your account 3 times/),
+    ).toBeTruthy();
+    cleanup();
+    fakeServer({
+      "GET /api/me": [200, { ...me([A1]), secondStepAlerts: { recent: 0, lastAt: null } }],
+    });
+    renderAt("/");
+    await screen.findByRole("heading", { level: 1, name: "Invented archive site" });
+    expect(screen.queryByText(/wrong two-step codes/)).toBeNull();
+  });
+
   it("asks a person with several sites to choose, listing only theirs", async () => {
     fakeServer({ "GET /api/me": [200, me([A1, A2])] });
     const { router } = renderAt("/");

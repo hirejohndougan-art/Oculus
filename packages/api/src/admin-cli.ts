@@ -7,13 +7,18 @@
  * URL, the secret key and every other value stay out of the output; a
  * refusal to start prints only its reason and exits 1.
  *
- * Deployment (D-035, T-050, T-051) decides how this runs in production; this
- * command has no email sender, so it refuses to start in production until
- * T-040 gives it one (development only logs that a reset link was made).
+ * Deployment (D-035, T-050, T-051) decides how this runs in production.
+ * Email goes through the mailer the environment configures (mail.ts,
+ * D-085): SMTP in production (it refuses to start without it), the
+ * development sender otherwise. The two-step alert notices run every minute
+ * (alert-notices.ts). The notices, the mailer's outbox and the server are
+ * closed on SIGINT and SIGTERM.
  */
 import { pathToFileURL } from "node:url";
 import { openDatabase } from "@oculus/db";
-import { buildAdminServer } from "./admin-server.js";
+import { buildAdminServer, defaultLog } from "./admin-server.js";
+import { startAlertNotices, type AlertNoticeRunner } from "./alert-notices.js";
+import { mailerFromEnv, type Mailer } from "./mail.js";
 import { PUBLIC_DATABASE_URL_ENV } from "./public-sites.js";
 
 const DATABASE_URL_VARIABLE = "OCULUS_DATABASE_URL";
@@ -52,26 +57,45 @@ export async function runAdminCli(
       return 2;
     }
   }
-  const closeAll = async (): Promise<void> => {
+  const closePools = async (): Promise<void> => {
     // Both, whatever happens to either.
     await Promise.allSettled([db.close(), publicDb?.close()]);
   };
+  let mailer: Mailer | undefined;
+  let notices: AlertNoticeRunner | undefined;
   try {
+    mailer = mailerFromEnv(env, { log: defaultLog });
     const app = await buildAdminServer({
       db,
       env,
       logger: true,
+      mailer,
+      log: defaultLog,
       ...(publicDb === undefined ? {} : { publicDb }),
     });
+    // "Someone is guessing your two-step codes" (D-077, D-085), every minute.
+    const outbox = mailer.outbox;
+    notices = startAlertNotices({
+      db,
+      deliver: mailer.deliverAlert,
+      log: defaultLog,
+      room: () => outbox.room("notice"),
+    });
     const close = (): void => {
-      void app.close().then(closeAll);
+      void app
+        .close()
+        .then(() => notices?.stop())
+        .then(() => mailer?.close())
+        .then(closePools);
     };
     process.once("SIGINT", close);
     process.once("SIGTERM", close);
     await app.listen({ host: env.OCULUS_HOST ?? "127.0.0.1", port });
     return undefined;
   } catch (error) {
-    await closeAll();
+    await notices?.stop();
+    await mailer?.close();
+    await closePools();
     // Startup refusals name the variable and the reason, never a value.
     err(`Oculus did not start: ${error instanceof Error ? error.message : "unknown error"}`);
     return 1;
