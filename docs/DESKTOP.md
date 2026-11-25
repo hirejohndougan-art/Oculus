@@ -36,7 +36,7 @@ Double-click `scripts\start-oculus.cmd` in the Oculus folder. To make a desktop 
 
 - **Your database.** `npm run db:backup -- <file>` makes a backup (see the README).
 - **The secret key** in `%APPDATA%\Oculus\secret-key`, made the first time Oculus starts. Two-step sign-in depends on it, and database backups don't include it. Copy it somewhere safe, like a USB drive kept with your backups. Once anyone has set up two-step sign-in, Oculus refuses to start without that key rather than make a new one that would lock everyone out: put it back from your backup. If it's truly lost, ask for help before doing anything else.
-- **Your password and recovery codes.** Without email the password reset is the command above, and the recovery codes Oculus shows at your first sign-in are the only way in if you lose your phone. Keep both somewhere safe.
+- **Your password and recovery codes.** Without email the password reset is the command in "If you forget your password" below, and the recovery codes Oculus shows at your first sign-in are the only way in if you lose your phone. Keep both somewhere safe.
 
 ## Updating
 
@@ -44,7 +44,7 @@ Close Oculus first. Then, in the Oculus folder, `git pull`, and double-click `st
 
 ## If you forget your password
 
-In a Command Prompt in the Oculus folder, run `node packages\api\dist\desktop-password-cli.js` (`npm run desktop:password` on a Mac or Linux). It asks for the account's email address and a new password, twice. It's the same reset as the emailed link, with this computer standing in for the email: anyone signed in to that account is signed out, and your two-step sign-in stays as it is, so you still need your phone's code or a recovery code. An account that hasn't set up two-step sign-in yet can only have its password reset by a system admin, from People.
+In a Command Prompt in the Oculus folder, run `node packages\api\dist\desktop-password-cli.js` (`npm run desktop:password` on a Mac or Linux). It asks for the account's email address and a new password, twice. It's the same reset as the emailed link, with this computer standing in for the email: anyone signed in to that account is signed out, and your two-step sign-in stays as it is, so you still need your phone's code or a recovery code. An account that hasn't set up two-step sign-in yet can only have its password reset by a system admin, from People. So sign in once and set up two-step sign-in right after the first-time setup, and keep your recovery codes.
 
 ## What the desktop version doesn't do yet
 

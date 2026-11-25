@@ -11,7 +11,9 @@
  * hold: the password checks, every session of the account ends, two-step
  * sign-in is kept (the person still needs their code or a recovery code),
  * the reset counters apply, and an account with no two-step sign-in in use
- * can't be reset this way (D-078: only a system admin can).
+ * can't be reset this way (D-078: only a system admin can). Unlike the
+ * emailed reset, no "your password was changed" email is sent: the person
+ * is at this computer.
  *
  * Who can run it: whoever can use this computer's settings folder and its
  * pgpass file, which already gives full use of the database. It uses only
@@ -119,7 +121,7 @@ export async function runDesktopPassword(options: DesktopPasswordOptions): Promi
     if (outcome !== "sent" || token === undefined) {
       err(
         outcome === "throttled"
-          ? "Too many new-password requests for that address. Wait a little and try again."
+          ? "Too many new-password requests (for that address, or from this computer). Wait a few minutes and try again."
           : (OUTCOMES[outcome] ?? "No new password was set. Try again."),
       );
       return 1;

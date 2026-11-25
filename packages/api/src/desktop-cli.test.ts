@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 // The launcher against real throwaway databases (D-049): it refuses what it
 // should, serves the admin on 127.0.0.1, opens and closes its window, and
 // never prints the database password or the secret key.
@@ -240,6 +241,29 @@ describe("npm run desktop", () => {
     expect(second.lines.join("\n")).toContain("another database");
     first.stop();
     expect(await first.done).toBe(0);
+  });
+
+  it("answers 4 (a message to read) when another start is still starting", async () => {
+    const other = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
+      stdio: "ignore",
+    });
+    try {
+      writeFileSync(
+        join(folder, "desktop.lock"),
+        JSON.stringify({
+          pid: other.pid,
+          token: "t".repeat(43),
+          database: "x",
+          started: Date.now(),
+        }),
+      );
+      const run = start();
+      expect(await run.done).toBe(4);
+      expect(run.lines.join("\n")).toContain("already starting");
+    } finally {
+      other.kill();
+      await new Promise((resolve) => other.once("exit", resolve));
+    }
   });
 
   it("starts normally over a stale lock whose PID lives but whose address is dead", async () => {

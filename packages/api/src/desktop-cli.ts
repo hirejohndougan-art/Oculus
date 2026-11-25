@@ -275,7 +275,7 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
     out(
       "Oculus is already running but busy right now. Try again in a minute, or use its open window.",
     );
-    return 0;
+    return 4;
   }
   if (lock.kind === "running") {
     if (lock.lock.database !== database) {
