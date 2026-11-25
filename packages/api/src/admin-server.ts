@@ -536,6 +536,11 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   timer.unref();
   const lease = setInterval(() => void renew(), FILE_LEASE_EVERY_MS);
   lease.unref();
+  // Another server held the lease lock at the start: the renewal is tried
+  // again within a minute, not only at the hour (S-052 third review).
+  const retry =
+    bound.warning === "files_lease_busy" ? setTimeout(() => void renew(), 30_000) : undefined;
+  retry?.unref();
   // The purge on a timer only when turned on (S-052; default off).
   const purge = async (): Promise<void> => {
     try {
@@ -555,6 +560,7 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     clearInterval(timer);
     clearInterval(lease);
     if (purgeTimer !== undefined) clearInterval(purgeTimer);
+    if (retry !== undefined) clearTimeout(retry);
     claim.release();
     void thumbnails?.close();
   });

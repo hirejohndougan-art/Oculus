@@ -137,6 +137,18 @@ describe("Clean up removed files", () => {
     );
   });
 
+  it("says to adopt when this database can't simply be accepted", async () => {
+    server(
+      { available: false, problem: "identity_changed" },
+      { "POST /api/system/files/cleanup/accept-identity": [409, { error: "use_adopt" }] },
+    );
+    renderAt("/settings/files");
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Accept this database as the owner" }),
+    );
+    expect(await screen.findByText(/can't simply be accepted/)).toBeTruthy();
+  });
+
   it("has nothing to run when nothing is waiting", async () => {
     server({ ...STATUS, trashed: none, deleted: none });
     renderAt("/settings/files");

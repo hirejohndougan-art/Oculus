@@ -24,6 +24,7 @@ import { dirname, join, relative } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { newOrganizationId } from "@oculus/core";
 import { LEASE_LOCK, STORE_MARKER, openFileStore, type FileStore } from "./file-store.js";
+import { hostKey } from "./lease-lock.js";
 
 let dir: string;
 let store: FileStore;
@@ -387,13 +388,26 @@ describe("the second review's changes", () => {
     // PID that this process doesn't hold (left by an earlier process).
     const gone = join(folder, `${host}-999999999-0123456789abcdef`);
     const earlier = join(folder, `${host}-${String(process.pid)}-fedcba9876543210`);
-    writeFileSync(gone, "7001:20000|copy|5432\n");
-    writeFileSync(earlier, "7001:20000|copy|5432\n");
+    // (Notes say which host, boot and PID namespace their PID belongs to.)
+    writeFileSync(gone, `7001:20000|copy|5432\n${hostKey() ?? "-"}\n`);
+    writeFileSync(earlier, `7001:20000|copy|5432\n${hostKey() ?? "-"}\n`);
     const later = await own.claimServer("7001:16384|oculus|5432");
     expect(later.ok).toBe(true);
     expect(existsSync(gone)).toBe(false);
     expect(existsSync(earlier)).toBe(false);
     if (later.ok) later.release();
+    // A note from another PID namespace (another container): its PID means
+    // nothing here, so only its age counts. Fresh, it refuses; 30 minutes
+    // still, it is gone (S-052 third review).
+    const elsewhere = join(folder, `${host}-1-0123456789abcdef`);
+    writeFileSync(elsewhere, "7001:20000|copy|5432\nhost|other-boot|pid:[1]\n");
+    expect((await own.claimServer("7001:16384|oculus|5432")).ok).toBe(false);
+    const old = new Date(Date.now() - 31 * 60_000);
+    utimesSync(elsewhere, old, old);
+    const after = await own.claimServer("7001:16384|oculus|5432");
+    expect(after.ok).toBe(true);
+    expect(existsSync(elsewhere)).toBe(false);
+    if (after.ok) after.release();
     if (first.ok) first.release();
     expect(notes()).toEqual([]);
     expect(await own.isEmpty()).toBe(true);
@@ -590,7 +604,7 @@ describe("the S-052 review's store changes", () => {
     expect(order).toEqual(["first in", "first out", "second"]);
     expect(existsSync(lock)).toBe(false);
     // A lock left by a process on this host that is gone.
-    writeFileSync(lock, `${hostname().replace(/[^A-Za-z0-9.-]/g, "_")}\n999999999\nabcd\n`);
+    writeFileSync(lock, `${hostKey() ?? "-"}\n999999999\nabcd\n`);
     expect(await store.withLeaseLock(() => Promise.resolve("taken"))).toBe("taken");
     // A lock from elsewhere, older than two minutes by the file system's clock.
     writeFileSync(lock, "another-host\n12\nabcd\n");
@@ -632,12 +646,10 @@ describe("the S-052 review's store changes", () => {
 });
 
 describe("the S-052 second review's store changes", () => {
-  const host = () => hostname().replace(/[^A-Za-z0-9.-]/g, "_");
-
   it("L1: two takers of a stale lock never hold it at once", async () => {
     const lock = join(dir, LEASE_LOCK);
     for (let round = 0; round < 5; round++) {
-      writeFileSync(lock, `${host()}\n999999999\nstale\n`);
+      writeFileSync(lock, `${hostKey() ?? "-"}\n999999999\nstale\n`);
       let inside = 0;
       let most = 0;
       const work = async () => {
@@ -655,7 +667,7 @@ describe("the S-052 second review's store changes", () => {
 
   it("L3: a lock with this PID but a nonce it doesn't hold, or a time in the future, is stale", async () => {
     const lock = join(dir, LEASE_LOCK);
-    writeFileSync(lock, `${host()}\n${String(process.pid)}\nnot-mine\n`);
+    writeFileSync(lock, `${hostKey() ?? "-"}\n${String(process.pid)}\nnot-mine\n`);
     expect(await store.withLeaseLock(() => Promise.resolve("taken"))).toBe("taken");
     writeFileSync(lock, "another-host\n12\nabcd\n");
     const future = new Date(Date.now() + 3600_000);

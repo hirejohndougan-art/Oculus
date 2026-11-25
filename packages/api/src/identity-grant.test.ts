@@ -135,4 +135,24 @@ describe("the writer can read the cluster's identity after its grant (S-052)", (
       await writer.close();
     }
   }, 60_000);
+
+  it("never grants to PUBLIC or a pg_ role, in any case (L5)", async () => {
+    for (const name of ["public", "pg_monitor", "pg_read_all_data"]) {
+      await expect(db.transaction((q) => grantWriterRole(q, name))).rejects.toThrow(/never/);
+    }
+    for (const name of ["PUBLIC", "Pg_Monitor"]) {
+      await expect(db.transaction((q) => grantIdentityRead(q, name))).rejects.toThrow(/never/);
+    }
+    const lines: string[] = [];
+    for (const name of ["public", "pg_monitor"]) {
+      expect(
+        await runGrantCli(
+          [name],
+          { OCULUS_DATABASE_URL: testDb.url },
+          (l) => lines.push(l),
+          (l) => lines.push(l),
+        ),
+      ).toBe(2);
+    }
+  });
 });

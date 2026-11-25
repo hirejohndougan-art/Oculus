@@ -111,6 +111,15 @@ export const WRITER_GRANTS: readonly string[] = Object.freeze([
   ),
 ]);
 
+/**
+ * `public` (every role) and `pg_` names (PostgreSQL's own roles), in any
+ * case: never a writer, never given a grant (S-052 third review).
+ */
+export function reservedRoleName(role: string): boolean {
+  const name = role.toLowerCase();
+  return name === "public" || name.startsWith("pg_");
+}
+
 /** A role name `grantWriterRole` takes: lower case, digits and `_`, up to 63 characters. */
 const ROLE_NAME = /^[a-z_][a-z0-9_]{0,62}$/;
 
@@ -128,6 +137,9 @@ export async function grantWriterRole(
 ): Promise<{ readonly identityReadable: boolean }> {
   if (!ROLE_NAME.test(role)) {
     throw new TypeError("A role name is lower case letters, digits and _, at most 63 characters.");
+  }
+  if (reservedRoleName(role)) {
+    throw new TypeError("PUBLIC and pg_ roles are never Oculus's writer.");
   }
   for (const statement of WRITER_GRANTS) {
     // Names can't be parameters: the name goes in through set_config and is
@@ -161,6 +173,7 @@ export function identityGrantHint(role: string): string {
 export async function grantIdentityRead(db: Queryable, role?: string): Promise<boolean> {
   const [who] = await db.rows<{ name: string }>(sql`SELECT current_user::text AS name`);
   const target = role ?? who?.name ?? "";
+  if (reservedRoleName(target)) throw new TypeError("PUBLIC and pg_ roles are never given this.");
   const [already] = await db.rows<{ ok: boolean }>(sql`
     SELECT pg_catalog.has_function_privilege(${target}, 'pg_catalog.pg_control_system()', 'EXECUTE')
       AS ok`);

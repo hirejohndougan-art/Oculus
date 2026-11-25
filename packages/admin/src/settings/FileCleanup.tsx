@@ -41,7 +41,9 @@ const PROBLEMS: Readonly<Record<string, string>> = {
   lease_mismatch:
     "Another database is using the files folder, or this database was restored or copied. Nothing is cleaned up until someone on the server runs npm run files:adopt.",
   identity_changed:
-    "The files folder names another database. If this database was upgraded or moved to another server, accept it as the folder's owner below; if it is a copy of the database that uses the folder, leave it.",
+    "The files folder names another database. If this database server was upgraded in place (pg_upgrade), accept it as the folder's owner below. If it was moved by a dump and restore, someone on the server runs npm run files:adopt. If it is a copy of the database that uses the folder, leave it.",
+  use_adopt:
+    "This database isn't the one that last held the files folder (it was restored from a dump, or it is a copy), so it can't simply be accepted. If it really is the folder's owner now, someone on the server runs npm run files:adopt.",
   identity_unknown:
     "Oculus can't read this database server's identity, so a copy restored elsewhere couldn't be told apart, and nothing is cleaned up. Ask whoever runs the database to let Oculus's role read it (EXECUTE on pg_control_system()).",
   mtime_unreliable:

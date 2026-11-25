@@ -10,7 +10,7 @@ import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { openDatabase } from "./client.js";
 import { DATABASE_URL_VARIABLE } from "./migrate-cli.js";
-import { grantWriterRole, identityGrantHint } from "./roles.js";
+import { grantWriterRole, identityGrantHint, reservedRoleName } from "./roles.js";
 
 export async function runGrantCli(
   args: readonly string[],
@@ -19,7 +19,12 @@ export async function runGrantCli(
   err: (line: string) => void,
 ): Promise<number> {
   const [role] = args;
-  if (args.length !== 1 || role === undefined || !/^[a-z_][a-z0-9_]{0,62}$/.test(role)) {
+  if (
+    args.length !== 1 ||
+    role === undefined ||
+    !/^[a-z_][a-z0-9_]{0,62}$/.test(role) ||
+    reservedRoleName(role)
+  ) {
     err("Usage: node packages/db/dist/grant-cli.js <writer role (lower case, digits and _)>");
     return 2;
   }

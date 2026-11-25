@@ -9,9 +9,10 @@
  *   trash; files in the trash for a day are deleted. `-- --dry-run` says
  *   what a step would do and changes nothing. Every step that changes
  *   something goes to the change log.
- * - `npm run files:accept-identity`: after a pg_upgrade or a move to another
- *   cluster, while the folder's lease is still this database's, makes the
- *   marker name this database's new identity (the change log says so).
+ * - `npm run files:accept-identity`: after a pg_upgrade, while the folder's
+ *   lease is still this database's and its catalog is the one that took it
+ *   (else `use_adopt`), makes the marker name this database's new identity
+ *   (an adopt-kind epoch; the change log says so).
  * - `npm run files:adopt`: after restoring or copying a database, makes it
  *   the folder's own again: a new lease epoch, and a time before which no
  *   file event will count for a later purge. It deletes nothing and enables
@@ -22,7 +23,7 @@
  * No URL, path or secret is printed.
  */
 import { pathToFileURL } from "node:url";
-import { openDatabase } from "@oculus/db";
+import { databaseIdentity, openDatabase } from "@oculus/db";
 import { createService, type PurgeReport, type PurgeTotals } from "@oculus/service";
 import { fileStoreFromEnv } from "./admin-server.js";
 
@@ -49,7 +50,9 @@ const PURGE_PROBLEMS: Readonly<Record<string, string>> = {
   lease_mismatch:
     "the files folder's lease isn't this database's: another database uses the folder, or this one was restored or copied. Nothing is purged until npm run files:adopt.",
   identity_changed:
-    "the files folder's marker names another database's identity: this database was upgraded (pg_upgrade) or moved, or it is a copy of the one that uses the folder. If it is the folder's own, run npm run files:accept-identity (or use System settings, Removed files).",
+    "the files folder's marker names another database's identity: this database was upgraded in place (pg_upgrade), moved by dump and restore, or is a copy of the one that uses the folder. After a pg_upgrade, run npm run files:accept-identity (or use System settings, Removed files); after a dump and restore, npm run files:adopt.",
+  use_adopt:
+    "this database's catalog isn't the one that last held the folder (a dump and restore, or a copy), so only an adopt can make the folder its own: npm run files:adopt.",
   identity_unknown:
     "this database's role can't read the cluster's system identifier, so a restore of it elsewhere couldn't be told apart. Have a superuser grant it EXECUTE on pg_catalog.pg_control_system().",
   mtime_unreliable:
@@ -133,6 +136,22 @@ export async function runFilesCli(
       return 2;
     }
     const service = createService(db, { files });
+    // The server's role and this command's may read the identity
+    // differently (one without the cluster's system identifier): said
+    // plainly, since the purge then refuses (S-052 third review).
+    const marker = await files.readMarker().catch(() => undefined);
+    const identity = await databaseIdentity(db).catch(() => undefined);
+    if (
+      marker?.database !== undefined &&
+      identity !== undefined &&
+      marker.database !== identity &&
+      marker.database.split(":")[1] === identity.split(":")[1] &&
+      (identity.startsWith("-:") || marker.database.startsWith("-:"))
+    ) {
+      io.err(
+        "Warning: this command's database role reads the database's identity differently from the server's (one of them can't run pg_control_system()). Run it as the server's role, or grant both.",
+      );
+    }
     if (command === "purge") {
       const purged = await service.purgeFiles({ apply: !dryRun });
       if (!purged.ok) {

@@ -100,7 +100,8 @@ export type PurgeProblem =
   /**
    * The epoch is this database's but the marker names another database's
    * identity: a dump or logical restore of the one that wrote it, or this
-   * database after a pg_upgrade or a move. Accept the identity or adopt.
+   * database after a pg_upgrade (accept the identity) or a dump-and-restore
+   * move (adopt).
    */
   | "identity_changed"
   /**
@@ -261,8 +262,9 @@ export async function runFilePurge(
     organizationId: OrganizationId,
     work: (tx: Queryable) => Promise<T>,
   ): Promise<T> {
-    return files.withLeaseLock(() =>
+    return files.withLeaseLock((held) =>
       db.transaction(async (tx) => {
+        stillHeld = held;
         await lockFileStoreLease(tx);
         await lockOrganizationFiles(tx, organizationId);
         if (monotonic() >= deadline) throw new LeaseEnded("lease_expired");
@@ -273,6 +275,12 @@ export async function runFilePurge(
       }),
     );
   }
+
+  /** The current step's lease-lock check, read again right before each rename or unlink. */
+  let stillHeld: () => Promise<boolean> = () => Promise.resolve(false);
+  const lockStillHeld = async (): Promise<void> => {
+    if (!(await stillHeld())) throw new LeaseEnded("lease_lost");
+  };
 
   /** One step's row in the change log, in the step's transaction. */
   async function logged(
@@ -389,6 +397,7 @@ export async function runFilePurge(
           ) {
             return "waiting" as const;
           }
+          await lockStillHeld();
           const done = await files.deleteTrashed(organizationId, item.sha256, again.copyMtimeNs);
           if (done !== "deleted") {
             await files.restoreFromTrash(organizationId, item.sha256);
@@ -428,6 +437,7 @@ export async function runFilePurge(
           if (now?.mtimeNs !== again.copyMtimeNs || fsNowAgain - now.mtimeMs < WEEK_MS) {
             return false;
           }
+          await lockStillHeld();
           const done = await files.trashContent(
             organizationId,
             candidate.sha256,
@@ -487,20 +497,25 @@ export async function restoreAllTrash(db: Database, store: FileStore): Promise<n
   let restored = 0;
   for (const organizationId of onDisk.filter((id) => known.has(id))) {
     for (const entry of await store.trashEntries(organizationId)) {
-      const back = await db.transaction(async (tx) => {
-        await lockOrganizationFiles(tx, organizationId);
-        const answer = await store.restoreFromTrash(organizationId, entry.sha256);
-        if (answer !== "none") {
-          await insertSystemEvent(tx, {
-            actorId: null,
-            kind: "files_restored",
-            files: 1,
-            bytes: entry.size,
-            source: "lease",
-          });
-        }
-        return answer;
-      });
+      // Under the folder's lease lock too, so it never runs inside another
+      // database's purge step (S-052 third review). Putting back is safe in
+      // any case: it never deletes a copy that isn't also at its path.
+      const back = await store.withLeaseLock(() =>
+        db.transaction(async (tx) => {
+          await lockOrganizationFiles(tx, organizationId);
+          const answer = await store.restoreFromTrash(organizationId, entry.sha256);
+          if (answer !== "none") {
+            await insertSystemEvent(tx, {
+              actorId: null,
+              kind: "files_restored",
+              files: 1,
+              bytes: entry.size,
+              source: "lease",
+            });
+          }
+          return answer;
+        }),
+      );
       if (back !== "none") restored++;
     }
   }

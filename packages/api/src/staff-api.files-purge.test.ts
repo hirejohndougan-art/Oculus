@@ -31,6 +31,7 @@ import { csrfTokenFor, type OrganizationId, type UserId } from "@oculus/core";
 import {
   openDatabase,
   purgeCandidates,
+  currentFingerprint,
   databaseIdentity,
   readAuditTrail,
   readFileStoreLease,
@@ -721,9 +722,55 @@ describe("the second review's fixes (S-052)", () => {
       WHERE kind = 'files_identity_accepted'`);
     expect(log).toEqual([{ actor_id: w.root }]);
     expect(await service.acceptFileStoreIdentity()).toEqual({ ok: true, changed: false });
+    // Accepting is an adopt-kind epoch (third review): removals before it
+    // count as unknown, so X stays.
+    expect((await readFileStoreLease(w.db))?.kind).toBe("adopt");
+    expect((await purge()).trashed.files).toBe(0);
+    expect(has(body)).toBe(true);
+    // (Moved back in time, as these tests move everything else back.)
+    await ageEpochsOf(w.db, 30);
     expect((await purge()).trashed.files).toBe(1);
-    expect(has(body)).toBe(false);
     await drain();
+  });
+
+  it("L3: a step whose lease lock isn't its own any more right before the rename stops, moving nothing", async () => {
+    const { body } = await removedLongAgo();
+    const taken: FileStore = {
+      ...store,
+      withLeaseLock: (work) => store.withLeaseLock(() => work(() => Promise.resolve(false))),
+    };
+    const result = await createService(w.db, { files: taken }).purgeFiles({ apply: true });
+    expect(result.ok && result.value).toMatchObject({
+      stopped: "lease_lost",
+      trashed: { files: 0 },
+    });
+    expect(has(body)).toBe(true);
+    await drain();
+  });
+
+  it("R3: after a pg_upgrade (only the system identifier differs) accepting is allowed, by the catalog fingerprint", async () => {
+    const real = await databaseIdentity(w.db);
+    // The identity read as pg_upgrade would leave it: a new system
+    // identifier, the same database and tables.
+    const upgraded: Database = {
+      rows: (q) =>
+        Sql.parts(q).join("").includes("pg_control_system")
+          ? Promise.resolve([{ id: "1111111111111111111" }] as never)
+          : w.db.rows(q),
+      execute: (q) => w.db.execute(q),
+      transaction: (work) => w.db.transaction(work),
+      close: () => Promise.resolve(),
+    };
+    const after = createService(upgraded, { files: store });
+    expect(await after.bindFileStore()).toEqual({ ok: true, warning: "files_identity_changed" });
+    expect((await readFileStoreLease(w.db))?.fingerprint).toBe(await currentFingerprint(w.db));
+    expect(await after.acceptFileStoreIdentity()).toEqual({ ok: true, changed: true });
+    expect(markerLines()[1]).toBe(`1111111111111111111:${real.split(":")[1] ?? ""}`);
+    expect((await readFileStoreLease(w.db))?.kind).toBe("adopt");
+    // And back, as this test database really is.
+    expect(await service.acceptFileStoreIdentity()).toEqual({ ok: true, changed: true });
+    expect(markerLines()[1]).toBe(real);
+    await ageEpochsOf(w.db, 30);
   });
 
   it("R2-B2: a poisoned marker is never poisoned again, so an adopt can find it quiet with servers running", async () => {
@@ -1073,6 +1120,41 @@ describe("another database on the folder (fifth review RV1, RV2; review B1; R1b'
       }
       expect(readFileSync(join(dir, STORE_MARKER), "utf8")).toBe(marker);
       expect(existsSync(join(trashOf(body), "content"))).toBe(true);
+      expect(await service.renewFileLease()).toBe(true);
+    });
+  }, 120_000);
+
+  it("R3-B1: a logical copy can't accept the folder: refused with use_adopt, and it never purges", async () => {
+    await withCopy("r3b1", async (step) => {
+      const body = bytes();
+      const fileId = await attach(body);
+      ageCopy(body, 20);
+      await step();
+      const copy = await step();
+      // The dump carried production's epoch rows with production's
+      // fingerprint; the copy's own catalog has new OIDs.
+      const carried = (await readFileStoreLease(copy.db))?.fingerprint;
+      expect(carried).toBe(await currentFingerprint(w.db));
+      expect(await currentFingerprint(copy.db)).not.toBe(carried);
+      expect(await copy.s.bindFileStore()).toEqual({
+        ok: true,
+        warning: "files_identity_changed",
+      });
+      const marker = readFileSync(join(dir, STORE_MARKER), "utf8");
+      expect(await copy.s.acceptFileStoreIdentity()).toEqual({ ok: false, problem: "use_adopt" });
+      expect(readFileSync(join(dir, STORE_MARKER), "utf8")).toBe(marker);
+      // The reviewer's steps after accept: remove X, purge twice a day apart.
+      await remove(fileId, copy.s);
+      await ageEvents(copy.db, body, 9);
+      for (const apply of [false, true, true]) {
+        expect(await copy.s.purgeFiles({ apply })).toEqual({
+          ok: false,
+          problem: "identity_changed",
+        });
+      }
+      expect(has(body)).toBe(true);
+      expect(await store.trashEntries(w.a)).toEqual([]);
+      // Production keeps its lease.
       expect(await service.renewFileLease()).toBe(true);
     });
   }, 120_000);

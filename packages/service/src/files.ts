@@ -56,6 +56,7 @@ import {
   insertSystemEvent,
   databaseIdentity,
   identityKnown,
+  currentFingerprint,
   readFileStoreLease,
   lockFileStoreLease,
   insertFileStoreEpoch,
@@ -313,19 +314,29 @@ export interface FileOperations {
       }
   >;
   /**
-   * Accepts this database's identity as the folder's (S-052 second review):
-   * after a pg_upgrade or a move to another cluster the identity changes
-   * while the folder's epoch is still this database's, and the purge
-   * refuses (`identity_changed`) until this. Only while the epoch is ours;
-   * written to the change log (`actorId`: the system manager, or none for
-   * the command line). It moves the lease on and changes nothing else.
+   * Accepts this database's identity as the folder's (S-052 second and
+   * third reviews): after a pg_upgrade the cluster's system identifier
+   * changes while the folder's epoch is still this database's, and the
+   * purge refuses (`identity_changed`) until this. Only while the epoch is
+   * ours, and only while this database's catalog fingerprint (the OIDs of
+   * its file tables and of the database, which a pg_upgrade keeps and a
+   * dump and restore doesn't) is the one on its newest epoch row: a logical
+   * copy, or a move by dump and restore, is refused with `use_adopt`. It
+   * writes an `adopt` epoch (so removals before it count as unknown to the
+   * purge) and the change log (`actorId`: the system manager, or none for
+   * the command line).
    */
   acceptFileStoreIdentity(actorId?: UserId): Promise<
     | { readonly ok: true; readonly changed: boolean }
     | {
         readonly ok: false;
         readonly problem:
-          "no_store" | "not_bound" | "other_install" | "lease_mismatch" | "identity_unknown";
+          | "no_store"
+          | "not_bound"
+          | "other_install"
+          | "lease_mismatch"
+          | "identity_unknown"
+          | "use_adopt";
       }
   >;
   /** The asset's files (name, size, sniffed type, who and when). */
@@ -572,7 +583,7 @@ export function fileOperations(
             return undefined;
           }
           // The epoch is ours but the marker names another identity (this
-          // database after a pg_upgrade or a move, or a logical copy of the
+          // database after a pg_upgrade or a dump-and-restore, or a copy of the
           // one that uses the folder): nothing is written, so a copy that
           // starts takes nothing from the folder's owner, until a system
           // manager accepts the identity (S-052 second review).
@@ -971,14 +982,25 @@ export function fileOperations(
       const epoch = randomUUID();
       return store.withLeaseLock(async () => {
         const answer = await db.transaction(
-          async (tx): Promise<"other_install" | "lease_mismatch" | "same" | "accepted"> => {
+          async (
+            tx,
+          ): Promise<"other_install" | "lease_mismatch" | "use_adopt" | "same" | "accepted"> => {
             await lockFileStoreLease(tx);
             const marker = await store.readMarker();
             if (marker?.storeId !== bound) return "other_install";
             const lease = await readFileStoreLease(tx);
             if (lease === undefined || marker.epoch !== lease.epoch) return "lease_mismatch";
             if (marker.database === identity) return "same";
-            await insertFileStoreEpoch(tx, epoch, "renew", identity);
+            // Only the system identifier may have changed (a pg_upgrade): the
+            // catalog must be the one that took the newest epoch. A dump
+            // restored anywhere has new OIDs (S-052 third review, R3-B1).
+            if (
+              lease.fingerprint === null ||
+              lease.fingerprint !== (await currentFingerprint(tx))
+            ) {
+              return "use_adopt";
+            }
+            await insertFileStoreEpoch(tx, epoch, "adopt", identity);
             await insertSystemEvent(tx, {
               actorId: actorId ?? null,
               kind: "files_identity_accepted",
@@ -988,7 +1010,7 @@ export function fileOperations(
             return "accepted";
           },
         );
-        if (answer === "other_install" || answer === "lease_mismatch") {
+        if (answer === "other_install" || answer === "lease_mismatch" || answer === "use_adopt") {
           return { ok: false as const, problem: answer };
         }
         if (answer === "accepted") {

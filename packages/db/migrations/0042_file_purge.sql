@@ -23,6 +23,37 @@ ALTER TABLE public.file_store_epochs DROP CONSTRAINT file_store_epochs_kind;
 ALTER TABLE public.file_store_epochs ADD CONSTRAINT file_store_epochs_kind
   CHECK (kind IN ('bind', 'renew', 'adopt', 'purge'));
 
+-- 2b. Each epoch row also records the database's catalog fingerprint: the
+--    OIDs of file_store_epochs, stored_file_events and stored_files and of
+--    the database, stamped by the database whatever the INSERT says. A
+--    pg_upgrade keeps them (only the cluster's system identifier changes);
+--    a pg_dump and restore gives new ones. Accepting a changed identity is
+--    allowed only while the fingerprint is the one on the newest epoch row,
+--    so a logical copy can never accept the folder (S-052 third review).
+CREATE FUNCTION public.file_store_fingerprint() RETURNS text
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+  SELECT 'public.file_store_epochs'::regclass::oid::text || ':'
+      || 'public.stored_file_events'::regclass::oid::text || ':'
+      || 'public.stored_files'::regclass::oid::text || ':'
+      || (SELECT d.oid::text FROM pg_catalog.pg_database d
+          WHERE d.datname = pg_catalog.current_database())
+$$;
+
+ALTER TABLE public.file_store_epochs ADD COLUMN catalog_fingerprint text;
+
+CREATE OR REPLACE FUNCTION public.file_store_epochs_stamp() RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  NEW.made_at := clock_timestamp();
+  NEW.catalog_fingerprint := public.file_store_fingerprint();
+  RETURN NEW;
+END
+$$;
+
 -- 3. The purge's two steps, append-only. For each content of an
 --    organization, its newest row says where it stands:
 --      trashed   step 1: the copy (and its thumbnails) moved into the

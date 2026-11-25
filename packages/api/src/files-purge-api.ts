@@ -13,9 +13,9 @@
  * - `POST /api/system/files/cleanup` `{}`: runs one step under the folder's
  *   lease, with the system manager as the change log's actor.
  * - `POST /api/system/files/cleanup/accept-identity` `{}`: after a
- *   pg_upgrade or a move (`identity_changed`), makes the marker name this
- *   database, while the folder's epoch is still its own; a recent sign-in,
- *   and the change log.
+ *   pg_upgrade (`identity_changed`), makes the marker name this database,
+ *   while the folder's epoch is still its own and its catalog fingerprint
+ *   unchanged (else `409 use_adopt`); a recent sign-in, and the change log.
  */
 import type { UserId } from "@oculus/core";
 import type { PeopleContext, RecordService, ServiceContext } from "@oculus/service";

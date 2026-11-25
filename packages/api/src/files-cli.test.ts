@@ -103,6 +103,24 @@ describe("files-cli", () => {
     writeFileSync(marker, kept);
   });
 
+  it("warns when its role reads the identity differently from the server's (L6)", async () => {
+    const marker = join(dir, STORE_MARKER);
+    const kept = readFileSync(marker, "utf8");
+    const [storeId, database, epoch] = kept.split("\n");
+    // As a server whose role can't run pg_control_system() would write it.
+    writeFileSync(
+      marker,
+      `${storeId ?? ""}\n-:${(database ?? "").split(":")[1] ?? ""}\n${epoch ?? ""}\n`,
+    );
+    const r = run(["purge", "--dry-run"]);
+    expect(await r.done).toBe(1);
+    expect(r.lines.join("\n")).toMatch(/reads the database's identity differently/);
+    writeFileSync(marker, kept);
+    const quiet = run(["purge", "--dry-run"]);
+    await quiet.done;
+    expect(quiet.lines.join("\n")).not.toMatch(/differently/);
+  });
+
   it("prints what is stuck in the trash and a step stopped early", () => {
     const none = { files: 0, bytes: 0 };
     const lines = purgeLines({

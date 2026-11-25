@@ -78,6 +78,9 @@ import { hostname } from "node:os";
 import { isAbsolute, join } from "node:path";
 import type { Readable } from "node:stream";
 import { SNIFF_BYTES, isOrganizationId, isSha256Hex, type OrganizationId } from "@oculus/core";
+import { LEASE_GATE, LEASE_LOCK, LeaseLockBusy, hostKey, leaseLock } from "./lease-lock.js";
+
+export { LEASE_GATE, LEASE_LOCK, LeaseLockBusy };
 
 /** Bytes in a mebibyte. */
 const MIB = 1024 * 1024;
@@ -130,14 +133,6 @@ export interface PlaceCheck {
   readonly same: boolean;
 }
 
-/** `withLeaseLock` waited its whole time and another holder still has the lock. */
-export class LeaseLockBusy extends Error {
-  constructor() {
-    super("The files folder's lease lock is held.");
-    this.name = "LeaseLockBusy";
-  }
-}
-
 /** A stored copy's time and size (`copyStamp`). */
 export interface CopyStamp {
   readonly mtimeNs: bigint;
@@ -162,17 +157,6 @@ export interface TrashEntry {
   readonly stuck: boolean;
 }
 
-/** The lock file the lease's steps take, beside the marker (`withLeaseLock`). */
-export const LEASE_LOCK = ".oculus-lease.lock";
-/** A lease lock older than this by the file system's clock is a crashed holder's (2 minutes). */
-const LEASE_LOCK_STALE_MS = 2 * 60_000;
-/** How long `withLeaseLock` waits for another holder (15 seconds). */
-const LEASE_LOCK_WAIT_MS = 15_000;
-/** How often a held lease lock's time is moved on (20 seconds). */
-const LEASE_LOCK_BEAT_MS = 20_000;
-/** A lease lock this far in the future by the file system's clock is stale (5 seconds). */
-const LEASE_LOCK_FUTURE_MS = 5_000;
-
 export type ReceiveRefusal = "file_too_large" | "empty_file" | "quota_exceeded" | "disk_full";
 
 export type ReceiveResult =
@@ -196,6 +180,10 @@ export interface StoreMarker {
 
 /** Where the servers using the folder note themselves (`claimServer`). */
 const SERVERS_FOLDER = ".oculus-servers";
+/** How often a running server moves its note's time on (5 minutes). */
+const SERVER_NOTE_BEAT_MS = 5 * 60_000;
+/** A note whose PID can't be checked is stale this long after its last move (30 minutes). */
+const SERVER_NOTE_STALE_MS = 30 * 60_000;
 
 const MARKER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const MARKER_DATABASE = /^[0-9A-Za-z_.:-]{1,100}$/;
@@ -349,15 +337,12 @@ export interface FileStore {
    */
   mtimeSelfTest(): Promise<boolean>;
   /**
-   * Runs `work` holding the folder's lease lock: a lock file beside the
-   * marker, made `O_EXCL` (Node has no `flock`), so a purge step, a lease
-   * renewal, a bind or an adopt of any database using the folder never
-   * runs inside another's. Its time moves on every 20 seconds while held.
-   * A holder that is gone (`lockIsStale`) is taken over by renaming its
-   * lock aside and checking it was that one; otherwise it waits up to 15
-   * seconds, then throws `LeaseLockBusy`.
+   * Runs `work` holding the folder's lease lock (lease-lock.ts): a purge
+   * step, a lease renewal, a bind, an adopt and an accept of any database
+   * using the folder never run inside another's. `held()` reads the lock
+   * again; a purge step checks it right before each rename or unlink.
    */
-  withLeaseLock<T>(work: () => Promise<T>): Promise<T>;
+  withLeaseLock<T>(work: (held: () => Promise<boolean>) => Promise<T>): Promise<T>;
   /**
    * The purge's step 1 (call under the organization's file lock): moves the
    * copy into `trash/<sha256>/content` by one rename, its thumbnails beside
@@ -630,6 +615,10 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
   /** The `.oculus-servers` notes this process holds (`claimServer`). */
   const claimed = new Set<string>();
   let boundTo: string | undefined;
+  const lock = leaseLock({
+    root,
+    ...(options.leaseLockBeatMs === undefined ? {} : { beatMs: options.leaseLockBeatMs }),
+  });
 
   async function lowOnSpace(extra: number): Promise<boolean> {
     if (minFree === 0) return false;
@@ -738,51 +727,6 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
     await syncDirectory(join(bin, "..")).catch(() => undefined);
   }
 
-  /** This host's name as lease locks write it. */
-  const lockHost = hostname()
-    .replace(/[^A-Za-z0-9.-]/g, "_")
-    .slice(0, 100);
-  /** The nonces of the lease locks this process holds now. */
-  const heldNonces = new Set<string>();
-
-  /** A lease lock's text, holder and time, or `undefined` if it is gone. */
-  async function readLock(
-    path: string,
-  ): Promise<
-    { text: string; host: string; pid: number; nonce: string; mtimeMs: number } | undefined
-  > {
-    const info = await lstat(path).catch(() => undefined);
-    if (info === undefined) return undefined;
-    if (!info.isFile()) throw new Error("The files folder's lease lock isn't a plain file.");
-    const text = await readFile(path, "utf8").catch(() => undefined);
-    if (text === undefined) return undefined;
-    const [host = "", pidText = "", nonce = ""] = text.split("\n");
-    return { text, host, pid: Number(pidText), nonce, mtimeMs: info.mtimeMs };
-  }
-
-  /**
-   * A lease lock whose holder is gone: on this host, a process that no
-   * longer exists, or this process when the nonce isn't one it holds (an
-   * earlier instance with the same PID, as after a container restart);
-   * anywhere, a lock older than two minutes or in the future by the file
-   * system's clock (its holder beats every 20 seconds).
-   */
-  async function lockIsStale(seen: { host: string; pid: number; nonce: string; mtimeMs: number }) {
-    if (seen.host === lockHost && Number.isSafeInteger(seen.pid) && seen.pid > 0) {
-      if (seen.pid === process.pid) {
-        if (!heldNonces.has(seen.nonce)) return true;
-      } else {
-        try {
-          process.kill(seen.pid, 0);
-        } catch (error) {
-          if ((error as { code?: unknown }).code !== "EPERM") return true;
-        }
-      }
-    }
-    const now = await fileSystemNow(root);
-    return now - seen.mtimeMs > LEASE_LOCK_STALE_MS || seen.mtimeMs - now > LEASE_LOCK_FUTURE_MS;
-  }
-
   const store: FileStore = {
     maxFileBytes,
     maxOrganizationBytes,
@@ -852,7 +796,8 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       const name = `${host}-${String(process.pid)}-${randomBytes(8).toString("hex")}`;
       const mine = join(folder, name);
       const temp = join(folder, `.${name}.tmp`);
-      await writeFile(temp, `${key}\n`, { mode: 0o600, flag: "wx" });
+      // The key, then this host as a PID's meaning (lease-lock.ts `hostKey`).
+      await writeFile(temp, `${key}\n${hostKey() ?? "-"}\n`, { mode: 0o600, flag: "wx" });
       try {
         await link(temp, mine);
       } catch (error) {
@@ -861,7 +806,17 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       } finally {
         await rm(temp, { force: true });
       }
+      // The note's time moves on while this server runs, so a note whose
+      // process can't be checked (another PID namespace, or no host key) is
+      // judged by its age.
+      const beat = setInterval(() => {
+        void fileSystemNow(folder)
+          .then((now) => utimes(mine, now / 1000, now / 1000))
+          .catch(() => undefined);
+      }, SERVER_NOTE_BEAT_MS);
+      beat.unref();
       const release = (): void => {
+        clearInterval(beat);
         claimed.delete(name);
         try {
           rmSync(mine, { force: true });
@@ -883,24 +838,37 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
           if (!entry.isFile() || match?.[1] !== host) continue;
           const pid = Number(match[2]);
           const path = join(folder, entry.name);
+          const text = await readFile(path, "utf8").catch(() => undefined);
+          const [theirKey, theirHost] = (text ?? "").split("\n");
+          const here = hostKey();
           let alive: boolean;
-          if (pid === process.pid) {
-            // This process's own notes are the ones it holds; any other is
-            // left from a process that had this PID before.
-            alive = claimed.has(entry.name);
-          } else {
-            alive = true;
-            try {
-              process.kill(pid, 0);
-            } catch (error) {
-              alive = (error as { code?: unknown }).code === "EPERM";
+          if (here !== undefined && theirHost === here) {
+            // The same host, boot and PID namespace: the PID says.
+            if (pid === process.pid) {
+              // This process's own notes are the ones it holds; any other is
+              // left from a process that had this PID before.
+              alive = claimed.has(entry.name);
+            } else {
+              alive = true;
+              try {
+                process.kill(pid, 0);
+              } catch (error) {
+                alive = (error as { code?: unknown }).code === "EPERM";
+              }
             }
+          } else {
+            // Its PID can't be checked from here: only its age (S-052
+            // third review, PID namespaces).
+            const info = await lstat(path).catch(() => undefined);
+            alive =
+              info !== undefined &&
+              Math.abs((await fileSystemNow(folder)) - info.mtimeMs) <= SERVER_NOTE_STALE_MS;
           }
           if (!alive) {
             await rm(path, { force: true });
             continue;
           }
-          const theirs = (await readFile(path, "utf8").catch(() => undefined))?.trim();
+          const theirs = text === undefined ? undefined : theirKey?.trim();
           // A note gone meanwhile was released; any other key refuses.
           if (theirs !== undefined && theirs !== key) {
             done();
@@ -953,8 +921,9 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
 
     async isEmpty() {
       return (
-        (await readdir(root)).filter((name) => name !== SERVERS_FOLDER && name !== LEASE_LOCK)
-          .length === 0
+        (await readdir(root)).filter(
+          (name) => name !== SERVERS_FOLDER && name !== LEASE_LOCK && name !== LEASE_GATE,
+        ).length === 0
       );
     },
 
@@ -1294,73 +1263,7 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
     },
 
     async withLeaseLock(work) {
-      const path = join(root, LEASE_LOCK);
-      const nonce = randomBytes(12).toString("hex");
-      const mine = `${lockHost}\n${String(process.pid)}\n${nonce}\n`;
-      const waitUntil = Date.now() + LEASE_LOCK_WAIT_MS;
-      for (;;) {
-        try {
-          await writeFile(path, mine, { mode: 0o600, flag: "wx" });
-          break;
-        } catch (error) {
-          if ((error as { code?: unknown }).code !== "EEXIST") throw error;
-        }
-        const seen = await readLock(path);
-        if (seen !== undefined && (await lockIsStale(seen))) {
-          // Taken over by renaming the stale lock aside and checking it is the
-          // one judged stale (two takers can't both get it, review L1).
-          const aside = `${path}.${randomBytes(8).toString("hex")}`;
-          const moved = await rename(path, aside).then(
-            () => true,
-            () => false,
-          );
-          if (moved) {
-            const what = await readFile(aside, "utf8").catch(() => undefined);
-            if (what !== seen.text) {
-              // A live holder's lock was moved: put back, unless another came.
-              await link(aside, path).catch(() => undefined);
-            }
-            await rm(aside, { force: true });
-          }
-          continue;
-        }
-        if (Date.now() > waitUntil) throw new LeaseLockBusy();
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-      heldNonces.add(nonce);
-      // A heartbeat while the work runs, so a long step never looks stale (L2).
-      const beat = setInterval(() => {
-        void readFile(path, "utf8")
-          .then(async (text) => {
-            if (text === mine) {
-              const now = (await fileSystemNow(root)) / 1000;
-              await utimes(path, now, now);
-            }
-          })
-          .catch(() => undefined);
-      }, options.leaseLockBeatMs ?? LEASE_LOCK_BEAT_MS);
-      beat.unref();
-      try {
-        return await work();
-      } finally {
-        clearInterval(beat);
-        heldNonces.delete(nonce);
-        // Only our own, by the same rename-and-check.
-        if ((await readFile(path, "utf8").catch(() => undefined)) === mine) {
-          const aside = `${path}.${randomBytes(8).toString("hex")}`;
-          if (
-            await rename(path, aside).then(
-              () => true,
-              () => false,
-            )
-          ) {
-            if ((await readFile(aside, "utf8").catch(() => undefined)) !== mine) {
-              await link(aside, path).catch(() => undefined);
-            }
-            await rm(aside, { force: true });
-          }
-        }
-      }
+      return lock.withLock(work);
     },
 
     async trashContent(organizationId, sha256, mtimeNs) {

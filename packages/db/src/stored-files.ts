@@ -532,6 +532,19 @@ export interface FileStoreLease {
   readonly madeAt: string;
   /** The last `files:adopt` (events before it are unknown to the purge), or null. */
   readonly since: string | null;
+  /** The catalog fingerprint the database stamped on this epoch's row (null before S-052). */
+  readonly fingerprint: string | null;
+}
+
+/**
+ * This database's catalog fingerprint now (the purge's migration): the OIDs
+ * of its file tables and of the database. A pg_upgrade keeps it; a dump and
+ * restore doesn't (S-052 third review).
+ */
+export async function currentFingerprint(db: Queryable): Promise<string> {
+  const [row] = await db.rows<{ f: string }>(sql`SELECT public.file_store_fingerprint() AS f`);
+  if (row === undefined) throw new Error("The catalog fingerprint can't be read.");
+  return row.f;
 }
 
 /** The current epoch, or undefined before the folder is first bound. */
@@ -541,8 +554,9 @@ export async function readFileStoreLease(db: Queryable): Promise<FileStoreLease 
     kind: string;
     made_at: string;
     since: string | null;
+    fingerprint: string | null;
   }>(sql`
-    SELECT e.epoch::text AS epoch, e.kind,
+    SELECT e.epoch::text AS epoch, e.kind, e.catalog_fingerprint AS fingerprint,
       to_char(e.made_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS made_at,
       (SELECT to_char(max(a.made_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
        FROM public.file_store_epochs a WHERE a.kind = 'adopt') AS since
@@ -554,7 +568,13 @@ export async function readFileStoreLease(db: Queryable): Promise<FileStoreLease 
   if (row.kind !== "bind" && row.kind !== "renew" && row.kind !== "adopt" && row.kind !== "purge") {
     throw new Error("A file store epoch doesn't read as one.");
   }
-  return Object.freeze({ epoch: row.epoch, kind: row.kind, madeAt: row.made_at, since: row.since });
+  return Object.freeze({
+    epoch: row.epoch,
+    kind: row.kind,
+    madeAt: row.made_at,
+    since: row.since,
+    fingerprint: row.fingerprint,
+  });
 }
 
 /**
