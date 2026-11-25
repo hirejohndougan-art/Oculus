@@ -29,7 +29,7 @@
  *   type decides anything; the claimed type and the name never do.
  *
  * Attaching a file doesn't change the asset's record or its version: the
- * files are their own rows (0025). `If-Match` only makes sure the person
+ * files are their own rows (0032). `If-Match` only makes sure the person
  * attached to the asset as they last saw it.
  */
 import { randomUUID } from "node:crypto";

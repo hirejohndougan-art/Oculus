@@ -487,6 +487,8 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
   timer.unref();
   const lease = setInterval(() => void renew(), FILE_LEASE_EVERY_MS);
   lease.unref();
+  // Started once the server is built, so a start that fails counts nothing.
+  publicSubjects?.start();
   app.server.once("close", () => {
     clearInterval(timer);
     clearInterval(lease);

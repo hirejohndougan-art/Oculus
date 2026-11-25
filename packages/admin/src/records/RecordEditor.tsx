@@ -874,21 +874,21 @@ function Editor(props: EditorProps) {
           </ConfirmPanel>
         </form>
 
-        {reply?.record.kind === "digital_asset" ? (
-          <FilesPanel
-            siteId={siteId}
-            recordId={reply.record.id}
-            version={reply.version}
-            canUpload={can.edit}
-          />
-        ) : null}
-
         {reply !== undefined && can.edit ? (
           <SharingPanel
             key={reply.record.id}
             siteId={siteId}
             recordId={reply.record.id}
             published={state === "published"}
+          />
+        ) : null}
+
+        {reply?.record.kind === "digital_asset" ? (
+          <FilesPanel
+            siteId={siteId}
+            recordId={reply.record.id}
+            version={reply.version}
+            canUpload={can.edit}
           />
         ) : null}
 

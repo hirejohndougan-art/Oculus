@@ -1,13 +1,13 @@
 -- The second review of M-002 (D-086, amended): the files folder bound to
 -- one install, a log of every attach and removal (which also keeps a
 -- removed file's bytes for seven days), and the file name check covering
--- every format character. Numbered 0026, right after 0025 (stored_files).
+-- every format character. Numbered 0033, right after 0032 (stored_files).
 
 -- core cleanFileName: no control (Cc), format character (every Cf of
 -- Unicode 15.1, listed: PostgreSQL's regular expressions have no \p{Cf}),
 -- line or paragraph separator, or path separator. Lone surrogates can't be
 -- stored in UTF-8 text at all. The service's check (core) is the one that
--- decides; this backs it up. 0025's narrower check is replaced.
+-- decides; this backs it up. 0032's narrower check is replaced.
 ALTER TABLE public.stored_files DROP CONSTRAINT stored_files_original_name_format;
 ALTER TABLE public.stored_files ADD CONSTRAINT stored_files_original_name_format
   CHECK (char_length(original_name) BETWEEN 1 AND 255
