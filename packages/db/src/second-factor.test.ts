@@ -2750,6 +2750,27 @@ describe("each sign-in's own unexplained codes, counted once known wrong (S-054b
     expect(await alertsOf(person.userId)).toEqual([]);
   });
 
+  it("a wrong code is still counted when its own session ends while it is checked (review)", async () => {
+    await ready();
+    const org = await organization();
+    const person = await member(org);
+    const p = await pending(person.userId, org);
+    const wrong = await wrongFor(person.userId);
+    // The guesser signs out (or uses up the session) while the code is checked.
+    const { result, fired } = await pausedAt(
+      (text) => text.includes("INSERT INTO public.second_step_throttles (key) VALUES"),
+      async () => {
+        await db.execute(sql`DELETE FROM public.sessions WHERE id = ${p.sessionId}::uuid`);
+      },
+      (conn) => completeSecondStep(conn, keys, p.token, { source: source(), code: wrong }),
+    );
+    expect(fired).toBe(true);
+    expect(result).toMatchObject({ ok: false });
+    expect(await unexplained(person.userId)).toBe(1);
+    await cleanupLater(person.userId);
+    expect(await alertsOf(person.userId)).toEqual([1]);
+  });
+
   it("a wrong code in flight across an admin reset isn't counted, so it is never told as someone else's", async () => {
     await ready();
     const org = await organization();

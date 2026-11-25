@@ -692,11 +692,10 @@ async function giveBackCodeAttempt(db: Queryable, counted: Counted): Promise<voi
 /**
  * A sign-in's TOTP code found wrong goes on the person's unexplained counter
  * and on its session's share (S-054b), in one transaction with both rows
- * locked in key order. Not when the session or the factor the code was
- * checked against is gone meanwhile (an admin reset ends the sessions and
- * revokes the factor, and forgets the counter, S-054a): such a code was
- * aimed at a factor no longer in use and would be told later as someone
- * else's.
+ * locked in key order. Not when the factor the code was checked against
+ * was revoked meanwhile (an admin reset revokes it and forgets the counter,
+ * S-054a): such a code was aimed at a factor no longer in use and would be
+ * told later as someone else's. A session ended meanwhile still counts.
  */
 async function countWrongCode(
   db: Database,
@@ -705,7 +704,7 @@ async function countWrongCode(
   factorId: string,
 ): Promise<void> {
   const sessionKey = counted.signInSessionKey;
-  if (!counted.countIfWrong || sessionKey === undefined || who.sessionId === undefined) return;
+  if (!counted.countIfWrong || sessionKey === undefined) return;
   const wrongKey = counted.wrongKey;
   await inTransaction(db, async (tx) => {
     await tx.execute(sql`
@@ -724,25 +723,32 @@ async function countWrongCode(
       ORDER BY key FOR UPDATE`);
     const wrong = rows.find((r) => r.key === wrongKey);
     const ownRow = rows.find((r) => r.key === sessionKey);
-    if (wrong === undefined || ownRow === undefined) return;
+    if (wrong === undefined) return;
+    // Only the factor, not the session: the guesser ends their own session
+    // (signing out, or a code past its cap) while a code is being checked,
+    // and the code must still be counted (S-054b review).
     const live = await tx.rows(sql`
-      SELECT 1 FROM public.sessions s JOIN public.second_factors f ON f.user_id = s.user_id
-      WHERE s.id = ${who.sessionId}::uuid AND s.user_id = ${who.userId}::uuid
-        AND f.id = ${factorId}::uuid AND f.state <> 'revoked'`);
+      SELECT 1 FROM public.second_factors f
+      WHERE f.id = ${factorId}::uuid AND f.user_id = ${who.userId}::uuid
+        AND f.state <> 'revoked'`);
     if (live.length === 0) return;
     // A counter forgotten after 30 days starts again, in a new round.
     const round = BigInt(wrong.told_round) + (wrong.fresh ? 0n : 1n);
     const before = wrong.fresh ? wrong.failures : 0;
-    const share = BigInt(ownRow.told_round) === round ? ownRow.unexplained : 0;
+    const share =
+      ownRow !== undefined && BigInt(ownRow.told_round) === round ? ownRow.unexplained : 0;
     await tx.execute(sql`
       UPDATE public.second_step_throttles
       SET failures = ${before + 1}, last_failure_at = clock_timestamp(),
           told_round = ${String(round)}::bigint
       WHERE key = ${wrongKey}`);
-    await tx.execute(sql`
-      UPDATE public.second_step_throttles
-      SET unexplained = ${share + 1}, told_round = ${String(round)}::bigint
-      WHERE key = ${sessionKey}`);
+    // A session gone meanwhile has no share left to explain.
+    if (ownRow !== undefined) {
+      await tx.execute(sql`
+        UPDATE public.second_step_throttles
+        SET unexplained = ${share + 1}, told_round = ${String(round)}::bigint
+        WHERE key = ${sessionKey}`);
+    }
   });
 }
 
@@ -758,12 +764,17 @@ async function wrongCode(
   counted: Counted,
   factorId: string,
 ): Promise<SecondStepRefusal> {
-  await countWrongCode(db, who, counted, factorId);
-  if (who.sessionId !== undefined && counted.sessionFailures >= MAX_PENDING_CODE_FAILURES) {
-    await endSessionById(db, who.sessionId);
-    return TOO_MANY;
+  // The session's end first, so a count that fails can't keep it open.
+  const ended = who.sessionId !== undefined && counted.sessionFailures >= MAX_PENDING_CODE_FAILURES;
+  if (ended && who.sessionId !== undefined) await endSessionById(db, who.sessionId);
+  // Tried once more if it fails (S-054b review): the code was checked, so a
+  // count lost to a passing timeout would be a guess never told.
+  try {
+    await countWrongCode(db, who, counted, factorId);
+  } catch {
+    await countWrongCode(db, who, counted, factorId);
   }
-  return INVALID_CODE;
+  return ended ? TOO_MANY : INVALID_CODE;
 }
 
 /**
