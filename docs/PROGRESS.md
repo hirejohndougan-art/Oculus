@@ -7,7 +7,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - What changed: a Dublin Core mapping change on more published records than can be listed (10,000) is confirmed by its exact count (`confirmPublishedCount`, read under the template's lock) instead of being refused, system managers only; the mapping screen shows the number and sends it back, and saves an empty mapping when the template has no public fields left. `createService` takes `maxListedPublished` (tests).
 - Decisions: D-096 amended
 - Review: one independent round, nothing blocking; fixed a changed count not being announced, the no-public-fields note for templates needing rights, the option's bounds, and two tests (a count made out of date by a later publication; a count below the limit is no confirmation).
-- Gate: see the merge commit
+- Gate: PASS · tests_passing 4729 (was 4724) · npm audit clean
 - Next: none; the pool's remaining jobs belong to other chats.
 
 ## 2026-11-25 02:35 CT — manual (Chat C) — T-050c OAI-PMH, and S-038 Cached public Subjects counts
