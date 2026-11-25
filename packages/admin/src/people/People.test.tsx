@@ -236,7 +236,7 @@ describe("a person's page", () => {
         secondStep: { inUse: true, enrolledAt: null, recentAlerts: 0, lastAlertAt: null },
       },
       {
-        [`POST /api/people/${PERSON}/reset-second-step`]: [
+        [`POST /api/people/${PERSON}/reset-two-step`]: [
           200,
           { hadFactor: true, ended: 1, delivered: true },
         ],
@@ -251,7 +251,7 @@ describe("a person's page", () => {
     );
     await userEvent.click(within(confirm).getByRole("button", { name: "Reset two-step sign-in" }));
     await screen.findByText(/set-up code is on its way/);
-    expect(sent.find((s) => s.path.endsWith("/reset-second-step"))?.body).toEqual({
+    expect(sent.find((s) => s.path.endsWith("/reset-two-step"))?.body).toEqual({
       recoveryCode: "ABCD-EFGH-JKMN-PQRS-TVWX-YZ01",
     });
   });

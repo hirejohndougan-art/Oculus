@@ -17,7 +17,7 @@ import { useReauthenticated } from "./Reauth";
 import { Confirm, PEOPLE_KEY, grantText, siteNames, useRoles } from "./shared";
 import { when, type Grant, type PersonDetail } from "./types";
 
-type Open = "disable" | "enable" | "sessions" | "second-step" | "password" | `revoke:${string}`;
+type Open = "disable" | "enable" | "sessions" | "two-step" | "password" | `revoke:${string}`;
 
 export function Person() {
   const { me } = useOutletContext<FrameContext>();
@@ -219,8 +219,8 @@ export function Person() {
       </section>
 
       {rights.manageAccounts && secondStep !== undefined ? (
-        <section className={styles.panel} aria-labelledby="second-step-title">
-          <h2 id="second-step-title" className={styles.panelTitle}>
+        <section className={styles.panel} aria-labelledby="two-step-title">
+          <h2 id="two-step-title" className={styles.panelTitle}>
             Two-step sign-in
           </h2>
           <p>
@@ -241,15 +241,15 @@ export function Person() {
               variant="secondary"
               onPress={() => {
                 setAdminCode("");
-                setOpen("second-step");
+                setOpen("two-step");
               }}
             >
               Reset two-step sign-in…
             </Button>
           </div>
-          {open === "second-step" ? (
+          {open === "two-step" ? (
             <Confirm
-              id="second-step"
+              id="two-step"
               title="Reset their two-step sign-in?"
               confirmLabel="Reset two-step sign-in"
               isDisabled={busy || adminCode.trim() === ""}
@@ -260,7 +260,7 @@ export function Person() {
                 void act(async () => {
                   const typed = adminCode.trim();
                   const reply = await api<{ delivered: boolean; ended: number }>(
-                    `${path}/reset-second-step`,
+                    `${path}/reset-two-step`,
                     { body: /^\d{6}$/.test(typed) ? { code: typed } : { recoveryCode: typed } },
                   );
                   setAdminCode("");

@@ -201,7 +201,7 @@ describe("the session rules (D-079)", () => {
     ["POST", `/api/people/${MADE_UP}/enable`],
     ["POST", `/api/people/${MADE_UP}/roles`, { role: "cataloger", siteId: null, scope: null }],
     ["DELETE", `/api/role-assignments/${MADE_UP}`],
-    ["POST", `/api/people/${MADE_UP}/reset-second-step`, { recoveryCode: "x" }],
+    ["POST", `/api/people/${MADE_UP}/reset-two-step`, { recoveryCode: "x" }],
     ["POST", `/api/people/${MADE_UP}/password-reset`],
     ["POST", `/api/people/${MADE_UP}/end-sessions`],
   ];
@@ -451,7 +451,7 @@ describe("accounts: system managers only", () => {
           const r = await call("POST", `/api/people/${target}/${action}`, { as });
           expect(r.status, `${as} ${action}`).toBe(403);
         }
-        const reset = await call("POST", `/api/people/${target}/reset-second-step`, {
+        const reset = await call("POST", `/api/people/${target}/reset-two-step`, {
           as,
           body: { recoveryCode: "0000-0000-0000-0000-0000-0000" },
         });
@@ -511,13 +511,13 @@ describe("accounts: system managers only", () => {
   });
 
   it("resets two-step sign-in with the admin's own code; the set-up token reaches only the mailbox", async () => {
-    const wrong = await call("POST", `/api/people/${helper}/reset-second-step`, {
+    const wrong = await call("POST", `/api/people/${helper}/reset-two-step`, {
       as: "root",
       body: { recoveryCode: "0000-0000-0000-0000-0000-0000" },
     });
     expect(wrong.status).toBe(422);
     expect(enrolments).toHaveLength(0);
-    const r = await call("POST", `/api/people/${helper}/reset-second-step`, {
+    const r = await call("POST", `/api/people/${helper}/reset-two-step`, {
       as: "root",
       body: { recoveryCode: spareRecoveryCode(w.root) },
     });

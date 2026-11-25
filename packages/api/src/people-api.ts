@@ -17,7 +17,7 @@
  * - `POST /api/people/:id/disable`, `/enable`.
  * - `POST /api/people/:id/roles` `{ role, siteId, scope }` (201) and
  *   `DELETE /api/role-assignments/:id`.
- * - `POST /api/people/:id/reset-second-step` `{ code | recoveryCode }`: the
+ * - `POST /api/people/:id/reset-two-step` `{ code | recoveryCode }`: the
  *   system manager's own code now (D-077).
  * - `POST /api/people/:id/password-reset` `{ confirmMailboxOnly? }`: 409
  *   `confirmation_required` with `confirm_mailbox_only` when the person
@@ -275,7 +275,7 @@ export function peopleApiRoutes(options: PeopleApiOptions, shared: Shared): Ocul
     },
     {
       method: "POST",
-      path: "/api/people/:id/reset-second-step",
+      path: "/api/people/:id/reset-two-step",
       handler: signedIn("write", true, async (request, reply, { context }) => {
         const body = objectBody(request);
         const extra = onlyKeys(body, ["code", "recoveryCode"], reply);
