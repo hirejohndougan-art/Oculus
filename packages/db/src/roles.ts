@@ -18,6 +18,7 @@
  * never revokes what a role already holds, and `checkWriterConnection`
  * refuses a role holding anything more.
  */
+import { SHARE_TABLE_PRIVILEGES } from "./shares.js";
 import { ACCOUNT_TABLE_PRIVILEGES } from "./accounts.js";
 import { PEOPLE_TABLE_PRIVILEGES } from "./people.js";
 import { PERMISSION_TABLE_PRIVILEGES } from "./permissions.js";
@@ -82,6 +83,9 @@ export const WRITER_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Ob
   ...PEOPLE_TABLE_PRIVILEGES,
   // Two-step alert notices (D-085): one row per alert, only ever added.
   ...ALERT_NOTICE_TABLE_PRIVILEGES,
+  // Shares between sites (T-041b, D-094): offered, then moved along their
+  // life; never deleted by the writer (rows go with their record).
+  ...SHARE_TABLE_PRIVILEGES,
 });
 
 /**
