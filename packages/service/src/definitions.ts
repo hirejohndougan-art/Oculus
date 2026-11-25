@@ -91,6 +91,7 @@ import {
   readRecordPlace,
   readRecordsUsingTemplate,
   readDublinCoreMapping as readStoredMapping,
+  readRecordsForChecks,
   readTemplate as readStoredTemplate,
   updateIdentifierType,
   writeDublinCoreMapping,
@@ -126,6 +127,11 @@ export interface SavedTemplate extends TemplateVersion {
 /** A saved identifier type, with the published records it changed at once (D-076). */
 export interface SavedIdentifierType extends TaggedIdentifierType {
   readonly publishedRecords: readonly RecordId[];
+  /**
+   * Published records a new format took off the public sites (S-033,
+   * D-091): their public number no longer fits it. Confirmed before saving.
+   */
+  readonly droppedFromPublic?: readonly RecordId[];
 }
 
 /** A template's Dublin Core mapping as read (T-050b, D-096): version 0 and `null` when none is stored. */
@@ -782,8 +788,26 @@ export function definitionOperations(run: Runner): DefinitionOperations {
         const org = who.organizationId;
         const access = await writerAccess(tx, who);
         if (!access.ok) return access;
-        const opts = readOptions(saveOptions, ["expectedTag", "confirm", "confirmPublished"]);
+        const opts = readOptions(saveOptions, [
+          "expectedTag",
+          "confirm",
+          "confirmPublished",
+          "confirmDropped",
+        ]);
         if (!opts.ok) return opts;
+        const confirmDropped = opts.value.confirmDropped;
+        if (
+          confirmDropped !== undefined &&
+          (!Array.isArray(confirmDropped) ||
+            confirmDropped.length > 10_000 ||
+            !confirmDropped.every((id) => typeof id === "string"))
+        ) {
+          return refusal(
+            ["options", "confirmDropped"],
+            "invalid_option",
+            "confirmDropped lists the IDs of the published records the change takes off public sites.",
+          );
+        }
         const expectedTag = opts.value.expectedTag;
         if (expectedTag !== null && (typeof expectedTag !== "string" || !TAG.test(expectedTag))) {
           return refusal(
@@ -872,15 +896,95 @@ export function definitionOperations(run: Runner): DefinitionOperations {
         // would list no records and slip through unconfirmed (third review).
         const compared = identifierTypeChanges(old, type);
         if (!compared.ok) return compared;
+        // S-033 (D-091): a new format takes the published records whose
+        // public number no longer fits it off the public sites. Which ones
+        // is found from the published holders only (read under the type's
+        // lock, which publishing waits on), and listed in the confirmation;
+        // the confirmations themselves still come from the call above.
+        let dropped: readonly RecordId[] = [];
+        let formatSuffix = "";
+        if (compared.value.changes.some((c) => c.code === "format_changed")) {
+          const holders = await publishedHoldingType(tx, org, type.key);
+          if (holders === undefined) {
+            return refusal(
+              [],
+              "too_many_records",
+              "Too many published records hold this type to check a new format here.",
+            );
+          }
+          if (holders.length > 0) {
+            // Which published records drop off is read from their public
+            // fields' `{ type, value }` (core's publishedMisfits), so the
+            // records and templates are all it needs; identifier sets would
+            // only feed a count of misfits among these records, which isn't
+            // asked (the message below keeps core's unchecked wording).
+            const records = await readRecordsForChecks(tx, org, holders);
+            const templates = (await listStoredTemplates(tx, org)).map((t) => t.template);
+            const withUse = identifierTypeChanges(old, type, {
+              identifierTypes: types.value,
+              identifiers: [],
+              records,
+              templates,
+              published: holders,
+            });
+            // Fails closed: a list that can't be made refuses the save.
+            if (!withUse.ok) return withUse;
+            const formatChange = withUse.value.changes.find((c) => c.code === "format_changed");
+            dropped = formatChange?.publishedRecordIds ?? [];
+          }
+          if (dropped.length > 0) {
+            const n = dropped.length;
+            formatSuffix = ` ${n === 1 ? "1 published record" : `${String(n)} published records`} would show as not available on public sites until ${n === 1 ? "its number is" : "their numbers are"} fixed.`;
+          }
+        }
         const needed = compared.value.changes
           .filter((c) => c.needsConfirmation)
-          .map((c) => ({ code: c.code, key: c.type, message: c.message }));
+          .map((c) => ({
+            code: c.code,
+            key: c.type,
+            message: c.code === "format_changed" ? `${c.message}${formatSuffix}` : c.message,
+          }));
         const madePublic = compared.value.changes.some((c) => c.code === "made_public");
         const affected = madePublic ? await publishedHoldingType(tx, org, type.key) : [];
+        // Listed with whichever confirmation is asked first, so the person
+        // sees what the save takes off the public sites before any of it.
+        const droppedIssues = dropped.map((id) =>
+          issue(
+            ["droppedFromPublic", id],
+            "published_record_dropped",
+            "This published record's number doesn't fit the new format; public sites would show it as not available.",
+          ),
+        );
         const gate = await publishedGate(tx, who, checker, affected, confirmPublished.value);
-        if (gate) return gate;
+        if (gate) {
+          return gate.ok || !gate.issues.some((i) => i.code === "publishes_records")
+            ? gate
+            : { ok: false, issues: [...gate.issues, ...droppedIssues] };
+        }
         const notConfirmed = unconfirmed(needed, confirm.value);
-        if (notConfirmed.length > 0) return { ok: false, issues: notConfirmed };
+        if (notConfirmed.length > 0) {
+          return { ok: false, issues: [...notConfirmed, ...droppedIssues] };
+        }
+        // The confirmation is tied to the list: exactly these records,
+        // as read now. A confirmation sent before seeing them, or before a
+        // record was published meanwhile, asks again.
+        const listed = new Set(Array.isArray(confirmDropped) ? confirmDropped : []);
+        if (
+          dropped.length > 0 &&
+          (listed.size !== dropped.length || !dropped.every((id) => listed.has(id)))
+        ) {
+          return {
+            ok: false,
+            issues: [
+              issue(
+                ["confirmDropped"],
+                "drops_published_records",
+                `This change takes ${String(dropped.length)} published record(s) off the public sites. Check them, then confirm them (confirmDropped).`,
+              ),
+              ...droppedIssues,
+            ],
+          };
+        }
         const saved = await updateIdentifierType(tx, type);
         if (!saved.ok) return saved;
         return {
@@ -889,6 +993,7 @@ export function definitionOperations(run: Runner): DefinitionOperations {
             type: saved.value,
             tag: identifierTypeTag(saved.value),
             publishedRecords: Object.freeze([...(affected ?? [])]),
+            droppedFromPublic: Object.freeze([...dropped]),
           }),
         };
       });

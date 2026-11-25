@@ -48,6 +48,11 @@ if "%ERRORLEVEL%"=="3" if not defined RETRIED (
   set "RETRIED=1"
   goto database
 )
+rem 4: another start is still starting or busy; leave its message on screen.
+if "%ERRORLEVEL%"=="4" (
+  pause
+  exit /b 0
+)
 if errorlevel 1 goto failed
 exit /b 0
 

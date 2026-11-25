@@ -47,6 +47,8 @@ import {
   backup,
   BackupError,
   compareMigrations,
+  defaultToolRunner,
+  executable,
   findTools,
   manifestAndTrailer,
   readManifest,
@@ -55,6 +57,7 @@ import {
   toolMajor,
   TRAILER_BYTES,
   WATCHDOG,
+  windowsInstallBins,
   type BackupManifest,
 } from "./backup.js";
 import { contentsOf, tableSummaries } from "./backup-catalog.js";
@@ -2064,4 +2067,104 @@ describe("the restoring role's own privileges and settings", () => {
     expect(refused.code).toBe("bad_file");
     expect(refused.message).toContain("format version is 1, from an earlier version of Oculus");
   }, 60_000);
+});
+
+// S-034b (D-102): Windows has no `sh` or process groups, so there the tools
+// run directly. The same code path runs here with toolRunner "direct".
+describe("tools run directly, as on Windows", () => {
+  it("backs up and restores, checked against the manifest", async () => {
+    const { testDb } = await populated();
+    const dir = await directory();
+    const file = join(dir, "direct.oculus-backup");
+    await backup({
+      connectionString: testDb.url,
+      file,
+      tempDir: await directory(),
+      toolRunner: "direct",
+    });
+    const target = await emptyTarget();
+    const done = await restore({
+      connectionString: target.url,
+      file,
+      tempDir: await directory(),
+      toolRunner: "direct",
+    });
+    expect(done.manifest.tables.length).toBeGreaterThan(0);
+    const source = pool(testDb.url);
+    const copy = pool(target.url);
+    expect(await tableSummaries(copy)).toEqual(await tableSummaries(source));
+  }, 120_000);
+
+  it("mid-backup: ends pg_dump and leaves no file or temporary file", async () => {
+    const { testDb } = await populated();
+    const dir = await directory();
+    const temp = await directory();
+    const pidFile = join(temp, "..", `s034b-dump-pid-${String(process.pid)}`);
+    cleanups.push(() => rm(pidFile, { force: true }));
+    const bin = await wrappedTools(
+      (_tool, real) => `'${real}' "$@" || exit $?\necho $$ > '${pidFile}'\nexec sleep 30`,
+    );
+    const controller = new AbortController();
+    const running = backup({
+      connectionString: testDb.url,
+      file: join(dir, "stopped.oculus-backup"),
+      env: { ...process.env, PG_BIN: bin },
+      tempDir: temp,
+      signal: controller.signal,
+      toolRunner: "direct",
+    });
+    await until(() => existsSync(pidFile));
+    const pid = Number((await readFile(pidFile, "utf8")).trim());
+    expect(alive(pid)).toBe(true);
+    controller.abort();
+    expect((await refusal(running)).code).toBe("interrupted");
+    await until(() => !alive(pid));
+    expect(await readdir(dir)).toEqual([]);
+    expect(await readdir(temp)).toEqual([]);
+  }, 60_000);
+
+  it("mid-restore: ends pg_restore, whose transaction rolls back", async () => {
+    const file = await slowBackup();
+    const target = await emptyTarget();
+    const temp = await directory();
+    const controller = new AbortController();
+    const running = restore({
+      connectionString: target.url,
+      file,
+      tempDir: temp,
+      signal: controller.signal,
+      toolRunner: "direct",
+    });
+    await until(() => restoring(target.testDb.name, "PgSleep"));
+    controller.abort();
+    expect((await refusal(running)).code).toBe("interrupted");
+    await until(async () => !(await restoring(target.testDb.name)));
+    expect(await contentsOf(pool(target.url))).toEqual({});
+    expect(await readdir(temp)).toEqual([]);
+  }, 60_000);
+
+  it("finds the tools where the Windows installer puts them, newest first, by their .exe names", async () => {
+    const programFiles = await directory();
+    for (const major of ["15", "17"]) {
+      const bin = join(programFiles, "PostgreSQL", major, "bin");
+      await mkdir(bin, { recursive: true });
+      await writeFile(join(bin, "pg_dump.exe"), "");
+    }
+    await mkdir(join(programFiles, "PostgreSQL", "data"), { recursive: true });
+    const env = { ProgramFiles: programFiles, PATH: "" };
+    expect(windowsInstallBins(env)).toEqual([
+      join(programFiles, "PostgreSQL", "17", "bin"),
+      join(programFiles, "PostgreSQL", "15", "bin"),
+    ]);
+    expect(await findTools(env, ["pg_dump"], "win32")).toBe(
+      join(programFiles, "PostgreSQL", "17", "bin"),
+    );
+    expect((await refusal(findTools(env, ["pg_dump", "pg_restore"], "win32"))).code).toBe(
+      "no_tools",
+    );
+    expect(executable("pg_dump", "win32")).toBe("pg_dump.exe");
+    expect(executable("pg_dump", "linux")).toBe("pg_dump");
+    expect(defaultToolRunner("win32")).toBe("direct");
+    expect(defaultToolRunner("linux")).toBe("watchdog");
+  });
 });

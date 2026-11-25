@@ -329,6 +329,24 @@ describe("the sign-in rules", () => {
     expect(read.json.version).toBe(2);
   });
 
+  it("a version too big for the service is a malformed If-Match, 400 (S-032)", async () => {
+    for (const tag of ['"v2147483647"', '"v9999999999"']) {
+      const r = await call("PUT", "/api/system-settings", {
+        as: "root",
+        headers: { "if-match": tag },
+        body: { settings: { sessionIdleMinutes: 30, sessionAbsoluteMinutes: 600 } },
+      });
+      expect([tag, r.status, r.json]).toEqual([tag, 400, { error: "bad_if_match" }]);
+    }
+    // The largest version the service takes is still a well-formed tag (a stale one here).
+    const largest = await call("PUT", "/api/system-settings", {
+      as: "root",
+      headers: { "if-match": '"v2147483646"' },
+      body: { settings: { sessionIdleMinutes: 30, sessionAbsoluteMinutes: 600 } },
+    });
+    expect(largest.status).toBe(412);
+  });
+
   it("nothing from the database reaches a reply or the log", () => {
     for (const r of logged) {
       expect(Object.keys(r).every((k) => ["event", "operation", "code", "name"].includes(k))).toBe(

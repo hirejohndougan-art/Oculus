@@ -792,6 +792,17 @@ describe("templates", () => {
     expect([r.status, r.json]).toEqual([403, { error: "not_permitted" }]);
   });
 
+  it("a version too big for the service is a malformed If-Match, 400 (S-032)", async () => {
+    for (const tag of ['"v2147483647"', '"v9999999999"']) {
+      const r = await call("PUT", "/api/templates/t-object", {
+        as: "root",
+        headers: { "if-match": tag },
+        body: { template: { label: "Object", appliesTo: ["object"], fields: OBJECT_FIELDS } },
+      });
+      expect([tag, r.status, r.json]).toEqual([tag, 400, { error: "bad_if_match" }]);
+    }
+  });
+
   it("new (If-None-Match: *), then a new version (If-Match), with conflicts", async () => {
     const made = await call("PUT", "/api/templates/t-made", {
       as: "root",

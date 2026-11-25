@@ -2,13 +2,61 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
-## 2026-11-25 00:10 CT — manual (Chat G) — T-050e Dublin Core mappings in the admin and in setup
+## 2026-11-25 02:45 CT — manual (Chat G) — T-050e Dublin Core mappings in the admin and in setup
 - Result: done
 - What changed: new screen Settings › Templates › Dublin Core (`packages/admin/src/settings/DublinCoreEditor.tsx`, linked from each template) saving through `GET`/`PUT /api/templates/:key/dublin-core` with If-None-Match/If-Match and D-076's confirmation; `npm run setup` stores the starter template's mapping (public fields as their `dcterms` standards, rights included) in its transaction; the record editor says when the template has no mapping that fits it, so no public site shows the record. Unit tests for the screen, the record editor's note and setup; the settings e2e visits the new screen with Alfa's rules.
 - Decisions: none new (D-096 amended)
 - Review: one independent round, nothing blocking. Fixed: the warning missed a mapping naming a field since made staff only; "Saved." could show for another template; the note named only system managers; D-096's "left for later" line. Filed S-039 (a first mapping for over 10,000 published records; saving an empty mapping).
 - Gate: see the merge commit · npm audit clean
 - Next: the job pool (T-034e is the first free job)
+
+## 2026-11-25 03:30 CT — manual (Chat D) — T-034e, T-064, T-065, S-032, S-029
+- Result: done (merged together)
+- What changed: **T-034e** each organization's time zone (migration 0029) and its own calendar day in the publish check and public output, through `organization_local_day`; `GET`/`PUT /api/organization/time-zone`. **T-064** (John, Q-10) site managers see role-less members by name only and grant only to people holding a role on their sites. **T-065** (John, Q-11) inviting needs a recent sign-in. **S-032** a too-large `If-Match` version is 400. **S-029** the deadlock test not reproduced in 270+ rounds under load; notes in the roadmap.
+- Decisions: D-103; D-084 amended (T-064, T-065)
+- Review: T-034e two independent rounds, nothing blocking (canonical zone names, failing closed on an unknown stored zone, who changed it). T-064 two rounds: the first found a manager of every site could grant to (and so reveal) someone holding only an every-site role, fixed with one shared rule and tests, and a read race fixed; the second found nothing blocking.
+- Gate: PASS · tests_passing 4651 (was 4624) · npm audit clean · licences all permissive
+- Next: the next free job on the board
+
+## 2026-11-25 02:40 CT — manual (Chat E) — T-034d Public subject counts
+- Result: done
+- What changed: `publicTermCounts` (packages/db/src/public-terms.ts) counts, for one site, the controlled terms each public record shows in its own public output (one Repeatable Read snapshot; records the output refuses count for nothing), on the server's staff connection; only labels, URIs and counts come out; at most 10,000 records and a time limit. `readPublicRecord`'s work is shared as `publicRecordIn` (stored mappings included). Never from `record_terms`. Follow-up S-038 (a cached public Subjects page).
+- Decisions: D-095
+- Review: two independent rounds. Round 1 (fixed): the first design gave the public reader a function listing every published record (migration 0023, now gone), which would have handed out the IDs of held-back records whose snapshots carry staff values; a records count that included held-back records; vocabulary keys and term hashes in the result; no time limit. Round 2 (fixed): terms told apart by what the public sees; a hard time ceiling; tests for held-back records and stored mappings. Caching left to S-038.
+- Gate: PASS · tests_passing 4624 (was 4618) · npm audit clean
+- Next: S-038 (after T-050d), or the next free job on the board
+
+## 2026-11-25 03:10 CT — manual (Chat C) — S-033 Identifier type edits list the records a new format drops
+- Result: done
+- What changed: `saveIdentifierType` lists the published records a new format takes off public sites and needs `confirmDropped` naming exactly them; `droppedFromPublic` in the reply; `PUT /api/identifier-types/:key` passes `confirmDropped` (409 `drops_published_records`); `readRecordsForChecks` exported from `@oculus/db`.
+- Decisions: D-091 amendment
+- Review: one independent round, nothing blocking; fixed an undercounting message, a confirmation that could skip the list (now tied to the exact IDs), and per-record reads under the type's lock.
+- Gate: PASS (T-050d and S-033 merged together) · tests_passing 4618 (was 4611) · npm audit clean
+- Next: T-050c (OAI-PMH)
+
+## 2026-11-25 02:00 CT — manual (Chat C) — T-050d Public record reads
+- Result: done
+- What changed: `packages/api/src/public-api.ts` (`GET /records/:id` on public hosts, mounted by `buildAdminServer` when public sites are configured); a `public` rate bucket.
+- Decisions: D-100
+- Review: one independent round, nothing blocking; fixed the public pool filling under many slow reads (a cap on reads at once, IPv6 counted by /64), the log line, and D-100's wording; S-037 filed (time limits on the reader pool).
+- Gate: PASS (T-050d and S-033 merged together) · tests_passing 4618 (was 4611) · npm audit clean
+- Next: T-050c (OAI-PMH) or T-050e
+
+## 2026-11-25 01:55 CT — Chat B — T-041c Shares: storage and the service (part of T-041b)
+- Result: done (T-041b continues as T-041d to T-041f)
+- What changed: migration 0024 (`record_shares`), `packages/db/src/shares.ts`, `publishedRecordView` (workflow.ts), `packages/service/src/shares.ts`: offer a published item to another site (any organization's), accept, decline, remove (the second site's manager), withdraw (home), lists, and a read-only view for the second site that is what the public could see, never through the record's own checks.
+- Decisions: D-094
+- Review: three independent rounds (the third found no leak). Fixed: the view copied raw values (links, rights notes, non-public numbers) and showed unpublished items; it then skipped public output's gates (home site, publish check, one snapshot); lock order; withdraw vs delete; moves onto the second site; concurrent offers; locking another organization's shares; trigger gaps; hidden shares filling lists; view errors thrown instead of refused. Left as S-036.
+- Gate: PASS · tests_passing 4611 (was 4591) · npm audit clean
+- Next: T-041d (shares over HTTP), then T-041e.
+
+## 2026-11-25 01:00 CT — manual (Chat D) — S-034a and S-034b Desktop follow-ups, parts one and two
+- Result: done (S-034 stays open for its other items)
+- What changed: S-034a: `exec.cmd` at the root and in packages/db (npm's `exec node …` scripts start under cmd.exe), `npm run desktop:password` (the ordinary reset with the console as the mailbox), launcher exit code 4 for "already starting/busy". S-034b: a `direct` tool runner for pg_dump/pg_restore where there's no `sh` (Windows; the POSIX watchdog unchanged), tools found in `%ProgramFiles%\\PostgreSQL\\<major>\\bin`, and the desktop backs up before every update that changes the database (fails closed; Ctrl+C stops it cleanly).
+- Decisions: D-099, D-102
+- Review: one independent round each. S-034a: busy also exits 4; wording. S-034b: nothing blocking; fail closed when the change list can't be read, signal handling for the pre-update backup, reasons on every failure. Filed: a rare restore hang at a chunk boundary (both runners, pre-existing) and pruning old backups (S-034 items 12, 13).
+- Gate: PASS · tests_passing 4591 (was 4580) · npm audit clean
+- Next: T-034e (Chat D, in review)
 
 ## 2026-11-24 22:45 CT — manual (Chat F) — T-060 Updates from an uploaded package
 - Result: done

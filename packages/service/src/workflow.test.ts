@@ -33,6 +33,7 @@ import {
   insertTemplateVersion,
   migrate,
   openDatabase,
+  publicTermCounts,
   publishCheckIssues,
   readPublicRecord,
   readVersions,
@@ -653,6 +654,97 @@ describe("a number that no longer fits a changed format (S-026, D-091)", () => {
     expect(await stateOf(org, id)).toBe("published");
   }, 60_000);
 
+  it("saving a new format through the service lists the published records it takes off public sites (S-033)", async () => {
+    await ready();
+    const org = await organization();
+    const misfit = ok(
+      await service.createRecord(ctx(org), objectDraft({ number: shown("INV-1") }), {
+        identifiers: numbers("INV-1"),
+      }),
+    ).record.id;
+    ok(await service.publish(ctx(org), misfit, { expectedVersion: 1 }));
+    const fits = ok(
+      await service.createRecord(ctx(org), objectDraft({ number: shown("DPL7") }), {
+        identifiers: numbers("DPL7"),
+      }),
+    ).record.id;
+    ok(await service.publish(ctx(org), fits, { expectedVersion: 1 }));
+    const draftMisfit = ok(
+      await service.createRecord(ctx(org), objectDraft({ number: shown("INV-2") }), {
+        identifiers: numbers("INV-2"),
+      }),
+    ).record.id;
+
+    const root = { ...ctx(org), actor: actorOf(folks?.root ?? ("" as UserId)) };
+    const [current] = ok(await service.listIdentifierTypes(root)).filter(
+      (t) => t.type.key === "object_number",
+    );
+    if (current === undefined) throw new Error("no type");
+    const changed = { ...current.type, pattern: "DPL#{1,9}" };
+    const asked = await service.saveIdentifierType(root, changed, { expectedTag: current.tag });
+    expect(asked.ok).toBe(false);
+    const issues = asked.ok ? [] : asked.issues;
+    const dropped = issues
+      .filter((i) => i.code === "published_record_dropped")
+      .map((i) => i.path[1]);
+    // Only the published record whose number doesn't fit; not the draft, not the one that fits.
+    expect(dropped).toEqual([misfit]);
+    // Then the format change's own confirmation, listing them again.
+    const next = await service.saveIdentifierType(root, changed, {
+      expectedTag: current.tag,
+      confirmPublished: true,
+    });
+    const nextIssues = next.ok ? [] : next.issues;
+    expect(
+      nextIssues.filter((i) => i.code === "published_record_dropped").map((i) => i.path[1]),
+    ).toEqual([misfit]);
+    expect(
+      nextIssues.find((i) => i.code === "needs_confirmation" && i.path[1] === "format_changed")
+        ?.message,
+    ).toMatch(/1 published record would show as not available/);
+    // Still public until confirmed.
+    expect((await publicText(org, misfit)).ok).toBe(true);
+    expect(draftMisfit).not.toBe(misfit);
+
+    const confirm = nextIssues
+      .filter((i) => i.code === "needs_confirmation")
+      .map((i) => ({ code: String(i.path[1]), key: String(i.path[2]) }));
+    // Confirming the changes isn't enough: the records themselves must be confirmed.
+    const unlisted = await service.saveIdentifierType(root, changed, {
+      expectedTag: current.tag,
+      confirm,
+      confirmPublished: true,
+    });
+    expect(codes(unlisted)).toContain("drops_published_records");
+    // A list that no longer matches (another misfit published meanwhile) asks again.
+    const late = ok(
+      await service.createRecord(ctx(org), objectDraft({ number: shown("INV-3") }), {
+        identifiers: numbers("INV-3"),
+      }),
+    ).record.id;
+    ok(await service.publish(ctx(org), late, { expectedVersion: 1 }));
+    const stale = await service.saveIdentifierType(root, changed, {
+      expectedTag: current.tag,
+      confirm,
+      confirmPublished: true,
+      confirmDropped: [misfit],
+    });
+    expect(codes(stale)).toContain("drops_published_records");
+    expect((await publicText(org, misfit)).ok).toBe(true);
+    const both = [misfit, late].sort();
+    const saved = ok(
+      await service.saveIdentifierType(root, changed, {
+        expectedTag: current.tag,
+        confirm,
+        confirmPublished: true,
+        confirmDropped: both,
+      }),
+    );
+    expect([...(saved.droppedFromPublic ?? [])].sort()).toEqual(both);
+    expect((await publicText(org, misfit)).ok).toBe(false);
+    expect((await publicText(org, fits)).ok).toBe(true);
+  }, 60_000);
+
   it("a record that only inherits a misfit number stays public, without it", async () => {
     await ready();
     const org = await organization();
@@ -753,6 +845,306 @@ describe("a number that no longer fits a changed format (S-026, D-091)", () => {
     );
     expect((await publicText(org, made.record.id)).ok).toBe(true);
   }, 60_000);
+});
+
+describe("public subject counts come from public output only (T-034d, D-095)", () => {
+  const LIGHT = "http://id.loc.gov/authorities/subjects/sh85077022";
+  const term = (label: string, uri?: string) =>
+    uri === undefined ? { label } : { label, uri, vocabulary: "lcsh" };
+  const subjectFields = [
+    field("rights", "rights"),
+    field("subject", "controlled_term", { repeatable: true }),
+    field("hidden", "controlled_term", { visibility: "staff" }),
+    field("number", "identifier"),
+  ];
+  const unitFields = [
+    field("rights", "rights"),
+    field("subject", "controlled_term", { repeatable: true, inherited: true }),
+  ];
+  const mappings = (org: OrganizationId, templates = ["pub-subj", "pub-subj-unit"]) =>
+    templates.map((template) => ({
+      organizationId: org,
+      template,
+      entries: [
+        { field: "rights", term: "rights" },
+        { field: "subject", term: "subject" },
+      ],
+    }));
+
+  async function world() {
+    await ready();
+    const org = await organization();
+    for (const [key, kind, fields] of [
+      ["pub-subj", "object", subjectFields],
+      ["pub-subj-unit", "archival_unit", unitFields],
+    ] as const) {
+      ok(
+        await insertTemplateVersion(s.owner, {
+          key,
+          organizationId: org,
+          label: key,
+          appliesTo: [kind],
+          fields,
+        }),
+      );
+    }
+    const item = (title: string, fields: Record<string, unknown>) =>
+      create(org, {
+        kind: "object",
+        title,
+        templateKey: "pub-subj",
+        fields: { rights: { uri: INC }, ...fields },
+      });
+    const a = await item("An invented lantern", {
+      subject: [term("Lighthouses", LIGHT), term("Fishing")],
+      hidden: term("Secret staff term"),
+    });
+    const b = await item("An invented net", {
+      // The same heading under another label: one term (its URI), counted once.
+      subject: [term("Lighthouses—Texas", LIGHT), term("Fishing")],
+    });
+    const draft = await item("An invented draft", {
+      subject: [term("Fishing"), term("Unpublished term")],
+    });
+    const gone = await item("An invented withdrawn thing", { subject: [term("Withdrawn term")] });
+    const fonds = (
+      await create(org, {
+        kind: "archival_unit",
+        level: "fonds",
+        title: "An invented fonds",
+        templateKey: "pub-subj-unit",
+        fields: { rights: { uri: INC }, subject: [term("Shipwrecks")] },
+      })
+    ).record;
+    const series = (
+      await create(org, {
+        kind: "archival_unit",
+        level: "series",
+        parentId: fonds.id,
+        title: "An invented series",
+        templateKey: "pub-subj-unit",
+        fields: { rights: { uri: INC } },
+      })
+    ).record;
+    for (const r of [a.record, b.record, gone.record, fonds, series]) {
+      ok(await service.publish(ctx(org), r.id, { expectedVersion: 1 }));
+    }
+    ok(await service.withdraw(ctx(org), gone.record.id, { expectedVersion: 2 }));
+    return { org, draft };
+  }
+
+  const counted = (r: Awaited<ReturnType<typeof publicTermCounts>>) =>
+    ok(r).counts.map((c) => [c.label, c.records, c.uri ?? null]);
+
+  it("counts each term once per public record that shows it, inherited values included", async () => {
+    const { org } = await world();
+    const result = await publicTermCounts(s.writer, org, siteFor(org), {
+      baseUrl: BASE,
+      mappings: mappings(org),
+    });
+    expect(counted(result)).toEqual([
+      ["Fishing", 2, null],
+      ["Lighthouses", 2, LIGHT],
+      ["Shipwrecks", 2, null],
+    ]);
+    expect(ok(result).recordsCounted).toBe(4);
+    const text = JSON.stringify(result);
+    for (const hidden of ["Secret staff term", "Unpublished term", "Withdrawn term"]) {
+      expect(text).not.toContain(hidden);
+    }
+    // Only what the public output shows: no vocabulary key, term key or ID.
+    expect(Object.keys(ok(result).counts[1] ?? {}).sort()).toEqual(["label", "records", "uri"]);
+    expect(text).not.toContain("lcsh");
+    expect(Object.isFrozen(ok(result).counts)).toBe(true);
+  }, 60_000);
+
+  it("counts only the fields asked for, and only fields the mapping shows", async () => {
+    const { org } = await world();
+    const only = (fields: string[]) =>
+      publicTermCounts(s.writer, org, siteFor(org), {
+        baseUrl: BASE,
+        mappings: mappings(org),
+        fields,
+      });
+    expect(counted(await only(["subject"]))).toHaveLength(3);
+    expect(counted(await only(["hidden"]))).toEqual([]);
+    // A template with no mapping given: its records' output is refused, so they count for nothing.
+    const noUnits = await publicTermCounts(s.writer, org, siteFor(org), {
+      baseUrl: BASE,
+      mappings: mappings(org, ["pub-subj"]),
+    });
+    expect(counted(noUnits)).toEqual([
+      ["Fishing", 2, null],
+      ["Lighthouses", 2, LIGHT],
+    ]);
+    // Records whose output is refused aren't counted, so their number never shows.
+    expect(ok(noUnits).recordsCounted).toBe(2);
+  }, 60_000);
+
+  it("another organization's site, or a site of none, counts nothing", async () => {
+    const { org } = await world();
+    const other = await organization();
+    const empty = await publicTermCounts(s.writer, other, siteFor(org), {
+      baseUrl: BASE,
+      mappings: mappings(other),
+    });
+    expect(ok(empty)).toEqual({ counts: [], recordsCounted: 0 });
+    const bad = await publicTermCounts(s.writer, org, "not-a-site" as SiteId, {
+      baseUrl: BASE,
+      mappings: mappings(org),
+    });
+    expect(codes(bad)).toEqual(["not_available"]);
+    expect(
+      codes(
+        await publicTermCounts(s.writer, org, siteFor(org), {
+          baseUrl: BASE,
+          mappings: mappings(org),
+          extra: true,
+        } as never),
+      ),
+    ).toEqual(["invalid_options"]);
+    expect(
+      codes(
+        await publicTermCounts(s.writer, org, siteFor(org), {
+          baseUrl: BASE,
+          mappings: mappings(org),
+          fields: ["Not A Key"],
+        }),
+      ),
+    ).toEqual(["invalid_fields"]);
+  }, 60_000);
+
+  it("a record the public output holds back counts for nothing; vocabularies aren't told apart", async () => {
+    const { org } = await world();
+    const held = ok(
+      await service.createRecord(
+        ctx(org),
+        {
+          kind: "object",
+          title: "An invented held-back thing",
+          templateKey: "pub-subj",
+          fields: {
+            rights: { uri: INC },
+            subject: [term("Held back term"), { label: "Fishing", vocabulary: "gnis" }],
+            number: { type: "object_number", value: "INV-9" },
+          },
+        },
+        {
+          identifiers: {
+            current: [{ type: "object_number", value: "INV-9", primary: true }],
+            former: [],
+          },
+        },
+      ),
+    );
+    ok(await service.publish(ctx(org), held.record.id, { expectedVersion: 1 }));
+    const count = () =>
+      publicTermCounts(s.writer, org, siteFor(org), { baseUrl: BASE, mappings: mappings(org) });
+    const before = ok(await count());
+    expect(before.recordsCounted).toBe(5);
+    // "Fishing" under another vocabulary is the same term to the public: one row.
+    expect(before.counts.filter((c) => c.label === "Fishing")).toEqual([
+      { label: "Fishing", records: 3 },
+    ]);
+    expect(JSON.stringify(before)).toContain("Held back term");
+    // A new format the number doesn't fit holds the record back (D-091).
+    ok(
+      await s.owner.transaction((q) =>
+        updateIdentifierType(q, {
+          organizationId: org,
+          key: "object_number",
+          label: "Object number",
+          uniqueness: "all_time",
+          public: true,
+          pattern: "DPL#{1,9}",
+        }),
+      ),
+    );
+    const after = ok(await count());
+    expect(after.recordsCounted).toBe(4);
+    expect(JSON.stringify(after)).not.toContain("Held back term");
+    expect(after.counts.find((c) => c.label === "Fishing")?.records).toBe(2);
+  }, 60_000);
+
+  it("without mappings, counts with each template's stored mapping (T-050b)", async () => {
+    const { org } = await world();
+    const count = () =>
+      publicTermCounts(s.writer, org, siteFor(org), { baseUrl: BASE, fields: ["subject"] });
+    // Nothing stored yet: no record's output is made, so nothing counts.
+    expect(ok(await count())).toEqual({ counts: [], recordsCounted: 0 });
+    const root = { ...ctx(org), actor: actorOf(folks?.root ?? ("" as UserId)) };
+    const [objects] = mappings(org, ["pub-subj"]);
+    ok(
+      await service.saveDublinCoreMapping(root, "pub-subj", objects, {
+        expectedVersion: 0,
+        confirmPublished: true,
+      }),
+    );
+    const stored = ok(await count());
+    expect(stored.recordsCounted).toBe(2);
+    expect(stored.counts.map((c) => [c.label, c.records])).toEqual([
+      ["Fishing", 2],
+      ["Lighthouses", 2],
+    ]);
+  }, 60_000);
+
+  it("needs the staff connection, and stops when it takes too long", async () => {
+    const { org } = await world();
+    // The public reader reads no table, so it can't list a site's records at all.
+    await expect(
+      publicTermCounts(s.reader, org, siteFor(org), { baseUrl: BASE, mappings: mappings(org) }),
+    ).rejects.toThrow();
+    expect(await checkPublicReaderConnection(s.reader)).toEqual([]);
+    const slow = await publicTermCounts(s.writer, org, siteFor(org), {
+      baseUrl: BASE,
+      mappings: mappings(org),
+      timeLimitMs: 1,
+    });
+    expect(codes(slow)).toEqual(["too_slow"]);
+    expect(
+      codes(
+        await publicTermCounts(s.writer, org, siteFor(org), {
+          baseUrl: BASE,
+          mappings: mappings(org),
+          timeLimitMs: 0,
+        }),
+      ),
+    ).toEqual(["invalid_time_limit"]);
+  }, 60_000);
+});
+
+describe("an organization whose stored time zone stops being known (T-034e, D-103)", () => {
+  it("refuses publishing and public output rather than guess the day", async () => {
+    await ready();
+    const org = await organization();
+    const { record } = await create(org, objectDraft());
+    ok(await service.publish(ctx(org), record.id, { expectedVersion: 1 }));
+    expect((await publicText(org, record.id)).ok).toBe(true);
+
+    // As if the operating system's time zone data dropped the stored zone.
+    await s.owner.transaction(async (q) => {
+      await q.execute(
+        sql`ALTER TABLE public.organizations DISABLE TRIGGER organizations_check_time_zone`,
+      );
+      await q.execute(
+        sql`UPDATE public.organizations SET time_zone = 'Africa/Atlantis' WHERE id = ${org}::uuid`,
+      );
+      await q.execute(
+        sql`ALTER TABLE public.organizations ENABLE ALWAYS TRIGGER organizations_check_time_zone`,
+      );
+    });
+
+    const found = await s.owner.transaction((q) => publishCheckIssues(q, org, record.id));
+    expect(found.map((i) => i.code)).toEqual(["unreadable_accessions"]);
+    const out = await publicText(org, record.id);
+    expect(out.ok).toBe(false);
+
+    await s.owner.execute(
+      sql`UPDATE public.organizations SET time_zone = 'America/Port-au-Prince' WHERE id = ${org}::uuid`,
+    );
+    expect(await s.owner.transaction((q) => publishCheckIssues(q, org, record.id))).toEqual([]);
+    expect((await publicText(org, record.id)).ok).toBe(true);
+  });
 });
 
 describe("the publish permission hook (T-041 plugs records.publish in here)", () => {
