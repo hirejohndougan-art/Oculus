@@ -6,7 +6,7 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Result: done
 - What changed: new screen Settings › Templates › Dublin Core (`packages/admin/src/settings/DublinCoreEditor.tsx`, linked from each template) saving through `GET`/`PUT /api/templates/:key/dublin-core` with If-None-Match/If-Match and D-076's confirmation; `npm run setup` stores the starter template's mapping (public fields as their `dcterms` standards, rights included) in its transaction; the record editor says when the template has no mapping that fits it, so no public site shows the record. Unit tests for the screen, the record editor's note and setup; the settings e2e visits the new screen with Alfa's rules.
 - Decisions: none new (D-096 amended)
-- Review: one independent round, nothing blocking. Fixed: the warning missed a mapping naming a field since made staff only; "Saved." could show for another template; the note named only system managers; D-096's "left for later" line. Filed S-037 (a first mapping for over 10,000 published records; saving an empty mapping).
+- Review: one independent round, nothing blocking. Fixed: the warning missed a mapping naming a field since made staff only; "Saved." could show for another template; the note named only system managers; D-096's "left for later" line. Filed S-039 (a first mapping for over 10,000 published records; saving an empty mapping).
 - Gate: see the merge commit · npm audit clean
 - Next: the job pool (T-034e is the first free job)
 
