@@ -396,10 +396,10 @@ function declaredLength(header: string | undefined): number | undefined {
 function addRoute(
   app: FastifyInstance,
   route: OculusRoute,
-  uploadHandlerMs: number,
   downloadMs: number,
   downloads: Set<{ stop: () => void }>,
   downloadsClosed: { value: boolean },
+  uploadHandlerMs: number,
 ): void {
   const credentials = route.credentials === true;
   const handler = route.handler;
@@ -826,9 +826,9 @@ export async function buildServer(options: ServerOptions = {}): Promise<FastifyI
     done();
   });
   const health = checkRoute({ method: "GET", path: "/health", handler: () => ({ status: "ok" }) });
-  addRoute(app, health, uploadTimeouts.request, timeouts.download, downloads, downloadsClosed);
+  addRoute(app, health, timeouts.download, downloads, downloadsClosed, uploadTimeouts.request);
   for (const route of appRoutes) {
-    addRoute(app, route, uploadTimeouts.request, timeouts.download, downloads, downloadsClosed);
+    addRoute(app, route, timeouts.download, downloads, downloadsClosed, uploadTimeouts.request);
   }
 
   await app.ready();

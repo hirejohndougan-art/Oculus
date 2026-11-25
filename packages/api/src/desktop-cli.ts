@@ -219,7 +219,6 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
   };
 
   let folder: string;
-  let filesDir: string;
   let url: string;
   let ownerUrl: string | undefined;
   let ownerFromSettings: boolean;
@@ -227,12 +226,6 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
   try {
     folder = settingsFolder(platform, env, options.home ?? homedir());
     ensureSettingsFolder(folder);
-    // Uploaded files (M-002, D-086): OCULUS_FILES_DIR, else a folder of
-    // their own beside the settings, made for this user alone.
-    const givenFiles = env.OCULUS_FILES_DIR;
-    filesDir =
-      givenFiles !== undefined && givenFiles.trim() !== "" ? givenFiles : join(folder, "files");
-    if (filesDir === join(folder, "files")) mkdirSync(filesDir, { recursive: true, mode: 0o700 });
     const settings = readDesktopSettings(folder);
     url = chooseDatabaseUrl(env, settings, folder);
     // The owner's address goes with the settings' writer address only: an
@@ -428,13 +421,17 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
 
     const port = await choosePort(wantedPort);
     const origin = `http://127.0.0.1:${String(port)}`;
+    // Uploaded files (M-002, D-086): OCULUS_FILES_DIR if set, else a folder
+    // of their own in the settings folder, readable by the person only.
+    const filesDir = env.OCULUS_FILES_DIR ?? join(folder, "files");
+    if (env.OCULUS_FILES_DIR === undefined) mkdirSync(filesDir, { recursive: true, mode: 0o700 });
     const serverEnv: Record<string, string | undefined> = {
       ...env,
+      OCULUS_FILES_DIR: filesDir,
       NODE_ENV: "development",
       [ORIGINS_ENV]: origin,
       [ADMIN_ORIGIN_ENV]: origin,
       [SECRET_KEY_VARIABLE]: key,
-      OCULUS_FILES_DIR: filesDir,
       OCULUS_TRUSTED_PROXY: undefined,
       OCULUS_CLIENT_ADDRESS: undefined,
     };

@@ -157,7 +157,7 @@ export async function runSetupCli(
     );
     out(`- A starter template, "Item", that you can change later.`);
     out(
-      "Next: on this computer, `npm run build` then `npm run desktop` (with the same OCULUS_DATABASE_URL, or the database in desktop.json) opens Oculus in its own window; on a server, start the admin as packages/admin/README.md describes (`npm run build`, then `npm run admin` with OCULUS_DATABASE_URL, OCULUS_ORIGINS, OCULUS_ADMIN_ORIGIN, OCULUS_SECRET_KEY and OCULUS_FILES_DIR set). Then sign in. At your first sign-in you set up two-step sign-in with an authenticator app.",
+      "Next: on this computer, `npm run build` then `npm run desktop` (with the same OCULUS_DATABASE_URL, or the database in desktop.json) opens Oculus in its own window; on a server, start the admin as packages/admin/README.md describes (it also needs OCULUS_FILES_DIR, a folder of its own for uploaded files). Then sign in. At your first sign-in you set up two-step sign-in with an authenticator app.",
     );
     return 0;
   } catch (error) {
