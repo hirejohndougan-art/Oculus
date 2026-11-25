@@ -13,8 +13,10 @@
  *     (SIGSTOP, so it grows no further while its peak is read) and kills
  *     it (SIGKILL) past the same trigger.
  *   The trigger is `KILL_HEADROOM_BYTES` below `DECODE_MEMORY_CAP_BYTES`,
- *   so the peak stays within the cap. A kill is answered `killed`, after
- *   one more try in a fresh process (a kill could come of timing).
+ *   so the peak stays within the cap. A kill either guard confirmed is
+ *   answered `killed`, after one more try in a fresh process; one nothing
+ *   confirmed (the system's out-of-memory killer) is `lost`. A process
+ *   that can't start is `failed`, and the next job still runs.
  * - **The file, not its bytes.** The process is handed the stored copy's
  *   descriptor and reads the file itself (nothing is copied over IPC); the
  *   server reads only its header (`precheckThumbnail`).
@@ -67,6 +69,8 @@ export interface ThumbnailRendererOptions {
    * without planning, to show the cap holding what a plan would miss.
    */
   readonly check?: DecodeCheck;
+  /** Tests only: what starts a decoder process (default `spawnDecoder`), to make it fail. */
+  readonly spawn?: typeof spawnDecoder;
 }
 
 export type RenderResult =
@@ -80,12 +84,15 @@ export type RenderResult =
       readonly ok: false;
       /**
        * `refused`: the decoder refused the image, and `killed`: the decode
-       * passed the memory cap twice (both the same every time, so they may
-       * be remembered); `failed`: the process crashed or couldn't start, or
-       * an allocation failed (says nothing about the image: never
-       * remembered); `timeout`: too slow; `busy`: the queue is full.
+       * passed the memory cap twice, as its watchdog or the parent saw it
+       * (both the same every time, so they may be remembered); `lost`: the
+       * process was killed by something else (the system's out-of-memory
+       * killer, say), so remembered only for a while, like `timeout`, too
+       * slow; `failed`: the process crashed or couldn't start, or an
+       * allocation failed (says nothing about the image: never
+       * remembered); `busy`: the queue is full.
        */
-      readonly code: "refused" | "killed" | "failed" | "busy" | "timeout";
+      readonly code: "refused" | "killed" | "lost" | "failed" | "busy" | "timeout";
       readonly peakBytes?: number;
     };
 
@@ -126,7 +133,7 @@ function temporaryFile(bytes: Uint8Array): { fd: number; remove: () => void } {
 }
 
 interface Pending {
-  readonly job: Omit<ThumbnailJob, "check">;
+  readonly job: Omit<ThumbnailJob, "check" | "timeoutMs">;
   readonly source: ThumbnailSource;
   readonly done: (result: RenderResult) => void;
 }
@@ -151,7 +158,13 @@ export function createThumbnailRenderer(options: ThumbnailRendererOptions = {}):
     fd: number,
   ): { readonly result: Promise<RenderResult>; readonly stop: () => void } {
     started++;
-    const child: ChildProcess = spawnDecoder({ fd, killAt, heapMiB });
+    let child: ChildProcess;
+    try {
+      child = (options.spawn ?? spawnDecoder)({ fd, killAt, heapMiB });
+    } catch {
+      // No process at all (ENOMEM under strict overcommit, say): says nothing about the image.
+      return { result: Promise.resolve({ ok: false, code: "failed" }), stop: () => undefined };
+    }
     const pid = child.pid ?? -1;
     const parentWatches = options.parentWatch ?? procMemory("self") !== undefined;
     let baseline: number | undefined;
@@ -163,20 +176,31 @@ export function createThumbnailRenderer(options: ThumbnailRendererOptions = {}):
       answer = resolve;
     });
     let answered = false;
-    // Descriptor 5 (the typed tuple stops at 4).
-    const pipe = (child.stdio as readonly unknown[])[DECODER_MARKER_FD] as
-      Readable | null | undefined;
+    // Descriptor 5 (the typed tuple stops at 4); none at all when the spawn
+    // failed (EMFILE, ENFILE), which its 'error' event then reports.
+    const stdio = child.stdio as readonly unknown[] | undefined | null;
+    const pipe = stdio?.[DECODER_MARKER_FD] as Readable | null | undefined;
     const end = (value: RenderResult): void => {
       if (answered) return;
       answered = true;
       clearTimeout(timer);
       clearInterval(sampler);
       child.removeAllListeners();
+      // Anything it reports from now on is ignored, never an unhandled error.
+      child.on("error", () => undefined);
       pipe?.removeAllListeners();
       pipe?.on("error", () => undefined);
-      child.kill("SIGKILL");
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Never started, or already gone.
+      }
       answer(value);
     };
+    // Listened for first: a spawn that failed reports it here, never as an unhandled error.
+    child.on("error", () => {
+      end({ ok: false, code: "failed" });
+    });
     const growth = (): { now: number; peak: number } | undefined => {
       if (baseline === undefined) return undefined;
       const memory = procMemory(pid);
@@ -212,8 +236,9 @@ export function createThumbnailRenderer(options: ThumbnailRendererOptions = {}):
             end({ ok: false, code: "killed", peakBytes: last.peak });
           }, sampleMs);
         }
+        const full: ThumbnailJob = { ...job, timeoutMs };
         const sent: ThumbnailJob =
-          options.check === undefined ? job : { ...job, check: options.check };
+          options.check === undefined ? full : { ...full, check: options.check };
         child.send(sent, (error) => {
           if (error !== null) end({ ok: false, code: "failed" });
         });
@@ -232,16 +257,17 @@ export function createThumbnailRenderer(options: ThumbnailRendererOptions = {}):
     child.on("close", (code, signal) => {
       const report = /^killed (\d+)/.exec(marker);
       if (report !== null) {
+        // The cap, confirmed by the watchdog's own report.
         end({ ok: false, code: "killed", peakBytes: Number(report[1]) });
+      } else if (marker.startsWith("timeout")) {
+        end({ ok: false, code: "timeout" });
       } else if (signal === "SIGKILL" || code === KILLED_EXIT_CODE) {
-        // The system's out-of-memory killer, or a watchdog that couldn't report.
-        end({ ok: false, code: "killed" });
+        // Killed with no report (the system's out-of-memory killer, say):
+        // not a confirmed cap, so remembered only for a while (review 2).
+        end({ ok: false, code: "lost" });
       } else {
         end({ ok: false, code: "failed" });
       }
-    });
-    child.on("error", () => {
-      end({ ok: false, code: "failed" });
     });
     // Starting doesn't count against the job's time limit (review), but has a limit of its own.
     timer = setTimeout(() => {
@@ -257,11 +283,12 @@ export function createThumbnailRenderer(options: ThumbnailRendererOptions = {}):
 
   async function run(pending: Pending): Promise<RenderResult> {
     const { source } = pending;
-    const temporary = source instanceof Uint8Array ? temporaryFile(source) : undefined;
-    const fd = temporary?.fd ?? (source instanceof Uint8Array ? -1 : source.fd);
+    let temporary: { fd: number; remove: () => void } | undefined;
     try {
+      temporary = source instanceof Uint8Array ? temporaryFile(source) : undefined;
+      const fd = temporary?.fd ?? (source instanceof Uint8Array ? -1 : source.fd);
       let result: RenderResult = { ok: false, code: "busy" };
-      // A kill is tried once more in a fresh process before it counts (review).
+      // A confirmed kill is tried once more in a fresh process before it counts (review).
       for (let tries = 0; tries < 2 && !closed; tries++) {
         const current = attempt(pending.job, fd);
         running = current;
@@ -271,6 +298,7 @@ export function createThumbnailRenderer(options: ThumbnailRendererOptions = {}):
       }
       return closed ? { ok: false, code: "busy" } : result;
     } finally {
+      running = undefined;
       temporary?.remove();
     }
   }
@@ -281,11 +309,15 @@ export function createThumbnailRenderer(options: ThumbnailRendererOptions = {}):
     const pending = queue.shift();
     if (pending === undefined) return;
     working = true;
-    void run(pending).then((result) => {
-      working = false;
-      pending.done(result);
-      next();
-    });
+    // Whatever happens (a temporary file that can't be written, say), the
+    // job is answered and the next one runs (review 2, B1).
+    void run(pending)
+      .catch((): RenderResult => ({ ok: false, code: "failed" }))
+      .then((result) => {
+        working = false;
+        pending.done(result);
+        next();
+      });
   }
 
   return Object.freeze({

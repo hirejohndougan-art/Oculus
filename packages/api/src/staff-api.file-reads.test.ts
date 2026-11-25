@@ -809,6 +809,82 @@ describe("review fixes: timeouts, budgets, HEAD, failures and downloads", () => 
     await capped.close();
   }, 120_000);
 
+  it("remembers an unconfirmed kill only for a while, like a timeout (review 2)", async () => {
+    const lost: ThumbnailRenderer = {
+      render: () => Promise.resolve({ ok: false, code: "lost" }),
+      processesStarted: () => 0,
+      close: () => Promise.resolve(),
+    };
+    const to = await serveAlso({ thumbnails: lost, thumbnailLimits: { perMinute: 1000 } });
+    const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented lost photograph"));
+    const body = makeJpeg(44, 28);
+    const id = await add(asset, body, "lost.jpg");
+    expect((await send(fileUrl(asset, id, "thumbnail"), { as: "cataloger", to })).status).toBe(422);
+    expect(existsSync(thumbPath(body, "timeout"))).toBe(true);
+    expect(existsSync(thumbPath(body, "none"))).toBe(false);
+  });
+
+  it("frees its slot and closes the copy when the renderer throws (review 2, B1)", async () => {
+    let calls = 0;
+    const throwing: ThumbnailRenderer = {
+      render: () => {
+        calls++;
+        return Promise.reject(new Error("invented failure"));
+      },
+      processesStarted: () => 0,
+      close: () => Promise.resolve(),
+    };
+    const to = await serveAlso({
+      thumbnails: throwing,
+      thumbnailLimits: { perMinute: 1000, atOnce: 1 },
+    });
+    const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented throwing photograph"));
+    const id = await add(asset, makeJpeg(45, 27), "throwing.jpg");
+    // Again and again: a 500 each time, never a stuck slot's 503.
+    for (let k = 0; k < 3; k++) {
+      expect((await send(fileUrl(asset, id, "thumbnail"), { as: "cataloger", to })).status).toBe(
+        500,
+      );
+    }
+    expect(calls).toBe(3);
+  });
+
+  it("takes the organizations in turn: one waits after three in a row while another was turned away (review 2)", async () => {
+    // A slow renderer that makes nothing (so nothing is cached and the same files can be asked for again).
+    const slow: ThumbnailRenderer = {
+      render: () =>
+        new Promise((resolve) =>
+          setTimeout(() => {
+            resolve({ ok: false, code: "failed" });
+          }, 300),
+        ),
+      processesStarted: () => 0,
+      close: () => Promise.resolve(),
+    };
+    const to = await serveAlso({
+      thumbnails: slow,
+      thumbnailLimits: { perMinute: 1000, atOnce: 1 },
+    });
+    const ours = await makeAs(w, w.a, w.a1, assetDraft("An invented turn-taking photograph"));
+    const theirs = await makeAs(w, w.b, w.b1, assetDraft("An invented waiting photograph"));
+    const a = await add(ours, makeJpeg(46, 26), "ours.jpg");
+    const b = await add(theirs, makeJpeg(47, 25), "theirs.jpg", "stranger");
+    const askA = () => send(fileUrl(ours, a, "thumbnail"), { as: "cataloger", to });
+    const askB = () => send(fileUrl(theirs, b, "thumbnail"), { as: "stranger", to });
+    // A's first is being made; B is turned away for want of the one slot.
+    const first = askA();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect((await askB()).status).toBe(503);
+    expect((await first).status).toBe(500);
+    // A's second and third; then A has had three in a row while B waits.
+    expect((await askA()).status).toBe(500);
+    expect((await askA()).status).toBe(500);
+    expect((await askA()).status).toBe(503);
+    // B's turn, then A again.
+    expect((await askB()).status).toBe(500);
+    expect((await askA()).status).toBe(500);
+  });
+
   it("can still be turned off: 422 for every file, HEAD too, nothing made, cached or decoded", async () => {
     let calls = 0;
     const spy: ThumbnailRenderer = {

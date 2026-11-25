@@ -178,6 +178,14 @@ export const THUMBNAILS_AT_ONCE = 2;
 /** Thumbnails an organization may have made (not from the cache) per minute. */
 export const THUMBNAILS_PER_MINUTE = 6;
 
+/**
+ * Thumbnails one organization may have made in a row while another was
+ * turned away for want of a slot (review 2 of T-072: round the
+ * organizations), and how long such a turning away counts.
+ */
+export const THUMBNAILS_IN_A_ROW = 3;
+const WAITING_MS = 30_000;
+
 export interface ThumbnailOptions {
   /** Only from the cache (HEAD): `not_cached` when nothing is cached. */
   readonly cacheOnly?: boolean;
@@ -360,7 +368,11 @@ export function fileOperations(
   store: FileStore | undefined,
   clock: () => Date,
   thumbnails?: ThumbnailRenderer,
-  thumbnailLimits: { readonly atOnce?: number; readonly perMinute?: number } = {},
+  thumbnailLimits: {
+    readonly atOnce?: number;
+    readonly perMinute?: number;
+    readonly inARow?: number;
+  } = {},
   thumbnailsEnabled: boolean = THUMBNAILS_ENABLED,
 ): FileOperations {
   const atOnce = thumbnailLimits.atOnce ?? THUMBNAILS_AT_ONCE;
@@ -371,6 +383,11 @@ export function fileOperations(
   /** Thumbnails being made now (all organizations), and the organizations making one. */
   let makingNow = 0;
   const makingFor = new Set<string>();
+  /** Organizations turned away for want of a slot, and when; the one served last, and how often. */
+  const waiting = new Map<string, number>();
+  let streakFor: string | undefined;
+  let streak = 0;
+  const inARow = thumbnailLimits.inARow ?? THUMBNAILS_IN_A_ROW;
   /** Each organization's thumbnails made in the current minute (a fixed window). */
   const budgets = new Map<string, { minute: number; used: number }>();
   const takeBudget = (organizationId: string): boolean => {
@@ -901,8 +918,26 @@ export function fileOperations(
       // A slot and the organization's budget before a byte is read (review
       // B3 and item 1): a few at once, a few a minute, then 503 busy.
       // One at a time per organization, so one can't fill every slot (review).
-      if (makingNow >= atOnce || makingFor.has(organizationId) || !takeBudget(organizationId)) {
+      // And round the organizations (review 2): one that has had
+      // THUMBNAILS_IN_A_ROW in a row waits while another was turned away
+      // for want of a slot in the last WAITING_MS.
+      const now = clock().getTime();
+      for (const [org, at] of waiting) if (now - at > WAITING_MS) waiting.delete(org);
+      const othersWaiting = [...waiting.keys()].some((org) => org !== organizationId);
+      const ownTurnUsed = streakFor === organizationId && streak >= inARow && othersWaiting;
+      if (makingFor.has(organizationId)) return busy();
+      if (makingNow >= atOnce || ownTurnUsed) {
+        if (waiting.size > 10_000) waiting.clear();
+        waiting.set(organizationId, now);
         return busy();
+      }
+      if (!takeBudget(organizationId)) return busy();
+      waiting.delete(organizationId);
+      if (streakFor === organizationId) {
+        streak++;
+      } else {
+        streakFor = organizationId;
+        streak = 1;
       }
       makingNow++;
       makingFor.add(organizationId);
@@ -936,7 +971,10 @@ export function fileOperations(
         let result: Awaited<ReturnType<ThumbnailRenderer["render"]>>;
         try {
           result = await renderer.render(file.mediaType, { fd }, box);
+        } catch {
+          result = { ok: false, code: "failed" };
         } finally {
+          // Closed whatever happened (review 2, B1).
           closeSync(fd);
         }
         if (result.ok) {
@@ -954,19 +992,26 @@ export function fileOperations(
             await remember("none");
             return noThumbnail();
           case "timeout":
+          case "lost":
             // Remembered for a while (THUMBNAIL_RETRY_MS), so it can't keep
-            // the worker busy by being asked for again and again.
+            // the decoder busy by being asked for again and again; a kill
+            // nothing confirmed as the memory cap is treated so too (review 2).
             await remember("timeout");
             return noThumbnail();
           default:
             // Out of memory or a crash: says nothing about the file.
             return refusal(["files"], "internal_error", "The thumbnail couldn't be made.");
         }
-      })();
+      })().catch(
+        // Anything thrown on the way (the cache, the copy): a plain 500, never a stuck slot.
+        (): ServiceResult<{ readonly jpeg: Uint8Array }> =>
+          refusal(["files"], "internal_error", "The thumbnail couldn't be made."),
+      );
       making.set(key, made);
       try {
         return await made;
       } finally {
+        // Released whatever happened (review 2, B1).
         making.delete(key);
         makingNow--;
         makingFor.delete(organizationId);

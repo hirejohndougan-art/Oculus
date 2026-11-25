@@ -4,6 +4,7 @@
 // copy (kept when it is the same, replaced when damaged or a link), and the
 // refusals when opening (and opening a copy for the thumbnail decoder,
 // T-072). Every byte is invented.
+import { spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
@@ -455,6 +456,14 @@ describe("the second review's changes", () => {
     mkdirSync(dirname(own.pathFor(org, linked)), { recursive: true });
     symlinkSync(target, own.pathFor(org, linked));
     expect(await own.openContentDescriptor(org, linked, body.length)).toBeUndefined();
+    // A FIFO where a copy should be: refused at once, never waited on (review 2).
+    const piped = "c".repeat(64);
+    mkdirSync(dirname(own.pathFor(org, piped)), { recursive: true });
+    if (spawnSync("mkfifo", [own.pathFor(org, piped)]).status === 0) {
+      const at = Date.now();
+      expect(await own.openContentDescriptor(org, piped, 0)).toBeUndefined();
+      expect(Date.now() - at).toBeLessThan(2000);
+    }
     rmSync(fresh, { recursive: true, force: true });
   });
 

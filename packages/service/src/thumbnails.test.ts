@@ -4,7 +4,8 @@
 // ceiling, the scaling, the decoder process's queue, time limit, closing
 // and hard memory cap, and the third review's four repros. Every image is
 // invented (images.fixtures.ts), and made here.
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
 import { closeSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -18,7 +19,12 @@ import {
   VIEW_LIMITS,
   DECODE_BUDGET_BYTES,
   DECODE_MEMORY_CAP_BYTES,
+  DECODER_MARKER_FD,
+  GIF_MAX_SUB_BLOCKS,
+  KILL_HEADROOM_BYTES,
   THUMBNAIL_HEADER_BYTES,
+  procMemory,
+  spawnDecoder,
   precheckThumbnail,
   decodeAny,
   decodeImage,
@@ -497,6 +503,46 @@ describe("strict walks and the memory budget (review B1, B2)", () => {
   });
 });
 
+describe("the inline view's checks (review 2)", () => {
+  it("counts a GIF's sub-blocks against a cap", () => {
+    // One 1 × 1 frame whose data is split into more 1-byte sub-blocks than the cap.
+    const head = Buffer.from([
+      ...Buffer.from("GIF89a"),
+      1,
+      0,
+      1,
+      0,
+      0x80,
+      0,
+      0,
+      0,
+      0,
+      0,
+      255,
+      255,
+      255,
+    ]);
+    const frame = Buffer.from([0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2]);
+    const many = Buffer.alloc(2 * (GIF_MAX_SUB_BLOCKS + 1), Buffer.from([1, 0]));
+    const gif = Buffer.concat([head, frame, many, Buffer.from([0, 0x3b])]);
+    expect(gifExtent(gif)).toBeUndefined();
+    expect(viewDimensions("image/gif", gif)).toBeUndefined();
+    expect(gifExtent(makeGif(30, 20))).toEqual({ width: 30, height: 20 });
+  });
+
+  it("sizes a WebP longer than what was read from its first chunk", async () => {
+    // A 16 × 16 lossy WebP with 2 MiB of metadata after its frame.
+    const small = await makeWebp(16, 16);
+    const exif = Buffer.concat([Buffer.from("EXIF"), Buffer.alloc(4), Buffer.alloc(2 * MIB)]);
+    exif.writeUInt32LE(2 * MIB, 4);
+    const big = Buffer.concat([small, exif]);
+    big.writeUInt32LE(big.length - 8, 4);
+    expect(viewDimensions("image/webp", big.subarray(0, MIB))).toEqual({ width: 16, height: 16 });
+    // Read whole, it is walked strictly (and its metadata is allowed).
+    expect(viewDimensions("image/webp", big)).toEqual({ width: 16, height: 16 });
+  });
+});
+
 describe("scaling", () => {
   it("fits the box and never scales up", () => {
     expect(fitInBox(4000, 3000, 160)).toEqual({ width: 160, height: 120 });
@@ -647,6 +693,128 @@ async function repros(): Promise<[string, string, Buffer, string][]> {
     ["D: VP8L-compressed ALPH in lossy WebP", "image/webp", await alphBigTables(), "too_large"],
   ];
 }
+
+describe("a decoder process that can't start (review 2, B1)", () => {
+  it("answers failed when the spawn throws (ENOMEM), and the next job still runs", async () => {
+    let calls = 0;
+    const renderer = createThumbnailRenderer({
+      spawn: (options) => {
+        calls++;
+        if (calls === 1) throw Object.assign(new Error("spawn ENOMEM"), { code: "ENOMEM" });
+        return spawnDecoder(options);
+      },
+    });
+    renderers.push(renderer);
+    expect(await renderer.render("image/jpeg", makeJpeg(40, 30), 160)).toEqual({
+      ok: false,
+      code: "failed",
+    });
+    expect((await renderer.render("image/jpeg", makeJpeg(40, 30), 160)).ok).toBe(true);
+  });
+
+  it("answers failed for a child with no stdio that reports EMFILE, never crashing", async () => {
+    let calls = 0;
+    const renderer = createThumbnailRenderer({
+      spawn: (options) => {
+        calls++;
+        if (calls > 1) return spawnDecoder(options);
+        // What Node gives when the spawn fails for want of descriptors:
+        // no process ID, no stdio, an 'error' event a moment later.
+        const fake = Object.assign(new EventEmitter(), {
+          pid: undefined,
+          stdio: undefined,
+          kill: () => false,
+        });
+        setImmediate(() =>
+          fake.emit("error", Object.assign(new Error("spawn EMFILE"), { code: "EMFILE" })),
+        );
+        return fake as unknown as ChildProcess;
+      },
+    });
+    renderers.push(renderer);
+    expect(await renderer.render("image/png", makePng(20, 20), 160)).toEqual({
+      ok: false,
+      code: "failed",
+    });
+    expect((await renderer.render("image/png", makePng(20, 20), 160)).ok).toBe(true);
+  });
+
+  it("answers failed when the bytes can't be written for it, and keeps going", async () => {
+    const renderer = createThumbnailRenderer();
+    renderers.push(renderer);
+    const saved = process.env.TMPDIR;
+    process.env.TMPDIR = join(tmpdir(), "no-such-folder-for-oculus");
+    try {
+      expect(await renderer.render("image/jpeg", makeJpeg(40, 30), 160)).toEqual({
+        ok: false,
+        code: "failed",
+      });
+    } finally {
+      if (saved === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = saved;
+    }
+    expect((await renderer.render("image/jpeg", makeJpeg(40, 30), 160)).ok).toBe(true);
+  });
+
+  it("answers lost, not killed, for a SIGKILL nothing confirmed as the cap (review 2)", async () => {
+    let child: ChildProcess | undefined;
+    const renderer = createThumbnailRenderer({
+      spawn: (options) => (child = spawnDecoder(options)),
+    });
+    renderers.push(renderer);
+    const pending = renderer.render("image/jpeg", flatJpeg(2480, 2480), 160);
+    // Killed from outside (as the system's out-of-memory killer would) once
+    // the decode is well under way (100 MiB over its start-up size).
+    let start: number | undefined;
+    for (let k = 0; k < 5000; k++) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      const rss = child?.pid === undefined ? undefined : procMemory(child.pid)?.rss;
+      if (rss === undefined) continue;
+      start ??= rss;
+      if (rss - start > 100 * MIB) break;
+    }
+    child?.kill("SIGKILL");
+    expect(await pending).toMatchObject({ ok: false, code: "lost" });
+    // Not retried: only a confirmed kill is.
+    expect(renderer.processesStarted()).toBe(1);
+  });
+
+  it("ends a job past its deadline from inside the process, without the parent (review 2)", async () => {
+    const file = join(tmpdir(), `oculus-deadline-${String(process.pid)}.jpg`);
+    writeFileSync(file, flatJpeg(2480, 2480));
+    const fd = openSync(file, "r");
+    try {
+      const child = spawnDecoder({
+        fd,
+        killAt: DECODE_MEMORY_CAP_BYTES - KILL_HEADROOM_BYTES,
+        heapMiB: 384,
+      });
+      const pipe = (child.stdio as readonly unknown[])[DECODER_MARKER_FD] as NodeJS.ReadableStream;
+      let report = "";
+      pipe.on("data", (c: Buffer) => {
+        report += c.toString();
+      });
+      let sentAt = 0;
+      child.on("message", (message: { ready?: boolean }) => {
+        if (message.ready === true) {
+          sentAt = Date.now();
+          child.send({ id: 1, format: "image/jpeg", box: 160, timeoutMs: 200 });
+        }
+      });
+      const [, signal] = await new Promise<[number | null, string | null]>((resolve) =>
+        child.on("close", (code, sig) => {
+          resolve([code, sig]);
+        }),
+      );
+      expect(signal).toBe("SIGKILL");
+      expect(report.startsWith("timeout")).toBe(true);
+      expect(Date.now() - sentAt).toBeLessThan(1000);
+    } finally {
+      closeSync(fd);
+      rmSync(file, { force: true });
+    }
+  });
+});
 
 describe("the third review's repros (T-072)", () => {
   it("refuses each one by its plan, and in the decoder process", { timeout: 120_000 }, async () => {

@@ -749,7 +749,15 @@ export async function openFileStore(options: FileStoreOptions): Promise<FileStor
       if (path === undefined) return undefined;
       let fd: number;
       try {
-        fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+        // O_NONBLOCK: a FIFO or device swapped in after the check can't
+        // hang the open (review 2); fstat refuses it before any read.
+        fd = openSync(
+          path,
+          constants.O_RDONLY |
+            constants.O_NOFOLLOW |
+            // Not defined on Windows, whatever the types say.
+            ((constants as { O_NONBLOCK?: number }).O_NONBLOCK ?? 0),
+        );
       } catch {
         return undefined;
       }

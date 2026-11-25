@@ -1281,6 +1281,12 @@ export function planDecode(format: string, bytes: Uint8Array, limits: ImageLimit
 
 /** The most frames and extension blocks a GIF may have (B2). */
 export const GIF_MAX_BLOCKS = 10_000;
+/**
+ * The most data sub-blocks a GIF may have, all its frames and extensions
+ * together: 1,048,576, room for 100 MiB in sub-blocks of 100 bytes
+ * (encoders write 255).
+ */
+export const GIF_MAX_SUB_BLOCKS = 1_048_576;
 
 /**
  * The extent a GIF's frames reach (the largest of its logical screen and
@@ -1296,9 +1302,12 @@ export function gifExtent(b: Uint8Array): { width: number; height: number } | un
   let height = u16le(b, 8);
   const flags = b[10] ?? 0;
   let i = 13 + ((flags & 0x80) !== 0 ? 3 * 2 ** ((flags & 0x07) + 1) : 0);
+  let subBlocks = 0;
   const skipSubBlocks = (): boolean => {
     for (;;) {
       if (i >= b.length) return false;
+      // Every data sub-block counted too (review 2: a 16 MiB GIF of 1-byte sub-blocks).
+      if (++subBlocks > GIF_MAX_SUB_BLOCKS) return false;
       const size = b[i] ?? 0;
       i += 1;
       if (size === 0) return true;
@@ -1342,6 +1351,15 @@ export function viewDimensions(
 ): { readonly width: number; readonly height: number } | undefined {
   if (format === "image/gif") return gifExtent(bytes);
   if (format === "image/webp") {
+    // Walked strictly when the whole RIFF is within `bytes`; a file longer
+    // than what was read (over 1 MiB) is sized from its first chunk's VP8,
+    // VP8L or VP8X header (review 2: such files were refused).
+    const riffSize =
+      (bytes[4] ?? 0) +
+      (bytes[5] ?? 0) * 256 +
+      (bytes[6] ?? 0) * 65_536 +
+      (bytes[7] ?? 0) * 16_777_216;
+    if (riffSize + 8 > bytes.length) return webpDimensions(bytes);
     try {
       const layout = walkWebp(bytes);
       return { width: layout.width, height: layout.height };
@@ -1622,6 +1640,8 @@ export interface ThumbnailJob {
   readonly id: number;
   readonly format: string;
   readonly box: number;
+  /** The job's wall-clock limit, which its watchdog enforces too. */
+  readonly timeoutMs: number;
   /** Tests of the memory cap only (`DecodeCheck`). */
   readonly check?: DecodeCheck;
 }
@@ -1677,14 +1697,16 @@ function resetPeak(): void {
  * it): a thread of the decoder process, started before any job, that every
  * 5 ms reads the process's resident size plus swap (/proc/self/status,
  * else `process.memoryUsage.rss()`) and kills the whole process once it
- * has grown past `killAt`, after writing "killed <peak growth>" to the
- * marker pipe; and that kills it at once if its parent is gone (its parent
- * process ID changed). The decode runs on the main thread, so only another
+ * has grown past `killAt` from its size when the job started (the same
+ * moment the parent takes its baseline), after writing "killed <peak
+ * growth>" to the marker pipe; that ends the job at its deadline
+ * ("timeout"); and that kills it at once if its parent is gone (its parent
+ * process ID changed, or `process.kill(parent, 0)` finds none). The decode runs on the main thread, so only another
  * thread can watch it, whatever the main thread is doing (WebAssembly
  * included).
  */
 const WATCHDOG = `
-const { workerData } = require("node:worker_threads");
+const { parentPort, workerData } = require("node:worker_threads");
 const { readFileSync, writeSync } = require("node:fs");
 const { killAt, parent, marker } = workerData;
 const field = (status, key) => {
@@ -1700,13 +1722,28 @@ const read = () => {
     return { now: rss, peak: rss };
   }
 };
-const base = read().now;
+// The baseline: its size at start-up, then (review 2) its size when the
+// job starts, the same moment the parent takes its own, so both guards
+// kill at the same growth. The job's deadline is enforced here too.
+let base = read().now;
+let deadline = Infinity;
+parentPort.on("message", (message) => {
+  base = read().now;
+  deadline = Date.now() + message.timeoutMs;
+  parentPort.postMessage("started");
+});
 const die = (line) => {
   try { writeSync(marker, line + "\\n"); } catch {}
   process.kill(process.pid, "SIGKILL");
 };
+const parentGone = () => {
+  if (process.ppid !== parent) return true;
+  // Where a process ID isn't reparented (Windows): is the parent still there?
+  try { process.kill(parent, 0); return false; } catch (error) { return error.code === "ESRCH"; }
+};
 setInterval(() => {
-  if (process.ppid !== parent) die("orphan");
+  if (parentGone()) die("orphan");
+  if (Date.now() > deadline) die("timeout");
   const m = read();
   if (m.now - base > killAt) die("killed " + String(Math.max(m.now, m.peak) - base));
 }, 5);
@@ -1755,6 +1792,11 @@ async function serve(
   resetPeak();
   process.on("message", (job: ThumbnailJob) => {
     void (async () => {
+      // The watchdog takes its baseline now and starts the job's deadline;
+      // nothing is read or decoded until it says so.
+      const started = new Promise((resolve) => watchdog.once("message", resolve));
+      watchdog.postMessage({ timeoutMs: job.timeoutMs });
+      await started;
       let answer: ThumbnailAnswer;
       try {
         const bytes = readDescriptor(DECODER_FILE_FD);
