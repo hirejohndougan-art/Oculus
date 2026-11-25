@@ -33,7 +33,12 @@
  * - `format_changed`: the format is added or changed; `recordIds` are the
  *   records holding a current value (in their identifiers or in a template
  *   `identifier` field) that no longer fits. Former identifiers are history
- *   and never checked against a format (D-009).
+ *   and never checked against a format (D-009). When `existing.published`
+ *   is given (S-026, D-091), `publishedRecordIds` are the published records
+ *   public sites would show as not available until the values are fixed:
+ *   those holding a misfit in a public field (any field, without
+ *   `templates`), and published records below them or representing them,
+ *   which may inherit it. The message gives their count.
  * - `uniqueness_tightened`: `none` → `current` or `all_time`, or `current` →
  *   `all_time`; `recordIds` are the records whose values (compared with
  *   `identifierKey`, former ones too under `all_time`) clash with another
@@ -59,7 +64,7 @@
  * organization's current list, which must contain `oldType` exactly),
  * `identifiers` (every record's identifiers) and `records` (the catalog
  * records, whose template `identifier` fields hold `{ type, value }`), and
- * optionally `templates`. Stored identifier sets are read leniently: a value
+ * optionally `templates` and `published` (the IDs of the published records). Stored identifier sets are read leniently: a value
  * of a removed type or one that never fit its format is already stranded, and
  * is counted, not refused. An
  * empty list means "there are none": pass nothing when they are unknown.
@@ -77,7 +82,7 @@
 import { issue, isPlainObject, type Validated } from "./issues.js";
 import { shown, type JsonValue } from "./plain-data.js";
 import { validateRecord, type CatalogRecord } from "./records.js";
-import type { RecordId } from "./record-id.js";
+import { isRecordId, type RecordId } from "./record-id.js";
 import {
   MAX_AUTO_NUMBER,
   validateIdentifierType,
@@ -139,6 +144,13 @@ export interface IdentifierTypeChange {
   readonly clashRecordIds?: readonly RecordId[];
   /** `templates_reference_type` only: the templates whose `identifierTypes` name the key. */
   readonly templateKeys?: readonly string[];
+  /**
+   * `format_changed` with `existing.published` only (S-026): the published
+   * records public sites would show as not available. At most `MAX_LISTED_RECORDS`.
+   */
+  readonly publishedRecordIds?: readonly RecordId[];
+  /** How many published records that is, even beyond the listed IDs. */
+  readonly publishedRecordCount?: number;
 }
 
 export interface IdentifierTypeChanges {
@@ -164,6 +176,8 @@ export interface IdentifierTypeUse {
   readonly records: readonly CatalogRecord[];
   /** The organization's templates (as stored), to tell which fields are public. */
   readonly templates?: readonly FieldTemplate[];
+  /** The IDs of the published records, to tell which a format change takes off public sites (S-026). */
+  readonly published?: readonly RecordId[];
 }
 
 /**
@@ -385,7 +399,17 @@ function compare(
   }
   if (now.pattern !== undefined && now.pattern !== was.pattern) {
     const held = use === undefined ? undefined : misfits(use, key, now.pattern);
-    changes.push(change("format_changed", key, held, unchecked || (held?.count ?? 0) > 0));
+    const published =
+      use?.published === undefined ? undefined : publishedMisfits(use, key, now.pattern);
+    changes.push(
+      change(
+        "format_changed",
+        key,
+        held,
+        unchecked || (held?.count ?? 0) > 0,
+        published === undefined ? {} : { published },
+      ),
+    );
   }
   const tightened = strictness(now.uniqueness) > strictness(was.uniqueness);
   if (tightened) {
@@ -453,6 +477,8 @@ interface Use {
   readonly publicKeysByTemplate: ReadonlyMap<string, ReadonlySet<string>> | undefined;
   /** The templates given, or undefined. */
   readonly templates: readonly FieldTemplate[] | undefined;
+  /** The published records' IDs, or undefined when not given. */
+  readonly published: ReadonlySet<RecordId> | undefined;
 }
 
 function readType(input: unknown, root: string): Validated<IdentifierType> {
@@ -499,7 +525,8 @@ function readUse(input: unknown, type: IdentifierType, listed = true): Validated
       name !== "identifierTypes" &&
       name !== "identifiers" &&
       name !== "records" &&
-      name !== "templates"
+      name !== "templates" &&
+      name !== "published"
     ) {
       return fail(
         ["existing", name],
@@ -561,6 +588,8 @@ function readUse(input: unknown, type: IdentifierType, listed = true): Validated
   if (!identifiers.ok) return identifiers;
   const records = readList(own(input, "records"), "records", validateRecord, (r) => r.id);
   if (!records.ok) return records;
+  const published = readPublished(input);
+  if (!published.ok) return published;
   let publicKeys: Map<string, Set<string>> | undefined;
   let publicKeysByTemplate: Map<string, Set<string>> | undefined;
   let templateList: readonly FieldTemplate[] | undefined;
@@ -618,8 +647,50 @@ function readUse(input: unknown, type: IdentifierType, listed = true): Validated
       publicKeys,
       publicKeysByTemplate,
       templates: templateList,
+      published: published.value,
     },
   };
+}
+
+/** `existing.published`: a list of record IDs, each at most once; undefined when left out. */
+function readPublished(input: object): Validated<ReadonlySet<RecordId> | undefined> {
+  if (!Object.hasOwn(input, "published")) return { ok: true, value: undefined };
+  const list = own(input, "published");
+  if (types.isProxy(list) || !Array.isArray(list)) {
+    return fail(
+      ["existing", "published"],
+      "not_a_list",
+      "existing.published must be a list of record IDs.",
+    );
+  }
+  if (list.length > MAX_RECORD_SET) {
+    return fail(
+      ["existing", "published"],
+      "too_many",
+      `At most ${String(MAX_RECORD_SET)} can be checked at once.`,
+    );
+  }
+  const ids = new Set<RecordId>();
+  for (let i = 0; i < list.length; i++) {
+    const d = Object.getOwnPropertyDescriptor(list, i);
+    const id: unknown = d !== undefined && "value" in d ? d.value : undefined;
+    if (!isRecordId(id)) {
+      return fail(
+        ["existing", "published", i],
+        "invalid_id",
+        "Each published record ID must be a lowercase version 4 UUID.",
+      );
+    }
+    if (ids.has(id)) {
+      return fail(
+        ["existing", "published", i],
+        "duplicate_id",
+        "A published record ID is listed twice.",
+      );
+    }
+    ids.add(id);
+  }
+  return { ok: true, value: ids };
 }
 
 /** An own data property, never a getter or an inherited one. */
@@ -762,18 +833,8 @@ function holders(use: Use, key: string): Held {
 function inPublicFields(use: Use, key: string): Held {
   const held = new Held();
   for (const record of use.records) {
-    const templateKey = own(record, "templateKey");
-    const publicHere =
-      typeof templateKey === "string"
-        ? use.publicKeysByTemplate?.get(templateKey)
-        : use.publicKeys?.get(record.kind);
-    if (
-      typeof templateKey !== "string" &&
-      use.publicKeys !== undefined &&
-      publicHere === undefined
-    ) {
-      continue;
-    }
+    const publicHere = publicFieldKeys(use, record);
+    if (publicHere === null) continue;
     for (const item of fieldIdentifiers(record)) {
       if (item.type === key && (publicHere === undefined || publicHere.has(item.field))) {
         held.add(record.id);
@@ -782,6 +843,19 @@ function inPublicFields(use: Use, key: string): Held {
     }
   }
   return held;
+}
+
+/**
+ * The record's public identifier field keys: by its template, or for a record
+ * naming none, public for its kind in some template; `undefined` when unknown
+ * (every field may be public); `null` when it has none (a record naming no
+ * template, of a kind no template has).
+ */
+function publicFieldKeys(use: Use, record: CatalogRecord): ReadonlySet<string> | undefined | null {
+  const templateKey = own(record, "templateKey");
+  if (typeof templateKey === "string") return use.publicKeysByTemplate?.get(templateKey);
+  const publicHere = use.publicKeys?.get(record.kind);
+  return use.publicKeys !== undefined && publicHere === undefined ? null : publicHere;
 }
 
 /** Records holding a current value of the type that the new format refuses. */
@@ -804,6 +878,60 @@ function misfits(use: Use, key: string, source: string): Held {
     }
   }
   return held;
+}
+
+/**
+ * The published records a new format takes off public sites (S-026, D-091):
+ * those holding a value of the type the format refuses in a field public in
+ * their template (any field, without templates, as `inPublicFields` reads
+ * them), and the published records below them or representing them (or
+ * anything below those), which may inherit the value. A record's own
+ * identifiers outside its fields are never shown, so they don't count.
+ */
+function publishedMisfits(use: Use, key: string, source: string): Held {
+  const out = new Held();
+  const published = use.published;
+  const parsed = parseIdentifierPattern(source);
+  if (published === undefined || !parsed.ok) return out;
+  const pattern = parsed.value;
+  const reached = new Set<RecordId>();
+  const queue: RecordId[] = [];
+  for (const record of use.records) {
+    const publicHere = publicFieldKeys(use, record);
+    if (publicHere === null) continue;
+    for (const item of fieldIdentifiers(record)) {
+      if (
+        item.type === key &&
+        (publicHere === undefined || publicHere.has(item.field)) &&
+        !matchesIdentifierPattern(pattern, item.value)
+      ) {
+        reached.add(record.id);
+        queue.push(record.id);
+        break;
+      }
+    }
+  }
+  // Records below (parentId) or representing (represents) each record.
+  const below = new Map<RecordId, RecordId[]>();
+  for (const record of use.records) {
+    for (const up of [own(record, "parentId"), own(record, "represents")]) {
+      if (!isRecordId(up)) continue;
+      const list = below.get(up);
+      if (list === undefined) below.set(up, [record.id]);
+      else list.push(record.id);
+    }
+  }
+  // The queue grows while it is walked; for-of reads its length each step.
+  for (const id of queue) {
+    for (const next of below.get(id) ?? []) {
+      if (reached.has(next)) continue;
+      reached.add(next);
+      queue.push(next);
+    }
+  }
+  for (const record of use.records)
+    if (reached.has(record.id) && published.has(record.id)) out.add(record.id);
+  return out;
 }
 
 function strictness(rule: UniquenessRule): number {
@@ -986,6 +1114,8 @@ interface Detail {
   /** key_adopts_values: how many records don't fit the format, and how many clash. */
   readonly misfits?: number;
   readonly clashes?: number;
+  /** format_changed: the published records public sites would show as not available (S-026). */
+  readonly published?: Held;
 }
 
 function change(
@@ -1003,6 +1133,12 @@ function change(
     message: message(code, type, held === undefined ? undefined : count, detail),
     recordIds: Object.freeze([...(held?.ids ?? [])]),
     recordCount: count,
+    ...(detail.published === undefined
+      ? {}
+      : {
+          publishedRecordIds: Object.freeze([...detail.published.ids]),
+          publishedRecordCount: detail.published.count,
+        }),
   });
 }
 
@@ -1073,11 +1209,17 @@ function message(
             ? "No record holds one now."
             : `${agree(count, "hold values of it")}.`
       } Confirm first.`;
-    case "format_changed":
+    case "format_changed": {
+      const n = detail.published?.count ?? 0;
+      const published =
+        n === 0
+          ? ""
+          : ` ${n === 1 ? "1 published record" : `${String(n)} published records`} would show as not available on public sites until ${n === 1 ? "its number is" : "their numbers are"} fixed.`;
       return `The identifier type ${key} gets a new format. ${some(
         "hold a current value that doesn't fit it",
         "Those would no longer pass the check: fix them or retire them first.",
-      )}`;
+      )}${published}`;
+    }
     case "uniqueness_tightened":
       return `The identifier type ${key} gets a stricter uniqueness rule. ${some(
         "hold a value another record also holds",

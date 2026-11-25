@@ -33,10 +33,12 @@ import {
   insertTemplateVersion,
   migrate,
   openDatabase,
+  publishCheckIssues,
   readPublicRecord,
   readVersions,
   readWorkflowState,
   sql,
+  updateIdentifierType,
   type Database,
   type Queryable,
   type Row,
@@ -580,6 +582,101 @@ describe("a published record stays publishable", () => {
     expect(history.map((v) => v.action)).toEqual(["save", "publish", "withdraw", "delete"]);
     expect(history.at(-1)?.workflowState).toBe("withdrawn");
   });
+});
+
+describe("a number that no longer fits a changed format (S-026, D-091)", () => {
+  const numbers = (value: string, former: string[] = []) => ({
+    current: [{ type: "object_number", value, primary: true }],
+    former: former.map((v) => ({ type: "object_number", value: v })),
+  });
+  const shown = (value: string) => ({ type: "object_number", value });
+
+  it("fails the publish check, as the public output refuses it, until the number fits", async () => {
+    await ready();
+    const org = await organization();
+    const made = ok(
+      await service.createRecord(ctx(org), objectDraft({ number: shown("INV-1") }), {
+        identifiers: numbers("INV-1"),
+      }),
+    );
+    const id = made.record.id;
+    ok(await service.publish(ctx(org), id, { expectedVersion: 1 }));
+    expect((await publicText(org, id)).ok).toBe(true);
+
+    // A manager gives the type a format the stored number doesn't fit.
+    ok(
+      await s.owner.transaction((q) =>
+        updateIdentifierType(q, {
+          organizationId: org,
+          key: "object_number",
+          label: "Object number",
+          uniqueness: "all_time",
+          public: true,
+          pattern: "DPL#{1,9}",
+        }),
+      ),
+    );
+    const out = await publicText(org, id);
+    expect(out.ok).toBe(false);
+    expect(out.issues.map((i) => i.code)).toContain("format_mismatch");
+
+    // The publish check says the same, in fixed text that quotes no number.
+    const found = await s.owner.transaction((q) => publishCheckIssues(q, org, id));
+    expect(found.map((i) => i.code)).toEqual(["format_mismatch"]);
+    expect(found[0]?.path).toEqual(["fields", "number", "value"]);
+    expect(JSON.stringify(found)).not.toContain("INV-1");
+    expect(JSON.stringify(found)).not.toContain("object_number");
+
+    // An edit that leaves the number as it is is refused (the save's own
+    // template check already says why), and nothing is saved.
+    const refused = await service.updateRecord(
+      ctx(org),
+      id,
+      { ...made.record, fields: { ...made.record.fields, note: "Rusted." } },
+      { expectedVersion: 2 },
+    );
+    expect(codes(refused)).toContain("format_mismatch");
+    expect(ok(await readVersions(s.owner, org, id)).versions).toHaveLength(2);
+
+    // Giving it a number that fits is saved, and the public output is back.
+    ok(
+      await service.updateRecord(
+        ctx(org),
+        id,
+        { ...made.record, fields: { ...made.record.fields, number: shown("DPL1") } },
+        { expectedVersion: 2, identifiers: numbers("DPL1", ["INV-1"]) },
+      ),
+    );
+    expect(await s.owner.transaction((q) => publishCheckIssues(q, org, id))).toEqual([]);
+    const back = await publicText(org, id);
+    expect(back.ok).toBe(true);
+    expect(await stateOf(org, id)).toBe("published");
+  }, 60_000);
+
+  it("a stranded number in no public field doesn't hold the record back", async () => {
+    await ready();
+    const org = await organization();
+    const made = ok(
+      await service.createRecord(ctx(org), objectDraft(), { identifiers: numbers("INV-2") }),
+    );
+    ok(await service.publish(ctx(org), made.record.id, { expectedVersion: 1 }));
+    ok(
+      await s.owner.transaction((q) =>
+        updateIdentifierType(q, {
+          organizationId: org,
+          key: "object_number",
+          label: "Object number",
+          uniqueness: "all_time",
+          public: true,
+          pattern: "DPL#{1,9}",
+        }),
+      ),
+    );
+    expect(await s.owner.transaction((q) => publishCheckIssues(q, org, made.record.id))).toEqual(
+      [],
+    );
+    expect((await publicText(org, made.record.id)).ok).toBe(true);
+  }, 60_000);
 });
 
 describe("the publish permission hook (T-041 plugs records.publish in here)", () => {
