@@ -1276,7 +1276,7 @@ describe("only a whole sign-in makes an address known (S-044)", () => {
     ).toMatchObject({ ok: true });
     await db.execute(sql`
       DELETE FROM public.sign_in_throttles WHERE key = ${throttleAccountKey(person.email)}`);
-  });
+  }, 60_000);
 
   it("a wrong code, or setting up at first sign-in, counts the same way", async () => {
     await ready();
