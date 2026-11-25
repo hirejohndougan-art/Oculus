@@ -28,6 +28,7 @@ import { join, relative } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { csrfTokenFor, newRecordId, type OrganizationId, type UserId } from "@oculus/core";
 import {
+  endSession,
   migrate,
   openDatabase,
   organizationFileBytes,
@@ -759,6 +760,79 @@ async function placeOrphan(db: Database, body: Buffer, assetId: string): Promise
     VALUES (${w.a}::uuid, ${newRecordId()}::uuid, 'placing', ${newRecordId()}::uuid,
       ${assetId}::uuid, ${sha(body)}, ${body.length}, ${actorOf(w.root)})`);
 }
+
+describe("an upload whose session ends while it arrives (S-060b)", () => {
+  it("isn't attached: 401, and the asset gains no file", async () => {
+    const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented scan, session ending"));
+    let ending: string | undefined;
+    // The store as the server sees it, but the session is ended (signed
+    // out) once the bytes are in and before the attach.
+    const endingStore: FileStore = {
+      ...store,
+      receive: async (...args: Parameters<FileStore["receive"]>) => {
+        const received = await store.receive(...args);
+        if (ending !== undefined) await endSession(w.db, ending);
+        return received;
+      },
+    };
+    const server = await serve(w, endingStore);
+    try {
+      const to = addressOf(server);
+      const live = (await fullSession(w.db, w.cataloger, w.a)).token;
+      tokens.ending = live;
+      ending = live;
+      const r = await upload(asset, { as: "ending", body: fakePng(512), name: "late.png", to });
+      expect([r.status, r.json]).toEqual([401, { error: "unauthenticated" }]);
+      const files = await w.db.rows<{ n: string }>(
+        sql`SELECT count(*) AS n FROM public.stored_files WHERE record_id = ${asset}::uuid`,
+      );
+      expect(Number(files[0]?.n)).toBe(0);
+      // A session still live attaches through the same store.
+      ending = undefined;
+      tokens.ending = (await fullSession(w.db, w.cataloger, w.a)).token;
+      const ok = await upload(asset, { as: "ending", body: fakePng(512), name: "ok.png", to });
+      expect(ok.status).toBe(201);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("the service refuses an attach for a session that isn't live or isn't the actor's", async () => {
+    const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented scan, service check"));
+    const service = createService(w.db, { files: store });
+    const receive = async () => {
+      const received = await store.receive(
+        w.a,
+        (async function* () {
+          await Promise.resolve();
+          yield fakePng(256);
+        })(),
+      );
+      if (!received.ok) throw new Error(received.code);
+      return received.file;
+    };
+    const ended = (await fullSession(w.db, w.cataloger, w.a)).token;
+    await endSession(w.db, ended);
+    const someoneElse = (await fullSession(w.db, w.manager, w.a)).token;
+    for (const sessionToken of [ended, someoneElse, "not-a-token"]) {
+      const r = await service.attachFile(
+        { organizationId: w.a, actor: actorOf(w.cataloger) },
+        asset as never,
+        await receive(),
+        { name: "x.png", expectedVersion: 1, sessionToken },
+      );
+      expect(r.ok ? "attached" : r.issues.map((i) => i.code)).toEqual(["no_session"]);
+    }
+    const live = (await fullSession(w.db, w.cataloger, w.a)).token;
+    const r = await service.attachFile(
+      { organizationId: w.a, actor: actorOf(w.cataloger) },
+      asset as never,
+      await receive(),
+      { name: "x.png", expectedVersion: 1, sessionToken: live },
+    );
+    expect(r.ok).toBe(true);
+  });
+});
 
 describe("removing files", () => {
   it("removes a file with the edit rule and If-Match; nothing deletes its bytes", async () => {

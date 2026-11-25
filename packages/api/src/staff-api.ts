@@ -183,6 +183,8 @@ export interface StaffApiOptions {
     readonly perUser?: number;
     readonly minBytes?: number;
     readonly windowMs?: number;
+    /** How often a running stream checks its session is still live (S-060b). */
+    readonly sessionCheckMs?: number;
   };
   /** People, roles and the audit trail (T-048, people-api.ts); left out, those routes aren't served. */
   readonly people?: PeopleApiOptions;
@@ -200,6 +202,12 @@ export const MAX_DOWNLOADS_PER_USER = 8;
 export const MIN_DOWNLOAD_BYTES = 64 * 1024;
 /** …of this many milliseconds, or it is cut off. */
 export const MIN_DOWNLOAD_WINDOW_MS = 10_000;
+/**
+ * A streamed file checks its session this often, and stops once the session
+ * has ended (S-060b): signed out, ended by a manager, the account disabled,
+ * the membership removed, timed out, from this process or another.
+ */
+export const DOWNLOAD_SESSION_CHECK_MS = 5_000;
 
 /** The headers carrying an upload's original name (percent-encoded UTF-8) and claimed type. */
 export const FILE_NAME_HEADER = "x-oculus-file-name";
@@ -506,6 +514,8 @@ function fileRefusal(result: ServiceRefusal): Refusal | undefined {
   if (codes.has("file_too_large")) return new Refusal(413, "payload_too_large");
   if (codes.has("quota_exceeded")) return new Refusal(413, "quota_exceeded");
   if (codes.has("disk_full")) return new Refusal(507, "disk_full");
+  // The session ended while an upload ran (S-060b).
+  if (codes.has("no_session")) return new Refusal(401, "unauthenticated");
   return undefined;
 }
 
@@ -608,7 +618,12 @@ export function refused(
 export type Handler = (
   request: OculusRequest,
   reply: OculusReply,
-  signed: { readonly session: FullSession; readonly context: ServiceContext },
+  signed: {
+    readonly session: FullSession;
+    readonly context: ServiceContext;
+    /** The session's token, for operations that check it in their own transaction. */
+    readonly token: string;
+  },
 ) => Promise<unknown>;
 
 /** The staff API's routes, for `buildServer({ routes })`. */
@@ -658,7 +673,7 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
         ...contextFromSession(session),
         ...(siteHeader === undefined ? {} : { siteId: siteHeader }),
       };
-      return handler(request, reply, { session, context });
+      return handler(request, reply, { session, context, token });
     };
   }
 
@@ -707,14 +722,16 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
     perUser: options.downloads?.perUser ?? MAX_DOWNLOADS_PER_USER,
     minBytes: options.downloads?.minBytes ?? MIN_DOWNLOAD_BYTES,
     windowMs: options.downloads?.windowMs ?? MIN_DOWNLOAD_WINDOW_MS,
+    sessionCheckMs: options.downloads?.sessionCheckMs ?? DOWNLOAD_SESSION_CHECK_MS,
   };
   const streaming = new Map<string, number>();
 
   /**
    * The opener, counted against the session and the person while its
-   * stream is open, and kept to the minimum rate.
+   * stream is open, kept to the minimum rate, and stopped once its session
+   * has ended (S-060b).
    */
-  function counted(keys: readonly string[], open: () => Readable): () => Readable {
+  function counted(keys: readonly string[], token: string, open: () => Readable): () => Readable {
     return () => {
       const source = open();
       for (const key of keys) streaming.set(key, (streaming.get(key) ?? 0) + 1);
@@ -733,11 +750,36 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
         checked = sent;
       }, downloadLimits.windowMs);
       timer.unref();
+      // The session is read, not refreshed (a download isn't activity), and
+      // only a definite "no session" stops it: a database that can't answer
+      // for a moment doesn't cut every download off.
+      let checking = false;
+      const sessionTimer = setInterval(() => {
+        if (checking || counter.destroyed) return;
+        checking = true;
+        resolveSession(db, token, {
+          activity: false,
+          onError: (error) => {
+            log({ event: "session_error", ...redactedError(error) });
+          },
+        })
+          .then((resolved) => {
+            if (!resolved.ok && resolved.code === "no_session") {
+              counter.destroy(new Error("the session ended"));
+            }
+          })
+          .catch(() => undefined)
+          .finally(() => {
+            checking = false;
+          });
+      }, downloadLimits.sessionCheckMs);
+      sessionTimer.unref();
       let released = false;
       const release = (): void => {
         if (released) return;
         released = true;
         clearInterval(timer);
+        clearInterval(sessionTimer);
         for (const key of keys) {
           const left = (streaming.get(key) ?? 1) - 1;
           if (left <= 0) streaming.delete(key);
@@ -757,6 +799,7 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
     request: OculusRequest,
     reply: OculusReply,
     session: FullSession,
+    token: string,
     context: ServiceContext,
     use: "download" | "view",
   ): Promise<unknown> {
@@ -780,7 +823,7 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
     }
     const { file, open } = result.value;
     return fileReply({
-      body: counted(keys, open),
+      body: counted(keys, token, open),
       size: file.size,
       // The sniffed type (D-086); fileReply sends a download as
       // application/octet-stream whatever it is.
@@ -802,7 +845,7 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
       method: "POST",
       path: "/api/records/:id/files",
       upload: { maxBytes: uploadLimit },
-      handler: signedIn("write", true, async (request, reply, { context }) => {
+      handler: signedIn("write", true, async (request, reply, { context, token }) => {
         const expectedVersion = ifMatchVersion(request);
         const upload = request.upload;
         if (upload === undefined) throw new Refusal(400, "bad_body");
@@ -845,6 +888,8 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
         }
         const result = await service.attachFile(context, id, received.file, {
           expectedVersion,
+          // Still live and this person's when the file is attached (S-060b).
+          sessionToken: token,
           name,
           ...(claimed === undefined ? {} : { claimedType: claimed }),
         });
@@ -884,8 +929,8 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
       // sent as application/octet-stream (fileReply), named by RFC 6266.
       method: "GET",
       path: "/api/records/:id/files/:fileId/content",
-      handler: signedIn("read", false, (request, reply, { session, context }) =>
-        readFileRoute(request, reply, session, context, "download"),
+      handler: signedIn("read", false, (request, reply, { session, context, token }) =>
+        readFileRoute(request, reply, session, token, context, "download"),
       ),
     },
     {
@@ -893,8 +938,8 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
       // sniffed type only, with fileReply's sandboxing CSP and nosniff.
       method: "GET",
       path: "/api/records/:id/files/:fileId/view",
-      handler: signedIn("read", false, (request, reply, { session, context }) =>
-        readFileRoute(request, reply, session, context, "view"),
+      handler: signedIn("read", false, (request, reply, { session, context, token }) =>
+        readFileRoute(request, reply, session, token, context, "view"),
       ),
     },
     {

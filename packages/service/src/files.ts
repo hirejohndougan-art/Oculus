@@ -47,6 +47,7 @@ import {
   type UserId,
 } from "@oculus/core";
 import {
+  actingSession,
   deleteStoredFile,
   existingOrganizations,
   findStoredFile,
@@ -131,6 +132,14 @@ export interface AttachOptions {
   readonly name: string;
   /** The media type the client claimed, if any: a hint only. */
   readonly claimedType?: string;
+  /**
+   * The uploader's session token (S-060b): when given, the attach is refused
+   * (`no_session`) unless that session is still live and the actor's, read
+   * in the attach's own transactions. An upload can run for a long time; a
+   * session ended, an account disabled or a membership removed meanwhile
+   * stops it here. The staff API always gives it.
+   */
+  readonly sessionToken?: string;
 }
 
 export interface AttachedFile {
@@ -832,6 +841,8 @@ export function fileOperations(
                 "The file was received for another organization.",
               );
             }
+            const ended = await stillSignedIn(tx, who, options.sessionToken);
+            if (ended) return ended;
             const refused = await attachable(tx, who, recordId, options.expectedVersion);
             if (refused) return refused;
             // A copy already there shows its last use in its own times (by
@@ -879,6 +890,8 @@ export function fileOperations(
             if (claimed !== null && !isClaimedMediaType(claimed)) {
               return refusal(["claimedType"], "invalid_media_type", "Not a media type.");
             }
+            const ended = await stillSignedIn(tx, who, options.sessionToken);
+            if (ended) return ended;
             const refused = await attachable(tx, who, recordId, options.expectedVersion);
             if (refused) return refused;
             await lockOrganizationFiles(tx, who.organizationId);
@@ -1403,4 +1416,21 @@ export function fileOperations(
       await scans?.stop();
     },
   };
+}
+
+/**
+ * `no_session` unless `token` names a live full session of the actor
+ * (S-060b). No token (a job, a test): nothing to check.
+ */
+async function stillSignedIn(
+  tx: Queryable,
+  who: { readonly actor: string },
+  token: string | undefined,
+): Promise<ServiceRefusal | undefined> {
+  if (token === undefined) return undefined;
+  const acting = await actingSession(tx, token);
+  if (acting === undefined || `user:${acting.userId}` !== who.actor) {
+    return refusal([], "no_session", "Sign in again.");
+  }
+  return undefined;
 }

@@ -28,7 +28,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { csrfTokenFor, newRecordId, type OrganizationId, type UserId } from "@oculus/core";
-import { sql } from "@oculus/db";
+import { endSession, sql } from "@oculus/db";
 import {
   createService,
   createThumbnailRenderer,
@@ -253,7 +253,13 @@ const extra: { close(): Promise<unknown> }[] = [];
 
 async function serveAlso(
   serviceOptions: Partial<Parameters<typeof createService>[1]>,
-  downloads?: { perSession?: number; perUser?: number; minBytes?: number; windowMs?: number },
+  downloads?: {
+    perSession?: number;
+    perUser?: number;
+    minBytes?: number;
+    windowMs?: number;
+    sessionCheckMs?: number;
+  },
 ): Promise<{ host: string; port: number }> {
   const service = createService(w.db, {
     onError: serviceErrorLogger((r) => logged.push(r)),
@@ -977,6 +983,59 @@ describe("review fixes: timeouts, budgets, HEAD, failures and downloads", () => 
     expect(r.status).toBe(422);
     expect(r.json.error).toBe("not_viewable");
   });
+
+  it("stops a running download once its session ends, and only that one (S-060b)", async () => {
+    const to = await serveAlso(
+      {},
+      { perSession: 4, perUser: 8, minBytes: 1, windowMs: 60_000, sessionCheckMs: 100 },
+    );
+    const asset = await makeAs(w, w.a, w.a1, assetDraft("An invented scan, session ends"));
+    const body = Buffer.concat([makeJpeg(8, 8), Buffer.alloc(40 * 1024 * 1024, 9)]);
+    const id = await add(asset, body, "ending.jpg");
+    const url = fileUrl(asset, id, "content");
+    const ending = (await fullSession(w.db, w.cataloger, w.a)).token;
+    const staying = (await fullSession(w.db, w.cataloger, w.a)).token;
+    const open: { destroy(): void }[] = [];
+    /** A download whose body is never read (a paused reader): its status once headers come. */
+    const start = (as: string) =>
+      new Promise<number>((resolve, reject) => {
+        const req = httpRequest(
+          {
+            host: to.host,
+            port: to.port,
+            path: url,
+            headers: { host: "localhost", cookie: `${OCULUS_COOKIES.session}=${as}` },
+            agent: false,
+          },
+          (res) => {
+            res.pause();
+            res.on("error", () => undefined);
+            resolve(res.statusCode ?? 0);
+          },
+        );
+        req.on("error", reject);
+        open.push(req);
+        req.end();
+      });
+    // A paused client doesn't notice the server cutting it off; the
+    // server's log says so (by code only), as for one too slow.
+    const cutOff = () => serverLog.filter((l) => l.includes("file_stream_storage")).length;
+    const before = cutOff();
+    expect([await start(ending), await start(staying)]).toEqual([200, 200]);
+    await new Promise((r) => setTimeout(r, 500));
+    expect(cutOff()).toBe(before);
+    // Signed out: the running download stops within a few checks.
+    await endSession(w.db, ending);
+    const deadline = Date.now() + 5_000;
+    while (cutOff() < before + 1 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    expect(cutOff()).toBe(before + 1);
+    // The other session's download keeps going.
+    await new Promise((r) => setTimeout(r, 1_000));
+    expect(cutOff()).toBe(before + 1);
+    for (const req of open) req.destroy();
+  }, 30_000);
 
   it("limits streamed files per session and cuts off one too slow (item 5)", async () => {
     const to = await serveAlso({}, { perSession: 2, minBytes: 2 * 1024 * 1024, windowMs: 300 });
