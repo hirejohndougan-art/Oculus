@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 03:00 CT — manual (Chat D) — S-042 Site managers see members whose role is on every site
+- Result: done
+- What changed: John (2026-11-25): a role on every site includes the site manager's own, so such a member is seen in full and may be given more roles there. `holdsRoleOn` (packages/service/src/admin.ts) and `listMembers` (packages/db/src/people.ts) count every-site grants; members with no role stay name-only.
+- Decisions: D-084 amended
+- Review: one independent round
+- Gate: PASS
+- Next: nothing claimed
+
 ## 2026-11-25 02:45 CT — manual (Chat G) — T-050e Dublin Core mappings in the admin and in setup
 - Result: done
 - What changed: new screen Settings › Templates › Dublin Core (`packages/admin/src/settings/DublinCoreEditor.tsx`, linked from each template) saving through `GET`/`PUT /api/templates/:key/dublin-core` with If-None-Match/If-Match and D-076's confirmation; `npm run setup` stores the starter template's mapping (public fields as their `dcterms` standards, rights included) in its transaction; the record editor says when the template has no mapping that fits it, so no public site shows the record. Unit tests for the screen, the record editor's note and setup; the settings e2e visits the new screen with Alfa's rules.
