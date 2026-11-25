@@ -10,6 +10,14 @@ One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 - Gate: PASS · tests_passing 4224 (was 4193) · npm audit clean
 - Next: M-001
 
+## 2026-11-24 20:15 CT — Chat B — T-055 First-time setup command
+- Result: done
+- What changed: `npm run setup` migrates an empty database and makes the first system admin (two-step set-up at first sign-in), organization, site and a starter `Item` template in one transaction; refuses, before changing anything, a database that is set up or not Oculus's. `setUpFirstInstall`, `databaseBeforeSetup`, README note.
+- Decisions: none
+- Review: three independent rounds; fixed every finding (it migrated before refusing; the empty-database check now reuses restore's `contentsOf`; terminal input that could become an answer; input checks). Left as S-031.
+- Gate: PASS · tests_passing 4208 (was 4193) · npm audit clean
+- Next: the next job in the work board's pool.
+
 ## 2026-11-24 19:57 CT — manual (Chat A) — T-048 Admin: people, roles and the audit trail
 - Result: done
 - What changed: service `people.ts`, db `people.ts`, migration 0020 (`people_events`, append-only; the last-active-system-manager trigger), `people-api.ts` routes, `POST /api/reauthenticate`, and admin screens for people, a person, invitations, roles (built-in, read-only) and the audit trail. Role and account changes need the password and code entered in the last 10 minutes.
