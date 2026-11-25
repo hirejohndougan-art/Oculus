@@ -9,7 +9,8 @@
 /** The most shares one list page holds (the server's `MAX_SHARE_PAGE`). */
 export const SHARE_PAGE = 50;
 
-export type ShareState = "offered" | "accepted" | "declined" | "withdrawn" | "removed";
+export type ShareState =
+  "offered" | "accepted" | "declined" | "withdrawn" | "removed" | "deleted" | "moved";
 
 export const SHARE_STATE_LABELS: Readonly<Record<ShareState, string>> = {
   offered: "Offered, waiting for an answer",
@@ -17,6 +18,8 @@ export const SHARE_STATE_LABELS: Readonly<Record<ShareState, string>> = {
   declined: "Declined",
   withdrawn: "Withdrawn",
   removed: "Removed by the other site",
+  deleted: "Ended: the item was deleted",
+  moved: "Ended: the item moved to that site",
 };
 
 export interface ShareSummary {

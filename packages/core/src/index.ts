@@ -538,6 +538,8 @@ export {
   validateAccession,
   validateDonorContact,
   indexAccessions,
+  indexAccessionHolds,
+  accessionHoldsOn,
   isAccessionRegister,
   accessionById,
   accessionsByNumber,
@@ -560,6 +562,8 @@ export type {
   Accession,
   DonorContact,
   AccessionRegister,
+  AccessionHold,
+  AccessionHoldsRegister,
   AccessionRegisterInput,
 } from "./accessions.js";
 export type { PublishCheckOptions } from "./effective.js";
@@ -735,3 +739,11 @@ export {
   MAX_CLIENT_LABEL_LENGTH,
 } from "./sessions.js";
 export type { SessionId, SessionPolicy } from "./sessions.js";
+export {
+  sniffMediaType,
+  cleanFileName,
+  isSha256Hex,
+  isClaimedMediaType,
+  SNIFF_BYTES,
+  MAX_FILE_NAME_LENGTH,
+} from "./files.js";

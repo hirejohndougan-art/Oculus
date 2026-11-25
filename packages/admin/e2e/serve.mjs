@@ -7,7 +7,8 @@
 // invented addresses, password and record title to OCULUS_E2E_SEED for the
 // tests. Everything is stopped and deleted on SIGTERM or SIGINT.
 import { randomBytes } from "node:crypto";
-import { rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { newOrganizationId } from "@oculus/core";
 import {
@@ -30,6 +31,10 @@ const seedFile = process.env.OCULUS_E2E_SEED;
 if (seedFile === undefined) throw new Error("OCULUS_E2E_SEED is not set");
 
 const database = startTestDatabase({ bin: findPostgresBin() });
+// Uploaded files go to a fresh folder of this run's own, deleted on stop:
+// never OCULUS_FILES_DIR from the environment, which may be a real install's
+// (D-086, review B1).
+const filesDir = mkdtempSync(join(tmpdir(), "oculus-e2e-files-"));
 let app;
 let db;
 const stop = async () => {
@@ -39,6 +44,7 @@ const stop = async () => {
   } finally {
     database.stop();
     rmSync(seedFile, { force: true });
+    rmSync(filesDir, { recursive: true, force: true });
     rmSync(`${seedFile}.root-recovery.json`, { force: true });
     process.exit(0);
   }
@@ -141,7 +147,32 @@ try {
       scope: null,
     }),
   );
-  // A fourth invented member for T-062's idle sign-out test (idle.spec.ts),
+  // A scanner on the site (attaches files to digital assets, M-002).
+  const scannerEmail = "scanner@example.org";
+  must(
+    await createInvitation(db, { organizationId, email: scannerEmail, invitedBy: root }, (m) => {
+      box.push(m);
+      return Promise.resolve();
+    }),
+  );
+  const scanner = must(
+    await acceptInvitation(db, {
+      token: box[3].token,
+      organizationId,
+      email: scannerEmail,
+      displayName: "Lin Invented",
+      password: PASSWORD,
+    }),
+  ).userId;
+  must(
+    await service.grantRole(actor, {
+      userId: scanner,
+      role: "scanner",
+      siteId: site.id,
+      scope: null,
+    }),
+  );
+  // A fifth invented member for T-062's idle sign-out test (idle.spec.ts),
   // so its session's sign-out leaves the others' tests alone.
   const idleEmail = "idle@example.org";
   must(
@@ -152,7 +183,7 @@ try {
   );
   const idler = must(
     await acceptInvitation(db, {
-      token: box[3].token,
+      token: box[4].token,
       organizationId,
       email: idleEmail,
       displayName: "Cy Invented",
@@ -228,6 +259,29 @@ try {
       },
     ),
   );
+  // A digital asset template and one invented asset (no files yet).
+  must(
+    await insertTemplateVersion(db, {
+      key: "photo",
+      organizationId,
+      label: "Photograph",
+      appliesTo: ["digital_asset"],
+      fields: [field("rights", "Rights statement", "rights"), field("caption", "Caption", "text")],
+    }),
+  );
+  const assetTitle = "Invented depot photograph";
+  must(
+    await service.createRecord(
+      { ...actor, siteId: site.id },
+      {
+        kind: "digital_asset",
+        mediaType: "image/png",
+        title: assetTitle,
+        templateKey: "photo",
+        fields: { rights: { uri: "http://rightsstatements.org/vocab/InC/1.0/" } },
+      },
+    ),
+  );
   const origin = `http://localhost:${String(port)}`;
   app = await buildAdminServer({
     db,
@@ -237,8 +291,13 @@ try {
       OCULUS_ADMIN_ORIGIN: origin,
       // A fresh random key for this throwaway run only; never stored.
       OCULUS_SECRET_KEY: randomBytes(32).toString("base64url"),
+      OCULUS_FILES_DIR: filesDir,
     },
     adminDir: join(import.meta.dirname, "..", "dist"),
+    // Every test signs in from 127.0.0.1 within the same minute or so: the
+    // per-address limit on sign-in posts (60 a minute, D-081) is raised for
+    // this run only, so the tenth test isn't refused for the first nine.
+    signIn: { rateLimits: { credentials: 600 } },
     log: () => undefined,
   });
   await app.listen({ host: "127.0.0.1", port });
@@ -247,9 +306,11 @@ try {
     JSON.stringify({
       email,
       editorEmail,
+      scannerEmail,
       password: PASSWORD,
       siteName: "Invented Archive",
       recordTitle,
+      assetTitle,
       // T-048's people screens: the system manager signs in too.
       rootEmail: "root@example.org",
       organizationName: "Invented Historical Society",

@@ -27,7 +27,13 @@ import { FAKE_TEST_SECRET_KEY } from "../../db/src/second-factor.fixtures.js";
 import { loadAdminFiles } from "./admin-files.js";
 import { buildAdminServer } from "./admin-server.js";
 import { OAI_PMH_PROLOGUE, isFileReply, oaiPmhReply } from "./file-replies.js";
-import { OAI_PAGE_SIZE, oaiAdminEmail, oaiPmhRoutes } from "./oai-pmh.js";
+import {
+  OAI_MAX_SLOTS,
+  OAI_PAGE_SIZE,
+  oaiAdminEmail,
+  oaiPmhRoutes,
+  oaiPoolOptions,
+} from "./oai-pmh.js";
 import { ReadSlots } from "./public-api.js";
 import { PublicSubjects } from "./public-subjects.js";
 import { checkPublicSites } from "./public-sites.js";
@@ -60,6 +66,9 @@ async function withRole(q: Queryable, statement: string, role: string): Promise<
   END $$`);
 }
 
+// The admin server needs a files folder (D-086); one of this file's own.
+const filesDir = mkdtempSync(join(tmpdir(), "oculus-t050c-files-"));
+
 function envFor(extra: Record<string, string> = {}): Record<string, string> {
   return {
     NODE_ENV: "development",
@@ -67,6 +76,7 @@ function envFor(extra: Record<string, string> = {}): Record<string, string> {
     OCULUS_ADMIN_ORIGIN: ADMIN,
     OCULUS_SECRET_KEY: FAKE_TEST_SECRET_KEY,
     OCULUS_PUBLIC_SITES: `${PUBLIC}=${w.a1}`,
+    OCULUS_FILES_DIR: filesDir,
     ...extra,
   };
 }
@@ -170,6 +180,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await app.close();
   rmSync(dir, { recursive: true, force: true });
+  rmSync(filesDir, { recursive: true, force: true });
   await reader.close();
   await w.db.close();
   await w.testDb.drop();
@@ -634,6 +645,87 @@ describe("stored datestamps (S-041, D-108)", () => {
     const get = await oai(`verb=GetRecord&metadataPrefix=oai_dc&identifier=${PREFIX}${back}`);
     expect(get.body).toContain("<metadata>");
     expect(get.body).not.toContain('status="deleted"');
+  });
+
+  it("a record no longer shown is skipped until the pass marks it, and one restored first keeps its datestamp (S-047)", async () => {
+    const quiet = more[1] ?? "";
+    const before = (await storedStamps()).get(quiet);
+    ok(
+      await w.service.withdraw({ organizationId: w.a, actor: actorOf(w.root) }, quiet as never, {
+        expectedVersion: 2,
+      }),
+    );
+    // No pass yet: skipped, never a deleted header at its old datestamp.
+    const listAll = async () => {
+      let all = "";
+      let reply = await oai("verb=ListIdentifiers&metadataPrefix=oai_dc");
+      all += reply.body;
+      let token = tokenIn(reply.body);
+      while (token !== undefined) {
+        reply = await oai(`verb=ListIdentifiers&resumptionToken=${token}`);
+        all += reply.body;
+        token = tokenIn(reply.body);
+      }
+      return all;
+    };
+    expect(await listAll()).not.toContain(quiet);
+    const get = await oai(`verb=GetRecord&metadataPrefix=oai_dc&identifier=${PREFIX}${quiet}`);
+    expect(errorCode(get.body)).toBe("idDoesNotExist");
+    // Restored before the next pass: shown again, same oai_dc, same datestamp,
+    // and no harvester was ever told it was deleted.
+    await publishAs(w, w.a, quiet, 3);
+    await stamps.check();
+    const after = (await storedStamps()).get(quiet);
+    expect(after).toEqual(before);
+    expect(await listAll()).toContain(`<identifier>${PREFIX}${quiet}</identifier>`);
+  });
+
+  it("before a site's first pass, GetRecord gives the site's lower bound, never a staff save time (S-046)", async () => {
+    const second = "http://127.0.0.1:8081";
+    const sites = await checkPublicSites(w.db, reader, [{ origin: second, siteId: w.a2 }]);
+    const fresh = await buildServer({
+      env: { OCULUS_ORIGINS: second },
+      routes: oaiPmhRoutes({
+        db: w.db,
+        publicDb: reader,
+        sites,
+        adminEmail: EMAIL,
+        rateLimits: { oai: 10_000 },
+      }),
+    });
+    try {
+      const identify = await oai("verb=Identify", "127.0.0.1:8081", fresh);
+      const earliest = /<earliestDatestamp>([^<]+)</.exec(identify.body)?.[1];
+      const get = await oai(
+        `verb=GetRecord&metadataPrefix=oai_dc&identifier=oai:127.0.0.1:${otherSite}`,
+        "127.0.0.1:8081",
+        fresh,
+      );
+      expect(get.body).toContain("<metadata>");
+      expect(earliest).toBeDefined();
+      expect(get.body).toContain(`<datestamp>${earliest ?? ""}</datestamp>`);
+      // Its lists are empty until the pass.
+      const list = await oai("verb=ListIdentifiers&metadataPrefix=oai_dc", "127.0.0.1:8081", fresh);
+      expect(errorCode(list.body)).toBe("noRecordsMatch");
+    } finally {
+      await fresh.close();
+    }
+  });
+
+  it("list reads take a bounded time limit, and OAI-PMH's own pool waits a bounded time (S-051)", async () => {
+    await expect(
+      listPublishedForOai(w.db, w.a, w.a1, { limit: 5, timeLimitMs: 0 }),
+    ).rejects.toThrow(TypeError);
+    await expect(
+      listPublishedForOai(w.db, w.a, w.a1, { limit: 5, timeLimitMs: 600_000 }),
+    ).rejects.toThrow(TypeError);
+    expect(
+      (await listPublishedForOai(w.db, w.a, w.a1, { limit: 5, timeLimitMs: 2000 })).length,
+    ).toBe(5);
+    const pool = oaiPoolOptions();
+    expect(pool.max).toBe(OAI_MAX_SLOTS);
+    expect(pool.connectionTimeoutMillis).toBeGreaterThan(0);
+    expect(pool.queryTimeoutMillis).toBeGreaterThan(60_000);
   });
 });
 

@@ -1,0 +1,374 @@
+// Upload routes in the HTTP layer (M-002, D-086), with no database: which
+// routes may be upload routes, the type list both ways, the view handed to
+// the handler (bytes once, never the stream), the cap counted as bytes
+// arrive with chunked encoding, and `Connection: close` when the body isn't
+// read to its end.
+import { request as httpRequest } from "node:http";
+import { connect, type AddressInfo } from "node:net";
+import { describe, expect, it } from "vitest";
+import type { FastifyInstance } from "fastify";
+import { UPLOAD_TYPES } from "./body.js";
+import { MAX_UPLOAD_BYTES, checkRoute, type OculusRoute } from "./routes.js";
+import { SAME_ORIGIN, testServer } from "./test-server.fixtures.js";
+
+const noop = () => ({ ok: true });
+
+describe("which routes may take uploads", () => {
+  it("refuses a bad cap, a GET, a form or credentials upload route and extra options", () => {
+    const bad: unknown[] = [
+      { method: "POST", path: "/u", upload: { maxBytes: 0 }, handler: noop },
+      { method: "POST", path: "/u", upload: { maxBytes: 1.5 }, handler: noop },
+      { method: "POST", path: "/u", upload: { maxBytes: MAX_UPLOAD_BYTES + 1 }, handler: noop },
+      { method: "POST", path: "/u", upload: { maxBytes: "10" }, handler: noop },
+      { method: "POST", path: "/u", upload: { maxBytes: 10, types: ["text/html"] }, handler: noop },
+      { method: "POST", path: "/u", upload: true, handler: noop },
+      { method: "GET", path: "/u", upload: { maxBytes: 10 }, handler: noop },
+      { method: "DELETE", path: "/u", upload: { maxBytes: 10 }, handler: noop },
+      { method: "POST", path: "/u", form: true, upload: { maxBytes: 10 }, handler: noop },
+      { method: "POST", path: "/u", credentials: true, upload: { maxBytes: 10 }, handler: noop },
+      {
+        method: "POST",
+        path: "/u",
+        upload: {
+          get maxBytes() {
+            return 10;
+          },
+        },
+        handler: noop,
+      },
+    ];
+    for (const route of bad) expect(() => checkRoute(route), JSON.stringify(route)).toThrow();
+    expect(
+      checkRoute({ method: "PUT", path: "/u", upload: { maxBytes: 10 }, handler: noop }).upload,
+    ).toEqual({
+      maxBytes: 10,
+    });
+  });
+
+  it("has no active type on its list", () => {
+    for (const type of UPLOAD_TYPES) {
+      expect(type).not.toMatch(/html|xml|svg|javascript|ecmascript|xsl|multipart|message/);
+    }
+  });
+});
+
+interface Seen {
+  calls: number;
+  views: unknown[];
+  bytes: number[];
+  errors: string[];
+}
+
+async function uploadServer(
+  maxBytes: number,
+  readAll = true,
+): Promise<{ app: FastifyInstance; seen: Seen }> {
+  const seen: Seen = { calls: 0, views: [], bytes: [], errors: [] };
+  const route: OculusRoute = {
+    method: "POST",
+    path: "/upload",
+    upload: { maxBytes },
+    handler: async (request) => {
+      seen.calls++;
+      const upload = request.upload;
+      seen.views.push(upload === undefined ? null : Object.keys(upload).sort());
+      if (upload === undefined) return { got: null };
+      if (!readAll) return { read: 0 };
+      let total = 0;
+      for await (const chunk of upload.chunks()) total += chunk.byteLength;
+      try {
+        upload.chunks();
+      } catch (error) {
+        seen.errors.push((error as Error).message);
+      }
+      seen.bytes.push(total);
+      return { total, type: upload.contentType, declared: upload.declaredBytes ?? null };
+    },
+  };
+  const { app } = await testServer({}, [route]);
+  return { app, seen };
+}
+
+/**
+ * One keep-alive request over a real socket; `parts` are written one by one
+ * (chunked unless `length` is set). Resolves with the reply even if the
+ * server stops reading early.
+ */
+async function post(
+  app: FastifyInstance,
+  parts: string[],
+  length?: number,
+  pace = 5,
+  path = "/upload",
+  type = "application/octet-stream",
+): Promise<{ status: number; connection: string | undefined; body: string }> {
+  if (!app.server.listening) await app.listen({ host: "127.0.0.1", port: 0 });
+  const { port } = app.server.address() as AddressInfo;
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      {
+        host: "127.0.0.1",
+        port,
+        method: "POST",
+        path,
+        agent: false,
+        headers: {
+          host: "localhost",
+          origin: "http://localhost",
+          connection: "keep-alive",
+          "content-type": type,
+          ...(length === undefined ? {} : { "content-length": String(length) }),
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", () => {
+          resolve({
+            status: res.statusCode ?? 0,
+            connection: res.headers.connection,
+            body: Buffer.concat(chunks).toString("utf8"),
+          });
+        });
+      },
+    );
+    req.on("error", (error) => {
+      setTimeout(() => {
+        reject(error);
+      }, 500);
+    });
+    void (async () => {
+      for (const part of parts) {
+        if (req.destroyed) return;
+        req.write(part);
+        await new Promise((r) => setTimeout(r, pace));
+      }
+      req.end();
+    })();
+  });
+}
+
+describe("the upload view", () => {
+  it("gives the handler the bytes once, the type and the declared length, and no stream", async () => {
+    const { app, seen } = await uploadServer(100);
+    const res = await app.inject({
+      method: "POST",
+      url: "/upload",
+      headers: { ...SAME_ORIGIN, "content-type": "Image/PNG" },
+      payload: Buffer.from("0123456789"),
+    });
+    expect(res.json()).toEqual({ total: 10, type: "image/png", declared: 10 });
+    expect(seen.views[0]).toEqual(["chunks", "contentType", "declaredBytes"]);
+    expect(seen.errors).toEqual(["an upload's bytes can be read once"]);
+    await app.close();
+  });
+
+  it("refuses other types on the upload route and upload types elsewhere", async () => {
+    const { app, seen } = await uploadServer(100);
+    for (const type of [
+      "application/json",
+      "text/html",
+      "image/png; x=1",
+      "application/x-www-form-urlencoded",
+    ]) {
+      const res = await app.inject({
+        method: "POST",
+        url: "/upload",
+        headers: { ...SAME_ORIGIN, "content-type": type },
+        payload: type === "application/json" ? "{}" : "a=b",
+      });
+      expect(res.statusCode, type).toBe(415);
+    }
+    const elsewhere = await app.inject({
+      method: "POST",
+      url: "/echo",
+      headers: { ...SAME_ORIGIN, "content-type": "application/octet-stream" },
+      payload: "bytes",
+    });
+    expect(elsewhere.statusCode).toBe(415);
+    expect(seen.calls).toBe(0);
+    await app.close();
+  });
+
+  it("counts chunked bytes as they arrive and answers 413 with the connection closed", async () => {
+    const { app, seen } = await uploadServer(25);
+    const res = await post(app, ["0123456789", "0123456789", "0123456789", "0123456789"]);
+    expect(res.status).toBe(413);
+    expect(res.body).toBe('{"error":"payload_too_large"}');
+    expect(res.connection).toBe("close");
+    expect(seen.bytes).toEqual([]);
+    const fits = await post(app, ["0123456789", "0123456789", "01234"]);
+    expect(fits.status).toBe(200);
+    expect(fits.connection).toBe("keep-alive");
+    expect(JSON.parse(fits.body)).toEqual({
+      total: 25,
+      type: "application/octet-stream",
+      declared: null,
+    });
+    await app.close();
+  });
+
+  it("closes the connection when the handler answers without reading the body", async () => {
+    const { app } = await uploadServer(100, false);
+    const res = await post(app, ["unread body"], 11);
+    expect(res.status).toBe(200);
+    expect(res.connection).toBe("close");
+    await app.close();
+  });
+});
+
+describe("upload time limits", () => {
+  it("lets an upload run past the usual request limit, and keeps that limit for other routes", async () => {
+    const route: OculusRoute = {
+      method: "POST",
+      path: "/upload",
+      upload: { maxBytes: 1000 },
+      handler: async (request) => {
+        let total = 0;
+        for await (const chunk of request.upload?.chunks() ?? []) total += chunk.byteLength;
+        return { total };
+      },
+    };
+    const { app } = await testServer(
+      { timeouts: { request: 600, headers: 600 }, uploadTimeouts: { idle: 2000, request: 5000 } },
+      [route],
+    );
+    // An upload trickling for longer than the usual 600 ms limit: fine.
+    const slow = await post(
+      app,
+      Array.from({ length: 10 }, () => "0123456789"),
+      undefined,
+      120,
+    );
+    expect(slow.status).toBe(200);
+    expect(JSON.parse(slow.body)).toEqual({ total: 100 });
+    // A JSON body as slow on the same server: refused at the usual limit.
+    const started = Date.now();
+    const json = await post(app, ['{"a":', '"b"', "}"], 11, 500, "/echo", "application/json").catch(
+      (error: unknown) => error,
+    );
+    expect(json instanceof Error ? 408 : (json as { status: number }).status).toBe(408);
+    expect(Date.now() - started).toBeLessThan(3000);
+    await app.close();
+  });
+
+  it("refuses longer upload limits than the defaults", async () => {
+    await expect(testServer({ uploadTimeouts: { request: 31 * 60_000 } })).rejects.toThrow(
+      /uploadTimeouts.request/,
+    );
+    await expect(testServer({ uploadTimeouts: { idle: 0 } })).rejects.toThrow(
+      /uploadTimeouts.idle/,
+    );
+  });
+});
+
+/**
+ * Sends a request's head and part of its body over a raw socket, then
+ * stalls; resolves with the reply's status and how long until the server
+ * closed the connection.
+ */
+async function stall(
+  app: FastifyInstance,
+  head: string[],
+  partial: string,
+): Promise<{ status: number; closedAfter: number }> {
+  if (!app.server.listening) await app.listen({ host: "127.0.0.1", port: 0 });
+  const { port } = app.server.address() as AddressInfo;
+  const started = Date.now();
+  return new Promise((resolve) => {
+    const socket = connect({ host: "127.0.0.1", port });
+    let text = "";
+    socket.on("data", (chunk: Buffer) => {
+      text += chunk.toString("latin1");
+    });
+    socket.on("error", () => undefined);
+    socket.on("close", () => {
+      resolve({
+        status: Number(/^HTTP\/1\.1 (\d{3})/.exec(text)?.[1] ?? "0"),
+        closedAfter: Date.now() - started,
+      });
+    });
+    socket.write(`${head.join("\r\n")}\r\n\r\n${partial}`);
+  });
+}
+
+describe("requests that stall on a server with upload routes (review B2)", () => {
+  it("close at the usual limit or at once, whatever the route and however they are answered", async () => {
+    const route: OculusRoute = {
+      method: "POST",
+      path: "/upload",
+      upload: { maxBytes: 1000 },
+      handler: () => ({ ok: true }),
+    };
+    const { app } = await testServer({ timeouts: { request: 800, headers: 800 } }, [route]);
+    const usual = 800;
+    const cases: [string, string[], number][] = [
+      [
+        "a cross-origin POST",
+        [
+          "POST /echo HTTP/1.1",
+          "Host: localhost",
+          "Origin: https://elsewhere.example.org",
+          "Content-Type: application/json",
+          "Content-Length: 100000",
+        ],
+        403,
+      ],
+      [
+        "a GET with a body",
+        ["GET /items/abc HTTP/1.1", "Host: localhost", "Content-Length: 100000"],
+        200,
+      ],
+      [
+        "JSON to the upload route",
+        [
+          "POST /upload HTTP/1.1",
+          "Host: localhost",
+          "Origin: http://localhost",
+          "Content-Type: application/json",
+          "Content-Length: 100000",
+        ],
+        415,
+      ],
+      [
+        "a form to the upload route",
+        [
+          "POST /upload HTTP/1.1",
+          "Host: localhost",
+          "Origin: http://localhost",
+          "Content-Type: application/x-www-form-urlencoded",
+          "Content-Length: 100000",
+        ],
+        415,
+      ],
+      [
+        "a cross-origin POST to the upload route",
+        [
+          "POST /upload HTTP/1.1",
+          "Host: localhost",
+          "Origin: https://elsewhere.example.org",
+          "Content-Type: application/octet-stream",
+          "Content-Length: 100000",
+        ],
+        403,
+      ],
+      [
+        "a JSON body that never finishes",
+        [
+          "POST /echo HTTP/1.1",
+          "Host: localhost",
+          "Origin: http://localhost",
+          "Content-Type: application/json",
+          "Content-Length: 100000",
+        ],
+        408,
+      ],
+    ];
+    for (const [name, head, status] of cases) {
+      const result = await stall(app, head, '{"a":');
+      expect(result.status, name).toBe(status);
+      expect(result.closedAfter, name).toBeLessThan(usual + 1500);
+    }
+    await app.close();
+  });
+});

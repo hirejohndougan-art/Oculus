@@ -1405,12 +1405,14 @@ describe("two connections at once", { timeout: 180_000 }, () => {
           source: source(),
         });
         // The sign-in's success transaction has deleted the address's counter
-        // and is about to update the user row when the use starts; the
-        // sign-in goes on once the use is waiting on a lock (or done).
+        // and is about to update the client address's counter when the use
+        // starts (it no longer updates the user row: "last sign-in" is
+        // stamped after the second step, S-053); the sign-in goes on once
+        // the use is waiting on a lock (or done).
         let fired = false;
         let use: Promise<Validated<{ readonly reset: true }>> | undefined;
         const gate = async (query: Sql): Promise<void> => {
-          if (!fired && query.text.includes("SET last_sign_in_at = now()")) {
+          if (!fired && query.text.includes("SET failures = greatest(failures - 1, 0)")) {
             fired = true;
             use = completePasswordReset(b, { token, password: `${NEW_PASSWORD} ${String(round)}` });
             const state = { settled: false };

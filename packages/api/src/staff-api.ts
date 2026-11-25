@@ -57,6 +57,30 @@
  * there), and `GET /api/records/:id` says what the person may do with the
  * record (`can`) and what it inherits (`inherited`).
  *
+ * Files (M-002, D-086): `POST /api/records/:id/files` streams one file's
+ * bytes to the file store (an upload route: its own type list, the cap
+ * counted as it streams), after the session, CSRF, `If-Match` and the
+ * asset's edit permission are checked and before a byte is read; `GET
+ * /api/records/:id/files` lists an asset's files.
+ * Reading files (M-003, D-097), for anyone who may view the asset, only
+ * through `fileReply` (D-089): `GET /api/records/:id/files/:fileId/content`
+ * downloads any file, always as `application/octet-stream` and an
+ * attachment; `.../view` shows a JPEG, PNG, GIF or WebP inline (by its
+ * sniffed type, never its name or claimed type; `422 not_viewable`
+ * otherwise); `.../thumbnail?size=small|medium` a JPEG thumbnail made by
+ * the service (`422 no_thumbnail` when none can be made). A file the asset
+ * doesn't have is the same `404 not_found` as a missing record. No byte
+ * ranges (fileReply sends whole files).
+ * Virus scanning (S-040, D-113): each listed file carries its content's
+ * `scan` (`pending`, `clean`, `infected`, `failed`, `not_scanned`). With a
+ * scanner set up only clean files are read: `409 scan_pending` and `409
+ * scan_failed` otherwise, files stored before scanning was turned on are
+ * read until their first scan (`not_yet_scanned`); an infected file is `423
+ * quarantined`, scanner or not. While scanning is on an upload larger than
+ * the scanner takes is `413 too_large_to_scan`. System managers read `GET /api/system/file-scans` (on or off, and
+ * the organization's counts) and queue every clean and failed file again
+ * with `POST /api/system/file-scans/rescan` (recent sign-in; `409
+ * scanning_off` without a scanner).
  * System settings (T-048a, D-087): `POST /api/sites` and `PUT
  * /api/sites/:id` make and rename a site (in the session's organization, or
  * the `organizationId` given), and `GET`/`PUT /api/system-settings` read and
@@ -80,7 +104,9 @@
 import { createHash } from "node:crypto";
 import {
   checkCsrfToken,
+  cleanFileName,
   csrfTokenFor,
+  isClaimedMediaType,
   isSiteId,
   issue,
   type Issue,
@@ -89,6 +115,7 @@ import {
 import { resolveSession, type FullSession, type Queryable } from "@oculus/db";
 import {
   contextFromSession,
+  type FileStore,
   type RecordService,
   type ServiceContext,
   type ServiceRefusal,
@@ -96,9 +123,12 @@ import {
 } from "@oculus/service";
 import { OCULUS_COOKIES } from "./cookies.js";
 import { Refusal } from "./errors.js";
+import { Transform, pipeline, type Readable } from "node:stream";
+import { fileReply } from "./file-replies.js";
 import type { OculusReply, OculusRequest, OculusRoute } from "./routes.js";
 import { peopleApiRoutes, type PeopleApiOptions } from "./people-api.js";
 import { updateApiRoutes, type UpdateApiOptions } from "./update-api.js";
+import { filesPurgeApiRoutes } from "./files-purge-api.js";
 import type { PublicSubjects } from "./public-subjects.js";
 import { DEFAULT_RATE_LIMITS, SessionRateLimiter, type RateBucket } from "./rate-limit.js";
 
@@ -141,6 +171,19 @@ export interface StaffApiOptions {
   readonly rateLimits?: Partial<Record<RateBucket, number>>;
   /** The limiter's clock (tests). */
   readonly clock?: () => number;
+  /**
+   * The file store (M-002, D-086), the same one the service was made with
+   * (`createService(db, { files })`). Without one, uploads answer `503
+   * files_unavailable`.
+   */
+  readonly files?: FileStore;
+  /** Limits on streamed files (defaults: 4 a session, 8 a person, 64 KiB every 10 s); tests change them. */
+  readonly downloads?: {
+    readonly perSession?: number;
+    readonly perUser?: number;
+    readonly minBytes?: number;
+    readonly windowMs?: number;
+  };
   /** People, roles and the audit trail (T-048, people-api.ts); left out, those routes aren't served. */
   readonly people?: PeopleApiOptions;
   /** Software updates (T-060, update-api.ts); left out, those routes aren't served. */
@@ -148,6 +191,22 @@ export interface StaffApiOptions {
   /** The cached public Subjects counts (S-038, public-subjects.ts), for their staff view. */
   readonly publicSubjects?: Pick<PublicSubjects, "statusFor">;
 }
+
+/** Files streamed at once per session (M-003). */
+export const MAX_DOWNLOADS_PER_SESSION = 4;
+/** Files streamed at once per person, across all their sessions (M-003). */
+export const MAX_DOWNLOADS_PER_USER = 8;
+/** A streamed file must send at least this many bytes in every window… */
+export const MIN_DOWNLOAD_BYTES = 64 * 1024;
+/** …of this many milliseconds, or it is cut off. */
+export const MIN_DOWNLOAD_WINDOW_MS = 10_000;
+
+/** The headers carrying an upload's original name (percent-encoded UTF-8) and claimed type. */
+export const FILE_NAME_HEADER = "x-oculus-file-name";
+export const FILE_TYPE_HEADER = "x-oculus-file-type";
+
+/** An upload's name when the client gives none. */
+const UNNAMED_FILE = "untitled";
 
 /** The header carrying the CSRF token on every change. */
 export const CSRF_HEADER = "x-oculus-csrf";
@@ -389,6 +448,67 @@ function optionalBody(
   return extra ?? { body };
 }
 
+/**
+ * An upload's original name from `X-Oculus-File-Name` (percent-encoded
+ * UTF-8, as `encodeURIComponent` writes it), cleaned by core's
+ * `cleanFileName`: metadata only, never part of a path. `400 bad_file_name`
+ * when it can't be decoded or kept.
+ */
+function uploadName(request: OculusRequest): string {
+  const raw = request.headers[FILE_NAME_HEADER];
+  if (raw === undefined) return UNNAMED_FILE;
+  let decoded: string;
+  try {
+    if (raw.length > 2048) throw new Error("too long");
+    decoded = decodeURIComponent(raw);
+  } catch {
+    throw new Refusal(400, "bad_file_name");
+  }
+  const name = cleanFileName(decoded);
+  if (name === undefined) throw new Refusal(400, "bad_file_name");
+  return name;
+}
+
+/**
+ * The type the client claims for an upload: `X-Oculus-File-Type`, else the
+ * request's own type unless it is `application/octet-stream`. A hint, kept
+ * beside the type sniffed from the bytes; `400 bad_file_type` when malformed.
+ */
+function claimedType(request: OculusRequest, contentType: string): string | undefined {
+  const raw = request.headers[FILE_TYPE_HEADER];
+  if (raw === undefined) {
+    return contentType === "application/octet-stream" ? undefined : contentType;
+  }
+  const type = raw.trim().toLowerCase();
+  if (type === "") return undefined;
+  if (!isClaimedMediaType(type)) throw new Refusal(400, "bad_file_type");
+  return type;
+}
+
+/** The file codes of the service, as HTTP refusals; `undefined` for anything else. */
+function fileRefusal(result: ServiceRefusal): Refusal | undefined {
+  const codes = new Set(result.issues.map((i) => i.code));
+  // A file the asset doesn't have: the same reply as a missing record.
+  if (codes.has("unknown_file")) return new Refusal(404, "not_found");
+  if (codes.has("not_viewable")) return new Refusal(422, "not_viewable");
+  // Virus scanning (S-040, D-113): only clean files are read while a
+  // scanner is set up; an infected one is never read.
+  if (codes.has("quarantined")) return new Refusal(423, "quarantined");
+  if (codes.has("scan_pending")) return new Refusal(409, "scan_pending");
+  if (codes.has("scan_failed")) return new Refusal(409, "scan_failed");
+  if (codes.has("scanning_off")) return new Refusal(409, "scanning_off");
+  // Larger than the scanner takes: it could never be scanned, so never kept.
+  if (codes.has("too_large_to_scan")) return new Refusal(413, "too_large_to_scan");
+  if (codes.has("no_thumbnail")) return new Refusal(422, "no_thumbnail");
+  if (codes.has("busy")) return new Refusal(503, "busy");
+  if (codes.has("not_cached")) return new Refusal(405, "method_not_allowed");
+  if (codes.has("files_unavailable")) return new Refusal(503, "files_unavailable");
+  if (codes.has("file_too_large")) return new Refusal(413, "payload_too_large");
+  if (codes.has("quota_exceeded")) return new Refusal(413, "quota_exceeded");
+  if (codes.has("disk_full")) return new Refusal(507, "disk_full");
+  return undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Service answers as HTTP replies
 
@@ -433,7 +553,10 @@ export function refused(
           VERSION_PATHS.has(String(i.path[0]))) ||
         (i.code === "unknown_template" && onPath(i, "key")) ||
         (i.code === "unknown_share" && onPath(i, "shareId")) ||
-        (i.code === "unknown_site" && onPath(i, "siteId")),
+        (i.code === "unknown_site" && onPath(i, "siteId")) ||
+        // A share offered to a site that doesn't exist (or to its own home
+        // site): the same 404 as any other unknown site (S-050).
+        (i.code === "unknown_site" && onPath(i, "targetSiteId")),
     )
   ) {
     throw new Refusal(404, "not_found");
@@ -574,7 +697,251 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
     };
   }
 
+  /** Download or view one file (M-003): the service checks, fileReply sends. */
+  // Streamed files per session (M-003, review item 5; S-035's core): at
+  // most `perSession` at once, and each must keep sending at least
+  // `minBytes` every `windowMs` or it is cut off, so a slow reader can't
+  // hold files open (and the server's sockets) for the 2-hour deadline.
+  const downloadLimits = {
+    perSession: options.downloads?.perSession ?? MAX_DOWNLOADS_PER_SESSION,
+    perUser: options.downloads?.perUser ?? MAX_DOWNLOADS_PER_USER,
+    minBytes: options.downloads?.minBytes ?? MIN_DOWNLOAD_BYTES,
+    windowMs: options.downloads?.windowMs ?? MIN_DOWNLOAD_WINDOW_MS,
+  };
+  const streaming = new Map<string, number>();
+
+  /**
+   * The opener, counted against the session and the person while its
+   * stream is open, and kept to the minimum rate.
+   */
+  function counted(keys: readonly string[], open: () => Readable): () => Readable {
+    return () => {
+      const source = open();
+      for (const key of keys) streaming.set(key, (streaming.get(key) ?? 0) + 1);
+      let sent = 0;
+      let checked = 0;
+      const counter = new Transform({
+        transform(chunk: Buffer, _encoding, done) {
+          sent += chunk.byteLength;
+          done(null, chunk);
+        },
+      });
+      const timer = setInterval(() => {
+        if (sent - checked < downloadLimits.minBytes) {
+          counter.destroy(new Error("the download is too slow"));
+        }
+        checked = sent;
+      }, downloadLimits.windowMs);
+      timer.unref();
+      let released = false;
+      const release = (): void => {
+        if (released) return;
+        released = true;
+        clearInterval(timer);
+        for (const key of keys) {
+          const left = (streaming.get(key) ?? 1) - 1;
+          if (left <= 0) streaming.delete(key);
+          else streaming.set(key, left);
+        }
+      };
+      // A storage error reaches the counter (the reply's 500 or cut-off);
+      // the counter destroyed (client gone, too slow) closes the source.
+      pipeline(source, counter, () => undefined);
+      counter.once("close", release);
+      return counter;
+    };
+  }
+
+  /** Download or view one file (M-003): the service checks, fileReply sends. */
+  async function readFileRoute(
+    request: OculusRequest,
+    reply: OculusReply,
+    session: FullSession,
+    context: ServiceContext,
+    use: "download" | "view",
+  ): Promise<unknown> {
+    const keys = [`session:${session.sessionId}`, `user:${session.userId}`];
+    if (
+      (streaming.get(keys[0] ?? "") ?? 0) >= downloadLimits.perSession ||
+      (streaming.get(keys[1] ?? "") ?? 0) >= downloadLimits.perUser
+    ) {
+      throw new Refusal(429, "too_many_downloads");
+    }
+    const result = await service.fileContent(
+      context,
+      recordId(request),
+      request.params.fileId ?? "",
+      use,
+    );
+    if (!result.ok) {
+      const fixed = fileRefusal(result);
+      if (fixed !== undefined) throw fixed;
+      return refused(result, reply, log);
+    }
+    const { file, open } = result.value;
+    return fileReply({
+      body: counted(keys, open),
+      size: file.size,
+      // The sniffed type (D-086); fileReply sends a download as
+      // application/octet-stream whatever it is.
+      mediaType: file.mediaType,
+      fileName: file.name,
+      disposition: use === "view" ? "inline" : "attachment",
+    });
+  }
+
+  const files = options.files;
+  // The route's own streaming cap is the store's per-file cap (D-086).
+  const uploadLimit = files?.maxFileBytes ?? 1;
+
   return [
+    {
+      // Attach a file to a digital asset (M-002, D-086): the body is the
+      // file's bytes, streamed to disk, never buffered. Everything about the
+      // person and the asset is checked before a byte is read.
+      method: "POST",
+      path: "/api/records/:id/files",
+      upload: { maxBytes: uploadLimit },
+      handler: signedIn("write", true, async (request, reply, { context }) => {
+        const expectedVersion = ifMatchVersion(request);
+        const upload = request.upload;
+        if (upload === undefined) throw new Refusal(400, "bad_body");
+        const name = uploadName(request);
+        const claimed = claimedType(request, upload.contentType);
+        if (files === undefined) throw new Refusal(503, "files_unavailable");
+        const id = recordId(request);
+        const declared = upload.declaredBytes;
+        if (declared === 0) throw new Refusal(400, "empty_file");
+        const check = await service.mayAttachFile(context, id, {
+          expectedVersion,
+          ...(declared === undefined ? {} : { declaredBytes: declared }),
+        });
+        if (!check.ok) {
+          const fixed = fileRefusal(check);
+          if (fixed !== undefined) throw fixed;
+          return refused(check, reply, log);
+        }
+        // The smaller cap while scanning is on: the scanner's (S-040).
+        const cap = check.value.maxFileBytes;
+        const received = await files.receive(context.organizationId, upload.chunks(), {
+          signal: request.signal,
+          usedBytes: check.value.usedBytes,
+          maxBytes: cap,
+        });
+        if (!received.ok) {
+          switch (received.code) {
+            case "empty_file":
+              throw new Refusal(400, "empty_file");
+            case "quota_exceeded":
+              throw new Refusal(413, "quota_exceeded");
+            case "disk_full":
+              throw new Refusal(507, "disk_full");
+            default:
+              // Past the scanner's limit (below the store's own): said so.
+              throw cap < files.maxFileBytes
+                ? new Refusal(413, "too_large_to_scan")
+                : new Refusal(413, "payload_too_large");
+          }
+        }
+        const result = await service.attachFile(context, id, received.file, {
+          expectedVersion,
+          name,
+          ...(claimed === undefined ? {} : { claimedType: claimed }),
+        });
+        if (!result.ok) {
+          const fixed = fileRefusal(result);
+          if (fixed !== undefined) throw fixed;
+          return refused(result, reply, log);
+        }
+        reply.status(result.value.created ? 201 : 200);
+        return { file: result.value.file, created: result.value.created };
+      }),
+    },
+    {
+      // Remove one file from an asset (M-002, D-086): the attach rule,
+      // If-Match on the asset. Its copy goes at the next sweep once no row
+      // names its content.
+      method: "DELETE",
+      path: "/api/records/:id/files/:fileId",
+      handler: signedIn("write", true, async (request, reply, { context }) => {
+        const expectedVersion = ifMatchVersion(request);
+        if (request.body !== undefined) throw new Refusal(400, "bad_body");
+        const result = await service.removeFile(
+          context,
+          recordId(request),
+          request.params.fileId ?? "",
+          { expectedVersion },
+        );
+        if (!result.ok && result.issues.some((i) => i.code === "unknown_file")) {
+          // A file the asset doesn't have: the same reply as a missing record.
+          throw new Refusal(404, "not_found");
+        }
+        return answer(result, reply, (value) => value);
+      }),
+    },
+    {
+      // Download one file (M-003, D-097): whatever it is, an attachment
+      // sent as application/octet-stream (fileReply), named by RFC 6266.
+      method: "GET",
+      path: "/api/records/:id/files/:fileId/content",
+      handler: signedIn("read", false, (request, reply, { session, context }) =>
+        readFileRoute(request, reply, session, context, "download"),
+      ),
+    },
+    {
+      // Show one file inline (M-003): a JPEG, PNG, GIF or WebP by its
+      // sniffed type only, with fileReply's sandboxing CSP and nosniff.
+      method: "GET",
+      path: "/api/records/:id/files/:fileId/view",
+      handler: signedIn("read", false, (request, reply, { session, context }) =>
+        readFileRoute(request, reply, session, context, "view"),
+      ),
+    },
+    {
+      // A thumbnail of one image (M-003): a JPEG made by the service.
+      method: "GET",
+      path: "/api/records/:id/files/:fileId/thumbnail",
+      handler: signedIn("read", false, async (request, reply, { context }) => {
+        const size = queryText(request, "size") ?? "small";
+        if (size !== "small" && size !== "medium") throw new Refusal(400, "bad_query");
+        // HEAD never makes a thumbnail: the cache's, or 405.
+        const result = await service.fileThumbnail(
+          context,
+          recordId(request),
+          request.params.fileId ?? "",
+          size,
+          { cacheOnly: request.method === "HEAD" },
+        );
+        if (!result.ok) {
+          const fixed = fileRefusal(result);
+          if (fixed !== undefined) throw fixed;
+          return refused(result, reply, log);
+        }
+        const jpeg = result.value.jpeg;
+        return fileReply({
+          body: jpeg,
+          size: jpeg.byteLength,
+          mediaType: "image/jpeg",
+          fileName: "thumbnail.jpg",
+          disposition: "inline",
+        });
+      }),
+    },
+    {
+      // The asset's files: name, size, sniffed type, who and when. Never
+      // the bytes (the routes above send those).
+      method: "GET",
+      path: "/api/records/:id/files",
+      handler: signedIn("read", false, async (request, reply, { context }) => {
+        const result = await service.listFiles(context, recordId(request));
+        return answer(result, reply, (value) => ({
+          files: value,
+          // So the admin can refuse a file that's too large before sending it.
+          // While scanning is on, no more than the scanner takes (S-040).
+          maxFileBytes: service.fileUploadLimit() ?? null,
+        }));
+      }),
+    },
     {
       method: "GET",
       path: "/api/session",
@@ -861,6 +1228,8 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
     ...(options.updates === undefined
       ? []
       : updateApiRoutes(options.updates, { service, log, signedIn })),
+    // Clean up removed files (S-052): only where files are stored.
+    ...(files === undefined ? [] : filesPurgeApiRoutes({ service, log, signedIn })),
     {
       method: "GET",
       path: "/api/templates",
@@ -1082,6 +1451,34 @@ export function staffApiRoutes(options: StaffApiOptions): OculusRoute[] {
         const status = options.publicSubjects?.statusFor(context.organizationId, siteId);
         if (status === undefined) throw new Refusal(404, "not_found");
         return status;
+      }),
+    },
+    // Virus scanning (S-040, D-113): whether a scanner is set up and the
+    // organization's files by scan state; and scanning them all again (after
+    // the scanner's signatures were updated), which needs a recent sign-in.
+    // System managers only (the service refuses everyone else).
+    {
+      method: "GET",
+      path: "/api/system/file-scans",
+      handler: signedIn("read", false, async (_request, reply, { context }) => {
+        const result = await service.fileScanStatus(context);
+        return answer(result, reply, (value) => value);
+      }),
+    },
+    {
+      method: "POST",
+      path: "/api/system/file-scans/rescan",
+      handler: signedIn("write", true, async (request, reply, { session, context }) => {
+        const body = objectBody(request);
+        const extra = onlyKeys(body, [], reply);
+        if (extra) return extra;
+        recentSignIn(session);
+        const result = await service.rescanFiles(context);
+        if (!result.ok) {
+          const fixed = fileRefusal(result);
+          if (fixed !== undefined) throw fixed;
+        }
+        return answer(result, reply, (value) => value);
       }),
     },
     {

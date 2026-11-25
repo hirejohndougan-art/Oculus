@@ -27,6 +27,7 @@ import {
   clientKey,
   PUBLIC_POOL_SIZE,
   PUBLIC_POOL_WAIT_MS,
+  PUBLIC_QUERY_TIMEOUT_MS,
   publicApiRoutes,
   publicPoolOptions,
 } from "./public-api.js";
@@ -42,6 +43,7 @@ let reader: Database;
 let readerRole: string;
 let app: FastifyInstance;
 let dir: string;
+let filesDir: string;
 let published: string;
 let draft: string;
 let otherSite: string;
@@ -136,6 +138,7 @@ beforeAll(async () => {
   dir = mkdtempSync(join(tmpdir(), "oculus-t050d-"));
   writeFileSync(join(dir, "index.html"), "<!doctype html><title>Oculus</title>");
   mkdirSync(join(dir, "assets"));
+  filesDir = mkdtempSync(join(tmpdir(), "oculus-t050d-files-"));
   app = await buildAdminServer({
     db: w.db,
     publicDb: reader,
@@ -145,6 +148,7 @@ beforeAll(async () => {
       OCULUS_ADMIN_ORIGIN: ADMIN,
       OCULUS_SECRET_KEY: FAKE_TEST_SECRET_KEY,
       OCULUS_PUBLIC_SITES: `${PUBLIC}=${w.a1}`,
+      OCULUS_FILES_DIR: filesDir,
     },
     adminFiles: loadAdminFiles(dir),
     log: () => undefined,
@@ -154,6 +158,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await app.close();
   rmSync(dir, { recursive: true, force: true });
+  rmSync(filesDir, { recursive: true, force: true });
   await reader.close();
   await w.db.close();
   await w.testDb.drop();
@@ -367,7 +372,11 @@ describe("GET /records/:id on a public host", () => {
       applicationName: "oculus-public",
       max: PUBLIC_POOL_SIZE,
       connectionTimeoutMillis: PUBLIC_POOL_WAIT_MS,
+      queryTimeoutMillis: PUBLIC_QUERY_TIMEOUT_MS,
     });
+    // Above every statement limit (at most 60 s), so it only fires on a dead
+    // server or network (S-051).
+    expect(PUBLIC_QUERY_TIMEOUT_MS).toBeGreaterThan(60_000);
     expect(PUBLIC_POOL_WAIT_MS).toBeGreaterThan(0);
     expect(PUBLIC_POOL_WAIT_MS).toBeLessThanOrEqual(10_000);
   });

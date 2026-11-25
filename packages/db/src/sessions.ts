@@ -1212,9 +1212,23 @@ export interface CleanupResult {
   readonly sessions: number;
   readonly signInThrottles: number;
   readonly passwordResets: number;
-  /** Wrong-code counters (T-038) a day old, and those of sessions that have ended. */
+  /** Wrong-code counters (T-038) a day old (unexplained ones, S-045: 30 days), and those of sessions that have ended. */
   readonly secondStepThrottles: number;
+  /** Alerts written for unexplained wrong codes an hour old (S-045). */
+  readonly secondStepAlerts: number;
 }
+
+/**
+ * How long wrong TOTP codes that no right code in their session explained
+ * are kept (S-045, D-077): 30 days without a new code.
+ */
+export const WRONG_CODE_MEMORY_SECONDS = 30 * 24 * 60 * 60;
+
+/**
+ * Unexplained wrong codes this old are told by the cleanup command (S-045):
+ * a waiting session lives 10 minutes, so no right code can explain them now.
+ */
+export const UNEXPLAINED_TOLD_AFTER_SECONDS = 60 * 60;
 
 /**
  * The cleanup command's work (`npm run db:cleanup`, D-035: any scheduler can
@@ -1227,11 +1241,48 @@ export async function runCleanup(db: Queryable): Promise<CleanupResult> {
   const signInThrottles = await deleteExpiredSignInThrottles(db);
   // core's SECOND_STEP_THROTTLE forgets a counter after a day without a
   // failure; a waiting session's counter is useless once the session is gone.
+  // A person's unexplained wrong codes (`wrong:`, S-045) an hour old can't
+  // be explained any more (a waiting session lives 10 minutes): they are told
+  // now, as an alert, and taken off; the row itself is kept 30 days.
+  const told = await db.rows<{ n: number }>(sql`
+    WITH old AS (
+      SELECT key, failures FROM public.second_step_throttles
+      WHERE key LIKE 'wrong:%' AND failures > 0
+        AND last_failure_at < clock_timestamp() - make_interval(secs => ${UNEXPLAINED_TOLD_AFTER_SECONDS})
+      ORDER BY key FOR UPDATE
+    ), cleared AS (
+      UPDATE public.second_step_throttles t SET failures = 0
+      FROM old WHERE t.key = old.key RETURNING old.key, old.failures
+    ), alerted AS (
+      INSERT INTO public.second_step_alerts (id, user_id, failures)
+      SELECT gen_random_uuid(), u.id, c.failures
+      FROM cleared c JOIN public.users u ON 'wrong:' || u.id::text = c.key
+      RETURNING 1
+    )
+    SELECT count(*)::int AS n FROM alerted`);
+  const secondStepAlerts = told[0]?.n ?? 0;
+  // Locked in key order first (S-054a), as a code attempt locks its
+  // counters: a delete in the table's own order could hold `wrong:` while
+  // waiting on the same person's `user:`, which an attempt holds while
+  // waiting on `wrong:`.
   const secondStepThrottles = await db.execute(sql`
-    DELETE FROM public.second_step_throttles t
-    WHERE t.last_failure_at IS NULL OR t.last_failure_at < clock_timestamp() - interval '1 day'
-       OR (t.key LIKE 'session:%' AND NOT EXISTS (
-             SELECT 1 FROM public.sessions s WHERE 'session:' || s.id::text = t.key))`);
+    WITH gone AS (
+      SELECT t.key FROM public.second_step_throttles t
+      WHERE t.last_failure_at IS NULL
+         OR (t.key NOT LIKE 'wrong:%' AND t.last_failure_at < clock_timestamp() - interval '1 day')
+         OR (t.key LIKE 'wrong:%'
+             AND t.last_failure_at < clock_timestamp() - make_interval(secs => ${WRONG_CODE_MEMORY_SECONDS}))
+         OR (t.key LIKE 'session:%' AND NOT EXISTS (
+               SELECT 1 FROM public.sessions s WHERE 'session:' || s.id::text = t.key))
+      ORDER BY t.key FOR UPDATE OF t
+    )
+    DELETE FROM public.second_step_throttles t USING gone WHERE t.key = gone.key`);
   const passwordResets = await deleteOldPasswordResets(db);
-  return Object.freeze({ sessions, signInThrottles, secondStepThrottles, passwordResets });
+  return Object.freeze({
+    sessions,
+    signInThrottles,
+    secondStepThrottles,
+    secondStepAlerts,
+    passwordResets,
+  });
 }

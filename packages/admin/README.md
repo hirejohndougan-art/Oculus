@@ -31,7 +31,10 @@ changes asks first. Confirmations appear in the page beside their control.
   last (`dist/`). The admin's server (`npm run admin`, `packages/api`'s
   `admin-cli.ts`) serves `dist/` on `OCULUS_ADMIN_ORIGIN` with its own CSP
   (`script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'
-  data:`), beside the API.
+  data:`), beside the API. It needs `OCULUS_FILES_DIR`: a folder of its
+  own, owned by the user it runs as and writable by that user alone (for
+  example `mkdir -m 700 ~/oculus-files`), where uploaded files are kept
+  (D-086).
 - In development, run the admin's server with `NODE_ENV=development` on
   port 3000, `OCULUS_ORIGINS=http://localhost:5173` and
   `OCULUS_ADMIN_ORIGIN=http://localhost:5173`, then `npm run dev -w

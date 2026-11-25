@@ -25,6 +25,10 @@ const OFFER_PROBLEMS: Readonly<Record<string, string>> = {
     "There is no such site under that organization, or it is this record's own site. Check both IDs with the other site's manager.",
   already_shared: "This record is already offered or shared to that site.",
   not_published: "Only a published record can be offered. Publish it first.",
+  too_many_offers:
+    "That site already has 100 offers from your organization waiting for an answer. Ask its manager to answer some, or withdraw some from their records.",
+  declined_recently:
+    "That site declined this record in the last 30 days. You can offer it again after that.",
 };
 
 export function SharingPanel(props: {
@@ -85,10 +89,14 @@ export function SharingPanel(props: {
       };
       await refreshShares(queries, site, props.recordId);
     } catch (error) {
+      // The record is on screen, so a 404 here is the site: no such site
+      // under that organization, or this record's own (S-050).
       const code =
         error instanceof ApiError && error.status === 422
           ? issuesIn(error.body)[0]?.code
-          : undefined;
+          : error instanceof ApiError && error.status === 404
+            ? "unknown_site"
+            : undefined;
       result = {
         tone: "amber",
         text:

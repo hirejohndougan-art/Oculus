@@ -37,6 +37,8 @@ let reader: Database;
 let readerRole: string;
 let app: FastifyInstance;
 let dir: string;
+/** The admin server's files folder (D-086), one of this file's own. */
+let filesDir: string;
 
 async function withRole(q: Queryable, statement: string, role: string): Promise<void> {
   await q.rows(sql`SELECT set_config('oculus_test.role', ${role}, true),
@@ -101,6 +103,7 @@ beforeAll(async () => {
     );
   }
   dir = mkdtempSync(join(tmpdir(), "oculus-t041f-"));
+  filesDir = mkdtempSync(join(tmpdir(), "oculus-t041f-files-"));
   writeFileSync(join(dir, "index.html"), "<!doctype html><title>Oculus</title>");
   mkdirSync(join(dir, "assets"));
   app = await buildAdminServer({
@@ -113,6 +116,7 @@ beforeAll(async () => {
       OCULUS_SECRET_KEY: FAKE_TEST_SECRET_KEY,
       // A1 and A2 have public hosts; B1 (the library) has none on this server.
       OCULUS_PUBLIC_SITES: `${PUBLIC}=${w.a1},${PUBLIC2}=${w.a2}`,
+      OCULUS_FILES_DIR: filesDir,
     },
     adminFiles: loadAdminFiles(dir),
     log: () => undefined,
@@ -122,6 +126,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await app.close();
   rmSync(dir, { recursive: true, force: true });
+  rmSync(filesDir, { recursive: true, force: true });
   await reader.close();
   await w.db.close();
   await w.testDb.drop();

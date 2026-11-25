@@ -39,6 +39,7 @@ import {
   type AppliedMigration,
   databaseBeforeSetup,
   grantWriterRole,
+  identityGrantHint,
   migrate,
   MigrationError,
   openDatabase,
@@ -67,6 +68,7 @@ import {
   takeLock,
   urlHasPassword,
   windowProfileFolder,
+  windowsSettingsWarning,
   type Env,
 } from "./desktop.js";
 import { ORIGINS_ENV } from "./origin.js";
@@ -300,6 +302,8 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
   let wantedPort: number;
   try {
     folder = settingsFolder(platform, env, options.home ?? homedir());
+    const warning = windowsSettingsWarning(platform, env);
+    if (warning !== undefined) err(warning);
     ensureSettingsFolder(folder);
     const settings = readDesktopSettings(folder);
     url = chooseDatabaseUrl(env, settings, folder);
@@ -484,9 +488,10 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
           (p) => p.code !== "missing_privilege",
         );
         if (before.length > 0) return refuse(before);
-        await owner.transaction(async (tx) => {
-          await grantWriterRole(tx, await writerRoleName(server));
-        });
+        const writer = await writerRoleName(server);
+        const granted = await owner.transaction((tx) => grantWriterRole(tx, writer));
+        // Not a failure (S-052): the purge of removed files waits for it.
+        if (!granted.identityReadable) out(identityGrantHint(writer));
         const after = await checkWriterConnection(server);
         if (after.length > 0) return refuse(after);
       }
@@ -501,8 +506,13 @@ export async function runDesktop(options: DesktopOptions): Promise<number> {
 
     const port = await choosePort(wantedPort);
     const origin = `http://127.0.0.1:${String(port)}`;
+    // Uploaded files (M-002, D-086): OCULUS_FILES_DIR if set, else a folder
+    // of their own in the settings folder, readable by the person only.
+    const filesDir = env.OCULUS_FILES_DIR ?? join(folder, "files");
+    if (env.OCULUS_FILES_DIR === undefined) mkdirSync(filesDir, { recursive: true, mode: 0o700 });
     const serverEnv: Record<string, string | undefined> = {
       ...env,
+      OCULUS_FILES_DIR: filesDir,
       NODE_ENV: "development",
       [ORIGINS_ENV]: origin,
       [ADMIN_ORIGIN_ENV]: origin,

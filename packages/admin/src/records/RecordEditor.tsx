@@ -28,6 +28,7 @@ import { ApiError, api, problemText } from "../api";
 import { Button, Note, TextLink } from "../components/ui";
 import { Choice, ConfirmPanel, StatePill, TextInput } from "./controls";
 import { FieldInput } from "./FieldInput";
+import { FilesPanel } from "./FilesPanel";
 import { HistoryPanel } from "./HistoryPanel";
 import { SharingPanel } from "../shares/SharingPanel";
 import {
@@ -885,6 +886,15 @@ function Editor(props: EditorProps) {
             siteId={siteId}
             recordId={reply.record.id}
             published={state === "published"}
+          />
+        ) : null}
+
+        {reply?.record.kind === "digital_asset" ? (
+          <FilesPanel
+            siteId={siteId}
+            recordId={reply.record.id}
+            version={reply.version}
+            canUpload={can.edit}
           />
         ) : null}
 

@@ -488,6 +488,114 @@ describe("npm run setup", () => {
     }
   });
 
+  it("trusts Oculus's migration table only when its names and hashes match the files (S-031)", async () => {
+    const cases = [
+      // A row whose hash isn't the file's.
+      [
+        sql`CREATE TABLE public.oculus_migrations (name text PRIMARY KEY, sha256 text NOT NULL)`,
+        sql`INSERT INTO public.oculus_migrations VALUES ('0001_migrations_table.sql', 'not-the-hash')`,
+      ],
+      // A name no file has.
+      [
+        sql`CREATE TABLE public.oculus_migrations (name text PRIMARY KEY, sha256 text NOT NULL)`,
+        sql`INSERT INTO public.oculus_migrations VALUES ('9999_someone_elses.sql', 'x')`,
+      ],
+      // No hashes at all.
+      [sql`CREATE TABLE public.oculus_migrations (name text PRIMARY KEY)`],
+    ];
+    for (const statements of cases) {
+      const testDb = await freshDatabase();
+      const db = openDatabase(testDb.url, { max: 1 });
+      try {
+        for (const statement of statements) await db.execute(statement);
+        expect(await databaseBeforeSetup(db)).toBe("other");
+        const run = await runCli({ OCULUS_DATABASE_URL: testDb.url }, typed);
+        expect(run.code).toBe(1);
+        expect(run.asked).toEqual([]);
+      } finally {
+        await db.close();
+        await testDb.drop();
+      }
+    }
+  });
+
+  it("doesn't finish a migrated database that has things the migrations never make (S-031)", async () => {
+    const testDb = await freshDatabase();
+    const db = openDatabase(testDb.url, { max: 1 });
+    try {
+      await migrate({ connectionString: testDb.url });
+      expect(await databaseBeforeSetup(db)).toBe("empty");
+      await db.execute(sql`CREATE SCHEMA side_door`);
+      expect(await databaseBeforeSetup(db)).toBe("other");
+      const run = await runCli({ OCULUS_DATABASE_URL: testDb.url }, typed);
+      expect(run.code).toBe(1);
+      expect(run.asked).toEqual([]);
+    } finally {
+      await db.close();
+      await testDb.drop();
+    }
+  });
+
+  it("says an extension from template1 is why a new database isn't empty (S-031)", async () => {
+    const testDb = await freshDatabase();
+    const db = openDatabase(testDb.url, { max: 1 });
+    try {
+      await db.execute(sql`CREATE EXTENSION citext`);
+      expect(await databaseBeforeSetup(db)).toBe("other");
+      const run = await runCli({ OCULUS_DATABASE_URL: testDb.url }, typed);
+      expect(run.code).toBe(1);
+      expect(run.out).toContain("template1");
+      expect(run.out).toContain("createdb -T template0 oculus");
+      // An extension with a view of its own: still the template1 hint.
+      await db.execute(sql`CREATE EXTENSION pg_stat_statements`);
+      const viewed = await runCli({ OCULUS_DATABASE_URL: testDb.url }, typed);
+      expect(viewed.out).toContain("template1");
+      // With something of someone else's too, the ordinary refusal: a domain,
+      // then a table.
+      await db.execute(sql`CREATE DOMAIN public.theirs_d AS int`);
+      const domain = await runCli({ OCULUS_DATABASE_URL: testDb.url }, typed);
+      expect(domain.out).not.toContain("template1");
+      await db.execute(sql`DROP DOMAIN public.theirs_d`);
+      await db.execute(sql`CREATE TABLE public.theirs (a int)`);
+      const other = await runCli({ OCULUS_DATABASE_URL: testDb.url }, typed);
+      expect(other.out).not.toContain("template1");
+    } finally {
+      await db.close();
+      await testDb.drop();
+    }
+  });
+
+  it("runs the migration with the keyboard quiet (S-031)", async () => {
+    const testDb = await freshDatabase();
+    try {
+      const order: string[] = [];
+      const s = scripted(typed);
+      const code = await runSetupCli(
+        { OCULUS_DATABASE_URL: testDb.url },
+        async (question, options) => {
+          order.push("ask");
+          return s.ask(question, options);
+        },
+        (l) => {
+          if (l.includes("0001_")) order.push("migrating");
+        },
+        () => undefined,
+        undefined,
+        async (work) => {
+          order.push("quiet");
+          const done = await work();
+          order.push("loud");
+          return done;
+        },
+      );
+      expect(code).toBe(0);
+      expect(order.slice(0, 2)).toEqual(["quiet", "migrating"]);
+      expect(order.indexOf("loud")).toBeLessThan(order.indexOf("ask"));
+    } finally {
+      await testDb.drop();
+    }
+  });
+
   it("classifies databases that aren't Oculus's, and changes none of them", async () => {
     const cases = [
       [sql`CREATE SCHEMA app`, sql`CREATE TABLE app.things (id int)`],

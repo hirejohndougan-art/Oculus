@@ -27,7 +27,23 @@
  * - `OCULUS_PUBLIC_SITES` is wrong (public-sites.ts), names a site that
  *   doesn't exist, or is set without a public reader connection
  *   (`publicDb`); or that connection, whenever one is given, could read more
- *   than the public read path (`checkPublicReaderConnection`, D-080).
+ *   than the public read path (`checkPublicReaderConnection`, D-080);
+ * - `OCULUS_FILES_DIR` (M-002, D-086) is missing, not an absolute path, or
+ *   not an existing writable directory, or the caps `OCULUS_FILE_MAX_MIB`
+ *   (default 500) or `OCULUS_FILES_TOTAL_MAX_MIB` (per organization,
+ *   default 20480) or the free-space floor `OCULUS_FILES_MIN_FREE_MIB`
+ *   (default: 5% of the disk or 2 GiB, whichever is smaller) aren't whole
+ *   numbers in range, or `OCULUS_FILES_AUTO_PURGE` is anything but `on` or
+ *   `off`. Stale temporary files are swept at startup and every 15
+ *   minutes. Removed files are purged only by a system manager's button or
+ *   `npm run files:purge`, unless `OCULUS_FILES_AUTO_PURGE=on` (default
+ *   off), which runs one purge step every 25 hours (S-052: a day and an
+ *   hour, so a second step due a day after the first is never just missed);
+ * - the virus scanner's settings (`OCULUS_CLAMD_*`, file-scanning.ts,
+ *   S-040, D-113) are malformed. None set is fine: files are then
+ *   `not_scanned` and served as before; in production that is logged as a
+ *   `startup_warning` (`files_not_scanned`), and a scanner set up but not
+ *   answering as `clamd_unreachable` (it is tried again by the queue).
  *
  * It warns loudly (a `startup_warning` log record) when the database
  * server's `log_parameter_max_length_on_error` is above 0, since pg's
@@ -40,6 +56,7 @@
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import {
+  databaseIdentity,
   loadSecretKeyring,
   sql,
   type Database,
@@ -47,9 +64,20 @@ import {
   type InvitationDelivery,
   type PasswordResetDelivery,
 } from "@oculus/db";
-import { createService } from "@oculus/service";
+import {
+  AUTOMATIC_PURGE_EVERY_MS,
+  clamdScanner,
+  createService,
+  createThumbnailRenderer,
+  FILE_LEASE_RENEW_MS,
+  pingClamd,
+  openFileStore,
+  type FileStore,
+  type FileStoreProblem,
+} from "@oculus/service";
 import type { FastifyInstance } from "fastify";
 import { ADMIN_ORIGIN_ENV, loadAdminFiles, type AdminFiles } from "./admin-files.js";
+import { scannerFromEnv } from "./file-scanning.js";
 import { originsFromEnv } from "./origin.js";
 import { isProduction } from "./environment.js";
 import { mailerFromEnv, type Mailer } from "./mail.js";
@@ -64,15 +92,127 @@ import {
   publicSitesFromEnv,
 } from "./public-sites.js";
 import type { OculusRoute } from "./routes.js";
-import { buildServer, type ServerOptions } from "./server.js";
+import { UPLOAD_TIMEOUTS, buildServer, type ServerOptions } from "./server.js";
 import { signInRoutes, type SignInApiOptions } from "./sign-in-api.js";
-import { serviceErrorLogger, staffApiRoutes, type ApiLogRecord } from "./staff-api.js";
+import {
+  redactedError,
+  serviceErrorLogger,
+  staffApiRoutes,
+  type ApiLogRecord,
+} from "./staff-api.js";
 import { updateChangeLog } from "./update-change-log.js";
 import { updateManagerFromEnv, type UpdateManager } from "./update-manager.js";
 
 export { isProduction };
 
 export const CLIENT_ADDRESS_ENV = "OCULUS_CLIENT_ADDRESS";
+export const FILES_DIR_ENV = "OCULUS_FILES_DIR";
+export const FILE_MAX_ENV = "OCULUS_FILE_MAX_MIB";
+export const FILES_TOTAL_MAX_ENV = "OCULUS_FILES_TOTAL_MAX_MIB";
+export const FILES_MIN_FREE_ENV = "OCULUS_FILES_MIN_FREE_MIB";
+/** `on` runs one purge step every 25 hours (S-052); default `off`: nothing purges on a timer. */
+export const FILES_AUTO_PURGE_ENV = "OCULUS_FILES_AUTO_PURGE";
+
+/**
+ * Whether the automatic purge is turned on: only `on` turns it on; unset,
+ * empty or `off` leaves it off; anything else refuses to start.
+ */
+export function automaticPurgeFromEnv(env: Readonly<Record<string, string | undefined>>): boolean {
+  const value = env[FILES_AUTO_PURGE_ENV]?.trim() ?? "";
+  if (value === "" || value === "off") return false;
+  if (value === "on") return true;
+  throw new Error(`refusing to start: ${FILES_AUTO_PURGE_ENV} must be on or off.`);
+}
+
+/** Why the files folder was refused, as the startup error says it (never the path). */
+const FILE_STORE_PROBLEMS: Readonly<Record<FileStoreProblem, string>> = {
+  no_store: "no files folder is configured.",
+  other_install:
+    "the folder belongs to another Oculus install (its .oculus-store-id names another database). Give this install a folder of its own.",
+  marker_missing:
+    "this database has used a files folder before, and this folder has no .oculus-store-id. Set OCULUS_FILES_DIR to the folder this database used (restore that folder from backup if it was lost).",
+  not_empty:
+    "the folder isn't empty and has no .oculus-store-id. Give Oculus an empty folder of its own.",
+};
+
+/** Temporary upload files older than this are swept: twice an upload's whole limit. */
+export const INCOMING_MAX_AGE_MS = 2 * UPLOAD_TIMEOUTS.request;
+/** How often the folder's lease moves on (D-086: at most this long until a shared folder shows). */
+export const FILE_LEASE_EVERY_MS = FILE_LEASE_RENEW_MS;
+
+/**
+ * What a server uses the files folder for: the database's identity, its
+ * name and the server's port, so two servers of one database agree and two
+ * databases never do. Read before the folder is bound, so nothing in it
+ * depends on the binding.
+ */
+async function serverKey(db: Database): Promise<string> {
+  const rows = await db.rows<{ name: string; port: number | null }>(
+    sql`SELECT current_database() AS name, inet_server_port() AS port`,
+  );
+  const identity = await databaseIdentity(db);
+  return encodeURIComponent(`${identity}|${rows[0]?.name ?? "-"}|${String(rows[0]?.port ?? "-")}`);
+}
+
+/** How often the scan queue looks for due scans (and once at startup; uploads kick it too). */
+export const FILE_SCAN_EVERY_MS = 60_000;
+
+/** How often the file sweep runs (and once at startup). */
+export const FILE_SWEEP_EVERY_MS = 15 * 60_000;
+
+/** A cap in MiB from the environment, as bytes; throws naming the variable, never the value. */
+function mibFromEnv(
+  env: Readonly<Record<string, string | undefined>>,
+  name: string,
+): number | undefined {
+  const text = env[name];
+  if (text === undefined || text.trim() === "") return undefined;
+  if (!/^[1-9][0-9]{0,6}$/.test(text.trim())) {
+    throw new Error(`refusing to start: ${name} must be a whole number of MiB from 1 to 1048576.`);
+  }
+  const mib = Number(text.trim());
+  if (mib > 1_048_576) {
+    throw new Error(`refusing to start: ${name} must be a whole number of MiB from 1 to 1048576.`);
+  }
+  return mib * 1024 * 1024;
+}
+
+/**
+ * The file store from `OCULUS_FILES_DIR` and the two caps (D-086). Refuses
+ * (throws) without the folder: uploads are part of the admin.
+ */
+export async function fileStoreFromEnv(
+  env: Readonly<Record<string, string | undefined>>,
+): Promise<FileStore> {
+  const dir = env[FILES_DIR_ENV];
+  if (dir === undefined || dir.trim() === "") {
+    throw new Error(`refusing to start: ${FILES_DIR_ENV} must name the folder files are kept in.`);
+  }
+  const maxFileBytes = mibFromEnv(env, FILE_MAX_ENV);
+  const maxOrganizationBytes = mibFromEnv(env, FILES_TOTAL_MAX_ENV);
+  const minFree = env[FILES_MIN_FREE_ENV];
+  let minFreeBytes: number | undefined;
+  if (minFree !== undefined && minFree.trim() !== "") {
+    if (!/^(0|[1-9][0-9]{0,6})$/.test(minFree.trim())) {
+      throw new Error(`refusing to start: ${FILES_MIN_FREE_ENV} must be a whole number of MiB.`);
+    }
+    minFreeBytes = Number(minFree.trim()) * 1024 * 1024;
+  }
+  try {
+    return await openFileStore({
+      dir,
+      ...(maxFileBytes === undefined ? {} : { maxFileBytes }),
+      ...(maxOrganizationBytes === undefined ? {} : { maxOrganizationBytes }),
+      ...(minFreeBytes === undefined ? {} : { minFreeBytes }),
+    });
+  } catch (error) {
+    // openFileStore's messages name no path.
+    throw new Error(
+      `refusing to start: ${FILES_DIR_ENV}: ${error instanceof Error ? error.message : "unusable"}`,
+      { cause: error },
+    );
+  }
+}
 
 /** Where the admin build is, from this file (dist or src, both two levels under the repo's packages). */
 export const DEFAULT_ADMIN_DIR = join(
@@ -98,6 +238,12 @@ export interface AdminServerOptions {
    * isn't served.
    */
   readonly countsDb?: Database;
+  /**
+   * OAI-PMH's own small pool on the staff role (S-051, `oaiPoolOptions`):
+   * its list and datestamp reads wait a bounded time for a connection.
+   * Left out (tests), they use `db`.
+   */
+  readonly oaiDb?: Database;
   /** Defaults to `process.env`. */
   readonly env?: Readonly<Record<string, string | undefined>>;
   /**
@@ -125,6 +271,11 @@ export interface AdminServerOptions {
   readonly logger?: ServerOptions["logger"];
   /** Routes of the program that starts the server (the desktop launcher's instance check, D-088). */
   readonly extraRoutes?: readonly OculusRoute[];
+  /**
+   * Server-side thumbnails (M-003, T-072, D-097): on by default; `false`
+   * turns them off, and `GET .../thumbnail` then answers `422 no_thumbnail`.
+   */
+  readonly thumbnails?: boolean;
   /** Passed on to the sign-in routes (tests). */
   readonly signIn?: Pick<SignInApiOptions, "rateLimits" | "clock" | "resetOptions">;
   /**
@@ -273,12 +424,39 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
           oaiStamps: oaiEmail !== undefined,
         });
 
-  const service = createService(options.db, { onError: serviceErrorLogger(log) });
+  const files = await fileStoreFromEnv(env);
+  // Virus scanning (S-040, D-113): only with clamd set up.
+  const scanning = scannerFromEnv(env);
+  if (scanning === undefined && production) {
+    log({ event: "startup_warning", code: "files_not_scanned" });
+  }
+  // Uploads over the scanner's limit are refused while scanning is on
+  // (S-040 review S1): the file cap is then really the scanner's.
+  if (scanning !== undefined && files.maxFileBytes > scanning.clamd.streamMaxBytes) {
+    log({ event: "startup_warning", code: "file_cap_over_scan_limit" });
+  }
+  // Thumbnails (M-003, T-072, D-097): one renderer (a decoder child
+  // process at a time), stopped with the server. Turned off, none is made.
+  const thumbnailsOn = options.thumbnails !== false;
+  const thumbnails = thumbnailsOn ? createThumbnailRenderer() : undefined;
+  const service = createService(options.db, {
+    onError: serviceErrorLogger(log),
+    files,
+    thumbnailsEnabled: thumbnailsOn,
+    ...(thumbnails === undefined ? {} : { thumbnails }),
+    ...(scanning === undefined
+      ? {}
+      : {
+          scanner: clamdScanner(scanning.clamd),
+          scanQueue: { concurrency: scanning.concurrency },
+        }),
+  });
   const routes = [
     ...staffApiRoutes({
       db: options.db,
       service,
       log,
+      files,
       people: {
         keys,
         deliverReset,
@@ -308,7 +486,7 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     ...(publicDb === undefined || publicSites.length === 0 || oaiEmail === undefined
       ? []
       : oaiPmhRoutes({
-          db: options.db,
+          db: options.oaiDb ?? options.db,
           publicDb,
           sites: publicSites,
           adminEmail: oaiEmail,
@@ -318,19 +496,144 @@ export async function buildAdminServer(options: AdminServerOptions): Promise<Fas
     ...(publicSubjects === undefined ? [] : publicSubjectsRoutes({ subjects: publicSubjects })),
     ...(options.extraRoutes ?? []),
   ];
-  const app = await buildServer({
-    env,
-    routes,
-    ...(options.logger === undefined ? {} : { logger: options.logger }),
-    ...(admin === undefined ? {} : { admin }),
-    // The public home pages until Phase 4 (D-109).
-    publicHomes: publicSites.map((site) => ({
-      origin: site.origin,
-      siteName: site.siteName ?? "",
-    })),
-    ...(publicSubjects === undefined ? {} : { onClose: () => publicSubjects.stop() }),
-  });
+  // The files folder (D-086). First this server's note in it, so a second
+  // server with another database is refused before it changes anything
+  // there (not the marker, not the lease); then the folder must be this
+  // install's (review B1).
+  const prepared = async <T>(step: () => Promise<T>): Promise<T> => {
+    try {
+      return await step();
+    } catch (error) {
+      // A file system error's message holds the path: only its code is shown.
+      const code = (error as { code?: unknown }).code;
+      throw new Error(
+        `refusing to start: ${FILES_DIR_ENV}: the folder couldn't be prepared (${typeof code === "string" && /^[A-Z][A-Z0-9_]{1,30}$/.test(code) ? code : "error"}).`,
+        { cause: error },
+      );
+    }
+  };
+  const automaticPurge = automaticPurgeFromEnv(env);
+  const key = await serverKey(options.db);
+  const claim = await prepared(() => files.claimServer(key));
+  if (!claim.ok) {
+    throw new Error(
+      `refusing to start: ${FILES_DIR_ENV}: another Oculus server on this computer uses this folder with another database. Give each database a folder of its own.`,
+    );
+  }
+  let bound: Awaited<ReturnType<typeof service.bindFileStore>>;
+  try {
+    bound = await prepared(() => service.bindFileStore());
+  } catch (error) {
+    claim.release();
+    throw error;
+  }
+  if (!bound.ok) {
+    claim.release();
+    throw new Error(`refusing to start: ${FILES_DIR_ENV}: ${FILE_STORE_PROBLEMS[bound.problem]}`);
+  }
+  if (bound.warning !== undefined) {
+    // Another database uses this folder, or this one was restored, copied
+    // or upgraded, or its identity can't be read, or the lease lock was
+    // busy: it starts; the purge refuses until an operator adopts the
+    // folder (or, when busy, the renewal tried again within a minute).
+    log({ event: "startup_warning", code: bound.warning });
+  }
+  const renew = async (): Promise<void> => {
+    try {
+      if (!(await service.renewFileLease())) {
+        log({ event: "startup_warning", code: "files_shared_or_restored" });
+      }
+    } catch (error) {
+      log({ event: "service_error", operation: "renewFileLease", ...redactedError(error) });
+    }
+  };
+  const sweep = async (): Promise<void> => {
+    try {
+      const swept = await service.sweepFiles(INCOMING_MAX_AGE_MS);
+      if (swept.failed > 0)
+        log({ event: "service_error", operation: "sweepFiles", code: "partial" });
+    } catch (error) {
+      log({ event: "service_error", operation: "sweepFiles", ...redactedError(error) });
+    }
+  };
+  await sweep();
+  const scan = async (): Promise<void> => {
+    try {
+      await service.scanQueuedFiles();
+    } catch (error) {
+      log({ event: "service_error", operation: "scanQueuedFiles", ...redactedError(error) });
+    }
+  };
+  let app: FastifyInstance;
+  try {
+    app = await buildServer({
+      env,
+      routes,
+      ...(options.logger === undefined ? {} : { logger: options.logger }),
+      ...(admin === undefined ? {} : { admin }),
+      // The public home pages until Phase 4 (D-109).
+      publicHomes: publicSites.map((site) => ({
+        origin: site.origin,
+        siteName: site.siteName ?? "",
+      })),
+      // Stopped before the server's close finishes: the public counts and
+      // the scans running now (S-040 review L5).
+      onClose: async () => {
+        await publicSubjects?.stop();
+        await service.stopFileScans();
+      },
+    });
+  } catch (error) {
+    claim.release();
+    throw error;
+  }
   // Started once the server is built, so a start that fails counts nothing.
   publicSubjects?.start();
+  const timer = setInterval(() => void sweep(), FILE_SWEEP_EVERY_MS);
+  timer.unref();
+  const lease = setInterval(() => void renew(), FILE_LEASE_EVERY_MS);
+  lease.unref();
+  // Another server held the lease lock at the start: the renewal is tried
+  // again within a minute, not only at the hour (S-052 third review).
+  const retry =
+    bound.warning === "files_lease_busy" ? setTimeout(() => void renew(), 30_000) : undefined;
+  retry?.unref();
+  // The purge on a timer only when turned on (S-052; default off).
+  const purge = async (): Promise<void> => {
+    try {
+      const purged = await service.purgeFiles({ apply: true, via: "timer" });
+      if (!purged.ok) log({ event: "startup_warning", code: `files_purge_${purged.problem}` });
+    } catch (error) {
+      log({ event: "service_error", operation: "purgeFiles", ...redactedError(error) });
+    }
+  };
+  const purgeTimer = automaticPurge
+    ? setInterval(() => void purge(), AUTOMATIC_PURGE_EVERY_MS)
+    : undefined;
+  purgeTimer?.unref();
+  // The scan queue (S-040): what is due now, then every minute. A scanner
+  // that doesn't answer is logged; its scans fail and are tried again.
+  let scans: ReturnType<typeof setInterval> | undefined;
+  if (scanning !== undefined) {
+    void pingClamd({ ...scanning.clamd, timeoutMs: Math.min(scanning.clamd.timeoutMs, 5000) })
+      .then((answered) => {
+        if (!answered) log({ event: "startup_warning", code: "clamd_unreachable" });
+      })
+      .catch(() => undefined);
+    void scan();
+    scans = setInterval(() => void scan(), FILE_SCAN_EVERY_MS);
+    scans.unref();
+  }
+  // Started once the server is built, so a start that fails counts nothing.
+  publicSubjects?.start();
+  app.server.once("close", () => {
+    clearInterval(timer);
+    clearInterval(lease);
+    if (purgeTimer !== undefined) clearInterval(purgeTimer);
+    if (retry !== undefined) clearTimeout(retry);
+    if (scans !== undefined) clearInterval(scans);
+    claim.release();
+    void thumbnails?.close();
+  });
   return app;
 }

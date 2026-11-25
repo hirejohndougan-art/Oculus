@@ -28,6 +28,7 @@ import {
   createFirstSystemAdmin,
   createInvitation,
   deleteExpiredSignInThrottles,
+  failureClass,
   markKnownSource,
   revokeInvitation,
   signIn,
@@ -666,7 +667,16 @@ describe("invitations", () => {
           inviteVia(conn, { organizationId: org, email: address, invitedBy: admin }),
         ),
       );
-      expect(made.every((r) => r.ok)).toBe(true);
+      // Each is stored; one sent while a newer one was made answers
+      // `superseded` (it was delivered, then revoked by the newer one), so
+      // every answer is `ok` or that, at least one is `ok`, and exactly one
+      // invitation stays pending.
+      const codes = made.map((r) => (r.ok ? "ok" : r.issues.map((i) => i.code).join(",")));
+      expect(
+        codes.every((c) => c === "ok" || c === "superseded"),
+        codes.join(" "),
+      ).toBe(true);
+      expect(codes).toContain("ok");
       const pending = await db.rows(sql`
         SELECT 1 FROM public.invitations WHERE organization_id = ${org}::uuid AND email = ${address}
           AND accepted_at IS NULL AND revoked_at IS NULL`);
@@ -2203,4 +2213,19 @@ describe("the writer's grants (D-068)", () => {
       });
     }
   }, 60_000);
+});
+
+describe("failureClass (S-050)", () => {
+  it("names a failure by its SQLSTATE or error name, never its message", () => {
+    expect(failureClass(Object.assign(new Error("secret 203.0.113.9"), { code: "57P01" }))).toBe(
+      "SQLSTATE 57P01",
+    );
+    expect(failureClass(new TypeError("person@example.org"))).toBe("TypeError");
+    expect(failureClass({ code: "ECONNREFUSED", name: "Error" })).toBe("ECONNREFUSED");
+    expect(failureClass({ code: "EPERM", name: "Error" })).toBe("EPERM");
+    expect(failureClass({ code: "40001" })).toBe("SQLSTATE 40001");
+    expect(failureClass({ name: "has spaces and 203.0.113.9" })).toBe("unknown");
+    expect(failureClass(null)).toBe("unknown");
+    expect(failureClass("text")).toBe("unknown");
+  });
 });

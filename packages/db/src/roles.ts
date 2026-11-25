@@ -28,6 +28,10 @@ import { PASSWORD_RESET_TABLE_PRIVILEGES } from "./password-resets.js";
 import { SECOND_FACTOR_TABLE_PRIVILEGES } from "./second-factor.js";
 import { ALERT_NOTICE_TABLE_PRIVILEGES } from "./alert-notices.js";
 import { SESSION_TABLE_PRIVILEGES } from "./sessions.js";
+import { STORED_FILE_TABLE_PRIVILEGES } from "./stored-files.js";
+import { FILE_SCAN_TABLE_PRIVILEGES } from "./file-scans.js";
+import { ACCESSION_TABLE_PRIVILEGES } from "./accessions.js";
+import { STORAGE_TABLE_PRIVILEGES } from "./storage.js";
 import { sql } from "./sql.js";
 
 /**
@@ -80,6 +84,19 @@ export const WRITER_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Ob
   // recovery codes written (codes also used and superseded); the wrong-code
   // counters. Nothing deletes a factor, a pass or a recovery code.
   ...SECOND_FACTOR_TABLE_PRIVILEGES,
+  // Stored files (M-002, D-086): attached by INSERT; rows never change and
+  // nothing deletes them yet.
+  ...STORED_FILE_TABLE_PRIVILEGES,
+  // Virus scan results (S-040, D-113): queued, then moved along; never
+  // deleted, and an infected content never changed back (0048's guard).
+  ...FILE_SCAN_TABLE_PRIVILEGES,
+  // Accessions and donor contacts (T-018c, D-114): accessions are made and
+  // changed, never deleted; a contact may be deleted. Their produced-records
+  // list and history are the migration's trigger's.
+  ...ACCESSION_TABLE_PRIVILEGES,
+  // Storage (T-018d, D-115): levels and locations made and changed, never
+  // deleted; moves insert only (a mistake is put right by a later move).
+  ...STORAGE_TABLE_PRIVILEGES,
   // The change log of people and roles (T-048, D-084): insert only.
   ...PEOPLE_TABLE_PRIVILEGES,
   // Two-step alert notices (D-085): one row per alert, only ever added.
@@ -107,17 +124,35 @@ export const WRITER_GRANTS: readonly string[] = Object.freeze([
   ),
 ]);
 
+/**
+ * `public` (every role) and `pg_` names (PostgreSQL's own roles), in any
+ * case: never a writer, never given a grant (S-052 third review).
+ */
+export function reservedRoleName(role: string): boolean {
+  const name = role.toLowerCase();
+  return name === "public" || name.startsWith("pg_");
+}
+
 /** A role name `grantWriterRole` takes: lower case, digits and `_`, up to 63 characters. */
 const ROLE_NAME = /^[a-z_][a-z0-9_]{0,62}$/;
 
 /**
  * Gives `role` the writer's privileges (`WRITER_GRANTS`) in the connected
  * database. Run as the owner of the tables (the migrating role), in a
- * transaction. The role must exist.
+ * transaction. The role must exist. Also tries `grantIdentityRead`, which
+ * only a superuser (or a role holding that grant with its option) can do:
+ * `identityReadable` says whether the role can now read the cluster's
+ * system identifier, which the purge of removed files needs (S-052).
  */
-export async function grantWriterRole(db: Queryable, role: string): Promise<void> {
+export async function grantWriterRole(
+  db: Queryable,
+  role: string,
+): Promise<{ readonly identityReadable: boolean }> {
   if (!ROLE_NAME.test(role)) {
     throw new TypeError("A role name is lower case letters, digits and _, at most 63 characters.");
+  }
+  if (reservedRoleName(role)) {
+    throw new TypeError("PUBLIC and pg_ roles are never Oculus's writer.");
   }
   for (const statement of WRITER_GRANTS) {
     // Names can't be parameters: the name goes in through set_config and is
@@ -128,6 +163,45 @@ export async function grantWriterRole(db: Queryable, role: string): Promise<void
       EXECUTE format(current_setting('oculus.grant_statement'), current_setting('oculus.grant_role'));
     END $$`);
   }
+  return { identityReadable: await grantIdentityRead(db, role) };
+}
+
+/**
+ * The line to show when `grantIdentityRead` couldn't make its grant
+ * (S-052, D-086): nothing fails over it, but the purge refuses until then.
+ */
+export function identityGrantHint(role: string): string {
+  return `Purging removed files will answer identity_unknown until a superuser runs, in this database: GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO ${role};`;
+}
+
+/**
+ * Lets `role` (default: the connected role) read the cluster's system
+ * identifier, `GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system()`, in
+ * the connected database (S-052): without it the database's identity is
+ * only `-:<oid>`, which a restore into a fresh cluster shares, and the purge
+ * of removed files refuses (`identity_unknown`). Only a superuser can grant
+ * it; for anyone else it changes nothing and never fails (safe inside a
+ * transaction). Returns whether the role can read it now.
+ */
+export async function grantIdentityRead(db: Queryable, role?: string): Promise<boolean> {
+  const [who] = await db.rows<{ name: string }>(sql`SELECT current_user::text AS name`);
+  const target = role ?? who?.name ?? "";
+  if (reservedRoleName(target)) throw new TypeError("PUBLIC and pg_ roles are never given this.");
+  const [already] = await db.rows<{ ok: boolean }>(sql`
+    SELECT pg_catalog.has_function_privilege(${target}, 'pg_catalog.pg_control_system()', 'EXECUTE')
+      AS ok`);
+  if (already?.ok === true) return true;
+  await db.rows(sql`SELECT set_config('oculus.grant_role', ${target}, true)`);
+  await db.execute(sql`DO $$ BEGIN
+    EXECUTE format('GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO %I',
+                   current_setting('oculus.grant_role'));
+  EXCEPTION WHEN insufficient_privilege THEN
+    NULL;
+  END $$`);
+  const [now] = await db.rows<{ ok: boolean }>(sql`
+    SELECT pg_catalog.has_function_privilege(${target}, 'pg_catalog.pg_control_system()', 'EXECUTE')
+      AS ok`);
+  return now?.ok === true;
 }
 
 /** What `checkWriterConnection` finds wrong with the connection's role. */
@@ -422,7 +496,9 @@ async function checkRoleConnection(
                          || pg_catalog.oidvectortypes(p.proargtypes) || ')' AS name
                   FROM pg_catalog.pg_proc p
                   JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+                  -- A trigger function can't be called by itself (T-018c).
                   WHERE p.prosecdef AND ${profile.definers !== undefined}::boolean
+                    AND p.prorettype <> 'pg_catalog.trigger'::pg_catalog.regtype
                     AND pg_catalog.has_function_privilege(w.oid, p.oid, 'EXECUTE')) AS f
             WHERE f.name <> ALL(${[...(profile.definers ?? [])]}::text[])) AS definers,
            (NOT w.current

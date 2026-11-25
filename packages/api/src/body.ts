@@ -30,6 +30,34 @@ export const DEFAULT_BODY_LIMIT = 1024 * 1024;
 export const CREDENTIALS_BODY_LIMIT = 8 * 1024;
 
 export const JSON_TYPE = "application/json";
+
+/**
+ * The request types an upload route takes (M-002, D-086), and no other
+ * route: exact, lower or upper case, with no parameters. The body is never
+ * parsed or buffered: it is streamed to the route as bytes (routes.ts
+ * `OculusUpload`), and its real type is sniffed from the bytes. The admin
+ * always sends `application/octet-stream`; the others let a plain client
+ * name a common passive type. No active type (HTML, XML, SVG, script) is
+ * on the list.
+ */
+export const UPLOAD_TYPES: readonly string[] = Object.freeze([
+  "application/octet-stream",
+  "application/pdf",
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/tiff",
+  "image/webp",
+  "image/heic",
+  "image/avif",
+  "audio/mpeg",
+  "audio/wav",
+  "audio/mp4",
+  "video/mp4",
+  "video/quicktime",
+  "text/plain",
+  "text/csv",
+]);
 export const FORM_TYPE = "application/x-www-form-urlencoded";
 
 /** Per-route settings for the HTTP layer, under `config.oculus`. */
@@ -38,6 +66,8 @@ export interface OculusRouteConfig {
   readonly form?: boolean;
   /** A sign-in, two-step or site password post: the 8 KiB body limit. */
   readonly credentials?: boolean;
+  /** An upload route: `UPLOAD_TYPES` only, streamed, never parsed (server.ts). */
+  readonly upload?: boolean;
 }
 
 declare module "fastify" {
@@ -200,12 +230,45 @@ export function bodyHeaderProblem(request: FastifyRequest): Refusal | undefined 
   return contentTypes > 1 ? new Refusal(400, "bad_request") : undefined;
 }
 
-/** Replaces Fastify's parsers with Oculus's two. */
+/**
+ * Upload bodies left unread, by request, for the upload route's handler
+ * (server.ts). Only the HTTP layer reads this; a handler gets the bytes
+ * through `OculusUpload`, never the stream.
+ */
+export const uploadStreams = new WeakMap<FastifyRequest, AsyncIterable<unknown>>();
+
+/** True when a Content-Type header is exactly `type`, any case, with no parameters. */
+function isBareMediaType(header: string | undefined, type: string): boolean {
+  return header?.toLowerCase() === type;
+}
+
+/**
+ * Replaces Fastify's parsers with Oculus's own: JSON everywhere but upload
+ * routes, forms on form routes, and `UPLOAD_TYPES` on upload routes only.
+ */
 export function registerBodyParsers(app: FastifyInstance): void {
   app.removeAllContentTypeParsers();
+  for (const type of UPLOAD_TYPES) {
+    // Not `parseAs`: the body stays unread (Fastify's own body limit only
+    // counts bodies it reads), and the upload view counts it as it streams.
+    app.addContentTypeParser(type, (request, payload, done) => {
+      if (
+        routeConfig(request)?.upload !== true ||
+        !isBareMediaType(request.headers["content-type"], type)
+      ) {
+        done(new Refusal(415, "unsupported_media_type"), undefined);
+        return;
+      }
+      uploadStreams.set(request, payload);
+      done(null, undefined);
+    });
+  }
   app.addContentTypeParser(JSON_TYPE, { parseAs: "buffer" }, (request, body, done) => {
     try {
-      if (!isExactMediaType(request.headers["content-type"], JSON_TYPE)) {
+      if (
+        routeConfig(request)?.upload === true ||
+        !isExactMediaType(request.headers["content-type"], JSON_TYPE)
+      ) {
         throw new Refusal(415, "unsupported_media_type");
       }
       done(null, parseJsonBody(body as Buffer));
@@ -217,6 +280,7 @@ export function registerBodyParsers(app: FastifyInstance): void {
     try {
       if (
         routeConfig(request)?.form !== true ||
+        routeConfig(request)?.upload === true ||
         !isExactMediaType(request.headers["content-type"], FORM_TYPE)
       ) {
         throw new Refusal(415, "unsupported_media_type");
