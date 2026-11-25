@@ -4,7 +4,7 @@
 // the database's time and never changed, a record that has moved can't be
 // deleted, and the public reader can read none of it. Every person, place
 // and record here is invented.
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   newOrganizationId,
   newRecordId,
@@ -22,6 +22,7 @@ import {
   insertTemplateVersion,
   migrate,
   openDatabase,
+  readAuditTrail,
   sql,
   type Database,
   type Queryable,
@@ -98,6 +99,11 @@ async function ready(): Promise<void> {
   })();
   folks = await peopleReady;
 }
+
+// Warm the setup before the first test, under the suite's longer hook limit
+// (U-008). A failure stays in `setup`, so with no database each test still
+// fails on its own when it calls ready().
+beforeAll(() => ready().catch(() => undefined));
 
 afterAll(async () => {
   const done = await setup?.catch(() => undefined);
@@ -316,6 +322,69 @@ describe("storage through the service (T-018d)", () => {
         }),
       ),
     ).toEqual(["not_permitted"]);
+  });
+
+  it("puts locations made and renamed, and moves, in the audit trail (S-064)", async () => {
+    await ready();
+    const w = await world();
+    const r = await room(w, "Invented Room 9");
+    ok(
+      await service.saveStorageLocation(
+        ctx(w, w.cataloger),
+        r.id,
+        { kind: "storage", name: "Invented Room 9 East", level: 0 },
+        { expectedVersion: 1 },
+      ),
+    );
+    ok(
+      await service.recordMove(ctx(w, w.cataloger), {
+        recordId: w.vase.id,
+        locationId: r.id,
+        movedOn: "2026-01-02",
+        reason: "placement",
+      }),
+    );
+    const trail = await readAuditTrail(
+      s.owner,
+      w.org,
+      { records: "all", people: "all" },
+      { limit: 100 },
+    );
+    const lines = trail.entries.filter((e) => e.type === "move" || e.type === "definition");
+    expect(lines.find((e) => e.type === "move")).toMatchObject({
+      actor: actorOf(w.cataloger),
+      recordId: w.vase.id,
+      title: "Invented blue vase",
+      locationId: r.id,
+      locationName: "Invented Room 9 East",
+    });
+    const location = lines.filter((e) => e.type === "definition" && e.key === r.id);
+    expect(location).toEqual([
+      expect.objectContaining({
+        action: "changed",
+        actor: actorOf(w.cataloger),
+        name: "Invented Room 9 East",
+        changes: ["name"],
+      }),
+      expect.objectContaining({ action: "created", name: "Invented Room 9" }),
+    ]);
+    // Moves follow the record's site (review): its site sees them, another doesn't.
+    const other = await makeSite(service, w.root, w.org, `Invented other site ${String(count)}`);
+    const scoped = async (site: SiteId) =>
+      (
+        await readAuditTrail(s.owner, w.org, { records: [site], people: [site] }, { limit: 100 })
+      ).entries.filter((e) => e.type === "move");
+    expect(await scoped(w.site)).toHaveLength(1);
+    expect(await scoped(other)).toEqual([]);
+    // A record filter keeps the record's moves and drops the definitions.
+    const one = await readAuditTrail(
+      s.owner,
+      w.org,
+      { records: "all", people: "all" },
+      { recordId: w.vase.id, limit: 100 },
+    );
+    expect(one.entries.some((e) => e.type === "move")).toBe(true);
+    expect(one.entries.some((e) => e.type === "definition")).toBe(false);
   });
 
   it("answers another organization's record like a missing one", async () => {

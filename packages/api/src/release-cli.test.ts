@@ -41,6 +41,7 @@ beforeEach(async () => {
   for (const p of ["core", "db", "service", "api"])
     await put(`packages/${p}/dist/index.js`, `// ${p}`);
   await put("packages/db/dist/migrate-cli.js", "process.exitCode = 0;");
+  await put("packages/db/dist/grant-cli.js", "process.exitCode = 0;");
   await put("packages/api/src/secret-notes.ts", "// source isn't shipped");
   await put("packages/admin/dist/index.html", "<!doctype html>");
   await put("packages/db/migrations/0001_start.sql", "-- start");
@@ -154,11 +155,22 @@ describe("the commands", () => {
 
     expect(await run(["verify", "oculus-1.0.0.zip"], { OCULUS_UPDATE_KEYS: publicKey })).toBe(0);
 
-    // The invented migrate script really runs, as a child process.
+    // A release that changes the database needs the writer role named (S-062):
+    // without it nothing is changed and nothing is switched.
+    const installEnv = {
+      OCULUS_UPDATE_KEYS: publicKey,
+      OCULUS_DATABASE_URL: "postgresql://owner@db.example.org/invented",
+    };
+    lines.length = 0;
+    expect(await run(["install", "oculus-1.0.0.zip", "--dir", "updates"], installEnv)).toBe(1);
+    expect(lines.join("\n")).toMatch(/Refused \(migrations_need_writer_role\)/);
+    await expect(readlink(join(work, "updates", "current"))).rejects.toThrow();
+
+    // The invented migrate and grant scripts really run, as child processes.
     expect(
       await run(["install", "oculus-1.0.0.zip", "--dir", "updates"], {
-        OCULUS_UPDATE_KEYS: publicKey,
-        OCULUS_DATABASE_URL: "postgresql://owner@db.example.org/invented",
+        ...installEnv,
+        OCULUS_UPDATE_WRITER_ROLE: "oculus_writer",
       }),
     ).toBe(0);
     expect(await readlink(join(work, "updates", "current"))).toBe(join("releases", "1.0.0"));
@@ -182,6 +194,7 @@ describe("the commands", () => {
         await run(["install", "oculus-1.0.0.zip", "--dir", "updates"], {
           OCULUS_UPDATE_KEYS: publicKey,
           OCULUS_DATABASE_URL: testDb.url,
+          OCULUS_UPDATE_WRITER_ROLE: "oculus_writer",
         }),
       ).toBe(0);
       expect(lines.join("\n")).not.toMatch(/change log/);

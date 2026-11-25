@@ -9,7 +9,11 @@
  * to 24 hours, idle no longer than absolute). Sites are System settings too,
  * kept in their own table. Email, backups, updates and site passwords join
  * as their tasks build them (T-040, T-051, T-019d, T-048a), each with its
- * own checked key; an unknown key is refused, never kept.
+ * own checked key; an unknown key is refused, never kept. **No secret
+ * (an email password, a backup key, a site password or its hash) goes in
+ * this document:** every change of it is copied for good into the
+ * append-only change log (migration 0058, D-117). Secrets get a table of
+ * their own.
  */
 import { types } from "node:util";
 import { issue, isPlainObject, type Issue, type Validated } from "./issues.js";

@@ -813,6 +813,8 @@ describe("the audit trail", () => {
     recordId?: string;
     kind?: string;
     siteId?: string | null;
+    subject?: string;
+    key?: string | null;
   }
   async function trail(as: string, query = "") {
     const r = await call("GET", `/api/audit${query}`, { as });
@@ -849,7 +851,15 @@ describe("the audit trail", () => {
   it("shows a cataloger their site's records only, and refuses people with no history right", async () => {
     const c = await trail("cataloger", "?limit=100");
     expect(c.status).toBe(200);
-    expect(c.entries.every((e) => e.type === "record")).toBe(true);
+    // Record versions, and (S-064) the changes to their own site only.
+    expect(
+      c.entries.every(
+        (e) =>
+          e.type === "record" ||
+          (e.type === "definition" && e.subject === "site" && e.key === w.a1),
+      ),
+    ).toBe(true);
+    expect(c.entries.some((e) => e.type === "definition")).toBe(true);
     expect(c.entries.map((e) => e.recordId)).not.toContain(a2Record);
     expect((await trail("reader")).status).toBe(403);
     const s = await trail("stranger", "?limit=100");

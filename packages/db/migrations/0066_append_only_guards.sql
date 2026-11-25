@@ -15,8 +15,8 @@
 -- The last two reference users (and alerts or factors) ON DELETE CASCADE.
 -- Nothing in Oculus deletes a user, an alert or a factor, and a cascade now
 -- stops at these rows, as it already did at people_events: a person's sign-in
--- history is kept. Numbered 0052, above 0050 and 0051 (reserved on the work
--- board by S-061 and S-064).
+-- history is kept. Numbered 0066, above main's 0058 and every number
+-- reserved on the work board.
 
 CREATE FUNCTION public.append_only_guard() RETURNS trigger
 LANGUAGE plpgsql

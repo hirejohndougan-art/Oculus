@@ -4,7 +4,7 @@
 // organizations and sites, role changes taking effect at once, revocations
 // racing writes, the writer role's grants on the new tables, and the
 // database's own guards. Every person, site and record here is invented.
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   ROLE_PERMISSIONS,
   newOrganizationId,
@@ -108,6 +108,11 @@ async function ready(): Promise<void> {
   })();
   folks = await peopleReady;
 }
+
+// Warm the setup before the first test, under the suite's longer hook limit
+// (U-008). A failure stays in `setup`, so with no database each test still
+// fails on its own when it calls ready().
+beforeAll(() => ready().catch(() => undefined));
 
 afterAll(async () => {
   const done = await setup?.catch(() => undefined);
@@ -1475,7 +1480,10 @@ describe("the database backs the rules up", () => {
       "role_assignments.role_assignments_check_grant",
       "role_assignments.role_assignments_check_new",
       "role_assignments.zzzz_role_assignments_keep_identity",
+      // 0058 (S-064): definitions in the change log.
+      "sites.definition_events_log",
       "sites.zzzz_sites_keep_identity",
+      "system_settings.definition_events_log",
       "system_settings.system_settings_version_step",
     ]);
     expect(rows.every((r) => r.tgenabled === "A")).toBe(true);

@@ -27,7 +27,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { csrfTokenFor, type OrganizationId, type UserId } from "@oculus/core";
+import { csrfTokenFor, newSiteId, type OrganizationId, type UserId } from "@oculus/core";
 import {
   openDatabase,
   purgeCandidates,
@@ -317,6 +317,15 @@ describe("the purge's steps", () => {
       ["files_deleted", 1, body.length],
       ["files_trashed", 1, body.length],
     ]);
+    // Its attach and removal, for those who see the record (S-064).
+    const files = await readAuditTrail(w.db, w.a, { records: "all", people: "all" }, {});
+    const lines = files.entries.flatMap((e) =>
+      e.type === "file" && e.bytes === body.length ? [e.kind] : [],
+    );
+    expect(lines).toEqual(expect.arrayContaining(["removed", "attached"]));
+    // Not for someone who sees only another site's records.
+    const elsewhere = await readAuditTrail(w.db, w.a, { records: [newSiteId()], people: [] }, {});
+    expect(elsewhere.entries.filter((e) => e.type === "file")).toEqual([]);
     await drain();
   });
 

@@ -3,7 +3,7 @@
 // are clean issues, deletion leaves a tombstone, races between two
 // connections resolve cleanly, and no other database role can write around
 // the service.
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   newOrganizationId,
   newRecordId,
@@ -164,6 +164,11 @@ async function ready(): Promise<void> {
   ALICE = actorOf(p.alice);
   BOB = actorOf(p.bob);
 }
+
+// Warm the setup before the first test, under the suite's longer hook limit
+// (U-008). A failure stays in `setup`, so with no database each test still
+// fails on its own when it calls ready().
+beforeAll(() => ready().catch(() => undefined));
 
 let people_: Promise<{ folks: People; alice: UserId; bob: UserId }> | undefined;
 

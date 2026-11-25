@@ -466,6 +466,8 @@ export {
   insertPeopleEvent,
   readAuditTrail,
   isAuditCursor,
+  changedProperties,
+  DEFINITION_SUBJECTS,
   PEOPLE_EVENT_KINDS,
   PEOPLE_TABLE_PRIVILEGES,
   MAX_MEMBERS,
@@ -483,6 +485,8 @@ export type {
   AuditFilter,
   AuditScope,
   AuditEntry,
+  DefinitionSubject,
+  ShareStep,
   AuditPage,
 } from "./people.js";
 export {

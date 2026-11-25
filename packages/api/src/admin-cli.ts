@@ -14,10 +14,16 @@
  * development sender otherwise. The two-step alert notices run every minute
  * (alert-notices.ts). The notices, the mailer's outbox and the server are
  * closed on SIGINT and SIGTERM.
+ *
+ * It refuses to start unless `OCULUS_DATABASE_URL` connects as the plain
+ * writer role D-067 asks for (`checkWriterConnection`, S-062): not a
+ * superuser, not the owner, and holding every privilege `grantWriterRole`
+ * gives, so a role a new migration's tables weren't granted to (after an
+ * update) is named before any request fails on them.
  */
 import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { openDatabase } from "@oculus/db";
+import { checkWriterConnection, openDatabase, type Queryable } from "@oculus/db";
 import { buildAdminServer, defaultLog } from "./admin-server.js";
 import { startAlertNotices, type AlertNoticeRunner } from "./alert-notices.js";
 import { mailerFromEnv, type Mailer } from "./mail.js";
@@ -26,6 +32,26 @@ import { oaiPoolOptions } from "./oai-pmh.js";
 import { publicPoolOptions } from "./public-api.js";
 
 const DATABASE_URL_VARIABLE = "OCULUS_DATABASE_URL";
+
+/**
+ * Why `db` can't be the server's connection (S-062, D-067), or undefined
+ * when it is the plain writer. Names the problems' codes only, never a role
+ * name, a value or the URL.
+ */
+export async function writerConnectionRefusal(db: Queryable): Promise<string | undefined> {
+  let problems: readonly { readonly code: string }[];
+  try {
+    problems = await checkWriterConnection(db);
+  } catch {
+    return `${DATABASE_URL_VARIABLE}: the database account can't be checked (is the database running and reachable?)`;
+  }
+  if (problems.length === 0) return undefined;
+  const codes = [...new Set(problems.map((p) => p.code))].sort();
+  const missingOnly = codes.every((code) => code === "missing_privilege");
+  return missingOnly
+    ? `${DATABASE_URL_VARIABLE}'s role lacks some of the writer's privileges (missing_privilege), usually tables from an update that weren't granted to it. Run the running release's packages/db/dist/grant-cli.js <writer role> (under <updates folder>/current on a server) with OCULUS_DATABASE_URL set to the owner's account, then start again (D-067).`
+    : `${DATABASE_URL_VARIABLE} must connect as the plain writer role made for Oculus (grantWriterRole, D-067), never a superuser or the owner; found: ${codes.join(", ")}`;
+}
 
 /** Starts the server; resolves with the exit code if it doesn't start. */
 export async function runAdminCli(
@@ -79,6 +105,9 @@ export async function runAdminCli(
   // Closed on a failed start too, so the Subjects counts stop before the pools (S-038).
   let built: { close: () => Promise<unknown> } | undefined;
   try {
+    // Before anything else starts (S-062): the service must write as the plain writer.
+    const refusal = await writerConnectionRefusal(db);
+    if (refusal !== undefined) throw new Error(refusal);
     mailer = mailerFromEnv(env, { log: defaultLog });
     // After an update with OCULUS_UPDATE_RESTART=exit (T-060, D-092): stop
     // cleanly so the host's process manager starts the new version.

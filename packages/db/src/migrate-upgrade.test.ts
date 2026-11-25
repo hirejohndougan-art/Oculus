@@ -3,9 +3,10 @@
 // is migrated to 0039, filled with rows the code of that time could write
 // (direct SQL, past every trigger and check of that schema), then migrated to
 // the newest file. The rows must survive, unchanged, and still pass every new
-// check: 0040 widens second_step_throttles' key check, 0043 rebuilds
+// check: 0040 widens second_step_throttles' key check and 0050 adds its counts, 0043 rebuilds
 // record_shares' states and foreign keys and adds the records triggers, 0049
-// adds columns and checks to system_events, and 0052 adds append-only guards.
+// adds columns and checks to system_events, 0055 adds a column to
+// second_step_alerts, and 0066 adds append-only guards.
 //
 // The last test lists every later file that changes an existing table
 // (ALTER TABLE … ADD, DROP, ALTER or RENAME; UPDATE; DELETE FROM): a new one
@@ -33,6 +34,8 @@ const COVERED = [
   "0040_unexplained_wrong_codes.sql",
   "0043_share_limits_and_endings.sql",
   "0049_file_purge.sql",
+  "0050_session_wrong_codes.sql",
+  "0055_second_step_alert_code_time.sql",
 ];
 
 const PLACEHOLDER_HASH = "$scrypt$ln=14,r=8,p=5$" + "A".repeat(22) + "$" + "A".repeat(43);
@@ -69,6 +72,7 @@ interface Seeded {
   records: string[];
   throttleKeys: string[];
   events: string[];
+  alerts: string[];
 }
 
 async function insertRecord(
@@ -161,7 +165,13 @@ async function seed(db: Database): Promise<Seeded> {
     VALUES (${events[0]}::uuid, ${admin}::uuid, 'update_installed', '1.2.0', '1.1.3')`);
   await db.execute(sql`INSERT INTO public.system_events (id, actor_id, kind, version, from_version)
     VALUES (${events[1]}::uuid, NULL, 'update_rolled_back', '1.1.3', '1.2.0')`);
-  return { org, admin, siteA, siteB, shares, records, throttleKeys, events };
+  // second_step_alerts (0055): two alerts, as D-077's wrong-code waits wrote them.
+  const alerts = [randomUUID(), randomUUID()];
+  for (const [i, id] of alerts.entries()) {
+    await db.execute(sql`INSERT INTO public.second_step_alerts (id, user_id, failures)
+      VALUES (${id}::uuid, ${admin}::uuid, ${5 + 10 * i})`);
+  }
+  return { org, admin, siteA, siteB, shares, records, throttleKeys, events, alerts };
 }
 
 async function migratedTo(last: string | undefined): Promise<{ db: Database; url: string }> {
@@ -224,6 +234,11 @@ describe("upgrading a database that holds data", () => {
         sql`SELECT key, failures FROM public.second_step_throttles ORDER BY key`,
       ),
     ).toEqual([...seeded.throttleKeys].sort().map((key) => ({ key, failures: 3 })));
+    // …with 0050's new counts at zero.
+    expect(
+      await db.rows<{ n: number }>(sql`SELECT count(*)::int AS n FROM public.second_step_throttles
+        WHERE unexplained <> 0 OR told_round <> 0`),
+    ).toEqual([{ n: 0 }]);
     // …and 0040's new key shape is now accepted beside them.
     await db.execute(sql`INSERT INTO public.second_step_throttles (key, failures)
       VALUES (${`wrong:${seeded.admin}`}, 1)`);
@@ -259,6 +274,13 @@ describe("upgrading a database that holds data", () => {
         },
       ]),
     );
+
+    // Alerts: both kept, the new column empty.
+    expect(
+      await db.rows<{ id: string; failures: number; last_code_at: string | null }>(sql`
+        SELECT id::text AS id, failures, last_code_at::text AS last_code_at
+        FROM public.second_step_alerts ORDER BY failures`),
+    ).toEqual(seeded.alerts.map((id, i) => ({ id, failures: 5 + 10 * i, last_code_at: null })));
 
     // Every constraint the new files added holds for the old rows too.
     expect(

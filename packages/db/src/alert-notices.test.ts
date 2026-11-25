@@ -3,7 +3,7 @@
 // alerts folded into a notice or seen too late, two runs at once, failed
 // sends, and 0021's guards as the writer role. Every person and address is
 // invented.
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { newOrganizationId, type OrganizationId, type UserId, type Validated } from "@oculus/core";
 import { acceptInvitation, createFirstSystemAdmin, createInvitation } from "./accounts.js";
 import type { InvitationMessage } from "./accounts.js";
@@ -54,6 +54,11 @@ async function ready(): Promise<void> {
   })();
   await setup;
 }
+
+// Warm the setup before the first test, under the suite's longer hook limit
+// (U-008). A failure stays in `setup`, so with no database each test still
+// fails on its own when it calls ready().
+beforeAll(() => ready().catch(() => undefined));
 
 afterAll(async () => {
   await setup?.catch(() => undefined);
@@ -128,12 +133,25 @@ describe("sendSecondStepAlertNotices", () => {
     const run = await sendSecondStepAlertNotices(db, box.deliver);
     expect(run).toEqual({ alerts: 2, notified: 1, sent: 2, failed: 0 });
     expect(box.messages).toEqual([
-      { to: "person", email: p.email, failures: 15, at: expect.any(String) as string },
+      {
+        to: "person",
+        email: p.email,
+        failures: 15,
+        at: expect.any(String) as string,
+        codesAt: expect.any(String) as string,
+      },
       {
         to: "system_admin",
         email: ADMIN_EMAIL,
         // By address only: never the self-chosen display name (review L1).
-        people: [{ email: p.email, failures: 15, at: expect.any(String) as string }],
+        people: [
+          {
+            email: p.email,
+            failures: 15,
+            at: expect.any(String) as string,
+            codesAt: expect.any(String) as string,
+          },
+        ],
         more: 0,
       },
     ]);
@@ -216,7 +234,7 @@ describe("sendSecondStepAlertNotices", () => {
         ENABLE ALWAYS TRIGGER second_step_alert_notices_check_new`);
       await q.execute(sql`ALTER TABLE public.second_step_alert_notices
         ENABLE ALWAYS TRIGGER second_step_alert_notices_no_change`);
-      // 0052's guards (S-065), put back as the migration left them.
+      // 0066's guards (S-065), put back as the migration left them.
       await q.execute(sql`ALTER TABLE public.second_step_alert_notices
         ENABLE ALWAYS TRIGGER second_step_alert_notices_append_only`);
       await q.execute(sql`ALTER TABLE public.second_step_alert_notices
@@ -249,7 +267,13 @@ describe("sendSecondStepAlertNotices", () => {
     const box = inbox();
     await sendSecondStepAlertNotices(db, box.deliver);
     expect(box.messages).toEqual([
-      { to: "person", email: ADMIN_EMAIL, failures: 5, at: expect.any(String) as string },
+      {
+        to: "person",
+        email: ADMIN_EMAIL,
+        failures: 5,
+        at: expect.any(String) as string,
+        codesAt: expect.any(String) as string,
+      },
     ]);
     const p = await person();
     await db.execute(sql`UPDATE public.users SET disabled_at = clock_timestamp()
@@ -306,6 +330,58 @@ describe("sendSecondStepAlertNotices", () => {
     const box = inbox();
     await sendSecondStepAlertNotices(db, box.deliver);
     expect(box.messages).toEqual([]);
+  });
+
+  it("gives when the codes were typed, not when the alert was written (S-054c)", async () => {
+    await ready();
+    await drain();
+    const p = await person();
+    const q = await person();
+    // Codes typed three hours before the alert (told by the cleanup, say).
+    await db.execute(sql`
+      INSERT INTO public.second_step_alerts (id, user_id, failures, created_at, last_code_at)
+      VALUES (gen_random_uuid(), ${p.userId}::uuid, 2, clock_timestamp(),
+              clock_timestamp() - interval '3 hours')`);
+    // A time after the alert's (a clock stepped back) is never given.
+    await db.execute(sql`
+      INSERT INTO public.second_step_alerts (id, user_id, failures, created_at, last_code_at)
+      VALUES (gen_random_uuid(), ${q.userId}::uuid, 1, clock_timestamp() - interval '1 hour',
+              clock_timestamp() + interval '1 hour')`);
+    const times = await db.rows<{ user_id: string; code: string; created: string }>(sql`
+      SELECT user_id::text AS user_id,
+             to_char(last_code_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS code,
+             to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created
+      FROM public.second_step_alerts WHERE user_id IN (${p.userId}::uuid, ${q.userId}::uuid)`);
+    const of = (u: UserId) => times.find((t) => t.user_id === u);
+    const box = inbox();
+    await sendSecondStepAlertNotices(db, box.deliver);
+    const toPerson = (email: string) =>
+      box.messages.find((m) => m.to === "person" && m.email === email);
+    // The wording gives the codes' time; the email's life runs from the alert's.
+    expect(toPerson(p.email)).toMatchObject({
+      failures: 2,
+      at: of(p.userId)?.created,
+      codesAt: of(p.userId)?.code,
+    });
+    expect(toPerson(q.email)).toMatchObject({
+      failures: 1,
+      at: of(q.userId)?.created,
+      codesAt: of(q.userId)?.created,
+    });
+    expect(of(p.userId)?.code).not.toBe(of(p.userId)?.created);
+    // An alert written before the time was kept gives when it was written.
+    const r = await person();
+    await alert(r.userId, 3);
+    const created = await db.rows<{ at: string }>(sql`
+      SELECT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS at
+      FROM public.second_step_alerts WHERE user_id = ${r.userId}::uuid`);
+    const later = inbox();
+    await sendSecondStepAlertNotices(db, later.deliver);
+    expect(later.messages.find((m) => m.to === "person")).toMatchObject({
+      failures: 3,
+      at: created[0]?.at,
+      codesAt: created[0]?.at,
+    });
   });
 
   it("checks its options", async () => {

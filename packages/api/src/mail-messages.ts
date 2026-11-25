@@ -392,6 +392,8 @@ export type SecondStepAlertMailInput =
       readonly email: string;
       readonly failures: number;
       readonly at: string;
+      /** When the codes were typed (S-054c), never after `at`; the email gives it. */
+      readonly codesAt?: string;
     }
   | {
       readonly to: "system_admin";
@@ -400,9 +402,18 @@ export type SecondStepAlertMailInput =
         readonly email: string;
         readonly failures: number;
         readonly at: string;
+        readonly codesAt?: string;
       }[];
       readonly more: number;
     };
+
+/**
+ * When the codes were typed (S-054c), for the wording: never after the
+ * alert's own time, which the email's life runs from; absent, that time.
+ */
+function codesTime(codesAt: unknown, at: number): number {
+  return codesAt === undefined ? at : Math.min(checkExpiry(codesAt), at);
+}
 
 function codesText(failures: number): string {
   return failures === 1 ? "1 wrong code" : `${String(failures)} wrong codes`;
@@ -422,13 +433,14 @@ export function renderSecondStepAlert(
   if (input.to === "person") {
     const failures = checkCount(input.failures);
     const at = checkExpiry(input.at);
+    const codesAt = codesTime(input.codesAt, at);
     return build(
       "two_step_alert",
       to,
       "Someone may know your Oculus password",
       [
         {
-          text: `Someone has been entering wrong two-step sign-in codes for your Oculus account (${codesText(failures)} by ${expiryText(at)}). Codes are asked for only after the right password, so whoever it is probably knows your password. Your two-step sign-in has kept them out.`,
+          text: `Someone has been entering wrong two-step sign-in codes for your Oculus account (${codesText(failures)} by ${expiryText(codesAt)}). Codes are asked for only after the right password, so whoever it is probably knows your password. Your two-step sign-in has kept them out.`,
         },
         {
           text: 'If it wasn\'t you, choose a new password now: open the sign-in page and use "Forgot your password?".',
@@ -447,6 +459,7 @@ export function renderSecondStepAlert(
     readonly email: unknown;
     readonly failures: unknown;
     readonly at: unknown;
+    readonly codesAt?: unknown;
   }[] = input.people;
   if (!isList(input.people) || people.length === 0 || people.length > ALERT_SUMMARY_MAX_LINES) {
     throw new MailContentError("bad_value");
@@ -461,7 +474,8 @@ export function renderSecondStepAlert(
     const failures = checkCount(p.failures);
     const at = checkExpiry(p.at);
     newest = Math.max(newest, at);
-    return { text: `${address}: ${codesText(failures)} by ${expiryText(at)}` };
+    const codesAt = codesTime(p.codesAt, at);
+    return { text: `${address}: ${codesText(failures)} by ${expiryText(codesAt)}` };
   });
   const count = people.length + more;
   return build(

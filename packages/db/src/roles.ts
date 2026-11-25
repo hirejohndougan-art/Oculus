@@ -19,6 +19,7 @@
  * refuses a role holding anything more.
  */
 import { SHARE_TABLE_PRIVILEGES } from "./shares.js";
+import { DEFINITION_EVENT_TABLE_PRIVILEGES } from "./definition-events.js";
 import { SYSTEM_EVENT_TABLE_PRIVILEGES } from "./system-events.js";
 import { ACCOUNT_TABLE_PRIVILEGES } from "./accounts.js";
 import { PEOPLE_TABLE_PRIVILEGES } from "./people.js";
@@ -108,6 +109,9 @@ export const WRITER_PRIVILEGES: Readonly<Record<string, readonly string[]>> = Ob
   ...SHARE_TABLE_PRIVILEGES,
   // Installs and rollbacks in the change log (T-060a): append-only.
   ...SYSTEM_EVENT_TABLE_PRIVILEGES,
+  // Definitions made or changed (S-064, D-117): append-only, written by
+  // migration 0058's triggers.
+  ...DEFINITION_EVENT_TABLE_PRIVILEGES,
   // Stored OAI-PMH datestamps (S-041, D-108): made and moved by the
   // background pass; a record that stops being shown is marked, never deleted.
   oai_datestamps: ["INSERT", "UPDATE"],

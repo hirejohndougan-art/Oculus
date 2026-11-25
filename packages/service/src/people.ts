@@ -911,7 +911,16 @@ export function peopleOperations(
             value: await readAuditTrail(
               tx,
               who.organizationId,
-              { records, people, system: v.system },
+              {
+                records,
+                people,
+                system: v.system,
+                // S-064: accession saves need donors.view on every site (D-036, D-117).
+                accessions:
+                  v.system ||
+                  (all.length > 0 &&
+                    wholeSitesHolding(v.access, "donors.view", all).length === all.length),
+              },
               {
                 ...(person === undefined ? {} : { actorId: person }),
                 ...(record === undefined ? {} : { recordId: record }),

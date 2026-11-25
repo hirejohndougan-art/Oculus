@@ -7,7 +7,7 @@
 // records back from the publish check and the public output at once, while
 // nothing of an accession ever reaches public output. Every person, record
 // and number here is invented.
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   newOrganizationId,
   newRecordId,
@@ -28,6 +28,7 @@ import {
   lockAccessionHolds,
   migrate,
   openDatabase,
+  readAuditTrail,
   publishCheckIssues,
   readPublicRecord,
   sql,
@@ -117,6 +118,11 @@ async function ready(): Promise<void> {
   })();
   folks = await peopleReady;
 }
+
+// Warm the setup before the first test, under the suite's longer hook limit
+// (U-008). A failure stays in `setup`, so with no database each test still
+// fails on its own when it calls ready().
+beforeAll(() => ready().catch(() => undefined));
 
 afterAll(async () => {
   const done = await setup?.catch(() => undefined);
@@ -342,6 +348,44 @@ describe("accessions through the service (T-018c)", () => {
       SELECT count(*)::int AS n, min(saved_by::text) AS who FROM public.accession_versions
       WHERE organization_id = ${w.org}::uuid AND accession_id = ${first.accession.id}::uuid`);
     expect(history).toEqual({ n: 2, who: w.donorStaff });
+  });
+
+  it("shows accession saves, by number only, to whole-organization viewers (S-064)", async () => {
+    await ready();
+    const w = await world();
+    const input = accessionInput(w);
+    const first = ok(await service.createAccession(ctx(w, w.donorStaff), input));
+    ok(
+      await service.updateAccession(
+        ctx(w, w.donorStaff),
+        first.accession.id,
+        { ...input, deedStatus: "signed", deedSignedOn: "2026-04-01" },
+        { expectedVersion: 1 },
+      ),
+    );
+    const lines = async (records: "all" | SiteId[], accessions = true) =>
+      (
+        await readAuditTrail(s.owner, w.org, { records, people: "all", accessions }, { limit: 100 })
+      ).entries.filter((e) => e.type === "accession");
+    expect(await lines("all")).toEqual([
+      expect.objectContaining({
+        actor: actorOf(w.donorStaff),
+        accessionId: first.accession.id,
+        version: 2,
+        number: input.number.value,
+      }),
+      expect.objectContaining({ version: 1, number: input.number.value }),
+    ]);
+    expect(JSON.stringify(await lines("all"))).not.toContain(w.donor.title);
+    // Only with donors.view on every site (D-036): the service gives a
+    // cataloger none, a system manager both.
+    expect(await lines("all", false)).toEqual([]);
+    const cataloger = await service.auditTrail(ctx(w, w.cataloger), {});
+    if (!cataloger.ok) throw new Error("no trail");
+    expect(cataloger.value.entries.some((e) => e.type === "accession")).toBe(false);
+    const root = await service.auditTrail(ctx(w, w.root), {});
+    if (!root.ok) throw new Error("no trail");
+    expect(root.value.entries.some((e) => e.type === "accession")).toBe(true);
   });
 
   it("never gives an all-time number to a second accession, even after the first gave it up", async () => {
@@ -651,6 +695,67 @@ describe("donor contacts through the service (T-018c)", () => {
     expect(codes(await service.readDonorContact(ctx(w, w.donorStaff), w.donor.id))).toEqual([
       "unknown_contact",
     ]);
+  });
+
+  it("are deleted only by someone who works with donors on the agent's own site (S-058)", async () => {
+    await ready();
+    const w = await world();
+    const other = await makeSite(service, w.root, w.org, `Invented contact site ${String(count)}`);
+    const agent = ok(
+      await service.createRecord(
+        { organizationId: w.org, actor: actorOf(w.root), siteId: other },
+        {
+          kind: "agent",
+          agentType: "person",
+          title: "Invented Other-Site Donor",
+          templateKey: "t-agent",
+          fields: {},
+        },
+      ),
+    ).record;
+    const input = { email: "other-site-donor@example.invalid" };
+    ok(await service.saveDonorContact(ctx(w, w.root), agent.id, input, { expectedVersion: 0 }));
+    // Donor relations on the first site only: saving is refused there, and so is deleting.
+    expect(
+      codes(
+        await service.saveDonorContact(ctx(w, w.donorStaff), agent.id, input, {
+          expectedVersion: 1,
+        }),
+      ),
+    ).toEqual(["not_permitted"]);
+    expect(
+      codes(
+        await service.deleteDonorContact(ctx(w, w.donorStaff), agent.id, { expectedVersion: 1 }),
+      ),
+    ).toEqual(["not_permitted"]);
+    // A wrong version doesn't get past the check either.
+    expect(
+      codes(
+        await service.deleteDonorContact(ctx(w, w.donorStaff), agent.id, { expectedVersion: 9 }),
+      ),
+    ).toEqual(["not_permitted"]);
+    // The contact is still there.
+    expect(ok(await service.readDonorContact(ctx(w, w.root), agent.id)).contact.email).toBe(
+      input.email,
+    );
+    // Someone who works with donors on that site may delete it.
+    await grant(service, w.root, w.org, {
+      userId: w.donorStaff,
+      role: "donor_relations",
+      siteId: other,
+    });
+    ok(await service.deleteDonorContact(ctx(w, w.donorStaff), agent.id, { expectedVersion: 1 }));
+    expect(codes(await service.readDonorContact(ctx(w, w.root), agent.id))).toEqual([
+      "unknown_contact",
+    ]);
+    // An ID that isn't one, or names no contact, is answered as a missing contact.
+    expect(
+      codes(
+        await service.deleteDonorContact(ctx(w, w.donorStaff), "not-an-id", {
+          expectedVersion: 1,
+        }),
+      ),
+    ).toEqual(["unknown_contact"]);
   });
 });
 

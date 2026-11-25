@@ -1,4 +1,4 @@
-// 0052's append-only guards (S-065, T-053 data review L4): storage moves,
+// 0066's append-only guards (S-065, T-053 data review L4): storage moves,
 // accession versions, two-step alert notices and two-step passes refuse
 // UPDATE, DELETE and TRUNCATE even for the owner, who has every privilege.
 // The writer is refused by privilege before any trigger runs (roles.ts).
@@ -34,7 +34,7 @@ async function refusedBy(statement: Sql): Promise<string | undefined> {
   return error?.constraint;
 }
 
-describe("append-only guards (0052)", () => {
+describe("append-only guards (0066)", () => {
   it.each([
     ["storage_moves", ["UPDATE", "DELETE", "TRUNCATE"]],
     ["accession_versions", ["UPDATE", "DELETE", "TRUNCATE"]],

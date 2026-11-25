@@ -11,6 +11,11 @@ export default defineConfig({
     },
   },
   test: {
+    // Generous limits for a busy machine (U-008): scrypt sign-ins, several
+    // connections and a fresh database's migrations can pass vitest's 5 s
+    // default when other work shares the CPUs. A test that hangs still fails.
+    testTimeout: 30_000,
+    hookTimeout: 120_000,
     // `*.test.tsx` are the admin's screen tests (D-073); each says
     // `// @vitest-environment jsdom` at the top.
     include: [

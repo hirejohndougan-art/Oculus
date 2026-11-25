@@ -8,7 +8,7 @@
 // and sites answer exactly like missing ones, and a share never lets the
 // second site read or change the record through the ordinary operations.
 // Every person, site and record here is invented.
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import {
   newOrganizationId,
@@ -30,6 +30,7 @@ import {
   MAX_SHARE_PAGE,
   migrate,
   openDatabase,
+  readAuditTrail,
   sharesIntoSite,
   sql,
   type Database,
@@ -91,6 +92,11 @@ async function ready(): Promise<void> {
   })();
   folks = await peopleReady;
 }
+
+// Warm the setup before the first test, under the suite's longer hook limit
+// (U-008). A failure stays in `setup`, so with no database each test still
+// fails on its own when it calls ready().
+beforeAll(() => ready().catch(() => undefined));
 
 afterAll(async () => {
   const done = await setup?.catch(() => undefined);
@@ -410,6 +416,75 @@ describe("deciding and ending", () => {
     expect(removed.state).toBe("removed");
     // Offering again after a removal makes a new offer.
     expect((await offer(w, { org: w.dhs, site: w.d1 })).id).not.toBe(share.id);
+  });
+
+  it("shows a share's steps to those who see the record, never naming the other organization's people (S-064)", async () => {
+    await ready();
+    const w = await world();
+    const share = await offer(w, { org: w.dhs, site: w.d1 });
+    ok(await service.acceptShare(at(w.dhs, w.dhsManager), share.id));
+    ok(await service.removeShare(at(w.dhs, w.dhsManager), share.id));
+    const steps = async (org: OrganizationId, records: "all" | SiteId[], actorId?: UserId) =>
+      (
+        await readAuditTrail(
+          s.owner,
+          org,
+          { records, people: "all" },
+          { limit: 100, ...(actorId === undefined ? {} : { actorId }) },
+        )
+      ).entries.flatMap((e) =>
+        e.type === "share" ? [[e.kind, e.actor, e.title, e.targetSiteId]] : [],
+      );
+    const home = [
+      ["removed", "other_organization", "Invented depot lantern", w.d1],
+      ["accepted", "other_organization", "Invented depot lantern", w.d1],
+      ["offered", actorOf(w.libCataloger), "Invented depot lantern", w.d1],
+    ];
+    expect(await steps(w.lib, "all")).toEqual(home);
+    expect(await steps(w.lib, [w.l1])).toEqual(home);
+    expect(await steps(w.lib, [w.l2])).toEqual([]);
+    // The other organization's person can't be found by ID either.
+    expect(await steps(w.lib, "all", w.dhsManager)).toEqual([]);
+    // The receiving organization's trail shows none of it (D-094, 0043).
+    expect(await steps(w.dhs, "all")).toEqual([]);
+    expect(await steps(w.dhs, [w.d1])).toEqual([]);
+    // A share between two sites of one organization: someone who sees only
+    // the receiving site sees nothing of it, not even the record's ID.
+    ok(
+      await service.offerRecord(at(w.lib, w.libCataloger, w.l1), {
+        recordId: w.item.id,
+        targetOrganizationId: w.lib,
+        targetSiteId: w.l2,
+      }),
+    );
+    expect(await steps(w.lib, [w.l2])).toEqual([]);
+    const l2 = await readAuditTrail(s.owner, w.lib, { records: [w.l2], people: [w.l2] }, {});
+    expect(JSON.stringify(l2)).not.toContain(w.item.id);
+    expect((await steps(w.lib, [w.l1]))[0]).toEqual([
+      "offered",
+      actorOf(w.libCataloger),
+      "Invented depot lantern",
+      w.l2,
+    ]);
+    // The sites and mappings made through the service name who made them.
+    const made = (
+      await readAuditTrail(s.owner, w.lib, { records: "all", people: "all" }, { limit: 100 })
+    ).entries.filter((e) => e.type === "definition");
+    expect(made).toContainEqual(
+      expect.objectContaining({
+        subject: "site",
+        key: w.l1,
+        action: "created",
+        actor: actorOf(folks.root),
+      }),
+    );
+    expect(made).toContainEqual(
+      expect.objectContaining({
+        subject: "dublin_core_mapping",
+        key: "t-object",
+        actor: actorOf(folks.root),
+      }),
+    );
   });
 
   it("lets the home side withdraw an offer or an accepted item, and no one else", async () => {
