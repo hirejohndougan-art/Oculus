@@ -49,7 +49,8 @@
  *    the method and path only.
  * 9. Headers (headers.ts): handlers write only the allowlisted headers
  *    (Content-Language, ETag, Last-Modified, Vary, a same-origin Location,
- *    Retry-After, and the Content-Type through `type()`), and every reply,
+ *    Retry-After, and the Content-Type through `type()`, never `text/html`:
+ *    the public home page is the server's own, rule 13, D-109), and every reply,
  *    the router's own errors included, carries nosniff, no-referrer, a CSP
  *    that loads nothing and `Cache-Control: no-store`.
  *

@@ -2,6 +2,14 @@
 
 One entry per run, newest at the top. Format: see [AUTOPILOT.md](AUTOPILOT.md).
 
+## 2026-11-25 05:40 CT — manual (Chat I) — T-070 "View public site" button in the admin
+- Result: done
+- What changed: `GET /api/me` adds each site's public origin (only from `OCULUS_PUBLIC_SITES` as checked at startup, only for the person's sites); `frame/ViewPublicSite.tsx` under the site selector and in Settings › Sites opens `<origin>/` in a new tab (`rel="noopener noreferrer"`, no Referer), disabled with "This site has no public address yet" when there is none; server rule 13 (`public-home.ts`): a public host's `/` answers one fixed page with the site's name and "This public site is being built", no record data, CSP with the one style's hash. Commit ba66cc7.
+- Decisions: D-109 (T-070 part); D-058 points to it
+- Review: independent review (run by the coordinator): safe to merge; one doc pointer added
+- Gate: see the merge commit · npm audit clean
+- Next: T-071 (Chat I)
+
 ## 2026-11-25 05:13 CT — build (BUILD MODE) — S-037 Time limits on the public reader pool
 - Result: done
 - What changed: `readPublicRecord` takes `timeLimitMs` (a transaction-local `statement_timeout`, default 5 s); the public pool waits at most 5 s for a connection (`publicPoolOptions`, `PUBLIC_POOL_SIZE` shared with the read slots); `isDatabaseTimeout` (57014, pg-pool's wait) answers `503 busy` on `GET /records/:id` and OAI-PMH; OAI list pages stop reading after 15 s, or just before a later read that timed out, and end with a resumption token. Tests lock `public.records`, exhaust the pool and cancel reads mid-page. Commits a44f691, 894a758, the second-review fix, c4b899a.
