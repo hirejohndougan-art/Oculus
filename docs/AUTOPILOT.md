@@ -1,5 +1,7 @@
 # Autopilot
 
+> **While [SPRINT.md](SPRINT.md) says the sprint is IN FORCE, its rules override this file where they differ** (John, 2026-11-25: build and push first, then review, bug and security checks, then merge).
+
 Oculus is built by scheduled Claude sessions with **no human approval** (see D-003 in [DECISIONS.md](DECISIONS.md)). Three sessions run every night, each with its own job:
 
 | Session | Time (Central) | Job |
